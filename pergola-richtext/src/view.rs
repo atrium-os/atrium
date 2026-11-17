@@ -303,7 +303,7 @@ impl RichTextView {
                         Item::Glyphs(r) => {
                             if let Some(face) = faces.and_then(|fs| fs.get(r.face as usize)) {
                                 let run: Vec<PGlyph> = r.glyphs.iter().map(|gl| PGlyph { id: gl.id, dx: (gl.x as f64 * g.k) as f32, dy: (gl.dy as f64 * g.k) as f32 }).collect();
-                                ctx.add(Node::Glyphs { origin: Point::new(q(ox + r.x as f64 * g.k), q(oy + r.y as f64 * g.k)), face: face.clone(), size: (r.size as f64 * g.k) as f32, color: rgb(r.color), glyphs: Arc::from(run) });
+                                ctx.add(Node::Glyphs { origin: Point::new(q(ox + r.x as f64 * g.k), q(oy + r.y as f64 * g.k)), face: face.clone(), size: (r.size as f64 * g.k) as f32, color: rgb(r.color), glyphs: Arc::from(run), turn: None });
                             }
                         }
                         Item::Image { image, x, y, w, h } => {

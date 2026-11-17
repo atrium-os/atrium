@@ -181,6 +181,18 @@ pub fn scene(r: &mut Rng, w: u32, h: u32) -> Scene {
                             bearing: [r.f(-1.0, 2.0), r.f(0.0, 8.0)],
                         })
                         .collect(),
+                    // Upright, turned (any angle, maybe flipped or
+                    // scaled), or a turn pack refuses.
+                    turn: match r.below(4) {
+                        0 => None,
+                        1 | 2 => {
+                            let (sn, cs) = r.f(-4.0, 4.0).sin_cos();
+                            let k = if r.chance(20) { r.f(0.5, 2.0) } else { 1.0 };
+                            let flip = if r.chance(20) { -1.0 } else { 1.0 };
+                            Some([k * cs, k * sn, -k * sn * flip, k * cs * flip])
+                        }
+                        _ => Some([r.wild(-2.0, 2.0), r.wild(-2.0, 2.0), r.wild(-2.0, 2.0), r.wild(-2.0, 2.0)]),
+                    },
                 })
                 .collect();
             s.glyph_batches.push(GlyphBatch { atlas, runs });
@@ -196,7 +208,7 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
     // Extra ops past the scene's, then rewrite some fields of any op.
     for _ in 0..r.below(4) {
         let mut o = f.ops[r.below(f.ops.len() as u32) as usize];
-        o.meta[0] = r.below(7);
+        o.meta[0] = r.below(8);
         f.ops.push(o);
     }
     // Layers (KIND_PUSH / KIND_POP): runs of PUSHes, deeper than the
@@ -217,7 +229,7 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
             continue;
         }
         match r.below(6) {
-            0 => o.meta[0] = if r.chance(70) { r.below(7) } else { r.word(8) },
+            0 => o.meta[0] = if r.chance(70) { r.below(8) } else { r.word(8) },
             1 => o.meta[1] = r.word(n_tex + 2),
             2 => {
                 let k = r.below(4) as usize;
@@ -225,6 +237,7 @@ pub fn corrupt(r: &mut Rng, f: &mut Frame) {
             }
             3 => o.p0[r.below(4) as usize] = r.wild(-20.0, fw + 20.0),
             4 => o.p2[r.below(4) as usize] = r.wild(-2.0, 2.0),
+            5 if o.meta[0] == KIND_GLYPH_XF => o.meta[2 + r.below(2) as usize] = r.word(70000),
             _ => o.p1[r.below(4) as usize] = r.wild(-0.5, 1.5),
         }
     }

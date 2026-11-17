@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 31] = [
+    pub const NAMES: [&str; 33] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -38,6 +38,8 @@ pub mod coverage {
         "pop",
         "pop with no layer open (ignored)",
         "layer still open after the last op",
+        "turned glyph: outside its box",
+        "turned glyph",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -243,6 +245,55 @@ fn fill_shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     [lin(c[0]), lin(c[1]), lin(c[2]), c[3] * o.p1[3] * cov]
 }
 
+/// raster.comp's `glyph_texel`: a texel of the glyph box, zero outside it.
+#[allow(clippy::too_many_arguments)]
+fn glyph_texel(f: &Frame, t: [u32; 4], u: u32, v: u32, gw: i32, gh: i32, x: i32, y: i32) -> f32 {
+    if x < 0 || y < 0 || x >= gw || y >= gh {
+        return 0.0;
+    }
+    texel(f, t, (u as i32).wrapping_add(x), (v as i32).wrapping_add(y))[0]
+}
+
+/// raster.comp's `glyph_xf`: a glyph under a 2x2 turn ([`crate::KIND_GLYPH_XF`]).
+fn glyph_xf(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
+    let (p0, p2) = (o.p0, o.p2);
+    let d = [pc[0] - p0[0], pc[1] - p0[1]];
+    let lx = p2[0] * d[0] + p2[1] * d[1];
+    let ly = p2[2] * d[0] + p2[3] * d[1];
+    if !(lx >= -0.5 && lx < p0[2] + 0.5 && ly >= -0.5 && ly < p0[3] + 0.5) {
+        hit(31);
+        return [0.0; 4];
+    }
+    let ti = o.meta[1];
+    if ti >= f.header.tex_count {
+        hit(11);
+        return [0.0; 4];
+    }
+    let t = f.tex[ti as usize];
+    if t[1] == 0 || t[2] == 0 || t[1] > crate::MAX_TEX_DIM || t[2] > crate::MAX_TEX_DIM {
+        hit(12);
+        return [0.0; 4];
+    }
+    hit(32);
+    let max = crate::MAX_TEX_DIM as f32;
+    let (fw, fh) = (clamp_(p0[2], 0.0, max), clamp_(p0[3], 0.0, max));
+    let (gw, gh) = (fw as i32, fh as i32);
+    let (u, v) = (o.meta[2].min(crate::MAX_TEX_DIM), o.meta[3].min(crate::MAX_TEX_DIM));
+    let (tx, ty) = (lx - 0.5, ly - 0.5);
+    let (flx, fly) = (tx.floor(), ty.floor());
+    let (ax, ay) = (tx - flx, ty - fly);
+    let x = clamp_(flx, -1.0, fw) as i32;
+    let y = clamp_(fly, -1.0, fh) as i32;
+    let c00 = glyph_texel(f, t, u, v, gw, gh, x, y);
+    let c10 = glyph_texel(f, t, u, v, gw, gh, x + 1, y);
+    let c01 = glyph_texel(f, t, u, v, gw, gh, x, y + 1);
+    let c11 = glyph_texel(f, t, u, v, gw, gh, x + 1, y + 1);
+    let a = mix(c00, c10, ax);
+    let b = mix(c01, c11, ax);
+    let cov = mix(a, b, ay);
+    [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
+}
+
 /// One op's straight-alpha colour at pixel centre `pc`.
 pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     // The op's whole-pixel box is also its clip: nothing is drawn outside
@@ -267,6 +318,9 @@ pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
         }
         hit(4);
         return [0.0; 4];
+    }
+    if kind == crate::KIND_GLYPH_XF {
+        return glyph_xf(f, o, pc);
     }
     if !inside(o.p0, pc) {
         hit(5);

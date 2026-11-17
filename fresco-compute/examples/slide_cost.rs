@@ -21,7 +21,7 @@ fn slide(dx: f32) -> Scene {
     }
     s.textures.push(Texture { width: 2048, height: 2048, format: TexFormat::R8, data: atlas });
     let glyphs = (0..20).map(|k| Glyph { d_offset: [k as f32 * 22.0, 0.0], atlas_uv: [k as f32 * 24.0, 0.0, 22.0, 30.0], bearing: [0.0, 24.0] }).collect();
-    s.glyph_batches.push(GlyphBatch { atlas: 0, runs: vec![GlyphRun { origin: [dx + 80.0, 90.0], color: [0.0, 0.0, 0.0, 1.0], glyphs }] });
+    s.glyph_batches.push(GlyphBatch { atlas: 0, runs: vec![GlyphRun { origin: [dx + 80.0, 90.0], color: [0.0, 0.0, 0.0, 1.0], glyphs, turn: None }] });
     s
 }
 

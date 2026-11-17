@@ -76,6 +76,10 @@ pub struct WindowSceneState {
     pub path_nodes:      HashMap<u32, PathParams>,
     pub glyph_run_nodes: HashMap<u32, GlyphRunParams>,
     pub fill_nodes:      HashMap<u32, FillParams>,
+    /// Glyph runs drawn turned (`ATRIUM_TEXT_GLYPH_TURN`), by node id; an
+    /// entry counts only while that node is a glyph run, and setting the
+    /// run again removes it (upright again).
+    pub glyph_turns:     HashMap<u32, [f32; 4]>,
     /// Groups (fresco-scene-groups.md); see `command::groups`.
     pub group_nodes:     HashMap<u32, fresco_protocol::GroupParams>,
     /// Where placed leaves sit (a group's own place is in its params).
@@ -1314,9 +1318,9 @@ impl EnvelopeFrontend {
             .map_err(|_| DispatchError::BadPayload)?;
         let writer = self.current_client;
         /* A node that would pass the client's budget is not applied
-         * (crate::budget). FILL_TRANSFORM and PLACE change a node that is
+         * (crate::budget). FILL_TRANSFORM, GLYPH_TURN and PLACE change a node that is
          * there already and add nothing that grows. */
-        let charged = !matches!(p.op_id, scene_ops::ATRIUM_CORE_FILL_TRANSFORM | scene_ops::ATRIUM_CORE_PLACE);
+        let charged = !matches!(p.op_id, scene_ops::ATRIUM_CORE_FILL_TRANSFORM | scene_ops::ATRIUM_CORE_PLACE | scene_ops::ATRIUM_TEXT_GLYPH_TURN);
         let bytes = crate::budget::node_bytes(p.params.len());
         if charged {
             if let Err(refusal) = self.admit_node(writer, win_id, p.node_id, bytes) {
@@ -1341,6 +1345,7 @@ impl EnvelopeFrontend {
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.glyph_turns.remove(&p.node_id);
                 s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_TEXTURE => {
@@ -1351,6 +1356,7 @@ impl EnvelopeFrontend {
                 s.rect_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.glyph_turns.remove(&p.node_id);
                 s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_PATH => {
@@ -1361,6 +1367,7 @@ impl EnvelopeFrontend {
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.glyph_turns.remove(&p.node_id);
                 s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
@@ -1368,6 +1375,7 @@ impl EnvelopeFrontend {
                     .map_err(|_| DispatchError::BadPayload)?;
                 s.leaf_replaces(p.node_id);
                 s.glyph_run_nodes.insert(p.node_id, inner);
+                s.glyph_turns.remove(&p.node_id);
                 s.rect_nodes.remove(&p.node_id);
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
@@ -1386,6 +1394,7 @@ impl EnvelopeFrontend {
                 s.texture_nodes.remove(&p.node_id);
                 s.path_nodes.remove(&p.node_id);
                 s.glyph_run_nodes.remove(&p.node_id);
+                s.glyph_turns.remove(&p.node_id);
             }
             scene_ops::ATRIUM_CORE_FILL_TRANSFORM => {
                 let t: FillTransformParams = decode(&p.params)
@@ -1396,6 +1405,20 @@ impl EnvelopeFrontend {
                 f.transform = t.transform;
                 f.opacity = t.opacity;
                 f.clip = t.clip;
+            }
+            scene_ops::ATRIUM_TEXT_GLYPH_TURN => {
+                let t: fresco_protocol::GlyphTurnParams = decode(&p.params)
+                    .map_err(|_| DispatchError::BadPayload)?;
+                t.validate().map_err(|_| DispatchError::BadPayload)?;
+                /* Only an existing glyph run turns. */
+                if !s.glyph_run_nodes.contains_key(&p.node_id) {
+                    return Err(DispatchError::BadPayload);
+                }
+                if t.turn == fresco_protocol::GlyphTurnParams::UPRIGHT {
+                    s.glyph_turns.remove(&p.node_id);
+                } else {
+                    s.glyph_turns.insert(p.node_id, t.turn);
+                }
             }
             scene_ops::ATRIUM_CORE_GROUP => {
                 let g: fresco_protocol::GroupParams = decode(&p.params)
@@ -1704,6 +1727,7 @@ impl EnvelopeFrontend {
         s.leaf_replaces(p.node_id);
         s.node_ledger.charge(p.node_id, writer, bytes);
         s.glyph_run_nodes.insert(p.node_id, run);
+        s.glyph_turns.remove(&p.node_id);
         s.rect_nodes.remove(&p.node_id);
         s.texture_nodes.remove(&p.node_id);
         s.path_nodes.remove(&p.node_id);
@@ -2505,6 +2529,47 @@ mod tests {
         let (uploads, _) = f.take_pending_uploads();
         assert!(!uploads.iter().any(|u|
             matches!(u, UploadRequest::TextureRegion { slot_id: 9, .. })));
+    }
+
+    #[test]
+    fn glyph_runs_turn_and_setting_them_again_puts_them_upright() {
+        use fresco_protocol::{GlyphInstance, GlyphTurnParams};
+        let mut f = fixture();
+        let set = |f: &mut EnvelopeFrontend, node_id: u32, op_id: u32, params: Vec<u8>| {
+            let outer = SceneNodeSetPayload { node_id, op_id, params };
+            f.dispatch(&msg(control::OP_SCENE_NODE_SET, 0, encode(&outer).unwrap()), 1)
+        };
+        let run = GlyphRunParams {
+            x: 10.0, y: 20.0, atlas_slot_id: 7, atlas_width: 64, atlas_height: 64,
+            r: 0.0, g: 0.0, b: 0.0, a: 1.0,
+            glyphs: vec![GlyphInstance { dx: 0.0, dy: 0.0, atlas_u: 0, atlas_v: 0, atlas_w: 4, atlas_h: 8, bearing_x: 0.0, bearing_y: 7.0 }],
+        };
+        let quarter = GlyphTurnParams { turn: [0.0, 1.0, -1.0, 0.0] };
+        // Only a glyph run turns.
+        assert!(set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&quarter).unwrap()).is_err());
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_RUN, encode(&run).unwrap()).expect("run");
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&quarter).unwrap()).expect("turn");
+        assert_eq!(f.window_state(0).unwrap().glyph_turns.get(&3), Some(&quarter.turn));
+        // Refused: not invertible, past the bound, NaN; the turn stays.
+        for t in [[0.0; 4], [1.0, 2.0, 2.0, 4.0], [65.0, 0.0, 0.0, 1.0], [f32::NAN, 0.0, 0.0, 1.0]] {
+            assert!(set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&GlyphTurnParams { turn: t }).unwrap()).is_err(), "{t:?}");
+        }
+        assert_eq!(f.window_state(0).unwrap().glyph_turns.get(&3), Some(&quarter.turn));
+        // Set again: upright. Turned back to the identity: no entry.
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_RUN, encode(&run).unwrap()).expect("run again");
+        assert!(f.window_state(0).unwrap().glyph_turns.is_empty());
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&GlyphTurnParams::rotation(0.5)).unwrap()).expect("turn");
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&GlyphTurnParams { turn: GlyphTurnParams::UPRIGHT }).unwrap()).expect("upright");
+        assert!(f.window_state(0).unwrap().glyph_turns.is_empty());
+        // The id becoming another kind, or cleared, drops the turn.
+        set(&mut f, 3, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&quarter).unwrap()).expect("turn");
+        let rect = RectParams { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 0.0, g: 0.0, b: 0.0, a: 1.0, radius: 0.0 };
+        set(&mut f, 3, scene_ops::ATRIUM_CORE_RECT, encode(&rect).unwrap()).expect("rect");
+        assert!(f.window_state(0).unwrap().glyph_turns.is_empty());
+        set(&mut f, 4, scene_ops::ATRIUM_TEXT_GLYPH_RUN, encode(&run).unwrap()).expect("run");
+        set(&mut f, 4, scene_ops::ATRIUM_TEXT_GLYPH_TURN, encode(&quarter).unwrap()).expect("turn");
+        f.dispatch(&msg(control::OP_SCENE_NODE_CLEAR, 0, encode(&SceneNodeClearPayload { node_id: 4 }).unwrap()), 1).expect("clear");
+        assert!(f.window_state(0).unwrap().glyph_turns.is_empty());
     }
 
     #[test]

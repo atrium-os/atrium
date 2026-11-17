@@ -1,8 +1,9 @@
 //! fresco-compute — Fresco's 2D renderer as two compute kernels.
 //!
 //! Fresco draws four ops: rounded rects, path segments (rotated rects),
-//! textured quads and glyphs from an R8 coverage atlas, blended src-over into
-//! an sRGB target. This crate draws them with compute alone:
+//! textured quads and glyphs from an R8 coverage atlas (upright, or turned:
+//! rotated text, [`GlyphRun::turn`]), plus filled paths, blended src-over
+//! into an sRGB target. This crate draws them with compute alone:
 //!
 //! 1. `bin.comp`: one invocation per op sets the op's bit in the mask of every
 //!    16x16 tile its bounding box touches. Bit index = op index, so each
@@ -83,6 +84,12 @@ pub const KIND_FILL: u32 = 4;
 pub const KIND_PUSH: u32 = 5;
 /// Blend the newest layer over what was under it (`p3` as its PUSH).
 pub const KIND_POP: u32 = 6;
+/// A glyph under a 2x2 turn (rotated text, [`GlyphRun::turn`]): `p0` is
+/// where the glyph box's top-left corner lands and its size in texels, `p2`
+/// the inverse turn (target offset to texels), `meta[2..4]` the glyph's
+/// top-left texel in the atlas. Drawn bilinear over the glyph's own texels,
+/// on its box grown by half a texel (raster.comp `glyph_xf`).
+pub const KIND_GLYPH_XF: u32 = 7;
 /// How many layers the raster kernel keeps open at once (raster.comp's
 /// `SAVE_LAYER` registers); pack draws isolated groups nested deeper with
 /// multiplied alpha instead.
@@ -172,6 +179,24 @@ pub struct GlyphRun {
     pub origin: [f32; 2],
     pub color: [f32; 4],
     pub glyphs: Vec<Glyph>,
+    /// The run turned about `origin` by `[a, b, c, d]`: a point `(x, y)`
+    /// of the upright run (relative to `origin`) lands at
+    /// `origin + (a x + c y, b x + d y)`. `None` (or the identity) draws
+    /// it upright, as before; one that is not [`turn_ok`] draws nothing.
+    pub turn: Option<[f32; 4]>,
+}
+
+/// Bound on a turn's entries (a turn may scale as well as rotate, but
+/// glyphs are bitmaps at the size they were shaped: turn, do not scale).
+pub const TURN_MAX: f32 = 64.0;
+/// Smallest |determinant| a turn may have (it must be invertible).
+pub const TURN_MIN_DET: f32 = 1.0 / 4096.0;
+
+/// A turn [`Frame::pack`] draws: finite, entries within [`TURN_MAX`],
+/// |det| at least [`TURN_MIN_DET`].
+pub fn turn_ok(t: &[f32; 4]) -> bool {
+    let det = t[0] * t[3] - t[1] * t[2];
+    t.iter().all(|v| v.is_finite() && v.abs() <= TURN_MAX) && det.abs() >= TURN_MIN_DET
 }
 
 /// Runs sharing one atlas: `fresco_vulkan::GlyphRunBatch`.
@@ -517,6 +542,10 @@ fn kind_ops(
         let t = &scene.textures[b.atlas];
         let (aw, ah) = (t.width as f32, t.height as f32);
         b.runs.iter().map(|run| {
+            match run.turn {
+                None | Some([1.0, 0.0, 0.0, 1.0]) => {}
+                Some(m) => return turned_glyphs(run, m, b.atlas as u32),
+            }
             run.glyphs.iter().map(|g| {
                 // As op_glyph_run: bearing_y is baseline-to-top.
                 let x = run.origin[0] + g.d_offset[0] + g.bearing[0];
@@ -533,6 +562,43 @@ fn kind_ops(
         }).collect()
     }).collect();
     (KindOps { rects, paths, fills, quads, runs }, tex, texels, dropped)
+}
+
+/// The ops of a run under turn `m` ([`KIND_GLYPH_XF`], one per glyph);
+/// when `m` is not [`turn_ok`], ops with an empty box (they draw nothing).
+fn turned_glyphs(run: &GlyphRun, m: [f32; 4], atlas: u32) -> Vec<Op> {
+    if !turn_ok(&m) {
+        let none = Op { meta: [KIND_GLYPH_XF, atlas, 0, 0], ..Default::default() };
+        return vec![none; run.glyphs.len()];
+    }
+    let [a, b, c, d] = m;
+    let det = a * d - b * c;
+    let inv = [d / det, -c / det, -b / det, a / det];
+    let at = |x: f32, y: f32| [run.origin[0] + a * x + c * y, run.origin[1] + b * x + d * y];
+    run.glyphs.iter().map(|g| {
+        // The upright box's top-left, relative to the origin (as
+        // op_glyph_run: bearing_y is baseline-to-top).
+        let lx = g.d_offset[0] + g.bearing[0];
+        let ly = g.d_offset[1] - g.bearing[1];
+        let [u, v, w, h] = g.atlas_uv;
+        let p = at(lx, ly);
+        // The box grown by half a texel, where its edges fade.
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (cx, cy) in [(-0.5, -0.5), (w + 0.5, -0.5), (-0.5, h + 0.5), (w + 0.5, h + 0.5)] {
+            let q = at(lx + cx, ly + cy);
+            x0 = x0.min(q[0]);
+            y0 = y0.min(q[1]);
+            x1 = x1.max(q[0]);
+            y1 = y1.max(q[1]);
+        }
+        Op {
+            p0: [p[0], p[1], w, h],
+            p1: run.color,
+            p2: inv,
+            p3: bbox(x0, y0, x1, y1),
+            meta: [KIND_GLYPH_XF, atlas, u.max(0.0) as u32, v.max(0.0) as u32],
+        }
+    }).collect()
 }
 
 fn finish(mut ops: Vec<Op>, mut tex: Vec<[u32; 4]>, texels: Vec<u32>, tex_count: usize, width: u32, height: u32, pitch: u32) -> Frame {

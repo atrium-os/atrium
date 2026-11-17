@@ -318,7 +318,7 @@ impl Compositor<'_> {
                             None => self.glyphs_skipped += 1,
                         }
                     }
-                    runs.push(GlyphRun { origin: [r.x as f32 / PX as f32 * s, (r.y as f32 / PX as f32 - dy) * s], color: rgba(r.rgba), glyphs });
+                    runs.push(GlyphRun { origin: [r.x as f32 / PX as f32 * s, (r.y as f32 / PX as f32 - dy) * s], color: rgba(r.rgba), glyphs, turn: None });
                 }
                 5 => {
                     let im = &self.nsg.images[i];

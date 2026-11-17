@@ -413,6 +413,7 @@ impl SceneState {
                     glyphs: glyphs.iter().map(|g| fc::Glyph {
                         d_offset: g.d_offset, atlas_uv: g.atlas_uv, bearing: g.bearing,
                     }).collect(),
+                    turn: turn_of(n),
                 }
             }).collect();
             scene.glyph_batches.push(fc::GlyphBatch { atlas, runs });
@@ -547,13 +548,13 @@ fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, 
             }, Vec::new()));
         ids.push(*id);
         let glyph_offset = entry.glyphs.len() as i32;
-        entry.nodes.push(GlyphRunNode {
+        entry.nodes.push(turned(GlyphRunNode {
             origin: [p.x, p.y, 0.0, 0.0],
             atlas_dim: [p.atlas_width as f32,
                         p.atlas_height as f32, 0.0, 0.0],
             color: [p.r, p.g, p.b, p.a],
             meta: [p.glyphs.len() as i32, glyph_offset, 0, 0],
-        });
+        }, state.glyph_turns.get(id)));
         for g in &p.glyphs {
             entry.glyphs.push(GlyphInstance {
                 d_offset: [g.dx, g.dy],
@@ -782,6 +783,7 @@ impl SceneState {
                         origin: [n.origin[0], n.origin[1]],
                         color: n.color,
                         glyphs: glyphs.iter().map(|g| fc::Glyph { d_offset: g.d_offset, atlas_uv: g.atlas_uv, bearing: g.bearing }).collect(),
+                        turn: turn_of(n),
                     }
                 }).collect();
                 scene.glyph_batches.push(fc::GlyphBatch { atlas, runs });
@@ -913,7 +915,8 @@ fn grouped_frame_but(
             Item::Quad(w.batches.len() - 1, 0)
         } else if let Some(p) = state.glyph_run_nodes.get(&id) {
             // Glyphs are atlas bitmaps at the size they were shaped: a run
-            // moves with its group but does not scale (§3 step 1).
+            // moves with its group but does not scale (§3 step 1); its own
+            // turn (GLYPH_TURN) is kept as sent.
             let glyphs = p.glyphs.iter().map(|g| GlyphInstance {
                 d_offset: [g.dx, g.dy],
                 atlas_uv: [g.atlas_u as f32, g.atlas_v as f32, g.atlas_w as f32, g.atlas_h as f32],
@@ -922,12 +925,12 @@ fn grouped_frame_but(
             }).collect::<Vec<_>>();
             w.glyph_batches.push(GlyphRunBatch {
                 atlas_slot_id: p.atlas_slot_id,
-                nodes: vec![GlyphRunNode {
+                nodes: vec![turned(GlyphRunNode {
                     origin: [x.x(p.x), x.y(p.y), 0.0, 0.0],
                     atlas_dim: [p.atlas_width as f32, p.atlas_height as f32, 0.0, 0.0],
                     color: [p.r, p.g, p.b, p.a * op],
                     meta: [glyphs.len() as i32, 0, 0, 0],
-                }],
+                }, state.glyph_turns.get(&id))],
                 glyphs,
             });
             Item::Run(w.glyph_batches.len() - 1, 0)
@@ -1285,6 +1288,7 @@ fn viewport(
                     slots.push(p.slot_id);
                 } else if let Some(p) = state.glyph_run_nodes.get(&k) {
                     hash_ser(&mut h, p);
+                    hash_ser(&mut h, &state.glyph_turns.get(&k));
                     slots.push(p.atlas_slot_id);
                 }
             }
@@ -1345,14 +1349,39 @@ fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
             let n = batch.nodes.get(r)?;
             let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
             let mut bx = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+            let [a, b, c, d] = turn_of(n).unwrap_or([1.0, 0.0, 0.0, 1.0]);
             for g in batch.glyphs.get(off..off + count)? {
-                let x = n.origin[0] + g.d_offset[0] + g.bearing[0];
-                let y = n.origin[1] + g.d_offset[1] - g.bearing[1];
-                bx = [bx[0].min(x), bx[1].min(y), bx[2].max(x + g.atlas_uv[2]), bx[3].max(y + g.atlas_uv[3])];
+                let x = g.d_offset[0] + g.bearing[0];
+                let y = g.d_offset[1] - g.bearing[1];
+                let (w, h) = (g.atlas_uv[2], g.atlas_uv[3]);
+                // The glyph box's corners, turned (a turned box is grown by
+                // the half texel its edges fade over).
+                let e = if a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0 { 0.0 } else { 0.5 };
+                for (u, v) in [(x - e, y - e), (x + w + e, y - e), (x - e, y + h + e), (x + w + e, y + h + e)] {
+                    let (px, py) = (n.origin[0] + a * u + c * v, n.origin[1] + b * u + d * v);
+                    bx = [bx[0].min(px), bx[1].min(py), bx[2].max(px), bx[3].max(py)];
+                }
             }
             bx
         }
     })
+}
+
+/// A run's turn (`ATRIUM_TEXT_GLYPH_TURN`) rides in lanes of its
+/// [`GlyphRunNode`] the Vulkan kernel does not read: `meta[2] = 1`, then
+/// `[a, b]` in `origin[2..4]` and `[c, d]` in `atlas_dim[2..4]`.
+fn turned(mut n: GlyphRunNode, turn: Option<&[f32; 4]>) -> GlyphRunNode {
+    if let Some(&[a, b, c, d]) = turn {
+        n.meta[2] = 1;
+        n.origin[2..4].copy_from_slice(&[a, b]);
+        n.atlas_dim[2..4].copy_from_slice(&[c, d]);
+    }
+    n
+}
+
+/// What [`turned`] put in `n`.
+fn turn_of(n: &GlyphRunNode) -> Option<[f32; 4]> {
+    (n.meta[2] == 1).then(|| [n.origin[2], n.origin[3], n.atlas_dim[2], n.atlas_dim[3]])
 }
 
 fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
@@ -1536,6 +1565,66 @@ mod group_tests {
     const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
     const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
     const ID: [f32; 6] = GroupParams::IDENTITY;
+
+    /// A turned glyph run (GLYPH_TURN) draws as fresco-compute draws the
+    /// same run turned, flat or in a group (moved by it, the turn kept).
+    #[test]
+    fn turned_glyph_runs_draw_turned() {
+        let atlas: Vec<u8> = (0..64u32).map(|i| (i * 37 % 251 + 4) as u8).collect();
+        let glyph = fresco_protocol::GlyphInstance { dx: 0.0, dy: 0.0, atlas_u: 2, atlas_v: 1, atlas_w: 4, atlas_h: 6, bearing_x: 1.0, bearing_y: 5.0 };
+        let run = fresco_protocol::GlyphRunParams {
+            x: 20.0, y: 30.0, atlas_slot_id: 9, atlas_width: 8, atlas_height: 8,
+            r: 0.1, g: 0.2, b: 0.9, a: 1.0,
+            glyphs: vec![glyph, fresco_protocol::GlyphInstance { dx: 6.0, ..glyph }],
+        };
+        let turn = [0.8, 0.6, -0.6, 0.8];
+        let want = |dx: f32, dy: f32| {
+            let scene = fresco_compute::Scene {
+                textures: vec![fresco_compute::Texture { width: 8, height: 8, format: fresco_compute::TexFormat::R8, data: atlas.clone() }],
+                glyph_batches: vec![fresco_compute::GlyphBatch { atlas: 0, runs: vec![fresco_compute::GlyphRun {
+                    origin: [20.0 + dx, 30.0 + dy],
+                    color: [0.1, 0.2, 0.9, 1.0],
+                    glyphs: run.glyphs.iter().map(|g| fresco_compute::Glyph {
+                        d_offset: [g.dx, g.dy],
+                        atlas_uv: [g.atlas_u as f32, g.atlas_v as f32, g.atlas_w as f32, g.atlas_h as f32],
+                        bearing: [g.bearing_x, g.bearing_y],
+                    }).collect(),
+                    turn: Some(turn),
+                }] }],
+                ..Default::default()
+            };
+            let mut f = fresco_compute::Frame::pack(&scene, W, W, W);
+            f.header.clear = fresco_compute::TRANSPARENT; // as a window's surface
+            reference::render(&f)
+        };
+        let mut st = SceneState::default();
+        st.slots.insert(9, fresco_compute::Texture { width: 8, height: 8, format: fresco_compute::TexFormat::R8, data: atlas.clone() });
+        let draw = |w: &WindowFrame| reference::render(&st.pack(w, W, W));
+        let mut s = WindowSceneState::new();
+        s.leaf_replaces(1);
+        s.glyph_run_nodes.insert(1, run.clone());
+        s.glyph_turns.insert(1, turn);
+        s.node_writers.insert(1, 1);
+        // Unplaced (an upright run would differ).
+        assert_eq!(draw(&grouped(&s)), want(0.0, 0.0));
+        // In a group moved by (7, -4): moved, still turned.
+        group(&mut s, 100, None, 0, [1.0, 0.0, 0.0, 1.0, 7.0, -4.0], None);
+        place(&mut s, 1, Some(100), 0);
+        assert_eq!(draw(&grouped(&s)), want(7.0, -4.0));
+        // The run's box (for damage and drops) holds every drawn pixel.
+        let w = grouped(&s);
+        let b = item_box(&w, fresco_compute::Node::Run(0, 0)).unwrap();
+        let clear = draw(&WindowFrame { id: 1, size: (W, W), ..Default::default() })[0];
+        let img = draw(&w);
+        for y in 0..W {
+            for x in 0..W {
+                if img[(y * W + x) as usize] != clear {
+                    let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    assert!(cx >= b[0] && cx < b[2] && cy >= b[1] && cy < b[3], "({x}, {y}) outside {b:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn unplaced_leaves_draw_as_a_flat_window() {

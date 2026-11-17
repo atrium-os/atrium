@@ -5,10 +5,14 @@
 //   p0  RECT/TEXTURE/GLYPH: x, y, w, h.  PATH: cx, cy, length, width.
 //       FILL: clip x0, y0, x1, y1
 //   p1  colour, linear RGB, straight alpha (RECT, PATH, GLYPH); PUSH: opacity in x
+//       GLYPH_XF: where the glyph box's top-left lands, its size in texels
 //   p2  RECT: radius.  PATH: cos, sin.  GLYPH: atlas u0, v0, u1, v1
+//       GLYPH_XF: the inverse of its 2x2 turn, target offset -> texels:
+//       lx = p2.x dx + p2.y dy, ly = p2.z dx + p2.w dy
 //   p3  bounding box x0, y0, x1, y1 in whole pixels (x1/y1 exclusive); also
 //       the op's clip: raster draws nothing outside it
-//   p4  as uint bits: kind, texture index (FILL: its block's first texel word), 0, 0
+//   p4  as uint bits: kind, texture index (FILL: its block's first texel word),
+//       0, 0 (GLYPH_XF: the glyph's top-left texel u, v in the atlas)
 // The buffers are flat arrays indexed by hand: the Tier-2 frontend takes a
 // dynamic index only as the last step into a runtime array.
 //
@@ -46,6 +50,8 @@ float clamp_(float v, float lo, float hi) { return v >= lo ? (v <= hi ? v : hi) 
 #define KIND_PUSH    5u
 #define KIND_POP     6u
 #define ISOLATE_DEPTH 4u
+// A glyph drawn under a 2x2 turn (rotated text): see glyph_xf in raster.comp.
+#define KIND_GLYPH_XF 7u
 
 #define TILE 16u
 

@@ -343,7 +343,7 @@ pub fn nodes(deck: &Deck, deck_key: u64, items: &[DrawItem], at: Place, scale: f
                             let Some(face) = faces.and_then(|fs| fs.get(r.face as usize)) else { continue };
                             let (x, y) = draw::apply(&m, r.x as f64, r.y as f64);
                             let run: Vec<PGlyph> = r.glyphs.iter().map(|g| PGlyph { id: g.id, dx: (g.x as f64 * s) as f32, dy: (g.dy as f64 * s) as f32 }).collect();
-                            out.push(Node::Glyphs { origin: Point::new(x as f32, y as f32), face: face.clone(), size: (r.size as f64 * s) as f32, color: rgb(r.color), glyphs: Arc::from(run) });
+                            out.push(Node::Glyphs { origin: Point::new(x as f32, y as f32), face: face.clone(), size: (r.size as f64 * s) as f32, color: rgb(r.color), glyphs: Arc::from(run), turn: None });
                         }
                         Item::Rect { x, y, w, h, color } => {
                             let (px, py) = draw::apply(&m, *x as f64, *y as f64);

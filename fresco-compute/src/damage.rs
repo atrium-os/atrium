@@ -7,7 +7,7 @@
 //! buffer holds re-rasters only the tiles whose signature changed.
 //! [`rects`] groups the dirty tiles into a few rectangles to dispatch.
 
-use crate::{Frame, KIND_FILL, KIND_GLYPH, KIND_TEXTURE, TILE};
+use crate::{Frame, KIND_FILL, KIND_GLYPH, KIND_GLYPH_XF, KIND_TEXTURE, TILE};
 
 const K: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -65,7 +65,7 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
         } else {
             oh = hash_words(oh, &o.meta);
         }
-        if o.meta[0] == KIND_TEXTURE || o.meta[0] == KIND_GLYPH {
+        if o.meta[0] == KIND_TEXTURE || o.meta[0] == KIND_GLYPH || o.meta[0] == KIND_GLYPH_XF {
             oh = mix(oh, tex_hash.get(o.meta[1] as usize).copied().unwrap_or(0));
         }
         if o.meta[0] == KIND_FILL {

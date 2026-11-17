@@ -857,9 +857,13 @@ impl Surface for FrescoSurface {
                 let (x, y, w, h) = self.place_rect(id.0, node, group, order, *rect);
                 self.conn.scene_node_texture(id.0, fresco_protocol::TextureParams { x, y, w, h, slot_id: slot })?;
             }
-            Node::Glyphs { origin, face, size, color, glyphs } => {
+            Node::Glyphs { origin, face, size, color, glyphs, turn } => {
                 let params = self.glyph_run(*origin, face, *size, *color, glyphs)?;
                 self.conn.scene_node_glyph_run(id.0, params)?;
+                // A turn is unitless: the same at every scale.
+                if let Some(t) = turn.filter(|t| *t != fresco_protocol::GlyphTurnParams::UPRIGHT) {
+                    self.conn.scene_node_glyph_turn(id.0, t)?;
+                }
             }
             Node::Stack { .. } | Node::Scroll { .. } => return self.set_group(id, node, group, order),
         }

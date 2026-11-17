@@ -164,6 +164,37 @@ GlyphRunParams nodes follow the same per-window lifecycle as RectParams / Textur
 
 A node_id can switch op_ids freely (a node that was a rect can become a glyph_run, displacing it from the rect_nodes map).
 
+### 3.5 Turned runs (rotated text): `GLYPH_TURN` (0x2001)
+
+Added 2026-11-17 for text inside rotated shapes (Officina Write and Slides).
+`OP_SCENE_NODE_SET { op_id: 0x2001, node_id, params: GlyphTurnParams { turn: [a, b, c, d] } }`,
+sent with the id of an existing glyph run (a `GLYPH_RUN` node or an
+`OP_TEXT_RUN_INSTALL` one), after it in the same frame, turns the run about its
+origin `(x, y)`: a point of the upright run at `(x + u, y + v)` is drawn at
+`(x + a u + c v, y + b u + d v)` (window pixels, y down). A clockwise rotation
+by θ is `[cos θ, sin θ, -sin θ, cos θ]` (`GlyphTurnParams::rotation`).
+
+- Refused (`BadPayload`) for a node that is not a glyph run, a non-finite
+  entry, an entry past ±64, or |det| < 1/4096. Not charged to the scene budget
+  (it changes a node that is there, like `FILL_TRANSFORM`).
+- Setting the run again (or the id becoming another kind, or cleared) puts it
+  upright; the identity turn does too. So a client that turns a run re-sends
+  the turn with each re-set of the run.
+- The glyphs stay the atlas bitmaps they were shaped as: shape at the size the
+  text is shown, then turn. A turn may scale, but the glyphs blur.
+- In a group, a turned run moves with the group and is not scaled by it, as an
+  upright run; the turn is not changed by the group either (groups are
+  translate + uniform scale only, fresco-scene-groups.md §2.1).
+- Drawn by the compute renderer on every executor (reference, Tier-2, GIR,
+  RDNA4) as `KIND_GLYPH_XF` (fresco-compute `raster.comp` `glyph_xf`): each
+  glyph is a box turned by the run's turn, sampled bilinear over the glyph's own
+  texels only, its edges fading over half a texel, never picking up atlas
+  neighbours. A quarter turn about a whole-pixel origin is exactly the upright
+  run turned (fresco-compute `tests/turned_text.rs`). The Vulkan dev renderer
+  (`FRESCOD_RENDERER=vulkan`, lavapipe) draws turned runs upright.
+- Pergola: `Node::Glyphs { turn: Some([a, b, c, d]), .. }` (`pergola::node::turn_by(radians)`);
+  fresco-client: `Connection::scene_node_glyph_turn(node_id, turn)`.
+
 ---
 
 ## 4. SPIR-V bundle structure

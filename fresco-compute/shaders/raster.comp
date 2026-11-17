@@ -209,6 +209,57 @@ vec4 fill_shade(vec4 c, vec4 color, uint b, vec2 pc) {
     return vec4(lin, ga * color.a * cov);
 }
 
+// A turned glyph (KIND_GLYPH_XF): the pixel centre mapped back into the
+// glyph's texels by the inverse turn in p2, then bilinear over the glyph's
+// own texels only (zero outside them), so its edges fade over half a texel
+// whatever the angle and never pick up a neighbour in the atlas. Drawn on
+// the glyph box grown by half a texel each side.
+float glyph_texel(uvec4 t, uint u, uint v, int gw, int gh, int x, int y) {
+    if (x < 0 || y < 0 || x >= gw || y >= gh) {
+        return 0.0;
+    }
+    return texel(t, int(u) + x, int(v) + y).r;
+}
+
+vec4 glyph_xf(vec4 p0, vec4 p1, vec4 p2, uvec4 meta, vec2 pc) {
+    vec2 d = pc - p0.xy;
+    float lx = p2.x * d.x + p2.y * d.y;
+    float ly = p2.z * d.x + p2.w * d.y;
+    if (!(lx >= -0.5 && lx < p0.z + 0.5 && ly >= -0.5 && ly < p0.w + 0.5)) {
+        return vec4(0.0);
+    }
+    uint ti = meta.y;
+    if (ti >= F.tex_count) {
+        return vec4(0.0);
+    }
+    uvec4 t = uvec4(texw[ti * 4u], texw[ti * 4u + 1u], texw[ti * 4u + 2u], texw[ti * 4u + 3u]);
+    if (t.y == 0u || t.z == 0u || t.y > MAX_TEX_DIM || t.z > MAX_TEX_DIM) {
+        return vec4(0.0);
+    }
+    float fw = clamp_(p0.z, 0.0, float(MAX_TEX_DIM));
+    float fh = clamp_(p0.w, 0.0, float(MAX_TEX_DIM));
+    int gw = int(fw);
+    int gh = int(fh);
+    uint u = min(meta.z, MAX_TEX_DIM);
+    uint v = min(meta.w, MAX_TEX_DIM);
+    float tx = lx - 0.5;
+    float ty = ly - 0.5;
+    float flx = floor(tx);
+    float fly = floor(ty);
+    float ax = tx - flx;
+    float ay = ty - fly;
+    int x = int(clamp_(flx, -1.0, fw));
+    int y = int(clamp_(fly, -1.0, fh));
+    float c00 = glyph_texel(t, u, v, gw, gh, x, y);
+    float c10 = glyph_texel(t, u, v, gw, gh, x + 1, y);
+    float c01 = glyph_texel(t, u, v, gw, gh, x, y + 1);
+    float c11 = glyph_texel(t, u, v, gw, gh, x + 1, y + 1);
+    float a = c00 + ax * (c10 - c00);
+    float b = c01 + ax * (c11 - c01);
+    float cov = a + ay * (b - a);
+    return vec4(p1.rgb, p1.a * cov);
+}
+
 vec4 shade(uint oi, vec2 pc) {
     uint base = oi * OP_VEC4S;
     vec4 p0 = opv[base];
@@ -235,6 +286,9 @@ vec4 shade(uint oi, vec2 pc) {
             return p1;
         }
         return vec4(0.0);
+    }
+    if (kind == KIND_GLYPH_XF) {
+        return glyph_xf(p0, p1, p2, meta, pc);
     }
     if (!inside(p0, pc)) {
         return vec4(0.0);

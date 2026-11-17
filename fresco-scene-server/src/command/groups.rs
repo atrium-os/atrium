@@ -164,6 +164,7 @@ impl WindowSceneState {
         self.texture_nodes.remove(&id);
         self.path_nodes.remove(&id);
         self.glyph_run_nodes.remove(&id);
+        self.glyph_turns.remove(&id);
         self.fill_nodes.remove(&id);
         self.placements.remove(&id);
         self.group_nodes.insert(id, g);
@@ -236,6 +237,7 @@ impl WindowSceneState {
         self.texture_nodes.remove(&id);
         self.path_nodes.remove(&id);
         self.glyph_run_nodes.remove(&id);
+        self.glyph_turns.remove(&id);
         self.fill_nodes.remove(&id);
         self.group_nodes.remove(&id);
         self.placements.remove(&id);

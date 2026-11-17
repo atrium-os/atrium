@@ -130,12 +130,20 @@ pub enum Node {
     /// or any shaper), rastered by the app into its atlas
     /// ([`crate::glyphs`]). `origin` is the pen's start on the baseline;
     /// absolutely positioned, layout doesn't move it.
+    ///
+    /// `turn`: the run drawn turned about `origin` (rotated text, Fresco's
+    /// GLYPH_TURN): a point `(u, v)` from the origin of the upright run
+    /// lands at `origin + (a u + c v, b u + d v)` for `[a, b, c, d]`, y
+    /// down. [`turn_by`] gives a clockwise rotation. `None` is upright.
+    /// Glyph offsets stay along the upright baseline; shape at the size
+    /// shown and turn, do not scale with it.
     Glyphs {
         origin: crate::geom::Point,
         face: crate::glyphs::Face,
         size: f32,
         color: Color,
         glyphs: std::sync::Arc<[crate::glyphs::Glyph]>,
+        turn: Option<[f32; 4]>,
     },
     /// A filled path (Fresco's FILL: curves, even-odd or non-zero, solid
     /// or gradient paint, its own affine and clip), in the node's group's
@@ -144,6 +152,27 @@ pub enum Node {
     Fill(std::sync::Arc<fresco_protocol::FillParams>),
     /// A bitmap drawn into `rect` ([`Image`]); uploaded once per window.
     Image { rect: Rect, image: Image },
+}
+
+/// A [`Node::Glyphs`] turn rotating the run clockwise on screen by
+/// `radians` about its origin.
+pub fn turn_by(radians: f32) -> [f32; 4] {
+    let (s, c) = radians.sin_cos();
+    [c, s, -s, c]
+}
+
+/// The box around `r` turned by `t` about `o`.
+fn turned_bounds(r: Rect, o: crate::geom::Point, t: &[f32; 4]) -> Rect {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let (l, tp, rt, b) = (r.origin.x - o.x, r.origin.y - o.y, r.origin.x + r.size.w - o.x, r.origin.y + r.size.h - o.y);
+    for (u, v) in [(l, tp), (rt, tp), (l, b), (rt, b)] {
+        let (x, y) = (o.x + t[0] * u + t[2] * v, o.y + t[1] * u + t[3] * v);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
 }
 
 /// RGBA8 (sRGB, straight alpha) pixels, named by a process-wide id so a
@@ -317,9 +346,13 @@ impl Node {
             // plus one em for the last glyph.
             Node::Fill(p) => fill_bounds(p),
             Node::Image { rect, .. } => *rect,
-            Node::Glyphs { origin, size, glyphs, .. } => {
+            Node::Glyphs { origin, size, glyphs, turn, .. } => {
                 let end = glyphs.iter().map(|g| g.dx).fold(0.0f32, f32::max) + size;
-                Rect::new(origin.x, origin.y - 0.8 * size, end, 1.05 * size)
+                let up = Rect::new(origin.x, origin.y - 0.8 * size, end, 1.05 * size);
+                match turn {
+                    Some(t) => turned_bounds(up, *origin, t),
+                    None => up,
+                }
             }
         }
     }

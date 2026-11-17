@@ -12,7 +12,7 @@ fn rect(x: f32, y: f32, c: f32) -> Rect {
 
 fn run(x: f32, glyphs: usize) -> GlyphRun {
     let g = Glyph { d_offset: [0.0, 0.0], atlas_uv: [0.0, 0.0, 4.0, 4.0], bearing: [0.0, 4.0] };
-    GlyphRun { origin: [x, 20.0], color: [0.0, 0.0, 0.0, 1.0], glyphs: vec![g; glyphs] }
+    GlyphRun { origin: [x, 20.0], color: [0.0, 0.0, 0.0, 1.0], glyphs: vec![g; glyphs], turn: None }
 }
 
 fn atlas() -> Texture {

@@ -123,8 +123,11 @@ fn check(name: &str, scene: &fc::Scene, w: u32, h: u32) -> Option<Stats> {
 
 #[test]
 fn matches_vulkan_renderer() {
-    // The Vulkan renderer has no filled paths.
-    let scene = fc::Scene { fills: Vec::new(), ..kernels::scene() };
+    // The Vulkan renderer has no filled paths and no turned glyph runs.
+    let mut scene = fc::Scene { fills: Vec::new(), ..kernels::scene() };
+    for b in &mut scene.glyph_batches {
+        b.runs.retain(|r| r.turn.is_none());
+    }
     let Some(s) = check("ops", &scene, kernels::W, kernels::H) else { return };
     let total = (kernels::W * kernels::H) as usize;
     assert!(s.over2 * 100 <= total, "{} of {total} pixels off by more than 2", s.over2);

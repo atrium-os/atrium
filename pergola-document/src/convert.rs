@@ -265,7 +265,7 @@ pub fn scene_nodes(scene: &Scene, faces: &Faces, images: Images, out: &mut Vec<N
                     }
                 }
                 let glyphs: Arc<[Glyph]> = r.glyphs.iter().map(|&(id, dx, dy)| Glyph { id, dx: px(dx), dy: px(dy) }).collect();
-                out.push(Node::Glyphs { origin, face: face.clone(), size, color: color(r.rgba, cx.alpha(a)), glyphs });
+                out.push(Node::Glyphs { origin, face: face.clone(), size, color: color(r.rgba, cx.alpha(a)), glyphs, turn: None });
             }
             3 => skipped.shadows += 1,
             4 => {

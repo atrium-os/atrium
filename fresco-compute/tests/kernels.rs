@@ -35,6 +35,16 @@ pub fn scene() -> Scene {
                     Glyph { d_offset: [0.0, 0.0], atlas_uv: [0.0, 0.0, 4.0, 8.0], bearing: [0.0, 7.0] },
                     Glyph { d_offset: [5.0, 0.0], atlas_uv: [4.0, 0.0, 4.0, 8.0], bearing: [1.0, 6.0] },
                 ],
+                turn: None,
+            }, GlyphRun {
+                // The same glyphs turned 30 degrees (rotated text).
+                origin: [56.5, 12.25],
+                color: [0.6, 0.1, 0.5, 0.9],
+                glyphs: vec![
+                    Glyph { d_offset: [0.0, 0.0], atlas_uv: [0.0, 0.0, 4.0, 8.0], bearing: [0.0, 7.0] },
+                    Glyph { d_offset: [5.0, 0.0], atlas_uv: [4.0, 0.0, 4.0, 8.0], bearing: [1.0, 6.0] },
+                ],
+                turn: Some([0.8660254, 0.5, -0.5, 0.8660254]),
             }],
         }],
     }

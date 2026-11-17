@@ -547,6 +547,14 @@ impl Connection {
         self.scene_node_set(node_id, scene_ops::ATRIUM_TEXT_GLYPH_RUN, &params)
     }
 
+    /// Turn an existing glyph run about its origin (atrium-text
+    /// GLYPH_TURN op, [`fresco_protocol::GlyphTurnParams`]): rotated text.
+    /// Send it after the run's SET (or text_run_install) in the same
+    /// frame; setting the run again puts it upright.
+    pub fn scene_node_glyph_turn(&mut self, node_id: u32, turn: [f32; 4]) -> io::Result<()> {
+        self.scene_node_set(node_id, scene_ops::ATRIUM_TEXT_GLYPH_TURN, &fresco_protocol::GlyphTurnParams { turn })
+    }
+
     pub fn scene_node_clear(&mut self, node_id: u32) -> io::Result<()> {
         self.send_routable(control::OP_SCENE_NODE_CLEAR,
             &SceneNodeClearPayload { node_id })

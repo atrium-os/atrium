@@ -2092,9 +2092,14 @@ pub mod scene_ops {
     pub const ATRIUM_CORE_PLACE: u32 = 0x1007;
 
     // atrium-text (0x2000..=0x2FFF). M6.1 ships atlas-based glyph runs;
-    // 0x2001..=0x2FFF reserved for future text ops (color-emoji glyph
+    // 0x2002..=0x2FFF reserved for future text ops (color-emoji glyph
     // runs, atlas patch, server-shaped runs).
     pub const ATRIUM_TEXT_GLYPH_RUN: u32 = 0x2000;
+    /// Turns an existing glyph run about its origin (rotated text,
+    /// [`super::GlyphTurnParams`]): sent with the node id of a GLYPH_RUN
+    /// or `OP_TEXT_RUN_INSTALL` node, after it in the same frame. Setting
+    /// the run again puts it upright until it is turned again.
+    pub const ATRIUM_TEXT_GLYPH_TURN: u32 = 0x2001;
 
     // Future engine bundles get their own ranges per spec §3.4.
 }
@@ -2417,6 +2422,51 @@ pub struct GlyphRunParams {
     pub a: f32,
 
     pub glyphs: Vec<GlyphInstance>,
+}
+
+/// Params for `scene_ops::ATRIUM_TEXT_GLYPH_TURN`, sent with the node id
+/// of an existing glyph run: the run drawn turned about its origin `(x, y)`.
+///
+/// `turn = [a, b, c, d]`: a point of the upright run at `(x + u, y + v)`
+/// is drawn at `(x + a u + c v, y + b u + d v)`, in the run's window
+/// pixels (y down). A rotation by `θ` clockwise on screen is
+/// `[cos θ, sin θ, -sin θ, cos θ]`; the identity puts it back upright.
+/// The glyphs stay the bitmaps they were shaped as: shape at the size the
+/// text is shown and turn it, do not use the turn to scale (it may, but
+/// the glyphs blur). Within a group the run moves with the group and is
+/// not scaled by it (as an upright run), and the turn is not either.
+///
+/// Turned glyphs are drawn by the compute renderer (every executor:
+/// Tier-2, RDNA4) with bilinear filtering over each glyph's own texels;
+/// the Vulkan dev renderer (`FRESCOD_RENDERER=vulkan`) draws them upright.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GlyphTurnParams {
+    pub turn: [f32; 4],
+}
+
+impl GlyphTurnParams {
+    /// Bound on each entry.
+    pub const MAX: f32 = 64.0;
+    /// Smallest |determinant| (the turn must be invertible).
+    pub const MIN_DET: f32 = 1.0 / 4096.0;
+    pub const UPRIGHT: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+    /// Turned clockwise on screen by `radians`.
+    pub fn rotation(radians: f32) -> Self {
+        let (s, c) = radians.sin_cos();
+        GlyphTurnParams { turn: [c, s, -s, c] }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let t = &self.turn;
+        if !finite(t) || t.iter().any(|v| v.abs() > Self::MAX) {
+            return Err("glyph turn not finite or past its bound");
+        }
+        if (t[0] * t[3] - t[1] * t[2]).abs() < Self::MIN_DET {
+            return Err("glyph turn not invertible");
+        }
+        Ok(())
+    }
 }
 
 /// One glyph within a `GlyphRunParams`. `dx`/`dy` are the glyph's
