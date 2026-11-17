@@ -46,9 +46,16 @@ psl = "2"
 atrium-links = { path = "../../atrium-links" }
 monstrator = { path = "../../monstrator" }
 
+# Accounts (mail.md §5): every connection is an Arca courier; Arca keeps
+# the password from its own field (KEEP_FOR).
+mail-sync = { path = "../mail-sync" }
+arca-courier = { path = "../../arca/arca-courier" }
+arca-courierd = { path = "../../arca/arca-courierd" }
+arca-store = { path = "../../arca/arca-store" }
+arcad = { path = "../../arca/arcad" }
+
 [dev-dependencies]
 tempfile = "3"
-mail-sync = { path = "../mail-sync" }
 # A stand-in for the token in the signing test.
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
