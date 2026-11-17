@@ -293,7 +293,7 @@ impl Editor {
         }
     }
 
-    fn text(&self, block: usize) -> &str {
+    pub(crate) fn text(&self, block: usize) -> &str {
         self.doc.para(block).map_or("", |p| p.text.as_str())
     }
     fn len(&self, block: usize) -> u32 {

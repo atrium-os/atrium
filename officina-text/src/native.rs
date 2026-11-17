@@ -330,7 +330,7 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
         }
     }
     // Bit 15: a second mask follows (tab stops, table of contents entry).
-    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3;
+    let ext = p.tabs.is_some() as u16 | (p.toc.is_some() as u16) << 1 | (p.section.is_some() as u16) << 2 | (p.section.is_some_and(|x| x.page.is_some()) as u16) << 3 | (p.rtl.is_some() as u16) << 4;
     if ext != 0 {
         m |= 1 << 15;
     }
@@ -423,6 +423,9 @@ pub fn encode_props(w: &mut Writer, p: &ParaProps) {
             encode_page(w, g);
         }
     }
+    if let Some(v) = p.rtl {
+        w.u8(v as u8);
+    }
 }
 
 /// Twips a length may be (±22 inches).
@@ -431,7 +434,7 @@ const MAX_TWIPS: i64 = 31_680;
 pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
     let m = r.u16()?;
     let ext = if m >> 15 != 0 { r.u16()? } else { 0 };
-    if ext >> 4 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
+    if ext >> 5 != 0 || (ext & 8 != 0 && ext & 4 == 0) || (m >> 15 != 0 && ext == 0) {
         return Err(WireError::Invalid("paragraph mask"));
     }
     let on = |i: u32| m & (1 << i) != 0;
@@ -559,6 +562,14 @@ pub fn decode_props(r: &mut Reader) -> Result<ParaProps, WireError> {
         // Bit 3: the section's own page setup follows.
         let page = if ext & 8 != 0 { Some(decode_page(r)?) } else { None };
         p.section = Some(Section { start, columns, gap, rule, page });
+    }
+    // Bit 4: the paragraph's direction.
+    if ext & 16 != 0 {
+        p.rtl = Some(match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::Invalid("direction")),
+        });
     }
     Ok(p)
 }
@@ -1913,6 +1924,16 @@ mod tests {
         assert_eq!(a.note_numbers(), b.note_numbers());
         assert_eq!(a.comments.iter().collect::<Vec<_>>(), b.comments.iter().collect::<Vec<_>>());
         assert_eq!(a.comment_ranges(), b.comment_ranges());
+    }
+
+    #[test]
+    fn paragraph_direction_round_trips() {
+        let mut d = TextDoc::new();
+        let a = d.push_para("שלום", 0, vec![]);
+        d.blocks.update(a, |x| x.as_para_mut().unwrap().props.rtl = Some(true));
+        let r = load(&save_to_vec(&d, &[])).unwrap().doc;
+        assert_eq!(r.para(a).unwrap().props.rtl, Some(true));
+        assert_eq!(r.para(0).unwrap().props.rtl, None);
     }
 
     #[test]

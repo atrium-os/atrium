@@ -207,6 +207,20 @@ pub(crate) mod tests {
         assert!(loaded.report.is_empty(), "{:?}", loaded.report.lines());
     }
 
+    /// A right-to-left paragraph and a left-to-right one say so after a
+    /// round trip.
+    #[test]
+    fn paragraph_direction_round_trips() {
+        let mut d = officina_text::model::TextDoc::new();
+        let a = d.push_para("שלום", 0, vec![]);
+        let b = d.push_para("hello", 0, vec![]);
+        d.blocks.update(a, |x| x.as_para_mut().unwrap().props.rtl = Some(true));
+        d.blocks.update(b, |x| x.as_para_mut().unwrap().props.rtl = Some(false));
+        let (r, _) = super::read(&super::write(&d, Vec::new()).unwrap()).unwrap();
+        let dirs: Vec<Option<bool>> = (0..r.blocks.len()).filter_map(|i| r.para(i)).filter(|p| !p.text.is_empty()).map(|p| p.props.rtl).collect();
+        assert_eq!(dirs, [Some(true), Some(false)]);
+    }
+
     /// A document whose header and footer have paragraphs of their own.
     pub fn margin_sample() -> TextDoc {
         use officina_text::model::Para;

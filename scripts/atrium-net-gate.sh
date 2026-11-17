@@ -196,6 +196,21 @@ n0)
     capmode "$p" && ok "atrium-lease is in capability mode" || fail "atrium-lease not in capability mode"
     capmode "$("$V" 'pgrep -x atrium-net')" && ok "atrium-net is in capability mode" || fail "atrium-net not in capability mode"
 
+    # A lease parser that dies is started again (atrium-net's spawner;
+    # capability mode forbids exec in atrium-net itself), the address kept.
+    old=$("$V" 'pgrep -x atrium-lease')
+    d0=$(stat discover); r0=$(stat request)
+    "$V" "kill -9 $old"
+    i=0; new=""
+    while [ $i -lt 20 ]; do new=$("$V" 'pgrep -x atrium-lease' || true); [ -n "$new" ] && [ "$new" != "$old" ] && break; sleep 1; i=$((i + 1)); done
+    sv=$("$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock")
+    "$V" 'pgrep -f "atrium-net -v" >/dev/null' && [ -n "$new" ] && [ "$new" != "$old" ] && echo "$sv" | grep -q 'lease_restarts=1' && wait_addr 10.88.0.50 5 \
+        && ok "atrium-lease killed: started again (pid $old -> $new), atrium-net running, address kept" || fail "lease restart: old=$old new=$new $sv"
+    u=$("$V" "ps -o user= -p $new")
+    capmode "$new" && [ "$u" = _atrium-lease ] && ok "the new atrium-lease is sandboxed too ($u, capability mode)" || fail "new lease: user $u"
+    i=0; while [ $i -lt 30 ] && [ "$(stat request)" -le "$r0" ]; do sleep 1; i=$((i + 1)); done
+    [ "$(stat discover)" -gt "$d0" ] && [ "$(stat request)" -gt "$r0" ] && wait_addr 10.88.0.50 5 && ok "the new parser leased 10.88.0.50 again (DISCOVER, REQUEST)" || fail "no lease after restart: discover $d0->$(stat discover) request $r0->$(stat request)"
+
     # Renewal at T1 (half the lease).
     i=0; while [ "$(stat renew)" -lt 1 ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done
     [ "$(stat renew)" -ge 1 ] && wait_addr 10.88.0.50 10 && ok "lease renewed at T1, address kept" || fail "no renewal"

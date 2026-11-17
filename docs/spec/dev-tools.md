@@ -1,7 +1,7 @@
 # Developer tools: editors, toolchains, builds and debugging
 
-**Status:** proposal 2026-11-17, waiting for Shankar's review (§13, decisions
-D1–D14). Nothing here is built yet.
+**Status:** accepted 2026-11-17 (Shankar: "yes, accepted", all §13 decisions
+D1–D14 as recommended). Nothing here is built yet; T1 first.
 
 **Asked by Shankar, 2026-11-17:** "we start a workspace, do we need a code
 editor? vim/emacs style text ones or full fledged IDEs like xcode and visual
@@ -32,6 +32,7 @@ Related: [homes.md](homes.md) §5 (workspaces, W1–W9, all built 2026-11-15);
 | Makefiles and build scripts? | `make` is FreeBSD's bmake from the base system; GNU make, CMake, Meson, Ninja, autotools and pkgconf come as packages in the workspace (§4.4). `build.rs`, `Makefile` recipes and `npm` hooks run inside the workspace's jail, which is exactly where untrusted build code should run (§9). |
 | Rust? | A signed Rust toolchain layer for both arches (aarch64 has no official rustup builds), crates fetched by cargo from the workspace, an **Atrium SDK** (published crates, C headers, a sysroot for cross builds) and a `cargo atrium` subcommand for new, run and bundle (§5). |
 | Debuggers? | lldb is already in the base system. Workspaces need a `develop` syscall class with `ptrace` and per-jail unprivileged debugging so a workspace can debug its own processes; a dev app can be **run under the debugger** through portcullisd (§7). |
+| Composing an app out of jailed parts, as the Navigator is? | Its own proposal, [app-composition.md](app-composition.md): system services instead of libraries, `[[workers]]` in the manifest called through the SDK like functions, typed messages, templates and a lint that finds parsers in the wrong process. |
 | Version control? | git as a package in the workspace (a tool, nothing links it); keys stay in Arca behind an SSH agent socket (§8). |
 
 ## 1. What exists today
@@ -69,7 +70,7 @@ Gaps found reading the code (2026-11-17):
    insists on root and `/var/db/pkg` is root's.
 2. **The workspace's syscall class is wrong for a build box.** Its manifest is
    generated with only `network`, so `sysfil_class` makes it `networked` (or `app`
-   with no network). Neither class has `execve`. Shells and compilers work today
+   with no network). Neither class has `fork`, `vfork` or `wait4` (only `terminal` adds them), so a shell can't start a command. Shells and compilers work today
    only because sysfil runs in log mode; switching to deny would break every
    workspace.
 3. **The Terminal can't draw full-screen programs.** `stoa-term` (the emulator
@@ -305,6 +306,42 @@ libraries only (gap 4). Proposed:
   workspaces may honour FreeBSD's per-binary `wxneeded` note.
 - **Sanitizers.** ASan, UBSan and TSan work with FreeBSD's clang; ASan reserves a
   large shadow mapping, so the workspace's address-space limit must allow it.
+
+
+### 4.7 Running a plain Unix binary in the workspace (Shankar, 2026-11-17)
+
+Shankar asked: if someone builds a standard Unix binary, it is already in a
+workspace, so does it just run inside the workspace's sandbox, which has a network
+and other reach?
+
+Yes, and that is deliberate: running what you build is the edit-build-test loop
+(tests, CLI tools, servers on loopback, the debugger). It runs as the workspace's
+uid with exactly the workspace's reach, which is everything the project's own build
+scripts already have:
+
+| It can | It can't |
+|---|---|
+| read and write this workspace's `work` and root, read linked workspaces, use the group object cache | reach the person's home, other workspaces, apps' data, Arca's items |
+| use the workspace's network (`none`, `registries` or `outbound`) | open a window (workspaces have no display, H8) |
+| ask the Arca agent to sign, for keys granted to this workspace (T7) | get a private key, or sign silently where the key asks for a touch |
+
+So the boundary is the workspace, not the program, and the guidance follows from
+that:
+
+- **Running your own code there is fine; running untrusted binaries there means
+  trusting them with that workspace.** One workspace per untrusted project (§9).
+- **Key grants to a workspace are opt-in and per key**, and pushing keys default to
+  "touch per use" or "per session" so a test binary can't push or sign behind the
+  developer's back (T7).
+- **The network is the workspace's setting**; a project that wants its tests
+  offline uses `none` or `registries`.
+- **Using a tool for real work is not running it in the workspace.** A windowed
+  program becomes a dev app (Run, W5) or an installed app. A command-line tool the
+  person wants to use on their own files should likewise become a bundle: a
+  **command bundle** (an `atrium.toml` with `kind = "command"`), installed through
+  Opifex, which Terminal runs in its own jail with only its declared capabilities
+  and with files handed in by the picker or by an app console. Its design is left
+  for a later step (after T5); until then CLI tools are used inside workspaces.
 
 ## 5. Rust
 

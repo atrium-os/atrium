@@ -265,6 +265,9 @@ fn main() {
     let mut looked: Option<(u64, mail_schema::Which, limen::proto::EmbedId)> = None;
     // What became of Open and Save, from their threads.
     let (file_done_tx, file_done) = mpsc::channel::<String>();
+    // One-press unsubscribes (§11.3): each a POST through a fetcher of its
+    // own, on a thread; (message, what came of it) back.
+    let (unsub_tx, unsub_done) = mpsc::channel::<(u64, Result<(), String>)>();
     // The picker up for a Save: its embed, and what it saves.
     let mut saving: Option<(limen::proto::EmbedId, u64, atrium_mail::files::File)> = None;
     // A message the viewer couldn't be asked for, not asked again.
@@ -430,6 +433,22 @@ fn main() {
         }
         while let Ok(note) = file_done.try_recv() {
             mail.file_note(note);
+        }
+        for (msg, url) in mail.take_unsubscribes() {
+            let tx = unsub_tx.clone();
+            std::thread::spawn(move || {
+                let r = match nuntius::launch::open() {
+                    Ok(f) => {
+                        let (mut c, _guard) = f.into_parts();
+                        mail_engine::senders::post(&mut c, &url)
+                    }
+                    Err(e) => Err(format!("no fetcher ({e})")),
+                };
+                let _ = tx.send((msg, r));
+            });
+        }
+        while let Ok((msg, r)) = unsub_done.try_recv() {
+            mail.unsubscribed(msg, r);
         }
         for ask in mail.take_file_asks() {
             match ask.act {

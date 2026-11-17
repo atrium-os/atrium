@@ -101,6 +101,8 @@ pub struct ComposeUi {
     pub asked_attachment: bool,
     /// The Send later choices are showing.
     pub later: bool,
+    /// "Remind me if no reply" (§9, §11.4): days, when on.
+    pub follow_up: Option<u32>,
     pub show_bcc: bool,
     /// The text's first shown line (the wheel moves it).
     pub top: usize,
@@ -475,7 +477,8 @@ impl Composer {
             self.ui.update(|u| u.asked_attachment = true);
             return fail("The message mentions an attachment, but nothing is attached. Press Send again to send it as it is.");
         }
-        match self.engine.send_draft(ui.draft_id, ui.account, &d, When { later, ..When::default() }) {
+        let follow_up = ui.follow_up.map(|d| d as i64 * 86_400);
+        match self.engine.send_draft(ui.draft_id, ui.account, &d, When { later, follow_up, ..When::default() }) {
             Ok(send) => {
                 let label = match later {
                     Some(t) => format!("Sending {}", crate::full_date(t)),
@@ -684,6 +687,13 @@ impl View for ComposeView {
         let later_r = button(ctx, "Send later", false, Box::new(move || c.ui.update(|u| u.later = !u.later)));
         let c = self.c.clone();
         button(ctx, "Discard", false, Box::new(move || c.discard()));
+        // Remind me if nobody replies: off, 3 days, 7 days, off.
+        let c = self.c.clone();
+        let remind = match ui.follow_up {
+            Some(d) => format!("Remind if no reply: {d} days"),
+            None => "Remind me".to_string(),
+        };
+        button(ctx, &remind, false, Box::new(move || c.ui.update(|u| u.follow_up = match u.follow_up { None => Some(3), Some(3) => Some(7), _ => None })));
 
         // The fields.
         let mut y = head;

@@ -4,7 +4,7 @@
 > printing press (*sub prelo*, "in the press"). Atrium's print system.
 
 **Status:** accepted 2026-11-17 (Shankar: all §12 decisions as recommended; D16: a printer
-simulator first, his own printer for R6 and R8). Nothing is built.
+simulator first, his own printer for R6 and R8). R0 and R1 built 2026-11-17 (§11.1).
 **Scope:** how an app prints, how printers are found and added, how a document becomes
 what a printer accepts, how it reaches the printer over the network or USB, what the user
 sees while it prints, and where printer passwords live.
@@ -436,6 +436,97 @@ a company network and the home printer at home, that is not quite enough:
 | R8 | a real printer on the network, by Shankar | a Wi-Fi printer prints from the VM over IPPS, found by mDNS |
 
 R0–R2 need no hardware. R6 and R8 need a real printer (§12 D16).
+
+### 11.1 R0 and R1 as built (2026-11-17)
+
+Crates under `prelum/` (one workspace, Rust, `#![forbid(unsafe_code)]`):
+
+- **`prelum-ipp-codec`**: IPP/2.x encode and decode (RFC 8010), every value
+  type including nested collections; decoding bounded by `Limits` (bytes,
+  attributes, values, depth, groups) before anything is allocated, unknown
+  tags kept as opaque bytes, the extension tag refused. `ops` builds the
+  requests of §6.3 (Get-Printer-Attributes, Validate-Job, Create-Job,
+  Send-Document, Print-Job, Get-Job-Attributes, Cancel-Job, Identify-Printer)
+  with the ticket of §6.3 (copies, sides, colour, media, quality, resolution;
+  page ranges, scaling and layout stay in `prelum-render`) and the job
+  identity of decision 14 (`atrium`, title or "Document", PIN). `printer`
+  turns a printer's answer into checked values: keywords that aren't
+  keywords dropped, lists capped at 256, free text cut to 200 bytes with
+  control and bidi characters removed, state reasons mapped onto a fixed set
+  with their severity, `printer-uuid` accepted only as a UUID, the format
+  choice of §6.2, URF resolutions and back-side rule, and `printer-resolution`
+  sent only when the printer lists it.
+- **`prelum-dnssd`**: the mDNS query (unicast-response bit) and a response
+  parser: compression pointers followed only backwards, at most 16 jumps,
+  names under 255 bytes, at most 256 records; queries refused (the browser
+  answers nobody). `Browser` keeps PTR, SRV, TXT and address records with
+  their TTL (capped at 75 minutes, goodbyes honoured), at most 256 services,
+  256 hosts, 8 addresses each, and gives complete services with the TXT keys
+  of §7.1 cleaned.
+- **`prelum-raster`**: PWG Raster and URF writers that take one row at a time
+  (line repeats up to 256, repeat and literal packets), with the PWG 5102.4
+  header (PageSize, colour space, transforms, PrintQuality, page size name)
+  and the 32-byte URF header; bounded readers for round trips and fuzzing.
+- **`prelum-render`** (R1): the conversion step outside its jail.
+  `render` reads the PDF with Folium, lays the selected pages out on the
+  printer's paper (1, 2 or 4 per sheet; fit, actual size shrunk to fit, or a
+  percentage; a page turned counter-clockwise when its shape matches the
+  paper better, as IPP's `landscape`) and draws each sheet in bands of 256
+  rows with Folium's CPU renderer straight into the PWG or URF writer; the
+  back of a two-sided sheet is drawn mirrored as the printer's
+  `pwg-raster-document-sheet-back` (or URF `DM`) asks and the transform is
+  recorded in the header. Time budget per page; cancellable. `pdf::rewrite`
+  writes the clean PDF of §6.2 with Folium's object writer: one new page per
+  sheet placing the source pages as Form XObjects (the same layout as the
+  raster path), every content stream re-tokenised and written back keeping
+  only PDF's content operators, resources deep-copied with actions,
+  JavaScript, annotations, forms, XFA, attachments, metadata and structure
+  removed (pages, catalogs and the page tree can't be reached through a
+  resource), every stream decoded and written again (Flate; JPEG kept),
+  optional-content settings kept so the same layers print. What it can't
+  carry yet returns `NeedsRaster` and the job is sent as raster: inline
+  images, Type 3 fonts, JPEG 2000, JBIG2 and CCITT images. Font programs are
+  copied after Folium has read them, not re-subset (later).
+
+Measured (release build, one core of the cloud container): an A4 colour
+page with text, shapes and fine lines at 600 dpi takes about 250 ms
+(19.7 MB of PWG Raster for 6 pages); at 300 dpi gray two pages per sheet,
+130 ms a sheet. Rewriting the same 6 pages as PDF: under 10 ms.
+
+Checks:
+
+- Unit tests: 11 (IPP), 7 (mDNS), 6 (raster), 13 (render and rewrite), all
+  passing: round trips, every prefix of a message failing cleanly, bounds,
+  layout positions to the pixel, back-side transforms for each rule, a
+  hostile PDF (open action with JavaScript, attached file, link annotation,
+  page actions, a launch action in a font, an unknown operator) rewritten
+  with none of it left and drawing the same, the rewrite laid out like the
+  raster path for 1, 2 and 4 per sheet.
+- `scripts/prelum-r0-oracle.sh` (RUNBOOK §13.8b) against CUPS's
+  `ippeveprinter`, an independent IPP implementation used only as a test
+  oracle: every operation above accepted with plain successful-ok; its own
+  raster reader (`ippeveps`) decodes our 2-page sRGB PWG Raster and 1-page
+  sGray URF and the pixels are identical to what we drew; Avahi's mDNS
+  answers about both test printers read by our parser into complete
+  services with TXT keys. poppler (`pdftoppm`) reads the rewritten PDF and
+  draws the same pages, the landscape page turned.
+- Fuzzing (cargo-fuzz): five targets (IPP decode with a re-encode round trip, mDNS packets through the browser cache, raster read, raster write/read round trip, PDF rewrite read back by Folium), an hour each; results here when they finish.
+
+Found along the way:
+
+- **Folium draws text in a different typeface when a page is turned a
+  quarter** (`View.rotate` 90 or 270): the same standard-14 text that draws
+  as Liberation Sans/Serif upright comes out in another face turned. Printing
+  a landscape page on portrait paper by raster hits it; the PDF path doesn't
+  (the printer draws the text). For Folium to fix.
+- **Annotations, including filled form fields, are printed by neither path**
+  until Folium draws them (folium.md P3/P5).
+- The URF header's byte layout and the `DM1`–`DM4` back-side reading follow
+  what other AirPrint clients do; `ippeveps` accepted the header, and a real
+  AirPrint printer confirms both at R8.
+
+Next: R2, `prelumd`, `prelum-ipp` with HTTP over the Nuntius stack, the
+`prelum-render` jail binary, `prelumctl print`, against `ippeveprinter`.
 
 ## 12. Decisions, with recommendations
 

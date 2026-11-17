@@ -503,8 +503,17 @@ fn main() {
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
     let mut last_sync = Instant::now();
-    loop {
+    // Closing waits on Save As (true), and Don't Save drops the changes.
+    let mut close_after_save = false;
+    let mut discard = false;
+    'main: loop {
         match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() { 20 } else { 250 }))) {
+            // Unsaved changes: ask first. Asked to close again while asking (or
+            // while picking), the changes stay in the autosave folder.
+            Ok(StepResult::Closed) if run.write.doc.borrow().dirty && !run.write.closing.get() && asking.is_none() => {
+                run.write.closing.set(true);
+                run.write.changed();
+            }
             Ok(StepResult::Closed) | Err(_) => break,
             _ => {}
         }
@@ -526,6 +535,20 @@ fn main() {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
                     }
+                }
+                Cmd::CloseSave => {
+                    if run.save() {
+                        if !run.write.doc.borrow().dirty {
+                            break 'main;
+                        }
+                    } else {
+                        want_picker = Some(Asking::SaveAs);
+                        close_after_save = true;
+                    }
+                }
+                Cmd::CloseDiscard => {
+                    discard = true;
+                    break 'main;
                 }
                 _ => {}
             }
@@ -614,6 +637,10 @@ fn main() {
                 }
                 asking = None;
                 run.write.ui.set(Ui { asking: false });
+                // Saved on the way out: close; cancelled: stay open.
+                if std::mem::take(&mut close_after_save) && !run.write.doc.borrow().dirty {
+                    break 'main;
+                }
             }
         }
         if let Some(ch) = channel.as_mut() {
@@ -643,7 +670,7 @@ fn main() {
     // Closing: a saved document leaves nothing behind; unsaved changes stay in the
     // autosave folder and come back at the next start.
     let d = std::mem::replace(&mut *run.write.doc.borrow_mut(), Doc::new(""));
-    if d.dirty {
+    if d.dirty && !discard {
         let mut d = d;
         if let Some(a) = d.autosave() {
             let _ = a.sync();

@@ -401,6 +401,23 @@ impl ParaLayout {
         }
     }
 
+    /// Where bytes `from..to` of line `li` are drawn, as spans of x (from
+    /// the column's left), left to right: one per stretch that is together
+    /// on screen (a selection across directions is several).
+    pub fn range_spans(&self, li: usize, from: u32, to: u32, text: &str) -> Vec<(i64, i64)> {
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        for (c, l, r, _) in self.visual_clusters(li, text) {
+            if c < from || c >= to {
+                continue;
+            }
+            match out.last_mut() {
+                Some(s) if s.1 == l => s.1 = r,
+                _ => out.push((l, r)),
+            }
+        }
+        out
+    }
+
     /// The byte nearest x in line `li` (x from the column's left), when the
     /// line has right-to-left text; `None` for a left-to-right line, where
     /// the caller's own walk applies.
@@ -466,15 +483,15 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
 
 /// Lays out `p` in a column `width` wide around floating pictures' `bands`.
 pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, bands: &[Band]) -> ParaLayout {
+    let (pf, cf) = doc.styles.para_format(p.style, &p.props);
     // Right-to-left text: levels for the lines' visual order, and the text
     // shaped with brackets mirrored where they sit right to left.
-    let bidi = crate::bidi::levels(&p.text);
-    let rtl = bidi.as_ref().is_some_and(|b| b.1);
+    let bidi = crate::bidi::levels_in(&p.text, pf.rtl);
+    let rtl = bidi.as_ref().map_or(pf.rtl == Some(true), |b| b.1);
     let shape_src: std::borrow::Cow<str> = match &bidi {
         Some((lv, _)) => crate::bidi::mirrored(&p.text, lv).into(),
         None => p.text.as_str().into(),
     };
-    let (pf, cf) = doc.styles.para_format(p.style, &p.props);
     let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
     let mut formats: Vec<CharFormat> = Vec::new();
     let mut glyphs: Vec<Glyph> = Vec::new();
@@ -992,6 +1009,25 @@ mod tests {
     }
 
     #[test]
+    fn a_paragraph_set_right_to_left_starts_at_the_right_even_in_latin() {
+        let f = PinnedFonts::new().unwrap();
+        let mut d = doc("Hello.");
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().props.rtl = Some(true));
+        let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+        assert!(l.rtl);
+        let line = &l.lines[0];
+        assert_eq!(line.x + line.width, 1_000_000);
+        // The full stop is drawn first (leftmost): it sits at the paragraph's level.
+        assert_eq!(l.glyphs[line.visual[0] as usize].cluster, 5);
+        // Set left to right, Hebrew text starts at the left.
+        let mut d = doc("שלום");
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().props.rtl = Some(false));
+        let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+        assert!(!l.rtl);
+        assert_eq!(l.lines[0].x, 0);
+    }
+
+    #[test]
     fn right_to_left_paragraphs_start_at_the_right_in_visual_order() {
         let f = PinnedFonts::new().unwrap();
         let text = "שלום עולם";
@@ -1028,6 +1064,13 @@ mod tests {
         assert!(pos_mem < pos_shin, "{order:?}");
         assert_eq!(order[0], 0);
         assert_eq!(*order.last().unwrap(), (text.len() - 1) as u32);
+        // Selecting "ab " and the Hebrew word's first letter: two stretches,
+        // the letter being the word's rightmost.
+        let lamed = text.find('ל').unwrap() as u32;
+        let spans = l.range_spans(0, 0, lamed, text);
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!(spans[0].0, 0);
+        assert_eq!(spans[1].1, l.caret_x(0, hebrew, text));
         // Every byte the caret can sit at maps to an x and back.
         for (i, _) in text.char_indices() {
             let x = l.caret_x(0, i as u32, text);

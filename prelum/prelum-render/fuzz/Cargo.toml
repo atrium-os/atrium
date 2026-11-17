@@ -1,0 +1,24 @@
+[package]
+name = "prelum-render-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prelum-render = { path = ".." }
+prelum-raster = { path = "../../prelum-raster" }
+folium-doc = { path = "../../../folium-doc" }
+folium-syntax = { path = "../../../folium-syntax" }
+
+# Its own workspace, like every cargo-fuzz crate.
+[workspace]
+
+[[bin]]
+name = "rewrite"
+path = "fuzz_targets/rewrite.rs"
+test = false
+doc = false

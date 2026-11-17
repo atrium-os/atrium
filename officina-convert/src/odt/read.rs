@@ -221,6 +221,11 @@ pub(crate) fn para_props(e: &El) -> ParaProps {
     if let Some(k) = e.attr("fo:keep-together") {
         p.keep_together = Some(k == "always");
     }
+    match e.attr("style:writing-mode") {
+        Some("rl-tb" | "rl" | "tb-rl") => p.rtl = Some(true),
+        Some("lr-tb" | "lr") => p.rtl = Some(false),
+        _ => {}
+    }
     if let Some(b) = e.attr("fo:break-before") {
         p.page_break_before = Some(b == "page");
     }
@@ -366,6 +371,7 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
         toc: over.toc.or(under.toc),
         section: over.section.or(under.section),
+        rtl: over.rtl.or(under.rtl),
     }
 }
 

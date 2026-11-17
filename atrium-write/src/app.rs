@@ -60,6 +60,12 @@ pub enum Cmd {
     /// The password bar's field submitted (to set, or to open a file).
     PasswordDone,
     PasswordClose,
+    /// Closing with unsaved changes: save first (then close).
+    CloseSave,
+    /// Closing with unsaved changes: close without them.
+    CloseDiscard,
+    /// Closing with unsaved changes: keep the window open.
+    CloseCancel,
     Open,
     Save,
     SaveAs,
@@ -68,6 +74,9 @@ pub enum Cmd {
     Redo,
     Toggle(Toggle),
     Align(Align),
+    /// The selected paragraphs' direction: from their text (`None`), left
+    /// to right, right to left.
+    Direction(Option<bool>),
     Style(usize),
     /// The style bar: on the caret paragraph's style.
     StyleOpen,
@@ -451,6 +460,8 @@ pub struct Write {
     /// The styles pane is shown.
     pub pane: Mutable<bool>,
     pub pane_scroll: Mutable<ScrollState>,
+    /// Asking whether to save before the window closes.
+    pub closing: Mutable<bool>,
     pub style_menu: Mutable<MenuState>,
     pub insert_menu: Mutable<MenuState>,
     pub align_menu: Mutable<MenuState>,
@@ -488,7 +499,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -1237,6 +1248,7 @@ impl Write {
                     }
                     Cmd::Toggle(t) => e.toggle(t),
                     Cmd::Align(a) => e.align(a),
+                    Cmd::Direction(d) => e.set_paragraphs("Direction", None, |p| p.rtl = d),
                     Cmd::Style(i) => {
                         // The document's paragraph styles; past them, the style bar.
                         let all = e.para_styles();
@@ -1358,6 +1370,20 @@ impl Write {
                         drop(d);
                         self.ask_password(if protected { "New password (empty removes it)" } else { "Password to protect this document" }, true);
                         return false;
+                    }
+                    Cmd::CloseCancel => {
+                        drop(e);
+                        drop(d);
+                        self.closing.set(false);
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::CloseSave | Cmd::CloseDiscard => {
+                        drop(e);
+                        drop(d);
+                        self.closing.set(false);
+                        self.changed();
+                        return true;
                     }
                     Cmd::PasswordClose => {
                         drop(e);
@@ -1481,14 +1507,15 @@ impl View for Write {
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 10.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
         button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 10.0);
-        let (style_name, cur_align, para_styles) = {
+        let (style_name, cur_align, para_styles, cur_dir) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
             let para_styles = e.para_styles();
             let p = e.doc.para(e.caret.block);
             let name = p.and_then(|p| e.doc.styles.styles.get(p.style as usize)).map(|s| s.name.to_string()).unwrap_or_default();
             let align = p.map(|p| e.doc.styles.para_format(p.style, &p.props).0.align).unwrap_or_default();
-            (name, align, para_styles)
+            let dir = p.and_then(|p| e.doc.styles.para_format(p.style, &p.props).0.rtl);
+            (name, align, para_styles, dir)
         };
         {
             let mut items: Vec<MenuItem> = para_styles.iter().map(|(_, s)| MenuItem::new(&**s).radio(**s == *style_name)).collect();
@@ -1551,10 +1578,16 @@ impl View for Write {
         {
             // Alignment, as a menu (the toolbar has no room for four buttons).
             let all = [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)];
-            let items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == cur_align)).collect();
+            // Then the paragraph's direction (right-to-left scripts).
+            let dirs = [("Direction from Text", None), ("Left to Right", Some(false)), ("Right to Left", Some(true))];
+            let mut items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == cur_align)).collect();
+            for (k, (l, d)) in dirs.iter().enumerate() {
+                let m = MenuItem::new(*l).radio(*d == cur_dir);
+                items.push(if k == 0 { m.separated() } else { m });
+            }
             let now = all.iter().find(|(_, a)| *a == cur_align).map_or("Left", |(l, _)| l);
             let cmds = self.cmds.clone();
-            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Align(all[i.min(3)].1))).at(x, 8.0).width(100.0).render(ctx);
+            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i < 4 { Cmd::Align(all[i].1) } else { Cmd::Direction(dirs[(i - 4).min(2)].1) })).at(x, 8.0).width(100.0).render(ctx);
             x += 108.0;
         }
         let (name, dirty, status, ed) = {
@@ -2079,6 +2112,24 @@ impl View for Write {
             .emit(ctx);
         }
 
+        // Closing with unsaved changes: save them, drop them, or stay.
+        if self.closing.get() {
+            let y = TOOLBAR_H;
+            let back = ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, FIND_H), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let name = self.doc.borrow().name.clone();
+            let ask = format!("Save the changes to “{name}” before closing?");
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, (w - 360.0).max(120.0), 20.0), content: ask, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            Button::secondary("Don't Save").at(w - 324.0, y + 8.0).width(110.0).on_click(push(Cmd::CloseDiscard)).render(ctx);
+            Button::secondary("Cancel").at(w - 206.0, y + 8.0).width(90.0).on_click(push(Cmd::CloseCancel)).render(ctx);
+            Button::primary("Save").at(w - 108.0, y + 8.0).width(96.0).on_click(push(Cmd::CloseSave)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + FIND_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         // Status line: page, pages (≈ while pagination runs), and the last message.
         let sy = h - STATUS_H;
         ctx.add(Node::Rect { rect: Rect::new(0.0, sy, w, STATUS_H), fill: t.bg_surface(), radius: 0.0 });
@@ -2409,6 +2460,52 @@ mod tests {
         assert!(w.doc.borrow().status.starts_with("Normal can't"));
         run(Cmd::StyleClose);
         assert!(!w.style_bar.get_cloned().open);
+    }
+
+    #[test]
+    fn closing_with_changes_asks_first() {
+        let doc = Doc::from_text("letter.txt", b"Dear all,").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        assert!(!texts().iter().any(|s| s.starts_with("Save the changes")));
+        w.closing.set(true);
+        let t = texts();
+        for want in ["Save the changes to “letter.txt” before closing?", "Don't Save", "Cancel", "Save"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        // Cancel stays here; Save and Don't Save go to the window's loop.
+        w.cmds.lock().unwrap().push(Cmd::CloseCancel);
+        assert!(w.take_cmds().is_empty());
+        assert!(!w.closing.get());
+        for c in [Cmd::CloseSave, Cmd::CloseDiscard] {
+            w.closing.set(true);
+            w.cmds.lock().unwrap().push(c);
+            assert_eq!(w.take_cmds(), [c]);
+            assert!(!w.closing.get());
+        }
+    }
+
+    #[test]
+    fn a_paragraph_s_direction_is_set_from_the_menu() {
+        let doc = Doc::from_text("d.txt", "\u{5e9}\u{5dc}\u{5d5}\u{5dd} world\nNext.".as_bytes()).unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        run(Cmd::Direction(Some(true)));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(true));
+        assert_eq!(ed.borrow().doc.para(1).unwrap().props.rtl, None, "only the caret's paragraph");
+        run(Cmd::Direction(Some(false)));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(false));
+        run(Cmd::Direction(None));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, None);
+        run(Cmd::Undo);
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(false));
     }
 
     #[test]

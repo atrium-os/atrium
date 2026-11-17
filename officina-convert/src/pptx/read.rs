@@ -548,6 +548,7 @@ impl<'a> Reader<'a> {
             indent_start: num(e, "marL").map(tw),
             first_line: num(e, "indent").map(tw),
             indent_end: num(e, "marR").map(tw),
+            rtl: e.attr("rtl").map(|v| v == "1" || v == "true"),
             ..Default::default()
         };
         let spacing = |s: &El| -> Option<(bool, i64)> {

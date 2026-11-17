@@ -483,9 +483,18 @@ fn main() {
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
     let mut last_sync = Instant::now();
-    loop {
+    // Closing waits on Save As (true), and Don't Save drops the changes.
+    let mut close_after_save = false;
+    let mut discard = false;
+    'main: loop {
         let busy = atrium_slides::render::decoding() + atrium_slides::render::previewing() > 0 || run.background.is_some();
         match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() || busy { 20 } else { 250 }))) {
+            // Unsaved changes: ask first. Asked to close again while asking (or
+            // while picking), the changes stay in the autosave folder.
+            Ok(StepResult::Closed) if run.slides.doc.borrow().dirty && !run.slides.closing.get() && asking.is_none() => {
+                run.slides.closing.set(true);
+                run.slides.changed();
+            }
             Ok(StepResult::Closed) | Err(_) => break,
             _ => {}
         }
@@ -513,6 +522,20 @@ fn main() {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
                     }
+                }
+                Cmd::CloseSave => {
+                    if run.save() {
+                        if !run.slides.doc.borrow().dirty {
+                            break 'main;
+                        }
+                    } else {
+                        want_picker = Some(Asking::SaveAs);
+                        close_after_save = true;
+                    }
+                }
+                Cmd::CloseDiscard => {
+                    discard = true;
+                    break 'main;
                 }
                 _ => {}
             }
@@ -602,6 +625,10 @@ fn main() {
                 }
                 asking = None;
                 run.slides.ui.set(Ui { asking: false });
+                // Saved on the way out: close; cancelled: stay open.
+                if std::mem::take(&mut close_after_save) && !run.slides.doc.borrow().dirty {
+                    break 'main;
+                }
             }
         }
         if let Some(msg) = run.background.as_ref().and_then(|b| b.poll()) {
@@ -626,7 +653,7 @@ fn main() {
     // Closing: a saved deck leaves nothing behind; unsaved changes stay in the
     // autosave folder and come back at the next start.
     let mut d = std::mem::replace(&mut *run.slides.doc.borrow_mut(), Doc::from_deck(officina_slides::model::Deck::new(), ""));
-    if d.dirty {
+    if d.dirty && !discard {
         if let Some(a) = d.autosave() {
             let _ = a.sync();
         }
