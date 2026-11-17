@@ -312,8 +312,16 @@ load over OCF with per-request keys and refuses to install if the XAES and XChaC
 answers fail; `tessera_keyring.c` is `/dev/tesserakeys` (§4.3; developer builds load keys
 with `tessera-keyload`). The mount looks the key up by `master_key_id` and the uuid, then
 selects the superblock as above; trees open only under the superblock's root tags, and blobs
-are read by opening the pack front from its own sectors against the registry's tag. Sealed
-mounts are read-only until the sealed write path exists (scripts/tessera-sealed-vm.sh).
+are read by opening the pack front from its own sectors against the registry's tag.
+Sealed mounts are read-write: packs are built sealed (registry values are 80 bytes, the
+entry then the front's tag; one contiguous extent, no sealed PEL), every commit copies each
+tree's root tag into the superblock and seals a copy of it, the journal's ROOT_UPDATE carries
+the root tags, and each commit (and a clean unmount) moves the journal to a fresh anchor
+written in the superblock before the checkpoint. A journal that does not open under the
+superblock's anchor (a crash between that superblock write and the checkpoint) is
+reformatted by a writable mount: the superblock already holds all of it. Garbage
+collection, repacking, snapshots and the dead-extent log are off on sealed volumes for now
+(scripts/tessera-sealed-vm.sh covers write, remount and crash replay).
 
 ### 5.3 Metadata blocks
 
