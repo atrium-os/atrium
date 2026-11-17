@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1161,7 +1161,45 @@ Stalwart in the cloud VM, and later a real account):
    places (homes.md W4: today it shows sticks and shares), attachment text from PDFs and
    office files, and a VM run with limend, Scrinium and portcullisd.
 7. **M6** search, smart folders, unsubscribe, newsletter lane, screener, snooze, follow-up,
-   notifications.
+   notifications. **Built 2026-11-18 on the host.** **Search** (§11.2): our own inverted
+   index in the store's redb (no tantivy), over from, to, subject, text, file names and
+   attachment text, each term with the fields it is in; operators `from:` `to:`
+   `subject:` `filename:` `has:attachment` `is:unread` `is:flagged` `in:` `before:`
+   `after:` `larger:` `smaller:`; the last word matches word starts while typing. In the
+   window `/` (or the sidebar's search box) takes the keys, results from every folder come
+   as you type, Enter or Down go to them, Escape clears then closes; a result is read and
+   archived where it was found; *Save* keeps it as a place under *Saved searches*.
+   **Lists** (§11.3): the best unsubscribe from `List-Unsubscribe` (RFC 8058 one press,
+   else `mailto:`, else web); one press is a POST through a Nuntius fetcher of its own;
+   `mailto:` opens a filled message to send; web goes to the link bar. Then "Block future
+   mail from this list": later ones go to Trash on arrival. **Arrival rules** in the
+   engine run on mail new to the index: addresses written to (from Sent), list mail into
+   the newsletter lane, blocked lists, the screener, Later. **Newsletters** view: list
+   mail from senders not written to, every folder. **Screener**: when on, someone new
+   (not written to, accepted, or heard from before it was on) is held under *New
+   senders*, local only; *Accept* releases their mail and lets later mail through,
+   *Refuse* keeps it under *Screened out*; off releases everything. **Later** (§11.4): `l`
+   opens a sheet (Reply, Read, Do, Waiting; this evening, tomorrow morning, this weekend,
+   next week, someday, keys 1–5); the conversation leaves the inbox (held locally),
+   `\Flagged` goes to the server, and it comes back at its time; a reply sent closes a
+   *Reply* item, an answer closes a *Waiting* one, mail to the person from a person
+   brings it back at once and list mail waits with it; setting it again counts as pushed
+   back (shown from 3); `d` is Done; the *Later* view lists items soonest first and
+   overdue ones colour the sidebar count. **Follow-up**: *Remind me* in compose (3 or 7
+   days) makes a *Waiting* item when the sent copy reaches Sent. **Notifications**
+   (§12, §12.1) through Praeco's v0 post: fresh mail (10 min) from a person or in a
+   conversation the person wrote in, one by one; lists and automated mail counted only;
+   more than 2 in 30 s grouped; older mail after a gap one silent summary replacing the
+   last; nothing for a first sync; withdrawn when read elsewhere; the Later review once a
+   day after 09:00 ("1 due today, 2 overdue"). Store schema 6. Tests: index and query
+   language, saved searches, list rules and screener, Later rules and follow-up,
+   notification rules, and window tests for search, unsubscribe/block/screener and Later.
+   **Not yet**: a settings page (screener switch, review time, quiet hours, sounds,
+   VIPs), times in the person's time zone (UTC for now), Later notes typed in the sheet,
+   the weekly look and the 7/30-day overdue rules, `$Snoozed` and a server *Snoozed*
+   folder, quick filters and grouping (§11.7), server-side search outside the offline
+   window, Praeco's longer posts and event times (tabula.md §5.3–5.4, so freshness uses
+   the message's date), notification actions, and a VM run.
 8. **M7** S/MIME with Sigillum tokens and Arca certificates; JMAP; OAuth (Microsoft first).
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
