@@ -130,7 +130,9 @@ under §6's rules.
   class after-first-unlock, once Tessera's at-rest encryption exists (tessera-fs.md flag
   `ENCRYPTED`, the same prerequisite as trusted sticks, device-assignment.md §4.6). Until
   then a persona volume is a separate Tessera volume with its own quota and group, without
-  crypto-erase.
+  crypto-erase. Design proposed 2026-11-17 in [tessera-encryption.md](tessera-encryption.md):
+  a persona's folders are encrypted domains on the internal Tessera volume, one key group
+  per persona (and one for Personal), not a partition of their own.
 - **Removing a persona** (Curia, with user verification): its instances stop, their
   overlays and workspaces are deleted, its Arca persona and volume key are destroyed, its
   devices are unbound (their data becomes unreadable here; Curia says so and lists them

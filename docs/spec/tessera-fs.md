@@ -99,12 +99,12 @@ Constants:
 
 | bit | name              | meaning |
 | --- | ----------------- | --- |
-|  0  | `ENCRYPTED`       | Volume is at-rest encrypted. Requires session unlock at mount. |
+|  0  | `ENCRYPTED`       | Volume is at-rest encrypted (informational; the mount gate is incompat bit 1 `SEALED`). Proposed design: [tessera-encryption.md](tessera-encryption.md). |
 |  1  | `MULTI_LEVEL_MFT` | Manifests may use the tree variant (see §6). v1 sets this always. |
 |  2  | `BLOOM_V2`        | Pack bloom uses XXH3 mixing (v1 default = blake3). Backward-compat. |
 | 3-31 | reserved          | must be zero |
 
-`incompat_flags` bits use the same numbering. A mount that doesn't recognize a set incompat bit must refuse to mount (read-only is not safe; old kernels can't reason about the new structure).
+`incompat_flags` has its own bits (format.h): bit 0 `HASH_ALG` (content hash is not SHA-256), bit 1 `SEALED` (proposed, [tessera-encryption.md](tessera-encryption.md) §5.2). A mount that doesn't recognize a set incompat bit must refuse to mount (read-only is not safe; old kernels can't reason about the new structure).
 
 ### 3.2 Backup superblock
 
@@ -945,7 +945,7 @@ Every received blob is hashed before storage. Hash mismatch is an immediate abor
 These do not block v1 implementation but are tracked for future spec revisions:
 
 - **Compression** of blob bytes (`compressed_size != 0` field is reserved). zstd-3 is the front-runner; per-pack-kind defaults likely.
-- **Encryption** at the blob layer, with convergent encryption keyed by content hash (so dedup survives encryption). Caveat: convergent encryption preserves the dedup existence oracle by construction — see §20.3 for the constraints any v2 design must satisfy.
+- **Encryption**: proposed in [tessera-encryption.md](tessera-encryption.md) (2026-11-17). It drops convergent encryption in favour of keyed content ids per key group and domain, which keeps dedup inside one key and satisfies §20.3.
 - **Snapshot/clone** API at the inode level: a snapshot is just a pinned root-directory manifest. The on-disk shape needs no change; the user-facing API requires VFS support.
 - **Extended manifest types** for sparse files, holes, replication metadata.
 - **Multi-device volumes** (RAID-Z-style striping inside Tessera). Out of scope for v1.
@@ -1121,7 +1121,9 @@ fundamental property* — it would reintroduce the oracle at the
 crypto layer. Any v2 encryption design MUST compose the domain
 salt into the key derivation for `salted` domains, and SHOULD
 treat "convergent across domains" as a per-domain opt-in
-equivalent to `global`.
+equivalent to `global`. The proposed design
+([tessera-encryption.md](tessera-encryption.md) §6) keys content
+ids per key group and per domain, so it needs no convergence.
 
 ### 20.4 What v1 explicitly accepts
 

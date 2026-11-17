@@ -270,6 +270,9 @@ any kernel mount of removable media, and it must **authenticate** metadata
 (AEAD, e.g. the planned AES-GCM), not only encrypt it: XTS alone still feeds
 the kernel attacker-influenced bytes and allows rolling back to an old copy.
 Until Tessera encryption lands, every removable disk takes the jailed path.
+Design proposed 2026-11-17: [tessera-encryption.md](tessera-encryption.md) §7
+(sealed sticks, XChaCha20-Poly1305 on every block with parent-held tags, key in a
+persona's Arca, kernel mount only for a stick whose key is found).
 
 ### 4.7 When nothing matches
 
