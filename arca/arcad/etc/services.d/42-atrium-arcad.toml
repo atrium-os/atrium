@@ -29,8 +29,9 @@ enabled       = true
 name          = "atrium-arcad"
 path          = "/var/lib/atrium/jails/arcad"
 children_max  = 0
-devfs_ruleset = 4
+devfs_ruleset = 32                                 # atrium_arca: basics + tesserakeys (arcad only)
 allow_mlock   = true                              # secrets in locked memory (jaild policy [mlock])
+allow_tessera_keys = true                         # load volume keys (jaild policy [tessera_keys])
 # network: none (the manifest default, `disable`). Arca has no network, ever.
 
 [[mounts]]

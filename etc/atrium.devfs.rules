@@ -132,3 +132,13 @@ add include $devfsrules_unhide_basic
 add path 'aura' unhide
 add path 'aura/key*' unhide
 add path 'aura/key*' mode 0600 user _aura-keys
+
+# Arca (arcad, arca.md §6.3): the basics plus the Tessera keyring, which
+# arcad alone writes (tessera-encryption.md §4.3). arcad runs as _arca, so
+# the node is handed to it in this jail's own devfs; the host's stays
+# root:wheel 0600. The kernel also refuses a jail without allow.tessera_keys.
+[atrium_arca=32]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'tesserakeys' unhide
+add path 'tesserakeys' mode 0600 user _arca

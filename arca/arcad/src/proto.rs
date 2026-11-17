@@ -215,6 +215,32 @@ pub mod share_op {
     pub const SH_SIGN: u16 = 0xAB;
 }
 
+/// Tessera volume keys (0xB0..), tessera-encryption.md §4.3: only the
+/// services in [`crate::volume::SERVICES`]. The key never appears in a reply.
+/// `owner` is `str user | str persona`; user [`crate::server::MACHINE_USER`]
+/// with persona [`crate::server::MACHINE_PERSONA`] is the machine store.
+pub mod volume_op {
+    /// `owner | uuid[16] | u64 group | str label` → `key_id[16]`. arcad
+    /// makes the key, stores it (class after-first-unlock) and loads it
+    /// into the kernel. Needs the owner's store unlocked.
+    pub const VK_MINT: u16 = 0xB0;
+    /// `owner | key_id[16] | uuid[16] | u64 group` → nothing. Loads the key
+    /// with its high-water mark if the owner's store is unlocked and holds
+    /// that key for exactly that scope; `DENIED` otherwise, `LOCKED` if
+    /// the store is locked. Already loaded: `OK`.
+    pub const VK_LOAD: u16 = 0xB1;
+    /// `owner | key_id[16]` → `u64 high_water`: the kernel's highest
+    /// committed generation under the key, raised into the item. Works
+    /// while the screen is locked.
+    pub const VK_RECORD: u16 = 0xB2;
+    /// `owner | key_id[16]` → nothing: crypto-erase (§9). The kernel drops
+    /// the key and the item is deleted. Needs Sigillum's `VERIFY_USER`
+    /// (`NEEDS_VERIFICATION` first).
+    pub const VK_FORGET: u16 = 0xB3;
+    /// Longest label.
+    pub const LABEL_MAX: usize = 128;
+}
+
 /// Courier ops (0x80..): only a courier's uid, for its own endpoint.
 pub mod courier_op {
     /// After TLS is up: `u8 n | n × (u8 source | ref[16])` → `n × bytes

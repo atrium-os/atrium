@@ -16,7 +16,7 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::courier::{app_persona, CourierLabel};
 use crate::label::Label;
-use crate::proto::{broker_op, courier_op, op, share_op, status, MAX_SIGN_MSG};
+use crate::proto::{broker_op, courier_op, op, share_op, status, volume_op, MAX_SIGN_MSG};
 use crate::share::ShareLabel;
 
 /// Personas arrive with the label once insula.md §13.6 lands; until then
@@ -46,6 +46,9 @@ pub struct State {
     /// Set only by [`State::handle_verified`], for the one request it runs:
     /// Sigillum verified the user for this use of a verify-each-use item.
     verified: bool,
+    /// The kernel keyring (`/dev/tesserakeys`), opened at start; `None`:
+    /// the volume ops answer `UNSUPPORTED`.
+    pub keyring: Option<Box<dyn crate::volume::Keyring>>,
 }
 
 fn system_now() -> u64 {
@@ -131,7 +134,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None })
     }
 
     /// Run a request that answered `NEEDS_VERIFICATION` again, after
@@ -160,6 +163,18 @@ impl State {
                 .map(|m| format!("\u{201c}{}\u{201d}", m.account))
                 .collect();
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
+        }
+        if let Label::Service(name) = who {
+            if op != volume_op::VK_FORGET || !crate::volume::SERVICES.contains(&name.as_str()) {
+                return None;
+            }
+            let mut r = Reader::new(body);
+            let user = r.str(caps::USER).ok()?.to_string();
+            let persona = r.str(caps::PERSONA).ok()?.to_string();
+            let key_id = r.array::<16>().ok()?;
+            let store = if user == MACHINE_USER { self.machine.as_ref()? } else { self.stores.get(&user)? };
+            let m = Self::volume_item(store, &persona, &key_id).ok()??;
+            return Some((user, format!("Forget the key of \u{201c}{}\u{201d}", m.account)));
         }
         let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id } | Label::FileManager { user, publisher, app_id }) = who else { return None };
         if !matches!(op, op::PUBKEY | op::SIGN | op::RELEASE) || body.len() < 16 {
@@ -203,6 +218,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
+            Label::Service(name) if (0xB0..=0xB3).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -465,6 +481,177 @@ impl State {
     /// wire, class after boot only, values released to the service itself
     /// (it hands them to hardware: a controller asks for a link key within
     /// milliseconds).
+    // ── Tessera volume keys (tessera-encryption.md §4.3) ─────────────────
+
+    /// The owner's store and persona for a volume op: a user's store only
+    /// while unlocked (`LOCKED` otherwise) unless `while_locked`; the
+    /// machine store under its own persona.
+    fn volume_store(&mut self, user: &str, persona: &str, while_locked: bool) -> Result<&mut Store, Reply> {
+        if user == MACHINE_USER {
+            if persona != MACHINE_PERSONA {
+                return Err(reply(status::DENIED));
+            }
+            return self.machine.as_mut().ok_or_else(|| reply(status::LOCKED));
+        }
+        if !valid_user(user) || !arca_store::model::valid_persona(persona) {
+            return Err(malformed());
+        }
+        let store = self.stores.get_mut(user).ok_or_else(|| reply(status::LOCKED))?;
+        match store.state() {
+            LockState::Unlocked => Ok(store),
+            LockState::Locked if while_locked => Ok(store),
+            _ => Err(reply(status::LOCKED)),
+        }
+    }
+
+    /// The volume key item with this key id, if the owner holds one.
+    fn volume_item(store: &Store, persona: &str, key_id: &[u8; 16]) -> Result<Option<arca_store::ItemMeta>, Error> {
+        let me = Recipient::service(crate::volume::RECIPIENT)?;
+        let who = Access { persona, recipient: &me };
+        Ok(store.list(&who)?.into_iter().find(|m| {
+            m.kind == Kind::VolumeKey && crate::volume::decode_scope(&m.scope).is_some_and(|(k, _, _)| &k == key_id)
+        }))
+    }
+
+    fn volume_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        use crate::volume::{decode_scope, encode_scope, owner_label, LoadInfo, RECIPIENT, SERVICES, VALUE_LEN};
+        let verified = std::mem::take(&mut self.verified);
+        if !SERVICES.contains(&name) {
+            return reply(status::DENIED);
+        }
+        if self.keyring.is_none() {
+            return reply(status::UNSUPPORTED);
+        }
+        let mut r = Reader::new(body);
+        macro_rules! field {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => return malformed(),
+                }
+            };
+        }
+        let user = field!(r.str(caps::USER)).to_string();
+        let persona = field!(r.str(caps::PERSONA)).to_string();
+        let me = tri!(Recipient::service(RECIPIENT));
+        let label = owner_label(&user, &persona);
+        match op {
+            volume_op::VK_MINT => {
+                let uuid = field!(r.array::<16>());
+                let group = field!(r.u64());
+                let account = field!(r.str(volume_op::LABEL_MAX)).to_string();
+                field!(r.end());
+                let mut key_id = [0u8; 16];
+                if getrandom::getrandom(&mut key_id).is_err() {
+                    return reply(status::INTERNAL);
+                }
+                let mut value = tri!(LockedBuf::zeroed(VALUE_LEN).map_err(Error::Io));
+                if getrandom::getrandom(&mut value.as_mut()[..32]).is_err() {
+                    return reply(status::INTERNAL);
+                }
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let m = tri!(store.add(NewItem {
+                    persona: &persona,
+                    recipient: me.clone(),
+                    class: Class::AfterFirstUnlock,
+                    kind: Kind::VolumeKey,
+                    provenance: Provenance::ArcaGenerated,
+                    account: &account,
+                    scope: &encode_scope(&key_id, &uuid, group),
+                    value: value.as_ref(),
+                }));
+                *item = Some(m.id);
+                let info = LoadInfo { key_id, uuid, group, high_water: 0, owner_uid: 0, owner_label: label };
+                let key: &[u8; 32] = value.as_ref()[..32].try_into().unwrap();
+                if self.keyring.as_mut().unwrap().load(&info, key).is_err() {
+                    // Not usable: don't keep a key the kernel never saw.
+                    if let Ok(s) = self.volume_store(&user, &persona, false) {
+                        let _ = s.delete(&m.id, &Access { persona: &persona, recipient: &me });
+                    }
+                    return reply(status::INTERNAL);
+                }
+                ok(key_id.to_vec())
+            }
+            volume_op::VK_LOAD => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                let group = field!(r.u64());
+                field!(r.end());
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                // The scope the key was made for, exactly: a key never
+                // opens another volume or group.
+                if decode_scope(&m.scope) != Some((key_id, uuid, group)) {
+                    return reply(status::DENIED);
+                }
+                let (_, v) = tri!(store.release(&m.id, &Access { persona: &persona, recipient: &me }, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: label };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                match self.keyring.as_mut().unwrap().load(&info, key) {
+                    Ok(()) => ok(Vec::new()),
+                    Err(e) if e == libc::EEXIST => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            volume_op::VK_RECORD => {
+                let key_id = field!(r.array::<16>());
+                field!(r.end());
+                let gen = match self.keyring.as_mut().unwrap().generation(&key_id) {
+                    Ok(g) => g,
+                    Err(_) => return reply(status::DENIED),
+                };
+                let store = match self.volume_store(&user, &persona, true) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                let who = Access { persona: &persona, recipient: &me };
+                let (_, mut v) = tri!(store.release(&m.id, &who, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let hw = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                if gen > hw {
+                    v.as_mut()[32..].copy_from_slice(&gen.to_le_bytes());
+                    tri!(store.update(&m.id, &who, v.as_ref(), None));
+                }
+                ok(gen.max(hw).to_le_bytes().to_vec())
+            }
+            volume_op::VK_FORGET => {
+                let key_id = field!(r.array::<16>());
+                field!(r.end());
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                if !verified {
+                    return reply(status::NEEDS_VERIFICATION);
+                }
+                tri!(store.delete(&m.id, &Access { persona: &persona, recipient: &me }));
+                match self.keyring.as_mut().unwrap().drop_key(&key_id) {
+                    Ok(()) => ok(Vec::new()),
+                    Err(e) if e == libc::ENOENT => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
     fn service_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         let Ok(me) = Recipient::service(name) else { return reply(status::UNKNOWN_PEER) };
         if op == op::TAKE_WIFI {
@@ -523,7 +710,10 @@ impl State {
                 let id = ItemId(field!(r.array::<16>()));
                 field!(r.end());
                 *item = Some(id);
-                let (_, v) = tri!(store.release(&id, &who, None));
+                let (m, v) = tri!(store.release(&id, &who, None));
+                if m.kind.shape() == Shape::Key {
+                    return reply(status::NOT_RELEASABLE);
+                }
                 let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
                 out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
                 out.as_mut()[4..].copy_from_slice(v.as_ref());

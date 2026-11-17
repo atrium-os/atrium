@@ -98,6 +98,11 @@ pub struct ServiceManifest {
     /// memory and it refuses to serve without it.
     #[serde(default)]
     pub allow_mlock: bool,
+    /// `allow.tessera_keys` for the jail (jaild allowlists it per jail name
+    /// in `policy.tessera_keys.allow_jails`). arcad sets it to load Tessera
+    /// volume keys into the kernel.
+    #[serde(default)]
+    pub allow_tessera_keys: bool,
 
     pub exec: Option<ManifestExec>,
 
@@ -479,6 +484,7 @@ impl ServiceManifest {
             hostid: None,
             hostuuid: None,
             allow_mlock: self.allow_mlock,
+            allow_tessera_keys: self.allow_tessera_keys,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
@@ -655,6 +661,7 @@ mod tests {
             volumes: vec![],
             network: ManifestNetwork::Disable,
             allow_mlock: false,
+            allow_tessera_keys: false,
             exec: None,
             supervision: Supervision::default(),
             capabilities: Capabilities::default(),
