@@ -708,3 +708,37 @@ fn a_signed_message_says_who_signed_it() {
     // The signature isn't a file.
     assert!(!t.iter().any(|x| x.contains("smime.p7s")), "{t:?}");
 }
+
+#[test]
+fn an_encrypted_message_is_read_with_the_person_s_key() {
+    use rsa::pkcs8::DecodePrivateKey;
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let data = |f: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
+    engine.set_roots(vec![data("ca.der")]);
+    let engine = Rc::new(engine);
+    let account = engine.store.add_account("grace@example.net").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let f = |uid, bytes: Vec<u8>| Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW), server_id: None, bytes, full: true };
+        sink.messages("INBOX", vec![f(1, data("signed.eml")), f(2, data("encrypted.eml"))]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let row = (0..2).find(|&i| mail.row(i).is_some_and(|r| r.subject == "Encrypted plan")).unwrap();
+    mail.open(row);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x.contains("This message is encrypted.")), "{:?}", texts(&app));
+    assert!(texts(&app).iter().any(|x| x == "Encrypted with S/MIME"));
+    // With a key (the token's, here in software): read.
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(&data("leaf.p8")).unwrap();
+    *mail.unwrapper.borrow_mut() = Some(Rc::new(move |_: &[u8], w: &[u8]| key.decrypt(rsa::Pkcs1v15Encrypt, w).map_err(|e| e.to_string())));
+    mail.open(row);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x.contains("The secret plan.")), "{:?}", texts(&app));
+    assert!(texts(&app).iter().any(|x| x == "plan.csv"));
+}

@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use crate::code::{CodeBuffer, Highlight, Span, Tag};
 use crate::color::Color;
-use crate::event::{Event, KeyEventKind};
+use crate::event::{Event, Key, KeyEventKind, Modifiers};
 use crate::geom::{Point, Rect};
 use crate::interaction::{DragPhase, ScrollKind};
 use crate::node::{Node, TextStyle};
@@ -45,7 +45,12 @@ pub struct CodeGrid {
     autofocus: bool,
     /// Lines with a diagnostic, and its severity (0 error, 1 warning, 2 note).
     marks: Vec<(usize, u8)>,
+    /// Keys the buffer doesn't use (Ctrl+S, Ctrl+P, F12…), for the app.
+    other_key: Option<OtherKey>,
 }
+
+/// What [`CodeGrid::on_other_key`] gets: the key, its modifiers, its text.
+pub type OtherKey = Rc<dyn Fn(Key, Modifiers, &str)>;
 
 /// A run of one tag on a line, at display column `col`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +71,7 @@ impl CodeGrid {
             gutter: true,
             autofocus: false,
             marks: Vec::new(),
+            other_key: None,
         }
     }
     pub fn highlight(mut self, h: Rc<dyn Highlight>) -> Self { self.highlight = h; self }
@@ -75,6 +81,8 @@ impl CodeGrid {
     pub fn gutter(mut self, on: bool) -> Self { self.gutter = on; self }
     pub fn autofocus(mut self, on: bool) -> Self { self.autofocus = on; self }
     pub fn marks(mut self, m: Vec<(usize, u8)>) -> Self { self.marks = m; self }
+    /// Keys the editor has no use for go to `f` (the app's shortcuts).
+    pub fn on_other_key(mut self, f: OtherKey) -> Self { self.other_key = Some(f); self }
 
     fn style(&self, color: Color) -> TextStyle {
         TextStyle { family: font::MONO.into(), size: self.size, weight: Weight::Regular, color }
@@ -257,6 +265,7 @@ impl View for CodeGrid {
         }
 
         ctx.focusable(bg);
+        ctx.takes_tab(bg);
         if self.autofocus {
             ctx.autofocus(bg);
         }
@@ -269,6 +278,7 @@ impl View for CodeGrid {
         };
 
         let (buffer, view) = (self.buffer.clone(), self.view.clone());
+        let other = self.other_key.clone();
         ctx.on_key(bg, move |ev| {
             let Event::Key { kind, key, chars, modifiers } = ev else { return };
             if !kind.pressed() || *kind == KeyEventKind::Up {
@@ -276,6 +286,12 @@ impl View for CodeGrid {
             }
             let mut b = buffer.get_cloned();
             let out = b.key(*key, *modifiers, chars, rows.saturating_sub(1));
+            if matches!(out, KeyOutcome::Ignored) {
+                if let Some(f) = &other {
+                    f(*key, *modifiers, chars);
+                }
+                return;
+            }
             let changed = match out {
                 KeyOutcome::Changed => true,
                 KeyOutcome::Copy(t) => crate::clipboard::copy_text(&t, false).is_ok(),

@@ -122,7 +122,7 @@ fn sent_signed_and_encrypted() {
     let outer: String = outer.lines().filter(|l| !l.starts_with("Content-") && !l.starts_with(' ')).map(|l| format!("{l}\r\n")).collect();
     let mut opened = outer.into_bytes();
     opened.extend_from_slice(&inner);
-    let o = engine.parser.open(&opened, vec![], &[data("ca.der")]).unwrap().unwrap();
+    let o = engine.parser.open(&opened, vec![], &[data("ca.der")], None).unwrap().unwrap();
     assert_eq!(o.summary.smime.unwrap().state, SmimeState::Valid);
     assert_eq!(o.summary.text.as_deref().map(str::trim), Some("The plan."));
 }
@@ -137,4 +137,47 @@ fn b64d(s: &str) -> Vec<u8> {
         if bits >= 8 { bits -= 8; out.push((acc >> bits) as u8) }
     }
     out
+}
+
+/// An encrypted message is unlocked with a key unwrapped outside (here in
+/// software, as the token would), read each time, and nothing of its
+/// inside is kept or indexed.
+#[test]
+fn encrypted_mail_is_unlocked_and_read_but_not_kept() {
+    use rsa::pkcs8::DecodePrivateKey;
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    engine.set_roots(vec![data("ca.der")]);
+    let account = engine.store.add_account("grace@example.net").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    // Grace's own signed mail: her certificate is known.
+    sink.messages("INBOX", vec![fetched(1, data("signed.eml"), true), fetched(2, data("encrypted.eml"), true)]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let id = engine.store.at(inbox, 2).unwrap().unwrap().0;
+    let m = engine.store.message(id).unwrap();
+    assert!(m.summary.encrypted && m.summary.text.is_none());
+    let r = engine.open(id).unwrap();
+    assert!(r.attachments.is_empty() && r.text.as_deref() == Some(""));
+
+    let certs = engine.my_certs(account, &[]);
+    assert_eq!(certs, vec![data("leaf.der")]);
+    let key = rsa::RsaPrivateKey::from_pkcs8_der(&data("leaf.p8")).unwrap();
+    let unwrap = |cert: &[u8], wrapped: &[u8]| {
+        assert_eq!(cert, data("leaf.der"));
+        key.decrypt(rsa::Pkcs1v15Encrypt, wrapped).map_err(|e| e.to_string())
+    };
+    assert!(!engine.unlock(id, &[data("ca.der")], &unwrap).unwrap(), "not for that certificate");
+    assert!(engine.unlock(id, &certs, &unwrap).unwrap());
+    let r = engine.open(id).unwrap();
+    assert_eq!(r.text.as_deref().map(str::trim), Some("The secret plan."));
+    assert_eq!(r.attachments.len(), 1);
+    assert_eq!(engine.attachment(id, &r.attachments[0].which).unwrap().bytes, b"step,when\r\none,now");
+    // Nothing of the inside is kept: no document, no files text.
+    let m = engine.store.message(id).unwrap();
+    assert!(m.document.is_none() && m.summary.text.is_none());
+    assert_eq!(engine.index_files(id).unwrap(), None);
+    // Forgotten keys lock it again.
+    engine.forget_keys();
+    assert_eq!(engine.open(id).unwrap().text.as_deref(), Some(""));
 }

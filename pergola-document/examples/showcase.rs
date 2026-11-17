@@ -154,6 +154,21 @@ fn text_demo(ctx: &mut Ctx) {
         ctx.paragraph_with(content, body.clone(), wrap);
         ctx.pop();
     };
+    // frescod's server-side text with the system font library
+    // (docs/spec/fonts.md §4): a family by name or stand-in, a script the
+    // face lacks from its Noto face, a right-to-left run in visual order.
+    Section::new("System fonts").show(ctx, |ctx| {
+        for (family, s) in [
+            ("Calibri", "Calibri (Carlito): The quick brown fox"),
+            ("Times New Roman", "Times New Roman (Liberation Serif)"),
+            ("Source Serif 4", "Source Serif 4: Sphinx of black quartz"),
+            (font::SANS, "हिन्दी में लिखा वाक्य, क्षत्रिय और श्री"),
+            (font::SANS, "தமிழ் எழுத்துக்கள் · ಕನ್ನಡ · ไทย ภาษา"),
+            (font::SANS, "שלום עולם (Hello) 2026 · مرحبا بالعالم"),
+        ] {
+            ctx.add(Node::Text { rect: Rect::ZERO_SIZED, content: s.into(), style: TextStyle { family: family.into(), size: type_size::MD, ..body.clone() } });
+        }
+    });
     Section::new("Wrapped text").show(ctx, |ctx| {
         demo(ctx, "Breaks at spaces only", 300.0, Wrap::default(), text);
         demo(ctx, "Hyphenated (en-US patterns)", 300.0, Wrap { hyphens: true, ..Wrap::default() }, text);

@@ -10,7 +10,8 @@
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cms::cert::IssuerAndSerialNumber;
 use cms::content_info::{CmsVersion, ContentInfo};
-use cms::enveloped_data::{EncryptedContentInfo, EnvelopedData, KeyTransRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos};
+pub use cms::enveloped_data::EnvelopedData;
+use cms::enveloped_data::{EncryptedContentInfo, KeyTransRecipientInfo, RecipientIdentifier, RecipientInfo, RecipientInfos};
 use der::asn1::{Any, OctetString, SetOfVec};
 use der::{Decode, Encode};
 use spki::AlgorithmIdentifierOwned;

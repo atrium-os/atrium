@@ -129,6 +129,10 @@ pub struct JailCreateSpec<'a> {
     /// Validator-gated to `policy.mlock.allow_jails`; Arca needs it so no
     /// secret reaches swap or the zram compressor (arca.md §6.3).
     pub allow_mlock:    bool,
+    /// `allow.tessera_keys`: the jail may use the Tessera keyring
+    /// (/dev/tesserakeys, tessera-encryption.md §4.3). Validator-gated to
+    /// `policy.tessera_keys.allow_jails`: arcad's jail alone.
+    pub allow_tessera_keys: bool,
     /// The kernel system call filter (`sysfil.*`, jail-sysfil.md). Only
     /// settable at creation; `None` = no filter.
     pub sysfil:         Option<&'a jaild_policy::SysfilParams>,
@@ -188,6 +192,12 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
     }
+    if spec.allow_tessera_keys && tessera_keys_supported() {
+        // Registered by tessera.ko. Without the module there is no keyring
+        // to allow, and jail_set would refuse the unknown parameter, so the
+        // jail (arcad's) is made without it rather than not at all.
+        iob.add_i32("allow.tessera_keys", 1);
+    }
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -210,6 +220,21 @@ pub fn sysfil_supported() -> bool {
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn sysfil_supported() -> bool { false }
+
+/// Is tessera.ko loaded, with its `allow.tessera_keys` jail parameter?
+#[cfg(target_os = "freebsd")]
+pub fn tessera_keys_supported() -> bool {
+    let name = c"security.jail.param.allow.tessera_keys";
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query; no output buffer is written.
+    unsafe {
+        libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len,
+                           std::ptr::null(), 0) == 0
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn tessera_keys_supported() -> bool { false }
 
 /// `RLIMIT_CORE` = 0, soft and hard, for the calling (child) process.
 pub fn disable_core_dumps() -> io::Result<()> {
@@ -344,6 +369,12 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     if spec.allow_mlock {
         // A jail boolean takes an int value (kern_jail.c copies sizeof(int)).
         iob.add_i32("allow.mlock", 1);
+    }
+    if spec.allow_tessera_keys && tessera_keys_supported() {
+        // Registered by tessera.ko. Without the module there is no keyring
+        // to allow, and jail_set would refuse the unknown parameter, so the
+        // jail (arcad's) is made without it rather than not at all.
+        iob.add_i32("allow.tessera_keys", 1);
     }
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
@@ -1670,7 +1701,7 @@ mod privilege_drop_tests {
         let spec = JailCreateSpec {
             name: &name, path: "/", persist: 1, children_max: 0, devfs_ruleset: 0,
             ip4_addr: None, ip4_inherit: false, isolated: false, hostname: "sysfil-test",
-            hostid: None, hostuuid: None, allow_mlock: false, sysfil: Some(&f),
+            hostid: None, hostuuid: None, allow_mlock: false, allow_tessera_keys: false, sysfil: Some(&f),
         };
         let jid = create_persistent_jail(&spec).expect("jail_set with sysfil").jid;
         let get = |p: &str| {

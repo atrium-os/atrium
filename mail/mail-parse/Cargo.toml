@@ -31,6 +31,8 @@ html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", 
 [dev-dependencies]
 mail-schema = { path = "../mail-schema" }
 png = "0.17"
+# S/MIME: unwrapping a content key as the token would.
+rsa = "0.9"
 
 [[bin]]
 name = "mail-parse-jail"

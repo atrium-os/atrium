@@ -24,6 +24,7 @@ pub mod server;
 pub mod share;
 pub mod tickets;
 pub mod verify;
+pub mod volume;
 
 use std::io;
 use std::os::unix::net::UnixStream;

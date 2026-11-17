@@ -63,6 +63,10 @@ pub struct Handlers {
     /// When `true`, this node can take keyboard focus. Pointer-down
     /// on a focusable node sets focus; Tab navigates among focusables.
     pub focusable: bool,
+    /// Tab (without Ctrl) goes to this node's key handler when it has
+    /// focus, not to focus traversal: a code editor indents with it.
+    /// Ctrl+Tab still moves focus.
+    pub takes_tab: bool,
     /// Take focus when this node first appears ([`crate::view::Ctx::autofocus`]).
     pub autofocus: bool,
     /// Shows a tooltip on hover ([`crate::view::Ctx::tooltip`]).

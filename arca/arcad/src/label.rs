@@ -70,7 +70,8 @@ pub fn parse_services(s: &str) -> Vec<(u32, String)> {
         .filter_map(|e| {
             let (n, u) = e.trim().split_once('=')?;
             let uid: u32 = u.trim().parse().ok()?;
-            (arca_store::model::valid_service(n.trim()) && uid != 0).then(|| (uid, n.trim().to_string()))
+            (arca_store::model::valid_service(n.trim()) && n.trim() != crate::volume::RECIPIENT && uid != 0)
+                .then(|| (uid, n.trim().to_string()))
         })
         .collect();
     all.iter()

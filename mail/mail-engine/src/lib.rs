@@ -158,9 +158,9 @@ impl Parser {
     /// One message for reading, alone in its jail.
     /// One attachment's bytes, alone in a jail; `None` when the jail
     /// refused (the part isn't there).
-    pub fn attachment(&self, raw: &[u8], which: &wire::Which) -> Result<Option<wire::Attached>, Error> {
+    pub fn attachment(&self, raw: &[u8], which: &wire::Which, key: Option<Vec<u8>>) -> Result<Option<wire::Attached>, Error> {
         let mut j = self.start()?;
-        wire::write_frame(&mut j.w, &ToJail::Attachment { message: wire::Raw { id: 1, bytes: raw.to_vec() }, which: which.clone() })
+        wire::write_frame(&mut j.w, &ToJail::Attachment { message: wire::Raw { id: 1, bytes: raw.to_vec() }, which: which.clone(), key })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
         let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
@@ -170,9 +170,26 @@ impl Parser {
         }
     }
 
-    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>]) -> Result<Option<Opened>, Error> {
+    /// Which of `certs` an encrypted message is for, and the content key
+    /// wrapped for it (S/MIME, §10.1).
+    pub fn key_for(&self, raw: &[u8], certs: &[Vec<u8>]) -> Result<Option<(usize, Vec<u8>)>, Error> {
+        let certs: Vec<Vec<u8>> = certs.iter().take(wire::MY_CERTS_MAX).cloned().collect();
         let mut j = self.start()?;
-        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
+        wire::write_frame(&mut j.w, &ToJail::KeyFor { message: wire::Raw { id: 1, bytes: raw.to_vec() }, certs: certs.clone() }).map_err(|e| Error::Jail(e.to_string()))?;
+        let frames = Self::exchange(&mut j, &|_| Some(raw.len() as u64))?;
+        match frames.into_iter().next() {
+            Some(FromJail::KeyFor { which, .. }) => match which {
+                Some((i, w)) if (i as usize) < certs.len() => Ok(Some((i as usize, w))),
+                Some(_) => Err(Error::Jail("key for a certificate it was not given".into())),
+                None => Ok(None),
+            },
+            _ => Err(Error::Jail("no answer".into())),
+        }
+    }
+
+    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>) -> Result<Option<Opened>, Error> {
+        let mut j = self.start()?;
+        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), key, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
         let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
@@ -188,6 +205,9 @@ pub struct Engine {
     pub parser: Parser,
     /// Trusted roots for S/MIME (DER), sent to each jail ([`smime`]).
     roots: Vec<Vec<u8>>,
+    /// Content keys of encrypted messages unlocked this session, in memory
+    /// only; their text is never kept (§10.1).
+    keys: std::cell::RefCell<std::collections::HashMap<mail_store::MsgId, Vec<u8>>>,
 }
 
 /// What the reading pane shows (§7.2, §7.3).
@@ -214,7 +234,7 @@ pub struct Shown {
 
 impl Engine {
     pub fn new(store: Store, parser: Parser) -> Engine {
-        Engine { store, parser, roots: smime::system_roots() }
+        Engine { store, parser, roots: smime::system_roots(), keys: Default::default() }
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {
@@ -230,6 +250,20 @@ impl Engine {
         let Some(full) = m.full else {
             return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None, attachments: Vec::new() });
         };
+        if m.summary.encrypted {
+            // Read only with its key, each time, and nothing of it kept.
+            let Some(key) = self.keys.borrow().get(&msg).cloned() else {
+                return Ok(Reading { summary: m.summary, text: Some(String::new()), has_html: false, document: None, attachments: Vec::new() });
+            };
+            let raw = self.store.blob(&full)?;
+            return match self.parser.open(&raw, Vec::new(), &self.roots, Some(key))? {
+                Some(o) => {
+                    let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
+                    Ok(Reading { has_html: o.document.is_some(), summary: o.summary, text, document: o.document, attachments: o.attachments })
+                }
+                None => Ok(Reading { summary: m.summary, text: Some("This message couldn't be decrypted.".into()), has_html: false, document: None, attachments: Vec::new() }),
+            };
+        }
         if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()) {
             let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
@@ -243,7 +277,7 @@ impl Engine {
             .take(wire::LOADED_MAX)
             .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
             .collect();
-        match self.parser.open(&raw, loaded, &self.roots)? {
+        match self.parser.open(&raw, loaded, &self.roots, None)? {
             Some(o) => {
                 let sh = Shown { document: o.document, attachments: o.attachments };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;

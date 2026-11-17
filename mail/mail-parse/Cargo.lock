@@ -841,6 +841,7 @@ dependencies = [
  "png 0.17.16",
  "psl",
  "ring",
+ "rsa",
 ]
 
 [[package]]

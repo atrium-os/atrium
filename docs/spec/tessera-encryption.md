@@ -178,6 +178,21 @@ holds it.
   - `FORGET_VOLUME_KEY { key_id }`: crypto-erase (§9), with user verification
     (Sigillum `VERIFY_USER`).
   - `ADOPT_RECOVERY { slot bytes, scope, persona, keep }`: §7.4.
+- **As built (E2).** The ops are `VK_MINT` 0xB0, `VK_LOAD` 0xB1, `VK_RECORD` 0xB2 and
+  `VK_FORGET` 0xB3 (`arca/arcad/src/proto.rs`, `volume_op`); every body starts with
+  `str user | str persona`, so the caller names the owner and arcad checks it. The item is
+  kind `VolumeKey` (0x103, a key shape, so the service `RELEASE` op refuses it), stored
+  for the recipient `tessera-keyring`, a name no service may take. `VK_LOAD` answers
+  `DENIED` for an unknown key id or a scope that isn't the item's exact scope, rather
+  than `NO_KEY`, so a caller can't probe which ids exist under someone else. `VK_MINT`
+  returns only `key_id`: the formatter in the kernel computes `check` when it writes the
+  header. `ADOPT_RECOVERY` waits for E5. arcad does not enter Capsicum yet; the
+  descriptor is opened before it serves and nothing else in its jail can open the node.
+- **Only arcad's jail.** The node is shown by devfs ruleset 32 (`atrium_arca`), which
+  jaild pins to the arcad service, and the kernel refuses every jailed caller whose jail
+  lacks `allow.tessera_keys`. tessera.ko registers that jail parameter, and jaild gives it
+  only to jails in `policy.tessera_keys.allow_jails` (arcad alone), so a ruleset mistake
+  in another jail still doesn't reach the keyring.
 - **The kernel trusts the scope.** A key loaded for volume uuid U (and group g) opens
   only U (and g). A mount of a different volume naming that key id fails, so a copied
   stick header cannot be used to point a key at someone else's disk.

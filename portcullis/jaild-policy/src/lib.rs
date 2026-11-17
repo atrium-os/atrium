@@ -55,6 +55,10 @@ pub struct Policy {
     /// Which jails may lock memory (`allow.mlock`). Absent = none.
     #[serde(default)]
     pub mlock: MlockPolicy,
+    /// Which jails may use the Tessera keyring (`allow.tessera_keys`).
+    /// Absent = none.
+    #[serde(default)]
+    pub tessera_keys: TesseraKeysPolicy,
     /// Arca's couriers (arca.md §5). Absent = none.
     #[serde(default)]
     pub couriers: Option<CourierPolicy>,
@@ -218,6 +222,14 @@ impl ShareServerPolicy {
 /// compressor; nothing else should have it.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct MlockPolicy {
+    #[serde(default)]
+    pub allow_jails: Vec<String>,
+}
+
+/// `[tessera_keys]`: jails that may use /dev/tesserakeys, loading volume
+/// keys into the kernel (tessera-encryption.md §4.3). arcad only.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct TesseraKeysPolicy {
     #[serde(default)]
     pub allow_jails: Vec<String>,
 }

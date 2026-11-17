@@ -1,7 +1,7 @@
 # Artifex, the code editor (docs/spec/dev-tools.md §3.4, dev-tools-plan.md M11).
 [workspace]
 resolver = "2"
-members = ["syntax"]
+members = ["syntax", "app"]
 
 [workspace.package]
 version = "0.1.0"

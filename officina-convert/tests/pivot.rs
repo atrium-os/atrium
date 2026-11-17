@@ -91,6 +91,24 @@ fn xlsx_round_trip() {
 }
 
 #[test]
+fn xlsx_compact_round_trip() {
+    let mut wb = book();
+    let mut p = wb.pivots()[0].clone();
+    p.compact = true;
+    wb.set_pivot(0, p).unwrap();
+    let file = xlsx::write(&wb, Vec::new()).unwrap();
+    let t = part(&file, "xl/pivotTables/pivotTable1.xml");
+    assert!(!t.contains(r#"compact="0""#) && t.contains(r#"<pivotField axis="axisRow" showAll="0">"#), "{t}");
+    assert!(part(&file, "xl/pivotTables/pivotTable2.xml").contains(r#"compact="0""#));
+    let (back, loaded) = xlsx::read(&file).unwrap();
+    assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
+    assert_eq!(back.pivots(), wb.pivots());
+    assert_eq!(back.pivot_shape(0), wb.pivot_shape(0));
+    assert!(!wb.pivot_shape(0).unwrap().indents.is_empty());
+    assert_eq!(cells(&back), cells(&wb));
+}
+
+#[test]
 fn ods_round_trip() {
     let wb = book();
     let file = ods::write(&wb, Vec::new()).unwrap();
@@ -98,5 +116,15 @@ fn ods_round_trip() {
     assert!(loaded.report.is_empty(), "{:?}", loaded.report.human());
     assert_eq!(back.pivots(), wb.pivots());
     assert_eq!(back.pivot_shape(0), wb.pivot_shape(0));
+    assert_eq!(cells(&back), cells(&wb));
+    // Compact form, as LibreOffice marks it.
+    let mut wb = wb;
+    let mut p = wb.pivots()[0].clone();
+    p.compact = true;
+    wb.set_pivot(0, p).unwrap();
+    let file = ods::write(&wb, Vec::new()).unwrap();
+    let (back, _) = ods::read(&file).unwrap();
+    assert!(back.pivots()[0].compact && !back.pivots()[1].compact);
+    assert_eq!(back.pivots(), wb.pivots());
     assert_eq!(cells(&back), cells(&wb));
 }

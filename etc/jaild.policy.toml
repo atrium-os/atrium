@@ -183,6 +183,7 @@ allowed = [
     "atrium-tty",        # baseline + a specific allocated tty
     "atrium-wifi-mlme",  # baseline + aura/ctl*; pinned to aura-mlme
     "atrium-wifi-keys",  # baseline + aura/key*; pinned to aura-keys
+    "atrium-arca",       # baseline + tesserakeys; pinned to arcad
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
 # themselves live in etc/atrium.devfs.rules (installed and loaded at boot by
@@ -213,7 +214,8 @@ allowed = [
 #      its own hidraw node through the request's devfs_grant (pinned below).
 # 28 = atrium_wifi_mlme — basics + aura/ctl*: aura-mlme's alone (pinned below).
 # 29 = atrium_wifi_keys — basics + aura/key*: aura-keys' alone (pinned below).
-allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31]
+# 32 = atrium_arca     — basics + tesserakeys: arcad's alone (pinned below).
+allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31, 32]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -284,6 +286,14 @@ id        = 29
 jail_name = "atrium-aura-keys"
 exec_path = "/usr/local/bin/atrium-aura-keys"
 uid       = 65032
+
+# The Tessera keyring belongs to arcad (tessera-encryption.md §4.3): only the
+# arcad service may mount the ruleset that shows /dev/tesserakeys.
+[[devfs_rulesets.pinned]]
+id        = 32
+jail_name = "atrium-arcad"
+exec_path = "/usr/local/bin/atrium-arcad"
+uid       = 65020
 
 
 # ---------------------------------------------------------------
@@ -464,6 +474,17 @@ allowed_system_gids = [
 # compressor (docs/spec/arca.md §6.3), and refuses to serve without it.
 # ---------------------------------------------------------------
 [mlock]
+allow_jails = ["atrium-arcad"]
+
+
+# ---------------------------------------------------------------
+# The Tessera keyring (allow.tessera_keys, registered by tessera.ko). A jail
+# with it may load volume keys into the kernel and drop them
+# (docs/spec/tessera-encryption.md §4.3). arcad alone: it holds the keys and
+# is the keyring's only writer. The kernel refuses every other jail even if
+# a devfs ruleset failed to hide /dev/tesserakeys.
+# ---------------------------------------------------------------
+[tessera_keys]
 allow_jails = ["atrium-arcad"]
 
 

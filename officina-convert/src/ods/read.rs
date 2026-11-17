@@ -1007,6 +1007,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             });
                         }
                     }
+                    b"table:data-pilot-layout-info" => {
+                        if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
+                            f.compact |= attrs(e).get("loext:layout-mode").is_some_and(|v| v == "compact-layout");
+                        }
+                    }
                     b"table:data-pilot-subtotal" => {
                         if let Some(f) = pilot.as_mut().and_then(|t| t.fields.last_mut()) {
                             f.subtotals |= attrs(e).get("table:function").is_some_and(|v| v != "none");

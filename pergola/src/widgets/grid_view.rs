@@ -89,7 +89,13 @@ pub struct CellView {
     pub bar: Option<(f32, Color)>,
     /// An icon at the cell's left (a conditional format's icon set).
     pub icon: Option<(CellIcon, Color)>,
+    /// Steps the text is indented from the left (a pivot's inner items), each
+    /// [`INDENT_STEP`] px.
+    pub indent: u8,
 }
+
+/// One step of a cell's indent, px.
+pub const INDENT_STEP: f32 = 12.0;
 
 /// The icons a cell can show (spreadsheet icon sets), drawn as vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +250,7 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0 }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -599,12 +605,12 @@ impl GridView {
                                     ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
                                 }
                                 // The icon at the left; text keeps clear of it.
-                                let mut lead = 0.0;
+                                let mut lead = cv.indent as f32 * INDENT_STEP;
                                 if let Some((icon, c)) = cv.icon {
                                     let s = (ch - 6.0).clamp(0.0, 14.0);
                                     if s >= 6.0 && cw > s + 4.0 {
-                                        draw_icon(ctx, icon, c, t.border_default(), cx + 3.0, cy + q(((ch - s) / 2.0) as f64), s);
-                                        lead = s + 3.0;
+                                        draw_icon(ctx, icon, c, t.border_default(), cx + 3.0 + lead, cy + q(((ch - s) / 2.0) as f64), s);
+                                        lead += s + 3.0;
                                     }
                                 }
                                 if cv.text.is_empty() {

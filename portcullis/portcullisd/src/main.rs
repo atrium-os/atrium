@@ -1690,8 +1690,14 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
     let stoa = console::stoad_up();
     let mine = if stoa { console::sessions(owner, app_id) } else { Vec::new() };
     // The Workspaces app opens workspaces' terminals as a launcher does.
+    // An IDE (`workspace-exec`) opens the terminal of a workspace the
+    // person picked in it (Artifex's terminal button, dev-tools-plan M11),
+    // with a press like a launcher's.
+    let ide_pick = |c: &str| app_id.strip_prefix(console::WORKSPACE_PREFIX)
+        .is_some_and(|ws| launch::app_execs_in_workspaces(c) && ide::picked(owner, c).iter().any(|p| p == ws));
     let launcher = caller.as_deref().is_some_and(|c| launch::app_may_launch_apps(c)
-        || (app_id.starts_with(console::WORKSPACE_PREFIX) && launch::app_manages_workspaces(c))) && tab_of.is_none();
+        || (app_id.starts_with(console::WORKSPACE_PREFIX) && launch::app_manages_workspaces(c))
+        || ide_pick(c)) && tab_of.is_none();
     let shows = caller.as_deref().is_some_and(launch::app_shows_consoles);
     /* homes.md §5.3 (W7): the terminal may open the empty console at any
      * time (it reaches nothing), and may switch one of its tabs into any

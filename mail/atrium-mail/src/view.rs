@@ -334,7 +334,13 @@ pub struct Mail {
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
     unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
+    /// Unwraps an encrypted message's content key with the person's
+    /// private key (S/MIME, §10.1); none until the token or Arca can.
+    pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
 }
+
+/// See [`Mail::unwrapper`]: (certificate, wrapped key) → content key.
+pub type Unwrapper = Rc<dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, String>>;
 
 /// A reader version never used before, even after the reader was empty
 /// (the laid-out lines are cached by it).
@@ -535,6 +541,24 @@ impl Mail {
 
     /// A message's body, parsed alone in its own jail.
     fn body(&self, msg: MsgId) -> Body {
+        // Encrypted and locked: opening it is asking to read it.
+        let mut locked_note = None;
+        if let Ok(m) = self.engine.store.message(msg) {
+            if m.summary.encrypted && m.full.is_some() && !self.engine.is_unlocked(msg) {
+                let un = self.unwrapper.borrow().clone();
+                locked_note = match un {
+                    None => Some("This message is encrypted. Mail can't decrypt it here yet: your private key is on a token or in Arca, and reading with it is still to come.".to_string()),
+                    Some(u) => match self.engine.unlock(msg, &self.engine.my_certs(m.account, &[]), &*u) {
+                        Ok(true) => None,
+                        Ok(false) => Some("This message is encrypted, but not to any certificate of yours Mail knows.".to_string()),
+                        Err(e) => Some(format!("This message couldn't be decrypted: {e}")),
+                    },
+                };
+            }
+        }
+        if let Some(note) = locked_note {
+            return Body { plain: None, note: Some(note), ..Body::default() };
+        }
         match self.engine.open(msg) {
             Ok(r) => {
                 let remote = match (&r.document, self.engine.store.message(msg)) {
@@ -1843,6 +1867,7 @@ impl MailView {
             asks: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
+            unwrapper: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }

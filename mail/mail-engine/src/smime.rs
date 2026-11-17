@@ -176,3 +176,56 @@ impl Engine {
         Ok(bytes)
     }
 }
+
+/// Unwraps a content key: given the person's certificate (DER) the message
+/// was encrypted to and the wrapped key, the key (RSA PKCS#1 v1.5
+/// decryption by whoever holds the private key: the token or Arca).
+pub type Unwrap<'a> = &'a dyn Fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+
+impl Engine {
+    /// The person's certificates for `account`: those seen on their own
+    /// signed mail (a Sent copy) for each of their addresses, plus `extra`
+    /// (a token's, say).
+    pub fn my_certs(&self, account: mail_store::AccountId, extra: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = extra.to_vec();
+        for i in self.identities(account).unwrap_or_default() {
+            for c in self.store.certs(&i.addr).unwrap_or_default() {
+                if !out.contains(&c.der) {
+                    out.push(c.der);
+                }
+            }
+        }
+        out.truncate(wire::MY_CERTS_MAX);
+        out
+    }
+
+    /// Unlock encrypted message `msg` for this session: the jail finds the
+    /// key wrapped for one of `certs`, `unwrap` unwraps it, and the key is
+    /// kept in memory. False when the message isn't for any of them.
+    pub fn unlock(&self, msg: MsgId, certs: &[Vec<u8>], unwrap: Unwrap) -> Result<bool, Error> {
+        let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
+        let full = m.full.ok_or(Error::NotFound)?;
+        let raw = self.store.blob(&full)?;
+        let Some((i, wrapped)) = self.parser.key_for(&raw, certs)? else { return Ok(false) };
+        let key = unwrap(&certs[i], &wrapped).map_err(Error::Compose)?;
+        if !matches!(key.len(), 16 | 32) {
+            return Err(Error::Compose("the unwrapped key has the wrong length".into()));
+        }
+        self.keys.borrow_mut().insert(msg, key);
+        Ok(true)
+    }
+
+    /// Whether `msg` was unlocked this session.
+    pub fn is_unlocked(&self, msg: MsgId) -> bool {
+        self.keys.borrow().contains_key(&msg)
+    }
+
+    pub(crate) fn content_key(&self, msg: MsgId) -> Option<Vec<u8>> {
+        self.keys.borrow().get(&msg).cloned()
+    }
+
+    /// Forget every unlocked key (the person locked the screen, say).
+    pub fn forget_keys(&self) {
+        self.keys.borrow_mut().clear();
+    }
+}
