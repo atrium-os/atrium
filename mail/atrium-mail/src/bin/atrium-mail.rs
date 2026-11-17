@@ -22,6 +22,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use atrium_mail::compose::{ComposeView, Composer, Done};
+use atrium_mail::view::FileAct;
 use atrium_mail::MailView;
 use mail_engine::{Engine, Parser};
 use mail_store::Store;
@@ -113,6 +114,36 @@ fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token:
     if let Err(err) = send() {
         let _ = embeds.borrow_mut().detach_embed(e);
         return Err(err);
+    }
+    Ok(e)
+}
+
+/// Quick look (§8.1): the attachment in a viewer in the look slot, handed
+/// over as a sealed read-only memory file (never a file on disk).
+fn look(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, engine: &Engine, token: [u8; 16], msg: u64, f: &atrium_mail::files::File, dark: bool) -> Result<limen::proto::EmbedId, String> {
+    let atrium_mail::files::Look::Viewer { role, mime } = f.look else { return Err("no viewer for this".into()) };
+    let a = engine.attachment(msg, &f.which).map_err(|e| format!("couldn't read it: {e}"))?;
+    let fd = atrium_mail::files::sealed(&a.bytes).map_err(|e| e.to_string())?;
+    drop(a);
+    let load = match role {
+        "doc-viewer" => {
+            let kind = if mime.starts_with("image/") { limen::doc_viewer::DocKind::Picture } else { limen::doc_viewer::DocKind::Html };
+            limen::doc_viewer::ToChild::Load { kind, base: String::new(), dark }.encode()
+        }
+        "pdf-viewer" => limen::pdf_viewer::ToChild::Load { dark }.encode(),
+        _ => limen::media_player::ToChild::Load { source: limen::media_player::Source::Fd, mime: mime.into(), growing: false }.encode(),
+    };
+    let asked = embeds.borrow_mut().request(role, token, atrium_mail::view::LOOK_SLOT);
+    let e = asked.map_err(|e| match e {
+        limen::client::Error::Refused(limen::proto::refusal::NO_PROVIDER) => "No app is set to show these".to_string(),
+        limen::client::Error::Refused(limen::proto::refusal::LAUNCH_FAILED) => "The viewer didn't start".to_string(),
+        limen::client::Error::Refused(n) => format!("The viewer was refused (Limen {n})"),
+        limen::client::Error::Io(e) => format!("Limen: {e}"),
+    })?;
+    let sent = embeds.borrow_mut().send_fd(e, load, fd.as_fd());
+    if let Err(err) = sent {
+        let _ = embeds.borrow_mut().detach_embed(e);
+        return Err(format!("{err:?}"));
     }
     Ok(e)
 }
@@ -228,6 +259,12 @@ fn main() {
         }
     };
     let mut frame: Option<Frame> = None;
+    // The quick look viewer: which attachment it shows.
+    let mut looked: Option<(u64, mail_schema::Which, limen::proto::EmbedId)> = None;
+    // What became of Open and Save, from their threads.
+    let (file_done_tx, file_done) = mpsc::channel::<String>();
+    // The picker up for a Save: its embed, and what it saves.
+    let mut saving: Option<(limen::proto::EmbedId, u64, atrium_mail::files::File)> = None;
     // A message the viewer couldn't be asked for, not asked again.
     let mut failed: Option<u64> = None;
     let dirty = Arc::new(AtomicBool::new(true));
@@ -369,6 +406,65 @@ fn main() {
                 }
             }
         }
+        while let Ok(note) = file_done.try_recv() {
+            mail.file_note(note);
+        }
+        for ask in mail.take_file_asks() {
+            match ask.act {
+                // The viewer follows `looking()` below.
+                FileAct::Look => {}
+                FileAct::Open { activation } => match engine.attachment(ask.msg, &ask.file.which).map_err(|e| e.to_string()).and_then(|a| atrium_mail::files::sealed(&a.bytes).map_err(|e| e.to_string())) {
+                    // The hand-over may start an app: off the window's thread.
+                    Ok(fd) => {
+                        mail.file_note(format!("Opening {}…", ask.file.name));
+                        let (tx, name) = (file_done_tx.clone(), ask.file.name.clone());
+                        std::thread::spawn(move || {
+                            let r = atrium_mail::files::open_in_app(&name, activation, &fd);
+                            let _ = tx.send(match r {
+                                Ok(app) => format!("Opened {name} in {app}"),
+                                Err(why) => format!("Couldn't open {name}: {why}"),
+                            });
+                        });
+                    }
+                    Err(e) => mail.file_note(format!("Couldn't open {}: {e}", ask.file.name)),
+                },
+                FileAct::Save if saving.is_some() => mail.file_note("Already saving a file".into()),
+                FileAct::Save => match (&embeds, win.embed_token()) {
+                    (Some(e), Some(token)) => {
+                        let origin = engine.origin(ask.msg).unwrap_or_else(|_| "mail".into());
+                        let filter = limen::picker::Filter::save(&ask.file.name, &origin);
+                        let asked = e.borrow_mut().request("picker", token, atrium_mail::view::PICK_SLOT);
+                        match asked.and_then(|id| e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map(|_| id)) {
+                            Ok(id) => {
+                                saving = Some((id, ask.msg, ask.file.clone()));
+                                mail.set_saving(true);
+                            }
+                            Err(err) => mail.file_note(format!("The picker didn't open: {err:?}")),
+                        }
+                    }
+                    _ => mail.file_note("Saving needs the system picker, which isn't running".into()),
+                },
+            }
+        }
+        if let Some(embeds) = &embeds {
+            let want = mail.looking();
+            if want.as_ref().map(|(m, f)| (*m, &f.which)) != looked.as_ref().map(|(m, w, _)| (*m, w)) {
+                if let Some((_, _, e)) = looked.take() {
+                    let _ = embeds.borrow_mut().detach_embed(e);
+                }
+                if let (Some((msg, f)), Some(token)) = (want.as_ref(), win.embed_token()) {
+                    match look(embeds, &engine, token, *msg, f, mail.is_dark()) {
+                        Ok(e) => looked = Some((*msg, f.which.clone(), e)),
+                        Err(why) => {
+                            eprintln!("atrium-mail: quick look: {why}");
+                            mail.look_failed(&why);
+                        }
+                    }
+                }
+            }
+        } else if mail.looking().is_some() {
+            mail.look_failed("Quick look needs Limen, which isn't running");
+        }
         if let Some(embeds) = &embeds {
             let want = mail.framed();
             // A new viewer for another message, or for a document converted again.
@@ -403,6 +499,47 @@ fn main() {
                             Some(limen::doc_viewer::ToParent::Error { code }) => eprintln!("atrium-mail: doc-viewer error {code}"),
                             _ => {}
                         }
+                    }
+                    // The picker made the new file: write the attachment into it.
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if saving.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let fd = embeds.borrow_mut().take_fd();
+                        let (_, msg, f) = saving.as_ref().unwrap();
+                        match (limen::picker::ToParent::decode(&bytes), fd) {
+                            (Some(limen::picker::ToParent::File { name, write: true, .. }), Some(fd)) => {
+                                let r = engine.attachment(*msg, &f.which).map_err(|e| e.to_string()).and_then(|a| {
+                                    let mut out = File::from(fd);
+                                    out.write_all(&a.bytes).and_then(|_| out.sync_all()).map_err(|e| e.to_string())
+                                });
+                                mail.file_note(match r {
+                                    Ok(()) => format!("Saved {name}"),
+                                    Err(why) => format!("Couldn't save {name}: {why}"),
+                                });
+                            }
+                            _ => eprintln!("atrium-mail: an odd message with a descriptor from the picker"),
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if saving.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let end = match limen::picker::ToParent::decode(&bytes) {
+                            Some(limen::picker::ToParent::Done { .. } | limen::picker::ToParent::Cancelled) => true,
+                            Some(limen::picker::ToParent::Failed { why }) => {
+                                mail.file_note(format!("The picker couldn't save it: {why}"));
+                                true
+                            }
+                            _ => false,
+                        };
+                        if end {
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                            saving = None;
+                            mail.set_saving(false);
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if saving.as_ref().is_some_and(|s| s.0 == embed) => {
+                        saving = None;
+                        mail.set_saving(false);
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if looked.as_ref().is_some_and(|l| l.2 == embed) => {
+                        looked = None;
+                        mail.look_failed("The viewer went away");
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if frame.as_ref().is_some_and(|f| f.embed == embed) => {
                         eprintln!("atrium-mail: the doc-viewer went away");

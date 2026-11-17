@@ -312,6 +312,11 @@ pub struct Capabilities {
     /// settings app.
     #[serde(rename = "app-grants")]
     pub app_grants: Option<bool>,
+    /// A mail app's attachments (mail.md §8.2): hand portcullisd a sealed,
+    /// read-only memory file with a press, to open in the person's default
+    /// app for its type (`OpenAttachment`). Never a path, never a program.
+    #[serde(rename = "open-attachments")]
+    pub open_attachments: Option<bool>,
     /// The person's workspaces (homes.md §5): list, make, change, stop and
     /// delete them, and open their terminals, over portcullisd's socket.
     /// Restricted to the Workspaces app.
@@ -390,7 +395,7 @@ impl Capabilities {
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
             ("navigator-broker", self.navigator_broker),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
-            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
             ("protected-media", self.protected_media),
         ];
@@ -605,6 +610,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         home_files:       ovr.home_files.or(base.home_files),
         consoles:         ovr.consoles.or(base.consoles),
         app_grants:       ovr.app_grants.or(base.app_grants),
+        open_attachments: ovr.open_attachments.or(base.open_attachments),
         workspaces:       ovr.workspaces.or(base.workspaces),
         workspace_exec:   ovr.workspace_exec.or(base.workspace_exec),
         bluetooth_control: ovr.bluetooth_control.or(base.bluetooth_control),

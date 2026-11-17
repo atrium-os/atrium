@@ -2,7 +2,9 @@
 # reached through Arca's mail courier, and remote pictures, only when the
 # person asks (§7.4), through its own Nuntius fetcher (net-fetch). HTML
 # bodies are drawn by a jailed doc-viewer in a slot (§7.3). It takes
-# mailto: links (§13, opening-links.md §4.1).
+# mailto: links (§13, opening-links.md §4.1). Attachments are never written
+# to a temporary file (§8.2): quick look and Open get sealed memory files,
+# Save goes through the system picker.
 [app]
 id          = "org.atrium.mail"
 name        = "Mail"
@@ -15,6 +17,9 @@ icon        = "envelope"
 graphics  = "fresco"
 network   = "none"
 net-fetch = true   # remote pictures, only when asked
+# Open in… (§8.2): a sealed, read-only memory file to portcullisd with a
+# press; it picks the person's default app from the bytes' type.
+open-attachments = true
 
 [[links]]
 schemes = ["mailto"]

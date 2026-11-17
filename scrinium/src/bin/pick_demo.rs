@@ -83,7 +83,7 @@ fn main() {
     let kind = if std::env::var("PICK_KIND").as_deref() == Ok("folder") { Kind::Folder } else { Kind::File };
     let write = std::env::var_os("PICK_WRITE").is_some();
     let extensions: Vec<String> = std::env::var("PICK_EXT").map(|s| s.split(',').filter(|e| !e.is_empty()).map(|e| e.to_ascii_lowercase()).collect()).unwrap_or_default();
-    let filter = Filter { kind, extensions, multiple: false, write, title: if kind == Kind::Folder { "Choose a folder for your notes".into() } else { "Open a note".into() } };
+    let filter = Filter { kind, extensions, multiple: false, write, title: if kind == Kind::Folder { "Choose a folder for your notes".into() } else { "Open a note".into() }, ..Filter::file() };
     let until = std::env::var("PICK_SECS").ok().and_then(|s| s.parse::<u64>().ok()).map(|s| Instant::now() + Duration::from_secs(s));
 
     let mut win = match Window::open(&WindowDesc::new("Notes", SizeSpec::Fixed(760, 540))) {

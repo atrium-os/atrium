@@ -300,6 +300,7 @@ pub struct CapabilityDelta {
     pub home_files:      bool,
     pub consoles:        bool,
     pub app_grants:      bool,
+    pub open_attachments: bool,
     pub workspaces:      bool,
     pub workspace_exec:  bool,
     pub bluetooth_control: bool,
@@ -360,6 +361,7 @@ impl CapabilityDelta {
             && !self.home_files
             && !self.consoles
             && !self.app_grants
+            && !self.open_attachments
             && !self.workspaces
             && !self.workspace_exec
             && !self.bluetooth_control
@@ -416,6 +418,7 @@ impl CapabilityDelta {
         if self.home_files      { out.push("Read and change all of your own files (Documents, Downloads, Pictures, Music, Videos)".into()); }
         if self.consoles        { out.push("Show apps' consoles, and open more of them".into()); }
         if self.app_grants      { out.push("See what each app may do, and allow or remove it".into()); }
+        if self.open_attachments { out.push("Open the files you receive in your apps, when you press Open".into()); }
         if self.workspaces      { out.push("Make, change and delete your workspaces, and open their terminals".into()); }
         if self.workspace_exec  { out.push("Build and run commands in the workspaces you pick in it".into()); }
         if self.bluetooth_control { out.push("Pair, connect and forget Bluetooth devices".into()); }
@@ -523,6 +526,7 @@ pub fn compute_delta(
     bool_cap!(home_files);
     bool_cap!(consoles);
     bool_cap!(app_grants);
+    bool_cap!(open_attachments);
     bool_cap!(workspaces);
     bool_cap!(workspace_exec);
     bool_cap!(bluetooth_control);
@@ -781,6 +785,7 @@ run_as = "_navpage"
             home_files: None,
             consoles: None,
             app_grants: None,
+            open_attachments: None,
             workspaces: None,
             workspace_exec: None,
             bluetooth_control: None,

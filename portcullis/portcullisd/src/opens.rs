@@ -241,6 +241,36 @@ pub fn check(fd: &OwnedFd, write: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Check an attachment's descriptor (mail.md §8.2): a regular file
+/// sealed against writing, growing and shrinking, so what the app gets is
+/// what the person pressed Open on; its first bytes, for its type.
+pub fn check_sealed(fd: &OwnedFd) -> Result<Vec<u8>, String> {
+    check(fd, false)?;
+    // SAFETY: F_GET_SEALS on a descriptor we hold.
+    let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+    if seals < 0 {
+        return Err(format!("not a sealed memory file ({})", io::Error::last_os_error()));
+    }
+    let want = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    if seals & want != want {
+        return Err("not sealed against changes".into());
+    }
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::from(fd.try_clone().map_err(|e| e.to_string())?);
+    let mut head = vec![0u8; atrium_types::HEAD];
+    let mut got = 0;
+    while got < head.len() {
+        match f.read_at(&mut head[got..], got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+    head.truncate(got);
+    Ok(head)
+}
+
 /// Narrow `fd` to what an app may do with an opened file (§6.2): read,
 /// seek, fstat; and, for an edit, write, ftruncate, fsync. Nothing else
 /// (no fchmod, fchown, fexecve, executable mappings).

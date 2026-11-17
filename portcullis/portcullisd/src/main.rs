@@ -438,6 +438,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             handle_open(uid, &owner, req, &shared, &mut writer, &reader)?;
             continue;
         }
+        /* ★ Attachments (mail.md §8.2): from a mail app, by its installed
+         * manifest's `open-attachments`; a sealed memory file follows. */
+        if let Request::OpenAttachment { name, activation } = req {
+            handle_open_attachment(uid, &owner, &name, activation, &shared, &mut writer, &reader)?;
+            continue;
+        }
         /* ★ Opening links (opening-links.md §5): only from Monstrator, by
          * its system user; the person is the asking app's. */
         if matches!(req, Request::LinkGrant { .. } | Request::DeliverLink { .. }) {
@@ -1118,6 +1124,82 @@ fn handle_open(
         }
         _ => unreachable!("routed by serve()"),
     }
+}
+
+/// OpenAttachment (mail.md §8.2): the caller holds `open-attachments`;
+/// the descriptor is a sealed, read-only memory file; its type comes from
+/// its bytes and name, decided here; it goes read-only to the person's
+/// default app for that type. The press is spent last, so a refusal
+/// doesn't use it up.
+fn handle_open_attachment(
+    uid:        u32,
+    owner:      &str,
+    name:       &str,
+    activation: [u8; 16],
+    shared:     &Mutex<Tenants>,
+    writer:     &mut UnixStream,
+    reader:     &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    use portcullis_policy::opens::Defaults;
+    use portcullisd::opens::{self, Delivery, Hub};
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: attachment REFUSED to uid {uid}: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    if !caller.as_deref().is_some_and(launch::app_opens_attachments) {
+        return refuse(writer, format!("cap.open_attachments.denied: {} may not open attachments",
+                                      caller.as_deref().unwrap_or("a process that is not a launched app")));
+    }
+    if name.is_empty() || name.contains(['/', '\0']) || name.len() > atrium_open::MAX_NAME || name == "." || name == ".." {
+        return refuse(writer, "the attachment's name, not a path".into());
+    }
+    write_response(writer, &Response::ReadyForFds)?;
+    if !reader.buffer().is_empty() {
+        return refuse(writer, "protocol violation: data buffered before the descriptor".into());
+    }
+    let mut fds = match portcullis_ipc::recv_fds(reader.get_ref(), 1) {
+        Ok(v) if v.len() == 1 => v,
+        Ok(v) => return refuse(writer, format!("expected one descriptor, got {}", v.len())),
+        Err(e) => return refuse(writer, format!("recv_fds: {e}")),
+    };
+    let fd = fds.pop().unwrap();
+    let head = match opens::check_sealed(&fd) {
+        Ok(h) => h,
+        Err(why) => return refuse(writer, format!("“{name}”: {why}")),
+    };
+    let d = atrium_types::detect(name, &head);
+    let Some(t) = d.known().filter(|t| t.family.declarable()) else {
+        return refuse(writer, d.question().unwrap_or_else(|| "No app opens this kind of file.".into()));
+    };
+    let apps = launch::apps_opening(t.mime);
+    let defaults = Defaults::load(&Defaults::user_path(owner)).unwrap_or_default();
+    let app = defaults.app_for(t.mime, |id| apps.iter().any(|(a, _, _)| a == id)).or_else(|| apps.first().map(|a| a.0.clone()));
+    let Some(app) = app else {
+        return refuse(writer, format!("No app opens {} yet", t.words));
+    };
+    let app_name = apps.iter().find(|a| a.0 == app).map(|a| a.1.clone()).unwrap_or_else(|| app.clone());
+    if let Err(why) = may_run_unasked(&app, owner, shared) {
+        return refuse(writer, why);
+    }
+    if let Err(e) = opens::narrow(&fd, false) {
+        return refuse(writer, format!("cap_rights_limit: {e}"));
+    }
+    if let Err(why) = opens::spend_press(&opens::activation_socket(), activation, uid) {
+        return refuse(writer, why);
+    }
+    let hub = Hub::global();
+    if let Err(e) = hub.listen(&app) {
+        return refuse(writer, format!("{app}'s document channel: {e}"));
+    }
+    match hub.deliver(owner, &app, name, t.mime, false, fd) {
+        Ok(Delivery::Sent) => {}
+        Ok(Delivery::Queued) => start_for(&app, owner, "to open an attachment"),
+        Err(e) => return refuse(writer, e.to_string()),
+    }
+    eprintln!("portcullisd: attachment “{name}” ({}) opened in {app} for {owner}", t.mime);
+    write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })
 }
 
 /// LinkGrant and DeliverLink (opening-links.md §5). `user` is the
@@ -2281,7 +2363,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::OpenApps { .. } | Request::OpenFile { .. } => Response::Error {
+        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },
