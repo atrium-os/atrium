@@ -1,7 +1,7 @@
 # Tessera at-rest encryption
 
 **Status: accepted 2026-11-17** (Shankar: "continue as planned", all §14 decisions as
-recommended). E0 under way.
+recommended). E0 done; cipher changed to XAES-256-GCM after E0 (decision 3).
 **Scope:** encrypting Tessera on disk: what is encrypted and with which key, how
 metadata is authenticated so that the kernel never parses bytes an attacker wrote, where
 keys live (Arca), crypto-erase, dedup under encryption, rollback, and trusted Tessera
@@ -40,7 +40,7 @@ dedup existence oracle), [tessera-quotas.md](tessera-quotas.md) (domains),
     boots from and where arcad lives, so no Arca key can open it before boot. Sealing it
     is the full disk encryption question of §11.
 - **AEAD, never XTS.** On a sealed stick, every block, pack and blob is sealed with an AEAD
-  (XChaCha20-Poly1305, §5.1). Each parent records its children's authentication tags,
+  (XAES-256-GCM, or XChaCha20-Poly1305 on chips without AES instructions, §5.1). Each parent records its children's authentication tags,
   so the tree checks itself from the superblock down. The kernel verifies a block before
   it decodes a single byte of it. Replacing any block with an older copy of itself is
   detected.
@@ -194,20 +194,29 @@ not check them today; §10 makes it refuse before any sealed stick exists.
 
 ### 5.1 The AEAD
 
-**XChaCha20-Poly1305** with a fresh random 24-byte nonce for every sealed unit, from the
-kernel's `arc4random_buf`.
+**XAES-256-GCM** ([c2sp.org/XAES-256-GCM](https://c2sp.org/XAES-256-GCM)) with a fresh
+random 24-byte nonce for every sealed unit, from the kernel's `arc4random_buf`. Shankar
+chose it over XChaCha20-Poly1305 on 2026-11-17 after E0 (below).
 
 - Random 192-bit nonces mean a nonce never needs to be derived from state. A crash that
   reuses a generation number, a replayed journal, or two machines writing the same stick
-  never risk nonce reuse. That rules out AES-GCM with 96-bit nonces, which this volume's
-  lifetime write count would push towards the birthday bound, and which is catastrophic
-  on reuse.
-- It is what Arca uses (arca.md §6.1), and what the format's key slots were already
-  reserved for (`tessera_key_slot_t`).
-- It is constant-time in plain software, so CPUs without AES instructions are safe too.
-- The format has a suite byte, so a second suite can be added later. The candidate is
-  XAES-256-GCM (C2SP), which is faster on CPUs with AES instructions. E0's numbers are
-  below.
+  never risk nonce reuse. That rules out plain AES-GCM with 96-bit nonces, which this
+  volume's lifetime write count would push towards the birthday bound, and which is
+  catastrophic on reuse. XAES derives a per-unit AES-256-GCM key from the first 12 nonce
+  bytes (CMAC-based, two AES blocks, with `K1` computed once per key) and uses the last
+  12 as the GCM nonce.
+- It runs on the AES and carry-less multiply instructions that every amd64 CPU of the
+  last decade, Apple silicon, Graviton, Ampere and the Raspberry Pi 5 have, at 2 to 5
+  times the speed of XChaCha20-Poly1305 on the same OpenSSL assembly (E0).
+- **Suite byte.** 1 = XAES-256-GCM (default), 2 = XChaCha20-Poly1305. A volume is made
+  with suite 2 only on a CPU without AES instructions (arm64 without the crypto
+  extension, such as the Raspberry Pi 4), where ChaCha on NEON is several times faster
+  than AES and software AES is hard to make constant-time. Every kernel reads both
+  suites, so a stick made on either kind of machine opens on the other, just slower.
+  Without AES instructions the kernel's AES is `ossl(4)`'s constant-time vector AES
+  (vpaes), never the table-based `rijndael` code.
+- Key slots (§5.2) keep XChaCha20-Poly1305 for their 32-byte wraps, as format.h
+  reserved them: arcad does those in software, a few per mount.
 
 A sealed unit is `nonce[24] | ciphertext | tag[16]`. The AAD always starts with the
 volume uuid and a one-byte object kind, so no unit can be moved to another volume or
@@ -256,7 +265,7 @@ nothing of the content. It is authenticated rather than encrypted:
 - `encryption_flags` (reserved in format.h as "bit 0 = AES-XTS active, bit 1 =
   convergent") is redefined, which is safe because no volume has ever set it: bit 0 =
   sealed, bit 1 = has key groups. The "convergent" bit is retired (§6).
-- `reserved_e0` becomes the **suite** byte (1 = XChaCha20-Poly1305).
+- `reserved_e0` becomes the **suite** byte (1 = XAES-256-GCM, 2 = XChaCha20-Poly1305; §5.1).
 - `master_key_id` holds the VK's key id. A new 32-byte field from the trailing slack
   holds `check` (§4.2).
 - **`hmac[32]`** (reserved in format.h) holds `HMAC-SHA-256(K_meta, superblock with
@@ -585,7 +594,7 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 
 | step | what | done when |
 |---|---|---|
-| E0 | Crypto in the kmod's Rust part (XChaCha20-Poly1305, HKDF, HMAC, keyed BLAKE3, FPU bracketing); bench on the arm64 VM under HVF and on an x86_64 box, against XAES-256-GCM | throughput per core of both suites recorded in this spec; decision 3 confirmed |
+| E0 | Suite benchmark on the kernel's candidate code paths, vectors checked | **done 2026-11-17** (a09cb45, 007eb73): numbers in §5.1 for x86_64 and Apple M4; XAES-256-GCM chosen; in-kernel timing moves to E1 |
 | E1 | Sealed volumes (layer A): incompat bit and readers refusing it, superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded |
 | E2 | Arca: `VolumeKey`, `/dev/tesserakeys` held by arcad, `LOAD`/`MINT`/`RECORD_GENERATION`/`FORGET` | arca-vm-test: key loads only for the active, unlocked owner, never released by any op; a mount with the wrong key id or a foreign uuid is refused |
 | E3 | Trusted sticks: format from Scrinium, probe, kernel mount, Locked state, recovery code, high-water, eject recording | vm-automount-check: a sealed stick opens for its persona only; a stick from another machine is Locked; a recovery code adopts it; an older image is refused and opens read-only after verification; forgetting the key leaves it Locked |
@@ -606,8 +615,10 @@ Accepted 2026-11-17, all as recommended.
    on every blob and group record in a key group; no XTS.** Format.h's
    "AES-XTS" and "convergent" reservations are redefined (nothing on disk uses them).
    *Recommend yes.*
-3. **Cipher suite: XChaCha20-Poly1305**, with a suite byte left for XAES-256-GCM if E0
-   shows ChaCha costs too much on CPUs with AES instructions. *Recommend yes.*
+3. **Cipher suite: XAES-256-GCM**, with XChaCha20-Poly1305 as suite 2 for CPUs without
+   AES instructions. *Changed by Shankar 2026-11-17 after E0* (the spec first recommended
+   XChaCha20-Poly1305; E0 showed it slower than SHA-256 on the M4 and 2 to 5 times
+   slower than XAES on the same assembly).
 4. **Keys only ever in Arca and the kernel:** new kind `VolumeKey`, loaded by arcad
    through `/dev/tesserakeys`, formatting done by the kernel. *Recommend yes.*
 5. **The internal Tessera volume stays unsealed for now**, because the loader boots from
