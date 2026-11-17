@@ -51,6 +51,12 @@ pub enum Cmd {
     /// The password bar's field submitted (to set, or to open a file).
     PasswordDone,
     PasswordClose,
+    /// Closing with unsaved changes: save first (then close).
+    CloseSave,
+    /// Closing with unsaved changes: close without them.
+    CloseDiscard,
+    /// Closing with unsaved changes: keep the window open.
+    CloseCancel,
     Open,
     Save,
     SaveAs,
@@ -154,6 +160,8 @@ pub struct PasswordBar {
 pub struct Slides {
     pub password: Mutable<PasswordBar>,
     pub password_text: Mutable<TextEdit>,
+    /// Asking whether to save before the window closes.
+    pub closing: Mutable<bool>,
     pub doc: Rc<RefCell<Doc>>,
     pub ui: Mutable<Ui>,
     pub rev: Mutable<u64>,
@@ -207,6 +215,7 @@ impl Slides {
         Slides {
             password: Mutable::new(PasswordBar::default()),
             password_text: Mutable::new(TextEdit::new("").secret(true)),
+            closing: Mutable::new(false),
             doc: Rc::new(RefCell::new(doc)),
             ui,
             rev,
@@ -347,6 +356,16 @@ impl Slides {
                     true
                 }
                 Cmd::PasswordDone => true,
+                Cmd::CloseCancel => {
+                    self.closing.set(false);
+                    self.changed();
+                    false
+                }
+                Cmd::CloseSave | Cmd::CloseDiscard => {
+                    self.closing.set(false);
+                    self.changed();
+                    true
+                }
                 c => !self.run_cmd(c),
             })
             .collect()
@@ -569,7 +588,7 @@ impl Slides {
                 let to = if c == Cmd::BringForward { at + 1 } else { at.saturating_sub(1) };
                 d.run(if c == Cmd::BringForward { "Bring Forward" } else { "Send Backward" }, vec![DeckOp::MoveShape { target: Target::Slide(sid), id, to }]);
             }
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce | Cmd::PasswordOpen | Cmd::PasswordDone | Cmd::PasswordClose => return false,
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce | Cmd::PasswordOpen | Cmd::PasswordDone | Cmd::PasswordClose | Cmd::CloseSave | Cmd::CloseDiscard | Cmd::CloseCancel => return false,
         }
         drop(d);
         self.changed();
@@ -1248,6 +1267,19 @@ impl View for Slides {
             ctx.add(Node::Rect { rect: PRect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
+        // Closing with unsaved changes: save them, drop them, or stay.
+        if self.closing.get() {
+            let (y, bh) = (TOOLBAR_H, 48.0);
+            let back = ctx.add(Node::Rect { rect: PRect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            let ask = format!("Save the changes to “{}” before closing?", self.doc.borrow().name);
+            ctx.add(Node::Text { rect: PRect::new(12.0, y + 14.0, (w - 360.0).max(120.0), 20.0), content: ask, style: text_style(type_size::MD, Weight::Semibold, t.text_primary()) });
+            Button::secondary("Don't Save").at(w - 324.0, y + 8.0).width(110.0).on_click(self.cmd(Cmd::CloseDiscard)).render(ctx);
+            Button::secondary("Cancel").at(w - 206.0, y + 8.0).width(90.0).on_click(self.cmd(Cmd::CloseCancel)).render(ctx);
+            Button::primary("Save").at(w - 108.0, y + 8.0).width(96.0).on_click(self.cmd(Cmd::CloseSave)).render(ctx);
+            ctx.add(Node::Rect { rect: PRect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         if self.ui.get_cloned().asking {
             let id = ctx.add(Node::Rect { rect: PRect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
             ctx.slot(id, PICKER_SLOT);
@@ -1455,6 +1487,30 @@ mod tests {
         assert_eq!(r, Rect::new(0, 0, 150, 130));
         let r = resized(Rect::new(0, 0, 100, 100), 0, 200, 200, 10);
         assert_eq!(r, Rect::new(90, 90, 10, 10));
+    }
+
+    #[test]
+    fn closing_with_changes_asks_first() {
+        let s = Slides::new(Doc::new("talk"), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        s.closing.set(true);
+        let t = texts();
+        for want in ["Don't Save", "Cancel", "Save"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        assert!(t.iter().any(|x| x.starts_with("Save the changes to “talk") && x.ends_with("before closing?")), "{t:?}");
+        s.cmds.lock().unwrap().push(Cmd::CloseCancel);
+        assert!(s.take_cmds().is_empty());
+        assert!(!s.closing.get());
+        for c in [Cmd::CloseSave, Cmd::CloseDiscard] {
+            s.closing.set(true);
+            s.cmds.lock().unwrap().push(c);
+            assert_eq!(s.take_cmds(), [c]);
+            assert!(!s.closing.get());
+        }
     }
 
     #[test]

@@ -35,6 +35,12 @@ pub enum Cmd {
     /// The password bar's field submitted (to set, or to open a file).
     PasswordDone,
     PasswordClose,
+    /// Closing with unsaved changes: save first (then close).
+    CloseSave,
+    /// Closing with unsaved changes: close without them.
+    CloseDiscard,
+    /// Closing with unsaved changes: keep the window open.
+    CloseCancel,
     Open,
     Save,
     SaveAs,
@@ -151,13 +157,15 @@ pub struct Sheets {
     pub filter: Mutable<FilterPanel>,
     pub filter_search: Mutable<TextEdit>,
     pub filter_scroll: Mutable<ScrollState>,
+    /// Asking whether to save before the window closes.
+    pub closing: Mutable<bool>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -545,6 +553,23 @@ impl View for Sheets {
             Button::primary("Apply").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::FilterApply)).render(ctx);
         }
 
+        // Closing with unsaved changes: save them, drop them, or stay.
+        if self.closing.get() {
+            let (y, bh) = (TOOLBAR_H, 48.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, bh), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let ask = format!("Save the changes to “{}” before closing?", self.doc.borrow().name);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, (w - 360.0).max(120.0), 20.0), content: ask, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            Button::secondary("Don't Save").at(w - 324.0, y + 8.0).width(110.0).on_click(push(Cmd::CloseDiscard)).render(ctx);
+            Button::secondary("Cancel").at(w - 206.0, y + 8.0).width(90.0).on_click(push(Cmd::CloseCancel)).render(ctx);
+            Button::primary("Save").at(w - 108.0, y + 8.0).width(96.0).on_click(push(Cmd::CloseSave)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + bh - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
         if self.ui.get_cloned().asking {
             // The system places the picker's sheet over the window.
             let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
@@ -593,6 +618,16 @@ impl Sheets {
                 Cmd::FilterApply => {
                     self.apply_values();
                     false
+                }
+                Cmd::CloseCancel => {
+                    self.closing.set(false);
+                    self.changed();
+                    false
+                }
+                Cmd::CloseSave | Cmd::CloseDiscard => {
+                    self.closing.set(false);
+                    self.changed();
+                    true
                 }
                 Cmd::FilterCancel => {
                     self.filter.set(FilterPanel::default());
@@ -676,6 +711,30 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn closing_with_changes_asks_first() {
+        let (d, _) = Doc::from_csv("sums.csv", b"a,1\n").unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        s.closing.set(true);
+        let t = texts();
+        for want in ["Save the changes to “sums.csv” before closing?", "Don't Save", "Cancel", "Save"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        s.cmds.lock().unwrap().push(Cmd::CloseCancel);
+        assert!(s.take_cmds().is_empty());
+        assert!(!s.closing.get());
+        for c in [Cmd::CloseSave, Cmd::CloseDiscard] {
+            s.closing.set(true);
+            s.cmds.lock().unwrap().push(c);
+            assert_eq!(s.take_cmds(), [c]);
+            assert!(!s.closing.get());
+        }
+    }
 
     #[test]
     fn a_filter_column_s_values_are_chosen_from_a_list() {

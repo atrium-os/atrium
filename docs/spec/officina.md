@@ -3443,6 +3443,26 @@ undo step. The list draws only the rows in view, so documents with up to
 4,096 styles scroll smoothly. Close or the menu item hides the pane.
 Editing styles stays in the style bar (§16.52, §16.55).
 
+### 16.57 Asking before closing with unsaved changes (2026-11-17)
+
+Write, Sheets and Slides no longer close silently with unsaved changes.
+frescod only asks a window to close (`WindowCloseRequested`), and the
+app decides. With unsaved changes a bar under the toolbar asks "Save the
+changes to “name” before closing?" and offers Don't Save, Cancel and
+Save.
+
+* Save saves to the document's file and closes. A document without one
+  (new, or read from a format the app doesn't write) opens the picker's
+  Save As and closes once it is saved. Cancelling the picker leaves the
+  window open.
+* Don't Save closes and removes the autosave folder, so the changes
+  don't come back at the next start.
+* Cancel puts the bar away.
+
+A second close request while the bar shows (or while the picker is up)
+closes as before. The changes stay in the autosave folder and come back
+at the next start, so nothing is lost when the window has to go.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
