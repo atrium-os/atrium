@@ -18,6 +18,16 @@ pub(crate) const TERMS: TableDefinition<(&str, u64), u8> = TableDefinition::new(
 /// message → its terms (postcard `Vec<String>`).
 pub(crate) const MSG_TERMS: TableDefinition<u64, &[u8]> = TableDefinition::new("search_msg_terms");
 
+/// id → a saved search (postcard [`Saved`]): the smart folders (§11.2).
+pub(crate) const SAVED: TableDefinition<u32, &[u8]> = TableDefinition::new("saved_searches");
+
+/// A search kept as a place in the sidebar.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Saved {
+    pub name: String,
+    pub query: String,
+}
+
 /// Where a term was found.
 pub mod field {
     pub const FROM: u8 = 1;
@@ -185,5 +195,39 @@ impl Store {
             v.push(e?.0.value());
         }
         Ok(v)
+    }
+}
+
+impl Store {
+    /// The saved searches, in the order they were made.
+    pub fn saved_searches(&self) -> Result<Vec<(u32, Saved)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(SAVED)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            out.push((k.value(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Keep `query` as a saved search called `name`; its id.
+    pub fn save_search(&self, name: &str, query: &str) -> Result<u32> {
+        let tx = self.db.begin_write()?;
+        let id = {
+            let mut t = tx.open_table(SAVED)?;
+            let id = t.last()?.map_or(1, |(k, _)| k.value() + 1);
+            t.insert(id, enc(&Saved { name: name.into(), query: query.into() }).as_slice())?;
+            id
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn forget_search(&self, id: u32) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(SAVED)?.remove(id)?;
+        tx.commit()?;
+        Ok(())
     }
 }

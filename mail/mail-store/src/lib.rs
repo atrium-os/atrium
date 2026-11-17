@@ -253,6 +253,7 @@ impl Store {
             tx.open_table(thread::VIEWS)?;
             tx.open_table(search::TERMS)?;
             tx.open_table(search::MSG_TERMS)?;
+            tx.open_table(search::SAVED)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();

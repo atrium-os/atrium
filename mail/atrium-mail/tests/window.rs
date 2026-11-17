@@ -464,3 +464,88 @@ fn attachments_show_what_they_are_and_quick_look_text() {
     mail.close_look();
     assert!(mail.looking().is_none());
 }
+
+#[test]
+fn search_as_you_type_and_a_saved_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
+        ]).unwrap();
+        let f = |uid: u32, from: &str, subject: &str, body: &str, t: i64| {
+            let bytes = message(uid, from, subject, body, false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![
+            f(1, "Arun <arun@acme.example>", "Q4 numbers", "The northern region grew.", NOW - 300),
+            f(2, "Lena <lena@partner.example>", "Lunch", "North Beach on Friday?", NOW - 200),
+            f(3, "Sam <sam@acme.example>", "Hello", "Nothing to see.", NOW - 100),
+        ]).unwrap();
+        sink.messages("Archive", vec![f(9, "Arun <arun@acme.example>", "Old north plan", "From last year.", NOW - 400)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    assert!(texts(&app).iter().any(|x| x == "Search"));
+
+    // `/` puts the caret in the search; keys are the query's now, even e and j.
+    assert!(mail.key(&key("/"), None));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x.starts_with("Words anywhere")), "{:?}", texts(&app));
+    for c in ["n", "o", "r"] {
+        assert!(mail.key(&key(c), None));
+    }
+    // "nor" matches the start of words, in every folder, newest first.
+    assert_eq!(subjects(&mail), ["Lunch", "Q4 numbers", "Old north plan"]);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "3 found"));
+    assert!(mail.key(&key("t"), None));
+    assert!(mail.key(&key("h"), None));
+    assert_eq!(mail.ui.get_cloned().search.unwrap().query, "north");
+    // Enter: whole words only ("northern" drops out) and the first opens.
+    assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Enter, modifiers: Modifiers::default(), chars: String::new() }, None));
+    assert_eq!(subjects(&mail), ["Lunch", "Old north plan"]);
+    assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Lunch");
+    // Now j moves through the results; one in Archive reads from there.
+    assert!(mail.key(&key("j"), None));
+    let r = mail.ui.get_cloned().reading.unwrap();
+    assert_eq!(r.subject, "Old north plan");
+    let archive = mail.ui.get_cloned().places.iter().find(|p| p.label == "Archive").unwrap().folder;
+    assert_eq!(r.folder, Some(archive));
+    assert!(r.msgs[0].here.is_some());
+
+    // Save: a place in the sidebar; choosing it searches again.
+    mail.save_search();
+    app.tick();
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.saved.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["north"]);
+    assert!(texts(&app).iter().any(|x| x == "SAVED SEARCHES"));
+    assert_eq!(engine.store.saved_searches().unwrap().len(), 1);
+
+    // Escape: back to the inbox.
+    assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
+    assert!(mail.ui.get_cloned().search.is_none());
+    assert_eq!(subjects(&mail), ["Hello", "Lunch", "Q4 numbers"]);
+
+    // Operators: from Arun with "plan", via the saved place too.
+    mail.search_for("from:arun@acme.example plan", None);
+    assert_eq!(subjects(&mail), ["Old north plan"]);
+    let id = mail.ui.get_cloned().saved[0].id;
+    mail.search_for("north", Some(id));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Remove"));
+    // Archive from the results: out of them, Undo puts it back.
+    mail.open(0);
+    assert!(mail.key(&key("e"), None));
+    assert_eq!(subjects(&mail), ["Old north plan"]);
+    mail.forget_search(id);
+    assert!(mail.ui.get_cloned().saved.is_empty());
+    assert!(engine.store.saved_searches().unwrap().is_empty());
+}

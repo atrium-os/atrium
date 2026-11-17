@@ -22,6 +22,8 @@ use crate::plain::{self, Plain};
 use crate::sender::{self, Check, Sender};
 
 pub fn side_w() -> f32 { em(224.0) }
+/// The search box's row in the sidebar.
+pub fn search_h() -> f32 { em(44.0) }
 pub fn list_w() -> f32 { em(400.0) }
 /// A list row: sender and time, subject, preview.
 pub fn row_h() -> f32 { em(72.0) }
@@ -126,6 +128,9 @@ pub struct Shown {
     pub framed: Option<usize>,
     /// Bumped on every change, for the laid-out lines.
     pub version: u64,
+    /// The folder the messages' `here` UIDs are in: the chosen folder, or
+    /// for a search result the folder the message was found in.
+    pub folder: Option<FolderId>,
 }
 
 impl Shown {
@@ -199,9 +204,34 @@ pub enum FileAct {
     Save,
 }
 
+/// A search (§11.2): what is typed, and what it finds. While it is up the
+/// list shows its results in place of the chosen folder.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Search {
+    pub query: String,
+    /// Where the caret is in `query`.
+    pub caret: usize,
+    /// Keys go to the query (after `/`); Enter or Down hand them back to
+    /// the list.
+    pub typing: bool,
+    pub hits: Vec<mail_engine::search::Hit>,
+    /// The saved search this is, when one was chosen or saved.
+    pub saved: Option<u32>,
+}
+
+/// A saved search in the sidebar (a smart folder).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPlace {
+    pub id: u32,
+    pub name: String,
+    pub query: String,
+}
+
 /// The window's state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ui {
+    pub search: Option<Search>,
+    pub saved: Vec<SavedPlace>,
     /// Quick look of an attachment (§8.1).
     pub look: Option<LookPane>,
     /// What became of Open or Save ("Opening in Atrium PDF…", or why not).
@@ -261,6 +291,8 @@ pub struct Mail {
     composes: Rc<RefCell<Vec<(mail_engine::compose::Compose, Option<u64>)>>>,
     /// Attachment asks for the app.
     asks: Rc<RefCell<Vec<FileAsk>>>,
+    /// The search being typed.
+    find: Rc<RefCell<pergola::text_edit::TextEdit>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -300,6 +332,19 @@ impl Mail {
     /// The row at `i` of the chosen folder, reading its page if needed.
     pub fn row(&self, i: usize) -> Option<ListRow> {
         let ui = self.ui.get_cloned();
+        if let Some(s) = &ui.search {
+            return s.hits.get(i).map(|h| ListRow {
+                thread: None,
+                msg: h.msg,
+                people: h.from.clone(),
+                count: 1,
+                date: h.date,
+                subject: h.subject.clone(),
+                preview: h.preview.clone(),
+                unread: h.unread,
+                flagged: false,
+            });
+        }
         let folder = ui.folder?;
         let mut p = self.pages.borrow_mut();
         if p.gen != ui.gen || p.folder != Some(folder) {
@@ -362,6 +407,19 @@ impl Mail {
         } else {
             ui.count = 0;
         }
+        ui.saved = store.saved_searches().unwrap_or_default().into_iter().map(|(id, s)| SavedPlace { id, name: s.name, query: s.query }).collect();
+        if let Some(s) = &mut ui.search {
+            // What sync brought in may match too; the row read stays put.
+            if !s.typing {
+                let shown: Option<MsgId> = ui.cursor.and_then(|c| s.hits.get(c)).map(|h| h.msg);
+                s.hits = self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default();
+                ui.cursor = shown.and_then(|m| s.hits.iter().position(|h| h.msg == m));
+                if ui.cursor.is_none() {
+                    ui.reading = None;
+                }
+            }
+            ui.count = s.hits.len();
+        }
         if ui.cursor.is_some_and(|c| c >= ui.count) {
             ui.cursor = None;
             ui.reading = None;
@@ -374,9 +432,10 @@ impl Mail {
 
     pub fn choose_folder(&self, folder: FolderId) {
         let mut ui = self.ui.get_cloned();
-        if ui.folder == Some(folder) {
+        if ui.folder == Some(folder) && ui.search.is_none() {
             return;
         }
+        ui.search = None;
         ui.folder = Some(folder);
         ui.conversations = self.engine.store.view(folder).unwrap_or(true);
         ui.count = self.count_of(folder, ui.conversations);
@@ -441,9 +500,8 @@ impl Mail {
         }
     }
 
-    fn msg_of(&self, msg: MsgId, m: &mail_store::Message, flags: u32) -> Msg {
+    fn msg_of(&self, msg: MsgId, m: &mail_store::Message, flags: u32, folder: Option<FolderId>) -> Msg {
         let s = &m.summary;
-        let folder = self.ui.get_cloned().folder;
         Msg {
             msg,
             here: m.locations.iter().find(|(f, _)| Some(*f) == folder).map(|l| l.1),
@@ -464,13 +522,19 @@ impl Mail {
     pub fn open(&self, i: usize) {
         let Some(row) = self.row(i) else { return };
         let store = &self.engine.store;
+        // A search result is read where it was found: its first folder.
+        let folder = if self.ui.get_cloned().search.is_some() {
+            store.message(row.msg).ok().and_then(|m| m.locations.first().map(|l| l.0))
+        } else {
+            self.ui.get_cloned().folder
+        };
         let mut msgs: Vec<Msg> = match row.thread {
-            Some(t) => store.thread(t).unwrap_or_default().iter().map(|m| self.msg_of(m.msg, &m.message, m.flags)).collect(),
+            Some(t) => store.thread(t).unwrap_or_default().iter().map(|m| self.msg_of(m.msg, &m.message, m.flags, folder)).collect(),
             None => Vec::new(),
         };
         if msgs.is_empty() {
             if let Ok(m) = store.message(row.msg) {
-                msgs.push(self.msg_of(row.msg, &m, if row.unread { 0 } else { flag::SEEN }));
+                msgs.push(self.msg_of(row.msg, &m, if row.unread { 0 } else { flag::SEEN }, folder));
             }
         }
         let n = msgs.len();
@@ -490,7 +554,7 @@ impl Mail {
         // Opened is read (§11.1); the "new" line still marks where they start.
         let unread: Vec<u32> = msgs.iter().filter(|m| m.open && m.new).filter_map(|m| m.here).collect();
         let mut read_any = false;
-        if let (false, Some(f)) = (unread.is_empty(), self.ui.get_cloned().folder) {
+        if let (false, Some(f)) = (unread.is_empty(), folder) {
             match self.engine.act(f, &unread, mail_engine::Action::Read(true)) {
                 Ok(_) => read_any = true,
                 Err(e) => eprintln!("atrium-mail: marking read: {e}"),
@@ -510,7 +574,13 @@ impl Mail {
             msgs,
             framed,
             version,
+            folder,
         });
+        if read_any {
+            if let Some(h) = ui.search.as_mut().and_then(|s| s.hits.get_mut(i)) {
+                h.unread = false;
+            }
+        }
         self.ui.set(ui);
         self.reader.set(ScrollState::default());
     }
@@ -685,7 +755,7 @@ impl Mail {
     /// after the undo window. The next row opens in its place.
     pub fn act(&self, action: mail_engine::Action) {
         let mut ui = self.ui.get_cloned();
-        let (Some(folder), Some(r), Some(cursor)) = (ui.folder, ui.reading.as_ref(), ui.cursor) else { return };
+        let (Some(folder), Some(r), Some(cursor)) = (ui.reading.as_ref().and_then(|r| r.folder), ui.reading.as_ref(), ui.cursor) else { return };
         let uids: Vec<u32> = r.msgs.iter().filter_map(|m| m.here).collect();
         if uids.is_empty() {
             return;
@@ -707,7 +777,16 @@ impl Mail {
                 return;
             }
         }
-        ui.count = self.count_of(folder, ui.conversations);
+        match &mut ui.search {
+            // Out of the results too, as out of a folder's list.
+            Some(s) => {
+                if cursor < s.hits.len() {
+                    s.hits.remove(cursor);
+                }
+                ui.count = s.hits.len();
+            }
+            None => ui.count = self.count_of(folder, ui.conversations),
+        }
         ui.gen += 1;
         ui.reading = None;
         ui.cursor = None;
@@ -718,6 +797,164 @@ impl Mail {
         if let Some(n) = next {
             self.open(n);
         }
+    }
+
+    // ── search (§11.2) ──────────────────────────────────────────────
+
+    /// Put the caret in the search (`/`), keeping what was typed.
+    pub fn start_search(&self) {
+        let mut ui = self.ui.get_cloned();
+        let new = ui.search.is_none();
+        let s = ui.search.get_or_insert_with(Search::default);
+        s.typing = true;
+        let mut e = self.find.borrow_mut();
+        if e.text() != s.query {
+            e.set_text(&s.query);
+        }
+        e.select_all();
+        s.caret = e.caret();
+        drop(e);
+        if new {
+            self.run_search(&mut ui);
+        }
+        self.ui.set(ui);
+    }
+
+    /// Show what `query` finds, as typed so far when `typing` (its last
+    /// word matches the start of words).
+    fn run_search(&self, ui: &mut Ui) {
+        let Some(s) = &mut ui.search else { return };
+        let q = mail_engine::search::parse(&s.query, s.typing);
+        s.hits = match self.engine.search(&q) {
+            Ok(h) => h,
+            Err(e) => {
+                ui.error = Some(format!("Couldn't search: {e}"));
+                Vec::new()
+            }
+        };
+        ui.count = s.hits.len();
+        ui.cursor = None;
+        ui.reading = None;
+        ui.link = None;
+        ui.gen += 1;
+        self.list.set(ScrollState::default());
+    }
+
+    /// Search for `query` (a saved search's, or one from elsewhere).
+    pub fn search_for(&self, query: &str, saved: Option<u32>) {
+        let mut ui = self.ui.get_cloned();
+        self.find.borrow_mut().set_text(query);
+        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved });
+        self.run_search(&mut ui);
+        self.ui.set(ui);
+    }
+
+    /// Back to the chosen folder.
+    pub fn end_search(&self) {
+        let mut ui = self.ui.get_cloned();
+        if ui.search.take().is_none() {
+            return;
+        }
+        self.find.borrow_mut().set_text("");
+        ui.count = ui.folder.map_or(0, |f| self.count_of(f, ui.conversations));
+        ui.cursor = None;
+        ui.reading = None;
+        ui.link = None;
+        ui.gen += 1;
+        self.ui.set(ui);
+        self.list.set(ScrollState::default());
+    }
+
+    /// A key while the search has the caret. Escape ends the search (or
+    /// clears it first); Enter and Down go to the results.
+    fn search_key(&self, key: &Key, modifiers: pergola::event::Modifiers, chars: &str) -> bool {
+        use pergola::text_edit::KeyOutcome;
+        let mut ui = self.ui.get_cloned();
+        match key {
+            Key::Escape => {
+                if self.find.borrow().text().is_empty() {
+                    self.end_search();
+                } else {
+                    self.find.borrow_mut().set_text("");
+                    if let Some(s) = &mut ui.search {
+                        s.query.clear();
+                        s.caret = 0;
+                        s.saved = None;
+                    }
+                    self.run_search(&mut ui);
+                    self.ui.set(ui);
+                }
+                return true;
+            }
+            Key::Down | Key::Enter => {
+                if let Some(s) = &mut ui.search {
+                    s.typing = false;
+                }
+                // Whole words now, not the start of the last one.
+                self.run_search(&mut ui);
+                let any = ui.count > 0;
+                self.ui.set(ui);
+                if any {
+                    self.open(0);
+                }
+                return true;
+            }
+            _ => {}
+        }
+        let mut e = self.find.borrow_mut();
+        let outcome = e.key(*key, modifiers, chars);
+        let handled = outcome != KeyOutcome::Ignored;
+        let changed = match outcome {
+            KeyOutcome::Changed => true,
+            KeyOutcome::Paste => pergola::clipboard::paste_text().ok().flatten().is_some_and(|t| e.insert(&t.replace(['\r', '\n'], " "))),
+            KeyOutcome::Copy(t) => {
+                let _ = pergola::clipboard::copy_text(&t, false);
+                false
+            }
+            _ => false,
+        };
+        let (text, caret) = (e.text().to_string(), e.caret());
+        drop(e);
+        let Some(s) = &mut ui.search else { return handled };
+        s.caret = caret;
+        if changed && text != s.query {
+            s.query = text;
+            s.saved = None;
+            self.run_search(&mut ui);
+        }
+        self.ui.set(ui);
+        handled
+    }
+
+    /// Keep the search as a place in the sidebar, named by its query.
+    pub fn save_search(&self) {
+        let mut ui = self.ui.get_cloned();
+        let Some(s) = &mut ui.search else { return };
+        let q = s.query.trim().to_string();
+        if q.is_empty() || s.saved.is_some() {
+            return;
+        }
+        match self.engine.store.save_search(&q, &q) {
+            Ok(id) => {
+                s.saved = Some(id);
+                ui.saved.push(SavedPlace { id, name: q.clone(), query: q });
+            }
+            Err(e) => ui.error = Some(format!("Couldn't save the search: {e}")),
+        }
+        self.ui.set(ui);
+    }
+
+    /// Take a saved search out of the sidebar.
+    pub fn forget_search(&self, id: u32) {
+        let mut ui = self.ui.get_cloned();
+        if let Err(e) = self.engine.store.forget_search(id) {
+            ui.error = Some(format!("Couldn't remove the search: {e}"));
+        }
+        ui.saved.retain(|p| p.id != id);
+        if let Some(s) = ui.search.as_mut().filter(|s| s.saved == Some(id)) {
+            s.saved = None;
+        }
+        self.ui.set(ui);
     }
 
     /// Drop the Undo toast once its time is up (called from the app's loop).
@@ -766,7 +1003,10 @@ impl Mail {
         if let Err(e) = self.engine.undo(&u.ops) {
             ui.error = Some(format!("Couldn't undo: {e}"));
         }
-        if let Some(f) = ui.folder {
+        if let Some(s) = &mut ui.search {
+            s.hits = self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default();
+            ui.count = s.hits.len();
+        } else if let Some(f) = ui.folder {
             ui.count = self.count_of(f, ui.conversations);
         }
         ui.gen += 1;
@@ -988,10 +1228,16 @@ impl Mail {
     /// is the press) and Escape closes it. Whether the key was Mail's.
     pub fn key(&self, ev: &Event, activation: Option<[u8; 16]>) -> bool {
         let Event::Key { kind, key, chars, modifiers } = ev else { return false };
-        if *kind == KeyEventKind::Up || modifiers.ctrl || modifiers.alt || modifiers.meta {
+        if *kind == KeyEventKind::Up {
             return false;
         }
         let ui = self.ui.get_cloned();
+        if ui.search.as_ref().is_some_and(|s| s.typing) {
+            return self.search_key(key, *modifiers, chars);
+        }
+        if modifiers.ctrl || modifiers.alt || modifiers.meta {
+            return false;
+        }
         if ui.link.is_some() {
             match key {
                 Key::Enter => {
@@ -1015,6 +1261,14 @@ impl Mail {
                 return true;
             }
             (Key::Char, "z") => return self.undo(),
+            (Key::Char, "/") => {
+                self.start_search();
+                return true;
+            }
+            (Key::Escape, _) if ui.search.is_some() && ui.link.is_none() => {
+                self.end_search();
+                return true;
+            }
             (Key::Char, "c") => {
                 self.write_new();
                 return true;
@@ -1211,6 +1465,7 @@ impl MailView {
             monstrator: Rc::new(monstrator::socket()),
             composes: Rc::default(),
             asks: Rc::default(),
+            find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -1308,13 +1563,15 @@ impl MailView {
         text(ctx, w - 12.0 - ww + em(9.0), head_h() / 2.0, "Write", type_size::XS, Weight::Medium, t.bg_canvas());
         ctx.pop();
         let mut y = head_h();
+        self.search_box(ctx, ui, w, y);
+        y += search_h();
         for p in &ui.places {
             if let Some(a) = &p.account {
                 y += em(8.0);
                 text(ctx, 16.0, y + em(10.0), &fit(&a.to_uppercase(), type_size::XS, Weight::Semibold, w - 32.0), type_size::XS, Weight::Semibold, t.text_tertiary());
                 y += em(20.0);
             }
-            let sel = ui.folder == Some(p.folder);
+            let sel = ui.folder == Some(p.folder) && ui.search.is_none();
             let (m, f) = (self.mail.clone(), p.folder);
             area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.choose_folder(f));
             let n = if p.count > 0 { p.count.to_string() } else { String::new() };
@@ -1331,15 +1588,109 @@ impl MailView {
         if ui.places.is_empty() {
             text(ctx, 16.0, y + em(16.0), "No accounts yet", type_size::SM, Weight::Regular, t.text_secondary());
         }
+        // Saved searches (smart folders, §11.2) under the folders.
+        if !ui.saved.is_empty() && y < h {
+            y += em(8.0);
+            text(ctx, 16.0, y + em(10.0), "SAVED SEARCHES", type_size::XS, Weight::Semibold, t.text_tertiary());
+            y += em(20.0);
+            for p in &ui.saved {
+                let sel = ui.search.as_ref().is_some_and(|s| s.saved == Some(p.id));
+                let (m, q, id) = (self.mail.clone(), p.query.clone(), p.id);
+                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.search_for(&q, Some(id)));
+                let wt = if sel { Weight::Semibold } else { Weight::Regular };
+                text(ctx, 20.0, y + place_h() / 2.0, &fit(&p.name, type_size::SM, wt, w - 40.0), type_size::SM, wt, t.text_primary());
+                ctx.pop();
+                y += place_h();
+                if y > h {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The search box under the sidebar's heading: a press (or `/`) puts
+    /// the caret in it; Mail takes the keys while it has it.
+    fn search_box(&self, ctx: &mut Ctx, ui: &Ui, w: f32, y: f32) {
+        let t = ctx.theme;
+        let r = Rect::new(12.0, y + em(4.0), w - 24.0, search_h() - em(8.0));
+        let typing = ui.search.as_ref().is_some_and(|s| s.typing);
+        let m = self.mail.clone();
+        let id = ctx.push(Node::Rect { rect: r, fill: if typing { t.focus_ring() } else { t.border_strong() }, radius: 5.0 });
+        ctx.on_click(id, move || m.start_search());
+        ctx.add(Node::Rect { rect: Rect::new(r.x() + 1.0, r.y() + 1.0, r.w() - 2.0, r.h() - 2.0), fill: t.bg_canvas(), radius: 4.0 });
+        let cy = r.y() + r.h() / 2.0;
+        let q = ui.search.as_ref().map_or("", |s| s.query.as_str());
+        let tx = r.x() + em(10.0);
+        let max = r.w() - em(20.0);
+        if q.is_empty() {
+            text(ctx, tx, cy, "Search", type_size::SM, Weight::Regular, t.text_tertiary());
+            if !typing {
+                let kw = width("/", type_size::XS, Weight::Regular);
+                text(ctx, r.x() + r.w() - em(10.0) - kw, cy, "/", type_size::XS, Weight::Regular, t.text_tertiary());
+            }
+        } else {
+            // The end of a long query stays in view, with the caret.
+            let shown = if width(q, type_size::SM, Weight::Regular) > max {
+                let chars: Vec<char> = q.chars().collect();
+                let mut k = 0;
+                while k < chars.len() && width(&chars[k..].iter().collect::<String>(), type_size::SM, Weight::Regular) > max - em(10.0) {
+                    k += 1;
+                }
+                format!("…{}", chars[k..].iter().collect::<String>())
+            } else {
+                q.to_string()
+            };
+            text(ctx, tx, cy, &shown, type_size::SM, Weight::Regular, t.text_primary());
+        }
+        if typing {
+            let s = ui.search.as_ref().map(|s| (s.query.as_str(), s.caret)).unwrap_or(("", 0));
+            let before = s.0.get(..s.1).unwrap_or(s.0);
+            let cx = (tx + width(before, type_size::SM, Weight::Regular)).min(r.x() + r.w() - em(8.0));
+            let lh = em(type_size::SM) * 1.3;
+            ctx.add(Node::Rect { rect: Rect::new(cx, cy - lh / 2.0, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+        }
+        ctx.pop();
     }
 
     fn list(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
         let t = ctx.theme;
         rect(ctx, Rect::new(x0 + w - 1.0, 0.0, 1.0, h), t.border_default());
-        let title = ui.places.iter().find(|p| Some(p.folder) == ui.folder).map(|p| p.label.clone()).unwrap_or_default();
-        // The Conversations | Messages switch at the header's right (§11.7).
+        let title = match &ui.search {
+            Some(s) => match s.saved.and_then(|id| ui.saved.iter().find(|p| p.id == id)) {
+                Some(p) => p.name.clone(),
+                None if s.query.trim().is_empty() => "Search".into(),
+                None => format!("{} found", if s.hits.len() >= mail_engine::search::RESULTS_MAX { format!("{}+", s.hits.len()) } else { s.hits.len().to_string() }),
+            },
+            None => ui.places.iter().find(|p| Some(p.folder) == ui.folder).map(|p| p.label.clone()).unwrap_or_default(),
+        };
         let mut sw_x = x0 + w - 16.0;
-        if ui.folder.is_some() {
+        // A search: Save it as a place, or Remove the saved one; Close (Esc).
+        if let Some(s) = &ui.search {
+            let mut buttons: Vec<(&str, Box<dyn Fn()>)> = Vec::new();
+            let m = self.mail.clone();
+            buttons.push(("Close", Box::new(move || m.end_search())));
+            match s.saved {
+                Some(id) => {
+                    let m = self.mail.clone();
+                    buttons.push(("Remove", Box::new(move || m.forget_search(id))));
+                }
+                None if !s.query.trim().is_empty() => {
+                    let m = self.mail.clone();
+                    buttons.push(("Save", Box::new(move || m.save_search())));
+                }
+                None => {}
+            }
+            for (label, on) in buttons {
+                let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);
+                sw_x -= lw;
+                area(ctx, Rect::new(sw_x, head_h() / 2.0 - em(12.0), lw, em(24.0)), Color::TRANSPARENT, on);
+                text(ctx, sw_x + em(8.0), head_h() / 2.0, label, type_size::XS, Weight::Medium, t.text_secondary());
+                ctx.pop();
+                sw_x -= em(2.0);
+            }
+        }
+        // The Conversations | Messages switch at the header's right (§11.7).
+        if ui.folder.is_some() && ui.search.is_none() {
             for (label, on) in [("Messages", false), ("Conversations", true)] {
                 let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);
                 sw_x -= lw;
@@ -1357,8 +1708,20 @@ impl MailView {
             return;
         }
         if ui.count == 0 {
-            if ui.folder.is_some() {
-                text(ctx, x0 + 16.0, head_h() + em(20.0), "Nothing here", type_size::SM, Weight::Regular, t.text_secondary());
+            match &ui.search {
+                Some(s) if s.query.trim().is_empty() => {
+                    let tips = ["Words anywhere, or from: to: subject:", "has:attachment  is:unread  is:flagged  in:archive", "before:2026-01-31  after:  larger:5M  smaller:"];
+                    for (k, tip) in tips.iter().enumerate() {
+                        text(ctx, x0 + 16.0, head_h() + em(20.0) + k as f32 * em(22.0), &fit(tip, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.text_secondary());
+                    }
+                }
+                Some(_) => {
+                    text(ctx, x0 + 16.0, head_h() + em(20.0), "Nothing found", type_size::SM, Weight::Regular, t.text_secondary());
+                }
+                None if ui.folder.is_some() => {
+                    text(ctx, x0 + 16.0, head_h() + em(20.0), "Nothing here", type_size::SM, Weight::Regular, t.text_secondary());
+                }
+                None => {}
             }
             return;
         }
