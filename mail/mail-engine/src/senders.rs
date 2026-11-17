@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use mail_schema::Summary;
-use mail_store::senders::{contact, lane, list};
+use mail_store::senders::{contact, lane, list, why};
 use mail_store::{AccountId, FolderId, MsgId, OpKind, Role};
 use nuntius::{Client, Event, Limits, Open};
 
@@ -147,7 +147,7 @@ impl Engine {
         if !on {
             let held = self.store.held(account)?;
             self.store.write(|w| {
-                for (msg, ..) in &held {
+                for (msg, .., _) in held.iter().filter(|h| h.3 == why::SCREENER) {
                     w.release(*msg)?;
                 }
                 w.set_setting(account, SCREENER, None)
@@ -181,7 +181,10 @@ impl Engine {
 
     fn held_from(&self, account: AccountId, addr: &str) -> Result<Vec<MsgId>, Error> {
         let mut out = Vec::new();
-        for (msg, ..) in self.store.held(account)? {
+        for (msg, .., w) in self.store.held(account)? {
+            if w != why::SCREENER {
+                continue;
+            }
             if self.store.message(msg).ok().and_then(|m| m.summary.from.first().map(|a| a.addr.eq_ignore_ascii_case(addr))).unwrap_or(false) {
                 out.push(msg);
             }
@@ -193,7 +196,10 @@ impl Engine {
     /// first.
     pub fn screened(&self, account: AccountId) -> Result<(Vec<MsgId>, Vec<MsgId>), Error> {
         let (mut new, mut out) = (Vec::new(), Vec::new());
-        for (msg, ..) in self.store.held(account)? {
+        for (msg, .., w) in self.store.held(account)? {
+            if w != why::SCREENER {
+                continue;
+            }
             let Ok(m) = self.store.message(msg) else { continue };
             let from = m.summary.from.first().map(|a| a.addr.clone()).unwrap_or_default();
             if self.store.contact(account, &from)? & contact::REFUSED != 0 {
@@ -240,6 +246,9 @@ impl Engine {
             return Ok(());
         }
         let f = self.store.folder(folder)?;
+        for &(uid, msg) in new {
+            self.later_arrived(account, folder, f.role, uid, msg)?;
+        }
         let screener = self.store.setting(account, SCREENER)?;
         let trash = self.store.folders(account)?.into_iter().find(|(_, x)| x.role == Role::Trash && !x.hidden).map(|(id, _)| id);
         let mut block = Vec::new();
@@ -290,7 +299,7 @@ impl Engine {
                 w.set_lane(account, lane::NEWSLETTERS, *msg, *date, true)?;
             }
             for uid in &hold {
-                w.hold(folder, *uid)?;
+                w.hold(folder, *uid, why::SCREENER)?;
             }
             if let Some(to) = trash {
                 for uid in &block {

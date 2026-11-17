@@ -25,6 +25,7 @@ pub mod drafts;
 pub mod pictures;
 pub mod send;
 pub mod senders;
+pub mod later;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};

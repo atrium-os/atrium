@@ -30,6 +30,7 @@ mod outbox;
 pub use outbox::{retry_after, Outgoing, SendState};
 pub mod search;
 pub mod senders;
+pub mod later;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
@@ -263,6 +264,8 @@ impl Store {
             tx.open_table(senders::SETTINGS)?;
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
+            tx.open_table(later::LATER)?;
+            tx.open_table(later::LATER_BY_THREAD)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();

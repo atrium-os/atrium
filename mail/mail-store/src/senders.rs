@@ -13,9 +13,16 @@ pub(crate) const CONTACTS: TableDefinition<(u32, &str), u8> = TableDefinition::n
 /// (account, name) → value: per-account switches (the screener).
 pub(crate) const SETTINGS: TableDefinition<(u32, &str), u64> = TableDefinition::new("account_settings");
 
-/// (account, newest-first date key, message) → (folder, uid): mail the
-/// screener holds back (*New senders*).
-pub(crate) const HELD: TableDefinition<(u32, u64, u64), (u32, u32)> = TableDefinition::new("held");
+/// (account, newest-first date key, message) → (folder, uid, [`why`]):
+/// mail held out of its folder's list, by the screener (*New senders*) or
+/// set aside with *Later*.
+pub(crate) const HELD: TableDefinition<(u32, u64, u64), (u32, u32, u8)> = TableDefinition::new("held");
+
+/// Why a message is held.
+pub mod why {
+    pub const SCREENER: u8 = 1;
+    pub const LATER: u8 = 2;
+}
 
 /// (account, lane, newest-first date key, message) → (): the lanes and
 /// views that are not folders (the newsletter lane, §11.3).
@@ -79,16 +86,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Mail the screener holds for `account`, newest first: (message,
-    /// folder, uid).
-    pub fn held(&self, account: AccountId) -> Result<Vec<(MsgId, FolderId, u32)>> {
+    /// Mail held for `account`, newest first: (message, folder, uid,
+    /// [`why`]).
+    pub fn held(&self, account: AccountId) -> Result<Vec<(MsgId, FolderId, u32, u8)>> {
         let tx = self.db.begin_read()?;
         let t = tx.open_table(HELD)?;
         let mut out = Vec::new();
         for e in t.range((account, 0, 0)..=(account, u64::MAX, u64::MAX))? {
             let (k, v) = e?;
-            let (f, u) = v.value();
-            out.push((k.value().2, f, u));
+            let (f, u, w) = v.value();
+            out.push((k.value().2, f, u, w));
         }
         Ok(out)
     }
@@ -147,15 +154,15 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Hold (folder, uid) back from its folder's list (the screener).
-    pub fn hold(&mut self, folder: FolderId, uid: u32) -> Result<bool> {
+    /// Hold (folder, uid) back from its folder's list ([`why`]).
+    pub fn hold(&mut self, folder: FolderId, uid: u32, why: u8) -> Result<bool> {
         let Some((msg, _)) = self.tx.open_table(crate::LOCATIONS)?.get((folder, uid))?.map(|v| v.value()) else { return Ok(false) };
         let mut m = self.get_msg(msg)?.ok_or(Error::NotFound)?;
         if !m.locations.contains(&(folder, uid)) {
             return Ok(false);
         }
         self.tx.open_table(LIST)?.remove((folder, date_key(m.date), msg))?;
-        self.tx.open_table(HELD)?.insert((m.account, date_key(m.date), msg), (folder, uid))?;
+        self.tx.open_table(HELD)?.insert((m.account, date_key(m.date), msg), (folder, uid, why))?;
         m.locations.retain(|l| *l != (folder, uid));
         m.held.push((folder, uid));
         self.put_msg(msg, &m)?;
