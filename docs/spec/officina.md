@@ -3372,6 +3372,26 @@ style, rename refused when taken, undo/redo), Write's bar (every command,
 four steps four undos, the menu lists a new style), and a crash recovery
 that keeps a new style and the paragraph on it.
 
+### 16.53 Moving and editing charts in Sheets (2026-11-17)
+
+A click on a chart picks it: a ring and a corner handle show. Dragging
+the chart moves it, dragging the corner handle of a picked chart sizes
+it (the top-left stays), and the new place is stored as a cell anchor
+(cell plus offset in points), so it follows row and column sizes as
+before. Each move or size is one undo step ("Move Chart", "Size
+Chart"), journaled like every grid op.
+
+While a chart is picked a chart bar sits over the formula bar: kind
+(column, bar, line, area, scatter, pie, doughnut), title, legend place
+(right, bottom, top, left) and stacking (side by side, stacked,
+percent; not offered for pie, doughnut or scatter), Delete and Done.
+Each change is one undo step. Delete or Backspace deletes the picked
+chart, Escape or a press elsewhere puts it down.
+
+Pergola's `GridView` does the picking for any float marked `movable`
+(`GridAction::PlaceFloat`, `GridAction::DeleteFloat`); tables' and
+filters' floats stay fixed.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

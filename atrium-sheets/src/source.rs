@@ -287,7 +287,7 @@ impl SheetSource {
             if x1 <= fx1 {
                 nodes.push(at(x1 - 1.0, fy0, 2.0, fy1 - fy0, edge));
             }
-            out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes) });
+            out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes), movable: false });
         }
         if let Some(f) = &d.wb.sheet(s).filter {
             let r = f.rect;
@@ -310,11 +310,24 @@ impl SheetSource {
                     let (cx, cy, k) = (size / 2.0, size / 2.0 + 1.0, size * 0.22);
                     let tri = PathData::new().move_to(cx - k * 1.3, cy - k * 0.7).line_to(cx + k * 1.3, cy - k * 0.7).line_to(cx, cy + k * 0.8).close();
                     nodes.extend(Shape::new(tri).fill(Paint::Solid(fg)).fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
-                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(nodes) });
+                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(nodes), movable: false });
                 }
             }
         }
         out
+    }
+}
+
+impl SheetSource {
+    /// The cell anchor of a box at `at` (content px) on the current sheet:
+    /// the cells its corners fall in and the offsets into them, points.
+    pub fn anchor_of(&self, at: [f64; 4]) -> officina_grid::charts::Anchor {
+        let sheet = self.doc.borrow().sheet;
+        let corner = |x: f64, y: f64| {
+            let (r, c) = (self.row_at(y.max(0.0)), self.col_at(x.max(0.0)));
+            (r, c, ((x - self.col_left(c)) * 72.0 / 96.0).max(0.0) as f32, ((y - self.row_top(r)) * 72.0 / 96.0).max(0.0) as f32)
+        };
+        officina_grid::charts::Anchor { sheet, from: corner(at[0], at[1]), to: corner(at[0] + at[2], at[1] + at[3]) }
     }
 }
 
@@ -372,7 +385,7 @@ impl GridSource for SheetSource {
                     n
                 }
             };
-            out.push(pergola::widgets::GridFloat { key: i as u64, at: [x0, y0, w, h], nodes });
+            out.push(pergola::widgets::GridFloat { key: i as u64, at: [x0, y0, w, h], nodes, movable: true });
         }
         out
     }

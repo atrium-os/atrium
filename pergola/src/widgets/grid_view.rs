@@ -157,6 +157,9 @@ pub struct GridFloat {
     pub at: [f64; 4],
     /// What it draws, placed at its own origin (0, 0).
     pub nodes: Rc<Vec<Node>>,
+    /// A click picks it, a drag moves it, its corner sizes it (charts);
+    /// otherwise presses go to the cells under it.
+    pub movable: bool,
 }
 
 /// `n` moved by (dx, dy): rectangles, text and fills.
@@ -210,6 +213,9 @@ enum Drag {
     Cols,
     Rows,
     Resize { col: u32, x0: f32, w0: f64 },
+    /// A picked float pressed: moved (or sized from its corner) by the
+    /// distance from where the press began, content px.
+    Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
 }
 
 /// The grid's own state, kept by the app in a `Mutable`.
@@ -222,6 +228,9 @@ pub struct GridState {
     /// The in-cell editor, while editing the active cell.
     pub edit: Option<TextEdit>,
     drag: Drag,
+    /// The movable float a click picked (its key), framed with a corner
+    /// handle; Delete asks to remove it, Escape lets it go.
+    pub picked: Option<u64>,
 }
 
 impl GridState {
@@ -250,6 +259,32 @@ pub enum GridAction {
     Cut(CellRange),
     /// Paste at the active cell.
     Paste { row: u32, col: u32 },
+    /// Float `key` dragged to `at` (content px: x, y, width, height).
+    PlaceFloat { key: u64, at: [f64; 4] },
+    /// Delete with float `key` picked.
+    DeleteFloat(u64),
+}
+
+impl GridState {
+    /// The distance a float is being dragged, while it is: (key, sizing, dx, dy).
+    pub fn float_drag(&self) -> Option<(u64, bool, f64, f64)> {
+        match self.drag {
+            Drag::Float { key, size, dx, dy, .. } => Some((key, size, dx, dy)),
+            _ => None,
+        }
+    }
+}
+
+/// How near a float's bottom-right corner a press sizes it, px.
+pub const FLOAT_GRIP: f64 = 10.0;
+
+/// `at` moved or sized by (`dx`, `dy`), at least 16 px a side.
+pub fn float_moved(at: [f64; 4], size: bool, dx: f64, dy: f64) -> [f64; 4] {
+    if size {
+        [at[0], at[1], (at[2] + dx).max(16.0), (at[3] + dy).max(16.0)]
+    } else {
+        [(at[0] + dx).max(0.0), (at[1] + dy).max(0.0), at[2], at[3]]
+    }
 }
 
 pub type ActionFn = Rc<dyn Fn(GridAction)>;
@@ -312,6 +347,8 @@ impl GridView {
     pub fn emit(&self, ctx: &mut Ctx) -> NodeId {
         let src = self.source.clone();
         let t = ctx.theme;
+        // Movable floats as drawn this frame (key, content rect), for presses.
+        let placed: Rc<std::cell::RefCell<Vec<(u64, [f64; 4])>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
         let (rows, cols) = (src.rows(), src.cols());
         let ext = [src.col_left(cols), src.row_top(rows)];
         let mut st = self.scroll.get();
@@ -472,6 +509,7 @@ impl GridView {
             }
             ctx.pop();
             // Floats (charts) over the cells, those meeting the view.
+            let gs = self.state.get_cloned();
             for f in src.floats([x, y, body.w() as f64, body.h() as f64], &t) {
                 let (fx, fy) = at(f.at[0], f.at[1]);
                 ctx.key((1u64 << 63) | f.key);
@@ -479,6 +517,21 @@ impl GridView {
                 ctx.set_flex(id, FlexStyle { free: true, ..FlexStyle::default() });
                 for n in f.nodes.iter() {
                     ctx.add(shift(n, fx, fy));
+                }
+                if f.movable && gs.picked == Some(f.key) {
+                    // Picked: a frame, its corner handle, and where a drag puts it.
+                    let (fw, fh) = (f.at[2] as f32, f.at[3] as f32);
+                    ring(ctx, Rect::new(fx - 2.0, fy - 2.0, fw + 4.0, fh + 4.0), t.accent_fg());
+                    ctx.add(Node::Rect { rect: Rect::new(fx + fw - 6.0, fy + fh - 6.0, 9.0, 9.0), fill: t.accent_fg(), radius: 2.0 });
+                    if let Some((k, size, dx, dy)) = gs.float_drag().filter(|d| d.0 == f.key) {
+                        let _ = k;
+                        let g = float_moved(f.at, size, dx, dy);
+                        let (gx, gy) = at(g[0], g[1]);
+                        ring(ctx, Rect::new(gx, gy, g[2] as f32, g[3] as f32), Color::rgba(0.2, 0.45, 0.95, 0.7));
+                    }
+                }
+                if f.movable {
+                    placed.borrow_mut().push((f.key, f.at));
                 }
                 ctx.pop();
             }
@@ -503,6 +556,7 @@ impl GridView {
         });
         {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
+            let placed = placed.clone();
             ctx.on_drag(body_id, move |phase, p| {
                 let st = sc.get();
                 let cx = st.physics_x.y + (p.x - geom.body.x()) as f64;
@@ -512,6 +566,36 @@ impl GridView {
                 }
                 let cell = (src.row_at(cy.max(0.0)), src.col_at(cx.max(0.0)));
                 let mut g = gst.get_cloned();
+                // A movable float under the press (the topmost) is picked and dragged.
+                if let (Drag::Float { key, size, from, .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
+                    let (dx, dy) = (cx - from.0, cy - from.1);
+                    if phase == DragPhase::End {
+                        g.drag = Drag::None;
+                        if dx.abs() + dy.abs() > 3.0 {
+                            if let Some(&(_, at0)) = placed.borrow().iter().find(|f| f.0 == key) {
+                                if let Some(f) = &act {
+                                    f(GridAction::PlaceFloat { key, at: float_moved(at0, size, dx, dy) });
+                                }
+                            }
+                        }
+                    } else {
+                        g.drag = Drag::Float { key, size, from, dx, dy };
+                    }
+                    gst.set(g);
+                    return;
+                }
+                if phase == DragPhase::Start {
+                    let hit = placed.borrow().iter().rev().find(|(_, a)| cx >= a[0] && cx < a[0] + a[2] + 4.0 && cy >= a[1] && cy < a[1] + a[3] + 4.0).copied();
+                    if let Some((key, a)) = hit {
+                        commit(&mut g, &act);
+                        let size = g.picked == Some(key) && cx >= a[0] + a[2] - FLOAT_GRIP && cy >= a[1] + a[3] - FLOAT_GRIP;
+                        g.picked = Some(key);
+                        g.drag = Drag::Float { key, size, from: (cx, cy), dx: 0.0, dy: 0.0 };
+                        gst.set(g);
+                        return;
+                    }
+                    g.picked = None;
+                }
                 match phase {
                     DragPhase::Start => {
                         commit(&mut g, &act);
@@ -829,6 +913,22 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
     let (last_r, last_c) = (geom.rows - 1, geom.cols - 1);
     let step = |(r, c): (u32, u32), dr: i64, dc: i64| -> (u32, u32) { ((r as i64 + dr).clamp(0, last_r as i64) as u32, (c as i64 + dc).clamp(0, last_c as i64) as u32) };
     let cmd = m.ctrl || m.meta;
+
+    // A picked float: Delete asks to remove it, Escape (or any other key)
+    // lets it go back to the cells.
+    if let Some(k) = g.picked {
+        if g.edit.is_none() {
+            g.picked = None;
+            match key {
+                Key::Delete | Key::Backspace => {
+                    send(GridAction::DeleteFloat(k));
+                    return true;
+                }
+                Key::Escape => return true,
+                _ => {}
+            }
+        }
+    }
 
     // The editor has the keys, except the ones that end it.
     if let Some(ed) = &mut g.edit {
