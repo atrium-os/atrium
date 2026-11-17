@@ -1,7 +1,10 @@
 # Composing an app: workers, services and the SDK that makes it easy
 
 **Status:** proposal 2026-11-17, waiting for Shankar's review (§10, decisions
-C1–C10). Companion to [dev-tools.md](dev-tools.md). Nothing here is built yet.
+C1–C10). Direction from Shankar, 2026-11-17: "artifex is probably the best way to do
+all of this without overwhelming the developer - and we ensure through the
+fuzzing that we point out unsecure build patterns...with some practice and
+experience, command-line users can adapt to it to" (§6.1). Companion to [dev-tools.md](dev-tools.md). Nothing here is built yet.
 
 **Asked by Shankar, 2026-11-17:** "just building a program is not enough for
 atrium..there are complicated ipc paths - when we built the navigator, you can see
@@ -279,6 +282,40 @@ there's no answer for other languages (aqueduct.md §10). Proposed (C5):
 - **The guide**: the rule, the level 1 table, the patterns, and three worked examples
   (a viewer, a networked client, a service), taken from Officina, Mail and the Player.
 
+### 6.1 Artifex is the front door (Shankar, 2026-11-17)
+
+The developer meets all of this through Artifex, not through the manifest and the
+tool list. The command line (`cargo atrium`, `atrium-bundle`, the manifest by hand)
+stays the same engine underneath, for people who prefer it and learn the shape with
+practice; Artifex never has a capability the CLI lacks.
+
+- **New project** asks what the app does (opens files, talks to a server, plays
+  media, serves others) and starts from the matching template, already split into
+  core, workers and services.
+- **The composition is visible while editing**: a panel shows the core, its
+  workers and the system services it uses, with the capabilities each holds; the
+  manifest is edited through it, with the consent text the person will see.
+- **Fuzzing runs in the background** in the workspace (`WorkspaceExec`, low
+  priority, within the workspace's limits), and its findings are how insecure
+  patterns get pointed out:
+  - every worker gets a fuzz target generated from its signature and is fuzzed
+    continuously; a crash is a bug report with the input, but contained;
+  - **the core's input surfaces are fuzzed too**: what it reads from picked files,
+    from Nuntius responses and from other apps. A crash or a limit hit *there* is
+    flagged as the insecure pattern itself, not just a bug: "this hostile input
+    crashed the process that holds `net-fetch` and your files", with the code path
+    and a **Move into a worker** action that creates the worker, its message types
+    and the call from the template;
+  - the crate-graph check of §6 runs on each build and shows its findings in the
+    same panel, so a parser linked into the core is flagged before any fuzzer
+    finds it.
+- **Run, debug and fuzz share one view**: a dev build's workers appear in the
+  composition panel as they start, crash or hit limits.
+
+Build order effect: Artifex v0 (dev-tools.md T9) gains the composition panel and
+the template-backed New project; the fuzz panel follows A6. The CLI pieces land
+first because Artifex runs them.
+
 ## 7. Monolithic ports
 
 A ported Unix program that links everything still runs: the jail is its boundary,
@@ -332,5 +369,5 @@ A1–A3 are the core of it and follow dev-tools.md's T5 (Run closure).
 | C6 | Image decoding as a system service | yes, from navigator-image, as a role or service any app can call |
 | C7 | Third-party access to Limen | `embeds` capability naming the roles; providers declared by `[roles] implements` |
 | C8 | Arca for third-party apps | an `arca` capability for the app's own items, couriers for requests |
-| C9 | `cargo atrium check` findings | warnings to the developer, not install blockers |
+| C9 | `cargo atrium check` and fuzz findings | warnings to the developer, shown in Artifex (§6.1), not install blockers |
 | C10 | Monolithic ports | allowed, with the details page saying which grants sit beside the parsers |
