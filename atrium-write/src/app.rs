@@ -110,6 +110,15 @@ pub enum Cmd {
     StyleClose,
     /// The styles pane shown or hidden.
     StylesPane,
+    /// The outline pane shown or hidden.
+    OutlinePane,
+    /// The caret to the heading at this block.
+    OutlineGo(usize),
+    /// The caret's heading and what it heads moved up (true) or down.
+    OutlineMove(bool),
+    /// The caret's heading and those under it a level deeper (true) or
+    /// higher.
+    OutlineLevel(bool),
     /// The pane's paragraph style put on the selected paragraphs.
     PaneStyle(StyleId),
     /// The pane's character style (or none) put on the selection.
@@ -349,6 +358,13 @@ pub const PANE_W: f32 = 260.0;
 /// A style's row in the pane.
 pub const PANE_ROW_H: f32 = 34.0;
 
+/// Where the outline pane's headings start, under its title and buttons.
+pub const OUTLINE_TOP: f32 = 84.0;
+/// A heading's row in the outline pane.
+pub const OUTLINE_ROW_H: f32 = 28.0;
+/// How far each level is set in.
+pub const OUTLINE_INDENT: f32 = 14.0;
+
 /// A row of the styles pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneRow {
@@ -460,6 +476,9 @@ pub struct Write {
     /// The styles pane is shown.
     pub pane: Mutable<bool>,
     pub pane_scroll: Mutable<ScrollState>,
+    /// The outline pane is shown (never with the styles pane).
+    pub outline: Mutable<bool>,
+    pub outline_scroll: Mutable<ScrollState>,
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
     pub style_menu: Mutable<MenuState>,
@@ -499,7 +518,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), pane: Mutable::new(false), pane_scroll: Mutable::new(ScrollState::default()), outline: Mutable::new(false), outline_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -542,7 +561,7 @@ impl Write {
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
         let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
-        let w = if self.pane.get() { (w - PANE_W).max(200.0) } else { w };
+        let w = if self.pane.get() || self.outline.get() { (w - PANE_W).max(200.0) } else { w };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -1254,6 +1273,12 @@ impl Write {
                         let all = e.para_styles();
                         match all.get(i) {
                             Some((id, _)) => e.set_paragraphs("Style", Some(*id), |_| {}),
+                            None if i == all.len() + 2 => {
+                                drop(e);
+                                drop(d);
+                                self.cmds.lock().unwrap().push(Cmd::OutlinePane);
+                                return false;
+                            }
                             None if i > all.len() => {
                                 drop(e);
                                 drop(d);
@@ -1272,6 +1297,41 @@ impl Write {
                         drop(e);
                         drop(d);
                         self.pane.set(!self.pane.get());
+                        self.outline.set(false);
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::OutlinePane => {
+                        drop(e);
+                        drop(d);
+                        self.outline.set(!self.outline.get());
+                        self.pane.set(false);
+                        self.changed();
+                        return false;
+                    }
+                    Cmd::OutlineGo(_) | Cmd::OutlineMove(_) | Cmd::OutlineLevel(_) => {
+                        match c {
+                            Cmd::OutlineGo(b) => {
+                                let last = e.doc.blocks.len().saturating_sub(1);
+                                e.set_caret(pergola_richtext::Pos::new(b.min(last), 0), false);
+                            }
+                            Cmd::OutlineMove(up) => {
+                                if let Some(b) = e.heading_at_caret() {
+                                    e.move_heading(b, up);
+                                }
+                            }
+                            Cmd::OutlineLevel(deeper) => {
+                                if let Some(b) = e.heading_at_caret() {
+                                    e.shift_heading_level(b, deeper);
+                                }
+                            }
+                            _ => {}
+                        }
+                        drop(e);
+                        drop(d);
+                        let ed = self.doc.borrow().ed.clone();
+                        let (w, h) = self.size.get();
+                        RichTextView::new(ed, self.scroll.clone(), self.rev.clone(), self.pages_rect(w, h)).reveal_caret();
                         self.changed();
                         return false;
                     }
@@ -1521,6 +1581,7 @@ impl View for Write {
             let mut items: Vec<MenuItem> = para_styles.iter().map(|(_, s)| MenuItem::new(&**s).radio(**s == *style_name)).collect();
             items.push(MenuItem::new("Edit Styles…").separated());
             items.push(MenuItem::new("Styles Pane").checked(self.pane.get()));
+            items.push(MenuItem::new("Outline Pane").checked(self.outline.get()));
             let cmds = self.cmds.clone();
             MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
             x += 128.0;
@@ -2112,6 +2173,54 @@ impl View for Write {
             .emit(ctx);
         }
 
+        // The outline pane: the headings, indented by level; a click goes to
+        // one, the buttons move or shift the caret's.
+        if self.outline.get() {
+            let pr = self.pages_rect(w, h);
+            let (x0, y0, ph) = (pr.x() + pr.w(), pr.y(), pr.h());
+            let pw = w - x0;
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, pw, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 14.0, pw - 100.0, 20.0), content: "Outline".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            Button::secondary("Close").at(x0 + pw - 76.0, y0 + 8.0).width(64.0).on_click(push(Cmd::OutlinePane)).render(ctx);
+            let (heads, cur) = {
+                let e = ed.borrow();
+                (e.headings(), e.heading_at_caret())
+            };
+            let bw = (pw - 12.0 - 4.0 * 6.0) / 4.0;
+            for (i, (label, c)) in [("Up", Cmd::OutlineMove(true)), ("Down", Cmd::OutlineMove(false)), ("Promote", Cmd::OutlineLevel(false)), ("Demote", Cmd::OutlineLevel(true))].into_iter().enumerate() {
+                Button::secondary(label).at(x0 + 8.0 + i as f32 * (bw + 6.0), y0 + 44.0).width(bw).on_click(push(c)).render(ctx);
+            }
+            let top = OUTLINE_TOP;
+            if heads.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + top + 8.0, pw - 24.0, 18.0), content: "No headings".into(), style: st(type_size::SM, Weight::Regular, t.text_tertiary()) });
+            }
+            let (heads, cmds) = (Rc::new(heads), self.cmds.clone());
+            let n = heads.len();
+            pergola::widgets::VirtualList::new(self.outline_scroll.clone(), Rect::new(x0 + 1.0, y0 + top, pw - 1.0, (ph - top).max(OUTLINE_ROW_H)), n, OUTLINE_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                let rw = pw - 1.0;
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, rw, OUTLINE_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let (b, level, ref text) = heads[k];
+                let hit = ctx.add(Node::Rect { rect: Rect::new(4.0, 1.0, rw - 8.0, OUTLINE_ROW_H - 2.0), fill: if cur == Some(b) { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                let cmds = cmds.clone();
+                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::OutlineGo(b)));
+                let indent = 10.0 + (level.saturating_sub(1)) as f32 * OUTLINE_INDENT;
+                let shown = if text.trim().is_empty() { "(empty heading)".to_string() } else { text.chars().filter(|c| *c != officina_text::model::OBJECT_CHAR).collect() };
+                ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(indent, (OUTLINE_ROW_H - 18.0) / 2.0, (rw - indent - 12.0).max(20.0), 18.0), content: shown, style: TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if level == 1 { Weight::Semibold } else { Weight::Regular }, color: t.text_primary() } });
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0x57A2)
+            .emit(ctx);
+        }
+
         // Closing with unsaved changes: save them, drop them, or stay.
         if self.closing.get() {
             let y = TOOLBAR_H;
@@ -2592,6 +2701,64 @@ mod tests {
         w.cmds.lock().unwrap().push(Cmd::StylesPane);
         w.take_cmds();
         assert!(!w.pane.get());
+        assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0);
+    }
+
+    #[test]
+    fn outline_pane_lists_moves_and_shifts_headings() {
+        use pergola::event::Event;
+        let doc = Doc::from_text("h.txt", b"Intro\nA\na text\nB\nb text").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        {
+            let mut e = ed.borrow_mut();
+            let h1 = e.doc.styles.by_name("Heading 1").unwrap();
+            for b in [1, 3] {
+                e.set_caret(pergola_richtext::Pos::new(b, 0), false);
+                e.set_paragraphs("Style", Some(h1), |_| {});
+            }
+        }
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        w.pane.set(true);
+        // From the Style menu, past “Styles Pane”; it takes the styles pane's place.
+        let n = ed.borrow().para_styles().len();
+        run(Cmd::Style(n + 2));
+        w.take_cmds();
+        assert!(w.outline.get() && !w.pane.get());
+        assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0 - PANE_W);
+        let t = texts();
+        for want in ["Outline", "A", "B", "Promote", "Demote"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        assert!(!t.iter().any(|s| s == "a text"), "body text isn't listed");
+        // A click on B's row takes the caret there.
+        let pr = w.pages_rect(1200.0, 800.0);
+        let at = pergola::geom::Point::new(pr.x() + pr.w() + 40.0, pr.y() + OUTLINE_TOP + OUTLINE_ROW_H * 1.5);
+        let mut app = pergola::app::App::new(w.clone());
+        app.tick();
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        w.take_cmds();
+        assert_eq!(ed.borrow().caret.block, 3);
+        // Up moves B with its text above A; Demote makes it level 2.
+        run(Cmd::OutlineMove(true));
+        let order = |ed: &Rc<RefCell<Editor>>| ed.borrow().doc.blocks.iter().map(|b| b.as_para().unwrap().text.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&ed), ["Intro", "B", "b text", "A", "a text"]);
+        run(Cmd::OutlineLevel(true));
+        assert_eq!(ed.borrow().headings().iter().map(|h| h.1).collect::<Vec<_>>(), vec![2, 1]);
+        run(Cmd::Undo);
+        run(Cmd::Undo);
+        assert_eq!(order(&ed), ["Intro", "A", "a text", "B", "b text"]);
+        run(Cmd::OutlinePane);
+        assert!(!w.outline.get());
         assert_eq!(w.pages_rect(1200.0, 800.0).w(), 1200.0);
     }
 
