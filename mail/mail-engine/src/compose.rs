@@ -1,0 +1,120 @@
+//! What a compose window starts with (mail.md §9.1, §9.2): a new message,
+//! a reply, reply-all or forward, or a `mailto:` link; From is one of the
+//! account's identities (a reply comes from the address it was sent to,
+//! E12) and its signature is added.
+
+use mail_compose::mailto;
+use mail_compose::reply::{self, Kind};
+use mail_compose::{Draft, Mailbox};
+use mail_store::{AccountId, Identity, MsgId};
+
+use crate::{Engine, Error};
+
+/// The signature separator (a line of "-- ", RFC 3676 §4.3).
+pub const SIG_SEP: &str = "-- \n";
+
+/// A compose window's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compose {
+    pub account: AccountId,
+    pub draft: Draft,
+    /// Which identity From is.
+    pub identity: usize,
+    /// Notes the window shows above the message (from a `mailto:` link).
+    pub notes: Vec<String>,
+}
+
+fn sig_block(i: &Identity) -> String {
+    let s = i.signature.trim_end();
+    if s.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{SIG_SEP}{s}\n")
+    }
+}
+
+impl Engine {
+    /// `account`'s From addresses, the default first. With none set, the
+    /// account's own address.
+    pub fn identities(&self, account: AccountId) -> Result<Vec<Identity>, Error> {
+        let ids = self.store.identities(account)?;
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        let a = self.store.accounts()?.into_iter().find(|(id, _)| *id == account).ok_or(Error::NotFound)?.1;
+        Ok(vec![Identity { name: String::new(), addr: a.name, signature: String::new() }])
+    }
+
+    fn from(&self, account: AccountId, identity: usize) -> Result<(usize, Identity), Error> {
+        let ids = self.identities(account)?;
+        let i = identity.min(ids.len() - 1);
+        Ok((i, ids[i].clone()))
+    }
+
+    /// A new message from identity `identity` (0: the default).
+    pub fn compose_new(&self, account: AccountId, identity: usize) -> Result<Compose, Error> {
+        let (i, id) = self.from(account, identity)?;
+        let draft = Draft { from: Mailbox::new(&id.name, &id.addr), text: sig_block(&id), ..Draft::default() };
+        Ok(Compose { account, draft, identity: i, notes: Vec::new() })
+    }
+
+    /// A reply, reply-all or forward of message `msg`.
+    pub fn compose_reply(&self, msg: MsgId, kind: Kind) -> Result<Compose, Error> {
+        let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
+        let account = m.account;
+        let ids = self.identities(account)?;
+        let mine: Vec<String> = ids.iter().map(|i| i.addr.clone()).collect();
+        let identity = reply::reply_from(&m.summary, &mine).unwrap_or(0);
+        let r = self.open(msg)?;
+        let text = r.text.or(m.summary.text.clone()).unwrap_or_default().replace("\r\n", "\n");
+        let when = m.summary.date.map(mail_compose::write::date).unwrap_or_default();
+        let s = reply::start(&m.summary, &text, &when, &mine, kind);
+        let id = &ids[identity];
+        let draft = Draft {
+            from: Mailbox::new(&id.name, &id.addr),
+            to: s.to,
+            cc: s.cc,
+            subject: s.subject,
+            text: format!("{}{}", sig_block(id), s.text),
+            in_reply_to: s.in_reply_to,
+            references: s.references,
+            ..Draft::default()
+        };
+        Ok(Compose { account, draft, identity, notes: Vec::new() })
+    }
+
+    /// A message filled from a `mailto:` link (shown in full; never sent
+    /// without the person pressing Send).
+    pub fn compose_mailto(&self, account: AccountId, link: &str) -> Result<Compose, Error> {
+        let f = mailto::parse(link).map_err(Error::Compose)?;
+        let mut c = self.compose_new(account, 0)?;
+        let mbs = |l: Vec<String>| l.into_iter().map(|a| Mailbox::new("", &a)).collect();
+        c.draft.to = mbs(f.to);
+        c.draft.cc = mbs(f.cc);
+        c.draft.bcc = mbs(f.bcc);
+        c.draft.subject = f.subject;
+        c.draft.text = format!("{}{}", f.body, c.draft.text);
+        c.draft.in_reply_to = f.in_reply_to;
+        c.notes = f.notes;
+        Ok(c)
+    }
+
+    /// Change From to identity `to`; the old identity's signature, if the
+    /// text still has it, becomes the new one's.
+    pub fn switch_identity(&self, c: &mut Compose, to: usize) -> Result<(), Error> {
+        let ids = self.identities(c.account)?;
+        let Some(new) = ids.get(to) else { return Err(Error::NotFound) };
+        let old = sig_block(&ids[c.identity.min(ids.len() - 1)]);
+        let new_sig = sig_block(new);
+        if !old.is_empty() && c.draft.text.contains(&old) {
+            c.draft.text = c.draft.text.replacen(&old, &new_sig, 1);
+        } else if old.is_empty() && !new_sig.is_empty() && !c.draft.text.contains(SIG_SEP) {
+            // No signature yet: under the person's text, above any quote.
+            let at = c.draft.text.find("\n\nOn ").or_else(|| c.draft.text.find("\n\n---------- Forwarded")).unwrap_or(c.draft.text.len());
+            c.draft.text.insert_str(at, &new_sig);
+        }
+        c.draft.from = Mailbox::new(&new.name, &new.addr);
+        c.identity = to;
+        Ok(())
+    }
+}

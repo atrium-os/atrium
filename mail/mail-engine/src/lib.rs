@@ -18,6 +18,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+pub mod compose;
 pub mod drafts;
 pub mod pictures;
 pub mod send;

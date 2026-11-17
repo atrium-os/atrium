@@ -56,6 +56,8 @@ const SERVER_IDS: TableDefinition<(u32, &str), u64> = TableDefinition::new("serv
 /// (account, lowercase sender address) → 1: load this sender's remote
 /// pictures without asking (§7.4; only offered for verified senders).
 const SENDER_PICTURES: TableDefinition<(u32, &str), u8> = TableDefinition::new("sender_pictures");
+/// account → its identities (postcard `Vec<Identity>`), the default first.
+const IDENTITIES: TableDefinition<u32, &[u8]> = TableDefinition::new("identities");
 
 /// Flags as bits; keywords are not kept yet.
 pub mod flag {
@@ -123,6 +125,16 @@ fn dec<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub name: String,
+}
+
+/// A From address of an account (mail.md §9.2): the account's own, or an
+/// alias the server lets it send as.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Identity {
+    pub name: String,
+    pub addr: String,
+    /// Added under new messages and replies ("-- " above it).
+    pub signature: String,
 }
 
 /// A folder's role (SPECIAL-USE, RFC 6154), for order and icons.
@@ -226,6 +238,7 @@ impl Store {
             tx.open_table(LIST)?;
             tx.open_table(SERVER_IDS)?;
             tx.open_table(SENDER_PICTURES)?;
+            tx.open_table(IDENTITIES)?;
             tx.open_table(ops::OPS)?;
             tx.open_table(outbox::OUTBOX)?;
             tx.open_table(drafts::DRAFTS)?;
@@ -298,6 +311,21 @@ impl Store {
         tx.open_table(ACCOUNTS)?.insert(id, enc(&Account { name: name.into() }).as_slice())?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// `account`'s From addresses, the default first.
+    pub fn identities(&self, account: AccountId) -> Result<Vec<Identity>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(IDENTITIES)?;
+        let v = t.get(account)?;
+        v.map(|v| dec(v.value())).transpose().map(Option::unwrap_or_default)
+    }
+
+    pub fn set_identities(&self, account: AccountId, ids: &[Identity]) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(IDENTITIES)?.insert(account, enc(&ids.to_vec()).as_slice())?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn accounts(&self) -> Result<Vec<(AccountId, Account)>> {
