@@ -31,6 +31,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod layer;
+
 const DEFAULT_ROOT: &str = "/var/lib/atrium";
 /// Where runtime libraries are read from. "/" = the running system (the native,
 /// on-target case). Point it at an extracted FreeBSD sysroot to install from a
@@ -50,6 +52,7 @@ fn main() -> ExitCode {
         "install"   => cmd_install(&args[2..]),
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
+        "layer"     => cmd_layer(&args[2..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
         other => { eprintln!("opifex: unknown command: {other}"); usage(); return ExitCode::from(2); }
     };
@@ -66,7 +69,12 @@ fn usage() {
            install <bundle-dir> [--allow-unsigned] [--root <dir>] [--sysroot <dir>]\n      \
              Install a pre-built signed bundle into the Portcullis app tree.\n  \
            list [--root <dir>]                 Show installed apps.\n  \
-           uninstall <app-id> [--root <dir>]   Remove an app + its overlay.\n\n\
+           uninstall <app-id> [--root <dir>]   Remove an app + its overlay.\n  \
+           layer pack <tree> --manifest <toml> [--sign <key.pem>]\n  \
+           layer install <dir> [--root <dir>] [--keys <dir>] [--arch <a>] [--allow-unsigned]\n  \
+           layer list [--root <dir>]\n  \
+           layer remove <name@version> [--root <dir>]\n      \
+             Toolchain layers (dev-tools-plan.md M3), signed by the platform key.\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -141,6 +149,58 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     println!("opifex: installed {id} -> {}", dest.display());
     println!("opifex:   entry {entry}, {added} runtime file(s) resolved into the app tree");
     Ok(())
+}
+
+fn cmd_layer(args: &[String]) -> Result<(), String> {
+    let (root, _sysroot, rest) = take_root(args);
+    let mut pos: Vec<&str> = Vec::new();
+    let (mut manifest, mut sign, mut keys_dir, mut arch, mut unsigned) =
+        (None::<String>, None::<String>, layer::PLATFORM_KEYS.to_string(), portcullis_toml::layer::host_arch().to_string(), false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--manifest" => manifest = Some(val()?),
+            "--sign" => sign = Some(val()?),
+            "--keys" => keys_dir = val()?,
+            "--arch" => arch = val()?,
+            "--allow-unsigned" => unsigned = true,
+            o if o.starts_with("--") => return Err(format!("layer: unknown flag {o}")),
+            o => pos.push(o),
+        }
+    }
+    match pos.as_slice() {
+        ["pack", tree] => {
+            let t = std::fs::read_to_string(manifest.ok_or("layer pack: --manifest <toml>")?).map_err(|e| e.to_string())?;
+            let key = match sign { Some(k) => Some(std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?), None => None };
+            let m = layer::pack(Path::new(tree), &t, key.as_deref())?;
+            println!("opifex: packed {} ({}, content {}){}", m.reference(), m.layer.arch, m.layer.content,
+                     if key.is_some() { ", signed" } else { ", NOT signed" });
+            Ok(())
+        }
+        ["install", dir] => {
+            let keys = load_publishers(&keys_dir);
+            let (m, dest) = layer::install(Path::new(dir), &layer::InstallOpts { root: &root, keys: &keys, arch: &arch, allow_unsigned: unsigned })?;
+            println!("opifex: layer {} installed -> {}", m.reference(), dest.display());
+            Ok(())
+        }
+        ["list"] => {
+            let v = layer::list(&root);
+            if v.is_empty() {
+                println!("opifex: no layers under {}", root.join("layers").display());
+            }
+            for (r, m) in v {
+                println!("  {r:<24} {:<8} {}", m.layer.arch, m.layer.summary);
+            }
+            Ok(())
+        }
+        ["remove", r] => {
+            let d = layer::remove(&root, r)?;
+            println!("opifex: removed {}", d.display());
+            Ok(())
+        }
+        _ => Err("layer: pack <tree> | install <dir> | list | remove <name@version>".into()),
+    }
 }
 
 fn cmd_list(args: &[String]) -> Result<(), String> {

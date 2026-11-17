@@ -16,3 +16,6 @@ path = "src/main.rs"
 [dependencies]
 portcullis-toml = { path = "../portcullis-toml" }
 portcullis-sig  = { path = "../portcullis-sig" }
+sha2   = "0.10"
+base64 = "0.22"
+toml   = "0.8"

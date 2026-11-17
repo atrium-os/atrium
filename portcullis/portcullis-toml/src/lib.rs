@@ -15,6 +15,7 @@
 //! tooling that wants to lint atrium.toml files.
 
 pub mod icon;
+pub mod layer;
 pub mod network;
 pub mod schema;
 pub mod validate;
