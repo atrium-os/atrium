@@ -1,0 +1,22 @@
+[?1049h[22;0;0t[?1h=[H[2J]11;?[?2004h[?u[c[?25h[?25l[>4;2m(B[m[H[2J[96m// A sample file for terminal recordings.(B[m[K
+[93mfn(B[m (B[0;1m[96mmain(B[m() {[K
+    [93mlet(B[m greeting [93m=(B[m [95m"hello, 世界"(B[m;[K
+    [93mfor(B[m i [93min(B[m [95m0(B[m..[95m3(B[m {[K
+        [38;5;81mprintln!(B[m([95m"{greeting} {i}"(B[m);[K
+    }[K
+    [93mlet(B[m long [93m=(B[m [95m"this line is long enough to run past the right margin of an eighty column terminal window"(B[m;[K
+}[K
+[94m~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+~[K
+(B[0;1;7msample.rs                                                     1,1            All]112[2 q]112[2 q[?1002h[?1006h[H[?25h[?25l[?1004h[?25h[?25l[24;70H(B[mj         [H[?25h[?25l[24;70H [23;63H(B[0;1;7m2[21A[?25h[?25l[24;70H(B[mj[22A[?25h[?25l[24;70H [23;63H(B[0;1;7m3,1-4[3;4H[?25h[?25l[24;70H(B[mA[3;4H[?25h[?25l[24;70H ]112[6 q[3;4H[?25h[?25l[21B(B[0;1m-- INSERT --(B[m[K[?25h[?25l[23;65H(B[0;1;7m33-34[3;34H[?25h[?25l[C(B[m[96m// x[23;11H(B[0;1;7m[+][52C8-39[3;39H[?25h[?25l(B[m[21B[12X]112[2 q[3;39H[?25h[?25l[23;66H(B[0;1;7m7-38[3;38H[?25h
