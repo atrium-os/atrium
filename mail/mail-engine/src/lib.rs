@@ -21,7 +21,7 @@ use std::process::{Child, Command, Stdio};
 pub mod pictures;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
-use mail_store::{flag, AccountId, Folder, FolderId, Incoming, Role, Store};
+use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
 use mail_sync::{FolderState, Sink};
 
 /// How the engine starts a parse jail. On Atrium jaild starts it with no
@@ -40,6 +40,8 @@ pub enum Error {
     /// The jail could not be started or sent an invalid frame.
     Jail(String),
     NotFound,
+    /// An action this account can't do, said why.
+    Refused(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +50,7 @@ impl std::fmt::Display for Error {
             Error::Store(e) => write!(f, "{e}"),
             Error::Jail(e) => write!(f, "parse jail: {e}"),
             Error::NotFound => f.write_str("no such message"),
+            Error::Refused(why) => f.write_str(why),
         }
     }
 }
@@ -390,5 +393,100 @@ impl Sink for AccountSink<'_> {
             }
         }
         out
+    }
+
+    fn changes(&mut self) -> Vec<mail_sync::Change> {
+        let Ok(due) = self.e.store.ops_due(self.account, now()) else { return Vec::new() };
+        let name = |f: FolderId| self.e.store.folder(f).ok().map(|f| f.name);
+        due.into_iter()
+            .filter_map(|(id, op)| {
+                let what = match op.kind {
+                    OpKind::Flags { add, remove } => mail_sync::What::Flags { add: imap_flags(add), remove: imap_flags(remove) },
+                    OpKind::Move { to } => mail_sync::What::Move { to: name(to)? },
+                    OpKind::Expunge => mail_sync::What::Expunge,
+                };
+                Some(mail_sync::Change { id, folder: name(op.folder)?, uid: op.uid, what })
+            })
+            .collect()
+    }
+
+    fn change_done(&mut self, id: u64, ok: bool) -> Result<(), String> {
+        self.e.store.write(|w| w.op_done(id, ok)).map_err(|e| e.to_string())
+    }
+}
+
+/// Flag bits as IMAP's system flags.
+fn imap_flags(bits: u32) -> Vec<String> {
+    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft")]
+        .iter()
+        .filter(|(b, _)| bits & b != 0)
+        .map(|(_, n)| n.to_string())
+        .collect()
+}
+
+/// What the person does to messages from the list or the reader (§15.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// To the account's Archive (Gmail: All Mail).
+    Archive,
+    /// To Trash; from Trash (or with none), for good.
+    Delete,
+    Read(bool),
+    Flag(bool),
+}
+
+/// How long a list action can be undone before sync makes it (§15.5).
+pub const UNDO_SECS: i64 = 10;
+
+impl Engine {
+    /// Do `action` to the messages at `uids` in `folder`: in the index at
+    /// once, on the server after the undo window (`due`, seconds; reads go
+    /// at once). The op ids, for [`Engine::undo`].
+    pub fn act(&self, folder: FolderId, uids: &[u32], action: Action) -> Result<Vec<u64>, Error> {
+        let f = self.store.folder(folder)?;
+        let role_folder = |roles: &[Role]| -> Result<Option<FolderId>, Error> {
+            for r in roles {
+                if let Some((id, _)) = self.store.folders(f.account)?.into_iter().find(|(_, x)| x.role == *r && !x.hidden) {
+                    return Ok(Some(id));
+                }
+            }
+            Ok(None)
+        };
+        let (kind, due) = match action {
+            Action::Read(on) => (OpKind::Flags { add: if on { flag::SEEN } else { 0 }, remove: if on { 0 } else { flag::SEEN } }, now()),
+            Action::Flag(on) => (OpKind::Flags { add: if on { flag::FLAGGED } else { 0 }, remove: if on { 0 } else { flag::FLAGGED } }, now() + UNDO_SECS),
+            Action::Archive => match role_folder(&[Role::Archive, Role::All])? {
+                Some(to) if to != folder => (OpKind::Move { to }, now() + UNDO_SECS),
+                _ => return Err(Error::Refused("This account has no Archive folder")),
+            },
+            Action::Delete => match role_folder(&[Role::Trash])? {
+                Some(to) if to != folder => (OpKind::Move { to }, now() + UNDO_SECS),
+                _ => (OpKind::Expunge, now() + UNDO_SECS),
+            },
+        };
+        let mut ids = Vec::new();
+        self.store.write(|w| {
+            for &u in uids {
+                match w.queue(folder, u, kind.clone(), due) {
+                    Ok(id) => ids.push(id),
+                    // Already leaving, or gone: nothing to do for it.
+                    Err(mail_store::Error::NotFound) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// Undo ops not yet made on the server; how many were.
+    pub fn undo(&self, ops: &[u64]) -> Result<usize, Error> {
+        Ok(self.store.write(|w| {
+            let mut n = 0;
+            for &id in ops {
+                n += w.undo(id)? as usize;
+            }
+            Ok(n)
+        })?)
     }
 }

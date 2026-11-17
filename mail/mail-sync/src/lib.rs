@@ -27,7 +27,7 @@
 
 use std::io::{Read, Write};
 
-use mail_proto::imap::{Chunk, Cmd, Code, Decoder, Encoder, FetchItem, FetchWant, Limits, Response, Search, Set, Status};
+use mail_proto::imap::{Chunk, Cmd, Code, Decoder, Encoder, FetchItem, FetchWant, Limits, Response, Search, Set, Status, StoreOp};
 
 /// Newest inbox messages listed first.
 pub const STAGE1: usize = 200;
@@ -129,6 +129,33 @@ pub trait Sink {
     /// UIDs in the text window still without their text, newest first, at
     /// most `limit`, with sizes as listed.
     fn text_wanted(&mut self, folder: &str, limit: usize) -> Vec<(u32, u64)>;
+    /// The person's changes due now, to make on the server first.
+    fn changes(&mut self) -> Vec<Change> {
+        Vec::new()
+    }
+    /// The server made change `id` (`ok`), or refused it.
+    fn change_done(&mut self, id: u64, ok: bool) -> std::result::Result<(), String> {
+        let _ = (id, ok);
+        Ok(())
+    }
+}
+
+/// A change the person made, to make on the server (mail.md §6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub id: u64,
+    pub folder: String,
+    pub uid: u32,
+    pub what: What,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum What {
+    /// IMAP system flags (`\Seen`, `\Flagged`) to add and remove.
+    Flags { add: Vec<String>, remove: Vec<String> },
+    Move { to: String },
+    /// Delete for good.
+    Expunge,
 }
 
 /// What one pass did.
@@ -329,6 +356,8 @@ impl<S: Read + Write> Session<S> {
         let mut report = Report::default();
         let all = self.folders()?;
         sink.folders(&all).map_err(Error::Sink)?;
+        // The person's changes first, so the walk below sees their result.
+        self.changes(sink)?;
         let walk = self.walk(&all);
         report.folders = walk.len();
         // Stage 1: the inbox, newest first, one small page.
@@ -344,6 +373,72 @@ impl<S: Read + Write> Session<S> {
             self.texts(&f.name, sink, &mut report)?;
         }
         Ok(report)
+    }
+
+    /// Make the person's due changes on the server, folder by folder. A
+    /// change the server refuses is reported so the index goes back; a
+    /// lost connection leaves the rest for the next pass.
+    fn changes(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        let mut todo = sink.changes();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        todo.sort_by(|a, b| a.folder.cmp(&b.folder).then(a.id.cmp(&b.id)));
+        let uidplus = has(&self.caps, "UIDPLUS");
+        let moves = has(&self.caps, "MOVE");
+        let mut open: Option<String> = None;
+        for c in todo {
+            if open.as_deref() != Some(c.folder.as_str()) {
+                let cmd = self.enc.select(&c.folder, false, None, false);
+                match self.run(cmd) {
+                    Ok(_) => open = Some(c.folder.clone()),
+                    Err(Error::No(_)) => {
+                        sink.change_done(c.id, false).map_err(Error::Sink)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let set = Set::one(c.uid);
+            let r = match &c.what {
+                What::Flags { add, remove } => {
+                    let mut r = Ok(());
+                    for (op, flags) in [(StoreOp::Add, add), (StoreOp::Remove, remove)] {
+                        if r.is_ok() && !flags.is_empty() {
+                            let f: Vec<&str> = flags.iter().map(String::as_str).collect();
+                            let cmd = self.enc.uid_store(&set, op, &f, None);
+                            r = self.run(cmd).map(|_| ());
+                        }
+                    }
+                    r
+                }
+                What::Move { to } if moves => {
+                    let cmd = self.enc.uid_move(&set, to);
+                    self.run(cmd).map(|_| ())
+                }
+                // Without MOVE: copy, then delete only this UID (UIDPLUS);
+                // a plain EXPUNGE could take others' \Deleted messages.
+                What::Move { to } if uidplus => {
+                    let cmd = self.enc.uid_copy(&set, to);
+                    self.run(cmd).and_then(|_| self.expunge_one(&set))
+                }
+                What::Expunge if uidplus => self.expunge_one(&set),
+                _ => Err(Error::No("the server can't move or delete one message alone (no MOVE, no UIDPLUS)".into())),
+            };
+            match r {
+                Ok(()) => sink.change_done(c.id, true).map_err(Error::Sink)?,
+                Err(Error::No(_)) => sink.change_done(c.id, false).map_err(Error::Sink)?,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn expunge_one(&mut self, set: &Set) -> Result<()> {
+        let cmd = self.enc.uid_store(set, StoreOp::Add, &["\\Deleted"], None);
+        self.run(cmd)?;
+        let cmd = self.enc.uid_expunge(set);
+        self.run(cmd).map(|_| ())
     }
 
     /// Open a folder and bring it up to date; with `first_page`, stop after

@@ -95,6 +95,9 @@ pub struct Body {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Msg {
     pub msg: MsgId,
+    /// Its UID in the chosen folder, when it is there (a conversation can
+    /// hold messages from other folders).
+    pub here: Option<u32>,
     pub account: AccountId,
     /// From's address, for "Always for this sender".
     pub from: String,
@@ -138,6 +141,15 @@ pub struct LinkBar {
     pub note: Option<String>,
 }
 
+/// An action that can still be undone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Undo {
+    pub ops: Vec<u64>,
+    /// "Message archived", "Conversation deleted".
+    pub label: String,
+    pub until: i64,
+}
+
 /// The window's state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ui {
@@ -152,6 +164,8 @@ pub struct Ui {
     pub reading: Option<Shown>,
     /// The link bar (§7.6), after a press on a link in a message.
     pub link: Option<LinkBar>,
+    /// The last list action, undoable until `until` (§15.5).
+    pub undo: Option<Undo>,
     /// Bumped whenever the index may have changed, to drop cached rows.
     pub gen: u64,
     pub error: Option<String>,
@@ -368,8 +382,10 @@ impl Mail {
 
     fn msg_of(&self, msg: MsgId, m: &mail_store::Message, flags: u32) -> Msg {
         let s = &m.summary;
+        let folder = self.ui.get_cloned().folder;
         Msg {
             msg,
+            here: m.locations.iter().find(|(f, _)| Some(*f) == folder).map(|l| l.1),
             account: m.account,
             from: s.from.first().map(|a| a.addr.clone()).unwrap_or_default(),
             sender: sender::sender(s),
@@ -410,11 +426,23 @@ impl Mail {
             }
         }
         let framed = msgs.iter().rposition(|m| m.open && m.body.as_ref().is_some_and(|b| b.document.is_some()));
+        // Opened is read (§11.1); the "new" line still marks where they start.
+        let unread: Vec<u32> = msgs.iter().filter(|m| m.open && m.new).filter_map(|m| m.here).collect();
+        let mut read_any = false;
+        if let (false, Some(f)) = (unread.is_empty(), self.ui.get_cloned().folder) {
+            match self.engine.act(f, &unread, mail_engine::Action::Read(true)) {
+                Ok(_) => read_any = true,
+                Err(e) => eprintln!("atrium-mail: marking read: {e}"),
+            }
+        }
         let subject = msgs.first().and_then(|m| store.message(m.msg).ok()).map(|m| m.summary.subject).unwrap_or(row.subject);
         let mut ui = self.ui.get_cloned();
         let version = ui.reading.as_ref().map_or(0, |r| r.version) + 1;
         ui.cursor = Some(i);
         ui.link = None;
+        if read_any {
+            ui.gen += 1;
+        }
         ui.reading = Some(Shown {
             subject: if subject.trim().is_empty() { "(no subject)".into() } else { subject },
             people: if n > 1 { format!("{} · {n} messages", people.join(", ")) } else { String::new() },
@@ -485,6 +513,75 @@ impl Mail {
                 if quoted { b.show_quoted = !b.show_quoted } else { b.show_signature = !b.show_signature }
             }
         });
+    }
+
+    /// Archive or delete what the reader shows (the conversation's
+    /// messages in this folder): gone from the list at once, on the server
+    /// after the undo window. The next row opens in its place.
+    pub fn act(&self, action: mail_engine::Action) {
+        let mut ui = self.ui.get_cloned();
+        let (Some(folder), Some(r), Some(cursor)) = (ui.folder, ui.reading.as_ref(), ui.cursor) else { return };
+        let uids: Vec<u32> = r.msgs.iter().filter_map(|m| m.here).collect();
+        if uids.is_empty() {
+            return;
+        }
+        let label = match action {
+            mail_engine::Action::Archive => "archived",
+            mail_engine::Action::Delete => "deleted",
+            _ => "changed",
+        };
+        let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
+        match self.engine.act(folder, &uids, action) {
+            Ok(ops) if !ops.is_empty() => {
+                ui.undo = Some(Undo { ops, label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
+            }
+            Ok(_) => return,
+            Err(e) => {
+                ui.error = Some(e.to_string());
+                self.ui.set(ui);
+                return;
+            }
+        }
+        ui.count = self.count_of(folder, ui.conversations);
+        ui.gen += 1;
+        ui.reading = None;
+        ui.cursor = None;
+        ui.link = None;
+        ui.error = None;
+        let next = (ui.count > 0).then(|| cursor.min(ui.count - 1));
+        self.ui.set(ui);
+        if let Some(n) = next {
+            self.open(n);
+        }
+    }
+
+    /// Drop the Undo toast once its time is up (called from the app's loop).
+    pub fn tick(&self) {
+        let ui = self.ui.get_cloned();
+        if ui.undo.as_ref().is_some_and(|u| u.until < (self.now)()) {
+            let mut ui = ui;
+            ui.undo = None;
+            self.ui.set(ui);
+        }
+    }
+
+    /// Undo the last list action, while it can be.
+    pub fn undo(&self) -> bool {
+        let mut ui = self.ui.get_cloned();
+        let Some(u) = ui.undo.take() else { return false };
+        if u.until < (self.now)() {
+            self.ui.set(ui);
+            return false;
+        }
+        if let Err(e) = self.engine.undo(&u.ops) {
+            ui.error = Some(format!("Couldn't undo: {e}"));
+        }
+        if let Some(f) = ui.folder {
+            ui.count = self.count_of(f, ui.conversations);
+        }
+        ui.gen += 1;
+        self.ui.set(ui);
+        true
     }
 
     /// "Load pictures" for message `k` (and, with `always`, for its
@@ -637,6 +734,18 @@ impl Mail {
                 }
                 _ => {}
             }
+        }
+        match (key, chars.as_str()) {
+            (Key::Char, "e") if ui.reading.is_some() => {
+                self.act(mail_engine::Action::Archive);
+                return true;
+            }
+            (Key::Char, "#") | (Key::Delete, _) if ui.reading.is_some() => {
+                self.act(mail_engine::Action::Delete);
+                return true;
+            }
+            (Key::Char, "z") => return self.undo(),
+            _ => {}
         }
         if ui.count == 0 {
             return false;
@@ -984,6 +1093,24 @@ impl MailView {
         .key(100)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+        // "Message archived · Undo z" at the list's foot while it can be undone.
+        if let Some(u) = ui.undo.as_ref().filter(|u| u.until >= now) {
+            let undo = "Undo";
+            let uw = width(undo, type_size::XS, Weight::Semibold) + width("z", type_size::XS, Weight::Regular) + em(24.0);
+            let lw = width(&u.label, type_size::SM, Weight::Regular);
+            let bw = (lw + uw + em(36.0)).min(w - 24.0);
+            let (bx, by, bh) = (x0 + (w - bw) / 2.0, h - em(56.0), em(40.0));
+            ctx.add(Node::Rect { rect: Rect::new(bx, by, bw, bh), fill: t.text_primary(), radius: 8.0 });
+            text(ctx, bx + em(14.0), by + bh / 2.0, &fit(&u.label, type_size::SM, Weight::Regular, bw - uw - em(28.0)), type_size::SM, Weight::Regular, t.bg_canvas());
+            let m = self.mail.clone();
+            let ux = bx + bw - uw - em(8.0);
+            area(ctx, Rect::new(ux, by + em(8.0), uw, bh - em(16.0)), Color::TRANSPARENT, move || {
+                m.undo();
+            });
+            text(ctx, ux + em(8.0), by + bh / 2.0, undo, type_size::XS, Weight::Semibold, t.bg_canvas());
+            text(ctx, ux + uw - em(8.0) - width("z", type_size::XS, Weight::Regular), by + bh / 2.0, "z", type_size::XS, Weight::Regular, t.bg_canvas());
+            ctx.pop();
+        }
     }
 
     fn reader(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
@@ -1007,8 +1134,21 @@ impl MailView {
         let col = w.min(read_max() + 64.0);
         let x = x0 + (w - col) / 2.0 + 32.0;
         let tw = col - 64.0;
+        // Its actions at the right, each with its key (§15.5).
+        let mut bx = x0 + w - 16.0;
+        for (label, k, action) in [("Delete", "#", mail_engine::Action::Delete), ("Archive", "e", mail_engine::Action::Archive)] {
+            let lw = width(label, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
+            bx -= lw;
+            let m = self.mail.clone();
+            area(ctx, Rect::new(bx, em(34.0) - em(12.0), lw, em(24.0)), t.bg_window(), move || m.act(action));
+            text(ctx, bx + em(9.0), em(34.0), label, type_size::XS, Weight::Medium, t.text_primary());
+            text(ctx, bx + lw - em(9.0) - width(k, type_size::XS, Weight::Regular), em(34.0), k, type_size::XS, Weight::Regular, t.text_tertiary());
+            ctx.pop();
+            bx -= em(6.0);
+        }
         // The heading: the subject in full, who is in it.
-        text(ctx, x, em(34.0), &fit(&s.subject, type_size::XL, Weight::Semibold, tw), type_size::XL, Weight::Semibold, t.text_primary());
+        let sw = tw.min(bx - x - em(8.0));
+        text(ctx, x, em(34.0), &fit(&s.subject, type_size::XL, Weight::Semibold, sw), type_size::XL, Weight::Semibold, t.text_primary());
         if !s.people.is_empty() {
             text(ctx, x, em(62.0), &fit(&s.people, type_size::SM, Weight::Regular, tw), type_size::SM, Weight::Regular, t.text_secondary());
         }

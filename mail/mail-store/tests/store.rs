@@ -148,3 +148,55 @@ fn two_threads_that_meet_are_one() {
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].count, 3);
 }
+
+#[test]
+fn an_archive_leaves_the_list_at_once_and_undo_brings_it_back() {
+    use mail_store::{OpKind, LEAVING};
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path()).unwrap();
+    let a = s.add_account("priya@example.org").unwrap();
+    let inbox = s.folder_id(a, "INBOX", Role::Inbox).unwrap();
+    let archive = s.folder_id(a, "Archive", Role::Archive).unwrap();
+    s.write(|w| { w.put(inbox, a, 10, inc(&s, "keep", 1_000, None, true))?; w.put(inbox, a, 11, inc(&s, "go", 2_000, None, true))?; Ok(()) }).unwrap();
+    assert_eq!(s.conversation_count(inbox).unwrap(), 2);
+
+    // Archive: gone from the list and the conversations at once, still known to sync.
+    let op = s.write(|w| w.queue(inbox, 11, OpKind::Move { to: archive }, 100)).unwrap();
+    assert_eq!(s.list(inbox, 0, 10).unwrap().iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["keep"]);
+    assert_eq!(s.conversation_count(inbox).unwrap(), 1);
+    assert_eq!(s.uids(inbox).unwrap(), [10, 11], "sync must not fetch it again");
+    // A text arriving for it in the undo window doesn't bring it back.
+    s.write(|w| w.put(inbox, a, 11, inc(&s, "go", 2_000, None, true)).map(|_| ())).unwrap();
+    s.write(|w| w.set_flags(inbox, 11, flag::SEEN).map(|_| ())).unwrap();
+    assert_eq!(s.count(inbox).unwrap(), 1);
+    assert_eq!(s.at(inbox, 11).unwrap().unwrap().1 & LEAVING, LEAVING);
+    // Not due yet; then due.
+    assert!(s.ops_due(a, 99).unwrap().is_empty());
+    assert_eq!(s.ops_due(a, 100).unwrap().len(), 1);
+    // Undo: back in the list.
+    assert!(s.write(|w| w.undo(op)).unwrap());
+    assert_eq!(s.count(inbox).unwrap(), 2);
+    assert_eq!(s.conversation_count(inbox).unwrap(), 2);
+    assert!(s.ops_due(a, i64::MAX).unwrap().is_empty());
+    assert!(!s.write(|w| w.undo(op)).unwrap(), "once");
+
+    // Done on the server: the server's expunge then removes the location,
+    // and the message with it.
+    let op = s.write(|w| w.queue(inbox, 11, OpKind::Move { to: archive }, 0)).unwrap();
+    s.write(|w| w.op_done(op, true)).unwrap();
+    assert_eq!(s.count(inbox).unwrap(), 1);
+    s.write(|w| w.remove(inbox, 11)).unwrap();
+    assert_eq!(s.uids(inbox).unwrap(), [10]);
+
+    // Read, refused by the server: back to unread.
+    let op = s.write(|w| w.queue(inbox, 10, OpKind::Flags { add: flag::SEEN, remove: 0 }, 0)).unwrap();
+    assert_eq!(s.at(inbox, 10).unwrap().unwrap().1, flag::SEEN);
+    assert!(!s.conversations(inbox, 0, 10).unwrap()[0].unread);
+    s.write(|w| w.op_done(op, false)).unwrap();
+    assert_eq!(s.at(inbox, 10).unwrap().unwrap().1, 0);
+    assert!(s.conversations(inbox, 0, 10).unwrap()[0].unread);
+    // Moving to a folder of another account is refused.
+    let b = s.add_account("work@example.org").unwrap();
+    let other = s.folder_id(b, "Archive", Role::Archive).unwrap();
+    assert!(s.write(|w| w.queue(inbox, 10, OpKind::Move { to: other }, 0)).is_err());
+}

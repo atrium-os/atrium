@@ -22,6 +22,8 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod ops;
+pub use ops::{Op, OpKind, LEAVING};
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
@@ -37,14 +39,14 @@ pub type Hash = [u8; 32];
 // Tables. Values are postcard.
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const ACCOUNTS: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
-const FOLDERS: TableDefinition<u32, &[u8]> = TableDefinition::new("folders");
+pub(crate) const FOLDERS: TableDefinition<u32, &[u8]> = TableDefinition::new("folders");
 /// (account, folder name) → folder id.
 const FOLDER_NAMES: TableDefinition<(u32, &str), u32> = TableDefinition::new("folder_names");
 const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
 /// (folder, uid) → (msg, flags).
-const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new("locations");
+pub(crate) const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new("locations");
 /// (folder, newest-first date key, msg) → uid: the list.
-const LIST: TableDefinition<(u32, u64, u64), u32> = TableDefinition::new("list");
+pub(crate) const LIST: TableDefinition<(u32, u64, u64), u32> = TableDefinition::new("list");
 /// (account, server's stable id) → msg: each message once (§6.4).
 const SERVER_IDS: TableDefinition<(u32, &str), u64> = TableDefinition::new("server_ids");
 /// (account, lowercase sender address) → 1: load this sender's remote
@@ -175,6 +177,9 @@ pub struct Message {
     /// Remote pictures fetched on the person's request (§7.4), by the
     /// document's resource id, kept so a second view fetches nothing.
     pub pictures: Vec<(String, Hash)>,
+    /// Locations the person moved or deleted it from, until the server
+    /// has done it too (they are no longer in `locations`).
+    pub leaving: Vec<(FolderId, u32)>,
 }
 
 /// One row of a folder's list.
@@ -217,6 +222,7 @@ impl Store {
             tx.open_table(LIST)?;
             tx.open_table(SERVER_IDS)?;
             tx.open_table(SENDER_PICTURES)?;
+            tx.open_table(ops::OPS)?;
             tx.open_table(thread::THREADS)?;
             tx.open_table(thread::MSGID_THREADS)?;
             tx.open_table(thread::SUBJECT_THREADS)?;
@@ -465,7 +471,7 @@ impl Writer<'_> {
                     old.full = Some(m.blob);
                     old.summary = m.summary;
                 }
-                if !old.locations.contains(&(folder, uid)) {
+                if !old.locations.contains(&(folder, uid)) && !old.leaving.contains(&(folder, uid)) {
                     old.locations.push((folder, uid));
                 }
                 // The list key carries the date: re-key if it changed.
@@ -493,6 +499,7 @@ impl Writer<'_> {
                     thread: 0,
                     document: None,
                     pictures: Vec::new(),
+                    leaving: Vec::new(),
                 };
                 self.put_msg(id, &msg)?;
                 if let Some(s) = &m.server_id {
@@ -502,6 +509,11 @@ impl Writer<'_> {
             }
         };
         let cur = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        // Leaving this folder (a move waits for the server): stays out of its list.
+        if cur.leaving.contains(&(folder, uid)) {
+            self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags | LEAVING))?;
+            return Ok(id);
+        }
         self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags))?;
         self.tx.open_table(LIST)?.insert((folder, date_key(cur.date), id), uid)?;
         if cur.thread == 0 {
@@ -549,7 +561,8 @@ impl Writer<'_> {
     pub fn set_flags(&mut self, folder: FolderId, uid: u32, flags: u32) -> Result<bool> {
         let mut t = self.tx.open_table(LOCATIONS)?;
         let Some(cur) = t.get((folder, uid))?.map(|v| v.value()) else { return Ok(false) };
-        t.insert((folder, uid), (cur.0, flags))?;
+        // A message leaving the folder stays so until its op is done.
+        t.insert((folder, uid), (cur.0, (flags & !LEAVING) | (cur.1 & LEAVING)))?;
         Ok(true)
     }
 
@@ -560,7 +573,8 @@ impl Writer<'_> {
         let Some(mut m) = self.get_msg(id)? else { return Ok(()) };
         self.tx.open_table(LIST)?.remove((folder, date_key(m.date), id))?;
         m.locations.retain(|l| *l != (folder, uid));
-        if m.locations.is_empty() {
+        m.leaving.retain(|l| *l != (folder, uid));
+        if m.locations.is_empty() && m.leaving.is_empty() {
             self.tx.open_table(MESSAGES)?.remove(id)?;
             if let Some(s) = &m.server_id {
                 self.tx.open_table(SERVER_IDS)?.remove((m.account, s.as_str()))?;
