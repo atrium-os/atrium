@@ -188,9 +188,10 @@ holds it.
 §5.5 (key groups, group packs and blobs) apply to any volume with key groups, sealed or
 not, and set a second incompat bit. Nothing changes for volumes with neither.
 
-The kernel module and the core's `volume_open` already refuse unknown incompat bits.
-The read-only reader that the loader and atrium-capsa-fuse use (`tessera_reader.c`) does
-not check them today; §10 makes it refuse before any sealed stick exists.
+The kernel module and the core's `tessera_volume_open` already refuse unknown incompat
+bits, and the read-only reader that the loader and atrium-capsa-fuse use opens volumes
+through `tessera_volume_open`, so it refuses them too (test_volume's
+`test_unknown_incompat_refused`, 2026-11-17).
 
 ### 5.1 The AEAD
 
@@ -537,9 +538,9 @@ passcode, and Curia says so when the persona is removed.
   key slots, and the pack prelude (§5.5). The superblock fields are read by the jailed
   FUSE probe, never by the kernel before the key is loaded. Each has a fuzz target with a
   positive control, as Arca's formats do (arca.md §6.3).
-- **Refusing sealed volumes without support.** Before the first sealed stick exists,
-  atrium-capsa-fuse's Tessera backend and the loader's reader refuse any incompat bit
-  they don't know. That is part of E1.
+- **Refusing sealed volumes without support.** atrium-capsa-fuse's Tessera backend and
+  the loader's reader already refuse any incompat bit they don't know (§5); a test keeps
+  it so.
 - **Crypto code** (revised after E0, §5.1). The kmod's Rust part is compiled file by
   file with only `core` and the KPI crate, so it cannot take RustCrypto crates, and
   writing our own AEAD is not an option. The kernel therefore uses FreeBSD's own crypto:
@@ -595,7 +596,7 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | step | what | done when |
 |---|---|---|
 | E0 | Suite benchmark on the kernel's candidate code paths, vectors checked | **done 2026-11-17** (a09cb45, 007eb73): numbers in §5.1 for x86_64 and Apple M4; XAES-256-GCM chosen; in-kernel timing moves to E1 |
-| E1 | Sealed volumes (layer A): incompat bit and readers refusing it, superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded |
+| E1 | Sealed volumes (layer A): incompat bit (readers already refuse it, tested 2026-11-17), superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded |
 | E2 | Arca: `VolumeKey`, `/dev/tesserakeys` held by arcad, `LOAD`/`MINT`/`RECORD_GENERATION`/`FORGET` | arca-vm-test: key loads only for the active, unlocked owner, never released by any op; a mount with the wrong key id or a foreign uuid is refused |
 | E3 | Trusted sticks: format from Scrinium, probe, kernel mount, Locked state, recovery code, high-water, eject recording | vm-automount-check: a sealed stick opens for its persona only; a stick from another machine is Locked; a recovery code adopts it; an older image is refused and opens read-only after verification; forgetting the key leaves it Locked |
 | E4 | Encrypted domains on the internal volume: key-group and domain records with MACs, group-tagged packs, keyed ids, names and CDC per group, the parent-domain rule, lock at logout with page invalidation, atrium-volumes `encrypt = "persona"` with expected groups | VM: two people; root cannot read B's files or names while B is logged out; an offline edit that strips a domain's group or moves a file out of it is refused at login; dedup within a group, none across groups; GC leaves a locked group's packs alone |

@@ -19,6 +19,7 @@
 #include "tessera/error.h"
 #include "tessera/extent.h"
 #include "tessera/format.h"
+#include "tessera/reader.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -363,6 +364,35 @@ test_layout_checked(void)
 	free(d);
 }
 
+/* An incompat bit this code doesn't know (here bit 1, which
+ * tessera-encryption.md reserves for SEALED) must be refused by the
+ * volume layer and by the read-only reader the loader and capsa-fuse use,
+ * so a sealed stick is never decoded by code that can't authenticate it. */
+static void
+test_unknown_incompat_refused(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	d->next_sector = 1;
+	tessera_block_io_t io = mk_io(d);
+	tessera_format_opts_t opts;
+	memset(&opts, 0, sizeof opts);
+	opts.total_sectors = 2048;
+	opts.journal_sectors = 64;
+	CHECK(tessera_volume_format(&io, &opts) == TESSERA_OK);
+
+	for (uint64_t s = 0; s < 2; s++) {
+		tessera_superblock_t sb;
+		CHECK(tessera_decode_superblock(d->blocks[s], &sb) == TESSERA_OK);
+		sb.incompat_flags |= 1u << 1;
+		CHECK(tessera_encode_superblock(&sb, d->blocks[s]) == TESSERA_OK);
+	}
+	tessera_volume_t *v = NULL;
+	CHECK(tessera_volume_open(&io, &v) == TESSERA_EINCOMPAT);
+	CHECK(v == NULL);
+	CHECK(tessera_reader_open(&io) == NULL);
+	free(d);
+}
+
 int
 main(void)
 {
@@ -375,6 +405,7 @@ main(void)
 	test_free_extent_tree_reachable();
 	test_inode_and_pack_roots_reachable();
 	test_layout_checked();
+	test_unknown_incompat_refused();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;
