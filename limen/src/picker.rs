@@ -11,6 +11,12 @@
 //!   until the app's jail goes, the stick is ejected or unplugged, or the
 //!   session locks.
 //!
+//! - A **save target** ([`Kind::Save`]): the user picks a folder; the
+//!   picker makes a new file there named as the app asked (never over
+//!   another: "q4 (2).csv"), records where it came from in its
+//!   `atrium.origin` attribute, and hands it over open for writing, like a
+//!   picked file. The app learns its name, never its folder.
+//!
 //! The embed ends after [`ToParent::Done`] or [`ToParent::Cancelled`]: one
 //! pick per embed.
 
@@ -22,6 +28,8 @@ pub enum Kind {
     File,
     /// One folder.
     Folder,
+    /// A new file in a folder the user picks (mail.md §8.2's Save).
+    Save,
 }
 
 /// What the app asks for. A hint about what to show, never a scope: the
@@ -40,7 +48,16 @@ pub struct Filter {
     /// The picker's heading ("Open a document"); empty: the picker's own.
     /// At most [`MAX_TITLE`] bytes, no control characters.
     pub title: String,
+    /// For [`Kind::Save`]: the new file's name (no folder), at most
+    /// [`MAX_NAME`] bytes; empty otherwise.
+    pub name: String,
+    /// For [`Kind::Save`]: where it came from, written to the file's
+    /// `atrium.origin` ("mail: from priya@example.com, 2026-11-15"); at
+    /// most [`MAX_ORIGIN`] bytes. Empty otherwise.
+    pub origin: String,
 }
+
+pub const MAX_ORIGIN: usize = 200;
 
 pub const MAX_EXTENSIONS: usize = 16;
 pub const MAX_EXTENSION: usize = 16;
@@ -51,7 +68,12 @@ pub const MAX_NAME: usize = 255;
 
 impl Filter {
     pub fn file() -> Self {
-        Self { kind: Kind::File, extensions: Vec::new(), multiple: false, write: false, title: String::new() }
+        Self { kind: Kind::File, extensions: Vec::new(), multiple: false, write: false, title: String::new(), name: String::new(), origin: String::new() }
+    }
+
+    /// Save `name` in a folder the user picks; `origin` says where it came from.
+    pub fn save(name: &str, origin: &str) -> Self {
+        Self { kind: Kind::Save, write: true, name: name.into(), origin: origin.into(), ..Self::file() }
     }
 
     pub fn folder() -> Self {
@@ -64,6 +86,20 @@ impl Filter {
             && self.title.len() <= MAX_TITLE
             && !self.title.chars().any(char::is_control)
             && !(self.kind == Kind::Folder && self.multiple)
+            && match self.kind {
+                Kind::Save => {
+                    !self.multiple
+                        && !self.name.is_empty()
+                        && self.name.len() <= MAX_NAME
+                        && !self.name.contains(['/', '\0'])
+                        && self.name != "."
+                        && self.name != ".."
+                        && !self.name.chars().any(char::is_control)
+                        && self.origin.len() <= MAX_ORIGIN
+                        && !self.origin.chars().any(char::is_control)
+                }
+                _ => self.name.is_empty() && self.origin.is_empty(),
+            }
     }
 
     /// Whether a file named `name` is shown.
@@ -147,12 +183,19 @@ mod tests {
         let f = Filter { extensions: vec!["txt".into(), "md".into()], multiple: true, title: "Open notes".into(), ..Filter::file() };
         let m = ToChild::Open(f.clone());
         assert_eq!(ToChild::decode(&m.encode()), Some(m));
+        let m = ToChild::Open(Filter::save("q4.csv", "mail: from priya@example.com, 2026-11-15"));
+        assert_eq!(ToChild::decode(&m.encode()), Some(m));
         for bad in [
             Filter { extensions: vec!["t.xt".into()], ..Filter::file() },
             Filter { extensions: vec!["".into()], ..Filter::file() },
             Filter { extensions: vec!["x".into(); MAX_EXTENSIONS + 1], ..Filter::file() },
             Filter { title: "a\u{1b}[2J".into(), ..Filter::file() },
             Filter { multiple: true, ..Filter::folder() },
+            Filter::save("../x", ""),
+            Filter::save("", ""),
+            Filter::save("a\nb", ""),
+            Filter::save("ok.txt", "mail\u{7}"),
+            Filter { name: "x".into(), ..Filter::file() },
         ] {
             assert_eq!(ToChild::decode(&ToChild::Open(bad.clone()).encode()), None, "{bad:?}");
         }

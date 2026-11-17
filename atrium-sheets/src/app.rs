@@ -55,6 +55,39 @@ pub enum Cmd {
     ChartDelete,
     /// Lets the chart go.
     ChartDone,
+    /// The value list: value `i` of the column chosen or not.
+    FilterToggle(usize),
+    /// Every value the search shows chosen (`true`) or none of them.
+    FilterAll(bool),
+    FilterApply,
+    FilterCancel,
+}
+
+/// The value list's width, at the window's right over the grid.
+pub const FILTER_W: f32 = 300.0;
+/// A value's row in the list.
+pub const FILTER_ROW_H: f32 = 28.0;
+
+/// The value list of a filter column: what Apply keeps.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FilterPanel {
+    pub open: bool,
+    /// The column, of the sheet.
+    pub col: u32,
+    /// The header's text, for the panel's title.
+    pub title: String,
+    /// Each distinct shown text and how many rows show it.
+    pub values: Vec<(String, u32)>,
+    /// Chosen, by value.
+    pub on: Vec<bool>,
+}
+
+impl FilterPanel {
+    /// The values the search `q` shows (ignoring case), by index.
+    pub fn shown(&self, q: &str) -> Vec<usize> {
+        let q = q.trim().to_lowercase();
+        (0..self.values.len()).filter(|&i| q.is_empty() || self.values[i].0.to_lowercase().contains(&q)).collect()
+    }
 }
 
 /// Legend places the chart bar offers, after None.
@@ -115,13 +148,16 @@ pub struct Sheets {
     pub chart_kind_menu: Mutable<MenuState>,
     pub chart_legend_menu: Mutable<MenuState>,
     pub chart_group_menu: Mutable<MenuState>,
+    pub filter: Mutable<FilterPanel>,
+    pub filter_search: Mutable<TextEdit>,
+    pub filter_scroll: Mutable<ScrollState>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -140,6 +176,44 @@ impl Sheets {
         if all[i] != before {
             d.run(label, vec![officina_grid::ops::GridOp::Charts(all)]);
         }
+    }
+
+    /// Opens the value list of filter column `col`, or says why not.
+    pub fn choose_values(&self, col: u32) {
+        let got = crate::data::column_values(&self.doc.borrow(), col);
+        match got {
+            Ok(v) => {
+                let d = self.doc.borrow();
+                let r0 = d.wb.sheet(d.sheet).filter.as_ref().map_or(0, |f| f.rect.r0);
+                let head = d.wb.formatted(officina_grid::addr::CellAddr::new(d.sheet, r0, col)).text;
+                drop(d);
+                let title = if head.trim().is_empty() { format!("Column {}", col_name(col)) } else { format!("{} · {}", col_name(col), head.trim()) };
+                let on = v.iter().map(|x| x.2).collect();
+                self.filter.set(FilterPanel { open: true, col, title, values: v.into_iter().map(|x| (x.0, x.1)).collect(), on });
+                self.filter_search.set(TextEdit::new(""));
+                self.filter_scroll.set(ScrollState::default());
+            }
+            Err(e) => self.doc.borrow_mut().status = e,
+        }
+        self.changed();
+    }
+
+    /// The value list's choice as the filter, and the list closed.
+    pub fn apply_values(&self) {
+        let p = self.filter.get_cloned();
+        if !p.open {
+            return;
+        }
+        if !p.on.iter().any(|&o| o) {
+            self.doc.borrow_mut().status = "Choose at least one value to show.".into();
+            self.changed();
+            return;
+        }
+        let keep: Vec<String> = p.values.iter().zip(&p.on).filter(|(_, &o)| o).map(|(v, _)| v.0.clone()).collect();
+        let every = keep.len() == p.values.len();
+        crate::data::keep_values(&mut self.doc.borrow_mut(), p.col, keep, every);
+        self.filter.set(FilterPanel::default());
+        self.changed();
     }
 
     /// Shows the password bar with `prompt`, its field empty.
@@ -419,6 +493,58 @@ impl View for Sheets {
             self.chart_loaded.set(None);
         }
 
+        // The value list of a filter column, at the right over the grid.
+        let fp = self.filter.get_cloned();
+        if fp.open && !pb.open {
+            let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(160.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            // Presses on the panel stay off the grid under it.
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: fp.title.clone(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            TextField::new(self.filter_search.clone()).placeholder("Search values").autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).render(ctx);
+            let shown = fp.shown(self.filter_search.get_cloned().text());
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            Button::secondary("Select All").at(x0 + 12.0, y0 + 78.0).width(100.0).on_click(push(Cmd::FilterAll(true))).render(ctx);
+            Button::secondary("Clear").at(x0 + 120.0, y0 + 78.0).width(72.0).on_click(push(Cmd::FilterAll(false))).render(ctx);
+            let chosen = fp.on.iter().filter(|&&o| o).count();
+            ctx.add(Node::Text { rect: Rect::new(x0 + 200.0, y0 + 86.0, FILTER_W - 212.0, 18.0), content: format!("{chosen} of {}", fp.values.len()), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            let ly = y0 + 120.0;
+            let lh = (ph - 120.0 - 56.0).max(FILTER_ROW_H);
+            let (vals, on, cmds) = (Rc::new(fp.values.clone()), Rc::new(fp.on.clone()), self.cmds.clone());
+            let rows = Rc::new(shown);
+            let n = rows.len();
+            pergola::widgets::VirtualList::new(self.filter_scroll.clone(), Rect::new(x0 + 1.0, ly, FILTER_W - 1.0, lh), n, FILTER_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                // One node a row; what is in it placed as given.
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, FILTER_W - 1.0, FILTER_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let i = rows[k];
+                let (text, count) = &vals[i];
+                let label = if text.is_empty() { "(Empty)".to_string() } else { text.chars().take(60).collect() };
+                let cmds = cmds.clone();
+                let v = Mutable::new(if on[i] { pergola::widgets::Check::On } else { pergola::widgets::Check::Off });
+                pergola::widgets::Checkbox::new(v, label).at(12.0, 4.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::FilterToggle(i))).render(ctx);
+                let c = count.to_string();
+                ctx.add(Node::Text { rect: Rect::new(FILTER_W - 72.0, 6.0, 56.0, 16.0), content: c, style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() } });
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0xF117)
+            .emit(ctx);
+            if n == 0 {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, ly + 8.0, FILTER_W - 24.0, 18.0), content: "No value matches.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            let by = y0 + ph - 48.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, FILTER_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            Button::secondary("Cancel").at(x0 + FILTER_W - 164.0, by).width(72.0).on_click(push(Cmd::FilterCancel)).render(ctx);
+            Button::primary("Apply").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::FilterApply)).render(ctx);
+        }
+
         if self.ui.get_cloned().asking {
             // The system places the picker's sheet over the window.
             let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
@@ -440,6 +566,37 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::ChooseValues) => {
+                    self.choose_values(self.grid.get_cloned().cursor.1);
+                    false
+                }
+                Cmd::FilterToggle(i) => {
+                    let mut p = self.filter.get_cloned();
+                    if let Some(o) = p.on.get_mut(i) {
+                        *o = !*o;
+                        self.filter.set(p);
+                    }
+                    self.changed();
+                    false
+                }
+                Cmd::FilterAll(on) => {
+                    let mut p = self.filter.get_cloned();
+                    for i in p.shown(self.filter_search.get_cloned().text()) {
+                        p.on[i] = on;
+                    }
+                    self.filter.set(p);
+                    self.changed();
+                    false
+                }
+                Cmd::FilterApply => {
+                    self.apply_values();
+                    false
+                }
+                Cmd::FilterCancel => {
+                    self.filter.set(FilterPanel::default());
+                    self.changed();
                     false
                 }
                 Cmd::Data(dc) => {
@@ -519,6 +676,63 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn a_filter_column_s_values_are_chosen_from_a_list() {
+        let (mut d, _) = Doc::from_csv("t.csv", b"Fruit,Qty\npear,3\napple,10\nfig,7\napple,1\n").unwrap();
+        d.wb.recalc();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let hidden = |s: &Sheets| (1..=4).filter(|&r| s.doc.borrow().wb.sheet(0).row_hidden(r)).collect::<Vec<u32>>();
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::Filter));
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseValues));
+        s.take_cmds();
+        let p = s.filter.get_cloned();
+        assert!(p.open, "{}", s.doc.borrow().status);
+        assert_eq!((p.title.as_str(), p.values.iter().map(|v| (v.0.as_str(), v.1)).collect::<Vec<_>>(), p.on.clone()), ("A · Fruit", vec![("apple", 2), ("fig", 1), ("pear", 1)], vec![true; 3]));
+        // A click on apple's row lets it go; Apply hides both apples, one undo step.
+        let mut app = App::new(s.clone());
+        app.tick();
+        let (x0, ly) = (1200.0 - FILTER_W + 1.0, TOOLBAR_H + FORMULA_H + 120.0);
+        let at = pergola::geom::Point::new(x0 + 12.0 + 8.0, ly + 4.0 + 8.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        s.take_cmds();
+        assert_eq!(s.filter.get_cloned().on, [false, true, true]);
+        assert_eq!(s.grid.get_cloned().cursor, (0, 0), "the press stayed off the grid");
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert!(!s.filter.get_cloned().open);
+        assert_eq!(hidden(&s), [2, 4]);
+        // Opened again, it shows the filter's choice; the search narrows Clear.
+        s.choose_values(0);
+        assert_eq!(s.filter.get_cloned().on, [false, true, true]);
+        s.filter_search.set(TextEdit::new("PE"));
+        s.cmds.lock().unwrap().push(Cmd::FilterAll(false));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [1, 2, 4]);
+        // Choosing nothing is refused; choosing everything drops the condition.
+        s.choose_values(0);
+        s.cmds.lock().unwrap().push(Cmd::FilterAll(false));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert!(s.filter.get_cloned().open);
+        assert_eq!(s.doc.borrow().status, "Choose at least one value to show.");
+        s.cmds.lock().unwrap().push(Cmd::FilterAll(true));
+        s.cmds.lock().unwrap().push(Cmd::FilterApply);
+        s.take_cmds();
+        assert!(hidden(&s).is_empty());
+        assert!(s.doc.borrow().wb.sheet(0).filter.as_ref().unwrap().conds.is_empty());
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(hidden(&s), [1, 2, 4]);
+        // Cancel keeps the filter as it is.
+        s.choose_values(0);
+        s.cmds.lock().unwrap().push(Cmd::FilterAll(true));
+        s.cmds.lock().unwrap().push(Cmd::FilterCancel);
+        s.take_cmds();
+        assert_eq!(hidden(&s), [1, 2, 4]);
+    }
 
     #[test]
     fn a_chart_is_picked_moved_sized_edited_and_deleted() {

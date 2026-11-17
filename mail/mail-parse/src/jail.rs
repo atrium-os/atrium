@@ -60,6 +60,10 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 let result = open(&message.bytes, &ctx, &port, &loaded, fonts);
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
+            wire::ToJail::Attachment { message, which } => {
+                let result = attachment(&message.bytes, &which);
+                port.borrow_mut().send(&wire::FromJail::Attachment { id: message.id, result })?;
+            }
             wire::ToJail::Answer { .. } => return Err(io::Error::new(io::ErrorKind::InvalidData, "answer with no query")),
         }
         port.borrow_mut().send(&wire::FromJail::Done)?;
@@ -238,15 +242,103 @@ fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, lo
             dropped: c.dropped.into_iter().take(256).map(|(k, v)| (k.chars().take(1024).collect(), v.min(u32::MAX as usize) as u32)).collect(),
         }
     });
-    let mut unpacked = Vec::new();
-    for p in &s.parts {
-        let is_tnef = p.content_type.eq_ignore_ascii_case("application/ms-tnef")
-            || p.filename.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("winmail.dat"));
-        if !is_tnef { continue }
-        if let Ok(t) = tnef::unpack(&mime::part_bytes(raw, p), 64 - unpacked.len().min(64)) {
-            unpacked.extend(t.attachments.into_iter().map(|a| wire::Unpacked { name: a.name, data: a.data }));
+    let shown: Vec<&str> = document.as_ref().map_or(Vec::new(), |d| d.resources.iter().filter_map(|r| match &r.source {
+        wire::Source::Cid(c) if !r.hidden => Some(c.as_str()),
+        _ => None,
+    }).collect());
+    let attachments = attachments(raw, &s, &shown);
+    Ok(wire::Opened { summary, document, attachments })
+}
+
+/// The most files unpacked from a message's `winmail.dat` parts.
+const UNPACKED_MAX: usize = 64;
+
+fn is_tnef(p: &mime::Part) -> bool {
+    p.content_type.eq_ignore_ascii_case("application/ms-tnef") || p.filename.as_deref().is_some_and(|f| f.eq_ignore_ascii_case("winmail.dat"))
+}
+
+/// Every file unpacked from the message's `winmail.dat` parts, in order:
+/// (the part it came from, the file).
+fn unpacked(raw: &[u8], s: &crate::Summary) -> Vec<(usize, tnef::Attachment)> {
+    let mut out = Vec::new();
+    for (i, p) in s.parts.iter().enumerate().filter(|(_, p)| is_tnef(p)) {
+        if let Ok(t) = tnef::unpack(&mime::part_bytes(raw, p), UNPACKED_MAX - out.len().min(UNPACKED_MAX)) {
+            out.extend(t.attachments.into_iter().map(|a| (i, a)));
         }
     }
-    unpacked.truncate(64);
-    Ok(wire::Opened { summary, document, unpacked })
+    out.truncate(UNPACKED_MAX);
+    out
+}
+
+fn head(b: &[u8]) -> Vec<u8> { b[..b.len().min(wire::ATTACHMENT_HEAD)].to_vec() }
+
+/// What the strip shows (§8.1): attached files, forwarded messages, and
+/// pictures the HTML doesn't show; a `winmail.dat` that unpacks is
+/// replaced by its files.
+fn attachments(raw: &[u8], s: &crate::Summary, shown: &[&str]) -> Vec<wire::Attachment> {
+    let files = unpacked(raw, s);
+    let mut out = Vec::new();
+    for (i, p) in s.parts.iter().enumerate() {
+        let listed = match p.kind {
+            mime::PartKind::Attachment | mime::PartKind::Message => true,
+            // A picture for the HTML is shown there; one no HTML shows is a file.
+            mime::PartKind::Inline => !p.content_id.as_deref().is_some_and(|c| shown.contains(&c)),
+            _ => false,
+        };
+        if !listed { continue }
+        if is_tnef(p) && files.iter().any(|(at, _)| *at == i) {
+            for (n, (_, f)) in files.iter().enumerate().filter(|(_, (at, _))| *at == i) {
+                let name = mime::sanitize_filename(&f.name);
+                out.push(wire::Attachment {
+                    which: wire::Which::Unpacked(n as u32),
+                    name: if name.is_empty() { "attachment".into() } else { name },
+                    content_type: "application/octet-stream".into(),
+                    size: f.data.len() as u64,
+                    head: head(&f.data),
+                });
+            }
+            continue;
+        }
+        let bytes = mime::part_bytes(raw, p);
+        let fallback = if p.kind == mime::PartKind::Message { "message.eml" } else { "attachment" };
+        out.push(wire::Attachment {
+            which: wire::Which::Part(p.path.clone()),
+            name: p.filename.clone().filter(|f| !f.is_empty() && f != "..").unwrap_or_else(|| fallback.into()),
+            content_type: p.content_type.clone(),
+            size: bytes.len() as u64,
+            head: head(&bytes),
+        });
+    }
+    out
+}
+
+/// One attachment's bytes, and its text for search.
+fn attachment(raw: &[u8], which: &wire::Which) -> Result<wire::Attached, wire::Refusal> {
+    let s = crate::parse(raw, &Limits::default()).map_err(refusal)?;
+    let (bytes, charset) = match which {
+        wire::Which::Part(path) => {
+            let p = s.parts.iter().find(|p| p.path == *path && p.kind != mime::PartKind::Multipart).ok_or(wire::Refusal::NotMail)?;
+            (mime::part_bytes(raw, p), p.charset.clone())
+        }
+        wire::Which::Unpacked(n) => (unpacked(raw, &s).into_iter().nth(*n as usize).ok_or(wire::Refusal::NotMail)?.1.data, None),
+    };
+    let text = text_of(&bytes, charset.as_deref());
+    Ok(wire::Attached { bytes, text })
+}
+
+/// An attachment's text, when it is text (UTF-8 or its declared charset,
+/// no NULs); cut to the schema's limit at a character.
+fn text_of(bytes: &[u8], charset: Option<&str>) -> Option<String> {
+    let probe = &bytes[..bytes.len().min(wire::ATTACHMENT_HEAD)];
+    if probe.contains(&0) { return None }
+    if charset.is_none() && std::str::from_utf8(probe).is_err_and(|e| e.error_len().is_some()) { return None }
+    let (mut t, _) = crate::decode::to_utf8(bytes, charset);
+    // Text as atrium-types counts it: no control characters but layout ones.
+    if t.chars().take(wire::ATTACHMENT_HEAD).any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\x0c' | '\x1b')) { return None }
+    if t.len() > wire::ATTACHMENT_TEXT_MAX {
+        let mut at = wire::ATTACHMENT_TEXT_MAX;
+        while !t.is_char_boundary(at) { at -= 1 }
+        t.truncate(at);
+    }
+    Some(t)
 }

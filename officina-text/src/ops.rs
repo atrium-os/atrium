@@ -57,6 +57,13 @@ pub enum TextOp {
     /// Changes style `id`, adds it (`id` one past the last), or takes out
     /// the last one when nothing uses it (`None`).
     SetStyle { id: StyleId, style: Option<crate::model::Style> },
+    /// Takes style `id` out when nothing uses it (`None`), the styles after
+    /// it moving down one; or puts `style` in at `id` (never 0), those from
+    /// `id` moving up one, its references as they will read after. Each
+    /// style id the document holds follows. `stale`: entries of the
+    /// attribute table no text uses that named the style taken out (the
+    /// inverse names them again).
+    PlaceStyle { id: StyleId, style: Option<crate::model::Style>, stale: Vec<AttrId> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -153,6 +160,8 @@ impl TextOp {
             TextOp::SetPage { .. } | TextOp::SetMargins { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
             TextOp::SetNote { .. } | TextOp::SetShape { .. } | TextOp::SetStyle { .. } => return None,
+            // Ids move; nothing looks different.
+            TextOp::PlaceStyle { .. } => return None,
             // Comments change no layout; the editor redraws on every action.
             TextOp::SetComment { .. } | TextOp::SetRevision { .. } | TextOp::SetTracking { .. } => return None,
             // A tombstone takes no room; its text is drawn only in review.
@@ -453,6 +462,36 @@ impl TextOp {
                             let old = std::mem::replace(&mut d.styles.styles[i], s);
                             TextOp::SetStyle { id, style: Some(old) }
                         }
+                    }
+                }
+            }
+            TextOp::PlaceStyle { id, style, stale } => {
+                let n = d.styles.styles.len();
+                let i = id as usize;
+                match style {
+                    None => {
+                        if i == 0 || i >= n || d.uses_style(id) {
+                            return TextOp::Nop;
+                        }
+                        let stale = d.attrs.with_style(id);
+                        let old = d.styles.styles.remove(i);
+                        let down = move |s: StyleId| if s > id { s - 1 } else { s };
+                        d.remap_para_styles(&down);
+                        d.attrs.remap_styles(&down, &stale, None);
+                        TextOp::PlaceStyle { id, style: Some(old), stale }
+                    }
+                    Some(s) => {
+                        let name_ok = !s.name.trim().is_empty() && s.name.len() <= 255 && d.styles.by_name(&s.name).is_none();
+                        let refs_ok = [s.parent, s.next].into_iter().flatten().all(|r| (r as usize) <= n) && s.parent != Some(id);
+                        let kind_ok = |r: Option<StyleId>| r.is_none_or(|r| r == id || d.styles.styles.get(if r > id { r as usize - 1 } else { r as usize }).is_some_and(|x| x.kind == s.kind));
+                        if i == 0 || i > n || n >= crate::model::MAX_STYLES || !name_ok || !refs_ok || !kind_ok(s.parent) {
+                            return TextOp::Nop;
+                        }
+                        let up = move |x: StyleId| if x >= id { x + 1 } else { x };
+                        d.remap_para_styles(&up);
+                        d.attrs.remap_styles(&up, &stale, Some(id));
+                        d.styles.styles.insert(i, s);
+                        TextOp::PlaceStyle { id, style: None, stale: Vec::new() }
                     }
                 }
             }
@@ -766,6 +805,50 @@ mod tests {
         let mut bad = sd;
         bad.paras[0].runs = vec![(0, 9_999)];
         assert_eq!(TextOp::SetShape { id: 0, shape: Some(bad) }.apply(&mut d), TextOp::Nop);
+    }
+
+    #[test]
+    fn a_style_in_the_middle_goes_and_comes_back() {
+        use crate::model::{Style, StyleKind};
+        let mut d = doc();
+        let n = d.styles.styles.len() as u16;
+        let st = |name: &str, kind, parent, next| Style { name: name.into(), kind, parent, next, para: ParaProps::default(), chars: CharAttrs::default() };
+        // Unused U, then a character style C and a paragraph style Q after it.
+        for (i, s) in [st("U", StyleKind::Para, Some(0), None), st("C", StyleKind::Char, None, None), st("Q", StyleKind::Para, Some(0), Some(n + 2))].into_iter().enumerate() {
+            assert_ne!(TextOp::SetStyle { id: n + i as u16, style: Some(s) }.apply(&mut d), TextOp::Nop);
+        }
+        let props = d.para(0).unwrap().props.clone();
+        TextOp::SetPara { block: 0, style: n + 2, props }.apply(&mut d);
+        let c = d.attrs.intern(CharAttrs { style: Some(n + 1), ..Default::default() });
+        let mut runs = d.para(0).unwrap().runs.clone();
+        runs[0].1 = c;
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = runs);
+        // An attribute entry nothing uses that names U.
+        let stale = d.attrs.intern(CharAttrs { style: Some(n), bold: Some(true), ..Default::default() });
+        let snap = |d: &TextDoc| (d.styles.styles.clone(), d.para(0).unwrap().style, d.attrs.get(c).style, d.attrs.get(stale).style);
+        let before = snap(&d);
+        // C is used: it stays. U goes; Q and C move down one.
+        assert_eq!(TextOp::PlaceStyle { id: n + 1, style: None, stale: vec![] }.apply(&mut d), TextOp::Nop);
+        let inv = TextOp::PlaceStyle { id: n, style: None, stale: vec![] }.apply(&mut d);
+        assert_eq!(inv, TextOp::PlaceStyle { id: n, style: Some(before.0[n as usize].clone()), stale: vec![stale] });
+        assert_eq!(d.styles.styles.len(), n as usize + 2);
+        assert_eq!((d.para(0).unwrap().style, d.attrs.get(c).style, d.attrs.get(stale).style), (n + 1, Some(n), None));
+        assert_eq!((&*d.styles.styles[n as usize + 1].name, d.styles.styles[n as usize + 1].next), ("Q", Some(n + 1)));
+        assert_eq!(d.attrs.intern(CharAttrs { style: Some(n), ..Default::default() }), c, "the lookup follows");
+        // Back: every id as it was.
+        let again = inv.apply(&mut d);
+        assert_eq!(again, TextOp::PlaceStyle { id: n, style: None, stale: vec![] });
+        assert_eq!(snap(&d), before);
+        // Refused: Normal, a gap, a taken name, a base of another kind.
+        let bad = |d: &mut TextDoc, id: u16, s: Option<Style>| assert_eq!(TextOp::PlaceStyle { id, style: s, stale: vec![] }.apply(d), TextOp::Nop, "{id}");
+        bad(&mut d, 0, None);
+        bad(&mut d, 0, Some(st("Z", StyleKind::Para, None, None)));
+        bad(&mut d, n + 4, Some(st("Z", StyleKind::Para, None, None)));
+        bad(&mut d, 1, Some(st("Q", StyleKind::Para, None, None)));
+        bad(&mut d, 1, Some(st("Z", StyleKind::Para, Some(n + 2), None)));
+        // The op through the journal's bytes.
+        let op = TextOp::PlaceStyle { id: n, style: Some(before.0[n as usize].clone()), stale: vec![stale] };
+        assert_eq!(crate::native::decode_op(&crate::native::encode_op(&op), d.attrs.len(), d.styles.styles.len()).unwrap(), op);
     }
 
     #[test]

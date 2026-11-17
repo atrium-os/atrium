@@ -1380,6 +1380,7 @@ dependencies = [
  "officina-shapes",
  "rustybuzz",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-linebreak",
 ]
 

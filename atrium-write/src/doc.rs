@@ -126,8 +126,11 @@ fn decode(b: &[u8], attrs: usize, styles: usize) -> Result<Record, WireError> {
             let mut styles = styles;
             for _ in 0..k {
                 let op = native::decode_op(r.bytes("op", 64 << 20)?, attrs + n, styles)?;
-                if let officina_text::ops::TextOp::SetStyle { id, style: Some(_) } = &op {
-                    styles = styles.max(*id as usize + 1);
+                match &op {
+                    officina_text::ops::TextOp::SetStyle { id, style: Some(_) } => styles = styles.max(*id as usize + 1),
+                    // One more after it (the bound only grows: ids are checked when run).
+                    officina_text::ops::TextOp::PlaceStyle { style: Some(_), .. } => styles += 1,
+                    _ => {}
                 }
                 ops.push(op);
             }
@@ -575,6 +578,14 @@ mod tests {
         d.sync_log();
         assert!(d.ed.borrow_mut().change_style("Style", id, |s| s.para.space_after = Some(480)));
         d.sync_log();
+        // Heading 1 deleted, put back by undo, deleted again: Lead moves down.
+        d.ed.borrow_mut().delete_style(1).unwrap();
+        d.sync_log();
+        d.ed.borrow_mut().undo();
+        d.sync_log();
+        d.ed.borrow_mut().redo();
+        d.sync_log();
+        let id = id - 1;
         d.autosave().unwrap().sync().unwrap();
         let want = d.ed.borrow().doc.styles.styles.clone();
         std::mem::forget(d);

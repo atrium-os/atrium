@@ -65,6 +65,9 @@ pub enum Outcome {
     /// A folder of a stick to put into the app's jail: the stick's
     /// partition and the folder's path on it (`/` for all of it).
     Folder { part: String, path: String, name: String },
+    /// A new file to make in `dir` (Scrinium's jail) named `name`, or
+    /// "name (2)" when that is taken, recording `origin` (Kind::Save).
+    Save { dir: PathBuf, name: String, origin: String },
     Cancelled,
 }
 
@@ -371,7 +374,7 @@ impl Browser {
             Ok(mut v) => {
                 if let Some(f) = self.picker() {
                     let f = f.clone();
-                    v.retain(|e| e.dir && !e.link || (f.kind == Kind::File && !e.link && f.shows(&e.name)));
+                    v.retain(|e| e.dir && !e.link || (matches!(f.kind, Kind::File | Kind::Save) && !e.link && f.shows(&e.name)));
                 }
                 self.entries = v;
                 self.unreadable = None;
@@ -527,6 +530,8 @@ impl Browser {
             return;
         }
         match &self.mode {
+            // Saving: a file shows what is there; it isn't a place to save.
+            Mode::Picker { filter, .. } if filter.kind == Kind::Save => self.select_only(i),
             Mode::Picker { .. } => {
                 self.select_only(i);
                 self.choose();
@@ -953,6 +958,20 @@ impl Browser {
                 let name = path.last().cloned().unwrap_or_else(|| place.label.clone());
                 Ok(Outcome::Folder { part: place.id.clone(), path: format!("/{}", path.join("/")), name })
             }
+            Kind::Save => {
+                if place.read_only {
+                    return Err("This place is read-only; choose another".into());
+                }
+                let mut d = dir.to_path_buf();
+                match sel.as_slice() {
+                    [] => {}
+                    [e] if e.dir && !e.link => d.push(&e.name),
+                    // A file selected: beside it.
+                    [e] if !e.dir => {}
+                    _ => return Err("Select one folder, or none to save here".into()),
+                }
+                Ok(Outcome::Save { dir: d, name: f.name.clone(), origin: f.origin.clone() })
+            }
         }
     }
 
@@ -1253,6 +1272,25 @@ mod tests {
         assert!(b.pick().is_err());
         b.cancel();
         assert_eq!(b.outcome, Some(Outcome::Cancelled));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_save_target_is_the_open_folder_or_the_selected_one() {
+        let (d, p) = stick("pick-save");
+        let mut b = picker(Filter::save("q4.csv", "mail: from priya@example.com, 2026-11-15"));
+        b.set_places(vec![p.clone()]);
+        assert_eq!(names(&b), ["Docs", "Photos", "hello.txt"], "files shown for orientation");
+        assert_eq!(b.pick().unwrap(), Outcome::Save { dir: d.clone(), name: "q4.csv".into(), origin: "mail: from priya@example.com, 2026-11-15".into() });
+        b.press(0, Mods::default(), 0.0);
+        assert!(matches!(b.pick().unwrap(), Outcome::Save { dir, .. } if dir == d.join("Docs")));
+        // A double press on a file only selects it: it isn't a place.
+        b.activate(2);
+        assert!(b.outcome.is_none());
+        let ro = Place { read_only: true, ..p };
+        let mut b = picker(Filter::save("q4.csv", ""));
+        b.set_places(vec![ro]);
+        assert!(b.pick().is_err(), "read-only");
         let _ = std::fs::remove_dir_all(&d);
     }
 

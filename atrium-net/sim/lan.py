@@ -30,6 +30,9 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
                                stand between it and the host)
   flap6                     -- kernel stress: RAs every 0.2 s and unsolicited
                                NAs for fe80::1 without the Router flag
+  conflict | noconflict     -- a host 02:4e:00:00:00:77 already has 10.88.0.50 and
+                               answers ARP for it; after a DHCPDECLINE the server
+                               offers 10.88.0.51 (noconflict: back to .50)
   web-ok | web-dead | web-captive  -- what 198.51.100.80:80 does (default ok)
   stats                     -- counters
 """
@@ -42,6 +45,15 @@ RMAC = bytes.fromhex("024e000000fe")
 ROUTER = bytes([10, 88, 0, 1])
 DNS = bytes([10, 88, 0, 53])
 YOU = bytes([10, 88, 0, 50])
+YOU2 = bytes([10, 88, 0, 51])
+CMAC = bytes.fromhex("024e00000077")
+conflict = False
+declined = False
+
+
+def you():
+    return YOU2 if declined else YOU
+
 WEB = bytes([198, 51, 100, 80])  # beyond the router
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 MAGIC = bytes([99, 130, 83, 99])
@@ -49,6 +61,7 @@ MAGIC = bytes([99, 130, 83, 99])
 mode = "good"
 stats = {"discover": 0, "request": 0, "renew": 0, "rebind": 0, "reboot": 0,
          "hostile_sent": 0, "dns": 0, "ping": 0, "arp": 0, "frames": 0,
+         "decline": 0, "arp_conflict": 0,
          "rs": 0, "ra": 0, "ns": 0, "ping6": 0, "dns6": 0, "hostile6_sent": 0,
          "d6_solicit": 0, "d6_request": 0, "d6_renew": 0, "d6_rebind": 0, "d6_info": 0,
          "d6_hostile_sent": 0}
@@ -93,7 +106,8 @@ def opts(pairs):
     return out + b"\xff"
 
 
-def dhcp_reply(req, kind, extra=None, yi=YOU, mangle=None):
+def dhcp_reply(req, kind, extra=None, yi=None, mangle=None):
+    yi = yi or you()
     xid, chaddr = req[4:8], req[28:44]
     b = bytes([2, 1, 6, 0]) + xid + b"\0\0\0\0" + b"\0" * 4 + yi + ROUTER + b"\0" * 4 + chaddr
     b += b"\0" * 192 + MAGIC
@@ -139,8 +153,15 @@ def handle_dhcp(src_mac, req):
             continue
         o[req[i]] = req[i + 2:i + 2 + req[i + 1]]
         i += 2 + req[i + 1]
+    global declined
     kind = o.get(53, b"\0")[0]
     ciaddr = req[12:16]
+    if kind == 4:
+        stats["decline"] += 1
+        stats["last_decline"] = socket.inet_ntoa(o.get(50, b"\0" * 4))
+        if o.get(50) == YOU:
+            declined = True
+        return []
     if kind == 1:
         stats["discover"] += 1
     elif kind == 3:
@@ -161,7 +182,7 @@ def handle_dhcp(src_mac, req):
         r = dhcp_reply(req, 2)
     elif kind == 3:
         want = o.get(50, ciaddr)
-        r = dhcp_reply(req, 5 if want == YOU else 6)
+        r = dhcp_reply(req, 5 if want == you() else 6)
     else:
         return []
     return [eth(src_mac, RMAC, 0x0800, ip(ROUTER, b"\xff" * 4 if ciaddr == b"\0\0\0\0" else ciaddr, 17,
@@ -463,6 +484,10 @@ def frame(f):
         return frame6(src, p)
     if typ == 0x0806 and len(p) >= 28 and p[6:8] == b"\0\x01":
         tpa = p[24:28]
+        if conflict and tpa == YOU and src != CMAC:
+            stats["arp_conflict"] += 1
+            r = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + CMAC + YOU + p[8:14] + p[14:18]
+            return [eth(src, CMAC, 0x0806, r)]
         if tpa in (ROUTER, DNS):
             stats["arp"] += 1
             r = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + RMAC + tpa + p[8:14] + p[14:18]
@@ -493,7 +518,7 @@ def frame(f):
 
 
 def main():
-    global mode, mode6, web, d6
+    global mode, mode6, web, d6, conflict, declined
     lan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -532,6 +557,10 @@ def main():
                 print(f"lan: mode {w}", flush=True)
             if w in ("web-ok", "web-dead", "web-captive"):
                 web = w
+                print(f"lan: {w}", flush=True)
+            if w in ("conflict", "noconflict"):
+                conflict = w == "conflict"
+                declined = False
                 print(f"lan: {w}", flush=True)
             if w in ("d6-off", "d6-info", "d6-addr", "d6-hostile"):
                 d6 = w

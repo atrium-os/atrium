@@ -857,6 +857,7 @@ impl ScriniumView {
                 (Some(why), _) => why.clone(),
                 (None, None) => "Nothing to show".into(),
                 (None, Some(_)) if b.picker().is_some_and(|f| f.kind == Kind::Folder) => "No folders here".into(),
+                (None, Some(_)) if b.picker().is_some_and(|f| f.kind == Kind::Save) => "This folder is empty: save here".into(),
                 (None, Some(_)) => "This folder is empty".into(),
             };
             let tw = width(&msg, type_size::SM, Weight::Regular);
@@ -1122,13 +1123,19 @@ impl ScriniumView {
                 (Kind::Folder, _) => "Choose a folder".into(),
                 (Kind::File, true) => "Choose files".into(),
                 (Kind::File, false) => "Choose a file".into(),
+                (Kind::Save, _) => format!("Save “{}”", filter.name),
             }
         };
         // Two lines in em, so they stay apart as the text grows.
         icon(ctx, 16.0, em(16.0), ph::FOLDER_OPEN, 20.0, t.accent_fg());
         let tx = 16.0 + em(30.0);
         text(ctx, tx, em(18.0), &fit(&title, type_size::MD, Weight::Semibold, w - tx - 24.0), type_size::MD, Weight::Semibold, t.text_primary());
-        let who = if filter.write { format!("for {app}, which may change it") } else { format!("for {app}, to read") };
+        let who = match filter.kind {
+            Kind::Save if filter.origin.is_empty() => format!("a new file from {app}"),
+            Kind::Save => format!("a new file from {app} ({})", filter.origin),
+            _ if filter.write => format!("for {app}, which may change it"),
+            _ => format!("for {app}, to read"),
+        };
         text(ctx, tx, em(37.0), &fit(&who, type_size::XS, Weight::Regular, w - tx - 24.0), type_size::XS, Weight::Regular, t.text_tertiary());
 
         let foot = h - pick_foot_h();
@@ -1149,6 +1156,7 @@ impl ScriniumView {
         let go = match filter.kind {
             Kind::File => "Open",
             Kind::Folder => "Choose folder",
+            Kind::Save => "Save",
         };
         // As wide as `button` draws them (their padding is em too).
         let (gw, cw) = (button_w(go), button_w("Cancel"));
@@ -1164,6 +1172,10 @@ impl ScriniumView {
             (_, Ok(Outcome::Files(f)), _) if f.len() == 1 => (format!("“{}”", f[0].0), t.text_primary()),
             (_, Ok(Outcome::Files(f)), _) => (format!("{} files", f.len()), t.text_primary()),
             (_, Ok(Outcome::Folder { name, .. }), _) => (format!("The folder “{name}”"), t.text_primary()),
+            (_, Ok(Outcome::Save { dir, name, .. }), _) => {
+                let into = dir.file_name().and_then(|n| n.to_str()).map_or_else(|| "here".to_string(), |d| format!("in “{d}”"));
+                (format!("“{name}” {into}"), t.text_primary())
+            }
             (_, Err(e), _) => (e.clone(), t.text_tertiary()),
             (_, Ok(Outcome::Cancelled), _) => (String::new(), t.text_tertiary()),
         };

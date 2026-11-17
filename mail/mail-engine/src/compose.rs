@@ -100,7 +100,17 @@ impl Engine {
             quote,
             ..Draft::default()
         };
-        Ok(Compose { account, draft, identity, notes: Vec::new(), original: r.document })
+        let mut c = Compose { account, draft, identity, notes: Vec::new(), original: r.document };
+        // A forward carries the original's files (§9.1).
+        if kind == Kind::Forward {
+            for a in &r.attachments {
+                match self.attachment(msg, &a.which) {
+                    Ok(got) => c.draft.attachments.push(mail_compose::Attachment { name: a.name.clone(), mime: a.content_type.clone(), bytes: got.bytes }),
+                    Err(_) => c.notes.push(format!("“{}” couldn't be read, so it isn't attached.", a.name)),
+                }
+            }
+        }
+        Ok(c)
     }
 
     /// A message filled from a `mailto:` link (shown in full; never sent

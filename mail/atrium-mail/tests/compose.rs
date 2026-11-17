@@ -290,3 +290,52 @@ fn reply_quotes_the_html_original() {
     assert!(k.original.borrow().is_none() && k.draft().quote.is_none());
     assert!(k.draft().text.contains("wrote:\n> The numbers are in."), "{:?}", k.draft().text);
 }
+
+#[test]
+fn files_are_attached_and_forwarded() {
+    use mail_sync::{Fetched, RemoteFolder, Role, Sink};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let bytes = b"From: Arun <arun@acme.example>\r\nTo: priya@example.org\r\nSubject: Q4\r\nDate: Mon, 23 Nov 2026 08:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nNumbers attached.\r\n--B\r\nContent-Type: text/csv\r\nContent-Disposition: attachment; filename=q4.csv\r\n\r\nregion,total\r\n--B--\r\n".to_vec();
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: 300, internal_date: Some(NOW), server_id: None, bytes, full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut main = App::new_with_flag(view, dirty);
+    main.tick();
+    mail.open(0);
+    main.tick();
+    // A forward carries the file.
+    assert!(mail.key(&typed("f"), None));
+    let (c, _) = mail.take_composes().remove(0);
+    assert_eq!(c.draft.attachments.len(), 1);
+    assert_eq!((c.draft.attachments[0].name.as_str(), c.draft.attachments[0].bytes.as_slice()), ("q4.csv", b"region,total".as_slice()));
+
+    // Attach… asks the app for the picker once; picked files are listed and sent.
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    k.ask_attach();
+    assert!(k.take_attach_ask() && !k.take_attach_ask());
+    k.set_attaching(true);
+    app.tick();
+    assert!(app.take_slot_changes().iter().any(|(s, r)| *s == atrium_mail::compose::ATTACH_SLOT && r.is_some()), "a slot for the picker");
+    k.set_attaching(false);
+    k.attach("report.pdf", b"%PDF-1.7\n".to_vec());
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x.starts_with("q4.csv")) && t.iter().any(|x| x.starts_with("report.pdf")), "{t:?}");
+    assert_eq!(k.draft().attachments[1].mime, "application/pdf", "the type from the bytes");
+    k.remove_attachment(0);
+    assert_eq!(k.attachments(), [("report.pdf".to_string(), 9)]);
+    k.to.set(TextEdit::new("lena@partner.example"));
+    assert!(k.send(Some([5; 16]), None));
+    let (_, o) = engine.store.outbox().unwrap().remove(0);
+    let raw = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
+    assert!(raw.contains("multipart/mixed") && raw.contains("filename=\"report.pdf\"") && !raw.contains("q4.csv"), "{raw}");
+}

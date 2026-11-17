@@ -542,10 +542,10 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.slides.doc.borrow().name.clone();
                     let filter = match what {
-                        Asking::Open => Filter { kind: Kind::File, extensions: ["oslides", "pptx", "odp"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a presentation".into() },
-                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
-                        Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
-                        Asking::Reduce => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save a smaller copy of “{}”", stem_of(&name)) },
+                        Asking::Open => Filter { kind: Kind::File, extensions: ["oslides", "pptx", "odp"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a presentation".into(), name: String::new(), origin: String::new() },
+                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into(), name: String::new(), origin: String::new() },
+                        Asking::Reduce => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save a smaller copy of “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {

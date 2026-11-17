@@ -461,7 +461,10 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
     let top = top + line.skip;
     let lh = line.height - line.skip;
     let bytes = text.as_bytes();
-    let gl = &l.glyphs[line.glyphs.clone()];
+    // Drawn left to right: the line's visual order (bidi).
+    let vis = !line.visual.is_empty();
+    let seq: Vec<crate::layout::Glyph> = l.visual_order(li).into_iter().map(|k| l.glyphs[k]).collect();
+    let gl = &seq[..];
     let mut pen = line.x;
     let mut i = 0;
     while i < gl.len() {
@@ -499,7 +502,8 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
                 } else {
                     // The cluster runs to the next glyph's cluster in the line
                     // (or one char at the line's end).
-                    let next = gl[i + 1..].iter().map(|n| n.cluster).find(|&c| c > g.cluster).or(Some(line.end)).filter(|&c| c > g.cluster && c <= line.end);
+                    let next = if vis { gl.iter().map(|n| n.cluster).filter(|&c| c > g.cluster).min() } else { gl[i + 1..].iter().map(|n| n.cluster).find(|&c| c > g.cluster) };
+                    let next = next.or(Some(line.end)).filter(|&c| c > g.cluster && c <= line.end);
                     let t = cluster_text(text, g.cluster, next);
                     let n = run.text.len() as u32;
                     // A note anchor's glyphs show its label.
@@ -524,8 +528,15 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
         let (rx, rw) = (left + x0, pen - x0);
         let size = run.size;
         if let (Some(rev), Some(b)) = (f.rev.or(f.fmt.map(|m| m.rev)), block) {
-            let start = gl.get(first).map_or(line.start, |g| g.cluster);
-            let end = gl.get(i).map_or(line.end, |g| g.cluster).max(start);
+            let (start, end) = if vis {
+                let run = &gl[first..i];
+                let lo = run.iter().map(|g| g.cluster).min().unwrap_or(line.start);
+                let hi = run.iter().map(|g| g.cluster).max().unwrap_or(lo);
+                (lo, gl.iter().map(|g| g.cluster).filter(|&c| c > hi).min().unwrap_or(line.end))
+            } else {
+                let start = gl.get(first).map_or(line.start, |g| g.cluster);
+                (start, gl.get(i).map_or(line.end, |g| g.cluster).max(start))
+            };
             out.push(Item::Change { x: rx, y: top, w: rw, h: lh, block: b, start, end, rev });
         }
         if let Some(h) = f.highlight {
@@ -582,7 +593,8 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
 
 /// Glyphs for `text` shaped in `fmt` from `x`, as runs by face.
 fn runs(out: &mut Vec<Item>, fonts: &dyn Fonts, text: &str, fmt: &CharFormat, x: i64, baseline: i64) {
-    let glyphs = fonts.shape(text, fmt);
+    let glyphs = crate::bidi::reorder(fonts.shape(text, fmt), text);
+    let vis = crate::bidi::levels(text).is_some();
     let size = size_lu(fmt);
     let mut pen = 0i64;
     let mut i = 0;
@@ -594,7 +606,7 @@ fn runs(out: &mut Vec<Item>, fonts: &dyn Fonts, text: &str, fmt: &CharFormat, x:
             let g = glyphs[i];
             let first = i == 0 || glyphs[i - 1].cluster != g.cluster;
             let range = if first {
-                let next = glyphs[i + 1..].iter().map(|n| n.cluster).find(|&c| c > g.cluster);
+                let next = if vis { glyphs.iter().map(|n| n.cluster).filter(|&c| c > g.cluster).min() } else { glyphs[i + 1..].iter().map(|n| n.cluster).find(|&c| c > g.cluster) };
                 let n = run.text.len() as u32;
                 run.text.push_str(cluster_text(text, g.cluster, next));
                 n..run.text.len() as u32

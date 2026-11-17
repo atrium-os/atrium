@@ -772,6 +772,29 @@ impl AttrTable {
     pub fn get(&self, id: AttrId) -> &CharAttrs {
         self.list.get(id as usize).unwrap_or(&self.list[0])
     }
+
+    /// Entries whose character style is `id`.
+    pub fn with_style(&self, id: StyleId) -> Vec<AttrId> {
+        (0..self.list.len()).filter(|&i| self.list[i].style == Some(id)).map(|i| i as AttrId).collect()
+    }
+
+    /// Each entry's character style through `f`, and entries `set` to
+    /// style `to` after; the lookup is rebuilt (the first of equal entries
+    /// wins).
+    pub fn remap_styles(&mut self, f: &dyn Fn(StyleId) -> StyleId, set: &[AttrId], to: Option<StyleId>) {
+        for a in &mut self.list {
+            a.style = a.style.map(f);
+        }
+        for &i in set {
+            if let Some(a) = self.list.get_mut(i as usize) {
+                a.style = to;
+            }
+        }
+        self.ids.clear();
+        for (i, a) in self.list.iter().enumerate() {
+            self.ids.entry(a.clone()).or_insert(i as AttrId);
+        }
+    }
     pub fn len(&self) -> usize {
         self.list.len()
     }
@@ -1030,6 +1053,14 @@ pub struct Style {
 /// Inheritance chains at most this deep; a longer (or cyclic) chain stops here.
 pub const MAX_STYLE_DEPTH: usize = 16;
 pub const MAX_STYLES: usize = 4096;
+
+/// Where a style is used ([`TextDoc::style_uses`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StyleUses {
+    pub body: bool,
+    pub elsewhere: bool,
+    pub styles: bool,
+}
 
 /// The document's named styles. Style 0 is the default paragraph style ("Normal").
 #[derive(Debug, Clone)]
@@ -1629,20 +1660,97 @@ impl TextDoc {
     /// Whether any paragraph anywhere (body, headers and footers, notes,
     /// shapes, deleted or conflicting text) or style names style `id`.
     pub fn uses_style(&self, id: StyleId) -> bool {
-        let p = |p: &Para| p.style == id;
+        let u = self.style_uses(id);
+        u.body || u.elsewhere || u.styles
+    }
+
+    /// Where style `id` is used: by paragraphs or text of the body, by those
+    /// anywhere else (headers and footers, notes, shapes, deleted or
+    /// conflicting text), and by other styles (as their base or next style).
+    pub fn style_uses(&self, id: StyleId) -> StyleUses {
+        let attrs = &self.attrs;
+        let runs = |r: &[(u32, AttrId)]| r.iter().any(|x| attrs.get(x.1).style == Some(id));
+        let p = |p: &Para| p.style == id || runs(&p.runs);
         let hf = |h: &Option<HeaderFooter>| h.as_ref().is_some_and(|h| h.paras.iter().any(p));
         let margins = |m: &Option<Margins>| m.as_ref().is_some_and(|m| hf(&m.header) || hf(&m.footer));
-        let pieces = |d: &Deletion| d.pieces.iter().any(|x| x.para.as_ref().is_some_and(|q| q.1 == id));
-        self.blocks.iter().any(|b| b.as_para().is_some_and(p))
-            || hf(&self.header)
-            || hf(&self.footer)
-            || margins(&self.first_page)
-            || margins(&self.even_pages)
-            || self.notes.iter().any(|(_, n)| n.paras.iter().any(p))
-            || self.shapes.iter().any(|(_, s)| s.all_paras().into_iter().any(p))
-            || self.deletions.iter().any(|(_, d)| pieces(d))
-            || self.conflicts.iter().any(|(_, d)| pieces(d))
-            || self.styles.styles.iter().enumerate().any(|(i, s)| i != id as usize && (s.parent == Some(id) || s.next == Some(id)))
+        let pieces = |d: &Deletion| d.pieces.iter().any(|x| x.para.as_ref().is_some_and(|q| q.1 == id) || runs(&x.runs));
+        StyleUses {
+            body: self.blocks.iter().any(|b| b.as_para().is_some_and(p)),
+            elsewhere: hf(&self.header)
+                || hf(&self.footer)
+                || margins(&self.first_page)
+                || margins(&self.even_pages)
+                || self.notes.iter().any(|(_, n)| n.paras.iter().any(p))
+                || self.shapes.iter().any(|(_, s)| s.all_paras().into_iter().any(p))
+                || self.deletions.iter().any(|(_, d)| pieces(d))
+                || self.conflicts.iter().any(|(_, d)| pieces(d)),
+            styles: self.styles.styles.iter().enumerate().any(|(i, s)| i != id as usize && (s.parent == Some(id) || s.next == Some(id))),
+        }
+    }
+
+    /// Every style id the document holds through `f` (one-to-one on the
+    /// ids in use): paragraphs anywhere, deleted paragraph breaks, styles'
+    /// base and next. Character styles in runs are the attribute table's
+    /// ([`AttrTable::remap_styles`]).
+    pub fn remap_para_styles(&mut self, f: &dyn Fn(StyleId) -> StyleId) {
+        fn shape(s: &mut ShapeData, f: &dyn Fn(StyleId) -> StyleId) {
+            for p in &mut s.paras {
+                p.style = f(p.style);
+            }
+            for k in &mut s.kids {
+                shape(&mut k.shape, f);
+            }
+        }
+        for i in 0..self.blocks.len() {
+            if self.blocks.get(i).is_some_and(|b| b.as_para().is_some()) {
+                self.blocks.update(i, |b| {
+                    if let Some(p) = b.as_para_mut() {
+                        p.style = f(p.style);
+                    }
+                });
+            }
+        }
+        let hf = |h: &mut Option<HeaderFooter>| {
+            if let Some(h) = h {
+                for p in &mut h.paras {
+                    p.style = f(p.style);
+                }
+            }
+        };
+        hf(&mut self.header);
+        hf(&mut self.footer);
+        for m in [&mut self.first_page, &mut self.even_pages].into_iter().flatten() {
+            hf(&mut m.header);
+            hf(&mut m.footer);
+        }
+        let ids: Vec<u32> = self.notes.iter().map(|(i, _)| i).collect();
+        for i in ids {
+            let mut n = (**self.notes.get(i).unwrap()).clone();
+            n.paras.iter_mut().for_each(|p| p.style = f(p.style));
+            self.notes.set(i, Some(n));
+        }
+        let ids: Vec<u32> = self.shapes.iter().map(|(i, _)| i).collect();
+        for i in ids {
+            let mut s = (**self.shapes.get(i).unwrap()).clone();
+            shape(&mut s, f);
+            self.shapes.set(i, Some(s));
+        }
+        for store in [&mut self.deletions, &mut self.conflicts] {
+            let ids: Vec<u32> = store.iter().map(|(i, _)| i).collect();
+            for i in ids {
+                let mut d = (**store.get(i).unwrap()).clone();
+                for x in &mut d.pieces {
+                    if let Some(q) = &mut x.para {
+                        q.1 = f(q.1);
+                    }
+                }
+                store.set(i, Some(d));
+            }
+        }
+        for st in &mut self.styles.styles {
+            st.parent = st.parent.map(f);
+            st.next = st.next.map(f);
+        }
     }
 
     /// Whether `s` may be style `id` (a change, or a new one just past the

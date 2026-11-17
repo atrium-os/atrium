@@ -229,6 +229,25 @@ n0)
     lanctl good >/dev/null
     wait_addr 10.88.0.50 120 && ok "back on a good server: bound again" || fail "no recovery"
 
+    # RFC 5227: another host already has the offered address. The lease
+    # parser's ARP probes find it; DHCPDECLINE, and the server's next
+    # address is used instead. 10.88.0.50 must never be applied meanwhile.
+    lanctl conflict >/dev/null
+    "$V" 'pkill -f "atrium-net -v"; sleep 1; for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
+        arp -d 10.88.0.50 >/dev/null 2>&1
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+    bad=""; i=0
+    while [ $i -lt 60 ]; do
+        a=$(addrs)
+        case " $a " in *" 10.88.0.50 "*) bad=1 ;; esac
+        case " $a " in *" 10.88.0.51 "*) break ;; esac
+        sleep 1; i=$((i + 1))
+    done
+    [ "$(stat arp_conflict)" -ge 1 ] && [ "$(stat decline)" -ge 1 ] && [ -z "$bad" ] && wait_addr 10.88.0.51 2 \
+        && ok "address in use: ARP probe answered ($(stat arp_conflict)), DHCPDECLINE ($(stat decline)), bound to 10.88.0.51 instead" \
+        || fail "conflict: arp=$(stat arp_conflict) decline=$(stat decline) bad=$bad addrs=$(addrs)"
+    lanctl noconflict >/dev/null
+
     echo "atrium-net N0+N2 gate: $pass checks passed"
     ;;
 *)

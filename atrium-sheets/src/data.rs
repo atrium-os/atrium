@@ -31,6 +31,9 @@ pub enum DataCmd {
     HideValue,
     /// Drop the cursor column's condition.
     ClearColumn,
+    /// Open the value list of the cursor's filter column ([`column_values`]); the
+    /// window runs it, as it opens a panel.
+    ChooseValues,
     /// Drop every condition: all rows show.
     ShowAll,
     FormatAsTable,
@@ -168,6 +171,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
         (MenuItem::new(format!("Show Only {shown}")).enabled(in_filter.is_some()), Some(DataCmd::KeepValue)),
         (MenuItem::new(format!("Hide {shown}")).enabled(in_filter.is_some()), Some(DataCmd::HideValue)),
+        (MenuItem::new(format!("Choose Values in Column {}…", officina_grid::addr::col_name(col))).enabled(filter.is_some_and(|f| (f.rect.r0..=f.rect.r1).contains(&row) && (f.rect.c0..=f.rect.c1).contains(&col))), Some(DataCmd::ChooseValues)),
         (MenuItem::new(format!("Clear Filter in Column {}", officina_grid::addr::col_name(col))).enabled(col_filtered), Some(DataCmd::ClearColumn)),
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
     ];
@@ -236,6 +240,66 @@ pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
         Ok(m) | Err(m) => m,
     };
     d.status = msg;
+}
+
+/// The most values a column's value list offers.
+pub const MAX_VALUES: usize = 10_000;
+
+/// A filter column's values to choose from: the column (of the sheet), then each
+/// distinct shown text with how many rows show it and whether the filter keeps it
+/// now. `Err` says why there is no list (no filter there, too many values).
+pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, String> {
+    let f = d.wb.sheet(d.sheet).filter.as_ref().ok_or("There is no filter on this sheet.")?;
+    if !(f.rect.c0..=f.rect.c1).contains(&col) {
+        return Err("Put the cursor in a column of the filter.".into());
+    }
+    let all = d.wb.filter_values(&f.rect, col, MAX_VALUES + 1);
+    if all.len() > MAX_VALUES {
+        return Err(format!("This column has more than {MAX_VALUES} different values; use Show Only or Hide."));
+    }
+    let now = f.conds.iter().find(|(c, _)| *c == col).map(|(_, c)| c.clone());
+    let key = officina_grid::eval::funcs::text_key;
+    Ok(all
+        .into_iter()
+        .map(|(t, n)| {
+            let on = match &now {
+                Some(Cond::Values(v)) => v.iter().any(|x| key(x) == key(&t)),
+                // A number condition: what it keeps now, as rows show it.
+                Some(Cond::Compare(..)) => (f.rect.r0 + 1..=f.rect.r1).any(|r| !d.wb.sheet(d.sheet).row_hidden(r) && key(&d.wb.formatted(CellAddr::new(d.sheet, r, col)).text) == key(&t)),
+                None => true,
+            };
+            (t, n, on)
+        })
+        .collect())
+}
+
+/// Keeps the rows of column `col` showing one of `keep` (every row when `keep`
+/// holds every value: the column's condition goes), one undo step.
+pub fn keep_values(d: &mut Doc, col: u32, keep: Vec<String>, every: bool) {
+    let msg = (|| {
+        let s = d.sheet;
+        let f = d.wb.sheet(s).filter.clone().ok_or("There is no filter on this sheet.")?;
+        let mut conds = f.conds.clone();
+        conds.retain(|(c, _)| *c != col);
+        if !every {
+            conds.push((col, Cond::Values(keep)));
+            conds.sort_by_key(|(c, _)| *c);
+        }
+        if conds == f.conds {
+            return Ok::<String, String>("The filter is as it was.".into());
+        }
+        let st = d.wb.filtered(s, Some(AutoFilter { rect: f.rect, conds }));
+        let hidden = hidden_in(&st, &f.rect);
+        d.run("Filter", vec![GridOp::Filter(st)]);
+        Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
+    })();
+    d.status = match msg {
+        Ok(m) | Err(m) => m,
+    };
+}
+
+fn hidden_in(st: &officina_grid::filter::FilterState, r: &Rect) -> u32 {
+    st.hidden.iter().filter(|(a, b)| *b > r.r0 && *a <= r.r1).map(|(a, b)| b.min(&r.r1) - a.max(&(r.r0 + 1)) + 1).sum()
 }
 
 fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Result<String, String> {
@@ -312,10 +376,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 }
             }
             let st = d.wb.filtered(s, Some(AutoFilter { rect: f.rect, conds }));
-            let hidden: u32 = st.hidden.iter().filter(|(a, b)| *b > f.rect.r0 && *a <= f.rect.r1).map(|(a, b)| b.min(&f.rect.r1) - a.max(&(f.rect.r0 + 1)) + 1).sum();
+            let hidden = hidden_in(&st, &f.rect);
             d.run("Filter", vec![GridOp::Filter(st)]);
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
+        // The window opens its value list for this one.
+        DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
             if d.wb.tables().iter().any(|x| x.rect.sheet == s && x.rect.r0 <= t.rect.r1 && x.rect.r1 >= t.rect.r0 && x.rect.c0 <= t.rect.c1 && x.rect.c1 >= t.rect.c0) {

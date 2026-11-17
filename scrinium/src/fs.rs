@@ -211,6 +211,60 @@ pub fn move_to(src: &Path, name: &str, dst: &Path) -> io::Result<String> {
 }
 
 /// `1.2 MB`, `640 KB`, `12 bytes`.
+/// A new file named `name` in `dir`, for a save target (limen picker
+/// `Kind::Save`): never over another (`q4 (2).csv`, …), never through a
+/// link, never executable. The file, open for writing, and its name.
+pub fn create_new(dir: &Path, name: &str) -> io::Result<(std::fs::File, String)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if !valid_name(name) || hidden(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a name to save as")));
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for n in 1..1000 {
+        let try_name = if n == 1 { name.to_string() } else { format!("{stem} ({n}){ext}") };
+        if !valid_name(&try_name) {
+            break;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(dir.join(&try_name)) {
+            Ok(f) => return Ok((f, try_name)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(taken(name))
+}
+
+/// The user extended attribute that says where a saved file came from
+/// (as navigatord's downloads, mail.md §8.2).
+pub const ORIGIN_ATTR: &str = "atrium.origin";
+
+/// Record where `f` came from.
+#[cfg(target_os = "freebsd")]
+pub fn mark_origin(f: &std::fs::File, origin: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(ORIGIN_ATTR).unwrap();
+    // SAFETY: a name and a buffer we own, on a descriptor we hold.
+    let r = unsafe { libc::extattr_set_fd(f.as_raw_fd(), libc::EXTATTR_NAMESPACE_USER, name.as_ptr(), origin.as_ptr().cast(), origin.len()) };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(target_os = "linux")]
+pub fn mark_origin(f: &std::fs::File, origin: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(format!("user.{ORIGIN_ATTR}")).unwrap();
+    // SAFETY: as above.
+    let r = unsafe { libc::fsetxattr(f.as_raw_fd(), name.as_ptr(), origin.as_ptr().cast(), origin.len(), 0) };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+pub fn mark_origin(_: &std::fs::File, _: &str) -> io::Result<()> {
+    Err(io::Error::other("no extended attributes here"))
+}
+
 pub fn size_text(n: u64) -> String {
     const U: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
     if n < 1000 {
@@ -413,6 +467,22 @@ mod tests {
         assert!(!a.join("Docs").exists());
         assert!(std::path::Path::new("/etc").exists(), "the link's target stays");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_save_target_is_new_and_never_over_another() {
+        use std::io::Write;
+        let d = tmp("save");
+        let (mut f, n) = create_new(&d, "q4.csv").unwrap();
+        f.write_all(b"region,total\n").unwrap();
+        assert_eq!(n, "q4.csv");
+        let (_, n2) = create_new(&d, "q4.csv").unwrap();
+        assert_eq!(n2, "q4 (2).csv");
+        assert_eq!(std::fs::read(d.join("q4.csv")).unwrap(), b"region,total\n", "the first is untouched");
+        assert!(create_new(&d, "../x").is_err() && create_new(&d, ".profile").is_err());
+        std::os::unix::fs::symlink("/etc/passwd", d.join("link.txt")).unwrap();
+        let (_, n3) = create_new(&d, "link.txt").unwrap();
+        assert_eq!(n3, "link (2).txt", "a link is never written through");
     }
 
     #[test]

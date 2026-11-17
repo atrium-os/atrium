@@ -3395,6 +3395,54 @@ Pergola's `GridView` does the picking for any float marked `movable`
 (`GridAction::PlaceFloat`, `GridAction::DeleteFloat`); tables' and
 filters' floats stay fixed.
 
+### 16.54 Choosing filter values from a list in Sheets (2026-11-17)
+
+Data ▸ Choose Values in Column … (the cursor anywhere in a filter
+column, its header too) opens the column's value list at the window's
+right, over the grid: each distinct shown text once (sorted, "(Empty)"
+for empty cells) with how many rows show it, ticked when the filter
+keeps it now. A search field narrows the list; Select All and Clear act
+on the values the search shows. Apply makes the ticked values the
+column's condition, one undo step ("Filter"); ticking every value drops
+the column's condition, ticking none is refused in words. Cancel leaves
+the filter as it was. The list draws only the rows in view (Pergola
+`VirtualList`) and offers at most 10,000 values; a column with more
+says so and points to Show Only and Hide.
+
+### 16.55 Deleting styles in Write (2026-11-17)
+
+The style bar's Delete deletes the caret's paragraph style, or with
+Characters picked its character style. Paragraphs of a deleted paragraph
+style take the style it is based on (Normal if none); text of a deleted
+character style takes its base character style, or none. Styles based on
+it are then based on its base; styles that Enter followed with it keep
+their own style after Enter. Normal can't be deleted. A style used in a
+header, footer, note, shape or tracked deletion is refused in words until
+those change. The whole deletion is one undo step and is kept by crash
+recovery.
+
+The engine op `TextOp::PlaceStyle { id, style, stale }` takes an unused
+style out of the middle of the table or puts one back. Every style id
+the document holds follows, wherever it is: paragraphs in the body,
+headers, notes, shapes and deleted text, styles' base and next, and the
+attribute table's character styles. The op inverts exactly, including
+attribute entries no text uses that still named the style (`stale`).
+Journal tag 18.
+
+### 16.56 The styles pane in Write (2026-11-17)
+
+Style ▸ Styles Pane shows a pane at the window's right, and the pages
+make room for it. It lists the document's paragraph styles, then "No
+Character Style" and the character styles. Each name is drawn in its
+style's own look: weight, a monospace face for code fonts, and the size
+kept between 11 and 20 px, with the size in points beside it. The caret
+paragraph's style and the character style at the caret are highlighted.
+A click on a paragraph style puts it on the selected paragraphs; a click
+on a character style (or "none") puts it on the selection. Each is one
+undo step. The list draws only the rows in view, so documents with up to
+4,096 styles scroll smoothly. Close or the menu item hides the pane.
+Editing styles stays in the style bar (§16.52, §16.55).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

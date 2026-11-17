@@ -417,3 +417,50 @@ fn archive_delete_and_undo_from_the_keyboard() {
     let due_now = engine.store.ops_due(account, real_now).unwrap();
     assert!(due_now.iter().all(|(_, o)| matches!(o.kind, mail_store::OpKind::Flags { .. })), "{due_now:?}");
 }
+
+#[test]
+fn attachments_show_what_they_are_and_quick_look_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let raw = "From: Arun <arun@acme.example>\r\nTo: priya@example.org\r\nSubject: Files\r\nDate: Mon, 23 Nov 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nThree files.\r\n--B\r\nContent-Type: text/csv\r\nContent-Disposition: attachment; filename=q4.csv\r\n\r\nregion,total\r\nNorth,42\r\n--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=invoice.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBHNjcmlwdA==\r\n--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\n\r\n%PDF-1.7\r\n--B--\r\n";
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: raw.len() as u64, internal_date: Some(NOW), server_id: None, bytes: raw.as_bytes().to_vec(), full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    mail.open(0);
+    app.tick();
+    let t = texts(&app);
+    for s in ["q4.csv", "invoice.pdf", "report.pdf", "Quick look", "Save"] {
+        assert!(t.iter().any(|x| x == s), "{s:?} not drawn: {t:?}");
+    }
+    // The zip called a PDF says so, and has no Open.
+    assert!(t.iter().any(|x| x.contains("says it is a PDF document but is really")), "{t:?}");
+    let files = mail.ui.get_cloned().reading.unwrap().msgs[0].body.clone().unwrap().files;
+    assert_eq!(files.iter().map(|f| f.can_open).collect::<Vec<_>>(), [true, false, true]);
+    // Open without a press does nothing but say so.
+    mail.open_file(0, 2, None);
+    assert!(mail.take_file_asks().is_empty());
+    mail.open_file(0, 2, Some([7; 16]));
+    let asks = mail.take_file_asks();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].act, atrium_mail::view::FileAct::Open { activation: [7; 16] });
+    // Quick look of the CSV: Mail draws the text itself.
+    mail.look_file(0, 0);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "North,42"), "{:?}", texts(&app));
+    assert!(mail.looking().is_none(), "no viewer for text");
+    // The PDF goes to a viewer the app embeds.
+    mail.look_file(0, 2);
+    let asks = mail.take_file_asks();
+    assert_eq!(asks[0].act, atrium_mail::view::FileAct::Look);
+    assert_eq!(mail.looking().map(|(_, f)| f.name), Some("report.pdf".into()));
+    mail.close_look();
+    assert!(mail.looking().is_none());
+}

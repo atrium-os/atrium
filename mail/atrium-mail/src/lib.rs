@@ -8,6 +8,7 @@
 //! process.
 
 pub mod compose;
+pub mod files;
 pub mod links;
 pub mod plain;
 pub mod rich;

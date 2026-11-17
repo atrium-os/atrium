@@ -162,6 +162,18 @@ pub fn frame6(src_mac: &[u8; 6], src: Ipv6Addr, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// An ARP probe (RFC 5227 §2.1.1) for `target`: sender address 0.0.0.0,
+/// broadcast. Built here from the address alone.
+pub fn arp_probe(src_mac: &[u8; 6], target: Ipv4Addr) -> Vec<u8> {
+    let mut f = vec![0xff; 6];
+    f.extend_from_slice(src_mac);
+    f.extend_from_slice(&[0x08, 0x06, 0, 1, 8, 0, 6, 4, 0, 1]);
+    f.extend_from_slice(src_mac);
+    f.extend_from_slice(&[0; 4 + 6]);
+    f.extend_from_slice(&target.octets());
+    f
+}
+
 /// A router solicitation from the unspecified address (RFC 4861 §6.3.7:
 /// no source link-layer option then), so routers answer at once instead of
 /// at their next periodic RA. Built here; nothing in it comes from the lease
@@ -208,34 +220,36 @@ mod rs_tests {
 }
 
 /// DHCP replies (IPv4, UDP, not a fragment, 67 -> 68), IPv6 router
-/// advertisements (ICMPv6 134, hop limit 255, no extension headers) and
-/// DHCPv6 replies (UDP 547 -> 546, no extension headers).
-pub const RX_FILTER: [(u16, u8, u8, u32); 25] = [
+/// advertisements (ICMPv6 134, hop limit 255, no extension headers),
+/// DHCPv6 replies (UDP 547 -> 546, no extension headers) and ARP (for the
+/// lease parser's conflict check before a new address is used, RFC 5227).
+pub const RX_FILTER: [(u16, u8, u8, u32); 26] = [
     (0x28, 0, 0, 12),       // 0  ldh [12]
     (0x15, 0, 9, 0x0800),   // 1  jeq IPv4 ? 2 : 11
     (0x30, 0, 0, 23),       // 2  ldb [23]
-    (0x15, 0, 20, 17),      // 3  jeq UDP ? 4 : drop
+    (0x15, 0, 21, 17),      // 3  jeq UDP ? 4 : drop
     (0x28, 0, 0, 20),       // 4  ldh [20]
-    (0x45, 18, 0, 0x1fff),  // 5  fragment ? drop : 6
+    (0x45, 19, 0, 0x1fff),  // 5  fragment ? drop : 6
     (0xb1, 0, 0, 14),       // 6  ldx 4*([14]&0xf)
     (0x48, 0, 0, 14),       // 7  ldh [x+14]
-    (0x15, 0, 15, 67),      // 8  jeq 67 ? 9 : drop
+    (0x15, 0, 16, 67),      // 8  jeq 67 ? 9 : drop
     (0x48, 0, 0, 16),       // 9  ldh [x+16]
-    (0x15, 12, 13, 68),     // 10 jeq 68 ? take : drop
-    (0x15, 0, 12, 0x86dd),  // 11 jeq IPv6 ? 12 : drop
+    (0x15, 13, 14, 68),     // 10 jeq 68 ? take : drop
+    (0x15, 0, 11, 0x86dd),  // 11 jeq IPv6 ? 12 : 23
     (0x30, 0, 0, 20),       // 12 ldb [20] next header
     (0x15, 0, 4, 58),       // 13 jeq ICMPv6 ? 14 : 18
     (0x30, 0, 0, 21),       // 14 ldb [21] hop limit
-    (0x15, 0, 8, 255),      // 15 jeq 255 ? 16 : drop
+    (0x15, 0, 9, 255),      // 15 jeq 255 ? 16 : drop
     (0x30, 0, 0, 54),       // 16 ldb [54] ICMPv6 type
-    (0x15, 5, 6, 134),      // 17 jeq RA ? take : drop
-    (0x15, 0, 5, 17),       // 18 jeq UDP ? 19 : drop
+    (0x15, 6, 7, 134),      // 17 jeq RA ? take : drop
+    (0x15, 0, 6, 17),       // 18 jeq UDP ? 19 : drop
     (0x28, 0, 0, 54),       // 19 ldh [54] source port
-    (0x15, 0, 3, 547),      // 20 jeq 547 ? 21 : drop
+    (0x15, 0, 4, 547),      // 20 jeq 547 ? 21 : drop
     (0x28, 0, 0, 56),       // 21 ldh [56] destination port
-    (0x15, 0, 1, 546),      // 22 jeq 546 ? take : drop
-    (0x06, 0, 0, 1514),     // 23 take
-    (0x06, 0, 0, 0),        // 24 drop
+    (0x15, 1, 2, 546),      // 22 jeq 546 ? take : drop
+    (0x15, 0, 1, 0x0806),   // 23 jeq ARP ? take : drop
+    (0x06, 0, 0, 1514),     // 24 take
+    (0x06, 0, 0, 0),        // 25 drop
 ];
 
 #[cfg(test)]
@@ -285,10 +299,16 @@ mod filter_tests {
         let mut r = ra::ra_for_test(ll, 1800, &[]);
         r[54] = 135;
         assert_eq!(run(&r), 0);
+        // ARP passes (the lease parser's conflict check); other types do not.
         let mut arp = vec![0xff; 12];
         arp.extend_from_slice(&[0x08, 0x06]);
         arp.extend_from_slice(&[0; 28]);
+        assert!(run(&arp) > 0);
+        arp[12..14].copy_from_slice(&[0x88, 0x8e]);
         assert_eq!(run(&arp), 0);
+        let p = super::arp_probe(&[2, 0, 0, 0, 0, 1], Ipv4Addr::new(10, 0, 0, 5));
+        assert!(run(&p) > 0);
+        assert_eq!(frame::arp_from_frame(&p).map(|a| (a.op, a.spa, a.tpa)), Some((1, Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(10, 0, 0, 5))));
     }
 
     #[test]

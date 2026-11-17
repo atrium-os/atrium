@@ -275,11 +275,18 @@ impl Fonts for PinnedFonts {
             let mut buf = rustybuzz::UnicodeBuffer::new();
             buf.push_str(&text[s..e]);
             buf.guess_segment_properties();
+            let rtl = buf.direction() == rustybuzz::Direction::RightToLeft;
             let shaped = rustybuzz::shape(&l.hb, &[], buf);
             let upem = l.upem.max(1);
             let sc = |v: i32| (v as i64 * size + upem / 2).div_euclid(upem);
+            let at = out.len();
             for (gi, gp) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
                 out.push(Glyph { face: face as u16, id: gi.glyph_id as u16, adv: sc(gp.x_advance), dx: sc(gp.x_offset), dy: -sc(gp.y_offset), cluster: (s as u32) + gi.cluster, fmt: 0 });
+            }
+            // Right-to-left output comes in visual order; layout keeps
+            // glyphs logical (`crate::bidi` puts lines back in visual order).
+            if rtl {
+                out[at..].reverse();
             }
         }
         out
@@ -320,6 +327,10 @@ pub struct Line {
     /// Space tabs took that a leader fills: from, to (from the paragraph's
     /// start edge, like `x`), and the leader.
     pub leaders: Vec<(i64, i64, Leader)>,
+    /// Its glyphs (indices into [`ParaLayout::glyphs`]) in the order they
+    /// are drawn from the left, when some are right to left; empty when that
+    /// is their logical order.
+    pub visual: Vec<u32>,
 }
 
 /// A paragraph laid out.
@@ -333,9 +344,79 @@ pub struct ParaLayout {
     pub space_after: i64,
     /// The lines' heights summed (no spacing before or after).
     pub height: i64,
+    /// Embedding level of each byte (`crate::bidi`), empty when the
+    /// paragraph is all left to right.
+    pub levels: Vec<u8>,
+    /// Its base direction is right to left: its start edge is the right.
+    pub rtl: bool,
 }
 
 impl ParaLayout {
+    /// Line `li`'s glyph indices in drawing order, left to right.
+    pub fn visual_order(&self, li: usize) -> Vec<usize> {
+        let line = &self.lines[li];
+        if line.visual.is_empty() { line.glyphs.clone().collect() } else { line.visual.iter().map(|&i| i as usize).collect() }
+    }
+
+    /// The line's clusters left to right: (byte, left x, right x, right to
+    /// left), x from the column's left like `Line::x`.
+    fn visual_clusters(&self, li: usize, text: &str) -> Vec<(u32, i64, i64, bool)> {
+        let line = &self.lines[li];
+        let bytes = text.as_bytes();
+        let mut out: Vec<(u32, i64, i64, bool)> = Vec::new();
+        let mut x = line.x;
+        for k in self.visual_order(li) {
+            let g = self.glyphs[k];
+            let mut w = g.adv;
+            if line.space_extra != 0 && bytes.get(g.cluster as usize) == Some(&b' ') {
+                w += line.space_extra;
+            }
+            let rtl = self.levels.get(g.cluster as usize).is_some_and(|l| l % 2 == 1);
+            match out.last_mut() {
+                Some(c) if c.0 == g.cluster => c.2 += w,
+                _ => out.push((g.cluster, x, x + w, rtl)),
+            }
+            x += w;
+        }
+        out
+    }
+
+    /// x (from the column's left) of the caret before byte `at` in line
+    /// `li`: a right-to-left character's start is its right side.
+    pub fn caret_x(&self, li: usize, at: u32, text: &str) -> i64 {
+        let line = &self.lines[li];
+        let cs = self.visual_clusters(li, text);
+        if cs.is_empty() {
+            return line.x;
+        }
+        // The cluster holding `at`, or the last one before it.
+        match cs.iter().filter(|c| c.0 <= at).max_by_key(|c| c.0) {
+            Some(&(c, l, r, rtl)) if c == at => if rtl { r } else { l },
+            Some(&(_, l, r, rtl)) => if rtl { l } else { r },
+            None => {
+                // Before the line's first character: its start edge.
+                let first = cs.iter().min_by_key(|c| c.0).unwrap();
+                if first.3 { first.2 } else { first.1 }
+            }
+        }
+    }
+
+    /// The byte nearest x in line `li` (x from the column's left), when the
+    /// line has right-to-left text; `None` for a left-to-right line, where
+    /// the caller's own walk applies.
+    pub fn hit_x(&self, li: usize, x: i64, text: &str) -> Option<u32> {
+        let line = &self.lines[li];
+        if line.visual.is_empty() {
+            return None;
+        }
+        let cs = self.visual_clusters(li, text);
+        let after = |c: u32| cs.iter().map(|d| d.0).filter(|&d| d > c).min().unwrap_or(line.end);
+        let k = cs.iter().position(|c| x < c.2).unwrap_or(cs.len() - 1);
+        let (c, l, r, rtl) = cs[k];
+        let left_half = x < (l + r) / 2;
+        Some(if left_half != rtl { c } else { after(c) })
+    }
+
     /// The line holding byte `at` (the end goes to the last line).
     pub fn line_of(&self, at: u32) -> usize {
         self.lines.partition_point(|l| l.end <= at && l.end > l.start).min(self.lines.len().saturating_sub(1))
@@ -385,6 +466,14 @@ pub fn layout_para(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts) -> Pa
 
 /// Lays out `p` in a column `width` wide around floating pictures' `bands`.
 pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, bands: &[Band]) -> ParaLayout {
+    // Right-to-left text: levels for the lines' visual order, and the text
+    // shaped with brackets mirrored where they sit right to left.
+    let bidi = crate::bidi::levels(&p.text);
+    let rtl = bidi.as_ref().is_some_and(|b| b.1);
+    let shape_src: std::borrow::Cow<str> = match &bidi {
+        Some((lv, _)) => crate::bidi::mirrored(&p.text, lv).into(),
+        None => p.text.as_str().into(),
+    };
     let (pf, cf) = doc.styles.para_format(p.style, &p.props);
     let full = width - twips(pf.indent_start as i64) - twips(pf.indent_end as i64);
     let mut formats: Vec<CharFormat> = Vec::new();
@@ -401,7 +490,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
         if s == e {
             continue;
         }
-        let text = &p.text[s as usize..e as usize];
+        let text = &shape_src[s as usize..e as usize];
         // Tabs: four spaces' width for now (tab stops come with the ruler).
         let mut g = match (&f.object, f.note) {
             // A tombstone (tracked deletion) takes no room.
@@ -427,7 +516,8 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
     if formats.is_empty() {
         formats.push(cf.clone());
     }
-    // Width up to each byte: glyphs are in logical order (no bidi yet).
+    // Width up to each byte: glyphs are in logical order (lines get their
+    // visual order below).
     let n = p.text.len();
     let mut cum = vec![0i64; n + 1];
     {
@@ -476,6 +566,8 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 let k = geo.len();
                 let h = heights.get(k).copied().unwrap_or(nominal);
                 let (skip, l, r) = if bands.is_empty() { (0, 0, 0) } else { place_line(bands, width, top, h) };
+                // A right-to-left paragraph starts at the right.
+                let (l, r) = if rtl { (r, l) } else { (l, r) };
                 let (st, en) = (ind_s.max(l), ind_e.max(r));
                 let fl = if k == 0 { twips(first_line as i64) } else { 0 };
                 geo.push((skip, st + fl, (width - st - en - fl).max(LU)));
@@ -637,7 +729,21 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
                 l.0 += x;
                 l.1 += x;
             }
-            lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height: height + skip, skip, leaders });
+            // Right to left: the same distances from the right edge.
+            let x = if rtl {
+                let spaces = if space_extra != 0 { p.text[s as usize..content_end as usize].bytes().filter(|&c| c == b' ').count() as i64 } else { 0 };
+                for l in leaders.iter_mut() {
+                    *l = (width - l.1, width - l.0, l.2);
+                }
+                width - x - (w + space_extra * spaces)
+            } else {
+                x
+            };
+            let visual = match &bidi {
+                Some((lv, r)) => crate::bidi::visual(&glyphs[g0..gi], &p.text, lv, *r, g0),
+                None => Vec::new(),
+            };
+            lines.push(Line { start: s, end: e, glyphs: g0..gi, x, width: w, space_extra, ascent: asc, descent: desc, height: height + skip, skip, leaders, visual });
             s = e;
         }
         if bands.is_empty() || pass == 2 {
@@ -649,6 +755,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
         let mut y = 0;
         for (k, &h) in got.iter().enumerate() {
             let (skip, l, r) = place_line(bands, width, y, h);
+            let (l, r) = if rtl { (r, l) } else { (l, r) };
             let (st, en) = (ind_s.max(l), ind_e.max(r));
             let fl = if k == 0 { twips(first_line as i64) } else { 0 };
             check.push((skip, st + fl, (width - st - en - fl).max(LU)));
@@ -660,7 +767,7 @@ pub fn layout_wrapped(doc: &TextDoc, p: &Para, width: i64, fonts: &dyn Fonts, ba
         heights = got;
     }
     let height = lines.iter().map(|l| l.height).sum();
-    ParaLayout { space_before: twips(pf.space_before.max(0) as i64), space_after: twips(pf.space_after.max(0) as i64), format: pf, formats, glyphs, lines, height }
+    ParaLayout { space_before: twips(pf.space_before.max(0) as i64), space_after: twips(pf.space_after.max(0) as i64), format: pf, formats, glyphs, lines, height, levels: bidi.map(|b| b.0).unwrap_or_default(), rtl }
 }
 
 /// Paragraph layouts by block, kept while their inputs hold.
@@ -882,6 +989,50 @@ mod tests {
         let g = l.glyphs[0];
         assert!(f.face_bytes(g.face).len() > 1000);
         assert!(f.face_address(g.face).starts_with("blake3:"));
+    }
+
+    #[test]
+    fn right_to_left_paragraphs_start_at_the_right_in_visual_order() {
+        let f = PinnedFonts::new().unwrap();
+        let text = "שלום עולם";
+        let d = doc(text);
+        let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+        assert!(l.rtl);
+        let line = &l.lines[0];
+        assert!(line.x > 500_000, "starts at the right: {}", line.x);
+        assert_eq!(line.x + line.width, 1_000_000);
+        // Glyphs stay logical; the line draws them last letter first.
+        assert!(l.glyphs.windows(2).all(|w| w[0].cluster <= w[1].cluster));
+        let first_drawn = l.glyphs[line.visual[0] as usize].cluster;
+        assert_eq!(first_drawn as usize, text.char_indices().last().unwrap().0);
+        // The caret before the first letter is at the right edge; after the
+        // last, at the left.
+        assert_eq!(l.caret_x(0, 0, text), line.x + line.width);
+        assert_eq!(l.caret_x(0, text.len() as u32, text), line.x);
+        // A click right of the middle of the first letter lands before it.
+        let w0 = l.glyphs[0].adv;
+        assert_eq!(l.hit_x(0, line.x + line.width - w0 / 4, text), Some(0));
+        assert_eq!(l.hit_x(0, line.x + line.width - w0 * 3 / 4, text), Some(2));
+
+        // Left to right with a Hebrew word: Latin first, the word reversed.
+        let text = "ab שלום cd";
+        let d = doc(text);
+        let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+        assert!(!l.rtl);
+        let line = &l.lines[0];
+        assert_eq!(line.x, 0);
+        let order: Vec<u32> = line.visual.iter().map(|&k| l.glyphs[k as usize].cluster).collect();
+        let hebrew = text.find('ש').unwrap() as u32;
+        let pos_shin = order.iter().position(|&c| c == hebrew).unwrap();
+        let pos_mem = order.iter().position(|&c| c == text.find('ם').unwrap() as u32).unwrap();
+        assert!(pos_mem < pos_shin, "{order:?}");
+        assert_eq!(order[0], 0);
+        assert_eq!(*order.last().unwrap(), (text.len() - 1) as u32);
+        // Every byte the caret can sit at maps to an x and back.
+        for (i, _) in text.char_indices() {
+            let x = l.caret_x(0, i as u32, text);
+            assert!(x >= 0 && x <= line.width, "{i} {x}");
+        }
     }
 
     #[test]

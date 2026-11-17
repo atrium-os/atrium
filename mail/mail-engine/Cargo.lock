@@ -750,6 +750,7 @@ dependencies = [
  "nuntius",
  "postcard",
  "rcgen",
+ "serde",
  "tempfile",
 ]
 

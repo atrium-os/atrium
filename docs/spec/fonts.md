@@ -84,12 +84,27 @@ Sans, Symbols, Symbols 2, Math and Serif.
   mapped bytes without a copy (`pergola::Face::from_static`).
 - `fresco-scene-server` (frescod's server-side text, what a Pergola `Text`
   node draws with): a name it has no built-in alias for is looked up in the
-  library, so any Pergola app can name a shipped family or a stand-in.
+  library, so any Pergola app can name a shipped family or a stand-in. A
+  character the run's font lacks falls back the same way (its script's Noto
+  face, then the general ones), and those runs, and any run of a complex
+  script, are shaped whole with rustybuzz (conjuncts, vowel signs, Arabic
+  joining, right-to-left order within the run); the run's own Latin text stays
+  one glyph per character, as Pergola measures it. Fallback glyphs share the
+  run's atlas page, so a run is still one slot.
 
 ## 5. Open
 
-- frescod's server-side text has no per-script fallback yet: a UI label in
-  Tamil needs its family named. The document path falls back already.
+- Bidi is built (UAX #9, `unicode-bidi`). frescod: a run is one line in
+  visual order, right-to-left level runs shaped right to left. officina-text
+  (`officina-text/src/bidi.rs`): glyphs stay logical for measuring and line
+  breaking; each line gets a visual order (`Line::visual`), a right-to-left
+  paragraph starts at the right edge (start indent and alignment mirrored),
+  brackets at right-to-left levels are mirrored for shaping, and the caret
+  and clicks follow the visual order (`ParaLayout::caret_x`, `hit_x`).
+  Left: a selection across mixed directions is one rectangle from caret to
+  caret, arrow keys move logically, and `.docx`/`.odt` paragraph direction
+  (`w:bidi`) is not read yet (direction comes from the first strong
+  character); explicit embedding controls work through UAX #9 itself.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - CJK on demand, and colour emoji, wait on the package catalog and colour glyph

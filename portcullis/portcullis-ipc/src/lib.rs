@@ -291,6 +291,20 @@ pub enum Request {
         always:     bool,
     },
 
+    /// ★ Open an attachment (mail.md §8.2). Only from an app whose
+    /// installed manifest holds `open-attachments` (Mail), with
+    /// `activation`, a press in its window spent here with frescod (purpose
+    /// OPEN). Then `ReadyForFds` and one descriptor: a sealed (no write,
+    /// grow or shrink), read-only memory file, never a path. portcullisd
+    /// decides the type from its bytes and `name` itself, refuses programs,
+    /// shortcuts and names that lie, and hands it read-only to the person's
+    /// default app for the type, as `OpenFile` does. Answer: `Opened`.
+    OpenAttachment {
+        /// The attachment's own name: never a path.
+        name:       String,
+        activation: [u8; 16],
+    },
+
     /// ★ A link to open (opening-links.md §5), first step. Only from
     /// Monstrator (peer uid `_monstrator`). `asker_uid` is the app the
     /// person pressed in, `activation` that press, spent here with frescod

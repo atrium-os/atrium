@@ -89,6 +89,8 @@ pub struct Body {
     /// "Load pictures" was pressed (or the sender is always loaded) and
     /// the fetch hasn't come back.
     pub loading: bool,
+    /// Its attachments (§8.1).
+    pub files: Vec<crate::files::File>,
 }
 
 /// A message in the reader.
@@ -152,9 +154,60 @@ pub struct Undo {
     pub until: i64,
 }
 
+/// The quick look pane (§8.1): one attachment, under the message list
+/// in place of the HTML frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookPane {
+    pub msg: MsgId,
+    pub file: crate::files::File,
+    pub body: LookBody,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookBody {
+    /// Text Mail draws itself; `cut` when there is more.
+    Text { text: String, cut: bool },
+    /// A viewer in [`LOOK_SLOT`], embedded by the app.
+    Viewer,
+    /// Nothing to show: why.
+    No(String),
+}
+
+/// The system picker's slot while an attachment is saved (§8.2): over the
+/// whole window, as Scrinium's picker draws there.
+pub const PICK_SLOT: pergola::slot::SlotKey = 0x4d41_5056;
+
+/// The quick look viewer's slot.
+pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4d41_4c4b;
+
+/// What the person asked of an attachment that the app does (it has
+/// Limen, portcullisd and the picker; the view has none of them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileAsk {
+    pub msg: MsgId,
+    pub file: crate::files::File,
+    pub act: FileAct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAct {
+    /// Show it in a viewer in [`LOOK_SLOT`].
+    Look,
+    /// Open in its app, with the press that asked.
+    Open { activation: [u8; 16] },
+    /// Save through the picker.
+    Save,
+}
+
 /// The window's state.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Ui {
+    /// Quick look of an attachment (§8.1).
+    pub look: Option<LookPane>,
+    /// What became of Open or Save ("Opening in Atrium PDF…", or why not).
+    pub file_note: Option<(String, i64)>,
+    /// The picker is up for a Save.
+    pub saving: bool,
     pub places: Vec<Place>,
     pub folder: Option<FolderId>,
     /// Conversations (true) or messages in the chosen folder.
@@ -192,6 +245,7 @@ pub struct Mail {
     /// The list's scroll, to keep the cursor in view on j/k.
     list: Mutable<ScrollState>,
     reader: Mutable<ScrollState>,
+    look_scroll: Mutable<ScrollState>,
     size: Mutable<(f32, f32)>,
     now: Rc<dyn Fn() -> i64>,
     /// Whether the window is drawn dark (the doc-viewer is told).
@@ -205,6 +259,8 @@ pub struct Mail {
     monstrator: Rc<std::path::PathBuf>,
     /// Compose windows asked for, for the app to open.
     composes: Rc<RefCell<Vec<(mail_engine::compose::Compose, Option<u64>)>>>,
+    /// Attachment asks for the app.
+    asks: Rc<RefCell<Vec<FileAsk>>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -378,7 +434,8 @@ impl Mail {
                     _ => None,
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
-                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always }
+                let files = r.attachments.iter().map(crate::files::file).collect();
+                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -505,9 +562,113 @@ impl Mail {
     /// document, and whether the window is dark.
     pub fn framed(&self) -> Option<(MsgId, Doc, bool)> {
         let ui = self.ui.get_cloned();
+        if self.look_shown(&ui) {
+            return None;
+        }
         let r = ui.reading?;
         let m = r.msgs.get(r.framed?)?;
         Some((m.msg, m.body.as_ref()?.document.clone()?, self.dark.get()))
+    }
+
+    /// Whether the quick look pane is showing (its message is in the reader).
+    fn look_shown(&self, ui: &Ui) -> bool {
+        ui.look.as_ref().is_some_and(|l| ui.reading.as_ref().is_some_and(|r| r.msgs.iter().any(|m| m.msg == l.msg)))
+    }
+
+    /// The attachment `i` of message `k` in the reader.
+    fn file_at(&self, k: usize, i: usize) -> Option<(MsgId, crate::files::File)> {
+        let ui = self.ui.get_cloned();
+        let m = ui.reading?.msgs.get(k)?.clone();
+        Some((m.msg, m.body?.files.get(i)?.clone()))
+    }
+
+    /// Quick look (§8.1): text is drawn here; a viewer is the app's to embed.
+    pub fn look_file(&self, k: usize, i: usize) {
+        use crate::files::Look;
+        let Some((msg, file)) = self.file_at(k, i) else { return };
+        let body = match &file.look {
+            Look::Text => match self.engine.attachment(msg, &file.which) {
+                Ok(a) => {
+                    let (text, cut) = crate::files::look_text(&a.bytes);
+                    LookBody::Text { text, cut }
+                }
+                Err(e) => LookBody::No(format!("Couldn't read it: {e}")),
+            },
+            Look::Viewer { .. } => {
+                self.asks.borrow_mut().push(FileAsk { msg, file: file.clone(), act: FileAct::Look });
+                LookBody::Viewer
+            }
+            Look::No(why) => LookBody::No(why.clone()),
+        };
+        let mut ui = self.ui.get_cloned();
+        ui.look = Some(LookPane { msg, file, body });
+        self.ui.set(ui);
+    }
+
+    /// The viewer couldn't be embedded: say why in the pane.
+    pub fn look_failed(&self, why: &str) {
+        let mut ui = self.ui.get_cloned();
+        if let Some(l) = &mut ui.look {
+            l.body = LookBody::No(why.into());
+            self.ui.set(ui);
+        }
+    }
+
+    pub fn close_look(&self) {
+        let mut ui = self.ui.get_cloned();
+        if ui.look.take().is_some() {
+            self.ui.set(ui);
+        }
+    }
+
+    /// The attachment in the quick look pane, when a viewer shows it.
+    pub fn looking(&self) -> Option<(MsgId, crate::files::File)> {
+        let ui = self.ui.get_cloned();
+        if !self.look_shown(&ui) {
+            return None;
+        }
+        ui.look.filter(|l| l.body == LookBody::Viewer).map(|l| (l.msg, l.file))
+    }
+
+    /// Open in its app (§8.2): a press, and only what may be opened.
+    pub fn open_file(&self, k: usize, i: usize, activation: Option<[u8; 16]>) {
+        let Some((msg, file)) = self.file_at(k, i) else { return };
+        if !file.can_open {
+            self.file_note(file.warn.clone().unwrap_or_else(|| "No app opens this kind of file.".into()));
+            return;
+        }
+        let Some(activation) = activation else {
+            self.file_note("Open needs a press of the button.".into());
+            return;
+        };
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Open { activation } });
+    }
+
+    /// Save through the picker (§8.2).
+    pub fn save_file(&self, k: usize, i: usize) {
+        let Some((msg, file)) = self.file_at(k, i) else { return };
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Save });
+    }
+
+    /// What the app should do with attachments now.
+    pub fn take_file_asks(&self) -> Vec<FileAsk> {
+        std::mem::take(&mut *self.asks.borrow_mut())
+    }
+
+    /// The picker for a Save is up, or gone.
+    pub fn set_saving(&self, on: bool) {
+        let mut ui = self.ui.get_cloned();
+        if ui.saving != on {
+            ui.saving = on;
+            self.ui.set(ui);
+        }
+    }
+
+    /// Say what became of Open or Save, for a few seconds.
+    pub fn file_note(&self, note: String) {
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some((note, (self.now)() + 6));
+        self.ui.set(ui);
     }
 
     /// Show or hide a message's quoted tail or signature.
@@ -562,9 +723,17 @@ impl Mail {
     /// Drop the Undo toast once its time is up (called from the app's loop).
     pub fn tick(&self) {
         let ui = self.ui.get_cloned();
-        if ui.undo.as_ref().is_some_and(|u| u.until < (self.now)()) {
+        let now = (self.now)();
+        let undo = ui.undo.as_ref().is_some_and(|u| u.until < now);
+        let note = ui.file_note.as_ref().is_some_and(|n| n.1 < now);
+        if undo || note {
             let mut ui = ui;
-            ui.undo = None;
+            if undo {
+                ui.undo = None;
+            }
+            if note {
+                ui.file_note = None;
+            }
             self.ui.set(ui);
         }
     }
@@ -904,6 +1073,9 @@ pub enum Item {
     ShowHtml(usize),
     /// "N pictures not loaded · Load pictures · Always for this sender" (§7.4).
     Pictures(usize),
+    /// Attachment `i` of message `msg`: icon, name, kind and size, and
+    /// Quick look, Open, Save (§8.1).
+    File { msg: usize, i: usize },
     Gap,
 }
 
@@ -931,6 +1103,12 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        for i in 0..b.files.len() {
+            out.push(Item::File { msg: k, i });
+        }
+        if !b.files.is_empty() {
+            out.push(Item::Gap);
+        }
         if b.remote > 0 && b.document.is_some() {
             out.push(Item::Pictures(k));
         }
@@ -1022,6 +1200,7 @@ impl MailView {
             engine,
             list: ui.sibling(ScrollState::default()),
             reader: ui.sibling(ScrollState::default()),
+            look_scroll: ui.sibling(ScrollState::default()),
             size: ui.sibling(size),
             ui,
             pages: Rc::default(),
@@ -1031,6 +1210,7 @@ impl MailView {
             opened: Default::default(),
             monstrator: Rc::new(monstrator::socket()),
             composes: Rc::default(),
+            asks: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -1108,6 +1288,10 @@ impl View for MailView {
         self.list(ctx, &ui, side, list, h);
         self.toast(ctx, &ui, side, list, h);
         self.reader(ctx, &ui, side + list, w - side - list, h);
+        if ui.saving {
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, PICK_SLOT);
+        }
     }
 }
 
@@ -1242,6 +1426,12 @@ impl MailView {
             text(ctx, ux + em(8.0), by + bh / 2.0, undo, type_size::XS, Weight::Semibold, t.bg_canvas());
             text(ctx, ux + uw - em(8.0) - width("z", type_size::XS, Weight::Regular), by + bh / 2.0, "z", type_size::XS, Weight::Regular, t.bg_canvas());
             ctx.pop();
+        } else if let Some((note, _)) = ui.file_note.as_ref().filter(|(_, until)| *until >= now) {
+            // What became of Open or Save.
+            let bw = (width(note, type_size::SM, Weight::Regular) + em(28.0)).min(w - 24.0);
+            let (bx, by, bh) = (x0 + (w - bw) / 2.0, h - em(56.0), em(40.0));
+            ctx.add(Node::Rect { rect: Rect::new(bx, by, bw, bh), fill: t.text_primary(), radius: 8.0 });
+            text(ctx, bx + em(14.0), by + bh / 2.0, &fit(note, type_size::SM, Weight::Regular, bw - em(28.0)), type_size::SM, Weight::Regular, t.bg_canvas());
         }
     }
 
@@ -1310,11 +1500,14 @@ impl MailView {
         // With an HTML body framed, the lines above it take at most what
         // they need, up to two fifths of the reader, and the frame the rest.
         let area_h = h - read_head_h();
-        let list_h = match s.framed {
-            Some(_) => (items.len() as f32 * lh).min((area_h * 0.4).max(3.0 * lh)).min(area_h),
-            None => area_h,
+        let look = ui.look.as_ref().filter(|_| self.mail.look_shown(ui));
+        let list_h = match (s.framed, look) {
+            (Some(_), _) | (_, Some(_)) => (items.len() as f32 * lh).min((area_h * 0.4).max(3.0 * lh)).min(area_h),
+            _ => area_h,
         };
-        if s.framed.is_some() {
+        if let Some(l) = look {
+            self.look_pane(ctx, l, x0, read_head_h() + list_h, w, h);
+        } else if s.framed.is_some() {
             let fy = read_head_h() + list_h;
             rect(ctx, Rect::new(x0 + 16.0, fy, w - 32.0, 1.0), t.border_default());
             // The slot the doc-viewer is bound into (an opaque rect until it is).
@@ -1329,6 +1522,56 @@ impl MailView {
         .key(200)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+    }
+}
+
+impl MailView {
+    /// Quick look (§8.1): the attachment's name and Close over its text,
+    /// its viewer's slot, or why it can't be shown.
+    fn look_pane(&self, ctx: &mut Ctx, l: &LookPane, x0: f32, y0: f32, w: f32, h: f32) {
+        let t = ctx.theme;
+        rect(ctx, Rect::new(x0 + 1.0, y0, w - 1.0, 1.0), t.border_default());
+        let bar = em(36.0);
+        rect(ctx, Rect::new(x0 + 1.0, y0 + 1.0, w - 1.0, bar), t.bg_window());
+        let cy = y0 + 1.0 + bar / 2.0;
+        let close = "Close";
+        let cw = width(close, type_size::XS, Weight::Medium) + em(16.0);
+        let m = self.mail.clone();
+        area(ctx, Rect::new(x0 + w - 12.0 - cw, cy - em(11.0), cw, em(22.0)), t.bg_canvas(), move || m.close_look());
+        text(ctx, x0 + w - 12.0 - cw + em(8.0), cy, close, type_size::XS, Weight::Medium, t.text_primary());
+        ctx.pop();
+        let name = fit(&l.file.name, type_size::SM, Weight::Semibold, (w - cw - em(48.0)) * 0.6);
+        let nw = width(&name, type_size::SM, Weight::Semibold);
+        text(ctx, x0 + 16.0, cy, &name, type_size::SM, Weight::Semibold, t.text_primary());
+        text(ctx, x0 + 16.0 + nw + em(8.0), cy, &fit(&l.file.words, type_size::XS, Weight::Regular, w - nw - cw - em(48.0)), type_size::XS, Weight::Regular, t.text_secondary());
+        let top = y0 + 1.0 + bar;
+        let body = Rect::new(x0 + 1.0, top, w - 1.0, (h - top).max(0.0));
+        match &l.body {
+            LookBody::Viewer => {
+                let id = ctx.add(Node::Rect { rect: body, fill: t.bg_canvas(), radius: 0.0 });
+                ctx.slot(id, LOOK_SLOT);
+            }
+            LookBody::No(why) => {
+                text(ctx, x0 + 16.0, top + em(24.0), &fit(why, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            LookBody::Text { text: s, cut } => {
+                let lh = line_h();
+                let mut lines: Vec<String> = s.lines().map(|l| l.replace('\t', "    ")).collect();
+                if *cut {
+                    lines.push("…".into());
+                }
+                let lines = Rc::new(lines);
+                VirtualList::new(self.mail.look_scroll.clone(), body, lines.len(), lh, move |i, ctx| {
+                    let t = ctx.theme;
+                    let st = TextStyle { family: font::MONO.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() };
+                    let hh = em(type_size::SM) * 1.5;
+                    ctx.add(Node::Text { rect: Rect::new(16.0, lh / 2.0 - hh / 2.0, 0.0, hh), content: lines[i].clone(), style: st });
+                })
+                .key(201)
+                .backdrop(t.bg_canvas())
+                .emit(ctx);
+            }
+        }
     }
 }
 
@@ -1521,6 +1764,49 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             if s.msgs[*k].sender.check == Check::Verified {
                 button(ctx, "Always for this sender", true);
             }
+        }
+        Item::File { msg, i } => {
+            let Some(f) = s.msgs[*msg].body.as_ref().and_then(|b| b.files.get(*i)) else { return };
+            let (k, i) = (*msg, *i);
+            // The buttons at the right: Save, Open, Quick look.
+            let mut bx = x + tw;
+            let mut button = |ctx: &mut Ctx, l: &str, on: Box<dyn Fn()>| {
+                let lw = width(l, type_size::XS, Weight::Medium) + em(16.0);
+                bx -= lw;
+                let id = ctx.push(Node::Rect { rect: Rect::new(bx, cy - em(11.0), lw, em(22.0)), fill: t.bg_window(), radius: 5.0 });
+                if ctx.is_hovered(id) || ctx.is_pressed(id) {
+                    let c = if ctx.is_pressed(id) { t.state_pressed() } else { t.state_hover() };
+                    if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                        *fill = c;
+                    }
+                }
+                ctx.on_click(id, on);
+                text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, t.text_primary());
+                ctx.pop();
+                bx -= em(6.0);
+            };
+            let mm = mail.clone();
+            button(ctx, "Save", Box::new(move || mm.save_file(k, i)));
+            if f.can_open {
+                let mm = mail.clone();
+                button(ctx, "Open", Box::new(move || mm.open_file(k, i, pergola::clipboard::current_activation())));
+            }
+            if !matches!(f.look, crate::files::Look::No(_)) {
+                let mm = mail.clone();
+                button(ctx, "Quick look", Box::new(move || mm.look_file(k, i)));
+            }
+            let (glyph, gc) = if f.warn.is_some() { (crate::files::ph::WARNING, t.warning_fg()) } else { (f.icon, t.text_secondary()) };
+            pergola::widgets::Glyph::new(glyph).size(type_size::LG).color(gc).at(x, cy - em(type_size::LG) * 0.75).emit(ctx);
+            let nx = x + em(26.0);
+            let room = bx - nx - em(8.0);
+            let name = fit(&f.name, type_size::SM, Weight::Medium, room * 0.6);
+            let nw = width(&name, type_size::SM, Weight::Medium);
+            text(ctx, nx, cy, &name, type_size::SM, Weight::Medium, t.text_primary());
+            let (said, c) = match &f.warn {
+                Some(w) => (w.clone(), t.warning_fg()),
+                None => (f.words.clone(), t.text_secondary()),
+            };
+            text(ctx, nx + nw + em(8.0), cy, &fit(&said, type_size::XS, Weight::Regular, room - nw - em(8.0)), type_size::XS, Weight::Regular, c);
         }
         Item::Gap => {}
     }

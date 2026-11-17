@@ -308,6 +308,19 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
             let _ = child.emit(embed, ToParent::Done { files: open.len() as u32 }.encode());
             Ok(())
         }
+        Outcome::Save { dir, name, origin } => {
+            let (f, saved) = scrinium::fs::create_new(&dir, &name).map_err(|err| format!("Couldn't save “{name}”: {}", scrinium::browser::err_text(&err)))?;
+            if !origin.is_empty() {
+                if let Err(err) = scrinium::fs::mark_origin(&f, &origin) {
+                    eprintln!("scrinium: picker {embed}: {saved}: origin not recorded ({err})");
+                }
+            }
+            let msg = ToParent::File { name: saved.clone(), size: 0, write: true };
+            child.emit_fd(embed, msg.encode(), f.as_fd()).map_err(|err| format!("limend refused the file ({err:?})"))?;
+            let _ = child.emit(embed, ToParent::Done { files: 1 }.encode());
+            eprintln!("scrinium: picker {embed}: a new file {saved} handed over to write");
+            Ok(())
+        }
         Outcome::Folder { part, path, name } => {
             let p = atrium_media::Picked { part, path: path.clone(), app_uid: e.parent_uid, read_only: !e.write };
             match atrium_media::client::picked(media_sock, &p) {

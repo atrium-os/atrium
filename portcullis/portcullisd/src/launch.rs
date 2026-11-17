@@ -867,6 +867,12 @@ pub fn installed_manifest(app_id: &str) -> Option<Manifest> {
     installed(app_id)
 }
 
+/// May this app open attachments (its INSTALLED manifest holds
+/// `open-attachments`, mail.md §8.2)?
+pub fn app_opens_attachments(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.open_attachments == Some(true))
+}
+
 /// Is this the terminal (its INSTALLED manifest holds `consoles`)?
 pub fn app_shows_consoles(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.consoles == Some(true))

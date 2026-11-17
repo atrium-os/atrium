@@ -1203,6 +1203,7 @@ mod imp {
         fn lease_line(&mut self, k: usize, l: &Line) {
             match l.verb.as_str() {
                 "send" => self.lease_send(k, l),
+                "probe" => self.lease_probe(k, l),
                 "lease4" => {
                     let Some(lease) = LeaseV4::from_line(l) else {
                         self.refuse(k, "unparsable");
@@ -1279,6 +1280,24 @@ mod imp {
             let f = wrap::frame(&i.mac, &dmac, src, dest.unwrap_or(Ipv4Addr::BROADCAST), &p, i.ip_id);
             i.ip_id = i.ip_id.wrapping_add(1);
             if let Err(e) = i.bpf.write(&f) {
+                eprintln!("atrium-net: {}: bpf write: {e}", i.name);
+            }
+        }
+
+        /// An ARP probe atrium-lease asks for before using a new address:
+        /// only an ordinary unicast address, under the DHCP token bucket.
+        fn lease_probe(&mut self, k: usize, l: &Line) {
+            let i = &mut self.ifs[k];
+            let now = Instant::now();
+            i.tokens = (i.tokens + now.duration_since(i.last_fill).as_secs_f64() / 2.0).min(10.0);
+            i.last_fill = now;
+            let a = l.get("addr").and_then(|x| x.parse::<Ipv4Addr>().ok()).filter(|a| net_proto::ordinary_unicast(*a));
+            let (Some(a), true) = (a, i.tokens >= 1.0) else {
+                i.sends_refused += 1;
+                return;
+            };
+            i.tokens -= 1.0;
+            if let Err(e) = i.bpf.write(&wrap::arp_probe(&i.mac, a)) {
                 eprintln!("atrium-net: {}: bpf write: {e}", i.name);
             }
         }
