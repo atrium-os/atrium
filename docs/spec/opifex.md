@@ -1,0 +1,573 @@
+# Opifex: the package catalog
+
+> *Opifex* (Latin): a craftsman, one who makes. Atrium's package system: the catalog of
+> published packages, and the fetch, check, install, update and rollback of them.
+
+**Status:** proposed 2026-11-17, waiting for Shankar's review (§14). Nothing built beyond the
+bring-up `opifex` CLI that already exists.
+**Scope:** what a package is, who may publish one, how the catalog is signed, hosted and
+downloaded, how a package is fetched, checked and installed, what the person sees, updates and
+rollback, and how fonts, drivers, firmware, toolchain layers and the SDK crate registry ride on
+the same machinery.
+**Background:** Shankar 2026-11-17 asked who owns the package catalog; nobody did. The pieces
+were design only (atrium-pkg.md, atrium-pkg-registry.md, atrium-pkg-install-ux.md from May, and
+the nomenclator.md sketch). They disagree with each other and with the code (§2). Several
+pieces of work wait on this one (§3).
+
+**Supersedes** (once accepted): [atrium-pkg.md](atrium-pkg.md),
+[atrium-pkg-registry.md](atrium-pkg-registry.md),
+[atrium-pkg-install-ux.md](atrium-pkg-install-ux.md). Narrows
+[nomenclator.md](nomenclator.md) (§9).
+
+Related: [atrium-bundle-format.md](atrium-bundle-format.md) (the bundle),
+[portcullis.md](portcullis.md) (manifests and the launch gate),
+[insula.md](insula.md) §3, §14 (install and updates), [limen.md](limen.md) §2 (system roles),
+[nuntius.md](nuntius.md) (the fetcher), [arca.md](arca.md) (app identity, publisher keys),
+[sigillum.md](sigillum.md) (presses, WebAuthn RP ids), [device-assignment.md](device-assignment.md)
+§4.4, §4.7, [fonts.md](fonts.md), [dev-tools.md](dev-tools.md) and
+[dev-tools-plan.md](dev-tools-plan.md) (layers, SDK, bundles from workspaces),
+[app-composition.md](app-composition.md) (workers), [opening-links.md](opening-links.md) L5,
+[navigator-ui.md](navigator-ui.md) (the app prompt), [personas.md](personas.md),
+[homes.md](homes.md) (dev bundles), [atrium-ax.md](atrium-ax.md) (coverage check).
+
+## 1. Short answer
+
+- **One catalog, downloaded whole.** The catalog is a signed, append-only list of every
+  published package version: id, publisher, kind, version, per-architecture hash and size,
+  where to fetch it, the capabilities it asks for, the roles it implements, the device ids
+  it drives, the scripts a font covers. Every Atrium machine downloads all of it and
+  answers every question locally: "is there a driver for this USB id", "which package has a
+  Japanese font", "who publishes `com.example.weather` and what does it ask for". Nothing
+  about what the person looks at, plugs in or reads leaves the machine until they choose to
+  install something.
+- **Static files, no servers.** The catalog is a set of static files (a Merkle log in
+  tiles, like Go's checksum database and Certificate Transparency) and the packages are
+  `.insula` archives at plain HTTPS URLs. Hosting is GitHub Pages and GitHub Releases at
+  first; any mirror works because every byte is checked by hash. Atrium runs no service
+  and pays nothing.
+- **One signing scheme, the one in the code.** P-256 ECDSA as `portcullis-sig` does today,
+  for bundles, layers, fonts, drivers and the catalog itself. No Sigstore keyless signing,
+  no minisign, no ed25519 second scheme. The publisher signs `atrium.toml`; `atrium.toml`
+  now carries the hash of a content index listing every file, so the one signature covers
+  every byte (today it covers only the manifest).
+- **Two kinds of signature, checked separately.** The publisher signs the package; the
+  catalog signs the list. A stolen catalog key can hide or delay a release but cannot make
+  one, because each entry carries the publisher's own signature, and a publisher's key can
+  only change by the old key's signature or Atrium's offline root keys.
+- **Binary only.** The catalog carries built bundles. Building from source happens in a
+  workspace ([dev-tools.md](dev-tools.md)), whose output is a bundle like any other. The
+  install-on-the-user's-machine cargo build in atrium-pkg-install-ux.md is dropped.
+- **Jailed, split by risk.** `opifex-fetch` talks to the network through Nuntius and
+  trusts nothing it gets. `opifex-check`, a worker with no capabilities, parses the catalog
+  and unpacks archives. `opifexd`, the only privileged part, never parses an archive or
+  touches the network; it checks the signature and re-hashes every file as it copies the
+  checked tree into place. `opifex-sheet` draws the install sheet as a Limen system role.
+- **Install is one sheet, drawn by the system.** Any app, the Navigator, Monstrator,
+  Artifex, a Praeco driver notice or Curia can ask for it; none of them draws it. It shows
+  the publisher, what the package may do, its size and licence, and on an update only what
+  changed.
+- **Updates in the background, consent only when needed.** Strict capability subsets
+  update quietly; additions ask; a change of publisher is refused. The old version stays on
+  disk for one-step rollback.
+- **Fonts, drivers, firmware, layers and the SDK registry use the same machinery** with
+  their own `kind`, each signed only by keys allowed that kind (§5.3).
+
+## 2. What exists, and what this settles
+
+The code: `portcullis/opifex` (448 lines) installs a local bundle folder into
+`/var/lib/atrium/apps/<id>/`, copies the entry binary's `DT_NEEDED` closure from a sysroot,
+lists and uninstalls. It checks `atrium.toml.sig` (P-256, base64 DER) against the PEM keys in
+`/etc/atrium/publishers`, but with its own copy of the check, not `portcullis-trust`'s gate, and
+it allows unsigned installs when no publisher key is configured. portcullisd checks the same
+signature again at every launch. There is no network fetch, no index, no update, no rollback.
+Tessera has no ingest or diff-stream API yet; `/var/lib/atrium` is on the Tessera root, so
+files placed there are deduplicated by Tessera anyway.
+
+The specs disagree. This spec picks:
+
+| Question | Said before | This spec |
+|---|---|---|
+| Signature algorithm | ed25519 (bundle-format, insula §12), P-256 (code) | P-256, as built |
+| Keyed or keyless | Sigstore keyless with Rekor (registry, navigator-backend) | keyed, pinned; our own append-only log gives the transparency Rekor would (§6.4) |
+| What the signature covers | "manifest and contents" (specs); manifest only (code) | manifest, which names the content index hash (§4.2) |
+| How names resolve | DNS TXT then per-publisher manifest (insula §12, nomenclator) | the downloaded catalog; DNS is checked once, when a publisher registers (§9) |
+| Index shape | git repo of TOML per version, fetched per package (registry) | Merkle log of signed entries, fetched whole (§6) |
+| Source or binary | both, with on-machine cargo builds (install-ux) | binary only (§1) |
+| Library closure | in the bundle (bundle-format); resolved at install (code) | in the bundle for catalog packages; install-time resolving stays for local side-loads only (§7.5) |
+| "Catalog" | portcullisd's installed list (forum, nuntius); Opifex's index (device-assignment, fonts); the font pin table (fonts) | *the catalog* is Opifex's list only; portcullisd's is *the installed list* (§13) |
+
+## 3. Who is waiting, and what each needs
+
+| Waiting | Needs from Opifex | Where |
+|---|---|---|
+| CJK fonts on demand, colour emoji (fonts thread) | `kind = "font"` packages, a coverage field to find the right one, a pin list the font library trusts | §8.1 |
+| `atrium-app://` for apps not installed (Monstrator L5) | look up an app id, then the install sheet | §7.1, §9 |
+| Navigator's app prompt | a pre-install query: publisher and capabilities for an id, no network | §7.1 |
+| Driver lookup (device-assignment §4.7, decision 16) | every driver package's `devices.d` matches in the local catalog; install through the trusted sheet | §8.2 |
+| Firmware (device-assignment §4.4, wifi) | `kind = "firmware"`, platform-signed | §8.2 |
+| Toolchain layers (toolchains thread) | `kind = "layer"`, platform key only, the layer contract that thread defines | §8.3 |
+| SDK crate registry (toolchains thread, M12) | the sparse index signed with the same keys, hosted next to the catalog | §8.4 |
+| Bundles from workspaces (platform thread, M4) | install of a local bundle signed by a publisher key held in Arca | §7.4 |
+| Workers, roles, ipc (app-composition) | carry them; read them from portcullis-toml; show the composition facts on the details page | §7.2 |
+| Sigillum WebAuthn RP ids | verify `/.well-known/atrium-apps` at install, record the result | §7.3 |
+| atrium-ax coverage | a check in publishing, a flag in the sheet when overridden | §10.2 |
+| Artifex extensions and language servers | search by role in the local catalog | §6.6 |
+
+## 4. Packages
+
+### 4.1 Kinds
+
+A package is a bundle as in [atrium-bundle-format.md](atrium-bundle-format.md): a tree with
+`atrium.toml` at the top and a detached `atrium.toml.sig`, shipped as a deterministic
+`.insula` archive. The manifest's top-level `kind` says what it is:
+
+| `kind` | Installs to | Who may sign it (v1) | Who may install |
+|---|---|---|---|
+| `app` (default) | `/var/lib/atrium/apps/<id>/` | any registered publisher, in its id prefix | any person, for themselves (§7.6) |
+| `service` | `/var/lib/atrium/apps/<id>/` plus `/etc/atrium/services.d/` | platform | admin, with a press |
+| `layer` | `/var/lib/atrium/layers/<name>@<version>/` (toolchains thread's contract) | platform | admin, with a press |
+| `font` | `/usr/share/fonts/atrium-extra/<id>/` | platform | any person (fonts are shared; §8.1) |
+| `driver` | `/var/lib/atrium/apps/<id>/` plus its `devices.d` entry | platform (device-claim scope) | admin, with a press |
+| `firmware` | `/boot/firmware/<vendor>/` or `/usr/local/share/atrium/firmware/<driver>/` | platform | admin, with a press; usually pulled in by a driver |
+| `command` | later (dev-tools §4.7: command bundles) | — | — |
+
+"Admin, with a press" means a person in the machine's admin group confirming on the sheet
+with a Sigillum press, as for other system changes. Kinds other than `app` are platform-only in
+v1 because each of them reaches beyond one jail: services run at boot, drivers get devices,
+layers enter every workspace that names them, fonts are parsed by every app.
+
+### 4.2 The content index: the signature covers every byte
+
+Today the signature covers `atrium.toml` and nothing ties `bin/` to it. The fix is small and
+keeps the scheme:
+
+- The packer writes `content.idx`: one line per entry in sorted path order, `type mode size
+  sha256 path` (types `f`, `d`, `l` for in-tree symlinks only). No mtimes, owners, devices,
+  hard links, setuid or setgid bits; the checker refuses all of them.
+- `atrium.toml` gains `[bundle] content = "sha256:<hash of content.idx>"`.
+- The publisher signs `atrium.toml` as today. One signature now covers the whole tree.
+- `opifexd` and portcullisd both require `content` for anything not `dev.` (portcullisd's
+  launch check reads the stored index hash from the installed record, §7.5, so launch stays
+  cheap).
+
+This is the same shape the toolchains thread is using for layers today, so layers need no
+change later.
+
+### 4.3 Ids and versions
+
+- Ids are reverse-DNS (`org.atrium.prelum`, `com.example.weather`). A publisher may publish
+  only ids under the prefixes registered for it (§5.2). `org.atrium.` is the platform's.
+  `dev.` ids are the machine's dev publisher's (homes.md) and are refused by the catalog and
+  by `opifexd` for catalog installs.
+- Versions are semver. Within one id, a version can be published once; the archive for a
+  (id, version, arch) never changes (a fix is a new version). Yanking marks a version as not
+  for new installs; it stays in the log.
+- Architectures: `aarch64`, `amd64`. A package names the ones it ships; IR bundles
+  (`form = "ir"`) are one entry for both.
+
+## 5. Keys and publishers
+
+### 5.1 Key roles
+
+| Key | Held by | Signs | Lifetime |
+|---|---|---|---|
+| **root** (3 keys, any 2 sign) | Shankar, offline, on hardware tokens (YubiKey PIV, P-256) | `root.toml`: the other keys and their scopes; publisher recovery | years; rotated by 2-of-3 of the old set |
+| **catalog** | the publishing CI (§10.1) | tree heads of the log, with an expiry | months; replaced by a new `root.toml` |
+| **platform** | Shankar's build machine, in Arca | `org.atrium.*` packages, all non-app kinds, the SDK registry | years |
+| **publisher** | each publisher, in their own Arca (or any P-256 signer, e.g. cosign keyed) | their own packages | until they rotate |
+
+`root.toml` ships in the base system at `/etc/atrium/opifex/root.toml` and is the one trust
+anchor. A new `root.toml` is accepted only if 2 of the current root keys signed it.
+
+### 5.2 Publishers
+
+A publisher is a record in the catalog: a **stable publisher id**, display name, verified
+domains, id prefixes, allowed kinds, and its current and past keys. The id is assigned once
+(`pub:` plus a short hash of its first key) and never changes, so key rotation does not
+change who the publisher is.
+
+- **Registering:** the publisher proves control of each domain once, when it registers, by a
+  DNS TXT record `_atrium-publisher.<domain>` or `https://<domain>/.well-known/atrium-publisher`
+  containing its key's fingerprint. The publishing CI checks it; a human approves new
+  publishers in v1. Its prefixes are the reversed domains (`example.com` gives `com.example.`).
+- **Rotating:** a key change is a catalog entry signed by the old key, naming the new one.
+  A lost or stolen key is replaced only by an entry signed by 2 root keys, shown to every
+  machine as a recovery (§7.7).
+- **Identity elsewhere:** Arca keys an app's items on (person, publisher key, app id) and
+  Sigillum's private RP is `app:<publisher>/<id>`. Both should key on the **publisher id**
+  instead, so a normal rotation keeps the person's secrets and passkeys; a recovery does not
+  carry them over automatically (the sheet asks). Side-loaded bundles from keys outside the
+  catalog keep today's key-digest identity. (Decision 6.)
+
+### 5.3 Scopes
+
+Every key in `root.toml` and every publisher record carries scopes, checked by `opifexd` on
+every install: id prefixes, allowed kinds, and `devices` (may ship `devices.d` entries). The
+flat `/etc/atrium/publishers/*.pem` set becomes the **side-load** list (§7.4) and gets the same
+scope fields, default `kinds = ["app"]`.
+
+## 6. The catalog
+
+### 6.1 Shape
+
+The catalog is an append-only log of entries. Each entry is one small CBOR record:
+
+- `release`: id, version, arch, kind, publisher id, the signed `atrium.toml` bytes and its
+  signature, archive SHA-256 and size, URLs (main plus alternates), and an extract for local
+  search: name, description, icon hash, capabilities, roles implemented, `[ipc] provides`,
+  device matches (§8.2), font coverage (§8.1), licence (SPDX), minimum Atrium release,
+  update timing (insula §14.3).
+- `publisher`: new publisher, key rotation, key recovery, prefix change.
+- `yank`: id, version, reason.
+
+Entries are leaves of a Merkle tree (SHA-256, RFC 6962 hashing). The **tree head**
+(size, root hash, time, expiry) is signed by the catalog key. Files are served as fixed-size
+**tiles** of the tree plus bundles of entries, exactly the static layout Go's checksum
+database uses, so a client that has head N fetches only the tiles and entries after N and
+checks they extend what it had.
+
+### 6.2 Why whole, why a log
+
+- **Whole:** device ids, fonts wanted, apps looked at and links followed are all private.
+  Device-assignment already decided the index is local (decision 16). With the whole catalog
+  on disk, every lookup is local, and the network sees one periodic sync identical for every
+  machine. Size: an entry is about 1 to 3 KB; ten thousand releases is under 30 MB, and the
+  client keeps only the latest per id plus what is installed, after checking the rest.
+- **Append-only log:** a catalog that could show different machines different lists could
+  give one person a targeted bad update. A log forces everyone onto the same history, and
+  machines can compare heads (later: with peers on the LAN, §12). This replaces what Rekor
+  would have given, without depending on Sigstore's servers or sending them each install.
+- **Expiry:** tree heads expire after 14 days. A machine that can only fetch an old head
+  (someone freezing its view to keep it on a vulnerable version) says so in Curia after the
+  expiry instead of silently staying old.
+
+### 6.3 Checks a client makes
+
+On every sync, `opifex-check`:
+
+1. checks the tree head's signature against the catalog key in `root.toml`, and that it
+   has not expired;
+2. checks the new tree extends the last one it accepted (consistency proof);
+3. for each new entry: the publisher's signature over `atrium.toml`, that the publisher's
+   key was current at that point in the log, that the id is in the publisher's prefixes and
+   the kind in its scopes, that no (id, version, arch) appears twice;
+4. writes the checked local catalog (`/var/db/atrium/opifex/catalog.db`) and the
+   derived files other services read (§8.2).
+
+Any failure keeps the previous local catalog and is reported in Curia.
+
+### 6.4 Hosting
+
+- Catalog: a public repo `atrium-os/catalog`, served by GitHub Pages. Releases of
+  `org.atrium.*` packages: GitHub Releases on `atrium-os/catalog-blobs`. Third-party archives:
+  wherever the publisher hosts them; the catalog only holds the URL and the hash.
+- A domain of our own later only adds a URL; nothing is trusted by host name.
+- Mirrors (a LAN cache, a company mirror) are additional base URLs in `opifex.toml`; any
+  byte from anywhere is checked by hash.
+
+### 6.5 Other catalogs
+
+An admin can add another catalog (a company's, an experimental one) with its own root key,
+with a press and a plain warning. It is limited to the id prefixes its `root.toml` lists, and
+may never list `org.atrium.` or an id an earlier catalog already has. The same checks apply.
+Per-persona use (a Work persona that installs only from the company catalog) is a later step,
+following personas.md.
+
+### 6.6 Local queries
+
+`opifexd` answers, from the local catalog only, with no network:
+
+- `Describe(id)`: publisher (name, verified domain, id), latest version, capabilities with
+  their plain descriptions, roles, size, licence, installed or not. The Navigator prompt and
+  Monstrator use this before showing anything.
+- `Search(text | role | capability | font script)`: Artifex's extension browser, the
+  language-server prompt, the fonts lookup.
+- `Updates()`, `Installed()`.
+
+## 7. Install
+
+### 7.1 Who asks, who decides
+
+Anything may ask for an install by id (or by local bundle path, §7.4): Monstrator for an
+`atrium-app://` link to an app not installed, the Navigator's app prompt, Artifex, Curia,
+a Praeco driver notice, Scrinium for a double-clicked `.insula`. The asker gets back only
+`installed`, `declined` or `failed`. The decision is always made on the **install sheet**, a
+new Limen system role `install` provided by `opifex-sheet` (`org.atrium.opifex`), which no app
+can declare (limen.md §2.0). The sheet shows:
+
+- the app name and icon from the catalog entry, the publisher's display name and verified
+  domain, and "new publisher" if the person has nothing from it yet;
+- what it may do: the capabilities in plain words (portcullis's capability registry), risk
+  marked, and the composition facts from app-composition §7 (which grants sit in a process
+  that reads files);
+- size to download and on disk, licence;
+- on an update or reinstall: only what changed;
+- *Install* · *Not now*. *Try it* appears only once `[trial]` exists in portcullis-toml
+  (decision 10).
+
+### 7.2 The steps
+
+```
+asker ──Limen install──▶ opifex-sheet ──▶ person presses Install
+                              │
+opifexd ◀─────────────────────┘
+  │ 1. look up (id, arch) in the local catalog
+  │ 2. opifex-fetch: archive → /var/db/atrium/opifex/dl/<sha256> (via Nuntius)
+  │ 3. opifex-check (worker, no caps): sha256 of archive = catalog; unpack into
+  │    staging; refuse anything content.idx can't describe; tree matches content.idx
+  │ 4. opifexd: verify atrium.toml.sig itself (portcullis-trust gate + scopes);
+  │    content.idx hash = atrium.toml; copy staging → apps/.<id>.new,
+  │    hashing every file again as it copies
+  │ 5. portcullis-toml validation (incl. [[workers]], [roles], [ipc]); kind-specific checks
+  │ 6. atomic switch (§7.5); record; tell portcullisd (uids for workers, installed list)
+  ▼
+installed
+```
+
+`opifexd` treats `opifex-check`'s work as a filter, not a verdict: the security-relevant facts
+(signature, scopes, per-file hashes) are checked again by `opifexd` on bytes it reads itself.
+`opifex-check` exists so that the archive and CBOR parsers, the code most likely to have a
+bug, run with nothing to steal and nothing to write but staging.
+
+### 7.3 Install-time verifications
+
+- **WebAuthn RP ids** (sigillum.md): for each `identity.webauthn` RP in the manifest,
+  `opifex-fetch` fetches `https://<rp>/.well-known/atrium-apps` and `opifex-check` checks it
+  names the publisher id (or key) and the app id. Verified RPs go into the installed record,
+  which Sigillum reads. Unverified ones are dropped, and the sheet says so.
+- **Kind checks:** drivers' `devices.d` entries need the `devices` scope; services and layers
+  their own validators; fonts §8.1.
+
+### 7.4 Local bundles (side-loading and workspaces)
+
+A bundle folder or `.insula` file on disk installs through the same sheet and the same
+`opifexd` path, without the catalog: its signature must verify against a key in the
+side-load list (`/etc/atrium/publishers`, with scopes), which an admin edits in Curia with a
+press. This is how a bundle built in a workspace and signed by its developer's Arca-held key
+(`cargo atrium bundle --sign`, dev-tools §4.5) gets installed for real. `--allow-unsigned`
+goes away; unsigned bundles run only as `dev.` ids through the dev publisher (homes.md),
+which `opifexd` refuses.
+
+### 7.5 On disk
+
+```
+/var/lib/atrium/apps/<id>/            the installed tree (what portcullisd reads today)
+/var/lib/atrium/apps/.<id>.prev/      the previous version, kept for rollback
+/var/db/atrium/opifex/catalog.db      checked local catalog
+/var/db/atrium/opifex/installed.toml  per id: version, publisher id, archive sha256,
+                                      content.idx hash, source (catalog | side-load),
+                                      verified RPs, who installed, when
+/var/db/atrium/opifex/dl/             downloaded archives (kept until the install settles)
+```
+
+Switching: unpack to `.<id>.new`, then rename the current tree to `.<id>.prev` (dropping
+the older one) and `.<id>.new` to `<id>`. Running instances keep the tree they started with
+(their nullfs mount holds the old directory) until they restart under the update's timing
+class. No change to portcullisd's layout. Deduplication between versions and between apps is
+Tessera's, since `/var/lib/atrium` is on the Tessera root; when Tessera grows an ingest API,
+placing becomes a tree pointer swap with no copy, without changing anything above.
+
+The library closure: catalog packages must ship it (atrium-bundle-format §5, the packer and
+`[bundle] extra-libs`); `opifexd` refuses a catalog package whose entry needs a library not in
+its tree. The current install-time `DT_NEEDED` resolving stays for side-loaded bundles only, as
+the bring-up exception already says.
+
+### 7.6 People and personas
+
+The installed tree is shared by everyone on the machine. Who may use it is per person: the
+install sheet records the installing person's approval of the capabilities (portcullisd's
+`ApproveAccess`, keyed by manifest hash, as the Curia Apps page does today); another person
+sees the app in their grid and approves on first open. Per-persona instances, data and grants
+are personas.md's and are unchanged. Removing an app a person installed removes it for them;
+the tree is deleted when nobody uses it.
+
+### 7.7 Uninstall and rollback
+
+- Uninstall: removes the person's approval and, if nobody else uses it, the tree and
+  `.prev`. The app's data in people's homes stays until they remove it on the Curia Apps page
+  (as today).
+- Rollback: swaps `<id>` and `.<id>.prev`. Offered in Curia for 30 days after an update.
+  Rolling back across a capability change asks again.
+- A publisher key recovery (§5.2) is shown to people who have that publisher's apps, and
+  the next update of each app asks again even with unchanged capabilities.
+
+## 8. The other kinds
+
+### 8.1 Fonts
+
+Today `atrium-fonts` trusts only faces whose BLAKE3 is compiled into `catalog.rs` (fonts.md).
+Font packages keep that rule with a second, installed pin list:
+
+- `kind = "font"`, platform-signed only, OFL or Apache-2.0, static TrueType, as fonts.md.
+- The catalog extract lists each face's scripts and family names, so "a Japanese serif" is a
+  local search.
+- `opifexd` installs into `/usr/share/fonts/atrium-extra/<id>/` and appends each face's
+  BLAKE3 to `/usr/share/fonts/atrium-extra/pins`, root-owned. `atrium-fonts` accepts a face
+  in `atrium-extra` only if its hash is in that file.
+- On demand: when text needs a script no installed face covers, the app's text path tells
+  frescod or the app shows tofu and a Praeco notice offers the font package (one sheet,
+  any person may approve, no capability prompt because fonts carry none).
+
+The fonts thread owns the library side; this is the contract to agree with it.
+
+### 8.2 Drivers and firmware
+
+- A driver package's `devices.d` entries are in its catalog extract. After each sync
+  `opifex-check` writes `/var/db/atrium/opifex/devices.idx` (match rows to package id), which
+  `dispensatord` reads for a device with no installed driver (device-assignment §4.7.2).
+  Nothing about the device leaves the machine.
+- The Praeco notice opens the install sheet for that driver (§4.7.3), admin with a press.
+- Firmware packages are platform-signed and installed into the paths device-assignment §4.4
+  names; a driver lists the firmware ids it needs and they are installed with it.
+- Only the platform key has the `devices` scope in v1 (device-assignment decision 3).
+
+### 8.3 Toolchain layers
+
+The toolchains thread defines `kind = "layer"` (portcullis-toml `layer.rs`), its install
+path `/var/lib/atrium/layers/<name>@<version>/`, and is writing a first `opifex layer
+install|list|remove` that checks a platform signature over `atrium.toml` naming a content index
+hash. Under this spec that same command keeps working; Opifex adds catalog lookup by
+`name@version` and arch, download, and update notices. Platform key only.
+
+### 8.4 SDK crate registry
+
+The SDK crates are a cargo sparse registry (static `config.json`, `index/`, `crates/`), served
+next to the catalog. Cargo checks each crate against the index's checksum but checks nothing
+about the index. So for each registry update the platform key signs `index.sig` over a file
+listing the SHA-256 of every index file, and `cargo atrium` checks it before letting cargo
+use the registry. The copy inside the Rust layer is covered by the layer's signature already.
+Host: the same Pages site under `/sdk/` (decision 9).
+
+## 9. Names: what is left of Nomenclator
+
+`atrium-app://<id>` resolves by looking the id up in the local catalog (and the installed list);
+that is all an app link needs. Publisher domains are proven once, at registration (§5.2),
+instead of by every client on every lookup, which removes the DNS TXT lookup, the per-client
+TOFU, and the privacy leak of a DNS query per app.
+
+Nomenclator's other job, `atrium-doc://` names for documents published by domain, is not a
+package question and stays in nomenclator.md, to be built when a document publisher exists.
+When it is, it should reuse the publisher records and keys of §5.2 rather than its own.
+
+## 10. Publishing
+
+### 10.1 The pipeline
+
+A publisher (Atrium included) publishes by opening a pull request to `atrium-os/catalog` that
+adds a release file: the signed `atrium.toml`, its signature, the archive URLs, sha256 and
+size. GitHub Actions runs the checks and, when they pass, appends the entry to the log, signs
+the new tree head with the catalog key (a repository secret) and publishes the tiles to Pages.
+`opifex publish` writes the pull request contents; `cargo atrium bundle --sign` produces the
+signed bundle.
+
+The catalog key in CI is the weakest key, and is deliberately the least powerful: it can
+order and delay, not forge (§1). Root keys never touch CI.
+
+### 10.2 Checks
+
+The CI fetches each archive (it must, to check the hash and the tree) and checks: schema;
+publisher signature; id in prefixes, kind in scopes; content.idx matches the archive;
+self-contained closure; portcullis-toml validation; capabilities on the review list (device
+claims, `network.host`-class grants, `arca`, `embeds` of system roles) wait for a human; new
+publishers wait for a human; typosquatting distance against existing names waits for a human;
+atrium-ax coverage below threshold is refused unless overridden by a maintainer, and an
+override is shown on the sheet. No review of what an app does: the jail and capabilities do
+that work.
+
+### 10.3 Licences
+
+The catalog accepts any licence, shown on the sheet as SPDX. The base system's no-GPL rule is
+about the base, which never depends on a catalog package. Platform-published packages follow
+the base rule except dev layers, which dev-tools already allows to carry GPL tools.
+
+## 11. Updates
+
+- `opifex-fetch` syncs the catalog once a day, at a random time, and when the person opens
+  the Updates part of Curia.
+- For each installed package with a newer release, under the publisher's timing class
+  (insula §14.3, the person may only make it more conservative):
+  - same publisher, capabilities a subset or equal: fetched and installed in the background;
+    the app picks it up at its next start;
+  - capabilities added: a Praeco notice; the sheet shows only the additions;
+  - different publisher id: refused, shown in Curia.
+- Platform packages (`org.atrium.*`, layers, fonts, drivers, firmware) follow the same path
+  with admin approval batched per sync.
+- The base system itself (kernel, base userland, base daemons) is not updated through the
+  catalog in v1 (decision 12).
+
+## 12. Not in the first version
+
+- Delta downloads. v1 downloads the whole archive. Next: `.insula` gets a per-file offset
+  table so a client fetches only files whose hash it lacks, with HTTP range requests on the
+  same static file. Later still, Tessera diff streams when Tessera has them.
+- LAN peer cache and head comparison between machines.
+- Third-party drivers, services, layers and fonts.
+- Trial installs (needs `[trial]` in portcullis-toml).
+- Payments: never in Opifex. A commercial app handles licences itself.
+- Base system updates through the catalog.
+- Per-persona catalogs.
+
+## 13. Words
+
+- **the catalog**: Opifex's signed log of published packages, and its local checked copy.
+- **the installed list**: portcullisd's `Request::Catalog` (the apps the dock and grid show).
+  Renaming the verb to `Installed` when next touched is suggested, not required.
+- **the font pin table**: `atrium-fonts/src/catalog.rs`, plus the installed `pins` file.
+
+## 14. Build order
+
+| Step | What | Unblocks |
+|---|---|---|
+| **C0** | Today's `opifex`: use `portcullis-trust`'s gate instead of its own copy; `content.idx` and `[bundle] content`; refuse `dev.` ids, setuid, devices, hard links, escaping symlinks; staging and rename; drop `--allow-unsigned`. Shared with the toolchains thread's `opifex layer`. | layers on the VM; signed bundles from workspaces |
+| **C1** | Key roles: `root.toml` (2-of-3), platform and catalog keys, scopes; key ceremony for Shankar with hardware tokens. Catalog entry format, log, tiles; `opifex catalog append|sign|verify` tools; a local catalog directory works offline. | fonts and layers from a local catalog |
+| **C2** | `opifexd`, `opifex-check` (worker), installed record, install, uninstall, rollback from a local catalog and local archives. `Describe`, `Search`. | |
+| **C3** | `opifex-sheet` as the Limen `install` role; callers: Monstrator L5, the Navigator prompt, Scrinium, Curia. | L5, publisher prompt |
+| **C4** | `opifex-fetch` through Nuntius (as an ordinary launched system bundle with `net-fetch`, no new Nuntius verb); `atrium-os/catalog` repo, Pages, CI pipeline and checks; first platform packages published. | everything online |
+| **C5** | Updates, timing classes, Praeco notices, Curia Updates; key rotation and recovery. | |
+| **C6** | Kinds: fonts (with the fonts thread), drivers and `devices.idx` (with dispensatord), firmware, layers from the catalog, signed SDK registry. | CJK on demand, driver lookup, SDK |
+| **C7** | Third-party publishers: registration with domain proof, prefixes; other catalogs; WebAuthn RP verification; ax coverage in CI. | third-party apps |
+
+Each step has a VM gate: C0 refuses a tampered file, a setuid file and a `dev.` id; C2
+installs, updates and rolls back an app with a running instance kept on the old tree; C3 shows
+the sheet from an `atrium-app://` link and a click-check that the sheet is the system's; C4
+syncs from Pages through Nuntius and refuses a catalog with a forked history; C6 installs a CJK
+font on demand and a driver from a `nobody` device's notice.
+
+## 15. Decisions, with recommendations
+
+1. **One downloaded catalog** for all lookups, not per-publisher DNS manifests or per-package
+   queries. *Recommend yes.*
+2. **Keyed P-256 signatures as built**, no Sigstore keyless, no ed25519 or minisign for
+   packages. Fix bundle-format.md and insula §12 to match. *Recommend yes.*
+3. **Content index named in the signed manifest** (§4.2), required for every non-`dev.`
+   install and launch. *Recommend yes.* This touches portcullis-trust; the platform and
+   toolchains threads have been told.
+4. **Catalog as an append-only Merkle log in static tiles**, heads expiring after 14 days.
+   *Recommend yes.* Alternative: a signed TOML-per-version git repo (simpler, but no
+   protection against showing different machines different histories).
+5. **Key roles**: 2-of-3 offline root keys on Shankar's hardware tokens, platform key,
+   catalog key in CI, publisher keys with scopes. *Recommend yes.* This needs three P-256
+   capable tokens (YubiKey PIV works; Shankar has one YubiKey 5).
+6. **Stable publisher id**, and Arca and Sigillum key app identity on it instead of the raw
+   key. *Recommend yes.* Arca and Sigillum change one key field each.
+7. **Binary only**; source builds belong to workspaces. *Recommend yes.*
+8. **Process split**: `opifex-fetch` (Nuntius), `opifex-check` (no-capability worker),
+   `opifexd` (privileged, re-checks), `opifex-sheet` (Limen system role `install`).
+   *Recommend yes.*
+9. **Hosting on GitHub**: catalog repo with Pages, platform archives on Releases, SDK
+   registry under the same Pages site; a domain later only adds a mirror URL. *Recommend
+   yes.* Question for Shankar: is there a domain you want used (`atrium.dev`,
+   `atrium-os.org`), or GitHub Pages for now?
+10. **No *Try it* until `[trial]` exists**; the sheet offers Install and Not now.
+    *Recommend yes.*
+11. **Non-app kinds platform-only in v1**, installed by an admin with a press (fonts by any
+    person). *Recommend yes.*
+12. **Base system updates stay out of the catalog in v1** (they need their own A/B and boot
+    rollback design). *Recommend yes.* Alternative: carry them as a `kind = "system"` from
+    the start.
+13. **Any licence in the catalog**, shown on the sheet; base rule unchanged. *Recommend yes.*
+14. **Retire atrium-pkg.md, atrium-pkg-registry.md and atrium-pkg-install-ux.md** (marked
+    superseded, kept for history) and narrow nomenclator.md to `atrium-doc://`. *Recommend
+    yes.*
+15. **Build C0 now** (it is shared with the layer work and fixes a real gap: files are not
+    covered by any signature today), the rest after acceptance. *Recommend yes.*
