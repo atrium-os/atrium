@@ -127,6 +127,8 @@ pub struct Msg {
     pub smime: Option<(String, sender::Tone)>,
     /// Its lane and why (E10), for "Always …".
     pub lane: Option<(mail_engine::lanes::LaneKind, String)>,
+    /// It came to one of the person's private addresses (§13.3).
+    pub came_to: Option<mail_engine::private::CameTo>,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -617,6 +619,7 @@ impl Mail {
             held: !m.held.is_empty(),
             smime: sender::smime_line(s),
             lane: self.engine.lane_of(msg).ok(),
+            came_to: self.engine.came_to(msg),
         }
     }
 
@@ -1226,6 +1229,27 @@ impl Mail {
         self.ui.set(ui);
     }
 
+    /// Turn the private address message `k` came to off (its mail goes to
+    /// Trash from now on) or on again.
+    pub fn private_off(&self, k: usize, off: bool) {
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).cloned() else { return };
+        let Some(c) = &m.came_to else { return };
+        if let Err(e) = self.engine.set_private_off(m.account, &c.addr, off) {
+            self.set_error(format!("Couldn't change it: {e}"));
+            return;
+        }
+        let now: Vec<_> = ui.reading.as_ref().map(|r| r.msgs.iter().map(|m| self.engine.came_to(m.msg)).collect()).unwrap_or_default();
+        self.change_reading(|r| {
+            for (m, c) in r.msgs.iter_mut().zip(now) {
+                m.came_to = c;
+            }
+        });
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some((if off { format!("{} is off: its mail goes to Trash", c.addr) } else { format!("{} is on again", c.addr) }, (self.now)() + 4));
+        self.ui.set(ui);
+    }
+
     /// "Block future mail from this list" (or take the block away).
     pub fn block_list(&self, k: usize, on: bool) {
         let ui = self.ui.get_cloned();
@@ -1781,6 +1805,8 @@ pub enum Item {
     Screener(usize),
     /// "In Updates: a machine sent it · Always People · …" (E10).
     Lane(usize),
+    /// "Sent to the address you made for shop.example" (§13.3).
+    CameTo(usize),
     /// A card's title line, then each of its lines (§14.3).
     CardTitle(usize),
     CardLine(usize, usize),
@@ -1826,6 +1852,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         if m.list.is_some() {
             out.push(Item::List(k));
+        }
+        if m.came_to.is_some() {
+            out.push(Item::CameTo(k));
         }
         if m.lane.is_some() && k + 1 == r.msgs.len() && !m.held {
             out.push(Item::Lane(k));
@@ -2687,6 +2716,26 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
                 ctx.pop();
                 bx += lw + em(6.0);
             }
+        }
+        Item::CameTo(k) => {
+            let m = &s.msgs[*k];
+            let Some(c) = &m.came_to else { return };
+            let (label, color) = if c.off {
+                (format!("Sent to {}, which you turned off", c.addr), t.text_secondary())
+            } else if c.leaked {
+                (format!("Sent to {}, made for {}, but from someone else: it may have been passed on", c.addr, c.made_for), t.warning_fg())
+            } else {
+                (format!("Sent to {}, the address you made for {}", c.addr, c.made_for), t.text_secondary())
+            };
+            let b = if c.off { "Turn it back on" } else { "Turn this address off" };
+            let bw = width(b, type_size::XS, Weight::Medium) + em(16.0);
+            let label = fit(&label, type_size::XS, Weight::Regular, (tw - bw - em(12.0)).max(em(60.0)));
+            text(ctx, x, cy, &label, type_size::XS, Weight::Regular, color);
+            let bx = x + width(&label, type_size::XS, Weight::Regular) + em(12.0);
+            let (mm, k, off) = (mail.clone(), *k, !c.off);
+            area(ctx, Rect::new(bx, cy - em(11.0), bw, em(22.0)), t.bg_window(), move || mm.private_off(k, off));
+            text(ctx, bx + em(8.0), cy, b, type_size::XS, Weight::Medium, t.text_primary());
+            ctx.pop();
         }
         Item::CardTitle(k) | Item::CardLine(k, _) => {
             let Some(c) = s.msgs[*k].body.as_ref().and_then(|b| b.card.as_ref()) else { return };

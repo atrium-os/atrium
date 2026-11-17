@@ -138,6 +138,31 @@ fn settings_window() {
     assert!(s.ui.get_cloned().note.unwrap().starts_with("That rule doesn't read"));
     s.remove_rule(0);
     assert!(engine.lane_rules().is_empty());
+    // Private addresses: a domain of one's own, then one per site.
+    let id = engine.store.add_configured(&AccountConfig {
+        address: "ada@me.example".into(),
+        name: "Ada".into(),
+        protocol: Protocol::Jmap { session: "https://api.me.example/jmap".into() },
+        incoming_item: Some([1; 16]),
+        outgoing_item: Some([1; 16]),
+        oauth: None,
+        reached: Reached::Ok { at: 1 },
+    }).unwrap();
+    s.reload();
+    drawn(&mut app, &["PRIVATE ADDRESSES", "Domain", "Save"]);
+    s.domain.set(TextEdit::new("me.example"));
+    s.save_domain();
+    assert_eq!(engine.private_domain(id).as_deref(), Some("me.example"));
+    drawn(&mut app, &["New, for", "Make"]);
+    s.made_for.set(TextEdit::new("shop.example"));
+    s.make_private(5);
+    let p = engine.private_addresses(id);
+    assert_eq!(p.len(), 1);
+    assert!(s.ui.get_cloned().note.unwrap().starts_with(&p[0].addr));
+    drawn(&mut app, &[p[0].addr.as_str(), "for shop.example", "Turn off"]);
+    s.toggle_private(&p[0].addr);
+    assert!(engine.private_addresses(id)[0].off);
+    drawn(&mut app, &["Turn on"]);
     s.close();
     assert!(s.closed());
 }

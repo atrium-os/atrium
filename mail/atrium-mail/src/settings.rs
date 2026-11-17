@@ -62,6 +62,10 @@ pub struct SettingsUi {
     pub prefs: Prefs,
     /// The person's lane rules, as written (E10).
     pub rules: Vec<String>,
+    /// Private addresses (§13.3): the account shown, its domain, its addresses.
+    pub priv_account: Option<AccountId>,
+    pub priv_domain: Option<String>,
+    pub privates: Vec<mail_engine::private::Private>,
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
@@ -121,6 +125,8 @@ pub struct Settings {
     pub quiet_to: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
+    pub domain: Mutable<TextEdit>,
+    pub made_for: Mutable<TextEdit>,
     pub cred_state: Mutable<CredentialState>,
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
@@ -145,6 +151,8 @@ impl Settings {
             quiet_to: ui.sibling(TextEdit::new(&t)),
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
+            domain: ui.sibling(TextEdit::new("")),
+            made_for: ui.sibling(TextEdit::new("")),
             engine,
             ui,
             found: Rc::default(),
@@ -176,11 +184,21 @@ impl Settings {
         let prefs = e.prefs();
         let rules: Vec<String> = e.lane_rules().iter().map(|r| r.text()).collect();
         let u = self.ui.get_cloned();
-        if u.rows != rows || u.prefs != prefs || u.rules != rules {
+        let rows: Vec<Row> = rows;
+        let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
+        let pd = pa.and_then(|a| e.private_domain(a));
+        let privates = pa.map(|a| e.private_addresses(a)).unwrap_or_default();
+        if pa != u.priv_account {
+            self.domain.set(TextEdit::new(pd.as_deref().unwrap_or("")));
+        }
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
                 u.rules = rules;
+                u.priv_account = pa;
+                u.priv_domain = pd;
+                u.privates = privates;
             });
         }
     }
@@ -392,6 +410,64 @@ impl Settings {
             if let Err(e) = self.engine.set_lane_rules(&rules) {
                 self.update(|u| u.note = Some(format!("Couldn't change the rules: {e:?}")));
             }
+        }
+        self.reload();
+    }
+
+    // ── private addresses ──
+
+    /// Show the next account's private addresses.
+    pub fn next_private_account(&self) {
+        let u = self.ui.get_cloned();
+        let i = u.rows.iter().position(|r| Some(r.id) == u.priv_account).map_or(0, |i| (i + 1) % u.rows.len().max(1));
+        if let Some(r) = u.rows.get(i) {
+            let id = r.id;
+            self.update(|u| u.priv_account = Some(id));
+            self.domain.set(TextEdit::new(self.engine.private_domain(id).as_deref().unwrap_or("")));
+            self.reload();
+        }
+    }
+
+    pub fn save_domain(&self) {
+        let Some(a) = self.ui.get_cloned().priv_account else { return };
+        let d = self.domain.get_cloned().text().trim().to_string();
+        let r = self.engine.set_private_domain(a, (!d.is_empty()).then_some(d.as_str()));
+        self.update(|u| {
+            u.note = Some(match r {
+                Ok(()) if d.is_empty() => "Private addresses are off for this account.".into(),
+                Ok(()) => format!("Private addresses are made at {d}. It has to take mail for any address (a catch-all) for them to arrive."),
+                Err(e) => format!("Couldn't use that: {e}"),
+            })
+        });
+        self.reload();
+    }
+
+    /// A new address for the site typed in, copied for pasting.
+    pub fn make_private(&self, now: i64) {
+        let Some(a) = self.ui.get_cloned().priv_account else { return };
+        let what = self.made_for.get_cloned().text().trim().to_string();
+        let r = self.engine.make_private(a, &what, now);
+        self.update(|u| {
+            u.note = Some(match &r {
+                Ok(addr) => match pergola::clipboard::copy_text(addr, false) {
+                    Ok(()) => format!("{addr} is for {what}, and copied: paste it where they ask for your address."),
+                    Err(_) => format!("{addr} is for {what}."),
+                },
+                Err(e) => format!("Couldn't make one: {e}"),
+            })
+        });
+        if r.is_ok() {
+            self.made_for.set(TextEdit::new(""));
+        }
+        self.reload();
+    }
+
+    pub fn toggle_private(&self, addr: &str) {
+        let u = self.ui.get_cloned();
+        let Some(a) = u.priv_account else { return };
+        let off = !u.privates.iter().any(|p| p.addr == addr && p.off);
+        if let Err(e) = self.engine.set_private_off(a, addr, off) {
+            self.update(|u| u.note = Some(format!("Couldn't change it: {e}")));
         }
         self.reload();
     }
@@ -637,6 +713,51 @@ impl View for SettingsView {
             }
         }
 
+        // Private addresses (§13.3), for one account at a time.
+        if let Some(pa) = ui.priv_account {
+            y += em(16.0);
+            section(ctx, x, &mut y, "PRIVATE ADDRESSES");
+            if ui.rows.len() > 1 {
+                let name = ui.rows.iter().find(|r| r.id == pa).map(|r| r.address.clone()).unwrap_or_default();
+                let s = self.s.clone();
+                button(ctx, x, y + em(14.0), &format!("{name}  ▸"), false, true, move || s.next_private_account());
+                y += em(34.0);
+            }
+            y += para(ctx, x, y, inner, "With a domain of your own that takes mail for any address, Mail makes an address per site and replies from it. Turn one off when it brings mail from someone else.", type_size::XS, t.text_tertiary()) + em(8.0);
+            let lw = em(80.0);
+            let bw = measure("Save", type_size::SM, Weight::Medium) + em(24.0);
+            let fw = (inner - lw - bw - em(8.0)).max(em(120.0));
+            text(ctx, x, y + em(18.0), "Domain", type_size::SM, Weight::Regular, t.text_secondary());
+            let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+            ctx.place(TextField::new(self.s.domain.clone()).at(x + lw, fy).width(fw).placeholder("me.example"));
+            let s = self.s.clone();
+            button(ctx, x + lw + fw + em(8.0), y + em(18.0), "Save", false, true, move || s.save_domain());
+            y += em(40.0);
+            if ui.priv_domain.is_some() {
+                let mw = measure("Make", type_size::SM, Weight::Medium) + em(24.0);
+                let fw = (inner - lw - mw - em(8.0)).max(em(120.0));
+                text(ctx, x, y + em(18.0), "New, for", type_size::SM, Weight::Regular, t.text_secondary());
+                let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+                ctx.place(TextField::new(self.s.made_for.clone()).at(x + lw, fy).width(fw).placeholder("shop.example"));
+                let s = self.s.clone();
+                button(ctx, x + lw + fw + em(8.0), y + em(18.0), "Make", true, true, move || s.make_private(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
+                y += em(44.0);
+                for p in ui.privates.iter().rev() {
+                    if y + em(40.0) > h {
+                        text(ctx, x, y + em(10.0), "…", type_size::SM, Weight::Regular, t.text_secondary());
+                        break;
+                    }
+                    let b = if p.off { "Turn on" } else { "Turn off" };
+                    let bw = measure(b, type_size::SM, Weight::Medium) + em(24.0);
+                    text(ctx, x, y + em(12.0), &crate::view::fit_text(&p.addr, type_size::SM, Weight::Regular, inner - bw - em(8.0)), type_size::SM, Weight::Regular, if p.off { t.text_tertiary() } else { t.text_primary() });
+                    let sub = if p.off { format!("for {} · off: its mail goes to Trash", p.made_for) } else { format!("for {}", p.made_for) };
+                    text(ctx, x, y + em(30.0), &crate::view::fit_text(&sub, type_size::XS, Weight::Regular, inner - bw - em(8.0)), type_size::XS, Weight::Regular, t.text_secondary());
+                    let (s, a) = (self.s.clone(), p.addr.clone());
+                    button(ctx, right - bw, y + em(20.0), b, false, true, move || s.toggle_private(&a));
+                    y += em(44.0);
+                }
+            }
+        }
         let _left_end = y;
         // Notifications, lanes and VIPs, in the right column.
         let x = right + 20.0;

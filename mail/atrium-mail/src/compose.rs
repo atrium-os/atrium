@@ -220,13 +220,18 @@ impl Composer {
     /// A window for `c`, every cell on `dirty`. `draft_id`: the stored
     /// draft it continues, if any.
     pub fn new(engine: Rc<Engine>, c: Compose, draft_id: Option<u64>, dirty: std::sync::Arc<std::sync::atomic::AtomicBool>, now: impl Fn() -> i64 + 'static) -> Composer {
-        let froms = engine
+        let mut froms: Vec<String> = engine
             .identities(c.account)
             .unwrap_or_default()
             .into_iter()
             .map(|i| if i.name.is_empty() { i.addr } else { format!("{} <{}>", i.name, i.addr) })
             .collect();
         let d = &c.draft;
+        // A reply from a private address (§13.3) is from it, though it
+        // isn't one of the account's identities.
+        if c.identity >= froms.len() {
+            froms.push(if d.from.name.is_empty() { d.from.addr.clone() } else { format!("{} <{}>", d.from.name, d.from.addr) });
+        }
         let ui = Mutable::with_dirty(
             ComposeUi { account: c.account, identity: c.identity, froms, draft_id, notes: c.notes.clone(), show_bcc: !d.bcc.is_empty(), ..ComposeUi::default() },
             dirty,

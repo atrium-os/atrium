@@ -256,6 +256,7 @@ impl Engine {
         let mut wrote = Vec::new();
         let mut lane_in = Vec::new();
         let mut received: Vec<String> = Vec::new();
+        let mut private_in = Vec::new();
         for &(uid, msg) in new {
             let Ok(m) = self.store.message(msg) else { continue };
             let s = &m.summary;
@@ -272,6 +273,7 @@ impl Engine {
             if f.role != Role::Inbox {
                 continue;
             }
+            private_in.push((uid, s.clone(), m.date));
             if let Some(k) = list_key(s).or_else(|| is_list(s).then(|| s.from.first().map(|a| a.addr.to_ascii_lowercase())).flatten()) {
                 if self.store.list_state(account, &k)? == list::BLOCKED {
                     block.push(uid);
@@ -287,6 +289,13 @@ impl Engine {
             } else if !known {
                 received.push(from.addr.clone());
             }
+        }
+        // Mail to a private address turned off goes to Trash (§13.3).
+        for uid in self.private_arrived(account, &private_in)? {
+            if !block.contains(&uid) {
+                block.push(uid);
+            }
+            hold.retain(|u| *u != uid);
         }
         self.store.write(|w| {
             for a in &wrote {

@@ -65,7 +65,14 @@ impl Engine {
     pub fn compose_reply(&self, msg: MsgId, kind: Kind) -> Result<Compose, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let account = m.account;
-        let ids = self.identities(account)?;
+        let mut ids = self.identities(account)?;
+        // Sent to a private address (§13.3): the reply comes from it.
+        if let Some(p) = self.private_to(account, &m.summary) {
+            if !ids.iter().any(|i| i.addr.eq_ignore_ascii_case(&p)) {
+                let base = ids.first().cloned().unwrap_or_default();
+                ids.push(mail_store::Identity { name: base.name, addr: p, signature: base.signature });
+            }
+        }
         let mine: Vec<String> = ids.iter().map(|i| i.addr.clone()).collect();
         let identity = reply::reply_from(&m.summary, &mine).unwrap_or(0);
         let r = self.open(msg)?;

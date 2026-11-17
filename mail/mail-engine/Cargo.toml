@@ -14,6 +14,8 @@ mail-store = { path = "../mail-store" }
 mail-sync = { path = "../mail-sync" }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
+# Private addresses (§13.3): their random part.
+getrandom = "0.2"
 # Remote pictures (§7.4) go through the caller's Nuntius channel.
 nuntius = { path = "../../nuntius", default-features = false }
 
