@@ -37,18 +37,18 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
         let req = { let mut p = port.borrow_mut(); wire::read_frame::<wire::ToJail>(&mut p.r)? };
         let Some(req) = req else { return Ok(()) };
         match req {
-            wire::ToJail::Summarize { authserv_id, me, now, batch } => {
+            wire::ToJail::Summarize { authserv_id, me, now, headers_only, batch } => {
                 if batch.len() > wire::MAX_BATCH || batch.iter().map(|m| m.bytes.len()).sum::<usize>() > wire::MAX_BATCH_BYTES {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "batch over its limits"));
                 }
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now };
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only };
                 for m in &batch {
                     let result = summarize(&m.bytes, &ctx, &port).map(|(s, _)| s);
                     port.borrow_mut().send(&wire::FromJail::Summary { id: m.id, result })?;
                 }
             }
             wire::ToJail::Open { authserv_id, me, now, message, loaded } => {
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now };
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false };
                 let loaded: BTreeMap<String, (u32, u32)> = loaded.into_iter().map(|(id, w, h)| (id, (w, h))).collect();
                 let result = open(&message.bytes, &ctx, &port, &loaded, fonts);
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
@@ -59,7 +59,7 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
     }
 }
 
-struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64 }
+struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool }
 
 fn refusal(r: Refused) -> wire::Refusal {
     match r { Refused::Empty => wire::Refusal::NotMail, _ => wire::Refusal::TooLarge }
@@ -72,7 +72,7 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     // engine sees the broken stream and retires the jail either way.
     let lookup = |name: String| port.borrow_mut().query(name).ok().flatten();
 
-    let sigs = if s.dkim_signatures > 0 {
+    let sigs = if s.dkim_signatures > 0 && !ctx.headers_only {
         dkim::verify(raw, &|sel, dom| lookup(format!("{sel}._domainkey.{dom}")), ctx.now)
     } else { Vec::new() };
     let from_domain = s.from.first().and_then(|a| a.addr.rsplit_once('@')).map(|(_, d)| d.to_ascii_lowercase()).unwrap_or_default();
@@ -88,6 +88,8 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
     let provider = ctx.authserv_id.and_then(|id| dkim::provider_result(raw, id));
     let sender_check = match dkim::verdict(&from_domain, &sigs, dmarc.as_deref(), provider.as_ref()) {
         dkim::Verdict::Verified { domain, by_provider } => wire::SenderCheck::Verified { domain, by_provider },
+        // Signed, but the body isn't here yet: checked when it is.
+        dkim::Verdict::NotVerified if ctx.headers_only && s.dkim_signatures > 0 => wire::SenderCheck::Pending,
         dkim::Verdict::NotVerified => wire::SenderCheck::NotVerified,
         dkim::Verdict::Pending => wire::SenderCheck::Pending,
     };

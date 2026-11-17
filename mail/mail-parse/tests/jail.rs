@@ -80,7 +80,7 @@ fn a_batch_is_summarized_with_keys_from_the_engine() {
     let batch: Vec<wire::Raw> = [&good, &forged, &plain, &not_mail].iter().enumerate()
         .map(|(i, b)| wire::Raw { id: i as u64, bytes: b.to_vec() }).collect();
     let max_len = batch.iter().map(|m| m.bytes.len()).max().unwrap() as u64;
-    e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, batch });
+    e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, headers_only: false, batch });
     let dns = |n: &str| match n { "sel._domainkey.example.com" => Some(rec.clone()), _ => None };
     let out = e.run(max_len, &dns);
     assert_eq!(out.len(), 4);

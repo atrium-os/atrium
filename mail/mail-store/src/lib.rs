@@ -1,0 +1,504 @@
+//! Mail's store (docs/spec/mail.md §6.2).
+//!
+//! - **Raw messages are the source of truth**: files named by the SHA-256 of
+//!   their bytes, byte-exact as the server gave them. A message in two
+//!   folders, or fetched twice, is one file. During the staged first sync
+//!   (§6.4) a message may at first have only its header block; its full
+//!   bytes arrive later, as a second blob.
+//! - **The index** (redb, one file): accounts, folders with their sync
+//!   state, where each message is (folder, UID) and with which flags, and per
+//!   message the parse jail's bounded summary. The list a folder shows is a
+//!   key range, newest first, so opening a folder of 200,000 reads only the
+//!   rows on screen. The index can always be rebuilt from the blobs.
+//!
+//! The store never parses a message: summaries come from a parse jail and are
+//! checked before they get here (mail-schema).
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use mail_schema::Summary;
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub type AccountId = u32;
+pub type FolderId = u32;
+pub type MsgId = u64;
+pub type Hash = [u8; 32];
+
+// Tables. Values are postcard.
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const ACCOUNTS: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
+const FOLDERS: TableDefinition<u32, &[u8]> = TableDefinition::new("folders");
+/// (account, folder name) → folder id.
+const FOLDER_NAMES: TableDefinition<(u32, &str), u32> = TableDefinition::new("folder_names");
+const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
+/// (folder, uid) → (msg, flags).
+const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new("locations");
+/// (folder, newest-first date key, msg) → uid: the list.
+const LIST: TableDefinition<(u32, u64, u64), u32> = TableDefinition::new("list");
+/// (account, server's stable id) → msg: each message once (§6.4).
+const SERVER_IDS: TableDefinition<(u32, &str), u64> = TableDefinition::new("server_ids");
+
+/// Flags as bits; keywords are not kept yet.
+pub mod flag {
+    pub const SEEN: u32 = 1;
+    pub const ANSWERED: u32 = 2;
+    pub const FLAGGED: u32 = 4;
+    pub const DELETED: u32 = 8;
+    pub const DRAFT: u32 = 16;
+
+    /// IMAP system flags → bits (others ignored).
+    pub fn from_imap<S: AsRef<str>>(flags: &[S]) -> u32 {
+        flags.iter().fold(0, |b, f| {
+            b | match f.as_ref().to_ascii_lowercase().as_str() {
+                "\\seen" => SEEN,
+                "\\answered" => ANSWERED,
+                "\\flagged" => FLAGGED,
+                "\\deleted" => DELETED,
+                "\\draft" => DRAFT,
+                _ => 0,
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Db(String),
+    Io(std::io::Error),
+    Corrupt(&'static str),
+    NotFound,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Db(e) => write!(f, "index: {e}"),
+            Error::Io(e) => write!(f, "store: {e}"),
+            Error::Corrupt(w) => write!(f, "index record: {w}"),
+            Error::NotFound => f.write_str("not found"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+macro_rules! db_err {
+    ($($t:ty),*) => { $(impl From<$t> for Error { fn from(e: $t) -> Self { Error::Db(e.to_string()) } })* };
+}
+db_err!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self { Error::Io(e) }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+fn enc<T: Serialize>(v: &T) -> Vec<u8> {
+    postcard::to_stdvec(v).expect("encodes")
+}
+
+fn dec<'a, T: Deserialize<'a>>(b: &'a [u8]) -> Result<T> {
+    postcard::from_bytes(b).map_err(|_| Error::Corrupt("postcard"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub name: String,
+}
+
+/// A folder's role (SPECIAL-USE, RFC 6154), for order and icons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role { Inbox, Sent, Drafts, Archive, Junk, Trash, All, Flagged, Other }
+
+/// A folder and where its sync stands. Resumable: every field is a
+/// checkpoint (§6.4 "Resumable").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folder {
+    pub account: AccountId,
+    pub name: String,
+    pub role: Role,
+    /// Not selectable (`\Noselect`), or gone from the server.
+    pub hidden: bool,
+    pub uidvalidity: u32,
+    /// Every UID ≥ this one the server had at the last sync is listed here.
+    pub synced_from: u32,
+    /// The next UID the server will assign, as of the last sync.
+    pub uidnext: u32,
+    /// CONDSTORE/QRESYNC state, 0 when the server has none.
+    pub highestmodseq: u64,
+    pub exists: u32,
+}
+
+/// What a sync hands the store for one message in one folder.
+#[derive(Debug, Clone)]
+pub struct Incoming {
+    pub server_id: Option<String>,
+    pub size: u64,
+    pub internal_date: Option<i64>,
+    pub flags: u32,
+    /// The header block, or the whole message when `full`.
+    pub blob: Hash,
+    pub full: bool,
+    pub summary: Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Message {
+    pub account: AccountId,
+    pub server_id: Option<String>,
+    pub size: u64,
+    pub date: i64,
+    /// The header block (always) and the whole message (once fetched).
+    pub headers: Hash,
+    pub full: Option<Hash>,
+    pub summary: Summary,
+    pub locations: Vec<(FolderId, u32)>,
+}
+
+/// One row of a folder's list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub msg: MsgId,
+    pub uid: u32,
+    pub flags: u32,
+    pub date: i64,
+    pub from: String,
+    pub subject: String,
+    pub preview: String,
+    /// The message text is here (stage 3), not only its headers.
+    pub has_text: bool,
+}
+
+pub struct Store {
+    db: Database,
+    blobs: PathBuf,
+}
+
+/// Newest first: the key sorts ascending, so it is the date reversed.
+fn date_key(date: i64) -> u64 {
+    (i64::MAX - date.max(0)) as u64
+}
+
+impl Store {
+    /// Open (or create) the store in `dir`: `index.redb` and `blobs/`.
+    pub fn open(dir: &Path) -> Result<Store> {
+        std::fs::create_dir_all(dir.join("blobs"))?;
+        let db = Database::create(dir.join("index.redb"))?;
+        let tx = db.begin_write()?;
+        {
+            tx.open_table(META)?;
+            tx.open_table(ACCOUNTS)?;
+            tx.open_table(FOLDERS)?;
+            tx.open_table(FOLDER_NAMES)?;
+            tx.open_table(MESSAGES)?;
+            tx.open_table(LOCATIONS)?;
+            tx.open_table(LIST)?;
+            tx.open_table(SERVER_IDS)?;
+        }
+        tx.commit()?;
+        Ok(Store { db, blobs: dir.join("blobs") })
+    }
+
+    // ── blobs ───────────────────────────────────────────────────────
+
+    fn blob_path(&self, h: &Hash) -> PathBuf {
+        let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
+        self.blobs.join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// Keep these bytes; their name is their hash. Written to a temporary
+    /// file and renamed, so a crash never leaves a half blob under a name.
+    pub fn put_blob(&self, bytes: &[u8]) -> Result<Hash> {
+        let h: Hash = Sha256::digest(bytes).into();
+        let p = self.blob_path(&h);
+        if p.exists() {
+            return Ok(h);
+        }
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        let tmp = p.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_data()?;
+        std::fs::rename(&tmp, &p)?;
+        Ok(h)
+    }
+
+    /// A blob's bytes, checked against its name.
+    pub fn blob(&self, h: &Hash) -> Result<Vec<u8>> {
+        let b = std::fs::read(self.blob_path(h)).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Error::NotFound } else { Error::Io(e) })?;
+        let got: Hash = Sha256::digest(&b).into();
+        if &got != h {
+            return Err(Error::Corrupt("blob does not match its name"));
+        }
+        Ok(b)
+    }
+
+    // ── accounts and folders ────────────────────────────────────────
+
+    fn next_id(tx: &redb::WriteTransaction, key: &str) -> Result<u64> {
+        let mut t = tx.open_table(META)?;
+        let n = t.get(key)?.map(|v| v.value()).unwrap_or(0) + 1;
+        t.insert(key, n)?;
+        Ok(n)
+    }
+
+    pub fn add_account(&self, name: &str) -> Result<AccountId> {
+        let tx = self.db.begin_write()?;
+        let id = Self::next_id(&tx, "account")? as u32;
+        tx.open_table(ACCOUNTS)?.insert(id, enc(&Account { name: name.into() }).as_slice())?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn accounts(&self) -> Result<Vec<(AccountId, Account)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(ACCOUNTS)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            out.push((k.value(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// The folder `name` of `account`, made if new.
+    pub fn folder_id(&self, account: AccountId, name: &str, role: Role) -> Result<FolderId> {
+        let tx = self.db.begin_write()?;
+        let existing = tx.open_table(FOLDER_NAMES)?.get((account, name))?.map(|v| v.value());
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = Self::next_id(&tx, "folder")? as u32;
+                tx.open_table(FOLDER_NAMES)?.insert((account, name), id)?;
+                let f = Folder { account, name: name.into(), role, hidden: false, uidvalidity: 0, synced_from: 0, uidnext: 0, highestmodseq: 0, exists: 0 };
+                tx.open_table(FOLDERS)?.insert(id, enc(&f).as_slice())?;
+                id
+            }
+        };
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn folder(&self, id: FolderId) -> Result<Folder> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(FOLDERS)?;
+        let v = t.get(id)?.ok_or(Error::NotFound)?;
+        dec(v.value())
+    }
+
+    pub fn folders(&self, account: AccountId) -> Result<Vec<(FolderId, Folder)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(FOLDERS)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let f: Folder = dec(v.value())?;
+            if f.account == account {
+                out.push((k.value(), f));
+            }
+        }
+        // Inbox first, then by role, then by name.
+        out.sort_by(|a, b| (a.1.role as u8, &a.1.name).cmp(&(b.1.role as u8, &b.1.name)));
+        Ok(out)
+    }
+
+    /// Run several changes in one transaction (sync writes in small
+    /// transactions, §6.4: one per page of messages).
+    pub fn write<T>(&self, f: impl FnOnce(&mut Writer<'_>) -> Result<T>) -> Result<T> {
+        let tx = self.db.begin_write()?;
+        let out = {
+            let mut w = Writer { tx: &tx };
+            f(&mut w)?
+        };
+        tx.commit()?;
+        Ok(out)
+    }
+
+    // ── reading ─────────────────────────────────────────────────────
+
+    pub fn message(&self, id: MsgId) -> Result<Message> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(MESSAGES)?;
+        let v = t.get(id)?.ok_or(Error::NotFound)?;
+        dec(v.value())
+    }
+
+    /// Rows `offset..offset+limit` of a folder's list, newest first.
+    pub fn list(&self, folder: FolderId, offset: usize, limit: usize) -> Result<Vec<Row>> {
+        let tx = self.db.begin_read()?;
+        let list = tx.open_table(LIST)?;
+        let locs = tx.open_table(LOCATIONS)?;
+        let msgs = tx.open_table(MESSAGES)?;
+        let mut out = Vec::with_capacity(limit);
+        for e in list.range((folder, 0u64, 0u64)..=(folder, u64::MAX, u64::MAX))?.skip(offset).take(limit) {
+            let (k, uid) = e?;
+            let (_, _, msg) = k.value();
+            let uid = uid.value();
+            let flags = locs.get((folder, uid))?.map(|v| v.value().1).unwrap_or(0);
+            let Some(m) = msgs.get(msg)? else { continue };
+            let m: Message = dec(m.value())?;
+            let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
+            out.push(Row { msg, uid, flags, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), has_text: m.full.is_some() });
+        }
+        Ok(out)
+    }
+
+    pub fn count(&self, folder: FolderId) -> Result<usize> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LIST)?;
+        Ok(t.range((folder, 0u64, 0u64)..=(folder, u64::MAX, u64::MAX))?.count())
+    }
+
+    /// The UIDs listed in a folder, ascending.
+    pub fn uids(&self, folder: FolderId) -> Result<Vec<u32>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOCATIONS)?;
+        let mut out = Vec::new();
+        for e in t.range((folder, 0u32)..=(folder, u32::MAX))? {
+            out.push(e?.0.value().1);
+        }
+        Ok(out)
+    }
+
+    /// The message at (folder, uid), with its flags.
+    pub fn at(&self, folder: FolderId, uid: u32) -> Result<Option<(MsgId, u32)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LOCATIONS)?;
+        Ok(t.get((folder, uid))?.map(|v| v.value()))
+    }
+
+    pub fn by_server_id(&self, account: AccountId, server_id: &str) -> Result<Option<MsgId>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(SERVER_IDS)?;
+        Ok(t.get((account, server_id))?.map(|v| v.value()))
+    }
+
+    pub fn message_count(&self) -> Result<u64> {
+        let tx = self.db.begin_read()?;
+        Ok(tx.open_table(MESSAGES)?.len()?)
+    }
+}
+
+/// Changes inside one transaction ([`Store::write`]).
+pub struct Writer<'a> {
+    tx: &'a redb::WriteTransaction,
+}
+
+impl Writer<'_> {
+    pub fn set_folder(&mut self, id: FolderId, f: &Folder) -> Result<()> {
+        self.tx.open_table(FOLDERS)?.insert(id, enc(f).as_slice())?;
+        Ok(())
+    }
+
+    fn get_msg(&self, id: MsgId) -> Result<Option<Message>> {
+        let t = self.tx.open_table(MESSAGES)?;
+        let v = t.get(id)?;
+        v.map(|v| dec(v.value())).transpose()
+    }
+
+    fn put_msg(&mut self, id: MsgId, m: &Message) -> Result<()> {
+        self.tx.open_table(MESSAGES)?.insert(id, enc(m).as_slice())?;
+        Ok(())
+    }
+
+    /// A message seen at (folder, uid). Returns its id: the existing one
+    /// when the folder already lists that UID or the account already has the
+    /// server id (the same message in another folder or label), else new.
+    /// A fuller blob or summary replaces a header-only one, never the reverse.
+    pub fn put(&mut self, folder: FolderId, account: AccountId, uid: u32, m: Incoming) -> Result<MsgId> {
+        let at = self.tx.open_table(LOCATIONS)?.get((folder, uid))?.map(|v| v.value().0);
+        let by_sid = match &m.server_id {
+            Some(s) => self.tx.open_table(SERVER_IDS)?.get((account, s.as_str()))?.map(|v| v.value()),
+            None => None,
+        };
+        let date = m.summary.date.or(m.internal_date).unwrap_or(0);
+        let id = match at.or(by_sid) {
+            Some(id) => {
+                let mut old = self.get_msg(id)?.ok_or(Error::Corrupt("location without message"))?;
+                if m.full && old.full.is_none() {
+                    old.full = Some(m.blob);
+                    old.summary = m.summary;
+                }
+                if !old.locations.contains(&(folder, uid)) {
+                    old.locations.push((folder, uid));
+                }
+                // The list key carries the date: re-key if it changed.
+                if old.date != date && m.full {
+                    for (f, u) in old.locations.clone() {
+                        self.tx.open_table(LIST)?.remove((f, date_key(old.date), id))?;
+                        self.tx.open_table(LIST)?.insert((f, date_key(date), id), u)?;
+                    }
+                    old.date = date;
+                }
+                self.put_msg(id, &old)?;
+                id
+            }
+            None => {
+                let id = Store::next_id(self.tx, "message")?;
+                let msg = Message {
+                    account,
+                    server_id: m.server_id.clone(),
+                    size: m.size,
+                    date,
+                    headers: m.blob,
+                    full: m.full.then_some(m.blob),
+                    summary: m.summary,
+                    locations: vec![(folder, uid)],
+                };
+                self.put_msg(id, &msg)?;
+                if let Some(s) = &m.server_id {
+                    self.tx.open_table(SERVER_IDS)?.insert((account, s.as_str()), id)?;
+                }
+                id
+            }
+        };
+        let date = self.get_msg(id)?.map(|x| x.date).unwrap_or(date);
+        self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags))?;
+        self.tx.open_table(LIST)?.insert((folder, date_key(date), id), uid)?;
+        Ok(id)
+    }
+
+    pub fn set_flags(&mut self, folder: FolderId, uid: u32, flags: u32) -> Result<bool> {
+        let mut t = self.tx.open_table(LOCATIONS)?;
+        let Some(cur) = t.get((folder, uid))?.map(|v| v.value()) else { return Ok(false) };
+        t.insert((folder, uid), (cur.0, flags))?;
+        Ok(true)
+    }
+
+    /// The server no longer has (folder, uid). A message left in no folder
+    /// leaves the index; its blobs stay until a sweep.
+    pub fn remove(&mut self, folder: FolderId, uid: u32) -> Result<()> {
+        let Some((id, _)) = self.tx.open_table(LOCATIONS)?.remove((folder, uid))?.map(|v| v.value()) else { return Ok(()) };
+        let Some(mut m) = self.get_msg(id)? else { return Ok(()) };
+        self.tx.open_table(LIST)?.remove((folder, date_key(m.date), id))?;
+        m.locations.retain(|l| *l != (folder, uid));
+        if m.locations.is_empty() {
+            self.tx.open_table(MESSAGES)?.remove(id)?;
+            if let Some(s) = &m.server_id {
+                self.tx.open_table(SERVER_IDS)?.remove((m.account, s.as_str()))?;
+            }
+        } else {
+            self.put_msg(id, &m)?;
+        }
+        Ok(())
+    }
+
+    /// UIDVALIDITY changed: everything the folder listed is void.
+    pub fn clear_folder(&mut self, folder: FolderId) -> Result<()> {
+        let uids: Vec<u32> = {
+            let t = self.tx.open_table(LOCATIONS)?;
+            let mut v = Vec::new();
+            for e in t.range((folder, 0u32)..=(folder, u32::MAX))? {
+                v.push(e?.0.value().1);
+            }
+            v
+        };
+        for u in uids {
+            self.remove(folder, u)?;
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "mail-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's engine (docs/spec/mail.md §4, §6): the store and index for one instance, fed by mail-sync; every message is parsed in a parse jail (mail-parse-jail) and only the checked summary is kept. No network, parses nothing itself."
+
+[dependencies]
+mail-schema = { path = "../mail-schema" }
+mail-store = { path = "../mail-store" }
+mail-sync = { path = "../mail-sync" }
+
+[dev-dependencies]
+tempfile = "3"
+# The end-to-end test: a real Dovecot over TLS, through the real Arca mail
+# courier, into the engine with real parse jails.
+arca-courier = { path = "../../arca/arca-courier" }
+arca-store = { path = "../../arca/arca-store" }
+navigator-fetch = { path = "../../navigator-fetch" }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

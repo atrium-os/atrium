@@ -50,6 +50,10 @@ pub enum ToJail {
         me: Vec<String>,
         /// Seconds since the epoch, for signature expiry.
         now: i64,
+        /// The messages are header blocks only (the staged first sync,
+        /// §6.4): no body, so no DKIM check yet; the verdict is `Pending`
+        /// for a signed message until its whole text is summarized.
+        headers_only: bool,
         batch: Vec<Raw>,
     },
     Open {

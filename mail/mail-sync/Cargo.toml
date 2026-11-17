@@ -1,0 +1,10 @@
+[package]
+name = "mail-sync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's account sync (docs/spec/mail.md §6.1, §6.4): IMAP over the Arca mail courier's relayed session, staged first sync (newest inbox first, headers for everything, then recent text), cheap resync with QRESYNC/CONDSTORE or UID diffs. Holds no store: it hands what it fetched to a Sink (the engine)."
+
+[dependencies]
+mail-proto = { path = "../mail-proto" }

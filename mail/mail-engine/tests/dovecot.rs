@@ -1,0 +1,326 @@
+//! Mail M2 end to end on the host: a real Dovecot serving IMAPS on loopback,
+//! the real Arca mail courier logging in and relaying, mail-sync over the
+//! courier's socket, and the engine parsing every message in real parse
+//! jails into the store. Skipped (with a note) when Dovecot isn't installed.
+
+use std::collections::BTreeMap;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
+
+use arca_courier::mail::{encode_hello, session, MailEndpoint, MailVault};
+use arca_courier::schema::Refusal;
+use arca_store::secret::LockedBuf;
+use arca_store::Scheme;
+use mail_engine::{Engine, Parser};
+use mail_store::{flag, Role, Store};
+use mail_sync::{FolderState, Session, Sink};
+use navigator_fetch::{addr, Connect};
+
+const HOST: &str = "imap.example.test";
+const DAY: i64 = 86_400;
+
+fn now() -> i64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+fn rfc2822(t: i64) -> String {
+    // Enough of a Date header for the parser: day, month name, year, time, zone.
+    let days = t.div_euclid(DAY);
+    let secs = t.rem_euclid(DAY);
+    // civil from days (Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][(m - 1) as usize];
+    format!("{d} {mon} {y} {:02}:{:02}:{:02} +0000", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+struct Dovecot {
+    child: Child,
+    dir: tempfile::TempDir,
+    port: u16,
+    ca_pem: String,
+}
+
+impl Drop for Dovecot {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn maildir(home: &Path) -> PathBuf {
+    home.join("Maildir")
+}
+
+/// Put one message in a maildir folder (`""` is the inbox), dated `t`.
+fn deliver(home: &Path, folder: &str, n: usize, t: i64, seen: bool, body: &str, subject: &str) -> PathBuf {
+    let base = if folder.is_empty() { maildir(home) } else { maildir(home).join(format!(".{folder}")) };
+    for d in ["cur", "new", "tmp"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    let msg = format!(
+        "From: Sender {n} <sender{n}@example.org>\r\nTo: priya@example.org\r\nSubject: {subject}\r\nDate: {}\r\nMessage-ID: <m{n}.{folder}@example.org>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n",
+        rfc2822(t)
+    );
+    let name = format!("{t}.M{n}P1.host:2,{}", if seen { "S" } else { "" });
+    let p = base.join("cur").join(name);
+    std::fs::write(&p, msg).unwrap();
+    let f = std::fs::File::options().write(true).open(&p).unwrap();
+    f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(t as u64)).unwrap();
+    p
+}
+
+fn chown_r(p: &Path, uid: u32, gid: u32) {
+    let _ = Command::new("chown").arg("-R").arg(format!("{uid}:{gid}")).arg(p).status();
+}
+
+fn start_dovecot() -> Option<Dovecot> {
+    let bin = ["/usr/sbin/dovecot", "/usr/local/sbin/dovecot"].into_iter().find(|p| Path::new(p).exists())?;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // Dovecot's processes must reach the files.
+    std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // PKI: a CA and the server's certificate.
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let k = rcgen::KeyPair::generate().unwrap();
+    let c = rcgen::CertificateParams::new(vec![HOST.to_string()]).unwrap().signed_by(&k, &ca_cert, &ca_key).unwrap();
+    std::fs::write(d.join("cert.pem"), c.pem()).unwrap();
+    std::fs::write(d.join("key.pem"), k.serialize_pem()).unwrap();
+    std::fs::write(d.join("passwd"), "priya@example.org:{PLAIN}hunter2::::::\n").unwrap();
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let conf = format!(
+        r#"base_dir = {d}/run
+state_dir = {d}/state
+log_path = {d}/dovecot.log
+protocols = imap
+listen = 127.0.0.1
+ssl = required
+ssl_cert = <{d}/cert.pem
+ssl_key = <{d}/key.pem
+auth_mechanisms = plain
+disable_plaintext_auth = yes
+default_login_user = dovenull
+default_internal_user = dovecot
+mail_location = maildir:~/Maildir
+first_valid_uid = 1
+passdb {{
+  driver = passwd-file
+  args = scheme=PLAIN username_format=%u {d}/passwd
+}}
+userdb {{
+  driver = static
+  args = uid=65534 gid=65534 home={d}/home
+}}
+namespace inbox {{
+  inbox = yes
+  separator = /
+  mailbox Sent {{
+    special_use = \Sent
+  }}
+}}
+service imap-login {{
+  inet_listener imap {{
+    port = 0
+  }}
+  inet_listener imaps {{
+    port = {port}
+    ssl = yes
+  }}
+}}
+service anvil {{
+  chroot =
+}}
+service stats {{
+  unix_listener stats-reader {{
+    mode = 0666
+  }}
+  unix_listener stats-writer {{
+    mode = 0666
+  }}
+}}
+"#,
+        d = d.display()
+    );
+    std::fs::write(d.join("dovecot.conf"), conf).unwrap();
+    std::fs::create_dir_all(d.join("home")).unwrap();
+    // Mail: 300 in the inbox over two years, newest first by date; 5 sent.
+    let home = d.join("home");
+    let t0 = now();
+    for n in 0..300 {
+        let t = t0 - (n as i64) * 2 * DAY - 3600;
+        deliver(&home, "", n, t, n % 3 == 0, &format!("Body of message {n}."), &format!("Message {n}"));
+    }
+    for n in 0..5 {
+        deliver(&home, "Sent", 1000 + n, t0 - (n as i64) * DAY, true, "A sent one.", &format!("Sent {n}"));
+    }
+    chown_r(&home, 65534, 65534);
+    let child = Command::new(bin).arg("-F").arg("-c").arg(d.join("dovecot.conf")).spawn().ok()?;
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Some(Dovecot { child, dir, port, ca_pem: ca_cert.pem() });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("dovecot did not start:\n{}", std::fs::read_to_string(d.join("dovecot.log")).unwrap_or_default());
+    None
+}
+
+struct Net(SocketAddr);
+
+impl Connect for Net {
+    fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![self.0])
+    }
+    fn connect_addr(&self, a: SocketAddr) -> std::io::Result<TcpStream> {
+        TcpStream::connect(a)
+    }
+}
+
+struct Vault;
+
+impl MailVault for Vault {
+    fn login(&mut self, _: &[u8; 16]) -> Result<(String, LockedBuf), Refusal> {
+        Ok(("priya@example.org".into(), LockedBuf::from_slice(b"hunter2").unwrap()))
+    }
+    fn anomaly(&mut self, _: u8, _: &str) {}
+}
+
+/// A courier session to the Dovecot; returns mail-sync's end.
+fn courier(dc: &Dovecot) -> UnixStream {
+    let tls = navigator_fetch::tls_config(dc.ca_pem.as_bytes()).unwrap();
+    let (c, courier_end) = UnixStream::pair().unwrap();
+    let at: SocketAddr = ([127, 0, 0, 1], dc.port).into();
+    std::thread::spawn(move || {
+        let net = Net(at);
+        let out = courier_end.try_clone().unwrap();
+        let ep = MailEndpoint { scheme: Scheme::Imaps, host: HOST.into(), port: at.port() };
+        session(&ep, &net, tls, addr::Policy { grant_private_network: true }, courier_end, out, &mut Vault)
+    });
+    let mut w = c.try_clone().unwrap();
+    std::io::Write::write_all(&mut w, &encode_hello(&[1; 16])).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    c
+}
+
+fn jail() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
+    let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
+    assert!(st.success());
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/target/debug/mail-parse-jail")
+}
+
+/// Records the order of what sync handed over, then passes it on.
+struct Recording<'a, S: Sink> {
+    inner: S,
+    pages: &'a Mutex<Vec<(String, usize, bool)>>,
+}
+
+impl<S: Sink> Sink for Recording<'_, S> {
+    fn folders(&mut self, l: &[mail_sync::RemoteFolder]) -> Result<(), String> { self.inner.folders(l) }
+    fn state(&mut self, f: &str) -> FolderState { self.inner.state(f) }
+    fn reset(&mut self, f: &str) -> Result<(), String> { self.inner.reset(f) }
+    fn known_uids(&mut self, f: &str) -> Vec<u32> { self.inner.known_uids(f) }
+    fn messages(&mut self, f: &str, page: Vec<mail_sync::Fetched>) -> Result<(), String> {
+        self.pages.lock().unwrap().push((f.to_string(), page.len(), page.first().is_some_and(|p| p.full)));
+        self.inner.messages(f, page)
+    }
+    fn flags(&mut self, f: &str, c: &[(u32, Vec<String>)]) -> Result<(), String> { self.inner.flags(f, c) }
+    fn vanished(&mut self, f: &str, u: &[u32]) -> Result<(), String> { self.inner.vanished(f, u) }
+    fn checkpoint(&mut self, f: &str, s: &FolderState) -> Result<(), String> { self.inner.checkpoint(f, s) }
+    fn text_wanted(&mut self, f: &str, l: usize) -> Vec<(u32, u64)> { self.inner.text_wanted(f, l) }
+}
+
+#[test]
+fn dovecot_through_the_courier_into_the_store() {
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed (apt-get install dovecot-imapd)");
+        return;
+    };
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("priya@example.org").unwrap();
+
+    // ── first sync ──
+    let pages = Mutex::new(Vec::new());
+    let mut s = Session::start(courier(&dc)).expect("a signed-in session through the courier");
+    assert!(s.capabilities().iter().any(|c| c.eq_ignore_ascii_case("IMAP4rev1")), "{:?}", s.capabilities());
+    assert!(!s.capabilities().iter().any(|c| c.starts_with("AUTH=")), "{:?}", s.capabilities());
+    let mut sink = Recording { inner: engine.sink(account), pages: &pages };
+    let r = s.sync(&mut sink).expect("sync");
+    let log = || std::fs::read_to_string(dc.dir.path().join("dovecot.log")).unwrap_or_default();
+    assert_eq!(r.headers, 305, "{r:?}\n{}", log());
+    // 90 days at one message per two days: 45 inbox texts (+5 sent).
+    assert_eq!(r.texts, 50, "{r:?}");
+    assert_eq!(sink.inner.refused, 0);
+
+    // Stage 1 came first: the inbox's newest 200, headers only.
+    let p = pages.lock().unwrap().clone();
+    assert_eq!(p[0], ("INBOX".to_string(), 200, false), "{p:?}");
+    assert!(p.iter().position(|x| x.2).unwrap() > p.iter().rposition(|x| !x.2).unwrap(), "texts after every header page: {p:?}");
+
+    let folders = engine.store.folders(account).unwrap();
+    let inbox = folders.iter().find(|(_, f)| f.role == Role::Inbox).unwrap().0;
+    let sent = folders.iter().find(|(_, f)| f.name == "Sent").unwrap();
+    assert_eq!(sent.1.role, Role::Sent);
+    assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    let rows = engine.store.list(inbox, 0, 3).unwrap();
+    assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["Message 0", "Message 1", "Message 2"]);
+    assert_eq!(rows[0].from, "Sender 0");
+    assert!(rows[0].has_text && rows[0].flags & flag::SEEN != 0 && rows[1].flags & flag::SEEN == 0);
+    let old = engine.store.list(inbox, 299, 1).unwrap();
+    assert!(!old[0].has_text, "two-year-old text is not fetched");
+
+    // Reading: the text, parsed alone in its own jail.
+    let reading = engine.open(rows[1].msg).unwrap();
+    assert_eq!(reading.text.as_deref().map(str::trim_end), Some("Body of message 1."));
+    assert!(engine.open(old[0].msg).unwrap().text.is_none());
+
+    // ── the server changes: one gone, one new, one flagged ──
+    let home = dc.dir.path().join("home");
+    let cur = maildir(&home).join("cur");
+    let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for e in std::fs::read_dir(&cur).unwrap() {
+        let e = e.unwrap();
+        files.insert(e.file_name().to_string_lossy().into_owned(), e.path());
+    }
+    let m5 = files.iter().find(|(n, _)| n.contains(".M5P1.")).unwrap().1.clone();
+    std::fs::remove_file(&m5).unwrap();
+    let m7 = files.iter().find(|(n, _)| n.contains(".M7P1.")).unwrap().1.clone();
+    let m7s = m7.to_string_lossy().into_owned();
+    std::fs::rename(&m7, m7s.replace(":2,", ":2,F")).unwrap();
+    deliver(&home, "", 9999, now() - 60, false, "Fresh.", "Brand new");
+    chown_r(&home, 65534, 65534);
+
+    let mut s2 = Session::start(courier(&dc)).unwrap();
+    let r2 = s2.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!((r2.headers, r2.vanished), (1, 1), "{r2:?}");
+    assert!(r2.flag_changes >= 1, "{r2:?}");
+    assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    let top = engine.store.list(inbox, 0, 1).unwrap();
+    assert_eq!(top[0].subject, "Brand new");
+    assert!(top[0].has_text);
+    let flagged = engine.store.list(inbox, 0, 20).unwrap().into_iter().find(|r| r.subject == "Message 7").unwrap();
+    assert!(flagged.flags & flag::FLAGGED != 0);
+    assert!(!engine.store.list(inbox, 0, 20).unwrap().iter().any(|r| r.subject == "Message 5"));
+
+    // ── a third pass with nothing new is cheap ──
+    let r3 = Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    assert_eq!((r3.headers, r3.texts, r3.vanished), (0, 0, 0), "{r3:?}");
+    let _ = s2.logout();
+    let _ = Arc::new(());
+}
