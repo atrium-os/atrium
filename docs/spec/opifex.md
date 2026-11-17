@@ -398,15 +398,27 @@ the tree is deleted when nobody uses it.
 Today `atrium-fonts` trusts only faces whose BLAKE3 is compiled into `catalog.rs` (fonts.md).
 Font packages keep that rule with a second, installed pin list:
 
-- `kind = "font"`, platform-signed only, OFL or Apache-2.0, static TrueType, as fonts.md.
+- `kind = "font"`, platform-signed only, OFL or Apache-2.0, static TrueType (`glyf`), as
+  fonts.md. The PDF writer subsets only `glyf`, so CJK ships as static TTF instances (Google
+  Fonts' static Noto Sans/Serif SC, TC, JP, KR, OFL, about 10 MB a weight), not the CFF
+  Noto CJK or Source Han `.otf` files.
 - The catalog extract lists each face's scripts and family names, so "a Japanese serif" is a
   local search.
-- `opifexd` installs into `/usr/share/fonts/atrium-extra/<id>/` and appends each face's
-  BLAKE3 to `/usr/share/fonts/atrium-extra/pins`, root-owned. `atrium-fonts` accepts a face
-  in `atrium-extra` only if its hash is in that file.
-- On demand: when text needs a script no installed face covers, the app's text path tells
-  frescod or the app shows tofu and a Praeco notice offers the font package (one sheet,
-  any person may approve, no capability prompt because fonts carry none).
+- `opifexd` installs into `/usr/share/fonts/atrium-extra/<id>/` and rewrites
+  `/usr/share/fonts/atrium-extra/pins` atomically (temp file and rename), root-owned. One
+  line per face in a format `atrium-fonts` parses itself: package id, family, file, weight,
+  italic, scripts (Unicode blocks) and BLAKE3. The library matches faces from this table as
+  it does from `catalog.rs`, never by parsing name tables at runtime, and maps a face only if
+  its file's hash matches its line.
+- Jails: the Portcullis `fonts` capability mounts `atrium-extra` read-only next to
+  `/usr/share/fonts/atrium`, and the Fresco renderer bundle (`scripts/fresco-renderer-bundle.sh`)
+  carries it the same way. After an install, opifexd signals frescod, which re-reads the
+  pins; running apps see new faces at their next start.
+- The Navigator reads neither folder (fingerprinting), so installed fonts never change what
+  web pages see.
+- On demand: when text needs a script no installed face covers, the app shows tofu and a
+  Praeco notice offers the font package (one sheet, any person may approve, no capability
+  prompt because fonts carry none).
 
 The fonts thread owns the library side; this is the contract to agree with it.
 
