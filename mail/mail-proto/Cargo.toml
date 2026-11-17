@@ -7,6 +7,8 @@ publish = false
 description = "Mail's protocol codecs (docs/spec/mail.md §6.1): IMAP4rev1/rev2 responses and commands, SMTP submission, sans-I/O. Runs in mail-sync; has no login commands, since the Arca mail courier logs in (§5.2)."
 
 [dependencies]
+# JMAP (RFC 8620/8621) is JSON.
+serde_json = "1"
 
 [profile.release]
 debug = 1

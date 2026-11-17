@@ -825,6 +825,7 @@ dependencies = [
  "arca-courier",
  "arca-store",
  "mail-compose",
+ "mail-proto",
  "mail-schema",
  "mail-smime",
  "mail-store",
@@ -835,6 +836,7 @@ dependencies = [
  "rcgen",
  "rsa",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
 ]
@@ -842,6 +844,9 @@ dependencies = [
 [[package]]
 name = "mail-proto"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "mail-schema"

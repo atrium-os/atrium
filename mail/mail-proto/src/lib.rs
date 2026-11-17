@@ -5,8 +5,10 @@
 //! courier has logged in. Neither has a way to log in or to start TLS:
 //! the Arca mail courier does both and refuses them from us (§5.2).
 //!
-//! JMAP (M7) will live here too.
+//! [`jmap`] builds JMAP requests and reads their answers (RFC 8620, 8621);
+//! the HTTP and its credential are the courier's.
 
 pub mod imap;
+pub mod jmap;
 pub mod smtp;
 pub mod utf7;

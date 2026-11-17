@@ -263,6 +263,7 @@ impl Store {
             tx.open_table(senders::LISTS)?;
             tx.open_table(senders::CONTACTS)?;
             tx.open_table(senders::SETTINGS)?;
+            tx.open_table(senders::SYNC_STATE)?;
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
             tx.open_table(certs::CERTS)?;

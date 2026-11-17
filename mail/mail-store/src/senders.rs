@@ -12,6 +12,8 @@ pub(crate) const LISTS: TableDefinition<(u32, &str), u8> = TableDefinition::new(
 pub(crate) const CONTACTS: TableDefinition<(u32, &str), u8> = TableDefinition::new("contacts");
 /// (account, name) → value: per-account switches (the screener).
 pub(crate) const SETTINGS: TableDefinition<(u32, &str), u64> = TableDefinition::new("account_settings");
+/// Text kept per account by sync (JMAP's Email state).
+pub(crate) const SYNC_STATE: TableDefinition<(u32, &str), &str> = TableDefinition::new("account_sync_state");
 
 /// (account, newest-first date key, message) → (folder, uid, [`why`]):
 /// mail held out of its folder's list, by the screener (*New senders*) or
@@ -117,6 +119,12 @@ impl Store {
         let v = tx.open_table(SETTINGS)?.get((account, name))?.map(|v| v.value());
         Ok(v)
     }
+
+    pub fn sync_state(&self, account: AccountId, name: &str) -> Result<Option<String>> {
+        let tx = self.db.begin_read()?;
+        let v = tx.open_table(SYNC_STATE)?.get((account, name))?.map(|v| v.value().to_string());
+        Ok(v)
+    }
 }
 
 impl Writer<'_> {
@@ -182,6 +190,15 @@ impl Writer<'_> {
         }
         self.put_msg(msg, &m)?;
         self.thread_refresh(m.thread)
+    }
+
+    pub fn set_sync_state(&mut self, account: AccountId, name: &str, value: Option<&str>) -> Result<()> {
+        let mut t = self.tx.open_table(SYNC_STATE)?;
+        match value {
+            Some(v) => t.insert((account, name), v)?,
+            None => t.remove((account, name))?,
+        };
+        Ok(())
     }
 
     pub fn set_setting(&mut self, account: AccountId, name: &str, value: Option<u64>) -> Result<()> {

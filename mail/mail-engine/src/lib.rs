@@ -498,6 +498,28 @@ impl Sink for AccountSink<'_> {
     fn change_done(&mut self, id: u64, ok: bool) -> Result<(), String> {
         self.e.store.write(|w| w.op_done(id, ok)).map_err(|e| e.to_string())
     }
+
+    fn server_state(&mut self, key: &str) -> Option<String> {
+        self.e.store.sync_state(self.account, key).ok().flatten()
+    }
+
+    fn set_server_state(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let account = self.account;
+        self.e.store.write(|w| w.set_sync_state(account, key, Some(value))).map_err(|e| e.to_string())
+    }
+
+    fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
+        let Ok(Some(msg)) = self.e.store.by_server_id(self.account, id) else { return Vec::new() };
+        let Ok(m) = self.e.store.message(msg) else { return Vec::new() };
+        // Held and leaving places are still the server's view of it.
+        m.locations.iter().chain(&m.held).chain(&m.leaving).filter_map(|(f, uid)| Some((self.e.store.folder(*f).ok()?.name, *uid))).collect()
+    }
+
+    fn server_id_at(&mut self, folder: &str, uid: u32) -> Option<String> {
+        let id = self.fid(folder).ok()?;
+        let (msg, _) = self.e.store.at(id, uid).ok()??;
+        self.e.store.message(msg).ok()?.server_id
+    }
 }
 
 /// Flag bits as IMAP's system flags.

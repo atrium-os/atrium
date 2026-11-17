@@ -25,6 +25,7 @@
 //! Read-only (M2): folders are opened with `EXAMINE`, so syncing never
 //! marks anything read.
 
+pub mod jmap;
 pub mod submit;
 
 use std::io::{Read, Write};
@@ -139,6 +140,25 @@ pub trait Sink {
     fn change_done(&mut self, id: u64, ok: bool) -> std::result::Result<(), String> {
         let _ = (id, ok);
         Ok(())
+    }
+    /// A sync state the account keeps (JMAP's Email state).
+    fn server_state(&mut self, key: &str) -> Option<String> {
+        let _ = key;
+        None
+    }
+    fn set_server_state(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
+        let _ = (key, value);
+        Err("this store can't keep a server state".into())
+    }
+    /// Where the message with server id `id` is listed: (folder, UID).
+    fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
+        let _ = id;
+        Vec::new()
+    }
+    /// The server id of the message at `folder`/`uid`.
+    fn server_id_at(&mut self, folder: &str, uid: u32) -> Option<String> {
+        let _ = (folder, uid);
+        None
     }
 }
 

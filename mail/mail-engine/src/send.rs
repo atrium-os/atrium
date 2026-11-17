@@ -169,6 +169,43 @@ impl Engine {
         }
     }
 
+    /// [`Engine::deliver`] over JMAP (§6.1): the server files the copy in
+    /// Sent itself, and holds it until later when it can.
+    pub fn deliver_jmap<H: mail_sync::jmap::Http>(&self, id: u64, client: &mut mail_sync::jmap::Client<H>) -> Result<Delivery, Error> {
+        let t = now();
+        if !self.store.write(|w| w.claim_send(id, t))? {
+            return Ok(Delivery::NotDue);
+        }
+        let Some((_, o)) = self.store.outbox()?.into_iter().find(|(k, _)| *k == id) else { return Ok(Delivery::NotDue) };
+        let failed = |why: String, transient: bool| -> Result<Delivery, Error> {
+            self.store.write(|w| w.send_failed(id, &why, transient, now()))?;
+            Ok(Delivery::Failed { why, transient })
+        };
+        let send_at = match o.later {
+            Some(l) if o.hold_on_server && l - t >= HOLD_MIN_SECS => {
+                if !client.can_hold(l - t) {
+                    self.store.write(|w| w.hold_here(id, l))?;
+                    return Ok(Delivery::HeldHere { until: l });
+                }
+                Some(l)
+            }
+            _ => None,
+        };
+        let bytes = match self.store.blob(&o.message) {
+            Ok(b) => b,
+            Err(e) => return failed(format!("the written message is missing: {e}"), false),
+        };
+        match client.send(&bytes, &o.from, &o.rcpts, send_at) {
+            Ok(_) => {
+                self.store.write(|w| w.send_done(id))?;
+                Ok(Delivery::Sent { copy: None, rejected: Vec::new(), held: send_at.is_some() })
+            }
+            // The server said no to this message: trying again won't help.
+            Err(e) if e.0.starts_with("not sent") || e.0.starts_with("not stored") || e.0.starts_with("the ") => failed(e.0, false),
+            Err(e) => failed(format!("couldn't reach the server: {e}"), true),
+        }
+    }
+
     /// The name of `account`'s Sent folder, if it has one.
     pub fn sent_folder(&self, account: AccountId) -> Result<Option<String>, Error> {
         Ok(self.store.folders(account)?.into_iter().find(|(_, f)| f.role == Role::Sent && !f.hidden).map(|(_, f)| f.name))
