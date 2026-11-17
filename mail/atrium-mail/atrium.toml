@@ -1,0 +1,24 @@
+# Mail (docs/spec/mail.md). It has no network of its own: accounts are
+# reached through Arca's mail courier, and remote pictures, only when the
+# person asks (§7.4), through its own Nuntius fetcher (net-fetch). HTML
+# bodies are drawn by a jailed doc-viewer in a slot (§7.3). It takes
+# mailto: links (§13, opening-links.md §4.1).
+[app]
+id          = "org.atrium.mail"
+name        = "Mail"
+version     = "0.1.0"
+entry       = "bin/atrium-mail"
+description = "Read and write email."
+icon        = "envelope"
+
+[capabilities]
+graphics  = "fresco"
+network   = "none"
+net-fetch = true   # remote pictures, only when asked
+
+[[links]]
+schemes = ["mailto"]
+
+[supervision]
+restart   = "on-crash"
+instances = "single"

@@ -1,4 +1,4 @@
-//! The shipped app manifests (Write, Player) must stay valid, with no
+//! The shipped app manifests (Write, Player, Mail) must stay valid, with no
 //! validation errors, and say what they open (opening-files.md §5).
 
 use portcullis_toml::{validate, Manifest, OpenMode};
@@ -27,4 +27,13 @@ fn player_only_views() {
     assert_eq!(m.app.id, "org.atrium.player");
     assert!(m.opens.iter().all(|o| o.mode == OpenMode::View));
     assert!(m.opens.iter().any(|o| o.types.iter().any(|t| t == "audio/flac")));
+}
+
+#[test]
+fn mail_takes_mailto_and_fetches_only_through_nuntius() {
+    let m = load("mail/atrium-mail/atrium.toml");
+    assert_eq!(m.app.id, "org.atrium.mail");
+    assert_eq!(m.capabilities.net_fetch, Some(true));
+    assert_eq!(m.capabilities.network.as_ref().map(|n| n.mode()), Some(portcullis_toml::NetworkCap::None));
+    assert!(m.links.iter().any(|l| l.schemes.iter().any(|s| s == "mailto")));
 }

@@ -23,6 +23,8 @@ mail-schema = { path = "../mail-schema" }
 # The doc-viewer role for HTML bodies (mail.md §7.3).
 limen = { path = "../../limen" }
 libc = "0.2"
+# Remote pictures, only when asked (mail.md §7.4): Mail's own fetcher.
+nuntius = { path = "../../nuntius" }
 
 [dev-dependencies]
 tempfile = "3"

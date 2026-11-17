@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mail_engine::Engine;
-use mail_store::{flag, FolderId, MsgId, Role, ThreadId};
+use mail_store::{flag, AccountId, FolderId, MsgId, Role, ThreadId};
 use pergola::geom::{Axis, Rect};
 use pergola::layout::FlexStyle;
 use pergola::node::Node;
@@ -84,12 +84,20 @@ pub struct Body {
     pub note: Option<String>,
     pub show_quoted: bool,
     pub show_signature: bool,
+    /// Remote pictures still to load (§7.4): the bar says how many.
+    pub remote: usize,
+    /// "Load pictures" was pressed (or the sender is always loaded) and
+    /// the fetch hasn't come back.
+    pub loading: bool,
 }
 
 /// A message in the reader.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Msg {
     pub msg: MsgId,
+    pub account: AccountId,
+    /// From's address, for "Always for this sender".
+    pub from: String,
     pub sender: Sender,
     pub to: String,
     pub date: String,
@@ -162,6 +170,9 @@ pub struct Mail {
     now: Rc<dyn Fn() -> i64>,
     /// Whether the window is drawn dark (the doc-viewer is told).
     dark: Rc<std::cell::Cell<bool>>,
+    /// Messages whose remote pictures the person asked for, for the app
+    /// to fetch through Nuntius (§7.4); Mail itself has no network.
+    loads: Rc<RefCell<Vec<MsgId>>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -318,13 +329,24 @@ impl Mail {
     fn body(&self, msg: MsgId) -> Body {
         match self.engine.open(msg) {
             Ok(r) => {
+                let remote = match (&r.document, self.engine.store.message(msg)) {
+                    (Some(d), Ok(m)) => mail_engine::pictures::loadable(d).iter().filter(|(id, _)| !m.pictures.iter().any(|(k, _)| k == id)).count(),
+                    _ => 0,
+                };
+                // A verified sender the person always loads: no bar, just load.
+                let always = remote > 0
+                    && matches!(r.summary.sender_check, mail_schema::SenderCheck::Verified { .. })
+                    && self.engine.store.message(msg).ok().zip(r.summary.from.first()).is_some_and(|(m, f)| self.engine.store.always_pictures(m.account, &f.addr).unwrap_or(false));
+                if always {
+                    self.loads.borrow_mut().push(msg);
+                }
                 let note = match (&r.text, &r.document) {
                     (None, _) => Some("Only the headers are here so far; the text comes with the next sync.".to_string()),
                     (Some(t), None) if r.has_html && t.trim().is_empty() => Some("This message's HTML couldn't be shown.".to_string()),
                     _ => None,
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
-                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false }
+                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -334,6 +356,8 @@ impl Mail {
         let s = &m.summary;
         Msg {
             msg,
+            account: m.account,
+            from: s.from.first().map(|a| a.addr.clone()).unwrap_or_default(),
             sender: sender::sender(s),
             to: addrs(&s.to),
             date: crate::full_date(m.date),
@@ -448,6 +472,64 @@ impl Mail {
         });
     }
 
+    /// "Load pictures" for message `k` (and, with `always`, for its
+    /// sender from now on: offered only when the sender is verified).
+    pub fn load_pictures(&self, k: usize, always: bool) {
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.msgs.get(k)).cloned() else { return };
+        if !m.body.as_ref().is_some_and(|b| b.remote > 0 && !b.loading) {
+            return;
+        }
+        if always && m.sender.check == Check::Verified {
+            if let Err(e) = self.engine.store.write(|w| w.set_always_pictures(m.account, &m.from, true)) {
+                eprintln!("atrium-mail: couldn't keep that choice: {e}");
+            }
+        }
+        self.loads.borrow_mut().push(m.msg);
+        self.change_reading(|r| {
+            if let Some(b) = r.msgs.get_mut(k).and_then(|m| m.body.as_mut()) {
+                b.loading = true;
+            }
+        });
+    }
+
+    /// The messages whose pictures are to be fetched now (each once).
+    pub fn take_loads(&self) -> Vec<MsgId> {
+        let mut v = std::mem::take(&mut *self.loads.borrow_mut());
+        v.dedup();
+        v
+    }
+
+    /// A fetch came back: keep what came whole and show it. The body is
+    /// read again (a background's size is known now, so its document may
+    /// have been converted again); the pictures that failed stay on the bar.
+    pub fn pictures_loaded(&self, msg: MsgId, got: Vec<(String, Vec<u8>)>) {
+        if let Err(e) = self.engine.keep_pictures(msg, got) {
+            eprintln!("atrium-mail: keeping pictures: {e}");
+        }
+        let ui = self.ui.get_cloned();
+        let Some(k) = ui.reading.as_ref().and_then(|r| r.msgs.iter().position(|m| m.msg == msg)) else { return };
+        let mut body = self.body(msg);
+        // Not again on its own: what failed waits for another press.
+        if body.loading {
+            self.loads.borrow_mut().retain(|m| *m != msg);
+            body.loading = false;
+        }
+        self.change_reading(|r| {
+            if let Some(m) = r.msgs.get_mut(k) {
+                if let Some(old) = &m.body {
+                    // Keep the same document (no new viewer) unless it changed.
+                    if old.document.as_ref().map(|d| &d.0) == body.document.as_ref().map(|d| &d.0) {
+                        body.document = old.document.clone();
+                    }
+                    body.show_quoted = old.show_quoted;
+                    body.show_signature = old.show_signature;
+                }
+                m.body = Some(body);
+            }
+        });
+    }
+
     /// A link pressed in a message (plain text, or the doc-viewer's
     /// `LinkActivated`): shown in the link bar, never opened from here.
     pub fn link(&self, url: &str) {
@@ -500,6 +582,8 @@ pub enum Item {
     Fold { msg: usize, quoted: bool, shown: bool },
     /// An open HTML message that isn't the framed one: a button to show it there.
     ShowHtml(usize),
+    /// "N pictures not loaded · Load pictures · Always for this sender" (§7.4).
+    Pictures(usize),
     Gap,
 }
 
@@ -527,6 +611,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        if b.remote > 0 && b.document.is_some() {
+            out.push(Item::Pictures(k));
+        }
         // The framed message's body is the doc-viewer's, under the list.
         if r.framed == Some(k) {
             continue;
@@ -620,6 +707,7 @@ impl MailView {
             pages: Rc::default(),
             now: Rc::new(now),
             dark: Rc::default(),
+            loads: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -926,8 +1014,8 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             for (s, link) in spans {
                 let id = text(ctx, tx, cy, s, type_size::MD, Weight::Regular, if link.is_some() { t.accent_fg() } else { color });
                 if let Some(url) = link {
-                    let url = url.clone();
-                    ctx.on_click(id, move || eprintln!("atrium-mail: link {url}"));
+                    let (url, mm) = (url.clone(), mail.clone());
+                    ctx.on_click(id, move || mm.link(&url));
                 }
                 tx += width(s, type_size::MD, Weight::Regular);
             }
@@ -952,6 +1040,30 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             area(ctx, Rect::new(x, cy - em(11.0), lw, em(22.0)), t.bg_window(), move || mm.frame(k));
             text(ctx, x + em(8.0), cy, label, type_size::XS, Weight::Medium, t.text_secondary());
             ctx.pop();
+        }
+        Item::Pictures(k) => {
+            let Some(b) = s.msgs[*k].body.as_ref() else { return };
+            if b.loading {
+                text(ctx, x, cy, "Loading pictures…", type_size::XS, Weight::Regular, t.text_secondary());
+                return;
+            }
+            let n = b.remote;
+            let label = if n == 1 { "1 picture not loaded".to_string() } else { format!("{n} pictures not loaded") };
+            text(ctx, x, cy, &label, type_size::XS, Weight::Regular, t.text_secondary());
+            let mut bx = x + width(&label, type_size::XS, Weight::Regular) + em(12.0);
+            let mut button = |ctx: &mut Ctx, l: &str, always: bool| {
+                let lw = width(l, type_size::XS, Weight::Medium) + em(16.0);
+                let (mm, k) = (mail.clone(), *k);
+                area(ctx, Rect::new(bx, cy - em(11.0), lw, em(22.0)), t.bg_window(), move || mm.load_pictures(k, always));
+                text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, t.text_primary());
+                ctx.pop();
+                bx += lw + em(6.0);
+            };
+            button(ctx, "Load pictures", false);
+            // Only a verified sender can be trusted with "always" (§7.4).
+            if s.msgs[*k].sender.check == Check::Verified {
+                button(ctx, "Always for this sender", true);
+            }
         }
         Item::Gap => {}
     }

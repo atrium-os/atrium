@@ -258,4 +258,29 @@ fn an_html_body_is_framed_for_the_doc_viewer() {
     assert!(m.document.is_some());
     let again = engine.open(s.msgs[1].msg).unwrap();
     assert_eq!(again.document.as_ref().map(|d| &d.html), Some(&doc.0.html));
+
+    // Remote pictures (§7.4): a bar, and nothing fetched until it is pressed.
+    let m0 = s.msgs[0].msg;
+    assert_eq!(s.msgs[0].body.as_ref().unwrap().remote, 1);
+    assert_eq!(s.msgs[1].body.as_ref().unwrap().remote, 0, "a data: picture is not remote");
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "1 picture not loaded") && t.iter().any(|x| x == "Load pictures"), "{t:?}");
+    assert!(!t.iter().any(|x| x == "Always for this sender"), "not offered for an unverified sender");
+    assert!(mail.take_loads().is_empty());
+    // "Always" is refused for an unverified sender even if asked.
+    mail.load_pictures(0, true);
+    assert!(!engine.store.always_pictures(account, "news@shop.example").unwrap());
+    assert_eq!(mail.take_loads(), [m0]);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Loading pictures…"));
+    let want = engine.pictures_to_load(m0).unwrap();
+    assert_eq!(want.iter().map(|w| w.1.as_str()).collect::<Vec<_>>(), ["https://cdn.example/a.png"]);
+    mail.pictures_loaded(m0, vec![(want[0].0.clone(), b"\x89PNG fetched".to_vec())]);
+    let b = mail.ui.get_cloned().reading.unwrap().msgs[0].body.clone().unwrap();
+    assert_eq!((b.remote, b.loading), (0, false));
+    assert_eq!(engine.pictures(m0).unwrap().len(), 1);
+    app.tick();
+    let t = texts(&app);
+    assert!(!t.iter().any(|x| x.contains("not loaded") || x.contains("Loading")), "{t:?}");
 }
