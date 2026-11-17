@@ -2506,6 +2506,12 @@ impl Editor {
 
     /// x of byte `at` in line `line`, from the column's left.
     pub fn x_in_line(&self, block: usize, l: &ParaLayout, line: &Line, at: u32) -> i64 {
+        // A line with right-to-left text: its visual order (bidi).
+        if !line.visual.is_empty() {
+            if let Some(li) = l.lines.iter().position(|x| std::ptr::eq(x, line)) {
+                return l.caret_x(li, at, self.text(block));
+            }
+        }
         let t = self.text(block).as_bytes();
         let mut x = line.x;
         for g in &l.glyphs[line.glyphs.clone()] {
@@ -2534,6 +2540,9 @@ impl Editor {
             end -= prev;
         } else if last_line && end > line.start && t[..end as usize].ends_with(['\u{2028}', '\n']) {
             end -= 3.min(t[..end as usize].chars().next_back().map_or(0, char::len_utf8) as u32);
+        }
+        if let Some(at) = l.hit_x(li, x, t) {
+            return Pos::new(block, at.min(end).max(line.start));
         }
         let mut gx = line.x;
         let mut best = line.start;

@@ -94,9 +94,17 @@ Sans, Symbols, Symbols 2, Math and Serif.
 
 ## 5. Open
 
-- No paragraph-level bidi in either path: within a run each script's
-  stretch is shaped in its own direction, but stretches sit in logical order,
-  so a right-to-left sentence with embedded Latin is ordered left to right.
+- Bidi is built (UAX #9, `unicode-bidi`). frescod: a run is one line in
+  visual order, right-to-left level runs shaped right to left. officina-text
+  (`officina-text/src/bidi.rs`): glyphs stay logical for measuring and line
+  breaking; each line gets a visual order (`Line::visual`), a right-to-left
+  paragraph starts at the right edge (start indent and alignment mirrored),
+  brackets at right-to-left levels are mirrored for shaping, and the caret
+  and clicks follow the visual order (`ParaLayout::caret_x`, `hit_x`).
+  Left: a selection across mixed directions is one rectangle from caret to
+  caret, arrow keys move logically, and `.docx`/`.odt` paragraph direction
+  (`w:bidi`) is not read yet (direction comes from the first strong
+  character); explicit embedding controls work through UAX #9 itself.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - CJK on demand, and colour emoji, wait on the package catalog and colour glyph

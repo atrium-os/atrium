@@ -14,6 +14,7 @@ atrium-fonts = { path = "../atrium-fonts" }
 rustybuzz = "0.20"
 ttf-parser = "0.25"
 unicode-linebreak = "0.1.5"
+unicode-bidi = "0.3.18"
 
 [profile.release]
 debug = 1
