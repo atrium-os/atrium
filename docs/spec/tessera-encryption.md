@@ -252,6 +252,27 @@ What it means:
   with XAES on the M4 (1.2 and 1.55 GB/s on the x86 machine). On metadata-sized 4 KiB
   units XAES is 2.7 to 3 times faster on both.
 
+#### E1: in the kernel
+
+Measured 2026-11-17 in the arm64 FreeBSD VM on the Mac (QEMU with HVF, OCF driver
+armv8crypto, a 1 GiB file written then read back on an md image, single runs; plain
+writes ranged 45 to 62 MiB/s across the day's runs, so read these as indicative):
+
+| 1 GiB, MiB/s | write | read |
+|---|---|---|
+| plain | 45 | 68–69 |
+| sealed | 43–44 | 48–52 |
+
+Sealing costs 2 to 4% on writes and 25 to 30% on reads, where each 4 KiB unit is
+opened in its own synchronous OCF request.
+
+**OCF sessions take one request at a time.** armv8crypto and aesni apply a request's
+`crp_cipher_key` by rewriting the session's key schedule, unlocked. Every XAES unit has
+its own derived key, so requests sharing a session ran under each other's keys: nodes
+written with tags no reader could reproduce, which surfaced only under concurrent load.
+The kernel backend (kmod/tessera_crypt_ocf.c) holds one set of sessions per CPU (up to
+16), each under its own lock for the whole request.
+
 ### 5.2 Superblock
 
 The superblock stays in the clear: it holds sector numbers, generations and sizes, but
@@ -642,7 +663,7 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | step | what | done when |
 |---|---|---|
 | E0 | Suite benchmark on the kernel's candidate code paths, vectors checked | **done 2026-11-17** (a09cb45, 007eb73): numbers in §5.1 for x86_64 and Apple M4; XAES-256-GCM chosen; in-kernel timing moves to E1 |
-| E1 | Sealed volumes (layer A): incompat bit (readers already refuse it, tested 2026-11-17), superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded |
+| E1 | Sealed volumes (layer A): incompat bit (readers already refuse it, tested 2026-11-17), superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded **done 2026-11-17**: scripts/tessera-sealed-vm.sh run/fsck/bench pass on both modules (2266fbd); byte flips over every block of a formatted volume in test_volume_sealed, per tree node and journal block in test_btree_sealed and test_journal_sealed, older copies in the latter two; capsa refuses via tessera_volume_open; throughput in §5.1. GC, repacking, snapshots and the dead-extent log on sealed volumes follow before E3 |
 | E2 | Arca: `VolumeKey`, `/dev/tesserakeys` held by arcad, `LOAD`/`MINT`/`RECORD_GENERATION`/`FORGET` | arca-vm-test: key loads only for the active, unlocked owner, never released by any op; a mount with the wrong key id or a foreign uuid is refused |
 | E3 | Trusted sticks: format from Scrinium, probe, kernel mount, Locked state, recovery code, high-water, eject recording | vm-automount-check: a sealed stick opens for its persona only; a stick from another machine is Locked; a recovery code adopts it; an older image is refused and opens read-only after verification; forgetting the key leaves it Locked |
 | E4 | Encrypted domains on the internal volume: key-group and domain records with MACs, group-tagged packs, keyed ids, names and CDC per group, the parent-domain rule, lock at logout with page invalidation, atrium-volumes `encrypt = "persona"` with expected groups | VM: two people; root cannot read B's files or names while B is logged out; an offline edit that strips a domain's group or moves a file out of it is refused at login; dedup within a group, none across groups; GC leaves a locked group's packs alone |
