@@ -20,10 +20,10 @@ Commands:
       Build for Atrium on that arch from Linux, macOS or the other arch:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
       ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
-  registry verify <folder or https URL> [--keys <dir>]
+  registry verify <folder or https URL> [--keys <dir or .pem>]
       Check the SDK registry's index against the platform keys
       (default /etc/atrium/platform-keys): index.sig over index.files,
-      and every listed file.
+      and every listed file. Exit status 1 on any mismatch.
   registry build --out <dir> --url <https://host/sdk> [--sign <key.pem>] <seed>...
       For the SDK's maintainers: pack every path crate the seed projects
       reach into a static sparse registry and sign its index.
@@ -263,7 +263,11 @@ fn cmd_cross(args: &[String]) -> ExitCode {
     }
 }
 
+/// The platform keys: one PEM file, or every `.pem` in a folder.
 fn read_keys(dir: &Path) -> Result<Vec<String>, String> {
+    if dir.is_file() {
+        return std::fs::read_to_string(dir).map(|k| vec![k]).map_err(|e| format!("{}: {e}", dir.display()));
+    }
     let mut v = Vec::new();
     for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?.flatten() {
         if e.path().extension().map(|x| x == "pem").unwrap_or(false) {
