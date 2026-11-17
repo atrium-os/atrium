@@ -293,6 +293,9 @@ pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
         env.push(c(&format!("TERMCAP=/{IN_JAIL}/termcap"))?);
         env.push(c(&format!("TERMINFO=/{IN_JAIL}/terminfo"))?);
         env.push(c(&format!("PS1={} $ ", s.app_id))?);
+        // App jails have /tmp but no /var/tmp: without a recovery folder the
+        // toolbox's vi opens on an error that eats the first key.
+        env.push(c("NEXINIT=set recdir=/tmp/vi.recover")?);
     }
     // A workspace's shell starts in ~/work.
     let home = if ws { c(&format!("{}/work", s.home))? } else { c(s.home)? };
