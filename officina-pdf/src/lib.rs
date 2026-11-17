@@ -66,6 +66,11 @@ fn pt(v: i64) -> f64 {
     v as f64 / LU as f64
 }
 
+/// Fractional layout units to points.
+fn pt_f(v: f64) -> f64 {
+    v / LU as f64
+}
+
 fn rgb(c: u32) -> [f64; 3] {
     let f = |s: u32| ((c >> s) & 0xff) as f64 / 255.0;
     [f(16), f(8), f(0)]
@@ -235,7 +240,13 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
                     while k < r.glyphs.len() {
                         let dy = r.glyphs[k].dy;
                         c.push(Op::Rise(-pt(dy)));
-                        c.push(Op::TextMatrix([1.0, 0.0, 0.0, 1.0, pt(r.x + r.glyphs[k].x), ph - pt(r.y)]));
+                        // Turned runs (a turned shape's words): the matrix
+                        // turns, the pen starts along the turned baseline
+                        // (y flips: the page's y is up).
+                        let [ta, tb, tc, td] = r.turn.unwrap_or([1.0, 0.0, 0.0, 1.0]);
+                        let gx = r.glyphs[k].x as f64;
+                        let (sx, sy) = (r.x as f64 + ta * gx, r.y as f64 + tb * gx);
+                        c.push(Op::TextMatrix([ta, -tb, -tc, td, pt_f(sx), ph - pt_f(sy)]));
                         let x0 = r.glyphs[k].x;
                         let mut pen = 0.0f64;
                         let mut parts: Vec<TjPart> = Vec::new();

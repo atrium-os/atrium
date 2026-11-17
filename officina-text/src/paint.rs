@@ -35,6 +35,10 @@ pub struct GlyphRun {
     pub y: i64,
     pub glyphs: Vec<PaintGlyph>,
     pub text: String,
+    /// Turned about the origin (a turned shape's words): a point (u, v)
+    /// from the origin of the upright run lands at origin + (a u + c v,
+    /// b u + d v), y down. Glyph offsets stay along the upright baseline.
+    pub turn: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,12 +161,22 @@ fn draw_shape(out: &mut Vec<Item>, doc: &TextDoc, cache: &mut LayoutCache, fonts
             crate::model::TextAnchor::Bottom => room - total,
         }
         .max(0);
+        let mut words = Vec::new();
         for (p, l) in sd.paras.iter().zip(&lays) {
             for li in 0..l.lines.len() {
-                line(out, doc, fonts, l, li, &p.text, x + il, ty, None);
+                line(&mut words, doc, fonts, l, li, &p.text, x + il, ty, None);
                 ty += l.lines[li].height;
             }
         }
+        // Laid out upright about the middle, then turned with the shape
+        // (a flip doesn't mirror words; flipped upside down, they turn
+        // half round, as Office draws them).
+        let det = m[0] * m[3] - m[1] * m[2];
+        let t = if det >= 0.0 { m[1].atan2(m[0]) } else { (-m[2]).atan2(m[3]) };
+        if t.abs() > 1e-6 {
+            turn_items(&mut words, t, cx as f64, cy as f64);
+        }
+        out.extend(words);
     }
     if depth < crate::model::MAX_GROUP_DEPTH {
         for kid in &sd.kids {
@@ -170,6 +184,34 @@ fn draw_shape(out: &mut Vec<Item>, doc: &TextDoc, cache: &mut LayoutCache, fonts
             let (kw, kh) = (f(kid.w, w).max(1.0), f(kid.h, h).max(1.0));
             let km = place(m, &kid.shape, f(kid.x, w), f(kid.y, h), kw, kh);
             draw_shape(out, doc, cache, fonts, &kid.shape, &km, kw as i64, kh as i64, depth + 1);
+        }
+    }
+}
+
+/// Turns words laid out upright by `t` radians (clockwise on the page)
+/// about (`cx`, `cy`): runs keep their glyphs and take a turn, rectangles
+/// (underlines, highlights) become turned outlines.
+fn turn_items(items: &mut [Item], t: f64, cx: f64, cy: f64) {
+    let (sin, cos) = t.sin_cos();
+    let at = |x: i64, y: i64| {
+        let (u, v) = (x as f64 - cx, y as f64 - cy);
+        ((cx + cos * u - sin * v).round() as i64, (cy + sin * u + cos * v).round() as i64)
+    };
+    for it in items.iter_mut() {
+        match it {
+            Item::Glyphs(r) => {
+                (r.x, r.y) = at(r.x, r.y);
+                r.turn = Some([cos, sin, -sin, cos]);
+            }
+            Item::Rect { x, y, w, h, color } => {
+                let c = [at(*x, *y), at(*x + *w, *y), at(*x + *w, *y + *h), at(*x, *y + *h)];
+                let mut cmds = vec![PathCmd::Move(c[0].0, c[0].1)];
+                cmds.extend(c[1..].iter().map(|&(a, b)| PathCmd::Line(a, b)));
+                cmds.push(PathCmd::Close);
+                *it = Item::Path { cmds, fill: Some(*color), line: None };
+            }
+            // Links and marks keep their upright boxes round the middle.
+            _ => {}
         }
     }
 }
@@ -445,7 +487,7 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
         }
         let x0 = pen;
         let first = i;
-        let mut run = GlyphRun { face, size: size_lu(f), color: f.color, x: left + x0, y: baseline, glyphs: Vec::new(), text: String::new() };
+        let mut run = GlyphRun { face, size: size_lu(f), color: f.color, x: left + x0, y: baseline, glyphs: Vec::new(), text: String::new(), turn: None };
         let mut last_cluster = None;
         while i < gl.len() && gl[i].face == face && gl[i].fmt == fmt {
             let g = gl[i];
@@ -522,7 +564,7 @@ fn line(out: &mut Vec<Item>, doc: &TextDoc, fonts: &dyn Fonts, l: &ParaLayout, l
                 // On a grid from the paragraph's edge, so leaders line up.
                 let pitch = (g.adv * 2).max(crate::LU);
                 let mut x = (a + pitch / 2 + pitch - 1) / pitch * pitch;
-                let mut run = GlyphRun { face: g.face, size, color: f.color, x: left + x, y: baseline, glyphs: Vec::new(), text: String::new() };
+                let mut run = GlyphRun { face: g.face, size, color: f.color, x: left + x, y: baseline, glyphs: Vec::new(), text: String::new(), turn: None };
                 let origin = x;
                 while x + g.adv <= b - pitch / 2 {
                     let n = run.text.len() as u32;
@@ -547,7 +589,7 @@ fn runs(out: &mut Vec<Item>, fonts: &dyn Fonts, text: &str, fmt: &CharFormat, x:
     while i < glyphs.len() {
         let face = glyphs[i].face;
         let start = pen;
-        let mut run = GlyphRun { face, size, color: fmt.color, x: x + start, y: baseline, glyphs: Vec::new(), text: String::new() };
+        let mut run = GlyphRun { face, size, color: fmt.color, x: x + start, y: baseline, glyphs: Vec::new(), text: String::new(), turn: None };
         while i < glyphs.len() && glyphs[i].face == face {
             let g = glyphs[i];
             let first = i == 0 || glyphs[i - 1].cluster != g.cluster;
@@ -689,6 +731,48 @@ mod tests {
         let ti = items.iter().position(|i| matches!(i, Item::Glyphs(r) if r.text == "Inside")).unwrap();
         let pi = items.iter().position(|i| matches!(i, Item::Path { .. })).unwrap();
         assert!(ti > pi);
+    }
+
+    #[test]
+    fn a_turned_shapes_words_turn_with_it() {
+        use crate::model::{Geom, Para, ShapeData};
+        let mut d = TextDoc::new();
+        let u = d.attrs.intern(CharAttrs { underline: Some(true), ..Default::default() });
+        let shape = |d: &mut TextDoc, rot: i32, flip_v: bool| {
+            let mut sd = ShapeData::new(Geom::preset("rect"));
+            sd.rot = rot;
+            sd.flip_v = flip_v;
+            let mut p = Para::new(d.new_id(), "Turned", 0);
+            p.runs = vec![(0, u)];
+            sd.paras.push(p);
+            d.shapes.add(sd).unwrap()
+        };
+        let (up, quarter, flipped) = (shape(&mut d, 0, false), shape(&mut d, 90 * 60_000, false), shape(&mut d, 0, true));
+        let fonts = FixedFonts;
+        let mut cache = LayoutCache::default();
+        let items = |d: &TextDoc, cache: &mut LayoutCache, id: u32| {
+            let mut out = Vec::new();
+            shape_items(&mut out, d, cache, &fonts, id, 0, 0, 20_000, 10_000);
+            out
+        };
+        let run = |v: &[Item]| v.iter().find_map(|i| if let Item::Glyphs(r) = i { Some(r.clone()) } else { None }).unwrap();
+        let a = items(&d, &mut cache, up);
+        let r0 = run(&a);
+        assert_eq!(r0.turn, None);
+        assert!(a.iter().any(|i| matches!(i, Item::Rect { .. })), "an upright underline");
+        // A quarter turn clockwise about the middle (10000, 5000).
+        let b = items(&d, &mut cache, quarter);
+        let r1 = run(&b);
+        let t = r1.turn.unwrap();
+        assert!(t[0].abs() < 1e-9 && (t[1] - 1.0).abs() < 1e-9 && (t[2] + 1.0).abs() < 1e-9, "{t:?}");
+        let (u, v) = (r0.x - 10_000, r0.y - 5_000);
+        assert!((r1.x - (10_000 - v)).abs() <= 1 && (r1.y - (5_000 + u)).abs() <= 1, "({}, {}) from ({}, {})", r1.x, r1.y, r0.x, r0.y);
+        assert_eq!(r1.glyphs, r0.glyphs, "the glyphs keep their upright offsets");
+        assert!(!b.iter().any(|i| matches!(i, Item::Rect { .. })), "the underline turns too");
+        // Flipped upside down: words half round, not mirrored.
+        let r2 = run(&items(&d, &mut cache, flipped));
+        let t = r2.turn.unwrap();
+        assert!((t[0] + 1.0).abs() < 1e-9 && t[1].abs() < 1e-9, "{t:?}");
     }
 
     #[test]

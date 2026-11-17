@@ -3288,9 +3288,14 @@ odt 52/52, floats 8/8, headers 4/4, slides 84/84).
   is picked by a click (framed) and dragged to where it is let go (a drop
   caret shows the place; one undoable Move; not while changes are tracked,
   and not between a table and the body).
-- **Turned words** wait on Fresco drawing turned glyph runs; a Fresco
-  thread was asked for it on 2026-11-17, and Write's shape text and
-  Slides' turned frames switch over when it lands.
+- **Turned words** (2026-11-17, on Fresco's turned glyph runs, 1f7273b):
+  a shape's words are laid out upright about its middle, then turned with
+  it: each run's origin turned about the middle and the run given the
+  turn (`GlyphRun::turn`, Pergola's `Node::Glyphs { turn }`), underlines
+  and highlights becoming turned outlines. A flip doesn't mirror words;
+  flipped upside down they turn half round, as Office draws them. The PDF
+  writes the turn in the text matrix. Slides' turned frames turn their
+  runs the same way (a mirrored group keeps them upright).
 - **Adjust handles** (same day): the standard's handle definitions
   (`ahXY`/`ahPolar`, 243 handles over the presets) are read with the
   shapes; a picked floating shape shows them as yellow dots. Dragging one

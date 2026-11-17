@@ -334,16 +334,26 @@ pub fn nodes(deck: &Deck, deck_key: u64, items: &[DrawItem], at: Place, scale: f
             }
             DrawItem::Text { xf, items, .. } => {
                 let m = draw::mul(&base, xf);
-                // Glyph runs are drawn upright at their transformed origin
-                // (turned text keeps its place, not its angle, for now).
+                // Turned frames turn their runs about each run's origin
+                // (Fresco's turned glyph runs); a mirrored map (a flipped
+                // group) keeps them upright at their place.
                 let s = (m[0] * m[0] + m[1] * m[1]).sqrt();
+                let det = m[0] * m[3] - m[1] * m[2];
+                let turned = det > 0.0 && s > 0.0 && (m[1].abs() > 1e-9 || m[0] < 0.0);
+                let turn = turned.then(|| [(m[0] / s) as f32, (m[1] / s) as f32, (m[2] / s) as f32, (m[3] / s) as f32]);
                 for t in items {
                     match t {
                         Item::Glyphs(r) => {
                             let Some(face) = faces.and_then(|fs| fs.get(r.face as usize)) else { continue };
                             let (x, y) = draw::apply(&m, r.x as f64, r.y as f64);
                             let run: Vec<PGlyph> = r.glyphs.iter().map(|g| PGlyph { id: g.id, dx: (g.x as f64 * s) as f32, dy: (g.dy as f64 * s) as f32 }).collect();
-                            out.push(Node::Glyphs { origin: Point::new(x as f32, y as f32), face: face.clone(), size: (r.size as f64 * s) as f32, color: rgb(r.color), glyphs: Arc::from(run), turn: None });
+                            out.push(Node::Glyphs { origin: Point::new(x as f32, y as f32), face: face.clone(), size: (r.size as f64 * s) as f32, color: rgb(r.color), glyphs: Arc::from(run), turn });
+                        }
+                        Item::Rect { x, y, w, h, color } if turned => {
+                            // An underline or highlight, turned with the words.
+                            let c = [(*x, *y), (*x + *w, *y), (*x + *w, *y + *h), (*x, *y + *h)].map(|(a, b)| draw::apply(&m, a as f64, b as f64));
+                            let p = PathData::new().move_to(c[0].0 as f32, c[0].1 as f32).line_to(c[1].0 as f32, c[1].1 as f32).line_to(c[2].0 as f32, c[2].1 as f32).line_to(c[3].0 as f32, c[3].1 as f32).close();
+                            out.extend(Shape::new(p).fill(Paint::Solid(rgb(*color))).fills().into_iter().map(|f| Node::Fill(Arc::new(f))));
                         }
                         Item::Rect { x, y, w, h, color } => {
                             let (px, py) = draw::apply(&m, *x as f64, *y as f64);
@@ -388,6 +398,27 @@ mod tests {
             e.write_header().unwrap().write_image_data(&px).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn a_turned_frames_words_are_turned_runs() {
+        use officina_text::paint::{GlyphRun, Item, PaintGlyph};
+        let deck = Deck::new();
+        let g = PaintGlyph { id: 36, x: 0, dy: 0, text: 0..1 };
+        let run = Item::Glyphs(GlyphRun { face: 0, size: 2_000, color: 0, x: 100, y: 200, glyphs: vec![g], text: "A".into(), turn: None });
+        let ul = Item::Rect { x: 100, y: 220, w: 500, h: 10, color: 0 };
+        let quarter = [0.0, 1.0, -1.0, 0.0, 5_000.0, 1_000.0];
+        let items = [DrawItem::Text { xf: quarter, shape: 1, items: vec![run.clone(), ul.clone()] }, DrawItem::Text { xf: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], shape: 2, items: vec![run, ul] }];
+        let mut out = Vec::new();
+        nodes(&deck, 1, &items, Place { k: 1.0, x: 0.0, y: 0.0 }, 1.0, &mut out);
+        let turns: Vec<Option<[f32; 4]>> = out.iter().filter_map(|n| if let Node::Glyphs { turn, .. } = n { Some(*turn) } else { None }).collect();
+        if turns.is_empty() {
+            return; // no system faces here
+        }
+        assert_eq!(turns, [Some([0.0, 1.0, -1.0, 0.0]), None]);
+        // The turned underline is an outline; the upright one a rectangle.
+        assert_eq!(out.iter().filter(|n| matches!(n, Node::Rect { .. })).count(), 1);
+        assert!(out.iter().any(|n| matches!(n, Node::Fill(_))));
     }
 
     #[test]
