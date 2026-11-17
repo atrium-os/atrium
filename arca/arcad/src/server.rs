@@ -261,7 +261,7 @@ impl State {
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         if !matches!(
             op,
-            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR
+            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR
         ) {
             return reply(status::DENIED);
         }
@@ -401,6 +401,47 @@ impl State {
                 }));
                 *item = Some(m.id);
                 ok(m.id.0.to_vec())
+            }
+            op::KEEP_FOR => {
+                let h = field!(r.array::<16>());
+                let class = rep!(class_for_app(field!(r.u8())));
+                let account = field!(r.str(caps::ACCOUNT)).to_string();
+                let n = field!(r.u8()) as usize;
+                if n == 0 || n > op::KEEP_FOR_MAX {
+                    return malformed();
+                }
+                let mut endpoints = Vec::with_capacity(n);
+                for _ in 0..n {
+                    endpoints.push(field!(crate::proto::read_endpoint_any(&mut r)));
+                }
+                field!(r.end());
+                let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
+                // The field's handle, for exactly this app (a mismatch burns it).
+                let Some(e) = self.handles.take(&h, user, PERSONA, me) else { return reply(status::DENIED) };
+                let value = match e.source {
+                    crate::handles::Source::Pending(v) => v,
+                    crate::handles::Source::Item(src) => {
+                        *item = Some(src);
+                        tri!(store.release(&src, &who, uv())).1
+                    }
+                };
+                let persona = app_persona(publisher, app_id);
+                let mut out = Vec::with_capacity(16 * n);
+                for ep in endpoints {
+                    let m = tri!(store.add(NewItem {
+                        persona: &persona,
+                        recipient: ep,
+                        class,
+                        kind: Kind::Password,
+                        provenance: Provenance::AppMinted,
+                        account: &account,
+                        scope: b"",
+                        value: value.as_ref(),
+                    }));
+                    *item = Some(m.id);
+                    out.extend_from_slice(&m.id.0);
+                }
+                ok(out)
             }
             op::LIST | op::LIST_FOR => {
                 let (persona, recipient) = if op == op::LIST_FOR {

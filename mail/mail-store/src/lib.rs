@@ -31,6 +31,8 @@ pub use outbox::{retry_after, Outgoing, SendState};
 pub mod search;
 pub mod senders;
 pub mod certs;
+pub mod config;
+pub use config::{AccountConfig, Protocol, Reached, Server};
 pub mod later;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
@@ -46,10 +48,10 @@ pub type Hash = [u8; 32];
 
 // Tables. Values are postcard.
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-const ACCOUNTS: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
+pub(crate) const ACCOUNTS: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
 pub(crate) const FOLDERS: TableDefinition<u32, &[u8]> = TableDefinition::new("folders");
 /// (account, folder name) → folder id.
-const FOLDER_NAMES: TableDefinition<(u32, &str), u32> = TableDefinition::new("folder_names");
+pub(crate) const FOLDER_NAMES: TableDefinition<(u32, &str), u32> = TableDefinition::new("folder_names");
 pub(crate) const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
 /// (folder, uid) → (msg, flags).
 pub(crate) const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new("locations");
@@ -61,7 +63,7 @@ const SERVER_IDS: TableDefinition<(u32, &str), u64> = TableDefinition::new("serv
 /// pictures without asking (§7.4; only offered for verified senders).
 const SENDER_PICTURES: TableDefinition<(u32, &str), u8> = TableDefinition::new("sender_pictures");
 /// account → its identities (postcard `Vec<Identity>`), the default first.
-const IDENTITIES: TableDefinition<u32, &[u8]> = TableDefinition::new("identities");
+pub(crate) const IDENTITIES: TableDefinition<u32, &[u8]> = TableDefinition::new("identities");
 
 /// Flags as bits; keywords are not kept yet.
 pub mod flag {
@@ -264,6 +266,7 @@ impl Store {
             tx.open_table(senders::CONTACTS)?;
             tx.open_table(senders::SETTINGS)?;
             tx.open_table(senders::SYNC_STATE)?;
+            tx.open_table(config::CONFIG)?;
             tx.open_table(senders::HELD)?;
             tx.open_table(senders::LANES)?;
             tx.open_table(certs::CERTS)?;
