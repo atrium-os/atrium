@@ -2,9 +2,9 @@
  * tessera_crypt_ocf.c — the kernel backend for tessera/crypt.h over OCF
  * (docs/spec/tessera-encryption.md §5.1, E1).
  *
- * Three OCF sessions, made once at module load with no key (each request
- * carries its own in crp_cipher_key, which ossl(4), armv8crypto/aesni and
- * cryptosoft all honour):
+ * Sets of three OCF sessions, made once at module load with no key (each
+ * request carries its own in crp_cipher_key, which ossl(4), armv8crypto/aesni
+ * and cryptosoft all honour):
  *
  *   - AES-256-GCM, 12-byte IV, 16-byte tag (XAES's inner AEAD; the key is
  *     the per-nonce derived Kx, so a per-request key is the only way);
@@ -17,6 +17,17 @@
  * Requests are dispatched and waited for (the fs calls seal/open from
  * contexts that may sleep), so the backend works with a synchronous or an
  * asynchronous driver.
+ *
+ * ★ ONE REQUEST PER SESSION AT A TIME. armv8crypto and aesni apply a
+ * request's crp_cipher_key by rewriting the SESSION's key schedule
+ * (armv8_crypto_cipher_setup(ses, ...)), unlocked, and then encrypt from
+ * it. Every XAES unit has its own derived key, so two threads sharing a
+ * session seal or open under each other's key: a node written that way
+ * carries a tag no reader can reproduce, and an open of a good node fails.
+ * Measured as EAUTH on metadata the writer itself had just written and on
+ * pack fronts nothing overwrote, only under concurrent load. So the
+ * sessions come in slots (one per CPU, capped), each slot held under its
+ * own sx lock for the whole request.
  *
  * Before installing, the backend runs the XAES-256-GCM (c2sp.org) and
  * XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha §A.3.1) known answers through
@@ -31,6 +42,9 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
+#include <sys/sx.h>
+#include <sys/smp.h>
+#include <sys/pcpu.h>
 #include <sys/libkern.h>
 
 #include <opencrypto/cryptodev.h>
@@ -42,8 +56,50 @@
 
 static MALLOC_DEFINE(M_TESSERA_CRYPT, "tessera_crypt", "Tessera OCF buffers");
 
-static crypto_session_t ocf_gcm, ocf_cp, ocf_cbc;
+#define OCF_SLOTS_MAX 16
+
+struct ocf_slot {
+	struct sx        lock;
+	crypto_session_t gcm, cp, cbc;
+};
+
+static struct ocf_slot ocf_slots[OCF_SLOTS_MAX];
+static int ocf_nslots;
 static int ocf_ready;
+
+enum { OCF_GCM, OCF_CP, OCF_CBC };
+
+/* A free slot, locked: try each from this CPU's, else wait on this CPU's. */
+static struct ocf_slot *
+ocf_slot_get(void)
+{
+	int n = ocf_nslots, start = (int)(curcpu % (u_int)n);
+
+	for (int i = 0; i < n; i++) {
+		struct ocf_slot *sl = &ocf_slots[(start + i) % n];
+
+		if (sx_try_xlock(&sl->lock))
+			return (sl);
+	}
+	sx_xlock(&ocf_slots[start].lock);
+	return (&ocf_slots[start]);
+}
+
+static void
+ocf_slot_put(struct ocf_slot *sl)
+{
+	sx_xunlock(&sl->lock);
+}
+
+static crypto_session_t
+ocf_slot_session(const struct ocf_slot *sl, int which)
+{
+	switch (which) {
+	case OCF_GCM: return (sl->gcm);
+	case OCF_CP:  return (sl->cp);
+	default:      return (sl->cbc);
+	}
+}
 
 struct ocf_wait {
 	struct mtx lock;
@@ -103,8 +159,9 @@ ocf_aes256_ecb(const uint8_t key[32], const uint8_t *in, uint8_t *out,
 
 	if (!ocf_ready)
 		return (TESSERA_ENOTIMPL);
+	struct ocf_slot *sl = ocf_slot_get();
 	for (size_t i = 0; i < nblocks && error == 0; i++) {
-		struct cryptop *crp = crypto_getreq(ocf_cbc, M_WAITOK);
+		struct cryptop *crp = crypto_getreq(sl->cbc, M_WAITOK);
 
 		memcpy(blk, in + 16 * i, 16);
 		crp->crp_op = CRYPTO_OP_ENCRYPT;
@@ -119,23 +176,26 @@ ocf_aes256_ecb(const uint8_t key[32], const uint8_t *in, uint8_t *out,
 		if (error == 0)
 			memcpy(out + 16 * i, blk, 16);
 	}
+	ocf_slot_put(sl);
 	explicit_bzero(blk, sizeof blk);
 	return (error == 0 ? TESSERA_OK : TESSERA_EIO);
 }
 
-static crypto_session_t
+/* Which slot session serves `alg`; -1 for none. */
+static int
 ocf_aead_session(uint32_t alg)
 {
 	switch (alg) {
-	case TESSERA_AEAD96_AES_256_GCM:       return (ocf_gcm);
-	case TESSERA_AEAD96_CHACHA20_POLY1305: return (ocf_cp);
-	default:                               return (NULL);
+	case TESSERA_AEAD96_AES_256_GCM:       return (OCF_GCM);
+	case TESSERA_AEAD96_CHACHA20_POLY1305: return (OCF_CP);
+	default:                               return (-1);
 	}
 }
 
-/* One AEAD request over tmp = payload[len] | tag[16]. */
+/* One AEAD request over tmp = payload[len] | tag[16], on a slot of its own
+ * for the whole request (see the top of this file). */
 static int
-ocf_aead(crypto_session_t s, int op, const uint8_t key[32],
+ocf_aead(int which, int op, const uint8_t key[32],
     const uint8_t nonce[12], const uint8_t *aad, size_t aad_len,
     uint8_t *tmp, size_t len)
 {
@@ -144,7 +204,8 @@ ocf_aead(crypto_session_t s, int op, const uint8_t key[32],
 
 	if (len > INT_MAX - 16 || aad_len > INT_MAX)
 		return (EFBIG);
-	crp = crypto_getreq(s, M_WAITOK);
+	struct ocf_slot *sl = ocf_slot_get();
+	crp = crypto_getreq(ocf_slot_session(sl, which), M_WAITOK);
 	crp->crp_op = op;
 	crp->crp_flags = CRYPTO_F_IV_SEPARATE;
 	memcpy(crp->crp_iv, nonce, 12);
@@ -157,6 +218,7 @@ ocf_aead(crypto_session_t s, int op, const uint8_t key[32],
 	crp->crp_digest_start = (int)len;
 	error = ocf_run(crp);
 	crypto_freereq(crp);
+	ocf_slot_put(sl);
 	return (error);
 }
 
@@ -165,13 +227,13 @@ ocf_seal(uint32_t alg, const uint8_t key[32], const uint8_t nonce[12],
     const uint8_t *aad, size_t aad_len, const uint8_t *pt, size_t len,
     uint8_t *ct, uint8_t tag[16])
 {
-	crypto_session_t s = ocf_aead_session(alg);
+	int s = ocf_aead_session(alg);
 	uint8_t *tmp;
 	int error;
 
 	if (!ocf_ready)
 		return (TESSERA_ENOTIMPL);
-	if (s == NULL)
+	if (s < 0)
 		return (TESSERA_EINCOMPAT);
 	tmp = malloc(len + 16, M_TESSERA_CRYPT, M_WAITOK);
 	if (len > 0)
@@ -193,13 +255,13 @@ ocf_open(uint32_t alg, const uint8_t key[32], const uint8_t nonce[12],
     const uint8_t *aad, size_t aad_len, const uint8_t *ct, size_t len,
     const uint8_t tag[16], uint8_t *pt)
 {
-	crypto_session_t s = ocf_aead_session(alg);
+	int s = ocf_aead_session(alg);
 	uint8_t *tmp;
 	int error;
 
 	if (!ocf_ready)
 		return (TESSERA_ENOTIMPL);
-	if (s == NULL)
+	if (s < 0)
 		return (TESSERA_EINCOMPAT);
 	tmp = malloc(len + 16, M_TESSERA_CRYPT, M_WAITOK);
 	if (len > 0)
@@ -341,10 +403,16 @@ ocf_newsession(crypto_session_t *s, int mode, int alg, int ivlen, int mlen)
 static void
 ocf_free_sessions(void)
 {
-	if (ocf_gcm != NULL) crypto_freesession(ocf_gcm);
-	if (ocf_cp != NULL)  crypto_freesession(ocf_cp);
-	if (ocf_cbc != NULL) crypto_freesession(ocf_cbc);
-	ocf_gcm = ocf_cp = ocf_cbc = NULL;
+	for (int i = 0; i < ocf_nslots; i++) {
+		struct ocf_slot *sl = &ocf_slots[i];
+
+		if (sl->gcm != NULL) crypto_freesession(sl->gcm);
+		if (sl->cp != NULL)  crypto_freesession(sl->cp);
+		if (sl->cbc != NULL) crypto_freesession(sl->cbc);
+		sl->gcm = sl->cp = sl->cbc = NULL;
+		sx_destroy(&sl->lock);
+	}
+	ocf_nslots = 0;
 }
 
 static const char *
@@ -358,16 +426,25 @@ ocf_driver(crypto_session_t s)
 int
 tessera_crypt_ocf_install(void)
 {
-	int error, kat;
+	int error = 0, kat, n;
 
-	error = ocf_newsession(&ocf_gcm, CSP_MODE_AEAD, CRYPTO_AES_NIST_GCM_16,
-	    12, 16);
-	if (error == 0)
-		error = ocf_newsession(&ocf_cp, CSP_MODE_AEAD,
-		    CRYPTO_CHACHA20_POLY1305, 12, 16);
-	if (error == 0)
-		error = ocf_newsession(&ocf_cbc, CSP_MODE_CIPHER,
-		    CRYPTO_AES_CBC, 16, 0);
+	n = mp_ncpus < 1 ? 1 : mp_ncpus > OCF_SLOTS_MAX ? OCF_SLOTS_MAX :
+	    mp_ncpus;
+	for (int i = 0; i < n && error == 0; i++) {
+		struct ocf_slot *sl = &ocf_slots[i];
+
+		memset(sl, 0, sizeof *sl);
+		sx_init(&sl->lock, "tessera_ocf_slot");
+		ocf_nslots = i + 1;
+		error = ocf_newsession(&sl->gcm, CSP_MODE_AEAD,
+		    CRYPTO_AES_NIST_GCM_16, 12, 16);
+		if (error == 0)
+			error = ocf_newsession(&sl->cp, CSP_MODE_AEAD,
+			    CRYPTO_CHACHA20_POLY1305, 12, 16);
+		if (error == 0)
+			error = ocf_newsession(&sl->cbc, CSP_MODE_CIPHER,
+			    CRYPTO_AES_CBC, 16, 0);
+	}
 	if (error != 0) {
 		printf("tessera_fs: no OCF driver for sealed volumes (%d); "
 		    "sealed mounts disabled\n", error);
@@ -383,8 +460,9 @@ tessera_crypt_ocf_install(void)
 		tessera_crypt_ocf_remove();
 		return (EIO);
 	}
-	printf("tessera_fs: sealed volumes ready (OCF: %s, %s)\n",
-	    ocf_driver(ocf_gcm), ocf_driver(ocf_cp));
+	printf("tessera_fs: sealed volumes ready (OCF: %s, %s; %d session "
+	    "slots)\n", ocf_driver(ocf_slots[0].gcm), ocf_driver(ocf_slots[0].cp),
+	    ocf_nslots);
 	return (0);
 }
 
