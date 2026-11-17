@@ -17,7 +17,8 @@ use pergola::interaction::ScrollKind;
 use pergola::node::Node;
 use pergola::theme::{font, radius, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::widgets::{Button, CodeGrid, CodeView};
+use pergola::text_edit::TextEdit;
+use pergola::widgets::{Button, CodeGrid, CodeView, TextField};
 use pergola::{Color, Mutable, TextStyle};
 use portcullis_ipc::WorkspaceInfo;
 
@@ -55,6 +56,14 @@ pub enum Act {
     Refresh,
     /// Next or previous tab.
     CycleTab(bool),
+    /// The New project form.
+    NewProject,
+    CancelNew,
+    Template(usize),
+    /// Make the project (the loop puts the form's name in).
+    Create(String),
+    /// Run `cargo atrium check` again.
+    Check,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,6 +71,7 @@ pub enum Panel {
     #[default]
     Output,
     Problems,
+    Composition,
 }
 
 /// A tab as the bar shows it.
@@ -111,6 +121,14 @@ pub struct State {
     /// Line and column of the caret, 1-based.
     pub caret: (usize, usize),
     pub note: Option<(String, bool)>,
+    /// The project folder (in `work`) of the active file: tasks and the
+    /// composition panel are about it.
+    pub project: String,
+    pub composition: Option<crate::composition::Composition>,
+    /// New project: shown, its templates (name, about), the one chosen.
+    pub creating: bool,
+    pub templates: Vec<(String, String)>,
+    pub template: usize,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -152,6 +170,8 @@ pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
 
 pub struct ArtifexView {
     pub state: Mutable<State>,
+    /// New project's name field.
+    pub new_name: Mutable<TextEdit>,
     pub doc: Mutable<Option<DocCells>>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
@@ -232,6 +252,8 @@ impl View for ArtifexView {
         if s.ws.is_some() {
             ctx.key(41);
             Button::ghost("Terminal").at(w - em(110.0), mid - em(16.0)).width(em(100.0)).on_click(pressed(q, Act::Terminal)).render(ctx);
+            ctx.key(42);
+            Button::ghost("New project").at(w - em(240.0), mid - em(16.0)).width(em(124.0)).on_click(plain(q, Act::NewProject)).render(ctx);
             if let Some(g) = &s.git {
                 if let Some(b) = &g.branch {
                     let mut label = format!("⎇ {b}");
@@ -241,7 +263,7 @@ impl View for ArtifexView {
                     if g.behind > 0 {
                         label.push_str(&format!(" ↓{}", g.behind));
                     }
-                    text(ctx, w - em(120.0) - em(8.0 * label.chars().count() as f32), mid, &label, type_size::SM, Weight::Medium, t.text_secondary());
+                    text(ctx, w - em(250.0) - em(8.0 * label.chars().count() as f32), mid, &label, type_size::SM, Weight::Medium, t.text_secondary());
                 }
             }
         }
@@ -365,7 +387,11 @@ impl View for ArtifexView {
             ctx.add(Node::Rect { rect: Rect::new(side_w(), py, w - side_w(), panel_h()), fill: t.bg_surface(), radius: 0.0 });
             ctx.add(Node::Rect { rect: Rect::new(side_w(), py, w - side_w(), 1.0), fill: t.border_default(), radius: 0.0 });
             let mut px = side_w() + em(8.0);
-            for (i, (p, label)) in [(Panel::Output, "Output".to_string()), (Panel::Problems, format!("Problems ({})", s.problems.len()))].into_iter().enumerate() {
+            let mut tabs = vec![(Panel::Output, "Output".to_string()), (Panel::Problems, format!("Problems ({})", s.problems.len()))];
+            if s.composition.is_some() {
+                tabs.push((Panel::Composition, "Composition".to_string()));
+            }
+            for (i, (p, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
                 let bw = em(24.0 + 7.5 * label.len() as f32);
                 if s.panel == p {
@@ -385,6 +411,20 @@ impl View for ArtifexView {
                     let all: Vec<&str> = s.output.lines().collect();
                     for (i, l) in all.iter().skip(all.len().saturating_sub(lines_fit)).enumerate() {
                         mono(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());
+                    }
+                }
+                Panel::Composition => {
+                    let Some(c) = &s.composition else { return };
+                    ctx.key(4020);
+                    Button::ghost("Check again").at(w - em(200.0), py + em(4.0)).width(em(110.0)).on_click(plain(q, Act::Check)).render(ctx);
+                    for (i, (lvl, l)) in c.lines().iter().take(lines_fit).enumerate() {
+                        let color = match lvl {
+                            Some(crate::composition::Level::Error) => t.danger_fg(),
+                            Some(crate::composition::Level::Warning) => t.warning_fg(),
+                            Some(crate::composition::Level::Note) => t.info_fg(),
+                            None => t.text_primary(),
+                        };
+                        text(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), type_size::SM, Weight::Regular, color);
                     }
                 }
                 Panel::Problems => {
@@ -440,6 +480,44 @@ impl View for ArtifexView {
         }
         let lw = em(6.5) * left.chars().count() as f32;
         text(ctx, w - lw - em(12.0), smid, &left, type_size::XS, Weight::Regular, t.text_secondary());
+
+        // New project.
+        if s.creating {
+            ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.scrim(), radius: 0.0 });
+            let cw = em(460.0).min(w - em(32.0));
+            let n = s.templates.len().max(1);
+            let ch = em(220.0) + n as f32 * em(40.0);
+            let (cx, cy) = ((w - cw) / 2.0, ((h - ch) / 2.0).max(em(16.0)));
+            ctx.key(7000);
+            ctx.push(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: t.bg_elevated(), radius: radius::MD });
+            text(ctx, cx + em(20.0), cy + em(28.0), "New project", type_size::LG, Weight::Semibold, t.text_primary());
+            text(ctx, cx + em(20.0), cy + em(52.0), "Made from an Atrium SDK template, in a folder of work.", type_size::SM, Weight::Regular, t.text_secondary());
+            let mut y = cy + em(72.0);
+            if s.templates.is_empty() {
+                text(ctx, cx + em(20.0), y + em(18.0), "Asking the workspace for templates…", type_size::SM, Weight::Regular, t.text_tertiary());
+            }
+            for (i, (name, about)) in s.templates.iter().enumerate() {
+                ctx.key(7100 + i as u64);
+                let id = ctx.push(Node::Rect { rect: Rect::new(cx + em(12.0), y, cw - em(24.0), em(36.0)),
+                    fill: if s.template == i { t.selection_idle() } else { Color::TRANSPARENT }, radius: radius::SM });
+                ctx.on_click(id, plain(q, Act::Template(i)));
+                text(ctx, cx + em(24.0), y + em(18.0), name, type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, cx + em(110.0), y + em(18.0), &fit(about, cw - em(130.0), type_size::SM), type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.pop();
+                y += em(40.0);
+            }
+            y += em(12.0);
+            text(ctx, cx + em(20.0), y, "Folder name", type_size::SM, Weight::Medium, t.text_secondary());
+            y += em(14.0);
+            ctx.key(7200);
+            TextField::new(self.new_name.clone()).placeholder("e.g. my-app").at(cx + em(20.0), y).width(cw - em(40.0)).render(ctx);
+            y += em(52.0);
+            ctx.key(7201);
+            Button::primary("Create").at(cx + cw - em(220.0), y).width(em(100.0)).on_click(plain(q, Act::Create(String::new()))).render(ctx);
+            ctx.key(7202);
+            Button::ghost("Cancel").at(cx + cw - em(110.0), y).width(em(90.0)).on_click(plain(q, Act::CancelNew)).render(ctx);
+            ctx.pop();
+        }
 
         // The workspace chooser, over everything.
         if s.choosing || (s.ws.is_none() && s.listed) {
