@@ -206,12 +206,41 @@ kernel's `arc4random_buf`.
   reserved for (`tessera_key_slot_t`).
 - It is constant-time in plain software, so CPUs without AES instructions are safe too.
 - The format has a suite byte, so a second suite can be added later. The candidate is
-  XAES-256-GCM (C2SP), which is faster on CPUs with AES instructions. Build step E0
-  measures both inside the kernel module (§13), and decision 3 picks.
+  XAES-256-GCM (C2SP), which is faster on CPUs with AES instructions. E0's numbers are
+  below.
 
 A sealed unit is `nonce[24] | ciphertext | tag[16]`. The AAD always starts with the
 volume uuid and a one-byte object kind, so no unit can be moved to another volume or
 reinterpreted as another kind.
+
+#### E0: what each suite costs
+
+Measured 2026-11-17 with `scripts/tessera-crypt-bench.sh` (atrium-tessera/bench/crypt):
+one core, sealing or opening one unit at a time with a fresh 24-byte nonce, every unit
+checked, after the c2sp XAES-256-GCM vectors and the draft-irtf-cfrg-xchacha A.3.1
+vector pass on every path. *sodium-ref* is the FreeBSD kernel KPI's own code (libsodium
+portable ChaCha20 and poly1305-donna from `sys/contrib`, at -O2); the *ossl* rows are
+OpenSSL's assembly, the code of the kernel `ossl(4)` driver. Userspace numbers: the
+kernel adds OCF dispatch and `fpu_kern` regions, which E1 measures in a VM.
+
+| MB/s, seal (open within 10%) | x86_64 cloud (Xeon 2.3 GHz, VAES, OpenSSL 3.0.13) 4 KiB / 64 KiB | Apple M4 Max (OpenSSL 3.6.2) 4 KiB / 64 KiB |
+|---|---|---|
+| XChaCha20-Poly1305, kernel KPI (sodium-ref) | 484 / 521 | 711 / 752 |
+| XChaCha20-Poly1305, ossl asm | 1626 / 3569 | 1863 / 2198 |
+| XAES-256-GCM, ossl asm | 4343 / 11705 | 5781 / 9187 |
+| AES-256-GCM, fixed key (ceiling, not usable) | 4524 / 11799 | 5883 / 9238 |
+| for scale: SHA-256 (content hashing), 64 KiB | 1837 | 3415 |
+
+What it means:
+
+- **The kernel KPI is out.** At 0.5 to 0.75 GB/s it would cost more than the content
+  hashing Tessera already does. Whichever suite, the kernel uses OCF and ossl (§10).
+- **XAES costs almost nothing over plain GCM** (1 to 2%), so its random 192-bit nonces
+  are free.
+- **XChaCha is slower than SHA-256 on the M4**, so it would be a second bottleneck. A
+  64 KiB chunk that is hashed and sealed runs at about 1.3 GB/s with XChaCha and 2.5 GB/s
+  with XAES on the M4 (1.2 and 1.55 GB/s on the x86 machine). On metadata-sized 4 KiB
+  units XAES is 2.7 to 3 times faster on both.
 
 ### 5.2 Superblock
 
@@ -502,11 +531,16 @@ passcode, and Curia says so when the persona is removed.
 - **Refusing sealed volumes without support.** Before the first sealed stick exists,
   atrium-capsa-fuse's Tessera backend and the loader's reader refuse any incompat bit
   they don't know. That is part of E1.
-- **Crypto code.** New kernel code is Rust by default (D2). The AEAD and KDFs come from
-  RustCrypto crates (`chacha20poly1305`, `hkdf`, `hmac`, `blake3` keyed mode), built
-  `no_std` into the kmod's Rust part like `tessera-decode`, with SIMD paths bracketed by
-  `fpu_kern_enter`, as the kmod's BLAKE3 NEON path already is. Argon2id runs only in
-  arcad.
+- **Crypto code** (revised after E0, §5.1). The kmod's Rust part is compiled file by
+  file with only `core` and the KPI crate, so it cannot take RustCrypto crates, and
+  writing our own AEAD is not an option. The kernel therefore uses FreeBSD's own crypto:
+  bulk AEAD through OCF (`crypto(9)`) on the `ossl(4)` driver, whose OpenSSL assembly
+  is what E0 measured, with a per-request key; subkey derivation (HChaCha20 from the
+  kernel's libsodium, or XAES's two AES blocks) beside it. The kernel's convenience KPI
+  `xchacha20_poly1305_encrypt()` is not used: it runs libsodium's portable ChaCha20 and
+  is 3 to 7 times slower (§5.1). Userspace tools (developer `mkfs`/`fsck` with a key
+  file, differential tests) use RustCrypto, and the two are tested against each other
+  and the published vectors. Argon2id runs only in arcad.
 - **Page cache.** Plaintext of open files is in memory while a group is unlocked. When a
   group locks at logout, the kernel flushes and invalidates that group's vnodes and
   pages before it drops GK. Anything still open makes the lock wait, and logout stops the

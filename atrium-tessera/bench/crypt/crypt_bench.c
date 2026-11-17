@@ -125,7 +125,7 @@ static void
 evp_seal(const EVP_CIPHER *c, uint8_t *out, const uint8_t *in, size_t n,
     const uint8_t *aad, size_t an, const uint8_t n12[12], const uint8_t key[32])
 {
-	int l;
+	int l = 0;
 	if (!EVP_EncryptInit_ex(ctx, c, NULL, key, n12) ||
 	    !EVP_EncryptUpdate(ctx, NULL, &l, aad, (int)an) ||
 	    !EVP_EncryptUpdate(ctx, out, &l, in, (int)n) ||
@@ -138,7 +138,7 @@ static int
 evp_open(const EVP_CIPHER *c, uint8_t *out, const uint8_t *in, size_t n,
     const uint8_t *aad, size_t an, const uint8_t n12[12], const uint8_t key[32])
 {
-	int l;
+	int l = 0;
 	if (!EVP_DecryptInit_ex(ctx, c, NULL, key, n12) ||
 	    !EVP_DecryptUpdate(ctx, NULL, &l, aad, (int)an) ||
 	    !EVP_DecryptUpdate(ctx, out, &l, in, (int)n) ||
