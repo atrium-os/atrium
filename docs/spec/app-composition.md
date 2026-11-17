@@ -1,7 +1,7 @@
 # Composing an app: workers, services and the SDK that makes it easy
 
-**Status:** proposal 2026-11-17, waiting for Shankar's review (§10, decisions
-C1–C10). Direction from Shankar, 2026-11-17: "artifex is probably the best way to do
+**Status:** accepted 2026-11-17 (Shankar: "yes, accepted", all §10 decisions
+C1–C10 as recommended). Nothing built yet. Direction from Shankar, 2026-11-17: "artifex is probably the best way to do
 all of this without overwhelming the developer - and we ensure through the
 fuzzing that we point out unsecure build patterns...with some practice and
 experience, command-line users can adapt to it to" (§6.1). Companion to [dev-tools.md](dev-tools.md). Nothing here is built yet.
