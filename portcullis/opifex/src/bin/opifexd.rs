@@ -4,12 +4,15 @@
 //! read-only questions). One JSON request per line, one answer per line; the
 //! caller's uid decides what it may ask (proto.rs). Runs as root, because it
 //! writes `/var/lib/atrium/apps`; it reads no archive itself (opifex-check
-//! does, sandboxed) and has no network.
+//! does, sandboxed) and has no network: `opifex-fetch`, a launched bundle with `net-fetch`, brings
+//! it bytes, which it checks (fetch.rs).
 //!
 //! Settings: `OPIFEX_SOCKET`, `OPIFEX_ROOT` (/var/lib/atrium), `OPIFEX_STATE`
 //! (/var/db/atrium/opifex), `OPIFEX_ROOT_TOML` (/etc/atrium/opifex/root.toml),
 //! `OPIFEX_CHECK` (/usr/local/libexec/opifex-check), `OPIFEX_SHEET_UID`
-//! (65042, the install sheet's uid, which may send `InstallApproved`).
+//! (65042, the install sheet's uid, which may send `InstallApproved`),
+//! `OPIFEX_FETCH` (how to start the fetcher, `portcullis launch --no-prompt
+//! org.atrium.opifex.fetch`), `OPIFEX_CATALOG_URL` (the first sync's base).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -81,6 +84,9 @@ fn main() {
         },
         trust: portcullis_trust::Trust::load(),
         require_content: opifex::app::require_content(std::path::Path::new(portcullis_trust::TRUST_CONFIG)),
+        fetch_cmd: std::env::var("OPIFEX_FETCH").map(|v| v.split_whitespace().map(String::from).collect())
+            .unwrap_or_else(|_| opifex::fetch::FETCH_CMD.iter().map(|s| s.to_string()).collect()),
+        catalog_url: std::env::var("OPIFEX_CATALOG_URL").unwrap_or_else(|_| opifex::fetch::CATALOG_URL.into()),
         sysroot: PathBuf::from("/"),
         lock: Mutex::new(()),
     });

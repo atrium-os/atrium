@@ -684,6 +684,39 @@ font on demand and a driver from a `nobody` device's notice.
   (arm64) 2026-11-17: 0 failed (the sheet as `_opifexsheet`, Not now, quiet repeat, Install
   recorded for the asker, forged request refused).
 
+### 14.5 C4 as built (2026-11-17)
+
+- `opifex-fetch` (`src/bin/opifex-fetch.rs`), installed as the system bundle
+  `org.atrium.opifex.fetch` (`scripts/opifex-fetch-bundle.sh`): one capability, `net-fetch`,
+  with `net-fetch-sites` set to GitHub Pages and Releases (`atrium-os.github.io`, `github.com`,
+  `objects.githubusercontent.com`, `release-assets.githubusercontent.com`), so it reaches the
+  network only through a Nuntius of its own, in that fetcher's jail. opifexd starts it when it
+  needs bytes with `portcullis launch --no-prompt org.atrium.opifex.fetch` (system grant),
+  whose stdio portcullisd hands to the jailed app: opifexd's two pipes are its whole channel.
+  The wire (`src/fetch.rs`): one JSON `get { url, max }` per line, answered by `ok { len }`
+  and the bytes, or `err { why }`; https only, no credentials in URLs. No new Nuntius verb,
+  no new capability, no socket of opifexd's in any jail.
+- `opifex sync` with no argument syncs over the network from where the catalog says it lives
+  (a signed `locations` entry), else `https://atrium-os.github.io/catalog/`
+  (`OPIFEX_CATALOG_URL`); `opifex sync https://…` from a given base; a folder as before.
+  Everything goes through the C1 client checks. `opifex get` (and the sheet's
+  `InstallApproved`) download a missing archive from the release's URLs, keeping it only if
+  its size and sha256 are the catalog's.
+- The catalog repository: `portcullis/opifex/catalog-repo/` is the template for
+  `atrium-os/catalog`: `publish.sh` (a pull request adding `incoming/*.toml` is checked: the
+  archive downloaded, its hash checked, unpacked, and added to a copy of the log, which checks
+  the signature and scopes; on main it is appended and the head signed with the catalog key,
+  the only key in CI), the SDK registry under `sdk/` checked with
+  `cargo atrium registry verify` before it is published, and a workflow that publishes `site/`
+  to Pages and re-signs the head weekly. `opifex unarchive` added for it.
+- Not yet: the repositories themselves (`atrium-os/catalog`, `atrium-os/catalog-blobs`), the
+  real keys (key ceremony), the first platform packages, a daily sync timer (C5).
+- Checked: host tests (the wire; sync and download through `opifex-fetch --dir` standing in
+  for the web; a server handing out other bytes refused and nothing kept; a 404; a URL with
+  credentials refused); `publish.sh` against a local HTTPS server (check, publish, a wrong
+  hash refused). VM gate `scripts/vm-opifex-c4-check.sh` (the hermetic HTTPS fixture of
+  nuntius-vm-check.sh serving the catalog; `run-vm.sh` takes `NETDEV_EXTRA` for it).
+
 ## 15. Decisions, with recommendations
 
 1. **Each catalog downloaded whole** for all lookups, not per-publisher DNS manifests or

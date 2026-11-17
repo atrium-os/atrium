@@ -886,6 +886,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "libc",
+ "portcullis-ipc",
  "postcard",
  "serde",
 ]
@@ -914,6 +915,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "libc",
+ "nuntius",
  "opifex-catalog",
  "portcullis-sig",
  "portcullis-toml",

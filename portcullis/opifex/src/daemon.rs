@@ -18,6 +18,7 @@ use opifex_catalog as oc;
 use sha2::{Digest, Sha256};
 
 use crate::app;
+use crate::fetch;
 use crate::installed::{Record, Store};
 use crate::proto::{Described, Request, Response};
 
@@ -38,6 +39,10 @@ pub struct Daemon {
     pub sheet_uid: Option<u32>,
     pub trust: portcullis_trust::Trust,
     pub require_content: bool,
+    /// How to start the fetcher (`fetch::FETCH_CMD`), and where the catalog
+    /// is served until it names its own locations (`fetch::CATALOG_URL`).
+    pub fetch_cmd: Vec<String>,
+    pub catalog_url: String,
     /// Where side-loaded bundles' libraries are read from (`/`).
     pub sysroot: PathBuf,
     /// One change at a time.
@@ -118,9 +123,21 @@ impl Daemon {
             let text = fs::read_to_string(&self.root_toml).map_err(|e| format!("{}: {e}", self.root_toml.display()))?;
             oc::Client::init(&c.dir, &text)?;
         }
-        let src = from.to_path_buf();
-        let fetch = move |p: &str| fs::read(src.join(p)).map_err(|e| format!("{p}: {e}"));
-        let l = c.update(&fetch, now())?;
+        let from = from.to_string_lossy().to_string();
+        let l = if from.is_empty() || from.starts_with("https://") {
+            // Over the network: the given base, else where the catalog says it
+            // lives, else the default.
+            let base = if !from.is_empty() { from } else {
+                c.local()?.locations.first().cloned().unwrap_or_else(|| self.catalog_url.clone())
+            };
+            let net = std::cell::RefCell::new(fetch::Fetcher::new(self.fetch_cmd.clone()));
+            let get = |p: &str| net.borrow_mut().get(&fetch::join(&base, p), fetch::CATALOG_FILE_MAX);
+            c.update(&get, now())?
+        } else {
+            let src = PathBuf::from(from);
+            let get = move |p: &str| fs::read(src.join(p)).map_err(|e| format!("{p}: {e}"));
+            c.update(&get, now())?
+        };
         Ok(Response::Synced { entries: l.size, releases: l.releases.len() })
     }
 
@@ -161,6 +178,26 @@ impl Daemon {
 
     /// Install the newest catalog release of `id` for `uid`. With `approved`,
     /// only if that release's manifest is the one the sheet showed.
+    /// Fetch `r`'s archive from its URLs into `to`, checked by size and hash
+    /// before it is kept.
+    fn download(&self, r: &oc::Release, to: &Path) -> Result<(), String> {
+        let mut net = fetch::Fetcher::new(self.fetch_cmd.clone());
+        let mut why = Vec::new();
+        for url in &r.urls {
+            match net.get(url, r.archive_size) {
+                Ok(b) if b.len() as u64 == r.archive_size && oc::hex(&Sha256::digest(&b)) == r.archive_sha256 => {
+                    fs::create_dir_all(self.downloads()).map_err(|e| e.to_string())?;
+                    let tmp = to.with_extension("part");
+                    fs::write(&tmp, &b).and_then(|_| fs::rename(&tmp, to)).map_err(|e| format!("{}: {e}", to.display()))?;
+                    return Ok(());
+                }
+                Ok(_) => why.push(format!("{url}: not the archive the catalog names")),
+                Err(e) => why.push(e),
+            }
+        }
+        Err(format!("{}: download failed: {}", r.id, if why.is_empty() { "no URLs".into() } else { why.join("; ") }))
+    }
+
     fn install_catalog(&self, id: &str, approved: Option<&str>, uid: u32) -> Result<Response, String> {
         let c = self.catalog();
         let local = c.local()?;
@@ -178,6 +215,9 @@ impl Daemon {
         let signer = root.key(&r.signer).ok_or("signer gone from root.toml")?.pem.clone();
         // The archive: fetched by C4; for now it must be in the download folder.
         let archive = self.downloads().join(format!("{}.insula", r.archive_sha256));
+        if !archive.is_file() {
+            self.download(&r, &archive)?;
+        }
         let mut f = fs::File::open(&archive).map_err(|_| format!("{id}: archive not downloaded ({})", archive.display()))?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; 1 << 16];
