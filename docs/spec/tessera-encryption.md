@@ -1,6 +1,7 @@
 # Tessera at-rest encryption
 
-**Status: proposed 2026-11-17**, for Shankar's review. Nothing here is built.
+**Status: accepted 2026-11-17** (Shankar: "continue as planned", all §14 decisions as
+recommended). E0 under way.
 **Scope:** encrypting Tessera on disk: what is encrypted and with which key, how
 metadata is authenticated so that the kernel never parses bytes an attacker wrote, where
 keys live (Arca), crypto-erase, dedup under encryption, rollback, and trusted Tessera
@@ -559,6 +560,8 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | E6 | Move existing home folders and app data into the person's Personal group (copy into the new encrypted domain, then GC the old) | an upgraded VM keeps every file, now sealed |
 
 ## 14. Decisions
+
+Accepted 2026-11-17, all as recommended.
 
 1. **Two layers: sealed volumes for sticks (key per stick) and encrypted domains on the
    internal volume (key per person and persona)**, so persona folders need no partition
