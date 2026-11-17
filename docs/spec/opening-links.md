@@ -223,7 +223,13 @@ new trail.
    follows a person's press; it picks the uid's top-level window highest in the stack (not
    a slot, pop-up or hidden window) and tells the WM alone (`EV_WINDOW_ACTIVATE`).
    forum-wm focuses it, switching to its space if it is on another. An app just started
-   for a link needs none: a new document opens focused.
+   for a link needs none: a new document opens focused. *Personas, 2026-11-17*
+   (personas.md §3): a link opens in the asking app's persona. portcullisd reads the
+   asker's persona from the launch registry by its uid, keeps it with the grant, and
+   delivers to that persona's instance of the chosen app on its own document channel
+   (`<id>@<persona>`), starting it if needed and raising it by its own uid. An app that
+   runs once for every persona (Settings, the file manager) has only the one instance.
+   Crossing on purpose, with Copy address and the switch, is personas.md P3.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
 
 ## 9. Decisions, with recommendations

@@ -160,6 +160,12 @@ pub enum Request {
         cpu_pct: Option<u32>,
         #[serde(default)]
         require_memory_limit: bool,
+        /// For a system caller under a `per_instance` worker rule (limend):
+        /// the uid of the app instance this worker serves (the embed's
+        /// parent), whose person and persona the worker's uid follows.
+        /// Asked, the answer is `ReadyForFdsAs` with the worker's uid.
+        #[serde(default)]
+        serves: Option<u32>,
     },
 
     /// ★ A fetcher of the caller's own: Nuntius (docs/spec/nuntius.md §2),
@@ -592,6 +598,9 @@ pub enum Response {
     /// drains the daemon's BufReader so the cmsg's 1-byte payload
     /// can't be silently swallowed by a buffered read.
     ReadyForFds,
+    /// `ReadyForFds`, for an `ExecInstance` that named `serves`: the
+    /// worker will run as `uid`.
+    ReadyForFdsAs { uid: u32 },
     /// Catalog → the apps this caller may launch.
     CatalogList { apps: Vec<CatalogEntry> },
 
@@ -746,7 +755,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let s = serde_json::to_string(&Request::ExecInstance { app_id: "a".into(), instance: None, tmpfs_mb: 64,
-            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true }).unwrap();
+            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true, serves: None }).unwrap();
         assert!(s.contains("\"memory_mb\":512") && s.contains("\"cpu_pct\":100") && s.contains("\"require_memory_limit\":true"), "{s}");
     }
 

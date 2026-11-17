@@ -60,6 +60,17 @@ pub enum Delivery {
     Queued,
 }
 
+/// The document channel of `app`'s instance in `persona` (personas.md §3):
+/// `<id>` for Personal, `<id>@<persona>` for a named persona, as the
+/// instance's jail root is named. The hub is keyed by it, so a Work
+/// instance's channel is never the Personal one's.
+pub fn channel_key(app: &str, persona: Option<&str>) -> String {
+    match persona {
+        None => app.to_string(),
+        Some(p) => format!("{app}@{p}"),
+    }
+}
+
 pub struct Hub {
     root: PathBuf,
     registry: String,
@@ -119,8 +130,9 @@ impl Hub {
     fn accepted(self: &Arc<Self>, app: &str, s: UnixStream) {
         let uid = portcullis_peer::uid_gid(s.as_raw_fd()).map(|(u, _)| u);
         let reg = portcullis_peer::AppRegistry::load(&self.registry).unwrap_or_default();
-        let owner = match uid.as_ref().ok().and_then(|u| reg.resolve(*u)) {
-            Some((o, a)) if a == app => o.to_string(),
+        // `app` is the channel's key: the uid must be that very instance.
+        let owner = match uid.as_ref().ok().and_then(|u| reg.resolve(*u).map(|r| (r, reg.persona(*u).flatten()))) {
+            Some(((o, a), p)) if channel_key(a, p) == app => o.to_string(),
             _ => {
                 eprintln!("portcullisd: {app}'s document channel: refused uid {uid:?}, not {app}");
                 return;
@@ -420,6 +432,31 @@ mod tests {
         drop(ch);
         std::thread::sleep(Duration::from_millis(200));
         assert!(!hub.connected("org.test.player"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_work_instance_has_a_channel_of_its_own() {
+        let d = tmp("persona");
+        let me = unsafe { libc::getuid() };
+        let reg = d.join("registry");
+        // This uid is alice's Work player: the Personal channel isn't its.
+        std::fs::write(&reg, format!("{me} alice org.test.player persona=work\n")).unwrap();
+        let hub = Hub::new(d.join("opens"), reg.to_str().unwrap());
+        assert_eq!(channel_key("org.test.player", Some("work")), "org.test.player@work");
+        assert_eq!(channel_key("org.test.player", None), "org.test.player");
+        let personal = hub.listen("org.test.player").unwrap();
+        let work = hub.listen(&channel_key("org.test.player", Some("work"))).unwrap();
+        assert_ne!(personal, work);
+        hub.deliver_link("alice", "org.test.player", "https", "https://personal.example/").unwrap();
+        let mut wrong = atrium_open::Channel::connect_to(&personal.join("opens.sock")).unwrap();
+        assert!(matches!(wrong.recv_any(Some(Duration::from_secs(2))), Err(_)), "Personal's link never reaches Work");
+        assert_eq!(hub.deliver_link("alice", "org.test.player@work", "https", "https://work.example/").unwrap(), Delivery::Queued);
+        let mut ch = atrium_open::Channel::connect_to(&work.join("opens.sock")).unwrap();
+        match ch.recv_any(Some(Duration::from_secs(2))).unwrap() {
+            Some(atrium_open::Message::Link(u)) => assert_eq!(u, "https://work.example/"),
+            other => panic!("{other:?}"),
+        }
         let _ = std::fs::remove_dir_all(d);
     }
 

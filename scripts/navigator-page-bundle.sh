@@ -44,7 +44,14 @@ PATH=$(dirname "$OPIFEX"):$PATH portcullis policy grant --system $APP
 # other system workers (_limen 65022, _nuntius 65023).
 pw groupshow _navpage >/dev/null 2>&1 || pw groupadd _navpage -g 65035
 id _navpage >/dev/null 2>&1 || pw useradd _navpage -u 65035 -g _navpage -d /nonexistent -s /usr/sbin/nologin -c "Navigator page"
+# ★ per_instance (personas.md §3, navigator-ui.md §2.4): each person's
+# and each persona's run as a uid of their own, named in the launch
+# registry; run_as is kept for the rule's shape and not used. An older
+# rule without it is replaced.
 P=/etc/atrium/policy.toml
+if grep -q "workers.\"$APP\"" $P 2>/dev/null && ! awk -v h="[workers.\"$APP\"]" '$0==h {f=1; next} /^\[/ {f=0} f && /^per_instance *= *true/ {ok=1} END {exit !ok}' $P; then
+    awk -v h="[workers.\"$APP\"]" '$0==h {f=1; next} /^\[/ {f=0} !f' $P > $P.new && mv $P.new $P
+fi
 if ! grep -q "workers.\"$APP\"" $P 2>/dev/null; then
     cat >> $P <<T
 
@@ -52,6 +59,7 @@ if ! grep -q "workers.\"$APP\"" $P 2>/dev/null; then
 callers    = ["_limen"]
 run_as     = "_navpage"
 concurrent = 64
+per_instance = true
 T
     chown root:wheel $P && chmod 644 $P
 fi

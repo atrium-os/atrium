@@ -9,7 +9,8 @@
 #
 # - The page child (org.atrium.navigator.page) is started by the real
 #   limend, as _limen, through portcullisd's ExecInstance: one jail per
-#   page, as _navpage (a system worker rule), with one capability,
+#   page, as a uid of the person's (and persona's) own (a per-instance
+#   system worker rule), with one capability,
 #   `navigator-page` (navigatord's ticket socket). scripts/navigator-page-bundle.sh.
 # - navigatord runs without --unconfined-for-testing, as an unprivileged
 #   broker (navtest): each page is fetched by navigator-fetchd in a jail of
@@ -259,7 +260,7 @@ g "set -e
 for a in org.test.mail:open-probe org.test.mail2:open-probe org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
     g "test -x /var/lib/atrium/apps/${a%%:*}/bin/${a#*:}" && ok "${a%%:*} installed" || bad "${a%%:*} not installed"
 done
-g "grep -q 'workers.\"$PAGE_ID\"' /etc/atrium/policy.toml" && ok "worker rule: _limen starts the page as _navpage" || bad "no worker rule for $PAGE_ID"
+g "awk '/^\\[workers.\"$PAGE_ID\"\\]/ {f=1; next} /^\\[/ {f=0} f && /^per_instance *= *true/ {ok=1} END {exit !ok}' /etc/atrium/policy.toml" && ok "worker rule: _limen starts the page as a uid of the instance it serves" || bad "no per-instance worker rule for $PAGE_ID"
 
 echo "=== start"
 # frescod as _frescod, renderers from portcullisd (no FRESCOD_RENDERER_LAUNCHER):
@@ -359,7 +360,10 @@ until_trace 'url=https://atlas.example/wiki/Atrium live=shown' && ok "the first 
 UI=$(g "ps -o jid= -o uid= -p \$(pgrep -x navigator-ui | head -1)" | tr -d '\r' | awk '{print $1, $2}')
 UJID=${UI%% *}; UUID=${UI#* }
 [ -n "$UJID" ] && [ "$UJID" != 0 ] && [ "$UJID" != "$NJID" ] && ok "the UI runs in a jail of its own (jid $UJID)" || bad "the UI's jail: '$UI' (navigatord's $NJID)"
-[ "$UUID" = 65037 ] && ok "as _navui (65037), not the Navigator's uid" || bad "the UI's uid: '$UUID'"
+# A uid of navtest's Personal Navigator's own, not navigatord's, and named
+# in the launch registry as its window (per-instance worker rule).
+[ -n "$UUID" ] && [ "$UUID" -ge 50000 ] && [ "$UUID" != "$NUID" ] && g "grep -qx '$UUID navtest org.atrium.navigator.ui' /var/run/atrium/app-registry" \
+    && ok "as a uid of its own ($UUID), navtest's Navigator window in the registry" || bad "the UI's uid: '$UUID' $(g "grep -a navigator.ui /var/run/atrium/app-registry" | tr '\n' ';')"
 UM=$(g "mount -p | awk '{print \$2}' | grep -E \"/jails/[^/]*navigator[.-]ui[^/]*/\" | grep -c /atrium/sockets || true" | tr -d '\r')
 [ "${UM:-1}" = 0 ] && ok "and with no sockets: navigatord passes it what it reaches" || bad "the UI's jail mounts $UM socket directories"
 g "grep -q 'kept by navigatord' $UL" && ok "the UI's trails came from navigatord" || bad "trails: $(g "grep -h 'trail store' $UL | tail -2 | tr '\n' ';'")"
@@ -368,8 +372,9 @@ g "grep -q 'laid out \"Atrium (architecture)\"' $UL" && ok "the jailed child red
     || bad "child: $(g "grep -h -e navigator-page -e limend $S/limend.log | tail -4 | tr '\n' ';'")"
 PS=$(g "ps -axo user,uid,jid,comm | awk '\$4==\"navigator-page\"'")
 echo "$PS" | sed 's/^/    /'
-echo "$PS" | awk '$2==65035 && $3!=0 {f=1} END {exit !f}' && ok "navigator-page runs as _navpage (65035) inside a jail" || bad "navigator-page: $PS"
-echo "$PS" | awk '$2!=65035 || $3==0 {f=1} END {exit f}' && ok "no navigator-page outside a jail or as another user" || bad "a navigator-page outside: $PS"
+PU=$(g "awk '\$2==\"navtest\" && \$3==\"$PAGE_ID\" && NF==3 {print \$1}' /var/run/atrium/app-registry" | tr -d '\r')
+[ -n "$PU" ] && echo "$PS" | awk -v u="$PU" '$2==u && $3!=0 {f=1} END {exit !f}' && ok "navigator-page runs inside a jail as navtest's page uid ($PU)" || bad "navigator-page: '$PU' $PS"
+echo "$PS" | awk -v u="$PU" '$2!=u || $3==0 {f=1} END {exit f}' && ok "no navigator-page outside a jail or as another user" || bad "a navigator-page outside: $PS"
 JP=$(g "jls name path | awk '\$1 ~ /limen-/ {print \$2; exit}'" | tr -d '\r')
 [ -n "$JP" ] || JP=/no-page-jail
 M=$(g "mount -p | awk -v r='$JP' 'index(\$2, r)==1 {print \$1\" -> \"substr(\$2, length(r)+1)}'")
@@ -387,7 +392,7 @@ L=$(g "grep -h -e '$CONV_ID' -e '$FETCH_ID' -e 'navigator.page' /var/log/atrium/
 echo "$L" | sed 's/^/    /'
 g "grep -q '$CONV_ID' /var/log/atrium/portcullisd-navigator.log" && ok "the conversion ran in a converter jail" || bad "no converter jail was started"
 g "grep -q '$FETCH_ID' /var/log/atrium/portcullisd-navigator.log" && ok "the fetches went through a fetcher jail" || bad "no fetcher jail was started"
-g "grep -q '_limen starts $PAGE_ID as _navpage' /var/log/atrium/portcullisd-navigator.log" && ok "portcullisd applied the worker rule" || bad "no worker rule line"
+g "grep -q '$PAGE_ID for navtest.s org.atrium.navigator runs as atrium-app-$PU' /var/log/atrium/portcullisd-navigator.log" && ok "portcullisd applied the worker rule, for the Navigator instance the page serves" || bad "no worker rule line: $(g "grep -h '$PAGE_ID' /var/log/atrium/portcullisd-navigator.log | tail -2" | tr '\n' ';')"
 # Images: the converter's verified bytes, kept by navigatord with the page,
 # handed over with the ticket, decoded in the page's jail.
 g "grep -q 'navigator-page: 1 images with the page' $S/limend.log" && ok "the page's image came with its ticket" || bad "no image with the page: $(g "grep -h -i image $S/limend.log $S/navigatord.log | tail -3 | tr '\n' ';'")"
@@ -510,9 +515,33 @@ sleep "$GAP"
 NL=$(g "grep -c 'laid out \"Atrium (architecture)\"' $WL" | tr -d '\r ')
 [ "${NL:-0}" -ge 1 ] && ok "Work's page child redeemed its ticket at Work's socket and laid the page out" || bad "Work's page: $NL layouts; $(g "grep -h -e redeem -e 'unknown ticket' $S/limend.log $WL $S/navigatord.log | tail -3" | tr '\n' ';')"
 g "grep -q 'unknown ticket' $S/navigatord.log $WL" && bad "a ticket went to the other instance" || ok "no ticket went to the other instance"
+# Work's window and pages run as Work's own uids (per-instance worker rules).
+WUU=$(g "awk '\$2==\"navtest\" && \$3==\"org.atrium.navigator.ui\" && \$4==\"persona=work\" {print \$1}' /var/run/atrium/app-registry" | tr -d '\r')
+WPU=$(g "awk '\$2==\"navtest\" && \$3==\"$PAGE_ID\" && \$4==\"persona=work\" {print \$1}' /var/run/atrium/app-registry" | tr -d '\r')
+[ -n "$WUU" ] && [ "$WUU" != "$UUID" ] && g "pgrep -u $WUU -x navigator-ui >/dev/null" && ok "Work's window runs as Work's own uid ($WUU, Personal's $UUID)" || bad "Work's UI uid: '$WUU' (Personal '$UUID')"
+[ -n "$WPU" ] && [ "$WPU" != "$PU" ] && g "grep -q '$PAGE_ID for navtest.s org.atrium.navigator (work) runs as atrium-app-$WPU' /var/log/atrium/portcullisd-navigator.log" && ok "Work's pages run as Work's own uid ($WPU, Personal's $PU)" || bad "Work's page uid: '$WPU' (Personal '$PU') $(g "grep -h '$PAGE_ID for' /var/log/atrium/portcullisd-navigator.log | tail -2" | tr '\n' ';')"
 WC=$(g "grep -A5 'conn from uid=$WUID ' /var/log/atrium/portcullisd-navigator.log | grep -c -e '$FETCH_ID authorized' -e '$CONV_ID authorized'" | tr -d '\r ')
 [ "${WC:-0}" -ge 2 ] && ok "Work's fetcher and converter jails ran as Work's uid" || bad "Work's workers: $(g "grep -h -e '$FETCH_ID' -e '$CONV_ID' /var/log/atrium/portcullisd-navigator.log | tail -3" | tr '\n' ';')"
 g "test -s \$(jls -j $WJID path)/var/db/navigatord/trails.json" && ok "Work keeps its own trails, in its own jail" || bad "no trails.json in Work's jail"
+g "grep -q 'taking links from other apps' $WL" && ok "Work's Navigator has a document channel of its own" || bad "Work's channel: $(g "grep -h -i 'document channel' $WL | tail -2" | tr '\n' ';')"
+# A link from a Work app opens in the Work Navigator, never the Personal
+# one (personas.md §3): link-probe, launched as Work's.
+WLAST() { g "grep 'trace' $WL | tail -1"; }
+WT0=$(WLAST | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
+PT0=$(last | sed -n 's/.* trails=\([0-9]*\) .*/\1/p')
+g "cd $S && daemon -f -o $S/linkprobe-work.log -u navtest /usr/local/bin/portcullis launch --no-prompt --persona work org.test.linkprobe </dev/null"
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'link-probe: up' $S/linkprobe-work.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: up' $S/linkprobe-work.log" && ok "Work's link-probe is up" || bad "Work link-probe: $(g "tail -3 $S/linkprobe-work.log")"
+sleep 10
+key 0x28
+i=0; while [ $i -lt 90 ] && ! g "grep -q -e 'link-probe: opened' -e 'link-probe: not opened' $S/linkprobe-work.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: opened' $S/linkprobe-work.log" && ok "Monstrator took Work's link" || bad "Work link: $(g "tail -2 $S/linkprobe-work.log; grep -h link $PL | tail -2" | tr '\n' ';')"
+g "grep -q 'a https link from org.test.linkprobe opened in org.atrium.navigator@work for navtest' $PL" && ok "…and portcullisd handed it to Work's Navigator" || bad "Work delivery: $(g "grep -h 'link from org.test.linkprobe' $PL | tail -2" | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! WLAST | grep -q "trails=$((${WT0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown"; do sleep 3; i=$((i+3)); done
+WLAST | grep -q "trails=$((${WT0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown" && ok "the Work window opened it in a trail of its own" || bad "Work incoming: $(WLAST)"
+last | grep -q "trails=${PT0:-x} " && ok "the Personal window got nothing" || bad "Personal: $(last)"
+[ "$(g "grep -c 'org.atrium.navigator.s window [0-9]* brought forward' $PL" | tr -d '\r ')" -ge 2 ] && ok "Work's window came forward" || bad "Work raise: $(g "grep -h -e 'brought forward' $PL | tail -2" | tr '\n' ';')"
+g "pkill -x link-probe; true"
 shot confined-6-work
 
 echo "=== end"

@@ -435,7 +435,10 @@ loaded() { g "$KL gen $1 >/dev/null 2>&1 && echo loaded || echo absent"; }
 check "the key is in the kernel" loaded "$(loaded $KID)"
 check "no op returns anything as long as a key" yes "$(as arcavol "vk-sweep alice work $KID $U" | awk -F'[= ]' '{print ($2 < 32) ? "yes" : $0}')"
 g "$KL drop $KID >/dev/null"
-check "another person: refused" "status=1 body=" "$(as arcavol "vk-load bob work $KID $U 0")"
+# Another person, unlocked: their store has no such key. (Locked, arcad can
+# only answer LOCKED: the item would be in that store, which it can't read.)
+as _ostiarius 'unlock vkbob other-horse' >/dev/null
+check "another person: refused" "status=1 body=" "$(as arcavol "vk-load vkbob work $KID $U 0")"
 check "another persona: refused" "status=1 body=" "$(as arcavol "vk-load alice personal $KID $U 0")"
 check "another volume: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $FOREIGN 0")"
 check "another key group: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $U 7")"

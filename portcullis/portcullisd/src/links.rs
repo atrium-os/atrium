@@ -25,6 +25,9 @@ pub struct Grant {
     pub at: Instant,
     pub person: String,
     pub asker_app: String,
+    /// The asking instance's persona (personas.md §3): the link opens in
+    /// the same persona's instance, never across (P3: off by default).
+    pub persona: Option<String>,
     pub scheme: String,
     pub apps: Vec<String>,
 }
@@ -113,7 +116,7 @@ mod tests {
     use super::*;
 
     fn g(at: Instant) -> Grant {
-        Grant { at, person: "ana".into(), asker_app: "org.atrium.navigator".into(), scheme: "mailto".into(), apps: vec!["org.example.mail".into()] }
+        Grant { at, person: "ana".into(), asker_app: "org.atrium.navigator".into(), persona: None, scheme: "mailto".into(), apps: vec!["org.example.mail".into()] }
     }
 
     #[test]

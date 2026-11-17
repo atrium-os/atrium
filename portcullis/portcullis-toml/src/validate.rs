@@ -201,6 +201,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
                  (renderer, app, networked, terminal); the launch fails unless jaild's \
                  policy defines it"));
         }
+        if class == "develop" {
+            r.errors.push(format!(
+                "{ctx}.syscalls = \"develop\": portcullisd gives this class to workspaces \
+                 only (ptrace, ktrace); an app can't ask for it"));
+        }
         if class == "terminal" {
             r.warnings.push(format!(
                 "{ctx}.syscalls = \"terminal\": restricted (runs programs, controls \
