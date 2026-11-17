@@ -585,7 +585,7 @@ impl Mail {
                     if let Some(account) = account {
                         let ids = self.engine.identities(account).unwrap_or_default();
                         let identity = ids.iter().position(|i| i.addr.eq_ignore_ascii_case(&draft.from.addr)).unwrap_or(0);
-                        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new() }, None));
+                        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new(), original: None }, None));
                     }
                 }
                 Ok(None) => ui.error = Some("It has already gone".into()),
@@ -603,6 +603,11 @@ impl Mail {
         ui.gen += 1;
         self.ui.set(ui);
         true
+    }
+
+    /// Whether the window is drawn dark (a doc-viewer is told).
+    pub fn is_dark(&self) -> bool {
+        self.dark.get()
     }
 
     /// The account an address belongs to (one of its identities).
@@ -658,7 +663,7 @@ impl Mail {
     pub fn open_draft(&self, account: AccountId, id: u64, draft: mail_compose::Draft) {
         let ids = self.engine.identities(account).unwrap_or_default();
         let identity = ids.iter().position(|i| i.addr.eq_ignore_ascii_case(&draft.from.addr)).unwrap_or(0);
-        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new() }, Some(id)));
+        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new(), original: None }, Some(id)));
     }
 
     /// Compose windows to open (the app opens a window for each).

@@ -101,9 +101,9 @@ fn provide(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, e: 
 /// Ask for a doc-viewer in the frame slot and hand it the document: its
 /// pictures first (`Provide`: the message's own, and remote ones already
 /// loaded), then the HTML (`Load`).
-fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token: [u8; 16], doc: &mail_schema::Document, remote: &[(String, Vec<u8>)], dark: bool) -> Result<limen::proto::EmbedId, String> {
+fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token: [u8; 16], slot: pergola::slot::SlotKey, doc: &mail_schema::Document, remote: &[(String, Vec<u8>)], dark: bool) -> Result<limen::proto::EmbedId, String> {
     use limen::doc_viewer::{DocKind, ToChild};
-    let e = embeds.borrow_mut().request("doc-viewer", token, atrium_mail::view::FRAME_SLOT).map_err(|e| format!("{e:?}"))?;
+    let e = embeds.borrow_mut().request("doc-viewer", token, slot).map_err(|e| format!("{e:?}"))?;
     let send = || -> Result<(), String> {
         provide(embeds, e, &doc.pictures)?;
         provide(embeds, e, remote)?;
@@ -123,17 +123,24 @@ struct ComposeWin {
     app: App<ComposeView>,
     c: Composer,
     size: pergola::Mutable<(f32, f32)>,
+    /// The doc-viewer showing the original under a reply or forward.
+    quote: Option<limen::proto::EmbedId>,
+    /// The original couldn't be shown; not asked again.
+    quote_failed: bool,
 }
 
 /// Open a compose window for `c` (`draft`: the stored draft it continues).
-fn compose_window(engine: &Rc<Engine>, c: mail_engine::compose::Compose, draft: Option<u64>) -> std::io::Result<ComposeWin> {
+fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pergola::embed::Embeds>>>, c: mail_engine::compose::Compose, draft: Option<u64>) -> std::io::Result<ComposeWin> {
     let title = if c.draft.subject.trim().is_empty() { "New message".to_string() } else { c.draft.subject.clone() };
-    let win = Window::open(&WindowDesc::new(&title, SizeSpec::Fixed(760, 640)))?;
+    let mut win = Window::open(&WindowDesc::new(&title, SizeSpec::Fixed(760, 640)))?;
+    if let Some(e) = embeds {
+        win.set_slot_binder(pergola::embed::Embeds::binder(e));
+    }
     let dirty = Arc::new(AtomicBool::new(true));
     let k = Composer::new(engine.clone(), c, draft, dirty.clone(), now);
     let view = ComposeView::new(k.clone(), (win.width, win.height));
     let size = view.size.clone();
-    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size })
+    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false })
 }
 
 /// The drafts whose windows were open, so a crash or a restart opens them
@@ -271,7 +278,7 @@ fn main() {
         let asked = mail.take_composes();
         let opened = !asked.is_empty();
         for (c, draft) in asked {
-            match compose_window(&engine, c, draft) {
+            match compose_window(&engine, embeds.as_ref(), c, draft) {
                 Ok(w) => composes.push(w),
                 Err(e) => eprintln!("atrium-mail: a compose window: {e}"),
             }
@@ -301,6 +308,33 @@ fn main() {
             cw.size.set((cw.win.width, cw.win.height));
             if save {
                 cw.c.tick();
+            }
+            // The original under a reply, in a jailed doc-viewer.
+            if let Some(embeds) = &embeds {
+                let original = cw.c.original.borrow().clone();
+                match (&original, cw.quote) {
+                    (Some(doc), None) if !cw.quote_failed => {
+                        if let Some(token) = cw.win.embed_token() {
+                            match show(embeds, token, atrium_mail::compose::QUOTE_SLOT, doc, &[], mail.is_dark()) {
+                                Ok(e) => cw.quote = Some(e),
+                                Err(e) => {
+                                    eprintln!("atrium-mail: the quoted message: {e}");
+                                    cw.quote_failed = true;
+                                }
+                            }
+                        }
+                    }
+                    (None, Some(e)) => {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                        cw.quote = None;
+                    }
+                    _ => {}
+                }
+                if cw.c.done().is_some() {
+                    if let Some(e) = cw.quote.take() {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                    }
+                }
             }
             match cw.c.done() {
                 None => true,
@@ -345,7 +379,7 @@ fn main() {
                 if let (Some((msg, doc, dark)), Some(token)) = (want.as_ref(), win.embed_token()) {
                     if failed != Some(*msg) {
                         let remote = engine.pictures(*msg).unwrap_or_default();
-                        match show(embeds, token, &doc.0, &remote, *dark) {
+                        match show(embeds, token, atrium_mail::view::FRAME_SLOT, &doc.0, &remote, *dark) {
                             Ok(embed) => frame = Some(Frame { msg: *msg, doc: doc.clone(), embed, dark: *dark }),
                             Err(e) => {
                                 eprintln!("atrium-mail: doc-viewer: {e}");

@@ -1112,7 +1112,12 @@ Stalwart in the cloud VM, and later a real account):
    wide as the window, growing with the text) kept to a mail profile (paragraphs,
    headings, B/I/U/strike, web and mail links, lists, quotes), sent as
    `multipart/alternative` with a plain part from the same paragraphs; drafts keep Mail's
-   HTML and reopen as rich text; a Plain text switch. Tests: compose 6 + 4 round trips
+   HTML and reopen as rich text; a Plain text switch. **Quoted originals** (`b4a1c0de`):
+   a reply or forward of an HTML message shows the original under the text in a jailed
+   doc-viewer slot, as the reader does (the Navigator's `DocumentView`), with Remove; it is
+   sent in a cited blockquote with its formatting, kept to a safe set of elements (no
+   pictures, styles, forms or attributes but web and mail links), and as "> " lines in the
+   plain part; switching to plain text folds the quote into the text. Tests: compose 6 + 4 round trips
    through Mail's own parser, sync submit (scripted server), store outbox and drafts, engine
    compose starts, the Dovecot end-to-end test now with Dovecot's submission service
    through the real courier to a test relay (every recipient, no Bcc header, filed in Sent,

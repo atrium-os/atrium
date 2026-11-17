@@ -14,10 +14,13 @@ use crate::{Engine, Error};
 pub const SIG_SEP: &str = "-- \n";
 
 /// A compose window's start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Compose {
     pub account: AccountId,
     pub draft: Draft,
+    /// The original's converted document, shown under a reply or forward
+    /// (in a doc-viewer, as the reader shows it).
+    pub original: Option<mail_schema::Document>,
     /// Which identity From is.
     pub identity: usize,
     /// Notes the window shows above the message (from a `mailto:` link).
@@ -55,7 +58,7 @@ impl Engine {
     pub fn compose_new(&self, account: AccountId, identity: usize) -> Result<Compose, Error> {
         let (i, id) = self.from(account, identity)?;
         let draft = Draft { from: Mailbox::new(&id.name, &id.addr), text: sig_block(&id), ..Draft::default() };
-        Ok(Compose { account, draft, identity: i, notes: Vec::new() })
+        Ok(Compose { account, draft, identity: i, notes: Vec::new(), original: None })
     }
 
     /// A reply, reply-all or forward of message `msg`.
@@ -66,21 +69,38 @@ impl Engine {
         let mine: Vec<String> = ids.iter().map(|i| i.addr.clone()).collect();
         let identity = reply::reply_from(&m.summary, &mine).unwrap_or(0);
         let r = self.open(msg)?;
-        let text = r.text.or(m.summary.text.clone()).unwrap_or_default().replace("\r\n", "\n");
+        let mut text = r.text.clone().or(m.summary.text.clone()).unwrap_or_default().replace("\r\n", "\n");
+        // An HTML-only original: its text, for the plain part's quote.
+        if text.trim().is_empty() {
+            if let Some(d) = &r.document {
+                text = mail_compose::quote::text_of(&d.html);
+            }
+        }
         let when = m.summary.date.map(mail_compose::write::date).unwrap_or_default();
         let s = reply::start(&m.summary, &text, &when, &mine, kind);
         let id = &ids[identity];
+        // An HTML original is quoted with its formatting: kept apart from
+        // the text, under it in each part.
+        let (text, quote) = match &r.document {
+            Some(doc) => {
+                let intro: Vec<&str> = s.text.trim_start().lines().take_while(|l| !l.is_empty() && !l.starts_with('>')).collect();
+                let html = mail_compose::quote::html(&intro.join("\n"), &doc.html, kind != Kind::Forward);
+                (sig_block(id), Some(mail_compose::quote::Quote { text: s.text, html }))
+            }
+            None => (format!("{}{}", sig_block(id), s.text), None),
+        };
         let draft = Draft {
             from: Mailbox::new(&id.name, &id.addr),
             to: s.to,
             cc: s.cc,
             subject: s.subject,
-            text: format!("{}{}", sig_block(id), s.text),
+            text,
             in_reply_to: s.in_reply_to,
             references: s.references,
+            quote,
             ..Draft::default()
         };
-        Ok(Compose { account, draft, identity, notes: Vec::new() })
+        Ok(Compose { account, draft, identity, notes: Vec::new(), original: r.document })
     }
 
     /// A message filled from a `mailto:` link (shown in full; never sent

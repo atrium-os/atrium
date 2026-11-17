@@ -163,6 +163,9 @@ pub struct Rich {
     pub rev: Mutable<u64>,
 }
 
+/// The doc-viewer's slot for the original under a reply or forward.
+pub const QUOTE_SLOT: pergola::slot::SlotKey = 0x5155_4f54;
+
 /// New messages are written as rich text (§9.1); "Plain text" switches.
 pub const RICH_BY_DEFAULT: bool = true;
 
@@ -171,6 +174,8 @@ pub const RICH_BY_DEFAULT: bool = true;
 pub struct Composer {
     /// The text as rich text, when it is (else `body`).
     pub rich: Rc<RefCell<Option<Rich>>>,
+    /// The original's document under a reply or forward, for a doc-viewer.
+    pub original: Rc<RefCell<Option<Rc<mail_schema::Document>>>>,
     pub engine: Rc<Engine>,
     pub ui: Mutable<ComposeUi>,
     pub to: Mutable<TextEdit>,
@@ -218,6 +223,7 @@ impl Composer {
             saved: Rc::new(RefCell::new((d.clone(), t))),
             now: Rc::new(now),
             rich: Rc::default(),
+            original: Rc::new(RefCell::new(c.original.clone().map(Rc::new))),
         };
         // A reply starts with the caret above the quote.
         let mut b = k.body.get_cloned();
@@ -228,10 +234,39 @@ impl Composer {
         match html {
             Some(h) => k.rich_from(rich::from_html(&h)),
             None if RICH_BY_DEFAULT => k.rich_from(rich::from_text(&d.text)),
-            None => {}
+            None => k.fold_quote(),
         }
         *k.saved.borrow_mut() = (k.draft(), t);
         k
+    }
+
+    /// Plain text: the quote becomes "> " lines in the text itself.
+    fn fold_quote(&self) {
+        let Some(q) = self.base.borrow_mut().quote.take() else { return };
+        *self.original.borrow_mut() = None;
+        let mut b = self.body.get_cloned();
+        let text = format!("{}\n{}", b.text().trim_end_matches('\n'), q.text);
+        b.set_text(&text);
+        b.set_caret(0, false);
+        self.body.set(b);
+    }
+
+    /// Take the quoted original away.
+    pub fn remove_quote(&self) {
+        self.base.borrow_mut().quote = None;
+        *self.original.borrow_mut() = None;
+        self.ui.update(|u| u.status = None);
+    }
+
+    /// "On Mon, Arun wrote:" (or a forward's first line), while there is a
+    /// quote apart from the text.
+    pub fn quote_intro(&self) -> Option<String> {
+        self.base.borrow().quote.as_ref().map(|q| q.text.trim_start().lines().next().unwrap_or("").to_string())
+    }
+
+    /// The quote's plain lines (shown when there is no document for it).
+    pub fn quote_text(&self) -> Option<String> {
+        self.base.borrow().quote.as_ref().map(|q| q.text.trim_start().lines().skip(1).collect::<Vec<_>>().join("\n"))
     }
 
     fn rich_from(&self, paras: Vec<rich::Para>) {
@@ -266,6 +301,7 @@ impl Composer {
             b.set_text(&text);
             b.set_caret(0, false);
             self.body.set(b);
+            self.fold_quote();
         }
         self.ui.update(|u| u.status = None);
     }
@@ -312,7 +348,7 @@ impl Composer {
     /// The compose state the engine knows (From and identity).
     fn compose(&self) -> Compose {
         let ui = self.ui.get_cloned();
-        Compose { account: ui.account, draft: self.draft(), identity: ui.identity, notes: Vec::new() }
+        Compose { account: ui.account, draft: self.draft(), identity: ui.identity, notes: Vec::new(), original: None }
     }
 
     /// Save the draft if it changed and `SAVE_SECS` passed since the last
@@ -667,7 +703,32 @@ impl View for ComposeView {
         tool(ctx, &mut sx, switch, Weight::Regular, Box::new(move || c.set_rich(!rich_on)));
         y += bar;
         ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
-        let body = Rect::new(0.0, y + 1.0, w, h - y - 1.0 - em(28.0));
+        let mut body = Rect::new(0.0, y + 1.0, w, h - y - 1.0 - em(28.0));
+        // The original under a reply or forward: its own area at the foot.
+        if let Some(intro) = self.c.quote_intro() {
+            // Under half the text area, and never all of it.
+            let qh = (body.h() * 0.45).max(em(120.0)).min((body.h() - em(80.0)).max(em(60.0))).min(body.h());
+            let qy = body.y() + body.h() - qh;
+            body = Rect::new(body.x(), body.y(), body.w(), body.h() - qh);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, qy, w, 1.0), fill: t.border_default(), radius: 0.0 });
+            let hh = em(32.0);
+            line(ctx, 16.0, qy + hh / 2.0, &intro, type_size::SM, Weight::Regular, t.text_secondary());
+            let mut rx = w - 16.0 - measure("Remove", &sans(type_size::SM, Weight::Regular, t.text_primary())) - em(16.0);
+            let c = self.c.clone();
+            tool_at(ctx, &mut rx, qy, hh, "Remove", Box::new(move || c.remove_quote()));
+            let area = Rect::new(16.0, qy + hh, w - 32.0, qh - hh);
+            if self.c.original.borrow().is_some() {
+                // Drawn by a jailed doc-viewer, as the reader draws mail.
+                let id = ctx.add(Node::Rect { rect: area, fill: t.bg_window(), radius: 4.0 });
+                ctx.slot(id, QUOTE_SLOT);
+            } else {
+                let lh = em(type_size::SM) * 1.5;
+                let rows = (area.h() / lh).floor() as usize;
+                for (i, l) in self.c.quote_text().unwrap_or_default().lines().take(rows).enumerate() {
+                    line(ctx, area.x(), area.y() + lh * (i as f32 + 0.5), l, type_size::SM, Weight::Regular, t.text_secondary());
+                }
+            }
+        }
         if rich_on {
             self.rich_body(ctx, body);
         } else {
@@ -854,6 +915,25 @@ impl ComposeView {
         });
         ctx.pop();
     }
+}
+
+/// A small text button at `x` in a bar at `y`, `h` high.
+fn tool_at(ctx: &mut Ctx, x: &mut f32, y: f32, h: f32, label: &str, on: Box<dyn Fn()>) {
+    let t = ctx.theme;
+    let st = sans(type_size::SM, Weight::Regular, t.text_primary());
+    let lw = measure(label, &st) + em(16.0);
+    let r = Rect::new(*x, y + (h - em(26.0)) / 2.0, lw, em(26.0));
+    let id = ctx.push(Node::Rect { rect: r, fill: Color::TRANSPARENT, radius: 4.0 });
+    if ctx.is_hovered(id) {
+        if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+            *fill = t.state_hover();
+        }
+    }
+    ctx.on_click(id, on);
+    let lh = em(type_size::SM) * 1.5;
+    ctx.add(Node::Text { rect: Rect::new(r.x() + em(8.0), r.y() + (r.h() - lh) / 2.0, lw - em(16.0), lh), content: label.into(), style: st });
+    ctx.pop();
+    *x += lw + em(2.0);
 }
 
 /// The byte in line `(s, e)` nearest `x`.

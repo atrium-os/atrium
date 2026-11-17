@@ -207,11 +207,86 @@ fn rich_text() {
     let raw = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
     assert!(raw.contains("multipart/alternative") && raw.contains("text/html") && raw.contains("text/plain"), "{raw}");
     let back = engine.undo_send(engine.store.outbox().unwrap()[0].0).unwrap().unwrap();
-    let c = mail_engine::compose::Compose { account, draft: back, identity: 1, notes: vec![] };
+    let c = mail_engine::compose::Compose { account, draft: back, identity: 1, notes: vec![], original: None };
     let k2 = Composer::new(engine.clone(), c, None, Arc::new(AtomicBool::new(true)), move || NOW);
     assert!(k2.is_rich());
     assert!(k2.draft().html.unwrap().contains("<b>world</b>"));
     // To plain text: the words stay.
     k2.set_rich(false);
     assert_eq!(k2.draft().text, "Hello world\n\n-- \nBilling\n");
+}
+
+fn jail() -> std::path::PathBuf {
+    use std::path::Path;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
+    let st = std::process::Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
+    assert!(st.success());
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/target/debug/mail-parse-jail")
+}
+
+/// A reply to an HTML message quotes it with its formatting: shown in a
+/// doc-viewer slot, sent in a cited blockquote, "> " lines in the plain part.
+#[test]
+fn reply_quotes_the_html_original() {
+    use mail_sync::{Fetched, RemoteFolder, Role, Sink};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let bytes = b"From: Arun <arun@acme.example>\r\nTo: Priya <priya@example.org>\r\nSubject: Q4 numbers\r\nDate: Mon, 23 Nov 2026 08:00:00 +0000\r\nMessage-ID: <q4@acme.example>\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body><p>The <b>numbers</b> are in.</p><ul><li>North up</li></ul><script>x()</script></body></html>\r\n".to_vec();
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: 300, internal_date: Some(NOW), server_id: None, bytes, full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut main = App::new_with_flag(view, dirty);
+    main.tick();
+    mail.open(0);
+    main.tick();
+    assert!(mail.key(&typed("r"), None));
+    let (c, _) = mail.take_composes().remove(0);
+    assert!(c.original.is_some(), "the original's document comes along");
+    let q = c.draft.quote.clone().unwrap();
+    assert!(q.html.contains("<blockquote type=\"cite\"") && q.html.contains("<b>numbers</b>") && !q.html.contains("script"), "{}", q.html);
+    assert!(q.text.contains("> The numbers are in."), "{:?}", q.text);
+
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x.starts_with("On ") && x.ends_with("Arun wrote:")), "{t:?}");
+    assert!(t.iter().any(|x| x == "Remove"));
+    assert!(app.take_slot_changes().iter().any(|(k, r)| *k == atrium_mail::compose::QUOTE_SLOT && r.is_some()), "a slot for the doc-viewer");
+    // Sent: the person's text, then the original.
+    k.to.set(TextEdit::new("arun@acme.example"));
+    {
+        let r = k.rich.borrow();
+        let mut e = r.as_ref().unwrap().editor.borrow_mut();
+        e.set_caret(pergola_richtext::Pos::new(0, 0), false);
+        e.insert("Great, thanks");
+    }
+    let d = k.draft();
+    assert_eq!(d.text, "Great, thanks", "only the person's text; the quote is apart");
+    assert!(k.send(Some([3; 16]), None));
+    let (_, o) = engine.store.outbox().unwrap().remove(0);
+    let raw = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap().replace("=\r\n", "");
+    let plain = raw.split("text/plain").nth(1).unwrap();
+    assert!(plain.contains("Great, thanks") && plain.contains("> The numbers are in.") && plain.contains("> - North up"), "{raw}");
+    let html = raw.split("text/html").nth(1).unwrap();
+    assert!(html.contains("<p>Great, thanks</p>") && html.contains("<blockquote type=\"cite\""), "{raw}");
+    assert!(html.contains("<b>numbers</b>") && html.contains("<li>North up</li>") && !html.contains("x()"), "{raw}");
+
+    // Remove takes the original away; plain text folds the quote into the text.
+    mail.reply(mail_compose::reply::Kind::Reply);
+    let (c, _) = mail.take_composes().remove(0);
+    let k = Composer::new(engine.clone(), c.clone(), None, Arc::new(AtomicBool::new(true)), move || NOW);
+    k.remove_quote();
+    assert!(k.original.borrow().is_none() && k.draft().quote.is_none());
+    let k = Composer::new(engine.clone(), c, None, Arc::new(AtomicBool::new(true)), move || NOW);
+    k.set_rich(false);
+    assert!(k.original.borrow().is_none() && k.draft().quote.is_none());
+    assert!(k.draft().text.contains("wrote:\n> The numbers are in."), "{:?}", k.draft().text);
 }
