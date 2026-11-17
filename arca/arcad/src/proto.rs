@@ -50,6 +50,14 @@ pub mod op {
     /// a Wi-Fi passphrase field (held with `HOLD_FOR_WIFI`) and nothing
     /// else: not a stored item, not another field's value.
     pub const TAKE_WIFI: u16 = 0x0A;
+    /// Keep what the user typed into (or picked on) this app's credential
+    /// field as a password for one or more of this app's endpoints (mail.md
+    /// §5.1: one password for the IMAP and the SMTP server), the app never
+    /// holding it: `handle[16] | u8 class | str account | u8 n (1..=4) | n ×
+    /// endpoint` → `n × id[16]`. The handle is redeemed once, for this app.
+    pub const KEEP_FOR: u16 = 0x0B;
+    /// Most endpoints one `KEEP_FOR` binds.
+    pub const KEEP_FOR_MAX: usize = 4;
     /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.

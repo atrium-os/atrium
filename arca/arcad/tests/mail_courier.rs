@@ -135,3 +135,48 @@ fn registry_lines_take_mail_schemes_without_partitions() {
     assert!(parse_line("64001 alice p http example.org 80").is_none());
     assert!(parse_line("64001 alice p gopher example.org 70").is_none());
 }
+
+fn hold(s: &mut State, app_id: &str, typed: &[u8]) -> [u8; 16] {
+    let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { w.str("alice"); w.raw(&[7; 32]); w.str(app_id); w.bytes(typed); }));
+    assert_eq!(r.status, status::OK);
+    r.body.bytes().try_into().unwrap()
+}
+
+fn keep(s: &mut State, h: [u8; 16], eps: &[(Scheme, &str, u16)]) -> (u8, Vec<[u8; 16]>) {
+    let r = s.handle(&app(), op::KEEP_FOR, &body(|w| {
+        w.raw(&h);
+        w.u8(2);
+        w.str("priya@example.org");
+        w.u8(eps.len() as u8);
+        for (sc, host, port) in eps {
+            write_endpoint_scheme(w, *sc, host, *port);
+        }
+    }));
+    (r.status, r.body.bytes().chunks(16).map(|c| c.try_into().unwrap()).collect())
+}
+
+#[test]
+fn a_typed_password_is_kept_for_imap_and_smtp_without_the_app_seeing_it() {
+    let (_d, mut s) = setup();
+    let h = hold(&mut s, MAIL, b"typed-in-arca");
+    let eps = [(Scheme::Imaps, "imap.example.org", 993), (Scheme::Submissions, "smtp.example.org", 465)];
+    let (st, ids) = keep(&mut s, h, &eps);
+    assert_eq!(st, status::OK);
+    assert_eq!(ids.len(), 2);
+    let want = Some(("priya@example.org".to_string(), b"typed-in-arca".to_vec()));
+    assert_eq!(login(&mut s, &courier(Scheme::Imaps, "imap.example.org", 993), ids[0]), (status::OK, want.clone()));
+    assert_eq!(login(&mut s, &courier(Scheme::Submissions, "smtp.example.org", 465), ids[1]), (status::OK, want));
+    // Each item is only its own endpoint's.
+    assert_eq!(login(&mut s, &courier(Scheme::Imaps, "imap.example.org", 993), ids[1]).0, status::DENIED);
+    // A handle is used once.
+    assert_eq!(keep(&mut s, h, &eps).0, status::DENIED);
+    // Another app's field handle isn't Mail's to keep (and is burned).
+    let other = hold(&mut s, "org.example.other", b"x");
+    assert_eq!(keep(&mut s, other, &eps).0, status::DENIED);
+    // Mail can't read it back.
+    assert_eq!(s.handle(&app(), op::RELEASE, &ids[0]).status, status::DENIED);
+    // Bounds.
+    let h = hold(&mut s, MAIL, b"y");
+    assert_eq!(keep(&mut s, h, &[]).0, status::MALFORMED);
+    assert_eq!(keep(&mut s, h, &[(Scheme::Https, "x.example", 443); 5]).0, status::MALFORMED);
+}
