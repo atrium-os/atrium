@@ -117,6 +117,8 @@ enum Drag {
     Resize { h: u8, orig: Rect },
     /// Selecting text in the frame being edited.
     Text,
+    /// Dragging the selected shape's yellow handle `i`: its outline changes.
+    Adjust { i: u8 },
 }
 
 /// What is selected and how the canvas is being used.
@@ -633,6 +635,22 @@ fn hit_shape(deck: &Deck, owner: Owner, shapes: &[Shape], x: f64, y: f64) -> Opt
 
 /// The eight handles of a box `r` in px: corners and edge middles,
 /// clockwise from the top left.
+/// The yellow adjust handles of drawn shape `id` (window points), from
+/// the standard's definitions for its preset: none for other shapes.
+fn adjust_handles(deck: &Deck, owner: Owner, shapes: &[Shape], id: ShapeId, to_px: &draw::Xform) -> Vec<(f32, f32)> {
+    let Some(s) = find(shapes, id).filter(|s| matches!(s.kind, ShapeKind::Geom { .. })) else { return Vec::new() };
+    let Some((m, w, h)) = draw::shape_box(deck, owner, shapes, id) else { return Vec::new() };
+    let g = resolve::resolve(deck, owner, s).geom;
+    let m = draw::mul(to_px, &m);
+    officina_slides::geom::handles(&g, w as i64, h as i64)
+        .into_iter()
+        .map(|(x, y)| {
+            let (px, py) = draw::apply(&m, x as f64, y as f64);
+            (px as f32, py as f32)
+        })
+        .collect()
+}
+
 fn handles(r: PRect) -> [(f32, f32); 8] {
     let (x0, y0, x1, y1) = (r.x(), r.y(), r.x() + r.w(), r.y() + r.h());
     let (xm, ym) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
@@ -732,7 +750,14 @@ impl Slides {
         sel.last_press = Some((Instant::now(), p));
         let slide = d.deck.slide_if_loaded(cur).expect("loaded").clone();
         let owner = Owner::Slide(slide.layout);
-        // A handle of the selected shape first.
+        // A yellow handle of the selected shape first, then its size handles.
+        if let (Some(id), None, true) = (sel.shape, &sel.edit, sel.more.is_empty()) {
+            let near = adjust_handles(&d.deck, owner, &slide.shapes, id, &place.xform()).into_iter().position(|(hx, hy)| (p.x - hx).abs() <= 6.0 && (p.y - hy).abs() <= 6.0);
+            if let Some(i) = near.filter(|&i| i <= u8::MAX as usize) {
+                sel.drag = Some(Drag::Adjust { i: i as u8 });
+                return;
+            }
+        }
         if let (Some(id), None, true) = (sel.shape, &sel.edit, sel.more.is_empty()) {
             if let Some((m, w, h)) = draw::shape_box(&d.deck, owner, &slide.shapes, id) {
                 let b = render::bounds(&draw::mul(&place.xform(), &m), w, h);
@@ -863,6 +888,33 @@ impl Slides {
         let owner = Owner::Slide(slide.layout);
         let shapes: Vec<Shape> = ids.iter().filter_map(|&i| find(&slide.shapes, i).cloned()).collect();
         if shapes.is_empty() {
+            return;
+        }
+        if let Drag::Adjust { i } = drag {
+            // The pointer read back into the shape's own box; its adjust
+            // values set so the handle lands as near it as the shape allows.
+            let x = &shapes[0];
+            let Some((m, w, h)) = draw::shape_box(&d.deck, owner, &slide.shapes, x.id) else { return };
+            let (lx, ly) = draw::apply(&frame::invert(&m), ex as f64, ey as f64);
+            let o = drag_orig(sid, x);
+            let g0 = resolve::resolve(&d.deck, owner, &o).geom;
+            let Some(g) = officina_slides::geom::drag_handle(&g0, i as usize, w as i64, h as i64, lx.round() as i64, ly.round() as i64) else { return };
+            let mut n = o.clone();
+            if let ShapeKind::Geom { geom, .. } = &mut n.kind {
+                *geom = Some(g);
+            }
+            if end {
+                sel.drag = None;
+                let o = DRAG_ORIG.with(|c| c.borrow_mut().remove(&(sid, x.id))).unwrap_or_else(|| x.clone());
+                DRAG_ORIG.with(|c| c.borrow_mut().clear());
+                d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(o.clone()) });
+                let ops = if o.kind != n.kind { vec![DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(n) }] } else { Vec::new() };
+                d.run("Adjust", ops);
+            } else {
+                DRAG_ORIG.with(|c| c.borrow_mut().entry((sid, x.id)).or_insert_with(|| x.clone()).clone());
+                d.probe(DeckOp::SetShape { target: Target::Slide(sid), shape: Box::new(n) });
+                d.touched.push(sid);
+            }
             return;
         }
         let snap = (SNAP_PX as f64 / place.k) as i64;
@@ -1310,6 +1362,10 @@ impl Slides {
                             out.push(Node::Rect { rect: PRect::new(hx - 4.5, hy - 4.5, 9.0, 9.0), fill: acc, radius: 2.0 });
                             out.push(Node::Rect { rect: PRect::new(hx - 3.0, hy - 3.0, 6.0, 6.0), fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 1.5 });
                         }
+                        for (hx, hy) in adjust_handles(&d.deck, owner, &slide.shapes, id, &place.xform()) {
+                            out.push(Node::Rect { rect: PRect::new(hx - 5.5, hy - 5.5, 11.0, 11.0), fill: Color::from_srgb8(0x5c, 0x47, 0x00), radius: 5.5 });
+                            out.push(Node::Rect { rect: PRect::new(hx - 4.5, hy - 4.5, 9.0, 9.0), fill: Color::from_srgb8(0xf5, 0xc5, 0x18), radius: 4.5 });
+                        }
                     }
                 }
             }
@@ -1443,6 +1499,35 @@ mod tests {
         s.doc.borrow_mut().undo();
         let back = s.doc.borrow_mut().deck.slide(0).unwrap().shapes.last().unwrap().frame.unwrap();
         assert_eq!(back, before);
+    }
+
+    #[test]
+    fn a_yellow_handle_drag_changes_the_outline_as_one_undo_step() {
+        let ui = Mutable::new(Ui::default());
+        let s = Slides::new(Doc::new("t"), ui, Mutable::new(0), (1200.0, 800.0));
+        s.cmds.lock().unwrap().push(Cmd::Shape(5));
+        s.take_cmds();
+        let handles_now = |s: &Slides| {
+            let mut d = s.doc.borrow_mut();
+            let place = s.slide_place(&d.deck);
+            let sl = d.deck.slide(0).unwrap().clone();
+            let id = sl.shapes.last().unwrap().id;
+            (id, adjust_handles(&d.deck, Owner::Slide(sl.layout), &sl.shapes, id, &place.xform()))
+        };
+        let (id, hs) = handles_now(&s);
+        assert_eq!(hs.len(), 2, "a right arrow's body and head");
+        *s.sel.borrow_mut() = Sel { shape: Some(id), ..Sel::default() };
+        // The head's handle pulled 30 points left: a longer head.
+        let (hx, hy) = hs[1];
+        s.press(Point::new(hx, hy));
+        assert_eq!(s.sel.borrow().drag, Some(Drag::Adjust { i: 1 }));
+        s.drag_to(Point::new(hx - 15.0, hy), false);
+        s.drag_to(Point::new(hx - 30.0, hy + 4.0), true);
+        let (_, after) = handles_now(&s);
+        assert!((after[1].0 - (hx - 30.0)).abs() <= 1.0 && (after[1].1 - hy).abs() <= 0.5, "{hs:?} {after:?}");
+        assert_eq!(after[0], hs[0], "the other handle stays");
+        s.doc.borrow_mut().undo();
+        assert_eq!(handles_now(&s).1, hs);
     }
 
     #[test]

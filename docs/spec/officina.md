@@ -3299,8 +3299,11 @@ odt 52/52, floats 8/8, headers 4/4, slides 84/84).
   then halving steps), handles that move two values twice over; a turned
   or flipped shape's pointer is read back into its own box first. One
   undoable Adjust; kept in `.docx`/`.odt` as the preset's adjust values.
-- **Not yet**: adjust handles on shapes in line and in Slides, moving the
-  anchor with the shape, grouping in Write.
+- **In Slides too** (same day): the selected drawn shape shows the same
+  yellow handles on the canvas; a drag shows the outline live and lands as
+  one undoable Adjust (inside groups and on turned shapes as well).
+- **Not yet**: adjust handles on shapes in line with Write's text, moving
+  the anchor with the shape, grouping in Write.
 
 Gates: every preset's every handle lands on itself when dragged there,
 an arrow's head and a callout's pointer dragged (also turned a quarter);
