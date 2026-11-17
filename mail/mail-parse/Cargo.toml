@@ -20,10 +20,12 @@ navigator-image = { path = "../../navigator-image", optional = true }
 # The jail runner: the engine conversation's fixed format.
 mail-schema = { path = "../mail-schema", optional = true }
 mail-smime = { path = "../mail-smime", optional = true }
+# Cards (§14.3): the sender's schema.org JSON-LD, read in the jail.
+serde_json = { version = "1", optional = true }
 
 [features]
 default = ["html", "jail"]
-jail = ["html", "dep:mail-schema", "dep:mail-smime"]
+jail = ["html", "dep:mail-schema", "dep:mail-smime", "dep:serde_json"]
 html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", "dep:navigator-style", "dep:navigator-image"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent

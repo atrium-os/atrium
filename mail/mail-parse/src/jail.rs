@@ -336,7 +336,8 @@ fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, lo
         _ => None,
     }).collect());
     let attachments = attachments(raw, &s, &shown);
-    Ok(wire::Opened { summary, document, attachments })
+    let card = s.html.as_deref().and_then(crate::cards::card);
+    Ok(wire::Opened { summary, document, attachments, card })
 }
 
 /// The most files unpacked from a message's `winmail.dat` parts.

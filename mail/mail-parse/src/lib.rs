@@ -21,6 +21,8 @@ pub mod tnef;
 pub mod html;
 #[cfg(feature = "jail")]
 pub mod jail;
+#[cfg(feature = "jail")]
+pub mod cards;
 pub(crate) mod mime;
 
 pub use address::Address;

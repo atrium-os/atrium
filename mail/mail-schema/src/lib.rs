@@ -275,7 +275,80 @@ pub struct Opened {
     /// replaced by the files in it), forwarded messages, pictures that no
     /// HTML shows. Their bytes come with [`ToJail::Attachment`].
     pub attachments: Vec<Attachment>,
+    /// An order, trip or booking the sender described in schema.org
+    /// JSON-LD (§14.3). Shown only when the sender is verified.
+    pub card: Option<Card>,
 }
+
+/// What a card is about (§14.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CardKind { Order, Parcel, Flight, Train, Bus, Hotel, Table, Event, Car }
+
+impl CardKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CardKind::Order => "Order",
+            CardKind::Parcel => "Delivery",
+            CardKind::Flight => "Flight",
+            CardKind::Train => "Train",
+            CardKind::Bus => "Bus",
+            CardKind::Hotel => "Stay",
+            CardKind::Table => "Table",
+            CardKind::Event => "Event",
+            CardKind::Car => "Car",
+        }
+    }
+}
+
+/// A card's lines: Mail's own labels, the sender's values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CardField {
+    Status, Number, Merchant, Total, Item, Carrier, Tracking, Delivery,
+    Flight, Departs, Arrives, From, To, Seat, Passenger,
+    Place, Address, CheckIn, CheckOut, Starts, Guests, PickUp, DropOff,
+}
+
+impl CardField {
+    pub fn label(self) -> &'static str {
+        match self {
+            CardField::Status => "Status",
+            CardField::Number => "Number",
+            CardField::Merchant => "Seller",
+            CardField::Total => "Total",
+            CardField::Item => "Item",
+            CardField::Carrier => "Carrier",
+            CardField::Tracking => "Tracking",
+            CardField::Delivery => "Expected",
+            CardField::Flight => "Flight",
+            CardField::Departs => "Departs",
+            CardField::Arrives => "Arrives",
+            CardField::From => "From",
+            CardField::To => "To",
+            CardField::Seat => "Seat",
+            CardField::Passenger => "Passenger",
+            CardField::Place => "Where",
+            CardField::Address => "Address",
+            CardField::CheckIn => "Check-in",
+            CardField::CheckOut => "Check-out",
+            CardField::Starts => "When",
+            CardField::Guests => "Guests",
+            CardField::PickUp => "Pick-up",
+            CardField::DropOff => "Drop-off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Card {
+    pub kind: CardKind,
+    /// "Order 1234", "AI 101 Delhi → Mumbai": plain text.
+    pub title: String,
+    pub fields: Vec<(CardField, String)>,
+}
+
+/// Most lines on a card, and longest value.
+pub const CARD_FIELDS_MAX: usize = 16;
+pub const CARD_VALUE_MAX: usize = 200;
 
 /// One attachment, for the strip (§8.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,6 +557,12 @@ impl Opened {
                 if text.chars().count() > LINK_TEXT_MAX || text.len() > 4 * LINK_TEXT_MAX { return Err(Lie("link text too long")) }
             }
         }
+        if let Some(card) = &self.card {
+            if card.fields.len() > CARD_FIELDS_MAX { return Err(Lie("too many card fields")) }
+            for v in std::iter::once(&card.title).chain(card.fields.iter().map(|f| &f.1)) {
+                if v.len() > CARD_VALUE_MAX || v.trim().is_empty() || v.chars().any(char::is_control) { return Err(Lie("card value")) }
+            }
+        }
         if self.attachments.len() > c.attachments { return Err(Lie("too many attachments")) }
         for a in &self.attachments {
             short(&a.name, c, "attachment name")?;
@@ -567,6 +646,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_card_is_held_to_its_limits() {
+        let c = Caps::default();
+        let card = |title: &str, n: usize| Opened { card: Some(Card { kind: CardKind::Order, title: title.into(), fields: vec![(CardField::Number, "1".into()); n] }), ..Default::default() };
+        assert_eq!(card("Order 1", 3).check(&c, 10), Ok(()));
+        assert!(card("Order 1", CARD_FIELDS_MAX + 1).check(&c, 10).is_err());
+        assert!(card("", 1).check(&c, 10).is_err());
+        assert!(card("Order\n1", 1).check(&c, 10).is_err());
+        assert!(card(&"x".repeat(CARD_VALUE_MAX + 1), 1).check(&c, 10).is_err());
+    }
+
+    #[test]
     fn pictures_are_only_the_message_s_own() {
         let res = |id: &str, source: Source| Resource { id: id.into(), source, used_as: Use::Image, hidden: false };
         let mut o = Opened {
@@ -579,6 +669,7 @@ mod tests {
                 links: vec![],
             }),
             attachments: vec![],
+            card: None,
         };
         let c = Caps::default();
         assert_eq!(o.check(&c, 100), Ok(()));
