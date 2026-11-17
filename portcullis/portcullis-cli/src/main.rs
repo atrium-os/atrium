@@ -22,9 +22,12 @@ usage:
     portcullis validate <atrium.toml>
         Parses and validates a manifest. Exits 0 on success.
 
-    portcullis launch [--dry-run | --no-prompt] <app-id|app-tree>
+    portcullis launch [--dry-run | --no-prompt] [--persona NAME] <app-id|app-tree>
         Reads <tree>/atrium.toml, builds a jail.conf section, and
         launches the jail.
+
+        --persona NAME runs the app's instance in that persona (one of
+        the person's personas, personas.md): its own jail, uid and data.
 
         Default mode: consults the per-user policy file. If the
         manifest asks for capabilities the user hasn't granted,
@@ -130,8 +133,14 @@ fn main() -> ExitCode {
             let mut dry_run = false;
             let mut no_prompt = false;
             let mut tree: Option<&str> = None;
-            for a in &args[2..] {
+            let mut persona: Option<&str> = None;
+            let mut it = args[2..].iter();
+            while let Some(a) = it.next() {
                 match a.as_str() {
+                    "--persona"   => match it.next() {
+                        Some(p) => persona = Some(p.as_str()),
+                        None => usage(),
+                    },
                     "--dry-run"   => dry_run = true,
                     "--no-prompt" => no_prompt = true,
                     other if other.starts_with("--") => {
@@ -142,7 +151,7 @@ fn main() -> ExitCode {
                 }
             }
             let Some(t) = tree else { usage() };
-            cmd_launch(t, dry_run, no_prompt)
+            cmd_launch(t, dry_run, no_prompt, persona)
         }
         "exec" => {
             /* A one-shot jail wired to this process's pipes — the worker-pool
@@ -263,7 +272,13 @@ fn resolve_app_tree(arg: &str) -> PathBuf {
     }
 }
 
-fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
+fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool, persona: Option<&str>) -> ExitCode {
+    /* A persona instance (personas.md §3) is the daemon's alone: the in-process
+     * fallback below has no registry or home places for it. */
+    if persona.is_some() && (dry_run || !looks_like_app_id(tree_arg)) {
+        eprintln!("portcullis launch: --persona needs an installed app id and portcullisd");
+        return ExitCode::from(2);
+    }
     /* Daemon-first short-circuit for app-id launches: when the arg
      * is an app-id (not an explicit path) and we're not doing a
      * dry-run, just forward to portcullisd. The daemon runs on the
@@ -273,7 +288,7 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
      * the work. (Local manifest read remains for --dry-run and
      * for explicit-path launches below.) */
     if !dry_run && looks_like_app_id(tree_arg) {
-        match daemon::launch(tree_arg, no_prompt) {
+        match daemon::launch(tree_arg, no_prompt, persona) {
             Ok(Some(reply)) => {
                 return handle_daemon_launch_reply(reply, tree_arg, no_prompt);
             }
@@ -434,7 +449,7 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
     if looks_like_app_id(tree_arg) {
         let mut bypass = no_prompt;
         loop {
-            match daemon::launch(&manifest.app.id, bypass) {
+            match daemon::launch(&manifest.app.id, bypass, None) {
                 Ok(Some(daemon::LaunchReply::Exited { code })) => {
                     return match code {
                         Some(0) => ExitCode::SUCCESS,

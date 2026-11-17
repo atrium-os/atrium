@@ -7,6 +7,9 @@
 //! Installed as `stay_probe` (scripts/vm-console-check.sh, homes.md §4) it
 //! also leaves `/var/console-mark` in its overlay and stays running, so a
 //! console has a jail to join.
+//!
+//! scripts/vm-personas-check.sh (personas.md P0) reads `hostuuid=` too: a
+//! persona's instance has its own synthetic identity.
 
 use std::io::Write;
 
@@ -34,7 +37,15 @@ fn main() {
         "-".into()
     };
     let group = std::fs::metadata("/atrium/home/Documents/probe.txt").map(|m| format!("{}", m.gid())).unwrap_or_else(|_| "-".into());
-    eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group}");
+    // The synthetic host identity the jail was given (portcullis.md §9.1c).
+    let hostuuid = {
+        let mut buf = [0u8; 64];
+        let mut len = buf.len();
+        let name = std::ffi::CString::new("kern.hostuuid").unwrap();
+        let r = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0) };
+        if r == 0 { String::from_utf8_lossy(&buf[..len]).trim_end_matches('\0').to_string() } else { "?".into() }
+    };
+    eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group} hostuuid={hostuuid}");
     let me = std::env::args().next().unwrap_or_default();
     if me.ends_with("stay_probe") {
         let _ = std::fs::write("/var/console-mark", "stay-mark\n");

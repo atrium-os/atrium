@@ -59,6 +59,24 @@ pub fn launch_with_stdio(
     user:   &str,
     stdio:  Option<[OwnedFd; 3]>,
 ) -> Result<LaunchOutcome, LaunchError> {
+    launch_instance(app_id, None, user, stdio)
+}
+
+/// Launch `(user, app_id)`'s instance in `persona` (personas.md §3; `None`:
+/// Personal). A named persona's instance is its own jail
+/// (`<id>@<persona>` root, `<name>__p_<persona>` jail), its own uid (registry
+/// line `persona=<name>`), its own overlay (`apps/<id>@<persona>`) and its own
+/// synthetic host identity, so the two instances share nothing an app could
+/// use to link them. The caller has checked the persona is the person's.
+pub fn launch_instance(
+    app_id:  &str,
+    persona: Option<&str>,
+    user:    &str,
+    stdio:   Option<[OwnedFd; 3]>,
+) -> Result<LaunchOutcome, LaunchError> {
+    if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
+        return Err(LaunchError::Failed("persona", "invalid persona name".into()));
+    }
     let tree = PathBuf::from(APPS_DIR).join(app_id);
     if !tree.exists() {
         return Err(LaunchError::Failed("manifest",
@@ -83,7 +101,12 @@ pub fn launch_with_stdio(
         return Err(LaunchError::Failed("manifest", msg));
     }
 
-    let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
+    let jail_path   = PathBuf::from(JAILS_DIR).join(instance_key(app_id, persona));
+    if persona.is_some() {
+        if let Some(why) = not_instanced_manifest(&manifest) {
+            return Err(LaunchError::Failed("persona", format!("{app_id} runs once for every persona: {why}")));
+        }
+    }
 
     /* PRIVILEGE INVARIANT (portcullis.md §9.0): the app runs under a dedicated,
      * non-root, non-human per-app uid (50000+) — NEVER root, NEVER the connecting
@@ -91,8 +114,9 @@ pub fn launch_with_stdio(
      * launch registry; the process executes as the per-app uid that services
      * peer-cred back to (owner, app_id). $HOME is the app uid's own (nologin)
      * home, not the human's. */
-    let (app_uid, run_as_user) = resolve_app_uid(user, app_id, publisher.as_ref())?;
-    eprintln!("portcullisd: launching {app_id} as uid {app_uid} ({run_as_user}); owner={user}");
+    let (app_uid, run_as_user) = resolve_instance_uid(user, app_id, publisher.as_ref(), persona)?;
+    eprintln!("portcullisd: launching {app_id} as uid {app_uid} ({run_as_user}); owner={user} persona={}",
+              persona.unwrap_or("personal"));
     let user_home = match std::ffi::CString::new(run_as_user.as_str()).ok().and_then(|cuser| {
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut buf = vec![0u8 as libc::c_char; 4096];
@@ -113,7 +137,7 @@ pub fn launch_with_stdio(
     /* ★ The app's synthetic host identity (portcullis.md §9.1c) — derived from
      * the BASE app id, so the setup phase below sees the same hostid/UUID the
      * app will: a licence registered during setup must still match at run. */
-    let host_identity = portcullis_identity::for_app(&manifest.app.id)
+    let host_identity = portcullis_identity::for_app(&instance_key(&manifest.app.id, persona))
         .map_err(|e| LaunchError::Failed("identity", e.to_string()))?;
     let sysfil = app_sysfil(&manifest)?;
     let opts = BuildOpts {
@@ -126,7 +150,7 @@ pub fn launch_with_stdio(
          * /var/lib/atrium/jails/<id> and one persistent overlay, so a second
          * concurrent jail here would share both. Concurrency belongs to the
          * one-shot piped path, which gets its own root per instance. */
-        instance: None,
+        instance: persona.map(|p| format!("p-{p}")),
         persist: true,
         host_identity,
         sysfil,
@@ -149,7 +173,11 @@ pub fn launch_with_stdio(
         .and_then(portcullis_overlay::parse_size)
         .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
     // The person's own overlay, in their home (homes.md §3).
-    let place = portcullis_overlay::place(Some(user), app_id);
+    let place = match persona {
+        None => portcullis_overlay::place(Some(user), app_id),
+        Some(p) => portcullis_overlay::persona_place(user, app_id, p).ok_or_else(||
+            LaunchError::Failed("overlay", format!("no home place for {user}'s {p} instance of {app_id}")))?,
+    };
     let overlay_dir = place.dir.clone();
     let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
         .map_err(|m| LaunchError::Failed("mount", m))?;
@@ -283,7 +311,12 @@ pub fn launch_with_stdio(
      * at /atrium/sockets/opens. Made before the mount, so the source exists. */
     let mut jc = jc;
     // The terminal gets its consoles the same way (homes.md §4).
-    if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
+    /* A named persona's instance gets no document channel yet: the hub is
+     * keyed by app id, so it would share the Personal instance's, and
+     * crossing personas is off by default (personas.md §6, step P3). */
+    if persona.is_some() && (!manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true)) {
+        eprintln!("portcullisd: {app_id}@{}: no document channel for persona instances yet (personas.md P3)", persona.unwrap_or(""));
+    } else if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(app_id)
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
@@ -596,6 +629,12 @@ pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
 /// out (mount/jail/umount). Longer-term this privileged mutation belongs in jaild
 /// (the audited broker) or at app-install time, not in portcullisd per-launch.
 pub fn resolve_app_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Result<(u32, String), LaunchError> {
+    resolve_instance_uid(owner, app_id, publisher, None)
+}
+
+/// [`resolve_app_uid`] for the instance in `persona`: each persona's instance
+/// has its own uid (personas.md §3), reused across its own launches only.
+pub fn resolve_instance_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>) -> Result<(u32, String), LaunchError> {
     let reg = portcullis_peer::DEFAULT_REGISTRY;
     let fail = |s: String| LaunchError::Failed("uid", s);
     if let Some(dir) = Path::new(reg).parent() {
@@ -603,11 +642,11 @@ pub fn resolve_app_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>) 
     }
     /* Reuse only a binding with the SAME publisher: an app id re-installed under
      * another publisher's key is another app (arca.md §4.1) and gets a new uid. */
-    let uid = match portcullis_peer::uid_for_app_publisher(reg, owner, app_id, publisher) {
+    let uid = match portcullis_peer::uid_for_app_instance(reg, owner, app_id, publisher, persona) {
         Some(uid) => uid,
         None => {
             let uid = portcullis_peer::allocate(reg);
-            portcullis_peer::register_with_publisher(reg, uid, owner, app_id, publisher)
+            portcullis_peer::register_instance(reg, uid, owner, app_id, publisher, persona)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
         }
@@ -1001,6 +1040,54 @@ pub fn running_jid(app_id: &str) -> Option<i32> {
         return None;   /* jls exits non-zero when the jail does not exist */
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The key of an instance: `<id>` for Personal, `<id>@<persona>` for a named
+/// persona. Names the jail root and seeds the synthetic host identity.
+pub fn instance_key(app_id: &str, persona: Option<&str>) -> String {
+    match persona {
+        None => app_id.to_string(),
+        Some(p) => format!("{app_id}@{p}"),
+    }
+}
+
+/// As [`running_jid`], for the instance in `persona`.
+pub fn running_jid_instance(app_id: &str, persona: Option<&str>) -> Option<i32> {
+    let name = portcullis_jail::jail_name_for_instance(app_id, persona.map(|p| format!("p-{p}")).as_deref());
+    let out = Command::new("jls").args(["-j", &name, "jid"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The uid of `user`'s instance of `app_id` in `persona`, if one was ever
+/// registered (any publisher).
+pub fn instance_uid(user: &str, app_id: &str, persona: Option<&str>) -> Option<u32> {
+    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok()?
+        .uid_for_persona(user, app_id, persona)
+}
+
+/// Why `app_id` has no per-persona instances, if it has none: system apps
+/// that span personas (personas.md §3: the file manager, the settings app,
+/// apps that reach every workspace) run once and show both sides.
+pub fn not_instanced(app_id: &str) -> Option<String> {
+    match installed(app_id) {
+        Some(m) => not_instanced_manifest(&m),
+        None => None, // launching reports the missing app
+    }
+}
+
+fn not_instanced_manifest(m: &Manifest) -> Option<String> {
+    let c = &m.capabilities;
+    let spans = [
+        (c.home_files == Some(true), "home-files"),
+        (c.removable_files == Some(true), "removable-files"),
+        (c.app_grants == Some(true), "app-grants"),
+        (c.workspaces == Some(true), "workspaces"),
+        (c.workspace_exec == Some(true), "workspace-exec"),
+    ];
+    spans.iter().find(|(on, _)| *on).map(|(_, cap)| format!("it holds {cap}"))
 }
 
 /// Does this app's manifest say only one instance may run?

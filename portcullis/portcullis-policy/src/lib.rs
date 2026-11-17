@@ -49,6 +49,50 @@ pub struct Policy {
     /// policy alone.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workers: BTreeMap<String, WorkerRule>,
+    /// The person's named personas (personas.md §2), by name. Personal is
+    /// always there and is never listed. Owned by portcullisd; Curia changes
+    /// them through it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub personas: BTreeMap<String, PersonaDef>,
+}
+
+/// The colours a persona may take (personas.md §2): a fixed set, distinct
+/// from one another by design, so "close colours" cannot happen. frescod and
+/// forum-wm draw the chip and frame in them; no app chooses its own.
+pub const PERSONA_COLOURS: &[&str] = &["blue", "green", "orange", "purple", "red", "teal", "pink", "yellow"];
+
+/// The most named personas a person may have.
+pub const MAX_PERSONAS: usize = 8;
+
+/// One named persona.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PersonaDef {
+    /// One of [`PERSONA_COLOURS`].
+    pub colour: String,
+    /// The VPN profile its instances route through (vpn.md §9.7), by
+    /// cryptad's profile name; `None` = direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<String>,
+}
+
+/// Why a persona list is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersonaError {
+    BadName(String),
+    BadColour(String),
+    SameColour(String, String),
+    TooMany,
+}
+
+impl std::fmt::Display for PersonaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PersonaError::BadName(n) => write!(f, "persona name {n:?}: use 1-32 of a-z, 0-9 and -, starting with a letter, not \"personal\""),
+            PersonaError::BadColour(c) => write!(f, "persona colour {c:?}: one of {}", PERSONA_COLOURS.join(", ")),
+            PersonaError::SameColour(a, b) => write!(f, "personas {a:?} and {b:?} have the same colour"),
+            PersonaError::TooMany => write!(f, "at most {MAX_PERSONAS} personas"),
+        }
+    }
 }
 
 /// One delegation: `callers` (user names, e.g. `_frescod`) may run the app
@@ -78,6 +122,36 @@ pub struct WorkerRule {
 }
 
 impl Policy {
+    /// Check the persona list: valid names, colours from the set, no two
+    /// personas sharing a colour, at most [`MAX_PERSONAS`].
+    pub fn check_personas(&self) -> Result<(), PersonaError> {
+        if self.personas.len() > MAX_PERSONAS {
+            return Err(PersonaError::TooMany);
+        }
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, def) in &self.personas {
+            if !portcullis_peer::valid_persona(name) {
+                return Err(PersonaError::BadName(name.clone()));
+            }
+            if !PERSONA_COLOURS.contains(&def.colour.as_str()) {
+                return Err(PersonaError::BadColour(def.colour.clone()));
+            }
+            if let Some(other) = seen.insert(def.colour.as_str(), name.as_str()) {
+                return Err(PersonaError::SameColour(other.to_string(), name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `persona` may be launched in: `None` (Personal) always; a
+    /// name only if it is one of the person's personas and the list is valid.
+    pub fn has_persona(&self, persona: Option<&str>) -> bool {
+        match persona {
+            None => true,
+            Some(p) => self.check_personas().is_ok() && self.personas.contains_key(p),
+        }
+    }
+
     /// The delegation for `app_id` if `caller` is one of its callers.
     pub fn worker_rule(&self, app_id: &str, caller: &str) -> Option<&WorkerRule> {
         self.workers.get(app_id).filter(|r| r.callers.iter().any(|c| c == caller))
@@ -623,6 +697,33 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn personas_are_checked() {
+        let mut p: Policy = toml::from_str(r#"
+            [personas.work]
+            colour = "blue"
+            vpn = "acme"
+            [personas.side-gig]
+            colour = "teal"
+        "#).unwrap();
+        assert_eq!(p.check_personas(), Ok(()));
+        assert!(p.has_persona(None) && p.has_persona(Some("work")) && p.has_persona(Some("side-gig")));
+        assert!(!p.has_persona(Some("home")));
+        assert_eq!(p.personas["work"].vpn.as_deref(), Some("acme"));
+        p.personas.insert("home".into(), PersonaDef { colour: "blue".into(), vpn: None });
+        assert!(matches!(p.check_personas(), Err(PersonaError::SameColour(..))));
+        assert!(!p.has_persona(Some("work")), "an invalid list allows no named persona");
+        p.personas.get_mut("home").unwrap().colour = "beige".into();
+        assert_eq!(p.check_personas(), Err(PersonaError::BadColour("beige".into())));
+        p.personas.remove("home");
+        p.personas.insert("Personal".into(), PersonaDef { colour: "red".into(), vpn: None });
+        assert_eq!(p.check_personas(), Err(PersonaError::BadName("Personal".into())));
+        p.personas.remove("Personal");
+        // A policy without personas writes none.
+        let empty = Policy::default();
+        assert!(!toml::to_string_pretty(&empty).unwrap().contains("personas"));
+    }
+
     use super::*;
 
     #[test]

@@ -68,7 +68,7 @@ pub fn request(app_id: &str, stdio: [RawFd; 3]) -> PreLaunch {
         Ok(other) => return PreLaunch::Failed(format!("unexpected handshake reply: {other:?}")),
         Err(e) => return PreLaunch::Failed(format!("handshake: {e}")),
     }
-    if let Err(e) = write_request(&mut s, &Request::Launch { app_id: app_id.into(), bypass_policy: false }) {
+    if let Err(e) = write_request(&mut s, &Request::Launch { app_id: app_id.into(), bypass_policy: false, persona: None }) {
         return PreLaunch::Failed(format!("send: {e}"));
     }
     match read_response(&mut s) {

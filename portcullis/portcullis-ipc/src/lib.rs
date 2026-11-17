@@ -124,6 +124,10 @@ pub enum Request {
     Launch {
         app_id:        String,
         bypass_policy: bool,
+        /// The persona to run the instance in (personas.md §3); absent =
+        /// Personal. Each persona's instance is its own jail, uid and data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persona:       Option<String>,
     },
 
     /// Run an installed app in a ONE-SHOT jail wired to the caller's stdio.

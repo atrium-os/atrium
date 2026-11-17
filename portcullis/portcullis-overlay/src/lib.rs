@@ -158,6 +158,31 @@ pub fn apps_root(home: &Path) -> Result<PathBuf, String> {
 /// Where `person`'s overlay of `app_id` lives: in their home when they have
 /// one, else the machine-wide place.
 pub fn place(person: Option<&str>, app_id: &str) -> Place {
+    place_instance(person, app_id, None)
+}
+
+/// The overlay of the instance of `app_id` in `persona` (personas.md §3):
+/// `apps/<id>` for Personal, `apps/<id>@<persona>` for a named persona. A
+/// named persona needs the person's home (there is no machine-wide place for
+/// it) and a name that is one plain segment without `@`; otherwise `None`.
+pub fn persona_place(person: &str, app_id: &str, persona: &str) -> Option<Place> {
+    if !plain_segment(persona) || persona.contains('@') || app_id.contains('@') || !plain_segment(app_id) {
+        return None;
+    }
+    let home = home_of(person)?;
+    let apps = home.join(".atrium").join("apps");
+    let key = format!("{app_id}@{persona}");
+    Some(Place { dir: apps.join(&key), img: apps.join(format!("{key}.img")), person: Some(person.to_string()) })
+}
+
+/// [`place`] for an instance: Personal falls back as `place` does; a named
+/// persona without a home place is `None` (never the Personal or legacy one).
+pub fn place_instance(person: Option<&str>, app_id: &str, persona: Option<&str>) -> Place {
+    if let (Some(person), Some(persona)) = (person, persona) {
+        if let Some(p) = persona_place(person, app_id, persona) {
+            return p;
+        }
+    }
     if let Some(p) = person {
         if let (Some(home), true) = (home_of(p), plain_segment(app_id)) {
             let apps = home.join(".atrium").join("apps");
@@ -177,6 +202,23 @@ pub fn all_places(app_id: &str) -> Vec<Place> {
             let p = place(Some(&person), app_id);
             if p.person.is_some() && (p.img.exists() || p.dir.exists()) {
                 v.push(p);
+            }
+            // And each persona's instance (personas.md §3): `apps/<id>@<persona>`.
+            let apps = Path::new("/home").join(&person).join(".atrium").join("apps");
+            if let Ok(rd) = fs::read_dir(&apps) {
+                let prefix = format!("{app_id}@");
+                let mut seen = std::collections::BTreeSet::new();
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let key = name.strip_suffix(".img").unwrap_or(&name);
+                    if let Some(persona) = key.strip_prefix(&prefix) {
+                        if seen.insert(persona.to_string()) {
+                            if let Some(p) = persona_place(&person, app_id, persona) {
+                                v.push(p);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

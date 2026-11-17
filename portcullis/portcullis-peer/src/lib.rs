@@ -117,6 +117,21 @@ struct Entry {
     /// grant shell roles (frescod's bar layer) trust only these; an app
     /// installed under the same id is never one.
     session: bool,
+    /// The persona this instance runs in (personas.md §3), `None` for
+    /// Personal. Written as a `persona=<name>` field; a line whose persona
+    /// name is invalid is void.
+    persona: Option<String>,
+}
+
+/// A named persona's name (personas.md §2): 1-32 of `[a-z0-9-]`, starting
+/// with a letter, never `personal` (Personal is the absence of a name).
+/// The name becomes part of paths (`apps/<id>@<persona>`) and jail names,
+/// so nothing else is allowed.
+pub fn valid_persona(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= 32 && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && name != "personal"
 }
 
 #[derive(Default)]
@@ -141,33 +156,47 @@ fn publisher_hex(p: &[u8; 32]) -> String {
 
 impl AppRegistry {
     /// Parse the registry text. One app per line:
-    /// `<uid> <user> <app-id> [publisher-id hex | session]`; `#` comments
-    /// and blanks ignored; a later line for the same uid replaces an earlier
-    /// one. A fourth field that is neither 64 hex digits nor `session` makes
-    /// the line void: a binding with a garbled publisher must not read as
-    /// "unsigned".
+    /// `<uid> <user> <app-id> [publisher-id hex | session] [persona=<name>]`;
+    /// `#` comments and blanks ignored; a later line for the same uid replaces
+    /// an earlier one. A field that is neither 64 hex digits, `session` nor a
+    /// valid `persona=` makes the line void: a binding with a garbled
+    /// publisher must not read as "unsigned", and one with a garbled persona
+    /// must not read as Personal. A session component has no persona.
     pub fn parse(text: &str) -> AppRegistry {
         let mut map = HashMap::new();
-        for line in text.lines() {
+        'lines: for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             let mut it = line.split_whitespace();
             if let (Some(uid), Some(user), Some(app)) = (it.next(), it.next(), it.next()) {
-                let (publisher, session) = match it.next() {
-                    None => (None, false),
-                    Some("session") => (None, true),
-                    Some(h) => match parse_publisher(h) {
-                        Some(p) => (Some(p), false),
-                        None => continue,
-                    },
-                };
-                if it.next().is_some() {
+                let (mut publisher, mut session, mut persona) = (None, false, None);
+                let mut kind_seen = false;
+                for f in it {
+                    if let Some(name) = f.strip_prefix("persona=") {
+                        if persona.is_some() || !valid_persona(name) {
+                            continue 'lines;
+                        }
+                        persona = Some(name.to_string());
+                    } else if kind_seen || persona.is_some() {
+                        continue 'lines; // order: kind first, persona last; one of each
+                    } else if f == "session" {
+                        session = true;
+                        kind_seen = true;
+                    } else {
+                        match parse_publisher(f) {
+                            Some(p) => publisher = Some(p),
+                            None => continue 'lines,
+                        }
+                        kind_seen = true;
+                    }
+                }
+                if session && persona.is_some() {
                     continue;
                 }
                 if let Ok(uid) = uid.parse::<u32>() {
-                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher, session });
+                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher, session, persona });
                 }
             }
         }
@@ -191,6 +220,32 @@ impl AppRegistry {
         self.map.get(&uid).map(|e| e.publisher)
     }
 
+    /// The persona of the instance at `uid`: `Some(None)` for Personal,
+    /// `Some(Some(name))` for a named persona, `None` if the uid isn't in the
+    /// registry. Services read the persona here, never from the app
+    /// (personas.md §3, §7).
+    pub fn persona(&self, uid: u32) -> Option<Option<&str>> {
+        self.map.get(&uid).map(|e| e.persona.as_deref())
+    }
+
+    /// The uid of the instance `(user, app_id, persona)` with this publisher,
+    /// if any. Each persona's instance has its own uid (personas.md §3).
+    pub fn uid_for_instance(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>) -> Option<u32> {
+        self.map.iter()
+            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id
+                  && e.publisher.as_ref() == publisher && e.persona.as_deref() == persona)
+            .map(|(uid, _)| *uid)
+    }
+
+    /// The uid of `(user, app_id)`'s instance in `persona`, whatever its
+    /// publisher (for answering "already running"; launching must use
+    /// [`Self::uid_for_instance`]).
+    pub fn uid_for_persona(&self, user: &str, app_id: &str, persona: Option<&str>) -> Option<u32> {
+        self.map.iter()
+            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id && e.persona.as_deref() == persona)
+            .map(|(uid, _)| *uid)
+    }
+
     /// Whether `uid` is a declared session component portcullisd launched
     /// (see [`register_session`]).
     pub fn is_session(&self, uid: u32) -> bool {
@@ -204,13 +259,14 @@ impl AppRegistry {
             .map(|(uid, _)| *uid)
     }
 
-    /// The app uid already bound to `(user, app_id)`, if any (never a
-    /// session component's: an app named like one must not inherit it). Lets a re-launch REUSE
+    /// The Personal app uid already bound to `(user, app_id)`, if any (never a
+    /// session component's: an app named like one must not inherit it; never
+    /// a named persona's instance, which is another identity). Lets a re-launch REUSE
     /// the app's existing dedicated uid (stable identity for services that
     /// peer-cred it) instead of leaking a fresh uid + passwd entry every time.
     pub fn uid_for(&self, user: &str, app_id: &str) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id)
+            .find(|(_, e)| !e.session && e.persona.is_none() && e.user == user && e.app_id == app_id)
             .map(|(uid, _)| *uid)
     }
 
@@ -218,9 +274,7 @@ impl AppRegistry {
     /// The launcher uses this: an app id re-installed under another publisher's
     /// key gets a NEW uid, so it inherits nothing keyed by the old one.
     pub fn uid_for_publisher(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Option<u32> {
-        self.map.iter()
-            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id && e.publisher.as_ref() == publisher)
-            .map(|(uid, _)| *uid)
+        self.uid_for_instance(user, app_id, publisher, None)
     }
 }
 
@@ -251,12 +305,35 @@ pub fn register_with_publisher(
     app_id: &str,
     publisher: Option<&[u8; 32]>,
 ) -> io::Result<()> {
+    register_instance(path, uid, user, app_id, publisher, None)
+}
+
+/// As [`register_with_publisher`], for the instance in `persona` (`None`:
+/// Personal). Refuses an invalid persona name rather than writing a line
+/// every reader would void.
+pub fn register_instance(
+    path: &str,
+    uid: u32,
+    user: &str,
+    app_id: &str,
+    publisher: Option<&[u8; 32]>,
+    persona: Option<&str>,
+) -> io::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    match publisher {
-        None => writeln!(f, "{uid} {user} {app_id}"),
-        Some(p) => writeln!(f, "{uid} {user} {app_id} {}", publisher_hex(p)),
+    if persona.is_some_and(|p| !valid_persona(p)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid persona name"));
     }
+    let mut line = format!("{uid} {user} {app_id}");
+    if let Some(p) = publisher {
+        line.push(' ');
+        line.push_str(&publisher_hex(p));
+    }
+    if let Some(p) = persona {
+        line.push_str(" persona=");
+        line.push_str(p);
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{line}")
 }
 
 /// Append a declared session component's binding (portcullisd only, for
@@ -276,6 +353,11 @@ pub fn uid_for_session(path: &str, user: &str, component_id: &str) -> Option<u32
 /// As [`AppRegistry::uid_for_publisher`], reading the registry file.
 pub fn uid_for_app_publisher(path: &str, user: &str, app_id: &str, publisher: Option<&[u8; 32]>) -> Option<u32> {
     AppRegistry::load(path).ok().and_then(|r| r.uid_for_publisher(user, app_id, publisher))
+}
+
+/// As [`AppRegistry::uid_for_instance`], reading the registry file.
+pub fn uid_for_app_instance(path: &str, user: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>) -> Option<u32> {
+    AppRegistry::load(path).ok().and_then(|r| r.uid_for_instance(user, app_id, publisher, persona))
 }
 
 // ── the one call a service makes ──────────────────────────────────────────────
@@ -451,6 +533,52 @@ mod tests {
         let r = AppRegistry::parse("50001 alice org.x.mail nothex\n50002 alice org.x.b 00 extra\n");
         assert_eq!(r.resolve(50001), None);
         assert_eq!(r.resolve(50002), None);
+    }
+
+    #[test]
+    fn persona_instances_have_their_own_uids() {
+        let d = std::env::temp_dir().join(format!("peer-persona-{}", std::process::id()));
+        let path = d.to_str().unwrap();
+        let _ = std::fs::remove_file(path);
+        register_with_publisher(path, 50000, "alice", "org.x.mail", Some(&[0xab; 32])).unwrap();
+        register_instance(path, 50001, "alice", "org.x.mail", Some(&[0xab; 32]), Some("work")).unwrap();
+        register_instance(path, 50002, "alice", "org.x.chat", None, Some("work")).unwrap();
+        assert!(register_instance(path, 50003, "alice", "org.x.chat", None, Some("Work")).is_err());
+        assert!(register_instance(path, 50003, "alice", "org.x.chat", None, Some("personal")).is_err());
+        let r = AppRegistry::load(path).unwrap();
+        assert_eq!(r.persona(50000), Some(None));
+        assert_eq!(r.persona(50001), Some(Some("work")));
+        assert_eq!(r.persona(50002), Some(Some("work")));
+        assert_eq!(r.persona(9), None);
+        assert_eq!(r.resolve(50001), Some(("alice", "org.x.mail")));
+        // Personal and Work are different identities.
+        assert_eq!(r.uid_for_publisher("alice", "org.x.mail", Some(&[0xab; 32])), Some(50000));
+        assert_eq!(r.uid_for_instance("alice", "org.x.mail", Some(&[0xab; 32]), Some("work")), Some(50001));
+        assert_eq!(r.uid_for_instance("alice", "org.x.mail", Some(&[0xab; 32]), Some("home")), None);
+        // A Work-only app has no Personal uid to reuse.
+        assert_eq!(r.uid_for("alice", "org.x.chat"), None);
+        assert_eq!(r.uid_for_instance("alice", "org.x.chat", None, Some("work")), Some(50002));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_garbled_persona_voids_the_line() {
+        let r = AppRegistry::parse(concat!(
+            "50001 alice a persona=Work\n",
+            "50002 alice a persona=\n",
+            "50003 alice a persona=work persona=home\n",
+            "50004 alice a persona=work session\n",
+            "50005 alice a session persona=work\n",
+            "50006 alice a persona=work\n",
+            "50007 alice a persona=../x\n",
+        ));
+        for uid in 50001..=50005 {
+            assert_eq!(r.resolve(uid), None, "uid {uid}");
+        }
+        assert_eq!(r.persona(50006), Some(Some("work")));
+        assert_eq!(r.resolve(50007), None);
+        assert!(valid_persona("work") && valid_persona("acme-2") && !valid_persona("2acme")
+            && !valid_persona("a.b") && !valid_persona(&"a".repeat(33)));
     }
 
     const REG: &str = "

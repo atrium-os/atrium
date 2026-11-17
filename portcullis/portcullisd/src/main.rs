@@ -482,11 +482,11 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if let Request::Launch { app_id, bypass_policy } = req {
+        if let Request::Launch { app_id, bypass_policy, persona } = req {
             /* `owner`, not `user`: see the inheritance note above. This is both
              * whose policy authorizes the launch and who the launched app is
              * recorded as belonging to. */
-            handle_launch(app_id, bypass_policy, &owner, &shared,
+            handle_launch(app_id, bypass_policy, persona, &owner, &shared,
                           &mut writer, &reader)?;
             continue;
         }
@@ -846,6 +846,7 @@ fn now_millis() -> u64 {
 fn handle_launch(
     app_id:        String,
     bypass_policy: bool,
+    persona:       Option<String>,
     user:          &str,
     shared:        &Mutex<Tenants>,
     writer:        &mut UnixStream,
@@ -864,10 +865,32 @@ fn handle_launch(
      * The uid goes back with the reply because surfaces carry `owner_uid`: it
      * is what lets a jailed launcher find the live window and focus it without
      * the launch registry, which it cannot read. */
+    /* The persona (personas.md §3): Personal, or one of the person's own
+     * named personas from their policy file. Checked before anything else,
+     * including under bypass: --no-prompt skips the capability prompt, never
+     * whose persona this is. */
+    if let Some(p) = persona.as_deref() {
+        let known = portcullis_peer::valid_persona(p) && {
+            let mut s = shared.lock().unwrap();
+            s.get_or_load(user).map(|tp| tp.policy.has_persona(Some(p))).unwrap_or(false)
+        };
+        if !known {
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "persona".into(),
+                message: format!("{user} has no persona {p:?}"),
+            });
+        }
+        if let Some(why) = launch::not_instanced(&app_id) {
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "persona".into(),
+                message: format!("{app_id} runs once for every persona: {why}"),
+            });
+        }
+    }
+    let persona = persona.as_deref();
     if launch::is_single_instance(&app_id) {
-        if let Some(jid) = launch::running_jid(&app_id) {
-            let uid = portcullis_peer::uid_for_app(
-                portcullis_peer::DEFAULT_REGISTRY, user, &app_id).unwrap_or(0);
+        if let Some(jid) = launch::running_jid_instance(&app_id, persona) {
+            let uid = launch::instance_uid(user, &app_id, persona).unwrap_or(0);
             eprintln!("portcullisd: {app_id} already running (jid {jid}, uid {uid}) \
                        — refusing a second instance");
             return write_response(writer, &Response::AlreadyRunning {
@@ -963,7 +986,7 @@ fn handle_launch(
     /* 4. launch as the connecting user. launch_with_stdio sets
      *    BuildOpts.user_name = user, which becomes exec.jail_user
      *    in the rendered jail.conf. */
-    let resp = match launch::launch_with_stdio(&app_id, user, Some(stdio)) {
+    let resp = match launch::launch_instance(&app_id, persona, user, Some(stdio)) {
         Ok(o) => Response::LaunchExit { code: o.exit_code },
         Err(e) => Response::LaunchFailed {
             stage: e.stage().into(),

@@ -160,12 +160,13 @@ pub enum LaunchReply {
 /// Wire dance: send Launch → expect ReadyForFds (or terminal
 /// LaunchFailed for policy / manifest errors) → send our stdio fds
 /// via SCM_RIGHTS → expect LaunchExit / LaunchFailed.
-pub fn launch(app_id: &str, bypass_policy: bool) -> DaemonResult<LaunchReply> {
+pub fn launch(app_id: &str, bypass_policy: bool, persona: Option<&str>) -> DaemonResult<LaunchReply> {
     let Some(mut s) = opened()? else { return Ok(None) };
 
     write_request(&mut s, &Request::Launch {
         app_id:        app_id.into(),
         bypass_policy,
+        persona:       persona.map(str::to_string),
     })?;
 
     /* Daemon's first reply is one of:
