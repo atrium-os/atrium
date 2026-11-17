@@ -32,6 +32,7 @@ Related: [homes.md](homes.md) §5 (workspaces, W1–W9, all built 2026-11-15);
 | Makefiles and build scripts? | `make` is FreeBSD's bmake from the base system; GNU make, CMake, Meson, Ninja, autotools and pkgconf come as packages in the workspace (§4.4). `build.rs`, `Makefile` recipes and `npm` hooks run inside the workspace's jail, which is exactly where untrusted build code should run (§9). |
 | Rust? | A signed Rust toolchain layer for both arches (aarch64 has no official rustup builds), crates fetched by cargo from the workspace, an **Atrium SDK** (published crates, C headers, a sysroot for cross builds) and a `cargo atrium` subcommand for new, run and bundle (§5). |
 | Debuggers? | lldb is already in the base system. Workspaces need a `develop` syscall class with `ptrace` and per-jail unprivileged debugging so a workspace can debug its own processes; a dev app can be **run under the debugger** through portcullisd (§7). |
+| Composing an app out of jailed parts, as the Navigator is? | Its own proposal, [app-composition.md](app-composition.md): system services instead of libraries, `[[workers]]` in the manifest called through the SDK like functions, typed messages, templates and a lint that finds parsers in the wrong process. |
 | Version control? | git as a package in the workspace (a tool, nothing links it); keys stay in Arca behind an SSH agent socket (§8). |
 
 ## 1. What exists today
