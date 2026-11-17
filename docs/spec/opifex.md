@@ -237,6 +237,17 @@ checks they extend what it had.
   give one person a targeted bad update. A log forces everyone onto the same history, and
   machines can compare heads (later: with peers on the LAN, §12). This replaces what Rekor
   would have given, without depending on Sigstore's servers or sending them each install.
+- **Growth:** the log only grows, so three things keep the download small. (1) After the
+  first sync a machine fetches only new tiles, typically kilobytes a day. (2) A new machine
+  does not replay history: it downloads a **snapshot** (the latest release of each id plus
+  publisher records) signed together with a tree head, and checks the log forward from there.
+  (3) An entry carries a compact extract (about 1 KB compressed); the full `atrium.toml` is
+  fetched with the archive at install. For scale: 10,000 apps is about 10 MB for a new
+  machine; 100,000 apps about 100 MB, a cost comparable to Debian's package lists. If the
+  snapshot passes about 50 MB compressed, lookups switch to **buckets**: the catalog is
+  split into 256 fixed-size parts by hash of id, a machine always holds the parts for what
+  it has installed plus drivers and fonts, and fetches other parts whole, so a lookup reveals
+  only one bucket among many ids, never the id.
 - **Expiry:** tree heads expire after 14 days. A machine that can only fetch an old head
   (someone freezing its view to keep it on a vulnerable version) says so in Curia after the
   expiry instead of silently staying old.
