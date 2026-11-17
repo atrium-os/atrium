@@ -510,7 +510,13 @@ Checks:
   answers about both test printers read by our parser into complete
   services with TXT keys. poppler (`pdftoppm`) reads the rewritten PDF and
   draws the same pages, the landscape page turned.
-- Fuzzing (cargo-fuzz): five targets (IPP decode with a re-encode round trip, mDNS packets through the browser cache, raster read, raster write/read round trip, PDF rewrite read back by Folium), an hour each; results here when they finish.
+- Fuzzing (cargo-fuzz, one hour each, 2026-11-17, no crashes): IPP decode
+  with a re-encode round trip, 46 M runs; mDNS packets through the browser
+  cache, 11 M; raster write/read round trip, 6.7 M; raster read, 0.96 M;
+  PDF rewrite read back by Folium (seeded with Folium's test PDFs), 0.87 M.
+  The raster-write harness's first run stopped on a bug in the harness
+  itself (it asked for pages past the writer's 100,000-row limit, which the
+  writer rightly refused); fixed and rerun.
 
 Found along the way:
 
