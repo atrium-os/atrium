@@ -74,6 +74,9 @@ pub enum Cmd {
     Redo,
     Toggle(Toggle),
     Align(Align),
+    /// The selected paragraphs' direction: from their text (`None`), left
+    /// to right, right to left.
+    Direction(Option<bool>),
     Style(usize),
     /// The style bar: on the caret paragraph's style.
     StyleOpen,
@@ -1245,6 +1248,7 @@ impl Write {
                     }
                     Cmd::Toggle(t) => e.toggle(t),
                     Cmd::Align(a) => e.align(a),
+                    Cmd::Direction(d) => e.set_paragraphs("Direction", None, |p| p.rtl = d),
                     Cmd::Style(i) => {
                         // The document's paragraph styles; past them, the style bar.
                         let all = e.para_styles();
@@ -1503,14 +1507,15 @@ impl View for Write {
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 10.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
         button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 10.0);
-        let (style_name, cur_align, para_styles) = {
+        let (style_name, cur_align, para_styles, cur_dir) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
             let para_styles = e.para_styles();
             let p = e.doc.para(e.caret.block);
             let name = p.and_then(|p| e.doc.styles.styles.get(p.style as usize)).map(|s| s.name.to_string()).unwrap_or_default();
             let align = p.map(|p| e.doc.styles.para_format(p.style, &p.props).0.align).unwrap_or_default();
-            (name, align, para_styles)
+            let dir = p.and_then(|p| e.doc.styles.para_format(p.style, &p.props).0.rtl);
+            (name, align, para_styles, dir)
         };
         {
             let mut items: Vec<MenuItem> = para_styles.iter().map(|(_, s)| MenuItem::new(&**s).radio(**s == *style_name)).collect();
@@ -1573,10 +1578,16 @@ impl View for Write {
         {
             // Alignment, as a menu (the toolbar has no room for four buttons).
             let all = [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)];
-            let items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == cur_align)).collect();
+            // Then the paragraph's direction (right-to-left scripts).
+            let dirs = [("Direction from Text", None), ("Left to Right", Some(false)), ("Right to Left", Some(true))];
+            let mut items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == cur_align)).collect();
+            for (k, (l, d)) in dirs.iter().enumerate() {
+                let m = MenuItem::new(*l).radio(*d == cur_dir);
+                items.push(if k == 0 { m.separated() } else { m });
+            }
             let now = all.iter().find(|(_, a)| *a == cur_align).map_or("Left", |(l, _)| l);
             let cmds = self.cmds.clone();
-            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Align(all[i.min(3)].1))).at(x, 8.0).width(100.0).render(ctx);
+            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i < 4 { Cmd::Align(all[i].1) } else { Cmd::Direction(dirs[(i - 4).min(2)].1) })).at(x, 8.0).width(100.0).render(ctx);
             x += 108.0;
         }
         let (name, dirty, status, ed) = {
@@ -2475,6 +2486,26 @@ mod tests {
             assert_eq!(w.take_cmds(), [c]);
             assert!(!w.closing.get());
         }
+    }
+
+    #[test]
+    fn a_paragraph_s_direction_is_set_from_the_menu() {
+        let doc = Doc::from_text("d.txt", "\u{5e9}\u{5dc}\u{5d5}\u{5dd} world\nNext.".as_bytes()).unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        run(Cmd::Direction(Some(true)));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(true));
+        assert_eq!(ed.borrow().doc.para(1).unwrap().props.rtl, None, "only the caret's paragraph");
+        run(Cmd::Direction(Some(false)));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(false));
+        run(Cmd::Direction(None));
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, None);
+        run(Cmd::Undo);
+        assert_eq!(ed.borrow().doc.para(0).unwrap().props.rtl, Some(false));
     }
 
     #[test]

@@ -3463,6 +3463,14 @@ A second close request while the bar shows (or while the picker is up)
 closes as before. The changes stay in the autosave folder and come back
 at the next start, so nothing is lost when the window has to go.
 
+### 16.58 Paragraph direction in Write (2026-11-17)
+
+Write's alignment menu sets the selected paragraphs' direction after the
+four alignments: Direction from Text, Left to Right or Right to Left. It
+sets `ParaProps.rtl`, which the bidi layout in `officina-text` uses and
+which `.docx`, `.odt` and the native file keep. Each change is one undo
+step and is kept by crash recovery.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
