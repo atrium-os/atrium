@@ -207,6 +207,27 @@ pub fn parse(text: &str) -> Vec<(FaceInfo, Installed)> {
         .collect()
 }
 
+/// A pin list as `parse` reads it, for the installer (opifexd): the header,
+/// then one line per face. Faces that would not parse back (a bad package
+/// id, file, weight, family or ranges) are an error, so a list written here
+/// never loses a line on reading.
+pub fn render(faces: &[(FaceInfo, Installed)]) -> Result<String, String> {
+    let mut out = format!("{HEADER}\n");
+    for (f, i) in faces {
+        let ranges: Vec<String> = i.ranges.iter().map(|&(lo, hi)| if lo == hi { format!("{lo:04X}") } else { format!("{lo:04X}-{hi:04X}") }).collect();
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", i.package, f.family, f.file, f.weight, f.italic as u8, ranges.join(","), f.address, f.size);
+        if parse(&format!("{HEADER}\n{line}")).len() != 1 {
+            return Err(format!("not a valid pin line: {line}"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if faces.len() > MAX_FACES {
+        return Err(format!("{} faces, at most {MAX_FACES}", faces.len()));
+    }
+    Ok(out)
+}
+
 /// Families of installed faces for `ch`, in install order.
 pub fn families_for(ch: char) -> impl Iterator<Item = &'static str> {
     let c = ch as u32;
@@ -256,5 +277,9 @@ mod tests {
         assert_eq!((got[0].0.weight, got[0].0.italic, got[0].0.size), (400, false, 123));
         assert_eq!(got[0].1.ranges, &[(0x3040, 0x30FF), (0x4E00, 0x9FFF)]);
         assert!(parse(&ok).is_empty(), "no header");
+        assert_eq!(render(&got).unwrap(), format!("{HEADER}\n{ok}\n"));
+        let mut bad = got[0].clone();
+        bad.0.file = "../x.ttf";
+        assert!(render(&[bad]).is_err());
     }
 }
