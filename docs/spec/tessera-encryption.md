@@ -518,7 +518,9 @@ Personal:
 3. The kernel formats the partition sealed (a `TESSERA_IOC_FORMAT` ioctl on the
    partition, with the key id). The kernel module already links the Tessera core that
    mkfs uses. Formatting in the kernel means no process ever holds the key, not even
-   mkfs.
+   mkfs. *As built:* `TKEY_FORMAT` on `/dev/tesserakeys` (`tessera/keyring.h`), with
+   the partition as a descriptor the caller opened read-write, the key id and the uuid
+   the key was minted for; unjailed callers only (`kmod/tessera_format.c`).
 4. If the person asked for a recovery code (§7.4), arcad produces one, wraps the VK into
    slot type 3, and Scrinium shows the code once.
 5. The stick is mounted as a trusted stick (§7.2).
