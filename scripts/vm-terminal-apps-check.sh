@@ -115,8 +115,8 @@ typ() {
 import sys
 lo = {c: 0x04 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
 lo.update({c: 0x1e + i for i, c in enumerate("1234567890")})
-lo.update({" ": 0x2c, "-": 0x2d, "=": 0x2e, "/": 0x38, ".": 0x37, ";": 0x33, "'": 0x34, ",": 0x36, "\n": 0x28})
-hi = {"$": 0x21, "+": 0x2e, "!": 0x1e, "~": 0x35, ">": 0x37, "<": 0x36, "_": 0x2d, "|": 0x31, ":": 0x33, '"': 0x34, "&": 0x24, "(": 0x26, ")": 0x27, "*": 0x25}
+lo.update({" ": 0x2c, "-": 0x2d, "=": 0x2e, "/": 0x38, ".": 0x37, ";": 0x33, "'": 0x34, ",": 0x36, "[": 0x2f, "]": 0x30, "\n": 0x28})
+hi = {"{": 0x2f, "}": 0x30, "$": 0x21, "+": 0x2e, "!": 0x1e, "~": 0x35, ">": 0x37, "<": 0x36, "_": 0x2d, "|": 0x31, ":": 0x33, '"': 0x34, "&": 0x24, "(": 0x26, ")": 0x27, "*": 0x25}
 hi.update({c.upper(): 0x04 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")})
 for c in sys.argv[1]:
     if c in lo:
@@ -159,6 +159,9 @@ typ "vi /tmp/gate.txt
 "
 waitscreen "<alt>" 30 && ok "vi takes the alternate screen" || bad "vi: $(screen)"
 waitscreen "| ~ | ~ |" 10 && ok "with its empty-line tildes" || bad "tildes: $(screen)"
+# nvi flushes the input queue as it sets up the terminal (TCSAFLUSH), which
+# under TCG ends well after its first frame: let it settle before typing.
+sleep 5
 typ "ihello from vi"
 esc
 waitscreen "hello from vi" 10 && ok "insert shows the text" || bad "insert: $(screen)"
@@ -190,10 +193,12 @@ k1 0x28
 waitscreen "scratch \\$" 60 && ok "in the Scratch workspace" || bad "switch: $(screen)"
 typ "top
 "
-waitscreen "<alt>.*last pid" 40 && ok "top draws on the alternate screen" || bad "top: $(screen)"
+# FreeBSD's top draws on the main screen (it sends no ti/te).
+waitscreen "last pid.*PID USERNAME" 40 && ok "top draws its table" || bad "top: $(screen)"
 shot apps-2-top
 typ "q"
-gone_alt && ok "q leaves top" || bad "top stayed: $(screen)"
+i=0; while [ $i -lt 20 ] && ! screen | sed 's/.*| //' | grep -q 'scratch \$'; do sleep 2; i=$((i+2)); done
+screen | sed 's/.*| //' | grep -q 'scratch \$' && ok "q leaves top for the prompt" || bad "top stayed: $(screen)"
 for ed in nvim hx; do
     if V "jexec ws_alice_scratch sh -c 'command -v $ed'" >/dev/null 2>&1; then
         typ "$ed /tmp/gate.txt

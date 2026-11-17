@@ -7,6 +7,7 @@
 //! doesn't.
 
 pub mod composition;
+pub mod dap;
 pub mod engine;
 pub mod exec;
 pub mod git;

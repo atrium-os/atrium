@@ -47,6 +47,12 @@ pub struct CodeGrid {
     marks: Vec<(usize, u8)>,
     /// Keys the buffer doesn't use (Ctrl+S, Ctrl+P, F12…), for the app.
     other_key: Option<OtherKey>,
+    /// Lines with a breakpoint (a dot in the gutter).
+    breakpoints: Vec<usize>,
+    /// The line a debugger stopped at (shaded).
+    stopped: Option<usize>,
+    /// A press in the gutter, with its line.
+    gutter_click: Option<Rc<dyn Fn(usize)>>,
 }
 
 /// What [`CodeGrid::on_other_key`] gets: the key, its modifiers, its text.
@@ -72,6 +78,9 @@ impl CodeGrid {
             autofocus: false,
             marks: Vec::new(),
             other_key: None,
+            breakpoints: Vec::new(),
+            stopped: None,
+            gutter_click: None,
         }
     }
     pub fn highlight(mut self, h: Rc<dyn Highlight>) -> Self { self.highlight = h; self }
@@ -83,6 +92,10 @@ impl CodeGrid {
     pub fn marks(mut self, m: Vec<(usize, u8)>) -> Self { self.marks = m; self }
     /// Keys the editor has no use for go to `f` (the app's shortcuts).
     pub fn on_other_key(mut self, f: OtherKey) -> Self { self.other_key = Some(f); self }
+    pub fn breakpoints(mut self, lines: Vec<usize>) -> Self { self.breakpoints = lines; self }
+    pub fn stopped(mut self, line: Option<usize>) -> Self { self.stopped = line; self }
+    /// A press in the gutter calls `f` with its line (toggle a breakpoint).
+    pub fn on_gutter_click(mut self, f: Rc<dyn Fn(usize)>) -> Self { self.gutter_click = Some(f); self }
 
     fn style(&self, color: Color) -> TextStyle {
         TextStyle { family: font::MONO.into(), size: self.size, weight: Weight::Regular, color }
@@ -209,7 +222,9 @@ impl View for CodeGrid {
         for line in v.top..last {
             let row = line - v.top;
             let y = y_of(row);
-            if line == primary_line && b.selections().len() == 1 && b.primary().is_empty() {
+            if self.stopped == Some(line) {
+                ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + m.gutter, y, r.w() - m.gutter, line_h), fill: theme.accent_bg(), radius: 0.0 });
+            } else if line == primary_line && b.selections().len() == 1 && b.primary().is_empty() {
                 ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + m.gutter, y, r.w() - m.gutter, line_h), fill: theme.state_hover(), radius: 0.0 });
             }
             // Selections on this line.
@@ -239,6 +254,10 @@ impl View for CodeGrid {
                 if let Some((_, sev)) = self.marks.iter().find(|(l, _)| *l == line) {
                     let c = match sev { 0 => theme.danger_fg(), 1 => theme.warning_fg(), _ => theme.info_fg() };
                     ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + 2.0, y + 2.0, 3.0, line_h - 4.0), fill: c, radius: 1.5 });
+                }
+                if self.breakpoints.contains(&line) {
+                    let d = (line_h * 0.55).min(m.gutter * 0.4);
+                    ctx.tree.insert(Some(bg), Node::Rect { rect: Rect::new(r.x() + m.gutter - d - 3.0, y + (line_h - d) / 2.0, d, d), fill: theme.danger_fg(), radius: d / 2.0 });
                 }
             }
             // Text.
@@ -304,9 +323,27 @@ impl View for CodeGrid {
             }
         });
         let (buffer, view) = (self.buffer.clone(), self.view.clone());
+        let gutter_click = self.gutter_click.clone();
+        // A press that began in the gutter selects nothing as it moves.
+        let in_gutter = Rc::new(std::cell::Cell::new(false));
         ctx.on_drag_local(bg, move |phase, p| {
             let mut b = buffer.get_cloned();
             let v = view.get_cloned();
+            if phase != DragPhase::Start && in_gutter.get() {
+                return;
+            }
+            in_gutter.set(false);
+            if phase == DragPhase::Start && p.x < m.gutter {
+                if let Some(f) = &gutter_click {
+                    in_gutter.set(true);
+                    let row = ((p.y - m.pad) / m.line).floor().max(0.0) as usize;
+                    let line = v.top + row;
+                    if line < b.len_lines() {
+                        f(line);
+                    }
+                    return;
+                }
+            }
             let at = hit(&b, v, p);
             match phase {
                 DragPhase::Start => b.set_caret(at, false),

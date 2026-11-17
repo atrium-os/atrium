@@ -13,11 +13,12 @@ use pergola::code::CodeBuffer;
 use pergola::widgets::CodeView;
 use pergola::Mutable;
 
+use crate::dap;
 use crate::exec::{Exec, Proc};
 use crate::lsp;
 use crate::tasks::{self, Severity};
 use crate::tree::{self, Tree};
-use crate::ui::{Act, DocCells, Panel, State, Tab};
+use crate::ui::{Act, Debug, DocCells, Panel, State, Tab};
 
 /// Output kept from a task (the tail).
 pub const OUTPUT_MAX: usize = 1 << 20;
@@ -76,6 +77,9 @@ pub struct Engine {
     next_git: Instant,
     /// Visible rows, from the window size.
     pub rows: usize,
+    debugger: Option<(dap::Session, Proc)>,
+    /// Start debugging when the build that's running succeeds.
+    debug_after_build: bool,
 }
 
 fn title_of(rel: &str) -> String {
@@ -113,6 +117,8 @@ impl Engine {
             no_server: Vec::new(),
             next_git: Instant::now(),
             rows: 40,
+            debugger: None,
+            debug_after_build: false,
         }
     }
 
@@ -253,6 +259,32 @@ impl Engine {
             Act::Template(i) => s.template = i.min(s.templates.len().saturating_sub(1)),
             Act::Create(name) => self.create(&name, s),
             Act::Check => self.check(s),
+            Act::Debug => self.debug(s),
+            Act::StopDebug => {
+                if let Some((sess, proc)) = &mut self.debugger {
+                    sess.stop();
+                    let out = sess.take_output();
+                    proc.write(&out);
+                }
+                self.debug_after_build = false;
+            }
+            Act::StepOver | Act::StepIn | Act::StepOut => {
+                if let Some((sess, _)) = &mut self.debugger {
+                    match a {
+                        Act::StepOver => sess.next(),
+                        Act::StepIn => sess.step_in(),
+                        _ => sess.step_out(),
+                    }
+                }
+            }
+            Act::Breakpoint(line) => self.toggle_breakpoint(line, s),
+            Act::Frame(i) => {
+                let f = s.debug.as_ref().and_then(|d| d.frames.get(i)).cloned();
+                if let Some((_, Some(rel), line)) = f {
+                    self.open(&rel, s);
+                    self.goto(line.saturating_sub(1), Some(0), None);
+                }
+            }
         }
         self.sync_tabs(s);
         if self.active != before {
@@ -339,6 +371,171 @@ impl Engine {
             self.check(s);
         } else if s.panel == Panel::Composition {
             s.panel = Panel::Output;
+        }
+    }
+
+    fn toggle_breakpoint(&mut self, line: usize, s: &mut State) {
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
+        let line = if line == usize::MAX {
+            let b = d.cells.buffer.get_cloned();
+            b.line_col(b.primary().head).0
+        } else {
+            line
+        };
+        let rel = d.rel.clone();
+        let path = d.cells.path.clone();
+        let list = s.breakpoints.entry(rel.clone()).or_default();
+        if let Some(i) = list.iter().position(|&l| l == line) {
+            list.remove(i);
+        } else {
+            list.push(line);
+            list.sort_unstable();
+        }
+        let lines: Vec<usize> = list.iter().map(|l| l + 1).collect();
+        if list.is_empty() {
+            s.breakpoints.remove(&rel);
+        }
+        if let Some((sess, proc)) = &mut self.debugger {
+            sess.set_breakpoints(&path, lines);
+            let out = sess.take_output();
+            proc.write(&out);
+        }
+    }
+
+    /// What the project builds to run, relative to `work`.
+    fn program(&self, s: &State) -> Option<String> {
+        let p = &s.project;
+        let dir = if p.is_empty() { self.root.clone() } else { self.root.join(p) };
+        let within = |f: String| if p.is_empty() { f } else { format!("{p}/{f}") };
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            let v: toml::Value = text.parse().ok()?;
+            let name = v.get("package")?.get("name")?.as_str()?;
+            return Some(within(format!("target/debug/{name}")));
+        }
+        let t = s.tasks.iter().find(|t| t.kind == tasks::Kind::Build)?;
+        // `cc … -o <name> <file>`: the single-file C project.
+        let o = t.argv.iter().position(|a| a == "-o")?;
+        Some(within(t.argv.get(o + 1)?.clone()))
+    }
+
+    /// F5: continue when stopped; else build, then start under lldb-dap.
+    fn debug(&mut self, s: &mut State) {
+        if let Some((sess, proc)) = &mut self.debugger {
+            if matches!(sess.run, dap::Run::Stopped(_)) {
+                sess.resume();
+                let out = sess.take_output();
+                proc.write(&out);
+            }
+            return;
+        }
+        if s.running.is_some() {
+            return;
+        }
+        match s.tasks.iter().position(|t| t.kind == tasks::Kind::Build) {
+            Some(i) => {
+                self.debug_after_build = true;
+                self.run_task(i, s);
+            }
+            None => self.start_debug(s),
+        }
+    }
+
+    fn start_debug(&mut self, s: &mut State) {
+        let (Some(ws), Some(remote)) = (self.ws.clone(), self.remote_root.clone()) else { return };
+        let Some(program) = self.program(s) else {
+            s.note = Some(("Artifex can't tell what this project runs: debugging needs a Cargo package or one C file".into(), true));
+            return;
+        };
+        let argv: Vec<String> = dap::ADAPTER.iter().map(|a| a.to_string()).collect();
+        let proc = match self.exec.spawn(&ws, &argv, &s.project) {
+            Ok(p) => p,
+            Err(e) => {
+                s.note = Some((format!("Can't start lldb-dap in the workspace: {e}"), true));
+                return;
+            }
+        };
+        let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
+        let sess = dap::Session::new(&self.root, &remote, &program, &[], &s.project, bps);
+        self.debugger = Some((sess, proc));
+        s.debug = Some(Debug { run: format!("Starting {program}"), live: true, ..Debug::default() });
+        s.output = format!("$ lldb-dap: {program}\n");
+        s.panel = Panel::Debug;
+        s.panel_open = true;
+    }
+
+    fn read_debugger(&mut self, s: &mut State) {
+        let Some((sess, proc)) = &mut self.debugger else { return };
+        let out = sess.take_output();
+        if out.is_empty() {
+            proc.flush();
+        } else {
+            proc.write(&out);
+        }
+        let (got, done) = proc.read(4 << 20);
+        let mut jump = None;
+        let mut ended = done;
+        if !got.is_empty() {
+            match sess.feed(&got) {
+                Ok(events) => {
+                    for e in events {
+                        match e {
+                            dap::Event::Output(o) => {
+                                s.output.push_str(&o);
+                            }
+                            dap::Event::Error(m) => s.note = Some((format!("Debugger: {m}"), true)),
+                            dap::Event::Frames => {
+                                if let Some(f) = sess.frames.iter().find(|f| f.file.is_some()) {
+                                    jump = Some((f.file.clone().unwrap(), f.line));
+                                }
+                            }
+                            dap::Event::State | dap::Event::Locals | dap::Event::Breakpoints(..) => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    s.note = Some((format!("Debugger: {e}"), true));
+                    ended = true;
+                }
+            }
+            let out = sess.take_output();
+            proc.write(&out);
+        }
+        let root = self.root.clone();
+        let rel = |p: &Path| tree::relative(&root, p);
+        let run = match &sess.run {
+            dap::Run::Starting => "Starting".to_string(),
+            dap::Run::Running => "Running".to_string(),
+            dap::Run::Stopped(why) => format!("Stopped ({why})"),
+            dap::Run::Exited(Some(c)) => format!("Exited ({c})"),
+            dap::Run::Exited(None) => "Ended".to_string(),
+        };
+        let exited = matches!(sess.run, dap::Run::Exited(_));
+        let d = Debug {
+            run,
+            stopped: matches!(sess.run, dap::Run::Stopped(_)),
+            live: !(ended || exited),
+            frames: sess.frames.iter().map(|f| (f.name.clone(), f.file.as_deref().and_then(rel), f.line)).collect(),
+            locals: sess.locals.iter().map(|v| (v.name.clone(), v.value.clone())).collect(),
+        };
+        if s.debug.as_ref() != Some(&d) {
+            s.debug = Some(d);
+        }
+        if ended || exited {
+            if exited {
+                let (sess, proc) = self.debugger.as_mut().unwrap();
+                sess.stop();
+                let out = sess.take_output();
+                proc.write(&out);
+            }
+            self.debugger = None;
+        }
+        if let Some((p, line)) = jump {
+            if let Some(r) = tree::relative(&self.root, &p) {
+                self.open(&r, s);
+                self.goto(line.saturating_sub(1), Some(0), None);
+                self.sync_tabs(s);
+                self.follow_project(s);
+            }
         }
     }
 
@@ -447,6 +644,8 @@ impl Engine {
             view: self.cell(CodeView::default()),
             spans: self.cell(Rc::new(LineSpans::default())),
             marks: self.cell(Vec::new()),
+            breakpoints: self.cell(Vec::new()),
+            stopped: self.cell(None),
         };
         let mut doc = Doc { cells, rel: rel.to_string(), lang, syntax, seen: 0, spans_at: (u64::MAX, 0), lsp_sent: 0, last_edit: Instant::now() };
         self.highlight(&mut doc, true);
@@ -692,6 +891,7 @@ impl Engine {
         }
         self.read_jobs(s);
         self.read_servers(s);
+        self.read_debugger(s);
         if self.ws.is_some() && now >= self.next_git && !self.jobs.iter().any(|(j, _, _)| matches!(j, Job::Git)) {
             self.next_git = now + GIT_EVERY;
             let argv: Vec<String> = crate::git::STATUS_ARGV.iter().map(|a| a.to_string()).collect();
@@ -745,6 +945,9 @@ impl Engine {
                     self.next_git = Instant::now();
                     if s.composition.is_some() {
                         self.check(s);
+                    }
+                    if std::mem::take(&mut self.debug_after_build) && errors == 0 {
+                        self.start_debug(s);
                     }
                 }
                 Job::Git => {
@@ -893,6 +1096,17 @@ impl Engine {
         if s.diags != diags {
             s.diags = diags;
         }
+        let bps = s.breakpoints.get(&d.rel).cloned().unwrap_or_default();
+        if d.cells.breakpoints.get_cloned() != bps {
+            d.cells.breakpoints.set(bps);
+        }
+        let stopped = s.debug.as_ref().filter(|x| x.stopped && x.live)
+            .and_then(|x| x.frames.iter().find(|f| f.1.is_some()))
+            .filter(|f| f.1.as_deref() == Some(d.rel.as_str()))
+            .map(|f| f.2.saturating_sub(1));
+        if d.cells.stopped.get_cloned() != stopped {
+            d.cells.stopped.set(stopped);
+        }
     }
 
     /// Ask every server to stop (the app is closing).
@@ -924,6 +1138,8 @@ fn placeholder() -> Doc {
             view: Mutable::new(CodeView::default()),
             spans: Mutable::new(Rc::new(LineSpans::default())),
             marks: Mutable::new(Vec::new()),
+            breakpoints: Mutable::new(Vec::new()),
+            stopped: Mutable::new(None),
         },
         rel: String::new(),
         lang: None,
