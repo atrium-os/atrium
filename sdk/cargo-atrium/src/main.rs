@@ -62,16 +62,18 @@ fn cmd_new(args: &[String]) -> ExitCode {
             o => name = Some(o.to_string()),
         }
     }
-    let Some(name) = name else {
+    let Some(dir) = name else {
         eprintln!("cargo atrium new: a name, e.g. cargo atrium new hello");
         return ExitCode::from(2);
     };
+    // Like cargo new: the argument is a path, the name its last component.
+    let name = Path::new(&dir).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let sdk = sdk.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let o = new::Opts { name: &name, template: &template, id: id.as_deref(), sdk_path: sdk.as_deref(), registry: &registry };
-    match new::create(Path::new(&name), &o) {
+    match new::create(Path::new(&dir), &o) {
         Ok(files) => {
-            println!("cargo atrium: made {name}/ from the {template} template: {}", files.join(", "));
-            println!("  next: cd {name} && cargo atrium check");
+            println!("cargo atrium: made {dir}/ from the {template} template: {}", files.join(", "));
+            println!("  next: cd {dir} && cargo atrium check");
             ExitCode::SUCCESS
         }
         Err(e) => {
