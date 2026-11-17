@@ -17,6 +17,15 @@
  *      under another content id, is refused.
  *   6. The sealed journal opens and replays empty at the SB's anchor, and
  *      refuses a wrong anchor; offline commit_roots is ENOTIMPL.
+ *   7. Byte flips across every block the format wrote, outside the two
+ *      superblocks (item 4) and the journal (test_journal_sealed): every
+ *      tree node of every tree, the pack prelude and front, every sealed
+ *      blob. A flip is either refused by a full decode of the volume or
+ *      changes nothing it decodes (pack padding, which no unit covers, or a
+ *      node the format superseded); in a live tree node every flip is
+ *      refused. An older copy of a block
+ *      is covered per kind by test_btree_sealed (4) and test_journal_sealed
+ *      (4); packs are written once and never rewritten in place.
  */
 #include "tessera/btree.h"
 #include "tessera/codec.h"
@@ -291,6 +300,189 @@ read_back(const tessera_seal_keys_t *k)
 	return bad;
 }
 
+/* FNV-1a, enough to tell "decoded the same" from "decoded otherwise". */
+static uint64_t
+fnv(uint64_t h, const void *p, size_t n)
+{
+	const uint8_t *b = p;
+
+	for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+	return h;
+}
+
+/* Sectors of the live tree nodes (decode_all fills it on a clean pass). */
+static uint8_t live_node[MAX_SECTORS];
+static int
+mark_live(void *ctx, uint64_t s)
+{
+	(void)ctx;
+	if (s < MAX_SECTORS) live_node[s] = 1;
+	return 0;
+}
+
+/* Every entry of a sealed tree, by cursor; nonzero if any node refuses. */
+static int
+tree_digest(const tessera_volume_t *v, const tessera_seal_keys_t *k,
+    uint8_t kind, uint64_t root, uint32_t ks, uint32_t vs, uint64_t *h)
+{
+	uint8_t tag[16], kb[64], vb[256];
+	int rc = 0;
+
+	if (tessera_volume_root_tag(v, kind, tag) != TESSERA_OK) return 1;
+	tessera_btree_t *t = tessera_btree_open_sealed(&IO, k, root, tag, kind,
+	    ks, vs);
+	if (t == NULL) return 1;
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(t);
+	if (c == NULL && tessera_btree_last_fail(t, NULL, NULL) !=
+	    TESSERA_BTREE_FAIL_NONE)
+		rc = 1;
+	while (c != NULL) {
+		if (tessera_btree_cursor_get(c, kb, vb) != TESSERA_OK) {
+			rc = 1;
+			break;
+		}
+		*h = fnv(fnv(*h, kb, ks), vb, vs);
+		int n = tessera_btree_cursor_next(c);
+		if (n == TESSERA_ENOENT) break;
+		if (n != TESSERA_OK) { rc = 1; break; }
+	}
+	if (c != NULL) tessera_btree_cursor_free(c);
+	if (rc == 0 && tessera_btree_walk_nodes(t, mark_live, NULL) != 0)
+		rc = 1;
+	tessera_btree_close(t);
+	return rc;
+}
+
+/* Decode everything the format wrote, quietly: 0 and a digest of all of it,
+ * or nonzero at the first refusal. */
+static int
+decode_all(const tessera_seal_keys_t *k, uint64_t *out)
+{
+	tessera_volume_t *v = NULL;
+	uint64_t h = 0xcbf29ce484222325ull;
+	int rc = 0;
+
+	if (tessera_volume_open_sealed(&IO, k, &v) != TESSERA_OK) return 1;
+	if (tree_digest(v, k, TESSERA_BTREE_KIND_INODE,
+	    tessera_volume_inode_root(v), 4, TESSERA_INODE_RECORD_SIZE, &h) ||
+	    tree_digest(v, k, TESSERA_BTREE_KIND_FREE_EXT,
+	    tessera_volume_free_extent_root(v), 8, 8, &h) ||
+	    tree_digest(v, k, TESSERA_BTREE_KIND_PACK_REG,
+	    tessera_volume_pack_registry_root(v), 16,
+	    TESSERA_REGISTRY_ENTRY_SIZE_SEALED, &h)) {
+		tessera_volume_close(v);
+		return 2;
+	}
+	/* every pack: front under the registry tag, then every blob */
+	uint8_t tag[16], pid[16], val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	tessera_volume_root_tag(v, TESSERA_BTREE_KIND_PACK_REG, tag);
+	tessera_btree_t *reg = tessera_btree_open_sealed(&IO, k,
+	    tessera_volume_pack_registry_root(v), tag,
+	    TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
+	tessera_btree_cursor_t *c = reg ? tessera_btree_seek_first(reg) : NULL;
+	if (c == NULL) rc = 3;
+	while (c != NULL && rc == 0 &&
+	    tessera_btree_cursor_get(c, pid, val) == TESSERA_OK) {
+		tessera_registry_entry_t re;
+		if (tessera_decode_registry_entry(val, &re) != TESSERA_OK ||
+		    re.length_sectors == 0 || re.length_sectors > 64) {
+			rc = 4;
+			break;
+		}
+		size_t len = re.length_sectors * BS;
+		uint8_t *pk = malloc(len);
+		for (uint64_t s = 0; s < re.length_sectors; s++)
+			if (d_read(NULL, re.start_sector + s, pk + s * BS) != 0)
+				rc = 5;
+		uint64_t grp;
+		uint32_t flen;
+		if (rc == 0 && (tessera_pack_sealed_prelude(pk, len, &grp,
+		    &flen) != TESSERA_OK || tessera_pack_open_front(&k->meta,
+		    k->uuid, grp, val + TESSERA_REGISTRY_ENTRY_SIZE, pk,
+		    len) != TESSERA_OK))
+			rc = 6;
+		tessera_pack_reader_t *r = rc == 0 ? tessera_pack_open(pk, len)
+		    : NULL;
+		if (rc == 0 && r == NULL) rc = 7;
+		for (uint32_t i = 0; r != NULL && rc == 0 &&
+		    i < tessera_pack_blob_count(r); i++) {
+			tessera_hash_t id;
+			const uint8_t *b;
+			uint32_t n;
+			static uint8_t pt[65536];
+			if (tessera_pack_blob_hash_at(r, i, id) != TESSERA_OK ||
+			    tessera_pack_lookup(r, id, &b, &n) != TESSERA_OK ||
+			    n < TESSERA_SEAL_OVERHEAD ||
+			    n - TESSERA_SEAL_OVERHEAD > sizeof pt ||
+			    tessera_blob_open(&k->blob, k->uuid, grp, id, b, n,
+			    pt) != TESSERA_OK) {
+				rc = 8;
+				break;
+			}
+			h = fnv(fnv(h, id, 32), pt, n - TESSERA_SEAL_OVERHEAD);
+		}
+		if (r != NULL) tessera_pack_close(r);
+		free(pk);
+		if (rc != 0 || tessera_btree_cursor_next(c) != TESSERA_OK)
+			break;
+	}
+	if (c != NULL) tessera_btree_cursor_free(c);
+	if (reg != NULL) tessera_btree_close(reg);
+	tessera_volume_close(v);
+	*out = h;
+	return rc;
+}
+
+/* 7: flip bytes of every block the format wrote; see the header. */
+static void
+flip_everything(const tessera_seal_keys_t *k)
+{
+	uint64_t want, got;
+	unsigned blocks = 0, nodes = 0, flips = 0, refused = 0, padding = 0;
+	static uint8_t live[MAX_SECTORS];
+
+	memset(live_node, 0, sizeof live_node);
+	CHECK(decode_all(k, &want) == 0);
+	memcpy(live, live_node, sizeof live);
+	for (uint64_t s = 2; s < MAX_SECTORS; s++) {
+		if (s >= 4 && s < 4 + JSECT) continue;   /* the journal */
+		int used = 0;
+		for (int i = 0; i < BS && !used; i++) used = disk[s][i] != 0;
+		if (!used) continue;
+		blocks++;
+		/* A live tree node: every byte is payload, nonce or tag. Any
+		 * other block is a pack (padding is no unit's) or a node the
+		 * format superseded, which nothing references. */
+		const int meta = live[s];
+		nodes += meta;
+		for (int off = 0; off < BS; off++) {
+			/* every byte of the first 128 and the last 64 (nonce,
+			 * tag, prelude), a stride through the rest */
+			if (off >= 128 && off < BS - 64 && off % 7 != 0)
+				continue;
+			disk[s][off] ^= 0x01;
+			flips++;
+			if (decode_all(k, &got) != 0)
+				refused++;
+			else if (got == want && !meta)
+				padding++;
+			else {
+				fprintf(stderr, "FAIL: flip at sector %ju "
+				    "byte %d %s\n", (uintmax_t)s, off,
+				    got == want ? "accepted in a live tree node"
+				    : "decoded to something else");
+				failures++;
+			}
+			disk[s][off] ^= 0x01;
+		}
+	}
+	CHECK(decode_all(k, &got) == 0 && got == want);
+	CHECK(nodes >= 3 && refused > 0);
+	printf("  flips: %u blocks (%u live nodes), %u flips, %u refused, %u "
+	    "unread (pack padding, superseded nodes)\n", blocks, nodes, flips,
+	    refused, padding);
+}
+
 static void
 run(uint32_t suite)
 {
@@ -313,6 +505,7 @@ run(uint32_t suite)
 	for (int i = 0; i < 16; i++) k.key_id[i] = (uint8_t)(0xc0 + i);
 	CHECK(tessera_volume_format_sealed(&IO, &o, &k) == TESSERA_OK);
 	CHECK(read_back(&k) == 0);
+	flip_everything(&k);
 	{
 		/* the key id is in the clear, for the keyring lookup */
 		tessera_superblock_t sb;

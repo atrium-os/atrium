@@ -131,3 +131,61 @@ fn native_files_keep_conditional_formats() {
         _ => unreachable!(),
     }, (2, 3)), "$A1>B$1");
 }
+
+#[test]
+fn icon_sets_pick_by_threshold() {
+    use officina_grid::condfmt::{icon_points, icon_set, ICON_SETS};
+    let mut wb = book();
+    let arrows = icon_set("3Arrows").unwrap();
+    // 1..10 over 0 / 33 / 67 percent of the way from 1 to 10 (3.97, 7.03):
+    // 1–3 the lowest icon, 4–7 the middle, 8–10 the top.
+    let kind = RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
+    let icons: Vec<u8> = (0..10).map(|r| wb.look(CellAddr::new(0, r, 0)).icon.unwrap().1).collect();
+    assert_eq!(icons, [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]);
+    assert!(!wb.look(CellAddr::new(0, 0, 0)).hide_value);
+    // Numbers, greater-than, reversed, icon only: 5 is not above 5.
+    wb.remove_cond_format(0);
+    let rating = icon_set("4Rating").unwrap();
+    let points = vec![(Cfvo::Num(0.0), true), (Cfvo::Num(5.0), false), (Cfvo::Num(8.0), true), (Cfvo::Percentile(100.0), true)];
+    let kind = RuleKind::IconSet { set: rating, points, reverse: true, show_value: false };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
+    let at = |r: u32| wb.look(CellAddr::new(0, r, 0));
+    assert_eq!((at(4).icon, at(5).icon, at(7).icon, at(9).icon), (Some((rating, 3)), Some((rating, 2)), Some((rating, 1)), Some((rating, 0))));
+    assert!(at(0).hide_value);
+    // Text cells get no icon; the set table names every set once.
+    assert_eq!(wb.look(CellAddr::new(0, 0, 1)).icon, None);
+    assert_eq!(ICON_SETS.len(), 20);
+    // Kept by the native file.
+    let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
+    assert_eq!(back.cond_formats(), wb.cond_formats());
+}
+
+#[test]
+fn changing_formats_is_one_undoable_journaled_op() {
+    use officina_core::history::History;
+    use officina_grid::ops::GridOp;
+    let mut wb = book();
+    let mut h: History<GridOp> = History::new();
+    let a = |r| CellAddr::new(0, r, 0);
+    let f = wb.cond_formula("A1>5", 0, (0, 0)).unwrap();
+    let rule = Rule { kind: RuleKind::Expression(f), dxf: fill(), stop: false };
+    let op = GridOp::cond_formats(&wb, &[CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![rule] }]);
+    // Through the journal's bytes and back.
+    let op = GridOp::decode(&op.encode()).unwrap();
+    h.run(&mut wb, "Conditional Format", vec![op]);
+    assert_eq!(wb.cond_formats().len(), 1);
+    assert_eq!(wb.look(a(5)).dxf.fill, Some(RED));
+    assert_eq!(wb.look(a(4)).dxf.fill, None);
+    h.undo(&mut wb);
+    assert!(wb.cond_formats().is_empty() && wb.look(a(5)).is_empty());
+    h.redo(&mut wb);
+    assert_eq!(wb.look(a(9)).dxf.fill, Some(RED));
+    // A list naming a sheet that isn't there changes nothing.
+    let mut other = book();
+    other.add_sheet("T").unwrap();
+    let bad = GridOp::cond_formats(&other, &[CondFormat { sheet: 1, ranges: vec![Rect { sheet: 1, r0: 0, c0: 0, r1: 0, c1: 0 }], rules: vec![Rule { kind: RuleKind::Blanks(true), dxf: fill(), stop: false }] }]);
+    h.run(&mut wb, "Bad", vec![bad]);
+    assert_eq!(wb.cond_formats().len(), 1);
+    assert!(GridOp::decode(&[8, 200]).is_err());
+}

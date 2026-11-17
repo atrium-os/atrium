@@ -115,6 +115,47 @@ pub enum RuleKind {
     /// Two or three points with their colours.
     ColorScale(Vec<(Cfvo, u32)>),
     DataBar { min: Cfvo, max: Cfvo, color: u32 },
+    /// An icon by where the value falls: `set` indexes [`ICON_SETS`]; one
+    /// threshold per icon from the lowest (the first is where icon 0 starts,
+    /// usually 0 %), each met by values at or above it (`true`) or above it.
+    /// `reverse` gives the highest values the first icon; `show_value: false`
+    /// shows only the icon.
+    IconSet { set: u8, points: Vec<(Cfvo, bool)>, reverse: bool, show_value: bool },
+}
+
+/// Icon sets, by their file names, and how many icons each has. The first
+/// seventeen are Excel 2007's; the last three came with Excel 2010.
+pub const ICON_SETS: [(&str, u8); 20] = [
+    ("3Arrows", 3),
+    ("3ArrowsGray", 3),
+    ("3Flags", 3),
+    ("3TrafficLights1", 3),
+    ("3TrafficLights2", 3),
+    ("3Signs", 3),
+    ("3Symbols", 3),
+    ("3Symbols2", 3),
+    ("4Arrows", 4),
+    ("4ArrowsGray", 4),
+    ("4RedToBlack", 4),
+    ("4Rating", 4),
+    ("4TrafficLights", 4),
+    ("5Arrows", 5),
+    ("5ArrowsGray", 5),
+    ("5Rating", 5),
+    ("5Quarters", 5),
+    ("3Stars", 3),
+    ("3Triangles", 3),
+    ("5Boxes", 5),
+];
+
+/// The icon set named `name` (as files spell it).
+pub fn icon_set(name: &str) -> Option<u8> {
+    ICON_SETS.iter().position(|s| s.0 == name).map(|i| i as u8)
+}
+
+/// Excel's default thresholds for a set of `n` icons: equal percent steps.
+pub fn icon_points(n: u8) -> Vec<(Cfvo, bool)> {
+    (0..n).map(|i| (Cfvo::Percent((100.0 * i as f64 / n as f64).round()), true)).collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +193,10 @@ pub struct Look {
     pub scale: Option<u32>,
     /// A data bar: how much of the cell's width (0–1), and its colour.
     pub bar: Option<(f32, u32)>,
+    /// An icon: its set ([`ICON_SETS`]) and which of it, 0 the lowest.
+    pub icon: Option<(u8, u8)>,
+    /// Only the icon shows, not the value.
+    pub hide_value: bool,
 }
 
 impl Look {
@@ -206,6 +251,41 @@ impl Workbook {
         self.cond_formats.push(f);
         self.cond_stats.lock().unwrap().clear();
         Ok(self.cond_formats.len() - 1)
+    }
+
+    /// Swaps in a whole list of conditional formats (formats that don't fit are left
+    /// out) and gives back the old one.
+    pub fn replace_cond_formats(&mut self, fs: Vec<CondFormat>) -> Vec<CondFormat> {
+        let old = std::mem::take(&mut self.cond_formats);
+        self.cond_stats.lock().unwrap().clear();
+        for f in fs {
+            let _ = self.add_cond_format(f);
+        }
+        old
+    }
+
+    /// A list of formats as bytes (formulas as text, as the native file keeps them).
+    pub fn encode_cond_formats(&self, fs: &[CondFormat]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.var(fs.len() as u64);
+        for f in fs {
+            f.encode(&mut w, self);
+        }
+        w.into_bytes()
+    }
+
+    /// Reads a list written by [`encode_cond_formats`](Self::encode_cond_formats).
+    pub fn decode_cond_formats(&self, b: &[u8]) -> Result<Vec<CondFormat>, WireError> {
+        let mut r = Reader::new(b);
+        let n = r.count("conditional formats", MAX_FORMATS as u64, 4)?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(CondFormat::decode(&mut r, self)?);
+        }
+        if !r.is_empty() {
+            return Err(WireError::Invalid("trailing bytes"));
+        }
+        Ok(v)
     }
 
     pub fn remove_cond_format(&mut self, i: usize) -> Option<CondFormat> {
@@ -371,6 +451,26 @@ impl Workbook {
                 let frac = if hi > lo { ((x - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 1.0 };
                 // Excel keeps a sliver for the lowest value.
                 out.bar = Some(((0.1 + 0.9 * frac) as f32, *color));
+                false
+            }
+            RuleKind::IconSet { set, points, reverse, show_value } => {
+                let Value::Num(x) = v else { return false };
+                let n = ICON_SETS.get(*set as usize).map_or(0, |s| s.1) as usize;
+                if n == 0 || points.len() != n {
+                    return false;
+                }
+                let st = self.stats(fi, ri, f);
+                // The highest threshold the value meets; below the first, icon 0.
+                let mut k = 0;
+                for (i, (p, gte)) in points.iter().enumerate().skip(1) {
+                    let t = self.cfvo(p, &st, f, a);
+                    if if *gte { *x >= t } else { *x > t } {
+                        k = i;
+                    }
+                }
+                let k = if *reverse { n - 1 - k } else { k };
+                out.icon = Some((*set, k as u8));
+                out.hide_value = !show_value;
                 false
             }
         }
@@ -593,6 +693,16 @@ impl CondFormat {
                     cfvo(w, max);
                     w.u32(*color);
                 }
+                RuleKind::IconSet { set, points, reverse, show_value } => {
+                    w.u8(10);
+                    w.u8(*set);
+                    w.u8(*reverse as u8 | (*show_value as u8) << 1);
+                    w.var(points.len() as u64);
+                    for (p, gte) in points {
+                        cfvo(w, p);
+                        w.u8(*gte as u8);
+                    }
+                }
             }
         }
     }
@@ -685,6 +795,21 @@ impl CondFormat {
                     let min = cfvo(r)?;
                     let max = cfvo(r)?;
                     RuleKind::DataBar { min, max, color: r.u32()? & 0xFF_FFFF }
+                }
+                10 => {
+                    let set = r.u8()?;
+                    let Some(&(_, n)) = ICON_SETS.get(set as usize) else { return Err(WireError::Invalid("icon set")) };
+                    let b = r.u8()?;
+                    let k = r.count("icon points", 5, 2)?;
+                    if k != n as usize {
+                        return Err(WireError::Invalid("icon set points"));
+                    }
+                    let mut points = Vec::with_capacity(k);
+                    for _ in 0..k {
+                        let p = cfvo(r)?;
+                        points.push((p, r.u8()? != 0));
+                    }
+                    RuleKind::IconSet { set, points, reverse: b & 1 != 0, show_value: b & 2 != 0 }
                 }
                 _ => return Err(WireError::Invalid("conditional format rule")),
             };

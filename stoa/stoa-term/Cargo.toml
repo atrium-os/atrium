@@ -15,3 +15,5 @@ path = "src/lib.rs"
 # We build the grid/cursor/attributes on top via its Perform trait; it has no
 # OS deps and does no I/O — an algorithm crate, like sha2.
 vte = "0.13"
+# Display width of a character (MIT OR Apache-2.0), for wide characters.
+unicode-width = "0.1"

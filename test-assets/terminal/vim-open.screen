@@ -1,0 +1,24 @@
+  1 // A sample file for terminal recordings.
+  2 fn main() {
+  3         let greeting = "hello, 世界";
+  4 new line
+  5         for i in 0..3 {
+  6                 println!("{greeting} {i}");
+  7         }
+  8         let long = "this line is long enough to run past the right margin of
+     an eighty column terminal window";
+  9 }
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+~
+

@@ -87,11 +87,164 @@ pub struct CellView {
     pub borders: [Option<(f32, Color)>; 4],
     /// A data bar: the share of the cell's width it fills (0–1) and its colour.
     pub bar: Option<(f32, Color)>,
+    /// An icon at the cell's left (a conditional format's icon set).
+    pub icon: Option<(CellIcon, Color)>,
+}
+
+/// The icons a cell can show (spreadsheet icon sets), drawn as vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellIcon {
+    /// An arrow: 2 up, 1 up and right, 0 right, -1 down and right, -2 down.
+    Arrow(i8),
+    /// A filled circle (a traffic light).
+    Dot,
+    Flag,
+    /// A tick, an exclamation mark, a cross: on a filled circle (`true`)
+    /// or bare.
+    Check(bool),
+    Exclaim(bool),
+    Cross(bool),
+    /// A triangle pointing up (`true`) or down.
+    Triangle(bool),
+    Diamond,
+    Dash,
+    /// A star: 0 empty, 1 half filled, 2 filled.
+    Star(u8),
+    /// Four rising bars, this many lit.
+    Bars(u8),
+    /// A circle, this many quarters filled.
+    Quarters(u8),
+    /// Four boxes, this many filled.
+    Boxes(u8),
+}
+
+/// A filled polygon in the grid's coordinates.
+fn poly(pts: &[(f32, f32)], c: Color, clip: Option<[f32; 4]>) -> Node {
+    use fresco_protocol::fill_verb::{CLOSE, LINE, MOVE};
+    let mut verbs = vec![MOVE];
+    verbs.extend(std::iter::repeat_n(LINE, pts.len().saturating_sub(1)));
+    verbs.push(CLOSE);
+    Node::Fill(std::sync::Arc::new(fresco_protocol::FillParams {
+        rule: 0,
+        transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        paint: fresco_protocol::FillPaint::Solid { r: c.r, g: c.g, b: c.b, a: c.a },
+        opacity: 1.0,
+        clip,
+        verbs,
+        points: pts.iter().map(|p| [p.0, p.1]).collect(),
+    }))
+}
+
+/// Draws `icon` in `c` in the square at (`x`, `y`), `s` wide; `off` is the
+/// colour of unlit parts.
+pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y: f32, s: f32) {
+    let (mx, my) = (x + s / 2.0, y + s / 2.0);
+    let line = |ctx: &mut Ctx, a: (f32, f32), b: (f32, f32), w: f32, col: Color| {
+        ctx.add(Node::Path { p0: a, p1: b, width: w, color: col });
+    };
+    let white = Color::rgba(1.0, 1.0, 1.0, 1.0);
+    let w = (s * 0.16).max(1.5);
+    match icon {
+        CellIcon::Arrow(d) => {
+            // Shaft from behind the middle to the head, the head a triangle.
+            let ang = -(d as f32) * std::f32::consts::FRAC_PI_4;
+            let (dx, dy) = (ang.cos(), ang.sin());
+            let (nx, ny) = (-dy, dx);
+            let r = s * 0.45;
+            let tip = (mx + dx * r, my + dy * r);
+            let base = (mx + dx * (r - s * 0.42), my + dy * (r - s * 0.42));
+            line(ctx, (mx - dx * r, my - dy * r), base, w * 1.4, c);
+            let hw = s * 0.32;
+            ctx.add(poly(&[tip, (base.0 + nx * hw, base.1 + ny * hw), (base.0 - nx * hw, base.1 - ny * hw)], c, None));
+        }
+        CellIcon::Dot => {
+            ctx.add(Node::Rect { rect: Rect::new(x + 1.0, y + 1.0, s - 2.0, s - 2.0), fill: c, radius: (s - 2.0) / 2.0 });
+        }
+        CellIcon::Flag => {
+            line(ctx, (x + s * 0.2, y + s * 0.05), (x + s * 0.2, y + s), w, off);
+            ctx.add(poly(&[(x + s * 0.25, y + s * 0.05), (x + s * 0.95, y + s * 0.3), (x + s * 0.25, y + s * 0.6)], c, None));
+        }
+        CellIcon::Check(ring) | CellIcon::Exclaim(ring) | CellIcon::Cross(ring) => {
+            let mark = if ring {
+                ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
+                white
+            } else {
+                c
+            };
+            let k = if ring { 0.28 } else { 0.18 };
+            match icon {
+                CellIcon::Check(_) => {
+                    line(ctx, (x + s * k, my), (x + s * 0.43, y + s * (1.0 - k)), w, mark);
+                    line(ctx, (x + s * 0.43, y + s * (1.0 - k)), (x + s * (1.0 - k), y + s * k), w, mark);
+                }
+                CellIcon::Exclaim(_) => {
+                    line(ctx, (mx, y + s * k), (mx, y + s * 0.6), w, mark);
+                    ctx.add(Node::Rect { rect: Rect::new(mx - w / 2.0, y + s * (0.95 - k) - w / 2.0, w, w), fill: mark, radius: w / 2.0 });
+                }
+                _ => {
+                    line(ctx, (x + s * k, y + s * k), (x + s * (1.0 - k), y + s * (1.0 - k)), w, mark);
+                    line(ctx, (x + s * (1.0 - k), y + s * k), (x + s * k, y + s * (1.0 - k)), w, mark);
+                }
+            }
+        }
+        CellIcon::Triangle(up) => {
+            let (a, b) = if up { (y + s * 0.15, y + s * 0.85) } else { (y + s * 0.85, y + s * 0.15) };
+            ctx.add(poly(&[(mx, a), (x + s * 0.95, b), (x + s * 0.05, b)], c, None));
+        }
+        CellIcon::Diamond => {
+            ctx.add(poly(&[(mx, y), (x + s, my), (mx, y + s), (x, my)], c, None));
+        }
+        CellIcon::Dash => {
+            ctx.add(Node::Rect { rect: Rect::new(x + s * 0.15, my - w / 2.0, s * 0.7, w), fill: c, radius: 0.0 });
+        }
+        CellIcon::Star(n) => {
+            let pts: Vec<(f32, f32)> = (0..10)
+                .map(|i| {
+                    let r = if i % 2 == 0 { s * 0.5 } else { s * 0.21 };
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    (mx + r * a.cos(), my + 0.04 * s + r * a.sin())
+                })
+                .collect();
+            ctx.add(poly(&pts, if n == 2 { c } else { off }, None));
+            if n == 1 {
+                ctx.add(poly(&pts, c, Some([x - 1.0, y - 1.0, mx, y + s + 1.0])));
+            }
+        }
+        CellIcon::Bars(n) => {
+            let bw = s / 4.0 - 1.0;
+            for i in 0..4u8 {
+                let h = s * (0.25 + 0.25 * i as f32);
+                ctx.add(Node::Rect { rect: Rect::new(x + i as f32 * (bw + 1.0) + 0.5, y + s - h, bw, h), fill: if i < n { c } else { off }, radius: 0.0 });
+            }
+        }
+        CellIcon::Quarters(n) => {
+            ctx.add(Node::Rect { rect: Rect::new(x, y, s, s), fill: c, radius: s / 2.0 });
+            ctx.add(Node::Rect { rect: Rect::new(x + w * 0.6, y + w * 0.6, s - w * 1.2, s - w * 1.2), fill: white, radius: (s - w * 1.2) / 2.0 });
+            if n > 0 {
+                // A pie from twelve o'clock, clockwise.
+                let r = s / 2.0;
+                let mut pts = vec![(mx, my)];
+                let steps = 6 * n as usize;
+                for i in 0..=steps {
+                    let a = -std::f32::consts::FRAC_PI_2 + (n as f32 * std::f32::consts::FRAC_PI_2) * i as f32 / steps as f32;
+                    pts.push((mx + r * a.cos(), my + r * a.sin()));
+                }
+                ctx.add(poly(&pts, c, None));
+            }
+        }
+        CellIcon::Boxes(n) => {
+            let b = s / 2.0 - 1.0;
+            for i in 0..4u8 {
+                let (bx, by) = (x + (i % 2) as f32 * (b + 2.0), y + (i / 2) as f32 * (b + 2.0));
+                ctx.add(Node::Rect { rect: Rect::new(bx, by, b, b), fill: if i < n { c } else { off }, radius: 1.0 });
+            }
+        }
+    }
 }
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -445,13 +598,22 @@ impl GridView {
                                     };
                                     ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
                                 }
+                                // The icon at the left; text keeps clear of it.
+                                let mut lead = 0.0;
+                                if let Some((icon, c)) = cv.icon {
+                                    let s = (ch - 6.0).clamp(0.0, 14.0);
+                                    if s >= 6.0 && cw > s + 4.0 {
+                                        draw_icon(ctx, icon, c, t.border_default(), cx + 3.0, cy + q(((ch - s) / 2.0) as f64), s);
+                                        lead = s + 3.0;
+                                    }
+                                }
                                 if cv.text.is_empty() {
                                     continue;
                                 }
                                 let style = text(TEXT_SIZE, if cv.bold { Weight::Semibold } else { Weight::Regular }, cv.color.unwrap_or(t.text_primary()));
-                                let (shown, w) = fit_text(&cv, cw - 2.0 * PAD, &style);
+                                let (shown, w) = fit_text(&cv, cw - 2.0 * PAD - lead, &style);
                                 let tx0 = match cv.align {
-                                    CellAlign::Left => cx + PAD,
+                                    CellAlign::Left => cx + PAD + lead,
                                     CellAlign::Center => cx + q(((cw - w) / 2.0) as f64),
                                     CellAlign::Right => cx + q((cw - PAD - w) as f64),
                                 };
@@ -1043,6 +1205,38 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_cell_icon_draws_inside_its_square() {
+        struct Icons;
+        impl View for Icons {
+            fn render(&self, ctx: &mut Ctx) {
+                ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, 800.0, 40.0), fill: Color::TRANSPARENT, radius: 0.0 });
+                let all = [
+                    CellIcon::Arrow(2), CellIcon::Arrow(1), CellIcon::Arrow(0), CellIcon::Arrow(-1), CellIcon::Arrow(-2), CellIcon::Dot, CellIcon::Flag,
+                    CellIcon::Check(true), CellIcon::Exclaim(false), CellIcon::Cross(true), CellIcon::Triangle(true), CellIcon::Diamond, CellIcon::Dash,
+                    CellIcon::Star(0), CellIcon::Star(1), CellIcon::Star(2), CellIcon::Bars(2), CellIcon::Quarters(3), CellIcon::Boxes(4),
+                ];
+                for (i, ic) in all.into_iter().enumerate() {
+                    draw_icon(ctx, ic, Color::rgba(1.0, 0.0, 0.0, 1.0), Color::rgba(0.5, 0.5, 0.5, 1.0), 20.0 + i as f32 * 40.0, 10.0, 14.0);
+                }
+                ctx.pop();
+            }
+        }
+        let (tree, _) = crate::view::render(&Icons, crate::theme::Semantic::LIGHT);
+        let mut per = [0usize; 19];
+        for (_, n) in tree.iter() {
+            let r = n.rect();
+            if r.w() >= 800.0 {
+                continue;
+            }
+            let i = ((r.x() - 20.0) / 40.0).floor().clamp(0.0, 18.0) as usize;
+            let x0 = 20.0 + i as f32 * 40.0;
+            assert!(r.x() >= x0 - 2.0 && r.x() + r.w() <= x0 + 16.0 && r.y() >= 8.0 && r.y() + r.h() <= 26.0, "icon {i}: {r:?}");
+            per[i] += 1;
+        }
+        assert!(per.iter().all(|&n| n > 0), "{per:?}");
+    }
     use crate::app::App;
     use crate::event::{KeyEventKind, ScrollPhase};
     use crate::geom::Point;

@@ -163,7 +163,7 @@ fn condition(wb: &Workbook, f: &CondFormat, rule: &Rule) -> String {
         }
         RuleKind::Duplicates { unique: false } => "duplicate".into(),
         RuleKind::Duplicates { unique: true } => "unique".into(),
-        RuleKind::ColorScale(_) | RuleKind::DataBar { .. } => String::new(),
+        RuleKind::ColorScale(_) | RuleKind::DataBar { .. } | RuleKind::IconSet { .. } => String::new(),
     }
 }
 
@@ -198,6 +198,20 @@ pub fn sheet_xml(wb: &Workbook, s: u16, list: &[Dxf]) -> String {
                     }
                     out.push_str("</calcext:data-bar>");
                 }
+                // LibreOffice reads show-value on the set and writes it on the first
+                // entry: both carry it. ODF has no reverse or strict thresholds (they
+                // are lost, as LibreOffice loses them).
+                RuleKind::IconSet { set, points, show_value, .. } => {
+                    let name = officina_grid::condfmt::ICON_SETS[*set as usize].0;
+                    let hide = if *show_value { "" } else { r#" calcext:show-value="false""# };
+                    let _ = write!(out, r#"<calcext:icon-set calcext:icon-set-type="{name}"{hide}>"#);
+                    for (i, (p, _)) in points.iter().enumerate() {
+                        let (t, v) = cfvo(wb, p, o);
+                        let hide = if i == 0 && !*show_value { r#" calcext:show-value="false""# } else { "" };
+                        let _ = write!(out, r#"<calcext:formatting-entry{hide} calcext:value="{}" calcext:type="{t}"/>"#, esc(&v));
+                    }
+                    out.push_str("</calcext:icon-set>");
+                }
                 _ => {
                     let style = list.iter().position(|d| *d == rule.dxf).map_or(0, |i| i + 1);
                     let _ = write!(out, r#"<calcext:condition calcext:apply-style-name="CF{style}" calcext:value="{}" calcext:base-cell-address="{base}"/>"#, esc(&condition(wb, f, rule)));
@@ -227,7 +241,9 @@ pub enum EntryIn {
     Condition { style: String, value: String, base: String },
     Scale(Vec<(String, String, String)>),
     Bar { color: String, points: Vec<(String, String)> },
-    /// Icon sets, date conditions: not modelled.
+    /// An icon set: its name, whether values show, its points.
+    Icons { set: String, show_value: bool, points: Vec<(String, String)> },
+    /// Date conditions: not modelled.
     Other(String),
 }
 
@@ -309,6 +325,13 @@ pub fn make(wb: &Workbook, f: &FormatIn, style: &dyn Fn(&str) -> Dxf) -> Result<
                 }
                 let kind = RuleKind::DataBar { min: point(&points[0].0, &points[0].1)?, max: point(&points[1].0, &points[1].1)?, color: color_of(color).ok_or("colour")? };
                 rules.push(Rule { kind, dxf: Dxf::default(), stop: false });
+            }
+            EntryIn::Icons { set: name, show_value, points } => {
+                let set = officina_grid::condfmt::icon_set(name).ok_or_else(|| format!("icon set {name}"))?;
+                let n = officina_grid::condfmt::ICON_SETS[set as usize].1 as usize;
+                let pts = points.iter().map(|(t, v)| Ok((point(t, v)?, true))).collect::<Result<Vec<_>, String>>()?;
+                let pts = if pts.len() == n { pts } else { officina_grid::condfmt::icon_points(n as u8) };
+                rules.push(Rule { kind: RuleKind::IconSet { set, points: pts, reverse: false, show_value: *show_value }, dxf: Dxf::default(), stop: false });
             }
             EntryIn::Other(what) => return Err(what.trim_start_matches("calcext:").into()),
             EntryIn::Condition { style: st, value, base } => {

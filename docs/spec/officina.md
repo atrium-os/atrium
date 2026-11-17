@@ -3471,6 +3471,22 @@ sets `ParaProps.rtl`, which the bidi layout in `officina-text` uses and
 which `.docx`, `.odt` and the native file keep. Each change is one undo
 step and is kept by crash recovery.
 
+### 16.59 Icon sets in Sheets (2026-11-17)
+
+Conditional formats gain Excel's icon sets: all 20 (3 to 5 icons: arrows, grey arrows, flags, traffic lights, signs, symbols, ratings, quarters, boxes, triangles, stars). A rule holds the set, one threshold per icon after the first (number, percent, percentile or formula, each "at least" or "more than"), reverse order and icon only. A cell gets the highest icon whose threshold it meets; the icon is drawn at the left of the cell by `GridView` from a small set of shape kinds coloured per set, so no picture files are needed. Native files keep the rule (codec tag 10).
+
+`.xlsx` reads and writes `<iconSet>` with `reverse`, `showValue` and `gte`. `.ods` reads and writes LibreOffice's `calcext:icon-set`. Gate (`examples/condfmt_lo.rs`, two icon columns added): every icon cell matches in .xlsx → .xlsx, .ods → .ods and .ods → .xlsx through LibreOffice. LibreOffice's ODF form keeps neither reverse order nor icon only (it writes show-value but does not read it back) and drops strict thresholds in both formats; those are its limits, written down in the gate.
+
+### 16.60 The conditional-format dialog in Sheets (2026-11-17)
+
+Data ▸ Conditional Formatting… opens a panel at the window's right on the rules whose ranges meet the selection, first applied first (with nothing there it opens straight on a new rule). A rule is picked by a click; New Rule, Edit, Delete, Up and Down work on it. The rule form has Apply To (cells, ranges, whole columns or rows, several split by commas), the kind (cell value, text, formula, top or bottom, average, duplicates, blanks, errors, colour scale, data bar, icon set), its comparison or choice (Excel's twelve colour scales, six bar colours, all twenty icon sets with reverse and icon only), one or two values, Excel's six ready-made looks with a sample, and Stop If True. A value typed for a comparison is a formula when it starts with `=`, a number when it reads as one, else text. What the form doesn't show is kept when a rule is changed: custom looks and colour scales show as "As it is", icon thresholds stay while the set does, an average rule keeps its standard-deviation line. New rules go first, as in Excel; a changed rule keeps its place and its format takes the new ranges. Errors are said in the panel and nothing changes.
+
+Each change is one undo step: `GridOp::CondFormats` swaps in the whole list, held as the native file's bytes so the journal can replay it (a list naming a sheet no longer there changes nothing). Tests: every kind and choice saves, loads back into the form and saves to the same rule; a panel test makes, changes, picks by click, reorders and deletes rules and undoes each.
+
+### 16.61 The pivot field list in Sheets (2026-11-17)
+
+Data ▸ Pivot Table Fields… (with the cursor in a pivot table or its source) opens a pane at the window's right: the source's fields, each marked with where it is, then buttons that put the picked field in Rows, Columns, Filters or Values, take it out, or move it earlier or later in its area; a line per area; each value field's summary function (all eleven); and switches for the grand total row, the grand total column and subtotals. A field going to Values is summed when most of its cells are numbers, else counted; a field leaving an axis and coming back keeps its hidden items. Each change refreshes the pivot and is one undo step (`Workbook::pivot_op`); a change that would leave the pivot with no row, column or value field, or that the refresh refuses (cells in the way, overlap), is said in the pane and nothing changes. Compact layout is still to come.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -29,7 +29,10 @@
 #   7. read-write: a 460 KB file, a directory and a small (inline) file are
 #      written, nothing of them is in the clear, and they read back after a
 #      remount; no key, no rw mount;
-#   8. a crash between the journal commit and the superblock write
+#   8. garbage collection: files written then deleted, tessera-gc reclaims
+#      their packs, the space comes back, every other file still reads, and
+#      the crash image below (kept for fsck) is the collected volume;
+#   9. a crash between the journal commit and the superblock write
 #      (kern.tessera.skip_next_sb, then a copy of the image): the copy
 #      mounts, replays the sealed ROOT_UPDATE and has the last file.
 set -eu
@@ -48,7 +51,8 @@ deploy() {
     TS="$ROOT/atrium-tessera"
     mkdir -p "$st/core" "$st/tools"
     cp -R "$TS/core/include" "$TS/core/src" "$st/core/"
-    cp "$TS/tools/tessera-mkfs-sealed.c" "$TS/kmod/tessera-keyload.c" "$st/tools/"
+    cp "$TS/tools/tessera-mkfs-sealed.c" "$TS/kmod/tessera-keyload.c" \
+        "$TS/kmod/tessera-gc.c" "$st/tools/"
     tar --no-xattrs -cf - -C "$st" . | "$VSSH" "rm -rf $T && mkdir -p $T && tar xf - -C $T"
     rm -r "$st"
     "$VSSH" "cd $T/core/src && cc -O2 -I../include -I. -o $T/tessera-mkfs-sealed \
@@ -57,7 +61,8 @@ deploy() {
         extent.c gc.c volume.c quota.c quota_store.c b3_blake3.c \
         b3_blake3_portable.c b3_shim.c tessera_reader.c crypt.c seal.c \
         -lmd -lcrypto && cc -O2 -I../include -o $T/tessera-keyload \
-        ../../tools/tessera-keyload.c && echo tools built"
+        ../../tools/tessera-keyload.c && cc -O2 -o $T/tessera-gc \
+        ../../tools/tessera-gc.c && echo tools built"
 }
 
 guest_script() {
@@ -168,7 +173,34 @@ ls $M/drafts >/dev/null || fail "dir after rw remount"
 umount $M
 echo "read-write: ok"
 
-# 8. crash after the journal commit, before the superblock write
+# 8. garbage collection
+mount -t tessera $DEV $M || fail "rw mount for gc"
+for i in 1 2 3 4 5 6; do
+    jot -w "doomed sealed file $i line %06d" 15000 > $M/doomed$i.txt || fail "gc write"
+done
+sync; sleep 2; sync
+f1=$(df -k $M | awk 'NR==2 {print $4}')
+rm $M/doomed*.txt || fail "gc rm"
+sync; sleep 2; sync
+g=$(tessera-gc $M) || fail "tessera-gc: $g"
+echo "$g"
+n=$(echo "$g" | awk '/reclaimed/ {print $3}')
+[ "${n:-0}" -ge 1 ] || fail "gc reclaimed nothing"
+sync
+f2=$(df -k $M | awk 'NR==2 {print $4}')
+[ "$f2" -gt "$f1" ] || fail "no space back after gc ($f1 -> $f2 KiB free)"
+cmp -s $M/$NAME $T/content && cmp -s $M/$NAME2 $T/content2 ||
+    fail "a kept file differs after gc"
+[ "$(cat $M/drafts/note.txt)" = 'tiny sealed note' ] || fail "small file after gc"
+umount $M || fail "umount after gc"
+mount -t tessera -r $DEV $M || fail "ro mount after gc"
+ls $M | grep -q doomed && fail "deleted files back after gc"
+cmp -s $M/$NAME2 $T/content2 || fail "kept file differs after gc remount"
+umount $M
+dmesg | tail -200 | grep -E 'tessera_fs: sealed pack .*refused|gc .*abort' | head -5
+echo "gc: ok ($f1 -> $f2 KiB free)"
+
+# 9. crash after the journal commit, before the superblock write
 mount -t tessera $DEV $M || fail "rw mount for the crash"
 echo 'written just before the crash' > $M/crash.txt
 sysctl kern.tessera.skip_next_sb=1 >/dev/null

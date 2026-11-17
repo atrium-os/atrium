@@ -4128,6 +4128,9 @@ struct tessera_mount {
 	uint64_t                  gc_scan_inode_root;
 	uint64_t                  gc_scan_registry_root;
 	uint64_t                  gc_scan_snapshots_root;
+	/* Sealed: the frozen roots' tags, taken with them (inode, registry,
+	 * snapshots), so the scan and the pinscan can open those trees. */
+	uint8_t                   gc_scan_tags[3][16];
 	/* SATB touch filter: every hash a writer publishes or re-references
 	 * while gc_scan_active gets 2 bits set here, and the apply phase
 	 * refuses to reclaim any pack whose blob hash tests present. A
@@ -18132,8 +18135,12 @@ tessera_fs_pinscan_seal_capture(struct tessera_mount *tmp_,
 	*out_tag = NULL;
 	if (tmp_->seal == NULL)
 		return (NULL);
-	proot = malloc(3 * N * sizeof *proot, M_TESSERA, M_WAITOK | M_ZERO);
-	ptag = malloc(3 * N * sizeof *ptag, M_TESSERA, M_WAITOK | M_ZERO);
+	/* Rows: live [0,N), durable0 [N,2N), durable1 [2N,3N), then the
+	 * running GC scan's three frozen roots [3N,3N+3). */
+	proot = malloc((3 * N + 3) * sizeof *proot, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	ptag = malloc((3 * N + 3) * sizeof *ptag, M_TESSERA,
+	    M_WAITOK | M_ZERO);
 	for (int k = 0; k < N; k++) {
 		proot[k] = tessera_fs_sb_root(&tmp_->sb, (uint8_t)k);
 		if (proot[k] != 0 && tessera_fs_root_tag(tmp_, proot[k],
@@ -18146,13 +18153,20 @@ tessera_fs_pinscan_seal_capture(struct tessera_mount *tmp_,
 			memcpy(ptag[j], tmp_->durable_sb[d].root_tags[k], 16);
 		}
 	}
+	if (tmp_->gc_scan_active) {
+		proot[3 * N + 0] = tmp_->gc_scan_inode_root;
+		proot[3 * N + 1] = tmp_->gc_scan_registry_root;
+		proot[3 * N + 2] = tmp_->gc_scan_snapshots_root;
+		memcpy(ptag[3 * N], tmp_->gc_scan_tags,
+		    sizeof tmp_->gc_scan_tags);
+	}
 	*out_tag = ptag;
 	return (proot);
 }
 
 /* Sealed: replace the scan's rows with the captured roots (live rows
- * [0, N), the three GC slots emptied — no GC scan runs on a sealed volume —
- * then the durable rows that differ). Row i's tag is ptag[i < N ? i : i-3].
+ * [0, N), the running GC scan's frozen roots, then the durable rows that
+ * differ). Row i's tag is ptag[tessera_pinscan_tag_row(i)].
  * Returns 1 when a live root had to be skipped (the scan is incomplete). */
 static __noinline int
 tessera_fs_pinscan_seal_rows(const uint64_t *proot,
@@ -18174,8 +18188,22 @@ tessera_fs_pinscan_seal_rows(const uint64_t *proot,
 		    (d1 != proot[t] && d1 != d0) ? d1 : 0;
 	}
 	for (int g = 0; g < 3; g++)
-		roots[N + g].root = 0;
+		roots[N + g].root = proot[3 * N + g];
 	return (skipped);
+}
+
+/* The captured tag of pinscan row i: live rows, the GC slots (captured
+ * last), then the durable rows. */
+static __inline int
+tessera_pinscan_tag_row(int i)
+{
+	const int N = TESSERA_RESERVE_TREE_COUNT;
+
+	if (i < N)
+		return (i);
+	if (i < N + 3)
+		return (3 * N + (i - N));
+	return (i - 3);
 }
 
 /*
@@ -18366,13 +18394,9 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t;
 		if (proot != NULL) {
-			/* Row i's captured tag: live rows 0..N-1, durable
-			 * rows after the three GC slots. */
-			const int N = TESSERA_RESERVE_TREE_COUNT;
-			const int j = i < N ? i : i - 3;
 			t = tessera_fs_tree_open_tagged(tmp_, roots[i].root,
 			    roots[i].kind, roots[i].ksz, roots[i].vsz,
-			    ptag[j]);
+			    ptag[tessera_pinscan_tag_row(i)]);
 		} else
 			t = tessera_fs_tree_open(tmp_, roots[i].root,
 			    roots[i].kind, roots[i].ksz, roots[i].vsz);
@@ -19626,21 +19650,27 @@ tessera_fs_fetch_reloc_ok(struct tessera_mount *tmp_, uint64_t reloc_gen0,
  * no content-hash check follows (the id is keyed; the AEAD is the check).
  * 0, ENOENT (not in this pack), or EIO / EINTEGRITY.
  */
+/*
+ * Read and open a sealed pack's front (prelude, header, index, bloom) against
+ * the registry's tag. 0 with *out_front (malloc'd, zfree) holding the plain
+ * front and *geom its geometry; EIO or EINTEGRITY with *why naming the check.
+ */
 static int
-tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
+tessera_fs_sealed_front_open(struct tessera_mount *tmp_,
     const tessera_registry_entry_t *re, const uint8_t front_tag[16],
-    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+    uint8_t **out_front, size_t *out_fbytes, tessera_pack_geom_t *geom,
+    const char **why)
 {
 	const uint64_t pack_len = re->length_sectors * TESSERA_SECTOR_SIZE;
 	tessera_pack_extent_t ext = { re->start_sector, re->length_sectors };
-	tessera_pack_geom_t geom;
-	uint8_t *front = NULL, *unit = NULL, *pt = NULL;
-	uint64_t grp, desc_off;
-	uint32_t flen, dsize;
+	uint8_t *front;
+	uint64_t grp;
+	uint32_t flen;
 	size_t fbytes;
-	const char *why = NULL;
 	int rc;
 
+	*out_front = NULL;
+	*why = NULL;
 	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0 ||
 	    re->length_sectors < 2 ||
 	    re->length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS)
@@ -19649,46 +19679,131 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors, 0,
 	    TESSERA_SECTOR_SIZE, front) != 0) {
 		rc = EIO;
-		goto out;
+		goto fail;
 	}
 	if (tessera_pack_sealed_prelude(front, TESSERA_SECTOR_SIZE, &grp,
 	    &flen) != TESSERA_OK || grp != 0) {
 		rc = EINTEGRITY;
-		why = "prelude";
-		goto out;
+		*why = "prelude";
+		goto fail;
 	}
 	fbytes = roundup2((size_t)TESSERA_SEALED_PACK_PRELUDE + flen,
 	    TESSERA_SECTOR_SIZE);
 	if (fbytes > pack_len) {
 		rc = EINTEGRITY;
-		why = "front size";
-		goto out;
+		*why = "front size";
+		goto fail;
 	}
 	free(front, M_TESSERA);
 	front = malloc(fbytes, M_TESSERA, M_WAITOK);
 	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors, 0,
 	    fbytes, front) != 0) {
 		rc = EIO;
-		goto out;
+		goto fail;
 	}
 	if (tessera_pack_open_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
 	    front_tag, front, fbytes) != TESSERA_OK) {
 		rc = EINTEGRITY;
-		why = "front open";
-		goto out;
+		*why = "front open";
+		goto fail;
 	}
-	if (tessera_pack_geom_from_header(front, pack_len, &geom) !=
-	    TESSERA_OK || geom.bloom_off > fbytes) {
+	if (tessera_pack_geom_from_header(front, pack_len, geom) !=
+	    TESSERA_OK || geom->bloom_off > fbytes) {
 		rc = EINTEGRITY;
-		why = "front header";
-		goto out;
+		*why = "front header";
+		goto fail;
 	}
 	if (memcmp(((const tessera_pack_header_t *)front)->pack_id,
 	    re->pack_id, 16) != 0) {
 		rc = EINTEGRITY;
-		why = "another pack's front";    /* authentic, but another pack's front */
-		goto out;
+		*why = "another pack's front";    /* authentic, but another pack's front */
+		goto fail;
 	}
+	*out_front = front;
+	*out_fbytes = fbytes;
+	return (0);
+fail:
+	zfree(front, M_TESSERA);
+	return (rc);
+}
+
+static void
+tessera_fs_sealed_refused(const tessera_registry_entry_t *re, const char *why)
+{
+	printf("tessera_fs: sealed pack %02x%02x%02x%02x at %ju: %s refused\n",
+	    re->pack_id[0], re->pack_id[1], re->pack_id[2], re->pack_id[3],
+	    (uintmax_t)re->start_sector, why);
+}
+
+/*
+ * Every keyed id a sealed pack holds, from its opened front: GC pass 2's
+ * question, without reading any blob. 0 and *out_bh (malloc'd) / *out_n, or
+ * nonzero, and the caller keeps the pack.
+ */
+static int
+tessera_fs_gc_sealed_index_hashes(struct tessera_mount *tmp_,
+    const tessera_registry_entry_t *re, const uint8_t front_tag[16],
+    tessera_hash_t **out_bh, uint32_t *out_n)
+{
+	tessera_pack_geom_t geom;
+	uint8_t *front;
+	size_t fbytes;
+	const char *why;
+	int rc;
+
+	*out_bh = NULL;
+	*out_n = 0;
+	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &front, &fbytes,
+	    &geom, &why);
+	if (rc != 0) {
+		if (why != NULL)
+			tessera_fs_sealed_refused(re, why);
+		return (rc);
+	}
+	if (geom.blob_count == 0 || geom.index_off > fbytes ||
+	    (fbytes - geom.index_off) / TESSERA_PACK_INDEX_ENTRY_SIZE <
+	    geom.blob_count) {
+		zfree(front, M_TESSERA);
+		return (EINTEGRITY);
+	}
+	tessera_hash_t *bh = malloc((size_t)geom.blob_count * sizeof(*bh),
+	    M_TESSERA, M_WAITOK);
+	for (uint32_t i = 0; i < geom.blob_count; i++) {
+		tessera_pack_index_entry_t ie;
+
+		if (tessera_decode_pack_index_entry(front + geom.index_off +
+		    (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE, &ie) !=
+		    TESSERA_OK) {
+			free(bh, M_TESSERA);
+			zfree(front, M_TESSERA);
+			return (EINTEGRITY);
+		}
+		memcpy(bh[i], ie.blob_hash, sizeof(tessera_hash_t));
+	}
+	zfree(front, M_TESSERA);
+	*out_bh = bh;
+	*out_n = geom.blob_count;
+	return (0);
+}
+
+static int
+tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
+    const tessera_registry_entry_t *re, const uint8_t front_tag[16],
+    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+{
+	tessera_pack_extent_t ext = { re->start_sector, re->length_sectors };
+	tessera_pack_geom_t geom;
+	uint8_t *front = NULL, *unit = NULL, *pt = NULL;
+	uint64_t desc_off;
+	uint32_t dsize;
+	size_t fbytes;
+	const char *why = NULL;
+	int rc;
+
+	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &front, &fbytes,
+	    &geom, &why);
+	if (rc != 0)
+		goto out;
 	rc = tessera_pack_index_find(front + geom.index_off,
 	    (size_t)(geom.bloom_off - geom.index_off), &geom, id, &desc_off,
 	    &dsize);
@@ -19720,9 +19835,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	rc = 0;
 out:
 	if (why != NULL)
-		printf("tessera_fs: sealed pack %02x%02x%02x%02x at %ju: %s "
-		    "refused\n", re->pack_id[0], re->pack_id[1], re->pack_id[2],
-		    re->pack_id[3], (uintmax_t)re->start_sector, why);
+		tessera_fs_sealed_refused(re, why);
 	if (front != NULL)
 		zfree(front, M_TESSERA);
 	if (unit != NULL)
@@ -20581,6 +20694,7 @@ struct tessera_gc_scan {
 	uint64_t        inode_root;
 	uint64_t        registry_root;
 	uint64_t        snapshots_root;
+	uint8_t         tags[3][16];  /* sealed: the three roots' tags */
 	tessera_hash_t *seeds;      /* in-flight refs, copied at activation */
 	uint32_t        nseeds;
 };
@@ -20669,6 +20783,27 @@ tessera_fs_gc_scan_begin(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 		s->inode_root     = tmp_->sb.inode_root;
 		s->registry_root  = tmp_->sb.pack_registry_root;
 		s->snapshots_root = tmp_->sb.snapshots_root;
+		/* Sealed: each frozen root with its tag, read here where the
+		 * pair cannot move. A root this mount cannot vouch for means
+		 * no pass this time, never a pass that cannot open its trees. */
+		if (tmp_->seal != NULL) {
+			const uint64_t r3[3] = { s->inode_root,
+			    s->registry_root, s->snapshots_root };
+			const uint8_t k3[3] = { TESSERA_BTREE_KIND_INODE,
+			    TESSERA_BTREE_KIND_PACK_REG,
+			    TESSERA_BTREE_KIND_SNAPSHOT };
+			int no_tag = 0;
+			for (int i = 0; i < 3; i++)
+				if (r3[i] != 0 && tessera_fs_root_tag(tmp_,
+				    r3[i], k3[i], s->tags[i]) != 0)
+					no_tag = 1;
+			if (no_tag) {
+				mtx_unlock(&tmp_->flush_mtx);
+				free(seeds, M_TESSERA);
+				return (EAGAIN);
+			}
+			memcpy(tmp_->gc_scan_tags, s->tags, sizeof s->tags);
+		}
 		/*
 		 * ★ #131: PUBLISH the frozen roots to the mount so the pinscan
 		 * can actually pin them.
@@ -20721,6 +20856,7 @@ tessera_fs_gc_scan_end(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 	tmp_->gc_scan_inode_root     = 0;
 	tmp_->gc_scan_registry_root  = 0;
 	tmp_->gc_scan_snapshots_root = 0;
+	memset(tmp_->gc_scan_tags, 0, sizeof tmp_->gc_scan_tags);
 	mtx_unlock(&tmp_->flush_mtx);
 	if (s->seeds != NULL) {
 		free(s->seeds, M_TESSERA);
@@ -20910,9 +21046,6 @@ static int
 tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
     struct tessera_gc_scan *scan)
 {
-	/* Not on a sealed volume yet (GC and repack read packs plain). */
-	if (tmp_->seal != NULL)
-		return (0);
 	const int concurrent = (scan != NULL && scan->concurrent);
 	/* A pass walks FROZEN roots the pinscan pins; it must not hold a
 	 * reader epoch for 55 s and stall every swap. */
@@ -20931,16 +21064,16 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 
 	if (concurrent) {
 		if (scan->inode_root != 0) {
-			open_inode = tessera_fs_tree_open(tmp_,
+			open_inode = tessera_fs_tree_open_tagged(tmp_,
 			    scan->inode_root, /*tree_kind*/ 0, /*key*/ 4,
-			    /*value*/ TESSERA_INODE_RECORD_SIZE);
+			    /*value*/ TESSERA_INODE_RECORD_SIZE, scan->tags[0]);
 			if (open_inode == NULL) return (0);
 			scan_inode_tree = open_inode;
 		}
 		if (scan->registry_root != 0) {
-			open_reg = tessera_fs_tree_open(tmp_,
+			open_reg = tessera_fs_tree_open_tagged(tmp_,
 			    scan->registry_root, /*tree_kind*/ 1, /*key*/ 16,
-			    TESSERA_REGISTRY_ENTRY_SIZE);
+			    TESSERA_REGISTRY_ENTRY_SIZE, scan->tags[1]);
 			if (open_reg == NULL) {
 				if (open_inode) tessera_btree_close(open_inode);
 				return (0);
@@ -20948,9 +21081,9 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			scan_reg_tree = open_reg;
 		}
 		if (scan->snapshots_root != 0) {
-			open_snap = tessera_fs_tree_open(tmp_,
+			open_snap = tessera_fs_tree_open_tagged(tmp_,
 			    scan->snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
-			    TESSERA_SNAPSHOT_RECORD_SIZE);
+			    TESSERA_SNAPSHOT_RECORD_SIZE, scan->tags[2]);
 			/* ★ #131: BEHAVIOUR UNCHANGED — still tolerated — but
 			 * no longer SILENT. A failure here drops every retained
 			 * snapshot from the live set; that must be countable
@@ -21958,6 +22091,28 @@ snap_next:
 			uint32_t nexts = 0;
 			int ok = (tessera_fs_pack_extents_resolve(tmp_, &re,
 			    &exts, &nexts) == 0);
+			/* Sealed: the index is inside the sealed front, opened
+			 * against the registry's tag. No whole-pack fallback:
+			 * a front that does not open keeps its pack. */
+			if (tmp_->seal != NULL) {
+				tessera_hash_t *pbh = NULL;
+				uint32_t pn = 0;
+				free(exts, M_TESSERA);
+				if (tessera_fs_gc_sealed_index_hashes(tmp_, &re,
+				    pval + TESSERA_REGISTRY_ENTRY_SIZE, &pbh,
+				    &pn) != 0)
+					goto next_p;
+				nbh = pn;
+				bh_all = pbh;
+				dead = 1;
+				for (uint32_t bi = 0; bi < pn; bi++) {
+					if (_GC_HASH_IS_LIVE(bh_all[bi])) {
+						dead = 0; break;
+					}
+				}
+				memcpy(bh, bh_all[0], sizeof(tessera_hash_t));
+				goto have_hashes;
+			}
 			if (ok && tessera_gc_pack_prefix_read) {
 				tessera_hash_t *pbh = NULL;
 				uint32_t pn = 0;
@@ -22709,9 +22864,6 @@ static int
 tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 {
 	if (out_reclaimed != NULL) *out_reclaimed = 0;
-	/* Not on a sealed volume yet (GC and repack read packs plain). */
-	if (tmp_->seal != NULL)
-		return (EOPNOTSUPP);
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
 		return (EROFS);
 	if (tmp_->readonly_snapshot)
@@ -22778,7 +22930,7 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 static void
 tessera_fs_gc_arm(struct tessera_mount *tmp_)
 {
-	if (!tmp_->gc_tq_init || tmp_->flush_unmounting || tmp_->seal != NULL)
+	if (!tmp_->gc_tq_init || tmp_->flush_unmounting)
 		return;
 	if (atomic_cmpset_acq_int((volatile int *)&tmp_->gc_task_armed, 0, 1))
 		taskqueue_enqueue(tmp_->gc_tq, &tmp_->gc_task);

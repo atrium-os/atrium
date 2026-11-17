@@ -20,3 +20,8 @@ stoa            = { path = "../stoa/stoa" }
 stoa-proto      = { path = "../stoa/stoa-proto" }
 stoa-term       = { path = "../stoa/stoa-term" }
 vte = "0.13"
+# The clipboard (Tabula) for paste and OSC 52, as pergola/src/clipboard.rs.
+aqueduct        = { path = "../aqueduct" }
+tabula          = { path = "../tabula" }
+serde           = { version = "1", features = ["derive"] }
+postcard        = { version = "1", features = ["use-std"] }
