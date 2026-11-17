@@ -137,6 +137,8 @@ pub struct Shown {
     /// The folder the messages' `here` UIDs are in: the chosen folder, or
     /// for a search result the folder the message was found in.
     pub folder: Option<FolderId>,
+    /// Its *Later* item, when it has one (§11.4).
+    pub later: Option<(u64, mail_store::later::Later)>,
 }
 
 impl Shown {
@@ -230,6 +232,8 @@ pub struct Search {
 /// The views that aren't folders (§11.3, §15.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
+    /// Everything set aside (§11.4), soonest first.
+    Later,
     Newsletters,
     NewSenders,
     ScreenedOut,
@@ -238,6 +242,7 @@ pub enum Lane {
 impl Lane {
     pub fn label(self) -> &'static str {
         match self {
+            Lane::Later => "Later",
             Lane::Newsletters => "Newsletters",
             Lane::NewSenders => "New senders",
             Lane::ScreenedOut => "Screened out",
@@ -260,6 +265,10 @@ pub struct Ui {
     pub saved: Vec<SavedPlace>,
     /// The views shown under the folders, with a count where it matters.
     pub views: Vec<(Lane, usize)>,
+    /// Later items past their time (the sidebar marks them).
+    pub overdue: usize,
+    /// The Later sheet (`l`): what it is for, then when.
+    pub later_sheet: Option<u8>,
     /// Quick look of an attachment (§8.1).
     pub look: Option<LookPane>,
     /// What became of Open or Save ("Opening in Atrium PDF…", or why not).
@@ -323,6 +332,13 @@ pub struct Mail {
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
     unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
+}
+
+/// A reader version never used before, even after the reader was empty
+/// (the laid-out lines are cached by it).
+fn next_version() -> u64 {
+    static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -438,6 +454,15 @@ impl Mail {
             ui.count = 0;
         }
         ui.saved = store.saved_searches().unwrap_or_default().into_iter().map(|(id, s)| SavedPlace { id, name: s.name, query: s.query }).collect();
+        let now = (self.now)();
+        match self.engine.later_due(now) {
+            Ok(n) if n > 0 => {
+                ui.count = ui.folder.map_or(0, |f| self.count_of(f, ui.conversations));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("atrium-mail: Later: {e}"),
+        }
+        ui.overdue = self.engine.later_items().unwrap_or_default().iter().filter(|(_, l)| !l.back && l.due <= now).count();
         ui.views = self.views(&accounts.iter().map(|a| a.0).collect::<Vec<_>>());
         if let Some(s) = &mut ui.search {
             // What sync brought in may match too; the row read stays put.
@@ -599,12 +624,13 @@ impl Mail {
         }
         let subject = msgs.first().and_then(|m| store.message(m.msg).ok()).map(|m| m.summary.subject).unwrap_or(row.subject);
         let mut ui = self.ui.get_cloned();
-        let version = ui.reading.as_ref().map_or(0, |r| r.version) + 1;
+        let version = next_version();
         ui.cursor = Some(i);
         ui.link = None;
         if read_any {
             ui.gen += 1;
         }
+        let later = msgs.last().and_then(|m| self.engine.later_of(m.msg).ok().flatten());
         ui.reading = Some(Shown {
             subject: if subject.trim().is_empty() { "(no subject)".into() } else { subject },
             people: if n > 1 { format!("{} · {n} messages", people.join(", ")) } else { String::new() },
@@ -612,6 +638,7 @@ impl Mail {
             framed,
             version,
             folder,
+            later,
         });
         if read_any {
             if let Some(h) = ui.search.as_mut().and_then(|s| s.hits.get_mut(i)) {
@@ -626,7 +653,7 @@ impl Mail {
         let mut ui = self.ui.get_cloned();
         if let Some(r) = &mut ui.reading {
             f(r);
-            r.version += 1;
+            r.version = next_version();
             self.ui.set(ui);
         }
     }
@@ -897,7 +924,7 @@ impl Mail {
     /// when it is on or holds something.
     fn views(&self, accounts: &[AccountId]) -> Vec<(Lane, usize)> {
         let e = &self.engine;
-        let mut out = Vec::new();
+        let mut out = vec![(Lane::Later, e.later_items().map(|l| l.len()).unwrap_or(0))];
         if accounts.iter().any(|a| e.newsletters(*a, 0, 1).is_ok_and(|n| !n.is_empty())) {
             out.push((Lane::Newsletters, 0));
         }
@@ -921,9 +948,28 @@ impl Mail {
     /// A view's rows, every account, newest first.
     fn lane_hits(&self, lane: Lane) -> Vec<mail_engine::search::Hit> {
         let e = &self.engine;
+        if lane == Lane::Later {
+            // Soonest first, each with what it is for and when.
+            let now = (self.now)();
+            return e.later_items().unwrap_or_default().into_iter().filter_map(|(_, l)| {
+                let newest = e.store.thread(l.thread).ok()?.last()?.msg;
+                let mut h = e.hit(newest).or_else(|| e.hit(l.msg))?;
+                let when = if l.back { "back".to_string() } else if l.due <= now { "overdue".to_string() } else { format!("{}", crate::date_text(l.due, now)) };
+                let mut p = format!("{} · {when}", mail_engine::later::kind_label(l.kind));
+                if l.pushed >= 3 {
+                    p += &format!(" · pushed back {} times", l.pushed);
+                }
+                if !l.note.is_empty() {
+                    p += &format!(" · {}", l.note);
+                }
+                h.preview = p;
+                Some(h)
+            }).collect();
+        }
         let mut ids = Vec::new();
         for (a, _) in e.store.accounts().unwrap_or_default() {
             match lane {
+                Lane::Later => {}
                 Lane::Newsletters => ids.extend(e.newsletters(a, 0, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::NewSenders => ids.extend(e.screened(a).map(|s| s.0).unwrap_or_default()),
                 Lane::ScreenedOut => ids.extend(e.screened(a).map(|s| s.1).unwrap_or_default()),
@@ -932,6 +978,99 @@ impl Mail {
         let mut hits: Vec<_> = ids.into_iter().filter_map(|m| e.hit(m)).collect();
         hits.sort_by(|a, b| b.date.cmp(&a.date).then(b.msg.cmp(&a.msg)));
         hits
+    }
+
+    /// `l`: the Later sheet for what the reader shows, its kind chosen.
+    pub fn ask_later(&self) {
+        let mut ui = self.ui.get_cloned();
+        let Some(r) = &ui.reading else { return };
+        let Some(m) = r.msgs.last() else { return };
+        let k = r.later.as_ref().map_or_else(|| self.engine.later_kind(m.msg), |(_, l)| l.kind);
+        ui.later_sheet = Some(k);
+        self.ui.set(ui);
+    }
+
+    pub fn later_kind(&self, k: u8) {
+        let mut ui = self.ui.get_cloned();
+        if ui.later_sheet.is_some() {
+            ui.later_sheet = Some(k);
+            self.ui.set(ui);
+        }
+    }
+
+    pub fn close_later_sheet(&self) {
+        let mut ui = self.ui.get_cloned();
+        ui.later_sheet = None;
+        self.ui.set(ui);
+    }
+
+    /// Set what the reader shows aside until `when`: it leaves the list and
+    /// the next opens, as after Archive.
+    pub fn later(&self, when: mail_engine::later::When) {
+        let mut ui = self.ui.get_cloned();
+        let (Some(k), Some(r)) = (ui.later_sheet.take(), ui.reading.as_ref()) else { return };
+        let Some(msg) = r.msgs.last().map(|m| m.msg) else { return };
+        let cursor = ui.cursor;
+        match self.engine.set_later(msg, k, when.at((self.now)()), "") {
+            Ok(_) => {
+                ui.undo = None;
+                ui.file_note = Some((format!("Set aside: {}", when.label().to_lowercase()), (self.now)() + 4));
+            }
+            Err(e) => {
+                ui.error = Some(format!("Couldn't set it aside: {e}"));
+                self.ui.set(ui);
+                return;
+            }
+        }
+        self.after_leaving(ui, cursor);
+    }
+
+    /// `d`: the reader's Later item is done (§11.4).
+    pub fn later_done(&self) -> bool {
+        let ui = self.ui.get_cloned();
+        let Some((id, _)) = ui.reading.as_ref().and_then(|r| r.later.clone()) else { return false };
+        if let Err(e) = self.engine.later_done(id) {
+            self.set_error(format!("Couldn't close it: {e}"));
+            return true;
+        }
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some(("Done".into(), (self.now)() + 3));
+        let cursor = ui.cursor;
+        if ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::Later)) {
+            self.after_leaving(ui, cursor);
+        } else {
+            if let Some(r) = &mut ui.reading {
+                r.later = None;
+                r.version = next_version();
+            }
+            ui.gen += 1;
+            ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+            if let Some(f) = ui.folder.filter(|_| ui.search.is_none()) {
+                ui.count = self.count_of(f, ui.conversations);
+            }
+            self.ui.set(ui);
+        }
+        true
+    }
+
+    /// The row read has left the list (set aside, done): read the list
+    /// again and open the one now at `cursor`.
+    fn after_leaving(&self, mut ui: Ui, cursor: Option<usize>) {
+        ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+        ui.reading = None;
+        ui.cursor = None;
+        ui.link = None;
+        ui.gen += 1;
+        if ui.search.is_some() {
+            self.run_search(&mut ui);
+        } else if let Some(f) = ui.folder {
+            ui.count = self.count_of(f, ui.conversations);
+        }
+        let next = cursor.filter(|_| ui.count > 0).map(|c| c.min(ui.count - 1));
+        self.ui.set(ui);
+        if let Some(n) = next {
+            self.open(n);
+        }
     }
 
     /// Show a view in the list.
@@ -1041,7 +1180,7 @@ impl Mail {
             for x in r.msgs.iter_mut().filter(|x| x.from.eq_ignore_ascii_case(&m.from)) {
                 x.held = !accept;
             }
-            r.version += 1;
+            r.version = next_version();
         }
         ui.gen += 1;
         self.ui.set(ui);
@@ -1436,6 +1575,16 @@ impl Mail {
         if modifiers.ctrl || modifiers.alt || modifiers.meta {
             return false;
         }
+        if ui.later_sheet.is_some() {
+            use mail_engine::later::When;
+            match (key, chars.as_str()) {
+                (Key::Escape, _) => self.close_later_sheet(),
+                (Key::Enter, _) => self.later(When::Tomorrow),
+                (Key::Char, c @ ("1" | "2" | "3" | "4" | "5")) => self.later(When::ALL[c.parse::<usize>().unwrap() - 1]),
+                _ => return false,
+            }
+            return true;
+        }
         if ui.link.is_some() {
             match key {
                 Key::Enter => {
@@ -1459,6 +1608,11 @@ impl Mail {
                 return true;
             }
             (Key::Char, "z") => return self.undo(),
+            (Key::Char, "l") if ui.reading.is_some() => {
+                self.ask_later();
+                return true;
+            }
+            (Key::Char, "d") if ui.reading.is_some() => return self.later_done(),
             (Key::Char, "/") => {
                 self.start_search();
                 return true;
@@ -1529,6 +1683,8 @@ pub enum Item {
     List(usize),
     /// "New sender · Accept · Refuse" (the screener, §11.3).
     Screener(usize),
+    /// The conversation's Later item: what for, when, Done (§11.4).
+    Later,
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
     /// Quick look, Open, Save (§8.1).
     File { msg: usize, i: usize },
@@ -1538,6 +1694,10 @@ pub enum Item {
 /// The reader's lines for a column `w` wide.
 pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
     let mut out = Vec::new();
+    if r.later.is_some() {
+        out.push(Item::Later);
+        out.push(Item::Gap);
+    }
     let first_new = r.msgs.iter().position(|m| m.new).filter(|&k| k > 0);
     for (k, m) in r.msgs.iter().enumerate() {
         if Some(k) == first_new {
@@ -1810,7 +1970,9 @@ impl MailView {
                 let n = if n > 0 { n.to_string() } else { String::new() };
                 let nw = width(&n, type_size::SM, Weight::Regular);
                 text(ctx, 20.0, y + place_h() / 2.0, &fit(lane.label(), type_size::SM, wt, w - 48.0 - nw), type_size::SM, wt, t.text_primary());
-                text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Regular, t.text_secondary());
+                // Overdue Later items are marked (§15.2).
+                let nc = if lane == Lane::Later && ui.overdue > 0 { t.danger_fg() } else { t.text_secondary() };
+                text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Regular, nc);
                 ctx.pop();
                 y += place_h();
             }
@@ -1939,6 +2101,7 @@ impl MailView {
             match &ui.search {
                 Some(Search { view: Some(v), .. }) => {
                     let empty = match v {
+                        Lane::Later => "Nothing set aside",
                         Lane::Newsletters => "No newsletters",
                         Lane::NewSenders => "No one new is waiting",
                         Lane::ScreenedOut => "Nothing screened out",
@@ -2059,8 +2222,9 @@ impl MailView {
         let mut bx = x0 + w - 16.0;
         use mail_compose::reply::Kind;
         let m = &self.mail;
-        let buttons: [(&str, &str, Box<dyn Fn()>); 5] = [
+        let buttons: [(&str, &str, Box<dyn Fn()>); 6] = [
             ("Delete", "#", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Delete)) }),
+            ("Later", "l", { let m = m.clone(); Box::new(move || m.ask_later()) }),
             ("Archive", "e", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Archive)) }),
             ("Forward", "f", { let m = m.clone(); Box::new(move || m.reply(Kind::Forward)) }),
             ("Reply all", "a", { let m = m.clone(); Box::new(move || m.reply(Kind::ReplyAll)) }),
@@ -2121,6 +2285,50 @@ impl MailView {
         .key(200)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+        if let Some(k) = ui.later_sheet {
+            self.later_sheet(ctx, k, x0 + w - 16.0, read_head_h() + 8.0);
+        }
+    }
+
+    /// The Later sheet (§11.4): what for, then when (each with its key).
+    fn later_sheet(&self, ctx: &mut Ctx, k: u8, right: f32, y0: f32) {
+        use mail_engine::later::{kind_label, When};
+        use mail_store::later::kind;
+        let t = ctx.theme;
+        let row_h = em(30.0);
+        let sw = em(300.0);
+        let sh = em(16.0) + em(28.0) + em(8.0) + 5.0 * row_h + em(12.0);
+        let (sx, sy) = (right - sw, y0);
+        ctx.push(Node::Rect { rect: Rect::new(sx - 1.0, sy - 1.0, sw + 2.0, sh + 2.0), fill: t.border_strong(), radius: 9.0 });
+        ctx.add(Node::Rect { rect: Rect::new(sx, sy, sw, sh), fill: t.bg_window(), radius: 8.0 });
+        let mut bx = sx + em(12.0);
+        let cy = sy + em(16.0) + em(14.0);
+        for kk in [kind::REPLY, kind::READ, kind::DO, kind::WAITING] {
+            let l = kind_label(kk);
+            let lw = width(l, type_size::XS, Weight::Medium) + em(16.0);
+            let m = self.mail.clone();
+            area(ctx, Rect::new(bx, cy - em(12.0), lw, em(24.0)), if kk == k { t.selection_bg() } else { Color::TRANSPARENT }, move || m.later_kind(kk));
+            text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, if kk == k { t.text_primary() } else { t.text_secondary() });
+            ctx.pop();
+            bx += lw + em(4.0);
+        }
+        let now = (self.mail.now)();
+        let mut y = sy + em(16.0) + em(28.0) + em(8.0);
+        for (i, w) in When::ALL.iter().enumerate() {
+            let m = self.mail.clone();
+            let w = *w;
+            area(ctx, Rect::new(sx + em(6.0), y, sw - em(12.0), row_h), Color::TRANSPARENT, move || m.later(w));
+            text(ctx, sx + em(14.0), y + row_h / 2.0, w.label(), type_size::SM, Weight::Regular, t.text_primary());
+            let when = crate::date_text(w.at(now), now);
+            let key = (i + 1).to_string();
+            let kw = width(&key, type_size::XS, Weight::Regular);
+            let ww = width(&when, type_size::XS, Weight::Regular);
+            text(ctx, sx + sw - em(14.0) - kw - em(12.0) - ww, y + row_h / 2.0, &when, type_size::XS, Weight::Regular, t.text_secondary());
+            text(ctx, sx + sw - em(14.0) - kw, y + row_h / 2.0, &key, type_size::XS, Weight::Regular, t.text_tertiary());
+            ctx.pop();
+            y += row_h;
+        }
+        ctx.pop();
     }
 }
 
@@ -2296,6 +2504,41 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::Note(l) => {
             text(ctx, x, cy, l, type_size::SM, Weight::Regular, t.text_secondary());
+        }
+        Item::Later => {
+            let Some((_, l)) = &s.later else { return };
+            let now = (mail.now)();
+            let kind = mail_engine::later::kind_label(l.kind);
+            let set = crate::date_text(l.set_at, now);
+            let mut label = if l.back {
+                format!("Back · {kind} · set aside {set}")
+            } else if l.due <= now {
+                format!("{kind} · overdue since {}", crate::date_text(l.due, now))
+            } else {
+                format!("{kind} · comes back {}", crate::date_text(l.due, now))
+            };
+            if !l.note.is_empty() {
+                label += &format!(": {}", l.note);
+            }
+            if l.pushed >= 3 {
+                label += &format!(" · pushed back {} times", l.pushed);
+            }
+            let buttons: [(&str, &str, Box<dyn Fn()>); 2] = [
+                ("Done", "d", { let m = mail.clone(); Box::new(move || { m.later_done(); }) }),
+                ("Later", "l", { let m = mail.clone(); Box::new(move || m.ask_later()) }),
+            ];
+            let bw: f32 = buttons.iter().map(|(l, k, _)| width(l, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(32.0)).sum();
+            let label = fit(&label, type_size::XS, Weight::Medium, (tw - bw - em(12.0)).max(em(60.0)));
+            text(ctx, x, cy, &label, type_size::XS, Weight::Medium, if l.back || l.due <= now { t.accent_fg() } else { t.text_secondary() });
+            let mut bx = x + width(&label, type_size::XS, Weight::Medium) + em(12.0);
+            for (l, k, on) in buttons {
+                let lw = width(l, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
+                area(ctx, Rect::new(bx, cy - em(11.0), lw, em(22.0)), t.bg_window(), on);
+                text(ctx, bx + em(8.0), cy, l, type_size::XS, Weight::Medium, t.text_primary());
+                text(ctx, bx + lw - em(8.0) - width(k, type_size::XS, Weight::Regular), cy, k, type_size::XS, Weight::Regular, t.text_tertiary());
+                ctx.pop();
+                bx += lw + em(6.0);
+            }
         }
         Item::List(k) | Item::Screener(k) => {
             let m = &s.msgs[*k];

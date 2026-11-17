@@ -577,7 +577,7 @@ fn unsubscribe_block_and_the_screener() {
     use atrium_mail::view::Lane;
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 1, "the stranger waits");
-    assert_eq!(ui.views, [(Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 1)]);
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "Newsletters") && t.iter().any(|x| x == "New senders"), "{t:?}");
 
@@ -611,7 +611,73 @@ fn unsubscribe_block_and_the_screener() {
     mail.screen(0, true);
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 0);
-    assert_eq!(ui.views, [(Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::Newsletters, 0), (Lane::NewSenders, 0)]);
     mail.end_search();
     assert_eq!(mail.ui.get_cloned().count, 2);
+}
+
+#[test]
+fn later_sets_aside_and_done_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200), f(3, "Three", NOW - 100)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    use atrium_mail::view::Lane;
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    mail.open(0);
+    // l: the sheet, Reply chosen (the last message is to Priya).
+    assert!(mail.key(&key("l"), None));
+    assert_eq!(mail.ui.get_cloned().later_sheet, Some(mail_store::later::kind::REPLY));
+    app.tick();
+    let t = texts(&app);
+    for s in ["Reply", "Waiting", "This evening", "Tomorrow morning", "Someday", "2"] {
+        assert!(t.iter().any(|x| x == s), "{s:?} not drawn: {t:?}");
+    }
+    // 2: tomorrow morning. Out of the inbox; the next opens.
+    assert!(mail.key(&key("2"), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.reading.as_ref().unwrap().subject, "Two");
+    assert!(ui.later_sheet.is_none());
+    assert_eq!(ui.views[0], (Lane::Later, 1));
+
+    // The Later list: what for and when.
+    mail.show_view(Lane::Later);
+    let r = mail.row(0).unwrap();
+    assert_eq!((r.subject.as_str(), r.preview.as_str()), ("Three", "Reply · 24 Nov"));
+    mail.open(0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Reply · comes back 24 Nov") && t.iter().any(|x| x == "Done"), "{t:?}");
+    // d: done; the list empties and Three is back in the inbox.
+    assert!(mail.key(&key("d"), None));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    mail.end_search();
+    assert_eq!(subjects(&mail), ["Three", "Two", "One"]);
+
+    // Its time comes: back in the inbox, marked.
+    mail.open(0);
+    assert!(mail.key(&key("l"), None));
+    assert!(mail.key(&key("1"), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    let item = engine.later_items().unwrap()[0].1.clone();
+    engine.later_due(item.due).unwrap();
+    mail.refresh();
+    assert_eq!(subjects(&mail), ["Three", "Two", "One"]);
+    mail.open(0);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x.starts_with("Back · Reply")), "{:?}", texts(&app));
 }
