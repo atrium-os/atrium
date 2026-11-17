@@ -14,6 +14,7 @@
 //! breaks and control characters first, so no field can add a header.
 
 pub mod mailto;
+pub mod quote;
 pub mod reply;
 pub mod write;
 

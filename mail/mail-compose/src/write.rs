@@ -39,6 +39,17 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     pub attachments: Vec<Attachment>,
+    /// The original under a reply or forward, kept apart from the text so
+    /// the HTML part can show it with its formatting.
+    pub quote: Option<crate::quote::Quote>,
+}
+
+impl Draft {
+    /// `self`'s text and HTML with `other`'s attachments (the body being
+    /// written).
+    fn merge_body(self, other: &Draft) -> Draft {
+        Draft { attachments: other.attachments.clone(), ..self }
+    }
 }
 
 /// When and with which random bytes (the caller's clock and generator, so
@@ -380,6 +391,16 @@ fn write_as(d: &Draft, stamp: &Stamp, draft: bool) -> Result<Written, Error> {
     };
     let mut body = String::new();
     let mut alt = String::new();
+    // The quote goes under the person's text in each part.
+    let text = match &d.quote {
+        Some(q) => format!("{}\n{}", d.text.trim_end_matches('\n'), q.text),
+        None => d.text.clone(),
+    };
+    let html = d.html.as_ref().map(|h| match &d.quote {
+        Some(q) => crate::quote::under(h, &q.html),
+        None => h.clone(),
+    });
+    let d = &Draft { text, html, ..Draft::default() }.merge_body(d);
     let alt_head = match &d.html {
         Some(html) => {
             let b = boundary(1);

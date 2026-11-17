@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1080,6 +1080,54 @@ Stalwart in the cloud VM, and later a real account):
    persona-specific link scanning (§7.6), first-contact and look-alike notes (§7.5), and a
    VM run with frescod (frescod doesn't build on the Linux host).
 5. **M4** compose and send: rich text, drafts, undo send, send later, identities, `mailto:`.
+   **Built 2026-11-17 on the host** (`7db04ce1`, `7914ac9b`, `8f000be4`, `4ef936c4`,
+   `641c2e88`, `478acadc`, `af5c213a`). **Writer** (`mail-compose`): RFC 5322 messages from a
+   draft: folded headers, RFC 2047 words for names and subjects, IDNA domains, plain text as
+   quoted-printable, an HTML alternative, attachments, a Message-ID from 16 random bytes, the
+   date in UTC, no `User-Agent`, no Bcc header; every typed header field cleaned of line
+   breaks and control characters. Replies (Reply-To first, "Re:" once, never to oneself, a
+   reply to one's own sent message to its recipients), forwards, quotes, threading headers.
+   `mailto:` links (RFC 6068): only to/cc/bcc/subject/body/in-reply-to, notes for what was
+   dropped, a hidden copy, hidden characters (removed) and a long body. The Drafts copy
+   (`write_draft`) keeps Bcc and leaves out half-typed addresses. **Sending** (§9.3):
+   `mail-sync::submit` sends over a courier submission session (the courier's greeting is
+   the post-login EHLO reply), pipelined, with a FUTURERELEASE hold when the server offers
+   one; the engine's outbox holds the written message and its draft, waits out the undo
+   window (10 s, 5–30), is claimed so Undo can't reach it after, retries transient failures
+   (1, 2, 4 … minutes, at most an hour), stops for the person on a permanent failure or
+   when Mail stopped mid-send (it may have gone: never sent twice), holds Send later itself
+   when the server can't, and asks about scheduled sends that came due while the machine
+   was off. After sending, a copy goes to Sent (`\Seen`) unless the provider files it.
+   **Drafts**: saved by the window every 3 s, copied to the server's Drafts (`\Draft`)
+   after 30 s at rest, each copy replacing the last (the old one deleted once sync has seen
+   it); sending or discarding removes every copy. **Identities** (§9.2): per account From
+   addresses with signatures; a reply comes from the address it was sent to (E12);
+   changing From swaps the signature. **Compose window**: a Pergola window per message
+   (From, To, Cc, Bcc, Subject, the text), Send only with a press's activation token
+   (Ctrl+Enter counts), Send later (in an hour, tomorrow 08:00, Monday 08:00; UTC until
+   apps get time zones), Discard, the forgotten-attachment question once; the main window
+   has Write (c), Reply (r), Reply all (a), Forward (f) and a "Sending… Undo" toast whose
+   Undo opens the message again; `mailto:` links arrive on the document channel; drafts
+   whose windows were open reopen at start. **Rich text**: `RichTextEditor` (one page as
+   wide as the window, growing with the text) kept to a mail profile (paragraphs,
+   headings, B/I/U/strike, web and mail links, lists, quotes), sent as
+   `multipart/alternative` with a plain part from the same paragraphs; drafts keep Mail's
+   HTML and reopen as rich text; a Plain text switch. **Quoted originals** (`4d27ed1d`):
+   a reply or forward of an HTML message shows the original under the text in a jailed
+   doc-viewer slot, as the reader does (the Navigator's `DocumentView`), with Remove; it is
+   sent in a cited blockquote with its formatting, kept to a safe set of elements (no
+   pictures, styles, forms or attributes but web and mail links), and as "> " lines in the
+   plain part; switching to plain text folds the quote into the text. Tests: compose 6 + 4 round trips
+   through Mail's own parser, sync submit (scripted server), store outbox and drafts, engine
+   compose starts, the Dovecot end-to-end test now with Dovecot's submission service
+   through the real courier to a test relay (every recipient, no Bcc header, filed in Sent,
+   drafts copied and replaced, Send later held locally), window compose 2 headless.
+   **Not yet**: the app runs no sync or send loop of its own (no account setup §5.1 yet,
+   so deliver/copy_drafts are called by tests), so the press's token isn't spent by a
+   trusted spender (§9.4 needs the separate engine process) and the courier's hourly cap
+   isn't reached; attachments in compose (M5 picker), address completion (§14.2), per
+   recipient plain text, inline images and tables in the profile, a link button, time
+   zones, and a VM run with frescod.
 6. **M5** attachments: quick look, `OpenAttachment`, Save via picker, attachment search
    text.
 7. **M6** search, smart folders, unsubscribe, newsletter lane, screener, snooze, follow-up,

@@ -7,8 +7,10 @@
 //! in its own parse jail through the engine (§7.1) and never in this
 //! process.
 
+pub mod compose;
 pub mod links;
 pub mod plain;
+pub mod rich;
 pub mod sender;
 pub mod view;
 

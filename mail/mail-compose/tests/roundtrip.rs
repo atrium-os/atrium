@@ -95,3 +95,24 @@ fn a_draft_copy() {
     assert_eq!(s.subject, "Half done");
     assert!(s.to.is_empty());
 }
+
+#[test]
+fn a_reply_quoting_html() {
+    use mail_compose::quote::{self, Quote};
+    let d = Draft {
+        from: Mailbox::new("Priya", "priya@example.org"),
+        to: vec![Mailbox::new("", "arun@acme.example")],
+        subject: "Re: Q4".into(),
+        text: "Thanks!".into(),
+        html: Some("<!DOCTYPE html>\n<html><body>\n<p>Thanks!</p>\n</body></html>\n".into()),
+        quote: Some(Quote { text: "\n\nOn Mon, Arun wrote:\n> The <b>numbers</b>\n".into(), html: quote::html("On Mon, Arun wrote:", "<p>The <b>numbers</b><img src=\"r1\"></p>", true) }),
+        ..Draft::default()
+    };
+    let w = write(&d, &stamp()).unwrap();
+    let s = parse(&w.bytes, &Limits::default()).unwrap();
+    let t = s.text.unwrap().replace("\r\n", "\n");
+    assert!(t.starts_with("Thanks!\n\n\nOn Mon, Arun wrote:\n> The <b>numbers</b>"), "{t:?}");
+    let raw = String::from_utf8_lossy(&w.bytes).replace("=\r\n", "");
+    assert!(raw.contains("<blockquote type=\"cite\""), "{raw}");
+    assert!(raw.contains("<p>The <b>numbers</b></p>") && !raw.contains("r1"), "{raw}");
+}

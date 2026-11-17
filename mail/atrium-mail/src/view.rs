@@ -145,6 +145,8 @@ pub struct LinkBar {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Undo {
     pub ops: Vec<u64>,
+    /// A send waiting in the outbox (Undo takes it back to compose).
+    pub send: Option<u64>,
     /// "Message archived", "Conversation deleted".
     pub label: String,
     pub until: i64,
@@ -201,6 +203,8 @@ pub struct Mail {
     opened: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
     /// Where Monstrator listens.
     monstrator: Rc<std::path::PathBuf>,
+    /// Compose windows asked for, for the app to open.
+    composes: Rc<RefCell<Vec<(mail_engine::compose::Compose, Option<u64>)>>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -533,7 +537,7 @@ impl Mail {
         let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
         match self.engine.act(folder, &uids, action) {
             Ok(ops) if !ops.is_empty() => {
-                ui.undo = Some(Undo { ops, label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
+                ui.undo = Some(Undo { ops, send: None, label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
             }
             Ok(_) => return,
             Err(e) => {
@@ -573,6 +577,23 @@ impl Mail {
             self.ui.set(ui);
             return false;
         }
+        if let Some(send) = u.send {
+            // The message goes back into a compose window.
+            match self.engine.undo_send(send) {
+                Ok(Some(draft)) => {
+                    let account = self.account_of(&draft.from.addr);
+                    if let Some(account) = account {
+                        let ids = self.engine.identities(account).unwrap_or_default();
+                        let identity = ids.iter().position(|i| i.addr.eq_ignore_ascii_case(&draft.from.addr)).unwrap_or(0);
+                        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new(), original: None }, None));
+                    }
+                }
+                Ok(None) => ui.error = Some("It has already gone".into()),
+                Err(e) => ui.error = Some(format!("Couldn't undo: {e}")),
+            }
+            self.ui.set(ui);
+            return true;
+        }
         if let Err(e) = self.engine.undo(&u.ops) {
             ui.error = Some(format!("Couldn't undo: {e}"));
         }
@@ -582,6 +603,86 @@ impl Mail {
         ui.gen += 1;
         self.ui.set(ui);
         true
+    }
+
+    /// Whether the window is drawn dark (a doc-viewer is told).
+    pub fn is_dark(&self) -> bool {
+        self.dark.get()
+    }
+
+    /// The account an address belongs to (one of its identities).
+    fn account_of(&self, addr: &str) -> Option<AccountId> {
+        let accounts = self.engine.store.accounts().ok()?;
+        accounts
+            .iter()
+            .find(|(a, _)| self.engine.identities(*a).unwrap_or_default().iter().any(|i| i.addr.eq_ignore_ascii_case(addr)))
+            .or(accounts.first())
+            .map(|(a, _)| *a)
+    }
+
+    /// The account a new message comes from: the chosen folder's, else
+    /// the first.
+    fn current_account(&self) -> Option<AccountId> {
+        let ui = self.ui.get_cloned();
+        ui.folder.and_then(|f| self.engine.store.folder(f).ok()).map(|f| f.account).or_else(|| self.engine.store.accounts().ok()?.first().map(|a| a.0))
+    }
+
+    /// Open a compose window for a new message.
+    pub fn write_new(&self) {
+        let Some(a) = self.current_account() else { return };
+        match self.engine.compose_new(a, 0) {
+            Ok(c) => self.composes.borrow_mut().push((c, None)),
+            Err(e) => self.set_error(e.to_string()),
+        }
+    }
+
+    /// Reply, reply all or forward the message being read.
+    pub fn reply(&self, kind: mail_compose::reply::Kind) {
+        let ui = self.ui.get_cloned();
+        let Some(m) = ui.reading.as_ref().and_then(|r| r.current().or(r.msgs.last())).map(|m| m.msg) else { return };
+        match self.engine.compose_reply(m, kind) {
+            Ok(c) => self.composes.borrow_mut().push((c, None)),
+            Err(e) => self.set_error(e.to_string()),
+        }
+    }
+
+    /// A `mailto:` link from another app (Monstrator, on the document
+    /// channel): a compose window filled from it, shown in full.
+    pub fn mailto(&self, link: &str) {
+        let Some(a) = self.current_account() else {
+            self.set_error("Add an account to write mail".into());
+            return;
+        };
+        match self.engine.compose_mailto(a, link) {
+            Ok(c) => self.composes.borrow_mut().push((c, None)),
+            Err(e) => self.set_error(format!("That link can't be written: {e}")),
+        }
+    }
+
+    /// Open a stored draft again.
+    pub fn open_draft(&self, account: AccountId, id: u64, draft: mail_compose::Draft) {
+        let ids = self.engine.identities(account).unwrap_or_default();
+        let identity = ids.iter().position(|i| i.addr.eq_ignore_ascii_case(&draft.from.addr)).unwrap_or(0);
+        self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new(), original: None }, Some(id)));
+    }
+
+    /// Compose windows to open (the app opens a window for each).
+    pub fn take_composes(&self) -> Vec<(mail_engine::compose::Compose, Option<u64>)> {
+        std::mem::take(&mut *self.composes.borrow_mut())
+    }
+
+    /// A compose window sent its message: "Sending… Undo" for the undo
+    /// window.
+    pub fn sent(&self, send: u64, label: String) {
+        let mut ui = self.ui.get_cloned();
+        ui.undo = Some(Undo { ops: Vec::new(), send: Some(send), label, until: (self.now)() + mail_engine::send::UNDO_SEND_SECS });
+        self.ui.set(ui);
+    }
+
+    fn set_error(&self, e: String) {
+        let mut ui = self.ui.get_cloned();
+        ui.error = Some(e);
+        self.ui.set(ui);
     }
 
     /// "Load pictures" for message `k` (and, with `always`, for its
@@ -745,6 +846,22 @@ impl Mail {
                 return true;
             }
             (Key::Char, "z") => return self.undo(),
+            (Key::Char, "c") => {
+                self.write_new();
+                return true;
+            }
+            (Key::Char, "r") if ui.reading.is_some() => {
+                self.reply(mail_compose::reply::Kind::Reply);
+                return true;
+            }
+            (Key::Char, "a") if ui.reading.is_some() => {
+                self.reply(mail_compose::reply::Kind::ReplyAll);
+                return true;
+            }
+            (Key::Char, "f") if ui.reading.is_some() => {
+                self.reply(mail_compose::reply::Kind::Forward);
+                return true;
+            }
             _ => {}
         }
         if ui.count == 0 {
@@ -913,6 +1030,7 @@ impl MailView {
             loads: Rc::default(),
             opened: Default::default(),
             monstrator: Rc::new(monstrator::socket()),
+            composes: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -988,6 +1106,7 @@ impl View for MailView {
         let list = list_w().min(w * 0.36).max(em(280.0).min(w * 0.4));
         self.places(ctx, &ui, side, h);
         self.list(ctx, &ui, side, list, h);
+        self.toast(ctx, &ui, side, list, h);
         self.reader(ctx, &ui, side + list, w - side - list, h);
     }
 }
@@ -998,6 +1117,12 @@ impl MailView {
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
         rect(ctx, Rect::new(w - 1.0, 0.0, 1.0, h), t.border_default());
         text(ctx, 16.0, head_h() / 2.0, "Mail", type_size::LG, Weight::Semibold, t.text_primary());
+        // Write (c): a new message.
+        let ww = width("Write", type_size::XS, Weight::Medium) + em(18.0);
+        let m = self.mail.clone();
+        area(ctx, Rect::new(w - 12.0 - ww, head_h() / 2.0 - em(12.0), ww, em(24.0)), t.accent_fg(), move || m.write_new());
+        text(ctx, w - 12.0 - ww + em(9.0), head_h() / 2.0, "Write", type_size::XS, Weight::Medium, t.bg_canvas());
+        ctx.pop();
         let mut y = head_h();
         for p in &ui.places {
             if let Some(a) = &p.account {
@@ -1093,6 +1218,13 @@ impl MailView {
         .key(100)
         .backdrop(t.bg_canvas())
         .emit(ctx);
+    }
+
+    /// "Message archived · Undo z" (or "Sending… · Undo z") at the list's
+    /// foot while it can be undone.
+    fn toast(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
+        let t = ctx.theme;
+        let now = (self.mail.now)();
         // "Message archived · Undo z" at the list's foot while it can be undone.
         if let Some(u) = ui.undo.as_ref().filter(|u| u.until >= now) {
             let undo = "Undo";
@@ -1136,11 +1268,19 @@ impl MailView {
         let tw = col - 64.0;
         // Its actions at the right, each with its key (§15.5).
         let mut bx = x0 + w - 16.0;
-        for (label, k, action) in [("Delete", "#", mail_engine::Action::Delete), ("Archive", "e", mail_engine::Action::Archive)] {
+        use mail_compose::reply::Kind;
+        let m = &self.mail;
+        let buttons: [(&str, &str, Box<dyn Fn()>); 5] = [
+            ("Delete", "#", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Delete)) }),
+            ("Archive", "e", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Archive)) }),
+            ("Forward", "f", { let m = m.clone(); Box::new(move || m.reply(Kind::Forward)) }),
+            ("Reply all", "a", { let m = m.clone(); Box::new(move || m.reply(Kind::ReplyAll)) }),
+            ("Reply", "r", { let m = m.clone(); Box::new(move || m.reply(Kind::Reply)) }),
+        ];
+        for (label, k, on) in buttons {
             let lw = width(label, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
             bx -= lw;
-            let m = self.mail.clone();
-            area(ctx, Rect::new(bx, em(34.0) - em(12.0), lw, em(24.0)), t.bg_window(), move || m.act(action));
+            area(ctx, Rect::new(bx, em(34.0) - em(12.0), lw, em(24.0)), t.bg_window(), on);
             text(ctx, bx + em(9.0), em(34.0), label, type_size::XS, Weight::Medium, t.text_primary());
             text(ctx, bx + lw - em(9.0) - width(k, type_size::XS, Weight::Regular), em(34.0), k, type_size::XS, Weight::Regular, t.text_tertiary());
             ctx.pop();

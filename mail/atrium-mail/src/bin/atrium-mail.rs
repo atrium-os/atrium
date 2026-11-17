@@ -2,7 +2,9 @@
 //! It reads what sync has stored; HTML bodies are drawn by a jailed
 //! doc-viewer in a slot, and remote pictures, only when asked, come
 //! through Mail's own Nuntius fetcher (§7.4; the manifest holds
-//! `net-fetch`). Writing and the separate engine and sync processes come in
+//! `net-fetch`). Each message being written has a compose window of its
+//! own (§9.1); `mailto:` links from other apps arrive on the document
+//! channel and open one. The separate engine and sync processes come in
 //! later milestones (§16).
 //!
 //! Environment:
@@ -19,6 +21,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use atrium_mail::compose::{ComposeView, Composer, Done};
 use atrium_mail::MailView;
 use mail_engine::{Engine, Parser};
 use mail_store::Store;
@@ -98,9 +101,9 @@ fn provide(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, e: 
 /// Ask for a doc-viewer in the frame slot and hand it the document: its
 /// pictures first (`Provide`: the message's own, and remote ones already
 /// loaded), then the HTML (`Load`).
-fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token: [u8; 16], doc: &mail_schema::Document, remote: &[(String, Vec<u8>)], dark: bool) -> Result<limen::proto::EmbedId, String> {
+fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token: [u8; 16], slot: pergola::slot::SlotKey, doc: &mail_schema::Document, remote: &[(String, Vec<u8>)], dark: bool) -> Result<limen::proto::EmbedId, String> {
     use limen::doc_viewer::{DocKind, ToChild};
-    let e = embeds.borrow_mut().request("doc-viewer", token, atrium_mail::view::FRAME_SLOT).map_err(|e| format!("{e:?}"))?;
+    let e = embeds.borrow_mut().request("doc-viewer", token, slot).map_err(|e| format!("{e:?}"))?;
     let send = || -> Result<(), String> {
         provide(embeds, e, &doc.pictures)?;
         provide(embeds, e, remote)?;
@@ -112,6 +115,73 @@ fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token:
         return Err(err);
     }
     Ok(e)
+}
+
+/// A compose window and its state.
+struct ComposeWin {
+    win: Window,
+    app: App<ComposeView>,
+    c: Composer,
+    size: pergola::Mutable<(f32, f32)>,
+    /// The doc-viewer showing the original under a reply or forward.
+    quote: Option<limen::proto::EmbedId>,
+    /// The original couldn't be shown; not asked again.
+    quote_failed: bool,
+}
+
+/// Open a compose window for `c` (`draft`: the stored draft it continues).
+fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<pergola::embed::Embeds>>>, c: mail_engine::compose::Compose, draft: Option<u64>) -> std::io::Result<ComposeWin> {
+    let title = if c.draft.subject.trim().is_empty() { "New message".to_string() } else { c.draft.subject.clone() };
+    let mut win = Window::open(&WindowDesc::new(&title, SizeSpec::Fixed(760, 640)))?;
+    if let Some(e) = embeds {
+        win.set_slot_binder(pergola::embed::Embeds::binder(e));
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, draft, dirty.clone(), now);
+    let view = ComposeView::new(k.clone(), (win.width, win.height));
+    let size = view.size.clone();
+    Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false })
+}
+
+/// The drafts whose windows were open, so a crash or a restart opens them
+/// again (`open-drafts` in the store's folder, one id per line).
+fn remember_open(store_dir: &std::path::Path, wins: &[ComposeWin]) {
+    let ids: Vec<String> = wins.iter().filter_map(|w| w.c.ui.get_cloned().draft_id).map(|i| i.to_string()).collect();
+    let _ = std::fs::write(store_dir.join("open-drafts"), ids.join("\n"));
+}
+
+/// `mailto:` links from Monstrator, read on a thread (§9.1).
+fn links() -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        let mut ch = match atrium_open::Channel::connect() {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("atrium-mail: the document channel: {e}");
+                std::thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+        };
+        loop {
+            match ch.recv_any(None) {
+                Ok(Some(atrium_open::Message::Link(url))) if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
+                    if tx.send(url).is_err() {
+                        return;
+                    }
+                }
+                Ok(Some(atrium_open::Message::Link(_))) => eprintln!("atrium-mail: a link refused: not a mailto: link"),
+                Ok(Some(atrium_open::Message::File(_))) => eprintln!("atrium-mail: a file on the document channel: Mail opens none"),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("atrium-mail: the document channel: {e}");
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    });
+    rx
 }
 
 fn main() {
@@ -128,7 +198,15 @@ fn main() {
         }
     };
     let engine = Rc::new(Engine::new(store, Parser { program: jail }));
+    // A send Mail was in the middle of when it stopped may have gone: it
+    // waits for the person instead of going twice.
+    match engine.recover_sends() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("atrium-mail: {n} message(s) may not have been sent; they wait in the outbox"),
+        Err(e) => eprintln!("atrium-mail: outbox: {e}"),
+    }
     let loads = loader();
+    let incoming = links();
 
     let mut win = match Window::open(&WindowDesc::new("Mail", SizeSpec::Fixed(1280, 800))) {
         Ok(w) => w,
@@ -159,6 +237,17 @@ fn main() {
     let trace = std::env::var_os("MAIL_TRACE").is_some();
     let mut last = String::new();
     let mut refreshed = Instant::now();
+    let mut composes: Vec<ComposeWin> = Vec::new();
+    // Drafts whose windows were open last time open again.
+    let reopen: Vec<u64> = std::fs::read_to_string(store_dir.join("open-drafts")).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect();
+    for (account, _) in engine.store.accounts().unwrap_or_default() {
+        for (id, d) in engine.drafts(account).unwrap_or_default() {
+            if reopen.contains(&id) {
+                mail.open_draft(account, id, d);
+            }
+        }
+    }
+    let mut ticked = Instant::now();
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
         // the cursor doesn't also scroll the list.
@@ -170,7 +259,8 @@ fn main() {
             };
             pergola::input::translate(ev).is_some_and(|e| mail.key(&e, activation))
         };
-        match win.step_with(&mut app, Some(Duration::from_millis(250)), first) {
+        let wait = if composes.is_empty() { 250 } else { 16 };
+        match win.step_with(&mut app, Some(Duration::from_millis(wait)), first) {
             Ok(StepResult::Closed) => break,
             Ok(_) => {}
             Err(e) => {
@@ -181,6 +271,83 @@ fn main() {
         mail.set_size(win.width, win.height);
         mail.poll_link();
         mail.tick();
+        // Compose windows: links from other apps, replies, Undo of a send.
+        while let Ok(url) = incoming.try_recv() {
+            mail.mailto(&url);
+        }
+        let asked = mail.take_composes();
+        let opened = !asked.is_empty();
+        for (c, draft) in asked {
+            match compose_window(&engine, embeds.as_ref(), c, draft) {
+                Ok(w) => composes.push(w),
+                Err(e) => eprintln!("atrium-mail: a compose window: {e}"),
+            }
+        }
+        let save = ticked.elapsed() > Duration::from_secs(1);
+        if save {
+            ticked = Instant::now();
+        }
+        let before = composes.len();
+        composes.retain_mut(|cw| {
+            let c = cw.c.clone();
+            let key = |ev: &fresco_client::Event| {
+                let activation = match ev {
+                    fresco_client::Event::Key { pressed: true, activation, .. } if *activation != [0u8; 16] => Some(*activation),
+                    _ => None,
+                };
+                pergola::input::translate(ev).is_some_and(|e| c.key(&e, activation))
+            };
+            match cw.win.step_with(&mut cw.app, Some(Duration::ZERO), key) {
+                Ok(StepResult::Closed) => cw.c.close(),
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("atrium-mail: a compose window: {e}");
+                    cw.c.close();
+                }
+            }
+            cw.size.set((cw.win.width, cw.win.height));
+            if save {
+                cw.c.tick();
+            }
+            // The original under a reply, in a jailed doc-viewer.
+            if let Some(embeds) = &embeds {
+                let original = cw.c.original.borrow().clone();
+                match (&original, cw.quote) {
+                    (Some(doc), None) if !cw.quote_failed => {
+                        if let Some(token) = cw.win.embed_token() {
+                            match show(embeds, token, atrium_mail::compose::QUOTE_SLOT, doc, &[], mail.is_dark()) {
+                                Ok(e) => cw.quote = Some(e),
+                                Err(e) => {
+                                    eprintln!("atrium-mail: the quoted message: {e}");
+                                    cw.quote_failed = true;
+                                }
+                            }
+                        }
+                    }
+                    (None, Some(e)) => {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                        cw.quote = None;
+                    }
+                    _ => {}
+                }
+                if cw.c.done().is_some() {
+                    if let Some(e) = cw.quote.take() {
+                        let _ = embeds.borrow_mut().detach_embed(e);
+                    }
+                }
+            }
+            match cw.c.done() {
+                None => true,
+                Some(Done::Sent { send, label }) => {
+                    mail.sent(send, label);
+                    false
+                }
+                Some(Done::Discarded | Done::Kept) => false,
+            }
+        });
+        if opened || save || composes.len() != before {
+            remember_open(&store_dir, &composes);
+        }
         // Pictures asked for go to the fetch thread; what came back is kept
         // and, when its message is in the viewer, handed to it.
         for msg in mail.take_loads() {
@@ -212,7 +379,7 @@ fn main() {
                 if let (Some((msg, doc, dark)), Some(token)) = (want.as_ref(), win.embed_token()) {
                     if failed != Some(*msg) {
                         let remote = engine.pictures(*msg).unwrap_or_default();
-                        match show(embeds, token, &doc.0, &remote, *dark) {
+                        match show(embeds, token, atrium_mail::view::FRAME_SLOT, &doc.0, &remote, *dark) {
                             Ok(embed) => frame = Some(Frame { msg: *msg, doc: doc.clone(), embed, dark: *dark }),
                             Err(e) => {
                                 eprintln!("atrium-mail: doc-viewer: {e}");

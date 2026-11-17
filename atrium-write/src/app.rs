@@ -91,6 +91,11 @@ pub enum Cmd {
     StyleBase(usize),
     /// After it, Enter gives the paragraph style at this place in the list.
     StyleNext(usize),
+    /// The bar edits paragraph (false) or character (true) styles.
+    StyleTarget(bool),
+    /// Puts the selection in the character style at this place in the
+    /// list (past the end: none).
+    StyleChar(usize),
     StyleClose,
     List(ListKind),
     PageNumbers,
@@ -315,11 +320,22 @@ pub struct ShapeBar {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StyleBar {
     pub open: bool,
-    pub id: StyleId,
+    /// The style it edits (none: the text at the caret has no character
+    /// style).
+    pub id: Option<StyleId>,
+    /// Character styles rather than paragraph styles.
+    pub chars: bool,
 }
 
 /// The fonts a style can take (the pinned set's families).
-pub const STYLE_FONTS: [&str; 2] = ["IBM Plex Sans", "IBM Plex Mono"];
+pub const STYLE_FONTS: [&str; 18] = [
+    "IBM Plex Sans", "IBM Plex Serif", "IBM Plex Mono",
+    "Liberation Sans", "Liberation Serif", "Liberation Mono",
+    "Carlito", "Caladea",
+    "Source Sans 3", "Source Serif 4", "Source Code Pro",
+    "Fira Sans", "Fira Mono", "Roboto", "Inter",
+    "Noto Sans", "Noto Serif", "Noto Sans Mono",
+];
 
 /// The style bar is three bars high.
 pub const STYLE_H: f32 = FIND_H * 3.0;
@@ -627,10 +643,33 @@ impl Write {
     fn style_cmd(&self, c: Cmd) {
         let ed = self.doc.borrow().ed.clone();
         let mut e = ed.borrow_mut();
-        let id = e.style_at_caret();
+        let chars = match c {
+            Cmd::StyleTarget(b) => b,
+            Cmd::StyleOpen => false,
+            _ => self.style_bar.get_cloned().chars,
+        };
+        let target = |e: &pergola_richtext::Editor| if chars { e.char_style_at_caret() } else { Some(e.style_at_caret()) };
         let name = self.style_name.get_cloned().text().trim().to_string();
+        let Some(id) = target(&e).or(match c {
+            // With no character style here, only making or applying one.
+            Cmd::StyleNew | Cmd::StyleChar(_) | Cmd::StyleTarget(_) | Cmd::StyleClose | Cmd::StyleOpen => Some(0),
+            _ => None,
+        }) else { return };
         let (pf, cf) = e.doc.styles.para_format(id, &Default::default());
         match c {
+            Cmd::StyleNew if chars => match e.new_char_style_from_selection(&name) {
+                Some(_) => self.doc.borrow_mut().status = format!("New character style “{name}”"),
+                None => self.doc.borrow_mut().status = if !e.has_selection() { "Select the text the new character style is made from".into() } else if name.is_empty() { "Type a name for the new style".into() } else { format!("There is a style called “{name}” already") },
+            },
+            Cmd::StyleUpdate if chars => {
+                if !e.update_char_style_to_match(id) {
+                    self.doc.borrow_mut().status = "The style already looks like this".into();
+                }
+            }
+            Cmd::StyleChar(i) => {
+                let to = e.char_styles().get(i).map(|s| s.0);
+                e.set_char_style(to);
+            }
             Cmd::StyleOpen => {
                 self.find.set(FindBar { open: false, ..self.find.get_cloned() });
                 self.spell.set(SpellBar::default());
@@ -692,10 +731,10 @@ impl Write {
             self.style_bar.set(StyleBar::default());
         } else {
             // The bar follows the caret's style (a new one is now the caret's).
-            let id = e.style_at_caret();
-            let n = e.doc.styles.styles.get(id as usize).map_or(String::new(), |s| s.name.to_string());
+            let id = target(&e);
+            let n = id.and_then(|i| e.doc.styles.styles.get(i as usize)).map_or(String::new(), |s| s.name.to_string());
             self.style_name.set(TextEdit::new(&n));
-            self.style_bar.set(StyleBar { open: true, id });
+            self.style_bar.set(StyleBar { open: true, id, chars });
         }
     }
 
@@ -1270,7 +1309,7 @@ impl Write {
                         self.changed();
                         return true;
                     }
-                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleFont(_) | Cmd::StyleBase(_) | Cmd::StyleNext(_) | Cmd::StyleClose => {
+                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleFont(_) | Cmd::StyleBase(_) | Cmd::StyleNext(_) | Cmd::StyleTarget(_) | Cmd::StyleChar(_) | Cmd::StyleClose => {
                         drop(e);
                         drop(d);
                         self.style_cmd(c);
@@ -1628,29 +1667,53 @@ impl View for Write {
                 let cmds = self.cmds.clone();
                 move || cmds.lock().unwrap().push(c)
             };
+            let chars = yb.chars;
             let (cur, pf, cf) = {
                 let e = ed.borrow();
-                let id = e.style_at_caret();
-                let (pf, cf) = e.doc.styles.para_format(id, &Default::default());
+                let id = if chars { e.char_style_at_caret() } else { Some(e.style_at_caret()) };
+                let (pf, cf) = e.doc.styles.para_format(id.unwrap_or(0), &Default::default());
                 (id, pf, cf)
             };
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 60.0, 20.0), content: "Style".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
-            let fw = (w - 72.0 - 560.0).max(140.0);
+            let fw = (w - 72.0 - 750.0).max(140.0);
             let cmds = self.cmds.clone();
             TextField::new(self.style_name.clone()).placeholder("Style name").at(72.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::StyleRename)).render(ctx);
             let mut x = 72.0 + fw + 8.0;
             if cur != yb.id {
-                // The caret moved to a paragraph of another style.
-                let n = ed.borrow().doc.styles.styles.get(cur as usize).map_or(String::new(), |s| s.name.to_string());
-                Button::primary(format!("Edit “{}”", fit_text(&n, 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())))).at(x, y + 8.0).width(170.0).on_click(push(Cmd::StyleOpen)).render(ctx);
+                // The caret moved to text of another style.
+                match cur {
+                    Some(c) => {
+                        let n = ed.borrow().doc.styles.styles.get(c as usize).map_or(String::new(), |s| s.name.to_string());
+                        Button::primary(format!("Edit “{}”", fit_text(&n, 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())))).at(x, y + 8.0).width(170.0).on_click(push(Cmd::StyleTarget(chars))).render(ctx);
+                    }
+                    None => {
+                        Button::primary("No Character Style Here").at(x, y + 8.0).width(190.0).on_click(push(Cmd::StyleTarget(chars))).render(ctx);
+                    }
+                }
             } else {
-                for (label, cmd, wd) in [("Rename", Cmd::StyleRename, 76.0), ("New from Selection", Cmd::StyleNew, 156.0), ("Update to Match", Cmd::StyleUpdate, 140.0)] {
+                let all: &[(&str, Cmd, f32)] = if cur.is_some() { &[("Rename", Cmd::StyleRename, 76.0), ("New from Selection", Cmd::StyleNew, 156.0), ("Update to Match", Cmd::StyleUpdate, 140.0)] } else { &[("New from Selection", Cmd::StyleNew, 156.0)] };
+                for &(label, cmd, wd) in all {
                     Button::secondary(label).at(x, y + 8.0).width(wd).on_click(push(cmd)).render(ctx);
                     x += wd + 6.0;
                 }
             }
+            // Which styles the bar edits.
+            let tx = w - 76.0 - 196.0;
+            for (k, (label, on)) in [("Paragraph", false), ("Characters", true)].into_iter().enumerate() {
+                let b = if chars == on { Button::primary(label) } else { Button::secondary(label) };
+                b.at(tx + k as f32 * 96.0, y + 8.0).width(92.0).on_click(push(Cmd::StyleTarget(on))).render(ctx);
+            }
             Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::StyleClose)).render(ctx);
-            if cur == yb.id {
+            if cur.is_none() && cur == yb.id {
+                // Character styles to put the selection in.
+                let ry = y + FIND_H + 8.0;
+                let mut items: Vec<MenuItem> = ed.borrow().char_styles().iter().map(|(_, n)| MenuItem::new(&**n)).collect();
+                items.push(MenuItem::new("None").radio(true).separated());
+                let cmds = self.cmds.clone();
+                MenuButton::new("Apply Character Style".to_string(), self.style_next_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleChar(i))).at(12.0, ry).width(200.0).render(ctx);
+            }
+            if cur.is_some() && cur == yb.id {
+                let cur = cur.unwrap_or(0);
                 let ry = y + FIND_H + 8.0;
                 let mut x = 12.0;
                 ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 70.0, 20.0), content: format!("{} pt", cf.size as f32 / 2.0), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
@@ -1664,6 +1727,7 @@ impl View for Write {
                 let items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == pf.align)).collect();
                 let now = all.iter().find(|(_, a)| *a == pf.align).map_or("Left", |(l, _)| l);
                 let cmds = self.cmds.clone();
+                if !chars {
                 MenuButton::new(now.to_string(), self.style_align_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleAlign(all[i.min(3)].1))).at(x, ry).width(96.0).render(ctx);
                 x += 108.0;
                 ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 150.0, 20.0), content: format!("Space above {} pt", pf.space_before / 20), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
@@ -1679,6 +1743,8 @@ impl View for Write {
                     Button::secondary(label).at(x, ry).width(32.0).on_click(push(cmd)).render(ctx);
                     x += 36.0;
                 }
+                }
+                let _ = x;
                 // Font, what it is based on, and what follows it.
                 let ry = y + FIND_H * 2.0 + 8.0;
                 let (styles, base, next, family) = {
@@ -1695,6 +1761,14 @@ impl View for Write {
                 MenuButton::new(family.as_deref().unwrap_or("Document's").to_string(), self.style_font_menu.clone(), fonts, move |i| cmds.lock().unwrap().push(Cmd::StyleFont(i))).at(x, ry).width(150.0).render(ctx);
                 x += 166.0;
                 let name_of = |id: Option<StyleId>| id.and_then(|i| styles.iter().find(|s| s.0 == i)).map_or("Nothing".to_string(), |s| s.1.to_string());
+                if chars {
+                    // Character styles to put the selection in.
+                    let list = ed.borrow().char_styles();
+                    let mut items: Vec<MenuItem> = list.iter().map(|(i, n)| MenuItem::new(&**n).radio(*i == cur)).collect();
+                    items.push(MenuItem::new("None").separated());
+                    let cmds = self.cmds.clone();
+                    MenuButton::new("Apply Character Style".to_string(), self.style_next_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleChar(i))).at(x, ry).width(200.0).render(ctx);
+                } else {
                 if cur != 0 {
                     lbl(ctx, x, "Based on");
                     x += 70.0;
@@ -1709,6 +1783,7 @@ impl View for Write {
                 let items: Vec<MenuItem> = styles.iter().map(|(i, n)| MenuItem::new(&**n).radio(Some(*i) == next)).collect();
                 let cmds = self.cmds.clone();
                 MenuButton::new(fit_text(&name_of(next.or(Some(cur))), 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())), self.style_next_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleNext(i))).at(x, ry).width(150.0).render(ctx);
+                }
             }
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + STYLE_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
@@ -2104,7 +2179,7 @@ mod tests {
         run(Cmd::StyleNew);
         let id = ed.borrow().style_at_caret();
         assert_eq!(&*ed.borrow().doc.styles.styles[id as usize].name, "Lead");
-        assert_eq!(w.style_bar.get_cloned().id, id, "the bar follows the new style");
+        assert_eq!(w.style_bar.get_cloned().id, Some(id), "the bar follows the new style");
         assert!(ed.borrow().para_styles().iter().any(|(_, s)| &**s == "Lead"));
         // Renamed; a taken name is refused.
         w.style_name.set(TextEdit::new("Opening"));
@@ -2116,7 +2191,7 @@ mod tests {
         // Its font, what it is based on (Heading 1), and Normal after it.
         let list = ed.borrow().para_styles();
         let at = |n: &str| list.iter().position(|s| &*s.1 == n).unwrap();
-        run(Cmd::StyleFont(2));
+        run(Cmd::StyleFont(3));
         run(Cmd::StyleBase(at("Heading 1")));
         run(Cmd::StyleNext(at("Normal")));
         {
@@ -2143,9 +2218,44 @@ mod tests {
         run(Cmd::StyleOpen);
         run(Cmd::StyleFont(0));
         assert_eq!(ed.borrow().doc.styles.styles[id as usize].chars.family, None);
+        // Character styles: none at the caret, then one made from the
+        // selection; the selection takes it, losing its own bold.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 0), false);
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 4), true);
+        ed.borrow_mut().format("Bold", |a| a.bold = Some(true));
+        run(Cmd::StyleTarget(true));
+        assert_eq!(w.style_bar.get_cloned(), StyleBar { open: true, id: None, chars: true });
+        assert!(texts().iter().any(|s| s == "New from Selection"));
+        w.style_name.set(TextEdit::new("Key Term"));
+        run(Cmd::StyleNew);
+        let ks = ed.borrow().char_style_at_caret().expect("the selection took it");
+        {
+            let e = ed.borrow();
+            let st = &e.doc.styles.styles[ks as usize];
+            assert_eq!((&*st.name, st.kind, st.chars.bold), ("Key Term", officina_text::model::StyleKind::Char, Some(true)));
+            assert_eq!(e.format_at_caret().bold, true, "bold now from the style");
+        }
+        assert_eq!(w.style_bar.get_cloned().id, Some(ks));
+        // Its look changes everywhere it's used; no paragraph settings shown.
+        run(Cmd::StyleToggle(1));
+        assert!(ed.borrow().format_at_caret().italic);
+        let t = texts();
+        assert!(!t.iter().any(|s| s.starts_with("Space above")), "{t:?}");
+        assert!(t.iter().any(|s| s == "Apply Character Style"));
+        // Taken off, then put on again from the menu.
+        let k = ed.borrow().char_styles().len();
+        run(Cmd::StyleChar(k));
+        assert_eq!(ed.borrow().char_style_at_caret(), None);
+        run(Cmd::StyleChar(0));
+        assert_eq!(ed.borrow().char_style_at_caret(), Some(ks));
+        run(Cmd::StyleTarget(false));
+        assert!(!w.style_bar.get_cloned().chars);
         // On a paragraph of another style the bar offers to switch.
+        let bar = w.style_bar.get_cloned().id;
         ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
-        assert!(texts().iter().any(|s| s.starts_with("Edit “Normal")), "{:?}", texts());
+        ed.borrow_mut().style_named("Heading 2");
+        assert_ne!(bar, Some(ed.borrow().style_at_caret()));
+        assert!(texts().iter().any(|s| s.starts_with("Edit “Heading 2")), "{:?}", texts());
         run(Cmd::StyleClose);
         assert!(!w.style_bar.get_cloned().open);
     }

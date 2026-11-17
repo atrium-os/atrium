@@ -50,6 +50,7 @@ g "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
 done
+. "$ROOT/scripts/vm-fonts.sh"; vm_install_fonts
 
 SHOW="/tmp/sh/$(basename "$OPEN")"
 put "$OPEN" "$SHOW"

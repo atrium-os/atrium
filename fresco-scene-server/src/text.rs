@@ -643,6 +643,13 @@ impl TextEngine {
             "DejaVuSerif" | "system-serif" =>
                 &["DejaVuSerif.ttf"],
             other => {
+                /* The system font library (atrium-fonts): a family we
+                 * ship by name, or its stand-in ("Calibri" is Carlito),
+                 * checked against its pinned address. */
+                if let Some(b) = library_font(other) {
+                    log::info!("font '{}' resolved from the system font library", name);
+                    return Some(b);
+                }
                 /* Fall through to literal-name lookup so callers can
                  * pass a basename like "MyFont.ttf" directly. */
                 return self.read_font_file(Path::new(other));
@@ -666,6 +673,21 @@ impl TextEngine {
     }
 }
 
+/// `name`'s regular face from the system font library: a family it ships
+/// (any spacing or case, "NotoSansTamil" or "Noto Sans Tamil"), or a name it
+/// maps to a stand-in.
+fn library_font(name: &str) -> Option<Vec<u8>> {
+    let family = atrium_fonts::Library::resolve(name)?.family;
+    let id = atrium_fonts::Library::face(family, false, false)?;
+    match atrium_fonts::Library::system().bytes(id) {
+        Ok(b) => Some(b.to_vec()),
+        Err(e) => {
+            log::warn!("font '{name}': {e}");
+            None
+        }
+    }
+}
+
 impl Default for TextEngine {
     fn default() -> Self { Self::new() }
 }
@@ -677,6 +699,15 @@ pub type SharedTextEngine = Arc<RwLock<TextEngine>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_families_and_stand_ins_open() {
+        let mut t = TextEngine::new();
+        let carlito = t.read_font("Carlito").expect("Carlito");
+        assert_eq!(t.read_font("Calibri").as_deref(), Some(&carlito[..]));
+        assert!(t.read_font("NotoSansTamil").is_some());
+        assert!(t.read_font("No Such Family").is_none());
+    }
 
     /// The page budget: a new size past it needs room; pages no live run
     /// draws from are evicted and their slots returned.

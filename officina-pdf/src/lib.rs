@@ -35,7 +35,8 @@ pub trait FontFiles {
 
 impl FontFiles for PinnedFonts {
     fn face(&self, face: u16) -> Option<&[u8]> {
-        Some(self.face_bytes(face))
+        // Empty when a library face's file is missing or changed.
+        Some(self.face_bytes(face)).filter(|b| !b.is_empty())
     }
 }
 
@@ -427,5 +428,24 @@ mod tests {
         assert!(uri_ok("https://example.org/a?b=c"));
         assert!(!uri_ok("javascript:alert(1)"));
         assert!(!uri_ok("file:///etc/passwd"));
+    }
+
+    /// Library faces (a stand-in and a script's Noto face) embed like the
+    /// pinned ones.
+    #[test]
+    fn library_faces_embed() {
+        use officina_text::model::CharAttrs;
+        let fonts = PinnedFonts::new().unwrap();
+        let mut d = TextDoc::new();
+        let a = d.attrs.intern(CharAttrs { family: Some("Calibri".into()), ..Default::default() });
+        d.blocks.update(0, |b| {
+            let p = b.as_para_mut().unwrap();
+            p.text = "Calibri text, नमस्ते, வணக்கம்".to_string();
+            p.runs = vec![(0, a)];
+        });
+        let (pdf, stats) = export(&d, &fonts, &fonts, &Info::default(), Vec::new(), &mut |_, _| {}).unwrap();
+        assert_eq!(stats.pages, 1);
+        assert_eq!(stats.fonts, 3, "Carlito, Noto Sans Devanagari, Noto Sans Tamil");
+        assert!(pdf.len() > 1000);
     }
 }

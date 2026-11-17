@@ -1,8 +1,9 @@
 //! A paragraph laid out at a width: shaped glyphs, lines, line metrics.
 //!
 //! Shaping is per run of one format (so kerning and ligatures work inside a run),
-//! through [`Fonts`]; [`PinnedFonts`] shapes with rustybuzz over the Navigator's
-//! pinned font set, falling back face by face for characters a face lacks. Lines
+//! through [`Fonts`]; [`PinnedFonts`] shapes with rustybuzz over the pinned set and
+//! the system font library, falling back face by face for characters a face
+//! lacks. Lines
 //! break at UAX #14 opportunities, greedily (total-fit justification comes later);
 //! spaces at a line's end hang. A word wider than the line breaks between
 //! characters.
@@ -134,33 +135,124 @@ pub fn size_lu(f: &CharFormat) -> i64 {
     f.size as i64 * LU / 2
 }
 
-/// Shaping with rustybuzz over the pinned font set (navigator-render's).
+/// Shaping with rustybuzz over the system's fonts: the pinned set
+/// (navigator-render's IBM Plex and DejaVu, faces `0..base`) and the system
+/// font library (`atrium-fonts`, face `base + id`), mapped as they're first
+/// used.
+///
+/// A run's font name picks its family: one we ship, a metric-compatible
+/// stand-in (Calibri is drawn with Carlito, Times New Roman with Liberation
+/// Serif), or the nearest class; IBM Plex otherwise. A character the family
+/// lacks goes to its script's Noto face, then the pinned fallbacks, then the
+/// broad Noto faces.
 pub struct PinnedFonts {
     set: &'static navigator_render::fontset::FontSet,
-    hb: Vec<rustybuzz::Face<'static>>,
-    tt: Vec<ttf_parser::Face<'static>>,
+    lib: &'static atrium_fonts::Library,
+    faces: Vec<std::sync::OnceLock<Option<Loaded>>>,
+}
+
+struct Loaded {
+    hb: rustybuzz::Face<'static>,
+    tt: ttf_parser::Face<'static>,
+    upem: i64,
+    ascent: i64,
+    descent: i64,
+}
+
+impl Loaded {
+    fn new(bytes: &'static [u8]) -> Option<Loaded> {
+        let tt = ttf_parser::Face::parse(bytes, 0).ok()?;
+        let hb = rustybuzz::Face::from_slice(bytes, 0)?;
+        let (upem, ascent, descent) = (tt.units_per_em() as i64, tt.ascender() as i64, tt.descender() as i64);
+        Some(Loaded { hb, tt, upem, ascent, descent })
+    }
 }
 
 impl PinnedFonts {
     pub fn new() -> Result<PinnedFonts, String> {
         let set = navigator_render::fontset::FontSet::shared()?;
-        let hb = set.faces.iter().map(|f| rustybuzz::Face::from_slice(&f.bytes, 0).ok_or("a pinned face doesn't parse")).collect::<Result<_, _>>()?;
-        let tt = set.faces.iter().map(|f| ttf_parser::Face::parse(&f.bytes, 0).map_err(|_| "a pinned face doesn't parse")).collect::<Result<_, _>>()?;
-        Ok(PinnedFonts { set, hb, tt })
+        let fonts = PinnedFonts { set, lib: atrium_fonts::Library::system(), faces: (0..set.faces.len() + atrium_fonts::FACES.len()).map(|_| Default::default()).collect() };
+        for i in 0..set.faces.len() {
+            fonts.get(i).ok_or("a pinned face doesn't parse")?;
+        }
+        Ok(fonts)
     }
 
+    /// The first library face: faces below it are the pinned set's.
+    pub fn base(&self) -> usize {
+        self.set.faces.len()
+    }
+
+    fn get(&self, k: usize) -> Option<&Loaded> {
+        self.faces.get(k)?
+            .get_or_init(|| {
+                let bytes: &'static [u8] = match k.checked_sub(self.base()) {
+                    None => &self.set.faces[k].bytes,
+                    Some(id) => self.lib.bytes(id).ok()?,
+                };
+                Loaded::new(bytes)
+            })
+            .as_ref()
+    }
+
+    fn lib_face(&self, family: &str, bold: bool, italic: bool) -> Option<usize> {
+        let id = atrium_fonts::Library::face(family, bold, italic)?;
+        let k = self.base() + id;
+        self.get(k).map(|_| k)
+    }
+
+    /// The faces for a format, in order: the family's face (or the pinned
+    /// stack's), then the pinned fallbacks.
     fn stack(&self, f: &CharFormat) -> Vec<usize> {
         use navigator_render::fontset::Family;
-        let fam = f.family.to_ascii_lowercase();
-        let mono = ["mono", "courier", "consolas", "menlo", "code"].iter().any(|m| fam.contains(m));
-        self.set.stack_of(if mono { Family::Mono } else { Family::Sans }, f.bold, f.italic)
+        let class = atrium_fonts::Library::class(&f.family);
+        let pinned = self.set.stack_of(if class == Some(atrium_fonts::Class::Mono) { Family::Mono } else { Family::Sans }, f.bold, f.italic);
+        match atrium_fonts::Library::resolve(&f.family).and_then(|r| self.lib_face(r.family, f.bold, f.italic)) {
+            Some(k) => std::iter::once(k).chain(pinned.into_iter().filter(|&i| self.set.faces[i].name.starts_with("DejaVu"))).collect(),
+            None => pinned,
+        }
+    }
+
+    fn has(&self, k: usize, ch: char) -> bool {
+        self.get(k).is_some_and(|l| l.tt.glyph_index(ch).is_some())
+    }
+
+    /// The face that draws `ch` in `stack`.
+    fn face_for(&self, stack: &[usize], ch: char, f: &CharFormat) -> usize {
+        if ch.is_whitespace() || ch.is_control() || self.has(stack[0], ch) {
+            return stack[0];
+        }
+        let lib = |fam: &str| self.lib_face(fam, f.bold, f.italic).filter(|&k| self.has(k, ch));
+        if let Some(k) = atrium_fonts::Library::script_family(ch).and_then(lib) {
+            return k;
+        }
+        if let Some(&k) = stack[1..].iter().find(|&&k| self.has(k, ch)) {
+            return k;
+        }
+        atrium_fonts::Library::fallback(ch).find_map(lib).unwrap_or(stack[0])
     }
 
     pub fn face_bytes(&self, face: u16) -> &[u8] {
-        &self.set.faces[face as usize].bytes
+        let k = face as usize;
+        match k.checked_sub(self.base()) {
+            None => &self.set.faces[k].bytes,
+            Some(id) => self.lib.bytes(id).unwrap_or(&[]),
+        }
     }
     pub fn face_address(&self, face: u16) -> &str {
-        &self.set.faces[face as usize].address
+        let k = face as usize;
+        match k.checked_sub(self.base()) {
+            None => &self.set.faces[k].address,
+            Some(id) => atrium_fonts::FACES.get(id).map_or("", |f| f.address),
+        }
+    }
+    /// The family a face belongs to.
+    pub fn face_family(&self, face: u16) -> &str {
+        let k = face as usize;
+        match k.checked_sub(self.base()) {
+            None => self.set.faces[k].name,
+            Some(id) => atrium_fonts::FACES.get(id).map_or("", |f| f.family),
+        }
     }
 }
 
@@ -171,7 +263,7 @@ impl Fonts for PinnedFonts {
         // Split by the first face that has each character.
         let mut segs: Vec<(usize, usize, usize)> = Vec::new(); // face, start, end
         for (i, ch) in text.char_indices() {
-            let face = if ch.is_whitespace() || ch.is_control() { stack[0] } else { stack.iter().copied().find(|&k| self.tt[k].glyph_index(ch).is_some()).unwrap_or(stack[0]) };
+            let face = self.face_for(&stack, ch, f);
             match segs.last_mut() {
                 Some((fc, _, e)) if *fc == face => *e = i + ch.len_utf8(),
                 _ => segs.push((face, i, i + ch.len_utf8())),
@@ -179,11 +271,12 @@ impl Fonts for PinnedFonts {
         }
         let mut out = Vec::new();
         for (face, s, e) in segs {
+            let Some(l) = self.get(face) else { continue };
             let mut buf = rustybuzz::UnicodeBuffer::new();
             buf.push_str(&text[s..e]);
             buf.guess_segment_properties();
-            let shaped = rustybuzz::shape(&self.hb[face], &[], buf);
-            let upem = self.set.faces[face].upem.max(1);
+            let shaped = rustybuzz::shape(&l.hb, &[], buf);
+            let upem = l.upem.max(1);
             let sc = |v: i32| (v as i64 * size + upem / 2).div_euclid(upem);
             for (gi, gp) in shaped.glyph_infos().iter().zip(shaped.glyph_positions()) {
                 out.push(Glyph { face: face as u16, id: gi.glyph_id as u16, adv: sc(gp.x_advance), dx: sc(gp.x_offset), dy: -sc(gp.y_offset), cluster: (s as u32) + gi.cluster, fmt: 0 });
@@ -193,12 +286,12 @@ impl Fonts for PinnedFonts {
     }
 
     fn metrics(&self, f: &CharFormat) -> (i64, i64, i64) {
-        let face = &self.set.faces[self.stack(f)[0]];
+        let Some(face) = self.get(self.stack(f)[0]) else { return (0, 0, 0) };
         let size = size_lu(f);
         let upem = face.upem.max(1);
         let asc = face.ascent * size / upem;
         let desc = -face.descent * size / upem;
-        let gap = self.tt[self.stack(f)[0]].line_gap() as i64 * size / upem;
+        let gap = face.tt.line_gap() as i64 * size / upem;
         (asc, desc, asc + desc + gap)
     }
 }
@@ -759,6 +852,36 @@ mod tests {
         let faces: std::collections::BTreeSet<u16> = l.glyphs.iter().map(|g| g.face).collect();
         assert!(faces.len() >= 2, "★ comes from the fallback face");
         assert!(l.lines[0].width > 0);
+    }
+
+    #[test]
+    fn office_fonts_get_their_stand_ins_and_scripts_their_noto_faces() {
+        let f = PinnedFonts::new().unwrap();
+        let family = |name: &str, text: &str| {
+            let mut d = doc(text);
+            let a = d.attrs.intern(CharAttrs { family: Some(name.into()), ..Default::default() });
+            d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, a)]);
+            let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+            l.glyphs.iter().map(|g| f.face_family(g.face).to_string()).collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(family("Calibri", "Office"), ["Carlito".to_string()].into());
+        assert_eq!(family("Times New Roman", "Office"), ["Liberation Serif".to_string()].into());
+        assert_eq!(family("Courier New", "x"), ["Liberation Mono".to_string()].into());
+        assert_eq!(family("Cambria", "x"), ["Caladea".to_string()].into());
+        assert_eq!(family("", "Office"), ["IBM Plex Sans".to_string()].into());
+        assert_eq!(family("Arial", "नमस्ते"), ["Noto Sans Devanagari".to_string()].into());
+        assert_eq!(family("", "வணக்கம் abc"), ["IBM Plex Sans".to_string(), "Noto Sans Tamil".to_string()].into());
+        assert_eq!(family("", "שלום"), ["Noto Sans Hebrew".to_string()].into());
+        // Devanagari shapes: the conjunct क्ष is fewer glyphs than characters.
+        let mut d = doc("क्ष");
+        let a = d.attrs.intern(CharAttrs { family: Some("Noto Sans Devanagari".into()), ..Default::default() });
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().runs = vec![(0, a)]);
+        let l = layout_para(&d, d.para(0).unwrap(), 1_000_000, &f);
+        assert!(l.glyphs.len() < 3, "{:?}", l.glyphs);
+        // The PDF writer gets the library face's bytes and address.
+        let g = l.glyphs[0];
+        assert!(f.face_bytes(g.face).len() > 1000);
+        assert!(f.face_address(g.face).starts_with("blake3:"));
     }
 
     #[test]

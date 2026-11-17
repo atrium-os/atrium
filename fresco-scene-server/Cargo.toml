@@ -23,6 +23,7 @@ aqueduct        = { path = "../aqueduct" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-vulkan   = { path = "../fresco-vulkan" }
 fresco-text     = { path = "../fresco-text" }
+atrium-fonts    = { path = "../atrium-fonts" }
 ash             = "0.38"
 
 [dev-dependencies]
