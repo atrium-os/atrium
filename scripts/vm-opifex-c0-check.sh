@@ -63,8 +63,12 @@ check "with its content.index" "yes" "$(V "test -f $APPS/$ID/content.index && ec
 check "and its file" "yes" "$(V "cmp -s /bin/echo $APPS/$ID/bin/hello && echo yes")"
 
 echo "=== refused, installed tree unchanged"
-mk $B/t $ID 2; V "opifex pack $B/t --sign $B/key8.pem >/dev/null; echo tampered >> $B/t/bin/hello"
+# Same size, different bytes: only the hash check can catch it. (An append is
+# caught earlier by the size check, so it would not exercise the hash.)
+mk $B/t $ID 2; V "opifex pack $B/t --sign $B/key8.pem >/dev/null; printf XXXXXXXX | dd of=$B/t/bin/hello bs=1 seek=4096 conv=notrunc 2>/dev/null"
 check "a file changed after signing" "1" "$(inst $B/t | grep -c 'not the file')"
+mk $B/g $ID 2; V "opifex pack $B/g --sign $B/key8.pem >/dev/null; echo tampered >> $B/g/bin/hello"
+check "a file grown after signing" "1" "$(inst $B/g | grep -c 'bigger than the index')"
 mk $B/s $ID 2; V "opifex pack $B/s --sign $B/key8.pem >/dev/null; chmod 4755 $B/s/bin/hello"
 check "a setuid file" "1" "$(inst $B/s | grep -c setuid)"
 mk $B/m $ID 2; V "opifex pack $B/m --sign $B/key8.pem >/dev/null; sed -i '' 's/name = \"C0\"/name = \"Evil\"/' $B/m/atrium.toml"
