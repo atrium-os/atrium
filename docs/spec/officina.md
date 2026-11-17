@@ -3483,6 +3483,10 @@ Data ▸ Conditional Formatting… opens a panel at the window's right on the ru
 
 Each change is one undo step: `GridOp::CondFormats` swaps in the whole list, held as the native file's bytes so the journal can replay it (a list naming a sheet no longer there changes nothing). Tests: every kind and choice saves, loads back into the form and saves to the same rule; a panel test makes, changes, picks by click, reorders and deletes rules and undoes each.
 
+### 16.61 The pivot field list in Sheets (2026-11-17)
+
+Data ▸ Pivot Table Fields… (with the cursor in a pivot table or its source) opens a pane at the window's right: the source's fields, each marked with where it is, then buttons that put the picked field in Rows, Columns, Filters or Values, take it out, or move it earlier or later in its area; a line per area; each value field's summary function (all eleven); and switches for the grand total row, the grand total column and subtotals. A field going to Values is summed when most of its cells are numbers, else counted; a field leaving an axis and coming back keeps its hidden items. Each change refreshes the pivot and is one undo step (`Workbook::pivot_op`); a change that would leave the pivot with no row, column or value field, or that the refresh refuses (cells in the way, overlap), is said in the pane and nothing changes. Compact layout is still to come.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
