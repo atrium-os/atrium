@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Mail's engine (docs/spec/mail.md §4, §6): the store and index for one instance, fed by mail-sync; every message is parsed in a parse jail (mail-parse-jail) and only the checked summary is kept. No network, parses nothing itself."
+description = "Mail's engine (docs/spec/mail.md §4, §6): the store and index for one instance, fed by mail-sync; every message is parsed in a parse jail (mail-parse-jail) and only the checked summary is kept. No network of its own (remote pictures go through the caller's Nuntius channel), parses nothing itself."
 
 [dependencies]
 mail-schema = { path = "../mail-schema" }
 mail-store = { path = "../mail-store" }
 mail-sync = { path = "../mail-sync" }
 postcard = { version = "1", features = ["use-std"] }
+# Remote pictures (§7.4) go through the caller's Nuntius channel.
+nuntius = { path = "../../nuntius", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

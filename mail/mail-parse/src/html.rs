@@ -118,6 +118,10 @@ pub fn convert(html: &str, loaded: &BTreeMap<String, (u32, u32)>, fonts: &FontSe
         };
         inputs.images.insert(id.clone(), n);
     }
+    // A loaded picture with no declared size (a background): its real one.
+    for (id, &(w, h)) in loaded {
+        inputs.images.entry(id.clone()).or_insert_with(|| ImageSize::from((w, h)));
+    }
     let (doc, report) = navigator_normalize::normalize_and_measure(&dom.serialize(), &inputs, fonts, env);
     for (k, v) in report.dropped { *out.dropped.entry(k).or_default() += v }
 
@@ -142,6 +146,16 @@ pub fn convert(html: &str, loaded: &BTreeMap<String, (u32, u32)>, fonts: &FontSe
     // A remote reference used again visibly elsewhere stays loadable only if
     // some visible use remains; ids are per reference, so nothing to merge.
     out.document = doc_dom.serialize();
+    // A picture the normalizer left out altogether (inside `display: none`,
+    // in a dropped element) is not shown, so it is never fetched either. Not
+    // a background: that is left out until its size is known, which only
+    // loading it tells (the document is then converted again).
+    for r in res.list.iter_mut() {
+        if matches!(r.source, Source::Remote(_)) && r.used_as == Use::Image && !r.hidden && !mentions(&out.document, &r.id) {
+            r.hidden = true;
+            *out.dropped.entry("hidden or tiny remote picture (tracking pixel; never fetched)".into()).or_default() += 1;
+        }
+    }
     out.resources = res.list;
     out
 }
@@ -377,10 +391,24 @@ fn percent_decode(s: &str) -> String {
 /// normalizer emits flat class rules; anything inside an at-rule (dark mode)
 /// is skipped, since hiding a pixel only in dark mode is still hiding it in
 /// light mode's absence and the light rules decide.
+fn strip_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(at) = rest.find("/*") {
+        out.push_str(&rest[..at]);
+        out.push(' ');
+        rest = match rest[at + 2..].find("*/") { Some(e) => &rest[at + 2 + e + 2..], None => "" };
+    }
+    out.push_str(rest);
+    out
+}
+
 fn class_rules(dom: &Dom) -> BTreeMap<String, Vec<(String, String)>> {
     let mut map = BTreeMap::new();
     for h in dom.by_tag_anywhere("style") {
-        let css = dom.text_content(h);
+        // Comments out first: the normalizer opens its block with one, which
+        // would otherwise hide the first rule's selector.
+        let css = strip_comments(&dom.text_content(h));
         let mut depth = 0usize;
         let mut sel_start = 0usize;
         let bytes = css.as_bytes();
@@ -413,6 +441,11 @@ fn class_rules(dom: &Dom) -> BTreeMap<String, Vec<(String, String)>> {
         }
     }
     map
+}
+
+/// `id` appears in `doc` as a whole id (`mail-res:1` is not in `mail-res:12`).
+fn mentions(doc: &str, id: &str) -> bool {
+    doc.match_indices(id).any(|(at, _)| !doc[at + id.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 fn decls_of<'a>(dom: &Dom, h: Handle, classes: &'a BTreeMap<String, Vec<(String, String)>>) -> Vec<&'a (String, String)> {

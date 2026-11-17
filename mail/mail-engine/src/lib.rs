@@ -18,6 +18,8 @@ use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+pub mod pictures;
+
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, Role, Store};
 use mail_sync::{FolderState, Sink};
@@ -136,7 +138,7 @@ impl Parser {
     }
 
     /// One message for reading, alone in its jail.
-    pub fn open(&self, raw: &[u8], loaded: Vec<(String, u32, u32)>) -> Result<Option<Opened>, Error> {
+    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>) -> Result<Option<Opened>, Error> {
         let mut j = self.start()?;
         wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
             .map_err(|e| Error::Jail(e.to_string()))?;
@@ -189,7 +191,14 @@ impl Engine {
             return Ok(Reading { summary: m.summary, text, has_html: true, document: Some(d) });
         }
         let raw = self.store.blob(&full)?;
-        match self.parser.open(&raw, Vec::new())? {
+        // Remote pictures already loaded: their first bytes, for their sizes.
+        let loaded = m
+            .pictures
+            .iter()
+            .take(wire::LOADED_MAX)
+            .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
+            .collect();
+        match self.parser.open(&raw, loaded)? {
             Some(o) => {
                 if let Some(d) = &o.document {
                     let h = self.store.put_blob(&postcard::to_stdvec(d).map_err(|e| Error::Jail(e.to_string()))?)?;

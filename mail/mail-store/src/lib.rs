@@ -27,7 +27,7 @@ pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW}
 
 /// The index's layout; an index of another layout is rebuilt from the blobs
 /// by sync (the store refuses to open it).
-const SCHEMA: u64 = 3;
+const SCHEMA: u64 = 4;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -47,6 +47,9 @@ const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new(
 const LIST: TableDefinition<(u32, u64, u64), u32> = TableDefinition::new("list");
 /// (account, server's stable id) → msg: each message once (§6.4).
 const SERVER_IDS: TableDefinition<(u32, &str), u64> = TableDefinition::new("server_ids");
+/// (account, lowercase sender address) → 1: load this sender's remote
+/// pictures without asking (§7.4; only offered for verified senders).
+const SENDER_PICTURES: TableDefinition<(u32, &str), u8> = TableDefinition::new("sender_pictures");
 
 /// Flags as bits; keywords are not kept yet.
 pub mod flag {
@@ -169,6 +172,9 @@ pub struct Message {
     /// `mail_schema::Document` blob), kept so opening it again does no work
     /// and fires nothing (§7.3).
     pub document: Option<Hash>,
+    /// Remote pictures fetched on the person's request (§7.4), by the
+    /// document's resource id, kept so a second view fetches nothing.
+    pub pictures: Vec<(String, Hash)>,
 }
 
 /// One row of a folder's list.
@@ -210,6 +216,7 @@ impl Store {
             tx.open_table(LOCATIONS)?;
             tx.open_table(LIST)?;
             tx.open_table(SERVER_IDS)?;
+            tx.open_table(SENDER_PICTURES)?;
             tx.open_table(thread::THREADS)?;
             tx.open_table(thread::MSGID_THREADS)?;
             tx.open_table(thread::SUBJECT_THREADS)?;
@@ -404,6 +411,14 @@ impl Store {
         Ok(t.get((account, server_id))?.map(|v| v.value()))
     }
 
+    /// Whether the person chose to load `addr`'s pictures without asking.
+    pub fn always_pictures(&self, account: AccountId, addr: &str) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        let a = addr.to_ascii_lowercase();
+        let v = tx.open_table(SENDER_PICTURES)?.get((account, a.as_str()))?.is_some();
+        Ok(v)
+    }
+
     pub fn message_count(&self) -> Result<u64> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(MESSAGES)?.len()?)
@@ -477,6 +492,7 @@ impl Writer<'_> {
                     locations: vec![(folder, uid)],
                     thread: 0,
                     document: None,
+                    pictures: Vec::new(),
                 };
                 self.put_msg(id, &msg)?;
                 if let Some(s) = &m.server_id {
@@ -501,6 +517,33 @@ impl Writer<'_> {
         let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
         m.document = document;
         self.put_msg(id, &m)
+    }
+
+    /// Keep remote pictures with a message (a resource id already kept is
+    /// not added again).
+    pub fn add_pictures(&mut self, id: MsgId, pictures: Vec<(String, Hash)>) -> Result<()> {
+        if pictures.is_empty() {
+            return Ok(());
+        }
+        let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        for (k, h) in pictures {
+            if !m.pictures.iter().any(|(x, _)| *x == k) {
+                m.pictures.push((k, h));
+            }
+        }
+        self.put_msg(id, &m)
+    }
+
+    /// Load (or stop loading) remote pictures from `addr` without asking.
+    pub fn set_always_pictures(&mut self, account: AccountId, addr: &str, on: bool) -> Result<()> {
+        let a = addr.to_ascii_lowercase();
+        let mut t = self.tx.open_table(SENDER_PICTURES)?;
+        if on {
+            t.insert((account, a.as_str()), 1)?;
+        } else {
+            t.remove((account, a.as_str()))?;
+        }
+        Ok(())
     }
 
     pub fn set_flags(&mut self, folder: FolderId, uid: u32, flags: u32) -> Result<bool> {

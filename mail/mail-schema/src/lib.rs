@@ -33,6 +33,9 @@ use std::io::{self, Read, Write};
 pub const MAX_FRAME: usize = (64 << 20) + (1 << 20);
 /// A batch (§4): one account's messages, at most this many and this many bytes.
 pub const MAX_BATCH: usize = 64;
+/// Loaded remote pictures sent with an `Open`, and the bytes of each.
+pub const LOADED_MAX: usize = 64;
+pub const LOADED_HEAD: usize = 64 << 10;
 pub const MAX_BATCH_BYTES: usize = 32 << 20;
 /// TXT lookups one message may ask for: a few DKIM keys and the DMARC record
 /// (and its organizational domain's). More is a message trying to make the
@@ -61,9 +64,12 @@ pub enum ToJail {
         me: Vec<String>,
         now: i64,
         message: Raw,
-        /// Pictures already loaded: resource id → natural size, so the
-        /// document keeps their real space.
-        loaded: Vec<(String, u32, u32)>,
+        /// Remote pictures already loaded (§7.4): resource id and their
+        /// first bytes (at most [`LOADED_HEAD`] each, [`LOADED_MAX`] of
+        /// them). The jail reads their natural size from these, so the
+        /// document keeps their real space and draws a background, which
+        /// the normalizer can only draw at a known size.
+        loaded: Vec<(String, Vec<u8>)>,
     },
     /// The answer to a [`FromJail::Query`]: the TXT record's text (strings
     /// joined), or `None` for no record or a failed lookup.

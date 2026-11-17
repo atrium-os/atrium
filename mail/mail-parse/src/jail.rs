@@ -49,7 +49,14 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
             }
             wire::ToJail::Open { authserv_id, me, now, message, loaded } => {
                 let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false };
-                let loaded: BTreeMap<String, (u32, u32)> = loaded.into_iter().map(|(id, w, h)| (id, (w, h))).collect();
+                if loaded.len() > wire::LOADED_MAX || loaded.iter().any(|(id, b)| b.len() > wire::LOADED_HEAD || id.len() > 64) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "loaded pictures over their limits"));
+                }
+                // Their sizes from their headers; one that doesn't say keeps the declared space.
+                let loaded: BTreeMap<String, (u32, u32)> = loaded
+                    .into_iter()
+                    .filter_map(|(id, b)| navigator_image::image::natural_size(&b).ok().map(|(_, w, h)| (id, (w, h))))
+                    .collect();
                 let result = open(&message.bytes, &ctx, &port, &loaded, fonts);
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
