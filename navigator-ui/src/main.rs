@@ -81,6 +81,9 @@ fn worker_channel() -> Option<std::os::unix::net::UnixStream> {
 
 fn main() -> std::io::Result<()> {
     let channel = worker_channel();
+    if let Some(p) = navigator_ui::shell::window_persona() {
+        eprintln!("navigator-ui: window persona {p}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut scene = None;
     let mut theme = None;

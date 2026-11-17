@@ -363,7 +363,12 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
         }));
         let unrec = s.store.persona == trail::Persona::Unrecorded;
         icon(ctx, em(20.0), em(12.0), if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, 16.0, t.text_secondary());
-        text(ctx, em(42.0), em(20.0), s.store.persona.name(), type_size::SM, Weight::Medium, t.text_primary());
+        // A Work window's recorded trails are Work's (personas.md §3).
+        let name = match (&s.window_persona, s.store.persona) {
+            (Some(p), trail::Persona::Personal) => p.as_str(),
+            _ => s.store.persona.name(),
+        };
+        text(ctx, em(42.0), em(20.0), name, type_size::SM, Weight::Medium, t.text_primary());
         icon(ctx, em(116.0), em(13.0), ph::CARET_DOWN, 12.0, t.text_secondary());
         ctx.pop();
     }

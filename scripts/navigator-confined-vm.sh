@@ -217,7 +217,7 @@ g "set -e
     cd /root && sh $D/fresco-renderer-bundle.sh $D/fresco-renderer /usr/local/share/fonts /root/e2e-key.pem /usr/local/bin/opifex
     pw usershow _limen >/dev/null 2>&1 || pw useradd _limen -u 65022 -d /nonexistent -s /usr/sbin/nologin
     pw usershow navtest >/dev/null 2>&1 || pw useradd navtest -m
-    printf '%s\n' NAVIGATORD_SOCKET=/atrium/sockets/navigator/navigator.sock \
+    printf '%s\n' NAVIGATORD_SOCKET=/atrium/sockets/navigator/{instance}.sock \
         FRESCOD_CHROME_SOCK=/atrium/sockets/fresco-chrome/fresco-chrome.sock \
         NAVIGATORD_ACTIVATION=/atrium/sockets/fresco-activation/fresco-activation.sock \
         NAVIGATORD_LIMEN=/atrium/sockets/limen/limend.sock PORTCULLIS_SOCKET=$PSOCK \
@@ -242,6 +242,9 @@ g "set -e
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/mail2-bundle/atrium.toml.sig /root/mail2-bundle/atrium.toml
     opifex install /root/mail2-bundle
     rm -f /var/db/atrium/navtest/links.toml
+    # navtest has a Work persona (personas.md §2) for the Work Navigator.
+    mkdir -p /var/db/atrium/navtest; P=/var/db/atrium/navtest/policy.toml
+    grep -q '^.personas.work.' \$P 2>/dev/null || printf '\n[personas.work]\ncolour = \"blue\"\n' >> \$P
     # Only these two take mailto: here (vm-apps-access-check.sh's own may linger).
     for a in org.test.new org.test.sys; do opifex uninstall \$a >/dev/null 2>&1 || true; done
     chmod +x $D/monstratord $D/monctl $D/link-probe
@@ -268,7 +271,9 @@ FS=/atrium/sockets/fresco/fresco.sock
 AS=/atrium/sockets/fresco-activation/fresco-activation.sock
 CS=/atrium/sockets/fresco-chrome/fresco-chrome.sock
 LS=/atrium/sockets/limen/limend.sock
-NS=/atrium/sockets/navigator/navigator.sock
+# navigatord's control socket, named by its uid (shared with any other
+# Navigator instance's).
+NS="/atrium/sockets/navigator/[0-9]*.sock"
 g "mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome /atrium/sockets/limen /atrium/sockets/navigator \
       /atrium/sockets/navigator-page /atrium/sockets/arca /atrium/sockets/arca-courier
    chown _frescod /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome; chown _limen /atrium/sockets/limen
@@ -483,6 +488,33 @@ sleep 3
 shot confined-5-incoming
 g "pkill -x link-probe; true"
 
+echo "=== a Work Navigator beside the Personal one (personas.md §3)"
+# navtest's Work persona: a second Navigator, its own instance (uid, jail,
+# overlay), with its own page socket in the shared directory. Its page
+# children redeem its tickets there, not the Personal one's.
+WL=$S/navigatord-work.log
+g "cd $S && daemon -f -o $WL -u navtest /usr/local/bin/portcullis launch --no-prompt --persona work org.atrium.navigator </dev/null"
+i=0; while [ $i -lt 90 ] && ! g "grep -q 'url=https://atlas.example/wiki/Atrium live=shown' $WL"; do sleep 3; i=$((i+3)); done
+WNAV=$(g "for p in \$(pgrep -x navigatord); do ps -o jid= -o uid= -p \$p; done | awk '\$2 != $NUID {print \$1, \$2; exit}'" | tr -d '\r')
+WJID=${WNAV%% *}; WUID=${WNAV#* }
+[ -n "$WUID" ] && [ "$WUID" != "$NUID" ] && [ "$WJID" != "$NJID" ] && [ "$WJID" != 0 ] && ok "a second navigatord, in a jail of its own (jid $WJID) as another uid ($WUID)" || bad "Work navigatord: '$WNAV' $(g "tail -3 $WL" | tr '\n' ';')"
+g "grep -q \"^$WUID navtest org.atrium.navigator .*persona=work\" /var/run/atrium/app-registry" && ok "the launch registry names it Work's" || bad "registry: $(g "grep -a navigator /var/run/atrium/app-registry" | tr '\n' ';')"
+g "grep -q 'navigatord: persona work (blue)' $WL" && ok "portcullisd told it its persona, by its uid" || bad "persona: $(g "grep -h persona $WL | tail -2" | tr '\n' ';')"
+g "grep -q 'navigatord: persona Personal' $S/navigatord.log" && ok "…and the first one that it is Personal" || bad "Personal: $(g "grep -h persona $S/navigatord.log | tail -2" | tr '\n' ';')"
+g "grep -q 'window persona Work' $WL" && ok "its rail names the window's persona Work" || bad "UI persona: $(g "grep -h 'persona' $WL | tail -2" | tr '\n' ';')"
+g "test -S /atrium/sockets/navigator-page/$NUID.sock && test -S /atrium/sockets/navigator-page/$WUID.sock" && ok "two page sockets, one per instance ($NUID, $WUID)" || bad "page sockets: $(g "ls /atrium/sockets/navigator-page/")"
+g "test -S /atrium/sockets/navigator/$NUID.sock && test -S /atrium/sockets/navigator/$WUID.sock" && ok "two control sockets" || bad "control sockets: $(g "ls -l /atrium/sockets/navigator/")"
+CM=$(g "stat -f '%Lp %u' /atrium/sockets/navigator/$WUID.sock" | tr -d '\r')
+[ "$CM" = "600 $WUID" ] && ok "Work's control socket is Work's uid's alone" || bad "control socket mode: '$CM'"
+sleep "$GAP"
+NL=$(g "grep -c 'laid out \"Atrium (architecture)\"' $WL" | tr -d '\r ')
+[ "${NL:-0}" -ge 1 ] && ok "Work's page child redeemed its ticket at Work's socket and laid the page out" || bad "Work's page: $NL layouts; $(g "grep -h -e redeem -e 'unknown ticket' $S/limend.log $WL $S/navigatord.log | tail -3" | tr '\n' ';')"
+g "grep -q 'unknown ticket' $S/navigatord.log $WL" && bad "a ticket went to the other instance" || ok "no ticket went to the other instance"
+WC=$(g "grep -A5 'conn from uid=$WUID ' /var/log/atrium/portcullisd-navigator.log | grep -c -e '$FETCH_ID authorized' -e '$CONV_ID authorized'" | tr -d '\r ')
+[ "${WC:-0}" -ge 2 ] && ok "Work's fetcher and converter jails ran as Work's uid" || bad "Work's workers: $(g "grep -h -e '$FETCH_ID' -e '$CONV_ID' /var/log/atrium/portcullisd-navigator.log | tail -3" | tr '\n' ';')"
+g "test -s \$(jls -j $WJID path)/var/db/navigatord/trails.json" && ok "Work keeps its own trails, in its own jail" || bad "no trails.json in Work's jail"
+shot confined-6-work
+
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"
 g "jls name | grep -qx atrium-monstratord" && bad "monstratord's jail outlived the bootstrap" || ok "monstratord's jail ended with the bootstrap"
@@ -493,7 +525,7 @@ N=$(jails)
 [ "${N:-0}" = 0 ] && ok "the page jails ended with the Navigator" || bad "$N page jails left"
 LEFT=$(g "jls name | grep -cE 'navigator[-_](converter|fetcher)' || true" | tr -d '\r')
 [ "${LEFT:-0}" = 0 ] && ok "no converter or fetcher jail left" || bad "$LEFT converter/fetcher jails left"
-for f in ui limend navigatord frescod bootstrap; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
+for f in ui limend navigatord navigatord-work frescod bootstrap; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
 get /var/log/atrium/portcullisd-navigator.log "$OUT/portcullisd.log" 2>/dev/null
 g "pkill -x limend; pkill -x navigatord; pkill -x forum-wm; pkill -x frescod; true"
 sleep 5

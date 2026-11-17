@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod app;
+mod catalog;
 mod content;
 mod layer;
 
@@ -58,6 +59,7 @@ fn main() -> ExitCode {
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
+        "catalog"   => catalog::cmd(&args[2..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
         other => { eprintln!("opifex: unknown command: {other}"); usage(); return ExitCode::from(2); }
     };
@@ -82,7 +84,14 @@ fn usage() {
            layer install <dir> [--root <dir>] [--keys <dir>] [--arch <a>] [--allow-unsigned]\n  \
            layer list [--root <dir>]\n  \
            layer remove <name@version> [--root <dir>]\n      \
-             Toolchain layers (dev-tools-plan.md M3), signed by the platform key.\n\n\
+             Toolchain layers (dev-tools-plan.md M3), signed by the platform key.\n  \
+           catalog root-sign <cat> --key <pem> --pub <pem>\n  \
+           catalog add <cat> <pkg-dir> --arch <a> --archive <file> --url <https://...>\n  \
+           catalog yank <cat> <id> <version> --reason <text> --key <pem> --pub <pem>\n  \
+           catalog head <cat> --key <catalog.pem> [--days 14]\n  \
+           catalog sync <state> --from <cat> [--root <root.toml>]\n  \
+           catalog list <state>\n      \
+             The signed catalog (opifex.md §6): publish into a folder, check a copy.\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."

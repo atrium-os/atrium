@@ -1,0 +1,23 @@
+[package]
+name = "artifex-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Artifex's syntax module: tree-sitter parsing and highlighting for the code grid (plan M11, P6)."
+
+[dependencies]
+pergola = { path = "../../pergola" }
+ropey = "1.6"
+# tree-sitter's C core and the grammars, all MIT (LANGUAGE-POLICY.md
+# carve-out (a): upstream C). Pinned: a grammar update is a reviewed change.
+tree-sitter = "=0.25.10"
+streaming-iterator = "0.1"
+tree-sitter-rust = "=0.24.0"
+tree-sitter-c = "=0.24.1"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-md = "=0.5.1"
+tree-sitter-bash = "=0.25.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-json = "=0.24.8"

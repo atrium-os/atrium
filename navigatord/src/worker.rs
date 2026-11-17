@@ -63,6 +63,23 @@ fn portcullisd() -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
+/// Our persona (personas.md §3), as portcullisd's launch registry has it
+/// by our uid: `None` for Personal, else its name and colour.
+pub fn persona() -> io::Result<Option<(String, String)>> {
+    use portcullis_ipc::{round_trip, Request, Response};
+    let mut s = portcullisd()?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+        Response::Hello { .. } => {}
+        other => return Err(io::Error::other(format!("portcullisd hello: {other:?}"))),
+    }
+    match round_trip(&mut s, &Request::Persona)? {
+        Response::Persona { name: None, .. } => Ok(None),
+        Response::Persona { name: Some(n), colour } => Ok(Some((n, colour.unwrap_or_default()))),
+        other => Err(io::Error::other(format!("portcullisd persona: {other:?}"))),
+    }
+}
+
 impl Worker {
     /// Start `spec` as run `instance`; its errors are captured when
     /// `capture_err`, else they go to navigatord's.

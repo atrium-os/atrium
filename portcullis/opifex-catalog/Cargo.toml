@@ -1,0 +1,19 @@
+[package]
+name = "opifex-catalog"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "The Opifex catalog (docs/spec/opifex.md §5, §6): root keys with scopes and a threshold, an append-only log of signed entries in static files, signed tree heads, and the client-side checks. Static files only; no network here (the fetcher hands bytes in)."
+
+[lib]
+name = "opifex_catalog"
+path = "src/lib.rs"
+
+[dependencies]
+portcullis-sig  = { path = "../portcullis-sig" }
+portcullis-toml = { path = "../portcullis-toml" }
+serde  = { version = "1", features = ["derive"] }
+toml   = "0.8"
+sha2   = "0.10"
+base64 = "0.22"
