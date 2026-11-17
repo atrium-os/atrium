@@ -307,6 +307,14 @@ seals the seed pack's front and blobs under keyed ids, and writes the root tags,
 anchor and the HMAC last (tests/test_volume_sealed.c reads a seeded file back through
 all of it on both suites).
 
+In the kernel (atrium-tessera/kmod): `tessera_crypt_ocf.c` installs the backend at module
+load over OCF with per-request keys and refuses to install if the XAES and XChaCha known
+answers fail; `tessera_keyring.c` is `/dev/tesserakeys` (§4.3; developer builds load keys
+with `tessera-keyload`). The mount looks the key up by `master_key_id` and the uuid, then
+selects the superblock as above; trees open only under the superblock's root tags, and blobs
+are read by opening the pack front from its own sectors against the registry's tag. Sealed
+mounts are read-only until the sealed write path exists (scripts/tessera-sealed-vm.sh).
+
 ### 5.3 Metadata blocks
 
 B+tree nodes (every tree), the journal header and journal records are 4 KiB blocks. On a
