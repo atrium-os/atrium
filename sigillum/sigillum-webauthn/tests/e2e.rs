@@ -116,7 +116,7 @@ fn rig_typing(press: Press, typed: &'static [u8]) -> Rig {
         ui_socket: dir.join("u.sock"),
         dev_uid: me(),
         ui_uid: me(),
-        broker: Config { web_broker: Some(navigator()), ceremony_ms: 10_000 },
+        broker: Config { web_broker: Some(navigator()), mail_signers: vec![], ceremony_ms: 10_000 },
     };
     let arca = sigillumd::platform::Arca(sigillumd::platform::Socket(arcad(&dir)));
     let passcode = sigillumd::daemon::Ostiarius(ostiarius(&dir));

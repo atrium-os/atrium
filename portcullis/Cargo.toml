@@ -22,6 +22,7 @@ members = [
     "atrium-volumes",
     "ostiarius",
     "opifex",
+    "opifex-catalog",
 ]
 
 [workspace.package]

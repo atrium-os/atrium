@@ -488,6 +488,22 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
+        /* ★ The caller's own persona (personas.md §3): from the launch
+         * registry by the PEER UID, its colour from the owner's policy. */
+        if matches!(req, Request::Persona) {
+            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let resp = match (reg.persona(uid), reg.resolve(uid)) {
+                (Some(None), _) => Response::Persona { name: None, colour: None },
+                (Some(Some(p)), Some((user, _))) => {
+                    let colour = shared.lock().unwrap().get_or_load(user).ok()
+                        .and_then(|tp| tp.policy.personas.get(p).map(|d| d.colour.clone()));
+                    Response::Persona { name: Some(p.to_string()), colour }
+                }
+                _ => Response::Error { message: "persona: caller is not a launched app".into() },
+            };
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         if let Request::Launch { app_id, bypass_policy, persona } = req {
             /* `owner`, not `user`: see the inheritance note above. This is both
              * whose policy authorizes the launch and who the launched app is
@@ -2350,7 +2366,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } => Response::Error {
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

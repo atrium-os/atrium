@@ -68,7 +68,9 @@ fn main() -> ExitCode {
         arca_uid: env_uid("SIGILLUM_ARCA_UID"),
         ostiarius_uid: env_uid("SIGILLUM_OSTIARIUS_UID"),
     };
-    let mut settings = Settings::standard(Config { web_broker, ceremony_ms: CEREMONY_MS });
+    // `SIGILLUM_MAIL_SIGNERS`: `app_id publisher-hex` entries, `;` between.
+    let mail_signers = std::env::var("SIGILLUM_MAIL_SIGNERS").map(|v| v.split(';').filter(|e| !e.trim().is_empty()).filter_map(parse_web_broker).collect()).unwrap_or_default();
+    let mut settings = Settings::standard(Config { web_broker, mail_signers, ceremony_ms: CEREMONY_MS });
     if let Some(u) = env_uid("SIGILLUM_DEV_UID") {
         settings.dev_uid = u;
     }

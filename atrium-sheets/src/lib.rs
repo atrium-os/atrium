@@ -5,7 +5,9 @@
 
 pub mod app;
 pub mod bench;
+pub mod condfmt;
 pub mod data;
 pub mod doc;
 pub mod files;
+pub mod pivotpane;
 pub mod source;

@@ -80,7 +80,7 @@ fn a_batch_is_summarized_with_keys_from_the_engine() {
     let batch: Vec<wire::Raw> = [&good, &forged, &plain, &not_mail].iter().enumerate()
         .map(|(i, b)| wire::Raw { id: i as u64, bytes: b.to_vec() }).collect();
     let max_len = batch.iter().map(|m| m.bytes.len()).max().unwrap() as u64;
-    e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, headers_only: false, batch });
+    e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, headers_only: false, roots: vec![], batch });
     let dns = |n: &str| match n { "sel._domainkey.example.com" => Some(rec.clone()), _ => None };
     let out = e.run(max_len, &dns);
     assert_eq!(out.len(), 4);
@@ -100,7 +100,7 @@ fn opening_converts_the_html_and_drops_the_pixel() {
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
     let raw = signed(&kp, HEADERS, BODY);
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, message: wire::Raw { id: 7, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], message: wire::Raw { id: 7, bytes: raw.clone() }, loaded: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 7, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     assert_eq!(o.summary.sender_check, wire::SenderCheck::Pending, "no key could be fetched");
@@ -149,7 +149,7 @@ fn a_message_s_own_pictures_come_with_its_document() {
 --b\r\nContent-Type: image/png\r\nContent-ID: <logo@shop>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--b--\r\n",
         b64(&dot), b64(&logo)).into_bytes();
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 9, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     let d = o.document.as_ref().unwrap();
@@ -168,7 +168,7 @@ fn a_message_s_own_pictures_come_with_its_document() {
 fn attachments_are_listed_and_handed_over() {
     let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--B\r\nContent-Type: application/pdf; name=\"invoice.pdf\"\r\nContent-Disposition: attachment; filename=\"invoice.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBHNjcmlwdA==\r\n--B\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"../notes.txt\"\r\n\r\nquarterly numbers\r\n--B--\r\n".to_vec();
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, message: wire::Raw { id: 3, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], message: wire::Raw { id: 3, bytes: raw.clone() }, loaded: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 3, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     let names: Vec<&str> = o.attachments.iter().map(|a| a.name.as_str()).collect();
@@ -187,4 +187,57 @@ fn attachments_are_listed_and_handed_over() {
     assert_eq!(a.bytes, b"PK\x03\x04script");
     assert_eq!(a.text, None, "a zip has no text");
     e.finish();
+}
+
+/// An S/MIME signed message (OpenSSL's, kept with bare LFs as some stores
+/// do): checked against the roots the engine sends; the signature part
+/// isn't listed as a file.
+#[test]
+fn smime_signature_is_checked_against_the_engine_s_roots() {
+    let d = |f: &str| std::fs::read(format!("{}/../mail-smime/tests/data/{f}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let raw = d("signed.eml");
+    let now = 1_800_000_000;
+    let run = |roots: Vec<Vec<u8>>, raw: &[u8]| {
+        let mut e = Engine::start();
+        e.send(&ToJail::Open { authserv_id: None, me: vec![], now, roots, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded: vec![] });
+        let f = e.run(raw.len() as u64, &|_| None);
+        e.finish();
+        match f.into_iter().next() { Some(FromJail::Opened { result: Ok(o), .. }) => o, other => panic!("{other:?}") }
+    };
+    let o = run(vec![d("ca.der")], &raw);
+    let m = o.summary.smime.clone().expect("signed");
+    assert_eq!(m.state, wire::SmimeState::Valid);
+    let s = m.signer.unwrap();
+    assert_eq!(s.name, "Grace Hopper");
+    assert_eq!(s.issuer, "Fixture");
+    assert_eq!(s.der, d("leaf.der"));
+    assert_eq!(m.issuers, vec!["OpenSSL Test Root".to_string()]);
+    assert!(o.attachments.is_empty(), "{:?}", o.attachments);
+    assert!(o.summary.parts.iter().any(|p| p.kind == wire::PartKind::Signature));
+    assert_eq!(o.summary.text.as_deref().map(str::trim), Some("From OpenSSL."));
+
+    // Not a root here.
+    assert!(matches!(run(vec![], &raw).summary.smime.unwrap().state, wire::SmimeState::NotTrusted(_)));
+    // Changed in transit.
+    let changed = String::from_utf8(raw.clone()).unwrap().replace("From OpenSSL.", "From 0penSSL.").into_bytes();
+    assert!(matches!(run(vec![d("ca.der")], &changed).summary.smime.unwrap().state, wire::SmimeState::Invalid(_)));
+    // Someone else in From.
+    let other = String::from_utf8(raw.clone()).unwrap().replace("<grace@example.net>", "<ceo@example.net>").into_bytes();
+    assert_eq!(run(vec![d("ca.der")], &other).summary.smime.unwrap().state, wire::SmimeState::WrongAddress(vec!["grace@example.net".into()]));
+}
+
+/// A lying jail can't claim a signature for From with someone else's
+/// certificate, or a certificate that isn't the one it hashed.
+#[test]
+fn the_engine_checks_smime_claims() {
+    let cert = wire::SmimeCert { name: "Bank".into(), emails: vec!["help@bank.example".into()], issuer: "CA".into(), not_before: 0, not_after: 1, sha256: [0; 32], der: vec![1, 2, 3] };
+    let mut s = wire::Summary { from: vec![wire::Address { addr: "help@bank.example".into(), ..Default::default() }], ..Default::default() };
+    s.smime = Some(wire::Smime { state: wire::SmimeState::Valid, signer: Some(cert.clone()), issuers: vec![], signed_at: None });
+    assert!(s.check(&Caps::default(), 10).is_err(), "hash of another certificate");
+    let mut good = cert.clone();
+    good.sha256 = ring::digest::digest(&ring::digest::SHA256, &good.der).as_ref().try_into().unwrap();
+    s.smime.as_mut().unwrap().signer = Some(good.clone());
+    assert_eq!(s.check(&Caps::default(), 10), Ok(()));
+    s.from[0].addr = "help@evil.example".into();
+    assert!(s.check(&Caps::default(), 10).is_err(), "valid for another address");
 }

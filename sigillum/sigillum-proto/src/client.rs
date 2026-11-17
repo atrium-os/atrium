@@ -95,12 +95,14 @@ pub struct VerifyUser {
 }
 
 /// What a certificate on a token is used for (sigillum.md §10): shown on
-/// the sheet. TLS client authentication is the one use so far; document
-/// signing for apps (§10.2) follows with `identity.certificate`.
+/// the sheet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CertPurpose {
     /// Client authentication to this server (§10.1).
     TlsClient { host: String, port: u16 },
+    /// Signing mail sent from this address (S/MIME, mail.md §10.1): only
+    /// the mail apps sigillumd is told of may ask (§10.2).
+    MailSign { from: String },
 }
 
 /// §10.1 step 3: the user picks a certificate from the attached tokens, for

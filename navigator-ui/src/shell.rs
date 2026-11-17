@@ -88,6 +88,9 @@ pub struct HistoryView {
 #[derive(Clone, Debug)]
 pub struct Shell {
     pub store: TrailStore,
+    /// This window's named persona (personas.md §3: one per window), from
+    /// navigatord's settings (`NAVIGATOR_UI_PERSONA`); `None` is Personal.
+    pub window_persona: Option<String>,
     pub w: f32,
     pub h: f32,
     /// Ctrl-B, or the rail's sidebar button.
@@ -263,9 +266,20 @@ pub struct Geo {
     pub media: bool,
 }
 
+/// The window's named persona from the settings, capitalised for the rail
+/// ("work" shows as "Work"), if it is a fit name.
+pub fn window_persona() -> Option<String> {
+    let p = std::env::var("NAVIGATOR_UI_PERSONA").ok()?;
+    if p.is_empty() || p.len() > 32 || !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let mut c = p.chars();
+    c.next().map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+}
+
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, window_persona: window_persona(), w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.

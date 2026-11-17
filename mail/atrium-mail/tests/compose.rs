@@ -344,3 +344,101 @@ fn files_are_attached_and_forwarded() {
     let raw = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
     assert!(raw.contains("multipart/mixed") && raw.contains("filename=\"report.pdf\"") && !raw.contains("q4.csv"), "{raw}");
 }
+
+/// Encrypt turns on only when every recipient's certificate is known, and
+/// then the message leaves encrypted.
+#[test]
+fn encrypt_needs_every_recipient_s_certificate() {
+    use mail_sync::{Fetched, RemoteFolder, Role, Sink};
+    let data = |f: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    engine.set_roots(vec![data("ca.der")]);
+    let engine = Rc::new(engine);
+    let account = engine.store.add_account("grace@example.net").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let bytes = data("signed.eml");
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW), server_id: None, bytes, full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let (c, _) = { mail.write_new(); mail.take_composes().remove(0) };
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    k.set_rich(false);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (900.0, 640.0)), dirty);
+    k.to.set(TextEdit::new("bob@example.net, grace@example.net"));
+    k.subject.set(TextEdit::new("Secret"));
+    k.toggle_encrypt();
+    app.tick();
+    assert!(!k.ui.get_cloned().encrypt);
+    assert!(texts(&app).iter().any(|x| x.contains("Can't encrypt to bob@example.net yet")), "{:?}", texts(&app));
+    k.to.set(TextEdit::new("grace@example.net"));
+    k.toggle_encrypt();
+    app.tick();
+    assert!(k.ui.get_cloned().encrypt);
+    assert!(texts(&app).iter().any(|x| x == "Encrypted"));
+    assert!(k.send(Some([1; 16]), None));
+    let (_, o) = engine.store.outbox().unwrap().remove(0);
+    let sent = String::from_utf8(engine.store.blob(&o.message).unwrap()).unwrap();
+    assert!(sent.contains("smime-type=enveloped-data") && sent.contains("Subject: Secret"), "{sent}");
+}
+
+/// Sign: Mail asks Sigillum (here a stand-in on a socket, the token's key
+/// in software) for the certificate and then the signature; what leaves is
+/// signed so the jail finds it valid.
+#[test]
+fn sign_through_sigillum() {
+    use rsa::pkcs8::DecodePrivateKey;
+    use sigillum_proto::client::{Reply, Request, CertPurpose, MAX_MESSAGE};
+    let data = |f: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("sigillum.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (cert, key) = (data("leaf.der"), rsa::RsaPrivateKey::from_pkcs8_der(&data("leaf.p8")).unwrap());
+    let server = std::thread::spawn(move || {
+        let mut asked = Vec::new();
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let req: Request = sigillum_proto::read_msg(&mut s, MAX_MESSAGE).unwrap().unwrap();
+            let reply = match &req {
+                Request::ChooseCertificate(c) => Reply::CertificateChosen { ceremony: c.ceremony, cert: cert.clone() },
+                Request::SignWithCertificate(w) => Reply::CertificateSigned { ceremony: w.ceremony, signature: key.sign(rsa::Pkcs1v15Sign::new::<sha2::Sha256>(), &w.digest).unwrap() },
+                _ => panic!("{req:?}"),
+            };
+            asked.push(req);
+            sigillum_proto::write_msg(&mut s, &reply, MAX_MESSAGE).unwrap();
+        }
+        asked
+    });
+
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    engine.set_roots(vec![data("ca.der")]);
+    let engine = Rc::new(engine);
+    engine.store.add_account("grace@example.net").unwrap();
+    let view = MailView::new(engine.clone(), Arc::new(AtomicBool::new(true)), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let (c, _) = { mail.write_new(); mail.take_composes().remove(0) };
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    k.set_rich(false);
+    *k.signer.borrow_mut() = Some(atrium_mail::signing::through_sigillum(&socket));
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (900.0, 640.0)), dirty);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Sign"));
+    k.ui.set(atrium_mail::compose::ComposeUi { sign: true, ..k.ui.get_cloned() });
+    k.to.set(TextEdit::new("ada@example.org"));
+    k.subject.set(TextEdit::new("Signed"));
+    k.body.set(TextEdit::new("Hello Ada."));
+    assert!(k.send(Some([1; 16]), None), "{:?}", k.ui.get_cloned().error);
+    let asked = server.join().unwrap();
+    assert!(matches!(&asked[0], Request::ChooseCertificate(c) if c.purpose == CertPurpose::MailSign { from: "grace@example.net".into() }));
+    let (_, o) = engine.store.outbox().unwrap().remove(0);
+    let sent = engine.store.blob(&o.message).unwrap();
+    let opened = engine.parser.open(&sent, vec![], &[data("ca.der")]).unwrap().unwrap();
+    assert_eq!(opened.summary.smime.unwrap().state, mail_schema::SmimeState::Valid);
+    assert_eq!(opened.summary.text.as_deref().map(str::trim), Some("Hello Ada."));
+}

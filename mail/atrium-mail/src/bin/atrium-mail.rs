@@ -217,6 +217,12 @@ fn compose_window(engine: &Rc<Engine>, embeds: Option<&Rc<std::cell::RefCell<per
     }
     let dirty = Arc::new(AtomicBool::new(true));
     let k = Composer::new(engine.clone(), c, draft, dirty.clone(), now);
+    // Sign with a token (S/MIME) when Sigillum is here; it says whether
+    // Mail may.
+    let socket = std::env::var("SIGILLUM_SOCKET").unwrap_or_else(|_| sigillum_proto::client::SOCKET.into());
+    if std::path::Path::new(&socket).exists() {
+        *k.signer.borrow_mut() = Some(atrium_mail::signing::through_sigillum(socket));
+    }
     let view = ComposeView::new(k.clone(), (win.width, win.height));
     let size = view.size.clone();
     Ok(ComposeWin { win, app: App::new_with_flag(view, dirty), c: k, size, quote: None, quote_failed: false, attach: None })

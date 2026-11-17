@@ -13,6 +13,7 @@ pub mod links;
 pub mod plain;
 pub mod rich;
 pub mod sender;
+pub mod signing;
 pub mod view;
 
 pub use view::{MailView, Ui};

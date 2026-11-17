@@ -160,3 +160,32 @@ fn icon_sets_pick_by_threshold() {
     let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
     assert_eq!(back.cond_formats(), wb.cond_formats());
 }
+
+#[test]
+fn changing_formats_is_one_undoable_journaled_op() {
+    use officina_core::history::History;
+    use officina_grid::ops::GridOp;
+    let mut wb = book();
+    let mut h: History<GridOp> = History::new();
+    let a = |r| CellAddr::new(0, r, 0);
+    let f = wb.cond_formula("A1>5", 0, (0, 0)).unwrap();
+    let rule = Rule { kind: RuleKind::Expression(f), dxf: fill(), stop: false };
+    let op = GridOp::cond_formats(&wb, &[CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![rule] }]);
+    // Through the journal's bytes and back.
+    let op = GridOp::decode(&op.encode()).unwrap();
+    h.run(&mut wb, "Conditional Format", vec![op]);
+    assert_eq!(wb.cond_formats().len(), 1);
+    assert_eq!(wb.look(a(5)).dxf.fill, Some(RED));
+    assert_eq!(wb.look(a(4)).dxf.fill, None);
+    h.undo(&mut wb);
+    assert!(wb.cond_formats().is_empty() && wb.look(a(5)).is_empty());
+    h.redo(&mut wb);
+    assert_eq!(wb.look(a(9)).dxf.fill, Some(RED));
+    // A list naming a sheet that isn't there changes nothing.
+    let mut other = book();
+    other.add_sheet("T").unwrap();
+    let bad = GridOp::cond_formats(&other, &[CondFormat { sheet: 1, ranges: vec![Rect { sheet: 1, r0: 0, c0: 0, r1: 0, c1: 0 }], rules: vec![Rule { kind: RuleKind::Blanks(true), dxf: fill(), stop: false }] }]);
+    h.run(&mut wb, "Bad", vec![bad]);
+    assert_eq!(wb.cond_formats().len(), 1);
+    assert!(GridOp::decode(&[8, 200]).is_err());
+}

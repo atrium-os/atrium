@@ -37,19 +37,19 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
         let req = { let mut p = port.borrow_mut(); wire::read_frame::<wire::ToJail>(&mut p.r)? };
         let Some(req) = req else { return Ok(()) };
         match req {
-            wire::ToJail::Summarize { authserv_id, me, now, headers_only, batch } => {
-                if batch.len() > wire::MAX_BATCH || batch.iter().map(|m| m.bytes.len()).sum::<usize>() > wire::MAX_BATCH_BYTES {
+            wire::ToJail::Summarize { authserv_id, me, now, headers_only, roots, batch } => {
+                if !roots_ok(&roots) || batch.len() > wire::MAX_BATCH || batch.iter().map(|m| m.bytes.len()).sum::<usize>() > wire::MAX_BATCH_BYTES {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "batch over its limits"));
                 }
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only };
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only, roots: &roots };
                 for m in &batch {
                     let result = summarize(&m.bytes, &ctx, &port).map(|(s, _)| s);
                     port.borrow_mut().send(&wire::FromJail::Summary { id: m.id, result })?;
                 }
             }
-            wire::ToJail::Open { authserv_id, me, now, message, loaded } => {
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false };
-                if loaded.len() > wire::LOADED_MAX || loaded.iter().any(|(id, b)| b.len() > wire::LOADED_HEAD || id.len() > 64) {
+            wire::ToJail::Open { authserv_id, me, now, roots, message, loaded } => {
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false, roots: &roots };
+                if !roots_ok(&roots) || loaded.len() > wire::LOADED_MAX || loaded.iter().any(|(id, b)| b.len() > wire::LOADED_HEAD || id.len() > 64) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "loaded pictures over their limits"));
                 }
                 // Their sizes from their headers; one that doesn't say keeps the declared space.
@@ -70,7 +70,45 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
     }
 }
 
-struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool }
+struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool, roots: &'a [Vec<u8>] }
+
+fn roots_ok(roots: &[Vec<u8>]) -> bool {
+    roots.len() <= wire::ROOTS_MAX && roots.iter().map(|r| r.len()).sum::<usize>() <= wire::ROOTS_BYTES_MAX
+}
+
+/// The message's S/MIME signature, checked (mail.md §10.1).
+fn smime(raw: &[u8], s: &crate::Summary, ctx: &Ctx) -> Option<wire::Smime> {
+    use mail_smime::verify;
+    let signed = s.signed.as_ref()?;
+    let part = s.parts.iter().find(|p| p.path == signed.signature)?;
+    let sig = mime::part_bytes(raw, part);
+    let content = &raw[signed.content.0..signed.content.1];
+    let from = s.from.first().map(|a| a.addr.as_str()).unwrap_or("");
+    let mut c = verify::detached(content, &sig, ctx.roots, ctx.now, from);
+    // Signed as CRLF lines; a copy kept with bare LFs is checked as sent.
+    if matches!(c.state, verify::State::Invalid(_)) && content.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r') {
+        let mut crlf = Vec::with_capacity(content.len() + content.len() / 32);
+        for (i, b) in content.iter().enumerate() {
+            if *b == b'\n' && (i == 0 || content[i - 1] != b'\r') { crlf.push(b'\r') }
+            crlf.push(*b);
+        }
+        let again = verify::detached(&crlf, &sig, ctx.roots, ctx.now, from);
+        if !matches!(again.state, verify::State::Invalid(_)) { c = again }
+    }
+    let cut = |t: String| -> String { t.chars().filter(|c| !c.is_control()).take(200).collect() };
+    let state = match c.state {
+        verify::State::Valid => wire::SmimeState::Valid,
+        verify::State::NotTrusted(w) => wire::SmimeState::NotTrusted(cut(w)),
+        verify::State::Invalid(w) => wire::SmimeState::Invalid(cut(w)),
+        verify::State::WrongAddress(l) => wire::SmimeState::WrongAddress(l.into_iter().take(16).map(cut).collect()),
+    };
+    let signer = match (c.signer, c.signer_cert) {
+        (Some(i), Some(der)) if der.len() <= wire::SMIME_CERT_MAX => Some(wire::SmimeCert { name: cut(i.name), emails: i.emails.into_iter().take(16).map(cut).collect(), issuer: cut(i.issuer), not_before: i.not_before, not_after: i.not_after, sha256: i.sha256, der }),
+        _ => None,
+    };
+    let state = if signer.is_none() && !matches!(state, wire::SmimeState::Invalid(_)) { wire::SmimeState::Invalid("the signer's certificate is too large".into()) } else { state };
+    Some(wire::Smime { state, signer, issuers: c.chain.into_iter().take(8).map(|i| cut(i.name)).collect(), signed_at: c.signed_at })
+}
 
 fn refusal(r: Refused) -> wire::Refusal {
     match r { Refused::Empty => wire::Refusal::NotMail, _ => wire::Refusal::TooLarge }
@@ -140,6 +178,7 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
                 mime::PartKind::Inline => wire::PartKind::Inline,
                 mime::PartKind::Message => wire::PartKind::Message,
                 mime::PartKind::Attachment => wire::PartKind::Attachment,
+                mime::PartKind::Signature => wire::PartKind::Signature,
             },
             content_type: p.content_type.clone(),
             filename: p.filename.clone(),
@@ -150,6 +189,8 @@ fn summarize<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>
         text: s.text.clone(),
         preview: s.preview.clone(),
         sender_check,
+        smime: if ctx.headers_only { None } else { smime(raw, &s, ctx) },
+        encrypted: s.encrypted,
         invite,
         unknown_charset: s.unknown_charset,
         truncated: s.truncated,

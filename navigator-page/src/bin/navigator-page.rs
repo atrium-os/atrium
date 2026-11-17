@@ -33,8 +33,6 @@ use pergola::{App, Event, SizeSpec, Window, WindowDesc};
 use pergola_document::{Doc, DocumentView};
 
 /// navigatord's page socket, where a ticket is redeemed.
-/// navigatord's page socket, as the `navigator-page` capability mounts it.
-const PAGE_SOCKET: &str = "/atrium/sockets/navigator-page/navigator-page.sock";
 
 /// The comfortable measure (navigator-ui.md §7): about 70 characters of
 /// body text at 100%, in CSS px; it grows with the text size.
@@ -661,7 +659,9 @@ fn embedded() {
                         out.send(ToParent::Parked { scroll: y });
                     }
                     Some(ToChild::Open { ticket, reading, scroll }) => {
-                        let path = std::env::var("NAVIGATOR_PAGE_SOCKET").unwrap_or_else(|_| PAGE_SOCKET.into());
+                        // The ticket names the navigatord instance that issued it.
+                        let path = std::env::var("NAVIGATOR_PAGE_SOCKET").unwrap_or_else(|_| navigator_control::PAGE_SOCKET.into());
+                        let path = navigator_control::instance_path(&path, navigator_control::ticket_instance(&ticket));
                         match navigator_control::redeem(&path, &ticket) {
                             Ok(r) => {
                                 if !r.images.is_empty() {

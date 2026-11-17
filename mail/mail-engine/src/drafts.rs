@@ -44,7 +44,12 @@ impl Engine {
     /// the outbox and the draft is done. The send's id, for Undo, which
     /// gives the draft back to save as a new one.
     pub fn send_draft(&self, id: Option<u64>, account: AccountId, draft: &Draft, when: When) -> Result<u64, Error> {
-        let send = self.send(account, draft, when)?;
+        self.send_draft_protected(id, account, draft, when, crate::smime::Protect::default())
+    }
+
+    /// [`Engine::send_draft`], signed and/or encrypted (§10.1).
+    pub fn send_draft_protected(&self, id: Option<u64>, account: AccountId, draft: &Draft, when: When, protect: crate::smime::Protect) -> Result<u64, Error> {
+        let send = self.send_protected(account, draft, when, protect)?;
         if let Some(id) = id {
             self.discard_draft(id)?;
         }

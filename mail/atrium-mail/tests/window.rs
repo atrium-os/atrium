@@ -681,3 +681,30 @@ fn later_sets_aside_and_done_closes() {
     app.tick();
     assert!(texts(&app).iter().any(|x| x.starts_with("Back · Reply")), "{:?}", texts(&app));
 }
+
+#[test]
+fn a_signed_message_says_who_signed_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let data = |f: &str| std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-smime/tests/data").join(f)).unwrap();
+    engine.set_roots(vec![data("ca.der")]);
+    let engine = Rc::new(engine);
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let raw = data("signed.eml");
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: raw.len() as u64, internal_date: Some(NOW), server_id: None, bytes: raw, full: true }]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    mail.open(0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Signed by Grace Hopper <grace@example.net> · certificate from Fixture"), "{t:?}");
+    // The signature isn't a file.
+    assert!(!t.iter().any(|x| x.contains("smime.p7s")), "{t:?}");
+}

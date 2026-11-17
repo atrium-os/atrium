@@ -121,6 +121,8 @@ pub struct Msg {
     pub list_note: Option<String>,
     /// Held by the screener: Accept or Refuse.
     pub held: bool,
+    /// The S/MIME line (§10.1): who signed, or why not, or encrypted.
+    pub smime: Option<(String, sender::Tone)>,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -576,6 +578,7 @@ impl Mail {
             list: self.engine.list_of(msg).ok().flatten(),
             list_note: None,
             held: !m.held.is_empty(),
+            smime: sender::smime_line(s),
         }
     }
 
@@ -1667,6 +1670,8 @@ pub enum Item {
     From(usize),
     To(usize),
     RepliesTo(usize),
+    /// "Signed by …" (§10.1).
+    Smime(usize),
     /// A note (headers only, HTML only, couldn't open), one line of it.
     Note(String),
     /// "New since you last looked" (§11.1).
@@ -1716,6 +1721,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         if m.sender.replies_to.is_some() {
             out.push(Item::RepliesTo(k));
+        }
+        if m.smime.is_some() {
+            out.push(Item::Smime(k));
         }
         if m.held {
             out.push(Item::Screener(k));
@@ -2501,6 +2509,16 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         Item::RepliesTo(k) => {
             let r = s.msgs[*k].sender.replies_to.clone().unwrap_or_default();
             text(ctx, x, cy, &fit(&format!("Replies go to {r}"), type_size::XS, Weight::Regular, tw), type_size::XS, Weight::Regular, t.warning_fg());
+        }
+        Item::Smime(k) => {
+            let Some((l, tone)) = &s.msgs[*k].smime else { return };
+            let c = match tone {
+                sender::Tone::Good => t.success_fg(),
+                sender::Tone::Warn => t.warning_fg(),
+                sender::Tone::Bad => t.danger_fg(),
+                sender::Tone::Plain => t.text_secondary(),
+            };
+            text(ctx, x, cy, &fit(l, type_size::XS, Weight::Regular, tw), type_size::XS, Weight::Regular, c);
         }
         Item::Note(l) => {
             text(ctx, x, cy, l, type_size::SM, Weight::Regular, t.text_secondary());

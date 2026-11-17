@@ -400,12 +400,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "portcullis-peer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
  "atrium-links",
  "atrium-types",
  "hex",
+ "portcullis-peer",
  "portcullis-toml",
  "serde",
  "sha2",

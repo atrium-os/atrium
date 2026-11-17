@@ -1,0 +1,13 @@
+# {{name}}: made by `cargo atrium new` (template: app).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A window and nothing else. Add only what the app needs; `cargo atrium
+# check` shows what the person will be asked to allow.
+[capabilities]
+graphics = "fresco"
+network = "none"

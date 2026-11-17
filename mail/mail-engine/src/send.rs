@@ -80,10 +80,17 @@ impl Engine {
     /// (for [`Engine::undo_send`]). The message is written now (its Date is
     /// when Send was pressed, or the scheduled time).
     pub fn send(&self, account: AccountId, draft: &Draft, when: When) -> Result<u64, Error> {
+        self.send_protected(account, draft, when, crate::smime::Protect::default())
+    }
+
+    /// [`Engine::send`], signed and/or encrypted with S/MIME (§10.1).
+    pub fn send_protected(&self, account: AccountId, draft: &Draft, when: When, protect: crate::smime::Protect) -> Result<u64, Error> {
         let t = now();
         let undo = when.undo_secs.clamp(*UNDO_SEND_RANGE.start(), *UNDO_SEND_RANGE.end());
         let later = when.later.filter(|l| *l > t + undo);
-        let w = mail_compose::write(draft, &Stamp { date: later.unwrap_or(t), random: random16() }).map_err(|e| Error::Compose(e.to_string()))?;
+        let random = random16();
+        let mut w = mail_compose::write(draft, &Stamp { date: later.unwrap_or(t), random }).map_err(|e| Error::Compose(e.to_string()))?;
+        w.bytes = self.protect(&w, protect, t, &random)?;
         let message = self.store.put_blob(&w.bytes)?;
         let draft_blob = self.store.put_blob(&postcard::to_stdvec(draft).map_err(|e| Error::Compose(e.to_string()))?)?;
         let o = Outgoing {

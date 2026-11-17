@@ -1,0 +1,3 @@
+OpenSSL-made fixtures (throwaway test keys, never used anywhere else):
+streamed BER signature and envelope from `openssl cms -sign/-encrypt -stream -binary`.
+ca.der: test root; leaf.der/leaf.p8: grace@example.net cert and key; content.txt: what was signed/encrypted.

@@ -19,6 +19,9 @@ pub enum PartKind {
     /// parsed on its own when opened.
     Message,
     Attachment,
+    /// An S/MIME signature (`application/pkcs7-signature`): checked and
+    /// shown as the "Signed by" line, never listed as a file.
+    Signature,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +115,15 @@ impl Walk<'_> {
                     size: body.1 - body.0,
                 });
                 let children = split_multipart(self.raw, body, boundary.as_bytes());
+                // S/MIME (RFC 8551 §3.5): the first part exactly as sent,
+                // headers and all, is what the second part signs.
+                let protocol = ct.get("protocol").map(|p| p.to_ascii_lowercase());
+                if ct.value == "multipart/signed" && s.signed.is_none() && children.len() == 2
+                    && matches!(protocol.as_deref(), Some("application/pkcs7-signature" | "application/x-pkcs7-signature"))
+                {
+                    let sig_path = if path.is_empty() { "2".to_string() } else { format!("{path}.2") };
+                    s.signed = Some(crate::Signed { content: children[0], signature: sig_path });
+                }
                 for (n, child) in children.into_iter().enumerate() {
                     let child_path = if path.is_empty() { format!("{}", n + 1) } else { format!("{}.{}", path, n + 1) };
                     let slice = &self.raw[child.0..child.1];
@@ -133,7 +145,17 @@ impl Walk<'_> {
             _ => body.1 - body.0,
         };
         let charset = ct.get("charset").map(|c| header::clean(c, 64));
-        let kind = if ct.value == "message/rfc822" || ct.value == "message/global" {
+ if depth == 0 && matches!(ct.value.as_str(), "application/pkcs7-mime" | "application/x-pkcs7-mime") {
+            let st = ct.get("smime-type").map(|t| t.to_ascii_lowercase());
+            s.encrypted = match st.as_deref() {
+                Some("enveloped-data") | Some("authenveloped-data") => true,
+                None => !filename.as_deref().is_some_and(|f| !f.eq_ignore_ascii_case("smime.p7m")),
+                _ => false,
+            };
+        }
+        let kind = if matches!(ct.value.as_str(), "application/pkcs7-signature" | "application/x-pkcs7-signature") {
+            PartKind::Signature
+        } else if ct.value == "message/rfc822" || ct.value == "message/global" {
             PartKind::Message
         } else if !attachment && ct.value == "text/plain" && s.text.is_none() {
             PartKind::Text

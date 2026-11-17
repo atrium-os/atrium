@@ -79,6 +79,9 @@ pub struct Config {
     /// `SIGILLUM_WEB_BROKER`: the one app that may name any RP ID; `None`,
     /// no app may.
     pub web_broker: Option<crate::label::AppId>,
+    /// `SIGILLUM_MAIL_SIGNERS`: the apps that may have mail signed with a
+    /// token certificate (S/MIME); none by default.
+    pub mail_signers: Vec<crate::label::AppId>,
     pub ceremony_ms: u64,
 }
 
@@ -1125,9 +1128,27 @@ fn sheet_for(c: &Ceremony) -> Sheet {
     }
 }
 
+/// A mail address as a sheet may show it: one `@`, a real domain, no
+/// spaces or controls.
+fn valid_mail_address(a: &str) -> bool {
+    let Some((local, domain)) = a.rsplit_once('@') else { return false };
+    !local.is_empty() && local.len() <= 64 && a.len() <= 254 && valid_domain(domain)
+        && local.chars().all(|c| c.is_ascii_graphic() && c != '@' && c != '<' && c != '>')
+}
+
 /// Token certificates: the web broker and Arca, for TLS client
-/// authentication to a real domain (§10.1).
+/// authentication to a real domain (§10.1); the mail apps named in the
+/// configuration, for signing mail from an address.
 fn may_use_token(label: &Label, cfg: &Config, purpose: &CertPurpose) -> Result<(), Refusal> {
+    if let CertPurpose::MailSign { from } = purpose {
+        return match label {
+            Label::App { app, .. } if cfg.mail_signers.contains(app) => {
+                if valid_mail_address(from) { Ok(()) } else { Err(Refusal::Malformed) }
+            }
+            Label::Unknown => Err(Refusal::UnknownPeer),
+            _ => Err(Refusal::Denied),
+        };
+    }
     match label {
         Label::App { app, .. } if Some(app) == cfg.web_broker.as_ref() => {}
         Label::Arca => {}
@@ -1137,6 +1158,7 @@ fn may_use_token(label: &Label, cfg: &Config, purpose: &CertPurpose) -> Result<(
     match purpose {
         CertPurpose::TlsClient { host, port } if valid_domain(host) && *port != 0 => Ok(()),
         CertPurpose::TlsClient { .. } => Err(Refusal::Malformed),
+        CertPurpose::MailSign { .. } => Err(Refusal::Denied),
     }
 }
 

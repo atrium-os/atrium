@@ -377,6 +377,8 @@ allowed_keys = [
     "SIGILLUM_ARCA_UID",
     "SIGILLUM_OSTIARIUS_UID",
     "SIGILLUM_WEB_BROKER",
+    # sigillumd: the mail apps that may sign mail with a token (S/MIME).
+    "SIGILLUM_MAIL_SIGNERS",
     # sigillumd: where users' enrolled login keys are kept (§16.6).
     "SIGILLUM_KEY_DIR",
     # arcad: the system services the machine store serves, `name=uid,...`

@@ -3,8 +3,9 @@
 > *Opifex* (Latin): a craftsman, one who makes. Atrium's package system: the catalog of
 > published packages, and the fetch, check, install, update and rollback of them.
 
-**Status:** proposed 2026-11-17, waiting for Shankar's review (§14). Nothing built beyond the
-bring-up `opifex` CLI that already exists.
+**Status:** accepted 2026-11-17 (Shankar: all §15 decisions as recommended; decision 1 with
+the Atrium catalog holding only what Atrium builds; GitHub Pages first, a domain later).
+C0 built 2026-11-17 (§14.1).
 **Scope:** what a package is, who may publish one, how the catalog is signed, hosted and
 downloaded, how a package is fetched, checked and installed, what the person sees, updates and
 rollback, and how fonts, drivers, firmware, toolchain layers and the SDK crate registry ride on
@@ -147,10 +148,11 @@ layers enter every workspace that names them, fonts are parsed by every app.
 Today the signature covers `atrium.toml` and nothing ties `bin/` to it. The fix is small and
 keeps the scheme:
 
-- The packer writes `content.idx`: one line per entry in sorted path order, `type mode size
-  sha256 path` (types `f`, `d`, `l` for in-tree symlinks only). No mtimes, owners, devices,
+- The packer (`opifex pack`, `opifex layer pack`) writes `content.index`: one line per
+  entry in sorted path order, tab-separated `kind mode size sha256 path target` (kinds `f`,
+  `d`, `l` for in-tree symlinks only; `opifex/src/content.rs`). No mtimes, owners, devices,
   hard links, setuid or setgid bits; the checker refuses all of them.
-- `atrium.toml` gains `[bundle] content = "sha256:<hash of content.idx>"`.
+- `atrium.toml` gains `[bundle] content = "sha256:<hash of content.index>"`.
 - The publisher signs `atrium.toml` as today. One signature now covers the whole tree.
 - `opifexd` and portcullisd both require `content` for anything not `dev.` (portcullisd's
   launch check reads the stored index hash from the installed record, §7.5, so launch stays
@@ -218,7 +220,8 @@ scope fields, default `kinds = ["app"]`.
 
 ### 6.1 Shape
 
-The catalog is an append-only log of entries. Each entry is one small CBOR record:
+The catalog is an append-only log of entries. Each entry is one small TOML document (the
+same parser the manifests already use; C1 found CBOR bought nothing):
 
 - `release`: id, version, arch, kind, publisher id, the signed `atrium.toml` bytes and its
   signature, archive SHA-256 and size, URLs (main plus alternates), and an extract for local
@@ -229,10 +232,11 @@ The catalog is an append-only log of entries. Each entry is one small CBOR recor
 - `yank`: id, version, reason.
 
 Entries are leaves of a Merkle tree (SHA-256, RFC 6962 hashing). The **tree head**
-(size, root hash, time, expiry) is signed by the catalog key. Files are served as fixed-size
-**tiles** of the tree plus bundles of entries, exactly the static layout Go's checksum
-database uses, so a client that has head N fetches only the tiles and entries after N and
-checks they extend what it had.
+(size, root hash, time, expiry) is signed by the catalog key. Entries are served in bundles of
+256 (`entries/000000`, the last one partial as `entries/000001.p17`), each entry a 4-byte
+length and its text. Because every machine downloads every entry, it rebuilds the tree itself
+and needs no inclusion or consistency proofs: it keeps the leaf hashes it accepted, and a new
+head must extend them exactly. A machine that has head N fetches only the bundles from N on.
 
 ### 6.2 Why whole, why a log
 
@@ -280,7 +284,9 @@ Any failure keeps the previous local catalog and is reported in Curia.
 - Catalog: a public repo `atrium-os/catalog`, served by GitHub Pages. Releases of
   `org.atrium.*` packages: GitHub Releases on `atrium-os/catalog-blobs`. Third-party archives:
   wherever the publisher hosts them; the catalog only holds the URL and the hash.
-- A domain of our own later only adds a URL; nothing is trusted by host name.
+- A domain of our own later only adds a URL; nothing is trusted by host name. The base URLs
+  are a `locations` entry in the log, signed by the catalog key, so a move reaches every
+  machine at its next sync; the old Pages address keeps serving, so nothing is stranded.
 - Mirrors (a LAN cache, a company mirror) are additional base URLs in `opifex.toml`; any
   byte from anywhere is checked by hash.
 
@@ -349,9 +355,9 @@ opifexd ◀─────────────────────┘
   │ 1. look up (id, arch) in the local catalog
   │ 2. opifex-fetch: archive → /var/db/atrium/opifex/dl/<sha256> (via Nuntius)
   │ 3. opifex-check (worker, no caps): sha256 of archive = catalog; unpack into
-  │    staging; refuse anything content.idx can't describe; tree matches content.idx
+  │    staging; refuse anything content.index can't describe; tree matches content.index
   │ 4. opifexd: verify atrium.toml.sig itself (portcullis-trust gate + scopes);
-  │    content.idx hash = atrium.toml; copy staging → apps/.<id>.new,
+  │    content.index hash = atrium.toml; copy staging → apps/.<id>.new,
   │    hashing every file again as it copies
   │ 5. portcullis-toml validation (incl. [[workers]], [roles], [ipc]); kind-specific checks
   │ 6. atomic switch (§7.5); record; tell portcullisd (uids for workers, installed list)
@@ -387,16 +393,18 @@ which `opifexd` refuses.
 
 ```
 /var/lib/atrium/apps/<id>/            the installed tree (what portcullisd reads today)
-/var/lib/atrium/apps/.<id>.prev/      the previous version, kept for rollback
+/var/lib/atrium/opifex/prev/<id>/     the previous version, kept for rollback
+/var/lib/atrium/opifex/staging/       trees being checked (same file system, so placing is a rename)
 /var/db/atrium/opifex/catalog.db      checked local catalog
 /var/db/atrium/opifex/installed.toml  per id: version, publisher id, archive sha256,
-                                      content.idx hash, source (catalog | side-load),
+                                      content.index hash, source (catalog | side-load),
                                       verified RPs, who installed, when
 /var/db/atrium/opifex/dl/             downloaded archives (kept until the install settles)
 ```
 
-Switching: unpack to `.<id>.new`, then rename the current tree to `.<id>.prev` (dropping
-the older one) and `.<id>.new` to `<id>`. Running instances keep the tree they started with
+Switching: stage under `opifex/staging/`, then rename the current tree to `opifex/prev/<id>`
+(dropping the older one) and the staged tree to `apps/<id>`. Staging and the previous
+version stay outside `apps/`, which portcullisd lists as the installed apps. Running instances keep the tree they started with
 (their nullfs mount holds the old directory) until they restart under the update's timing
 class. No change to portcullisd's layout. Deduplication between versions and between apps is
 Tessera's, since `/var/lib/atrium` is on the Tessera root; when Tessera grows an ingest API,
@@ -421,7 +429,7 @@ the tree is deleted when nobody uses it.
 - Uninstall: removes the person's approval and, if nobody else uses it, the tree and
   `.prev`. The app's data in people's homes stays until they remove it on the Curia Apps page
   (as today).
-- Rollback: swaps `<id>` and `.<id>.prev`. Offered in Curia for 30 days after an update.
+- Rollback: swaps `apps/<id>` and `opifex/prev/<id>`. Offered in Curia for 30 days after an update.
   Rolling back across a capability change asks again.
 - A publisher key recovery (§5.2) is shown to people who have that publisher's apps, and
   the next update of each app asks again even with unchanged capabilities.
@@ -512,7 +520,7 @@ order and delay, not forge (§1). Root keys never touch CI.
 ### 10.2 Checks
 
 The CI fetches each archive (it must, to check the hash and the tree) and checks: schema;
-publisher signature; id in prefixes, kind in scopes; content.idx matches the archive;
+publisher signature; id in prefixes, kind in scopes; content.index matches the archive;
 self-contained closure; portcullis-toml validation; capabilities on the review list (device
 claims, `network.host`-class grants, `arca`, `embeds` of system roles) need Shankar's
 approval on the pull request; atrium-ax coverage below threshold is refused unless overridden,
@@ -563,7 +571,7 @@ the base rule except dev layers, which dev-tools already allows to carry GPL too
 
 | Step | What | Unblocks |
 |---|---|---|
-| **C0** | Today's `opifex`: use `portcullis-trust`'s gate instead of its own copy; `content.idx` and `[bundle] content`; refuse `dev.` ids, setuid, devices, hard links, escaping symlinks; staging and rename; drop `--allow-unsigned`. Shared with the toolchains thread's `opifex layer`. | layers on the VM; signed bundles from workspaces |
+| **C0** | Today's `opifex`: use `portcullis-trust`'s gate instead of its own copy; `content.index` and `[bundle] content`; refuse `dev.` ids, setuid, devices, hard links, escaping symlinks; staging and rename; drop `--allow-unsigned`. Shared with the toolchains thread's `opifex layer`. | layers on the VM; signed bundles from workspaces |
 | **C1** | Key roles: `root.toml` (2-of-3), platform and catalog keys, scopes; key ceremony for Shankar with hardware tokens. Catalog entry format, log, tiles; `opifex catalog append|sign|verify` tools; a local catalog directory works offline. | fonts and layers from a local catalog |
 | **C2** | `opifexd`, `opifex-check` (worker), installed record, install, uninstall, rollback from a local catalog and local archives. `Describe`, `Search`. | |
 | **C3** | `opifex-sheet` as the Limen `install` role; callers: Monstrator L5, the Navigator prompt, Scrinium, Curia. | L5, publisher prompt |
@@ -577,6 +585,71 @@ installs, updates and rolls back an app with a running instance kept on the old 
 the sheet from an `atrium-app://` link and a click-check that the sheet is the system's; C4
 syncs from Pages through Nuntius and refuses a catalog with a forked history; C6 installs a CJK
 font on demand and a driver from a `nobody` device's notice.
+
+### 14.1 C0 as built (2026-11-17)
+
+- `opifex/src/content.rs`: the content index (format, indexing, parsing, placing with
+  per-file hashing), shared by apps and the toolchains thread's layers (`layer.rs`).
+- `opifex pack <bundle> [--sign key.pem]`: writes `content.index`, sets `[bundle] content`
+  (new optional field in portcullis-toml), signs `atrium.toml`.
+- `opifex install`: the signature goes through `portcullis-trust`'s gate (opifex's own copy
+  is gone, so `trust.toml require_signatures` now applies to installs too); `dev.` ids are
+  refused; with `[bundle] content` every file is checked as it is copied into staging, and
+  setuid, devices, hard links, unlisted types and escaping links are refused; the tree is
+  swapped in by rename with the previous version kept; `opifex rollback <id>` swaps back.
+- Not yet: bundles without `content` are still accepted with a warning, because the VM gate
+  scripts sign bare `atrium.toml` files; `trust.toml require_content = true` refuses them.
+  It becomes the default once the build scripts run `opifex pack`. portcullisd does not
+  check the index at launch yet (C2, from the installed record). `--allow-unsigned` stays
+  for `forum-on-tessera.sh` until C2.
+- Checked: 10 unit tests (pack, install, update, rollback, and refusals of a changed file, a
+  setuid file, an edited manifest, a missing index when required, a `dev.` id, an unsigned
+  bundle). VM gate `scripts/vm-opifex-c0-check.sh` on the Mac VM (arm64) 2026-11-17: 22
+  checks, 0 failed (also a file grown after signing, nothing left in staging, uninstall clears
+  the kept version).
+
+### 14.2 C1 as built (2026-11-17)
+
+- `opifex-catalog` crate: `root.toml` (roles root, catalog, platform; scopes: prefixes,
+  kinds, devices; threshold), root rotation accepted only when signed by the current
+  threshold and the new one's; entries (release, yank, locations) as TOML; bundles of 256;
+  RFC 6962 tree; heads signed by the catalog key with an expiry; releases checked against
+  the signer's scopes and the publisher's own signature over `atrium.toml`, which must name a
+  content index; the client rebuilds the tree from every entry, keeps accepted leaf hashes,
+  and changes nothing on any refusal.
+- `opifex catalog root-sign | add | yank | head | sync | list`, working on folders (network
+  fetch is C4).
+- Checked: 6 unit tests (sync across bundles, yank, publishing refusals, expired head, wrong
+  head key, rewritten history, a forged release under a stolen catalog key, root rotation
+  needing 2 of the old keys).
+- Real keys: waits for Shankar's key ceremony (three hardware tokens for root).
+
+### 14.3 C2 as built (2026-11-17)
+
+- `opifexd` (`src/bin/opifexd.rs`, the work in `src/daemon.rs`): root, unjailed like
+  portcullisd for now, no network; one JSON request per line on
+  `/atrium/sockets/opifex/opifex.sock`. Anyone may ask `Installed`, `Describe` and `Search`
+  (answered from the local catalog); `Install` (newest catalog release), `InstallLocal`
+  (side-load of a folder or `.insula`), `Uninstall`, `Rollback` and `Sync` are root's until
+  the install sheet (C3) carries a person's approval.
+- `opifex-check`: started per archive with the bytes on stdin; chroots into an empty folder
+  owned by `_opifex` (65041), drops to that uid, unpacks there. opifexd then checks the
+  manifest is the catalog's, the signature (against the catalog signer's key for catalog
+  installs, the side-load list otherwise) and every file against the signed index while
+  copying into its own staging, and swaps it in.
+- The `.insula` archive is version 2 (`src/archive.rs`): adds folders and in-tree links to
+  INSB v1, which layers need; deterministic; `opifex archive <dir> <out>` writes one.
+- Catalog installs must carry their own library closure (no install-time resolving); the
+  archive must match the catalog's hash and size (a mismatch is deleted). Downloading is C4:
+  until then archives are placed in `/var/db/atrium/opifex/dl/<sha256>.insula`.
+- The installed record `/var/db/atrium/opifex/installed.toml` (id, version, kind, publisher
+  key id, source, archive hash, content hash, who, when).
+- CLI through opifexd: `opifex describe | search | installed | get | side-load | remove | sync`.
+- Launch trust: portcullisd still checks `/etc/atrium/publishers`, so the platform key must
+  be listed there too until launch reads the installed record (C5).
+- Checked: host tests (archive round trip and refusals; daemon: sync, describe, search,
+  person refused, catalog install, update, rollback, uninstall, missing and wrong archive,
+  untrusted and trusted side-load, garbage archive). VM gate `scripts/vm-opifex-c2-check.sh`.
 
 ## 15. Decisions, with recommendations
 

@@ -427,6 +427,13 @@ the endpoint, and arcad releases the card's *effect* only to that endpoint's cou
 
 - **Apps** with `identity.certificate` (§13) get "sign this digest with a certificate the
   user picks" for document signing (PDF, email S/MIME), with a chooser and a PIN every time.
+- **Mail (built, 2026-11-17)**: `CertPurpose::MailSign { from }`. Until the
+  `identity.certificate` entitlement exists, the apps that may ask are named in
+  `SIGILLUM_MAIL_SIGNERS` (`app_id publisher-hex`, `;` between; unset, none). `from` must be
+  a real address; the sheet says "*app* asks your token to sign a message from *from*". The
+  app picks with `ChooseCertificate`, then sends `SignWithCertificate` with the digest of the
+  CMS signed attributes; sigillumd checks the token's signature as for TLS. The web broker
+  and Arca can't ask for mail signing, and Mail can't ask for TLS.
 - **SSH** with a PIV key later goes through Arca's SSH agent (A5) to Sigillum.
 - **Disk or login with a smartcard** (PIV-based login, as enterprises do) is out of scope
   until someone asks; §12 covers the FIDO2 second factor instead.

@@ -702,6 +702,7 @@ dependencies = [
  "atrium-links",
  "atrium-types",
  "hex",
+ "portcullis-peer",
  "portcullis-toml",
  "serde",
  "sha2",

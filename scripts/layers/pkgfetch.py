@@ -107,6 +107,8 @@ def main():
         i = 0
         while i < len(want):
             for dep in sorted(pk[want[i]].get("deps", {})):
+                if any(re.search(x, dep) for x in a.exclude):
+                    continue  # left out on purpose, as dependency too
                 if dep not in want:
                     if dep not in pk:
                         raise SystemExit(f"pkgfetch: {want[i]} needs {dep}, not in the catalogue")

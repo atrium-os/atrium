@@ -19,6 +19,10 @@
 # one app that may run WebAuthn for any RP ID; set it here once Navigator's
 # publisher key is known. Unset, apps get only their private RP IDs.
 #
+# SIGILLUM_MAIL_SIGNERS names the mail apps (`app_id publisher-hex`, `;`
+# between) that may have mail signed with a token certificate (S/MIME,
+# CertPurpose::MailSign); Mail is org.atrium.mail. Unset, none may.
+#
 # REQUIRES (scripts/sigillum-service.sh does all of it):
 #   1. The _sigillum (65028), _sigillum-dev (65029), _sigillum-ui (65030)
 #      system users, in jaild.policy's allowed_system_uids.

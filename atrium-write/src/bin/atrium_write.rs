@@ -558,12 +558,12 @@ fn main() {
                 (Some(e), Some(token)) => {
                     let name = run.write.doc.borrow().name.clone();
                     let filter = match what {
-                        Asking::Open => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a document".into() },
-                        Asking::Compare => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with an earlier version", stem_of(&name)) },
-                        Asking::Merge => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Merge a reviewed copy into “{}”", stem_of(&name)) },
-                        Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into() },
-                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)) },
-                        Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)) },
+                        Asking::Open => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a document".into(), name: String::new(), origin: String::new() },
+                        Asking::Compare => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with an earlier version", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::Merge => Filter { kind: Kind::File, extensions: ["owrite", "docx", "odt", "txt", "md", "text"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Merge a reviewed copy into “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::Picture => Filter { kind: Kind::File, extensions: ["png", "jpg", "jpeg", "gif", "webp"].map(String::from).to_vec(), multiple: false, write: false, title: "Insert a picture".into(), name: String::new(), origin: String::new() },
+                        Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
+                        Asking::ExportPdf => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to put “{}.pdf”", stem_of(&name)), name: String::new(), origin: String::new() },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {

@@ -133,6 +133,19 @@ pub struct Summary {
     pub unknown_charset: bool,
     /// Something was cut by a soft limit.
     pub truncated: bool,
+    /// The first `multipart/signed` with an S/MIME signature.
+    pub signed: Option<Signed>,
+    /// The message is S/MIME encrypted (enveloped data at the top).
+    pub encrypted: bool,
+}
+
+/// Where an S/MIME detached signature is.
+#[derive(Debug, Clone)]
+pub struct Signed {
+    /// Byte range of the signed entity (its headers and body) in the raw message.
+    pub content: (usize, usize),
+    /// The signature part's path.
+    pub signature: String,
 }
 
 /// Parses one message.

@@ -25,6 +25,7 @@
 pub mod anim;
 pub mod app;
 pub mod clipboard;
+pub mod code;
 pub mod color;
 pub mod embed;
 pub mod event;

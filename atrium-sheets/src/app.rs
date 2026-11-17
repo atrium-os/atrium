@@ -67,7 +67,64 @@ pub enum Cmd {
     FilterAll(bool),
     FilterApply,
     FilterCancel,
+    /// The conditional-format panel.
+    Cond(CondCmd),
+    /// The pivot field list.
+    Pivot(PivotCmd),
 }
+
+/// What the pivot field list asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PivotCmd {
+    /// Source field `f` picked.
+    Pick(u32),
+    /// The picked field to an area, or out of the pivot.
+    To(Option<crate::pivotpane::Area>),
+    Earlier,
+    Later,
+    /// Value field `k` summed by [`Agg::ALL`](officina_grid::pivot::Agg::ALL)`[i]`.
+    Agg(usize, usize),
+    Totals(crate::pivotpane::Totals),
+    Close,
+}
+
+/// The pivot field list's width, at the window's right over the grid.
+pub const PIVOT_W: f32 = 340.0;
+/// A field's row in it.
+pub const PIVOT_ROW_H: f32 = 28.0;
+/// Value fields whose summary the pane offers to change.
+pub const PIVOT_AGG_ROWS: usize = 4;
+const AGG_NAMES: [&str; 11] = ["Sum", "Count", "Average", "Max", "Min", "Product", "Count Numbers", "StdDev", "StdDevp", "Var", "Varp"];
+
+/// What the conditional-format panel asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CondCmd {
+    /// Row `i` of the rules over the selection picked.
+    Pick(usize),
+    New,
+    Edit,
+    Delete,
+    Up,
+    Down,
+    Close,
+    /// The rule's kind ([`crate::condfmt::KINDS`]).
+    Kind(usize),
+    /// Its comparison, scale, colour or set ([`crate::condfmt::choices`]).
+    Choice(usize),
+    /// Its look ([`crate::condfmt::LOOKS`]).
+    Look(usize),
+    Reverse,
+    IconOnly,
+    Stop,
+    Save,
+    /// Back to the list without saving.
+    Back,
+}
+
+/// The conditional-format panel's width, at the window's right over the grid.
+pub const COND_W: f32 = 360.0;
+/// A rule's row in its list.
+pub const COND_ROW_H: f32 = 44.0;
 
 /// The value list's width, at the window's right over the grid.
 pub const FILTER_W: f32 = 300.0;
@@ -159,13 +216,24 @@ pub struct Sheets {
     pub filter_scroll: Mutable<ScrollState>,
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
+    pub cond: Mutable<crate::condfmt::CondPanel>,
+    /// Its Apply To field and the rule's two value fields.
+    pub cond_range: Mutable<TextEdit>,
+    pub cond_a: Mutable<TextEdit>,
+    pub cond_b: Mutable<TextEdit>,
+    pub cond_kind_menu: Mutable<MenuState>,
+    pub cond_choice_menu: Mutable<MenuState>,
+    pub cond_look_menu: Mutable<MenuState>,
+    pub pivot_pane: Mutable<crate::pivotpane::PivotPane>,
+    pub pivot_scroll: Mutable<ScrollState>,
+    pub pivot_agg_menus: Rc<Vec<Mutable<MenuState>>>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -221,6 +289,169 @@ impl Sheets {
         let every = keep.len() == p.values.len();
         crate::data::keep_values(&mut self.doc.borrow_mut(), p.col, keep, every);
         self.filter.set(FilterPanel::default());
+        self.changed();
+    }
+
+    /// Opens the field list of the pivot at the cursor, or says why not.
+    pub fn open_pivot_pane(&self) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let here = {
+            let d = self.doc.borrow();
+            crate::pivotpane::pivot_here(&d.wb, d.sheet, r, c)
+        };
+        match here {
+            Some(i) => {
+                self.filter.set(FilterPanel::default());
+                self.cond.set(crate::condfmt::CondPanel::default());
+                self.pivot_scroll.set(ScrollState::default());
+                self.pivot_pane.set(crate::pivotpane::PivotPane { open: true, pivot: i, picked: None, error: String::new() });
+            }
+            None => self.doc.borrow_mut().status = "Put the cursor in a pivot table or its source data first.".into(),
+        }
+        self.changed();
+    }
+
+    /// Runs a press in the pivot field list.
+    pub fn pivot_cmd(&self, c: PivotCmd) {
+        use crate::pivotpane as pp;
+        let mut p = self.pivot_pane.get_cloned();
+        if !p.open {
+            return;
+        }
+        let i = p.pivot;
+        let r = {
+            let mut d = self.doc.borrow_mut();
+            match c {
+                PivotCmd::Pick(f) => {
+                    p.picked = Some(f);
+                    Ok(())
+                }
+                PivotCmd::To(a) => p.picked.map_or(Ok(()), |f| pp::place(&mut d, i, f, a)),
+                PivotCmd::Earlier | PivotCmd::Later => p.picked.map_or(Ok(()), |f| pp::shift(&mut d, i, f, c == PivotCmd::Earlier)),
+                PivotCmd::Agg(k, a) => pp::set_agg(&mut d, i, k, officina_grid::pivot::Agg::ALL[a.min(10)]),
+                PivotCmd::Totals(t) => pp::toggle(&mut d, i, t),
+                PivotCmd::Close => {
+                    p = pp::PivotPane::default();
+                    Ok(())
+                }
+            }
+        };
+        p.error = r.err().unwrap_or_default();
+        self.pivot_pane.set(p);
+        self.changed();
+    }
+
+    /// Opens the conditional-format panel on the selection's rules.
+    pub fn open_cond(&self) {
+        let sel = self.grid.get_cloned().selection();
+        let sheet = self.doc.borrow().sheet;
+        let sel = officina_grid::Rect { sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+        let any = !crate::condfmt::entries(&self.doc.borrow().wb, sel).is_empty();
+        self.filter.set(FilterPanel::default());
+        self.pivot_pane.set(crate::pivotpane::PivotPane::default());
+        self.cond.set(crate::condfmt::CondPanel { open: true, sel: Some(sel), picked: any.then_some(0), editor: None, error: String::new() });
+        if !any {
+            // Nothing here yet: straight to a new rule.
+            self.cond_cmd(CondCmd::New);
+        }
+        self.changed();
+    }
+
+    fn cond_fields(&self, range: &str, a: &str, b: &str) {
+        self.cond_range.set(TextEdit::new(range));
+        self.cond_a.set(TextEdit::new(a));
+        self.cond_b.set(TextEdit::new(b));
+    }
+
+    /// Runs a press in the conditional-format panel.
+    pub fn cond_cmd(&self, c: CondCmd) {
+        use crate::condfmt as cf;
+        let mut p = self.cond.get_cloned();
+        let Some(sel) = p.sel else { return };
+        let rows = cf::entries(&self.doc.borrow().wb, sel);
+        p.error.clear();
+        match c {
+            CondCmd::Pick(i) => p.picked = (i < rows.len()).then_some(i),
+            CondCmd::New => {
+                let (e, range) = cf::fresh(sel);
+                self.cond_fields(&range, "", "");
+                p.editor = Some(e);
+            }
+            CondCmd::Edit => {
+                if let Some(&(fi, ri)) = p.picked.and_then(|i| rows.get(i)) {
+                    if let Some((e, range, a, b)) = cf::load(&self.doc.borrow().wb, fi, ri) {
+                        self.cond_fields(&range, &a, &b);
+                        p.editor = Some(e);
+                    }
+                }
+            }
+            CondCmd::Delete => {
+                if let Some(&(fi, ri)) = p.picked.and_then(|i| rows.get(i)) {
+                    cf::delete(&mut self.doc.borrow_mut(), fi, ri);
+                    let n = cf::entries(&self.doc.borrow().wb, sel).len();
+                    p.picked = p.picked.map(|i| i.min(n.saturating_sub(1))).filter(|_| n > 0);
+                }
+            }
+            CondCmd::Up | CondCmd::Down => {
+                if let Some(i) = p.picked {
+                    if let Some(j) = cf::shift(&mut self.doc.borrow_mut(), sel, i, c == CondCmd::Up) {
+                        p.picked = Some(j);
+                    }
+                }
+            }
+            CondCmd::Close => p = cf::CondPanel::default(),
+            CondCmd::Back => p.editor = None,
+            CondCmd::Kind(k) => {
+                if let Some(e) = p.editor.as_mut() {
+                    if e.kind != k.min(cf::KINDS.len() - 1) {
+                        e.kind = k.min(cf::KINDS.len() - 1);
+                        e.choice = 0;
+                        e.orig = None;
+                        if e.look >= cf::LOOKS.len() {
+                            e.look = 0;
+                        }
+                    }
+                }
+            }
+            CondCmd::Choice(i) => {
+                if let Some(e) = p.editor.as_mut() {
+                    e.choice = i;
+                }
+            }
+            CondCmd::Look(i) => {
+                if let Some(e) = p.editor.as_mut() {
+                    e.look = i.min(cf::LOOKS.len());
+                }
+            }
+            CondCmd::Reverse | CondCmd::IconOnly | CondCmd::Stop => {
+                if let Some(e) = p.editor.as_mut() {
+                    let f = match c {
+                        CondCmd::Reverse => &mut e.reverse,
+                        CondCmd::IconOnly => &mut e.icon_only,
+                        _ => &mut e.stop,
+                    };
+                    *f = !*f;
+                }
+            }
+            CondCmd::Save => {
+                if let Some(e) = p.editor.clone() {
+                    let (range, a, b) = (self.cond_range.get_cloned().text().to_string(), self.cond_a.get_cloned().text().to_string(), self.cond_b.get_cloned().text().to_string());
+                    let r = cf::save(&mut self.doc.borrow_mut(), &e, &range, &a, &b);
+                    match r {
+                        Ok(()) => {
+                            p.editor = None;
+                            let rows = cf::entries(&self.doc.borrow().wb, sel);
+                            p.picked = match e.editing {
+                                Some(x) => rows.iter().position(|&y| y == x),
+                                None => rows.iter().position(|&y| y == (0, 0)),
+                            };
+                        }
+                        Err(m) => p.error = m,
+                    }
+                }
+            }
+        }
+        self.cond.set(p);
         self.changed();
     }
 
@@ -553,6 +784,225 @@ impl View for Sheets {
             Button::primary("Apply").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::FilterApply)).render(ctx);
         }
 
+        // The conditional-format panel, at the right over the grid.
+        let cp = self.cond.get_cloned();
+        if let (true, false, Some(sel)) = (cp.open, pb.open, cp.sel) {
+            use crate::condfmt as cf;
+            let (x0, y0) = ((w - COND_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(200.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, COND_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            let push = |c: CondCmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(Cmd::Cond(c))
+            };
+            let label = |ctx: &mut Ctx, y: f32, s: &str| {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y, COND_W - 24.0, 16.0), content: s.into(), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Semibold, color: t.text_secondary() } });
+            };
+            let fw = COND_W - 24.0;
+            let by = y0 + ph - 48.0;
+            match &cp.editor {
+                None => {
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: "Conditional Formatting".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 32.0, fw, 16.0), content: format!("Rules over {}, first applied first", cf::rect_text(&sel)), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+                    let d = self.doc.borrow();
+                    let rows = cf::entries(&d.wb, sel);
+                    let ly = y0 + 58.0;
+                    let room = ((by - 96.0 - ly) / COND_ROW_H).floor().max(1.0) as usize;
+                    // Keep the picked row in view.
+                    let first = cp.picked.map_or(0, |p| (p + 1).saturating_sub(room));
+                    for (k, &(fi, ri)) in rows.iter().enumerate().skip(first).take(room) {
+                        let f = &d.wb.cond_formats()[fi];
+                        let y = ly + (k - first) as f32 * COND_ROW_H;
+                        let on = cp.picked == Some(k);
+                        let hit = ctx.add(Node::Rect { rect: Rect::new(x0 + 6.0, y + 1.0, COND_W - 12.0, COND_ROW_H - 2.0), fill: if on { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                        ctx.on_click(hit, push(CondCmd::Pick(k)));
+                        ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 4.0, COND_W - 28.0, 18.0), content: cf::describe(&d.wb, f, &f.rules[ri]), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+                        ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 23.0, COND_W - 28.0, 16.0), content: cf::ranges_text(&f.ranges).chars().take(60).collect(), style: st(type_size::XS, Weight::Regular, t.text_tertiary()) });
+                    }
+                    if rows.is_empty() {
+                        ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, ly + 8.0, fw, 18.0), content: "No rules here yet.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                    } else if rows.len() > room {
+                        ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, by - 100.0, fw, 16.0), content: format!("{} rules; move through them with Up and Down.", rows.len()), style: st(type_size::XS, Weight::Regular, t.text_tertiary()) });
+                    }
+                    drop(d);
+                    let picked = cp.picked.is_some();
+                    let ry = by - 80.0;
+                    ctx.add(Node::Rect { rect: Rect::new(x0, ry - 8.0, COND_W, 1.0), fill: t.border_default(), radius: 0.0 });
+                    Button::secondary("New Rule…").at(x0 + 12.0, ry).width(104.0).on_click(push(CondCmd::New)).render(ctx);
+                    if picked {
+                        Button::secondary("Edit…").at(x0 + 124.0, ry).width(72.0).on_click(push(CondCmd::Edit)).render(ctx);
+                        Button::secondary("Delete").at(x0 + 204.0, ry).width(72.0).on_click(push(CondCmd::Delete)).render(ctx);
+                        Button::secondary("Up").at(x0 + 12.0, ry + 40.0).width(56.0).on_click(push(CondCmd::Up)).render(ctx);
+                        Button::secondary("Down").at(x0 + 76.0, ry + 40.0).width(64.0).on_click(push(CondCmd::Down)).render(ctx);
+                    }
+                    Button::primary("Done").at(x0 + COND_W - 84.0, by).width(72.0).on_click(push(CondCmd::Close)).render(ctx);
+                }
+                Some(e) => {
+                    let title = if e.editing.is_some() { "Change Rule" } else { "New Rule" };
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: title.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+                    let mut y = y0 + 40.0;
+                    label(ctx, y, "Apply to");
+                    TextField::new(self.cond_range.clone()).placeholder("e.g. B2:D20").at(x0 + 12.0, y + 18.0).width(fw).render(ctx);
+                    y += 60.0;
+                    label(ctx, y, "Format cells by");
+                    let kinds: Vec<pergola::widgets::MenuItem> = cf::KINDS.iter().enumerate().map(|(i, k)| pergola::widgets::MenuItem::new(*k).radio(i == e.kind)).collect();
+                    let cmds = self.cmds.clone();
+                    MenuButton::new(cf::KINDS[e.kind].to_string(), self.cond_kind_menu.clone(), kinds, move |i| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Kind(i)))).at(x0 + 12.0, y + 18.0).width(fw).render(ctx);
+                    y += 60.0;
+                    let ch = cf::choices(e.kind);
+                    if !ch.is_empty() {
+                        let mut items: Vec<pergola::widgets::MenuItem> = ch.iter().enumerate().map(|(i, c)| pergola::widgets::MenuItem::new(c.clone()).radio(i == e.choice)).collect();
+                        if e.choice >= ch.len() {
+                            items.push(pergola::widgets::MenuItem::new("As it is").radio(true));
+                        }
+                        let now = ch.get(e.choice).cloned().unwrap_or_else(|| "As it is".into());
+                        let cmds = self.cmds.clone();
+                        MenuButton::new(now, self.cond_choice_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Choice(i)))).at(x0 + 12.0, y).width(fw).render(ctx);
+                        y += 42.0;
+                    }
+                    if let Some(ph_a) = cf::field_a(e.kind) {
+                        let between = e.kind == 0 && e.choice < 2;
+                        let aw = if between { (fw - 40.0) / 2.0 } else { fw };
+                        let cmds = self.cmds.clone();
+                        TextField::new(self.cond_a.clone()).placeholder(ph_a).at(x0 + 12.0, y).width(aw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Save))).render(ctx);
+                        if between {
+                            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0 + aw + 8.0, y + 8.0, 24.0, 18.0), content: "and".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                            let cmds = self.cmds.clone();
+                            TextField::new(self.cond_b.clone()).placeholder("Value").at(x0 + 12.0 + aw + 40.0, y).width(aw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Save))).render(ctx);
+                        }
+                        y += 42.0;
+                    }
+                    if e.kind == 10 {
+                        let cmds = self.cmds.clone();
+                        pergola::widgets::Checkbox::new(Mutable::new(if e.reverse { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), "Reverse icon order").at(x0 + 12.0, y).on_change(move |_| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Reverse))).render(ctx);
+                        let cmds = self.cmds.clone();
+                        pergola::widgets::Checkbox::new(Mutable::new(if e.icon_only { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), "Show icon only").at(x0 + 12.0, y + 28.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::IconOnly))).render(ctx);
+                        y += 60.0;
+                    }
+                    if cf::has_look(e.kind) {
+                        label(ctx, y, "Look");
+                        let mut items: Vec<pergola::widgets::MenuItem> = cf::LOOKS.iter().enumerate().map(|(i, l)| pergola::widgets::MenuItem::new(l.0).radio(i == e.look)).collect();
+                        if e.look >= cf::LOOKS.len() {
+                            items.push(pergola::widgets::MenuItem::new("As it is").radio(true));
+                        }
+                        let now = cf::LOOKS.get(e.look).map_or("As it is", |l| l.0).to_string();
+                        let cmds = self.cmds.clone();
+                        MenuButton::new(now, self.cond_look_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Look(i)))).at(x0 + 12.0, y + 18.0).width(fw).render(ctx);
+                        if let Some(&(_, fill, color, bold)) = cf::LOOKS.get(e.look) {
+                            // A sample of the look.
+                            let sy = y + 62.0;
+                            let bg = fill.map_or(t.bg_canvas(), crate::source::rgb);
+                            ctx.add(Node::Rect { rect: Rect::new(x0 + 12.0, sy, 120.0, 24.0), fill: bg, radius: 2.0 });
+                            let fg = color.map_or(t.text_primary(), crate::source::rgb);
+                            ctx.add(Node::Text { rect: Rect::new(x0 + 20.0, sy + 4.0, 104.0, 16.0), content: "AaBbCc 123".into(), style: st(type_size::SM, if bold { Weight::Bold } else { Weight::Regular }, fg) });
+                            y += 34.0;
+                        }
+                        y += 60.0;
+                    }
+                    let cmds = self.cmds.clone();
+                    pergola::widgets::Checkbox::new(Mutable::new(if e.stop { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), "Stop if true (later rules skip these cells)").at(x0 + 12.0, y).on_change(move |_| cmds.lock().unwrap().push(Cmd::Cond(CondCmd::Stop))).render(ctx);
+                    y += 34.0;
+                    if !cp.error.is_empty() {
+                        ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y, fw, 36.0), content: cp.error.clone(), style: st(type_size::SM, Weight::Regular, t.danger_fg()) });
+                    }
+                    ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, COND_W, 1.0), fill: t.border_default(), radius: 0.0 });
+                    Button::secondary("Cancel").at(x0 + COND_W - 164.0, by).width(72.0).on_click(push(CondCmd::Back)).render(ctx);
+                    Button::primary("Save").at(x0 + COND_W - 84.0, by).width(72.0).on_click(push(CondCmd::Save)).render(ctx);
+                }
+            }
+        }
+
+        // The pivot field list, at the right over the grid.
+        let pv = self.pivot_pane.get_cloned();
+        let pivot = pv.open.then(|| self.doc.borrow().wb.pivots().get(pv.pivot).cloned()).flatten();
+        if let (Some(piv), false) = (pivot, pb.open) {
+            use crate::pivotpane as pp;
+            let (x0, y0) = ((w - PIVOT_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(200.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, PIVOT_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            let push = |c: PivotCmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(Cmd::Pivot(c))
+            };
+            let fw = PIVOT_W - 24.0;
+            let (fields, lines, captions) = {
+                let d = self.doc.borrow();
+                let lines: Vec<String> = pp::Area::ALL.iter().map(|a| pp::area_line(&d.wb, &piv, *a)).collect();
+                let caps: Vec<String> = piv.data.iter().map(|x| d.wb.data_caption(&piv, x)).collect();
+                (pp::fields(&d.wb, &piv), lines, caps)
+            };
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: format!("“{}” Fields", piv.name), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 32.0, fw, 16.0), content: "Pick a field, then where it goes.".into(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            let ly = y0 + 56.0;
+            let n = fields.len();
+            let lh = (n as f32 * PIVOT_ROW_H).min((ph * 0.35).max(PIVOT_ROW_H * 3.0)).max(PIVOT_ROW_H);
+            let (rows, cmds, picked) = (Rc::new(fields), self.cmds.clone(), pv.picked);
+            pergola::widgets::VirtualList::new(self.pivot_scroll.clone(), Rect::new(x0 + 1.0, ly, PIVOT_W - 1.0, lh), n, PIVOT_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, PIVOT_W - 1.0, PIVOT_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let (name, area) = &rows[k];
+                let on = picked == Some(k as u32);
+                let hit = ctx.add(Node::Rect { rect: Rect::new(6.0, 1.0, PIVOT_W - 13.0, PIVOT_ROW_H - 2.0), fill: if on { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                let cmds = cmds.clone();
+                let f = k as u32;
+                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Pick(f))));
+                let tx = TextStyle { family: font::SANS.into(), size: type_size::SM, weight: if area.is_some() { Weight::Semibold } else { Weight::Regular }, color: t.text_primary() };
+                ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 5.0, PIVOT_W - 110.0, 18.0), content: name.chars().take(40).collect(), style: tx });
+                if let Some(a) = area {
+                    ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(PIVOT_W - 96.0, 6.0, 80.0, 16.0), content: a.name().into(), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() } });
+                }
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0xF118)
+            .emit(ctx);
+            let mut y = ly + lh + 10.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, y - 5.0, PIVOT_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            if pv.picked.is_some() {
+                let mut x = x0 + 12.0;
+                for a in pp::Area::ALL {
+                    Button::secondary(a.name()).at(x, y).width(74.0).on_click(push(PivotCmd::To(Some(a)))).render(ctx);
+                    x += 80.0;
+                }
+                Button::secondary("Remove").at(x0 + 12.0, y + 38.0).width(84.0).on_click(push(PivotCmd::To(None))).render(ctx);
+                Button::secondary("Earlier").at(x0 + 104.0, y + 38.0).width(76.0).on_click(push(PivotCmd::Earlier)).render(ctx);
+                Button::secondary("Later").at(x0 + 188.0, y + 38.0).width(68.0).on_click(push(PivotCmd::Later)).render(ctx);
+            } else {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 8.0, fw, 18.0), content: "No field picked.".into(), style: st(type_size::SM, Weight::Regular, t.text_tertiary()) });
+            }
+            y += 84.0;
+            for l in &lines {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y, fw, 16.0), content: l.chars().take(70).collect(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+                y += 18.0;
+            }
+            y += 6.0;
+            for (k, cap) in captions.iter().enumerate().take(PIVOT_AGG_ROWS) {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 8.0, fw - 132.0, 18.0), content: cap.chars().take(30).collect(), style: st(type_size::SM, Weight::Regular, t.text_primary()) });
+                let agg = piv.data[k].agg;
+                let items: Vec<pergola::widgets::MenuItem> = officina_grid::pivot::Agg::ALL.iter().zip(AGG_NAMES).map(|(a, n)| pergola::widgets::MenuItem::new(n).radio(*a == agg)).collect();
+                let now = officina_grid::pivot::Agg::ALL.iter().position(|a| *a == agg).map_or("Sum", |i| AGG_NAMES[i]).to_string();
+                let cmds = self.cmds.clone();
+                MenuButton::new(now, self.pivot_agg_menus[k].clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Agg(k, i)))).at(x0 + PIVOT_W - 132.0, y).width(120.0).render(ctx);
+                y += 38.0;
+            }
+            for (label, on, which) in [("Grand total row", piv.grand_row, pp::Totals::GrandRow), ("Grand total column", piv.grand_col, pp::Totals::GrandCol), ("Subtotals", piv.subtotals, pp::Totals::Subtotals)] {
+                let cmds = self.cmds.clone();
+                pergola::widgets::Checkbox::new(Mutable::new(if on { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), label).at(x0 + 12.0, y).on_change(move |_| cmds.lock().unwrap().push(Cmd::Pivot(PivotCmd::Totals(which)))).render(ctx);
+                y += 28.0;
+            }
+            if !pv.error.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y + 4.0, fw, 36.0), content: pv.error.clone(), style: st(type_size::SM, Weight::Regular, t.danger_fg()) });
+            }
+            let by = y0 + ph - 48.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, PIVOT_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            Button::primary("Done").at(x0 + PIVOT_W - 84.0, by).width(72.0).on_click(push(PivotCmd::Close)).render(ctx);
+        }
+
         // Closing with unsaved changes: save them, drop them, or stay.
         if self.closing.get() {
             let (y, bh) = (TOOLBAR_H, 48.0);
@@ -591,6 +1041,22 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::CondFormats) => {
+                    self.open_cond();
+                    false
+                }
+                Cmd::Cond(c) => {
+                    self.cond_cmd(c);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::PivotFields) => {
+                    self.open_pivot_pane();
+                    false
+                }
+                Cmd::Pivot(c) => {
+                    self.pivot_cmd(c);
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::ChooseValues) => {
@@ -791,6 +1257,152 @@ mod tests {
         s.cmds.lock().unwrap().push(Cmd::FilterCancel);
         s.take_cmds();
         assert_eq!(hidden(&s), [1, 2, 4]);
+    }
+
+    #[test]
+    fn conditional_formats_are_made_in_the_panel() {
+        let (mut d, _) = Doc::from_csv("t.csv", b"Qty\n3\n10\n7\n1\n").unwrap();
+        d.wb.recalc();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let mut g = s.grid.get_cloned();
+        g.anchor = (1, 0);
+        g.cursor = (4, 0);
+        s.grid.set(g);
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: CondCmd| {
+            s.cmds.lock().unwrap().push(Cmd::Cond(c));
+            s.take_cmds();
+        };
+        // No rules yet: the panel opens on a new rule over the selection.
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::CondFormats));
+        s.take_cmds();
+        let p = s.cond.get_cloned();
+        assert!(p.open && p.editor.is_some());
+        assert_eq!(s.cond_range.get_cloned().text(), "A2:A5");
+        let t = texts();
+        for want in ["New Rule", "Format cells by", "Cell Value", "between", "Look", "Light Red Fill with Dark Red Text", "Save"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        // Greater than 5, green.
+        run(CondCmd::Choice(4));
+        run(CondCmd::Look(2));
+        s.cond_a.set(TextEdit::new("5"));
+        run(CondCmd::Save);
+        let p = s.cond.get_cloned();
+        assert!(p.editor.is_none(), "{}", p.error);
+        let fill = |r: u32| s.doc.borrow().wb.look(officina_grid::CellAddr::new(0, r, 0)).dxf.fill;
+        assert_eq!((fill(1), fill(2), fill(3), fill(4)), (None, Some(0xC6EFCE), Some(0xC6EFCE), None));
+        let t = texts();
+        assert!(t.iter().any(|x| x == "Cell value greater than 5"), "{t:?}");
+        // A data bar as a second rule, then the first rule changed to less than 5.
+        run(CondCmd::New);
+        run(CondCmd::Kind(9));
+        assert!(texts().iter().any(|x| x == "Blue"));
+        run(CondCmd::Choice(1));
+        run(CondCmd::Save);
+        assert_eq!(crate::condfmt::entries(&s.doc.borrow().wb, s.cond.get_cloned().sel.unwrap()).len(), 2);
+        assert!(s.doc.borrow().wb.look(officina_grid::CellAddr::new(0, 2, 0)).bar.is_some());
+        // A click on the second row picks it, and stays off the grid.
+        let mut app = App::new(s.clone());
+        app.tick();
+        let at = pergola::geom::Point::new(1200.0 - COND_W + 40.0, TOOLBAR_H + FORMULA_H + 58.0 + COND_ROW_H + 12.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        s.take_cmds();
+        assert_eq!(s.cond.get_cloned().picked, Some(1));
+        assert_eq!(s.grid.get_cloned().cursor, (4, 0));
+        run(CondCmd::Edit);
+        assert_eq!(s.cond_a.get_cloned().text(), "5");
+        run(CondCmd::Choice(5));
+        run(CondCmd::Save);
+        assert_eq!((fill(1), fill(2), fill(4)), (Some(0xC6EFCE), None, Some(0xC6EFCE)));
+        // A bad value says why and keeps the editor open.
+        run(CondCmd::Edit);
+        s.cond_a.set(TextEdit::new("=SUM("));
+        run(CondCmd::Save);
+        assert!(!s.cond.get_cloned().error.is_empty());
+        assert!(texts().contains(&s.cond.get_cloned().error));
+        run(CondCmd::Back);
+        // Up, delete, and each step undoes.
+        run(CondCmd::Up);
+        assert_eq!(s.cond.get_cloned().picked, Some(0));
+        assert!(matches!(s.doc.borrow().wb.cond_formats()[0].rules[0].kind, officina_grid::condfmt::RuleKind::CellIs { .. }));
+        run(CondCmd::Delete);
+        assert_eq!(s.doc.borrow().wb.cond_formats().len(), 1);
+        run(CondCmd::Close);
+        assert!(!s.cond.get_cloned().open);
+        for _ in 0..5 {
+            assert!(s.doc.borrow_mut().undo());
+        }
+        assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn the_pivot_field_list_moves_fields() {
+        use crate::pivotpane::{Area, Totals};
+        let (mut d, _) = Doc::from_csv("t.csv", b"Region,Product,Units\nNorth,Pear,3\nSouth,Fig,10\nNorth,Fig,7\n").unwrap();
+        d.wb.recalc();
+        crate::data::run(&mut d, CellRange::of((0, 0), (0, 0)), (0, 0), crate::data::DataCmd::InsertPivot);
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        // Away from any pivot it says why.
+        let mut g = s.grid.get_cloned();
+        g.cursor = (30, 30);
+        g.anchor = (30, 30);
+        s.grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::PivotFields));
+        assert!(!s.pivot_pane.get_cloned().open);
+        assert!(s.doc.borrow().status.contains("pivot table"));
+        let mut g = s.grid.get_cloned();
+        g.cursor = (1, 0);
+        g.anchor = (1, 0);
+        s.grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::PivotFields));
+        assert!(s.pivot_pane.get_cloned().open);
+        let t = texts();
+        for want in ["“PivotTable1” Fields", "Region", "Product", "Units", "Rows: Region", "Values: Sum of Units", "Sum", "Grand total row", "Done"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        // A click on Product's row picks it, and stays off the grid.
+        let mut app = App::new(s.clone());
+        app.tick();
+        let at = pergola::geom::Point::new(1200.0 - PIVOT_W + 40.0, TOOLBAR_H + FORMULA_H + 56.0 + PIVOT_ROW_H + 10.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        s.take_cmds();
+        assert_eq!(s.pivot_pane.get_cloned().picked, Some(1));
+        assert_eq!(s.grid.get_cloned().cursor, (1, 0));
+        run(Cmd::Pivot(PivotCmd::To(Some(Area::Columns))));
+        assert!(texts().iter().any(|x| x == "Columns: Product"));
+        run(Cmd::Pivot(PivotCmd::Agg(0, 2)));
+        assert!(texts().iter().any(|x| x == "Values: Average of Units"));
+        run(Cmd::Pivot(PivotCmd::Totals(Totals::Subtotals)));
+        assert!(!s.doc.borrow().wb.pivots()[0].subtotals);
+        // Emptying the pivot is refused in words.
+        for f in [0, 1, 2] {
+            run(Cmd::Pivot(PivotCmd::Pick(f)));
+            run(Cmd::Pivot(PivotCmd::To(None)));
+        }
+        let e = s.pivot_pane.get_cloned().error;
+        assert!(e.contains("at least one field") && texts().contains(&e), "{e}");
+        run(Cmd::Pivot(PivotCmd::Close));
+        assert!(!s.pivot_pane.get_cloned().open);
+        for _ in 0..5 {
+            assert!(s.doc.borrow_mut().undo());
+        }
+        assert_eq!(s.doc.borrow().wb.pivots()[0].cols.len(), 0);
     }
 
     #[test]
