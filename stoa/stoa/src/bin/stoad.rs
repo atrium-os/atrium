@@ -235,6 +235,7 @@ fn restore_sessions(reg: &Reg, path: &Path) {
                 sync: false,
                 last_sent: stoa_term::Grid::new(cols, rows),
                 restore: Some(ps),
+                pending_clip: None,
             }),
         });
         map.insert(name.clone(), state.clone());
@@ -406,7 +407,19 @@ impl Window {
                 (p.top + cr, p.left + cc)
             })
             .unwrap_or((0, 0));
-        stoa_term::compose_grid(cols, rows, &views, &vdivs, &hdivs, cursor)
+        let mut g = stoa_term::compose_grid(cols, rows, &views, &vdivs, &hdivs, cursor);
+        // The client keys, pastes and draws the cursor by the active pane's
+        // modes. With panes side by side, a click's cell isn't the pane's,
+        // so mouse reporting is off.
+        if let Some(p) = self.active() {
+            let pg = p.term.grid();
+            let mut modes = pg.modes();
+            if self.live_panes() > 1 {
+                modes &= !(stoa_term::mode::MOUSE_ANY | stoa_term::mode::MOUSE_SGR);
+            }
+            g.set_meta(modes, pg.title());
+        }
+        g
     }
 
     /// Recompute pane regions for a `cols`×`rows` window and resize each
@@ -496,6 +509,9 @@ struct Inner {
     /// A restored session's saved layout, rebuilt (shells respawned) on the
     /// first client datagram instead of a single lazy window-0 (S3a).
     restore: Option<PersistSession>,
+    /// Text the active window's program wrote to the clipboard (OSC 52),
+    /// sent once with the next grid-sync diff.
+    pending_clip: Option<String>,
 }
 
 impl Inner {
@@ -545,10 +561,15 @@ impl Inner {
         let addr = self.last_addr?;
         let (cols, rows) = (self.cols, self.rows);
         let grid = self.windows.get(self.active).filter(|w| w.alive)?.grid(cols, rows);
-        let mut diff = stoa_term::StateDiff::between(&self.last_sent, &grid);
-        if full {
-            diff.resized = Some((grid.cols(), grid.rows()));
-        }
+        let mut diff = if full {
+            // Against a fresh grid: the client resets to one first.
+            let mut d = stoa_term::StateDiff::between(&stoa_term::Grid::new(cols, rows), &grid);
+            d.resized = Some((grid.cols(), grid.rows()));
+            d
+        } else {
+            stoa_term::StateDiff::between(&self.last_sent, &grid)
+        };
+        diff.clipboard = self.pending_clip.take();
         if !full && diff.is_empty() && grid.cursor() == self.last_sent.cursor() {
             return None; // nothing to send
         }
@@ -879,6 +900,7 @@ fn adopt(reg: &Reg, name: &str, app: &str, pid: i32, procdesc: std::os::fd::Owne
                         sync: false,
                         last_sent: stoa_term::Grid::new(cols, rows),
                         restore: None,
+                        pending_clip: None,
                     }),
                 });
                 map.insert(name.to_string(), state.clone());
@@ -1040,6 +1062,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             sync: false,
             last_sent: stoa_term::Grid::new(80, 24),
             restore: None,
+            pending_clip: None,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -1655,9 +1678,14 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
         }
         let bytes = &buf[..n as usize];
         let mut cwd_changed = false;
+        let mut clip: Option<String> = None;
         let out = {
             let mut inner = state.inner.lock().unwrap();
             let (cols, rows) = (inner.cols, inner.rows);
+            // A raw-mode client whose terminal sees this pane's bytes as they
+            // are answers the program's queries itself; otherwise we do.
+            let streamed_raw = !inner.sync && inner.active == win_idx && inner.scroll == 0
+                && inner.windows.get(win_idx).map_or(false, |w| w.live_panes() <= 1);
             // Mirror every byte into THIS pane's grid (even when not active),
             // so a switch/split can paint its current screen.
             if let Some(w) = inner.windows.get_mut(win_idx) {
@@ -1668,7 +1696,18 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
                     let before = p.term.grid().cwd().map(str::to_string);
                     p.term.feed(bytes);
                     cwd_changed = p.term.grid().cwd().map(str::to_string) != before;
+                    // Answers to the program's queries (cursor position,
+                    // device attributes, ...) go back to it: editors wait
+                    // on them.
+                    let replies = p.term.take_replies();
+                    if !replies.is_empty() && !streamed_raw {
+                        write_all_fd(p.pty_fd, &replies);
+                    }
+                    clip = p.term.take_clipboard();
                 }
+            }
+            if clip.is_some() && inner.active == win_idx {
+                inner.pending_clip = clip;
             }
             // Stream only when this pane's window is active and not scrolled.
             if inner.active == win_idx && inner.scroll == 0 {

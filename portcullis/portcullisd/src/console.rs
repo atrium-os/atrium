@@ -27,9 +27,24 @@ pub const WORKSPACE_PREFIX: &str = "workspace/";
 /// What a console is on the document channel: `MIME; app=<id>`, the
 /// app the terminal may ask for more of (another window).
 pub const MIME: &str = "application/x-atrium-console";
-/// The console's terminal, as termcap capabilities (the toolbox's
-/// `termcap` file).
-const VT100: &str = "co#80:li#24:am:bs:cl=\\E[H\\E[J:cm=\\E[%i%d;%dH:ce=\\E[K:cd=\\E[J:up=\\E[A:do=^J:nd=\\E[C:le=^H:ho=\\E[H:so=\\E[7m:se=\\E[m:";
+/// The console's terminal (the Terminal, stoa-term), as the toolbox's
+/// `termcap` entry: xterm-256color's capabilities that stoa-term implements
+/// (dev-tools-plan.md M1). Kept under termcap's 1023-byte entry limit.
+const TERM_NAME: &str = "xterm-256color";
+const TERMCAP: &str = concat!(
+    "xterm-256color|atrium console:",
+    "am:bs:km:mi:ms:xn:co#80:li#24:it#8:Co#256:pa#32767:",
+    "AB=\\E[48;5;%dm:AF=\\E[38;5;%dm:AL=\\E[%dL:DC=\\E[%dP:DL=\\E[%dM:DO=\\E[%dB:IC=\\E[%d@:",
+    "LE=\\E[%dD:RI=\\E[%dC:UP=\\E[%dA:SF=\\E[%dS:SR=\\E[%dT:",
+    "al=\\E[L:cd=\\E[J:ce=\\E[K:cl=\\E[H\\E[2J:cm=\\E[%i%d;%dH:cs=\\E[%i%d;%dr:ct=\\E[3g:",
+    "dc=\\E[P:dl=\\E[M:do=^J:ec=\\E[%dX:ei=\\E[4l:ho=\\E[H:im=\\E[4h:le=^H:nd=\\E[C:up=\\E[A:",
+    "sf=^J:sr=\\EM:st=\\EH:ta=^I:cr=^M:sc=\\E7:rc=\\E8:",
+    "md=\\E[1m:me=\\E[m:mr=\\E[7m:mh=\\E[2m:so=\\E[7m:se=\\E[27m:us=\\E[4m:ue=\\E[24m:op=\\E[39;49m:",
+    "ti=\\E[?1049h:te=\\E[?1049l:vi=\\E[?25l:ve=\\E[?25h:ks=\\E[?1h\\E=:ke=\\E[?1l\\E>:",
+    "ku=\\EOA:kd=\\EOB:kr=\\EOC:kl=\\EOD:kh=\\EOH:@7=\\EOF:kb=^?:kD=\\E[3~:kI=\\E[2~:kN=\\E[6~:kP=\\E[5~:",
+    "k1=\\EOP:k2=\\EOQ:k3=\\EOR:k4=\\EOS:k5=\\E[15~:k6=\\E[17~:k7=\\E[18~:k8=\\E[19~:k9=\\E[20~:k;=\\E[21~:",
+    "ac=``aaffggiijjkkllmmnnooppqqrrssttuuvvwwxxyyzz{{||}}~~:as=\\E(0:ae=\\E(B:\n",
+);
 /// The crunched binary the tools are links to.
 const RESCUE: &str = "/rescue/rescue";
 
@@ -61,15 +76,16 @@ pub fn ensure_toolbox() -> io::Result<PathBuf> {
     // no database. Ours: the one entry, as termcap, and the base system's
     // terminfo entry when there is one.
     let tc = dir.join("termcap");
-    if !tc.exists() {
-        std::fs::write(&tc, format!("vt100|atrium console:{}\n", VT100))?;
-        std::fs::set_permissions(&tc, std::fs::Permissions::from_mode(0o444))?;
+    if std::fs::read_to_string(&tc).ok().as_deref() != Some(TERMCAP) {
+        let tmp = dir.join(".termcap.new");
+        std::fs::write(&tmp, TERMCAP)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
+        std::fs::rename(&tmp, &tc)?;
     }
-    let ti = dir.join("terminfo/v/vt100");
+    let ti = dir.join("terminfo/x").join(TERM_NAME);
     if !ti.exists() {
-        if let Some(src) = ["/usr/share/terminfo/v/vt100", "/usr/share/misc/terminfo/v/vt100"]
-            .iter().find(|p| Path::new(p).exists())
-        {
+        let src = [format!("/usr/share/terminfo/x/{TERM_NAME}"), format!("/usr/share/misc/terminfo/x/{TERM_NAME}")];
+        if let Some(src) = src.iter().find(|p| Path::new(p).exists()) {
             std::fs::create_dir_all(ti.parent().unwrap())?;
             std::fs::copy(src, &ti)?;
         }
@@ -198,7 +214,7 @@ pub fn spawn_raw(s: &Spec) -> io::Result<(OwnedFd, OwnedFd, i32)> {
     let argv = [c("sh")?, c("-i")?];
     let mut env = vec![
         c(&format!("HOME={}", s.home))?,
-        c("TERM=vt100")?,
+        c(&format!("TERM={TERM_NAME}"))?,
         c("ENV=")?,
     ];
     if ws {
