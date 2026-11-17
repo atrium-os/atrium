@@ -127,6 +127,10 @@ fn ppr_body(p: &ParaProps) -> String {
         }
         s += "</w:tabs>";
     }
+    // w:bidi comes before w:spacing in a w:pPr.
+    if let Some(v) = p.rtl {
+        s += &on("bidi", v);
+    }
     if p.space_before.is_some() || p.space_after.is_some() || p.line_spacing.is_some() {
         s += "<w:spacing";
         if let Some(v) = p.space_before {

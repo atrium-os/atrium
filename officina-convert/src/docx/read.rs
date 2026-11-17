@@ -229,10 +229,11 @@ fn ppr(e: &El, rep: &mut Report) -> ParaProps {
             }
             "w:keepNext" => p.keep_with_next = Some(on(x)),
             "w:keepLines" => p.keep_together = Some(on(x)),
+            "w:bidi" => p.rtl = Some(on(x)),
             "w:pageBreakBefore" => p.page_break_before = Some(on(x)),
             "w:widowControl" => p.widows = Some(on(x)),
             "w:outlineLvl" => p.outline_level = num(val(x)).filter(|v| (0..9).contains(v)).map(|v| v as u8 + 1),
-            "w:pStyle" | "w:numPr" | "w:sectPr" | "w:rPr" | "w:contextualSpacing" | "w:snapToGrid" | "w:suppressAutoHyphens" | "w:autoSpaceDE" | "w:autoSpaceDN" | "w:adjustRightInd" | "w:bidi" | "w:textAlignment" | "w:kinsoku" | "w:wordWrap" | "w:overflowPunct" | "w:topLinePunct" | "w:suppressLineNumbers" => {}
+            "w:pStyle" | "w:numPr" | "w:sectPr" | "w:rPr" | "w:contextualSpacing" | "w:snapToGrid" | "w:suppressAutoHyphens" | "w:autoSpaceDE" | "w:autoSpaceDN" | "w:adjustRightInd" | "w:textAlignment" | "w:kinsoku" | "w:wordWrap" | "w:overflowPunct" | "w:topLinePunct" | "w:suppressLineNumbers" => {}
             "w:tabs" => p.tabs = Some(tab_stops(x).0),
             "w:pBdr" => rep.note(Kind::Approximate, "paragraph borders (dropped)"),
             "w:shd" => rep.note(Kind::Approximate, "paragraph shading (dropped)"),
@@ -264,6 +265,7 @@ fn props_over(over: &ParaProps, under: &ParaProps) -> ParaProps {
         tabs: over.tabs.clone().or_else(|| under.tabs.clone()),
         toc: over.toc.or(under.toc),
         section: over.section.or(under.section),
+        rtl: over.rtl.or(under.rtl),
     }
 }
 

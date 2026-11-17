@@ -857,6 +857,9 @@ pub struct ParaProps {
     /// The paragraph starts a section with these settings (never from a
     /// style). On the first paragraph it sets the first section's columns.
     pub section: Option<Section>,
+    /// Right to left (`true`) or left to right; unset, the paragraph's first
+    /// strong character decides (UAX #9).
+    pub rtl: Option<bool>,
 }
 
 /// How a section begins.
@@ -1002,11 +1005,13 @@ pub struct ParaFormat {
     pub outline_level: Option<u8>,
     pub list: Option<ListRef>,
     pub tabs: Vec<TabStop>,
+    /// Direction; `None`: from the text.
+    pub rtl: Option<bool>,
 }
 
 impl Default for ParaFormat {
     fn default() -> Self {
-        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None, tabs: Vec::new() }
+        ParaFormat { align: Align::Start, indent_start: 0, indent_end: 0, first_line: 0, space_before: 0, space_after: 160, line_spacing: LineSpacing::Multiple(115), keep_with_next: false, keep_together: false, page_break_before: false, widows: true, outline_level: None, list: None, tabs: Vec::new(), rtl: None }
     }
 }
 
@@ -1018,6 +1023,9 @@ impl ParaFormat {
         set!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows);
         if p.outline_level.is_some() {
             self.outline_level = p.outline_level.filter(|l| (1..=9).contains(l));
+        }
+        if p.rtl.is_some() {
+            self.rtl = p.rtl;
         }
         if let Some(t) = &p.tabs {
             self.tabs = t.iter().take(MAX_TABS).copied().collect();

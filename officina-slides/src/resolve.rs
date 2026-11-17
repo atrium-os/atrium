@@ -153,7 +153,7 @@ pub fn para_over(top: &ParaProps, under: &ParaProps) -> ParaProps {
     macro_rules! take {
         ($($f:ident),*) => { $( if top.$f.is_some() { p.$f = top.$f.clone(); } )* };
     }
-    take!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows, outline_level, list, cell, rev, tabs, toc, section);
+    take!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows, outline_level, list, cell, rev, tabs, toc, section, rtl);
     p
 }
 

@@ -897,7 +897,20 @@ fn selection_rects(e: &mut Editor, a: Pos, b: Pos, first: usize, last: usize) ->
                 let (from, to) = (a.max(ls), b.min(le));
                 // A line is covered where the selection meets it; a paragraph's
                 // last line also when the selection runs on past its mark.
-                if from < to || (last_line && from == le && b > le) {
+                if !line.visual.is_empty() && (from < to || (last_line && from == le && b > le)) {
+                    // Right-to-left text in the line: the selected stretches
+                    // as drawn, and the paragraph mark at the line's end side.
+                    let text = e.text(s.block).to_string();
+                    for (x0, x1) in l.range_spans(li, from.at, to.at.max(from.at), &text) {
+                        out.push((pg, s.x + x0, y + line.skip, x1 - x0, line.height - line.skip));
+                    }
+                    if b > le && last_line {
+                        let (x0, x1) = if l.rtl { ((line.x - 320).max(0), line.x) } else { (line.x + line.width, (line.x + line.width + 320).min(width.max(line.x + line.width))) };
+                        if x1 > x0 {
+                            out.push((pg, s.x + x0, y + line.skip, x1 - x0, line.height - line.skip));
+                        }
+                    }
+                } else if from < to || (last_line && from == le && b > le) {
                     let x0 = if from > ls { e.x_in_line(s.block, &l, line, from.at) } else { line.x };
                     let x1 = if b > le {
                         let end = e.x_in_line(s.block, &l, line, line.end);

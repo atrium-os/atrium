@@ -14,11 +14,22 @@ use crate::layout::Glyph;
 /// when nothing in it is right to left, so the visual order is the logical
 /// one.
 pub fn levels(text: &str) -> Option<(Vec<u8>, bool)> {
+    levels_in(text, None)
+}
+
+/// [`levels`] in a paragraph whose direction is set (`Some(true)`: right
+/// to left, which always needs levels, even for text with no right-to-left
+/// letters, so its punctuation and numbers sit right).
+pub fn levels_in(text: &str, rtl: Option<bool>) -> Option<(Vec<u8>, bool)> {
     use unicode_bidi::BidiClass::{AL, AN, R, RLE, RLI, RLO};
-    if !text.chars().any(|c| matches!(unicode_bidi::bidi_class(c), R | AL | AN | RLE | RLO | RLI)) {
+    if rtl != Some(true) && !text.chars().any(|c| matches!(unicode_bidi::bidi_class(c), R | AL | AN | RLE | RLO | RLI)) {
         return None;
     }
-    let info = unicode_bidi::BidiInfo::new(text, None);
+    let base = rtl.map(|r| if r { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() });
+    let info = unicode_bidi::BidiInfo::new(text, base);
+    if text.is_empty() {
+        return Some((Vec::new(), rtl == Some(true)));
+    }
     let rtl = info.paragraphs.first().is_some_and(|p| p.level.is_rtl());
     Some((info.levels.iter().map(|l| l.number()).collect(), rtl))
 }

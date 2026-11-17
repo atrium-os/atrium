@@ -165,6 +165,9 @@ pub(crate) fn para_props(p: &ParaProps, tab_base: i32) -> String {
     if let Some(v) = p.keep_together {
         let _ = write!(s, r#" fo:keep-together="{}""#, if v { "always" } else { "auto" });
     }
+    if let Some(v) = p.rtl {
+        let _ = write!(s, r#" style:writing-mode="{}""#, if v { "rl-tb" } else { "lr-tb" });
+    }
     if let Some(v) = p.page_break_before {
         let _ = write!(s, r#" fo:break-before="{}""#, if v { "page" } else { "auto" });
     }

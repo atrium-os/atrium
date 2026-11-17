@@ -312,6 +312,9 @@ impl W<'_> {
                 Align::Justify => "just",
             });
         }
+        if let Some(v) = p.rtl {
+            let _ = write!(at, " rtl=\"{}\"", v as u8);
+        }
         let mut kids = String::new();
         match p.line_spacing {
             Some(LineSpacing::Multiple(m)) => {

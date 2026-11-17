@@ -101,10 +101,14 @@ Sans, Symbols, Symbols 2, Math and Serif.
   paragraph starts at the right edge (start indent and alignment mirrored),
   brackets at right-to-left levels are mirrored for shaping, and the caret
   and clicks follow the visual order (`ParaLayout::caret_x`, `hit_x`).
-  Left: a selection across mixed directions is one rectangle from caret to
-  caret, arrow keys move logically, and `.docx`/`.odt` paragraph direction
-  (`w:bidi`) is not read yet (direction comes from the first strong
-  character); explicit embedding controls work through UAX #9 itself.
+  Paragraph direction is a paragraph property (`ParaProps::rtl`; unset, the
+  first strong character decides), kept in the native file and read and
+  written as `w:bidi` (.docx), `style:writing-mode` (.odt) and `rtl`
+  (.pptx); LibreOffice keeps it both ways in both formats
+  (`officina-convert/examples/bidi_lo.rs`, 4/4). A selection across
+  directions highlights each stretch as drawn (`ParaLayout::range_spans`).
+  Left: arrow keys move in logical order; no command yet to set a
+  paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - CJK on demand, and colour emoji, wait on the package catalog and colour glyph
