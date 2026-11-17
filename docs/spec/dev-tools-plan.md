@@ -31,7 +31,7 @@ a frame must be looked at). Sizes are relative: **S** a day or less of thread wo
 | later | Command bundles; self-hosted Atrium build; Nuntius C ABI and libatrium level 1 calls | §4.7, §5.6, A7 | — | — |
 
 M0 goes first because it is a latent break: today's workspaces, the empty console
-and app consoles all run in jails whose syscall class has no `execve`, and they
+and app consoles all run in jails whose syscall class has no `fork` or `wait4`, and they
 work only because sysfil is in log mode (§2). M1 and M2 together give a usable
 terminal development setup quickly. M5–M7 come before Artifex because Artifex's
 New project and composition panel are built on them.
@@ -44,7 +44,8 @@ portcullisd generates name none: workspaces (`portcullisd/src/workspace.rs`, the
 `[capabilities] network` line), the empty console (`portcullisd/src/empty.rs:87`,
 `network = "none"`, so `app`). App consoles join the app's own jail
 (`console.rs`, `jail_attach`), whose class is the app's. None of `app`,
-`networked` has `execve` (jail-sysfil.md §5.1).
+`networked` has `fork`, `vfork` or `wait4`; only `terminal` adds them
+(`etc/jaild.policy.toml`), so a shell there can't start a command.
 
 **Work.**
 1. `etc/jaild.policy.toml`: a `develop` profile = `terminal` + `networked` +

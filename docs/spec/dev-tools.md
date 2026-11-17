@@ -70,7 +70,7 @@ Gaps found reading the code (2026-11-17):
    insists on root and `/var/db/pkg` is root's.
 2. **The workspace's syscall class is wrong for a build box.** Its manifest is
    generated with only `network`, so `sysfil_class` makes it `networked` (or `app`
-   with no network). Neither class has `execve`. Shells and compilers work today
+   with no network). Neither class has `fork`, `vfork` or `wait4` (only `terminal` adds them), so a shell can't start a command. Shells and compilers work today
    only because sysfil runs in log mode; switching to deny would break every
    workspace.
 3. **The Terminal can't draw full-screen programs.** `stoa-term` (the emulator
