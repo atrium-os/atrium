@@ -23,6 +23,7 @@
  * land alongside the xattr / GC implementations.
  */
 
+#include "tessera/crypt.h"
 #include "tessera/manifest.h"
 #include "tessera/codec.h"
 #include "tessera/error.h"
@@ -44,6 +45,10 @@ struct tessera_manifest_builder {
 	uint32_t                 entry_count;
 	uint64_t                 logical_size;
 	uint32_t                 hash_alg;   /* TESSERA_HASH_ALG_*, default SHA256 */
+	/* Sealed volumes (tessera-encryption.md §6.1): the manifest's own id
+	 * is keyed under K_id or a group's K_gid. */
+	int                      keyed;
+	uint8_t                  id_key[32];
 };
 
 static int
@@ -94,7 +99,23 @@ tessera_manifest_free(tessera_manifest_builder_t *b)
 {
 	if (b == NULL) return;
 	tessera_free(b->body);
+	memset(b->id_key, 0, sizeof b->id_key);
 	tessera_free(b);
+}
+
+int
+tessera_manifest_set_id_key(tessera_manifest_builder_t *b,
+                            const uint8_t key[32])
+{
+#ifdef TESSERA_STAND
+	(void)b; (void)key;
+	return TESSERA_ENOTIMPL;        /* the loader never writes */
+#else
+	if (b == NULL || key == NULL) return TESSERA_EINVAL;
+	memcpy(b->id_key, key, 32);
+	b->keyed = 1;
+	return TESSERA_OK;
+#endif
 }
 
 int
@@ -409,8 +430,14 @@ tessera_manifest_finalize(tessera_manifest_builder_t *b,
 	if (b->body_len > 0)
 		memcpy(out_buffer + HEADER_SIZE, b->body, b->body_len);
 
-	if (out_hash != NULL)
+	if (out_hash != NULL) {
+#ifndef TESSERA_STAND
+		if (b->keyed)
+			return tessera_keyed_id(b->hash_alg, b->id_key, out_buffer,
+			    total, out_hash);
+#endif
 		tessera_content_hash(b->hash_alg, out_buffer, total, out_hash);
+	}
 
 	return TESSERA_OK;
 }

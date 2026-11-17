@@ -30,8 +30,16 @@
 #include "tessera/journal.h"
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
+#include "tessera/seal.h"
 
 #include "tessera_compat.h"
+
+/* The loader opens only unsealed volumes and links no crypto. */
+#ifdef TESSERA_STAND
+#  define VOLUME_SEALING 0
+#else
+#  define VOLUME_SEALING 1
+#endif
 
 #define DEFAULT_JOURNAL_SECTORS 256u
 
@@ -40,6 +48,7 @@
 struct tessera_volume {
 	tessera_block_io_t    io;
 	tessera_superblock_t  sb;
+	const tessera_seal_keys_t *seal;   /* sealed volume: the caller's keys */
 };
 
 /* ── format-time bump allocator shim ─────────────────────────────── */
@@ -94,6 +103,21 @@ encode_inode_key_be(uint32_t inode_no, uint8_t out[4])
 	out[3] = (uint8_t)(inode_no      );
 }
 
+/* A blob into the seed pack: sealed under K_blob (key group 0) on a sealed
+ * volume, whose ids are keyed. */
+static int
+add_blob(tessera_pack_builder_t *pb, const tessera_seal_keys_t *seal,
+         const tessera_hash_t id, const uint8_t *bytes, uint32_t len,
+         uint32_t flags)
+{
+#if VOLUME_SEALING
+	if (seal != NULL)
+		return tessera_pack_add_sealed_blob(pb, &seal->blob, seal->uuid,
+		    0, id, bytes, len, flags);
+#endif
+	return tessera_pack_add_blob(pb, id, bytes, len, flags);
+}
+
 /* Pre-populate the volume with a single dirent in the root directory.
  *
  * Builds a 1-entry DIRECTORY manifest, packages it into a tiny pack
@@ -110,7 +134,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
                  tessera_btree_t *pack_tree,
                  uint64_t *inode_root,
                  uint64_t *pack_root,
-                 const tessera_format_opts_t *opts)
+                 const tessera_format_opts_t *opts,
+                 const tessera_seal_keys_t *seal)
 {
 	const int has_seed = (opts->seed_dirent_name != NULL &&
 	                      opts->seed_dirent_name_len > 0);
@@ -130,6 +155,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
 	if (mb != NULL)
 		(void)tessera_manifest_set_hash_alg(mb, opts->hash_alg);
+	if (mb != NULL && seal != NULL)
+		(void)tessera_manifest_set_id_key(mb, seal->id);
 	if (mb == NULL) return TESSERA_ENOMEM;
 	if (has_seed) {
 		r = tessera_manifest_add_dirent(mb, opts->seed_dirent_inode,
@@ -170,9 +197,11 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		    ? TESSERA_MFT_CHUNK_LIST
 		    : TESSERA_MFT_INLINE;
 		tessera_manifest_builder_t *ib = tessera_manifest_begin(kind);
-	if (ib != NULL) {
-		(void)tessera_manifest_set_hash_alg(ib, opts->hash_alg);
-	}
+		if (ib != NULL) {
+			(void)tessera_manifest_set_hash_alg(ib, opts->hash_alg);
+			if (seal != NULL)
+				(void)tessera_manifest_set_id_key(ib, seal->id);
+		}
 		if (ib == NULL) {
 			tessera_free(mft_bytes);
 			return TESSERA_ENOMEM;
@@ -190,6 +219,13 @@ seed_root_dirent(const tessera_block_io_t *shim,
 				             opts->seed_content_len)
 				    ? opts->seed_content_len - off
 				    : opts->seed_chunk_size;
+#if VOLUME_SEALING
+				if (seal != NULL)
+					(void)tessera_keyed_id(opts->hash_alg,
+					    seal->id, opts->seed_content_data + off,
+					    cs, chunk_hashes[i]);
+				else
+#endif
 				tessera_content_hash(opts->hash_alg,
 				    opts->seed_content_data + off,
 				    cs, chunk_hashes[i]);
@@ -241,7 +277,9 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return TESSERA_ENOMEM;
 	}
-	r = tessera_pack_add_blob(pb, mft_hash, mft_bytes,
+	if (seal != NULL)
+		tessera_pack_set_sealed(pb);
+	r = add_blob(pb, seal, mft_hash, mft_bytes,
 	    (uint32_t)mft_size, TESSERA_BLOB_FLAG_MANIFEST);
 	if (r != TESSERA_OK) {
 		tessera_pack_free(pb);
@@ -249,7 +287,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		return r;
 	}
 	if (has_content) {
-		r = tessera_pack_add_blob(pb, inl_hash, inl_bytes,
+		r = add_blob(pb, seal, inl_hash, inl_bytes,
 		    (uint32_t)inl_size, TESSERA_BLOB_FLAG_MANIFEST);
 		if (r != TESSERA_OK) {
 			tessera_pack_free(pb);
@@ -265,7 +303,7 @@ seed_root_dirent(const tessera_block_io_t *shim,
 			             opts->seed_content_len)
 			    ? opts->seed_content_len - off
 			    : opts->seed_chunk_size;
-			r = tessera_pack_add_blob(pb, chunk_hashes[i],
+			r = add_blob(pb, seal, chunk_hashes[i],
 			    opts->seed_content_data + off, (uint32_t)cs,
 			    TESSERA_BLOB_FLAG_CHUNK);
 			if (r != TESSERA_OK) {
@@ -301,6 +339,20 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
 		return TESSERA_ECORRUPT;
 	}
+	uint8_t front_tag[16];
+	memset(front_tag, 0, sizeof front_tag);
+#if VOLUME_SEALING
+	if (seal != NULL) {
+		r = tessera_pack_seal_front(&seal->meta, seal->uuid, 0,
+		    pack_bytes, pack_size, front_tag);
+		if (r != TESSERA_OK) {
+			tessera_free(pack_bytes);
+			tessera_free(inl_bytes); tessera_free(chunk_hashes);
+			tessera_free(mft_bytes);
+			return r;
+		}
+	}
+#endif
 
 	/* 3. Allocate pack-zone sectors. */
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
@@ -337,7 +389,10 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		re.create_time     = 0;
 		re.reachable_blobs = re.blob_count;
 		re.flags           = TESSERA_REGISTRY_FLAG_SEALED;
-		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		/* Sealed volume: the front matter's tag follows the entry. */
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+		memset(reg_value, 0, sizeof reg_value);
+		memcpy(reg_value + TESSERA_REGISTRY_ENTRY_SIZE, front_tag, 16);
 		r = tessera_encode_registry_entry(&re, reg_value);
 		if (r != TESSERA_OK) {
 			tessera_free(inl_bytes); tessera_free(chunk_hashes); tessera_free(mft_bytes);
@@ -392,21 +447,26 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		encode_inode_key_be(TESSERA_INODE_ROOT_DIR, key);
 		uint8_t value[TESSERA_INODE_RECORD_SIZE];
 		r = tessera_encode_inode(&ino, value);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
-		r = tessera_btree_put(inode_tree, key, value, inode_root);
-		if (r != TESSERA_OK) { tessera_free(mft_bytes); return r; }
+		if (r == TESSERA_OK)
+			r = tessera_btree_put(inode_tree, key, value, inode_root);
+		if (r != TESSERA_OK) {
+			tessera_free(inl_bytes); tessera_free(chunk_hashes);
+			tessera_free(mft_bytes);
+			return r;
+		}
 	}
 
 	tessera_free(inl_bytes);
+	tessera_free(chunk_hashes);
 	tessera_free(mft_bytes);
 	return TESSERA_OK;
 }
 
 /* ── format ──────────────────────────────────────────────────────── */
 
-int
-tessera_volume_format(const tessera_block_io_t *io,
-                      const tessera_format_opts_t *opts)
+static int
+format_impl(const tessera_block_io_t *io, const tessera_format_opts_t *opts,
+            const tessera_seal_keys_t *seal)
 {
 	if (io == NULL || opts == NULL) return TESSERA_EINVAL;
 	if (opts->hash_alg != TESSERA_HASH_ALG_SHA256 &&
@@ -432,9 +492,25 @@ tessera_volume_format(const tessera_block_io_t *io,
 	if (opts->total_sectors <= free_zone_start + 1)
 		return TESSERA_EINVAL;
 
-	/* 1. Format the journal. */
-	int r = tessera_journal_format(io, 4, J);
+	/* 1. Format the journal. A sealed one starts its first epoch at a
+	 * fresh random anchor, which the superblock records. */
+	uint8_t anchor[16];
+	memset(anchor, 0, sizeof anchor);
+	int r;
+#if VOLUME_SEALING
+	if (seal != NULL) {
+		const tessera_crypt_backend_t *be = tessera_crypt_backend();
+		if (be == NULL || be->random == NULL) return TESSERA_ENOTIMPL;
+		if (memcmp(seal->uuid, opts->volume_uuid, 16) != 0)
+			return TESSERA_EINVAL;
+		be->random(anchor, sizeof anchor);
+		r = tessera_journal_format_sealed(io, 4, J, seal, anchor);
+	} else
+#endif
+		r = tessera_journal_format(io, 4, J);
 	if (r != TESSERA_OK) return r;
+	uint8_t tag_inode[16], tag_reg[16], tag_free[16];
+	memset(tag_inode, 0, 16); memset(tag_reg, 0, 16); memset(tag_free, 0, 16);
 
 	/* 2. Set up the bump-allocator shim. */
 	struct fmt_ctx fc = {
@@ -454,8 +530,11 @@ tessera_volume_format(const tessera_block_io_t *io,
 	 * memcmp ordering matches numeric ordering, value = 144-byte
 	 * inode record). */
 	uint64_t inode_root = 0;
-	tessera_btree_t *t1 = tessera_btree_create(&shim, /*kind*/ 0,
-	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE, &inode_root);
+	tessera_btree_t *t1 = seal != NULL
+	    ? tessera_btree_create_sealed(&shim, seal, /*kind*/ 0, /*key*/ 4,
+	        TESSERA_INODE_RECORD_SIZE, &inode_root, tag_inode)
+	    : tessera_btree_create(&shim, /*kind*/ 0,
+	        /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE, &inode_root);
 	if (t1 == NULL) return TESSERA_ENOSPC;
 
 	/* 3a. Seed inode 2 (the root directory). manifest_hash + xattr_hash
@@ -491,9 +570,12 @@ tessera_volume_format(const tessera_block_io_t *io,
 	/* 4. Create empty pack-registry B+tree (key = 16-byte pack_id,
 	 * value = 64-byte registry entry). */
 	uint64_t pack_registry_root = 0;
-	tessera_btree_t *t2 = tessera_btree_create(&shim, /*kind*/ 1,
-	    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE,
-	    &pack_registry_root);
+	tessera_btree_t *t2 = seal != NULL
+	    ? tessera_btree_create_sealed(&shim, seal, /*kind*/ 1, /*key*/ 16,
+	        TESSERA_REGISTRY_ENTRY_SIZE_SEALED, &pack_registry_root, tag_reg)
+	    : tessera_btree_create(&shim, /*kind*/ 1,
+	        /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE,
+	        &pack_registry_root);
 	if (t2 == NULL) {
 		tessera_btree_close(t1);
 		return TESSERA_ENOSPC;
@@ -501,7 +583,9 @@ tessera_volume_format(const tessera_block_io_t *io,
 
 	/* 5. Seed the free-extent allocator with the post-metadata free
 	 * zone (don't flush yet — the seed step below allocates from it). */
-	tessera_extent_alloc_t *ea = tessera_extent_open(&shim, 0);
+	tessera_extent_alloc_t *ea = seal != NULL
+	    ? tessera_extent_open_sealed(&shim, seal, 0, NULL, 0, UINT64_MAX)
+	    : tessera_extent_open(&shim, 0);
 	if (ea == NULL) {
 		tessera_btree_close(t2); tessera_btree_close(t1);
 		return TESSERA_ENOMEM;
@@ -524,13 +608,15 @@ tessera_volume_format(const tessera_block_io_t *io,
 	 * are added inside seed_root_dirent when seed_dirent_name is
 	 * non-NULL. */
 	r = seed_root_dirent(&shim, ea, t1, t2,
-	    &inode_root, &pack_registry_root, opts);
+	    &inode_root, &pack_registry_root, opts, seal);
 	if (r != TESSERA_OK) {
 		tessera_extent_close(ea);
 		tessera_btree_close(t2); tessera_btree_close(t1);
 		return r;
 	}
 
+	tessera_btree_root_tag(t2, tag_reg);
+	tessera_btree_root_tag(t1, tag_inode);
 	tessera_btree_close(t2);
 	tessera_btree_close(t1);
 
@@ -538,6 +624,7 @@ tessera_volume_format(const tessera_block_io_t *io,
 	 * sectors consumed by 5a) as the on-disk free-extent tree. */
 	uint64_t free_extent_root = 0;
 	r = tessera_extent_flush(ea, &free_extent_root);
+	tessera_extent_root_tag(ea, tag_free);
 	tessera_extent_close(ea);
 	if (r != TESSERA_OK) return r;
 
@@ -573,6 +660,17 @@ tessera_volume_format(const tessera_block_io_t *io,
 	        ? (uint64_t)opts->seed_dirent_inode + 1
 	        : TESSERA_INODE_FIRST_USER;
 	sb.last_unmount_clean     = 1;
+#if VOLUME_SEALING
+	if (seal != NULL) {
+		memcpy(sb.root_tags[TESSERA_BTREE_KIND_INODE], tag_inode, 16);
+		memcpy(sb.root_tags[TESSERA_BTREE_KIND_PACK_REG], tag_reg, 16);
+		memcpy(sb.root_tags[TESSERA_BTREE_KIND_FREE_EXT], tag_free, 16);
+		memcpy(sb.journal_anchor_tag, anchor, 16);
+		sb.total_pack_count = 1;
+		r = tessera_sb_seal(seal, &sb, NULL);
+		if (r != TESSERA_OK) return r;
+	}
+#endif
 
 	uint8_t buf[TESSERA_SECTOR_SIZE];
 	r = tessera_encode_superblock(&sb, buf);
@@ -581,6 +679,22 @@ tessera_volume_format(const tessera_block_io_t *io,
 	if (io->write_block(io->ctx, 1, buf) != 0) return TESSERA_EIO;
 
 	return TESSERA_OK;
+}
+
+int
+tessera_volume_format(const tessera_block_io_t *io,
+                      const tessera_format_opts_t *opts)
+{
+	return format_impl(io, opts, NULL);
+}
+
+int
+tessera_volume_format_sealed(const tessera_block_io_t *io,
+                             const tessera_format_opts_t *opts,
+                             const struct tessera_seal_keys *seal)
+{
+	if (seal == NULL || !VOLUME_SEALING) return TESSERA_EINVAL;
+	return format_impl(io, opts, seal);
 }
 
 /* ── offline commit (fsck-repair) ─────────────────────────────────── */
@@ -617,6 +731,10 @@ tessera_volume_commit_roots_ex(tessera_volume_t *v,
 {
 	if (v == NULL || roots == NULL) return TESSERA_EINVAL;
 	if (v->io.write_block == NULL) return TESSERA_EINVAL;
+	/* Offline repair of a sealed volume (root tags, a fresh HMAC) is not
+	 * built yet: refuse rather than write an unauthenticated SB. */
+	if (v->seal != NULL || (v->sb.incompat_flags & TESSERA_INCOMPAT_SEALED))
+		return TESSERA_ENOTIMPL;
 
 	tessera_superblock_t sb = v->sb;   /* preserve everything */
 
@@ -720,6 +838,100 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 	v->sb = *active;
 	*out = v;
 	return TESSERA_OK;
+}
+
+/*
+ * Open a sealed volume (tessera-encryption.md §5.2): of the two superblock
+ * copies, use the newest one whose key check and HMAC pass under `seal`,
+ * before any other field is believed. TESSERA_ENOKEY when a copy is sealed
+ * but under another key (and none opens), TESSERA_EAUTH when the key is
+ * right but neither copy authenticates, TESSERA_EINCOMPAT for an unsealed
+ * volume (open it with tessera_volume_open).
+ */
+int
+tessera_volume_open_sealed(const tessera_block_io_t *io,
+                           const struct tessera_seal_keys *seal,
+                           tessera_volume_t **out)
+{
+#if !VOLUME_SEALING
+	(void)io; (void)seal; (void)out;
+	return TESSERA_EINCOMPAT;
+#else
+	if (io == NULL || seal == NULL || out == NULL) return TESSERA_EINVAL;
+	if (io->read_block == NULL) return TESSERA_EINVAL;
+
+	uint8_t *buf = tessera_zalloc(TESSERA_SECTOR_SIZE);
+	tessera_superblock_t *sb = tessera_zalloc(2 * sizeof *sb);
+	if (buf == NULL || sb == NULL) {
+		tessera_free(buf); tessera_free(sb);
+		return TESSERA_ENOMEM;
+	}
+	int ok[2] = { 0, 0 }, why = TESSERA_ECORRUPT;
+	for (int i = 0; i < 2; i++) {
+		if (io->read_block(io->ctx, (uint64_t)i, buf) != 0 ||
+		    tessera_decode_superblock(buf, &sb[i]) != TESSERA_OK)
+			continue;
+		int r = tessera_sb_verify(seal, &sb[i], NULL);
+		if (r == TESSERA_OK)
+			ok[i] = 1;
+		else if (why != TESSERA_EAUTH)
+			why = r;    /* EAUTH beats ENOKEY beats EINCOMPAT */
+	}
+	tessera_free(buf);
+	if (!ok[0] && !ok[1]) { tessera_free(sb); return why; }
+	const tessera_superblock_t *active =
+	    (ok[0] && ok[1]) ? (sb[0].generation >= sb[1].generation ? &sb[0]
+	        : &sb[1]) : (ok[0] ? &sb[0] : &sb[1]);
+
+	int rc = TESSERA_OK;
+	const uint32_t known = TESSERA_INCOMPAT_HASH_ALG | TESSERA_INCOMPAT_SEALED;
+	if (active->version_major != 1 ||
+	    active->sector_size != TESSERA_SECTOR_SIZE)
+		rc = TESSERA_EBADVERSION;
+	else if ((active->incompat_flags & ~known) != 0 ||
+	    (active->hash_alg != TESSERA_HASH_ALG_SHA256 &&
+	     active->hash_alg != TESSERA_HASH_ALG_BLAKE3_256))
+		rc = TESSERA_EINCOMPAT;
+	else if ((active->hash_alg != TESSERA_HASH_ALG_SHA256) !=
+	    ((active->incompat_flags & TESSERA_INCOMPAT_HASH_ALG) != 0) ||
+	    tessera_superblock_layout(active, 0, NULL, NULL) != TESSERA_OK)
+		rc = TESSERA_ECORRUPT;
+	tessera_volume_t *v = NULL;
+	if (rc == TESSERA_OK && (v = tessera_zalloc(sizeof *v)) == NULL)
+		rc = TESSERA_ENOMEM;
+	if (rc == TESSERA_OK) {
+		v->io = *io;
+		v->sb = *active;
+		v->seal = seal;
+		*out = v;
+	}
+	tessera_free(sb);
+	return rc;
+#endif
+}
+
+int
+tessera_volume_root_tag(const tessera_volume_t *v, uint8_t tree_kind,
+                        uint8_t out[16])
+{
+	if (v == NULL || out == NULL || tree_kind >= TESSERA_SB_ROOT_TAGS)
+		return TESSERA_EINVAL;
+	memcpy(out, v->sb.root_tags[tree_kind], 16);
+	return TESSERA_OK;
+}
+
+int
+tessera_volume_journal_anchor(const tessera_volume_t *v, uint8_t out[16])
+{
+	if (v == NULL || out == NULL) return TESSERA_EINVAL;
+	memcpy(out, v->sb.journal_anchor_tag, 16);
+	return TESSERA_OK;
+}
+
+int
+tessera_volume_is_sealed(const tessera_volume_t *v)
+{
+	return v != NULL && v->seal != NULL;
 }
 
 void

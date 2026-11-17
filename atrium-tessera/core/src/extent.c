@@ -52,6 +52,10 @@ struct tessera_extent_alloc {
 	int                 dirty;
 	/* Every free extent lies in [lo, hi) (0, UINT64_MAX unbounded). */
 	uint64_t            lo, hi;
+	/* Sealed volume: the tree is sealed (btree.h), its root tag kept
+	 * beside `root`. */
+	const struct tessera_seal_keys *seal;
+	uint8_t             root_tag[16];
 };
 
 static int
@@ -90,16 +94,19 @@ tessera_extent_open(const tessera_block_io_t *io, uint64_t free_root_sector)
 	return tessera_extent_open_bounded(io, free_root_sector, 0, UINT64_MAX);
 }
 
-tessera_extent_alloc_t *
-tessera_extent_open_bounded(const tessera_block_io_t *io,
-                            uint64_t free_root_sector, uint64_t lo,
-                            uint64_t hi)
+static tessera_extent_alloc_t *
+open_impl(const tessera_block_io_t *io, const struct tessera_seal_keys *seal,
+          uint64_t free_root_sector, const uint8_t root_tag[16], uint64_t lo,
+          uint64_t hi)
 {
 	if (lo >= hi) return NULL;
 	tessera_extent_alloc_t *a = tessera_zalloc(sizeof *a);
 	if (a == NULL) return NULL;
 	a->lo = lo;
 	a->hi = hi;
+	a->seal = seal;
+	if (seal != NULL && root_tag != NULL)
+		memcpy(a->root_tag, root_tag, 16);
 	if (io != NULL) {
 		a->io = *io;
 		a->has_io = 1;
@@ -113,8 +120,11 @@ tessera_extent_open_bounded(const tessera_block_io_t *io,
 	 * through the in-memory free() path. The tree's stored entries
 	 * are by construction non-overlapping and non-touching, so each
 	 * free() takes the simple-insert branch — coalesce never fires. */
-	tessera_btree_t *t = tessera_btree_open(io, free_root_sector,
-	    EXTENT_TREE_KIND, EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE);
+	tessera_btree_t *t = seal != NULL
+	    ? tessera_btree_open_sealed(io, seal, free_root_sector, a->root_tag,
+	        EXTENT_TREE_KIND, EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE)
+	    : tessera_btree_open(io, free_root_sector,
+	        EXTENT_TREE_KIND, EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE);
 	if (t == NULL) goto fail;
 
 	tessera_btree_cursor_t *c = tessera_btree_seek_first(t);
@@ -141,6 +151,33 @@ fail:
 	tessera_free(a->extents);
 	tessera_free(a);
 	return NULL;
+}
+
+tessera_extent_alloc_t *
+tessera_extent_open_bounded(const tessera_block_io_t *io,
+                            uint64_t free_root_sector, uint64_t lo,
+                            uint64_t hi)
+{
+	return open_impl(io, NULL, free_root_sector, NULL, lo, hi);
+}
+
+tessera_extent_alloc_t *
+tessera_extent_open_sealed(const tessera_block_io_t *io,
+                           const struct tessera_seal_keys *seal,
+                           uint64_t free_root_sector,
+                           const uint8_t root_tag[16], uint64_t lo,
+                           uint64_t hi)
+{
+	if (seal == NULL || (free_root_sector != 0 && root_tag == NULL))
+		return NULL;
+	return open_impl(io, seal, free_root_sector, root_tag, lo, hi);
+}
+
+void
+tessera_extent_root_tag(const tessera_extent_alloc_t *a, uint8_t out[16])
+{
+	if (a == NULL || out == NULL) return;
+	memcpy(out, a->root_tag, 16);
 }
 
 int
@@ -187,8 +224,12 @@ tessera_extent_flush_via(tessera_extent_alloc_t *a,
 	}
 
 	uint64_t root = 0;
-	tessera_btree_t *t = tessera_btree_create(use_io, EXTENT_TREE_KIND,
-	    EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE, &root);
+	uint8_t tag[16];
+	tessera_btree_t *t = a->seal != NULL
+	    ? tessera_btree_create_sealed(use_io, a->seal, EXTENT_TREE_KIND,
+	        EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE, &root, tag)
+	    : tessera_btree_create(use_io, EXTENT_TREE_KIND,
+	        EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE, &root);
 	if (t == NULL) return TESSERA_ENOSPC;
 
 	/*
@@ -240,6 +281,7 @@ tessera_extent_flush_via(tessera_extent_alloc_t *a,
 			return r;
 		}
 	}
+	tessera_btree_root_tag(t, a->root_tag);
 	tessera_btree_close(t);
 	*out_new_root = root;
 	a->root  = root;

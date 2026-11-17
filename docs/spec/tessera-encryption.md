@@ -296,6 +296,17 @@ keyring) before it reads any other field. Every number it then uses (zone starts
 lengths, root sectors) has passed the HMAC, and `tessera_superblock_layout` still bounds
 them as it does today.
 
+In core this is `tessera_volume_open_sealed` (core/src/volume.c). It reads both
+superblock copies and uses the newest one whose key check and HMAC pass, so a damaged or
+forged copy, even one claiming a newer generation, falls back to the other. When neither
+passes it returns `ENOKEY` if the key is not the volume's, `EAUTH` if the key is right
+but nothing authenticates, and `EINCOMPAT` for an unsealed volume. `tessera_volume_open`
+refuses a sealed volume with `EINCOMPAT`, as the loader and the capsa reader must.
+`tessera_volume_format_sealed` seals every tree, starts the journal at a random anchor,
+seals the seed pack's front and blobs under keyed ids, and writes the root tags, the
+anchor and the HMAC last (tests/test_volume_sealed.c reads a seeded file back through
+all of it on both suites).
+
 ### 5.3 Metadata blocks
 
 B+tree nodes (every tree), the journal header and journal records are 4 KiB blocks. On a

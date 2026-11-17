@@ -43,6 +43,9 @@ extern "C" {
 #define TESSERA_INODE_RECORD_SIZE     144u
 #define TESSERA_PACK_INDEX_ENTRY_SIZE  48u
 #define TESSERA_REGISTRY_ENTRY_SIZE    64u
+/* Sealed volumes (tessera-encryption.md §5.5): the entry, then the tag of
+ * the pack's sealed front matter. */
+#define TESSERA_REGISTRY_ENTRY_SIZE_SEALED  80u
 #define TESSERA_EXTENT_ENTRY_SIZE      16u
 #define TESSERA_QUOTA_DOMAIN_SIZE     128u    /* per-directory-tree quota record */
 /* ★ These four exist so codec.h can stop writing bare literals for its output

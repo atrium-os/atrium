@@ -93,6 +93,32 @@ int tessera_volume_open(const tessera_block_io_t *io,
 
 void tessera_volume_close(tessera_volume_t *);
 
+/*
+ * Sealed volumes (docs/spec/tessera-encryption.md §5). `seal` holds the keys
+ * derived from the volume key (tessera_seal_keys_init, with the same uuid as
+ * opts->volume_uuid) and must outlive the handle. Format seals every tree
+ * node, the journal (first epoch at a random anchor), the seed pack's front
+ * and blobs (keyed content ids) and HMACs the superblock; registry values
+ * are TESSERA_REGISTRY_ENTRY_SIZE_SEALED bytes (entry + front tag). Open
+ * authenticates a superblock copy before believing any field (see volume.c).
+ * tessera_volume_open still refuses a sealed volume (EINCOMPAT), as the
+ * loader and the capsa reader must. Offline commit_roots on a sealed volume
+ * is not built yet (ENOTIMPL).
+ */
+struct tessera_seal_keys;
+int tessera_volume_format_sealed(const tessera_block_io_t *io,
+                                 const tessera_format_opts_t *opts,
+                                 const struct tessera_seal_keys *seal);
+int tessera_volume_open_sealed(const tessera_block_io_t *io,
+                               const struct tessera_seal_keys *seal,
+                               tessera_volume_t **out);
+int tessera_volume_is_sealed(const tessera_volume_t *);
+/* The root tag of tree `tree_kind` (TESSERA_BTREE_KIND_*), for
+ * tessera_btree_open_sealed; the journal's current anchor. */
+int tessera_volume_root_tag(const tessera_volume_t *, uint8_t tree_kind,
+                            uint8_t out[16]);
+int tessera_volume_journal_anchor(const tessera_volume_t *, uint8_t out[16]);
+
 
 /* Offline-repair commit (tessera-fsck --repair). Overrides the roots a
  * consistency repair can legitimately move, bumps the superblock

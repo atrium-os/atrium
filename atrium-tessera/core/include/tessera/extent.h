@@ -98,6 +98,16 @@ int tessera_extent_flush_via(tessera_extent_alloc_t *,
                              const tessera_block_io_t *alt_io,
                              uint64_t *out_new_root_sector);
 
+/* Sealed volumes (tessera-encryption.md §5.3): the free-extent tree is a
+ * sealed B+tree; its root tag goes with the root sector (superblock
+ * root_tags). `seal` must outlive the allocator. After a flush,
+ * tessera_extent_root_tag gives the new root's tag. */
+struct tessera_seal_keys;
+tessera_extent_alloc_t *tessera_extent_open_sealed(const tessera_block_io_t *io,
+    const struct tessera_seal_keys *seal, uint64_t free_root_sector,
+    const uint8_t root_tag[16], uint64_t lo, uint64_t hi);
+void tessera_extent_root_tag(const tessera_extent_alloc_t *, uint8_t out[16]);
+
 void tessera_extent_close(tessera_extent_alloc_t *);
 
 #ifdef __cplusplus

@@ -40,6 +40,11 @@ int tessera_manifest_add_tree_child(tessera_manifest_builder_t *,
  * (TESSERA_HASH_ALG_*). Defaults to SHA256; set from the volume's
  * sb.hash_alg before finalizing. */
 int tessera_manifest_set_hash_alg(tessera_manifest_builder_t *, uint32_t alg);
+/* Sealed volumes: the id finalize returns is the keyed content id (keyed
+ * BLAKE3 or HMAC-SHA-256 by hash_alg) under `key` (K_id or a group's K_gid;
+ * tessera-encryption.md §6.1). Not available in the loader. */
+int tessera_manifest_set_id_key(tessera_manifest_builder_t *,
+                                const uint8_t key[32]);
 
 int tessera_manifest_set_logical_size(tessera_manifest_builder_t *,
                                       uint64_t logical_size);

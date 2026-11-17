@@ -94,7 +94,7 @@ SAN_CFLAGS="-O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 SAN_RUN_ENV="ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
              UBSAN_OPTIONS=print_stacktrace=1"
 
-# test_crypt, test_seal, test_btree_sealed and test_journal_sealed need OpenSSL's libcrypto for its backend (src/crypt_openssl.c).
+# test_crypt, test_seal and the *_sealed tests need OpenSSL's libcrypto for its backend (src/crypt_openssl.c).
 # OPENSSL=<prefix> picks one (macOS: $(brew --prefix openssl@3)); otherwise
 # the system's. Without one, test_crypt is reported as skipped, never passed.
 SSL_CFLAGS=""; SSL_LIBS="-lcrypto"
@@ -160,7 +160,8 @@ run_suite() {
             [ "$KEEPGOING" = "-k" ] || break
         fi
     done
-    for t in test_crypt test_seal test_btree_sealed test_journal_sealed; do
+    for t in test_crypt test_seal test_btree_sealed test_journal_sealed \
+        test_volume_sealed; do
     if [ "$SSL_OK" = 1 ]; then
         # shellcheck disable=SC2086
         if $CC $cflags $SSL_CFLAGS -o "$obj/$t" "$CORE/tests/$t.c" \
