@@ -79,6 +79,16 @@ pub struct Def {
     pub paths: Vec<PathDef>,
     /// Where text goes: left, top, right, bottom (none: the whole box).
     pub rect: Option<[Arg; 4]>,
+    /// Its adjust handles.
+    pub handles: Vec<HandleDef>,
+}
+
+/// An adjust handle (§20.1.9.3, 20.1.9.4): where it is drawn, and the
+/// adjust values (by variable number) a drag changes with their ranges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandleDef {
+    pub refs: Vec<(u16, Arg, Arg)>,
+    pub pos: [Arg; 2],
 }
 
 /// The built-in variables (§20.1.9.11), in order: their values depend on
@@ -208,6 +218,13 @@ impl Builder {
         self.def.rect = Some(r);
     }
 
+    /// An adjust handle: up to two (adjust value, min, max) and its place.
+    pub fn handle(&mut self, refs: &[(&str, &str, &str)], x: &str, y: &str) {
+        let refs = refs.iter().map(|&(r, lo, hi)| (self.var(r), self.arg(lo), self.arg(hi))).collect();
+        let pos = [self.arg(x), self.arg(y)];
+        self.def.handles.push(HandleDef { refs, pos });
+    }
+
     pub fn finish(self) -> Def {
         self.def
     }
@@ -284,6 +301,97 @@ impl Def {
         let c = |x: f64| x.round().clamp(-1e12, 1e12) as i64;
         let [l, t, rr, b] = r.map(|a| c(get(a)));
         if rr > l && b > t { [l, t, rr, b] } else { [0, 0, w, h] }
+    }
+
+    /// Its adjust handles' places in a `w` × `h` box.
+    pub fn handles(&self, w: i64, h: i64, adj: &[(Arc<str>, i64)]) -> Vec<(i64, i64)> {
+        let v = self.values(w.max(0) as f64, h.max(0) as f64, adj);
+        let get = |a: Arg| match a {
+            Arg::Num(x) => x,
+            Arg::Var(k) => v.get(k as usize).copied().unwrap_or(0.0),
+        };
+        self.handles.iter().map(|hd| (get(hd.pos[0]).round() as i64, get(hd.pos[1]).round() as i64)).collect()
+    }
+
+    /// The adjust values after handle `i` is dragged to (`tx`, `ty`) in a
+    /// `w` × `h` box: `adj` with the handle's values set (each kept in its
+    /// range) so the handle lands as near the point as the shape allows.
+    pub fn drag_handle(&self, i: usize, w: i64, h: i64, adj: &[(Arc<str>, i64)], tx: i64, ty: i64) -> Vec<(Arc<str>, i64)> {
+        let Some(hd) = self.handles.get(i) else { return adj.to_vec() };
+        let (wf, hf) = (w.max(0) as f64, h.max(0) as f64);
+        let mut cur: Vec<(Arc<str>, i64)> = adj.to_vec();
+        // Every handle value at its present value, so the others hold.
+        let v0 = self.values(wf, hf, &cur);
+        for &(k, _, _) in &hd.refs {
+            let name = self.names[k as usize].clone();
+            if !cur.iter().any(|(n, _)| *n == name) {
+                cur.push((name, v0[k as usize].round() as i64));
+            }
+        }
+        let miss = |cur: &[(Arc<str>, i64)]| {
+            let v = self.values(wf, hf, cur);
+            let get = |a: Arg| match a {
+                Arg::Num(x) => x,
+                Arg::Var(k) => v.get(k as usize).copied().unwrap_or(0.0),
+            };
+            let (dx, dy) = (get(hd.pos[0]) - tx as f64, get(hd.pos[1]) - ty as f64);
+            dx * dx + dy * dy
+        };
+        // Each value in turn: sampled across its range, then narrowed round
+        // the best; twice over for handles moving two.
+        for _ in 0..hd.refs.len().max(1) * 2 - 1 {
+            for &(k, lo, hi) in &hd.refs {
+                let v = self.values(wf, hf, &cur);
+                let get = |a: Arg| match a {
+                    Arg::Num(x) => x,
+                    Arg::Var(k) => v.get(k as usize).copied().unwrap_or(0.0),
+                };
+                let (mut lo, mut hi) = (get(lo).clamp(-1e7, 1e7), get(hi).clamp(-1e7, 1e7));
+                if lo > hi {
+                    std::mem::swap(&mut lo, &mut hi);
+                }
+                let name = self.names[k as usize].clone();
+                let slot = cur.iter().position(|(n, _)| *n == name).expect("added above");
+                let try_at = |cur: &mut Vec<(Arc<str>, i64)>, x: f64| {
+                    cur[slot].1 = x.round() as i64;
+                    miss(cur)
+                };
+                const N: usize = 64;
+                let start = cur[slot].1 as f64;
+                let m0 = try_at(&mut cur, start);
+                let (mut best, mut best_m) = (start, m0);
+                for s in 0..=N {
+                    let x = lo + (hi - lo) * s as f64 / N as f64;
+                    let m = try_at(&mut cur, x);
+                    if m < best_m {
+                        (best, best_m) = (x, m);
+                    }
+                }
+                let mut step = (hi - lo) / N as f64;
+                while step >= 0.5 {
+                    for x in [best - step, best + step] {
+                        if (lo..=hi).contains(&x) {
+                            let m = try_at(&mut cur, x);
+                            if m < best_m {
+                                (best, best_m) = (x, m);
+                            }
+                        }
+                    }
+                    step /= 2.0;
+                }
+                cur[slot].1 = best.round() as i64;
+            }
+        }
+        // Every adjust value, in the definition's order: formats that keep
+        // them by place (ODF's modifiers) read them back right.
+        let v = self.values(wf, hf, &cur);
+        let mut out: Vec<(Arc<str>, i64)> = self.adj.iter().map(|&(k, _)| {
+            let name = self.names[k as usize].clone();
+            let val = cur.iter().find(|(n, _)| *n == name).map_or(v[k as usize].round() as i64, |(_, x)| *x);
+            (name, val)
+        }).collect();
+        out.extend(cur.into_iter().filter(|(n, _)| !self.adj.iter().any(|&(k, _)| self.names[k as usize] == *n)));
+        out
     }
 
     /// The paths in a `w` × `h` box; `adj` overrides adjust values by name.
@@ -414,6 +522,10 @@ fn all() -> &'static HashMap<&'static str, Def> {
                         if tag == "a" { b.adj(name, fmla) } else { b.guide(name, fmla) }
                     }
                 }
+                "h" if f.len() == 8 => {
+                    let refs: Vec<(&str, &str, &str)> = [0, 3].iter().filter(|&&i| f[i] != "-").map(|&i| (f[i], f[i + 1], f[i + 2])).collect();
+                    b.handle(&refs, f[6], f[7]);
+                }
                 "r" => b.rect(f.first().copied().unwrap_or("l"), f.get(1).copied().unwrap_or("t"), f.get(2).copied().unwrap_or("r"), f.get(3).copied().unwrap_or("b")),
                 "p" => {
                     let num = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
@@ -463,6 +575,38 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handles_sit_where_the_definitions_say_and_drags_move_them() {
+        let a: Vec<(Arc<str>, i64)> = Vec::new();
+        // A right arrow: the body's edge (adj1, down) and the head's start
+        // (adj2, across).
+        let d = preset("rightArrow").unwrap();
+        assert_eq!(d.handles(1000, 400, &a), vec![(0, 100), (800, 0)]);
+        let adj = d.drag_handle(1, 1000, 400, &a, 500, 0);
+        assert_eq!(d.handles(1000, 400, &adj)[1], (500, 0), "{adj:?}");
+        // All its values, in order (ODF keeps them by place).
+        assert_eq!(adj.iter().map(|(n, _)| &**n).collect::<Vec<_>>(), ["adj1", "adj2"]);
+        assert_eq!(adj[0].1, 50_000);
+        // Past its range it stops at the end (the head at most the
+        // whole width).
+        let adj = d.drag_handle(1, 1000, 400, &a, -300, 0);
+        assert_eq!(d.handles(1000, 400, &adj)[1], (0, 0));
+        // A callout's pointer moves both ways at once.
+        let c = preset("wedgeRectCallout").unwrap();
+        let adj = c.drag_handle(0, 1000, 500, &a, 900, 800);
+        assert_eq!(c.handles(1000, 500, &adj)[0], (900, 800), "{adj:?}");
+        // Every handle of every preset lands near itself when dragged to
+        // where it is (the search finds its present values).
+        for n in names() {
+            let d = preset(n).unwrap();
+            for (i, &(x, y)) in d.handles(1000, 600, &a).iter().enumerate() {
+                let adj = d.drag_handle(i, 1000, 600, &a, x, y);
+                let (nx, ny) = d.handles(1000, 600, &adj)[i];
+                assert!((nx - x).abs() <= 2 && (ny - y).abs() <= 2, "{n} handle {i}: ({x}, {y}) -> ({nx}, {ny})");
+            }
+        }
+    }
 
     #[test]
     fn text_rectangles_follow_the_definitions() {

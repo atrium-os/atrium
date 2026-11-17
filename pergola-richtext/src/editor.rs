@@ -191,6 +191,9 @@ pub enum DragKind {
     Turn,
     /// An object in line with the text: it goes where it is let go.
     Inline,
+    /// A shape's yellow handle `n`: it changes the shape's outline (an
+    /// arrow's head, a callout's pointer).
+    Adjust(u8),
 }
 
 impl Editor {
@@ -1590,6 +1593,60 @@ impl Editor {
             return false;
         }
         self.apply("Turn", vec![TextOp::SetShape { id: pf.object.image, shape: Some(officina_text::model::ShapeData { rot, ..sd }) }], Kind::Other);
+        true
+    }
+
+    /// The floating shape anchored at byte `at` of paragraph `b` on page
+    /// `page`: its frame and data.
+    fn placed_shape(&self, b: usize, at: u32, page: usize) -> Option<(officina_text::paginate::PlacedFloat, officina_text::model::ShapeData)> {
+        let pf = self.pages.pages().get(page)?.floats.iter().find(|f| f.block == b && f.at == at && f.object.shape)?.clone();
+        let sd = (**self.doc.shapes.get(pf.object.image)?).clone();
+        Some((pf, sd))
+    }
+
+    /// The map from the shape's own box onto the page (turned and flipped
+    /// about its middle): `[a, b, c, d]` so x' = a·x + c·y, y' = b·x + d·y
+    /// about the middle.
+    fn shape_turn(sd: &officina_text::model::ShapeData) -> [f64; 4] {
+        let (sin, cos) = (sd.rot as f64 / 60_000.0).to_radians().sin_cos();
+        let (fx, fy) = (if sd.flip_h { -1.0 } else { 1.0 }, if sd.flip_v { -1.0 } else { 1.0 });
+        [cos * fx, sin * fx, -sin * fy, cos * fy]
+    }
+
+    /// The yellow handles of the floating shape anchored at byte `at` of
+    /// paragraph `b` on page `page`, where they are drawn (layout units,
+    /// the page's content box).
+    pub fn shape_handles(&self, b: usize, at: u32, page: usize) -> Vec<(i64, i64)> {
+        let Some((pf, sd)) = self.placed_shape(b, at, page) else { return Vec::new() };
+        let m = Self::shape_turn(&sd);
+        let (cx, cy) = (pf.x as f64 + pf.w as f64 / 2.0, pf.y as f64 + pf.h as f64 / 2.0);
+        officina_shapes::geom::handles(&sd.geom, pf.w.max(1), pf.h.max(1))
+            .into_iter()
+            .map(|(x, y)| {
+                let (lx, ly) = (x as f64 - pf.w as f64 / 2.0, y as f64 - pf.h as f64 / 2.0);
+                ((m[0] * lx + m[2] * ly + cx).round() as i64, (m[1] * lx + m[3] * ly + cy).round() as i64)
+            })
+            .collect()
+    }
+
+    /// Drags yellow handle `i` of the floating shape anchored at byte `at`
+    /// of paragraph `b` on page `page` to (`x`, `y`) (layout units, the
+    /// page's content box): the shape's outline follows as far as it
+    /// allows. One undo step; false if nothing changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adjust_by_drag(&mut self, b: usize, at: u32, page: usize, i: usize, x: i64, y: i64) -> bool {
+        let Some((pf, sd)) = self.placed_shape(b, at, page) else { return false };
+        let [a, bb, c, d] = Self::shape_turn(&sd);
+        let det = a * d - bb * c;
+        let (cx, cy) = (pf.x as f64 + pf.w as f64 / 2.0, pf.y as f64 + pf.h as f64 / 2.0);
+        let (sx, sy) = (x as f64 - cx, y as f64 - cy);
+        // Back into the shape's own box.
+        let (lx, ly) = ((d * sx - c * sy) / det + pf.w as f64 / 2.0, (-bb * sx + a * sy) / det + pf.h as f64 / 2.0);
+        let Some(geom) = officina_shapes::geom::drag_handle(&sd.geom, i, pf.w.max(1), pf.h.max(1), lx.round() as i64, ly.round() as i64) else { return false };
+        if geom == sd.geom {
+            return false;
+        }
+        self.apply("Adjust", vec![TextOp::SetShape { id: pf.object.image, shape: Some(officina_text::model::ShapeData { geom, ..sd }) }], Kind::Other);
         true
     }
 

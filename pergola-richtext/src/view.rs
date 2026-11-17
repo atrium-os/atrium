@@ -444,6 +444,12 @@ impl RichTextView {
                             let (tx, ty) = (ox + pb.mx + (f.x + f.w / 2) as f64 * g.k, oy + pb.my + f.y as f64 * g.k);
                             ctx.add(Node::Rect { rect: Rect::new(q(tx - 0.75), q(ty - TURN_LIFT as f64), 1.5, TURN_LIFT - 2.0), fill: accent, radius: 0.0 });
                             ctx.add(Node::Rect { rect: Rect::new(q(tx - HANDLE as f64 / 2.0), q(ty - TURN_LIFT as f64 - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: accent, radius: HANDLE / 2.0 });
+                            // Its yellow handles: what shapes its outline.
+                            for (hx, hy) in ed.shape_handles(b, at, i) {
+                                let (px, py) = (ox + pb.mx + hx as f64 * g.k, oy + pb.my + hy as f64 * g.k);
+                                ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0 - 1.0), q(py - HANDLE as f64 / 2.0 - 1.0), HANDLE + 2.0, HANDLE + 2.0), fill: Color::from_srgb8(0x5c, 0x47, 0x00), radius: HANDLE / 2.0 + 1.0 });
+                                ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: Color::from_srgb8(0xf5, 0xc5, 0x18), radius: HANDLE / 2.0 });
+                            }
                         }
                         if let Some(d) = drag {
                             match d.kind {
@@ -451,6 +457,10 @@ impl RichTextView {
                                 DragKind::Move => frame(ctx, f.x + d.dx, f.y + d.dy, f.w, f.h, ghost),
                                 DragKind::Turn => {
                                     // Where the handle is pulled to.
+                                    let (px, py) = (ox + pb.mx + (d.sx + d.dx) as f64 * g.k, oy + pb.my + (d.sy + d.dy) as f64 * g.k);
+                                    ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: ghost, radius: HANDLE / 2.0 });
+                                }
+                                DragKind::Adjust(_) => {
                                     let (px, py) = (ox + pb.mx + (d.sx + d.dx) as f64 * g.k, oy + pb.my + (d.sy + d.dy) as f64 * g.k);
                                     ctx.add(Node::Rect { rect: Rect::new(q(px - HANDLE as f64 / 2.0), q(py - HANDLE as f64 / 2.0), HANDLE, HANDLE), fill: ghost, radius: HANDLE / 2.0 });
                                 }
@@ -655,8 +665,14 @@ impl RichTextView {
                         let lift = (TURN_LIFT as f64 / g.k) as i64;
                         // The picked shape's turn handle, above its middle.
                         let turn = picked.and_then(|(b, at)| e.pages.pages().get(pg).and_then(|p| p.floats.iter().find(|f| f.block == b && f.at == at && f.object.shape)).cloned()).filter(|f| (lx - (f.x + f.w / 2)).abs() <= grip && (ly - (f.y - lift)).abs() <= grip);
+                        // The picked shape's yellow handles come first.
+                        let adjust = picked.and_then(|(b, at)| e.shape_handles(b, at, pg).into_iter().enumerate().find(|&(_, (hx, hy))| (lx - hx).abs() <= grip && (ly - hy).abs() <= grip).map(|(n, h)| (b, at, n, h)));
                         let float = if turn.is_some() { turn.clone() } else { e.float_at(pg, lx, ly) };
-                        if let Some(f) = float {
+                        if let Some((b, at, n, (hx, hy))) = adjust.filter(|a| a.2 <= u8::MAX as usize) {
+                            // Measured from the handle itself, so it doesn't jump.
+                            e.dragging = Some(ObjectDrag { block: b, at, page: pg, dx: 0, dy: 0, kind: DragKind::Adjust(n as u8), sx: hx, sy: hy, drop: None });
+                            start.set((pg, lx, ly));
+                        } else if let Some(f) = float {
                             // Its corner handle (shown when picked) sizes it.
                             let is_picked = picked == Some((f.block, f.at));
                             let kind = if turn.is_some() {
@@ -706,6 +722,9 @@ impl RichTextView {
                                 }
                                 DragKind::Turn => {
                                     e.turn_by_drag(d.block, d.at, d.page, d.sx, d.sy, d.sx + d.dx, d.sy + d.dy);
+                                }
+                                DragKind::Adjust(n) => {
+                                    e.adjust_by_drag(d.block, d.at, d.page, n as usize, d.sx + d.dx, d.sy + d.dy);
                                 }
                                 DragKind::Inline => {
                                     if let Some(to) = d.drop {
@@ -1145,6 +1164,65 @@ mod tests {
         assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Turn));
         app.handle_event(Event::PointerUp { at: right });
         assert_eq!(ed.borrow().shape_at_caret().map(|s| s.2.rot), Some(90 * 60_000));
+    }
+
+    #[test]
+    fn a_shapes_yellow_handle_changes_its_outline_even_when_turned() {
+        let (mut app, ed, _) = host(20);
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(Pos::new(2, 0), false);
+            assert!(e.insert_shape("rightArrow"));
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        app.tick();
+        let g = Geom::of(&ed.borrow(), Rect::new(0.0, 0.0, 900.0, 700.0), 1.0);
+        let f = ed.borrow().pages.pages()[0].floats[0].clone();
+        let pb = g.page(0);
+        let win = |x: i64, y: i64| Point::new((g.left_of(0) + pb.mx + x as f64 * g.k) as f32, (pb.top + pb.my + y as f64 * g.k) as f32);
+        let hs = ed.borrow().shape_handles(f.block, f.at, 0);
+        assert_eq!(hs.len(), 2, "an arrow's body and head");
+        // The head's handle, on the top edge, pulled 30 px left: a longer head.
+        let (hx, hy) = hs[1];
+        let at = win(hx, hy);
+        let to = Point::new(at.x - 30.0, at.y + 5.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerMove { at: Point::new(at.x - 15.0, at.y) });
+        app.handle_event(Event::PointerMove { at: to });
+        app.tick();
+        assert_eq!(ed.borrow().dragging.map(|d| d.kind), Some(DragKind::Adjust(1)));
+        app.handle_event(Event::PointerUp { at: to });
+        {
+            let mut e = ed.borrow_mut();
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let (nx, ny) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        assert!(((hx - nx) as f64 * g.k - 30.0).abs() <= 2.0 && ny == hy, "({hx}, {hy}) -> ({nx}, {ny})");
+        let adj = match ed.borrow().shape_at_caret().map(|s| s.2.geom) {
+            Some(officina_text::model::Geom::Preset { adj, .. }) => adj,
+            g => panic!("{g:?}"),
+        };
+        assert!(adj.iter().any(|(n, v)| &**n == "adj2" && *v > 50_000), "{adj:?}");
+        // One undo puts the outline back.
+        ed.borrow_mut().undo();
+        assert_eq!(ed.borrow().shape_handles(f.block, f.at, 0)[1], (hx, hy));
+        // Turned a quarter, the handle is drawn turned, and a drag to a
+        // point is read back in the shape's own box.
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(Pos::new(f.block, f.at), false);
+            assert!(e.set_shape("Turn", |s| s.rot = 90 * 60_000));
+            while !e.paginate(Duration::from_secs(5)) {}
+        }
+        let (cx, cy) = (f.x + f.w / 2, f.y + f.h / 2);
+        let (tx, ty) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        // Turned clockwise: the top edge is now on the right, the head down.
+        let (lx, ly) = (hx - cx, hy - cy);
+        assert!((tx - (cx - ly)).abs() <= 1 && (ty - (cy + lx)).abs() <= 1, "({tx}, {ty})");
+        let d = officina_text::LU * 10;
+        assert!(ed.borrow_mut().adjust_by_drag(f.block, f.at, 0, 1, tx, ty - d));
+        let (ux, uy) = ed.borrow().shape_handles(f.block, f.at, 0)[1];
+        assert!((ux - tx).abs() <= 2 && (uy - (ty - d)).abs() <= 2, "({ux}, {uy})");
     }
 
     #[test]

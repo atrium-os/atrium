@@ -3291,10 +3291,20 @@ odt 52/52, floats 8/8, headers 4/4, slides 84/84).
 - **Turned words** wait on Fresco drawing turned glyph runs; a Fresco
   thread was asked for it on 2026-11-17, and Write's shape text and
   Slides' turned frames switch over when it lands.
-- **Not yet**: adjust handles (an arrow's head, a callout's pointer),
-  moving the anchor with the shape, grouping in Write.
+- **Adjust handles** (same day): the standard's handle definitions
+  (`ahXY`/`ahPolar`, 243 handles over the presets) are read with the
+  shapes; a picked floating shape shows them as yellow dots. Dragging one
+  sets the shape's adjust values so the handle lands as near the pointer
+  as the shape allows: each value searched across its range (64 samples,
+  then halving steps), handles that move two values twice over; a turned
+  or flipped shape's pointer is read back into its own box first. One
+  undoable Adjust; kept in `.docx`/`.odt` as the preset's adjust values.
+- **Not yet**: adjust handles on shapes in line and in Slides, moving the
+  anchor with the shape, grouping in Write.
 
-Gates: engine (set, undo, refusals), native journal op round trip, editor
+Gates: every preset's every handle lands on itself when dragged there,
+an arrow's head and a callout's pointer dragged (also turned a quarter);
+engine (set, undo, refusals), native journal op round trip, editor
 (insert, words keeping their format, fill, turn, size, undo, text box,
 arrow), Write's bar (both modes, every command, undo a step each, bars
 sharing their place), and a crash recovery that keeps a shape's words

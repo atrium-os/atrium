@@ -9,6 +9,10 @@ Format, one item per line:
   =name                 a shape
   a NAME FMLA           an adjust value's default (avLst)
   r L T R B             the text rectangle (guide names or numbers)
+  h R1 MIN1 MAX1 R2 MIN2 MAX2 X Y
+                        an adjust handle at (X, Y): the adjust values it
+                        moves with their ranges (- for none); for ahXY
+                        across then down, for ahPolar radius then angle
   g NAME FMLA           a guide (gdLst)
   p W H FILL STROKE     a path: its own size (0: the shape's), fill
                         (n norm, - none, l lighten, L lightenLess, d darken,
@@ -41,6 +45,19 @@ def main():
         rect = shape.find(NS + 'rect')
         if rect is not None:
             out.append('r ' + ' '.join(rect.get(k, '0') for k in ('l', 't', 'r', 'b')))
+        ah = shape.find(NS + 'ahLst')
+        if ah is not None:
+            for h in ah:
+                t = h.tag.replace(NS, '')
+                keys = (('gdRefX', 'minX', 'maxX'), ('gdRefY', 'minY', 'maxY')) if t == 'ahXY' else (('gdRefR', 'minR', 'maxR'), ('gdRefAng', 'minAng', 'maxAng'))
+                f = []
+                for ref, lo, hi in keys:
+                    if h.get(ref):
+                        f += [h.get(ref), h.get(lo, '0'), h.get(hi, '0')]
+                    else:
+                        f += ['-', '-', '-']
+                p = h.find(NS + 'pos')
+                out.append('h ' + ' '.join(f + [p.get('x'), p.get('y')]))
         pl = shape.find(NS + 'pathLst')
         if pl is None:
             continue

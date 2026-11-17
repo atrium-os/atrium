@@ -166,3 +166,23 @@ fn star(w: i64, h: i64, n: usize, inner: f64) -> Path {
         .collect();
     poly(w, h, &pts)
 }
+
+/// A geometry's adjust handles in a `w` × `h` box (none for a custom one
+/// or a preset the standard doesn't define).
+pub fn handles(g: &Geom, w: i64, h: i64) -> Vec<(i64, i64)> {
+    match g {
+        Geom::Preset { name, adj } => crate::presets::preset(name).map_or_else(Vec::new, |d| d.handles(w, h, adj)),
+        Geom::Custom(_) => Vec::new(),
+    }
+}
+
+/// The geometry after handle `i` is dragged to (`tx`, `ty`) in a `w` × `h`
+/// box; `None` when it has no such handle.
+pub fn drag_handle(g: &Geom, i: usize, w: i64, h: i64, tx: i64, ty: i64) -> Option<Geom> {
+    let Geom::Preset { name, adj } = g else { return None };
+    let d = crate::presets::preset(name)?;
+    if i >= d.handles(w, h, adj).len() {
+        return None;
+    }
+    Some(Geom::Preset { name: name.clone(), adj: d.drag_handle(i, w, h, adj, tx, ty) })
+}

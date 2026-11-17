@@ -9,6 +9,8 @@ g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
 p 0 0 n 1
 M l t
 L r t
@@ -36,6 +38,9 @@ g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
 p 0 0 n 1
 M l t
 L r t
@@ -68,6 +73,10 @@ g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
+h adj8 -2147483647 2147483647 adj7 -2147483647 2147483647 x4 y4
 p 0 0 n 1
 M l t
 L r t
@@ -93,6 +102,8 @@ g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
 p 0 0 n 0
 M l t
 L r t
@@ -120,6 +131,9 @@ g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
 p 0 0 n 0
 M l t
 L r t
@@ -152,6 +166,10 @@ g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
+h adj8 -2147483647 2147483647 adj7 -2147483647 2147483647 x4 y4
 p 0 0 n 0
 M l t
 L r t
@@ -972,6 +990,8 @@ g cang1 +- stAng 0 cd4
 g cang2 +- enAng cd4 0
 g cang3 +/ cang1 cang2 2
 r il it ir ib
+h - - - adj1 0 21599999 x1 y1
+h - - - adj2 0 21599999 x2 y2
 p 0 0 n 0
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -1009,6 +1029,10 @@ g y4 +- y3 dh2 0
 g y5 +- dh2 bd 0
 g y6 +- y3 bd2 0
 r l t r b
+h adj1 0 maxAdj1 - - - th b
+h - - - adj2 0 50000 r y4
+h adj3 0 50000 - - - x4 t
+h adj4 0 maxAdj4 - - - bd t
 p 0 0 n 1
 M l b
 L l y5
@@ -1032,6 +1056,7 @@ L r b
 a adj1 val 50000
 g x1 */ w adj1 100000
 r l t r b
+h adj1 -2147483647 2147483647 - - - x1 vc
 p 0 0 - 1
 M l t
 L x1 t
@@ -1045,6 +1070,8 @@ g x2 +/ x1 r 2
 g y2 */ h adj2 100000
 g y1 +/ t y2 2
 r l t r b
+h adj1 -2147483647 2147483647 - - - x1 y1
+h - - - adj2 -2147483647 2147483647 x2 y2
 p 0 0 - 1
 M l t
 L x1 t
@@ -1062,6 +1089,9 @@ g y2 */ h adj2 100000
 g y1 +/ t y2 2
 g y3 +/ b y2 2
 r l t r b
+h adj1 -2147483647 2147483647 - - - x1 y1
+h - - - adj2 -2147483647 2147483647 x2 y2
+h adj3 -2147483647 2147483647 - - - x3 y3
 p 0 0 - 1
 M l t
 L x1 t
@@ -1090,6 +1120,9 @@ g x0 */ x4 1 2
 g y3 +/ y2 b 2
 g y15 +/ y1 b 2
 r l y2 x4 b
+h - - - adj1 0 50000 l y2
+h adj2 0 50000 - - - x1 t
+h - - - adj3 0 50000 x2 y1
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -1108,6 +1141,7 @@ g x1 */ ss a 100000
 g x2 +- r 0 x1
 g y2 +- b 0 x1
 r x1 x1 x2 y2
+h adj 0 50000 - - - x1 t
 p 0 0 n 0
 M x1 x1
 L x2 x1
@@ -1233,6 +1267,8 @@ g cang1 +- stAng 0 cd4
 g cang2 +- istAng cd4 0
 g cang3 +/ cang1 cang2 2
 r il it ir ib
+h - - - adj1 0 21599999 x1 y1
+h adj3 0 50000 adj2 0 21599999 x2 y2
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -1249,6 +1285,8 @@ g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
 p 0 0 n 1
 M l t
 L r t
@@ -1272,6 +1310,9 @@ g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
 p 0 0 n 1
 M l t
 L r t
@@ -1300,6 +1341,10 @@ g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
+h adj8 -2147483647 2147483647 adj7 -2147483647 2147483647 x4 y4
 p 0 0 n 1
 M l t
 L r t
@@ -1326,6 +1371,7 @@ g il +- x1 it 0
 g ir +- r 0 il
 g ib +- b 0 it
 r il il ir ib
+h - - - adj 0 25000 l x1
 p 0 0 n 0
 M x2 b
 A x1 x1 cd4 cd4
@@ -1367,6 +1413,7 @@ g il */ x1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h - - - adj 0 50000 l x1
 p 0 0 n 0
 M l x1
 A x1 x1 cd2 cd4
@@ -1396,6 +1443,8 @@ g x1 */ w adj2 100000
 g y2 */ h adj3 100000
 g x2 */ w adj4 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
 p 0 0 n 0
 M l t
 L r t
@@ -1419,6 +1468,9 @@ g x2 */ w adj4 100000
 g y3 */ h adj5 100000
 g x3 */ w adj6 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
 p 0 0 n 0
 M l t
 L r t
@@ -1447,6 +1499,10 @@ g x3 */ w adj6 100000
 g y4 */ h adj7 100000
 g x4 */ w adj8 100000
 r l t r b
+h adj2 -2147483647 2147483647 adj1 -2147483647 2147483647 x1 y1
+h adj4 -2147483647 2147483647 adj3 -2147483647 2147483647 x2 y2
+h adj6 -2147483647 2147483647 adj5 -2147483647 2147483647 x3 y3
+h adj8 -2147483647 2147483647 adj7 -2147483647 2147483647 x4 y4
 p 0 0 n 0
 M l t
 L r t
@@ -1466,6 +1522,7 @@ g y1 */ ss a 200000
 g y2 +- y1 y1 0
 g y3 +- b 0 y1
 r l y2 r y3
+h - - - adj 0 maxAdj hc y2
 p 0 0 n 0
 M l y1
 A wd2 y1 cd2 -10800000
@@ -1533,6 +1590,7 @@ g dx +- x2 0 x1
 g il ?: dx x1 l
 g ir ?: dx x2 r
 r il t ir b
+h adj 0 maxAdj - - - x2 t
 p 0 0 n 1
 M l t
 L x2 t
@@ -1572,6 +1630,8 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h - - - adj1 0 21599999 x1 y1
+h - - - adj2 0 21599999 x2 y2
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -1775,6 +1835,10 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h - - - adj2 0 maxAng xA yA
+h - - - adj4 0 21599999 xE yE
+h adj1 0 maxAdj1 adj3 0 21599999 xF yF
+h adj5 0 25000 - - - xB yB
 p 0 0 n 1
 M xE yE
 A rw1 rh1 stAng swAng
@@ -1878,6 +1942,7 @@ g g29 */ w 21582 21600
 g g30 */ h 1235 21600
 g pang at2 dxPos dyPos
 r il it ir ib
+h adj1 -2147483647 2147483647 adj2 -2147483647 2147483647 xPos yPos
 p 43200 43200 n 1
 M 3900 14370
 A 6753 9190 -11429249 7426832
@@ -1943,6 +2008,8 @@ g d +- w 0 h
 g it ?: d y1 t
 g ir ?: d r x1
 r l it ir b
+h - - - adj1 0 maxAdj1 l y1
+h adj2 0 maxAdj2 - - - x1 t
 p 0 0 n 1
 M l t
 L x1 t
@@ -1988,6 +2055,7 @@ g x4 +- r 0 y1
 g x2 */ x4 1 2
 g x3 +/ y1 r 2
 r l y1 x4 b
+h - - - adj 0 100000 l y1
 p 0 0 n 0
 M l y1
 L x4 y1
@@ -2031,6 +2099,7 @@ g x1 +/ l x2 2
 g x3 +/ r x2 2
 g y3 */ h 3 4
 r l t r b
+h adj1 -2147483647 2147483647 - - - x2 vc
 p 0 0 - 1
 M l t
 C x1 t x2 hd4 x2 vc
@@ -2049,6 +2118,8 @@ g y2 +/ t y1 2
 g y3 +/ y1 y4 2
 g y5 +/ b y4 2
 r l t r b
+h adj1 -2147483647 2147483647 - - - x2 y1
+h - - - adj2 -2147483647 2147483647 x3 y4
 p 0 0 - 1
 M l t
 C x1 t x2 y2 x2 y1
@@ -2073,6 +2144,9 @@ g y5 +/ b y4 2
 g y6 +/ y5 y4 2
 g y7 +/ y5 b 2
 r l t r b
+h adj1 -2147483647 2147483647 - - - x3 y1
+h - - - adj2 -2147483647 2147483647 x1 y4
+h adj3 -2147483647 2147483647 - - - x6 y5
 p 0 0 - 1
 M l t
 C x2 t x3 y2 x3 y1
@@ -2125,6 +2199,9 @@ g stAng2 +- 3cd4 0 dang2
 g swAng2 +- dang2 0 cd4
 g swAng3 +- cd4 dang2 0
 r l t r b
+h adj1 0 adj2 - - - x7 y1
+h adj2 0 maxAdj2 - - - x4 b
+h - - - adj3 0 maxAdj3 r y1
 p 0 0 n 0
 M x6 b
 L x4 y1
@@ -2197,6 +2274,9 @@ g swAng2 +- dang2 0 swAng
 g swAng3 +- swAng dang2 0
 g stAng3 +- 0 0 dang2
 r l t r b
+h - - - adj1 0 a2 x1 y5
+h - - - adj2 0 maxAdj2 r y4
+h adj3 0 maxAdj3 - - - x1 b
 p 0 0 n 0
 M l y6
 L x1 y4
@@ -2269,6 +2349,9 @@ g swAng2 +- dang2 0 cd4
 g swAng3 +- cd4 dang2 0
 g stAng3 +- cd2 0 dang2
 r l t r b
+h - - - adj1 0 a2 x1 y5
+h - - - adj2 0 maxAdj2 r y4
+h adj3 0 maxAdj3 - - - x1 b
 p 0 0 n 0
 M l hR
 A w hR cd2 mswAng
@@ -2342,6 +2425,9 @@ g stAng3 +- cd4 0 swAng
 g swAng3 +- swAng dang2 0
 g stAng2 +- cd4 0 dang2
 r l t r b
+h adj1 0 a2 - - - x7 y1
+h adj2 0 maxAdj2 - - - x4 t
+h - - - adj3 0 maxAdj3 r y1
 p 0 0 n 0
 M x6 t
 L x8 y1
@@ -2406,6 +2492,7 @@ g y2 */ h a 100000
 g y1 */ y2 1 2
 g y3 +/ y2 b 2
 r l t x3 y3
+h - - - adj 0 100000 l y2
 p 0 0 n 1
 M l y2
 L x2 t
@@ -2459,6 +2546,7 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h adj 0 50000 - - - dr vc
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -2512,6 +2600,8 @@ g ir min x8 x15
 g it */ h a1 50000
 g ib +- b 0 it
 r il it ir ib
+h - - - adj1 0 12500 l y1
+h adj2 -10000 10000 - - - xAdj b
 p 0 0 n 1
 M x2 y1
 C x3 y2 x4 y3 x5 y1
@@ -2534,6 +2624,8 @@ g x2 +- hc dx1 0
 g dy2 */ x1 dy1 wd2
 g y2 +- y1 dy2 0
 r x1 t x2 y2
+h adj1 0 100000 - - - x1 t
+h - - - adj2 0 maxAdj2 l y1
 p 0 0 n 1
 M l y1
 L x1 y1
@@ -2568,6 +2660,10 @@ g y3 +- b 0 dy3
 g y2 */ h a4 100000
 g y1 */ y2 1 2
 r l t r y2
+h adj1 0 maxAdj1 - - - x2 y3
+h adj2 0 maxAdj2 - - - x1 b
+h - - - adj3 0 maxAdj3 r y3
+h - - - adj4 0 maxAdj4 l y2
 p 0 0 n 1
 M l t
 L r t
@@ -2644,6 +2740,9 @@ g y7 +- y1 dy3 0
 g cy7 +- q1 q1 y7
 g y8 +- b 0 dy1
 r x2 q1 x5 y6
+h - - - adj1 0 100000 hc q1
+h adj2 25000 75000 - - - x2 b
+h - - - adj3 minAdj3 a1 l y8
 p 0 0 n 0
 M l t
 Q cx1 cy1 x3 y1
@@ -2751,6 +2850,9 @@ g y7 +- b 0 u7
 g cu7 +- q1 q1 u7
 g cy7 +- b 0 cu7
 r x2 y6 x5 rh
+h - - - adj1 0 100000 hc rh
+h adj2 25000 100000 - - - x2 t
+h - - - adj3 minAdj3 a1 l dy1
 p 0 0 n 0
 M l b
 Q cx1 cy1 x3 y1
@@ -3258,6 +3360,7 @@ g x2 +- x1 dy1 0
 g y2 +- b 0 dy2
 g y1 +- y2 dy1 0
 r l t r y2
+h adj 0 50000 - - - x1 b
 p 0 0 n 0
 M l t
 L r t
@@ -3286,6 +3389,7 @@ g x1 */ ss a1 100000
 g x4 +- r 0 x1
 g y4 +- b 0 x1
 r x1 x1 x4 y4
+h adj1 0 50000 - - - x1 t
 p 0 0 n 1
 M l t
 L r t
@@ -3450,6 +3554,8 @@ g yCxn1 +/ yB1 yC1 2
 g yCxn2 +- b 0 yCxn1
 g xCxn4 +/ r 0 xCxn1
 r xD5 yA1 xA1 yD2
+h - - - adj1 0 20000 xD6 yD6
+h adj2 0 5358 - - - xA6 yD6
 p 0 0 n 1
 M xA1 yA1
 L xB1 yB1
@@ -3723,6 +3829,8 @@ g xCxn6 +/ r 0 xCxn3
 g xCxn7 +/ r 0 xCxn2
 g xCxn8 +/ r 0 xCxn1
 r xA8 yD1 xD1 yD3
+h - - - adj1 0 20000 xD9 yD9
+h adj2 0 2679 - - - xA9 yD9
 p 0 0 n 1
 M xA1 yA1
 L xB1 yB1
@@ -3782,6 +3890,8 @@ g cy1 +/ y2 b 2
 g cx2 +/ x2 r 2
 g cy2 */ y1 1 2
 r l t r b
+h - - - adj1 0 maxAdj1 l y1
+h adj2 0 maxAdj2 - - - x1 t
 p 0 0 n 1
 M l t
 L r t
@@ -3863,6 +3973,7 @@ g it */ h q8 24
 g ir +- r 0 il
 g ib +- b 0 it
 r il it ir ib
+h adj 0 maxAdj - - - x1 t
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -3880,6 +3991,7 @@ g x1 +- r 0 dx1
 g ir +/ x1 r 2
 g x2 */ x1 1 2
 r l t ir b
+h adj 0 maxAdj - - - x1 t
 p 0 0 n 1
 M l t
 L x1 t
@@ -3901,6 +4013,7 @@ g y5 +- y6 0 ch2
 g x3 +- r 0 ch
 g x4 +- r 0 ch2
 r ch ch x4 y6
+h adj 0 25000 - - - ch t
 p 0 0 n 0
 M r ch2
 A ch2 ch2 0 cd4
@@ -4045,6 +4158,8 @@ g y2 +- vc dy1 0
 g dx1 */ y1 dx2 hd2
 g x1 +- x2  0 dx1
 r x1 y1 r y2
+h - - - adj1 0 100000 r y1
+h adj2 0 maxAdj2 - - - x2 t
 p 0 0 n 1
 M l vc
 L x2 t
@@ -4079,6 +4194,10 @@ g dx2 */ w a4 100000
 g x2 +- r 0 dx2
 g x3 +/ x2 r 2
 r x2 t r b
+h - - - adj1 0 maxAdj1 x1 y2
+h - - - adj2 0 maxAdj2 l y1
+h adj3 0 maxAdj3 - - - x1 t
+h adj4 0 maxAdj4 - - - x2 b
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -4110,6 +4229,8 @@ g il +- r 0 dx1
 g it +- y1 0 dy1
 g ib +- b dy1 y1
 r il it r ib
+h - - - adj1 0 maxAdj1 hc y1
+h - - - adj2 0 100000 l y3
 p 0 0 n 0
 M r b
 A wd2 y1 cd4 cd4
@@ -4139,6 +4260,7 @@ g il +- r 0 dx1
 g it +- y1 0 dy1
 g ib +- b dy1 y1
 r il it r ib
+h - - - adj 0 maxAdj l y1
 p 0 0 n 0
 M r b
 A w y1 cd4 cd4
@@ -4362,6 +4484,10 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h - - - adj2 minAng 0 xA yA
+h - - - adj4 0 21599999 xE yE
+h adj1 0 maxAdj1 adj3 0 21599999 xF yF
+h adj5 0 25000 - - - xB yB
 p 0 0 n 1
 M xE yE
 L xD yD
@@ -4387,6 +4513,8 @@ g dx1 */ y1 x2 hd2
 g x1 +- x2 0 dx1
 g x4 +- x3 dx1 0
 r x1 y1 x4 y2
+h - - - adj1 0 100000 x3 y1
+h adj2 0 maxAdj2 - - - x2 t
 p 0 0 n 1
 M l vc
 L x2 t
@@ -4425,6 +4553,10 @@ g dx2 */ w a4 200000
 g x2 +- hc 0 dx2
 g x3 +- hc dx2 0
 r x2 t x3 b
+h - - - adj1 0 maxAdj1 x1 y2
+h - - - adj2 0 maxAdj2 l y1
+h adj3 0 maxAdj3 - - - x1 t
+h adj4 0 maxAdj4 - - - x2 b
 p 0 0 n 1
 M l vc
 L x1 y1
@@ -4682,6 +4814,10 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h - - - adj2 0 maxAng xA yA
+h - - - adj4 0 21599999 xE yE
+h adj1 0 maxAdj1 adj3 0 21599999 xF yF
+h adj5 0 25000 - - - xB yB
 p 0 0 n 1
 M xL yL
 L xKp yKp
@@ -4722,6 +4858,9 @@ g x3 +- hc wd32 0
 g y1 +- ly1 hR 0
 g y2 +- ry2 0 hR
 r x1 ly1 x4 ry4
+h - - - adj1 0 maxAdj1 x4 ry2
+h adj2 0 maxAdj2 - - - x1 t
+h - - - adj3 0 33333 x3 ry2
 p 0 0 n 0
 M l ly2
 L x1 t
@@ -4794,6 +4933,9 @@ g y5 +- y4 dx3 0
 g il */ dx3 x1 dx2
 g ir +- r 0 il
 r il y3 ir y5
+h adj1 0 maxAdj1 - - - x3 x1
+h adj2 0 50000 - - - x2 t
+h - - - adj3 0 maxAdj3 r x1
 p 0 0 n 1
 M l y4
 L x1 y2
@@ -4838,6 +4980,9 @@ g il */ dx3 x1 dx4
 g cx1 +/ x1 x5 2
 g cy1 +/ x1 y5 2
 r il y3 x4 y5
+h - - - adj1 0 maxAdj1 x3 y3
+h adj2 0 50000 - - - x2 t
+h - - - adj3 0 maxAdj3 x3 x1
 p 0 0 n 1
 M l y4
 L x1 y2
@@ -4916,6 +5061,9 @@ g x1 +- hc 0 dx1
 g x3 +- hc dx1 0
 g x2 +- hc 0 rad
 r x1 y3 x3 y4
+h - - - adj1 1000 36745 l y3
+h - - - adj2 0 maxAdj2 r y2
+h adj3 1000 maxAdj3 - - - x2 t
 p 0 0 n 1
 M hc y1
 A rad rad 3cd4 21600000
@@ -4947,6 +5095,8 @@ g x2 +- hc dx1 0
 g yC1 +/ y1 y2 2
 g yC2 +/ y3 y4 2
 r x1 y1 x2 y4
+h - - - adj1 0 36745 l y1
+h - - - adj2 0 mAdj2 r y2
 p 0 0 n 1
 M x1 y1
 L x2 y1
@@ -4968,6 +5118,7 @@ g y2 +- vc dy1 0
 g x1 +- hc 0 dx1
 g x2 +- hc dx1 0
 r x1 y1 x2 y2
+h - - - adj1 0 100000 l y1
 p 0 0 n 1
 M x1 y1
 L x2 y1
@@ -5008,6 +5159,7 @@ g yI +- b 0 yC
 g xC2 +- r 0 xM
 g yC3 +- b 0 yM
 r xA yB xE yH
+h - - - adj1 0 51965 l th
 p 0 0 n 1
 M xA yA
 L xB yB
@@ -5082,6 +5234,9 @@ g yC2 +/ y1 y2 2
 g yC3 +/ y3 y4 2
 g yC4 +/ dry dly 2
 r x1 y1 x8 y4
+h - - - adj1 0 50000 l y1
+h - - - adj2 4200000 6600000 lx t
+h - - - adj3 0 maxAdj3 r y2
 p 0 0 n 1
 M x1 y1
 L x6 y1
@@ -5119,6 +5274,7 @@ g y2 +- vc 0 dx2
 g y3 +- vc dx2 0
 g y4 +- vc dy1 0
 r x1 y2 x4 y3
+h - - - adj1 0 73490 l y2
 p 0 0 n 1
 M x1 y2
 L x2 y2
@@ -5170,6 +5326,7 @@ g enAngp1 at2 dx2 hd2
 g enAng1 +- enAngp1 0 21600000
 g swAng1 +- enAng1 0 stAng1
 r g12w g15h g0w g16h
+h adj 0 87500 - - - g0w vc
 p 0 0 n 1
 M r b
 A w hd2 cd4 cd2
@@ -5192,6 +5349,8 @@ g it */ hd3 adjm maxAdj
 g irt */ wd3 a2 maxAdj
 g ir +- r 0 irt
 r il it ir b
+h adj1 0 maxAdj - - - x2 t
+h adj2 0 maxAdj - - - x3 t
 p 0 0 n 1
 M l b
 L x2 t
@@ -5233,6 +5392,7 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h adj 0 50000 - - - dr vc
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -5260,6 +5420,8 @@ g y2 +- vc dy1 0
 g x1 */ dy1 dx2 hd2
 g x3 +- r 0 x1
 r x1 y1 x3 y2
+h - - - adj1 0 100000 r y1
+h adj2 0 maxAdj2 - - - x2 t
 p 0 0 n 1
 M l y1
 L x2 y1
@@ -5280,6 +5442,7 @@ g il */ x1 1 2
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l x1
 L x1 t
@@ -5311,6 +5474,7 @@ g q3 */ h hc x2
 g y1 pin 0 q3 h
 g y2 +- b 0 y1
 r il it ir ib
+h adj 0 maxAdj - - - x2 t
 p 0 0 n 1
 M l b
 L x2 t
@@ -5369,6 +5533,8 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il ir it ib
+h - - - adj1 0 21599999 x1 y1
+h - - - adj2 0 21599999 x2 y2
 p 0 0 n 1
 M x1 y1
 A wd2 hd2 stAng swAng
@@ -5395,6 +5561,7 @@ g il */ x1 70711 100000
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l x1
 A x1 x1 cd4 -5400000
@@ -5443,6 +5610,7 @@ g ir ?: d r x2
 g it ?: d x1 t
 g ib ?: d y2 b
 r il it ir ib
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l x1
 L x1 x1
@@ -5483,6 +5651,9 @@ g y6 +- b 0 x1
 g il */ dx3 x1 dx2
 g ir +- r 0 il
 r il y3 ir y4
+h adj1 0 maxAdj1 - - - x3 x1
+h adj2 0 50000 - - - x2 t
+h - - - adj3 0 maxAdj3 r x1
 p 0 0 n 1
 M l vc
 L x1 y2
@@ -5542,6 +5713,10 @@ g y6 +- vc dx2 0
 g y4 +- vc 0 dx3
 g y5 +- vc dx3 0
 r x2 y2 x7 y7
+h adj1 0 maxAdj1 - - - x4 ah
+h adj2 0 50000 - - - x3 t
+h - - - adj3 0 maxAdj3 r ah
+h - - - adj4 a1 maxAdj4 l y2
 p 0 0 n 1
 M l vc
 L ah y3
@@ -5607,6 +5782,8 @@ g hR */ h a1 400000
 g y5 +- b 0 hR
 g y6 +- y2 0 hR
 r x2 y2 x9 b
+h - - - adj1 0 33333 hc y2
+h adj2 25000 75000 - - - x2 t
 p 0 0 n 0
 M l t
 L x4 t
@@ -5697,6 +5874,8 @@ g hR */ h a1 400000
 g y6 +- b 0 hR
 g y7 +- y1 0 hR
 r x2 t x9 y2
+h - - - adj1 0 33333 hc y2
+h adj2 25000 75000 - - - x2 b
 p 0 0 n 0
 M l b
 L x4 b
@@ -5777,6 +5956,8 @@ g y2 +- vc dy1 0
 g dx2 */ y1 dx1 hd2
 g x2 +- x1 dx2 0
 r l y1 x2 y2
+h - - - adj1 0 100000 l y1
+h adj2 0 maxAdj2 - - - x1 t
 p 0 0 n 1
 M l y1
 L x1 y1
@@ -5811,6 +5992,10 @@ g x3 +- r 0 dx3
 g x2 */ w a4 100000
 g x1 */ x2 1 2
 r l t x2 b
+h - - - adj1 0 maxAdj1 x3 y2
+h - - - adj2 0 maxAdj2 r y1
+h adj3 0 maxAdj3 - - - x3 t
+h adj4 0 maxAdj4 - - - x2 b
 p 0 0 n 1
 M l t
 L x2 t
@@ -5843,6 +6028,8 @@ g ir +- l dx1 0
 g it +- y1 0 dy1
 g ib +- b dy1 y1
 r l it ir ib
+h - - - adj1 0 maxAdj1 hc y1
+h - - - adj2 0 100000 r y3
 p 0 0 n 0
 M l t
 A wd2 y1 3cd4 cd4
@@ -5872,6 +6059,7 @@ g ir +- l dx1 0
 g it +- y1 0 dy1
 g ib +- b dy1 y1
 r l it ir ib
+h - - - adj 0 maxAdj r y1
 p 0 0 n 0
 M l t
 A w y1 3cd4 cd4
@@ -5891,6 +6079,7 @@ g x1 +- r 0 dx1
 g idx */ dx1 29289 100000
 g ir +- r 0 idx
 r l t ir b
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l t
 L x1 t
@@ -5915,6 +6104,8 @@ g dx ?: d dx1 dx2
 g ir +- r 0 dx
 g ib +- b 0 dx
 r dx dx ir ib
+h adj1 0 50000 - - - x1 t
+h adj2 0 50000 - - - x2 t
 p 0 0 n 1
 M x1 t
 L x2 t
@@ -5943,6 +6134,8 @@ g il ?: d tdx bdx
 g ir +- r 0 il
 g ib +- b 0 bdx
 r il tdx ir ib
+h adj1 0 50000 - - - tx2 t
+h adj2 0 50000 - - - bx1 b
 p 0 0 n 1
 M tx1 t
 L tx2 t
@@ -5964,6 +6157,7 @@ g il */ x1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l x1
 A x1 x1 cd2 cd4
@@ -6007,6 +6201,7 @@ g ib +- vc idy 0
 g wR */ w 1125 21600
 g hR */ h 1125 21600
 r il it ir ib
+h - - - adj -4653 4653 hc y4
 p 0 0 n 0
 M l vc
 A wd2 hd2 cd2 21600000
@@ -6031,6 +6226,7 @@ g x1 +- r 0 dx1
 g it */ dx1 1 2
 g ir +/ x1 r 2
 r l it ir b
+h adj 0 50000 - - - x1 t
 p 0 0 n 1
 M l t
 L x1 t
@@ -6055,6 +6251,8 @@ g il */ dx 1 2
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h adj1 0 50000 - - - lx1 t
+h adj2 0 50000 - - - rx2 t
 p 0 0 n 1
 M lx1 t
 L rx2 t
@@ -6082,6 +6280,8 @@ g ir +- r 0 il
 g it */ tx1 1 2
 g ib +/ by1 b 2
 r il it ir ib
+h adj1 0 50000 - - - tx2 t
+h adj2 0 50000 - - - bx1 b
 p 0 0 n 1
 M tx1 t
 L tx2 t
@@ -6103,6 +6303,8 @@ g x2 +- r 0 dx2
 g il */ x1 29289 100000
 g ir +/ x2 r 2
 r il il ir b
+h adj1 0 50000 - - - x1 t
+h adj2 0 50000 - - - x2 t
 p 0 0 n 1
 M x1 t
 L x2 t
@@ -6177,6 +6379,7 @@ g sy3 +- vc sdy2 0
 g sy4 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
 r sx2 sy2 sx5 sy3
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M x1 y2
 L sx2 sy2
@@ -6232,6 +6435,7 @@ g sy5 +- vc sdy2 0
 g sy6 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
 r sx2 sy2 sx5 sy5
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy3
@@ -6313,6 +6517,7 @@ g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
 r il it ir ib
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy4
@@ -6426,6 +6631,7 @@ g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
 r il it ir ib
+h - - - adj 0 ssd2 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy6
@@ -6579,6 +6785,7 @@ g ir +- hc idx 0
 g ib +- vc idy 0
 g yAdj +- vc 0 ihd2
 r il it ir ib
+h - - - adj 0 ssd2 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy8
@@ -6658,6 +6865,7 @@ g sy1 +- vc 0 sdy
 g sy2 +- vc sdy 0
 g yAdj +- vc 0 ihd2
 r sx1 sy1 sx2 sy2
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy1
@@ -6701,6 +6909,7 @@ g sy2 +- svc 0 sdy2
 g sy3 +- svc ihd2 0
 g yAdj +- svc 0 ihd2
 r sx1 sy1 sx4 sy3
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M x1 y1
 L sx2 sy1
@@ -6734,6 +6943,7 @@ g sy1 +- vc 0 sdy1
 g sy2 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
 r sx1 sy1 sx4 sy2
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M x1 hd4
 L sx2 sy1
@@ -6791,6 +7001,7 @@ g sy3 +- svc sdy3 0
 g sy4 +- svc ihd2 0
 g yAdj +- svc 0 ihd2
 r sx2 sy1 sx5 sy3
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M x1 y2
 L sx1 sy2
@@ -6832,6 +7043,7 @@ g sy3 +- vc sdy2 0
 g sy4 +- vc sdy1 0
 g yAdj +- vc 0 ihd2
 r sx1 sy1 sx4 sy4
+h - - - adj 0 50000 hc yAdj
 p 0 0 n 1
 M l vc
 L sx1 sy2
@@ -6870,6 +7082,8 @@ g y2 +- vc dy1 0
 g dx6 */ dy1 dx5 hd2
 g x6 +- r 0 dx6
 r x4 y1 x6 y2
+h - - - adj1 0 100000 l y1
+h adj2 0 maxAdj2 - - - x5 t
 p 0 0 n 1
 M l y1
 L ssd32 y1
@@ -6939,6 +7153,7 @@ g y16 */ h g16 100000
 g y17 */ h g17 100000
 g y18 */ h g18 100000
 r x9 y9 x8 y8
+h adj 12500 46875 - - - x19 vc
 p 0 0 n 1
 M r vc
 L x15 y18
@@ -7004,6 +7219,8 @@ g dy5 */ hd6 1 2
 g yP2 +- yF dy5 0
 g xP2 val wd4
 r l t r b
+h - - - adj1 1 75000 xF yF
+h adj2 0 maxAdj2 - - - xB yB
 p 0 0 n 1
 M l b
 Q xP1 yP1 xB yB
@@ -7034,6 +7251,7 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h adj 0 200000 - - - x1 t
 p 0 0 n 1
 M l vc
 A wd2 hd2 cd2 cd4
@@ -7054,6 +7272,7 @@ g il */ wd3 a maxAdj
 g it */ hd3 a maxAdj
 g ir +- r 0 il
 r il it ir b
+h adj 0 maxAdj - - - x2 t
 p 0 0 n 1
 M l b
 L x2 t
@@ -7067,6 +7286,7 @@ g x1 */ w a 200000
 g x2 */ w a 100000
 g x3 +- x1 wd2 0
 r x1 vc x3 b
+h adj 0 100000 - - - x2 t
 p 0 0 n 1
 M l b
 L x2 t
@@ -7097,6 +7317,10 @@ g dy2 */ h a4 100000
 g y2 +- b 0 dy2
 g y3 +/ y2 b 2
 r l y2 r b
+h adj1 0 maxAdj1 - - - x2 y1
+h adj2 0 maxAdj2 - - - x1 t
+h - - - adj3 0 maxAdj3 r y1
+h - - - adj4 0 maxAdj4 l y2
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -7125,6 +7349,8 @@ g dy1 */ x1 y2 wd2
 g y1 +- y2 0 dy1
 g y4 +- y3 dy1 0
 r x1 y1 x2 y4
+h adj1 0 100000 - - - x1 y3
+h - - - adj2 0 maxAdj2 l y2
 p 0 0 n 1
 M l y2
 L hc t
@@ -7151,6 +7377,8 @@ g x2 +- hc dx1 0
 g dy1 */ x1 dy2 wd2
 g y1 +- y2  0 dy1
 r x1 y1 x2 b
+h adj1 0 100000 - - - x1 b
+h - - - adj2 0 maxAdj2 l y2
 p 0 0 n 1
 M l y2
 L hc t
@@ -7186,6 +7414,10 @@ g dy2 */ h a4 200000
 g y2 +- vc 0 dy2
 g y3 +- vc dy2 0
 r l y2 r y3
+h adj1 0 maxAdj1 - - - x2 y1
+h adj2 0 maxAdj2 - - - x1 t
+h - - - adj3 0 maxAdj3 r y1
+h - - - adj4 0 maxAdj4 l y2
 p 0 0 n 1
 M l y2
 L x2 y2
@@ -7245,6 +7477,11 @@ g x4 +- x9 0 bd
 g x5 +- x7 0 bd2
 g cx +/ th x7 2
 r l t r b
+h adj1 0 maxAdj1 - - - th b
+h adj2 0 25000 - - - x6 b
+h - - - adj3 0 maxAdj3 x6 y4
+h adj4 0 maxAdj4 - - - bd t
+h - - - adj5 minAdj5 100000 r y5
 p 0 0 n 1
 M l b
 L l bd
@@ -7276,6 +7513,7 @@ g x5 +- x6 0 ch2
 g y3 +- b 0 ch
 g y4 +- b 0 ch2
 r ch ch x6 y4
+h - - - adj 0 25000 l ch
 p 0 0 n 0
 M ch2 b
 A ch2 ch2 cd4 -5400000
@@ -7361,6 +7599,8 @@ g ir min x5 x10
 g it */ h a1 50000
 g ib +- b 0 it
 r il it ir ib
+h - - - adj1 0 20000 l y1
+h adj2 -10000 10000 - - - xAdj b
 p 0 0 n 1
 M x2 y1
 C x3 y2 x4 y3 x5 y1
@@ -7399,6 +7639,7 @@ g ir +- hc idx 0
 g it +- vc 0 idy
 g ib +- vc idy 0
 r il it ir ib
+h adj1 -2147483647 2147483647 adj2 -2147483647 2147483647 xPos yPos
 p 0 0 n 1
 M xPos yPos
 L x1 y1
@@ -7442,6 +7683,7 @@ g yr ?: dz y1 t7
 g t8 ?: dyPos yPos b
 g yb ?: dz t8 b
 r l t r b
+h adj1 -2147483647 2147483647 adj2 -2147483647 2147483647 xPos yPos
 p 0 0 n 1
 M l t
 L x1 t
@@ -7503,6 +7745,7 @@ g il */ u1 29289 100000
 g ir +- r 0 il
 g ib +- b 0 il
 r il il ir ib
+h adj1 -2147483647 2147483647 adj2 -2147483647 2147483647 xPos yPos
 p 0 0 n 1
 M l u1
 A u1 u1 cd2 cd4
