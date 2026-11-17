@@ -64,6 +64,35 @@ pub enum Act {
     Create(String),
     /// Run `cargo atrium check` again.
     Check,
+    /// Debugging (F5: build and start, or continue when stopped).
+    Debug,
+    StopDebug,
+    StepOver,
+    StepIn,
+    StepOut,
+    /// A breakpoint on (0-based) line of the active file, on or off;
+    /// `usize::MAX`: the caret's line.
+    Breakpoint(usize),
+    /// Show a frame of the stopped program.
+    Frame(usize),
+    /// Fuzzing on or off for the project.
+    Fuzz,
+    /// Go to where a fuzz crash happened.
+    Crash(usize),
+    /// Run the crashing input under the debugger.
+    ReplayCrash(usize),
+}
+
+/// The debugger as the window shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Debug {
+    /// "Starting", "Running", "Stopped (breakpoint)", "Exited (0)".
+    pub run: String,
+    pub stopped: bool,
+    pub live: bool,
+    /// name, file in work, 1-based line.
+    pub frames: Vec<(String, Option<String>, usize)>,
+    pub locals: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,6 +101,8 @@ pub enum Panel {
     Output,
     Problems,
     Composition,
+    Debug,
+    Fuzz,
 }
 
 /// A tab as the bar shows it.
@@ -91,6 +122,9 @@ pub struct DocCells {
     pub spans: Mutable<Rc<LineSpans>>,
     /// Gutter marks: line, 0 error / 1 warning / 2 note.
     pub marks: Mutable<Vec<(usize, u8)>>,
+    pub breakpoints: Mutable<Vec<usize>>,
+    /// The line the debugger stopped at, in this file.
+    pub stopped: Mutable<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -129,6 +163,10 @@ pub struct State {
     pub creating: bool,
     pub templates: Vec<(String, String)>,
     pub template: usize,
+    /// Breakpoints: file in work → 0-based lines.
+    pub breakpoints: std::collections::BTreeMap<String, Vec<usize>>,
+    pub debug: Option<Debug>,
+    pub fuzz: Option<crate::fuzz::Fuzz>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -163,6 +201,12 @@ pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
         (Key::PageDown, true, _) => Some(Act::CycleTab(true)),
         (Key::PageUp, true, _) => Some(Act::CycleTab(false)),
         (Key::F(12), _, _) => Some(Act::Definition),
+        (Key::F(5), _, true) => Some(Act::StopDebug),
+        (Key::F(5), _, false) => Some(Act::Debug),
+        (Key::F(9), _, _) => Some(Act::Breakpoint(usize::MAX)),
+        (Key::F(10), _, _) => Some(Act::StepOver),
+        (Key::F(11), _, true) => Some(Act::StepOut),
+        (Key::F(11), _, false) => Some(Act::StepIn),
         (Key::Escape, false, false) => Some(Act::HidePanel),
         _ => None,
     }
@@ -242,6 +286,27 @@ impl View for ArtifexView {
                 Button::secondary(task.label.clone()).at(x, mid - em(16.0)).width(bw).on_click(plain(q, Act::Task(i))).render(ctx);
             }
             x += bw + em(8.0);
+        }
+        if s.ws.is_some() && s.running.is_none() {
+            let live = s.debug.as_ref().is_some_and(|d| d.live);
+            let stopped = s.debug.as_ref().is_some_and(|d| d.stopped);
+            let mut buttons: Vec<(&str, Act)> = Vec::new();
+            if !live {
+                if !s.tasks.is_empty() {
+                    buttons.push(("Debug", Act::Debug));
+                }
+            } else {
+                if stopped {
+                    buttons.extend([("Continue", Act::Debug), ("Over", Act::StepOver), ("Into", Act::StepIn), ("Out", Act::StepOut)]);
+                }
+                buttons.push(("Stop", Act::StopDebug));
+            }
+            for (i, (label, a)) in buttons.into_iter().enumerate() {
+                ctx.key(30 + i as u64);
+                let bw = em(18.0 + 8.0 * label.len() as f32);
+                Button::ghost(label).at(x, mid - em(16.0)).width(bw).on_click(plain(q, a)).render(ctx);
+                x += bw + em(4.0);
+            }
         }
         if let Some(r) = &s.running {
             ctx.key(40);
@@ -357,6 +422,12 @@ impl View for ArtifexView {
                 .rect(er)
                 .highlight(doc.spans.get_cloned())
                 .marks(doc.marks.get_cloned())
+                .breakpoints(doc.breakpoints.get_cloned())
+                .stopped(doc.stopped.get_cloned())
+                .on_gutter_click({
+                    let q3 = q.clone();
+                    Rc::new(move |line| push(&q3, Act::Breakpoint(line)))
+                })
                 .autofocus(true)
                 .on_other_key(Rc::new(move |k, m, c| {
                     if let Some(a) = shortcut(k, m, c) {
@@ -390,6 +461,12 @@ impl View for ArtifexView {
             let mut tabs = vec![(Panel::Output, "Output".to_string()), (Panel::Problems, format!("Problems ({})", s.problems.len()))];
             if s.composition.is_some() {
                 tabs.push((Panel::Composition, "Composition".to_string()));
+            }
+            if s.debug.is_some() {
+                tabs.push((Panel::Debug, "Debug".to_string()));
+            }
+            if let Some(f) = &s.fuzz {
+                tabs.push((Panel::Fuzz, if f.crashes.is_empty() { "Fuzz".to_string() } else { format!("Fuzz ({})", f.crashes.len()) }));
             }
             for (i, (p, label)) in tabs.into_iter().enumerate() {
                 ctx.key(4000 + i as u64);
@@ -425,6 +502,61 @@ impl View for ArtifexView {
                             None => t.text_primary(),
                         };
                         text(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                    }
+                }
+                Panel::Debug => {
+                    let Some(d) = &s.debug else { return };
+                    text(ctx, side_w() + em(12.0), body_y, &d.run, type_size::SM, Weight::Medium, t.text_primary());
+                    let half = (w - side_w()) / 2.0;
+                    for (i, (name, file, line)) in d.frames.iter().take(lines_fit.saturating_sub(1)).enumerate() {
+                        let y = body_y + (i + 1) as f32 * em(18.0);
+                        ctx.key(5500 + i as u64);
+                        let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), half - em(8.0), em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                        if ctx.is_hovered(id) {
+                            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                                *fill = t.state_hover();
+                            }
+                        }
+                        ctx.on_click(id, plain(q, Act::Frame(i)));
+                        let place = match file { Some(f) => format!("{name}  {f}:{line}"), None => name.clone() };
+                        mono(ctx, side_w() + em(12.0), y, &fit(&place, half - em(24.0), type_size::SM),
+                            if file.is_some() { t.text_primary() } else { t.text_tertiary() });
+                        ctx.pop();
+                    }
+                    for (i, (name, value)) in d.locals.iter().take(lines_fit.saturating_sub(1)).enumerate() {
+                        let y = body_y + (i + 1) as f32 * em(18.0);
+                        mono(ctx, side_w() + half, y, &fit(&format!("{name} = {value}"), half - em(16.0), type_size::SM), t.text_primary());
+                    }
+                }
+                Panel::Fuzz => {
+                    let Some(f) = &s.fuzz else { return };
+                    if f.listed && !f.targets.is_empty() {
+                        ctx.key(4030);
+                        Button::ghost(if f.on { "Stop fuzzing" } else { "Start fuzzing" }).at(w - em(220.0), py + em(4.0)).width(em(130.0))
+                            .on_click(plain(q, Act::Fuzz)).render(ctx);
+                    }
+                    for (i, (core, l, crash)) in f.lines().into_iter().take(lines_fit).enumerate() {
+                        let y = body_y + i as f32 * em(18.0);
+                        let color = match core { Some(true) => t.danger_fg(), Some(false) => t.warning_fg(), None => t.text_primary() };
+                        if let Some(c) = crash {
+                            ctx.key(5800 + i as u64);
+                            let id = ctx.push(Node::Rect { rect: Rect::new(side_w() + em(4.0), y - em(9.0), width, em(18.0)), fill: Color::TRANSPARENT, radius: 0.0 });
+                            if ctx.is_hovered(id) {
+                                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                                    *fill = t.state_hover();
+                                }
+                            }
+                            ctx.on_click(id, plain(q, Act::Crash(c)));
+                            text(ctx, side_w() + em(12.0), y, &fit(&l, width - em(90.0), type_size::SM), type_size::SM, Weight::Regular, color);
+                            if core.is_some() {
+                                ctx.key(1);
+                                Button::ghost("Debug it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
+                                    .on_click(plain(q, Act::ReplayCrash(c))).render(ctx);
+                            }
+                            ctx.pop();
+                        } else {
+                            text(ctx, side_w() + em(12.0), y, &fit(&l, width, type_size::SM), type_size::SM, Weight::Regular, color);
+                        }
                     }
                 }
                 Panel::Problems => {

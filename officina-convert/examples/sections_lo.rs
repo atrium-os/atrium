@@ -18,11 +18,11 @@ fn main() {
     let dir: PathBuf = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("sections-lo"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let d = s::sections_doc();
-    let want = s::shape(&d);
     let (mut pass, mut fail) = (0, 0);
+    for (kind, d) in [("columns", s::sections_doc()), ("odd-even", s::odd_even_doc())] {
+    let want = s::shape(&d);
     for (ours, bytes) in [("docx", docx::write(&d, Vec::new()).unwrap()), ("odt", odt::write(&d, Vec::new()).unwrap())] {
-        let src = dir.join(format!("ours-{ours}.{ours}"));
+        let src = dir.join(format!("ours-{kind}-{ours}.{ours}"));
         std::fs::write(&src, &bytes).unwrap();
         for (theirs, filter) in [("docx", "docx:MS Word 2007 XML"), ("odt", "odt")] {
             let out = dir.join(format!("lo-{ours}"));
@@ -35,7 +35,7 @@ fn main() {
             };
             let r = if theirs == "docx" { docx::read(&b).expect("our reader takes LibreOffice's .docx").0 } else { odt::read(&b).expect("our reader takes LibreOffice's .odt").0 };
             let got = s::shape(&r);
-            let route = format!("{ours} → LibreOffice → {theirs}");
+            let route = format!("{kind}: {ours} → LibreOffice → {theirs}");
             if got == want {
                 pass += 1;
                 println!("ok   {route}: sections");
@@ -52,6 +52,7 @@ fn main() {
                 println!("FAIL {route}: text: {:?}", texts(&r));
             }
         }
+    }
     }
     println!("sections via LibreOffice: {pass} of {} checks pass", pass + fail);
     if fail > 0 {

@@ -20,6 +20,12 @@ Commands:
       Build for Atrium on that arch from Linux, macOS or the other arch:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
       ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
+  fuzz --list [--json]
+  fuzz <target> [--json] [--max-time <secs>]
+      Fuzz a worker or an input surface of the core with libFuzzer
+      (targets: package.metadata.atrium.fuzz tables named worker:x or
+      core:x in Cargo.toml, with function = mylib::f). Stops at the first crash; the
+      input is saved in fuzz/crashes/<target>/. --json: one event a line.
   registry verify <folder or https URL> [--keys <dir or .pem>]
       Check the SDK registry's index against the platform keys
       (default /etc/atrium/platform-keys): index.sig over index.files,
@@ -41,6 +47,7 @@ fn main() -> ExitCode {
         Some("new") => cmd_new(&args[1..]),
         Some("cross") => cmd_cross(&args[1..]),
         Some("registry") => cmd_registry(&args[1..]),
+        Some("fuzz") => cmd_fuzz(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -379,4 +386,177 @@ fn cmd_registry(args: &[String]) -> ExitCode {
         }
         _ => fail("build or verify".into()),
     }
+}
+
+fn cmd_fuzz(args: &[String]) -> ExitCode {
+    use cargo_atrium::fuzz;
+    use std::io::{BufRead, BufReader};
+    let (mut list, mut jsonl, mut max_time, mut name) = (false, false, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--list" => list = true,
+            "--json" => jsonl = true,
+            "--max-time" => max_time = it.next().and_then(|v| v.parse::<u64>().ok()),
+            o if o.starts_with("--") => {
+                eprintln!("cargo atrium fuzz: unknown flag {o}");
+                return ExitCode::from(2);
+            }
+            o => name = Some(o.to_string()),
+        }
+    }
+    let fail = |m: String| {
+        if jsonl {
+            println!("{}", serde_json::json!({"event": "error", "message": m}));
+        } else {
+            eprintln!("cargo atrium fuzz: {m}");
+        }
+        ExitCode::FAILURE
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut d = Some(cwd.as_path());
+    let mut manifest = None;
+    while let Some(x) = d {
+        if x.join("Cargo.toml").is_file() {
+            manifest = Some(x.join("Cargo.toml"));
+            break;
+        }
+        d = x.parent();
+    }
+    let Some(manifest) = manifest else { return fail("no Cargo.toml here or above".into()) };
+    let project = manifest.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let text = match std::fs::read_to_string(&manifest) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("{}: {e}", manifest.display())),
+    };
+    let targets = match fuzz::targets(&text) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    if list {
+        if jsonl {
+            let v: Vec<_> = targets.iter().map(|t| t.to_json()).collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        } else if targets.is_empty() {
+            println!("No fuzz targets: declare them in Cargo.toml as [package.metadata.atrium.fuzz.\"worker:<name>\"] function = \"mylib::f\"");
+        } else {
+            for t in &targets {
+                println!("  {:<24} {}", t.name, t.about);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let Some(name) = name else { return fail("which target? (--list shows them)".into()) };
+    let Some(t) = targets.iter().find(|t| t.name == name) else { return fail(format!("no fuzz target {name:?}")) };
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let meta = match Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).current_dir(&project).output() {
+        Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_default(),
+        _ => return fail("cargo metadata failed".into()),
+    };
+    let Some(lib) = fuzz::lib_name(&meta, &manifest) else {
+        return fail("the project has no lib crate: put the fuzzed functions in src/lib.rs".into());
+    };
+    let tdir = meta["target_directory"].as_str().map(PathBuf::from).unwrap_or_else(|| project.join("target"));
+    let hdir = tdir.join("atrium-fuzz").join(t.slug());
+    let (hc, hm) = fuzz::harness(t, &lib, &project);
+    if let Err(e) = std::fs::create_dir_all(hdir.join("src"))
+        .and_then(|_| std::fs::write(hdir.join("Cargo.toml"), hc))
+        .and_then(|_| std::fs::write(hdir.join("src/main.rs"), hm))
+    {
+        return fail(format!("{}: {e}", hdir.display()));
+    }
+    let htarget = tdir.join("atrium-fuzz").join("target");
+    // With --target, RUSTFLAGS reach only the harness and its dependencies,
+    // not build scripts and proc macros (which have no fuzzer to link).
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let host = Command::new(&rustc).arg("-vV").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("host: ").map(str::to_string)));
+    let Some(host) = host else { return fail(format!("{rustc} -vV: no host")) };
+    let mut b = Command::new(&cargo);
+    b.args(["build", "--release", "--target", &host, "--manifest-path"]).arg(hdir.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", &htarget)
+        .env("RUSTFLAGS", fuzz::RUSTFLAGS);
+    if jsonl {
+        b.arg("-q").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        match b.output() {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let e = String::from_utf8_lossy(&o.stderr);
+                let tail: Vec<&str> = e.lines().rev().take(30).collect();
+                return fail(format!("build failed:\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n")));
+            }
+            Err(e) => return fail(format!("{cargo}: {e}")),
+        }
+    } else {
+        match b.status() {
+            Ok(s) if s.success() => {}
+            _ => return fail("build failed".into()),
+        }
+    }
+    let binary = htarget.join(&host).join("release").join(format!("atrium-fuzz-{}", t.slug()));
+    let corpus = Path::new("fuzz/corpus").join(t.slug());
+    let crashes = Path::new("fuzz/crashes").join(t.slug());
+    for d in [&corpus, &crashes] {
+        if let Err(e) = std::fs::create_dir_all(project.join(d)) {
+            return fail(format!("{}: {e}", d.display()));
+        }
+    }
+    let start = std::time::Instant::now();
+    let mut child = match Command::new(&binary)
+        .args(fuzz::fuzzer_args(&corpus, &crashes, max_time))
+        .current_dir(&project)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return fail(format!("{}: {e}", binary.display())),
+    };
+    if !jsonl {
+        println!("cargo atrium fuzz: {} ({}) with {}", t.name, t.function, binary.display());
+    }
+    let mut p = fuzz::Parse::default();
+    let (mut ncrash, mut last) = (0u64, std::time::Instant::now() - std::time::Duration::from_secs(2));
+    let stderr = child.stderr.take().expect("piped");
+    for l in BufReader::new(stderr).lines().map_while(Result::ok) {
+        match p.line(&l, &project) {
+            Some(fuzz::Event::Progress { execs, corpus }) if last.elapsed().as_secs() >= 1 => {
+                last = std::time::Instant::now();
+                let secs = start.elapsed().as_secs();
+                if jsonl {
+                    println!("{}", serde_json::json!({"event": "progress", "execs": execs, "corpus": corpus, "secs": secs}));
+                } else {
+                    println!("  {execs} runs, corpus {corpus}, {secs} s");
+                }
+            }
+            Some(fuzz::Event::Crash { input, summary, frame }) => {
+                ncrash += 1;
+                if jsonl {
+                    println!("{}", serde_json::json!({
+                        "event": "crash", "target": t.name, "input": input.display().to_string(),
+                        "summary": summary, "frame": frame, "in_core": t.in_core(), "fix": fuzz::fix(t),
+                        "binary": binary.display().to_string(),
+                    }));
+                } else {
+                    println!("crash in {}: {summary}", t.name);
+                    if let Some(f) = &frame {
+                        println!("  at {f}");
+                    }
+                    println!("  input: {}\n  replay: {} {}", input.display(), binary.display(), input.display());
+                    if let Some(f) = fuzz::fix(t) {
+                        println!("  this input crashed the core, which holds the app's capabilities: {f}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = child.wait();
+    if jsonl {
+        println!("{}", serde_json::json!({"event": "done", "crashes": ncrash, "execs": p.execs, "secs": start.elapsed().as_secs()}));
+    } else {
+        println!("cargo atrium fuzz: {} runs, {ncrash} crash(es)", p.execs);
+    }
+    if ncrash > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

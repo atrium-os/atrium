@@ -48,3 +48,39 @@ fn sections_round_trip() {
         assert_eq!(r.blocks.len(), d.blocks.len(), "{fmt}");
     }
 }
+
+/// Sections starting on odd and even pages, one with a page of its own.
+pub fn odd_even_doc() -> TextDoc {
+    let mut d = TextDoc::new();
+    d.blocks.remove(0);
+    for i in 0..8 {
+        d.push_para(&format!("Paragraph {i}."), 0, vec![]);
+    }
+    let mark = |d: &mut TextDoc, k: usize, s: Section| {
+        d.blocks.update(k, |b| b.as_para_mut().unwrap().props.section = Some(s));
+    };
+    mark(&mut d, 2, Section { start: SectionStart::OddPage, ..Section::default() });
+    mark(&mut d, 4, Section { start: SectionStart::EvenPage, ..Section::default() });
+    mark(&mut d, 6, Section { start: SectionStart::OddPage, page: Some(PageSetup { width: 16838, height: 11906, margin_top: 1000, margin_bottom: 1000, margin_start: 1200, margin_end: 1200 }), ..Section::default() });
+    mark(&mut d, 7, Section { start: SectionStart::EvenPage, ..Section::default() });
+    d
+}
+
+#[test]
+fn odd_and_even_pages_round_trip() {
+    let d = odd_even_doc();
+    let want = shape(&d);
+    assert_eq!(want.len(), 4);
+    for fmt in ["docx", "odt"] {
+        let (r, rep) = if fmt == "docx" {
+            let (r, l) = docx::read(&docx::write(&d, Vec::new()).unwrap()).unwrap();
+            (r, l.report)
+        } else {
+            let (r, l) = odt::read(&odt::write(&d, Vec::new()).unwrap()).unwrap();
+            (r, l.report)
+        };
+        assert_eq!(shape(&r), want, "{fmt}");
+        assert!(rep.is_empty(), "{fmt}: {:?}", rep.human());
+        assert!(r.blocks.iter().filter_map(|b| b.as_para()).all(|p| p.props.page_break_before.is_none()), "{fmt}: no stray page breaks");
+    }
+}

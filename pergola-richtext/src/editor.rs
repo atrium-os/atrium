@@ -1904,7 +1904,9 @@ impl Editor {
         }
         let (mut ops, p) = self.delete_selection_ops();
         let cur = Section { start, ..self.section() };
-        let at_start = p.at == 0 && p.block > 0 && self.doc.para(p.block).is_some_and(|q| q.props.section.is_none());
+        // At the start of a paragraph the break goes before it; one that
+        // already starts a section changes how it starts.
+        let at_start = p.at == 0 && p.block > 0;
         let b = if at_start {
             let q = self.doc.para(p.block).expect("in range");
             let mut props = q.props.clone();

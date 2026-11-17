@@ -99,6 +99,16 @@ mod imp {
     const PROBE_RETRY_MS: u64 = 30_000;
     /// A dead probe process is started again after this long.
     const PROBE_AGAIN_MS: u64 = 10_000;
+    const UNBOUND_CHECK_MS: u64 = 10_000;
+
+    /// The root zone's forwarders in `unbound-control list_forwards` output
+    /// (". IN forward A B ..."), without scope suffixes.
+    fn root_forwards(s: &str) -> Vec<String> {
+        s.lines()
+            .find_map(|l| l.strip_prefix(". IN forward "))
+            .map(|r| r.split_whitespace().filter(|w| !w.starts_with('+')).map(|w| w.split('%').next().unwrap_or(w).to_string()).collect())
+            .unwrap_or_default()
+    }
     const PROBE_CONFIRM_MS: u64 = 5_000;
 
     struct Opts {
@@ -305,6 +315,7 @@ mod imp {
         prober: Option<Prober>,
         /// A probe process that died, started again at this time.
         probe_again: Option<(ProbeCfg, u64)>,
+        unbound_check_at: u64,
         spawner: Spawner,
         netd: Option<Dir>,
         /// The interface group pf's NAT rule names (`nat on atrium_egress`):
@@ -442,6 +453,31 @@ mod imp {
                 }
                 Ok(s) => eprintln!("atrium-net: unbound said {:?}", s.trim_end()),
                 Err(e) => eprintln!("atrium-net: unbound: {e}"),
+            }
+        }
+
+        /// Every 10 s: does unbound still forward to our servers? A restart
+        /// of local-unbound (or one that was down when we set them) falls
+        /// back to forward.conf; set them again.
+        fn unbound_tick(&mut self) {
+            let now = self.now();
+            if now < self.unbound_check_at || self.forwarders.is_empty() {
+                return;
+            }
+            self.unbound_check_at = now + UNBOUND_CHECK_MS;
+            let Some(u) = &self.unbound else { return };
+            let have = match u.cmd("list_forwards") {
+                Ok(s) => root_forwards(&s),
+                Err(_) => return, // down: try again next time
+            };
+            let mut want: Vec<String> = self.forwarders.iter().map(|x| x.split('%').next().unwrap_or(x).to_string()).collect();
+            let mut have = have;
+            want.sort();
+            have.sort();
+            if want != have {
+                self.log(&format!("unbound forwards {:?}, not ours: setting them again", have));
+                self.forwarders.clear();
+                self.forward();
             }
         }
 
@@ -1528,6 +1564,7 @@ mod imp {
             announced: None,
             prober: None,
             probe_again: None,
+            unbound_check_at: 0,
             spawner,
             netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
             egress_group: o.egress_group.clone(),
@@ -1791,6 +1828,7 @@ mod imp {
             net.probe_tick();
             net.probe_restart();
             net.lease_restart_tick();
+            net.unbound_tick();
         }
     }
 

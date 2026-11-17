@@ -649,7 +649,8 @@ font on demand and a driver from a `nobody` device's notice.
   be listed there too until launch reads the installed record (C5).
 - Checked: host tests (archive round trip and refusals; daemon: sync, describe, search,
   person refused, catalog install, update, rollback, uninstall, missing and wrong archive,
-  untrusted and trusted side-load, garbage archive). VM gate `scripts/vm-opifex-c2-check.sh`.
+  untrusted and trusted side-load, garbage archive). VM gate `scripts/vm-opifex-c2-check.sh` on the
+  Mac VM (arm64) 2026-11-17: 0 failed.
 
 ### 14.4 C3 as built (2026-11-17)
 
@@ -679,7 +680,9 @@ font on demand and a driver from a `nobody` device's notice.
   callers themselves (Monstrator L5, the Navigator prompt), which their threads add.
 - Checked: host tests (sheet state and keys, layout, plain words, opifex-sheetd against a
   stand-in opifexd, opifexd refusing a person, a forged sender and a changed release).
-  VM gate `scripts/vm-opifex-c3-check.sh` (frescod headless with real presses).
+  VM gate `scripts/vm-opifex-c3-check.sh` (frescod headless with real presses) on the Mac VM
+  (arm64) 2026-11-17: 0 failed (the sheet as `_opifexsheet`, Not now, quiet repeat, Install
+  recorded for the asker, forged request refused).
 
 ## 15. Decisions, with recommendations
 

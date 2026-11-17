@@ -13,11 +13,12 @@ use pergola::code::CodeBuffer;
 use pergola::widgets::CodeView;
 use pergola::Mutable;
 
+use crate::dap;
 use crate::exec::{Exec, Proc};
 use crate::lsp;
 use crate::tasks::{self, Severity};
 use crate::tree::{self, Tree};
-use crate::ui::{Act, DocCells, Panel, State, Tab};
+use crate::ui::{Act, Debug, DocCells, Panel, State, Tab};
 
 /// Output kept from a task (the tail).
 pub const OUTPUT_MAX: usize = 1 << 20;
@@ -54,6 +55,9 @@ enum Job {
     Check { project: String },
     Templates,
     New { dir: String },
+    FuzzList { project: String },
+    /// Streams JSON lines; `buf` holds the unfinished one.
+    FuzzRun { target: String },
 }
 
 /// Files that make a folder a project (its tasks, its composition).
@@ -76,6 +80,9 @@ pub struct Engine {
     next_git: Instant,
     /// Visible rows, from the window size.
     pub rows: usize,
+    debugger: Option<(dap::Session, Proc)>,
+    /// Start debugging when the build that's running succeeds.
+    debug_after_build: bool,
 }
 
 fn title_of(rel: &str) -> String {
@@ -113,6 +120,8 @@ impl Engine {
             no_server: Vec::new(),
             next_git: Instant::now(),
             rows: 40,
+            debugger: None,
+            debug_after_build: false,
         }
     }
 
@@ -253,6 +262,65 @@ impl Engine {
             Act::Template(i) => s.template = i.min(s.templates.len().saturating_sub(1)),
             Act::Create(name) => self.create(&name, s),
             Act::Check => self.check(s),
+            Act::Debug => self.debug(s),
+            Act::StopDebug => {
+                if let Some((sess, proc)) = &mut self.debugger {
+                    sess.stop();
+                    let out = sess.take_output();
+                    proc.write(&out);
+                }
+                self.debug_after_build = false;
+            }
+            Act::StepOver | Act::StepIn | Act::StepOut => {
+                if let Some((sess, _)) = &mut self.debugger {
+                    match a {
+                        Act::StepOver => sess.next(),
+                        Act::StepIn => sess.step_in(),
+                        _ => sess.step_out(),
+                    }
+                }
+            }
+            Act::Breakpoint(line) => self.toggle_breakpoint(line, s),
+            Act::Fuzz => {
+                if let Some(f) = &mut s.fuzz {
+                    f.on = !f.on;
+                    if !f.on {
+                        self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. }));
+                        f.running = None;
+                    }
+                }
+            }
+            Act::Crash(i) => {
+                let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
+                if let Some(frame) = c.and_then(|c| c.frame) {
+                    let (file, line) = frame.rsplit_once(':').map(|(f, l)| (f.to_string(), l.parse::<usize>().unwrap_or(1))).unwrap_or((frame.clone(), 1));
+                    match join_rel(&s.project, &file) {
+                        Some(rel) => {
+                            self.open(&rel, s);
+                            self.goto(line.saturating_sub(1), Some(0), None);
+                        }
+                        None => s.note = Some((format!("{file} is outside work"), true)),
+                    }
+                }
+            }
+            Act::ReplayCrash(i) => {
+                let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
+                match c {
+                    Some(c) if c.binary.is_some() => {
+                        // The harness with the crashing input, stopped where it crashes.
+                        let input = c.input.clone();
+                        self.start_debug_of(c.binary.as_deref().unwrap(), &[input], s);
+                    }
+                    _ => s.note = Some(("This crash can't be replayed: the fuzzer didn't say which binary".into(), true)),
+                }
+            }
+            Act::Frame(i) => {
+                let f = s.debug.as_ref().and_then(|d| d.frames.get(i)).cloned();
+                if let Some((_, Some(rel), line)) = f {
+                    self.open(&rel, s);
+                    self.goto(line.saturating_sub(1), Some(0), None);
+                }
+            }
         }
         self.sync_tabs(s);
         if self.active != before {
@@ -337,8 +405,193 @@ impl Engine {
         };
         if s.composition.is_some() {
             self.check(s);
-        } else if s.panel == Panel::Composition {
-            s.panel = Panel::Output;
+            if s.fuzz.is_none() {
+                s.fuzz = Some(crate::fuzz::Fuzz::default());
+                let argv: Vec<String> = crate::fuzz::LIST_ARGV.iter().map(|a| a.to_string()).collect();
+                if !self.start_job(Job::FuzzList { project: p.clone() }, &argv, &p, s) {
+                    s.fuzz = None;
+                }
+            }
+        } else {
+            if matches!(s.panel, Panel::Composition | Panel::Fuzz) {
+                s.panel = Panel::Output;
+            }
+            self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. } | Job::FuzzList { .. }));
+            s.fuzz = None;
+        }
+    }
+
+    fn toggle_breakpoint(&mut self, line: usize, s: &mut State) {
+        let Some(d) = self.active.and_then(|i| self.docs.get(i)) else { return };
+        let line = if line == usize::MAX {
+            let b = d.cells.buffer.get_cloned();
+            b.line_col(b.primary().head).0
+        } else {
+            line
+        };
+        let rel = d.rel.clone();
+        let path = d.cells.path.clone();
+        let list = s.breakpoints.entry(rel.clone()).or_default();
+        if let Some(i) = list.iter().position(|&l| l == line) {
+            list.remove(i);
+        } else {
+            list.push(line);
+            list.sort_unstable();
+        }
+        let lines: Vec<usize> = list.iter().map(|l| l + 1).collect();
+        if list.is_empty() {
+            s.breakpoints.remove(&rel);
+        }
+        if let Some((sess, proc)) = &mut self.debugger {
+            sess.set_breakpoints(&path, lines);
+            let out = sess.take_output();
+            proc.write(&out);
+        }
+    }
+
+    /// What the project builds to run, relative to `work`.
+    fn program(&self, s: &State) -> Option<String> {
+        let p = &s.project;
+        let dir = if p.is_empty() { self.root.clone() } else { self.root.join(p) };
+        let within = |f: String| if p.is_empty() { f } else { format!("{p}/{f}") };
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            let v: toml::Value = text.parse().ok()?;
+            let name = v.get("package")?.get("name")?.as_str()?;
+            return Some(within(format!("target/debug/{name}")));
+        }
+        let t = s.tasks.iter().find(|t| t.kind == tasks::Kind::Build)?;
+        // `cc … -o <name> <file>`: the single-file C project.
+        let o = t.argv.iter().position(|a| a == "-o")?;
+        Some(within(t.argv.get(o + 1)?.clone()))
+    }
+
+    /// F5: continue when stopped; else build, then start under lldb-dap.
+    fn debug(&mut self, s: &mut State) {
+        if let Some((sess, proc)) = &mut self.debugger {
+            if matches!(sess.run, dap::Run::Stopped(_)) {
+                sess.resume();
+                let out = sess.take_output();
+                proc.write(&out);
+            }
+            return;
+        }
+        if s.running.is_some() {
+            return;
+        }
+        match s.tasks.iter().position(|t| t.kind == tasks::Kind::Build) {
+            Some(i) => {
+                self.debug_after_build = true;
+                self.run_task(i, s);
+            }
+            None => self.start_debug(s),
+        }
+    }
+
+    fn start_debug(&mut self, s: &mut State) {
+        let Some(program) = self.program(s) else {
+            s.note = Some(("Artifex can't tell what this project runs: debugging needs a Cargo package or one C file".into(), true));
+            return;
+        };
+        self.start_debug_of(&program, &[], s);
+    }
+
+    /// Debug `program` (in work, or absolute in the workspace) with `args`.
+    fn start_debug_of(&mut self, program: &str, args: &[String], s: &mut State) {
+        let (Some(ws), Some(remote)) = (self.ws.clone(), self.remote_root.clone()) else { return };
+        if self.debugger.is_some() {
+            s.note = Some(("Stop the program being debugged first".into(), true));
+            return;
+        }
+        let argv: Vec<String> = dap::ADAPTER.iter().map(|a| a.to_string()).collect();
+        let proc = match self.exec.spawn(&ws, &argv, &s.project) {
+            Ok(p) => p,
+            Err(e) => {
+                s.note = Some((format!("Can't start lldb-dap in the workspace: {e}"), true));
+                return;
+            }
+        };
+        let bps = s.breakpoints.iter().map(|(rel, lines)| (self.root.join(rel), lines.iter().map(|l| l + 1).collect())).collect();
+        let sess = dap::Session::new(&self.root, &remote, program, args, &s.project, bps);
+        self.debugger = Some((sess, proc));
+        s.debug = Some(Debug { run: format!("Starting {program}"), live: true, ..Debug::default() });
+        s.output = format!("$ lldb-dap: {program}\n");
+        s.panel = Panel::Debug;
+        s.panel_open = true;
+    }
+
+    fn read_debugger(&mut self, s: &mut State) {
+        let Some((sess, proc)) = &mut self.debugger else { return };
+        let out = sess.take_output();
+        if out.is_empty() {
+            proc.flush();
+        } else {
+            proc.write(&out);
+        }
+        let (got, done) = proc.read(4 << 20);
+        let mut jump = None;
+        let mut ended = done;
+        if !got.is_empty() {
+            match sess.feed(&got) {
+                Ok(events) => {
+                    for e in events {
+                        match e {
+                            dap::Event::Output(o) => {
+                                s.output.push_str(&o);
+                            }
+                            dap::Event::Error(m) => s.note = Some((format!("Debugger: {m}"), true)),
+                            dap::Event::Frames => {
+                                if let Some(f) = sess.frames.iter().find(|f| f.file.is_some()) {
+                                    jump = Some((f.file.clone().unwrap(), f.line));
+                                }
+                            }
+                            dap::Event::State | dap::Event::Locals | dap::Event::Breakpoints(..) => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    s.note = Some((format!("Debugger: {e}"), true));
+                    ended = true;
+                }
+            }
+            let out = sess.take_output();
+            proc.write(&out);
+        }
+        let root = self.root.clone();
+        let rel = |p: &Path| tree::relative(&root, p);
+        let run = match &sess.run {
+            dap::Run::Starting => "Starting".to_string(),
+            dap::Run::Running => "Running".to_string(),
+            dap::Run::Stopped(why) => format!("Stopped ({why})"),
+            dap::Run::Exited(Some(c)) => format!("Exited ({c})"),
+            dap::Run::Exited(None) => "Ended".to_string(),
+        };
+        let exited = matches!(sess.run, dap::Run::Exited(_));
+        let d = Debug {
+            run,
+            stopped: matches!(sess.run, dap::Run::Stopped(_)),
+            live: !(ended || exited),
+            frames: sess.frames.iter().map(|f| (f.name.clone(), f.file.as_deref().and_then(rel), f.line)).collect(),
+            locals: sess.locals.iter().map(|v| (v.name.clone(), v.value.clone())).collect(),
+        };
+        if s.debug.as_ref() != Some(&d) {
+            s.debug = Some(d);
+        }
+        if ended || exited {
+            if exited {
+                let (sess, proc) = self.debugger.as_mut().unwrap();
+                sess.stop();
+                let out = sess.take_output();
+                proc.write(&out);
+            }
+            self.debugger = None;
+        }
+        if let Some((p, line)) = jump {
+            if let Some(r) = tree::relative(&self.root, &p) {
+                self.open(&r, s);
+                self.goto(line.saturating_sub(1), Some(0), None);
+                self.sync_tabs(s);
+                self.follow_project(s);
+            }
         }
     }
 
@@ -447,6 +700,8 @@ impl Engine {
             view: self.cell(CodeView::default()),
             spans: self.cell(Rc::new(LineSpans::default())),
             marks: self.cell(Vec::new()),
+            breakpoints: self.cell(Vec::new()),
+            stopped: self.cell(None),
         };
         let mut doc = Doc { cells, rel: rel.to_string(), lang, syntax, seen: 0, spans_at: (u64::MAX, 0), lsp_sent: 0, last_edit: Instant::now() };
         self.highlight(&mut doc, true);
@@ -692,6 +947,22 @@ impl Engine {
         }
         self.read_jobs(s);
         self.read_servers(s);
+        self.read_debugger(s);
+        // Background fuzzing: the next target, never while a task runs
+        // (they'd fight over the build folder).
+        if s.running.is_none() {
+            if let Some(t) = s.fuzz.as_mut().and_then(|f| f.next_target()) {
+                let p = s.project.clone();
+                if self.start_job(Job::FuzzRun { target: t.clone() }, &crate::fuzz::run_argv(&t), &p, s) {
+                    if let Some(f) = &mut s.fuzz {
+                        f.running = Some(t);
+                        f.execs = 0;
+                    }
+                } else if let Some(f) = &mut s.fuzz {
+                    f.on = false;
+                }
+            }
+        }
         if self.ws.is_some() && now >= self.next_git && !self.jobs.iter().any(|(j, _, _)| matches!(j, Job::Git)) {
             self.next_git = now + GIT_EVERY;
             let argv: Vec<String> = crate::git::STATUS_ARGV.iter().map(|a| a.to_string()).collect();
@@ -714,6 +985,18 @@ impl Engine {
                             cut += 1;
                         }
                         s.output.drain(..cut);
+                    }
+                }
+                Job::FuzzRun { target, .. } => {
+                    buf.extend_from_slice(&got);
+                    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=nl).collect();
+                        if let Some(f) = &mut s.fuzz {
+                            f.line(target, &String::from_utf8_lossy(&line));
+                        }
+                    }
+                    if buf.len() > OUTPUT_MAX {
+                        buf.clear();
                     }
                 }
                 _ => {
@@ -746,6 +1029,9 @@ impl Engine {
                     if s.composition.is_some() {
                         self.check(s);
                     }
+                    if std::mem::take(&mut self.debug_after_build) && errors == 0 {
+                        self.start_debug(s);
+                    }
                 }
                 Job::Git => {
                     // Not a repository (or no git): no status shown.
@@ -755,6 +1041,24 @@ impl Engine {
                 Job::Check { project } => {
                     if let Some(c) = s.composition.as_mut().filter(|c| c.project == project) {
                         c.take_check(&buf);
+                    }
+                }
+                Job::FuzzList { project } => {
+                    if let Some(f) = s.fuzz.as_mut().filter(|_| s.project == project) {
+                        f.listed = true;
+                        match crate::fuzz::targets(&buf) {
+                            Ok(t) if t.is_empty() => f.error = Some("No fuzz targets: the project has no workers or input surfaces yet".into()),
+                            Ok(t) => f.targets = t,
+                            Err(e) => f.error = Some(e),
+                        }
+                    }
+                }
+                Job::FuzzRun { target, .. } => {
+                    if let Some(f) = &mut s.fuzz {
+                        if !buf.is_empty() {
+                            f.line(&target, &String::from_utf8_lossy(&buf));
+                        }
+                        f.running = None;
                     }
                 }
                 Job::Templates => {
@@ -893,6 +1197,17 @@ impl Engine {
         if s.diags != diags {
             s.diags = diags;
         }
+        let bps = s.breakpoints.get(&d.rel).cloned().unwrap_or_default();
+        if d.cells.breakpoints.get_cloned() != bps {
+            d.cells.breakpoints.set(bps);
+        }
+        let stopped = s.debug.as_ref().filter(|x| x.stopped && x.live)
+            .and_then(|x| x.frames.iter().find(|f| f.1.is_some()))
+            .filter(|f| f.1.as_deref() == Some(d.rel.as_str()))
+            .map(|f| f.2.saturating_sub(1));
+        if d.cells.stopped.get_cloned() != stopped {
+            d.cells.stopped.set(stopped);
+        }
     }
 
     /// Ask every server to stop (the app is closing).
@@ -924,6 +1239,8 @@ fn placeholder() -> Doc {
             view: Mutable::new(CodeView::default()),
             spans: Mutable::new(Rc::new(LineSpans::default())),
             marks: Mutable::new(Vec::new()),
+            breakpoints: Mutable::new(Vec::new()),
+            stopped: Mutable::new(None),
         },
         rel: String::new(),
         lang: None,
@@ -1087,13 +1404,79 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(s.composition.as_ref().unwrap().checked);
+        // Fuzz targets are asked for too; without cargo atrium here the
+        // panel says why, and nothing runs.
+        for _ in 0..1000 {
+            e.tick(&mut s);
+            if s.fuzz.as_ref().is_some_and(|f| f.listed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let f = s.fuzz.clone().unwrap();
+        assert!(f.listed && (f.error.is_some() || !f.targets.is_empty()), "{f:?}");
         // Back to a file outside it.
         e.act(Act::Open("hello.c".into()), &mut s);
         assert_eq!(s.project, "");
         assert!(s.composition.is_none());
+        assert!(s.fuzz.is_none());
         assert_eq!(e.new_problem("app").as_deref(), Some("There is a app in work already"));
         assert!(e.new_problem("Bad").is_some());
         assert!(e.new_problem("fresh").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// With lldb-dap on this machine (LLVM's), the whole debugger path:
+    /// build, stop at a breakpoint, stack and locals, step, run to the end.
+    #[test]
+    fn debugs_with_lldb_dap_when_there_is_one() {
+        let llvm = PathBuf::from("/usr/lib/llvm-18/bin");
+        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join("lldb-dap").is_file());
+        if !found {
+            if !llvm.join("lldb-dap").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("dap");
+        std::fs::write(d.join("proj/hello.c"), "#include <stdio.h>\n\nint main(void) {\n\tint n = 3;\n\tn = n * 2;\n\tprintf(\"%d\\n\", n);\n\treturn 0;\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("hello.c".into()), &mut s);
+        e.act(Act::Breakpoint(4), &mut s); // n = n * 2;
+        assert_eq!(s.breakpoints.get("hello.c"), Some(&vec![4]));
+        e.tick(&mut s);
+        assert_eq!(e.active_doc().unwrap().breakpoints.get_cloned(), vec![4]);
+        e.act(Act::Debug, &mut s);
+        let wait = |e: &mut Engine, s: &mut State, f: &dyn Fn(&State) -> bool| {
+            for _ in 0..1500 {
+                e.tick(s);
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let stopped = wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && !d.locals.is_empty()));
+        if !stopped && s.debug.as_ref().is_some_and(|d| !d.live) || s.note.as_ref().is_some_and(|n| n.0.contains("ptrace") || n.0.contains("Operation not permitted")) {
+            // No ptrace in this sandbox: nothing more to see here.
+            eprintln!("debugger couldn't run here: {:?} {:?}", s.debug, s.note);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(stopped, "{:?} {:?}\n{}", s.debug, s.note, s.output);
+        let dbg = s.debug.clone().unwrap();
+        assert_eq!(dbg.frames[0].1.as_deref(), Some("hello.c"));
+        assert_eq!(dbg.frames[0].2, 5);
+        assert!(dbg.locals.iter().any(|(n, v)| n == "n" && v == "3"), "{:?}", dbg.locals);
+        assert_eq!(e.active_doc().unwrap().stopped.get_cloned(), Some(4));
+        e.act(Act::StepOver, &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && d.frames.first().is_some_and(|f| f.2 == 6) && d.locals.iter().any(|(n, v)| n == "n" && v == "6"))),
+            "{:?}", s.debug);
+        e.act(Act::Debug, &mut s); // continue to the end
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| !d.live)), "{:?}", s.debug);
+        assert!(s.output.contains("6"), "{}", s.output);
         let _ = std::fs::remove_dir_all(&d);
     }
 
