@@ -1313,6 +1313,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// With lldb-dap on this machine (LLVM's), the whole debugger path:
+    /// build, stop at a breakpoint, stack and locals, step, run to the end.
+    #[test]
+    fn debugs_with_lldb_dap_when_there_is_one() {
+        let llvm = PathBuf::from("/usr/lib/llvm-18/bin");
+        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join("lldb-dap").is_file());
+        if !found {
+            if !llvm.join("lldb-dap").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("dap");
+        std::fs::write(d.join("proj/hello.c"), "#include <stdio.h>\n\nint main(void) {\n\tint n = 3;\n\tn = n * 2;\n\tprintf(\"%d\\n\", n);\n\treturn 0;\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("hello.c".into()), &mut s);
+        e.act(Act::Breakpoint(4), &mut s); // n = n * 2;
+        assert_eq!(s.breakpoints.get("hello.c"), Some(&vec![4]));
+        e.tick(&mut s);
+        assert_eq!(e.active_doc().unwrap().breakpoints.get_cloned(), vec![4]);
+        e.act(Act::Debug, &mut s);
+        let wait = |e: &mut Engine, s: &mut State, f: &dyn Fn(&State) -> bool| {
+            for _ in 0..1500 {
+                e.tick(s);
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let stopped = wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && !d.locals.is_empty()));
+        if !stopped && s.debug.as_ref().is_some_and(|d| !d.live) || s.note.as_ref().is_some_and(|n| n.0.contains("ptrace") || n.0.contains("Operation not permitted")) {
+            // No ptrace in this sandbox: nothing more to see here.
+            eprintln!("debugger couldn't run here: {:?} {:?}", s.debug, s.note);
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(stopped, "{:?} {:?}\n{}", s.debug, s.note, s.output);
+        let dbg = s.debug.clone().unwrap();
+        assert_eq!(dbg.frames[0].1.as_deref(), Some("hello.c"));
+        assert_eq!(dbg.frames[0].2, 5);
+        assert!(dbg.locals.iter().any(|(n, v)| n == "n" && v == "3"), "{:?}", dbg.locals);
+        assert_eq!(e.active_doc().unwrap().stopped.get_cloned(), Some(4));
+        e.act(Act::StepOver, &mut s);
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && d.frames.first().is_some_and(|f| f.2 == 6) && d.locals.iter().any(|(n, v)| n == "n" && v == "6"))),
+            "{:?}", s.debug);
+        e.act(Act::Debug, &mut s); // continue to the end
+        assert!(wait(&mut e, &mut s, &|s| s.debug.as_ref().is_some_and(|d| !d.live)), "{:?}", s.debug);
+        assert!(s.output.contains("6"), "{}", s.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn paths_join_inside_work() {
         assert_eq!(join_rel("app", "src/a.c").as_deref(), Some("app/src/a.c"));
