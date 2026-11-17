@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 
 mod catalog;
 pub mod extra;
+mod han;
+pub use han::Han;
 pub use catalog::FACES;
 pub use extra::faces;
 
@@ -177,11 +179,17 @@ impl Library {
     /// Families to try, in order, for a character no face in the chosen
     /// stack has: the script's own face first, then the broad Noto faces.
     pub fn fallback(ch: char) -> impl Iterator<Item = &'static str> {
+        Library::fallback_in(ch, Han::of_system())
+    }
+
+    /// [`Library::fallback`] with the CJK convention to prefer for a Han
+    /// character (`Han::for_text` of the run it is in).
+    pub fn fallback_in(ch: char, han: Option<Han>) -> impl Iterator<Item = &'static str> {
         let c = ch as u32;
         let script = SCRIPTS.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&c)).map(|s| s.2);
         // Installed packages (CJK and the like) come after the script's
         // shipped face and before the general ones.
-        script.into_iter().chain(extra::families_for(ch)).chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Serif"])
+        script.into_iter().chain(extra::families_for(ch, han)).chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Serif"])
     }
 
     /// The family a character's script asks for before any general

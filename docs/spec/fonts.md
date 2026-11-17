@@ -122,6 +122,16 @@ only adds faces, and an uninstalled face's file fails its check. The Portcullis
 `fonts` capability mounts `/usr/share/fonts`, so `atrium-extra` is in it; the
 Fresco renderer bundle copies it as of the bundle.
 
+A Han character has different forms in Simplified and Traditional Chinese,
+Japanese and Korean, and each CJK package draws one (Noto Sans SC, TC, HK, JP,
+KR). Documents seldom say their language, so `atrium_fonts::Han` picks: kana in
+the run means JP, Hangul KR, else the locale (`LC_ALL`, `LC_CTYPE`, `LANG`:
+`ja`, `ko`, `zh_TW`/`zh-Hant` TC, `zh_HK` HK, other `zh` SC), else install
+order. Installed faces whose family ends in that suffix come first
+(`Library::fallback_in`); Write, Slides, the PDF export and frescod's labels
+pass the run's hint. Checked with Noto Sans SC installed before JP: a Chinese
+line draws 直骨角写次海 in SC forms, the same characters next to kana in JP forms.
+
 Checked with Noto Sans JP 2.004 (static TTF instances, OFL, 5.7 MB a weight,
 from the `@expo-google-fonts/noto-sans-jp` npm package, which carries Google
 Fonts' static files): Write's PDF export embeds subset CJK, and frescod draws
@@ -147,6 +157,7 @@ a Japanese label in the VM.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - Colour emoji waits on colour glyph support. CJK packages wait on Opifex
-  publishing them; Han characters go to the first installed CJK face, with
-  no language preference yet (SC/TC/JP/KR forms differ).
+  publishing them (its step C6). Han forms follow the run's kana or Hangul and
+  the locale; a per-person language setting (Curia) and a document language
+  (`w:lang w:eastAsia`, which Write drops today) would be better hints.
 - Write's style font list (`STYLE_FONTS`) to offer the new families.
