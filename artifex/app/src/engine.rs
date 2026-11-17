@@ -1480,6 +1480,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// With cargo atrium on this machine (or built in sdk/), the fuzz panel
+    /// against the real fuzzer: a seeded bug in a core input surface is
+    /// found, flagged as in the core, and opens where it crashes.
+    #[test]
+    fn fuzzes_with_cargo_atrium_when_there_is_one() {
+        let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/target/release");
+        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|d| Path::new(d).join("cargo-atrium").is_file());
+        if !found {
+            if !sdk.join("cargo-atrium").is_file() {
+                return;
+            }
+            std::env::set_var("PATH", format!("{}:{}", sdk.display(), std::env::var("PATH").unwrap_or_default()));
+        }
+        let (d, mut e, mut s) = setup("fuzz");
+        std::fs::create_dir_all(d.join("proj/photos/src")).unwrap();
+        std::fs::write(d.join("proj/photos/Cargo.toml"), "[package]\nname = \"photos\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n\n\
+            [package.metadata.atrium.fuzz.\"core:album\"]\nfunction = \"photos::read_album\"\nabout = \"album bytes\"\n").unwrap();
+        std::fs::write(d.join("proj/photos/atrium.toml"), "[app]\nid = \"org.example.photos\"\nentry = \"bin/photos\"\n").unwrap();
+        std::fs::write(d.join("proj/photos/src/lib.rs"),
+            "pub fn read_album(b: &[u8]) {\n    if b.len() > 3 && b[0] == b'A' {\n        let n = b[1] as usize;\n        let _ = b[n];\n    }\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("photos/src/lib.rs".into()), &mut s);
+        let wait = |e: &mut Engine, s: &mut State, secs: u64, f: &dyn Fn(&State) -> bool| {
+            let end = std::time::Instant::now() + Duration::from_secs(secs);
+            while std::time::Instant::now() < end {
+                e.tick(s);
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait(&mut e, &mut s, 60, &|s| s.fuzz.as_ref().is_some_and(|f| f.listed)), "{:?}", s.fuzz);
+        let f = s.fuzz.clone().unwrap();
+        assert_eq!(f.error, None);
+        assert_eq!(f.targets, vec![crate::fuzz::Target { name: "core:album".into(), core: true, about: "album bytes".into() }]);
+        e.act(Act::Fuzz, &mut s);
+        // Building the harness (libfuzzer-sys from crates.io) takes a while.
+        let found = wait(&mut e, &mut s, 600, &|s| s.fuzz.as_ref().is_some_and(|f| !f.crashes.is_empty() || f.run_error.is_some()));
+        let f = s.fuzz.clone().unwrap();
+        if let Some((_, m)) = &f.run_error {
+            // No network for crates.io, or no C++ compiler: nothing to fuzz with.
+            eprintln!("cargo atrium fuzz couldn't build here: {m}");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        assert!(found, "{f:?}");
+        let c = &f.crashes[0];
+        assert!(c.in_core && c.target == "core:album", "{c:?}");
+        assert_eq!(c.frame.as_deref(), Some("src/lib.rs:4"));
+        assert!(c.binary.is_some() && d.join("proj/photos").join(&c.input).is_file(), "{c:?}");
+        assert!(f.lines().iter().any(|l| l.0 == Some(true) && l.1.contains("In the core")));
+        e.act(Act::Crash(0), &mut s);
+        assert_eq!(s.active.map(|i| s.tabs[i].rel.as_str()), Some("photos/src/lib.rs"));
+        e.tick(&mut s);
+        assert_eq!(s.caret.0, 4);
+        e.act(Act::Fuzz, &mut s);
+        assert!(!s.fuzz.as_ref().unwrap().on);
+        // Replay under lldb-dap, when there is one: it stops in the crash.
+        let llvm = Path::new("/usr/lib/llvm-18/bin");
+        if llvm.join("lldb-dap").is_file() {
+            std::env::set_var("PATH", format!("{}:{}", llvm.display(), std::env::var("PATH").unwrap_or_default()));
+            e.act(Act::ReplayCrash(0), &mut s);
+            let stopped = wait(&mut e, &mut s, 120, &|s| s.debug.as_ref().is_some_and(|d| d.stopped && !d.frames.is_empty() || !d.live));
+            let dbg = s.debug.clone();
+            eprintln!("replay: {dbg:?} {:?}", s.note);
+            if stopped && dbg.as_ref().is_some_and(|d| d.stopped) {
+                assert!(dbg.unwrap().frames.iter().any(|f| f.1.as_deref() == Some("photos/src/lib.rs") && f.2 == 4), "{:?}", s.debug);
+                assert!(wait(&mut e, &mut s, 30, &|s| s.debug.as_ref().is_some_and(|d| !d.locals.is_empty())), "{:?}", s.debug);
+            }
+            e.act(Act::StopDebug, &mut s);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn paths_join_inside_work() {
         assert_eq!(join_rel("app", "src/a.c").as_deref(), Some("app/src/a.c"));
