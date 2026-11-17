@@ -616,3 +616,24 @@ fn noise_never_panics() {
         let _ = t.take_replies();
     }
 }
+
+#[test]
+fn osc_7770_pkg_requests() {
+    let mut t = Terminal::new(20, 2);
+    t.feed(b"\x1b]7770;pkg;install  helix\x07");
+    assert_eq!(t.take_ask().as_deref(), Some("install helix"));
+    assert_eq!(t.take_ask(), None, "a one-shot");
+    // Anything but package-name words is dropped.
+    t.feed(b"\x1b]7770;pkg;install helix; rm -rf /\x07");
+    assert_eq!(t.take_ask(), None);
+    t.feed(b"\x1b]7770;pkg;install $(id)\x07");
+    assert_eq!(t.take_ask(), None);
+    t.feed(b"\x1b]7770;pkg;   \x1b\\");
+    assert_eq!(t.take_ask(), None);
+    t.feed(format!("\x1b]7770;pkg;{}\x07", "a".repeat(300)).as_bytes());
+    assert_eq!(t.take_ask(), None);
+    t.feed(b"\x1b]7770;pkg;install -y py311-pip devel/git py3*\x1b\\");
+    assert_eq!(t.take_ask().as_deref(), Some("install -y py311-pip devel/git py3*"));
+    // Nothing shows on the screen.
+    assert!(t.rows_text().iter().all(|r| r.trim().is_empty()));
+}

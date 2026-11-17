@@ -116,7 +116,7 @@ import sys
 lo = {c: 0x04 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
 lo.update({c: 0x1e + i for i, c in enumerate("1234567890")})
 lo.update({" ": 0x2c, "-": 0x2d, "=": 0x2e, "/": 0x38, ".": 0x37, ";": 0x33, "'": 0x34, ",": 0x36, "[": 0x2f, "]": 0x30, "\n": 0x28})
-hi = {"{": 0x2f, "}": 0x30, "$": 0x21, "+": 0x2e, "!": 0x1e, "~": 0x35, ">": 0x37, "<": 0x36, "_": 0x2d, "|": 0x31, ":": 0x33, '"': 0x34, "&": 0x24, "(": 0x26, ")": 0x27, "*": 0x25}
+hi = {"{": 0x2f, "}": 0x30, "$": 0x21, "+": 0x2e, "!": 0x1e, "~": 0x35, ">": 0x37, "<": 0x36, "_": 0x2d, "|": 0x31, ":": 0x33, '"': 0x34, "&": 0x24, "(": 0x26, ")": 0x27, "*": 0x25, "?": 0x38}
 hi.update({c.upper(): 0x04 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")})
 for c in sys.argv[1]:
     if c in lo:
@@ -198,8 +198,29 @@ shot apps-2-top
 typ "q"
 i=0; while [ $i -lt 20 ] && ! screen | sed 's/.*| //' | grep -q 'scratch \$'; do sleep 2; i=$((i+2)); done
 screen | sed 's/.*| //' | grep -q 'scratch \$' && ok "q leaves top for the prompt" || bad "top stayed: $(screen)"
+# pkg in a workspace (homes.md §5.5): the workspace's pkg asks the Terminal,
+# which asks the person; Esc cancels (and stays the Terminal's), Install (Enter, a press) runs it as
+# the workspace jail's root and shows its output over the tab. (The cloud
+# VM's egress rewrites TLS, so pkg can't fetch there: any status passes.)
+typ "pkg install -y helix
+"
+waitscreen "menu=scratch asks to run: pkg install -y helix,Install,Cancel@1" 30 && ok "pkg asks with the tab's workspace" || bad "pkg ask: $(screen)"
+esc
+waitscreen "pkg: cancelled | scratch \\$" 20 && ok "Esc cancels it" || bad "pkg cancel: $(screen)"
+typ "pkg install -y helix
+"
+waitscreen "menu=scratch asks to run" 30
+screen | grep -q "helixkg" && bad "the Esc reached the shell: $(screen)"
+k1 0x28
+waitscreen "<pkg>.*pkg install -y helix" 30 && ok "Install runs pkg over the tab" || bad "pkg run: $(screen) $(V "grep 'pkg' $LOG | tail -3")"
+waitscreen "<pkg>.*pkg: exit [0-9]" 900 && ok "pkg finishes: $(screen | grep -o 'pkg: exit [0-9]*' | tail -1)" || bad "pkg end: $(screen)"
+shot apps-3-pkg
+k1 0x2c
+typ "echo rc=\$?
+"
+waitscreen "rc=[0-9]" 20 && ok "back at the shell, pkg's status: $(screen | grep -o 'rc=[0-9]*' | tail -1)" || bad "after pkg: $(screen)"
 for ed in nvim hx; do
-    if V "jexec ws_alice_scratch sh -c 'command -v $ed'" >/dev/null 2>&1; then
+    if V "jexec ws_alice_scratch sh -c 'PATH=/usr/local/bin:$PATH command -v $ed'" >/dev/null 2>&1; then
         typ "$ed /tmp/gate.txt
 "
         waitscreen "<alt>.*hello from vi" 60 && ok "$ed opens the file" || bad "$ed: $(screen)"
@@ -209,7 +230,7 @@ for ed in nvim hx; do
 "
         gone_alt && ok "$ed quits" || bad "$ed stayed: $(screen)"
     else
-        echo "  skip $ed: not in Scratch (pkg in workspaces is M2)"
+        echo "  skip $ed: not in Scratch (pkg couldn't install it here)"
     fi
 done
 

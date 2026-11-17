@@ -34,6 +34,8 @@ pub struct StateDiff {
     pub modes: Option<u32>,
     pub title: Option<String>,
     pub clipboard: Option<String>,
+    /// A one-shot like `clipboard`: the words of a `pkg` request (OSC 7770).
+    pub ask: Option<String>,
 }
 
 impl StateDiff {
@@ -79,7 +81,7 @@ impl StateDiff {
         let modes = (new.modes() != old_modes).then(|| new.modes());
         let title = (new.title() != old_title).then(|| new.title().to_string());
 
-        StateDiff { resized, runs, cursor: new.cursor(), modes, title, clipboard: None }
+        StateDiff { resized, runs, cursor: new.cursor(), modes, title, clipboard: None, ask: None }
     }
 
     /// Apply this diff to `grid`, converging it toward the source `new`.
@@ -106,18 +108,19 @@ impl StateDiff {
     /// still counts as empty here — callers may send a cursor-only update.
     pub fn is_empty(&self) -> bool {
         self.resized.is_none() && self.runs.is_empty() && self.modes.is_none() && self.title.is_none()
-            && self.clipboard.is_none()
+            && self.clipboard.is_none() && self.ask.is_none()
     }
 
     /// Serialize to the wire form carried inside a `StateDiff` datagram.
     ///
     /// Layout (all integers big-endian):
     /// ```text
-    ///   flags    : u8     bit0 resized, bit1 modes, bit2 title, bit3 clipboard
+    ///   flags    : u8     bit0 resized, bit1 modes, bit2 title, bit3 clipboard, bit4 ask
     ///   [cols,rows : u16,u16]   if resized
     ///   [modes   : u32]         if modes
     ///   [title   : len:u16 utf8]   if title
     ///   [clipboard : len:u32 utf8] if clipboard
+    ///   [ask     : len:u16 utf8]   if ask
     ///   cursor   : u16,u16
     ///   nruns    : u16
     ///   per run  : row:u16  col:u16  ncells:u16  ncells×Cell
@@ -131,6 +134,7 @@ impl StateDiff {
         if self.modes.is_some() { f |= 2 }
         if self.title.is_some() { f |= 4 }
         if self.clipboard.is_some() { f |= 8 }
+        if self.ask.is_some() { f |= 16 }
         o.push(f);
         if let Some((cols, rows)) = self.resized {
             o.extend_from_slice(&cols.to_be_bytes());
@@ -147,6 +151,11 @@ impl StateDiff {
         if let Some(c) = &self.clipboard {
             o.extend_from_slice(&(c.len() as u32).to_be_bytes());
             o.extend_from_slice(c.as_bytes());
+        }
+        if let Some(a) = &self.ask {
+            let b = &a.as_bytes()[..a.len().min(crate::ASK_MAX)];
+            o.extend_from_slice(&(b.len() as u16).to_be_bytes());
+            o.extend_from_slice(b);
         }
         o.extend_from_slice(&self.cursor.0.to_be_bytes());
         o.extend_from_slice(&self.cursor.1.to_be_bytes());
@@ -170,7 +179,7 @@ impl StateDiff {
     pub fn decode(buf: &[u8]) -> Option<StateDiff> {
         let mut r = Reader { buf, pos: 0 };
         let flags = r.u8()?;
-        if flags & !0x0f != 0 {
+        if flags & !0x1f != 0 {
             return None;
         }
         let resized = if flags & 1 != 0 { Some((r.u16()?, r.u16()?)) } else { None };
@@ -187,6 +196,13 @@ impl StateDiff {
                 return None;
             }
             Some(std::str::from_utf8(r.take(n)?).ok()?.to_string())
+        } else {
+            None
+        };
+        // Checked again here: what the client shows came from the server.
+        let ask = if flags & 16 != 0 {
+            let n = r.u16()? as usize;
+            Some(crate::pkg_words(r.take(n)?)?)
         } else {
             None
         };
@@ -210,7 +226,7 @@ impl StateDiff {
         if r.pos != buf.len() {
             return None; // trailing bytes: not a diff we wrote
         }
-        Some(StateDiff { resized, runs, cursor, modes, title, clipboard })
+        Some(StateDiff { resized, runs, cursor, modes, title, clipboard, ask })
     }
 }
 
@@ -441,6 +457,7 @@ mod tests {
         t.feed("\x1b]2;tïtle\x07\x1b[?1049h漢".as_bytes());
         let mut d = StateDiff::between(&crate::Grid::new(10, 2), t.grid());
         d.clipboard = Some("copied ✓".into());
+        d.ask = Some("install helix".into());
         assert!(!d.is_empty());
         let w = d.encode();
         assert_eq!(StateDiff::decode(&w), Some(d));

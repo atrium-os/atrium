@@ -238,6 +238,8 @@ pub struct Grid {
     replies: Vec<u8>,
     /// The last OSC 52 write not yet taken.
     clip: Option<String>,
+    /// The last `pkg` request (OSC 7770) not yet taken.
+    ask: Option<String>,
 }
 
 /// Max scrollback lines retained per window.
@@ -274,6 +276,7 @@ impl Grid {
             last: None,
             replies: Vec::new(),
             clip: None,
+            ask: None,
         }
     }
 
@@ -317,6 +320,14 @@ impl Grid {
     /// Take the text the program last wrote to the clipboard (OSC 52).
     pub fn take_clipboard(&mut self) -> Option<String> {
         self.clip.take()
+    }
+
+    /// Take the words of the last `pkg` request (OSC 7770, homes.md §5.5):
+    /// `ESC ] 7770 ; pkg ; <words> BEL` from a workspace's `/atrium/bin/pkg`.
+    /// The words are package-name characters and single spaces only; the
+    /// terminal shows them and asks the person, it never acts on them alone.
+    pub fn take_ask(&mut self) -> Option<String> {
+        self.ask.take()
     }
 
     /// The whole scrollback as plain text (oldest first): the history rows
@@ -1014,6 +1025,23 @@ impl Grid {
     }
 }
 
+/// The longest `pkg` request taken (bytes).
+pub const ASK_MAX: usize = 256;
+
+/// A `pkg` request's words, if they are only package-name characters
+/// (`A-Za-z0-9._+@/:=,~^*-`, as portcullisd's `check_pkg_argv`) separated
+/// by spaces; normalised to single spaces.
+pub fn pkg_words(raw: &[u8]) -> Option<String> {
+    if raw.len() > ASK_MAX || !raw.iter().all(|&b| b.is_ascii_alphanumeric() || b"._+@/:=,~^*- ".contains(&b)) {
+        return None;
+    }
+    let words: Vec<&str> = std::str::from_utf8(raw).ok()?.split(' ').filter(|w| !w.is_empty()).collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(words.join(" "))
+}
+
 /// `38`/`48`/`58` colour at `ps[i]`, in either form: colon subparameters
 /// (`38:5:n`, `38:2:r:g:b`, `38:2:cs:r:g:b`) or the following semicolon
 /// parameters (`38;5;n`, `38;2;r;g;b`). Returns the colour and how many
@@ -1334,6 +1362,8 @@ impl Perform for Grid {
             }
             // OSC 52 (`52;c;base64`): a clipboard write.
             [b"52", _target, data] => self.osc52(data),
+            // OSC 7770 (`7770;pkg;words`): a workspace asks to run pkg.
+            [b"7770", b"pkg", words] => self.ask = pkg_words(words),
             _ => {}
         }
     }
@@ -1405,6 +1435,8 @@ impl Terminal {
 
     /// The program's last clipboard write (OSC 52), if any.
     pub fn take_clipboard(&mut self) -> Option<String> { self.grid.take_clipboard() }
+    /// The last `pkg` request (OSC 7770), if any: see [`Grid::take_ask`].
+    pub fn take_ask(&mut self) -> Option<String> { self.grid.take_ask() }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.grid.resize(cols, rows);
