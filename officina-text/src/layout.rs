@@ -218,7 +218,7 @@ impl PinnedFonts {
     }
 
     /// The face that draws `ch` in `stack`.
-    fn face_for(&self, stack: &[usize], ch: char, f: &CharFormat) -> usize {
+    fn face_for(&self, stack: &[usize], ch: char, f: &CharFormat, han: Option<atrium_fonts::Han>) -> usize {
         if ch.is_whitespace() || ch.is_control() || self.has(stack[0], ch) {
             return stack[0];
         }
@@ -229,7 +229,7 @@ impl PinnedFonts {
         if let Some(&k) = stack[1..].iter().find(|&&k| self.has(k, ch)) {
             return k;
         }
-        atrium_fonts::Library::fallback(ch).find_map(lib).unwrap_or(stack[0])
+        atrium_fonts::Library::fallback_in(ch, han).find_map(lib).unwrap_or(stack[0])
     }
 
     pub fn face_bytes(&self, face: u16) -> &[u8] {
@@ -262,8 +262,11 @@ impl Fonts for PinnedFonts {
         let size = size_lu(f);
         // Split by the first face that has each character.
         let mut segs: Vec<(usize, usize, usize)> = Vec::new(); // face, start, end
+        // Which CJK forms a Han character takes (kana or Hangul in the run,
+        // else the locale).
+        let han = atrium_fonts::Han::for_text(text);
         for (i, ch) in text.char_indices() {
-            let face = self.face_for(&stack, ch, f);
+            let face = self.face_for(&stack, ch, f, han);
             match segs.last_mut() {
                 Some((fc, _, e)) if *fc == face => *e = i + ch.len_utf8(),
                 _ => segs.push((face, i, i + ch.len_utf8())),
