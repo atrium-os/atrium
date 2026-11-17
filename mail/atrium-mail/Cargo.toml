@@ -1,0 +1,26 @@
+[package]
+name = "atrium-mail"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's window (docs/spec/mail.md §15): places, the message list and a plain-text reader over the engine's store. M2: read-only, plain text."
+
+[lib]
+name = "atrium_mail"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-mail"
+path = "src/bin/atrium-mail.rs"
+
+[dependencies]
+pergola = { path = "../../pergola" }
+fresco-client = { path = "../../fresco-client" }
+mail-engine = { path = "../mail-engine" }
+mail-store = { path = "../mail-store" }
+mail-schema = { path = "../mail-schema" }
+
+[dev-dependencies]
+tempfile = "3"
+mail-sync = { path = "../mail-sync" }

@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1007,6 +1007,35 @@ Stalwart in the cloud VM, and later a real account):
    client's). Not yet: XOAUTH2/OAUTHBEARER (with §5.3), a VM run against Dovecot.
 3. **M2** engine + sync: read-only IMAP sync into the store, the index, plain-text reading in
    a minimal Pergola window; jailed parse batches.
+   *Built 2026-11-17 (host-tested):* `mail/mail-store`: the index in redb (accounts,
+   folders with their sync checkpoints, messages, (folder, UID) locations with flags, a
+   newest-first list key, server-id dedupe), message bytes as SHA-256-named blobs written
+   to a temporary file and renamed, checked on every read. `mail/mail-sync`: the session
+   over the courier's PREAUTH socket, `ENABLE QRESYNC`, folders with SPECIAL-USE roles
+   (Gmail: only Inbox, Sent and All Mail walked), every folder opened with `EXAMINE`; the
+   staged first sync of §6.4 (the inbox's newest 200 headers, then all headers in pages of
+   500 newest first, then whole messages ≤ 2 MiB in the 90-day window), resumable from
+   checkpoints after every page; resync by QRESYNC (`VANISHED` and changed flags in
+   `SELECT`), else CONDSTORE `CHANGEDSINCE`, else all flags and a UID diff; UIDVALIDITY
+   change resets the folder. `mail/mail-engine`: sync's sink, which parses each page in
+   parse jails in batches (≤ 64 messages / 32 MiB, every frame checked) and writes each
+   batch in one transaction; a headers-only batch makes a signed message's sender check
+   *Pending* until its body comes, not a failure; `open` parses a message alone in its own
+   jail for reading. `mail/atrium-mail`: the window of §15.2 at M2's size: places (each
+   account's folders with counts), the list (sender and time, subject, preview; unread
+   bold; the selected row with the accent bar; rows read from the index a page at a time
+   as they come into view), and the reader (subject, sender, recipients, date, the plain
+   text wrapped to an 80-character column; notes for headers-only and HTML-only
+   messages); j/k and the arrows move and open. Tests: store 2, sync 1, window 2+1
+   headless (a press on a row, j/k, an empty folder), and end to end against a real
+   Dovecot over TLS through the real courier and real parse jails: 305 messages in 5
+   folders, stage 1 first, 50 texts in the window, resync after a delete, an arrival
+   and a flag change, then a pass that changes nothing. Not yet: DKIM/DMARC lookups (the
+   engine answers every `Query` with nothing, so sender checks stay *Pending*; see the
+   privacy note on lookups at arrival), sync and engine as separate jailed processes over
+   Aqueduct with the window reading through the engine, jails started by jaild, fetching a
+   text on open and fetching only the text part, IDLE in a loop, the narrow layouts of
+   §15.4, a VM run with frescod.
 4. **M3** the full UI: three panes, conversations, HTML through `doc-viewer`, remote content
    bar, sender line, link bar through Monstrator, keyboard set. Mail becomes the `mailto`
    app.
