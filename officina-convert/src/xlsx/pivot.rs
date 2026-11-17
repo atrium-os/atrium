@@ -1,7 +1,7 @@
 //! Pivot tables in `.xlsx` (ECMA-376 Part 1 §18.10): a pivot cache definition per
 //! pivot (the source range and each field's items, no records: `saveData="0"` and
 //! `refreshOnLoad="1"`, so Excel rebuilds it from the source on opening) and the
-//! pivot table definition in Excel's tabular form (`compact="0" outline="0"`).
+//! pivot table definition in Excel's tabular (`compact="0" outline="0"`) or compact form.
 //! The output cells are written as ordinary cells, as Excel saves them.
 
 use std::fmt::Write as _;
@@ -141,8 +141,9 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
     let loc = shape.table().unwrap_or(Rect { sheet: p.dest.sheet, r0: p.dest.row, c0: p.dest.col, r1: p.dest.row, c1: p.dest.col });
     let first_data_row = if col_dims == 0 { 1 } else { shape.header_rows };
     let mut o = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotTableDefinition {NS} name="{}" cacheId="{cache_id}" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6" indent="0" compact="0" compactData="0" outline="1" outlineData="1" multipleFieldFilters="0"{}{}>"#,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><pivotTableDefinition {NS} name="{}" cacheId="{cache_id}" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6"{} outline="1" outlineData="1" multipleFieldFilters="0"{}{}>"#,
         esc(&p.name),
+        if p.compact { "" } else { r#" indent="0" compact="0" compactData="0""# },
         if p.grand_col { "" } else { r#" rowGrandTotals="0""# },
         if p.grand_row { "" } else { r#" colGrandTotals="0""# },
     );
@@ -169,7 +170,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
         if p.data.iter().any(|d| d.field == f) {
             o.push_str(r#" dataField="1""#);
         }
-        o.push_str(r#" compact="0" outline="0" showAll="0""#);
+        o.push_str(if p.compact { r#" showAll="0""# } else { r#" compact="0" outline="0" showAll="0""# });
         let pf = axis_fields(p).into_iter().find(|x| x.field == f);
         if pf.is_some() && axis == Some("axisPage") && pf.is_some_and(|x| x.hidden.len() > 0) {
             o.push_str(r#" multipleItemSelectionAllowed="1""#);
@@ -298,6 +299,9 @@ fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
 #[derive(Default)]
 struct FieldIn {
     hidden: Vec<u32>,
+    /// Shown in compact form (`compact`, default on) and outline form (`outline`).
+    compact: bool,
+    outline: bool,
     subtotal: bool,
 }
 
@@ -333,7 +337,9 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
                 }
                 b"pivotField" if fields.len() < 16_384 => {
                     let subtotal = attr(&e, b"defaultSubtotal")?.is_none_or(|v| v != "0" && v != "false");
-                    fields.push(FieldIn { hidden: Vec::new(), subtotal });
+                    let on = |v: Option<String>| v.is_none_or(|v| v != "0" && v != "false");
+                    let (compact, outline) = (on(attr(&e, b"compact")?), on(attr(&e, b"outline")?));
+                    fields.push(FieldIn { hidden: Vec::new(), subtotal, compact, outline });
                 }
                 b"item" => {
                     if let (Some(f), Some(x)) = (fields.last_mut(), attr(&e, b"x")?.and_then(|v| v.parse::<u32>().ok())) {
@@ -432,8 +438,12 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     p.subtotals = axis.iter().any(|&f| fields.get(f as usize).is_some_and(|x| x.subtotal));
     p.grand_col = grand_col;
     p.grand_row = grand_row;
-    if compact {
-        rep.note(Kind::Approximate, "pivot tables in compact form (shown in tabular form once refreshed)");
+    // Compact form when the table and its row fields say so; outline form (a
+    // column per field without compact) is shown tabular.
+    let row_fields: Vec<&FieldIn> = p.rows.iter().filter_map(|f| fields.get(f.field as usize)).collect();
+    p.compact = compact && row_fields.iter().all(|f| f.compact);
+    if !p.compact && row_fields.len() > 1 && row_fields.iter().any(|f| f.outline) {
+        rep.note(Kind::Approximate, "pivot tables in outline form (shown in tabular form once refreshed)");
     }
     if shown_as {
         rep.note(Kind::Approximate, "pivot table values shown as percentages or differences (refreshing shows the plain values)");

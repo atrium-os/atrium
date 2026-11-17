@@ -1,0 +1,102 @@
+//! Artifex: the window and the loop. Acts from the window go to the
+//! engine; between frames the engine follows edits and reads what runs in
+//! the workspace.
+//!
+//! Environment: `ARTIFEX_SIZE` (1200x800); `ARTIFEX_LOCAL_WORK=<dir>` runs
+//! off Atrium with each folder of `<dir>` as a workspace and commands run
+//! locally (for working on Artifex itself); `ARTIFEX_TRACE` prints the state
+//! on each change, for checks.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use artifex::engine::Engine;
+use artifex::exec::{Exec, Local, Portcullis};
+use artifex::ui::{editor_rect, Act, ArtifexView, State};
+use pergola::window::StepResult;
+use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
+
+fn main() {
+    let (w, h) = std::env::var("ARTIFEX_SIZE").ok()
+        .and_then(|s| s.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+        .unwrap_or((1200, 800));
+    let exec: Box<dyn Exec> = match std::env::var_os("ARTIFEX_LOCAL_WORK") {
+        Some(d) => Box::new(Local { root: d.into() }),
+        None => Box::new(Portcullis),
+    };
+    let mut win = match Window::open(&WindowDesc::new("Artifex", SizeSpec::Fixed(w, h))) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("artifex: frescod: {e}");
+            std::process::exit(1);
+        }
+    };
+    let dirty = Arc::new(AtomicBool::new(true));
+    let state = Mutable::with_dirty(State::default(), dirty.clone());
+    let doc = Mutable::with_dirty(None, dirty.clone());
+    let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let view = ArtifexView { state: state.clone(), doc: doc.clone(), size: size.clone(), queue: queue.clone() };
+    let mut app = App::new_with_flag(view, dirty.clone());
+    let mut engine = Engine::new(exec);
+    engine.set_dirty_flag(dirty);
+
+    let mut s = State::default();
+    engine.list(&mut s);
+    // The workspace picked last time comes back; one picked is opened.
+    if let [only] = s.picked.as_slice() {
+        let only = only.clone();
+        engine.act(Act::Use(only), &mut s);
+    }
+    state.set(s);
+    let trace = std::env::var_os("ARTIFEX_TRACE").is_some();
+    let mut traced = String::new();
+    let mut failed = false;
+    loop {
+        match win.step(&mut app, Some(Duration::from_millis(30))) {
+            Ok(StepResult::Closed) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("artifex: frescod: {e}");
+                failed = true;
+                break;
+            }
+        }
+        if size.get() != (win.width, win.height) {
+            size.set((win.width, win.height));
+        }
+        let mut s = state.get_cloned();
+        let before = s.clone();
+        // Rows the editor shows, for highlighting what's visible.
+        let er = editor_rect(win.width, win.height, s.panel_open);
+        engine.rows = (er.h() / 17.0).ceil().max(1.0) as usize;
+        let acts: Vec<Act> = std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut swap = false;
+        for a in acts {
+            swap |= engine.act(a, &mut s);
+        }
+        engine.tick(&mut s);
+        let active = engine.active_doc();
+        if swap || active.as_ref().map(|d| &d.path) != doc.get_cloned().as_ref().map(|d| &d.path) {
+            doc.set(active);
+        }
+        if s != before {
+            state.set(s.clone());
+        }
+        if trace {
+            let line = format!("ws={:?} tabs=[{}] active={:?} caret={:?} running={:?} problems={} git={:?} lsp={:?} diags={} note={:?}",
+                s.ws, s.tabs.iter().map(|t| format!("{}{}", t.rel, if t.dirty { "*" } else { "" })).collect::<Vec<_>>().join(","),
+                s.active, s.caret, s.running, s.problems.len(), s.git.as_ref().and_then(|g| g.branch.clone()), s.lsp, s.diags.len(),
+                s.note.as_ref().map(|n| &n.0));
+            if line != traced {
+                eprintln!("artifex: {line}");
+                traced = line;
+            }
+        }
+    }
+    engine.shutdown();
+    if failed {
+        std::process::exit(1);
+    }
+}

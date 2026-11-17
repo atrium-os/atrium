@@ -104,11 +104,15 @@ pub struct Pivot {
     pub grand_col: bool,
     /// Subtotals for outer row and column fields.
     pub subtotals: bool,
+    /// Excel's compact form: the row fields share one column, inner items
+    /// indented under their outer item, whose row holds its subtotal (else the
+    /// tabular form, a column per row field and subtotal rows under each group).
+    pub compact: bool,
 }
 
 impl Pivot {
     pub fn new(name: &str, source: Rect, dest: CellAddr) -> Self {
-        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), grand_row: true, grand_col: true, subtotals: true }
+        Pivot { name: Arc::from(name), source, dest, rows: Vec::new(), cols: Vec::new(), pages: Vec::new(), data: Vec::new(), grand_row: true, grand_col: true, subtotals: true, compact: false }
     }
 }
 
@@ -140,12 +144,29 @@ pub struct Shape {
     /// Total rows and columns, from the table's first row and column.
     pub total_rows: Vec<u32>,
     pub total_cols: Vec<u32>,
+    /// Compact form: body rows whose label is indented, with its level (1 for
+    /// the second row field, …), and whether the row is an outer item's (a group).
+    pub indents: Vec<(u32, u8, bool)>,
 }
 
 impl Shape {
     /// The table without the page fields (Excel's pivot "location").
     pub fn table(&self) -> Option<Rect> {
         self.area.map(|a| Rect { r0: a.r0 + self.page_rows, ..a })
+    }
+
+    /// A compact pivot's label cell: how far it is indented and whether it is an
+    /// outer item's row; `(0, false)` elsewhere.
+    pub fn indent(&self, a: CellAddr) -> (u8, bool) {
+        let Some(area) = self.area else { return (0, false) };
+        if !area.contains(a) || a.col != area.c0 || self.indents.is_empty() {
+            return (0, false);
+        }
+        let Some(r) = (a.row - area.r0).checked_sub(self.page_rows + self.header_rows) else { return (0, false) };
+        match self.indents.binary_search_by_key(&r, |x| x.0) {
+            Ok(i) => (self.indents[i].1, self.indents[i].2),
+            Err(_) => (0, false),
+        }
     }
 
     pub fn role(&self, a: CellAddr) -> Option<Role> {
@@ -442,6 +463,7 @@ impl Workbook {
             shape.area = Some(a);
             shape.total_rows.clear();
             shape.total_cols.clear();
+            shape.indents.clear();
         }
         self.pivots.push(p);
         self.pivot_shapes.push(shape);
@@ -702,8 +724,20 @@ impl Workbook {
 
         // Rows of the body: (path, is a subtotal of that prefix).
         let mut body: Vec<(Path, bool)> = Vec::new();
+        let compact = p.compact && k > 0;
         if k == 0 {
             body.push((Vec::new(), false));
+        } else if compact {
+            // A row for each outer item where its group starts, then its inner ones.
+            let mut prev: Option<&Path> = None;
+            for path in &row_paths {
+                for d in 1..=k {
+                    if prev.is_none_or(|q| q[..d] != path[..d]) {
+                        body.push((path[..d].to_vec(), false));
+                    }
+                }
+                prev = Some(path);
+            }
         } else {
             for (n, path) in row_paths.iter().enumerate() {
                 body.push((path.clone(), false));
@@ -751,7 +785,7 @@ impl Workbook {
         // A header row for the column fields (and "Values") when there are any.
         let col_dims = m + multi as usize;
         let header_rows = if col_dims == 0 { 1 } else { 1 + col_dims } as u32;
-        let label_cols = k.max(1) as u32;
+        let label_cols = if compact { 1 } else { k.max(1) as u32 };
         let page_rows = if p.pages.is_empty() { 0 } else { p.pages.len() as u32 + 1 };
         let rows_total = page_rows as u64 + header_rows as u64 + body.len() as u64 + (p.grand_row && k > 0) as u64;
         let cols_total = label_cols as u64 + heads.len() as u64;
@@ -783,7 +817,22 @@ impl Workbook {
         let top = page_rows;
         let caption = |d: usize| -> String { p.data.get(d).map_or_else(|| "Count".to_string(), |x| self.data_caption(p, x)) };
         // Headers.
-        if col_dims == 0 {
+        if compact {
+            let last = top + header_rows - 1;
+            if col_dims == 0 {
+                if p.data.len() == 1 {
+                    put(top, label_cols, Value::str(&caption(0)));
+                }
+            } else {
+                if !multi {
+                    put(top, 0, Value::str(&caption(0)));
+                }
+                put(top, label_cols, Value::str("Column Labels"));
+            }
+            put(last, 0, Value::str("Row Labels"));
+        }
+        if compact && col_dims == 0 {
+        } else if col_dims == 0 {
             for (j, f) in p.rows.iter().enumerate() {
                 put(top, j as u32, Value::str(&self.pivot_field_name(p, f.field)));
             }
@@ -791,18 +840,20 @@ impl Workbook {
                 put(top, label_cols, Value::str(&caption(0)));
             }
         } else {
-            if !multi {
-                put(top, 0, Value::str(&caption(0)));
-            }
-            for (j, f) in p.cols.iter().enumerate() {
-                put(top, label_cols + j as u32, Value::str(&self.pivot_field_name(p, f.field)));
-            }
-            if multi {
-                put(top, label_cols + m as u32, Value::str("Values"));
-            }
-            let last = top + header_rows - 1;
-            for (j, f) in p.rows.iter().enumerate() {
-                put(last, j as u32, Value::str(&self.pivot_field_name(p, f.field)));
+            if !compact {
+                if !multi {
+                    put(top, 0, Value::str(&caption(0)));
+                }
+                for (j, f) in p.cols.iter().enumerate() {
+                    put(top, label_cols + j as u32, Value::str(&self.pivot_field_name(p, f.field)));
+                }
+                if multi {
+                    put(top, label_cols + m as u32, Value::str("Values"));
+                }
+                let last = top + header_rows - 1;
+                for (j, f) in p.rows.iter().enumerate() {
+                    put(last, j as u32, Value::str(&self.pivot_field_name(p, f.field)));
+                }
             }
             let mut prev: Option<&ColHead> = None;
             for (x, h) in heads.iter().enumerate() {
@@ -842,7 +893,22 @@ impl Workbook {
             }
         };
         let mut row = first;
+        let mut indents = Vec::new();
         for (path, sub) in &body {
+            if compact {
+                let d = path.len();
+                put(row, 0, items(p.rows[d - 1].field, path[d - 1]));
+                if d > 1 || d < k {
+                    indents.push((row - first, (d - 1) as u8, d < k));
+                }
+                if d == k || p.subtotals {
+                    for (x, h) in heads.iter().enumerate() {
+                        put(row, label_cols + x as u32, value(path, h));
+                    }
+                }
+                row += 1;
+                continue;
+            }
             if *sub {
                 let d = path.len();
                 put(row, d as u32 - 1, Value::str(&format!("{} Total", label_text(&items(p.rows[d - 1].field, path[d - 1])))));
@@ -880,6 +946,7 @@ impl Workbook {
             label_cols,
             total_rows,
             total_cols,
+            indents,
         };
         Ok(Output { cells, rows: rows_total as u32, cols: cols_total as u32, shape })
     }
@@ -947,7 +1014,7 @@ impl Pivot {
         w.u16(self.dest.sheet);
         w.var(self.dest.row as u64);
         w.var(self.dest.col as u64);
-        w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2);
+        w.u8(self.grand_row as u8 | (self.grand_col as u8) << 1 | (self.subtotals as u8) << 2 | (self.compact as u8) << 3);
         for axis in [&self.rows, &self.cols, &self.pages] {
             w.var(axis.len() as u64);
             for f in axis {
@@ -1012,6 +1079,6 @@ impl Pivot {
         let pages = axes.pop().unwrap();
         let cols = axes.pop().unwrap();
         let rows = axes.pop().unwrap();
-        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0 }, area))
+        Ok((Pivot { name, source, dest: CellAddr::new(sheet, row as u32, col as u32), rows, cols, pages, data, grand_row: flags & 1 != 0, grand_col: flags & 2 != 0, subtotals: flags & 4 != 0, compact: flags & 8 != 0 }, area))
     }
 }

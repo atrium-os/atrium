@@ -89,7 +89,9 @@ pub fn tables_xml(wb: &Workbook) -> String {
                 let show = !f.hidden.iter().any(|h| same_item(h, v));
                 let _ = write!(o, r#"<table:data-pilot-member table:name="{}" table:display="{show}" table:show-details="true"/>"#, esc(&member(v)));
             }
-            o.push_str(r#"</table:data-pilot-members><table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"/></table:data-pilot-level></table:data-pilot-field>"#);
+            // LibreOffice keeps the compact form as its own extension.
+            let compact = if p.compact { r#" loext:layout-mode="compact-layout""# } else { "" };
+            let _ = write!(o, r#"</table:data-pilot-members><table:data-pilot-layout-info table:add-empty-lines="false" table:layout-mode="tabular-layout"{compact}/></table:data-pilot-level></table:data-pilot-field>"#);
         };
         for f in &p.rows {
             field(&mut o, f, "row", p.subtotals);
@@ -126,6 +128,8 @@ pub struct FieldIn {
     /// LibreOffice's: the members shown say what the page shows, not `selected`.
     pub ignore_selected: bool,
     pub subtotals: bool,
+    /// LibreOffice's compact form (`loext:layout-mode="compact-layout"`).
+    pub compact: bool,
     pub hidden: Vec<String>,
 }
 
@@ -161,6 +165,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
         let mut bad = None;
         let mut subtotals = false;
         let mut multi_on_rows = false;
+        let mut compact = None;
         for f in &t.fields {
             if f.data_layout {
                 multi_on_rows |= f.orient == "row";
@@ -197,6 +202,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             match f.orient.as_str() {
                 "row" => {
                     subtotals |= f.subtotals;
+                    compact = Some(compact.unwrap_or(true) && f.compact);
                     p.rows.push(pf);
                 }
                 "column" => {
@@ -215,6 +221,7 @@ pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
             rep.note(Kind::Approximate, "pivot table values shown down the rows (shown across)");
         }
         p.subtotals = subtotals;
+        p.compact = compact.unwrap_or(false);
         (p.grand_row, p.grand_col) = match t.grand.as_str() {
             "none" => (false, false),
             "row" => (false, true),

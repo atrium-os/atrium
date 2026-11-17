@@ -105,6 +105,7 @@ pub fn run_init(
         hostid: None,
         hostuuid: None,
         allow_mlock: false,
+        allow_tessera_keys: false,
         syscall_profile: None,
         devfs_grant: None,
         devfs_grants: vec![],

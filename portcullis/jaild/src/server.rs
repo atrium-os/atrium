@@ -1038,6 +1038,7 @@ fn handle_create(
         hostid:         req.hostid,
         hostuuid:       req.hostuuid.as_deref(),
         allow_mlock:    req.allow_mlock,
+        allow_tessera_keys: req.allow_tessera_keys,
         sysfil,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
@@ -1194,6 +1195,7 @@ fn isolated_spec<'a>(req: &'a CreateJailRequest, sysfil: Option<&'a SysfilParams
         hostid:        req.hostid,
         hostuuid:      req.hostuuid.as_deref(),
         allow_mlock:   req.allow_mlock,
+        allow_tessera_keys: req.allow_tessera_keys,
         sysfil,
     }
 }
@@ -1412,6 +1414,7 @@ fn handle_create_with_exec(
             hostid:         req.hostid,
             hostuuid:       req.hostuuid.as_deref(),
             allow_mlock:    req.allow_mlock,
+            allow_tessera_keys: req.allow_tessera_keys,
             sysfil,
         };
         // No core dumps from a filtered jail: three of the advisories the

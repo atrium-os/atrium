@@ -309,6 +309,12 @@ pub struct CreateJailRequest {
     #[serde(default)]
     pub allow_mlock: bool,
 
+    /// `allow.tessera_keys` for the jail: it may use the Tessera keyring
+    /// (/dev/tesserakeys). Only for jails named in
+    /// `policy.tessera_keys.allow_jails` (arcad, tessera-encryption.md §4.3).
+    #[serde(default)]
+    pub allow_tessera_keys: bool,
+
     /// The jail's system call filter class (jail-sysfil.md §5): a profile
     /// name from the policy's `[sysfil.profiles]`. The kernel gets the
     /// resolved lists as `sysfil.*` parameters at jail creation, and they
@@ -694,6 +700,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            allow_tessera_keys: false,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],

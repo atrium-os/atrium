@@ -16,6 +16,11 @@
 #    and a while-unlocked item is unreadable after lock.
 # …§4–6 the courier, a jail per courier, web couriers and tickets; §7 the
 # Navigator broker's tickets through navigator-cookies' own clients.
+# §9 Tessera volume keys (tessera-encryption.md §4.3, E2), when the guest has
+# tessera_fs loaded (/dev/tesserakeys; scripts/tessera-sealed-vm.sh deploy
+# puts the module and tools in /root/sealed). It must be loaded before arcad
+# starts, and the guest's jaild must be current (allow.tessera_keys).
+# VK_ONLY=1 skips §4–§8.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 set -- env
@@ -117,11 +122,17 @@ put "$tmpd/jaild.policy.toml" /etc/atrium/jaild.policy.toml
 # The web broker (§6): a test app id and publisher, as the Navigator's will be.
 BROKER_PUB=$(printf 'b%.0s' $(seq 64))
 # And a test system service for the machine store (§3, uid 50804).
+# §9: a test uid (50805) stands in for dispensatord.
 sed -e "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" -e "s|vinculumd=65024|vinculumd=50804|" \
+    -e "s|aura-keys=65032|aura-keys=65032,dispensatord=50805|" \
     "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
 put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.
 g "mkdir -p /etc/atrium/services.d.off && mv /etc/atrium/services.d/*-atrium-smoke-*.toml /etc/atrium/services.d.off/ 2>/dev/null; true"
+# arcad's devfs ruleset (32, atrium_arca: basics + tesserakeys) must be loaded.
+put "$ROOT/etc/atrium.devfs.rules" /usr/local/etc/atrium/devfs.rules
+g "service devfs restart >/dev/null 2>&1; true"
+check "arcad's devfs ruleset is loaded" yes "$(g 'test -n "$(devfs rule -s 32 show 2>/dev/null)" && echo yes || echo no')"
 g "service atrium-jaild restart >/dev/null 2>&1; sleep 2; service atrium-portcullisd-bootstrap onestart >/dev/null 2>&1; true"
 i=0; while [ $i -lt 60 ] && ! g "test -S /atrium/sockets/arca/arcad.sock"; do sleep 2; i=$((i+1)); done
 check "socket bound" yes "$(g 'test -S /atrium/sockets/arca/arcad.sock && echo yes || echo no')"
@@ -186,6 +197,7 @@ check "and the key works again" 0 "$(as arcaapp1 "sign $KID hello" | sed -n 's/^
 check "audit log has no value" 0 "$(g 'grep -c hunter2 /var/db/arca/audit.log' || true)"
 check "nothing in clear on disk" 0 "$(g 'grep -rl hunter2 /var/db/arca | wc -l' | tr -d ' ')"
 
+if [ "${VK_ONLY:-0}" != 1 ]; then
 echo "=== 4. the courier (A1)"
 # Two couriers for mail's persona: one bound to api.example, one to
 # evil.example. Their labels come from the courier registry by uid.
@@ -394,6 +406,63 @@ check "no page text in navigatord's store (pages the site knew you on stay in me
 g "pkill -x navigatord; true"
 fi
 g "pkill -x arca-courierd; true"
+fi
+
+echo "=== 9. Tessera volume keys (tessera-encryption.md §4.3, E2)"
+if g "test -c /dev/tesserakeys"; then
+KL=/root/sealed/tessera-keyload
+VK=/root/vk-test
+g "pw usershow arcavol >/dev/null 2>&1 || pw useradd arcavol -u 50805 -d /nonexistent -s /usr/sbin/nologin"
+check "arcad's jail may use the keyring (allow.tessera_keys)" true "$(g "jls -j $JID allow.tessera_keys" | tr -d ' ')"
+check "arcad's jail sees the keyring, as _arca" "_arca 600" "$(g "stat -f '%Su %Lp' $J/dev/tesserakeys" 2>/dev/null)"
+# Another jail, shown the host's /dev: the kernel still refuses it.
+g "jail -r vktest >/dev/null 2>&1; jail -c name=vktest path=/ persist >/dev/null"
+check "another jail can't use the keyring" "TKEY_GEN: Operation not permitted" "$(g "jexec vktest $KL gen 00000000000000000000000000000000 2>&1")"
+g "jail -r vktest >/dev/null 2>&1; jail -c name=vktest path=/ persist allow.tessera_keys=1 >/dev/null"
+check "…unless it has allow.tessera_keys" "TKEY_GEN: No such file or directory" "$(g "jexec vktest $KL gen 00000000000000000000000000000000 2>&1")"
+g "jail -r vktest >/dev/null 2>&1; true"
+
+as _ostiarius 'unlock alice correct-horse' >/dev/null
+U=$(g "head -c 16 /dev/random | od -An -tx1 | tr -d ' \n'")
+FOREIGN=$(g "head -c 16 /dev/random | od -An -tx1 | tr -d ' \n'")
+check "an app can't mint a volume key" no "$(as arcaapp1 "vk-mint alice work $U stick" | grep -q '^status=0' && echo yes || echo no)"
+check "an unnamed service can't" no "$(as arcabt "vk-mint alice work $U stick" | grep -q '^status=0' && echo yes || echo no)"
+r=$(as arcavol "vk-mint alice work $U VM-stick")
+KID=$(echo "$r" | sed -n 's/^status=0 body=//p')
+check "the volume service mints a key (only its id comes back)" 32 "${#KID}"
+loaded() { g "$KL gen $1 >/dev/null 2>&1 && echo loaded || echo absent"; }
+check "the key is in the kernel" loaded "$(loaded $KID)"
+check "no op returns anything as long as a key" yes "$(as arcavol "vk-sweep alice work $KID $U" | awk -F'[= ]' '{print ($2 < 32) ? "yes" : $0}')"
+g "$KL drop $KID >/dev/null"
+check "another person: refused" "status=1 body=" "$(as arcavol "vk-load bob work $KID $U 0")"
+check "another persona: refused" "status=1 body=" "$(as arcavol "vk-load alice personal $KID $U 0")"
+check "another volume: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $FOREIGN 0")"
+check "another key group: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $U 7")"
+check "an app can't load it" no "$(as arcaapp1 "vk-load alice work $KID $U 0" | grep -q '^status=0' && echo yes || echo no)"
+check "…and nothing was loaded" absent "$(loaded $KID)"
+as _ostiarius 'lock alice' >/dev/null
+check "locked: LOCKED" "status=2 body=" "$(as arcavol "vk-load alice work $KID $U 0")"
+check "…nothing loaded" absent "$(loaded $KID)"
+as _ostiarius 'unlock alice correct-horse' >/dev/null
+check "unlocked: the owner's key loads" "status=0 body=" "$(as arcavol "vk-load alice work $KID $U 0")"
+check "…into the kernel" loaded "$(loaded $KID)"
+check "record: the high-water mark (8 bytes)" 16 "$(as arcavol "vk-record alice work $KID" | sed -n 's/^status=0 body=//p' | tr -d '\n' | wc -c | tr -d ' ')"
+r=$(as arcavol "vk-forget alice work $KID")
+check "forget without verification is refused" no "$(echo "$r" | grep -q '^status=0' && echo yes || echo no)"
+check "…and the key stays" loaded "$(loaded $KID)"
+# Mounts against arcad's key: a volume naming its id for another uuid, and
+# one with its uuid under another id, are refused.
+g "mkdir -p $VK && head -c 32 /dev/random > $VK/k && mkdir -p /mnt/vk"
+dev_of() { g "rm -f $VK/$1.img; /root/sealed/tessera-mkfs-sealed --key-file $VK/k --key-id $2 --uuid $3 --create -s 64 -j 64 $VK/$1.img >/dev/null && mdconfig -a -t vnode -f $VK/$1.img"; }
+D1=$(dev_of foreign $KID $FOREIGN) || D1=
+D2=$(dev_of otherid 0123456789abcdef0123456789abcdef $U) || D2=
+check "test volumes made" yes "$(case "$D1/$D2" in md*/md*) echo yes ;; *) echo "no ($D1/$D2)" ;; esac)"
+check "a volume naming the key's id, of another uuid: refused" refused "$(g "mount -t tessera -r /dev/$D1 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
+check "the key's own uuid under another key id: refused" refused "$(g "mount -t tessera -r /dev/$D2 /mnt/vk 2>/dev/null && { umount /mnt/vk; echo mounted; } || echo refused")"
+g "mdconfig -d -u $D1; mdconfig -d -u $D2; $KL drop $KID >/dev/null 2>&1; rm -rf $VK; true"
+else
+echo "  SKIP: no /dev/tesserakeys in the guest (load tessera_fs before arcad)"
+fi
 
 echo "=== $pass passed, $fail failed"
 [ "$fail" = 0 ]

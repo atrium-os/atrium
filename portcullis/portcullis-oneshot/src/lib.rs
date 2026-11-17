@@ -418,6 +418,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         hostid:   Some(host_identity.hostid),
         hostuuid: Some(host_identity.hostuuid.clone()),
         allow_mlock: false,
+        allow_tessera_keys: false,
         // jail-sysfil.md §5.2; jaild drops it on a kernel without sysfil.
         syscall_profile: Some(portcullis_jail::sysfil_class(&manifest.capabilities)),
         devfs_grant: None,

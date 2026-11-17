@@ -135,6 +135,7 @@ fn start(cfg: &Config, uid: u32, root: &Path, port: u16, addrs: &[Ipv4Addr]) -> 
         hostid: Some(id.hostid),
         hostuuid: Some(id.hostuuid.clone()),
         allow_mlock: true,
+        allow_tessera_keys: false,
         syscall_profile: None,
         devfs_grant: None,
         devfs_grants: vec![],

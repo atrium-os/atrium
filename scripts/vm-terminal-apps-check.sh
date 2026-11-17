@@ -51,6 +51,8 @@ xb stoa "-p stoa --bin stoad"
 echo "=== install"
 B=/var/tmp/termapps
 V "pkill -x portcullisd; pkill -x frescod; pkill -x stoad; pkill -f atrium-term-socket; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+# A fresh VM has no alice (the open-files gates' user, uid 1011).
+V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/examples/home_probe \
          atrium-term-socket/target/$TARGET/release/atrium-term-socket atrium-term-socket/target/$TARGET/release/examples/console_probe \

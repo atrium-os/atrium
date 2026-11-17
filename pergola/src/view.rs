@@ -356,6 +356,12 @@ impl<'a> Ctx<'a> {
         self.interactions.entry(id).focusable = true;
     }
 
+    /// Let a focused node have Tab and Shift+Tab (a code editor);
+    /// Ctrl+Tab and Ctrl+Shift+Tab still move focus out of it.
+    pub fn takes_tab(&mut self, id: NodeId) {
+        self.interactions.entry(id).takes_tab = true;
+    }
+
     /// Give the next node emitted a stable key among its siblings, so
     /// it keeps its id (and its state on the screen) when siblings
     /// before it are inserted or removed. Keys are per parent.

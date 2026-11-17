@@ -624,6 +624,33 @@ font on demand and a driver from a `nobody` device's notice.
   needing 2 of the old keys).
 - Real keys: waits for Shankar's key ceremony (three hardware tokens for root).
 
+### 14.3 C2 as built (2026-11-17)
+
+- `opifexd` (`src/bin/opifexd.rs`, the work in `src/daemon.rs`): root, unjailed like
+  portcullisd for now, no network; one JSON request per line on
+  `/atrium/sockets/opifex/opifex.sock`. Anyone may ask `Installed`, `Describe` and `Search`
+  (answered from the local catalog); `Install` (newest catalog release), `InstallLocal`
+  (side-load of a folder or `.insula`), `Uninstall`, `Rollback` and `Sync` are root's until
+  the install sheet (C3) carries a person's approval.
+- `opifex-check`: started per archive with the bytes on stdin; chroots into an empty folder
+  owned by `_opifex` (65041), drops to that uid, unpacks there. opifexd then checks the
+  manifest is the catalog's, the signature (against the catalog signer's key for catalog
+  installs, the side-load list otherwise) and every file against the signed index while
+  copying into its own staging, and swaps it in.
+- The `.insula` archive is version 2 (`src/archive.rs`): adds folders and in-tree links to
+  INSB v1, which layers need; deterministic; `opifex archive <dir> <out>` writes one.
+- Catalog installs must carry their own library closure (no install-time resolving); the
+  archive must match the catalog's hash and size (a mismatch is deleted). Downloading is C4:
+  until then archives are placed in `/var/db/atrium/opifex/dl/<sha256>.insula`.
+- The installed record `/var/db/atrium/opifex/installed.toml` (id, version, kind, publisher
+  key id, source, archive hash, content hash, who, when).
+- CLI through opifexd: `opifex describe | search | installed | get | side-load | remove | sync`.
+- Launch trust: portcullisd still checks `/etc/atrium/publishers`, so the platform key must
+  be listed there too until launch reads the installed record (C5).
+- Checked: host tests (archive round trip and refusals; daemon: sync, describe, search,
+  person refused, catalog install, update, rollback, uninstall, missing and wrong archive,
+  untrusted and trusted side-load, garbage archive). VM gate `scripts/vm-opifex-c2-check.sh`.
+
 ## 15. Decisions, with recommendations
 
 1. **Each catalog downloaded whole** for all lookups, not per-publisher DNS manifests or

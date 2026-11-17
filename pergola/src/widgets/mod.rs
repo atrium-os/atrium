@@ -35,7 +35,7 @@ pub use basics::{Avatar, Divider, Dot, ProgressBar};
 pub use button::Button;
 pub use canvas::{Canvas, CanvasEvent, Item as CanvasItem};
 pub use chip::{Chip, ListRow};
-pub use code_grid::{CodeGrid, CodeView};
+pub use code_grid::{CodeGrid, CodeView, OtherKey};
 pub use choice::{Check, Checkbox, RadioGroup, Segmented, Tabs, Toggle};
 pub use credential_field::{CredentialField, CredentialState};
 pub use grid_view::{CellAlign, CellIcon, CellRange, CellView, GridAction, GridFloat, GridSource, GridState, GridView};

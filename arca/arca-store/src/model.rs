@@ -79,6 +79,11 @@ pub enum Kind {
     /// A symmetric key released only as an unwrap/derive operation
     /// (the Loculus master key).
     Symmetric = 0x102,
+    /// A Tessera volume or key-group key (tessera-encryption.md §4.1):
+    /// loaded into the kernel keyring by arcad and never given to any
+    /// process. Scope `key_id[16] | volume uuid[16] | group u64 LE`; value
+    /// `key[32] | high_water u64 LE`; account is the label.
+    VolumeKey = 0x103,
 }
 
 impl Kind {
@@ -96,6 +101,7 @@ impl Kind {
             0x100 => Ed25519,
             0x101 => P256,
             0x102 => Symmetric,
+            0x103 => VolumeKey,
             _ => return Err(Error::Corrupt("unknown kind")),
         })
     }

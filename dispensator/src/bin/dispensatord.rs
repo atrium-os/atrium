@@ -926,6 +926,7 @@ mod run {
             hostuuid: Some(id.hostuuid.clone()),
             // The WebDAV server locks the password it holds for the session.
             allow_mlock: true,
+            allow_tessera_keys: false,
             syscall_profile: Some("share-server".into()),
             devfs_grant: None,
             devfs_grants: vec![],
@@ -1905,6 +1906,7 @@ mod run {
                 hostid: None,
                 hostuuid: None,
                 allow_mlock: false,
+                allow_tessera_keys: false,
                 syscall_profile: Some(p.sysfil.clone()),
                 devfs_grant: p.devfs_grants.first().cloned(),
                 devfs_grants: p.devfs_grants.iter().skip(1).cloned().collect(),

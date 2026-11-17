@@ -31,6 +31,7 @@ pub fn validate_create(
     validate_devfs_pin(req, policy)?;
     validate_network(&req.network, &req.name, policy)?;
     validate_mlock(req, policy)?;
+    validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
         validate_tmpfs_owner(m, req.exec.as_ref())?;
@@ -190,6 +191,18 @@ fn validate_mlock(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildE
     Err(JaildError::PolicyViolation {
         rule:   "mlock.not_allowed",
         detail: format!("jail {:?} not in policy.mlock.allow_jails", req.name),
+    })
+}
+
+/// `allow.tessera_keys` lets a jail load volume keys into the kernel and drop
+/// them, so it is allowlisted per jail with no exceptions: arcad alone.
+fn validate_tessera_keys(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    if !req.allow_tessera_keys || policy.tessera_keys.allow_jails.iter().any(|n| n == &req.name) {
+        return Ok(());
+    }
+    Err(JaildError::PolicyViolation {
+        rule:   "tessera_keys.not_allowed",
+        detail: format!("jail {:?} not in policy.tessera_keys.allow_jails", req.name),
     })
 }
 
@@ -820,6 +833,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            allow_tessera_keys: false,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
@@ -849,6 +863,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            allow_tessera_keys: false,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
@@ -1108,6 +1123,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            allow_tessera_keys: false,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
@@ -1134,6 +1150,7 @@ mod tests {
             hostid: None,
             hostuuid: None,
             allow_mlock: false,
+            allow_tessera_keys: false,
             syscall_profile: None,
             devfs_grant: None,
             devfs_grants: vec![],
@@ -1404,6 +1421,25 @@ mod tests {
         req.allow_mlock = false;
         p.mlock.allow_jails.clear();
         assert!(validate_mlock(&req, &p).is_ok());
+    }
+
+    #[test]
+    fn tessera_keys_require_allowlist_with_no_exceptions() {
+        let mut p = load_sample_policy();
+        assert_eq!(p.tessera_keys.allow_jails, vec!["atrium-arcad".to_string()]);
+        let mut req = req_default();
+        req.allow_tessera_keys = true;
+        assert!(matches!(validate_tessera_keys(&req, &p),
+            Err(JaildError::PolicyViolation { rule: "tessera_keys.not_allowed", .. })));
+        // Being allowed to mlock (as couriers and share servers are) is not
+        // enough.
+        p.mlock.allow_jails.push(req.name.clone());
+        assert!(validate_tessera_keys(&req, &p).is_err());
+        p.tessera_keys.allow_jails.push(req.name.clone());
+        assert!(validate_tessera_keys(&req, &p).is_ok());
+        req.allow_tessera_keys = false;
+        p.tessera_keys.allow_jails.clear();
+        assert!(validate_tessera_keys(&req, &p).is_ok());
     }
 
     #[test]

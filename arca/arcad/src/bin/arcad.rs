@@ -16,6 +16,8 @@
 //!   sigillumd, which verifies the user before each use of a
 //!   verify-each-use item (sigillum.md §8); `none`: those items stay
 //!   unusable (`NEEDS_VERIFICATION`).
+//! - `ARCA_TESSERA_KEYRING` (default `/dev/tesserakeys`, FreeBSD only): the
+//!   kernel keyring Tessera volume keys are loaded into.
 //! - `ARCA_ALLOW_UNSIGNED=1`: development only; serves apps launched without
 //!   a verified publisher. Logged loudly.
 //!
@@ -70,6 +72,18 @@ fn main() -> ExitCode {
             // screen; a failure here leaves users' stores working.
             if let Err(e) = s.open_machine() {
                 eprintln!("arcad: machine store: {e:?}");
+            }
+            // The kernel keyring for Tessera volume keys
+            // (tessera-encryption.md §4.3), opened before serving anyone.
+            // Absent (no tessera_fs, or not this jail's): the volume ops
+            // answer UNSUPPORTED.
+            #[cfg(target_os = "freebsd")]
+            {
+                let path = std::env::var("ARCA_TESSERA_KEYRING").unwrap_or_else(|_| arcad::volume::dev::PATH.into());
+                match arcad::volume::dev::Device::open(&path) {
+                    Ok(d) => s.keyring = Some(Box::new(d)),
+                    Err(e) => eprintln!("arcad: {path}: {e}; volume keys unavailable"),
+                }
             }
             Arc::new(Mutex::new(s))
         }

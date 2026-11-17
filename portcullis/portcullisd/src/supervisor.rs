@@ -676,6 +676,7 @@ mod tests {
             volumes:       vec![],
             network:       ManifestNetwork::Disable,
             allow_mlock: false,
+            allow_tessera_keys: false,
             exec: Some(ManifestExec {
                 path: "/usr/local/bin/atrium-jaild".into(),
                 argv: vec!["atrium-jaild".into()],

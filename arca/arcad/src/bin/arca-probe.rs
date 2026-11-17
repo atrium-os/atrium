@@ -21,6 +21,11 @@
 //! arca-probe SOCK share-list                                       # as the file manager
 //! arca-probe SOCK share-items KEYHEX          # as a share server's uid
 //! arca-probe SOCK share-fill KEYHEX ID        # as a share server's uid
+//! arca-probe SOCK vk-mint USER PERSONA UUIDHEX LABEL       # as a volume service
+//! arca-probe SOCK vk-load USER PERSONA KEYID UUIDHEX GROUP # as a volume service
+//! arca-probe SOCK vk-record USER PERSONA KEYID             # as a volume service
+//! arca-probe SOCK vk-forget USER PERSONA KEYID             # as a volume service
+//! arca-probe SOCK vk-sweep USER PERSONA KEYID UUIDHEX      # every op: the longest reply
 //! ```
 //!
 //! Prints `status=N` and any body; exits 0 whatever the status, so a
@@ -32,7 +37,7 @@ use std::process::ExitCode;
 
 use arca_store::codec::Writer;
 use arcad::client::VestibulumLink;
-use arcad::proto::{self, op, share_op};
+use arcad::proto::{self, op, share_op, volume_op};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -164,6 +169,63 @@ fn main() -> ExitCode {
             w.raw(&unhex(arg(3)));
             w.raw(&unhex(arg(4)));
             call(sock, share_op::SH_FILL, &w.buf)
+        }
+        // Tessera volume keys (tessera-encryption.md §4.3): the caller names
+        // the owner; arcad never returns the key.
+        "vk-mint" => {
+            w.str(arg(3));
+            w.str(arg(4));
+            w.raw(&unhex(arg(5)));
+            w.u64(0);
+            w.str(arg(6));
+            call(sock, volume_op::VK_MINT, &w.buf)
+        }
+        "vk-load" => {
+            w.str(arg(3));
+            w.str(arg(4));
+            w.raw(&unhex(arg(5)));
+            w.raw(&unhex(arg(6)));
+            w.u64(arg(7).parse().unwrap_or(0));
+            call(sock, volume_op::VK_LOAD, &w.buf)
+        }
+        "vk-record" | "vk-forget" => {
+            w.str(arg(3));
+            w.str(arg(4));
+            w.raw(&unhex(arg(5)));
+            call(sock, if arg(2) == "vk-record" { volume_op::VK_RECORD } else { volume_op::VK_FORGET }, &w.buf)
+        }
+        // Every op but VK_FORGET and VK_MINT (whose reply is a key id) with
+        // each body shape that names the key: prints the longest reply body
+        // (a volume key is 32 bytes).
+        "vk-sweep" => {
+            let (kid, uuid) = (unhex(arg(5)), unhex(arg(6)));
+            let mut owner = Writer::new();
+            owner.str(arg(3));
+            owner.str(arg(4));
+            owner.raw(&kid);
+            let mut scoped = Writer::new();
+            scoped.buf = owner.buf.clone();
+            scoped.raw(&uuid);
+            scoped.u64(0);
+            let (mut longest, mut at) = (0usize, 0u16);
+            for o in 0u16..=0xff {
+                if o == volume_op::VK_FORGET || o == volume_op::VK_MINT {
+                    continue;
+                }
+                for b in [kid.clone(), owner.buf.clone(), scoped.buf.clone(), Vec::new()] {
+                    let Ok(mut s) = UnixStream::connect(sock) else { continue };
+                    if proto::write_request(&mut s, o, &b).is_err() {
+                        continue;
+                    }
+                    if let Ok((_, r)) = proto::read_reply(&mut s) {
+                        if r.as_ref().len() > longest {
+                            (longest, at) = (r.as_ref().len(), o);
+                        }
+                    }
+                }
+            }
+            println!("longest={longest} op={at:#x}");
+            return ExitCode::SUCCESS;
         }
         c => {
             eprintln!("unknown command {c}");

@@ -37,6 +37,8 @@ fn book() -> Workbook {
     p.rows = vec![PivotField::new(0), PivotField { field: 1, hidden: vec![Value::str("Bo")] }];
     p.cols = vec![PivotField::new(2)];
     p.data = vec![DataField { field: 3, agg: Agg::Sum, name: None }];
+    // COMPACT=1: this one in compact form.
+    p.compact = std::env::var_os("COMPACT").is_some();
     wb.add_pivot(p).unwrap();
     let mut q = Pivot::new("Prices", src, CellAddr::new(0, 0, 7));
     q.rows = vec![PivotField::new(1)];

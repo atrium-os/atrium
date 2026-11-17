@@ -5,7 +5,10 @@
  * arcad (or, in developer builds, tessera-keyload) loads a volume key for
  * one scope; a mount of that volume copies it out, derives its keys and
  * wipes the copy. The device is root:wheel 0600 here; devfs rules hand it to
- * _arca. Jailed processes are refused whatever the permissions.
+ * _arca. A jailed process is refused whatever the permissions unless its
+ * jail has allow.tessera_keys, which jaild gives arcad's jail alone (policy
+ * [tessera_keys]): a devfs ruleset that failed to hide the node still does
+ * not hand the keyring to another jail.
  */
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -36,6 +39,7 @@ struct tkey {
 };
 
 static struct tkey *ring;         /* TESSERA_KEYRING_MAX slots */
+static u_int        ring_allow;   /* PR_ALLOW bit of allow.tessera_keys */
 static struct mtx   ring_mtx;
 static struct cdev *ring_dev;
 
@@ -98,7 +102,8 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	int error = 0;
 
 	(void)dev;
-	if (jailed(td->td_ucred))
+	if (jailed(td->td_ucred) &&
+	    (ring_allow == 0 || !prison_allow(td->td_ucred, ring_allow)))
 		return (EPERM);
 	switch (cmd) {
 	case TKEY_LOAD: {
@@ -188,6 +193,10 @@ tessera_keyring_init(void)
 
 	ring = malloc(sizeof(*ring) * TESSERA_KEYRING_MAX, M_TESSERA_KEYS,
 	    M_WAITOK | M_ZERO);
+	/* The jail parameter stays registered after unload (the kernel has no
+	 * way to remove one); a reload finds the same bit. */
+	ring_allow = prison_add_allow(NULL, "tessera_keys", NULL,
+	    "Allow the Tessera keyring (/dev/tesserakeys) in the jail");
 	mtx_init(&ring_mtx, "tessera_keys", NULL, MTX_DEF);
 	make_dev_args_init(&a);
 	a.mda_flags = MAKEDEV_WAITOK | MAKEDEV_CHECKNAME;
