@@ -669,6 +669,15 @@ impl Store {
         Ok((meta, value))
     }
 
+    /// The personas holding any group for `recipient`. Group headers carry
+    /// the persona in the clear, so this works while the store is locked.
+    pub fn personas_for(&self, recipient: &Recipient) -> Vec<String> {
+        let mut out: Vec<String> = self.groups.values().filter(|g| &g.recipient == recipient).map(|g| g.persona.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Items for one recipient, metadata only.
     pub fn list(&self, who: &Access<'_>) -> Result<Vec<ItemMeta>, Error> {
         let mut out = Vec::new();
