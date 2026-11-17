@@ -340,9 +340,16 @@ tree's root tag into the superblock and seals a copy of it, the journal's ROOT_U
 the root tags, and each commit (and a clean unmount) moves the journal to a fresh anchor
 written in the superblock before the checkpoint. A journal that does not open under the
 superblock's anchor (a crash between that superblock write and the checkpoint) is
-reformatted by a writable mount: the superblock already holds all of it. Garbage
-collection, repacking, snapshots and the dead-extent log are off on sealed volumes for now
-(scripts/tessera-sealed-vm.sh covers write, remount and crash replay).
+reformatted by a writable mount: the superblock already holds all of it.
+
+Garbage collection runs on sealed volumes. Pass 1 walks manifests through the sealed fetch;
+pass 2 learns each pack's keyed ids by opening its front against the registry tag (no blob
+is read), and a front that does not open keeps its pack. A concurrent pass takes each frozen
+root's tag with the root under the commit gate, and the background pin scan walks those
+frozen trees under the same tags. Repacking does not apply: it consolidates multi-extent
+packs, and sealed packs are always one extent. Snapshots and the dead-extent log stay off
+on sealed volumes for now (snapshot records would need their roots' tags).
+scripts/tessera-sealed-vm.sh covers write, remount, garbage collection and crash replay.
 
 ### 5.3 Metadata blocks
 
@@ -663,7 +670,7 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | step | what | done when |
 |---|---|---|
 | E0 | Suite benchmark on the kernel's candidate code paths, vectors checked | **done 2026-11-17** (a09cb45, 007eb73): numbers in §5.1 for x86_64 and Apple M4; XAES-256-GCM chosen; in-kernel timing moves to E1 |
-| E1 | Sealed volumes (layer A): incompat bit (readers already refuse it, tested 2026-11-17), superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded **done 2026-11-17**: scripts/tessera-sealed-vm.sh run/fsck/bench pass on both modules (2266fbd); byte flips over every block of a formatted volume in test_volume_sealed, per tree node and journal block in test_btree_sealed and test_journal_sealed, older copies in the latter two; capsa refuses via tessera_volume_open; throughput in §5.1. GC, repacking, snapshots and the dead-extent log on sealed volumes follow before E3 |
+| E1 | Sealed volumes (layer A): incompat bit (readers already refuse it, tested 2026-11-17), superblock HMAC and root tags, sealed metadata blocks with parent tags, journal chain, sealed packs and blobs, keyed ids, kernel keyring with a developer key loader, kernel format; `fsck.tessera --key-file` (developer builds) | VM: write, crash, replay and fsck on a sealed volume. Flipping any byte of any block is refused before decoding (fuzz across every block kind). An older copy of any one block is refused. The capsa reader refuses a sealed volume. Throughput vs unsealed recorded **done 2026-11-17**: scripts/tessera-sealed-vm.sh run/fsck/bench pass on both modules (2266fbd); byte flips over every block of a formatted volume in test_volume_sealed, per tree node and journal block in test_btree_sealed and test_journal_sealed, older copies in the latter two; capsa refuses via tessera_volume_open; throughput in §5.1. Garbage collection on sealed volumes added after (§5.2); snapshots still off |
 | E2 | Arca: `VolumeKey`, `/dev/tesserakeys` held by arcad, `LOAD`/`MINT`/`RECORD_GENERATION`/`FORGET` | arca-vm-test: key loads only for the active, unlocked owner, never released by any op; a mount with the wrong key id or a foreign uuid is refused |
 | E3 | Trusted sticks: format from Scrinium, probe, kernel mount, Locked state, recovery code, high-water, eject recording | vm-automount-check: a sealed stick opens for its persona only; a stick from another machine is Locked; a recovery code adopts it; an older image is refused and opens read-only after verification; forgetting the key leaves it Locked |
 | E4 | Encrypted domains on the internal volume: key-group and domain records with MACs, group-tagged packs, keyed ids, names and CDC per group, the parent-domain rule, lock at logout with page invalidation, atrium-volumes `encrypt = "persona"` with expected groups | VM: two people; root cannot read B's files or names while B is logged out; an offline edit that strips a domain's group or moves a file out of it is refused at login; dedup within a group, none across groups; GC leaves a locked group's packs alone |
