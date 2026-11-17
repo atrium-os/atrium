@@ -2288,6 +2288,74 @@ impl Editor {
         true
     }
 
+    /// The document's character styles, in its order.
+    pub fn char_styles(&self) -> Vec<(StyleId, std::sync::Arc<str>)> {
+        self.doc.styles.styles.iter().enumerate().filter(|(_, s)| s.kind == officina_text::model::StyleKind::Char).map(|(i, s)| (i as StyleId, s.name.clone())).collect()
+    }
+
+    /// The character style of the text at the caret (the selection's start).
+    pub fn char_style_at_caret(&self) -> Option<StyleId> {
+        let (a, _) = self.selection();
+        let p = self.doc.para(a.block)?;
+        let at = if self.has_selection() { a.at } else { a.at.saturating_sub(1) };
+        let mut x = self.doc.attrs.get(p.attr_at(at)).clone();
+        if let Some(t) = &self.typing {
+            x = t.over(&x);
+        }
+        x.style.filter(|&s| self.doc.styles.styles.get(s as usize).is_some_and(|st| st.kind == officina_text::model::StyleKind::Char))
+    }
+
+    /// Puts the selection (or what typing gives) in character style `id`,
+    /// or none; its own font, size, weight and colour give way to the
+    /// style's. One undo step.
+    pub fn set_char_style(&mut self, id: Option<StyleId>) {
+        self.format("Character Style", move |a| {
+            a.style = id;
+            if id.is_some() {
+                shed_chars(a);
+            }
+        });
+    }
+
+    /// A new character style `name` that looks as the text at the caret
+    /// does; the selection takes it. One undo step; `None` if the name is
+    /// empty or taken, or nothing is selected.
+    pub fn new_char_style_from_selection(&mut self, name: &str) -> Option<StyleId> {
+        let name = name.trim();
+        if name.is_empty() || self.doc.styles.by_name(name).is_some() || !self.has_selection() {
+            return None;
+        }
+        let id = self.doc.styles.styles.len() as StyleId;
+        let (_, ca) = self.look_here()?;
+        let s = officina_text::model::Style { name: name.into(), kind: officina_text::model::StyleKind::Char, parent: None, next: None, para: ParaProps::default(), chars: ca };
+        if !self.doc.style_fits(id, &s) {
+            return None;
+        }
+        let mut ops = vec![TextOp::SetStyle { id, style: Some(s) }];
+        let (a, b) = self.selection();
+        for k in a.block..=b.block {
+            let st = if k == a.block { a.at } else { 0 };
+            let en = if k == b.block { b.at } else { self.len(k) };
+            if st < en {
+                ops.extend(self.doc.format_ops(k, st, en, &|x: &mut CharAttrs| {
+                    x.style = Some(id);
+                    shed_chars(x);
+                }));
+            }
+        }
+        self.apply("New Character Style", ops, Kind::Other);
+        (self.doc.styles.styles.len() as StyleId > id).then_some(id)
+    }
+
+    /// Character style `id` takes on how the text at the caret looks
+    /// (direct font, size, weight, colour over the style's). One undo step.
+    pub fn update_char_style_to_match(&mut self, id: StyleId) -> bool {
+        let Some((_, ca)) = self.look_here() else { return false };
+        let Some(mut s) = self.doc.styles.styles.get(id as usize).cloned() else { return false };
+        merge_chars(&mut s.chars, &ca);
+        self.change_style("Update Style", id, |x| *x = s)
+    }
+
     /// A new paragraph style `name`, based on the caret paragraph's, that
     /// looks as the selection does; the selected paragraphs take it. One
     /// undo step; `None` if the name is empty or taken.
@@ -3660,4 +3728,9 @@ fn merge_para(dst: &mut ParaProps, src: &ParaProps) {
 fn merge_chars(dst: &mut CharAttrs, src: &CharAttrs) {
     macro_rules! m { ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* } }
     m!(bold, italic, underline, strike, size, color, highlight, family);
+}
+
+/// Takes off a run's own look (what a character style gives).
+fn shed_chars(a: &mut CharAttrs) {
+    (a.bold, a.italic, a.underline, a.strike, a.size, a.color, a.highlight, a.family) = (None, None, None, None, None, None, None, None);
 }

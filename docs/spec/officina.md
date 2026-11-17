@@ -3356,7 +3356,14 @@ Write's Style menu offered five fixed names, so a document's own styles
 - **Refusals leave no trace**: a change the engine would refuse (a loop
   through parents, a taken name) is checked first (`style_fits`), so it
   adds no empty undo step and the bar says why.
-- **Not yet**: character styles, deleting a style (its index is in every
+- **Character styles** (same day): the bar switches between Paragraph
+  and Characters. On characters it edits the character style of the text
+  at the caret (rename, size, bold, italic, underline, font), makes one
+  from the selection (the selection takes it and drops its own font,
+  size, weight and colour) or updates one to match, and applies one or
+  none from a menu; each one undo step. Runs carry it as before
+  (`CharAttrs::style`, `w:rStyle`, ODF text styles).
+- **Not yet**: deleting a style (its index is in every
   paragraph), a styles pane with previews, more fonts than the pinned set.
 
 Gates: engine (change, add, remove, every refusal), journal op round
