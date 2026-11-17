@@ -122,8 +122,14 @@ fn decode(b: &[u8], attrs: usize, styles: usize) -> Result<Record, WireError> {
             }
             let k = r.count("ops", 1 << 20, 1)?;
             let mut ops = Vec::with_capacity(k);
+            // A style added by one op may be used by the next.
+            let mut styles = styles;
             for _ in 0..k {
-                ops.push(native::decode_op(r.bytes("op", 64 << 20)?, attrs + n, styles)?);
+                let op = native::decode_op(r.bytes("op", 64 << 20)?, attrs + n, styles)?;
+                if let officina_text::ops::TextOp::SetStyle { id, style: Some(_) } = &op {
+                    styles = styles.max(*id as usize + 1);
+                }
+                ops.push(op);
             }
             let mut images = Vec::new();
             if !r.is_empty() {
@@ -548,6 +554,41 @@ mod tests {
         assert_eq!(got, want);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1.fill, Some(0xC00000));
+        r.close().unwrap();
+    }
+
+    #[test]
+    fn a_crash_keeps_style_changes() {
+        let dir = tmp("styles");
+        let mut d = Doc::from_text("notes.txt", b"first line\nsecond\n").unwrap();
+        d.autosave_to(&dir).unwrap();
+        {
+            let mut e = d.ed.borrow_mut();
+            e.set_caret(Pos::new(0, 0), false);
+            e.set_caret(Pos::new(0, 5), true);
+            e.format("Bold", |a| a.bold = Some(true));
+        }
+        d.sync_log();
+        // A new style and the paragraph on it in one step (the journal must
+        // know the style before the paragraph names it), then a change.
+        let id = d.ed.borrow_mut().new_style_from_selection("Lead").unwrap();
+        d.sync_log();
+        assert!(d.ed.borrow_mut().change_style("Style", id, |s| s.para.space_after = Some(480)));
+        d.sync_log();
+        d.autosave().unwrap().sync().unwrap();
+        let want = d.ed.borrow().doc.styles.styles.clone();
+        std::mem::forget(d);
+        let copy = tmp("styles-copy");
+        fs::create_dir_all(&copy).unwrap();
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            if e.file_name() != LOCK {
+                fs::copy(e.path(), copy.join(e.file_name())).unwrap();
+            }
+        }
+        let (r, _) = recover(&copy).unwrap();
+        assert_eq!(r.ed.borrow().doc.styles.styles, want);
+        assert_eq!(r.ed.borrow().doc.para(0).unwrap().style, id);
+        assert_eq!(want[id as usize].para.space_after, Some(480));
         r.close().unwrap();
     }
 

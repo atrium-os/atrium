@@ -1123,6 +1123,17 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
                 }
             }
         }
+        TextOp::SetStyle { id, style } => {
+            w.u8(17);
+            w.var(*id as u64);
+            match style {
+                None => w.u8(0),
+                Some(s) => {
+                    w.u8(1);
+                    encode_style(&mut w, s);
+                }
+            }
+        }
         TextOp::SetShape { id, shape } => {
             w.u8(16);
             w.var(*id as u64);
@@ -1147,6 +1158,44 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
         }
     }
     w.into_bytes()
+}
+
+/// A named style: name, kind, parent and next (0 for none, else index + 1),
+/// paragraph and character properties.
+pub fn encode_style(w: &mut Writer, s: &Style) {
+    w.str(&s.name);
+    w.u8(match s.kind {
+        StyleKind::Para => 0,
+        StyleKind::Char => 1,
+    });
+    w.var(s.parent.map_or(0, |p| p as u64 + 1));
+    w.var(s.next.map_or(0, |p| p as u64 + 1));
+    encode_props(w, &s.para);
+    encode_attrs(w, &s.chars);
+}
+
+/// A style whose references are below `n`.
+pub fn decode_style(r: &mut Reader, n: usize) -> Result<Style, WireError> {
+    let name: Arc<str> = Arc::from(r.str("style name", MAX_NAME)?);
+    let kind = match r.u8()? {
+        0 => StyleKind::Para,
+        1 => StyleKind::Char,
+        _ => return Err(WireError::Invalid("style kind")),
+    };
+    let idx = |v: u64| -> Result<Option<u16>, WireError> {
+        if v == 0 {
+            Ok(None)
+        } else if v as usize <= n {
+            Ok(Some((v - 1) as u16))
+        } else {
+            Err(WireError::Invalid("style reference"))
+        }
+    };
+    let parent = idx(r.var()?)?;
+    let next = idx(r.var()?)?;
+    let para = decode_props(r)?;
+    let chars = decode_attrs(r)?;
+    Ok(Style { name, kind, parent, next, para, chars })
 }
 
 /// Decodes an op; `attrs` and `styles` are the table sizes it may refer to.
@@ -1219,6 +1268,16 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("comment")),
             };
             TextOp::SetComment { id, comment }
+        }
+        17 => {
+            // It may add the style one past the table.
+            let id = r.len("style", styles.min(MAX_STYLES - 1) as u64)? as u16;
+            let style = match r.u8()? {
+                0 => None,
+                1 => Some(decode_style(&mut r, styles + 1)?),
+                _ => return Err(WireError::Invalid("style")),
+            };
+            TextOp::SetStyle { id, style }
         }
         16 => {
             let id = r.len("shape", crate::model::MAX_SHAPES as u64 - 1)? as u32;
@@ -1334,15 +1393,7 @@ pub fn save<W: Write>(doc: &TextDoc, checkpoints: &[Checkpoint], out: W) -> io::
     let mut w = Writer::new();
     w.var(doc.styles.styles.len() as u64);
     for s in &doc.styles.styles {
-        w.str(&s.name);
-        w.u8(match s.kind {
-            StyleKind::Para => 0,
-            StyleKind::Char => 1,
-        });
-        w.var(s.parent.map_or(0, |p| p as u64 + 1));
-        w.var(s.next.map_or(0, |p| p as u64 + 1));
-        encode_props(&mut w, &s.para);
-        encode_attrs(&mut w, &s.chars);
+        encode_style(&mut w, s);
     }
     c.add(STYLES, &w.into_bytes())?;
 
@@ -1540,26 +1591,7 @@ pub fn load(data: &[u8]) -> Result<Loaded, LoadError> {
     }
     let mut styles = Vec::with_capacity(n);
     for _ in 0..n {
-        let name: Arc<str> = Arc::from(r.str("style name", MAX_NAME)?);
-        let kind = match r.u8()? {
-            0 => StyleKind::Para,
-            1 => StyleKind::Char,
-            _ => return Err(LoadError::Bad("style kind")),
-        };
-        let idx = |v: u64| -> Result<Option<u16>, LoadError> {
-            if v == 0 {
-                Ok(None)
-            } else if v as usize <= n {
-                Ok(Some((v - 1) as u16))
-            } else {
-                Err(LoadError::Bad("style reference"))
-            }
-        };
-        let parent = idx(r.var()?)?;
-        let next = idx(r.var()?)?;
-        let para = decode_props(&mut r)?;
-        let chars = decode_attrs(&mut r)?;
-        styles.push(Style { name, kind, parent, next, para, chars });
+        styles.push(decode_style(&mut r, n)?);
     }
     doc.styles = StyleSheet { styles, ..StyleSheet::default() };
 
@@ -1939,6 +1971,8 @@ mod tests {
             TextOp::SetDeletion { id: 4, del: Some(Deletion { rev: 2, pieces: vec![DelPiece { para: None, text: "gone".into(), runs: vec![(0, 1)] }, DelPiece { para: Some((77, 1, ParaProps { rev: Some(1), ..Default::default() })), text: "".into(), runs: vec![(0, 0)] }] }) },
             TextOp::SetDeletion { id: 4, del: None },
             TextOp::SetTracking { on: true },
+            TextOp::SetStyle { id: 5, style: Some(Style { name: "Quote".into(), kind: StyleKind::Para, parent: Some(0), next: Some(5), para: ParaProps { indent_start: Some(720), ..Default::default() }, chars: CharAttrs { italic: Some(true), ..Default::default() } }) },
+            TextOp::SetStyle { id: 5, style: None },
             TextOp::Nop,
         ];
         for op in ops {

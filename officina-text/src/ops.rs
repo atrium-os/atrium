@@ -54,6 +54,9 @@ pub enum TextOp {
     SetConflict { id: crate::model::ConflictId, alt: Option<crate::model::Deletion> },
     /// Turns tracking on or off.
     SetTracking { on: bool },
+    /// Changes style `id`, adds it (`id` one past the last), or takes out
+    /// the last one when nothing uses it (`None`).
+    SetStyle { id: StyleId, style: Option<crate::model::Style> },
     /// Nothing (what an op that didn't fit becomes).
     Nop,
 }
@@ -149,7 +152,7 @@ impl TextOp {
             // Every page may change (the paginator resets on a new geometry).
             TextOp::SetPage { .. } | TextOp::SetMargins { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
-            TextOp::SetNote { .. } | TextOp::SetShape { .. } => return None,
+            TextOp::SetNote { .. } | TextOp::SetShape { .. } | TextOp::SetStyle { .. } => return None,
             // Comments change no layout; the editor redraws on every action.
             TextOp::SetComment { .. } | TextOp::SetRevision { .. } | TextOp::SetTracking { .. } => return None,
             // A tombstone takes no room; its text is drawn only in review.
@@ -178,6 +181,24 @@ impl Op<TextDoc> for TextOp {
                 // Its anchor's page is painted again.
                 if let Some(at) = d.shape_anchor(id) {
                     d.note(crate::model::Edit { first: at, last: at + 1, delta: 0 });
+                }
+            }
+            return inv;
+        }
+        if let TextOp::SetStyle { id, .. } = &self {
+            let id = *id;
+            // Paragraphs of the style (or styles based on it) before and
+            // after are laid out again.
+            let before = d.style_span(id);
+            let inv = self.apply_inner(d);
+            if !matches!(inv, TextOp::Nop) {
+                let after = d.style_span(id);
+                let span = match (before, after) {
+                    (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                    (a, b) => a.or(b),
+                };
+                if let Some((first, last)) = span {
+                    d.note(crate::model::Edit { first, last, delta: 0 });
                 }
             }
             return inv;
@@ -409,6 +430,50 @@ impl TextOp {
                 first_page: std::mem::replace(&mut d.first_page, first_page),
                 even_pages: std::mem::replace(&mut d.even_pages, even_pages),
             },
+            TextOp::SetStyle { id, style } => {
+                let n = d.styles.styles.len();
+                let i = id as usize;
+                match style {
+                    None => {
+                        // Only the last, never Normal, and only when unused.
+                        if i + 1 != n || i == 0 || d.uses_style(id) {
+                            return TextOp::Nop;
+                        }
+                        let old = d.styles.styles.pop();
+                        TextOp::SetStyle { id, style: old }
+                    }
+                    Some(s) => {
+                        let len = if i == n { n + 1 } else { n };
+                        let refs_ok = [s.parent, s.next].into_iter().flatten().all(|r| (r as usize) < len) && s.parent != Some(id);
+                        let name_ok = !s.name.trim().is_empty() && s.name.len() <= 255 && !d.styles.styles.iter().enumerate().any(|(k, x)| k != i && x.name == s.name);
+                        // Normal stays a paragraph style based on nothing.
+                        let normal_ok = i != 0 || (s.kind == crate::model::StyleKind::Para && s.parent.is_none());
+                        if i > n || len > crate::model::MAX_STYLES || !refs_ok || !name_ok || !normal_ok {
+                            return TextOp::Nop;
+                        }
+                        // A kind change would leave paragraphs on a character style.
+                        if i < n && d.styles.styles[i].kind != s.kind {
+                            return TextOp::Nop;
+                        }
+                        // No loop through parents.
+                        let mut at = s.parent;
+                        for _ in 0..crate::model::MAX_STYLE_DEPTH {
+                            match at {
+                                Some(q) if q == id => return TextOp::Nop,
+                                Some(q) => at = d.styles.styles.get(q as usize).and_then(|x| x.parent),
+                                None => break,
+                            }
+                        }
+                        if i == n {
+                            d.styles.styles.push(s);
+                            TextOp::SetStyle { id, style: None }
+                        } else {
+                            let old = std::mem::replace(&mut d.styles.styles[i], s);
+                            TextOp::SetStyle { id, style: Some(old) }
+                        }
+                    }
+                }
+            }
             TextOp::SetPage { page, header, footer } => {
                 let ok = |t: i32| (0..=63_360).contains(&t);
                 if !(page.width >= 1440 && page.height >= 1440 && [page.width, page.height, page.margin_top, page.margin_bottom, page.margin_start, page.margin_end].into_iter().all(ok)) || page.margin_start + page.margin_end + 720 > page.width || page.margin_top + page.margin_bottom + 720 > page.height {
@@ -719,6 +784,49 @@ mod tests {
         let mut bad = sd;
         bad.paras[0].runs = vec![(0, 9_999)];
         assert_eq!(TextOp::SetShape { id: 0, shape: Some(bad) }.apply(&mut d), TextOp::Nop);
+    }
+
+    #[test]
+    fn styles_change_add_and_refuse_bad_ones() {
+        use crate::model::{Style, StyleKind};
+        let mut d = doc();
+        let n = d.styles.styles.len();
+        let normal = d.styles.styles[0].clone();
+        // Normal made bigger: its paragraphs are laid out again.
+        let big = Style { chars: CharAttrs { size: Some(30), ..Default::default() }, ..normal.clone() };
+        let inv = TextOp::SetStyle { id: 0, style: Some(big.clone()) }.apply(&mut d);
+        assert_eq!(inv, TextOp::SetStyle { id: 0, style: Some(normal.clone()) });
+        assert_eq!(d.styles.styles[0], big);
+        inv.apply(&mut d);
+        assert_eq!(d.styles.styles[0], normal);
+        // A new one after the last; taking it out again.
+        let quote = Style { name: "Quote".into(), kind: StyleKind::Para, parent: Some(0), next: Some(n as u16), para: ParaProps::default(), chars: CharAttrs { italic: Some(true), ..Default::default() } };
+        let inv = TextOp::SetStyle { id: n as u16, style: Some(quote.clone()) }.apply(&mut d);
+        assert_eq!(inv, TextOp::SetStyle { id: n as u16, style: None });
+        // Used by a paragraph, it can't go.
+        let p = d.para(0).unwrap().props.clone();
+        TextOp::SetPara { block: 0, style: n as u16, props: p.clone() }.apply(&mut d);
+        assert_eq!(inv.clone().apply(&mut d), TextOp::Nop);
+        TextOp::SetPara { block: 0, style: 0, props: p }.apply(&mut d);
+        inv.apply(&mut d);
+        assert_eq!(d.styles.styles.len(), n);
+        // Refused: a name taken, an empty name, a gap, its own parent, a
+        // loop, a kind change, Normal based on something, Normal removed.
+        let bad = |d: &mut TextDoc, id: usize, s: Option<Style>| assert_eq!(TextOp::SetStyle { id: id as u16, style: s }.apply(d), TextOp::Nop, "{id}");
+        bad(&mut d, n, Some(Style { name: "Heading 1".into(), ..quote.clone() }));
+        bad(&mut d, n, Some(Style { name: " ".into(), ..quote.clone() }));
+        bad(&mut d, n + 1, Some(quote.clone()));
+        bad(&mut d, n, Some(Style { parent: Some(n as u16), ..quote.clone() }));
+        bad(&mut d, 0, Some(Style { parent: Some(1), ..normal.clone() }));
+        let h1 = d.styles.styles[1].clone();
+        bad(&mut d, 1, Some(Style { kind: StyleKind::Char, ..h1.clone() }));
+        // Heading 1 based on Heading 2, Heading 2 already on Normal: fine;
+        // then Heading 2 on Heading 1 would loop.
+        assert_ne!(TextOp::SetStyle { id: 1, style: Some(Style { parent: Some(2), ..h1 }) }.apply(&mut d), TextOp::Nop);
+        let h2 = d.styles.styles[2].clone();
+        bad(&mut d, 2, Some(Style { parent: Some(1), ..h2 }));
+        bad(&mut d, 0, None);
+        bad(&mut d, 1, None);
     }
 
     #[test]

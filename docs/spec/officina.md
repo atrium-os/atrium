@@ -3317,6 +3317,44 @@ and 20 px shorter with its corner fixed, its turn handle pulled round to its rig
 Write tests all pass; twelve shapes drawn by the editor look right in our
 PDF.
 
+### 16.52 Paragraph styles in Write (2026-11-17)
+
+Write's Style menu offered five fixed names, so a document's own styles
+(a `.docx` full of them) could not be picked, changed or added to.
+
+- **Engine**: `TextOp::SetStyle { id, style }` changes a style, adds one
+  one past the last, or takes the last out (`None`, only when nothing
+  uses it: body, headers and footers, notes, shapes, deleted or
+  conflicting text, other styles' parent or next). Refused: an empty or
+  taken name, a reference past the table, a loop through parents, a
+  paragraph style turned character style, Normal based on something.
+  Paragraphs of the style or styles based on it are laid out again
+  (layouts are keyed on the resolved format already). Journal tag 17;
+  the autosave reader counts a style added earlier in the same step, so
+  New Style then the paragraph on it replays.
+- **Editor**: `para_styles`, `style_at_caret`, `change_style` (one undo
+  step), **Update to Match** (the caret's style takes the selection's
+  paragraph settings and the characters' font, size, weight, slant,
+  underline, strike, colour and highlight; the selected paragraphs drop
+  their own look and keep lists, cells and sections) and **New from
+  Selection** (based on the caret's style, next itself, the selection
+  takes it); each one undo step.
+- **Write**: the Style menu lists the document's paragraph styles, then
+  *Edit Styles…*, which opens a two-row style bar on the caret
+  paragraph's style: its name (Rename), New from Selection, Update to
+  Match; size a point at a time, bold, italic, underline, alignment,
+  space above and below. Moving to a paragraph of another style offers
+  to switch to it. Styles are saved in `.owrite`, `.docx` and `.odt` as
+  before.
+- **Not yet**: character styles, based-on and next pickers, a font list,
+  deleting a style, a styles pane with previews.
+
+Gates: engine (change, add, remove, every refusal), journal op round
+trip, editor (update to match moves direct format into the style, new
+style, rename refused when taken, undo/redo), Write's bar (every command,
+four steps four undos, the menu lists a new style), and a crash recovery
+that keeps a new style and the paragraph on it.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

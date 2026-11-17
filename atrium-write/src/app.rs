@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use officina_text::model::{HAlign, Rel, Wrap, SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
+use officina_text::model::{StyleId, HAlign, Rel, Wrap, SectionStart, Align, CommentId, ListKind, NoteId, NoteKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, type_size, Weight};
@@ -69,6 +69,22 @@ pub enum Cmd {
     Toggle(Toggle),
     Align(Align),
     Style(usize),
+    /// The style bar: on the caret paragraph's style.
+    StyleOpen,
+    /// A new style from the selection, named by the bar's field.
+    StyleNew,
+    /// The caret's style takes on the selection's look.
+    StyleUpdate,
+    /// The caret's style takes the bar's name.
+    StyleRename,
+    /// Its letters a point larger or smaller.
+    StyleSize(bool),
+    /// Bold, italic or underline on or off (0, 1, 2).
+    StyleToggle(u8),
+    StyleAlign(Align),
+    /// Space above (true) or below, a step more or less.
+    StyleSpace(bool, bool),
+    StyleClose,
     List(ListKind),
     PageNumbers,
     InsertPicture,
@@ -288,6 +304,13 @@ pub struct ShapeBar {
     pub id: Option<u32>,
 }
 
+/// The style bar: which style it shows (the caret paragraph's when opened).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StyleBar {
+    pub open: bool,
+    pub id: StyleId,
+}
+
 /// The header and footer bar is two bars high.
 pub const MARGIN_H: f32 = FIND_H * 2.0;
 
@@ -367,6 +390,9 @@ pub struct Write {
     pub style_menu: Mutable<MenuState>,
     pub insert_menu: Mutable<MenuState>,
     pub align_menu: Mutable<MenuState>,
+    pub style_bar: Mutable<StyleBar>,
+    pub style_name: Mutable<TextEdit>,
+    pub style_align_menu: Mutable<MenuState>,
     pub find: Mutable<FindBar>,
     pub find_text: Mutable<TextEdit>,
     pub replace_text: Mutable<TextEdit>,
@@ -395,7 +421,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -437,7 +463,7 @@ impl Write {
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.margin.get_cloned().open || self.shape.get_cloned().open || self.style_bar.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -581,6 +607,67 @@ impl Write {
 
     /// The shape bar on the shape at the caret (its words in the field), or
     /// offering shapes when there's none.
+    /// Runs a style bar command, on the caret paragraph's style.
+    fn style_cmd(&self, c: Cmd) {
+        let ed = self.doc.borrow().ed.clone();
+        let mut e = ed.borrow_mut();
+        let id = e.style_at_caret();
+        let name = self.style_name.get_cloned().text().trim().to_string();
+        let (pf, cf) = e.doc.styles.para_format(id, &Default::default());
+        match c {
+            Cmd::StyleOpen => {
+                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                self.spell.set(SpellBar::default());
+                self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
+                self.shape.set(ShapeBar::default());
+            }
+            Cmd::StyleNew => match e.new_style_from_selection(&name) {
+                Some(_) => self.doc.borrow_mut().status = format!("New style “{name}”"),
+                None => self.doc.borrow_mut().status = if name.is_empty() { "Type a name for the new style".into() } else { format!("There is a style called “{name}” already") },
+            },
+            Cmd::StyleUpdate => {
+                if !e.update_style_to_match() {
+                    self.doc.borrow_mut().status = "The style already looks like this".into();
+                }
+            }
+            Cmd::StyleRename => {
+                if !name.is_empty() && !e.change_style("Rename Style", id, |s| s.name = name.as_str().into()) {
+                    self.doc.borrow_mut().status = format!("There is a style called “{name}” already");
+                }
+            }
+            Cmd::StyleSize(up) => {
+                let size = if up { cf.size.saturating_add(2).min(400) } else { cf.size.saturating_sub(2).max(2) };
+                e.change_style("Style Size", id, |s| s.chars.size = Some(size));
+            }
+            Cmd::StyleToggle(k) => {
+                e.change_style("Style", id, |s| match k {
+                    0 => s.chars.bold = Some(!cf.bold),
+                    1 => s.chars.italic = Some(!cf.italic),
+                    _ => s.chars.underline = Some(!cf.underline),
+                });
+            }
+            Cmd::StyleAlign(a) => {
+                e.change_style("Style Alignment", id, |s| s.para.align = Some(a));
+            }
+            Cmd::StyleSpace(above, more) => {
+                let now = if above { pf.space_before } else { pf.space_after };
+                let v = if more { (now + 120).min(31_680) } else { (now - 120).max(0) };
+                e.change_style("Style Spacing", id, |s| if above { s.para.space_before = Some(v) } else { s.para.space_after = Some(v) });
+            }
+            _ => {}
+        }
+        if c == Cmd::StyleClose {
+            self.style_bar.set(StyleBar::default());
+        } else {
+            // The bar follows the caret's style (a new one is now the caret's).
+            let id = e.style_at_caret();
+            let n = e.doc.styles.styles.get(id as usize).map_or(String::new(), |s| s.name.to_string());
+            self.style_name.set(TextEdit::new(&n));
+            self.style_bar.set(StyleBar { open: true, id });
+        }
+    }
+
     fn shape_show(&self) {
         let ed = self.doc.borrow().ed.clone();
         let e = ed.borrow();
@@ -959,16 +1046,19 @@ impl Write {
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
                 // The bars share one place under the toolbar.
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen | Cmd::MarginOpen | Cmd::ShapeOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen | Cmd::MarginOpen | Cmd::ShapeOpen | Cmd::StyleOpen) {
                     e.review = false;
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::MarginOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::MarginOpen | Cmd::ShapeOpen | Cmd::ShapeInsert(_)) {
+                    self.style_bar.set(StyleBar::default());
+                }
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::MarginOpen | Cmd::StyleOpen) {
                     self.shape.set(ShapeBar::default());
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::MarginOpen | Cmd::ShapeOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::MarginOpen | Cmd::ShapeOpen | Cmd::StyleOpen) {
                     self.xref.set(XrefBar::default());
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen | Cmd::StyleOpen) {
                     self.margin.set(MarginBar::default());
                 }
                 match c {
@@ -1034,7 +1124,19 @@ impl Write {
                     }
                     Cmd::Toggle(t) => e.toggle(t),
                     Cmd::Align(a) => e.align(a),
-                    Cmd::Style(i) => e.style_named(STYLES[i.min(STYLES.len() - 1)]),
+                    Cmd::Style(i) => {
+                        // The document's paragraph styles; past them, the style bar.
+                        let all = e.para_styles();
+                        match all.get(i) {
+                            Some((id, _)) => e.set_paragraphs("Style", Some(*id), |_| {}),
+                            None => {
+                                drop(e);
+                                drop(d);
+                                self.cmds.lock().unwrap().push(Cmd::StyleOpen);
+                                return false;
+                            }
+                        }
+                    }
                     Cmd::List(k) => e.toggle_list(k),
                     Cmd::PageNumbers => e.toggle_page_numbers(),
                     Cmd::SectionBreak(start) => {
@@ -1136,6 +1238,13 @@ impl Write {
                         self.password_text.set(TextEdit::new("").secret(true));
                         self.changed();
                         return true;
+                    }
+                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleClose => {
+                        drop(e);
+                        drop(d);
+                        self.style_cmd(c);
+                        self.changed();
+                        return false;
                     }
                     Cmd::ShapeOpen | Cmd::ShapeInsert(_) | Cmd::ShapeFill(_) | Cmd::ShapeLine(_) | Cmd::ShapeWeight(_) | Cmd::ShapeDash | Cmd::ShapeArrows | Cmd::ShapeTurn(_) | Cmd::ShapeSize(..) | Cmd::ShapeAnchor | Cmd::ShapeDone | Cmd::ShapeClose => {
                         drop(e);
@@ -1244,16 +1353,18 @@ impl View for Write {
         button(ctx, "U", Cmd::Toggle(Toggle::Underline), 36.0, 10.0);
         button(ctx, "• List", Cmd::List(ListKind::Bullet), 64.0, 4.0);
         button(ctx, "1. List", Cmd::List(ListKind::Numbered), 68.0, 10.0);
-        let (style_name, cur_align) = {
+        let (style_name, cur_align, para_styles) = {
             let d = self.doc.borrow();
             let e = d.ed.borrow();
+            let para_styles = e.para_styles();
             let p = e.doc.para(e.caret.block);
             let name = p.and_then(|p| e.doc.styles.styles.get(p.style as usize)).map(|s| s.name.to_string()).unwrap_or_default();
             let align = p.map(|p| e.doc.styles.para_format(p.style, &p.props).0.align).unwrap_or_default();
-            (name, align)
+            (name, align, para_styles)
         };
         {
-            let items: Vec<MenuItem> = STYLES.iter().map(|s| MenuItem::new(*s).radio(*s == style_name)).collect();
+            let mut items: Vec<MenuItem> = para_styles.iter().map(|(_, s)| MenuItem::new(&**s).radio(**s == *style_name)).collect();
+            items.push(MenuItem::new("Edit Styles…").separated());
             let cmds = self.cmds.clone();
             MenuButton::new(if style_name.is_empty() { "Style".to_string() } else { style_name.clone() }, self.style_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Style(i))).at(x, 8.0).width(120.0).render(ctx);
             x += 128.0;
@@ -1474,6 +1585,70 @@ impl View for Write {
             Checkbox::new(check(first), "Different first page").at(rx + 124.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginFirst)).render(ctx);
             let cmds = self.cmds.clone();
             Checkbox::new(check(even), "Different even pages").at(rx + 300.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginEven)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
+        // The style bar: the caret paragraph's style, its name and look.
+        let yb = self.style_bar.get_cloned();
+        if yb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, MARGIN_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let (cur, pf, cf) = {
+                let e = ed.borrow();
+                let id = e.style_at_caret();
+                let (pf, cf) = e.doc.styles.para_format(id, &Default::default());
+                (id, pf, cf)
+            };
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 60.0, 20.0), content: "Style".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let fw = (w - 72.0 - 560.0).max(140.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.style_name.clone()).placeholder("Style name").at(72.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::StyleRename)).render(ctx);
+            let mut x = 72.0 + fw + 8.0;
+            if cur != yb.id {
+                // The caret moved to a paragraph of another style.
+                let n = ed.borrow().doc.styles.styles.get(cur as usize).map_or(String::new(), |s| s.name.to_string());
+                Button::primary(format!("Edit “{}”", fit_text(&n, 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())))).at(x, y + 8.0).width(170.0).on_click(push(Cmd::StyleOpen)).render(ctx);
+            } else {
+                for (label, cmd, wd) in [("Rename", Cmd::StyleRename, 76.0), ("New from Selection", Cmd::StyleNew, 156.0), ("Update to Match", Cmd::StyleUpdate, 140.0)] {
+                    Button::secondary(label).at(x, y + 8.0).width(wd).on_click(push(cmd)).render(ctx);
+                    x += wd + 6.0;
+                }
+            }
+            Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::StyleClose)).render(ctx);
+            if cur == yb.id {
+                let ry = y + FIND_H + 8.0;
+                let mut x = 12.0;
+                ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 70.0, 20.0), content: format!("{} pt", cf.size as f32 / 2.0), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                x += 62.0;
+                let on = |b: bool, l: &str| if b { format!("{l} ✓") } else { l.to_string() };
+                for (label, cmd, wd, gap) in [("Smaller".to_string(), Cmd::StyleSize(false), 76.0, 4.0), ("Larger".to_string(), Cmd::StyleSize(true), 68.0, 12.0), (on(cf.bold, "Bold"), Cmd::StyleToggle(0), 66.0, 4.0), (on(cf.italic, "Italic"), Cmd::StyleToggle(1), 66.0, 4.0), (on(cf.underline, "Underline"), Cmd::StyleToggle(2), 96.0, 12.0)] {
+                    Button::secondary(label).at(x, ry).width(wd).on_click(push(cmd)).render(ctx);
+                    x += wd + gap;
+                }
+                let all = [("Left", Align::Start), ("Centre", Align::Center), ("Right", Align::End), ("Justify", Align::Justify)];
+                let items: Vec<MenuItem> = all.iter().map(|(l, a)| MenuItem::new(*l).radio(*a == pf.align)).collect();
+                let now = all.iter().find(|(_, a)| *a == pf.align).map_or("Left", |(l, _)| l);
+                let cmds = self.cmds.clone();
+                MenuButton::new(now.to_string(), self.style_align_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleAlign(all[i.min(3)].1))).at(x, ry).width(96.0).render(ctx);
+                x += 108.0;
+                ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 150.0, 20.0), content: format!("Space above {} pt", pf.space_before / 20), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                x += 130.0;
+                for (label, cmd) in [("−", Cmd::StyleSpace(true, false)), ("+", Cmd::StyleSpace(true, true))] {
+                    Button::secondary(label).at(x, ry).width(32.0).on_click(push(cmd)).render(ctx);
+                    x += 36.0;
+                }
+                x += 8.0;
+                ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 150.0, 20.0), content: format!("Space below {} pt", pf.space_after / 20), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                x += 130.0;
+                for (label, cmd) in [("−", Cmd::StyleSpace(false, false)), ("+", Cmd::StyleSpace(false, true))] {
+                    Button::secondary(label).at(x, ry).width(32.0).on_click(push(cmd)).render(ctx);
+                    x += 36.0;
+                }
+            }
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
@@ -1820,6 +1995,68 @@ mod tests {
         assert_eq!(footer(0).as_deref(), Some("Page {page}"));
         run(Cmd::FindOpen);
         assert!(!w.margin.get_cloned().open, "bars share one place");
+    }
+
+    #[test]
+    fn style_bar_makes_and_changes_styles() {
+        let doc = Doc::from_text("h.txt", b"Lead paragraph\nBody text\n").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        let ed = w.doc.borrow().ed.clone();
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let top = w.pages_rect(1200.0, 800.0).origin.y;
+        // The Style menu's last item opens the bar on the caret's style.
+        let n = ed.borrow().para_styles().len();
+        run(Cmd::Style(n));
+        run(Cmd::Style(n)); // (the menu pushes StyleOpen for the next round)
+        assert!(w.style_bar.get_cloned().open);
+        assert_eq!(w.style_name.get_cloned().text(), "Normal");
+        assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H);
+        let t = texts();
+        for want in ["Style", "Rename", "New from Selection", "Update to Match", "Smaller", "Larger", "Bold", "Left", "Space above 0 pt", "Close"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        // Normal made larger, bold, centred, with room below: both paragraphs.
+        run(Cmd::StyleSize(true));
+        run(Cmd::StyleToggle(0));
+        run(Cmd::StyleAlign(Align::Center));
+        run(Cmd::StyleSpace(false, true));
+        {
+            let e = ed.borrow();
+            let (pf, cf) = e.doc.styles.para_format(e.doc.para(1).unwrap().style, &Default::default());
+            assert_eq!((cf.bold, pf.align, pf.space_after, cf.size), (true, Align::Center, officina_text::model::ParaFormat::default().space_after + 120, officina_text::model::CharFormat::default().size + 2));
+        }
+        assert!(texts().iter().any(|s| s == "Bold ✓"));
+        // Four steps, four undos.
+        for _ in 0..4 {
+            run(Cmd::Undo);
+        }
+        assert_eq!(ed.borrow().doc.styles.styles[0], officina_text::model::StyleSheet::default().styles[0]);
+        // A new style from the selection, named in the bar; the menu lists it.
+        w.style_name.set(TextEdit::new("Lead"));
+        run(Cmd::StyleNew);
+        let id = ed.borrow().style_at_caret();
+        assert_eq!(&*ed.borrow().doc.styles.styles[id as usize].name, "Lead");
+        assert_eq!(w.style_bar.get_cloned().id, id, "the bar follows the new style");
+        assert!(ed.borrow().para_styles().iter().any(|(_, s)| &**s == "Lead"));
+        // Renamed; a taken name is refused.
+        w.style_name.set(TextEdit::new("Opening"));
+        run(Cmd::StyleRename);
+        assert_eq!(&*ed.borrow().doc.styles.styles[id as usize].name, "Opening");
+        w.style_name.set(TextEdit::new("Normal"));
+        run(Cmd::StyleRename);
+        assert_eq!(&*ed.borrow().doc.styles.styles[id as usize].name, "Opening");
+        // On a paragraph of another style the bar offers to switch.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
+        assert!(texts().iter().any(|s| s.starts_with("Edit “Normal")), "{:?}", texts());
+        run(Cmd::StyleClose);
+        assert!(!w.style_bar.get_cloned().open);
     }
 
     #[test]

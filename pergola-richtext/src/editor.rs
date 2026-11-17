@@ -2219,6 +2219,93 @@ impl Editor {
         }
     }
 
+    /// The document's paragraph styles, in its order.
+    pub fn para_styles(&self) -> Vec<(StyleId, std::sync::Arc<str>)> {
+        self.doc.styles.styles.iter().enumerate().filter(|(_, s)| s.kind == officina_text::model::StyleKind::Para).map(|(i, s)| (i as StyleId, s.name.clone())).collect()
+    }
+
+    /// The style of the paragraph at the caret.
+    pub fn style_at_caret(&self) -> StyleId {
+        self.doc.para(self.caret.block).map_or(0, |p| p.style)
+    }
+
+    /// Changes style `id` through `f` (one undo step); false if the change
+    /// was refused (a name taken, a loop) or changed nothing.
+    pub fn change_style(&mut self, label: &str, id: StyleId, f: impl FnOnce(&mut officina_text::model::Style)) -> bool {
+        let Some(old) = self.doc.styles.styles.get(id as usize).cloned() else { return false };
+        let mut s = old.clone();
+        f(&mut s);
+        if s == old {
+            return false;
+        }
+        let before = self.doc.styles.styles.get(id as usize).cloned();
+        self.apply(label, vec![TextOp::SetStyle { id, style: Some(s) }], Kind::Other);
+        self.doc.styles.styles.get(id as usize).cloned() != before
+    }
+
+    /// Paragraph `b`'s own look (what its style doesn't give it) and the
+    /// characters' at the caret, as a style would hold them.
+    fn look_here(&self) -> Option<(ParaProps, CharAttrs)> {
+        let p = self.doc.para(self.caret.block)?;
+        let pp = ParaProps { list: None, cell: None, rev: None, toc: None, section: None, ..p.props.clone() };
+        let (a, _) = self.selection();
+        let at = if self.has_selection() { a.at } else { self.caret.at.saturating_sub(1) };
+        let x = self.doc.attrs.get(p.attr_at(at));
+        let ca = CharAttrs { bold: x.bold, italic: x.italic, underline: x.underline, strike: x.strike, size: x.size, color: x.color, highlight: x.highlight, family: x.family.clone(), ..Default::default() };
+        Some((pp, ca))
+    }
+
+    /// The selection's paragraphs with their own look taken off (it went
+    /// into a style), keeping what places them (lists, cells, sections).
+    fn shed_look_ops(&self, style: StyleId) -> Vec<TextOp> {
+        let (a, b) = self.selection();
+        let mut ops = Vec::new();
+        for k in a.block..=b.block {
+            let Some(p) = self.doc.para(k) else { continue };
+            let props = ParaProps { list: p.props.list, cell: p.props.cell, rev: p.props.rev, toc: p.props.toc, section: p.props.section, ..Default::default() };
+            if props != p.props || style != p.style {
+                ops.push(TextOp::SetPara { block: k as u32, style, props });
+            }
+        }
+        ops
+    }
+
+    /// The caret paragraph's style takes on how the selection looks (its
+    /// paragraph settings and the characters' font, size, weight, colour);
+    /// the selected paragraphs then rely on it. One undo step.
+    pub fn update_style_to_match(&mut self) -> bool {
+        let id = self.style_at_caret();
+        let Some((pp, ca)) = self.look_here() else { return false };
+        let Some(mut s) = self.doc.styles.styles.get(id as usize).cloned() else { return false };
+        merge_para(&mut s.para, &pp);
+        merge_chars(&mut s.chars, &ca);
+        let shed = self.shed_look_ops(id);
+        if self.doc.styles.styles.get(id as usize) == Some(&s) && shed.is_empty() {
+            return false;
+        }
+        let mut ops = vec![TextOp::SetStyle { id, style: Some(s) }];
+        ops.extend(shed);
+        self.apply("Update Style", ops, Kind::Other);
+        true
+    }
+
+    /// A new paragraph style `name`, based on the caret paragraph's, that
+    /// looks as the selection does; the selected paragraphs take it. One
+    /// undo step; `None` if the name is empty or taken.
+    pub fn new_style_from_selection(&mut self, name: &str) -> Option<StyleId> {
+        let name = name.trim();
+        if name.is_empty() || self.doc.styles.by_name(name).is_some() {
+            return None;
+        }
+        let id = self.doc.styles.styles.len() as StyleId;
+        let (para, chars) = self.look_here()?;
+        let s = officina_text::model::Style { name: name.into(), kind: officina_text::model::StyleKind::Para, parent: Some(self.style_at_caret()), next: Some(id), para, chars };
+        let mut ops = vec![TextOp::SetStyle { id, style: Some(s) }];
+        ops.extend(self.shed_look_ops(id));
+        self.apply("New Style", ops, Kind::Other);
+        (self.doc.styles.styles.len() as StyleId > id).then_some(id)
+    }
+
     // ---- motion ----
 
     fn grapheme_left(&self, p: Pos) -> Pos {
@@ -2968,6 +3055,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn styles_update_to_match_and_new_from_selection() {
+        let mut e = ed(&["One body line", "Two body line", "Three"]);
+        // Direct formatting on the first paragraph: centred, bold, 18 pt.
+        e.set_caret(Pos::new(0, 0), false);
+        e.set_caret(Pos::new(0, 3), true);
+        e.format("Bold", |a| a.bold = Some(true));
+        e.format("Size", |a| a.size = Some(36));
+        e.set_paragraphs("Align", None, |p| p.align = Some(Align::Center));
+        // Normal updated to match: the style holds it, the paragraph's own
+        // centring is gone, and the second paragraph (Normal) is centred too.
+        assert!(e.update_style_to_match());
+        let n = e.doc.styles.styles[0].clone();
+        assert_eq!((n.para.align, n.chars.bold, n.chars.size), (Some(Align::Center), Some(true), Some(36)));
+        assert_eq!(e.doc.para(0).unwrap().props.align, None);
+        assert_eq!(e.doc.styles.para_format(e.doc.para(1).unwrap().style, &e.doc.para(1).unwrap().props).0.align, Align::Center);
+        assert!(!e.update_style_to_match(), "nothing more to take");
+        e.undo();
+        assert_eq!(e.doc.styles.styles[0].para.align, None);
+        assert_eq!(e.doc.para(0).unwrap().props.align, Some(Align::Center));
+        // A new style from the selection: based on Normal, the paragraph
+        // takes it; one undo takes both away.
+        let before = e.doc.styles.styles.len();
+        e.set_caret(Pos::new(0, 0), false);
+        e.set_caret(Pos::new(0, 3), true);
+        let id = e.new_style_from_selection("Callout").expect("made");
+        assert_eq!(id as usize, before);
+        let s = e.doc.styles.styles[id as usize].clone();
+        assert_eq!((&*s.name, s.parent, s.para.align, s.chars.bold), ("Callout", Some(0), Some(Align::Center), Some(true)));
+        assert_eq!(e.doc.para(0).unwrap().style, id);
+        assert!(e.para_styles().iter().any(|(i, n)| *i == id && &**n == "Callout"));
+        assert!(e.new_style_from_selection("Callout").is_none(), "name taken");
+        assert!(e.new_style_from_selection("  ").is_none());
+        // Changing the style changes its paragraphs' look.
+        assert!(e.change_style("Style", id, |s| s.para.space_after = Some(600)));
+        assert_eq!(e.doc.styles.para_format(id, &Default::default()).0.space_after, 600);
+        e.undo();
+        e.undo();
+        assert_eq!(e.doc.styles.styles.len(), before);
+        assert_eq!(e.doc.para(0).unwrap().style, 0);
+        e.redo();
+        assert_eq!(e.doc.para(0).unwrap().style, id);
+    }
+
+    #[test]
     fn spelling_next_and_fix() {
         let mut e = ed(&["ok teh one", "fine", "teh end teh"]);
         assert!(!e.next_misspelled());
@@ -3515,4 +3646,16 @@ pub(crate) mod tests {
         e.redo();
         check(&mut e);
     }
+}
+
+/// `src`'s set paragraph settings over `dst`'s.
+fn merge_para(dst: &mut ParaProps, src: &ParaProps) {
+    macro_rules! m { ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* } }
+    m!(align, indent_start, indent_end, first_line, space_before, space_after, line_spacing, keep_with_next, keep_together, page_break_before, widows, outline_level, tabs);
+}
+
+/// `src`'s set character settings over `dst`'s.
+fn merge_chars(dst: &mut CharAttrs, src: &CharAttrs) {
+    macro_rules! m { ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* } }
+    m!(bold, italic, underline, strike, size, color, highlight, family);
 }

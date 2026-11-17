@@ -1626,6 +1626,50 @@ impl TextDoc {
     }
 
     /// Where note `id` is anchored: (block, byte).
+    /// Whether any paragraph anywhere (body, headers and footers, notes,
+    /// shapes, deleted or conflicting text) or style names style `id`.
+    pub fn uses_style(&self, id: StyleId) -> bool {
+        let p = |p: &Para| p.style == id;
+        let hf = |h: &Option<HeaderFooter>| h.as_ref().is_some_and(|h| h.paras.iter().any(p));
+        let margins = |m: &Option<Margins>| m.as_ref().is_some_and(|m| hf(&m.header) || hf(&m.footer));
+        let pieces = |d: &Deletion| d.pieces.iter().any(|x| x.para.as_ref().is_some_and(|q| q.1 == id));
+        self.blocks.iter().any(|b| b.as_para().is_some_and(p))
+            || hf(&self.header)
+            || hf(&self.footer)
+            || margins(&self.first_page)
+            || margins(&self.even_pages)
+            || self.notes.iter().any(|(_, n)| n.paras.iter().any(p))
+            || self.shapes.iter().any(|(_, s)| s.all_paras().into_iter().any(p))
+            || self.deletions.iter().any(|(_, d)| pieces(d))
+            || self.conflicts.iter().any(|(_, d)| pieces(d))
+            || self.styles.styles.iter().enumerate().any(|(i, s)| i != id as usize && (s.parent == Some(id) || s.next == Some(id)))
+    }
+
+    /// The body paragraphs whose look style `id` decides (it or a style
+    /// based on it): the first and one past the last, if any.
+    pub fn style_span(&self, id: StyleId) -> Option<(usize, usize)> {
+        let under = |mut s: StyleId| {
+            for _ in 0..MAX_STYLE_DEPTH {
+                if s == id {
+                    return true;
+                }
+                match self.styles.styles.get(s as usize).and_then(|x| x.parent) {
+                    Some(q) => s = q,
+                    None => return false,
+                }
+            }
+            false
+        };
+        let hit = |b: &Block| b.as_para().is_some_and(|p| under(p.style));
+        let mut span = None;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if hit(b) {
+                span = Some(span.map_or((i, i + 1), |(f, _)| (f, i + 1)));
+            }
+        }
+        span
+    }
+
     /// The block whose text places shape `id`.
     pub fn shape_anchor(&self, id: u32) -> Option<usize> {
         self.blocks.iter().position(|b| b.as_para().is_some_and(|p| p.text.contains(OBJECT_CHAR) && p.runs.iter().any(|r| self.attrs.get(r.1).object.is_some_and(|o| o.shape && o.image == id))))
