@@ -1300,6 +1300,22 @@ impl<'a> FrameBuilder<'a> {
         Ok(id)
     }
 
+    /// [`FrameBuilder::text_run`] at a font `weight` (400 regular, 700 bold).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_run_weight(
+        &mut self,
+        font_id: u32, size_px: f32,
+        x: f32, y: f32,
+        color: [f32; 4],
+        text: impl Into<String>,
+        weight: u16,
+    ) -> io::Result<u32> {
+        let id = self.next_id;
+        self.conn.text_run_install(id, font_id, size_px, x, y, color, text, weight)?;
+        self.next_id += 1;
+        Ok(id)
+    }
+
     /// Send `scene_node_clear` for every id that was live in the
     /// previous frame but not this one, then `scene_frame_end`. Always
     /// call this — the `Drop` impl is a fallback that swallows errors.

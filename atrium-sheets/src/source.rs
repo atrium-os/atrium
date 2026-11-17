@@ -8,7 +8,7 @@ use officina_grid::style::{HAlign, Line, StyleId, StyleTable};
 use officina_grid::Value;
 use pergola::Color;
 use pergola::theme::palette;
-use pergola::widgets::{CellAlign, CellView, GridSource};
+use pergola::widgets::{CellAlign, CellIcon, CellView, GridSource};
 
 use crate::doc::Doc;
 
@@ -140,7 +140,7 @@ pub fn pivot_view(cv: Option<CellView>, role: officina_grid::pivot::Role) -> Opt
 /// colour, weight and number format, and the data bar under the text.
 pub fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &Value) -> Option<CellView> {
     let d = &look.dxf;
-    if look.scale.is_none() && look.bar.is_none() && *d == officina_grid::condfmt::Dxf::default() {
+    if look.scale.is_none() && look.bar.is_none() && look.icon.is_none() && *d == officina_grid::condfmt::Dxf::default() {
         return cv;
     }
     let mut cv = cv.unwrap_or_else(|| CellView::text(""));
@@ -161,7 +161,48 @@ pub fn cond_view(cv: Option<CellView>, look: &officina_grid::condfmt::Look, v: &
         cv.bold = b;
     }
     cv.bar = look.bar.map(|(share, c)| (share, rgb(c)));
+    cv.icon = look.icon.and_then(|(set, k)| icon_of(set, k));
+    if look.icon.is_some() && look.hide_value {
+        cv.text.clear();
+    }
     Some(cv)
+}
+
+/// Icon `k` (0 the lowest) of icon set `set` ([`officina_grid::condfmt::ICON_SETS`]),
+/// as Excel draws it.
+pub fn icon_of(set: u8, k: u8) -> Option<(CellIcon, Color)> {
+    const RED: u32 = 0xE0393E;
+    const AMBER: u32 = 0xF4C431;
+    const GREEN: u32 = 0x3BAA5C;
+    const GRAY: u32 = 0x8C8C8C;
+    const BLUE: u32 = 0x4A7EBB;
+    const GOLD: u32 = 0xF2B705;
+    let name = officina_grid::condfmt::ICON_SETS.get(set as usize)?.0;
+    let k = k as usize;
+    let pick = |v: &[(CellIcon, u32)]| v.get(k).map(|(i, c)| (*i, rgb(*c)));
+    use CellIcon::*;
+    match name {
+        "3Arrows" => pick(&[(Arrow(-2), RED), (Arrow(0), AMBER), (Arrow(2), GREEN)]),
+        "3ArrowsGray" => pick(&[(Arrow(-2), GRAY), (Arrow(0), GRAY), (Arrow(2), GRAY)]),
+        "3Flags" => pick(&[(Flag, RED), (Flag, AMBER), (Flag, GREEN)]),
+        "3TrafficLights1" | "3TrafficLights2" => pick(&[(Dot, RED), (Dot, AMBER), (Dot, GREEN)]),
+        "3Signs" => pick(&[(Diamond, RED), (Triangle(true), AMBER), (Dot, GREEN)]),
+        "3Symbols" => pick(&[(Cross(true), RED), (Exclaim(true), AMBER), (Check(true), GREEN)]),
+        "3Symbols2" => pick(&[(Cross(false), RED), (Exclaim(false), AMBER), (Check(false), GREEN)]),
+        "3Stars" => pick(&[(Star(0), GOLD), (Star(1), GOLD), (Star(2), GOLD)]),
+        "3Triangles" => pick(&[(Triangle(false), RED), (Dash, AMBER), (Triangle(true), GREEN)]),
+        "4Arrows" => pick(&[(Arrow(-2), RED), (Arrow(-1), AMBER), (Arrow(1), AMBER), (Arrow(2), GREEN)]),
+        "4ArrowsGray" => pick(&[(Arrow(-2), GRAY), (Arrow(-1), GRAY), (Arrow(1), GRAY), (Arrow(2), GRAY)]),
+        "4RedToBlack" => pick(&[(Dot, 0x262626), (Dot, GRAY), (Dot, 0xF4A6A8), (Dot, RED)]),
+        "4Rating" => pick(&[(Bars(1), BLUE), (Bars(2), BLUE), (Bars(3), BLUE), (Bars(4), BLUE)]),
+        "4TrafficLights" => pick(&[(Dot, 0x262626), (Dot, RED), (Dot, AMBER), (Dot, GREEN)]),
+        "5Arrows" => pick(&[(Arrow(-2), RED), (Arrow(-1), AMBER), (Arrow(0), AMBER), (Arrow(1), AMBER), (Arrow(2), GREEN)]),
+        "5ArrowsGray" => pick(&[(Arrow(-2), GRAY), (Arrow(-1), GRAY), (Arrow(0), GRAY), (Arrow(1), GRAY), (Arrow(2), GRAY)]),
+        "5Rating" => pick(&[(Bars(0), BLUE), (Bars(1), BLUE), (Bars(2), BLUE), (Bars(3), BLUE), (Bars(4), BLUE)]),
+        "5Quarters" => pick(&[(Quarters(0), 0x404040), (Quarters(1), 0x404040), (Quarters(2), 0x404040), (Quarters(3), 0x404040), (Quarters(4), 0x404040)]),
+        "5Boxes" => pick(&[(Boxes(0), BLUE), (Boxes(1), BLUE), (Boxes(2), BLUE), (Boxes(3), BLUE), (Boxes(4), BLUE)]),
+        _ => None,
+    }
 }
 
 /// sRGB components to Pergola's linear colour.
@@ -490,14 +531,14 @@ mod tests {
     #[test]
     fn conditional_formats_show_over_the_cell() {
         use officina_grid::condfmt::{Dxf, Look};
-        let look = Look { dxf: Dxf { fill: Some(0xFFC7CE), color: Some(0x9C0006), bold: Some(true), num_fmt: Some("0.0%".into()), ..Dxf::default() }, scale: None, bar: Some((0.5, 0x638EC6)) };
+        let look = Look { dxf: Dxf { fill: Some(0xFFC7CE), color: Some(0x9C0006), bold: Some(true), num_fmt: Some("0.0%".into()), ..Dxf::default() }, scale: None, bar: Some((0.5, 0x638EC6)), ..Look::default() };
         let v = Value::Num(0.25);
         let cv = cond_view(view_of(&v), &look, &v).unwrap();
         assert_eq!(cv.text, "25.0%");
         assert_eq!((cv.fill, cv.color, cv.bold), (Some(rgb(0xFFC7CE)), Some(rgb(0x9C0006)), true));
         assert_eq!(cv.bar, Some((0.5, rgb(0x638EC6))));
         // A blank cell a rule fills; a colour scale over the fill.
-        let look = Look { dxf: Dxf { fill: Some(1), ..Dxf::default() }, scale: Some(0x63BE7B), bar: None };
+        let look = Look { dxf: Dxf { fill: Some(1), ..Dxf::default() }, scale: Some(0x63BE7B), ..Look::default() };
         assert_eq!(cond_view(None, &look, &Value::Empty).unwrap().fill, Some(rgb(0x63BE7B)));
         assert!(cond_view(None, &Look::default(), &Value::Empty).is_none());
     }
@@ -554,5 +595,25 @@ mod tests {
         assert_eq!(s.cell(0, 3).unwrap().align, CellAlign::Center);
         assert!(s.cell(5, 5).is_none());
         assert_eq!(s.rows(), MIN_ROWS);
+    }
+
+    #[test]
+    fn every_icon_set_draws_each_of_its_icons() {
+        use officina_grid::condfmt::{Look, ICON_SETS};
+        for (set, (name, n)) in ICON_SETS.iter().enumerate() {
+            for k in 0..*n {
+                assert!(icon_of(set as u8, k).is_some(), "{name} {k}");
+            }
+            assert!(icon_of(set as u8, *n).is_none(), "{name} has {n}");
+        }
+        // Arrows run from red down to green up; icon only clears the text.
+        assert_eq!(icon_of(0, 0).unwrap().0, CellIcon::Arrow(-2));
+        assert_eq!(icon_of(0, 2).unwrap().0, CellIcon::Arrow(2));
+        let v = officina_grid::Value::Num(5.0);
+        let look = Look { icon: Some((0, 1)), ..Look::default() };
+        let cv = cond_view(Some(CellView::number("5")), &look, &v).unwrap();
+        assert_eq!((cv.text.as_str(), cv.icon.map(|i| i.0)), ("5", Some(CellIcon::Arrow(0))));
+        let cv = cond_view(Some(CellView::number("5")), &Look { hide_value: true, ..look }, &v).unwrap();
+        assert_eq!(cv.text, "");
     }
 }

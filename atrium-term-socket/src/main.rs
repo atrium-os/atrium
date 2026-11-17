@@ -30,7 +30,9 @@
 //! person's workspaces. Choosing one is a press that moves this window to
 //! a shell there (portcullisd starts or reattaches it).
 
+mod clipboard;
 mod keymap;
+mod mouse;
 mod pty;
 mod render;
 
@@ -62,6 +64,10 @@ const HID_N: u16 = 0x11;
 const HID_PAGE_UP: u16 = 0x4B;
 const HID_PAGE_DOWN: u16 = 0x4E;
 const HID_O: u16 = 0x12;
+const HID_C: u16 = 0x06;
+const HID_V: u16 = 0x19;
+const HID_INSERT: u16 = 0x49;
+const HID_KP_ENTER: u16 = 0x58;
 const HID_ENTER: u16 = 0x28;
 const HID_ESC: u16 = 0x29;
 const HID_DOWN: u16 = 0x51;
@@ -69,6 +75,11 @@ const HID_UP: u16 = 0x52;
 /// How long a terminal opened on its own waits for a console before it
 /// asks for the empty one.
 const ALONE_AFTER: Duration = Duration::from_millis(1500);
+/// How long after a key press a program's clipboard write (OSC 52) may
+/// spend that press (frescod keeps a press for 1 s).
+const COPY_AFTER_PRESS: Duration = Duration::from_millis(900);
+/// Points of wheel travel per step (frescod sends 8 per detent).
+const WHEEL_STEP: f32 = 8.0;
 
 /// Where a window's screen comes from.
 enum Io {
@@ -127,14 +138,15 @@ impl Io {
         }
     }
 
-    /// Take what is waiting. `Ok(true)`: the screen changed; `Err`: it's over.
-    fn read(&mut self, buf: &mut [u8]) -> Result<bool, ()> {
+    /// Take what is waiting. `Ok(true)`: the screen changed; `Err`: it's
+    /// over. A program's clipboard write (OSC 52) lands in `clip`.
+    fn read(&mut self, buf: &mut [u8], clip: &mut Option<String>) -> Result<bool, ()> {
         match self {
             Io::Pty { shell, term } => {
                 let mut changed = false;
                 loop {
                     match shell.read(buf) {
-                        Ok(0) => return Ok(changed),
+                        Ok(0) => break,
                         Ok(n) => {
                             term.feed(&buf[..n]);
                             changed = true;
@@ -142,6 +154,15 @@ impl Io {
                         Err(_) => return Err(()),
                     }
                 }
+                // Answers to the program's queries go back to it.
+                let replies = term.take_replies();
+                if !replies.is_empty() {
+                    let _ = shell.write(&replies);
+                }
+                if let Some(c) = term.take_clipboard() {
+                    *clip = Some(c);
+                }
+                Ok(changed)
             }
             Io::Stoa { sock, key, rx, grid, last, .. } => {
                 let mut changed = false;
@@ -164,7 +185,10 @@ impl Io {
                     *last = Some(env.seq);
                     match env.msg_type {
                         MsgType::StateDiff => {
-                            if let Some(d) = stoa_term::StateDiff::decode(&env.payload) {
+                            if let Some(mut d) = stoa_term::StateDiff::decode(&env.payload) {
+                                if let Some(c) = d.clipboard.take() {
+                                    *clip = Some(c);
+                                }
                                 d.apply(grid);
                                 changed = true;
                             }
@@ -192,8 +216,20 @@ struct Session {
     /// The app this is a console of (more may be asked for), if any.
     app:      Option<String>,
     io:       Io,
-    keymap:   keymap::Keymap,
     renderer: render::Renderer,
+    /// The title the window shows now (the program's, else `title`).
+    shown:    String,
+    /// The last key press: its token, when, and whether it may be spent on
+    /// a copy (Ctrl, Alt or Enter, tabula.md §2.2). A program's clipboard
+    /// write right after it spends it.
+    press:    Option<([u8; 16], std::time::Instant, bool)>,
+    /// Text a program offered for the clipboard with no press to spend:
+    /// Ctrl+Shift+C copies it.
+    offered:  Option<String>,
+    /// The mouse button held, for drag reports.
+    held:     Option<mouse::Button>,
+    /// Wheel travel not yet a whole step.
+    wheel:    f32,
     dirty:    bool,
     /// What the trace last printed.
     traced:   String,
@@ -276,11 +312,21 @@ fn open_window(conn: &mut Connection, font: &Font, title: &str, mut io: Io, app:
     io.control(Control::SyncMode);
     io.resize(COLS, ROWS);
     let strip = render::Strip { place: place_name(app.as_deref()), hint: "switch: click or Ctrl+Shift+O".into(), menu: None };
-    Ok(Session { win, title: title.into(), app, io, keymap: keymap::Keymap::new(), renderer, dirty: true, traced: String::new(),
-                 strip, targets: Vec::new() })
+    Ok(Session { win, title: title.into(), app, io, renderer, shown: title.into(), press: None, offered: None, held: None,
+                 wheel: 0.0, dirty: true, traced: String::new(), strip, targets: Vec::new() })
 }
 
 fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
+    // The program's title (OSC 0/2, already bounded and stripped), else
+    // the console's name.
+    let want = match s.io.grid().title() {
+        "" => s.title.clone(),
+        t => t.to_string(),
+    };
+    if want != s.shown {
+        conn.window_set_title(s.win, want.clone())?;
+        s.shown = want;
+    }
     conn.set_default_window(s.win as u16);
     s.renderer.render(conn, s.io.grid(), &s.strip)?;
     s.dirty = false;
@@ -301,6 +347,30 @@ fn draw(conn: &mut Connection, s: &mut Session, trace: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A program wrote `text` to the clipboard (OSC 52). Right after a press
+/// that may be spent on a copy (the Enter that ran the yank command, a
+/// Ctrl chord) it is copied with that press; otherwise it waits for
+/// Ctrl+Shift+C. A program never copies on its own.
+fn offer_copy(tabula: &mut clipboard::Tabula, s: &mut Session, text: String) {
+    if let Some((token, at, true)) = s.press.take() {
+        if at.elapsed() < COPY_AFTER_PRESS {
+            match tabula.copy(token, &text) {
+                Ok(()) => {
+                    s.offered = None;
+                    s.strip.hint = "copied".into();
+                    s.dirty = true;
+                    return;
+                }
+                Err(e) => eprintln!("atrium-term-socket: copy: {e}"),
+            }
+        }
+    }
+    eprintln!("atrium-term-socket: window {}: {} bytes offered for the clipboard", s.win, text.len());
+    s.offered = Some(text);
+    s.strip.hint = "a program offered text to copy: Ctrl+Shift+C copies it".into();
+    s.dirty = true;
 }
 
 /// Ask portcullisd for a console of `app`: a tab in Stoa session `tab_of`,
@@ -380,6 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events: [MaybeUninit<libc::kevent>; 16] =
         unsafe { MaybeUninit::uninit().assume_init() };
     let mut buf = vec![0u8; 65536];
+    let mut tabula = clipboard::Tabula::default();
     // With nothing open after the last console closed, wait this long for
     // another before quitting (one asked for may be on its way).
     let idle = libc::timespec { tv_sec: 5, tv_nsec: 0 };
@@ -482,7 +553,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Some(input) = conn.poll_event()? {
                     let Some(s) = sessions.iter_mut().find(|s| match &input {
                         Event::Key { window_id, .. } | Event::Resized { window_id, .. } | Event::CloseRequested { window_id }
-                        | Event::PointerButton { window_id, .. } => *window_id == s.win,
+                        | Event::PointerButton { window_id, .. } | Event::PointerMotion { window_id, .. }
+                        | Event::PointerScroll { window_id, .. } | Event::FocusChanged { window_id, .. } => *window_id == s.win,
                         _ => false,
                     }) else { continue };
                     // The switcher: a press on a row (or Enter) moves this
@@ -490,11 +562,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut choose: Option<(usize, [u8; 16])> = None;
                     // Modifiers always reach the keymap, or a Ctrl let go
                     // while the switcher had the keys would stay held.
-                    if let Event::Key { hid_usage: h @ 0xe0..=0xe7, pressed, .. } = &input {
-                        if s.strip.menu.is_some() {
-                            let _ = s.keymap.handle(*h, *pressed);
-                            continue;
-                        }
+                    if let Event::Key { hid_usage: 0xe0..=0xe7, .. } = &input {
+                        continue; // modifiers alone send nothing; each press carries them
                     }
                     let mut taken = false;
                     match &input {
@@ -551,6 +620,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if taken || (s.strip.menu.is_some() && matches!(input, Event::Key { .. } | Event::PointerButton { .. })) {
                         continue;
                     }
+                    // A click on the strip is the Terminal's, not the program's.
+                    if matches!(input, Event::PointerButton { y, .. } if y < s.renderer.top) {
+                        continue;
+                    }
                     match input {
                         Event::Key { hid_usage, pressed: true, modifiers, activation, repeat: false, .. }
                             if modifiers & 0x11 != 0 && modifiers & 0x22 != 0 && (hid_usage == HID_T || hid_usage == HID_N) && s.app.is_some() =>
@@ -571,9 +644,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             s.io.control(if h == HID_PAGE_DOWN { Control::NextWindow } else { Control::PrevWindow });
                         }
-                        Event::Key { hid_usage, pressed, .. } => {
-                            if let Some(bytes) = s.keymap.handle(hid_usage, pressed) {
+                        // Ctrl+Shift+V (or Shift+Insert): paste, spending the press.
+                        Event::Key { hid_usage, pressed: true, modifiers, activation, repeat: false, .. }
+                            if (hid_usage == HID_V && keymap::ctrl_shift(modifiers))
+                                || (hid_usage == HID_INSERT && modifiers & 0x22 != 0 && modifiers & 0x11 == 0) =>
+                        {
+                            match tabula.paste(activation) {
+                                Ok(Some(text)) => {
+                                    let bracketed = s.io.grid().mode(stoa_term::mode::BRACKETED_PASTE);
+                                    s.io.input(&clipboard::paste_bytes(&text, bracketed));
+                                }
+                                Ok(None) => {}
+                                Err(e) => eprintln!("atrium-term-socket: paste: {e}"),
+                            }
+                        }
+                        // Ctrl+Shift+C: copy what a program offered.
+                        Event::Key { hid_usage: HID_C, pressed: true, modifiers, activation, repeat: false, .. }
+                            if keymap::ctrl_shift(modifiers) =>
+                        {
+                            if let Some(text) = s.offered.take() {
+                                match tabula.copy(activation, &text) {
+                                    Ok(()) => s.strip.hint = "copied".into(),
+                                    Err(e) => s.strip.hint = format!("not copied: {e}"),
+                                }
+                                s.dirty = true;
+                            }
+                        }
+                        Event::Key { hid_usage, pressed: true, modifiers, activation, repeat, .. } => {
+                            if !repeat {
+                                let copyable = modifiers & 0x55 != 0 || hid_usage == HID_ENTER || hid_usage == HID_KP_ENTER;
+                                s.press = Some((activation, std::time::Instant::now(), copyable));
+                            }
+                            if let Some(bytes) = keymap::encode(hid_usage, modifiers, s.io.grid().modes()) {
                                 s.io.input(&bytes);
+                            }
+                        }
+                        Event::PointerButton { x, y, button, pressed, modifiers, .. } => {
+                            let Some(b) = mouse::Button::from_fresco(button) else { continue };
+                            s.held = if pressed { Some(b) } else { None };
+                            let (row, col) = s.renderer.cell_at(x, y, s.io.grid());
+                            let action = if pressed { mouse::Action::Press(b) } else { mouse::Action::Release(b) };
+                            if let Some(bytes) = mouse::report(action, row, col, modifiers, s.io.grid().modes()) {
+                                s.io.input(&bytes);
+                            }
+                        }
+                        Event::PointerMotion { x, y, .. } => {
+                            let (row, col) = s.renderer.cell_at(x, y, s.io.grid());
+                            if s.renderer.pointer_cell != Some((row, col)) {
+                                s.renderer.pointer_cell = Some((row, col));
+                                let action = mouse::Action::Motion { held: s.held };
+                                if let Some(bytes) = mouse::report(action, row, col, 0, s.io.grid().modes()) {
+                                    s.io.input(&bytes);
+                                }
+                            }
+                        }
+                        Event::PointerScroll { dy, .. } => {
+                            s.wheel += dy;
+                            while s.wheel.abs() >= WHEEL_STEP {
+                                let up = s.wheel < 0.0;
+                                s.wheel -= WHEEL_STEP.copysign(s.wheel);
+                                let modes = s.io.grid().modes();
+                                let (row, col) = s.renderer.pointer_cell.unwrap_or((0, 0));
+                                if let Some(bytes) = mouse::report(mouse::Action::Wheel { up }, row, col, 0, modes)
+                                    .or_else(|| mouse::alt_scroll(up, modes))
+                                {
+                                    s.io.input(&bytes);
+                                }
+                            }
+                        }
+                        Event::FocusChanged { gained, .. } => {
+                            if s.io.grid().mode(stoa_term::mode::FOCUS) {
+                                s.io.input(if gained { b"\x1b[I" } else { b"\x1b[O" });
                             }
                         }
                         // The WM's size, in points: as many cells as fit,
@@ -600,10 +741,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else if let Some(s) = sessions.iter_mut().find(|s| s.io.fd() == fd) {
-                match s.io.read(&mut buf) {
+                let mut clip = None;
+                match s.io.read(&mut buf, &mut clip) {
                     Ok(true) => s.dirty = true,
                     Ok(false) => {}
                     Err(()) => closed.push(s.win),
+                }
+                if let Some(text) = clip {
+                    offer_copy(&mut tabula, s, text);
                 }
                 if matches!(s.io, Io::Pty { .. }) && (ev.flags as u32) & (libc::EV_EOF as u32) != 0 {
                     closed.push(s.win);

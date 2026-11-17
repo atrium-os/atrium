@@ -20,6 +20,9 @@ net-fetch = true   # remote pictures, only when asked
 # Open in… (§8.2): a sealed, read-only memory file to portcullisd with a
 # press; it picks the person's default app from the bytes' type.
 open-attachments = true
+# New mail and the Later review through Praeco (§12): quiet by default,
+# never a storm after a gap.
+notify = true
 
 [[links]]
 schemes = ["mailto"]

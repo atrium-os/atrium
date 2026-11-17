@@ -35,6 +35,7 @@ limen = { path = "../../limen" }
 libc = "0.2"
 # Remote pictures, only when asked (mail.md §7.4): Mail's own fetcher.
 nuntius = { path = "../../nuntius" }
+praeco = { path = "../../praeco" }
 # The link bar (mail.md §7.6): peeling, the registrable domain, the link
 # check Monstrator applies, and Monstrator itself for Open.
 url = "2"

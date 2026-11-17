@@ -11,19 +11,24 @@
 
 use std::fmt::Write as _;
 
-use crate::{flags, Cell, Color, Grid};
+use crate::{flags, mode, Cell, Color, Grid};
 
 /// Emit one cell, writing an SGR sequence only when its attributes differ
 /// from the last emitted (`cur`). Shared by snapshot + scrollback render.
-fn emit_cell(out: &mut String, cell: &Cell, cur: &mut Option<(Color, Color, u8)>) {
-    let want = (cell.fg, cell.bg, cell.flags);
+fn emit_cell(out: &mut String, cell: &Cell, cur: &mut Option<(Color, Color, u16)>) {
+    // A wide character's right half: the terminal drawing the left half
+    // already moved past it.
+    if cell.flags & flags::WIDE_SPACER != 0 {
+        return;
+    }
+    let want = (cell.fg, cell.bg, cell.flags & !flags::WIDE);
     let is_default = want == (Color::Default, Color::Default, 0);
     let need = match cur {
         Some(p) => *p != want,
         None => !is_default,
     };
     if need {
-        out.push_str(&sgr_for(cell.fg, cell.bg, cell.flags));
+        out.push_str(&sgr_for(cell.fg, cell.bg, want.2));
         *cur = Some(want);
     }
     out.push(cell.c);
@@ -38,10 +43,14 @@ pub fn render_snapshot(grid: &Grid) -> Vec<u8> {
     if !grid.title().is_empty() {
         let _ = write!(out, "\x1b]2;{}\x07", grid.title());
     }
+    // The screen first (entering the alternate one clears it), then paint.
+    if grid.mode(mode::ALT_SCREEN) {
+        out.push_str("\x1b[?1049h");
+    }
     out.push_str("\x1b[0m\x1b[2J\x1b[H");
 
     // `None` = "we just emitted SGR reset" (default attributes in effect).
-    let mut cur: Option<(Color, Color, u8)> = None;
+    let mut cur: Option<(Color, Color, u16)> = None;
 
     for r in 0..grid.rows() {
         // Position at the start of each row (so trailing-blank skips don't
@@ -53,9 +62,39 @@ pub fn render_snapshot(grid: &Grid) -> Vec<u8> {
     }
 
     out.push_str("\x1b[0m");
+    out.push_str(&mode_sequences(mode::DEFAULT & !mode::ALT_SCREEN, grid.modes() & !mode::ALT_SCREEN));
     let (cr, cc) = grid.cursor();
     let _ = write!(out, "\x1b[{};{}H", cr + 1, cc + 1);
     out.into_bytes()
+}
+
+/// The DEC private mode sets and resets (and DECKPAM, DECSCUSR) that take a
+/// terminal from modes `from` to `to`.
+pub(crate) fn mode_sequences(from: u32, to: u32) -> String {
+    const DEC: &[(u32, u16)] = &[
+        (mode::ALT_SCREEN, 1049), (mode::CURSOR_KEYS, 1), (mode::ORIGIN, 6), (mode::AUTOWRAP, 7),
+        (mode::MOUSE_X10, 9), (mode::MOUSE_CLICK, 1000), (mode::MOUSE_DRAG, 1002), (mode::MOUSE_MOTION, 1003),
+        (mode::FOCUS, 1004), (mode::MOUSE_SGR, 1006), (mode::ALT_SCROLL, 1007), (mode::BRACKETED_PASTE, 2004),
+    ];
+    let mut out = String::new();
+    for &(bit, n) in DEC {
+        if (from ^ to) & bit != 0 {
+            let _ = write!(out, "\x1b[?{n}{}", if to & bit != 0 { 'h' } else { 'l' });
+        }
+    }
+    if (from ^ to) & mode::HIDE_CURSOR != 0 {
+        out.push_str(if to & mode::HIDE_CURSOR != 0 { "\x1b[?25l" } else { "\x1b[?25h" });
+    }
+    if (from ^ to) & mode::INSERT != 0 {
+        out.push_str(if to & mode::INSERT != 0 { "\x1b[4h" } else { "\x1b[4l" });
+    }
+    if (from ^ to) & mode::APP_KEYPAD != 0 {
+        out.push_str(if to & mode::APP_KEYPAD != 0 { "\x1b=" } else { "\x1b>" });
+    }
+    if (from ^ to) & mode::SHAPE_MASK != 0 {
+        let _ = write!(out, "\x1b[{} q", mode::cursor_shape(to));
+    }
+    out
 }
 
 /// Render a scrollback viewport: `rows` lines ending `offset` lines above
@@ -78,7 +117,7 @@ pub fn render_scrollback(grid: &Grid, offset: usize) -> Vec<u8> {
     out.push_str("\x1b[0m\x1b[2J\x1b[H");
 
     let blank = Cell::default();
-    let mut cur: Option<(Color, Color, u8)> = None;
+    let mut cur: Option<(Color, Color, u16)> = None;
     for (disp, i) in (top..=bottom).enumerate() {
         let _ = write!(out, "\x1b[{};1H", disp + 1);
         for c in 0..cols {
@@ -96,13 +135,16 @@ pub fn render_scrollback(grid: &Grid, offset: usize) -> Vec<u8> {
 
 /// Build a full SGR sequence (always starts with reset) for a cell's
 /// attributes.
-fn sgr_for(fg: Color, bg: Color, flags: u8) -> String {
+fn sgr_for(fg: Color, bg: Color, flags: u16) -> String {
     let mut p: Vec<String> = vec!["0".into()]; // reset, then re-apply
     if flags & flags::BOLD != 0 { p.push("1".into()); }
     if flags & flags::DIM != 0 { p.push("2".into()); }
     if flags & flags::ITALIC != 0 { p.push("3".into()); }
     if flags & flags::UNDERLINE != 0 { p.push("4".into()); }
+    if flags & flags::BLINK != 0 { p.push("5".into()); }
     if flags & flags::REVERSE != 0 { p.push("7".into()); }
+    if flags & flags::HIDDEN != 0 { p.push("8".into()); }
+    if flags & flags::STRIKE != 0 { p.push("9".into()); }
     push_color(&mut p, fg, true);
     push_color(&mut p, bg, false);
     format!("\x1b[{}m", p.join(";"))
@@ -153,7 +195,7 @@ pub fn render_composite(
     let mut out = String::new();
     out.push_str("\x1b[0m\x1b[2J\x1b[H");
 
-    let mut cur: Option<(Color, Color, u8)> = None;
+    let mut cur: Option<(Color, Color, u16)> = None;
     for p in panes {
         let g = p.grid;
         for r in 0..g.rows() {
@@ -201,10 +243,21 @@ pub fn render_composite(
 /// in grid-sync mode — it stays a thin renderer, no local grid needed.
 pub fn render_diff(diff: &crate::StateDiff) -> Vec<u8> {
     let mut out = String::new();
+    if let Some(t) = &diff.title {
+        let _ = write!(out, "\x1b]2;{t}\x07");
+    }
+    // Modes before the cells: the alternate screen switch comes first. The
+    // diff carries only the new modes, so every mode bit is restated.
+    if let Some(m) = diff.modes {
+        out.push_str(&mode_sequences(!m & !mode::SHAPE_MASK, m));
+        if mode::cursor_shape(m) == 0 {
+            out.push_str("\x1b[0 q");
+        }
+    }
     if diff.resized.is_some() {
         out.push_str("\x1b[0m\x1b[2J\x1b[H");
     }
-    let mut cur: Option<(Color, Color, u8)> = None;
+    let mut cur: Option<(Color, Color, u16)> = None;
     for run in &diff.runs {
         let _ = write!(out, "\x1b[{};{}H", run.row + 1, run.col + 1);
         for cell in &run.cells {

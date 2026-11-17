@@ -131,3 +131,32 @@ fn native_files_keep_conditional_formats() {
         _ => unreachable!(),
     }, (2, 3)), "$A1>B$1");
 }
+
+#[test]
+fn icon_sets_pick_by_threshold() {
+    use officina_grid::condfmt::{icon_points, icon_set, ICON_SETS};
+    let mut wb = book();
+    let arrows = icon_set("3Arrows").unwrap();
+    // 1..10 over 0 / 33 / 67 percent of the way from 1 to 10 (3.97, 7.03):
+    // 1–3 the lowest icon, 4–7 the middle, 8–10 the top.
+    let kind = RuleKind::IconSet { set: arrows, points: icon_points(3), reverse: false, show_value: true };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
+    let icons: Vec<u8> = (0..10).map(|r| wb.look(CellAddr::new(0, r, 0)).icon.unwrap().1).collect();
+    assert_eq!(icons, [0, 0, 0, 1, 1, 1, 1, 2, 2, 2]);
+    assert!(!wb.look(CellAddr::new(0, 0, 0)).hide_value);
+    // Numbers, greater-than, reversed, icon only: 5 is not above 5.
+    wb.remove_cond_format(0);
+    let rating = icon_set("4Rating").unwrap();
+    let points = vec![(Cfvo::Num(0.0), true), (Cfvo::Num(5.0), false), (Cfvo::Num(8.0), true), (Cfvo::Percentile(100.0), true)];
+    let kind = RuleKind::IconSet { set: rating, points, reverse: true, show_value: false };
+    wb.add_cond_format(CondFormat { sheet: 0, ranges: vec![col(0, 10)], rules: vec![Rule { kind, dxf: Dxf::default(), stop: false }] }).unwrap();
+    let at = |r: u32| wb.look(CellAddr::new(0, r, 0));
+    assert_eq!((at(4).icon, at(5).icon, at(7).icon, at(9).icon), (Some((rating, 3)), Some((rating, 2)), Some((rating, 1)), Some((rating, 0))));
+    assert!(at(0).hide_value);
+    // Text cells get no icon; the set table names every set once.
+    assert_eq!(wb.look(CellAddr::new(0, 0, 1)).icon, None);
+    assert_eq!(ICON_SETS.len(), 20);
+    // Kept by the native file.
+    let back = officina_grid::native::load(&officina_grid::native::save_to_vec(&wb)).unwrap();
+    assert_eq!(back.cond_formats(), wb.cond_formats());
+}

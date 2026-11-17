@@ -322,7 +322,8 @@ pub mod server {
     }
 }
 
-/// Posting, for a system service (one of praecod's system posters).
+/// Posting, for an app (named by the launch registry) or a system service
+/// (one of praecod's system posters).
 pub mod client {
     use std::io;
     use std::path::Path;
@@ -342,6 +343,23 @@ pub mod client {
                     (Some(&status::OK), Some(id)) => Ok(u64::from_le_bytes(id.try_into().unwrap())),
                     (Some(&st), _) => Err(io::Error::other(format!("praecod refused the post (status {st})"))),
                     _ => Err(io::Error::new(io::ErrorKind::InvalidData, "short reply")),
+                };
+            }
+        }
+    }
+
+    /// Take back one's own notification `id`.
+    pub fn withdraw(sock: &Path, id: u64) -> io::Result<()> {
+        let mut c = Connection::connect(sock)?;
+        let p = postcard::to_stdvec(&proto::Withdraw { id }).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        c.send_message(proto::CLASS, op::WITHDRAW, flag::RESPONSE_EXPECTED, &p)?;
+        loop {
+            let m = c.recv_message()?;
+            if m.opcode_class == proto::CLASS && m.op == op::WITHDRAW && m.flags & flag::IS_RESPONSE != 0 {
+                return match m.payload.first() {
+                    Some(&status::OK) => Ok(()),
+                    Some(&st) => Err(io::Error::other(format!("praecod refused the withdraw (status {st})"))),
+                    None => Err(io::Error::new(io::ErrorKind::InvalidData, "short reply")),
                 };
             }
         }

@@ -186,6 +186,27 @@ impl Store {
         Ok(out)
     }
 
+    /// Messages stored after `after` (ids only grow), oldest first, at most
+    /// `limit`: what arrived since the caller last looked.
+    pub fn messages_after(&self, after: MsgId, limit: usize) -> Result<Vec<(MsgId, Message)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(MESSAGES)?;
+        let mut v = Vec::new();
+        for e in t.range(after + 1..)?.take(limit) {
+            let (k, m) = e?;
+            v.push((k.value(), dec(m.value())?));
+        }
+        Ok(v)
+    }
+
+    /// The newest message id (0 when there are none).
+    pub fn last_message(&self) -> Result<MsgId> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(MESSAGES)?;
+        let last = t.last()?.map_or(0, |(k, _)| k.value());
+        Ok(last)
+    }
+
     /// Every message id, newest first is the caller's to sort.
     pub fn all_messages(&self) -> Result<Vec<MsgId>> {
         let tx = self.db.begin_read()?;

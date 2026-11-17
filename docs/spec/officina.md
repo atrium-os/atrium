@@ -3471,6 +3471,12 @@ sets `ParaProps.rtl`, which the bidi layout in `officina-text` uses and
 which `.docx`, `.odt` and the native file keep. Each change is one undo
 step and is kept by crash recovery.
 
+### 16.59 Icon sets in Sheets (2026-11-17)
+
+Conditional formats gain Excel's icon sets: all 20 (3 to 5 icons: arrows, grey arrows, flags, traffic lights, signs, symbols, ratings, quarters, boxes, triangles, stars). A rule holds the set, one threshold per icon after the first (number, percent, percentile or formula, each "at least" or "more than"), reverse order and icon only. A cell gets the highest icon whose threshold it meets; the icon is drawn at the left of the cell by `GridView` from a small set of shape kinds coloured per set, so no picture files are needed. Native files keep the rule (codec tag 10).
+
+`.xlsx` reads and writes `<iconSet>` with `reverse`, `showValue` and `gte`. `.ods` reads and writes LibreOffice's `calcext:icon-set`. Gate (`examples/condfmt_lo.rs`, two icon columns added): every icon cell matches in .xlsx → .xlsx, .ods → .ods and .ods → .xlsx through LibreOffice. LibreOffice's ODF form keeps neither reverse order nor icon only (it writes show-value but does not read it back) and drops strict thresholds in both formats; those are its limits, written down in the gate.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
