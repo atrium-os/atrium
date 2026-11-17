@@ -632,6 +632,24 @@ fn seed_etc(root: &Path, user: &str, uid: u32, gid: u32, files: u32, home_in: &s
             let _ = fs::copy(&src, etc.join(f));
         }
     }
+    // The trusted CAs, so cargo, git and pkg can check TLS: the bundle
+    // (read through its link) and certctl's hashed links, which point into
+    // /usr/share/certs (mounted read-only from the base).
+    let ssl = etc.join("ssl");
+    let _ = fs::create_dir_all(ssl.join("certs"));
+    if let Ok(b) = fs::read("/etc/ssl/cert.pem") {
+        let _ = fs::write(ssl.join("cert.pem"), b);
+    }
+    if let Ok(rd) = fs::read_dir("/etc/ssl/certs") {
+        for e in rd.flatten() {
+            if let Ok(t) = fs::read_link(e.path()) {
+                if t.starts_with("/usr/share/certs") || t.is_relative() {
+                    let _ = fs::remove_file(ssl.join("certs").join(e.file_name()));
+                    let _ = std::os::unix::fs::symlink(&t, ssl.join("certs").join(e.file_name()));
+                }
+            }
+        }
+    }
     let _ = fs::remove_file(etc.join("termcap"));
     let _ = std::os::unix::fs::symlink("/usr/share/misc/termcap", etc.join("termcap"));
     let mp = etc.join("master.passwd");
