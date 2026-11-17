@@ -40,6 +40,8 @@ typedef enum {
 	TESSERA_EXDEV           = -22,	/* cross-device operation */
 	TESSERA_ERANGE          = -23,	/* offset/length out of range */
 	TESSERA_EDQUOT          = -24,	/* quota domain limit exceeded */
+	TESSERA_EAUTH           = -25,	/* AEAD/MAC check failed (tampered, wrong key) */
+	TESSERA_ENOKEY          = -26,	/* sealed object, key not loaded */
 } tessera_errno_t;
 
 /* Human-readable description of a code (for logs, never NULL). */

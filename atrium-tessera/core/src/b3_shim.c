@@ -33,6 +33,7 @@
 #include "b3_blake3_impl.h"
 
 #include "tessera/hash.h"
+#include "tessera/crypt.h"
 #include "tessera_compat.h"
 
 #if BLAKE3_USE_X86
@@ -208,12 +209,15 @@ blake3_simd_degree(void)
 #define TESSERA_B3_FPU_SLICE	(64u * 1024u)
 
 static void
-b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
-    tessera_hash_t out)
+b3_hash_with(blake3_hasher *hasher, const uint8_t *key, const uint8_t *data,
+    size_t len, tessera_hash_t out)
 {
 	size_t off = 0;
 
-	blake3_hasher_init(hasher);
+	if (key != NULL)
+		blake3_hasher_init_keyed(hasher, key);
+	else
+		blake3_hasher_init(hasher);
 	while (off < len) {
 		size_t n = len - off;
 
@@ -231,10 +235,13 @@ b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
 }
 #else
 static void
-b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
-    tessera_hash_t out)
+b3_hash_with(blake3_hasher *hasher, const uint8_t *key, const uint8_t *data,
+    size_t len, tessera_hash_t out)
 {
-	blake3_hasher_init(hasher);
+	if (key != NULL)
+		blake3_hasher_init_keyed(hasher, key);
+	else
+		blake3_hasher_init(hasher);
 	blake3_hasher_update(hasher, data, len);
 	blake3_hasher_finalize(hasher, out, TESSERA_HASH_SIZE);
 }
@@ -251,31 +258,57 @@ b3_hash_with(blake3_hasher *hasher, const uint8_t *data, size_t len,
  * the normal path never enters.
  */
 static __noinline void
-b3_hash_on_stack(const uint8_t *data, size_t len, tessera_hash_t out)
+b3_hash_on_stack(const uint8_t *key, const uint8_t *data, size_t len,
+    tessera_hash_t out)
 {
 	blake3_hasher hasher;
 
-	b3_hash_with(&hasher, data, len, out);
+	b3_hash_with(&hasher, key, data, len, out);
+	if (key != NULL)
+		explicit_bzero(&hasher, sizeof(hasher));
 }
 
-void
-tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
+static void
+b3_hash_any(const uint8_t *key, const uint8_t *data, size_t len,
+    tessera_hash_t out)
 {
 	blake3_hasher *hasher = malloc(sizeof *hasher, M_TESSERA, M_NOWAIT);
 
 	if (hasher == NULL) {
-		b3_hash_on_stack(data, len, out);
+		b3_hash_on_stack(key, data, len, out);
 		return;
 	}
-	b3_hash_with(hasher, data, len, out);
+	b3_hash_with(hasher, key, data, len, out);
+	if (key != NULL)
+		explicit_bzero(hasher, sizeof(*hasher));
 	free(hasher, M_TESSERA);
 }
 #else
+static void
+b3_hash_any(const uint8_t *key, const uint8_t *data, size_t len,
+    tessera_hash_t out)
+{
+	blake3_hasher hasher;
+	volatile uint8_t *v = (volatile uint8_t *)&hasher;
+
+	b3_hash_with(&hasher, key, data, len, out);
+	if (key != NULL)
+		for (size_t i = 0; i < sizeof(hasher); i++)
+			v[i] = 0;
+}
+#endif
+
 void
 tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
 {
-	blake3_hasher hasher;
-
-	b3_hash_with(&hasher, data, len, out);
+	b3_hash_any(NULL, data, len, out);
 }
-#endif
+
+/* Keyed BLAKE3 (tessera/crypt.h, keyed content ids). The hasher's chaining
+ * values are key-dependent, so they are wiped after use. */
+void
+tessera_blake3_256_keyed(const uint8_t key[32], const uint8_t *data,
+    size_t len, tessera_hash_t out)
+{
+	b3_hash_any(key, data, len, out);
+}

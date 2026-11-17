@@ -28,6 +28,8 @@ tessera_strerror(tessera_errno_t e)
 	case TESSERA_EISDIR:       return "is a directory";
 	case TESSERA_ENOTEMPTY:    return "directory not empty";
 	case TESSERA_EPERM:        return "operation not permitted";
+	case TESSERA_EAUTH:        return "authentication failed";
+	case TESSERA_ENOKEY:       return "key not loaded";
 	case TESSERA_EXDEV:        return "cross-device";
 	case TESSERA_ERANGE:       return "out of range";
 	case TESSERA_EDQUOT:       return "quota exceeded";
