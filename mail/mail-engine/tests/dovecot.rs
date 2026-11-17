@@ -579,3 +579,67 @@ fn sending_through_the_courier() {
     // Undo of that send gives the draft back.
     assert_eq!(engine.undo_send(sent).unwrap(), Some(draft.clone()));
 }
+
+/// The app's connections, as couriers to the test Dovecot.
+struct Couriers<'a>(&'a Dovecot);
+
+impl mail_engine::accounts::Connect for Couriers<'_> {
+    fn mail(&self, server: &mail_store::Server, item: &[u8; 16]) -> std::io::Result<UnixStream> {
+        assert_eq!(item, &[9; 16]);
+        assert_eq!(server.host, HOST);
+        Ok(courier_to(self.0, Scheme::from_name(&server.scheme).unwrap(), server.port))
+    }
+    fn jmap(&self, _: &str, _: &[u8; 16]) -> Result<Box<dyn mail_sync::jmap::Http>, String> {
+        Err("no JMAP here".into())
+    }
+}
+
+#[test]
+fn a_configured_account_syncs_and_sends_in_one_pass() {
+    use mail_compose::{Draft, Mailbox};
+    use mail_engine::send::When;
+    use mail_store::{AccountConfig, Protocol, Reached, Server};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let cfg = AccountConfig {
+        address: "priya@example.org".into(),
+        name: "Priya Raman".into(),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: HOST.into(), port: dc.port },
+            smtp: Server { scheme: "submissions".into(), host: HOST.into(), port: dc.sub_port },
+        },
+        incoming_item: Some([9; 16]),
+        outgoing_item: Some([9; 16]),
+        oauth: None,
+        reached: Reached::Never,
+    };
+    let account = engine.store.add_configured(&cfg).unwrap();
+    assert_eq!(engine.configured().len(), 1);
+    let p = engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert!(p.report.headers >= 300, "{p:?}");
+    assert!(matches!(engine.store.account_config(account).unwrap().unwrap().reached, Reached::Ok { .. }));
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 300);
+
+    // A send made due goes out in the next pass, and its copy lands in Sent.
+    let draft = Draft { from: Mailbox::new("Priya Raman", "priya@example.org"), to: vec![Mailbox::new("", "arun@acme.example")], subject: "From the pass".into(), text: "Hi.\n".into(), ..Default::default() };
+    let id = engine.send(account, &draft, When::default()).unwrap();
+    assert!(engine.send_now(id).unwrap());
+    assert!(engine.next_pass(now(), 300) <= now() + 300);
+    let p = engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert_eq!((p.sent, p.failed.len()), (1, 0), "{p:?}");
+    assert_eq!(dc.relayed.lock().unwrap().len(), 1);
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    let sent = engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.role == Role::Sent).unwrap().0;
+    assert!(engine.store.list(sent, 0, 10).unwrap().iter().any(|r| r.subject == "From the pass"));
+
+    // Removing the account takes its mail with it.
+    engine.store.write(|w| w.remove_account(account)).unwrap();
+    assert!(engine.store.accounts().unwrap().is_empty());
+    assert!(engine.configured().is_empty());
+    assert!(engine.store.account_config(account).unwrap().is_none());
+}
