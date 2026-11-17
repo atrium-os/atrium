@@ -913,10 +913,13 @@ name = "opifex"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "libc",
  "opifex-catalog",
  "portcullis-sig",
  "portcullis-toml",
  "portcullis-trust",
+ "serde",
+ "serde_json",
  "sha2",
  "toml",
 ]

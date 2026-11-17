@@ -25,6 +25,9 @@ pub struct Opts<'a> {
     pub trust:           &'a portcullis_trust::Trust,
     pub allow_unsigned:  bool,
     pub require_content: bool,
+    /// A catalog install: the signer's key from the checked catalog. The
+    /// manifest must verify against it (instead of the side-load list).
+    pub catalog_key:     Option<&'a str>,
 }
 
 /// Where Opifex keeps its own state under the Atrium root.
@@ -120,7 +123,16 @@ pub fn stage(bundle: &Path, o: &Opts) -> Result<(Manifest, PathBuf), String> {
         return Err(format!("{id:?}: not an app id"));
     }
     // 1. The signature, through the launch gate.
-    if o.allow_unsigned {
+    if let Some(pem) = o.catalog_key {
+        let raw = fs::read(bundle.join(SIG)).map_err(|e| format!("{SIG}: {e}"))?;
+        let der = std::str::from_utf8(&raw).ok().and_then(|t| portcullis_sig::sig_from_base64(t.trim()).ok())
+            .unwrap_or(raw);
+        portcullis_sig::verify_one(text.as_bytes(), &der, pem)
+            .map_err(|e| format!("{id}: not signed by the catalog's signer ({e:?})"))?;
+        if m.bundle.as_ref().and_then(|b| b.content.as_deref()).is_none() {
+            return Err(format!("{id}: a catalog package without a content index"));
+        }
+    } else if o.allow_unsigned {
         eprintln!("opifex: --allow-unsigned: skipping signature verification for {}", bundle.display());
     } else {
         o.trust.verify(bundle, &text, portcullis_trust::Demand::PolicyDefault)?;
@@ -256,7 +268,7 @@ mod tests {
     }
 
     fn opts<'a>(root: &'a Path, trust: &'a portcullis_trust::Trust, req: bool) -> Opts<'a> {
-        Opts { root, trust, allow_unsigned: false, require_content: req }
+        Opts { root, trust, allow_unsigned: false, require_content: req, catalog_key: None }
     }
 
     #[test]
