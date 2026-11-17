@@ -44,6 +44,8 @@ name = "atrium-mail"
 version = "0.1.0"
 dependencies = [
  "fresco-client",
+ "libc",
+ "limen",
  "mail-engine",
  "mail-schema",
  "mail-store",
@@ -690,6 +692,7 @@ dependencies = [
  "mail-schema",
  "mail-store",
  "mail-sync",
+ "postcard",
 ]
 
 [[package]]

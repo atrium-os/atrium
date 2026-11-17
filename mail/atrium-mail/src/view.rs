@@ -61,10 +61,25 @@ pub struct ListRow {
     pub flagged: bool,
 }
 
+/// A converted HTML document, shared (compared by identity, so the state
+/// stays cheap to clone and compare).
+#[derive(Debug, Clone)]
+pub struct Doc(pub Rc<mail_schema::Document>);
+
+impl PartialEq for Doc {
+    fn eq(&self, o: &Doc) -> bool { Rc::ptr_eq(&self.0, &o.0) }
+}
+
+/// The doc-viewer's slot in Mail's window (mail.md §7.3, §15.1: the body
+/// is a framed slot that can't draw over Mail's chrome).
+pub const FRAME_SLOT: pergola::slot::SlotKey = 0x4d41_494c;
+
 /// A message's body in the reader.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Body {
     pub plain: Option<Plain>,
+    /// The HTML body, shown in the doc-viewer when this message is framed.
+    pub document: Option<Doc>,
     /// Said in place of the text, or before it.
     pub note: Option<String>,
     pub show_quoted: bool,
@@ -93,6 +108,9 @@ pub struct Shown {
     pub subject: String,
     pub people: String,
     pub msgs: Vec<Msg>,
+    /// The message whose HTML body is in the doc-viewer: one at a time, the
+    /// newest open one with HTML unless the person chose another.
+    pub framed: Option<usize>,
     /// Bumped on every change, for the laid-out lines.
     pub version: u64,
 }
@@ -142,6 +160,8 @@ pub struct Mail {
     reader: Mutable<ScrollState>,
     size: Mutable<(f32, f32)>,
     now: Rc<dyn Fn() -> i64>,
+    /// Whether the window is drawn dark (the doc-viewer is told).
+    dark: Rc<std::cell::Cell<bool>>,
 }
 
 fn addrs(l: &[mail_schema::Address]) -> String {
@@ -298,13 +318,13 @@ impl Mail {
     fn body(&self, msg: MsgId) -> Body {
         match self.engine.open(msg) {
             Ok(r) => {
-                let note = match (&r.text, r.has_html) {
+                let note = match (&r.text, &r.document) {
                     (None, _) => Some("Only the headers are here so far; the text comes with the next sync.".to_string()),
-                    (Some(t), true) if t.trim().is_empty() => Some("This message is written in HTML, which Mail will show soon. It has no plain-text version.".to_string()),
+                    (Some(t), None) if r.has_html && t.trim().is_empty() => Some("This message's HTML couldn't be shown.".to_string()),
                     _ => None,
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
-                Body { plain, note, show_quoted: false, show_signature: false }
+                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -351,6 +371,7 @@ impl Mail {
                 people.push(m.sender.name.clone());
             }
         }
+        let framed = msgs.iter().rposition(|m| m.open && m.body.as_ref().is_some_and(|b| b.document.is_some()));
         let subject = msgs.first().and_then(|m| store.message(m.msg).ok()).map(|m| m.summary.subject).unwrap_or(row.subject);
         let mut ui = self.ui.get_cloned();
         let version = ui.reading.as_ref().map_or(0, |r| r.version) + 1;
@@ -359,6 +380,7 @@ impl Mail {
             subject: if subject.trim().is_empty() { "(no subject)".into() } else { subject },
             people: if n > 1 { format!("{} · {n} messages", people.join(", ")) } else { String::new() },
             msgs,
+            framed,
             version,
         });
         self.ui.set(ui);
@@ -389,8 +411,32 @@ impl Mail {
                 if body.is_some() {
                     m.body = body;
                 }
+                let html = m.body.as_ref().is_some_and(|b| b.document.is_some());
+                if m.open && html {
+                    r.framed = Some(k);
+                } else if !m.open && r.framed == Some(k) {
+                    r.framed = r.msgs.iter().rposition(|m| m.open && m.body.as_ref().is_some_and(|b| b.document.is_some()));
+                }
             }
         });
+    }
+
+    /// Show message `k`'s HTML body in the doc-viewer.
+    pub fn frame(&self, k: usize) {
+        self.change_reading(|r| {
+            if r.msgs.get(k).is_some_and(|m| m.body.as_ref().is_some_and(|b| b.document.is_some())) {
+                r.framed = Some(k);
+            }
+        });
+    }
+
+    /// The document the doc-viewer should show now: its message and the
+    /// document, and whether the window is dark.
+    pub fn framed(&self) -> Option<(MsgId, Doc, bool)> {
+        let ui = self.ui.get_cloned();
+        let r = ui.reading?;
+        let m = r.msgs.get(r.framed?)?;
+        Some((m.msg, m.body.as_ref()?.document.clone()?, self.dark.get()))
     }
 
     /// Show or hide a message's quoted tail or signature.
@@ -400,6 +446,12 @@ impl Mail {
                 if quoted { b.show_quoted = !b.show_quoted } else { b.show_signature = !b.show_signature }
             }
         });
+    }
+
+    /// A link pressed in a message (plain text, or the doc-viewer's
+    /// `LinkActivated`): shown in the link bar, never opened from here.
+    pub fn link(&self, url: &str) {
+        eprintln!("atrium-mail: link {url}");
     }
 
     /// j/k and the arrows move through the list and open as they go.
@@ -446,6 +498,8 @@ pub enum Item {
     Text { depth: u8, spans: Vec<(String, Option<String>)> },
     /// "Show quoted text" / "Show signature" (`shown`: "Hide …").
     Fold { msg: usize, quoted: bool, shown: bool },
+    /// An open HTML message that isn't the framed one: a button to show it there.
+    ShowHtml(usize),
     Gap,
 }
 
@@ -473,6 +527,14 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        // The framed message's body is the doc-viewer's, under the list.
+        if r.framed == Some(k) {
+            continue;
+        }
+        if b.document.is_some() {
+            out.push(Item::ShowHtml(k));
+            continue;
+        }
         if let Some(n) = &b.note {
             let st = sans(type_size::SM, Weight::Regular, Color::TRANSPARENT);
             for l in pergola::text::lines(n, &st, w) {
@@ -557,6 +619,7 @@ impl MailView {
             ui,
             pages: Rc::default(),
             now: Rc::new(now),
+            dark: Rc::default(),
         };
         mail.refresh();
         MailView { mail, laid: Rc::default() }
@@ -623,6 +686,7 @@ impl View for MailView {
         let ui = self.mail.ui.get_cloned();
         let (w, h) = self.mail.size.get();
         let t = ctx.theme;
+        self.mail.dark.set(t.mode == pergola::theme::Mode::Dark);
         ctx.min_size(pergola::geom::Size::new(em(160.0) + em(280.0) + em(320.0), head_h() + 4.0 * row_h()));
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_canvas());
         // The places and the list keep their widths while the reader has
@@ -770,7 +834,21 @@ impl MailView {
         };
         let shown = Rc::new(s.clone());
         let (m, lh, xi) = (self.mail.clone(), line_h(), x - x0);
-        VirtualList::new(self.mail.reader.clone(), Rect::new(x0, read_head_h(), w, h - read_head_h()), items.len(), lh, move |i, ctx| {
+        // With an HTML body framed, the lines above it take at most what
+        // they need, up to two fifths of the reader, and the frame the rest.
+        let area_h = h - read_head_h();
+        let list_h = match s.framed {
+            Some(_) => (items.len() as f32 * lh).min((area_h * 0.4).max(3.0 * lh)).min(area_h),
+            None => area_h,
+        };
+        if s.framed.is_some() {
+            let fy = read_head_h() + list_h;
+            rect(ctx, Rect::new(x0 + 16.0, fy, w - 32.0, 1.0), t.border_default());
+            // The slot the doc-viewer is bound into (an opaque rect until it is).
+            let id = ctx.add(Node::Rect { rect: Rect::new(x0 + 1.0, fy + 1.0, w - 1.0, (h - fy - 1.0).max(0.0)), fill: t.bg_canvas(), radius: 0.0 });
+            ctx.slot(id, FRAME_SLOT);
+        }
+        VirtualList::new(self.mail.reader.clone(), Rect::new(x0, read_head_h(), w, list_h), items.len(), lh, move |i, ctx| {
             row(ctx, w, lh);
             draw_item(ctx, &items[i], &shown, &m, xi, tw, lh);
             ctx.pop();
@@ -864,6 +942,14 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);
             let (mm, k, q) = (mail.clone(), *msg, *quoted);
             area(ctx, Rect::new(x, cy - em(11.0), lw, em(22.0)), t.bg_window(), move || mm.unfold(k, q));
+            text(ctx, x + em(8.0), cy, label, type_size::XS, Weight::Medium, t.text_secondary());
+            ctx.pop();
+        }
+        Item::ShowHtml(k) => {
+            let label = "Show this message";
+            let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);
+            let (mm, k) = (mail.clone(), *k);
+            area(ctx, Rect::new(x, cy - em(11.0), lw, em(22.0)), t.bg_window(), move || mm.frame(k));
             text(ctx, x + em(8.0), cy, label, type_size::XS, Weight::Medium, t.text_secondary());
             ctx.pop();
         }

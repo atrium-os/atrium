@@ -69,7 +69,20 @@ pub enum ToChild {
     /// navigator-ui.md §4.4): answer `Parked` with what it needs to bring
     /// the page back as it was.
     Park,
+    /// A picture the document may show (mail.md §7.3: a message's `cid:`
+    /// part, or a remote picture the person allowed), as the descriptor
+    /// limend passes with this message, for the document's resource `id`
+    /// (an `<img src>` or CSS `url()` the document spells exactly so).
+    /// Sent before `Load`, it is for the document that `Load` brings;
+    /// after, for the document shown, which is laid out again with it.
+    /// The child never fetches: what isn't provided stays a placeholder
+    /// of its declared size.
+    Provide { id: String },
 }
+
+/// The most pictures one document is given, and the most bytes in all.
+pub const PROVIDED_MAX: usize = 256;
+pub const PROVIDED_BYTES_MAX: usize = 64 << 20;
 
 /// How the reader wants the page laid out (navigator-ui.md §7; backend
 /// §4.9): text size and page zoom in 1/64 (64 = 100%), the appearance,
@@ -180,6 +193,7 @@ impl ToChild {
             ToChild::SetReading { reading } => reading.ok(),
             ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
             ToChild::Park => true,
+            ToChild::Provide { id } => !id.is_empty() && clean_text(id, ANCHOR_MAX),
         };
         ok.then_some(m)
     }

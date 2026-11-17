@@ -8,6 +8,9 @@
 //!   MAIL_PARSE_JAIL   [mail-parse-jail beside this program] the parse jail
 //!   MAIL_TRACE        print the window's state after each change (VM gates)
 
+use std::fs::File;
+use std::io::{Seek, Write};
+use std::os::fd::{AsFd, FromRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -22,6 +25,45 @@ use pergola::{App, SizeSpec, Window, WindowDesc};
 
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Bytes as an anonymous file for the doc-viewer, read from the start.
+fn anon(bytes: &[u8]) -> std::io::Result<File> {
+    let fd = unsafe { libc::memfd_create(c"mail".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    f.write_all(bytes)?;
+    f.rewind()?;
+    Ok(f)
+}
+
+/// The doc-viewer showing a message's HTML body.
+struct Frame {
+    msg: u64,
+    embed: limen::proto::EmbedId,
+    dark: bool,
+}
+
+/// Ask for a doc-viewer in the frame slot and hand it the document: its
+/// pictures first (`Provide`), then the HTML (`Load`).
+fn show(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, token: [u8; 16], doc: &mail_schema::Document, dark: bool) -> Result<limen::proto::EmbedId, String> {
+    use limen::doc_viewer::{DocKind, ToChild};
+    let e = embeds.borrow_mut().request("doc-viewer", token, atrium_mail::view::FRAME_SLOT).map_err(|e| format!("{e:?}"))?;
+    let send = || -> Result<(), String> {
+        for (id, bytes) in &doc.pictures {
+            let f = anon(bytes).map_err(|e| e.to_string())?;
+            embeds.borrow_mut().send_fd(e, ToChild::Provide { id: id.clone() }.encode(), f.as_fd()).map_err(|e| format!("{e:?}"))?;
+        }
+        let f = anon(doc.html.as_bytes()).map_err(|e| e.to_string())?;
+        embeds.borrow_mut().send_fd(e, ToChild::Load { kind: DocKind::Html, base: String::new(), dark }.encode(), f.as_fd()).map_err(|e| format!("{e:?}"))
+    };
+    if let Err(err) = send() {
+        let _ = embeds.borrow_mut().detach_embed(e);
+        return Err(err);
+    }
+    Ok(e)
 }
 
 fn main() {
@@ -46,6 +88,21 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // HTML bodies are drawn by a jailed doc-viewer in a slot (§7.3); without
+    // limend Mail still reads plain text.
+    let embeds = match pergola::embed::Embeds::connect() {
+        Ok(e) => {
+            win.set_slot_binder(pergola::embed::Embeds::binder(&e));
+            Some(e)
+        }
+        Err(e) => {
+            eprintln!("atrium-mail: limend: {e:?}; HTML bodies won't show");
+            None
+        }
+    };
+    let mut frame: Option<Frame> = None;
+    // A message the viewer couldn't be asked for, not asked again.
+    let mut failed: Option<u64> = None;
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine, dirty.clone(), (win.width, win.height), now);
     let mail = view.mail.clone();
@@ -66,6 +123,52 @@ fn main() {
             }
         }
         mail.set_size(win.width, win.height);
+        if let Some(embeds) = &embeds {
+            let want = mail.framed();
+            if want.as_ref().map(|w| w.0) != frame.as_ref().map(|f| f.msg) {
+                if let Some(f) = frame.take() {
+                    let _ = embeds.borrow_mut().detach_embed(f.embed);
+                }
+                if let (Some((msg, doc, dark)), Some(token)) = (want.as_ref(), win.embed_token()) {
+                    if failed != Some(*msg) {
+                        match show(embeds, token, &doc.0, *dark) {
+                            Ok(embed) => frame = Some(Frame { msg: *msg, embed, dark: *dark }),
+                            Err(e) => {
+                                eprintln!("atrium-mail: doc-viewer: {e}");
+                                failed = Some(*msg);
+                            }
+                        }
+                    }
+                }
+            } else if let (Some(f), Some((_, _, dark))) = (frame.as_mut(), want.as_ref()) {
+                if f.dark != *dark {
+                    f.dark = *dark;
+                    let _ = embeds.borrow_mut().send(f.embed, limen::doc_viewer::ToChild::SetTheme { dark: *dark }.encode());
+                }
+            }
+            loop {
+                let ev = embeds.borrow_mut().poll(Duration::from_millis(0));
+                match ev {
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if frame.as_ref().is_some_and(|f| f.embed == embed) => {
+                        match limen::doc_viewer::ToParent::decode(&bytes) {
+                            Some(limen::doc_viewer::ToParent::LinkActivated { url }) => mail.link(&url),
+                            Some(limen::doc_viewer::ToParent::Error { code }) => eprintln!("atrium-mail: doc-viewer error {code}"),
+                            _ => {}
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if frame.as_ref().is_some_and(|f| f.embed == embed) => {
+                        eprintln!("atrium-mail: the doc-viewer went away");
+                        failed = frame.take().map(|f| f.msg);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("atrium-mail: limend: {e:?}");
+                        break;
+                    }
+                }
+            }
+        }
         // The index changes under the window as sync stores mail.
         if refreshed.elapsed() > Duration::from_secs(5) {
             refreshed = Instant::now();

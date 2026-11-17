@@ -121,7 +121,7 @@ fn list_and_read() {
     assert!(mail.key(&key("k")));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "This week");
-    assert!(note(&r).contains("HTML"));
+    assert_eq!(r.framed, Some(0), "an HTML-only message goes to the doc-viewer");
     assert!(mail.key(&key("k")));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "Headers only so far");
@@ -211,4 +211,51 @@ fn a_conversation() {
     assert_eq!(mail.ui.get_cloned().count, 3);
     let inbox = mail.ui.get_cloned().folder.unwrap();
     assert!(!mail.engine.store.view(inbox).unwrap());
+}
+
+#[test]
+fn an_html_body_is_framed_for_the_doc_viewer() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let html = |uid: u32, mid: &str, refs: &str, t: i64, body: &str| {
+        let refs = if refs.is_empty() { String::new() } else { format!("References: {refs}\r\n") };
+        let bytes = format!("From: Shop <news@shop.example>\r\nTo: p@example.org\r\nSubject: Sale\r\nMessage-ID: {mid}\r\n{refs}Date: Mon, 23 Nov 2026 0{uid}:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{body}\r\n").into_bytes();
+        Fetched { uid, flags: vec![], size: 1000, internal_date: Some(t), server_id: None, bytes, full: true }
+    };
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![
+            html(1, "<s1@x>", "", NOW - 7200, "<h1>First sale</h1><img src=\"https://cdn.example/a.png\" width=\"50\" height=\"50\">"),
+            html(2, "<s2@x>", "<s1@x>", NOW - 3600, "<h1>Second sale</h1><img src=\"data:image/gif;base64,R0lGODlhAQABAAAAACw=\" width=\"1\" height=\"1\">"),
+        ]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    mail.open(0);
+    app.tick();
+    // Both unread, so both open; the newest is framed, the other offers itself.
+    let s = mail.ui.get_cloned().reading.unwrap();
+    assert_eq!(s.framed, Some(1));
+    let (msg, doc, dark) = mail.framed().unwrap();
+    assert_eq!(msg, s.msgs[1].msg);
+    assert!(doc.0.html.contains("Second sale") && !dark);
+    assert_eq!(doc.0.pictures.len(), 1, "the data: picture is the message's own");
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Show this message"), "{t:?}");
+    // Choosing the first moves the frame.
+    let items = atrium_mail::view::lay_out(&s, 560.0);
+    assert!(!items.iter().any(|i| matches!(i, atrium_mail::view::Item::Text { .. })), "the bodies are the doc-viewer's, not drawn by Mail");
+    assert!(items.iter().any(|i| *i == atrium_mail::view::Item::ShowHtml(0)));
+    mail.frame(0);
+    assert!(mail.framed().unwrap().1 .0.html.contains("First sale"));
+    // The document was kept: opening again parses nothing (the stored one is the same).
+    let m = engine.store.message(s.msgs[1].msg).unwrap();
+    assert!(m.document.is_some());
+    let again = engine.open(s.msgs[1].msg).unwrap();
+    assert_eq!(again.document.as_ref().map(|d| &d.html), Some(&doc.0.html));
 }

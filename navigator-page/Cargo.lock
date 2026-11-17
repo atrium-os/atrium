@@ -1116,10 +1116,12 @@ dependencies = [
 name = "navigator-page"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fresco-client",
  "fresco-protocol",
  "limen",
  "navigator-control",
+ "navigator-dom",
  "navigator-image",
  "navigator-normalize",
  "navigator-render",

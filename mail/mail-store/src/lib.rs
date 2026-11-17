@@ -27,7 +27,7 @@ pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW}
 
 /// The index's layout; an index of another layout is rebuilt from the blobs
 /// by sync (the store refuses to open it).
-const SCHEMA: u64 = 2;
+const SCHEMA: u64 = 3;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -165,6 +165,10 @@ pub struct Message {
     pub locations: Vec<(FolderId, u32)>,
     /// Its conversation (§11.1).
     pub thread: ThreadId,
+    /// The HTML body as converted by a parse jail (a postcard
+    /// `mail_schema::Document` blob), kept so opening it again does no work
+    /// and fires nothing (§7.3).
+    pub document: Option<Hash>,
 }
 
 /// One row of a folder's list.
@@ -472,6 +476,7 @@ impl Writer<'_> {
                     summary: m.summary,
                     locations: vec![(folder, uid)],
                     thread: 0,
+                    document: None,
                 };
                 self.put_msg(id, &msg)?;
                 if let Some(s) = &m.server_id {
@@ -489,6 +494,13 @@ impl Writer<'_> {
             self.thread_refresh(cur.thread)?;
         }
         Ok(id)
+    }
+
+    /// Keep (or forget) a message's converted HTML document.
+    pub fn set_document(&mut self, id: MsgId, document: Option<Hash>) -> Result<()> {
+        let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        m.document = document;
+        self.put_msg(id, &m)
     }
 
     pub fn set_flags(&mut self, folder: FolderId, uid: u32, flags: u32) -> Result<bool> {

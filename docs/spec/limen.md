@@ -138,6 +138,7 @@ window (pergola.md §10).
 | parent → child | `SetReading` | `reading: { text_64: u16 (32–256), zoom_64: u16 (16–512), dark: bool, comfortable: bool }`, the reader's choices (navigator-ui.md §7); the child lays the page out again keeping its place, nothing fetched |
 | parent → child | `Find` | `query: String` (at most 256 bytes, no control characters; empty clears), `step: i8` (0 the first match from the top of the view, 1 the next, -1 the one before); answered by `Found` |
 | parent → child | `Park` | the parent will close the child (navigator-ui.md §4.4); answered by `Parked` |
+| parent → child | `Provide` | `id: String` (at most 256 bytes) with a descriptor holding a picture's bytes (mail.md §7.3: a message's `cid:` part or `data:` picture, or a remote picture the person loaded). Before `Load` it is for the document `Load` brings; after, for the document shown, laid out again where the reader was. An `<img src>` (or CSS `url()`) spelled exactly `id` shows it, at its real size when the document declares none. At most 256 pictures, 16 MiB each, 64 MiB in all per document; bytes that aren't a picture are ignored. The child never fetches: an id never provided stays a placeholder of its declared size. Added 2026-11-17 at the end of the enum (§2's versioning) |
 | child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
 | child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
 | child → parent | `Error` | `code: u16` |

@@ -172,12 +172,50 @@ fn invite_wire(i: ical::Invite) -> wire::Invite {
     }
 }
 
+/// The bytes of the pictures the message carries itself: `cid:` parts and
+/// `data:` URLs, within the schema's limits (the rest stay placeholders).
+fn own_pictures(raw: &[u8], s: &crate::Summary, resources: &[html::Resource]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut total = 0;
+    for r in resources {
+        if out.len() >= wire::PICTURES_MAX { break }
+        if r.hidden { continue }
+        let bytes = match &r.source {
+            html::Source::Cid(cid) => s.parts.iter().find(|p| p.content_id.as_deref() == Some(cid.as_str()) && p.kind != mime::PartKind::Multipart)
+                .map(|p| mime::part_bytes(raw, p)),
+            html::Source::Data(d) => html::data_url(d, wire::PICTURE_BYTES_MAX),
+            html::Source::Remote(_) => None,
+        };
+        let Some(b) = bytes else { continue };
+        if b.is_empty() || b.len() > wire::PICTURE_BYTES_MAX || b.len() as u64 > raw.len() as u64 || total + b.len() > wire::PICTURES_BYTES_MAX { continue }
+        total += b.len();
+        out.push((r.id.clone(), b));
+    }
+    out
+}
+
 fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, loaded: &BTreeMap<String, (u32, u32)>,
                            fonts: &html::FontSet) -> Result<wire::Opened, wire::Refusal> {
     let (summary, s) = summarize(raw, ctx, port)?;
     let document = s.html.as_deref().map(|h| {
-        let c = html::convert(h, loaded, fonts, &html::Env::default());
+        let env = html::Env::default();
+        let mut c = html::convert(h, loaded, fonts, &env);
+        let pictures = own_pictures(raw, &s, &c.resources);
+        // Their real sizes, from their headers, so the space is right the
+        // first time: converted again only when one wasn't declared.
+        let mut sized = loaded.clone();
+        for (id, b) in &pictures {
+            if !sized.contains_key(id) {
+                if let Ok((_, w, h)) = navigator_image::image::natural_size(b) {
+                    sized.insert(id.clone(), (w, h));
+                }
+            }
+        }
+        if sized.len() > loaded.len() {
+            c = html::convert(h, &sized, fonts, &env);
+        }
         wire::Document {
+            pictures,
             html: c.document,
             resources: c.resources.into_iter().map(|r| wire::Resource {
                 id: r.id,

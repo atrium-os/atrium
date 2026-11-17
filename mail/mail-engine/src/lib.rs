@@ -154,13 +154,16 @@ pub struct Engine {
     pub parser: Parser,
 }
 
-/// What the reading pane shows for a plain-text message (§7.2).
+/// What the reading pane shows (§7.2, §7.3).
 #[derive(Debug, Clone)]
 pub struct Reading {
     pub summary: Summary,
     /// The text, or `None` when only the headers are here yet.
     pub text: Option<String>,
     pub has_html: bool,
+    /// The HTML body converted into a document, with the message's own
+    /// pictures, for the document viewer.
+    pub document: Option<wire::Document>,
 }
 
 impl Engine {
@@ -173,20 +176,30 @@ impl Engine {
     }
 
     /// A message for reading. Its whole bytes when here, parsed alone; else
-    /// what the index has (the caller then asks sync for the text).
+    /// what the index has (the caller then asks sync for the text). The
+    /// converted document is kept, so a second opening parses nothing again
+    /// unless it needs the text.
     pub fn open(&self, msg: u64) -> Result<Reading, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let Some(full) = m.full else {
-            return Ok(Reading { summary: m.summary, text: None, has_html: false });
+            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None });
         };
+        if let Some(d) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<wire::Document>(&b).ok()) {
+            let text = m.summary.text.clone().or(Some(String::new()));
+            return Ok(Reading { summary: m.summary, text, has_html: true, document: Some(d) });
+        }
         let raw = self.store.blob(&full)?;
         match self.parser.open(&raw, Vec::new())? {
             Some(o) => {
+                if let Some(d) = &o.document {
+                    let h = self.store.put_blob(&postcard::to_stdvec(d).map_err(|e| Error::Jail(e.to_string()))?)?;
+                    self.store.write(|w| w.set_document(msg, Some(h)))?;
+                }
                 let has_html = o.document.is_some();
                 let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
-                Ok(Reading { summary: o.summary, text, has_html })
+                Ok(Reading { summary: o.summary, text, has_html, document: o.document })
             }
-            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false }),
+            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None }),
         }
     }
 }

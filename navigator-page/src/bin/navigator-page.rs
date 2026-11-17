@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use limen::doc_viewer::{error, ChromeKey, DocKind, Reading, ToChild, ToParent, FOUND_MAX};
 use limen::proto::{ChildEvent, EmbedId};
-use navigator_page::{fit_picture, picture, prepare, read_bounded, resolve, Prepared};
+use navigator_page::{fit_picture, picture, read_bounded, resolve, Prepared};
 use pergola::geom::Rect;
 use pergola::reactive::Mutable;
 use pergola::view::{Ctx, View};
@@ -239,6 +239,11 @@ struct Run {
     view: PageView,
     hover: Option<String>,
     finding: Option<Finding>,
+    /// Pictures the parent provided for an HTML document (mail.md §7.3).
+    provided: navigator_page::Provided,
+    /// The HTML document shown and its base, to lay out again when a
+    /// picture comes after it.
+    html: Option<(String, Vec<u8>)>,
 }
 
 impl Run {
@@ -257,9 +262,23 @@ impl Run {
                 Err(code) => out.send(ToParent::Error { code }),
             };
         }
+        let mut images = images;
+        let mut extra = navigator_render::Subresources::new();
+        if kind == DocKind::Html {
+            let (subs, im) = self.provided.resources();
+            extra = subs;
+            images.extend(im);
+            self.html = bytes.as_ref().ok().map(|b| (base.clone(), b.clone()));
+        } else {
+            self.html = None;
+        }
         let images = Rc::new(Images::new(images));
-        let prepared = match bytes.and_then(|b| prepare(kind, &b)) {
-            Ok(p) => Rc::new(p),
+        let sizes = if kind == DocKind::Html { self.provided.sizes() } else { Default::default() };
+        let prepared = match bytes.and_then(|b| navigator_page::prepare_with(kind, &b, &sizes)) {
+            Ok(mut p) => {
+                p.subs.extend(extra);
+                Rc::new(p)
+            }
             Err(code) => return out.send(ToParent::Error { code }),
         };
         let t = Instant::now();
@@ -562,7 +581,7 @@ fn main() {
 fn standalone(path: &str, kind: DocKind, dark: bool) {
     let mut window = Window::open(&WindowDesc::new("Page", SizeSpec::Fixed(1000, 700))).unwrap_or_else(|e| die(e));
     let (mut app, view) = new_app((window.width, window.height));
-    let mut run = Run { view, hover: None, finding: None };
+    let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
     let bytes = std::fs::File::open(path).map_err(|_| error::NO_DOCUMENT).and_then(read_bounded);
     let base = std::env::var("NAVIGATOR_PAGE_BASE").unwrap_or_else(|_| "https://a.test/".into());
     run.load(&mut LogOut, kind, base, Reading::plain(dark), 0.0, bytes, vec![]);
@@ -594,7 +613,7 @@ fn embedded() {
     let mut window = Window::open_on(conn, &desc).unwrap_or_else(|e| die(format_args!("window: {e}")));
     window.follow_appearance(false);
     let (mut app, view) = new_app((window.width, window.height));
-    let mut run = Run { view, hover: None, finding: None };
+    let mut run = Run { view, hover: None, finding: None, provided: Default::default(), html: None };
     // Resizes that come before the token are the slot's size.
     let until = Instant::now() + Duration::from_secs(10);
     let token = loop {
@@ -634,6 +653,7 @@ fn embedded() {
                     Some(ToChild::Find { query, step }) => run.find(&mut out, &query, step),
                     Some(ToChild::ScrollTo { anchor }) => run.scroll_to(&anchor),
                     Some(ToChild::Load { .. }) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
+                    Some(ToChild::Provide { .. }) => eprintln!("navigator-page: a picture came without its bytes"),
                     Some(ToChild::Park) => {
                         let y = run.view.scroll.get_cloned().physics.y as f32;
                         let y = if y.is_finite() { y.clamp(0.0, limen::doc_viewer::SCROLL_MAX) } else { 0.0 };
@@ -662,7 +682,24 @@ fn embedded() {
                     match ToChild::decode(&bytes) {
                         Some(ToChild::Load { kind, base, dark }) => {
                             let b = fd.map(std::fs::File::from).ok_or(error::NO_DOCUMENT).and_then(read_bounded);
+                            run.provided.load();
                             run.load(&mut out, kind, base, Reading::plain(dark), 0.0, b, vec![]);
+                        }
+                        Some(ToChild::Provide { id }) => {
+                            use std::io::Read as _;
+                            let cap = navigator_image::image::MAX_ENCODED_IMAGE_BYTES as u64;
+                            let mut b = Vec::new();
+                            let read = fd.map(std::fs::File::from).is_some_and(|f| f.take(cap + 1).read_to_end(&mut b).is_ok());
+                            let shown = run.html.is_some();
+                            if !read || !run.provided.provide(id, b, shown) {
+                                eprintln!("navigator-page: a provided picture not kept");
+                            } else if let (true, Some((base, doc))) = (shown, run.html.clone()) {
+                                // Laid out again with it, where the reader was.
+                                let p = run.view.page.get_cloned();
+                                let reading = p.as_ref().map_or(Reading::plain(false), |p| p.reading);
+                                let y = run.view.scroll.get_cloned().physics.y as f32;
+                                run.load(&mut out, DocKind::Html, base, reading, y.max(0.0), Ok(doc), vec![]);
+                            }
                         }
                         _ => eprintln!("navigator-page: dropped a descriptor"),
                     }

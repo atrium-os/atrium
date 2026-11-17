@@ -7,6 +7,7 @@
 //! network and no files (only the descriptor it was handed and its
 //! frescod connection), so what a bug here can reach is this one page.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 
 use limen::doc_viewer::{error, DocKind, DOC_MAX, TITLE_MAX};
@@ -93,6 +94,43 @@ pub fn fit_picture(iw: u32, ih: u32, w: f32, h: f32) -> [f32; 4] {
 /// A recording (or, for `DocKind::Html`, a page's own HTML) as a
 /// normalized document.
 pub fn prepare(kind: DocKind, bytes: &[u8]) -> Result<Prepared, u16> {
+    prepare_with(kind, bytes, &BTreeMap::new())
+}
+
+/// The sizes the normalizer is told for an HTML document's pictures: what
+/// each `<img>` declares (`width`, `height`, `natural-ratio`, as a mail
+/// body comes from Mail's parse jail), or the real size of a picture the
+/// parent provided. A picture with neither is dropped, as before.
+fn html_image_sizes(doc: &str, provided: &BTreeMap<String, (u32, u32)>) -> BTreeMap<String, navigator_normalize::ImageSize> {
+    use navigator_normalize::ImageSize;
+    let dom = navigator_dom::parse(doc);
+    let mut out = BTreeMap::new();
+    for h in dom.by_tag_anywhere("img") {
+        let Some(src) = dom.attr(h, "src").filter(|s| !s.is_empty()) else { continue };
+        if let Some(&wh) = provided.get(src) {
+            out.insert(src.to_string(), ImageSize::from(wh));
+            continue;
+        }
+        let px = |a: &str| dom.attr(h, a).and_then(|v| v.trim().trim_end_matches("px").parse::<u32>().ok()).filter(|v| *v <= 16_384);
+        let (w, ht) = (px("width"), px("height"));
+        let ratio = dom.attr(h, "natural-ratio").map(str::trim);
+        let size = match (w, ht, ratio) {
+            (Some(w), Some(ht), _) => ImageSize::from((w, ht)),
+            (None, None, None) => continue,
+            (w, ht, r) => ImageSize {
+                width: w,
+                height: ht,
+                ratio: r.and_then(|r| r.split_once('/')).and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))).filter(|&(a, b): &(u32, u32)| a > 0 && b > 0),
+            },
+        };
+        out.insert(src.to_string(), size);
+    }
+    out
+}
+
+/// [`prepare`], with the natural sizes of the pictures provided for an
+/// HTML document (`ToChild::Provide`).
+pub fn prepare_with(kind: DocKind, bytes: &[u8], provided: &BTreeMap<String, (u32, u32)>) -> Result<Prepared, u16> {
     let text = std::str::from_utf8(bytes).map_err(|_| error::UNREADABLE)?;
     let fonts = navigator_render::fontset::FontSet::shared().map_err(|_| error::UNREADABLE)?;
     let env = navigator_style::cascade::Env::default();
@@ -102,7 +140,10 @@ pub fn prepare(kind: DocKind, bytes: &[u8]) -> Result<Prepared, u16> {
             let subs = navigator_render::conformance::subresources_from_recording_json(text);
             (r.document, r.inputs, subs)
         }
-        DocKind::Html => (text.to_string(), Default::default(), Subresources::default()),
+        DocKind::Html => {
+            let inputs = navigator_normalize::Inputs { images: html_image_sizes(text, provided), ..Default::default() };
+            (text.to_string(), inputs, Subresources::default())
+        }
         DocKind::Picture => return Err(error::UNREADABLE),
     };
     let html = navigator_normalize::normalize_and_measure(&doc, &inputs, fonts, &env).0;
@@ -311,5 +352,120 @@ mod tests {
         }
         assert_eq!(read_bounded(Endless).err(), Some(error::TOO_BIG));
         assert_eq!(read_bounded(&b"abc"[..]).unwrap(), b"abc");
+    }
+}
+
+/// Pictures the parent provided (`ToChild::Provide`, mail.md §7.3), for the
+/// document about to load and for the one shown.
+#[derive(Default)]
+pub struct Provided {
+    pending: Vec<(String, Vec<u8>)>,
+    current: Vec<(String, Vec<u8>)>,
+}
+
+impl Provided {
+    /// Keep a picture: for the shown document when `shown`, else for the
+    /// next `Load`. False (and dropped) past the limits.
+    pub fn provide(&mut self, id: String, bytes: Vec<u8>, shown: bool) -> bool {
+        let list = if shown { &mut self.current } else { &mut self.pending };
+        let total: usize = list.iter().map(|(_, b)| b.len()).sum();
+        if list.len() >= limen::doc_viewer::PROVIDED_MAX || total + bytes.len() > limen::doc_viewer::PROVIDED_BYTES_MAX
+            || bytes.len() > navigator_image::image::MAX_ENCODED_IMAGE_BYTES {
+            return false;
+        }
+        list.retain(|(i, _)| *i != id);
+        list.push((id, bytes));
+        true
+    }
+
+    /// A `Load` came: what was provided before it is now the shown document's.
+    pub fn load(&mut self) {
+        self.current = std::mem::take(&mut self.pending);
+    }
+
+    /// The natural size of each picture provided for the shown document.
+    pub fn sizes(&self) -> BTreeMap<String, (u32, u32)> {
+        self.current.iter().filter_map(|(id, b)| navigator_image::image::natural_size(b).ok().map(|(_, w, h)| (id.clone(), (w, h)))).collect()
+    }
+
+    /// The shown document's pictures as the renderer takes them: each `id`
+    /// (as the document spells it) mapped to its bytes' address and natural
+    /// size, and the bytes by address. Bytes that aren't a picture are left out.
+    pub fn resources(&self) -> (Subresources, Vec<(String, Vec<u8>)>) {
+        let mut subs = Subresources::new();
+        let mut images = Vec::new();
+        for (id, b) in &self.current {
+            let Ok((_, w, h)) = navigator_image::image::natural_size(b) else { continue };
+            let address = format!("blake3:{}", blake3::hash(b).to_hex());
+            subs.insert(id.clone(), (address.clone(), w as i64 * navigator_render::PX, h as i64 * navigator_render::PX));
+            images.push((address, b.clone()));
+        }
+        (subs, images)
+    }
+}
+
+#[cfg(test)]
+mod provided_tests {
+    use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header().unwrap().write_image_data(&vec![200u8; (w * h * 4) as usize]).unwrap();
+        out
+    }
+
+    /// Lay `doc` out with what `p` holds and paint it: how many pictures
+    /// were drawn.
+    fn pictures_drawn(doc: &[u8], p: &Provided) -> usize {
+        use pergola::view::{Ctx, View};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut prepared = prepare_with(DocKind::Html, doc, &p.sizes()).unwrap();
+        let (subs, images) = p.resources();
+        prepared.subs.extend(subs);
+        let images: std::collections::HashMap<String, Vec<u8>> = images.into_iter().collect();
+        let d = pergola_document::Doc::html_scaled(prepared.html, prepared.subs, 600.0, 800.0, false, 64, move |a| {
+            images.get(a).map(|_| pergola::node::Image::new(2, 2, vec![9; 16]))
+        }).unwrap();
+        struct V(pergola_document::DocumentView);
+        impl View for V {
+            fn render(&self, ctx: &mut Ctx) { self.0.emit(ctx); }
+        }
+        let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let scroll = pergola::Mutable::with_dirty(pergola::widgets::ScrollState::default(), dirty.clone());
+        let more = scroll.sibling(0u64);
+        let v = pergola_document::DocumentView::new(scroll, pergola::geom::Rect::new(0.0, 0.0, 600.0, 800.0), Rc::new(RefCell::new(d)), more);
+        let mut app = pergola::App::new_with_flag(V(v), dirty);
+        for _ in 0..3 {
+            app.tick();
+        }
+        app.tree().iter().filter(|(_, n)| matches!(n, pergola::node::Node::Image { .. })).count()
+    }
+
+    #[test]
+    fn a_mail_picture_is_drawn_once_provided() {
+        // As Mail's parse jail writes it: the picture's size declared.
+        let doc = br#"<html><body><p>Hello</p><img src="mail-res:0" width="40" height="300"><p>after</p></body></html>"#;
+        let mut p = Provided::default();
+        assert_eq!(pictures_drawn(doc, &p), 0, "a placeholder until provided");
+        // Provided before Load: it belongs to the next document.
+        assert!(p.provide("mail-res:0".into(), png(40, 300), false));
+        assert_eq!(pictures_drawn(doc, &p), 0);
+        p.load();
+        assert_eq!(pictures_drawn(doc, &p), 1);
+        // A picture whose size the document doesn't declare is laid out at
+        // its own size once provided.
+        let bare = br#"<html><body><img src="mail-res:0"></body></html>"#;
+        assert_eq!(pictures_drawn(bare, &p), 1);
+        // Another document (the next message) starts with nothing.
+        p.load();
+        assert_eq!(pictures_drawn(doc, &p), 0);
+        // Not a picture: left out. Over the limits: refused.
+        assert!(p.provide("mail-res:1".into(), b"<script>".to_vec(), true));
+        assert!(p.resources().0.is_empty());
+        assert!(!p.provide("big".into(), vec![0; navigator_image::image::MAX_ENCODED_IMAGE_BYTES + 1], true));
     }
 }

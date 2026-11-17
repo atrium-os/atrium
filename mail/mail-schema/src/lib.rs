@@ -197,7 +197,16 @@ pub struct Document {
     pub resources: Vec<Resource>,
     /// What was removed or could not be shown, by reason, with a count.
     pub dropped: Vec<(String, u32)>,
+    /// The bytes of the pictures the message carries itself (`cid:` parts
+    /// and `data:` URLs), by resource id, for the document viewer; never
+    /// decoded by the engine or Mail (§7.3).
+    pub pictures: Vec<(String, Vec<u8>)>,
 }
+
+/// The most pictures a document carries, each one's largest size, and all of them together.
+pub const PICTURES_MAX: usize = 64;
+pub const PICTURE_BYTES_MAX: usize = 16 << 20;
+pub const PICTURES_BYTES_MAX: usize = 32 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source { Cid(String), Remote(String), Data(String) }
@@ -317,6 +326,16 @@ impl Opened {
                 let u = match &r.source { Source::Cid(s) | Source::Remote(s) => s.len(), Source::Data(s) => s.len().min(c.url) };
                 if u > c.url { return Err(Lie("resource url too long")) }
             }
+            if d.pictures.len() > PICTURES_MAX { return Err(Lie("too many pictures")) }
+            let mut total = 0usize;
+            for (id, b) in &d.pictures {
+                // Only the message's own pictures: a remote one is fetched by the engine, never handed over.
+                let own = d.resources.iter().any(|r| r.id == *id && matches!(r.source, Source::Cid(_) | Source::Data(_)));
+                if !own { return Err(Lie("picture for no inline resource")) }
+                if b.len() > PICTURE_BYTES_MAX || b.len() as u64 > raw_len { return Err(Lie("picture too large")) }
+                total += b.len();
+            }
+            if total > PICTURES_BYTES_MAX { return Err(Lie("pictures too large")) }
         }
         if self.unpacked.len() > c.unpacked { return Err(Lie("too many unpacked files")) }
         for u in &self.unpacked {
@@ -379,4 +398,33 @@ pub fn read_frame<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> io::Result
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     postcard::from_bytes(&buf).map(Some).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pictures_are_only_the_message_s_own() {
+        let res = |id: &str, source: Source| Resource { id: id.into(), source, used_as: Use::Image, hidden: false };
+        let mut o = Opened {
+            summary: Summary::default(),
+            document: Some(Document {
+                html: String::new(),
+                resources: vec![res("mail-res:0", Source::Cid("a@b".into())), res("mail-res:1", Source::Remote("https://x.example/p.png".into()))],
+                dropped: vec![],
+                pictures: vec![("mail-res:0".into(), vec![1; 10])],
+            }),
+            unpacked: vec![],
+        };
+        let c = Caps::default();
+        assert_eq!(o.check(&c, 100), Ok(()));
+        // A remote picture is the engine's to fetch, never the jail's to hand over.
+        o.document.as_mut().unwrap().pictures = vec![("mail-res:1".into(), vec![1; 10])];
+        assert_eq!(o.check(&c, 100), Err(Lie("picture for no inline resource")));
+        o.document.as_mut().unwrap().pictures = vec![("mail-res:9".into(), vec![1; 10])];
+        assert!(o.check(&c, 100).is_err());
+        o.document.as_mut().unwrap().pictures = vec![("mail-res:0".into(), vec![1; 101])];
+        assert_eq!(o.check(&c, 100), Err(Lie("picture too large")));
+    }
 }

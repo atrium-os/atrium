@@ -45,7 +45,7 @@ pub fn part_bytes(raw: &[u8], part: &Part) -> Vec<u8> {
     decode_body(body, &part.transfer_encoding, usize::MAX)
 }
 
-fn decode_body(body: &[u8], cte: &str, cap: usize) -> Vec<u8> {
+pub(crate) fn decode_body(body: &[u8], cte: &str, cap: usize) -> Vec<u8> {
     match cte {
         "base64" => base64(body, cap),
         "quoted-printable" => quoted_printable(body, false, cap),

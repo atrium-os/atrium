@@ -130,3 +130,36 @@ fn the_engine_refuses_a_lying_frame() {
     assert!(wire::read_frame::<FromJail>(&mut big.as_slice()).is_err());
     let _ = std::io::sink().flush();
 }
+
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut e = png::Encoder::new(&mut out, w, h);
+    e.set_color(png::ColorType::Rgb);
+    e.write_header().unwrap().write_image_data(&vec![120u8; (w * h * 3) as usize]).unwrap();
+    out
+}
+
+#[test]
+fn a_message_s_own_pictures_come_with_its_document() {
+    let logo = png(120, 40);
+    let dot = png(2, 2);
+    let raw = format!(
+        "From: Shop <news@shop.example>\r\nTo: p@example.org\r\nSubject: New\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n\
+--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hi</p><img src=\"cid:logo@shop\"><img src=\"data:image/png;base64,{}\" width=\"2\" height=\"2\"><img src=\"cid:missing@shop\" width=\"10\" height=\"10\"><img src=\"https://cdn.example/a.png\" width=\"50\" height=\"50\">\r\n\
+--b\r\nContent-Type: image/png\r\nContent-ID: <logo@shop>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--b--\r\n",
+        b64(&dot), b64(&logo)).into_bytes();
+    let mut e = Engine::start();
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
+    let out = e.run(raw.len() as u64, &|_| None);
+    let FromJail::Opened { id: 9, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
+    let d = o.document.as_ref().unwrap();
+    let id_of = |src: &wire::Source| d.resources.iter().find(|r| r.source == *src).map(|r| r.id.clone()).unwrap();
+    let logo_id = id_of(&wire::Source::Cid("logo@shop".into()));
+    let got: Vec<&str> = d.pictures.iter().map(|(i, _)| i.as_str()).collect();
+    assert_eq!(got.len(), 2, "the cid part and the data URL, not the missing part or the remote one: {got:?}");
+    assert_eq!(d.pictures.iter().find(|(i, _)| *i == logo_id).unwrap().1, logo);
+    // The logo declared no size: its real one is in the document.
+    assert!(d.html.contains(&format!("src=\"{logo_id}\" width=\"120\" height=\"40\"")) || d.html.contains(&format!("src=\"{logo_id}\" class")), "{}", d.html);
+    assert!(d.html.contains("width=\"120\""), "{}", d.html);
+    e.finish();
+}

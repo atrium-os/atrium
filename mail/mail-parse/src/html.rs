@@ -331,13 +331,39 @@ fn property_before(prefix: &str) -> &str {
     stmt.split(':').next().unwrap_or("").trim()
 }
 
+/// The bytes a `data:` URL carries (base64 or percent-encoded), when at
+/// most `cap`.
+pub fn data_url(s: &str, cap: usize) -> Option<Vec<u8>> {
+    let rest = s.get(..5).filter(|p| p.eq_ignore_ascii_case("data:")).map(|_| &s[5..])?;
+    let (meta, payload) = rest.split_once(',')?;
+    let bytes = if meta.trim().to_ascii_lowercase().ends_with(";base64") {
+        crate::mime::decode_body(payload.as_bytes(), "base64", cap.saturating_add(1))
+    } else {
+        let b = payload.as_bytes();
+        let mut out = Vec::with_capacity(b.len().min(cap + 1));
+        let mut i = 0;
+        while i < b.len() && out.len() <= cap {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) { out.push(h << 4 | l); i += 3; continue }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
+    };
+    (bytes.len() <= cap).then_some(bytes)
+}
+
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Byte by byte: a `%` before a multi-byte character must not slice it.
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) { out.push(v); i += 3; continue }
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) { out.push(h << 4 | l); i += 3; continue }
         }
         out.push(b[i]);
         i += 1;
