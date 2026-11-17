@@ -1645,6 +1645,33 @@ impl TextDoc {
             || self.styles.styles.iter().enumerate().any(|(i, s)| i != id as usize && (s.parent == Some(id) || s.next == Some(id)))
     }
 
+    /// Whether `s` may be style `id` (a change, or a new one just past the
+    /// last): a name of its own, references inside the table, no loop
+    /// through parents, no kind change, Normal a paragraph style on nothing.
+    pub fn style_fits(&self, id: StyleId, s: &Style) -> bool {
+        let n = self.styles.styles.len();
+        let i = id as usize;
+        let len = if i == n { n + 1 } else { n };
+        if i > n || len > MAX_STYLES {
+            return false;
+        }
+        let refs_ok = [s.parent, s.next].into_iter().flatten().all(|r| (r as usize) < len) && s.parent != Some(id);
+        let name_ok = !s.name.trim().is_empty() && s.name.len() <= 255 && !self.styles.styles.iter().enumerate().any(|(k, x)| k != i && x.name == s.name);
+        let normal_ok = i != 0 || (s.kind == StyleKind::Para && s.parent.is_none());
+        if !refs_ok || !name_ok || !normal_ok || (i < n && self.styles.styles[i].kind != s.kind) {
+            return false;
+        }
+        let mut at = s.parent;
+        for _ in 0..MAX_STYLE_DEPTH {
+            match at {
+                Some(q) if q == id => return false,
+                Some(q) => at = self.styles.styles.get(q as usize).and_then(|x| x.parent),
+                None => break,
+            }
+        }
+        true
+    }
+
     /// The body paragraphs whose look style `id` decides (it or a style
     /// based on it): the first and one past the last, if any.
     pub fn style_span(&self, id: StyleId) -> Option<(usize, usize)> {

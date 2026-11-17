@@ -443,26 +443,8 @@ impl TextOp {
                         TextOp::SetStyle { id, style: old }
                     }
                     Some(s) => {
-                        let len = if i == n { n + 1 } else { n };
-                        let refs_ok = [s.parent, s.next].into_iter().flatten().all(|r| (r as usize) < len) && s.parent != Some(id);
-                        let name_ok = !s.name.trim().is_empty() && s.name.len() <= 255 && !d.styles.styles.iter().enumerate().any(|(k, x)| k != i && x.name == s.name);
-                        // Normal stays a paragraph style based on nothing.
-                        let normal_ok = i != 0 || (s.kind == crate::model::StyleKind::Para && s.parent.is_none());
-                        if i > n || len > crate::model::MAX_STYLES || !refs_ok || !name_ok || !normal_ok {
+                        if !d.style_fits(id, &s) {
                             return TextOp::Nop;
-                        }
-                        // A kind change would leave paragraphs on a character style.
-                        if i < n && d.styles.styles[i].kind != s.kind {
-                            return TextOp::Nop;
-                        }
-                        // No loop through parents.
-                        let mut at = s.parent;
-                        for _ in 0..crate::model::MAX_STYLE_DEPTH {
-                            match at {
-                                Some(q) if q == id => return TextOp::Nop,
-                                Some(q) => at = d.styles.styles.get(q as usize).and_then(|x| x.parent),
-                                None => break,
-                            }
                         }
                         if i == n {
                             d.styles.styles.push(s);
