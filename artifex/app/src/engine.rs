@@ -51,7 +51,13 @@ enum Job {
     Task { label: String, cwd: String },
     Git,
     Home,
+    Check { project: String },
+    Templates,
+    New { dir: String },
 }
+
+/// Files that make a folder a project (its tasks, its composition).
+const PROJECT_FILES: [&str; 8] = ["Cargo.toml", "atrium.toml", "meson.build", "CMakeLists.txt", "Makefile", "makefile", "BSDmakefile", "GNUmakefile"];
 
 pub struct Engine {
     exec: Box<dyn Exec>,
@@ -206,7 +212,7 @@ impl Engine {
             }
             Act::Problem(i) => {
                 if let Some(p) = s.problems.get(i).cloned() {
-                    let cwd = s.tasks.first().map(|t| t.cwd.clone()).unwrap_or_default();
+                    let cwd = s.project.clone();
                     let rel = match (&self.remote_root, p.file.starts_with('/')) {
                         (Some(r), true) => p.file.strip_prefix(&format!("{r}/")).map(str::to_string),
                         (_, true) => None,
@@ -233,9 +239,123 @@ impl Engine {
                 self.tree.refresh();
                 self.next_git = Instant::now();
             }
+            Act::NewProject => {
+                if self.ws.is_some() {
+                    s.creating = true;
+                    s.template = 0;
+                    if s.templates.is_empty() {
+                        let argv: Vec<String> = crate::composition::TEMPLATES_ARGV.iter().map(|a| a.to_string()).collect();
+                        self.start_job(Job::Templates, &argv, "", s);
+                    }
+                }
+            }
+            Act::CancelNew => s.creating = false,
+            Act::Template(i) => s.template = i.min(s.templates.len().saturating_sub(1)),
+            Act::Create(name) => self.create(&name, s),
+            Act::Check => self.check(s),
         }
         self.sync_tabs(s);
+        if self.active != before {
+            self.follow_project(s);
+        }
         self.active != before
+    }
+
+    /// Why `name` can't be a new project folder, if it can't.
+    pub fn new_problem(&self, name: &str) -> Option<String> {
+        let n = name.trim();
+        if n.is_empty() {
+            Some("Give it a name".into())
+        } else if !crate::composition::valid_project(n) {
+            Some("Lowercase letters, digits, - and _, starting with a letter".into())
+        } else if self.root.join(n).exists() {
+            Some(format!("There is a {n} in work already"))
+        } else {
+            None
+        }
+    }
+
+    fn create(&mut self, name: &str, s: &mut State) {
+        let name = name.trim().to_string();
+        if let Some(why) = self.new_problem(&name) {
+            s.note = Some((why, true));
+            return;
+        }
+        let template = s.templates.get(s.template).map(|t| t.0.clone()).unwrap_or_else(|| "app".into());
+        let argv: Vec<String> = ["cargo", "atrium", "new", &name, "--template", &template].iter().map(|a| a.to_string()).collect();
+        s.output = format!("$ {}\n", argv.join(" "));
+        s.panel = Panel::Output;
+        s.panel_open = true;
+        if self.start_job(Job::New { dir: name.clone() }, &argv, "", s) {
+            s.creating = false;
+            s.running = Some(format!("Making {name}"));
+        }
+    }
+
+    /// The project folder `rel` is in: the nearest folder up from it with
+    /// a build file or a manifest, else `work` itself.
+    pub fn project_of(&self, rel: &str) -> String {
+        let mut dir: Vec<&str> = rel.split('/').collect();
+        dir.pop();
+        loop {
+            let d = dir.join("/");
+            let path = if d.is_empty() { self.root.clone() } else { self.root.join(&d) };
+            if PROJECT_FILES.iter().any(|f| path.join(f).is_file()) || dir.is_empty() {
+                return d;
+            }
+            dir.pop();
+        }
+    }
+
+    /// The active file moved to another project: its tasks, its composition.
+    fn follow_project(&mut self, s: &mut State) {
+        let Some(rel) = self.active.and_then(|i| self.docs.get(i)).map(|d| d.rel.clone()) else { return };
+        let p = self.project_of(&rel);
+        if p != s.project || s.tasks.is_empty() {
+            self.set_project(&p, s);
+        }
+    }
+
+    fn set_project(&mut self, p: &str, s: &mut State) {
+        s.project = p.to_string();
+        let dir = if p.is_empty() { self.root.clone() } else { self.root.join(p) };
+        s.tasks = tasks::detect(&dir, p);
+        self.load_composition(s);
+    }
+
+    fn load_composition(&mut self, s: &mut State) {
+        let p = s.project.clone();
+        let dir = if p.is_empty() { self.root.clone() } else { self.root.join(&p) };
+        s.composition = match std::fs::read_to_string(dir.join("atrium.toml")) {
+            Ok(text) => Some(crate::composition::read(&p, &text).unwrap_or_else(|e| crate::composition::Composition {
+                project: p.clone(),
+                check_error: Some(e),
+                checked: true,
+                ..Default::default()
+            })),
+            Err(_) => None,
+        };
+        if s.composition.is_some() {
+            self.check(s);
+        } else if s.panel == Panel::Composition {
+            s.panel = Panel::Output;
+        }
+    }
+
+    fn check(&mut self, s: &mut State) {
+        let Some(c) = &mut s.composition else { return };
+        if self.jobs.iter().any(|(j, _, _)| matches!(j, Job::Check { .. })) {
+            return;
+        }
+        c.checked = false;
+        let project = c.project.clone();
+        let argv: Vec<String> = crate::composition::CHECK_ARGV.iter().map(|a| a.to_string()).collect();
+        if !self.start_job(Job::Check { project: project.clone() }, &argv, &project, s) {
+            if let Some(c) = &mut s.composition {
+                c.checked = true;
+                c.check_error = Some("can't run cargo atrium check".into());
+            }
+        }
     }
 
     fn use_ws(&mut self, ws: &str, s: &mut State) {
@@ -258,8 +378,10 @@ impl Engine {
         self.root = root.clone();
         self.tree = Tree::new(root.clone());
         s.ws = Some(ws.to_string());
-        s.tasks = tasks::detect(&root, "");
         s.git = None;
+        s.creating = false;
+        s.templates.clear();
+        self.set_project("", s);
         s.problems.clear();
         s.output.clear();
         s.lsp = None;
@@ -386,6 +508,10 @@ impl Engine {
                 }
                 self.next_git = Instant::now();
                 self.tree.refresh();
+                if title_of(&self.docs[i].rel) == "atrium.toml" || PROJECT_FILES.contains(&title_of(&self.docs[i].rel).as_str()) {
+                    let p = s.project.clone();
+                    self.set_project(&p, s);
+                }
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -605,9 +731,7 @@ impl Engine {
                 Job::Task { label, cwd } => {
                     s.running = None;
                     s.problems = tasks::problems(&s.output);
-                    if let Some(t) = s.tasks.first_mut() {
-                        t.cwd = cwd;
-                    }
+                    let _ = cwd;
                     let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
                     s.note = Some(if errors > 0 {
                         (format!("{label}: {errors} errors"), true)
@@ -619,11 +743,42 @@ impl Engine {
                     }
                     self.tree.refresh();
                     self.next_git = Instant::now();
+                    if s.composition.is_some() {
+                        self.check(s);
+                    }
                 }
                 Job::Git => {
                     // Not a repository (or no git): no status shown.
                     let st = crate::git::parse(&buf);
                     s.git = (st.branch.is_some() || !st.files.is_empty()).then_some(st);
+                }
+                Job::Check { project } => {
+                    if let Some(c) = s.composition.as_mut().filter(|c| c.project == project) {
+                        c.take_check(&buf);
+                    }
+                }
+                Job::Templates => {
+                    s.templates = crate::composition::templates(&buf);
+                    if s.templates.is_empty() {
+                        s.note = Some(("No project templates: cargo atrium isn't in this workspace (it comes with the Rust toolchain layer)".into(), true));
+                    }
+                }
+                Job::New { dir } => {
+                    s.output.push_str(&String::from_utf8_lossy(&buf));
+                    s.running = None;
+                    self.tree.refresh();
+                    let main = ["src/main.rs", "atrium.toml", "Cargo.toml"].iter().map(|f| format!("{dir}/{f}"))
+                        .find(|f| self.root.join(f).is_file());
+                    match main {
+                        Some(f) => {
+                            s.note = Some((format!("Made {dir}"), false));
+                            self.open(&f, s);
+                            self.sync_tabs(s);
+                            self.follow_project(s);
+                            s.panel = Panel::Composition;
+                        }
+                        None => s.note = Some((format!("{dir} wasn't made: see the output"), true)),
+                    }
                 }
                 Job::Home => {
                     let home = String::from_utf8_lossy(&buf).trim().to_string();
@@ -699,6 +854,7 @@ impl Engine {
                 self.open(&rel, s);
                 self.goto(l, None, Some((c, enc)));
                 self.sync_tabs(s);
+                self.follow_project(s);
             }
         }
     }
@@ -720,7 +876,7 @@ impl Engine {
                 diags.push((g.start.0, sev, g.message.clone()));
             }
         }
-        let cwd = s.tasks.first().map(|t| t.cwd.clone()).unwrap_or_default();
+        let cwd = s.project.clone();
         for p in &s.problems {
             if join_rel(&cwd, &p.file).as_deref() == Some(d.rel.as_str()) && p.severity != Severity::Note {
                 let line = p.line.saturating_sub(1);
@@ -898,6 +1054,46 @@ mod tests {
         let g = s.git.clone().expect("git status");
         assert_eq!(g.branch.as_deref(), Some("main"));
         assert_eq!(g.files.get("hello.c"), Some(&crate::git::Change::Untracked));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn projects_and_their_composition() {
+        let (d, mut e, mut s) = setup("proj");
+        std::fs::create_dir_all(d.join("proj/app/src")).unwrap();
+        std::fs::write(d.join("proj/app/Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(d.join("proj/app/atrium.toml"), "[app]\nid = \"org.example.app\"\nentry = \"bin/app\"\n\n[[workers]]\nname = \"parse\"\nentry = \"bin/app-parse\"\n").unwrap();
+        std::fs::write(d.join("proj/app/src/main.rs"), "fn main() {}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        assert_eq!(s.project, "");
+        assert!(s.composition.is_none());
+        assert_eq!(e.project_of("app/src/main.rs"), "app");
+        assert_eq!(e.project_of("hello.c"), "");
+        assert_eq!(e.project_of("src/notes.md"), "");
+        e.act(Act::Open("app/src/main.rs".into()), &mut s);
+        assert_eq!(s.project, "app");
+        assert_eq!(s.tasks[0].argv[0], "cargo");
+        assert_eq!(s.tasks[0].cwd, "app");
+        let c = s.composition.clone().unwrap();
+        assert_eq!(c.workers.len(), 1);
+        // The check runs in the workspace; this host may have no cargo
+        // atrium: either way it answers.
+        for _ in 0..1000 {
+            e.tick(&mut s);
+            if s.composition.as_ref().is_some_and(|c| c.checked) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(s.composition.as_ref().unwrap().checked);
+        // Back to a file outside it.
+        e.act(Act::Open("hello.c".into()), &mut s);
+        assert_eq!(s.project, "");
+        assert!(s.composition.is_none());
+        assert_eq!(e.new_problem("app").as_deref(), Some("There is a app in work already"));
+        assert!(e.new_problem("Bad").is_some());
+        assert!(e.new_problem("fresh").is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

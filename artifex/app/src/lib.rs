@@ -6,6 +6,7 @@
 //! Artifex itself holds no compilers and reaches nothing the workspace
 //! doesn't.
 
+pub mod composition;
 pub mod engine;
 pub mod exec;
 pub mod git;

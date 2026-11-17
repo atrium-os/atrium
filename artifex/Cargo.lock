@@ -36,10 +36,12 @@ name = "artifex"
 version = "0.1.0"
 dependencies = [
  "artifex-syntax",
+ "fresco-protocol",
  "libc",
  "pergola",
  "portcullis-ipc",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
