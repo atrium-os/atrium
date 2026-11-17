@@ -297,8 +297,11 @@ impl Connect for Net {
 struct Vault;
 
 impl MailVault for Vault {
-    fn login(&mut self, _: &[u8; 16]) -> Result<(String, LockedBuf), Refusal> {
-        Ok(("priya@example.org".into(), LockedBuf::from_slice(b"hunter2").unwrap()))
+    fn login(&mut self, _: &[u8; 16]) -> Result<(String, arca_courier::mail::Secret), Refusal> {
+        Ok(("priya@example.org".into(), arca_courier::mail::Secret::Password(LockedBuf::from_slice(b"hunter2").unwrap())))
+    }
+    fn refreshed(&mut self, _: &[u8; 16], _: &LockedBuf) -> Result<(), Refusal> {
+        Err(Refusal::Denied)
     }
     fn anomaly(&mut self, _: u8, _: &str) {}
 }

@@ -39,6 +39,7 @@ dependencies = [
  "arcad",
  "libc",
  "navigator-fetch",
+ "ring",
  "rustls",
  "rustls-pki-types",
 ]

@@ -87,6 +87,7 @@ dependencies = [
  "arcad",
  "libc",
  "navigator-fetch",
+ "ring",
  "rustls",
  "rustls-pki-types",
 ]
@@ -150,6 +151,18 @@ checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
 ]
+
+[[package]]
+name = "atrium-links"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "url",
+]
+
+[[package]]
+name = "atrium-types"
+version = "0.1.0"
 
 [[package]]
 name = "base16ct"
@@ -1072,7 +1085,10 @@ dependencies = [
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
+ "atrium-types",
  "hex",
+ "portcullis-peer",
  "portcullis-toml",
  "serde",
  "sha2",
@@ -1083,6 +1099,8 @@ dependencies = [
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
+ "atrium-types",
  "serde",
  "thiserror 1.0.69",
  "toml",

@@ -25,14 +25,74 @@ use arca_store::Scheme;
 use navigator_fetch::{addr, Connect, Conversation};
 
 use crate::mail_filter::{self, Stop};
+use crate::oauth;
 use crate::schema::Refusal;
 
 /// Arca, as a mail courier sees it.
 pub trait MailVault {
     /// The item's account name and secret (arcad `courier_op::LOGIN`).
-    fn login(&mut self, item: &[u8; 16]) -> Result<(String, LockedBuf), Refusal>;
+    fn login(&mut self, item: &[u8; 16]) -> Result<(String, Secret), Refusal>;
+    /// The provider rotated the refresh token: `grant` replaces the OAuth
+    /// item's value (arcad `courier_op::REFRESHED`).
+    fn refreshed(&mut self, item: &[u8; 16], grant: &LockedBuf) -> Result<(), Refusal>;
     /// An exact anomaly, by name (arcad `courier_op::ANOMALY`).
     fn anomaly(&mut self, code: u8, detail: &str);
+}
+
+/// What an item holds.
+pub enum Secret {
+    Password(LockedBuf),
+    /// An [`oauth::grant`] record: traded for an access token first.
+    OAuth(LockedBuf),
+}
+
+/// What logs in: a password, or an access token fresh from the provider.
+enum Cred {
+    Plain(LockedBuf),
+    Bearer(LockedBuf),
+}
+
+/// What a login needs beyond the mail connection: the way to the token
+/// endpoint, and the providers a grant may name.
+struct Ctx<'a> {
+    net: &'a (dyn Connect + Sync),
+    tls: &'a Arc<rustls::ClientConfig>,
+    policy: addr::Policy,
+    providers: &'a [oauth::Provider],
+}
+
+/// Ask Arca (only now, past TLS to the bound host), and for an OAuth item
+/// get an access token, handing a rotated refresh token back to Arca.
+fn credential(cx: &Ctx<'_>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<(String, Cred), Refusal> {
+    let (account, secret) = vault.login(item)?;
+    match secret {
+        Secret::Password(p) => {
+            if !sendable(&account, &p) {
+                return Err(Refusal::Unsendable);
+            }
+            Ok((account, Cred::Plain(p)))
+        }
+        Secret::OAuth(g) => {
+            let grant = oauth::parse_grant(g.as_ref()).ok_or(Refusal::Denied)?;
+            let p = oauth::provider(cx.providers, grant.provider).ok_or(Refusal::Denied)?;
+            let t = oauth::refresh(p, grant.client_id, grant.refresh, cx.net, cx.tls, cx.policy).map_err(|e| match e {
+                oauth::RefreshError::SignInAgain => Refusal::SignInAgain,
+                oauth::RefreshError::Failed(r) => r,
+            })?;
+            if let Some(new) = &t.refresh {
+                if new.as_ref() != grant.refresh {
+                    let ng = oauth::grant(grant.provider, grant.client_id, new.as_ref())?;
+                    // Not kept: the old one may already be spent, so say so
+                    // rather than log in with a token Arca can't renew.
+                    vault.refreshed(item, &ng)?;
+                }
+            }
+            if !sendable(&account, &t.access) {
+                return Err(Refusal::Unsendable);
+            }
+            Ok((account, Cred::Bearer(t.access)))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,14 +242,19 @@ fn plain_line(prefix: &[u8], account: &str, secret: &LockedBuf, suffix: &[u8]) -
         r[1 + account.len()] = 0;
         r[2 + account.len()..].copy_from_slice(secret.as_ref());
     }
-    let enc_len = raw_len.div_ceil(3) * 4;
+    b64_line(prefix, raw.as_ref(), suffix)
+}
+
+/// `raw` base64-encoded between `prefix` and `suffix`, in locked memory.
+pub(crate) fn b64_line(prefix: &[u8], raw: &[u8], suffix: &[u8]) -> Result<LockedBuf, Refusal> {
+    let enc_len = raw.len().div_ceil(3) * 4;
     let mut out = LockedBuf::zeroed(prefix.len() + enc_len + suffix.len()).map_err(|_| Refusal::Internal)?;
     // Encode straight into the locked buffer, a chunk at a time.
     let o = out.as_mut();
     o[..prefix.len()].copy_from_slice(prefix);
     let mut at = prefix.len();
     let mut tmp = Vec::with_capacity(4);
-    for c in raw.as_ref().chunks(3) {
+    for c in raw.chunks(3) {
         tmp.clear();
         b64(c, &mut tmp);
         o[at..at + 4].copy_from_slice(&tmp);
@@ -263,7 +328,7 @@ fn imap_until(l: &mut Lines, tag: &[u8], caps: &mut Option<Vec<String>>, mut on_
     }
 }
 
-fn imap_login(l: &mut Lines, ep: &MailEndpoint, tls: &Arc<rustls::ClientConfig>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<Result<Vec<String>, ()>, Refusal> {
+fn imap_login(l: &mut Lines, ep: &MailEndpoint, cx: &Ctx<'_>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<Result<Vec<String>, ()>, Refusal> {
     let greeting = l.line()?;
     if !starts(&greeting, b"* OK") {
         return Err(Refusal::Http);
@@ -274,7 +339,7 @@ fn imap_login(l: &mut Lines, ep: &MailEndpoint, tls: &Arc<rustls::ClientConfig>,
         if !imap_until(l, b"A0", &mut None, None)? {
             return Err(Refusal::Tls);
         }
-        l.starttls(tls, &ep.host)?;
+        l.starttls(cx.tls, &ep.host)?;
         caps = None; // what was said in the clear is not believed
     }
     if caps.is_none() {
@@ -285,31 +350,52 @@ fn imap_login(l: &mut Lines, ep: &MailEndpoint, tls: &Arc<rustls::ClientConfig>,
     let has = |c: &str| caps_before.iter().any(|x| x.eq_ignore_ascii_case(c));
 
     // Only now, past TLS to the bound host: ask Arca.
-    let (account, secret) = vault.login(item)?;
-    if !sendable(&account, &secret) {
-        return Err(Refusal::Unsendable);
-    }
+    let (account, cred) = credential(cx, item, vault)?;
+    let (mech, line): (&[u8], LockedBuf) = match &cred {
+        Cred::Plain(p) => (b"PLAIN", plain_line(b"", &account, p, b"\r\n")?),
+        Cred::Bearer(t) => {
+            if !has("AUTH=XOAUTH2") {
+                return Err(Refusal::Denied);
+            }
+            (b"XOAUTH2", oauth::xoauth2_line(b"", &account, t, b"\r\n")?)
+        }
+    };
+    drop(cred);
     let mut after: Option<Vec<String>> = None;
-    let ok = if has("SASL-IR") {
-        let line = plain_line(b"A2 AUTHENTICATE PLAIN ", &account, &secret, b"\r\n")?;
-        l.send(line.as_ref())?;
-        drop(line);
-        imap_until(l, b"A2", &mut after, None)?
+    let ir = has("SASL-IR");
+    let mut cmd = b"A2 AUTHENTICATE ".to_vec();
+    cmd.extend_from_slice(mech);
+    let ok = if ir {
+        let mut first = LockedBuf::zeroed(cmd.len() + 1 + line.len()).map_err(|_| Refusal::Internal)?;
+        {
+            let f = first.as_mut();
+            f[..cmd.len()].copy_from_slice(&cmd);
+            f[cmd.len()] = b' ';
+            f[cmd.len() + 1..].copy_from_slice(line.as_ref());
+        }
+        l.send(first.as_ref())?;
+        drop(first);
+        // A challenge after the initial response is a failure's details
+        // (XOAUTH2 sends them as JSON): answer empty to end the exchange;
+        // for PLAIN, cancel (RFC 9051 §6.2.2).
+        let bearer = mech == b"XOAUTH2";
+        let mut answer = |l: &mut Lines| -> Result<(), Refusal> { l.send(if bearer { b"\r\n" } else { b"*\r\n" }) };
+        imap_until(l, b"A2", &mut after, Some(&mut answer))?
     } else {
-        l.send(b"A2 AUTHENTICATE PLAIN\r\n")?;
+        cmd.extend_from_slice(b"\r\n");
+        l.send(&cmd)?;
         let mut sent = false;
+        let bearer = mech == b"XOAUTH2";
         let mut answer = |l: &mut Lines| -> Result<(), Refusal> {
             if sent {
-                // A second challenge: cancel (RFC 9051 §6.2.2).
-                return l.send(b"*\r\n");
+                return l.send(if bearer { b"\r\n" } else { b"*\r\n" });
             }
             sent = true;
-            let line = plain_line(b"", &account, &secret, b"\r\n")?;
             l.send(line.as_ref())
         };
         imap_until(l, b"A2", &mut after, Some(&mut answer))?
     };
-    drop(secret);
+    drop(line);
     if !ok {
         return Ok(Err(()));
     }
@@ -341,7 +427,8 @@ fn smtp_reply(l: &mut Lines) -> Result<(u16, Vec<String>), Refusal> {
     Err(Refusal::Http)
 }
 
-fn smtp_login(l: &mut Lines, ep: &MailEndpoint, tls: &Arc<rustls::ClientConfig>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<Result<Vec<u8>, ()>, Refusal> {
+fn smtp_login(l: &mut Lines, ep: &MailEndpoint, cx: &Ctx<'_>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<Result<Vec<u8>, ()>, Refusal> {
+    let tls = cx.tls;
     let (code, _) = smtp_reply(l)?;
     if code != 220 {
         return Err(Refusal::Http);
@@ -360,18 +447,33 @@ fn smtp_login(l: &mut Lines, ep: &MailEndpoint, tls: &Arc<rustls::ClientConfig>,
         l.starttls(tls, &ep.host)?;
     }
     l.send(ehlo.as_bytes())?;
-    if smtp_reply(l)?.0 != 250 {
+    let (code, offered) = smtp_reply(l)?;
+    if code != 250 {
         return Err(Refusal::Http);
     }
-    let (account, secret) = vault.login(item)?;
-    if !sendable(&account, &secret) {
-        return Err(Refusal::Unsendable);
-    }
-    let line = plain_line(b"AUTH PLAIN ", &account, &secret, b"\r\n")?;
+    let (account, cred) = credential(cx, item, vault)?;
+    let line = match &cred {
+        Cred::Plain(p) => plain_line(b"AUTH PLAIN ", &account, p, b"\r\n")?,
+        Cred::Bearer(t) => {
+            let auth = offered.iter().any(|o| {
+                let u = o.to_ascii_uppercase();
+                u.starts_with("AUTH ") && u.split(' ').any(|m| m == "XOAUTH2")
+            });
+            if !auth {
+                return Err(Refusal::Denied);
+            }
+            oauth::xoauth2_line(b"AUTH XOAUTH2 ", &account, t, b"\r\n")?
+        }
+    };
+    drop(cred);
     l.send(line.as_ref())?;
     drop(line);
-    drop(secret);
-    let (code, _) = smtp_reply(l)?;
+    let (mut code, _) = smtp_reply(l)?;
+    if code == 334 {
+        // XOAUTH2's failure details: an empty answer ends it (535 follows).
+        l.send(b"\r\n")?;
+        code = smtp_reply(l)?.0;
+    }
     if code != 235 {
         return Ok(Err(()));
     }
@@ -415,6 +517,8 @@ fn connect(ep: &MailEndpoint, net: &(dyn Connect + Sync), tls: &Arc<rustls::Clie
 fn refusal_text(imap: bool, why: Refusal) -> &'static [u8] {
     match (imap, why) {
         (true, Refusal::Locked) => b"* BYE [UNAVAILABLE] Arca is locked\r\n",
+        (true, Refusal::SignInAgain) => b"* BYE [AUTHENTICATIONFAILED] Sign in again\r\n",
+        (false, Refusal::SignInAgain) => b"535 5.7.8 Sign in again\r\n",
         (true, Refusal::NotVerified) => b"* BYE [AUTHENTICATIONFAILED] Not confirmed\r\n",
         (true, Refusal::Denied | Refusal::Unsendable) => b"* BYE [AUTHENTICATIONFAILED] No sign-in for this server\r\n",
         (true, _) => b"* BYE [UNAVAILABLE] Cannot reach the mail server securely\r\n",
@@ -432,10 +536,27 @@ pub fn session(
     net: &(dyn Connect + Sync),
     tls: Arc<rustls::ClientConfig>,
     policy: addr::Policy,
+    cin: impl Read + AsRawFd,
+    cout: impl Write,
+    vault: &mut dyn MailVault,
+) -> Ended {
+    session_with(ep, net, tls, policy, oauth::PROVIDERS, cin, cout, vault)
+}
+
+/// [`session`] with the OAuth providers a grant may name (tests: one on
+/// loopback).
+#[allow(clippy::too_many_arguments)]
+pub fn session_with(
+    ep: &MailEndpoint,
+    net: &(dyn Connect + Sync),
+    tls: Arc<rustls::ClientConfig>,
+    policy: addr::Policy,
+    providers: &[oauth::Provider],
     mut cin: impl Read + AsRawFd,
     mut cout: impl Write,
     vault: &mut dyn MailVault,
 ) -> Ended {
+    let cx = Ctx { net, tls: &tls, policy, providers };
     let imap = ep.scheme.is_imap();
     let item = match read_hello(&mut cin) {
         Ok(i) => i,
@@ -447,13 +568,13 @@ pub fn session(
         Err(e) => { tell(&mut cout, refusal_text(imap, e)); return Ended::NotLoggedIn(e) }
     };
     let greeting = if imap {
-        match imap_login(&mut lines, ep, &tls, &item, vault) {
+        match imap_login(&mut lines, ep, &cx, &item, vault) {
             Ok(Ok(caps)) => format!("* PREAUTH [CAPABILITY {}] Logged in by Arca\r\n", caps.join(" ")).into_bytes(),
             Ok(Err(())) => { tell(&mut cout, b"* BYE [AUTHENTICATIONFAILED] The server refused the sign-in\r\n"); return Ended::LoginFailed }
             Err(e) => { tell(&mut cout, refusal_text(true, e)); return Ended::NotLoggedIn(e) }
         }
     } else {
-        match smtp_login(&mut lines, ep, &tls, &item, vault) {
+        match smtp_login(&mut lines, ep, &cx, &item, vault) {
             Ok(Ok(r)) => r,
             Ok(Err(())) => { tell(&mut cout, b"535 5.7.8 The server refused the sign-in\r\n"); return Ended::LoginFailed }
             Err(e) => { tell(&mut cout, refusal_text(false, e)); return Ended::NotLoggedIn(e) }

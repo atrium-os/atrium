@@ -262,8 +262,16 @@ pub mod courier_op {
 
     /// A mail courier's login (mail.md §5.2), after TLS is up and only for
     /// a courier whose label is a mail scheme: `u8 source (1 item) | ref[16]`
-    /// → `str account | bytes value`. Password and OAuth token items only.
+    /// → `str account | bytes value | u8 kind` ([`LOGIN_PASSWORD`] or
+    /// [`LOGIN_OAUTH`], whose value is an OAuth grant record). Password and
+    /// OAuth token items only.
     pub const LOGIN: u16 = 0x83;
+    pub const LOGIN_PASSWORD: u8 = 1;
+    pub const LOGIN_OAUTH: u8 = 2;
+    /// A mail courier hands back the grant the provider rotated (mail.md
+    /// §5.3), for the item it just logged in with, and only an OAuth one:
+    /// `u8 source (1 item) | ref[16] | bytes grant` → nothing.
+    pub const REFRESHED: u16 = 0x85;
     /// A courier reports an exact anomaly (arca.md §10) before it ends its
     /// client: `u8 code | str detail` → nothing. Logged, never a value.
     pub const ANOMALY: u16 = 0x84;

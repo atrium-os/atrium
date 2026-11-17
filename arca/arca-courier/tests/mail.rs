@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
-use arca_courier::mail::{encode_hello, session, Ended, MailEndpoint, MailVault};
+use arca_courier::mail::{encode_hello, session, Ended, MailEndpoint, MailVault, Secret};
 use arca_courier::schema::Refusal;
 use arca_store::secret::LockedBuf;
 use arca_store::Scheme;
@@ -67,12 +67,15 @@ struct Vault {
 }
 
 impl MailVault for Vault {
-    fn login(&mut self, _: &[u8; 16]) -> Result<(String, LockedBuf), Refusal> {
+    fn login(&mut self, _: &[u8; 16]) -> Result<(String, Secret), Refusal> {
         self.logins += 1;
         if self.locked {
             return Err(Refusal::Locked);
         }
-        Ok(("priya@example.org".into(), LockedBuf::from_slice(self.password.as_bytes()).unwrap()))
+        Ok(("priya@example.org".into(), Secret::Password(LockedBuf::from_slice(self.password.as_bytes()).unwrap())))
+    }
+    fn refreshed(&mut self, _: &[u8; 16], _: &LockedBuf) -> Result<(), Refusal> {
+        Err(Refusal::Denied)
     }
     fn anomaly(&mut self, code: u8, detail: &str) {
         self.anomalies.lock().unwrap().push((code, detail.into()));

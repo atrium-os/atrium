@@ -34,12 +34,16 @@ fn courier(scheme: Scheme, host: &str, port: u16) -> Label {
 }
 
 fn store(s: &mut State, kind: u16, scheme: Scheme, host: &str, port: u16) -> [u8; 16] {
+    store_value(s, kind, scheme, host, port, b"hunter2")
+}
+
+fn store_value(s: &mut State, kind: u16, scheme: Scheme, host: &str, port: u16, value: &[u8]) -> [u8; 16] {
     let r = s.handle(&app(), op::STORE_FOR, &body(|w| {
         w.u16(kind);
         w.u8(2);
         w.str("priya@example.org");
         write_endpoint_scheme(w, scheme, host, port);
-        w.bytes(b"hunter2");
+        w.bytes(value);
     }));
     assert_eq!(r.status, status::OK);
     r.body.bytes().try_into().unwrap()
@@ -53,8 +57,38 @@ fn login(s: &mut State, who: &Label, id: [u8; 16]) -> (u8, Option<(String, Vec<u
     let mut rd = Reader::new(r.body.bytes());
     let acct = rd.str(1024).unwrap().to_string();
     let v = rd.bytes(1 << 20).unwrap().to_vec();
+    let kind = rd.u8().unwrap();
     rd.end().unwrap();
+    let want = if v.starts_with(b"oauth1 ") { cop::LOGIN_OAUTH } else { cop::LOGIN_PASSWORD };
+    assert_eq!(kind, want);
     (r.status, Some((acct, v)))
+}
+
+fn refreshed(s: &mut State, who: &Label, id: [u8; 16], grant: &[u8]) -> u8 {
+    s.handle(who, cop::REFRESHED, &body(|w| { w.u8(cop::SOURCE_ITEM); w.raw(&id); w.bytes(grant); })).status
+}
+
+#[test]
+fn an_oauth_item_logs_in_as_oauth_and_only_its_refresh_token_rotates() {
+    let (_d, mut s) = setup();
+    let imap = courier(Scheme::Imaps, "outlook.office365.com", 993);
+    let id = store_value(&mut s, 3, Scheme::Imaps, "outlook.office365.com", 993, b"oauth1 microsoft cid-1 R1");
+    assert_eq!(login(&mut s, &imap, id), (status::OK, Some(("priya@example.org".into(), b"oauth1 microsoft cid-1 R1".to_vec()))));
+    // The rotated token replaces the old one.
+    assert_eq!(refreshed(&mut s, &imap, id, b"oauth1 microsoft cid-1 R2"), status::OK);
+    assert_eq!(login(&mut s, &imap, id).1.unwrap().1, b"oauth1 microsoft cid-1 R2");
+    // Not another provider or client id, nor a bad record.
+    assert_eq!(refreshed(&mut s, &imap, id, b"oauth1 evil cid-1 R3"), status::DENIED);
+    assert_eq!(refreshed(&mut s, &imap, id, b"oauth1 microsoft cid-2 R3"), status::DENIED);
+    assert_eq!(refreshed(&mut s, &imap, id, b"oauth1 microsoft cid-1 "), status::DENIED);
+    assert_eq!(refreshed(&mut s, &imap, id, b"R3"), status::DENIED);
+    // Not from another endpoint's courier, nor an https one.
+    assert_eq!(refreshed(&mut s, &courier(Scheme::Imaps, "evil.example", 993), id, b"oauth1 microsoft cid-1 R3"), status::DENIED);
+    assert_eq!(refreshed(&mut s, &courier(Scheme::Https, "outlook.office365.com", 993), id, b"oauth1 microsoft cid-1 R3"), status::DENIED);
+    assert_eq!(login(&mut s, &imap, id).1.unwrap().1, b"oauth1 microsoft cid-1 R2");
+    // A password item can't be rewritten this way.
+    let pw = store(&mut s, 1, Scheme::Imaps, "outlook.office365.com", 993);
+    assert_eq!(refreshed(&mut s, &imap, pw, b"oauth1 microsoft cid-1 R3"), status::DENIED);
 }
 
 #[test]

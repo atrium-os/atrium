@@ -1500,15 +1500,60 @@ impl State {
                 let uv = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
                 let (_, v) = tri!(store.release(&id, &who, uv));
                 let acct = m.account.as_bytes();
-                let total = 4 + acct.len() + 4 + v.len();
+                let total = 4 + acct.len() + 4 + v.len() + 1;
                 let mut out = tri!(LockedBuf::zeroed(total).map_err(Error::Io));
                 let b = out.as_mut();
                 b[..4].copy_from_slice(&(acct.len() as u32).to_le_bytes());
                 b[4..4 + acct.len()].copy_from_slice(acct);
                 let at = 4 + acct.len();
                 b[at..at + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
-                b[at + 4..].copy_from_slice(v.as_ref());
+                b[at + 4..total - 1].copy_from_slice(v.as_ref());
+                b[total - 1] = if m.kind == Kind::OAuthToken { courier_op::LOGIN_OAUTH } else { courier_op::LOGIN_PASSWORD };
                 Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            courier_op::REFRESHED => {
+                let parsed = (|| {
+                    let src = r.u8()?;
+                    let x = r.array::<16>()?;
+                    let v = r.bytes(arca_store::model::caps::VALUE)?;
+                    r.end()?;
+                    Ok::<_, Error>((src, x, v))
+                })();
+                let Ok((src, x, v)) = parsed else { return malformed() };
+                if src != courier_op::SOURCE_ITEM {
+                    return malformed();
+                }
+                let Recipient::Endpoint { scheme, .. } = &c.endpoint else { return reply(status::DENIED) };
+                if !scheme.is_mail() {
+                    return reply(status::DENIED);
+                }
+                // Only an OAuth item of this courier's endpoint (as LOGIN),
+                // and only its refresh token changes: the same provider and
+                // client id, so a courier can't point the item elsewhere.
+                let id = ItemId(x);
+                *item = Some(id);
+                let Some(store) = self.stores.get_mut(&c.user) else { return reply(status::LOCKED) };
+                let m = tri!(store.meta(&id, &who));
+                if m.kind != Kind::OAuthToken {
+                    return reply(status::DENIED);
+                }
+                let (_, old) = tri!(store.release(&id, &who, None));
+                let head = |g: &[u8]| -> Option<usize> {
+                    let g = g.strip_prefix(b"oauth1 ")?;
+                    let last = g.iter().rposition(|&b| b == b' ')?;
+                    let tok = &g[last + 1..];
+                    (!tok.is_empty() && tok.iter().all(|b| b.is_ascii_graphic())).then_some(7 + last)
+                };
+                let same = match (head(old.as_ref()), head(v)) {
+                    (Some(a), Some(b)) => a == b && old.as_ref()[..a] == v[..b],
+                    _ => false,
+                };
+                drop(old);
+                if !same {
+                    return reply(status::DENIED);
+                }
+                tri!(store.update(&id, &who, v, None));
+                reply(status::OK)
             }
             courier_op::ANOMALY => {
                 let parsed = (|| {
