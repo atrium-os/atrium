@@ -219,8 +219,11 @@ k1 0x2c
 typ "echo rc=\$?
 "
 waitscreen "rc=[0-9]" 20 && ok "back at the shell, pkg's status: $(screen | grep -o 'rc=[0-9]*' | tail -1)" || bad "after pkg: $(screen)"
+# Scratch has its own /tmp: vi's file was the empty console's.
+typ "echo hello from vi > /tmp/gate.txt
+"
 for ed in nvim hx; do
-    if V "jexec ws_alice_scratch sh -c 'PATH=/usr/local/bin:$PATH command -v $ed'" >/dev/null 2>&1; then
+    if V "jexec ws_alice_scratch sh -c 'PATH=/usr/local/bin:\$PATH command -v $ed'" >/dev/null 2>&1; then
         typ "$ed /tmp/gate.txt
 "
         waitscreen "<alt>.*hello from vi" 60 && ok "$ed opens the file" || bad "$ed: $(screen)"
