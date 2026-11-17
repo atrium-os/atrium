@@ -142,7 +142,10 @@ int tessera_pack_seal_front(const tessera_aead_key_t *key,
         const uint8_t volume_uuid[16], uint64_t key_group, uint8_t *pack,
         size_t len, uint8_t tag_out[16]);
 
-/* Open a sealed pack's front in place, leaving the plain pack. When
+/* Open a sealed pack's front in place, leaving the plain pack. `len` may
+ * be the whole pack or just the sectors holding prelude and front (the
+ * kernel's partial read); either way bound the plain header's sizes
+ * against the real pack afterwards (tessera_pack_geom_from_header). When
  * expected_tag (the registry's record) is non-NULL the front's tag must
  * equal it. `key_group` must match the prelude's. TESSERA_EAUTH on any
  * failure, with the front region zeroed. */

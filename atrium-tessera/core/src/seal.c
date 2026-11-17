@@ -406,8 +406,10 @@ tessera_pack_open_front(const tessera_aead_key_t *key,
 	memset(pack + f, 0, PRE + fl - f);
 	/* Authentic, so written by us: still insist the plain front is the
 	 * canonical one, so the plain view is exactly the pack that was
-	 * sealed. */
-	if (pack_front_len(pack, len, &f2) != TESSERA_OK || f2 != f) {
+	 * sealed. `len` may cover only the front (the kernel reads just those
+	 * sectors), so the header's size is bounded here by nothing but
+	 * itself; the caller checks it against the pack it has on disk. */
+	if (pack_front_len(pack, (size_t)-1, &f2) != TESSERA_OK || f2 != f) {
 		tessera_wipe(pack, f);
 		return (TESSERA_ECORRUPT);
 	}

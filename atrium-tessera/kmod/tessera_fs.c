@@ -19153,6 +19153,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	uint64_t grp, desc_off;
 	uint32_t flen, dsize;
 	size_t fbytes;
+	const char *why = NULL;
 	int rc;
 
 	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0 ||
@@ -19168,12 +19169,14 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	if (tessera_pack_sealed_prelude(front, TESSERA_SECTOR_SIZE, &grp,
 	    &flen) != TESSERA_OK || grp != 0) {
 		rc = EINTEGRITY;
+		why = "prelude";
 		goto out;
 	}
 	fbytes = roundup2((size_t)TESSERA_SEALED_PACK_PRELUDE + flen,
 	    TESSERA_SECTOR_SIZE);
 	if (fbytes > pack_len) {
 		rc = EINTEGRITY;
+		why = "front size";
 		goto out;
 	}
 	free(front, M_TESSERA);
@@ -19186,16 +19189,19 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	if (tessera_pack_open_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
 	    front_tag, front, fbytes) != TESSERA_OK) {
 		rc = EINTEGRITY;
+		why = "front open";
 		goto out;
 	}
 	if (tessera_pack_geom_from_header(front, pack_len, &geom) !=
 	    TESSERA_OK || geom.bloom_off > fbytes) {
 		rc = EINTEGRITY;
+		why = "front header";
 		goto out;
 	}
 	if (memcmp(((const tessera_pack_header_t *)front)->pack_id,
 	    re->pack_id, 16) != 0) {
-		rc = EINTEGRITY;    /* authentic, but another pack's front */
+		rc = EINTEGRITY;
+		why = "another pack's front";    /* authentic, but another pack's front */
 		goto out;
 	}
 	rc = tessera_pack_index_find(front + geom.index_off,
@@ -19207,6 +19213,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	}
 	if (rc != TESSERA_OK || dsize < TESSERA_SEAL_OVERHEAD) {
 		rc = EINTEGRITY;
+		why = "index";
 		goto out;
 	}
 	unit = malloc(dsize, M_TESSERA, M_WAITOK);
@@ -19219,6 +19226,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	if (tessera_blob_open(&tmp_->seal->blob, tmp_->seal->uuid, 0, id,
 	    unit, dsize, pt) != TESSERA_OK) {
 		rc = EINTEGRITY;
+		why = "blob open";
 		goto out;
 	}
 	*out_buf = pt;
@@ -19226,6 +19234,10 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	pt = NULL;
 	rc = 0;
 out:
+	if (why != NULL)
+		printf("tessera_fs: sealed pack %02x%02x%02x%02x at %ju: %s "
+		    "refused\n", re->pack_id[0], re->pack_id[1], re->pack_id[2],
+		    re->pack_id[3], (uintmax_t)re->start_sector, why);
 	if (front != NULL)
 		zfree(front, M_TESSERA);
 	if (unit != NULL)

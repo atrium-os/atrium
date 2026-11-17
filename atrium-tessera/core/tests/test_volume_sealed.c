@@ -168,6 +168,32 @@ read_back(const tessera_seal_keys_t *k)
 	uint32_t flen;
 	CHECK(tessera_pack_sealed_prelude(pack, pack_len, &grp, &flen) ==
 	    TESSERA_OK && grp == 0);
+	/* The kernel's partial read (tessera_fs_sealed_pack_find): only the
+	 * sectors holding prelude and front, then the index from that. */
+	{
+		size_t fb = ((size_t)TESSERA_SEALED_PACK_PRELUDE + flen + BS - 1) /
+		    BS * BS;
+		uint8_t *front = malloc(fb);
+		tessera_pack_geom_t g;
+		memcpy(front, pack, fb);
+		CHECK(tessera_pack_open_front(&k->meta, k->uuid, 0, pack_tag,
+		    front, fb) == TESSERA_OK);
+		CHECK(tessera_pack_geom_from_header(front, pack_len, &g) ==
+		    TESSERA_OK && g.bloom_off <= fb);
+		tessera_hash_t first;
+		uint64_t doff;
+		uint32_t dsz;
+		memcpy(first, front + g.index_off, 32);   /* entry 0's hash */
+		CHECK(tessera_pack_index_find(front + g.index_off,
+		    (size_t)(g.bloom_off - g.index_off), &g, first, &doff,
+		    &dsz) == TESSERA_OK && dsz > TESSERA_SEAL_OVERHEAD);
+		uint8_t *pt = malloc(dsz);
+		CHECK(tessera_blob_open(&k->blob, k->uuid, 0, first,
+		    pack + doff + sizeof(tessera_blob_descriptor_t), dsz, pt) ==
+		    TESSERA_OK);
+		free(pt);
+		free(front);
+	}
 	if (tessera_pack_open_front(&k->meta, k->uuid, 0, pack_tag, pack,
 	    pack_len) != TESSERA_OK)
 		bad = 4;
