@@ -58,7 +58,7 @@ fn start(dev_uid: u32, ui_uid: u32) -> Paths {
         ui_socket: dir.join("u.sock"),
         dev_uid,
         ui_uid,
-        broker: Config { web_broker: Some(navigator()), ceremony_ms: 10_000 },
+        broker: Config { web_broker: Some(navigator()), mail_signers: vec![], ceremony_ms: 10_000 },
     };
     let d = Daemon::bind(settings.clone(), Arc::new(AllNavigator), Box::new(NoPasscode)).unwrap();
     std::thread::spawn(move || d.run());

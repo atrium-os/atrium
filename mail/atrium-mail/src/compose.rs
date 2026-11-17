@@ -103,6 +103,10 @@ pub struct ComposeUi {
     pub later: bool,
     /// "Remind me if no reply" (§9, §11.4): days, when on.
     pub follow_up: Option<u32>,
+    /// S/MIME (§10.1): encrypt to every recipient's certificate; sign with
+    /// the person's certificate on a token.
+    pub encrypt: bool,
+    pub sign: bool,
     pub show_bcc: bool,
     /// The text's first shown line (the wheel moves it).
     pub top: usize,
@@ -203,7 +207,14 @@ pub struct Composer {
     /// The draft as last saved (or as the window opened), and when.
     saved: Rc<RefCell<(Draft, i64)>>,
     now: Rc<dyn Fn() -> i64>,
+    /// How to sign as an address (the app's Sigillum ceremony), when this
+    /// person can sign at all.
+    pub signer: Rc<RefCell<Option<SignWith>>>,
 }
+
+/// Makes a signer for a From address: the token's certificate and a
+/// signature through Sigillum's sheet.
+pub type SignWith = Rc<dyn Fn(&str) -> Result<mail_engine::smime::Signer, String>>;
 
 impl Composer {
     /// A window for `c`, every cell on `dirty`. `draft_id`: the stored
@@ -237,6 +248,7 @@ impl Composer {
             base: Rc::new(RefCell::new(d.clone())),
             saved: Rc::new(RefCell::new((d.clone(), t))),
             now: Rc::new(now),
+            signer: Rc::default(),
             rich: Rc::default(),
             original: Rc::new(RefCell::new(c.original.clone().map(Rc::new))),
         };
@@ -478,7 +490,16 @@ impl Composer {
             return fail("The message mentions an attachment, but nothing is attached. Press Send again to send it as it is.");
         }
         let follow_up = ui.follow_up.map(|d| d as i64 * 86_400);
-        match self.engine.send_draft(ui.draft_id, ui.account, &d, When { later, follow_up, ..When::default() }) {
+        let sign = match (ui.sign, self.signer.borrow().clone()) {
+            (false, _) => None,
+            (true, None) => return fail("There's no certificate to sign with"),
+            (true, Some(make)) => match make(&d.from.addr) {
+                Ok(s) => Some(s),
+                Err(e) => return fail(&format!("Not signed: {e}")),
+            },
+        };
+        let protect = mail_engine::smime::Protect { sign, encrypt: ui.encrypt };
+        match self.engine.send_draft_protected(ui.draft_id, ui.account, &d, When { later, follow_up, ..When::default() }, protect) {
             Ok(send) => {
                 let label = match later {
                     Some(t) => format!("Sending {}", crate::full_date(t)),
@@ -492,6 +513,29 @@ impl Composer {
                 true
             }
             Err(e) => fail(&e.to_string()),
+        }
+    }
+
+    /// Encrypt on or off. On only when every recipient has a certificate
+    /// Mail has seen (on signed mail from them).
+    pub fn toggle_encrypt(&self) {
+        if self.ui.get_cloned().encrypt {
+            self.ui.update(|u| u.encrypt = false);
+            return;
+        }
+        let d = self.draft();
+        if d.to.is_empty() && d.cc.is_empty() && d.bcc.is_empty() {
+            self.ui.update(|u| u.error = Some("Add who it's for first: encrypting needs each one's certificate".into()));
+            return;
+        }
+        let missing = self.engine.missing_certs(&d);
+        if missing.is_empty() {
+            self.ui.update(|u| {
+                u.encrypt = true;
+                u.error = None;
+            });
+        } else {
+            self.ui.update(|u| u.error = Some(format!("Can't encrypt to {} yet: Mail needs a signed message from them first", missing.join(", "))));
         }
     }
 
@@ -694,6 +738,12 @@ impl View for ComposeView {
             None => "Remind me".to_string(),
         };
         button(ctx, &remind, false, Box::new(move || c.ui.update(|u| u.follow_up = match u.follow_up { None => Some(3), Some(3) => Some(7), _ => None })));
+        let c = self.c.clone();
+        button(ctx, if ui.encrypt { "Encrypted" } else { "Encrypt" }, false, Box::new(move || c.toggle_encrypt()));
+        if self.c.signer.borrow().is_some() {
+            let c = self.c.clone();
+            button(ctx, if ui.sign { "Signed" } else { "Sign" }, false, Box::new(move || c.ui.update(|u| u.sign = !u.sign)));
+        }
 
         // The fields.
         let mut y = head;

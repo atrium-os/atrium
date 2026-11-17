@@ -64,7 +64,7 @@ fn sigillumd(typed: &'static [u8]) -> (std::path::PathBuf, Arc<Mutex<Vec<String>
         ui_socket: dir.path().join("u.sock"),
         dev_uid: me(),
         ui_uid: me(),
-        broker: Config { web_broker: None, ceremony_ms: 10_000 },
+        broker: Config { web_broker: None, mail_signers: vec![], ceremony_ms: 10_000 },
     };
     let checks = Arc::new(AtomicU64::new(0));
     let d = Daemon::bind(settings.clone(), Arc::new(AllArca), Box::new(Pam(checks.clone()))).unwrap();

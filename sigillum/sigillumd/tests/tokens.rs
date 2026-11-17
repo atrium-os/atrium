@@ -93,7 +93,7 @@ struct Rig {
 
 impl Rig {
     fn new(token: bool) -> Rig {
-        let mut b = Broker::new(Config { web_broker: Some(broker_app()), ceremony_ms: 120_000 });
+        let mut b = Broker::new(Config { web_broker: Some(broker_app()), mail_signers: vec![], ceremony_ms: 120_000 });
         let mut out = Vec::new();
         if token {
             out = b.driver(TOKEN, FromDriver::Hello { class: DeviceClass::Ccid, vendor: 0x338c, product: 0x32, name: "InnaitKey DSC".into(), fido: None });
@@ -333,4 +333,54 @@ fn a_token_record_out_of_place_ends_the_ceremony() {
     r.run(a);
     assert_eq!(r.reply(), Some(Reply::Refused { ceremony: 9, reason: Refusal::NotAllowed }));
     assert!(r.audit("out of place"));
+}
+
+fn mail_app() -> AppId {
+    AppId { publisher: [0xCD; 32], app_id: "org.atrium.mail".into() }
+}
+
+/// Signing mail (S/MIME): only the mail apps sigillumd is told of, only
+/// for an address, and the sheet says which.
+#[test]
+fn mail_signing_is_for_the_named_mail_apps() {
+    let mail = Label::App { user: "alice".into(), app: mail_app(), rp_ids: vec![] };
+    let ec = ec_cert("Asha Rao");
+    let digest: [u8; 32] = Sha256::digest(b"signed attributes").into();
+    let req = |from: &str| Request::SignWithCertificate(SignWithCertificate {
+        ceremony: 9,
+        timeout_ms: 0,
+        purpose: CertPurpose::MailSign { from: from.into() },
+        cert_sha256: Sha256::digest(&ec).into(),
+        scheme: ECDSA,
+        digest: digest.to_vec(),
+    });
+    // Not named: refused, as is the web broker and Arca for mail.
+    let mut r = Rig::new(true);
+    let a = r.b.request(1, &mail, req("asha@example.in"), 0);
+    r.run(a);
+    assert!(matches!(r.reply(), Some(Reply::Refused { reason: Refusal::Denied, .. })), "{:?}", r.out);
+    for who in [navigator(), Label::Arca] {
+        let mut r = Rig::new(true);
+        r.b = Broker::new(Config { web_broker: Some(broker_app()), mail_signers: vec![mail_app()], ceremony_ms: 120_000 });
+        let a = r.b.request(1, &who, req("asha@example.in"), 0);
+        r.run(a);
+        assert!(matches!(r.reply(), Some(Reply::Refused { reason: Refusal::Denied, .. })), "{:?}", r.out);
+    }
+    // Named: the sheet, then the token signs.
+    let mut r = Rig::new(false);
+    r.b = Broker::new(Config { web_broker: Some(broker_app()), mail_signers: vec![mail_app()], ceremony_ms: 120_000 });
+    let a = r.b.driver(TOKEN, FromDriver::Hello { class: DeviceClass::Ccid, vendor: 0x338c, product: 0x32, name: "InnaitKey DSC".into(), fido: None });
+    r.run(a);
+    let a = r.b.request(1, &mail, req("not an address"), 0);
+    r.run(a);
+    assert!(matches!(r.reply(), Some(Reply::Refused { reason: Refusal::Malformed, .. })), "{:?}", r.out);
+    let a = r.b.request(1, &mail, req("asha@example.in"), 0);
+    r.run(a);
+    let a = r.b.driver(TOKEN, FromDriver::Certificates { ceremony: 1, token_label: "DSC".into(), certs: vec![tc(&[1, 2], "mine", &ec)] });
+    r.run(a);
+    let (key, sheet) = r.sheet().unwrap();
+    assert!(matches!(&sheet, Sheet::Certificates { sign: true, requester, purpose: CertPurpose::MailSign { from }, .. } if requester == "org.atrium.mail" && from == "asha@example.in"), "{sheet:?}");
+    let a = r.b.press(key, Choice::Certificate(0), true);
+    r.run(a);
+    assert_eq!(r.to_driver(), vec![(TOKEN, ToDriver::SignDigest { ceremony: key, key_id: vec![1, 2], scheme: ECDSA, digest: digest.to_vec(), pin: None })]);
 }

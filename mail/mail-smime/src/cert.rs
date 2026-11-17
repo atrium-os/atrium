@@ -27,6 +27,13 @@ pub struct CertInfo {
     pub sha256: [u8; 32],
 }
 
+/// The SHA-256 of a certificate's DER (how Sigillum names one).
+pub fn sha256(der: &[u8]) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, der).as_ref());
+    h
+}
+
 pub fn parse(der: &[u8]) -> Result<Certificate, String> {
     Certificate::from_der(der).map_err(|e| format!("certificate: {e}"))
 }

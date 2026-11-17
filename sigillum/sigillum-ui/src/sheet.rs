@@ -126,12 +126,22 @@ impl State {
                 vec![format!("{requester} asks to add a security key for {user}"), format!("Name: \u{201c}{name}\u{201d}"), "Your passcode first, then the key\u{2019}s PIN and a touch.".into()],
             ),
             Sheet::Certificates { requester, purpose, sign, certs } => {
-                let CertPurpose::TlsClient { host, port } = purpose;
-                let at = if *port == 443 { host.clone() } else { format!("{host}:{port}") };
-                let mut lines = if *sign {
-                    vec![format!("{requester} asks your token to sign you in to {at}")]
-                } else {
-                    vec![format!("{at} asks {requester} for a certificate")]
+                let mut lines = match purpose {
+                    CertPurpose::TlsClient { host, port } => {
+                        let at = if *port == 443 { host.clone() } else { format!("{host}:{port}") };
+                        if *sign {
+                            vec![format!("{requester} asks your token to sign you in to {at}")]
+                        } else {
+                            vec![format!("{at} asks {requester} for a certificate")]
+                        }
+                    }
+                    CertPurpose::MailSign { from } => {
+                        if *sign {
+                            vec![format!("{requester} asks your token to sign a message from {from}")]
+                        } else {
+                            vec![format!("{requester} asks which certificate signs mail from {from}")]
+                        }
+                    }
                 };
                 if let Some(t) = certs.first().map(|c| &c.token).filter(|t| !t.is_empty()) {
                     lines.push(format!("Token: {t}"));

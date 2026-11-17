@@ -100,7 +100,7 @@ impl Rig {
         let key = Rc::new(RefCell::new(soft));
         let (mut driver, hello) = Driver::open(Key_(key.clone()), 0x1050, 0x0407, "Soft Key").unwrap();
         driver.u2f_poll = std::time::Duration::ZERO;
-        let mut broker = Broker::new(Config { web_broker: Some(broker_app()), ceremony_ms: 120_000 });
+        let mut broker = Broker::new(Config { web_broker: Some(broker_app()), mail_signers: vec![], ceremony_ms: 120_000 });
         let a = broker.driver(DEV, hello);
         assert!(matches!(a[0], Action::Audit(_)));
         Rig { broker, driver, key, pin: Some(PIN), pin_asks: 0, replies: vec![], sheets: vec![], audit: vec![], tamper: None, arca: None, passcode_ok: true, passcode_asks: 0, passcode_answers: Default::default(), arca_tamper: None, logins: vec![] }
