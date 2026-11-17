@@ -779,9 +779,22 @@ sockopts = [
 include = ["base"]
 
 # Nuntius fetchers and apps with the network capability.
+#
+# ★ The jail's vnet is set up from the host with `ifconfig -j`, `route -j`
+# and `sysctl -j` (portcullis-jail), which attach to the jail and so run under
+# its filter: hence the interface ioctls, netlink and the read-only module
+# queries (learnt in log mode, M0 gate). Setting flags or an address needs
+# PRIV_NET_* as the jail's root; the app's own user gets EPERM.
 [sysfil.profiles.networked]
 include  = ["base"]
-families = ["inet", "inet6"]
+families = ["inet", "inet6", "netlink"]
+syscalls = ["modstat", "modfnext", "modfind", "kldnext", "kldfirstmod", "kldstat", "kldfind"]
+ioctls = [
+    "0xc0206911",   # SIOCGIFFLAGS
+    "0x80206910",   # SIOCSIFFLAGS (priv)
+    "0x8020693c",   # SIOCSIFLLADDR (priv)
+    "0xc0206920",   # SIOCGIFINDEX
+]
 sockopts = [
     "6:1",          # TCP_NODELAY
     "6:256",        # TCP_KEEPIDLE
@@ -791,13 +804,15 @@ sockopts = [
     "0:3",          # IP_TOS
     "0:4",          # IP_TTL
     "41:4",         # IPV6_UNICAST_HOPS
+    "270:11",       # NETLINK_EXT_ACK (ifconfig, route)
 ]
 
-# The shell and what it runs.
+# The shell and what it runs. rfork: posix_spawn(3) is rfork(RFSPAWN)
+# (cc runs its compiler and linker that way; M0 gate).
 [sysfil.profiles.terminal]
 include  = ["networked"]
 syscalls = [
-    "fork", "vfork", "pdfork", "wait4", "wait6", "setsid", "setpgid",
+    "fork", "vfork", "pdfork", "rfork", "wait4", "wait6", "setsid", "setpgid",
     "getpgid", "getpgrp", "getsid", "copy_file_range", "ktimer_create",
     "ktimer_settime", "ktimer_gettime", "ktimer_delete", "setitimer",
     "getitimer", "setpriority", "getpriority", "chown", "fchown", "lchown",
@@ -813,4 +828,22 @@ ioctls = [
     "0x80047476",   # TIOCSPGRP
     "0x40047477",   # TIOCGPGRP
     "0x40047463",   # TIOCGSID
+]
+
+# Workspaces (dev-tools.md §7.1, dev-tools-plan.md M0): the shell and what it
+# runs, plus debugging the workspace's own processes. Set by portcullisd for
+# workspace jails only; a manifest naming it is refused. ptrace reaches only
+# the workspace's uid in its own jail (allow.unprivileged_proc_debug on that
+# jail alone; the host keeps security.bsd.unprivileged_proc_debug=0).
+[sysfil.profiles.develop]
+include  = ["terminal"]
+syscalls = [
+    "ptrace", "ktrace", "utrace", "procctl", "thr_kill2", "sigqueue",
+    "posix_openpt",
+]
+# A pty of its own: lldb gives the program it runs one (learnt in log mode,
+# M0 gate), and so do tmux and script(1).
+ioctls = [
+    "0x2000741c",   # TIOCPTMASTER (grantpt, unlockpt)
+    "0x80106678",   # FIODGNAME (ptsname)
 ]

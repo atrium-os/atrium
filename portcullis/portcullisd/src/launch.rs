@@ -520,8 +520,34 @@ pub fn app_sysfil(manifest: &Manifest) -> Result<Option<jaild_policy::SysfilPara
         return Ok(None);
     }
     let class = portcullis_jail::sysfil_class(&manifest.capabilities);
+    // ★ `develop` (ptrace, ktrace, procctl) is portcullisd's for workspaces
+    // alone (dev-tools-plan.md M0): an app's manifest naming it is refused.
+    if class == DEVELOP_CLASS {
+        return Err(fail(format!("{}: class {class:?} is for workspaces only", manifest.app.id)));
+    }
     policy.sysfil.resolve(&class).map(Some)
         .map_err(|e| fail(format!("{}: class {class:?}: {e}", manifest.app.id)))
+}
+
+/// The class portcullisd gives workspace jails (dev-tools-plan.md M0).
+pub const DEVELOP_CLASS: &str = "develop";
+/// The class of a console's shell: the empty console's jail and the console
+/// jail beside an app's (dev-tools-plan.md M0, P1).
+pub const TERMINAL_CLASS: &str = "terminal";
+
+/// The filter for a jail portcullisd makes itself (a workspace, a console),
+/// by class name, not from a manifest: [`app_sysfil`] refuses `develop`.
+pub fn sysfil_for_class(class: &str) -> Result<Option<jaild_policy::SysfilParams>, LaunchError> {
+    let fail = |s: String| LaunchError::Failed("sysfil", s);
+    let policy = jaild_policy::Policy::load(JAILD_POLICY)
+        .map_err(|e| fail(format!("{JAILD_POLICY}: {e}")))?;
+    if !jaild::ffi::sysfil_supported() {
+        if policy.sysfil.required {
+            return Err(fail("this kernel has no system call filter and policy.sysfil.required is set".into()));
+        }
+        return Ok(None);
+    }
+    policy.sysfil.resolve(class).map(Some).map_err(|e| fail(format!("class {class:?}: {e}")))
 }
 
 fn run_one_jail_inner(
@@ -612,6 +638,9 @@ pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
         let _ = Command::new("jail").arg("-q").arg("-r").arg(n)
             .stderr(Stdio::null()).status();
     }
+    // ★ A console jail on the same root (M0/P1) holds its mounts busy and
+    // would outlive them: it goes first.
+    remove_jails_at(jail_path);
     let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
     portcullis_mounts::warn_survivors("portcullisd", &left);
 }
@@ -1123,5 +1152,24 @@ mod fetch_sites_tests {
         assert_eq!(fetch_sites_of(Some(&[])), Ok(Some(String::new())), "an empty list is no sites, not unlimited");
         assert!(fetch_sites_of(Some(&["10.0.0.1".to_string()])).is_err());
         assert!(fetch_sites_of(Some(&["a.com,b.com".to_string()])).is_err());
+    }
+}
+
+/// Names of console jails start with this (dev-tools-plan.md M0, P1).
+pub const CONSOLE_JAIL_PREFIX: &str = "con-";
+
+/// Remove the console jails whose root is `path` (the jail beside an app's,
+/// dev-tools-plan.md M0): their shells end, and the root's mounts can go.
+/// Only console jails: an app's own jail has a network to release first.
+pub fn remove_jails_at(path: &Path) {
+    let Ok(o) = Command::new("jls").args(["-N", "name", "path"]).stderr(Stdio::null()).output() else { return };
+    let want = path.to_string_lossy();
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let mut f = line.split_whitespace();
+        if let (Some(name), Some(p)) = (f.next(), f.next()) {
+            if p == want && name.starts_with(CONSOLE_JAIL_PREFIX) {
+                let _ = Command::new("jail").arg("-q").arg("-r").arg(name).stderr(Stdio::null()).status();
+            }
+        }
     }
 }

@@ -1789,9 +1789,16 @@ fn handle_console(uid: u32, owner: &str, app_id: &str, activation: [u8; 16], tab
         let Some(gid) = console::gid_of(app_uid) else {
             return refuse(format!("no group for uid {app_uid}"));
         };
-        if let Err(why) = console::mount_toolbox(&PathBuf::from(launch::JAILS_DIR).join(app_id)) {
+        let app_root = PathBuf::from(launch::JAILS_DIR).join(app_id);
+        if let Err(why) = console::mount_toolbox(&app_root) {
             return refuse(why);
         }
+        // The shell goes in the console jail beside the app's, never in the
+        // app's own (dev-tools-plan.md M0, P1): the app keeps its class.
+        let jid = match console::console_jail(app_id, &app_root) {
+            Ok(j) => j,
+            Err(why) => return refuse(format!("the console's jail: {why}")),
+        };
         ws_groups = Vec::new();
         (jid, app_uid, gid, "/nonexistent".to_string(), console::Kind::App, format!("Terminal: {name}"))
     };

@@ -90,7 +90,8 @@ pub fn start(owner: &str) -> Result<(i32, u32, u32), String> {
         launch::full_teardown(&jp, None);
         m
     };
-    let sysfil = launch::app_sysfil(&manifest).map_err(|e| fail(format!("{e:?}")))?;
+    // `terminal`: the shell runs programs (fork, wait4); no app class can.
+    let sysfil = launch::sysfil_for_class(launch::TERMINAL_CLASS).map_err(|e| fail(format!("{e:?}")))?;
     let host_identity = portcullis_identity::for_app(&mid).map_err(|e| fail(format!("identity: {e}")))?;
     let opts = portcullis_jail::BuildOpts {
         root_path: jp.clone(),
