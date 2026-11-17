@@ -56,6 +56,10 @@ pub enum GridOp {
     /// The workbook's pivot tables with where their output is, swapped in whole
     /// (their cells change by the `Replace`s beside it).
     Pivots(Vec<(crate::pivot::Pivot, Option<Rect>)>),
+    /// The workbook's conditional formats, swapped in whole, as
+    /// [`Workbook::encode_cond_formats`] writes them (their formulas are text, read
+    /// against the workbook when the op is applied). Made by [`GridOp::cond_formats`].
+    CondFormats(std::sync::Arc<[u8]>),
 }
 
 impl GridOp {
@@ -90,6 +94,11 @@ impl GridOp {
             values: Vec::new(),
             fills: vec![Fill { col, r0, r1, src: src.to_string() }],
         })
+    }
+
+    /// Puts `fs` in place of the workbook's conditional formats.
+    pub fn cond_formats(wb: &Workbook, fs: &[crate::condfmt::CondFormat]) -> Self {
+        GridOp::CondFormats(wb.encode_cond_formats(fs).into())
     }
 
     /// Empties a rectangle.
@@ -154,6 +163,11 @@ impl GridOp {
                 for (p, area) in ps {
                     p.encode(&mut w, *area);
                 }
+                return w.into_bytes();
+            }
+            GridOp::CondFormats(b) => {
+                w.u8(8);
+                w.bytes(b);
                 return w.into_bytes();
             }
             GridOp::Batch(ops) => {
@@ -239,6 +253,13 @@ impl GridOp {
             }
             return Ok(GridOp::Pivots(v));
         }
+        if kind == 8 {
+            let v = r.bytes("conditional formats", b.len() as u64)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::CondFormats(v.into()));
+        }
         if kind == 4 {
             let f = crate::filter::FilterState::decode(&mut r)?;
             if !r.is_empty() {
@@ -322,6 +343,15 @@ impl Op<Workbook> for GridOp {
             GridOp::Tables(ts) => GridOp::Tables(wb.replace_tables(ts)),
             GridOp::Charts(cs) => GridOp::Charts(wb.replace_charts(cs)),
             GridOp::Pivots(ps) => GridOp::Pivots(wb.replace_pivots(ps)),
+            GridOp::CondFormats(b) => {
+                // A list that no longer reads against the workbook (a sheet it
+                // names is gone) changes nothing.
+                let old = wb.encode_cond_formats(wb.cond_formats());
+                if let Ok(fs) = wb.decode_cond_formats(&b) {
+                    wb.replace_cond_formats(fs);
+                }
+                GridOp::CondFormats(old.into())
+            }
             GridOp::Batch(ops) => {
                 // The inverse undoes them in reverse order.
                 let mut inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(wb)).collect();

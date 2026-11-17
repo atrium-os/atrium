@@ -71,7 +71,7 @@ pub fn view_of(v: &Value) -> Option<CellView> {
     })
 }
 
-fn rgb(c: u32) -> Color {
+pub fn rgb(c: u32) -> Color {
     Color::from_srgb8((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 

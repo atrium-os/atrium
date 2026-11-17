@@ -52,6 +52,9 @@ pub enum DataCmd {
     /// The cursor's column of the pivot's source as (or no longer as) a column
     /// field of the pivot beside it.
     PivotColumns,
+    /// Open the conditional-format panel on the selection ([`crate::condfmt`]); the
+    /// window runs it, as it opens a panel.
+    CondFormats,
 }
 
 /// The block of non-empty cells around (`row`, `col`), bounded by empty rows and
@@ -202,6 +205,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         }
     }
     v.push((MenuItem::new("Refresh All Pivot Tables").enabled(!wb.pivots().is_empty()), Some(DataCmd::RefreshAllPivots)));
+    v.push((MenuItem::new("Conditional Formatting…").separated(), Some(DataCmd::CondFormats)));
     v
 }
 
@@ -381,6 +385,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
+        DataCmd::CondFormats => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

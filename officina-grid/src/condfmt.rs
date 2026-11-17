@@ -253,6 +253,41 @@ impl Workbook {
         Ok(self.cond_formats.len() - 1)
     }
 
+    /// Swaps in a whole list of conditional formats (formats that don't fit are left
+    /// out) and gives back the old one.
+    pub fn replace_cond_formats(&mut self, fs: Vec<CondFormat>) -> Vec<CondFormat> {
+        let old = std::mem::take(&mut self.cond_formats);
+        self.cond_stats.lock().unwrap().clear();
+        for f in fs {
+            let _ = self.add_cond_format(f);
+        }
+        old
+    }
+
+    /// A list of formats as bytes (formulas as text, as the native file keeps them).
+    pub fn encode_cond_formats(&self, fs: &[CondFormat]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.var(fs.len() as u64);
+        for f in fs {
+            f.encode(&mut w, self);
+        }
+        w.into_bytes()
+    }
+
+    /// Reads a list written by [`encode_cond_formats`](Self::encode_cond_formats).
+    pub fn decode_cond_formats(&self, b: &[u8]) -> Result<Vec<CondFormat>, WireError> {
+        let mut r = Reader::new(b);
+        let n = r.count("conditional formats", MAX_FORMATS as u64, 4)?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(CondFormat::decode(&mut r, self)?);
+        }
+        if !r.is_empty() {
+            return Err(WireError::Invalid("trailing bytes"));
+        }
+        Ok(v)
+    }
+
     pub fn remove_cond_format(&mut self, i: usize) -> Option<CondFormat> {
         (i < self.cond_formats.len()).then(|| {
             self.cond_stats.lock().unwrap().clear();
