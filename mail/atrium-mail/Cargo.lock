@@ -44,9 +44,11 @@ name = "atrium-mail"
 version = "0.1.0"
 dependencies = [
  "atrium-links",
+ "atrium-open",
  "fresco-client",
  "libc",
  "limen",
+ "mail-compose",
  "mail-engine",
  "mail-schema",
  "mail-store",
@@ -57,6 +59,13 @@ dependencies = [
  "psl",
  "tempfile",
  "url",
+]
+
+[[package]]
+name = "atrium-open"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -691,9 +700,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-compose"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "mail-schema",
+ "serde",
+]
+
+[[package]]
 name = "mail-engine"
 version = "0.1.0"
 dependencies = [
+ "mail-compose",
  "mail-schema",
  "mail-store",
  "mail-sync",

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Mail's window (docs/spec/mail.md §15): places, the message list and a plain-text reader over the engine's store. M2: read-only, plain text."
+description = "Mail's windows (docs/spec/mail.md §9, §15): places, the message list, the reader, and compose windows (drafts, Send as a press, Send later, mailto: links)."
 
 [lib]
 name = "atrium_mail"
@@ -18,6 +18,9 @@ path = "src/bin/atrium-mail.rs"
 pergola = { path = "../../pergola" }
 fresco-client = { path = "../../fresco-client" }
 mail-engine = { path = "../mail-engine" }
+mail-compose = { path = "../mail-compose" }
+# mailto: links from Monstrator, on the document channel (mail.md §9.1).
+atrium-open = { path = "../../atrium-open" }
 mail-store = { path = "../mail-store" }
 mail-schema = { path = "../mail-schema" }
 # The doc-viewer role for HTML bodies (mail.md §7.3).
