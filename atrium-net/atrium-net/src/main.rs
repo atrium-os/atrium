@@ -37,6 +37,7 @@ mod imp {
     use atrium_net::plan::{Action, Applied};
     use atrium_net::sys::{self, Bpf, Dir, Ifc, Rtsock, Unbound};
     use atrium_net::wifi::{Act, Profile, Saved, Wifi};
+    use atrium_net::spawn::Spawner;
     use atrium_net::wrap;
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
@@ -46,9 +47,7 @@ mod imp {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
-    use std::process::{Child, Command};
     use std::time::{Duration, Instant};
 
     const STATE_FILE: &str = "networks";
@@ -98,6 +97,8 @@ mod imp {
     const PROBE_DEADLINE_MS: u64 = 30_000;
     /// After a failed probe, try again this soon (or --probe-every if less).
     const PROBE_RETRY_MS: u64 = 30_000;
+    /// A dead probe process is started again after this long.
+    const PROBE_AGAIN_MS: u64 = 10_000;
     const PROBE_CONFIRM_MS: u64 = 5_000;
 
     struct Opts {
@@ -214,7 +215,12 @@ mod imp {
         mac: [u8; 6],
         bpf: Bpf,
         lease: Conn,
-        _child: Child,
+        /// Lease-process restarts: their times (the last minute's), and
+        /// when a parser that keeps dying may be started again.
+        lease_restarts: u32,
+        lease_deaths: Vec<u64>,
+        lease_hold: Option<u64>,
+        lease_gen: u32,
         applied: Applied,
         ip_id: u16,
         tokens: f64,
@@ -251,7 +257,6 @@ mod imp {
 
     struct Prober {
         c: Conn,
-        _child: Child,
         cfg: ProbeCfg,
         busy: Option<Job>,
         next_id: u64,
@@ -298,6 +303,9 @@ mod imp {
         def4: Option<(usize, Ipv4Addr)>,
         announced: Option<usize>,
         prober: Option<Prober>,
+        /// A probe process that died, started again at this time.
+        probe_again: Option<(ProbeCfg, u64)>,
+        spawner: Spawner,
         netd: Option<Dir>,
         /// The interface group pf's NAT rule names (`nat on atrium_egress`):
         /// the egress interface alone is in it. Every interface there was
@@ -624,7 +632,85 @@ mod imp {
             if let Some(j) = self.prober.as_mut().and_then(|p| p.busy.take()) {
                 self.unpin(&j.pins);
             }
-            self.prober = None;
+            if let Some(p) = self.prober.take() {
+                self.probe_again = Some((p.cfg, self.now() + PROBE_AGAIN_MS));
+            }
+        }
+
+        fn probe_restart(&mut self) {
+            let Some((_, at)) = &self.probe_again else { return };
+            if self.now() < *at {
+                return;
+            }
+            let (cfg, _) = self.probe_again.take().unwrap();
+            match self.spawner.spawn(b'P').and_then(|s| Conn::new(s).map_err(|_| io::Error::other("conn"))) {
+                Ok(c) => {
+                    self.log("atrium-probe started again");
+                    self.prober = Some(Prober { c, cfg, busy: None, next_id: 0 });
+                }
+                Err(e) => {
+                    eprintln!("atrium-net: starting atrium-probe again: {e}");
+                    self.probe_again = Some((cfg, self.now() + PROBE_AGAIN_MS));
+                }
+            }
+        }
+
+        /// The lease process of interface k died or misbehaved: start a new
+        /// one (from the spawner; capability mode forbids exec here) and
+        /// tell it where the link is. More than five deaths in a minute and
+        /// the interface's parser is held off for a minute: a frame that
+        /// crashes it every time must not keep the host busy.
+        fn lease_died(&mut self, k: usize, why: &str) {
+            let now = self.now();
+            let i = &mut self.ifs[k];
+            i.lease_gen += 1;
+            i.lease_deaths.retain(|t| now.saturating_sub(*t) < 60_000);
+            i.lease_deaths.push(now);
+            eprintln!("atrium-net: {}: atrium-lease {why}", i.name);
+            if i.lease_deaths.len() > 5 {
+                eprintln!("atrium-net: {}: atrium-lease died {} times in a minute; next try in 60 s", i.name, i.lease_deaths.len());
+                i.lease_hold = Some(now + 60_000);
+                // A connection nothing writes to, until then.
+                let (a, b) = UnixStream::pair().unwrap_or_else(|_| die("socketpair"));
+                i.lease = Conn::new(a).unwrap_or_else(|_| die("conn"));
+                std::mem::forget(b);
+                return;
+            }
+            self.start_lease(k);
+        }
+
+        fn start_lease(&mut self, k: usize) {
+            let now = self.now();
+            let conn = self.spawner.spawn(b'L').and_then(|s| Conn::new(s).map_err(|_| io::Error::other("conn")));
+            let i = &mut self.ifs[k];
+            let c = match conn {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("atrium-net: {}: starting atrium-lease: {e}", i.name);
+                    i.lease_hold = Some(now + 10_000);
+                    return;
+                }
+            };
+            i.lease = c;
+            i.lease_hold = None;
+            i.lease_restarts += 1;
+            let _ = i.lease.send(&Line::new("hello").with("mac", fmt_mac(&i.mac)));
+            let m = format!("{}: atrium-lease started again ({})", i.name, i.lease_restarts);
+            self.log(&m);
+            // The new parser knows nothing: DHCP again if the link is up and
+            // DHCP is in use (the applied lease stays until a new one comes).
+            if self.ifs[k].link && self.manual_for(k).is_none() {
+                let _ = self.ifs[k].lease.send(&Line::new("up"));
+            }
+        }
+
+        fn lease_restart_tick(&mut self) {
+            let now = self.now();
+            for k in 0..self.ifs.len() {
+                if self.ifs[k].lease_hold.is_some_and(|t| now >= t) {
+                    self.start_lease(k);
+                }
+            }
         }
 
         fn probe_line(&mut self, l: &Line) {
@@ -1150,7 +1236,7 @@ mod imp {
                 if k.is_some() && self.announced == k {
                     l = l.with("egress", 1);
                 }
-                l = l.with("refused", i.refusals).with("sends_refused", i.sends_refused);
+                l = l.with("refused", i.refusals).with("sends_refused", i.sends_refused).with("lease_restarts", i.lease_restarts);
                 if !i.last_refusal.is_empty() {
                     l = l.with("last_refusal", &i.last_refusal);
                 }
@@ -1245,7 +1331,7 @@ mod imp {
                         }
                     }
                 }
-                _ => die(&format!("{}: unexpected message from atrium-lease", self.ifs[k].name)),
+                _ => self.lease_died(k, "sent an unexpected message"),
             }
         }
 
@@ -1401,31 +1487,13 @@ mod imp {
         }
     }
 
-    fn spawn_child(path: &str, v: bool) -> (Child, Conn) {
-        let (ours, theirs) = UnixStream::pair().unwrap_or_else(|_| die("socketpair"));
-        let fd = theirs.as_raw_fd();
-        let mut cmd = Command::new(path);
-        if v {
-            cmd.arg("-v");
-        }
-        unsafe {
-            cmd.pre_exec(move || {
-                if libc::dup2(fd, 3) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // The lease process gets nothing else of ours.
-                libc::closefrom(4);
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().unwrap_or_else(|e| die(&format!("spawn {path}: {e}")));
-        drop(theirs);
-        (child, Conn::new(ours).unwrap_or_else(|_| die("lease conn")))
-    }
-
     pub fn main() {
         let o = opts();
         let follow = o.follow;
+        // First, while nothing else is open: the spawner that starts the
+        // sandboxed helpers now and again later (spawn.rs).
+        let vflag: &[&str] = if o.verbose { &["-v"] } else { &[] };
+        let spawner = Spawner::start(&[(b'L', o.lease.as_str(), vflag), (b'P', o.probe_bin.as_str(), vflag)]).unwrap_or_else(|e| die(&format!("spawner: {e}")));
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
@@ -1459,6 +1527,8 @@ mod imp {
             def4: None,
             announced: None,
             prober: None,
+            probe_again: None,
+            spawner,
             netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
             egress_group: o.egress_group.clone(),
             ports_seen: all.iter().map(|i| i.name.clone()).collect(),
@@ -1482,7 +1552,7 @@ mod imp {
                 eprintln!("atrium-net: {name}: IPv6: {e}");
             }
             let bpf = Bpf::open(name).unwrap_or_else(|e| die(&format!("{name}: {e}")));
-            let (child, mut lease) = spawn_child(&o.lease, o.verbose);
+            let mut lease = Conn::new(net.spawner.spawn(b'L').unwrap_or_else(|e| die(&format!("atrium-lease: {e}")))).unwrap_or_else(|_| die("lease conn"));
             lease.send(&Line::new("hello").with("mac", fmt_mac(&mac))).unwrap_or_else(|_| die("hello"));
             // Wired links start now (DHCP, or the port's fixed setting just
             // below); Wi-Fi when aura-mlme reports the port open.
@@ -1497,7 +1567,10 @@ mod imp {
                 mac,
                 bpf,
                 lease,
-                _child: child,
+                lease_restarts: 0,
+                lease_deaths: Vec::new(),
+                lease_hold: None,
+                lease_gen: 0,
                 applied: Applied::default(),
                 ip_id: 1,
                 tokens: 10.0,
@@ -1525,9 +1598,9 @@ mod imp {
         // The probe must exist before capability mode (no exec after it).
         if let Some(url) = &o.probe {
             let cfg = probe_cfg(url, o.probe_expect.as_deref(), o.probe_every);
-            let (child, c) = spawn_child(&o.probe_bin, o.verbose);
+            let c = Conn::new(net.spawner.spawn(b'P').unwrap_or_else(|e| die(&format!("atrium-probe: {e}")))).unwrap_or_else(|_| die("probe conn"));
             net.log(&format!("probing http://{}{}", cfg.host, cfg.path));
-            net.prober = Some(Prober { c, _child: child, cfg, busy: None, next_id: 0 });
+            net.prober = Some(Prober { c, cfg, busy: None, next_id: 0 });
         }
         if let Some(d) = o.sock.parent() {
             let _ = std::fs::create_dir_all(d);
@@ -1648,7 +1721,7 @@ mod imp {
             for k in 0..net.ifs.len() {
                 if ready[4 + 2 * k] {
                     for f in net.ifs[k].bpf.read() {
-                        if f.len() <= 1514 {
+                        if f.len() <= 1514 && net.ifs[k].lease_hold.is_none() {
                             let _ = net.ifs[k].lease.send(&Line::new("frame").with_hex("hex", &f));
                         }
                     }
@@ -1656,11 +1729,22 @@ mod imp {
                 if ready[5 + 2 * k] {
                     let lines = match net.ifs[k].lease.lines() {
                         Ok(l) => l,
-                        Err(_) => die(&format!("{}: atrium-lease exited", net.ifs[k].name)),
+                        Err(_) => {
+                            net.lease_died(k, "exited");
+                            continue;
+                        }
                     };
+                    let gen = net.ifs[k].lease_gen;
                     for g in lines {
-                        let Got::Line(l) = g else { die("bad line from atrium-lease") };
+                        let Got::Line(l) = g else {
+                            net.lease_died(k, "sent a bad line");
+                            break;
+                        };
                         net.lease_line(k, &l);
+                        // A new process since: the rest came from the old one.
+                        if net.ifs[k].lease_gen != gen {
+                            break;
+                        }
                     }
                 }
             }
@@ -1705,6 +1789,8 @@ mod imp {
             net.mlme_connect();
             net.route_default();
             net.probe_tick();
+            net.probe_restart();
+            net.lease_restart_tick();
         }
     }
 

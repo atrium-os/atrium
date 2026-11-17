@@ -2,6 +2,7 @@
 
 pub mod egress;
 pub mod plan;
+pub mod spawn;
 pub mod wifi;
 pub mod wrap;
 

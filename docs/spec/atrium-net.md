@@ -411,8 +411,17 @@ VM from the Aura gates cover them.
   only to the applied lease's server (renewals go to the MAC the ACK came from).
 - Unbound's forwarders are set at run time (`forward`), so an unbound restart falls back
   to `forward.conf` until the next lease; atrium-net will rewrite it in N1.
-- Known gaps: a dead atrium-lease makes atrium-net exit (respawning needs `exec`, which
-  capability mode forbids; the service manager restarts it, N1 adds a small spawner);
+- Known gaps then: a dead atrium-lease made atrium-net exit (respawning needs `exec`,
+  which capability mode forbids). Fixed 2026-11-17: atrium-net forks a spawner first
+  thing, before it opens anything (`spawn.rs`). The spawner reads one byte per request
+  (which of the two programs fixed at fork time, atrium-lease or atrium-probe), starts
+  it with a fresh socketpair as its fd 3 and nothing else, and hands atrium-net its end
+  over SCM_RIGHTS; the kernel reaps the children. A parser that exits, sends a bad line
+  or an unexpected message is replaced: `hello` and, if the link is up on DHCP, `up`; the
+  applied lease stays until the new parser's. More than five deaths in a minute hold
+  that interface's parser off for a minute. A dead probe helper is started again after
+  10 s. `status` shows `lease_restarts`. The spawner shows in `pgrep -x atrium-net` as a
+  second process (it exits with atrium-net);
   ARP probe before using an address: built 2026-11-17 (below); no rc/services.d manifest yet
   (rc.d services since, §10.6).
 - Gate: `scripts/atrium-net-gate.sh vm|n0` (RUNBOOK §13.6e), 14 checks. The VM's
@@ -435,7 +444,7 @@ VM from the Aura gates cover them.
 - §4.1 behaviour: beacon loss in aura-mlme (8 s), address grace 60 s, reconnect scans
   every ~10 s in the first minute, three failures skip a network for 10 min, DHCP option
   43 `ANDROID_METERED` and the profile's `metered` flag reported as `metered=1`.
-- Not yet: unbound's `forward.conf` rewrite, the lease-process spawner, the cross-network
+- Not yet: unbound's `forward.conf` rewrite, the cross-network
   low-signal move (N3), connectivity probe (N3).
 
 ### 10.3 N2 as built (2026-11-14)
