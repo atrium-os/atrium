@@ -124,6 +124,7 @@ dependencies = [
  "pergola",
  "pergola-richtext",
  "portcullis-ipc",
+ "praeco",
  "psl",
  "tempfile",
  "url",
@@ -1658,6 +1659,16 @@ dependencies = [
  "serde_core",
  "writeable",
  "zerovec",
+]
+
+[[package]]
+name = "praeco"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "portcullis-peer",
+ "postcard",
+ "serde",
 ]
 
 [[package]]

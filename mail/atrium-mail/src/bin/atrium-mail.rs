@@ -88,6 +88,52 @@ fn loader() -> Loader {
     Loader { jobs, done }
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Posts to Praeco (§12) from a thread of their own (praecod may be slow or
+/// absent; Mail never waits on it). Remembers which post was for which
+/// message, to withdraw it when read elsewhere, and replaces the last
+/// "while you were away" summary rather than stacking another.
+fn notifications() -> mpsc::Sender<mail_engine::notify::Post> {
+    use mail_engine::notify::Post;
+    use praeco::proto::urgency;
+    let (tx, rx) = mpsc::channel::<Post>();
+    std::thread::spawn(move || {
+        let sock = std::path::PathBuf::from(std::env::var("PRAECO_SOCKET").unwrap_or_else(|_| "/var/run/atrium/praecod.sock".into()));
+        let mut by_msg: std::collections::HashMap<u64, u64> = Default::default();
+        let mut summary: Option<u64> = None;
+        let mut said = false;
+        for p in rx {
+            let r = match p {
+                Post::One { msg, title, body } => praeco::client::post(&sock, urgency::NORMAL, &title, &body).map(|id| {
+                    by_msg.insert(msg, id);
+                }),
+                Post::Group { title, body } => praeco::client::post(&sock, urgency::NORMAL, &title, &body).map(|_| ()),
+                Post::Review { title, body } => praeco::client::post(&sock, urgency::LOW, &title, &body).map(|_| ()),
+                Post::Summary { title, body } => {
+                    if let Some(old) = summary.take() {
+                        let _ = praeco::client::withdraw(&sock, old);
+                    }
+                    praeco::client::post(&sock, urgency::LOW, &title, &body).map(|id| summary = Some(id))
+                }
+                Post::Withdraw { msg } => match by_msg.remove(&msg) {
+                    Some(id) => praeco::client::withdraw(&sock, id),
+                    None => Ok(()),
+                },
+            };
+            if let Err(e) = r {
+                if !said {
+                    eprintln!("atrium-mail: notifications: {e}");
+                    said = true;
+                }
+            }
+        }
+    });
+    tx
+}
+
 /// Hand the doc-viewer pictures by resource id (before `Load`, for its
 /// first layout; after, it lays out again).
 fn provide(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, e: limen::proto::EmbedId, pictures: &[(String, Vec<u8>)]) -> Result<(), String> {
@@ -289,6 +335,8 @@ fn main() {
             }
         }
     }
+    let mut notifier = mail_engine::notify::Notifier::new();
+    let notes = notifications();
     let mut ticked = Instant::now();
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
@@ -630,6 +678,10 @@ fn main() {
         if refreshed.elapsed() > Duration::from_secs(5) {
             refreshed = Instant::now();
             mail.refresh();
+            // What to tell Praeco, posted from its own thread.
+            for p in notifier.check(&engine, now_secs()) {
+                let _ = notes.send(p);
+            }
         }
         if trace {
             let ui = mail.ui.get_cloned();
