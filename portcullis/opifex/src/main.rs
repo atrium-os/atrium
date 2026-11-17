@@ -60,6 +60,17 @@ fn main() -> ExitCode {
             println!("opifex: {o}: {} bytes", b.len());
             Ok(())
         })(),
+        // The publishing pipeline unpacks a release to check it (not sandboxed:
+        // opifexd uses opifex-check for that).
+        "unarchive" => (|| {
+            let (a, d) = (args.get(2).ok_or("unarchive <file.insula> <new-dir>")?, args.get(3).ok_or("unarchive <file.insula> <new-dir>")?);
+            let f = std::fs::File::open(a).map_err(|e| format!("{a}: {e}"))?;
+            let size = f.metadata().map_err(|e| e.to_string())?.len();
+            std::fs::create_dir(d).map_err(|e| format!("{d}: {e}"))?;
+            let n = opifex::archive::unpack(f, size, Path::new(d))?;
+            println!("opifex: {d}: {n} bytes unpacked");
+            Ok(())
+        })(),
         "install"   => cmd_install(&args[2..]),
         "rollback"  => cmd_rollback(&args[2..]),
         "list"      => cmd_list(&args[2..]),
@@ -83,6 +94,7 @@ fn usage() {
            pack <bundle-dir> [--sign <key.pem>]\n      \
              Index every file, name the index in atrium.toml, sign it.\n  \
            archive <packed-dir> <out.insula>   Write the .insula archive (INSB v2).\n  \
+           unarchive <file.insula> <new-dir>   Unpack one (the publishing pipeline; not sandboxed).\n  \
            install <bundle-dir> [--allow-unsigned] [--root <dir>] [--sysroot <dir>]\n      \
              Install a pre-built signed bundle into the Portcullis app tree.\n  \
            rollback <app-id> [--root <dir>]    Swap back to the version before the last install.\n  \
@@ -104,7 +116,7 @@ fn usage() {
            describe <id> | search <text> | installed\n  \
            get <id>            install the newest catalog release (root)\n  \
            side-load <path>    install a bundle folder or .insula file (root)\n  \
-           remove <id> | sync <catalog-dir>   (root)\n\n\
+           remove <id> | sync [https://… | <catalog-dir>]   (root; no argument: the network)\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -208,7 +220,12 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         "get" => Request::Install { id: arg(1)? },
         "side-load" => Request::InstallLocal { path: std::fs::canonicalize(arg(1)?).map_err(|e| e.to_string())?.display().to_string() },
         "remove" => Request::Uninstall { id: arg(1)? },
-        "sync" => Request::Sync { from: std::fs::canonicalize(arg(1)?).map_err(|e| e.to_string())?.display().to_string() },
+        // `opifex sync` (the network), `opifex sync https://…`, or a folder.
+        "sync" => Request::Sync { from: match args.get(1) {
+            None => String::new(),
+            Some(a) if a.starts_with("https://") => a.clone(),
+            Some(_) => std::fs::canonicalize(arg(1)?).map_err(|e| e.to_string())?.display().to_string(),
+        } },
         _ => unreachable!(),
     };
     let sock = std::env::var("OPIFEX_SOCKET").unwrap_or_else(|_| opifex::proto::SOCKET.into());

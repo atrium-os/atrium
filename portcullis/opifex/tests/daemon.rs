@@ -41,6 +41,8 @@ fn world(tag: &str) -> W {
         root: d.join("root"), state: d.join("state"), root_toml: d.join("root.toml"),
         check_bin: PathBuf::from(env!("CARGO_BIN_EXE_opifex-check")), sandbox: false, worker_uid: 0, sheet_uid: Some(65042),
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
+        fetch_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
+        catalog_url: "https://example.org/cat/".into(),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
     };
     W { d, plat, cat, daemon }
@@ -59,8 +61,11 @@ fn publish(w: &W, v: &str, body: &[u8]) -> String {
     let sha = oc::hex(&Sha256::digest(&bytes));
     fs::create_dir_all(w.daemon.downloads()).unwrap();
     fs::write(w.daemon.downloads().join(format!("{sha}.insula")), &bytes).unwrap();
+    // The same archive "on the web", for the fetcher's --dir.
+    fs::create_dir_all(w.d.join("web/example.org")).unwrap();
+    fs::write(w.d.join(format!("web/example.org/{v}.insula")), &bytes).unwrap();
     let e = oc::release_entry(&b, opifex_arch(), &sha, bytes.len() as u64,
-                              vec!["https://example.org/x.insula".into()], &w.plat.pk, 1_800_000_000).unwrap();
+                              vec![format!("https://example.org/{v}.insula")], &w.plat.pk, 1_800_000_000).unwrap();
     let log = oc::Log::open(&w.d.join("cat"));
     log.append(&[e]).unwrap();
     log.sign_head(&w.cat.sk, now(), 14).unwrap();
@@ -119,11 +124,12 @@ fn refusals() {
     let w = world("refuse");
     let sha = publish(&w, "1.0", &elf(1));
     sync(&w);
-    // Not downloaded.
+    // Not downloaded, and not on the web either.
     let dl = w.daemon.downloads().join(format!("{sha}.insula"));
     let good = fs::read(&dl).unwrap();
     fs::remove_file(&dl).unwrap();
-    assert!(err(ask(&w, 0, Request::Install { id: ID.into() })).contains("not downloaded"));
+    fs::remove_file(w.d.join("web/example.org/1.0.insula")).unwrap();
+    assert!(err(ask(&w, 0, Request::Install { id: ID.into() })).contains("download failed"));
     // A different archive under the right name: refused and removed.
     let mut bad = good.clone();
     let n = bad.len();
@@ -177,4 +183,32 @@ fn the_sheet_installs_what_the_person_saw() {
     // The sheet may not remove, roll back, side-load or sync.
     assert!(err(ask(&w, 65042, Request::Uninstall { id: ID.into() })).contains("administrator"));
     assert!(err(ask(&w, 65042, Request::Install { id: ID.into() })).contains("administrator"));
+}
+
+#[test]
+fn over_the_network() {
+    let w = world("net");
+    let sha = publish(&w, "1.0", &elf(1));
+    // The catalog "served" at https://example.org/cat/.
+    std::os::unix::fs::symlink(w.d.join("cat"), w.d.join("web/example.org/cat")).unwrap();
+    // Nothing downloaded yet: the archive comes through the fetcher.
+    fs::remove_file(w.daemon.downloads().join(format!("{sha}.insula"))).unwrap();
+    assert!(matches!(ask(&w, 0, Request::Sync { from: String::new() }), Response::Synced { entries: 1, .. }));
+    assert_eq!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { id: ID.into(), version: "1.0".into() });
+    assert_eq!(fs::read(w.daemon.root.join("apps").join(ID).join("bin/hello")).unwrap(), elf(1));
+    // A server that hands out other bytes: refused, nothing kept.
+    let sha2 = publish(&w, "1.1", &elf(2));
+    fs::remove_file(w.daemon.downloads().join(format!("{sha2}.insula"))).unwrap();
+    fs::write(w.d.join("web/example.org/1.1.insula"), b"INSB not the archive").unwrap();
+    assert!(matches!(ask(&w, 0, Request::Sync { from: "https://example.org/cat".into() }), Response::Synced { entries: 2, .. }));
+    let e = err(ask(&w, 0, Request::Install { id: ID.into() }));
+    assert!(e.contains("not the archive the catalog names"), "{e}");
+    assert!(!w.daemon.downloads().join(format!("{sha2}.insula")).exists());
+    assert_eq!(w.daemon.store().get(ID).unwrap().unwrap().version, "1.0");
+    // A missing file and a catalog that isn't there.
+    fs::remove_file(w.d.join("web/example.org/1.1.insula")).unwrap();
+    assert!(err(ask(&w, 0, Request::Install { id: ID.into() })).contains("404"));
+    assert!(err(ask(&w, 0, Request::Sync { from: "https://example.org/nothing/".into() })).contains("404"));
+    // Only https.
+    assert!(err(ask(&w, 0, Request::Sync { from: "https://someone@example.org/cat/".into() })).contains("not a plain https URL"));
 }
