@@ -49,7 +49,7 @@ impl Engine {
             }
         }
         let h = self.store.put_blob(out.as_bytes())?;
-        self.store.write(|w| w.set_files_text(msg, Some(h)))?;
+        self.store.write(|w| w.set_files_text_indexed(msg, Some(h), Some(&out)))?;
         Ok(Some(out))
     }
 

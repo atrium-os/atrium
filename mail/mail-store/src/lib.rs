@@ -28,12 +28,13 @@ mod drafts;
 pub use drafts::LocalDraft;
 mod outbox;
 pub use outbox::{retry_after, Outgoing, SendState};
+pub mod search;
 mod thread;
 pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
 
 /// The index's layout; an index of another layout is rebuilt from the blobs
 /// by sync (the store refuses to open it).
-const SCHEMA: u64 = 4;
+const SCHEMA: u64 = 5;
 
 pub type AccountId = u32;
 pub type FolderId = u32;
@@ -46,7 +47,7 @@ const ACCOUNTS: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
 pub(crate) const FOLDERS: TableDefinition<u32, &[u8]> = TableDefinition::new("folders");
 /// (account, folder name) → folder id.
 const FOLDER_NAMES: TableDefinition<(u32, &str), u32> = TableDefinition::new("folder_names");
-const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
+pub(crate) const MESSAGES: TableDefinition<u64, &[u8]> = TableDefinition::new("messages");
 /// (folder, uid) → (msg, flags).
 pub(crate) const LOCATIONS: TableDefinition<(u32, u32), (u64, u32)> = TableDefinition::new("locations");
 /// (folder, newest-first date key, msg) → uid: the list.
@@ -250,6 +251,8 @@ impl Store {
             tx.open_table(thread::SUBJECT_THREADS)?;
             tx.open_table(thread::CONVERSATIONS)?;
             tx.open_table(thread::VIEWS)?;
+            tx.open_table(search::TERMS)?;
+            tx.open_table(search::MSG_TERMS)?;
             let mut meta = tx.open_table(META)?;
             let schema = meta.get("schema")?.map(|v| v.value());
             let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();
@@ -507,6 +510,7 @@ impl Writer<'_> {
                 if m.full && old.full.is_none() {
                     old.full = Some(m.blob);
                     old.summary = m.summary;
+                    self.index(id, &old, None)?;
                 }
                 if !old.locations.contains(&(folder, uid)) && !old.leaving.contains(&(folder, uid)) {
                     old.locations.push((folder, uid));
@@ -540,6 +544,7 @@ impl Writer<'_> {
                     leaving: Vec::new(),
                 };
                 self.put_msg(id, &msg)?;
+                self.index(id, &msg, None)?;
                 if let Some(s) = &m.server_id {
                     self.tx.open_table(SERVER_IDS)?.insert((account, s.as_str()), id)?;
                 }
@@ -567,6 +572,14 @@ impl Writer<'_> {
         let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
         m.document = document;
         self.put_msg(id, &m)
+    }
+
+    /// Keep a message's attachment text for search, and index it
+    /// (`text`: the blob's contents).
+    pub fn set_files_text_indexed(&mut self, id: MsgId, hash: Option<Hash>, text: Option<&str>) -> Result<()> {
+        self.set_files_text(id, hash)?;
+        let m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        self.index(id, &m, text)
     }
 
     /// Keep a message's attachment text for search.
@@ -621,6 +634,7 @@ impl Writer<'_> {
         m.leaving.retain(|l| *l != (folder, uid));
         if m.locations.is_empty() && m.leaving.is_empty() {
             self.tx.open_table(MESSAGES)?.remove(id)?;
+            self.unindex(id)?;
             if let Some(s) = &m.server_id {
                 self.tx.open_table(SERVER_IDS)?.remove((m.account, s.as_str()))?;
             }
