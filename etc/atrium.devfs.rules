@@ -15,6 +15,11 @@
 # so forgetting this file fails loudly instead of silently exposing /dev.
 #
 # The numeric ids must match jaild.policy.toml [devfs_rulesets].allowed_ids.
+#
+# ★ Owners are uids, never user names. rc.d/devfs stops reading this file at
+# the first name the system doesn't know, so one service's missing user
+# (2026-11-17: _aura on a guest without Wi-Fi) left every later ruleset
+# unloaded, and jaild then refused arcad's jail.
 
 # The jailed memory governor (atrium-memoryd / atrium-memfed): the basics plus
 # /dev/pressure, readable (0644) inside the jail's own devfs so the non-root
@@ -124,14 +129,16 @@ add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'aura' unhide
 add path 'aura/ctl*' unhide
-add path 'aura/ctl*' mode 0600 user _aura
+# user 65033 = _aura
+add path 'aura/ctl*' mode 0600 user 65033
 
 [atrium_wifi_keys=29]
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'aura' unhide
 add path 'aura/key*' unhide
-add path 'aura/key*' mode 0600 user _aura-keys
+# user 65032 = _aura-keys
+add path 'aura/key*' mode 0600 user 65032
 
 # Arca (arcad, arca.md §6.3): the basics plus the Tessera keyring, which
 # arcad alone writes (tessera-encryption.md §4.3). arcad runs as _arca, so
@@ -141,4 +148,5 @@ add path 'aura/key*' mode 0600 user _aura-keys
 add include $devfsrules_hide_all
 add include $devfsrules_unhide_basic
 add path 'tesserakeys' unhide
-add path 'tesserakeys' mode 0600 user _arca
+# user 65020 = _arca
+add path 'tesserakeys' mode 0600 user 65020

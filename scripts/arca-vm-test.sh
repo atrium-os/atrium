@@ -133,7 +133,8 @@ g "mkdir -p /etc/atrium/services.d.off && mv /etc/atrium/services.d/*-atrium-smo
 put "$ROOT/etc/atrium.devfs.rules" /usr/local/etc/atrium/devfs.rules
 g "service devfs restart >/dev/null 2>&1; true"
 check "arcad's devfs ruleset is loaded" yes "$(g 'test -n "$(devfs rule -s 32 show 2>/dev/null)" && echo yes || echo no')"
-g "service atrium-jaild restart >/dev/null 2>&1; sleep 2; service atrium-portcullisd-bootstrap onestart >/dev/null 2>&1; true"
+# A stale socket from an earlier run would pass "socket bound" with no arcad.
+g "rm -f /atrium/sockets/arca/arcad.sock; service atrium-jaild restart >/dev/null 2>&1; sleep 2; service atrium-portcullisd-bootstrap onestart >/dev/null 2>&1; true"
 i=0; while [ $i -lt 60 ] && ! g "test -S /atrium/sockets/arca/arcad.sock"; do sleep 2; i=$((i+1)); done
 check "socket bound" yes "$(g 'test -S /atrium/sockets/arca/arcad.sock && echo yes || echo no')"
 PID=$(g "pgrep -x atrium-arcad | head -1" || true)
