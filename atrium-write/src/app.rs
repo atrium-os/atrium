@@ -41,7 +41,7 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 37] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…"];
+pub const INSERT: [&str; 39] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…"];
 
 /// The shapes the shape bar draws: (label, preset; "textBox", "line" and
 /// "arrow" are the editor's own).
@@ -263,13 +263,13 @@ impl PageCmd {
     }
 }
 
-/// The page commands of Insert menu items 28 on.
+/// The page commands of Insert menu items 30 on.
 pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, PageCmd::A4, PageCmd::Letter, PageCmd::Margins(1440), PageCmd::Margins(720)];
 
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::SectionBreak(SectionStart::OddPage), Cmd::SectionBreak(SectionStart::EvenPage), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -1294,7 +1294,7 @@ impl Write {
                         e.set_wrap(w);
                     }
                     Cmd::Page(c) => {
-                        let label = INSERT[28 + PAGE_CMDS.iter().position(|x| *x == c).unwrap_or(0)];
+                        let label = INSERT[30 + PAGE_CMDS.iter().position(|x| *x == c).unwrap_or(0)];
                         e.set_section_page(label, |g| c.apply(g));
                     }
                     Cmd::FloatAlign(a) => {
@@ -1535,25 +1535,25 @@ impl View for Write {
             let wraps = [None, Some(Wrap::Square), Some(Wrap::TopBottom), Some(Wrap::Behind), Some(Wrap::InFront)];
             let aligns = [HAlign::Start, HAlign::Center, HAlign::End];
             let items: Vec<MenuItem> = INSERT.iter().enumerate().map(|(i, s)| match i {
-                20..=24 => {
-                    let m = MenuItem::new(*s).enabled(pic.is_some()).radio(pic.is_some_and(|f| f.map(|f| f.wrap) == wraps[i - 20]));
-                    if i == 20 { m.separated() } else { m }
+                22..=26 => {
+                    let m = MenuItem::new(*s).enabled(pic.is_some()).radio(pic.is_some_and(|f| f.map(|f| f.wrap) == wraps[i - 22]));
+                    if i == 22 { m.separated() } else { m }
                 }
-                25..=27 => {
-                    let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 25]));
-                    if i == 25 { m.separated() } else { m }
+                27..=29 => {
+                    let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 27]));
+                    if i == 27 { m.separated() } else { m }
                 }
-                34 | 35 => MenuItem::new(*s).separated(),
-                28..=33 => {
-                    let m = MenuItem::new(*s).radio(PAGE_CMDS[i - 28].is(&page));
-                    if i == 28 || i == 30 || i == 32 { m.separated() } else { m }
+                36 | 37 => MenuItem::new(*s).separated(),
+                30..=35 => {
+                    let m = MenuItem::new(*s).radio(PAGE_CMDS[i - 30].is(&page));
+                    if i == 30 || i == 32 || i == 34 { m.separated() } else { m }
                 }
                 12 => MenuItem::new(if has_toc { "Update Table of Contents" } else { *s }).separated(),
                 14 => MenuItem::new(*s).enabled(!in_table).separated(),
-                15 => MenuItem::new(*s).enabled(!in_table),
-                16 => MenuItem::new(*s).radio(sec.columns == 1).separated(),
-                17 | 18 => MenuItem::new(*s).radio(sec.columns as usize == i - 15),
-                19 => MenuItem::new(*s).checked(sec.rule).enabled(sec.columns > 1),
+                15..=17 => MenuItem::new(*s).enabled(!in_table),
+                18 => MenuItem::new(*s).radio(sec.columns == 1).separated(),
+                19 | 20 => MenuItem::new(*s).radio(sec.columns as usize == i - 17),
+                21 => MenuItem::new(*s).checked(sec.rule).enabled(sec.columns > 1),
                 _ => MenuItem::new(*s).enabled(match i {
                     2..=5 => in_table,
                     9 => on_note,
@@ -2188,6 +2188,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_section_break_to_an_odd_page_leaves_a_blank_page() {
+        let mut d = officina_text::model::TextDoc::new();
+        d.blocks.remove(0);
+        d.push_para("One", 0, vec![]);
+        d.push_para("Two", 0, vec![]);
+        d.push_para("Three", 0, vec![]);
+        let doc = Doc::from_text_doc(d, "t.owrite");
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let ed = w.doc.borrow().ed.clone();
+        assert_eq!(INSERT[16], "Section Break to Odd Page");
+        // Two on page 2, then Three to an odd page: page 3, nothing blank.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
+        run(Cmd::insert(14));
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(2, 0), false);
+        run(Cmd::insert(16));
+        let s = ed.borrow().doc.para(2).unwrap().props.section.unwrap();
+        assert_eq!(s.start, SectionStart::OddPage);
+        while !ed.borrow_mut().paginate(std::time::Duration::from_millis(50)) {}
+        let blanks = |ed: &std::rc::Rc<std::cell::RefCell<pergola_richtext::Editor>>| ed.borrow().pages.pages().iter().map(|p| p.blank).collect::<Vec<_>>();
+        assert_eq!(blanks(&ed), [false, false, false]);
+        // An even page: a blank page 3 goes before it.
+        run(Cmd::insert(17));
+        while !ed.borrow_mut().paginate(std::time::Duration::from_millis(50)) {}
+        assert_eq!(ed.borrow().doc.para(2).unwrap().props.section.unwrap().start, SectionStart::EvenPage);
+        assert_eq!(blanks(&ed), [false, false, true, false]);
+    }
+
+    #[test]
     fn contents_and_cross_reference_commands() {
         let mut d = officina_text::model::TextDoc::new();
         d.blocks.remove(0);
@@ -2284,7 +2316,7 @@ mod tests {
         let ed = w.doc.borrow().ed.clone();
         let footer = |i: usize| ed.borrow().doc.margins_of(i).1.map(|f| f.text.clone());
         let top = w.pages_rect(1200.0, 800.0).origin.y;
-        run(Cmd::insert(34));
+        run(Cmd::insert(36));
         assert!(w.margin.get_cloned().open);
         assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H, "the pages make room for both rows");
         let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
@@ -2310,7 +2342,7 @@ mod tests {
         assert_eq!(footer(1).as_deref(), Some("Page {page}"));
         run(Cmd::Undo);
         assert_eq!(footer(0), None, "the first page's footer is undone, its own blank one stays");
-        run(Cmd::insert(34));
+        run(Cmd::insert(36));
         run(Cmd::MarginFirst);
         assert_eq!(ed.borrow().margin_pages(), (false, false));
         assert_eq!(footer(0).as_deref(), Some("Page {page}"));
@@ -2577,7 +2609,7 @@ mod tests {
             tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
         };
         let top = w.pages_rect(1200.0, 800.0).origin.y;
-        run(Cmd::insert(36));
+        run(Cmd::insert(38));
         assert!(w.shape.get_cloned().open);
         assert_eq!(w.shape.get_cloned().id, None, "no shape at the caret: the bar offers shapes");
         assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H);
@@ -2613,7 +2645,7 @@ mod tests {
         run(Cmd::Undo);
         assert_eq!(ed.borrow().doc.shapes.get(0).unwrap().line.map(|l| l.tail), Some(officina_text::model::ArrowEnd::None), "each change is its own undo step");
         // Insert ▸ Text Box draws one and opens the bar on it.
-        run(Cmd::insert(35));
+        run(Cmd::insert(37));
         let (id, _, tb) = ed.borrow().shape_at_caret().unwrap();
         assert_eq!((w.shape.get_cloned().id, tb.fill), (Some(id), Some(0xFFFFFF)));
         // The caret on another shape: the bar offers to edit it.
@@ -2639,7 +2671,7 @@ mod tests {
         let base = page();
         assert!(base.width < base.height);
         // One section: the document's page turns.
-        run(Cmd::insert(29));
+        run(Cmd::insert(31));
         assert!(page().width > page().height);
         assert_eq!(w.doc.borrow().ed.borrow().doc.page, page());
         run(Cmd::Undo);
@@ -2647,8 +2679,8 @@ mod tests {
         // Two sections: only the caret's.
         w.doc.borrow().ed.borrow_mut().set_caret(pergola_richtext::Pos::new(2, 0), false);
         run(Cmd::insert(14));
-        run(Cmd::insert(29));
-        run(Cmd::insert(33));
+        run(Cmd::insert(31));
+        run(Cmd::insert(35));
         let land = page();
         assert!(land.width > land.height && land.margin_start == 720, "{land:?}");
         assert_eq!(w.doc.borrow().ed.borrow().doc.page, base, "the document's page stays");
@@ -2660,8 +2692,8 @@ mod tests {
             assert_eq!(sizes, vec![base.width, land.width]);
         }
         // Back to portrait and normal margins: the section's page goes.
-        run(Cmd::insert(28));
-        run(Cmd::insert(32));
+        run(Cmd::insert(30));
+        run(Cmd::insert(34));
         assert_eq!(page(), base);
         assert!(w.doc.borrow().ed.borrow().doc.para(2).unwrap().props.section.unwrap().page.is_none());
         assert!(PAGE_CMDS[2].is(&base) || PAGE_CMDS[3].is(&base));
