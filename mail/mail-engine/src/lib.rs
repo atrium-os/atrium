@@ -225,6 +225,8 @@ pub struct Reading {
     pub document: Option<wire::Document>,
     /// The attachments (§8.1), empty until the whole message is here.
     pub attachments: Vec<wire::Attachment>,
+    /// The sender's card (§14.3), only when the sender is verified.
+    pub card: Option<wire::Card>,
 }
 
 /// What a parse leaves for the next opening: the converted document and
@@ -233,6 +235,13 @@ pub struct Reading {
 pub struct Shown {
     pub document: Option<wire::Document>,
     pub attachments: Vec<wire::Attachment>,
+    pub card: Option<wire::Card>,
+}
+
+/// A card is shown only for a sender whose domain checked out (§14.3):
+/// anyone can write JSON-LD saying their mail is your bank's.
+fn verified_card(s: &Summary, card: Option<wire::Card>) -> Option<wire::Card> {
+    card.filter(|_| matches!(s.sender_check, wire::SenderCheck::Verified { .. }))
 }
 
 impl Engine {
@@ -251,26 +260,28 @@ impl Engine {
     pub fn open(&self, msg: u64) -> Result<Reading, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let Some(full) = m.full else {
-            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None, attachments: Vec::new() });
+            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None, attachments: Vec::new(), card: None });
         };
         if m.summary.encrypted {
             // Read only with its key, each time, and nothing of it kept.
             let Some(key) = self.keys.borrow().get(&msg).cloned() else {
-                return Ok(Reading { summary: m.summary, text: Some(String::new()), has_html: false, document: None, attachments: Vec::new() });
+                return Ok(Reading { summary: m.summary, text: Some(String::new()), has_html: false, document: None, attachments: Vec::new(), card: None });
             };
             let raw = self.store.blob(&full)?;
             return match self.parser.open(&raw, Vec::new(), &self.roots, Some(key))? {
                 Some(o) => {
                     let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
-                    Ok(Reading { has_html: o.document.is_some(), summary: o.summary, text, document: o.document, attachments: o.attachments })
+                    let card = verified_card(&o.summary, o.card);
+                    Ok(Reading { has_html: o.document.is_some(), summary: o.summary, text, document: o.document, attachments: o.attachments, card })
                 }
-                None => Ok(Reading { summary: m.summary, text: Some("This message couldn't be decrypted.".into()), has_html: false, document: None, attachments: Vec::new() }),
+                None => Ok(Reading { summary: m.summary, text: Some("This message couldn't be decrypted.".into()), has_html: false, document: None, attachments: Vec::new(), card: None }),
             };
         }
         if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()) {
             let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
-            return Ok(Reading { summary: m.summary, text, has_html, document: sh.document, attachments: sh.attachments });
+            let card = verified_card(&m.summary, sh.card);
+            return Ok(Reading { summary: m.summary, text, has_html, document: sh.document, attachments: sh.attachments, card });
         }
         let raw = self.store.blob(&full)?;
         // Remote pictures already loaded: their first bytes, for their sizes.
@@ -282,14 +293,15 @@ impl Engine {
             .collect();
         match self.parser.open(&raw, loaded, &self.roots, None)? {
             Some(o) => {
-                let sh = Shown { document: o.document, attachments: o.attachments };
+                let sh = Shown { document: o.document, attachments: o.attachments, card: o.card };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
                 self.store.write(|w| w.set_document(msg, Some(h)))?;
                 let has_html = sh.document.is_some();
                 let text = o.summary.text.clone().or_else(|| sh.document.as_ref().map(|_| String::new()));
-                Ok(Reading { summary: o.summary, text, has_html, document: sh.document, attachments: sh.attachments })
+                let card = verified_card(&o.summary, sh.card);
+                Ok(Reading { summary: o.summary, text, has_html, document: sh.document, attachments: sh.attachments, card })
             }
-            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None, attachments: Vec::new() }),
+            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None, attachments: Vec::new(), card: None }),
         }
     }
 }

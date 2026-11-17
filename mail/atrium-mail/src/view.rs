@@ -93,6 +93,8 @@ pub struct Body {
     pub loading: bool,
     /// Its attachments (§8.1).
     pub files: Vec<crate::files::File>,
+    /// The sender's card (§14.3), from a verified sender only.
+    pub card: Option<mail_schema::Card>,
 }
 
 /// A message in the reader.
@@ -590,7 +592,7 @@ impl Mail {
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
                 let files = r.attachments.iter().map(crate::files::file).collect();
-                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files }
+                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files, card: r.card }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -1779,6 +1781,9 @@ pub enum Item {
     Screener(usize),
     /// "In Updates: a machine sent it · Always People · …" (E10).
     Lane(usize),
+    /// A card's title line, then each of its lines (§14.3).
+    CardTitle(usize),
+    CardLine(usize, usize),
     /// The conversation's Later item: what for, when, Done (§11.4).
     Later,
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
@@ -1827,6 +1832,13 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        if let Some(c) = &b.card {
+            out.push(Item::CardTitle(k));
+            for i in 0..c.fields.len() {
+                out.push(Item::CardLine(k, i));
+            }
+            out.push(Item::Gap);
+        }
         for i in 0..b.files.len() {
             out.push(Item::File { msg: k, i });
         }
@@ -2674,6 +2686,30 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
                 text(ctx, bx + lw - em(8.0) - width(k, type_size::XS, Weight::Regular), cy, k, type_size::XS, Weight::Regular, t.text_tertiary());
                 ctx.pop();
                 bx += lw + em(6.0);
+            }
+        }
+        Item::CardTitle(k) | Item::CardLine(k, _) => {
+            let Some(c) = s.msgs[*k].body.as_ref().and_then(|b| b.card.as_ref()) else { return };
+            let last = matches!(item, Item::CardLine(_, i) if *i + 1 == c.fields.len());
+            let top = matches!(item, Item::CardTitle(_));
+            // One panel over the lines: rounded at its ends, an accent at its left.
+            let (py, ph) = (if top { em(4.0) } else { 0.0 }, lh - if top { em(4.0) } else { 0.0 } - if last { em(4.0) } else { 0.0 });
+            rect(ctx, Rect::new(x, py, tw, ph), t.bg_window());
+            rect(ctx, Rect::new(x, py, 3.0, ph), t.accent_fg());
+            match item {
+                Item::CardTitle(_) => {
+                    let kind = c.kind.label().to_uppercase();
+                    let kw = width(&kind, type_size::XS, Weight::Semibold);
+                    text(ctx, x + em(14.0), cy, &kind, type_size::XS, Weight::Semibold, t.text_tertiary());
+                    text(ctx, x + em(24.0) + kw, cy, &fit(&c.title, type_size::SM, Weight::Semibold, tw - kw - em(36.0)), type_size::SM, Weight::Semibold, t.text_primary());
+                }
+                Item::CardLine(_, i) => {
+                    let (f, v) = &c.fields[*i];
+                    let lw = em(88.0);
+                    text(ctx, x + em(14.0), cy, f.label(), type_size::XS, Weight::Regular, t.text_secondary());
+                    text(ctx, x + em(14.0) + lw, cy, &fit(v, type_size::SM, Weight::Regular, tw - lw - em(28.0)), type_size::SM, Weight::Regular, t.text_primary());
+                }
+                _ => {}
             }
         }
         Item::Lane(k) => {

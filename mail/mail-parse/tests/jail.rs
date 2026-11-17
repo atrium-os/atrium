@@ -281,3 +281,24 @@ fn encrypted_mail_is_read_with_a_key_unwrapped_outside() {
     assert!(matches!(f.into_iter().next(), Some(FromJail::Opened { result: Err(_), .. })));
     e.finish();
 }
+
+#[test]
+fn an_order_in_json_ld_becomes_a_card() {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let rec = format!("v=DKIM1; k=ed25519; p={}", b64(kp.public_key().as_ref()));
+    let body = "<script type=\"application/ld+json\">{\"@type\":\"Order\",\"orderNumber\":\"A-77\",\"merchant\":{\"name\":\"Shop\"},\"orderStatus\":\"http://schema.org/OrderDelivered\",\"url\":\"https://shop.example/o/77\"}</script>\r\n<p>Delivered.</p>\r\n";
+    let raw = signed(&kp, HEADERS, body);
+    let mut e = Engine::start();
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
+    let dns = |n: &str| (n == "sel._domainkey.example.com").then(|| rec.clone());
+    let out = e.run(raw.len() as u64, &dns);
+    let FromJail::Opened { id: 9, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
+    assert!(matches!(o.summary.sender_check, wire::SenderCheck::Verified { .. }));
+    let c = o.card.as_ref().expect("a card");
+    assert_eq!((c.kind, c.title.as_str()), (wire::CardKind::Order, "Order A-77"));
+    assert_eq!(c.fields, vec![(wire::CardField::Status, "Delivered".into()), (wire::CardField::Merchant, "Shop".into()), (wire::CardField::Number, "A-77".into())]);
+    // The script is gone from the document the viewer gets.
+    assert!(!o.document.as_ref().unwrap().html.contains("ld+json"));
+    e.finish();
+}
