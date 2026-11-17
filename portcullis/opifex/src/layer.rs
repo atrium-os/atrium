@@ -72,7 +72,10 @@ pub fn install(src: &Path, o: &InstallOpts) -> Result<(LayerManifest, PathBuf), 
         if o.keys.is_empty() {
             return Err(format!("no platform keys in {PLATFORM_KEYS}: a layer can't be checked"));
         }
-        let raw = fs::read(src.join(SIG)).map_err(|e| format!("{SIG}: {e}"))?;
+        let raw = fs::read(src.join(SIG)).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!("{} is not signed (no {SIG})", m.reference()),
+            _ => format!("{SIG}: {e}"),
+        })?;
         let sig = std::str::from_utf8(&raw).ok().and_then(|s| portcullis_sig::sig_from_base64(s).ok())
             .ok_or_else(|| format!("{SIG}: not base64"))?;
         portcullis_sig::verify_trusted(text.as_bytes(), &sig, o.keys)
