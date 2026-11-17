@@ -70,6 +70,10 @@ pub enum ToJail {
         /// For an encrypted message: the unwrapped content key; the jail
         /// decrypts and the answer is about the message inside.
         key: Option<Vec<u8>>,
+        /// OpenPGP keys Mail has for the sender (§10.2), to check a
+        /// PGP/MIME signature: at most [`PGP_KEYS_MAX`], each at most
+        /// [`PGP_KEY_MAX`] bytes.
+        pgp_keys: Vec<Vec<u8>>,
         message: Raw,
         /// Remote pictures already loaded (§7.4): resource id and their
         /// first bytes (at most [`LOADED_HEAD`] each, [`LOADED_MAX`] of
@@ -123,6 +127,9 @@ pub enum FromJail {
     /// The index into the certificates sent and the wrapped key, or None
     /// when the message isn't encrypted to any of them.
     KeyFor { id: u64, which: Option<(u32, Vec<u8>)> },
+    /// The message's `Autocrypt:` key (§10.2), checked to be for its From
+    /// address: sent before that message's `Summary`.
+    Autocrypt { id: u64, addr: String, key: Vec<u8> },
     Done,
 }
 
@@ -278,6 +285,33 @@ pub struct Opened {
     /// An order, trip or booking the sender described in schema.org
     /// JSON-LD (§14.3). Shown only when the sender is verified.
     pub card: Option<Card>,
+    /// A PGP/MIME signature, checked against the keys the engine sent.
+    pub pgp: Option<Pgp>,
+    /// PGP/MIME encrypted: reading it needs the person's key (in Arca).
+    pub pgp_encrypted: bool,
+}
+
+/// OpenPGP keys sent with an `Open`, and the largest.
+pub const PGP_KEYS_MAX: usize = 8;
+pub const PGP_KEY_MAX: usize = 64 << 10;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PgpState {
+    /// By a key Mail has for From.
+    Valid,
+    /// By a key Mail has, for another address.
+    NotForFrom,
+    /// By a key Mail doesn't have.
+    NoKey,
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pgp {
+    pub state: PgpState,
+    /// The signing key's fingerprint (hex) and addresses, when Mail has it.
+    pub fingerprint: Option<String>,
+    pub emails: Vec<String>,
 }
 
 /// What a card is about (§14.3).
@@ -557,6 +591,13 @@ impl Opened {
                 if text.chars().count() > LINK_TEXT_MAX || text.len() > 4 * LINK_TEXT_MAX { return Err(Lie("link text too long")) }
             }
         }
+        if let Some(p) = &self.pgp {
+            if let PgpState::Invalid(w) = &p.state { short(w, c, "pgp reason")? }
+            if p.fingerprint.as_ref().is_some_and(|f| f.len() > 64 || !f.chars().all(|c| c.is_ascii_hexdigit())) { return Err(Lie("pgp fingerprint")) }
+            if p.emails.len() > 16 { return Err(Lie("too many pgp addresses")) }
+            for e in &p.emails { short(e, c, "pgp address")? }
+            if p.state == PgpState::Valid && !self.summary.from.first().is_some_and(|f| p.emails.iter().any(|e| e.eq_ignore_ascii_case(&f.addr))) { return Err(Lie("pgp signature valid for another address")) }
+        }
         if let Some(card) = &self.card {
             if card.fields.len() > CARD_FIELDS_MAX { return Err(Lie("too many card fields")) }
             for v in std::iter::once(&card.title).chain(card.fields.iter().map(|f| &f.1)) {
@@ -599,6 +640,11 @@ impl FromJail {
             FromJail::Query { name, .. } => if query_allowed(name) { Ok(()) } else { Err(Lie("lookup outside _domainkey/_dmarc")) },
             FromJail::Summary { result: Ok(s), .. } => s.check(c, raw_len),
             FromJail::Opened { result: Ok(o), .. } => o.check(c, raw_len),
+            FromJail::Autocrypt { addr, key, .. } => {
+                short(addr, c, "autocrypt address")?;
+                if !addr.contains('@') || key.is_empty() || key.len() > PGP_KEY_MAX { return Err(Lie("autocrypt key")) }
+                Ok(())
+            }
             FromJail::Attachment { result: Ok(a), .. } => {
                 if a.bytes.len() as u64 > raw_len { return Err(Lie("attachment larger than its message")) }
                 if a.text.as_ref().is_some_and(|t| t.len() > ATTACHMENT_TEXT_MAX) { return Err(Lie("attachment text too long")) }
@@ -670,6 +716,8 @@ mod tests {
             }),
             attachments: vec![],
             card: None,
+            pgp: None,
+            pgp_encrypted: false,
         };
         let c = Caps::default();
         assert_eq!(o.check(&c, 100), Ok(()));

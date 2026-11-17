@@ -438,7 +438,7 @@ fn sign_through_sigillum() {
     assert!(matches!(&asked[0], Request::ChooseCertificate(c) if c.purpose == CertPurpose::MailSign { from: "grace@example.net".into() }));
     let (_, o) = engine.store.outbox().unwrap().remove(0);
     let sent = engine.store.blob(&o.message).unwrap();
-    let opened = engine.parser.open(&sent, vec![], &[data("ca.der")], None).unwrap().unwrap();
+    let opened = engine.parser.open(&sent, vec![], &[data("ca.der")], None, vec![]).unwrap().unwrap();
     assert_eq!(opened.summary.smime.unwrap().state, mail_schema::SmimeState::Valid);
     assert_eq!(opened.summary.text.as_deref().map(str::trim), Some("Hello Ada."));
 }

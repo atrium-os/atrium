@@ -9,6 +9,8 @@ description = "Mail's engine (docs/spec/mail.md §4, §6): the store and index f
 [dependencies]
 mail-compose = { path = "../mail-compose" }
 mail-smime = { path = "../mail-smime" }
+# OpenPGP (§10.2): encrypting to keys, and reading a key the person gives.
+mail-pgp = { path = "../mail-pgp" }
 mail-schema = { path = "../mail-schema" }
 mail-store = { path = "../mail-store" }
 mail-sync = { path = "../mail-sync" }
@@ -26,6 +28,9 @@ mail-proto = { path = "../mail-proto" }
 # S/MIME round trips with a software key.
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
+# OpenPGP: keys and signatures made as senders would.
+pgp = { version = "0.21", default-features = false }
+rand = "0.8"
 # The end-to-end test: a real Dovecot over TLS, through the real Arca mail
 # courier, into the engine with real parse jails.
 arca-courier = { path = "../../arca/arca-courier" }

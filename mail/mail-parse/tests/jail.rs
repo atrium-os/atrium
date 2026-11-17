@@ -100,7 +100,7 @@ fn opening_converts_the_html_and_drops_the_pixel() {
     let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
     let raw = signed(&kp, HEADERS, BODY);
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 7, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 7, bytes: raw.clone() }, loaded: vec![], pgp_keys: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 7, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     assert_eq!(o.summary.sender_check, wire::SenderCheck::Pending, "no key could be fetched");
@@ -149,7 +149,7 @@ fn a_message_s_own_pictures_come_with_its_document() {
 --b\r\nContent-Type: image/png\r\nContent-ID: <logo@shop>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--b--\r\n",
         b64(&dot), b64(&logo)).into_bytes();
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![], pgp_keys: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 9, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     let d = o.document.as_ref().unwrap();
@@ -168,7 +168,7 @@ fn a_message_s_own_pictures_come_with_its_document() {
 fn attachments_are_listed_and_handed_over() {
     let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: files\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n--B\r\nContent-Type: application/pdf; name=\"invoice.pdf\"\r\nContent-Disposition: attachment; filename=\"invoice.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nUEsDBHNjcmlwdA==\r\n--B\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=\"../notes.txt\"\r\n\r\nquarterly numbers\r\n--B--\r\n".to_vec();
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 3, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 3, bytes: raw.clone() }, loaded: vec![], pgp_keys: vec![] });
     let out = e.run(raw.len() as u64, &|_| None);
     let FromJail::Opened { id: 3, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
     let names: Vec<&str> = o.attachments.iter().map(|a| a.name.as_str()).collect();
@@ -199,7 +199,7 @@ fn smime_signature_is_checked_against_the_engine_s_roots() {
     let now = 1_800_000_000;
     let run = |roots: Vec<Vec<u8>>, raw: &[u8]| {
         let mut e = Engine::start();
-        e.send(&ToJail::Open { authserv_id: None, me: vec![], now, roots, key: None, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded: vec![] });
+        e.send(&ToJail::Open { authserv_id: None, me: vec![], now, roots, key: None, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded: vec![], pgp_keys: vec![] });
         let f = e.run(raw.len() as u64, &|_| None);
         e.finish();
         match f.into_iter().next() { Some(FromJail::Opened { result: Ok(o), .. }) => o, other => panic!("{other:?}") }
@@ -264,7 +264,7 @@ fn encrypted_mail_is_read_with_a_key_unwrapped_outside() {
     let Some(FromJail::KeyFor { which: Some((1, wrapped)), .. }) = f.into_iter().next() else { panic!() };
     let key = rsa::RsaPrivateKey::from_pkcs8_der(&d("leaf.p8")).unwrap().decrypt(rsa::Pkcs1v15Encrypt, &wrapped).unwrap();
 
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: Some(key.clone()), message: msg(), loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: Some(key.clone()), message: msg(), loaded: vec![], pgp_keys: vec![] });
     let f = e.run(len, &|_| None);
     let Some(FromJail::Opened { result: Ok(o), .. }) = f.into_iter().next() else { panic!() };
     assert!(o.summary.encrypted);
@@ -276,7 +276,7 @@ fn encrypted_mail_is_read_with_a_key_unwrapped_outside() {
     let Some(FromJail::Attachment { result: Ok(a), .. }) = f.into_iter().next() else { panic!() };
     assert_eq!(a.bytes, b"step,when\r\none,now");
     // A wrong key reads nothing.
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: Some(vec![7; 32]), message: msg(), loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: Some(vec![7; 32]), message: msg(), loaded: vec![], pgp_keys: vec![] });
     let f = e.run(len, &|_| None);
     assert!(matches!(f.into_iter().next(), Some(FromJail::Opened { result: Err(_), .. })));
     e.finish();
@@ -290,7 +290,7 @@ fn an_order_in_json_ld_becomes_a_card() {
     let body = "<script type=\"application/ld+json\">{\"@type\":\"Order\",\"orderNumber\":\"A-77\",\"merchant\":{\"name\":\"Shop\"},\"orderStatus\":\"http://schema.org/OrderDelivered\",\"url\":\"https://shop.example/o/77\"}</script>\r\n<p>Delivered.</p>\r\n";
     let raw = signed(&kp, HEADERS, body);
     let mut e = Engine::start();
-    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![] });
+    e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 9, bytes: raw.clone() }, loaded: vec![], pgp_keys: vec![] });
     let dns = |n: &str| (n == "sel._domainkey.example.com").then(|| rec.clone());
     let out = e.run(raw.len() as u64, &dns);
     let FromJail::Opened { id: 9, result: Ok(o) } = &out[0] else { panic!("{out:?}") };
@@ -300,5 +300,53 @@ fn an_order_in_json_ld_becomes_a_card() {
     assert_eq!(c.fields, vec![(wire::CardField::Status, "Delivered".into()), (wire::CardField::Merchant, "Shop".into()), (wire::CardField::Number, "A-77".into())]);
     // The script is gone from the document the viewer gets.
     assert!(!o.document.as_ref().unwrap().html.contains("ld+json"));
+    e.finish();
+}
+
+#[test]
+fn autocrypt_keys_come_out_and_pgp_signatures_are_checked() {
+    use pgp::composed::{ArmorOptions, DetachedSignature, EncryptionCaps, KeyType, SecretKeyParamsBuilder, SubkeyParamsBuilder};
+    use pgp::crypto::{ecc_curve::ECCCurve, hash::HashAlgorithm};
+    use pgp::ser::Serialize;
+    use pgp::types::Password;
+    let mut p = SecretKeyParamsBuilder::default();
+    p.key_type(KeyType::Ed25519Legacy).can_certify(true).can_sign(true).primary_user_id("Priya Nair <priya@example.com>".into())
+        .subkeys(vec![SubkeyParamsBuilder::default().key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy)).can_encrypt(EncryptionCaps::All).build().unwrap()]);
+    let sk = p.build().unwrap().generate(rand::thread_rng()).unwrap();
+    let key = sk.to_public_key().to_bytes().unwrap();
+
+    // The signed part ends before the line end that starts the boundary.
+    let content = "Content-Type: text/plain; charset=utf-8\r\n\r\nThe numbers are in.";
+    let sig = DetachedSignature::sign_binary_data(rand::thread_rng(), &sk.primary_key, &Password::empty(), HashAlgorithm::Sha256, content.as_bytes()).unwrap();
+    let sig = sig.to_armored_string(ArmorOptions::default()).unwrap().replace("\r\n", "\n").replace('\n', "\r\n");
+    let keydata: String = b64(&key).as_bytes().chunks(76).map(|c| format!(" {}\r\n", std::str::from_utf8(c).unwrap())).collect();
+    let raw = format!(
+        "From: Priya Nair <priya@example.com>\r\nTo: me@example.org\r\nSubject: Numbers\r\nAutocrypt: addr=priya@example.com; keydata=\r\n{keydata}\
+MIME-Version: 1.0\r\nContent-Type: multipart/signed; micalg=pgp-sha256; protocol=\"application/pgp-signature\"; boundary=\"b1\"\r\n\r\n\
+--b1\r\n{content}\r\n--b1\r\nContent-Type: application/pgp-signature; name=\"signature.asc\"\r\n\r\n{sig}\r\n--b1--\r\n"
+    ).into_bytes();
+    let len = raw.len() as u64;
+
+    let mut e = Engine::start();
+    e.send(&ToJail::Summarize { authserv_id: None, me: vec![], now: 0, headers_only: false, roots: vec![], batch: vec![wire::Raw { id: 4, bytes: raw.clone() }] });
+    let f = e.run(len, &|_| None);
+    let learned = f.iter().find_map(|x| match x { FromJail::Autocrypt { id: 4, addr, key } => Some((addr.clone(), key.clone())), _ => None });
+    assert_eq!(learned, Some(("priya@example.com".into(), key.clone())), "{f:?}");
+    assert!(f.iter().any(|x| matches!(x, FromJail::Summary { id: 4, result: Ok(_) })));
+
+    let open = |e: &mut Engine, keys: Vec<Vec<u8>>, bytes: Vec<u8>| {
+        let len = bytes.len() as u64;
+        e.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 5, bytes }, loaded: vec![], pgp_keys: keys });
+        match e.run(len, &|_| None).into_iter().next() { Some(FromJail::Opened { result: Ok(o), .. }) => o.pgp.expect("a pgp check"), o => panic!("{o:?}") }
+    };
+    let ok = open(&mut e, vec![key.clone()], raw.clone());
+    assert_eq!(ok.state, wire::PgpState::Valid);
+    assert_eq!(ok.fingerprint.as_ref().unwrap().len(), 40);
+    assert_eq!(open(&mut e, vec![], raw.clone()).state, wire::PgpState::NoKey);
+    let changed = String::from_utf8(raw.clone()).unwrap().replace("numbers are in", "numbers are out").into_bytes();
+    assert!(matches!(open(&mut e, vec![key.clone()], changed).state, wire::PgpState::Invalid(_)));
+    // Kept with bare line ends, it still checks as sent.
+    let lf = String::from_utf8(raw).unwrap().replace("\r\n", "\n").into_bytes();
+    assert_eq!(open(&mut e, vec![key], lf).state, wire::PgpState::Valid);
     e.finish();
 }

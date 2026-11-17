@@ -57,6 +57,22 @@ pub fn enveloped(outer: &[u8], env: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `outer` with a PGP/MIME encrypted body (RFC 3156 §4): `armored`, the
+/// OpenPGP message, ASCII-armored.
+pub fn pgp_encrypted(outer: &[u8], armored: &[u8], boundary: &str) -> Vec<u8> {
+    let mut out = outer.to_vec();
+    out.extend_from_slice(format!("Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"{boundary}\"\r\n\r\n").as_bytes());
+    out.extend_from_slice(format!("This is an OpenPGP/MIME encrypted message (RFC 3156).\r\n--{boundary}\r\nContent-Type: application/pgp-encrypted\r\nContent-Description: PGP/MIME version identification\r\n\r\nVersion: 1\r\n\r\n--{boundary}\r\nContent-Type: application/octet-stream; name=\"encrypted.asc\"\r\nContent-Description: OpenPGP encrypted message\r\nContent-Disposition: inline; filename=\"encrypted.asc\"\r\n\r\n").as_bytes());
+    // Armor, with CRLF line ends whatever it came with.
+    for line in armored.split(|b| *b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +92,9 @@ mod tests {
         assert!(split(b"Subject: x\r\n\r\nbody").is_none());
         // "Content-Type" only in the body doesn't count.
         assert!(split(b"Subject: x\r\n\r\nContent-Type: y\r\n").is_none());
+        let p = String::from_utf8(pgp_encrypted(outer, b"-----BEGIN PGP MESSAGE-----\n\nwV4D\n-----END PGP MESSAGE-----\n", "E")).unwrap();
+        assert!(p.contains("Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"E\"\r\n\r\n"), "{p}");
+        assert!(p.contains("\r\n--E\r\nContent-Type: application/pgp-encrypted\r\n") && p.contains("Version: 1\r\n"));
+        assert!(p.contains("\r\nwV4D\r\n-----END PGP MESSAGE-----\r\n\r\n--E--\r\n"), "{p}");
     }
 }

@@ -22,10 +22,12 @@ mail-schema = { path = "../mail-schema", optional = true }
 mail-smime = { path = "../mail-smime", optional = true }
 # Cards (§14.3): the sender's schema.org JSON-LD, read in the jail.
 serde_json = { version = "1", optional = true }
+# OpenPGP (§10.2): Autocrypt keys and PGP/MIME signatures, checked in the jail.
+mail-pgp = { path = "../mail-pgp", optional = true }
 
 [features]
 default = ["html", "jail"]
-jail = ["html", "dep:mail-schema", "dep:mail-smime", "dep:serde_json"]
+jail = ["html", "dep:mail-schema", "dep:mail-smime", "dep:serde_json", "dep:mail-pgp"]
 html = ["dep:navigator-dom", "dep:navigator-normalize", "dep:navigator-render", "dep:navigator-style", "dep:navigator-image"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
@@ -35,6 +37,9 @@ mail-schema = { path = "../mail-schema" }
 png = "0.17"
 # S/MIME: unwrapping a content key as the token would.
 rsa = "0.9"
+# OpenPGP: a key and a signature made as a sender would.
+pgp = { version = "0.21", default-features = false }
+rand = "0.8"
 
 [[bin]]
 name = "mail-parse-jail"

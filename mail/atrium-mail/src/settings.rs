@@ -66,6 +66,9 @@ pub struct SettingsUi {
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
     pub privates: Vec<mail_engine::private::Private>,
+    /// The person's own OpenPGP key for that account (§10.2): its
+    /// addresses and short fingerprint.
+    pub my_key: Option<(String, String)>,
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
@@ -188,10 +191,11 @@ impl Settings {
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
         let pd = pa.and_then(|a| e.private_domain(a));
         let privates = pa.map(|a| e.private_addresses(a)).unwrap_or_default();
+        let my_key = pa.and_then(|a| e.my_pgp_key(a)).map(|k| (k.emails.join(", "), k.short()));
         if pa != u.priv_account {
             self.domain.set(TextEdit::new(pd.as_deref().unwrap_or("")));
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
@@ -199,6 +203,7 @@ impl Settings {
                 u.priv_account = pa;
                 u.priv_domain = pd;
                 u.privates = privates;
+                u.my_key = my_key;
             });
         }
     }
@@ -440,6 +445,28 @@ impl Settings {
             })
         });
         self.reload();
+    }
+
+    /// An OpenPGP public key, pasted (armored): the person's own, or
+    /// someone's they write to.
+    pub fn give_key(&self, text: &str, now: i64) {
+        let r = self.engine.give_pgp_key(text.trim().as_bytes(), now);
+        self.update(|u| {
+            u.note = Some(match r {
+                Ok(k) => format!("Mail will encrypt to {} with key {}.", k.emails.join(", "), k.short()),
+                Err(e) => format!("Couldn't use it: {e}"),
+            })
+        });
+        self.reload();
+    }
+
+    /// "Paste a key": from the clipboard.
+    pub fn paste_key(&self, now: i64) {
+        match pergola::clipboard::paste_text() {
+            Ok(Some(t)) => self.give_key(&t, now),
+            Ok(None) => self.update(|u| u.note = Some("The clipboard has no text: copy the key (it starts with -----BEGIN PGP PUBLIC KEY BLOCK-----) first.".into())),
+            Err(_) => self.update(|u| u.note = Some("Couldn't read the clipboard.".into())),
+        }
     }
 
     /// A new address for the site typed in, copied for pasting.
@@ -711,6 +738,23 @@ impl View for SettingsView {
                 button(ctx, r.x() + r.w() + em(8.0), y + em(16.0), "Cancel", false, !keeping, move || s.cancel_adding());
                 y += em(44.0);
             }
+        }
+
+        // OpenPGP (§10.2): the person's own key, for copies of encrypted
+        // mail they can read; anyone's key can be pasted too.
+        if ui.priv_account.is_some() {
+            y += em(16.0);
+            section(ctx, x, &mut y, "OPENPGP");
+            let bw = measure("Paste a key", type_size::SM, Weight::Medium) + em(24.0);
+            let (l, sub) = match &ui.my_key {
+                Some((who, fp)) => (format!("Your key: {fp}"), format!("for {who}")),
+                None => ("No key of yours yet".to_string(), "It comes from your own sent mail, or paste it".to_string()),
+            };
+            text(ctx, x, y + em(12.0), &crate::view::fit_text(&l, type_size::SM, Weight::Regular, inner - bw - em(8.0)), type_size::SM, Weight::Regular, t.text_primary());
+            text(ctx, x, y + em(30.0), &crate::view::fit_text(&sub, type_size::XS, Weight::Regular, inner - bw - em(8.0)), type_size::XS, Weight::Regular, t.text_secondary());
+            let s = self.s.clone();
+            button(ctx, right - bw, y + em(20.0), "Paste a key", false, true, move || s.paste_key(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
+            y += em(44.0);
         }
 
         // Private addresses (§13.3), for one account at a time.

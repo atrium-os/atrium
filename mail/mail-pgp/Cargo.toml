@@ -1,0 +1,12 @@
+[package]
+name = "mail-pgp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "OpenPGP for Mail (mail.md §10.2): verify, Autocrypt keys, encrypt; rpgp (MIT/Apache)"
+
+[dependencies]
+pgp = { version = "0.21", default-features = false }
+rand = "0.8"
+
+[dev-dependencies]

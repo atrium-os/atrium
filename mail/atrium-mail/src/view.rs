@@ -95,6 +95,8 @@ pub struct Body {
     pub files: Vec<crate::files::File>,
     /// The sender's card (§14.3), from a verified sender only.
     pub card: Option<mail_schema::Card>,
+    /// The OpenPGP line (§10.2): who signed, or why not.
+    pub pgp: Option<(String, sender::Tone)>,
 }
 
 /// A message in the reader.
@@ -588,13 +590,14 @@ impl Mail {
                     self.loads.borrow_mut().push(msg);
                 }
                 let note = match (&r.text, &r.document) {
+                    _ if r.pgp_encrypted => Some("This message is encrypted with OpenPGP. Mail can't decrypt it here yet: reading it needs your private key in Arca, which is still to come.".to_string()),
                     (None, _) => Some("Only the headers are here so far; the text comes with the next sync.".to_string()),
                     (Some(t), None) if r.has_html && t.trim().is_empty() => Some("This message's HTML couldn't be shown.".to_string()),
                     _ => None,
                 };
                 let plain = r.text.filter(|t| !t.trim().is_empty()).map(|t| plain::parse(&t));
                 let files = r.attachments.iter().map(crate::files::file).collect();
-                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files, card: r.card }
+                Body { plain, document: r.document.map(|d| Doc(Rc::new(d))), note, show_quoted: false, show_signature: false, remote, loading: always, files, card: r.card, pgp: r.pgp.as_ref().map(sender::pgp_line) }
             }
             Err(e) => Body { plain: None, note: Some(format!("Couldn't open this message: {e}")), ..Body::default() },
         }
@@ -1787,6 +1790,8 @@ pub enum Item {
     RepliesTo(usize),
     /// "Signed by …" (§10.1).
     Smime(usize),
+    /// "Signed with OpenPGP by …" (§10.2).
+    Pgp(usize),
     /// A note (headers only, HTML only, couldn't open), one line of it.
     Note(String),
     /// "New since you last looked" (§11.1).
@@ -1861,6 +1866,10 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         }
         out.push(Item::Gap);
         let Some(b) = &m.body else { continue };
+        if b.pgp.is_some() {
+            out.push(Item::Pgp(k));
+            out.push(Item::Gap);
+        }
         if let Some(c) = &b.card {
             out.push(Item::CardTitle(k));
             for i in 0..c.fields.len() {
@@ -2669,8 +2678,9 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             let r = s.msgs[*k].sender.replies_to.clone().unwrap_or_default();
             text(ctx, x, cy, &fit(&format!("Replies go to {r}"), type_size::XS, Weight::Regular, tw), type_size::XS, Weight::Regular, t.warning_fg());
         }
-        Item::Smime(k) => {
-            let Some((l, tone)) = &s.msgs[*k].smime else { return };
+        Item::Smime(k) | Item::Pgp(k) => {
+            let line = match item { Item::Smime(_) => s.msgs[*k].smime.as_ref(), _ => s.msgs[*k].body.as_ref().and_then(|b| b.pgp.as_ref()) };
+            let Some((l, tone)) = line else { return };
             let c = match tone {
                 sender::Tone::Good => t.success_fg(),
                 sender::Tone::Warn => t.warning_fg(),

@@ -123,6 +123,13 @@ impl Walk<'_> {
                 {
                     let sig_path = if path.is_empty() { "2".to_string() } else { format!("{path}.2") };
                     s.signed = Some(crate::Signed { content: children[0], signature: sig_path });
+                } else if ct.value == "multipart/signed" && s.pgp_signed.is_none() && children.len() == 2 && protocol.as_deref() == Some("application/pgp-signature") {
+                    // PGP/MIME (RFC 3156 §5): the same shape, an OpenPGP signature.
+                    let sig_path = if path.is_empty() { "2".to_string() } else { format!("{path}.2") };
+                    s.pgp_signed = Some(crate::Signed { content: children[0], signature: sig_path });
+                }
+                if depth == 0 && ct.value == "multipart/encrypted" && protocol.as_deref() == Some("application/pgp-encrypted") {
+                    s.pgp_encrypted = true;
                 }
                 for (n, child) in children.into_iter().enumerate() {
                     let child_path = if path.is_empty() { format!("{}", n + 1) } else { format!("{}.{}", path, n + 1) };
@@ -153,7 +160,7 @@ impl Walk<'_> {
                 _ => false,
             };
         }
-        let kind = if matches!(ct.value.as_str(), "application/pkcs7-signature" | "application/x-pkcs7-signature") {
+        let kind = if matches!(ct.value.as_str(), "application/pkcs7-signature" | "application/x-pkcs7-signature" | "application/pgp-signature") {
             PartKind::Signature
         } else if ct.value == "message/rfc822" || ct.value == "message/global" {
             PartKind::Message

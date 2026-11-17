@@ -147,6 +147,7 @@ impl Engine {
         let (outer, entity) = shape::split(&w.bytes).ok_or(Error::Compose("the message can't be cut for S/MIME".into()))?;
         let mut bytes = w.bytes.clone();
         let mut own: Option<Vec<u8>> = None;
+        let signed = p.sign.is_some();
         if let Some(s) = p.sign {
             let sig = mail_smime::sign::detached(entity, &s.cert, &s.chain, t, s.sign).map_err(Error::Compose)?;
             let boundary = format!("=_atrium_sig_{}", random[8..].iter().map(|b| format!("{b:02x}")).collect::<String>());
@@ -157,8 +158,21 @@ impl Engine {
         }
         if p.encrypt {
             let missing: Vec<String> = w.rcpts.iter().filter(|a| self.cert_for(a).is_none()).cloned().collect();
+            // Not everyone has a certificate: OpenPGP, when everyone has a
+            // key and nothing was signed with S/MIME (§10.2).
+            if !missing.is_empty() && !signed && w.rcpts.iter().all(|a| !self.pgp_keys_for(a).is_empty()) {
+                let entity = shape::entity_of(&bytes).ok_or(Error::Compose("the message can't be cut for OpenPGP".into()))?.to_vec();
+                let armored = self.pgp_encrypt(&entity, &w.from, &w.rcpts)?;
+                let outer = shape::split(&bytes).map(|(o, _)| o.to_vec()).unwrap_or_default();
+                let boundary = format!("=_atrium_pgp_{}", random[8..].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                bytes = shape::pgp_encrypted(&outer, &armored, &boundary);
+                if bytes.len() > mail_compose::write::MESSAGE_MAX {
+                    return Err(Error::Compose("the message is too large".into()));
+                }
+                return Ok(bytes);
+            }
             if !missing.is_empty() {
-                return Err(Error::Compose(format!("No certificate to encrypt to {}: they need to send you signed mail first", missing.join(", "))));
+                return Err(Error::Compose(format!("No certificate or OpenPGP key to encrypt to {}: they need to send you signed mail, or mail with their key, first", missing.join(", "))));
             }
             // A copy the person can read again: their own certificate.
             let own = own.or_else(|| self.cert_for(&w.from).map(|c| c.der)).ok_or(Error::Compose("Mail has no certificate of yours to keep a copy you can read; sign a message first".into()))?;

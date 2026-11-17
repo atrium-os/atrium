@@ -149,7 +149,9 @@ fn settings_window() {
         reached: Reached::Ok { at: 1 },
     }).unwrap();
     s.reload();
-    drawn(&mut app, &["PRIVATE ADDRESSES", "Domain", "Save"]);
+    drawn(&mut app, &["PRIVATE ADDRESSES", "Domain", "Save", "OPENPGP", "No key of yours yet", "Paste a key"]);
+    s.give_key("hello", 5);
+    assert!(s.ui.get_cloned().note.unwrap().starts_with("Couldn't use it"));
     s.domain.set(TextEdit::new("me.example"));
     s.save_domain();
     assert_eq!(engine.private_domain(id).as_deref(), Some("me.example"));

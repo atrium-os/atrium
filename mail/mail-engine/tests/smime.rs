@@ -122,7 +122,7 @@ fn sent_signed_and_encrypted() {
     let outer: String = outer.lines().filter(|l| !l.starts_with("Content-") && !l.starts_with(' ')).map(|l| format!("{l}\r\n")).collect();
     let mut opened = outer.into_bytes();
     opened.extend_from_slice(&inner);
-    let o = engine.parser.open(&opened, vec![], &[data("ca.der")], None).unwrap().unwrap();
+    let o = engine.parser.open(&opened, vec![], &[data("ca.der")], None, vec![]).unwrap().unwrap();
     assert_eq!(o.summary.smime.unwrap().state, SmimeState::Valid);
     assert_eq!(o.summary.text.as_deref().map(str::trim), Some("The plan."));
 }

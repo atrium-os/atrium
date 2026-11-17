@@ -92,12 +92,37 @@ pub fn smime_line(s: &Summary) -> Option<(String, Tone)> {
     })
 }
 
+/// The OpenPGP line (§10.2): who signed, or why not.
+pub fn pgp_line(p: &mail_schema::Pgp) -> (String, Tone) {
+    use mail_schema::PgpState as S;
+    let key = p.fingerprint.as_deref().map(|f| {
+        let tail = &f[f.len().saturating_sub(16)..];
+        tail.as_bytes().chunks(4).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(" ")
+    });
+    let who = p.emails.first().cloned().unwrap_or_else(|| "someone".into());
+    match &p.state {
+        S::Valid => (match key { Some(k) => format!("Signed with OpenPGP by {who} · key {k}"), None => format!("Signed with OpenPGP by {who}") }, Tone::Good),
+        S::NoKey => ("Signed with OpenPGP by a key Mail doesn't have; it comes with their mail, or add it in Settings".into(), Tone::Plain),
+        S::NotForFrom => (format!("Signed with an OpenPGP key for {who}, not the sender's address"), Tone::Bad),
+        S::Invalid(why) => (format!("The OpenPGP signature isn't good: {why}"), Tone::Bad),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn a(name: &str, addr: &str) -> Address {
         Address { name: name.into(), addr: addr.into(), name_looks_like_address: false }
+    }
+
+    #[test]
+    fn pgp_lines() {
+        use mail_schema::{Pgp, PgpState};
+        let p = Pgp { state: PgpState::Valid, fingerprint: Some("0123456789ABCDEF0123456789ABCDEF01234567".into()), emails: vec!["priya@example.com".into()] };
+        assert_eq!(pgp_line(&p), ("Signed with OpenPGP by priya@example.com · key 89AB CDEF 0123 4567".to_string(), Tone::Good));
+        assert_eq!(pgp_line(&Pgp { state: PgpState::NotForFrom, ..p.clone() }).1, Tone::Bad);
+        assert_eq!(pgp_line(&Pgp { state: PgpState::NoKey, fingerprint: None, emails: vec![] }).1, Tone::Plain);
     }
 
     #[test]

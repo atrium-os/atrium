@@ -41,14 +41,26 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 if !roots_ok(&roots) || batch.len() > wire::MAX_BATCH || batch.iter().map(|m| m.bytes.len()).sum::<usize>() > wire::MAX_BATCH_BYTES {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "batch over its limits"));
                 }
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only, roots: &roots };
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only, roots: &roots, pgp_keys: &[] };
                 for m in &batch {
-                    let result = summarize(&m.bytes, &ctx, &port).map(|(s, _)| s);
-                    port.borrow_mut().send(&wire::FromJail::Summary { id: m.id, result })?;
+                    let result = summarize(&m.bytes, &ctx, &port);
+                    // Autocrypt (§10.2): a key for From's own address, before its summary.
+                    if let Ok((_, s)) = &result {
+                        let from = s.from.first().map(|a| a.addr.to_ascii_lowercase());
+                        if let Some((addr, key)) = s.autocrypt.as_deref().and_then(mail_pgp::autocrypt) {
+                            if Some(&addr) == from.as_ref() && key.len() <= wire::PGP_KEY_MAX {
+                                port.borrow_mut().send(&wire::FromJail::Autocrypt { id: m.id, addr, key })?;
+                            }
+                        }
+                    }
+                    port.borrow_mut().send(&wire::FromJail::Summary { id: m.id, result: result.map(|(s, _)| s) })?;
                 }
             }
-            wire::ToJail::Open { authserv_id, me, now, roots, key, message, loaded } => {
-                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false, roots: &roots };
+            wire::ToJail::Open { authserv_id, me, now, roots, key, pgp_keys, message, loaded } => {
+                if pgp_keys.len() > wire::PGP_KEYS_MAX || pgp_keys.iter().any(|k| k.len() > wire::PGP_KEY_MAX) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "OpenPGP keys over their limits"));
+                }
+                let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false, roots: &roots, pgp_keys: &pgp_keys };
                 if !roots_ok(&roots) || loaded.len() > wire::LOADED_MAX || loaded.iter().any(|(id, b)| b.len() > wire::LOADED_HEAD || id.len() > 64) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "loaded pictures over their limits"));
                 }
@@ -118,7 +130,7 @@ fn decrypted(raw: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool, roots: &'a [Vec<u8>] }
+struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool, roots: &'a [Vec<u8>], pgp_keys: &'a [Vec<u8>] }
 
 fn roots_ok(roots: &[Vec<u8>]) -> bool {
     roots.len() <= wire::ROOTS_MAX && roots.iter().map(|r| r.len()).sum::<usize>() <= wire::ROOTS_BYTES_MAX
@@ -156,6 +168,36 @@ fn smime(raw: &[u8], s: &crate::Summary, ctx: &Ctx) -> Option<wire::Smime> {
     };
     let state = if signer.is_none() && !matches!(state, wire::SmimeState::Invalid(_)) { wire::SmimeState::Invalid("the signer's certificate is too large".into()) } else { state };
     Some(wire::Smime { state, signer, issuers: c.chain.into_iter().take(8).map(|i| cut(i.name)).collect(), signed_at: c.signed_at })
+}
+
+/// The message's PGP/MIME signature, checked against the sender's keys
+/// the engine sent (mail.md §10.2).
+fn pgp(raw: &[u8], s: &crate::Summary, ctx: &Ctx) -> Option<wire::Pgp> {
+    use mail_pgp::State;
+    let signed = s.pgp_signed.as_ref()?;
+    let part = s.parts.iter().find(|p| p.path == signed.signature)?;
+    let sig = mime::part_bytes(raw, part);
+    let content = &raw[signed.content.0..signed.content.1];
+    let from = s.from.first().map(|a| a.addr.as_str()).unwrap_or("");
+    let mut c = mail_pgp::verify(content, &sig, ctx.pgp_keys, from);
+    // Signed as CRLF lines; a copy kept with bare LFs is checked as sent.
+    if matches!(c.state, State::Invalid(_)) && content.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r') {
+        let mut crlf = Vec::with_capacity(content.len() + content.len() / 32);
+        for (i, b) in content.iter().enumerate() {
+            if *b == b'\n' && (i == 0 || content[i - 1] != b'\r') { crlf.push(b'\r') }
+            crlf.push(*b);
+        }
+        let again = mail_pgp::verify(&crlf, &sig, ctx.pgp_keys, from);
+        if !matches!(again.state, State::Invalid(_)) { c = again }
+    }
+    let cut = |t: String| -> String { t.chars().filter(|c| !c.is_control()).take(200).collect() };
+    let state = match c.state {
+        State::Valid => wire::PgpState::Valid,
+        State::NotForFrom => wire::PgpState::NotForFrom,
+        State::NoKey => wire::PgpState::NoKey,
+        State::Invalid(w) => wire::PgpState::Invalid(cut(w)),
+    };
+    Some(wire::Pgp { state, fingerprint: c.signer.as_ref().map(|i| i.fingerprint.clone()), emails: c.signer.map(|i| i.emails.into_iter().take(16).map(cut).collect()).unwrap_or_default() })
 }
 
 fn refusal(r: Refused) -> wire::Refusal {
@@ -337,7 +379,8 @@ fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, lo
     }).collect());
     let attachments = attachments(raw, &s, &shown);
     let card = s.html.as_deref().and_then(crate::cards::card);
-    Ok(wire::Opened { summary, document, attachments, card })
+    let pgp = pgp(raw, &s, ctx);
+    Ok(wire::Opened { summary, document, attachments, card, pgp, pgp_encrypted: s.pgp_encrypted })
 }
 
 /// The most files unpacked from a message's `winmail.dat` parts.

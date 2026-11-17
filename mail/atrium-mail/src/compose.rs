@@ -522,7 +522,7 @@ impl Composer {
     }
 
     /// Encrypt on or off. On only when every recipient has a certificate
-    /// Mail has seen (on signed mail from them).
+    /// Mail has seen (on signed mail from them), or else an OpenPGP key.
     pub fn toggle_encrypt(&self) {
         if self.ui.get_cloned().encrypt {
             self.ui.update(|u| u.encrypt = false);
@@ -530,17 +530,15 @@ impl Composer {
         }
         let d = self.draft();
         if d.to.is_empty() && d.cc.is_empty() && d.bcc.is_empty() {
-            self.ui.update(|u| u.error = Some("Add who it's for first: encrypting needs each one's certificate".into()));
+            self.ui.update(|u| u.error = Some("Add who it's for first: encrypting needs each one's certificate or key".into()));
             return;
         }
-        let missing = self.engine.missing_certs(&d);
-        if missing.is_empty() {
-            self.ui.update(|u| {
+        match self.engine.encryption_for(&d) {
+            Ok(_) => self.ui.update(|u| {
                 u.encrypt = true;
                 u.error = None;
-            });
-        } else {
-            self.ui.update(|u| u.error = Some(format!("Can't encrypt to {} yet: Mail needs a signed message from them first", missing.join(", "))));
+            }),
+            Err(missing) => self.ui.update(|u| u.error = Some(format!("Can't encrypt to {} yet: Mail needs a signed message, or their OpenPGP key, from them first", missing.join(", ")))),
         }
     }
 

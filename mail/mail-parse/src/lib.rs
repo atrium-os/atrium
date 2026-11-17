@@ -139,6 +139,12 @@ pub struct Summary {
     pub signed: Option<Signed>,
     /// The message is S/MIME encrypted (enveloped data at the top).
     pub encrypted: bool,
+    /// The first `multipart/signed` with an OpenPGP signature (§10.2).
+    pub pgp_signed: Option<Signed>,
+    /// PGP/MIME encrypted (`multipart/encrypted` at the top).
+    pub pgp_encrypted: bool,
+    /// The `Autocrypt:` header as sent (unfolded), if any.
+    pub autocrypt: Option<String>,
 }
 
 /// Where an S/MIME detached signature is.
@@ -190,6 +196,13 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<Summary, Refused> {
             .map(|v| matches!(String::from_utf8_lossy(v).trim().to_ascii_lowercase().as_str(), "bulk" | "list" | "junk"))
             .unwrap_or(false);
     s.dkim_signatures = header::get_all(&fields, "dkim-signature").count();
+    // One Autocrypt header counts; two mean neither does (Autocrypt 1.1 §2.3).
+    let mut ac = header::get_all(&fields, "autocrypt");
+    if let (Some(v), None) = (ac.next(), ac.next()) {
+        if v.len() <= 32 << 10 {
+            s.autocrypt = Some(String::from_utf8_lossy(v).replace(['\r', '\n'], ""));
+        }
+    }
 
     mime::walk(raw, &fields, body_at, limits, &mut s)?;
     s.preview = mime::preview(s.text.as_deref(), s.html.as_deref(), limits.max_preview);

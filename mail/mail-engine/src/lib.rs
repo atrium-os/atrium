@@ -32,6 +32,7 @@ pub mod accounts;
 pub mod prefs;
 pub mod lanes;
 pub mod private;
+pub mod pgp;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
@@ -136,6 +137,12 @@ impl Parser {
     /// Summaries for one batch, in order; `None` for a message the jail
     /// refused (too large, not mail). An invalid jail fails the batch.
     pub fn summarize(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>]) -> Result<Vec<Option<Summary>>, Error> {
+        self.summarize_keyed(batch, headers_only, roots).map(|(s, _)| s)
+    }
+
+    /// As [`Parser::summarize`], with the OpenPGP keys the messages carried
+    /// in `Autocrypt:` for their From addresses: `(index in batch, addr, key)`.
+    pub fn summarize_keyed(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>]) -> Result<(Vec<Option<Summary>>, Vec<(usize, String, Vec<u8>)>), Error> {
         let mut j = self.start()?;
         let msgs: Vec<wire::Raw> = batch.iter().map(|(id, b)| wire::Raw { id: *id, bytes: b.to_vec() }).collect();
         wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
@@ -143,20 +150,37 @@ impl Parser {
         let lens = |id: u64| batch.iter().find(|(i, _)| *i == id).map(|(_, b)| b.len() as u64);
         let frames = Self::exchange(&mut j, &lens)?;
         let mut out = vec![None; batch.len()];
+        let mut keys = Vec::new();
         let mut seen = 0;
         for f in frames {
-            let FromJail::Summary { id, result } = f else { return Err(Error::Jail("unexpected frame".into())) };
-            // Answers come in batch order, each once.
-            if batch.get(seen).map(|(i, _)| *i) != Some(id) {
-                return Err(Error::Jail("answers out of order".into()));
+            match f {
+                // A key comes just before its message's summary.
+                FromJail::Autocrypt { id, addr, key } => {
+                    if batch.get(seen).map(|(i, _)| *i) != Some(id) {
+                        return Err(Error::Jail("a key for a message out of order".into()));
+                    }
+                    if keys.iter().any(|(k, _, _)| *k == seen) {
+                        return Err(Error::Jail("two keys for one message".into()));
+                    }
+                    keys.push((seen, addr, key));
+                }
+                FromJail::Summary { id, result } => {
+                    // Answers come in batch order, each once.
+                    if batch.get(seen).map(|(i, _)| *i) != Some(id) {
+                        return Err(Error::Jail("answers out of order".into()));
+                    }
+                    out[seen] = result.ok();
+                    seen += 1;
+                }
+                _ => return Err(Error::Jail("unexpected frame".into())),
             }
-            out[seen] = result.ok();
-            seen += 1;
         }
         if seen != batch.len() {
             return Err(Error::Jail("missing answers".into()));
         }
-        Ok(out)
+        // A key counts only for a message summarized, and for its From.
+        keys.retain(|(i, addr, _)| out[*i].as_ref().and_then(|s| s.from.first()).is_some_and(|f| f.addr.eq_ignore_ascii_case(addr)));
+        Ok((out, keys))
     }
 
     /// One message for reading, alone in its jail.
@@ -191,9 +215,10 @@ impl Parser {
         }
     }
 
-    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>) -> Result<Option<Opened>, Error> {
+    pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>, pgp_keys: Vec<Vec<u8>>) -> Result<Option<Opened>, Error> {
         let mut j = self.start()?;
-        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), key, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded })
+        let pgp_keys = pgp_keys.into_iter().filter(|k| k.len() <= wire::PGP_KEY_MAX).take(wire::PGP_KEYS_MAX).collect();
+        wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), key, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded, pgp_keys })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
         let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
@@ -228,6 +253,16 @@ pub struct Reading {
     pub attachments: Vec<wire::Attachment>,
     /// The sender's card (§14.3), only when the sender is verified.
     pub card: Option<wire::Card>,
+    /// An OpenPGP signature as the jail checked it (§10.2).
+    pub pgp: Option<wire::Pgp>,
+    /// PGP/MIME encrypted: reading it needs the person's key, in Arca.
+    pub pgp_encrypted: bool,
+}
+
+impl Reading {
+    fn bare(summary: Summary, text: Option<String>) -> Reading {
+        Reading { summary, text, has_html: false, document: None, attachments: Vec::new(), card: None, pgp: None, pgp_encrypted: false }
+    }
 }
 
 /// What a parse leaves for the next opening: the converted document and
@@ -237,6 +272,8 @@ pub struct Shown {
     pub document: Option<wire::Document>,
     pub attachments: Vec<wire::Attachment>,
     pub card: Option<wire::Card>,
+    pub pgp: Option<wire::Pgp>,
+    pub pgp_encrypted: bool,
 }
 
 /// A card is shown only for a sender whose domain checked out (§14.3):
@@ -261,28 +298,32 @@ impl Engine {
     pub fn open(&self, msg: u64) -> Result<Reading, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let Some(full) = m.full else {
-            return Ok(Reading { summary: m.summary, text: None, has_html: false, document: None, attachments: Vec::new(), card: None });
+            return Ok(Reading::bare(m.summary, None));
         };
         if m.summary.encrypted {
             // Read only with its key, each time, and nothing of it kept.
             let Some(key) = self.keys.borrow().get(&msg).cloned() else {
-                return Ok(Reading { summary: m.summary, text: Some(String::new()), has_html: false, document: None, attachments: Vec::new(), card: None });
+                return Ok(Reading::bare(m.summary, Some(String::new())));
             };
             let raw = self.store.blob(&full)?;
-            return match self.parser.open(&raw, Vec::new(), &self.roots, Some(key))? {
+            return match self.parser.open(&raw, Vec::new(), &self.roots, Some(key), self.pgp_keys_of(&m.summary))? {
                 Some(o) => {
                     let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
                     let card = verified_card(&o.summary, o.card);
-                    Ok(Reading { has_html: o.document.is_some(), summary: o.summary, text, document: o.document, attachments: o.attachments, card })
+                    Ok(Reading { has_html: o.document.is_some(), summary: o.summary, text, document: o.document, attachments: o.attachments, card, pgp: o.pgp, pgp_encrypted: o.pgp_encrypted })
                 }
-                None => Ok(Reading { summary: m.summary, text: Some("This message couldn't be decrypted.".into()), has_html: false, document: None, attachments: Vec::new(), card: None }),
+                None => Ok(Reading::bare(m.summary, Some("This message couldn't be decrypted.".into()))),
             };
         }
-        if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()) {
+        let pgp_keys = self.pgp_keys_of(&m.summary);
+        // Kept from a parse that had no key for the signer, while there is
+        // one now: parse again.
+        let stale = |sh: &Shown| matches!(&sh.pgp, Some(p) if p.state == wire::PgpState::NoKey) && !pgp_keys.is_empty();
+        if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()).filter(|sh| !stale(sh)) {
             let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
             let card = verified_card(&m.summary, sh.card);
-            return Ok(Reading { summary: m.summary, text, has_html, document: sh.document, attachments: sh.attachments, card });
+            return Ok(Reading { summary: m.summary, text, has_html, document: sh.document, attachments: sh.attachments, card, pgp: sh.pgp, pgp_encrypted: sh.pgp_encrypted });
         }
         let raw = self.store.blob(&full)?;
         // Remote pictures already loaded: their first bytes, for their sizes.
@@ -292,17 +333,17 @@ impl Engine {
             .take(wire::LOADED_MAX)
             .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
             .collect();
-        match self.parser.open(&raw, loaded, &self.roots, None)? {
+        match self.parser.open(&raw, loaded, &self.roots, None, pgp_keys)? {
             Some(o) => {
-                let sh = Shown { document: o.document, attachments: o.attachments, card: o.card };
+                let sh = Shown { document: o.document, attachments: o.attachments, card: o.card, pgp: o.pgp, pgp_encrypted: o.pgp_encrypted };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
                 self.store.write(|w| w.set_document(msg, Some(h)))?;
                 let has_html = sh.document.is_some();
                 let text = o.summary.text.clone().or_else(|| sh.document.as_ref().map(|_| String::new()));
                 let card = verified_card(&o.summary, sh.card);
-                Ok(Reading { summary: o.summary, text, has_html, document: sh.document, attachments: sh.attachments, card })
+                Ok(Reading { summary: o.summary, text, has_html, document: sh.document, attachments: sh.attachments, card, pgp: sh.pgp, pgp_encrypted: sh.pgp_encrypted })
             }
-            None => Ok(Reading { summary: m.summary, text: Some("This message is too large to show; you can save it.".into()), has_html: false, document: None, attachments: Vec::new(), card: None }),
+            None => Ok(Reading::bare(m.summary, Some("This message is too large to show; you can save it.".into()))),
         }
     }
 }
@@ -384,6 +425,7 @@ impl Sink for AccountSink<'_> {
     fn messages(&mut self, folder: &str, page: Vec<mail_sync::Fetched>) -> Result<(), String> {
         let id = self.fid(folder)?;
         let mut stored = Vec::with_capacity(page.len());
+        let mut keys = Vec::new();
         // Blobs first (named by content), then summaries from jails in
         // batches, then one index transaction per batch.
         let mut i = 0;
@@ -400,7 +442,11 @@ impl Sink for AccountSink<'_> {
             let chunk = &page[i..end];
             let full = chunk[0].full;
             let input: Vec<(u64, &[u8])> = chunk.iter().enumerate().map(|(k, f)| (k as u64, f.bytes.as_slice())).collect();
-            let sums = self.e.parser.summarize(&input, !full, &self.e.roots).map_err(|e| e.to_string())?;
+            let (sums, found) = self.e.parser.summarize_keyed(&input, !full, &self.e.roots).map_err(|e| e.to_string())?;
+            for (k, addr, key) in found {
+                let when = sums[k].as_ref().and_then(|s| s.date).or(chunk[k].internal_date).unwrap_or_else(now).min(now());
+                keys.push((addr, key, when, chunk[k].uid));
+            }
             for (f, s) in chunk.iter().zip(sums) {
                 let Some(summary) = s else {
                     self.refused += 1;
@@ -435,6 +481,7 @@ impl Sink for AccountSink<'_> {
             Ok(())
         }).map_err(|e| e.to_string())?;
         self.e.certs_seen(&all).map_err(|e| e.to_string())?;
+        self.e.pgp_keys_seen(account, id, &keys).map_err(|e| e.to_string())?;
         self.e.arrived(account, id, &new).map_err(|e| e.to_string())
     }
 
