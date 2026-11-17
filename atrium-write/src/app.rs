@@ -328,7 +328,14 @@ pub struct StyleBar {
 }
 
 /// The fonts a style can take (the pinned set's families).
-pub const STYLE_FONTS: [&str; 2] = ["IBM Plex Sans", "IBM Plex Mono"];
+pub const STYLE_FONTS: [&str; 18] = [
+    "IBM Plex Sans", "IBM Plex Serif", "IBM Plex Mono",
+    "Liberation Sans", "Liberation Serif", "Liberation Mono",
+    "Carlito", "Caladea",
+    "Source Sans 3", "Source Serif 4", "Source Code Pro",
+    "Fira Sans", "Fira Mono", "Roboto", "Inter",
+    "Noto Sans", "Noto Serif", "Noto Sans Mono",
+];
 
 /// The style bar is three bars high.
 pub const STYLE_H: f32 = FIND_H * 3.0;
@@ -2184,7 +2191,7 @@ mod tests {
         // Its font, what it is based on (Heading 1), and Normal after it.
         let list = ed.borrow().para_styles();
         let at = |n: &str| list.iter().position(|s| &*s.1 == n).unwrap();
-        run(Cmd::StyleFont(2));
+        run(Cmd::StyleFont(3));
         run(Cmd::StyleBase(at("Heading 1")));
         run(Cmd::StyleNext(at("Normal")));
         {
