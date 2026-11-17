@@ -736,6 +736,11 @@ pub struct NetGrants {
     pub peers: Vec<NetPeer>,
     #[serde(default)]
     pub inbound: Vec<u16>,
+    /// No pass to the host's resolvers, which a restricted `outbound`
+    /// otherwise gets: for a worker handed addresses already resolved
+    /// (a print worker), where DNS would only be a way out.
+    #[serde(default)]
+    pub no_resolver: bool,
 }
 
 /// An outbound destination, already resolved: an IPv4 CIDR (`a.b.c.d/n`).

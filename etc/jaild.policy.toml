@@ -342,6 +342,19 @@ uid_first    = 63000
 uid_last     = 63499
 mount_prefix = "/media"
 
+# ---------------------------------------------------------------
+# Prelum's workers (docs/spec/printing.md §6.1, §6.3): prelumd asks for one
+# jail per job conversion (render_exec, no network) and per printer
+# connection (ipp_exec, a routed vnet passing only the printer's address and
+# port), named <name_prefix><uid> at <instance_root_dir>/<name>, running
+# exactly that binary as that uid with prelumd's socket as its stdio.
+# ---------------------------------------------------------------
+[print_workers]
+name_prefix = "system-prelum-"
+render_exec = "/usr/local/bin/atrium-prelum-render"
+ipp_exec    = "/usr/local/bin/atrium-prelum-ipp"
+uid_first   = 62000
+uid_last    = 62499
 
 # ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not

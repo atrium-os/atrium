@@ -5925,6 +5925,26 @@ oracle on the host (never shipped). Cloud container or any Linux host:
   OUT pwg|urf|pdf [dpi] [media] [pages] [per-sheet] [gray|color]
   [simplex|long|short] [sheet-back]` in `prelum/`.
 
+Print service (R2, spec §11.2), against the same oracle:
+
+- Host, workers unjailed: `sh scripts/prelum-r2-check.sh`. Three
+  ippeveprinters on 127.0.0.1:8641 (IPPS, PDF + raster, two-sided), :8642
+  (plain IPP, raster) and :8643 (slow); `atrium-prelumd --direct` with a
+  socket in a temp dir. Covers add and pin, PDF and raster jobs, cancel,
+  offline (a relay pulled and put back), a new key and a new UUID (held,
+  then `repin`). Ends with `PASS: Prelum R2 end to end`. `KEEP=1` keeps the
+  work dir (printer logs, `prelumd.log`).
+- FreeBSD guest, workers jailed: `sh scripts/cloud-vm.sh up`, then
+  `sh scripts/prelum-r2-vm.sh`. Cross-builds prelum and jaild, deploys
+  portcullis, installs `atrium-prelum*` to `/usr/local/bin`, runs the
+  printers on this host (:8661–8663, reached from the guest at 10.0.2.2),
+  and checks jobs from the guest plus the jails: render with `ip4=disable`,
+  ipp in a vnet whose `atrium/<jail>` anchor passes only the printer's
+  address and port, no jail left after a job. Ends with `PASS`.
+- By hand: `atrium-prelumd --socket S --state D --spool D [--direct BIN]`,
+  then `prelumctl --socket S add ipps://HOST/ipp/print`, `print FILE
+  --printer 1 [--wait]`, `jobs`, `cancel N`, `repin 1`.
+
 ### 13.9 Shared-checkout hygiene
 
 Several threads push to `main` from the cloud and from the Mac.

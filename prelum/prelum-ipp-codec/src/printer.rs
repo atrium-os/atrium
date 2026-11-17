@@ -15,6 +15,7 @@ pub const MAX_LIST: usize = 256;
 pub const MAX_TEXT: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PrinterState {
     Idle,
     Processing,
@@ -23,6 +24,7 @@ pub enum PrinterState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Severity {
     Report,
     Warning,
@@ -32,6 +34,7 @@ pub enum Severity {
 /// The state reasons the sheet, Forum and Praeco show (§6.6). Anything else a
 /// printer reports is `Other`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Reason {
     MediaEmpty,
     MediaLow,
@@ -52,12 +55,14 @@ pub enum Reason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StateReason {
     pub reason: Reason,
     pub severity: Severity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Marker {
     pub name: String,
     pub color: String,
@@ -66,6 +71,7 @@ pub struct Marker {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PrinterInfo {
     pub uuid: Option<String>,
     pub make_and_model: String,

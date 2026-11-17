@@ -65,6 +65,10 @@ pub struct Policy {
     /// Network share servers (network-shares.md §4.1). Absent = none.
     #[serde(default)]
     pub share_servers: Option<ShareServerPolicy>,
+    /// Prelum's per-job and per-printer workers (printing.md §6.1, §6.3).
+    /// Absent = none.
+    #[serde(default)]
+    pub print_workers: Option<PrintWorkerPolicy>,
     /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
@@ -215,6 +219,22 @@ impl ShareServerPolicy {
     pub fn mountpoint(&self, uid: u32) -> String {
         format!("{}/share-{uid}", self.mount_prefix.trim_end_matches('/'))
     }
+}
+
+/// `[print_workers]`: prelumd asks for one jail per worker (printing.md
+/// §6.1, §6.3), named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
+/// running exactly `render_exec` (no network) or `ipp_exec` (a routed vnet
+/// whose grants name only printer addresses and ports) as that uid. Either
+/// takes its caller's stdio, prelumd's socket (and the job's document);
+/// nothing else beyond an ordinary service.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrintWorkerPolicy {
+    pub name_prefix: String,
+    pub render_exec: String,
+    pub ipp_exec:    String,
+    pub uid_first:   u32,
+    pub uid_last:    u32,
 }
 
 /// `[mlock]`: jails whose processes may `mlock(2)`. A jail that holds secrets

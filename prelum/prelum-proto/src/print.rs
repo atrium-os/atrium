@@ -1,0 +1,297 @@
+//! `CLASS_PRINT`: prelumd's Aqueduct surface (printing.md §6.4).
+//!
+//! | op | request | reply (`IS_RESPONSE`): `u8 status`, then |
+//! |---|---|---|
+//! | `PRINTERS` 0x00 | empty | postcard `Vec<Printer>` |
+//! | `ADD` 0x01 | postcard [`Add`] | postcard [`Printer`] (asked, learned and saved), or a `String` |
+//! | `REMOVE` 0x02 | postcard `u32` (printer) | postcard `String` |
+//! | `RENAME` 0x03 | postcard [`Rename`] | postcard `String` |
+//! | `REPIN` 0x04 | postcard `u32` | postcard [`Printer`] with its new identity, or a `String`: "Use the new identity" (§7.3) |
+//! | `IDENTIFY` 0x05 | postcard `u32` | postcard `String` |
+//! | `REFRESH` 0x06 | postcard `u32` | postcard [`Printer`]: asked again now |
+//! | `PRINT` 0x10 | postcard [`Print`], the PDF as the message's one descriptor | postcard `u64` (the job) or a `String` |
+//! | `JOBS` 0x11 | empty | postcard `Vec<Job>` |
+//! | `CANCEL` 0x12 | postcard `u64` | postcard `String` |
+//! | `RELEASE` 0x13 | postcard `u64` | postcard `String`: a held job goes back in its queue |
+//!
+//! On anything but `OK` the payload after the status is a postcard
+//! `String` to show. Every caller sees only its own printers and jobs: the
+//! daemon keys both by the peer's uid (`getpeereid`).
+
+use prelum_ipp_codec::ops::{ColorMode, Quality, Sides};
+use prelum_ipp_codec::printer::{Marker, PrinterState, StateReason};
+use serde::{Deserialize, Serialize};
+
+/// Next free after `CLASS_NETCONF` (18) and vpn.md's `CLASS_VPN` (19).
+pub use aqueduct::classes::CLASS_PRINT as CLASS;
+
+pub mod op {
+    pub const PRINTERS: u16 = 0x00;
+    pub const ADD: u16 = 0x01;
+    pub const REMOVE: u16 = 0x02;
+    pub const RENAME: u16 = 0x03;
+    pub const REPIN: u16 = 0x04;
+    pub const IDENTIFY: u16 = 0x05;
+    pub const REFRESH: u16 = 0x06;
+    pub const PRINT: u16 = 0x10;
+    pub const JOBS: u16 = 0x11;
+    pub const CANCEL: u16 = 0x12;
+    pub const RELEASE: u16 = 0x13;
+}
+
+pub mod status {
+    pub const OK: u8 = 0;
+    pub const MALFORMED: u8 = 1;
+    pub const NOT_ALLOWED: u8 = 2;
+    pub const NOT_FOUND: u8 = 3;
+    /// The printer could not be reached.
+    pub const OFFLINE: u8 = 4;
+    /// The printer is not the one that was saved (§7.3).
+    pub const IDENTITY_CHANGED: u8 = 5;
+    pub const FAILED: u8 = 6;
+}
+
+/// Add a printer by address: `ipps://host[:port]/path`, `ipp://…`, or a
+/// bare host (IPPS tried first, then IPP, on 631, `/ipp/print`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Add {
+    pub uri: String,
+    /// What to call it; empty: the printer's own `printer-info` or model.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rename {
+    pub printer: u32,
+    pub name: String,
+}
+
+/// A saved printer as clients see it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Printer {
+    pub id: u32,
+    pub name: String,
+    pub uri: String,
+    /// IPPS; a plain IPP printer is shown as unencrypted.
+    pub tls: bool,
+    /// The pinned key's fingerprint (`SHA256:` base64), IPPS only.
+    pub fingerprint: Option<String>,
+    pub uuid: Option<String>,
+    pub make_and_model: String,
+    pub location: String,
+    /// The network it was added on (§7.3).
+    pub network: String,
+    /// Not on the network it was added on: it is not contacted.
+    pub elsewhere: bool,
+    pub state: Option<PrinterState>,
+    pub reasons: Vec<StateReason>,
+    pub markers: Vec<Marker>,
+    pub media_supported: Vec<String>,
+    pub media_default: Option<String>,
+    pub duplex: bool,
+    pub color: bool,
+    /// No job has gone to it yet (§7.2: the sheet says so).
+    pub new: bool,
+    /// Its identity changed since it was saved (§7.3): what it shows now.
+    pub changed: Option<Changed>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Changed {
+    pub fingerprint: Option<String>,
+    pub uuid: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scale {
+    Fit,
+    ShrinkToFit,
+    Percent(u16),
+}
+
+/// What the sheet sends with the document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Print {
+    pub printer: u32,
+    /// The document's title; shown in history and sent as `job-name`.
+    pub title: String,
+    pub copies: u32,
+    pub sides: Sides,
+    pub color: ColorMode,
+    /// A PWG media keyword; `None`: the printer's default.
+    pub media: Option<String>,
+    pub quality: Option<Quality>,
+    /// `1-3,5`; `None`: all.
+    pub pages: Option<String>,
+    /// Pages per sheet: 1, 2 or 4.
+    pub per_sheet: u8,
+    pub scale: Scale,
+}
+
+impl Print {
+    pub fn new(printer: u32, title: &str) -> Print {
+        Print {
+            printer,
+            title: title.into(),
+            copies: 1,
+            sides: Sides::OneSided,
+            color: ColorMode::Color,
+            media: None,
+            quality: None,
+            pages: None,
+            per_sheet: 1,
+            scale: Scale::ShrinkToFit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    Pending,
+    /// Rendering (and sending as it goes).
+    Preparing,
+    Sending,
+    /// The printer has it and reports it processing.
+    Printing,
+    Done,
+    Cancelled,
+    Failed,
+    /// Needs the person (§6.4): the printer's identity changed.
+    Held,
+}
+
+impl Phase {
+    pub fn ended(&self) -> bool {
+        matches!(self, Phase::Done | Phase::Cancelled | Phase::Failed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Job {
+    pub id: u64,
+    pub printer: u32,
+    pub title: String,
+    pub phase: Phase,
+    /// Sheets drawn so far, and of how many (0 until known).
+    pub sheets: u32,
+    pub of: u32,
+    /// Why it waits, failed or is held (plain text).
+    pub message: String,
+    /// Seconds since the epoch.
+    pub submitted: u64,
+}
+
+pub mod client {
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+
+    use aqueduct::{flag, Connection};
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
+    use super::*;
+
+    pub struct Client {
+        c: Connection,
+    }
+
+    /// A refusal: the status and the daemon's message.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Refused {
+        pub status: u8,
+        pub message: String,
+    }
+
+    impl std::fmt::Display for Refused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    pub type Res<T> = Result<T, Refused>;
+
+    fn io_refused(e: io::Error) -> Refused {
+        Refused { status: status::FAILED, message: format!("prelumd: {e}") }
+    }
+
+    impl Client {
+        pub fn connect(sock: &Path) -> io::Result<Client> {
+            Ok(Client { c: Connection::connect(sock)? })
+        }
+
+        fn call<T: DeserializeOwned>(&mut self, o: u16, payload: &[u8], fd: Option<&dyn AsRawFd>) -> Res<T> {
+            match fd {
+                Some(f) => self.c.send_message_with_fds(CLASS, o, flag::RESPONSE_EXPECTED, payload, &[f.as_raw_fd()]),
+                None => self.c.send_message(CLASS, o, flag::RESPONSE_EXPECTED, payload),
+            }
+            .map_err(io_refused)?;
+            let p = loop {
+                let m = self.c.recv_message().map_err(io_refused)?;
+                if m.opcode_class == CLASS && m.op == o && m.flags & flag::IS_RESPONSE != 0 {
+                    break m.payload;
+                }
+            };
+            let bad = || Refused { status: status::MALFORMED, message: "prelumd sent a malformed reply".into() };
+            match p.split_first() {
+                Some((&status::OK, rest)) => postcard::from_bytes(rest).map_err(|_| bad()),
+                Some((&st, rest)) => Err(Refused { status: st, message: postcard::from_bytes(rest).unwrap_or_default() }),
+                None => Err(bad()),
+            }
+        }
+
+        fn enc<T: Serialize>(v: &T) -> Vec<u8> {
+            postcard::to_stdvec(v).unwrap_or_default()
+        }
+
+        pub fn printers(&mut self) -> Res<Vec<Printer>> {
+            self.call(op::PRINTERS, &[], None)
+        }
+        pub fn add(&mut self, a: &Add) -> Res<Printer> {
+            self.call(op::ADD, &Self::enc(a), None)
+        }
+        pub fn remove(&mut self, id: u32) -> Res<String> {
+            self.call(op::REMOVE, &Self::enc(&id), None)
+        }
+        pub fn rename(&mut self, r: &Rename) -> Res<String> {
+            self.call(op::RENAME, &Self::enc(r), None)
+        }
+        pub fn repin(&mut self, id: u32) -> Res<Printer> {
+            self.call(op::REPIN, &Self::enc(&id), None)
+        }
+        pub fn identify(&mut self, id: u32) -> Res<String> {
+            self.call(op::IDENTIFY, &Self::enc(&id), None)
+        }
+        pub fn refresh(&mut self, id: u32) -> Res<Printer> {
+            self.call(op::REFRESH, &Self::enc(&id), None)
+        }
+        pub fn print(&mut self, p: &Print, pdf: &dyn AsRawFd) -> Res<u64> {
+            self.call(op::PRINT, &Self::enc(p), Some(pdf))
+        }
+        pub fn jobs(&mut self) -> Res<Vec<Job>> {
+            self.call(op::JOBS, &[], None)
+        }
+        pub fn cancel(&mut self, job: u64) -> Res<String> {
+            self.call(op::CANCEL, &Self::enc(&job), None)
+        }
+        pub fn release(&mut self, job: u64) -> Res<String> {
+            self.call(op::RELEASE, &Self::enc(&job), None)
+        }
+    }
+}
+
+/// `OK` and a value, or a status and a message: a reply's payload.
+pub fn reply<T: Serialize>(r: Result<T, (u8, String)>) -> Vec<u8> {
+    match r {
+        Ok(v) => {
+            let mut p = vec![status::OK];
+            p.extend(postcard::to_stdvec(&v).unwrap_or_default());
+            p
+        }
+        Err((st, msg)) => {
+            let mut p = vec![st];
+            p.extend(postcard::to_stdvec(&msg).unwrap_or_default());
+            p
+        }
+    }
+}

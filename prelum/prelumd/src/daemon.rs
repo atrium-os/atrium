@@ -1,0 +1,1179 @@
+//! prelumd's state and its jobs (printing.md §6.4–§6.5, §7.2–§7.3).
+//!
+//! One lock holds everything: people's saved printers (loaded when first
+//! asked), what each printer last said, and the jobs. One runner thread per
+//! printer with work takes its jobs in order, one at a time; it drops the
+//! lock whenever it waits on a worker.
+//!
+//! prelumd parses nothing from outside: a printer's answers arrive as
+//! `prelum_proto::ipp::Ev` values from prelum-ipp, the document's pages as
+//! opaque bytes from prelum-render, which go to a spool file and on to
+//! prelum-ipp without being looked at.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
+
+use prelum_ipp_codec::ops::{ColorMode, Format, JobIdentity, Quality, Sides, Ticket};
+use prelum_ipp_codec::printer::{PrinterInfo, PrinterState};
+use prelum_proto::frame::{self, DATA_CHUNK};
+use prelum_proto::ipp::{self, JobState};
+use prelum_proto::print::{self, status, Changed, Phase};
+use prelum_proto::render;
+
+use crate::launch::{Launcher, Proc, Stopper};
+use crate::store::{self, Saved};
+
+/// How long a finished job stays in the list (history proper is R5's).
+const KEEP_ENDED: usize = 200;
+/// Spool per person (§6.5).
+pub const SPOOL_CAP: u64 = 2 << 30;
+/// Job state polling (§6.3): every 2 s for a minute, then every 10 s.
+const POLL_FAST: Duration = Duration::from_secs(2);
+const POLL_SLOW: Duration = Duration::from_secs(10);
+/// A printer that stops answering after it took the whole job is taken to
+/// have printed it after this long.
+const POLL_GIVE_UP: Duration = Duration::from_secs(300);
+/// Offline: try again after this, doubling up to the max.
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// The name a job gives the printer for us (§6.3).
+const USER: &str = "atrium";
+
+pub struct Config {
+    pub state: PathBuf,
+    pub spool: PathBuf,
+    /// The network we are on now, as atrium-net names it (§7.3).
+    pub network: Box<dyn Fn() -> String + Send + Sync>,
+}
+
+pub type Fail = (u8, String);
+
+fn fail<T>(st: u8, msg: impl Into<String>) -> Result<T, Fail> {
+    Err((st, msg.into()))
+}
+
+/// What a printer said the last time it was asked.
+#[derive(Default, Clone)]
+struct Live {
+    changed: Option<Changed>,
+    offline: bool,
+}
+
+struct Person {
+    file: store::File,
+    live: HashMap<u32, Live>,
+}
+
+struct JobRec {
+    uid: u32,
+    view: print::Job,
+    req: print::Print,
+    pdf: OwnedFd,
+    cancel: bool,
+    stops: Vec<Stopper>,
+    /// The printer's id for it, once it has one.
+    remote: Option<i32>,
+}
+
+#[derive(Default)]
+struct State {
+    people: HashMap<u32, Person>,
+    jobs: BTreeMap<u64, JobRec>,
+    next_job: u64,
+    /// (uid, printer) with a runner.
+    running: HashSet<(u32, u32)>,
+}
+
+pub struct Daemon {
+    cfg: Config,
+    launcher: Box<dyn Launcher>,
+    st: Mutex<State>,
+    /// Woken when a job is released or cancelled.
+    cv: Condvar,
+}
+
+/// One worker conversation: send a request, read its events.
+struct Ipp {
+    p: Proc,
+}
+
+impl Ipp {
+    fn send(&mut self, r: &ipp::Req) -> io::Result<()> {
+        frame::write(&mut self.p.sock, r)
+    }
+    fn next(&mut self) -> io::Result<ipp::Ev> {
+        frame::read(&mut self.p.sock)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "prelum-ipp ended"))
+    }
+    fn ask(&mut self, r: &ipp::Req) -> io::Result<ipp::Ev> {
+        self.send(r)?;
+        self.next()
+    }
+}
+
+impl Drop for Ipp {
+    fn drop(&mut self) {
+        let _ = self.p.sock.shutdown(std::net::Shutdown::Both);
+        self.p.stop.stop();
+    }
+}
+
+pub fn fingerprint(k: &[u8; 32]) -> String {
+    use base64::Engine;
+    format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(k))
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// A PWG media keyword whose size Prelum knows how to read (`..._210x297mm`).
+fn media_ok(k: &str) -> bool {
+    let Some(d) = k.rsplit('_').next() else { return false };
+    let Some(d) = d.strip_suffix("mm").or_else(|| d.strip_suffix("in")) else { return false };
+    let mut it = d.split('x');
+    let ok = |s: Option<&str>| s.and_then(|s| s.parse::<f64>().ok()).is_some_and(|v| v > 0.0 && v < 2000.0);
+    ok(it.next()) && ok(it.next()) && it.next().is_none()
+}
+
+/// The candidate URIs for what the person typed (§7.2): `ipps://…` and
+/// `ipp://…` as given; a bare host tries IPPS, then IPP, on 631.
+pub fn candidates(input: &str) -> Result<Vec<(String, bool, String)>, String> {
+    let input = input.trim();
+    let ok = |s: &str| !s.is_empty() && s.len() <= 1023 && s.bytes().all(|b| b.is_ascii_graphic()) && !s.contains('@');
+    if !ok(input) {
+        return Err("not a printer address".into());
+    }
+    let split = |rest: &str| -> (String, String) {
+        match rest.find('/') {
+            Some(i) => (rest[..i].to_string(), rest[i..].to_string()),
+            None => (rest.to_string(), "/ipp/print".to_string()),
+        }
+    };
+    let with_port = |h: &str| if h.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) && !h.ends_with(']') { h.to_string() } else { format!("{h}:631") };
+    if let Some(r) = input.strip_prefix("ipps://") {
+        let (h, p) = split(r);
+        return Ok(vec![(format!("ipps://{}{p}", with_port(&h)), true, with_port(&h))]);
+    }
+    if let Some(r) = input.strip_prefix("ipp://") {
+        let (h, p) = split(r);
+        return Ok(vec![(format!("ipp://{}{p}", with_port(&h)), false, with_port(&h))]);
+    }
+    if input.contains("://") {
+        return Err("only ipps:// and ipp:// printers".into());
+    }
+    let (h, p) = split(input);
+    let h = with_port(&h);
+    Ok(vec![(format!("ipps://{h}{p}"), true, h.clone()), (format!("ipp://{h}{p}"), false, h)])
+}
+
+/// Resolved once, here, before the worker starts (§6.3: no rebinding).
+/// IPv4 first: a worker's network grant names IPv4 addresses.
+fn resolve(hostport: &str) -> Result<SocketAddr, String> {
+    let addrs: Vec<SocketAddr> = hostport.to_socket_addrs().map_err(|e| format!("{hostport}: {e}"))?.collect();
+    addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied().ok_or_else(|| format!("{hostport}: no address"))
+}
+
+fn pick_dpi(mut list: Vec<i32>, q: Option<Quality>) -> Option<i32> {
+    list.sort();
+    list.dedup();
+    match q {
+        Some(Quality::Draft) => list.first().copied(),
+        Some(Quality::High) => list.last().copied(),
+        _ => list.iter().copied().min_by_key(|d| ((d - 300).abs(), -d)),
+    }
+}
+
+/// How a job goes to this printer: format, raster arguments and ticket.
+pub fn plan(info: &PrinterInfo, raster_only: bool, req: &print::Print) -> Result<(Format, Vec<String>, Ticket), String> {
+    let format = info.choose_format(raster_only).ok_or("the printer takes none of the formats Prelum sends")?;
+    let color_ok = match format {
+        Format::Pdf => info.color_modes.iter().any(|m| m == "color" || m == "auto"),
+        Format::PwgRaster => info.pwg_types.iter().any(|t| t == "srgb_8"),
+        Format::Urf => info.urf.iter().any(|t| t == "SRGB24"),
+    };
+    let gray = req.color == ColorMode::Monochrome || !color_ok;
+    let media = req
+        .media
+        .clone()
+        .filter(|m| info.media_supported.is_empty() || info.media_supported.contains(m))
+        .or_else(|| info.media_default.clone())
+        .filter(|m| media_ok(m))
+        .unwrap_or_else(|| "iso_a4_210x297mm".into());
+    let sides = if req.sides != Sides::OneSided && info.sides_supported.iter().any(|s| s == req.sides.keyword()) { req.sides } else { Sides::OneSided };
+    // Raster is drawn at the printer's own resolution for the quality.
+    let raster = |f: Format| -> Result<(i32, String, &'static str), String> {
+        match f {
+            Format::Urf => Ok((pick_dpi(info.urf_resolutions().collect(), req.quality).ok_or("no URF resolution")?, info.urf_sheet_back().unwrap_or("normal").into(), "urf")),
+            _ => Ok((
+                pick_dpi(info.pwg_resolutions.iter().filter(|(x, y)| x == y).map(|(x, _)| *x).collect(), req.quality).ok_or("no PWG resolution")?,
+                info.pwg_sheet_back.clone().unwrap_or_else(|| "normal".into()),
+                "pwg",
+            )),
+        }
+    };
+    let mut args = Vec::new();
+    let mut arg = |k: &str, v: String| {
+        args.push(k.to_string());
+        args.push(v);
+    };
+    let mut resolution = None;
+    match format {
+        Format::Pdf => {
+            arg("--format", "pdf".into());
+            // If the document can't be rewritten: the printer's raster.
+            let fb = if info.formats.iter().any(|f| f == "image/pwg-raster") && !info.pwg_resolutions.is_empty() {
+                Some(Format::PwgRaster)
+            } else if info.formats.iter().any(|f| f == "image/urf") {
+                Some(Format::Urf)
+            } else {
+                None
+            };
+            if let Some(fb) = fb {
+                let (dpi, back, name) = raster(fb)?;
+                arg("--fallback", name.into());
+                arg("--dpi", dpi.to_string());
+                arg("--sheet-back", back);
+            }
+        }
+        f => {
+            let (dpi, back, name) = raster(f)?;
+            arg("--format", name.into());
+            arg("--dpi", dpi.to_string());
+            arg("--sheet-back", back);
+            resolution = info.ticket_resolution((dpi, dpi));
+        }
+    }
+    arg("--media", media.clone());
+    if let Some(p) = &req.pages {
+        arg("--pages", p.clone());
+    }
+    arg("--per-sheet", req.per_sheet.clamp(1, 4).to_string());
+    arg("--color", if gray { "gray" } else { "color" }.into());
+    arg("--duplex", match sides {
+        Sides::OneSided => "simplex",
+        Sides::TwoSidedLongEdge => "long",
+        Sides::TwoSidedShortEdge => "short",
+    }
+    .into());
+    arg("--scale", match req.scale {
+        print::Scale::Fit => "fit".into(),
+        print::Scale::ShrinkToFit => "shrink".into(),
+        print::Scale::Percent(p) => p.clamp(10, 400).to_string(),
+    });
+    if let Some(q) = req.quality {
+        arg("--quality", (q as i32).to_string());
+    }
+    let ticket = Ticket {
+        copies: req.copies.clamp(1, 999),
+        sides,
+        color: if gray && info.color_modes.iter().any(|m| m == "monochrome") { ColorMode::Monochrome } else { ColorMode::Color },
+        media: (info.media_supported.contains(&media)).then_some(media),
+        quality: req.quality.filter(|q| info.qualities.contains(&(*q as i32))),
+        resolution,
+    };
+    Ok((format, args, ticket))
+}
+
+/// A worker's message, as plain text to show.
+fn short(m: &str) -> String {
+    prelum_ipp_codec::display_text(m, 200)
+}
+
+/// A worker's description of a printer, cut again here: prelum-ipp checks
+/// it, but prelum-ipp is what a hostile printer would attack, so prelumd
+/// keeps nothing it couldn't have said honestly (§6.3 bounds).
+fn clean(mut i: PrinterInfo) -> PrinterInfo {
+    use prelum_ipp_codec::display_text;
+    use prelum_ipp_codec::printer::{MAX_LIST, MAX_TEXT};
+    let text = |s: &mut String| *s = display_text(s, MAX_TEXT);
+    let word = |v: &mut Vec<String>| {
+        v.truncate(MAX_LIST);
+        v.retain(|k| !k.is_empty() && k.len() <= 255 && k.bytes().all(|b| b.is_ascii_graphic()));
+    };
+    text(&mut i.make_and_model);
+    text(&mut i.info);
+    text(&mut i.location);
+    for v in [&mut i.formats, &mut i.pwg_types, &mut i.urf, &mut i.media_supported, &mut i.sides_supported, &mut i.color_modes, &mut i.identify_actions] {
+        word(v);
+    }
+    i.uris.truncate(8);
+    i.uris.retain(|(u, s)| u.len() <= 1023 && u.bytes().all(|b| b.is_ascii_graphic()) && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_graphic()));
+    i.media_default = i.media_default.filter(|m| m.len() <= 255 && m.bytes().all(|b| b.is_ascii_graphic()));
+    i.pwg_sheet_back = i.pwg_sheet_back.filter(|m| m.len() <= 32 && m.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'));
+    i.uuid = i.uuid.filter(|u| u.len() == 36 && u.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
+    i.state_reasons.truncate(MAX_LIST);
+    i.pwg_resolutions.truncate(MAX_LIST);
+    i.printer_resolutions.truncate(MAX_LIST);
+    i.qualities.truncate(8);
+    i.operations.truncate(MAX_LIST);
+    i.markers.truncate(32);
+    for m in &mut i.markers {
+        m.name = display_text(&m.name, 64);
+        m.color = display_text(&m.color, 64);
+        m.level = m.level.clamp(-3, 100);
+    }
+    i
+}
+
+/// How a runner's job ended, or why it stopped for now.
+enum Outcome {
+    Done(String),
+    Failed(String),
+    Cancelled,
+    /// Waits (offline, elsewhere): try again later.
+    Retry(String),
+    /// Needs the person: identity changed.
+    Held(String),
+}
+
+impl Daemon {
+    pub fn new(cfg: Config, launcher: Box<dyn Launcher>) -> Arc<Daemon> {
+        Arc::new(Daemon { cfg, launcher, st: Mutex::new(State { next_job: 1, ..Default::default() }), cv: Condvar::new() })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn person<'a>(&self, st: &'a mut State, uid: u32) -> &'a mut Person {
+        st.people.entry(uid).or_insert_with(|| Person { file: store::load(&self.cfg.state, uid), live: HashMap::new() })
+    }
+
+    fn saved(&self, uid: u32, id: u32) -> Result<Saved, Fail> {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        p.file.printer.iter().find(|s| s.id == id).cloned().ok_or((status::NOT_FOUND, "no such printer".into()))
+    }
+
+    fn persist(&self, uid: u32, st: &mut State) {
+        let f = self.person(st, uid).file.clone();
+        if let Err(e) = store::save(&self.cfg.state, uid, &f) {
+            eprintln!("prelumd: saving printers of {uid}: {e}");
+        }
+    }
+
+    fn view(&self, s: &Saved, live: Option<&Live>) -> print::Printer {
+        let i = &s.info;
+        print::Printer {
+            id: s.id,
+            name: s.name.clone(),
+            uri: s.uri.clone(),
+            tls: s.tls,
+            fingerprint: s.key.as_deref().and_then(store::unhex).map(|k| fingerprint(&k)),
+            uuid: s.uuid.clone(),
+            make_and_model: i.make_and_model.clone(),
+            location: i.location.clone(),
+            network: s.network.clone(),
+            elsewhere: s.network != (self.cfg.network)(),
+            state: if live.is_some_and(|l| l.offline) { None } else { i.state },
+            reasons: i.state_reasons.clone(),
+            markers: i.markers.clone(),
+            media_supported: i.media_supported.clone(),
+            media_default: i.media_default.clone(),
+            duplex: i.sides_supported.iter().any(|s| s != "one-sided"),
+            color: i.color_modes.iter().any(|m| m == "color"),
+            new: s.jobs_sent == 0,
+            changed: live.and_then(|l| l.changed.clone()),
+        }
+    }
+
+    pub fn printers(&self, uid: u32) -> Vec<print::Printer> {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        p.file.printer.iter().map(|s| self.view(s, p.live.get(&s.id))).collect()
+    }
+
+    fn worker(&self, s: &Saved, learn: bool) -> Result<Ipp, Fail> {
+        let addr: SocketAddr = s.addr.parse().map_err(|_| (status::FAILED, "bad saved address".to_string()))?;
+        let p = self.launcher.ipp(addr).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
+        let mut w = Ipp { p };
+        let start = ipp::Start {
+            uri: s.uri.clone(),
+            addr,
+            tls: s.tls,
+            key: if learn { None } else { s.key.as_deref().and_then(store::unhex) },
+            uuid: if learn { None } else { s.uuid.clone() },
+        };
+        frame::write(&mut w.p.sock, &start).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
+        Ok(w)
+    }
+
+    /// Ask a printer who it is, learning its key (§7.2).
+    fn learn(&self, s: &Saved) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
+        let mut w = self.worker(s, true)?;
+        match w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))? {
+            ipp::Ev::Printer { info, key } => {
+                if s.tls && key.is_none() {
+                    return fail(status::FAILED, "the printer showed no TLS key");
+                }
+                Ok((clean(*info), key))
+            }
+            ipp::Ev::Unreachable(m) => fail(status::OFFLINE, short(&m)),
+            ipp::Ev::Refused { message, .. } => fail(status::FAILED, format!("the printer refused: {}", short(&message))),
+            ipp::Ev::Failed(m) => fail(status::FAILED, short(&m)),
+            other => fail(status::FAILED, short(&format!("unexpected answer {other:?}"))),
+        }
+    }
+
+    pub fn add(&self, uid: u32, a: &print::Add) -> Result<print::Printer, Fail> {
+        if a.name.len() > 128 || a.name.chars().any(char::is_control) {
+            return fail(status::MALFORMED, "bad name");
+        }
+        let cands = candidates(&a.uri).map_err(|e| (status::MALFORMED, e))?;
+        let network = (self.cfg.network)();
+        let mut last = (status::FAILED, "no printer there".to_string());
+        for (uri, tls, hostport) in cands {
+            let addr = match resolve(&hostport) {
+                Ok(a) => a,
+                Err(e) => return fail(status::OFFLINE, e),
+            };
+            let mut s = Saved {
+                id: 0,
+                name: a.name.clone(),
+                uri,
+                addr: addr.to_string(),
+                tls,
+                key: None,
+                uuid: None,
+                network: network.clone(),
+                raster_only: false,
+                titles_off: false,
+                jobs_sent: 0,
+                info: PrinterInfo::default(),
+            };
+            match self.learn(&s) {
+                Ok((info, key)) => {
+                    s.key = key.map(|k| store::hex(&k));
+                    s.uuid = info.uuid.clone();
+                    if s.name.is_empty() {
+                        s.name = [&info.info, &info.make_and_model].into_iter().find(|n| !n.is_empty()).cloned().unwrap_or_else(|| hostport.clone());
+                    }
+                    s.info = info;
+                    let mut st = self.lock();
+                    let p = self.person(&mut st, uid);
+                    // The same printer again (same identity): what was saved.
+                    if let Some(old) = p.file.printer.iter().find(|o| o.uuid.is_some() && o.uuid == s.uuid && o.key == s.key && o.uri == s.uri) {
+                        return Ok(self.view(old, p.live.get(&old.id)));
+                    }
+                    s.id = p.file.printer.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+                    p.file.printer.push(s.clone());
+                    self.persist(uid, &mut st);
+                    return Ok(self.view(&s, None));
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    pub fn remove(&self, uid: u32, id: u32) -> Result<String, Fail> {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let n = p.file.printer.len();
+        p.file.printer.retain(|s| s.id != id);
+        if p.file.printer.len() == n {
+            return fail(status::NOT_FOUND, "no such printer");
+        }
+        p.live.remove(&id);
+        self.persist(uid, &mut st);
+        // Its waiting jobs go with it.
+        let ids: Vec<u64> = st.jobs.iter().filter(|(_, j)| j.uid == uid && j.view.printer == id && !j.view.phase.ended()).map(|(k, _)| *k).collect();
+        drop(st);
+        for j in ids {
+            let _ = self.cancel(uid, j);
+        }
+        Ok("removed".into())
+    }
+
+    pub fn rename(&self, uid: u32, r: &print::Rename) -> Result<String, Fail> {
+        if r.name.is_empty() || r.name.len() > 128 || r.name.chars().any(char::is_control) {
+            return fail(status::MALFORMED, "bad name");
+        }
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let s = p.file.printer.iter_mut().find(|s| s.id == r.printer).ok_or((status::NOT_FOUND, "no such printer".to_string()))?;
+        s.name = r.name.clone();
+        self.persist(uid, &mut st);
+        Ok("renamed".into())
+    }
+
+    /// "Use the new identity" (§7.3): learn the printer again at its saved
+    /// address and release the jobs held for it.
+    pub fn repin(self: &Arc<Self>, uid: u32, id: u32) -> Result<print::Printer, Fail> {
+        let s = self.saved(uid, id)?;
+        let (info, key) = self.learn(&s)?;
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let Some(s) = p.file.printer.iter_mut().find(|s| s.id == id) else { return fail(status::NOT_FOUND, "no such printer") };
+        s.key = key.map(|k| store::hex(&k));
+        s.uuid = info.uuid.clone();
+        s.info = info;
+        s.network = (self.cfg.network)();
+        let s = s.clone();
+        p.live.insert(id, Live::default());
+        self.persist(uid, &mut st);
+        let mut any = false;
+        for j in st.jobs.values_mut().filter(|j| j.uid == uid && j.view.printer == id && j.view.phase == Phase::Held) {
+            j.view.phase = Phase::Pending;
+            j.view.message.clear();
+            any = true;
+        }
+        let v = self.view(&s, None);
+        if any {
+            self.kick(&mut st, uid, id);
+        }
+        Ok(v)
+    }
+
+    pub fn identify(&self, uid: u32, id: u32) -> Result<String, Fail> {
+        let s = self.saved(uid, id)?;
+        let mut w = self.worker(&s, false)?;
+        let mut actions: Vec<String> = ["sound", "flash", "display"].iter().filter(|a| s.info.identify_actions.iter().any(|x| x == *a)).map(|a| a.to_string()).collect();
+        if actions.is_empty() {
+            actions.push("sound".into());
+        }
+        match w.ask(&ipp::Req::Identify { actions }).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))? {
+            ipp::Ev::Done => Ok("the printer was asked to identify itself".into()),
+            ev => Err(self.ev_fail(uid, id, ev)),
+        }
+    }
+
+    /// An error event as a refusal, noting a changed identity or offline.
+    fn ev_fail(&self, uid: u32, id: u32, ev: ipp::Ev) -> Fail {
+        match ev {
+            ipp::Ev::IdentityChanged { key, uuid } => {
+                self.mark_changed(uid, id, key, uuid);
+                (status::IDENTITY_CHANGED, "the printer's identity changed".into())
+            }
+            ipp::Ev::Unreachable(m) => {
+                self.set_offline(uid, id, true);
+                (status::OFFLINE, format!("the printer is offline ({})", short(&m)))
+            }
+            ipp::Ev::Refused { message, status: s } => (status::FAILED, format!("the printer refused (0x{s:04x}): {}", short(&message))),
+            ipp::Ev::Failed(m) => (status::FAILED, short(&m)),
+            other => (status::FAILED, short(&format!("unexpected answer {other:?}"))),
+        }
+    }
+
+    fn mark_changed(&self, uid: u32, id: u32, key: Option<[u8; 32]>, uuid: Option<String>) {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let saved_uuid = p.file.printer.iter().find(|s| s.id == id).and_then(|s| s.uuid.clone());
+        p.live.entry(id).or_default().changed =
+            Some(Changed { fingerprint: key.map(|k| fingerprint(&k)), uuid: uuid.filter(|u| u.len() <= 64).map(|u| short(&u)).or(saved_uuid) });
+    }
+
+    fn set_offline(&self, uid: u32, id: u32, off: bool) {
+        let mut st = self.lock();
+        self.person(&mut st, uid).live.entry(id).or_default().offline = off;
+    }
+
+    /// Ask the printer again now (the sheet opening, Curia's page).
+    pub fn refresh(&self, uid: u32, id: u32) -> Result<print::Printer, Fail> {
+        let s = self.saved(uid, id)?;
+        if s.network != (self.cfg.network)() {
+            return Ok(self.view(&s, None));
+        }
+        let mut w = self.worker(&s, false)?;
+        let ev = w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
+        match ev {
+            ipp::Ev::Printer { info, .. } => {
+                let info = clean(*info);
+                if info.uuid != s.uuid {
+                    self.mark_changed(uid, id, None, info.uuid.clone());
+                } else {
+                    let mut st = self.lock();
+                    let p = self.person(&mut st, uid);
+                    p.live.insert(id, Live::default());
+                    if let Some(s) = p.file.printer.iter_mut().find(|s| s.id == id) {
+                        s.info = info;
+                    }
+                    self.persist(uid, &mut st);
+                }
+            }
+            ipp::Ev::IdentityChanged { key, uuid } => self.mark_changed(uid, id, key, uuid),
+            ipp::Ev::Unreachable(_) => self.set_offline(uid, id, true),
+            ev => return Err(self.ev_fail(uid, id, ev)),
+        }
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let s = p.file.printer.iter().find(|s| s.id == id).ok_or((status::NOT_FOUND, "no such printer".to_string()))?;
+        Ok(self.view(s, p.live.get(&id)))
+    }
+
+    pub fn jobs(&self, uid: u32) -> Vec<print::Job> {
+        self.lock().jobs.values().filter(|j| j.uid == uid).map(|j| j.view.clone()).collect()
+    }
+
+    pub fn submit(self: &Arc<Self>, uid: u32, req: print::Print, pdf: OwnedFd) -> Result<u64, Fail> {
+        if req.title.len() > 512 || req.copies == 0 || req.copies > 999 || ![1, 2, 4].contains(&req.per_sheet) {
+            return fail(status::MALFORMED, "bad print settings");
+        }
+        if req.pages.as_ref().is_some_and(|p| p.len() > 256 || !p.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b',' || b == b' ')) {
+            return fail(status::MALFORMED, "bad page range");
+        }
+        if req.media.as_ref().is_some_and(|m| !media_ok(m)) {
+            return fail(status::MALFORMED, "bad paper size");
+        }
+        let file = File::from(pdf);
+        match file.metadata() {
+            Ok(m) if m.is_file() => {}
+            _ => return fail(status::MALFORMED, "the document must be a file"),
+        }
+        let s = self.saved(uid, req.printer)?;
+        let mut st = self.lock();
+        let id = st.next_job;
+        st.next_job += 1;
+        let title: String = req.title.chars().filter(|c| !c.is_control()).take(200).collect();
+        st.jobs.insert(id, JobRec {
+            uid,
+            view: print::Job {
+                id,
+                printer: s.id,
+                title,
+                phase: Phase::Pending,
+                sheets: 0,
+                of: 0,
+                message: String::new(),
+                submitted: now(),
+            },
+            req,
+            pdf: file.into(),
+            cancel: false,
+            stops: Vec::new(),
+            remote: None,
+        });
+        // Forget the oldest ended jobs.
+        let ended: Vec<u64> = st.jobs.iter().filter(|(_, j)| j.view.phase.ended()).map(|(k, _)| *k).collect();
+        if ended.len() > KEEP_ENDED {
+            for k in &ended[..ended.len() - KEEP_ENDED] {
+                st.jobs.remove(k);
+            }
+        }
+        self.kick(&mut st, uid, s.id);
+        Ok(id)
+    }
+
+    pub fn cancel(&self, uid: u32, job: u64) -> Result<String, Fail> {
+        let mut st = self.lock();
+        let j = st.jobs.get_mut(&job).filter(|j| j.uid == uid).ok_or((status::NOT_FOUND, "no such job".to_string()))?;
+        if j.view.phase.ended() {
+            return fail(status::NOT_FOUND, "the job has ended");
+        }
+        j.cancel = true;
+        // Not started (or held): it just ends. A running job's runner sees
+        // the flag once its workers are stopped, and cancels at the printer.
+        let running = matches!(j.view.phase, Phase::Preparing | Phase::Sending | Phase::Printing);
+        if !running {
+            j.view.phase = Phase::Cancelled;
+            j.view.message.clear();
+        }
+        for s in j.stops.drain(..) {
+            s.stop();
+        }
+        self.cv.notify_all();
+        Ok("cancelled".into())
+    }
+
+    pub fn release(self: &Arc<Self>, uid: u32, job: u64) -> Result<String, Fail> {
+        let mut st = self.lock();
+        let j = st.jobs.get_mut(&job).filter(|j| j.uid == uid).ok_or((status::NOT_FOUND, "no such job".to_string()))?;
+        if j.view.phase != Phase::Held {
+            return fail(status::NOT_FOUND, "the job is not held");
+        }
+        j.view.phase = Phase::Pending;
+        j.view.message.clear();
+        let p = j.view.printer;
+        self.kick(&mut st, uid, p);
+        Ok("released".into())
+    }
+
+    /// Make sure the printer has a runner.
+    fn kick(self: &Arc<Self>, st: &mut State, uid: u32, printer: u32) {
+        self.cv.notify_all();
+        if st.running.insert((uid, printer)) {
+            let d = self.clone();
+            std::thread::spawn(move || d.runner(uid, printer));
+        }
+    }
+
+    fn runner(self: Arc<Self>, uid: u32, printer: u32) {
+        let mut wait = RETRY_FIRST;
+        loop {
+            let next = {
+                let mut st = self.lock();
+                let next = st.jobs.iter().find(|(_, j)| j.uid == uid && j.view.printer == printer && j.view.phase == Phase::Pending).map(|(k, _)| *k);
+                if next.is_none() {
+                    st.running.remove(&(uid, printer));
+                    return;
+                }
+                next.unwrap()
+            };
+            let out = self.run(uid, printer, next);
+            let mut st = self.lock();
+            let Some(j) = st.jobs.get_mut(&next) else { continue };
+            j.stops.clear();
+            let retry = matches!(out, Outcome::Retry(_));
+            match out {
+                Outcome::Done(m) => {
+                    j.view.phase = Phase::Done;
+                    j.view.sheets = j.view.of;
+                    j.view.message = m;
+                }
+                Outcome::Failed(m) => {
+                    j.view.phase = Phase::Failed;
+                    j.view.message = m;
+                }
+                Outcome::Cancelled => {
+                    j.view.phase = Phase::Cancelled;
+                    j.view.message.clear();
+                }
+                Outcome::Held(m) => {
+                    j.view.phase = Phase::Held;
+                    j.view.message = m;
+                }
+                Outcome::Retry(m) => {
+                    j.view.phase = Phase::Pending;
+                    j.view.message = m;
+                }
+            }
+            let _ = std::fs::remove_file(self.spool_path(uid, next));
+            if retry {
+                // Wait, unless something changes (a cancel, a release).
+                let (st2, _) = self.cv.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner());
+                drop(st2);
+                wait = (wait * 2).min(RETRY_MAX);
+            } else {
+                wait = RETRY_FIRST;
+            }
+        }
+    }
+
+    fn spool_path(&self, uid: u32, job: u64) -> PathBuf {
+        self.cfg.spool.join(uid.to_string()).join(format!("{job}.spool"))
+    }
+
+    fn set(&self, job: u64, f: impl FnOnce(&mut JobRec)) -> bool {
+        let mut st = self.lock();
+        match st.jobs.get_mut(&job) {
+            Some(j) => {
+                f(j);
+                !j.cancel
+            }
+            None => false,
+        }
+    }
+
+    fn cancelled(&self, job: u64) -> bool {
+        self.lock().jobs.get(&job).is_none_or(|j| j.cancel)
+    }
+
+    /// Register a worker's stopper; false (and the worker stopped) if the
+    /// job was cancelled meanwhile.
+    fn hold(&self, job: u64, s: &Stopper) -> bool {
+        let ok = self.set(job, |j| j.stops.push(s.clone()));
+        if !ok {
+            s.stop();
+        }
+        ok
+    }
+
+    /// One attempt at one job.
+    fn run(self: &Arc<Self>, uid: u32, printer: u32, job: u64) -> Outcome {
+        let s = match self.saved(uid, printer) {
+            Ok(s) => s,
+            Err(_) => return Outcome::Failed("the printer was removed".into()),
+        };
+        if s.network != (self.cfg.network)() {
+            return Outcome::Retry(format!("{} is not on this network", s.name));
+        }
+        let Some((req, pdf)) = ({
+            let st = self.lock();
+            st.jobs.get(&job).and_then(|j| Some((j.req.clone(), j.pdf.try_clone().ok()?)))
+        }) else {
+            return Outcome::Failed("the document is gone".into());
+        };
+        if !self.set(job, |j| {
+            j.view.phase = Phase::Preparing;
+            j.view.message.clear();
+        }) {
+            return Outcome::Cancelled;
+        }
+
+        // Who is it, and what does it take? (§7.3: before any job byte.)
+        let mut w = match self.worker(&s, false) {
+            Ok(w) => w,
+            Err((_, m)) => return Outcome::Failed(m),
+        };
+        if !self.hold(job, &w.p.stop) {
+            return Outcome::Cancelled;
+        }
+        let info = match w.ask(&ipp::Req::Query) {
+            Ok(ipp::Ev::Printer { info, .. }) if info.uuid == s.uuid => {
+                self.set_offline(uid, printer, false);
+                clean(*info)
+            }
+            Ok(ipp::Ev::Printer { info, .. }) => {
+                self.mark_changed(uid, printer, None, info.uuid.clone());
+                return Outcome::Held(format!("{}'s identity changed", s.name));
+            }
+            Ok(ipp::Ev::IdentityChanged { key, uuid }) => {
+                self.mark_changed(uid, printer, key, uuid);
+                return Outcome::Held(format!("{}'s identity changed", s.name));
+            }
+            Ok(ipp::Ev::Unreachable(_)) => {
+                self.set_offline(uid, printer, true);
+                return Outcome::Retry(format!("{} is offline", s.name));
+            }
+            Ok(ev) => return Outcome::Failed(self.ev_fail(uid, printer, ev).1),
+            Err(_) if self.cancelled(job) => return Outcome::Cancelled,
+            Err(e) => return Outcome::Failed(format!("prelum-ipp: {e}")),
+        };
+        if info.state == Some(PrinterState::Stopped) {
+            return Outcome::Retry(format!("{} is stopped", s.name));
+        }
+        let (_, args, ticket) = match plan(&info, s.raster_only, &req) {
+            Ok(p) => p,
+            Err(m) => return Outcome::Failed(m),
+        };
+
+        // Render into the spool, and send from it as it grows (§6.5).
+        let spool = self.spool_path(uid, job);
+        let spool_file = match open_spool(&spool) {
+            Ok(f) => f,
+            Err(e) => return Outcome::Failed(format!("spool: {e}")),
+        };
+        let r = match self.launcher.render(pdf, &args) {
+            Ok(r) => r,
+            Err(e) => return Outcome::Failed(format!("can't start prelum-render: {e}")),
+        };
+        if !self.hold(job, &r.stop) {
+            return Outcome::Cancelled;
+        }
+        let prog = Arc::new((Mutex::new(Progress::default()), Condvar::new()));
+        let reader = {
+            let prog = prog.clone();
+            let d_job = job;
+            let d = self.clone();
+            let set_sheets: Arc<dyn Fn(u32, u32) + Send + Sync> = Arc::new(move |n, of| {
+                d.set(d_job, |j| {
+                    j.view.sheets = n;
+                    if of > 0 {
+                        j.view.of = of;
+                    }
+                });
+            });
+            std::thread::spawn(move || read_render(r.sock, spool_file, prog, set_sheets))
+        };
+        let format = {
+            let (m, cv) = &*prog;
+            let mut p = m.lock().unwrap();
+            while p.format.is_none() && p.end.is_none() {
+                p = cv.wait(p).unwrap();
+            }
+            match (&p.format, &p.end) {
+                (Some(f), _) => *f,
+                (None, Some(Err(e))) => {
+                    let e = e.clone();
+                    drop(p);
+                    let _ = reader.join();
+                    return if self.cancelled(job) { Outcome::Cancelled } else { Outcome::Failed(e) };
+                }
+                _ => unreachable!(),
+            }
+        };
+        let identity = JobIdentity {
+            user: USER.into(),
+            job_name: if s.titles_off { "Document".into() } else { req.title.clone() },
+            job_password: None,
+        };
+        let sent = self.send(&mut w, job, &spool, &prog, identity, format, ticket);
+        let rendered = reader.join().unwrap_or_else(|_| Err("prelum-render's reader failed".into()));
+        let remote = self.lock().jobs.get(&job).and_then(|j| j.remote);
+        if self.cancelled(job) {
+            drop(w);
+            if let Some(id) = remote {
+                self.cancel_remote(&s, id);
+            }
+            return Outcome::Cancelled;
+        }
+        if let Err(e) = rendered {
+            drop(w);
+            if let Some(id) = remote {
+                self.cancel_remote(&s, id);
+            }
+            return Outcome::Failed(e);
+        }
+        match sent {
+            Ok(()) => {}
+            Err(SendErr::Ev(ipp::Ev::IdentityChanged { key, uuid })) => {
+                self.mark_changed(uid, printer, key, uuid);
+                return Outcome::Held(format!("{}'s identity changed", s.name));
+            }
+            Err(SendErr::Ev(ipp::Ev::Unreachable(_))) if remote.is_none() => {
+                self.set_offline(uid, printer, true);
+                return Outcome::Retry(format!("{} is offline", s.name));
+            }
+            Err(SendErr::Ev(ev)) => return Outcome::Failed(self.ev_fail(uid, printer, ev).1),
+            Err(SendErr::Msg(m)) => return Outcome::Failed(m),
+        }
+        let _ = std::fs::remove_file(&spool);
+        {
+            let mut st = self.lock();
+            let p = self.person(&mut st, uid);
+            if let Some(s) = p.file.printer.iter_mut().find(|s| s.id == printer) {
+                s.jobs_sent = s.jobs_sent.saturating_add(1);
+            }
+            self.persist(uid, &mut st);
+        }
+        let Some(remote) = remote else { return Outcome::Done(String::new()) };
+        self.set(job, |j| j.view.phase = Phase::Printing);
+        self.watch(&s, w, job, remote)
+    }
+
+    /// Submit, then the spool's bytes as they come, then the end.
+    #[allow(clippy::too_many_arguments)]
+    fn send(&self, w: &mut Ipp, job: u64, spool: &PathBuf, prog: &Arc<(Mutex<Progress>, Condvar)>, identity: JobIdentity, format: Format, ticket: Ticket) -> Result<(), SendErr> {
+        let io = |e: io::Error| SendErr::Msg(format!("prelum-ipp: {e}"));
+        w.send(&ipp::Req::Submit { identity, format, ticket }).map_err(io)?;
+        let mut f = File::open(spool).map_err(|e| SendErr::Msg(format!("spool: {e}")))?;
+        let mut at = 0u64;
+        let mut buf = vec![0u8; DATA_CHUNK];
+        let (m, cv) = &**prog;
+        let mut broken = None;
+        loop {
+            let (written, end) = {
+                let mut p = m.lock().unwrap();
+                while p.written == at && p.end.is_none() {
+                    p = cv.wait(p).unwrap();
+                }
+                (p.written, p.end.clone())
+            };
+            if end.as_ref().is_some_and(|e| e.is_err()) {
+                // The document failed: stop without an End, so the printer
+                // never takes a partial document as whole.
+                return Err(SendErr::Msg(end.unwrap().unwrap_err()));
+            }
+            if end.is_some() && written == at {
+                self.set(job, |j| j.view.phase = Phase::Sending);
+                break;
+            }
+            f.seek(SeekFrom::Start(at)).map_err(|e| SendErr::Msg(format!("spool: {e}")))?;
+            let n = ((written - at) as usize).min(buf.len());
+            f.read_exact(&mut buf[..n]).map_err(|e| SendErr::Msg(format!("spool: {e}")))?;
+            if let Err(e) = w.send(&ipp::Req::Data(buf[..n].to_vec())) {
+                broken = Some(e);
+                break;
+            }
+            at += n as u64;
+        }
+        if broken.is_none() {
+            if let Err(e) = w.send(&ipp::Req::End) {
+                broken = Some(e);
+            }
+        }
+        // The worker's answers: maybe the job's id, then Sent or why not.
+        loop {
+            match w.next() {
+                Ok(ipp::Ev::JobCreated { id }) => {
+                    self.set(job, |j| j.remote = Some(id));
+                }
+                Ok(ipp::Ev::Sent) if broken.is_none() => return Ok(()),
+                Ok(ev) => return Err(SendErr::Ev(ev)),
+                Err(e) => return Err(io(broken.unwrap_or(e))),
+            }
+        }
+    }
+
+    /// Follow the job at the printer until it ends (§6.3 polling).
+    fn watch(&self, s: &Saved, mut w: Ipp, job: u64, remote: i32) -> Outcome {
+        let began = Instant::now();
+        let mut failing_since: Option<Instant> = None;
+        loop {
+            let pause = if began.elapsed() < Duration::from_secs(60) { POLL_FAST } else { POLL_SLOW };
+            {
+                let st = self.lock();
+                let (st, _) = self.cv.wait_timeout_while(st, pause, |st| st.jobs.get(&job).is_some_and(|j| !j.cancel)).unwrap_or_else(|e| e.into_inner());
+                if st.jobs.get(&job).is_none_or(|j| j.cancel) {
+                    drop(st);
+                    drop(w);
+                    self.cancel_remote(s, remote);
+                    return Outcome::Cancelled;
+                }
+            }
+            let ev = w.ask(&ipp::Req::Job { id: remote, user: USER.into() });
+            match ev {
+                Ok(ipp::Ev::Job { state, impressions, .. }) => {
+                    failing_since = None;
+                    if let Some(n) = impressions {
+                        self.set(job, |j| {
+                            if j.view.of > 0 {
+                                j.view.sheets = (n as u32).min(j.view.of);
+                            }
+                        });
+                    }
+                    match state {
+                        JobState::Completed => return Outcome::Done(String::new()),
+                        JobState::Canceled => return Outcome::Cancelled,
+                        JobState::Aborted => return Outcome::Failed("the printer stopped the job".into()),
+                        JobState::Stopped => {
+                            self.set(job, |j| j.view.message = "the printer has stopped".into());
+                        }
+                        _ => {
+                            self.set(job, |j| j.view.message.clear());
+                        }
+                    }
+                }
+                other => {
+                    let since = *failing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() > POLL_GIVE_UP {
+                        return Outcome::Done("the printer stopped answering; it has the whole document".into());
+                    }
+                    if other.is_err() {
+                        // The worker died: a new one.
+                        match self.worker(s, false) {
+                            Ok(nw) => {
+                                let ok = self.hold(job, &nw.p.stop);
+                                w = nw;
+                                if !ok {
+                                    continue;
+                                }
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel_remote(&self, s: &Saved, remote: i32) {
+        if let Ok(mut w) = self.worker(s, false) {
+            let _ = w.ask(&ipp::Req::Cancel { id: remote, user: USER.into() });
+        }
+    }
+}
+
+enum SendErr {
+    Ev(ipp::Ev),
+    Msg(String),
+}
+
+#[derive(Default)]
+struct Progress {
+    format: Option<Format>,
+    written: u64,
+    /// Ok: the document is complete; Err: why it can't be.
+    end: Option<Result<(), String>>,
+}
+
+fn open_spool(p: &PathBuf) -> io::Result<File> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(p.parent().unwrap())?;
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(p)
+}
+
+/// prelum-render's frames: data to the spool, progress to the job.
+fn read_render(mut sock: UnixStream, mut spool: File, prog: Arc<(Mutex<Progress>, Condvar)>, sheets: Arc<dyn Fn(u32, u32) + Send + Sync>) -> Result<(), String> {
+    let (m, cv) = &*prog;
+    let finish = |r: Result<(), String>| {
+        let mut p = m.lock().unwrap();
+        if p.end.is_none() {
+            p.end = Some(r.clone());
+        }
+        cv.notify_all();
+        r
+    };
+    let mut of = 0;
+    let mut total = 0u64;
+    loop {
+        let ev = match frame::read::<render::Ev>(&mut sock) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return finish(Err("the document could not be prepared".into())),
+            Err(e) => return finish(Err(format!("the document could not be prepared ({e})"))),
+        };
+        match ev {
+            render::Ev::Started { sheets: n, format } => {
+                of = n;
+                sheets(0, n);
+                m.lock().unwrap().format = Some(format);
+                cv.notify_all();
+            }
+            render::Ev::Data(d) => {
+                total += d.len() as u64;
+                if total > SPOOL_CAP {
+                    return finish(Err("the document is too large to print".into()));
+                }
+                if let Err(e) = spool.write_all(&d) {
+                    return finish(Err(format!("spool: {e}")));
+                }
+                m.lock().unwrap().written = total;
+                cv.notify_all();
+            }
+            render::Ev::Sheet(n) => sheets(n, of),
+            render::Ev::Done { .. } => {
+                let _ = spool.flush();
+                return finish(Ok(()));
+            }
+            render::Ev::Failed(e) => return finish(Err(short(&e))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_addresses() {
+        let c = candidates("printer.lan").unwrap();
+        assert_eq!(c[0], ("ipps://printer.lan:631/ipp/print".into(), true, "printer.lan:631".into()));
+        assert_eq!(c[1].0, "ipp://printer.lan:631/ipp/print");
+        assert_eq!(candidates("ipp://10.0.0.5:8631/ipp/print").unwrap(), vec![("ipp://10.0.0.5:8631/ipp/print".into(), false, "10.0.0.5:8631".into())]);
+        assert!(candidates("http://x").is_err());
+        assert!(candidates("ipp://u@x").is_err());
+    }
+
+    #[test]
+    fn media_names() {
+        assert!(media_ok("iso_a4_210x297mm"));
+        assert!(media_ok("na_letter_8.5x11in"));
+        assert!(!media_ok("letter"));
+        assert!(!media_ok("iso_a4_210x297x3mm"));
+    }
+
+    #[test]
+    fn plans() {
+        let info = PrinterInfo {
+            formats: vec!["image/pwg-raster".into(), "image/urf".into()],
+            pwg_resolutions: vec![(150, 150), (300, 300), (600, 600)],
+            pwg_types: vec!["sgray_8".into(), "srgb_8".into()],
+            media_supported: vec!["iso_a4_210x297mm".into(), "na_letter_8.5x11in".into()],
+            media_default: Some("na_letter_8.5x11in".into()),
+            sides_supported: vec!["one-sided".into(), "two-sided-long-edge".into()],
+            color_modes: vec!["color".into(), "monochrome".into()],
+            printer_resolutions: vec![(300, 300)],
+            ..Default::default()
+        };
+        let mut req = print::Print::new(1, "t");
+        let (f, args, t) = plan(&info, false, &req).unwrap();
+        assert_eq!(f, Format::PwgRaster);
+        assert!(args.windows(2).any(|w| w == ["--dpi", "300"]));
+        assert!(args.windows(2).any(|w| w == ["--media", "na_letter_8.5x11in"]));
+        assert_eq!(t.resolution, Some((300, 300)));
+        req.quality = Some(Quality::High);
+        req.color = ColorMode::Monochrome;
+        req.sides = Sides::TwoSidedShortEdge;
+        let (_, args, t) = plan(&info, false, &req).unwrap();
+        assert!(args.windows(2).any(|w| w == ["--dpi", "600"]));
+        assert!(args.windows(2).any(|w| w == ["--color", "gray"]));
+        assert_eq!((t.color, t.sides, t.resolution), (ColorMode::Monochrome, Sides::OneSided, None));
+    }
+}

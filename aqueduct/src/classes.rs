@@ -156,6 +156,11 @@ pub const CLASS_DEVICES:   u8 = 17;
 /// `atrium-netconf` crate). `CLASS_NET` (12) is the Insula connect broker.
 pub const CLASS_NETCONF:   u8 = 18;
 
+/// Printing (docs/spec/printing.md §6.4): saved printers, jobs and cancel,
+/// served by prelumd. Postcard payloads (the `prelum-proto` crate). 19 is
+/// `CLASS_VPN`'s (docs/spec/vpn.md §7.2).
+pub const CLASS_PRINT:     u8 = 20;
+
 /// Smoke-test / fuzzing service. Not part of the production
 /// surface; used by aqueduct-echo and unit tests.
 pub const CLASS_ECHO:      u8 = 63;
@@ -182,6 +187,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_MEDIA      => "media",
         CLASS_DEVICES    => "devices",
         CLASS_NETCONF    => "netconf",
+        CLASS_PRINT      => "print",
         CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",
         CLASS_TABELLARIUS => "tabellarius",
