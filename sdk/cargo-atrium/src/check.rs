@@ -115,6 +115,12 @@ pub const PARSERS: &[(&str, Kind)] = &[
     ("async-imap", Kind::Network), ("imap", Kind::Network), ("russh", Kind::Network), ("ssh2", Kind::Network),
 ];
 
+/// The SDK's own crates: what they link is the platform's choice, used
+/// for the platform's purposes (Pergola shapes text with swash on the
+/// system's fonts), not a parser the app put in its core.
+pub const SDK_CRATES: &[&str] = &["pergola", "fresco-client", "fresco-protocol", "atrium-message", "atrium-worker",
+    "limen", "tabula", "aqueduct", "libatrium", "atrium-fonts", "nuntius", "pergola-document", "pergola-richtext"];
+
 pub fn kind_of(name: &str) -> Option<Kind> { PARSERS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k) }
 
 /// What a manifest says the app holds, as the lint needs it.
@@ -259,10 +265,14 @@ pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, St
         if !members.contains(id) {
             continue;
         }
-        // Everything this package links, from its id.
+        // Everything this package links, from its id; not through the
+        // SDK's own crates (they are listed, what they link is not).
         let mut seen = BTreeSet::new();
         let mut q = VecDeque::from([id]);
         while let Some(x) = q.pop_front() {
+            if x != id && by_id.get(x).is_some_and(|(n, _)| SDK_CRATES.contains(n)) {
+                continue;
+            }
             for d in deps.get(x).into_iter().flatten() {
                 if seen.insert(*d) {
                     q.push_back(d);
@@ -375,7 +385,8 @@ input = "fd"
                 {"id": "image 1", "name": "image", "version": "0.25.6", "targets": [{"kind": ["lib"], "name": "image"}]},
                 {"id": "png 1", "name": "png", "version": "0.17.0", "targets": [{"kind": ["lib"], "name": "png"}]},
                 {"id": "pergola 1", "name": "pergola", "version": "0.1.0", "targets": [{"kind": ["lib"], "name": "pergola"}]},
-                {"id": "zip 1", "name": "zip", "version": "2.0.0", "targets": [{"kind": ["lib"], "name": "zip"}]}
+                {"id": "zip 1", "name": "zip", "version": "2.0.0", "targets": [{"kind": ["lib"], "name": "zip"}]},
+                {"id": "swash 1", "name": "swash", "version": "0.1.0", "targets": [{"kind": ["lib"], "name": "swash"}]}
             ],
             "resolve": {"nodes": [
                 {"id": "photos 1", "deps": [
@@ -384,7 +395,8 @@ input = "fd"
                     {"pkg": "zip 1", "dep_kinds": [{"kind": "dev"}]}]},
                 {"id": "decode 1", "deps": [{"pkg": "image 1", "dep_kinds": [{"kind": null}]}]},
                 {"id": "image 1", "deps": [{"pkg": "png 1", "dep_kinds": [{"kind": null}]}]},
-                {"id": "png 1", "deps": []}, {"id": "pergola 1", "deps": []}, {"id": "zip 1", "deps": []}
+                {"id": "png 1", "deps": []}, {"id": "zip 1", "deps": []}, {"id": "swash 1", "deps": []},
+                {"id": "pergola 1", "deps": [{"pkg": "swash 1", "dep_kinds": [{"kind": null}]}]}
             ]}
         })
     }
@@ -403,6 +415,8 @@ input = "fd"
         assert!(p.iter().all(|x| x.level == Level::Warning));
         assert!(p[0].message.contains("holds net-fetch and links image 0.25.6"), "{}", p[0].message);
         assert_eq!(p[0].fix.as_deref(), Some("decode in a worker (template: viewer); this app has workers: decode"));
+        // What the SDK links (Pergola's swash) is not the app's parser.
+        assert!(!g.iter().any(|x| x.message.contains("swash")), "{g:?}");
         // A dev-dependency is not linked into the core.
         assert!(!g.iter().any(|x| x.message.contains("zip")));
         // The worker's own image is its business.

@@ -1,0 +1,12 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+# The core: the process that holds atrium.toml's capabilities.
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+[dependencies]
+pergola = {{dep:pergola}}

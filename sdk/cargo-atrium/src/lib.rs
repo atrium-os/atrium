@@ -3,3 +3,4 @@
 //! is the same engine for people who prefer it.
 
 pub mod check;
+pub mod new;

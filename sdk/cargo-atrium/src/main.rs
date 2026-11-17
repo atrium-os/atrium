@@ -14,6 +14,8 @@ Commands:
       the consent text the person will see) and the crate graph (parsers
       and network clients linked into the core, which holds the grants).
       Findings are warnings; the exit status is 1 only for manifest errors.
+  new <name> [--template <t>] [--id <app id>] [--sdk-path <atrium checkout>]
+      A project in ./<name> from an SDK template; --list shows them.
 
 Run it in the project folder (the one with Cargo.toml and atrium.toml).";
 
@@ -25,6 +27,7 @@ fn main() -> ExitCode {
     }
     match args.first().map(String::as_str) {
         Some("check") => cmd_check(&args[1..]),
+        Some("new") => cmd_new(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -32,6 +35,48 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("cargo atrium: unknown command {other:?}\n\n{HELP}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_new(args: &[String]) -> ExitCode {
+    use cargo_atrium::new;
+    let (mut name, mut template, mut id, mut sdk, mut registry) = (None, "app".to_string(), None, None, new::REGISTRY.to_string());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--list" => {
+                for (t, what, _) in new::TEMPLATES {
+                    println!("  {t:<10} {what}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            "--template" => template = it.next().cloned().unwrap_or_default(),
+            "--id" => id = it.next().cloned(),
+            "--sdk-path" => sdk = it.next().map(PathBuf::from),
+            "--registry" => registry = it.next().cloned().unwrap_or(registry),
+            o if o.starts_with("--") => {
+                eprintln!("cargo atrium new: unknown flag {o}");
+                return ExitCode::from(2);
+            }
+            o => name = Some(o.to_string()),
+        }
+    }
+    let Some(name) = name else {
+        eprintln!("cargo atrium new: a name, e.g. cargo atrium new hello");
+        return ExitCode::from(2);
+    };
+    let sdk = sdk.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let o = new::Opts { name: &name, template: &template, id: id.as_deref(), sdk_path: sdk.as_deref(), registry: &registry };
+    match new::create(Path::new(&name), &o) {
+        Ok(files) => {
+            println!("cargo atrium: made {name}/ from the {template} template: {}", files.join(", "));
+            println!("  next: cd {name} && cargo atrium check");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cargo atrium new: {e}");
+            ExitCode::FAILURE
         }
     }
 }
