@@ -1192,8 +1192,10 @@ Each step runs in the VM on headless frescod before the next.
      cannot be read at all is moved aside, never overwritten.
    - Checked in `scripts/navigator-live-vm.sh` (RUNBOOK §13.6d). Not yet: the broker's saved
      address per page (step 4 added it as navigatord's store address; version history comes with
-     broker sessions), and the content
-     store collecting pages only a forgotten trail referred to.
+     broker sessions). *Built 2026-11-17:* forgetting a trail put away, or its expiry after 30 days,
+     takes out of navigatord's store the stored versions only it named (not another trail's, not a
+     kept page's), with the `Clear` that clearing history sends (unit-tested; `Clear` itself is
+     checked in the VM by the history step).
 4. **Parking.** Save and restore under the broker's budget; measure restore time on the Mac
    (HVF) and the R9700 box, and set the live budget from it.
    *Built 2026-11-13 (static pages; measured under TCG only):*

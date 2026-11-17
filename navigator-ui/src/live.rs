@@ -374,6 +374,14 @@ impl Live {
     /// the page children. Returns whether the shell changed.
     pub fn tick(&mut self, s: &mut Shell) -> bool {
         let mut changed = false;
+        // Stored versions only a forgotten trail named (§4.5).
+        if !s.store.orphaned.is_empty() {
+            let records = std::mem::take(&mut s.store.orphaned);
+            eprintln!("navigator-ui: a forgotten trail: {} stored versions to take out", records.len());
+            for chunk in records.chunks(navigator_control::CLEAR_MAX) {
+                send(&mut self.w, &Request::Clear { records: chunk.to_vec() });
+            }
+        }
         // navigatord's answers.
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;

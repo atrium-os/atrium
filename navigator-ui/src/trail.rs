@@ -613,6 +613,10 @@ pub struct TrailStore {
     pub(crate) reading: std::collections::BTreeMap<(String, String), ReadingPrefs>,
     pub(crate) clock: u64,
     pub(crate) next_id: u64,
+    /// Stored versions only a forgotten trail named (§4.5): navigatord is
+    /// told to take them out (`Clear`), then this is emptied. Never
+    /// written to disk.
+    pub orphaned: Vec<String>,
 }
 
 impl Default for TrailStore {
@@ -627,6 +631,7 @@ impl Default for TrailStore {
             reading: Default::default(),
             clock: 0,
             next_id: 1,
+            orphaned: vec![],
         };
         s.new_trail(false);
         s
@@ -766,20 +771,46 @@ impl TrailStore {
         true
     }
 
-    /// Forget a trail put away: its records go now (§4.5).
+    /// Forget a trail put away: its records go now (§4.5), and the stored
+    /// versions only it named with them.
     pub fn forget(&mut self, index: usize) -> bool {
         if index >= self.earlier.len() {
             return false;
         }
-        self.earlier.remove(index);
+        let gone = self.earlier.remove(index).trail;
+        self.orphan(&[gone]);
         true
     }
 
-    /// Drop what has been put away longer than `EARLIER_KEEP_S`.
+    /// Drop what has been put away longer than `EARLIER_KEEP_S`, and the
+    /// stored versions only those trails named.
     pub fn expire(&mut self, now_s: u64) -> usize {
-        let n = self.earlier.len();
-        self.earlier.retain(|e| now_s.saturating_sub(e.at_s) < EARLIER_KEEP_S);
-        n - self.earlier.len()
+        let (keep, gone): (Vec<PutAway>, Vec<PutAway>) =
+            std::mem::take(&mut self.earlier).into_iter().partition(|e| now_s.saturating_sub(e.at_s) < EARLIER_KEEP_S);
+        self.earlier = keep;
+        let gone: Vec<Trail> = gone.into_iter().map(|e| e.trail).collect();
+        self.orphan(&gone);
+        gone.len()
+    }
+
+    /// The stored versions `gone` named that no trail left names and no
+    /// kept page is, onto `orphaned`.
+    fn orphan(&mut self, gone: &[Trail]) {
+        let still: BTreeSet<&str> = self
+            .trails
+            .iter()
+            .chain(self.earlier.iter().map(|e| &e.trail))
+            .flat_map(|t| t.pages.iter().filter_map(|p| p.saved.as_deref()))
+            .collect();
+        let mut add = Vec::new();
+        for p in gone.iter().flat_map(|t| t.pages.iter()) {
+            if let Some(a) = p.saved.as_deref() {
+                if !still.contains(a) && !self.is_kept(&p.url) && !self.orphaned.iter().any(|o| o == a) && !add.contains(&a.to_string()) {
+                    add.push(a.to_string());
+                }
+            }
+        }
+        self.orphaned.extend(add);
     }
 
     fn jar_of(t: &Trail) -> String {
@@ -1104,6 +1135,27 @@ mod tests {
         assert_eq!(s.earlier[0].trail.title(), "b");
         assert!(s.forget(0));
         assert!(s.earlier.is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_trail_takes_out_what_only_it_named() {
+        let mut s = TrailStore::default();
+        s.follow(spec("https://a.example/1"));
+        s.trail_mut().pages[0].saved = Some("rec-a1".into());
+        s.follow(spec("https://a.example/2"));
+        s.trail_mut().pages[1].saved = Some("rec-shared".into());
+        s.follow(spec("https://a.example/kept"));
+        s.trail_mut().pages[2].saved = Some("rec-kept".into());
+        s.toggle_keep();
+        s.put_away(1000);
+        s.follow(spec("https://a.example/2"));
+        s.trail_mut().pages[0].saved = Some("rec-shared".into());
+        s.put_away(2000);
+        assert!(s.forget(1), "the older one, put away first");
+        assert_eq!(s.orphaned, ["rec-a1"], "not the version another trail names, not a kept page's");
+        s.orphaned.clear();
+        assert_eq!(s.expire(2000 + EARLIER_KEEP_S), 1);
+        assert_eq!(s.orphaned, ["rec-shared"]);
     }
 
     #[test]
