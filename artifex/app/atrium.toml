@@ -1,0 +1,22 @@
+# Artifex (docs/spec/dev-tools.md §3.4, dev-tools-plan.md M11): the code
+# editor. It edits the `work` of workspaces the person picks in it (a press;
+# mounted at /work/<name>) and runs builds, git and language servers in the
+# workspace with `workspace-exec`. It holds no toolchain and no network of
+# its own. The terminal button opens the picked workspace's terminal.
+[app]
+id          = "org.atrium.artifex"
+name        = "Artifex"
+version     = "0.1.0"
+entry       = "bin/artifex"
+description = "Edit code in your workspaces, build and run it there."
+icon        = "code"
+
+[capabilities]
+graphics       = "fresco"
+workspace-exec = true
+clipboard      = true
+network        = "none"
+
+[supervision]
+restart   = "on-crash"
+instances = "single"

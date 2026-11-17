@@ -615,7 +615,9 @@ impl<V: View> App<V> {
                 }
                 // Tab is focus traversal, owned by the App; focused
                 // widgets never see it.
-                if kind.pressed() && *key == Key::Tab {
+                let tab_taken = !modifiers.ctrl
+                    && self.focused.and_then(|f| self.interactions.get(f)).is_some_and(|h| h.takes_tab);
+                if kind.pressed() && *key == Key::Tab && !tab_taken {
                     self.cycle_focus(modifiers.shift);
                     return;
                 }
