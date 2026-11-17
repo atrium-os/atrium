@@ -4541,7 +4541,9 @@ tessera_fs_sb_root(const tessera_superblock_t *sb, uint8_t kind)
  * is refused rather than read without one. The pack registry is refused too:
  * its sealed values are 80 bytes, and only seal_reg_tree reads them.
  */
-static tessera_btree_t *
+/* __noinline: inlined at its seven pinscan call sites it pushed
+ * tessera_fs_pinscan_run over the frame limit (#114). */
+static __noinline tessera_btree_t *
 tessera_fs_tree_open(struct tessera_mount *tmp_, uint64_t root,
     uint8_t kind, uint32_t key_size, uint32_t value_size)
 {
