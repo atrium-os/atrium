@@ -198,6 +198,17 @@ DHCP with a fresh DISCOVER). `Manual::check` (in `atrium-netconf`) refuses a pre
 outside 8–30, the network or broadcast address, a router outside the subnet or equal to
 the address.
 
+Address conflicts (RFC 5227, built 2026-11-17): before using a new address (an ACK
+after DISCOVER/OFFER/REQUEST; not a reboot or renewal of one already used), atrium-lease
+asks for three ARP probes 600-900 ms apart and waits as long again, about 2-3 s in all
+(the RFC asks 4-7 s; a host that has the address answers within milliseconds). The bpf
+filter passes ARP to atrium-lease, which reads it; atrium-net only sends the probes it
+builds itself from an address (`probe addr=`, ordinary unicast only, DHCP token bucket),
+sender address 0.0.0.0. Any ARP from another MAC that has the address, or that probes for
+it too, is a conflict: DHCPDECLINE, and DISCOVER again after 10 s (RFC 2131 §3.1). Once
+bound, defending the address is the kernel's. Gate: `lan.py conflict` (a host that has
+10.88.0.50) in `atrium-net-gate.sh n0`.
+
 ### 5.2 Proposal checks (in atrium-net)
 
 A proposal is applied only if: the address is unicast and not in 0/8, 127/8, 169.254/16
@@ -402,7 +413,8 @@ VM from the Aura gates cover them.
   to `forward.conf` until the next lease; atrium-net will rewrite it in N1.
 - Known gaps: a dead atrium-lease makes atrium-net exit (respawning needs `exec`, which
   capability mode forbids; the service manager restarts it, N1 adds a small spawner);
-  no ARP probe before using an address (DHCPDECLINE) yet; no rc/services.d manifest yet.
+  ARP probe before using an address: built 2026-11-17 (below); no rc/services.d manifest yet
+  (rc.d services since, §10.6).
 - Gate: `scripts/atrium-net-gate.sh vm|n0` (RUNBOOK §13.6e), 14 checks. The VM's
   second NIC is a QEMU UDP socket netdev to `atrium-net/sim/lan.py`, a simulated LAN
   with router, DHCP and DNS that can turn hostile (17 kinds of bad reply).

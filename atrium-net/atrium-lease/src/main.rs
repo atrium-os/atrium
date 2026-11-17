@@ -10,7 +10,8 @@
 //!                      payload; atrium-net wraps it), `lease4 ..`,
 //!                      `lost why=..`, `state s=..`,
 //!                      `dns6 servers=A,B` (from RAs and DHCPv6; empty
-//!                      when none), `send6 hex=..` (a DHCPv6 payload;
+//!                      when none), `probe addr=A.B.C.D` (an ARP probe
+//!                      before a new address is used), `send6 hex=..` (a DHCPv6 payload;
 //!                      atrium-net sends it to ff02::1:2), `lease6 addr=A
 //!                      pref=S valid=S`, `lost6 why=..`
 //!
@@ -157,6 +158,14 @@ fn main() {
                             }
                             continue;
                         }
+                        if let Some(a) = frame::arp_from_frame(&f) {
+                            let o = cl.arp(&a, now());
+                            if verbose && !o.is_empty() {
+                                eprintln!("atrium-lease: {} is in use ({}): declined", fmt_mac(&a.sha), a.spa);
+                            }
+                            outs.extend(o);
+                            continue;
+                        }
                         if let Some((src_mac, _src, p)) = frame::dhcp_from_frame_mac(&f) {
                             let o = cl.rx(p, now());
                             if o.iter().any(|x| matches!(x, Out::Bound(_))) {
@@ -217,6 +226,7 @@ fn main() {
                 }
                 Out::Bound(l) => l.to_line(),
                 Out::Lost(why) => Line::new("lost").with("why", why),
+                Out::Probe(a) => Line::new("probe").with("addr", a.to_string()),
             };
             if c.send(&line).is_err() {
                 std::process::exit(0);

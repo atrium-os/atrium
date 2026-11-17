@@ -19,6 +19,9 @@ pub enum Out {
     Bound(LeaseV4),
     /// Remove the address: lease expired, NAK, or link gone.
     Lost(&'static str),
+    /// Send an ARP probe for this address (RFC 5227 §2.1.1: sender
+    /// address 0.0.0.0); atrium-net builds the frame.
+    Probe(Ipv4Addr),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +29,8 @@ enum St {
     Idle,
     Selecting,
     Requesting { offer: Ipv4Addr, server: Ipv4Addr },
+    /// ACKed, asking the link whether anyone has the address yet.
+    Probing { left: u8, t1: u64 },
     Rebooting { addr: Ipv4Addr },
     Bound,
     Renewing,
@@ -53,6 +58,21 @@ pub struct Client {
 const REQUEST_TRIES: u32 = 4;
 const REBOOT_TRIES: u32 = 2;
 const REFUSED_BACKOFF_MS: u64 = 10_000;
+/// RFC 5227 probes, shortened: three probes 600-900 ms apart, then the
+/// last waits as long (about 2-3 s in all, where §1.1 asks 4-7 s; a
+/// conflicting host answers the first probe within milliseconds).
+const PROBES: u8 = 3;
+/// RFC 2131 §3.1 (5): after DHCPDECLINE, wait at least 10 s.
+const DECLINE_BACKOFF_MS: u64 = 10_000;
+
+/// The parts of an ARP packet a conflict check needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arp {
+    pub op: u16,
+    pub sha: [u8; 6],
+    pub spa: Ipv4Addr,
+    pub tpa: Ipv4Addr,
+}
 
 impl Client {
     pub fn new(mac: [u8; 6], rand: Box<dyn FnMut() -> u32 + Send>) -> Client {
@@ -64,6 +84,7 @@ impl Client {
             St::Idle => "idle",
             St::Selecting => "selecting",
             St::Requesting { .. } => "requesting",
+            St::Probing { .. } => "probing",
             St::Rebooting { .. } => "rebooting",
             St::Bound => "bound",
             St::Renewing => "renewing",
@@ -190,6 +211,19 @@ impl Client {
                 vec![]
             }
             St::Selecting => self.send_discover(now),
+            St::Probing { left, t1 } => {
+                let addr = self.held.as_ref().map(|h| h.lease.addr).unwrap_or(Ipv4Addr::UNSPECIFIED);
+                if left > 0 {
+                    self.st = St::Probing { left: left - 1, t1 };
+                    self.deadline = Some(now + 600 + (self.rand)() as u64 % 301);
+                    vec![Out::Probe(addr)]
+                } else {
+                    // No one answered: the address is ours.
+                    self.st = St::Bound;
+                    self.deadline = Some(t1.max(now));
+                    self.held.as_ref().map(|h| vec![Out::Bound(h.lease.clone())]).unwrap_or_default()
+                }
+            }
             St::Requesting { offer, server } => {
                 if self.tries >= REQUEST_TRIES {
                     self.st = St::Selecting;
@@ -277,11 +311,41 @@ impl Client {
         let secs = r.lease.unwrap_or(lease.lease_s) as u64 * 1000;
         let t2 = r.t2.map(|t| t as u64 * 1000).filter(|&t| t > 0 && t < secs).unwrap_or(secs * 7 / 8);
         let t1 = r.t1.map(|t| t as u64 * 1000).filter(|&t| t > 0 && t < t2).unwrap_or(secs / 2);
+        let fresh = matches!(self.st, St::Requesting { .. });
         self.held = Some(Held { lease: lease.clone(), t2: now + t2, expiry: now + secs });
-        self.st = St::Bound;
         self.tries = 0;
+        if fresh {
+            // A new address: probe before using it (RFC 5227). A reboot or
+            // renewal keeps an address we already used without conflict.
+            self.st = St::Probing { left: PROBES, t1: now + t1 };
+            self.deadline = Some(now + (self.rand)() as u64 % 201);
+            return vec![];
+        }
+        self.st = St::Bound;
         self.deadline = Some(now + t1);
         vec![Out::Bound(lease)]
+    }
+
+    /// An ARP packet seen on the link. While probing, a packet from another
+    /// host that has the address (any sender with it), or that is probing
+    /// for it too, is a conflict (RFC 5227 §2.1.1): DHCPDECLINE and start
+    /// over after 10 s.
+    pub fn arp(&mut self, a: &Arp, now: u64) -> Vec<Out> {
+        let St::Probing { .. } = self.st else { return vec![] };
+        let Some(h) = &self.held else { return vec![] };
+        let addr = h.lease.addr;
+        if a.sha == self.mac || !(a.spa == addr || (a.op == 1 && a.spa.is_unspecified() && a.tpa == addr)) {
+            return vec![];
+        }
+        let server = h.lease.server;
+        self.held = None;
+        let mut m = self.msg(Kind::Decline, now);
+        m.requested = Some(addr);
+        m.server_id = Some(server);
+        self.st = St::Selecting;
+        self.fresh(now);
+        self.deadline = Some(now + DECLINE_BACKOFF_MS);
+        vec![Out::Send { to: Dest::Broadcast, payload: dhcp::build(&m) }]
     }
 }
 

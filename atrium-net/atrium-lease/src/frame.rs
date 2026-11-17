@@ -84,3 +84,37 @@ pub fn frame_for_test(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
     f.extend_from_slice(payload);
     f
 }
+
+/// An ARP packet for IPv4 over Ethernet, or `None`.
+pub fn arp_from_frame(f: &[u8]) -> Option<crate::client::Arp> {
+    if f.len() < 14 + 28 || f[12..14] != [0x08, 0x06] {
+        return None;
+    }
+    let p = &f[14..];
+    if p[0..6] != [0, 1, 8, 0, 6, 4] {
+        return None;
+    }
+    let op = u16::from_be_bytes([p[6], p[7]]);
+    if op != 1 && op != 2 {
+        return None;
+    }
+    Some(crate::client::Arp {
+        op,
+        sha: p[8..14].try_into().ok()?,
+        spa: Ipv4Addr::new(p[14], p[15], p[16], p[17]),
+        tpa: Ipv4Addr::new(p[24], p[25], p[26], p[27]),
+    })
+}
+
+/// An ARP frame (tests).
+pub fn arp_for_test(op: u16, sha: [u8; 6], spa: Ipv4Addr, tpa: Ipv4Addr) -> Vec<u8> {
+    let mut f = vec![0xff; 6];
+    f.extend_from_slice(&sha);
+    f.extend_from_slice(&[0x08, 0x06, 0, 1, 8, 0, 6, 4]);
+    f.extend_from_slice(&op.to_be_bytes());
+    f.extend_from_slice(&sha);
+    f.extend_from_slice(&spa.octets());
+    f.extend_from_slice(&[0; 6]);
+    f.extend_from_slice(&tpa.octets());
+    f
+}

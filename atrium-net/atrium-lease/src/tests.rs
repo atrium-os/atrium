@@ -49,7 +49,7 @@ fn parse_req(b: &[u8]) -> crate::dhcp::Msg {
         let (c, l) = (b[i], b[i + 1] as usize);
         let v = &b[i + 2..i + 2 + l];
         match c {
-            53 => m.kind = match v[0] { 1 => Kind::Discover, 3 => Kind::Request, 7 => Kind::Release, k => panic!("kind {k}") },
+            53 => m.kind = match v[0] { 1 => Kind::Discover, 3 => Kind::Request, 4 => Kind::Decline, 7 => Kind::Release, k => panic!("kind {k}") },
             50 => m.requested = Some(Ipv4Addr::new(v[0], v[1], v[2], v[3])),
             54 => m.server_id = Some(Ipv4Addr::new(v[0], v[1], v[2], v[3])),
             61 => {
@@ -84,6 +84,22 @@ fn reply(kind: Kind, xid: u32) -> Reply {
     }
 }
 
+/// An ACK for a new address, then the ARP probes with no one answering:
+/// everything the client put out until it bound.
+fn ack_probe(c: &mut Client, ack: &[u8], now: u64) -> Vec<Out> {
+    let mut out = c.rx(ack, now);
+    let mut probes = 0;
+    while !out.iter().any(|o| matches!(o, Out::Bound(_))) {
+        let d = c.deadline().expect("probing has a deadline");
+        assert!(d - now < 4000, "probing takes under 4 s");
+        let o = c.tick(d);
+        probes += o.iter().filter(|x| matches!(x, Out::Probe(a) if *a == YOU)).count();
+        out.extend(o.into_iter().filter(|x| !matches!(x, Out::Probe(_))));
+    }
+    assert_eq!(probes, 3);
+    out
+}
+
 fn bound(c: &mut Client) -> u32 {
     let out = c.start(0);
     let (to, d) = sent(&out).remove(0);
@@ -91,7 +107,7 @@ fn bound(c: &mut Client) -> u32 {
     let out = c.rx(&dhcp::build_reply(&reply(Kind::Offer, d.xid)), 100);
     let (_, r) = sent(&out).remove(0);
     assert_eq!((r.kind, r.requested, r.server_id), (Kind::Request, Some(YOU), Some(SRV)));
-    let out = c.rx(&dhcp::build_reply(&reply(Kind::Ack, r.xid)), 200);
+    let out = ack_probe(c, &dhcp::build_reply(&reply(Kind::Ack, r.xid)), 200);
     let Some(Out::Bound(l)) = out.into_iter().next() else { panic!("not bound") };
     assert_eq!((l.addr, l.prefix, l.router, l.lease_s), (YOU, 24, Some(SRV), 600));
     assert_eq!(check_v4(&l, &HostView::default()), Ok(()));
@@ -233,7 +249,7 @@ fn classless_routes_replace_router() {
     let mut a = reply(Kind::Ack, x);
     a.routers = vec![Ipv4Addr::new(10, 77, 0, 99)];
     a.classless = Some(v);
-    let Out::Bound(l) = c.rx(&dhcp::build_reply(&a), 2).remove(0) else { panic!() };
+    let Out::Bound(l) = ack_probe(&mut c, &dhcp::build_reply(&a), 2).remove(0) else { panic!() };
     assert_eq!(l.router, Some(SRV));
     assert_eq!(l.routes, vec![
         Route { dst: Ipv4Addr::new(10, 1, 0, 0), prefix: 16, gw: Ipv4Addr::new(10, 77, 0, 2) },
@@ -357,7 +373,7 @@ fn android_hotspot_is_metered() {
     let (_, req) = sent(&out).remove(0);
     let mut a = reply(Kind::Ack, req.xid);
     a.metered = true;
-    let out = c.rx(&dhcp::build_reply(&a), 200);
+    let out = ack_probe(&mut c, &dhcp::build_reply(&a), 200);
     let l = out.iter().find_map(|o| match o { Out::Bound(l) => Some(l.clone()), _ => None }).expect("bound");
     assert!(l.metered);
     assert_eq!(LeaseV4::from_line(&l.to_line()).unwrap().metered, true);
@@ -577,4 +593,54 @@ fn probe_http() {
             assert!(h.location.as_ref().is_none_or(|l| l.len() <= 256 && l.bytes().all(|c| (0x21..0x7f).contains(&c))));
         }
     }
+}
+
+#[test]
+fn arp_conflict_declines() {
+    let other = [2, 0x4e, 0, 0, 0, 0x77];
+    for (op, spa, tpa) in [
+        (2, YOU, Ipv4Addr::UNSPECIFIED),          // a reply: someone has it
+        (1, YOU, SRV),                            // a request from it
+        (1, Ipv4Addr::UNSPECIFIED, YOU),          // another host probing for it
+    ] {
+        let mut c = Client::new(MAC, rng(23));
+        let d = sent(&c.start(0)).remove(0).1;
+        let x = sent(&c.rx(&dhcp::build_reply(&reply(Kind::Offer, d.xid)), 1))[0].1.xid;
+        assert!(c.rx(&dhcp::build_reply(&reply(Kind::Ack, x)), 2).is_empty());
+        assert_eq!(c.state(), "probing");
+        let f = frame::arp_for_test(op, other, spa, tpa);
+        let a = frame::arp_from_frame(&f).unwrap();
+        let s = sent(&c.arp(&a, 300));
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].0, s[0].1.kind, s[0].1.requested, s[0].1.server_id), (Dest::Broadcast, Kind::Decline, Some(YOU), Some(SRV)));
+        assert_eq!(c.state(), "selecting");
+        assert_eq!(c.deadline(), Some(300 + 10_000));
+        assert!(c.lease().is_none());
+    }
+}
+
+#[test]
+fn arp_unrelated_or_own_is_no_conflict() {
+    let mut c = Client::new(MAC, rng(29));
+    let d = sent(&c.start(0)).remove(0).1;
+    let x = sent(&c.rx(&dhcp::build_reply(&reply(Kind::Offer, d.xid)), 1))[0].1.xid;
+    c.rx(&dhcp::build_reply(&reply(Kind::Ack, x)), 2);
+    let other = [2, 0x4e, 0, 0, 0, 0x77];
+    for f in [
+        frame::arp_for_test(1, MAC, Ipv4Addr::UNSPECIFIED, YOU), // our own probe
+        frame::arp_for_test(2, other, Ipv4Addr::new(10, 77, 0, 9), SRV),
+        frame::arp_for_test(1, other, SRV, YOU), // someone asking for YOU: not a claim
+    ] {
+        assert!(c.arp(&frame::arp_from_frame(&f).unwrap(), 5).is_empty());
+    }
+    assert_eq!(c.state(), "probing");
+    // Not ARP for IPv4 over Ethernet.
+    let mut f = frame::arp_for_test(2, other, YOU, SRV);
+    f[17] = 0x86;
+    assert!(frame::arp_from_frame(&f).is_none());
+    // Once bound, ARP is not this client's business (the kernel defends).
+    let mut c = Client::new(MAC, rng(31));
+    bound(&mut c);
+    assert!(c.arp(&frame::arp_from_frame(&frame::arp_for_test(2, other, YOU, SRV)).unwrap(), 9_000).is_empty());
+    assert_eq!(c.state(), "bound");
 }
