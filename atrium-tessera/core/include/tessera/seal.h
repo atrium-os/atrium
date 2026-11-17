@@ -43,6 +43,8 @@ typedef struct tessera_seal_keys {
 	uint8_t            id[32];      /* K_id: keyed content ids */
 	uint8_t            uuid[16];
 	uint8_t            check[32];   /* expected sb.key_check */
+	uint8_t            key_id[16];  /* VK's id, sb.master_key_id (§4.1);
+	                                 * zero after init, set by the caller */
 } tessera_seal_keys_t;
 
 /* Derive every key from VK. TESSERA_EINCOMPAT for an unknown suite. */

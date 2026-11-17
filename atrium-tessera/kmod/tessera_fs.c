@@ -81,6 +81,9 @@
 #include "tessera/pack.h"
 #include "tessera/volume.h"
 #include "tessera_crypt_ocf.h"
+#include "tessera/keyring.h"
+#include "tessera/crypt.h"
+#include "tessera/seal.h"
 #include "tessera_rs.h"	/* D3: Rust on-disk decoders (core/src) */
 
 MALLOC_DEFINE(M_TESSERA, "tessera", "Tessera filesystem");
@@ -3904,6 +3907,13 @@ struct tessera_mount {
 	struct g_consumer        *cp;        /* GEOM consumer for I/O */
 	struct cdev              *dev;
 	tessera_superblock_t      sb;
+	/* Sealed volume (docs/spec/tessera-encryption.md §5): the keys derived
+	 * from the volume key at mount, or NULL. Sealed mounts are read-only
+	 * until the sealed write path lands; seal_reg_tree is the pack registry
+	 * with its 80-byte sealed values, kept apart from pack_registry_tree
+	 * (NULL on a sealed mount) so no 64-byte reader ever sees it. */
+	struct tessera_seal_keys *seal;
+	tessera_btree_t          *seal_reg_tree;
 	/*
 	 * ★ The roots a crash would recover to. [0] = the superblock last
 	 * written to sectors 0/1; [1] = the roots of the last journal
@@ -4506,6 +4516,44 @@ struct tessera_mount {
 	struct tessera_btree     *quota_tree;
 	int                       quota_dirty;
 };
+
+/* The superblock's root for tree kind `kind` (0 for none). */
+static uint64_t
+tessera_fs_sb_root(const tessera_superblock_t *sb, uint8_t kind)
+{
+	switch (kind) {
+	case TESSERA_BTREE_KIND_INODE:      return (sb->inode_root);
+	case TESSERA_BTREE_KIND_PACK_REG:   return (sb->pack_registry_root);
+	case TESSERA_BTREE_KIND_FREE_EXT:   return (sb->free_extent_root);
+	case TESSERA_BTREE_KIND_SNAPSHOT:   return (sb->snapshots_root);
+	case TESSERA_BTREE_KIND_QUOTA:      return (sb->quota_tree_root);
+	case TESSERA_BTREE_KIND_BLOB_INDEX: return (sb->blob_index_root);
+	case TESSERA_BTREE_KIND_DEAD_EXT:   return (sb->dead_extent_root);
+	default:                            return (0);
+	}
+}
+
+/*
+ * Every metadata tree opens through here. On a sealed volume a node opens
+ * only under the tag its parent holds, and the only parent this mount has
+ * for a tree root is the superblock (root_tags). A root that is not the
+ * superblock's own (a snapshot's, a frozen scan copy) has no tag here, so it
+ * is refused rather than read without one. The pack registry is refused too:
+ * its sealed values are 80 bytes, and only seal_reg_tree reads them.
+ */
+static tessera_btree_t *
+tessera_fs_tree_open(struct tessera_mount *tmp_, uint64_t root,
+    uint8_t kind, uint32_t key_size, uint32_t value_size)
+{
+	if (tmp_->seal == NULL)
+		return (tessera_btree_open(&tmp_->meta_bio, root, kind,
+		    key_size, value_size));
+	if (kind >= TESSERA_SB_ROOT_TAGS || kind == TESSERA_BTREE_KIND_PACK_REG ||
+	    root == 0 || root != tessera_fs_sb_root(&tmp_->sb, kind))
+		return (NULL);
+	return (tessera_btree_open_sealed(&tmp_->meta_bio, tmp_->seal, root,
+	    tmp_->sb.root_tags[kind], kind, key_size, value_size));
+}
 
 /*
  * ★ #73(C) instrumentation: expose the flush-gate holder.
@@ -5523,7 +5571,7 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 		    M_WAITOK);
 		_snapgens  = malloc(512 * sizeof(*_snapgens), M_TESSERA,
 		    M_WAITOK);
-		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *_st = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, 3, 8,
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
 		tessera_btree_cursor_t *_sc = (_st != NULL)
@@ -5860,7 +5908,7 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 	if (tessera_drain_audit_snaproots && tmp_->sb.snapshots_root != 0) {
 		_esr = malloc(512 * sizeof(*_esr), M_TESSERA, M_WAITOK);
 		_esg = malloc(512 * sizeof(*_esg), M_TESSERA, M_WAITOK);
-		tessera_btree_t *_t = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *_t = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, 3, 8,
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
 		tessera_btree_cursor_t *_c = (_t != NULL)
@@ -6035,7 +6083,7 @@ tessera_meta_alloc_audit_snaproot(struct tessera_mount *tmp_, uint64_t sect,
 	if (!tessera_alloc_audit_snaproots || tmp_->sb.snapshots_root == 0)
 		return;
 	tessera_stat_alloc_audit_calls++;
-	tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+	tessera_btree_t *t = tessera_fs_tree_open(tmp_,
 	    tmp_->sb.snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
 	    TESSERA_SNAPSHOT_RECORD_SIZE);
 	if (t == NULL)
@@ -7346,6 +7394,98 @@ tessera_fs_journal_setup(struct tessera_mount *tmp_)
 
 /* ── core mount: open device + decode SB ─────────────────────── */
 
+/*
+ * Sealed superblocks (docs/spec/tessera-encryption.md §5.2, §4.3). Only the
+ * clear fields are read before this: the incompat bit, the key id and the
+ * uuid, to find the key in the keyring. Every other field is believed only
+ * from a copy whose key check and HMAC pass under that key; when either
+ * copy says sealed, an unsealed copy is never used. The newest copy that
+ * verifies wins, and it must not be older than the key's high-water mark
+ * (§8). Read-only until the sealed write path exists.
+ */
+static int
+tessera_fs_seal_select(tessera_superblock_t *a, int va,
+    tessera_superblock_t *b, int vb, int ronly, uint64_t requested_gen,
+    struct tessera_seal_keys **out_seal, tessera_superblock_t **out_active)
+{
+	struct tessera_seal_keys *k = NULL;
+	tessera_superblock_t *cand[2] = { va ? a : NULL, vb ? b : NULL };
+	uint8_t vk[32];
+	uint64_t hw = 0;
+	int ok[2] = { 0, 0 }, have = -1, r, why = EINTEGRITY;
+
+	if (!ronly || requested_gen != 0) {
+		printf("tessera_fs: sealed volumes mount read-only for now "
+		    "(no tessera.gen); refusing\n");
+		return (EROFS);
+	}
+	if (tessera_crypt_backend() == NULL) {
+		printf("tessera_fs: sealed volume, but no crypto backend "
+		    "(see the module load messages); refusing\n");
+		return (EOPNOTSUPP);
+	}
+	for (int i = 0; i < 2 && have < 0; i++) {
+		if (cand[i] == NULL ||
+		    (cand[i]->incompat_flags & TESSERA_INCOMPAT_SEALED) == 0)
+			continue;
+		if (tessera_keyring_get(cand[i]->master_key_id,
+		    cand[i]->volume_uuid, 0, vk, &hw) == 0)
+			have = i;
+	}
+	if (have < 0) {
+		const uint8_t *u = (cand[0] != NULL ? cand[0] : cand[1])->
+		    volume_uuid;
+		printf("tessera_fs: sealed volume %02x%02x%02x%02x...: no key "
+		    "loaded for it; refusing\n", u[0], u[1], u[2], u[3]);
+		return (EACCES);
+	}
+	k = malloc(sizeof(*k), M_TESSERA, M_WAITOK | M_ZERO);
+	r = tessera_seal_keys_init(k, cand[have]->enc_suite, vk,
+	    cand[have]->volume_uuid);
+	explicit_bzero(vk, sizeof(vk));
+	if (r != TESSERA_OK) {
+		zfree(k, M_TESSERA);
+		printf("tessera_fs: sealed volume: unknown suite %u; refusing\n",
+		    cand[have]->enc_suite);
+		return (EOPNOTSUPP);
+	}
+	memcpy(k->key_id, cand[have]->master_key_id, 16);
+	for (int i = 0; i < 2; i++) {
+		if (cand[i] == NULL)
+			continue;
+		r = tessera_sb_verify(k, cand[i], NULL);
+		if (r == TESSERA_OK)
+			ok[i] = 1;
+		else if (r == TESSERA_ENOKEY && why != EINTEGRITY)
+			why = EACCES;
+	}
+	if (!ok[0] && !ok[1]) {
+		tessera_seal_keys_clear(k);
+		zfree(k, M_TESSERA);
+		printf("tessera_fs: sealed volume: no superblock copy "
+		    "authenticates under the loaded key; refusing\n");
+		return (why);
+	}
+	if (ok[0] && ok[1])
+		*out_active = a->generation >= b->generation ? a : b;
+	else
+		*out_active = ok[0] ? a : b;
+	if ((*out_active)->generation < hw) {
+		tessera_seal_keys_clear(k);
+		zfree(k, M_TESSERA);
+		printf("tessera_fs: sealed volume at generation %ju, below the "
+		    "key's high-water %ju (an older copy); refusing\n",
+		    (uintmax_t)(*out_active)->generation, (uintmax_t)hw);
+		return (EINTEGRITY);
+	}
+	if (ok[0] != ok[1] && va && vb)
+		printf("tessera_fs: sealed volume: superblock %c does not "
+		    "authenticate; using %c\n", ok[0] ? 'B' : 'A',
+		    ok[0] ? 'A' : 'B');
+	*out_seal = k;
+	return (0);
+}
+
 static int
 tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
     uint32_t chunk_size_override, uint64_t quota_bytes)
@@ -7359,6 +7499,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * at mountfs entry, eating the kstack budget that subsequent
 	 * frames (tree opens, GC, commit_sb) need. */
 	tessera_superblock_t *sb_a, *sb_b, *active = NULL;
+	struct tessera_seal_keys *seal = NULL;
 	sb_a = malloc(sizeof *sb_a, M_TESSERA, M_WAITOK | M_ZERO);
 	sb_b = malloc(sizeof *sb_b, M_TESSERA, M_WAITOK | M_ZERO);
 	int err;
@@ -7402,6 +7543,13 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		active = (sb_a->generation >= sb_b->generation) ? sb_a : sb_b;
 	else
 		active = valid_a ? sb_a : sb_b;
+	if ((valid_a && (sb_a->incompat_flags & TESSERA_INCOMPAT_SEALED)) ||
+	    (valid_b && (sb_b->incompat_flags & TESSERA_INCOMPAT_SEALED))) {
+		err = tessera_fs_seal_select(sb_a, valid_a, sb_b, valid_b, ronly,
+		    requested_gen, &seal, &active);
+		if (err != 0)
+			goto fail_close;
+	}
 
 	if (active->version_major != 1 ||
 	    active->sector_size  != TESSERA_SECTOR_SIZE) {
@@ -7415,7 +7563,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * every pre-hash_alg volume (zeroed slack). BLAKE3 additionally
 	 * requires the load-time KAT to have passed — never run content
 	 * addressing on an implementation that failed its self-test. */
-	if ((active->incompat_flags & ~TESSERA_INCOMPAT_HASH_ALG) != 0) {
+	if ((active->incompat_flags & ~(TESSERA_INCOMPAT_HASH_ALG |
+	    (seal != NULL ? TESSERA_INCOMPAT_SEALED : 0))) != 0) {
 		printf("tessera_fs: unknown incompat_flags 0x%x; refusing\n",
 		    active->incompat_flags);
 		err = EINVAL;
@@ -7513,6 +7662,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->cp    = cp;
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
+	tmp_->seal  = seal;
 	tmp_->zone_lo = zone_lo;
 	tmp_->zone_hi = zone_hi;
 	tmp_->ronly = ronly;
@@ -7704,7 +7854,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * root volume escaped the blanket version only because it mounts ro
 	 * and upgrades, and the upgrade replays after the trees are open.
 	 */
-	if (requested_gen == 0) {
+	/* Sealed (read-only for now): nothing but format has written its
+	 * journal, whose first epoch is empty; replay comes with the sealed
+	 * write path, whose ROOT_UPDATEs must carry the roots' tags. */
+	if (requested_gen == 0 && tmp_->seal == NULL) {
 		int applied = tessera_fs_journal_replay(tmp_, /*roots_only=*/1);
 		if (!ronly && applied > 0 && tmp_->journal != NULL)
 			tessera_fs_journal_persist_sb(tmp_);
@@ -7720,7 +7873,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * never writes back through the snapshot's roots — that would
 	 * fork the timeline. */
 	if (requested_gen != 0 && tmp_->sb.snapshots_root != 0) {
-		tessera_btree_t *st = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *st = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, /*tree_kind*/ 3,
 		    /*key*/ 8, /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
 		if (st == NULL) {
@@ -7774,7 +7927,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->durable_sb[0] = tmp_->sb;
 	tmp_->durable_sb[1] = tmp_->sb;
 
-	tmp_->inode_tree = tessera_btree_open(&tmp_->meta_bio,
+	tmp_->inode_tree = tessera_fs_tree_open(tmp_,
 	    tmp_->sb.inode_root, /*tree_kind*/ 0,
 	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
 	if (tmp_->inode_tree == NULL)
@@ -7782,10 +7935,16 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    "failed; root will be synthesized\n",
 		    (unsigned long)tmp_->sb.inode_root);
 
-	tmp_->pack_registry_tree = tessera_btree_open(&tmp_->meta_bio,
+	tmp_->pack_registry_tree = tessera_fs_tree_open(tmp_,
 	    tmp_->sb.pack_registry_root, /*tree_kind*/ 1,
 	    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
-	if (tmp_->pack_registry_tree == NULL)
+	if (tmp_->seal != NULL)
+		tmp_->seal_reg_tree = tessera_btree_open_sealed(&tmp_->meta_bio,
+		    tmp_->seal, tmp_->sb.pack_registry_root,
+		    tmp_->sb.root_tags[TESSERA_BTREE_KIND_PACK_REG],
+		    TESSERA_BTREE_KIND_PACK_REG, 16,
+		    TESSERA_REGISTRY_ENTRY_SIZE_SEALED);
+	if (tmp_->pack_registry_tree == NULL && tmp_->seal_reg_tree == NULL)
 		printf("tessera_fs: warning — pack registry open at sector %lu "
 		    "failed; blob lookups will fail\n",
 		    (unsigned long)tmp_->sb.pack_registry_root);
@@ -7796,7 +7955,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * (post-repack) that no longer holds the blob falls through to the scan. */
 	tmp_->blob_index_tree = NULL;
 	if (tmp_->sb.blob_index_root != 0) {
-		tmp_->blob_index_tree = tessera_btree_open(&tmp_->meta_bio,
+		tmp_->blob_index_tree = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
 		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE);
 		if (tmp_->blob_index_tree == NULL)
@@ -7811,7 +7970,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * — a drain simply will not happen this mount. */
 	tmp_->dead_extent_tree = NULL;
 	if (tmp_->sb.dead_extent_root != 0) {
-		tmp_->dead_extent_tree = tessera_btree_open(&tmp_->meta_bio,
+		tmp_->dead_extent_tree = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.dead_extent_root, TESSERA_BTREE_KIND_DEAD_EXT,
 		    TESSERA_DEAD_EXT_KEY_SIZE, TESSERA_DEAD_EXT_VAL_SIZE);
 		if (tmp_->dead_extent_tree == NULL)
@@ -7846,7 +8005,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    "failed; time-machine disabled this mount\n");
 		}
 	} else {
-		tmp_->snapshots_tree = tessera_btree_open(&tmp_->meta_bio,
+		tmp_->snapshots_tree = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, /*tree_kind*/ 3,
 		    /*key*/ 8, /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
 		if (tmp_->snapshots_tree == NULL)
@@ -7875,7 +8034,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * carries its own used_bytes, so usage survives umount/remount.
 	 * Forensic mounts skip (no enforcement). */
 	if (tmp_->sb.quota_tree_root != 0 && !tmp_->readonly_snapshot) {
-		tmp_->quota_tree = tessera_btree_open(&tmp_->meta_bio,
+		tmp_->quota_tree = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.quota_tree_root, TESSERA_BTREE_KIND_QUOTA,
 		    /*key*/ 8, /*value*/ TESSERA_QUOTA_DOMAIN_SIZE);
 		tessera_btree_cursor_t *qc = (tmp_->quota_tree != NULL)
@@ -8037,8 +8196,13 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	/* Open the free-extent allocator off the on-disk tree. Powers
 	 * future kbio_alloc / _free calls (round 6+ mutation paths).
 	 * For round 6a it's loaded but unused. */
-	tmp_->extent_alloc = tessera_extent_open_bounded(&tmp_->bio,
-	    tmp_->sb.free_extent_root, tmp_->zone_lo, tmp_->zone_hi);
+	tmp_->extent_alloc = tmp_->seal != NULL
+	    ? tessera_extent_open_sealed(&tmp_->bio, tmp_->seal,
+	        tmp_->sb.free_extent_root,
+	        tmp_->sb.root_tags[TESSERA_BTREE_KIND_FREE_EXT],
+	        tmp_->zone_lo, tmp_->zone_hi)
+	    : tessera_extent_open_bounded(&tmp_->bio,
+	        tmp_->sb.free_extent_root, tmp_->zone_lo, tmp_->zone_hi);
 	if (tmp_->extent_alloc == NULL)
 		printf("tessera_fs: warning — free-extent open at sector %lu "
 		    "failed (unreadable, or an extent outside the pack zone "
@@ -8108,7 +8272,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * repack pass before mount returns. Caps at 100 packs / 1 s by
 	 * default; extra work happens in the background after first
 	 * writes. Skipped on read-only forensic mounts. */
-	if (!tmp_->readonly_snapshot) {
+	if (!tmp_->readonly_snapshot && tmp_->seal == NULL) {
 		uint32_t mc = 0;
 		(void)tessera_fs_count_multi_extent(tmp_, &mc);
 		tmp_->multi_extent_pack_count = mc;
@@ -8250,6 +8414,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	return (0);
 
 fail_close:
+	if (seal != NULL) {
+		tessera_seal_keys_clear(seal);
+		zfree(seal, M_TESSERA);
+	}
 	if (sb_a) free(sb_a, M_TESSERA);
 	if (sb_b) free(sb_b, M_TESSERA);
 	g_topology_lock();
@@ -8300,6 +8468,11 @@ tessera_mount_impl(struct mount *mp)
 		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
 		if (tmp_ != NULL) {
 			int going_ro = vfs_flagopt(mp->mnt_optnew, "ro", NULL, 0);
+			if (tmp_->ronly && !going_ro && tmp_->seal != NULL) {
+				printf("tessera_fs: a sealed volume stays "
+				    "read-only for now\n");
+				return (EROFS);
+			}
 			if (tmp_->ronly && !going_ro) {
 				/* ro -> rw: acquire write access before any write. */
 				g_topology_lock();
@@ -8848,6 +9021,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->quota_tree);
 		if (tmp_->pack_registry_tree != NULL)
 			tessera_btree_close(tmp_->pack_registry_tree);
+		if (tmp_->seal_reg_tree != NULL)
+			tessera_btree_close(tmp_->seal_reg_tree);
 		if (tmp_->blob_index_tree != NULL)
 			tessera_btree_close(tmp_->blob_index_tree);
 		if (tmp_->dead_extent_tree != NULL)
@@ -8893,6 +9068,11 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->bio_ctx.cred != NULL) {
 			crfree(tmp_->bio_ctx.cred);
 			tmp_->bio_ctx.cred = NULL;
+		}
+		if (tmp_->seal != NULL) {
+			tessera_seal_keys_clear(tmp_->seal);
+			zfree(tmp_->seal, M_TESSERA);
+			tmp_->seal = NULL;
 		}
 		free(tmp_, M_TESSERA);
 		mp->mnt_data = NULL;
@@ -9339,8 +9519,9 @@ tessera_init_impl(struct vfsconf *vfsp)
 {
 	(void)vfsp;
 	printf("tessera_fs: VFS registered\n");
-	/* Sealed volumes need it; plain ones mount either way. */
+	/* Sealed volumes need both; plain ones mount either way. */
 	(void)tessera_crypt_ocf_install();
+	(void)tessera_keyring_init();
 	return (0);
 }
 
@@ -9348,6 +9529,7 @@ static int
 tessera_uninit_impl(struct vfsconf *vfsp)
 {
 	(void)vfsp;
+	tessera_keyring_fini();
 	tessera_crypt_ocf_remove();
 	printf("tessera_fs: VFS unregistered\n");
 	return (0);
@@ -12826,8 +13008,8 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 			 * tree under another name — already verified above.
 			 */
 			if (root != 0 && root != tmp_->sb.inode_root) {
-				tessera_btree_t *it = tessera_btree_open(
-				    &tmp_->meta_bio, root,
+				tessera_btree_t *it = tessera_fs_tree_open(
+				    tmp_, root,
 				    TESSERA_BTREE_KIND_INODE, 4,
 				    TESSERA_INODE_RECORD_SIZE);
 				if (it != NULL) {
@@ -13257,7 +13439,7 @@ tessera_fs_inode_get_at_gen(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (srec.inode_root == 0)
 		return (TESSERA_ENOENT);
 
-	tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+	tessera_btree_t *t = tessera_fs_tree_open(tmp_,
 	    srec.inode_root, /*tree_kind*/ 0,
 	    /*key*/ 4, /*value*/ TESSERA_INODE_RECORD_SIZE);
 	if (t == NULL) return (TESSERA_ENOENT);
@@ -17729,7 +17911,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	}
 	for (int i = 0; i < (int)nitems(roots) && !aborted; i++) {
 		if (roots[i].root == 0) continue;
-		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *t = tessera_fs_tree_open(tmp_,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
 		if (t == NULL) continue;
 		int _wrc = tessera_btree_walk_nodes_ex(t, meta_mark_visitor,
@@ -17766,7 +17948,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	 * merely delays reclaim. So every uncertainty resolves to incomplete.
 	 */
 	if (!aborted && r_snap != 0) {
-		tessera_btree_t *st = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *st = tessera_fs_tree_open(tmp_,
 		    r_snap, /*tree_kind*/ 3, /*key*/ 8,
 		    /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
 		if (st == NULL) {
@@ -17808,8 +17990,8 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 			};
 			for (int i = 0; i < 3 && !aborted; i++) {
 				if (sr[i].root == 0) continue;
-				tessera_btree_t *t = tessera_btree_open(
-				    &tmp_->meta_bio, sr[i].root, sr[i].kind,
+				tessera_btree_t *t = tessera_fs_tree_open(
+				    tmp_, sr[i].root, sr[i].kind,
 				    sr[i].ksz, sr[i].vsz);
 				if (t == NULL) {
 					/* ★ #102: an unopenable tree is one we
@@ -17955,7 +18137,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	 * bitmap rather than install one that under-pins.
 	 */
 	if (tmp_->sb.snapshots_root != 0) {
-		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *_st = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, /*kind*/ 3, /*key*/ 8,
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
 		tessera_btree_cursor_t *_sc = (_st != NULL)
@@ -17988,8 +18170,8 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 				if (scratch[_bit / 8] & (1u << (_bit % 8)))
 					continue;   /* already covered */
 				tessera_stat_pinscan_snaproot_unpinned++;
-				tessera_btree_t *_t = tessera_btree_open(
-				    &tmp_->meta_bio, _r, _sroots[_k].kind,
+				tessera_btree_t *_t = tessera_fs_tree_open(
+				    tmp_, _r, _sroots[_k].kind,
 				    _sroots[_k].ksz, _sroots[_k].vsz);
 				if (_t == NULL) { _late_fail = 1; break; }
 				if (tessera_btree_walk_nodes_ex(_t,
@@ -18123,7 +18305,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	 * as catching it.
 	 */
 	if (r_snap != 0) {
-		tessera_btree_t *_dt = tessera_btree_open(&tmp_->meta_bio,
+		tessera_btree_t *_dt = tessera_fs_tree_open(tmp_,
 		    r_snap, /*tree_kind*/ 3, /*key*/ 8,
 		    /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
 		tessera_btree_cursor_t *_dc = (_dt != NULL)
@@ -18947,6 +19129,153 @@ tessera_fs_fetch_reloc_ok(struct tessera_mount *tmp_, uint64_t reloc_gen0,
 	return (0);
 }
 
+/*
+ * Sealed volumes (docs/spec/tessera-encryption.md §5.5): find `id` (a keyed
+ * content id) in one pack. The registry value carries the front matter's
+ * tag; the front (header, index, bloom) is read and opened under K_meta
+ * against that tag, the index searched in the plain front, and the blob's
+ * sealed unit read and opened under K_blob with the id in its AAD. So the
+ * bytes returned are the ones this key sealed under this id, in this pack:
+ * no content-hash check follows (the id is keyed; the AEAD is the check).
+ * 0, ENOENT (not in this pack), or EIO / EINTEGRITY.
+ */
+static int
+tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
+    const tessera_registry_entry_t *re, const uint8_t front_tag[16],
+    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+{
+	const uint64_t pack_len = re->length_sectors * TESSERA_SECTOR_SIZE;
+	tessera_pack_extent_t ext = { re->start_sector, re->length_sectors };
+	tessera_pack_geom_t geom;
+	uint8_t *front = NULL, *unit = NULL, *pt = NULL;
+	uint64_t grp, desc_off;
+	uint32_t flen, dsize;
+	size_t fbytes;
+	int rc;
+
+	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0 ||
+	    re->length_sectors < 2 ||
+	    re->length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS)
+		return (EIO);   /* sealed PEL packs: not written yet */
+	front = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
+	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors, 0,
+	    TESSERA_SECTOR_SIZE, front) != 0) {
+		rc = EIO;
+		goto out;
+	}
+	if (tessera_pack_sealed_prelude(front, TESSERA_SECTOR_SIZE, &grp,
+	    &flen) != TESSERA_OK || grp != 0) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	fbytes = roundup2((size_t)TESSERA_SEALED_PACK_PRELUDE + flen,
+	    TESSERA_SECTOR_SIZE);
+	if (fbytes > pack_len) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	free(front, M_TESSERA);
+	front = malloc(fbytes, M_TESSERA, M_WAITOK);
+	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors, 0,
+	    fbytes, front) != 0) {
+		rc = EIO;
+		goto out;
+	}
+	if (tessera_pack_open_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
+	    front_tag, front, fbytes) != TESSERA_OK) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	if (tessera_pack_geom_from_header(front, pack_len, &geom) !=
+	    TESSERA_OK || geom.bloom_off > fbytes) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	if (memcmp(((const tessera_pack_header_t *)front)->pack_id,
+	    re->pack_id, 16) != 0) {
+		rc = EINTEGRITY;    /* authentic, but another pack's front */
+		goto out;
+	}
+	rc = tessera_pack_index_find(front + geom.index_off,
+	    (size_t)(geom.bloom_off - geom.index_off), &geom, id, &desc_off,
+	    &dsize);
+	if (rc == TESSERA_ENOENT) {
+		rc = ENOENT;
+		goto out;
+	}
+	if (rc != TESSERA_OK || dsize < TESSERA_SEAL_OVERHEAD) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	unit = malloc(dsize, M_TESSERA, M_WAITOK);
+	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors,
+	    desc_off + sizeof(tessera_blob_descriptor_t), dsize, unit) != 0) {
+		rc = EIO;
+		goto out;
+	}
+	pt = malloc(dsize - TESSERA_SEAL_OVERHEAD + 1, M_TESSERA, M_WAITOK);
+	if (tessera_blob_open(&tmp_->seal->blob, tmp_->seal->uuid, 0, id,
+	    unit, dsize, pt) != TESSERA_OK) {
+		rc = EINTEGRITY;
+		goto out;
+	}
+	*out_buf = pt;
+	*out_len = dsize - TESSERA_SEAL_OVERHEAD;
+	pt = NULL;
+	rc = 0;
+out:
+	if (front != NULL)
+		zfree(front, M_TESSERA);
+	if (unit != NULL)
+		free(unit, M_TESSERA);
+	if (pt != NULL)
+		zfree(pt, M_TESSERA);
+	return (rc);
+}
+
+/* Sealed fetch: every pack in the registry, in order, until one holds the
+ * id. O(packs) per miss; the sealed write path adds the blob index. */
+static int
+tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
+    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+{
+	uint8_t key[16], val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
+	tessera_registry_entry_t re;
+	tessera_btree_cursor_t *c;
+	int rc = ENOENT, r;
+
+	if (tmp_->seal_reg_tree == NULL)
+		return (EIO);
+	c = tessera_btree_seek_first(tmp_->seal_reg_tree);
+	if (c == NULL)
+		return (EIO);
+	for (;;) {
+		r = tessera_btree_cursor_get(c, key, val);
+		if (r == TESSERA_ENOENT)
+			break;
+		if (r != TESSERA_OK ||
+		    tessera_decode_registry_entry(val, &re) != TESSERA_OK) {
+			rc = EIO;
+			break;
+		}
+		r = tessera_fs_sealed_pack_find(tmp_, &re,
+		    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf, out_len);
+		if (r != ENOENT) {
+			rc = r;
+			break;
+		}
+		r = tessera_btree_cursor_next(c);
+		if (r == TESSERA_ENOENT)
+			break;
+		if (r != TESSERA_OK) {
+			rc = EIO;    /* a node that failed to open */
+			break;
+		}
+	}
+	tessera_btree_cursor_free(c);
+	return (rc);
+}
+
 static int
 tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
                       tessera_btree_t *reg_override,
@@ -18983,6 +19312,9 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	if (tessera_fs_pending_manifest_lookup(tmp_, hash,
 	    out_buf, out_len) != 0)
 		return (0);
+	if (tmp_->seal != NULL)
+		return (tessera_fs_fetch_blob_sealed(tmp_, hash, out_buf,
+		    out_len));
 	/*
 	 * NOT ENOENT: with the registry unavailable we know nothing about
 	 * what is on this volume, and ENOENT now MEANS "definitively absent"
@@ -20007,14 +20339,14 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 
 	if (concurrent) {
 		if (scan->inode_root != 0) {
-			open_inode = tessera_btree_open(&tmp_->meta_bio,
+			open_inode = tessera_fs_tree_open(tmp_,
 			    scan->inode_root, /*tree_kind*/ 0, /*key*/ 4,
 			    /*value*/ TESSERA_INODE_RECORD_SIZE);
 			if (open_inode == NULL) return (0);
 			scan_inode_tree = open_inode;
 		}
 		if (scan->registry_root != 0) {
-			open_reg = tessera_btree_open(&tmp_->meta_bio,
+			open_reg = tessera_fs_tree_open(tmp_,
 			    scan->registry_root, /*tree_kind*/ 1, /*key*/ 16,
 			    TESSERA_REGISTRY_ENTRY_SIZE);
 			if (open_reg == NULL) {
@@ -20024,7 +20356,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			scan_reg_tree = open_reg;
 		}
 		if (scan->snapshots_root != 0) {
-			open_snap = tessera_btree_open(&tmp_->meta_bio,
+			open_snap = tessera_fs_tree_open(tmp_,
 			    scan->snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
 			    TESSERA_SNAPSHOT_RECORD_SIZE);
 			/* ★ #131: BEHAVIOUR UNCHANGED — still tolerated — but
@@ -20433,7 +20765,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * tolerated and simply makes the re-check conservative. */
 	tessera_btree_t *cur_snap_tree = NULL;
 	if (tmp_->sb.snapshots_root != 0)
-		cur_snap_tree = tessera_btree_open(&tmp_->meta_bio,
+		cur_snap_tree = tessera_fs_tree_open(tmp_,
 		    tmp_->sb.snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
 
@@ -20460,7 +20792,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			    srec.inode_root != (concurrent ? scan->inode_root
 			                                   : tmp_->sb.inode_root)) {
 				tessera_btree_t *snap_inode =
-				    tessera_btree_open(&tmp_->meta_bio,
+				    tessera_fs_tree_open(tmp_,
 				        srec.inode_root, /*tree_kind*/ 0,
 				        /*key*/ 4,
 				        /*value*/ TESSERA_INODE_RECORD_SIZE);

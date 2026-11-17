@@ -284,8 +284,15 @@ run(uint32_t suite)
 	    TESSERA_OK);
 
 	/* 1 */
+	for (int i = 0; i < 16; i++) k.key_id[i] = (uint8_t)(0xc0 + i);
 	CHECK(tessera_volume_format_sealed(&IO, &o, &k) == TESSERA_OK);
 	CHECK(read_back(&k) == 0);
+	{
+		/* the key id is in the clear, for the keyring lookup */
+		tessera_superblock_t sb;
+		CHECK(tessera_decode_superblock(disk[0], &sb) == TESSERA_OK);
+		CHECK(memcmp(sb.master_key_id, k.key_id, 16) == 0);
+	}
 
 	/* the front under another tag */
 	{

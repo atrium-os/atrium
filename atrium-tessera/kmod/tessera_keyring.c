@@ -1,0 +1,221 @@
+/*
+ * tessera_keyring.c — the kernel keyring and /dev/tesserakeys
+ * (docs/spec/tessera-encryption.md §4.3; ABI in tessera/keyring.h).
+ *
+ * arcad (or, in developer builds, tessera-keyload) loads a volume key for
+ * one scope; a mount of that volume copies it out, derives its keys and
+ * wipes the copy. The device is root:wheel 0600 here; devfs rules hand it to
+ * _arca. Jailed processes are refused whatever the permissions.
+ */
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/conf.h>
+#include <sys/fcntl.h>
+#include <sys/jail.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mutex.h>
+#include <sys/proc.h>
+#include <sys/ucred.h>
+
+#include "tessera/keyring.h"
+
+static MALLOC_DEFINE(M_TESSERA_KEYS, "tessera_keys", "Tessera keyring");
+
+struct tkey {
+	uint8_t  key_id[16];
+	uint8_t  uuid[16];
+	uint64_t group;
+	uint8_t  key[32];
+	uint64_t high_water;
+	uint64_t committed;           /* highest generation noted */
+	uint32_t owner_uid;
+	char     owner_label[32];
+	int      used;
+};
+
+static struct tkey *ring;         /* TESSERA_KEYRING_MAX slots */
+static struct mtx   ring_mtx;
+static struct cdev *ring_dev;
+
+static struct tkey *
+find_locked(const uint8_t key_id[16])
+{
+	mtx_assert(&ring_mtx, MA_OWNED);
+	for (int i = 0; i < TESSERA_KEYRING_MAX; i++)
+		if (ring[i].used && memcmp(ring[i].key_id, key_id, 16) == 0)
+			return (&ring[i]);
+	return (NULL);
+}
+
+static void
+drop_slot(struct tkey *k)
+{
+	explicit_bzero(k, sizeof(*k));
+}
+
+int
+tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
+    uint64_t group, uint8_t vk[32], uint64_t *high_water)
+{
+	struct tkey *k;
+	int error = ENOENT;
+
+	if (ring == NULL)
+		return (ENOENT);
+	mtx_lock(&ring_mtx);
+	k = find_locked(key_id);
+	if (k != NULL && memcmp(k->uuid, uuid, 16) == 0 && k->group == group) {
+		memcpy(vk, k->key, 32);
+		if (high_water != NULL)
+			*high_water = k->high_water;
+		error = 0;
+	}
+	mtx_unlock(&ring_mtx);
+	return (error);
+}
+
+void
+tessera_keyring_note_gen(const uint8_t key_id[16], uint64_t gen)
+{
+	struct tkey *k;
+
+	if (ring == NULL)
+		return;
+	mtx_lock(&ring_mtx);
+	k = find_locked(key_id);
+	if (k != NULL && gen > k->committed)
+		k->committed = gen;
+	mtx_unlock(&ring_mtx);
+}
+
+static int
+ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
+    struct thread *td)
+{
+	struct tkey *k;
+	int error = 0;
+
+	(void)dev;
+	if (jailed(td->td_ucred))
+		return (EPERM);
+	switch (cmd) {
+	case TKEY_LOAD: {
+		struct tkey_load *l = (struct tkey_load *)data;
+
+		if ((fflag & FWRITE) == 0) {
+			error = EBADF;
+		} else if (l->flags != 0) {
+			error = EINVAL;
+		} else {
+			mtx_lock(&ring_mtx);
+			if (find_locked(l->key_id) != NULL) {
+				error = EEXIST;
+			} else {
+				k = NULL;
+				for (int i = 0; i < TESSERA_KEYRING_MAX; i++)
+					if (!ring[i].used) {
+						k = &ring[i];
+						break;
+					}
+				if (k == NULL) {
+					error = ENOSPC;
+				} else {
+					memcpy(k->key_id, l->key_id, 16);
+					memcpy(k->uuid, l->scope_uuid, 16);
+					k->group = l->scope_group;
+					memcpy(k->key, l->key, 32);
+					k->high_water = l->high_water;
+					k->committed = 0;
+					k->owner_uid = l->owner_uid;
+					memcpy(k->owner_label, l->owner_label,
+					    sizeof(k->owner_label));
+					k->owner_label[sizeof(k->owner_label) - 1]
+					    = '\0';
+					k->used = 1;
+				}
+			}
+			mtx_unlock(&ring_mtx);
+		}
+		/* the ioctl buffer is a kernel copy: don't leave the key in it */
+		explicit_bzero(l->key, sizeof(l->key));
+		break;
+	}
+	case TKEY_DROP: {
+		struct tkey_id *d = (struct tkey_id *)data;
+
+		if ((fflag & FWRITE) == 0)
+			return (EBADF);
+		mtx_lock(&ring_mtx);
+		k = find_locked(d->key_id);
+		if (k != NULL)
+			drop_slot(k);
+		else
+			error = ENOENT;
+		mtx_unlock(&ring_mtx);
+		break;
+	}
+	case TKEY_GEN: {
+		struct tkey_gen *g = (struct tkey_gen *)data;
+
+		mtx_lock(&ring_mtx);
+		k = find_locked(g->key_id);
+		if (k != NULL)
+			g->generation = k->committed;
+		else
+			error = ENOENT;
+		mtx_unlock(&ring_mtx);
+		break;
+	}
+	default:
+		error = ENOTTY;
+	}
+	return (error);
+}
+
+static struct cdevsw ring_cdevsw = {
+	.d_version = D_VERSION,
+	.d_ioctl   = ring_ioctl,
+	.d_name    = TESSERA_KEYRING_DEV,
+};
+
+int
+tessera_keyring_init(void)
+{
+	struct make_dev_args a;
+	int error;
+
+	ring = malloc(sizeof(*ring) * TESSERA_KEYRING_MAX, M_TESSERA_KEYS,
+	    M_WAITOK | M_ZERO);
+	mtx_init(&ring_mtx, "tessera_keys", NULL, MTX_DEF);
+	make_dev_args_init(&a);
+	a.mda_flags = MAKEDEV_WAITOK | MAKEDEV_CHECKNAME;
+	a.mda_devsw = &ring_cdevsw;
+	a.mda_uid = UID_ROOT;
+	a.mda_gid = GID_WHEEL;
+	a.mda_mode = 0600;
+	error = make_dev_s(&a, &ring_dev, TESSERA_KEYRING_DEV);
+	if (error != 0) {
+		printf("tessera_fs: /dev/%s: %d\n", TESSERA_KEYRING_DEV, error);
+		ring_dev = NULL;
+	}
+	return (error);
+}
+
+void
+tessera_keyring_fini(void)
+{
+	if (ring_dev != NULL) {
+		destroy_dev(ring_dev);    /* waits out running ioctls */
+		ring_dev = NULL;
+	}
+	if (ring == NULL)
+		return;
+	mtx_lock(&ring_mtx);
+	explicit_bzero(ring, sizeof(*ring) * TESSERA_KEYRING_MAX);
+	mtx_unlock(&ring_mtx);
+	mtx_destroy(&ring_mtx);
+	free(ring, M_TESSERA_KEYS);
+	ring = NULL;
+}

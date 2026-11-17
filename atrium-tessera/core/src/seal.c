@@ -123,6 +123,7 @@ tessera_sb_seal(const tessera_seal_keys_t *k, tessera_superblock_t *sb,
 	sb->encryption_flags |= TESSERA_ENC_SEALED;
 	sb->enc_suite         = (uint8_t)k->meta.suite;
 	memcpy(sb->key_check, k->check, 32);
+	memcpy(sb->master_key_id, k->key_id, 16);
 	sb->total_blob_count = 0;
 	sb->total_pack_count = 0;
 	sb->format_time      = 0;
