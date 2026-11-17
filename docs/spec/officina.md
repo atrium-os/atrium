@@ -723,6 +723,9 @@ in the converter jail and shows the signer and whether the document changed sinc
   (Calibri), Caladea (Cambria), Liberation Sans / Serif / Mono (Arial, Times New Roman,
   Courier New). Substitutions keep line breaks and page counts close; each is listed in the
   fidelity report. Users can install more fonts (Opifex font packages).
+  Built 2026-11-17 as the system font library ([fonts.md](fonts.md)): the stand-ins,
+  IBM Plex Serif, Noto for 23 scripts, and Source, Fira, Roboto and Inter, matched by name in
+  `officina-text::PinnedFonts`.
 - **Languages.** Shaping is already rustybuzz; needed are IME (§10.1), bidi, vertical text
   later, hyphenation and spell-check dictionaries per language (Hunspell-format
   dictionaries; check each dictionary's licence against LICENSING-POLICY.md, since many are

@@ -20,8 +20,15 @@ pub struct Face(Arc<FaceData>);
 
 struct FaceData {
     id: u32,
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     index: u32,
+}
+
+/// A face's bytes: owned, or mapped for the process's life (the system font
+/// library's files, shared with every other process through the page cache).
+enum Bytes {
+    Owned(Arc<[u8]>),
+    Static(&'static [u8]),
 }
 
 static NEXT_FACE: AtomicU32 = AtomicU32::new(1);
@@ -30,10 +37,20 @@ impl Face {
     /// Register a face. Call once per font and keep the handle: each call
     /// mints a new id (and so new atlas entries).
     pub fn new(bytes: impl Into<Arc<[u8]>>, index: u32) -> Self {
-        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: bytes.into(), index }))
+        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Owned(bytes.into()), index }))
+    }
+    /// Register a face whose bytes live as long as the process, without
+    /// copying them.
+    pub fn from_static(bytes: &'static [u8], index: u32) -> Self {
+        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Static(bytes), index }))
     }
     pub fn id(&self) -> u32 { self.0.id }
-    pub fn bytes(&self) -> &[u8] { &self.0.bytes }
+    pub fn bytes(&self) -> &[u8] {
+        match &self.0.bytes {
+            Bytes::Owned(b) => b,
+            Bytes::Static(b) => b,
+        }
+    }
     pub fn index(&self) -> u32 { self.0.index }
 }
 

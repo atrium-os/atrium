@@ -1,0 +1,14 @@
+[package]
+name = "atrium-fonts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The system font library (docs/spec/fonts.md): the fonts Atrium ships, as read-only files in one system folder, each checked against its pinned BLAKE3 address and mapped so every process shares one copy; plus matching (a document's font name to the face we have, metric-compatible stand-ins first) and per-script fallback. No font server."
+
+[dependencies]
+blake3 = { version = "1", features = ["pure"] }
+memmap2 = "0.9"
+
+[dev-dependencies]
+ttf-parser = "0.25"

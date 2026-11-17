@@ -10,6 +10,7 @@ description = "Officina's word-processing engine (docs/spec/officina.md §7): th
 officina-core = { path = "../officina-core" }
 officina-shapes = { path = "../officina-shapes" }
 navigator-render = { path = "../navigator-render" }
+atrium-fonts = { path = "../atrium-fonts" }
 rustybuzz = "0.20"
 ttf-parser = "0.25"
 unicode-linebreak = "0.1.5"

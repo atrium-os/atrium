@@ -7,6 +7,7 @@ description = "DocumentView (pergola.md §10.2): the document engine's bands dra
 [dependencies]
 pergola = { path = "../pergola" }
 navigator-render = { path = "../navigator-render" }
+atrium-fonts = { path = "../atrium-fonts" }
 fresco-protocol = { path = "../fresco-protocol" }
 
 [dev-dependencies]

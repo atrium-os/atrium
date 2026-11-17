@@ -20,16 +20,30 @@ use pergola::node::{Image, Node};
 use pergola::Color;
 
 /// The document's faces registered with Pergola, by `FontSet` index.
-pub struct Faces(Vec<Face>);
+pub struct Faces {
+    pinned: Vec<Face>,
+    /// The system font library's faces, registered when a glyph first
+    /// names one (officina-text's face `pinned.len() + id`).
+    library: Vec<std::sync::OnceLock<Option<Face>>>,
+}
 
 impl Faces {
     pub fn new(fonts: &FontSet) -> Self {
-        Faces(fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect())
+        Faces {
+            pinned: fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect(),
+            library: atrium_fonts::FACES.iter().map(|_| Default::default()).collect(),
+        }
     }
 
-    /// The face registered for `FontSet` index `i`.
+    /// The face registered for `FontSet` index `i`, or past the set, for
+    /// library face `i - set length`.
     pub fn get(&self, i: usize) -> Option<&Face> {
-        self.0.get(i)
+        match i.checked_sub(self.pinned.len()) {
+            None => self.pinned.get(i),
+            Some(id) => self.library.get(id)?
+                .get_or_init(|| atrium_fonts::Library::system().bytes(id).ok().map(|b| Face::from_static(b, 0)))
+                .as_ref(),
+        }
     }
 
     /// The shared set's faces, registered once per process (so every
@@ -245,7 +259,7 @@ pub fn scene_nodes(scene: &Scene, faces: &Faces, images: Images, out: &mut Vec<N
             1 => {
                 let r = &scene.runs[i];
                 let a = scene.run_attrs[i];
-                let Some(face) = faces.0.get(r.face) else { continue };
+                let Some(face) = faces.get(r.face) else { continue };
                 let mut origin = Point::new(px(r.x), px(r.y));
                 if let Some(t) = cx.xform(a) {
                     if !is_translate(&t) {
