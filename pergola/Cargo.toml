@@ -15,6 +15,9 @@ fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 futures-signals = "0.3"
 unicode-segmentation = "1.12"
+# The code editor's buffer (MIT) and display widths (MIT OR Apache-2.0).
+ropey = "1.6"
+unicode-width = "0.1"
 # Wrapped text: break opportunities by UAX #14, and Knuth-Liang
 # hyphenation with the en-US TeX patterns built in (src/text.rs).
 unicode-linebreak = "0.1.5"
