@@ -8,6 +8,9 @@
 //!   everything: the service fails closed.
 //! - [`store`]: the one entry, its limits, sensitive entries, the audit
 //!   log. Content is bytes: Tabula never parses or converts it.
+//! - [`personas`]: whose persona an entry is in, and whether a paste or
+//!   drop may take it across (personas.md §6): off unless the person's
+//!   switch for clipboard crossings is on.
 //! - [`server`]: one client connection.
 
 pub mod proto {
@@ -48,6 +51,11 @@ pub mod proto {
         /// A password or other secret (Arca sets it): cleared after
         /// [`crate::store::SENSITIVE_SECS`], offered as `text/plain` only.
         pub sensitive: bool,
+        /// The app the entry is copied for: Monstrator's Copy address
+        /// (personas.md §6) copies for the app that asked, so the entry is
+        /// in that app's persona. Taken only from a uid Tabula trusts with
+        /// it ([`crate::server::Shared::for_others`]); `None` for everyone else.
+        pub for_uid: Option<u32>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +104,11 @@ pub mod proto {
         pub const DUPLICATE_MIME: u8 = 8;
         /// No such drag, or it was dropped, cancelled or timed out.
         pub const NO_DRAG: u8 = 9;
+        /// The entry was copied in another persona, and the person's
+        /// switch for clipboard crossings between the two is off
+        /// (personas.md §6). Also: `for_uid` from a caller not trusted
+        /// with it.
+        pub const OTHER_PERSONA: u8 = 10;
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,9 +267,107 @@ pub mod gate {
     }
 }
 
+pub mod personas {
+    //! Whose side an entry is on. Read from the launch registry by uid,
+    //! never from the app (personas.md §3, §7).
+
+    use crate::proto::refusal;
+
+    /// Where a uid stands.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Side {
+        /// A system service, outside every persona.
+        System,
+        /// One of `person`'s apps (or their own login), in `persona`
+        /// (`None`: Personal).
+        Person { person: String, persona: Option<String> },
+    }
+
+    pub trait Personas: Send {
+        fn side(&self, uid: u32) -> Side;
+        /// Whether `person`'s switch lets clipboard entries cross from
+        /// `from` to `to`.
+        fn may_cross(&self, person: &str, from: Option<&str>, to: Option<&str>) -> bool;
+    }
+
+    /// Whether `taker` may take an entry `owner` copied: system services
+    /// and the same persona always; another persona of the same person
+    /// with their switch; another person never.
+    pub fn may_take(p: &dyn Personas, owner: &Side, taker: &Side) -> Result<(), u8> {
+        match (owner, taker) {
+            (Side::System, _) | (_, Side::System) => Ok(()),
+            (Side::Person { person: a, persona: f }, Side::Person { person: b, persona: t }) => {
+                if a == b && (f == t || p.may_cross(a, f.as_deref(), t.as_deref())) {
+                    Ok(())
+                } else {
+                    Err(refusal::OTHER_PERSONA)
+                }
+            }
+        }
+    }
+
+    /// From the launch registry (`TABULA_REGISTRY`, default portcullis's)
+    /// and each person's policy, read afresh on each question: a persona
+    /// launched or a switch turned a moment ago counts.
+    pub struct Registry {
+        pub registry: String,
+        /// Where a person's policy is (`None`: `/var/db/atrium/<person>/policy.toml`).
+        pub policy_dir: Option<std::path::PathBuf>,
+    }
+
+    impl Default for Registry {
+        fn default() -> Self {
+            Registry {
+                registry: std::env::var("TABULA_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into()),
+                policy_dir: None,
+            }
+        }
+    }
+
+    impl Personas for Registry {
+        fn side(&self, uid: u32) -> Side {
+            if let Ok(r) = portcullis_peer::AppRegistry::load(&self.registry) {
+                if let (Some((person, _)), Some(persona)) = (r.resolve(uid), r.persona(uid)) {
+                    return Side::Person { person: person.into(), persona: persona.map(str::to_string) };
+                }
+            }
+            // A person's own login (a terminal, a shell): Personal.
+            match portcullis_peer::username(uid) {
+                Some(u) if (1000..portcullis_peer::APP_UID_BASE).contains(&uid) => Side::Person { person: u, persona: None },
+                _ => Side::System,
+            }
+        }
+
+        fn may_cross(&self, person: &str, from: Option<&str>, to: Option<&str>) -> bool {
+            let path = match &self.policy_dir {
+                Some(d) => d.join(person).join("policy.toml"),
+                None => portcullis_policy::Policy::user_path(person),
+            };
+            portcullis_policy::Policy::load(&path).is_ok_and(|p| p.may_cross(from, to, "clipboard"))
+        }
+    }
+
+    /// For tests: sides by uid, crossings as (person, from, to).
+    #[derive(Default)]
+    pub struct Fixed {
+        pub sides: std::collections::HashMap<u32, Side>,
+        pub crossings: Vec<(String, Option<String>, Option<String>)>,
+    }
+
+    impl Personas for Fixed {
+        fn side(&self, uid: u32) -> Side {
+            self.sides.get(&uid).cloned().unwrap_or(Side::System)
+        }
+        fn may_cross(&self, person: &str, from: Option<&str>, to: Option<&str>) -> bool {
+            self.crossings.iter().any(|(p, f, t)| p == person && f.as_deref() == from && t.as_deref() == to)
+        }
+    }
+}
+
 pub mod store {
     use std::time::{Duration, Instant};
 
+    use crate::personas::Side;
     use crate::proto::refusal;
 
     pub const MAX_FORMATS: usize = 16;
@@ -280,6 +391,7 @@ pub mod store {
     struct Entry {
         formats: Vec<(String, Vec<u8>)>,
         owner: u32,
+        side: Side,
         sensitive: bool,
         at: Instant,
     }
@@ -300,6 +412,7 @@ pub mod store {
     #[derive(Debug, Clone)]
     struct Drag {
         owner: u32,
+        side: Side,
         formats: Vec<(String, Vec<u8>)>,
         at: Instant,
     }
@@ -355,14 +468,14 @@ pub mod store {
 
         /// Replace the entry (the caller has validated it and spent a
         /// gesture).
-        pub fn set(&mut self, owner: u32, formats: Vec<(String, Vec<u8>)>, sensitive: bool, now: Instant) {
+        pub fn set(&mut self, owner: u32, side: Side, formats: Vec<(String, Vec<u8>)>, sensitive: bool, now: Instant) {
             let formats = if sensitive {
                 // A secret is offered as text only, whatever else came with it.
                 formats.into_iter().filter(|(m, _)| m == "text/plain").collect()
             } else {
                 formats
             };
-            self.entry = Some(Entry { formats, owner, sensitive, at: now });
+            self.entry = Some(Entry { formats, owner, side, sensitive, at: now });
             self.generation += 1;
         }
 
@@ -396,22 +509,27 @@ pub mod store {
 
         pub fn owner(&self) -> Option<u32> { self.entry.as_ref().map(|e| e.owner) }
 
+        /// The side the entry was copied on.
+        pub fn side(&self) -> Option<&Side> { self.entry.as_ref().map(|e| &e.side) }
+
         /// Hold a drag's payload. A source has one drag at a time: a new
         /// one replaces its old one.
-        pub fn drag_begin(&mut self, owner: u32, formats: Vec<(String, Vec<u8>)>, now: Instant) -> u64 {
+        pub fn drag_begin(&mut self, owner: u32, side: Side, formats: Vec<(String, Vec<u8>)>, now: Instant) -> u64 {
             self.drags.retain(|_, d| d.owner != owner && now.duration_since(d.at) < Duration::from_secs(DRAG_SECS));
             self.next_drag += 1;
-            self.drags.insert(self.next_drag, Drag { owner, formats, at: now });
+            self.drags.insert(self.next_drag, Drag { owner, side, formats, at: now });
             self.next_drag
         }
 
-        /// Release a dropped drag's payload in the first accepted format;
-        /// the drag is gone either way.
-        pub fn drop_take(&mut self, drag_id: u64, accept: &[String], now: Instant) -> Result<Option<(String, Vec<u8>)>, u8> {
+        /// Release a dropped drag's payload in the first accepted format,
+        /// if `may` lets the drop take it from the drag's side; the drag is
+        /// gone either way.
+        pub fn drop_take(&mut self, drag_id: u64, accept: &[String], now: Instant, may: impl FnOnce(&Side) -> Result<(), u8>) -> Result<Option<(String, Vec<u8>)>, u8> {
             let d = self.drags.remove(&drag_id).ok_or(refusal::NO_DRAG)?;
             if now.duration_since(d.at) >= Duration::from_secs(DRAG_SECS) {
                 return Err(refusal::NO_DRAG);
             }
+            may(&d.side)?;
             Ok(accept.iter().find_map(|a| d.formats.iter().find(|(m, _)| m == a).cloned()))
         }
 
@@ -436,6 +554,7 @@ pub mod server {
     use fresco_protocol::activation::{purpose, Consume, ConsumeResult};
 
     use crate::gate::Gate;
+    use crate::personas::{may_take, Personas, Registry, Side};
     use crate::proto::{self, op, refusal, Format, Reply};
     use crate::store::{self, Store};
 
@@ -443,11 +562,33 @@ pub mod server {
     pub struct Shared {
         pub store: Mutex<Store>,
         pub gate: Mutex<Box<dyn Gate>>,
+        pub personas: Mutex<Box<dyn Personas>>,
+        /// The uids that may copy for another app (`Set::for_uid`):
+        /// monstratord, for Copy address (`TABULA_FOR_OTHERS`, default
+        /// `_monstrator`, 65038).
+        pub for_others: Vec<u32>,
     }
 
     impl Shared {
         pub fn new(gate: Box<dyn Gate>) -> Arc<Self> {
-            Arc::new(Self { store: Mutex::new(Store::new()), gate: Mutex::new(gate) })
+            let for_others = std::env::var("TABULA_FOR_OTHERS").unwrap_or_else(|_| "65038".into())
+                .split(',').filter_map(|u| u.trim().parse().ok()).collect();
+            Self::with_personas(gate, Box::new(Registry::default()), for_others)
+        }
+
+        pub fn with_personas(gate: Box<dyn Gate>, personas: Box<dyn Personas>, for_others: Vec<u32>) -> Arc<Self> {
+            Arc::new(Self { store: Mutex::new(Store::new()), gate: Mutex::new(gate), personas: Mutex::new(personas), for_others })
+        }
+
+        fn side(&self, uid: u32) -> Side {
+            self.personas.lock().unwrap().side(uid)
+        }
+
+        /// Whether `taker` may take what was copied on `owner`'s side.
+        fn may_take(&self, owner: &Side, taker: u32) -> Result<(), u8> {
+            let p = self.personas.lock().unwrap();
+            let t = p.side(taker);
+            may_take(p.as_ref(), owner, &t)
         }
     }
 
@@ -524,6 +665,14 @@ pub mod server {
 
     fn malformed() -> Reply { Reply::Refused { reason: refusal::MALFORMED, detail: 0 } }
 
+    /// For the log: which side, never what.
+    fn say(s: &Side) -> String {
+        match s {
+            Side::System => "outside the personas".into(),
+            Side::Person { person, persona } => format!("in {} for {person}", persona.as_deref().unwrap_or("personal")),
+        }
+    }
+
     fn handle_inner(conn: &mut Connection, uid: u32, shared: &Shared, m: &Message, now: Instant) -> Reply {
         match m.op {
             op::SET => {
@@ -536,10 +685,20 @@ pub mod server {
                     // A secret is kept as text only; nothing would be left.
                     return Reply::Refused { reason: refusal::NO_FORMATS, detail: 0 };
                 }
+                // Copied for another app: only by a uid trusted with it,
+                // and then on that app's side.
+                let side = match req.for_uid {
+                    None => shared.side(uid),
+                    Some(f) if shared.for_others.contains(&uid) => shared.side(f),
+                    Some(_) => return Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 },
+                };
                 if let Err(r) = gesture(shared, uid, req.token, purpose::COPY) {
                     return r;
                 }
-                shared.store.lock().unwrap().set(uid, formats, req.sensitive, now);
+                if let Some(f) = req.for_uid {
+                    eprintln!("tabulad: uid {uid} copied for uid {f}, {}", say(&side));
+                }
+                shared.store.lock().unwrap().set(uid, side, formats, req.sensitive, now);
                 Reply::Ok
             }
             op::OFFERS => {
@@ -554,6 +713,14 @@ pub mod server {
                 }
                 if let Err(r) = gesture(shared, uid, req.token, purpose::PASTE) {
                     return r;
+                }
+                // Copied in another persona: only with the person's switch.
+                let owner = shared.store.lock().unwrap().side().cloned();
+                if let Some(o) = owner {
+                    if let Err(r) = shared.may_take(&o, uid) {
+                        eprintln!("tabulad: a paste by uid {uid} refused: copied {}", say(&o));
+                        return Reply::Refused { reason: r, detail: 0 };
+                    }
                 }
                 let got = shared.store.lock().unwrap().get(&req.accept, now);
                 match got {
@@ -573,7 +740,8 @@ pub mod server {
                 if let Err(r) = gesture(shared, uid, req.token, purpose::DRAG) {
                     return r;
                 }
-                let drag_id = shared.store.lock().unwrap().drag_begin(uid, formats, now);
+                let side = shared.side(uid);
+                let drag_id = shared.store.lock().unwrap().drag_begin(uid, side, formats, now);
                 Reply::Dragging { drag_id }
             }
             op::DROP_GET => {
@@ -589,7 +757,7 @@ pub mod server {
                     ConsumeResult::Ok { drag_id, .. } => drag_id,
                     ConsumeResult::Refused { reason } => return Reply::Refused { reason: refusal::NO_GESTURE, detail: reason },
                 };
-                let got = shared.store.lock().unwrap().drop_take(drag_id, &req.accept, now);
+                let got = shared.store.lock().unwrap().drop_take(drag_id, &req.accept, now, |s| shared.may_take(s, uid));
                 match got {
                     Err(r) => Reply::Refused { reason: r, detail: 0 },
                     Ok(None) => Reply::Empty,
@@ -652,7 +820,7 @@ mod tests {
     fn a_secret_is_text_only_and_expires() {
         let mut s = Store::new();
         let t0 = Instant::now();
-        s.set(7, vec![("text/html".into(), b"<b>x</b>".to_vec()), ("text/plain".into(), b"x".to_vec())], true, t0);
+        s.set(7, crate::personas::Side::System, vec![("text/html".into(), b"<b>x</b>".to_vec()), ("text/plain".into(), b"x".to_vec())], true, t0);
         assert_eq!(s.offers(t0), vec!["text/plain".to_string()]);
         assert!(s.get(&["text/html".into()], t0).is_none());
         let later = t0 + Duration::from_secs(SENSITIVE_SECS);
@@ -663,7 +831,7 @@ mod tests {
     fn get_takes_the_first_accepted_format() {
         let mut s = Store::new();
         let t = Instant::now();
-        s.set(7, vec![("text/plain".into(), b"a".to_vec()), ("text/html".into(), b"<i>a</i>".to_vec())], false, t);
+        s.set(7, crate::personas::Side::System, vec![("text/plain".into(), b"a".to_vec()), ("text/html".into(), b"<i>a</i>".to_vec())], false, t);
         let (m, _) = s.get(&["image/png".into(), "text/html".into(), "text/plain".into()], t).unwrap();
         assert_eq!(m, "text/html");
     }

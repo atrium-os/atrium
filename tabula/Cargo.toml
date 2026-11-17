@@ -20,6 +20,7 @@ fresco-protocol = { path = "../fresco-protocol" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
+portcullis-policy = { path = "../portcullis/portcullis-policy" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -66,6 +66,10 @@ fn open(asker: u32, url: &str, activation: [u8; 16], choose: bool) -> Result<Str
         Some(a) => (a.to_string(), false, None),
         None => match self::choose(&link.shown, &link.scheme, apps, personas)? {
             Outcome::Chose { app, always, persona } => (app, always, persona),
+            Outcome::Copy { token } => {
+                copy_address(asker, token, &link.url)?;
+                return Err("address copied".into());
+            }
             Outcome::Cancelled => return Err("cancelled".into()),
         },
     };
@@ -73,6 +77,39 @@ fn open(asker: u32, url: &str, activation: [u8; 16], choose: bool) -> Result<Str
         Response::LinkDelivered { .. } => Ok(link.scheme),
         Response::Error { message } => Err(message),
         other => Err(format!("portcullisd: {other:?}")),
+    }
+}
+
+/// Tabula, the clipboard (tabula.md), where Copy address goes.
+const TABULA: &str = "/atrium/sockets/clipboard/clipboard.sock";
+
+/// Copy address (personas.md §6): `url` on the clipboard for `asker`, so
+/// the entry is in the asker's persona and pastes only there (unless the
+/// person's switch for clipboard crossings is on). `token` is the press
+/// in the sheet; Tabula spends it with frescod as a copy.
+fn copy_address(asker: u32, token: [u8; 16], url: &str) -> Result<(), String> {
+    use tabula::proto::{op, Format, Reply, Set, CLASS};
+    let path = std::env::var("MONSTRATOR_TABULA").unwrap_or_else(|_| TABULA.into());
+    let go = || -> Result<Reply, String> {
+        let mut c = aqueduct::Connection::connect(&path).map_err(|e| format!("the clipboard: {e}"))?;
+        let hash = c.upload_blob(url.as_bytes()).map_err(|e| e.to_string())?;
+        let set = Set { token, formats: vec![Format { mime: "text/plain".into(), hash }], sensitive: false, for_uid: Some(asker) };
+        let payload = postcard::to_stdvec(&set).map_err(|e| e.to_string())?;
+        c.send_message(CLASS, op::SET, aqueduct::flag::RESPONSE_EXPECTED, &payload).map_err(|e| e.to_string())?;
+        loop {
+            let m = c.recv_message_or_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?
+                .ok_or("the clipboard did not answer")?;
+            if m.flags & aqueduct::flag::IS_RESPONSE != 0 && m.op == op::SET {
+                return postcard::from_bytes(&m.payload).map_err(|e| e.to_string());
+            }
+        }
+    };
+    match go()? {
+        Reply::Ok => {
+            eprintln!("monstratord: the address copied for uid {asker}");
+            Ok(())
+        }
+        r => Err(format!("the clipboard refused: {r:?}")),
     }
 }
 

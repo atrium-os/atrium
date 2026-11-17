@@ -7,6 +7,7 @@ use std::time::Duration;
 use aqueduct::{flag, Connection};
 use fresco_protocol::activation::{kind, refusal as fr, Token};
 use tabula::gate::Fake;
+use tabula::personas::{Fixed, Side};
 use tabula::proto::{self, op, refusal, Format, Reply};
 use tabula::server::{serve, Shared};
 
@@ -41,7 +42,7 @@ fn call<T: serde::Serialize>(c: &mut Connection, o: u16, req: &T) -> Reply {
 
 fn copy(c: &mut Connection, token: Token, items: &[(&str, &[u8])], sensitive: bool) -> Reply {
     let formats = items.iter().map(|(m, b)| Format { mime: m.to_string(), hash: c.upload_blob(b).unwrap() }).collect();
-    call(c, op::SET, &proto::Set { token, formats, sensitive })
+    call(c, op::SET, &proto::Set { token, formats, sensitive, for_uid: None })
 }
 
 fn paste(c: &mut Connection, token: Token, accept: &[&str]) -> (Reply, Option<Vec<u8>>) {
@@ -55,8 +56,65 @@ fn paste(c: &mut Connection, token: Token, accept: &[&str]) -> (Reply, Option<Ve
 
 fn setup() -> (Fake, std::sync::Arc<Shared>) {
     let fake = Fake::default();
-    let shared = Shared::new(Box::new(fake.clone()));
+    let shared = Shared::with_personas(Box::new(fake.clone()), Box::new(Fixed::default()), vec![]);
     (fake, shared)
+}
+
+const WORK_MAIL: u32 = 50_010;
+const MONSTRATOR: u32 = 65_038;
+
+/// The editor and viewer in ana's Personal, a mail app in her Work.
+fn personas(crossings: Vec<(String, Option<String>, Option<String>)>) -> (Fake, std::sync::Arc<Shared>) {
+    let fake = Fake::default();
+    let me = |persona: Option<&str>| Side::Person { person: "ana".into(), persona: persona.map(str::to_string) };
+    let sides = [(EDITOR, me(None)), (VIEWER, me(None)), (WORK_MAIL, me(Some("work")))].into_iter().collect();
+    let shared = Shared::with_personas(Box::new(fake.clone()), Box::new(Fixed { sides, crossings }), vec![MONSTRATOR]);
+    (fake, shared)
+}
+
+/// personas.md §6: a clipboard entry stays in the persona it was copied in
+/// unless the person's switch for that direction is on; Copy address in
+/// Monstrator's sheet copies in the asking app's persona.
+#[test]
+fn a_paste_takes_only_from_its_own_persona_without_the_switch() {
+    let (f, s) = personas(vec![]);
+    let mut work = app(&s, WORK_MAIL);
+    let mut vw = app(&s, VIEWER);
+    let mut ed = app(&s, EDITOR);
+    assert_eq!(copy(&mut work, f.mint(WORK_MAIL, kind::KEY), &[("text/plain", b"q3 numbers")], false), Reply::Ok);
+    assert_eq!(paste(&mut vw, f.mint(VIEWER, kind::KEY), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
+    assert!(matches!(paste(&mut work, f.mint(WORK_MAIL, kind::KEY), &["text/plain"]).0, Reply::Got { .. }), "Work to Work");
+    // Personal to Personal as before; Personal to Work is off too.
+    assert_eq!(copy(&mut ed, f.mint(EDITOR, kind::KEY), &[("text/plain", b"hi")], false), Reply::Ok);
+    assert!(matches!(paste(&mut vw, f.mint(VIEWER, kind::KEY), &["text/plain"]).0, Reply::Got { .. }));
+    assert_eq!(paste(&mut work, f.mint(WORK_MAIL, kind::KEY), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
+    // A drag from Work dropped on a Personal window: the same.
+    let Reply::Dragging { drag_id } = drag(&mut work, f.mint(WORK_MAIL, kind::BUTTON), &[("text/plain", b"x")]) else { panic!() };
+    assert_eq!(drop_get(&mut vw, f.mint_drop(VIEWER, drag_id), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
+
+    // With ana's switch from Work to Personal, one way only.
+    let (f, s) = personas(vec![("ana".into(), Some("work".into()), None)]);
+    let (mut work, mut vw) = (app(&s, WORK_MAIL), app(&s, VIEWER));
+    copy(&mut work, f.mint(WORK_MAIL, kind::KEY), &[("text/plain", b"q3")], false);
+    assert!(matches!(paste(&mut vw, f.mint(VIEWER, kind::KEY), &["text/plain"]).0, Reply::Got { .. }));
+    copy(&mut vw, f.mint(VIEWER, kind::KEY), &[("text/plain", b"p")], false);
+    assert_eq!(paste(&mut work, f.mint(WORK_MAIL, kind::KEY), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
+}
+
+#[test]
+fn copy_address_copies_in_the_askers_persona() {
+    let (f, s) = personas(vec![]);
+    let mut mon = app(&s, MONSTRATOR);
+    let (mut work, mut vw) = (app(&s, WORK_MAIL), app(&s, VIEWER));
+    let set = |c: &mut Connection, token, for_uid| {
+        let formats = vec![Format { mime: "text/plain".into(), hash: c.upload_blob(b"https://intra.example/").unwrap() }];
+        call(c, op::SET, &proto::Set { token, formats, sensitive: false, for_uid })
+    };
+    assert_eq!(set(&mut mon, f.mint(MONSTRATOR, kind::KEY), Some(WORK_MAIL)), Reply::Ok);
+    assert!(matches!(paste(&mut work, f.mint(WORK_MAIL, kind::KEY), &["text/plain"]).0, Reply::Got { .. }), "in Work");
+    assert_eq!(paste(&mut vw, f.mint(VIEWER, kind::KEY), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 }, "not in Personal");
+    // Only monstratord may copy for another app.
+    assert_eq!(set(&mut work, f.mint(WORK_MAIL, kind::KEY), Some(VIEWER)), Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
 }
 
 #[test]
@@ -123,7 +181,7 @@ fn content_must_be_uploaded_not_named() {
     // Naming a hash this connection never sent (probing whether some
     // content exists on the machine) is refused, gesture or not.
     let formats = vec![Format { mime: "text/plain".into(), hash: aqueduct::cas::hash(b"someone else's file") }];
-    let r = call(&mut vw, op::SET, &proto::Set { token: f.mint(VIEWER, kind::KEY), formats, sensitive: false });
+    let r = call(&mut vw, op::SET, &proto::Set { token: f.mint(VIEWER, kind::KEY), formats, sensitive: false, for_uid: None });
     assert_eq!(r, Reply::Refused { reason: refusal::NOT_UPLOADED, detail: 0 });
 }
 

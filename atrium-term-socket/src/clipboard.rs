@@ -20,7 +20,7 @@ pub struct Tabula {
 impl Tabula {
     fn conn(&mut self) -> Result<&mut aqueduct::Connection, String> {
         if self.conn.is_none() {
-            let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard.sock".into());
+            let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard/clipboard.sock".into());
             let c = aqueduct::Connection::connect(&path).map_err(|e| format!("the clipboard: {e}"))?;
             self.conn = Some(c);
         }
@@ -49,7 +49,7 @@ impl Tabula {
     /// Copy `text` as `text/plain`, spending `token`.
     pub fn copy(&mut self, token: [u8; 16], text: &str) -> Result<(), String> {
         let hash = self.conn()?.upload_blob(text.as_bytes()).map_err(|e| e.to_string())?;
-        let set = Set { token, formats: vec![Format { mime: "text/plain".into(), hash }], sensitive: false };
+        let set = Set { token, formats: vec![Format { mime: "text/plain".into(), hash }], sensitive: false, for_uid: None };
         match self.call(op::SET, &set)? {
             Reply::Ok => Ok(()),
             Reply::Refused { reason, detail } => Err(format!("refused ({reason}/{detail})")),

@@ -5862,11 +5862,18 @@ the launch registry (`<uid> navtest org.atrium.navigator.page [persona=work]`), 
 logs `org.atrium.navigator.page for navtest's org.atrium.navigator (work) runs as atrium-app-N`.
 The bundle scripts replace an older rule without `per_instance`. Last, Open with… in the Work
 window (the toolbar's last button): Monstrator's sheet asks with "In: Work"; with navtest's switch
-off, choosing Personal is refused in the sheet (`confined-7-crossing-off.png`) and Escape cancels;
+off, choosing Personal is refused in the sheet (`confined-7-crossing-off.png`, the sheet over the
+Work window that asked) and Copy address copies it instead: tabulad, started as `_tabula` (65039,
+created before frescod so frescod lets it spend copy presses) on
+`/atrium/sockets/clipboard/clipboard.sock`, logs `uid 65038 copied for uid N, in work for
+navtest`, and the Navigator logs `not handed on: address copied`;
 with `[[crossings]] from = "work" to = "personal" kinds = ["links"]` added and `portcullis daemon
 reload`, the same opens the page in the Personal Navigator in a new trail (`crosses from Work to
 Personal` in portcullisd's log). navtest having a Work persona adds an "In:" row to the mailto
-sheet too, so the keys there step past it. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
+sheet too (and a Copy address row), so the keys there step past them. The run first deletes any
+`[[crossings]]` left in navtest's `policy.toml` by an earlier run. jaild's policy needs
+`/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it). 96/96 on
+2026-11-18. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

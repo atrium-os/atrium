@@ -86,9 +86,9 @@ fn layer(role: WmRole) -> i32 {
 /// the focused one ([`DOC_UNFOCUSED`]) so it gets occluded + render-gated. Tiled
 /// (split intent): all documents sit at [`DOC_FOCUSED`] — they're laid out
 /// side-by-side (non-overlapping), so none should gate the others.
-fn slot_layer(s: &WmSurfaceInfo, focus: u32, tiled: bool) -> i32 {
+fn slot_layer(s: &WmSurfaceInfo, front: u32, tiled: bool) -> i32 {
     match s.role {
-        WmRole::Document if !tiled && s.surface_id != focus => DOC_UNFOCUSED,
+        WmRole::Document if !tiled && s.surface_id != front => DOC_UNFOCUSED,
         r => layer(r),
     }
 }
@@ -269,7 +269,33 @@ pub fn arrange_for(
     focus_intent: Option<u32>,
     tiled: bool,
 ) -> WmDeclareLayoutPayload {
+    arrange_front(screen, surfaces, focus_intent, None, tiled)
+}
+
+/// The document in front: the one the focus intent names, else `front`
+/// (the last document the person was in), else the first. A dialog takes
+/// the focus but not the front: a sheet a window asked for comes up over
+/// that window, not over whichever document was opened first.
+fn front_document(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>, front: Option<u32>) -> u32 {
+    let doc = |id: u32| surfaces.iter().any(|s| s.surface_id == id && s.role == WmRole::Document);
+    focus_intent
+        .filter(|f| doc(*f))
+        .or(front.filter(|f| doc(*f)))
+        .or_else(|| surfaces.iter().find(|s| s.role == WmRole::Document).map(|s| s.surface_id))
+        .unwrap_or(0)
+}
+
+/// `arrange_for`, with the document that was last in front when the focus
+/// intent names something else (a dialog, a panel).
+pub fn arrange_front(
+    screen: &Screen,
+    surfaces: &[WmSurfaceInfo],
+    focus_intent: Option<u32>,
+    front: Option<u32>,
+    tiled: bool,
+) -> WmDeclareLayoutPayload {
     let focus = resolve_focus(surfaces, focus_intent);
+    let front = front_document(surfaces, focus_intent, front);
 
     // In tiled mode, assign each document a column (stable order by surface_id).
     let mut doc_rect: std::collections::HashMap<u32, WmRect> = std::collections::HashMap::new();
@@ -292,18 +318,18 @@ pub fn arrange_for(
             }
             // The documents' minimums don't fit side by side: stacked
             // instead, rather than squeezed (resolution-independence.md §6.3).
-            None => return arrange_for(screen, surfaces, focus_intent, false),
+            None => return arrange_front(screen, surfaces, focus_intent, Some(front), false),
         }
     }
 
     let mut ordered: Vec<&WmSurfaceInfo> = surfaces.iter().collect();
-    ordered.sort_by_key(|s| slot_layer(s, focus, tiled));
+    ordered.sort_by_key(|s| slot_layer(s, front, tiled));
     let slots: Vec<WmSlot> = ordered
         .iter()
         .map(|s| WmSlot {
             surface_id: s.surface_id,
             rect: doc_rect.get(&s.surface_id).copied().unwrap_or_else(|| rect_for(screen, s.role)),
-            layer: slot_layer(s, focus, tiled),
+            layer: slot_layer(s, front, tiled),
         })
         .collect();
 
@@ -901,6 +927,9 @@ pub mod daemon {
     pub struct Wm {
         pub screen: Screen,
         pub focus_intent: Option<u32>,
+        /// The document last in front, kept while the focus is on a dialog
+        /// or a panel, so the window that asked stays under its sheet.
+        front_doc: std::cell::Cell<Option<u32>>,
         /// What moved the focus since the last layout
         /// (`fresco_protocol::focus_cause`), declared with it.
         focus_cause: std::cell::Cell<u8>,
@@ -973,6 +1002,7 @@ pub mod daemon {
             Wm {
                 screen,
                 focus_intent: None,
+                front_doc: std::cell::Cell::new(None),
                 focus_cause: std::cell::Cell::new(0),
                 spaces: DEFAULT_SPACES,
                 active: 0,
@@ -1744,7 +1774,10 @@ pub mod daemon {
             }
             // Otherwise the space's split (tiled) or stacked arrangement.
             let tiled = self.tiled_spaces.contains(&self.active);
-            arrange_for(screen, active, focus_intent, tiled)
+            if let Some(f) = focus_intent.filter(|f| active.iter().any(|s| s.surface_id == *f && s.role == WmRole::Document)) {
+                self.front_doc.set(Some(f));
+            }
+            crate::arrange_front(screen, active, focus_intent, self.front_doc.get(), tiled)
         }
 
         /// The space-aware placement step shared by every reconcile path:
@@ -2540,6 +2573,28 @@ mod tests {
         assert_eq!(conn.declared.as_ref().unwrap().focus, 2, "dialog focused");
         assert_eq!(layout.slots.len(), 2);
         assert_eq!(conn.rendering.len(), 2, "a rendering decision per surface");
+    }
+
+    /// A sheet a window asked for comes up over that window, not over the
+    /// document opened first, and the window stays in front while the
+    /// person clicks in the sheet.
+    #[test]
+    fn a_dialog_comes_up_over_the_window_in_front() {
+        let mut conn = MockConn { surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)], ..Default::default() };
+        let mut wm = Wm::new(screen());
+        wm.focus_click(&mut conn, 2).unwrap();
+        conn.surfaces.push(surf(3, WmRole::Dialog));
+        let front = |conn: &MockConn| {
+            let l = conn.declared.as_ref().unwrap();
+            let top = l.slots.iter().filter(|s| s.surface_id != 3).min_by_key(|s| s.layer).unwrap();
+            (l.focus, top.surface_id)
+        };
+        wm.reconcile(&mut conn).unwrap();
+        assert_eq!(front(&conn), (3, 2), "the sheet has the keys, over window 2");
+        wm.focus_click(&mut conn, 3).unwrap();
+        assert_eq!(front(&conn), (3, 2), "a click in the sheet keeps window 2 in front");
+        let l = arrange(&screen(), &[surf(1, WmRole::Document), surf(2, WmRole::Document), surf(3, WmRole::Dialog)], Some(2));
+        assert!(l.slots.iter().find(|s| s.surface_id == 2).unwrap().layer < l.slots.iter().find(|s| s.surface_id == 1).unwrap().layer);
     }
 
     #[test]

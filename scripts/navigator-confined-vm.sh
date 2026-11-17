@@ -144,6 +144,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb navigator-fetch "--bin navigator-fetchd"
     xb navigatord "--bin navigatord"
     xb monstrator "--bin monstratord --example monctl --example link-probe"
+    xb tabula "--bin tabulad"
     xb atrium-open "--example open-probe"
 fi
 
@@ -161,6 +162,10 @@ g "P=/etc/atrium/jaild.policy.toml
 allow_rctl = true
 ' \$P
     else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
+    # Tabula's socket directory for monstratord's Copy address (etc/jaild.policy.toml).
+    grep -q '\"/atrium/sockets/clipboard\"' \$P || sed -i '' '/\"\/atrium\/sockets\/fresco-activation\",/a\\
+    \"/atrium/sockets/clipboard\",
+' \$P
     service atrium-jaild restart >/dev/null 2>&1; sleep 2
     pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
     : > /var/log/atrium/portcullisd-navigator.log
@@ -177,7 +182,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" \
          "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem" \
          "$ROOT/monstrator/target/$R/monstratord" "$ROOT/monstrator/target/$R/examples/monctl" \
-         "$ROOT/monstrator/target/$R/examples/link-probe" \
+         "$ROOT/monstrator/target/$R/examples/link-probe" "$ROOT/tabula/target/$R/tabulad" \
          "$ROOT/atrium-open/target/$R/examples/open-probe" "$ROOT/scripts/monstrator-service.sh" \
          "$ROOT/monstrator/etc/services.d/38-atrium-monstratord.toml" \
          "$ROOT/portcullis/target/$R/atrium-portcullisd-bootstrap"; do
@@ -283,11 +288,24 @@ g "mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/soc
    # first launch: open to it here (portcullisd making a served socket's
    # directory the app's own is a later step).
    chmod 1777 /atrium/sockets/navigator /atrium/sockets/navigator-page"
+# No crossing switch left on by an earlier run: off is where it starts.
+g "sed -i '' '/^\[\[crossings\]\]/,/^kinds/d' /var/db/atrium/navtest/policy.toml 2>/dev/null; su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null 2>&1; true"
+# Tabula's uid, before frescod starts: frescod lets _tabula spend copy
+# and paste presses (its consumers are read at start).
+g "id _tabula >/dev/null 2>&1 || pw useradd _tabula -u 65039 -d /nonexistent -s /usr/sbin/nologin -c 'Tabula, the clipboard'"
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute \
     FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$FS FRESCOD_WM_SOCK=$S/wm.sock \
     FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$CS FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
     daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S $FS && test -S $AS"; do sleep 2; i=$((i+1)); done
+# Tabula, the clipboard (tabula.md), for Copy address: entries in the
+# persona of the app they were copied for (personas.md §6).
+TS=/atrium/sockets/clipboard/clipboard.sock
+# As _tabula, the uid frescod lets spend copy and paste presses.
+g "pkill -x tabulad; mkdir -p /atrium/sockets/clipboard; chown _tabula /atrium/sockets/clipboard; rm -f $TS
+   cd $S && env TABULA_SOCKET=$TS TABULA_FRESCOD_ACTIVATION=$AS daemon -f -o $S/tabulad.log -u _tabula $D/tabulad </dev/null"
+i=0; while [ $i -lt 20 ] && ! g "test -S $TS"; do sleep 1; i=$((i+1)); done
+g "test -S $TS" && ok "tabulad is up" || bad "tabulad: $(g "tail -3 $S/tabulad.log")"
 # Monstrator, the link opener (opening-links.md §6), as the system service
 # it is: portcullisd's bootstrap starts it from its services.d manifest, the
 # only one in this run's services directory.
@@ -300,7 +318,7 @@ MON=$(g "ps -o jid= -o uid= -p \$(pgrep -f atrium-monstratord | head -1)" | tr -
 MJID=${MON%% *}; MUID=${MON#* }
 [ -n "$MJID" ] && [ "$MJID" != 0 ] && [ "$MUID" = 65038 ] && ok "monstratord runs in a jail (jid $MJID) as _monstrator (65038)" || bad "monstratord: '$MON' $(g "tail -3 $S/bootstrap.log")"
 MM=$(g "mount -p | awk '{print \$2}' | grep '/jails/monstratord/atrium/sockets' | sed 's#.*/atrium/sockets/#sockets/#' | sort | tr '\n' ' '" | tr -d '\r')
-[ "$MM" = "sockets/fresco sockets/fresco-activation sockets/monstrator sockets/portcullis " ] && ok "its jail reaches its own socket, portcullisd's and frescod's two, no other" || bad "monstratord's socket mounts: '$MM'"
+[ "$MM" = "sockets/clipboard sockets/fresco sockets/fresco-activation sockets/monstrator sockets/portcullis " ] && ok "its jail reaches its own socket, portcullisd's, frescod's two and Tabula's, no other" || bad "monstratord's socket mounts: '$MM'"
 # A services.d jail without network: no addresses at all (ip4 and ip6
 # disabled), or a stack of its own.
 MN=$(g "jls -n -j ${MJID:-0} ip4 ip6 vnet 2>&1" | tr -d '\r')
@@ -435,10 +453,10 @@ i=0; while [ $i -lt 60 ] && ! g "grep -q 'asking which of 2 apps' $ML"; do sleep
 g "grep -q 'asking which of 2 apps opens a mailto link' $ML" && ok "two apps take mailto: and none is the default: Monstrator asks in its sheet" || bad "no sheet: $(g "tail -3 $ML")"
 sleep 3
 shot confined-4-sheet
-key 0x51; key 0x51; key 0x51   # Down x3: Always use (past "In: Personal",
-                                # navtest has a Work persona)
+key 0x51; key 0x51; key 0x51; key 0x51   # Down x4: Always use (past "In: Personal"
+                                # and Copy address: navtest has a Work persona)
 key 0x2c                  # Space: ticked
-key 0x52; key 0x52; key 0x52   # Up x3: Test mail
+key 0x52; key 0x52; key 0x52; key 0x52   # Up x4: Test mail
 key 0x28                  # Enter
 i=0; while [ $i -lt 90 ] && [ "$(links)" != 1 ]; do sleep 3; i=$((i+3)); done
 [ "$(links)" = 1 ] && ok "…the pick counted: the mail app got the link, through Monstrator and portcullisd" \
@@ -556,9 +574,10 @@ sleep 3
 key 0x51; key 0x28        # Down to "In: Work", Enter: In: Personal (off)
 shot confined-7-crossing-off
 key 0x52; key 0x28        # Up to Navigator, Enter: refused in the sheet
-key 0x29                  # Escape
+key 0x51; key 0x51; key 0x28   # Down x2 to Copy address, Enter
 i=0; while [ $i -lt 30 ] && ! g "grep -q 'not handed on' $WL"; do sleep 3; i=$((i+3)); done
-g "grep -q 'atlas.example/wiki/Impluvium not handed on: cancelled' $WL" && ok "…the switch is off: the sheet said so, and nothing crossed" || bad "off: $(g "grep -h 'handed' $WL | tail -2" | tr '\n' ';')"
+g "grep -q 'atlas.example/wiki/Impluvium not handed on: address copied' $WL" && ok "…the switch is off: the sheet said so, nothing crossed, and Copy address copied it instead" || bad "off: $(g "grep -h 'handed' $WL | tail -2; tail -2 $ML" | tr '\n' ';')"
+g "grep -q 'tabulad: uid 65038 copied for uid [0-9]*, in work for navtest' $S/tabulad.log" && ok "…in Work, the asker's persona, so it pastes only there" || bad "Copy address: $(g "tail -3 $S/tabulad.log" | tr '\n' ';')"
 g "grep -q 'crosses from Work to Personal' $PL" && bad "a link crossed with the switch off" || ok "portcullisd crossed nothing"
 # The switch on (Curia will ask for user verification; here, the file),
 # then the same: the Work page opens in the Personal Navigator, in a
