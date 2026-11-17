@@ -8,7 +8,8 @@
 //!
 //! Settings: `OPIFEX_SOCKET`, `OPIFEX_ROOT` (/var/lib/atrium), `OPIFEX_STATE`
 //! (/var/db/atrium/opifex), `OPIFEX_ROOT_TOML` (/etc/atrium/opifex/root.toml),
-//! `OPIFEX_CHECK` (/usr/local/libexec/opifex-check).
+//! `OPIFEX_CHECK` (/usr/local/libexec/opifex-check), `OPIFEX_SHEET_UID`
+//! (65042, the install sheet's uid, which may send `InstallApproved`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -72,6 +73,12 @@ fn main() {
         check_bin: env("OPIFEX_CHECK", "/usr/local/libexec/opifex-check"),
         sandbox: true,
         worker_uid: 65041,
+        // The install sheet (_opifexsheet); OPIFEX_SHEET_UID=none turns it off.
+        sheet_uid: match std::env::var("OPIFEX_SHEET_UID").ok().as_deref() {
+            Some("none") => None,
+            Some(u) => u.parse().ok(),
+            None => Some(65042),
+        },
         trust: portcullis_trust::Trust::load(),
         require_content: opifex::app::require_content(std::path::Path::new(portcullis_trust::TRUST_CONFIG)),
         sysroot: PathBuf::from("/"),

@@ -33,6 +33,9 @@ pub struct Daemon {
     pub check_bin: PathBuf,
     pub sandbox: bool,
     pub worker_uid: u32,
+    /// The install sheet's uid (`_opifexsheet`), which may send
+    /// `InstallApproved`; None: nobody but root installs.
+    pub sheet_uid: Option<u32>,
     pub trust: portcullis_trust::Trust,
     pub require_content: bool,
     /// Where side-loaded bundles' libraries are read from (`/`).
@@ -56,8 +59,11 @@ impl Daemon {
             Request::Installed => self.store().load().map(|i| Response::Installed { apps: i.apps }),
             Request::Describe { id } => self.describe(&id).map(|app| Response::Described { app }),
             Request::Search { text } => self.search(&text).map(|ids| Response::Found { ids }),
-            _ if !admin => Err("only an administrator may change what is installed (the install sheet comes with C3)".into()),
-            Request::Install { id } => self.locked(|| self.install_catalog(&id, uid)),
+            Request::InstallApproved { id, manifest_sha256, for_uid } if admin || Some(uid) == self.sheet_uid =>
+                self.locked(|| self.install_catalog(&id, Some(&manifest_sha256), for_uid)),
+            _ if !admin => Err("only an administrator, or a person on the install sheet, may change what is installed".into()),
+            Request::InstallApproved { .. } => unreachable!("matched above"),
+            Request::Install { id } => self.locked(|| self.install_catalog(&id, None, uid)),
             Request::InstallLocal { path } => self.locked(|| self.install_local(Path::new(&path), uid)),
             Request::Uninstall { id } => self.locked(|| self.uninstall(&id)),
             Request::Rollback { id } => self.locked(|| self.rollback(&id)),
@@ -81,13 +87,16 @@ impl Daemon {
         let app = v.get("app");
         let s = |k: &str| app.and_then(|a| a.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let capabilities = v.get("capabilities").and_then(|c| c.as_table()).map(|t| {
-            t.iter().filter(|(_, v)| v.as_bool() != Some(false)).map(|(k, _)| k.clone()).collect()
+            // Every app has a window; `false` and `network = "none"` grant nothing.
+            t.iter().filter(|(k, v)| k.as_str() != "graphics" && v.as_bool() != Some(false) && v.as_str() != Some("none"))
+                .map(|(k, _)| k.clone()).collect()
         }).unwrap_or_default();
         Ok(Described {
             id: id.into(), kind: r.kind.clone(), name: s("name"), description: s("description"),
             latest: r.version.clone(), publisher: r.signer.clone(), catalog: local.name.clone(),
             capabilities, archive_size: r.archive_size,
             installed: self.store().get(id)?.map(|x| x.version),
+            manifest_sha256: oc::hex(&Sha256::digest(r.manifest.as_bytes())),
         })
     }
 
@@ -150,7 +159,9 @@ impl Daemon {
         Ok(Response::Done { id, version })
     }
 
-    fn install_catalog(&self, id: &str, uid: u32) -> Result<Response, String> {
+    /// Install the newest catalog release of `id` for `uid`. With `approved`,
+    /// only if that release's manifest is the one the sheet showed.
+    fn install_catalog(&self, id: &str, approved: Option<&str>, uid: u32) -> Result<Response, String> {
         let c = self.catalog();
         let local = c.local()?;
         let root = c.root()?;
@@ -158,6 +169,11 @@ impl Daemon {
             .ok_or_else(|| format!("{id}: not in the catalog for this machine"))?.clone();
         if r.kind != "app" {
             return Err(format!("{id}: a {} (installed by its own path)", r.kind));
+        }
+        if let Some(want) = approved {
+            if oc::hex(&Sha256::digest(r.manifest.as_bytes())) != want {
+                return Err(format!("{id}: the catalog changed since the sheet was shown; ask again"));
+            }
         }
         let signer = root.key(&r.signer).ok_or("signer gone from root.toml")?.pem.clone();
         // The archive: fetched by C4; for now it must be in the download folder.
