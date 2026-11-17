@@ -386,6 +386,11 @@ pub struct ObjectRef {
 
 pub use officina_shapes::{Geom, Path as ShapePath, PathCmd};
 
+/// Whether `name` is a preset outline we draw.
+pub fn is_preset(name: &str) -> bool {
+    officina_shapes::presets::preset(name).is_some()
+}
+
 /// How a shape's outline is dashed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Dash {
@@ -489,6 +494,17 @@ impl ShapeData {
             v.extend(k.shape.all_paras());
         }
         v
+    }
+
+    /// Within the limits: groups at most [`MAX_GROUP_DEPTH`] deep and
+    /// [`MAX_GROUP_SHAPES`] in all, each shape's paragraphs at most
+    /// [`MAX_SHAPE_PARAS`].
+    pub fn fits(&self) -> bool {
+        fn walk(s: &ShapeData, depth: usize, n: &mut usize) -> bool {
+            *n += 1;
+            depth <= MAX_GROUP_DEPTH && *n <= MAX_GROUP_SHAPES && s.paras.len() <= MAX_SHAPE_PARAS && s.kids.iter().all(|k| walk(&k.shape, depth + 1, n))
+        }
+        walk(self, 0, &mut 0)
     }
 
     /// The shape down `path` of group indices (itself for an empty path).
@@ -1610,6 +1626,11 @@ impl TextDoc {
     }
 
     /// Where note `id` is anchored: (block, byte).
+    /// The block whose text places shape `id`.
+    pub fn shape_anchor(&self, id: u32) -> Option<usize> {
+        self.blocks.iter().position(|b| b.as_para().is_some_and(|p| p.text.contains(OBJECT_CHAR) && p.runs.iter().any(|r| self.attrs.get(r.1).object.is_some_and(|o| o.shape && o.image == id))))
+    }
+
     pub fn anchor_of(&self, id: NoteId) -> Option<(usize, u32)> {
         for (i, b) in self.blocks.iter().enumerate() {
             let Some(p) = b.as_para() else { continue };

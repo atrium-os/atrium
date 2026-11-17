@@ -41,6 +41,9 @@ pub enum TextOp {
     SetMargins { header: Option<crate::model::HeaderFooter>, footer: Option<crate::model::HeaderFooter>, first_page: Option<crate::model::Margins>, even_pages: Option<crate::model::Margins> },
     /// Sets note `id`'s text (None takes the note out of the store).
     SetNote { id: crate::model::NoteId, note: Option<crate::model::Note> },
+    /// A drawn shape put in, changed or taken out (its anchor run is the
+    /// text's; this is its outline, look and text).
+    SetShape { id: u32, shape: Option<crate::model::ShapeData> },
     /// Sets comment `id` (None takes it out of the store).
     SetComment { id: crate::model::CommentId, comment: Option<crate::model::Comment> },
     /// Sets revision `id` (None takes it out).
@@ -146,7 +149,7 @@ impl TextOp {
             // Every page may change (the paginator resets on a new geometry).
             TextOp::SetPage { .. } | TextOp::SetMargins { .. } => Edit { first: 0, last: 0, delta: 0 },
             // Noted by `apply`, from the anchor.
-            TextOp::SetNote { .. } => return None,
+            TextOp::SetNote { .. } | TextOp::SetShape { .. } => return None,
             // Comments change no layout; the editor redraws on every action.
             TextOp::SetComment { .. } | TextOp::SetRevision { .. } | TextOp::SetTracking { .. } => return None,
             // A tombstone takes no room; its text is drawn only in review.
@@ -168,6 +171,17 @@ impl TextOp {
 
 impl Op<TextDoc> for TextOp {
     fn apply(self, d: &mut TextDoc) -> TextOp {
+        if let TextOp::SetShape { id, .. } = &self {
+            let id = *id;
+            let inv = self.apply_inner(d);
+            if !matches!(inv, TextOp::Nop) {
+                // Its anchor's page is painted again.
+                if let Some(at) = d.shape_anchor(id) {
+                    d.note(crate::model::Edit { first: at, last: at + 1, delta: 0 });
+                }
+            }
+            return inv;
+        }
         if let TextOp::SetNote { id, .. } = &self {
             let id = *id;
             let inv = self.apply_inner(d);
@@ -325,6 +339,25 @@ impl TextOp {
                 let old = d.notes.set(id, note);
                 d.notes.renumber();
                 TextOp::SetNote { id, note: old }
+            }
+            TextOp::SetShape { id, shape } => {
+                if id as usize >= crate::model::MAX_SHAPES {
+                    return TextOp::Nop;
+                }
+                if let Some(sd) = &shape {
+                    // Its paragraphs' runs and styles must be the document's,
+                    // with no objects in them (no shape in a shape).
+                    let paras = sd.all_paras();
+                    let bad = |p: &crate::model::Para| p.style as usize >= d.styles.styles.len() || p.runs.iter().any(|r| r.1 as usize >= d.attrs.len() || !boundary(&p.text, r.0) || d.attrs.get(r.1).object.is_some());
+                    if paras.len() > crate::model::MAX_SHAPE_PARAS * 4 || paras.iter().any(|p| bad(p)) || !sd.fits() {
+                        return TextOp::Nop;
+                    }
+                    for p in &paras {
+                        d.raise_watermark(p.id + 1);
+                    }
+                }
+                let old = d.shapes.set(id, shape);
+                TextOp::SetShape { id, shape: old }
             }
             TextOp::SetComment { id, comment } => {
                 if id as usize >= crate::model::MAX_COMMENTS || comment.as_ref().is_some_and(|c| c.text.len() > crate::model::MAX_COMMENT_TEXT || c.parent == Some(id)) {
@@ -564,6 +597,60 @@ impl TextDoc {
         Some(HeaderFooter { text: text.chars().take(1000).collect(), align, paras })
     }
 
+    /// A shape's paragraphs for `text` (a line a paragraph, at most
+    /// [`crate::model::MAX_SHAPE_PARAS`]), keeping `old`'s format round each
+    /// change; new lines take the last line's format, or `fresh` (an
+    /// attribute and alignment) when there was none. No objects: the shape
+    /// text is words only.
+    pub fn shape_paras(&mut self, old: &[crate::model::Para], text: &str, fresh: (crate::model::CharAttrs, Option<crate::model::Align>)) -> Vec<crate::model::Para> {
+        use crate::model::{Para, MAX_SHAPE_PARAS, OBJECT_CHAR};
+        let text: String = text.trim_end_matches('\n').chars().filter(|&c| c != OBJECT_CHAR && (!c.is_control() || c == '\n' || c == '\t')).collect();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let plain = self.attrs.intern(fresh.0);
+        let lines: Vec<&str> = text.split('\n').collect();
+        let keep = lines.len().min(MAX_SHAPE_PARAS);
+        let mut paras = Vec::with_capacity(keep);
+        for i in 0..keep {
+            let t = if i + 1 == keep && lines.len() > keep { lines[i..].join(" ") } else { lines[i].to_string() };
+            let attrs = &self.attrs;
+            let ok = |a: crate::model::AttrId| {
+                let x = attrs.get(a);
+                x.object.is_none() && x.note.is_none() && x.field.is_none() && x.deleted.is_none()
+            };
+            let p = match (old.get(i), old.last()) {
+                (Some(o), _) => {
+                    let mut p = o.retext(&t, &self.attrs, plain);
+                    for r in p.runs.iter_mut() {
+                        if !ok(r.1) {
+                            r.1 = plain;
+                        }
+                    }
+                    p
+                }
+                (None, Some(last)) => {
+                    let a = last.attr_at(last.text.len() as u32);
+                    let a = if ok(a) { a } else { plain };
+                    let mut p = Para::new(self.new_id(), &t, last.style);
+                    p.props = last.props.clone();
+                    p.runs = vec![(0, a)];
+                    p
+                }
+                (None, None) => {
+                    let mut p = Para::new(self.new_id(), &t, 0);
+                    p.runs = vec![(0, plain)];
+                    p.props.align = fresh.1;
+                    p.props.space_before = Some(0);
+                    p.props.space_after = Some(0);
+                    p
+                }
+            };
+            paras.push(p);
+        }
+        paras
+    }
+
     /// Ops that delete from (`b0`, `o0`) to (`b1`, `o1`), across paragraphs.
     pub fn delete_ops(&self, b0: usize, o0: u32, b1: usize, o1: u32) -> Vec<TextOp> {
         if (b1, o1) <= (b0, o0) {
@@ -610,6 +697,28 @@ mod tests {
 
     fn snapshot(d: &TextDoc) -> Vec<(u64, String, Vec<(u32, AttrId)>, StyleId)> {
         d.blocks.iter().map(|b| b.as_para().unwrap()).map(|p| (p.id, p.text.clone(), p.runs.clone(), p.style)).collect()
+    }
+
+    #[test]
+    fn shapes_set_undo_and_bad_ones_are_refused() {
+        use crate::model::{Geom, ObjectRef, Para, ShapeData, OBJECT_CHAR};
+        let mut d = TextDoc::new();
+        let mut sd = ShapeData::new(Geom::preset("rect"));
+        sd.paras.push(Para::new(d.new_id(), "inside", 0));
+        let inv = TextOp::SetShape { id: 0, shape: Some(sd.clone()) }.apply(&mut d);
+        assert_eq!(inv, TextOp::SetShape { id: 0, shape: None });
+        assert_eq!(d.shapes.get(0).map(|s| (**s).clone()), Some(sd.clone()));
+        inv.apply(&mut d);
+        assert!(d.shapes.get(0).is_none());
+        // A shape whose text holds an object (a shape in a shape).
+        let a = d.attrs.intern(CharAttrs { object: Some(ObjectRef { image: 0, width: 10, height: 10, float: None, shape: true }), ..Default::default() });
+        let mut bad = sd.clone();
+        bad.paras = vec![Para { id: d.new_id(), text: OBJECT_CHAR.to_string(), runs: vec![(0, a)], style: 0, props: Default::default() }];
+        assert_eq!(TextOp::SetShape { id: 0, shape: Some(bad) }.apply(&mut d), TextOp::Nop);
+        // A run with an attribute the document lacks.
+        let mut bad = sd;
+        bad.paras[0].runs = vec![(0, 9_999)];
+        assert_eq!(TextOp::SetShape { id: 0, shape: Some(bad) }.apply(&mut d), TextOp::Nop);
     }
 
     #[test]

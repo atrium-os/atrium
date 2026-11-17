@@ -41,7 +41,14 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 pub const TOOLS: [&str; 7] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…"];
 
 /// The Insert menu, in order.
-pub const INSERT: [&str; 35] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…"];
+pub const INSERT: [&str; 37] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…"];
+
+/// The shapes the shape bar draws: (label, preset; "textBox", "line" and
+/// "arrow" are the editor's own).
+pub const SHAPES: [(&str, &str); 12] = [("Rectangle", "rect"), ("Rounded", "roundRect"), ("Ellipse", "ellipse"), ("Triangle", "triangle"), ("Diamond", "diamond"), ("Arrow", "rightArrow"), ("Star", "star5"), ("Callout", "wedgeRectCallout"), ("Heart", "heart"), ("Line", "line"), ("Line Arrow", "arrow"), ("Text Box", "textBox")];
+
+/// The shape bar's colours: (name, RGB).
+pub const SHAPE_COLORS: [(&str, u32); 9] = [("Blue", 0x4472C4), ("Dark Blue", 0x2F528F), ("Orange", 0xED7D31), ("Green", 0x70AD47), ("Red", 0xC00000), ("Yellow", 0xFFC000), ("Grey", 0xA5A5A5), ("Black", 0x000000), ("White", 0xFFFFFF)];
 
 /// Paragraphs of a note as the note bar's one line shows them.
 pub const NOTE_PARA_MARK: &str = " ¶ ";
@@ -146,6 +153,28 @@ pub enum Cmd {
     MarginPageNumber,
     MarginDone,
     MarginClose,
+    /// Insert ▸ Shape…: the shape bar (on the shape at the caret, if any).
+    ShapeOpen,
+    /// Draw `SHAPES[i]` beside the caret's paragraph.
+    ShapeInsert(usize),
+    /// Fill (none, or `SHAPE_COLORS[i]`).
+    ShapeFill(Option<usize>),
+    /// Line (none, or `SHAPE_COLORS[i]`).
+    ShapeLine(Option<usize>),
+    /// The line a step thicker (true) or thinner.
+    ShapeWeight(bool),
+    /// Solid, dotted, dashed, dash-dot, long dashes, in turn.
+    ShapeDash,
+    /// Arrowheads: none, at the end, at both ends, in turn.
+    ShapeArrows,
+    /// Turn by this many degrees (clockwise).
+    ShapeTurn(i32),
+    /// Wider or narrower, taller or shorter (twips).
+    ShapeSize(i32, i32),
+    /// Words at the top, middle or bottom, in turn.
+    ShapeAnchor,
+    ShapeDone,
+    ShapeClose,
 }
 
 /// A change to a section's page.
@@ -195,7 +224,7 @@ pub const PAGE_CMDS: [PageCmd; 6] = [PageCmd::Portrait, PageCmd::Landscape, Page
 impl Cmd {
     /// The command of Insert menu item `i`.
     pub fn insert(i: usize) -> Cmd {
-        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen][i.min(INSERT.len() - 1)]
+        [Cmd::InsertPicture, Cmd::Table, Cmd::RowBelow, Cmd::ColumnRight, Cmd::DeleteRow, Cmd::DeleteColumn, Cmd::PageNumbers, Cmd::NoteInsert(NoteKind::Foot), Cmd::NoteInsert(NoteKind::End), Cmd::NoteEdit, Cmd::CommentAdd, Cmd::CommentEdit, Cmd::Toc, Cmd::XrefOpen, Cmd::SectionBreak(SectionStart::NextPage), Cmd::SectionBreak(SectionStart::Continuous), Cmd::Columns(1), Cmd::Columns(2), Cmd::Columns(3), Cmd::ColumnRule, Cmd::Wrap(None), Cmd::Wrap(Some(Wrap::Square)), Cmd::Wrap(Some(Wrap::TopBottom)), Cmd::Wrap(Some(Wrap::Behind)), Cmd::Wrap(Some(Wrap::InFront)), Cmd::FloatAlign(HAlign::Start), Cmd::FloatAlign(HAlign::Center), Cmd::FloatAlign(HAlign::End), Cmd::Page(PAGE_CMDS[0]), Cmd::Page(PAGE_CMDS[1]), Cmd::Page(PAGE_CMDS[2]), Cmd::Page(PAGE_CMDS[3]), Cmd::Page(PAGE_CMDS[4]), Cmd::Page(PAGE_CMDS[5]), Cmd::MarginOpen, Cmd::ShapeInsert(SHAPES.len() - 1), Cmd::ShapeOpen][i.min(INSERT.len() - 1)]
     }
 }
 
@@ -249,6 +278,14 @@ pub struct NoteBar {
 pub struct MarginBar {
     pub open: bool,
     pub pages: usize,
+}
+
+/// The shape bar: open, on shape `id` (its words in the field) or, with
+/// none, offering shapes to draw.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShapeBar {
+    pub open: bool,
+    pub id: Option<u32>,
 }
 
 /// The header and footer bar is two bars high.
@@ -347,6 +384,10 @@ pub struct Write {
     pub margin_footer: Mutable<TextEdit>,
     /// The bar's segmented control.
     pub margin_seg: Mutable<usize>,
+    pub shape: Mutable<ShapeBar>,
+    pub shape_text: Mutable<TextEdit>,
+    pub fill_menu: Mutable<MenuState>,
+    pub line_menu: Mutable<MenuState>,
     pub speller: Rc<RefCell<Speller>>,
     /// Where words added to the dictionary are kept (one per line).
     pub words_file: Rc<RefCell<Option<std::path::PathBuf>>>,
@@ -354,7 +395,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -396,7 +437,7 @@ impl Write {
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if self.margin.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -535,6 +576,124 @@ impl Write {
         };
         if own || !h.is_empty() || !f.is_empty() {
             ed.borrow_mut().set_margins(margin_pages(mb.pages), &h, &f);
+        }
+    }
+
+    /// The shape bar on the shape at the caret (its words in the field), or
+    /// offering shapes when there's none.
+    fn shape_show(&self) {
+        let ed = self.doc.borrow().ed.clone();
+        let e = ed.borrow();
+        let id = e.shape_at_caret().map(|s| s.0);
+        self.shape_text.set(TextEdit::new(&e.shape_text().unwrap_or_default().replace('\n', NOTE_PARA_MARK)));
+        self.shape.set(ShapeBar { open: true, id });
+    }
+
+    /// Puts the field's words in the bar's shape (if the caret is still on it).
+    fn shape_save(&self) {
+        let sb = self.shape.get_cloned();
+        let ed = self.doc.borrow().ed.clone();
+        let on = ed.borrow().shape_at_caret().map(|s| s.0);
+        if sb.open && sb.id.is_some() && sb.id == on {
+            ed.borrow_mut().set_shape_text(&unmark(&self.shape_text.get_cloned()));
+        }
+    }
+
+    /// Runs a shape bar command.
+    fn shape_cmd(&self, c: Cmd) {
+        use officina_text::model::{ArrowEnd, Dash, ShapeLine, TextAnchor};
+        let ed = self.doc.borrow().ed.clone();
+        if !matches!(c, Cmd::ShapeOpen | Cmd::ShapeClose) {
+            self.shape_save();
+        }
+        let mut e = ed.borrow_mut();
+        match c {
+            Cmd::ShapeOpen => {
+                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                self.spell.set(SpellBar::default());
+                self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
+            }
+            Cmd::ShapeInsert(i) => {
+                e.insert_shape(SHAPES[i.min(SHAPES.len() - 1)].1);
+                self.find.set(FindBar { open: false, ..self.find.get_cloned() });
+                self.spell.set(SpellBar::default());
+                self.note.set(NoteBar::default());
+                self.comment.set(CommentBar::default());
+                self.margin.set(MarginBar::default());
+                self.xref.set(XrefBar::default());
+                e.review = false;
+            }
+            Cmd::ShapeFill(k) => {
+                e.set_shape("Fill", |s| s.fill = k.map(|k| SHAPE_COLORS[k.min(SHAPE_COLORS.len() - 1)].1));
+            }
+            Cmd::ShapeLine(k) => {
+                e.set_shape("Line", |s| {
+                    s.line = k.map(|k| ShapeLine { color: SHAPE_COLORS[k.min(SHAPE_COLORS.len() - 1)].1, ..s.line.unwrap_or(ShapeLine { color: 0, width: 15, dash: Dash::Solid, head: ArrowEnd::None, tail: ArrowEnd::None }) })
+                });
+            }
+            Cmd::ShapeWeight(up) => {
+                // Office's widths: ¼, ½, ¾, 1, 1½, 2¼, 3, 4½, 6 pt.
+                const STEPS: [i32; 9] = [5, 10, 15, 20, 30, 45, 60, 90, 120];
+                e.set_shape("Line Width", |s| {
+                    if let Some(l) = s.line.as_mut() {
+                        let i = STEPS.iter().position(|&w| w >= l.width).unwrap_or(STEPS.len() - 1);
+                        let i = if up { (i + usize::from(STEPS[i] <= l.width)).min(STEPS.len() - 1) } else { i.saturating_sub(1) };
+                        l.width = STEPS[i];
+                    }
+                });
+            }
+            Cmd::ShapeDash => {
+                e.set_shape("Dashes", |s| {
+                    if let Some(l) = s.line.as_mut() {
+                        l.dash = match l.dash {
+                            Dash::Solid => Dash::Dot,
+                            Dash::Dot => Dash::Dash,
+                            Dash::Dash => Dash::DashDot,
+                            Dash::DashDot => Dash::LongDash,
+                            Dash::LongDash => Dash::Solid,
+                        };
+                    }
+                });
+            }
+            Cmd::ShapeArrows => {
+                e.set_shape("Arrowheads", |s| {
+                    if let Some(l) = s.line.as_mut() {
+                        (l.head, l.tail) = match (l.head, l.tail) {
+                            (ArrowEnd::None, ArrowEnd::None) => (ArrowEnd::None, ArrowEnd::Triangle),
+                            (ArrowEnd::None, _) => (ArrowEnd::Triangle, ArrowEnd::Triangle),
+                            _ => (ArrowEnd::None, ArrowEnd::None),
+                        };
+                    }
+                });
+            }
+            Cmd::ShapeTurn(deg) => {
+                e.set_shape("Turn", |s| s.rot = (s.rot + deg * 60_000).rem_euclid(21_600_000));
+            }
+            Cmd::ShapeSize(dw, dh) => {
+                e.resize_object(dw, dh);
+            }
+            Cmd::ShapeAnchor => {
+                e.set_shape("Text Position", |s| {
+                    s.anchor = match s.anchor {
+                        TextAnchor::Top => TextAnchor::Middle,
+                        TextAnchor::Middle => TextAnchor::Bottom,
+                        TextAnchor::Bottom => TextAnchor::Top,
+                    }
+                });
+            }
+            Cmd::ShapeDone | Cmd::ShapeClose => {
+                drop(e);
+                self.shape.set(ShapeBar::default());
+                return;
+            }
+            _ => {}
+        }
+        drop(e);
+        // The bar follows the caret's shape (a new one, or none).
+        let id = ed.borrow().shape_at_caret().map(|s| s.0);
+        if c == Cmd::ShapeOpen || id != self.shape.get_cloned().id || !self.shape.get_cloned().open {
+            self.shape_show();
         }
     }
 
@@ -800,13 +959,16 @@ impl Write {
                 let d = self.doc.borrow();
                 let mut e = d.ed.borrow_mut();
                 // The bars share one place under the toolbar.
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen | Cmd::MarginOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::XrefOpen | Cmd::MarginOpen | Cmd::ShapeOpen) {
                     e.review = false;
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::MarginOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::MarginOpen) {
+                    self.shape.set(ShapeBar::default());
+                }
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::MarginOpen | Cmd::ShapeOpen) {
                     self.xref.set(XrefBar::default());
                 }
-                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen) {
+                if matches!(c, Cmd::FindOpen | Cmd::SpellOpen | Cmd::NoteInsert(_) | Cmd::NoteEdit | Cmd::CommentAdd | Cmd::CommentEdit | Cmd::CommentOpen(_) | Cmd::ReviewOpen | Cmd::XrefOpen | Cmd::ShapeOpen) {
                     self.margin.set(MarginBar::default());
                 }
                 match c {
@@ -975,6 +1137,13 @@ impl Write {
                         self.changed();
                         return true;
                     }
+                    Cmd::ShapeOpen | Cmd::ShapeInsert(_) | Cmd::ShapeFill(_) | Cmd::ShapeLine(_) | Cmd::ShapeWeight(_) | Cmd::ShapeDash | Cmd::ShapeArrows | Cmd::ShapeTurn(_) | Cmd::ShapeSize(..) | Cmd::ShapeAnchor | Cmd::ShapeDone | Cmd::ShapeClose => {
+                        drop(e);
+                        drop(d);
+                        self.shape_cmd(c);
+                        self.changed();
+                        return false;
+                    }
                     Cmd::MarginOpen | Cmd::MarginShow(_) | Cmd::MarginFirst | Cmd::MarginEven | Cmd::MarginPageNumber | Cmd::MarginDone | Cmd::MarginClose => {
                         drop(e);
                         drop(d);
@@ -1107,7 +1276,7 @@ impl View for Write {
                     let m = MenuItem::new(*s).enabled(pic.is_some_and(|f| f.is_some())).radio(pic.flatten().is_some_and(|f| f.h_rel == Rel::Text && f.h_align == aligns[i - 25]));
                     if i == 25 { m.separated() } else { m }
                 }
-                34 => MenuItem::new(*s).separated(),
+                34 | 35 => MenuItem::new(*s).separated(),
                 28..=33 => {
                     let m = MenuItem::new(*s).radio(PAGE_CMDS[i - 28].is(&page));
                     if i == 28 || i == 30 || i == 32 { m.separated() } else { m }
@@ -1305,6 +1474,63 @@ impl View for Write {
             Checkbox::new(check(first), "Different first page").at(rx + 124.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginFirst)).render(ctx);
             let cmds = self.cmds.clone();
             Checkbox::new(check(even), "Different even pages").at(rx + 300.0, ry + 14.0).on_change(move |_| cmds.lock().unwrap().push(Cmd::MarginEven)).render(ctx);
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        }
+
+        // The shape bar: on the caret's shape, its words and look; with none,
+        // the shapes to draw.
+        let sb = self.shape.get_cloned();
+        if sb.open {
+            let y = TOOLBAR_H;
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, MARGIN_H), fill: t.bg_surface(), radius: 0.0 });
+            let push = |c: Cmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(c)
+            };
+            let on = ed.borrow().shape_at_caret();
+            match on.filter(|s| Some(s.0) == sb.id) {
+                None => {
+                    ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 120.0, 20.0), content: "Draw a shape".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+                    let bw = ((w - 140.0 - 90.0) / 6.0 - 6.0).clamp(72.0, 110.0);
+                    for (i, (label, _)) in SHAPES.iter().enumerate() {
+                        let (row, col) = (i / 6, i % 6);
+                        Button::secondary(*label).at(140.0 + col as f32 * (bw + 6.0), y + row as f32 * FIND_H + 8.0).width(bw).on_click(push(Cmd::ShapeInsert(i))).render(ctx);
+                    }
+                    Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ShapeClose)).render(ctx);
+                }
+                Some((_, _, sd)) => {
+                    ctx.add(Node::Text { rect: Rect::new(12.0, y + 14.0, 70.0, 20.0), content: "Words".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+                    let fw = (w - 84.0 - 160.0).max(160.0);
+                    let cmds = self.cmds.clone();
+                    TextField::new(self.shape_text.clone()).placeholder("Words in the shape").autofocus(true).at(84.0, y + 8.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ShapeDone)).render(ctx);
+                    Button::primary("Done").at(w - 148.0, y + 8.0).width(64.0).on_click(push(Cmd::ShapeDone)).render(ctx);
+                    Button::secondary("Close").at(w - 76.0, y + 8.0).width(64.0).on_click(push(Cmd::ShapeClose)).render(ctx);
+                    let ry = y + FIND_H + 8.0;
+                    let mut x = 12.0;
+                    let colors = |cur: Option<u32>, none: &str| -> Vec<MenuItem> {
+                        std::iter::once(MenuItem::new(none).radio(cur.is_none())).chain(SHAPE_COLORS.iter().map(|(n, c)| MenuItem::new(*n).radio(cur == Some(*c)))).collect()
+                    };
+                    let cmds = self.cmds.clone();
+                    MenuButton::new("Fill".to_string(), self.fill_menu.clone(), colors(sd.fill, "No Fill"), move |i| cmds.lock().unwrap().push(Cmd::ShapeFill(i.checked_sub(1)))).at(x, ry).width(72.0).render(ctx);
+                    x += 78.0;
+                    let cmds = self.cmds.clone();
+                    MenuButton::new("Line".to_string(), self.line_menu.clone(), colors(sd.line.map(|l| l.color), "No Line"), move |i| cmds.lock().unwrap().push(Cmd::ShapeLine(i.checked_sub(1)))).at(x, ry).width(72.0).render(ctx);
+                    x += 84.0;
+                    let has_line = sd.line.is_some();
+                    for (label, cmd, wd, gap, on) in [("Thinner", Cmd::ShapeWeight(false), 76.0, 4.0, has_line), ("Thicker", Cmd::ShapeWeight(true), 76.0, 4.0, has_line), ("Dashes", Cmd::ShapeDash, 72.0, 4.0, has_line), ("Arrowheads", Cmd::ShapeArrows, 100.0, 12.0, has_line), ("Turn Left", Cmd::ShapeTurn(-15), 84.0, 4.0, true), ("Turn Right", Cmd::ShapeTurn(15), 90.0, 12.0, true), ("Wider", Cmd::ShapeSize(288, 0), 64.0, 4.0, true), ("Narrower", Cmd::ShapeSize(-288, 0), 84.0, 4.0, true), ("Taller", Cmd::ShapeSize(0, 288), 64.0, 4.0, true), ("Shorter", Cmd::ShapeSize(0, -288), 72.0, 12.0, true)] {
+                        if on {
+                            Button::secondary(label).at(x, ry).width(wd).on_click(push(cmd)).render(ctx);
+                        }
+                        x += wd + gap;
+                    }
+                    let place = match sd.anchor {
+                        officina_text::model::TextAnchor::Top => "Words: Top",
+                        officina_text::model::TextAnchor::Middle => "Words: Middle",
+                        officina_text::model::TextAnchor::Bottom => "Words: Bottom",
+                    };
+                    Button::secondary(place).at(x, ry).width(120.0).on_click(push(Cmd::ShapeAnchor)).render(ctx);
+                }
+            }
             ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
@@ -1590,6 +1816,63 @@ mod tests {
         assert_eq!(footer(0).as_deref(), Some("Page {page}"));
         run(Cmd::FindOpen);
         assert!(!w.margin.get_cloned().open, "bars share one place");
+    }
+
+    #[test]
+    fn shape_bar_draws_and_changes_shapes() {
+        let doc = Doc::from_text("h.txt", b"Some text here.").unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            assert!(w.take_cmds().is_empty());
+        };
+        let ed = w.doc.borrow().ed.clone();
+        let texts = || {
+            let (tree, _) = pergola::view::render(&w, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let top = w.pages_rect(1200.0, 800.0).origin.y;
+        run(Cmd::insert(36));
+        assert!(w.shape.get_cloned().open);
+        assert_eq!(w.shape.get_cloned().id, None, "no shape at the caret: the bar offers shapes");
+        assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H);
+        let t = texts();
+        for (label, _) in SHAPES {
+            assert!(t.iter().any(|s| s == label), "{label} missing from {t:?}");
+        }
+        run(Cmd::ShapeInsert(5));
+        let sb = w.shape.get_cloned();
+        assert!(sb.open && sb.id.is_some(), "the new shape is the bar's");
+        let t = texts();
+        for want in ["Words", "Fill", "Line", "Thicker", "Dashes", "Arrowheads", "Turn Right", "Wider", "Words: Middle", "Done"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        w.shape_text.set(TextEdit::new("Next ¶ step"));
+        run(Cmd::ShapeFill(Some(2)));
+        run(Cmd::ShapeLine(None));
+        run(Cmd::ShapeTurn(15));
+        run(Cmd::ShapeSize(288, 0));
+        run(Cmd::ShapeAnchor);
+        let (_, o, sd) = ed.borrow().shape_at_caret().unwrap();
+        assert_eq!(sd.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Next", "step"], "the words went in before the fill");
+        assert_eq!((sd.geom.clone(), sd.fill, sd.line, sd.rot, o.width, sd.anchor), (officina_text::model::Geom::preset("rightArrow"), Some(0xED7D31), None, 15 * 60_000, 2448, officina_text::model::TextAnchor::Bottom));
+        assert!(!texts().iter().any(|s| s == "Dashes"), "no line, no line buttons");
+        run(Cmd::ShapeLine(Some(7)));
+        run(Cmd::ShapeWeight(true));
+        run(Cmd::ShapeDash);
+        run(Cmd::ShapeArrows);
+        let l = ed.borrow().shape_at_caret().unwrap().2.line.unwrap();
+        assert_eq!((l.color, l.width, l.dash, l.tail), (0, 20, officina_text::model::Dash::Dot, officina_text::model::ArrowEnd::Triangle));
+        run(Cmd::ShapeDone);
+        assert!(!w.shape.get_cloned().open);
+        run(Cmd::Undo);
+        assert_eq!(ed.borrow().doc.shapes.get(0).unwrap().line.map(|l| l.tail), Some(officina_text::model::ArrowEnd::None), "each change is its own undo step");
+        // Insert ▸ Text Box draws one and opens the bar on it.
+        run(Cmd::insert(35));
+        let (id, _, tb) = ed.borrow().shape_at_caret().unwrap();
+        assert_eq!((w.shape.get_cloned().id, tb.fill), (Some(id), Some(0xFFFFFF)));
+        run(Cmd::FindOpen);
+        assert!(!w.shape.get_cloned().open, "bars share one place");
     }
 
     #[test]

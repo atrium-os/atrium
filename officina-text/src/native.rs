@@ -1123,6 +1123,17 @@ pub fn encode_op(op: &TextOp) -> Vec<u8> {
                 }
             }
         }
+        TextOp::SetShape { id, shape } => {
+            w.u8(16);
+            w.var(*id as u64);
+            match shape {
+                None => w.u8(0),
+                Some(s) => {
+                    w.u8(1);
+                    encode_shape(&mut w, s);
+                }
+            }
+        }
         TextOp::SetNote { id, note } => {
             w.u8(9);
             w.var(*id as u64);
@@ -1208,6 +1219,15 @@ pub fn decode_op(b: &[u8], attrs: usize, styles: usize) -> Result<TextOp, WireEr
                 _ => return Err(WireError::Invalid("comment")),
             };
             TextOp::SetComment { id, comment }
+        }
+        16 => {
+            let id = r.len("shape", crate::model::MAX_SHAPES as u64 - 1)? as u32;
+            let shape = match r.u8()? {
+                0 => None,
+                1 => Some(decode_shape(&mut r, attrs, styles)?),
+                _ => return Err(WireError::Invalid("shape")),
+            };
+            TextOp::SetShape { id, shape }
         }
         9 => {
             let id = r.len("note", MAX_NOTES as u64 - 1)? as NoteId;
@@ -1910,6 +1930,8 @@ mod tests {
             TextOp::SetMargins { header: Some(HeaderFooter::line("H", Align::Center)), footer: None, first_page: Some(crate::model::Margins::default()), even_pages: Some(crate::model::Margins { header: None, footer: Some(HeaderFooter { text: "e".into(), align: Align::Start, paras: vec![Para::new(d.new_id(), "e {page}", 0)] }) }) },
             TextOp::SetNote { id: 5, note: Some(Note { kind: NoteKind::End, paras: vec![Para::new(d.new_id(), "note", 0)] }) },
             TextOp::SetNote { id: 5, note: None },
+            TextOp::SetShape { id: 3, shape: Some(crate::model::ShapeData { fill: Some(0xFF0000), paras: vec![Para::new(d.new_id(), "box", 0)], ..crate::model::ShapeData::new(crate::model::Geom::preset("ellipse")) }) },
+            TextOp::SetShape { id: 3, shape: None },
             TextOp::SetComment { id: 9, comment: Some(Comment { author: "A".into(), text: "c".into(), parent: Some(0), ..Default::default() }) },
             TextOp::SetComment { id: 9, comment: None },
             TextOp::SetRevision { id: 2, rev: Some(crate::model::Revision { author: "Ann".into(), date: "2026-11-15T00:00:00Z".into(), set: 3, name: "Legal".into() }) },

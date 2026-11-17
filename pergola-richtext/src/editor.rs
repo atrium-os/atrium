@@ -1343,6 +1343,104 @@ impl Editor {
         })
     }
 
+    /// Draws a new shape floating beside the caret's paragraph (square
+    /// wrap, at the column's end): `preset` names a preset outline, or
+    /// `"textBox"` (a white box with a thin black line and words at the
+    /// top), `"line"` or `"arrow"` (a line ending in an arrowhead). Shapes
+    /// come filled blue with a darker line and white words in the middle,
+    /// as Word draws them. The caret goes after it, ready for its text.
+    pub fn insert_shape(&mut self, preset: &str) -> bool {
+        use officina_text::model::{ArrowEnd, Dash, Geom, ShapeData, ShapeLine, TextAnchor};
+        let line = |color: u32, tail: ArrowEnd| Some(ShapeLine { color, width: 15, dash: Dash::Solid, head: ArrowEnd::None, tail });
+        let (sd, w, h) = match preset {
+            "textBox" => (ShapeData { fill: Some(0xFFFFFF), line: line(0, ArrowEnd::None), ..ShapeData::new(Geom::preset("rect")) }, 2880, 1080),
+            "line" | "arrow" => {
+                let tail = if preset == "arrow" { ArrowEnd::Triangle } else { ArrowEnd::None };
+                (ShapeData { line: line(0x4472C4, tail), ..ShapeData::new(Geom::preset(if preset == "arrow" { "straightConnector1" } else { "line" })) }, 2160, 1)
+            }
+            name => {
+                if !officina_text::model::is_preset(name) {
+                    return false;
+                }
+                let square = matches!(name, "ellipse" | "star5" | "heart" | "sun" | "smileyFace" | "triangle" | "diamond" | "octagon" | "hexagon" | "cloud");
+                (ShapeData { fill: Some(0x4472C4), line: line(0x2F528F, ArrowEnd::None), anchor: TextAnchor::Middle, ..ShapeData::new(Geom::preset(name)) }, if square { 1440 } else { 2160 }, 1440)
+            }
+        };
+        let id = self.doc.shapes.next_id();
+        if id as usize >= officina_text::model::MAX_SHAPES {
+            return false;
+        }
+        let (mut ops, start) = self.delete_selection_ops();
+        let mut a = self.typing_attr(start).map(|a| self.doc.attrs.get(a).clone()).unwrap_or_else(|| {
+            let before = self.doc.para(start.block).map_or(0, |p| p.attr_at(start.at.saturating_sub(1)));
+            self.doc.attrs.get(before).clone()
+        });
+        a.object = Some(ObjectRef { image: id, width: w, height: h, float: Some(Float { wrap: Wrap::Square, ..Float::default() }), shape: true });
+        a.note = None;
+        a.field = None;
+        let attr = self.doc.attrs.intern(a);
+        ops.insert(0, TextOp::SetShape { id, shape: Some(sd) });
+        ops.push(TextOp::Splice { block: start.block as u32, at: start.at, del: 0, ins: Fragment { text: OBJECT_CHAR.to_string(), runs: vec![(0, attr)] } });
+        self.apply(if preset == "textBox" { "Insert Text Box" } else { "Insert Shape" }, ops, Kind::Other);
+        let p = Pos::new(start.block, start.at + OBJECT_CHAR.len_utf8() as u32);
+        self.caret = p;
+        self.anchor = p;
+        self.goal_x = None;
+        true
+    }
+
+    /// The drawn shape at the caret (as [`Editor::picture_at_caret`] finds
+    /// pictures): its id, frame and look.
+    pub fn shape_at_caret(&self) -> Option<(u32, ObjectRef, officina_text::model::ShapeData)> {
+        let (_, _, o) = self.picture_at_caret().filter(|p| p.2.shape)?;
+        Some((o.image, o, (**self.doc.shapes.get(o.image)?).clone()))
+    }
+
+    /// Changes the shape at the caret through `f` (one undo step); false if
+    /// there's none or nothing changed.
+    pub fn set_shape(&mut self, label: &str, f: impl FnOnce(&mut officina_text::model::ShapeData)) -> bool {
+        let Some((id, _, old)) = self.shape_at_caret() else { return false };
+        let mut new = old.clone();
+        f(&mut new);
+        if new == old {
+            return false;
+        }
+        self.apply(label, vec![TextOp::SetShape { id, shape: Some(new) }], Kind::Other);
+        true
+    }
+
+    /// The words in the shape at the caret, a paragraph a line.
+    pub fn shape_text(&self) -> Option<String> {
+        self.shape_at_caret().map(|(_, _, s)| s.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Puts `text` in the shape at the caret, keeping the format round
+    /// what changed; new words in a shape that had none are white and
+    /// centred (black and at the start in a text box: a white fill).
+    pub fn set_shape_text(&mut self, text: &str) -> bool {
+        let Some((_, _, sd)) = self.shape_at_caret() else { return false };
+        if self.shape_text().as_deref() == Some(text) {
+            return false;
+        }
+        let light = sd.fill.is_none_or(|c| {
+            let (r, g, b) = ((c >> 16) & 255, (c >> 8) & 255, c & 255);
+            r * 299 + g * 587 + b * 114 > 128_000
+        });
+        let fresh = if light { (CharAttrs::default(), None) } else { (CharAttrs { color: Some(0xFFFFFF), ..Default::default() }, Some(Align::Center)) };
+        let paras = self.doc.shape_paras(&sd.paras, text, fresh);
+        self.set_shape("Shape Text", |s| s.paras = paras)
+    }
+
+    /// Makes the picture or shape at the caret `dw` wider and `dh` taller
+    /// (twips; at least a twip, at most the largest object).
+    pub fn resize_object(&mut self, dw: i32, dh: i32) -> bool {
+        let max = MAX_OBJECT_TWIPS as i64;
+        self.reframe("Size", |o| {
+            o.width = (o.width as i64 + dw as i64).clamp(1, max) as u32;
+            o.height = (o.height as i64 + dh as i64).clamp(1, max) as u32;
+        })
+    }
+
     /// Bold, italic or underline on or off, by what the caret shows.
     pub fn toggle(&mut self, which: Toggle) {
         let cur = self.format_at_caret();
@@ -2843,6 +2941,51 @@ pub(crate) mod tests {
         // Clearing the text takes the header away.
         assert!(e.set_margins(MarginPages::All, "", "Page {page}"));
         assert!(e.doc.header.is_none());
+    }
+
+    #[test]
+    fn shapes_insert_and_change_as_one_step_each() {
+        use officina_text::model::{ArrowEnd, Geom, TextAnchor};
+        let mut e = ed(&["Body text"]);
+        e.caret = Pos::new(0, 4);
+        e.anchor = e.caret;
+        assert!(!e.insert_shape("noSuchShape"));
+        assert!(e.insert_shape("rightArrow"));
+        let (id, o, sd) = e.shape_at_caret().expect("a shape at the caret");
+        assert_eq!((sd.geom.clone(), sd.fill, o.width, o.height), (Geom::preset("rightArrow"), Some(0x4472C4), 2160, 1440));
+        assert!(o.float.is_some_and(|f| f.wrap == Wrap::Square));
+        assert_eq!(e.doc.para(0).unwrap().text, format!("Body{OBJECT_CHAR} text"));
+        // Words in a dark shape: white and centred; an edit keeps them so.
+        assert!(e.set_shape_text("Go\nnow"));
+        let sd = e.shape_at_caret().unwrap().2;
+        assert_eq!(sd.paras.iter().map(|p| p.text.as_str()).collect::<Vec<_>>(), ["Go", "now"]);
+        assert!(sd.paras.iter().all(|p| e.doc.attrs.get(p.runs[0].1).color == Some(0xFFFFFF) && p.props.align == Some(Align::Center)));
+        assert!(e.set_shape_text("Go\nnow!"));
+        assert_eq!(e.doc.attrs.get(e.shape_at_caret().unwrap().2.paras[1].runs[0].1).color, Some(0xFFFFFF));
+        assert!(!e.set_shape_text("Go\nnow!"), "nothing changed");
+        assert!(e.set_shape("Fill", |s| s.fill = Some(0xFF0000)));
+        assert!(e.set_shape("Turn", |s| s.rot = 15 * 60_000));
+        assert!(e.resize_object(720, -360));
+        assert_eq!(e.shape_at_caret().map(|s| (s.1.width, s.1.height)), Some((2880, 1080)));
+        e.undo();
+        e.undo();
+        e.caret = Pos::new(0, 4);
+        e.anchor = e.caret;
+        assert_eq!(e.shape_at_caret().map(|s| (s.2.rot, s.2.fill, s.1.width)), Some((0, Some(0xFF0000), 2160)));
+        // A text box: white, black line, words at the top in black.
+        e.caret = Pos::new(0, 0);
+        e.anchor = e.caret;
+        assert!(e.insert_shape("textBox"));
+        assert!(e.set_shape_text("Note"));
+        let (id2, _, tb) = e.shape_at_caret().unwrap();
+        assert_ne!(id, id2);
+        assert_eq!((tb.fill, tb.anchor, e.doc.attrs.get(tb.paras[0].runs[0].1).color), (Some(0xFFFFFF), TextAnchor::Top, None));
+        assert!(e.insert_shape("arrow"));
+        assert_eq!(e.shape_at_caret().unwrap().2.line.map(|l| l.tail), Some(ArrowEnd::Triangle));
+        // Undoing the insert takes the run and the shape away.
+        e.undo();
+        assert!(e.doc.shapes.get(id2 + 1).is_none());
+        assert_eq!(e.doc.para(0).unwrap().text.matches(OBJECT_CHAR).count(), 2);
     }
 
     /// A w x h PNG, one colour.

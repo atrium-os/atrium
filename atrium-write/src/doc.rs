@@ -522,6 +522,36 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_keeps_drawn_shapes() {
+        let dir = tmp("shapes");
+        let mut d = Doc::from_text("notes.txt", b"first line\n").unwrap();
+        d.autosave_to(&dir).unwrap();
+        d.ed.borrow_mut().set_caret(Pos::new(0, 5), false);
+        assert!(d.ed.borrow_mut().insert_shape("rightArrow"));
+        d.sync_log();
+        assert!(d.ed.borrow_mut().set_shape_text("Go"));
+        d.sync_log();
+        assert!(d.ed.borrow_mut().set_shape("Fill", |s| s.fill = Some(0xC00000)));
+        d.sync_log();
+        d.autosave().unwrap().sync().unwrap();
+        let want: Vec<_> = d.ed.borrow().doc.shapes.iter().map(|(i, s)| (i, (**s).clone())).collect();
+        std::mem::forget(d);
+        let copy = tmp("shapes-copy");
+        fs::create_dir_all(&copy).unwrap();
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            if e.file_name() != LOCK {
+                fs::copy(e.path(), copy.join(e.file_name())).unwrap();
+            }
+        }
+        let (r, _) = recover(&copy).unwrap();
+        let got: Vec<_> = r.ed.borrow().doc.shapes.iter().map(|(i, s)| (i, (**s).clone())).collect();
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.fill, Some(0xC00000));
+        r.close().unwrap();
+    }
+
+    #[test]
     fn a_crash_loses_nothing_typed() {
         let dir = tmp("crash");
         let mut d = Doc::from_text("notes.txt", b"first line\nsecond line\n").unwrap();

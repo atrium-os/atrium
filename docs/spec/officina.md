@@ -3244,6 +3244,47 @@ paint with no panic, 308 with 928 shapes, every one kept through our own
 `.docx` and `.odt`; Write's other LibreOffice gates unchanged (docx 26/26,
 odt 52/52, floats 8/8, headers 4/4, slides 84/84).
 
+### 16.51 Drawing shapes in Write (2026-11-17)
+
+- **Operation.** `TextOp::SetShape { id, shape }` puts a shape in, changes
+  it or takes it out (inverse: the old one; journal tag 16). It refuses
+  shapes past the limits, paragraphs with attributes or styles the
+  document lacks, and any object in a shape's words (no shape in a shape);
+  the anchor paragraph's page is painted again.
+- **Editor.** `insert_shape(preset)` draws a preset (or `"textBox"`,
+  `"line"`, `"arrow"`) floating beside the caret's paragraph with square
+  wrap, in one undo step with its anchor run: shapes come blue with a
+  darker line and words in the middle, text boxes white with a thin black
+  line and words at the top, lines blue (the arrow with a triangle end).
+  `shape_at_caret`, `set_shape(label, f)` (one undo step a change),
+  `shape_text` / `set_shape_text` (a line a paragraph; the format round an
+  edit kept by `TextDoc::shape_paras`; new words white and centred in a
+  dark shape) and `resize_object` (pictures too).
+- **Write.** Insert ▸ Text Box and Insert ▸ Shape…; the shape bar (two
+  rows, where the header bar goes) offers twelve shapes when the caret is
+  on none; on a shape it shows its words (paragraphs marked ¶), Fill and
+  Line menus (none or nine colours), Thinner / Thicker (Office's widths),
+  Dashes, Arrowheads (none, end, both), Turn Left / Right (15°), Wider /
+  Narrower / Taller / Shorter (a fifth of an inch) and where the words sit.
+  The words go in before any other change; the bar follows the caret's
+  shape. The wrap and position items of the Insert menu work on shapes as
+  on pictures. Crash recovery replays shapes from the journal.
+- **Text turned with its shape**: not on screen yet. Fresco draws glyphs
+  as upright atlas bitmaps (a run moves with its group but does not turn),
+  so turned words wait on the Fresco renderer; Write draws them upright
+  in the turned shape's middle, on screen and in PDF alike.
+- **Not yet**: dragging shapes and handles on the page, adjust handles
+  (an arrow's head, a callout's pointer), picking a shape by clicking it
+  (the caret beside its anchor picks it), grouping in Write.
+
+Gates: engine (set, undo, refusals), native journal op round trip, editor
+(insert, words keeping their format, fill, turn, size, undo, text box,
+arrow), Write's bar (both modes, every command, undo a step each, bars
+sharing their place), and a crash recovery that keeps a shape's words
+and fill; officina-text 68, officina-convert, pergola-richtext 28 and
+Write tests all pass; twelve shapes drawn by the editor look right in our
+PDF.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
