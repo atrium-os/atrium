@@ -47,7 +47,7 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                     port.borrow_mut().send(&wire::FromJail::Summary { id: m.id, result })?;
                 }
             }
-            wire::ToJail::Open { authserv_id, me, now, roots, message, loaded } => {
+            wire::ToJail::Open { authserv_id, me, now, roots, key, message, loaded } => {
                 let ctx = Ctx { authserv_id: authserv_id.as_deref(), me: &me, now, headers_only: false, roots: &roots };
                 if !roots_ok(&roots) || loaded.len() > wire::LOADED_MAX || loaded.iter().any(|(id, b)| b.len() > wire::LOADED_HEAD || id.len() > 64) {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "loaded pictures over their limits"));
@@ -57,17 +57,65 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                     .into_iter()
                     .filter_map(|(id, b)| navigator_image::image::natural_size(&b).ok().map(|(_, w, h)| (id, (w, h))))
                     .collect();
-                let result = open(&message.bytes, &ctx, &port, &loaded, fonts);
+                let result = match key.as_deref().map(|k| decrypted(&message.bytes, k)) {
+                    None => open(&message.bytes, &ctx, &port, &loaded, fonts),
+                    Some(Some(inner)) => open(&inner, &ctx, &port, &loaded, fonts).map(|mut o| {
+                        o.summary.encrypted = true;
+                        o
+                    }),
+                    Some(None) => Err(wire::Refusal::NotMail),
+                };
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
-            wire::ToJail::Attachment { message, which } => {
-                let result = attachment(&message.bytes, &which);
+            wire::ToJail::Attachment { message, which, key } => {
+                let result = match key.as_deref().map(|k| decrypted(&message.bytes, k)) {
+                    None => attachment(&message.bytes, &which),
+                    Some(Some(inner)) => attachment(&inner, &which),
+                    Some(None) => Err(wire::Refusal::NotMail),
+                };
                 port.borrow_mut().send(&wire::FromJail::Attachment { id: message.id, result })?;
+            }
+            wire::ToJail::KeyFor { message, certs } => {
+                if certs.len() > wire::MY_CERTS_MAX {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "too many certificates"));
+                }
+                let which = envelope_of(&message.bytes).and_then(|env| {
+                    certs.iter().enumerate().find_map(|(i, c)| mail_smime::envelope::wrapped_key(&env, c).filter(|w| w.len() <= wire::WRAPPED_KEY_MAX).map(|w| (i as u32, w)))
+                });
+                port.borrow_mut().send(&wire::FromJail::KeyFor { id: message.id, which })?;
             }
             wire::ToJail::Answer { .. } => return Err(io::Error::new(io::ErrorKind::InvalidData, "answer with no query")),
         }
         port.borrow_mut().send(&wire::FromJail::Done)?;
     }
+}
+
+/// The S/MIME envelope of an encrypted message (its top-level body).
+fn envelope_of(raw: &[u8]) -> Option<mail_smime::envelope::EnvelopedData> {
+    let s = crate::parse(raw, &Limits::default()).ok()?;
+    if !s.encrypted { return None }
+    let p = s.parts.iter().find(|p| p.path.is_empty())?;
+    mail_smime::envelope::enveloped_data(&mime::part_bytes(raw, p)).ok()
+}
+
+/// The message inside an encrypted one: its outer header lines (but the
+/// `Content-*` ones), then the decrypted entity.
+fn decrypted(raw: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let env = envelope_of(raw)?;
+    let inner = mail_smime::envelope::decrypt(&env, key).ok()?;
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 2).or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|p| p + 1))?;
+    let mut out = Vec::with_capacity(end + inner.len());
+    let mut skip = false;
+    for line in raw[..end].split_inclusive(|b| *b == b'\n') {
+        if line.first().is_some_and(|c| *c == b' ' || *c == b'\t') {
+            if !skip { out.extend_from_slice(line) }
+            continue;
+        }
+        skip = line.len() >= 8 && line[..8].eq_ignore_ascii_case(b"content-");
+        if !skip { out.extend_from_slice(line) }
+    }
+    out.extend_from_slice(&inner);
+    Some(out)
 }
 
 struct Ctx<'a> { authserv_id: Option<&'a str>, me: &'a [String], now: i64, headers_only: bool, roots: &'a [Vec<u8>] }

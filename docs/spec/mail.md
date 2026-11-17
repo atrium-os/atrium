@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 next.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME built on the host, JMAP and OAuth next.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1201,6 +1201,39 @@ Stalwart in the cloud VM, and later a real account):
    window, Praeco's longer posts and event times (tabula.md §5.3–5.4, so freshness uses
    the message's date), notification actions, and a VM run.
 8. **M7** S/MIME with Sigillum tokens and Arca certificates; JMAP; OAuth (Microsoft first).
+   **S/MIME built on the host (2026-11-17)**: new crate `mail/mail-smime` (RustCrypto
+   `cms`/`x509-cert`/`der` and ring; no OpenSSL; holds no private key): a detached
+   signature checked with its chain to the roots given (RSA PKCS#1/PSS 2048–8192, ECDSA
+   P-256/P-384, SHA-2 only; SHA-1 refused; issuers must be CAs; validity at the signing
+   time when that is not in the future; extended key usage must allow email; From must be
+   one of the certificate's addresses), detached signing around an outside signer (ECDSA
+   `r||s` made DER; the signature is checked before it is sent), `EnvelopedData` with
+   AES-256-CBC and RSA PKCS#1 v1.5 key transport (EC recipients refused by name), reading
+   AES-128/256-CBC, and BER from streaming senders. Checked against OpenSSL both ways
+   (its streamed signature and envelope verify and decrypt here; ours verify and decrypt
+   with `openssl cms`). The parse jail checks `multipart/signed` against the roots the
+   engine sends (the system's `/etc/ssl/cert.pem`, same as Nuntius; bare-LF copies are
+   checked as CRLF) and reports signer, issuers and state; the engine holds a jail's claim
+   to From and to the certificate's hash (mail-schema). The reader shows "Signed by Grace
+   Hopper <grace@…> · certificate from …", or why not, and the signature part is never
+   listed as a file. Valid signers' certificates are kept per address (store schema 7,
+   4 per address) and used to encrypt. Compose has **Encrypt** (on only when every
+   recipient's certificate is known; the person's own certificate is added so the Sent
+   copy stays readable) and **Sign** (when sigillumd is there): Sigillum gained
+   `CertPurpose::MailSign { from }` (sigillum.md §10.2; only apps in
+   `SIGILLUM_MAIL_SIGNERS`), the certificate is picked and the token signs the digest of
+   the CMS signed attributes on Sigillum's sheets. Decrypting: the jail says which of the
+   person's certificates the message is for and hands out the wrapped key; whatever holds
+   the key unwraps it; the jail decrypts and parses the inside. The content key is kept in
+   memory for the session only, and nothing of an encrypted message's inside is stored or
+   indexed (stricter than the setting above, until persona volumes are encrypted). Tests:
+   mail-smime 5, jail 4 more (signed, claims, encrypted), engine 3, window 2, compose 2,
+   sigillumd 1. **Not yet**: unwrapping with the token (Sigillum needs a decrypt op and the
+   PKCS#11 host's allow-list a decrypt mechanism) or with an Arca-held key (`arca_decrypt`,
+   `arca_sign`), so the reader says it can't decrypt yet; the person's added CAs; opaque
+   signed-data (`smime-type=signed-data`) and AuthEnvelopedData (AES-GCM); revocation
+   (OCSP/CRL); a certificates page (seen certificates, forgetting one); Bcc recipients
+   show in the envelope's recipient list (as in other clients). JMAP and OAuth are next.
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
 

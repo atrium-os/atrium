@@ -67,6 +67,9 @@ pub enum ToJail {
         me: Vec<String>,
         now: i64,
         roots: Vec<Vec<u8>>,
+        /// For an encrypted message: the unwrapped content key; the jail
+        /// decrypts and the answer is about the message inside.
+        key: Option<Vec<u8>>,
         message: Raw,
         /// Remote pictures already loaded (§7.4): resource id and their
         /// first bytes (at most [`LOADED_HEAD`] each, [`LOADED_MAX`] of
@@ -80,8 +83,17 @@ pub enum ToJail {
     Answer { query: u32, txt: Option<String> },
     /// One attachment's decoded bytes (§8), and its text for search when
     /// it has some.
-    Attachment { message: Raw, which: Which },
+    Attachment { message: Raw, which: Which, key: Option<Vec<u8>> },
+    /// S/MIME (§10.1): which of `certs` (the person's, DER) the encrypted
+    /// message is for, and the content key wrapped for it, to be unwrapped
+    /// by whoever holds that key. The answer is [`FromJail::KeyFor`].
+    KeyFor { message: Raw, certs: Vec<Vec<u8>> },
 }
+
+/// Most of the person's certificates sent with a [`ToJail::KeyFor`].
+pub const MY_CERTS_MAX: usize = 16;
+/// Largest wrapped content key (RSA up to 8192 bits).
+pub const WRAPPED_KEY_MAX: usize = 1024;
 
 /// Which attachment of a message: a MIME part by its path, or the `n`th
 /// file unpacked from its `winmail.dat` parts.
@@ -108,6 +120,9 @@ pub enum FromJail {
     Summary { id: u64, result: Result<Summary, Refusal> },
     Opened { id: u64, result: Result<Opened, Refusal> },
     Attachment { id: u64, result: Result<Attached, Refusal> },
+    /// The index into the certificates sent and the wrapped key, or None
+    /// when the message isn't encrypted to any of them.
+    KeyFor { id: u64, which: Option<(u32, Vec<u8>)> },
     Done,
 }
 
@@ -508,6 +523,10 @@ impl FromJail {
             FromJail::Attachment { result: Ok(a), .. } => {
                 if a.bytes.len() as u64 > raw_len { return Err(Lie("attachment larger than its message")) }
                 if a.text.as_ref().is_some_and(|t| t.len() > ATTACHMENT_TEXT_MAX) { return Err(Lie("attachment text too long")) }
+                Ok(())
+            }
+            FromJail::KeyFor { which: Some((i, w)), .. } => {
+                if *i as usize >= MY_CERTS_MAX || w.is_empty() || w.len() > WRAPPED_KEY_MAX { return Err(Lie("wrapped key")) }
                 Ok(())
             }
             _ => Ok(()),

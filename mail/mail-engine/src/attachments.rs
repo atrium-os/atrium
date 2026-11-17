@@ -17,12 +17,17 @@ impl Engine {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let full = m.full.ok_or(Error::NotFound)?;
         let raw = self.store.blob(&full)?;
-        self.parser.attachment(&raw, which)?.ok_or(Error::NotFound)
+        let key = if m.summary.encrypted { Some(self.content_key(msg).ok_or(Error::Refused("This message is encrypted; unlock it first"))?) } else { None };
+        self.parser.attachment(&raw, which, key)?.ok_or(Error::NotFound)
     }
 
     /// Take out `msg`'s attachment names and text for search (§11.2) and
     /// keep them; what was kept. Nothing when it has no attachments.
     pub fn index_files(&self, msg: MsgId) -> Result<Option<String>, Error> {
+        // An encrypted message's files stay out of the index.
+        if self.store.message(msg).is_ok_and(|m| m.summary.encrypted) {
+            return Ok(None);
+        }
         let r = self.open(msg)?;
         if r.attachments.is_empty() {
             return Ok(None);

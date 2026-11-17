@@ -1,0 +1,23 @@
+To: ada@example.org
+From: Grace Hopper <grace@example.net>
+Subject: Encrypted plan
+MIME-Version: 1.0
+Content-Disposition: attachment; filename="smime.p7m"
+Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"
+Content-Transfer-Encoding: base64
+
+MIICjQYJKoZIhvcNAQcDoIICfjCCAnoCAQAxggFiMIIBXgIBADBGMC4xGjAYBgNV
+BAMMEU9wZW5TU0wgVGVzdCBSb290MRAwDgYDVQQKDAdGaXh0dXJlAhQgoy4Y7BO2
+6q2ePmsNxlvBP8Xy8zANBgkqhkiG9w0BAQEFAASCAQAjpavWW1k3wVeiFB5j1CfY
+nnXdbW6E89KrpxWFCuzNZZZ2I+opcItN+uKePtuYwVYZpheOmTiqyIbTkQKVh1+g
+GSvx2WY8rL6/fB/A5VNYi/36AoIjRHNwmUsLD00psLnwZEfCPI2Ssmf/Nm7kfFR1
+4eNTtDqywhpUvsQ7KdJYSolG39QZZQO5mF1fHOVGqXKPypmtZ8L/T24cjyIYoiyo
+Mm01zCugD+dhoQ60LuLUx7X7+MJobuD+WSuu/BXghEU+MNC4jcR2rg70JFO2qoUO
+TsBg7Ulq/a81eoWg/E1UIBUGdQCB4IK7BnoH0WSLhwro40LnXJYR1trudgOW/LoM
+MIIBDQYJKoZIhvcNAQcBMB0GCWCGSAFlAwQBKgQQG8n8Ea+u6l3DDLyROptSj4CB
+4A1RxPeXLjonnoBbdlR28RABRHW/ynG7xNlUB93AdownltFU05flIYZYvMT3pYU7
+U0hTEDucLKT6KzUt7ygv77vK4KYF6bOrMgPpz26t0YtOCuJn0L5qf8B01iber2iw
++xX7hjxfnbOD0ftgNrfgoww9R7vkDNZUHoVV5uBouDEccwJv70UdwGxU4315s2GV
+75up3GhoyEm6Lcz2pMF6hLhf1zzZRsRxi2sJmDLHwUDoGuY33AGZ+pArYCeMFM9F
+y5MrHIx2TjNpdgBIfggisaI8nqQMLg96SDWgoLWpfE4a
+
