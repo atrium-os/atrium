@@ -3,8 +3,9 @@
 > *Opifex* (Latin): a craftsman, one who makes. Atrium's package system: the catalog of
 > published packages, and the fetch, check, install, update and rollback of them.
 
-**Status:** proposed 2026-11-17, waiting for Shankar's review (§14). Nothing built beyond the
-bring-up `opifex` CLI that already exists.
+**Status:** accepted 2026-11-17 (Shankar: all §15 decisions as recommended; decision 1 with
+the Atrium catalog holding only what Atrium builds; GitHub Pages first, a domain later).
+Building C0.
 **Scope:** what a package is, who may publish one, how the catalog is signed, hosted and
 downloaded, how a package is fetched, checked and installed, what the person sees, updates and
 rollback, and how fonts, drivers, firmware, toolchain layers and the SDK crate registry ride on
@@ -280,7 +281,9 @@ Any failure keeps the previous local catalog and is reported in Curia.
 - Catalog: a public repo `atrium-os/catalog`, served by GitHub Pages. Releases of
   `org.atrium.*` packages: GitHub Releases on `atrium-os/catalog-blobs`. Third-party archives:
   wherever the publisher hosts them; the catalog only holds the URL and the hash.
-- A domain of our own later only adds a URL; nothing is trusted by host name.
+- A domain of our own later only adds a URL; nothing is trusted by host name. The base URLs
+  are a `locations` entry in the log, signed by the catalog key, so a move reaches every
+  machine at its next sync; the old Pages address keeps serving, so nothing is stranded.
 - Mirrors (a LAN cache, a company mirror) are additional base URLs in `opifex.toml`; any
   byte from anywhere is checked by hash.
 
