@@ -1,0 +1,15 @@
+[package]
+name = "mail-compose"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Mail's message writer (docs/spec/mail.md §9): RFC 5322 messages from a draft (encoded words, folded headers, plain and HTML alternatives, attachments), replies and forwards, and mailto: links (RFC 6068). Writes only; parses no untrusted message."
+
+[dependencies]
+mail-schema = { path = "../mail-schema" }
+idna = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+mail-parse = { path = "../mail-parse", default-features = false }

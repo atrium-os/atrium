@@ -2235,12 +2235,11 @@ impl Editor {
         let Some(old) = self.doc.styles.styles.get(id as usize).cloned() else { return false };
         let mut s = old.clone();
         f(&mut s);
-        if s == old {
+        if s == old || !self.doc.style_fits(id, &s) {
             return false;
         }
-        let before = self.doc.styles.styles.get(id as usize).cloned();
         self.apply(label, vec![TextOp::SetStyle { id, style: Some(s) }], Kind::Other);
-        self.doc.styles.styles.get(id as usize).cloned() != before
+        true
     }
 
     /// Paragraph `b`'s own look (what its style doesn't give it) and the
@@ -2280,7 +2279,7 @@ impl Editor {
         merge_para(&mut s.para, &pp);
         merge_chars(&mut s.chars, &ca);
         let shed = self.shed_look_ops(id);
-        if self.doc.styles.styles.get(id as usize) == Some(&s) && shed.is_empty() {
+        if !self.doc.style_fits(id, &s) || (self.doc.styles.styles.get(id as usize) == Some(&s) && shed.is_empty()) {
             return false;
         }
         let mut ops = vec![TextOp::SetStyle { id, style: Some(s) }];
@@ -2300,6 +2299,9 @@ impl Editor {
         let id = self.doc.styles.styles.len() as StyleId;
         let (para, chars) = self.look_here()?;
         let s = officina_text::model::Style { name: name.into(), kind: officina_text::model::StyleKind::Para, parent: Some(self.style_at_caret()), next: Some(id), para, chars };
+        if !self.doc.style_fits(id, &s) {
+            return None;
+        }
         let mut ops = vec![TextOp::SetStyle { id, style: Some(s) }];
         ops.extend(self.shed_look_ops(id));
         self.apply("New Style", ops, Kind::Other);

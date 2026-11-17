@@ -3348,11 +3348,16 @@ Write's Style menu offered five fixed names, so a document's own styles
   *Edit Styles…*, which opens a two-row style bar on the caret
   paragraph's style: its name (Rename), New from Selection, Update to
   Match; size a point at a time, bold, italic, underline, alignment,
-  space above and below. Moving to a paragraph of another style offers
+  space above and below; its font (the document's, IBM Plex Sans or
+  Mono: the pinned set), what it is based on (Normal on nothing) and the
+  style Enter gives after it. Moving to a paragraph of another style offers
   to switch to it. Styles are saved in `.owrite`, `.docx` and `.odt` as
   before.
-- **Not yet**: character styles, based-on and next pickers, a font list,
-  deleting a style, a styles pane with previews.
+- **Refusals leave no trace**: a change the engine would refuse (a loop
+  through parents, a taken name) is checked first (`style_fits`), so it
+  adds no empty undo step and the bar says why.
+- **Not yet**: character styles, deleting a style (its index is in every
+  paragraph), a styles pane with previews, more fonts than the pinned set.
 
 Gates: engine (change, add, remove, every refusal), journal op round
 trip, editor (update to match moves direct format into the style, new

@@ -25,6 +25,8 @@
 //! Read-only (M2): folders are opened with `EXAMINE`, so syncing never
 //! marks anything read.
 
+pub mod submit;
+
 use std::io::{Read, Write};
 
 use mail_proto::imap::{Chunk, Cmd, Code, Decoder, Encoder, FetchItem, FetchWant, Limits, Response, Search, Set, Status, StoreOp};
@@ -373,6 +375,17 @@ impl<S: Read + Write> Session<S> {
             self.texts(&f.name, sink, &mut report)?;
         }
         Ok(report)
+    }
+
+    /// Put a message in `folder` (a sent copy, a draft); its new UID when
+    /// the server says (UIDPLUS).
+    pub fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
+        let cmd = self.enc.append(folder, flags, message);
+        let (_, code) = self.run(cmd)?;
+        Ok(match code {
+            Some(Code::AppendUid { uids, .. }) => uids.parse().ok(),
+            _ => None,
+        })
     }
 
     /// Make the person's due changes on the server, folder by folder. A

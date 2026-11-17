@@ -84,6 +84,13 @@ pub enum Cmd {
     StyleAlign(Align),
     /// Space above (true) or below, a step more or less.
     StyleSpace(bool, bool),
+    /// The style's font: 0 the document's default, else [`STYLE_FONTS`].
+    StyleFont(usize),
+    /// Based on the document's paragraph style at this place in the list
+    /// (past the end: on nothing).
+    StyleBase(usize),
+    /// After it, Enter gives the paragraph style at this place in the list.
+    StyleNext(usize),
     StyleClose,
     List(ListKind),
     PageNumbers,
@@ -311,6 +318,12 @@ pub struct StyleBar {
     pub id: StyleId,
 }
 
+/// The fonts a style can take (the pinned set's families).
+pub const STYLE_FONTS: [&str; 2] = ["IBM Plex Sans", "IBM Plex Mono"];
+
+/// The style bar is three bars high.
+pub const STYLE_H: f32 = FIND_H * 3.0;
+
 /// The header and footer bar is two bars high.
 pub const MARGIN_H: f32 = FIND_H * 2.0;
 
@@ -393,6 +406,9 @@ pub struct Write {
     pub style_bar: Mutable<StyleBar>,
     pub style_name: Mutable<TextEdit>,
     pub style_align_menu: Mutable<MenuState>,
+    pub style_font_menu: Mutable<MenuState>,
+    pub style_base_menu: Mutable<MenuState>,
+    pub style_next_menu: Mutable<MenuState>,
     pub find: Mutable<FindBar>,
     pub find_text: Mutable<TextEdit>,
     pub replace_text: Mutable<TextEdit>,
@@ -421,7 +437,7 @@ pub struct Write {
 
 impl Write {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
-        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
+        let w = Self { doc: Rc::new(RefCell::new(doc)), scroll, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), style_menu: Mutable::new(MenuState::default()), insert_menu: Mutable::new(MenuState::default()), align_menu: Mutable::new(MenuState::default()), style_bar: Mutable::new(StyleBar::default()), style_name: Mutable::new(TextEdit::new("")), style_align_menu: Mutable::new(MenuState::default()), style_font_menu: Mutable::new(MenuState::default()), style_base_menu: Mutable::new(MenuState::default()), style_next_menu: Mutable::new(MenuState::default()), find: Mutable::new(FindBar::default()), find_text: Mutable::new(TextEdit::new("")), replace_text: Mutable::new(TextEdit::new("")), tools_menu: Mutable::new(MenuState::default()), spell: Mutable::new(SpellBar::default()), xref: Mutable::new(XrefBar::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), note: Mutable::new(NoteBar::default()), note_text: Mutable::new(TextEdit::new("")), comment: Mutable::new(CommentBar::default()), comment_text: Mutable::new(TextEdit::new("")), margin: Mutable::new(MarginBar::default()), margin_header: Mutable::new(TextEdit::new("")), margin_footer: Mutable::new(TextEdit::new("")), margin_seg: Mutable::new(0), shape: Mutable::new(ShapeBar::default()), shape_text: Mutable::new(TextEdit::new("")), fill_menu: Mutable::new(MenuState::default()), line_menu: Mutable::new(MenuState::default()), speller: Rc::new(RefCell::new(Speller::new(Dictionary::en_us()))), words_file: Rc::new(RefCell::new(None)) };
         w.attach_checker();
         w
     }
@@ -463,7 +479,7 @@ impl Write {
     /// when one is open.
     pub fn pages_rect(&self, w: f32, h: f32) -> Rect {
         let review = self.doc.borrow().ed.borrow().review;
-        let top = TOOLBAR_H + if self.margin.get_cloned().open || self.shape.get_cloned().open || self.style_bar.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
+        let top = TOOLBAR_H + if self.style_bar.get_cloned().open { STYLE_H } else if self.margin.get_cloned().open || self.shape.get_cloned().open { MARGIN_H } else if review || self.find.get_cloned().open || self.spell.get_cloned().open || self.note.get_cloned().open || self.comment.get_cloned().open || self.xref.get_cloned().open { FIND_H } else { 0.0 };
         Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
     }
 
@@ -654,6 +670,21 @@ impl Write {
                 let now = if above { pf.space_before } else { pf.space_after };
                 let v = if more { (now + 120).min(31_680) } else { (now - 120).max(0) };
                 e.change_style("Style Spacing", id, |s| if above { s.para.space_before = Some(v) } else { s.para.space_after = Some(v) });
+            }
+            Cmd::StyleFont(i) => {
+                let f = i.checked_sub(1).map(|k| std::sync::Arc::<str>::from(STYLE_FONTS[k.min(STYLE_FONTS.len() - 1)]));
+                e.change_style("Style Font", id, |s| s.chars.family = f);
+            }
+            Cmd::StyleBase(i) => {
+                let to = e.para_styles().get(i).map(|s| s.0);
+                if to != e.doc.styles.styles.get(id as usize).and_then(|s| s.parent) && !e.change_style("Based On", id, |s| s.parent = to) {
+                    self.doc.borrow_mut().status = "A style can't be based on itself or on a style based on it".into();
+                }
+            }
+            Cmd::StyleNext(i) => {
+                if let Some((to, _)) = e.para_styles().get(i).cloned() {
+                    e.change_style("Next Style", id, |s| s.next = Some(to));
+                }
             }
             _ => {}
         }
@@ -1239,7 +1270,7 @@ impl Write {
                         self.changed();
                         return true;
                     }
-                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleClose => {
+                    Cmd::StyleOpen | Cmd::StyleNew | Cmd::StyleUpdate | Cmd::StyleRename | Cmd::StyleSize(_) | Cmd::StyleToggle(_) | Cmd::StyleAlign(_) | Cmd::StyleSpace(..) | Cmd::StyleFont(_) | Cmd::StyleBase(_) | Cmd::StyleNext(_) | Cmd::StyleClose => {
                         drop(e);
                         drop(d);
                         self.style_cmd(c);
@@ -1592,7 +1623,7 @@ impl View for Write {
         let yb = self.style_bar.get_cloned();
         if yb.open {
             let y = TOOLBAR_H;
-            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, MARGIN_H), fill: t.bg_surface(), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, STYLE_H), fill: t.bg_surface(), radius: 0.0 });
             let push = |c: Cmd| {
                 let cmds = self.cmds.clone();
                 move || cmds.lock().unwrap().push(c)
@@ -1648,8 +1679,38 @@ impl View for Write {
                     Button::secondary(label).at(x, ry).width(32.0).on_click(push(cmd)).render(ctx);
                     x += 36.0;
                 }
+                // Font, what it is based on, and what follows it.
+                let ry = y + FIND_H * 2.0 + 8.0;
+                let (styles, base, next, family) = {
+                    let e = ed.borrow();
+                    let s = e.doc.styles.styles.get(cur as usize).cloned();
+                    (e.para_styles(), s.as_ref().and_then(|s| s.parent), s.as_ref().and_then(|s| s.next), s.and_then(|s| s.chars.family))
+                };
+                let mut x = 12.0;
+                let lbl = |ctx: &mut Ctx, x: f32, text: &str| ctx.add(Node::Text { rect: Rect::new(x, ry + 6.0, 80.0, 20.0), content: text.into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                lbl(ctx, x, "Font");
+                x += 40.0;
+                let fonts: Vec<MenuItem> = std::iter::once(MenuItem::new("Document's").radio(family.is_none())).chain(STYLE_FONTS.iter().map(|f| MenuItem::new(*f).radio(family.as_deref() == Some(*f)))).collect();
+                let cmds = self.cmds.clone();
+                MenuButton::new(family.as_deref().unwrap_or("Document's").to_string(), self.style_font_menu.clone(), fonts, move |i| cmds.lock().unwrap().push(Cmd::StyleFont(i))).at(x, ry).width(150.0).render(ctx);
+                x += 166.0;
+                let name_of = |id: Option<StyleId>| id.and_then(|i| styles.iter().find(|s| s.0 == i)).map_or("Nothing".to_string(), |s| s.1.to_string());
+                if cur != 0 {
+                    lbl(ctx, x, "Based on");
+                    x += 70.0;
+                    let mut items: Vec<MenuItem> = styles.iter().map(|(i, n)| MenuItem::new(&**n).radio(Some(*i) == base).enabled(*i != cur)).collect();
+                    items.push(MenuItem::new("Nothing").radio(base.is_none()).separated());
+                    let cmds = self.cmds.clone();
+                    MenuButton::new(fit_text(&name_of(base), 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())), self.style_base_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleBase(i))).at(x, ry).width(150.0).render(ctx);
+                    x += 166.0;
+                }
+                lbl(ctx, x, "Next");
+                x += 40.0;
+                let items: Vec<MenuItem> = styles.iter().map(|(i, n)| MenuItem::new(&**n).radio(Some(*i) == next)).collect();
+                let cmds = self.cmds.clone();
+                MenuButton::new(fit_text(&name_of(next.or(Some(cur))), 120.0, &st(type_size::MD, Weight::Regular, t.text_primary())), self.style_next_menu.clone(), items, move |i| cmds.lock().unwrap().push(Cmd::StyleNext(i))).at(x, ry).width(150.0).render(ctx);
             }
-            ctx.add(Node::Rect { rect: Rect::new(0.0, y + MARGIN_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y + STYLE_H - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });
         }
 
         // The shape bar: on the caret's shape, its words and look; with none,
@@ -2017,7 +2078,7 @@ mod tests {
         run(Cmd::Style(n)); // (the menu pushes StyleOpen for the next round)
         assert!(w.style_bar.get_cloned().open);
         assert_eq!(w.style_name.get_cloned().text(), "Normal");
-        assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + MARGIN_H);
+        assert_eq!(w.pages_rect(1200.0, 800.0).origin.y, top + STYLE_H);
         let t = texts();
         for want in ["Style", "Rename", "New from Selection", "Update to Match", "Smaller", "Larger", "Bold", "Left", "Space above 0 pt", "Close"] {
             assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
@@ -2052,6 +2113,36 @@ mod tests {
         w.style_name.set(TextEdit::new("Normal"));
         run(Cmd::StyleRename);
         assert_eq!(&*ed.borrow().doc.styles.styles[id as usize].name, "Opening");
+        // Its font, what it is based on (Heading 1), and Normal after it.
+        let list = ed.borrow().para_styles();
+        let at = |n: &str| list.iter().position(|s| &*s.1 == n).unwrap();
+        run(Cmd::StyleFont(2));
+        run(Cmd::StyleBase(at("Heading 1")));
+        run(Cmd::StyleNext(at("Normal")));
+        {
+            let s = ed.borrow().doc.styles.styles[id as usize].clone();
+            assert_eq!((s.chars.family.as_deref(), s.parent, s.next), (Some("IBM Plex Mono"), Some(list[at("Heading 1")].0), Some(0)));
+        }
+        let t = texts();
+        for want in ["Font", "Based on", "Next", "IBM Plex Mono", "Heading 1"] {
+            assert!(t.iter().any(|s| s == want), "{want} missing from {t:?}");
+        }
+        // Heading 1 can't then be based on it (a loop): refused.
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 0), false);
+        ed.borrow_mut().style_named("Heading 1");
+        run(Cmd::StyleOpen);
+        let h1 = ed.borrow().style_at_caret();
+        run(Cmd::StyleBase(at("Opening")));
+        assert_ne!(ed.borrow().doc.styles.styles[h1 as usize].parent, Some(id));
+        assert!(w.doc.borrow().status.contains("based on itself"), "{}", w.doc.borrow().status);
+        // The refusal left no empty undo step: one undo takes Heading 1 off.
+        run(Cmd::Undo);
+        assert_ne!(ed.borrow().doc.para(0).unwrap().style, h1);
+        let on = ed.borrow().doc.blocks.iter().position(|b| b.as_para().unwrap().style == id).unwrap();
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(on, 0), false);
+        run(Cmd::StyleOpen);
+        run(Cmd::StyleFont(0));
+        assert_eq!(ed.borrow().doc.styles.styles[id as usize].chars.family, None);
         // On a paragraph of another style the bar offers to switch.
         ed.borrow_mut().set_caret(pergola_richtext::Pos::new(1, 0), false);
         assert!(texts().iter().any(|s| s.starts_with("Edit “Normal")), "{:?}", texts());
