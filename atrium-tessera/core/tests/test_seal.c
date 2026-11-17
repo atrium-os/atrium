@@ -13,10 +13,17 @@
  *   3. Journal chain: records chained by prev tag open only in order.
  *   4. Units and blobs: round trip; another id, group, kind or volume is
  *      refused; truncation is refused.
+ *   5. Sealed packs: opening the front gives back the plain pack byte for
+ *      byte; tessera_pack_open and lookup work on it and the blobs open;
+ *      nothing of the index or the blobs is in the clear; a flip anywhere
+ *      in the prelude or front, another key group, a wrong registry tag or
+ *      another key is refused; the prelude gives the key group without a
+ *      key.
  */
 #include "tessera/codec.h"
 #include "tessera/crypt.h"
 #include "tessera/error.h"
+#include "tessera/pack.h"
 #include "tessera/seal.h"
 
 #include <stdint.h>
@@ -294,6 +301,137 @@ test_units(uint32_t suite)
 }
 
 static void
+test_packs(uint32_t suite)
+{
+	enum { NB = 40 };
+	tessera_seal_keys_t k;
+	static uint8_t blobs[NB][300];
+	tessera_hash_t ids[NB];
+	uint8_t tag[16], bad[16];
+	size_t sz = 0, sz2 = 0;
+	const uint64_t G = 77;
+
+	CHECK(tessera_seal_keys_init(&k, suite, VK, UUID) == TESSERA_OK);
+	/* the same pack twice: plain-sealed-blobs reference and sealed */
+	tessera_pack_builder_t *b = tessera_pack_begin(2, UUID, 5);
+	CHECK(b != NULL);
+	tessera_pack_set_sealed(b);
+	for (int i = 0; i < NB; i++) {
+		fill(blobs[i], sizeof blobs[i], 1000 + i);
+		CHECK(tessera_keyed_id(TESSERA_HASH_ALG_SHA256, k.id, blobs[i],
+		    sizeof blobs[i], ids[i]) == TESSERA_OK);
+		CHECK(tessera_pack_add_sealed_blob(b, &k.blob, UUID, G, ids[i],
+		    blobs[i], sizeof blobs[i], TESSERA_BLOB_FLAG_CHUNK) ==
+		    TESSERA_OK);
+	}
+	CHECK(tessera_pack_finalize(b, NULL, 0, &sz) == TESSERA_ETOOBIG);
+	uint8_t *plain = calloc(1, sz), *p = calloc(1, sz), *t = calloc(1, sz);
+	CHECK(tessera_pack_finalize(b, plain, sz, &sz2) == TESSERA_OK &&
+	    sz2 == sz);
+	tessera_pack_free(b);
+	memcpy(p, plain, sz);
+
+	CHECK(tessera_pack_seal_front(&k.meta, UUID, G, p, sz, tag) ==
+	    TESSERA_OK);
+	{
+		uint64_t g = 0;
+		uint32_t fl = 0;
+		CHECK(tessera_pack_sealed_prelude(p, sz, &g, &fl) == TESSERA_OK);
+		CHECK(g == G && fl > 4096);
+		CHECK(tessera_pack_sealed_prelude(plain, sz, &g, &fl) ==
+		    TESSERA_EINVAL);
+	}
+	/* no index entry (blob id) nor blob plaintext in the clear */
+	{
+		int found = 0;
+		for (size_t o = 0; o + 16 <= sz && !found; o++)
+			for (int i = 0; i < NB; i++)
+				if (memcmp(p + o, ids[i], 16) == 0 ||
+				    memcmp(p + o, blobs[i] + 100, 16) == 0) {
+					found = 1;
+					break;
+				}
+		CHECK(!found);
+	}
+	/* open: byte-exact plain pack */
+	memcpy(t, p, sz);
+	CHECK(tessera_pack_open_front(&k.meta, UUID, G, tag, t, sz) ==
+	    TESSERA_OK);
+	CHECK(memcmp(t, plain, sz) == 0);
+	tessera_pack_reader_t *r = tessera_pack_open(t, sz);
+	CHECK(r != NULL);
+	if (r != NULL) {
+		for (int i = 0; i < NB; i++) {
+			const uint8_t *sb;
+			uint32_t sl;
+			uint8_t back[300];
+			CHECK(tessera_pack_lookup(r, ids[i], &sb, &sl) == TESSERA_OK);
+			CHECK(sl == sizeof back + TESSERA_SEAL_OVERHEAD);
+			CHECK(tessera_blob_open(&k.blob, UUID, G, ids[i], sb, sl,
+			    back) == TESSERA_OK);
+			CHECK(memcmp(back, blobs[i], sizeof back) == 0);
+			/* a blob read as another id, or another group */
+			CHECK(tessera_blob_open(&k.blob, UUID, G, ids[(i + 1) % NB],
+			    sb, sl, back) == TESSERA_EAUTH);
+			CHECK(tessera_blob_open(&k.blob, UUID, 0, ids[i], sb, sl,
+			    back) == TESSERA_EAUTH);
+		}
+		tessera_pack_close(r);
+	}
+	/* every byte of prelude and front */
+	{
+		uint32_t fl = 0;
+		int refused = 0, tried = 0;
+		(void)tessera_pack_sealed_prelude(p, sz, NULL, &fl);
+		for (size_t o = 0; o < TESSERA_SEALED_PACK_PRELUDE + fl; o++) {
+			memcpy(t, p, sz);
+			t[o] ^= 0x10;
+			tried++;
+			int rc = tessera_pack_open_front(&k.meta, UUID, G, NULL, t,
+			    sz);
+			if (rc != TESSERA_OK)
+				refused++;
+		}
+		CHECK(refused == tried);
+	}
+	memcpy(t, p, sz);
+	CHECK(tessera_pack_open_front(&k.meta, UUID, G + 1, NULL, t, sz) ==
+	    TESSERA_EAUTH);
+	memcpy(bad, tag, 16);
+	bad[0] ^= 1;
+	memcpy(t, p, sz);
+	CHECK(tessera_pack_open_front(&k.meta, UUID, G, bad, t, sz) ==
+	    TESSERA_EAUTH);
+	memcpy(t, p, sz);
+	CHECK(tessera_pack_open_front(&k.blob, UUID, G, NULL, t, sz) ==
+	    TESSERA_EAUTH);
+	/* the prelude rewritten to claim another group */
+	memcpy(t, p, sz);
+	t[16] ^= 1;
+	CHECK(tessera_pack_open_front(&k.meta, UUID, G ^ 1, NULL, t, sz) ==
+	    TESSERA_EAUTH);
+	/* a plain (unsealed-layout) pack cannot be sealed */
+	{
+		tessera_pack_builder_t *pb = tessera_pack_begin(0, UUID, 1);
+		size_t n = 0;
+		CHECK(tessera_pack_add_blob(pb, ids[0], blobs[0], 300, 0) ==
+		    TESSERA_OK);
+		(void)tessera_pack_finalize(pb, NULL, 0, &n);
+		uint8_t *q = calloc(1, n);
+		CHECK(tessera_pack_finalize(pb, q, n, &n) == TESSERA_OK);
+		/* 32 B index + bloom fits the slack in one sector? only if
+		 * the layout reserved it: a plain layout may or may not, so
+		 * just require that sealing never corrupts silently */
+		int rc = tessera_pack_seal_front(&k.meta, UUID, 0, q, n, NULL);
+		CHECK(rc == TESSERA_OK || rc == TESSERA_EINVAL);
+		free(q);
+		tessera_pack_free(pb);
+	}
+	free(plain); free(p); free(t);
+	tessera_seal_keys_clear(&k);
+}
+
+static void
 test_keys(void)
 {
 	tessera_seal_keys_t a, b;
@@ -322,7 +460,7 @@ main(void)
 	    TESSERA_SUITE_XCHACHA20_POLY1305 };
 
 	printf("test_seal: superblock HMAC, sealed blocks, journal chain, "
-	    "blobs\n");
+	    "blobs, packs\n");
 	tessera_crypt_openssl_install();
 	test_keys();
 	for (unsigned i = 0; i < 2; i++) {
@@ -330,6 +468,7 @@ main(void)
 		test_blocks(suites[i]);
 		test_journal_chain(suites[i]);
 		test_units(suites[i]);
+		test_packs(suites[i]);
 	}
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);

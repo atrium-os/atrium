@@ -130,6 +130,32 @@ int tessera_blob_open(const tessera_aead_key_t *key,
         const tessera_hash_t id, const uint8_t *in, size_t in_len,
         uint8_t *pt);
 
+/* ── sealed packs (§5.5, tessera/pack.h) ───────────────────────────── */
+
+/* Seal the front matter of a finished pack (built with
+ * tessera_pack_set_sealed, len bytes) in place, under `key` (K_meta, or a
+ * group's K_gmeta) and `key_group`. tag_out (may be NULL) is what the
+ * pack-registry entry records. */
+int tessera_pack_seal_front(const tessera_aead_key_t *key,
+        const uint8_t volume_uuid[16], uint64_t key_group, uint8_t *pack,
+        size_t len, uint8_t tag_out[16]);
+
+/* Open a sealed pack's front in place, leaving the plain pack. When
+ * expected_tag (the registry's record) is non-NULL the front's tag must
+ * equal it. `key_group` must match the prelude's. TESSERA_EAUTH on any
+ * failure, with the front region zeroed. */
+int tessera_pack_open_front(const tessera_aead_key_t *key,
+        const uint8_t volume_uuid[16], uint64_t key_group,
+        const uint8_t expected_tag[16], uint8_t *pack, size_t len);
+
+/* Add a blob sealed for this pack: AAD binds the content id and the key
+ * group. `key` is K_blob or the group's K_gblob. */
+struct tessera_pack_builder;
+int tessera_pack_add_sealed_blob(struct tessera_pack_builder *b,
+        const tessera_aead_key_t *key, const uint8_t volume_uuid[16],
+        uint64_t key_group, const tessera_hash_t id, const uint8_t *bytes,
+        uint32_t len, uint32_t flags);
+
 #ifdef __cplusplus
 }
 #endif

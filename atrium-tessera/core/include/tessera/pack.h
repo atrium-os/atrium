@@ -39,6 +39,38 @@ int tessera_pack_finalize(tessera_pack_builder_t *,
 
 void tessera_pack_free(tessera_pack_builder_t *);
 
+/* ── Sealed packs (docs/spec/tessera-encryption.md §5.5) ────────────
+ *
+ * A sealed pack is a plain pack whose blobs are sealed units (nonce | ct |
+ * tag, AAD = volume uuid | kind | key group | content id) and whose front
+ * matter (header, index, bloom) is one sealed unit, stored after a 64-byte
+ * plaintext prelude:
+ *
+ *   [0, 64)          prelude: "TPACKSL1", version, front_len, key_group,
+ *                    zeros; all of it in the front's AAD
+ *   [64, 64+front)   nonce[24] | sealed header+index+bloom | tag[16]
+ *   [.., data_off)   zero
+ *   data_off ..      as a plain pack (sealed blobs), then the footer
+ *
+ * Opening the front in place gives back the plain pack byte for byte, so
+ * tessera_pack_open and the kernel's partial reads work on it unchanged;
+ * the blobs they return are still sealed (tessera_blob_open). The prelude
+ * alone (no key) tells GC and crypto-erase the pack's key group.
+ */
+#define TESSERA_MAGIC_PACK_SEALED   "TPACKSL1"
+#define TESSERA_SEALED_PACK_PRELUDE 64u
+#define TESSERA_SEALED_PACK_SLACK   (TESSERA_SEALED_PACK_PRELUDE + 40u)
+
+/* Lay the pack out with room for the prelude, nonce and tag in front of
+ * the data area. Call before tessera_pack_finalize. */
+void tessera_pack_set_sealed(tessera_pack_builder_t *);
+
+/* Prelude only, no key: TESSERA_OK and the key group and front length, or
+ * TESSERA_EINVAL when sector0 is not a sealed pack. */
+int tessera_pack_sealed_prelude(const uint8_t *sector0, size_t len,
+                                uint64_t *out_key_group,
+                                uint32_t *out_front_len);
+
 /* ── Pack reader ─────────────────────────────────────────────────── */
 
 typedef struct tessera_pack_reader tessera_pack_reader_t;

@@ -108,7 +108,33 @@ struct tessera_pack_builder {
 	struct staging_blob  *blobs;
 	size_t                count;
 	size_t                cap;
+	int                   sealed;   /* leave room to seal the front */
 };
+
+void
+tessera_pack_set_sealed(tessera_pack_builder_t *b)
+{
+	if (b != NULL) b->sealed = 1;
+}
+
+int
+tessera_pack_sealed_prelude(const uint8_t *s0, size_t len,
+                            uint64_t *out_key_group, uint32_t *out_front_len)
+{
+	uint32_t ver, fl;
+	uint64_t g;
+	if (s0 == NULL || len < TESSERA_SEALED_PACK_PRELUDE ||
+	    memcmp(s0, TESSERA_MAGIC_PACK_SEALED, 8) != 0)
+		return TESSERA_EINVAL;
+	memcpy(&ver, s0 + 8, 4);
+	memcpy(&fl, s0 + 12, 4);
+	memcpy(&g, s0 + 16, 8);
+	if (ver != 1 || fl < 40u + TESSERA_SECTOR_SIZE)
+		return TESSERA_EINVAL;
+	if (out_key_group) *out_key_group = g;
+	if (out_front_len) *out_front_len = fl;
+	return TESSERA_OK;
+}
 
 tessera_pack_builder_t *
 tessera_pack_begin(uint32_t pack_kind, const uint8_t pack_id[16],
@@ -210,7 +236,12 @@ tessera_pack_finalize(tessera_pack_builder_t *b,
 	const size_t header_off = 0;
 	const size_t index_off  = TESSERA_SECTOR_SIZE;
 	const size_t bloom_off  = index_off + index_size_pad;
-	const size_t data_off   = bloom_off + bloom_size_pad;
+	/* A pack to be sealed (tessera_pack_seal_front) needs the prelude,
+	 * nonce and tag in front of its data area as well. */
+	const size_t data_off   = b->sealed
+	    ? round_up(bloom_off + bloom_bytes + TESSERA_SEALED_PACK_SLACK,
+	        TESSERA_SECTOR_SIZE)
+	    : bloom_off + bloom_size_pad;
 	const size_t footer_off = data_off + data_size_pad;
 	const size_t total      = footer_off + TESSERA_SECTOR_SIZE;
 

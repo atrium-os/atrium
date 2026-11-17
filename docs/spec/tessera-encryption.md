@@ -364,7 +364,13 @@ and 16-byte tag at the end of the block.
   `K_gmeta` for a group's pack, under `K_meta` for other packs on a sealed volume. Its
   plaintext prelude is a magic, the key group, the unit's length and the nonce. On a
   sealed volume the pack-registry entry (sealed under `K_meta`) records the front
-  matter's tag, and so the registry's value grows to 80 bytes there.
+  matter's tag, and so the registry's value grows to 80 bytes there. On disk: the
+  64-byte prelude (`TPACKSL1`, version, front length, key group, zeros), then the
+  sealed front (nonce, header, index and bloom, tag), with the whole prelude in its AAD;
+  the data area and footer follow as in a plain pack. Opening the front in place gives
+  back the plain pack byte for byte, so the pack reader and the kernel's partial reads
+  work on it unchanged (core/src/seal.c `tessera_pack_seal_front`,
+  `tessera_pack_open_front`; tests/test_seal.c).
 - **Each blob** is a sealed unit under `K_gblob` or `K_blob`, with AAD = volume uuid |
   kind | key group | content id. So a blob cannot be swapped for another in the same
   pack, nor moved to another group.

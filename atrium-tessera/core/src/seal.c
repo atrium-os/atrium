@@ -5,6 +5,7 @@
 #include "tessera_compat.h"
 
 #include "tessera/error.h"
+#include "tessera/pack.h"
 #include "tessera/seal.h"
 
 static inline void
@@ -321,4 +322,116 @@ tessera_blob_open(const tessera_aead_key_t *key, const uint8_t volume_uuid[16],
 {
 	return (tessera_unit_open(key, volume_uuid, TESSERA_SEAL_KIND_BLOB,
 	    key_group, id, TESSERA_HASH_SIZE, in, in_len, NULL, pt));
+}
+
+/* ── sealed packs ──────────────────────────────────────────────────── */
+
+#define PRE  TESSERA_SEALED_PACK_PRELUDE
+
+/* The plain front of a finished pack: [0, F) holds header, index and bloom,
+ * and the data area starts far enough behind to hold the sealed form. */
+static int
+pack_front_len(const uint8_t *pack, size_t len, size_t *out_f)
+{
+	tessera_pack_geom_t g;
+	int err = tessera_pack_geom_from_header(pack, len, &g);
+	if (err != TESSERA_OK)
+		return (err);
+	size_t f = (size_t)(g.bloom_off + g.bloom_bytes);
+	if (f < TESSERA_SECTOR_SIZE || f + TESSERA_SEALED_PACK_SLACK > g.data_off ||
+	    f > (uint32_t)-1 - TESSERA_SEAL_OVERHEAD)
+		return (TESSERA_ECORRUPT);
+	*out_f = f;
+	return (TESSERA_OK);
+}
+
+int
+tessera_pack_seal_front(const tessera_aead_key_t *key,
+    const uint8_t volume_uuid[16], uint64_t key_group, uint8_t *pack,
+    size_t len, uint8_t tag_out[16])
+{
+	size_t f;
+	uint32_t ver = 1, fl;
+	int err;
+
+	if (key == NULL || volume_uuid == NULL || pack == NULL)
+		return (TESSERA_EINVAL);
+	if ((err = pack_front_len(pack, len, &f)) != TESSERA_OK)
+		return (err == TESSERA_ECORRUPT ? TESSERA_EINVAL : err);
+	fl = (uint32_t)(f + TESSERA_SEAL_OVERHEAD);
+	memmove(pack + PRE + TESSERA_NONCE_SIZE, pack, f);
+	/* The whole prelude is the AAD tail, so every byte of it is bound. */
+	memset(pack, 0, PRE);
+	memcpy(pack, TESSERA_MAGIC_PACK_SEALED, 8);
+	memcpy(pack + 8, &ver, 4);
+	memcpy(pack + 12, &fl, 4);
+	memcpy(pack + 16, &key_group, 8);
+	err = tessera_unit_seal(key, volume_uuid, TESSERA_SEAL_KIND_PACK_FRONT,
+	    key_group, pack, PRE, pack + PRE + TESSERA_NONCE_SIZE, f,
+	    pack + PRE, tag_out);
+	if (err != TESSERA_OK)
+		tessera_wipe(pack, PRE + fl);
+	return (err);
+}
+
+int
+tessera_pack_open_front(const tessera_aead_key_t *key,
+    const uint8_t volume_uuid[16], uint64_t key_group,
+    const uint8_t expected_tag[16], uint8_t *pack, size_t len)
+{
+	uint64_t g;
+	uint32_t fl;
+	size_t f, f2;
+	int err;
+
+	if (key == NULL || volume_uuid == NULL || pack == NULL)
+		return (TESSERA_EINVAL);
+	if (tessera_pack_sealed_prelude(pack, len, &g, &fl) != TESSERA_OK ||
+	    (size_t)PRE + fl > len)
+		return (TESSERA_EAUTH);
+	if (g != key_group)
+		return (TESSERA_EAUTH);
+	f = fl - TESSERA_SEAL_OVERHEAD;
+	uint8_t pre[PRE];
+	memcpy(pre, pack, PRE);
+	err = tessera_unit_open(key, volume_uuid, TESSERA_SEAL_KIND_PACK_FRONT,
+	    key_group, pre, PRE, pack + PRE, fl, expected_tag,
+	    pack + PRE + TESSERA_NONCE_SIZE);
+	if (err != TESSERA_OK) {
+		tessera_wipe(pack, PRE + fl);
+		return (err == TESSERA_EINVAL ? TESSERA_EAUTH : err);
+	}
+	memmove(pack, pack + PRE + TESSERA_NONCE_SIZE, f);
+	memset(pack + f, 0, PRE + fl - f);
+	/* Authentic, so written by us: still insist the plain front is the
+	 * canonical one, so the plain view is exactly the pack that was
+	 * sealed. */
+	if (pack_front_len(pack, len, &f2) != TESSERA_OK || f2 != f) {
+		tessera_wipe(pack, f);
+		return (TESSERA_ECORRUPT);
+	}
+	return (TESSERA_OK);
+}
+
+int
+tessera_pack_add_sealed_blob(struct tessera_pack_builder *b,
+    const tessera_aead_key_t *key, const uint8_t volume_uuid[16],
+    uint64_t key_group, const tessera_hash_t id, const uint8_t *bytes,
+    uint32_t len, uint32_t flags)
+{
+	uint8_t *s;
+	int err;
+
+	if (b == NULL || key == NULL || id == NULL ||
+	    len > (uint32_t)-1 - TESSERA_SEAL_OVERHEAD)
+		return (TESSERA_EINVAL);
+	s = tessera_malloc((size_t)len + TESSERA_SEAL_OVERHEAD);
+	if (s == NULL)
+		return (TESSERA_ENOMEM);
+	err = tessera_blob_seal(key, volume_uuid, key_group, id, bytes, len, s);
+	if (err == TESSERA_OK)
+		err = tessera_pack_add_blob(b, id, s, len + TESSERA_SEAL_OVERHEAD,
+		    flags);
+	tessera_free(s);
+	return (err);
 }
