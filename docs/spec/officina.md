@@ -3395,6 +3395,20 @@ Pergola's `GridView` does the picking for any float marked `movable`
 (`GridAction::PlaceFloat`, `GridAction::DeleteFloat`); tables' and
 filters' floats stay fixed.
 
+### 16.54 Choosing filter values from a list in Sheets (2026-11-17)
+
+Data ▸ Choose Values in Column … (the cursor anywhere in a filter
+column, its header too) opens the column's value list at the window's
+right, over the grid: each distinct shown text once (sorted, "(Empty)"
+for empty cells) with how many rows show it, ticked when the filter
+keeps it now. A search field narrows the list; Select All and Clear act
+on the values the search shows. Apply makes the ticked values the
+column's condition, one undo step ("Filter"); ticking every value drops
+the column's condition, ticking none is refused in words. Cancel leaves
+the filter as it was. The list draws only the rows in view (Pergola
+`VirtualList`) and offers at most 10,000 values; a column with more
+says so and points to Show Only and Hide.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
