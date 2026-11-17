@@ -79,7 +79,7 @@ fn main() {
                 ui.folder,
                 ui.count,
                 ui.cursor,
-                ui.reading.as_ref().map(|r| format!("{:?} text={}", r.subject, r.text.len())).unwrap_or("-".into()),
+                ui.reading.as_ref().map(|r| format!("{:?} msgs={} open={}", r.subject, r.msgs.len(), r.msgs.iter().filter(|m| m.open).count())).unwrap_or("-".into()),
             );
             if t != last {
                 eprintln!("atrium-mail: {t}");

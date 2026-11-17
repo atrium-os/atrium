@@ -62,3 +62,89 @@ fn a_blob_that_changed_on_disk_is_refused() {
     std::fs::write(d.path().join("blobs").join(&hex[..2]).join(&hex[2..]), b"evil").unwrap();
     assert!(s.blob(&h).is_err());
 }
+
+fn mail(s: &Store, subject: &str, date: i64, mid: &str, refs: &[&str], from: &str) -> Incoming {
+    let blob = s.put_blob(format!("Message-ID: <{mid}>\r\nSubject: {subject}\r\n\r\nbody").as_bytes()).unwrap();
+    let summary = Summary {
+        subject: subject.into(),
+        date: Some(date),
+        message_id: Some(mid.into()),
+        references: refs.iter().map(|r| r.to_string()).collect(),
+        from: vec![Address { name: from.into(), addr: format!("{}@example.org", from.to_lowercase()), name_looks_like_address: false }],
+        preview: format!("{from} says {subject}"),
+        ..Default::default()
+    };
+    Incoming { server_id: None, size: 100, internal_date: None, flags: 0, blob, full: true, summary }
+}
+
+#[test]
+fn conversations_join_by_references_and_subject() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path()).unwrap();
+    let a = s.add_account("priya@example.org").unwrap();
+    let inbox = s.folder_id(a, "INBOX", Role::Inbox).unwrap();
+    let sent = s.folder_id(a, "Sent", Role::Sent).unwrap();
+    const DAY: i64 = 86_400;
+    s.write(|w| {
+        // A reply arrives before what it answers.
+        w.put(inbox, a, 2, mail(&s, "Re: Q4 numbers", 2 * DAY, "b@x", &["a@x"], "Arun"))?;
+        w.put(inbox, a, 1, mail(&s, "Q4 numbers", DAY, "a@x", &[], "Lena"))?;
+        // Priya's own reply is in Sent.
+        w.put(sent, a, 1, mail(&s, "Re: Q4 numbers", 3 * DAY, "c@x", &["a@x", "b@x"], "Priya"))?;
+        // A reply with its references stripped finds it by subject...
+        w.put(inbox, a, 3, mail(&s, "RE: q4  NUMBERS", 4 * DAY, "d@x", &[], "Sam"))?;
+        // ...but not three weeks on, and not without a Re: prefix.
+        w.put(inbox, a, 4, mail(&s, "Re: Q4 numbers", 30 * DAY, "e@x", &[], "Sam"))?;
+        w.put(inbox, a, 5, mail(&s, "Lunch", 5 * DAY, "f@x", &[], "Lena"))?;
+        w.put(inbox, a, 6, mail(&s, "Lunch", 6 * DAY, "g@x", &[], "Arun"))?;
+        Ok(())
+    }).unwrap();
+    let c = s.conversations(inbox, 0, 10).unwrap();
+    let rows: Vec<(&str, usize)> = c.iter().map(|c| (c.subject.as_str(), c.count)).collect();
+    assert_eq!(rows, [("Re: Q4 numbers", 1), ("Lunch", 1), ("Lunch", 1), ("Q4 numbers", 4)]);
+    let q4 = &c[3];
+    assert_eq!(q4.people, ["Lena", "Arun", "Priya", "Sam"]);
+    assert_eq!(q4.date, 4 * DAY);
+    assert_eq!(q4.preview, "Sam says RE: q4  NUMBERS");
+    assert!(q4.unread);
+    // Listed in Sent too, with the whole thread.
+    assert_eq!(s.conversation_count(sent).unwrap(), 1);
+    let t = s.thread(q4.thread).unwrap();
+    assert_eq!(t.iter().map(|m| m.message.summary.message_id.clone().unwrap()).collect::<Vec<_>>(), ["a@x", "b@x", "c@x", "d@x"]);
+    // Views: conversations in the inbox, messages in Sent, then a choice.
+    assert!(s.view(inbox).unwrap());
+    assert!(!s.view(sent).unwrap());
+    s.write(|w| w.set_view(sent, true)).unwrap();
+    assert!(s.view(sent).unwrap());
+    // Read on one copy: the conversation is read once all are.
+    s.write(|w| { for u in [1, 2, 3] { w.set_flags(inbox, u, flag::SEEN)?; } w.set_flags(sent, 1, flag::SEEN).map(|_| ()) }).unwrap();
+    assert!(!s.conversations(inbox, 3, 1).unwrap()[0].unread);
+    // The newest goes: the thread moves back under its next newest; when
+    // the last of it leaves the inbox it leaves the inbox's list.
+    s.write(|w| w.remove(inbox, 3)).unwrap();
+    let c = s.conversations(inbox, 0, 10).unwrap();
+    assert_eq!(c.last().map(|c| (c.date, c.count)), Some((3 * DAY, 3)));
+    s.write(|w| { w.remove(inbox, 1)?; w.remove(inbox, 2) }).unwrap();
+    assert_eq!(s.conversation_count(inbox).unwrap(), 3);
+    assert_eq!(s.conversation_count(sent).unwrap(), 1);
+    s.write(|w| w.remove(sent, 1)).unwrap();
+    assert_eq!(s.conversation_count(sent).unwrap(), 0);
+}
+
+#[test]
+fn two_threads_that_meet_are_one() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(d.path()).unwrap();
+    let a = s.add_account("priya@example.org").unwrap();
+    let inbox = s.folder_id(a, "INBOX", Role::Inbox).unwrap();
+    s.write(|w| {
+        w.put(inbox, a, 1, mail(&s, "Plan", 100, "a@x", &[], "Lena"))?;
+        w.put(inbox, a, 2, mail(&s, "Other plan", 200, "z@x", &[], "Sam"))?;
+        // Refers to both.
+        w.put(inbox, a, 3, mail(&s, "Re: Plan", 300, "m@x", &["a@x", "z@x"], "Arun"))?;
+        Ok(())
+    }).unwrap();
+    let c = s.conversations(inbox, 0, 10).unwrap();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].count, 3);
+}

@@ -22,6 +22,13 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod thread;
+pub use thread::{base_subject, Conversation, InThread, ThreadId, SUBJECT_WINDOW};
+
+/// The index's layout; an index of another layout is rebuilt from the blobs
+/// by sync (the store refuses to open it).
+const SCHEMA: u64 = 2;
+
 pub type AccountId = u32;
 pub type FolderId = u32;
 pub type MsgId = u64;
@@ -156,6 +163,8 @@ pub struct Message {
     pub full: Option<Hash>,
     pub summary: Summary,
     pub locations: Vec<(FolderId, u32)>,
+    /// Its conversation (§11.1).
+    pub thread: ThreadId,
 }
 
 /// One row of a folder's list.
@@ -197,6 +206,21 @@ impl Store {
             tx.open_table(LOCATIONS)?;
             tx.open_table(LIST)?;
             tx.open_table(SERVER_IDS)?;
+            tx.open_table(thread::THREADS)?;
+            tx.open_table(thread::MSGID_THREADS)?;
+            tx.open_table(thread::SUBJECT_THREADS)?;
+            tx.open_table(thread::CONVERSATIONS)?;
+            tx.open_table(thread::VIEWS)?;
+            let mut meta = tx.open_table(META)?;
+            let schema = meta.get("schema")?.map(|v| v.value());
+            let empty = meta.get("message")?.is_none() && meta.get("account")?.is_none();
+            match schema {
+                Some(SCHEMA) => {}
+                None if empty => {
+                    meta.insert("schema", SCHEMA)?;
+                }
+                _ => return Err(Error::Corrupt("index of an older layout")),
+            }
         }
         tx.commit()?;
         Ok(Store { db, blobs: dir.join("blobs") })
@@ -447,6 +471,7 @@ impl Writer<'_> {
                     full: m.full.then_some(m.blob),
                     summary: m.summary,
                     locations: vec![(folder, uid)],
+                    thread: 0,
                 };
                 self.put_msg(id, &msg)?;
                 if let Some(s) = &m.server_id {
@@ -455,9 +480,14 @@ impl Writer<'_> {
                 id
             }
         };
-        let date = self.get_msg(id)?.map(|x| x.date).unwrap_or(date);
+        let cur = self.get_msg(id)?.ok_or(Error::NotFound)?;
         self.tx.open_table(LOCATIONS)?.insert((folder, uid), (id, m.flags))?;
-        self.tx.open_table(LIST)?.insert((folder, date_key(date), id), uid)?;
+        self.tx.open_table(LIST)?.insert((folder, date_key(cur.date), id), uid)?;
+        if cur.thread == 0 {
+            self.thread_new(id)?;
+        } else {
+            self.thread_refresh(cur.thread)?;
+        }
         Ok(id)
     }
 
@@ -483,7 +513,7 @@ impl Writer<'_> {
         } else {
             self.put_msg(id, &m)?;
         }
-        Ok(())
+        self.thread_refresh(m.thread)
     }
 
     /// UIDVALIDITY changed: everything the folder listed is void.

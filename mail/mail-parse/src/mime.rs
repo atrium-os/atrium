@@ -163,6 +163,9 @@ impl Walk<'_> {
                 s.truncated = true;
             }
             if kind == PartKind::Text {
+                if ct.get("format").is_some_and(|f| f.eq_ignore_ascii_case("flowed")) {
+                    text = unflow(&text, ct.get("delsp").is_some_and(|d| d.eq_ignore_ascii_case("yes")));
+                }
                 s.text = Some(text);
             } else {
                 s.html = Some(text);
@@ -389,4 +392,56 @@ fn html_text(h: &str, cap: usize) -> String {
         }
     }
     out
+}
+
+/// RFC 3676 `format=flowed`: a line ending in a space continues on the next
+/// line of the same quote depth (with `delsp=yes` that space goes too);
+/// space-stuffing is removed; the signature separator `-- ` stays a line.
+/// Quote markers are normalised to `> ` per level.
+pub fn unflow(text: &str, delsp: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut open: Option<usize> = None; // depth of a paragraph still flowing
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let depth = line.chars().take_while(|&c| c == '>').count();
+        let mut body = &line[depth..];
+        if body.starts_with(' ') {
+            body = &body[1..]; // space-stuffing (or the space after the quote marks)
+        }
+        let flowed = body.ends_with(' ') && body != "-- ";
+        if open != Some(depth) {
+            if open.is_some() {
+                out.push('\n');
+            }
+            for _ in 0..depth {
+                out.push_str("> ");
+            }
+        }
+        let piece = if flowed && delsp { &body[..body.len() - 1] } else { body };
+        out.push_str(piece);
+        if flowed {
+            open = Some(depth);
+        } else {
+            out.push('\n');
+            open = None;
+        }
+    }
+    if out.ends_with('\n') && !text.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(test)]
+mod flowed_tests {
+    use super::unflow;
+
+    #[test]
+    fn flowed() {
+        let t = "Here is a long \r\nparagraph that flows.\r\n\r\n> quoted \r\n> on.\r\n>> deeper\r\n From the start\r\n-- \r\nPriya";
+        assert_eq!(unflow(t, false), "Here is a long paragraph that flows.\n\n> quoted on.\n> > deeper\nFrom the start\n-- \nPriya");
+        assert_eq!(unflow("Zusammen \r\ngeschrieben", true), "Zusammengeschrieben");
+        // A flowing line at a different depth ends the paragraph.
+        assert_eq!(unflow("a \r\n> b", false), "a \n> b");
+    }
 }

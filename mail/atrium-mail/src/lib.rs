@@ -7,6 +7,8 @@
 //! in its own parse jail through the engine (§7.1) and never in this
 //! process.
 
+pub mod plain;
+pub mod sender;
 pub mod view;
 
 pub use view::{MailView, Ui};
@@ -48,12 +50,6 @@ fn civil(t: i64) -> (i64, u32, u32, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32)
-}
-
-/// How a sender is named in the list: the display name, else the address.
-pub fn who(a: &mail_schema::Address) -> String {
-    let n = a.name.trim();
-    if n.is_empty() || a.name_looks_like_address { a.addr.clone() } else { n.to_string() }
 }
 
 /// A folder's name as the places show it: the role's word for the

@@ -37,6 +37,10 @@ fn texts(app: &App<MailView>) -> Vec<String> {
     app.tree().iter().filter_map(|(_, n)| match n { Node::Text { content, .. } => Some(content.clone()), _ => None }).collect()
 }
 
+fn note(r: &atrium_mail::view::Shown) -> String {
+    r.msgs[0].body.as_ref().and_then(|b| b.note.clone()).unwrap_or_default()
+}
+
 fn key(chars: &str) -> Event {
     Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers::default(), chars: chars.into() }
 }
@@ -99,8 +103,10 @@ fn list_and_read() {
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.cursor, Some(3));
     let r = ui.reading.clone().unwrap();
-    assert_eq!((r.subject.as_str(), r.from.as_str(), r.to.as_str()), ("Q4 numbers", "Arun", "Priya"));
-    assert!(r.note.is_none());
+    let m = &r.msgs[0];
+    assert_eq!((r.subject.as_str(), m.sender.name.as_str(), m.to.as_str()), ("Q4 numbers", "Arun", "Priya"));
+    assert_eq!(m.sender.detail, "arun@acme.example", "unsigned: the whole address, not a domain");
+    assert!(m.body.as_ref().unwrap().note.is_none());
     let t = texts(&app);
     let body: Vec<&String> = t.iter().filter(|x| x.starts_with("Here are the Q4") || x.contains("regional split")).collect();
     assert!(body.len() > 2, "the text should wrap over several lines: {t:?}");
@@ -115,11 +121,11 @@ fn list_and_read() {
     assert!(mail.key(&key("k")));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "This week");
-    assert!(r.note.unwrap().contains("HTML"));
+    assert!(note(&r).contains("HTML"));
     assert!(mail.key(&key("k")));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "Headers only so far");
-    assert!(r.note.unwrap().contains("headers"));
+    assert!(note(&r).contains("headers"));
     assert!(mail.key(&key("k")), "at the top k stays");
     assert_eq!(mail.ui.get_cloned().cursor, Some(0));
     assert!(!mail.key(&key("x")), "other keys are not Mail's");
@@ -130,4 +136,79 @@ fn list_and_read() {
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "Nothing here"));
     assert!(mail.ui.get_cloned().reading.is_none());
+}
+
+fn threaded(uid: u32, from: &str, subject: &str, body: &str, t: i64, mid: &str, refs: &str) -> Fetched {
+    let s = t.rem_euclid(86_400);
+    let date = format!("Mon, 23 Nov 2026 {:02}:{:02}:{:02} +0000", s / 3600, s % 3600 / 60, s % 60);
+    let refs = if refs.is_empty() { String::new() } else { format!("References: {refs}\r\nIn-Reply-To: {refs}\r\n") };
+    let bytes = format!("From: {from}\r\nTo: Priya <priya@example.org>\r\nSubject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n{refs}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8; format=flowed\r\n\r\n{body}\r\n").into_bytes();
+    Fetched { uid, flags: if uid == 1 { vec!["\\Seen".into()] } else { vec![] }, size: 1000, internal_date: Some(t), server_id: None, bytes, full: true }
+}
+
+#[test]
+fn a_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![
+            threaded(1, "Lena <lena@partner.example>", "Venue", "Shall we book the hall for \r\nthe 4th?", NOW - 7200, "<a@x>", ""),
+            threaded(2, "Arun <arun@acme.example>", "Re: Venue", "Yes, see https://hall.example/book.\r\n\r\nOn Mon, Lena wrote:\r\n> Shall we book the hall for the 4th?\r\n\r\n-- \r\nArun\r\nAcme", NOW - 3600, "<b@x>", "<a@x>"),
+            threaded(3, "Sam <sam@other.example>", "Parking", "Where do we park?", NOW - 600, "<c@x>", ""),
+        ]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+
+    // Two conversations, the venue one with both people and a count.
+    let ui = mail.ui.get_cloned();
+    assert!(ui.conversations);
+    assert_eq!(ui.count, 2);
+    let r = mail.row(1).unwrap();
+    assert_eq!((r.people.as_str(), r.count, r.subject.as_str()), ("Lena, Arun", 2, "Venue"));
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Lena, Arun") && t.iter().any(|x| x == " 2"), "{t:?}");
+    assert!(t.iter().any(|x| x == "Conversations") && t.iter().any(|x| x == "Messages"));
+
+    // Opening it: Lena's (read) folded, the new line, Arun's open with its
+    // quote and signature folded and the link a link.
+    mail.open(1);
+    app.tick();
+    let s = mail.ui.get_cloned().reading.unwrap();
+    assert_eq!(s.msgs.iter().map(|m| m.open).collect::<Vec<_>>(), [false, true]);
+    assert_eq!(s.people, "Lena, Arun · 2 messages");
+    let items = atrium_mail::view::lay_out(&s, 560.0);
+    use atrium_mail::view::Item;
+    assert!(matches!(items[0], Item::Folded(0)));
+    assert!(matches!(items[1], Item::New));
+    assert!(items.iter().any(|i| matches!(i, Item::Fold { quoted: true, shown: false, .. })));
+    assert!(items.iter().any(|i| matches!(i, Item::Fold { quoted: false, shown: false, .. })));
+    let link = items.iter().find_map(|i| match i { Item::Text { spans, .. } => spans.iter().find_map(|(_, l)| l.clone()), _ => None });
+    assert_eq!(link.as_deref(), Some("https://hall.example/book"));
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "https://hall.example/book"), "{t:?}");
+    assert_eq!(t.iter().filter(|x| x.contains("Shall we book the hall for the 4th")).count(), 1, "only Lena's folded preview: the quote is folded");
+    assert!(t.iter().any(|x| x == "Show quoted text"));
+
+    // Show the quote; open Lena's (format=flowed joined into one line).
+    mail.unfold(1, true);
+    mail.toggle(0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Shall we book the hall for the 4th?"), "{t:?}");
+    assert_eq!(t.iter().filter(|x| x.contains("Shall we book the hall")).count(), 2, "Lena's text and Arun's quote of it");
+    assert!(t.iter().any(|x| x == "Hide quoted text"));
+
+    // Messages: three rows, one per message, and the choice is kept.
+    mail.set_conversations(false);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    let inbox = mail.ui.get_cloned().folder.unwrap();
+    assert!(!mail.engine.store.view(inbox).unwrap());
 }
