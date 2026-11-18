@@ -12,14 +12,14 @@ set -e
 D=$1
 [ -x "$D" ] || { echo "usage: $0 <share-sheet binary>"; exit 2; }
 id _share >/dev/null 2>&1 || pw useradd _share -u 65045 -d /nonexistent -s /usr/sbin/nologin -c "Atrium share sheet"
-install -d -m 0755 /atrium/sockets /var/lib/atrium/apps /var/run/atrium
+install -d -m 0755 /atrium/sockets /var/lib/atrium/apps /var/db/atrium /var/run/atrium
 install -m 0755 "$D" /usr/local/bin/atrium-share-sheet
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 M=${2:-$HERE/share-sheet/etc/services.d/42-atrium-share-sheet.toml}
 install -m 0644 "$M" /etc/atrium/services.d/42-atrium-share-sheet.toml
 R=/var/lib/atrium/jails/share-sheet
-for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/limen atrium/sockets/fresco atrium/sockets/fresco-activation var/lib/atrium/apps var/run/atrium; do
+for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/limen atrium/sockets/fresco atrium/sockets/fresco-activation var/lib/atrium/apps var/db/atrium var/run/atrium; do
     [ -d "$R/$d" ] || install -d "$R/$d"
 done
 [ -e "$R/var/run/atrium/app-registry" ] || : > "$R/var/run/atrium/app-registry"

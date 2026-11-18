@@ -694,7 +694,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Crossings) {
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1935,6 +1935,31 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
             match r.map_err(std::io::Error::other).and_then(|_| d.save(&p)) {
                 Ok(()) => {
                     eprintln!("portcullisd: {owner}'s default for {scheme} links is now {} (from {caller})", app.as_deref().unwrap_or("ask each time"));
+                    Response::Ok
+                }
+                Err(e) => refuse(format!("save: {e}")),
+            }
+        }
+        Request::ShareTargets => {
+            use portcullis_policy::share::SharePrefs;
+            let d = SharePrefs::load(&SharePrefs::user_path(&owner)).unwrap_or_default();
+            let targets = d.arrange(launch::share_targets_for(&owner), |(id, _)| id.as_str()).into_iter()
+                .map(|(id, name)| portcullis_ipc::ShareTargetRow { hidden: d.hidden.contains(&id), id, name })
+                .collect::<Vec<_>>();
+            eprintln!("portcullisd: share targets -> {caller} (uid {uid}) for {owner}: {}", targets.len());
+            Response::ShareTargets { targets }
+        }
+        Request::SetShareTargets { order, hidden, activation } => {
+            use portcullis_policy::share::SharePrefs;
+            let known: Vec<String> = launch::share_targets_for(&owner).into_iter().map(|(id, _)| id).collect();
+            let d = SharePrefs::chosen(&order, &hidden, &known);
+            // Last of the checks: a refusal above doesn't spend the press.
+            if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+                return refuse(why);
+            }
+            match d.save(&SharePrefs::user_path(&owner)) {
+                Ok(()) => {
+                    eprintln!("portcullisd: {owner}'s share sheet: order {:?}, hidden {:?} (from {caller})", d.order, d.hidden);
                     Response::Ok
                 }
                 Err(e) => refuse(format!("save: {e}")),
@@ -3209,6 +3234,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "internal: session verbs must go through handle_session".into(),
         },
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        | Request::ShareTargets | Request::SetShareTargets { .. }
 
         | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
