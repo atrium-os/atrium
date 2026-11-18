@@ -588,7 +588,7 @@ Personal:
   kernel then opens the copy below the mark, read-only only (a writable mount or a
   ro→rw remount with that key is `EROFS`). Adopting the copy as current (the second
   verified step that lowers the mark) is not built yet.
-- **Grants of its folders** (built, VM gate pending): a trusted stick has no
+- **Grants of its folders** (built; `tessera-sticks-vm.sh` §5b, 12 checks, all pass in the VM on 2026-11-18 at 908973d): a trusted stick has no
   FUSE server of its own, so dispensatord starts one per mounted stick,
   `atrium-capsa-local`, in a jail of jaild's `[stick_servers]` class: named
   `system-stick-<part>`, running as the stick's person (a person's uid, never a
@@ -604,7 +604,10 @@ Personal:
   app's uid (personas.md §5.1); an older copy's grants are read-only. Eject
   ends the grants and the server before the gentle unmount (and brings the
   server back if the stick is busy); lock, unplug and session end do the same
-  through `stop_sealed`.
+  through `stop_sealed`. jaild hands the directory to the child only after
+  `jail_attach`, over a socket at fd 3: the kernel refuses to attach a process
+  holding a directory descriptor. Needs `fusefs.ko` on the Atrium kernel
+  (kernel-hardening.md keeps it loadable).
 - **Not yet:** Scrinium's and Forum's Locked display and "Make this a Work
   stick", the Arca field for typing a recovery code, and adopting an older
   copy as current.
