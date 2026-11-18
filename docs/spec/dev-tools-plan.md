@@ -291,7 +291,15 @@ and Mail's host tests pass with real jails.
   with the c-dev and Rust layers installed (`CDEV=`, `RUST=`) clangd marks hello.c
   and rust-analyzer marks a Cargo project's main.rs in a Rust workspace. Language
   and debug servers run with their stderr dropped, since `WorkspaceExec` merges it
-  into the output the protocol is framed on. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
+  into the output the protocol is framed on. Run (2026-11-18): a project with
+  `atrium.toml` gets a Run task (`make run` on atrium.app.mk, `cargo atrium run`,
+  Ctrl+R); its `atrium-run` asks Artifex as it asks a terminal (`ATRIUM_ASK=1`, the
+  OSC 7770 request read from the task's output), Artifex shows "<workspace> asks to
+  Run <folder>" with Run and Cancel, and the press on Run sends `WorkspaceRun`
+  (portcullisd lets an IDE Run in a workspace it was given). In the gate a c-app
+  project shows its core in the composition panel, and Run opens its window in the
+  amber dev frame. libatrium now finds Fresco at the jail's socket when
+  `ATRIUM_FRESCO_SOCKET` is unset, as a Run's dev app has it. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
   `WorkspaceExec` (breakpoints in the gutter, stack, locals, stepping; end-to-end on
   Linux), and the fuzz panel running `cargo atrium fuzz` in the background, core
   crashes first with "Move into a worker", a crash opening at its line and replaying

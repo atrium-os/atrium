@@ -1624,6 +1624,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
         // The Terminal too, for `make run` in a workspace's console
         // (atrium-run, OSC 7770 `run`), on the person's press.
         Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => true,
+        // An IDE (`workspace-exec`), in a workspace the person gave it
+        // (dev-tools.md §3.4: its Run of a windowed app is W5's).
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == ws) => true,
+        Some(a) if launch::app_execs_in_workspaces(a) => return refuse(format!("cap.workspace.denied: {a} wasn't given workspace {ws}")),
         Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
         None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
         None => return refuse("cap.workspace.denied: not a person or a launcher".into()),

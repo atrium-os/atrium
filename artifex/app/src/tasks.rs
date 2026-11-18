@@ -57,7 +57,13 @@ pub fn detect(dir: &Path, project: &str) -> Vec<Task> {
         // Short messages: one `file:line:col: error: …` line each.
         out.push(mk(Kind::Build, "cargo", argv(&["cargo", "build", "--message-format=short"])));
         out.push(mk(Kind::Test, "cargo", argv(&["cargo", "test", "--message-format=short"])));
-        out.push(mk(Kind::Run, "cargo", argv(&["cargo", "run", "--message-format=short"])));
+        if has("atrium.toml") {
+            // An Atrium app: built, then Run as a dev app (W5), which asks
+            // the person; Artifex shows the question (`ask_of`).
+            out.push(mk(Kind::Run, "cargo atrium", argv(&["cargo", "atrium", "run", "--message-format=short"])));
+        } else {
+            out.push(mk(Kind::Run, "cargo", argv(&["cargo", "run", "--message-format=short"])));
+        }
     } else if has("meson.build") {
         let setup = "[ -d build ] || meson setup build";
         out.push(mk(Kind::Build, "meson", sh(&format!("{setup} && meson compile -C build"))));
@@ -70,6 +76,10 @@ pub fn detect(dir: &Path, project: &str) -> Vec<Task> {
         let tool = if has("GNUmakefile") { "gmake" } else { "make" };
         out.push(mk(Kind::Build, tool, argv(&[tool])));
         out.push(mk(Kind::Test, tool, argv(&[tool, "test"])));
+        let mk_text = ["Makefile", "makefile", "BSDmakefile"].iter().filter_map(|f| std::fs::read_to_string(dir.join(f)).ok()).collect::<String>();
+        if mk_text.contains("atrium.app.mk") {
+            out.push(mk(Kind::Run, tool, argv(&[tool, "run"])));
+        }
     } else if let Some(c) = single_c(dir) {
         // One C file and no build system: what the Scratch template is.
         out.push(mk(Kind::Build, "cc", argv(&["cc", "-Wall", "-g", "-o", &stem(&c), &c])));
@@ -77,6 +87,35 @@ pub fn detect(dir: &Path, project: &str) -> Vec<Task> {
     }
     out
 }
+
+/// What a Run task's `atrium-run` asks (OSC 7770 `run`, homes.md §5.5),
+/// taken out of `buf` (the output not yet shown): the folder in `work`,
+/// once the request is complete and well formed. A request for anything
+/// else (`pkg`) comes back as `Err` with its kind, to be refused.
+pub fn take_ask(buf: &mut Vec<u8>) -> Option<Result<String, String>> {
+    const START: &[u8] = b"\x1b]7770;";
+    let at = buf.windows(START.len()).position(|w| w == START)?;
+    let end = at + buf[at..].iter().position(|&b| b == 0x07)?;
+    let req: Vec<u8> = buf.drain(at..=end).collect();
+    let body = String::from_utf8_lossy(&req[START.len()..req.len() - 1]).to_string();
+    let (kind, arg) = body.split_once(';').unwrap_or((&body, ""));
+    Some(match kind {
+        "run" if run_folder(arg) => Ok(arg.to_string()),
+        k => Err(k.to_string()),
+    })
+}
+
+/// A folder in `work` as atrium-run and portcullisd take it.
+fn run_folder(f: &str) -> bool {
+    !f.is_empty() && f.len() <= 256 && !f.starts_with('/') && !f.split('/').any(|c| c == "..")
+        && f.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/-".contains(&b))
+}
+
+/// The answers atrium-run reads on its stdin.
+pub fn ask_ok(status: i32) -> Vec<u8> {
+    format!("\x1b]7770;ok;{status}\x07\r\n").into_bytes()
+}
+pub const ASK_CANCEL: &[u8] = b"\x1b]7770;cancel\x07\r\n";
 
 fn single_c(dir: &Path) -> Option<String> {
     let mut found = None;
@@ -169,6 +208,24 @@ pub fn problems(output: &str) -> Vec<Problem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asks_come_out_of_the_output() {
+        let mut b = b"cc -o app main.c\nasking\x1b]7770;run;app\x07".to_vec();
+        assert_eq!(take_ask(&mut b), Some(Ok("app".into())));
+        assert_eq!(b, b"cc -o app main.c\nasking");
+        let mut b = b"x\x1b]7770;run;ap".to_vec();
+        assert_eq!(take_ask(&mut b), None, "not whole yet");
+        b.extend_from_slice(b"p\x07");
+        assert_eq!(take_ask(&mut b), Some(Ok("app".into())));
+        for bad in ["../x", "/etc", "a b", ""] {
+            let mut b = format!("\x1b]7770;run;{bad}\x07").into_bytes();
+            assert_eq!(take_ask(&mut b), Some(Err("run".into())), "{bad}");
+        }
+        let mut b = b"\x1b]7770;pkg;install vim\x07".to_vec();
+        assert_eq!(take_ask(&mut b), Some(Err("pkg".into())));
+        assert_eq!(ask_ok(0), b"\x1b]7770;ok;0\x07\r\n");
+    }
 
     #[test]
     fn problems_from_compilers() {
