@@ -196,15 +196,19 @@ pub fn sign(manifest: &[u8], key_pem: &str) -> Result<Vec<u8>, SigError> {
             None => Err(SigError::BadKey),
         };
     }
-    use p256::pkcs8::DecodePrivateKey;
-    // PKCS#8 ("BEGIN PRIVATE KEY"), or SEC1 ("BEGIN EC PRIVATE KEY", what
-    // `openssl ecparam -genkey` writes).
-    let k = match SigningKey::from_pkcs8_pem(key_pem) {
-        Ok(k) => k,
-        Err(_) => p256::SecretKey::from_sec1_pem(key_pem).map(SigningKey::from).map_err(|_| SigError::BadKey)?,
-    };
+    let k = signing_key(key_pem)?;
     let s: Signature = k.sign(manifest);
     Ok(s.to_der().as_bytes().to_vec())
+}
+
+/// A PEM private key: PKCS#8 ("BEGIN PRIVATE KEY"), or SEC1 ("BEGIN EC
+/// PRIVATE KEY", what `openssl ecparam -genkey` writes). Every path that
+/// reads a private key goes through here, so both work everywhere.
+fn signing_key(key_pem: &str) -> Result<p256::ecdsa::SigningKey, SigError> {
+    use p256::pkcs8::DecodePrivateKey;
+    p256::ecdsa::SigningKey::from_pkcs8_pem(key_pem)
+        .or_else(|_| p256::SecretKey::from_sec1_pem(key_pem).map(p256::ecdsa::SigningKey::from))
+        .map_err(|_| SigError::BadKey)
 }
 
 /// A key pair from 32 random bytes: (private PKCS#8 PEM, public SPKI PEM).
@@ -217,7 +221,7 @@ pub fn new_key(seed: [u8; 32]) -> Result<(String, String), SigError> {
     Ok((private, public))
 }
 
-/// The public SPKI PEM of a PKCS#8 PEM private key.
+/// The public SPKI PEM of a PEM private key (PKCS#8 or SEC1).
 pub fn public_pem(key_pem: &str) -> Result<String, SigError> {
     use p256::ecdsa::SigningKey;
     if !is_pem(key_pem) {
@@ -226,8 +230,8 @@ pub fn public_pem(key_pem: &str) -> Result<String, SigError> {
             None => Err(SigError::BadKey),
         };
     }
-    use p256::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
-    let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
+    use p256::pkcs8::{EncodePublicKey, LineEnding};
+    let k: SigningKey = signing_key(key_pem)?;
     k.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|_| SigError::BadKey)
 }
 
@@ -240,6 +244,7 @@ mod sign_tests {
         let sec1 = p256::SecretKey::from_bytes(&[7u8; 32].into()).unwrap().to_sec1_pem(LineEnding::LF).unwrap();
         assert!(sec1.contains("BEGIN EC PRIVATE KEY"));
         for k in [pkcs8.as_str(), sec1.as_str()] {
+            assert_eq!(super::public_pem(k).unwrap(), super::public_pem(pkcs8.as_str()).unwrap(), "the public key of a SEC1 key");
             let sig = super::sign(b"m", k).unwrap();
             super::verify_one(b"m", &sig, &public).unwrap();
         }
