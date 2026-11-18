@@ -3566,6 +3566,10 @@ Gates: `officina-grid` `ops::tests::sheets_are_added_renamed_and_undone`; `atriu
 
 Gates: `sheetops::tests::a_sheet_moves_with_everything_that_reads_it` and `deleting_a_sheet_breaks_what_read_it_and_undo_brings_all_back` (three sheets reading each other with names, a table, a chart and a spill: moved and back, and deleted and undone, each save byte for byte the same native file as before); `atrium-sheets` `sheets_are_added_switched_renamed_and_tabbed`.
 
+### 16.73 Sheets and Slides as installable apps with a jailed converter (2026-11-18)
+
+Write already ran its converter as a worker (dev-tools-plan.md M5). Sheets and Slides now have their manifests too (`atrium-sheets/atrium.toml`, `atrium-slides/atrium.toml`): Fresco graphics, no network, no folders, the `convert` worker (`bin/officina-convert`, 2 GB, 2 CPU-minutes) in a jail of its own as a uid of its own, so `launch::convert` runs it there once installed (a child process in development and tests, as before). Sheets opens `.xlsx`, `.ods` and CSV for changes and `.xls` to view (it doesn't write `.xls`); Slides opens `.pptx` and `.odp`. Both now take files handed over from Scrinium on the document channel (`atrium_open::Channel`, opening-files.md §6.2), as Write does. Gate: `portcullis-toml` `tests/app_manifests.rs` `sheets_and_slides_convert_in_a_worker_and_read_no_folders`. Not yet: a VM run of either installed bundle (the shared VM is booted only through the coordinator).
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

@@ -37,3 +37,21 @@ fn mail_takes_mailto_and_fetches_only_through_nuntius() {
     assert_eq!(m.capabilities.network.as_ref().map(|n| n.mode()), Some(portcullis_toml::NetworkCap::None));
     assert!(m.links.iter().any(|l| l.schemes.iter().any(|s| s == "mailto")));
 }
+
+#[test]
+fn sheets_and_slides_convert_in_a_worker_and_read_no_folders() {
+    for (rel, id, ty) in [
+        ("atrium-sheets/atrium.toml", "org.atrium.sheets", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("atrium-slides/atrium.toml", "org.atrium.slides", "application/vnd.oasis.opendocument.presentation"),
+    ] {
+        let m = load(rel);
+        assert_eq!(m.app.id, id);
+        assert_eq!(m.capabilities.removable_files, None);
+        assert_eq!(m.capabilities.network.as_ref().map(|n| n.mode()), Some(portcullis_toml::NetworkCap::None));
+        assert!(m.workers.iter().any(|w| w.name == "convert"), "{rel}");
+        assert!(m.opens.iter().any(|o| o.mode == OpenMode::Edit && o.types.iter().any(|t| t == ty)), "{rel}");
+    }
+    // Sheets reads .xls but doesn't write it.
+    let m = load("atrium-sheets/atrium.toml");
+    assert!(m.opens.iter().any(|o| o.mode == OpenMode::View && o.types.iter().any(|t| t == "application/vnd.ms-excel")));
+}
