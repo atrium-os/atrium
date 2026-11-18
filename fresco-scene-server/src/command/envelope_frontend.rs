@@ -428,7 +428,9 @@ impl EnvelopeFrontend {
         if !self.refused.insert((client, window, resource)) {
             return Vec::new();
         }
-        log::warn!("client {client} window {window}: over budget {resource} ({used} of {limit}); refusing until it evicts");
+        // Always printed (frescod and its renderers run without RUST_LOG):
+        // a refused node is something the person sees missing.
+        eprintln!("fresco: client {client} window {window}: over budget {resource} ({used} of {limit}) at node {id}; refusing until it evicts");
         budget_event(window, resource, id, used, limit)
     }
 
