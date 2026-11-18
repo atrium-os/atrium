@@ -67,12 +67,16 @@ pub enum Cmd {
     ChartDelete,
     /// Lets the chart go.
     ChartDone,
+    /// The value list of filter column `col`, opened.
+    FilterOpen(u32),
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
     FilterAll(bool),
     FilterApply,
     FilterCancel,
+    /// The data validation panel.
+    Valid(ValidCmd),
     /// The validation list: item `i` (of those the search shows) typed into
     /// the cell; closed.
     ListPick(usize),
@@ -129,6 +133,24 @@ pub enum CondCmd {
     Save,
     /// Back to the list without saving.
     Back,
+}
+
+/// The data validation panel's controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidCmd {
+    /// What the cells allow ([`crate::validation::ALLOWS`]), the comparison
+    /// ([`crate::validation::OPS`]), the error style ([`crate::validation::STYLES`]).
+    Allow(usize),
+    Op(usize),
+    Style(usize),
+    Blank,
+    Dropdown,
+    Prompt,
+    Error,
+    Save,
+    /// The rule being changed, deleted.
+    Remove,
+    Close,
 }
 
 /// The conditional-format panel's width, at the window's right over the grid.
@@ -273,6 +295,9 @@ pub struct Sheets {
     pub linking: Mutable<Option<(u16, u32, u32)>>,
     pub link_text: Mutable<TextEdit>,
     pub list: Mutable<ListPanel>,
+    pub valid: Mutable<crate::validation::Panel>,
+    pub valid_text: Rc<Vec<Mutable<TextEdit>>>,
+    pub valid_menus: Rc<Vec<Mutable<MenuState>>>,
     pub list_search: Mutable<TextEdit>,
     pub list_scroll: Mutable<ScrollState>,
     /// The activation of the press on Open Link, for the link opener.
@@ -285,7 +310,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -480,6 +505,69 @@ impl Sheets {
             // Nothing here yet: straight to a new rule.
             self.cond_cmd(CondCmd::New);
         }
+        self.changed();
+    }
+
+    /// Opens the data validation panel on the cursor's rule, or a new rule
+    /// for the selection.
+    pub fn open_valid(&self) {
+        let g = self.grid.get_cloned();
+        let sel = g.selection();
+        let sheet = self.doc.borrow().sheet;
+        let sel = officina_grid::Rect { sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+        let (p, f) = crate::validation::open(&self.doc.borrow().wb, sel, g.cursor);
+        for (m, t) in self.valid_text.iter().zip(f.iter()) {
+            m.set(TextEdit::new(t));
+        }
+        self.filter.set(FilterPanel::default());
+        self.cond.set(crate::condfmt::CondPanel::default());
+        self.list.set(ListPanel::default());
+        self.valid.set(p);
+        self.changed();
+    }
+
+    pub fn valid_cmd(&self, c: ValidCmd) {
+        use crate::validation as va;
+        let mut p = self.valid.get_cloned();
+        if !p.open {
+            return;
+        }
+        p.error.clear();
+        match c {
+            ValidCmd::Allow(i) => p.allow = i.min(va::ALLOWS.len() - 1),
+            ValidCmd::Op(i) => p.op = i.min(va::OPS.len() - 1),
+            ValidCmd::Style(i) => p.style = i.min(va::STYLES.len() - 1),
+            ValidCmd::Blank => p.blank = !p.blank,
+            ValidCmd::Dropdown => p.dropdown = !p.dropdown,
+            ValidCmd::Prompt => p.show_prompt = !p.show_prompt,
+            ValidCmd::Error => p.show_error = !p.show_error,
+            ValidCmd::Close => p = va::Panel::default(),
+            ValidCmd::Save => {
+                let f: [String; va::FIELDS] = std::array::from_fn(|i| self.valid_text[i].get_cloned().text().to_string());
+                let saved = va::save(&mut self.doc.borrow_mut(), &p, &f);
+                match saved {
+                    Ok(()) => {
+                        self.doc.borrow_mut().status = "Validation saved.".into();
+                        p = va::Panel::default();
+                    }
+                    Err(e) => p.error = e,
+                }
+            }
+            ValidCmd::Remove => {
+                if let Some(i) = p.editing {
+                    let mut d = self.doc.borrow_mut();
+                    let mut vs = d.wb.validations().to_vec();
+                    if i < vs.len() {
+                        vs.remove(i);
+                        let op = officina_grid::ops::GridOp::validations(&d.wb, &vs);
+                        d.run("Delete Validation", vec![op]);
+                        d.status = "Validation rule deleted.".into();
+                    }
+                }
+                p = va::Panel::default();
+            }
+        }
+        self.valid.set(p);
         self.changed();
     }
 
@@ -1102,7 +1190,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1255,6 +1343,10 @@ impl View for Sheets {
                     press.set(pergola::clipboard::current_activation());
                     cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
                 }
+                // The cursor cell's list button, or Alt+Down: its list.
+                GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
+                // A filter column's button: its value list.
+                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
                 a => Self::act(&doc, &src, &rev, a),
             })
             .emit(ctx);
@@ -1559,6 +1651,87 @@ impl View for Sheets {
             }
         }
 
+        // The data validation panel, at the right over the grid.
+        let vp = self.valid.get_cloned();
+        if vp.open && !pb.open {
+            use crate::validation as va;
+            let (x0, y0) = ((w - COND_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(200.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, COND_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            let push = |c: ValidCmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(Cmd::Valid(c))
+            };
+            let label = |ctx: &mut Ctx, y: f32, s: &str| {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y, COND_W - 24.0, 16.0), content: s.into(), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Semibold, color: t.text_secondary() } });
+            };
+            let check = |ctx: &mut Ctx, x: f32, y: f32, on: bool, text: &str, c: ValidCmd| {
+                let cmds = self.cmds.clone();
+                pergola::widgets::Checkbox::new(Mutable::new(if on { pergola::widgets::Check::On } else { pergola::widgets::Check::Off }), text).at(x, y).on_change(move |_| cmds.lock().unwrap().push(Cmd::Valid(c))).render(ctx);
+            };
+            let field = |ctx: &mut Ctx, i: usize, x: f32, y: f32, fw: f32, ph: &str| {
+                let cmds = self.cmds.clone();
+                TextField::new(self.valid_text[i].clone()).placeholder(ph).at(x, y).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Valid(ValidCmd::Save))).render(ctx);
+            };
+            let menu = |ctx: &mut Ctx, k: usize, names: &[&str], now: usize, y: f32, mk: fn(usize) -> ValidCmd| {
+                let items: Vec<pergola::widgets::MenuItem> = names.iter().enumerate().map(|(i, n)| pergola::widgets::MenuItem::new(*n).radio(i == now)).collect();
+                let cmds = self.cmds.clone();
+                MenuButton::new(names[now.min(names.len() - 1)].to_string(), self.valid_menus[k].clone(), items, move |i| cmds.lock().unwrap().push(Cmd::Valid(mk(i)))).at(x0 + 12.0, y).width(COND_W - 24.0).render(ctx);
+            };
+            let fw = COND_W - 24.0;
+            let title = if vp.editing.is_some() { "Change Validation" } else { "New Validation" };
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: title.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let mut y = y0 + 40.0;
+            label(ctx, y, "Apply to");
+            field(ctx, va::RANGE, x0 + 12.0, y + 18.0, fw, "e.g. B2:B100");
+            y += 60.0;
+            label(ctx, y, "Allow");
+            menu(ctx, 0, &va::ALLOWS, vp.allow, y + 18.0, ValidCmd::Allow);
+            y += 60.0;
+            if va::compares(vp.allow) {
+                menu(ctx, 1, &va::OPS, vp.op, y, ValidCmd::Op);
+                y += 42.0;
+            }
+            if let Some(pa) = va::field_a(vp.allow) {
+                let both = va::compares(vp.allow) && va::two(vp.op);
+                let aw = if both { (fw - 40.0) / 2.0 } else { fw };
+                field(ctx, va::A, x0 + 12.0, y, aw, pa);
+                if both {
+                    ctx.add(Node::Text { rect: Rect::new(x0 + 12.0 + aw + 8.0, y + 8.0, 24.0, 18.0), content: "and".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+                    field(ctx, va::B, x0 + 12.0 + aw + 40.0, y, aw, "Highest");
+                }
+                y += 42.0;
+            }
+            check(ctx, x0 + 12.0, y, vp.blank, "Allow empty cells", ValidCmd::Blank);
+            if vp.allow == officina_grid::validation::Allow::List as usize {
+                check(ctx, x0 + 180.0, y, vp.dropdown, "Offer the list", ValidCmd::Dropdown);
+            }
+            y += 34.0;
+            check(ctx, x0 + 12.0, y, vp.show_prompt, "Show a prompt when the cell is chosen", ValidCmd::Prompt);
+            y += 28.0;
+            field(ctx, va::PROMPT_TITLE, x0 + 12.0, y, fw, "Prompt title");
+            field(ctx, va::PROMPT_TEXT, x0 + 12.0, y + 38.0, fw, "Prompt");
+            y += 84.0;
+            check(ctx, x0 + 12.0, y, vp.show_error, "Check values typed in", ValidCmd::Error);
+            y += 28.0;
+            menu(ctx, 2, &va::STYLES, vp.style, y, ValidCmd::Style);
+            field(ctx, va::ERROR_TITLE, x0 + 12.0, y + 42.0, fw, "Error title");
+            field(ctx, va::ERROR_TEXT, x0 + 12.0, y + 80.0, fw, "Error message");
+            y += 126.0;
+            if !vp.error.is_empty() {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y, fw, 36.0), content: vp.error.clone(), style: st(type_size::SM, Weight::Regular, t.danger_fg()) });
+            }
+            let by = y0 + ph - 48.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, COND_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            if vp.editing.is_some() {
+                Button::secondary("Delete Rule").at(x0 + 12.0, by).width(104.0).on_click(push(ValidCmd::Remove)).render(ctx);
+            }
+            Button::secondary("Cancel").at(x0 + COND_W - 164.0, by).width(72.0).on_click(push(ValidCmd::Close)).render(ctx);
+            Button::primary("Save").at(x0 + COND_W - 84.0, by).width(72.0).on_click(push(ValidCmd::Save)).render(ctx);
+        }
+
         // Compare with…: the other copy's differences, at the right over the grid.
         let rv = self.review.get_cloned();
         if rv.open {
@@ -1797,6 +1970,14 @@ impl Sheets {
                     self.cond_cmd(c);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::Validation) => {
+                    self.open_valid();
+                    false
+                }
+                Cmd::Valid(c) => {
+                    self.valid_cmd(c);
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::PivotFields) => {
                     self.open_pivot_pane();
                     false
@@ -1839,6 +2020,11 @@ impl Sheets {
                         p.on[i] = on;
                     }
                     self.filter.set(p);
+                    self.changed();
+                    false
+                }
+                Cmd::FilterOpen(col) => {
+                    self.choose_values(col);
                     self.changed();
                     false
                 }
@@ -2138,6 +2324,82 @@ mod tests {
         s.take_cmds();
         assert_eq!(v(3, 0), Value::str("Maybe later"));
         assert!(!s.list.get_cloned().open);
+    }
+
+    #[test]
+    fn the_validation_panel_makes_changes_and_deletes_rules() {
+        use crate::data::DataCmd;
+        use crate::validation as va;
+        let s = Sheets::new(Doc::new("v"), Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 900.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        let mut g = s.grid.get_cloned();
+        g.select(1, 1);
+        s.grid.set(g);
+        run(Cmd::Data(DataCmd::Validation));
+        assert!(texts().iter().any(|x| x == "New Validation"));
+        assert_eq!(s.valid_text[va::RANGE].get_cloned().text(), "B2");
+        // Whole numbers 1 to 5 over B2:B9, told with the rule's own words.
+        run(Cmd::Valid(ValidCmd::Allow(1)));
+        s.valid_text[va::RANGE].set(TextEdit::new("B2:B9"));
+        s.valid_text[va::A].set(TextEdit::new("1"));
+        run(Cmd::Valid(ValidCmd::Save));
+        assert_eq!(s.valid.get_cloned().error, "Type the highest value.");
+        s.valid_text[va::B].set(TextEdit::new("5"));
+        s.valid_text[va::ERROR_TEXT].set(TextEdit::new("One to five, please."));
+        run(Cmd::Valid(ValidCmd::Save));
+        assert!(!s.valid.get_cloned().open);
+        assert!(!s.doc.borrow_mut().type_into(4, 1, "9"));
+        assert_eq!(s.doc.borrow().status, "One to five, please.");
+        // Opened again on a cell of it: it changes that rule, and can delete it.
+        run(Cmd::Data(DataCmd::Validation));
+        assert!(texts().iter().any(|x| x == "Change Validation"));
+        assert!(texts().iter().any(|x| x == "Delete Rule"));
+        assert_eq!(s.valid_text[va::B].get_cloned().text(), "5");
+        run(Cmd::Valid(ValidCmd::Remove));
+        assert!(s.doc.borrow().wb.validations().is_empty());
+        assert!(s.doc.borrow_mut().type_into(4, 1, "9"));
+    }
+
+    #[test]
+    fn a_list_cell_s_button_and_alt_down_open_its_list() {
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, Validation};
+        let mut d = Doc::new("v");
+        let f = d.wb.validation_formula("\"Yes,No\"", 0, (1, 1)).unwrap();
+        d.wb.add_validation(Validation::new(0, vec![officina_grid::Rect { sheet: 0, r0: 1, c0: 1, r1: 5, c1: 1 }], Allow::List, CmpOp::Between, Some(f), None)).unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let buttons = |t: &pergola::NodeTree| t.iter().filter_map(|(_, n)| match n { Node::Rect { rect, radius, .. } if *radius == 3.0 && rect.w() == 16.0 && rect.h() == 16.0 => Some(*rect), _ => None }).collect::<Vec<_>>();
+        // No button away from the rule's cells.
+        assert!(buttons(&pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0).is_empty());
+        let mut g = s.grid.get_cloned();
+        g.select(2, 1);
+        s.grid.set(g);
+        let mut app = App::new(s.clone());
+        app.tick();
+        let b = buttons(app.tree());
+        assert_eq!(b.len(), 1, "{b:?}");
+        let at = pergola::geom::Point::new(b[0].x() + 8.0, b[0].y() + 8.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        s.take_cmds();
+        let p = s.list.get_cloned();
+        assert!(p.open && (p.row, p.col) == (2, 1) && p.items == ["Yes", "No"], "{p:?}");
+        s.cmds.lock().unwrap().push(Cmd::ListCancel);
+        s.take_cmds();
+        // Alt+Down does the same.
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Down, modifiers: Modifiers { alt: true, ..Modifiers::default() }, chars: String::new() });
+        app.tick();
+        s.take_cmds();
+        assert!(s.list.get_cloned().open);
+        assert_eq!(s.grid.get_cloned().cursor, (2, 1));
     }
 
     #[test]

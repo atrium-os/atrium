@@ -272,14 +272,31 @@ fn chart_nodes(prims: Vec<officina_draw::chart::Prim>, theme: &pergola::theme::S
 }
 
 /// Float keys: charts use their index; these sit above any chart count.
-const KEY_FILTER: u64 = 1 << 61;
+/// Float keys: a filter column's button (with its column), a table's
+/// frame, the cursor's list button.
+pub const KEY_FILTER: u64 = 1 << 61;
 const KEY_TABLE: u64 = 1 << 60;
+pub const KEY_LIST: u64 = 1 << 59;
+
+/// A small square button with a down-pointing triangle, `size` px.
+fn drop_button(theme: &pergola::theme::Semantic, size: f32, lit: bool) -> Vec<pergola::Node> {
+    use pergola::shape::{Paint, PathData, Shape};
+    let bg = if lit { theme.accent_fill() } else { theme.bg_surface() };
+    let fg = if lit { theme.accent_fg() } else { theme.text_secondary() };
+    let mut nodes = vec![
+        pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, size, size), fill: theme.border_default(), radius: 3.0 },
+        pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, size - 2.0, size - 2.0), fill: bg, radius: 2.0 },
+    ];
+    let (cx, cy, k) = (size / 2.0, size / 2.0 + 1.0, size * 0.22);
+    let tri = PathData::new().move_to(cx - k * 1.3, cy - k * 0.7).line_to(cx + k * 1.3, cy - k * 0.7).line_to(cx, cy + k * 0.8).close();
+    nodes.extend(Shape::new(tri).fill(Paint::Solid(fg)).fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+    nodes
+}
 
 impl SheetSource {
     /// Tables (an outline, a header tint, stripes) and the auto-filter's header marks
     /// (a filtered column's mark is lit), for the part of the sheet in `view`.
     fn data_marks(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
-        use pergola::shape::{Paint, PathData, Shape};
         let d = self.doc.borrow();
         let s = d.sheet;
         let mut out = Vec::new();
@@ -331,7 +348,7 @@ impl SheetSource {
             if x1 <= fx1 {
                 nodes.push(at(x1 - 1.0, fy0, 2.0, fy1 - fy0, edge));
             }
-            out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes), movable: false });
+            out.push(pergola::widgets::GridFloat { key: KEY_TABLE | i as u64, at: [fx0, fy0, w as f64, h as f64], nodes: Rc::new(nodes), movable: false, pressable: false });
         }
         if let Some(f) = &d.wb.sheet(s).filter {
             let r = f.rect;
@@ -344,17 +361,8 @@ impl SheetSource {
                     let size = 14.0f32.min((y1 - y0) as f32 - 2.0).max(6.0);
                     let x = col_x(c + 1) - size as f64 - 3.0;
                     let y = y0 + ((y1 - y0) - size as f64) / 2.0;
-                    let bg = if lit { theme.accent_fill() } else { theme.bg_surface() };
-                    let fg = if lit { theme.accent_fg() } else { theme.text_secondary() };
-                    let mut nodes = vec![
-                        pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, size, size), fill: theme.border_default(), radius: 3.0 },
-                        pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, size - 2.0, size - 2.0), fill: bg, radius: 2.0 },
-                    ];
-                    // A small down-pointing triangle.
-                    let (cx, cy, k) = (size / 2.0, size / 2.0 + 1.0, size * 0.22);
-                    let tri = PathData::new().move_to(cx - k * 1.3, cy - k * 0.7).line_to(cx + k * 1.3, cy - k * 0.7).line_to(cx, cy + k * 0.8).close();
-                    nodes.extend(Shape::new(tri).fill(Paint::Solid(fg)).fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
-                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(nodes), movable: false });
+                    // A press opens the column's value list.
+                    out.push(pergola::widgets::GridFloat { key: KEY_FILTER | c as u64, at: [x, y, size as f64, size as f64], nodes: Rc::new(drop_button(theme, size, lit)), movable: false, pressable: true });
                 }
             }
         }
@@ -424,6 +432,29 @@ pub fn wrap_lines(text: &str, style: &pergola::TextStyle, w: f32, max: usize) ->
 }
 
 impl SheetSource {
+    /// A button at the right of [`Self::note_at`]'s cell when a validation
+    /// rule offers it a list; a press opens the list.
+    fn list_button(&self, theme: &pergola::theme::Semantic) -> Option<pergola::widgets::GridFloat> {
+        let (r, c) = self.note_at.get()?;
+        let (r0, r1, c1) = {
+            let d = self.doc.borrow();
+            let a = CellAddr::new(d.sheet, r, c);
+            let v = d.wb.validation_at(a)?;
+            if v.allow != officina_grid::validation::Allow::List || !v.dropdown {
+                return None;
+            }
+            d.wb.merge_at(a).map_or((r, r, c), |m| (m.r0, m.r1, m.c1))
+        };
+        let (y0, y1) = (self.row_top(r0), self.row_top(r1 + 1));
+        if y1 <= y0 {
+            return None;
+        }
+        let size = 16.0f32.min((y1 - y0) as f32 - 2.0).max(6.0);
+        let x = self.col_left(c1 + 1) - size as f64 - 2.0;
+        let y = y0 + ((y1 - y0) - size as f64) / 2.0;
+        Some(pergola::widgets::GridFloat { key: KEY_LIST, at: [x, y, size as f64, size as f64], nodes: Rc::new(drop_button(theme, size, false)), movable: false, pressable: true })
+    }
+
     /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
     fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
@@ -502,7 +533,7 @@ impl SheetSource {
         };
         let x = self.col_left(c1 + 1) + 6.0;
         let y = self.row_top(r0);
-        Some(pergola::widgets::GridFloat { key: 1 << 62, at: [x, y, NOTE_W as f64, h as f64], nodes: std::rc::Rc::new(nodes), movable: false })
+        Some(pergola::widgets::GridFloat { key: 1 << 62, at: [x, y, NOTE_W as f64, h as f64], nodes: std::rc::Rc::new(nodes), movable: false, pressable: false })
     }
 }
 
@@ -523,6 +554,7 @@ impl GridSource for SheetSource {
     fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
         let mut out = self.data_marks(view, theme);
         out.extend(self.note_float());
+        out.extend(self.list_button(theme));
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {
@@ -574,7 +606,7 @@ impl GridSource for SheetSource {
                     n
                 }
             };
-            out.push(pergola::widgets::GridFloat { key: i as u64, at: [x0, y0, w, h], nodes, movable: true });
+            out.push(pergola::widgets::GridFloat { key: i as u64, at: [x0, y0, w, h], nodes, movable: true, pressable: false });
         }
         out
     }
