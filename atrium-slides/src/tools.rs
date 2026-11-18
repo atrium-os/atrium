@@ -186,11 +186,7 @@ pub fn recompress(bytes: &[u8], w: u32, h: u32) -> Option<(&'static str, Vec<u8>
         jpeg_encoder::Encoder::new(&mut out, 85).encode(&px.rgba, px.width as u16, px.height as u16, jpeg_encoder::ColorType::Rgba).ok()?;
         Some(("image/jpeg", out))
     } else {
-        let mut e = png::Encoder::new(&mut out, px.width, px.height);
-        e.set_color(png::ColorType::Rgba);
-        e.set_depth(png::BitDepth::Eight);
-        e.write_header().ok()?.write_image_data(&px.rgba).ok()?;
-        Some(("image/png", out))
+        Some(("image/png", crate::decode::encode_png(px.width, px.height, &px.rgba)?))
     }
 }
 
