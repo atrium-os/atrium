@@ -615,6 +615,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "tabula",
 ]
 
 [[package]]
@@ -1005,6 +1006,7 @@ dependencies = [
  "aqueduct",
  "fresco-protocol",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "serde",
 ]

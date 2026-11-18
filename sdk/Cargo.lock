@@ -56,6 +56,17 @@ name = "atrium-types"
 version = "0.1.0"
 
 [[package]]
+name = "atrium-worker"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

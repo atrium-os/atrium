@@ -502,7 +502,7 @@ impl Engine {
             s.note = Some(("Stop the program being debugged first".into(), true));
             return;
         }
-        let argv: Vec<String> = dap::ADAPTER.iter().map(|a| a.to_string()).collect();
+        let argv = quiet(&dap::ADAPTER);
         let proc = match self.exec.spawn(&ws, &argv, &s.project) {
             Ok(p) => p,
             Err(e) => {
@@ -834,12 +834,12 @@ impl Engine {
                 return;
             }
             let (Some(ws), Some(remote)) = (self.ws.clone(), self.remote_root.clone()) else { return };
-            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-            match self.exec.spawn(&ws, &argv, "") {
+            let name = argv[0];
+            match self.exec.spawn(&ws, &quiet(argv), "") {
                 Ok(proc) => {
                     let client = lsp::Client::new(&self.root, &remote);
                     self.servers.insert(key, Server { client, proc });
-                    s.lsp = Some(format!("{} starting", argv[0]));
+                    s.lsp = Some(format!("{name} starting"));
                 }
                 Err(e) => {
                     self.no_server.push(key);
@@ -1242,6 +1242,15 @@ fn placeholder() -> Doc {
         lsp_sent: 0,
         last_edit: Instant::now(),
     }
+}
+
+/// A JSON-RPC server's argv, its stderr thrown away: a workspace command's
+/// output is stdout and stderr together, and the logs clangd and
+/// rust-analyzer write to stderr would break the framing.
+fn quiet(argv: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = ["sh", "-c", "exec \"$0\" \"$@\" 2>/dev/null"].iter().map(|a| a.to_string()).collect();
+    v.extend(argv.iter().map(|a| a.to_string()));
+    v
 }
 
 /// Save `text` to `path`. Through a temporary in the same folder, then

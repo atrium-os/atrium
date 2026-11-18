@@ -99,7 +99,7 @@ impl Tabula {
 
     fn conn(&mut self) -> Result<&mut aqueduct::Connection, Error> {
         if self.conn.is_none() {
-            let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard.sock".into());
+            let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard/clipboard.sock".into());
             let c = aqueduct::Connection::connect(&path).map_err(|e| Error::Unavailable(e.to_string()))?;
             self.conn = Some(c);
         }
@@ -153,7 +153,7 @@ impl Backend for Tabula {
             let hash = self.conn()?.upload_blob(bytes).map_err(|e| Error::Unavailable(e.to_string()))?;
             fs.push(Format { mime: mime.to_string(), hash });
         }
-        match self.call(op::SET, &Set { token, formats: fs, sensitive })? {
+        match self.call(op::SET, &Set { token, formats: fs, sensitive, for_uid: None })? {
             Reply::Ok => Ok(()),
             Reply::Refused { reason, detail } => Err(Error::Refused { reason, detail }),
             other => Err(Error::Unavailable(format!("unexpected reply {other:?}"))),

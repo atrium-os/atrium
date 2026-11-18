@@ -1336,6 +1336,24 @@ impl Editor {
         self.apply(label, ops, Kind::Other);
     }
 
+    /// Sets the East Asian language (a BCP 47 tag; None: the document's)
+    /// of the selection, or with none of the caret's paragraph and what is
+    /// typed next. It picks the Han forms (Simplified, Traditional,
+    /// Japanese, Korean) the text is drawn in.
+    pub fn set_lang_ea(&mut self, lang: Option<std::sync::Arc<str>>) {
+        if !self.has_selection() {
+            let k = self.caret.block;
+            let n = self.len(k);
+            let mut t = self.typing.take().unwrap_or_default();
+            t.lang_ea = lang.clone();
+            let ops = if n > 0 { self.doc.format_ops(k, 0, n, |a: &mut CharAttrs| a.lang_ea = lang.clone()) } else { Vec::new() };
+            self.apply("Language", ops, Kind::Other);
+            self.typing = Some(t);
+            return;
+        }
+        self.format("Language", move |a| a.lang_ea = lang.clone());
+    }
+
     /// The picture at the caret (just after it, else just before; or the one
     /// selected): its block, byte and frame.
     pub fn picture_at_caret(&self) -> Option<(usize, u32, ObjectRef)> {

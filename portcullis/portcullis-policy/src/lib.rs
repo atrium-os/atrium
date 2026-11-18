@@ -351,6 +351,10 @@ pub struct CapabilityDelta {
     pub net_fetch:       bool,
     pub protected_media: bool,
     pub tessera_cas_read: bool,
+    /// `arca`: keep secrets in Arca, its own items only.
+    pub arca:            bool,
+    /// `embeds` roles not yet granted.
+    pub embeds_added:    Vec<String>,
     /// The manifest asks for the `terminal` system call class, which is
     /// wider than an app's (jail-sysfil.md §5.2).
     pub syscalls_terminal: bool,
@@ -412,6 +416,8 @@ impl CapabilityDelta {
             && !self.net_fetch
             && !self.protected_media
             && !self.tessera_cas_read
+            && !self.arca
+            && self.embeds_added.is_empty()
             && !self.syscalls_terminal
             && !self.input_gamepad_exclusive
             && !self.input_pointer_lock
@@ -468,6 +474,10 @@ impl CapabilityDelta {
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
+        if self.arca            { out.push("Keep its own passwords and keys in Arca".into()); }
+        for r in &self.embeds_added {
+            out.push(format!("Show the system's {r} inside its windows"));
+        }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         if self.input_gamepad_exclusive { out.push("Keep a game controller when you switch to another window".into()); }
         if self.input_pointer_lock { out.push("Hide and capture the pointer while its window has focus (Escape releases it)".into()); }
@@ -577,6 +587,15 @@ pub fn compute_delta(
     bool_cap!(net_fetch);
     bool_cap!(protected_media);
     bool_cap!(tessera_cas_read);
+    bool_cap!(arca);
+    if let Some(req) = &requested.embeds {
+        let granted: Vec<&String> = g.and_then(|c| c.embeds.as_ref()).map(|v| v.iter().collect()).unwrap_or_default();
+        for r in req {
+            if !granted.iter().any(|x| **x == *r) && !d.embeds_added.contains(r) {
+                d.embeds_added.push(r.clone());
+            }
+        }
+    }
 
     macro_rules! input_cap {
         ($field:ident, $out:ident) => {
@@ -824,6 +843,8 @@ run_as = "_navpage"
             network:    Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::Loopback)),
             fonts:      None,
             tessera_cas_read: None,
+            embeds:     None,
+            arca:       None,
             usb_hid:    None,
             camera:     None,
             microphone: None,
@@ -1041,5 +1062,23 @@ run_as = "_navpage"
         // Control: a missing file is an empty policy, not an error.
         assert!(Policy::load_system(&dir.join("absent.toml")).unwrap().grants.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod composition_delta {
+    use super::*;
+
+    #[test]
+    fn embeds_and_arca_ask_consent_once() {
+        let req = Capabilities { embeds: Some(vec!["picker".into(), "doc-viewer".into()]), arca: Some(true), ..Default::default() };
+        let d = compute_delta(&req, None, None, "h");
+        assert!(d.arca && d.embeds_added == ["picker", "doc-viewer"]);
+        assert!(d.describe().iter().any(|l| l.contains("picker")) && d.describe().iter().any(|l| l.contains("Arca")));
+        let granted = Capabilities { embeds: Some(vec!["picker".into()]), arca: Some(true), ..Default::default() };
+        let d = compute_delta(&req, Some(&granted), Some("h"), "h");
+        assert!(!d.arca && d.embeds_added == ["doc-viewer"], "only what wasn't granted");
+        let d = compute_delta(&req, Some(&req), Some("h"), "h");
+        assert!(d.is_empty());
     }
 }

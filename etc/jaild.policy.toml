@@ -126,6 +126,8 @@ rw_paths = [
     # frescod's socket and its activation socket: monstratord's sheet.
     "/atrium/sockets/fresco",
     "/atrium/sockets/fresco-activation",
+    # Tabula's socket: monstratord's Copy address (personas.md §6).
+    "/atrium/sockets/clipboard",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",

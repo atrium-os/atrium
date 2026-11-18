@@ -107,9 +107,23 @@ for t in X86_64:amd64 AARCH64:aarch64; do
     u=${t%%:*}; a=${t##*:}
     export "${u}_UNKNOWN_FREEBSD_OPENSSL_LIB_DIR=$SYSROOTS/$a/usr/lib"
     export "${u}_UNKNOWN_FREEBSD_OPENSSL_INCLUDE_DIR=$SYSROOTS/$a/usr/include"
+    # pkg-config for the target looks in the sysroot only (else libz-sys
+    # finds the build host's zlib.pc and adds -I/usr/include).
+    l=$(echo "$u" | tr 'A-Z' 'a-z')_unknown_freebsd
+    export "PKG_CONFIG_LIBDIR_$l=$SYSROOTS/$a/usr/libdata/pkgconfig"
+    export "PKG_CONFIG_SYSROOT_DIR_$l=$SYSROOTS/$a"
 done
 export PKG_CONFIG_ALLOW_CROSS=1
-if ! ls build/dist/rustc-$VERSION-aarch64-unknown-freebsd.tar.xz >/dev/null 2>&1; then
+# Run (or resume) dist unless every component the layer trees take is there.
+need=""
+for cpu in x86_64 aarch64; do
+    for c in rustc cargo clippy rustfmt rust-analyzer; do need="$need build/dist/$c-$VERSION-$cpu-unknown-freebsd.tar.xz"; done
+    need="$need build/dist/rust-std-$VERSION-$cpu-unknown-freebsd.tar.xz"
+done
+need="$need build/dist/rust-src-$VERSION.tar.xz"
+missing=0
+for f in $need; do [ -f "$f" ] || missing=1; done
+if [ $missing = 1 ]; then
     say "x.py dist (long)"
     python3 x.py dist -j "$JOBS"
 fi

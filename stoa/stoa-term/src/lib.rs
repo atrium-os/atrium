@@ -238,7 +238,7 @@ pub struct Grid {
     replies: Vec<u8>,
     /// The last OSC 52 write not yet taken.
     clip: Option<String>,
-    /// The last `pkg` request (OSC 7770) not yet taken.
+    /// The last workspace request (OSC 7770) not yet taken.
     ask: Option<String>,
 }
 
@@ -322,10 +322,12 @@ impl Grid {
         self.clip.take()
     }
 
-    /// Take the words of the last `pkg` request (OSC 7770, homes.md §5.5):
-    /// `ESC ] 7770 ; pkg ; <words> BEL` from a workspace's `/atrium/bin/pkg`.
-    /// The words are package-name characters and single spaces only; the
-    /// terminal shows them and asks the person, it never acts on them alone.
+    /// Take the last workspace request (OSC 7770, homes.md §5.5), as
+    /// `"<kind> <argument>"`: `ESC ] 7770 ; pkg ; <words> BEL` from a
+    /// workspace's `/atrium/bin/pkg` (`"pkg install helix"`), or
+    /// `ESC ] 7770 ; run ; <folder> BEL` from `/atrium/bin/atrium-run`
+    /// (`"run app"`). Checked by [`parse_ask`]; the terminal shows it and
+    /// asks the person, it never acts on it alone.
     pub fn take_ask(&mut self) -> Option<String> {
         self.ask.take()
     }
@@ -1025,8 +1027,39 @@ impl Grid {
     }
 }
 
-/// The longest `pkg` request taken (bytes).
+/// The longest workspace request taken (bytes).
 pub const ASK_MAX: usize = 256;
+
+/// A workspace request (OSC 7770) as `"<kind> <argument>"`, if it is one
+/// the terminal knows and its argument is well formed: `pkg` with
+/// [`pkg_words`], `run` with [`run_folder`].
+pub fn parse_ask(kind: &[u8], arg: &[u8]) -> Option<String> {
+    match kind {
+        b"pkg" => Some(format!("pkg {}", pkg_words(arg)?)),
+        b"run" => Some(format!("run {}", run_folder(arg)?)),
+        _ => None,
+    }
+}
+
+/// Check a request again (from the wire): `"<kind> <argument>"`.
+pub fn check_ask(s: &str) -> Option<String> {
+    let (kind, arg) = s.split_once(' ')?;
+    parse_ask(kind.as_bytes(), arg.as_bytes())
+}
+
+/// A Run request's folder in the workspace's work: `[A-Za-z0-9._/-]`, not
+/// absolute, no `..`; `.` is work itself.
+pub fn run_folder(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() || raw.len() > ASK_MAX || raw[0] == b'/'
+        || !raw.iter().all(|&b| b.is_ascii_alphanumeric() || b"._/-".contains(&b)) {
+        return None;
+    }
+    let s = std::str::from_utf8(raw).ok()?;
+    if s.split('/').any(|c| c == "..") {
+        return None;
+    }
+    Some(s.to_string())
+}
 
 /// A `pkg` request's words, if they are only package-name characters
 /// (`A-Za-z0-9._+@/:=,~^*-`, as portcullisd's `check_pkg_argv`) separated
@@ -1362,8 +1395,9 @@ impl Perform for Grid {
             }
             // OSC 52 (`52;c;base64`): a clipboard write.
             [b"52", _target, data] => self.osc52(data),
-            // OSC 7770 (`7770;pkg;words`): a workspace asks to run pkg.
-            [b"7770", b"pkg", words] => self.ask = pkg_words(words),
+            // OSC 7770 (`7770;pkg;words`, `7770;run;folder`): a workspace
+            // asks for pkg or Run.
+            [b"7770", kind, arg] => self.ask = parse_ask(kind, arg),
             _ => {}
         }
     }

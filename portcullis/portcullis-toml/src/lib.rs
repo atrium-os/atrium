@@ -24,7 +24,8 @@ pub use schema::{
     merge_capabilities,
     AppSection, Capabilities, FontsCap, InputCaps, InstancesPolicy, Manifest,
     NetworkCap, OpenMode, OpensSection, PoolSection, ResourcesSection, RestartPolicy, SetupSection,
-    SupervisionSection,
+    SupervisionSection, WorkerSection, WorkerInput, WorkerLifetime, WorkerIsolation,
+    RolesSection, IpcSection,
 };
 pub use validate::{validate, Report};
 pub use network::{Dest, NetworkGrants, NetworkSpec, Outbound, Peer, Proto};

@@ -621,7 +621,7 @@ fn noise_never_panics() {
 fn osc_7770_pkg_requests() {
     let mut t = Terminal::new(20, 2);
     t.feed(b"\x1b]7770;pkg;install  helix\x07");
-    assert_eq!(t.take_ask().as_deref(), Some("install helix"));
+    assert_eq!(t.take_ask().as_deref(), Some("pkg install helix"));
     assert_eq!(t.take_ask(), None, "a one-shot");
     // Anything but package-name words is dropped.
     t.feed(b"\x1b]7770;pkg;install helix; rm -rf /\x07");
@@ -633,7 +633,21 @@ fn osc_7770_pkg_requests() {
     t.feed(format!("\x1b]7770;pkg;{}\x07", "a".repeat(300)).as_bytes());
     assert_eq!(t.take_ask(), None);
     t.feed(b"\x1b]7770;pkg;install -y py311-pip devel/git py3*\x1b\\");
-    assert_eq!(t.take_ask().as_deref(), Some("install -y py311-pip devel/git py3*"));
+    assert_eq!(t.take_ask().as_deref(), Some("pkg install -y py311-pip devel/git py3*"));
+    // Run: a folder in work.
+    t.feed(b"\x1b]7770;run;app\x07");
+    assert_eq!(t.take_ask().as_deref(), Some("run app"));
+    t.feed(b"\x1b]7770;run;.\x07");
+    assert_eq!(t.take_ask().as_deref(), Some("run ."));
+    for bad in [&b"/etc"[..], b"../x", b"a/../b", b"a b", b"", b"a;b"] {
+        let mut v = b"\x1b]7770;run;".to_vec();
+        v.extend_from_slice(bad);
+        v.push(7);
+        t.feed(&v);
+        assert_eq!(t.take_ask(), None, "{:?}", String::from_utf8_lossy(bad));
+    }
+    t.feed(b"\x1b]7770;rm;x\x07");
+    assert_eq!(t.take_ask(), None, "an unknown kind");
     // Nothing shows on the screen.
     assert!(t.rows_text().iter().all(|r| r.trim().is_empty()));
 }

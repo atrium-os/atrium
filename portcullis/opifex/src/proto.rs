@@ -31,6 +31,14 @@ pub enum Request {
     InstallApproved { id: String, manifest_sha256: String, for_uid: u32 },
     Uninstall { id: String },
     Rollback { id: String },
+    /// Installed apps with a newer release, and what will happen to each.
+    Updates,
+    /// A person's care for one app's updates: `"notify"` (wait for me) or
+    /// `"auto"` (the publisher's class). Root, or the person who installed it.
+    SetUpdates { id: String, care: String },
+    /// Sync over the network, install what may go in the background, and
+    /// announce the rest (what the daily timer does). Root.
+    Tick,
     /// Check the catalog into the local copy: from the network (`from` empty:
     /// where the catalog says it lives; or an `https://` base) through the
     /// fetcher, or from a folder.
@@ -52,6 +60,10 @@ pub struct Described {
     /// sha256 of the release's `atrium.toml`: what the sheet approves.
     #[serde(default)]
     pub manifest_sha256: String,
+    /// On an update: the capabilities the new release asks for that the
+    /// installed one doesn't (what the sheet shows).
+    #[serde(default)]
+    pub added: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -62,5 +74,8 @@ pub enum Response {
     Found { ids: Vec<String> },
     Done { id: String, version: String },
     Synced { entries: u64, releases: usize },
+    Updates { items: Vec<crate::updates::Pending>, last_sync: u64, last_error: String },
+    Ticked { installed: Vec<String>, waiting: usize },
+    Ok,
     Error { message: String },
 }

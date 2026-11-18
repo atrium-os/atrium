@@ -161,7 +161,7 @@ Not yet built:
 - the system users `_tabula`, `_share`, `_praeco` and `_forum`;
 - Portcullis mounting the socket's directory into those jails.
 
-## 3. Tabula's wire (`CLASS_CLIPBOARD` = 2, `/var/run/atrium/tabulad.sock`)
+## 3. Tabula's wire (`CLASS_CLIPBOARD` = 2, `/atrium/sockets/clipboard/clipboard.sock`)
 
 Reachable by apps whose manifest says `clipboard = true` (portcullis.md). Payloads are CAS blobs
 (aqueduct.md §6.4): a large image copied once is one allocation, also in Tessera.
@@ -220,6 +220,24 @@ of the drag frescod bound it to, once; `DRAG_CANCEL { drag_id }` (op `0x12`, sou
 it; one pending drag per source, 60 s at most. Tested: a drop releases once; a plain press or a
 drop token minted for another app takes nothing; only the source cancels; a drag needs a button
 press. Not yet: privacy mode, persistence across restarts (none planned for v1).
+
+### 3.3 Personas, as built (2026-11-18)
+
+Each entry and each pending drag is in a persona (personas.md §6): the one the launch registry
+gives the copying uid (a person's own login uid is their Personal; other unregistered uids are
+system services, outside every persona). `GET` and `DROP_GET` take an entry only within its
+persona, or across with the person's switch for `clipboard` crossings in their `policy.toml`
+(`Policy::may_cross`, read afresh each time); otherwise `Refused { reason: OTHER_PERSONA (10) }`
+and tabulad logs which persona the entry was copied in, never what. `Set.for_uid` copies for
+another app, in that app's persona: only from the uids in `TABULA_FOR_OTHERS` (default
+`_monstrator`, for Monstrator's Copy address), refused for anyone else. tabulad listens on
+`/atrium/sockets/clipboard/clipboard.sock` (the directory the `clipboard` capability mounts;
+Pergola's and the Terminal's clients default to it) and runs as `_tabula` (65039), the uid
+frescod lets spend copy and paste presses. Tested in `tabula/tests/wire.rs` (Work to Personal
+and back, a drag, the switch one way only, Copy address and a stranger's `for_uid`) and in the
+VM by `scripts/navigator-confined-vm.sh`. Not yet: frescod's strip note "copied in Work" on a
+refused paste, and tabulad in a jail of its own (the person's `policy.toml` must stay readable
+to it).
 
 ## 4. Drag and drop
 

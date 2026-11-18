@@ -10,3 +10,4 @@ pub mod installed;
 pub mod layer;
 pub mod proto;
 pub mod runtime;
+pub mod updates;

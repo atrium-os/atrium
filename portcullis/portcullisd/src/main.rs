@@ -334,6 +334,23 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let mut rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule_for(&app_id, &owner, registry.resolve(uid).map(|(_, a)| a)).cloned());
+            /* ★ An app with no system rule starts only its own id, or an id
+             * under it (the Navigator's `org.atrium.navigator.converter`),
+             * and only as itself: not another app's bundle as its own uid,
+             * which would let it run any installed program with its grants.
+             * Its own parsers are `[[workers]]`, through WorkerCall. A
+             * person's own processes (the CLI) keep this lane as before. */
+            if rule.is_none() {
+                if let Some((_, caller)) = registry.resolve(uid) {
+                    if app_id != caller && !app_id.starts_with(&format!("{caller}.")) {
+                        eprintln!("portcullisd: ExecInstance of {app_id} DENIED to {caller} (uid {uid}): not its own");
+                        write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                            message: format!("{caller} may start only its own id or one under it; \
+                                              its parsers are [[workers]] (WorkerCall)") })?;
+                        continue;
+                    }
+                }
+            }
             /* ★ A per-instance worker (personas.md §3): its uid is the
              * served instance's, one per (person, worker app, persona). The
              * served instance is the caller itself, or for a system caller
@@ -379,7 +396,60 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                 as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
             } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None, as_uid)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid, None)?;
+            continue;
+        }
+        /* ★ WorkerCall (app-composition.md §4, dev-tools-plan.md M5): one
+         * of the caller's own `[[workers]]`, named in its INSTALLED manifest,
+         * found by the PEER UID through the launch registry. It runs in a
+         * one-shot jail of its own with no capability at all, as a uid of
+         * its own per (person, app, worker, persona): never the caller's,
+         * so a parser that is taken over holds nothing of the core's. */
+        if let Request::WorkerCall { worker } = &req {
+            let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            let refuse = |why: String| Response::LaunchFailed { stage: "worker".into(), message: why };
+            let Some((person, app, persona)) = reg.resolve(uid)
+                .map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(uid).flatten().map(String::from))) else {
+                eprintln!("portcullisd: worker {worker:?} DENIED to uid {uid}: not a launched app");
+                write_response(&mut writer, &refuse("only an app calls its workers: uid is not a launched app".into()))?;
+                continue;
+            };
+            if app.starts_with("worker:") {
+                write_response(&mut writer, &refuse("a worker calls no workers".into()))?;
+                continue;
+            }
+            let Some(m) = launch::installed_manifest(&app) else {
+                write_response(&mut writer, &refuse(format!("{app} is not installed")))?;
+                continue;
+            };
+            let Some(w) = m.worker(worker) else {
+                write_response(&mut writer, &refuse(format!("{app} has no worker {worker:?} in its manifest")))?;
+                continue;
+            };
+            if w.isolation != portcullis_toml::WorkerIsolation::Jail {
+                write_response(&mut writer, &refuse(format!("worker {worker:?} is isolation = capsicum: the SDK starts it in the core's own jail")))?;
+                continue;
+            }
+            static WORKER_CALL_UIDS: Mutex<()> = Mutex::new(());
+            let held = WORKER_CALL_UIDS.lock().unwrap_or_else(|e| e.into_inner());
+            let got = launch::resolve_instance_uid(&person, &format!("worker:{app}:{worker}"), None, persona.as_deref());
+            drop(held);
+            let run_as = match got {
+                Ok((_, name)) => name,
+                Err(e) => {
+                    write_response(&mut writer, &refuse(format!("worker {worker:?}'s uid for {person}: {e:?}")))?;
+                    continue;
+                }
+            };
+            let instance = worker_instance(worker, uid);
+            eprintln!("portcullisd: worker {app}/{worker} for {person}{} runs as {run_as} ({instance})",
+                      persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default());
+            let rule = portcullis_policy::WorkerRule {
+                callers: Vec::new(), caller_apps: vec![app.clone()], run_as, per_instance: false,
+                concurrent: Some(WORKER_CALLS_PER_APP),
+            };
+            handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
+                                 &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()))?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -423,7 +493,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None)?;
             continue;
         }
         /* ★ OpenCdm (docs/spec/hospes.md §3, §8.4): a content decryption
@@ -471,7 +541,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None)?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -708,6 +778,9 @@ fn handle_exec_instance(
     prepare:  Option<&dyn Fn([OwnedFd; 3]) -> std::io::Result<[OwnedFd; 3]>>,
     /* Some: answer `ReadyForFdsAs` with this uid (the caller asked). */
     as_uid:   Option<u32>,
+    /* Some: the app's `[[workers]]` entry of this name, which runs with no
+     * capability at all, so the capability gate has nothing to ask. */
+    worker:   Option<String>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -755,7 +828,14 @@ fn handle_exec_instance(
         }),
     };
     let current_hash = hash_manifest(text.as_bytes());
-    let delta = {
+    if let Some(w) = &worker {
+        if manifest.worker(w).is_none() {
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "worker".into(), message: format!("{app_id} has no worker {w:?}"),
+            });
+        }
+    }
+    let (delta, system_unusable) = if worker.is_some() { (Default::default(), None) } else {
         let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
         let tp = match st.get_or_load(user) {
             Ok(tp) => tp,
@@ -767,9 +847,8 @@ fn handle_exec_instance(
         let d = decide(&app_id, &manifest.capabilities, &current_hash, &tp.policy, system.as_ref());
         if let Some(why) = &d.system_unusable { eprintln!("portcullisd: system policy unusable: {why}") }
         if let Some(by) = d.by { eprintln!("portcullisd: {app_id} authorized by {by:?} policy (one-shot lane, user {user})") }
-        d
+        (d.delta, d.system_unusable)
     };
-    let (delta, system_unusable) = (delta.delta, delta.system_unusable);
     if !delta.is_empty() {
         let why = format!(
             "{} needs capabilities that are not granted: {}. \
@@ -836,6 +915,7 @@ fn handle_exec_instance(
         // inside portcullis_oneshot — see Spec::user_name.
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
         extra_env,
+        worker,
     };
     /* ★ A worker does not outlive its caller. The caller holds this
      * connection for the jail's whole life; if it hangs up (it exited, or it
@@ -866,6 +946,16 @@ fn handle_exec_instance(
     drop(slot);
     if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
     write_response(writer, &resp)
+}
+
+/// How many calls of one app's workers may run at once.
+const WORKER_CALLS_PER_APP: usize = 16;
+
+/// A worker call's jail instance: the worker's name and a sequence number,
+/// unique per call, within the 64 bytes a jail name may take.
+fn worker_instance(worker: &str, uid: u32) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("w-{worker}-{uid}-{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// A fetcher's jail instance: unique per start (the caller's uid and a
@@ -2532,6 +2622,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::OpenCdm { .. } => Response::Error {
             message: "OpenCdm must be routed through the peer-uid, fd-passing path".into(),
+        },
+        Request::WorkerCall { .. } => Response::Error {
+            message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::OpenFetcher => Response::Error {
             message: "OpenFetcher must be routed through the peer-uid, fd-passing path".into(),

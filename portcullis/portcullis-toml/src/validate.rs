@@ -32,6 +32,11 @@ pub fn validate(m: &Manifest) -> Report {
     if m.app.version.trim().is_empty() {
         r.errors.push("[app].version: must be non-empty".into());
     }
+    if let Some(u) = &m.app.updates {
+        if !crate::schema::UPDATE_CLASSES.contains(&u.as_str()) {
+            r.errors.push(format!("[app].updates {u:?}: one of \"auto\", \"notify\", \"required\""));
+        }
+    }
     /* entry: relative path within the tree (no leading /, no ..) */
     let e = &m.app.entry;
     if e.starts_with('/') {
@@ -50,6 +55,65 @@ pub fn validate(m: &Manifest) -> Report {
     /* ── [capabilities] ─────────────────────────────────────── */
 
     validate_capabilities(&m.capabilities, "[capabilities]", &mut r);
+
+    /* ── [[workers]], [roles], [ipc] (app-composition.md §4.1, §5.1) ── */
+
+    let mut names = std::collections::BTreeSet::new();
+    for (i, w) in m.workers.iter().enumerate() {
+        let ctx = format!("[[workers]] #{} ({:?})", i + 1, w.name);
+        if w.name.is_empty() || w.name.len() > 32
+            || !w.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || w.name.starts_with('-') {
+            r.errors.push(format!("{ctx}.name: 1 to 32 of `a-z 0-9 -`, not starting with `-`"));
+        }
+        if !names.insert(w.name.as_str()) {
+            r.errors.push(format!("{ctx}.name: two workers are called {:?}", w.name));
+        }
+        let e = &w.entry;
+        if e.trim().is_empty() || e.starts_with('/') || e.split('/').any(|c| c == "..") {
+            r.errors.push(format!("{ctx}.entry {e:?}: a relative path in the bundle, without `..`"));
+        }
+        if e == &m.app.entry {
+            r.errors.push(format!("{ctx}.entry {e:?}: is the app's own entry; a worker is a separate program"));
+        }
+        if let Some(mem) = &w.memory {
+            if !is_valid_size(mem) {
+                r.errors.push(format!("{ctx}.memory {mem:?}: must look like \"512M\", \"2G\""));
+            }
+        }
+        if let Some(t) = &w.cpu {
+            if !is_valid_duration(t) {
+                r.errors.push(format!("{ctx}.cpu {t:?}: must look like \"10s\", \"2m\""));
+            }
+        }
+    }
+    if m.workers.len() > 16 {
+        r.errors.push(format!("[[workers]]: {} declared, at most 16", m.workers.len()));
+    }
+    let role_name = |n: &str| !n.is_empty() && n.len() <= 32
+        && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if let Some(roles) = &m.roles {
+        for n in roles.implements.iter().filter(|n| !role_name(n)) {
+            r.errors.push(format!("[roles].implements {n:?}: a role name, `a-z 0-9 -`"));
+        }
+    }
+    if let Some(ipc) = &m.ipc {
+        for (k, list) in [("provides", &ipc.provides), ("uses", &ipc.uses)] {
+            for n in list {
+                let ok = n.split_once('/').is_some_and(|(id, v)| is_valid_app_id(id) && !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+                if !ok {
+                    r.errors.push(format!("[ipc].{k} {n:?}: a service name and a version, `com.example.app.service/1`"));
+                }
+            }
+        }
+        // A service is named under the app's own id.
+        for n in &ipc.provides {
+            let id = n.split('/').next().unwrap_or("");
+            if id != m.app.id && !id.starts_with(&format!("{}.", m.app.id)) {
+                r.errors.push(format!("[ipc].provides {n:?}: must be under the app's own id {:?}", m.app.id));
+            }
+        }
+    }
 
     /* ── [setup] + [setup.capabilities] ─────────────────────── */
 
@@ -150,6 +214,14 @@ pub fn validate(m: &Manifest) -> Report {
 }
 
 fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
+    /* embeds: Limen role names (app-composition.md §3, C7). */
+    if let Some(e) = &c.embeds {
+        for n in e {
+            if n.is_empty() || n.len() > 32 || !n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                r.errors.push(format!("{ctx}.embeds {n:?}: a role name, `a-z 0-9 -`"));
+            }
+        }
+    }
     /* graphics: "fresco" (windows) or "vulkan" (windows + the per-app GPU
      * executor broker); warn on others. */
     if let Some(g) = &c.graphics {
@@ -376,4 +448,90 @@ fn is_valid_size(s: &str) -> bool {
     let (num, unit) = s.split_at(s.len() - 1);
     if !matches!(unit, "K" | "M" | "G") { return false; }
     num.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use crate::Manifest;
+
+    const PHOTOS: &str = r#"
+[app]
+id = "com.example.photos"
+name = "Photos"
+version = "1"
+entry = "bin/photos"
+
+[capabilities]
+graphics = "fresco"
+embeds = ["picker", "doc-viewer"]
+arca = true
+
+[[workers]]
+name   = "decode"
+entry  = "bin/photos-decode"
+input  = "fd"
+lifetime = "call"
+memory = "512M"
+cpu    = "10s"
+
+[[workers]]
+name   = "index"
+entry  = "bin/photos-index"
+input  = "message"
+lifetime = "session"
+isolation = "capsicum"
+
+[roles]
+implements = ["share-target"]
+
+[ipc]
+provides = ["com.example.photos.library/1"]
+uses     = ["org.atrium.notify/1"]
+"#;
+
+    #[test]
+    fn workers_roles_ipc_parse_and_validate() {
+        let m = Manifest::from_str(PHOTOS).unwrap();
+        let r = crate::validate(&m);
+        assert!(r.is_ok(), "{:?}", r.errors);
+        assert_eq!(m.workers.len(), 2);
+        let d = m.worker("decode").unwrap();
+        assert_eq!((d.input, d.lifetime, d.isolation), (crate::schema::WorkerInput::Fd, crate::schema::WorkerLifetime::Call, crate::schema::WorkerIsolation::Jail));
+        assert_eq!(m.worker("index").unwrap().isolation, crate::schema::WorkerIsolation::Capsicum);
+        assert_eq!(m.roles.as_ref().unwrap().implements, ["share-target"]);
+        assert_eq!(m.capabilities.embeds.as_deref().unwrap(), ["picker", "doc-viewer"]);
+        assert_eq!(m.capabilities.arca, Some(true));
+        assert!(m.capabilities.extra.is_empty(), "embeds and arca are known keys");
+    }
+
+    #[test]
+    fn a_worker_can_hold_no_capability_and_unknown_keys_are_refused() {
+        let with_caps = PHOTOS.replace("cpu    = \"10s\"", "cpu    = \"10s\"\ncapabilities = { network = \"full\" }");
+        assert!(Manifest::from_str(&with_caps).is_err(), "a worker's capabilities");
+        assert!(Manifest::from_str(&format!("{PHOTOS}\n[plugins]\nx = 1\n")).is_err(), "an unknown section");
+        assert!(Manifest::from_str(&PHOTOS.replace("implements", "implement")).is_err(), "an unknown key in [roles]");
+    }
+
+    #[test]
+    fn bad_workers_are_errors() {
+        for (from, to) in [
+            ("name   = \"index\"", "name   = \"decode\""),
+            ("entry  = \"bin/photos-decode\"", "entry  = \"../x\""),
+            ("entry  = \"bin/photos-decode\"", "entry  = \"bin/photos\""),
+            ("name   = \"decode\"", "name   = \"Decode\""),
+            ("memory = \"512M\"", "memory = \"lots\""),
+            ("com.example.photos.library/1", "org.other.thing/1"),
+            ("org.atrium.notify/1", "org.atrium.notify"),
+        ] {
+            let m = Manifest::from_str(&PHOTOS.replacen(from, to, 1)).unwrap();
+            assert!(!crate::validate(&m).is_ok(), "{to}");
+        }
+    }
+
+    #[test]
+    fn old_manifests_are_unchanged() {
+        let m = Manifest::from_str("[app]\nid = \"org.x.y\"\nname = \"Y\"\nversion = \"1\"\nentry = \"y\"\n").unwrap();
+        assert!(m.workers.is_empty() && m.roles.is_none() && m.ipc.is_none());
+        assert!(crate::validate(&m).is_ok());
+    }
 }

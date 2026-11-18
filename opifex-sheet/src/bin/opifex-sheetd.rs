@@ -329,7 +329,7 @@ mod tests {
         Described {
             id: "org.atrium.hello".into(), kind: "app".into(), name: "Hello".into(), description: String::new(),
             latest: "1.1".into(), publisher: "k".into(), catalog: "Atrium".into(), capabilities: vec![],
-            archive_size: 1, installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32),
+            archive_size: 1, installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32), added: vec![],
         }
     }
 

@@ -69,6 +69,8 @@ pub fn words(cap: &str) -> (String, bool) {
         "usb-hid" | "usb_hid" => ("talk to USB input devices directly", true),
         "audio-monitor" | "audio_monitor" => ("hear what other apps play", true),
         "window-management" | "window_management" => ("manage other apps' windows", true),
+        "arca" => ("keep secrets in your keychain (Arca)", false),
+        "embeds" => ("show parts of other apps inside its window", false),
         _ => return (cap.replace(['-', '_'], " "), true),
     };
     (w.into(), risky)

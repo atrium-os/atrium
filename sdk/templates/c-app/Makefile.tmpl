@@ -1,0 +1,7 @@
+# {{name}}: made by `cargo atrium new --template c-app` (dev-tools.md §5.4).
+# make        builds {{name}}
+# make run    asks you, in the Terminal, to Run it as an app
+PROG=		{{name}}
+SRCS=		{{name}}.c
+ATRIUM_LIBS=	atrium
+.include <atrium.app.mk>

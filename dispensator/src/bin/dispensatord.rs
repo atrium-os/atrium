@@ -1062,7 +1062,8 @@ mod run {
             outbound: vec![NetDest { cidr: format!("{addr}/32"), port: Some(port), udp: false }],
             peers: vec![],
             inbound: vec![],
-            no_resolver: false,
+            // The server is handed the address (share::argv): no DNS.
+            no_resolver: true,
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {

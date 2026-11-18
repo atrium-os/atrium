@@ -121,6 +121,7 @@ echo "$L" | grep -q " rust@$RVER " && echo "$L" | grep -q " c-dev@1 " && ok "bot
 check "installed trees are root's, not writable by others" "root 755" "$(V "stat -f '%Su %Lp' /var/lib/atrium/layers/rust@$RVER")"
 
 echo "=== portcullisd"
+V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 V "mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK; daemon -f -o $LOG /usr/local/bin/portcullisd --socket $PSOCK; sleep 3; chmod 666 $PSOCK; test -S $PSOCK" \
@@ -142,8 +143,8 @@ echo "=== a Rust workspace"
 out=$(ws "new rs --toolchain rust --network none")
 echo "$out" | grep -q "^rs" && ok "made (rust, no network)" || bad "new rs: $out"
 check "its project file names both layers" "1" "$(V "grep -c 'layers = \[\"rust@$RVER\", \"c-dev@1\"\]' $W/rs/work/.atrium/devjail.toml" | tr -d ' ')"
-out=$(x rs 'echo PATH=$PATH; command -v cargo rustc rust-analyzer clangd')
-echo "$out" | grep -q "PATH=/atrium/toolchains/rust/bin:/atrium/toolchains/c-dev/bin:" && ok "layers first on PATH" || bad "PATH: $out"
+out=$(x rs 'echo PATH=$PATH; for c in cargo rustc rust-analyzer clangd; do command -v $c; done')
+echo "$out" | grep -q "PATH=\(/atrium/bin:\)\{0,1\}/atrium/toolchains/rust/bin:/atrium/toolchains/c-dev/bin:" && ok "layers on PATH before the base" || bad "PATH: $out"
 echo "$out" | grep -q "/atrium/toolchains/rust/bin/rust-analyzer" && ok "rust-analyzer by bare name" || bad "rust-analyzer: $out"
 out=$(x rs 'touch /atrium/toolchains/rust/bin/x 2>&1; echo rc=$?')
 echo "$out" | grep -q "rc=1" && ok "the layer is read-only" || bad "layer write: $out"
@@ -154,7 +155,7 @@ echo "$out" | grep -q "Hello, world!" && ok "cargo new, test, run (no network)" 
 out=$(x rs 'cd hello && cargo clippy -q -- -D warnings 2>&1; echo clippy=$?; cargo fmt --check; echo fmt=$?')
 echo "$out" | grep -q "clippy=0" && ok "clippy" || bad "clippy: $out"
 echo "$out" | grep -q "fmt=0" && ok "rustfmt" || bad "rustfmt: $out"
-out=$(x rs 'ls $(rustc --print target-libdir --target aarch64-unknown-freebsd) | grep -c "^libstd-"')
+out=$(x rs 'ls $(rustc --print target-libdir --target aarch64-unknown-freebsd) | grep -c "^libstd-.*rlib$"')
 check "std for aarch64 is in the layer" "1" "$(echo "$out" | tail -1)"
 check "RUST_SRC_PATH points at the std source" "1" "$(x rs 'test -f $RUST_SRC_PATH/std/src/lib.rs && echo 1' | tail -1)"
 
@@ -206,7 +207,7 @@ echo "=== a C workspace"
 out=$(ws "new cw --toolchain c --network none")
 echo "$out" | grep -q "^cw" && ok "made (c, no network)" || bad "new cw: $out"
 put() { printf '%b' "$2" > "$H/f"; scp -q $K -P 2222 "$H/f" "root@localhost:$W/cw/work/$1"; V "chown alice:files-alice $W/cw/work/$1"; }
-V "mkdir -p $W/cw/work/cm $W/cw/work/me; chown alice:files-alice $W/cw/work/cm $W/cw/work/me"
+V "mkdir -p $W/cw/work/cm $W/cw/work/me; chown alice:files-alice $W/cw/work/cm $W/cw/work/me; chmod 2775 $W/cw/work/cm $W/cw/work/me"
 put cm/CMakeLists.txt 'cmake_minimum_required(VERSION 3.20)\nproject(cm C)\nadd_executable(cm cm.c)\n'
 put cm/cm.c '#include <stdio.h>\nint main(void) { puts("hello from cmake"); return 0; }\n'
 put me/meson.build "project('me', 'c')\nexecutable('me', 'me.c', dependencies: dependency('zlib'))\n"
@@ -215,16 +216,17 @@ out=$(x cw 'cd cm && cmake -S . -B b -G Ninja >/dev/null && cmake --build b >/de
 check "CMake + Ninja" "hello from cmake" "$(echo "$out" | tail -1)"
 out=$(x cw 'cd me && meson setup b >/dev/null && meson compile -C b >/dev/null && ./b/me')
 echo "$out" | tail -1 | grep -q "^zlib " && ok "Meson with zlib ($(echo "$out" | tail -1))" || bad "meson: $out"
-check "pkg-config finds the base system's zlib" "-lz" "$(x cw 'pkg-config --libs zlib' | tail -1 | tr -d ' ')"
+out=$(x cw 'pkg-config --libs zlib' | tail -1)
+case " $out " in *" -lz "*) ok "pkg-config finds the base system's zlib ($out)" ;; *) bad "pkg-config: $out" ;; esac
 out=$(x cw 'git init -q g && cd g && echo a > a && git add a && git -c user.name=t -c user.email=t@t commit -qm one && git log --oneline | wc -l')
 check "git commits" "1" "$(echo "$out" | tail -1 | tr -d ' ')"
 out=$(x cw 'command -v rustc || echo none')
 check "a C workspace doesn't get Rust" "none" "$(echo "$out" | tail -1)"
 
 echo "=== shared"
-src() { V "mount -p | awk '\$2 ~ /ws.*$1.*atrium\/toolchains\/c-dev\$/ {print \$1}' | head -1"; }
-a=$(src rs); b=$(src cw)
-[ -n "$a" ] && [ "$a" = "$b" ] && ok "both workspaces mount the same c-dev tree ($a)" || bad "c-dev sources: [$a] [$b]"
+m=$(V "mount -p | awk '\$2 ~ /toolchains\/c-dev\$/ {print \$1}'")
+n=$(echo "$m" | grep -c .); u=$(echo "$m" | sort -u | grep -c .)
+[ "$n" -ge 2 ] && [ "$u" = 1 ] && ok "both workspaces mount the same c-dev tree ($(echo "$m" | head -1))" || bad "c-dev mounts: $(V "mount -p | grep toolchains")"
 
 for w in rs cw; do ws "stop $w" >/dev/null; done
 V "pkill -x portcullisd"

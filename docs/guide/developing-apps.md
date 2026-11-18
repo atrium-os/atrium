@@ -67,7 +67,10 @@ The `app` template is a Pergola window with a button and a counter, an
 `atrium.toml` that asks for the display and nothing else, and a
 `.cargo/config.toml` naming the Atrium crate registry. **Planned (M7):**
 `viewer`, `client`, `media` and `service` templates with workers, once
-`atrium-worker` lands, and a C template on `atrium.app.mk`.
+`atrium-worker` lands.
+
+`cargo atrium new hello --template c-app` is the same in C: a window on
+libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
 
 `--sdk-path <atrium checkout>` makes path dependencies on a local tree
 instead of registry ones (what the SDK's own tests use).
@@ -159,10 +162,21 @@ the first signed publication, and `cargo atrium` verifying before each build.
 
 In a workspace, the `c-dev` layer has CMake, Meson, Ninja, gmake and
 pkgconf; the base system has clang, lld and the Atrium headers and
-libraries (`pkg-config --cflags --libs atrium`). **Planned (M4):**
-`atrium.app.mk` with `make run` and `make bundle`, and a C template.
+libraries (`pkg-config --cflags --libs atrium`) and `atrium.app.mk`:
+`PROG=`, `ATRIUM_LIBS=` and `.include <atrium.app.mk>` give `make`,
+`make atrium.toml` and `make run`. `cargo atrium new <dir> --template c-app`
+starts one. **Planned (M7):** `make bundle`.
 
-## 7. Fuzzing (built), running and bundling (planned)
+## 7. Running, fuzzing and bundling
+
+In a workspace's Terminal, `cargo atrium run [--release]` builds, puts the
+binary where `atrium.toml`'s `entry` says (the app template uses
+`bin/<name>`), and asks you to Run the project as an app: the Terminal shows
+what it asks and Run needs your press. The app runs with the capabilities
+its manifest asks for and the libraries it links, in its own jail (amber
+window frame). For C, `make run` does the same.
+
+### Fuzzing
 
 Declare what to fuzz in Cargo.toml; each target is a `fn(&[u8])` in the
 project's lib crate:
@@ -199,8 +213,6 @@ being declared.
 
 **Planned:**
 
-- `cargo atrium run` (M7): build, then ask portcullisd to run the app from
-  the workspace as a dev app (amber window frame).
 - `cargo atrium bundle [--sign]` (M7): a release bundle with its closure,
   signed with your publisher key from Arca.
 
@@ -213,6 +225,7 @@ being declared.
 | `cargo atrium new --list [--json]` | the templates |
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
+| `cargo atrium run [--release] [cargo args]` | build and Run the project as a dev app (asks for your press) |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |
 | `cargo atrium registry build --out d --url u [--sign key] <seed>...` | for SDK maintainers: pack and sign the registry |

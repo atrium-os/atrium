@@ -75,11 +75,15 @@ impl Sheet {
         if let Some(old) = &a.installed {
             v.push((format!("You have {old}."), Tone::Quiet));
         }
-        if a.capabilities.is_empty() {
+        // An update shows only what it adds: the rest was agreed to already.
+        let (head, list) = if self.update() { ("It now also asks to:", &a.added) } else { ("It may:", &a.capabilities) };
+        if self.update() && list.is_empty() {
+            v.push(("It asks for nothing new.".into(), Tone::Body));
+        } else if list.is_empty() {
             v.push(("It may use nothing beyond its own window.".into(), Tone::Body));
         } else {
-            v.push(("It may:".into(), Tone::Body));
-            for c in &a.capabilities {
+            v.push((head.into(), Tone::Body));
+            for c in list {
                 let (w, risky) = crate::words(c);
                 v.push((format!("  {w}"), if risky { Tone::Marked } else { Tone::Body }));
             }
@@ -164,7 +168,7 @@ pub(crate) fn described(installed: Option<&str>) -> Described {
         id: "org.atrium.hello".into(), kind: "app".into(), name: "Hello".into(), description: "Says hello".into(),
         latest: "1.1".into(), publisher: "0123456789abcdef0123".into(), catalog: "Atrium".into(),
         capabilities: vec!["clipboard".into(), "network".into()], archive_size: 2_500_000,
-        installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32),
+        installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32), added: vec![],
     }
 }
 
@@ -201,5 +205,13 @@ mod tests {
         assert_eq!(u.title(), "Update Hello to 1.1?");
         assert_eq!(u.label(Row::Install), "Update");
         assert!(u.lines().iter().any(|(x, _)| x == "You have 1.0."));
+        assert!(u.lines().iter().any(|(x, _)| x == "It asks for nothing new."));
+        assert!(!u.lines().iter().any(|(x, _)| x.contains("clipboard")));
+        let mut d = described(Some("1.0"));
+        d.added = vec!["network".into()];
+        let l = Sheet::new(d).lines();
+        assert!(l.iter().any(|(x, _)| x == "It now also asks to:"));
+        assert!(l.contains(&("  use the network".into(), Tone::Marked)));
+        assert!(!l.iter().any(|(x, _)| x.contains("clipboard")));
     }
 }

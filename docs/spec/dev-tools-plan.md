@@ -287,9 +287,11 @@ and Mail's host tests pass with real jails.
   from Cargo/Meson/CMake/make/a lone C file with a Problems panel, git status, the
   composition panel with `cargo atrium check`, New project from `cargo atrium new`,
   and the workspace's Terminal from a button). `vm-artifex-check.sh` passes on the
-  cloud VM (pick, edit, save, build problems, jump to the error, the terminal);
-  rust-analyzer and clangd diagnostics wait for the toolchain layers to be installed
-  there. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
+  cloud VM (pick, edit, save, build problems, jump to the error, the terminal), and
+  with the c-dev and Rust layers installed (`CDEV=`, `RUST=`) clangd marks hello.c
+  and rust-analyzer marks a Cargo project's main.rs in a Rust workspace. Language
+  and debug servers run with their stderr dropped, since `WorkspaceExec` merges it
+  into the output the protocol is framed on. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
   `WorkspaceExec` (breakpoints in the gutter, stack, locals, stepping; end-to-end on
   Linux), and the fuzz panel running `cargo atrium fuzz` in the background, core
   crashes first with "Move into a worker", a crash opening at its line and replaying

@@ -12,6 +12,9 @@ pub enum Outcome {
     /// `persona`: another persona to open it in (personas.md §6), by
     /// name; `None`, the asking app's own.
     Chose { app: String, always: bool, persona: Option<String> },
+    /// Copy address (personas.md §6): the address goes on the clipboard
+    /// in the asking app's persona, spending `token`, the press.
+    Copy { token: [u8; 16] },
     Cancelled,
 }
 
@@ -31,6 +34,9 @@ pub enum Row {
     App(usize),
     /// Which persona it opens in (cycles); only with named personas.
     Persona,
+    /// Copy the address instead, in the asker's persona; only with named
+    /// personas, for when the link may not go where the person wants.
+    Copy,
     Always,
     Cancel,
 }
@@ -72,8 +78,8 @@ impl Sheet {
     }
 
     pub fn rows(&self) -> Vec<Row> {
-        let p = (!self.personas.is_empty()).then_some(Row::Persona);
-        (0..self.apps.len()).map(Row::App).chain(p).chain([Row::Always, Row::Cancel]).collect()
+        let p = (!self.personas.is_empty()).then_some([Row::Persona, Row::Copy]);
+        (0..self.apps.len()).map(Row::App).chain(p.into_iter().flatten()).chain([Row::Always, Row::Cancel]).collect()
     }
 
     fn persona_name(p: &PersonaChoice) -> String {
@@ -112,6 +118,7 @@ impl Sheet {
                 let how = if p.here { " (where it was opened)" } else if p.allowed { "" } else { " (off in Settings)" };
                 format!("In: {}{how}", Self::persona_name(p))
             }
+            Row::Copy => format!("Copy address (in {})", Self::persona_name(&self.personas[0])),
             Row::Always => format!("{} Always use this app for {} links", if self.always { "[x]" } else { "[ ]" }, self.scheme),
             Row::Cancel => "Cancel".into(),
         }
@@ -144,6 +151,7 @@ impl Sheet {
                 self.focus = i;
                 Do::Redraw
             }
+            Some(Row::Copy) => Do::Done(Outcome::Copy { token }),
             Some(Row::Cancel) => Do::Done(Outcome::Cancelled),
             None => Do::Nothing,
         }
@@ -259,7 +267,7 @@ mod tests {
         // in Personal; School's switch is off.
         let mut s = Sheet::with_personas("https://a.example/", "https", vec![nav],
             vec![p("work", true, true, &[]), p("personal", false, true, &["org.atrium.navigator"]), p("school", false, false, &["org.atrium.navigator"])]);
-        assert_eq!(s.rows(), vec![Row::App(0), Row::App(1), Row::Persona, Row::Always, Row::Cancel]);
+        assert_eq!(s.rows(), vec![Row::App(0), Row::App(1), Row::Persona, Row::Copy, Row::Always, Row::Cancel]);
         assert!(s.label(&Row::Persona).starts_with("In: Work"));
         assert_eq!(s.press(1, [1; 16]), Do::Redraw, "the asker itself, in its own persona: no");
         assert!(s.notice.as_deref().unwrap().contains("another persona"));
@@ -271,6 +279,9 @@ mod tests {
         assert!(s.label(&Row::Persona).contains("off in Settings"));
         assert_eq!(s.press(0, [1; 16]), Do::Redraw, "School's switch is off");
         assert!(s.notice.as_deref().unwrap().contains("Links from Work to School are off"));
+        // Copy address instead: in Work, whatever persona is chosen.
+        assert_eq!(s.label(&Row::Copy), "Copy address (in Work)");
+        assert_eq!(s.press(3, [4; 16]), Do::Done(Outcome::Copy { token: [4; 16] }));
         // No named persona: no persona row.
         assert!(!Sheet::with_personas("x", "https", vec![], vec![p("personal", true, true, &[])]).rows().contains(&Row::Persona));
     }

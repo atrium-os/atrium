@@ -77,7 +77,8 @@ fn main() -> ExitCode {
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
         "catalog"   => catalog::cmd(&args[2..]),
-        "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load" => ask_daemon(&args[1..]),
+        "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
+        | "updates" | "update-care" | "tick" => ask_daemon(&args[1..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
         other => { eprintln!("opifex: unknown command: {other}"); usage(); return ExitCode::from(2); }
     };
@@ -116,7 +117,10 @@ fn usage() {
            describe <id> | search <text> | installed\n  \
            get <id>            install the newest catalog release (root)\n  \
            side-load <path>    install a bundle folder or .insula file (root)\n  \
-           remove <id> | sync [https://… | <catalog-dir>]   (root; no argument: the network)\n\n\
+           remove <id> | sync [https://… | <catalog-dir>]   (root; no argument: the network)\n  \
+           updates             what is waiting, and why\n  \
+           update-care <id> notify|auto   wait for me / the publisher's timing\n  \
+           tick                the daily round now (root)\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -226,6 +230,9 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
             Some(a) if a.starts_with("https://") => a.clone(),
             Some(_) => std::fs::canonicalize(arg(1)?).map_err(|e| e.to_string())?.display().to_string(),
         } },
+        "updates" => Request::Updates,
+        "update-care" => Request::SetUpdates { id: arg(1)?, care: arg(2)? },
+        "tick" => Request::Tick,
         _ => unreachable!(),
     };
     let sock = std::env::var("OPIFEX_SOCKET").unwrap_or_else(|_| opifex::proto::SOCKET.into());
@@ -252,6 +259,27 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         Response::Found { ids } => { for i in ids { println!("  {i}"); } Ok(()) }
         Response::Done { id, version } => { println!("opifex: {id} {version}: done"); Ok(()) }
         Response::Synced { entries, releases } => { println!("opifex: catalog checked: {entries} entries, {releases} releases"); Ok(()) }
+        Response::Updates { items, last_sync, last_error } => {
+            println!("last checked: {}{}", if last_sync == 0 { "never".into() } else { format!("{last_sync} (unix time)") },
+                     if last_error.is_empty() { String::new() } else { format!(", failed: {last_error}") });
+            if items.is_empty() { println!("  everything is up to date"); }
+            for u in items {
+                let what = match u.action {
+                    opifex::updates::Action::Background => "goes in on its own".to_string(),
+                    opifex::updates::Action::Notify => "waits for you".to_string(),
+                    opifex::updates::Action::Ask => format!("asks for more: {}", u.added.join(", ")),
+                    opifex::updates::Action::Refused => format!("refused: {}", u.why),
+                };
+                println!("  {:<32} {} -> {}  {what}", u.id, u.from, u.to);
+            }
+            Ok(())
+        }
+        Response::Ticked { installed, waiting } => {
+            for i in &installed { println!("opifex: updated {i}"); }
+            println!("opifex: {} updated, {waiting} waiting", installed.len());
+            Ok(())
+        }
+        Response::Ok => Ok(()),
     }
 }
 

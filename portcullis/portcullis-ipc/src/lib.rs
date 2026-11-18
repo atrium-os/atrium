@@ -168,6 +168,20 @@ pub enum Request {
         serves: Option<u32>,
     },
 
+    /// ★ One of the caller's own workers (app-composition.md §4.1,
+    /// dev-tools-plan.md M5): `worker` names a `[[workers]]` entry of the
+    /// caller's INSTALLED manifest, the caller being the launched app its
+    /// peer uid resolves to, never anything it sends. The worker runs from
+    /// the app's own signed bundle in a one-shot jail with no capability, as
+    /// a uid of its own per (person, app, worker). `instance` keeps
+    /// concurrent calls apart (portcullisd adds its own count). The handoff
+    /// is `ExecInstance`'s: `ReadyForFds`, then three descriptors (the
+    /// worker's stdin, stdout, stderr), then `LaunchExit` when it ends; the
+    /// jail goes when the caller hangs up.
+    WorkerCall {
+        worker: String,
+    },
+
     /// ★ A fetcher of the caller's own: Nuntius (docs/spec/nuntius.md §2),
     /// the system's jailed fetcher, one instance per request. Requires the
     /// caller's INSTALLED manifest to hold `net-fetch`; the caller is

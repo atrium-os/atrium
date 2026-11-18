@@ -34,7 +34,8 @@ pub struct StateDiff {
     pub modes: Option<u32>,
     pub title: Option<String>,
     pub clipboard: Option<String>,
-    /// A one-shot like `clipboard`: the words of a `pkg` request (OSC 7770).
+    /// A one-shot like `clipboard`: a workspace request (OSC 7770), as
+    /// `"<kind> <argument>"` ([`crate::Grid::take_ask`]).
     pub ask: Option<String>,
 }
 
@@ -153,7 +154,7 @@ impl StateDiff {
             o.extend_from_slice(c.as_bytes());
         }
         if let Some(a) = &self.ask {
-            let b = &a.as_bytes()[..a.len().min(crate::ASK_MAX)];
+            let b = &a.as_bytes()[..a.len().min(crate::ASK_MAX + 8)];
             o.extend_from_slice(&(b.len() as u16).to_be_bytes());
             o.extend_from_slice(b);
         }
@@ -202,7 +203,7 @@ impl StateDiff {
         // Checked again here: what the client shows came from the server.
         let ask = if flags & 16 != 0 {
             let n = r.u16()? as usize;
-            Some(crate::pkg_words(r.take(n)?)?)
+            Some(crate::check_ask(std::str::from_utf8(r.take(n)?).ok()?)?)
         } else {
             None
         };
@@ -457,7 +458,7 @@ mod tests {
         t.feed("\x1b]2;tïtle\x07\x1b[?1049h漢".as_bytes());
         let mut d = StateDiff::between(&crate::Grid::new(10, 2), t.grid());
         d.clipboard = Some("copied ✓".into());
-        d.ask = Some("install helix".into());
+        d.ask = Some("pkg install helix".into());
         assert!(!d.is_empty());
         let w = d.encode();
         assert_eq!(StateDiff::decode(&w), Some(d));

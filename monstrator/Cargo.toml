@@ -20,6 +20,7 @@ fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 pergola = { path = "../pergola" }
 aqueduct = { path = "../aqueduct" }
+tabula = { path = "../tabula" }
 postcard = { version = "1", features = ["use-std"] }
 
 [workspace]

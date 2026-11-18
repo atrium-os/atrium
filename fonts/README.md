@@ -19,6 +19,11 @@ How they're installed, checked and matched is in `docs/spec/fonts.md`.
 | `roboto/` | Roboto 2 | Apache 2.0 (`LICENSE`) | `github.com/googlefonts/roboto`, `src/hinted/` |
 | `inter/` | Inter 3.019 (Regular, Bold) | OFL 1.1 (`OFL.txt`) | npm `inter-font` 3.19.0 `ttf/`, a repackaging of the upstream build: the name table reads "Version 3.019;git-0a5106e0b", Rasmus Andersson |
 
+Noto Emoji 3.006 (`NotoEmoji-Regular.ttf`, `NotoEmoji-Bold.ttf`): the
+monochrome outline emoji, static instances of Google Fonts' build as carried
+by the npm package `@expo-google-fonts/noto-emoji` 0.4.8 (name table:
+"Version 3.006", "Copyright 2013 Google LLC", OFL 1.1), files renamed only.
+
 Noto script families: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil,
 Telugu, Kannada, Malayalam, Sinhala, Thai, Lao, Khmer, Myanmar, Georgian,
 Armenian, Hebrew, Ethiopic, Thaana, Syriac, Cherokee (Noto Sans), Tibetan (Noto
@@ -30,9 +35,10 @@ its own copyright line in its name table ("The Noto Project Authors").
 
 - **Arimo, Tinos, Cousine** (Apache 2.0): Liberation 2 is built from the same
   designs with the same metrics, so they would be second copies.
-- **CJK** (Noto Sans/Serif CJK): about 16 to 25 MB a weight. To be installed on
-  demand, not part of the base set.
-- **Colour emoji**: the drawing path has no colour glyph tables yet.
+- **CJK** (Noto Sans/Serif CJK): about 6 MB a weight as static TrueType.
+  Installed on demand as font packages (`docs/spec/fonts.md` §5).
+- **Colour emoji**: the drawing path has no colour glyph tables yet; Noto
+  Emoji (outlines, in the text's colour) stands in.
 - **Liberation 1.x**: GPL with a font exception. 2.x is OFL.
 - Variable-only releases (Gelasio, current Roboto and Inter): the library maps
   static files, so a family comes in only when it ships static TTFs.

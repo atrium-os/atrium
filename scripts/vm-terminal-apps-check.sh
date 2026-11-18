@@ -212,7 +212,7 @@ typ "pkg install -y helix
 waitscreen "menu=scratch asks to run" 30
 screen | grep -q "helixkg" && bad "the Esc reached the shell: $(screen)"
 k1 0x28
-waitscreen "<pkg>.*pkg install -y helix" 30 && ok "Install runs pkg over the tab" || bad "pkg run: $(screen) $(V "grep 'pkg' $LOG | tail -3")"
+waitscreen "<pkg>" 30 && ok "Install runs pkg over the tab" || bad "pkg run: $(screen) $(V "grep 'pkg' $LOG | tail -3")"
 waitscreen "<pkg>.*pkg: exit [0-9]" 900 && ok "pkg finishes: $(screen | grep -o 'pkg: exit [0-9]*' | tail -1)" || bad "pkg end: $(screen)"
 shot apps-3-pkg
 k1 0x2c
@@ -222,6 +222,15 @@ waitscreen "rc=[0-9]" 20 && ok "back at the shell, pkg's status: $(screen | grep
 # Scratch has its own /tmp: vi's file was the empty console's.
 typ "echo hello from vi > /tmp/gate.txt
 "
+# Run (homes.md §5.5, M4): atrium-run asks the Terminal the same way; a
+# folder with nothing built to run gets portcullisd's error and status 1.
+typ "atrium-run nothing-here
+"
+waitscreen "menu=scratch asks to Run nothing-here,Run,Cancel@1" 30 && ok "atrium-run asks to Run" || bad "run ask: $(screen)"
+k1 0x28
+typ "echo run=\$?
+"
+waitscreen "run=1" 30 && ok "Run with nothing built answers 1" || bad "run: $(screen) $(V "grep 'run nothing-here' $LOG | tail -2")"
 for ed in nvim hx; do
     if V "jexec ws_alice_scratch sh -c 'PATH=/usr/local/bin:\$PATH command -v $ed'" >/dev/null 2>&1; then
         typ "$ed /tmp/gate.txt

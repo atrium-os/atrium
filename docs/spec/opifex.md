@@ -576,7 +576,7 @@ the base rule except dev layers, which dev-tools already allows to carry GPL too
 | **C2** | `opifexd`, `opifex-check` (worker), installed record, install, uninstall, rollback from a local catalog and local archives. `Describe`, `Search`. | |
 | **C3** | `opifex-sheet` as the Limen `install` role; callers: Monstrator L5, the Navigator prompt, Scrinium, Curia. | L5, publisher prompt |
 | **C4** | `opifex-fetch` through Nuntius (as an ordinary launched system bundle with `net-fetch`, no new Nuntius verb); `atrium-os/catalog` repo, Pages, CI pipeline and checks; first platform packages published. | everything online |
-| **C5** | Updates, timing classes, Praeco notices, Curia Updates; key rotation and recovery. | |
+| **C5** | Updates, timing classes, Praeco notices, Curia Updates; key rotation and recovery (moved to C7, §14.6). | |
 | **C6** | Kinds: fonts (with the fonts thread), drivers and `devices.idx` (with dispensatord), firmware, layers from the catalog, signed SDK registry. | CJK on demand, driver lookup, SDK |
 | **C7** | Third-party catalogs: `opifex catalog init/add/sign/publish`, the Actions recipe, domain proofs checked on each machine, Curia's add-a-catalog with a press; WebAuthn RP verification; ax coverage in CI. | third-party apps |
 
@@ -719,6 +719,40 @@ font on demand and a driver from a `nobody` device's notice.
   VM (arm64) 2026-11-17: 0 failed (sync and download through the fetcher's own Nuntius, other
   bytes refused, a host outside its sites refused, a forked history refused, no jail left). The
   Mac VM now boots with `kern.racct.enable=1`, which every Nuntius fetcher needs.
+
+### 14.6 C5 as built (2026-11-18)
+
+- The timing class is the manifest's `[app] updates = "auto" | "notify" | "required"`
+  (portcullis-toml; anything else fails validation; none means `auto`). A person may ask for
+  more care for one app (`notify`), never less; root or whoever installed the app may set it.
+- `opifex::updates::decide` (`src/updates.rs`) for each installed app with a newer release
+  in the checked catalog:
+  - another publisher (another catalog, or another key unless both keys hold the platform
+    role), or a side-loaded app: **refused**, and `install_catalog` refuses it too, so
+    `opifex get` can't apply it either;
+  - capabilities added (by key, with `network` compared by mode): **ask**, whatever the
+    class; `Described.added` lists them and the install sheet shows only those ("It now also
+    asks to: …", or "It asks for nothing new.");
+  - `notify` (by the publisher or the person): **waits** for the person;
+  - otherwise (`auto`, `required`): installed **in the background**, as the person who
+    installed it; a running instance keeps its tree until its next start (C2).
+- opifexd: `Updates` (anyone: the list, the last sync time and error; what Curia's Updates
+  page reads), `SetUpdates { id, care }`, `Tick` (root). The daily round runs in opifexd
+  10 to 70 minutes after start and then about every 24 hours at a time picked at random
+  (`OPIFEX_DAILY=0` turns it off): sync over the network, install what may go in the
+  background, then one Praeco notice naming what waits (asks or notify), each version
+  announced once. Praeco: opifexd posts on `PRAECO_SOCKET` as a system poster, so praecod
+  needs `PRAECO_SYSTEM_POSTERS=0:Updates` (opifexd is root).
+- `opifex updates`, `opifex update-care <id> notify|auto`, `opifex tick`.
+- Not yet: Curia's Updates page (Curia's owner: it reads `Updates` and sends the person to the
+  sheet for an ask); a VM run of the daily round with praecod; batched admin approval for
+  platform kinds (C6, with the kinds); **key rotation and recovery move to C7**, where
+  publisher keys other than the platform's first appear: until then the only publisher is
+  the platform key, which rotates through `root.toml` (2-of-3).
+- Checked: host tests (unit tests of `decide` and the notice; `updates_and_the_daily_round`:
+  a background update, a `notify` release waiting and announced once, added capabilities
+  asked with `added` on `Describe`, more care set and cleared, only root or the installer may
+  set it, only root may tick); the sheet's update lines.
 
 ## 15. Decisions, with recommendations
 
