@@ -1402,9 +1402,14 @@ Stalwart in the cloud VM, and later a real account):
    the wire 1 (sent, and a refused sender), and the Dovecot sends through the worker. *JMAP* followed: the worker runs the JMAP client and reads every JSON answer,
    and asks Mail for each HTTP exchange (`SinkCall::Get`/`Post`), which Mail makes
    through Arca's courier as before, so the worker still has no network and no token.
-   Sync and sending go through it; the EventSource watch still runs in Mail's process
-   (it only reads state-change events). Tests: the wire 1 (the same session, errors and
-   HTTP exchanges as in-process), and the engine's JMAP suite passes through the worker.
+   Sync and sending go through it, and so does the EventSource watch: Mail opens the
+   stream through the courier and hands each event to the worker
+   (`SinkCall::Events`, `SinkAnswer::Event`), which parses it and says whether it was
+   news (`SinkCall::Pushed`); Mail answers whether to keep watching. So Mail's own
+   process reads no mail server's replies at all. Tests: the wire 2 (the same session,
+   errors and HTTP exchanges as in-process; the same verdicts on a scripted stream,
+   stopped and ended), and the engine's JMAP suite, push included, passes through the
+   worker.
 
 ## 17. Decisions, with recommendations
 

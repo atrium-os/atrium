@@ -413,7 +413,7 @@ fn jmap_push_reports_state_changes_only() {
         events: vec![state("e1"), "event: ping\ndata: {\"interval\":60}\n\n", state("e1"), "event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"x\"}}}\n\n", state("e2"), state("e3")],
         asked: vec![],
     };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     let mut seen = Vec::new();
     let r = client.watch(&mut |changed| {
         seen.push(changed);
@@ -425,11 +425,11 @@ fn jmap_push_reports_state_changes_only() {
     assert_eq!(seen, vec![true, false, false, false, true]);
 
     let h = Pushing { es: None, events: vec![], asked: vec![] };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     assert_eq!(client.watch(&mut |_| true), Ok(Pushed::NoPush));
 
     // A stream the server ends: Ended, to connect again.
     let h = Pushing { es: Some("https://jmap.test/events/"), events: vec![state("e1")], asked: vec![] };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     assert_eq!(client.watch(&mut |_| true), Ok(Pushed::Ended));
 }
