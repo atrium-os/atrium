@@ -8,9 +8,9 @@
 //! charts, pivot tables, conditional formats, filter and hidden rows moved
 //! along. Its inverse is the inverse of each, so undo needs nothing new.
 //!
-//! Defined names follow as formulas do, and row heights or column widths
-//! move with their rows or columns. Not moved yet: the formulas inside
-//! conditional-format rules (their ranges move).
+//! Defined names and the formulas inside conditional-format rules follow as
+//! cell formulas do, and row heights or column widths move with their rows or
+//! columns.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -407,14 +407,23 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::Pivots(moved));
     }
 
-    // Conditional formats: their ranges.
+    // Conditional formats: their ranges, and their rules' formulas (written for
+    // the first range's top-left, which may move differently from what they read).
     let cfs: Vec<_> = wb.cond_formats().iter().filter_map(|f| {
-        if f.sheet != sheet {
-            return Some(f.clone());
-        }
         let mut f = f.clone();
-        f.ranges = f.ranges.iter().filter_map(|r| s.map_rect(*r)).collect();
-        (!f.ranges.is_empty()).then_some(f)
+        let (or, oc) = f.origin();
+        if f.sheet == sheet {
+            f.ranges = f.ranges.iter().filter_map(|r| s.map_rect(*r)).collect();
+            if f.ranges.is_empty() {
+                return None;
+            }
+        }
+        let (nr, nc) = f.origin();
+        let a = Adjust { own: f.sheet, target: sheet, s, or, oc, nr, nc };
+        for r in &mut f.rules {
+            r.kind = r.kind.map_exprs(&|e| a.expr(e));
+        }
+        Some(f)
     }).collect();
     if cfs != wb.cond_formats() {
         ops.push(GridOp::cond_formats(wb, &cfs));
@@ -585,6 +594,48 @@ mod tests {
         assert!(wb.tables().is_empty());
         apply(&mut wb, inv);
         assert_eq!(wb.tables().len(), 1);
+    }
+
+    #[test]
+    fn conditional_format_formulas_follow_what_they_read() {
+        use crate::condfmt::{CmpOp, CondFormat, Rule, RuleKind};
+        let mut wb = book(&[&["1", "2"], &["3", "4"], &["5", "6"], &["7", "8"]]);
+        if wb.sheet_count() < 2 {
+            wb.add_sheet("Other").unwrap();
+        }
+        let rule = |src: &str, origin| Rule { kind: RuleKind::Expression(wb.cond_formula(src, 0, origin).unwrap()), dxf: Default::default(), stop: false };
+        // On sheet 0 over B3:B4, reading $A$1 and the cell to its left.
+        let a = CondFormat { sheet: 0, ranges: vec![Rect { sheet: 0, r0: 2, c0: 1, r1: 3, c1: 1 }], rules: vec![rule("A3>$A$1", (2, 1))] };
+        // On the other sheet, reading sheet 0's A2 and A4 (Sheet1 named by the book).
+        let name = wb.sheet_name(0).to_string();
+        let b_rule = Rule { kind: RuleKind::CellIs { op: CmpOp::Greater, a: wb.cond_formula(&format!("{name}!$A$2"), 1, (0, 0)).unwrap(), b: None }, dxf: Default::default(), stop: false };
+        let b = CondFormat { sheet: 1, ranges: vec![Rect { sheet: 1, r0: 0, c0: 0, r1: 1, c1: 0 }], rules: vec![b_rule] };
+        GridOp::cond_formats(&wb, &[a, b]).apply(&mut wb);
+        let text = |wb: &Workbook, i: usize| {
+            let f = &wb.cond_formats()[i];
+            match &f.rules[0].kind {
+                RuleKind::Expression(e) | RuleKind::CellIs { a: e, .. } => wb.cond_formula_text(e, f.origin()),
+                _ => unreachable!(),
+            }
+        };
+        // A row inserted at row 2 (between A1 and A3).
+        let op = shift_op(&wb, 0, Axis::Rows, 1, 1).unwrap();
+        let inv = apply(&mut wb, op);
+        assert_eq!(wb.cond_formats()[0].ranges[0].r0, 3);
+        assert_eq!(text(&wb, 0), "A4>$A$1");
+        assert_eq!(text(&wb, 1), format!("{name}!$A$3"));
+        apply(&mut wb, inv);
+        assert_eq!(text(&wb, 0), "A3>$A$1");
+        assert_eq!(text(&wb, 1), format!("{name}!$A$2"));
+        // Deleting row 1 breaks the absolute reference; a column before A moves both.
+        let op = shift_op(&wb, 0, Axis::Rows, 0, -1).unwrap();
+        let inv = apply(&mut wb, op);
+        assert_eq!(text(&wb, 0), "A2>#REF!");
+        apply(&mut wb, inv);
+        let op = shift_op(&wb, 0, Axis::Cols, 0, 1).unwrap();
+        apply(&mut wb, op);
+        assert_eq!(text(&wb, 0), "B3>$B$1");
+        assert_eq!(text(&wb, 1), format!("{name}!$B$2"));
     }
 
     #[test]

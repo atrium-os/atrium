@@ -167,6 +167,27 @@ pub struct Rule {
     pub stop: bool,
 }
 
+impl RuleKind {
+    /// The rule with every formula in it replaced by `f` of it.
+    pub fn map_exprs(&self, f: &dyn Fn(&Expr) -> Expr) -> RuleKind {
+        let m = |e: &Arc<Expr>| Arc::new(f(e));
+        let v = |c: &Cfvo| match c {
+            Cfvo::Formula(e) => Cfvo::Formula(m(e)),
+            other => other.clone(),
+        };
+        match self {
+            RuleKind::CellIs { op, a, b } => RuleKind::CellIs { op: *op, a: m(a), b: b.as_ref().map(m) },
+            RuleKind::Expression(e) => RuleKind::Expression(m(e)),
+            RuleKind::ColorScale(pts) => RuleKind::ColorScale(pts.iter().map(|(c, k)| (v(c), *k)).collect()),
+            RuleKind::DataBar { min, max, color } => RuleKind::DataBar { min: v(min), max: v(max), color: *color },
+            RuleKind::IconSet { set, points, reverse, show_value } => {
+                RuleKind::IconSet { set: *set, points: points.iter().map(|(c, k)| (v(c), *k)).collect(), reverse: *reverse, show_value: *show_value }
+            }
+            other => other.clone(),
+        }
+    }
+}
+
 /// Rules over ranges of one sheet; earlier rules come first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CondFormat {
