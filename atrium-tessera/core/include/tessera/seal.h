@@ -55,6 +55,70 @@ void tessera_seal_keys_clear(tessera_seal_keys_t *k);
 /* Constant-time comparison: 1 when equal. */
 int  tessera_ct_eq(const void *a, const void *b, size_t n);
 
+/* ── key groups (§4.2, §5.4) ───────────────────────────────────────── */
+
+/* The keys of one loaded key group, derived from its GK. A group lives on
+ * any volume, sealed or not; nothing here needs the volume's own keys. */
+typedef struct tessera_group_keys {
+	tessera_aead_key_t gmeta;       /* K_gmeta: group pack fronts, journal
+	                                 * names; its key bytes key the MACs */
+	tessera_aead_key_t gblob;       /* K_gblob: the group's blobs */
+	uint8_t            gid[32];     /* K_gid before a domain's salt */
+	uint8_t            name[32];    /* K_name: keyed dir-name hashes */
+	uint8_t            cdc[32];     /* K_cdc: the gear table's seed */
+	uint8_t            check[32];   /* expected tessera_key_group_t.check */
+	uint8_t            uuid[16];
+	uint64_t           group_id;
+} tessera_group_keys_t;
+
+/* Derive a group's keys from GK. TESSERA_EINVAL for group 0 (no group) or
+ * an id past TESSERA_KEY_GROUP_ID_MAX, TESSERA_EINCOMPAT for a suite. */
+int  tessera_group_keys_init(tessera_group_keys_t *g, uint32_t suite,
+         const uint8_t gk[32], const uint8_t volume_uuid[16],
+         uint64_t group_id);
+void tessera_group_keys_clear(tessera_group_keys_t *g);
+
+/* A new group record for these keys: check, suite, generation, then the
+ * MAC. key_id is the caller's (Arca's) id for GK. */
+int  tessera_key_group_make(const tessera_group_keys_t *g,
+         const uint8_t key_id[16], uint32_t suite, uint64_t generation,
+         tessera_key_group_t *out);
+/* Recompute the MAC after changing `generation`. */
+int  tessera_key_group_reseal(const tessera_group_keys_t *g,
+         tessera_key_group_t *rec);
+/* Check a group record against loaded keys: its id, then check
+ * (TESSERA_ENOKEY: the wrong key), then the MAC (TESSERA_EAUTH). */
+int  tessera_key_group_verify(const tessera_group_keys_t *g,
+         const tessera_key_group_t *rec);
+
+/* Put a domain in the group (key_group, group_mac) or check that it is
+ * in it: TESSERA_EAUTH when the domain names another group, names none,
+ * or its MAC doesn't hold (an offline edit, §5.4). */
+int  tessera_domain_seal_group(const tessera_group_keys_t *g,
+         tessera_quota_domain_t *d);
+int  tessera_domain_verify_group(const tessera_group_keys_t *g,
+         const tessera_quota_domain_t *d);
+
+/* K_gid[d] (§6.1): the group's id key, then the domain's salt when the
+ * domain is salted. */
+int  tessera_group_domain_id_key(const tessera_group_keys_t *g,
+         const tessera_quota_domain_t *d, uint8_t out[32]);
+
+/* A keyed directory-name hash for a directory in the group (§4.2 K_name),
+ * the same width as tessera_dir_name_hash so directory manifests keep
+ * their shape. */
+uint64_t tessera_dir_name_hash_keyed(const uint8_t name_key[32],
+         const char *name, size_t name_len);
+
+/* A name in a journal record of an inode in the group (§5.3), sealed a
+ * second time under K_gmeta: out = nonce | ct | tag (len + 40 bytes). The
+ * AAD binds the inode number, so a name can't be moved to another
+ * record. */
+int  tessera_group_name_seal(const tessera_group_keys_t *g,
+         uint64_t inode_no, const uint8_t *name, size_t len, uint8_t *out);
+int  tessera_group_name_open(const tessera_group_keys_t *g,
+         uint64_t inode_no, const uint8_t *in, size_t in_len, uint8_t *name);
+
 /* ── superblock (§5.2) ─────────────────────────────────────────────── */
 
 /* Make `sb` a sealed superblock under `k`: sets the incompat bit, the

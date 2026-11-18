@@ -63,6 +63,218 @@ tessera_seal_keys_clear(tessera_seal_keys_t *k)
 		tessera_wipe(k, sizeof(*k));
 }
 
+/* ── key groups ────────────────────────────────────────────────────── */
+
+int
+tessera_group_keys_init(tessera_group_keys_t *g, uint32_t suite,
+    const uint8_t gk[32], const uint8_t volume_uuid[16], uint64_t group_id)
+{
+	uint8_t sub[32];
+	int err;
+
+	if (g == NULL || gk == NULL || volume_uuid == NULL || group_id == 0 ||
+	    group_id > TESSERA_KEY_GROUP_ID_MAX)
+		return (TESSERA_EINVAL);
+	memset(g, 0, sizeof(*g));
+	memcpy(g->uuid, volume_uuid, 16);
+	g->group_id = group_id;
+	err = tessera_subkey(gk, TESSERA_KDF_GMETA, volume_uuid, group_id, sub);
+	if (err == TESSERA_OK)
+		err = tessera_aead_key_init(&g->gmeta, suite, sub);
+	if (err == TESSERA_OK)
+		err = tessera_subkey(gk, TESSERA_KDF_GBLOB, volume_uuid,
+		    group_id, sub);
+	if (err == TESSERA_OK)
+		err = tessera_aead_key_init(&g->gblob, suite, sub);
+	if (err == TESSERA_OK)
+		err = tessera_subkey(gk, TESSERA_KDF_GID, volume_uuid, group_id,
+		    g->gid);
+	if (err == TESSERA_OK)
+		err = tessera_subkey(gk, TESSERA_KDF_NAME, volume_uuid, group_id,
+		    g->name);
+	if (err == TESSERA_OK)
+		err = tessera_subkey(gk, TESSERA_KDF_CDC, volume_uuid, group_id,
+		    g->cdc);
+	if (err == TESSERA_OK)
+		err = tessera_key_check(gk, volume_uuid, group_id, g->check);
+	tessera_wipe(sub, sizeof(sub));
+	if (err != TESSERA_OK)
+		tessera_group_keys_clear(g);
+	return (err);
+}
+
+void
+tessera_group_keys_clear(tessera_group_keys_t *g)
+{
+	if (g != NULL)
+		tessera_wipe(g, sizeof(*g));
+}
+
+/* HMAC-SHA-256 under K_gmeta's bytes, with a domain-separating label,
+ * cut to 16 bytes. */
+static int
+group_mac(const tessera_group_keys_t *g, const char *label,
+    const void *msg, size_t len, uint8_t out[16])
+{
+	uint8_t full[32];
+	const uint8_t *parts[3] = { (const uint8_t *)label, g->uuid, msg };
+	size_t lens[3] = { strlen(label), 16, len };
+	int err = tessera_hmac_sha256_v(g->gmeta.key, 32, parts, lens, 3, full);
+
+	if (err == TESSERA_OK)
+		memcpy(out, full, 16);
+	tessera_wipe(full, sizeof(full));
+	return (err);
+}
+
+#define GROUP_REC_MAC_LEN  offsetof(tessera_key_group_t, mac)
+
+int
+tessera_key_group_reseal(const tessera_group_keys_t *g,
+    tessera_key_group_t *rec)
+{
+	if (g == NULL || rec == NULL || rec->group_id != g->group_id)
+		return (TESSERA_EINVAL);
+	return (group_mac(g, "tessera group record", rec, GROUP_REC_MAC_LEN,
+	    rec->mac));
+}
+
+int
+tessera_key_group_make(const tessera_group_keys_t *g,
+    const uint8_t key_id[16], uint32_t suite, uint64_t generation,
+    tessera_key_group_t *out)
+{
+	if (g == NULL || key_id == NULL || out == NULL)
+		return (TESSERA_EINVAL);
+	memset(out, 0, sizeof(*out));
+	out->group_id = g->group_id;
+	memcpy(out->key_id, key_id, 16);
+	memcpy(out->check, g->check, 32);
+	out->suite = suite;
+	out->generation = generation;
+	return (tessera_key_group_reseal(g, out));
+}
+
+int
+tessera_key_group_verify(const tessera_group_keys_t *g,
+    const tessera_key_group_t *rec)
+{
+	uint8_t mac[16];
+	int err;
+
+	if (g == NULL || rec == NULL)
+		return (TESSERA_EINVAL);
+	if (rec->group_id != g->group_id)
+		return (TESSERA_ENOKEY);
+	if (!tessera_ct_eq(rec->check, g->check, 32))
+		return (TESSERA_ENOKEY);
+	err = group_mac(g, "tessera group record", rec, GROUP_REC_MAC_LEN, mac);
+	if (err == TESSERA_OK && !tessera_ct_eq(mac, rec->mac, 16))
+		err = TESSERA_EAUTH;
+	return (err);
+}
+
+/* The domain fields the MAC covers (§5.4): id, root inode, dedup policy,
+ * salt and group, little-endian where wider than a byte. */
+static int
+domain_mac(const tessera_group_keys_t *g, const tessera_quota_domain_t *d,
+    uint8_t out[16])
+{
+	uint8_t m[8 + 8 + 1 + 32 + 8];
+
+	put_le64(m, d->domain_id);
+	put_le64(m + 8, d->root_inode_no);
+	m[16] = d->dedup_policy;
+	memcpy(m + 17, d->domain_salt, 32);
+	put_le64(m + 49, d->key_group);
+	return (group_mac(g, "tessera domain record", m, sizeof(m), out));
+}
+
+int
+tessera_domain_seal_group(const tessera_group_keys_t *g,
+    tessera_quota_domain_t *d)
+{
+	if (g == NULL || d == NULL)
+		return (TESSERA_EINVAL);
+	d->key_group = g->group_id;
+	return (domain_mac(g, d, d->group_mac));
+}
+
+int
+tessera_domain_verify_group(const tessera_group_keys_t *g,
+    const tessera_quota_domain_t *d)
+{
+	uint8_t mac[16];
+	int err;
+
+	if (g == NULL || d == NULL)
+		return (TESSERA_EINVAL);
+	if (d->key_group != g->group_id)
+		return (TESSERA_EAUTH);
+	err = domain_mac(g, d, mac);
+	if (err == TESSERA_OK && !tessera_ct_eq(mac, d->group_mac, 16))
+		err = TESSERA_EAUTH;
+	return (err);
+}
+
+int
+tessera_group_domain_id_key(const tessera_group_keys_t *g,
+    const tessera_quota_domain_t *d, uint8_t out[32])
+{
+	if (g == NULL || d == NULL || out == NULL)
+		return (TESSERA_EINVAL);
+	if (d->dedup_policy != TESSERA_DEDUP_SALTED) {
+		memcpy(out, g->gid, 32);
+		return (TESSERA_OK);
+	}
+	return (tessera_hmac_sha256(g->gid, 32, d->domain_salt, 32, out));
+}
+
+uint64_t
+tessera_dir_name_hash_keyed(const uint8_t name_key[32], const char *name,
+    size_t name_len)
+{
+	uint8_t h[32];
+	uint64_t v = 0;
+
+	if (tessera_hmac_sha256(name_key, 32, (const uint8_t *)name, name_len,
+	    h) != TESSERA_OK)
+		return (0);
+	/* Big-endian, like tessera_dir_name_hash's first 8 digest bytes. */
+	for (int i = 0; i < 8; i++)
+		v = (v << 8) | h[i];
+	tessera_wipe(h, sizeof(h));
+	return (v);
+}
+
+int
+tessera_group_name_seal(const tessera_group_keys_t *g, uint64_t inode_no,
+    const uint8_t *name, size_t len, uint8_t *out)
+{
+	uint8_t tail[8];
+
+	if (g == NULL || (name == NULL && len > 0) || out == NULL)
+		return (TESSERA_EINVAL);
+	put_le64(tail, inode_no);
+	return (tessera_unit_seal(&g->gmeta, g->uuid,
+	    TESSERA_SEAL_KIND_GROUP_NAME, g->group_id, tail, 8, name, len, out,
+	    NULL));
+}
+
+int
+tessera_group_name_open(const tessera_group_keys_t *g, uint64_t inode_no,
+    const uint8_t *in, size_t in_len, uint8_t *name)
+{
+	uint8_t tail[8];
+
+	if (g == NULL || in == NULL || name == NULL)
+		return (TESSERA_EINVAL);
+	put_le64(tail, inode_no);
+	return (tessera_unit_open(&g->gmeta, g->uuid,
+	    TESSERA_SEAL_KIND_GROUP_NAME, g->group_id, tail, 8, in, in_len,
+	    NULL, name));
+}
+
 /* ── superblock ────────────────────────────────────────────────────── */
 
 #define SB_CRC_OFF   offsetof(tessera_superblock_t, crc32)

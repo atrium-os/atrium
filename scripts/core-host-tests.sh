@@ -161,7 +161,7 @@ run_suite() {
         fi
     done
     for t in test_crypt test_seal test_btree_sealed test_journal_sealed \
-        test_volume_sealed; do
+        test_volume_sealed test_keygroup; do
     if [ "$SSL_OK" = 1 ]; then
         # shellcheck disable=SC2086
         if $CC $cflags $SSL_CFLAGS -o "$obj/$t" "$CORE/tests/$t.c" \

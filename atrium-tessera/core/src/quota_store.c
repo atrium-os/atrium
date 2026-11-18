@@ -55,6 +55,46 @@ tessera_quota_store_get(tessera_btree_t *t,
 	return tessera_decode_quota_domain(val, out);
 }
 
+void
+tessera_key_group_key(uint64_t group_id, uint8_t out[8])
+{
+	tessera_quota_key(group_id & TESSERA_KEY_GROUP_ID_MAX, out);
+	out[0] = TESSERA_QUOTA_GROUP_PREFIX;
+}
+
+int
+tessera_quota_key_is_group(const uint8_t key[8])
+{
+	return (key != NULL && key[0] == TESSERA_QUOTA_GROUP_PREFIX);
+}
+
+int
+tessera_key_group_store_put(tessera_btree_t *t, const tessera_key_group_t *g,
+                            uint64_t *new_root)
+{
+	if (t == NULL || g == NULL || g->group_id == 0 ||
+	    g->group_id > TESSERA_KEY_GROUP_ID_MAX)
+		return TESSERA_EINVAL;
+	uint8_t key[8];
+	tessera_key_group_key(g->group_id, key);
+	return tessera_btree_put(t, key, (const uint8_t *)g, new_root);
+}
+
+int
+tessera_key_group_store_get(tessera_btree_t *t, uint64_t group_id,
+                            tessera_key_group_t *out)
+{
+	if (t == NULL || out == NULL || group_id == 0 ||
+	    group_id > TESSERA_KEY_GROUP_ID_MAX)
+		return TESSERA_EINVAL;
+	uint8_t key[8];
+	tessera_key_group_key(group_id, key);
+	int rc = tessera_btree_get(t, key, (uint8_t *)out);
+	if (rc == TESSERA_OK && out->group_id != group_id)
+		return TESSERA_ECORRUPT;
+	return rc;
+}
+
 int
 tessera_quota_store_delete(tessera_btree_t *t,
                            uint64_t domain_id,

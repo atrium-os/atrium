@@ -8411,6 +8411,12 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			uint8_t qk[8], qv[TESSERA_QUOTA_DOMAIN_SIZE];
 			if (tessera_btree_cursor_get(qc, qk, qv) != TESSERA_OK)
 				break;
+			/* Key-group records share the tree (encryption §5.4). */
+			if (tessera_quota_key_is_group(qk)) {
+				if (tessera_btree_cursor_next(qc) != TESSERA_OK)
+					break;
+				continue;
+			}
 			if (tessera_decode_quota_domain(qv,
 			    &tmp_->quota_domains[tmp_->quota_ndomains])
 			    == TESSERA_OK)

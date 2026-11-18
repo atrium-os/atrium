@@ -596,8 +596,38 @@ typedef struct TESSERA_PACKED {
 	uint8_t   dedup_policy;       /* 0=global, 1=deferred, 2=salted (§20.2) */
 	uint8_t   pad[7];
 	uint8_t   domain_salt[32];    /* set iff salted; else zero */
-	uint8_t   reserved[32];       /* future: HMAC slot, nested-domain ptr */
+	/* tessera-encryption.md §5.4: the key group the domain's contents are
+	 * encrypted under (0 = none), and a MAC under the group's K_gmeta over
+	 * domain_id, root_inode_no, dedup_policy, domain_salt and key_group,
+	 * so nobody without the key can move the domain out of its group or
+	 * change its salt. Both zero on a domain in no group. */
+	uint64_t  key_group;
+	uint8_t   group_mac[16];
+	uint8_t   reserved[8];        /* future: nested-domain ptr */
 } tessera_quota_domain_t;
+
+/* ── Key-group record (128 bytes, tessera-encryption.md §5.4) ───────
+ *
+ * Lives in the quota tree beside the domain records, under keys whose
+ * first byte is TESSERA_QUOTA_GROUP_PREFIX (domain ids never reach it).
+ * A volume with any of these sets TESSERA_INCOMPAT_KEY_GROUPS, so an older
+ * kernel neither misreads them as domains nor writes plain blobs into an
+ * encrypted domain. `mac` is under the group's K_gmeta over every field
+ * before it, so the generation (§8) can't be rolled back without the key.
+ */
+typedef struct TESSERA_PACKED {
+	uint64_t  group_id;           /* 1..2^56-1 */
+	uint8_t   key_id[16];         /* the GK's Arca id */
+	uint8_t   check[32];          /* tessera_key_check(GK, uuid, group_id) */
+	uint32_t  suite;              /* TESSERA_SUITE_* */
+	uint32_t  pad;
+	uint64_t  generation;         /* the group's generation (§8) */
+	uint8_t   mac[16];
+	uint8_t   reserved[40];
+} tessera_key_group_t;
+
+#define TESSERA_QUOTA_GROUP_PREFIX  0xFFu
+#define TESSERA_KEY_GROUP_ID_MAX    ((1ull << 56) - 1)
 
 /* dedup_policy values (tessera-fs.md §20.2). */
 #define TESSERA_DEDUP_GLOBAL    0u
@@ -816,6 +846,7 @@ TESSERA_STATIC_ASSERT(sizeof(tessera_chunk_record_t)      == 48,   chunk_record_
 TESSERA_STATIC_ASSERT(sizeof(tessera_tree_record_t)       == 40,   tree_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_inode_record_t)      == 144,  inode_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_quota_domain_t)      == 128,  quota_domain_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_key_group_t)         == 128,  key_group_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == TESSERA_BTREE_NODE_HEADER_SIZE, btree_node_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);

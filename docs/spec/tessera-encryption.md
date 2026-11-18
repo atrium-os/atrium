@@ -803,6 +803,19 @@ rollback checks. *Recommend a short follow-up spec on the system disk once the T
 | E5 | Personas: persona domains and sticks keyed in the persona's Arca, crypto-erase on persona removal (personas.md P2 and P4) | removing Work leaves none of its packs, items or keys, and its sticks show Locked |
 | E6 | Move existing home folders and app data into the person's Personal group (copy into the new encrypted domain, then GC the old) | an upgraded VM keeps every file, now sealed |
 
+### 13.1 E4 in steps
+
+E4 is mostly kernel work, so it is built in steps that each pass on their own:
+
+| step | what | done when |
+|---|---|---|
+| E4.1 | Core: group keys from GK (`tessera_group_keys_init`), key-group records in the quota tree (prefix 0xFF, `tessera_key_group_t`, MAC under `K_gmeta`), a domain's `key_group` and `group_mac`, `K_gid[d]`, keyed directory-name hashes, sealed journal names. The kernel's domain loader skips group records | host tests (`test_keygroup`, plain and ASan) **done 2026-11-18** |
+| E4.2 | Keyring and mount: `TKEY_LOAD` with a group scope makes the group's keys; a mount reads its group records and verifies each against a loaded key; `TESSERA_IOC_GROUP_CREATE` (key id, group) writes a record and sets `INCOMPAT_KEY_GROUPS`; `TESSERA_IOC_QUOTA_SET` takes a group and seals the domain into it | VM: a group made, remounted, verified; a domain record edited offline is refused |
+| E4.3 | Writes and reads in a group: one open pack per group, blobs sealed under `K_gblob` with ids under `K_gid[d]`, the front under `K_gmeta`, directory names hashed under `K_name`, journal names sealed. On an unsealed volume the registry keeps its 40-byte entries: a group pack's front is authenticated by its own tag, and packs never change, so there is no older copy to swap in | VM: files and names written in a group are not in the clear on the device; read back after remount; dedup inside the group, none across |
+| E4.4 | Locked groups and the rules: without the key, contents, names and xattrs answer `EACCES` (root can still `stat`); the parent-domain rule; rename into, out of or between groups is `EXDEV`; dropping a key flushes and invalidates the group's vnodes and pages | VM: root can't read B's files while B's key is dropped; an offline edit that moves a file out of the group is refused |
+| E4.5 | GC: group packs are kept while the group is locked and collected by group when it's loaded; crypto-erase retires a group's packs without its key | VM: GC on a volume with a locked group frees nothing of it |
+| E4.6 | atrium-volumes `encrypt = "persona"` with expected groups, arcad group keys (`VK_MINT`/`VK_LOAD` with a group scope) at login and dropped at logout | VM: two people, the §13 E4 gate |
+
 ## 14. Decisions
 
 Accepted 2026-11-17, all as recommended.

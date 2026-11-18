@@ -110,6 +110,10 @@ TEST_BINS+= ${.OBJDIR}/test_volume_sealed
 ${.OBJDIR}/test_volume_sealed: lib${LIB}.a ${.CURDIR}/tests/test_volume_sealed.c ${.CURDIR}/src/crypt_openssl.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_volume_sealed.c \
 	    ${.CURDIR}/src/crypt_openssl.c ${.OBJDIR}/libtessera_core.a -lmd -lcrypto
+TEST_BINS+= ${.OBJDIR}/test_keygroup
+${.OBJDIR}/test_keygroup: lib${LIB}.a ${.CURDIR}/tests/test_keygroup.c ${.CURDIR}/src/crypt_openssl.c
+	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_keygroup.c \
+	    ${.CURDIR}/src/crypt_openssl.c ${.OBJDIR}/libtessera_core.a -lmd -lcrypto
 TEST_BINS+= ${.OBJDIR}/test_btree_sealed
 ${.OBJDIR}/test_btree_sealed: lib${LIB}.a ${.CURDIR}/tests/test_btree_sealed.c ${.CURDIR}/src/crypt_openssl.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/test_btree_sealed.c \

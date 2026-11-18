@@ -68,6 +68,18 @@ int tessera_quota_store_get(struct tessera_btree *t,
                             uint64_t domain_id,
                             tessera_quota_domain_t *out);
 
+/* Key-group records (tessera-encryption.md §5.4) share the quota tree:
+ * key = TESSERA_QUOTA_GROUP_PREFIX, then group_id's low 7 bytes
+ * big-endian. A reader that loads domains skips keys with that first byte
+ * (tessera_quota_key_is_group). */
+void tessera_key_group_key(uint64_t group_id, uint8_t out[8]);
+int  tessera_quota_key_is_group(const uint8_t key[8]);
+int  tessera_key_group_store_put(struct tessera_btree *t,
+                                 const tessera_key_group_t *g,
+                                 uint64_t *new_root);
+int  tessera_key_group_store_get(struct tessera_btree *t, uint64_t group_id,
+                                 tessera_key_group_t *out);
+
 /* Remove a domain record; returns the new tree root in *new_root. */
 int tessera_quota_store_delete(struct tessera_btree *t,
                                uint64_t domain_id,
