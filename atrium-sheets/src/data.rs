@@ -58,6 +58,9 @@ pub enum DataCmd {
     /// Open the pivot field list of the pivot at the cursor (or whose source holds
     /// it) ([`crate::pivotpane`]); the window runs it.
     PivotFields,
+    /// Compare this workbook with another copy ([`crate::review`]); the window
+    /// asks for the copy.
+    CompareWith,
 }
 
 /// The block of non-empty cells around (`row`, `col`), bounded by empty rows and
@@ -210,6 +213,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Pivot Table Fields…").enabled(crate::pivotpane::pivot_here(wb, s, row, col).is_some()), Some(DataCmd::PivotFields)));
     v.push((MenuItem::new("Refresh All Pivot Tables").enabled(!wb.pivots().is_empty()), Some(DataCmd::RefreshAllPivots)));
     v.push((MenuItem::new("Conditional Formatting…").separated(), Some(DataCmd::CondFormats)));
+    v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
     v
 }
 
@@ -389,7 +393,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

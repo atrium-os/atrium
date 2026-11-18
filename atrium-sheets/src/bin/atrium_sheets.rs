@@ -57,6 +57,8 @@ enum Target {
 enum Asking {
     Open,
     SaveAs,
+    /// The copy to compare with.
+    Compare,
 }
 
 fn state_root() -> PathBuf {
@@ -272,6 +274,18 @@ impl Run {
         }
     }
 
+    /// Compares the window's workbook with the picked copy.
+    fn compare(&mut self, name: String, fd: std::os::fd::OwnedFd) {
+        let mut f = File::from(fd);
+        match read_all(&mut f).map_err(|e| e.to_string()).and_then(|data| load_with(&name, &data, None).map_err(|e| match e {
+            ConvertError::NeedsPassword | ConvertError::WrongPassword => format!("“{name}” is protected; open it and save an unprotected copy to compare with."),
+            ConvertError::Failed(e) => e,
+        })) {
+            Ok(d) => self.sheets.compare_with(&name, d.wb),
+            Err(e) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
+        }
+    }
+
     /// Opens `data` (named `name`), with `password` when it is protected;
     /// without the right one, the password bar asks and the file waits.
     fn open_bytes(&mut self, name: String, data: Vec<u8>, target: Option<Target>, read_only: bool, password: Option<&str>) {
@@ -446,6 +460,7 @@ fn main() {
         for c in run.sheets.take_cmds() {
             match c {
                 Cmd::Open => want_picker = Some(Asking::Open),
+                Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
                 Cmd::PasswordDone => run.password_done(),
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
@@ -468,7 +483,7 @@ fn main() {
                     discard = true;
                     break 'main;
                 }
-                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::Cond(_) | Cmd::Pivot(_) => {}
+                Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) => {}
             }
         }
         if let (Some(what), None) = (want_picker.take(), asking) {
@@ -477,6 +492,7 @@ fn main() {
                     let name = run.sheets.doc.borrow().name.clone();
                     let filter = match what {
                         Asking::Open => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: true, title: "Open a spreadsheet".into(), name: String::new(), origin: String::new() },
+                        Asking::Compare => Filter { kind: Kind::File, extensions: ["xlsx", "xlsm", "xls", "ods", "csv", "tsv", "txt", "osheet"].map(String::from).to_vec(), multiple: false, write: false, title: format!("Compare “{}” with…", stem_of(&name)), name: String::new(), origin: String::new() },
                         Asking::SaveAs => Filter { kind: Kind::Folder, extensions: Vec::new(), multiple: false, write: true, title: format!("Choose where to save “{}”", stem_of(&name)), name: String::new(), origin: String::new() },
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
@@ -500,6 +516,7 @@ fn main() {
                     let fd = e.borrow_mut().take_fd();
                     match (ToParent::decode(&bytes), fd) {
                         (Some(ToParent::File { name, write, .. }), Some(fd)) if asking == Some(Asking::Open) => run.opened(name, write, fd),
+                        (Some(ToParent::File { name, .. }), Some(fd)) if asking == Some(Asking::Compare) => run.compare(name, fd),
                         _ => eprintln!("atrium-sheets: an odd message with a descriptor from the picker"),
                     }
                 }
