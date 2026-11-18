@@ -116,7 +116,7 @@ mkdir -p $APPS/org.atrium.scrinium $APPS/org.test.notes /var/run/atrium
 sed -i '' '/ org.atrium.scrinium\$/d; / org.test.notes\$/d' $REG 2>/dev/null || true
 printf '50603 alice org.atrium.scrinium\n50601 alice org.test.notes\n' >> $REG
 printf '[app]\nid = "org.atrium.scrinium"\n[capabilities]\ngraphics = "fresco"\nremovable-files = true\nfile-picker = true\nhome-files = true\narca = true\nnetwork = "none"\nembeds = ["doc-viewer", "pdf-viewer", "media-player", "credential"]\n' > $APPS/org.atrium.scrinium/atrium.toml
-printf '[app]\nid = "org.test.notes"\n[capabilities]\ngraphics = "fresco"\nembeds = ["picker"]\n' > $APPS/org.test.notes/atrium.toml
+printf '[app]\nid = "org.test.notes"\nname = "Notes"\nversion = "1"\nentry = "bin/pick-demo"\n[capabilities]\ngraphics = "fresco"\nembeds = ["picker"]\n' > $APPS/org.test.notes/atrium.toml
 for J in "$JF $RF scrinium" "$JN $RN scrinium-pick-demo"; do
   set -- \$J
   mkdir -p \$2/bin \$2/tmp/sc \$2/sock \$2/dev
