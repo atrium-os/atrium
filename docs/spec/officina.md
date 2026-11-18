@@ -3507,6 +3507,10 @@ Write's Tools menu gains Continuous View and Read Mode, the last two of §7.1's 
 
 A picked shape that sits in line with the text now shows its yellow adjust handles as a floating one does (an arrow's head, a callout's pointer), and dragging one reshapes it the same way, one undo step; the editor finds a shape's box from the page's floats or, for one in line, from where its character sits on the line. Pictures and shapes in line also gain the corner handle that floating ones have: dragging it sizes the object (pictures keep their proportions), one undo step, the object staying in line. Test: `pergola-richtext` `a_shape_in_line_takes_its_yellow_and_corner_handles`.
 
+### 16.67 East Asian language in Write (2026-11-18)
+
+Write's alignment menu, after the paragraph direction, sets the East Asian language of text (the model's `lang_ea`, added with fonts.md §5): Asian Text as Document, Chinese (Simplified), Chinese (Traditional), Japanese, Korean. It picks which Han forms the same characters are drawn in. With a selection it sets the selected text; with none, the caret's paragraph and what is typed next. One undo step; the menu marks the language at the caret. `.docx` and `.odt` keep it (`w:lang w:eastAsia`, `style:language-asian`). Test: `atrium-write` `east_asian_language_is_set_from_the_menu`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

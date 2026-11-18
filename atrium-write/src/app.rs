@@ -40,6 +40,10 @@ pub const STYLES: [&str; 5] = ["Normal", "Title", "Heading 1", "Heading 2", "Hea
 /// The Tools menu, in order.
 pub const TOOLS: [&str; 9] = ["Find and Replace", "Spelling", "Track Changes", "Review Changes", "Compare with…", "Merge with…", "Password…", "Continuous View", "Read Mode"];
 
+/// The alignment menu's East Asian languages: (label, BCP 47 tag; none
+/// for the document's).
+pub const LANGS_EA: [(&str, Option<&str>); 5] = [("Asian Text as Document", None), ("Chinese (Simplified)", Some("zh-Hans")), ("Chinese (Traditional)", Some("zh-Hant")), ("Japanese", Some("ja")), ("Korean", Some("ko"))];
+
 /// The Insert menu, in order.
 pub const INSERT: [&str; 39] = ["Picture…", "Table", "Row Below", "Column Right", "Delete Row", "Delete Column", "Page Numbers", "Footnote", "Endnote", "Edit Note", "Comment", "Edit Comment", "Table of Contents", "Cross-reference…", "Section Break", "Continuous Section Break", "Section Break to Odd Page", "Section Break to Even Page", "One Column", "Two Columns", "Three Columns", "Line Between Columns", "In Line with Text", "Wrap Square", "Wrap Top and Bottom", "Behind Text", "In Front of Text", "Picture Left", "Picture Centre", "Picture Right", "Portrait", "Landscape", "A4 Paper", "Letter Paper", "Normal Margins", "Narrow Margins", "Header and Footer…", "Text Box", "Shape…"];
 
@@ -77,6 +81,8 @@ pub enum Cmd {
     /// The selected paragraphs' direction: from their text (`None`), left
     /// to right, right to left.
     Direction(Option<bool>),
+    /// The East Asian language at this place in [`LANGS_EA`].
+    LangEa(usize),
     Style(usize),
     /// The style bar: on the caret paragraph's style.
     StyleOpen,
@@ -1280,6 +1286,7 @@ impl Write {
                     Cmd::Toggle(t) => e.toggle(t),
                     Cmd::Align(a) => e.align(a),
                     Cmd::Direction(d) => e.set_paragraphs("Direction", None, |p| p.rtl = d),
+                    Cmd::LangEa(i) => e.set_lang_ea(LANGS_EA[i.min(LANGS_EA.len() - 1)].1.map(std::sync::Arc::from)),
                     Cmd::Style(i) => {
                         // The document's paragraph styles; past them, the style bar.
                         let all = e.para_styles();
@@ -1713,9 +1720,15 @@ impl View for Write {
                 let m = MenuItem::new(*l).radio(*d == cur_dir);
                 items.push(if k == 0 { m.separated() } else { m });
             }
+            // Then the East Asian language (which Han forms show).
+            let lang = self.doc.borrow().ed.borrow().format_at_caret().lang_ea;
+            for (k, (l, tag)) in LANGS_EA.iter().enumerate() {
+                let m = MenuItem::new(*l).radio(lang.as_deref() == *tag);
+                items.push(if k == 0 { m.separated() } else { m });
+            }
             let now = all.iter().find(|(_, a)| *a == cur_align).map_or("Left", |(l, _)| l);
             let cmds = self.cmds.clone();
-            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i < 4 { Cmd::Align(all[i].1) } else { Cmd::Direction(dirs[(i - 4).min(2)].1) })).at(x, 8.0).width(100.0).render(ctx);
+            MenuButton::new(now.to_string(), self.align_menu.clone(), items, move |i| cmds.lock().unwrap().push(if i < 4 { Cmd::Align(all[i].1) } else if i < 7 { Cmd::Direction(dirs[i - 4].1) } else { Cmd::LangEa(i - 7) })).at(x, 8.0).width(100.0).render(ctx);
             x += 108.0;
         }
         let (name, dirty, status, ed) = {
@@ -2694,6 +2707,42 @@ mod tests {
             assert_eq!(w.take_cmds(), [c]);
             assert!(!w.closing.get());
         }
+    }
+
+    #[test]
+    fn east_asian_language_is_set_from_the_menu() {
+        let doc = Doc::from_text("l.txt", "骨直 text\nNext.".as_bytes()).unwrap();
+        let w = Write::new(doc, Mutable::new(ScrollState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let ed = w.doc.borrow().ed.clone();
+        let run = |c: Cmd| {
+            w.cmds.lock().unwrap().push(c);
+            w.take_cmds();
+        };
+        let lang = |b: usize, at: u32| {
+            let e = ed.borrow();
+            let p = e.doc.para(b).unwrap();
+            e.doc.attrs.get(p.attr_at(at)).lang_ea.as_deref().map(str::to_string)
+        };
+        // No selection: the caret's paragraph, and what is typed next.
+        run(Cmd::LangEa(3));
+        assert_eq!(lang(0, 0).as_deref(), Some("ja"));
+        assert_eq!(lang(0, 6).as_deref(), Some("ja"));
+        assert_eq!(lang(1, 0), None, "only the caret's paragraph");
+        assert_eq!(ed.borrow().format_at_caret().lang_ea.as_deref(), Some("ja"));
+        // A selection: just it.
+        {
+            let mut e = ed.borrow_mut();
+            e.set_caret(pergola_richtext::Pos::new(1, 0), false);
+            e.set_caret(pergola_richtext::Pos::new(1, 4), true);
+        }
+        run(Cmd::LangEa(1));
+        assert_eq!(lang(1, 0).as_deref(), Some("zh-Hans"));
+        assert_eq!(lang(1, 4), None);
+        run(Cmd::Undo);
+        assert_eq!(lang(1, 0), None);
+        ed.borrow_mut().set_caret(pergola_richtext::Pos::new(0, 1), false);
+        run(Cmd::LangEa(0));
+        assert_eq!(lang(0, 0), None, "back to the document's");
     }
 
     #[test]
