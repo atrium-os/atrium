@@ -2780,11 +2780,13 @@ mod run {
                 return (mstatus::FAILED, format!("the code opened its key, but the kernel refused the stick: {e}"));
             }
             self.locked.remove(&a.part);
+            // Its name, for the file manager's word that it's open.
+            let named = if label.is_empty() { String::new() } else { format!("; named {label}") };
             self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false, label });
             self.serve_trusted(&a.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);
-            (mstatus::OK, format!("{} opened for {}", a.part, a.persona))
+            (mstatus::OK, format!("{} opened for {}{named}", a.part, a.persona))
         }
 
         fn stop(&mut self, driver: &str, device: &str, vars: &Vars) {

@@ -111,9 +111,10 @@ struct Config {
     /// arcad's socket and Arca's courier launcher's: with both, a page
     /// whose site knows you is fetched through Arca's couriers.
     arca: Option<(PathBuf, String)>,
-    /// Where Save writes a file (`NAVIGATORD_DOWNLOADS`, default
-    /// `$HOME/Downloads`).
-    downloads: PathBuf,
+    /// Where Save writes a file itself (`NAVIGATORD_DOWNLOADS`, a
+    /// development run's); otherwise portcullisd saves it into the
+    /// Downloads of our persona (`SaveDownload`, personas.md §4.1).
+    downloads: Option<PathBuf>,
     /// Monstrator, the link opener, that hand-offs go to with their press
     /// (`NAVIGATORD_MONSTRATOR`, default its socket; opening-links.md §7).
     monstrator: PathBuf,
@@ -146,9 +147,7 @@ impl Config {
             trails: var("NAVIGATORD_TRAILS").map(PathBuf::from),
             store: var("NAVIGATORD_STORE").map(PathBuf::from),
             arca: var("NAVIGATORD_ARCA").zip(var("NAVIGATORD_COURIERD")).map(|(a, c)| (PathBuf::from(a), c)),
-            downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from)
-                .or_else(|| var("HOME").map(|h| Path::new(&h).join("Downloads")))
-                .unwrap_or_else(|| PathBuf::from("/nonexistent/Downloads")),
+            downloads: var("NAVIGATORD_DOWNLOADS").map(PathBuf::from),
             monstrator: var("NAVIGATORD_MONSTRATOR").map(PathBuf::from).unwrap_or_else(|| monstrator::SOCKET.into()),
             activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
             opifex: var("NAVIGATORD_OPIFEX").map(PathBuf::from).unwrap_or_else(|| OPIFEX_SOCKET.into()),
@@ -1341,12 +1340,29 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     continue;
                 }
                 let Some(h) = waiting.lock().unwrap().take(id) else { continue };
-                match files::save(&cfg.downloads, &h) {
-                    Ok(path) => {
-                        eprintln!("navigatord: saved {} as {}", h.url, path.display());
-                        send(&w, &Event::Saved { id, path: path.display().to_string() });
+                match &cfg.downloads {
+                    Some(dir) => match files::save(dir, &h) {
+                        Ok(path) => {
+                            eprintln!("navigatord: saved {} as {}", h.url, path.display());
+                            send(&w, &Event::Saved { id, path: path.display().to_string() });
+                        }
+                        Err(why) => send(&w, &Event::NotSaved { id, why }),
+                    },
+                    // portcullisd writes it, off this thread: a big file
+                    // takes a moment.
+                    None => {
+                        let w = w.clone();
+                        std::thread::spawn(move || match worker::save_download(&h.name, &h.url, &h.bytes) {
+                            Ok((name, place)) => {
+                                eprintln!("navigatord: saved {} in {place} as “{name}”", h.url);
+                                send(&w, &Event::Saved { id, path: format!("“{name}” in {place}") });
+                            }
+                            Err(why) => {
+                                eprintln!("navigatord: {} not saved: {why}", h.url);
+                                send(&w, &Event::NotSaved { id, why });
+                            }
+                        });
                     }
-                    Err(why) => send(&w, &Event::NotSaved { id, why }),
                 }
             }
             Request::Discard { id } => {

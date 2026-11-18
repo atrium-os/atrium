@@ -414,6 +414,22 @@ fn launch_inner(
                 for (src, dst) in portcullisd::home::mounts(&home, &jail_path) {
                     jc.add_mount(&src, &dst, "nullfs", &["rw"]);
                 }
+                /* The named personas' folders (personas.md §4.1): the file
+                 * manager spans them, with each one's group; they go in at
+                 * /atrium/personas/<persona>/. One persona failing leaves
+                 * the others. */
+                let named: Vec<String> = portcullis_policy::Policy::load(&portcullis_policy::Policy::user_path(user)).ok()
+                    .filter(|p| p.check_personas().is_ok()).map(|p| p.personas.keys().cloned().collect()).unwrap_or_default();
+                let mut any = false;
+                for p in &named {
+                    match portcullisd::home::ensure_persona(user, p).and_then(|_| portcullisd::home::grant_persona_group(user, p, &run_as_user)) {
+                        Ok(()) => any = true,
+                        Err(e) => eprintln!("portcullisd: {app_id}: {p}'s folders: {e}"),
+                    }
+                }
+                if any {
+                    jc.add_mount(&home.join(portcullisd::home::PERSONAS_DIR), &jail_path.join(portcullisd::home::PERSONAS_IN_JAIL), "nullfs", &["rw"]);
+                }
                 /* And the workspaces (homes.md §5): each one's `work`; their
                  * `.state` is root's alone. */
                 match crate::workspace::root_dir(&home, gid) {
@@ -1020,6 +1036,12 @@ pub fn installed_manifest(app_id: &str) -> Option<Manifest> {
 /// `open-attachments`, mail.md §8.2)?
 pub fn app_opens_attachments(app_id: &str) -> bool {
     installed(app_id).is_some_and(|m| m.capabilities.open_attachments == Some(true))
+}
+
+/// Is this the Navigator (its INSTALLED manifest holds `navigator-broker`)?
+/// The only caller of SaveDownload.
+pub fn app_is_navigator(app_id: &str) -> bool {
+    installed(app_id).is_some_and(|m| m.capabilities.navigator_broker == Some(true))
 }
 
 /// Is this the terminal (its INSTALLED manifest holds `consoles`)?

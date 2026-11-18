@@ -80,6 +80,10 @@ pub const ROLES: &[Role] = &[
     Role { name: "print", provider: Provider::System(PRELUM), slot: SlotKind::Sheet { w: 760, h: 540 }, takes_fd: true, returns_fd: true },
 ];
 
+/// Roles whose child is told the parent's persona (`ParentPersona`,
+/// personas.md §4.1): the picker shows only that persona's folders.
+pub const PERSONA_ROLES: &[&str] = &["picker"];
+
 /// Roles whose children may play sound as their parent (lyra-v1.md §4):
 /// limend asks choragusd for an attribution ticket for each embed.
 pub const AUDIO_ROLES: &[&str] = &["media-player"];

@@ -50,6 +50,26 @@ pub struct Seal {
 }
 
 impl Place {
+    /// The named persona whose folder this is (`persona:<p>:<folder>`,
+    /// personas.md §4.1); the person's own folders are Personal's.
+    pub fn persona_folder(&self) -> Option<&str> {
+        let rest = self.id.strip_prefix("persona:")?;
+        rest.split_once(':').map(|(p, _)| p)
+    }
+
+    /// Whether a picker for an app in `persona` lists this place
+    /// (personas.md §4.1): Personal's folders only for Personal, a named
+    /// persona's only for it, a sealed stick only for its own persona.
+    pub fn for_picker(&self, persona: &str) -> bool {
+        if let Some(p) = self.persona_folder() {
+            return p == persona;
+        }
+        if self.id.starts_with("home:") {
+            return persona == "personal";
+        }
+        !self.stick || self.seal.persona.is_empty() || self.seal.persona == persona
+    }
+
     /// A place whose files can be listed in this window: not a Locked
     /// stick, nor another persona's (its own windows get it).
     pub fn browsable(&self, persona: &str) -> bool {
@@ -436,6 +456,11 @@ impl Browser {
     /// is looking at otherwise.
     pub fn set_places(&mut self, places: Vec<Place>) {
         let cur = self.place().map(|p| p.id.clone());
+        // A picker lists only the asking app's persona's places (§4.1).
+        let places = match &self.mode {
+            Mode::Picker { .. } => places.into_iter().filter(|p| p.for_picker(&self.persona)).collect(),
+            Mode::Manager => places,
+        };
         self.places = places;
         self.at = cur.as_ref().and_then(|id| self.places.iter().position(|p| &p.id == id));
         if self.at.is_none() {
@@ -1155,7 +1180,10 @@ impl Browser {
             Err(e) => sh.error = Some(e),
             Ok(m) => {
                 let code = m.split_once("recovery code ").map(|(_, c)| c.trim().to_string()).filter(|c| !c.is_empty());
-                let (label, ask) = (sh.label.clone(), sh.ask.clone());
+                // A stick opened with its code may answer the name it was
+                // given at format, before the places list catches up.
+                let label = m.split_once("; named ").map(|(_, n)| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| sh.label.clone());
+                let ask = sh.ask.clone();
                 match (ask, code) {
                     (StickAsk::Format { .. }, Some(code)) => {
                         sh.ask = StickAsk::Code { code };
@@ -1494,6 +1522,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[test]
+    fn a_picker_lists_only_its_apps_personas_folders() {
+        let d = std::env::temp_dir().join(format!("scrinium-personas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["home/Documents", "home/Downloads", "personas/work/Documents", "personas/work/Downloads", "personas/side-project/Documents", "personas/Bad/Documents"] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+        }
+        let mut all = crate::places::home_in(&d.join("home"));
+        let named = crate::places::personas_in(&d.join("personas"));
+        assert_eq!(named.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["persona:side-project:documents", "persona:work:documents", "persona:work:downloads"]);
+        all.extend(named);
+        let sealed = Place { id: "da1s1".into(), label: "stick".into(), root: d.clone(), stick: true, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Seal { persona: "work".into(), ..Default::default() } };
+        let plain = Place { id: "da2s1".into(), seal: Default::default(), ..sealed.clone() };
+        all.extend([sealed, plain]);
+        let ids = |b: &Browser| b.places.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        // The file manager spans the personas, labelled.
+        let mut m = Browser::new(Mode::Manager);
+        m.set_places(all.clone());
+        assert_eq!(m.places.len(), 7);
+        // A Personal app's picker: the person's own folders, no Work ones.
+        let mut b = picker(Filter::file());
+        b.set_places(all.clone());
+        assert_eq!(ids(&b), ["home:documents", "home:downloads", "da2s1"]);
+        // A Work app's: Work's folders, Work's stick and the neutral one.
+        let mut b = picker(Filter::file());
+        b.persona = "work".into();
+        b.set_places(all);
+        assert_eq!(ids(&b), ["persona:work:documents", "persona:work:downloads", "da1s1", "da2s1"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     fn picker(filter: Filter) -> Browser {
         Browser::new(Mode::Picker { filter, app: "org.example.notes".into() })
     }
@@ -1671,6 +1730,11 @@ mod tests {
         b.media_done(Ok("da0s1 opened for personal".into()));
         assert!(b.stick_sheet.is_none());
         assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("USB stick is open"));
+        b.ask_about(0);
+        b.ask_recovery();
+        b.confirm_stick(Some([7; 16]));
+        b.media_done(Ok("da0s1 opened for personal; named Holiday".into()));
+        assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("Holiday is open"));
 
         // An older copy: open read-only, then make it current.
         b.ask_about(1);

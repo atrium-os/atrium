@@ -18,6 +18,8 @@ path = "src/bin/arcad.rs"
 arca-store      = { path = "../arca-store" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }
 ed25519-dalek   = { version = "2", default-features = false, features = ["zeroize"] }
+x25519-dalek    = { version = "2", features = ["static_secrets", "zeroize"] }
+zeroize         = "1"
 sigillum-proto  = { path = "../../sigillum/sigillum-proto" }
 p256            = { version = "0.13", features = ["ecdsa"] }
 libc            = "0.2"

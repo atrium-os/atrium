@@ -157,6 +157,17 @@ pub fn sort_op(wb: &Workbook, rect: Rect, keys: &[SortKey]) -> Option<GridOp> {
         }
         ops.push(GridOp::Restyle(StyleRegion { rect, spans }));
     }
+    // Comments go with their rows.
+    let cm: Vec<_> = wb.comments(s).range((rect.r0, 0)..=(rect.r1, u32::MAX)).filter(|(&(_, c), _)| (rect.c0..=rect.c1).contains(&c)).map(|(&k, v)| (k, v.clone())).collect();
+    if !cm.is_empty() {
+        let mut dest_of = std::collections::HashMap::with_capacity(cm.len());
+        for (i, &src) in ord.iter().enumerate() {
+            dest_of.insert(src, rect.r0 + i as u32);
+        }
+        let mut set: Vec<_> = cm.iter().map(|&((r, c), _)| (r, c, None)).collect();
+        set.extend(cm.into_iter().map(|((r, c), k)| (dest_of.get(&r).copied().unwrap_or(r), c, Some(k))));
+        ops.push(GridOp::Comments { sheet: s, set });
+    }
     Some(if ops.len() == 1 { ops.pop().unwrap() } else { GridOp::Batch(ops) })
 }
 
@@ -229,5 +240,25 @@ mod tests {
             assert_eq!(wb.get(CellAddr::new(0, r, 1)), Value::Num(2.0 * r as f64));
         }
         assert!(sort_op(&wb, Rect { sheet: 0, r0: 0, c0: 0, r1: 999, c1: 1 }, &[SortKey { col: 0, descending: false }]).is_none());
+    }
+
+    #[test]
+    fn comments_move_with_their_rows() {
+        use crate::comments::Comment;
+        use officina_core::history::Op;
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        for (r, v) in [3.0, 1.0, 2.0].iter().enumerate() {
+            wb.set_value(crate::addr::CellAddr::new(0, r as u32, 0), crate::Value::Num(*v));
+        }
+        wb.set_comments(0, vec![(0, 1, Some(Comment::new("", "three"))), (1, 0, Some(Comment::new("", "one")))]);
+        let op = sort_op(&wb, Rect { sheet: 0, r0: 0, c0: 0, r1: 2, c1: 1 }, &[SortKey { col: 0, descending: false }]).unwrap();
+        let inv = op.apply(&mut wb);
+        assert_eq!(wb.comment(0, 0, 0).map(|k| &*k.text), Some("one"));
+        assert_eq!(wb.comment(0, 2, 1).map(|k| &*k.text), Some("three"));
+        assert_eq!(wb.comments(0).len(), 2);
+        inv.apply(&mut wb);
+        assert_eq!(wb.comment(0, 0, 1).map(|k| &*k.text), Some("three"));
+        assert_eq!(wb.comment(0, 1, 0).map(|k| &*k.text), Some("one"));
     }
 }

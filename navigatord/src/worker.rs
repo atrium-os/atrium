@@ -80,6 +80,35 @@ pub fn persona() -> io::Result<(Option<(String, String)>, Vec<String>)> {
     }
 }
 
+/// Save a held download (`SaveDownload`, personas.md §4.1): portcullisd
+/// writes it into the Downloads of our persona; we never hold the
+/// person's folders. Its name there, and the folder in words.
+pub fn save_download(name: &str, origin: &str, bytes: &[u8]) -> Result<(String, String), String> {
+    use portcullis_ipc::{round_trip, send_fds, Request, Response};
+    use std::os::fd::AsRawFd;
+    let fd = crate::files::sealed(bytes).map_err(|e| format!("a memory file: {e}"))?;
+    let ask = || -> io::Result<Response> {
+        let mut s = portcullisd()?;
+        s.set_read_timeout(Some(Duration::from_secs(60)))?;
+        match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+            Response::Hello { .. } => {}
+            other => return Err(io::Error::other(format!("portcullisd hello: {other:?}"))),
+        }
+        match round_trip(&mut s, &Request::SaveDownload { name: name.into(), origin: origin.into() })? {
+            Response::ReadyForFds => {}
+            other => return Ok(other),
+        }
+        send_fds(&s, &[fd.as_raw_fd()])?;
+        portcullis_ipc::read_response(&mut s)
+    };
+    match ask() {
+        Ok(Response::Downloaded { name, place }) => Ok((name, place)),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected answer: {other:?}")),
+        Err(e) => Err(format!("portcullisd: {e}")),
+    }
+}
+
 /// A window of ours in `persona` (`NewWindowIn`), with the person's press.
 pub fn new_window_in(persona: &str, press: [u8; 16]) -> Result<(), String> {
     use portcullis_ipc::{round_trip, Request, Response};

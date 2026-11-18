@@ -400,7 +400,10 @@ parent                    limend                 portcullisd       frescod      
   goes nowhere, and its stderr is limend's. Hanging up the request connection ends the jail.
   The parent's identity goes to the child as data (`Attach { parent_app, parent_uid }`: the uid limend read off the
   parent's connection, which frescod's bind confirmed owns the slot's window), never as
-  authority.
+  authority. For the roles in `PERSONA_ROLES` (the picker) `ParentPersona { persona }`
+  follows it: the persona the parent's uid runs in, from the launch registry (`None`:
+  Personal), so the picker lists only that persona's folders (personas.md §4.1). Added
+  2026-11-18 at the end of `ChildEvent`.
 - **The child runs as its own user, never as `_limen`.** `ExecInstance` runs a worker as its
   caller unless the system policy has a worker rule for it, so every provider needs one:
   `[workers."<app>"] callers = ["_limen"], run_as = "<its user>"`. limend refuses a launch
