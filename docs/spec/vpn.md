@@ -1,6 +1,6 @@
 # VPN: tunnels with the usual Atrium walls (Crypta)
 
-**Status: proposed 2026-11-15**, for Shankar's review. Nothing here is built.
+**Status: accepted 2026-11-18** (Shankar: all §13 decisions 1–17 as recommended). Build order §14, starting with V0.
 **Scope:** VPN client support for Atrium: our own tunnels first (WireGuard, later IKEv2),
 then corporate VPNs (Cisco AnyConnect / Secure Client, Palo Alto GlobalProtect), including
 their single sign-on and posture checks.
