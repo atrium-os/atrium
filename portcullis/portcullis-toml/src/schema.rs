@@ -5,9 +5,10 @@
 //! schema free of business rules and makes `Manifest` easy to use as
 //! a typed configuration object once it's been validated.
 //!
-//! Forward compatibility: unknown top-level sections and unknown keys
-//! within `[capabilities]` are NOT rejected at parse time. Validation
-//! emits warnings for unknown capability keys (per spec §3.3).
+//! Unknown top-level sections and unknown keys in every section but
+//! `[capabilities]` are refused at parse time (`deny_unknown_fields`).
+//! Unknown keys within `[capabilities]` are NOT rejected: validation warns
+//! about them (spec §3.3), for forward compatibility.
 
 use std::collections::BTreeMap;
 
@@ -36,6 +37,81 @@ pub struct Manifest {
     /// §4.1). Eligibility only, as for `[[opens]]`.
     #[serde(default)]
     pub links:        Vec<LinksSection>,
+    /// `[[workers]]` (app-composition.md §4.1, dev-tools-plan.md M5): parts
+    /// of the app that parse what it doesn't trust, entries in the same
+    /// bundle under the same signature, each run in a jail of its own as a
+    /// uid of its own per (person, app, worker), with no capability at all
+    /// (decision C3). Only this app's core may call them.
+    #[serde(default)]
+    pub workers:      Vec<WorkerSection>,
+    /// `[roles]` (app-composition.md §5.1): the Limen roles the app serves.
+    pub roles:        Option<RolesSection>,
+    /// `[ipc]` (app-composition.md §5.1): Aqueduct services it provides and uses.
+    pub ipc:          Option<IpcSection>,
+}
+
+/// One `[[workers]]` entry.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSection {
+    /// What the core calls it by: `[a-z0-9-]`, unique in the manifest.
+    pub name:      String,
+    /// Its program, a path in the bundle (as `[app] entry`).
+    pub entry:     String,
+    /// What it's given: an open descriptor (`fd`, read-only) or messages on
+    /// a socket (`message`).
+    #[serde(default)]
+    pub input:     WorkerInput,
+    /// `call`: a fresh jail per call. `session`: one jail for many calls,
+    /// until the core lets go.
+    #[serde(default)]
+    pub lifetime:  WorkerLifetime,
+    /// A memory ceiling, as `[resources] memory` ("512M").
+    pub memory:    Option<String>,
+    /// Time per call ("10s", "2m"): the SDK ends a call that takes longer.
+    pub cpu:       Option<String>,
+    /// `jail` (the default) or `capsicum`: a Capsicum child of the core's,
+    /// for many tiny calls (decision C4).
+    #[serde(default)]
+    pub isolation: WorkerIsolation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerInput { #[default] Fd, Message }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerLifetime { #[default] Call, Session }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerIsolation { #[default] Jail, Capsicum }
+
+/// `[roles]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RolesSection {
+    /// Roles it provides (limen.md §3.1): `share-target`, `doc-viewer`, ...
+    #[serde(default)]
+    pub implements: Vec<String>,
+}
+
+/// `[ipc]`: service names with a version, `com.example.photos.library/1`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IpcSection {
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub uses:     Vec<String>,
+}
+
+impl Manifest {
+    /// The worker called `name`, if the manifest declares one.
+    pub fn worker(&self, name: &str) -> Option<&WorkerSection> {
+        self.workers.iter().find(|w| w.name == name)
+    }
 }
 
 /// One `[[links]]` entry: schemes (`mailto`, the app's own).
@@ -369,6 +445,12 @@ pub struct Capabilities {
     /// the module is a binary nobody here can read.
     #[serde(rename = "protected-media")]
     pub protected_media: Option<bool>,
+    /// Limen roles the app may ask to embed (app-composition.md §3, C7):
+    /// `embeds = ["picker", "doc-viewer"]`. Each is a consent line.
+    pub embeds: Option<Vec<String>>,
+    /// Arca's API for the app's own items (app-composition.md §3, C8): it
+    /// keeps secrets in Arca and reads back only its own. Asks consent.
+    pub arca: Option<bool>,
     /// ★ The system call filter class the app's jail gets
     /// (docs/spec/jail-sysfil.md §5): a profile name from the `[sysfil]`
     /// section of jaild's policy, e.g. `renderer`. Absent: `networked` if the
@@ -624,6 +706,8 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
         protected_media:  ovr.protected_media.or(base.protected_media),
+        embeds:           ovr.embeds.clone().or_else(|| base.embeds.clone()),
+        arca:             ovr.arca.or(base.arca),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),
         input:            InputCaps::merge(base.input, ovr.input),
         extra:            {
