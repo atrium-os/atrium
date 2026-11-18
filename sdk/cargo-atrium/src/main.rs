@@ -651,6 +651,9 @@ fn cmd_cross(args: &[String]) -> ExitCode {
     match Command::new(&rustc).args(["--print", "target-libdir", "--target", t.triple]).output() {
         _ if build_std => {}
         Ok(o) if o.status.success() && cross::has_std(Path::new(String::from_utf8_lossy(&o.stdout).trim())) => {}
+        // No prebuilt std (aarch64 is tier 3): a nightly with rust-src
+        // builds it, so pass the flag rather than asking for it.
+        _ if cross::can_build_std(&rustc) => rest.push("-Zbuild-std=std,panic_abort".into()),
         _ => return fail(format!("this rustc has no std for {}: {}", t.triple, cross::std_hint(t))),
     }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
@@ -681,6 +684,7 @@ fn cmd_cross(args: &[String]) -> ExitCode {
         .args(["build", "--target", t.triple])
         .args(&rest)
         .envs(cross::env(t, &wrappers[0], &wrappers[1], ar.as_deref(), &sysroot))
+        .envs(cross::rustflags_env(std::env::var_os("RUSTFLAGS").is_some() || std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some()))
         .status();
     match st {
         Ok(s) if s.success() => ExitCode::SUCCESS,

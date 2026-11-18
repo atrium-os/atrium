@@ -29,9 +29,10 @@ workspaces.
 ### From Linux or macOS
 
 1. Rust: `rustup target add x86_64-unknown-freebsd`. aarch64 has no rustup
-   build (tier 3): use a nightly with `-Zbuild-std`, or the SDK's
-   `rust-std` for aarch64 (published with the Rust layer, for the same rustc
-   version).
+   build (tier 3): on a nightly with `rust-src` (the tree's pinned
+   toolchain has it) `cross` and `bundle` add `-Zbuild-std=std,panic_abort`
+   themselves; otherwise use the SDK's `rust-std` for aarch64 (published
+   with the Rust layer, for the same rustc version).
 2. clang and ld.lld: on Linux your distribution's `clang` and `lld`; on
    macOS `brew install llvm lld` (found in `/opt/homebrew/opt/llvm/bin`
    without changing `PATH`). `ATRIUM_CLANG` picks a specific clang.
@@ -45,9 +46,14 @@ workspaces.
 Then, in your project:
 
 ```sh
-cargo atrium cross amd64            # or aarch64 (add -Zbuild-std on nightly)
+cargo atrium cross amd64            # or aarch64
 cargo atrium cross aarch64 --release
 ```
+
+`cross` links through clang with the sysroot, so it ignores the
+`rustflags` a `.cargo/config.toml` sets (they are usually written for
+another linker); set `RUSTFLAGS` in the environment to pass flags of your
+own.
 
 `cross` writes clang wrappers for the FreeBSD 16 target and the sysroot
 into `target/atrium-cross/<arch>/`, sets the linker, the `cc` crate's

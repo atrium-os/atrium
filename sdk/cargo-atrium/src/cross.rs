@@ -140,6 +140,23 @@ pub fn std_hint(t: &Target) -> String {
     }
 }
 
+/// Whether `rustc` can build std itself: a nightly with rust-src.
+pub fn can_build_std(rustc: &str) -> bool {
+    let out = |a: &[&str]| std::process::Command::new(rustc).args(a).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let nightly = out(&["-V"]).is_some_and(|v| v.contains("-nightly") || v.contains("-dev"));
+    nightly && out(&["--print", "sysroot"]).is_some_and(|s| Path::new(&s).join("lib/rustlib/src/rust/library/std").is_dir())
+}
+
+/// The target's rustflags come from the wrappers, not from a
+/// `.cargo/config.toml`: a config written for another linker (rust-lld's
+/// `--dynamic-linker=`, CRT objects on a Mac path) breaks clang's link. An
+/// empty RUSTFLAGS overrides `target.<triple>.rustflags` and
+/// `build.rustflags`; flags the caller set in the environment stay.
+pub fn rustflags_env(caller_set: bool) -> Vec<(String, String)> {
+    if caller_set { Vec::new() } else { vec![("RUSTFLAGS".into(), String::new())] }
+}
+
 pub fn has_std(libdir: &Path) -> bool {
     std::fs::read_dir(libdir)
         .map(|d| d.flatten().any(|e| {
@@ -165,6 +182,9 @@ mod tests {
         let e = env(t, Path::new("/w/cc"), Path::new("/w/c++"), None, Path::new("/s"));
         assert!(e.contains(&("CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER".into(), "/w/cc".into())));
         assert!(e.contains(&("CC_aarch64_unknown_freebsd".into(), "/w/cc".into())));
+        // A config's target rustflags are overridden; the caller's stay.
+        assert_eq!(rustflags_env(false), [("RUSTFLAGS".to_string(), String::new())]);
+        assert!(rustflags_env(true).is_empty());
     }
 
     #[test]
