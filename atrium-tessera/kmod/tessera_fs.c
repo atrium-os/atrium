@@ -32904,6 +32904,16 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * safe. */
 #define TESSERA_IOC_QUOTA_DETACH _IO('T', 5)
 
+/* Remove a sealed stick's recovery code (tessera-encryption.md §7.4,
+ * "removing the code later"): zero every recovery key slot (type 3) in the
+ * in-core superblock and mark it dirty; the next commit (an fsync on any
+ * vnode of the mount) writes both superblock copies under the HMAC, so
+ * neither still holds the wrapped key. Userspace (dispensatord, root
+ * outside any jail): ioctl(rootfd, TESSERA_IOC_CLEAR_RECOVERY); fsync.
+ * EINVAL on an unsealed volume, ENOENT when it has no recovery slot,
+ * EROFS on a read-only mount. */
+#define TESSERA_IOC_CLEAR_RECOVERY _IO('T', 6)
+
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
@@ -32943,7 +32953,8 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	case TESSERA_IOC_GC:
 	case TESSERA_IOC_DEDUP_POLICY:
 	case TESSERA_IOC_QUOTA_DUMP:
-	case TESSERA_IOC_QUOTA_DETACH: {
+	case TESSERA_IOC_QUOTA_DETACH:
+	case TESSERA_IOC_CLEAR_RECOVERY: {
 		if (jailed(ap->a_cred))
 			return (EPERM);
 		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
@@ -33142,6 +33153,27 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		    "(%u domain(s) left, %u non-global)\n", (uintmax_t)id,
 		    (unsigned)tn->inode_no, (unsigned)tmp_->quota_ndomains,
 		    (unsigned)tmp_->quota_nnonglobal);
+		return (0);
+	}
+	case TESSERA_IOC_CLEAR_RECOVERY: {
+		if (tmp_->seal == NULL ||
+		    (tmp_->sb.incompat_flags & TESSERA_INCOMPAT_SEALED) == 0)
+			return (EINVAL);
+		if ((vp->v_mount->mnt_flag & MNT_RDONLY) != 0 ||
+		    tmp_->inode_tree == NULL)
+			return (EROFS);
+		int found = 0;
+		for (int i = 0; i < 8; i++) {
+			if (tmp_->sb.key_slots[i].slot_type !=
+			    TESSERA_KEY_SLOT_RECOVERY)
+				continue;
+			explicit_bzero(&tmp_->sb.key_slots[i],
+			    sizeof tmp_->sb.key_slots[i]);
+			found = 1;
+		}
+		if (!found)
+			return (ENOENT);
+		tessera_fs_mark_dirty(tmp_);
 		return (0);
 	}
 	case TESSERA_IOC_GC: {

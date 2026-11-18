@@ -120,6 +120,8 @@ pub enum StickAsk {
     /// "Forget this stick's key?" (§9): `recovery` if its recovery code
     /// would still open it.
     Forget { recovery: bool },
+    /// "Remove its recovery code?" (§7.4).
+    RemoveCode,
 }
 
 /// What the app asks dispensatord for, off the window's thread (arcad
@@ -133,6 +135,7 @@ pub enum MediaAsk {
     OpenOlder(String),
     MakeCurrent(String),
     Forget(String),
+    RemoveCode(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1106,6 +1109,17 @@ impl Browser {
         self.stick_sheet = self.sheet_for(i, ask);
     }
 
+    /// "Remove recovery code": for such a stick, open writable, with one.
+    pub fn ask_remove_code(&mut self, i: usize) {
+        if self.places.get(i).is_some_and(|p| Self::code_removable(p, &self.persona)) {
+            self.stick_sheet = self.sheet_for(i, StickAsk::RemoveCode);
+        }
+    }
+
+    pub fn code_removable(p: &Place, persona: &str) -> bool {
+        Self::forgettable(p, persona) && p.seal.recovery && !p.read_only
+    }
+
     /// Whether "Forget this stick's key" applies to `p` in `persona`'s window.
     pub fn forgettable(p: &Place, persona: &str) -> bool {
         p.stick && !p.network && !p.seal.locked && !p.seal.persona.is_empty() && p.seal.persona == persona
@@ -1151,6 +1165,7 @@ impl Browser {
             StickAsk::Older => MediaAsk::OpenOlder(sh.part.clone()),
             StickAsk::MakeCurrent => MediaAsk::MakeCurrent(sh.part.clone()),
             StickAsk::Forget { .. } => MediaAsk::Forget(sh.part.clone()),
+            StickAsk::RemoveCode => MediaAsk::RemoveCode(sh.part.clone()),
             StickAsk::Code { .. } | StickAsk::Locked => {
                 self.stick_sheet = None;
                 return;
@@ -1217,6 +1232,7 @@ impl Browser {
                             StickAsk::MakeCurrent => format!("{label} is now the current copy"),
                             StickAsk::Forget { recovery: true } => format!("This machine forgot the key of {label}: only its recovery code opens it now"),
                             StickAsk::Forget { .. } => format!("This machine forgot the key of {label}"),
+                            StickAsk::RemoveCode => format!("{label} no longer has a recovery code"),
                             _ => String::new(),
                         };
                         self.say(words, false);
@@ -1784,6 +1800,20 @@ mod tests {
         assert_eq!(b.want_media.take(), Some(MediaAsk::Forget("da2s1".into())));
         b.media_done(Ok("da2s1's key is forgotten".into()));
         assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("This machine forgot the key of Holiday: only its recovery code opens it now"));
+
+        // Its recovery code can be removed, while it's open writable.
+        let mine = Place { id: "da2s1".into(), label: "Holiday".into(), seal: Seal { persona: "personal".into(), recovery: true, ..Default::default() }, ..p.clone() };
+        let ro = Place { id: "da3s1".into(), read_only: true, ..mine.clone() };
+        let none = Place { id: "da4s1".into(), seal: Seal { persona: "personal".into(), ..Default::default() }, ..p.clone() };
+        b.set_places(vec![mine, ro, none]);
+        b.ask_remove_code(1);
+        b.ask_remove_code(2);
+        assert!(b.stick_sheet.is_none());
+        b.ask_remove_code(0);
+        b.confirm_stick(None);
+        assert_eq!(b.want_media.take(), Some(MediaAsk::RemoveCode("da2s1".into())));
+        b.media_done(Ok(String::new()));
+        assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("Holiday no longer has a recovery code"));
 
         // Format: this window's persona; a recovery code by default only for Personal.
         let older = Place { id: "da1s1".into(), read_only: true, seal: Seal { persona: "personal".into(), older: true, ..Default::default() }, ..p.clone() };

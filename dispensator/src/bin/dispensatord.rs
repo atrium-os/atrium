@@ -136,6 +136,8 @@ fn args() -> Result<Args, String> {
             "--make-current" => a.media_cmd = Some(format!("make-current {}", val()?)),
             // "Forget this stick's key" (§9).
             "--forget" => a.media_cmd = Some(format!("forget {}", val()?)),
+            // Remove a stick's recovery code (§7.4).
+            "--remove-code" => a.media_cmd = Some(format!("remove-code {}", val()?)),
             "--adopt" => {
                 let part = val()?;
                 let persona = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
@@ -441,6 +443,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
     if let Some(part) = cmd.strip_prefix("make-current ") {
         return answer(atrium_media::client::make_current(sock, &atrium_media::Eject { part: part.into() }));
     }
+    if let Some(part) = cmd.strip_prefix("remove-code ") {
+        return answer(atrium_media::client::remove_code(sock, &atrium_media::Eject { part: part.into() }));
+    }
     if let Some(part) = cmd.strip_prefix("forget ") {
         return answer(atrium_media::client::forget(sock, &atrium_media::Eject { part: part.into() }));
     }
@@ -696,6 +701,8 @@ mod run {
         MakeCurrent(String),
         /// Forget an open sealed stick's key, once Sigillum verified (§9).
         Forget(String),
+        /// Remove an open sealed stick's recovery code (§7.4).
+        RemoveCode(String),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -883,6 +890,9 @@ mod run {
         Ok(())
     }
 
+    /// `TESSERA_IOC_CLEAR_RECOVERY = _IO('T', 6)`: IOC_VOID | 'T' << 8 | 6.
+    const TESSERA_IOC_CLEAR_RECOVERY: libc::c_ulong = 0x2000_0000 | ((b'T' as libc::c_ulong) << 8) | 6;
+
     fn tkey_drop(ring: &std::fs::File, key_id: [u8; 16]) {
         let mut id = key_id;
         // SAFETY: 16 bytes, the size the command encodes.
@@ -1029,6 +1039,10 @@ mod run {
 
         fn forget(&self, part: &str) -> (u8, String) {
             self.ask(Req::Forget(part.to_string()))
+        }
+
+        fn remove_code(&self, part: &str) -> (u8, String) {
+            self.ask(Req::RemoveCode(part.to_string()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1915,6 +1929,7 @@ mod run {
                     Req::OpenOlder(p) => self.open_older(&p),
                     Req::MakeCurrent(p) => self.make_current(&p),
                     Req::Forget(p) => self.forget(&p),
+                    Req::RemoveCode(p) => self.remove_code(&p),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -2822,6 +2837,43 @@ mod run {
             let code = self.recoverable.contains(part);
             eprintln!("atrium-dispensatord: {part}: {user}/{}'s key forgotten; Locked{}", t.persona, if code { " (it has a recovery code)" } else { "" });
             (mstatus::OK, if code { format!("{part}'s key is forgotten; its recovery code still opens it") } else { format!("{part}'s key is forgotten") })
+        }
+
+        /// Remove a stick's recovery code (§7.4): the kernel zeroes its
+        /// slot in the mounted volume's superblock, and the fsync that
+        /// follows writes both copies. Only the person's own writable
+        /// mount; nothing to verify, since it only takes a way in away.
+        fn remove_code(&mut self, part: &str) -> (u8, String) {
+            use std::os::unix::fs::OpenOptionsExt;
+            let Session::Active { user, .. } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            };
+            let Some(t) = self.trusted.get(part).filter(|t| t.user == user && !t.read_only).cloned() else {
+                return (mstatus::NOT_FOUND, format!("{part} is not an open sealed stick of yours"));
+            };
+            if !self.recoverable.contains(part) {
+                return (mstatus::NOT_FOUND, format!("{part} has no recovery code"));
+            }
+            let dir = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&t.mnt) {
+                Ok(d) => d,
+                Err(e) => return (mstatus::FAILED, format!("{}: {e}", t.mnt)),
+            };
+            // Never a path into someone else's mount: it must be the stick's.
+            if jaild::ffi::fsid_of(&t.mnt).is_none() {
+                return (mstatus::FAILED, format!("{} is not mounted", t.mnt));
+            }
+            // SAFETY: an _IO command on a descriptor we own; no argument.
+            if unsafe { libc::ioctl(dir.as_raw_fd(), TESSERA_IOC_CLEAR_RECOVERY) } != 0 {
+                let e = std::io::Error::last_os_error();
+                return (mstatus::FAILED, format!("the kernel didn't remove it: {e}"));
+            }
+            if let Err(e) = dir.sync_all() {
+                return (mstatus::FAILED, format!("removed, but not yet written: {e}"));
+            }
+            self.recoverable.remove(part);
+            self.publish();
+            eprintln!("atrium-dispensatord: {part}: {user}/{}'s recovery code removed", t.persona);
+            (mstatus::OK, format!("{part}'s recovery code is removed"))
         }
 
         /// A Locked stick opened with its recovery code (§7.4): arcad

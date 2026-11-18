@@ -679,7 +679,7 @@ impl ScriniumView {
         let pad = 24.0;
         let (cw, ch) = (520.0_f32.min(w - 16.0), em(236.0));
         let (x, y) = (((w - cw) / 2.0).max(8.0), ((h - ch) / 2.0).max(8.0));
-        let danger = matches!(sh.ask, StickAsk::Format { .. } | StickAsk::Forget { .. });
+        let danger = matches!(sh.ask, StickAsk::Format { .. } | StickAsk::Forget { .. } | StickAsk::RemoveCode);
         rect(ctx, x - 1.0, y - 1.0, cw + 2.0, ch + 2.0, if danger { t.danger_fg() } else { t.border_strong() }, 11.0);
         rect(ctx, x, y, cw, ch, t.bg_surface(), 10.0);
         let (lx, inner) = (x + pad, cw - 2.0 * pad);
@@ -790,6 +790,13 @@ impl ScriniumView {
                 }
                 line(ctx, 126.0, "You'll be asked to confirm it's you.", t.text_tertiary());
                 btn(ctx, if busy { "Waiting for you…" } else { "Forget key" }, Look::Danger, !busy, confirm);
+                btn(ctx, "Cancel", Look::Ghost, !busy, close);
+            }
+            StickAsk::RemoveCode => {
+                title(ctx, &format!("Remove the recovery code of “{}”?", sh.label));
+                line(ctx, 66.0, "The code you wrote down won't open it any more, here or anywhere.", t.text_secondary());
+                line(ctx, 86.0, "Only this machine's key will: if it's lost, so is everything on it.", t.text_secondary());
+                btn(ctx, if busy { "Removing…" } else { "Remove code" }, Look::Danger, !busy, confirm);
                 btn(ctx, "Cancel", Look::Ghost, !busy, close);
             }
         }
@@ -1238,6 +1245,10 @@ impl ScriniumView {
         if let Some(i) = b.at.filter(|_| b.place().is_some_and(|p| Browser::forgettable(p, &b.persona))) {
             let s = self.state.clone();
             items.push(ToolItem::new("Forget this stick's key…", move || with(&s, |b| b.ask_forget(i))).priority(0).enabled(b.stick_sheet.is_none()));
+        }
+        if let Some(i) = b.at.filter(|_| b.place().is_some_and(|p| Browser::code_removable(p, &b.persona))) {
+            let s = self.state.clone();
+            items.push(ToolItem::new("Remove recovery code…", move || with(&s, |b| b.ask_remove_code(i))).priority(0).enabled(b.stick_sheet.is_none()));
         }
         if compact {
             // The hidden-files switch joins them, first into More.

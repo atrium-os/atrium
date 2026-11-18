@@ -209,6 +209,7 @@ fn stick_trace(b: &scrinium::browser::Browser) -> String {
         StickAsk::Older => "older".into(),
         StickAsk::MakeCurrent => "make-current".into(),
         StickAsk::Forget { recovery } => format!("forget{}", if *recovery { "+code" } else { "" }),
+        StickAsk::RemoveCode => "remove-code".into(),
     };
     let state = if sh.busy { ":busy" } else if sh.armed.is_some() { ":armed" } else { "" };
     match &sh.error {
@@ -835,6 +836,7 @@ impl Network {
                     MediaAsk::OpenOlder(part) => atrium_media::client::open_older(&media, &eject(part)),
                     MediaAsk::MakeCurrent(part) => atrium_media::client::make_current(&media, &eject(part)),
                     MediaAsk::Forget(part) => atrium_media::client::forget(&media, &eject(part)),
+                    MediaAsk::RemoveCode(part) => atrium_media::client::remove_code(&media, &eject(part)),
                 };
                 let _ = tx.send(Job::Media(r.map_err(|(_, m)| m)));
             });

@@ -20,6 +20,7 @@
 //! | `OPEN_OLDER` 0x0C | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Open read-only?" for a Locked stick that is an older copy of one of the person's (tessera-encryption.md §8); Sigillum verifies the person first |
 //! | `MAKE_CURRENT` 0x0D | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Use this copy as current" for an older copy opened read-only (§8): Sigillum verifies the person, arcad lowers its key's high-water mark to this copy, and it is mounted writable |
 //! | `FORGET` 0x0E | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Forget this stick's key" for an open sealed stick of the person's (tessera-encryption.md §9): Sigillum verifies the person, arcad deletes the key and the kernel drops it; the stick is unmounted and shows Locked (openable again only with its recovery code, if it has one) |
+//! | `REMOVE_CODE` 0x0F | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: remove an open sealed stick's recovery code (tessera-encryption.md §7.4): the kernel zeroes its slot in both superblock copies, so only this machine's key opens it from then on |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -51,6 +52,7 @@ pub mod op {
     pub const OPEN_OLDER: u16 = 0x0C;
     pub const MAKE_CURRENT: u16 = 0x0D;
     pub const FORGET: u16 = 0x0E;
+    pub const REMOVE_CODE: u16 = 0x0F;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -272,6 +274,9 @@ pub mod server {
         /// "Forget this stick's key" (checked here: who, and that it's
         /// listed as an open sealed stick).
         fn forget(&self, part: &str) -> (u8, String);
+        /// Remove its recovery code (checked here: who, and that it's
+        /// listed open, writable and with one).
+        fn remove_code(&self, part: &str) -> (u8, String);
     }
 
     pub struct Shared {
@@ -388,6 +393,16 @@ pub mod server {
                 return (status::NOT_FOUND, format!("{part} is not an open sealed stick"));
             }
             self.host.forget(part)
+        }
+
+        pub fn remove_code(&self, uid: u32, part: &str) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may change a stick".into());
+            }
+            if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == part && !v.locked && !v.read_only && v.recovery && !v.persona.is_empty() && !v.part.starts_with("share-")) {
+                return (status::NOT_FOUND, format!("{part} is not an open sealed stick with a recovery code"));
+            }
+            self.host.remove_code(part)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -560,6 +575,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::FORGET, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::REMOVE_CODE => {
+                    let (st, msg) = match postcard::from_bytes::<Eject>(&m.payload) {
+                        Ok(e) if !e.part.is_empty() && e.part.len() <= 32 => shared.remove_code(uid, &e.part),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::REMOVE_CODE, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -651,6 +673,10 @@ pub mod client {
 
     pub fn forget(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
         status_call(sock, op::FORGET, part)
+    }
+
+    pub fn remove_code(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
+        status_call(sock, op::REMOVE_CODE, part)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -802,6 +828,9 @@ mod tests {
         }
         fn forget(&self, part: &str) -> (u8, String) {
             (status::OK, format!("{part}'s key is forgotten"))
+        }
+        fn remove_code(&self, part: &str) -> (u8, String) {
+            (status::OK, format!("{part}'s recovery code is removed"))
         }
     }
 
@@ -1004,5 +1033,20 @@ mod tests {
         assert_eq!(shared.forget(1000, "da0p1").0, status::NOT_FOUND, "a plain stick");
         assert_eq!(shared.forget(1000, "da2p1").0, status::NOT_FOUND, "already Locked");
         assert_eq!(shared.forget(1000, "share-1000").0, status::NOT_FOUND, "a share");
+    }
+
+    #[test]
+    fn remove_code_needs_an_open_writable_stick_with_one() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        let with = Volume { persona: "personal".into(), recovery: true, ..vol("da1p1") };
+        let without = Volume { persona: "personal".into(), ..vol("da2p1") };
+        let older = Volume { persona: "personal".into(), recovery: true, read_only: true, older: true, ..vol("da3p1") };
+        let locked = Volume { mountpoint: String::new(), locked: true, recovery: true, ..vol("da4p1") };
+        shared.update(vec![with, without, older, locked], &[]);
+        assert_eq!(shared.remove_code(1000, "da1p1").0, status::OK);
+        assert_eq!(shared.remove_code(2000, "da1p1").0, status::NOT_ALLOWED);
+        for p in ["da2p1", "da3p1", "da4p1"] {
+            assert_eq!(shared.remove_code(1000, p).0, status::NOT_FOUND, "{p}");
+        }
     }
 }
