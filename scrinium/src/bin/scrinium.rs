@@ -135,7 +135,7 @@ impl Pane {
         if self.trace.is_some() {
             let b = self.state.get_cloned();
             let line = format!(
-                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} look={} open={}",
+                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} look={} open={} seals=[{}] stick={}",
                 b.place().map_or("-", |p| p.id.as_str()),
                 b.path.join("/"),
                 b.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
@@ -147,6 +147,8 @@ impl Pane {
                 b.unreadable.as_deref().unwrap_or("-"),
                 look_trace(&b),
                 open_trace(&b),
+                seals_trace(&b),
+                stick_trace(&b),
             );
             if self.trace.as_deref() != Some(&line) {
                 eprintln!("scrinium: {who}: {line}");
@@ -181,6 +183,38 @@ fn open_trace(b: &scrinium::browser::Browser) -> String {
 }
 
 /// The Connect sheet's step, or the key-changed stop, for the trace.
+/// Sealed sticks, for the trace: `PART:PERSONA[+locked][+recovery][+older]`.
+fn seals_trace(b: &scrinium::browser::Browser) -> String {
+    b.places
+        .iter()
+        .filter(|p| p.seal != Default::default())
+        .map(|p| {
+            let s = &p.seal;
+            format!("{}:{}{}{}{}", p.id, if s.persona.is_empty() { "-" } else { &s.persona }, if s.locked { "+locked" } else { "" }, if s.recovery { "+recovery" } else { "" }, if s.older { "+older" } else { "" })
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A stick's sheet, for the trace: `ASK[:busy|:armed][(error)]`.
+fn stick_trace(b: &scrinium::browser::Browser) -> String {
+    use scrinium::browser::StickAsk;
+    let Some(sh) = &b.stick_sheet else { return "-".into() };
+    let ask = match &sh.ask {
+        StickAsk::Format { persona, recovery } => format!("format:{persona}{}", if *recovery { "+code" } else { "" }),
+        StickAsk::Code { .. } => "code-shown".into(),
+        StickAsk::Locked => "locked".into(),
+        StickAsk::Recovery { keep } => format!("recovery:{}", if *keep { "keep" } else { "once" }),
+        StickAsk::Older => "older".into(),
+        StickAsk::MakeCurrent => "make-current".into(),
+    };
+    let state = if sh.busy { ":busy" } else if sh.armed.is_some() { ":armed" } else { "" };
+    match &sh.error {
+        Some(e) => format!("{ask}{state}({e})"),
+        None => format!("{ask}{state}"),
+    }
+}
+
 fn connect_trace(b: &scrinium::browser::Browser) -> String {
     use scrinium::connect::Step;
     if let Some(k) = &b.key_changed {
@@ -651,6 +685,7 @@ impl Network {
         if let Some(f) = &mut b.connect {
             changed |= f.tick(std::time::Instant::now());
         }
+        changed |= b.stick_tick(std::time::Instant::now());
         // What the form asks for.
         if let Some(want) = b.connect.as_mut().and_then(|f| f.take_want()) {
             changed = true;
@@ -724,6 +759,9 @@ impl Network {
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.rcode_embed => {
                         if let Some(m) = limen::credential::ToParent::decode(&bytes) {
                             pane.rcode.apply(m);
+                            if let Some(h) = pane.rcode_state.get_cloned().handle {
+                                b.code_handle(h);
+                            }
                             changed = true;
                         }
                     }
