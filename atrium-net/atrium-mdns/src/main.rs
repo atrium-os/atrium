@@ -11,7 +11,7 @@
 //!   atrium-mdns [--uid N] [-v]
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -97,6 +97,16 @@ fn sandbox(uid: Option<u32>) {
 #[cfg(not(target_os = "freebsd"))]
 fn sandbox(_uid: Option<u32>) {}
 
+/// `v6=P1,P2`: the interface's global and unique-local /64s, each written
+/// as an address in it. Anything else is left out.
+fn v6_prefixes(s: &str) -> Vec<Ipv6Addr> {
+    s.split(',')
+        .filter_map(|p| p.trim_end_matches("/64").parse::<Ipv6Addr>().ok())
+        .filter(|a| !a.is_loopback() && !a.is_unspecified() && a.segments()[0] & 0xffc0 != 0xfe80)
+        .take(4)
+        .collect()
+}
+
 struct Conn {
     s: TcpStream,
     buf: Vec<u8>,
@@ -119,7 +129,8 @@ fn main() {
     let net = l
         .get("addr")
         .and_then(|s| s.split_once('/'))
-        .and_then(|(a, p)| Some(Net { addr: a.parse::<Ipv4Addr>().ok()?, prefix: p.parse().ok()? }))
+        .and_then(|(a, p)| Some((a.parse::<Ipv4Addr>().ok()?, p.parse().ok()?)))
+        .map(|(addr, prefix)| Net { addr, prefix, v6: v6_prefixes(l.get("v6").unwrap_or("")) })
         .unwrap_or_else(|| die("start: addr=A/P"));
     if l.verb != "start" || fds.len() != 3 {
         die("start: three descriptors");
@@ -132,11 +143,11 @@ fn main() {
     let _ = recv.set_nonblocking(true);
     let _ = ctl.set_nonblocking(true);
     if v {
-        eprintln!("atrium-mdns: serving .local for {}/{}", net.addr, net.prefix);
+        eprintln!("atrium-mdns: serving .local for {}/{} v6 {:?}", net.addr, net.prefix, net.v6);
     }
     let t0 = Instant::now();
     let now = || t0.elapsed().as_millis() as u64;
-    let mut r: Resolver<u64> = Resolver::new(net);
+    let mut r: Resolver<u64> = Resolver::new(net.clone());
     let mut conns: Vec<(u64, Conn)> = Vec::new();
     let mut next_id = 0u64;
     let mut asked = 0u64;

@@ -35,7 +35,23 @@ fn resp(rrs: &[Vec<u8>]) -> Vec<u8> {
     m
 }
 
-const NET: Net = Net { addr: Ipv4Addr::new(10, 88, 0, 50), prefix: 24 };
+#[allow(non_snake_case)]
+fn NET() -> Net {
+    Net { addr: Ipv4Addr::new(10, 88, 0, 50), prefix: 24, v6: vec!["fd77:0:0:88::".parse().unwrap()] }
+}
+
+fn v4(a: [u8; 4]) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::from(a))
+}
+
+fn aaaa_rr(n: &[u8], ttl: u32, a: &str) -> Vec<u8> {
+    let mut r = n.to_vec();
+    r.extend_from_slice(&[0, 28, 0x80, 1]);
+    r.extend_from_slice(&ttl.to_be_bytes());
+    r.extend_from_slice(&[0, 16]);
+    r.extend_from_slice(&a.parse::<Ipv6Addr>().unwrap().octets());
+    r
+}
 
 #[test]
 fn local_names() {
@@ -68,10 +84,10 @@ fn mdns_question_one_shot() {
 
 #[test]
 fn net_rules() {
-    assert!(NET.allows(Ipv4Addr::new(10, 88, 0, 77)));
-    assert!(NET.allows(Ipv4Addr::new(169, 254, 3, 4)));
+    assert!(NET().allows(Ipv4Addr::new(10, 88, 0, 77)));
+    assert!(NET().allows(Ipv4Addr::new(169, 254, 3, 4)));
     for bad in [[10, 88, 1, 77], [10, 88, 0, 0], [10, 88, 0, 255], [10, 88, 0, 50], [127, 0, 0, 1], [8, 8, 8, 8], [224, 0, 0, 251], [0, 0, 0, 0]] {
-        assert!(!NET.allows(Ipv4Addr::from(bad)), "{bad:?}");
+        assert!(!NET().allows(Ipv4Addr::from(bad)), "{bad:?}");
     }
 }
 
@@ -87,21 +103,21 @@ fn answers_checked() {
         a_rr(&wire("other.local"), 120, [10, 88, 0, 79]),
         a_rr(&n, 30, [169, 254, 9, 9]),
     ]);
-    assert_eq!(answers(&m, &want, &NET), vec![(Ipv4Addr::new(10, 88, 0, 77), 120), (Ipv4Addr::new(169, 254, 9, 9), 30)]);
+    assert_eq!(answers(&m, &want, TYPE_A, &NET()), vec![(v4([10, 88, 0, 77]), 120), (v4([169, 254, 9, 9]), 30)]);
     // Upper case on the wire still matches; a query (QR clear) never does.
-    assert_eq!(answers(&resp(&[a_rr(&wire("NAS.local"), 60, [10, 88, 0, 77])]), &want, &NET).len(), 1);
+    assert_eq!(answers(&resp(&[a_rr(&wire("NAS.local"), 60, [10, 88, 0, 77])]), &want, TYPE_A, &NET()).len(), 1);
     let mut q = m.clone();
     q[2] = 0;
-    assert!(answers(&q, &want, &NET).is_empty());
+    assert!(answers(&q, &want, TYPE_A, &NET()).is_empty());
     // Many addresses: four kept.
     let many: Vec<Vec<u8>> = (1..20).map(|k| a_rr(&n, 60, [10, 88, 0, k])).collect();
-    assert_eq!(answers(&resp(&many), &want, &NET).len(), MAX_ADDRS);
+    assert_eq!(answers(&resp(&many), &want, TYPE_A, &NET()).len(), MAX_ADDRS);
     // Compressed names, pointing backwards only.
     let mut m = resp(&[]);
     m[7] = 2;
     m.extend(a_rr(&n, 60, [10, 88, 0, 70])); // name at 12
     m.extend(a_rr(&[0xc0, 12], 60, [10, 88, 0, 71]));
-    assert_eq!(answers(&m, &want, &NET).len(), 2);
+    assert_eq!(answers(&m, &want, TYPE_A, &NET()).len(), 2);
 }
 
 #[test]
@@ -125,7 +141,7 @@ fn hostile_messages_are_bounded() {
     let mut counts = resp(&[a_rr(&wire("nas.local"), 60, [10, 88, 0, 9])]);
     counts[4..12].copy_from_slice(&[0xff; 8]);
     for m in [loop1, fwd, past, long, counts] {
-        assert!(answers(&m, &want, &NET).is_empty());
+        assert!(answers(&m, &want, TYPE_A, &NET()).is_empty());
     }
     // Labels adding up past 255 bytes.
     let mut big = resp(&[]);
@@ -151,15 +167,16 @@ fn hostile_messages_are_bounded() {
             m[2] |= 0x80;
             m[3] &= 0xf0;
         }
-        let _ = answers(&m, &want, &NET);
+        let _ = answers(&m, &want, TYPE_A, &NET());
         let _ = parse_query(&m);
     }
 }
 
 #[test]
 fn resolver_flow() {
-    let mut r: Resolver<u32> = Resolver::new(NET);
-    // Not ours: REFUSED at once. AAAA: no data, no question on the link.
+    let mut r: Resolver<u32> = Resolver::new(Net { v6: vec![], ..NET() });
+    // Not ours: REFUSED at once. AAAA on a v4-only network: no data, no
+    // question on the link.
     let out = r.query(1, &dq(1, "example.com", TYPE_A), 0);
     assert!(matches!(&out[..], [Out::Reply(1, m)] if m[3] & 0xf == rcode::REFUSED as u8));
     let out = r.query(1, &dq(2, "nas.local", TYPE_AAAA), 0);
@@ -185,10 +202,61 @@ fn resolver_flow() {
     assert!(matches!(&r.query(1, &dq(6, "gone.local", TYPE_A), 4000)[..], [Out::Reply(1, _)]));
     assert!(matches!(&r.query(1, &dq(7, "gone.local", TYPE_A), 3000 + NEGATIVE_MS)[..], [Out::Ask(_)]));
     // At most MAX_PENDING questions on the link.
-    let mut r: Resolver<u32> = Resolver::new(NET);
+    let mut r: Resolver<u32> = Resolver::new(NET());
     for k in 0..MAX_PENDING {
         assert!(matches!(&r.query(1, &dq(k as u16, &format!("h{k}.local"), TYPE_A), 0)[..], [Out::Ask(_)]));
     }
     let out = r.query(1, &dq(99, "more.local", TYPE_A), 0);
     assert!(matches!(&out[..], [Out::Reply(1, m)] if m[3] & 0xf == rcode::SERVFAIL as u8));
+}
+
+#[test]
+fn ipv6_answers() {
+    let net = NET();
+    let ok = |s: &str| net.allows_ip(IpAddr::V6(s.parse().unwrap()));
+    assert!(ok("fd77:0:0:88::77"));
+    for bad in ["fd77:0:0:88::", "fd77:0:0:89::77", "::1", "2001:db8::1", "fe80::1", "::"] {
+        assert!(!ok(bad), "{bad}");
+    }
+    let want = name("nas.local");
+    let n = wire("nas.local");
+    let m = resp(&[
+        aaaa_rr(&n, 600, "fd77:0:0:88::77"),
+        aaaa_rr(&n, 60, "::1"),
+        aaaa_rr(&n, 60, "fe80::1"),
+        aaaa_rr(&n, 60, "2001:db8::1"),
+        a_rr(&n, 60, [10, 88, 0, 77]),
+    ]);
+    assert_eq!(answers(&m, &want, TYPE_AAAA, &net), vec![(IpAddr::V6("fd77:0:0:88::77".parse().unwrap()), 120)]);
+    assert_eq!(answers(&m, &want, TYPE_A, &net), vec![(v4([10, 88, 0, 77]), 60)]);
+    // A wrong length is no address.
+    let mut bad = aaaa_rr(&n, 60, "fd77:0:0:88::78");
+    let l = bad.len();
+    bad[l - 17] = 4;
+    bad.truncate(l - 12);
+    assert!(answers(&resp(&[bad]), &want, TYPE_AAAA, &net).is_empty());
+}
+
+#[test]
+fn ipv6_resolver() {
+    let mut r: Resolver<u32> = Resolver::new(NET());
+    assert!(matches!(&r.query(1, &dq(1, "nas.local", TYPE_AAAA), 0)[..], [Out::Ask(q)] if q[q.len() - 4..] == [0, 28, 0, 1]));
+    assert!(matches!(&r.query(1, &dq(2, "nas.local", TYPE_A), 0)[..], [Out::Ask(_)]));
+    r.mdns(&resp(&[aaaa_rr(&wire("nas.local"), 60, "fd77:0:0:88::77")]));
+    let out = r.tick(1000);
+    assert_eq!(out.len(), 2);
+    for o in &out {
+        let Out::Reply(_, m) = o else { panic!() };
+        match u16::from_be_bytes([m[0], m[1]]) {
+            1 => assert_eq!((m[3] & 0xf, m[7], &m[m.len() - 2..]), (0, 1, &[0u8, 0x77][..])),
+            2 => assert_eq!(m[3] & 0xf, rcode::NXDOMAIN as u8),
+            x => panic!("{x}"),
+        }
+    }
+    // An AAAA question nobody answers: no data, not NXDOMAIN.
+    assert!(matches!(&r.query(1, &dq(3, "v4only.local", TYPE_AAAA), 2000)[..], [Out::Ask(_)]));
+    assert!(matches!(&r.tick(3000)[..], [Out::Reply(1, m)] if m[3] & 0xf == 0 && m[7] == 0));
+    // No IPv6 on this network: AAAA is answered at once, nothing asked.
+    let mut r: Resolver<u32> = Resolver::new(Net { v6: vec![], ..NET() });
+    assert!(matches!(&r.query(1, &dq(4, "nas.local", TYPE_AAAA), 0)[..], [Out::Reply(1, m)] if m[3] & 0xf == 0 && m[7] == 0));
 }

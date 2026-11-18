@@ -282,7 +282,7 @@ other name, through the same resolver.
   It can't open others and can't send anywhere but 224.0.0.251:5353 and back to unbound.
   It is started again with new sockets when the egress changes, and not run when there is
   none (or only a VPN tunnel): then `.local` gets SERVFAIL.
-- **What it answers:** A queries (AAAA with the IPv6 pair, later) for names of one to
+- **What it answers:** A and AAAA queries for names of one to
   four labels under `local.`, nothing else (no PTR, no SRV: printers have prelum-browse).
   One query per question, answers collected for 1 s, at most 8 queries in flight and
   a negative-cache of 10 s per name so a loop in some program can't flood the LAN.
@@ -304,7 +304,17 @@ other name, through the same resolver.
   `atrium-net/etc/unbound-atrium-local.conf` is installed by `atrium-net-service.sh`.
   Gates: `atrium-net-gate.sh n0` 53/53 (gatebox.local through unbound and one mDNS
   question, the cache, evil/loopy/nothere.local NXDOMAIN, getent, kill and restart),
-  `aura-sim-gate.sh svc` 23/23 (the installed service resolves `.local`). Not yet: L3.
+  `aura-sim-gate.sh svc` 23/23 (the installed service resolves `.local`).
+- **As built (2026-11-18), L3:** AAAA questions go over the same IPv4 one-shot pair, not
+  ff02::fb: one socket pair, and hosts answer AAAA over IPv4 alike. An AAAA answer counts
+  only inside one of the interface's own /64s (global or unique-local, from SLAAC or
+  DHCPv6; not the prefix's anycast address, never loopback or fe80::/10, which a DNS
+  answer can't give a zone). atrium-net passes the /64s on the start line (`v6=P/64,..`)
+  and starts atrium-mdns again when they change; with none, AAAA is answered at once
+  with no data. An AAAA nobody answers is NOERROR/no data (the name may have an IPv4
+  address), not NXDOMAIN. 9 host tests. Gate `atrium-net-gate.sh n0` 55/55
+  (gatebox.local AAAA fd77:0:0:88::77; evil.local's ::1, 2001:db8::1, fe80::1 and anycast
+  refused).
 
 ## 7. Interfaces to others
 

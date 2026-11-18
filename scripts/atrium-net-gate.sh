@@ -265,8 +265,19 @@ n0)
         echo "$r" | grep -q 'rcode: NXDOMAIN' && ! echo "$r" | grep -qE 'IN[[:space:]]+A[[:space:]]' || fail "$h.local: $r"
     done
     ok "evil.local (8.8.8.8, 127.0.0.1, broadcast), loopy.local (pointer loop), nothere.local: NXDOMAIN"
+    # AAAA (§6.1 L3): asked over the same IPv4 socket; only addresses in
+    # vtnet1's /64s count.
+    "$V" 'grep "atrium-mdns: .local on vtnet1" /tmp/atrium-net/net.log | tail -n 1' | grep -q 'fd77:0:0:88::/64' \
+        || fail "atrium-mdns without the IPv6 prefix: $("$V" 'grep atrium-mdns /tmp/atrium-net/net.log | tail -n 3')"
+    a0=$(stat mdns_a)
+    r=$("$V" 'drill gatebox.local AAAA @127.0.0.1' 2>&1 || true)
+    echo "$r" | grep -qE '^gatebox\.local\.[[:space:]]+[0-9]+[[:space:]]+IN[[:space:]]+AAAA[[:space:]]+fd77:0:0:88::77' && [ "$(stat mdns_a)" -gt "$a0" ] \
+        && ok "gatebox.local AAAA = fd77:0:0:88::77 (prefix from SLAAC)" || fail "gatebox.local AAAA: $r"
+    r=$("$V" 'drill evil.local AAAA @127.0.0.1' 2>&1 || true)
+    echo "$r" | grep -q 'rcode: NOERROR' && ! echo "$r" | grep -qE 'IN[[:space:]]+AAAA[[:space:]]' \
+        && ok "evil.local AAAA (::1, 2001:db8::1, fe80::1, the prefix's anycast): no address" || fail "evil.local AAAA: $r"
     r=$("$V" 'getent hosts gatebox.local' 2>&1 || true)
-    echo "$r" | grep -q '^10.88.0.77' && ok "programs resolve it too: getent hosts gatebox.local = $r" || fail "getent: $r"
+    echo "$r" | grep -qE '^(10\.88\.0\.77|fd77:0:0:88::77)[[:space:]]' && ok "programs resolve it too: getent hosts gatebox.local = $r" || fail "getent: $r"
     "$V" "kill -9 $mp"
     i=0; until [ -n "$("$V" 'pgrep -x atrium-mdns' || true)" ] && "$V" 'local-unbound-control flush gatebox.local >/dev/null; local-unbound-control flush_bogus >/dev/null; local-unbound-control flush_negative >/dev/null' && look gatebox.local | grep -q 10.88.0.77; do i=$((i + 1)); [ $i -lt 30 ] || fail "atrium-mdns not back"; sleep 1; done
     ok "atrium-mdns killed: started again (${i} s), atrium-net running"

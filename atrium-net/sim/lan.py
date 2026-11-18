@@ -297,10 +297,15 @@ def mdns_flood():
 # answers with a name that points at itself.
 MDNS_HOSTS = {b"gatebox": [bytes([10, 88, 0, 77])],
               b"evil": [bytes([8, 8, 8, 8]), bytes([127, 0, 0, 1]), bytes([10, 88, 0, 255])]}
+# AAAA: gatebox has an address in the LAN's /64; evil only loopback,
+# documentation, link-local and the prefix's anycast address.
+MDNS_HOSTS6 = {b"gatebox": [socket.inet_pton(socket.AF_INET6, "fd77:0:0:88::77")],
+               b"evil": [socket.inet_pton(socket.AF_INET6, x) for x in ("::1", "2001:db8::1", "fe80::1", "fd77:0:0:88::")]}
 
 
 def mdns_a_question(m):
-    """(host label, QU) for a single-question A query for HOST.local."""
+    """(host label, QU, qtype) for a single-question A or AAAA query for
+    HOST.local."""
     if len(m) < 12 or struct.unpack("!H", m[4:6])[0] != 1:
         return None
     i, labels = 12, []
@@ -311,25 +316,25 @@ def mdns_a_question(m):
     if i + 4 > len(m) or len(labels) != 2 or labels[1] != b"local":
         return None
     qt, qc = struct.unpack("!HH", m[i:i + 4])
-    return (labels[0], bool(qc & 0x8000)) if qt == 1 else None
+    return (labels[0], bool(qc & 0x8000), qt) if qt in (1, 28) else None
 
 
-def mdns_a_answer(host):
+def mdns_a_answer(host, qt=1):
     hdr = lambda n: struct.pack("!HHHHHH", 0, 0x8400, 0, n, 0, 0)
     if host == b"loopy":
         return hdr(1) + b"\xc0\x0c" + struct.pack("!HHIH", 1, 0x8001, 120, 4) + bytes([10, 88, 0, 78])
-    addrs = MDNS_HOSTS.get(host)
+    addrs = (MDNS_HOSTS6 if qt == 28 else MDNS_HOSTS).get(host)
     if not addrs:
         return None
     n = dname(host, b"local")
-    return hdr(len(addrs)) + b"".join(rr(n, 1, 120, a) for a in addrs)
+    return hdr(len(addrs)) + b"".join(rr(n, qt, 120, a) for a in addrs)
 
 
 def handle_mdns(src_mac, s, sport, m):
     aq = mdns_a_question(m)
     if aq:
         stats["mdns_a"] += 1
-        a = mdns_a_answer(aq[0])
+        a = mdns_a_answer(aq[0], aq[2])
         if not a:
             return []
         if aq[1] or sport != 5353:  # QU, or a one-shot query from its own port

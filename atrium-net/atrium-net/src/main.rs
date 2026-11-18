@@ -337,7 +337,7 @@ mod imp {
         /// unbound's `.local` stub listener (127.0.0.1:5354), made once.
         mdns_listener: Option<std::os::fd::OwnedFd>,
         /// The running atrium-mdns: its socket and the network it serves.
-        mdns: Option<(UnixStream, String, Ipv4Addr, u8)>,
+        mdns: Option<(UnixStream, String, Ipv4Addr, u8, Vec<Ipv6Addr>)>,
         mdns_again_at: u64,
         netd: Option<Dir>,
         /// The interface group pf's NAT rule names (`nat on atrium_egress`):
@@ -768,6 +768,19 @@ mod imp {
         fn mdns_tick(&mut self) {
             let Some(lis) = &self.mdns_listener else { return };
             let want = self.announced.and_then(|k| self.ifs.get(k)).and_then(|i| i.applied.lease.as_ref().map(|x| (i.name.clone(), x.addr, x.prefix)));
+            // The interface's IPv6 /64s (not link-local): AAAA answers must
+            // fall in one of them.
+            let want = want.map(|(n, a, p)| {
+                let mut v6: Vec<Ipv6Addr> = self
+                    .v6_of(&n)
+                    .into_iter()
+                    .filter(|x| x.segments()[0] & 0xffc0 != 0xfe80 && !x.is_loopback())
+                    .map(|x| Ipv6Addr::from(u128::from(x) & !((1u128 << 64) - 1)))
+                    .collect();
+                v6.sort();
+                v6.dedup();
+                (n, a, p, v6)
+            });
             if let Some((s, ..)) = &self.mdns {
                 let mut b = [0u8; 16];
                 let dead = match std::io::Read::read(&mut &*s, &mut b) {
@@ -781,14 +794,14 @@ mod imp {
                     self.mdns_again_at = self.now() + 5000;
                 }
             }
-            let have = self.mdns.as_ref().map(|(_, n, a, p)| (n.clone(), *a, *p));
+            let have = self.mdns.as_ref().map(|(_, n, a, p, v6)| (n.clone(), *a, *p, v6.clone()));
             if have == want {
                 return;
             }
             if self.mdns.take().is_some() {
                 self.log("atrium-mdns stopped (network changed)");
             }
-            let Some((name, addr, prefix)) = want else { return };
+            let Some((name, addr, prefix, v6)) = want else { return };
             let now = self.now();
             if now < self.mdns_again_at {
                 return;
@@ -797,14 +810,19 @@ mod imp {
                 let lis = lis.try_clone()?;
                 let child = self.spawner.spawn(b'D')?;
                 let (rx, tx) = self.spawner.oneshot4(addr)?;
-                send_line_fds(&child, &Line::new("start").with("addr", format!("{addr}/{prefix}")), &[lis, rx, tx])?;
+                let mut l = Line::new("start").with("addr", format!("{addr}/{prefix}"));
+                if !v6.is_empty() {
+                    l = l.with("v6", v6.iter().map(|x| format!("{x}/64")).collect::<Vec<_>>().join(","));
+                }
+                send_line_fds(&child, &l, &[lis, rx, tx])?;
                 child.set_nonblocking(true)?;
                 Ok(child)
             })();
             match r {
                 Ok(c) => {
-                    self.log(&format!("atrium-mdns: .local on {name} ({addr}/{prefix})"));
-                    self.mdns = Some((c, name, addr, prefix));
+                    let six: String = v6.iter().map(|x| format!(" {x}/64")).collect();
+                    self.log(&format!("atrium-mdns: .local on {name} ({addr}/{prefix}{six})"));
+                    self.mdns = Some((c, name, addr, prefix, v6));
                 }
                 Err(e) => {
                     eprintln!("atrium-net: atrium-mdns on {name}: {e}");
