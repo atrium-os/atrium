@@ -2331,7 +2331,11 @@ mod run {
                         Err(e) => {
                             // The key is this person's, but the stick doesn't
                             // open under it (damaged, or an old copy): Locked.
-                            eprintln!("atrium-dispensatord: {device}: the kernel refused the sealed stick: {e}; Locked");
+                            if e.raw_os_error() == Some(libc::ESTALE) {
+                                eprintln!("atrium-dispensatord: {device}: an older copy of {user}/{persona}'s stick (below its high-water mark); Locked");
+                            } else {
+                                eprintln!("atrium-dispensatord: {device}: the kernel refused the sealed stick: {e}; Locked");
+                            }
                             if let Some(r) = &self.keyring {
                                 tkey_drop(r, key_id);
                             }
