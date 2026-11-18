@@ -34,7 +34,15 @@ libc = "0.2"
 pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
+# What ships in the bundle: no debug info, symbols stripped.
+strip = true
+
+# `--profile profiling`: release code with line tables, for perf and the
+# stall probes.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
 
 [dev-dependencies]
 png = "0.17"
