@@ -201,6 +201,7 @@ name = "atrium-write"
 version = "0.1.0"
 dependencies = [
  "atrium-open",
+ "fresco-client",
  "libc",
  "limen",
  "officina-convert",

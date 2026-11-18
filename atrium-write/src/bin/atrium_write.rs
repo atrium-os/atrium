@@ -28,6 +28,7 @@ use officina_convert::launch::ConvertError;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
 use pergola::embed::Embeds;
+use pergola::print::{Outcome, Paper, Printing, Step};
 use pergola::widgets::ScrollState;
 use pergola::window::StepResult;
 use pergola::{App, Mutable, SizeSpec, Window, WindowDesc};
@@ -279,6 +280,31 @@ impl Run {
         }
     }
 
+    /// The document as it is now as a PDF in memory, made in the
+    /// background for printing (printing.md §5.1), with its title and paper.
+    fn pdf_for_printing(&mut self) -> (std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, String, Paper) {
+        let (doc, title) = {
+            let d = self.write.doc.borrow();
+            let e = d.ed.borrow();
+            (e.doc.clone(), stem_of(&d.name).to_string())
+        };
+        let paper = Paper { w_pt: (doc.page.width.max(1440) / 20) as u32, h_pt: (doc.page.height.max(1440) / 20) as u32 };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = title.clone();
+        let spawned = std::thread::Builder::new().name("pdf-print".into()).spawn(move || {
+            let r = officina_text::layout::PinnedFonts::new().map_err(|e| e.to_string()).and_then(|fonts| {
+                officina_pdf::export(&doc, &fonts, &fonts, &officina_pdf::Info { title: t }, Vec::new(), &mut |_, _| {}).map(|(b, _)| b).map_err(|e| e.to_string())
+            });
+            let _ = tx.send(r);
+        });
+        if let Err(e) = spawned {
+            let (tx, rx2) = std::sync::mpsc::channel();
+            let _ = tx.send(Err(e.to_string()));
+            return (rx2, title, paper);
+        }
+        (rx, title, paper)
+    }
+
     /// Shows how the export is going; forgets it once it ends.
     fn poll_export(&mut self) {
         let Some(w) = &self.export else { return };
@@ -506,12 +532,25 @@ fn main() {
     let mut asking: Option<Asking> = None;
     let mut embed = None;
     let mut want_picker: Option<Asking> = None;
+    // Printing: the PDF being made, then the print sheet (or its Save).
+    let mut print_pdf: Option<(std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, String, Paper)> = None;
+    let mut printing: Option<Printing> = None;
+    let mut want_print = false;
     let mut last_sync = Instant::now();
     // Closing waits on Save As (true), and Don't Save drops the changes.
     let mut close_after_save = false;
     let mut discard = false;
     'main: loop {
-        match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() { 20 } else { 250 }))) {
+        let busy = asking.is_some() || printing.is_some() || print_pdf.is_some();
+        // Ctrl+P prints, as the toolbar's Print… does.
+        let stepped = win.step_with(&mut app, Some(Duration::from_millis(if busy { 20 } else { 250 })), |ev| match ev {
+            fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
+                want_print = true;
+                true
+            }
+            _ => false,
+        });
+        match stepped {
             // Unsaved changes: ask first. Asked to close again while asking (or
             // while picking), the changes stay in the autosave folder.
             Ok(StepResult::Closed) if run.write.doc.borrow().dirty && !run.write.closing.get() && asking.is_none() => {
@@ -535,6 +574,7 @@ fn main() {
                 Cmd::InsertPicture => want_picker = Some(Asking::Picture),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::ExportPdf => want_picker = Some(Asking::ExportPdf),
+                Cmd::Print => want_print = true,
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
@@ -557,7 +597,38 @@ fn main() {
                 _ => {}
             }
         }
-        if let (Some(what), None) = (want_picker.take(), asking) {
+        if std::mem::take(&mut want_print) {
+            if asking.is_some() || printing.is_some() || print_pdf.is_some() {
+                run.set_status("Finish what's open first, then print.");
+            } else if embeds.is_none() || win.embed_token().is_none() {
+                run.set_status("Printing isn't available here.");
+            } else {
+                run.set_status("Getting the document ready to print…");
+                print_pdf = Some(run.pdf_for_printing());
+            }
+        }
+        if let Some((rx, title, paper)) = &print_pdf {
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                r => {
+                    let (title, paper) = (title.clone(), *paper);
+                    print_pdf = None;
+                    match (r, &embeds, win.embed_token()) {
+                        (Ok(Ok(pdf)), Some(e), Some(token)) => match Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, false, Some(paper)) {
+                            Ok(p) => {
+                                printing = Some(p);
+                                run.set_status("");
+                                run.write.ui.set(Ui { asking: true });
+                            }
+                            Err(err) => run.set_status(format!("The print sheet didn't open ({err:?}).")),
+                        },
+                        (Ok(Err(why)), ..) => run.set_status(format!("Couldn't get the document ready to print: {why}.")),
+                        _ => run.set_status("Printing isn't available here."),
+                    }
+                }
+            }
+        }
+        if let (Some(what), None, None) = (want_picker.take(), asking, &printing) {
             match (&embeds, win.embed_token()) {
                 (Some(e), Some(token)) => {
                     let name = run.write.doc.borrow().name.clone();
@@ -585,6 +656,23 @@ fn main() {
         if let Some(e) = &embeds {
             let ev = e.borrow_mut().poll(Duration::from_millis(0));
             let mut finish = false;
+            let step = match (&mut printing, &ev) {
+                (Some(p), Ok(Some(pev))) => p.handle(e, pev),
+                _ => None,
+            };
+            let ours = step.is_some();
+            if let Some(Step::Done(o)) = step {
+                printing = None;
+                run.write.ui.set(Ui { asking: false });
+                run.set_status(match o {
+                    Outcome::Queued => "Sent to the printer.".to_string(),
+                    Outcome::Saved(name) => format!("Saved “{name}”."),
+                    Outcome::Cancelled => String::new(),
+                    Outcome::Failed(why) => format!("{why}."),
+                });
+            }
+            if ours {
+            } else {
             match ev {
                 Ok(Some(ParentEvent::MessageFd { bytes, .. })) => {
                     let fd = e.borrow_mut().take_fd();
@@ -634,6 +722,7 @@ fn main() {
                     eprintln!("atrium-write: limend: {err:?}");
                     finish = asking.is_some();
                 }
+            }
             }
             if finish {
                 if let Some(id) = embed.take() {

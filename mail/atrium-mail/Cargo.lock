@@ -304,6 +304,7 @@ dependencies = [
  "mail-sync",
  "monstrator",
  "nuntius",
+ "officina-pdf",
  "officina-text",
  "pergola",
  "pergola-richtext",
@@ -1292,6 +1293,32 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "folium-content"
+version = "0.1.0"
+dependencies = [
+ "folium-font",
+ "folium-syntax",
+]
+
+[[package]]
+name = "folium-font"
+version = "0.1.0"
+dependencies = [
+ "folium-syntax",
+ "ttf-parser",
+]
+
+[[package]]
+name = "folium-syntax"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "md-5",
+ "miniz_oxide 0.8.9",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "font-types"
@@ -2307,6 +2334,18 @@ dependencies = [
 [[package]]
 name = "officina-core"
 version = "0.1.0"
+
+[[package]]
+name = "officina-pdf"
+version = "0.1.0"
+dependencies = [
+ "atrium-colr",
+ "folium-content",
+ "folium-font",
+ "folium-syntax",
+ "navigator-image",
+ "officina-text",
+]
 
 [[package]]
 name = "officina-pict"

@@ -28,6 +28,7 @@ mail-compose = { path = "../mail-compose" }
 # Rich text in compose (mail.md §9.1): RichTextEditor over officina-text.
 pergola-richtext = { path = "../../pergola-richtext" }
 officina-text = { path = "../../officina-text" }
+officina-pdf = { path = "../../officina-pdf" }
 # mailto: links from Monstrator, on the document channel (mail.md §9.1).
 atrium-open = { path = "../../atrium-open" }
 # Attachments (mail.md §8): their type from their bytes, never their name alone.

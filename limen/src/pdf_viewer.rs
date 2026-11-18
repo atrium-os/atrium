@@ -61,6 +61,11 @@ pub enum ToParent {
     Error { code: u16 },
     /// The file is encrypted; the child shows its own password sheet.
     PasswordNeeded,
+    /// Ctrl+P was pressed in the child: the parent may print the PDF it
+    /// handed over (printing.md §5.1). It asks for nothing more; a child
+    /// that sends it unasked only opens the print sheet, whose Print still
+    /// needs the person's own press, at Limen's rate.
+    PrintAsked,
 }
 
 /// `Error` codes.
@@ -109,7 +114,7 @@ impl ToParent {
             ToParent::LinkActivated { url } => link_ok(url),
             ToParent::Found { count, current, page } => *count <= FOUND_MAX && *current <= *count && (*current == 0) == page.is_none() && page.is_none_or(|p| p < PAGES_MAX),
             ToParent::AtPage { page } => *page < PAGES_MAX,
-            ToParent::Error { .. } | ToParent::PasswordNeeded => true,
+            ToParent::Error { .. } | ToParent::PasswordNeeded | ToParent::PrintAsked => true,
         };
         ok.then_some(m)
     }
@@ -144,6 +149,7 @@ mod tests {
             ToParent::AtPage { page: 3 },
             ToParent::Error { code: error::UNREADABLE },
             ToParent::PasswordNeeded,
+            ToParent::PrintAsked,
         ] {
             assert_eq!(ToParent::decode(&m.encode()), Some(m));
         }
