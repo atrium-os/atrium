@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1596,6 +1596,23 @@ Stalwart in the cloud VM, and later a real account):
    gone message), window 1 (archive while reading it, its Undo, read, reply). **Not
    yet**: raising the reply window with the notification's press (Praeco doesn't hand
    the app a press yet), and a run through praecod and Forum in the VM.
+
+   **The command palette built on the host (2026-11-18, §15.5, E9).** **Ctrl-K** opens a
+   box over the window: "Type a command or a place", then the entries that match, each
+   with its key where it has one ("Archive · e"). It lists what makes sense now: Reply,
+   Reply all, Forward, Archive, Delete, Later…, Print while reading, Done and Drop for a
+   Later item, Restore for a dropped one, "Undo: Message archived" while there is one;
+   Write, Search, Search the server (after a search), Get mail, Settings; in a folder,
+   messages or conversations, each quick filter, grouping and Save filters as a folder;
+   then "Go to …" every folder (with its account where two share a name), view and saved
+   search. Typing matches letters in order, ignoring case, word starts and runs first
+   (`ra` finds Reply all, `go inb` the inbox); nine are shown. Up and Down choose, Enter or
+   a press does it and closes the box, Escape or Ctrl-K again closes it; while it is up,
+   every key is the palette's, so letters that are keys elsewhere are typed. The search
+   field shows "/   Ctrl-K". Tests: the matching (unit), window 1 (open, go to a folder,
+   archive from it with its key shown, Undo from it, a filter, nothing matching, Escape,
+   Ctrl-K twice, a press on Write). **Not yet**: the palette in compose windows, the
+   switch for single-key shortcuts, and screen-reader names for its rows.
 
 ## 17. Decisions, with recommendations
 

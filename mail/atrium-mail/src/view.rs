@@ -354,6 +354,8 @@ pub struct Ui {
     pub group: Group,
     /// Sections folded, by label.
     pub folded: Vec<String>,
+    /// The command palette (Ctrl-K, §15.5) while it is up.
+    pub palette: Option<crate::palette::Palette>,
     pub error: Option<String>,
 }
 
@@ -2319,6 +2321,13 @@ impl Mail {
             return false;
         }
         let ui = self.ui.get_cloned();
+        if ui.palette.is_some() {
+            return self.palette_key(key, *modifiers, chars);
+        }
+        if modifiers.ctrl && !modifiers.alt && !modifiers.meta && *key == Key::Char && chars.eq_ignore_ascii_case("k") {
+            self.open_palette();
+            return true;
+        }
         if ui.search.as_ref().is_some_and(|s| s.typing) {
             return self.search_key(key, *modifiers, chars);
         }
@@ -2432,6 +2441,184 @@ impl Mail {
             VirtualList::reveal(&self.list, next, ui.count, row_h(), shown);
         }
         true
+    }
+}
+
+impl Mail {
+    // ── the command palette (§15.5) ──────────────────────────────────
+
+    pub fn open_palette(&self) {
+        let mut ui = self.ui.get_cloned();
+        ui.palette = Some(crate::palette::Palette::default());
+        self.ui.set(ui);
+    }
+
+    pub fn close_palette(&self) {
+        let mut ui = self.ui.get_cloned();
+        if ui.palette.take().is_some() {
+            self.ui.set(ui);
+        }
+    }
+
+    /// Everything the palette can do now, in a sensible order: what to do
+    /// with the message being read, then writing and finding, then the
+    /// list, then places to go.
+    pub fn palette_entries(&self) -> Vec<crate::palette::Entry> {
+        use crate::palette::{Cmd, Entry};
+        let ui = self.ui.get_cloned();
+        let mut v = Vec::new();
+        let mut add = |label: String, key: &'static str, cmd: Cmd| v.push(Entry { label, key, cmd });
+        if let Some(r) = &ui.reading {
+            add("Reply".into(), "r", Cmd::Reply);
+            add("Reply all".into(), "a", Cmd::ReplyAll);
+            add("Forward".into(), "f", Cmd::Forward);
+            if r.folder.is_some() {
+                add("Archive".into(), "e", Cmd::Archive);
+                add("Delete".into(), "#", Cmd::Delete);
+            }
+            add("Later…".into(), "l", Cmd::Later);
+            if r.later.is_some() {
+                add("Done (Later)".into(), "d", Cmd::Done);
+                add("Drop (Later)".into(), "x", Cmd::Drop);
+            }
+            if r.dropped.is_some() {
+                add("Restore (Later)".into(), "u", Cmd::Restore);
+            }
+            add("Print".into(), "Ctrl-P", Cmd::Print);
+        }
+        if ui.undo.is_some() {
+            add(format!("Undo: {}", ui.undo.as_ref().map(|u| u.label.as_str()).unwrap_or_default()), "z", Cmd::Undo);
+        }
+        add("Write a message".into(), "c", Cmd::Write);
+        add("Search".into(), "/", Cmd::Search);
+        if ui.search.as_ref().is_some_and(|s| s.view.is_none() && s.server.is_none() && !s.query.trim().is_empty()) {
+            add("Search the server".into(), "", Cmd::SearchServer);
+        }
+        add("Get mail".into(), "g", Cmd::GetMail);
+        add("Settings".into(), ",", Cmd::Settings);
+        if ui.folder.is_some() && ui.search.is_none() {
+            add(if ui.conversations { "Show messages".into() } else { "Show conversations".into() }, "", Cmd::Conversations(!ui.conversations));
+            for (bit, label) in mail_engine::quick::CHIPS {
+                let on = ui.quick & bit != 0;
+                add(format!("Filter: {label}{}", if on { " (off)" } else { "" }), "", Cmd::Quick(bit));
+            }
+            add(format!("Grouping: {}", ui.group.label()), "", Cmd::NextGroup);
+            if ui.quick != 0 {
+                add("Save filters as a folder".into(), "", Cmd::SaveFilters);
+            }
+        }
+        for p in &ui.places {
+            let label = match &p.account {
+                Some(a) if ui.places.iter().filter(|x| x.label == p.label).count() > 1 => format!("Go to {} ({a})", p.label),
+                _ => format!("Go to {}", p.label),
+            };
+            add(label, "", Cmd::Folder(p.folder));
+        }
+        for (lane, _) in &ui.views {
+            add(format!("Go to {}", lane.label()), "", Cmd::View(*lane));
+        }
+        for sp in &ui.saved {
+            add(format!("Go to {}", sp.name), "", Cmd::Saved(sp.id));
+        }
+        v
+    }
+
+    /// The entries the palette shows for what is typed, at most
+    /// [`crate::palette::SHOWN_MAX`].
+    pub fn palette_shown(&self) -> Vec<crate::palette::Entry> {
+        let q = self.ui.get_cloned().palette.map(|p| p.query).unwrap_or_default();
+        let mut v = crate::palette::filter(&self.palette_entries(), &q);
+        v.truncate(crate::palette::SHOWN_MAX);
+        v
+    }
+
+    /// A key while the palette is up: typing narrows it, Up and Down
+    /// choose, Enter does it, Escape (or Ctrl-K again) closes it.
+    fn palette_key(&self, key: &Key, modifiers: pergola::event::Modifiers, chars: &str) -> bool {
+        let mut ui = self.ui.get_cloned();
+        let Some(p) = &mut ui.palette else { return false };
+        let n = self.palette_shown().len();
+        match key {
+            Key::Escape => ui.palette = None,
+            Key::Char if modifiers.ctrl && chars.eq_ignore_ascii_case("k") => ui.palette = None,
+            Key::Down => p.sel = if n == 0 { 0 } else { (p.sel + 1) % n },
+            Key::Up => p.sel = if n == 0 { 0 } else { (p.sel + n - 1) % n },
+            Key::Enter => {
+                let sel = p.sel;
+                return self.palette_run(sel);
+            }
+            Key::Backspace => {
+                p.query.pop();
+                p.sel = 0;
+            }
+            Key::Char if !modifiers.ctrl && !modifiers.alt && !modifiers.meta => {
+                if p.query.chars().count() < crate::palette::QUERY_MAX {
+                    p.query.extend(chars.chars().filter(|c| !c.is_control()));
+                }
+                p.sel = 0;
+            }
+            _ => return true,
+        }
+        self.ui.set(ui);
+        true
+    }
+
+    /// Do the shown entry `i` and close the palette.
+    pub fn palette_run(&self, i: usize) -> bool {
+        let Some(e) = self.palette_shown().into_iter().nth(i) else { return true };
+        self.close_palette();
+        self.run_cmd(e.cmd);
+        true
+    }
+
+    pub fn run_cmd(&self, cmd: crate::palette::Cmd) {
+        use crate::palette::Cmd;
+        use mail_compose::reply::Kind;
+        match cmd {
+            Cmd::Write => self.write_new(),
+            Cmd::Reply => self.reply(Kind::Reply),
+            Cmd::ReplyAll => self.reply(Kind::ReplyAll),
+            Cmd::Forward => self.reply(Kind::Forward),
+            Cmd::Archive => self.act(mail_engine::Action::Archive),
+            Cmd::Delete => self.act(mail_engine::Action::Delete),
+            Cmd::Later => self.ask_later(),
+            Cmd::Done => {
+                self.later_done();
+            }
+            Cmd::Drop => {
+                self.later_drop();
+            }
+            Cmd::Restore => {
+                self.later_restore();
+            }
+            Cmd::Undo => {
+                self.undo();
+            }
+            Cmd::Print => {
+                self.print_current();
+            }
+            Cmd::Search => self.start_search(),
+            Cmd::SearchServer => self.search_server(),
+            Cmd::GetMail => self.get_mail(),
+            Cmd::Settings => self.ask_settings(),
+            Cmd::Conversations(on) => self.set_conversations(on),
+            Cmd::Quick(bit) => self.toggle_quick(bit),
+            Cmd::NextGroup => self.next_group(),
+            Cmd::SaveFilters => self.save_filters(),
+            Cmd::Folder(f) => {
+                if self.ui.get_cloned().search.is_some() {
+                    self.end_search();
+                }
+                self.choose_folder(f);
+            }
+            Cmd::View(lane) => self.show_view(lane),
+            Cmd::Saved(id) => {
+                let q = self.ui.get_cloned().saved.iter().find(|s| s.id == id).map(|s| s.query.clone());
+                if let Some(q) = q {
+                    self.search_for(&q, Some(id));
+                }
+            }
+        }
     }
 }
 
@@ -2744,6 +2931,9 @@ impl View for MailView {
         self.list(ctx, &ui, side, list, h);
         self.toast(ctx, &ui, side, list, h);
         self.reader(ctx, &ui, side + list, w - side - list, h);
+        if let Some(p) = &ui.palette {
+            self.palette(ctx, p, w);
+        }
         if ui.saving {
             let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
             ctx.slot(id, PICK_SLOT);
@@ -2860,8 +3050,10 @@ impl MailView {
         if q.is_empty() {
             text(ctx, tx, cy, "Search", type_size::SM, Weight::Regular, t.text_tertiary());
             if !typing {
-                let kw = width("/", type_size::XS, Weight::Regular);
-                text(ctx, r.x() + r.w() - em(10.0) - kw, cy, "/", type_size::XS, Weight::Regular, t.text_tertiary());
+                // Its key, and the palette's for everything else (§15.5).
+                let hint = "/   Ctrl-K";
+                let kw = width(hint, type_size::XS, Weight::Regular);
+                text(ctx, r.x() + r.w() - em(10.0) - kw, cy, hint, type_size::XS, Weight::Regular, t.text_tertiary());
             }
         } else {
             // The end of a long query stays in view, with the caret.
@@ -3225,6 +3417,50 @@ impl MailView {
         if let Some(k) = ui.later_sheet {
             self.later_sheet(ctx, k, x0 + w - 16.0, read_head_h() + 8.0);
         }
+    }
+
+    /// The command palette (§15.5): what is typed, then what it finds,
+    /// each with its key; a press does one.
+    fn palette(&self, ctx: &mut Ctx, p: &crate::palette::Palette, w: f32) {
+        let t = ctx.theme;
+        let shown = self.mail.palette_shown();
+        let row = em(30.0);
+        let pw = em(440.0).min(w - em(32.0));
+        let field = em(40.0);
+        let ph = field + 1.0 + (shown.len().max(1)) as f32 * row + em(8.0);
+        let (px, py) = ((w - pw) / 2.0, head_h() + em(8.0));
+        ctx.push(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, pw + 2.0, ph + 2.0), fill: t.border_strong(), radius: 9.0 });
+        ctx.add(Node::Rect { rect: Rect::new(px, py, pw, ph), fill: t.bg_window(), radius: 8.0 });
+        let cy = py + field / 2.0;
+        if p.query.is_empty() {
+            text(ctx, px + em(14.0), cy, "Type a command or a place", type_size::SM, Weight::Regular, t.text_tertiary());
+        } else {
+            let q = fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0));
+            text(ctx, px + em(14.0), cy, &q, type_size::SM, Weight::Regular, t.text_primary());
+        }
+        let lh = em(type_size::SM) * 1.3;
+        let cx = px + em(14.0) + if p.query.is_empty() { 0.0 } else { width(&fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0)), type_size::SM, Weight::Regular) };
+        ctx.add(Node::Rect { rect: Rect::new(cx, cy - lh / 2.0, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(px, py + field, pw, 1.0), fill: t.border_default(), radius: 0.0 });
+        let mut y = py + field + 1.0 + em(4.0);
+        if shown.is_empty() {
+            text(ctx, px + em(14.0), y + row / 2.0, "Nothing matches", type_size::SM, Weight::Regular, t.text_secondary());
+        }
+        for (i, e) in shown.iter().enumerate() {
+            let m = self.mail.clone();
+            let sel = i == p.sel.min(shown.len().saturating_sub(1));
+            area(ctx, Rect::new(px + em(6.0), y, pw - em(12.0), row), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || {
+                m.palette_run(i);
+            });
+            let kw = if e.key.is_empty() { 0.0 } else { width(e.key, type_size::XS, Weight::Regular) + em(12.0) };
+            text(ctx, px + em(14.0), y + row / 2.0, &fit(&e.label, type_size::SM, Weight::Regular, pw - em(28.0) - kw), type_size::SM, Weight::Regular, t.text_primary());
+            if !e.key.is_empty() {
+                text(ctx, px + pw - em(14.0) - width(e.key, type_size::XS, Weight::Regular), y + row / 2.0, e.key, type_size::XS, Weight::Regular, t.text_tertiary());
+            }
+            ctx.pop();
+            y += row;
+        }
+        ctx.pop();
     }
 
     /// The Later sheet (§11.4): what for, then when (each with its key).

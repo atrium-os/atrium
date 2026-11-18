@@ -1155,3 +1155,98 @@ fn a_notification_s_buttons_act_in_the_window() {
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].0.draft.subject, "Re: One");
 }
+
+#[test]
+fn the_command_palette() {
+    use atrium_mail::palette::Cmd;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
+            RemoteFolder { name: "Receipts".into(), role: Role::Other, selectable: true },
+        ]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200)]).unwrap();
+        sink.messages("Receipts", vec![f(9, "Order 1", NOW - 900)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let ctrl_k = Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Modifiers::default() }, chars: "k".into() };
+    let press = |k: Key| Event::Key { kind: KeyEventKind::Down, key: k, modifiers: Modifiers::default(), chars: String::new() };
+    let typed = |s: &str| for c in s.chars() { assert!(mail.key(&key(&c.to_string()), None)); };
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    assert!(texts(&app).iter().any(|x| x == "/   Ctrl-K"));
+
+    // Nothing read: no Reply; places to go.
+    assert!(mail.key(&ctrl_k, None));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Type a command or a place"));
+    let cmds: Vec<Cmd> = mail.palette_entries().iter().map(|e| e.cmd).collect();
+    assert!(!cmds.contains(&Cmd::Reply) && cmds.contains(&Cmd::Write) && cmds.contains(&Cmd::GetMail));
+    // "rec": Receipts; Enter goes there, the palette closes.
+    typed("rec");
+    assert_eq!(mail.palette_shown()[0].label, "Go to Receipts");
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Go to Receipts"));
+    assert!(mail.key(&press(Key::Enter), None));
+    assert!(mail.ui.get_cloned().palette.is_none());
+    assert_eq!(subjects(&mail), ["Order 1"]);
+
+    // Back to the inbox, read Two, archive it from the palette.
+    assert!(mail.key(&ctrl_k, None));
+    typed("go inb");
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    mail.open(0);
+    assert!(mail.key(&ctrl_k, None));
+    let shown = mail.palette_shown();
+    assert_eq!(shown[0].label, "Reply");
+    assert_eq!(shown[0].key, "r");
+    typed("arch");
+    let shown = mail.palette_shown();
+    assert_eq!((shown[0].label.as_str(), shown[0].key), ("Archive", "e"));
+    assert!(shown.iter().any(|e| e.label == "Go to Archive"));
+    // Down then Up: still the first; letters other keys would take are typed.
+    assert!(mail.key(&press(Key::Down), None));
+    assert!(mail.key(&press(Key::Up), None));
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(subjects(&mail), ["One"]);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message archived");
+    // Undo is offered, and does it.
+    assert!(mail.key(&ctrl_k, None));
+    typed("undo");
+    assert_eq!(mail.palette_shown()[0].label, "Undo: Message archived");
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+
+    // A filter; nothing matching; Escape closes without doing anything.
+    assert!(mail.key(&ctrl_k, None));
+    typed("unread");
+    assert_eq!(mail.palette_shown()[0].cmd, Cmd::Quick(mail_engine::quick::UNREAD));
+    assert!(mail.key(&press(Key::Backspace), None));
+    typed("qqq");
+    assert!(mail.palette_shown().is_empty());
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Nothing matches"));
+    assert!(mail.key(&press(Key::Escape), None));
+    assert!(mail.ui.get_cloned().palette.is_none());
+    assert_eq!(mail.ui.get_cloned().quick, 0);
+    // Ctrl-K, Ctrl-K: open and closed.
+    assert!(mail.key(&ctrl_k, None) && mail.key(&ctrl_k, None));
+    assert!(mail.ui.get_cloned().palette.is_none());
+    // A press on an entry does it: Write.
+    assert!(mail.key(&ctrl_k, None));
+    typed("write");
+    assert!(mail.palette_run(0));
+    assert_eq!(mail.take_composes().len(), 1);
+}

@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod compose;
 pub mod files;
 pub mod links;
+pub mod palette;
 pub mod plain;
 pub mod rich;
 pub mod sender;
