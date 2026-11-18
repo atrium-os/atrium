@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1427,7 +1427,7 @@ Stalwart in the cloud VM, and later a real account):
    matching, ranking, forgetting), the engine's JMAP send (in the book once, Bcc too), and
    the compose window 1 (typing, arrows, Enter, Tab, Escape, no suggestions without the
    caret). **Not yet**: imported vCards and CardDAV (§17 D8), and a page to see and
-   forget people (`forget_person` exists).
+   forget people (built later, see the People section below).
 
    **Platform SDK (2026-11-18)**: the manifest names the roles Mail embeds
    (`embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential"]`), so it
@@ -1631,6 +1631,18 @@ Stalwart in the cloud VM, and later a real account):
    the search box over the list, Back, j after Back). **Not yet**: icons on the rail
    (short names stand in until Mail has folder icons), and a look at the narrow layout on
    a real display in the VM.
+
+   **The address book in Settings built on the host (2026-11-18, §14.2).** Settings has
+   a **People** section once anyone is in the book: "12 people you've written to,
+   completed as you type", a *Find someone* field (matching as completion does: the
+   address, its domain, a word of the name), and the likeliest four, each with its
+   messages count and **Forget**. Forgetting takes the address out of completion, and out
+   of what makes a sender known (§7.5), so its next message is a first contact again unless
+   other mail from it is here. A forgotten person **stays forgotten** when a message already
+   counted is seen again (a resync of Sent); only a new message to them puts them back.
+   Tests: store 1 (forgotten, a resync, a new message), settings 1 (the section, finding,
+   nothing found, Forget). **Not yet**: imported vCards and CardDAV (§17 D8), and a
+   scrolling Settings window (a long list of private addresses can be cut off with "…").
 
 ## 17. Decisions, with recommendations
 

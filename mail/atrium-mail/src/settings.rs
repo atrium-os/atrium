@@ -72,9 +72,26 @@ pub struct SettingsUi {
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
+    /// The address book (§14.2): who is shown for what is typed in the
+    /// find field, and how many there are.
+    pub people: Vec<mail_store::people::Person>,
+    pub people_query: String,
+    pub people_count: u64,
     /// What the last thing did, or why it didn't.
     pub note: Option<String>,
     pub closed: bool,
+}
+
+/// People shown at once in Settings; the find field reaches the rest.
+pub const PEOPLE_SHOWN: usize = 4;
+
+/// Who Settings shows for `q`: the likeliest first, at most
+/// [`PEOPLE_SHOWN`]; and how many are in the book.
+fn people_of(e: &Engine, q: &str) -> (Vec<mail_store::people::Person>, u64) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let mut v = if q.is_empty() { e.store.people(now).unwrap_or_default() } else { e.store.complete(q, now, PEOPLE_SHOWN).unwrap_or_default() };
+    v.truncate(PEOPLE_SHOWN);
+    (v, e.store.people_count().unwrap_or(0))
 }
 
 /// `HH:MM` → minutes after midnight.
@@ -143,6 +160,8 @@ pub struct Settings {
     pub rule: Mutable<TextEdit>,
     pub domain: Mutable<TextEdit>,
     pub made_for: Mutable<TextEdit>,
+    /// Find someone in the address book.
+    pub person: Mutable<TextEdit>,
     pub cred_state: Mutable<CredentialState>,
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
@@ -173,6 +192,7 @@ impl Settings {
             rule: ui.sibling(TextEdit::new("")),
             domain: ui.sibling(TextEdit::new("")),
             made_for: ui.sibling(TextEdit::new("")),
+            person: ui.sibling(TextEdit::new("")),
             engine,
             ui,
             found: Rc::default(),
@@ -212,6 +232,15 @@ impl Settings {
         let my_key = pa.and_then(|a| e.my_pgp_key(a)).map(|k| (k.emails.join(", "), k.short()));
         if pa != u.priv_account {
             self.domain.set(TextEdit::new(pd.as_deref().unwrap_or("")));
+        }
+        let q = self.person.get_cloned().text().trim().to_string();
+        let (people, people_count) = people_of(e, &q);
+        if u.people != people || u.people_count != people_count || u.people_query != q {
+            self.update(|u| {
+                u.people = people;
+                u.people_count = people_count;
+                u.people_query = q;
+            });
         }
         if u.rows != rows || u.prefs != prefs || u.rules != rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
             self.update(|u| {
@@ -544,6 +573,17 @@ impl Settings {
         self.reload();
     }
 
+    /// Take `addr` out of the address book (§14.2): it no longer
+    /// completes, and is a first contact again unless mail from it is here.
+    /// Writing to it again puts it back.
+    pub fn forget_person(&self, addr: &str) {
+        match self.engine.store.write(|w| w.forget_person(addr)) {
+            Ok(()) => self.update(|u| u.note = Some(format!("Forgot {addr}"))),
+            Err(e) => self.update(|u| u.note = Some(format!("Couldn't forget {addr}: {e}"))),
+        }
+        self.reload();
+    }
+
     pub fn remove_vip(&self, a: &str) {
         self.set_prefs(|p| p.vips.retain(|v| v != a));
     }
@@ -599,6 +639,10 @@ impl Settings {
                     self.set_prefs(|p| p.quiet = Some((f, t)));
                 }
             }
+        }
+        // The address book follows what is typed to find someone.
+        if self.person.get_cloned().text().trim() != self.ui.get_cloned().people_query {
+            self.reload();
         }
         // Typed times take effect once they read as times.
         if let Some(d) = parse_times(self.digest_at.get_cloned().text()) {
@@ -821,6 +865,34 @@ impl View for SettingsView {
             let s = self.s.clone();
             button(ctx, right - bw, y + em(20.0), "Paste a key", false, true, move || s.paste_key(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
             y += em(44.0);
+        }
+
+        // The address book (§14.2): find someone, forget them.
+        if ui.people_count > 0 {
+            y += em(16.0);
+            section(ctx, x, &mut y, "PEOPLE");
+            let n = ui.people_count;
+            y += para(ctx, x, y, inner, &format!("{n} {} you've written to, completed as you type.", if n == 1 { "person" } else { "people" }), type_size::XS, t.text_tertiary()) + em(8.0);
+            let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+            ctx.place(TextField::new(self.s.person.clone()).at(x, fy).width(inner).placeholder("Find someone"));
+            y += em(40.0);
+            if ui.people.is_empty() {
+                text(ctx, x, y + em(12.0), "No one by that", type_size::SM, Weight::Regular, t.text_secondary());
+                y += em(30.0);
+            }
+            for p in &ui.people {
+                if y + em(40.0) > h {
+                    break;
+                }
+                let bw = measure("Forget", type_size::SM, Weight::Medium) + em(24.0);
+                let name = if p.name.is_empty() { p.addr.clone() } else { p.name.clone() };
+                text(ctx, x, y + em(12.0), &crate::view::fit_text(&name, type_size::SM, Weight::Regular, inner - bw - em(8.0)), type_size::SM, Weight::Regular, t.text_primary());
+                let sub = if p.name.is_empty() { format!("{} {}", p.count, if p.count == 1 { "message" } else { "messages" }) } else { format!("{} · {} {}", p.addr, p.count, if p.count == 1 { "message" } else { "messages" }) };
+                text(ctx, x, y + em(30.0), &crate::view::fit_text(&sub, type_size::XS, Weight::Regular, inner - bw - em(8.0)), type_size::XS, Weight::Regular, t.text_secondary());
+                let (s, a) = (self.s.clone(), p.addr.clone());
+                button(ctx, right - bw, y + em(20.0), "Forget", false, true, move || s.forget_person(&a));
+                y += em(44.0);
+            }
         }
 
         // Private addresses (§13.3), for one account at a time.

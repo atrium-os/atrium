@@ -139,6 +139,9 @@ impl Writer<'_> {
                     }
                     p
                 }
+                // Forgotten since this message was counted (its copy seen
+                // again on a resync): it stays forgotten.
+                None if counted => continue,
                 None => Person { addr: addr.to_string(), name: name.to_string(), count: 1, last: at },
             };
             t.insert(key.as_str(), enc(&p).as_slice())?;
@@ -188,5 +191,13 @@ mod tests {
         s.write(|w| w.forget_person("ADA@x.example")).unwrap();
         assert!(addrs("ada").is_empty());
         assert_eq!(s.people_count().unwrap(), 2);
+        assert!(s.person("ada@x.example").unwrap().is_none() && s.person("GRACE@navy.example").unwrap().is_some());
+        // Its message seen again (a resync of Sent): still forgotten; a
+        // new message to Ada puts her back.
+        s.write(|w| w.wrote_to(Some("<a2@x>"), &[("Ada Lovelace", "ada@x.example")], now - 2 * day)).unwrap();
+        assert!(addrs("ada").is_empty());
+        s.write(|w| w.wrote_to(Some("<a3@x>"), &[("Ada Lovelace", "ada@x.example")], now)).unwrap();
+        assert_eq!(addrs("ada"), ["ada@x.example"]);
+        assert_eq!(s.person("ada@x.example").unwrap().unwrap().count, 1);
     }
 }

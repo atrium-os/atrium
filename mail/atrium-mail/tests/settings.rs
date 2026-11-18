@@ -176,6 +176,30 @@ fn settings_window() {
     s.toggle_private(&p[0].addr);
     assert!(engine.private_addresses(id)[0].off);
     drawn(&mut app, &["Turn on"]);
+
+    // The address book: none, then the people written to, found by typing,
+    // forgotten with Forget (and kept forgotten).
+    assert!(!texts(&app).iter().any(|x| x == "PEOPLE"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    engine.store.write(|w| {
+        w.wrote_to(Some("<w1@x>"), &[("Grace Hopper", "grace@navy.example"), ("", "ada@x.example")], now - 86_400)?;
+        w.wrote_to(Some("<w2@x>"), &[("Grace Hopper", "grace@navy.example")], now)
+    }).unwrap();
+    s.reload();
+    drawn(&mut app, &["PEOPLE", "2 people you've written to, completed as you type.", "Grace Hopper", "grace@navy.example · 2 messages", "ada@x.example", "1 message"]);
+    s.person.set(TextEdit::new("hopp"));
+    s.tick();
+    assert_eq!(s.ui.get_cloned().people.iter().map(|p| p.addr.as_str()).collect::<Vec<_>>(), ["grace@navy.example"]);
+    s.person.set(TextEdit::new("zzz"));
+    s.tick();
+    drawn(&mut app, &["No one by that"]);
+    s.person.set(TextEdit::new(""));
+    s.tick();
+    s.forget_person("grace@navy.example");
+    assert_eq!(s.ui.get_cloned().note.as_deref(), Some("Forgot grace@navy.example"));
+    assert!(engine.store.complete("grace", now, 5).unwrap().is_empty());
+    drawn(&mut app, &["1 person you've written to, completed as you type."]);
+
     s.close();
     assert!(s.closed());
 }
