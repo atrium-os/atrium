@@ -112,7 +112,7 @@ echo "=== 1.1 published"
 V "cd $B && sh publish.sh org.atrium.c5auto 1.1 '' 'clipboard = true' && \
     sh publish.sh org.atrium.c5notify 1.1 'updates = \"notify\"' 'clipboard = true' && \
     sh publish.sh org.atrium.c5more 1.1 '' 'clipboard = true
-network = true'"
+network = \"full\"'"
 Q sync >/dev/null
 U=$(A updates)
 check "auto goes in on its own" "1" "$(echo "$U" | grep 'org.atrium.c5auto' | grep -c 'goes in on its own')"
@@ -133,7 +133,7 @@ Q tick >/dev/null
 check "a second round posts nothing new" "0" "$(V "grep -c 'opifexd: praecod' $B/opifexd.log")"
 
 echo "=== praecod refuses a poster it doesn't know"
-start_praecod 0:Forum-not-us
+start_praecod 1:Forum-not-us   # posters are keyed by uid: opifexd (uid 0) is now unknown
 V "cd $B && sh publish.sh org.atrium.c5notify 1.2 'updates = \"notify\"' 'clipboard = true'" >/dev/null
 Q tick >/dev/null
 check "opifexd says praecod refused" "1" "$(V "grep -c 'opifexd: praecod' $B/opifexd.log" | awk '{print ($1>0)}')"
