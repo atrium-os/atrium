@@ -131,9 +131,13 @@ pub fn persona_name(p: &str) -> String {
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
-/// "Work may send links to Personal".
+/// "Work may send links to Personal"; for `share`, "Work may share to
+/// Personal's apps" (the share sheet lists them).
 pub fn crossing_words(s: &CrossingSwitch) -> String {
-    format!("{} may send {} to {}", persona_name(&s.from), s.kind, persona_name(&s.to))
+    match s.kind.as_str() {
+        "share" => format!("{} may share to {}'s apps", persona_name(&s.from), persona_name(&s.to)),
+        k => format!("{} may send {k} to {}", persona_name(&s.from), persona_name(&s.to)),
+    }
 }
 
 /// One line on what an app may do now.
@@ -661,6 +665,7 @@ mod tests {
         assert_eq!(p.directions(), [("personal".to_string(), "work".to_string()), ("work".into(), "personal".into())]);
         assert!(p.crossing_on(&sw("work", "personal", "links")));
         assert_eq!(crossing_words(&sw("work", "personal", "links")), "Work may send links to Personal");
+        assert_eq!(crossing_words(&sw("personal", "work", "share")), "Personal may share to Work's apps");
         p.set_crossing(sw("personal", "work", "clipboard"), true, None);
         assert!(p.take_wants().is_empty() && p.crossing_note.is_some(), "no press");
         p.set_crossing(sw("work", "personal", "links"), true, Some([1; 16]));

@@ -60,6 +60,11 @@ pub enum Call {
     /// ([`SinkCall::Events`]), each event's verdict told to it
     /// ([`SinkCall::Pushed`]). Answers [`Reply::Watched`].
     JmapWatch,
+    /// Search the IMAP server for messages with every word (§11.2);
+    /// answers [`Reply::Found`].
+    Search { words: Vec<String>, limit: u32 },
+    /// The same on a JMAP account.
+    JmapSearch { text: String, limit: u32 },
 }
 
 /// What [`Error`] was, across the wire.
@@ -85,6 +90,8 @@ pub enum Reply {
     JmapReady { max_delayed_send: u64 },
     JmapSent(std::result::Result<String, String>),
     Watched(std::result::Result<crate::jmap::Pushed, String>),
+    /// How many messages a server search found.
+    Found(u32),
     Failed(Kind, String),
 }
 
@@ -115,6 +122,8 @@ pub enum SinkCall {
     /// An event was news (`true`) or a sign of life; answered
     /// [`SinkAnswer::Go`]: whether to keep watching.
     Pushed(bool),
+    /// [`Sink::has_text`]; answered [`SinkAnswer::Go`].
+    HasText(String, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +377,9 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
             _ => None,
         }
     }
+    fn has_text(&mut self, folder: &str, uid: u32) -> bool {
+        matches!(self.ask(SinkCall::HasText(folder.into(), uid)), Ok(SinkAnswer::Go(true)))
+    }
 }
 
 /// JMAP's HTTP, inside the worker: asked of the engine.
@@ -446,7 +458,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } => {
                 let reply = match (next, jmap.as_mut()) {
                     (Call::JmapWatch, Some(c)) => {
                         let mut a = RemoteSink(chan.clone());
@@ -456,6 +468,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
+                    (Call::JmapSearch { text, limit }, Some(c)) => c.search_server(&text, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     _ => unreachable!(),
                 };
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
@@ -483,7 +496,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
             (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch, _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. }, _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -491,6 +504,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 s.append(&folder, &f, &message).map(Reply::Appended).unwrap_or_else(|e| fail(&e))
             }
             (Call::Idle { folder }, Some(s)) => s.idle(&folder).map(Reply::Idled).unwrap_or_else(|e| fail(&e)),
+            (Call::Search { words, limit }, Some(s)) => s.search_server(&words, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| fail(&e)),
             (Call::Logout, Some(_)) => {
                 let _ = session.take().unwrap().logout();
                 Reply::LoggedOut
@@ -520,6 +534,8 @@ pub trait Imap {
     /// `IDLE` on `folder` until a change or `wait` passes.
     fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool>;
     fn logout(&mut self) -> Result<()>;
+    /// Search the server (§11.2); see [`Session::search_server`].
+    fn search(&mut self, words: &[String], sink: &mut dyn Sink, limit: usize) -> Result<usize>;
 }
 
 /// The session here, over the courier's socket (tests, and Mail without
@@ -548,6 +564,9 @@ impl Imap for Local {
     }
     fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
         self.s()?.append(folder, flags, message)
+    }
+    fn search(&mut self, words: &[String], sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        self.s()?.search_server(words, sink, limit)
     }
     fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool> {
         let s = self.s()?;
@@ -763,6 +782,7 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::Get { .. } | SinkCall::Post { .. } => SinkAnswer::Body(Err("no HTTP here".into())),
         SinkCall::Events { .. } => SinkAnswer::EventsEnd(Err("not watching".into())),
         SinkCall::Pushed(_) => SinkAnswer::Go(false),
+        SinkCall::HasText(f, u) => SinkAnswer::Go(s.has_text(&f, u)),
     }
 }
 
@@ -792,6 +812,13 @@ impl<I: Write + AsFd, O: Read + AsFd> Imap for Remote<I, O> {
     fn logout(&mut self) -> Result<()> {
         self.reply(&Call::Logout, None, QUIET, |r| (r == Reply::LoggedOut).then_some(()))
     }
+    fn search(&mut self, words: &[String], sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        let c = Call::Search { words: words.to_vec(), limit: limit.min(u32::MAX as usize) as u32 };
+        self.reply(&c, Some(sink), QUIET, |r| match r {
+            Reply::Found(n) => Some(n as usize),
+            _ => None,
+        })
+    }
 }
 
 impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
@@ -814,6 +841,15 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> crate::jmap::Result<crate::jmap::Pushed> {
         self.watch_jmap(on).map_err(|e| crate::jmap::Error(e.to_string()))
+    }
+    fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> crate::jmap::Result<usize> {
+        let c = Call::JmapSearch { text: text.into(), limit: limit.min(u32::MAX as usize) as u32 };
+        match self.call(&c, Some(sink), QUIET) {
+            Ok(Reply::Found(n)) => Ok(n as usize),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
     }
     fn can_hold(&self, secs: i64) -> bool {
         secs > 0 && (secs as u64) <= self.max_delayed_send

@@ -3620,7 +3620,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Moving around:** a press inside one puts the cursor on its top-left, and the arrows step over it as one cell. A selection that meets part of one shows all of it.
   - **Commands:** Data ▸ Merge Cells merges the selection (grown to whole merges). As Excel does, it keeps the top-left value, clears the others (the status says how many) and centres it. Data ▸ Unmerge Cells undoes merges the selection meets. Each is one undo step.
   - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
-- **Sorting** a range that holds merged cells is refused ("Unmerge the merged cells in the range before sorting it."); Excel sorts only when every merge is the same size.
+- **Sorting** a range with merged cells works when every row is merged across the same columns, one row high and inside the range (`sort::merges_allow_sort`); the merges stay put as the rows move. Anything else is refused with "To sort, every row needs the same merged cells; unmerge them first." Excel also sorts blocks of rows merged to the same height; we don't yet.
 - **Printing** merged areas as one cell: done by the printing thread (c7af758b).
 - **Not yet:** the editor spanning the area while typing, and Excel's "Center Across Selection" without merging.
 - **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.
@@ -3636,7 +3636,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Seeing them:** a commented cell has a small red triangle in its top-right corner (`CellView::note`). With the cursor on it and no edit open, the comment shows in a pale yellow box beside the cell or its merged area, author in bold, wrapped, ten lines at most. This is a grid float from `SheetSource::note_at`.
   - **Writing them:** Data ▸ New Comment… / Edit Comment… opens a bar where the tabs are. Lines show joined by ¶. Save writes the comment as `$USER` (an edit keeps the original author), and an empty one deletes it. Data ▸ Delete Comment(s) removes those in the selection. Each is one undo step.
 - **Sorting** moves comments with their rows (`sort::tests::comments_move_with_their_rows`).
-- **Not yet:** threaded comments (Excel 365's `threadedComments`, read as their legacy note when the file has one), rich text in comments, and printing them.
+- **Threaded comments** (Excel 365's `threadedComments` and `persons`): read as one note per cell, replacing Excel's "[Threaded comment] Your version of Excel..." stand-in. The note's author is the first message's person, and each reply follows as a "Name: text" paragraph; a file with replies gets a report note. Saving writes plain notes, which Excel shows as notes. Gate: `threaded_comments_are_read_as_their_conversation`.
+- **Not yet:** writing threads back as threads, rich text in comments, and printing them.
 - **Gates:** officina-grid `comments::tests`; officina-convert `tests/comments.rs` (round trips, Excel's author prefix, LibreOffice both ways); atrium-sheets `comments_are_written_shown_beside_the_cell_edited_and_deleted`.
 
 ### 16.81 Cell hyperlinks (2026-11-18)
@@ -3650,8 +3651,10 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - A link cell is drawn in blue, unless it has a colour of its own.
   - Data ▸ Open Link follows the cursor's link. A place shows its sheet and selects the cell. An address goes to Monstrator with the activation of that press (`open-uri` in the manifest), from a thread, and the status line says what happened. Sheets never opens an address without a press.
   - Data ▸ Insert Link… / Edit Link… opens a bar where the tabs are. It takes `Sheet2!B4` or `B4` as a place, a bare host as `https://`, and an address as given; anything else is refused with a reason and the bar stays. An empty cell gets the target as its text, in the same undo step. An empty field removes the link, as does Data ▸ Remove Link(s) for the selection.
-- **Not yet:** Ctrl+click to follow, a tooltip with the target, link styles in printing.
-- **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`.
+  - Ctrl+click (or Cmd+click) on a cell selects it and follows its link, with that click's activation. Pointer events carry no modifiers, so `pergola::input::pointer_modifiers()` keeps those of the last button event, and the grid sends `GridAction::Follow`.
+  - With the cursor on a link cell and no edit open, the target shows beside the cell ("Go to Sheet2!B4" for a place) with "Ctrl+click to open". It shares the comment box when the cell has both.
+- **Not yet:** link styles in printing.
+- **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`; pergola `ctrl_click_selects_and_asks_to_follow`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

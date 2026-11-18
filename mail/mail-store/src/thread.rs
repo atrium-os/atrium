@@ -269,9 +269,26 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Conversations or messages for `folder` (§11.7).
+    /// Conversations or messages for `folder` (§11.7). The grouping kept
+    /// with it stays.
     pub fn set_view(&mut self, folder: FolderId, conversations: bool) -> Result<()> {
-        self.tx.open_table(VIEWS)?.insert(folder, conversations as u8)?;
+        let mut t = self.tx.open_table(VIEWS)?;
+        let g = t.get(folder)?.map_or(0, |v| v.value() & !1);
+        t.insert(folder, g | conversations as u8)?;
+        Ok(())
+    }
+
+    /// How `folder`'s list is grouped (§11.7; 0 none, else the app's
+    /// number for it, below 128). Conversations or messages stays.
+    pub fn set_grouping(&mut self, folder: FolderId, group: u8) -> Result<()> {
+        let conv = match self.tx.open_table(VIEWS)?.get(folder)?.map(|v| v.value()) {
+            Some(v) => v & 1,
+            None => {
+                use crate::Role::*;
+                !matches!(self.store_folder(folder)?.role, Sent | Drafts | Trash | Junk) as u8
+            }
+        };
+        self.tx.open_table(VIEWS)?.insert(folder, (group.min(127) << 1) | conv)?;
         Ok(())
     }
 }
@@ -360,11 +377,17 @@ impl Store {
     pub fn view(&self, folder: FolderId) -> Result<bool> {
         let tx = self.db.begin_read()?;
         if let Some(v) = tx.open_table(VIEWS)?.get(folder)? {
-            return Ok(v.value() == 1);
+            return Ok(v.value() & 1 == 1);
         }
         let f = self.folder(folder)?;
         use crate::Role::*;
         Ok(!matches!(f.role, Sent | Drafts | Trash | Junk))
+    }
+
+    /// How `folder`'s list is grouped: what [`Writer::set_grouping`] kept.
+    pub fn grouping(&self, folder: FolderId) -> Result<u8> {
+        let tx = self.db.begin_read()?;
+        Ok(tx.open_table(VIEWS)?.get(folder)?.map_or(0, |v| v.value() >> 1))
     }
 }
 

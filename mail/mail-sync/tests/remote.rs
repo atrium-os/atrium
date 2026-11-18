@@ -256,6 +256,9 @@ fn jmap_runs_in_the_worker_with_the_http_here() {
     let rcpts = ["b@x.example".to_string()];
     let (le, re) = (l.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err(), r.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err());
     assert_eq!(le.0, re.0);
+    // A server search (§11.2) too.
+    let (le, re) = (mail_sync::jmap::Jmap::search(&mut l, "zanzibar", &mut Log::default(), 5).unwrap_err(), mail_sync::jmap::Jmap::search(&mut r, "zanzibar", &mut Log::default(), 5).unwrap_err());
+    assert_eq!(le.0, re.0);
     // Every exchange the worker wanted went over Mail's HTTP, the same as here.
     assert_eq!(*here.lock().unwrap(), *there.lock().unwrap());
 }

@@ -559,6 +559,28 @@ fn search_as_you_type_and_a_saved_search() {
     mail.forget_search(id);
     assert!(mail.ui.get_cloned().saved.is_empty());
     assert!(engine.store.saved_searches().unwrap().is_empty());
+
+    // Search server (§11.2): the words go to the sync thread; what it
+    // stored joins the results, with a note.
+    mail.search_for("zanzibar contract", None);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Search server"), "{:?}", texts(&app));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    mail.search_server();
+    assert_eq!(mail.take_server_search(), Some(vec!["zanzibar".to_string(), "contract".to_string()]));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Searching server…"));
+    {
+        let bytes = message(10, "Arun <arun@acme.example>", "Old deal", "The zanzibar contract.", false, NOW - 900 * 86_400);
+        engine.sink(account).messages("Archive", vec![Fetched { uid: 10, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW - 900 * 86_400), server_id: None, bytes, full: true }]).unwrap();
+    }
+    mail.server_searched(Ok(1));
+    let ui = mail.ui.get_cloned();
+    assert_eq!(subjects(&mail), ["Old deal"]);
+    assert_eq!(ui.file_note.map(|n| n.0).as_deref(), Some("1 more found on the server"));
+    assert_eq!(ui.search.unwrap().server, Some(false));
+    mail.search_server();
+    assert_eq!(mail.take_server_search(), None, "once per query");
 }
 
 #[test]
@@ -987,18 +1009,23 @@ fn grouped_by_date_and_by_sender_and_folded() {
     };
     {
         let mut sink = engine.sink(account);
-        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
+        ]).unwrap();
         sink.messages("INBOX", vec![
             at(1, "Lena <lena@partner.example>", "Today 1", NOW - 600, false),
             at(2, "Arun <arun@acme.example>", "Today 2", NOW - 1200, true),
         ]).unwrap();
     }
     let dirty = Arc::new(AtomicBool::new(true));
-    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
     let mail = view.mail.clone();
     let mut app = App::new_with_flag(view, dirty);
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "No grouping ⌄"));
+    let fid = |name: &str| engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.name == name).unwrap().0;
+    let (inbox, archive) = (fid("INBOX"), fid("Archive"));
     // By date: one header, then both.
     mail.set_group(Group::Date);
     app.tick();
@@ -1037,7 +1064,36 @@ fn grouped_by_date_and_by_sender_and_folded() {
     mail.toggle_quick(mail_engine::quick::UNREAD);
     assert_eq!(mail.ui.get_cloned().count, 0);
     mail.toggle_quick(mail_engine::quick::UNREAD);
+    // In an inbox, by lane next: both are from people.
+    mail.next_group();
+    assert_eq!(mail.ui.get_cloned().group, Group::Lane);
+    let h = mail.header(0).unwrap();
+    assert_eq!((h.label.as_str(), h.rows), ("People", 2));
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    // Kept per folder: Archive has none, the inbox gets its own back, also
+    // after a restart.
+    mail.choose_folder(archive);
+    assert_eq!(mail.ui.get_cloned().group, Group::None);
+    mail.choose_folder(inbox);
+    assert_eq!(mail.ui.get_cloned().group, Group::Lane);
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    let again = MailView::new(engine.clone(), Arc::new(AtomicBool::new(true)), (1280.0, 800.0), || NOW);
+    again.mail.refresh();
+    assert_eq!((again.mail.ui.get_cloned().group, again.mail.ui.get_cloned().count), (Group::Lane, 3));
     mail.next_group();
     assert_eq!(mail.ui.get_cloned().group, Group::None);
+    assert!(engine.store.view(inbox).unwrap(), "conversations stays");
+
+    // Filters on: Save as folder keeps them as a smart folder and shows it.
+    mail.toggle_quick(mail_engine::quick::FROM_PEOPLE);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Save as folder"));
+    mail.save_filters();
+    let ui = mail.ui.get_cloned();
+    let saved = ui.saved.last().unwrap().clone();
+    assert_eq!((saved.name.as_str(), saved.query.as_str()), ("Inbox · From people", "in:\"INBOX\" is:from-people"));
+    assert_eq!(ui.search.as_ref().unwrap().saved, Some(saved.id));
+    assert_eq!(ui.quick, 0);
+    assert_eq!(ui.count, 2);
     assert_eq!(mail.ui.get_cloned().count, 2);
 }

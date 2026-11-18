@@ -429,6 +429,8 @@ pub enum Wake {
     Now,
     /// The server said this account's inbox changed.
     Changed(AccountId),
+    /// Search every account's server for these words (§11.2).
+    Search(Vec<String>),
     Stop,
 }
 
@@ -439,6 +441,9 @@ pub struct Syncer {
     pub changed: Arc<AtomicBool>,
     /// Per account, how the last pass went.
     pub status: Arc<Mutex<Vec<(AccountId, Result<mail_engine::accounts::Pass, Reached>)>>>,
+    /// What the last server search found in all, or why it failed; taken
+    /// by the window.
+    pub searched: Arc<Mutex<Option<Result<usize, String>>>>,
 }
 
 /// One account's IDLE watch (§6.1), on a thread and a connection of its
@@ -532,7 +537,8 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Conn
     let (wake, rx) = mpsc::channel();
     let changed = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(Vec::new()));
-    let (ch, st, waker) = (changed.clone(), status.clone(), wake.clone());
+    let searched = Arc::new(Mutex::new(None));
+    let (ch, st, waker, found) = (changed.clone(), status.clone(), wake.clone(), searched.clone());
     std::thread::spawn(move || {
         let mut engine = Engine::new(store, Parser { program: jail });
         engine.set_roots(roots);
@@ -574,28 +580,53 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Conn
             let next = engine.next_pass(now(), idle);
             let wait = Duration::from_secs((next - now()).clamp(1, idle) as u64);
             only = None;
+            // A server search runs alone, no pass with it (account 0 is
+            // none: no account has id 0).
+            let search = |words: &[String]| {
+                let mut total = 0;
+                let mut failed = None;
+                for (id, _) in engine.configured() {
+                    match engine.search_server(id, words, net.as_ref()) {
+                        Ok(n) => total += n,
+                        Err(e) => {
+                            eprintln!("atrium-mail: account {id}: server search: {e}");
+                            failed = Some(e);
+                        }
+                    }
+                }
+                *found.lock().unwrap() = Some(match failed {
+                    Some(e) if total == 0 => Err(e),
+                    _ => Ok(total),
+                });
+                ch.store(true, Ordering::Release);
+            };
             match rx.recv_timeout(wait) {
                 Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Ok(w) => {
                     // Several wakes at once are one pass, of one account
                     // when only its inbox changed.
-                    let mut one = match w { Wake::Changed(a) => Some(a), _ => None };
-                    let mut all = one.is_none();
+                    let mut one = match &w { Wake::Changed(a) => Some(*a), _ => None };
+                    let mut all = matches!(w, Wake::Now);
+                    let mut pass = !matches!(w, Wake::Search(_));
+                    if let Wake::Search(words) = &w {
+                        search(words);
+                    }
                     while let Ok(w) = rx.try_recv() {
                         match w {
                             Wake::Stop => return,
-                            Wake::Now => all = true,
-                            Wake::Changed(a) if one.is_none_or(|o| o == a) => one = Some(a),
-                            Wake::Changed(_) => all = true,
+                            Wake::Search(words) => search(&words),
+                            Wake::Now => (all, pass) = (true, true),
+                            Wake::Changed(a) if one.is_none_or(|o| o == a) => (one, pass) = (Some(a), true),
+                            Wake::Changed(_) => (all, pass) = (true, true),
                         }
                     }
-                    only = if all { None } else { one };
+                    only = if !pass { Some(0) } else if all { None } else { one };
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
     });
-    Syncer { wake, changed, status }
+    Syncer { wake, changed, status, searched }
 }
 
 /// Whether two settings reach the same servers with the same sign-in.

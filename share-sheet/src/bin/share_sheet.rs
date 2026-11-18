@@ -11,8 +11,9 @@
 //!   SHARE_FRESCOD_ACTIVATION    [/atrium/sockets/fresco-activation/fresco-activation.sock]
 //!   SHARE_APP_REGISTRY          [the launch registry]
 //!   SHARE_APPS                  [/var/lib/atrium/apps] installed manifests
-//!   SHARE_AUTO_PICK             [unset] tests only: choose this app id as
-//!                               soon as it is shown, as if pressed
+//!   SHARE_AUTO_PICK             [unset] tests only: choose this app id
+//!                               (`<app>@<persona>` for another persona's
+//!                               row) as soon as it is shown, as if pressed
 //!   SHARE_SECS                  [unset] exit after this many seconds
 
 use std::collections::HashMap;
@@ -45,17 +46,25 @@ const H: f32 = 400.0;
 /// From a sheet's thread to the limend thread.
 enum FromPane {
     Ready(EmbedId, [u8; 16]),
-    Chose(EmbedId, String),
+    /// What was pressed: (app, persona), or None for Cancel.
+    Chose(EmbedId, Option<Pick>),
     Gone(EmbedId),
 }
+
+/// A row: its app, and the persona it opens in when not the sharer's.
+type Pick = (String, Option<String>);
+
+fn pick(t: &Target) -> Pick { (t.app.clone(), t.persona.clone()) }
 
 #[derive(Clone, Default)]
 struct Shown {
     title: String,
     from_app: String,
+    /// The sharing app's persona and colour, for a person with personas.
+    from_persona: Option<(String, Option<String>)>,
     targets: Vec<Target>,
-    /// What the person pressed: an app id, or "" for Cancel.
-    pressed: Option<String>,
+    /// What the person pressed: Some(row), or None for Cancel.
+    pressed: Option<Option<Pick>>,
     /// The row picked with the arrow keys. None at first, so an Enter
     /// typed into the app just before the sheet came up chooses nothing.
     selected: Option<usize>,
@@ -73,9 +82,9 @@ impl Shown {
         }
         let n = self.targets.len().min(ROWS);
         match key {
-            Key::Escape => self.pressed = Some(String::new()),
+            Key::Escape => self.pressed = Some(None),
             Key::Enter => match self.selected {
-                Some(i) if i < n => self.pressed = Some(self.targets[i].app.clone()),
+                Some(i) if i < n => self.pressed = Some(Some(pick(&self.targets[i]))),
                 _ => return false,
             },
             Key::Down | Key::Up | Key::Home | Key::End if n > 0 => {
@@ -144,6 +153,28 @@ fn style(size: f32, weight: Weight, color: Color) -> TextStyle {
     TextStyle { family: font::SANS.into(), size, weight, color }
 }
 
+/// A persona's chip at (`x`, `y`), in its colour (Personal: plain), as
+/// the window frames show it. Returns its width.
+fn chip(ctx: &mut Ctx, x: f32, y: f32, name: &str, colour: Option<&str>) -> f32 {
+    let t = ctx.theme;
+    let size = type_size::XS;
+    let label = cut(&title(name), 16);
+    let w = label.chars().count() as f32 * size * 0.62 + 14.0;
+    let (fill, ink) = match colour.and_then(fresco_protocol::persona::rgb) {
+        Some([r, g, b]) => (Color::rgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0), Color::rgba(1.0, 1.0, 1.0, 1.0)),
+        None => (t.bg_surface(), t.text_primary()),
+    };
+    ctx.add(Node::Rect { rect: Rect::new(x, y, w, em(size * 1.5)), fill, radius: radius::SM });
+    ctx.add(Node::Text { rect: Rect::new(x + 7.0, y + em(size * 0.12), 0.0, em(size * 1.25)), content: label, style: style(size, Weight::Semibold, ink) });
+    w
+}
+
+/// A persona's name as people read it: "work" is "Work".
+fn title(name: &str) -> String {
+    let mut c = name.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 /// `s` cut to `max` characters, with an ellipsis.
 fn cut(s: &str, max: usize) -> String {
     if s.chars().count() <= max { s.to_string() } else { s.chars().take(max - 1).collect::<String>() + "…" }
@@ -167,7 +198,12 @@ impl View for Pane {
         });
         ctx.add(Node::Text { rect: Rect::new(24.0, em(18.0), 0.0, em(24.0)), content: format!("Share “{}”", cut(&s.title, 40)), style: style(type_size::LG, Weight::Semibold, t.text_primary()) });
         // Who is sharing: the app's registry id, from limend, not from the app.
-        ctx.add(Node::Text { rect: Rect::new(24.0, em(46.0), 0.0, em(18.0)), content: format!("From {}", cut(&s.from_app, 48)), style: style(type_size::SM, Weight::Regular, t.text_secondary()) });
+        let from = format!("From {}", cut(&s.from_app, 40));
+        let fx = 24.0 + from.chars().count() as f32 * type_size::SM * 0.5 + 6.0;
+        ctx.add(Node::Text { rect: Rect::new(24.0, em(46.0), 0.0, em(18.0)), content: from, style: style(type_size::SM, Weight::Regular, t.text_secondary()) });
+        if let Some((name, colour)) = &s.from_persona {
+            chip(ctx, fx, em(46.0), name, colour.as_deref());
+        }
         let mut y = em(80.0);
         if s.targets.is_empty() {
             ctx.add(Node::Text { rect: Rect::new(24.0, y, 0.0, em(20.0)), content: "No app on this computer takes this.".into(), style: style(type_size::SM, Weight::Regular, t.text_primary()) });
@@ -181,18 +217,29 @@ impl View for Pane {
                     *fill = c;
                 }
             }
-            let (shown, app) = (self.shown.clone(), target.app.clone());
+            let (shown, row_pick) = (self.shown.clone(), pick(target));
             ctx.on_click(row, move || {
                 let mut s = shown.get_cloned();
                 if s.pressed.is_none() {
-                    s.pressed = Some(app.clone());
+                    s.pressed = Some(Some(row_pick.clone()));
                     shown.set(s);
                 }
             });
             mark.draw(ctx, 28.0, y + (em(44.0) - em(ICON)) / 2.0, em(ICON));
             let tx = 28.0 + em(ICON) + 12.0;
-            ctx.add(Node::Text { rect: Rect::new(tx, y + em(6.0), 0.0, em(20.0)), content: cut(&target.name, 36), style: style(type_size::MD, Weight::Medium, t.text_primary()) });
-            ctx.add(Node::Text { rect: Rect::new(tx, y + em(26.0), 0.0, em(16.0)), content: format!("{} · takes {}", cut(&target.app, 32), target.takes.join(", ")), style: style(type_size::XS, Weight::Regular, t.text_tertiary()) });
+            let name = cut(&target.name, 28);
+            let nx = tx + name.chars().count() as f32 * type_size::MD * 0.58 + 8.0;
+            ctx.add(Node::Text { rect: Rect::new(tx, y + em(6.0), 0.0, em(20.0)), content: name, style: style(type_size::MD, Weight::Medium, t.text_primary()) });
+            // Another persona's row says so, in that persona's colour: the
+            // item leaves the sharer's persona for it.
+            let how = match &target.persona {
+                Some(q) => {
+                    chip(ctx, nx, y + em(8.0), q, target.colour.as_deref());
+                    format!("opens in {} · takes {}", title(q), target.takes.join(", "))
+                }
+                None => format!("{} · takes {}", cut(&target.app, 32), target.takes.join(", ")),
+            };
+            ctx.add(Node::Text { rect: Rect::new(tx, y + em(26.0), 0.0, em(16.0)), content: how, style: style(type_size::XS, Weight::Regular, t.text_tertiary()) });
             ctx.pop();
             y += em(48.0);
         }
@@ -201,7 +248,7 @@ impl View for Pane {
         ctx.on_click(b, move || {
             let mut s = shown.get_cloned();
             if s.pressed.is_none() {
-                s.pressed = Some(String::new());
+                s.pressed = Some(None);
                 shown.set(s);
             }
         });
@@ -228,7 +275,13 @@ fn pane(embed: EmbedId, fresco: String, first: Shown, rx: Receiver<()>, tx: Send
             return;
         }
     };
-    let auto = std::env::var("SHARE_AUTO_PICK").ok().filter(|a| first.targets.iter().any(|t| &t.app == a));
+    let auto = std::env::var("SHARE_AUTO_PICK").ok().and_then(|a| {
+        let want = match a.split_once('@') {
+            Some((app, q)) => (app.to_string(), Some(q.to_string())),
+            None => (a, None),
+        };
+        first.targets.iter().map(pick).find(|p| *p == want)
+    });
     let dirty = Arc::new(AtomicBool::new(true));
     let marks = first.targets.iter().take(ROWS).map(Mark::of).collect();
     let shown = Mutable::with_dirty(first, dirty.clone());
@@ -246,9 +299,9 @@ fn pane(embed: EmbedId, fresco: String, first: Shown, rx: Receiver<()>, tx: Send
                 ready = true;
                 let _ = tx.send(FromPane::Ready(embed, token));
                 if let Some(a) = &auto {
-                    eprintln!("share-sheet: {embed}: SHARE_AUTO_PICK {a}");
+                    eprintln!("share-sheet: {embed}: SHARE_AUTO_PICK {a:?}");
                     let mut s = shown.get_cloned();
-                    s.pressed = Some(a.clone());
+                    s.pressed = Some(Some(a.clone()));
                     shown.set(s);
                 }
             }
@@ -284,16 +337,17 @@ fn main() {
             }
         };
         eprintln!("share-sheet: providing share");
-        let mut sheet = Sheet::new(child, Box::new(tabula::gate::Frescod::new(&act)), Installed::at(&apps), share_sheet::registry_person(registry.clone()));
+        let mut sheet = Sheet::new(child, Box::new(tabula::gate::Frescod::new(&act)), Installed::at(&apps), share_sheet::registry_person(registry.clone()))
+            .with_personas(share_sheet::registry_persona(registry.clone()));
         let (tx, rx) = mpsc::channel::<FromPane>();
         let mut panes: HashMap<EmbedId, Sender<()>> = HashMap::new();
         loop {
             match sheet.poll(Duration::from_millis(20)) {
-                Ok(Some(Event::Show { embed, title, from_app, targets })) => {
+                Ok(Some(Event::Show { embed, title, from_app, from_persona, targets })) => {
                     let (ptx, prx) = mpsc::channel();
                     panes.insert(embed, ptx);
                     let (f, t) = (fresco.clone(), tx.clone());
-                    let first = Shown { title, from_app, targets, pressed: None, selected: None };
+                    let first = Shown { title, from_app, from_persona, targets, pressed: None, selected: None };
                     std::thread::spawn(move || pane(embed, f, first, prx, t));
                 }
                 Ok(Some(Event::Close { embed })) => {
@@ -314,9 +368,9 @@ fn main() {
                             eprintln!("share-sheet: {embed}: ready: {e:?}");
                         }
                     }
-                    FromPane::Chose(embed, app) if app.is_empty() => sheet.cancelled(embed),
-                    FromPane::Chose(embed, app) => {
-                        if let Err(why) = sheet.chose(embed, &app) {
+                    FromPane::Chose(embed, None) => sheet.cancelled(embed),
+                    FromPane::Chose(embed, Some((app, persona))) => {
+                        if let Err(why) = sheet.chose(embed, &app, persona.as_deref()) {
                             eprintln!("share-sheet: {embed}: {why}");
                             sheet.cancelled(embed);
                         }
@@ -344,7 +398,7 @@ mod tests {
     use super::*;
 
     fn shown(n: usize) -> Shown {
-        let targets = (0..n).map(|i| Target { app: format!("org.t.{i}"), name: format!("T{i}"), takes: vec![], icon: None, icon_svg: None }).collect();
+        let targets = (0..n).map(|i| Target { app: format!("org.t.{i}"), name: format!("T{i}"), takes: vec![], icon: None, icon_svg: None, persona: None, colour: None }).collect();
         Shown { targets, ..Default::default() }
     }
 
@@ -360,15 +414,16 @@ mod tests {
         assert_eq!(s.selected, Some(2), "stops at the last");
         assert!(s.key(Key::Up));
         assert!(s.key(Key::Enter));
-        assert_eq!(s.pressed.as_deref(), Some("org.t.1"));
+        let one = Some(Some(("org.t.1".to_string(), None)));
+        assert_eq!(s.pressed, one);
         assert!(!s.key(Key::Escape), "once chosen, nothing more");
-        assert_eq!(s.pressed.as_deref(), Some("org.t.1"));
+        assert_eq!(s.pressed, one);
 
         let mut s = shown(2);
         assert!(s.key(Key::Up));
         assert_eq!(s.selected, Some(1), "Up from nothing is the last");
         assert!(s.key(Key::Escape));
-        assert_eq!(s.pressed.as_deref(), Some(""));
+        assert_eq!(s.pressed, Some(None));
 
         // No targets: arrows do nothing, Escape still cancels.
         let mut s = shown(0);

@@ -728,6 +728,16 @@ impl FrescoSurface {
         Ok(())
     }
 
+    /// Let go of what [`Self::place_rect`] kept for `id` (and, if it was a
+    /// group, for what it held).
+    fn unplace(&mut self, id: u32) {
+        if self.sent.contains_key(&id) {
+            for gone in self.edges.forget(id) {
+                self.sent.remove(&gone);
+            }
+        }
+    }
+
     fn rect_params(&mut self, id: u32, node: &Node, group: Option<NodeId>, order: u32, rect: crate::geom::Rect, fill: crate::Color, radius: f32) -> fresco_protocol::RectParams {
         let k = self.scale;
         let (x, y, w, h) = self.place_rect(id, node, group, order, rect);
@@ -817,6 +827,13 @@ impl Surface for FrescoSurface {
 
     fn set_node(&mut self, id: NodeId, node: &Node, group: Option<NodeId>, order: u32) -> io::Result<()> {
         let k = self.scale;
+        // A node not placed from its edges (text, a path, a fill) at an id
+        // that was a rect or an image: what was kept to send that again
+        // goes, or `settle` sends the old rect over it when a neighbour
+        // moves (the Navigator's prompt answers lost their labels so).
+        if !matches!(node, Node::Rect { .. } | Node::Image { .. }) {
+            self.unplace(id.0);
+        }
         match node {
             Node::Rect { rect, fill, radius } => {
                 let params = self.rect_params(id.0, node, group, order, *rect, *fill, *radius);
@@ -960,6 +977,27 @@ impl Surface for FrescoSurface {
 
 #[cfg(test)]
 mod tests {
+    /// An id that was a rect and is now a path (or text) keeps nothing to
+    /// send again, so a neighbour's move never sends the old rect over it.
+    #[test]
+    fn a_rect_turned_text_is_not_sent_again_as_the_rect() {
+        use super::Surface;
+        use crate::node::{Node, NodeId};
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut s = super::FrescoSurface::new(fresco_client::Connection::wrap(a).unwrap(), 0);
+        let rect = |x: f32| Node::Rect { rect: crate::geom::Rect::new(x, 0.0, 10.0, 10.0), fill: crate::color::Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 };
+        s.set_node(NodeId(5), &rect(0.0), None, 1).unwrap();
+        s.set_node(NodeId(6), &rect(10.0), None, 2).unwrap();
+        assert!(s.sent.contains_key(&5));
+        s.set_node(NodeId(5), &Node::Path { p0: (0.0, 0.0), p1: (5.0, 0.0), width: 1.0, color: crate::color::Color::rgba(0.0, 0.0, 0.0, 1.0) }, None, 1).unwrap();
+        assert!(!s.sent.contains_key(&5), "the old rect is not kept to send again");
+        // The neighbour moves: whatever settles, 5 is not among it.
+        s.set_node(NodeId(6), &rect(12.5), None, 2).unwrap();
+        let again = s.edges.settle();
+        assert!(!again.contains(&5), "{again:?}");
+        assert!(s.sent.contains_key(&6));
+    }
+
     #[test]
     fn an_edge_far_off_saturates_instead_of_panicking() {
         // A tall page (or an infinite clip) puts an edge past i32 in 1/64 pt.

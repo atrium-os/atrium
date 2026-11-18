@@ -258,6 +258,11 @@ pub struct Search {
     pub saved: Option<u32>,
     /// A view in place of a query (the newsletter lane, the screener's).
     pub view: Option<Lane>,
+    /// The server was searched too: `Some(true)` while it is, `Some(false)`
+    /// once it has been (§11.2).
+    pub server: Option<bool>,
+    /// Results before the server was searched.
+    pub server_base: usize,
 }
 
 /// An answer to a Later item.
@@ -360,6 +365,8 @@ pub enum Group {
     Date,
     /// One person's mail together, the newest sender first.
     Sender,
+    /// People, Updates, Newsletters (E10), in an inbox.
+    Lane,
 }
 
 impl Group {
@@ -368,13 +375,36 @@ impl Group {
             Group::None => "No grouping",
             Group::Date => "By date",
             Group::Sender => "By sender",
+            Group::Lane => "By lane",
         }
     }
-    fn next(self) -> Group {
+
+    /// The next way, in an inbox (`lanes`) or another folder.
+    fn next(self, lanes: bool) -> Group {
         match self {
             Group::None => Group::Date,
             Group::Date => Group::Sender,
-            Group::Sender => Group::None,
+            Group::Sender if lanes => Group::Lane,
+            Group::Sender | Group::Lane => Group::None,
+        }
+    }
+
+    /// As kept per folder in the store.
+    pub fn code(self) -> u8 {
+        match self {
+            Group::None => 0,
+            Group::Date => 1,
+            Group::Sender => 2,
+            Group::Lane => 3,
+        }
+    }
+
+    pub fn from_code(c: u8) -> Group {
+        match c {
+            1 => Group::Date,
+            2 => Group::Sender,
+            3 => Group::Lane,
+            _ => Group::None,
         }
     }
 }
@@ -414,13 +444,18 @@ pub fn date_section(t: i64, now: i64) -> String {
 
 /// `rows` (newest first) in sections, folded ones without their rows.
 pub fn sections(rows: &[ListRow], group: Group, now: i64, folded: &[String]) -> Vec<Entry> {
+    sections_by(rows, folded, |r| match group {
+        Group::Date => date_section(mail_engine::clock::to_local(r.date), mail_engine::clock::to_local(now)),
+        _ => r.people.split(", ").next().unwrap_or("").to_string(),
+    })
+}
+
+/// `rows` in sections named by `label_of`, in order of first appearance.
+pub fn sections_by(rows: &[ListRow], folded: &[String], mut label_of: impl FnMut(&ListRow) -> String) -> Vec<Entry> {
     let mut order: Vec<String> = Vec::new();
     let mut by: HashMap<String, Vec<&ListRow>> = HashMap::new();
     for r in rows {
-        let label = match group {
-            Group::Date => date_section(mail_engine::clock::to_local(r.date), mail_engine::clock::to_local(now)),
-            _ => r.people.split(", ").next().unwrap_or("").to_string(),
-        };
+        let label = label_of(r);
         let label = if label.is_empty() { "(no sender)".to_string() } else { label };
         if !by.contains_key(&label) {
             order.push(label.clone());
@@ -488,6 +523,9 @@ pub struct Mail {
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
     unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
+    /// A server search asked for (§11.2): its words, for the app's sync
+    /// thread.
+    server_ask: Rc<RefCell<Option<Vec<String>>>>,
     /// Unwraps an encrypted message's content key with the person's
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
@@ -612,7 +650,19 @@ impl Mail {
             }
         }
         let rows = self.filtered_rows(folder, ui.conversations, ui.quick);
-        let e = Rc::new(sections(&rows, ui.group, (self.now)(), &ui.folded));
+        let e = Rc::new(if ui.group == Group::Lane {
+            // People first, then Updates, then Newsletters.
+            let mut rows: Vec<(usize, ListRow)> = rows.iter().map(|r| {
+                let lane = self.engine.lane_of(r.msg).map(|l| l.0).unwrap_or(mail_engine::lanes::LaneKind::People);
+                (lane as usize, r.clone())
+            }).collect();
+            rows.sort_by_key(|x| x.0);
+            let order: Vec<ListRow> = rows.iter().map(|x| x.1.clone()).collect();
+            let labels: HashMap<MsgId, &'static str> = rows.iter().map(|(k, r)| (r.msg, [mail_engine::lanes::LaneKind::People, mail_engine::lanes::LaneKind::Updates, mail_engine::lanes::LaneKind::Newsletters].into_iter().find(|l| *l as usize == *k).map_or("People", |l| l.label()))).collect();
+            sections_by(&order, &ui.folded, |r| labels.get(&r.msg).copied().unwrap_or("People").to_string())
+        } else {
+            sections(&rows, ui.group, (self.now)(), &ui.folded)
+        });
         *self.grouped.borrow_mut() = Some((key, e.clone()));
         e
     }
@@ -631,15 +681,45 @@ impl Mail {
 
     /// Group the list the next way: none, by date, by sender (§11.7).
     pub fn next_group(&self) {
-        let g = self.ui.get_cloned().group.next();
-        self.set_group(g);
+        let ui = self.ui.get_cloned();
+        let inbox = ui.folder.and_then(|f| self.engine.store.folder(f).ok()).is_some_and(|f| f.role == Role::Inbox);
+        self.set_group(ui.group.next(inbox));
     }
 
+    /// Group the list `g`, kept for this folder (§11.7).
     pub fn set_group(&self, g: Group) {
         let mut ui = self.ui.get_cloned();
         ui.group = g;
         ui.folded.clear();
+        if let Some(f) = ui.folder {
+            if let Err(e) = self.engine.store.write(|w| w.set_grouping(f, g.code())) {
+                ui.error = Some(format!("Couldn't keep the grouping: {e}"));
+            }
+        }
         self.relist(ui);
+    }
+
+    /// Keep the quick filters on as a saved search, "Inbox · Unread, To
+    /// me", and show it (§11.7).
+    pub fn save_filters(&self) {
+        let ui = self.ui.get_cloned();
+        let (Some(f), true) = (ui.folder, ui.quick != 0) else { return };
+        let Ok(folder) = self.engine.store.folder(f) else { return };
+        let label = ui.places.iter().find(|p| p.folder == f).map(|p| p.label.clone()).unwrap_or_else(|| folder.name.clone());
+        let chips: Vec<&str> = mail_engine::quick::CHIPS.iter().filter(|(b, _)| ui.quick & b != 0).map(|(_, l)| *l).collect();
+        let name = format!("{label} · {}", chips.join(", "));
+        let query = format!("in:\"{}\" {}", folder.name, mail_engine::quick::query_of(ui.quick));
+        match self.engine.store.save_search(&name, &query) {
+            Ok(id) => {
+                let mut ui = self.ui.get_cloned();
+                let query_kept = query.clone();
+                ui.saved.push(SavedPlace { id, name, query });
+                ui.quick = 0;
+                self.ui.set(ui);
+                self.search_for(&query_kept, Some(id));
+            }
+            Err(e) => self.set_error(format!("Couldn't save the filters: {e}")),
+        }
     }
 
     /// Fold or unfold the section `label`.
@@ -732,9 +812,16 @@ impl Mail {
             ui.folder = inbox.or(places.first().map(|p| p.folder));
             ui.cursor = None;
             ui.reading = None;
+            ui.group = ui.folder.map_or(Group::None, |f| Group::from_code(store.grouping(f).unwrap_or(0)));
+            ui.folded.clear();
         }
         if let Some(f) = ui.folder {
             ui.conversations = store.view(f).unwrap_or(true);
+            // The count reads the grouping from the window's state.
+            if self.ui.get_cloned().group != ui.group {
+                self.ui.set(Ui { gen: ui.gen + 1, ..ui.clone() });
+                ui.gen += 1;
+            }
             ui.count = self.count_of(f, ui.conversations);
         } else {
             ui.count = 0;
@@ -791,12 +878,9 @@ impl Mail {
         ui.search = None;
         ui.folder = Some(folder);
         ui.conversations = self.engine.store.view(folder).unwrap_or(true);
-        ui.count = self.count_of(folder, ui.conversations);
-        ui.cursor = None;
-        ui.reading = None;
-        ui.gen += 1;
-        self.ui.set(ui);
-        self.list.set(ScrollState::default());
+        ui.group = Group::from_code(self.engine.store.grouping(folder).unwrap_or(0));
+        ui.folded.clear();
+        self.relist(ui);
     }
 
     /// Conversations or messages for the chosen folder, remembered (§11.7).
@@ -1269,7 +1353,7 @@ impl Mail {
     pub fn search_for(&self, query: &str, saved: Option<u32>) {
         let mut ui = self.ui.get_cloned();
         self.find.borrow_mut().set_text(query);
-        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved, view: None });
+        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved, view: None, server: None, server_base: 0 });
         self.run_search(&mut ui);
         self.ui.set(ui);
     }
@@ -1629,6 +1713,45 @@ impl Mail {
         self.get_asked.take()
     }
 
+    /// Search the server for the search's words (§11.2), for mail outside
+    /// what is kept here; what it finds joins the results.
+    pub fn search_server(&self) {
+        let mut ui = self.ui.get_cloned();
+        let Some(s) = &mut ui.search else { return };
+        if s.view.is_some() || s.server.is_some() {
+            return;
+        }
+        let words = mail_engine::search::parse(&s.query, false).server_words();
+        if words.is_empty() {
+            return;
+        }
+        s.server = Some(true);
+        s.server_base = s.hits.len();
+        *self.server_ask.borrow_mut() = Some(words);
+        self.ui.set(ui);
+    }
+
+    pub fn take_server_search(&self) -> Option<Vec<String>> {
+        self.server_ask.borrow_mut().take()
+    }
+
+    /// What the server search found: the results again, and a note.
+    pub fn server_searched(&self, r: Result<usize, String>) {
+        let mut ui = self.ui.get_cloned();
+        let Some(s) = &mut ui.search else { return };
+        s.server = Some(false);
+        let before = s.server_base;
+        self.run_search(&mut ui);
+        let more = ui.count.saturating_sub(before);
+        let note = match r {
+            Ok(_) if more > 0 => format!("{more} more found on the server"),
+            Ok(_) => "Nothing more on the server".to_string(),
+            Err(e) => format!("Couldn't search the server: {e}"),
+        };
+        ui.file_note = Some((note, (self.now)() + 5));
+        self.ui.set(ui);
+    }
+
     pub fn take_unsubscribes(&self) -> Vec<(MsgId, String)> {
         std::mem::take(&mut *self.unsubs.borrow_mut())
     }
@@ -1814,6 +1937,7 @@ impl Mail {
         if changed && text != s.query {
             s.query = text;
             s.saved = None;
+            s.server = None;
             self.run_search(&mut ui);
         }
         self.ui.set(ui);
@@ -2495,6 +2619,7 @@ impl MailView {
             print: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
+            server_ask: Rc::default(),
             unwrapper: Rc::default(),
             settings_asked: Rc::default(),
             get_asked: Rc::default(),
@@ -2761,6 +2886,20 @@ impl MailView {
         area(ctx, Rect::new(x, y, lw, ch), Color::TRANSPARENT, move || m.next_group());
         text(ctx, x + em(8.0), y + ch / 2.0, &format!("{label} ⌄"), type_size::XS, Weight::Medium, if ui.group == Group::None { t.text_secondary() } else { t.accent_fg() });
         ctx.pop();
+        x += lw + gap;
+        // Filters on: keep them as a smart folder in the sidebar.
+        if ui.quick != 0 {
+            let label = "Save as folder";
+            let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);
+            if x + lw > x0 + w - 12.0 && x > x0 + 12.0 {
+                x = x0 + 12.0;
+                y += ch + gap;
+            }
+            let m = self.mail.clone();
+            area(ctx, Rect::new(x, y, lw, ch), Color::TRANSPARENT, move || m.save_filters());
+            text(ctx, x + em(8.0), y + ch / 2.0, label, type_size::XS, Weight::Medium, t.accent_fg());
+            ctx.pop();
+        }
         y + ch + em(8.0) - head_h()
     }
 
@@ -2792,6 +2931,15 @@ impl MailView {
                     buttons.push(("Save", Box::new(move || m.save_search())));
                 }
                 None => {}
+            }
+            // Mail outside what is kept here (§11.2).
+            if s.view.is_none() && !s.typing && !s.query.trim().is_empty() {
+                let m = self.mail.clone();
+                match s.server {
+                    None => buttons.push(("Search server", Box::new(move || m.search_server()))),
+                    Some(true) => buttons.push(("Searching server…", Box::new(|| {}))),
+                    Some(false) => {}
+                }
             }
             for (label, on) in buttons {
                 let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);

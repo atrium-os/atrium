@@ -172,6 +172,14 @@ pub enum Request {
         /// Asked, the answer is `ReadyForFdsAs` with the worker's uid.
         #[serde(default)]
         serves: Option<u32>,
+        /// With `serves`, for limend only: start the worker in this persona
+        /// of the served instance's person ("personal" or a named one)
+        /// rather than the instance's own, a share across personas
+        /// (share-sheet.md §7). portcullisd starts it only while that
+        /// person's `share` crossing switch from the instance's persona to
+        /// this one is on.
+        #[serde(default)]
+        persona: Option<String>,
     },
 
     /// ★ One of the caller's own workers (app-composition.md §4.1,
@@ -346,6 +354,19 @@ pub enum Request {
         name:   String,
         /// Where it came from (at most 2048 bytes).
         origin: String,
+    },
+
+    /// ★ Open a download in an app (navigator-ui.md §6.4 "Open"). Only from
+    /// the Navigator (`navigator-broker`), after the person's press on Open,
+    /// which it spent itself. Then `ReadyForFds` and one sealed memory file,
+    /// as `OpenAttachment`: portcullisd decides the type from the bytes and
+    /// `name`, refuses programs and names that lie, and hands it read-only
+    /// to the person's default app for the type, its instance in the
+    /// Navigator's persona. Nothing is written to the person's folders.
+    /// Answer: `Opened`.
+    OpenDownload {
+        /// The file's name: never a path.
+        name: String,
     },
 
     /// ★ A link to open (opening-links.md §5), first step. Only from
@@ -706,7 +727,7 @@ pub struct CrossingSwitch {
 }
 
 /// The kinds a crossing switch names in Settings (personas.md §6).
-pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files"];
+pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files", "share"];
 
 /// A link scheme in Settings' Links section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1009,7 +1030,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let s = serde_json::to_string(&Request::ExecInstance { app_id: "a".into(), instance: None, tmpfs_mb: 64,
-            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true, serves: None }).unwrap();
+            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true, serves: None, persona: None }).unwrap();
         assert!(s.contains("\"memory_mb\":512") && s.contains("\"cpu_pct\":100") && s.contains("\"require_memory_limit\":true"), "{s}");
     }
 

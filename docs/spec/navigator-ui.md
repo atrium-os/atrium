@@ -1409,8 +1409,15 @@ Each step runs in the VM on headless frescod before the next.
        extension kept or added), the file is created new (never over a file, `name (2).ext`,
        no link followed), never executable (0660 with the folder's group from portcullisd,
        0644 in a development run), and the address it came
-       from is recorded on it as the user extended attribute `atrium.origin`. *Open in
-       viewer* waits for a jailed viewer.
+       from is recorded on it as the user extended attribute `atrium.origin`.
+     - *Open* (built 2026-11-18; the row reads *Cancel* · *Open* · *Save*) has navigatord
+       spend the press the same way and hand the file to portcullisd (`OpenDownload`, a
+       sealed memory file), which decides its type from the bytes and the name as it does
+       for Mail's attachments, refuses programs and names that lie, and hands it read-only
+       to the person's default app for the type, that app's instance in the window's
+       persona. Nothing is written to the person's folders; the window says which app
+       opened it. This replaces the planned *Open in viewer*: every app is jailed already,
+       so the person's own app is the viewer.
    - **Hand-offs** (threat model §2.10). `NAVIGATORD_SCHEMES` lists the schemes the person
      allowed (e.g. `mailto`), and `atrium-app` is always allowed. A link to one of them is
      `Handoff` and asks first: *Not now* · *Open in Mail* for `mailto:`, *Not now* · *Open*

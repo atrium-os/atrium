@@ -653,6 +653,12 @@ impl Sink for AccountSink<'_> {
         let (msg, _) = self.e.store.at(id, uid).ok()??;
         self.e.store.message(msg).ok()?.server_id
     }
+
+    fn has_text(&mut self, folder: &str, uid: u32) -> bool {
+        let Ok(id) = self.fid(folder) else { return false };
+        let Ok(Some((msg, _))) = self.e.store.at(id, uid) else { return false };
+        self.e.store.message(msg).is_ok_and(|m| m.full.is_some())
+    }
 }
 
 /// Flag bits as IMAP's system flags (and the `$Snoozed` keyword).

@@ -45,6 +45,8 @@ pub trait Jmap {
     fn can_hold(&self, secs: i64) -> bool;
     /// See [`Client::watch`].
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed>;
+    /// Search the server for `text` (§11.2); see [`Client::search_server`].
+    fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
 }
 
 impl<H: Http> Jmap for Client<H> {
@@ -56,6 +58,9 @@ impl<H: Http> Jmap for Client<H> {
     }
     fn can_hold(&self, secs: i64) -> bool {
         Client::can_hold(self, secs)
+    }
+    fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        Client::search_server(self, text, sink, limit)
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed> {
         Client::watch(self, on)
@@ -265,6 +270,39 @@ impl<H: Http> Client<H> {
         }
         self.texts(sink, &mut report)?;
         Ok(report)
+    }
+
+    /// Search the server for `text` (JMAP `Email/query`, §11.2), newest
+    /// first, at most `limit`: messages not listed here are placed whole
+    /// (or by their headers when large); listed ones without their text
+    /// get it. How many the server found.
+    pub fn search_server(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        if text.trim().is_empty() || limit == 0 {
+            return Ok(0);
+        }
+        if self.mailboxes.is_empty() {
+            self.folders(sink)?;
+        }
+        let a = self.call(jmap::query_text(&self.session.account, text, limit as u64))?;
+        let (emails, _, _) = jmap::mailbox_page(&a)?;
+        let mut report = Report::default();
+        for e in emails.iter().take(limit) {
+            let listed = sink.listed(&e.id);
+            if listed.is_empty() {
+                self.place(sink, e, true, &mut report)?;
+                continue;
+            }
+            let lacking: Vec<(String, u32)> = listed.into_iter().filter(|(f, u)| !sink.has_text(f, *u)).collect();
+            if lacking.is_empty() || e.size > crate::TEXT_MAX {
+                continue;
+            }
+            let url = self.session.download(&e.blob);
+            let bytes = self.h.get(&url, MESSAGE_MAX).map_err(Error)?;
+            for (folder, uid) in lacking {
+                sink.messages(&folder, vec![crate::Fetched { uid, flags: flags(&e.keywords), size: e.size.max(bytes.len() as u64), internal_date: e.received, server_id: Some(e.id.clone()), bytes: bytes.clone(), full: true }]).map_err(Error)?;
+            }
+        }
+        Ok(emails.len().min(limit))
     }
 
     /// Stage 3 (§6.4): whole messages for the text window, newest first,

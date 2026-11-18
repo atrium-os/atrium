@@ -1365,6 +1365,29 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     }
                 }
             }
+            Request::OpenFile { id, press } => {
+                if !waiting.lock().unwrap().holds(id) {
+                    send(&w, &Event::FileOpened { id, app: None, why: Some("that file is no longer held".into()) });
+                    continue;
+                }
+                if let Err(why) = spend(press) {
+                    eprintln!("navigatord: open {id} refused: {why}");
+                    send(&w, &Event::PressRefused { why });
+                    continue;
+                }
+                let Some(h) = waiting.lock().unwrap().take(id) else { continue };
+                let w = w.clone();
+                std::thread::spawn(move || match worker::open_download(&h.name, &h.bytes) {
+                    Ok(app) => {
+                        eprintln!("navigatord: opened {} in {app}", h.url);
+                        send(&w, &Event::FileOpened { id, app: Some(app), why: None });
+                    }
+                    Err(why) => {
+                        eprintln!("navigatord: {} not opened: {why}", h.url);
+                        send(&w, &Event::FileOpened { id, app: None, why: Some(why) });
+                    }
+                });
+            }
             Request::Discard { id } => {
                 waiting.lock().unwrap().take(id);
             }

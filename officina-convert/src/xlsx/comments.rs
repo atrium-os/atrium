@@ -135,6 +135,23 @@ mod read {
                 _ => {}
             }
         }
+        // Excel 365's threaded comments: their legacy note above is only a
+        // "[Threaded comment] Your version of Excel..." stand-in.
+        let threads = threaded(z, part)?;
+        if !threads.is_empty() {
+            let replies = threads.iter().any(|t| t.3);
+            for ((row, col), who, text, _) in threads {
+                let k = Some(Comment::new(who.trim(), &text));
+                match set.iter().position(|x| (x.0, x.1) == (row, col)) {
+                    Some(i) => set[i].2 = k,
+                    None if set.len() < MAX_COMMENTS => set.push((row, col, k)),
+                    None => {}
+                }
+            }
+            if replies {
+                rep.note(Kind::Approximate, "threaded comments kept as notes, replies as lines under them");
+            }
+        }
         if set.iter().any(|x| x.2.as_ref().is_some_and(|k| k.text.len() >= MAX_TEXT)) {
             rep.note(Kind::Approximate, "comments cut to 32 KB");
         }
@@ -142,5 +159,94 @@ mod read {
             wb.set_comments(s, set);
         }
         Ok(())
+    }
+
+    /// The sheet's threaded comments, one per cell: (cell, first author, the
+    /// first message then "Name: reply" paragraphs, whether it had replies).
+    fn threaded(z: &Archive, part: &str) -> Result<Vec<((u32, u32), String, String, bool)>, XlsxError> {
+        let Some(path) = rels(z, part)?.into_values().find(|(t, _)| t.ends_with("/threadedComment")).map(|(_, p)| p) else { return Ok(Vec::new()) };
+        let Some(data) = z.read_name(&path)? else { return Ok(Vec::new()) };
+        let people = persons(z)?;
+        let name = |id: &str| people.iter().find(|(i, _)| i.eq_ignore_ascii_case(id)).map(|(_, n)| n.clone()).unwrap_or_default();
+        let mut r = xml(&data);
+        let mut buf = Vec::new();
+        let mut out: Vec<((u32, u32), String, String, bool)> = Vec::new();
+        // The message being read: cell, person, whether it is a reply, text.
+        let mut cur: Option<((u32, u32), String, bool, String)> = None;
+        let mut in_text = false;
+        loop {
+            buf.clear();
+            match r.read_event_into(&mut buf)? {
+                Event::Start(e) => match e.local_name().as_ref() {
+                    b"threadedComment" => {
+                        let at = attr(&e, b"ref")?.as_deref().and_then(parse_ref).map(|(r0, c0, _, _)| (r0, c0));
+                        let who = attr(&e, b"personId")?.unwrap_or_default();
+                        let reply = attr(&e, b"parentId")?.is_some();
+                        cur = at.map(|a| (a, who, reply, String::new()));
+                    }
+                    b"text" => in_text = true,
+                    _ => {}
+                },
+                Event::Text(t) if in_text => {
+                    if let Some(c) = cur.as_mut() {
+                        if c.3.len() < MAX_TEXT {
+                            c.3.push_str(&t.unescape().map_err(|e| XlsxError::Xml(e.to_string()))?);
+                        }
+                    }
+                }
+                Event::End(e) => match e.local_name().as_ref() {
+                    b"text" => in_text = false,
+                    b"threadedComment" => {
+                        let Some((at, who, reply, text)) = cur.take() else { continue };
+                        let text = text.replace("\r\n", "\n");
+                        let text = text.trim();
+                        match out.iter().position(|t| t.0 == at) {
+                            Some(i) if out[i].2.len() < MAX_TEXT => {
+                                let n = name(&who);
+                                let t = &mut out[i];
+                                t.2.push_str("\n\n");
+                                if !n.trim().is_empty() {
+                                    t.2.push_str(n.trim());
+                                    t.2.push_str(": ");
+                                }
+                                t.2.push_str(text);
+                                t.3 = true;
+                            }
+                            Some(_) => {}
+                            None if out.len() < MAX_COMMENTS => out.push((at, name(&who), text.to_string(), reply)),
+                            None => {}
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// The workbook's people who wrote threaded comments: (id, display name).
+    fn persons(z: &Archive) -> Result<Vec<(String, String)>, XlsxError> {
+        let Some(path) = rels(z, "xl/workbook.xml")?.into_values().find(|(t, _)| t.ends_with("/person")).map(|(_, p)| p) else { return Ok(Vec::new()) };
+        let Some(data) = z.read_name(&path)? else { return Ok(Vec::new()) };
+        let mut r = xml(&data);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            buf.clear();
+            match r.read_event_into(&mut buf)? {
+                Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"person" => {
+                    if let (Some(id), Some(n)) = (attr(&e, b"id")?, attr(&e, b"displayName")?) {
+                        if out.len() < MAX_COMMENTS {
+                            out.push((id, n));
+                        }
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 }

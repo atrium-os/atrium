@@ -1,6 +1,6 @@
 # The share sheet: handing one item to an app the person picks
 
-Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 21/21 (limend-dev) `scripts/vm-share-jail-check.sh` 13/13 (real jails) and `scripts/vm-share-forum-check.sh` 18/18 (under Forum, services from services.d). Crate `share-sheet/`
+Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 21/21 (limend-dev) `scripts/vm-share-jail-check.sh` 13/13 (real jails) and `scripts/vm-share-forum-check.sh` 27/27 (under Forum, services from services.d, across personas §7). Crate `share-sheet/`
 (the service and two demo apps), role messages `limen::share` and `limen::share_target`,
 limend's `CHOOSE`. Assigned to the Pergola thread on 2026-11-06 (pergola.md §1), built by
 the share-sheet thread.
@@ -73,15 +73,16 @@ limend's side (`limen::daemon`):
 - `share` is a **system role** (`org.atrium.share`, slot `Sheet { 480, 400 }`); limend accepts
   `PROVIDE share` only from `LIMEN_SHARE_UID` (default 65045, `_share`). An app needs `share` in
   its manifest's `embeds` (platform bundles without `embeds` keep every role).
-- `CHOOSE { embed, app }` (op `0x16`): only from the connection serving that `share` embed, only
+- `CHOOSE { embed, app, persona }` (op `0x16`; `persona` optional, §7): only from the connection serving that `share` embed, only
   for an app whose installed manifest implements `share-target` and, for a dev build, only the
   parent's person's own (`Installed::may_target`); otherwise `NOT_A_TARGET` (16) or `NOT_YOURS`.
   The choice is stored for the embed's **parent connection**.
 - `share-target` is `Provider::Chosen`: a request takes the parent's stored choice (removing it)
   if it is at most `CHOICE_MS` (30 s) old, else `NO_PROVIDER`. No `embeds` check for it: the
   choice can only come from a sheet the parent was allowed to open. The child is started with
-  `launch_for(parent_uid)`, so it runs in the parent's person and persona; a share never crosses
-  personas in v1 (personas.md §6 would need a crossing switch and a sheet saying so).
+  `launch_for(parent_uid)`, so it runs in the parent's person and persona, unless the person
+  chose a row of another persona's (§7): then `launch_in(parent_uid, persona)`, which portcullisd
+  allows only while the person's `share` switch for that crossing is on.
 - `share-target` takes descriptors (`SEND_FD`): each is checked to be a read-only regular file or
   pipe and narrowed to read, seek and fstat.
 
@@ -144,6 +145,10 @@ belongs to. portcullisd keeps only installed share-targets for the person and wr
 the person ordered come first, in their order, then the rest by name; a hidden app isn't
 listed, so it can't be chosen. A newly installed target is listed, after the ordered ones.
 
+### 4.5 Across personas (§7)
+
+See §7.
+
 ## 5. For app developers
 
 Sharing, with Pergola (`pergola::share`; `share-sheet/src/bin/share_demo.rs` uses it):
@@ -205,7 +210,7 @@ may spend `SHARE`) and injected clicks:
   the entry and its libraries, not other files in the project (share-demo writes its picture in
   its home when the bundle has none).
 
-- `scripts/vm-share-forum-check.sh` (18/18) runs it under Forum: frescod in split mode with forum-wm,
+- `scripts/vm-share-forum-check.sh` (27/27) runs it under Forum: frescod in split mode with forum-wm,
   the dock jailed, limend and the share sheet started by the boot supervisor from their
   services.d entries (`41-atrium-limend.toml`, `share-sheet/etc/services.d/42-atrium-share-sheet.toml`,
   commissioned by `limen-service.sh` and `share-sheet-service.sh`). The sheet's jail sees only
@@ -220,7 +225,47 @@ may spend `SHARE`) and injected clicks:
   it. `vm-share-forum-check.sh` writes a `share.toml` hiding Photos and the jailed sheet then
   lists Scraps only.
 
+- Across personas (§7): `share-sheet/tests/sheet.rs`
+  `another_personas_apps_only_while_the_share_switch_is_on` (no switch, no other rows; with it,
+  Work's apps below with their persona, a row not shown can't be chosen, limend hands the
+  persona to the launcher; one way only); `limen/tests/daemon.rs`
+  `a_choice_in_another_persona_goes_to_the_launcher_which_decides`; Curia's words. In the VM,
+  `vm-share-forum-check.sh` gives root a Work persona and the Personal-to-Work share switch:
+  the jailed sheet adds Work's Notes, Photos and Scraps; the fifth row starts Scraps as its Work
+  instance (its registry line says `persona=work`, a uid apart from Personal's Scraps), which
+  gets the item; with the switch turned off while a sheet is up, the press still reaches
+  portcullisd, which refuses it, and the next sheet lists Personal's apps only.
+  `vm-apps-access-check.sh` turns "Personal may share to Work's apps" on (Sigillum confirms)
+  and off in Settings.
+
 Not done yet:
 
-- Sharing across personas (refused by construction: targets run in the parent's persona).
 - Notification actions over `CLASS_BROKER` (tabula.md §5) are a separate path, still not built.
+
+## 7. Across personas
+
+A person with personas (personas.md) can share from one persona to an app in another, one
+direction at a time, only while that crossing's `share` switch is on: Settings, Apps,
+Between personas, "Work may share to Personal's apps", turned on only after Sigillum
+confirms it's them (personas.md §6). Off by default.
+
+- **The sheet** knows the sharing app's persona from the launch registry, reads the person's
+  `policy.toml` (its jail mounts `/var/db/atrium` read-only), and when the person has personas,
+  says which one the item comes from (a chip by "From", in the persona's colour). Below the
+  sharer's own persona's apps it lists, for each other persona the switch lets this one share
+  to (Personal first, then by name), the same apps (hidden ones stay hidden, the sharing app's
+  own instance there included), each with that persona's chip and "opens in Work". Only a row
+  shown can be chosen.
+- **limend** takes `CHOOSE { embed, app, persona }` from the sheet (a plausible persona name;
+  `personal` for Personal), keeps it with the choice, and starts the target with
+  `Launcher::launch_in(parent_uid, persona)` instead of `launch_for`.
+- **portcullisd** decides: `ExecInstance { persona }` only from limend, for a per-instance
+  provider serving an app instance; the persona must be one of the instance's person's, not
+  the instance's own, and `may_cross(instance's persona, persona, "share")` must hold, read
+  from `policy.toml` at that moment. Otherwise `LaunchFailed` "cap.share.crossing: sharing from
+  personal to work is off", and the app hears the target failed. Then the target runs as that
+  person's instance in that persona (its own uid, folders and VPN), like any launch there.
+
+The sheet listing a row is a convenience; the check that counts is portcullisd's, so a switch
+turned off while a sheet is up refuses the start.
+

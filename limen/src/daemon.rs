@@ -61,6 +61,14 @@ pub trait Launcher: Send {
         let _ = parent_uid;
         self.launch(app_id, embed, channel)
     }
+    /// [`Launcher::launch_for`], with the child in `persona` (one of the
+    /// parent's person's) rather than the parent's own: a share across
+    /// personas (share-sheet.md §7). The launcher's authority decides
+    /// whether that crossing is on; one that can't ask refuses.
+    fn launch_in(&mut self, app_id: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
+        let _ = (app_id, embed, channel, parent_uid);
+        Err(format!("this launcher starts nothing in another persona ({persona})"))
+    }
     /// End the child's jail.
     fn end(&mut self, embed: EmbedId);
 }
@@ -147,7 +155,7 @@ struct State {
     providers: HashMap<&'static str, (ConnId, u32)>,
     /// parent → the app the person chose for its next `share-target`, and
     /// when (share-sheet.md §3).
-    choices: HashMap<ConnId, (String, Instant)>,
+    choices: HashMap<ConnId, (String, Option<String>, Instant)>,
     /// When each window last opened a print sheet, within the last minute
     /// (printing.md §5.2).
     print_opens: HashMap<WindowToken, Vec<Instant>>,
@@ -404,18 +412,22 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
         Provider::User | Provider::Chosen => {
             let provider = match role.provider {
                 Provider::Chosen => match st.choices.remove(&conn) {
-                    Some((app, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some(app),
+                    Some((app, persona, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some((app, persona)),
                     _ => None,
                 },
-                _ => (shared.defaults)(&user, role.name),
+                _ => (shared.defaults)(&user, role.name).map(|a| (a, None)),
             };
-            let Some(provider) = provider else { return refuse(refusal::NO_PROVIDER) };
+            let Some((provider, persona)) = provider else { return refuse(refusal::NO_PROVIDER) };
             let (ours, theirs) = UnixStream::pair().map_err(|_| Reply::Refused { reason: refusal::LAUNCH_FAILED })?;
             let (tx, rx) = mpsc::channel();
             st.next_conn += 1;
             let id = st.next_conn;
             st.conns.insert(id, tx);
-            let child_uid = match shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid) {
+            let launched = match &persona {
+                Some(p) => shared.launcher.lock().unwrap().launch_in(&provider, embed, theirs, uid, p),
+                None => shared.launcher.lock().unwrap().launch_for(&provider, embed, theirs, uid),
+            };
+            let child_uid = match launched {
                 Ok(u) => u,
                 Err(e) => {
                     eprintln!("limend: launching {provider} for {}: {e}", role.name);
@@ -708,6 +720,7 @@ fn choose(shared: &Arc<Shared>, conn: ConnId, c: proto::Choose) -> Result<Reply,
     };
     let person = (shared.resolve)(parent_uid).map(|(u, _)| u).unwrap_or_default();
     let ok = crate::manifests::plausible_id(&c.app)
+        && c.persona.as_deref().is_none_or(plausible_persona)
         && shared.target_check.lock().unwrap().as_ref().is_none_or(|check| check(&person, &c.app));
     if !ok {
         eprintln!("limend: the share sheet chose {:?}, not a share target for {person}", c.app);
@@ -716,9 +729,17 @@ fn choose(shared: &Arc<Shared>, conn: ConnId, c: proto::Choose) -> Result<Reply,
     let mut st = shared.state.lock().unwrap();
     // The parent may have gone meanwhile; a choice for nobody is dropped.
     if st.embeds.get(&c.embed).is_some_and(|e| e.parent == parent) {
-        st.choices.insert(parent, (c.app, Instant::now()));
+        st.choices.insert(parent, (c.app, c.persona, Instant::now()));
     }
     Ok(Reply::Ok)
+}
+
+/// A persona's name as policy.toml has them ("personal", "work",
+/// "side-project"). Whether it is one of the person's, and whether the
+/// crossing is on, is portcullisd's to say.
+fn plausible_persona(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 32 && p.starts_with(|c: char| c.is_ascii_lowercase())
+        && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> Result<Reply, Reply> {

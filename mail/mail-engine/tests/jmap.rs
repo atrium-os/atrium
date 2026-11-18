@@ -106,8 +106,13 @@ impl Server {
                     json!({ "state": "m1", "list": [mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj"))], "notFound": [] })
                 }
                 "Email/query" => {
-                    let mb = args["filter"]["inMailbox"].as_str().unwrap();
-                    let mut ids: Vec<(&i64, &String)> = self.mails.iter().filter(|(_, m)| m.boxes.contains(mb)).map(|(id, m)| (&m.received, id)).collect();
+                    // In a mailbox, or with text (the server's search).
+                    let words: Vec<String> = args["filter"]["text"].as_str().map(|t| t.split_whitespace().map(str::to_lowercase).collect()).unwrap_or_default();
+                    let mb = args["filter"]["inMailbox"].as_str();
+                    let mut ids: Vec<(&i64, &String)> = self.mails.iter().filter(|(_, m)| match mb {
+                        Some(mb) => m.boxes.contains(mb),
+                        None => { let t = String::from_utf8_lossy(&m.bytes).to_lowercase(); words.iter().all(|w| t.contains(w.as_str())) }
+                    }).map(|(id, m)| (&m.received, id)).collect();
                     ids.sort_by(|a, b| b.cmp(a));
                     let (pos, limit) = (args["position"].as_u64().unwrap() as usize, args["limit"].as_u64().unwrap() as usize);
                     let page: Vec<&String> = ids.iter().skip(pos).take(limit).map(|(_, id)| *id).collect();
@@ -375,6 +380,19 @@ fn jmap_sync_changes_and_send() {
     assert!(engine.send_now(id).unwrap());
     let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert!(matches!(d, Delivery::Failed { transient: false, .. }), "{d:?}");
+
+    // Searching the server (§11.2): a message not here yet is found there,
+    // placed whole, and found here next.
+    server.borrow_mut().add(message(5, "Old deal", "The zanzibar contract."), &["arch"], &[], t0 - 400 * 86_400);
+    let q = mail_engine::search::parse("zanzibar", false);
+    assert!(engine.search(&q).unwrap().is_empty());
+    assert_eq!(engine.search_jmap(account, client.as_mut(), &q.server_words()).unwrap(), 1);
+    let hits = engine.search(&q).unwrap();
+    assert_eq!(hits.iter().map(|h| h.subject.as_str()).collect::<Vec<_>>(), ["Old deal"]);
+    assert_eq!(engine.store.list(archive, 0, 10).unwrap().iter().filter(|r| r.subject == "Old deal").count(), 1);
+    // The next pass doesn't list it twice.
+    client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!(engine.store.list(archive, 0, 10).unwrap().iter().filter(|r| r.subject == "Old deal").count(), 1);
 }
 
 /// A session with an event source, and a scripted stream.

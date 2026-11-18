@@ -15,6 +15,12 @@
 //!    `share-target`, which limend starts from that choice and nothing
 //!    else, and sends the item to it.
 //!
+//! A person with personas (personas.md) also sees, below those, the apps
+//! of each other persona their `share` switch from the sharing app's
+//! persona to it is on (Settings, Between personas), each marked with the
+//! persona it opens in (§7). portcullisd checks that switch again when
+//! limend asks it to start the target there.
+//!
 //! The app never sees the list, nor which app was chosen; the sheet never
 //! sees the content, only its title and types.
 //!
@@ -31,10 +37,14 @@ use limen::manifests::{Installed, Target};
 use limen::proto::{ChildEvent, EmbedId, WindowToken};
 use limen::share::{ToChild, ToParent};
 use portcullis_policy::share::SharePrefs;
+use portcullis_policy::{Policy, PERSONAL};
 use tabula::gate::Gate;
 
 /// uid → the person whose app it is (the launch registry's user).
 pub type Person = Box<dyn Fn(u32) -> Option<String> + Send>;
+
+/// uid → the persona its instance runs in (None: Personal).
+pub type PersonaOf = Box<dyn Fn(u32) -> Option<String> + Send>;
 
 /// What the windows should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +52,9 @@ pub enum Event {
     /// Open the sheet for `embed` (hidden until limend binds it), then call
     /// [`Sheet::ready`] with its embed token. `targets` may be empty: the
     /// sheet says no app takes this.
-    Show { embed: EmbedId, title: String, from_app: String, targets: Vec<Target> },
+    /// `from_persona`: the sharing app's persona and its colour, when
+    /// the person has personas.
+    Show { embed: EmbedId, title: String, from_app: String, from_persona: Option<(String, Option<String>)>, targets: Vec<Target> },
     /// The app detached the sheet or went: close its window.
     Close { embed: EmbedId },
 }
@@ -61,6 +73,7 @@ pub struct Sheet {
     gate: Box<dyn Gate>,
     installed: Installed,
     person: Person,
+    persona_of: PersonaOf,
     embeds: HashMap<EmbedId, Pending>,
     /// Where each person's `share.toml` is (`<dir>/<person>/share.toml`):
     /// the apps they hid and their order, from Settings.
@@ -71,12 +84,18 @@ impl Sheet {
     /// `child` is the connection that provides `share` (see
     /// [`Child::provider`]).
     pub fn new(child: Child, gate: Box<dyn Gate>, installed: Installed, person: Person) -> Self {
-        Sheet { child, gate, installed, person, embeds: HashMap::new(), prefs: "/var/db/atrium".into() }
+        Sheet { child, gate, installed, person, persona_of: Box::new(|_| None), embeds: HashMap::new(), prefs: "/var/db/atrium".into() }
     }
 
     /// Read people's choices under `dir` instead of /var/db/atrium.
     pub fn with_prefs(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.prefs = dir.into();
+        self
+    }
+
+    /// Tell which persona each app runs in (by default, all Personal).
+    pub fn with_personas(mut self, persona_of: PersonaOf) -> Self {
+        self.persona_of = persona_of;
         self
     }
 
@@ -127,17 +146,40 @@ impl Sheet {
             return None;
         };
         let p = self.embeds.get_mut(&embed)?;
-        let mut targets = self.installed.share_targets(&person, &o.mimes);
-        targets.retain(|t| t.app != p.parent_app);
-        // The person's order, without the apps they hid (Settings' Share
-        // section). A hidden app isn't shown, so it can't be chosen.
+        let from = (self.persona_of)(parent_uid);
+        let mut all = self.installed.share_targets(&person, &o.mimes);
+        let mut from_persona = None;
+        let mut crossed = Vec::new();
         if !person.is_empty() && !person.contains(['/', '\0']) && !person.starts_with('.') {
+            // The person's order, without the apps they hid (Settings'
+            // Share section). A hidden app isn't shown, so it can't be chosen.
             let prefs = SharePrefs::load(&self.prefs.join(&person).join("share.toml")).unwrap_or_default();
-            targets = prefs.shown(targets, |t| t.app.as_str());
+            all = prefs.shown(all, |t| t.app.as_str());
+            // Each other persona the person lets this one share to, in
+            // the order Settings lists them: Personal, then by name.
+            let policy = Policy::load(&self.prefs.join(&person).join("policy.toml")).unwrap_or_default();
+            if !policy.personas.is_empty() && policy.has_persona(from.as_deref()) {
+                let named = |n: Option<&str>| n.unwrap_or(PERSONAL).to_string();
+                let colour = |n: Option<&str>| n.and_then(|n| policy.personas.get(n)).map(|d| d.colour.clone());
+                from_persona = Some((named(from.as_deref()), colour(from.as_deref())));
+                let others = std::iter::once(None).chain(policy.personas.keys().map(|k| Some(k.as_str())));
+                for q in others.filter(|q| *q != from.as_deref() && policy.may_cross(from.as_deref(), *q, "share")) {
+                    // The sharing app's own other instance is a fine target.
+                    crossed.extend(all.iter().cloned().map(|mut t| {
+                        t.persona = Some(named(q));
+                        t.colour = colour(q);
+                        t
+                    }));
+                }
+            }
         }
-        eprintln!("share-sheet: {embed}: {} types, {} targets for {person}", o.mimes.len(), targets.len());
+        all.retain(|t| t.app != p.parent_app);
+        let crossings = crossed.len();
+        all.extend(crossed);
+        let targets = all;
+        eprintln!("share-sheet: {embed}: {} types, {} targets for {person} ({crossings} in other personas)", o.mimes.len(), targets.len());
         p.targets = targets.clone();
-        Some(Event::Show { embed, title: o.title, from_app: p.parent_app.clone(), targets })
+        Some(Event::Show { embed, title: o.title, from_app: p.parent_app.clone(), from_persona, targets })
     }
 
     /// The sheet's window for `embed` is open: `window` is its embed token.
@@ -145,19 +187,27 @@ impl Sheet {
         self.child.ready(embed, window)
     }
 
-    /// The person pressed `app` in the sheet. Only an app the sheet showed.
-    pub fn chose(&mut self, embed: EmbedId, app: &str) -> Result<(), String> {
+    /// The person pressed `app` in the sheet, in `persona` for a row of
+    /// another persona's. Only a row the sheet showed.
+    pub fn chose(&mut self, embed: EmbedId, app: &str, persona: Option<&str>) -> Result<(), String> {
         let p = self.embeds.get_mut(&embed).ok_or("no such sheet")?;
         if p.done {
             return Err("already answered".into());
         }
-        if !p.targets.iter().any(|t| t.app == app) {
-            return Err(format!("{app} was not offered"));
+        if !p.targets.iter().any(|t| t.app == app && t.persona.as_deref() == persona) {
+            return Err(format!("{app} in {persona:?} was not offered"));
         }
-        self.child.choose(embed, app).map_err(|e| format!("limend refused the choice ({e:?})"))?;
+        let chosen = match persona {
+            Some(q) => self.child.choose_in(embed, app, q),
+            None => self.child.choose(embed, app),
+        };
+        chosen.map_err(|e| format!("limend refused the choice ({e:?})"))?;
         p.done = true;
         self.child.emit(embed, ToParent::Chosen.encode()).map_err(|e| format!("{e:?}"))?;
-        eprintln!("share-sheet: {embed}: chose {app}");
+        match persona {
+            Some(q) => eprintln!("share-sheet: {embed}: chose {app} in {q}"),
+            None => eprintln!("share-sheet: {embed}: chose {app}"),
+        }
         Ok(())
     }
 
@@ -178,5 +228,13 @@ pub fn registry_person(path: String) -> Person {
     Box::new(move |uid| {
         let reg = portcullis_peer::AppRegistry::load(&path).ok()?;
         reg.resolve(uid).map(|(u, _)| u.to_string())
+    })
+}
+
+/// The persona of a uid's instance, from the launch registry at `path`.
+pub fn registry_persona(path: String) -> PersonaOf {
+    Box::new(move |uid| {
+        let reg = portcullis_peer::AppRegistry::load(&path).ok()?;
+        reg.persona(uid).flatten().map(str::to_string)
     })
 }

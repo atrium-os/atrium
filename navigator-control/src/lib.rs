@@ -177,6 +177,11 @@ pub enum Request {
     /// starts that persona's Navigator or brings it forward. Nothing of
     /// this window goes with it. Answered by `WindowIn`.
     NewWindow { persona: String, press: Press },
+    /// The person pressed Open on a held file (§6.4): navigatord spends the
+    /// press as for `Save`, then hands the file to portcullisd, which opens
+    /// it read-only in the person's default app for its type, in this
+    /// window's persona; nothing is written. Answered by `FileOpened`.
+    OpenFile { id: u32, press: Press },
 }
 
 /// frescod's activation token for a press (zero: none).
@@ -293,6 +298,9 @@ pub enum Event {
     /// The accounts Arca holds for `url`'s site, at most [`ACCOUNTS_MAX`];
     /// `why` when Arca couldn't be asked.
     Accounts { url: String, accounts: Vec<Account>, why: Option<String> },
+    /// `OpenFile` done: the app it opened in, or why not (the file is
+    /// dropped either way).
+    FileOpened { id: u32, app: Option<String>, why: Option<String> },
 }
 
 /// The most accounts an `Accounts` names, and the longest name.

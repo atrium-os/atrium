@@ -185,6 +185,8 @@ pub enum Out {
     /// navigatord spends (the row seen uncovered by other windows).
     Save { id: u32, press: navigator_control::Press },
     Discard { id: u32 },
+    /// Open that file in the person's app for it (§6.4), with the press.
+    OpenFile { id: u32, press: navigator_control::Press },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
@@ -691,6 +693,7 @@ impl Shell {
             }
             (Prompt::Download { id, .. }, "Save") if live => self.outbox.push(Out::Save { id: *id, press }),
             (Prompt::Download { id, .. }, "Cancel") if live => self.outbox.push(Out::Discard { id: *id }),
+            (Prompt::Download { id, .. }, "Open") if live => self.outbox.push(Out::OpenFile { id: *id, press }),
             (Prompt::Handoff { url, .. } | Prompt::OpenApp { url, .. }, "Open") if live => {
                 self.outbox.push(Out::Hand { url: url.clone(), how: navigator_control::Hand::Open, press })
             }
@@ -698,7 +701,7 @@ impl Shell {
             (Prompt::Stored { .. }, "Fetch the current version") => self.reload(),
             _ => {}
         }
-        if matches!(self.outbox.last(), Some(Out::Save { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
+        if matches!(self.outbox.last(), Some(Out::Save { .. } | Out::OpenFile { .. } | Out::Hand { .. })) && self.outbox.len() > sent {
             self.answered = key.map(|k| (k, prompt));
         }
         true
@@ -1921,7 +1924,7 @@ mod tests {
         s.live = Some(LivePage::Shown(String::new()));
         let dl = |id: u32, f: &str| Prompt::Download { id, file: f.into(), size: "1 KB".into(), origin: "atlas.example".into(), kind: "PDF".into() };
         assert!(s.ask(dl(7, "a.pdf"), 0.0));
-        assert!(s.answer_pressed(1, 600.0, Some([5; 16])), "Save");
+        assert!(s.answer_pressed(2, 600.0, Some([5; 16])), "Save");
         assert_eq!(s.outbox.pop(), Some(Out::Save { id: 7, press: [5; 16] }), "the press goes with it");
         assert!(s.store.trail().page().unwrap().asked.is_none());
         // Something else asked meanwhile: the refused one goes in front.
@@ -1930,8 +1933,8 @@ mod tests {
         let page = s.store.trail().page().unwrap();
         assert!(matches!(&page.asked, Some(a) if a.prompt.key().contains("a.pdf") && a.since_ms == 1800.0));
         assert!(page.prompts.queued.iter().any(|p| p.key().contains("b.pdf")));
-        assert!(!s.answer(1, 2000.0), "its own 500 ms again");
-        assert!(s.answer_pressed(1, 2400.0, Some([6; 16])));
+        assert!(!s.answer(2, 2000.0), "its own 500 ms again");
+        assert!(s.answer_pressed(2, 2400.0, Some([6; 16])));
         assert_eq!(s.outbox.pop(), Some(Out::Save { id: 7, press: [6; 16] }));
         // Nothing sent with a press: nothing to put back.
         s.answered = None;
@@ -1961,9 +1964,13 @@ mod tests {
         assert_eq!(s.outbox.pop(), Some(Out::Discard { id: 7 }));
         // The next one takes its own 500 ms.
         assert!(matches!(&s.store.trail().page().unwrap().asked, Some(a) if a.prompt.key().contains("b.pdf")));
-        assert!(!s.answer(1, 2700.0));
-        assert!(s.answer(1, 3200.0), "Save");
+        assert!(!s.answer(2, 2700.0));
+        assert!(s.answer(2, 3200.0), "Save");
         assert_eq!(s.outbox.pop(), Some(Out::Save { id: 8, press: [0; 16] }));
+        // Open: the held file goes to the person's app for it, with the press.
+        assert!(s.ask(dl(11, "d.pdf"), 4300.0));
+        assert!(s.answer_pressed(1, 4900.0, Some([7; 16])), "Open");
+        assert_eq!(s.outbox.pop(), Some(Out::OpenFile { id: 11, press: [7; 16] }));
         assert!(s.geo().prompt.is_none());
         assert!(!s.ask(dl(9, "a.pdf"), 9000.0), "dismissed on this page: not asked again");
         // A row that moves starts again too.

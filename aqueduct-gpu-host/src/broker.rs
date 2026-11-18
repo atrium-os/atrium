@@ -148,6 +148,7 @@ fn jail(app: &str, instance: &str, stdin: OwnedFd) -> io::Result<Proc> {
         // racct refuses rather than runs a worker uncapped.
         require_memory_limit: true,
         serves: None,
+        persona: None,
     })?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}

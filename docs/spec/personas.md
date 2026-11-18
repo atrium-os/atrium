@@ -199,7 +199,7 @@ One rule for every way data moves:
 | a link opened in another persona | the Limen/hand-off path (navigator-ui.md hand-offs) |
 | a file (picker, Scrinium copy or move, drag and drop) | Scrinium and the picker |
 | a clipboard entry | Tabula: each entry carries the persona of the instance that copied it (from its peer uid) |
-| a share-sheet offer | the broker (CLASS_BROKER) |
+| a share-sheet offer | the share sheet lists another persona's apps only with the `share` switch on; portcullisd checks it again when limend starts the target there (share-sheet.md §7) |
 | a workspace link (homes.md §5.2) | portcullisd |
 | a notification action that opens something | Forum, as a link |
 

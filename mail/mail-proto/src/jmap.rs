@@ -183,6 +183,19 @@ pub fn query_mailbox(account: &str, mailbox: &str, position: u64, limit: u64) ->
     )
 }
 
+/// The newest `limit` messages anywhere with `text` (the server's own
+/// search, §11.2), with what sync needs of each; read with
+/// [`mailbox_page`].
+pub fn query_text(account: &str, text: &str, limit: u64) -> Vec<u8> {
+    request(
+        vec![
+            json!(["Email/query", { "accountId": account, "filter": { "text": text }, "sort": [{ "property": "receivedAt", "isAscending": false }], "position": 0, "limit": limit, "calculateTotal": true }, "q"]),
+            json!(["Email/get", { "accountId": account, "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" }, "properties": EMAIL_PROPS }, "g"]),
+        ],
+        false,
+    )
+}
+
 /// What changed since `state`, and the changed messages themselves.
 pub fn email_changes(account: &str, state: &str, max: u64) -> Vec<u8> {
     request(

@@ -254,6 +254,12 @@ g "set -e
     printf '[app]\nid = \"org.test.mail2\"\nname = \"Test mail 2\"\nversion = \"1\"\nentry = \"bin/open-probe\"\n\n[[links]]\nschemes = [\"mailto\"]\n' > /root/mail2-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/mail2-bundle/atrium.toml.sig /root/mail2-bundle/atrium.toml
     opifex install /root/mail2-bundle
+    # A PDF app for a download's Open (navigator-ui.md §6.4): open-probe
+    # again, opening application/pdf.
+    rm -rf /root/pdf-bundle && cp -R /root/mail-bundle /root/pdf-bundle
+    printf '[app]\nid = \"org.test.pdfview\"\nname = \"Test PDF\"\nversion = \"1\"\nentry = \"bin/open-probe\"\n\n[[opens]]\ntypes = [\"application/pdf\"]\n' > /root/pdf-bundle/atrium.toml
+    openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/pdf-bundle/atrium.toml.sig /root/pdf-bundle/atrium.toml
+    opifex install /root/pdf-bundle
     rm -f /var/db/atrium/navtest/links.toml
     # navtest has a Work persona (personas.md §2) for the Work Navigator.
     mkdir -p /var/db/atrium/navtest; P=/var/db/atrium/navtest/policy.toml
@@ -536,6 +542,31 @@ i=0; while [ $i -lt 90 ] && [ "$(links)" != 2 ]; do sleep 3; i=$((i+3)); done
 [ "$(links)" = 2 ] && ok "the next mailto: link went straight to the default, no sheet" || bad "second hand-off: $(links) links; $(g "tail -3 $ML" | tr '\n' ';')"
 g "grep -c 'asking which' $ML" | grep -qx 1 && ok "…asked once" || bad "sheets: $(g "grep -c 'asking which' $ML")"
 g "grep -h -e monstratord $S/bootstrap.log $ML 2>/dev/null | grep -q curator" && bad "monstratord logged the link itself" || ok "nothing logged the address but the app"
+# A download (navigator-ui.md §6.4, personas.md §4.1): the survey PDF asks
+# in the prompt row. Save: navigatord spends the press and hands the file
+# to portcullisd, which writes it into navtest's Downloads (Personal's),
+# the person's with the files group, 0660, with its origin. Then Open (the
+# middle answer): portcullisd opens it read-only in the PDF app.
+NH=$(g "pw usershow navtest | cut -d: -f9" | tr -d '\r')
+g "rm -f $NH/Downloads/survey*.pdf"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 4 * 40))    # The survey (PDF)
+until_trace 'prompt=download' && ok "a link to a PDF asked in the prompt row" || bad "download: $(last)"
+shot confined-4b-download
+press $((W - 40)) $((TOP + 41 + 22))                   # Save
+i=0; while [ $i -lt 30 ] && ! g "test -f $NH/Downloads/survey.pdf"; do sleep 2; i=$((i+2)); done
+g "grep -q 'portcullisd: a download from org.atrium.navigator saved for navtest in Downloads as “survey.pdf”' $PL" && ok "Save: portcullisd wrote it into navtest's Downloads" || bad "save: $(g "grep -h -e download -e saved $PL $UL | tail -3" | tr '\n' ';')"
+[ "$(g "stat -f '%Su %Sg %Lp' $NH/Downloads/survey.pdf" | tr -d '\r')" = "navtest files-navtest 660" ] && ok "…navtest's, the files group, 0660" || bad "mode: $(g "stat -f '%Su %Sg %Lp' $NH/Downloads/survey.pdf")"
+g "getextattr -q user atrium.origin $NH/Downloads/survey.pdf" | grep -q 'https://atlas.example/files/survey.pdf' && ok "…with where it came from" || bad "origin: $(g "getextattr user atrium.origin $NH/Downloads/survey.pdf 2>&1")"
+until_trace 'prompt=- ' || bad "the row stayed: $(last)"
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 4 * 40))    # The survey again
+until_trace 'prompt=download' || bad "download again: $(last)"
+press $((W - 106)) $((TOP + 41 + 22))                  # Open (Save is 16 px in, then 8 px)
+i=0; while [ $i -lt 90 ] && ! g "grep -q 'open-probe: got name=survey.pdf' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'portcullisd: a download “survey.pdf” (application/pdf) from org.atrium.navigator opened in org.test.pdfview for navtest' $PL" && ok "Open: portcullisd opened it in the PDF app" || bad "open: $(g "grep -h -e 'download' -e REFUSED $PL | tail -3; grep -h 'not opened' $UL | tail -1" | tr '\n' ';')"
+g "grep -q 'open-probe: got name=survey.pdf type=application/pdf write=0 head=%PDF' $PL" && ok "…which read it, read-only" || bad "app: $(g "grep -h 'open-probe: got' $PL | tail -1")"
+g "grep -q 'navigator-ui: download opened in Test PDF' $UL" && ok "…and the window says so" || bad "UI: $(g "grep -h 'navigator-ui: download' $UL | tail -1")"
+g "ls $NH/Downloads/ | grep -c survey" | grep -qx 1 && ok "Open wrote nothing" || bad "Downloads: $(g "ls $NH/Downloads/")"
+until_trace 'prompt=- ' || bad "the row stayed after Open: $(last)"
 # An atrium-app: link (navigator-ui.md §6.4): the prompt names the app,
 # its publisher and what it asks for, from opifexd's Describe through the
 # Navigator jail's opifex socket. Try it, the primary answer, clears it.

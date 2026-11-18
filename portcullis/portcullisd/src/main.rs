@@ -364,7 +364,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 message: "this socket takes only WorkerCall".into() })?;
             return Ok(());
         }
-        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves } = req {
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
              * fetcher's own network would make it anyone's raw fetch. */
@@ -420,6 +420,18 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
              * embed's parent: limend has it from that parent's peer cred).
              * Neither resolving in the launch registry: refused, never the
              * shared `run_as`. */
+            /* ★ A share across personas (share-sheet.md §7): limend, for a
+             * provider it starts for an instance, may ask for it in another
+             * of that instance's person's personas, and only while the
+             * person's `share` switch from the instance's persona to that
+             * one is on (Settings, Between personas, turned on only after
+             * Sigillum confirmed it's them). Anyone else: refused. */
+            if into.is_some() && !(owner == LIMEN_USER && serves.is_some() && rule.as_ref().is_some_and(|r| r.per_instance)) {
+                eprintln!("portcullisd: ExecInstance of {app_id} in persona {into:?} DENIED to uid {uid}: only limend, for a provider");
+                write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                    message: "only limend starts a provider in another persona".into() })?;
+                continue;
+            }
             let mut as_uid = None;
             if let Some(r) = rule.as_mut().filter(|r| r.per_instance) {
                 let served = match serves {
@@ -428,11 +440,26 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 };
                 let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
                 let inst = reg.resolve(served).map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(served).flatten().map(String::from)));
-                let Some((person, served_app, persona)) = inst else {
+                let Some((person, served_app, mut persona)) = inst else {
                     write_response(&mut writer, &Response::LaunchFailed { stage: "worker".into(),
                         message: format!("{app_id} serves an app instance, and uid {served} is none") })?;
                     continue;
                 };
+                if let Some(to) = into.as_deref() {
+                    let to = (to != portcullis_policy::PERSONAL).then_some(to);
+                    let pol = Policy::load(&Policy::user_path(&person)).unwrap_or_default();
+                    let shown = |p: Option<&str>| p.unwrap_or(portcullis_policy::PERSONAL).to_string();
+                    if to == persona.as_deref() || !pol.has_persona(to) || !pol.may_cross(persona.as_deref(), to, "share") {
+                        eprintln!("portcullisd: {app_id} for {person}'s {served_app} in {} REFUSED: sharing from {} to {} is off",
+                                  shown(to), shown(persona.as_deref()), shown(to));
+                        write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                            message: format!("cap.share.crossing: sharing from {} to {} is off (Settings, Apps, Between personas)",
+                                             shown(persona.as_deref()), shown(to)) })?;
+                        continue;
+                    }
+                    eprintln!("portcullisd: {app_id} for {person}'s {served_app}: a share from {} to {}", shown(persona.as_deref()), shown(to));
+                    persona = to.map(str::to_string);
+                }
                 // One allocation at a time: two pages at once must not both
                 // allocate a uid for the same instance.
                 static WORKER_UIDS: Mutex<()> = Mutex::new(());
@@ -622,6 +649,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Downloads (personas.md §4.1): from the Navigator, into its
          * persona's Downloads; a sealed memory file follows. */
+        if let Request::OpenDownload { name } = req {
+            handle_open_download(uid, &owner, &name, &shared, &mut writer, &reader)?;
+            continue;
+        }
         if let Request::SaveDownload { name, origin } = req {
             handle_save_download(uid, &owner, &name, &origin, &mut writer, &reader)?;
             continue;
@@ -1481,6 +1512,81 @@ fn handle_save_download(
         }
         Err(e) => refuse(writer, e),
     }
+}
+
+/// OpenDownload (navigator-ui.md §6.4): the Navigator's file, opened
+/// read-only in the person's default app for its type, in the caller's
+/// persona.
+fn handle_open_download(
+    uid:    u32,
+    owner:  &str,
+    name:   &str,
+    shared: &Mutex<Tenants>,
+    writer: &mut UnixStream,
+    reader: &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    use portcullis_policy::opens::Defaults;
+    use portcullisd::opens::{self, Delivery, Hub};
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: download open REFUSED to uid {uid}: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
+    if !caller.as_deref().is_some_and(launch::app_is_navigator) {
+        return refuse(writer, format!("cap.navigator_broker.denied: {} may not open downloads",
+                                      caller.as_deref().unwrap_or("a process that is not a launched app")));
+    }
+    let persona = reg.persona(uid).flatten().map(String::from);
+    if name.is_empty() || name.contains(['/', '\0']) || name.len() > atrium_open::MAX_NAME || name.starts_with('.') || name.chars().any(char::is_control) {
+        return refuse(writer, "the file's name, not a path".into());
+    }
+    write_response(writer, &Response::ReadyForFds)?;
+    if !reader.buffer().is_empty() {
+        return refuse(writer, "protocol violation: data buffered before the descriptor".into());
+    }
+    let mut fds = match portcullis_ipc::recv_fds(reader.get_ref(), 1) {
+        Ok(v) if v.len() == 1 => v,
+        Ok(v) => return refuse(writer, format!("expected one descriptor, got {}", v.len())),
+        Err(e) => return refuse(writer, format!("recv_fds: {e}")),
+    };
+    let fd = fds.pop().unwrap();
+    let head = match opens::check_sealed(&fd) {
+        Ok(h) => h,
+        Err(why) => return refuse(writer, format!("“{name}”: {why}")),
+    };
+    let d = atrium_types::detect(name, &head);
+    let Some(t) = d.known().filter(|t| t.family.declarable()) else {
+        return refuse(writer, d.question().unwrap_or_else(|| "No app opens this kind of file.".into()));
+    };
+    let apps = launch::apps_opening(t.mime);
+    let defaults = Defaults::load(&Defaults::user_path(owner)).unwrap_or_default();
+    let app = defaults.app_for(t.mime, |id| apps.iter().any(|(a, _, _)| a == id)).or_else(|| apps.first().map(|a| a.0.clone()));
+    let Some(app) = app else {
+        return refuse(writer, format!("No app opens {} yet", t.words));
+    };
+    let app_name = apps.iter().find(|a| a.0 == app).map(|a| a.1.clone()).unwrap_or_else(|| app.clone());
+    if let Err(why) = may_run_unasked(&app, owner, shared) {
+        return refuse(writer, why);
+    }
+    // The app's instance in the Navigator's persona (one that spans
+    // personas has just the one).
+    let persona = if launch::not_instanced(&app).is_some() { None } else { persona };
+    let key = opens::channel_key(&app, persona.as_deref());
+    if let Err(e) = opens::narrow(&fd, false) {
+        return refuse(writer, format!("cap_rights_limit: {e}"));
+    }
+    let hub = Hub::global();
+    if let Err(e) = hub.listen(&key) {
+        return refuse(writer, format!("{key}'s document channel: {e}"));
+    }
+    match hub.deliver(owner, &key, name, t.mime, false, fd) {
+        Ok(Delivery::Sent) => {}
+        Ok(Delivery::Queued) => start_for_instance(&app, persona.as_deref(), owner, "to open a download"),
+        Err(e) => return refuse(writer, e.to_string()),
+    }
+    eprintln!("portcullisd: a download “{name}” ({}) from {} opened in {key} for {owner}", t.mime, caller.as_deref().unwrap_or("?"));
+    write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })
 }
 
 /// OpenAttachment (mail.md §8.2): the caller holds `open-attachments`;
@@ -3250,7 +3356,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } => Response::Error {
+        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } | Request::OpenDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },
