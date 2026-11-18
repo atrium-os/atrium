@@ -2435,6 +2435,22 @@ pub struct GlyphRunParams {
     pub glyphs: Vec<GlyphInstance>,
 }
 
+/// `GlyphInstance::atlas_u` bit: the glyph is a colour glyph (emoji) on
+/// the run's colour atlas, slot [`color_atlas_slot`] of the run's
+/// `atlas_slot_id`, an RGBA8 texture drawn in its own colours at the run's
+/// opacity (docs/spec/fonts.md §6). Only frescod's own text sets it; a
+/// client's run has it cleared.
+pub const GLYPH_COLOR: u32 = 0x8000_0000;
+
+/// A colour atlas's size in texels.
+pub const COLOR_ATLAS_W: u32 = 512;
+pub const COLOR_ATLAS_H: u32 = 512;
+
+/// The colour atlas slot paired with glyph atlas slot `slot`.
+pub const fn color_atlas_slot(slot: u32) -> u32 {
+    slot ^ 0x0800_0000
+}
+
 /// Params for `scene_ops::ATRIUM_TEXT_GLYPH_TURN`, sent with the node id
 /// of an existing glyph run: the run drawn turned about its origin `(x, y)`.
 ///

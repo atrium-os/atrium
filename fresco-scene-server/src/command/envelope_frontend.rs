@@ -807,10 +807,10 @@ impl EnvelopeFrontend {
         for a in atlas_uploads {
             match a {
                 PendingAtlasUpload::Full {
-                    slot_id, width, height, pixels,
+                    slot_id, width, height, pixels, rgba,
                 } => uploads.push(UploadRequest::Texture {
                     slot_id, bytes: pixels, width, height,
-                    format: ash::vk::Format::R8_UNORM,
+                    format: if rgba { ash::vk::Format::R8G8B8A8_SRGB } else { ash::vk::Format::R8_UNORM },
                 }),
                 PendingAtlasUpload::Region {
                     slot_id, dst_x, dst_y, width, height, pixels,
@@ -1371,8 +1371,13 @@ impl EnvelopeFrontend {
                 s.fill_nodes.remove(&p.node_id);
             }
             scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
-                let inner: GlyphRunParams = decode(&p.params)
+                let mut inner: GlyphRunParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
+                // Colour glyphs are frescod's own text's: a client's run
+                // names only its own atlas.
+                for g in &mut inner.glyphs {
+                    g.atlas_u &= !fresco_protocol::GLYPH_COLOR;
+                }
                 s.leaf_replaces(p.node_id);
                 s.glyph_run_nodes.insert(p.node_id, inner);
                 s.glyph_turns.remove(&p.node_id);
@@ -1719,9 +1724,7 @@ impl EnvelopeFrontend {
                 [p.r, p.g, p.b, p.a], &p.text, p.weight,
             ).ok_or(DispatchError::BadPayload)?
         };
-        if let Some(up) = pending {
-            self.pending_atlas_uploads.push(up);
-        }
+        self.pending_atlas_uploads.extend(pending);
         let bytes = crate::budget::glyph_run_bytes(run.glyphs.len());
         let s = self.ensure_window_state(win_id);
         s.leaf_replaces(p.node_id);
