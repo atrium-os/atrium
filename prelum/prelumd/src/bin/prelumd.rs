@@ -3,7 +3,7 @@
 //! ```text
 //! atrium-prelumd [--socket PATH] [--state DIR] [--spool DIR] [--network NAME]
 //!         [--direct BIN_DIR] [--jaild PATH] [--rctl]
-//!         [--mdns-legacy ADDR:PORT]
+//!         [--netconf DIR | --mdns-legacy ADDR:PORT]
 //! ```
 //!
 //! Serves `CLASS_PRINT` on `--socket`. Workers run through jaild
@@ -11,7 +11,10 @@
 //! directory (development and the Linux tests only: no jail at all).
 //! `--network` names the network for the pin (§7.3) until atrium-net
 //! says it (R3). `--rctl` caps each render jail (1 GB, one CPU); it needs
-//! `kern.racct.enable=1` and jaild's `allow_rctl`. `--mdns-legacy` looks
+//! `kern.racct.enable=1` and jaild's `allow_rctl`. Printers on the LAN
+//! (§7.1) are looked for on the two mDNS sockets atrium-net hands out on
+//! atrium-netconf's root-only `print-discovery` socket under `--netconf`
+//! (default `/atrium/sockets`), asked each time the list opens; `--mdns-legacy` looks
 //! for printers by asking one mDNS responder by unicast (RFC 6762 §6.7;
 //! `127.0.0.1:5353` reaches the host's Avahi): development and the Linux
 //! tests, where atrium-net isn't there to hand over the LAN's sockets.
@@ -39,6 +42,7 @@ fn main() -> ExitCode {
     let mut rctl = false;
     let mut jaild = "/var/run/atrium/jaild.sock".to_string();
     let mut mdns_legacy: Option<std::net::SocketAddr> = None;
+    let mut netconf = PathBuf::from("/atrium/sockets");
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         if k == "--rctl" {
@@ -56,6 +60,7 @@ fn main() -> ExitCode {
             "--network" => network = v,
             "--direct" => direct = Some(v.into()),
             "--jaild" => jaild = v,
+            "--netconf" => netconf = v.into(),
             "--mdns-legacy" => match v.parse() {
                 Ok(a) => mdns_legacy = Some(a),
                 Err(_) => {
@@ -99,7 +104,12 @@ fn main() -> ExitCode {
             let r = s.try_clone()?;
             Ok(MdnsSockets { recv: r.into(), send: s.into(), legacy: true })
         })),
-        None => None,
+        None => Some(Box::new(move || {
+            use atrium_netconf::{client::Client, Grant};
+            let mut c = Client::connect(&Client::path(&netconf, Grant::PrintDiscovery))?;
+            let (_iface, recv, send) = c.print_discovery().map_err(|f| std::io::Error::other(f.1))?;
+            Ok(MdnsSockets { recv, send, legacy: false })
+        })),
     };
     let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()), mdns }, launcher);
     if let Some(dir) = socket.parent() {

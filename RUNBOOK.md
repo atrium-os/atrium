@@ -5952,6 +5952,13 @@ Print service (R2, spec §11.2), against the same oracle:
   and checks jobs from the guest plus the jails: render with `ip4=disable`,
   ipp in a vnet whose `atrium/<jail>` anchor passes only the printer's
   address and port, no jail left after a job. Ends with `PASS`.
+- Finding printers (R3, spec §11.3). Host: `sh scripts/prelum-r3-check.sh`
+  (Avahi by legacy unicast, `--mdns-legacy 127.0.0.1:5353`; at most two
+  test printers, since Avahi cuts legacy answers at 512 bytes). VM: boot it
+  with the fake LAN once (`sh scripts/atrium-net-gate.sh vm`), then
+  `sh scripts/prelum-r3-vm.sh`. That runs atrium-net on vtnet1 with
+  `--no-egress-group` so the ipp jails' NAT stays on vtnet0, and lan.py's
+  `mdns-printer 10.0.2.2 8661` / `mdns-flood`. Ends with `PASS`.
 - By hand: `atrium-prelumd --socket S --state D --spool D [--direct BIN]`,
   then `prelumctl --socket S add ipps://HOST/ipp/print`, `print FILE
   --printer 1 [--wait]`, `jobs`, `cancel N`, `repin 1`.
