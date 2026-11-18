@@ -347,12 +347,13 @@ parse = "../mail-parse"      # its folder, or its Cargo.toml
 `cargo atrium bundle --sign <key.pem>` makes the installable bundle
 (atrium-bundle-format.md): it builds release, puts `atrium.toml`, the core
 and each worker at their `entry` paths and the icon (an SVG path) in a
-tree, and adds the runtime closure: every library the programs need,
-read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
-the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others,
-pkg's `/usr/local/lib` among them, go to `usr/lib/`, since an app's jail
-has no `ld-elf.so.hints` and its loader looks only in `/lib` and
-`/usr/lib`. The programs are stripped (`--no-strip` keeps them as
+tree, and adds the libraries the programs need that the base system
+lacks, read from their `DT_NEEDED` and `DT_RUNPATH` (never by running
+them). Base libraries (`/lib`, `/usr/lib`) and the loader aren't shipped:
+opifex puts the machine's own copies into the app tree at install and
+refreshes them after each base update. The others, pkg's `/usr/local/lib`
+among them, go to `usr/lib/`, since an app's jail has no
+`ld-elf.so.hints` and its loader looks only in `/lib` and `/usr/lib`. The programs are stripped (`--no-strip` keeps them as
 built); their debug info goes to `<tree>.debug/`, linked by
 `.gnu_debuglink`, for the debugger. Then `opifex pack` writes the content
 index and the signature (the key may be PKCS#8 or SEC1 PEM), and `opifex

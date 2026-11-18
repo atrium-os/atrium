@@ -5,16 +5,17 @@
 #   ARCH=amd64 sh scripts/cloud-vm.sh up
 #   sh scripts/vm-bundle-check.sh
 # It installs the current opifex, atrium-jaild, portcullisd and portcullis.
-# Ends "bundle: N failed". Passed 8/8 on 2026-11-18 in a cloud amd64 VM
+# Ends "bundle: N failed". Passed 8/8 on 2026-11-18 (base files from the machine) in a cloud amd64 VM
 # (GENERIC kernel).
 #
 #   - `cargo atrium new` (app template), two library functions moved into
 #     workers with `cargo atrium worker add --from` (one fd, one message);
 #   - `cargo atrium bundle --sign` cross-builds it against the VM's sysroot
-#     and writes the tree (programs, the libraries they need, the loader),
-#     packs, signs and archives it to an .insula;
+#     and writes the tree (the programs; base libraries and the loader are
+#     the machine's, added at install), packs, signs and archives it to an
+#     .insula;
 #   - in the VM the .insula unpacks and installs through the trust gate with
-#     the publisher's key, with nothing left for install to resolve;
+#     the publisher's key, and the app tree has the machine's libc and rtld;
 #   - launched, its core calls both workers, each in a jail of its own, and
 #     prints what came back; no worker jail is left afterwards.
 # No frescod: the core is a probe that opens no window, and the manifest's
@@ -89,10 +90,14 @@ T="$G/out/$APP"
     scp -q $K -P 2222 root@localhost:/libexec/ld-elf.so.1 "$VMDIR/sysroot/libexec/"; } || die "no loader for the sysroot"
 (cd "$P" && RUSTFLAGS= "$CA" atrium bundle --sysroot "$VMDIR/sysroot" --sign "$G/key8.pem" --out "$T" -- -q >"$G/bundle.log" 2>&1) \
     || die "bundle: $(tail -5 "$G/bundle.log")"
-for f in bin/bundle-demo bin/bundle-demo-count bin/bundle-demo-shout lib/libc.so.7 lib/libthr.so.3 libexec/ld-elf.so.1 content.index atrium.toml.sig; do
+for f in bin/bundle-demo bin/bundle-demo-count bin/bundle-demo-shout content.index atrium.toml.sig; do
     [ -f "$T/$f" ] || bad "no $f in the bundle"
 done
-[ -f "$T.insula" ] && ok "bundle: the programs, their libraries and the loader, signed, $(du -h "$T.insula" | cut -f1) .insula" || bad "no .insula"
+# Base libraries and the loader come from the machine at install (opifex.md §7.5).
+for f in lib/libc.so.7 lib/libthr.so.3 libexec/ld-elf.so.1; do
+    [ -e "$T/$f" ] && bad "$f shipped: base files come from the machine"
+done
+[ -f "$T.insula" ] && ok "bundle: the programs, signed, no base libraries, $(du -h "$T.insula" | cut -f1) .insula" || bad "no .insula"
 
 echo "=== install"
 B=/var/tmp/bundle-gate
@@ -130,11 +135,11 @@ test -S /atrium/sockets/workers/workers.sock
 EOS
 [ $? = 0 ] && ok "portcullisd up, with the worker-call socket" || die "setup: $(V "tail -3 $LOG")"
 out=$(V "opifex uninstall $APP >/dev/null 2>&1; cd $B && opifex unarchive $APP.insula tree >/dev/null && opifex install $B/tree 2>&1")
-case "$out" in *"installed $APP"*"0 runtime file(s) resolved"*) ok "the .insula installs, signed, with its closure: nothing to resolve" ;;
+case "$out" in *"installed $APP"*) ok "the .insula installs, signed" ;;
                *) bad "install: $out" ;; esac
 APPS=/var/lib/atrium/apps
-r=$(V "cmp -s $B/tree/lib/libc.so.7 $APPS/$APP/lib/libc.so.7 && echo same")
-[ "$r" = same ] && ok "its own libc is what's installed" || bad "libc: $r"
+r=$(V "cmp -s /lib/libc.so.7 $APPS/$APP/lib/libc.so.7 && cmp -s /libexec/ld-elf.so.1 $APPS/$APP/libexec/ld-elf.so.1 && echo same")
+[ "$r" = same ] && ok "the machine's own libc and loader are in the app tree" || bad "base files: $r"
 
 echo "=== launch"
 V ": > $B/app.log; daemon -f -o $B/app.log su -m alice -c 'portcullis launch --no-prompt $APP'"
