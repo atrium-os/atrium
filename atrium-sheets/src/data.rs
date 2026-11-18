@@ -66,6 +66,10 @@ pub enum DataCmd {
     DeleteRows,
     /// The selection's columns.
     DeleteCols,
+    /// The selection as one merged cell, its top-left's value centred across it.
+    Merge,
+    /// The merged areas the selection meets, back to separate cells.
+    Unmerge,
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
@@ -178,6 +182,10 @@ fn chart_at(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<usize> {
     })
 }
 
+/// The most cells one merge may span (a whole column of a million rows is
+/// fine; a whole sheet is not).
+const MAX_MERGE_CELLS: u64 = 1 << 24;
+
 /// The Data menu as it reads now, with the command of each item.
 pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Option<DataCmd>)> {
     let wb = &d.wb;
@@ -199,6 +207,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
+        if wb.merges_in(&Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }).next().is_some() {
+            (MenuItem::new("Unmerge Cells").separated(), Some(DataCmd::Unmerge))
+        } else {
+            (MenuItem::new("Merge Cells").enabled(nr > 1 || nc > 1).separated(), Some(DataCmd::Merge))
+        },
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
@@ -354,6 +367,48 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
     match cmd {
+        DataCmd::Merge => {
+            let r = d.wb.grow_to_merges(Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
+            if r.cells() < 2 {
+                return Err("Select two or more cells to merge.".into());
+            }
+            if r.cells() > MAX_MERGE_CELLS {
+                return Err("That's too many cells to merge into one.".into());
+            }
+            // As Excel does: only the top-left value stays (the others are cleared).
+            let mut others = 0u64;
+            d.wb.each(&r, &mut |row, col, v| {
+                if (row, col) != (r.r0, r.c0) && v != officina_grid::Value::Empty {
+                    others += 1;
+                }
+            });
+            let mut ops = Vec::new();
+            if r.c1 > r.c0 {
+                ops.push(GridOp::clear(Rect { r0: r.r0, r1: r.r0, c0: r.c0 + 1, ..r }));
+            }
+            if r.r1 > r.r0 {
+                ops.push(GridOp::clear(Rect { r0: r.r0 + 1, ..r }));
+            }
+            ops.push(GridOp::restyle(&d.wb, Rect { r1: r.r0, c1: r.c0, ..r }, |st| officina_grid::style::Style { h_align: officina_grid::style::HAlign::Center, ..st.clone() }));
+            let mut list: Vec<Rect> = d.wb.merges(s).iter().filter(|m| !m.intersects(&r)).copied().collect();
+            list.push(r);
+            ops.push(GridOp::Merges { sheet: s, list });
+            d.run("Merge Cells", ops);
+            Ok(match others {
+                0 => "Cells merged.".into(),
+                1 => "Cells merged; the one other value in them was cleared.".into(),
+                n => format!("Cells merged; the {n} other values in them were cleared."),
+            })
+        }
+        DataCmd::Unmerge => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let list: Vec<Rect> = d.wb.merges(s).iter().filter(|m| !m.intersects(&r)).copied().collect();
+            if list.len() == d.wb.merges(s).len() {
+                return Ok("Nothing merged there.".into());
+            }
+            d.run("Unmerge Cells", vec![GridOp::Merges { sheet: s, list }]);
+            Ok("Cells unmerged.".into())
+        }
         DataCmd::InsertRows | DataCmd::InsertCols | DataCmd::DeleteRows | DataCmd::DeleteCols => {
             use officina_grid::shift::{shift_op, Axis};
             let (axis, at, n, what) = match cmd {
@@ -629,6 +684,32 @@ mod tests {
     }
     fn cell(d: &Doc, r: u32, c: u32) -> String {
         d.wb.formatted(CellAddr::new(0, r, c)).text
+    }
+
+    #[test]
+    fn merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back() {
+        let mut d = doc();
+        let sel = CellRange { r0: 1, c0: 0, r1: 2, c1: 1 };
+        let titles = menu(&d, sel, (1, 0)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
+        assert!(titles.iter().any(|t| t == "Merge Cells"), "{titles:?}");
+        let before = (cell(&d, 1, 0), cell(&d, 1, 1), cell(&d, 2, 0));
+        run(&mut d, sel, (1, 0), DataCmd::Merge);
+        assert!(d.status.starts_with("Cells merged; the 3 other values"), "{}", d.status);
+        assert_eq!(d.wb.merges(0), &[Rect { sheet: 0, r0: 1, c0: 0, r1: 2, c1: 1 }]);
+        assert_eq!(cell(&d, 1, 0), before.0);
+        assert_eq!(cell(&d, 1, 1), "");
+        // The cursor in it offers Unmerge.
+        let titles = menu(&d, one(2, 1), (2, 1)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
+        assert!(titles.iter().any(|t| t == "Unmerge Cells"), "{titles:?}");
+        run(&mut d, one(2, 1), (2, 1), DataCmd::Unmerge);
+        assert!(d.wb.merges(0).is_empty());
+        assert_eq!(cell(&d, 1, 1), "");
+        // Undo twice: merged again, then every value back.
+        assert!(d.undo());
+        assert_eq!(d.wb.merges(0).len(), 1);
+        assert!(d.undo());
+        assert!(d.wb.merges(0).is_empty());
+        assert_eq!((cell(&d, 1, 0), cell(&d, 1, 1), cell(&d, 2, 0)), before);
     }
 
     #[test]

@@ -2805,8 +2805,8 @@ codes with multi-byte characters near the end, fixed in `numfmt.rs`). A 65,536
 record by record, plain and RC4 CryptoAPI protected (`xls::sample`), and Sheets
 opens both through the real converter.
 
-Open: the missing functions above; merged cells and comments once the grid
-has them; `.xls` charts and pictures; Excel 4 macro sheets.
+Open: the missing functions above; comments once the grid has them (merged
+cells: §16.79); `.xls` charts and pictures; Excel 4 macro sheets.
 
 ### 16.43 O7c as built (2026-11-15): `.doc` import
 
@@ -3546,7 +3546,7 @@ Shankar asked whether each sheet has a memory budget or only the workbook, and t
 - **One budget per workbook, not per sheet.** A per-sheet cap would refuse one legitimately large sheet while thousands of small ones could still exhaust memory. `Workbook::memory_bytes()` estimates the cells' memory (chunks, strings, styles, sizes, and every formula cell's result whether computed yet or not) in about 0.2 ms at 20 M cells (167 MB estimated, 197 MB resident). Sheets' budget is half the machine's memory, between 1 and 16 GiB; a change (typing, paste, fill, insert, redo) that takes the workbook past it is undone at once and the status bar says so, so a formula filled down two billion rows is refused before anything computes it.
 - Opening a file (converter, load and its recalculation) and reading one for Compare with… run on a thread of their own since the same day (`files::Loading`): the window keeps answering with “Reading …” in the status line, and a password, an error or the document arrives when the thread is done (`a_slow_file_is_read_while_the_caller_carries_on`: a 20,000-row volatile SUMIF file reads for 6 s, each poll under 5 ms).
 - At start the window shows at once: a document restored from its autosave (`files::Loading::restore`) or a file named on the command line is read on its thread too (`an_autosave_is_restored_on_its_own_thread`).
-- Not yet: native files load without a cell cap (the converters have theirs: §5), the Sheets process has no memory limit of its own until documents run in their own jails, and wildcard and range criteria still walk their range per row.
+- Not yet: the Sheets process has no memory limit of its own until documents run in their own jails, and wildcard and ordered-text criteria still walk their range per row (native files load within the budget: §16.76; ordered number criteria: §16.77).
 
 Gates: `officina-grid` `tests/ifcache.rs`, `tests/budget.rs`; `atrium-sheets` `a_slow_edit_hands_the_window_back_and_greys_what_is_not_done`, `a_change_past_the_memory_budget_is_not_made`.
 
@@ -3611,6 +3611,18 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 - **Gates:** `officina-pdf/tests/print.rs` (pages, look and text read back and drawn by Folium); `atrium_sheets::print` tests; `scripts/prelum-r4-vm.sh` stages `sheets` and `slides`.
 
 Not yet: print areas, repeated titles, charts and pictures on sheets; speaker notes and handouts.
+
+### 16.79 Merged cells (2026-11-18)
+
+- **Engine** (`officina-grid::merges`). A sheet keeps merged areas: disjoint, at least two cells each, sorted. `Workbook::merges`, `merge_at`, `merges_in` and `grow_to_merges` read them. `GridOp::Merges { sheet, list }` (journal tag 16) swaps them in whole as one undo step, and the native file keeps them in chunk `MERGES` (16). Cells under a merge keep what they hold, as Excel's and LibreOffice's files do. Inserted and deleted rows and columns move, grow or shrink a merge. One left as a single cell is no longer merged. A merge counts toward a sheet not being "bare", and Delete Sheet clears its merges first.
+- **Files.** `.xlsx` `<mergeCells>` and `.ods` `table:number-columns-spanned` / `number-rows-spanned` are read and written. Before this they were reported as "merged cells shown unmerged". Overlapping or one-cell areas in a file are dropped and reported. LibreOffice opens ours in both formats, and we read back what it saves (`officina-convert/tests/merges.rs`).
+- **Sheets.**
+  - **Drawing:** the grid draws a merged area as one cell, with the top-left cell's fill, borders, icon and text across the whole area and no grid lines inside. This is a layer above the tiles, so an area crossing tiles draws whole.
+  - **Moving around:** a press inside one puts the cursor on its top-left, and the arrows step over it as one cell. A selection that meets part of one shows all of it.
+  - **Commands:** Data ▸ Merge Cells merges the selection (grown to whole merges). As Excel does, it keeps the top-left value, clears the others (the status says how many) and centres it. Data ▸ Unmerge Cells undoes merges the selection meets. Each is one undo step.
+  - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
+- **Not yet:** printing merged areas as one cell (the printing thread, through `GridSource::merge_at`), the editor spanning the area while typing, and Excel's "Center Across Selection" without merging.
+- **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

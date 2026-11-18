@@ -8,7 +8,7 @@ use officina_grid::style::{HAlign, Line, StyleId, StyleTable};
 use officina_grid::Value;
 use pergola::Color;
 use pergola::theme::palette;
-use pergola::widgets::{CellAlign, CellIcon, CellView, GridSource};
+use pergola::widgets::{CellAlign, CellIcon, CellRange, CellView, GridSource};
 
 use crate::doc::Doc;
 
@@ -373,6 +373,15 @@ impl SheetSource {
 }
 
 impl GridSource for SheetSource {
+    fn merge_at(&self, r: u32, c: u32) -> Option<CellRange> {
+        let d = self.doc.borrow();
+        d.wb.merge_at(CellAddr::new(d.sheet, r, c)).map(|m| CellRange { r0: m.r0, c0: m.c0, r1: m.r1, c1: m.c1 })
+    }
+    fn merges_in(&self, g: CellRange) -> Vec<CellRange> {
+        let d = self.doc.borrow();
+        let rect = officina_grid::addr::Rect { sheet: d.sheet, r0: g.r0, c0: g.c0, r1: g.r1, c1: g.c1 };
+        d.wb.merges_in(&rect).map(|m| CellRange { r0: m.r0, c0: m.c0, r1: m.r1, c1: m.c1 }).collect()
+    }
     fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
         let mut out = self.data_marks(view, theme);
         let d = self.doc.borrow();

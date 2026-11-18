@@ -283,6 +283,15 @@ pub trait GridSource {
     }
     /// Ctrl + arrow from (`r`, `c`) by (`dr`, `dc`): where the data ends.
     /// The default goes to the sheet's edge.
+    /// The merged area holding cell (`r`, `c`), drawn as one cell with the
+    /// top-left's content; the cursor treats it as one.
+    fn merge_at(&self, _r: u32, _c: u32) -> Option<CellRange> {
+        None
+    }
+    /// The merged areas meeting `range`.
+    fn merges_in(&self, _range: CellRange) -> Vec<CellRange> {
+        Vec::new()
+    }
     fn data_edge(&self, r: u32, c: u32, dr: i32, dc: i32) -> (u32, u32) {
         let r = match dr.signum() {
             -1 => 0,
@@ -583,52 +592,43 @@ impl GridView {
                                 continue;
                             }
                             for col in c0..=c1 {
+                                if src.merge_at(row, col).is_some() {
+                                    // Drawn whole with the merged areas below.
+                                    continue;
+                                }
                                 let Some(cv) = src.cell(row, col) else { continue };
                                 let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
                                 let (cx, cy) = at(xl, yt);
                                 let (cw, ch) = ((xr - xl) as f32, (yb - yt) as f32);
-                                if let Some(f) = cv.fill {
-                                    ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: f, radius: 0.0 });
-                                }
-                                if let Some((share, c)) = cv.bar {
-                                    let w = ((cw - 4.0) * share.clamp(0.0, 1.0)).max(0.0);
-                                    ctx.add(Node::Rect { rect: Rect::new(cx + 2.0, cy + 2.0, q(w as f64), (ch - 5.0).max(0.0)), fill: c, radius: 0.0 });
-                                }
-                                for (k, b) in cv.borders.iter().enumerate() {
-                                    let Some((w, c)) = *b else { continue };
-                                    let r = match k {
-                                        0 => Rect::new(cx - 1.0, cy - 1.0, w, ch + 1.0),
-                                        1 => Rect::new(cx + cw - w, cy - 1.0, w, ch + 1.0),
-                                        2 => Rect::new(cx - 1.0, cy - 1.0, cw + 1.0, w),
-                                        _ => Rect::new(cx - 1.0, cy + ch - w, cw + 1.0, w),
-                                    };
-                                    ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
-                                }
-                                // The icon at the left; text keeps clear of it.
-                                let mut lead = cv.indent as f32 * INDENT_STEP;
-                                if let Some((icon, c)) = cv.icon {
-                                    let s = (ch - 6.0).clamp(0.0, 14.0);
-                                    if s >= 6.0 && cw > s + 4.0 {
-                                        draw_icon(ctx, icon, c, t.border_default(), cx + 3.0 + lead, cy + q(((ch - s) / 2.0) as f64), s);
-                                        lead += s + 3.0;
-                                    }
-                                }
-                                if cv.text.is_empty() {
-                                    continue;
-                                }
-                                let style = text(TEXT_SIZE, if cv.bold { Weight::Semibold } else { Weight::Regular }, cv.color.unwrap_or(t.text_primary()));
-                                let (shown, w) = fit_text(&cv, cw - 2.0 * PAD - lead, &style);
-                                let tx0 = match cv.align {
-                                    CellAlign::Left => cx + PAD + lead,
-                                    CellAlign::Center => cx + q(((cw - w) / 2.0) as f64),
-                                    CellAlign::Right => cx + q((cw - PAD - w) as f64),
-                                };
-                                let lh = TEXT_SIZE * 1.3;
-                                ctx.add(Node::Text { rect: Rect::new(tx0, cy + q(((ch - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
+                                draw_cell(ctx, &t, &cv, cx, cy, cw, ch);
                             }
                         }
                         ctx.pop();
                     }
+                }
+            }
+            // Merged areas meeting the resident tiles: a plain ground over the
+            // grid lines inside, then the top-left cell drawn across the area.
+            if tiles_r.0 <= tiles_r.1 && tiles_c.0 <= tiles_c.1 && rows > 0 && cols > 0 {
+                let vis = CellRange { r0: tiles_r.0 * TILE_ROWS, c0: tiles_c.0 * TILE_COLS, r1: ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1, c1: ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 };
+                let merged = src.merges_in(vis);
+                if !merged.is_empty() {
+                    ctx.key(u64::MAX - 1);
+                    let layer = ctx.push(Node::vstack(local, 0.0));
+                    ctx.set_flex(layer, FlexStyle { free: true, ..FlexStyle::default() });
+                    for m in merged {
+                        let (cx, cy) = at(src.col_left(m.c0), src.row_top(m.r0));
+                        let (ex, ey) = at(src.col_left(m.c1 + 1), src.row_top(m.r1 + 1));
+                        let (cw, ch) = (ex - cx, ey - cy);
+                        if cw <= 1.0 || ch <= 1.0 {
+                            continue;
+                        }
+                        ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw - 1.0, ch - 1.0), fill: t.bg_canvas(), radius: 0.0 });
+                        if let Some(cv) = src.cell(m.r0, m.c0) {
+                            draw_cell(ctx, &t, &cv, cx, cy, cw, ch);
+                        }
+                    }
+                    ctx.pop();
                 }
             }
             // The overlay: selection, active cell, editor.
@@ -639,8 +639,11 @@ impl GridView {
                 // The selection, cut to the resident tiles (it can be a
                 // whole column of a billion rows).
                 let vis = CellRange { r0: tiles_r.0 * TILE_ROWS, c0: tiles_c.0 * TILE_COLS, r1: ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1, c1: ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 };
+                // A selection meeting part of a merged area shows all of it.
+                let sel = grow_to_merges(&*src, sel);
+                let one = src.merge_at(gs.cursor.0, gs.cursor.1).unwrap_or(CellRange::of(gs.cursor, gs.cursor));
                 let cut = CellRange { r0: sel.r0.max(vis.r0), c0: sel.c0.max(vis.c0), r1: sel.r1.min(vis.r1), c1: sel.c1.min(vis.c1) };
-                if (sel.r0 != sel.r1 || sel.c0 != sel.c1) && cut.r0 <= cut.r1 && cut.c0 <= cut.c1 {
+                if sel != one && cut.r0 <= cut.r1 && cut.c0 <= cut.c1 {
                     let (sx, sy) = at(src.col_left(cut.c0), src.row_top(cut.r0));
                     let (ex, ey) = at(src.col_left(cut.c1 + 1), src.row_top(cut.r1 + 1));
                     let mut fill = t.accent_fill();
@@ -649,8 +652,9 @@ impl GridView {
                 }
                 let (ar, ac) = gs.cursor;
                 if vis.contains(ar, ac) {
-                    let (sx, sy) = at(src.col_left(ac), src.row_top(ar));
-                    let (ex, ey) = at(src.col_left(ac + 1), src.row_top(ar + 1));
+                    // The active cell, or the whole merged area it is in.
+                    let (sx, sy) = at(src.col_left(one.c0), src.row_top(one.r0));
+                    let (ex, ey) = at(src.col_left(one.c1 + 1), src.row_top(one.r1 + 1));
                     let (w, h) = (ex - sx, ey - sy);
                     if let Some(ed) = &gs.edit {
                         // The editor: as wide as its text needs, from the cell.
@@ -767,7 +771,8 @@ impl GridView {
                 match phase {
                     DragPhase::Start => {
                         commit(&mut g, &act);
-                        g.select(cell.0, cell.1);
+                        let at = src.merge_at(cell.0, cell.1).map_or(cell, |m| (m.r0, m.c0));
+                        g.select(at.0, at.1);
                         g.drag = Drag::Cells;
                     }
                     DragPhase::Move if g.drag == Drag::Cells => g.cursor = cell,
@@ -985,6 +990,64 @@ impl View for GridView {
 /// goes on the wire, [`Node::to_group`]) is the same wherever the tile is:
 /// moving the base moves only the tiles' groups, and nothing in them is
 /// sent again.
+/// `r` grown until no merged area crosses its edge.
+pub fn grow_to_merges(src: &dyn GridSource, mut r: CellRange) -> CellRange {
+    for _ in 0..64 {
+        let mut g = r;
+        for m in src.merges_in(r) {
+            g = CellRange { r0: g.r0.min(m.r0), c0: g.c0.min(m.c0), r1: g.r1.max(m.r1), c1: g.c1.max(m.c1) };
+        }
+        if g == r {
+            break;
+        }
+        r = g;
+    }
+    r
+}
+
+/// One cell's ground, bar, borders, icon and text in the box (`cx`, `cy`,
+/// `cw`, `ch`), window px.
+fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, cy: f32, cw: f32, ch: f32) {
+    if let Some(f) = cv.fill {
+        ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw, ch), fill: f, radius: 0.0 });
+    }
+    if let Some((share, c)) = cv.bar {
+        let w = ((cw - 4.0) * share.clamp(0.0, 1.0)).max(0.0);
+        ctx.add(Node::Rect { rect: Rect::new(cx + 2.0, cy + 2.0, q(w as f64), (ch - 5.0).max(0.0)), fill: c, radius: 0.0 });
+    }
+    for (k, b) in cv.borders.iter().enumerate() {
+        let Some((w, c)) = *b else { continue };
+        let r = match k {
+            0 => Rect::new(cx - 1.0, cy - 1.0, w, ch + 1.0),
+            1 => Rect::new(cx + cw - w, cy - 1.0, w, ch + 1.0),
+            2 => Rect::new(cx - 1.0, cy - 1.0, cw + 1.0, w),
+            _ => Rect::new(cx - 1.0, cy + ch - w, cw + 1.0, w),
+        };
+        ctx.add(Node::Rect { rect: r, fill: c, radius: 0.0 });
+    }
+    // The icon at the left; text keeps clear of it.
+    let mut lead = cv.indent as f32 * INDENT_STEP;
+    if let Some((icon, c)) = cv.icon {
+        let s = (ch - 6.0).clamp(0.0, 14.0);
+        if s >= 6.0 && cw > s + 4.0 {
+            draw_icon(ctx, icon, c, t.border_default(), cx + 3.0 + lead, cy + q(((ch - s) / 2.0) as f64), s);
+            lead += s + 3.0;
+        }
+    }
+    if cv.text.is_empty() {
+        return;
+    }
+    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
+    let (shown, w) = fit_text(cv, cw - 2.0 * PAD - lead, &style);
+    let tx0 = match cv.align {
+        CellAlign::Left => cx + PAD + lead,
+        CellAlign::Center => cx + q(((cw - w) / 2.0) as f64),
+        CellAlign::Right => cx + q((cw - PAD - w) as f64),
+    };
+    let lh = TEXT_SIZE * 1.3;
+    ctx.add(Node::Text { rect: Rect::new(tx0, cy + q(((ch - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
+}
+
 fn q(v: f64) -> f32 {
     ((v * 64.0).round() / 64.0) as f32
 }
@@ -1079,7 +1142,17 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
     };
     let (last_r, last_c) = (geom.rows - 1, geom.cols - 1);
-    let step = |(r, c): (u32, u32), dr: i64, dc: i64| -> (u32, u32) { ((r as i64 + dr).clamp(0, last_r as i64) as u32, (c as i64 + dc).clamp(0, last_c as i64) as u32) };
+    // One step from a merged area starts at its far edge, and one landing in
+    // a merged area lands on its top-left cell.
+    let step = |(r, c): (u32, u32), dr: i64, dc: i64| -> (u32, u32) {
+        let (mut r, mut c) = (r, c);
+        if let Some(m) = src.merge_at(r, c) {
+            r = if dr > 0 { m.r1 } else if dr < 0 { m.r0 } else { r };
+            c = if dc > 0 { m.c1 } else if dc < 0 { m.c0 } else { c };
+        }
+        let to = ((r as i64 + dr).clamp(0, last_r as i64) as u32, (c as i64 + dc).clamp(0, last_c as i64) as u32);
+        src.merge_at(to.0, to.1).map_or(to, |m| if (dr, dc) == (0, 0) || m.contains(r, c) { to } else { (m.r0, m.c0) })
+    };
     let cmd = m.ctrl || m.meta;
 
     // A picked float: Delete asks to remove it, Escape (or any other key)
@@ -1259,11 +1332,12 @@ mod tests {
         cols: u32,
         widths: RefCell<HashMap<u32, f64>>,
         cells: RefCell<HashMap<(u32, u32), String>>,
+        merges: RefCell<Vec<CellRange>>,
     }
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default() }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -1303,6 +1377,12 @@ mod tests {
         }
         fn edit_text(&self, r: u32, c: u32) -> String {
             self.cells.borrow().get(&(r, c)).cloned().unwrap_or_default()
+        }
+        fn merge_at(&self, r: u32, c: u32) -> Option<CellRange> {
+            self.merges.borrow().iter().find(|m| m.contains(r, c)).copied()
+        }
+        fn merges_in(&self, g: CellRange) -> Vec<CellRange> {
+            self.merges.borrow().iter().filter(|m| m.r0 <= g.r1 && g.r0 <= m.r1 && m.c0 <= g.c1 && g.c0 <= m.c1).copied().collect()
         }
     }
 
@@ -1450,6 +1530,36 @@ mod tests {
         // Only the viewports and the tiles' groups: nothing inside a tile.
         assert!(d.iter().all(|x| matches!(x, NodeDelta::Changed { node: Node::Stack { .. } | Node::Scroll { .. }, .. })), "{kinds:?}");
         assert!(d.len() < 40, "{kinds:?}");
+    }
+
+    #[test]
+    fn a_merged_area_is_one_cell_to_the_pointer_and_the_keys() {
+        let (mut app, grid, _, state, _) = host(100, 20);
+        // B2:D3 merged.
+        grid.merges.borrow_mut().push(CellRange { r0: 1, c0: 1, r1: 2, c1: 3 });
+        grid.cells.borrow_mut().insert((1, 1), "Title".into());
+        app.tick();
+        // A press on C3, inside it, puts the cursor on its top-left.
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 2.0 * 64.0 + 10.0, HEADER_H + 2.0 * 20.0 + 5.0);
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        app.tick();
+        assert_eq!(state.get_cloned().cursor, (1, 1));
+        let none = Modifiers::default();
+        // Out past its edges, and back in onto its top-left.
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().cursor, (1, 4));
+        key(&mut app, Key::Left, "", none);
+        assert_eq!(state.get_cloned().cursor, (1, 1));
+        key(&mut app, Key::Down, "", none);
+        assert_eq!(state.get_cloned().cursor, (3, 1));
+        key(&mut app, Key::Right, "", none);
+        key(&mut app, Key::Up, "", none);
+        assert_eq!(state.get_cloned().cursor, (1, 1));
+        // A selection meeting part of it shows all of it.
+        let src: &dyn GridSource = &*grid;
+        assert_eq!(grow_to_merges(src, CellRange { r0: 0, c0: 2, r1: 1, c1: 2 }), CellRange { r0: 0, c0: 1, r1: 2, c1: 3 });
     }
 
     #[test]
