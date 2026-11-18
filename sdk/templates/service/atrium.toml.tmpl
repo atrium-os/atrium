@@ -1,0 +1,19 @@
+# {{name}}: made by `cargo atrium new` (template: service).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A provider asks for nothing: Limen starts it with its channel and a
+# window that shows only inside the sharing app's sheet.
+[capabilities]
+network = "none"
+
+# It appears in the share sheet for text (share-sheet.md §4.3).
+[roles]
+implements = ["share-target"]
+
+[roles.share-target]
+mime = ["text/*"]

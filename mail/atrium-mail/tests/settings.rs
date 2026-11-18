@@ -106,6 +106,17 @@ fn settings_window() {
     assert_eq!(engine.configured().len(), 1);
     s.remove(id);
     assert!(engine.configured().is_empty());
+    // Its password in Arca goes too; Arca isn't running here, so: said.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        s.tick();
+        let n = s.ui.get_cloned().note.unwrap_or_default();
+        if n.starts_with("Removed the account and its mail, but not its password: Arca isn't reachable") {
+            break;
+        }
+        assert!(Instant::now() < until, "{n}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Notifications, quiet hours (kept as typed once they read as times), VIPs.
     s.toggle_notify();

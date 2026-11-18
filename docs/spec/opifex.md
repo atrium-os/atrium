@@ -346,6 +346,12 @@ can declare (limen.md §2.0). The sheet shows:
 - *Install* · *Not now*. *Try it* appears only once `[trial]` exists in portcullis-toml
   (decision 10).
 
+*Asking for another app, as built 2026-11-18 (opening-links.md L5):* `Ask::Install` has an
+optional `for_uid`, the app the install is asked for. opifex-sheetd takes it only from the uids
+in `OPIFEX_SHEET_FOR_OTHERS` (default `_monstrator`, 65038) and answers anyone else `Failed`;
+the declines, the one-at-a-time rule and opifexd's `InstallApproved.for_uid` are then that
+app's, not Monstrator's. A line without it reads as before.
+
 ### 7.2 The steps
 
 ```
@@ -824,6 +830,13 @@ font on demand and a driver from a `nobody` device's notice.
   `jid 0` in dispensatord's line is jaild's sentinel for exec'd jails, not a failure.)
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
+- CJK packages (2026-11-18): `scripts/opifex-cjk-fonts.sh <out> --sign <platform key>` builds
+  Noto Sans JP, SC, TC, HK and KR 2.004 (regular and bold, OFL) from the
+  `@expo-google-fonts/noto-sans-*` 0.4.4 tarballs, each pinned by its npm sha512, with
+  `incoming/<id>.toml` requests for the catalog-blobs release `fonts-noto-cjk-2.004`.
+  `opifex/tests/cjk_fonts.rs` installs all five and checks atrium-fonts picks each one's forms
+  by hint; a scratch catalog took all five (`catalog add`, sync). Published once the platform key
+  and the repositories exist.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
   frescod with an installed package; the gate checks the library); the notice opening Curia's install page for a driver
   (it names the command for now); PCI devices in the lookup (dispensatord sees USB and HID
@@ -909,14 +922,46 @@ font on demand and a driver from a `nobody` device's notice.
   a WebAuthn RP verified and one dropped, a rotation updating in the background, a recovery
   asking, removal keeping the app; the sheet's lines and its add-a-catalog decision; TXT
   answers in the fetcher; jaild's `ro_subtrees` refusals); the publishing tools run by hand
-  (init, register, add, publish, rotate, a past key refused, sync).
+  (init, register, add, publish, rotate, a past key refused, sync). VM gate
+  `scripts/vm-opifex-c7-check.sh` 0 failed on the Mac VM (2026-11-18, 56c424a): a third-party
+  catalog made with `opifex catalog init`, followed after its preview, a proven publisher's app
+  offered and installed for one person, an unproven publisher's never offered, WebAuthn RPs
+  verified, rotation and recovery, a forged entry refused with the copy unchanged.
 - Not yet: launch trust for apps from added catalogs (portcullis-trust's gate knows only
   `/etc/atrium/publishers`; reading opifexd's record and the publisher's keys is the
   platform thread's, told 2026-11-18); Sigillum reading `verified_rps` and keying private
   RPs on the publisher id; Curia's add-a-catalog page and a link that opens the sheet
   (both call `opifex_sheet::add_catalog`); per-persona catalogs (personas.md, later);
   atrium-ax coverage in the publishing check, which needs an ax measurement tool that
-  doesn't exist yet (atrium-ax.md §5.3); a VM gate for C7.
+  doesn't exist yet (atrium-ax.md §5.3).
+
+### 14.9 Root keys on hardware tokens (2026-11-18)
+
+- `portcullis-token`: a key on a PKCS#11 token (YubiKey PIV through Yubico's `libykcs11`,
+  Nitrokey or any module, loaded at run time) signs with ECDSA P-256 over the SHA-256 digest;
+  the signature is checked against the token's public key before use and comes out in the
+  same DER form as a PEM key's. A small **key file** names the key (`atrium-token-key = 1`,
+  `module`, `serial`, `id`); it holds nothing secret.
+- `portcullis_sig::set_external_signer`: `sign` and `public_pem` hand a non-PEM key file to
+  the signer a tool installed. Only the `opifex` CLI installs it, so every `--key`/`--sign`
+  (`root-sign`, `yank`, `register`, `publisher`, `pack`, `head`) takes a token key file;
+  daemons never install it.
+- The PIN is typed at the terminal with echo off, once per token per run, never an argument,
+  file or environment variable. A key that wants the PIN for every signature (YubiKey slot
+  9c) gets a context-specific login; slot 9a needs only the one.
+- `opifex token list|ref|pub`; `opifex catalog root-new` writes an unsigned `root.toml` from
+  public keys or key files (three root keys, a catalog key, the platform key with every kind
+  under `org.atrium.`), `--next yes` the one after it (version + 1, signatures cleared).
+  `root-sign`'s `--pub` is now optional.
+- Handover (a new owner, or admins holding root slots): a next `root.toml` naming the new
+  keys, signed by the threshold of the old root keys and of its own; machines adopt it at
+  their next sync. After that the old keys alone can change nothing. Losing more root keys
+  than the threshold allows before a handover leaves only a reinstall with a new `root.toml`.
+- Checked: unit tests on SoftHSM (listing, public key, signing, a wrong PIN, a missing
+  token, a catalog root through `portcullis_sig`), and `scripts/opifex-token-check.sh`
+  (host, SoftHSM + pkcs11-tool, PINs through a pty): the ceremony with three token keys, a
+  handover to three new tokens adopted by a machine, a root signed by the old keys alone
+  refused, a wrong PIN signing nothing. 0 failed. Not yet tried on a real YubiKey.
 
 ## 15. Decisions, with recommendations
 

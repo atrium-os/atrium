@@ -1,6 +1,6 @@
 //! A test app for the link opener (opening-links.md §5): one window; a
 //! click or Enter in it asks Monstrator to open a link (the first argument,
-//! else the confined gate's fixture page) with that press. Prints
+//! else `link-probe.url` in its bundle, else the confined gate's fixture page) with that press. Prints
 //! `link-probe: up`, then `link-probe: opened` or `link-probe: not opened:
 //! <why>` for each ask. Exits after five idle minutes.
 use std::time::{Duration, Instant};
@@ -17,7 +17,14 @@ fn draw(c: &mut Connection, w: f32, h: f32) {
 }
 
 fn main() {
-    let url = std::env::args().nth(1).unwrap_or_else(|| URL.into());
+    // The first argument, else `link-probe.url` in its bundle (the app's
+    // launch passes none), else the fixture page.
+    let beside = || {
+        let exe = std::env::current_exe().ok().or_else(|| std::env::args().next().map(Into::into))?;
+        let t = std::fs::read_to_string(exe.parent()?.parent()?.join("link-probe.url")).ok()?;
+        Some(t.trim().to_string()).filter(|t| !t.is_empty())
+    };
+    let url = std::env::args().nth(1).or_else(beside).unwrap_or_else(|| URL.into());
     let mut c = match Connection::connect(&fresco_client::default_socket_path()) {
         Ok(c) => c,
         Err(e) => return println!("link-probe: frescod: {e}"),

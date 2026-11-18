@@ -91,8 +91,8 @@ anything else; portcullis-toml refuses them in manifests.
 
 `atrium-app://<app id>` opens an installed app (its start, no link given). Resolving a
 publisher's name to a signed bundle that isn't installed is Nomenclator's work; until it
-exists Monstrator answers "not installed", and later it hands that case to Opifex's install
-screen ("Try it" there, not in the asking app).
+exists Monstrator hands that case to Opifex's install sheet, by id (L5, built 2026-11-18,
+§8); "Try it" will be there, not in the asking app.
 
 ### 4.4 Defaults
 
@@ -233,6 +233,16 @@ new trail.
    in the sheet, which has an "In: <persona>" row; the person's crossing switch decides
    whether the link may go there, and portcullisd checks it again on delivery.
 5. **L5** `atrium-app://` publishers through Nomenclator and Opifex, when those exist.
+   *Built 2026-11-18 (Opifex part):* for an `atrium-app://<id>` link whose app isn't
+   installed, portcullisd spends the press as for any link and answers `LinkGranted` with the
+   one app and `install: true` (a malformed id is refused earlier by atrium-links). monstratord
+   then asks Opifex's install sheet (`/atrium/sockets/opifex-sheet/`, mounted into its jail)
+   to install it for the asking app (`for_uid`, opifex.md §7.1), and on `Installed` delivers
+   the link, which starts the app; `Declined` or `Failed` answer the asker "isn't installed"
+   with the reason. The grant's two minutes include the sheet. Gate:
+   `scripts/navigator-confined-vm.sh` (a test catalog, opifexd and opifex-sheetd beside the
+   Navigator's run; App probe asks for `atrium-app://org.atrium.l5hello`, Install on the
+   sheet, the app installed and opened). Not yet: Nomenclator (a publisher's name for an id).
 
 ## 9. Decisions, with recommendations
 

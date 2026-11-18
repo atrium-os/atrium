@@ -256,12 +256,44 @@ struct Askers {
     declined: HashMap<u32, Instant>,
 }
 
+/// The uids that may ask for another app (`Ask::Install::for_uid`):
+/// `OPIFEX_SHEET_FOR_OTHERS`, default `_monstrator` (65038).
+fn for_others() -> Vec<u32> {
+    std::env::var("OPIFEX_SHEET_FOR_OTHERS").unwrap_or_else(|_| "65038".into())
+        .split(',').filter_map(|u| u.trim().parse().ok()).collect()
+}
+
+/// Who an ask is for: the asker, or the app it asks for when the asker is
+/// trusted with that.
+fn asked_for(peer: u32, for_uid: Option<u32>, trusted: &[u32]) -> Result<u32, String> {
+    match for_uid {
+        None => Ok(peer),
+        Some(f) if trusted.contains(&peer) => Ok(f),
+        Some(_) => Err("only Monstrator asks for another app".into()),
+    }
+}
+
 fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
-    let Some(uid) = peer_uid(&s) else { return };
+    let Some(peer) = peer_uid(&s) else { return };
     let answer = |mut s: &UnixStream, a: Answer| {
         let mut line = serde_json::to_vec(&a).unwrap_or_default();
         line.push(b'\n');
         let _ = s.write_all(&line);
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut line = String::new();
+    let read = BufReader::new((&s).take(MAX_LINE as u64)).read_line(&mut line);
+    let Some(ask) = read.ok().and_then(|_| serde_json::from_str::<Ask>(line.trim_end()).ok()) else {
+        return answer(&s, Answer::Failed { why: "not a request".into() });
+    };
+    // Whom it is for (the asker, or Monstrator's asker for an install):
+    // their declines and their one ask at a time.
+    let uid = match &ask {
+        Ask::Install { for_uid, .. } => match asked_for(peer, *for_uid, &for_others()) {
+            Ok(u) => u,
+            Err(why) => return answer(&s, Answer::Failed { why }),
+        },
+        Ask::AddCatalog { .. } => peer,
     };
     {
         let mut a = askers.lock().unwrap();
@@ -272,21 +304,18 @@ fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
             return answer(&s, Answer::Failed { why: "one install at a time".into() });
         }
     }
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut line = String::new();
-    let read = BufReader::new((&s).take(MAX_LINE as u64)).read_line(&mut line);
-    let a = match read.ok().and_then(|_| serde_json::from_str::<Ask>(line.trim_end()).ok()) {
-        Some(Ask::Install { id }) => {
+    let by = if uid != peer { format!(" (asked by uid {peer})") } else { String::new() };
+    let a = match ask {
+        Ask::Install { id, .. } => {
             let a = decide(uid, &id, show);
-            eprintln!("opifex-sheetd: {id} for uid {uid}: {a:?}");
+            eprintln!("opifex-sheetd: {id} for uid {uid}{by}: {a:?}");
             a
         }
-        Some(Ask::AddCatalog { url }) => {
+        Ask::AddCatalog { url } => {
             let a = decide_catalog(uid, &url, show);
             eprintln!("opifex-sheetd: catalog {url} for uid {uid}: {a:?}");
             a
         }
-        None => Answer::Failed { why: "not a request".into() },
     };
     {
         let mut st = askers.lock().unwrap();
@@ -371,6 +400,15 @@ mod tests {
     }
 
     // One test: OPIFEX_SOCKET is process-wide.
+    #[test]
+    fn only_monstrator_asks_for_another_app() {
+        assert_eq!(asked_for(50001, None, &[65038]), Ok(50001));
+        assert_eq!(asked_for(65038, Some(50007), &[65038]), Ok(50007), "an atrium-app: link's asker");
+        assert!(asked_for(50001, Some(50007), &[65038]).is_err());
+        let ask: Ask = serde_json::from_str(r#"{"Install":{"id":"org.atrium.hello"}}"#).unwrap();
+        assert_eq!(ask, Ask::Install { id: "org.atrium.hello".into(), for_uid: None }, "an old asker's line");
+    }
+
     #[test]
     fn the_person_decides_and_opifexd_installs_what_was_shown() {
         let (p, h) = fake("yes", vec![

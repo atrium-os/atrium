@@ -686,6 +686,11 @@ pub enum Response {
         /// link may cross into it (personas.md §6). Empty: no named persona.
         #[serde(default)]
         personas: Vec<PersonaChoice>,
+        /// An `atrium-app:` link to an app that isn't installed: the one
+        /// app listed is to be installed first, through the install sheet
+        /// (opening-links.md §4.3, L5), then delivered as any other.
+        #[serde(default)]
+        install: bool,
     },
     /// DeliverLink → handed to `app` (its name).
     LinkDelivered { app: String },

@@ -89,9 +89,13 @@ Two templates show an app split into a core and a worker
   core sends the opened file's descriptor to the player and draws the
   controls; it never demuxes or decodes.
 
-**Planned:** a `service` template, an app that provides a role
-(`[roles] implements`), once `share-target` has its messages and the share
-sheet sends them.
+- `service`: provides a role to other apps (`[roles] implements =
+  ["share-target"]`). It shows up in the share sheet
+  ([share-sheet.md](../spec/share-sheet.md)) for text, shows what was
+  shared in an embedded window, and keeps it in `~/kept.txt` when you
+  press Keep. It asks for no network and no graphics of its own; its
+  window comes from the app that shares. Try it with `share-demo` from
+  `share-sheet/`.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).

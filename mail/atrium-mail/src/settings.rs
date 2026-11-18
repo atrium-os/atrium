@@ -135,6 +135,8 @@ pub struct Settings {
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
     kept: Rc<RefCell<Option<mpsc::Receiver<Result<AccountConfig, String>>>>>,
     added: Rc<std::cell::Cell<bool>>,
+    /// Arca's answer to removing a removed account's items.
+    forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
     /// Where arcad listens.
     arca: Rc<std::path::PathBuf>,
 }
@@ -161,6 +163,7 @@ impl Settings {
             found: Rc::default(),
             kept: Rc::default(),
             added: Rc::default(),
+            forgot: Rc::default(),
             arca: Rc::new(arca),
         };
         s.reload();
@@ -343,14 +346,27 @@ impl Settings {
             self.update(|u| u.removing = Some(id));
             return;
         }
+        let cfg = self.engine.store.account_config(id).ok().flatten();
         let r = self.engine.store.write(|w| w.remove_account(id));
         self.update(|u| {
             u.removing = None;
-            u.note = Some(match r {
-                Ok(()) => "Removed the account and its mail from this device. Its password stays in Arca until removed there.".into(),
+            u.note = Some(match &r {
+                Ok(()) if cfg.as_ref().is_some_and(|c| !crate::accounts::items_of(c).is_empty()) => "Removed the account and its mail from this device. Removing its password from Arca…".into(),
+                Ok(()) => "Removed the account and its mail from this device.".into(),
                 Err(e) => format!("Couldn't remove it: {e}"),
             });
         });
+        // Its sign-in in Arca goes with it, off the window's thread.
+        if let (Ok(()), Some(cfg)) = (r, cfg) {
+            if !crate::accounts::items_of(&cfg).is_empty() {
+                let (tx, rx) = mpsc::channel();
+                let arca = (*self.arca).clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::accounts::forget(&arca, &cfg));
+                });
+                *self.forgot.borrow_mut() = Some(rx);
+            }
+        }
         self.reload();
     }
 
@@ -519,6 +535,16 @@ impl Settings {
                     u.note = Some(e);
                 }),
             }
+        }
+        let forgot = self.forgot.borrow().as_ref().and_then(|r| r.try_recv().ok());
+        if let Some(r) = forgot {
+            *self.forgot.borrow_mut() = None;
+            self.update(|u| {
+                u.note = Some(match r {
+                    Ok(()) => "Removed the account, its mail and its password.".into(),
+                    Err(e) => format!("Removed the account and its mail, but not its password: {e}. Remove it in Arca."),
+                })
+            });
         }
         let kept = self.kept.borrow().as_ref().and_then(|r| r.try_recv().ok());
         if let Some(r) = kept {

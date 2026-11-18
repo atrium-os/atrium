@@ -1,4 +1,4 @@
-//! The share-target provider of scripts/vm-embeds-check.sh: says who it
+//! The editor-extension provider of scripts/vm-embeds-check.sh: says who it
 //! runs as, then waits for its channel to close.
 use std::io::Read;
 

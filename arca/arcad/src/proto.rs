@@ -58,6 +58,10 @@ pub mod op {
     pub const KEEP_FOR: u16 = 0x0B;
     /// Most endpoints one `KEEP_FOR` binds.
     pub const KEEP_FOR_MAX: usize = 4;
+    /// Delete one of this app's items bound to an endpoint (what
+    /// `KEEP_FOR` or a courier's `GRANTED` made; mail.md §5.1: removing an
+    /// account removes its password): `endpoint | id[16]` → nothing.
+    pub const DELETE_FOR: u16 = 0x0C;
     /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.

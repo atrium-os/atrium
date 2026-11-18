@@ -8,14 +8,16 @@
 # (refusal 9, LAUNCH_FAILED); what the gate checks is how far each gets.
 #
 # Three dev builds Run from Scratch (limen/examples):
-#   - Share: `[roles] implements = ["share-target"]`, no capabilities;
-#   - Embedder: `embeds = ["doc-viewer", "share-target"]`, `arca = true`;
+#   - Share: `[roles] implements = ["editor-extension", "share-target"]`, no capabilities;
+#   - Embedder: `embeds = ["doc-viewer", "editor-extension"]`, `arca = true`;
 #   - Bare: the same program, no `embeds`.
 # Embedder has limend's socket in its jail; Bare has none. limend lets
 # Embedder ask for doc-viewer (no provider installed: refusal 2) and
-# share-target, which it gives to Share, read from Share's manifest:
+# editor-extension, which it gives to Share, read from Share's manifest:
 # portcullisd starts Share as a uid of Embedder's instance (not limend's,
 # not Embedder's); map and picker are refused (15, NOT_EMBEDDABLE).
+# share-target has no default since the share sheet (share-sheet.md §3):
+# without the person's choice in a sheet it is refused 2 (NO_PROVIDER).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=amd64
@@ -78,8 +80,8 @@ mk() { # folder id bin extra-toml
        printf '[app]\nid = \"$2\"\nname = \"$1\"\nversion = \"1\"\nentry = \"bin/app\"\n$4' > $W/scratch/work/$1/atrium.toml; \
        chown -R alice:files-alice $W/scratch/work/$1"
 }
-mk share org.example.share embeds_provider '\n[roles]\nimplements = [\"share-target\"]\n'
-mk embedder org.example.embedder embeds_gate '\n[capabilities]\nembeds = [\"doc-viewer\", \"share-target\"]\narca = true\n'
+mk share org.example.share embeds_provider '\n[roles]\nimplements = [\"editor-extension\", \"share-target\"]\n'
+mk embedder org.example.embedder embeds_gate '\n[capabilities]\nembeds = [\"doc-viewer\", \"editor-extension\"]\narca = true\n'
 mk bare org.example.bare embeds_gate ''
 
 echo "=== Run"
@@ -95,7 +97,8 @@ socks=$(V "grep 'embeds-gate socket' $LOG" | sed 's/.*socket //' | sort | tr '\n
 arcas=$(V "grep 'embeds-gate arca' $LOG" | sed 's/.*arca //' | sort | tr '\n' ' ')
 [ "$arcas" = "no yes " ] && ok "arca = true puts arcad's socket in Embedder's jail, and Bare has none" || bad "arca: [$arcas]"
 r=$(line doc-viewer); [ "$r" = "refused 2" ] && ok "doc-viewer passes the embeds check (no provider installed: 2)" || bad "doc-viewer: $r"
-r=$(line share-target); [ "$r" = "refused 9" ] && ok "share-target goes to a provider (ends at frescod: 9)" || bad "share-target: $r ($(V "tail -5 $LLOG"))"
+r=$(line editor-extension); [ "$r" = "refused 9" ] && ok "editor-extension goes to a provider (ends at frescod: 9)" || bad "editor-extension: $r ($(V "tail -5 $LLOG"))"
+r=$(line share-target); [ "$r" = "refused 2" ] && ok "share-target without a choice in the share sheet: no provider (2)" || bad "share-target: $r"
 r=$(line map); [ "$r" = "refused 15" ] && ok "map is refused: not in embeds" || bad "map: $r"
 r=$(line picker); [ "$r" = "refused 15" ] && ok "picker is refused: not in embeds" || bad "picker: $r"
 started=$(V "grep 'dev.alice.scratch.org.example.share for alice' $LOG | tail -1")

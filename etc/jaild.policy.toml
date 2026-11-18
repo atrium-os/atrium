@@ -128,6 +128,8 @@ rw_paths = [
     "/atrium/sockets/fresco-activation",
     # Tabula's socket: monstratord's Copy address (personas.md §6).
     "/atrium/sockets/clipboard",
+    # The install sheet's: monstratord, for atrium-app: links (L5).
+    "/atrium/sockets/opifex-sheet",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",

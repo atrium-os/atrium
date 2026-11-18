@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use atrium_sheets::app::{Cmd, Sheets, Ui, PICKER_SLOT};
 use atrium_sheets::bench::{self, Frame, Pattern, Report};
 use atrium_sheets::doc::{self, Doc};
-use atrium_sheets::files::{format_of, load_with, stem_of, Format};
+use atrium_sheets::files::{format_of, stem_of, Format};
 use officina_convert::launch::ConvertError;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
@@ -167,6 +167,18 @@ struct Run {
     target: Option<Target>,
     locked: Option<Locked>,
     root: PathBuf,
+    /// A file being read (converted, loaded and recalculated) on its own
+    /// thread, so the window keeps answering however big the file is.
+    opening: Option<Opening>,
+}
+
+struct Opening {
+    name: String,
+    /// Read to compare with (Compare with…), not to open.
+    compare: bool,
+    target: Option<Target>,
+    read_only: bool,
+    loading: atrium_sheets::files::Loading,
 }
 
 impl Run {
@@ -277,14 +289,17 @@ impl Run {
         }
     }
 
-    /// Compares the window's workbook with the picked copy.
+    /// Compares the window's workbook with the picked copy, read on its own
+    /// thread as an open is.
     fn compare(&mut self, name: String, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
-        match read_all(&mut f).map_err(|e| e.to_string()).and_then(|data| load_with(&name, &data, None).map_err(|e| match e {
-            ConvertError::NeedsPassword | ConvertError::WrongPassword => format!("“{name}” is protected; open it and save an unprotected copy to compare with."),
-            ConvertError::Failed(e) => e,
-        })) {
-            Ok(d) => self.sheets.compare_with(&name, d.wb),
+        match read_all(&mut f) {
+            Ok(data) => {
+                self.open_bytes(name, data, None, true, None);
+                if let Some(o) = &mut self.opening {
+                    o.compare = true;
+                }
+            }
             Err(e) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
         }
     }
@@ -292,7 +307,33 @@ impl Run {
     /// Opens `data` (named `name`), with `password` when it is protected;
     /// without the right one, the password bar asks and the file waits.
     fn open_bytes(&mut self, name: String, data: Vec<u8>, target: Option<Target>, read_only: bool, password: Option<&str>) {
-        match load_with(&name, &data, password) {
+        let loading = match atrium_sheets::files::Loading::start(&name, data, password) {
+            Ok(l) => l,
+            Err(e) => {
+                self.set_status(format!("Couldn't open “{name}”: {e}"));
+                return;
+            }
+        };
+        // A file still opening is dropped for this one (its thread finishes unheard).
+        self.set_status(format!("Reading “{name}”…"));
+        self.opening = Some(Opening { name, compare: false, target, read_only, loading });
+    }
+
+    /// The file being opened, if its thread is done: on screen, or the
+    /// password asked for, or why not. True while one is still opening.
+    fn poll_open(&mut self) -> bool {
+        let Some(o) = &self.opening else { return false };
+        let Some((r, data)) = o.loading.poll() else { return true };
+        let Opening { name, compare, target, read_only, .. } = self.opening.take().unwrap();
+        if compare {
+            match r {
+                Ok(d) => self.sheets.compare_with(&name, d.wb),
+                Err(ConvertError::NeedsPassword | ConvertError::WrongPassword) => self.set_status(format!("Couldn't compare with “{name}”: it is protected; open it and save an unprotected copy to compare with.")),
+                Err(ConvertError::Failed(e)) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
+            }
+            return false;
+        }
+        match r {
             Ok(mut d) => {
                 if read_only {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
@@ -306,6 +347,7 @@ impl Run {
             }
             Err(ConvertError::Failed(e)) => self.set_status(e),
         }
+        false
     }
 
     /// Restores a protected document's autosave folder, asking for its
@@ -367,39 +409,29 @@ fn main() {
 
     let root = state_root();
     let _ = fs::create_dir_all(&root);
-    // A document a crash left comes back first.
-    let mut first: Option<(Doc, Option<Target>)> = None;
+    // A document a crash left comes back first; it, or a file named on the
+    // command line, is read on its own thread once the window shows.
     let mut locked: Option<(PathBuf, String)> = None;
-    let mut locked_file: Option<(String, Vec<u8>, Target)> = None;
+    let mut restore: Option<(PathBuf, String)> = None;
+    let mut start_file: Option<(String, Vec<u8>, Target)> = None;
     if let Some((dir, name)) = doc::pending(&root).pop() {
         if doc::recovery_locked(&dir) {
             locked = Some((dir, name));
         } else {
-            match doc::recover(&dir) {
-                Ok((mut d, rec)) => {
-                    d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
-                    first = Some((d, None));
-                }
-                Err(e) => eprintln!("atrium-sheets: couldn't restore {}: {e}", dir.display()),
-            }
+            restore = Some((dir, name));
         }
     }
-    if first.is_none() && locked.is_none() {
+    if restore.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
             match fs::read(&p) {
-                Ok(data) => match load_with(&name, &data, None) {
-                    Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
-                    Err(ConvertError::Failed(e)) => eprintln!("atrium-sheets: {e}"),
-                    Err(_) => locked_file = Some((name.clone(), data, Target::Path { path: p.clone(), format: format_of(&name) })),
-                },
+                Ok(data) => start_file = Some((name.clone(), data, Target::Path { path: p.clone(), format: format_of(&name) })),
                 Err(e) => eprintln!("atrium-sheets: {e}"),
             }
         }
     }
-    let (mut doc, target) = first.unwrap_or_else(|| (Doc::new("Untitled"), None));
-    let target = keep_target(&mut doc, target);
+    let (doc, target) = (Doc::new("Untitled"), None);
 
     let mut win = match Window::open(&WindowDesc::new("Sheets", SizeSpec::Fixed(1100, 720))) {
         Ok(w) => w,
@@ -427,11 +459,19 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
-    let mut run = Run { sheets, target: None, locked: None, root: root.clone() };
+    let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None };
     run.show(doc, target);
     if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
-    } else if let Some((name, data, t)) = locked_file {
+    } else if let Some((dir, name)) = restore {
+        match atrium_sheets::files::Loading::restore(dir, &name) {
+            Ok(loading) => {
+                run.set_status(format!("Restoring “{name}”…"));
+                run.opening = Some(Opening { name, compare: false, target: None, read_only: false, loading });
+            }
+            Err(e) => eprintln!("atrium-sheets: couldn't restore {name}: {e}"),
+        }
+    } else if let Some((name, data, t)) = start_file {
         run.open_bytes(name, data, Some(t), false, None);
     }
     let size = run.sheets.size.clone();
@@ -449,7 +489,8 @@ fn main() {
     'main: loop {
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
-        let wait = if recalculating { 1 } else if asking.is_some() { 20 } else { 250 };
+        let opening = run.poll_open();
+        let wait = if recalculating { 1 } else if asking.is_some() || opening { 20 } else { 250 };
         match win.step(&mut app, Some(Duration::from_millis(wait))) {
             // Unsaved changes: ask first. Asked to close again while asking (or
             // while picking), the changes stay in the autosave folder.

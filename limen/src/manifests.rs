@@ -13,12 +13,28 @@ pub const APPS_DIR: &str = "/var/lib/atrium/apps";
 /// verified prefix (opifex.md §6.5), so only platform bundles are here.
 pub const PLATFORM_PREFIX: &str = "org.atrium.";
 
+/// An app id that can name a folder in the app tree: not empty, no
+/// slash, no NUL, not hidden, at most 255 bytes.
+pub fn plausible_id(app: &str) -> bool {
+    !app.is_empty() && app.len() <= 255 && !app.contains(['/', '\0']) && !app.starts_with('.')
+}
+
 fn manifest(dir: &Path, app: &str) -> Option<portcullis_toml::Manifest> {
-    if app.is_empty() || app.contains(['/', '\0']) || app.starts_with('.') {
+    if !plausible_id(app) {
         return None;
     }
     let text = std::fs::read_to_string(dir.join(app).join("atrium.toml")).ok()?;
     portcullis_toml::Manifest::from_str(&text).ok()
+}
+
+/// A `share-target` the share sheet can offer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub app: String,
+    /// `[app] name`.
+    pub name: String,
+    /// Which of the item's types it takes, in the item's order.
+    pub takes: Vec<String>,
 }
 
 /// Installed manifests under one folder.
@@ -51,6 +67,31 @@ impl Installed {
         manifest(&self.dir, app)
             .and_then(|m| m.roles)
             .is_some_and(|r| r.implements.iter().any(|x| x == role))
+    }
+
+    /// Whether `app` is a `share-target` the share sheet may offer `person`:
+    /// its installed manifest implements the role, and a dev build only
+    /// for the person whose workspace made it.
+    pub fn may_target(&self, person: &str, app: &str) -> bool {
+        (!app.starts_with("dev.") || app.starts_with(&format!("dev.{person}."))) && self.implements(app, "share-target")
+    }
+
+    /// The `share-target`s for `person` that take one of `mimes`, by app id,
+    /// with the types each declared (`[roles.share-target] mime`; none:
+    /// anything) and its name from the manifest.
+    pub fn share_targets(&self, person: &str, mimes: &[String]) -> Vec<Target> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let mut ids: Vec<String> = rd.flatten().filter_map(|e| e.file_name().to_str().map(String::from)).collect();
+        ids.sort();
+        ids.into_iter()
+            .filter(|id| self.may_target(person, id))
+            .filter_map(|id| {
+                let m = manifest(&self.dir, &id)?;
+                let accepts = m.roles.as_ref().and_then(|r| r.share_target.as_ref()).map(|s| s.mime.clone()).unwrap_or_default();
+                let takes: Vec<String> = mimes.iter().filter(|t| crate::share_target::accepts(&accepts, t)).cloned().collect();
+                (!takes.is_empty()).then(|| Target { app: id, name: m.app.name.clone(), takes })
+            })
+            .collect()
     }
 
     /// The provider of `role` for `person` when no default is set (until
@@ -110,6 +151,18 @@ mod tests {
         // Bob doesn't see alice's dev build: the one installed provider.
         assert_eq!(i.provider("bob", "share-target").as_deref(), Some("com.example.share"));
         assert_eq!(i.provider("bob", "payment"), None);
+        // Share targets: alice's own dev build and the installed one; bob
+        // only the installed one; a declared type list narrows.
+        assert!(i.may_target("alice", "dev.alice.scratch.org.example.share") && !i.may_target("bob", "dev.alice.scratch.org.example.share"));
+        assert!(!i.may_target("bob", "org.atrium.maps") && !i.may_target("bob", "../x"));
+        app(&d, "com.example.photos", "\n[roles]\nimplements = [\"share-target\"]\n\n[roles.share-target]\nmime = [\"image/*\"]\n");
+        let pdf = vec!["application/pdf".to_string()];
+        let png = vec!["image/png".to_string(), "text/plain".to_string()];
+        let ids = |v: Vec<Target>| v.into_iter().map(|t| t.app).collect::<Vec<_>>();
+        assert_eq!(ids(i.share_targets("bob", &pdf)), ["com.example.share"]);
+        assert_eq!(ids(i.share_targets("bob", &png)), ["com.example.photos", "com.example.share"]);
+        assert_eq!(i.share_targets("bob", &png)[0].takes, ["image/png"]);
+        assert_eq!(ids(i.share_targets("alice", &pdf)), ["com.example.share", "dev.alice.scratch.org.example.share"]);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

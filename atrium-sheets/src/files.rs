@@ -47,6 +47,54 @@ pub fn convert(kind: &str, data: &[u8]) -> Result<(Vec<u8>, Vec<String>), String
     officina_convert::launch::convert(kind, data, None).map_err(|e| e.to_string())
 }
 
+/// A file being read on its own thread ([`Loading::start`]): converted,
+/// loaded and recalculated there, so the window keeps answering.
+pub struct Loading {
+    rx: std::sync::mpsc::Receiver<(Result<Doc, ConvertError>, Vec<u8>)>,
+}
+
+impl Loading {
+    /// Starts reading `data` as [`load_with`] does.
+    pub fn start(name: &str, data: Vec<u8>, password: Option<&str>) -> std::io::Result<Loading> {
+        let (n, pw) = (name.to_string(), password.map(str::to_string));
+        Self::spawn(move || {
+            let r = load_with(&n, &data, pw.as_deref());
+            (r, data)
+        })
+    }
+
+    /// Restores the autosave folder `dir` (a document Sheets didn't close),
+    /// as [`crate::doc::recover`] does, named `name` in the status line.
+    pub fn restore(dir: std::path::PathBuf, name: &str) -> std::io::Result<Loading> {
+        let name = name.to_string();
+        Self::spawn(move || match crate::doc::recover(&dir) {
+            Ok((mut d, rec)) => {
+                d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
+                (Ok(d), Vec::new())
+            }
+            Err(e) => (Err(ConvertError::Failed(format!("Couldn't restore “{name}”: {e}"))), Vec::new()),
+        })
+    }
+
+    fn spawn(f: impl FnOnce() -> (Result<Doc, ConvertError>, Vec<u8>) + Send + 'static) -> std::io::Result<Loading> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("open".into()).stack_size(16 << 20).spawn(move || {
+            let _ = tx.send(f());
+        })?;
+        Ok(Loading { rx })
+    }
+
+    /// The document (and the bytes back, for a password retry) once read;
+    /// None while still reading.
+    pub fn poll(&self) -> Option<(Result<Doc, ConvertError>, Vec<u8>)> {
+        match self.rx.try_recv() {
+            Ok(x) => Some(x),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((Err(ConvertError::Failed("reading it stopped".into())), Vec::new())),
+        }
+    }
+}
+
 /// A document from a file's bytes, by its name's extension.
 pub fn load(name: &str, data: &[u8]) -> Result<Doc, String> {
     load_with(name, data, None).map_err(|e| match e {
@@ -117,5 +165,80 @@ pub fn stem_of(name: &str) -> &str {
     match name.rfind('.') {
         Some(i) if i > 0 => &name[..i],
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_slow_file_is_read_while_the_caller_carries_on() {
+        // Volatile and slow: every row walks the column again on open.
+        let rows = 20_000u32;
+        let mut d = Doc::new("slow.osheet");
+        let a: Vec<f64> = (0..rows).map(|r| (r % 97) as f64).collect();
+        d.wb.set_numbers(0, 0, 0, &a);
+        d.wb.fill_formula(0, 1, 0, rows - 1, &format!("=SUMIF($A$1:$A${rows},\">\"&A1)+RAND()*0")).unwrap();
+        d.wb.recalc();
+        let want = d.wb.value(0, 7, 1);
+        let bytes = d.stored_native().unwrap();
+        let t = Instant::now();
+        let l = Loading::start("slow.osheet", bytes, None).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(50), "{:?}", t.elapsed());
+        let mut polls = 0;
+        let (r, _) = loop {
+            let p = Instant::now();
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            assert!(p.elapsed() < Duration::from_millis(5));
+            polls += 1;
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(polls > 3, "the read took {polls} polls");
+        assert_eq!(r.unwrap().wb.value(0, 7, 1), want);
+        let l = Loading::start("bad.osheet", b"not a sheet".to_vec(), None).unwrap();
+        let (r, back) = loop {
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(r, Err(ConvertError::Failed(_))));
+        assert_eq!(back, b"not a sheet");
+    }
+
+    #[test]
+    fn an_autosave_is_restored_on_its_own_thread() {
+        let dir = std::env::temp_dir().join(format!("atrium-sheets-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut d = Doc::new("Book");
+        d.autosave_to(&dir).unwrap();
+        d.type_into(0, 0, "21");
+        d.type_into(0, 1, "=A1*2");
+        d.autosave().unwrap().sync().unwrap();
+        drop(d);
+        let l = Loading::restore(dir.clone(), "Book").unwrap();
+        let (r, _) = loop {
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let back = r.unwrap();
+        assert_eq!(back.wb.value(0, 0, 1), officina_grid::Value::Num(42.0));
+        assert!(back.status.starts_with("Restored “Book”"), "{}", back.status);
+        drop(back);
+        let l = Loading::restore(dir.join("nothing"), "Gone").unwrap();
+        let (r, _) = loop {
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(r, Err(ConvertError::Failed(e)) if e.starts_with("Couldn't restore “Gone”")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

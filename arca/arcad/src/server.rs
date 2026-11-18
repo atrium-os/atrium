@@ -264,7 +264,7 @@ impl State {
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         if !matches!(
             op,
-            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR
+            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR | op::DELETE_FOR
         ) {
             return reply(status::DENIED);
         }
@@ -471,6 +471,16 @@ impl State {
                 let i = rep!(id(&mut r));
                 field!(r.end());
                 tri!(store.delete(&i, &who));
+                ok(Vec::new())
+            }
+            op::DELETE_FOR => {
+                let ep = field!(crate::proto::read_endpoint_any(&mut r));
+                let i = rep!(id(&mut r));
+                field!(r.end());
+                let Recipient::App { publisher, app_id } = me else { return reply(status::DENIED) };
+                let persona = app_persona(publisher, app_id);
+                *item = Some(i);
+                tri!(store.delete(&i, &Access { persona: &persona, recipient: &ep }));
                 ok(Vec::new())
             }
             _ => reply(status::DENIED),

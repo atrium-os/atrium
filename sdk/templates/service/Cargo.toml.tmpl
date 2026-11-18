@@ -1,0 +1,16 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+# A share target: started by Limen when the person picks it in another
+# app's share sheet, with no capabilities, drawing only in that sheet.
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+[dependencies]
+pergola = {{dep:pergola}}
+limen = {{dep:limen}}
+fresco-client = {{dep:fresco-client}}
+fresco-protocol = {{dep:fresco-protocol}}

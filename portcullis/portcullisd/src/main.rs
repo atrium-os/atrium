@@ -1453,12 +1453,18 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             }
             // The apps it may go to, before the press is spent.
             let mut asker_takes = false;
+            let mut install = false;
             let apps: Vec<(String, String)> = if scheme == atrium_links::APP {
                 let Some(id) = app else { return refuse("an atrium-app: link names its app".into()) };
                 match launch::app_name(&id) {
                     Some(name) if id != asker_app => vec![(id, name)],
                     Some(_) => return refuse("an app's link to itself".into()),
-                    None => return refuse(format!("{id} isn't installed")),
+                    // Not here: the install sheet asks the person first (L5);
+                    // atrium-links checked the id's form.
+                    None => {
+                        install = true;
+                        vec![(id.clone(), id)]
+                    }
                 }
             } else {
                 if let Err(why) = atrium_links::declarable(&scheme) {
@@ -1520,8 +1526,9 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 .map(|(id, name)| LinkChoice { default: def.as_deref() == Some(id.as_str()), id, name })
                 .collect();
             list.sort_by_key(|c| !c.default);
-            eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}{}: {} app(s)", persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default(), list.len());
-            Response::LinkGranted { grant, person, apps: list, personas }
+            eprintln!("portcullisd: a {scheme} link from {asker_app} for {person}{}: {} app(s){}", persona.as_deref().map(|p| format!(" ({p})")).unwrap_or_default(), list.len(),
+                      if install { ", not installed: to install first" } else { "" });
+            Response::LinkGranted { grant, person, apps: list, personas, install }
         }
         Request::DeliverLink { grant, app, url, always, persona: into } => {
             let g = match grants.take(&grant, &app, &url, std::time::Instant::now()) {

@@ -212,7 +212,9 @@ and wipes them afterwards.
   recipient is the endpoint, and its persona is the app's own
   (`app-` + 16 bytes of SHA-256 over publisher and app id). So only couriers whose label
   names that persona and that endpoint can fill it. The app itself can't read it back,
-  and another app's courier to the same server gets nothing. The launcher sets a
+  and another app's courier to the same server gets nothing. The app can delete one with
+  `DELETE_FOR` (`endpoint | id`, 2026-11-18: Mail removes an account's password with
+  the account); the plain `DELETE` reaches only items whose recipient is the app. The launcher sets a
   courier's persona from the app that asked for it. The Navigator's web personas come
   with A2.
 - **The request** (`schema.rs`) is a fixed binary frame. It has a method, a path and a
