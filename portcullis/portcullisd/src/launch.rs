@@ -74,6 +74,86 @@ pub fn launch_instance(
     user:    &str,
     stdio:   Option<[OwnedFd; 3]>,
 ) -> Result<LaunchOutcome, LaunchError> {
+    launch_inner(app_id, persona, user, stdio, None)
+}
+
+/// Run dev app `app_id` under the debugger (dev-tools.md §7.2,
+/// dev-tools-plan.md M10): `lldb-server gdbserver` is its parent in its own
+/// jail, speaking over `conn`, a connection a debugger in the workspace
+/// made. Only `dev.` apps (D9): an installed app is refused.
+pub fn launch_debug(app_id: &str, user: &str, conn: OwnedFd) -> Result<LaunchOutcome, LaunchError> {
+    if !app_id.starts_with("dev.") {
+        return Err(LaunchError::Failed("debug", format!("{app_id} is not a dev build: installed apps are never debugged")));
+    }
+    launch_inner(app_id, None, user, None, Some(conn))
+}
+
+/// What a debug run mounts at [`DEBUG_IN_JAIL`]: lldb-server and sh from
+/// the base (copied, so nothing else of /usr/bin goes in), and the script
+/// that starts lldb-server on the debugger's connection. The base's /lib
+/// and /usr/lib go in beside them, read-only, for their libraries, which
+/// the loader is told of with `-o LIBRARY_PATH=`: it isn't put in the
+/// environment, so the app lldb-server starts loads its own as ever.
+const DEBUG_TREE: &str = "/var/lib/atrium/debug";
+const DEBUG_IN_JAIL: &str = "atrium/debug";
+/* ★ jail(8) closes every descriptor above 2, so the connection arrives as
+ * stdin; the script moves it to 3 and gives the program /dev/null. And
+ * jail(8) runs exec.start without a shell when it has no shell characters,
+ * as here. */
+const DEBUG_LD: &str = "/libexec/ld-elf.so.1 -o LIBRARY_PATH=/atrium/debug/lib:/atrium/debug/usr-lib";
+const DEBUG_START: &str = "exec 3<&0 0</dev/null\nexec /libexec/ld-elf.so.1 -o LIBRARY_PATH=/atrium/debug/lib:/atrium/debug/usr-lib /atrium/debug/bin/lldb-server gdbserver --fd 3 -- \"$@\"\n";
+
+fn debug_tree() -> Result<PathBuf, String> {
+    let t = Path::new(DEBUG_TREE);
+    let bin = t.join("bin");
+    fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    let _ = fs::remove_file(bin.join("env"));
+    for (from, to) in [("/usr/bin/lldb-server", "lldb-server"), ("/bin/sh", "sh")] {
+        let dst = bin.join(to);
+        let fresh = fs::metadata(from).and_then(|a| fs::metadata(&dst).map(|b| (a, b)))
+            .is_ok_and(|(a, b)| a.len() == b.len() && b.modified().ok() >= a.modified().ok());
+        if !fresh {
+            fs::copy(from, &dst).map_err(|e| format!("{from}: {e} (is lldb in the base?)"))?;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o555)).map_err(|e| e.to_string())?;
+        }
+    }
+    fs::write(t.join("start"), DEBUG_START).map_err(|e| format!("start: {e}"))?;
+    for d in ["lib", "usr-lib"] {
+        fs::create_dir_all(t.join(d)).map_err(|e| e.to_string())?;
+    }
+    Ok(t.to_path_buf())
+}
+
+/// The app's filter with the `develop` class's added (ptrace, fork and
+/// what lldb-server does), for a debug run only.
+fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_policy::SysfilParams>, LaunchError> {
+    let (Some(a), Some(d)) = (app, sysfil_for_class(DEVELOP_CLASS)?) else { return Ok(None) };
+    let join = |x: &Option<String>, y: &Option<String>| match (x, y) {
+        (None, _) | (_, None) => None,
+        (Some(x), Some(y)) => {
+            let mut v: Vec<&str> = x.split(',').chain(y.split(',')).filter(|s| !s.is_empty()).collect();
+            v.sort();
+            v.dedup();
+            Some(v.join(","))
+        }
+    };
+    Ok(Some(jaild_policy::SysfilParams {
+        mode: a.mode,
+        syscalls: join(&a.syscalls, &d.syscalls),
+        ioctls: join(&a.ioctls, &d.ioctls),
+        sockopts: join(&a.sockopts, &d.sockopts),
+        families: join(&a.families, &d.families),
+    }))
+}
+
+fn launch_inner(
+    app_id:  &str,
+    persona: Option<&str>,
+    user:    &str,
+    stdio:   Option<[OwnedFd; 3]>,
+    debug:   Option<OwnedFd>,
+) -> Result<LaunchOutcome, LaunchError> {
+    let mut stdio = stdio;
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
         return Err(LaunchError::Failed("persona", "invalid persona name".into()));
     }
@@ -139,7 +219,11 @@ pub fn launch_instance(
      * app will: a licence registered during setup must still match at run. */
     let host_identity = portcullis_identity::for_app(&instance_key(&manifest.app.id, persona))
         .map_err(|e| LaunchError::Failed("identity", e.to_string()))?;
-    let sysfil = app_sysfil(&manifest)?;
+    let sysfil = if debug.is_some() { with_develop(app_sysfil(&manifest)?)? } else { app_sysfil(&manifest)? };
+    let debug_tree = match &debug {
+        Some(_) => Some(debug_tree().map_err(|e| LaunchError::Failed("debug", e))?),
+        None => None,
+    };
     let opts = BuildOpts {
         root_path:    jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
@@ -350,6 +434,35 @@ pub fn launch_instance(
             full_teardown(&jail_path, None);
             return Err(LaunchError::Failed("workspace-exec", e));
         }
+    }
+    /* ★ A dev build runs from its bundle's own path (M10), mounted there in
+     * its jail too: the kernel names what a jailed process maps by the
+     * host's path (the nullfs root's lower files), and lldb needs the
+     * program where the process says it was started. The workspace that
+     * made it sees the bundle at the same path (workspace::show_bundle), so
+     * a debugger there, or a core, finds the very files. */
+    let mut entry_at = format!("/{}", manifest.entry());
+    if portcullisd::manifest_trust::is_dev(app_id) && persona.is_none() {
+        let at = Path::new(APPS_DIR).join(app_id);
+        jc.add_mount(&tree, &jail_path.join(at.strip_prefix("/").unwrap_or(&at)), "nullfs", &["ro"]);
+        entry_at = format!("{}/{}", at.display(), manifest.entry());
+        jc.set("exec.start", portcullis_jail::Value::String(entry_at.clone()));
+    }
+    /* ★ Under the debugger (M10): lldb-server is the entry, the app its
+     * child; debugging is allowed in this jail alone, as in a workspace. */
+    if let (Some(conn), Some(t)) = (debug, &debug_tree) {
+        let at = jail_path.join(DEBUG_IN_JAIL);
+        jc.add_mount(t, &at, "nullfs", &["ro"]);
+        jc.add_mount(Path::new("/lib"), &at.join("lib"), "nullfs", &["ro"]);
+        jc.add_mount(Path::new("/usr/lib"), &at.join("usr-lib"), "nullfs", &["ro"]);
+        jc.set("allow.unprivileged_proc_debug", portcullis_jail::Value::Bool(true));
+        jc.set("exec.start", portcullis_jail::Value::String(format!(
+            "{DEBUG_LD} /{DEBUG_IN_JAIL}/bin/sh /{DEBUG_IN_JAIL}/start {entry_at}")));
+        let err = |e: std::io::Error| { full_teardown(&jail_path, None); LaunchError::Failed("debug", e.to_string()) };
+        let out = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned().map_err(err)?;
+        let out2 = out.try_clone().map_err(err)?;
+        stdio = Some([conn, out, out2]);
+        eprintln!("portcullisd: {app_id} starts under lldb-server");
     }
     if let Err(e) = ensure_mountpoints(&jc) {
         full_teardown(&jail_path, None);
