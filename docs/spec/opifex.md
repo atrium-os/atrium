@@ -346,6 +346,12 @@ can declare (limen.md §2.0). The sheet shows:
 - *Install* · *Not now*. *Try it* appears only once `[trial]` exists in portcullis-toml
   (decision 10).
 
+*Asking for another app, as built 2026-11-18 (opening-links.md L5):* `Ask::Install` has an
+optional `for_uid`, the app the install is asked for. opifex-sheetd takes it only from the uids
+in `OPIFEX_SHEET_FOR_OTHERS` (default `_monstrator`, 65038) and answers anyone else `Failed`;
+the declines, the one-at-a-time rule and opifexd's `InstallApproved.for_uid` are then that
+app's, not Monstrator's. A line without it reads as before.
+
 ### 7.2 The steps
 
 ```
