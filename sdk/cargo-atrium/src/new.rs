@@ -75,6 +75,14 @@ const MEDIA: &[File] = &[
     ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/media/cargo-config.toml.tmpl")),
 ];
 
+const SERVICE: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/service/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/service/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/service/src/main.rs")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/service/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/service/cargo-config.toml.tmpl")),
+];
+
 /// (template, what it is, its files).
 pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("app", "a window and nothing else: start here for an app that opens no files and uses no network", APP),
@@ -83,6 +91,7 @@ pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("indexer", "keeps one worker for the app's run and talks to it in messages (word counts of opened text)", INDEXER),
     ("client", "fetches through Nuntius (net-fetch) and parses each response in a worker (a JSON Feed reader)", CLIENT),
     ("media", "plays opened audio and video in the system's media player, embedded through Limen (no codecs in the app)", MEDIA),
+    ("service", "provides a role to other apps: a share target that keeps the text people share to it", SERVICE),
 ];
 
 /// Where an SDK crate is in an Atrium checkout.
@@ -184,6 +193,17 @@ mod tests {
             assert_eq!(targets[0].name, format!("worker:{worker}"));
             assert_eq!(targets[0].function, format!("my_app::workers::{worker}"));
         }
+    }
+
+    #[test]
+    fn service() {
+        let o = Opts { name: "my-service", template: "service", id: None, sdk_path: None, registry: REGISTRY };
+        let f = render(&o).unwrap();
+        assert!(f.iter().all(|x| !x.1.contains("{{")), "unfilled placeholder");
+        let m = &f.iter().find(|x| x.0 == "atrium.toml").unwrap().1;
+        assert!(m.contains("implements = [\"share-target\"]"), "{m}");
+        let (findings, _, _) = crate::check::manifest(m);
+        assert!(findings.iter().all(|x| x.level != crate::check::Level::Error), "{findings:?}");
     }
 
     #[test]
