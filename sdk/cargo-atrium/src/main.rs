@@ -20,6 +20,10 @@ Commands:
       Build for Atrium on that arch from Linux, macOS or the other arch:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
       ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
+  run [--release] [cargo build args]
+      In a workspace: build, put the binary where atrium.toml's entry says,
+      and ask (in the Terminal, with your press) to Run the project as an
+      app, with the capabilities its manifest asks for.
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer
@@ -48,6 +52,7 @@ fn main() -> ExitCode {
         Some("cross") => cmd_cross(&args[1..]),
         Some("registry") => cmd_registry(&args[1..]),
         Some("fuzz") => cmd_fuzz(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -101,7 +106,8 @@ fn cmd_new(args: &[String]) -> ExitCode {
     match new::create(Path::new(&dir), &o) {
         Ok(files) => {
             println!("cargo atrium: made {dir}/ from the {template} template: {}", files.join(", "));
-            println!("  next: cd {dir} && cargo atrium check");
+            let build = if template == "c-app" { "make" } else { "cargo build" };
+            println!("  next: cd {dir} && cargo atrium check && {build}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -149,8 +155,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     };
     let (mut findings, consent, reach) = check::manifest(&text);
-    if let Some(reach) = &reach {
-        let dir = mpath.parent().unwrap_or(Path::new("."));
+    let dir = mpath.parent().unwrap_or(Path::new("."));
+    // A C project has no crate graph to read.
+    if let Some(reach) = reach.as_ref().filter(|_| dir.join("Cargo.toml").is_file()) {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         match Command::new(cargo).args(["metadata", "--format-version", "1"]).current_dir(dir).output() {
             Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout).map_err(|e| e.to_string()).and_then(|v| check::binaries(&v)) {
@@ -559,4 +566,57 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         println!("cargo atrium fuzz: {} runs, {ncrash} crash(es)", p.execs);
     }
     if ncrash > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn cmd_run(args: &[String]) -> ExitCode {
+    let fail = |m: String| {
+        eprintln!("cargo atrium run: {m}");
+        ExitCode::FAILURE
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(mpath) = find_manifest(&cwd) else { return fail("no atrium.toml here or above".into()) };
+    let proj = mpath.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let m = match std::fs::read_to_string(&mpath).map_err(|e| e.to_string())
+        .and_then(|t| t.parse::<toml::Value>().map_err(|e| e.to_string())) {
+        Ok(m) => m,
+        Err(e) => return fail(format!("{}: {e}", mpath.display())),
+    };
+    let Some(entry) = m.get("app").and_then(|a| a.get("entry")).and_then(|e| e.as_str()).map(str::to_string) else {
+        return fail("atrium.toml has no [app] entry".into());
+    };
+    if entry.starts_with('/') || entry.split('/').any(|c| c == ".." || c.is_empty()) {
+        return fail(format!("entry {entry:?} isn't a path in the project"));
+    }
+    let bin = entry.rsplit('/').next().unwrap_or(&entry).to_string();
+    let release = args.iter().any(|a| a == "--release");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    match Command::new(&cargo).arg("build").args(["--bin", &bin]).args(args).current_dir(&proj).status() {
+        Ok(s) if s.success() => {}
+        _ => return fail("build failed".into()),
+    }
+    let tdir = Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).current_dir(&proj).output().ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| proj.join("target"));
+    let built = tdir.join(if release { "release" } else { "debug" }).join(&bin);
+    let dest = proj.join(&entry);
+    let copied = dest.parent().map(std::fs::create_dir_all).unwrap_or(Ok(()))
+        .and_then(|_| std::fs::copy(&built, &dest).map(|_| ()));
+    if let Err(e) = copied {
+        return fail(format!("{} -> {}: {e}", built.display(), dest.display()));
+    }
+    // Run takes the project as a folder in ~/work.
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    let real = std::fs::canonicalize(&proj).unwrap_or(proj.clone());
+    let work = std::fs::canonicalize(home.join("work")).unwrap_or(home.join("work"));
+    let Ok(rel) = real.strip_prefix(&work) else {
+        return fail(format!("{} isn't in ~/work: Run takes a project in this workspace's work folder", real.display()));
+    };
+    let rel = if rel.as_os_str().is_empty() { ".".to_string() } else { rel.display().to_string() };
+    let runner = ["/atrium/bin/atrium-run"].iter().map(PathBuf::from).find(|p| p.is_file()).unwrap_or_else(|| PathBuf::from("atrium-run"));
+    match Command::new(&runner).arg(&rel).status() {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(1, 255) as u8),
+        Err(e) => fail(format!("{}: {e} (Run works in an Atrium workspace's Terminal)", runner.display())),
+    }
 }

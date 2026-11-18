@@ -26,9 +26,17 @@ const APP: &[File] = &[
     ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/app/cargo-config.toml.tmpl")),
 ];
 
+const C_APP: &[File] = &[
+    ("Makefile.tmpl", "Makefile", include_str!("../../templates/c-app/Makefile.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/c-app/atrium.toml.tmpl")),
+    ("main.c.tmpl", "{{name}}.c", include_str!("../../templates/c-app/main.c.tmpl")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/c-app/gitignore.tmpl")),
+];
+
 /// (template, what it is, its files).
 pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("app", "a window and nothing else: start here for an app that opens no files and uses no network", APP),
+    ("c-app", "the same in C: a window on libatrium, a Makefile on atrium.app.mk (make, make run)", C_APP),
 ];
 
 /// Where an SDK crate is in an Atrium checkout.
@@ -85,7 +93,7 @@ pub fn render(o: &Opts) -> Result<Vec<(String, String)>, String> {
             };
             t.replace_range(at..end + 2, &dep);
         }
-        out.push((to.to_string(), t));
+        out.push((to.replace("{{name}}", o.name), t));
     }
     Ok(out)
 }
@@ -111,6 +119,16 @@ pub fn create(dir: &Path, o: &Opts) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_app() {
+        let o = Opts { name: "hello", template: "c-app", id: Some("org.x.hello"), sdk_path: None, registry: REGISTRY };
+        let f = render(&o).unwrap();
+        let names: Vec<&str> = f.iter().map(|x| x.0.as_str()).collect();
+        assert!(names.contains(&"hello.c") && names.contains(&"Makefile"), "{names:?}");
+        assert!(f.iter().any(|x| x.0 == "atrium.toml" && x.1.contains("entry = \"hello\"") && x.1.contains("org.x.hello")));
+        assert!(!f.iter().any(|x| x.1.contains("{{")));
+    }
 
     #[test]
     fn registry_and_path_dependencies() {

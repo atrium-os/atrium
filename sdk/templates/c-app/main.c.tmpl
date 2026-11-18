@@ -1,0 +1,34 @@
+/* {{title}}: a window with a coloured square (template: c-app).
+ *
+ * This program is the app's core: it holds the capabilities in
+ * atrium.toml. Parse what comes from outside (files, the network, other
+ * apps) in a worker or a system service, not here (app-composition.md). */
+#include <stdio.h>
+#include <time.h>
+#include <atrium.h>
+
+int main(void) {
+    if (atrium_init(0, 1) != ATRIUM_OK)
+        fprintf(stderr, "{{name}}: no platform connection, logging to stderr\n");
+    int32_t w = atrium_window_open("{{title}}", 480, 320);
+    if (w < 0) {
+        fprintf(stderr, "{{name}}: no window (%d)\n", w);
+        return 1;
+    }
+    struct timespec tick = { 0, 16 * 1000 * 1000 };
+    for (unsigned n = 0;; n++) {
+        atrium_window_event_t ev;
+        while (atrium_window_poll_event(&ev) == 1)
+            if (ev.kind == ATRIUM_EV_WINDOW_CLOSE_REQUESTED)
+                goto done;
+        float x = 40.0f + (float)(n % 200);
+        atrium_window_frame_begin((uint32_t)w);
+        atrium_window_frame_rect(1, 0, 0, 480, 320, 0.96f, 0.96f, 0.95f, 1);
+        atrium_window_frame_rect(2, x, 120, 80, 80, 0.20f, 0.45f, 0.85f, 1);
+        atrium_window_frame_end();
+        nanosleep(&tick, NULL);
+    }
+done:
+    atrium_window_destroy((uint32_t)w);
+    return 0;
+}
