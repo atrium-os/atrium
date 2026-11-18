@@ -79,6 +79,8 @@ pub trait Attribution: Send {
 pub type Resolve = Box<dyn Fn(u32) -> Option<(String, String)> + Send + Sync>;
 /// (user, role) → the app that provides it (the user's default; limen.md §3.2).
 pub type Defaults = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
+/// (parent app id, role) → whether its manifest lets it embed the role.
+pub type EmbedCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 type ConnId = u64;
 
@@ -172,6 +174,8 @@ pub struct Shared {
     /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
     system_uids: Mutex<HashMap<&'static str, u32>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
+    /// Without one (tests), any app may embed any role.
+    embed_check: Mutex<Option<EmbedCheck>>,
 }
 
 impl Shared {
@@ -188,6 +192,7 @@ impl Shared {
             defaults,
             system_uids: Mutex::new(HashMap::new()),
             attribution: Mutex::new(None),
+            embed_check: Mutex::new(None),
         })
     }
 
@@ -201,6 +206,12 @@ impl Shared {
     /// embedded player gets no ticket and so plays nothing.
     pub fn set_attribution(&self, a: Box<dyn Attribution>) {
         *self.attribution.lock().unwrap() = Some(a);
+    }
+
+    /// Who may embed what: limend's is the installed manifests' `embeds`
+    /// ([`crate::manifests::Installed::may_embed`]).
+    pub fn set_embed_check(&self, c: EmbedCheck) {
+        *self.embed_check.lock().unwrap() = Some(c);
     }
 
     /// Live embeds (tests and logs).
@@ -323,6 +334,12 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     let refuse = |reason| Err(Reply::Refused { reason });
     let Some((user, app)) = (shared.resolve)(uid) else { return refuse(refusal::NOT_AN_APP) };
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
+    if let Some(check) = shared.embed_check.lock().unwrap().as_ref() {
+        if !check(&app, role.name) {
+            eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
+            return refuse(refusal::NOT_EMBEDDABLE);
+        }
+    }
     let mut st = shared.state.lock().unwrap();
     if st.embeds.values().filter(|e| e.parent == conn).count() >= catalogue::MAX_EMBEDS_PER_PARENT {
         return refuse(refusal::TOO_MANY);

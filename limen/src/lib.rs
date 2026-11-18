@@ -6,6 +6,7 @@
 //!   it can be tested without either.
 //! - [`client`]: the parent's and the child's ends.
 //! - [`audio`]: choragusd's attribution tickets for embedded players.
+//! - [`manifests`]: `embeds` and `[roles] implements` from installed manifests.
 //! - [`fdpass`]: the checks on a descriptor a parent passes with a message.
 //! - one module per role's messages: [`credential`], [`doc_viewer`], [`media_player`], [`picker`].
 
@@ -18,6 +19,7 @@ pub mod doc_viewer;
 pub mod fdpass;
 pub mod fresco;
 pub mod launch;
+pub mod manifests;
 pub mod media_player;
 pub mod pdf_viewer;
 pub mod picker;

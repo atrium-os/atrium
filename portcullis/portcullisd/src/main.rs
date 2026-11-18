@@ -368,6 +368,19 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let mut rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule_for(&app_id, &owner, registry.resolve(uid).map(|(_, a)| a)).cloned());
+            /* ★ A Limen provider from its manifest (app-composition.md §5.1,
+             * dev-tools-plan.md M6): an installed app whose `[roles]
+             * implements` names a role, started by limend for a parent it
+             * serves, runs per instance (a uid of that parent's person and
+             * persona), as a system `[workers."id"] callers = ["_limen"],
+             * per_instance = true` rule would have it. Only for limend. */
+            if rule.is_none() && owner == LIMEN_USER && serves.is_some()
+                && launch::installed_manifest(&app_id).and_then(|m| m.roles).is_some_and(|r| !r.implements.is_empty()) {
+                rule = Some(portcullis_policy::WorkerRule {
+                    callers: vec![LIMEN_USER.to_string()], caller_apps: Vec::new(), run_as: String::new(),
+                    per_instance: true, concurrent: Some(PROVIDERS_PER_APP),
+                });
+            }
             /* ★ An app with no system rule starts only its own id, or an id
              * under it (the Navigator's `org.atrium.navigator.converter`),
              * and only as itself: not another app's bundle as its own uid,
@@ -981,6 +994,12 @@ fn handle_exec_instance(
     if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
     write_response(writer, &resp)
 }
+
+/// limend's user: the only caller a manifest's `[roles]` provider is
+/// started for without a system rule.
+const LIMEN_USER: &str = "_limen";
+/// How many embeds of one manifest provider may run at once.
+const PROVIDERS_PER_APP: usize = 32;
 
 /// How many calls of one app's workers may run at once.
 const WORKER_CALLS_PER_APP: usize = 16;

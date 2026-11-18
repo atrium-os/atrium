@@ -234,6 +234,11 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     if !manifest.workers.is_empty() {
         capabilities::apply_socket("workers", &mut jc, opts);
     }
+    /* `embeds` (app-composition.md §5.1): limend's socket. limend checks
+     * each role against this manifest; the mount only lets it ask. */
+    if manifest.capabilities.embeds.as_ref().is_some_and(|e| !e.is_empty()) {
+        capabilities::apply_socket("limen", &mut jc, opts);
+    }
 
     /* ★★ Capability device grants, applied to THIS jail's devfs mount.
      *
