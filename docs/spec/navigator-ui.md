@@ -968,6 +968,25 @@ the child again (`Relayout`) and the sheet gets the new layout. The page's HTML,
 pictures and its fonts never leave the page's jail for this; only the PDF does. Built
 2026-11-18; the confined VM gate opens the sheet over a fixture page and cancels it.
 
+**Forms in the Wi-Fi sign-in window** (atrium-net.md §8.1 S3, P5; Shankar 2026-11-18). The
+Navigator sends no form anywhere, except in the network's sign-in window: its own Navigator
+instance in the reserved `portal` persona, started by portcullisd's `PortalWindow`. There
+navigatord asks `PortalStatus` for the network's name and start address, fetches every page
+through a Nuntius fetcher of the network's own (`OpenPortalFetcher`: its DNS servers, private
+addresses allowed; never navigator-fetchd, Arca, cookies or a persona), keeps no trail and
+opens the start address in an Unrecorded trail. The page child reads the page's plain forms
+(`ToParent::Forms`, limen.md §2.1: text, password, checkbox, radio, hidden and submit fields;
+multipart, `javascript:` actions and file inputs are left out). Under the address bar a panel,
+"Sign in to <network>" and "This network's own page, not a website. Nothing here is kept.",
+shows each form's fields as rows and its buttons; the person types and ticks there, and only a
+press on a button sends (Enter sends nothing). The panel is the window's guarded row while no
+prompt shows (§6.4), so the button's press is spent only if frescod saw it clear. navigatord
+sends the form only if the action, every name and every value the person did not type are
+spelled in the page as recorded: a GET is opened as a link, a POST goes as Nuntius `Form` and
+its answer (a 303 followed as a GET) is converted as any page. The window ends when atrium-net
+says the network is online (asked every 5 s) or after ten minutes. Built 2026-11-18; the
+confined VM gate signs in to a stand-in "Hotel Guest" network.
+
 ---
 
 ## 8. Windows, split, fullscreen, picture-in-picture

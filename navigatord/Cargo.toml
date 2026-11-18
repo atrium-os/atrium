@@ -24,6 +24,7 @@ libc = "0.2"
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 monstrator = { path = "../monstrator" }
 atrium-open = { path = "../atrium-open" }
+nuntius = { path = "../nuntius" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

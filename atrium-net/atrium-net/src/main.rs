@@ -2115,7 +2115,7 @@ mod imp {
         } else if o.mdns_bin.as_ref().is_some_and(|m| !std::path::Path::new(m).exists()) {
             eprintln!("atrium-net: {} not there: no .local names", o.mdns_bin.take().unwrap());
         }
-        let mut mdns_args: Vec<&str> = vec!["--uid", "65037"];
+        let mut mdns_args: Vec<&str> = vec!["--uid", "65049"];
         mdns_args.extend_from_slice(vflag);
         let mut progs: Vec<(u8, &str, &[&str])> = vec![(b'L', o.lease.as_str(), vflag), (b'P', o.probe_bin.as_str(), vflag)];
         if let Some(m) = &o.mdns_bin {

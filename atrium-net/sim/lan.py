@@ -171,7 +171,7 @@ TV = [(121, bytes([0]) + ROUTER + bytes([1, 128]) + ROUTER + bytes([8, 1]) + ROU
        + bytes([24, 203, 0, 113]) + ROUTER)]
 
 
-def handle_dhcp(src_mac, req):
+def handle_dhcp(src_mac, req, dst=b"\xff" * 4):
     if len(req) < 240 or req[0] != 1 or req[236:240] != MAGIC:
         return []
     o, i = {}, 240
@@ -193,8 +193,12 @@ def handle_dhcp(src_mac, req):
     if kind == 1:
         stats["discover"] += 1
     elif kind == 3:
-        if ciaddr != b"\0\0\0\0":
-            stats["renew" if 54 not in o else "request"] += 1
+        if ciaddr != b"\0\0\0\0" and 54 in o:
+            stats["request"] += 1
+        elif ciaddr != b"\0\0\0\0":
+            # RFC 2131 4.4.5: a renewal is unicast to the server; the same
+            # REQUEST broadcast is a rebind (the renewal went unanswered).
+            stats["renew" if dst == ROUTER else "rebind"] += 1
         elif 54 in o:
             stats["request"] += 1
         else:
@@ -732,7 +736,7 @@ def frame(f, relay=None):
     if proto == 17 and len(body) >= 8:
         sport, dport = struct.unpack("!HH", body[:4])
         if dport == 67:
-            return handle_dhcp(src, body[8:])
+            return handle_dhcp(src, body[8:], d)
         if d == WG_GW and dport == WG_PORT and relay is not None:
             stats["wg_out"] = stats.get("wg_out", 0) + 1
             wg_peer = (src, s, sport)

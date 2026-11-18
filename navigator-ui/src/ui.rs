@@ -98,7 +98,7 @@ pub fn trace(s: &mut Shell) {
     if std::env::var_os("NAVIGATOR_UI_TRACE").is_some() {
         let t = s.store.trail();
         eprintln!(
-            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={}",
+            "navigator-ui: trace trail=\"{}\" pages={} trails={} earlier={} where={} prompt={} rail={} url={} live={} page={},{} w={} sections={} section={} form={}",
             t.title(),
             t.pages.len(),
             s.store.trails.len(),
@@ -128,6 +128,13 @@ pub fn trace(s: &mut Shell) {
             // Where to press for Sections, and for its first row.
             s.geo().sections_button.map_or("-".to_string(), |b| format!("{},{}", (b.x() + b.w() / 2.0) as i32, (b.y() + b.h() / 2.0) as i32)),
             s.geo().sections_menu.map_or("-".to_string(), |m| format!("{},{}", (m.x() + m.w() / 2.0) as i32, (m.y() + em(8.0) + em(shell::SECTION_ROW) / 2.0) as i32)),
+            // The sign-in window's form: where to press each row, then each
+            // button ("row:x,y;…|button:x,y;…").
+            {
+                let (rows, buttons, _) = s.form_layout();
+                let at = |v: &[(usize, Rect)]| v.iter().map(|(_, r)| format!("{},{}", (r.x() + em(10.0)) as i32, (r.y() + r.h() / 2.0) as i32)).collect::<Vec<_>>().join(";");
+                if s.form.is_none() { "-".to_string() } else { format!("{}|{}", at(&rows), buttons.iter().map(|(_, r)| format!("{},{}", (r.x() + r.w() / 2.0) as i32, (r.y() + r.h() / 2.0) as i32)).collect::<Vec<_>>().join(";")) }
+            },
         );
     }
 }
@@ -297,6 +304,9 @@ impl View for ShellView {
         }
         if let (Some(r), Some(f)) = (g.find, &s.find) {
             find_bar(ctx, r, f, g.sections_button, s.sections_open, &self.state);
+        }
+        if let (Some(r), Some(n)) = (g.form, &s.portal) {
+            form_bar(ctx, r, n, s.form.as_ref(), s.form_layout(), &self.state);
         }
         if g.rail > em(shell::RAIL_NARROW) {
             rail(ctx, &s, &g, &self.state);
@@ -1108,6 +1118,93 @@ fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, sections_button: Option<
     if let Some(b) = sections_button {
         let st2 = st.clone();
         small_button(ctx, b, None, "Sections", sections_open, "Jump to section", move || with(&st2, |s| s.toggle_sections()));
+    }
+}
+
+/// The sign-in window's bar (atrium-net.md §8.1 S3, P5): whose page this
+/// is, said by the chrome, not the page; then the page's form as the
+/// chrome's own fields, sent only by a press on one of its buttons.
+fn form_bar(ctx: &mut Ctx, r: Rect, network: &str, f: Option<&shell::FormPanel>, layout: (Vec<(usize, Rect)>, Vec<(usize, Rect)>, f32), st: &Mutable<Shell>) {
+    use limen::doc_viewer::FieldKind;
+    let t = ctx.theme;
+    rect(ctx, r.x(), r.y(), r.w(), r.h(), t.bg_surface(), 0.0);
+    rect(ctx, r.x(), r.y() + r.h() - 1.0, r.w(), 1.0, t.border_default(), 0.0);
+    let x = r.x() + em(16.0);
+    let cy = r.y() + em(shell::FORM_HEAD) / 2.0;
+    icon(ctx, x, cy - em(8.0), ph::WIFI_HIGH, 16.0, t.accent_fg());
+    let head = format!("Sign in to {network}");
+    let hs = sans(type_size::SM, Weight::Semibold, t.text_primary());
+    let hw = width(&head, &hs).min(r.w() / 2.0);
+    text(ctx, x + em(24.0), cy, &fit(&head, &hs, r.w() / 2.0), type_size::SM, Weight::Semibold, t.text_primary());
+    let note = "This network's own page, not a website. Nothing here is kept.";
+    let ns = sans(type_size::XS, Weight::Regular, t.text_secondary());
+    text(ctx, x + em(36.0) + hw, cy, &fit(note, &ns, r.w() - hw - em(64.0)), type_size::XS, Weight::Regular, t.text_secondary());
+    let Some(p) = f else { return };
+    let (rows, buttons, cx) = layout;
+    let label_w = cx - x - em(16.0);
+    let cw = em(320.0).min(r.w() - (cx - r.x()) - em(16.0)).max(em(80.0));
+    let ls = sans(type_size::SM, Weight::Regular, t.text_primary());
+    for (i, row) in rows {
+        let fld = &p.form.fields[i];
+        let y = row.y();
+        let row_cy = y + row.h() / 2.0;
+        let st2 = st.clone();
+        match fld.kind {
+            FieldKind::Text | FieldKind::Password => {
+                // The whole row, its label too, gives the field the keys.
+                let rr = Rect::new(x - em(4.0), y + em(2.0), label_w + cw + em(24.0), em(32.0));
+                area(ctx, rr, em(6.0), Color::TRANSPARENT, Color::TRANSPARENT, move || with(&st2, |s| s.form_field(i)));
+                text(ctx, x, row_cy, &fit(&fld.label, &ls, label_w), type_size::SM, Weight::Regular, t.text_secondary());
+                let fr = Rect::new(cx, y + em(4.0), cw, em(28.0));
+                form_field(ctx, fr, &p.edits[i], p.focus == Some(i), fld.kind == FieldKind::Password);
+                ctx.pop();
+            }
+            FieldKind::Checkbox | FieldKind::Radio => {
+                let on = p.checked[i];
+                let rr = Rect::new(x - em(4.0), y + em(2.0), label_w + cw + em(24.0), em(32.0));
+                area(ctx, rr, em(6.0), Color::TRANSPARENT, t.state_hover(), move || with(&st2, |s| s.form_field(i)));
+                let round = if fld.kind == FieldKind::Radio { em(9.0) } else { em(4.0) };
+                let (edge, fill) = if on { (t.accent_mark(), t.accent_bg()) } else { (t.border_control(), t.bg_canvas()) };
+                boxed(ctx, x, row_cy - em(9.0), em(18.0), em(18.0), edge, fill, round);
+                if on {
+                    icon(ctx, x + em(2.0), row_cy - em(7.0), ph::CHECK, 14.0, t.accent_strong());
+                }
+                text(ctx, x + em(28.0), row_cy, &fit(&fld.label, &ls, label_w + cw - em(12.0)), type_size::SM, Weight::Regular, t.text_primary());
+                ctx.pop();
+            }
+            FieldKind::Fixed | FieldKind::Submit => {}
+        }
+    }
+    let bs = sans(type_size::XS, Weight::Medium, t.text_primary());
+    for (i, b) in buttons {
+        let label = fit(&p.form.fields[i].label, &bs, b.w() - em(16.0));
+        let st2 = st.clone();
+        small_button(ctx, b, None, &label, true, "Send this form to the network", move || {
+            let press = pergola::clipboard::current_activation();
+            with(&st2, |s| s.submit_form(i, press))
+        });
+    }
+}
+
+/// One of the form panel's text fields: the caret when it has the keys; a
+/// password as dots.
+fn form_field(ctx: &mut Ctx, f: Rect, edit: &pergola::text_edit::TextEdit, focused: bool, password: bool) {
+    let t = ctx.theme;
+    if focused {
+        boxed(ctx, f.x() - 2.0, f.y() - 2.0, f.w() + 4.0, f.h() + 4.0, t.focus_ring(), t.focus_ring(), em(8.0));
+    }
+    boxed(ctx, f.x(), f.y(), f.w(), f.h(), t.border_control(), t.bg_canvas(), em(6.0));
+    let st = sans(type_size::SM, Weight::Regular, t.text_primary());
+    let raw = edit.text();
+    let shown: String = if password { "•".repeat(raw.chars().count()) } else { raw.to_string() };
+    let tx = f.x() + em(10.0);
+    let cy = f.y() + f.h() / 2.0;
+    text(ctx, tx, cy, &fit(&shown, &st, f.w() - em(20.0)), type_size::SM, Weight::Regular, t.text_primary());
+    if focused {
+        let line = Node::measure_text("Mg", &st).h;
+        let before: String = if password { "•".repeat(raw[..edit.caret()].chars().count()) } else { raw[..edit.caret()].to_string() };
+        let cx = (tx + width(&before, &st)).min(f.x() + f.w() - em(8.0));
+        rect(ctx, cx, cy - line / 2.0, 1.5, line, t.accent_fg(), 0.0);
     }
 }
 

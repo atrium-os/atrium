@@ -148,7 +148,54 @@ pub struct Shell {
     /// F6 asked for the page to have the keys: the main loop hands them
     /// over (frescod `OP_WINDOW_FOCUS_EMBED`) and clears it.
     pub focus_page: bool,
+    /// The network's name when this is its sign-in window (atrium-net.md
+    /// §8.1 S3; `NAVIGATOR_UI_PORTAL` from navigatord): the only window
+    /// whose form panel shows and sends a page's forms.
+    pub portal: Option<String>,
+    /// The sign-in window's form panel, for the page shown.
+    pub form: Option<FormPanel>,
 }
+
+/// The form panel (navigator-ui.md "Forms in the sign-in window"): the
+/// shown page's first plain form as its page child read it, with what the
+/// person types and ticks here, in the chrome; the page never sees it.
+#[derive(Clone, Debug)]
+pub struct FormPanel {
+    pub key: Option<(u64, PageId)>,
+    pub form: limen::doc_viewer::Form,
+    /// One per field; only text and password fields' are used.
+    pub edits: Vec<TextEdit>,
+    pub checked: Vec<bool>,
+    /// The text field with the keys.
+    pub focus: Option<usize>,
+}
+
+impl FormPanel {
+    /// The fields the panel shows a row for (text, password, checkbox,
+    /// radio), by index.
+    pub fn rows(&self) -> Vec<usize> {
+        use limen::doc_viewer::FieldKind::*;
+        self.form.fields.iter().enumerate().filter(|(_, f)| matches!(f.kind, Text | Password | Checkbox | Radio)).map(|(i, _)| i).collect()
+    }
+
+    /// The buttons that send it, by index.
+    pub fn buttons(&self) -> Vec<usize> {
+        self.form.fields.iter().enumerate().filter(|(_, f)| f.kind == limen::doc_viewer::FieldKind::Submit).map(|(i, _)| i).take(4).collect()
+    }
+
+    fn texts(&self) -> Vec<usize> {
+        use limen::doc_viewer::FieldKind::*;
+        self.rows().into_iter().filter(|&i| matches!(self.form.fields[i].kind, Text | Password)).collect()
+    }
+}
+
+/// The form panel's rows and its heading.
+pub const FORM_ROW: f32 = 36.0;
+pub const FORM_HEAD: f32 = 36.0;
+/// A form button's width.
+pub const FORM_BUTTON_W: f32 = 160.0;
+/// The most rows the panel shows; a longer form shows its first ones.
+pub const FORM_ROWS_SHOWN: usize = 8;
 
 /// What F6 moves the keys between (§9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +238,9 @@ pub enum Out {
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
     /// A Navigator window in another persona (§2.4), with the press.
     NewWindow { persona: String, press: navigator_control::Press },
+    /// Send the sign-in page's form (atrium-net.md §8.1 P5), with the press
+    /// on its button.
+    SubmitForm { page: String, jar: navigator_control::Jar, action: String, post: bool, fields: Vec<navigator_control::FormField>, press: navigator_control::Press },
     /// Find in the page on screen (§7; limen `ToChild::Find`).
     Find { query: String, step: i8 },
     /// The current version of the page `key`, fetched again (§5.5).
@@ -284,6 +334,16 @@ pub struct Geo {
     pub sections_button: Option<Rect>,
     /// Space on the toolbar for the current page's media glyph.
     pub media: bool,
+    /// The sign-in window's bar: the network's name and the page's form.
+    pub form: Option<Rect>,
+}
+
+/// The network's name when this window is its sign-in window
+/// (`NAVIGATOR_UI_PORTAL`), cleaned and cut.
+pub fn window_portal() -> Option<String> {
+    let n: String = std::env::var("NAVIGATOR_UI_PORTAL").ok()?.chars().filter(|c| !c.is_control()).collect();
+    let n = limen::doc_viewer::cut(n.trim(), 64);
+    (!n.is_empty()).then_some(n)
 }
 
 /// The window's named persona from the settings, capitalised for the rail
@@ -313,7 +373,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false, portal: window_portal(), form: None }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -454,6 +514,12 @@ impl Shell {
             y += em(FIND);
             r
         });
+        let form = self.portal.as_ref().filter(|_| self.history.is_none()).map(|_| {
+            let rows = self.form.as_ref().map_or(0.0, |f| f.rows().len().min(FORM_ROWS_SHOWN) as f32 + 1.0);
+            let r = Rect::new(x0, y, w - x0, em(FORM_HEAD) + rows * em(FORM_ROW) + if rows > 0.0 { em(8.0) } else { 0.0 });
+            y += r.h();
+            r
+        });
         let prompt = page.filter(|_| self.history.is_none()).and_then(|p| p.asked.as_ref()).map(|_| {
             let r = Rect::new(x0, y, w - x0, em(PROMPT));
             y += em(PROMPT);
@@ -486,7 +552,7 @@ impl Shell {
         let persona_menu = (self.persona_open && rail > em(100.0)).then(|| {
             Rect::new(em(8.0), persona_chip.y() + persona_chip.h() + 4.0, em(PERSONA_W), em(PERSONA_ROW) * self.persona_rows().len() as f32 + em(16.0) + em(26.0))
         });
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button }
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button, form }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -1211,6 +1277,127 @@ impl Shell {
         }
     }
 
+    // -- the sign-in window's form panel (atrium-net.md §8.1 P5) -----------
+
+    /// The shown page's forms, as its child read them: the panel takes the
+    /// first. The same form on the same page keeps what was typed.
+    pub fn set_forms(&mut self, forms: Vec<limen::doc_viewer::Form>) {
+        if self.portal.is_none() {
+            return;
+        }
+        let key = self.shown_key();
+        let Some(form) = forms.into_iter().next() else {
+            self.form = None;
+            return;
+        };
+        if self.form.as_ref().is_some_and(|f| f.key == key && f.form == form) {
+            return;
+        }
+        let n = form.fields.len();
+        let edits = form.fields.iter().map(|f| TextEdit::new(&f.value)).collect();
+        let checked = form.fields.iter().map(|f| f.checked).collect();
+        let mut p = FormPanel { key, form, edits, checked, focus: None };
+        p.focus = p.texts().first().copied();
+        debug_assert_eq!(p.edits.len(), n);
+        self.form = Some(p);
+    }
+
+    /// Where the form panel's rows and buttons are: (field, its row) for
+    /// each row shown, and (field, its button) for each button, and the
+    /// x where the controls start.
+    pub fn form_layout(&self) -> (Vec<(usize, Rect)>, Vec<(usize, Rect)>, f32) {
+        let (Some(r), Some(p)) = (self.geo().form, &self.form) else { return (vec![], vec![], 0.0) };
+        let x = r.x() + em(16.0);
+        let label_w = em(200.0).min(r.w() / 3.0);
+        let cx = x + label_w + em(16.0);
+        let mut y = r.y() + em(FORM_HEAD);
+        let mut rows = Vec::new();
+        for i in p.rows().into_iter().take(FORM_ROWS_SHOWN) {
+            rows.push((i, Rect::new(x, y, r.w() - em(32.0), em(FORM_ROW))));
+            y += em(FORM_ROW);
+        }
+        let buttons = p.buttons().into_iter().enumerate()
+            .map(|(k, i)| (i, Rect::new(cx + k as f32 * em(FORM_BUTTON_W + 12.0), y + em(4.0), em(FORM_BUTTON_W), em(28.0)))).collect();
+        (rows, buttons, cx)
+    }
+
+    /// A press on a field's row: a text field takes the keys, a checkbox
+    /// turns over, a radio button is chosen from its group.
+    pub fn form_field(&mut self, i: usize) {
+        use limen::doc_viewer::FieldKind::*;
+        let Some(p) = &mut self.form else { return };
+        let Some(f) = p.form.fields.get(i) else { return };
+        match f.kind {
+            Text | Password => p.focus = Some(i),
+            Checkbox => p.checked[i] = !p.checked[i],
+            Radio => {
+                let name = f.name.clone();
+                for (j, g) in p.form.fields.iter().enumerate() {
+                    if g.kind == Radio && g.name == name {
+                        p.checked[j] = j == i;
+                    }
+                }
+            }
+            Fixed | Submit => {}
+        }
+    }
+
+    /// A key while the panel has a text field: typed into it; Tab and
+    /// Shift-Tab go through the text fields. Enter sends nothing: a form
+    /// goes only on a press on one of its buttons.
+    pub fn form_key(&mut self, key: Key, m: Modifiers, chars: &str) -> bool {
+        let Some(p) = &mut self.form else { return false };
+        let texts = p.texts();
+        let Some(at) = p.focus.filter(|i| texts.contains(i)) else { return false };
+        if key == Key::Tab {
+            let k = texts.iter().position(|&i| i == at).unwrap_or(0);
+            let n = texts.len();
+            p.focus = Some(texts[if m.shift { (k + n - 1) % n } else { (k + 1) % n }]);
+            return true;
+        }
+        match p.edits[at].key(key, m, chars) {
+            KeyOutcome::Changed => {
+                let t = p.edits[at].text().to_string();
+                if t.len() > navigator_control::FORM_TEXT_MAX || t.chars().any(char::is_control) {
+                    p.edits[at].set_text(&limen::doc_viewer::cut(&t, navigator_control::FORM_TEXT_MAX));
+                }
+                true
+            }
+            KeyOutcome::Copy(t) if p.form.fields[at].kind != limen::doc_viewer::FieldKind::Password => {
+                let _ = pergola::clipboard::copy_text(&t, false);
+                true
+            }
+            KeyOutcome::Submit | KeyOutcome::Copy(_) => true,
+            KeyOutcome::Paste | KeyOutcome::Ignored => false,
+        }
+    }
+
+    /// A press on button `i`: the form goes to navigatord as the page and
+    /// the person filled it, with that button's own name and value.
+    pub fn submit_form(&mut self, i: usize, press: Option<navigator_control::Press>) {
+        use limen::doc_viewer::FieldKind::*;
+        let (Some(p), Some(page)) = (&self.form, self.shown_url()) else { return };
+        if p.form.fields.get(i).is_none_or(|f| f.kind != Submit) || p.key != self.shown_key() {
+            return;
+        }
+        let mut fields = Vec::new();
+        for (j, f) in p.form.fields.iter().enumerate() {
+            if f.name.is_empty() {
+                continue;
+            }
+            let (value, typed) = match f.kind {
+                Fixed => (f.value.clone(), false),
+                Text | Password => (p.edits[j].text().to_string(), true),
+                Checkbox | Radio if p.checked[j] => (f.value.clone(), false),
+                Submit if j == i => (f.value.clone(), false),
+                _ => continue,
+            };
+            fields.push(navigator_control::FormField { name: f.name.clone(), value, typed });
+        }
+        self.last_note = Some(format!("sent \"{}\"", p.form.fields[i].label));
+        self.outbox.push(Out::SubmitForm { page, jar: self.store.trail().jar(), action: p.form.action.clone(), post: p.form.post, fields, press: press.unwrap_or_default() });
+    }
+
     /// The page child's answer.
     pub fn found(&mut self, count: u32, current: u32) {
         if let Some(f) = &mut self.find {
@@ -1516,6 +1703,49 @@ mod tests {
         let (t, _) = s.shown_key().unwrap();
         let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
         assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
+    }
+
+    #[test]
+    fn the_sign_in_window_sends_its_form_as_filled_on_a_press() {
+        use limen::doc_viewer::{Field, FieldKind::*, Form};
+        let f = |kind, name: &str, label: &str, value: &str| Field { kind, name: name.into(), label: label.into(), value: value.into(), checked: false };
+        let form = Form { action: "/login".into(), post: true, fields: vec![
+            f(Fixed, "t", "", "9f"), f(Text, "room", "Room number", ""), f(Password, "pin", "PIN", ""),
+            f(Checkbox, "terms", "I accept", "yes"), f(Submit, "go", "Connect", "1"), f(Submit, "", "Cancel", "")] };
+        // Not the sign-in window: no panel, whatever the page has.
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(true);
+        s.enter("http://10.88.0.1/welcome");
+        s.set_forms(vec![form.clone()]);
+        assert!(s.form.is_none() && s.geo().form.is_none());
+        s.portal = Some("Hotel Guest".into());
+        s.set_forms(vec![form.clone()]);
+        let p = s.form.as_ref().unwrap();
+        assert_eq!((p.rows(), p.buttons(), p.focus), (vec![1, 2, 3], vec![4, 5], Some(1)));
+        assert!(s.geo().form.unwrap().h() > em(FORM_HEAD + 3.0 * FORM_ROW));
+        for c in "4 12".chars() {
+            assert!(s.form_key(Key::Char, Modifiers::default(), &c.to_string()));
+        }
+        assert!(s.form_key(Key::Tab, Modifiers::default(), ""));
+        s.form_key(Key::Char, Modifiers::default(), "7");
+        // Enter sends nothing: only a press on a button does.
+        s.form_key(Key::Enter, Modifiers::default(), "");
+        assert!(s.outbox.is_empty());
+        s.set_forms(vec![form.clone()]);
+        assert_eq!(s.form.as_ref().unwrap().edits[1].text(), "4 12", "the same form again keeps what was typed");
+        s.form_field(3);
+        s.submit_form(4, None);
+        let Some(Out::SubmitForm { page, action, post, fields, jar, .. }) = s.outbox.pop() else { panic!("{:?}", s.outbox) };
+        assert_eq!((page.as_str(), action.as_str(), post), ("http://10.88.0.1/welcome", "/login", true));
+        assert!(matches!(jar, navigator_control::Jar::Unrecorded(_)));
+        let got: Vec<_> = fields.iter().map(|f| (f.name.as_str(), f.value.as_str(), f.typed)).collect();
+        assert_eq!(got, vec![("t", "9f", false), ("room", "4 12", true), ("pin", "7", true), ("terms", "yes", false), ("go", "1", false)]);
+        // A press on what isn't a button sends nothing.
+        s.submit_form(3, None);
+        assert!(s.outbox.is_empty());
+        s.set_forms(vec![]);
+        assert!(s.form.is_none());
     }
 
     #[test]

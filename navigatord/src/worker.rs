@@ -63,6 +63,11 @@ fn portcullisd() -> io::Result<UnixStream> {
     UnixStream::connect(path)
 }
 
+/// portcullisd's socket, for a request of our own.
+pub fn portcullisd_socket() -> io::Result<UnixStream> {
+    portcullisd()
+}
+
 /// Our persona (personas.md §3), as portcullisd's launch registry has it
 /// by our uid: `None` for Personal, else its name and colour; and the
 /// person's other personas (`personal` for Personal).

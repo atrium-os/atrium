@@ -311,20 +311,86 @@ pub fn addresses(ex: &dyn Exchange, name: &str) -> io::Result<Vec<IpAddr>> {
 
 /// Resolve with `dns` (the network's own servers), connect with `net`:
 /// the fetcher of a portal sign-in window (atrium-net.md §8.1). The
-/// address check and pins in `Conversation` apply as ever.
+/// address check and pins in `Conversation` apply as ever, and on top of
+/// the private-network grant this window needs (portals sit on the LAN), it
+/// never reaches the machine itself: loopback, the unspecified address and
+/// the machine's own addresses (`own`, read before the sandbox) are refused.
 pub struct ViaDns {
     pub net: &'static (dyn crate::Connect + Sync),
     pub dns: std::sync::Arc<dyn Exchange>,
+    pub own: Vec<IpAddr>,
+}
+
+impl ViaDns {
+    /// Whether the window may reach `a`: never the machine itself.
+    pub fn off_machine(&self, a: IpAddr) -> bool {
+        let a = match a {
+            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(a),
+            v4 => v4,
+        };
+        !(a.is_loopback() || a.is_unspecified() || self.own.contains(&a))
+    }
+}
+
+/// `ATRIUM_NUNTIUS_OWN=A,B,..`: the host's addresses, from portcullisd (a
+/// jail sees only its own interfaces).
+pub const OWN_ENV: &str = "ATRIUM_NUNTIUS_OWN";
+
+/// The machine's own addresses, for [`ViaDns::own`]: every interface this
+/// process sees, and those portcullisd names in [`OWN_ENV`].
+pub fn own_addresses() -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = std::env::var(OWN_ENV).unwrap_or_default().split(',').filter_map(|a| a.trim().parse().ok()).collect();
+    let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `ifa` with a list freed below; each entry's
+    // address is read according to its family.
+    unsafe {
+        if libc::getifaddrs(&mut ifa) != 0 {
+            return out;
+        }
+        let mut p = ifa;
+        while !p.is_null() {
+            let a = (*p).ifa_addr;
+            if !a.is_null() {
+                match (*a).sa_family as i32 {
+                    libc::AF_INET => {
+                        let s = &*(a as *const libc::sockaddr_in);
+                        out.push(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let s = &*(a as *const libc::sockaddr_in6);
+                        out.push(IpAddr::V6(std::net::Ipv6Addr::from(s.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            p = (*p).ifa_next;
+        }
+        libc::freeifaddrs(ifa);
+    }
+    out
 }
 
 impl crate::Connect for ViaDns {
     fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-        if let Ok(a) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(a, port)]);
+        let v: Vec<IpAddr> = match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+            Ok(a) => vec![a],
+            Err(_) => addresses(&*self.dns, host)?,
+        };
+        let v: Vec<SocketAddr> = v.into_iter().filter(|a| self.off_machine(*a)).map(|a| SocketAddr::new(a, port)).collect();
+        if v.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{host}: only this machine's own addresses (a sign-in window never reaches the machine)")));
         }
-        Ok(addresses(&*self.dns, host)?.into_iter().map(|a| SocketAddr::new(a, port)).collect())
+        Ok(v)
     }
     fn connect_addr(&self, addr: SocketAddr) -> io::Result<std::net::TcpStream> {
+        if !self.off_machine(addr.ip()) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{addr}: this machine (a sign-in window never reaches it)")));
+        }
+        // In the sandbox casper connects only where it resolved
+        // (CAPNET_CONNECTDNS), and these addresses came from the network's
+        // servers or the URL. Its resolving the literal (numeric: nothing
+        // is asked of anyone) is what lets the connect through.
+        self.net.resolve(&addr.ip().to_string(), addr.port())?;
         self.net.connect_addr(addr)
     }
 }
@@ -470,6 +536,27 @@ mod tests {
                 _ => reply(q, 0, &[(28, vec![0xfd, 0x77, 0, 0, 0, 0, 0, 0x88, 0, 0, 0, 0, 0, 0, 0, 1])]),
             })
         }
+    }
+
+    #[test]
+    fn a_sign_in_window_never_reaches_the_machine() {
+        use crate::Connect;
+        let via = ViaDns { net: &crate::Direct, dns: std::sync::Arc::new(Portal), own: vec!["10.88.0.50".parse().unwrap()] };
+        for a in ["127.0.0.1", "::1", "0.0.0.0", "::", "::ffff:127.0.0.1", "10.88.0.50", "::ffff:10.88.0.50"] {
+            assert!(!via.off_machine(a.parse().unwrap()), "{a}");
+            assert_eq!(via.resolve(a, 80).unwrap_err().kind(), io::ErrorKind::PermissionDenied, "{a}");
+            assert_eq!(via.connect_addr(SocketAddr::new(a.parse().unwrap(), 80)).unwrap_err().kind(), io::ErrorKind::PermissionDenied, "{a}");
+        }
+        for a in ["10.88.0.1", "192.168.1.1", "fd77:0:0:88::1", "fe80::1"] {
+            assert!(via.off_machine(a.parse().unwrap()), "{a}");
+        }
+        let v = via.resolve("portal.example", 80).unwrap();
+        assert_eq!(v.len(), 2, "the portal's own addresses pass: {v:?}");
+        assert!(!own_addresses().is_empty(), "this host has a loopback at least");
+        std::env::set_var(OWN_ENV, "10.88.0.50, fd77::88:1,junk");
+        let own = own_addresses();
+        std::env::remove_var(OWN_ENV);
+        assert!(own.contains(&"10.88.0.50".parse().unwrap()) && own.contains(&"fd77::88:1".parse().unwrap()));
     }
 
     #[test]

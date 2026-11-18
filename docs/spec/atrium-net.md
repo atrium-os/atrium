@@ -169,7 +169,7 @@ NXDOMAIN or a refused connection is `internet=no`. Reported in `status` and as
 sandboxed process instead, `atrium-probe`, because Nuntius is a per-app fetcher started by
 portcullisd that cannot be pinned to one interface or ask a given DNS server, and
 atrium-net cannot start anything once in capability mode. atrium-net spawns it before
-`cap_enter`; it chroots to `/var/empty`, drops to uid `_atrium-probe` (65035), and sets
+`cap_enter`; it chroots to `/var/empty`, drops to uid `_atrium-probe` (65048), and sets
 `RLIMIT_NPROC` 0 and `RLIMIT_NOFILE` 8. It needs to connect, so it is not in capability
 mode. It parses one DNS reply and one HTTP head (`probe.rs`, host-fuzzed); atrium-net
 checks the address it reports (ordinary unicast, not one of ours) and the Location
@@ -286,7 +286,7 @@ other name, through the same resolver.
   (`/var/unbound/conf.d/atrium-local.conf`: `stub-zone`, `domain-insecure: "local."`,
   `do-not-query-localhost: no`). Everything else keeps forwarding as now; unbound caches
   the answers.
-- **`atrium-mdns`** answers that stub. One process, uid `_atrium-mdns` (65037), chroot
+- **`atrium-mdns`** answers that stub. One process, uid `_atrium-mdns` (65049), chroot
   `/var/empty`, capability mode, started by atrium-net's spawner like `atrium-lease`. It
   holds three descriptors, all made in the spawner and handed over its fd 3: a TCP socket
   listening on 127.0.0.1:5354 (unbound talks TCP to it: `stub-tcp-upstream`, since capability
@@ -512,6 +512,16 @@ brings it forward on a press; the instance alone may ask `PortalStatus` (→ net
 start URL, online) and `OpenPortalFetcher`. Nuntius gained `Method::Form`: a form's POST
 whose 301/302/303 answer is followed as a GET without the body, as a browser does; plain
 `Post` still never follows.
+
+*S3 built (Navigator thread, 2026-11-18):* the window reads the page's plain forms in its page
+jail and sends one only on a press of its button (navigator-ui.md §7 "Forms in the Wi-Fi
+sign-in window"), polls `PortalStatus` every 5 s and closes when online or after ten minutes.
+Workers' environments carry `ATRIUM_` keys only, so the private grant is
+`ATRIUM_NUNTIUS_PRIVATE_NETWORK=1`. In the sandbox casper connects only to addresses it
+resolved (`CAPNET_CONNECTDNS`), so `ViaDns` has casper resolve each address numerically before
+connecting. The confined VM gate runs it against `portal_standin` (a netconf stand-in: "Hotel
+Guest", the fixture server's /portal/, online once a file exists); the joint run on the
+network thread's portal LAN is next.
 
 P5 (Shankar, 2026-11-18): the sign-in window may send the page's plain HTML forms (text,
 checkboxes, buttons), only on the person's press, and only in that window. Everywhere

@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Hotel Guest Wi-Fi</title></head>
+<body>
+<h1>Welcome to Hotel Guest Wi-Fi</h1>
+<p>Enter your room number and accept the terms to go online.</p>
+<form method="post" action="/portal/login">
+<input type="hidden" name="session" value="a1b2c3">
+<p><label for="room">Room number</label> <input id="room" name="room"></p>
+<p><label><input type="checkbox" name="terms" value="yes"> I accept the terms of use</label></p>
+<p><button type="submit" name="connect" value="1">Connect</button></p>
+</form>
+</body></html>

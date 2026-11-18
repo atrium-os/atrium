@@ -116,6 +116,9 @@ rw_paths = [
     # aura-mlme's mlme.sock, aura-keys' keys.sock.
     "/atrium/sockets/aura",
     "/atrium/sockets/aura-keys",
+    # Arca's SSH agent (arca.md §9.1): its control socket and a folder per
+    # workspace, which portcullisd mounts read-only into that workspace.
+    "/atrium/sockets/ssh-agent",
     # navigatord's ticket socket, the Navigator page jail's one capability
     # (`navigator-page`, navigator-ui.md §2.1).
     "/atrium/sockets/navigator-page",
@@ -517,6 +520,9 @@ allowed_system_uids = [
              # started by dispensatord (capsa-service.sh creates it)
     65032,   # _aura-keys: Aura's key daemon, aura-keys (wifi.md §8.3)
     65033,   # _aura: Aura's MLME daemon, aura-mlme (docs/spec/wifi.md §8.3)
+    # 65034 = _atrium-lease    (atrium-net's DHCP/RA parser: chroot + setuid +
+    #                           Capsicum by atrium-net, no jail; atrium-net.md §5)
+    # 65036 = _atrium-netconf  (atrium-net's settings front, same, §7.1)
     65035,   # _navpage: the Navigator's page children, one jail per page, started
              # by limend under the system worker rule (navigator-page-bundle.sh)
     65037,   # _navui: the Navigator's window, started by navigatord under the
@@ -532,6 +538,13 @@ allowed_system_uids = [
              # system worker rule (nuntius-egress-bundle.sh; dev-tools.md §5.2)
     65045,   # _share: the share sheet, Limen's `share` provider
              # (share-sheet.md; share-sheet-service.sh creates it)
+    65047,   # _arca-ssh: Arca's SSH agent, atrium-ssh-agent (arca.md §9.1;
+             # ssh-agent-service.sh creates it)
+    # 65048 = _atrium-probe    (atrium-net's connectivity probe: chroot + setuid
+    #                           + Capsicum, no jail; atrium-net.md §4.2)
+    # 65049 = _atrium-mdns     (atrium-net's .local answerer, same, §6.1)
+    # 65052 = _crypta-key      (cryptad's Arca key helper: setuid by cryptad
+    #                           itself, no jail; vpn.md "V1 as built")
 ]
 
 [gid]
@@ -560,6 +573,7 @@ allowed_system_gids = [
     65042,   # _opifexsheet
     65044,   # _egress
     65045,   # _share
+    65047,   # _arca-ssh
 ]
 
 

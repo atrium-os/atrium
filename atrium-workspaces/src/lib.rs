@@ -53,6 +53,8 @@ pub enum Act {
     AddHost(String),
     RemoveHost(String, String),
     DefaultHosts(String),
+    /// Open or close the host list's own page (it doesn't fit beside the rest).
+    EditHosts(bool),
 }
 
 /// What the loop asks portcullisd.
@@ -81,6 +83,8 @@ pub struct State {
     /// Index into NETWORKS.
     pub new_net: usize,
     pub confirm_delete: bool,
+    /// The selected workspace's host list page is open.
+    pub editing_hosts: bool,
     /// The form copies this one rather than making a new one.
     pub dup_from: Option<String>,
     /// What is being done now ("Starting scratch…").
@@ -178,6 +182,7 @@ impl State {
                 self.selected = Some(n);
                 self.creating = false;
                 self.confirm_delete = false;
+                self.editing_hosts = false;
                 None
             }
             Act::NewForm => {
@@ -249,6 +254,11 @@ impl State {
                     return None;
                 }
                 Some(Want::Set { name: n, network: None, uses: None, object_cache: None, hosts: Some(hosts) })
+            }
+            Act::EditHosts(on) => {
+                self.editing_hosts = on;
+                self.confirm_delete = false;
+                None
             }
             Act::DefaultHosts(n) => {
                 (!self.find(&n)?.hosts_default).then(|| Want::Set { name: n, network: None, uses: None, object_cache: None, hosts: Some(Vec::new()) })
@@ -486,21 +496,23 @@ impl View for WorkspacesView {
                 .on_change(move |i| push(&qq, Act::SetNetwork(n.clone(), NETWORKS[i].0.into())))
                 .render(ctx);
             y += em(40.0);
-            if ws.network == "registries" {
+            if ws.network == "registries" && s.editing_hosts {
                 // Its one way out is a proxy that reaches only these, on 443
-                // (dev-tools.md §5.2).
+                // (dev-tools.md §5.2). Its own page: two columns.
                 text(ctx, x0, y, if ws.hosts_default { "It reaches the default registries:" } else { "It reaches only these hosts:" },
                      type_size::SM, Weight::Medium, t.text_secondary());
                 y += em(22.0);
+                let rows = (ws.hosts.len() + 1) / 2;
                 for (i, h) in ws.hosts.iter().enumerate() {
-                    text(ctx, x0 + em(8.0), y, h, type_size::SM, Weight::Regular, t.text_primary());
+                    let (cx, cy) = (x0 + em(290.0) * (i / rows.max(1)) as f32, y + em(26.0) * (i % rows.max(1)) as f32);
+                    text(ctx, cx + em(8.0), cy, h, type_size::SM, Weight::Regular, t.text_primary());
                     if ws.hosts.len() > 1 {
                         ctx.key(330 + i as u64);
-                        Button::ghost("Remove").at(x0 + em(240.0), y - em(12.0)).width(em(80.0))
+                        Button::ghost("Remove").at(cx + em(200.0), cy - em(12.0)).width(em(80.0))
                             .on_click(plain(q, Act::RemoveHost(name.clone(), h.clone()))).render(ctx);
                     }
-                    y += em(26.0);
                 }
+                y += em(26.0) * rows as f32 + em(8.0);
                 ctx.key(320);
                 TextField::new(self.host.clone()).placeholder("add a host, e.g. proxy.golang.org").at(x0, y).width(em(230.0)).render(ctx);
                 ctx.key(321);
@@ -510,6 +522,19 @@ impl View for WorkspacesView {
                     Button::ghost("Use the defaults").at(x0 + em(330.0), y).width(em(150.0)).on_click(plain(q, Act::DefaultHosts(name.clone()))).render(ctx);
                 }
                 y += em(48.0);
+                text(ctx, x0, y, "A change stops the workspace; it starts again with its next terminal.", type_size::SM, Weight::Regular, t.text_tertiary());
+                y += em(30.0);
+                ctx.key(323);
+                Button::primary("Done").at(x0, y).width(em(110.0)).on_click(plain(q, Act::EditHosts(false))).render(ctx);
+                return;
+            }
+            if ws.network == "registries" {
+                let n = ws.hosts.len();
+                let line = if ws.hosts_default { format!("It reaches the {n} default registries.") } else { format!("It reaches only {n} hosts of its own.") };
+                text(ctx, x0, y, &line, type_size::SM, Weight::Regular, t.text_secondary());
+                ctx.key(324);
+                Button::secondary("Edit hosts…").at(x0 + em(240.0), y - em(14.0)).width(em(120.0)).on_click(plain(q, Act::EditHosts(true))).render(ctx);
+                y += em(28.0);
             }
             text(ctx, x0, y, "A change stops the workspace; it starts again with its next terminal.", type_size::SM, Weight::Regular, t.text_tertiary());
             y += em(36.0);

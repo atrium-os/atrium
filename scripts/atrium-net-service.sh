@@ -24,9 +24,9 @@ for f in atrium-net atrium-lease atrium-probe atrium-netconf atrium-netctl; do
 done
 
 id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
-id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'
+id -u _atrium-probe 2>/dev/null | grep -qx 65048 || { pw userdel _atrium-probe 2>/dev/null || true; pw useradd _atrium-probe -u 65048 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'; }
 id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net settings front'
-id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
+id -u _atrium-mdns 2>/dev/null | grep -qx 65049 || { pw userdel _atrium-mdns 2>/dev/null || true; pw useradd _atrium-mdns -u 65049 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'; }
 # atrium-lease and atrium-probe chroot here.
 install -d -m 0555 /var/empty
 

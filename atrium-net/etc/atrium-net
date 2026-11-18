@@ -27,7 +27,7 @@
 #   atrium_net_logfile="/var/log/atrium/atrium-net.log"
 #
 # Needs (commissioned once): the _atrium-lease (65034) and _atrium-probe
-# (65035) users, /usr/local/libexec/atrium-lease and atrium-probe, and
+# (65048) users, /usr/local/libexec/atrium-lease and atrium-probe, and
 # local-unbound set up (`local-unbound-setup`), whose control socket
 # /var/run/local_unbound.ctl atrium-net uses to set forwarders.
 

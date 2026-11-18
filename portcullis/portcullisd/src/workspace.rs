@@ -709,6 +709,10 @@ pub fn work_dir(owner: &str, name: &str) -> Result<PathBuf, String> {
 
 pub fn delete(owner: &str, name: &str) -> Result<(), String> {
     check_delete(owner, name)?;
+    let persona = person(owner).ok()
+        .and_then(|(home, gid)| root_dir(&home, gid).ok())
+        .and_then(|d| load(&d.join(name)))
+        .map(|r| r.persona);
     stop(owner, name);
     if running_jid(owner, name).is_some() {
         return Err(format!("{name} is still running"));
@@ -733,6 +737,9 @@ pub fn delete(owner: &str, name: &str) -> Result<(), String> {
     }
     fs::remove_dir_all(&dir).map_err(|e| format!("delete {}: {e}", dir.display()))?;
     let _ = fs::remove_dir(&jp);
+    if let Some(p) = persona {
+        crate::ssh_agent::forget(owner, name, &p);
+    }
     eprintln!("portcullisd: workspace {name} of {owner} deleted");
     Ok(())
 }
@@ -883,6 +890,14 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     if r.network == "registries" {
         env.extend(egress::proxy_env());
     }
+    // Arca's SSH agent (M9): its socket for this workspace, mounted below
+    // when the jail is made; a jail made before the agent ran has none.
+    let agent = crate::ssh_agent::open(owner, name, &r.persona, uid);
+    let jp = jail_path(owner, name);
+    let mounted = jp.join(crate::ssh_agent::IN_JAIL).join("agent.sock").exists();
+    if agent.is_some() && (running_jid(owner, name).is_none() || mounted) {
+        env.push(crate::ssh_agent::AUTH_SOCK.into());
+    }
     let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
         return Ok(Running { jid, ..running });
@@ -905,7 +920,6 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     }
     seed_etc(&root, &user, uid, gid, files, &home_in)?;
 
-    let jp = jail_path(owner, name);
     fs::create_dir_all(&jp).map_err(|e| format!("{}: {e}", jp.display()))?;
     let _ = launch::umount_silent(&jp);
     launch::run("mount", &["-t", "nullfs", "-o", "rw", root.to_str().unwrap_or(""), jp.to_str().unwrap_or("")])
@@ -965,6 +979,11 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     }
     if let Some(o) = &objects {
         jc.add_mount(o, &jp.join(OBJECTS_IN_JAIL), "nullfs", &["rw"]);
+    }
+    // ★ Read-only: the workspace connects to its socket and can put
+    // nothing beside it.
+    if let Some(d) = &agent {
+        jc.add_mount(d, &jp.join(crate::ssh_agent::IN_JAIL), "nullfs", &["ro"]);
     }
     // ★ Read-only, shared by every workspace that names the same version.
     for (src, at) in &layer_dirs {
@@ -1037,6 +1056,7 @@ pub fn stop(owner: &str, name: &str) {
         .is_some_and(|r| r.network == "outbound");
     launch::remove_persistent(&jail_name(owner, name), &jail_path(owner, name), networked);
     egress::stop(&jail_name(owner, name));
+    crate::ssh_agent::close(owner, name);
     eprintln!("portcullisd: workspace {name} of {owner} stopped");
 }
 

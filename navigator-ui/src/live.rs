@@ -74,6 +74,9 @@ struct Child {
     reading: Reading,
     /// Its page's sections, from `Loaded` (§7 "Jump to section").
     sections: Vec<(String, String)>,
+    /// Its page's plain forms (limen `Forms`), for the sign-in window's
+    /// form panel.
+    forms: Vec<limen::doc_viewer::Form>,
 }
 
 pub struct Live {
@@ -400,6 +403,7 @@ impl Live {
             knows,
             reading,
             sections: Vec::new(),
+            forms: Vec::new(),
         });
         s.live = Some(LivePage::Loading(url.clone()));
         let fresh = self.fresh.remove(&key);
@@ -700,6 +704,11 @@ impl Live {
                         }
                         changed = true;
                     }
+                    Some(ToParent::Forms { forms }) => {
+                        eprintln!("navigator-ui: the page has {} form(s)", forms.len());
+                        self.children[i].forms = forms;
+                        changed = true;
+                    }
                     Some(ToParent::Found { count, current, .. }) => {
                         if on_screen {
                             eprintln!("navigator-ui: find: {count} matches, at {current}");
@@ -800,6 +809,11 @@ impl Live {
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
                 Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
+                Out::SubmitForm { page, jar, action, post, fields, press } => {
+                    let id = self.id();
+                    self.activations.insert(id, false);
+                    send(&mut self.w, &Request::SubmitForm { id, page, jar, action, post, fields, press });
+                }
                 Out::Hand { url, how, press } => send(&mut self.w, &Request::Hand { url, how, press }),
                 Out::NewWindow { persona, press } => send(&mut self.w, &Request::NewWindow { persona, press }),
                 Out::Reload { key } => {
@@ -836,6 +850,17 @@ impl Live {
                         self.to_child(c.embed, &ToChild::ScrollTo { anchor });
                     }
                 }
+            }
+        }
+        // The page shown's forms, for the sign-in window's form panel.
+        if s.portal.is_some() {
+            let shown = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k));
+            let forms = shown.map(|c| c.forms.clone()).unwrap_or_default();
+            let now = s.form.as_ref().map(|f| (f.key, f.form.clone()));
+            let want = forms.first().map(|f| (s.shown_key(), f.clone()));
+            if now != want {
+                s.set_forms(forms);
+                changed = true;
             }
         }
         // The page shown's sections, for the find bar.

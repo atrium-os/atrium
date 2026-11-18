@@ -450,7 +450,7 @@ n3() {
     sh "$AP" ssh "ip addr add 192.0.2.80/32 dev lo 2>/dev/null; echo ok > /tmp/inet-mode; pkill -f '[i]net.py'; (nohup python3 /tmp/inet.py >/tmp/inet.log 2>&1 &); sleep 2; true"
     "$V" "set -e
         ifconfig vtnet1 >/dev/null 2>&1 || { echo 'no vtnet1: boot with the vms step'; exit 1; }
-        id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'
+        id -u _atrium-probe 2>/dev/null | grep -qx 65048 || { pw userdel _atrium-probe 2>/dev/null || true; pw useradd _atrium-probe -u 65048 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'; }
         pkill -f 'nc -lkU /tmp/netd' 2>/dev/null || true
         rm -rf /tmp/netd && mkdir -p /tmp/netd
         daemon -f -o /tmp/netd/events nc -lkU /tmp/netd/ctl.sock
