@@ -14,6 +14,8 @@ icon        = "bell"
 graphics = "fresco"
 notify   = true
 network  = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [supervision]
 restart    = "on-crash"

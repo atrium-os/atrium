@@ -63,7 +63,13 @@ pub fn picture(data: &ImageData, w: f64, h: f64) -> Option<Image> {
             c.bytes -= old.bytes;
         }
         c.decodes += 1;
+        let t = std::time::Instant::now();
         let image = decode(&data.bytes, target).map(|(w, h, rgba)| Image::new(w, h, rgba));
+        if c.decodes <= 3 {
+            // The first few, for measuring where pictures are decoded.
+            eprintln!("officina: picture {} decoded in {:.1} ms ({})", c.decodes, t.elapsed().as_secs_f64() * 1000.0,
+                      if officina_text::picture::decoder().is_some() { "worker" } else { "in-process" });
+        }
         let bytes = image.as_ref().map_or(0, |i| i.data().rgba.len());
         // Make room, least recently used first.
         while c.bytes + bytes > BUDGET && !c.map.is_empty() {

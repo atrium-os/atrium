@@ -1108,8 +1108,8 @@ Stalwart in the cloud VM, and later a real account):
    addresses with signatures; a reply comes from the address it was sent to (E12);
    changing From swaps the signature. **Compose window**: a Pergola window per message
    (From, To, Cc, Bcc, Subject, the text), Send only with a press's activation token
-   (Ctrl+Enter counts), Send later (in an hour, tomorrow 08:00, Monday 08:00; UTC until
-   apps get time zones), Discard, the forgotten-attachment question once; the main window
+   (Ctrl+Enter counts), Send later (in an hour, tomorrow 08:00, Monday 08:00; local time,
+   see M8), Discard, the forgotten-attachment question once; the main window
    has Write (c), Reply (r), Reply all (a), Forward (f) and a "Sending… Undo" toast whose
    Undo opens the message again; `mailto:` links arrive on the document channel; drafts
    whose windows were open reopen at start. **Rich text**: `RichTextEditor` (one page as
@@ -1195,7 +1195,7 @@ Stalwart in the cloud VM, and later a real account):
    language, saved searches, list rules and screener, Later rules and follow-up,
    notification rules, and window tests for search, unsubscribe/block/screener and Later.
    **Not yet**: a settings page (screener switch, review time, quiet hours, sounds,
-   VIPs), times in the person's time zone (UTC for now), Later notes typed in the sheet,
+   VIPs), times in the person's time zone (built later, see M8), Later notes typed in the sheet,
    the weekly look and the 7/30-day overdue rules, `$Snoozed` and a server *Snoozed*
    folder, quick filters and grouping (§11.7), server-side search outside the offline
    window, Praeco's longer posts and event times (tabula.md §5.3–5.4, so freshness uses
@@ -1450,6 +1450,18 @@ Stalwart in the cloud VM, and later a real account):
    of their own in jails with no addresses and only unix sockets. Start time was the
    same before and after. Not yet: an amd64 bundle (no amd64 sysroot on the Mac), and
    `vm-workers-check.sh` as written (amd64 cloud VM).
+
+   **Local time (2026-11-18)**: Mail's times follow the time zone the system gives the app
+   (`mail_engine::clock`: localtime(3), so `TZ`, else `/etc/localtime`; with neither,
+   UTC as before). That covers the list's and reader's dates, Send later's "tomorrow at
+   08:00" and "Monday at 08:00", Later's evening, morning, weekend and next-week times,
+   the daily review's day and hour, quiet hours, and the days of `before:` and `after:`.
+   A wall-clock time becomes a moment with the offset of that moment, so a
+   daylight-saving change in between is right. Tests: the date and choice functions on
+   wall-clock times, and a test that what is chosen is what is shown; both suites pass
+   under UTC, Asia/Kolkata and America/New_York. On Atrium, app and worker jails get
+   the machine's zone file as `/etc/localtime` (portcullis-jail, 9e07795); a changed zone
+   reaches Mail on its next launch.
 
 ## 17. Decisions, with recommendations
 

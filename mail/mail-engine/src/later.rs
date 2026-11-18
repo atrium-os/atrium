@@ -1,8 +1,8 @@
 //! *Later* (mail.md §11.4): one action for flag, snooze and pin. A
 //! conversation set aside leaves the inbox and comes back at its time;
 //! a reply closes a *Reply* item, someone's answer closes a *Waiting* one,
-//! and new mail to the person brings it back at once. Times are UTC until
-//! Atrium's time zones reach apps.
+//! and new mail to the person brings it back at once. Times are the person's
+//! local time ([`crate::clock`]).
 
 use mail_store::later::{kind, Later};
 use mail_store::senders::why;
@@ -38,8 +38,14 @@ impl When {
         }
     }
 
-    /// The time it names, from `now`.
+    /// The time it names, from `now`, in the person's time zone.
     pub fn at(self, now: i64) -> i64 {
+        crate::clock::from_local(self.at_local(crate::clock::to_local(now)))
+    }
+
+    /// The wall-clock time it names, from wall-clock `now` (both as
+    /// seconds since 1970 as if local time were UTC).
+    pub fn at_local(self, now: i64) -> i64 {
         let day = now.div_euclid(86_400) * 86_400;
         // 1970-01-01 was a Thursday: 0 = Monday.
         let weekday = (now.div_euclid(86_400) + 3).rem_euclid(7);
@@ -244,11 +250,11 @@ mod tests {
     fn times() {
         let mon = 1_795_425_660; // Mon 2026-11-23 09:21 UTC
         let day = 1_795_392_000;
-        assert_eq!(When::Evening.at(mon), day + 18 * 3600);
-        assert_eq!(When::Evening.at(day + 19 * 3600), day + 86_400 + 18 * 3600);
-        assert_eq!(When::Tomorrow.at(mon), day + 86_400 + 9 * 3600);
-        assert_eq!(When::Weekend.at(mon), day + 5 * 86_400 + 9 * 3600);
-        assert_eq!(When::NextWeek.at(mon), day + 7 * 86_400 + 9 * 3600);
-        assert_eq!(When::Someday.at(mon), day + 30 * 86_400 + 9 * 3600);
+        assert_eq!(When::Evening.at_local(mon), day + 18 * 3600);
+        assert_eq!(When::Evening.at_local(day + 19 * 3600), day + 86_400 + 18 * 3600);
+        assert_eq!(When::Tomorrow.at_local(mon), day + 86_400 + 9 * 3600);
+        assert_eq!(When::Weekend.at_local(mon), day + 5 * 86_400 + 9 * 3600);
+        assert_eq!(When::NextWeek.at_local(mon), day + 7 * 86_400 + 9 * 3600);
+        assert_eq!(When::Someday.at_local(mon), day + 30 * 86_400 + 9 * 3600);
     }
 }

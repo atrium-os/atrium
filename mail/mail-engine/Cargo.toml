@@ -7,6 +7,7 @@ publish = false
 description = "Mail's engine (docs/spec/mail.md §4, §6): the store and index for one instance, fed by mail-sync; every message is parsed in a parse jail (mail-parse-jail) and only the checked summary is kept. No network of its own (remote pictures go through the caller's Nuntius channel), parses nothing itself."
 
 [dependencies]
+libc = "0.2"
 # The parser as Mail's `parse` worker when installed (dev-tools-plan.md M5).
 atrium-worker = { path = "../../sdk/atrium-worker" }
 mail-compose = { path = "../mail-compose" }

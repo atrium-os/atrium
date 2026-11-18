@@ -917,6 +917,10 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
 
     out.push_str("<table:table table:name=\"");
     esc(out, &name);
+    if sh.tab_color.is_some() {
+        // Its tab colour (tableooo:tab-color) is on table style "taS{s}".
+        let _ = write!(out, "\" table:style-name=\"taS{s}");
+    }
     out.push_str("\">");
     // Charts on this sheet, as frames anchored to it.
     let mut shapes = String::new();
@@ -1194,6 +1198,11 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     // Styles: data styles and cell styles for every style in the table.
     let mut auto = String::new();
+    for s in 0..wb.sheet_count() as u16 {
+        if let Some(c) = wb.sheet(s).tab_color {
+            let _ = write!(auto, r##"<style:style style:name="taS{s}" style:family="table" style:master-page-name="Default"><style:table-properties table:display="true" style:writing-mode="lr-tb" tableooo:tab-color="#{:06x}"/></style:style>"##, c & 0xFF_FFFF);
+        }
+    }
     for (&key, &i) in &col_style {
         let _ = write!(auto, r#"<style:style style:name="co{i}" style:family="table-column"><style:table-column-properties fo:break-before="auto" style:column-width="{}"/></style:style>"#, len_in(key as f64 / 64.0));
     }

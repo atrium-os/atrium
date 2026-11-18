@@ -21,8 +21,14 @@ pub mod view;
 pub use view::{MailView, Ui};
 
 /// A date for the list: the time today, the day and month this year,
-/// else the full date. UTC until Atrium's time zones reach apps.
+/// else the full date; in the person's time zone.
 pub fn date_text(t: i64, now: i64) -> String {
+    use mail_engine::clock::to_local;
+    date_text_local(to_local(t), to_local(now))
+}
+
+/// [`date_text`] of wall-clock times (seconds as if local time were UTC).
+pub fn date_text_local(t: i64, now: i64) -> String {
     let (y, m, d, hh, mm) = civil(t);
     let (ny, nm, nd, _, _) = civil(now);
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -35,14 +41,20 @@ pub fn date_text(t: i64, now: i64) -> String {
     }
 }
 
-/// The reader's full date: "17 Nov 2026, 09:41".
+/// The reader's full date: "17 Nov 2026, 09:41", in the person's time
+/// zone.
 pub fn full_date(t: i64) -> String {
+    full_date_local(mail_engine::clock::to_local(t))
+}
+
+/// [`full_date`] of a wall-clock time.
+pub fn full_date_local(t: i64) -> String {
     let (y, m, d, hh, mm) = civil(t);
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     format!("{d} {} {y}, {hh:02}:{mm:02}", MONTHS[m as usize - 1])
 }
 
-/// (year, month, day, hour, minute) of seconds since the epoch, UTC
+/// (year, month, day, hour, minute) of seconds since the epoch as UTC
 /// (Howard Hinnant's civil_from_days).
 fn civil(t: i64) -> (i64, u32, u32, u32, u32) {
     let days = t.div_euclid(86_400);
@@ -83,10 +95,10 @@ mod tests {
     #[test]
     fn dates() {
         let now = 1_795_425_660; // 2026-11-23 09:21 UTC
-        assert_eq!(date_text(now - 60, now), "09:20");
-        assert_eq!(date_text(now - 3 * 86_400, now), "20 Nov");
-        assert_eq!(date_text(now - 400 * 86_400, now), "19 Oct 2025");
-        assert_eq!(full_date(now), "23 Nov 2026, 09:21");
+        assert_eq!(date_text_local(now - 60, now), "09:20");
+        assert_eq!(date_text_local(now - 3 * 86_400, now), "20 Nov");
+        assert_eq!(date_text_local(now - 400 * 86_400, now), "19 Oct 2025");
+        assert_eq!(full_date_local(now), "23 Nov 2026, 09:21");
     }
 
     #[test]
@@ -94,5 +106,27 @@ mod tests {
         assert_eq!(folder_label("INBOX", mail_store::Role::Inbox), "Inbox");
         assert_eq!(folder_label("Work/Projects/Q4", mail_store::Role::Other), "Q4");
         assert_eq!(folder_label("[Gmail]/All Mail", mail_store::Role::All), "All mail");
+    }
+}
+
+#[cfg(test)]
+mod local_time {
+    use super::*;
+    use mail_engine::clock::{from_local, to_local};
+
+    /// Whatever the machine's time zone, a wall-clock time shown is the
+    /// one chosen, and "tomorrow at 08:00" is 08:00 here.
+    #[test]
+    fn shown_as_chosen() {
+        let now = 1_795_425_660;
+        for c in crate::compose::later_choices(now).iter().skip(1) {
+            assert!(full_date(c.at).ends_with(", 08:00"), "{}", full_date(c.at));
+            assert_eq!(full_date(c.at), full_date_local(to_local(c.at)));
+        }
+        let l = to_local(now);
+        assert_eq!(from_local(l), now);
+        assert_eq!(date_text(now - 60, now), date_text_local(to_local(now - 60), l));
+        let evening = mail_engine::later::When::Evening.at(now);
+        assert!(full_date(evening).ends_with(", 18:00"), "{}", full_date(evening));
     }
 }

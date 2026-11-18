@@ -39,6 +39,21 @@ fn handle(a: Ask, f: Option<std::fs::File>) -> Result<Answer, String> {
             format!("held {} MiB", v.iter().map(|b| b.len()).sum::<usize>() >> 20)
         }
         "ifs" => net_view(),
+        // The UTC offset localtime(3) gives here, as date +%z would print it.
+        "tz" => {
+            extern "C" { fn tzset(); }
+            unsafe { tzset() };
+            let now = unsafe { libc::time(std::ptr::null_mut()) };
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe { libc::localtime_r(&now, &mut tm) };
+            let off = tm.tm_gmtoff / 60;
+            let z = format!("{}{:02}{:02}", if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60);
+            match std::fs::metadata("/etc/localtime") {
+                Ok(m) if m.len() > 0 => z,
+                Ok(m) => format!("{z} (/etc/localtime is {} bytes)", m.len()),
+                Err(e) => format!("{z} (/etc/localtime: {e})"),
+            }
+        }
         "fail" => return Err("asked to fail".into()),
         "crash" => std::process::exit(3),
         "sleep" => { std::thread::sleep(std::time::Duration::from_secs(60)); String::new() }

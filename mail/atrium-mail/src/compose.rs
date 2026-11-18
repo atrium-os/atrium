@@ -68,9 +68,20 @@ pub struct Later {
     pub at: i64,
 }
 
-/// The choices Send later offers at `now` (UTC until apps get time zones):
-/// in an hour, tomorrow at 08:00, next Monday at 08:00.
+/// The choices Send later offers at `now`: in an hour, tomorrow at 08:00,
+/// next Monday at 08:00, in the person's time zone.
 pub fn later_choices(now: i64) -> Vec<Later> {
+    use mail_engine::clock::{from_local, to_local};
+    let mut c = later_choices_local(to_local(now));
+    c[0].at = now + 3600;
+    for l in &mut c[1..] {
+        l.at = from_local(l.at);
+    }
+    c
+}
+
+/// [`later_choices`] in wall-clock times.
+pub fn later_choices_local(now: i64) -> Vec<Later> {
     let day = 86_400;
     let midnight = now - now.rem_euclid(day);
     let tomorrow = midnight + day + 8 * 3600;
@@ -1265,10 +1276,10 @@ mod tests {
     #[test]
     fn later() {
         let now = 1_795_425_660; // Mon 23 Nov 2026 09:21 UTC
-        let c = later_choices(now);
+        let c = later_choices_local(now);
         assert_eq!(c[0].at, now + 3600);
-        assert_eq!(crate::full_date(c[1].at), "24 Nov 2026, 08:00");
-        assert_eq!(crate::full_date(c[2].at), "30 Nov 2026, 08:00");
+        assert_eq!(crate::full_date_local(c[1].at), "24 Nov 2026, 08:00");
+        assert_eq!(crate::full_date_local(c[2].at), "30 Nov 2026, 08:00");
     }
 
     #[test]

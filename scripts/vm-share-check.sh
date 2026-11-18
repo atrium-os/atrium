@@ -156,6 +156,27 @@ V "grep -q 'share-demo: cancelled' $S/demo.log" && ok "Cancel: the app hears Can
 [ "$(V "grep -c 'started org.test' $S/limend.log")" = "$n" ] && ok "and nothing was started" || bad "a target started after a cancel"
 shot 4 share-cancelled
 
+echo "== the keyboard: Escape, then Down Down Return"
+key() { inj "KEY $1 1"; sleep 1; inj "KEY $1 0"; sleep 2; }
+# HID usages: Return 0x28, Escape 0x29, Down 0x51.
+c=$(V "grep -c 'share-demo: cancelled' $S/demo.log")
+press 688 28
+sleep 10
+key 0x28
+V "grep -q 'chose ' $S/sheet.log && [ \$(grep -c 'chose ' $S/sheet.log) -gt 1 ]" && bad "Return before a pick chose something" || ok "Return before any pick chooses nothing (a key typed into the app)"
+key 0x29
+[ "$(V "grep -c 'share-demo: cancelled' $S/demo.log")" -gt "$c" ] && ok "Escape: the app hears Cancelled" || bad "escape: $(V "tail -3 $S/demo.log $S/sheet.log | tr '\n' ';'")"
+a=$(V "grep -c 'share-demo: accepted' $S/demo.log")
+press 688 28
+sleep 10
+key 0x51; key 0x51
+shot 1 share-keys
+key 0x28
+[ "$(V "grep -c 'chose org.test.scraps' $S/sheet.log")" -ge 2 ] && ok "Down, Down, Return chose Scraps, the second row" || bad "keys: $(V "tail -3 $S/sheet.log $S/demo.log | tr '\n' ';'")"
+sleep $WAIT
+press 588 452
+[ "$(V "grep -c 'share-demo: accepted' $S/demo.log")" -gt "$a" ] && ok "and Scraps took it" || bad "keys keep: $(V "tail -3 $S/demo.log | tr '\n' ';'")"
+
 echo "== clean up"
 V "pkill -f share-; pkill -x limend-dev; pkill -x frescod; true"
 for f in frescod limend sheet unasked demo; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done

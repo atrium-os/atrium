@@ -239,6 +239,8 @@ struct Styles {
     data: HashMap<String, DataStyle>,
     col_width: HashMap<String, f64>,
     row_height: HashMap<String, f64>,
+    /// Table styles' `tableooo:tab-color`, 0xRRGGBB.
+    tab_color: HashMap<String, u32>,
     /// Font face name → family.
     faces: HashMap<String, String>,
     /// Cell styles with `style:map` conditions.
@@ -298,6 +300,11 @@ impl Styles {
                         "style:table-column-properties" if cur_family == "table-column" => {
                             if let Some(w) = a.get("style:column-width").and_then(|w| length_px(w)) {
                                 self.col_width.insert(cur_name.clone(), w);
+                            }
+                        }
+                        "style:table-properties" if cur_family == "table" => {
+                            if let Some(c) = a.get("tableooo:tab-color").and_then(|v| v.strip_prefix('#')).and_then(|v| u32::from_str_radix(v, 16).ok()) {
+                                self.tab_color.insert(cur_name.clone(), c & 0xFF_FFFF);
                             }
                         }
                         "style:table-row-properties" if cur_family == "table-row" => {
@@ -834,7 +841,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         if n.is_empty() || wb.sheet_id(&n).is_some() {
                             n = format!("Sheet{}", wb.sheet_count() + 1);
                         }
-                        sheet = Some(wb.add_sheet(&n).map_err(bad)?);
+                        let id = wb.add_sheet(&n).map_err(bad)?;
+                        wb.sheet_mut(id).tab_color = a.get("table:style-name").and_then(|t| styles.tab_color.get(t)).copied();
+                        sheet = Some(id);
                         row = 0;
                         col_x = 0;
                         col_defaults.clear();

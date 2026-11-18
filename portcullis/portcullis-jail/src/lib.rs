@@ -270,6 +270,13 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
             .map(|s| (manifest.app.id.clone(), s));
     }
 
+    /* Local time: a copy of the machine's zone file at /etc/localtime, so
+     * localtime(3) in an app gives the person's time rather than UTC. Public
+     * data, so no capability asks for it. None set (UTC): nothing copied. */
+    if let Some(zone) = system_zone() {
+        jc.copies.push((zone, opts.root_path.join("etc/localtime")));
+    }
+
     /* The system call filter, fixed at creation (jail-sysfil.md §3.2). */
     if let Some(f) = &opts.sysfil {
         jc.set("sysfil.mode", Value::Number(f.mode as i64));
@@ -287,6 +294,15 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     }
 
     Ok(jc)
+}
+
+/// The machine's time zone file: /etc/localtime, or the zoneinfo file it
+/// links to. Nothing else is accepted, so a link elsewhere mounts nothing.
+pub fn system_zone() -> Option<std::path::PathBuf> {
+    let p = std::fs::canonicalize("/etc/localtime").ok()?;
+    let ok = (p == std::path::Path::new("/etc/localtime") || p.starts_with("/usr/share/zoneinfo/"))
+        && std::fs::metadata(&p).is_ok_and(|m| m.is_file());
+    ok.then_some(p)
 }
 
 #[cfg(test)]

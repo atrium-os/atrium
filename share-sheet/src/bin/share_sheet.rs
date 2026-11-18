@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use limen::client::Child;
 use limen::manifests::{Installed, Target};
 use limen::proto::EmbedId;
+use pergola::event::{Event as Input, Key, KeyEventKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
 use pergola::theme::{font, size::em, type_size, Weight};
@@ -53,6 +54,40 @@ struct Shown {
     targets: Vec<Target>,
     /// What the person pressed: an app id, or "" for Cancel.
     pressed: Option<String>,
+    /// The row picked with the arrow keys. None at first, so an Enter
+    /// typed into the app just before the sheet came up chooses nothing.
+    selected: Option<usize>,
+}
+
+/// The rows the sheet shows.
+const ROWS: usize = 6;
+
+impl Shown {
+    /// Up, Down, Home, End: move the pick. Enter: choose it. Escape:
+    /// cancel. True when the key was the sheet's.
+    fn key(&mut self, key: Key) -> bool {
+        if self.pressed.is_some() {
+            return false;
+        }
+        let n = self.targets.len().min(ROWS);
+        match key {
+            Key::Escape => self.pressed = Some(String::new()),
+            Key::Enter => match self.selected {
+                Some(i) if i < n => self.pressed = Some(self.targets[i].app.clone()),
+                _ => return false,
+            },
+            Key::Down | Key::Up | Key::Home | Key::End if n > 0 => {
+                self.selected = Some(match (key, self.selected) {
+                    (Key::Home, _) | (Key::Down, None) => 0,
+                    (Key::Down, Some(i)) => (i + 1).min(n - 1),
+                    (Key::Up, Some(i)) => i.saturating_sub(1),
+                    _ => n - 1, // End, or Up from nothing
+                });
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 struct Pane {
@@ -72,7 +107,18 @@ impl View for Pane {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         let s = self.shown.get_cloned();
-        ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, W, H), fill: t.bg_elevated(), radius: 0.0 });
+        let root = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, W, H), fill: t.bg_elevated(), radius: 0.0 });
+        // The keys: frescod gives the sheet those of the window it holds.
+        ctx.autofocus(root);
+        let keys = self.shown.clone();
+        ctx.on_key(root, move |ev| {
+            if let Input::Key { kind: KeyEventKind::Down, key, .. } = ev {
+                let mut s = keys.get_cloned();
+                if s.key(*key) {
+                    keys.set(s);
+                }
+            }
+        });
         ctx.add(Node::Text { rect: Rect::new(24.0, em(18.0), 0.0, em(24.0)), content: format!("Share “{}”", cut(&s.title, 40)), style: style(type_size::LG, Weight::Semibold, t.text_primary()) });
         // Who is sharing: the app's registry id, from limend, not from the app.
         ctx.add(Node::Text { rect: Rect::new(24.0, em(46.0), 0.0, em(18.0)), content: format!("From {}", cut(&s.from_app, 48)), style: style(type_size::SM, Weight::Regular, t.text_secondary()) });
@@ -80,10 +126,11 @@ impl View for Pane {
         if s.targets.is_empty() {
             ctx.add(Node::Text { rect: Rect::new(24.0, y, 0.0, em(20.0)), content: "No app on this computer takes this.".into(), style: style(type_size::SM, Weight::Regular, t.text_primary()) });
         }
-        for target in s.targets.iter().take(6) {
+        for (i, target) in s.targets.iter().take(ROWS).enumerate() {
             let row = ctx.push(Node::Rect { rect: Rect::new(16.0, y, W - 32.0, em(44.0)), fill: Color::TRANSPARENT, radius: 8.0 });
-            if ctx.is_hovered(row) || ctx.is_pressed(row) {
-                let c = if ctx.is_pressed(row) { t.state_pressed() } else { t.state_hover() };
+            let picked = s.selected == Some(i);
+            if ctx.is_hovered(row) || ctx.is_pressed(row) || picked {
+                let c = if ctx.is_pressed(row) || picked { t.state_pressed() } else { t.state_hover() };
                 if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(row) {
                     *fill = c;
                 }
@@ -111,6 +158,9 @@ impl View for Pane {
             }
         });
         ctx.add(Node::Text { rect: Rect::new(W - 98.0, H - em(46.0), 0.0, em(20.0)), content: "Cancel".into(), style: style(type_size::SM, Weight::Medium, t.text_primary()) });
+        if !s.targets.is_empty() {
+            ctx.add(Node::Text { rect: Rect::new(24.0, H - em(46.0), 0.0, em(20.0)), content: "↑ ↓ to pick, Return to share, Esc to cancel".into(), style: style(type_size::XS, Weight::Regular, t.text_tertiary()) });
+        }
         ctx.pop();
         ctx.pop();
     }
@@ -194,7 +244,7 @@ fn main() {
                     let (ptx, prx) = mpsc::channel();
                     panes.insert(embed, ptx);
                     let (f, t) = (fresco.clone(), tx.clone());
-                    let first = Shown { title, from_app, targets, pressed: None };
+                    let first = Shown { title, from_app, targets, pressed: None, selected: None };
                     std::thread::spawn(move || pane(embed, f, first, prx, t));
                 }
                 Ok(Some(Event::Close { embed })) => {
@@ -237,5 +287,48 @@ fn main() {
             let _ = p.send(());
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shown(n: usize) -> Shown {
+        let targets = (0..n).map(|i| Target { app: format!("org.t.{i}"), name: format!("T{i}"), takes: vec![] }).collect();
+        Shown { targets, ..Default::default() }
+    }
+
+    #[test]
+    fn keys_pick_choose_and_cancel() {
+        // Enter before any pick chooses nothing: a key typed into the app.
+        let mut s = shown(3);
+        assert!(!s.key(Key::Enter));
+        assert_eq!(s.pressed, None);
+        assert!(s.key(Key::Down));
+        assert!(s.key(Key::Down));
+        assert!(s.key(Key::Down));
+        assert_eq!(s.selected, Some(2), "stops at the last");
+        assert!(s.key(Key::Up));
+        assert!(s.key(Key::Enter));
+        assert_eq!(s.pressed.as_deref(), Some("org.t.1"));
+        assert!(!s.key(Key::Escape), "once chosen, nothing more");
+        assert_eq!(s.pressed.as_deref(), Some("org.t.1"));
+
+        let mut s = shown(2);
+        assert!(s.key(Key::Up));
+        assert_eq!(s.selected, Some(1), "Up from nothing is the last");
+        assert!(s.key(Key::Escape));
+        assert_eq!(s.pressed.as_deref(), Some(""));
+
+        // No targets: arrows do nothing, Escape still cancels.
+        let mut s = shown(0);
+        assert!(!s.key(Key::Down));
+        assert!(!s.key(Key::Enter));
+        assert!(s.key(Key::Escape));
+        // Only the rows shown can be picked.
+        let mut s = shown(9);
+        assert!(s.key(Key::End));
+        assert_eq!(s.selected, Some(ROWS - 1));
     }
 }

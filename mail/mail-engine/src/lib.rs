@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 pub mod attachments;
+pub mod clock;
 pub mod compose;
 pub mod search;
 pub mod drafts;

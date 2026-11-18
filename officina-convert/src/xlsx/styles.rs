@@ -22,6 +22,13 @@ use crate::report::{Kind, Report};
 /// `cellXfs` entries a file may have (Excel's limit is 64,000).
 pub const MAX_XFS: usize = 65_536;
 
+/// A `<color>`-like element's colour (rgb, theme or indexed, with tint)
+/// outside the style table: a sheet's tab colour.
+#[cfg(feature = "read")]
+pub(crate) fn color_of(e: &BytesStart, theme: &[u32]) -> Option<u32> {
+    Colors { theme, indexed: &PALETTE }.of(&attrs(e))
+}
+
 #[cfg(feature = "read")]
 fn attrs(e: &BytesStart) -> HashMap<Vec<u8>, String> {
     let mut m = HashMap::new();

@@ -228,6 +228,9 @@ pub fn ensure_network_ready(jc: &JailConfig) -> Result<(), String> {
 /// Directory-or-file is decided by stat'ing the SOURCE: a nullfs mount of a
 /// file onto a directory fails, and so does the reverse.
 pub fn ensure_mountpoints(jc: &JailConfig) -> Result<(), String> {
+    for (src, dst) in &jc.copies {
+        place_copy(src, dst)?;
+    }
     for m in &jc.mounts {
         // ★ A source that isn't there (a service whose socket folder is
         // missing, say) says nothing about the mountpoint's kind. Guessing
@@ -249,6 +252,32 @@ pub fn ensure_mountpoints(jc: &JailConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Copy host file `src` to `dst` in a jail's writable root. The root may
+/// hold what the app left in an earlier run, so nothing there is followed:
+/// a symlink on the way is refused, and the file is made new (O_EXCL,
+/// O_NOFOLLOW) after removing whatever was at `dst` (unlink never follows).
+fn place_copy(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let bytes = std::fs::read(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    let parent = dst.parent().ok_or_else(|| format!("{}: no parent", dst.display()))?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(md) if md.file_type().is_symlink() || !md.is_dir() =>
+            return Err(format!("{} is in the way: not a folder", parent.display())),
+        Ok(_) => {}
+        Err(_) => std::fs::create_dir(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?,
+    }
+    match std::fs::symlink_metadata(dst) {
+        Ok(md) if md.is_dir() => return Err(format!("{} is in the way: a folder", dst.display())),
+        Ok(_) => std::fs::remove_file(dst).map_err(|e| format!("replace {}: {e}", dst.display()))?,
+        Err(_) => {}
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444)
+        .custom_flags(libc::O_NOFOLLOW).open(dst)
+        .map_err(|e| format!("create {}: {e}", dst.display()))?;
+    f.write_all(&bytes).map_err(|e| format!("write {}: {e}", dst.display()))
 }
 
 /// A mountpoint left behind as the other kind (an empty file where the

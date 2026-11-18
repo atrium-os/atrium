@@ -16,7 +16,7 @@
 //! parser can open no file and no socket whatever the input does; CPU time and memory
 //! are capped with rlimits. Writes the native file on stdout. On stderr, one line per
 //! fidelity note (`note<TAB>kind<TAB>count<TAB>what<TAB>examples`), `stats<TAB>...`, and
-//! on failure `error<TAB>why` with exit status 1.
+//! on failure `error<TAB>why` with exit status 1; on success the last line is `done`.
 //!
 //! This is the converter process of docs/spec/officina.md §5.2. Installed, it is
 //! the app's `convert` worker (`[[workers]]`, app-composition.md §4): a one-shot jail of
@@ -233,4 +233,7 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // Everything is written: the app needn't wait for this process's end
+    // (a jail's teardown) to know it went well.
+    eprintln!("done");
 }

@@ -1972,6 +1972,7 @@ version = "0.1.0"
 dependencies = [
  "atrium-worker",
  "getrandom 0.2.17",
+ "libc",
  "mail-compose",
  "mail-pgp",
  "mail-schema",
@@ -2801,6 +2802,7 @@ dependencies = [
 name = "portcullis-mounts"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-jail",
 ]
 

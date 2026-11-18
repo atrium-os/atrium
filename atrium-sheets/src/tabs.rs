@@ -33,6 +33,29 @@ pub enum TabCmd {
     Rename,
     RenameDone,
     RenameCancel,
+    /// The tab colour bar for the sheet on screen; a colour picked from it
+    /// (None takes the colour off); closed.
+    Coloring,
+    Color(Option<u32>),
+    ColorCancel,
+}
+
+/// The colours the tab colour bar offers, 0xRRGGBB, with their names.
+pub const COLORS: [(u32, &str); 8] = [
+    (0xC62828, "Red"),
+    (0xEF6C00, "Orange"),
+    (0xF9A825, "Yellow"),
+    (0x2E7D32, "Green"),
+    (0x00838F, "Teal"),
+    (0x1565C0, "Blue"),
+    (0x6A1B9A, "Purple"),
+    (0x616161, "Grey"),
+];
+
+/// 0xRRGGBB as a Pergola colour.
+pub fn color(rgb: u32) -> Color {
+    let c = |sh: u32| ((rgb >> sh) & 0xFF) as f32 / 255.0;
+    Color::rgba(c(16), c(8), c(0), 1.0)
 }
 
 /// The style tab names are drawn in.

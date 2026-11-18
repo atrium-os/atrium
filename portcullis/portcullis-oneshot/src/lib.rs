@@ -253,6 +253,20 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
 /// As [`run_with_stdio`], and `extra` at 3, 4, ... in the jail (at most
 /// `jaild::protocol::MAX_EXTRA_FDS`; only with `stdio`).
 pub fn run_with_fds(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<std::os::fd::OwnedFd>) -> OneShot {
+    run_inner(spec, stdio, extra, false)
+}
+
+/// As [`run_with_fds`], but the outcome comes back as soon as the jail is
+/// removed, and its mounts are unwound on a thread of their own. For a
+/// long-lived daemon only (portcullisd's WorkerCall): a dying jail pins its
+/// root until the kernel frees it, which has been seen to take over 10 s,
+/// and the caller has its answer long before. A process that exits right
+/// after would leave the mounts for `reclaim_abandoned`.
+pub fn run_with_fds_detached(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<std::os::fd::OwnedFd>) -> OneShot {
+    run_inner(spec, stdio, extra, true)
+}
+
+fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<std::os::fd::OwnedFd>, detached: bool) -> OneShot {
     if !extra.is_empty() && (stdio.is_none() || extra.len() > jaild::protocol::MAX_EXTRA_FDS) {
         return OneShot::Refused(format!("{} extra descriptors: at most {}, and only with the caller's stdio",
             extra.len(), jaild::protocol::MAX_EXTRA_FDS));
@@ -482,6 +496,18 @@ pub fn run_with_fds(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra
 
     jaild_remove(&jail_name);
     tm.mark("jaild-remove");
+    if detached {
+        let spawned = std::thread::Builder::new().name("oneshot-teardown".into()).spawn({
+            let (jail_path, jail_name) = (jail_path.clone(), jail_name.clone());
+            move || {
+                teardown(&jail_path, &jail_name);
+                tm.mark("teardown");
+                tm.report(&jail_name);
+            }
+        });
+        if spawned.is_err() { teardown(&jail_path, &jail_name) }
+        return outcome;
+    }
     teardown(&jail_path, &jail_name);
     tm.mark("teardown");
     tm.report(&jail_name);

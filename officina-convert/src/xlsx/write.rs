@@ -160,9 +160,18 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
     let sh = wb.sheet(s);
     let mut o: Vec<u8> = Vec::with_capacity(1 << 16);
     let _ = write!(o, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet {NS}>"#);
-    if let Some(c) = code {
-        // Code names are letters, digits and `_` (checked by the grid).
-        let _ = write!(o, r#"<sheetPr codeName="{c}"/>"#);
+    if code.is_some() || sh.tab_color.is_some() {
+        o.extend_from_slice(b"<sheetPr");
+        if let Some(c) = code {
+            // Code names are letters, digits and `_` (checked by the grid).
+            let _ = write!(o, r#" codeName="{c}""#);
+        }
+        match sh.tab_color {
+            Some(t) => {
+                let _ = write!(o, r#"><tabColor rgb="FF{:06X}"/></sheetPr>"#, t & 0xFF_FFFF);
+            }
+            None => o.extend_from_slice(b"/>"),
+        }
     }
     if rows > 0 && cols > 0 {
         let _ = write!(o, r#"<dimension ref="A1:{}"/>"#, a1(rows - 1, cols - 1));

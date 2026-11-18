@@ -3580,6 +3580,10 @@ For the platform SDK move (`cargo atrium check`'s parser-in-core). Write's, Shee
 
 Left: Slides links `png` only to encode its own previews, and the checker lists fonts (allsorts, rustybuzz, ttf-parser) that only ever read the shipped faces.
 
+### 16.75 Tab colours (2026-11-18)
+
+A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab Colour…, a bar in the tab strip's place with eight colours, None and Cancel (`TabCmd::Coloring`, `Color`, `ColorCancel`). It is drawn as a bar along the bottom of the tab, thicker on the sheet on screen. `GridOp::TabColor` (tag 15) sets it and is its own inverse; it moves with its sheet, a coloured sheet isn't bare (so `DropSheet` keeps it), and Delete Sheet takes the colour off first so undo brings it back. Native chunk 15 (TAB_COLORS). `.xlsx`: `<sheetPr><tabColor rgb>`, read also as a theme or indexed colour with its tint. `.ods`: a table style's `tableooo:tab-color`. Gates: officina-grid `tab_colours_are_set_undone_and_saved`, officina-convert `tests/tabs.rs`, atrium-sheets `sheets_are_added_switched_renamed_and_tabbed`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

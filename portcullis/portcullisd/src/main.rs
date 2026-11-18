@@ -1006,7 +1006,10 @@ fn handle_exec_instance(
     let watch = jail_name_for(&spec).and_then(|name| {
         reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name))
     });
-    let resp = match portcullis_oneshot::run_with_fds(&spec, Some(stdio), extra_fds) {
+    // A worker's caller has its answer once the jail is removed; its mounts
+    // are unwound after (a dying jail can pin them for seconds).
+    let run = if spec.worker.is_some() { portcullis_oneshot::run_with_fds_detached } else { portcullis_oneshot::run_with_fds };
+    let resp = match run(&spec, Some(stdio), extra_fds) {
         // The worker's own status (jaild reaps it); None = killed by a signal.
         portcullis_oneshot::OneShot::Exit { code, .. } =>
             Response::LaunchExit { code },

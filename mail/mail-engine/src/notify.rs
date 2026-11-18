@@ -30,7 +30,7 @@ use crate::Engine;
 pub const FRESH_SECS: i64 = 600;
 pub const BURST: usize = 2;
 pub const BURST_SECS: i64 = 30;
-/// The daily review's hour (UTC until apps get time zones).
+/// The daily review's hour, local time.
 pub const REVIEW_HOUR: i64 = 9;
 const BODY_MAX: usize = 2048;
 const SCAN_MAX: usize = 5000;
@@ -91,12 +91,12 @@ impl Notifier {
     }
 
     /// [`Notifier::check`] with the local time's offset from UTC (seconds),
-    /// for quiet hours.
+    /// for quiet hours and the review's day and hour.
     pub fn check_local(&mut self, e: &Engine, now: i64, offset: i64) -> Vec<Post> {
         let prefs = e.prefs();
         let minute = ((now + offset).rem_euclid(86_400) / 60) as u16;
         let quiet = prefs.is_quiet(minute);
-        let mut out = self.look(e, now, &prefs, quiet);
+        let mut out = self.look(e, now, offset, &prefs, quiet);
         if !prefs.notify {
             // Off: only take back what was said before.
             self.quiet.clear();
@@ -115,7 +115,7 @@ impl Notifier {
         out
     }
 
-    fn look(&mut self, e: &Engine, now: i64, prefs: &crate::prefs::Prefs, quiet: bool) -> Vec<Post> {
+    fn look(&mut self, e: &Engine, now: i64, offset: i64, prefs: &crate::prefs::Prefs, quiet: bool) -> Vec<Post> {
         let mut out = Vec::new();
         let accounts: Vec<AccountId> = e.store.accounts().map(|a| a.into_iter().map(|x| x.0).collect()).unwrap_or_default();
         if !self.started {
@@ -124,7 +124,7 @@ impl Notifier {
             for a in &accounts {
                 self.had_mail.insert(*a, self.inbox_has_mail(e, *a));
             }
-            self.review(e, now, &mut out);
+            self.review(e, now, offset, &mut out);
             return out;
         }
         // Read elsewhere since: take it back.
@@ -214,7 +214,7 @@ impl Notifier {
             }
             out.push(Post::Summary { title: "While you were away".into(), body });
         }
-        self.review(e, now, &mut out);
+        self.review(e, now, offset, &mut out);
         out
     }
 
@@ -222,14 +222,19 @@ impl Notifier {
         e.store.folders(a).unwrap_or_default().iter().any(|(id, f)| f.role == Role::Inbox && e.store.count(*id).unwrap_or(0) > 0)
     }
 
-    /// Once a day after the review hour: what Later has due.
-    fn review(&mut self, e: &Engine, now: i64, out: &mut Vec<Post>) {
+    /// Once a day after the review hour: what Later has due. Days and the
+    /// hour are local (`offset` seconds east of UTC).
+    fn review(&mut self, e: &Engine, now: i64, offset: i64, out: &mut Vec<Post>) {
+        let now = now + offset;
         let day = now.div_euclid(86_400);
         if self.reviewed == Some(day) || now - day * 86_400 < REVIEW_HOUR * 3600 {
             return;
         }
         self.reviewed = Some(day);
-        let items = e.later_items().unwrap_or_default();
+        let items: Vec<_> = e.later_items().unwrap_or_default().into_iter().map(|(id, mut l)| {
+            l.due += offset;
+            (id, l)
+        }).collect();
         let end = (day + 1) * 86_400;
         let overdue = items.iter().filter(|(_, l)| l.due < day * 86_400 + REVIEW_HOUR * 3600 && !l.back).count() + items.iter().filter(|(_, l)| l.back).count();
         let today = items.iter().filter(|(_, l)| !l.back && l.due >= day * 86_400 + REVIEW_HOUR * 3600 && l.due < end).count();

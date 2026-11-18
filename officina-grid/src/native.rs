@@ -16,6 +16,7 @@
 //! | 13 | COND_FORMATS | conditional formats: ranges, rules (formulas as text), formats |
 //! | 14 | PIVOTS | pivot tables: source, place, fields on each axis with hidden items, value fields |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
+//! | 15 | TAB_COLORS | sheets' tab colours: count; per sheet, its index and 0xRRGGBB |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -38,6 +39,7 @@ use std::sync::Arc;
 
 pub const WORKBOOK: u16 = 1;
 pub const STRINGS: u16 = 2;
+pub const TAB_COLORS: u16 = 15;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -264,6 +266,16 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             t.encode(&mut w);
         }
         c.add(TABLES, &w.into_bytes())?;
+    }
+    let tabs: Vec<(usize, u32)> = wb.sheets.iter().enumerate().filter_map(|(i, sh)| sh.tab_color.map(|c| (i, c))).collect();
+    if !tabs.is_empty() {
+        let mut w = Writer::new();
+        w.var(tabs.len() as u64);
+        for (i, c) in tabs {
+            w.u16(i as u16);
+            w.u32(c & 0xFF_FFFF);
+        }
+        c.add(TAB_COLORS, &w.into_bytes())?;
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sh.hidden.is_empty() && sh.filter.is_none() {
@@ -662,6 +674,23 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         }
         wb.sheets[s].hidden = st.hidden;
         wb.sheets[s].filter = st.filter;
+    }
+
+    for i in of(TAB_COLORS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more tab colours than sheets"));
+        }
+        for _ in 0..n {
+            let s = r.u16()? as usize;
+            let color = r.u32()?;
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("a tab colour for a sheet that does not exist")) };
+            if sh.tab_color.replace(color & 0xFF_FFFF).is_some() {
+                return Err(LoadError::Bad("a sheet's tab colour twice"));
+            }
+        }
+        done(&r)?;
     }
 
     // Pivot tables: their output is in the cells already.

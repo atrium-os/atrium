@@ -238,6 +238,8 @@ pub struct Sheets {
     /// The first sheet tab drawn, and the rename bar (open, and its field).
     pub tab_first: Mutable<u16>,
     pub renaming: Mutable<bool>,
+    /// The tab colour bar is showing.
+    pub coloring: Mutable<bool>,
     pub rename_text: Mutable<TextEdit>,
 }
 
@@ -245,7 +247,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -593,6 +595,7 @@ impl Sheets {
         self.filter.set(FilterPanel::default());
         self.cond.set(Default::default());
         self.renaming.set(false);
+        self.coloring.set(false);
         self.reveal_tab();
         self.home();
     }
@@ -719,6 +722,25 @@ impl Sheets {
                 self.renaming.set(false);
                 self.changed();
             }
+            TabCmd::Coloring => {
+                self.renaming.set(false);
+                self.coloring.set(true);
+                self.changed();
+            }
+            TabCmd::Color(color) => {
+                let mut d = self.doc.borrow_mut();
+                let s = d.sheet;
+                if d.wb.sheet(s).tab_color != color {
+                    d.run("Tab Colour", vec![officina_grid::ops::GridOp::TabColor { sheet: s, color }]);
+                }
+                drop(d);
+                self.coloring.set(false);
+                self.changed();
+            }
+            TabCmd::ColorCancel => {
+                self.coloring.set(false);
+                self.changed();
+            }
         }
     }
 
@@ -743,6 +765,20 @@ impl Sheets {
             Button::secondary("Cancel").at(212.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::RenameCancel)).render(ctx);
             return;
         }
+        if self.coloring.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Tab colour".into(), style: st });
+            let mut x = 100.0;
+            for (rgb, _) in crate::tabs::COLORS {
+                let sw = ctx.add(Node::Rect { rect: Rect::new(x, y + 5.0, 18.0, 18.0), fill: crate::tabs::color(rgb), radius: 4.0 });
+                let cmds = self.cmds.clone();
+                ctx.on_click(sw, move || cmds.lock().unwrap().push(Cmd::Tab(TabCmd::Color(Some(rgb)))));
+                x += 24.0;
+            }
+            Button::secondary("None").at(x + 8.0, y + 2.0).width(64.0).on_click(push(TabCmd::Color(None))).render(ctx);
+            Button::secondary("Cancel").at(x + 80.0, y + 2.0).width(72.0).on_click(push(TabCmd::ColorCancel)).render(ctx);
+            return;
+        }
         Button::secondary("+").at(4.0, y + 2.0).width(28.0).on_click(push(TabCmd::Add)).render(ctx);
         Button::secondary("‹").at(34.0, y + 2.0).width(26.0).on_click(push(TabCmd::Earlier)).render(ctx);
         Button::secondary("›").at(62.0, y + 2.0).width(26.0).on_click(push(TabCmd::Later)).render(ctx);
@@ -752,8 +788,17 @@ impl Sheets {
             let on = s == d.sheet;
             let r = Rect::new(TABS_X + x, y + 1.0, tw - 2.0, TABS_H - 2.0);
             let hit = ctx.add(Node::Rect { rect: r, fill: if on { t.bg_canvas() } else { Color::TRANSPARENT }, radius: 0.0 });
-            if on {
-                ctx.add(Node::Rect { rect: Rect::new(TABS_X + x, y + TABS_H - 3.0, tw - 2.0, 2.0), fill: t.accent_bg(), radius: 0.0 });
+            // Its colour as a bar along the bottom (thicker on screen), or
+            // the accent under the tab on screen.
+            match d.wb.sheet(s).tab_color {
+                Some(rgb) => {
+                    let h = if on { 4.0 } else { 3.0 };
+                    ctx.add(Node::Rect { rect: Rect::new(TABS_X + x, y + TABS_H - 1.0 - h, tw - 2.0, h), fill: crate::tabs::color(rgb), radius: 0.0 });
+                }
+                None if on => {
+                    ctx.add(Node::Rect { rect: Rect::new(TABS_X + x, y + TABS_H - 3.0, tw - 2.0, 2.0), fill: t.accent_bg(), radius: 0.0 });
+                }
+                None => {}
             }
             let st = crate::tabs::style(if on { t.text_primary() } else { t.text_secondary() }, on);
             let name = d.wb.sheet_name(s);
@@ -1381,6 +1426,10 @@ impl Sheets {
                     self.tab_cmd(crate::tabs::TabCmd::Rename);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::TabColor) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Coloring);
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::DeleteSheet) => {
                     self.tab_cmd(crate::tabs::TabCmd::Delete);
                     false
@@ -1814,6 +1863,18 @@ mod tests {
         run(Cmd::Tab(TabCmd::RenameDone));
         assert!(!s.renaming.get());
         assert_eq!(s.doc.borrow().wb.sheet_name(1), "Totals");
+        // Tab colour: the bar, a colour drawn on the tab, undone with the rest.
+        run(Cmd::Data(crate::data::DataCmd::TabColor));
+        assert!(s.coloring.get() && texts().iter().any(|t| t == "Tab colour"));
+        run(Cmd::Tab(TabCmd::Color(Some(0x2E7D32))));
+        assert!(!s.coloring.get());
+        assert_eq!(s.doc.borrow().wb.sheet(1).tab_color, Some(0x2E7D32));
+        let green = crate::tabs::color(0x2E7D32);
+        let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, n)| matches!(n, Node::Rect { fill, .. } if *fill == green)));
+        run(Cmd::Undo);
+        assert_eq!(s.doc.borrow().wb.sheet(1).tab_color, None);
+        run(Cmd::Redo);
         run(Cmd::Tab(TabCmd::Go(0)));
         assert_eq!(s.doc.borrow().sheet, 0);
         {
@@ -1823,7 +1884,7 @@ mod tests {
         }
         run(Cmd::Tab(TabCmd::Go(1)));
         // Undo back past the sheet's making: the view moves to a sheet that's there.
-        for _ in 0..4 {
+        for _ in 0..5 {
             run(Cmd::Undo);
         }
         assert_eq!(s.doc.borrow().wb.sheet_count(), 1);
