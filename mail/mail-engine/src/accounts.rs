@@ -92,19 +92,17 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     }
 }
 
-/// An IMAP session over `courier`: in Mail's `sync` worker when the app
-/// has one (a jail of its own, no capability, §4), in the program
-/// `MAIL_SYNC_WORKER` names (development, tests), else here.
-pub fn open_imap(courier: UnixStream) -> Result<Box<dyn Imap>, String> {
-    use mail_sync::remote::Remote;
+/// Mail's `sync` worker when the app has one (a jail of its own, no
+/// capability, §4), else the program `MAIL_SYNC_WORKER` names
+/// (development, tests), else none: its input, its output, and it.
+fn sync_worker() -> Result<Option<(std::fs::File, std::fs::File, SyncProc)>, String> {
+    use std::os::fd::OwnedFd;
     let named = std::env::var_os("MAIL_SYNC_WORKER");
     if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| named.is_none() && w.has(SYNC_WORKER)) {
         let mut p = w.spawn_stdio(SYNC_WORKER).map_err(|e| format!("start the sync worker: {e}"))?;
         let (i, o) = (p.stdin.take().ok_or("no worker input")?, p.stdout.take().ok_or("no worker output")?);
         drop(p.stderr.take());
-        let proc = SyncProc::Worker(p);
-        let remote = Remote::start(courier, i, o).map_err(|e| e.to_string())?;
-        return Ok(Box::new(InWorker { remote, proc }));
+        return Ok(Some((OwnedFd::from(i).into(), OwnedFd::from(o).into(), SyncProc::Worker(p))));
     }
     if let Some(program) = named {
         let mut c = std::process::Command::new(program)
@@ -114,11 +112,37 @@ pub fn open_imap(courier: UnixStream) -> Result<Box<dyn Imap>, String> {
             .spawn()
             .map_err(|e| format!("start the sync worker: {e}"))?;
         let (i, o) = (c.stdin.take().ok_or("no worker input")?, c.stdout.take().ok_or("no worker output")?);
-        let proc = SyncProc::Child(c);
-        let remote = Remote::start(courier, i, o).map_err(|e| e.to_string())?;
-        return Ok(Box::new(InWorker { remote, proc }));
+        return Ok(Some((OwnedFd::from(i).into(), OwnedFd::from(o).into(), SyncProc::Child(c))));
     }
-    Ok(Box::new(mail_sync::remote::Local::start(courier).map_err(|e| e.to_string())?))
+    Ok(None)
+}
+
+/// An IMAP session over `courier`, in the `sync` worker when there is one
+/// (see [`sync_worker`]), else here.
+pub fn open_imap(courier: UnixStream) -> Result<Box<dyn Imap>, String> {
+    match sync_worker()? {
+        Some((i, o, proc)) => {
+            let remote = mail_sync::remote::Remote::start(courier, i, o).map_err(|e| e.to_string())?;
+            Ok(Box::new(InWorker { remote, proc }))
+        }
+        None => Ok(Box::new(mail_sync::remote::Local::start(courier).map_err(|e| e.to_string())?)),
+    }
+}
+
+/// Send one message over a submission `courier`, its replies read in the
+/// `sync` worker when there is one, else here.
+pub fn submit(courier: UnixStream, o: &mail_sync::submit::Outgoing<'_>) -> Result<mail_sync::submit::Sent, mail_sync::submit::SendError> {
+    match sync_worker() {
+        Ok(Some((i, w, mut proc))) => {
+            let r = mail_sync::remote::Remote::submit(courier, i, w, o);
+            if let SyncProc::Child(c) = &mut proc {
+                let _ = c.wait();
+            }
+            r
+        }
+        Ok(None) => mail_sync::submit::submit(courier, o),
+        Err(why) => Err(mail_sync::submit::SendError::Failed { why, transient: true }),
+    }
 }
 
 /// Seconds one `IDLE` waits before it is renewed: under the 29 minutes

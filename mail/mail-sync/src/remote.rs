@@ -47,6 +47,9 @@ pub enum Call {
     Append { folder: String, flags: Vec<String>, message: Vec<u8> },
     Idle { folder: String },
     Logout,
+    /// Send one message on a submission session (instead of `Start`; the
+    /// worker ends after it). Answers [`Reply::Submitted`].
+    Submit { from: String, rcpts: Vec<String>, bytes: Vec<u8>, hold_for: Option<u64> },
 }
 
 /// What [`Error`] was, across the wire.
@@ -67,6 +70,7 @@ pub enum Reply {
     Appended(Option<u32>),
     Idled(bool),
     LoggedOut,
+    Submitted(std::result::Result<crate::submit::Sent, crate::submit::SendError>),
     Failed(Kind, String),
 }
 
@@ -370,7 +374,10 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     Reply::Failed(k, t)
                 }
             },
-            (Call::Start, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
+            (Call::Submit { from, rcpts, bytes, hold_for }, None) => {
+                Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
+            }
+            (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -383,7 +390,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::LoggedOut
             }
         };
-        let done = reply == Reply::LoggedOut;
+        let done = matches!(reply, Reply::LoggedOut | Reply::Submitted(_));
         let b = enc(&reply)?;
         write_frame(&mut chan.borrow_mut().w, REPLY, &b)?;
         if done {
@@ -472,6 +479,20 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
             other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
         }
         Ok(r)
+    }
+
+    /// Send `o` on a submission `courier` in the worker (one message, then
+    /// the worker ends).
+    pub fn submit(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O, o: &crate::submit::Outgoing<'_>) -> std::result::Result<crate::submit::Sent, crate::submit::SendError> {
+        use crate::submit::SendError;
+        let mut r = Remote { courier, to_worker, from_worker, caps: Vec::new(), gone: false };
+        let c = Call::Submit { from: o.from.into(), rcpts: o.rcpts.to_vec(), bytes: o.bytes.to_vec(), hold_for: o.hold_for };
+        match r.call(&c, None, QUIET) {
+            Ok(Reply::Submitted(x)) => x,
+            Ok(Reply::Failed(_, t)) => Err(SendError::Failed { why: t, transient: true }),
+            Ok(other) => Err(SendError::Failed { why: format!("the worker answered {other:?}"), transient: true }),
+            Err(e) => Err(SendError::Failed { why: format!("the sync worker: {e}"), transient: true }),
+        }
     }
 
     /// One call: relay until its reply.

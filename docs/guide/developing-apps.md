@@ -293,11 +293,27 @@ reads. Without AddressSanitizer (stable Rust), comparisons that go through
 `memcmp` (slice equality) aren't traced, so magic numbers are found slowly;
 seed the corpus with a valid file.
 
-**Planned:**
+### Bundling: `cargo atrium bundle`
 
-- `cargo atrium bundle [--sign]` (M7): a release bundle with its closure,
-  signed with your publisher key from Arca.
+`cargo atrium bundle --sign <key.pem>` makes the installable bundle
+(atrium-bundle-format.md): it builds release, puts `atrium.toml`, the core
+and each worker at their `entry` paths and the icon (an SVG path) in a
+tree, and adds the runtime closure: every library the programs need,
+read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
+the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others
+go to `usr/lib/`. Then `opifex pack` writes the content index and the
+signature, and `opifex archive` the `.insula` beside the tree
+(`target/atrium-bundle/<id>-<version>-<arch>`), which installs through
+the install sheet.
 
+In a workspace the libraries come from what the workspace sees, so a
+library from `pkg` or a linked workspace goes in too. From Linux or macOS
+they come from the SDK sysroot (`--arch`, `--sysroot` as for `cross`), so
+the app can only need base libraries there, and packing needs `OPIFEX`
+pointing at an opifex. A `dev.` id isn't bundled: give `[app] id` one of
+your own. In a folder without `Cargo.toml` (a C project) it bundles what
+`make` put at the entries, into `bundle/`. **Planned:** the key from Arca instead of a file, and
+`[bundle] extra-libs` for libraries the app `dlopen`s.
 
 ## 8. Reference
 
@@ -308,6 +324,7 @@ seed the corpus with a valid file.
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
 | `cargo atrium run [--release] [cargo args]` | build the core and workers, and Run the project as a dev app (asks for your press) |
+| `cargo atrium bundle [--arch a] [--sign key.pem] [--out dir] [--json]` | a release bundle with its closure, packed, signed, and an `.insula` |
 | `cargo atrium worker add <name> [--input fd\|bytes\|message] [--from path::fn] [--dry-run] [--json]` | move part of the app into a new worker |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |

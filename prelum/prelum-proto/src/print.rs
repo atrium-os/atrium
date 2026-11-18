@@ -14,10 +14,14 @@
 //! | `JOBS` 0x11 | empty | postcard `Vec<Job>` |
 //! | `CANCEL` 0x12 | postcard `u64` | postcard `String` |
 //! | `RELEASE` 0x13 | postcard `u64` | postcard `String`: a held job goes back in its queue |
+//! | `PREVIEW` 0x14 | postcard [`PreviewReq`], the PDF as the one descriptor | postcard [`Previews`]: small sheet images drawn in a render jail (§5.2) |
+//! | `SAVE_PDF` 0x15 | postcard [`Layout`], the PDF as the one descriptor | postcard `u64` (its size), the rewritten PDF as the reply's one descriptor (§5.2's Save as PDF) |
+//! | `FOR` 0x20 | postcard `u32`: the app's uid, as limend named the sheet's parent | postcard `String`: the app's persona ("" for Personal). Only from prelum-sheet's uid, once per connection: from then on the connection acts for that app's person (§5.2) |
 //!
 //! On anything but `OK` the payload after the status is a postcard
 //! `String` to show. Every caller sees only its own printers and jobs: the
-//! daemon keys both by the peer's uid (`getpeereid`).
+//! daemon keys both by the person, the peer's uid (`getpeereid`), or for
+//! prelum-sheet after `FOR`, the person whose app asked to print.
 
 use prelum_ipp_codec::ops::{ColorMode, Quality, Sides};
 use prelum_ipp_codec::printer::{Marker, PrinterState, StateReason};
@@ -39,6 +43,9 @@ pub mod op {
     pub const JOBS: u16 = 0x11;
     pub const CANCEL: u16 = 0x12;
     pub const RELEASE: u16 = 0x13;
+    pub const PREVIEW: u16 = 0x14;
+    pub const SAVE_PDF: u16 = 0x15;
+    pub const FOR: u16 = 0x20;
 }
 
 pub mod status {
@@ -169,6 +176,55 @@ impl Print {
     }
 }
 
+/// How pages go on paper, for a preview or Save as PDF: what [`Print`]
+/// says of the same things.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Layout {
+    /// A PWG media keyword (the paper).
+    pub media: String,
+    /// `1-3,5`; `None`: all.
+    pub pages: Option<String>,
+    /// 1, 2 or 4.
+    pub per_sheet: u8,
+    pub scale: Scale,
+}
+
+impl Layout {
+    pub fn new(media: &str) -> Layout {
+        Layout { media: media.into(), pages: None, per_sheet: 1, scale: Scale::ShrinkToFit }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewReq {
+    pub layout: Layout,
+    /// From 1.
+    pub first: u32,
+    /// At most [`MAX_PREVIEWS`].
+    pub count: u8,
+    /// The longer side, pixels, at most [`MAX_PREVIEW`].
+    pub longest: u16,
+}
+
+pub const MAX_PREVIEWS: u8 = 8;
+pub const MAX_PREVIEW: u16 = 400;
+
+/// One sheet's preview: 8-bit sRGB, `w` x `h`, rows top down.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SheetImage {
+    pub sheet: u32,
+    pub w: u32,
+    pub h: u32,
+    pub rgb: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Previews {
+    /// How many sheets the whole document makes with this layout.
+    pub sheets: u32,
+    pub images: Vec<SheetImage>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Pending,
@@ -245,6 +301,11 @@ pub mod client {
         }
 
         fn call<T: DeserializeOwned>(&mut self, o: u16, payload: &[u8], fd: Option<&dyn AsRawFd>) -> Res<T> {
+            self.call_fd(o, payload, fd).map(|(v, _)| v)
+        }
+
+        /// A call whose reply may carry a descriptor.
+        fn call_fd<T: DeserializeOwned>(&mut self, o: u16, payload: &[u8], fd: Option<&dyn AsRawFd>) -> Res<(T, Option<std::os::fd::OwnedFd>)> {
             match fd {
                 Some(f) => self.c.send_message_with_fds(CLASS, o, flag::RESPONSE_EXPECTED, payload, &[f.as_raw_fd()]),
                 None => self.c.send_message(CLASS, o, flag::RESPONSE_EXPECTED, payload),
@@ -258,7 +319,10 @@ pub mod client {
             };
             let bad = || Refused { status: status::MALFORMED, message: "prelumd sent a malformed reply".into() };
             match p.split_first() {
-                Some((&status::OK, rest)) => postcard::from_bytes(rest).map_err(|_| bad()),
+                Some((&status::OK, rest)) => {
+                    let fd = if o == op::SAVE_PDF { self.c.take_fds(1).and_then(|mut v| v.pop()) } else { None };
+                    postcard::from_bytes(rest).map(|v| (v, fd)).map_err(|_| bad())
+                }
                 Some((&st, rest)) => Err(Refused { status: st, message: postcard::from_bytes(rest).unwrap_or_default() }),
                 None => Err(bad()),
             }
@@ -303,6 +367,20 @@ pub mod client {
         }
         pub fn release(&mut self, job: u64) -> Res<String> {
             self.call(op::RELEASE, &Self::enc(&job), None)
+        }
+        pub fn preview(&mut self, r: &PreviewReq, pdf: &dyn AsRawFd) -> Res<Previews> {
+            self.call(op::PREVIEW, &Self::enc(r), Some(pdf))
+        }
+        /// The document rewritten with `l` (§6.2), as an unnamed file.
+        pub fn save_pdf(&mut self, l: &Layout, pdf: &dyn AsRawFd) -> Res<(u64, std::fs::File)> {
+            match self.call_fd::<u64>(op::SAVE_PDF, &Self::enc(l), Some(pdf))? {
+                (n, Some(fd)) => Ok((n, std::fs::File::from(fd))),
+                (_, None) => Err(Refused { status: status::MALFORMED, message: "prelumd sent no document".into() }),
+            }
+        }
+        /// Act for the person whose app runs as `app_uid` (prelum-sheet only).
+        pub fn act_for(&mut self, app_uid: u32) -> Res<String> {
+            self.call(op::FOR, &Self::enc(&app_uid), None)
         }
     }
 }

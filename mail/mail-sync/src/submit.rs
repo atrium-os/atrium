@@ -15,13 +15,13 @@ pub struct Outgoing<'a> {
     pub hold_for: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sent {
     /// Recipients the server refused (the others got it), with its reply.
     pub rejected: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SendError {
     /// The server can't hold it (no FUTURERELEASE, or not this long):
     /// the engine holds it instead.

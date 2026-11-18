@@ -156,3 +156,65 @@ fn a_worker_that_dies_is_an_error_not_a_hang() {
     drop(_keep);
     assert!(Remote::start(server(false), i, from).is_err());
 }
+
+#[test]
+fn a_message_is_submitted_through_the_worker() {
+    use mail_sync::submit::{Outgoing, SendError};
+    // A submission server: the courier's post-login EHLO reply, then a
+    // reply per command, DATA taken whole.
+    let server = |refuse_from: bool| {
+        let (mine, theirs) = UnixStream::pair().unwrap();
+        let got = Arc::new(Mutex::new(Vec::<String>::new()));
+        let g = got.clone();
+        std::thread::spawn(move || {
+            let mut w = theirs.try_clone().unwrap();
+            let mut r = BufReader::new(theirs);
+            let _ = write!(w, "250-smtp.example\r\n250-SIZE 1000000\r\n250 8BITMIME\r\n");
+            let mut line = String::new();
+            let mut data = false;
+            loop {
+                line.clear();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let l = line.trim_end().to_string();
+                if data {
+                    if l == "." {
+                        data = false;
+                        let _ = write!(w, "250 2.0.0 queued\r\n");
+                    }
+                    continue;
+                }
+                g.lock().unwrap().push(l.clone());
+                let reply = if l.starts_with("MAIL FROM") && refuse_from {
+                    "550 5.7.1 not you\r\n"
+                } else if l == "DATA" {
+                    data = true;
+                    "354 go\r\n"
+                } else if l == "QUIT" {
+                    "221 bye\r\n"
+                } else {
+                    "250 ok\r\n"
+                };
+                let _ = w.write_all(reply.as_bytes());
+            }
+        });
+        (mine, got)
+    };
+    let rcpts = vec!["arun@acme.example".to_string()];
+    let o = Outgoing { from: "priya@example.org", rcpts: &rcpts, bytes: b"Subject: hi\r\n\r\nhello\r\n", hold_for: None };
+    let (s, got) = server(false);
+    let (i, w) = worker();
+    let sent = Remote::submit(s, i, w, &o).unwrap();
+    assert!(sent.rejected.is_empty());
+    let g = got.lock().unwrap().clone();
+    assert!(g[0].starts_with("MAIL FROM:<priya@example.org>"), "{g:?}");
+    assert!(g.iter().any(|l| l == "RCPT TO:<arun@acme.example>"), "{g:?}");
+    // The server's refusal comes back as the same error as here.
+    let (s, _) = server(true);
+    let (i, w) = worker();
+    match Remote::submit(s, i, w, &o) {
+        Err(SendError::Failed { why, transient: false }) => assert!(why.contains("550"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}

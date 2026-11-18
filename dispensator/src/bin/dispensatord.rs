@@ -1958,6 +1958,9 @@ mod run {
             }
             let line = format!("mount {} {} {} {}\n", g.uid, g.gid, u8::from(read_only), g.path);
             if let Err(e) = send_with_fd(ctl, &line, fuse.as_raw_fd()) {
+                // Close our /dev/fuse first: unmounting a FUSE mount whose
+                // device is still open and never answered INIT waits forever.
+                drop(fuse);
                 return fail(&dir, format!("the server: {e}"));
             }
             drop(fuse);
@@ -2435,6 +2438,9 @@ mod run {
             }
             let mnt = stick_mountpoint(device);
             unmount_force(Path::new(&mnt));
+            if jaild::ffi::fsid_of(&mnt).is_some() {
+                return fail(format!("{mnt} is still mounted"));
+            }
             let _ = std::fs::remove_dir(&mnt);
             let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
             let mut argv: Vec<String> = ["atrium-capsa-local", "--root-fd", "3", "--fuse-fd", "4", "--control-fd", "5"].iter().map(|a| a.to_string()).collect();
@@ -2474,6 +2480,17 @@ mod run {
                         // SAFETY: jaild just passed us this procdesc; held, it keeps the jail.
                         self.stick_servers.insert(device.to_string(), unsafe { OwnedFd::from_raw_fd(raw) });
                     }
+                    // A server that fails at once (it never got into its
+                    // jail, say) is gone again before anything waits on it.
+                    let exited = self.stick_servers.get(device).is_some_and(|pd| {
+                        let mut p = libc::pollfd { fd: pd.as_raw_fd(), events: libc::POLLHUP, revents: 0 };
+                        // SAFETY: one valid pollfd.
+                        (unsafe { libc::poll(&mut p, 1, 500) }) > 0
+                    });
+                    if exited {
+                        fail("it exited at once (see its log under /var/log/atrium)".into());
+                        self.stop_stick_server(device);
+                    }
                 }
                 other => {
                     unmount_force(Path::new(&mnt));
@@ -2506,7 +2523,10 @@ mod run {
             }
             let mnt = stick_mountpoint(device);
             unmount_force(Path::new(&mnt));
-            let _ = std::fs::remove_dir(&mnt);
+            // Never a path lookup into a FUSE mount still there.
+            if jaild::ffi::fsid_of(&mnt).is_none() {
+                let _ = std::fs::remove_dir(&mnt);
+            }
             eprintln!("atrium-dispensatord: {device}: {name} removed");
         }
 

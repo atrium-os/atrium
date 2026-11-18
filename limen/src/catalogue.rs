@@ -58,6 +58,8 @@ pub const SHARE: &str = "org.atrium.share";
 /// How long the person's choice in the share sheet waits for the parent's
 /// `share-target` request.
 pub const CHOICE_MS: u64 = 30_000;
+/// Prelum's print sheet (printing.md §5): prelum-sheet, as `_prelum-sheet`.
+pub const PRELUM: &str = "org.atrium.prelum";
 
 pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
@@ -72,6 +74,8 @@ pub const ROLES: &[Role] = &[
     Role { name: "web-island", provider: Provider::System(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
+    // The PDF comes with Print; Save as PDF goes back read-only.
+    Role { name: "print", provider: Provider::System(PRELUM), slot: SlotKind::Sheet { w: 760, h: 540 }, takes_fd: true, returns_fd: true },
 ];
 
 /// Roles whose children may play sound as their parent (lyra-v1.md §4):
@@ -93,5 +97,10 @@ pub fn role(name: &str) -> Option<&'static Role> {
 pub const MAX_EMBEDS_PER_PARENT: usize = 16;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 pub const MAX_MESSAGES_PER_SEC: u32 = 256;
+/// A window opens print sheets freely this many times a minute, then one
+/// each [`PRINT_SLOWED`] (printing.md §5.2).
+pub const PRINT_FREE: usize = 3;
+pub const PRINT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+pub const PRINT_SLOWED: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long a child has between `Detaching` and the end of its jail.
 pub const DETACH_GRACE_MS: u64 = 500;

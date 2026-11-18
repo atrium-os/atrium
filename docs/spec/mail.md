@@ -1395,9 +1395,12 @@ Stalwart in the cloud VM, and later a real account):
    before. Tests: the wire 3 (the same store calls as in-process, APPEND, IDLE with news
    and with a passed wait, a dead worker is an error), Dovecot 1 (two passes with sync
    in the worker; the whole Dovecot suite passes that way too). **Not yet**: one uid per
-   account (workers have one uid per app worker, not per account); SMTP submission and
-   JMAP still parse their answers in Mail's process; the engine is not yet a process of
-   its own apart from the window.
+   account (workers have one uid per app worker, not per account); JMAP still parses
+   its answers in Mail's process; the engine is not yet a process of its own apart from
+   the window. *Sending* went the same way the same day: each message goes out over a
+   submission courier whose replies the worker reads (`Call::Submit`, one message per
+   worker, which then ends); a refusal comes back as the same error as before. Tests:
+   the wire 1 (sent, and a refused sender), and the Dovecot sends through the worker.
 
 ## 17. Decisions, with recommendations
 

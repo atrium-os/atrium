@@ -32,6 +32,7 @@ pub mod ops;
 pub mod pivot;
 pub mod recalc;
 pub mod shift;
+pub mod sheetops;
 pub mod sort;
 pub mod spill;
 pub mod strings;

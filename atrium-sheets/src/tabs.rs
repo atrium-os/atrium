@@ -25,6 +25,10 @@ pub enum TabCmd {
     /// Move the strip a tab back or on.
     Earlier,
     Later,
+    /// The sheet on screen deleted, or moved a place left or right.
+    Delete,
+    MoveLeft,
+    MoveRight,
     /// The rename bar for the sheet on screen; its field submitted; closed.
     Rename,
     RenameDone,

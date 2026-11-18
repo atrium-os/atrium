@@ -11,7 +11,11 @@
 #   - alice asks through the sheet: it shows, Not now declines, nothing is
 #     installed; asking again at once is declined without a sheet;
 #   - bob asks: Install on the sheet installs it, recorded for bob;
-#   - asking again when it is installed answers at once, no sheet.
+#   - asking again when it is installed answers at once, no sheet;
+#   - a file (opifex.md §7.4): bob hands the sheet an .insula as a
+#     descriptor; one signed by a key off the side-load list fails with no
+#     sheet; one signed by a listed key shows, Install installs that copy
+#     for bob as a side-load, and nothing stays held.
 # WX/WY: where frescod puts the sheet (0 0 with no window manager).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -79,6 +83,15 @@ opifex pack b --sign platform.pem >/dev/null
 opifex archive b 1.0.insula >/dev/null
 opifex catalog add cat b --arch $ARCHN --archive 1.0.insula --url https://example.org/1.0.insula >/dev/null
 opifex catalog head cat --key catalog.pem >/dev/null
+# Two files for the sheet: signed by a key on the side-load list, and by one off it.
+mkdir -p /etc/atrium/publishers; cp platform.pub /etc/atrium/publishers/opifex-c3.pem
+for k in platform catalog; do
+  rm -rf f; mkdir -p f/bin; cp /bin/echo f/bin/hello
+  printf '[app]\nid = "org.atrium.c3file"\nname = "C3 file"\nversion = "1.0"\nentry = "bin/hello"\n\n[capabilities]\nclipboard = true\n' > f/atrium.toml
+  opifex pack f --sign \$k.pem >/dev/null
+  opifex archive f file-\$k.insula >/dev/null
+done
+chmod 644 file-*.insula
 mkdir -p /var/db/atrium/opifex/dl; cp 1.0.insula /var/db/atrium/opifex/dl/\$(sha256 -q 1.0.insula).insula
 (OPIFEX_SOCKET=$B/opifex.sock /usr/local/sbin/opifexd > $B/opifexd.log 2>&1 &)
 sleep 1
@@ -141,6 +154,22 @@ check "opifexd took it from the sheet's uid" "1" "$(V "grep -c 'uid 65042: Insta
 ask bob 4
 check "asked again: installed, no sheet" "Installed 2" "$(answer 4) $(sheets)"
 
+echo "=== a file through the sheet"
+FID=org.atrium.c3file
+sload() { V "rm -f $B/ask-$2; daemon -f -o $B/ask-$2 su -m bob -c 'OPIFEX_SHEET_SOCKET=$B/sheet/sheet.sock /usr/local/bin/opifex-sheetd side-load $B/$1'"; }
+sload file-catalog.insula 5
+check "a key off the side-load list: refused, no sheet" "1 2" "$(answer 5 | grep -c 'Failed') $(sheets)"
+sload file-platform.insula 6
+wait_sheet 3
+[ -n "$IY" ] && ok "the sheet shows the file" || bad "no sheet: $(V "tail -3 $B/sheet.log")"
+shot c3-file-sheet
+press "$IX" "$IY"
+check "Install: installed from the file" "Installed" "$(answer 6)"
+check "the copy is in apps/" "yes" "$(V "cmp -s $B/f/bin/hello /var/lib/atrium/apps/$FID/bin/hello && echo yes")"
+check "recorded as a side-load for bob" "2" "$(V "grep -A9 'id = \"$FID\"' /var/db/atrium/opifex/installed.toml | grep -c 'installed_by = 1012\|source = \"side-load\"'")"
+check "opifexd took the file and the press from the sheet's uid" "2" "$(V "grep -c 'uid 65042: \(PreviewLocal\|InstallLocalApproved\) -> ok' $B/opifexd.log")"
+check "nothing stays held" "0" "$(V "ls /var/db/atrium/opifex/held | wc -l | tr -d ' '")"
+
 V "pkill -x opifex-sheetd; pkill -x opifexd; pkill -x frescod" >/dev/null 2>&1
-V "OPIFEX_SOCKET=/nonexistent opifex uninstall $ID >/dev/null 2>&1; true"
+V "OPIFEX_SOCKET=/nonexistent opifex uninstall $ID >/dev/null 2>&1; OPIFEX_SOCKET=/nonexistent opifex uninstall org.atrium.c3file >/dev/null 2>&1; rm -f /etc/atrium/publishers/opifex-c3.pem; true"
 echo "opifex-c3: $fails failed"

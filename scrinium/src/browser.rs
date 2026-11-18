@@ -257,6 +257,8 @@ pub enum OpenStep {
     Apps(OpenReq),
     /// Open it and hand it to `req.app`.
     Hand(OpenReq),
+    /// An app bundle: open it and hand it to the install sheet.
+    Install(OpenReq),
 }
 
 /// A sheet over the window while a file is being opened.
@@ -573,7 +575,10 @@ impl Browser {
         match d {
             _ if d.is_program() => self.say(format!("“{name}”: {}", d.question().unwrap_or_default()), true),
             Detected::Known(t) if t.family == Family::Link => self.say(format!("“{name}”: {}", d.question().unwrap_or_default()), true),
-            Detected::Known(t) if t.family == Family::Bundle => self.say(format!("“{name}” is an app to install: installing from Scrinium comes later"), false),
+            Detected::Known(t) if t.family == Family::Bundle => {
+                self.say(format!("“{name}” is an app: the installer shows what it is"), false);
+                self.want_open = Some(OpenStep::Install(req));
+            }
             Detected::Known(t) => self.want_open = Some(OpenStep::Apps(OpenReq { mime: Some(t.mime.into()), ..req })),
             Detected::Mismatch { actual, .. } => {
                 let actual = actual.filter(|a| a.family.declarable()).map(|a| (a.mime.to_string(), a.words.to_string()));
@@ -643,6 +648,15 @@ impl Browser {
     }
 
     /// How the hand-over went: the app's name, or why not.
+    /// What the install sheet said about a bundle.
+    pub fn installed(&mut self, req: &OpenReq, r: Result<crate::install::Outcome, String>) {
+        match r {
+            Ok(crate::install::Outcome::Installed) => self.say(format!("Installed the app in “{}”", req.name), false),
+            Ok(crate::install::Outcome::Declined) => self.say(format!("Didn't install “{}”", req.name), false),
+            Err(e) => self.say(format!("Couldn't install “{}”: {e}", req.name), true),
+        }
+    }
+
     pub fn handed(&mut self, req: &OpenReq, r: Result<String, String>) {
         match r {
             Ok(app) => self.say(format!("Opened “{}” in {app}{}", req.name, if req.always { ", which now opens these files" } else { "" }), false),
@@ -1036,6 +1050,7 @@ mod tests {
         std::fs::write(d.join("invoice.pdf"), "<!DOCTYPE html><script>steal()</script>").unwrap();
         std::fs::write(d.join("setup.jpg"), b"\x7fELF\x02\x01\x01").unwrap();
         std::fs::write(d.join("README"), b"plain words\n").unwrap();
+        std::fs::write(d.join("hello.insula"), b"INSB\x02\0\0\0").unwrap();
         let mut b = Browser::new(Mode::Manager);
         b.set_places(vec![p]);
         let at = |b: &Browser, n: &str| b.entries.iter().position(|e| e.name == n).unwrap();
@@ -1055,6 +1070,14 @@ mod tests {
         b.open_as("text/plain");
         let Some(OpenStep::Apps(req)) = b.want_open.take() else { panic!() };
         assert_eq!(req.mime.as_deref(), Some("text/plain"));
+        // An app bundle: to the install sheet.
+        typed(&mut b, "hello.insula");
+        let Some(OpenStep::Install(req)) = b.want_open.take() else { panic!("to the installer") };
+        assert_eq!(req.name, "hello.insula");
+        b.installed(&req, Ok(crate::install::Outcome::Installed));
+        assert_eq!(b.notice.clone().unwrap().text, "Installed the app in “hello.insula”");
+        b.installed(&req, Err("not signed".into()));
+        assert!(b.notice.clone().unwrap().error);
         // A program: never.
         typed(&mut b, "setup.jpg");
         let n = b.notice.clone().unwrap();

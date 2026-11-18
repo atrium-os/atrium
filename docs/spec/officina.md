@@ -3554,9 +3554,17 @@ Gates: `officina-grid` `tests/ifcache.rs`, `tests/budget.rs`; `atrium-sheets` `a
 
 Sheets showed only a workbook's first sheet. A tab strip now sits under the grid: a press on a tab shows that sheet (at its top left; the filter and conditional-format panels about the last sheet close), **+** adds a sheet at the end and shows it, and ‹ › move the strip a tab at a time. Only the tabs that fit are measured and drawn (`atrium-sheets::tabs::visible`, `reveal`), so 3,000 sheets render as a few do. The Data menu gains Add Sheet and Rename Sheet…, which opens a bar in the strip's place; a taken name (case aside) or one with `[ ] : * ? / \` is refused with the reason, and formulas follow a rename because they name sheets by number.
 
-Three new undoable ops, journaled like the rest: `GridOp::AddSheet(name)` (tag 11), its inverse `GridOp::DropSheet` (tag 12, takes away the last sheet only when it holds nothing and isn't the first), and `GridOp::RenameSheet { sheet, name }` (tag 13); a refused one changes nothing. Undo past a sheet's making moves the view to a sheet that exists. Not yet: deleting or moving sheets (every reference to later sheets would be renumbered), and tab colours.
+Three new undoable ops, journaled like the rest: `GridOp::AddSheet(name)` (tag 11), its inverse `GridOp::DropSheet` (tag 12, takes away the last sheet only when it holds nothing and isn't the first), and `GridOp::RenameSheet { sheet, name }` (tag 13); a refused one changes nothing. Undo past a sheet's making moves the view to a sheet that exists. Deleting and moving sheets followed the same day (§16.72). Not yet: tab colours.
 
 Gates: `officina-grid` `ops::tests::sheets_are_added_renamed_and_undone`; `atrium-sheets` `sheets_are_added_switched_renamed_and_tabbed`, `tabs::tests::only_the_tabs_that_fit_are_laid_out`.
+
+### 16.72 Deleting and moving sheets (2026-11-18)
+
+- **Moving.** `Workbook::move_sheet(from, to)` renumbers in place: formula groups come out and go back on their sheets' new places with their references renumbered (`remap_sheets`), and tables, charts, pivot tables, conditional formats, names (read back from their text, which names sheets), spills, macro code names and pending recalculation follow. Cells don't move or recalculate, so the cost is the workbook's groups and objects, not its cells. Journaled as `GridOp::MoveSheet { from, to }` (tag 14), its inverse moving it back.
+- **Deleting.** `officina-grid::sheetops::delete_sheet_op(wb, s)` is one undoable batch of existing ops: formulas elsewhere that read the sheet get `#REF!` there (as Excel does), names scoped to it go and others reading it break, tables, charts, pivot tables and conditional formats on or reading it go, its filter, cells, styles and sizes are emptied, then it moves to the end and `DropSheet` takes it away. Undo brings each back in turn; the first sheet can't go when it is the only one.
+- Sheets' Data menu gains Move Sheet Left, Move Sheet Right and Delete Sheet (the sheet that takes its place shows; deleting the last shows the one before).
+
+Gates: `sheetops::tests::a_sheet_moves_with_everything_that_reads_it` and `deleting_a_sheet_breaks_what_read_it_and_undo_brings_all_back` (three sheets reading each other with names, a table, a chart and a spill: moved and back, and deleted and undone, each save byte for byte the same native file as before); `atrium-sheets` `sheets_are_added_switched_renamed_and_tabbed`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -160,9 +160,90 @@ impl Fuzz {
     }
 }
 
+/// `cargo atrium worker add` (the SDK's "Move into a worker").
+pub const WORKER_ADD: [&str; 4] = ["cargo", "atrium", "worker", "add"];
+
+/// What to move for a crash at `frame` (`file:line` in the project,
+/// whose source is `text`): the worker's name and the `--from` path of the
+/// function the line is in.
+pub fn move_target(frame: &str, text: &str) -> Result<(String, String), String> {
+    let (file, line) = frame.rsplit_once(':').and_then(|(f, l)| Some((f, l.parse::<usize>().ok()?))).ok_or("no line to move")?;
+    let module = file.strip_prefix("src/").and_then(|f| f.strip_suffix(".rs")).ok_or_else(|| format!("{file} isn't in src/"))?;
+    if module == "main" || module.starts_with("bin/") {
+        return Err(format!("{file} is the app's binary: move the function into the library first"));
+    }
+    let mut path: Vec<&str> = vec!["crate"];
+    path.extend(module.split('/').filter(|m| *m != "lib" && *m != "mod"));
+    let lines: Vec<&str> = text.lines().take(line).collect();
+    let name = lines.iter().rev().find_map(|l| {
+        let at = l.find("fn ")?;
+        // `fn` as a word: start of line or after a space / `pub` etc.
+        if at > 0 && !l[..at].ends_with(' ') && !l[..at].ends_with(')') {
+            return None;
+        }
+        let rest = &l[at + 3..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        (!id.is_empty()).then_some(id)
+    }).ok_or_else(|| format!("no function around {frame}"))?;
+    path.push(&name);
+    let mut worker: String = name.trim_matches('_').to_ascii_lowercase().replace('_', "-").chars().take(48).collect();
+    if !worker.starts_with(|c: char| c.is_ascii_lowercase()) {
+        worker.insert_str(0, "w-");
+    }
+    Ok((worker, path.join("::")))
+}
+
+/// The CLI's answer: what it changed (or would), the call for the core,
+/// and the call sites to change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Move {
+    pub worker: String,
+    pub from: String,
+    pub dry_run: bool,
+    pub changed: Vec<String>,
+    pub core_call: String,
+    pub calls: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+pub fn read_move(out: &[u8], worker: &str, from: &str) -> Result<Move, String> {
+    let text = String::from_utf8_lossy(out);
+    // One JSON object, pretty or not, maybe after cargo's own lines.
+    let v: Value = text.match_indices('{').find_map(|(i, _)| serde_json::from_str(text[i..].trim()).ok())
+        .ok_or_else(|| format!("cargo atrium worker add: {}", text.trim().lines().last().unwrap_or("no answer")))?;
+    if v["ok"] != Value::Bool(true) {
+        return Err(v["error"].as_str().unwrap_or("failed").to_string());
+    }
+    let strs = |k: &str, f: &dyn Fn(&Value) -> String| v[k].as_array().map(|a| a.iter().map(f).collect()).unwrap_or_default();
+    Ok(Move {
+        worker: worker.into(),
+        from: from.into(),
+        dry_run: v["dry_run"].as_bool().unwrap_or(false),
+        changed: strs("changed", &|c| format!("{} {}", c["action"].as_str().unwrap_or(""), c["path"].as_str().unwrap_or(""))),
+        core_call: v["core_call"].as_str().unwrap_or("").into(),
+        calls: strs("calls", &|c| format!("{}:{}: {}", c["path"].as_str().unwrap_or(""), c["line"], c["text"].as_str().unwrap_or("").trim())),
+        notes: strs("notes", &|n| n.as_str().unwrap_or("").to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_core_crash_moves() {
+        let src = "use x;\n\npub fn parse_header(b: &[u8]) -> u32 {\n    let n = b[4];\n    n as u32\n}\n";
+        assert_eq!(move_target("src/lib.rs:4", src), Ok(("parse-header".into(), "crate::parse_header".into())));
+        assert_eq!(move_target("src/fmt/bmp.rs:4", src).unwrap().1, "crate::fmt::bmp::parse_header");
+        assert_eq!(move_target("src/fmt/mod.rs:4", src).unwrap().1, "crate::fmt::parse_header");
+        assert!(move_target("src/main.rs:4", src).unwrap_err().contains("library first"));
+        assert!(move_target("src/lib.rs:1", src).is_err());
+        let m = read_move(br#"{"ok": true, "dry_run": true, "worker": "parse-header", "changed": [{"path": "atrium.toml", "action": "edited"}], "core_call": "demo::parse_header_worker::call", "calls": [{"path": "src/main.rs", "line": 63, "text": "  let h = parse_header(&b);"}], "notes": []}"#, "parse-header", "crate::parse_header").unwrap();
+        assert_eq!(m.changed, vec!["edited atrium.toml"]);
+        assert_eq!(m.calls, vec!["src/main.rs:63: let h = parse_header(&b);"]);
+        assert!(m.dry_run);
+        assert_eq!(read_move(br#"{"ok": false, "error": "generic"}"#, "a", "b"), Err("generic".into()));
+    }
 
     #[test]
     fn targets_and_a_round() {

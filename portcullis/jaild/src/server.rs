@@ -1362,6 +1362,17 @@ fn handle_create_with_exec(
         Some(f) => Some(fuse_prepare(f)?),
         None => None,
     };
+    /* ★ A trusted stick's server is handed a DIRECTORY (fuse.root_dir). The
+     * kernel refuses jail_attach to a process holding a directory descriptor
+     * (chroot_refuse_vdir_fds: EPERM), so the child gets a socket at fd 3
+     * instead and receives the directory on it once it is attached. */
+    let dir_pass = match &req.fuse {
+        Some(f) if !f.root_dir.is_empty() => Some(std::os::unix::net::UnixStream::pair().map_err(|e| {
+            ffi::unmount_force_quiet(&f.mountpoint);
+            JaildError::Syscall { name: "socketpair", errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}") }
+        })?),
+        _ => None,
+    };
 
     let pdf = match ffi::pdfork() {
         Ok(p) => p,
@@ -1400,7 +1411,19 @@ fn handle_create_with_exec(
 
         if let Some((dev, fusefd)) = &fuse {
             use std::os::unix::io::AsRawFd;
-            let mut fds: Vec<i32> = dev.iter().map(|d| d.as_raw_fd()).collect();
+            let mut fds: Vec<i32> = match &dir_pass {
+                // The directory comes after jail_attach (above): close it
+                // here, and hold fd 3 with the socket it will come on.
+                Some((_, theirs)) => {
+                    for d in dev.iter() {
+                        // SAFETY: the child's copy; the parent keeps its own.
+                        #[allow(unsafe_code)]
+                        unsafe { libc::close(d.as_raw_fd()) };
+                    }
+                    vec![theirs.as_raw_fd()]
+                }
+                None => dev.iter().map(|d| d.as_raw_fd()).collect(),
+            };
             fds.push(fusefd.as_raw_fd());
             if let Some(c) = &control {
                 fds.push(c.as_raw_fd());
@@ -1469,6 +1492,22 @@ fn handle_create_with_exec(
             eprintln!("jaild-child: attach: {e}");
             ffi::child_exit(102);
         }
+        if dir_pass.is_some() {
+            // Inside the jail now: the stick's directory, at fd 3.
+            let got = ffi::recv_one_fd(3).and_then(|d| {
+                // SAFETY: dup2 onto fd 3 (the socket, no longer needed); it
+                // clears FD_CLOEXEC there.
+                #[allow(unsafe_code)]
+                let r = unsafe { libc::dup2(d, 3) };
+                #[allow(unsafe_code)]
+                unsafe { libc::close(d) };
+                if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            });
+            if let Err(e) = got {
+                eprintln!("jaild-child: the stick's directory: {e}");
+                ffi::child_exit(105);
+            }
+        }
         if let Err(e) = ffi::drop_privileges(exec.uid, exec.gid) {
             eprintln!("jaild-child: drop_privileges({}, {}): {e}",
                 exec.uid, exec.gid);
@@ -1490,6 +1529,15 @@ fn handle_create_with_exec(
     /* The child holds the caller's stdio now; jaild's copies must go, or the
      * broker's end would never see EOF when the worker exits. */
     drop(stdio);
+    /* A trusted stick's directory goes to the child once it is attached
+     * (above). If the child is already gone, the send fails and so does it. */
+    if let (Some((ours, _)), Some((Some(dir), _))) = (&dir_pass, &fuse) {
+        use std::os::unix::io::AsRawFd;
+        if let Err(e) = ffi::send_one_fd(ours.as_raw_fd(), dir.as_raw_fd()) {
+            warn!("jaild: {}: handing over the stick's directory: {e}", req.name);
+        }
+    }
+    drop(dir_pass);
     /* Likewise the partition and /dev/fuse: the server holds them now. */
     drop(fuse);
     drop(control);

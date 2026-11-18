@@ -56,6 +56,8 @@ enum Job {
     Templates,
     New { dir: String },
     FuzzList { project: String },
+    /// `cargo atrium worker add` (`dry`: the preview).
+    WorkerAdd { project: String, worker: String, from: String, dry: bool },
     /// Streams JSON lines; `buf` holds the unfinished one.
     FuzzRun { target: String },
 }
@@ -313,6 +315,25 @@ impl Engine {
                     }
                 }
             }
+            Act::MoveToWorker(i) => {
+                let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
+                let Some(frame) = c.and_then(|c| c.frame) else { return true };
+                let p = s.project.clone();
+                let file = frame.rsplit_once(':').map(|(f, _)| f).unwrap_or(&frame);
+                let text = join_rel(&p, file).and_then(|rel| std::fs::read_to_string(self.root.join(rel)).ok()).unwrap_or_default();
+                match crate::fuzz::move_target(&frame, &text) {
+                    Ok((worker, from)) => self.worker_add(&p, &worker, &from, true, s),
+                    Err(e) => s.note = Some((format!("Can't move it: {e}"), true)),
+                }
+            }
+            Act::ConfirmMove(yes) => {
+                if let Some(m) = s.moving.take() {
+                    if yes {
+                        let p = s.project.clone();
+                        self.worker_add(&p, &m.worker, &m.from, false, s);
+                    }
+                }
+            }
             Act::ReplayCrash(i) => {
                 let c = s.fuzz.as_ref().and_then(|f| f.crashes.get(i)).cloned();
                 match c {
@@ -391,6 +412,18 @@ impl Engine {
         let p = self.project_of(&rel);
         if p != s.project || s.tasks.is_empty() {
             self.set_project(&p, s);
+        }
+    }
+
+    fn worker_add(&mut self, project: &str, worker: &str, from: &str, dry: bool, s: &mut State) {
+        let mut argv: Vec<String> = crate::fuzz::WORKER_ADD.iter().map(|a| a.to_string()).collect();
+        argv.extend([worker.to_string(), "--from".into(), from.to_string(), "--json".into()]);
+        if dry {
+            argv.push("--dry-run".into());
+        }
+        let job = Job::WorkerAdd { project: project.into(), worker: worker.into(), from: from.into(), dry };
+        if !self.start_job(job, &argv, project, s) {
+            s.note = Some(("Can't run cargo atrium worker add".into(), true));
         }
     }
 
@@ -1110,6 +1143,44 @@ impl Engine {
                         c.take_check(&buf);
                     }
                 }
+                Job::WorkerAdd { project, worker, from, dry } => {
+                    s.panel = Panel::Output;
+                    s.panel_open = true;
+                    match crate::fuzz::read_move(&buf, &worker, &from) {
+                        Ok(m) => {
+                            let mut out = format!("$ cargo atrium worker add {worker} --from {from}{}\n", if dry { " --dry-run" } else { "" });
+                            for c in &m.changed {
+                                out.push_str(&format!("  {c}\n"));
+                            }
+                            if !m.calls.is_empty() {
+                                out.push_str(&format!("Calls to change to {}:\n", m.core_call));
+                                for c in &m.calls {
+                                    out.push_str(&format!("  {c}\n"));
+                                }
+                            }
+                            for n in &m.notes {
+                                out.push_str(&format!("{n}\n"));
+                            }
+                            s.output = out;
+                            if dry {
+                                s.moving = Some(m);
+                            } else {
+                                s.note = Some((format!("Moved {from} into the worker {worker}"), false));
+                                self.tree.refresh();
+                                // The composition and the fuzz targets change with it.
+                                if s.project == project {
+                                    self.jobs.retain(|(j, _, _)| !matches!(j, Job::FuzzRun { .. } | Job::FuzzList { .. }));
+                                    s.fuzz = None;
+                                    self.load_composition(s);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            s.output = format!("cargo atrium worker add {worker}: {e}\n");
+                            s.note = Some((format!("Can't move it: {e}"), true));
+                        }
+                    }
+                }
                 Job::FuzzList { project } => {
                     if let Some(f) = s.fuzz.as_mut().filter(|_| s.project == project) {
                         f.listed = true;
@@ -1686,6 +1757,21 @@ mod tests {
             }
             e.act(Act::StopDebug, &mut s);
         }
+        // Move into a worker: a preview, then the move; the worker becomes a
+        // fuzz target of its own.
+        e.act(Act::MoveToWorker(0), &mut s);
+        assert!(wait(&mut e, &mut s, 120, &|s| s.moving.is_some() || s.note.as_ref().is_some_and(|n| n.1)), "{:?} {}", s.note, s.output);
+        let m = s.moving.clone().unwrap_or_else(|| panic!("{:?} {}", s.note, s.output));
+        assert_eq!((m.worker.as_str(), m.from.as_str(), m.dry_run), ("read-album", "crate::read_album", true));
+        assert!(m.changed.iter().any(|c| c.ends_with("atrium.toml")), "{m:?}");
+        assert!(!std::fs::read_to_string(d.join("proj/photos/atrium.toml")).unwrap().contains("[[workers]]"), "a preview writes nothing");
+        e.act(Act::ConfirmMove(true), &mut s);
+        assert!(wait(&mut e, &mut s, 120, &|s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Moved") || n.1)), "{:?} {}", s.note, s.output);
+        assert_eq!(s.note.as_ref().map(|n| n.1), Some(false), "{:?} {}", s.note, s.output);
+        assert!(std::fs::read_to_string(d.join("proj/photos/atrium.toml")).unwrap().contains("[[workers]]"));
+        assert!(wait(&mut e, &mut s, 60, &|s| s.fuzz.as_ref().is_some_and(|f| f.listed)), "{:?}", s.fuzz);
+        assert!(s.fuzz.as_ref().unwrap().targets.iter().any(|t| t.name == "worker:read-album" && !t.core), "{:?}", s.fuzz);
+        assert_eq!(s.composition.as_ref().map(|c| c.workers.len()), Some(1));
         let _ = std::fs::remove_dir_all(&d);
     }
 

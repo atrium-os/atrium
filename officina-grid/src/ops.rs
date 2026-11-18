@@ -75,6 +75,9 @@ pub enum GridOp {
     DropSheet,
     /// A sheet's new name; formulas name sheets by number, so they follow.
     RenameSheet { sheet: u16, name: String },
+    /// Sheet `from` moved to place `to` ([`Workbook::move_sheet`]); its inverse
+    /// moves it back.
+    MoveSheet { from: u16, to: u16 },
 }
 
 impl GridOp {
@@ -204,6 +207,12 @@ impl GridOp {
                 w.u8(12);
                 return w.into_bytes();
             }
+            GridOp::MoveSheet { from, to } => {
+                w.u8(14);
+                w.u16(*from);
+                w.u16(*to);
+                return w.into_bytes();
+            }
             GridOp::RenameSheet { sheet, name } => {
                 w.u8(13);
                 w.u16(*sheet);
@@ -311,8 +320,9 @@ impl GridOp {
             }
             return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
         }
-        if (11..=13).contains(&kind) {
+        if (11..=14).contains(&kind) {
             let op = match kind {
+                14 => GridOp::MoveSheet { from: r.u16()?, to: r.u16()? },
                 11 => GridOp::AddSheet(r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string()),
                 12 => GridOp::DropSheet,
                 _ => {
@@ -452,6 +462,13 @@ impl Op<Workbook> for GridOp {
                 Some(name) => GridOp::AddSheet(name),
                 None => GridOp::Batch(Vec::new()),
             },
+            GridOp::MoveSheet { from, to } => {
+                if wb.move_sheet(from, to) {
+                    GridOp::MoveSheet { from: to, to: from }
+                } else {
+                    GridOp::Batch(Vec::new())
+                }
+            }
             GridOp::RenameSheet { sheet, name } => match wb.rename_sheet(sheet, &name) {
                 Ok(old) => GridOp::RenameSheet { sheet, name: old },
                 Err(_) => GridOp::Batch(Vec::new()),

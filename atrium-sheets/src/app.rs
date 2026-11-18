@@ -627,6 +627,51 @@ impl Sheets {
                     None => self.changed(),
                 }
             }
+            TabCmd::Delete => {
+                let shown = {
+                    let mut d = self.doc.borrow_mut();
+                    let s = d.sheet;
+                    match officina_grid::sheetops::delete_sheet_op(&d.wb, s) {
+                        Some(op) => {
+                            let name = d.wb.sheet_name(s);
+                            let n = d.wb.sheet_count();
+                            d.run("Delete Sheet", vec![op]);
+                            if d.wb.sheet_count() < n {
+                                d.status = format!("Deleted “{name}”; Undo brings it back.");
+                            }
+                            // The sheet that took its place, or the one before the last.
+                            let to = s.min(d.wb.sheet_count().saturating_sub(1) as u16);
+                            d.sheet = u16::MAX;
+                            Some(to)
+                        }
+                        None => {
+                            d.status = "A workbook keeps at least one sheet.".into();
+                            None
+                        }
+                    }
+                };
+                match shown {
+                    Some(s) => self.show_sheet(s),
+                    None => self.changed(),
+                }
+            }
+            TabCmd::MoveLeft | TabCmd::MoveRight => {
+                let to = {
+                    let mut d = self.doc.borrow_mut();
+                    let s = d.sheet;
+                    let n = d.wb.sheet_count() as u16;
+                    let to = if c == TabCmd::MoveLeft { s.checked_sub(1) } else { (s + 1 < n).then_some(s + 1) };
+                    if let Some(to) = to {
+                        d.run("Move Sheet", vec![officina_grid::ops::GridOp::MoveSheet { from: s, to }]);
+                        d.sheet = to;
+                    }
+                    to
+                };
+                if to.is_some() {
+                    self.reveal_tab();
+                }
+                self.changed();
+            }
             TabCmd::Earlier => {
                 self.tab_first.set(self.tab_first.get().saturating_sub(1));
                 self.changed();
@@ -1336,6 +1381,18 @@ impl Sheets {
                     self.tab_cmd(crate::tabs::TabCmd::Rename);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::DeleteSheet) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Delete);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::MoveSheetLeft) => {
+                    self.tab_cmd(crate::tabs::TabCmd::MoveLeft);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::MoveSheetRight) => {
+                    self.tab_cmd(crate::tabs::TabCmd::MoveRight);
+                    false
+                }
                 Cmd::Review(c) => {
                     self.review_cmd(c);
                     false
@@ -1771,6 +1828,31 @@ mod tests {
         }
         assert_eq!(s.doc.borrow().wb.sheet_count(), 1);
         assert_eq!(s.doc.borrow().sheet, 0);
+        // Move and delete: Data sheet with a formula reading it.
+        run(Cmd::Data(crate::data::DataCmd::AddSheet));
+        run(Cmd::Data(crate::data::DataCmd::AddSheet));
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 3);
+        assert!(s.doc.borrow_mut().type_into(0, 0, "=Sheet1!B1+1"));
+        run(Cmd::Data(crate::data::DataCmd::MoveSheetLeft));
+        assert_eq!((s.doc.borrow().sheet, s.doc.borrow().wb.sheet_name(1)), (1, "Sheet3".to_string()));
+        assert_eq!(s.doc.borrow().wb.value(1, 0, 0), officina_grid::Value::Num(2.0));
+        run(Cmd::Tab(TabCmd::Go(0)));
+        run(Cmd::Data(crate::data::DataCmd::DeleteSheet));
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 2);
+        assert_eq!(s.doc.borrow().sheet, 0);
+        assert_eq!(s.doc.borrow().wb.value(0, 0, 0), officina_grid::Value::Err(officina_grid::ErrorKind::Ref));
+        run(Cmd::Undo);
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 3);
+        assert_eq!(s.doc.borrow().wb.value(1, 0, 0), officina_grid::Value::Num(2.0));
+        run(Cmd::Tab(TabCmd::Go(2)));
+        run(Cmd::Data(crate::data::DataCmd::DeleteSheet));
+        assert_eq!(s.doc.borrow().sheet, 1, "deleting the last shows the one before");
+        // Undo the delete, the move, the formula and both sheets.
+        for _ in 0..5 {
+            run(Cmd::Undo);
+        }
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 1);
+
         // Thousands of sheets: only the tabs that fit are drawn, quickly.
         {
             let mut d = s.doc.borrow_mut();
