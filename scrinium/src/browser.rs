@@ -74,6 +74,10 @@ pub struct StickSheet {
     pub busy: bool,
     /// What went wrong last, shown on the sheet.
     pub error: Option<String>,
+    /// Open was pressed before Arca's field gave its handle: the press
+    /// itself takes the field's focus, and Arca holds what was typed then,
+    /// so the handle follows it (as on "Connect to server").
+    pub armed: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1028,7 +1032,7 @@ impl Browser {
 
     fn sheet_for(&self, i: usize, ask: StickAsk) -> Option<StickSheet> {
         let p = self.places.get(i).filter(|p| p.stick && !p.network)?;
-        (self.picker().is_none()).then(|| StickSheet { part: p.id.clone(), label: p.label.clone(), ask, busy: false, error: None })
+        (self.picker().is_none()).then(|| StickSheet { part: p.id.clone(), label: p.label.clone(), ask, busy: false, error: None, armed: None })
     }
 
     /// "Make this a Work stick" (or "Encrypt this stick" for Personal):
@@ -1097,7 +1101,8 @@ impl Browser {
             StickAsk::Recovery { keep } => match handle {
                 Some(h) => MediaAsk::Adopt { part: sh.part.clone(), persona, keep: *keep, handle: h },
                 None => {
-                    sh.error = Some("Type the recovery code in the field first".into());
+                    sh.armed = Some(std::time::Instant::now());
+                    sh.error = None;
                     return;
                 }
             },
@@ -1110,7 +1115,29 @@ impl Browser {
         };
         sh.busy = true;
         sh.error = None;
+        sh.armed = None;
         self.want_media = Some(ask);
+    }
+
+    /// Arca's recovery-code field gave a handle: a press on Open that was
+    /// waiting for it goes ahead.
+    pub fn code_handle(&mut self, h: [u8; 16]) {
+        if self.stick_sheet.as_ref().is_some_and(|s| s.armed.is_some()) {
+            self.confirm_stick(Some(h));
+        }
+    }
+
+    /// No handle came after a press on Open: nothing was typed. `true` if
+    /// that changed the sheet.
+    pub fn stick_tick(&mut self, now: std::time::Instant) -> bool {
+        match self.stick_sheet.as_mut() {
+            Some(sh) if sh.armed.is_some_and(|t| now.duration_since(t) >= crate::connect::ARMED_WAIT) => {
+                sh.armed = None;
+                sh.error = Some("Type the recovery code in Arca's field first".into());
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn close_stick_sheet(&mut self) {
@@ -1623,7 +1650,16 @@ mod tests {
         b.ask_recovery();
         b.confirm_stick(None);
         assert!(b.want_media.is_none());
+        // The press waits for the field's handle; none comes: nothing typed.
+        let t = b.stick_sheet.as_ref().unwrap().armed.unwrap();
+        assert!(!b.stick_tick(t));
+        assert!(b.stick_tick(t + crate::connect::ARMED_WAIT));
         assert!(b.stick_sheet.as_ref().unwrap().error.is_some());
+        // One that comes in time completes the press.
+        b.confirm_stick(None);
+        b.code_handle([4; 16]);
+        assert!(matches!(b.want_media.take(), Some(MediaAsk::Adopt { handle: [4, ..], .. })));
+        b.media_done(Err("x".into()));
         b.toggle_keep();
         b.confirm_stick(Some([5; 16]));
         assert_eq!(b.want_media.take(), Some(MediaAsk::Adopt { part: "da0s1".into(), persona: "personal".into(), keep: false, handle: [5; 16] }));
