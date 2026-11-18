@@ -6,8 +6,10 @@
 //! closure (§5 there): every library the programs need, found by reading
 //! their `DT_NEEDED` (never by running them), and the rtld. Base
 //! libraries keep their paths (`lib/`, `usr/lib/`); one found anywhere
-//! else (a `DT_RUNPATH`, `$ORIGIN`, a linked workspace) goes to `usr/lib/`,
-//! where the app's loader looks. `opifex pack` then writes the content
+//! else (`usr/local/lib` from pkg, a `DT_RUNPATH`, `$ORIGIN`, a linked
+//! workspace) goes to `usr/lib/`. An app's jail has no
+//! `ld-elf.so.hints`, so the loader looks only in its built-in `/lib` and
+//! `/usr/lib`. `opifex pack` then writes the content
 //! index and, with `--sign`, the signature, and `opifex archive` the
 //! `.insula` file to side-load.
 //!
@@ -98,8 +100,15 @@ pub fn dynamic(b: &[u8]) -> Result<Dynamic, String> {
     Ok(out)
 }
 
-/// The rtld's default path, under the root the libraries come from.
+/// Where libraries are looked for, under the root they come from.
 pub const LIB_DIRS: [&str; 3] = ["lib", "usr/lib", "usr/local/lib"];
+
+/// Where a library found in `dir` goes in the bundle: one of the rtld's
+/// built-in directories, which are all it searches in an app's jail (no
+/// hints file there).
+fn staged_dir(dir: &str) -> &'static str {
+    if dir == "lib" { "lib" } else { "usr/lib" }
+}
 
 /// One file of the closure: where it is, and where it goes in the bundle.
 #[derive(Debug, PartialEq)]
@@ -146,7 +155,7 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 hit = true;
                 seen.insert(n.clone(), ());
                 queue.push((from.clone(), n.clone()));
-                out.push(Staged { from, to: format!("{d}/{n}") });
+                out.push(Staged { from, to: format!("{}/{n}", staged_dir(d)) });
             }
         }
         if !hit {
@@ -186,7 +195,7 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 for d in LIB_DIRS {
                     let p = root.join(d).join(so);
                     if p.is_file() {
-                        found = Some((p, format!("{d}/{so}")));
+                        found = Some((p, format!("{}/{so}", staged_dir(d))));
                         break;
                     }
                 }
@@ -363,6 +372,16 @@ mod tests {
         let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
         assert!(tos.contains(&"usr/lib/libp_a.so") && tos.contains(&"usr/lib/libp_b.so"), "{tos:?}");
         assert_eq!(tos.iter().filter(|t| **t == "lib/libthr.so.3").count(), 1, "{tos:?}");
+        // pkg's libraries (usr/local/lib) go where the jail's loader looks.
+        std::fs::create_dir_all(root.join("usr/local/lib")).unwrap();
+        std::fs::write(root.join("usr/local/lib/libdav1d.so.7"), elf(&["libthr.so.3"], None)).unwrap();
+        std::fs::write(root.join("usr/local/lib/libx_1.so"), elf(&[], None)).unwrap();
+        let p2 = dir.join("app/prog2");
+        std::fs::write(&p2, elf(&["libdav1d.so.7"], None)).unwrap();
+        let c = closure(&[p2], &root, &["libx_*.so".into()]).unwrap();
+        let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
+        assert!(tos.contains(&"usr/lib/libdav1d.so.7") && tos.contains(&"usr/lib/libx_1.so"), "{tos:?}");
+        assert!(!tos.iter().any(|t| t.starts_with("usr/local")), "{tos:?}");
         let e = closure(&[prog.clone()], &root, &["libq_*.so".into()]).unwrap_err();
         assert!(e.contains("libq_*.so"), "{e}");
         std::fs::write(&prog, elf(&["libnope.so.1"], None)).unwrap();
