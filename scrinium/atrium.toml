@@ -1,0 +1,25 @@
+# Scrinium, the file manager (docs/spec/scrinium.md). The window lists the
+# sticks dispensatord serves into its jail and hands files to the apps that
+# open them; the system picker (the catalogue's `picker` provider) stays a
+# system service. Capabilities as vm-scrinium-check.sh grants them (uid
+# 50603): no more.
+[app]
+id          = "org.atrium.scrinium"
+name        = "Files"
+version     = "0.1.0"
+entry       = "bin/scrinium"
+description = "Your files, USB sticks and network shares."
+icon        = "files"
+
+[capabilities]
+graphics        = "fresco"
+removable-files = true   # every stick served for the session, in its jail; eject
+file-picker     = true   # hand a picked file or folder to the app that asked
+network         = "none"
+# Limen roles the window embeds (app-composition.md §3): quick look's
+# viewers, and Arca's fields (a share's password, a stick's recovery code).
+embeds          = ["doc-viewer", "pdf-viewer", "media-player", "credential"]
+
+[supervision]
+restart   = "on-crash"
+instances = "single"
