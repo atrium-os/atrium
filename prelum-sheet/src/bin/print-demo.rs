@@ -8,6 +8,8 @@
 //!   PRINT_RELAYOUT=1   the app can lay itself out again: it answers a
 //!                      Relayout with a page of the asked size
 //!   PRINT_AGAIN=n      open the sheet n times in a row (the rate limit)
+//!   PRINT_DROP=1       close each sheet as soon as it opens (with
+//!                      PRINT_AGAIN: opens as fast as the app can)
 //!   PRINT_SECS=n       exit after n seconds
 //!   FRESCO_SOCKET, LIMEN_SOCKET as usual.
 //!
@@ -89,6 +91,7 @@ fn page(w: u32, h: u32) -> Vec<u8> {
 fn main() {
     let title = std::env::var("PRINT_TITLE").unwrap_or_else(|_| "Print demo".into());
     let relayout = std::env::var_os("PRINT_RELAYOUT").is_some();
+    let drop_each = std::env::var_os("PRINT_DROP").is_some();
     let mut again: u32 = std::env::var("PRINT_AGAIN").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let until = std::env::var("PRINT_SECS").ok().and_then(|s| s.parse::<u64>().ok()).map(|s| Instant::now() + Duration::from_secs(s));
     let file = std::env::var("PRINT_PDF").ok().map(|p| std::fs::File::open(&p).unwrap_or_else(|e| {
@@ -129,6 +132,10 @@ fn main() {
                     None => Printing::start_bytes(&embeds, token, SLOT, &page(595, 842), &title, relayout, Some(Paper::A4)),
                 };
                 match r {
+                    Ok(p) if drop_each => {
+                        eprintln!("print-demo: asked to print (embed {}), and closed it", p.embed());
+                        p.cancel(&embeds);
+                    }
                     Ok(p) => {
                         eprintln!("print-demo: asked to print (embed {})", p.embed());
                         shown.set(Shown { printing: true, line: "Printing…".into() });

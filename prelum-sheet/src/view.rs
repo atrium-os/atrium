@@ -130,7 +130,9 @@ impl SheetView {
         for (i, d) in s.dests.iter().enumerate().skip(skip).take(MAX_ROWS) {
             let on = i == s.chosen;
             let r = Rect::new(RIGHT_X, y, RIGHT_W, ROW - 2.0);
-            let row = ctx.add(Node::Rect { rect: r, fill: if on { t.selection_bg() } else { Color::TRANSPARENT }, radius: radius::SM });
+            // The row holds its hover and its words, so a press on either
+            // is the row's.
+            let row = ctx.push(Node::Rect { rect: r, fill: if on { t.selection_bg() } else { Color::TRANSPARENT }, radius: radius::SM });
             if ctx.is_hovered(row) && !on {
                 ctx.add(Node::Rect { rect: r, fill: t.state_hover(), radius: radius::SM });
             }
@@ -145,6 +147,7 @@ impl SheetView {
                 let m = Node::measure_text(mark, &st);
                 self.text(ctx, r.x() + r.w() - m.w - 10.0, r.y() + 7.0, m.w, mark, st);
             }
+            ctx.pop();
             let st = self.sheet.clone();
             ctx.on_click(row, move || edit(&st, |v| v.choose(i)));
             y += ROW;
@@ -164,7 +167,7 @@ impl View for SheetView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         let s = self.sheet.get_cloned();
-        ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, W, H), fill: t.bg_window(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, W, H), fill: t.bg_canvas(), radius: 0.0 });
         self.preview(ctx, &s);
 
         let head = if s.title.is_empty() { "Print".to_string() } else { format!("Print “{}”", s.title) };
@@ -320,7 +323,11 @@ mod tests {
         s.listed = true;
         v.sheet.set(s);
         let _ = a.tick();
-        click(&mut a, Rect::new(RIGHT_X, PAD + 34.0, RIGHT_W, ROW - 2.0));
+        // The pointer rests on the row first (its hover drawn), then presses.
+        let r = Rect::new(RIGHT_X, PAD + 34.0, RIGHT_W, ROW - 2.0);
+        a.handle_event(Event::PointerMove { at: Point::new(r.x() + 20.0, r.y() + 10.0) });
+        let _ = a.tick();
+        click(&mut a, r);
         assert!(matches!(v.sheet.get_cloned().dest(), Dest::Nearby(_)));
         assert_eq!(v.sheet.get_cloned().button(), "Print");
     }
