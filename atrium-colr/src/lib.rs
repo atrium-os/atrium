@@ -239,6 +239,35 @@ impl Painter<'_> {
     }
 }
 
+/// A sweep gradient's colour at `deg` (counter-clockwise from +x, font
+/// space): where it falls between the start and end angles, extended as
+/// `extend` says, then between the stops (straight RGBA).
+fn sweep_color(stops: &[(f32, Color)], start: f32, end: f32, extend: Extend, deg: f32) -> Color {
+    let span = end - start;
+    let mut t = if span.abs() < 1e-6 { if deg < start { 0.0 } else { 1.0 } } else { (deg - start) / span };
+    t = match extend {
+        Extend::Repeat => t.rem_euclid(1.0),
+        Extend::Reflect => {
+            let r = t.rem_euclid(2.0);
+            if r > 1.0 { 2.0 - r } else { r }
+        }
+        _ => t.clamp(0.0, 1.0),
+    };
+    let first = stops[0];
+    if t <= first.0 {
+        return first.1;
+    }
+    for pair in stops.windows(2) {
+        let ((a, ca), (b, cb)) = (pair[0], pair[1]);
+        if t <= b {
+            let k = if b - a > 1e-6 { (t - a) / (b - a) } else { 1.0 };
+            let l = |x: f32, y: f32| x + (y - x) * k;
+            return Color::from_rgba(l(ca.red(), cb.red()), l(ca.green(), cb.green()), l(ca.blue(), cb.blue()), l(ca.alpha(), cb.alpha())).unwrap_or(cb);
+        }
+    }
+    stops[stops.len() - 1].1
+}
+
 fn gs(s: &[(f32, Color)]) -> Vec<GradientStop> {
     s.iter().map(|&(o, c)| GradientStop::new(o, c)).collect()
 }
@@ -310,13 +339,28 @@ impl ColorPainter for Painter<'_> {
                     },
                 }
             }
-            // No sweep gradients in tiny-skia: the middle stop's colour.
-            Brush::SweepGradient { color_stops, .. } => {
+            // No sweep gradients in tiny-skia: drawn here, a pixel at a
+            // time, then laid on through the clip.
+            Brush::SweepGradient { c0, start_angle, end_angle, color_stops, extend } => {
                 let stops = self.stops(color_stops);
-                match stops.get(stops.len() / 2) {
-                    Some(s) => Shader::SolidColor(s.1),
-                    None => return,
+                if stops.is_empty() {
+                    return;
                 }
+                let Some(inv) = t.invert() else { return };
+                let Some(mut src) = Pixmap::new(self.w, self.h) else { return };
+                let w = self.w as usize;
+                for (i, px) in src.pixels_mut().iter_mut().enumerate() {
+                    let mut p = Point::from_xy((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+                    inv.map_point(&mut p);
+                    let deg = (p.y - c0.y).atan2(p.x - c0.x).to_degrees().rem_euclid(360.0);
+                    let c = sweep_color(&stops, start_angle, end_angle, extend, deg);
+                    *px = c.premultiply().to_color_u8();
+                }
+                let clip = self.clips.last().cloned().flatten();
+                if let Some((pm, _)) = self.layers.last_mut() {
+                    pm.draw_pixmap(0, 0, src.as_ref(), &PixmapPaint::default(), Transform::identity(), clip.as_ref());
+                }
+                return;
             }
         };
         let paint = Paint { shader, anti_alias: true, ..Paint::default() };
@@ -361,6 +405,20 @@ mod tests {
     fn junk_is_not_a_color_font() {
         assert!(!is_color_font(b"not a font"));
         assert!(render(b"not a font", 1, 32.0, [0.0, 0.0, 0.0, 1.0]).is_none());
+    }
+
+    #[test]
+    fn sweep_colours_follow_the_angle() {
+        let (r, b) = (Color::from_rgba8(255, 0, 0, 255), Color::from_rgba8(0, 0, 255, 255));
+        let stops = [(0.0, r), (1.0, b)];
+        let at = |e, d| sweep_color(&stops, 0.0, 180.0, e, d);
+        assert_eq!(at(Extend::Pad, 0.0), r);
+        assert_eq!(at(Extend::Pad, 180.0), b);
+        let mid = at(Extend::Pad, 90.0);
+        assert!((mid.red() - 0.5).abs() < 0.01 && (mid.blue() - 0.5).abs() < 0.01);
+        assert_eq!(at(Extend::Pad, 270.0), b, "padded past the end");
+        assert!((at(Extend::Repeat, 270.0).red() - 0.5).abs() < 0.01, "repeats");
+        assert!((at(Extend::Reflect, 225.0).blue() - 0.75).abs() < 0.01, "reflects");
     }
 
     /// The shipped Noto Color Emoji: 😀 comes out yellow, about an em and a

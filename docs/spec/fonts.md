@@ -104,7 +104,8 @@ Sans, Symbols, Symbols 2, Math and Serif.
   run's atlas page, so a run is still one slot. Emoji take Noto Color Emoji:
   `atrium-colr` draws the COLRv1 (or v0) glyph to RGBA (skrifa's paint
   graph, tiny-skia; sweep gradients are drawn as their middle stop), into a
-  512×512 RGBA twin of the run's page at `color_atlas_slot(slot)`; the
+  RGBA twin of the run's page at `color_atlas_slot(slot)`, half the page's
+  size each way (`color_atlas_dims`: 512² for frescod's 1024² pages); the
   glyph's `atlas_u` carries `GLYPH_COLOR`, and the renderer takes the texel's
   colour (times the run's alpha) instead of the run's colour. A space after
   an emoji is the run font's, not the emoji face's (whose space is as wide as
@@ -187,8 +188,12 @@ a Japanese label in the VM.
   marking them `GLYPH_COLOR` (frescod keeps the mark only when the window
   bound that slot); the PDF export draws each emoji once as a picture
   (160 px to the em, soft mask) over its text written invisibly (`3 Tr`),
-  so the text copies and searches. Left: the colour atlas is 512² per
-  window, so very many large emoji drop the rest (logged). Opifex installs font
+  so the text copies and searches. Pergola's colour twin is 1024² (its
+  glyph atlas is 2048²), made on a window's first emoji: about 600
+  distinct emoji at one large size; past that the rest are dropped
+  (logged), like coverage glyphs when that atlas fills. A COLRv1 sweep
+  gradient is drawn per pixel (tiny-skia has none); Noto Color Emoji uses
+  none, other COLR fonts may. Opifex installs font
   packages (opifex.md §14.7: `opifex font pack`, the pin list written by
   opifexd). The CJK packages (`org.atrium.font.noto-sans-{jp,sc,tc,hk,kr}`
   2.004, regular and bold, 11 to 21 MB each) are built by
