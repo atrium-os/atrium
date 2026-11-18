@@ -231,7 +231,12 @@ fn a_flag_from_elsewhere_gets_a_date() {
     assert_eq!((items[0].1.msg, items[0].1.kind), (id_of(1), kind::REPLY));
     let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     assert!(items[0].1.due > soon && items[0].1.due <= soon + 2 * 86_400, "tomorrow morning");
-    assert_eq!(engine.store.ops_pending().unwrap(), 0, "already flagged on the server");
+    // Already flagged on the server: only `$Snoozed` goes to it.
+    let ops = engine.store.ops_due(account, i64::MAX).unwrap();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].1.kind, mail_store::OpKind::Flags { add: mail_store::flag::SNOOZED, remove: 0 });
+    engine.store.write(|w| w.op_done(ops[0].0, true)).unwrap();
+    assert!(engine.store.at(inbox, 1).unwrap().unwrap().1 & mail_store::flag::SNOOZED != 0);
 
     // Flagged later elsewhere: the next flags report makes one too.
     sink.flags("INBOX", &[(2, vec!["\\Flagged".into()])]).unwrap();
@@ -244,9 +249,22 @@ fn a_flag_from_elsewhere_gets_a_date() {
     sink.flags("INBOX", &[(2, vec!["\\Flagged".into()])]).unwrap();
     assert!(engine.later_of(id_of(2)).unwrap().is_none());
 
+    // Unflagged on the phone: Priya's item is done, back in the inbox.
+    for (id, _) in engine.store.ops_due(account, i64::MAX).unwrap() {
+        engine.store.write(|w| w.op_done(id, true)).unwrap();
+    }
+    assert!(engine.later_of(id_of(1)).unwrap().is_some());
+    sink.flags("INBOX", &[(1, vec!["$Snoozed".into()])]).unwrap();
+    assert!(engine.later_of(id_of(1)).unwrap().is_none());
+    assert!(engine.store.list(inbox, 0, 10).unwrap().iter().any(|r| r.subject == "Numbers?"));
+    // ...and `$Snoozed` comes off.
+    let ops = engine.store.ops_due(account, i64::MAX).unwrap();
+    assert_eq!(ops.iter().map(|o| o.1.kind.clone()).collect::<Vec<_>>(), [mail_store::OpKind::Flags { add: 0, remove: mail_store::flag::SNOOZED }]);
+    engine.store.write(|w| w.op_done(ops[0].0, true)).unwrap();
+
     // Flagged in Trash: nothing.
     let mut t = f(1, msg("Sam <sam@acme.example>", me, "Old", 9, "s1@x", ""));
     t.flags = vec!["\\Flagged".into()];
     sink.messages("Trash", vec![t]).unwrap();
-    assert_eq!(engine.later_items().unwrap().len(), 1);
+    assert!(engine.later_items().unwrap().is_empty());
 }

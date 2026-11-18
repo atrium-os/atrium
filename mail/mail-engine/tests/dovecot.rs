@@ -438,6 +438,11 @@ fn dovecot_through_the_courier_into_the_store() {
     // ── a third pass with nothing new is cheap ──
     let r3 = Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     assert_eq!((r3.headers, r3.texts, r3.vanished), (0, 0, 0), "{r3:?}");
+    // That pass carried `$Snoozed` for Message 7, and Dovecot kept it.
+    assert_eq!(engine.store.ops_pending().unwrap(), 0);
+    Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    let m7 = engine.store.message(items[0].1.msg).unwrap();
+    assert!(m7.held.iter().chain(&m7.locations).any(|(f, u)| engine.store.at(*f, *u).unwrap().is_some_and(|(_, fl)| fl & flag::SNOOZED != 0)));
 
     // ── the person's changes reach the server ──
     let folders = engine.store.folders(account).unwrap();

@@ -161,11 +161,15 @@ impl Engine {
         let msgs = self.store.thread(t).unwrap_or_default();
         let flag_at = msgs.last().and_then(|x| x.message.locations.first().copied());
         let id = self.store.write(|w| {
+            // `\Flagged` and `$Snoozed` on the newest message (§11.4).
             if let Some((f, u)) = flag_at {
-                if self.store.at(f, u)?.is_some_and(|(_, fl)| fl & flag::FLAGGED == 0) {
-                    match w.queue(f, u, OpKind::Flags { add: flag::FLAGGED, remove: 0 }, now()) {
-                        Ok(_) | Err(mail_store::Error::NotFound) => {}
-                        Err(e) => return Err(e),
+                if let Some((_, fl)) = self.store.at(f, u)? {
+                    let add = (flag::FLAGGED | flag::SNOOZED) & !fl;
+                    if add != 0 {
+                        match w.queue(f, u, OpKind::Flags { add, remove: 0 }, now()) {
+                            Ok(_) | Err(mail_store::Error::NotFound) => {}
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
@@ -344,6 +348,21 @@ impl Engine {
             }
             Ok(())
         })?;
+        // Back: no longer snoozed for other clients either.
+        let msgs = self.store.thread(t).unwrap_or_default();
+        self.store.write(|w| {
+            for x in &msgs {
+                for &(f, u) in x.message.locations.iter().chain(&x.message.held) {
+                    if self.store.at(f, u)?.is_some_and(|(_, fl)| fl & flag::SNOOZED != 0) {
+                        match w.queue(f, u, OpKind::Flags { add: 0, remove: flag::SNOOZED }, now()) {
+                            Ok(_) | Err(mail_store::Error::NotFound) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -366,6 +385,26 @@ impl Engine {
         }
         self.set_later(msg, kind::REPLY, When::Tomorrow.at(now()), "")?;
         Ok(())
+    }
+
+    /// A message unflagged by another client: when nothing in its
+    /// conversation is flagged any more, its item is done (unflagging on
+    /// a phone is how other clients say "done"). Not while an op of
+    /// Mail's own on it is still to be sent.
+    pub(crate) fn later_unflagged(&self, folder: mail_store::FolderId, uid: u32, msg: MsgId) -> Result<(), Error> {
+        if self.store.op_pending_at(folder, uid)? {
+            return Ok(());
+        }
+        let Ok(m) = self.store.message(msg) else { return Ok(()) };
+        let Some((id, _)) = self.store.later_of(m.thread)? else { return Ok(()) };
+        for x in self.store.thread(m.thread).unwrap_or_default() {
+            for &(f, u) in x.message.locations.iter().chain(&x.message.held) {
+                if (f, u) != (folder, uid) && self.store.at(f, u)?.is_some_and(|(_, fl)| fl & flag::FLAGGED != 0) {
+                    return Ok(());
+                }
+            }
+        }
+        self.later_done(id)
     }
 
     /// New mail in a set-aside conversation (§11.4): a reply the person

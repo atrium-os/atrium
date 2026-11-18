@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look and flags from other clients built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1502,10 +1502,20 @@ Stalwart in the cloud VM, and later a real account):
    closes** once its conversation has been open 5 s with the reader at its end (all on
    screen or scrolled to the bottom), where Mail draws the message itself. Tests: engine 1
    (arrives flagged, flagged later, a stale report after Done, Trash), the Dovecot suite
-   (a message flagged on the server leaves the inbox as a Later item), window 1. **Not
-   yet**: an HTML message read to its end (the doc-viewer doesn't report how far it was
-   scrolled), a flag removed elsewhere closing the item, the review's time as a setting,
-   and `$Snoozed` with a server `Snoozed` folder.
+   (a message flagged on the server leaves the inbox as a Later item), window 1. Then
+   **`$Snoozed`**: setting a conversation aside puts `\Flagged` and `$Snoozed` on its
+   newest message in one op, and coming back (its time, mail to the person, Do it now,
+   Done, Drop) takes `$Snoozed` off everywhere in the conversation; the store keeps it as
+   a flag bit, IMAP and JMAP carry it as a keyword. **Unflagging elsewhere** closes the
+   item as Done once nothing in the conversation is flagged (again not while Mail's own op
+   is pending). Tests: engine 1 (only `$Snoozed` sent for a message already flagged, the
+   phone's unflag closing it and `$Snoozed` coming off), the JMAP suite (the keyword
+   reaches the server, an unflag on the server brings Plan back), the Dovecot suite
+   (Dovecot takes the keyword). **Not yet**: an HTML message read to its end (the
+   doc-viewer doesn't report how far it was scrolled), the review's time as a setting,
+   and the hidden server `Snoozed` folder (moving messages out of the server's inbox
+   needs folder creation and a move back at the due time; `$Snoozed` alone covers
+   clients that know the keyword).
 
 ## 17. Decisions, with recommendations
 

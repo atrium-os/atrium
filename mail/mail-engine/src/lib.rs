@@ -537,10 +537,14 @@ impl Sink for AccountSink<'_> {
 
     fn flags(&mut self, folder: &str, changes: &[(u32, Vec<String>)]) -> Result<(), String> {
         let id = self.fid(folder)?;
-        // Flagged elsewhere since the last look: a Later item (§11.4).
-        let flagged: Vec<(u32, mail_store::MsgId)> = changes.iter().filter(|(_, f)| flag::from_imap(f) & flag::FLAGGED != 0).filter_map(|(uid, _)| match self.e.store.at(id, *uid) {
-            Ok(Some((m, fl))) if fl & flag::FLAGGED == 0 => Some((*uid, m)),
-            _ => None,
+        // Flagged or unflagged elsewhere since the last look: Later (§11.4).
+        // (uid, msg, now flagged) for each message whose \Flagged changed.
+        let turned: Vec<(u32, mail_store::MsgId, bool)> = changes.iter().filter_map(|(uid, f)| {
+            let on = flag::from_imap(f) & flag::FLAGGED != 0;
+            match self.e.store.at(id, *uid) {
+                Ok(Some((m, fl))) if (fl & flag::FLAGGED != 0) != on => Some((*uid, m, on)),
+                _ => None,
+            }
         }).collect();
         self.e.store.write(|w| {
             for (uid, f) in changes {
@@ -548,10 +552,14 @@ impl Sink for AccountSink<'_> {
             }
             Ok(())
         }).map_err(|e| e.to_string())?;
-        if !flagged.is_empty() {
+        if !turned.is_empty() {
             let role = self.e.store.folder(id).map_err(|e| e.to_string())?.role;
-            for (uid, m) in flagged {
-                self.e.later_flagged(id, role, uid, m).map_err(|e| e.to_string())?;
+            for (uid, m, on) in turned {
+                if on {
+                    self.e.later_flagged(id, role, uid, m).map_err(|e| e.to_string())?;
+                } else {
+                    self.e.later_unflagged(id, uid, m).map_err(|e| e.to_string())?;
+                }
             }
         }
         Ok(())
@@ -647,9 +655,9 @@ impl Sink for AccountSink<'_> {
     }
 }
 
-/// Flag bits as IMAP's system flags.
+/// Flag bits as IMAP's system flags (and the `$Snoozed` keyword).
 fn imap_flags(bits: u32) -> Vec<String> {
-    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft")]
+    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft"), (flag::SNOOZED, "$Snoozed")]
         .iter()
         .filter(|(b, _)| bits & b != 0)
         .map(|(_, n)| n.to_string())
