@@ -109,6 +109,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if wb.sheet(s).tab_color.is_some() {
         ops.push(GridOp::TabColor { sheet: s, color: None });
     }
+    if !wb.merges(s).is_empty() {
+        ops.push(GridOp::Merges { sheet: s, list: Vec::new() });
+    }
     ops.push(GridOp::MoveSheet { from: s, to: (n - 1) as u16 });
     ops.push(GridOp::DropSheet);
     Some(GridOp::Batch(ops))

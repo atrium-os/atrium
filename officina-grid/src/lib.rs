@@ -24,6 +24,7 @@ pub mod eval;
 pub mod fast;
 pub mod filter;
 pub mod macros;
+pub mod merges;
 pub mod formula;
 pub mod names;
 pub mod native;
