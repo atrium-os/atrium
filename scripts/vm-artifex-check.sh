@@ -68,6 +68,8 @@ if [ -n "${BUNDLE:-}" ]; then
     BK=$ROOT/scratch/artifexchk-bundle; mkdir -p "$BK"
     [ -f "$BK/key8.pem" ] || { openssl ecparam -name prime256v1 -genkey -noout -out "$BK/key.pem" && openssl pkcs8 -topk8 -nocrypt -in "$BK/key.pem" -out "$BK/key8.pem"; }
     openssl ec -in "$BK/key8.pem" -pubout -out "$BK/pub.pem" 2>/dev/null
+    # The sysroot pulled from the guest has no loader; the bundle carries it.
+    [ -f "$S/libexec/ld-elf.so.1" ] || { mkdir -p "$S/libexec" && scp -q $K -P 2222 root@localhost:/libexec/ld-elf.so.1 "$S/libexec/"; }
     for d in artifex/app atrium-term-socket; do
         (cd "$ROOT/$d" && PATH="$ROOT/sdk/target/release:$PATH" OPIFEX="$ROOT/portcullis/target/release/opifex" RUSTFLAGS= \
             cargo atrium bundle --arch amd64 --sysroot "$S" --sign "$BK/key8.pem" --out "$BK/$(basename $d)" >"$BK/$(basename $d).log" 2>&1) \
