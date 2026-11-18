@@ -30,6 +30,7 @@ fn book(rows: u32, seed: u64) -> Workbook {
             }
         }
         wb.set_value(CellAddr::new(0, r, 3), Value::Num((next() % 1000) as f64 / 7.0));
+        wb.set_value(CellAddr::new(0, r, 4), Value::Num((next() % 1000) as f64 - 500.0));
     }
     wb
 }
@@ -51,17 +52,26 @@ fn indexed_if_functions_match_the_walk() {
         "=COUNTIF(A:A,TRUE)",
         "=COUNTIF(A:A,\"\")",
         "=SUMIF(A1:B20000,A1,C1:D20000)",
+        "=COUNTIF(D:D,\">\"&D1)",
+        "=COUNTIF(A:A,\"<=\"&C1)",
+        "=SUMIF(C:C,\">=\"&C1,E:E)",
+        "=SUMIF(C:C,\"<\"&C1,D:D)",
+        "=AVERAGEIF(C:C,\">\"&C1,E:E)",
+        "=COUNTIFS(D:D,\">\"&D1,D:D,\"<\"&(D1+50),A:A,A1)",
+        "=SUMIFS(E:E,C:C,\">=\"&C1,C:C,\"<=\"&(C1+3),B:B,B1)",
+        "=SUMIFS(D:D,A:A,\">\"&C1,B:B,B1)",
+        "=COUNTIF(A1:C20000,\">=\"&C1)",
     ];
     for (i, f) in forms.iter().enumerate() {
         let mut wb = book(rows, 0x9E37_79B9 + i as u64);
-        let g = wb.fill_formula(0, 5, 0, rows - 1, f).unwrap();
+        let g = wb.fill_formula(0, 6, 0, rows - 1, f).unwrap();
         let t = Instant::now();
         wb.recalc();
         let took = t.elapsed();
         let expr = wb.group(g).expr.clone();
         for r in (0..rows).step_by(97) {
-            let want = Ctx::new(&wb, 0, r, 5).eval_cell(&expr);
-            let got = wb.value(0, r, 5);
+            let want = Ctx::new(&wb, 0, r, 6).eval_cell(&expr);
+            let got = wb.value(0, r, 6);
             let same = match (&want, &got) {
                 (Value::Num(a), Value::Num(b)) => a.to_bits() == b.to_bits(),
                 _ => want == got,
