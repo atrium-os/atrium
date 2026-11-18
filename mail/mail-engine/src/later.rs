@@ -347,6 +347,27 @@ impl Engine {
         Ok(())
     }
 
+    /// A message flagged by another client (it arrived flagged, or the
+    /// server's flags turned `\Flagged` on): its conversation becomes a
+    /// *Reply* item due tomorrow morning, so even flags from elsewhere get a
+    /// date (§11.4). Not while an op of Mail's own on it is still to be
+    /// sent, not in Sent, Drafts, Junk or Trash, and not when the
+    /// conversation already has an item.
+    pub(crate) fn later_flagged(&self, folder: mail_store::FolderId, role: Role, uid: u32, msg: MsgId) -> Result<(), Error> {
+        if matches!(role, Role::Sent | Role::Drafts | Role::Junk | Role::Trash) {
+            return Ok(());
+        }
+        if !self.store.at(folder, uid)?.is_some_and(|(_, fl)| fl & flag::FLAGGED != 0) || self.store.op_pending_at(folder, uid)? {
+            return Ok(());
+        }
+        let Ok(m) = self.store.message(msg) else { return Ok(()) };
+        if self.store.later_of(m.thread)?.is_some() {
+            return Ok(());
+        }
+        self.set_later(msg, kind::REPLY, When::Tomorrow.at(now()), "")?;
+        Ok(())
+    }
+
     /// New mail in a set-aside conversation (§11.4): a reply the person
     /// sent closes a *Reply* item; an answer from someone else closes a
     /// *Waiting* one; mail to the person from a person brings it back at
@@ -364,7 +385,7 @@ impl Engine {
                 }
             }
         }
-        let Some((id, mut l)) = self.store.later_of(m.thread)? else { return Ok(()) };
+        let Some((id, mut l)) = self.store.later_of(m.thread)? else { return self.later_flagged(folder, role, uid, msg) };
         let me: Vec<String> = self.identities(account)?.into_iter().map(|i| i.addr.to_ascii_lowercase()).collect();
         let from_me = m.summary.from.iter().any(|a| me.contains(&a.addr.to_ascii_lowercase()));
         if role == Role::Sent || from_me {

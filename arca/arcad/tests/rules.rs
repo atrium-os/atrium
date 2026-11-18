@@ -144,6 +144,39 @@ fn lock_and_unlock_through_vestibulum_only() {
 }
 
 #[test]
+fn a_wireguard_key_does_diffie_hellman_and_is_never_read() {
+    // vpn.md §4.3: the engine gets the effect of the key, never the key.
+    let (_d, mut s) = setup();
+    let a = app("org.atrium.crypta-wg", 7);
+    let r = s.handle(&a, op::MINT, &body(|w| { w.u16(0x104); w.u8(1); w.str("vpn.example"); }));
+    assert_eq!(r.status, status::OK);
+    let (id, pk): ([u8; 16], [u8; 32]) = (r.body.bytes()[..16].try_into().unwrap(), r.body.bytes()[16..].try_into().unwrap());
+    assert_eq!(s.handle(&a, op::PUBKEY, &id).body.bytes(), &pk);
+    // The far side's DH with our public key matches Arca's with theirs.
+    let theirs = x25519_dalek::StaticSecret::from([0x5a; 32]);
+    let their_pub = x25519_dalek::PublicKey::from(&theirs);
+    let r = s.handle(&a, op::DH_X25519, &body(|w| { w.raw(&id); w.raw(their_pub.as_bytes()); }));
+    assert_eq!(r.status, status::OK);
+    assert_eq!(r.body.bytes(), theirs.diffie_hellman(&x25519_dalek::PublicKey::from(pk)).as_bytes());
+    // A low-order point (here zero) is refused, not answered with zeros.
+    let r = s.handle(&a, op::DH_X25519, &body(|w| { w.raw(&id); w.raw(&[0; 32]); }));
+    assert_eq!(r.status, status::MALFORMED);
+    // Never released, never signed with, never another app's to use.
+    assert_eq!(s.handle(&a, op::RELEASE, &id).status, status::NOT_RELEASABLE);
+    assert_eq!(s.handle(&a, op::SIGN, &body(|w| { w.raw(&id); w.bytes(b"x"); })).status, status::UNSUPPORTED);
+    let st = s.handle(&app("org.example.evil", 7), op::DH_X25519, &body(|w| { w.raw(&id); w.raw(their_pub.as_bytes()); })).status;
+    assert_ne!(st, status::OK);
+    // DH only with a WireGuard key: not with a signing key.
+    let r = s.handle(&a, op::MINT, &body(|w| { w.u16(0x100); w.u8(1); w.str("sig"); }));
+    let ed: [u8; 16] = r.body.bytes()[..16].try_into().unwrap();
+    assert_eq!(s.handle(&a, op::DH_X25519, &body(|w| { w.raw(&ed); w.raw(their_pub.as_bytes()); })).status, status::UNSUPPORTED);
+    // Used at every handshake: no "verify each use" WireGuard key.
+    assert_eq!(s.handle(&a, op::MINT, &body(|w| { w.u16(0x104); w.u8(3); w.str("x"); })).status, status::UNSUPPORTED);
+    // Short bodies are malformed.
+    assert_eq!(s.handle(&a, op::DH_X25519, &id).status, status::MALFORMED);
+}
+
+#[test]
 fn unknown_peers_get_nothing() {
     let (_d, mut s) = setup();
     for o in [op::MINT, op::STORE, op::LIST, op::V_UNLOCK, op::U_GRANT] {

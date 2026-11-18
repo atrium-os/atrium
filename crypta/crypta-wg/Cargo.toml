@@ -1,0 +1,20 @@
+[package]
+name        = "crypta-wg"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Crypta's WireGuard engine core (docs/spec/vpn.md §4.2): Noise_IKpsk2, cookies, transport, timers and the replay window, sans-IO. The static key is used through a trait (Arca's DH_X25519, §4.3), never held."
+
+[dependencies]
+blake2           = "0.10"
+hmac             = "0.12"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek     = { version = "2", features = ["static_secrets", "zeroize"] }
+zeroize          = { version = "1", features = ["derive"] }
+getrandom        = { version = "0.2", features = ["std"] }
+
+[dev-dependencies]
+# Interop only (vpn.md §11): an independent WireGuard implementation to
+# handshake with on the host. BSD-3-Clause; never linked into the engine.
+boringtun = { version = "0.7", default-features = false }

@@ -143,6 +143,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Whether an op not yet sent acts on (folder, uid): the server's flags
+    /// for it are not the last word until it is.
+    pub fn op_pending_at(&self, folder: FolderId, uid: u32) -> Result<bool> {
+        let tx = self.db.begin_read()?;
+        for e in tx.open_table(OPS)?.iter()? {
+            let (_, v) = e?;
+            let op: Op = dec(v.value())?;
+            if op.folder == folder && op.uid == uid {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Ops not yet sent, for every account.
     pub fn ops_pending(&self) -> Result<usize> {
         let tx = self.db.begin_read()?;

@@ -23,7 +23,7 @@ pub const MAX_SIGN_MSG: usize = 16 * 1024;
 /// Opcodes. Apps use 0x01..; Vestibulum 0x40..; Arca's trusted UI 0x60..
 pub mod op {
     /// Mint a key item for the calling app: `u16 kind | u8 class | str account`
-    /// → `id[16] | pubkey[32]`.
+    /// → `id[16] | pubkey[32]`. Kinds: `Ed25519`, `WireGuardKey`.
     pub const MINT: u16 = 0x01;
     /// `id[16]` → `pubkey[32]`.
     pub const PUBKEY: u16 = 0x02;
@@ -62,6 +62,11 @@ pub mod op {
     /// `KEEP_FOR` or a courier's `GRANTED` made; mail.md §5.1: removing an
     /// account removes its password): `endpoint | id[16]` → nothing.
     pub const DELETE_FOR: u16 = 0x0C;
+    /// X25519 with one of this app's `WireGuardKey` items (vpn.md §4.3):
+    /// `id[16] | point[32]` → `shared[32]`. The private key never leaves
+    /// Arca; a low-order point is refused (`MALFORMED`). V1 binds the item
+    /// to a Crypta profile (`crypta:<profile>`) instead of the app.
+    pub const DH_X25519: u16 = 0x0D;
     /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.

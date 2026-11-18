@@ -110,10 +110,14 @@ V 'sysrc -q atrium_portcullisd_bootstrap_enable=YES >/dev/null' && ok "bootstrap
 # NETIF_TRIM=1 (Shankar 2026-11-18): the dev VM gets its lease in the
 # background and no IPv6 autoconf, so rc.d/netif waits for neither the
 # DHCP lease nor the DAD sleep. Backup: /etc/rc.conf.pre-netif-trim.
+# vtnet0 gets its own line instead of ifconfig_DEFAULT: network.subr's
+# _ifconfig_getargs falls back to $ifconfig_DEFAULT even when asked for an
+# interface's _ipv6 arguments, so with ifconfig_DEFAULT set every port counts
+# as IPv6-configured and rc.d/netif sleeps dad_count + 1 s (2 s) for DAD.
 if [ "${NETIF_TRIM:-0}" = 1 ]; then
     V '[ -f /etc/rc.conf.pre-netif-trim ] || cp -p /etc/rc.conf /etc/rc.conf.pre-netif-trim
-       sysrc -q ifconfig_DEFAULT="DHCP" background_dhclient=YES >/dev/null' \
-        && ok "netif trim: ifconfig_DEFAULT=DHCP, background_dhclient=YES" || bad "netif trim"
+       sysrc -q -x ifconfig_DEFAULT; sysrc -q ifconfig_vtnet0="DHCP" background_dhclient=YES >/dev/null' \
+        && ok "netif trim: ifconfig_vtnet0=DHCP (no ifconfig_DEFAULT), background_dhclient=YES" || bad "netif trim"
 fi
 # The atrium_jaild rc script loads the devfs rulesets before the services
 # launch; rc.d/devfs must not reload them under jails launching at that moment.

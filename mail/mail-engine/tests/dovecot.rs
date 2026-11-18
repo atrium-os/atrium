@@ -422,12 +422,17 @@ fn dovecot_through_the_courier_into_the_store() {
     let r2 = s2.sync(&mut engine.sink(account)).unwrap();
     assert_eq!((r2.headers, r2.vanished), (1, 1), "{r2:?}");
     assert!(r2.flag_changes >= 1, "{r2:?}");
-    assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    // Message 7, flagged on the server, is a Later item now (§11.4): out
+    // of the inbox until tomorrow morning.
+    assert_eq!(engine.store.count(inbox).unwrap(), 299);
     let top = engine.store.list(inbox, 0, 1).unwrap();
     assert_eq!(top[0].subject, "Brand new");
     assert!(top[0].has_text);
-    let flagged = engine.store.list(inbox, 0, 20).unwrap().into_iter().find(|r| r.subject == "Message 7").unwrap();
-    assert!(flagged.flags & flag::FLAGGED != 0);
+    let items = engine.later_items().unwrap();
+    assert_eq!(items.len(), 1);
+    let m7 = engine.store.message(items[0].1.msg).unwrap();
+    assert_eq!(m7.summary.subject, "Message 7");
+    assert!(m7.held.iter().chain(&m7.locations).any(|(f, u)| engine.store.at(*f, *u).unwrap().is_some_and(|(_, fl)| fl & flag::FLAGGED != 0)));
     assert!(!engine.store.list(inbox, 0, 20).unwrap().iter().any(|r| r.subject == "Message 5"));
 
     // ── a third pass with nothing new is cheap ──
@@ -446,19 +451,19 @@ fn dovecot_through_the_courier_into_the_store() {
     let a = engine.act(inbox, &[others[0].uid], Action::Archive).unwrap();
     let d = engine.act(inbox, &[others[1].uid], Action::Delete).unwrap();
     let kept = engine.act(inbox, &[others[2].uid], Action::Delete).unwrap();
-    assert_eq!(engine.store.count(inbox).unwrap(), 297, "gone from the list at once");
+    assert_eq!(engine.store.count(inbox).unwrap(), 296, "gone from the list at once");
     assert_eq!(engine.undo(&kept).unwrap(), 1);
-    assert_eq!(engine.store.count(inbox).unwrap(), 298);
+    assert_eq!(engine.store.count(inbox).unwrap(), 297);
     // A pass inside the window sends only the read.
     Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.store.ops_pending().unwrap(), 2);
-    assert_eq!(engine.store.count(inbox).unwrap(), 298, "not fetched again while leaving");
+    assert_eq!(engine.store.count(inbox).unwrap(), 297, "not fetched again while leaving");
     // Past the window (made due here rather than waiting 10 s).
     engine.store.write(|w| { for id in a.iter().chain(&d) { w.undo(*id)?; } Ok(()) }).unwrap();
     engine.store.write(|w| { w.queue(inbox, others[0].uid, mail_store::OpKind::Move { to: archive }, 0)?; w.queue(inbox, others[1].uid, mail_store::OpKind::Move { to: trash }, 0)?; Ok(()) }).unwrap();
     let r4 = Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.store.ops_pending().unwrap(), 0, "{r4:?}\n{}", log());
-    assert_eq!(engine.store.count(inbox).unwrap(), 298);
+    assert_eq!(engine.store.count(inbox).unwrap(), 297);
     assert_eq!(engine.store.count(archive).unwrap(), 1);
     assert_eq!(engine.store.count(trash).unwrap(), 1);
     assert_eq!(engine.store.list(archive, 0, 1).unwrap()[0].subject, others[0].subject);

@@ -151,7 +151,14 @@ pub struct Shown {
     pub later: Option<(u64, mail_store::later::Later)>,
     /// Its dropped item (and when it was dropped), when it has no open one.
     pub dropped: Option<(u64, mail_store::later::Later, i64)>,
+    /// When it was opened (a *Read* item closes once it has been open
+    /// [`READ_SECS`] and seen to its end).
+    pub opened: i64,
 }
+
+/// How long a conversation must be open, seen to its end, before its *Read*
+/// item closes (§11.4).
+pub const READ_SECS: i64 = 5;
 
 impl Shown {
     /// The message most recently opened (the one keys act on).
@@ -954,6 +961,7 @@ impl Mail {
             folder,
             later,
             dropped,
+            opened: (self.now)(),
         });
         if read_any {
             if let Some(h) = ui.search.as_mut().and_then(|s| s.hits.get_mut(i)) {
@@ -1843,8 +1851,10 @@ impl Mail {
         self.ui.set(ui);
     }
 
-    /// Drop the Undo toast once its time is up (called from the app's loop).
+    /// Drop the Undo toast once its time is up, and close a *Read* item
+    /// read to its end (called from the app's loop).
     pub fn tick(&self) {
+        self.read_to_end();
         let ui = self.ui.get_cloned();
         let now = (self.now)();
         let undo = ui.undo.as_ref().is_some_and(|u| u.until < now);
@@ -1859,6 +1869,37 @@ impl Mail {
             }
             self.ui.set(ui);
         }
+    }
+
+    /// A *Read* item closes once its conversation has been open
+    /// [`READ_SECS`] with the reader at its end (everything on screen, or
+    /// scrolled to the bottom). Only where Mail draws the whole message: an
+    /// HTML body in the doc-viewer doesn't say how far it was read.
+    fn read_to_end(&self) {
+        let ui = self.ui.get_cloned();
+        let Some(r) = &ui.reading else { return };
+        let Some((id, l)) = &r.later else { return };
+        if l.kind != mail_store::later::kind::READ || r.framed.is_some() || (self.now)() - r.opened < READ_SECS {
+            return;
+        }
+        let p = self.reader.get_cloned().physics;
+        if p.y < p.max - 1.0 {
+            return;
+        }
+        let id = *id;
+        if let Err(e) = self.engine.later_done(id) {
+            eprintln!("atrium-mail: Later: {e}");
+            return;
+        }
+        let mut ui = self.ui.get_cloned();
+        if let Some(r) = &mut ui.reading {
+            r.later = None;
+            r.version = next_version();
+        }
+        ui.file_note = Some(("Read: closed".into(), (self.now)() + 3));
+        ui.gen += 1;
+        ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+        self.ui.set(ui);
     }
 
     /// Undo the last list action, while it can be.
