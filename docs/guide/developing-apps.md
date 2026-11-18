@@ -324,9 +324,11 @@ and each worker at their `entry` paths and the icon (an SVG path) in a
 tree, and adds the runtime closure: every library the programs need,
 read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
 the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others
-go to `usr/lib/`. Then `opifex pack` writes the content index and the
-signature, and `opifex archive` the `.insula` beside the tree (the key may be PKCS#8 or
-SEC1 PEM)
+go to `usr/lib/`. The programs are stripped (`--no-strip` keeps them as
+built); their debug info goes to `<tree>.debug/`, linked by
+`.gnu_debuglink`, for the debugger. Then `opifex pack` writes the content
+index and the signature (the key may be PKCS#8 or SEC1 PEM), and `opifex
+archive` the `.insula` beside the tree
 (`target/atrium-bundle/<id>-<version>-<arch>`), which installs through
 the install sheet.
 
@@ -350,7 +352,7 @@ from Arca instead of a file.
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
 | `cargo atrium run [--release] [cargo args]` | build the core and workers, and Run the project as a dev app (asks for your press) |
-| `cargo atrium bundle [--arch a] [--sign key.pem] [--out dir] [--json]` | a release bundle with its closure, packed, signed, and an `.insula` |
+| `cargo atrium bundle [--arch a] [--sign key.pem] [--out dir] [--no-strip] [--json]` | a release bundle with its closure, packed, signed, and an `.insula` |
 | `cargo atrium worker add <name> [--input fd\|bytes\|message] [--from path::fn] [--dry-run] [--json]` | move part of the app into a new worker |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |

@@ -32,12 +32,13 @@ Commands:
       function in the worker and lists the core's calls to it to replace
       with <name>_worker::call. --json: what changed, for Artifex.
   bundle [--arch amd64|aarch64] [--sign <key.pem>] [--out <dir>]
-         [--sysroot <dir>] [--json] [-- cargo build args]
+         [--sysroot <dir>] [--no-strip] [--json] [-- cargo build args]
       Build release and write an installable bundle: atrium.toml, the core
       and each worker at their entries, the icon, and every library they
       need with the loader (read from the programs, never run). Then
       opifex pack (with --sign, the publisher's signature) and opifex
       archive to <out>.insula, which installs through the install sheet.
+      Programs are stripped; their debug info goes to <out>.debug/.
       Without Cargo.toml (a C project) it bundles what make built.
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
@@ -233,6 +234,7 @@ fn build_programs(progs: &[cargo_atrium::programs::Program], release: bool, cros
 fn cmd_bundle(args: &[String]) -> ExitCode {
     use cargo_atrium::{bundle, cross};
     let (mut arch, mut sign, mut out, mut sysroot, mut json, mut rest) = (None, None, None, None, false, Vec::new());
+    let mut strip = true;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -241,6 +243,7 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
             "--out" => out = it.next().map(PathBuf::from),
             "--sysroot" => sysroot = it.next().map(PathBuf::from),
             "--json" => json = true,
+            "--no-strip" => strip = false,
             "--" => rest.extend(it.by_ref().cloned()),
             o => {
                 eprintln!("cargo atrium bundle: unknown argument {o} (cargo's go after --)");
@@ -343,6 +346,30 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
             return fail(e);
         }
     }
+    // Strip the programs; their debug info goes beside the tree, linked
+    // by .gnu_debuglink, for the debugger.
+    let mut debug_dir = None;
+    if strip && !prebuilt {
+        let path = std::env::var("PATH").unwrap_or_default();
+        match cross::find_tool(&["llvm-objcopy", "llvm-objcopy-21", "llvm-objcopy-20", "llvm-objcopy-19", "llvm-objcopy-18", "objcopy"], &path) {
+            Some(oc) => {
+                let dd = PathBuf::from(format!("{}.debug", tree.display()));
+                let _ = std::fs::remove_dir_all(&dd);
+                for (entry, _) in &built {
+                    let prog = tree.join(entry);
+                    let dbg = dd.join(format!("{entry}.debug"));
+                    let ok = dbg.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).is_ok()
+                        && Command::new(&oc).arg("--only-keep-debug").arg(&prog).arg(&dbg).status().is_ok_and(|s| s.success())
+                        && Command::new(&oc).arg("--strip-all").arg(format!("--add-gnu-debuglink={}", dbg.display())).arg(&prog).status().is_ok_and(|s| s.success());
+                    if !ok {
+                        return fail(format!("{}: strip failed (--no-strip skips it)", oc.display()));
+                    }
+                }
+                debug_dir = Some(dd);
+            }
+            None => eprintln!("cargo atrium bundle: no objcopy on PATH, so the programs keep their debug info"),
+        }
+    }
     // 3. The closure.
     let extra = match bundle::extra_libs(&manifest) {
         Ok(e) => e,
@@ -403,6 +430,7 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
             "tree": tree.display().to_string(),
             "insula": packed.then(|| insula.display().to_string()),
             "signed": packed && sign.is_some(),
+            "debug": debug_dir.as_ref().map(|d| d.display().to_string()),
             "files": placed,
         })).unwrap_or_default());
     } else {
