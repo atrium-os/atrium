@@ -56,10 +56,13 @@ atrium_portcullisd_bootstrap_prepare_dirs() {
     install -d -m 0755 -o root -g wheel /var/run/atrium
     install -d -m 0755 -o root -g wheel /var/log/atrium
     install -d -m 0755 -o root -g wheel "${atrium_portcullisd_bootstrap_services_dir}"
-    # Services mount the app registry read-only (a nullfs file mount, whose
-    # source must exist). /var/run is emptied at boot and portcullisd, which
-    # fills it, starts after the network, well after these services launch.
-    [ -e /var/run/atrium/app-registry ] || install -m 0644 -o root -g wheel /dev/null /var/run/atrium/app-registry
+    # Services mount these registries read-only (nullfs file mounts, whose
+    # source must exist): app-registry (portcullisd) and courier-registry
+    # (arca-courierd). /var/run is emptied at boot and their writers start
+    # after the network, well after these services launch.
+    for _reg in app-registry courier-registry; do
+        [ -e "/var/run/atrium/${_reg}" ] || install -m 0644 -o root -g wheel /dev/null "/var/run/atrium/${_reg}"
+    done
 }
 
 atrium_portcullisd_bootstrap_start() {
