@@ -1007,6 +1007,11 @@ pub fn fs_of_fd(f: &impl std::os::fd::AsRawFd) -> Option<(String, String)> {
     Some((text(&st.f_fstypename), text(&st.f_mntonname)))
 }
 
+#[cfg(not(target_os = "freebsd"))]
+pub fn fs_of_fd(_f: &impl std::os::fd::AsRawFd) -> Option<(String, String)> {
+    None
+}
+
 /// The id of the top file system mounted on `path` (mount_table).
 #[cfg(target_os = "freebsd")]
 pub fn fsid_of(path: &str) -> Option<[i32; 2]> {
