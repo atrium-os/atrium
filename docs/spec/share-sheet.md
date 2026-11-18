@@ -1,6 +1,6 @@
 # The share sheet: handing one item to an app the person picks
 
-Status: built 2026-11-18 (Linux tests; not yet run on frescod). Crate `share-sheet/`
+Status: built 2026-11-18; VM gate `scripts/vm-share-check.sh` 16/16 on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18. Crate `share-sheet/`
 (the service and two demo apps), role messages `limen::share` and `limen::share_target`,
 limend's `CHOOSE`. Assigned to the Pergola thread on 2026-11-06 (pergola.md §1), built by
 the share-sheet thread.
@@ -129,14 +129,22 @@ keep what they get (save it, show it, put it in a draft the person sends from th
 
 ## 5. For app developers
 
-Sharing (`share-sheet/src/bin/share_demo.rs` is the whole of it):
+Sharing, with Pergola (`pergola::share`; `share-sheet/src/bin/share_demo.rs` uses it):
 
-1. In the Share button's click handler, take `pergola::clipboard::current_activation()`.
-2. `request("share", window_token)` into a slot; `send(ToChild::Open { activation, title,
-   mimes })`. The system places the sheet; the slot's rect doesn't matter.
-3. On `Chosen`: detach the sheet, `request("share-target", ...)`, `send(Share(item))`, then
-   `send_fd(Part { index }, fd)` for each `Fd` format.
-4. On `Accepted` or `Declined` (or `ChildLost`): detach.
+- `share::button(pressed)` is a Share button that keeps the press it was clicked with in a
+  `Mutable<Option<Token>>` (or call `share::press()` in any click handler).
+- `Sharing::begin(&embeds, window_token, press, item, files, (sheet_slot, target_slot))`
+  brings the sheet up; `files` are the descriptors of the item's `Fd` formats, by index.
+  It refuses an item out of shape or a missing descriptor before anything is asked.
+- Draw `sharing.slot()` (the sheet's slot, then the target's; the system places both, so the
+  rect doesn't matter) and feed it the window's Limen events with `sharing.event(&embeds,
+  &ev)`, which answers `Some(Outcome::Shared | NotShared | Failed(why))` at the end, with both
+  embeds detached.
+
+Without Pergola the steps are the same by hand: in the click handler take the press;
+`request("share")`, `send(Open { activation, title, mimes })`; on `Chosen` detach it,
+`request("share-target")`, `send(Share(item))` and `send_fd(Part { index }, fd)` for each `Fd`
+format; on `Accepted`, `Declined` or `ChildLost`, detach.
 
 Receiving (`share-sheet/src/bin/share_target_demo.rs`, the shape of the SDK's `service`
 template): `Child::embedded()`, wait for `Attach { role: "share-target" }`, open a window with
@@ -160,11 +168,12 @@ Built and tested on Linux:
 
 Not done yet:
 
-- **A VM run** on frescod with Forum: share-demo → share-sheet → share-target-demo, with a real
-  click (the gate needs `_share` 65045 created before frescod starts, share-sheet run as it with
-  `SHARE_FRESCOD_ACTIVATION`, and the demo target installed with a signed manifest as for the
-  picker's gate).
-- Pergola's share button widget (apps use the steps in §5 directly today).
+- **The VM gate with real jails**: `scripts/vm-share-check.sh` (16/16) runs frescod's real
+  activation table (only `_share` 65045 may spend `SHARE`), injected clicks (Share, Scraps,
+  Keep, Cancel) and `pergola::share`, but limend is `limend-dev` (targets start unconfined as
+  `sharetgt`) and nothing runs in a jail or under Forum yet. It also checks: no press gives
+  `Failed`; Photos and Scraps are listed but not Maps nor the app itself; a press beside the
+  sheet does nothing; the picture arrives by descriptor; Cancel starts nothing.
 - Escape and keyboard choice in the sheet; app icons in the list (names only now).
 - Sharing across personas (refused by construction: targets run in the parent's persona).
 - Curia: the person's ordering or hiding of targets.

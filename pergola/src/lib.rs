@@ -40,6 +40,7 @@ pub mod popup;
 pub mod print;
 pub mod reactive;
 pub mod scroll;
+pub mod share;
 pub mod slot;
 pub mod surface;
 pub mod text;
