@@ -309,7 +309,7 @@ pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) ->
     let eps = endpoints(c)?;
     let mut w = Writer::new();
     w.raw(handle);
-    w.u8(2); // after first unlock: sync runs in the background
+    w.u8(arca_store::model::Class::AfterFirstUnlock as u8); // sync runs in the background
     w.str(&c.address);
     w.u8(eps.len() as u8);
     for (s, h, p) in &eps {
