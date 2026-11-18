@@ -745,14 +745,17 @@ font on demand and a driver from a `nobody` device's notice.
   needs `PRAECO_SYSTEM_POSTERS=0:Updates` (opifexd is root).
 - `opifex updates`, `opifex update-care <id> notify|auto`, `opifex tick`.
 - Not yet: Curia's Updates page (Curia's owner: it reads `Updates` and sends the person to the
-  sheet for an ask); a VM run of the daily round with praecod; batched admin approval for
+  sheet for an ask); batched admin approval for
   platform kinds (C6, with the kinds); **key rotation and recovery move to C7**, where
   publisher keys other than the platform's first appear: until then the only publisher is
   the platform key, which rotates through `root.toml` (2-of-3).
 - Checked: host tests (unit tests of `decide` and the notice; `updates_and_the_daily_round`:
   a background update, a `notify` release waiting and announced once, added capabilities
   asked with `added` on `Describe`, more care set and cleared, only root or the installer may
-  set it, only root may tick); the sheet's update lines.
+  set it, only root may tick); the sheet's update lines. VM gate
+  `scripts/vm-opifex-c5-check.sh` 0 failed on the Mac VM (2026-11-18, 21327c4): the daily round
+  through the fetcher's file mode, one notice taken by a real praecod as "Updates", none on a
+  second round, and praecod refusing opifexd when its uid isn't a listed poster.
 
 ### 14.7 C6 as built (2026-11-18)
 
