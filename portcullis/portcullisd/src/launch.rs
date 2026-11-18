@@ -773,7 +773,19 @@ pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
     // ★ A console jail on the same root (M0/P1) holds its mounts busy and
     // would outlive them: it goes first.
     remove_jails_at(jail_path);
-    let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
+    let mut left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
+    // A process that was in the jail can still hold the root for a moment
+    // after the jail is gone (a console's shell being reaped): retry briefly
+    // before calling a mount a survivor.
+    let start = std::time::Instant::now();
+    while !left.is_empty() && start.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
+    }
+    if start.elapsed() >= std::time::Duration::from_millis(100) {
+        eprintln!("portcullisd: {} unmounted after {} ms of retries{}", jail_path.display(), start.elapsed().as_millis(),
+                  if left.is_empty() { "" } else { " (not all)" });
+    }
     portcullis_mounts::warn_survivors("portcullisd", &left);
 }
 
@@ -1351,12 +1363,20 @@ pub const CONSOLE_JAIL_PREFIX: &str = "con-";
 pub fn remove_jails_at(path: &Path) {
     let Ok(o) = Command::new("jls").args(["-N", "name", "path"]).stderr(Stdio::null()).output() else { return };
     let want = path.to_string_lossy();
+    let mut removed = Vec::new();
     for line in String::from_utf8_lossy(&o.stdout).lines() {
         let mut f = line.split_whitespace();
         if let (Some(name), Some(p)) = (f.next(), f.next()) {
             if p == want && name.starts_with(CONSOLE_JAIL_PREFIX) {
                 let _ = Command::new("jail").arg("-q").arg("-r").arg(name).stderr(Stdio::null()).status();
+                removed.push(name.to_string());
             }
         }
+    }
+    // ★ A dying console jail pins the root as the workspace's own would
+    // (portcullis_mounts::wait_jail_gone): wait for each before the caller
+    // unmounts, or the root survives the teardown and Delete refuses.
+    for name in removed {
+        portcullis_mounts::wait_jail_gone(&name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     }
 }

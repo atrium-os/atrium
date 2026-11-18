@@ -336,9 +336,7 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   (`portcullis workspace set NAME --hosts a,b`, `WorkspaceSet.hosts`), defaulting to
   §5.2's list. Gate `scripts/vm-registries-check.sh`: 27/27 in deny mode. The Workspaces app
   offers Registries and edits the host list on its own page ("Edit hosts…"): its VM
-  check `scripts/vm-workspaces-app-check.sh` passes every Network and host step (24 of
-  26; the two that fail are Delete's, a mount of the workspace's root that survives
-  its stop after a terminal ran in it, also seen intermittently before). Not done: a `cargo fetch` (the gate fetches with
+  check `scripts/vm-workspaces-app-check.sh` passes 26/26. Not done: a `cargo fetch` (the gate fetches with
   `fetch(1)`, which uses the same proxy variables, because the cloud VM has no Rust
   layer).
 - **M9 (M).** Needs Arca's SSH agent (Arca A5); this thread builds the workspace side:

@@ -215,6 +215,7 @@ shot delete-1
 press 347 396          # Delete (takes the press)
 waitfor "L | cut -f1 | grep -c '^web$' || true" "^0$" 30 && ok "Web is deleted" || bad "web: $(L)"
 check "its folder is gone" "" "$(V "test -e $W/web && echo there")"
+V "test -e $W/web" && echo "  (diag) $(V "jls -d name path jid dying | grep -i web; mount -p | grep web; fstat -f /var/lib/atrium/workspaces/alice/web 2>/dev/null | tail -5; grep -i 'survived\|dying\|retries' $LOG | tail -3" | tr '\n' ' ')"
 check "and its jail" "" "$(V "jls name | grep '^ws_alice_web$'")"
 shot delete-2
 
