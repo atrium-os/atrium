@@ -571,7 +571,8 @@ Personal:
   verification (§8), grants of a trusted stick's folders into app jails (the FUSE
   server's control socket does that for FAT; a trusted stick has no server), and
   Scrinium's and Forum's Locked display and "Make this a Work stick".
-- Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick).
+- Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): 25/25 in
+  the VM on 2026-11-18 (514f551), with `arca-vm-test.sh` §9 66/66.
 
 ### 7.3 Not mine, but a person here has the key
 
