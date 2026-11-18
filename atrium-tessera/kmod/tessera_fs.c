@@ -52,6 +52,7 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/rwlock.h>
+#include <sys/sx.h>
 #include <sys/taskqueue.h>
 #include <sys/unistd.h>
 #include <sys/limits.h>
@@ -3917,6 +3918,10 @@ static struct tessera_dirent_log_entry *tessera_dirent_log_entry_clone(
 /* ── per-mount state ─────────────────────────────────────────── */
 
 struct tessera_legacy_sweep;
+/* Key groups a mount holds at once (encryption §5.4): one per persona of
+ * the people on the volume. */
+#define TESSERA_FS_MAX_GROUPS 32u
+
 struct tessera_mount {
 	struct vnode             *devvp;     /* the block-device vnode */
 	struct g_consumer        *cp;        /* GEOM consumer for I/O */
@@ -4535,6 +4540,22 @@ struct tessera_mount {
 	 * commit_sb only rewrites the records when something changed. */
 	struct tessera_btree     *quota_tree;
 	int                       quota_dirty;
+	/* Key groups (tessera-encryption.md §5.4, E4.2): the records loaded
+	 * from the quota tree, and each group's derived keys while its GK is
+	 * in the keyring (NULL: locked). groups_sx guards all of it; it is an
+	 * sx lock because deriving keys may sleep in the crypto backend.
+	 * groups_epoch is the keyring epoch the keys were last checked at:
+	 * a load or drop anywhere bumps it, and the next lookup looks again. */
+	struct tessera_fs_group {
+		tessera_key_group_t   rec;
+		tessera_group_keys_t *keys;
+		int                   bad;   /* the record failed its key's check */
+	}                         groups[TESSERA_FS_MAX_GROUPS];
+	uint32_t                  ngroups;
+	int                       groups_dirty;
+	int                       groups_sx_init;
+	uint64_t                  groups_epoch;
+	struct sx                 groups_sx;
 };
 
 /* The superblock's root for tree kind `kind` (0 for none). */
@@ -5609,6 +5630,120 @@ tessera_quota_find(struct tessera_mount *tmp_, uint64_t domain_id)
 		if (tmp_->quota_domains[i].domain_id == domain_id)
 			return (&tmp_->quota_domains[i]);
 	return (NULL);
+}
+
+/* ── key groups (tessera-encryption.md §5.4, E4.2) ─────────────────── */
+
+static struct tessera_fs_group *
+tessera_fs_group_find(struct tessera_mount *tmp_, uint64_t group_id)
+{
+	if (group_id == 0)
+		return (NULL);
+	for (uint32_t i = 0; i < tmp_->ngroups; i++)
+		if (tmp_->groups[i].rec.group_id == group_id)
+			return (&tmp_->groups[i]);
+	return (NULL);
+}
+
+static void
+tessera_fs_group_lock_keys(struct tessera_fs_group *g)
+{
+	if (g->keys != NULL) {
+		tessera_group_keys_clear(g->keys);
+		zfree(g->keys, M_TESSERA);
+		g->keys = NULL;
+	}
+}
+
+/*
+ * Bring every group's keys in line with the keyring: derive them for a
+ * group whose GK has arrived (and check its record: the wrong key or a
+ * forged record marks the group bad and leaves it locked), wipe them for a
+ * group whose GK was dropped. Cheap when the keyring hasn't changed since
+ * the last look. Called with groups_sx held exclusive.
+ */
+static void
+tessera_fs_groups_refresh(struct tessera_mount *tmp_)
+{
+	uint64_t epoch = tessera_keyring_epoch();
+
+	sx_assert(&tmp_->groups_sx, SA_XLOCKED);
+	if (epoch == tmp_->groups_epoch)
+		return;
+	for (uint32_t i = 0; i < tmp_->ngroups; i++) {
+		struct tessera_fs_group *g = &tmp_->groups[i];
+		uint8_t gk[32];
+		int have = tessera_keyring_get(g->rec.key_id, tmp_->sb.uuid,
+		    g->rec.group_id, gk, NULL, NULL) == 0;
+
+		if (!have) {
+			if (g->keys != NULL)
+				printf("tessera_fs: key group %ju locked\n",
+				    (uintmax_t)g->rec.group_id);
+			tessera_fs_group_lock_keys(g);
+			g->bad = 0;
+			continue;
+		}
+		if (g->keys == NULL && !g->bad) {
+			tessera_group_keys_t *k = malloc(sizeof(*k), M_TESSERA,
+			    M_WAITOK | M_ZERO);
+			int r = tessera_group_keys_init(k, g->rec.suite, gk,
+			    tmp_->sb.uuid, g->rec.group_id);
+			if (r == TESSERA_OK)
+				r = tessera_key_group_verify(k, &g->rec);
+			if (r == TESSERA_OK) {
+				g->keys = k;
+			} else {
+				printf("tessera_fs: key group %ju: %s; it stays "
+				    "locked\n", (uintmax_t)g->rec.group_id,
+				    r == TESSERA_ENOKEY ? "not this group's key" :
+				    "its record doesn't verify");
+				g->bad = 1;
+				tessera_group_keys_clear(k);
+				zfree(k, M_TESSERA);
+			}
+		}
+		explicit_bzero(gk, sizeof(gk));
+	}
+	tmp_->groups_epoch = epoch;
+}
+
+/*
+ * A copy of the keys for domain_id's group, if the domain is in one, its
+ * group's key is loaded, and the domain record carries the group's MAC
+ * (§5.4: an offline edit that moves a domain or changes its salt fails
+ * here). 0, ENOENT (the domain is in no group), EACCES (locked) or
+ * EINTEGRITY (the record or the group doesn't verify).
+ */
+static int
+tessera_fs_domain_keys(struct tessera_mount *tmp_, uint64_t domain_id,
+    tessera_group_keys_t *out)
+{
+	tessera_quota_domain_t *d;
+	struct tessera_fs_group *g;
+	int err = 0;
+
+	if (!tmp_->groups_sx_init)
+		return (ENOENT);
+	sx_xlock(&tmp_->groups_sx);
+	d = tessera_quota_find(tmp_, domain_id);
+	if (d == NULL || d->key_group == 0) {
+		err = ENOENT;
+		goto out;
+	}
+	tessera_fs_groups_refresh(tmp_);
+	g = tessera_fs_group_find(tmp_, d->key_group);
+	if (g == NULL || g->bad)
+		err = EINTEGRITY;
+	else if (g->keys == NULL)
+		err = EACCES;
+	else if (tessera_domain_verify_group(g->keys, d) != TESSERA_OK)
+		err = EINTEGRITY;
+	else
+		*out = *g->keys;
+out:
+	sx_xunlock(&tmp_->groups_sx);
+	return (err);
 }
 
 /* The domain an inode is charged to: its own quota_domain if set, else the
@@ -7921,6 +8056,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * requires the load-time KAT to have passed — never run content
 	 * addressing on an implementation that failed its self-test. */
 	if ((active->incompat_flags & ~(TESSERA_INCOMPAT_HASH_ALG |
+	    TESSERA_INCOMPAT_KEY_GROUPS |
 	    (seal != NULL ? TESSERA_INCOMPAT_SEALED : 0))) != 0) {
 		printf("tessera_fs: unknown incompat_flags 0x%x; refusing\n",
 		    active->incompat_flags);
@@ -8165,6 +8301,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
+	sx_init(&tmp_->groups_sx, "tess_groups");
+	tmp_->groups_sx_init = 1;
 	mtx_init(&tmp_->legacy_sweep_mtx, "tess_lsweep", NULL, MTX_DEF);
 	tmp_->flush_co_init = 1;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_INODE_BUCKETS; _b++)
@@ -8254,6 +8392,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			free(tmp_->meta_scanwin, M_TESSERA);
 			if (tmp_->bio_ctx.cred != NULL)
 				crfree(tmp_->bio_ctx.cred);
+			if (tmp_->groups_sx_init)
+				sx_destroy(&tmp_->groups_sx);
 			free(tmp_, M_TESSERA);
 			err = ENOENT;
 			goto fail_close;
@@ -8271,6 +8411,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			free(tmp_->meta_scanwin, M_TESSERA);
 			if (tmp_->bio_ctx.cred != NULL)
 				crfree(tmp_->bio_ctx.cred);
+			if (tmp_->groups_sx_init)
+				sx_destroy(&tmp_->groups_sx);
 			free(tmp_, M_TESSERA);
 			err = ENOENT;
 			goto fail_close;
@@ -8411,8 +8553,21 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			uint8_t qk[8], qv[TESSERA_QUOTA_DOMAIN_SIZE];
 			if (tessera_btree_cursor_get(qc, qk, qv) != TESSERA_OK)
 				break;
-			/* Key-group records share the tree (encryption §5.4). */
+			/* Key-group records share the tree (encryption §5.4):
+			 * held locked until their key arrives. */
 			if (tessera_quota_key_is_group(qk)) {
+				tessera_key_group_t gr;
+				memcpy(&gr, qv, sizeof(gr));
+				if (tmp_->ngroups < TESSERA_FS_MAX_GROUPS &&
+				    gr.group_id != 0 &&
+				    gr.group_id <= TESSERA_KEY_GROUP_ID_MAX &&
+				    tessera_fs_group_find(tmp_, gr.group_id) ==
+				    NULL)
+					tmp_->groups[tmp_->ngroups++].rec = gr;
+				else
+					printf("tessera_fs: key group record "
+					    "%ju skipped\n",
+					    (uintmax_t)gr.group_id);
 				if (tessera_btree_cursor_next(qc) != TESSERA_OK)
 					break;
 				continue;
@@ -9449,6 +9604,12 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_seal_keys_clear(tmp_->seal);
 			zfree(tmp_->seal, M_TESSERA);
 			tmp_->seal = NULL;
+		}
+		for (uint32_t gi = 0; gi < tmp_->ngroups; gi++)
+			tessera_fs_group_lock_keys(&tmp_->groups[gi]);
+		if (tmp_->groups_sx_init) {
+			sx_destroy(&tmp_->groups_sx);
+			tmp_->groups_sx_init = 0;
 		}
 		free(tmp_, M_TESSERA);
 		mp->mnt_data = NULL;
@@ -13018,10 +13179,12 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * it would skip the commit that removes the record — the domain would
 	 * come back at the next mount, which is precisely the leak the detach
 	 * ioctl exists to stop. */
-	if (tmp_->quota_dirty &&
-	    (tmp_->quota_ndomains > 0 || tmp_->quota_ndead > 0)) {
+	if ((tmp_->quota_dirty &&
+	    (tmp_->quota_ndomains > 0 || tmp_->quota_ndead > 0)) ||
+	    tmp_->groups_dirty) {
 		uint64_t qroot = tmp_->sb.quota_tree_root;
-		if (tmp_->quota_tree == NULL && tmp_->quota_ndomains > 0)
+		if (tmp_->quota_tree == NULL &&
+		    (tmp_->quota_ndomains > 0 || tmp_->ngroups > 0))
 			tmp_->quota_tree = tessera_fs_tree_create(tmp_,
 			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
 			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
@@ -13040,6 +13203,13 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			if (tessera_quota_store_put(tmp_->quota_tree,
 			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
 				qok = 0;
+		/* Key-group records (encryption §5.4): written whole, each
+		 * already carrying its MAC. */
+		for (uint32_t i = 0; qok && tmp_->groups_dirty &&
+		    i < tmp_->ngroups; i++)
+			if (tessera_key_group_store_put(tmp_->quota_tree,
+			    &tmp_->groups[i].rec, &qroot) != TESSERA_OK)
+				qok = 0;
 		/* Mirror the handle even when a put failed: the deletes and
 		 * puts that succeeded already released their superseded nodes
 		 * (see dirty_inodes_drain's write-back). The dirty flag stays
@@ -13050,6 +13220,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		if (qok) {
 			tmp_->quota_dirty = 0;
 			tmp_->quota_ndead = 0;
+			tmp_->groups_dirty = 0;
 		}
 	}
 
@@ -31885,6 +32056,42 @@ out:
 }
 
 /*
+ * Whether directory inode_no has no entries, after checkpointing its
+ * pending dirent log (as rmdir does). 0 with *empty set, or an errno.
+ */
+static int
+tessera_fs_dir_empty(struct tessera_mount *tmp_, uint32_t inode_no,
+    int *empty)
+{
+	uint8_t ckey[4];
+	tessera_inode_record_t cino;
+
+	*empty = 1;
+	(void)tessera_fs_dirent_log_checkpoint_parent(tmp_, inode_no, 1);
+	encode_inode_key(inode_no, ckey);
+	if (tessera_fs_inode_get_byk(tmp_, ckey, &cino) != TESSERA_OK)
+		return (EIO);
+	if ((cino.mode & 0170000) != 0040000)
+		return (ENOTDIR);
+	if (tessera_hash_is_null(cino.manifest_hash))
+		return (0);
+	uint8_t *blob = NULL;
+	uint32_t len = 0;
+	if (tessera_fs_fetch_blob(tmp_, cino.manifest_hash, &blob, &len) != 0)
+		return (EIO);
+	if (len >= 32) {
+		tessera_manifest_parser_t *p = tessera_manifest_parse(blob, len);
+		if (p != NULL) {
+			if (tessera_manifest_parser_count(p) > 0)
+				*empty = 0;
+			tessera_manifest_parser_free(p);
+		}
+	}
+	free(blob, M_TESSERA);
+	return (0);
+}
+
+/*
  * vop_rmdir — unlink an empty subdirectory.
  *
  * Differs from vop_remove only by enforcing emptiness: fetch the
@@ -32920,6 +33127,23 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * EROFS on a read-only mount. */
 #define TESSERA_IOC_CLEAR_RECOVERY _IO('T', 6)
 
+/* Key groups (tessera-encryption.md §5.4, E4.2). Unjailed root only.
+ *
+ * TESSERA_IOC_GROUP_CREATE, on any vnode of the mount: make a key group
+ * whose GK is already loaded in the keyring for (key_id, this volume,
+ * group_id): the group's record is written at the next commit, and the
+ * volume gains TESSERA_INCOMPAT_KEY_GROUPS. group_id is the caller's
+ * (atrium-volumes picks it), 1..2^56-1. EEXIST: the id is taken; ENOENT:
+ * no such key loaded for that scope; ENOSPC: the mount's table is full.
+ *
+ * TESSERA_IOC_QUOTA_GROUP, on a quota domain's root directory: put the
+ * domain in a group (its record gets key_group and the group's MAC). Only
+ * while the directory is empty, so nothing in it was written in the clear;
+ * EEXIST if it is in a group already, ENOTEMPTY, EACCES if the group is
+ * locked. */
+/* struct tessera_ioc_group and the two commands are in tessera/keyring.h,
+ * for tessera-keyload and atrium-volumes. */
+
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
@@ -32960,7 +33184,9 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	case TESSERA_IOC_DEDUP_POLICY:
 	case TESSERA_IOC_QUOTA_DUMP:
 	case TESSERA_IOC_QUOTA_DETACH:
-	case TESSERA_IOC_CLEAR_RECOVERY: {
+	case TESSERA_IOC_CLEAR_RECOVERY:
+	case TESSERA_IOC_GROUP_CREATE:
+	case TESSERA_IOC_QUOTA_GROUP: {
 		if (jailed(ap->a_cred))
 			return (EPERM);
 		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
@@ -32971,8 +33197,12 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	default:
 		break;
 	}
+	/* QUOTA_GROUP checks emptiness first, which may publish the
+	 * directory's pending dirents through the gate; it takes the gate
+	 * itself afterwards. */
 	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init &&
-	    ap->a_command != TESSERA_IOC_GC;
+	    ap->a_command != TESSERA_IOC_GC &&
+	    ap->a_command != TESSERA_IOC_QUOTA_GROUP;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int r = tessera_vop_ioctl_impl(ap);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
@@ -33159,6 +33389,120 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		    "(%u domain(s) left, %u non-global)\n", (uintmax_t)id,
 		    (unsigned)tn->inode_no, (unsigned)tmp_->quota_ndomains,
 		    (unsigned)tmp_->quota_nnonglobal);
+		return (0);
+	}
+	case TESSERA_IOC_GROUP_CREATE: {
+		struct tessera_ioc_group *a =
+		    (struct tessera_ioc_group *)ap->a_data;
+		uint32_t suite = a->suite != 0 ? a->suite :
+		    TESSERA_SUITE_XAES_256_GCM;
+		/* On a directory, so it runs under the flush gate (the
+		 * commit reads the group table and the superblock). */
+		if (vp->v_type != VDIR)
+			return (ENOTDIR);
+		if ((vp->v_mount->mnt_flag & MNT_RDONLY) != 0 ||
+		    tmp_->inode_tree == NULL)
+			return (EROFS);
+		if (a->group_id == 0 || a->group_id > TESSERA_KEY_GROUP_ID_MAX)
+			return (EINVAL);
+		uint8_t gk[32];
+		if (tessera_keyring_get(a->key_id, tmp_->sb.uuid, a->group_id,
+		    gk, NULL, NULL) != 0)
+			return (ENOENT);
+		tessera_group_keys_t *k = malloc(sizeof(*k), M_TESSERA,
+		    M_WAITOK | M_ZERO);
+		int r = tessera_group_keys_init(k, suite, gk, tmp_->sb.uuid,
+		    a->group_id);
+		explicit_bzero(gk, sizeof(gk));
+		int err = 0;
+		sx_xlock(&tmp_->groups_sx);
+		if (r != TESSERA_OK)
+			err = EINVAL;
+		else if (tessera_fs_group_find(tmp_, a->group_id) != NULL)
+			err = EEXIST;
+		else if (tmp_->ngroups >= TESSERA_FS_MAX_GROUPS)
+			err = ENOSPC;
+		if (err == 0) {
+			struct tessera_fs_group *g = &tmp_->groups[tmp_->ngroups];
+			memset(g, 0, sizeof(*g));
+			if (tessera_key_group_make(k, a->key_id, suite, 0,
+			    &g->rec) != TESSERA_OK) {
+				err = EIO;
+			} else {
+				g->keys = k;
+				k = NULL;
+				tmp_->ngroups++;
+				tmp_->groups_dirty = 1;
+				tmp_->sb.incompat_flags |=
+				    TESSERA_INCOMPAT_KEY_GROUPS;
+				tmp_->sb.encryption_flags |=
+				    TESSERA_ENC_KEY_GROUPS;
+			}
+		}
+		sx_xunlock(&tmp_->groups_sx);
+		if (k != NULL) {
+			tessera_group_keys_clear(k);
+			zfree(k, M_TESSERA);
+		}
+		if (err == 0) {
+			tessera_fs_mark_dirty(tmp_);
+			printf("tessera_fs: key group %ju made\n",
+			    (uintmax_t)a->group_id);
+		}
+		return (err);
+	}
+	case TESSERA_IOC_QUOTA_GROUP: {
+		if (vp->v_type != VDIR) return (ENOTDIR);
+		if ((vp->v_mount->mnt_flag & MNT_RDONLY) != 0 ||
+		    tmp_->inode_tree == NULL)
+			return (EROFS);
+		uint64_t gid = *(uint64_t *)ap->a_data;
+		tessera_inode_record_t dino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK)
+			return (EIO);
+		tessera_quota_domain_t *qd =
+		    tessera_quota_find(tmp_, dino.quota_domain);
+		if (qd == NULL || qd->root_inode_no != tn->inode_no)
+			return (EINVAL);      /* not a domain's root */
+		if (qd->key_group != 0)
+			return (EEXIST);
+		int empty = 0;
+		int e = tessera_fs_dir_empty(tmp_, (uint32_t)tn->inode_no,
+		    &empty);
+		if (e != 0)
+			return (e);
+		if (!empty)
+			return (ENOTEMPTY);
+		int err = 0;
+		if (tmp_->flush_mtx_init)
+			tessera_fs_flush_gate_enter(tmp_);
+		/* Look again under the gate: the table may have moved. */
+		qd = tessera_quota_find(tmp_, dino.quota_domain);
+		sx_xlock(&tmp_->groups_sx);
+		tessera_fs_groups_refresh(tmp_);
+		struct tessera_fs_group *g = tessera_fs_group_find(tmp_, gid);
+		if (qd == NULL || qd->key_group != 0)
+			err = EAGAIN;
+		else if (g == NULL)
+			err = ENOENT;
+		else if (g->bad)
+			err = EINTEGRITY;
+		else if (g->keys == NULL)
+			err = EACCES;
+		else if (tessera_domain_seal_group(g->keys, qd) != TESSERA_OK)
+			err = EIO;
+		sx_xunlock(&tmp_->groups_sx);
+		if (err == 0) {
+			tmp_->quota_dirty = 1;
+			tessera_fs_mark_dirty(tmp_);
+		}
+		if (tmp_->flush_mtx_init)
+			tessera_fs_flush_gate_exit(tmp_);
+		if (err != 0)
+			return (err);
+		printf("tessera_fs: quota domain %ju in key group %ju\n",
+		    (uintmax_t)qd->domain_id, (uintmax_t)gid);
 		return (0);
 	}
 	case TESSERA_IOC_CLEAR_RECOVERY: {

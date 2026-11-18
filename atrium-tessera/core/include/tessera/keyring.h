@@ -68,6 +68,17 @@ struct tkey_format {
 };
 #define TKEY_FORMAT_RECOVERY 0x1u
 
+/* Key-group ioctls on the mounted volume (not the keyring device; see
+ * tessera_fs.c TESSERA_IOC_GROUP_CREATE): a directory's descriptor. */
+struct tessera_ioc_group {
+	uint8_t  key_id[16];
+	uint64_t group_id;
+	uint32_t suite;               /* 0: XAES-256-GCM */
+	uint32_t pad;
+};
+#define TESSERA_IOC_GROUP_CREATE _IOW('T', 7, struct tessera_ioc_group)
+#define TESSERA_IOC_QUOTA_GROUP  _IOW('T', 8, uint64_t)
+
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
 /* ENOENT if not loaded. Mounts keep their derived keys until unmount. */
@@ -82,6 +93,9 @@ struct tkey_format {
  * vk after deriving its keys. */
 int  tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
          uint64_t group, uint8_t vk[32], uint64_t *high_water, uint32_t *flags);
+/* Bumped by every TKEY_LOAD and TKEY_DROP: a mount holding derived group
+ * keys looks again when it changes (encryption §5.4, E4.2). */
+uint64_t tessera_keyring_epoch(void);
 /* Record a committed generation under key_id (TKEY_GEN reports the max). */
 void tessera_keyring_note_gen(const uint8_t key_id[16], uint64_t gen);
 struct thread;

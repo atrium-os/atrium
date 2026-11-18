@@ -7,6 +7,11 @@
  *   tessera-keyload load KEY_FILE KEY_ID_HEX UUID_HEX [HIGH_WATER]
  *   tessera-keyload drop KEY_ID_HEX
  *   tessera-keyload gen  KEY_ID_HEX
+ *   tessera-keyload load-group KEY_FILE KEY_ID_HEX UUID_HEX GROUP
+ *       (a key group's GK, scope (uuid, group); encryption §5.4)
+ *   tessera-keyload group-create DIR KEY_ID_HEX GROUP
+ *   tessera-keyload quota-group DIR GROUP
+ *       (on a mounted volume: make the group; put DIR's quota domain in it)
  *   tessera-keyload format KEY_ID_HEX UUID_HEX DEVICE [JOURNAL_SECTORS]
  *       (the kernel formats DEVICE sealed with the loaded key; the key
  *       never reaches this process)
@@ -51,6 +56,9 @@ usage(void)
 	fprintf(stderr, "usage: tessera-keyload load KEY_FILE KEY_ID UUID "
 	    "[HIGH_WATER [older-ro]]\n       tessera-keyload drop KEY_ID\n"
 	    "       tessera-keyload gen KEY_ID\n"
+	    "       tessera-keyload load-group KEY_FILE KEY_ID UUID GROUP\n"
+	    "       tessera-keyload group-create DIR KEY_ID GROUP\n"
+	    "       tessera-keyload quota-group DIR GROUP\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
 }
@@ -62,12 +70,49 @@ main(int argc, char **argv)
 
 	if (argc < 3)
 		usage();
+	/* The two that act on a mounted volume, not on the keyring. */
+	if (strcmp(argv[1], "group-create") == 0 && argc == 5) {
+		struct tessera_ioc_group g;
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		memset(&g, 0, sizeof g);
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		if (unhex16(argv[3], g.key_id) != 0)
+			usage();
+		g.group_id = strtoull(argv[4], NULL, 0);
+		if (ioctl(dfd, TESSERA_IOC_GROUP_CREATE, &g) != 0) {
+			perror("TESSERA_IOC_GROUP_CREATE");
+			return (1);
+		}
+		printf("group %ju made\n", (uintmax_t)g.group_id);
+		return (0);
+	}
+	if (strcmp(argv[1], "quota-group") == 0 && argc == 4) {
+		uint64_t gid = strtoull(argv[3], NULL, 0);
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		if (ioctl(dfd, TESSERA_IOC_QUOTA_GROUP, &gid) != 0) {
+			perror("TESSERA_IOC_QUOTA_GROUP");
+			return (1);
+		}
+		printf("in group %ju\n", (uintmax_t)gid);
+		return (0);
+	}
 	fd = open("/dev/" TESSERA_KEYRING_DEV, O_RDWR);
 	if (fd < 0) {
 		perror("/dev/" TESSERA_KEYRING_DEV);
 		return (1);
 	}
-	if (strcmp(argv[1], "load") == 0 && (argc >= 5 && argc <= 7)) {
+	int group_load = strcmp(argv[1], "load-group") == 0 && argc == 6;
+	if (group_load || (strcmp(argv[1], "load") == 0 &&
+	    (argc >= 5 && argc <= 7))) {
 		struct tkey_load l;
 		int kf;
 		ssize_t n;
@@ -78,7 +123,9 @@ main(int argc, char **argv)
 			fprintf(stderr, "key id and uuid: 32 hex digits\n");
 			return (2);
 		}
-		if (argc >= 6)
+		if (group_load)
+			l.scope_group = strtoull(argv[5], NULL, 0);
+		else if (argc >= 6)
 			l.high_water = strtoull(argv[5], NULL, 0);
 		l.owner_uid = (uint32_t)getuid();
 		strlcpy(l.owner_label, "dev", sizeof l.owner_label);
@@ -94,7 +141,8 @@ main(int argc, char **argv)
 			return (1);
 		}
 		/* "older-ro": as arcad loads it once the person verified (§8). */
-		l.flags = (argc == 7 && strcmp(argv[6], "older-ro") == 0)
+		l.flags = (!group_load && argc == 7 &&
+		    strcmp(argv[6], "older-ro") == 0)
 		    ? TKEY_LOAD_OLDER_RO : 0;
 		close(kf);
 		int r = ioctl(fd, TKEY_LOAD, &l);

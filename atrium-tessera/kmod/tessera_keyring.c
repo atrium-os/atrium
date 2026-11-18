@@ -21,6 +21,7 @@
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/ucred.h>
+#include <machine/atomic.h>
 
 #include "tessera/keyring.h"
 
@@ -43,6 +44,13 @@ static struct tkey *ring;         /* TESSERA_KEYRING_MAX slots */
 static u_int        ring_allow;   /* PR_ALLOW bit of allow.tessera_keys */
 static struct mtx   ring_mtx;
 static struct cdev *ring_dev;
+static volatile uint64_t ring_epoch = 1;
+
+uint64_t
+tessera_keyring_epoch(void)
+{
+	return (atomic_load_acq_64(&ring_epoch));
+}
 
 static struct tkey *
 find_locked(const uint8_t key_id[16])
@@ -143,6 +151,7 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 					k->owner_label[sizeof(k->owner_label) - 1]
 					    = '\0';
 					k->used = 1;
+					atomic_add_rel_64(&ring_epoch, 1);
 				}
 			}
 			mtx_unlock(&ring_mtx);
@@ -158,9 +167,10 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 			return (EBADF);
 		mtx_lock(&ring_mtx);
 		k = find_locked(d->key_id);
-		if (k != NULL)
+		if (k != NULL) {
 			drop_slot(k);
-		else
+			atomic_add_rel_64(&ring_epoch, 1);
+		} else
 			error = ENOENT;
 		mtx_unlock(&ring_mtx);
 		break;
