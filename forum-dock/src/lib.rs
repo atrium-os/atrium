@@ -40,6 +40,9 @@ pub struct AppEntry {
     pub vector: Option<std::sync::Arc<bundle_icon::VectorIcon>>,
     /// It may have a console (homes.md §4): its tile offers Terminal.
     pub console: bool,
+    /// Its instances in named personas (personas.md §7), each matched to
+    /// windows by its own uid and shown as its own tile with a badge.
+    pub instances: Vec<portcullis_ipc::CatalogInstance>,
 }
 
 /// A workspace's entry id (homes.md §5): `workspace/<name>`, the console
@@ -72,6 +75,7 @@ pub fn workspace_entry(w: &portcullis_ipc::WorkspaceInfo) -> AppEntry {
         uid: None,
         vector: None,
         console: false,
+        instances: Vec::new(),
     }
 }
 
@@ -90,6 +94,7 @@ pub fn new_workspace_entry(apps: &[AppEntry], query: &str) -> Option<AppEntry> {
         uid: None,
         vector: None,
         console: false,
+        instances: Vec::new(),
     })
 }
 
@@ -116,6 +121,7 @@ pub fn entry_from_manifest(text: &str) -> Option<AppEntry> {
         uid: None,
         vector: None,
         console: false,
+        instances: Vec::new(),
     })
 }
 
@@ -179,6 +185,7 @@ pub fn catalog_from_daemon() -> Option<Vec<AppEntry>> {
                     icon: a.icon,
                     uid: a.uid,
                     console: a.console,
+                    instances: a.instances,
                 })
                 .collect(),
         ),

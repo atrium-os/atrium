@@ -955,6 +955,7 @@ pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
     /* Each app's uid for this person, so the launcher can match windows
      * (their owner uid) to apps (forum.md §6.1). Loaded once per catalog. */
     let registry = user.and_then(|_| portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok());
+    let colours = user.map(portcullisd::persona_colours::read).unwrap_or_default();
     for e in entries.flatten() {
         let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
         let Ok(m) = Manifest::from_str(&text) else { continue };
@@ -971,6 +972,9 @@ pub fn catalog(user: Option<&str>) -> Vec<portcullis_ipc::CatalogEntry> {
             icon_svg:    m.app.icon.as_deref()
                 .and_then(|i| portcullis_toml::icon::read_bundle_svg(&e.path(), i)),
             console:     no_console(&m).is_none(),
+            instances:   registry.as_ref().zip(user).map(|(r, u)| r.named_instances(u, &m.app.id).into_iter()
+                .map(|(uid, p)| portcullis_ipc::CatalogInstance { persona: p.to_string(), uid, colour: colours.get(p).cloned() })
+                .collect()).unwrap_or_default(),
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));

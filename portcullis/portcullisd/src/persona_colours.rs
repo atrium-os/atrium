@@ -43,6 +43,17 @@ pub fn publish(person: &str, personas: &[(String, String)]) -> std::io::Result<(
     std::fs::rename(&tmp, &p)
 }
 
+/// `person`'s colours as published: persona -> colour name.
+pub fn read(person: &str) -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(path()).unwrap_or_default().lines().filter_map(|l| {
+        let mut it = l.split(' ');
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(u), Some(p), Some(c), None) if u == person => Some((p.to_string(), c.to_string())),
+            _ => None,
+        }
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +67,8 @@ mod tests {
         publish("bob", &[("school".into(), "green".into())]).unwrap();
         publish("alice", &[("work".into(), "teal".into()), ("bad name".into(), "red".into())]).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("c")).unwrap(), "alice work teal\nbob school green\n");
+        assert_eq!(read("alice").get("work").map(String::as_str), Some("teal"));
+        assert!(read("carol").is_empty());
         publish("alice", &[]).unwrap();
         assert_eq!(std::fs::read_to_string(d.join("c")).unwrap(), "bob school green\n");
         std::fs::remove_dir_all(&d).unwrap();

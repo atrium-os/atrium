@@ -26,6 +26,9 @@
 # /var/db/atrium/state/<person>/org.atrium.forum-dock/pinned, and they are
 # read back after a teardown and a fresh launch. Alpha ships its own SVG icon,
 # which portcullisd reads from the bundle and the dock draws as filled paths.
+# The person has a Work persona (personas.md §7): launching from the grid asks
+# which (Enter: Personal); Beta opened in Work gets a dock tile of its own
+# beside Personal's, with a blue badge, and a press on it raises Work's.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-/tmp/apps-grid-jail}
@@ -111,7 +114,8 @@ g "set -e
     openssl dgst -sha256 -sign /root/e2e-key.pem -out \$B/atrium.toml.sig \$B/atrium.toml
     /usr/local/bin/opifex install \$B
   done
-  for id in org.atrium.forum-dock org.example.alpha org.example.beta; do /usr/local/bin/portcullis policy grant \$id; done" \
+  for id in org.atrium.forum-dock org.example.alpha org.example.beta; do /usr/local/bin/portcullis policy grant \$id; done
+  P=/var/db/atrium/root/policy.toml; rm -f /var/db/atrium/root/persona-last; sed -i '' '/^\[personas.work\]/,+1d' \$P; printf '[personas.work]\ncolour = \"blue\"\n' >> \$P" \
   > "$OUT/install.log" 2>&1 || die "install: $(tail -5 "$OUT/install.log")"
 tail -3 "$OUT/install.log"
 
@@ -153,7 +157,10 @@ sleep 6
 g "grep 'apps: ' $S/dock.log | tail -1" | grep -q 'selected=org.example.beta' && ok "\"beta\" selects Beta" || bad "Beta not selected"
 shot 1-filtered
 key 0x28
-sleep 40
+sleep 20
+has "persona question for Beta" && ok "Beta: which persona? asked" || bad "no persona question: $(g "grep -i persona $S/dock.log | tail -2")"
+key 0x28
+sleep 30
 has "launched 'org.example.beta'" && ok "portcullisd accepted the launch" || bad "no launch: $(g "grep -E 'beta|launch' $S/dock.log | tail -2")"
 g "jls name | grep -q example.beta" && ok "Beta runs in its own jail" || bad "no Beta jail"
 has "Applications view closed" && ok "the view closed on the launch" || bad "the view stayed up"
@@ -172,9 +179,46 @@ BTN=$(g "grep 'Applications button at' $S/dock.log | tail -1" | sed 's/.* at //'
 bx=${BTN%,*}; by=${BTN#*,}
 # Default pins: the first five listed (Alpha, Beta): Beta is the third tile.
 press $((bx + 152)) "$by"
+sleep 20
+key 0x28   # the persona question again: Personal, last used
 sleep 30
 has "'org.example.beta' is already running" && ok "a second press is AlreadyRunning" || bad "no AlreadyRunning: $(g "tail -3 $S/dock.log")"
 has "asked the WM to focus its surface" && ok "the dock asked forum-wm to focus Beta" || bad "Beta's window not found by its uid"
+
+echo "== Beta in Work: a tile of its own, badged"
+g "cd $S && daemon -f -o $S/beta-work.log /usr/local/bin/portcullis launch --no-prompt --persona work org.example.beta </dev/null"
+sleep 45
+g "grep 'running:' $S/dock.log | tail -1" | tee "$OUT/running-work.txt"
+grep -q 'org.example.beta@work' "$OUT/running-work.txt" && grep -q 'org.example.beta,\|org.example.beta]' "$OUT/running-work.txt" \
+  && ok "the dock tells Work's Beta from Personal's by uid" || bad "Work's Beta not shown running: $(g "tail -3 $S/beta-work.log")"
+inj "MOVE 10 300"
+shot 6-work-tile
+BTN=$(g "grep 'Applications button at' $S/dock.log | tail -1" | sed 's/.* at //')
+bx=${BTN%,*}; by=${BTN#*,}
+# Tiles 76 pt apart: Alpha, Beta, then Beta in Work; its badge sits on the
+# top-right corner (a 20 pt blue dot centred 24 right of and 24 above the
+# tile's centre).
+blue() { python3 -c "
+from PIL import Image
+im = Image.open('$OUT/6-work-tile.png').convert('RGB')
+n = 0
+for x in range($1 + 12, $1 + 37):
+    for y in range($2 - 37, $2 - 12):
+        r, g, b = im.getpixel((x, y))
+        n += abs(r - 0x25) < 12 and abs(g - 0x63) < 12 and abs(b - 0xeb) < 12
+print(n)"; }
+# (The logged y is in the dock window, which starts under frescod's 24 pt strip.)
+WB=$(blue $((bx + 228)) $((by + 24))); PB=$(blue $((bx + 152)) $((by + 24)))
+echo "  badge pixels: Work's tile $WB, Personal's $PB"
+[ "${WB:-0}" -gt 100 ] && ok "Work's tile has a blue badge" || bad "no blue badge on Work's tile ($WB)"
+[ "${PB:-1}" = 0 ] && ok "Personal's tile has none" || bad "Personal's tile badged ($PB)"
+NQ=$(g "grep -c 'persona question' $S/dock.log")
+press $((bx + 228)) "$by"
+sleep 30
+has "'org.example.beta' is already running" && [ "$(g "grep -c 'asked the WM to focus its surface' $S/dock.log")" -ge 2 ] \
+  && ok "a press on Work's tile raises Work's Beta, nothing asked" || bad "Work's tile: $(g "tail -3 $S/dock.log")"
+g "grep -c 'persona question' $S/dock.log" | grep -qx "$NQ" && ok "and asked nothing" || bad "the tile asked which persona"
+g "pkill -x beta; P=/var/db/atrium/root/policy.toml; sed -i '' '/^\[personas.work\]/,+1d' \$P"
 
 echo "== the dock as a session component: pins kept in the person's state folder"
 SD=/var/db/atrium/state/root/org.atrium.forum-dock

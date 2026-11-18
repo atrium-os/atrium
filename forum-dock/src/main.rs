@@ -116,9 +116,11 @@ enum ToApps {
 /// open while the app runs), and tell the Applications view how it went.
 fn start_launch(id: String, name: String, to_apps: Sender<ToApps>) {
     std::thread::spawn(move || {
-        // The app gets the dock's stdio: the session's log.
-        let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
-        let persona = match choose_persona(&id, &name) {
+        // The Applications view gives way to the question (a dialog of its
+        // own, which must have the focus the view holds).
+        let tx = to_apps.clone();
+        let done = id.clone();
+        let persona = match choose_persona(&id, &name, move || { let _ = tx.send(ToApps::Launched(Report::Done(done))); }) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 let _ = to_apps.send(ToApps::Launched(Report::Done(id)));
@@ -129,41 +131,53 @@ fn start_launch(id: String, name: String, to_apps: Sender<ToApps>) {
                 return;
             }
         };
-        match launch::request_in(&id, persona.as_deref(), stdio) {
-            PreLaunch::Started(run) => {
-                eprintln!("forum-dock: launched '{id}'");
-                let _ = to_apps.send(ToApps::Launched(Report::Done(id.clone())));
-                match run.wait() {
-                    Ok(code) => eprintln!("forum-dock: '{id}' exited (code {code:?})"),
-                    Err(e) => eprintln!("forum-dock: '{id}': {e}"),
-                }
-            }
-            PreLaunch::AlreadyRunning { jid, uid } => {
-                eprintln!("forum-dock: '{id}' is already running (jid {jid})");
-                match launch::focus_running(uid) {
-                    Ok(Some(sid)) => eprintln!("forum-dock: asked the WM to focus its surface {sid}"),
-                    Ok(None) => eprintln!("forum-dock: '{id}' has no window to focus"),
-                    Err(e) => eprintln!("forum-dock: could not focus '{id}': {e}"),
-                }
-                let _ = to_apps.send(ToApps::Launched(Report::Done(id)));
-            }
-            PreLaunch::NeedsApproval(delta) => {
-                eprintln!("forum-dock: '{id}' needs the user's approval: {}", delta.join("; "));
-                let text = format!("{name} needs your approval before it can run: {}", delta.join(", "));
-                let _ = to_apps.send(ToApps::Launched(Report::Note(id, text)));
-            }
-            PreLaunch::Failed(why) => {
-                eprintln!("forum-dock: launch of '{id}': {why}");
-                let _ = to_apps.send(ToApps::Launched(Report::Note(id, format!("{name} could not start: {why}"))));
+        run_launch(id, name, persona, to_apps);
+    });
+}
+
+/// An instance's dock tile: open or raise `id` in `persona`, nothing asked.
+fn start_launch_in(id: String, name: String, persona: String, to_apps: Sender<ToApps>) {
+    std::thread::spawn(move || run_launch(id, name, Some(persona), to_apps));
+}
+
+/// Launch `id` in `persona` (`None` Personal) and wait for it to exit.
+fn run_launch(id: String, name: String, persona: Option<String>, to_apps: Sender<ToApps>) {
+    // The app gets the dock's stdio: the session's log.
+    let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
+    match launch::request_in(&id, persona.as_deref(), stdio) {
+        PreLaunch::Started(run) => {
+            eprintln!("forum-dock: launched '{id}'");
+            let _ = to_apps.send(ToApps::Launched(Report::Done(id.clone())));
+            match run.wait() {
+                Ok(code) => eprintln!("forum-dock: '{id}' exited (code {code:?})"),
+                Err(e) => eprintln!("forum-dock: '{id}': {e}"),
             }
         }
-    });
+        PreLaunch::AlreadyRunning { jid, uid } => {
+            eprintln!("forum-dock: '{id}' is already running (jid {jid})");
+            match launch::focus_running(uid) {
+                Ok(Some(sid)) => eprintln!("forum-dock: asked the WM to focus its surface {sid}"),
+                Ok(None) => eprintln!("forum-dock: '{id}' has no window to focus"),
+                Err(e) => eprintln!("forum-dock: could not focus '{id}': {e}"),
+            }
+            let _ = to_apps.send(ToApps::Launched(Report::Done(id)));
+        }
+        PreLaunch::NeedsApproval(delta) => {
+            eprintln!("forum-dock: '{id}' needs the user's approval: {}", delta.join("; "));
+            let text = format!("{name} needs your approval before it can run: {}", delta.join(", "));
+            let _ = to_apps.send(ToApps::Launched(Report::Note(id, text)));
+        }
+        PreLaunch::Failed(why) => {
+            eprintln!("forum-dock: launch of '{id}': {why}");
+            let _ = to_apps.send(ToApps::Launched(Report::Note(id, format!("{name} could not start: {why}"))));
+        }
+    }
 }
 
 /// Which persona to open `id` in (personas.md §3), asked only when there is
 /// a choice: `Ok(Some(None))` Personal or nothing to ask, `Ok(None)` the
 /// person said no.
-fn choose_persona(id: &str, name: &str) -> Result<Option<Option<String>>, String> {
+fn choose_persona(id: &str, name: &str, before_asking: impl FnOnce()) -> Result<Option<Option<String>>, String> {
     let (list, last, spans) = match launch::personas(id) {
         Ok(v) => v,
         // An older portcullisd, or none: the launch says what's wrong.
@@ -173,6 +187,7 @@ fn choose_persona(id: &str, name: &str) -> Result<Option<Option<String>>, String
         }
     };
     let Some(q) = Question::new(name, list, last.as_deref(), spans) else { return Ok(Some(None)) };
+    before_asking();
     match ask_persona(q) {
         Ok(Answer::In(p)) => {
             eprintln!("forum-dock: '{id}' in persona {p}");
@@ -576,11 +591,14 @@ fn poll_running(shared: &SharedRef) {
     let running: HashSet<u32> = surfaces.iter().map(|s| s.owner_uid).filter(|&u| u != 0).collect();
     let unknown = {
         let mut s = shared.lock().unwrap();
-        let known: HashSet<u32> = s.apps.iter().filter_map(|a| a.uid).collect();
+        let known: HashSet<u32> = s.apps.iter().flat_map(|a| a.uid.into_iter().chain(a.instances.iter().map(|i| i.uid))).collect();
         if s.running != running {
             s.running = running.clone();
             s.bump();
-            let ids: Vec<&str> = s.apps.iter().filter(|a| a.uid.is_some_and(|u| running.contains(&u))).map(|a| a.id.as_str()).collect();
+            let ids: Vec<String> = s.apps.iter().flat_map(|a| {
+                let personal = a.uid.is_some_and(|u| running.contains(&u)).then(|| a.id.clone());
+                personal.into_iter().chain(a.instances.iter().filter(|i| running.contains(&i.uid)).map(|i| format!("{}@{}", a.id, i.persona)))
+            }).collect();
             eprintln!("forum-dock: running: [{}]", ids.join(", "));
         }
         // A uid no app has yet: an app ran for the first time and the
@@ -663,6 +681,7 @@ fn render_dock() -> io::Result<()> {
                     let _ = to_apps.send(ToApps::Toggle);
                 }
                 DockAction::Launch(id) => start_launch(id.clone(), name_of(&shared, &id), to_apps.clone()),
+                DockAction::LaunchIn(id, persona) => start_launch_in(id.clone(), name_of(&shared, &id), persona.clone(), to_apps.clone()),
             }
         }
         if last_poll.elapsed() >= RUNNING_POLL {
@@ -712,7 +731,7 @@ fn main() -> io::Result<()> {
             let persona = match (args.get(2).map(String::as_str), args.get(3)) {
                 (Some("--persona"), Some(p)) => Some(p.as_str()),
                 // As the dock would: ask which persona when there's a choice.
-                (Some("--ask"), None) => match choose_persona(id, id) {
+                (Some("--ask"), None) => match choose_persona(id, id, || ()) {
                     Ok(Some(p)) => {
                         asked = p;
                         asked.as_deref()

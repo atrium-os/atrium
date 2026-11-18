@@ -710,6 +710,22 @@ pub struct CatalogEntry {
     /// shows Terminal for it.
     #[serde(default)]
     pub console:     bool,
+    /// Its instances in the person's named personas (personas.md §7: the
+    /// dock gives each its own tile with a persona badge), by uid like
+    /// `uid`. Personal's is `uid`.
+    #[serde(default)]
+    pub instances:   Vec<CatalogInstance>,
+}
+
+/// An app's instance in a named persona, for a launcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogInstance {
+    pub persona: String,
+    pub uid:     u32,
+    /// Its colour's name (`fresco_protocol::persona::COLOURS`), `None`
+    /// when unknown: drawn grey.
+    #[serde(default)]
+    pub colour:  Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

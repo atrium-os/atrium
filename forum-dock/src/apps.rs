@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, name: &str, desc: Option<&str>) -> AppEntry {
-        AppEntry { id: id.into(), name: name.into(), description: desc.map(Into::into), icon: None, uid: None, vector: None, console: false }
+        AppEntry { id: id.into(), name: name.into(), description: desc.map(Into::into), icon: None, uid: None, vector: None, console: false, instances: Vec::new() }
     }
 
     fn sample() -> Vec<AppEntry> {

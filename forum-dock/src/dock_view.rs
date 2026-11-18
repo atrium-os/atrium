@@ -18,7 +18,9 @@ use pergola::{Color, Mutable};
 
 use crate::apps_view::draw_icon;
 use crate::pins::Pins;
+use crate::persona_view;
 use crate::AppEntry;
+use portcullis_ipc::CatalogInstance;
 
 fn em(pt: f32) -> f32 {
     pergola::theme::size::em(pt)
@@ -45,6 +47,8 @@ pub fn reserve_pt() -> u32 {
 pub enum DockAction {
     ToggleApps,
     Launch(String),
+    /// An instance's tile (personas.md §7): open or raise it in that persona.
+    LaunchIn(String, String),
 }
 
 /// What the dock shows.
@@ -63,7 +67,9 @@ pub struct DockState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Apps,
-    App { app: AppEntry, running: bool },
+    /// An app's tile: its Personal instance (`persona` none), or its instance
+    /// in a named persona, which has a tile of its own while it runs.
+    App { app: AppEntry, running: bool, persona: Option<CatalogInstance> },
     Divider,
 }
 
@@ -72,17 +78,27 @@ impl DockState {
         a.uid.is_some_and(|u| self.running.contains(&u))
     }
 
-    /// The row, left to right.
+    /// `a`'s named-persona instances with windows up.
+    fn running_instances<'a>(&'a self, a: &'a AppEntry) -> impl Iterator<Item = &'a CatalogInstance> {
+        a.instances.iter().filter(|i| self.running.contains(&i.uid))
+    }
+
+    /// The row, left to right. A pinned app's running instances follow its
+    /// tile; an app not pinned shows a tile per running instance.
     pub fn items(&self) -> Vec<Item> {
         let mut v = vec![Item::Apps];
         let pinned = self.pins.resolve(&self.apps);
-        v.extend(pinned.iter().map(|a| Item::App { app: (*a).clone(), running: self.is_running(a) }));
-        let others: Vec<Item> = self
-            .apps
-            .iter()
-            .filter(|a| self.is_running(a) && !pinned.iter().any(|p| p.id == a.id))
-            .map(|a| Item::App { app: a.clone(), running: true })
-            .collect();
+        for a in &pinned {
+            v.push(Item::App { app: (*a).clone(), running: self.is_running(a), persona: None });
+            v.extend(self.running_instances(a).map(|i| Item::App { app: (*a).clone(), running: true, persona: Some(i.clone()) }));
+        }
+        let mut others: Vec<Item> = Vec::new();
+        for a in self.apps.iter().filter(|a| !pinned.iter().any(|p| p.id == a.id)) {
+            if self.is_running(a) {
+                others.push(Item::App { app: a.clone(), running: true, persona: None });
+            }
+            others.extend(self.running_instances(a).map(|i| Item::App { app: a.clone(), running: true, persona: Some(i.clone()) }));
+        }
         if !others.is_empty() {
             v.push(Item::Divider);
             v.extend(others);
@@ -161,7 +177,7 @@ impl View for DockView {
                     ctx.tooltip(id, "Applications (Super+A)");
                     ctx.pop();
                 }
-                Item::App { app, running } => {
+                Item::App { app, running, persona } => {
                     ctx.key(100 + k as u64);
                     let id = ctx.push(Node::Rect { rect: Rect::new(x, y, tile, tile), fill: Color::TRANSPARENT, radius: radius::MD });
                     let plate = if ctx.is_pressed(id) {
@@ -173,9 +189,21 @@ impl View for DockView {
                     };
                     // The icon fills the tile here (its plate is the tile).
                     draw_icon_sized(ctx, app, x, y, tile, plate, t.text_primary());
-                    ctx.on_click(id, self.act(DockAction::Launch(app.id.clone())));
-                    ctx.tooltip(id, app.name.clone());
+                    match persona {
+                        None => {
+                            ctx.on_click(id, self.act(DockAction::Launch(app.id.clone())));
+                            ctx.tooltip(id, app.name.clone());
+                        }
+                        Some(i) => {
+                            ctx.on_click(id, self.act(DockAction::LaunchIn(app.id.clone(), i.persona.clone())));
+                            ctx.tooltip(id, format!("{} \u{00b7} {}", app.name, fresco_protocol::persona::label(&i.persona)));
+                        }
+                    }
                     ctx.pop();
+                    if let Some(i) = persona {
+                        let fill = i.colour.as_deref().and_then(persona_view::colour).unwrap_or_else(persona_view::unknown_colour);
+                        persona_view::badge(ctx, x + tile + em(4.0), y - em(4.0), em(20.0), &i.persona, fill);
+                    }
                     if *running {
                         let d = em(5.0);
                         ctx.add(Node::Rect { rect: Rect::new(x + (tile - d) / 2.0, y + tile + em(5.0), d, d), fill: t.text_secondary(), radius: radius::PILL });
@@ -208,7 +236,7 @@ mod tests {
     use super::*;
 
     fn app(id: &str, uid: Option<u32>) -> AppEntry {
-        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid, vector: None, console: false }
+        AppEntry { id: id.into(), name: id.into(), description: None, icon: None, uid, vector: None, console: false, instances: Vec::new() }
     }
 
     #[test]
@@ -221,11 +249,37 @@ mod tests {
         };
         let row = s.items();
         assert_eq!(row[0], Item::Apps);
-        assert_eq!(row[1], Item::App { app: app("b", Some(2)), running: true });
-        assert_eq!(row[2], Item::App { app: app("d", None), running: false });
+        assert_eq!(row[1], Item::App { app: app("b", Some(2)), running: true, persona: None });
+        assert_eq!(row[2], Item::App { app: app("d", None), running: false, persona: None });
         assert_eq!(row[3], Item::Divider);
-        assert_eq!(row[4], Item::App { app: app("c", Some(3)), running: true });
+        assert_eq!(row[4], Item::App { app: app("c", Some(3)), running: true, persona: None });
         assert_eq!(row.len(), 5);
+    }
+
+    #[test]
+    fn each_running_persona_instance_has_its_own_tile() {
+        let work = |uid| CatalogInstance { persona: "work".into(), uid, colour: Some("blue".into()) };
+        let mut b = app("b", Some(2));
+        b.instances = vec![work(12)];
+        let mut c = app("c", Some(3));
+        c.instances = vec![work(13)];
+        let mut e = app("e", Some(5));
+        e.instances = vec![work(15)];
+        let s = DockState {
+            apps: vec![b.clone(), c.clone(), e.clone()],
+            pins: Pins { ids: vec!["b".into(), "e".into()], from_file: true },
+            // b in Work only, c in Work only (not pinned), e not at all.
+            running: [12, 13].into_iter().collect(),
+            apps_open: false,
+        };
+        let row = s.items();
+        assert_eq!(row[1], Item::App { app: b.clone(), running: false, persona: None });
+        assert_eq!(row[2], Item::App { app: b, running: true, persona: Some(work(12)) });
+        assert_eq!(row[3], Item::App { app: e, running: false, persona: None });
+        assert_eq!(row[4], Item::Divider);
+        // Not pinned and only Work's up: Work's tile alone.
+        assert_eq!(row[5], Item::App { app: c, running: true, persona: Some(work(13)) });
+        assert_eq!(row.len(), 6);
     }
 
     #[test]

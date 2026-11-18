@@ -112,8 +112,33 @@ fn sans(size: f32, weight: Weight, color: Color) -> TextStyle {
 }
 
 fn swatch(p: &PersonaOption) -> Option<Color> {
-    let [r, g, b] = fresco_protocol::persona::rgb(p.colour.as_deref()?)?;
+    colour(p.colour.as_deref()?)
+}
+
+/// A persona colour's name as a Pergola colour (linear, from the sRGB value).
+pub fn colour(name: &str) -> Option<Color> {
+    let [r, g, b] = fresco_protocol::persona::rgb(name)?;
     Some(Color::from_hex(&format!("#{r:02x}{g:02x}{b:02x}")))
+}
+
+/// Grey, for a persona whose colour is not known.
+pub fn unknown_colour() -> Color {
+    Color::from_hex("#6b7280")
+}
+
+/// The badge on an instance's icon (personas.md §7): a dot in the persona's
+/// colour with its first letter, `d` across, its top-right corner at
+/// `(right, top)`. The letter is a convenience; the persona's name is in the
+/// tooltip and frescod's chip.
+pub fn badge(ctx: &mut Ctx, right: f32, top: f32, d: f32, persona: &str, fill: Color) {
+    let t = ctx.theme;
+    let ring = (d * 0.12).max(1.0);
+    ctx.add(Node::Rect { rect: Rect::new(right - d - ring, top - ring, d + 2.0 * ring, d + 2.0 * ring), fill: t.bg_elevated(), radius: radius::PILL });
+    ctx.add(Node::Rect { rect: Rect::new(right - d, top, d, d), fill, radius: radius::PILL });
+    let letter: String = persona.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    let style = sans(d * 0.6, Weight::Bold, Color::from_hex("#ffffff"));
+    let sz = pergola::text::measure(&letter, &style);
+    ctx.add(Node::Text { rect: Rect::new(right - d + (d - sz.w) / 2.0, top + (d - sz.h) / 2.0, 0.0, sz.h), content: letter, style });
 }
 
 pub struct PersonaView {

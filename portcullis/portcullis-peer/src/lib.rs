@@ -246,6 +246,17 @@ impl AppRegistry {
             .map(|(uid, _)| *uid)
     }
 
+    /// `(user, app_id)`'s instances in named personas, `(uid, persona)`,
+    /// in persona order (Personal's is [`Self::uid_for`]).
+    pub fn named_instances(&self, user: &str, app_id: &str) -> Vec<(u32, &str)> {
+        let mut v: Vec<(u32, &str)> = self.map.iter()
+            .filter(|(_, e)| !e.session && e.user == user && e.app_id == app_id)
+            .filter_map(|(uid, e)| e.persona.as_deref().map(|p| (*uid, p)))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
     /// Every uid of `user`'s persona `persona` (its app instances and
     /// workers), with the app each is for.
     pub fn persona_uids(&self, user: &str, persona: &str) -> Vec<(u32, &str)> {
@@ -567,6 +578,8 @@ mod tests {
         // A Work-only app has no Personal uid to reuse.
         assert_eq!(r.uid_for("alice", "org.x.chat"), None);
         assert_eq!(r.uid_for_instance("alice", "org.x.chat", None, Some("work")), Some(50002));
+        assert_eq!(r.named_instances("alice", "org.x.mail"), vec![(50001, "work")]);
+        assert!(r.named_instances("bob", "org.x.mail").is_empty());
         let _ = std::fs::remove_file(path);
     }
 
