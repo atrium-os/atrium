@@ -331,6 +331,23 @@ pub enum Request {
         activation: [u8; 16],
     },
 
+    /// ★ Save a download (personas.md §4.1, navigator-ui.md §6.4). Only
+    /// from the Navigator (its installed manifest holds `navigator-broker`),
+    /// after the person's press on Save, which it spent itself. Then
+    /// `ReadyForFds` and one descriptor: a sealed memory file with the
+    /// file's bytes. portcullisd writes it, under `name` or a new name
+    /// beside it, into the Downloads of the caller's persona (the person's
+    /// own for Personal, `~/.atrium/personas/<persona>/Downloads` for a
+    /// named one), the person's with that folder's group, 0660, with
+    /// `origin` recorded as `atrium.origin`. The Navigator never holds the
+    /// person's folders. Answer: `Downloaded`.
+    SaveDownload {
+        /// The file's name: never a path.
+        name:   String,
+        /// Where it came from (at most 2048 bytes).
+        origin: String,
+    },
+
     /// ★ A link to open (opening-links.md §5), first step. Only from
     /// Monstrator (peer uid `_monstrator`). `asker_uid` is the app the
     /// person pressed in, `activation` that press, spent here with frescod
@@ -811,6 +828,9 @@ pub enum Response {
     Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
+    /// A download saved: the name it has, and its folder in words
+    /// ("Downloads", "Work's Downloads").
+    Downloaded { name: String, place: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.

@@ -222,6 +222,35 @@ pub fn save(dir: &Path, h: &Held) -> Result<PathBuf, String> {
     Err("too many files of that name".into())
 }
 
+/// A memory file holding `bytes`, sealed against changes: what portcullisd
+/// takes for `SaveDownload`.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+pub fn sealed(bytes: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::Seek;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let c = std::ffi::CString::new("download").unwrap();
+    // SAFETY: a valid C string; the flags are memfd_create's.
+    let raw = unsafe { libc::memfd_create(c.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a new descriptor nothing else owns.
+    let mut f = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    f.write_all(bytes)?;
+    f.rewind()?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl(F_ADD_SEALS) on a descriptor we own.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(f.into())
+}
+
+#[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+pub fn sealed(_: &[u8]) -> std::io::Result<std::os::fd::OwnedFd> {
+    Err(std::io::Error::other("no sealed memory files here"))
+}
+
 /// The user extended attribute that says where a saved file came from.
 pub const ORIGIN_ATTR: &str = "atrium.origin";
 

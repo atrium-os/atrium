@@ -27,6 +27,9 @@
 #   netif    rc.conf's interface lines and the netif share of rc, for trimming
 #   NETIF_TRIM=1 also sets the dev VM's rc.conf to DHCP in the background
 #            with no IPv6 autoconf before the reboots (backup kept)
+#   QUIET_WITNESS=1 adds debug.witness.trace=0 to loader.conf (no vtnet
+#            backtraces on the serial console inside netif)
+#   FIRMWARE_TIMEOUT=N sets the firmware's boot Timeout (efibootmgr -t N)
 #   efi      print the firmware boot entries (the 5 s "X64 image" detour)
 #
 # KERNELS=1 also boots, once each through nextboot (falls back by itself):
@@ -119,6 +122,19 @@ V 'sysrc -q devfs_load_rulesets=NO >/dev/null' && ok "rc.d/devfs leaves the rule
 put "$ROOT/portcullis/ostiarius/etc/services.d/45-atrium-ostiarius.toml" /etc/atrium/services.d/45-atrium-ostiarius.toml \
     && ok "ostiarius manifest (readiness)" || bad "ostiarius manifest copy"
 V 'ls /etc/atrium/services.d/' > "$OUT/services.d.txt"
+# QUIET_WITNESS=1: the dev VM's GENERIC kernel (WITNESS) prints ~1000 lines
+# of vtnet lock backtraces when netif brings vtnet0 up, and the serial console
+# takes ~2.2 s to write them inside rc.d/netif. debug.witness.trace=0 keeps
+# the lock checking and the one-line reports, without the backtraces.
+# FIRMWARE_TIMEOUT=0: the firmware waits its 5 s Timeout before Boot0001
+# (serial: 2.03 s -> 7.04 s). Reset with `efibootmgr -t 5`.
+if [ "${QUIET_WITNESS:-0}" = 1 ]; then
+    V 'grep -q "^debug.witness.trace=" /boot/loader.conf || echo "debug.witness.trace=\"0\"" >> /boot/loader.conf' \
+        && ok "loader.conf: debug.witness.trace=0" || bad "witness trace tunable"
+fi
+if [ -n "${FIRMWARE_TIMEOUT:-}" ]; then
+    V "efibootmgr -t ${FIRMWARE_TIMEOUT} >/dev/null" && ok "firmware Timeout ${FIRMWARE_TIMEOUT} s" || bad "efibootmgr -t ${FIRMWARE_TIMEOUT}"
+fi
 
 say "boot (3 reboots)"
 RUNS=3 sh "$ROOT/scripts/boot-trace.sh" "$OUT/boot" > "$OUT/boot-trace.log" 2>&1 || bad "boot-trace.sh"
@@ -210,6 +226,9 @@ V 'grep -E "^(ifconfig|ipv6|rtsol|dhclient|background_dhclient|synchronous_dhcli
 sed 's/^/  /' "$OUT/netif.txt"
 r="$OUT/boot/run-3/boottrace.txt"
 [ -f "$r" ] && grep -E "netif|dhclient|routing|defaultroute|netwait" "$r" | sed 's/^/  /' > "$OUT/netif-trace.txt" && cat "$OUT/netif-trace.txt"
+
+s3="$OUT/boot/run-3/serial.txt"
+[ -f "$s3" ] && echo "  run-3 serial: $(grep -c "stack backtrace\|lock order reversal" "$s3") witness reports, $(wc -l < "$s3" | tr -d ' ') lines; firmware: $(awk '/UEFI firmware/{a=$1} /BdsDxe: starting/{b=$1} END{if (a!="" && b!="") printf "%.1f s", b-a}' "$s3")"
 
 say "efi"
 V 'efibootmgr -v' > "$OUT/efibootmgr.txt" 2>&1; cat "$OUT/efibootmgr.txt"

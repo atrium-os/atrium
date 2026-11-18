@@ -149,6 +149,8 @@ pub struct Shown {
     pub folder: Option<FolderId>,
     /// Its *Later* item, when it has one (§11.4).
     pub later: Option<(u64, mail_store::later::Later)>,
+    /// Its dropped item (and when it was dropped), when it has no open one.
+    pub dropped: Option<(u64, mail_store::later::Later, i64)>,
 }
 
 impl Shown {
@@ -172,6 +174,8 @@ pub struct Undo {
     pub ops: Vec<u64>,
     /// A send waiting in the outbox (Undo takes it back to compose).
     pub send: Option<u64>,
+    /// Later items dropped after 30 days overdue (Undo brings them back).
+    pub later: Vec<u64>,
     /// "Message archived", "Conversation deleted".
     pub label: String,
     pub until: i64,
@@ -249,11 +253,21 @@ pub struct Search {
     pub view: Option<Lane>,
 }
 
+/// An answer to a Later item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Done,
+    Drop,
+    Now,
+}
+
 /// The views that aren't folders (§11.3, §15.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     /// Everything set aside (§11.4), soonest first.
     Later,
+    /// Items dropped (by hand, or 30 days overdue), latest first.
+    Dropped,
     /// The inbox's lanes (E10).
     People,
     Updates,
@@ -266,6 +280,7 @@ impl Lane {
     pub fn label(self) -> &'static str {
         match self {
             Lane::Later => "Later",
+            Lane::Dropped => "Dropped",
             Lane::People => "People",
             Lane::Updates => "Updates",
             Lane::Newsletters => "Newsletters",
@@ -294,6 +309,9 @@ pub struct Ui {
     pub overdue: usize,
     /// The Later sheet (`l`): what it is for, then when.
     pub later_sheet: Option<u8>,
+    /// The sheet's one-line note, and whether it is being typed (`n`).
+    pub later_note: String,
+    pub later_noting: bool,
     /// Quick look of an attachment (§8.1).
     pub look: Option<LookPane>,
     /// What became of Open or Save ("Opening in Atrium PDF…", or why not).
@@ -716,6 +734,14 @@ impl Mail {
         }
         ui.saved = store.saved_searches().unwrap_or_default().into_iter().map(|(id, s)| SavedPlace { id, name: s.name, query: s.query }).collect();
         let now = (self.now)();
+        match self.engine.later_drop_stale(now) {
+            Ok(ids) if !ids.is_empty() => {
+                let label = if ids.len() == 1 { "1 item 30 days overdue dropped".to_string() } else { format!("{} items 30 days overdue dropped", ids.len()) };
+                ui.undo = Some(Undo { ops: Vec::new(), send: None, later: ids, label, until: now + mail_engine::UNDO_SECS });
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("atrium-mail: Later: {e}"),
+        }
         match self.engine.later_due(now) {
             Ok(n) if n > 0 => {
                 ui.count = ui.folder.map_or(0, |f| self.count_of(f, ui.conversations));
@@ -918,6 +944,7 @@ impl Mail {
             ui.gen += 1;
         }
         let later = msgs.last().and_then(|m| self.engine.later_of(m.msg).ok().flatten());
+        let dropped = if later.is_some() { None } else { msgs.last().and_then(|m| self.engine.later_dropped_of(m.msg).ok().flatten()) };
         ui.reading = Some(Shown {
             subject: if subject.trim().is_empty() { "(no subject)".into() } else { subject },
             people: if n > 1 { format!("{} · {n} messages", people.join(", ")) } else { String::new() },
@@ -926,6 +953,7 @@ impl Mail {
             version,
             folder,
             later,
+            dropped,
         });
         if read_any {
             if let Some(h) = ui.search.as_mut().and_then(|s| s.hits.get_mut(i)) {
@@ -1150,7 +1178,7 @@ impl Mail {
         let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
         match self.engine.act(folder, &uids, action) {
             Ok(ops) if !ops.is_empty() => {
-                ui.undo = Some(Undo { ops, send: None, label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: format!("{what} {label}"), until: (self.now)() + mail_engine::UNDO_SECS });
             }
             Ok(_) => return,
             Err(e) => {
@@ -1243,6 +1271,10 @@ impl Mail {
     fn views(&self, accounts: &[AccountId]) -> Vec<(Lane, usize)> {
         let e = &self.engine;
         let mut out = vec![(Lane::Later, e.later_items().map(|l| l.len()).unwrap_or(0))];
+        let dropped = e.later_dropped().map(|l| l.len()).unwrap_or(0);
+        if dropped > 0 {
+            out.push((Lane::Dropped, dropped));
+        }
         if !accounts.is_empty() {
             out.extend([(Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0)]);
         }
@@ -1284,10 +1316,23 @@ impl Mail {
                 Some(h)
             }).collect();
         }
+        if lane == Lane::Dropped {
+            let now = (self.now)();
+            return e.later_dropped().unwrap_or_default().into_iter().filter_map(|(_, l, at)| {
+                let newest = e.store.thread(l.thread).ok()?.last()?.msg;
+                let mut h = e.hit(newest).or_else(|| e.hit(l.msg))?;
+                let mut p = format!("Dropped {} · was {}", crate::date_text(at, now), mail_engine::later::kind_label(l.kind));
+                if !l.note.is_empty() {
+                    p += &format!(" · {}", l.note);
+                }
+                h.preview = p;
+                Some(h)
+            }).collect();
+        }
         let mut ids = Vec::new();
         for (a, _) in e.store.accounts().unwrap_or_default() {
             match lane {
-                Lane::Later => {}
+                Lane::Later | Lane::Dropped => {}
                 Lane::People => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::People, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Updates => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Updates, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
                 Lane::Newsletters => ids.extend(e.lane(a, mail_engine::lanes::LaneKind::Newsletters, mail_engine::search::RESULTS_MAX).unwrap_or_default()),
@@ -1306,8 +1351,41 @@ impl Mail {
         let Some(r) = &ui.reading else { return };
         let Some(m) = r.msgs.last() else { return };
         let k = r.later.as_ref().map_or_else(|| self.engine.later_kind(m.msg), |(_, l)| l.kind);
+        ui.later_note = r.later.as_ref().map(|(_, l)| l.note.clone()).unwrap_or_default();
+        ui.later_noting = false;
         ui.later_sheet = Some(k);
         self.ui.set(ui);
+    }
+
+    /// `n` in the Later sheet: type its note.
+    pub fn later_noting(&self, on: bool) {
+        let mut ui = self.ui.get_cloned();
+        if ui.later_sheet.is_some() {
+            ui.later_noting = on;
+            self.ui.set(ui);
+        }
+    }
+
+    /// A key while the note has the caret: text, Backspace, and Enter or
+    /// Escape to stop typing.
+    fn later_note_key(&self, key: &Key, chars: &str) -> bool {
+        let mut ui = self.ui.get_cloned();
+        match key {
+            Key::Enter | Key::Escape | Key::Tab => ui.later_noting = false,
+            Key::Backspace => {
+                ui.later_note.pop();
+            }
+            Key::Char => {
+                let mut n = ui.later_note.clone();
+                n.push_str(chars);
+                let n = mail_engine::later::clean_note(&n);
+                // Keep a trailing space while typing.
+                ui.later_note = if chars.ends_with(' ') && !n.is_empty() && n.len() < mail_engine::later::NOTE_MAX { n + " " } else { n };
+            }
+            _ => return false,
+        }
+        self.ui.set(ui);
+        true
     }
 
     pub fn later_kind(&self, k: u8) {
@@ -1321,6 +1399,7 @@ impl Mail {
     pub fn close_later_sheet(&self) {
         let mut ui = self.ui.get_cloned();
         ui.later_sheet = None;
+        ui.later_noting = false;
         self.ui.set(ui);
     }
 
@@ -1331,7 +1410,9 @@ impl Mail {
         let (Some(k), Some(r)) = (ui.later_sheet.take(), ui.reading.as_ref()) else { return };
         let Some(msg) = r.msgs.last().map(|m| m.msg) else { return };
         let cursor = ui.cursor;
-        match self.engine.set_later(msg, k, when.at((self.now)()), "") {
+        ui.later_noting = false;
+        let note = std::mem::take(&mut ui.later_note);
+        match self.engine.set_later(msg, k, when.at((self.now)()), &note) {
             Ok(_) => {
                 ui.undo = None;
                 ui.file_note = Some((format!("Set aside: {}", when.label().to_lowercase()), (self.now)() + 4));
@@ -1347,20 +1428,104 @@ impl Mail {
 
     /// `d`: the reader's Later item is done (§11.4).
     pub fn later_done(&self) -> bool {
+        self.later_answer(Answer::Done)
+    }
+
+    /// `x`: the reader's Later item is dropped (kept in *Dropped*).
+    pub fn later_drop(&self) -> bool {
+        self.later_answer(Answer::Drop)
+    }
+
+    /// *Do it now*: the item is back in the inbox at once.
+    pub fn later_now(&self) -> bool {
+        self.later_answer(Answer::Now)
+    }
+
+    /// *Make it someday*: 30 days out, kind and note kept.
+    pub fn later_someday(&self) -> bool {
+        let ui = self.ui.get_cloned();
+        let Some(r) = ui.reading.as_ref() else { return false };
+        let (Some((_, l)), Some(m)) = (r.later.clone(), r.msgs.last()) else { return false };
+        if let Err(e) = self.engine.set_later(m.msg, l.kind, mail_engine::later::When::Someday.at((self.now)()), "") {
+            self.set_error(format!("Couldn't set it aside: {e}"));
+            return true;
+        }
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some(("Set aside: someday".into(), (self.now)() + 4));
+        let cursor = ui.cursor;
+        self.after_leaving(ui, cursor);
+        true
+    }
+
+    /// `u` on a dropped conversation: its item is open again.
+    pub fn later_restore(&self) -> bool {
+        let ui = self.ui.get_cloned();
+        let Some((id, _, _)) = ui.reading.as_ref().and_then(|r| r.dropped.clone()) else { return false };
+        match self.engine.later_undrop(id) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.set_error("It has another Later item now".into());
+                return true;
+            }
+            Err(e) => {
+                self.set_error(format!("Couldn't restore it: {e}"));
+                return true;
+            }
+        }
+        let mut ui = self.ui.get_cloned();
+        ui.file_note = Some(("Restored to Later".into(), (self.now)() + 3));
+        let cursor = ui.cursor;
+        if ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::Dropped)) {
+            self.after_leaving(ui, cursor);
+        } else {
+            if let Some(r) = &mut ui.reading {
+                let last = r.msgs.last().map(|m| m.msg);
+                r.dropped = None;
+                r.later = last.and_then(|m| self.engine.later_of(m).ok().flatten());
+                r.version = next_version();
+            }
+            ui.gen += 1;
+            ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+            self.ui.set(ui);
+        }
+        true
+    }
+
+    fn later_answer(&self, a: Answer) -> bool {
         let ui = self.ui.get_cloned();
         let Some((id, _)) = ui.reading.as_ref().and_then(|r| r.later.clone()) else { return false };
-        if let Err(e) = self.engine.later_done(id) {
+        let (done, label) = match a {
+            Answer::Done => (self.engine.later_done(id), "Done"),
+            Answer::Drop => (self.engine.later_drop(id, (self.now)()), "Dropped"),
+            Answer::Now => (self.engine.later_now(id, (self.now)()), "Back in the inbox"),
+        };
+        if let Err(e) = done {
             self.set_error(format!("Couldn't close it: {e}"));
             return true;
         }
         let mut ui = self.ui.get_cloned();
-        ui.file_note = Some(("Done".into(), (self.now)() + 3));
+        ui.file_note = Some((label.into(), (self.now)() + 3));
+        if a == Answer::Now {
+            if let Some(r) = &mut ui.reading {
+                let last = r.msgs.last().map(|m| m.msg);
+                r.later = last.and_then(|m| self.engine.later_of(m).ok().flatten());
+                r.version = next_version();
+            }
+            ui.gen += 1;
+            if let Some(f) = ui.folder.filter(|_| ui.search.is_none()) {
+                ui.count = self.count_of(f, ui.conversations);
+            }
+            self.ui.set(ui);
+            return true;
+        }
         let cursor = ui.cursor;
         if ui.search.as_ref().is_some_and(|s| s.view == Some(Lane::Later)) {
             self.after_leaving(ui, cursor);
         } else {
             if let Some(r) = &mut ui.reading {
+                let last = r.msgs.last().map(|m| m.msg);
                 r.later = None;
+                r.dropped = if a == Answer::Drop { last.and_then(|m| self.engine.later_dropped_of(m).ok().flatten()) } else { None };
                 r.version = next_version();
             }
             ui.gen += 1;
@@ -1724,6 +1889,14 @@ impl Mail {
         if let Err(e) = self.engine.undo(&u.ops) {
             ui.error = Some(format!("Couldn't undo: {e}"));
         }
+        for id in &u.later {
+            if let Err(e) = self.engine.later_undrop(*id) {
+                ui.error = Some(format!("Couldn't undo: {e}"));
+            }
+        }
+        if !u.later.is_empty() {
+            ui.views = self.views(&self.engine.store.accounts().unwrap_or_default().iter().map(|a| a.0).collect::<Vec<_>>());
+        }
         if let Some(s) = &mut ui.search {
             s.hits = self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default();
             ui.count = s.hits.len();
@@ -1805,7 +1978,7 @@ impl Mail {
     /// window.
     pub fn sent(&self, send: u64, label: String) {
         let mut ui = self.ui.get_cloned();
-        ui.undo = Some(Undo { ops: Vec::new(), send: Some(send), label, until: (self.now)() + mail_engine::send::UNDO_SEND_SECS });
+        ui.undo = Some(Undo { ops: Vec::new(), send: Some(send), later: Vec::new(), label, until: (self.now)() + mail_engine::send::UNDO_SEND_SECS });
         self.ui.set(ui);
     }
 
@@ -1964,7 +2137,11 @@ impl Mail {
         }
         if ui.later_sheet.is_some() {
             use mail_engine::later::When;
+            if ui.later_noting {
+                return self.later_note_key(key, chars);
+            }
             match (key, chars.as_str()) {
+                (Key::Char, "n") => self.later_noting(true),
                 (Key::Escape, _) => self.close_later_sheet(),
                 (Key::Enter, _) => self.later(When::Tomorrow),
                 (Key::Char, c @ ("1" | "2" | "3" | "4" | "5")) => self.later(When::ALL[c.parse::<usize>().unwrap() - 1]),
@@ -2008,6 +2185,8 @@ impl Mail {
                 return true;
             }
             (Key::Char, "d") if ui.reading.is_some() => return self.later_done(),
+            (Key::Char, "x") if ui.reading.is_some() => return self.later_drop(),
+            (Key::Char, "u") if ui.reading.as_ref().is_some_and(|r| r.dropped.is_some()) => return self.later_restore(),
             (Key::Char, "/") => {
                 self.start_search();
                 return true;
@@ -2110,7 +2289,7 @@ pub enum Item {
 /// The reader's lines for a column `w` wide.
 pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
     let mut out = Vec::new();
-    if r.later.is_some() {
+    if r.later.is_some() || r.dropped.is_some() {
         out.push(Item::Later);
         out.push(Item::Gap);
     }
@@ -2609,6 +2788,7 @@ impl MailView {
                 Some(Search { view: Some(v), .. }) => {
                     let empty = match v {
                         Lane::Later => "Nothing set aside",
+                        Lane::Dropped => "Nothing dropped",
                         Lane::People => "No mail from people",
                         Lane::Updates => "No updates",
                         Lane::Newsletters => "No newsletters",
@@ -2826,7 +3006,8 @@ impl MailView {
         let t = ctx.theme;
         let row_h = em(30.0);
         let sw = em(300.0);
-        let sh = em(16.0) + em(28.0) + em(8.0) + 5.0 * row_h + em(12.0);
+        let note_h = em(30.0);
+        let sh = em(16.0) + em(28.0) + em(8.0) + note_h + 5.0 * row_h + em(12.0);
         let (sx, sy) = (right - sw, y0);
         ctx.push(Node::Rect { rect: Rect::new(sx - 1.0, sy - 1.0, sw + 2.0, sh + 2.0), fill: t.border_strong(), radius: 9.0 });
         ctx.add(Node::Rect { rect: Rect::new(sx, sy, sw, sh), fill: t.bg_window(), radius: 8.0 });
@@ -2841,8 +3022,22 @@ impl MailView {
             ctx.pop();
             bx += lw + em(4.0);
         }
+        // The note (`n`): one line, shown when it comes back.
+        let ui = self.mail.ui.get_cloned();
+        let ny = sy + em(16.0) + em(28.0) + em(8.0);
+        let m = self.mail.clone();
+        let fill = if ui.later_noting { t.bg_canvas() } else { Color::TRANSPARENT };
+        area(ctx, Rect::new(sx + em(6.0), ny, sw - em(12.0), note_h), fill, move || m.later_noting(true));
+        let shown = if ui.later_note.is_empty() && !ui.later_noting { "Add a note".to_string() } else if ui.later_noting { format!("{}|", ui.later_note) } else { ui.later_note.clone() };
+        let shown = fit(&shown, type_size::SM, Weight::Regular, sw - em(56.0));
+        let c = if ui.later_note.is_empty() && !ui.later_noting { t.text_tertiary() } else { t.text_primary() };
+        text(ctx, sx + em(14.0), ny + note_h / 2.0, &shown, type_size::SM, Weight::Regular, c);
+        if !ui.later_noting {
+            text(ctx, sx + sw - em(14.0) - width("n", type_size::XS, Weight::Regular), ny + note_h / 2.0, "n", type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+        ctx.pop();
         let now = (self.mail.now)();
-        let mut y = sy + em(16.0) + em(28.0) + em(8.0);
+        let mut y = ny + note_h;
         for (i, w) in When::ALL.iter().enumerate() {
             let m = self.mail.clone();
             let w = *w;
@@ -3046,8 +3241,25 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             text(ctx, x, cy, l, type_size::SM, Weight::Regular, t.text_secondary());
         }
         Item::Later => {
-            let Some((_, l)) = &s.later else { return };
             let now = (mail.now)();
+            if let (None, Some((_, l, at))) = (&s.later, &s.dropped) {
+                let mut label = format!("Dropped {} · was {}", crate::date_text(*at, now), mail_engine::later::kind_label(l.kind));
+                if !l.note.is_empty() {
+                    label += &format!(": {}", l.note);
+                }
+                let (b, k) = ("Restore", "u");
+                let bw = width(b, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
+                let label = fit(&label, type_size::XS, Weight::Medium, (tw - bw - em(12.0)).max(em(60.0)));
+                text(ctx, x, cy, &label, type_size::XS, Weight::Medium, t.text_secondary());
+                let bx = x + width(&label, type_size::XS, Weight::Medium) + em(12.0);
+                let m = mail.clone();
+                area(ctx, Rect::new(bx, cy - em(11.0), bw, em(22.0)), t.bg_window(), move || { m.later_restore(); });
+                text(ctx, bx + em(8.0), cy, b, type_size::XS, Weight::Medium, t.text_primary());
+                text(ctx, bx + bw - em(8.0) - width(k, type_size::XS, Weight::Regular), cy, k, type_size::XS, Weight::Regular, t.text_tertiary());
+                ctx.pop();
+                return;
+            }
+            let Some((_, l)) = &s.later else { return };
             let kind = mail_engine::later::kind_label(l.kind);
             let set = crate::date_text(l.set_at, now);
             let mut label = if l.back {
@@ -3063,10 +3275,20 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             if l.pushed >= 3 {
                 label += &format!(" · pushed back {} times", l.pushed);
             }
-            let buttons: [(&str, &str, Box<dyn Fn()>); 2] = [
-                ("Done", "d", { let m = mail.clone(); Box::new(move || { m.later_done(); }) }),
-                ("Later", "l", { let m = mail.clone(); Box::new(move || m.ask_later()) }),
-            ];
+            // Pushed back three times: the review's question, here (§11.4).
+            let buttons: Vec<(&str, &str, Box<dyn Fn()>)> = if l.pushed >= mail_engine::later::PUSHED_ASK && !l.back {
+                vec![
+                    ("Do it now", "", { let m = mail.clone(); Box::new(move || { m.later_now(); }) }),
+                    ("Drop", "x", { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
+                    ("Someday", "", { let m = mail.clone(); Box::new(move || { m.later_someday(); }) }),
+                ]
+            } else {
+                vec![
+                    ("Done", "d", { let m = mail.clone(); Box::new(move || { m.later_done(); }) }),
+                    ("Later", "l", { let m = mail.clone(); Box::new(move || m.ask_later()) }),
+                    ("Drop", "x", { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
+                ]
+            };
             let bw: f32 = buttons.iter().map(|(l, k, _)| width(l, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(32.0)).sum();
             let label = fit(&label, type_size::XS, Weight::Medium, (tw - bw - em(12.0)).max(em(60.0)));
             text(ctx, x, cy, &label, type_size::XS, Weight::Medium, if l.back || l.due <= now { t.accent_fg() } else { t.text_secondary() });

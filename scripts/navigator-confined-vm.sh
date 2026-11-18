@@ -235,7 +235,7 @@ g "set -e
         NAVIGATORD_ACTIVATION=/atrium/sockets/fresco-activation/fresco-activation.sock \
         NAVIGATORD_LIMEN=/atrium/sockets/limen/limend.sock PORTCULLIS_SOCKET=$PSOCK \
         NAVIGATORD_CONVERTER=jail:$CONV_ID NAVIGATORD_FETCHD=jail:$FETCH_ID \
-        NAVIGATORD_STORE=/var/db/navigatord/store NAVIGATORD_DOWNLOADS=/var/db/navigatord/downloads \
+        NAVIGATORD_STORE=/var/db/navigatord/store \
         NAVIGATORD_UI=jail:org.atrium.navigator.ui NAVIGATORD_TRAILS=/var/db/navigatord/trails.json \
         NAVIGATORD_SCHEMES=mailto \
         NAVIGATOR_UI_TRACE=1 NAVIGATOR_UI_WIRE_LOG=1 NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium > /root/navigatord.conf

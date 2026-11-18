@@ -82,6 +82,8 @@ pub enum GridOp {
     TabColor { sheet: u16, color: Option<u32> },
     /// A sheet's merged cells ([`crate::merges`]), swapped in whole.
     Merges { sheet: u16, list: Vec<Rect> },
+    /// Comments set, or taken away (`None`), on cells of a sheet, in order.
+    Comments { sheet: u16, set: Vec<(u32, u32, Option<crate::comments::Comment>)> },
 }
 
 impl GridOp {
@@ -235,6 +237,12 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::Comments { sheet, set } => {
+                w.u8(17);
+                w.u16(*sheet);
+                crate::comments::encode(&mut w, set);
+                return w.into_bytes();
+            }
             GridOp::Merges { sheet, list } => {
                 w.u8(16);
                 w.u16(*sheet);
@@ -365,6 +373,14 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 17 {
+            let sheet = r.u16()?;
+            let set = crate::comments::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Comments { sheet, set });
         }
         if kind == 16 {
             let sheet = r.u16()?;
@@ -519,6 +535,12 @@ impl Op<Workbook> for GridOp {
                 Ok(old) => GridOp::RenameSheet { sheet, name: old },
                 Err(_) => GridOp::Batch(Vec::new()),
             },
+            GridOp::Comments { sheet, set } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::Comments { sheet, set: wb.set_comments(sheet, set) }
+            }
             GridOp::Merges { sheet, list } => {
                 if sheet as usize >= wb.sheet_count() {
                     return GridOp::Batch(Vec::new());

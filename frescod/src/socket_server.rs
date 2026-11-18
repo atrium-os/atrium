@@ -110,10 +110,9 @@ pub fn spawn(shared: Shared, sock_path: &Path, wm_sock_path: Option<&Path>)
 fn start_listener(sock_path: &Path, shared: Shared, event_subs: EventSubs, wm_grant: bool)
     -> io::Result<()>
 {
-    if sock_path.exists() {
-        let _ = std::fs::remove_file(sock_path);
-    }
-    let listener = UnixListener::bind(sock_path)?;
+    /* The supervisor's socket when it bound one for this path (fast-boot.md
+     * §5; already 0666), else a fresh bind. */
+    let (listener, origin) = atrium_listen::listener(sock_path)?;
     /* 0666 so the (non-root, per-app uid) apps that reach this socket can connect
      * — same pattern as portcullisd's control socket. Reachability IS the
      * capability gate: only an app holding `graphics` gets this socket's
@@ -122,7 +121,7 @@ fn start_listener(sock_path: &Path, shared: Shared, event_subs: EventSubs, wm_gr
      * file mode, is the boundary. Every app has its own dynamic uid and they all
      * share one frescod, so the socket must be multi-uid-connectable. Without
      * this a jailed app at uid 50000 gets EACCES on a root-owned 0755 socket. */
-    {
+    if origin == atrium_listen::Origin::Bound {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o666));
     }

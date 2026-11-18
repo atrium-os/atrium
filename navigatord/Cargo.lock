@@ -265,6 +265,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-open"
 version = "0.1.0"
 dependencies = [
@@ -2221,6 +2228,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",

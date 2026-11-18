@@ -92,6 +92,8 @@ pub struct CellView {
     /// Steps the text is indented from the left (a pivot's inner items), each
     /// [`INDENT_STEP`] px.
     pub indent: u8,
+    /// The cell has a comment: a small triangle in its top-right corner.
+    pub note: bool,
 }
 
 /// One step of a cell's indent, px.
@@ -250,7 +252,7 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0 }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -1033,6 +1035,10 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
             draw_icon(ctx, icon, c, t.border_default(), cx + 3.0 + lead, cy + q(((ch - s) / 2.0) as f64), s);
             lead += s + 3.0;
         }
+    }
+    if cv.note && cw > 10.0 && ch > 8.0 {
+        let (x1, y0) = (cx + cw - 1.0, cy);
+        ctx.add(poly(&[(x1 - 6.0, y0), (x1, y0), (x1, y0 + 6.0)], Color::rgba(0.84, 0.18, 0.15, 1.0), None));
     }
     if cv.text.is_empty() {
         return;

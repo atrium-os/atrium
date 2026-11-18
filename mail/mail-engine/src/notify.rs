@@ -10,7 +10,11 @@
 //! - more than [`BURST`] within [`BURST_SECS`] is one grouped post;
 //! - a first sync (an inbox that was empty) never notifies;
 //! - a message read elsewhere since is withdrawn;
-//! - Later: once a day after [`REVIEW_HOUR`], "3 due today, 2 overdue".
+//! - Later: once a day after [`REVIEW_HOUR`], "3 due today, 2 overdue",
+//!   naming every item a week overdue or pushed back three times, every
+//!   day until it is answered; and, when the weekly look is on, once on
+//!   Friday after [`WEEKLY_HOUR`]: what is due next week and who has been
+//!   waited on for more than a week.
 //!
 //! - Settings ([`crate::prefs`]): notifications off (only withdrawals),
 //!   VIPs always one by one, and quiet hours: what arrives inside them is
@@ -32,6 +36,10 @@ pub const BURST: usize = 2;
 pub const BURST_SECS: i64 = 30;
 /// The daily review's hour, local time.
 pub const REVIEW_HOUR: i64 = 9;
+/// The weekly look's hour on Friday, local time.
+pub const WEEKLY_HOUR: i64 = 15;
+/// Items named in a review, at most.
+const NAMED_MAX: usize = 3;
 const BODY_MAX: usize = 2048;
 const SCAN_MAX: usize = 5000;
 
@@ -47,6 +55,8 @@ pub enum Post {
     Summary { title: String, body: String },
     /// The Later review.
     Review { title: String, body: String },
+    /// The weekly look (Friday afternoon).
+    Week { title: String, body: String },
     /// Take back the post made for this message (read elsewhere).
     Withdraw { msg: MsgId },
 }
@@ -75,6 +85,8 @@ pub struct Notifier {
     recent: VecDeque<i64>,
     /// The day (days since 1970) the review was posted.
     reviewed: Option<i64>,
+    /// The week (Monday's day since 1970) the weekly look was posted.
+    looked: Option<i64>,
     /// Arrivals held back during quiet hours, said when they end.
     quiet: Vec<Arrival>,
 }
@@ -125,6 +137,9 @@ impl Notifier {
                 self.had_mail.insert(*a, self.inbox_has_mail(e, *a));
             }
             self.review(e, now, offset, &mut out);
+            if prefs.weekly {
+                self.week(e, now, offset, &mut out);
+            }
             return out;
         }
         // Read elsewhere since: take it back.
@@ -215,6 +230,9 @@ impl Notifier {
             out.push(Post::Summary { title: "While you were away".into(), body });
         }
         self.review(e, now, offset, &mut out);
+        if prefs.weekly {
+            self.week(e, now, offset, &mut out);
+        }
         out
     }
 
@@ -238,7 +256,8 @@ impl Notifier {
         let end = (day + 1) * 86_400;
         let overdue = items.iter().filter(|(_, l)| l.due < day * 86_400 + REVIEW_HOUR * 3600 && !l.back).count() + items.iter().filter(|(_, l)| l.back).count();
         let today = items.iter().filter(|(_, l)| !l.back && l.due >= day * 86_400 + REVIEW_HOUR * 3600 && l.due < end).count();
-        if overdue + today == 0 {
+        let asking = e.later_asking(now - offset).unwrap_or_default();
+        if overdue + today == 0 && asking.is_empty() {
             return;
         }
         let mut parts = Vec::new();
@@ -248,8 +267,55 @@ impl Notifier {
         if overdue > 0 {
             parts.push(format!("{overdue} overdue"));
         }
-        out.push(Post::Review { title: "Later".into(), body: parts.join(", ") });
+        let mut body = parts.join(", ");
+        let stale: Vec<_> = asking.iter().filter(|a| a.2 == crate::later::Ask::Stale).map(|a| &a.1).collect();
+        let pushed: Vec<_> = asking.iter().filter(|a| a.2 == crate::later::Ask::Pushed).map(|a| &a.1).collect();
+        if !stale.is_empty() {
+            body += &format!("\nOver a week overdue: {}", subjects(e, &stale));
+        }
+        if !pushed.is_empty() {
+            body += &format!("\nPushed back {} times or more: {}", crate::later::PUSHED_ASK, subjects(e, &pushed));
+        }
+        out.push(Post::Review { title: "Later".into(), body: body.trim_start().into() });
     }
+
+    /// The weekly look (§11.4): once a week, on Friday after
+    /// [`WEEKLY_HOUR`] local time, when it is on.
+    fn week(&mut self, e: &Engine, now: i64, offset: i64, out: &mut Vec<Post>) {
+        let local = now + offset;
+        let day = local.div_euclid(86_400);
+        let weekday = (day + 3).rem_euclid(7);
+        let monday = day - weekday;
+        if weekday != 4 || local - day * 86_400 < WEEKLY_HOUR * 3600 || self.looked == Some(monday) {
+            return;
+        }
+        self.looked = Some(monday);
+        let Ok((next, waiting)) = e.later_week(local, offset) else { return };
+        if next.is_empty() && waiting.is_empty() {
+            return;
+        }
+        let mut lines = Vec::new();
+        if !next.is_empty() {
+            lines.push(format!("{} due next week: {}", next.len(), subjects(e, &next.iter().map(|x| &x.1).collect::<Vec<_>>())));
+        }
+        if !waiting.is_empty() {
+            lines.push(format!("Waiting over a week: {}", subjects(e, &waiting.iter().map(|x| &x.1).collect::<Vec<_>>())));
+        }
+        out.push(Post::Week { title: "Later this week".into(), body: lines.join("\n") });
+    }
+}
+
+/// "Numbers for Q3, Lunch…": the first items' subjects (or notes).
+fn subjects(e: &Engine, items: &[&mail_store::later::Later]) -> String {
+    let mut s: Vec<String> = items.iter().take(NAMED_MAX).map(|l| {
+        let subj = e.store.message(l.msg).map(|m| m.summary.subject.trim().to_string()).unwrap_or_default();
+        let t = if !l.note.is_empty() { l.note.clone() } else if subj.is_empty() { "(no subject)".into() } else { subj };
+        if t.chars().count() > 40 { t.chars().take(39).collect::<String>() + "…" } else { t }
+    }).collect();
+    if items.len() > NAMED_MAX {
+        s.push(format!("{} more", items.len() - NAMED_MAX));
+    }
+    s.join(", ")
 }
 
 /// The new part of a message's text: quoted lines and the signature

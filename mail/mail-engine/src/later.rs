@@ -10,6 +10,53 @@ use mail_store::{flag, AccountId, MsgId, OpKind, Role, ThreadId};
 
 use crate::{now, Engine, Error};
 
+/// Overdue this many days, an item is asked about in every daily review
+/// until it is answered (§11.4).
+pub const ASK_DAYS: i64 = 7;
+/// Overdue this many days, an item moves to *Dropped* (with an undo).
+pub const DROP_DAYS: i64 = 30;
+/// Moved again this many times, the review asks: do it now, drop it, or
+/// make it someday.
+pub const PUSHED_ASK: u32 = 3;
+/// Dropped items are kept this long for an undo.
+pub const DROPPED_KEEP_DAYS: i64 = 90;
+/// A note is at most this long (one line).
+pub const NOTE_MAX: usize = 200;
+
+/// A note as kept: one line, at most [`NOTE_MAX`] bytes.
+pub fn clean_note(n: &str) -> String {
+    let one: String = n.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let mut one = one.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.len() > NOTE_MAX {
+        let mut cut = NOTE_MAX;
+        while !one.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        one.truncate(cut);
+    }
+    one
+}
+
+/// Why an item is asked about in the review, if it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// Overdue [`ASK_DAYS`] or more.
+    Stale,
+    /// Moved [`PUSHED_ASK`] times or more.
+    Pushed,
+}
+
+/// Whether the review asks about `l` at `now`.
+pub fn ask_of(l: &Later, now: i64) -> Option<Ask> {
+    if now - l.due >= ASK_DAYS * 86_400 {
+        Some(Ask::Stale)
+    } else if l.pushed >= PUSHED_ASK {
+        Some(Ask::Pushed)
+    } else {
+        None
+    }
+}
+
 /// When an item comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum When {
@@ -95,6 +142,8 @@ impl Engine {
     pub fn set_later(&self, msg: MsgId, k: u8, due: i64, note: &str) -> Result<u64, Error> {
         let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
         let t = m.thread;
+        let note = clean_note(note);
+        let note = note.as_str();
         let item = match self.store.later_of(t)? {
             Some((id, mut l)) => {
                 l.pushed += 1;
@@ -130,10 +179,113 @@ impl Engine {
         Ok(id)
     }
 
-    /// *Done* (or *Drop*): the item closes, its conversation is back where
-    /// it was, and the flag comes off.
+    /// *Done*: the item closes, its conversation is back where it was, and
+    /// the flag comes off.
     pub fn later_done(&self, id: u64) -> Result<(), Error> {
         let Some(l) = self.store.write(|w| w.close_later(id))? else { return Ok(()) };
+        self.unset_later(&l)
+    }
+
+    /// *Drop* (`x`) at `at`: closed like Done, but kept in *Dropped* where
+    /// [`Engine::later_undrop`] can bring it back.
+    pub fn later_drop(&self, id: u64, at: i64) -> Result<(), Error> {
+        let Some(l) = self.store.write(|w| w.drop_later(id, at))? else { return Ok(()) };
+        self.unset_later(&l)
+    }
+
+    /// Undo a drop: the item is open again, back in the inbox (its time
+    /// has passed) with its flag. False when the conversation has another
+    /// item by now, or the drop is gone.
+    pub fn later_undrop(&self, id: u64) -> Result<bool, Error> {
+        let Some(mut l) = self.store.write(|w| w.undrop_later(id))? else { return Ok(false) };
+        if !l.back {
+            l.back = true;
+            self.store.write(|w| w.put_later(Some(id), &l))?;
+        }
+        let msgs = self.store.thread(l.thread).unwrap_or_default();
+        if let Some((f, u)) = msgs.last().and_then(|x| x.message.locations.first().copied()) {
+            self.store.write(|w| {
+                if self.store.at(f, u)?.is_some_and(|(_, fl)| fl & flag::FLAGGED == 0) {
+                    match w.queue(f, u, OpKind::Flags { add: flag::FLAGGED, remove: 0 }, now()) {
+                        Ok(_) | Err(mail_store::Error::NotFound) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// *Do it now* (the review's answer to an item pushed back): it comes
+    /// back to the inbox at once, its time now.
+    pub fn later_now(&self, id: u64, at: i64) -> Result<(), Error> {
+        let Some(mut l) = self.later_items()?.into_iter().find(|(i, _)| *i == id).map(|x| x.1) else { return Ok(()) };
+        self.release_later(l.account, l.thread)?;
+        l.back = true;
+        l.due = l.due.min(at);
+        self.store.write(|w| w.put_later(Some(id), &l))?;
+        Ok(())
+    }
+
+    /// Items [`DROP_DAYS`] overdue move to *Dropped* (§11.4), and drops
+    /// older than [`DROPPED_KEEP_DAYS`] are forgotten. The ids dropped now.
+    pub fn later_drop_stale(&self, at: i64) -> Result<Vec<u64>, Error> {
+        let mut out = Vec::new();
+        for (id, l) in self.later_items()? {
+            if at - l.due < DROP_DAYS * 86_400 {
+                continue;
+            }
+            if let Some(l) = self.store.write(|w| w.drop_later(id, at))? {
+                self.unset_later(&l)?;
+                out.push(id);
+            }
+        }
+        self.store.write(|w| w.forget_dropped(at - DROPPED_KEEP_DAYS * 86_400))?;
+        Ok(out)
+    }
+
+    /// Dropped items, latest dropped first, with when.
+    pub fn later_dropped(&self) -> Result<Vec<(u64, Later, i64)>, Error> {
+        let mut out = Vec::new();
+        for (a, _) in self.store.accounts()? {
+            out.extend(self.store.later_dropped(a)?);
+        }
+        out.sort_by_key(|(id, _, at)| (std::cmp::Reverse(*at), std::cmp::Reverse(*id)));
+        Ok(out)
+    }
+
+    /// The dropped item on `msg`'s conversation, when it has no open one.
+    pub fn later_dropped_of(&self, msg: MsgId) -> Result<Option<(u64, Later, i64)>, Error> {
+        let m = self.store.message(msg).map_err(|_| Error::NotFound)?;
+        if self.store.later_of(m.thread)?.is_some() {
+            return Ok(None);
+        }
+        Ok(self.store.later_dropped_of(m.thread)?)
+    }
+
+    /// The items the daily review asks about (§11.4), oldest due first.
+    pub fn later_asking(&self, at: i64) -> Result<Vec<(u64, Later, Ask)>, Error> {
+        Ok(self.later_items()?.into_iter().filter_map(|(id, l)| ask_of(&l, at).map(|a| (id, l, a))).collect())
+    }
+
+    /// The weekly look (§11.4) from wall-clock `local` (`offset` east of
+    /// UTC): items due next week (Monday to Sunday) and *Waiting* items
+    /// set aside more than 7 days ago.
+    pub fn later_week(&self, local: i64, offset: i64) -> Result<(Vec<(u64, Later)>, Vec<(u64, Later)>), Error> {
+        let day = local.div_euclid(86_400);
+        let weekday = (day + 3).rem_euclid(7);
+        let from = (day - weekday + 7) * 86_400;
+        let to = from + 7 * 86_400;
+        let items = self.later_items()?;
+        let next = items.iter().filter(|(_, l)| !l.back && (from..to).contains(&(l.due + offset))).cloned().collect();
+        let waiting = items.into_iter().filter(|(_, l)| l.kind == kind::WAITING && local - offset - l.set_at > 7 * 86_400).collect();
+        Ok((next, waiting))
+    }
+
+    /// The item closed (done or dropped): its conversation is back where it
+    /// was, and the flag comes off.
+    fn unset_later(&self, l: &Later) -> Result<(), Error> {
         self.release_later(l.account, l.thread)?;
         let msgs = self.store.thread(l.thread).unwrap_or_default();
         self.store.write(|w| {

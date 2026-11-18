@@ -240,6 +240,8 @@ fn connect_trace(b: &scrinium::browser::Browser) -> String {
 /// From the limend thread to a picker's thread.
 enum ToPane {
     Open(Filter),
+    /// The asking app's persona (limen `ParentPersona`; `None`: Personal).
+    Persona(Option<String>),
     Failed(String),
     Close,
 }
@@ -288,6 +290,13 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
                         Mode::Picker { app, .. } => Mode::Picker { filter: f, app: app.clone() },
                         m => m.clone(),
                     };
+                    b.set_places(list);
+                });
+            }
+            Ok(ToPane::Persona(p)) => {
+                let list = places.lock().unwrap().list.clone();
+                with(&pane.state, |b| {
+                    b.persona = p.unwrap_or_else(|| "personal".into());
                     b.set_places(list);
                 });
             }
@@ -405,6 +414,12 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                     embeds.insert(embed, Embed { to_pane: ptx, parent_uid, write: false });
                     let (f, pl, t) = (fresco.clone(), places.clone(), tx.clone());
                     std::thread::spawn(move || picker_pane(embed, parent_app, f, pl, prx, t));
+                }
+                Some(ChildEvent::ParentPersona { embed, persona }) => {
+                    if let Some(e) = embeds.get(&embed) {
+                        eprintln!("scrinium: picker {embed} is for {}", persona.as_deref().unwrap_or("personal"));
+                        let _ = e.to_pane.send(ToPane::Persona(persona));
+                    }
                 }
                 Some(ChildEvent::Message { embed, bytes }) => {
                     if let (Some(e), Some(ToChild::Open(f))) = (embeds.get_mut(&embed), ToChild::decode(&bytes)) {
@@ -988,6 +1003,7 @@ fn main() {
     // The person's folders first, their workspaces, then the folders it was given.
     let mut configured = places::home();
     configured.extend(places::workspaces());
+    configured.extend(places::personas());
     configured.extend(places::configured());
     let shared: SharedPlaces = Arc::new(Mutex::new(Places { list: configured.clone(), gen: 1 }));
     let (ptx, prx) = mpsc::channel();

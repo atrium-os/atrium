@@ -50,6 +50,26 @@ pub struct Seal {
 }
 
 impl Place {
+    /// The named persona whose folder this is (`persona:<p>:<folder>`,
+    /// personas.md §4.1); the person's own folders are Personal's.
+    pub fn persona_folder(&self) -> Option<&str> {
+        let rest = self.id.strip_prefix("persona:")?;
+        rest.split_once(':').map(|(p, _)| p)
+    }
+
+    /// Whether a picker for an app in `persona` lists this place
+    /// (personas.md §4.1): Personal's folders only for Personal, a named
+    /// persona's only for it, a sealed stick only for its own persona.
+    pub fn for_picker(&self, persona: &str) -> bool {
+        if let Some(p) = self.persona_folder() {
+            return p == persona;
+        }
+        if self.id.starts_with("home:") {
+            return persona == "personal";
+        }
+        !self.stick || self.seal.persona.is_empty() || self.seal.persona == persona
+    }
+
     /// A place whose files can be listed in this window: not a Locked
     /// stick, nor another persona's (its own windows get it).
     pub fn browsable(&self, persona: &str) -> bool {
@@ -436,6 +456,11 @@ impl Browser {
     /// is looking at otherwise.
     pub fn set_places(&mut self, places: Vec<Place>) {
         let cur = self.place().map(|p| p.id.clone());
+        // A picker lists only the asking app's persona's places (§4.1).
+        let places = match &self.mode {
+            Mode::Picker { .. } => places.into_iter().filter(|p| p.for_picker(&self.persona)).collect(),
+            Mode::Manager => places,
+        };
         self.places = places;
         self.at = cur.as_ref().and_then(|id| self.places.iter().position(|p| &p.id == id));
         if self.at.is_none() {
@@ -1494,6 +1519,37 @@ mod tests {
         assert_eq!((b.place().unwrap().id.as_str(), b.path.len()), ("da1s1", 0));
         b.set_places(vec![]);
         assert!(b.place().is_none() && b.entries.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_picker_lists_only_its_apps_personas_folders() {
+        let d = std::env::temp_dir().join(format!("scrinium-personas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["home/Documents", "home/Downloads", "personas/work/Documents", "personas/work/Downloads", "personas/side-project/Documents", "personas/Bad/Documents"] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+        }
+        let mut all = crate::places::home_in(&d.join("home"));
+        let named = crate::places::personas_in(&d.join("personas"));
+        assert_eq!(named.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["persona:side-project:documents", "persona:work:documents", "persona:work:downloads"]);
+        all.extend(named);
+        let sealed = Place { id: "da1s1".into(), label: "stick".into(), root: d.clone(), stick: true, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Seal { persona: "work".into(), ..Default::default() } };
+        let plain = Place { id: "da2s1".into(), seal: Default::default(), ..sealed.clone() };
+        all.extend([sealed, plain]);
+        let ids = |b: &Browser| b.places.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        // The file manager spans the personas, labelled.
+        let mut m = Browser::new(Mode::Manager);
+        m.set_places(all.clone());
+        assert_eq!(m.places.len(), 7);
+        // A Personal app's picker: the person's own folders, no Work ones.
+        let mut b = picker(Filter::file());
+        b.set_places(all.clone());
+        assert_eq!(ids(&b), ["home:documents", "home:downloads", "da2s1"]);
+        // A Work app's: Work's folders, Work's stick and the neutral one.
+        let mut b = picker(Filter::file());
+        b.persona = "work".into();
+        b.set_places(all);
+        assert_eq!(ids(&b), ["persona:work:documents", "persona:work:downloads", "da1s1", "da2s1"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

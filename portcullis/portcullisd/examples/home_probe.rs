@@ -45,7 +45,23 @@ fn main() {
         let r = unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null(), 0) };
         if r == 0 { String::from_utf8_lossy(&buf[..len]).trim_end_matches('\0').to_string() } else { "?".into() }
     };
-    eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group} hostuuid={hostuuid}");
+    // The named personas' folders (personas.md §4.1), for the file manager.
+    let personas = match std::fs::read_dir("/atrium/personas") {
+        Ok(rd) => {
+            let mut v: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v.join(",")
+        }
+        Err(_) => "absent".into(),
+    };
+    let pmade = match personas.split(',').next().filter(|p| !p.is_empty() && *p != "absent") {
+        Some(p) => match std::fs::File::create(format!("/atrium/personas/{p}/Documents/probe.txt")).and_then(|mut f| f.write_all(b"from the file manager")) {
+            Ok(()) => "ok".to_string(),
+            Err(e) => format!("err({})", e.raw_os_error().unwrap_or(0)),
+        },
+        None => "-".into(),
+    };
+    eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group} personas=[{personas}] persona_made={pmade} hostuuid={hostuuid}");
     let me = std::env::args().next().unwrap_or_default();
     if me.ends_with("stay_probe") {
         let _ = std::fs::write("/var/console-mark", "stay-mark\n");

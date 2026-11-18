@@ -548,12 +548,9 @@ pub fn link_old(new: &std::path::Path, old: &std::path::Path) {
 /// caller, peer uid checked on connect. `focused(window)` answers from
 /// the compositor's focus.
 pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) -> bool + Send + Sync>, comp: Arc<Mutex<fresco_scene_server::window::Compositor>>) -> std::io::Result<()> {
-    use std::os::unix::net::UnixListener;
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-    let listener = UnixListener::bind(path)?;
-    {
+    // The supervisor's socket when it bound one (fast-boot.md §5), else ours.
+    let (listener, origin) = atrium_listen::listener(path)?;
+    if origin == atrium_listen::Origin::Bound {
         use std::os::unix::fs::PermissionsExt;
         // Reachability (Portcullis mounts the directory only into the
         // brokers' jails) and the peer uid below are the gate.

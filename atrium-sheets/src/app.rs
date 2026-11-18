@@ -243,13 +243,17 @@ pub struct Sheets {
     /// The tab colour bar is showing.
     pub coloring: Mutable<bool>,
     pub rename_text: Mutable<TextEdit>,
+    /// The comment bar: the cell it writes the comment of (sheet, row,
+    /// column), and its field (lines shown joined by ¶).
+    pub commenting: Mutable<Option<(u16, u32, u32)>>,
+    pub comment_text: Mutable<TextEdit>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -743,6 +747,42 @@ impl Sheets {
                 self.coloring.set(false);
                 self.changed();
             }
+            TabCmd::Commenting => {
+                let (r, c) = self.grid.get_cloned().cursor;
+                let (s, text) = {
+                    let d = self.doc.borrow();
+                    (d.sheet, d.wb.comment(d.sheet, r, c).map(|k| k.text.replace('\n', " ¶ ")).unwrap_or_default())
+                };
+                self.renaming.set(false);
+                self.coloring.set(false);
+                let mut ed = TextEdit::new(&text);
+                ed.set_caret(ed.text().len(), false);
+                self.comment_text.set(ed);
+                self.commenting.set(Some((s, r, c)));
+                self.changed();
+            }
+            TabCmd::CommentDone => {
+                let Some((s, r, c)) = self.commenting.get() else { return };
+                let text = from_bar(self.comment_text.get_cloned().text());
+                let mut d = self.doc.borrow_mut();
+                let old = d.wb.comment(s, r, c).cloned();
+                let new = (!text.is_empty()).then(|| officina_grid::comments::Comment::new(old.as_ref().map_or_else(comment_author, |k| k.author.to_string()).as_str(), &text));
+                if new.as_ref().map(|k| &k.text) != old.as_ref().map(|k| &k.text) {
+                    let label = match (&old, &new) {
+                        (None, _) => "New Comment",
+                        (_, None) => "Delete Comment",
+                        _ => "Edit Comment",
+                    };
+                    d.run(label, vec![officina_grid::ops::GridOp::Comments { sheet: s, set: vec![(r, c, new)] }]);
+                }
+                drop(d);
+                self.commenting.set(None);
+                self.changed();
+            }
+            TabCmd::CommentCancel => {
+                self.commenting.set(None);
+                self.changed();
+            }
         }
     }
 
@@ -765,6 +805,17 @@ impl Sheets {
             TextField::new(self.rename_text.clone()).autofocus(true).at(116.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::RenameDone))).render(ctx);
             Button::primary("Rename").at(124.0 + fw, y + 2.0).width(80.0).on_click(push(TabCmd::RenameDone)).render(ctx);
             Button::secondary("Cancel").at(212.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::RenameCancel)).render(ctx);
+            return;
+        }
+        if let Some((_, r, c)) = self.commenting.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            let label = format!("Comment on {}", officina_grid::addr::a1(r, c));
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 130.0, 18.0), content: label, style: st });
+            let fw = (w - 150.0 - 180.0).clamp(120.0, 640.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.comment_text.clone()).autofocus(true).at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
+            Button::primary("Save").at(154.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::CommentDone)).render(ctx);
+            Button::secondary("Cancel").at(234.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::CommentCancel)).render(ctx);
             return;
         }
         if self.coloring.get() {
@@ -967,7 +1018,8 @@ impl View for Sheets {
         let shown: String = contents.chars().take(400).collect();
         ctx.add(Node::Text { rect: Rect::new(124.0, y + 6.0, (w - 136.0).max(0.0), 20.0), content: shown, style: TextStyle { family: font::MONO.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() } });
 
-        // The grid.
+        // The grid, with the cursor cell's comment beside it while not editing.
+        self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none()).then_some(g.cursor));
         let doc = self.doc.clone();
         let rev = self.rev.clone();
         let src = self.source.clone();
@@ -1432,6 +1484,10 @@ impl Sheets {
                     self.tab_cmd(crate::tabs::TabCmd::Coloring);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::Comment) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Commenting);
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::DeleteSheet) => {
                     self.tab_cmd(crate::tabs::TabCmd::Delete);
                     false
@@ -1574,6 +1630,17 @@ impl Sheets {
             })
             .collect()
     }
+}
+
+/// The comment bar's text as the comment's: " ¶ " back to line breaks,
+/// trimmed.
+fn from_bar(s: &str) -> String {
+    s.split('¶').map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+/// Who new comments are by: `$USER`, else "Me" (as Write writes them).
+fn comment_author() -> String {
+    std::env::var("USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "Me".into())
 }
 
 #[cfg(test)]
@@ -1832,6 +1899,49 @@ mod tests {
             assert!(s.doc.borrow_mut().undo());
         }
         assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn comments_are_written_shown_beside_the_cell_edited_and_deleted() {
+        use crate::tabs::TabCmd;
+        let (mut d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
+        d.wb.recalc();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        let mut g = grid.get_cloned();
+        g.select(1, 1);
+        grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::Comment));
+        assert_eq!(s.commenting.get(), Some((0, 1, 1)));
+        assert!(texts().iter().any(|t| t == "Comment on B2"));
+        s.comment_text.set(TextEdit::new("Too high ¶ check March"));
+        run(Cmd::Tab(TabCmd::CommentDone));
+        assert!(s.commenting.get().is_none());
+        let k = s.doc.borrow().wb.comment(0, 1, 1).cloned().unwrap();
+        assert_eq!(&*k.text, "Too high\ncheck March");
+        assert!(!k.author.is_empty());
+        // With the cursor on it, the comment shows beside the cell.
+        let shown = texts();
+        assert!(shown.iter().any(|t| t == "Too high") && shown.iter().any(|t| t == "check March"), "{shown:?}");
+        // Editing keeps the author; emptying the text deletes it; undo brings it back.
+        run(Cmd::Data(crate::data::DataCmd::Comment));
+        assert_eq!(s.comment_text.get_cloned().text(), "Too high ¶ check March");
+        s.comment_text.set(TextEdit::new(""));
+        run(Cmd::Tab(TabCmd::CommentDone));
+        assert!(s.doc.borrow().wb.comment(0, 1, 1).is_none());
+        assert!(s.doc.borrow_mut().undo());
+        assert!(s.doc.borrow().wb.comment(0, 1, 1).is_some());
+        run(Cmd::Data(crate::data::DataCmd::DeleteComments));
+        assert!(s.doc.borrow().wb.comment(0, 1, 1).is_none());
+        assert_eq!(s.doc.borrow().status, "Comment deleted.");
     }
 
     #[test]

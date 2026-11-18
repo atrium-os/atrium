@@ -12,6 +12,10 @@ pub(crate) const LATER: TableDefinition<u64, &[u8]> = TableDefinition::new("late
 /// thread → its open item.
 pub(crate) const LATER_BY_THREAD: TableDefinition<u64, u64> = TableDefinition::new("later_by_thread");
 
+/// id → ([`Later`], when it was dropped): items dropped by hand or after
+/// 30 days overdue (§11.4), kept so a drop can be undone.
+pub(crate) const LATER_DROPPED: TableDefinition<u64, &[u8]> = TableDefinition::new("later_dropped");
+
 /// Message-ID (without `<>`) → (account, when): a follow-up asked for on
 /// send, waiting for the sent copy to arrive in Sent (§9, §11.4).
 pub(crate) const FOLLOW_UPS: TableDefinition<&str, (u32, i64)> = TableDefinition::new("follow_ups");
@@ -69,6 +73,39 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Dropped items of `account`, latest dropped first, with when.
+    pub fn later_dropped(&self, account: AccountId) -> Result<Vec<(u64, Later, i64)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LATER_DROPPED)?;
+        let mut out = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let (l, at): (Later, i64) = dec(v.value())?;
+            if l.account == account {
+                out.push((k.value(), l, at));
+            }
+        }
+        out.sort_by_key(|(id, _, at)| (std::cmp::Reverse(*at), std::cmp::Reverse(*id)));
+        Ok(out)
+    }
+
+    /// The dropped item on a conversation, the latest when several.
+    pub fn later_dropped_of(&self, thread: ThreadId) -> Result<Option<(u64, Later, i64)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(LATER_DROPPED)?;
+        let mut best: Option<(u64, Later, i64)> = None;
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let (l, at): (Later, i64) = dec(v.value())?;
+            if l.thread == thread && best.as_ref().is_none_or(|b| (at, k.value()) > (b.2, b.0)) {
+                best = Some((k.value(), l, at));
+            }
+        }
+        Ok(best)
+    }
+}
+
 impl Writer<'_> {
     /// Keep `item` (new when `id` is None); its id.
     pub fn put_later(&mut self, id: Option<u64>, item: &Later) -> Result<u64> {
@@ -90,6 +127,42 @@ impl Writer<'_> {
     /// The follow-up asked for on `message_id`, taken.
     pub fn take_follow_up(&mut self, message_id: &str) -> Result<Option<(AccountId, i64)>> {
         Ok(self.tx.open_table(FOLLOW_UPS)?.remove(message_id.trim_matches(['<', '>']))?.map(|v| v.value()))
+    }
+
+    /// Drop an open item at `at`: it closes, kept aside for an undo.
+    pub fn drop_later(&mut self, id: u64, at: i64) -> Result<Option<Later>> {
+        let Some(l) = self.close_later(id)? else { return Ok(None) };
+        self.tx.open_table(LATER_DROPPED)?.insert(id, enc(&(&l, at)).as_slice())?;
+        Ok(Some(l))
+    }
+
+    /// Undo a drop: the item is open again, unless its conversation has
+    /// another open item by now (then it stays dropped: None).
+    pub fn undrop_later(&mut self, id: u64) -> Result<Option<Later>> {
+        let Some((l, _)) = self.tx.open_table(LATER_DROPPED)?.get(id)?.map(|v| dec::<(Later, i64)>(v.value())).transpose()? else { return Ok(None) };
+        if self.tx.open_table(LATER_BY_THREAD)?.get(l.thread)?.is_some() {
+            return Ok(None);
+        }
+        self.tx.open_table(LATER_DROPPED)?.remove(id)?;
+        self.put_later(Some(id), &l)?;
+        Ok(Some(l))
+    }
+
+    /// Forget dropped items dropped before `before`; how many.
+    pub fn forget_dropped(&mut self, before: i64) -> Result<usize> {
+        let mut t = self.tx.open_table(LATER_DROPPED)?;
+        let mut old = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            let (_, at): (Later, i64) = dec(v.value())?;
+            if at < before {
+                old.push(k.value());
+            }
+        }
+        for k in &old {
+            t.remove(*k)?;
+        }
+        Ok(old.len())
     }
 
     /// Close an item (done, dropped, or closed by a reply).

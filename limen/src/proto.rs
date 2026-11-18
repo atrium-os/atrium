@@ -179,4 +179,10 @@ pub enum ChildEvent {
     AudioTicket { embed: EmbedId, ticket: [u8; 16] },
     /// PiP began or ended (also when another embed's PiP replaced this one).
     Pip { embed: EmbedId, on: bool },
+    /// Right after `Attach`, for a role that keeps personas apart
+    /// ([`crate::catalogue::PERSONA_ROLES`], the picker): the persona the
+    /// parent runs in, from the launch registry by its uid (`None`:
+    /// Personal). Personas.md §4.1: a Work app's picker shows Work's
+    /// folders. Added 2026-11-18 at the end of the enum.
+    ParentPersona { embed: EmbedId, persona: Option<String> },
 }

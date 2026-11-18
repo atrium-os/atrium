@@ -46,6 +46,11 @@ fn main() -> std::io::Result<()> {
         .split(',')
         .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
         .collect();
+    let reg_path = registry.clone();
+    let persona_of: limen::daemon::PersonaOf = Box::new(move |uid: u32| {
+        let reg = portcullis_peer::AppRegistry::load(&reg_path).ok()?;
+        reg.persona(uid).flatten().map(String::from)
+    });
     let resolve = Box::new(move |uid: u32| {
         let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
         reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string()))
@@ -63,6 +68,8 @@ fn main() -> std::io::Result<()> {
     // arca-ui, the credential provider, is a system service (`_arca-ui`),
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
+    // The picker is told its parent's persona (personas.md §4.1).
+    shared.set_persona_lookup(persona_of);
     // The share sheet is a system service (`_share`), not a registry app;
     // it may choose only installed share targets for the parent's person.
     let share_uid: u32 = std::env::var("LIMEN_SHARE_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(65045);
