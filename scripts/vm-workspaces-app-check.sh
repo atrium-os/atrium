@@ -76,6 +76,12 @@ V "su -m alice -c 'portcullis policy grant $STAY; portcullis policy grant $SYS' 
 for a in $LAUNCHER $TERM_ID $WS_ID; do V "su -m alice -c 'portcullis policy grant $a' >/dev/null 2>&1; portcullis policy grant --system $a >/dev/null 2>&1"; done
 
 echo "=== frescod"
+# The system fonts frescod opens (the UI's sans and icons), as the other
+# app gates install them.
+V "mkdir -p /usr/local/share/fonts/ibm-plex"
+for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
+    V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
+done
 V "mkdir -p /atrium/sockets/fresco; cd $B && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$B/screen FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=$B/wm.sock \
    FRESCOD_INPUT_SOCK=$B/inject.sock FRESCOD_ACTIVATION_SOCK=$B/activation.sock FRESCOD_SLOT_UIDS=0 FRESCOD_DEV_CAPS=all \
    FRESCOD_INJECT_ACTIVATION=1 FRESCOD_ACTIVATION_UIDS=0 \
@@ -140,7 +146,7 @@ press 130 560
 shot new-1
 press 400 104
 typ "web"
-press 457 284          # Network: None
+press 566 284          # Network: None
 shot new-2
 press 372 340          # Create and open
 waitfor "row web" "web" 60 && ok "web is made" || bad "no web: $(L)"
@@ -164,27 +170,33 @@ press 330 270
 waitfor "row scratch | cut -f5" "^uses=$" 30 && ok "and stops using it" || bad "uses: $(row scratch)"
 
 echo "=== network"
-press 457 182
+press 566 182          # Network: None
 waitfor "row scratch | cut -f4" "none" 30 && ok "Scratch: None" || bad "network: $(row scratch)"
 press 347 182
 waitfor "row scratch | cut -f4" "outbound" 30 && ok "Scratch: Outbound again" || bad "network: $(row scratch)"
-# Registries (dev-tools.md §5.2): the proxy's host list, edited in place.
-# Layout: the network row's top is 166; the list starts at y 228, a row
-# every 26 (8 default hosts); the field and Add sit below it.
-press 402 182          # Network: Registries
+# Registries (dev-tools.md §5.2): the proxy's host list, on its own page.
+# Layout: the network row's top is 166; below it a summary line with "Edit
+# hosts…" (centre 592,208). On the page the list starts at y 228 in two
+# columns, a row every 26 (Remove at x 492-572 in the first); the field
+# (top 228 + 26 * rows + 8), Add and "Use the defaults" sit below it, and
+# Done 78 below those.
+press 457 182          # Network: Registries
 waitfor "row scratch | cut -f4" "registries" 30 && ok "Scratch: Registries" || bad "network: $(row scratch)"
 check "the default hosts listed" "8 (default)" "$(row scratch | cut -f8 | sed 's/^hosts=//' | awk -F' ' '{n=split($1,a,","); print n, $2}')"
 shot registries-1
-press 407 452          # the host field
+press 592 208          # Edit hosts…
+press 407 356          # the host field (4 rows)
 typ "proxy.golang.org"
-press 572 452          # Add
+press 572 356          # Add
 waitfor "row scratch | cut -f8" "proxy.golang.org" 30 && ok "a host added" || bad "hosts: $(row scratch | cut -f8)"
 check "the list is its own now" "9" "$(row scratch | cut -f8 | sed 's/^hosts=//' | awk -F, '{print NF}')"
 shot registries-2
-press 572 232          # Remove crates.io
+press 532 232          # Remove crates.io
 waitfor "row scratch | cut -f8 | grep -c 'hosts=crates.io,' || true" "^0$" 30 && ok "a host removed" || bad "hosts: $(row scratch | cut -f8)"
-press 697 452          # Use the defaults
+press 697 356          # Use the defaults (4 rows again)
 waitfor "row scratch | cut -f8" "(default)" 30 && ok "back to the defaults" || bad "hosts: $(row scratch | cut -f8)"
+press 347 434          # Done
+shot registries-3
 press 347 182
 waitfor "row scratch | cut -f4" "outbound" 30 && ok "Scratch: Outbound once more" || bad "network: $(row scratch)"
 
