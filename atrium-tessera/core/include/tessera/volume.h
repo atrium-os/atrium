@@ -109,6 +109,12 @@ struct tessera_seal_keys;
 int tessera_volume_format_sealed(const tessera_block_io_t *io,
                                  const tessera_format_opts_t *opts,
                                  const struct tessera_seal_keys *seal);
+/* The same, with a recovery slot (tessera-encryption.md §7.4: type 3,
+ * Argon2id, the volume key wrapped by arcad) in key_slots[0]. */
+int tessera_volume_format_sealed_recovery(const tessera_block_io_t *io,
+                                          const tessera_format_opts_t *opts,
+                                          const struct tessera_seal_keys *seal,
+                                          const uint8_t recovery_slot[256]);
 int tessera_volume_open_sealed(const tessera_block_io_t *io,
                                const struct tessera_seal_keys *seal,
                                tessera_volume_t **out);

@@ -872,8 +872,9 @@ driver and no rule`, gone from the list when unplugged; a user with no
 session refused: **0 failed** 2026-11-14. The run also showed one real
 unclaimed device, QEMU's fw_cfg (`acpi0:\_SB_.PCI0.FWCF`).
 
-Not yet: Curia itself (its Devices page reads this), and the Opifex
-catalog lookup for a `nobody` device (§4.7, point 2).
+Not yet: Curia itself (its Devices page reads this). The Opifex
+catalog lookup for a `nobody` device (§4.7, point 2) is built (opifex.md §14.7):
+dispensatord reads opifexd's `devices.idx` and posts one notice.
 
 **Mount options (2026-11-14).** jaild's fusefs mounts are `nosuid,noexec`
 with an explicit 30 s answer timeout (`timeout=30`): a stick server that

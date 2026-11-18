@@ -94,7 +94,7 @@ tessera_format_dev(struct thread *td, const struct tkey_format *f)
 	uint32_t suite;
 	int error, r;
 
-	if (f->flags != 0)
+	if ((f->flags & ~TKEY_FORMAT_RECOVERY) != 0)
 		return (EINVAL);
 	suite = f->suite != 0 ? f->suite : TESSERA_SUITE_XAES_256_GCM;
 	if (tessera_crypt_backend() == NULL)
@@ -144,7 +144,9 @@ tessera_format_dev(struct thread *td, const struct tkey_format *f)
 	io.read_block = fmt_read;
 	io.write_block = fmt_write;
 	io.ctx = &d;
-	r = tessera_volume_format_sealed(&io, &o, k);
+	r = (f->flags & TKEY_FORMAT_RECOVERY) != 0
+	    ? tessera_volume_format_sealed_recovery(&io, &o, k, f->recovery_slot)
+	    : tessera_volume_format_sealed(&io, &o, k);
 	if (r != TESSERA_OK) {
 		printf("tessera_fs: format of a sealed volume failed (%d)\n", r);
 		error = (r == TESSERA_EINVAL) ? EINVAL : EIO;

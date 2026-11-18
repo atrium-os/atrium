@@ -273,12 +273,13 @@ fn links() -> mpsc::Receiver<String> {
         };
         loop {
             match ch.recv_any(None) {
-                Ok(Some(atrium_open::Message::Link(url))) if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
+                // From another persona too: a draft holds nothing of either.
+                Ok(Some(atrium_open::Message::Link(url) | atrium_open::Message::Crossed { url, .. })) if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
                     if tx.send(url).is_err() {
                         return;
                     }
                 }
-                Ok(Some(atrium_open::Message::Link(_))) => eprintln!("atrium-mail: a link refused: not a mailto: link"),
+                Ok(Some(atrium_open::Message::Link(_) | atrium_open::Message::Crossed { .. })) => eprintln!("atrium-mail: a link refused: not a mailto: link"),
                 Ok(Some(atrium_open::Message::File(_))) => eprintln!("atrium-mail: a file on the document channel: Mail opens none"),
                 Ok(None) => {}
                 Err(e) => {

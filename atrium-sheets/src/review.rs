@@ -64,8 +64,8 @@ impl ReviewPane {
 /// can't be taken (a sheet added or removed).
 pub fn take(d: &mut Doc, theirs: &Workbook, ch: &Change) -> bool {
     match compare::take(&d.wb, theirs, ch) {
-        Some(op) => {
-            d.run(if ch.whole_sheet() { "Take Sheet" } else { "Take Change" }, vec![op]);
+        Some(ops) => {
+            d.run(if ch.is_rows() { "Take Rows" } else { "Take Change" }, ops);
             true
         }
         None => false,
@@ -75,7 +75,7 @@ pub fn take(d: &mut Doc, theirs: &Workbook, ch: &Change) -> bool {
 /// Takes every change that can be taken as one undo step: a sheet with rows
 /// added or removed whole, other sheets cell by cell. The number taken.
 pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change]) -> usize {
-    let whole: Vec<u16> = changes.iter().filter(|c| c.whole_sheet()).filter_map(Change::sheet).collect();
+    let whole: Vec<u16> = changes.iter().filter(|c| c.is_rows()).filter_map(Change::sheet).collect();
     let mut ops = Vec::new();
     let mut n = 0;
     let mut done: Vec<u16> = Vec::new();
@@ -89,8 +89,8 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change]) -> usize {
                 }
             }
             n += 1;
-        } else if let Some(op) = compare::take(&d.wb, theirs, ch) {
-            ops.push(op);
+        } else if let Some(more) = compare::take(&d.wb, theirs, ch) {
+            ops.extend(more);
             n += 1;
         }
     }

@@ -253,8 +253,11 @@ pub enum Event {
     PressRefused { why: String },
     /// A link another app opened in the Navigator (opening-links.md §5),
     /// as navigatord took it from its document channel: a web address.
-    /// The UI opens it in a trail of its own.
-    Incoming { url: String },
+    /// The UI opens it in a trail of its own. `from`: the person sent it
+    /// here from another of their personas (its name, `personal` for
+    /// Personal); a named persona's window opens it anonymous
+    /// (personas.md §6).
+    Incoming { url: String, from: Option<String> },
     /// A hand-off was passed to its handler, or why not.
     Handed { url: String, ok: bool, why: Option<String> },
     /// `SignOut` done: how many session cookies ended, or why not.

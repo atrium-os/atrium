@@ -596,6 +596,23 @@ g "grep -q 'a https link crosses from Work to Personal for navtest, by the perso
 g "grep -q 'a https link from org.atrium.navigator opened in org.atrium.navigator for navtest' $PL" && ok "…into the Personal Navigator" || bad "where: $(g "grep -h 'link from org.atrium.navigator' $PL | tail -2" | tr '\n' ';')"
 until_trace "trails=$((${PT0:-0} + 1)) .*url=https://atlas.example/wiki/Impluvium live=shown" && ok "…which opened it in a trail of its own" || bad "Personal: $(last)"
 shot confined-8-crossed
+# Into Work (personas.md §6): with navtest's switch from Personal to Work,
+# Open with… in the Personal window sends the page to the Work Navigator,
+# which opens it in a new trail where no site knows you.
+g "printf '\n[[crossings]]\nfrom = \"personal\"\nto = \"work\"\nkinds = [\"links\"]\n' >> /var/db/atrium/navtest/policy.toml
+   su -m navtest -c '/usr/local/bin/portcullis daemon reload' >/dev/null"
+S0=$(sheets)
+press $((W - 26)) $((TOP + 20))
+i=0; while [ $i -lt 60 ] && [ "$(sheets)" = "$S0" ]; do sleep 3; i=$((i+3)); done
+sleep 3
+key 0x51; key 0x28        # In: Work
+key 0x52; key 0x28        # Navigator
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'crosses from Personal to Work' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'a https link crosses from Personal to Work for navtest' $PL" && ok "with that switch on, the link crossed from Personal into Work" || bad "into Work: $(g "tail -2 $ML; grep -h cross $PL | tail -2" | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'a link sent from personal' $WL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'navigator-ui: a link sent from personal: a new trail, anonymous' $WL" && ok "…and the Work window opened it in a new trail, anonymous" || bad "Work anonymous: $(g "grep -h -e 'sent from' -e 'link from' $WL | tail -2" | tr '\n' ';')"
+sleep 5
+shot confined-9-into-work
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"

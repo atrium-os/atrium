@@ -567,7 +567,21 @@ Personal:
 - **arcad sees dispensatord by uid**, and dispensatord is root, which arcad serves no
   one as; its arcad calls run in a child as `_dispensator-vk` (65043), named
   `dispensatord` in `ARCA_SERVICES`.
-- **Not yet:** recovery codes (§7.4), opening an older copy read-only after
+- **Recovery codes (§7.4):** `FORMAT { recovery: true }` (`--format … --recovery`).
+  arcad `VK_RECOVERY` 0xB5 makes the code (128 bits and a 22-bit checksum, Crockford
+  base 32, `XXXXX-` × 6) and a type-3 slot: Argon2id at arcad's cost (kept in the
+  slot) over the code's 16 bytes, then XChaCha20-Poly1305 over the key, bound to the
+  uuid and key id. `TKEY_FORMAT_RECOVERY` has the kernel write the slot in
+  `key_slots[0]` under the HMAC. The code comes back in the format reply, once; it
+  passes through dispensatord, never on a command line. A Locked stick with a slot is
+  listed `recovery`; media op `ADOPT { part, persona, keep, code }` (0x0B) has arcad
+  `VK_ADOPT` 0xB6 unwrap the key and keep it in the persona (or load it for this
+  session only), then the kernel mounts it. The AEAD tag stands in for comparing
+  `check`: a wrong code fails the unwrap, and the kernel still checks the key against
+  the volume. Still to come: the Arca credential field the code is typed into
+  (arca.md §8.3; for now the client sends it), removing a code later, and Curia's
+  wording.
+- **Not yet:** opening an older copy read-only after
   verification (§8), grants of a trusted stick's folders into app jails (the FUSE
   server's control socket does that for FAT; a trusted stick has no server), and
   Scrinium's and Forum's Locked display and "Make this a Work stick".

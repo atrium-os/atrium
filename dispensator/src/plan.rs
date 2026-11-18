@@ -40,6 +40,9 @@ pub enum Op {
     /// had time to make its partitions (a second or two).
     Settle { disk: String },
     Log(String),
+    /// Nobody drives `device`, and the synced catalog has `package` for it
+    /// (device-assignment §4.7.2): say so to the person.
+    DriverAvailable { device: String, label: String, package: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +68,8 @@ pub struct Planner {
     /// Why a device present has no owner (or a rule that matches did not
     /// take it), by the same key as `owned`: the Devices list's "why".
     why: BTreeMap<String, String>,
+    /// opifexd's devices.idx, looked up for a device nobody drives.
+    catalog: Option<std::path::PathBuf>,
 }
 
 /// A USB interface's attach or nomatch: `(ugen, bus, addr, interface, ids
@@ -176,7 +181,24 @@ fn vars(pairs: &[(&str, Option<String>)]) -> Vars {
 
 impl Planner {
     pub fn new(rules: Rules) -> Self {
-        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default(), whole: Default::default(), parts: Default::default(), why: BTreeMap::new() }
+        Self { rules, hid: Classifier::default(), owned: BTreeMap::new(), registry: Registry::default(), whole: Default::default(), parts: Default::default(), why: BTreeMap::new(), catalog: None }
+    }
+
+    /// Look devices nobody drives up in this devices.idx.
+    pub fn with_catalog(mut self, idx: std::path::PathBuf) -> Self {
+        self.catalog = Some(idx);
+        self
+    }
+
+    /// The catalog's driver for a device nobody drives: an op saying so,
+    /// and the Devices list's "why" naming it.
+    fn offer(&mut self, device: &str, label: &str, usb: Option<((u16, u16), [u8; 3])>, pages: &[u16]) -> Option<Op> {
+        let idx = std::fs::read_to_string(self.catalog.as_ref()?).ok()?;
+        let package = crate::catalog::lookup(&idx, usb, pages).into_iter().next()?;
+        if let Some(w) = self.why.get_mut(device) {
+            w.push_str(&format!("; the catalog has {package}"));
+        }
+        Some(Op::DriverAvailable { device: device.into(), label: label.into(), package })
     }
 
     pub fn rules(&self) -> &Rules {
@@ -263,7 +285,12 @@ impl Planner {
             if kernel.is_none() {
                 self.why.insert(device.clone(), "no driver and no rule".into());
             }
-            return kernel.is_none().then(|| vec![Op::Log(format!("{device} ({label}): no driver and no rule; shown to nobody"))]);
+            if kernel.is_some() {
+                return None;
+            }
+            let mut out = vec![Op::Log(format!("{device} ({label}): no driver and no rule; shown to nobody"))];
+            out.extend(self.offer(&device, &label, Some(((i.vendor, i.product), [i.class, i.subclass, i.protocol])), &[]));
+            return Some(out);
         };
         if let (Some(k), false) = (kernel, rule.detach_kernel) {
             self.why.insert(device.clone(), format!("matches rule {}, but the rule does not take it from {k}", rule.name));
@@ -395,6 +422,9 @@ impl Planner {
                 let why = if pages.is_none() { "no collections reported" } else { "no rule matches" };
                 self.why.insert(device.clone(), why.into());
                 out.push(Op::Log(format!("{device} ({label}): {why}; shown to nobody")));
+                if let Some(p) = pages.as_deref() {
+                    out.extend(self.offer(&device, &label, None, p));
+                }
                 out
             }
         }
@@ -932,6 +962,24 @@ sysfil        = "device"
         assert_eq!(p.line(&usb_line("?", 8, "1050:0407", "0b/00/00").replace("ugen=ugen0.8", "ugen=ugenx")), vec![]);
         // A bare-ugen notify for a device never seen ends nothing.
         assert_eq!(p.line(&gone(9)), vec![]);
+    }
+
+    #[test]
+    fn a_driver_in_the_catalog() {
+        let d = std::env::temp_dir().join(format!("dispensator-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let idx = d.join("devices.idx");
+        std::fs::write(&idx, "# opifex devices 1\nusb-id\tdead:beef\torg.atrium.driver.beef\n").unwrap();
+        let mut p = Planner::new(shipped()).with_catalog(idx);
+        p.devinfo("nexus0\n  pci0\n    xhci0 <XHCI>\n      usbus0\n        uhub0 <Root hub>\n");
+        let ops = p.line(&usb_line("?", 7, "dead:beef", "ff/00/00"));
+        assert!(matches!(&ops[..], [Op::Log(_), Op::DriverAvailable { device, package, .. }]
+                         if device == "ugen0.7:0" && package == "org.atrium.driver.beef"), "{ops:?}");
+        // Something the catalog has nothing for: the log only.
+        assert!(matches!(&p.line(&usb_line("?", 8, "1234:5678", "ff/00/00"))[..], [Op::Log(_)]));
+        let inv = p.inventory(|_, _| false);
+        let beef = inv.iter().find(|x| x.name == "ugen0.7:0").unwrap();
+        assert_eq!(beef.owner, atrium_devices::Owner::Nobody { why: "no driver and no rule; the catalog has org.atrium.driver.beef".into() });
     }
 
     #[test]

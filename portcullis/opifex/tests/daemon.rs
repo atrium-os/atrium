@@ -33,7 +33,7 @@ fn world(tag: &str) -> W {
         "schema = \"{}\"\nname = \"Atrium\"\nversion = 1\nexpires = 4000000000\nthreshold = 1\n\n\
          [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n\
          [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"catalog\"]\n\n\
-         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\"]\n",
+         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\", \"font\", \"layer\", \"driver\", \"firmware\"]\n",
         oc::ROOT_SCHEMA, r1.pk, r2.pk, cat.pk, plat.pk);
     fs::create_dir_all(d.join("cat")).unwrap();
     fs::write(d.join("cat/root.toml"), &text).unwrap();
@@ -44,7 +44,7 @@ fn world(tag: &str) -> W {
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
         fetch_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
         catalog_url: "https://example.org/cat/".into(),
-        praeco: None,
+        praeco: None, fonts: d.join("fonts"), system: d.join("sys"),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
     };
     W { d, plat, cat, daemon }
@@ -62,14 +62,19 @@ fn publish_m(w: &W, v: &str, body: &[u8], app_extra: &str, caps: &str) -> String
     fs::write(b.join("atrium.toml"), format!(
         "[app]\nid = \"{ID}\"\nname = \"Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\ndescription = \"Says hello\"\n{app_extra}\n[capabilities]\n{caps}")).unwrap();
     opifex::app::pack(&b, Some(&w.plat.sk)).unwrap();
-    let bytes = opifex::archive::pack(&b).unwrap();
+    publish_dir(w, &b, opifex_arch(), v)
+}
+
+/// Archive a packed, signed folder and publish it; returns the archive's sha.
+fn publish_dir(w: &W, b: &Path, arch: &str, v: &str) -> String {
+    let bytes = opifex::archive::pack(b).unwrap();
     let sha = oc::hex(&Sha256::digest(&bytes));
     fs::create_dir_all(w.daemon.downloads()).unwrap();
     fs::write(w.daemon.downloads().join(format!("{sha}.insula")), &bytes).unwrap();
     // The same archive "on the web", for the fetcher's --dir.
     fs::create_dir_all(w.d.join("web/example.org")).unwrap();
     fs::write(w.d.join(format!("web/example.org/{v}.insula")), &bytes).unwrap();
-    let e = oc::release_entry(&b, opifex_arch(), &sha, bytes.len() as u64,
+    let e = oc::release_entry(b, arch, &sha, bytes.len() as u64,
                               vec![format!("https://example.org/{v}.insula")], &w.plat.pk, 1_800_000_000).unwrap();
     let log = oc::Log::open(&w.d.join("cat"));
     log.append(&[e]).unwrap();
@@ -279,4 +284,146 @@ fn updates_and_the_daily_round() {
     assert_eq!(pending(&w)[0].action, Action::Background);
     // The daily round is root's.
     assert!(err(ask(&w, 1001, Request::Tick)).contains("administrator"));
+}
+
+const FONT: &str = "org.atrium.font.test-jp";
+
+fn font_package(w: &W, v: &str, tag: u8) -> PathBuf {
+    let t = w.d.join(format!("font{v}"));
+    let _ = fs::remove_dir_all(&t);
+    fs::create_dir_all(&t).unwrap();
+    for f in ["TestJP-Regular.ttf", "TestJP-Bold.ttf"] {
+        fs::write(t.join(f), [&[0u8, 1, 0, 0][..], &[tag; 60]].concat()).unwrap();
+    }
+    fs::write(t.join("OFL.txt"), "SIL Open Font License 1.1\n").unwrap();
+    let m = format!("kind = \"font\"\n[font]\nid = \"{FONT}\"\nname = \"Test JP\"\nversion = \"{v}\"\nlicense = \"OFL-1.1\"\n\
+                     description = \"Japanese, sans serif\"\nlanguages = [\"ja\"]\n\n\
+                     [[face]]\nfamily = \"Test Sans JP\"\nfile = \"TestJP-Regular.ttf\"\nweight = 400\nranges = \"3040-30FF,4E00-9FFF\"\n\n\
+                     [[face]]\nfamily = \"Test Sans JP\"\nfile = \"TestJP-Bold.ttf\"\nweight = 700\nranges = \"3040-30FF,4E00-9FFF\"\n");
+    opifex::font::pack(&t, &m, Some(&w.plat.sk)).unwrap();
+    t
+}
+
+fn layer_package(w: &W, v: &str) -> PathBuf {
+    let t = w.d.join(format!("layer{v}"));
+    let _ = fs::remove_dir_all(&t);
+    fs::create_dir_all(t.join("bin")).unwrap();
+    fs::write(t.join("bin/rustc"), elf(9)).unwrap();
+    let m = format!("kind = \"layer\"\n[layer]\nname = \"rust\"\nversion = \"{v}\"\narch = \"{}\"\nmount = \"/atrium/toolchains/rust\"\npath = [\"bin\"]\n",
+                    opifex_arch());
+    opifex::layer::pack(&t, &m, Some(&w.plat.sk)).unwrap();
+    t
+}
+
+#[test]
+fn fonts_and_layers_from_the_catalog() {
+    let w = world("kinds");
+    let f = font_package(&w, "1.0", 1);
+    publish_dir(&w, &f, "any", "f1.0");
+    let l = layer_package(&w, "1.100.0");
+    publish_dir(&w, &l, opifex_arch(), "l1.100.0");
+    assert!(matches!(sync(&w), Response::Synced { entries: 2, .. }));
+    assert_eq!(ask(&w, 1001, Request::Search { text: "japanese".into() }), Response::Found { ids: vec![FONT.into()] });
+
+    // A font: any person, through the sheet.
+    let sha = match ask(&w, 1001, Request::Describe { id: FONT.into() }) {
+        Response::Described { app } => {
+            assert_eq!((app.kind.as_str(), app.name.as_str(), app.description.as_str()), ("font", "Test JP", "Japanese, sans serif"));
+            assert!(app.capabilities.is_empty());
+            app.manifest_sha256
+        }
+        other => panic!("{other:?}"),
+    };
+    let approved = |id: &str, sha: &str| Request::InstallApproved { id: id.into(), manifest_sha256: sha.into(), for_uid: 1001 };
+    assert_eq!(ask(&w, 65042, approved(FONT, &sha)), Response::Done { id: FONT.into(), version: "1.0".into() });
+    let pins = fs::read_to_string(w.daemon.fonts.join("pins")).unwrap();
+    let faces = atrium_fonts::extra::parse(&pins);
+    assert_eq!(faces.len(), 2);
+    assert_eq!(faces[0].0.file, format!("{FONT}/TestJP-Regular.ttf"));
+    let rec = w.daemon.store().get(FONT).unwrap().unwrap();
+    assert_eq!((rec.kind.as_str(), rec.installed_by), ("font", 1001));
+    assert!(err(ask(&w, 0, Request::Rollback { id: FONT.into() })).contains("only apps"));
+
+    // Its update goes in on the daily round.
+    let f2 = font_package(&w, "1.1", 2);
+    publish_dir(&w, &f2, "any", "f1.1");
+    sync(&w);
+    match w.daemon.tick(false).unwrap() {
+        Response::Ticked { installed, waiting } => assert_eq!((installed, waiting), (vec![format!("{FONT} 1.1")], 0)),
+        other => panic!("{other:?}"),
+    }
+    assert_ne!(fs::read_to_string(w.daemon.fonts.join("pins")).unwrap(), pins);
+
+    // A layer: an administrator's.
+    let lsha = match ask(&w, 1001, Request::Describe { id: "rust".into() }) {
+        Response::Described { app } => { assert_eq!(app.kind, "layer"); app.manifest_sha256 }
+        other => panic!("{other:?}"),
+    };
+    assert!(err(ask(&w, 65042, approved("rust", &lsha))).contains("administrator"));
+    assert_eq!(ask(&w, 0, Request::Install { id: "rust".into() }), Response::Done { id: "rust".into(), version: "1.100.0".into() });
+    assert!(w.daemon.root.join("layers/rust@1.100.0/bin/rustc").is_file());
+    let l2 = layer_package(&w, "1.101.0");
+    publish_dir(&w, &l2, opifex_arch(), "l1.101.0");
+    sync(&w);
+    match ask(&w, 1001, Request::Updates) {
+        Response::Updates { items, .. } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].id.as_str(), items[0].action), ("rust", Action::Notify));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ask(&w, 0, Request::Install { id: "rust".into() }), Response::Done { id: "rust".into(), version: "1.101.0".into() });
+    // The version before stays for workspaces that name it.
+    assert!(w.daemon.root.join("layers/rust@1.100.0").is_dir());
+
+    // Removing.
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: FONT.into() }), Response::Done { .. }));
+    assert_eq!(fs::read_to_string(w.daemon.fonts.join("pins")).unwrap(), "# atrium-fonts pins 1\n");
+    assert!(!w.daemon.fonts.join(FONT).exists());
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: "rust".into() }), Response::Done { .. }));
+    assert!(!w.daemon.root.join("layers/rust@1.101.0").exists());
+}
+
+#[test]
+fn a_driver_with_its_firmware() {
+    let w = world("driver");
+    let drv = "org.atrium.driver.rtl";
+    let fw = w.d.join("fwpkg");
+    fs::create_dir_all(&fw).unwrap();
+    fs::write(fw.join("rtl8153a-4.fw"), b"blob").unwrap();
+    opifex::driver::pack_firmware(&fw, "kind = \"firmware\"\n[firmware]\nid = \"org.atrium.firmware.rtl\"\nname = \"RTL firmware\"\n\
+        version = \"1\"\nlicense = \"LicenseRef-Realtek\"\nplace = \"jailed\"\ndir = \"rtl8153\"\n", Some(&w.plat.sk)).unwrap();
+    publish_dir(&w, &fw, "any", "fw1");
+    let t = w.d.join("drvpkg");
+    fs::create_dir_all(&t).unwrap();
+    fs::write(t.join("rtl"), elf(3)).unwrap();
+    fs::write(t.join("devices.toml"), format!("[[rule]]\nname = \"rtl\"\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\nnodes = [\"ugen{{bus}}.{{addr}}\"]\n\
+        owner = \"driver:rtl\"\n\n[driver.rtl]\nexec = \"/usr/local/libexec/atrium/drivers/{drv}/rtl\"\nargv = [\"rtl\"]\nuid = 65060\ngid = 65060\n\
+        jail = \"atrium-rtl-{{usb}}\"\nroot = \"/var/lib/atrium/jails/rtl-{{usb}}\"\ndevfs_ruleset = 30\nsysfil = \"device\"\n")).unwrap();
+    opifex::driver::pack_driver(&t, &format!("kind = \"driver\"\n[driver]\nid = \"{drv}\"\nname = \"Realtek USB Ethernet\"\nversion = \"1.0\"\n\
+        license = \"BSD-2-Clause\"\nfirmware = [\"org.atrium.firmware.rtl\"]\n\n[[match]]\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\n"), Some(&w.plat.sk)).unwrap();
+    publish_dir(&w, &t, opifex_arch(), "d1");
+    assert!(matches!(sync(&w), Response::Synced { entries: 2, .. }));
+
+    // The lookup is local: devices.idx after the sync.
+    let idx = fs::read_to_string(w.daemon.state.join("devices.idx")).unwrap();
+    assert_eq!(opifex::driver::lookup(&idx, Some(((0x0bda, 0x8153), [0xff, 0, 0])), &[]), vec![drv.to_string()]);
+
+    // An administrator's: not through the sheet.
+    let sha = match ask(&w, 1001, Request::Describe { id: drv.into() }) {
+        Response::Described { app } => { assert_eq!((app.kind.as_str(), app.name.as_str()), ("driver", "Realtek USB Ethernet")); app.manifest_sha256 }
+        other => panic!("{other:?}"),
+    };
+    assert!(err(ask(&w, 65042, Request::InstallApproved { id: drv.into(), manifest_sha256: sha, for_uid: 1001 })).contains("administrator"));
+    assert_eq!(ask(&w, 0, Request::Install { id: drv.into() }), Response::Done { id: drv.into(), version: "1.0".into() });
+    let sys = &w.daemon.system;
+    assert!(sys.join(format!("usr/local/etc/atrium/devices.d/60-{drv}.toml")).is_file());
+    assert!(sys.join(format!("usr/local/libexec/atrium/drivers/{drv}/rtl")).is_file());
+    assert_eq!(fs::read(sys.join("usr/local/share/atrium/firmware/rtl8153/rtl8153a-4.fw")).unwrap(), b"blob");
+    assert_eq!(w.daemon.store().get("org.atrium.firmware.rtl").unwrap().unwrap().kind, "firmware");
+
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: drv.into() }), Response::Done { .. }));
+    assert!(!sys.join(format!("usr/local/etc/atrium/devices.d/60-{drv}.toml")).exists());
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: "org.atrium.firmware.rtl".into() }), Response::Done { .. }));
+    assert!(!sys.join("usr/local/share/atrium/firmware/rtl8153").exists());
 }

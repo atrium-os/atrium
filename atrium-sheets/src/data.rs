@@ -58,6 +58,14 @@ pub enum DataCmd {
     /// Open the pivot field list of the pivot at the cursor (or whose source holds
     /// it) ([`crate::pivotpane`]); the window runs it.
     PivotFields,
+    /// Rows above the selection, as many as it spans.
+    InsertRows,
+    /// Columns left of the selection, as many as it spans.
+    InsertCols,
+    /// The selection's rows.
+    DeleteRows,
+    /// The selection's columns.
+    DeleteCols,
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
@@ -174,8 +182,14 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let col_filtered = filter.is_some_and(|f| f.conds.iter().any(|(c, _)| *c == col));
     let any_cond = filter.is_some_and(|f| !f.conds.is_empty());
     let table = wb.table_at(s, row, col);
+    let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
+    let plural = |n: u32, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
     let mut v = vec![
-        (MenuItem::new("Sort A to Z").enabled(some), Some(DataCmd::SortAsc)),
+        (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))), Some(DataCmd::InsertRows)),
+        (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
+        (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
+        (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
+        (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
         (MenuItem::new(format!("Show Only {shown}")).enabled(in_filter.is_some()), Some(DataCmd::KeepValue)),
@@ -319,6 +333,31 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
     match cmd {
+        DataCmd::InsertRows | DataCmd::InsertCols | DataCmd::DeleteRows | DataCmd::DeleteCols => {
+            use officina_grid::shift::{shift_op, Axis};
+            let (axis, at, n, what) = match cmd {
+                DataCmd::InsertRows => (Axis::Rows, sel.r0, (sel.r1 - sel.r0 + 1) as i64, "Insert Rows"),
+                DataCmd::InsertCols => (Axis::Cols, sel.c0, (sel.c1 - sel.c0 + 1) as i64, "Insert Columns"),
+                DataCmd::DeleteRows => (Axis::Rows, sel.r0, -((sel.r1 - sel.r0 + 1) as i64), "Delete Rows"),
+                _ => (Axis::Cols, sel.c0, -((sel.c1 - sel.c0 + 1) as i64), "Delete Columns"),
+            };
+            let _ = (row, col);
+            match shift_op(&d.wb, s, axis, at, n) {
+                Some(op) => {
+                    d.run(what, vec![op]);
+                    let k = n.unsigned_abs();
+                    let thing = match (axis, k) {
+                        (Axis::Rows, 1) => "1 row".to_string(),
+                        (Axis::Rows, k) => format!("{k} rows"),
+                        (Axis::Cols, 1) => "1 column".to_string(),
+                        (Axis::Cols, k) => format!("{k} columns"),
+                    };
+                    Ok(format!("{thing} {}.", if n > 0 { "inserted" } else { "deleted" }))
+                }
+                None if n > 0 => Err("There's no room: the sheet's last rows or columns are in use.".into()),
+                None => Ok("Nothing there to delete.".into()),
+            }
+        }
         DataCmd::SortAsc | DataCmd::SortDesc => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
             if d.wb.sheet(s).filter.as_ref().is_some_and(|f| !f.conds.is_empty() && f.rect.r0 <= t.rect.r1 && f.rect.r1 >= t.rect.r0) {

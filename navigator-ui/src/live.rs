@@ -490,9 +490,13 @@ impl Live {
                     eprintln!("navigator-ui: {note}");
                     s.last_note = Some(note)
                 }
-                Event::Incoming { url } => {
-                    if s.incoming(&url) {
-                        eprintln!("navigator-ui: a link from another app: a new trail");
+                Event::Incoming { url, from } => {
+                    if s.incoming(&url, from.as_deref()) {
+                        let anon = if s.store.trail().anonymous { ", anonymous" } else { "" };
+                        match &from {
+                            None => eprintln!("navigator-ui: a link from another app: a new trail{anon}"),
+                            Some(f) => eprintln!("navigator-ui: a link sent from {f}: a new trail{anon}"),
+                        }
                     }
                 }
                 Event::SignedOut { url, cookies, why } => {

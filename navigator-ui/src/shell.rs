@@ -833,13 +833,22 @@ impl Shell {
     /// A link another app opened here (opening-links.md §5): a trail of
     /// its own, recorded, showing it. Only a web address the Where field
     /// would take as one; anything else is dropped.
-    pub fn incoming(&mut self, url: &str) -> bool {
+    /// `from`: the person sent it from another of their personas. Into a
+    /// named persona's window it opens anonymous (personas.md §6): a
+    /// phishing link sent into Work meets no Work sign-in.
+    pub fn incoming(&mut self, url: &str, from: Option<&str>) -> bool {
         let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
         if !(lower.starts_with("https://") || lower.starts_with("http://")) {
             return false;
         }
         let Some(Entry::Address(a)) = where_field::parse(url) else { return false };
         self.store.new_trail(false);
+        if let (Some(f), Some(_)) = (from, &self.window_persona) {
+            self.store.trail_mut().anonymous = true;
+            let mut c = f.chars();
+            let f = c.next().map(|x| x.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+            self.last_note = Some(format!("sent from {f}: sites in this trail don't know you"));
+        }
         self.popover = false;
         self.end_edit();
         let spec = self.spec(&a);
@@ -1538,14 +1547,36 @@ mod tests {
     fn a_link_from_another_app_opens_in_a_trail_of_its_own() {
         let mut s = shell();
         let (n, before) = (s.store.trails.len(), s.shown_url());
-        assert!(!s.incoming("mailto:a@b.example"));
-        assert!(!s.incoming("javascript:alert(1)"));
+        assert!(!s.incoming("mailto:a@b.example", None));
+        assert!(!s.incoming("javascript:alert(1)", None));
         assert_eq!(s.store.trails.len(), n);
-        assert!(s.incoming("https://atlas.example/wiki/Atrium"));
+        assert!(s.incoming("https://atlas.example/wiki/Atrium", None));
         assert_eq!(s.store.trails.len(), n + 1);
         assert_eq!(s.shown_url().as_deref(), Some("https://atlas.example/wiki/Atrium"));
         assert!(s.editing.is_none());
         assert_ne!(s.shown_url(), before);
+    }
+
+    /// personas.md §6: a link the person sent into Work from Personal opens
+    /// in a new trail where no site knows you, though Work's jar knows it,
+    /// until the person lets the site know them there.
+    #[test]
+    fn a_link_sent_into_work_opens_anonymous() {
+        let mut s = shell();
+        s.store.set_knows("atlas.example", true);
+        // In the Personal window: as any link.
+        assert!(s.incoming("https://atlas.example/wiki/Atrium", Some("work")));
+        assert!(!s.store.trail().anonymous && s.store.knows("atlas.example"));
+        s.window_persona = Some("work".into());
+        assert!(s.incoming("https://atlas.example/wiki/Impluvium", None));
+        assert!(!s.store.trail().anonymous, "from Work itself");
+        assert!(s.incoming("https://atlas.example/wiki/Impluvium", Some("personal")));
+        let t = s.store.trail().id;
+        assert!(s.store.trail().anonymous && !s.store.knows("atlas.example"));
+        assert_eq!(s.store.presence_of(t, "https://atlas.example/wiki/Impluvium").map(|p| p.1), Some(false));
+        assert!(s.last_note.as_deref().unwrap().contains("sent from Personal"));
+        s.store.set_knows("atlas.example", true);
+        assert!(!s.store.trail().anonymous && s.store.knows("atlas.example"), "the person let it");
     }
 
     #[test]

@@ -79,6 +79,7 @@ struct Args {
     open_write: bool,
     /// Client: `list` or `eject PART`.
     media_cmd: Option<String>,
+    recovery: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -102,6 +103,7 @@ fn args() -> Result<Args, String> {
         open: None,
         open_write: false,
         media_cmd: None,
+        recovery: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -124,6 +126,16 @@ fn args() -> Result<Args, String> {
                 let persona = it.next().ok_or("--format needs PART PERSONA LABEL")?;
                 let label = it.next().ok_or("--format needs PART PERSONA LABEL")?;
                 a.media_cmd = Some(format!("format {part} {persona} {label}"));
+            }
+            // With --format: also make a recovery code (§7.4), printed once.
+            "--recovery" => a.recovery = true,
+            // Open a Locked stick with its recovery code, read from stdin
+            // (never an argument): keep its key in PERSONA, or `once`.
+            "--adopt" => {
+                let part = val()?;
+                let persona = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
+                let keep = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
+                a.media_cmd = Some(format!("adopt {part} {persona} {keep}"));
             }
             // Tests: what the file manager asks for a share.
             "--learn" => a.media_cmd = Some(format!("learn {}", val()?)),
@@ -181,7 +193,12 @@ fn args() -> Result<Args, String> {
 /// request, one line out.
 fn arca_vk(args: &[String]) -> ExitCode {
     use dispensator::sealed::arca;
-    let Some((op, body)) = arca::request(args) else {
+    // adopt's code comes on stdin, never in the arguments (ps shows those).
+    let mut code = String::new();
+    if args.first().map(String::as_str) == Some("adopt") {
+        let _ = std::io::stdin().read_line(&mut code);
+    }
+    let Some((op, body)) = arca::request(args, code.trim()) else {
         println!("status 254");
         return ExitCode::from(2);
     };
@@ -248,7 +265,7 @@ fn main() -> ExitCode {
         };
     }
     if let Some(cmd) = &a.media_cmd {
-        return media_client(&a.media_socket, cmd);
+        return media_client(&a.media_socket, cmd, a.recovery);
     }
     if a.devices_cmd && a.plan.is_none() {
         return match atrium_devices::client::list(&a.devices_socket) {
@@ -334,7 +351,7 @@ fn print_devices(ds: &[atrium_devices::Device]) {
 
 /// One request to the daemon's media socket (Aqueduct `CLASS_MEDIA`);
 /// prints the answer.
-fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
+fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
     if cmd == "attach-all" {
         return match atrium_media::client::attach_all(sock) {
             Ok(m) => {
@@ -414,7 +431,20 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
             println!("error malformed");
             return ExitCode::FAILURE;
         };
-        return answer(atrium_media::client::format(sock, &atrium_media::Format { part: part.into(), persona: persona.into(), label: label.into() }));
+        return answer(atrium_media::client::format(sock, &atrium_media::Format { part: part.into(), persona: persona.into(), label: label.into(), recovery }));
+    }
+    if let Some(rest) = cmd.strip_prefix("adopt ") {
+        let f: Vec<&str> = rest.split(' ').collect();
+        let code = std::io::stdin().lines().next().and_then(Result::ok);
+        let (&[part, persona, keep], Some(code)) = (f.as_slice(), code) else {
+            println!("error malformed (the code goes on stdin)");
+            return ExitCode::FAILURE;
+        };
+        if keep != "keep" && keep != "once" {
+            println!("error malformed: keep or once");
+            return ExitCode::FAILURE;
+        }
+        return answer(atrium_media::client::adopt(sock, &atrium_media::Adopt { part: part.into(), persona: persona.into(), keep: keep == "keep", code: code.trim().into() }));
     }
     if let Some(rest) = cmd.strip_prefix("at-login ") {
         let (part, on) = rest.split_once(' ').unwrap_or((rest, "ask"));
@@ -472,13 +502,14 @@ fn media_client(sock: &std::path::Path, cmd: &str) -> ExitCode {
                 println!("ok");
                 for v in vs {
                     println!(
-                        "{} {} {} {}{}{}{}",
+                        "{} {} {} {}{}{}{}{}",
                         v.part,
                         if v.mountpoint.is_empty() { "-" } else { &v.mountpoint },
                         v.size_bytes,
                         v.free_bytes,
                         if v.read_only { " ro" } else { "" },
                         if v.locked { " locked" } else { "" },
+                        if v.recovery { " recovery" } else { "" },
                         if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) }
                     );
                 }
@@ -533,6 +564,9 @@ mod run {
         /// The last failure showing each (service, node), so a service that
         /// is down is logged once, not every reshow.
         show_errors: BTreeMap<(String, String), String>,
+        /// Catalog drivers already offered, by (device label, package):
+        /// one notice each while this agent runs.
+        offered: std::collections::BTreeSet<(String, String)>,
         media: Media,
         session: Session,
         seat: PathBuf,
@@ -566,6 +600,8 @@ mod run {
         trusted: BTreeMap<String, Trusted>,
         /// Sealed sticks the session holds no key for: shown as Locked.
         locked: std::collections::BTreeSet<String>,
+        /// Sealed sticks here that carry a recovery slot (§7.4).
+        recoverable: std::collections::BTreeSet<String>,
         /// /dev/tesserakeys, for TKEY_FORMAT and TKEY_DROP (None: no
         /// tessera_fs, so no sealed sticks).
         keyring: Option<std::fs::File>,
@@ -616,6 +652,8 @@ mod run {
         AtLogin(String, Option<bool>),
         /// Erase a stick and seal it for a persona (§7.1).
         Format(atrium_media::Format),
+        /// Open a Locked stick with its recovery code (§7.4).
+        Adopt(atrium_media::Adopt),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -708,27 +746,46 @@ mod run {
     /// (jaild::ffi::unmount_at).
     /// The first two sectors of /dev/`dev`: the superblock copies.
     fn read_header(dev: &str) -> dispensator::sealed::Header {
+        dispensator::sealed::header(&read_sectors(dev))
+    }
+
+    /// The first two sectors of /dev/`dev`, or nothing.
+    fn read_sectors(dev: &str) -> Vec<u8> {
         use std::io::Read;
         let mut b = vec![0u8; 2 * dispensator::sealed::SECTOR];
         match std::fs::File::open(Path::new("/dev").join(dev)).and_then(|mut f| f.read_exact(&mut b)) {
-            Ok(()) => dispensator::sealed::header(&b),
-            Err(_) => dispensator::sealed::Header::Other,
+            Ok(()) => b,
+            Err(_) => Vec::new(),
         }
     }
 
     /// One arcad call as `_dispensator-vk` (sealed.rs): `Ok(answer)` or
     /// `Err(status)`.
     fn vk_call(args: &[&str]) -> Result<String, u8> {
+        vk_call_in(args, None)
+    }
+
+    /// With `input` (a recovery code) on the child's stdin, not in its
+    /// arguments, which any process may read.
+    fn vk_call_in(args: &[&str], input: Option<&str>) -> Result<String, u8> {
+        use std::io::Write;
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe().map_err(|_| 252u8)?;
-        let out = std::process::Command::new(exe)
+        let mut child = std::process::Command::new(exe)
             .arg("--arca-vk")
             .args(args)
             .uid(dispensator::sealed::VK_UID)
             .gid(dispensator::sealed::VK_UID)
             .env_clear()
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|_| 252u8)?;
+        if let Some(mut w) = child.stdin.take() {
+            let _ = writeln!(w, "{}", input.unwrap_or(""));
+        }
+        let out = child.wait_with_output().map_err(|_| 252u8)?;
         let line = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
         if let Some(a) = line.strip_prefix("ok ") {
             return Ok(a.to_string());
@@ -751,15 +808,28 @@ mod run {
         suite: u32,
         hash_alg: u32,
         flags: u32,
+        recovery_slot: [u8; 256],
     }
-    const _: () = assert!(std::mem::size_of::<TkeyFormat>() == 64);
+    const _: () = assert!(std::mem::size_of::<TkeyFormat>() == 320);
+    const TKEY_FORMAT_RECOVERY: u32 = 1;
     const TKEY_DROP: libc::c_ulong = ioc_in(2, 16);
-    const TKEY_FORMAT: libc::c_ulong = ioc_in(4, 64);
+    const TKEY_FORMAT: libc::c_ulong = ioc_in(4, 320);
 
     /// The kernel formats `dev` sealed with the loaded key (§7.1 step 3).
-    fn tkey_format(ring: &std::fs::File, dev: &str, key_id: [u8; 16], uuid: [u8; 16]) -> std::io::Result<()> {
+    /// With `recovery`, arcad's slot goes in under the superblock's HMAC.
+    fn tkey_format(ring: &std::fs::File, dev: &str, key_id: [u8; 16], uuid: [u8; 16], recovery: Option<&[u8; 256]>) -> std::io::Result<()> {
         let disk = std::fs::OpenOptions::new().read(true).write(true).open(Path::new("/dev").join(dev))?;
-        let mut f = TkeyFormat { key_id, uuid, total_sectors: 0, journal_sectors: 0, fd: disk.as_raw_fd(), suite: 0, hash_alg: 0, flags: 0 };
+        let mut f = TkeyFormat {
+            key_id,
+            uuid,
+            total_sectors: 0,
+            journal_sectors: 0,
+            fd: disk.as_raw_fd(),
+            suite: 0,
+            hash_alg: 0,
+            flags: if recovery.is_some() { TKEY_FORMAT_RECOVERY } else { 0 },
+            recovery_slot: recovery.copied().unwrap_or([0; 256]),
+        };
         // SAFETY: a live #[repr(C)] struct of the size the command encodes.
         if unsafe { libc::ioctl(ring.as_raw_fd(), TKEY_FORMAT, &mut f as *mut TkeyFormat) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -893,6 +963,10 @@ mod run {
 
         fn format(&self, f: &atrium_media::Format) -> (u8, String) {
             self.ask(Req::Format(f.clone()))
+        }
+
+        fn adopt(&self, a: &atrium_media::Adopt) -> (u8, String) {
+            self.ask(Req::Adopt(a.clone()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1423,9 +1497,11 @@ mod run {
         let mut a = Agent {
             jaild,
             state,
-            planner: Planner::new(rules),
+            planner: Planner::new(rules).with_catalog(
+                std::env::var_os("OPIFEX_DEVICES_IDX").map(PathBuf::from).unwrap_or_else(|| dispensator::catalog::IDX.into())),
             drivers: BTreeMap::new(),
             show_errors: BTreeMap::new(),
+            offered: Default::default(),
             media: Media::default(),
             session: Session::None,
             seat,
@@ -1444,6 +1520,7 @@ mod run {
             logins: mpsc::channel(),
             trusted: BTreeMap::new(),
             locked: Default::default(),
+            recoverable: Default::default(),
             keyring: std::fs::OpenOptions::new().read(true).write(true).open("/dev/tesserakeys").ok(),
         };
         a.retire_stale_shares();
@@ -1695,10 +1772,11 @@ mod run {
                 };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
                 let persona = self.trusted.get(&part).map(|t| t.persona.clone()).unwrap_or_default();
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false });
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false });
             }
             for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
-                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona: String::new(), locked: true });
+                let recovery = self.recoverable.contains(part);
+                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona: String::new(), locked: true, recovery });
             }
             // A share's server answers only once it has logged in, so it is
             // never statfs'd here (that would wait on the network): its
@@ -1715,6 +1793,7 @@ mod run {
                     label: r.label.clone(),
                     persona: String::new(),
                     locked: false,
+                    recovery: false,
                 });
             }
             shared.update(vols, &std::mem::take(&mut self.ejected_now));
@@ -1735,6 +1814,7 @@ mod run {
                 let a = match r {
                     Req::Eject(part) => self.eject(&part),
                     Req::Format(f) => self.format(&f),
+                    Req::Adopt(a) => self.adopt(&a),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -1981,6 +2061,22 @@ mod run {
             }
         }
 
+        /// A driver for a device nobody drives is in the catalog: one Praeco
+        /// notice (as a system poster: praecod's PRAECO_SYSTEM_POSTERS names
+        /// uid 0). Installing it is an administrator's (opifex.md §8.2).
+        fn offer(&mut self, device: &str, label: &str, package: &str) {
+            eprintln!("atrium-dispensatord: {device} ({label}): the catalog has a driver, {package}");
+            if !self.offered.insert((label.to_string(), package.to_string())) {
+                return;
+            }
+            let sock = std::env::var_os("PRAECO_SOCKET").map(PathBuf::from).unwrap_or_else(|| "/var/run/atrium/praecod.sock".into());
+            let body = format!("A device you connected ({label}) has no driver here. The catalog has one, {package}; \
+                                an administrator can install it with: opifex get {package}");
+            if let Err(e) = praeco::client::post(&sock, praeco::proto::urgency::NORMAL, "A driver is available", &body) {
+                eprintln!("atrium-dispensatord: praecod: {e}");
+            }
+        }
+
         fn run(&mut self, ops: Vec<Op>) {
             let changed = ops.iter().any(|o| !matches!(o, Op::Show { .. }));
             for op in ops {
@@ -2002,6 +2098,7 @@ mod run {
                     Op::DetachKernel { ugen, interface } => Self::detach_kernel(&ugen, interface),
                     Op::StopDriver { driver, device, vars } => self.stop(&driver, &device, &vars),
                     Op::Log(m) => eprintln!("atrium-dispensatord: {m}"),
+                    Op::DriverAvailable { device, label, package } => self.offer(&device, &label, &package),
                     Op::Settle { disk } => self.settling.push((Instant::now() + Duration::from_millis(1500), disk)),
                 }
             }
@@ -2128,7 +2225,12 @@ mod run {
             // A sealed stick is the kernel's to mount, with the session
             // person's key, or nobody's (§7.2): never a FUSE server's.
             if let Some((dev, mnt, _)) = &p.fuse {
-                if let dispensator::sealed::Header::Sealed { key_id, uuid } = read_header(dev) {
+                if let dispensator::sealed::Header::Sealed { key_id, uuid, recovery } = read_header(dev) {
+                    if recovery {
+                        self.recoverable.insert(device.to_string());
+                    } else {
+                        self.recoverable.remove(device);
+                    }
                     self.start_sealed(device, dev, mnt, key_id, uuid);
                     return;
                 }
@@ -2258,7 +2360,25 @@ mod run {
                 Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
                 Err(st) => return (mstatus::FAILED, format!("arcad refused the key (status {st})")),
             };
-            if let Err(e) = tkey_format(&ring, &f.part, key_id, uuid) {
+            // A recovery code (§7.4): arcad wraps the key under it; the
+            // code goes back to the person in this reply, once.
+            let mut code = None;
+            let mut slot = None;
+            if f.recovery {
+                let r = vk_call(&["recovery", &user, &f.persona, &hex(&key_id), &hex(&uuid)]);
+                let parsed = r.as_ref().ok().and_then(|a| {
+                    let (h, c) = a.split_once(' ')?;
+                    let b: [u8; 256] = dispensator::sealed::unhex(h)?.try_into().ok()?;
+                    Some((b, c.to_string()))
+                });
+                let Some((b, c)) = parsed else {
+                    tkey_drop(&ring, key_id);
+                    return (mstatus::FAILED, format!("arcad made no recovery code ({})", r.err().unwrap_or(255)));
+                };
+                slot = Some(b);
+                code = Some(c);
+            }
+            if let Err(e) = tkey_format(&ring, &f.part, key_id, uuid, slot.as_ref()) {
                 tkey_drop(&ring, key_id);
                 return (mstatus::FAILED, format!("format {}: {e}", f.part));
             }
@@ -2272,8 +2392,49 @@ mod run {
             let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
             self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id });
             self.publish();
-            eprintln!("atrium-dispensatord: {}: sealed for {user}/{}, mounted at {mnt}", f.part, f.persona);
-            (mstatus::OK, format!("{} is now {}'s sealed stick", f.part, f.persona))
+            eprintln!("atrium-dispensatord: {}: sealed for {user}/{}{}, mounted at {mnt}", f.part, f.persona, if code.is_some() { " with a recovery code" } else { "" });
+            match code {
+                Some(c) => (mstatus::OK, format!("{} is now {}'s sealed stick; recovery code {c}", f.part, f.persona)),
+                None => (mstatus::OK, format!("{} is now {}'s sealed stick", f.part, f.persona)),
+            }
+        }
+
+        /// A Locked stick opened with its recovery code (§7.4): arcad
+        /// unwraps its key from the slot (and keeps it, if asked), then the
+        /// kernel mounts it as for a stick found in Arca.
+        fn adopt(&mut self, a: &atrium_media::Adopt) -> (u8, String) {
+            use dispensator::sealed::{arca, hex, Header};
+            let Session::Active { user, .. } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            };
+            if !self.locked.contains(&a.part) {
+                return (mstatus::NOT_FOUND, format!("{} is not Locked", a.part));
+            }
+            let Some(mnt) = self.mountpoint(&a.part) else { return (mstatus::NOT_FOUND, format!("{} has no mount point", a.part)) };
+            let b = read_sectors(&a.part);
+            let (Header::Sealed { key_id, uuid, .. }, Some(slot)) = (dispensator::sealed::header(&b), dispensator::sealed::recovery_slot(&b)) else {
+                return (mstatus::NOT_FOUND, format!("{} has no recovery code", a.part));
+            };
+            let keep = if a.keep { "keep" } else { "once" };
+            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&a.code)) {
+                Ok(_) => {}
+                Err(st) if st == arca::DENIED => return (mstatus::NOT_ALLOWED, "that isn't this stick's recovery code".into()),
+                Err(st) if st == arca::MALFORMED => return (mstatus::MALFORMED, "that isn't a recovery code: check it for typos".into()),
+                Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
+                Err(st) => return (mstatus::FAILED, format!("arcad couldn't open it (status {st})")),
+            }
+            let _ = std::fs::create_dir_all(&mnt);
+            if let Err(e) = mount_tessera(&a.part, &mnt) {
+                if let Some(r) = &self.keyring {
+                    tkey_drop(r, key_id);
+                }
+                return (mstatus::FAILED, format!("the code opened its key, but the kernel refused the stick: {e}"));
+            }
+            self.locked.remove(&a.part);
+            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id });
+            self.publish();
+            eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);
+            (mstatus::OK, format!("{} opened for {}", a.part, a.persona))
         }
 
         fn stop(&mut self, driver: &str, device: &str, vars: &Vars) {
