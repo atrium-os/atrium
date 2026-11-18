@@ -1108,6 +1108,19 @@ pub fn apps_taking_link(scheme: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Every installed share-target `person` may share to (share-sheet.md
+/// §4.3: dev builds only their own person's): (id, name), by name.
+pub fn share_targets_for(person: &str) -> Vec<(String, String)> {
+    let mine = format!("dev.{person}.");
+    let mut out: Vec<(String, String)> = installed_texts().into_iter()
+        .filter(|(_, _, m)| m.roles.as_ref().is_some_and(|r| r.implements.iter().any(|i| i == "share-target")))
+        .filter(|(_, _, m)| !m.app.id.starts_with("dev.") || m.app.id.starts_with(&mine))
+        .map(|(_, _, m)| (m.app.id.clone(), if m.app.name.is_empty() { m.app.id.clone() } else { m.app.name.clone() }))
+        .collect();
+    out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(&b.0)));
+    out
+}
+
 /// Every link scheme an installed app takes (not `atrium-app`), sorted.
 pub fn link_schemes() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();

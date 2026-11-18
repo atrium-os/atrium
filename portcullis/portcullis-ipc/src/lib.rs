@@ -429,6 +429,21 @@ pub enum Request {
         app:        Option<String>,
         activation: [u8; 16],
     },
+    /// ★ Settings' Share section (share-sheet.md §4.4): every share-target
+    /// installed for the person, in the order the share sheet lists them,
+    /// and which it doesn't. `app-grants` only, about the person that app
+    /// belongs to. Answer: `ShareTargets`.
+    ShareTargets,
+    /// ★ The share sheet's order (`order`, first first) and the apps it
+    /// doesn't list (`hidden`); apps that aren't installed share-targets
+    /// for the person are dropped. `app-grants` only, and only with
+    /// `activation`, a press portcullisd spends with frescod (purpose
+    /// APPROVE). Answer: `Ok`.
+    SetShareTargets {
+        order:      Vec<String>,
+        hidden:     Vec<String>,
+        activation: [u8; 16],
+    },
     /// ★ Settings' Personas section (personas.md §6): the person's named
     /// personas and which crossing switches are on. `app-grants` only,
     /// about the person that app belongs to. Answer: `Crossings`.
@@ -645,6 +660,15 @@ pub struct Toolchain {
     pub available: bool,
 }
 
+/// A share-target in Settings' Share section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareTargetRow {
+    pub id:     String,
+    pub name:   String,
+    /// The share sheet doesn't list it.
+    pub hidden: bool,
+}
+
 /// An app that opens a type, for the Open with sheet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkChoice {
@@ -823,6 +847,8 @@ pub enum Response {
     LinkDelivered { app: String },
     /// Links → each scheme an app takes, by scheme.
     Links { schemes: Vec<LinkScheme> },
+    /// ShareTargets → each share-target, in the share sheet's order.
+    ShareTargets { targets: Vec<ShareTargetRow> },
     /// Crossings → the person's named personas (by name, with colour) and
     /// the switches that are on.
     Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },

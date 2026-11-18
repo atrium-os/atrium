@@ -9,16 +9,19 @@
 # from this uid only, LIMEN_SHARE_UID), draws each sheet through frescod, and
 # spends the app's press there (purpose SHARE, which frescod lets only this
 # uid spend). It reads the installed manifests and their icons, and the
-# launch registry to know whose app is sharing. It never sees the item.
+# launch registry to know whose app is sharing, and each person's
+# share.toml (the apps they hid and their order, from Settings). It never
+# sees the item.
 #
 # It waits for limend (again every 5 s), so boot order doesn't matter.
 #
 # REQUIRES (scripts/share-sheet-service.sh does all of it):
 #   1. The _share (65045) system user, in jaild.policy's allowed_system_uids.
-#   2. /var/lib/atrium/apps and /var/run/atrium/app-registry in ro_paths.
+#   2. /var/lib/atrium/apps, /var/db/atrium and /var/run/atrium/app-registry
+#      in ro_paths.
 #   3. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
 #      atrium/sockets/{limen,fresco,fresco-activation},var/lib/atrium/apps,
-#      var/run/atrium} and an empty file <path>/var/run/atrium/app-registry.
+#      var/db/atrium,var/run/atrium} and an empty file <path>/var/run/atrium/app-registry.
 
 enabled       = true
 name          = "atrium-share-sheet"
@@ -58,6 +61,10 @@ kind   = "rw_nullfs"
 [[mounts]]
 source = "/var/lib/atrium/apps"                   # ro: installed manifests (share-targets) and icons
 dest   = "var/lib/atrium/apps"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/db/atrium"                         # ro: each person's share.toml (hidden apps, order)
+dest   = "var/db/atrium"
 kind   = "ro_nullfs"
 [[mounts]]
 source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)

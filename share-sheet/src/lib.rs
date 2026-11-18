@@ -22,6 +22,7 @@
 //! `share-sheet` binary draws each sheet with Pergola.
 
 use std::collections::HashMap;
+
 use std::time::Duration;
 
 use fresco_protocol::activation::{purpose, Consume, ConsumeResult};
@@ -29,6 +30,7 @@ use limen::client::{Child, Error};
 use limen::manifests::{Installed, Target};
 use limen::proto::{ChildEvent, EmbedId, WindowToken};
 use limen::share::{ToChild, ToParent};
+use portcullis_policy::share::SharePrefs;
 use tabula::gate::Gate;
 
 /// uid → the person whose app it is (the launch registry's user).
@@ -60,13 +62,22 @@ pub struct Sheet {
     installed: Installed,
     person: Person,
     embeds: HashMap<EmbedId, Pending>,
+    /// Where each person's `share.toml` is (`<dir>/<person>/share.toml`):
+    /// the apps they hid and their order, from Settings.
+    prefs: std::path::PathBuf,
 }
 
 impl Sheet {
     /// `child` is the connection that provides `share` (see
     /// [`Child::provider`]).
     pub fn new(child: Child, gate: Box<dyn Gate>, installed: Installed, person: Person) -> Self {
-        Sheet { child, gate, installed, person, embeds: HashMap::new() }
+        Sheet { child, gate, installed, person, embeds: HashMap::new(), prefs: "/var/db/atrium".into() }
+    }
+
+    /// Read people's choices under `dir` instead of /var/db/atrium.
+    pub fn with_prefs(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.prefs = dir.into();
+        self
     }
 
     /// Serve limend for up to `wait`.
@@ -118,6 +129,12 @@ impl Sheet {
         let p = self.embeds.get_mut(&embed)?;
         let mut targets = self.installed.share_targets(&person, &o.mimes);
         targets.retain(|t| t.app != p.parent_app);
+        // The person's order, without the apps they hid (Settings' Share
+        // section). A hidden app isn't shown, so it can't be chosen.
+        if !person.is_empty() && !person.contains(['/', '\0']) && !person.starts_with('.') {
+            let prefs = SharePrefs::load(&self.prefs.join(&person).join("share.toml")).unwrap_or_default();
+            targets = prefs.shown(targets, |t| t.app.as_str());
+        }
         eprintln!("share-sheet: {embed}: {} types, {} targets for {person}", o.mimes.len(), targets.len());
         p.targets = targets.clone();
         Some(Event::Show { embed, title: o.title, from_app: p.parent_app.clone(), targets })

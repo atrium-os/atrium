@@ -101,7 +101,7 @@ impl World {
             _ => None,
         });
         let frescod = Fake::default();
-        let sheet = Sheet::new(child, Box::new(frescod.clone()), installed, person);
+        let sheet = Sheet::new(child, Box::new(frescod.clone()), installed, person).with_prefs(dir.join("prefs"));
         World { shared, launched: rx, frescod, sheet, dir }
     }
 
@@ -194,6 +194,28 @@ fn the_sheet_lists_targets_for_the_types_and_the_person_and_never_the_app_itself
     let mut bob = Parent::wrap(w.connect(BOB_APP));
     let p = w.frescod.mint(BOB_APP, kind::BUTTON);
     let (_, ev) = w.open(&mut bob, W_BOB, p, &["text/plain"]);
+    assert_eq!(targets(ev), ["dev.bob.scratch.org.example.his", "org.example.notes"]);
+}
+
+#[test]
+fn the_persons_order_and_hidden_apps_from_settings() {
+    let mut w = World::new("prefs");
+    let p = portcullis_policy::share::SharePrefs::chosen(
+        &["org.example.photos".into(), "org.example.notes".into()],
+        &["dev.ana.scratch.org.example.mine".into()],
+        &["org.example.photos".into(), "org.example.notes".into(), "dev.ana.scratch.org.example.mine".into()]);
+    p.save(&w.dir.join("prefs/ana/share.toml")).unwrap();
+    let mut mail = Parent::wrap(w.connect(MAIL));
+    let press = w.frescod.mint(MAIL, kind::BUTTON);
+    let (e, ev) = w.open(&mut mail, W_MAIL, press, &["image/png", "text/plain"]);
+    // Ana's order, without the app she hid.
+    assert_eq!(targets(ev), ["org.example.photos", "org.example.notes"]);
+    // A hidden app wasn't shown, so it can't be chosen.
+    assert!(w.sheet.chose(e, "dev.ana.scratch.org.example.mine").is_err());
+    // Bob's sheet is his own: nothing hidden.
+    let mut bob = Parent::wrap(w.connect(BOB_APP));
+    let press = w.frescod.mint(BOB_APP, kind::BUTTON);
+    let (_, ev) = w.open(&mut bob, W_BOB, press, &["text/plain"]);
     assert_eq!(targets(ev), ["dev.bob.scratch.org.example.his", "org.example.notes"]);
 }
 

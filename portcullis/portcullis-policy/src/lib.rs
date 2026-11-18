@@ -25,6 +25,7 @@
 //! ```
 
 pub mod links;
+pub mod share;
 pub mod opens;
 
 use std::collections::BTreeMap;
