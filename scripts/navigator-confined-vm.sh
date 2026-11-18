@@ -395,7 +395,9 @@ echo "=== the package catalog"
 # open-an-app prompt asks it who publishes an app (navigator-ui.md §6.4),
 # and the L5 section below installs from it.
 L5=$S/l5; L5ID=org.atrium.l5hello; OX=/atrium/sockets/opifex/opifex.sock; ARCHN=$(echo "$TARGET" | cut -d- -f1); [ "$ARCHN" = x86_64 ] && ARCHN=amd64
-g "pkill -x opifex-sheetd; pkill -x opifexd; rm -f $OX; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; rm -rf $L5 /var/lib/atrium/apps/$L5ID; mkdir -p $L5; chmod 755 $L5
+# A fresh opifex state each run (as vm-opifex-c3-check.sh): the catalog's
+# keys are new each time, and the last run installed $L5ID.
+g "pkill -x opifex-sheetd; pkill -x opifexd; rm -f $OX; rm -rf $L5 /var/lib/atrium/apps/$L5ID /var/db/atrium/opifex /var/lib/atrium/opifex; mkdir -p $L5; chmod 755 $L5
    install -m 0755 $D/opifexd /usr/local/sbin/opifexd; install -m 0755 $D/opifex-sheetd /usr/local/bin/opifex-sheetd
    mkdir -p /usr/local/libexec; install -m 0755 $D/opifex-check /usr/local/libexec/opifex-check"
 g 'sh -s' > "$OUT.l5.log" 2>&1 <<EOS
