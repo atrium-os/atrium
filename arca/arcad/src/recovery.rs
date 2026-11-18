@@ -11,7 +11,10 @@
 //! | `kdf_iterations` u32 (t_cost) | `kdf_salt[16]` | `wrapped_key[80]`
 //! (nonce 24, ct 32, tag 16, 8 zero) | 40 zero (TPM fields) |
 //! `credential_id[16]` = the key id | `reserved[96]`: m_kib u32, p_cost u32,
-//! then zero.
+//! the stick's name sealed under the same key (`len u8 | name[63]`, zero
+//! padded so its length doesn't show, then a 16-byte tag; the nonce is the
+//! key's with its last byte flipped), then 8 zero. A slot made before the
+//! name was added has zeros there, and opens with no name.
 
 use arca_store::secret::LockedBuf;
 use arca_store::{KdfParams, RootKey};
@@ -29,6 +32,10 @@ const OFF_WRAP: usize = 24;
 const OFF_CRED: usize = 144;
 const OFF_M: usize = 160;
 const OFF_P: usize = 164;
+const OFF_NAME: usize = 168;
+const NAME_LEN: usize = 64;
+/// The longest name a slot carries, in bytes.
+pub const NAME_MAX: usize = NAME_LEN - 1;
 /// The most a slot may ask of arcad: a slot is read from a stick anyone
 /// could have written.
 const MAX_M_KIB: u32 = 1024 * 1024;
@@ -115,13 +122,34 @@ fn aad(uuid: &[u8; 16], key_id: &[u8; 16]) -> Vec<u8> {
     [b"tessera recovery slot".as_slice(), uuid, key_id].concat()
 }
 
+fn name_nonce(slot: &[u8]) -> XNonce {
+    let mut n = [0u8; 24];
+    n.copy_from_slice(&slot[OFF_WRAP..OFF_WRAP + 24]);
+    n[23] ^= 0xff;
+    *XNonce::from_slice(&n)
+}
+
+fn name_aad(uuid: &[u8; 16], key_id: &[u8; 16]) -> Vec<u8> {
+    [b"tessera recovery name".as_slice(), uuid, key_id].concat()
+}
+
+/// `name` cut to `NAME_MAX` bytes on a character boundary.
+fn clip(name: &str) -> &str {
+    let mut end = name.len().min(NAME_MAX);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 fn kek(secret: &[u8; 16], salt: &[u8; 16], kdf: KdfParams) -> Option<XChaCha20Poly1305> {
     let k = RootKey::derive(secret, salt, kdf).ok()?;
     XChaCha20Poly1305::new_from_slice(&k.as_bytes()[..32]).ok()
 }
 
-/// A new code and the slot that opens `vk` with it.
-pub fn make(vk: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], kdf: KdfParams) -> Option<(String, [u8; SLOT_LEN])> {
+/// A new code and the slot that opens `vk` with it, carrying the stick's
+/// `name` (at most `NAME_MAX` bytes kept) for whoever opens it with the code.
+pub fn make(vk: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], name: &str, kdf: KdfParams) -> Option<(String, [u8; SLOT_LEN])> {
     if vk.len() != 32 {
         return None;
     }
@@ -144,6 +172,12 @@ pub fn make(vk: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], kdf: KdfParams) -> Op
     s[OFF_CRED..OFF_CRED + 16].copy_from_slice(key_id);
     s[OFF_M..OFF_M + 4].copy_from_slice(&kdf.m_kib.to_le_bytes());
     s[OFF_P..OFF_P + 4].copy_from_slice(&kdf.p_cost.to_le_bytes());
+    let name = clip(name);
+    s[OFF_NAME] = name.len() as u8;
+    s[OFF_NAME + 1..OFF_NAME + 1 + name.len()].copy_from_slice(name.as_bytes());
+    let nonce = name_nonce(&s);
+    let tag = cipher.encrypt_in_place_detached(&nonce, &name_aad(uuid, key_id), &mut s[OFF_NAME..OFF_NAME + NAME_LEN]).ok()?;
+    s[OFF_NAME + NAME_LEN..OFF_NAME + NAME_LEN + 16].copy_from_slice(&tag);
     let code = encode(&secret);
     secret.fill(0);
     Some((code, s))
@@ -160,8 +194,9 @@ pub enum OpenError {
     WrongCode,
 }
 
-/// The volume key, if `code` opens `slot` for this volume.
-pub fn open(slot: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], code: &str) -> Result<LockedBuf, OpenError> {
+/// The volume key and the stick's name (empty if the slot has none), if
+/// `code` opens `slot` for this volume.
+pub fn open(slot: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], code: &str) -> Result<(LockedBuf, String), OpenError> {
     if slot.len() != SLOT_LEN || slot[0] != SLOT_RECOVERY || slot[1] != KDF_ARGON2ID || slot[OFF_CRED..OFF_CRED + 16] != key_id[..] {
         return Err(OpenError::BadSlot);
     }
@@ -179,7 +214,15 @@ pub fn open(slot: &[u8], uuid: &[u8; 16], key_id: &[u8; 16], code: &str) -> Resu
     let nonce = XNonce::from_slice(&slot[OFF_WRAP..OFF_WRAP + 24]);
     let tag = Tag::from_slice(&slot[OFF_WRAP + 56..OFF_WRAP + 72]);
     cipher.decrypt_in_place_detached(nonce, &aad(uuid, key_id), vk.as_mut(), tag).map_err(|_| OpenError::WrongCode)?;
-    Ok(vk)
+    // The name: a slot without one (or a damaged one) opens all the same.
+    let mut n = [0u8; NAME_LEN];
+    n.copy_from_slice(&slot[OFF_NAME..OFF_NAME + NAME_LEN]);
+    let ntag = Tag::from_slice(&slot[OFF_NAME + NAME_LEN..OFF_NAME + NAME_LEN + 16]);
+    let name = match cipher.decrypt_in_place_detached(&name_nonce(slot), &name_aad(uuid, key_id), &mut n, ntag) {
+        Ok(()) if (n[0] as usize) <= NAME_MAX => String::from_utf8(n[1..1 + n[0] as usize].to_vec()).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok((vk, name))
 }
 
 #[cfg(test)]
@@ -209,11 +252,13 @@ mod tests {
     fn a_slot_opens_with_its_code_only() {
         let vk = [7u8; 32];
         let (uuid, kid) = ([1u8; 16], [2u8; 16]);
-        let (code, slot) = make(&vk, &uuid, &kid, KdfParams::TEST).unwrap();
+        let (code, slot) = make(&vk, &uuid, &kid, "Holiday", KdfParams::TEST).unwrap();
         assert_eq!(slot[0], 3);
         assert_eq!(&slot[OFF_WRAP + 24..OFF_WRAP + 56] == vk.as_slice(), false, "wrapped, not clear");
-        assert_eq!(open(&slot, &uuid, &kid, &code).unwrap().as_ref(), vk.as_slice());
-        let (other, _) = make(&vk, &uuid, &kid, KdfParams::TEST).unwrap();
+        let (k, name) = open(&slot, &uuid, &kid, &code).unwrap();
+        assert_eq!((k.as_ref(), name.as_str()), (vk.as_slice(), "Holiday"));
+        assert!(!slot.windows(7).any(|w| w == b"Holiday"), "the name is sealed too");
+        let (other, _) = make(&vk, &uuid, &kid, "", KdfParams::TEST).unwrap();
         assert_eq!(open(&slot, &uuid, &kid, &other).err(), Some(OpenError::WrongCode));
         assert_eq!(open(&slot, &uuid, &kid, "nope").err(), Some(OpenError::BadCode));
         // Bound to the volume: another uuid, or key id, doesn't open it.
@@ -226,5 +271,14 @@ mod tests {
         let mut flipped = slot;
         flipped[OFF_WRAP + 30] ^= 1;
         assert_eq!(open(&flipped, &uuid, &kid, &code).err(), Some(OpenError::WrongCode));
+        // A slot from before names: zeros there, so it opens without one.
+        let mut old = slot;
+        old[OFF_NAME..OFF_NAME + NAME_LEN + 16].fill(0);
+        let (k, name) = open(&old, &uuid, &kid, &code).unwrap();
+        assert_eq!((k.as_ref(), name.as_str()), (vk.as_slice(), ""));
+        // A long name is cut on a character boundary.
+        let long = "é".repeat(40);
+        let (code, slot) = make(&vk, &uuid, &kid, &long, KdfParams::TEST).unwrap();
+        assert_eq!(open(&slot, &uuid, &kid, &code).unwrap().1, "é".repeat(31));
     }
 }

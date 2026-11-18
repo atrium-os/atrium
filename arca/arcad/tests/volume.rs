@@ -245,9 +245,9 @@ fn a_plugged_in_stick_finds_its_persona() {
     k.lock().unwrap().loaded.clear();
 
     let (st, p) = find(&mut s, &dispensatord(), "alice", &work, UUID, 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"work"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"work\0Work stick, 64 GB"[..]));
     let (st, p) = find(&mut s, &dispensatord(), "alice", &personal, [0x77; 16], 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal\0Work stick, 64 GB"[..]));
     assert_eq!(k.lock().unwrap().loaded.len(), 2);
     assert_eq!(k.lock().unwrap().loaded[0].0.owner_label, "alice/work");
     k.lock().unwrap().loaded.clear();
@@ -315,8 +315,17 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, [9; 16], slot, true, &code), status::DENIED, "another volume");
     assert!(k2.lock().unwrap().loaded.is_empty());
 
-    // This session only: loaded, not kept.
-    assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, false, &code), status::OK);
+    // This session only: loaded, not kept, and its name answered.
+    let r = t.handle(&dispensatord(), volume_op::VK_ADOPT, &body(|w| {
+        w.str("alice");
+        w.str("personal");
+        w.raw(&key_id);
+        w.raw(&UUID);
+        w.raw(slot);
+        w.u8(0);
+        w.str(&code);
+    }));
+    assert_eq!((r.status, r.body.bytes()), (status::OK, &b"Work stick, 64 GB"[..]));
     assert_eq!(k2.lock().unwrap().loaded[0].1, key);
     assert_eq!(k2.lock().unwrap().loaded[0].0.owner_label, "alice/personal");
     k2.lock().unwrap().loaded.clear();
@@ -326,7 +335,7 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code.to_lowercase()), status::OK);
     k2.lock().unwrap().loaded.clear();
     let (st, p) = find(&mut t, &dispensatord(), "alice", &key_id, UUID, 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal\0Work stick, 64 GB"[..]), "with the name sealed in its slot");
     assert_eq!(k2.lock().unwrap().loaded[0].1, key);
 
     // Typed into Arca's recovery-code field (Scrinium never sees it): the

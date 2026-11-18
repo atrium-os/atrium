@@ -511,7 +511,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                 println!("ok");
                 for v in vs {
                     println!(
-                        "{} {} {} {}{}{}{}{}{}",
+                        "{} {} {} {}{}{}{}{}{}{}",
                         v.part,
                         if v.mountpoint.is_empty() { "-" } else { &v.mountpoint },
                         v.size_bytes,
@@ -520,7 +520,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                         if v.locked { " locked" } else { "" },
                         if v.recovery { " recovery" } else { "" },
                         if v.older { " older" } else { "" },
-                        if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) }
+                        if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) },
+                        // Last: a name may hold spaces.
+                        if v.label.is_empty() { String::new() } else { format!(" name={}", v.label) }
                     );
                 }
                 ExitCode::SUCCESS
@@ -631,6 +633,8 @@ mod run {
         key_id: [u8; 16],
         /// An older copy opened read-only, as the person verified (§8).
         read_only: bool,
+        /// The name it was given at format (Arca's item), if known here.
+        label: String,
     }
 
     /// A stick of this person's that is older than its key's high-water
@@ -638,6 +642,7 @@ mod run {
     #[derive(Clone)]
     struct Older {
         persona: String,
+        label: String,
         key_id: [u8; 16],
         uuid: [u8; 16],
     }
@@ -1845,14 +1850,15 @@ mod run {
                 };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
                 let persona = self.trusted.get(&part).map(|t| t.persona.clone()).unwrap_or_default();
+                let label = self.trusted.get(&part).map(|t| t.label.clone()).unwrap_or_default();
                 let read_only = read_only || self.trusted.get(&part).is_some_and(|t| t.read_only);
                 let older = self.trusted.get(&part).is_some_and(|t| t.read_only);
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false, older });
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label, persona, locked: false, recovery: false, older });
             }
             for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
                 let recovery = self.recoverable.contains(part);
-                let (older, persona) = self.older.get(part).map_or((false, String::new()), |o| (true, o.persona.clone()));
-                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona, locked: true, recovery, older });
+                let (older, persona, label) = self.older.get(part).map_or((false, String::new(), String::new()), |o| (true, o.persona.clone(), o.label.clone()));
+                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label, persona, locked: true, recovery, older });
             }
             // A share's server answers only once it has logged in, so it is
             // never statfs'd here (that would wait on the network): its
@@ -2388,12 +2394,13 @@ mod run {
                 return;
             }
             match vk_call(&["find", &user, &hex(&key_id), &hex(&uuid)]) {
-                Ok(persona) => {
+                Ok(answer) => {
+                    let (persona, label) = dispensator::sealed::find_answer(&answer);
                     let _ = std::fs::create_dir_all(mnt);
                     match mount_tessera(dev, mnt) {
                         Ok(()) => {
                             eprintln!("atrium-dispensatord: {device}: sealed stick of {user}/{persona}, mounted at {mnt}");
-                            self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id, read_only: false });
+                            self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id, read_only: false, label });
                             self.serve_trusted(device);
                         }
                         Err(e) => {
@@ -2408,7 +2415,7 @@ mod run {
                                 tkey_drop(r, key_id);
                             }
                             if e.raw_os_error() == Some(libc::ESTALE) {
-                                self.older.insert(device.to_string(), Older { persona, key_id, uuid });
+                                self.older.insert(device.to_string(), Older { persona, key_id, uuid, label });
                             }
                             self.locked.insert(device.to_string());
                         }
@@ -2625,7 +2632,7 @@ mod run {
             // The new stick is its person's: a private top folder.
             let _ = std::os::unix::fs::chown(&mnt, Some(uid), Some(gid));
             let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-            self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id, read_only: false });
+            self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id, read_only: false, label: f.label.clone() });
             self.serve_trusted(&f.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: sealed for {user}/{}{}, mounted at {mnt}", f.part, f.persona, if code.is_some() { " with a recovery code" } else { "" });
@@ -2664,7 +2671,7 @@ mod run {
             }
             self.locked.remove(part);
             self.older.remove(part);
-            self.trusted.insert(part.to_string(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: o.persona.clone(), key_id: o.key_id, read_only: true });
+            self.trusted.insert(part.to_string(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: o.persona.clone(), key_id: o.key_id, read_only: true, label: o.label.clone() });
             self.serve_trusted(part);
             self.publish();
             eprintln!("atrium-dispensatord: {part}: an older copy of {user}/{}, opened read-only at {mnt}", o.persona);
@@ -2757,13 +2764,14 @@ mod run {
             };
             let keep = if a.keep { "keep" } else { "once" };
             let code = if a.handle == [0; 16] { a.code.clone() } else { format!("held:{}", hex(&a.handle)) };
-            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
-                Ok(_) => {}
+            // arcad answers the name the stick was given, sealed in its slot.
+            let label = match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
+                Ok(n) => dispensator::sealed::label_from_hex(&n),
                 Err(st) if st == arca::DENIED => return (mstatus::NOT_ALLOWED, "that isn't this stick's recovery code".into()),
                 Err(st) if st == arca::MALFORMED => return (mstatus::MALFORMED, "that isn't a recovery code: check it for typos".into()),
                 Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
                 Err(st) => return (mstatus::FAILED, format!("arcad couldn't open it (status {st})")),
-            }
+            };
             let _ = std::fs::create_dir_all(&mnt);
             if let Err(e) = mount_tessera(&a.part, &mnt) {
                 if let Some(r) = &self.keyring {
@@ -2772,7 +2780,7 @@ mod run {
                 return (mstatus::FAILED, format!("the code opened its key, but the kernel refused the stick: {e}"));
             }
             self.locked.remove(&a.part);
-            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false });
+            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false, label });
             self.serve_trusted(&a.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);

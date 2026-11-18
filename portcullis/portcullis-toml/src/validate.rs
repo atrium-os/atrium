@@ -393,6 +393,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.workspaces = true: restricted to the Workspaces app (makes, changes and \
              deletes the person's workspaces, and opens their terminals); requires explicit policy approval"));
     }
+    if c.printers_configure == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.printers-configure = true: restricted to the settings app (adds, shares \
+             and removes the person's printers, sees their print history); requires explicit policy approval"));
+    }
     if c.app_grants == Some(true) {
         r.warnings.push(format!(
             "{ctx}.app-grants = true: restricted to the settings app (sees and changes \

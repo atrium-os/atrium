@@ -762,7 +762,7 @@ Checks:
 
 Sheets and Slides print (2026-11-18): `officina_pdf::sheet` pages a sheet down, then
 across, each cell as the grid draws it (formatted text, fill, borders, data bars, "###"
-for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; and
+for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; a merged area prints as one cell, as the grid draws it, cut where it crosses a page, with its text on the page that has its first cell; and
 `officina_pdf::slides` draws a page per slide from the display list the editor draws
 (hidden slides left out), fitted on the paper. Gradients are bands of solid colour,
 since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout
@@ -781,6 +781,60 @@ quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` help
 Pergola (`officina_pdf::plain` is the text half).
 
 Next: R5.
+
+### 11.5 R5 as built (2026-11-18)
+
+- **Who may ask prelumd what.** prelumd looks each caller up in the launch registry
+  (`person_of(uid)` now gives the app id too) and gives it a role: the **person**
+  (not an app: `prelumctl`, tests) may do everything; **Curia** (`org.atrium.curia`)
+  everything but `PRINT`, `PREVIEW` and `SAVE_PDF`; **prelum-status**
+  (`org.atrium.prelum-status`) only `PRINTERS`, `JOBS`, `WATCH`, `CANCEL` and `RELEASE`;
+  any other app is refused ("apps print through the print sheet"). The sheet keeps
+  `FOR`. Each connection carries a persona, which `ADD` and `PRINT` record.
+- **New ops:** `SHARE` 0x08 (`Share { printer, shared }`: a printer for every persona,
+  or back to the persona it was added on), `HISTORY` 0x09 (ended jobs, newest first),
+  `CLEAR_HISTORY` 0x0A, and `WATCH` 0x16 (give the last generation seen; the answer
+  comes when the jobs change, or after 25 s, as `Watched { generation, jobs }`).
+  `Printer` gains `persona` and `shared`; `Job` gains `alert` and `alert_since`.
+- **Alerts.** A job that can't go on says why: `OutOfPaper`, `Jam`, `Open` (a door or
+  tray), `Offline`, `IdentityChanged` (not the printer saved) or `Stopped` (any other
+  reason). They come from the printer's `printer-state-reasons` when it is stopped
+  before sending, or when the job stops while printing (prelumd then asks the printer
+  why), from the connection failing (offline) and from the pin check. The alert goes
+  when the job moves on; `alert_since` stays while it is the same alert.
+- **History**, per person in `<state>/<uid>/history.toml`: title, printer, persona,
+  sheets, how it ended, when. Never the document. Kept 30 days and at most 2000 jobs.
+  A printer with titles off records "Document".
+- **`prelum-status`**, a session component (one per person, started by ostiarius, keep
+  alive, no network, `status-item` and `notify`): it follows `WATCH` and
+  - shows a Forum status item while a job is active: a panel with each job, where it
+    is ("Printing page 2 of 3"), a progress bar and a Cancel button; gone when none is;
+  - posts a Praeco notice as itself when the person must act (HIGH): out of paper, a
+    jam, a door open, not the printer saved, and offline once it has lasted 2 minutes
+    (`PRELUM_OFFLINE_AFTER`); withdrawn when the job moves on;
+  - posts "didn't print" (NORMAL) when a job fails and "Printed" (LOW, which the shelf
+    keeps without a toast) when it prints; nothing for a cancel; jobs that ended before
+    it started are not told again.
+- **Curia's Printers page** (eighth in the sidebar, after Personas): each printer as a
+  card with its address, state and whether it is shared or which persona it is on, and
+  Identify, Rename (a field opens under the card), Share / Stop sharing and Remove…
+  (pressed twice); Add by address and Find printers nearby; History with Clear
+  history… (pressed twice). The page refreshes every 5 s while it is shown.
+- **Capability `printers-configure`** (system only): mounts the print socket in the
+  app's jail. Only Curia has it.
+
+Checks: unit tests in prelumd (store round trip with history), prelum-status (notices,
+the panel) and Curia (the page). `scripts/prelum-r5-vm.sh` in the FreeBSD VM, with
+frescod, forum-wm, praecod, Curia and prelum-status as alice's apps, and
+`scripts/prelum-fake-printer.py` (a plain-IPP printer whose state a file sets, so it
+runs out of paper on cue) beside ippeveprinter: 40/40 pass (roles; add, identify,
+rename, share, remove in Curia; the out-of-paper notice and its withdrawal, "Printed",
+offline told only after the wait, Cancel from the status item; history kept without the
+document and cleared from Curia).
+
+Not yet: sharing a printer asks nothing of the person (the persona crossing rule is R7,
+with per-persona printers enforced), as are a PIN or password for a printer; "Printed"
+can't be turned off yet; the status item has no Release button for held jobs.
 
 ## 12. Decisions, with recommendations
 

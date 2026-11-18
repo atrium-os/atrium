@@ -254,8 +254,8 @@ pub mod volume_op {
     /// the key and the item is deleted. Needs Sigillum's `VERIFY_USER`
     /// (`NEEDS_VERIFICATION` first).
     pub const VK_FORGET: u16 = 0xB3;
-    /// `str user | key_id[16] | uuid[16] | u64 group` → the persona's name
-    /// (the whole body, UTF-8): a
+    /// `str user | key_id[16] | uuid[16] | u64 group` → the persona's name,
+    /// a NUL, and the label the stick was minted with (UTF-8): a
     /// stick was plugged in (tessera-encryption.md §7.2). Looks for the key
     /// in every persona of the user's store and loads it as `VK_LOAD` does;
     /// the reply names the persona it belongs to. `DENIED`: not this
@@ -268,7 +268,8 @@ pub mod volume_op {
     /// neither.
     pub const VK_RECOVERY: u16 = 0xB5;
     /// `owner | key_id[16] | uuid[16] | slot[256] | u8 keep | str code
-    /// [| handle[16] when code is empty]` → nothing: a stick from
+    /// [| handle[16] when code is empty]` → the stick's name from its slot
+    /// (empty if it has none): a stick from
     /// elsewhere, opened with its recovery code. With a handle, the code is
     /// what the person typed into Arca's field (`U_HOLD` with
     /// `HOLD_FOR_RECOVERY`, as the same user); `DENIED` if it isn't one.

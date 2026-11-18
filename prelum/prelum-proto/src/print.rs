@@ -10,11 +10,15 @@
 //! | `IDENTIFY` 0x05 | postcard `u32` | postcard `String` |
 //! | `REFRESH` 0x06 | postcard `u32` | postcard [`Printer`]: asked again now |
 //! | `NEARBY` 0x07 | postcard `u8`: seconds to listen (at most 10) | postcard `Vec<Nearby>`: printers found by mDNS and confirmed over IPP (§7.1) |
+//! | `SHARE` 0x08 | postcard [`Share`] | postcard `String`: the printer is now shared, or its persona's again (§9) |
+//! | `HISTORY` 0x09 | empty | postcard `Vec<Ended>`: the last 30 days' jobs, newest first (§6.5) |
+//! | `CLEAR_HISTORY` 0x0A | empty | postcard `String` |
 //! | `PRINT` 0x10 | postcard [`Print`], the PDF as the message's one descriptor | postcard `u64` (the job) or a `String` |
 //! | `JOBS` 0x11 | empty | postcard `Vec<Job>` |
 //! | `CANCEL` 0x12 | postcard `u64` | postcard `String` |
 //! | `RELEASE` 0x13 | postcard `u64` | postcard `String`: a held job goes back in its queue |
 //! | `PREVIEW` 0x14 | postcard [`PreviewReq`], the PDF as the one descriptor | postcard [`Previews`]: small sheet images drawn in a render jail (§5.2) |
+//! | `WATCH` 0x16 | postcard `u64`: the last generation seen (0 at first) | postcard [`Watched`]: the jobs once they differ from that generation, or after 25 s unchanged |
 //! | `SAVE_PDF` 0x15 | postcard [`Layout`], the PDF as the one descriptor | postcard `u64` (its size), the rewritten PDF as the reply's one descriptor (§5.2's Save as PDF) |
 //! | `FOR` 0x20 | postcard `u32`: the app's uid, as limend named the sheet's parent | postcard `String`: the app's persona ("" for Personal). Only from prelum-sheet's uid, once per connection: from then on the connection acts for that app's person (§5.2) |
 //!
@@ -22,6 +26,12 @@
 //! `String` to show. Every caller sees only its own printers and jobs: the
 //! daemon keys both by the person, the peer's uid (`getpeereid`), or for
 //! prelum-sheet after `FOR`, the person whose app asked to print.
+//!
+//! Two apps act for their person without `FOR`, named by the launch registry
+//! (never by what they say): Curia's Printers page (`printers-configure`:
+//! everything but printing) and prelum-status, the Forum status item and
+//! Praeco notices (§6.6: `PRINTERS`, `JOBS`, `WATCH`, `CANCEL`, `RELEASE`).
+//! Any other app is refused: apps print through the sheet.
 
 use prelum_ipp_codec::ops::{ColorMode, Quality, Sides};
 use prelum_ipp_codec::printer::{Marker, PrinterState, StateReason};
@@ -39,12 +49,16 @@ pub mod op {
     pub const IDENTIFY: u16 = 0x05;
     pub const REFRESH: u16 = 0x06;
     pub const NEARBY: u16 = 0x07;
+    pub const SHARE: u16 = 0x08;
+    pub const HISTORY: u16 = 0x09;
+    pub const CLEAR_HISTORY: u16 = 0x0A;
     pub const PRINT: u16 = 0x10;
     pub const JOBS: u16 = 0x11;
     pub const CANCEL: u16 = 0x12;
     pub const RELEASE: u16 = 0x13;
     pub const PREVIEW: u16 = 0x14;
     pub const SAVE_PDF: u16 = 0x15;
+    pub const WATCH: u16 = 0x16;
     pub const FOR: u16 = 0x20;
 }
 
@@ -67,6 +81,13 @@ pub struct Add {
     pub uri: String,
     /// What to call it; empty: the printer's own `printer-info` or model.
     pub name: String,
+}
+
+/// Make a printer shared by every persona, or its own persona's again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    pub printer: u32,
+    pub shared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +124,10 @@ pub struct Printer {
     pub new: bool,
     /// Its identity changed since it was saved (§7.3): what it shows now.
     pub changed: Option<Changed>,
+    /// The persona it was added from ("" for Personal), §9.
+    pub persona: String,
+    /// Every persona's (§9).
+    pub shared: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,7 +284,68 @@ pub struct Job {
     pub message: String,
     /// Seconds since the epoch.
     pub submitted: u64,
+    /// What the person may have to do something about (§6.6), and since when
+    /// (seconds since the epoch).
+    pub alert: Option<Alert>,
+    pub alert_since: u64,
 }
+
+/// Why a job needs the person, or may (§6.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Alert {
+    OutOfPaper,
+    Jam,
+    /// A door or cover is open, a tray is out, the output tray is full.
+    Open,
+    /// Not answering: Praeco is told after 2 minutes.
+    Offline,
+    /// Held: the printer is not the one that was saved (§7.3).
+    IdentityChanged,
+    /// Stopped for another reason.
+    Stopped,
+}
+
+impl Alert {
+    /// What to tell the person, about the printer named `printer`.
+    pub fn words(self, printer: &str) -> (String, String) {
+        match self {
+            Alert::OutOfPaper => (format!("{printer} is out of paper"), "Add paper and the job carries on.".into()),
+            Alert::Jam => (format!("Paper is jammed in {printer}"), "Clear the jam and the job carries on.".into()),
+            Alert::Open => (format!("{printer} needs attention"), "A door or tray is open, or the output tray is full.".into()),
+            Alert::Offline => (format!("{printer} is offline"), "The job waits until the printer answers again.".into()),
+            Alert::IdentityChanged => (format!("{printer} is not the printer you saved"), "The job is held. Check the printer in Settings, Printers.".into()),
+            Alert::Stopped => (format!("{printer} has stopped"), "The job waits until the printer is ready.".into()),
+        }
+    }
+}
+
+/// What `WATCH` answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watched {
+    pub generation: u64,
+    pub jobs: Vec<Job>,
+}
+
+/// A job that ended, as history keeps it (§6.5): no document content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ended {
+    pub job: u64,
+    /// "Document" when the printer has titles off.
+    pub title: String,
+    /// The printer's name when the job ended.
+    pub printer: String,
+    pub sheets: u32,
+    /// Seconds since the epoch.
+    pub at: u64,
+    /// Done, Cancelled or Failed.
+    pub result: Phase,
+    pub message: String,
+    /// "" for Personal.
+    pub persona: String,
+}
+
+/// How long history keeps a job.
+pub const HISTORY_DAYS: u64 = 30;
 
 pub mod client {
     use std::io;
@@ -355,6 +441,19 @@ pub mod client {
         }
         pub fn nearby(&mut self, seconds: u8) -> Res<Vec<Nearby>> {
             self.call(op::NEARBY, &Self::enc(&seconds), None)
+        }
+        pub fn share(&mut self, s: &Share) -> Res<String> {
+            self.call(op::SHARE, &Self::enc(s), None)
+        }
+        pub fn history(&mut self) -> Res<Vec<Ended>> {
+            self.call(op::HISTORY, &[], None)
+        }
+        pub fn clear_history(&mut self) -> Res<String> {
+            self.call(op::CLEAR_HISTORY, &[], None)
+        }
+        /// The jobs once they differ from generation `after`, or after 25 s.
+        pub fn watch(&mut self, after: u64) -> Res<Watched> {
+            self.call(op::WATCH, &Self::enc(&after), None)
         }
         pub fn print(&mut self, p: &Print, pdf: &dyn AsRawFd) -> Res<u64> {
             self.call(op::PRINT, &Self::enc(p), Some(pdf))

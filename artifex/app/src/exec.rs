@@ -218,6 +218,8 @@ impl Exec for Local {
                 uses: vec![],
                 running: true,
                 object_cache: false,
+                hosts: vec![],
+                hosts_default: true,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));

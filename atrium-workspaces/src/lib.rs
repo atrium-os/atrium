@@ -23,7 +23,7 @@ pub fn em(pt: f32) -> f32 {
 
 pub const SCRATCH: &str = "scratch";
 /// The network choices, as the record names them and as shown.
-pub const NETWORKS: [(&str, &str); 2] = [("outbound", "Outbound"), ("none", "None")];
+pub const NETWORKS: [(&str, &str); 3] = [("outbound", "Outbound"), ("registries", "Registries"), ("none", "None")];
 
 /// What a press or a click asked for; the loop carries it out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +48,11 @@ pub enum Act {
     DuplicateForm(String),
     /// Share compiled objects with linked workspaces, or stop (§5.4, W9).
     ToggleObjects(String),
+    /// A `registries` workspace's host list (dev-tools.md §5.2): add the
+    /// host typed in the field, take one away, or go back to the defaults.
+    AddHost(String),
+    RemoveHost(String, String),
+    DefaultHosts(String),
 }
 
 /// What the loop asks portcullisd.
@@ -56,7 +61,7 @@ pub enum Want {
     List,
     /// Made, then its terminal opened with the same press.
     New { name: String, toolchain: String, network: String, activation: [u8; 16] },
-    Set { name: String, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool> },
+    Set { name: String, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool>, hosts: Option<Vec<String>> },
     Stop(String),
     Delete(String, [u8; 16]),
     Open(String, [u8; 16]),
@@ -90,6 +95,14 @@ pub fn valid_name(n: &str) -> bool {
     !b.is_empty() && b.len() <= 32
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// portcullisd's rule for a host on the list: a plain name, no wildcard, no
+/// address.
+pub fn valid_host(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 253 && !h.starts_with(['.', '-']) && !h.ends_with('.')
+        && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && h.bytes().any(|b| b.is_ascii_lowercase())
 }
 
 pub fn title(name: &str) -> String {
@@ -192,7 +205,7 @@ impl State {
                 }
                 let tool = self.available().get(self.new_tool).map(|t| t.id.clone()).unwrap_or_else(|| "c".into());
                 self.busy = Some(format!("Making {}…", title(&name)));
-                Some(Want::New { name, toolchain: tool, network: NETWORKS[self.new_net.min(1)].0.into(), activation: token })
+                Some(Want::New { name, toolchain: tool, network: NETWORKS[self.new_net.min(NETWORKS.len() - 1)].0.into(), activation: token })
             }
             Act::Open(n, token) => {
                 self.busy = Some(format!("Opening {}…", title(&n)));
@@ -201,14 +214,44 @@ impl State {
             Act::Stop(n) => Some(Want::Stop(n)),
             Act::ToggleObjects(n) => {
                 let on = self.find(&n)?.object_cache;
-                Some(Want::Set { name: n, network: None, uses: None, object_cache: Some(!on) })
+                Some(Want::Set { name: n, network: None, uses: None, object_cache: Some(!on), hosts: None })
             }
             Act::SetNetwork(n, net) => {
-                (self.find(&n)?.network != net).then(|| Want::Set { name: n, network: Some(net), uses: None, object_cache: None })
+                (self.find(&n)?.network != net).then(|| Want::Set { name: n, network: Some(net), uses: None, object_cache: None, hosts: None })
             }
             Act::ToggleUse(n, other) => {
                 let uses = self.toggled_uses(&n, &other)?;
-                Some(Want::Set { name: n, network: None, uses: Some(uses), object_cache: None })
+                Some(Want::Set { name: n, network: None, uses: Some(uses), object_cache: None, hosts: None })
+            }
+            Act::AddHost(n) => {
+                let h = text.trim().trim_end_matches('.').to_ascii_lowercase();
+                if !valid_host(&h) {
+                    self.note = Some(("A host name like crates.io: letters, digits, dots and dashes".into(), true));
+                    return None;
+                }
+                let ws = self.find(&n)?;
+                if ws.hosts.iter().any(|x| *x == h) {
+                    self.note = Some((format!("{h} is on the list already"), false));
+                    return None;
+                }
+                let mut hosts = ws.hosts.clone();
+                hosts.push(h);
+                Some(Want::Set { name: n, network: None, uses: None, object_cache: None, hosts: Some(hosts) })
+            }
+            Act::RemoveHost(n, h) => {
+                let ws = self.find(&n)?;
+                let hosts: Vec<String> = ws.hosts.iter().filter(|x| **x != h).cloned().collect();
+                if hosts.len() == ws.hosts.len() {
+                    return None;
+                }
+                if hosts.is_empty() {
+                    self.note = Some(("The last host can't go: with none, the default registries come back".into(), true));
+                    return None;
+                }
+                Some(Want::Set { name: n, network: None, uses: None, object_cache: None, hosts: Some(hosts) })
+            }
+            Act::DefaultHosts(n) => {
+                (!self.find(&n)?.hosts_default).then(|| Want::Set { name: n, network: None, uses: None, object_cache: None, hosts: Some(Vec::new()) })
             }
             Act::AskDelete => {
                 self.confirm_delete = true;
@@ -249,6 +292,8 @@ pub struct WorkspacesView {
     pub name: Mutable<TextEdit>,
     /// The project folder to Run, in the shown workspace's `work`.
     pub project: Mutable<TextEdit>,
+    /// A host to add to a `registries` workspace's list.
+    pub host: Mutable<TextEdit>,
     pub size: Mutable<(f32, f32)>,
     pub queue: Queue,
 }
@@ -291,7 +336,7 @@ pub fn row_rect(i: usize) -> Rect {
 }
 
 fn summary(w: &WorkspaceInfo) -> String {
-    let net = if w.network == "none" { "no network" } else { "outbound" };
+    let net = match w.network.as_str() { "none" => "no network", "registries" => "registries only", _ => "outbound" };
     format!("{} · {net}{}", tool_name(&w.toolchain), if w.running { " · running" } else { "" })
 }
 
@@ -400,7 +445,7 @@ impl View for WorkspacesView {
             y += em(16.0);
             let st = self.state.clone();
             ctx.key(220);
-            Segmented::new(Mutable::new(s.new_net), NETWORKS.iter().map(|n| n.1)).at(x0, y).width(em(220.0))
+            Segmented::new(Mutable::new(s.new_net), NETWORKS.iter().map(|n| n.1)).at(x0, y).width(em(330.0))
                 .on_change(move |i| {
                     let mut v = st.get_cloned();
                     v.new_net = i;
@@ -437,10 +482,35 @@ impl View for WorkspacesView {
             let cur = NETWORKS.iter().position(|n| n.0 == ws.network).unwrap_or(0);
             let (qq, n) = (q.clone(), name.clone());
             ctx.key(310);
-            Segmented::new(Mutable::new(cur), NETWORKS.iter().map(|n| n.1)).at(x0, y).width(em(220.0))
+            Segmented::new(Mutable::new(cur), NETWORKS.iter().map(|n| n.1)).at(x0, y).width(em(330.0))
                 .on_change(move |i| push(&qq, Act::SetNetwork(n.clone(), NETWORKS[i].0.into())))
                 .render(ctx);
             y += em(40.0);
+            if ws.network == "registries" {
+                // Its one way out is a proxy that reaches only these, on 443
+                // (dev-tools.md §5.2).
+                text(ctx, x0, y, if ws.hosts_default { "It reaches the default registries:" } else { "It reaches only these hosts:" },
+                     type_size::SM, Weight::Medium, t.text_secondary());
+                y += em(22.0);
+                for (i, h) in ws.hosts.iter().enumerate() {
+                    text(ctx, x0 + em(8.0), y, h, type_size::SM, Weight::Regular, t.text_primary());
+                    if ws.hosts.len() > 1 {
+                        ctx.key(330 + i as u64);
+                        Button::ghost("Remove").at(x0 + em(240.0), y - em(12.0)).width(em(80.0))
+                            .on_click(plain(q, Act::RemoveHost(name.clone(), h.clone()))).render(ctx);
+                    }
+                    y += em(26.0);
+                }
+                ctx.key(320);
+                TextField::new(self.host.clone()).placeholder("add a host, e.g. proxy.golang.org").at(x0, y).width(em(230.0)).render(ctx);
+                ctx.key(321);
+                Button::secondary("Add").at(x0 + em(240.0), y).width(em(80.0)).on_click(plain(q, Act::AddHost(name.clone()))).render(ctx);
+                if !ws.hosts_default {
+                    ctx.key(322);
+                    Button::ghost("Use the defaults").at(x0 + em(330.0), y).width(em(150.0)).on_click(plain(q, Act::DefaultHosts(name.clone()))).render(ctx);
+                }
+                y += em(48.0);
+            }
             text(ctx, x0, y, "A change stops the workspace; it starts again with its next terminal.", type_size::SM, Weight::Regular, t.text_tertiary());
             y += em(36.0);
 
@@ -530,7 +600,8 @@ mod tests {
 
     fn ws(name: &str, uses: &[&str]) -> WorkspaceInfo {
         WorkspaceInfo { name: name.into(), toolchain: "c".into(), persona: "personal".into(), network: "outbound".into(),
-                        uses: uses.iter().map(|s| s.to_string()).collect(), running: false, object_cache: false }
+                        uses: uses.iter().map(|s| s.to_string()).collect(), running: false, object_cache: false,
+                        hosts: vec![], hosts_default: true }
     }
 
     fn state() -> State {
@@ -569,13 +640,13 @@ mod tests {
     fn uses_toggle_and_keep_a_used_one() {
         let mut s = state();
         assert_eq!(s.act(Act::ToggleUse("appb".into(), "liba".into()), ""),
-                   Some(Want::Set { name: "appb".into(), network: None, uses: Some(vec![]), object_cache: None }));
+                   Some(Want::Set { name: "appb".into(), network: None, uses: Some(vec![]), object_cache: None, hosts: None }));
         assert_eq!(s.act(Act::ToggleUse("scratch".into(), "liba".into()), ""),
-                   Some(Want::Set { name: "scratch".into(), network: None, uses: Some(vec!["liba".into()]), object_cache: None }));
+                   Some(Want::Set { name: "scratch".into(), network: None, uses: Some(vec!["liba".into()]), object_cache: None, hosts: None }));
         assert_eq!(s.users_of("liba"), vec!["appb".to_string()]);
         assert!(s.act(Act::SetNetwork("scratch".into(), "outbound".into()), "").is_none(), "no change, nothing asked");
         assert_eq!(s.act(Act::ToggleObjects("liba".into()), ""),
-                   Some(Want::Set { name: "liba".into(), network: None, uses: None, object_cache: Some(true) }));
+                   Some(Want::Set { name: "liba".into(), network: None, uses: None, object_cache: Some(true), hosts: None }));
     }
 
     #[test]
@@ -603,5 +674,33 @@ mod tests {
         assert!(s.act(Act::Run("scratch".into(), [2; 16]), "../x").is_none());
         assert_eq!(s.act(Act::Run("scratch".into(), [2; 16]), " /hello/ "),
                    Some(Want::Run { name: "scratch".into(), project: "hello".into(), activation: [2; 16] }));
+    }
+
+    #[test]
+    fn a_registries_workspace_edits_its_host_list() {
+        let mut s = state();
+        let mut w = ws("net", &[]);
+        w.network = "registries".into();
+        w.hosts = vec!["crates.io".into(), "static.crates.io".into()];
+        w.hosts_default = true;
+        s.list.push(w);
+        assert_eq!(s.act(Act::AddHost("net".into()), " Proxy.Golang.org. "),
+                   Some(Want::Set { name: "net".into(), network: None, uses: None, object_cache: None,
+                                    hosts: Some(vec!["crates.io".into(), "static.crates.io".into(), "proxy.golang.org".into()]) }));
+        assert!(s.act(Act::AddHost("net".into()), "*.evil.com").is_none(), "no wildcards");
+        assert!(s.act(Act::AddHost("net".into()), "10.0.0.1").is_none(), "no addresses");
+        assert!(s.act(Act::AddHost("net".into()), "crates.io").is_none(), "already there");
+        assert_eq!(s.act(Act::RemoveHost("net".into(), "crates.io".into()), ""),
+                   Some(Want::Set { name: "net".into(), network: None, uses: None, object_cache: None,
+                                    hosts: Some(vec!["static.crates.io".into()]) }));
+        assert!(s.act(Act::DefaultHosts("net".into()), "").is_none(), "already the defaults");
+        let w = s.list.iter_mut().find(|w| w.name == "net").unwrap();
+        w.hosts = vec!["crates.io".into()];
+        w.hosts_default = false;
+        assert!(s.act(Act::RemoveHost("net".into(), "crates.io".into()), "").is_none(), "the last one stays");
+        assert_eq!(s.act(Act::DefaultHosts("net".into()), ""),
+                   Some(Want::Set { name: "net".into(), network: None, uses: None, object_cache: None, hosts: Some(vec![]) }));
+        assert_eq!(s.act(Act::SetNetwork("scratch".into(), "registries".into()), ""),
+                   Some(Want::Set { name: "scratch".into(), network: Some("registries".into()), uses: None, object_cache: None, hosts: None }));
     }
 }

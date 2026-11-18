@@ -623,9 +623,14 @@ impl State {
                 let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
                 let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona), older_read_only: false };
                 let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                // The persona, then the name the stick was given (the item's
+                // account), for Scrinium and the bar to call it by.
+                let mut answer = persona.into_bytes();
+                answer.push(0);
+                answer.extend_from_slice(m.account.as_bytes());
                 return match self.keyring.as_mut().unwrap().load(&info, key) {
-                    Ok(()) => ok(persona.into_bytes()),
-                    Err(e) if e == libc::EEXIST => ok(persona.into_bytes()),
+                    Ok(()) => ok(answer),
+                    Err(e) if e == libc::EEXIST => ok(answer),
                     Err(_) => reply(status::INTERNAL),
                 };
             }
@@ -848,7 +853,7 @@ impl State {
                 if v.len() != VALUE_LEN {
                     return reply(status::INTERNAL);
                 }
-                let Some((code, slot)) = crate::recovery::make(&v.as_ref()[..32], &uuid, &key_id, kdf) else {
+                let Some((code, slot)) = crate::recovery::make(&v.as_ref()[..32], &uuid, &key_id, &m.account, kdf) else {
                     return reply(status::INTERNAL);
                 };
                 let mut out = tri!(LockedBuf::zeroed(slot.len() + code.len()).map_err(Error::Io));
@@ -884,7 +889,7 @@ impl State {
                 if let Err(r) = self.volume_store(&user, &persona, false) {
                     return r;
                 }
-                let vk = match crate::recovery::open(&slot, &uuid, &key_id, &code) {
+                let (vk, name) = match crate::recovery::open(&slot, &uuid, &key_id, &code) {
                     Ok(k) => k,
                     Err(crate::recovery::OpenError::BadCode) => return malformed(),
                     Err(_) => return reply(status::DENIED),
@@ -902,7 +907,8 @@ impl State {
                                 class: Class::AfterFirstUnlock,
                                 kind: Kind::VolumeKey,
                                 provenance: Provenance::UserTyped,
-                                account: "recovered stick",
+                                // The name it was given at format, from the slot.
+                                account: &name,
                                 scope: &encode_scope(&key_id, &uuid, 0),
                                 value: value.as_ref(),
                             }));
@@ -913,8 +919,8 @@ impl State {
                 let info = LoadInfo { key_id, uuid, group: 0, high_water: 0, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = vk.as_ref().try_into().unwrap();
                 match self.keyring.as_mut().unwrap().load(&info, key) {
-                    Ok(()) => ok(Vec::new()),
-                    Err(e) if e == libc::EEXIST => ok(Vec::new()),
+                    Ok(()) => ok(name.into_bytes()),
+                    Err(e) if e == libc::EEXIST => ok(name.into_bytes()),
                     Err(_) => reply(status::INTERNAL),
                 }
             }

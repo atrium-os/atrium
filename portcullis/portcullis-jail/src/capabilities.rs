@@ -49,6 +49,11 @@ pub fn apply_all(
     if caps.status_item == Some(true) {
         apply_socket("forum-status.sock", jc, opts);
     }
+    if caps.printers_configure == Some(true) {
+        // prelumd (printing.md §6.4), which knows the settings app by the
+        // launch registry and gives it the printers ops, never printing.
+        apply_socket("print.sock", jc, opts);
+    }
     if caps.media_control == Some(true) {
         apply_media_control(jc, opts);
     }

@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use prelum_proto::frame;
-use prelum_proto::print::{self, status, Layout, PreviewReq, Previews, SheetImage};
+use prelum_proto::print::{self, op, status, Layout, PreviewReq, Previews, SheetImage};
 use prelum_proto::render;
 
 use crate::daemon::{media_ok, short, Daemon, Fail};
@@ -67,10 +67,22 @@ impl Daemon {
             return Err((status::NOT_ALLOWED, "only the print sheet acts for an app".into()));
         }
         match (self.cfg().person_of)(app_uid) {
-            Some((person, persona)) => Ok((person, persona.unwrap_or_default())),
+            Some((person, persona, _)) => Ok((person, persona.unwrap_or_default())),
             None => Err((status::NOT_ALLOWED, "not an app".into())),
         }
     }
+
+    /// Who a peer that is not the sheet is: the person themselves, Curia or
+    /// prelum-status acting for theirs, or another app (refused).
+    pub fn caller(&self, peer: u32) -> Caller {
+        match (self.cfg().person_of)(peer) {
+            None => Caller::Person,
+            Some((person, persona, app)) if app == crate::daemon::CURIA_APP => Caller::Curia { person, persona: persona.unwrap_or_default() },
+            Some((person, _, app)) if app == crate::daemon::STATUS_APP => Caller::Status { person },
+            Some(_) => Caller::App,
+        }
+    }
+
 
     /// Small images of the sheets asked for, drawn in a render jail.
     pub fn preview(&self, r: &PreviewReq, pdf: OwnedFd) -> Result<Previews, Fail> {
@@ -140,6 +152,30 @@ impl Daemon {
         r?;
         out.seek(SeekFrom::Start(0)).map_err(|e| (status::FAILED, format!("spool: {e}")))?;
         Ok((n, out))
+    }
+}
+
+/// A connection's caller, other than the sheet (§6.4's clients).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Caller {
+    /// Not an app: the person (prelumctl, the console).
+    Person,
+    /// Curia's Printers page: everything but printing.
+    Curia { person: u32, persona: String },
+    /// prelum-status: jobs, cancel, release, printers' names.
+    Status { person: u32 },
+    /// Any other app: apps print through the sheet.
+    App,
+}
+
+impl Caller {
+    pub fn may(&self, o: u16) -> bool {
+        match self {
+            Caller::Person => true,
+            Caller::Curia { .. } => !matches!(o, op::PRINT | op::PREVIEW | op::SAVE_PDF),
+            Caller::Status { .. } => matches!(o, op::PRINTERS | op::JOBS | op::WATCH | op::CANCEL | op::RELEASE),
+            Caller::App => false,
+        }
     }
 }
 

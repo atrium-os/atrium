@@ -1533,8 +1533,9 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
     match daemon::workspaces(req) {
         Ok(Some((list, _))) => {
             for w in list {
-                println!("{}\t{}\t{}\t{}\tuses={}\t{}\t{}", w.name, w.toolchain, w.persona, w.network,
-                         w.uses.join(","), if w.running { "running" } else { "stopped" }, if w.object_cache { "objects=on" } else { "objects=off" });
+                println!("{}\t{}\t{}\t{}\tuses={}\t{}\t{}\thosts={}{}", w.name, w.toolchain, w.persona, w.network,
+                         w.uses.join(","), if w.running { "running" } else { "stopped" }, if w.object_cache { "objects=on" } else { "objects=off" },
+                         w.hosts.join(","), if w.hosts_default { " (default)" } else { "" });
             }
             ExitCode::SUCCESS
         }

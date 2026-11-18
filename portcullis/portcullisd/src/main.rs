@@ -2389,7 +2389,7 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     match workspace::list(owner) {
         Ok(l) => Response::WorkspaceList {
             workspaces: l.into_iter().map(|(r, running)| portcullis_ipc::WorkspaceInfo {
-                object_cache: r.object_cache,
+                object_cache: r.object_cache, hosts: r.egress_hosts(), hosts_default: r.hosts.is_empty(),
                 name: r.name, toolchain: r.toolchain, persona: r.persona, network: r.network, uses: r.uses, running,
             }).collect(),
             toolchains: workspace::toolchains().into_iter().map(|(id, name, available)| portcullis_ipc::Toolchain {

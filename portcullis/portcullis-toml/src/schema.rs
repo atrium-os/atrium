@@ -470,6 +470,11 @@ pub struct Capabilities {
     /// socket. The app never draws in the bar.
     #[serde(rename = "status-item")]
     pub status_item: Option<bool>,
+    /// The person's printers (printing.md §6.4): add, identify, rename,
+    /// share and remove them, and see and clear print history, over
+    /// prelumd's `print/` socket. Restricted to the settings app.
+    #[serde(rename = "printers-configure")]
+    pub printers_configure: Option<bool>,
     /// An output device driver (vinculum-audio): add an output to choragusd
     /// and read that output's mix over `audio-device/`. It hears no app's
     /// own samples and sets no app's level (lyra-external-device.md).
@@ -533,7 +538,7 @@ impl Capabilities {
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
             ("navigator-broker", self.navigator_broker),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
-            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item),
+            ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
             ("protected-media", self.protected_media),
         ];
@@ -753,6 +758,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         workspace_exec:   ovr.workspace_exec.or(base.workspace_exec),
         bluetooth_control: ovr.bluetooth_control.or(base.bluetooth_control),
         status_item:      ovr.status_item.or(base.status_item),
+        printers_configure: ovr.printers_configure.or(base.printers_configure),
         audio_device:     ovr.audio_device.or(base.audio_device),
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),

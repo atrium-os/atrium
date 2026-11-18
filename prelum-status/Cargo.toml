@@ -1,0 +1,22 @@
+[package]
+name = "prelum-status"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "What the person sees while a job prints (docs/spec/printing.md §6.6): a Forum status item while any job is active (printer, page N of M, Cancel) and Praeco notices when a job needs the person or ends badly. One per session, acting for its person with prelumd's status ops only."
+
+[lib]
+name = "prelum_status"
+path = "src/lib.rs"
+
+[[bin]]
+name = "prelum-status"
+path = "src/bin/prelum-status.rs"
+
+[dependencies]
+prelum-proto = { path = "../prelum/prelum-proto" }
+forum-ctl = { path = "../forum-ctl" }
+praeco = { path = "../praeco" }
+
+[workspace]

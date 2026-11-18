@@ -74,8 +74,9 @@ pub struct Volume {
     pub size_bytes: u64,
     pub free_bytes: u64,
     pub read_only: bool,
-    /// What to call it: empty for a stick (the file manager names it),
-    /// `user@host:path` for a network share.
+    /// What to call it: the name a sealed stick was given at format (empty
+    /// for a plain stick or an unnamed one, which the file manager names by
+    /// its size), `user@host:path` for a network share.
     pub label: String,
     /// A trusted (sealed) stick: the persona whose key opened it, for its
     /// chip (personas.md §5.1). Empty otherwise.

@@ -1110,12 +1110,14 @@ fn stick_menu(sticks: &[atrium_media::Volume], note: Option<&str>) -> (Vec<MenuI
             let mut c = v.persona.chars();
             c.next().map(|f| format!("{}{}, ", f.to_uppercase(), c.as_str())).unwrap_or_default()
         };
+        // A sealed stick's name from format, else its device.
+        let name = if v.label.trim().is_empty() || v.part.starts_with("share-") { v.part.as_str() } else { v.label.trim() };
         let text = if v.locked {
             let what = if v.older { "older copy, Locked" } else { "Locked: encrypted stick from another machine or persona" };
-            format!("{} · {what}", v.part)
+            format!("{name} · {what}")
         } else {
             let ro = if v.older { ", older copy, read-only" } else if v.read_only { ", read-only" } else { "" };
-            format!("{} · {whose}{}, {} free{ro}", v.part, human_size(v.size_bytes), human_size(v.free_bytes))
+            format!("{name} · {whose}{}, {} free{ro}", human_size(v.size_bytes), human_size(v.free_bytes))
         };
         let head = MenuItem::new(text).enabled(false);
         items.push(if i > 0 || note.is_some() { head.separated() } else { head });
@@ -1125,7 +1127,7 @@ fn stick_menu(sticks: &[atrium_media::Volume], note: Option<&str>) -> (Vec<MenuI
             items.push(MenuItem::new(how.to_string()).enabled(false));
             parts.push(None);
         }
-        items.push(MenuItem::new(format!("Eject {}", v.part)));
+        items.push(MenuItem::new(format!("Eject {name}")));
         parts.push(Some(v.part.clone()));
     }
     (items, parts)
@@ -1529,11 +1531,12 @@ mod tests {
 
     #[test]
     fn sealed_sticks_say_whose_and_locked_ones_say_where_to_open_them() {
-        let work = atrium_media::Volume { persona: "work".into(), ..stick("da0p1") };
+        let work = atrium_media::Volume { persona: "work".into(), label: "Holiday".into(), ..stick("da0p1") };
         let locked = atrium_media::Volume { mountpoint: String::new(), locked: true, recovery: true, ..stick("da1p1") };
         let (items, parts) = stick_menu(&[work, locked], None);
         let labels: Vec<String> = items.iter().map(|m| m.label.clone()).collect();
-        assert_eq!(labels[0], "da0p1 · Work, 80 MB, 19 MB free");
+        assert_eq!(labels[0], "Holiday · Work, 80 MB, 19 MB free");
+        assert_eq!(labels[1], "Eject Holiday");
         assert_eq!(labels[2], "da1p1 · Locked: encrypted stick from another machine or persona");
         assert_eq!(labels[3], "Enter its recovery code in Scrinium");
         assert_eq!(parts, [None, Some("da0p1".to_string()), None, None, Some("da1p1".to_string())]);
