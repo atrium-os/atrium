@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 
 pub mod driver;
 pub mod font;
+pub mod publisher;
+
+use publisher::{Publisher, PublisherEntry};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -291,6 +294,9 @@ pub struct Release {
     pub archive_sha256: String,
     pub archive_size: u64,
     pub urls: Vec<String>,
+    /// The publisher record whose key signed (C7); empty for root.toml keys.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub publisher: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -328,17 +334,21 @@ pub struct Entry {
     pub yank: Option<Yank>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locations: Option<Locations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<PublisherEntry>,
 }
 
 impl Entry {
     pub fn parse(bytes: &[u8]) -> Result<Entry, String> {
         let t = std::str::from_utf8(bytes).map_err(|_| "entry: not UTF-8")?;
         let e: Entry = toml::from_str(t).map_err(|e| format!("entry: {e}"))?;
-        let n = [e.release.is_some(), e.yank.is_some(), e.locations.is_some()].iter().filter(|x| **x).count();
+        let n = [e.release.is_some(), e.yank.is_some(), e.locations.is_some(), e.publisher.is_some()]
+            .iter().filter(|x| **x).count();
         let want = match e.kind.as_str() {
             "release" => e.release.is_some(),
             "yank" => e.yank.is_some(),
             "locations" => e.locations.is_some(),
+            "publisher" => e.publisher.is_some(),
             _ => false,
         };
         if n != 1 || !want {
@@ -392,26 +402,55 @@ pub fn describe(manifest: &str) -> Result<Described, String> {
                    content: b.and_then(|b| b.content.clone()) })
 }
 
-/// Check one release against the root's scopes and its own signature.
-pub fn check_release(r: &Release, root: &Root) -> Result<(), String> {
+/// Who may publish in a catalog: its root.toml, whether it is a third-party
+/// catalog (apps only, never `org.atrium.`, publishers only), and the
+/// publisher records seen so far in its log.
+pub struct Scope<'a> {
+    pub root: &'a Root,
+    pub third_party: bool,
+    pub publishers: &'a [Publisher],
+}
+
+/// The signing key's pem and scopes for a release.
+fn signer_of<'a>(r: &Release, s: &'a Scope) -> Result<(&'a str, &'a [String], &'a [String]), String> {
     let what = format!("{} {} {}", r.id, r.version, r.arch);
-    let key = root.key(&r.signer).ok_or_else(|| format!("{what}: signer not in {ROOT}"))?;
-    // C1: the Atrium catalog publishes only what Atrium builds (opifex.md §1):
-    // platform keys. Third-party publisher records come with C7.
+    if !r.publisher.is_empty() {
+        let p = s.publishers.iter().find(|p| p.id == r.publisher)
+            .ok_or_else(|| format!("{what}: publisher {} not registered", r.publisher))?;
+        if p.key_id != r.signer {
+            return Err(format!("{what}: not signed by {}'s current key", p.id));
+        }
+        return Ok((&p.key, &p.prefixes, &p.kinds));
+    }
+    if s.third_party {
+        return Err(format!("{what}: a third-party catalog publishes through publisher records"));
+    }
+    let key = s.root.key(&r.signer).ok_or_else(|| format!("{what}: signer not in {ROOT}"))?;
+    // The Atrium catalog publishes only what Atrium builds (opifex.md §1).
     if !key.roles.iter().any(|x| x == "platform") {
         return Err(format!("{what}: signer is not a publishing key"));
     }
-    if !key.kinds.iter().any(|k| *k == r.kind) {
+    Ok((&key.pem, &key.prefixes, &key.kinds))
+}
+
+/// Check one release against its signer's scopes and its own signature.
+pub fn check_release(r: &Release, s: &Scope) -> Result<(), String> {
+    let what = format!("{} {} {}", r.id, r.version, r.arch);
+    let (pem, prefixes, kinds) = signer_of(r, s)?;
+    if s.third_party && (r.kind != "app" || r.id.starts_with("org.atrium.")) {
+        return Err(format!("{what}: a third-party catalog carries apps only, never org.atrium."));
+    }
+    if !kinds.iter().any(|k| *k == r.kind) {
         return Err(format!("{what}: signer may not publish kind {}", r.kind));
     }
-    if !verify(r.manifest.as_bytes(), &r.sig, &key.pem) {
+    if !verify(r.manifest.as_bytes(), &r.sig, pem) {
         return Err(format!("{what}: manifest not signed by its signer"));
     }
     let d = describe(&r.manifest)?;
     if d.kind != r.kind || d.id != r.id || d.version != r.version {
         return Err(format!("{what}: entry doesn't match its manifest ({} {} {})", d.kind, d.id, d.version));
     }
-    if r.kind != "layer" && !key.prefixes.iter().any(|p| r.id.starts_with(p.as_str())) {
+    if r.kind != "layer" && !prefixes.iter().any(|p| r.id.starts_with(p.as_str())) {
         return Err(format!("{what}: id outside the signer's prefixes"));
     }
     if r.id.starts_with("dev.") {
@@ -467,10 +506,14 @@ pub fn decode_bundle(b: &[u8], want: u64) -> Result<Vec<Vec<u8>>, String> {
 
 // ── the publishing side: a catalog folder ───────────────────────────────────
 
-pub struct Log { pub dir: PathBuf }
+pub struct Log { pub dir: PathBuf, pub third_party: bool }
 
 impl Log {
-    pub fn open(dir: &Path) -> Log { Log { dir: dir.to_path_buf() } }
+    /// The Atrium catalog's log (platform keys from root.toml).
+    pub fn open(dir: &Path) -> Log { Log { dir: dir.to_path_buf(), third_party: false } }
+
+    /// A third-party catalog's log: apps from publisher records only.
+    pub fn third_party(dir: &Path) -> Log { Log { dir: dir.to_path_buf(), third_party: true } }
 
     pub fn root(&self) -> Result<Root, String> {
         Root::parse(&fs::read_to_string(self.dir.join(ROOT)).map_err(|e| format!("{ROOT}: {e}"))?)
@@ -502,19 +545,15 @@ impl Log {
     pub fn append(&self, new: &[Entry]) -> Result<u64, String> {
         let root = self.root()?;
         let mut all = self.entries()?;
+        // Replay what is there, exactly as a machine will, then the new ones.
+        let mut local = Local::default();
         let mut seen = HashSet::new();
-        for e in &all {
-            if let Ok(Entry { release: Some(r), .. }) = Entry::parse(e) {
-                seen.insert((r.kind, r.id, r.version, r.arch));
-            }
+        for (i, e) in all.iter().enumerate() {
+            let e = Entry::parse(e).map_err(|m| format!("entry {i}: {m}"))?;
+            apply(&e, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {i}: {m}"))?;
         }
         for e in new {
-            if let Some(r) = &e.release {
-                check_release(r, &root)?;
-                if !seen.insert((r.kind.clone(), r.id.clone(), r.version.clone(), r.arch.clone())) {
-                    return Err(format!("{} {} {} is published already", r.id, r.version, r.arch));
-                }
-            }
+            apply(e, &root, self.third_party, &mut local, &mut seen)?;
             all.push(e.bytes());
         }
         let d = self.dir.join(ENTRIES);
@@ -566,9 +605,11 @@ pub fn release_entry(pkg: &Path, arch: &str, archive_sha256: &str, archive_size:
         release: Some(Release {
             id: d.id, version: d.version, arch: arch.into(), kind: d.kind, signer: key_id(signer_pem)?,
             manifest, sig: sig.trim().into(), archive_sha256: archive_sha256.into(), archive_size, urls,
+            publisher: String::new(),
         }),
         yank: None,
         locations: None,
+        publisher: None,
     })
 }
 
@@ -580,6 +621,7 @@ pub fn yank_entry(id: &str, version: &str, reason: &str, key_pem: &str, pub_pem:
         yank: Some(Yank { id: id.into(), version: version.into(), reason: reason.into(), signer: key_id(pub_pem)?,
                           sig: sign(Yank::message(id, version, reason).as_bytes(), key_pem)? }),
         locations: None,
+        publisher: None,
     })
 }
 
@@ -605,6 +647,8 @@ pub struct Local {
     pub yanked: Vec<(String, String)>,
     #[serde(default, rename = "release")]
     pub releases: Vec<Release>,
+    #[serde(default, rename = "publisher")]
+    pub publishers: Vec<Publisher>,
 }
 
 impl Local {
@@ -634,7 +678,7 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// A machine's view of one catalog, kept in a state folder:
 /// `root.toml` (pinned), `leaves` (accepted leaf hashes), `head`, `catalog.toml`.
-pub struct Client { pub dir: PathBuf }
+pub struct Client { pub dir: PathBuf, pub third_party: bool }
 
 const LEAVES: &str = "leaves";
 pub const LOCAL: &str = "catalog.toml";
@@ -644,10 +688,14 @@ impl Client {
     pub fn init(dir: &Path, root_text: &str) -> Result<Client, String> {
         Root::parse(root_text)?;
         write_atomic(&dir.join(ROOT), root_text.as_bytes())?;
-        Ok(Client { dir: dir.to_path_buf() })
+        Ok(Client { dir: dir.to_path_buf(), third_party: false })
     }
 
-    pub fn open(dir: &Path) -> Client { Client { dir: dir.to_path_buf() } }
+    /// The Atrium catalog's state folder.
+    pub fn open(dir: &Path) -> Client { Client { dir: dir.to_path_buf(), third_party: false } }
+
+    /// A third-party catalog's state folder: apps only, from publisher records.
+    pub fn third_party(dir: &Path) -> Client { Client { dir: dir.to_path_buf(), third_party: true } }
 
     pub fn root(&self) -> Result<Root, String> {
         Root::parse(&fs::read_to_string(self.dir.join(ROOT)).map_err(|e| format!("pinned {ROOT}: {e}"))?)
@@ -715,7 +763,7 @@ impl Client {
                     continue;
                 }
                 let entry = Entry::parse(e).map_err(|m| format!("entry {idx}: {m}"))?;
-                apply(&entry, &root, &mut local, &mut seen).map_err(|m| format!("entry {idx}: {m}"))?;
+                apply(&entry, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {idx}: {m}"))?;
                 leaves.push(h);
             }
             n += 1;
@@ -736,22 +784,42 @@ impl Client {
     }
 }
 
-fn apply(e: &Entry, root: &Root, local: &mut Local, seen: &mut HashSet<(String, String, String, String)>) -> Result<(), String> {
+fn apply(e: &Entry, root: &Root, third_party: bool, local: &mut Local,
+         seen: &mut HashSet<(String, String, String, String)>) -> Result<(), String> {
+    if let Some(p) = &e.publisher {
+        p.apply(root, third_party, &mut local.publishers)?;
+    }
     if let Some(r) = &e.release {
-        check_release(r, root)?;
+        check_release(r, &Scope { root, third_party, publishers: &local.publishers })?;
         if !seen.insert((r.kind.clone(), r.id.clone(), r.version.clone(), r.arch.clone())) {
-            return Err(format!("{} {} {} published twice", r.id, r.version, r.arch));
+            return Err(format!("{} {} {} is published already", r.id, r.version, r.arch));
         }
         local.releases.push(r.clone());
     }
     if let Some(y) = &e.yank {
-        let key = root.key(&y.signer).ok_or("yank: signer not in root.toml")?;
-        if !key.roles.iter().any(|x| x == "platform")
-            || !verify(Yank::message(&y.id, &y.version, &y.reason).as_bytes(), &y.sig, &key.pem) {
-            return Err("yank: not signed by a publishing key".into());
-        }
-        if !local.releases.iter().any(|r| r.id == y.id && r.version == y.version && r.signer == y.signer) {
-            return Err("yank: of a release this key didn't publish".into());
+        // A publishing key yanks its own releases; a publisher's current key
+        // yanks any of that publisher's (also those signed by a past key).
+        let pem = match local.publishers.iter().find(|p| p.key_id == y.signer) {
+            Some(p) => {
+                if !local.releases.iter().any(|r| r.id == y.id && r.version == y.version && r.publisher == p.id) {
+                    return Err("yank: of a release this publisher didn't publish".into());
+                }
+                p.key.clone()
+            }
+            None if !third_party => {
+                let key = root.key(&y.signer).ok_or("yank: signer not in root.toml")?;
+                if !key.roles.iter().any(|x| x == "platform") {
+                    return Err("yank: not signed by a publishing key".into());
+                }
+                if !local.releases.iter().any(|r| r.id == y.id && r.version == y.version && r.signer == y.signer) {
+                    return Err("yank: of a release this key didn't publish".into());
+                }
+                key.pem.clone()
+            }
+            None => return Err("yank: not signed by a publisher's current key".into()),
+        };
+        if !verify(Yank::message(&y.id, &y.version, &y.reason).as_bytes(), &y.sig, &pem) {
+            return Err("yank: bad signature".into());
         }
         local.yanked.push((y.id.clone(), y.version.clone()));
     }

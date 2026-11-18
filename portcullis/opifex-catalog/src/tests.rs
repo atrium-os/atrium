@@ -47,10 +47,10 @@ fn app_manifest(id: &str, version: &str) -> String {
 fn release(_w: &World, id: &str, version: &str, signer: &Keys) -> Entry {
     let manifest = app_manifest(id, version);
     let sig = b64(&portcullis_sig::sign(manifest.as_bytes(), &signer.sk).unwrap());
-    Entry { kind: "release".into(), time: NOW, yank: None, locations: None, release: Some(Release {
+    Entry { kind: "release".into(), time: NOW, yank: None, locations: None, publisher: None, release: Some(Release {
         id: id.into(), version: version.into(), arch: "aarch64".into(), kind: "app".into(),
         signer: key_id(&signer.pk).unwrap(), manifest, sig, archive_sha256: "cd".repeat(32), archive_size: 10,
-        urls: vec![format!("https://example.org/{id}-{version}.insula")] }) }
+        urls: vec![format!("https://example.org/{id}-{version}.insula")], publisher: String::new() }) }
 }
 
 fn fetcher(dir: PathBuf) -> impl Fn(&str) -> Result<Vec<u8>, String> {
@@ -185,4 +185,126 @@ fn versions() {
     assert_eq!(version_cmp("1.10", "1.9"), Greater);
     assert_eq!(version_cmp("1.0", "1"), Equal);
     assert_eq!(version_cmp("2.0.1", "2.0.0"), Greater);
+}
+
+// ── C7: third-party catalogs and publisher records ──────────────────────────
+
+/// A third-party catalog: root keys and a catalog key, no platform key.
+fn third_world(tag: &str) -> World {
+    let w = world(tag);
+    let text = fs::read_to_string(w.dir.join("cat").join(ROOT)).unwrap();
+    // Drop the platform key (the last [[key]] block) and rename.
+    let last = text.rfind("\n[[key]]").unwrap();
+    let text = text[..last].replace("name = \"Atrium\"", "name = \"Example\"") + "\n";
+    let sigs = sign_root(&text, &w.roots[0].sk, &w.roots[0].pk).unwrap() + &sign_root(&text, &w.roots[1].sk, &w.roots[1].pk).unwrap();
+    fs::write(w.dir.join("cat").join(ROOT), &text).unwrap();
+    fs::write(w.dir.join("cat").join(ROOT_SIG), sigs).unwrap();
+    w
+}
+
+fn pub_entry(action: &str, id: &str, domains: &[&str], kinds: &[&str], key: &Keys, signers: &[&Keys]) -> Entry {
+    let mut p = publisher::PublisherEntry {
+        id: id.into(), action: action.into(), name: "Example Ltd".into(),
+        domains: domains.iter().map(|d| d.to_string()).collect(), kinds: kinds.iter().map(|d| d.to_string()).collect(),
+        devices: false, key: key.pk.clone(), sigs: Vec::new() };
+    for s in signers {
+        p.sign_with(&s.sk, &s.pk).unwrap();
+    }
+    p.entry(NOW)
+}
+
+fn pub_release(w: &World, id: &str, version: &str, signer: &Keys, publisher: &str) -> Entry {
+    let mut e = release(w, id, version, signer);
+    e.release.as_mut().unwrap().publisher = publisher.into();
+    e
+}
+
+#[test]
+fn third_party_publisher_lifecycle() {
+    let w = third_world("pubs");
+    let cat = w.dir.join("cat");
+    let log = Log::third_party(&cat);
+    let (k1, k2, k3) = (key(20), key(21), key(22));
+    let id = publisher::publisher_id(&k1.pk).unwrap();
+    assert!(id.starts_with("pub:") && id.len() == 20);
+
+    // Register, publish under the proven prefix.
+    log.append(&[pub_entry("register", &id, &["example.com"], &["app"], &k1, &[&k1])]).unwrap();
+    log.append(&[pub_release(&w, "com.example.weather", "1.0", &k1, &id)]).unwrap();
+    log.sign_head(&w.cat.sk, NOW, 14).unwrap();
+    let text = fs::read_to_string(cat.join(ROOT)).unwrap();
+    let c = Client::init(&w.dir.join("state"), &text).unwrap();
+    let c = Client::third_party(&c.dir);
+    let l = c.update(&fetcher(cat.clone()), NOW).unwrap();
+    assert_eq!(l.publishers.len(), 1);
+    assert_eq!(l.publishers[0].prefixes, vec!["com.example.".to_string()]);
+    assert_eq!(l.latest("com.example.weather", "aarch64").unwrap().publisher, id);
+
+    // Outside its prefix, unknown publisher, not its key, no publisher at all.
+    assert!(log.append(&[pub_release(&w, "com.other.x", "1", &k1, &id)]).unwrap_err().contains("prefixes"));
+    assert!(log.append(&[pub_release(&w, "com.example.x", "1", &k1, "pub:0000000000000000")]).unwrap_err().contains("not registered"));
+    assert!(log.append(&[pub_release(&w, "com.example.x", "1", &k2, &id)]).unwrap_err().contains("current key"));
+    assert!(log.append(&[release(&w, "com.example.x", "1", &k1)]).unwrap_err().contains("publisher records"));
+
+    // Rotation needs the old and the new key; afterwards the old key is refused.
+    assert!(log.append(&[pub_entry("rotate", &id, &["example.com"], &["app"], &k2, &[&k2])]).unwrap_err().contains("old and the new"));
+    log.append(&[pub_entry("rotate", &id, &["example.com"], &["app"], &k2, &[&k1, &k2])]).unwrap();
+    assert!(log.append(&[pub_release(&w, "com.example.weather", "1.1", &k1, &id)]).unwrap_err().contains("current key"));
+    log.append(&[pub_release(&w, "com.example.weather", "1.1", &k2, &id)]).unwrap();
+    // A past key can't come back.
+    assert!(log.append(&[pub_entry("rotate", &id, &["example.com"], &["app"], &k1, &[&k2, &k1])]).unwrap_err().contains("past key"));
+
+    // Recovery: two root keys and the new key; one root key is not enough.
+    assert!(log.append(&[pub_entry("recover", &id, &["example.com"], &["app"], &k3, &[&w.roots[0], &k3])]).unwrap_err().contains("root keys"));
+    log.append(&[pub_entry("recover", &id, &["example.com"], &["app"], &k3, &[&w.roots[0], &w.roots[2], &k3])]).unwrap();
+
+    // Scope change by the current key adds a domain.
+    log.append(&[pub_entry("scope", &id, &["example.com", "example.net"], &["app"], &k3, &[&k3])]).unwrap();
+    log.append(&[pub_release(&w, "net.example.notes", "1", &k3, &id)]).unwrap();
+
+    // The current key yanks a release a past key signed.
+    let mut y = yank_entry("com.example.weather", "1.0", "bad", &k3.sk, &k3.pk, NOW).unwrap();
+    log.append(&[y.clone()]).unwrap();
+    y.yank.as_mut().unwrap().signer = key_id(&k1.pk).unwrap();
+    assert!(log.append(&[y]).is_err());
+
+    log.sign_head(&w.cat.sk, NOW + 5, 14).unwrap();
+    let l = c.update(&fetcher(cat.clone()), NOW + 5).unwrap();
+    let p = &l.publishers[0];
+    assert_eq!((p.recoveries, p.past.len(), p.key_id.clone()), (1, 2, key_id(&k3.pk).unwrap()));
+    assert_eq!(l.latest("com.example.weather", "aarch64").unwrap().version, "1.1");
+    assert!(l.latest("net.example.notes", "aarch64").is_some());
+}
+
+#[test]
+fn third_party_catalogs_refuse() {
+    let w = third_world("pubrefuse3");
+    let log = Log::third_party(&w.dir.join("cat"));
+    let (k1, k2) = (key(30), key(31));
+    let id = publisher::publisher_id(&k1.pk).unwrap();
+    let id2 = publisher::publisher_id(&k2.pk).unwrap();
+    // Id must come from the key; signed by it; apps only; never org.atrium.
+    assert!(log.append(&[pub_entry("register", &id2, &["example.com"], &["app"], &k1, &[&k1])]).unwrap_err().contains("derived"));
+    assert!(log.append(&[pub_entry("register", &id, &["example.com"], &["app"], &k1, &[&k2])]).unwrap_err().contains("its key"));
+    assert!(log.append(&[pub_entry("register", &id, &["example.com"], &["font"], &k1, &[&k1])]).unwrap_err().contains("apps only"));
+    assert!(log.append(&[pub_entry("register", &id, &["atrium.org"], &["app"], &k1, &[&k1])]).unwrap_err().contains("org.atrium"));
+    assert!(log.append(&[pub_entry("register", &id, &["Example.com"], &["app"], &k1, &[&k1])]).unwrap_err().contains("lowercase"));
+    log.append(&[pub_entry("register", &id, &["example.com"], &["app"], &k1, &[&k1])]).unwrap();
+    // Twice, or a second publisher claiming the same domain.
+    assert!(log.append(&[pub_entry("register", &id, &["example.com"], &["app"], &k1, &[&k1])]).unwrap_err().contains("already"));
+    assert!(log.append(&[pub_entry("register", &id2, &["example.com"], &["app"], &k2, &[&k2])]).unwrap_err().contains("belongs to"));
+
+    // The same records in the Atrium catalog may carry other kinds.
+    let w = world("pubfirst");
+    let log = Log::open(&w.dir.join("cat"));
+    log.append(&[pub_entry("register", &id, &["example.com"], &["app", "font"], &k1, &[&k1])]).unwrap();
+}
+
+#[test]
+fn proofs() {
+    let id = "pub:0123456789abcdef";
+    assert!(publisher::proof_ok(&publisher::proof_text(id), id));
+    assert!(publisher::proof_ok("v=spf1 -all\n\"atrium-publisher pub:0123456789abcdef\"", id));
+    assert!(!publisher::proof_ok("atrium-publisher pub:0123456789abcdee", id));
+    assert_eq!(publisher::prefix_of("shop.example.co.uk"), "uk.co.example.shop.");
 }
