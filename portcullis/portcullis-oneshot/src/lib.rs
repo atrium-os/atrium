@@ -260,6 +260,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     if let Some((k, _)) = spec.extra_env.iter().find(|(k, v)| !k.starts_with("ATRIUM_") || k.contains(['=', '\0']) || v.contains('\0')) {
         return OneShot::Refused(format!("worker environment {k:?}: only ATRIUM_ keys without '=' or NUL"));
     }
+    let mut tm = Phases::new();
     let target = spec.target.as_str();
     let instance = spec.instance.clone();
     let tmpfs_mb = spec.tmpfs_mb;
@@ -278,6 +279,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         return OneShot::Refused(e);
     }
 
+    tm.mark("verify");
     let mut manifest = match portcullis_toml::Manifest::from_str(&text) {
         Ok(m) => m,
         Err(e) => return OneShot::Failed(format!("{}: {e:?}", manifest_path.display())),
@@ -371,8 +373,10 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         eprintln!("portcullis: reclaiming abandoned jail {jail_name} (jid {jid}, no processes)");
     }
 
+    tm.mark("build");
     // Now safe: anything left under this name belongs to a run that is gone.
     teardown(&jail_path, &jail_name);
+    tm.mark("pre-teardown");
 
     if let Err(e) = std::fs::create_dir_all(&jail_path) {
         return OneShot::Failed(format!("mkdir {}: {e}", jail_path.display()));
@@ -381,6 +385,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e.to_string());
     }
+    tm.mark("mounts");
     // A networked worker resolves names through the host's resolvers (reached
     // over NAT). Written into the discarded tmpfs layer, never the signed tree.
     let net_mode = manifest.capabilities.network.as_ref().map(|n| n.mode());
@@ -456,11 +461,38 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         devfs_grants: vec![],
         fuse: None,
     });
+    tm.mark("prepare");
     let outcome = run_via_jaild(&req, stdio);
+    tm.mark("jaild-run");
 
     jaild_remove(&jail_name);
+    tm.mark("jaild-remove");
     teardown(&jail_path, &jail_name);
+    tm.mark("teardown");
+    tm.report(&jail_name);
     outcome
+}
+
+/// Where a one-shot's time goes, logged to stderr with
+/// `ATRIUM_ONESHOT_TIMING=1` in the caller's (portcullisd's) environment.
+struct Phases { on: bool, t: std::time::Instant, start: std::time::Instant, marks: Vec<(&'static str, f64)> }
+
+impl Phases {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Phases { on: std::env::var_os("ATRIUM_ONESHOT_TIMING").is_some_and(|v| v == "1"), t: now, start: now, marks: Vec::new() }
+    }
+    fn mark(&mut self, what: &'static str) {
+        if !self.on { return }
+        let now = std::time::Instant::now();
+        self.marks.push((what, (now - self.t).as_secs_f64() * 1000.0));
+        self.t = now;
+    }
+    fn report(&self, jail: &str) {
+        if !self.on { return }
+        let parts: Vec<String> = self.marks.iter().map(|(w, ms)| format!("{w} {ms:.1}")).collect();
+        eprintln!("portcullis: oneshot-timing {jail}: total {:.1} ms: {}", self.start.elapsed().as_secs_f64() * 1000.0, parts.join(", "));
+    }
 }
 
 const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";

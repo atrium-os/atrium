@@ -2262,6 +2262,19 @@ IP address restrictions"); jaild lane: new `NetworkConfig::Isolated`, used by ev
 interfaces `lo0` only, 0 `ether` lines. Cost: ~47 ms per create+remove against ~1 ms (measured,
 20 each); invisible at corpus scale (98 docs: 58.3 s vs 59.2 s).
 
+**No vnet needed on a netblind kernel (2026-11-18).** atrium-os/freebsd-src 0e42bfbdb
+(`prison_netblind`, `kern.features.jail_netblind`): a jail on the host's stack with neither
+IPv4 nor IPv6 sees none of the host's network. Routing sysctls (`getifaddrs`) return nothing,
+the interface MIB sysctl and every interface ioctl fail, and routing and netlink sockets don't
+open. On such a kernel jaild makes `Isolated` as `ip4=disable ip6=disable` with no vnet. It
+still uses the empty vnet on a kernel without the feature. Checked from inside a worker by
+`vm-workers-check.sh`: no interface at all (the empty vnet showed its own `lo0`), no MAC, no
+interface MIB, no SIOCGIFCONF, no inet, inet6, route or netlink socket. On the cloud VM (TCG)
+a WorkerCall's p50 went from 1141 to 1128 ms: the vnet is a few percent there. Most of a call
+is spent in the helper programs it runs (`mount` three times, `jail -r` before and after;
+`ATRIUM_ONESHOT_TIMING=1` logs each phase). The jail(8) lane (launched apps) still uses the
+empty vnet.
+
 **Found on the way — the `loopback` capability never worked.** It set `ip4.addr`/`ip6.addr` on a
 vnet jail, which the kernel refuses; its unit test pinned exactly that recipe and passed. Now:
 `vnet = new` plus `exec.created` = `ifconfig -j <jail> lo0 inet 127.0.0.1/8 up …` (on the host,
