@@ -122,3 +122,113 @@ fn libatrium_v0_wire_still_posts() {
     let (st, id) = rpc(&mut mail, op::POST, &p);
     assert_eq!((st, id > 0), (status::OK, true));
 }
+
+fn post_actions(c: &mut Connection, actions: &[(&str, &str)]) -> (u8, u64) {
+    let p = proto::Post { urgency: 1, title: "Ana: lunch?".into(), body: "Friday at one".into(),
+        actions: actions.iter().map(|(i, l)| proto::Action { id: i.to_string(), label: l.to_string() }).collect() };
+    rpc(c, op::POST_ACTIONS, &postcard::to_stdvec(&p).unwrap())
+}
+
+fn act(c: &mut Connection, id: u64, action: &str, token: [u8; 16]) -> u8 {
+    rpc(c, op::ACT, &postcard::to_stdvec(&proto::Act { id, action: action.into(), token }).unwrap()).0
+}
+
+fn heard(c: &mut Connection) -> Option<proto::Acted> {
+    let m = c.recv_message_or_timeout(Duration::from_millis(500)).unwrap()?;
+    assert_eq!(m.op, op::ACTED);
+    Some(postcard::from_bytes(&m.payload).unwrap())
+}
+
+fn with_gate(gate: Fake) -> std::sync::Arc<Shared> {
+    let resolve = |uid: u32| match uid {
+        MAIL => Some(("shankar".to_string(), "org.atrium.mail".to_string())),
+        ROGUE => Some(("shankar".to_string(), "com.example.rogue".to_string())),
+        FORUM => Some(("shankar".to_string(), "org.atrium.forum".to_string())),
+        _ => None,
+    };
+    Shared::with(Box::new(resolve), vec![FORUM], Box::new(|uid| (uid == MAIL).then(|| "work".to_string())), Box::new(gate))
+}
+
+use fresco_protocol::activation::kind;
+use tabula::gate::Fake;
+
+#[test]
+fn actions_are_checked_shown_and_reach_only_the_app_with_a_granted_press() {
+    let frescod = Fake::default();
+    let s = with_gate(frescod.clone());
+    let mut forum = conn(&s, FORUM);
+    rpc(&mut forum, op::SUBSCRIBE, &[]);
+    // A subscription only streams: Forum acts on a connection of its own.
+    let mut desk = conn(&s, FORUM);
+    let mut mail = conn(&s, MAIL);
+    // Bad actions: too many, a bad id, a repeated id, an empty label.
+    let four = [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")];
+    assert_eq!(post_actions(&mut mail, &four).0, status::MALFORMED);
+    assert_eq!(post_actions(&mut mail, &[("Archive!", "Archive")]).0, status::MALFORMED);
+    let (st, id) = post_actions(&mut mail, &[("archive", "Archive\u{202E}"), ("reply", "Reply to everyone in this long thread")]);
+    assert_eq!(st, status::OK);
+    let n = match next_event(&mut forum) { Event::Posted(n) => n, e => panic!("{e:?}") };
+    assert_eq!((n.uid, n.persona.as_deref()), (MAIL, Some("work")));
+    assert_eq!(n.actions[0], proto::Action { id: "archive".into(), label: "Archive".into() });
+    assert!(n.actions[1].label.len() <= proto::LABEL_MAX && n.actions[1].label.ends_with('…'));
+
+    // Mail listens; the rogue app listens too and must hear nothing.
+    let mut ear = conn(&s, MAIL);
+    assert_eq!(rpc(&mut ear, op::LISTEN, &[]).0, status::OK);
+    let mut rogue = conn(&s, ROGUE);
+    assert_eq!(rpc(&mut rogue, op::LISTEN, &[]).0, status::OK);
+    let mut stranger = conn(&s, STRANGER);
+    assert_eq!(rpc(&mut stranger, op::LISTEN, &[]).0, status::NOT_AN_APP);
+
+    // Only Forum acts; only with a press granted to Mail's uid; only a
+    // real action of that notification.
+    let press = frescod.mint(MAIL, kind::GRANTED);
+    assert_eq!(act(&mut conn(&s, ROGUE), id, "archive", press), status::NOT_ALLOWED);
+    assert_eq!(act(&mut desk, id, "archive", [7; 16]), status::NO_PRESS, "no such press");
+    assert_eq!(act(&mut desk, id, "archive", frescod.mint(ROGUE, kind::GRANTED)), status::NO_PRESS, "granted to another app");
+    assert_eq!(act(&mut desk, id, "delete-all", press), status::MALFORMED, "not one of its actions");
+    assert_eq!(act(&mut desk, id + 99, "archive", press), status::NOT_YOURS, "no such notification");
+    assert_eq!(act(&mut desk, id, "archive", press), status::OK);
+    assert_eq!(heard(&mut ear), Some(proto::Acted { id, action: "archive".into() }));
+    assert_eq!(heard(&mut rogue), None);
+    assert_eq!(act(&mut desk, id, "archive", press), status::NO_PRESS, "a press is spent once");
+}
+
+#[test]
+fn an_action_waits_for_its_app_to_start() {
+    let frescod = Fake::default();
+    let s = with_gate(frescod.clone());
+    let mut forum = conn(&s, FORUM);
+    rpc(&mut forum, op::SUBSCRIBE, &[]);
+    // A subscription only streams: Forum acts on a connection of its own.
+    let mut desk = conn(&s, FORUM);
+    let mut mail = conn(&s, MAIL);
+    let (_, id) = post_actions(&mut mail, &[("reply", "Reply")]);
+    drop(mail);
+    // It listened, then quit: that listener no longer counts.
+    let mut gone = conn(&s, MAIL);
+    assert_eq!(rpc(&mut gone, op::LISTEN, &[]).0, status::OK);
+    drop(gone);
+    std::thread::sleep(Duration::from_millis(400));
+    // Nobody listening: held, and Forum is told to start the app.
+    assert_eq!(act(&mut desk, id, "reply", frescod.mint(MAIL, kind::GRANTED)), status::NOT_RUNNING);
+    let mut ear = conn(&s, MAIL);
+    assert_eq!(rpc(&mut ear, op::LISTEN, &[]).0, status::OK);
+    assert_eq!(heard(&mut ear), Some(proto::Acted { id, action: "reply".into() }));
+    // Delivered once.
+    let mut again = conn(&s, MAIL);
+    rpc(&mut again, op::LISTEN, &[]);
+    assert_eq!(heard(&mut again), None);
+}
+
+#[test]
+fn without_frescod_no_action_goes_through() {
+    let s = shared();
+    let mut forum = conn(&s, FORUM);
+    rpc(&mut forum, op::SUBSCRIBE, &[]);
+    // A subscription only streams: Forum acts on a connection of its own.
+    let mut desk = conn(&s, FORUM);
+    let mut mail = conn(&s, MAIL);
+    let (_, id) = post_actions(&mut mail, &[("archive", "Archive")]);
+    assert_eq!(act(&mut desk, id, "archive", [1; 16]), status::NO_PRESS);
+}

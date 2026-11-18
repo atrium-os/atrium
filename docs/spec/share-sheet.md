@@ -240,7 +240,7 @@ may spend `SHARE`) and injected clicks:
 
 Not done yet:
 
-- Notification actions over `CLASS_BROKER` (tabula.md §5) are a separate path, still not built.
+- Notification actions are a separate path: built 2026-11-18, tabula.md §5.5.
 
 ## 7. Across personas
 

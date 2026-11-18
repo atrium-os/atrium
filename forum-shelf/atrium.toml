@@ -13,6 +13,9 @@ icon        = "bell"
 [capabilities]
 graphics = "fresco"
 notify   = true
+# Starts an app whose notification action was pressed while it wasn't
+# running (tabula.md §5.3); portcullisd does the checks, as for the dock.
+app-launch = true
 network  = "none"
 # Limen roles it embeds. Without this key a platform bundle keeps every role.
 embeds = []

@@ -188,7 +188,8 @@ impl Table {
     /// to mint a `GRANTED` token for `for_uid` to spend on `purpose`.
     pub fn grant(&mut self, now: u64, token: &Token, granter_uid: u32, for_uid: u32, purpose: u8) -> GrantResult {
         let Some(e) = self.live.get(token).copied() else { return GrantResult::Refused { reason: refusal::UNKNOWN } };
-        if now.saturating_sub(e.minted_ns) >= LIFETIME_NS {
+        // The same lifetime as a consume (FRESCOD_TOKEN_LIFE_MS in tests).
+        if now.saturating_sub(e.minted_ns) >= if cfg!(test) { LIFETIME_NS } else { lifetime() } {
             self.live.remove(token);
             return GrantResult::Refused { reason: refusal::EXPIRED };
         }

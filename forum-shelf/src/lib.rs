@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use pergola::geom::{Axis, Rect};
 use pergola::reactive::Mutable;
 use pergola::theme::{type_size, Weight};
+use pergola::widgets::button::Button;
 use pergola::{Ctx, FlexStyle, Label, Node, View};
 use praeco::proto::{urgency, Notification};
 
@@ -99,6 +100,17 @@ pub struct ShelfView {
     pub shelf: Mutable<Shelf>,
     /// Set by a click on a toast: its id (the main loop dismisses it).
     pub dismissed: Mutable<Option<u64>>,
+    /// Set by a click on an action: the toast, the action and the press
+    /// (the main loop has frescod grant it to the app, tabula.md §5.3).
+    pub acted: Mutable<Option<Pressed>>,
+}
+
+/// A press on a toast's action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pressed {
+    pub id: u64,
+    pub action: String,
+    pub press: Option<[u8; 16]>,
 }
 
 impl View for ShelfView {
@@ -125,6 +137,20 @@ impl View for ShelfView {
             for line in toast.n.body.lines().take(6) {
                 Label::new(line.to_string()).size(type_size::SM).color(t.text_secondary()).emit(ctx);
             }
+            // Its buttons: the app's labels, plain text Praeco cleaned. A
+            // press goes to the app only through praecod, with frescod's word.
+            if !toast.n.actions.is_empty() {
+                let row = ctx.push(Node::stack(Axis::Horizontal, Rect::ZERO_SIZED, 6.0));
+                ctx.set_flex(row, FlexStyle { padding: 0.0, ..FlexStyle::default() });
+                for a in &toast.n.actions {
+                    let (acted, id, action) = (self.acted.clone(), toast.n.id, a.id.clone());
+                    ctx.place(Button::secondary(a.label.clone()).on_click(move || {
+                        let press = pergola::clipboard::current_activation();
+                        acted.set(Some(Pressed { id, action: action.clone(), press }));
+                    }));
+                }
+                ctx.pop();
+            }
             ctx.pop();
             let id = toast.n.id;
             let d = self.dismissed.clone();
@@ -139,7 +165,7 @@ mod tests {
     use super::*;
 
     fn n(id: u64, urg: u8, user: &str) -> Notification {
-        Notification { id, app: "org.atrium.mail".into(), user: user.into(), urgency: urg, title: format!("t{id}"), body: String::new(), at_ms: 0 }
+        Notification { id, app: "org.atrium.mail".into(), user: user.into(), urgency: urg, title: format!("t{id}"), body: String::new(), at_ms: 0, actions: vec![], uid: 1001, persona: None }
     }
 
     #[test]
@@ -181,7 +207,7 @@ mod tests {
     fn the_view_names_the_app_from_the_registry() {
         let mut s = Shelf::new("me");
         s.posted(Notification { title: "org.atrium.system".into(), ..n(1, urgency::NORMAL, "me") }, 0.0);
-        let view = ShelfView { w: Mutable::new(420.0), shelf: Mutable::new(s), dismissed: Mutable::new(None) };
+        let view = ShelfView { w: Mutable::new(420.0), shelf: Mutable::new(s), dismissed: Mutable::new(None), acted: Mutable::new(None) };
         let (tree, _) = pergola::view::render(&view, pergola::theme::Semantic::LIGHT);
         let texts: Vec<String> = tree.iter().filter_map(|(_, n)| match n {
             Node::Text { content, .. } => Some(content.clone()),
@@ -190,5 +216,19 @@ mod tests {
         // The first line is the registry's id; a title claiming to be
         // the system is only a title.
         assert_eq!(texts[0], "org.atrium.mail");
+    }
+
+    #[test]
+    fn a_toasts_actions_are_its_buttons() {
+        let mut s = Shelf::new("me");
+        let actions = vec![praeco::proto::Action { id: "archive".into(), label: "Archive".into() }, praeco::proto::Action { id: "reply".into(), label: "Reply".into() }];
+        s.posted(Notification { actions, ..n(1, urgency::NORMAL, "me") }, 0.0);
+        let view = ShelfView { w: Mutable::new(420.0), shelf: Mutable::new(s), dismissed: Mutable::new(None), acted: Mutable::new(None) };
+        let (tree, _) = pergola::view::render(&view, pergola::theme::Semantic::LIGHT);
+        let texts: Vec<String> = tree.iter().filter_map(|(_, n)| match n {
+            Node::Text { content, .. } => Some(content.clone()),
+            _ => None,
+        }).collect();
+        assert!(texts.iter().any(|t| t == "Archive") && texts.iter().any(|t| t == "Reply"), "{texts:?}");
     }
 }

@@ -8,6 +8,10 @@
 //! subscribe. `PRAECO_SYSTEM_POSTERS` (comma-separated `uid:name`) names
 //! system services that may post too, as `name`, to every user's shelf
 //! (`proto::SYSTEM_USER`): Forum, telling the user about a monitor.
+//! `PRAECO_FRESCOD_ACTIVATION` (default
+//! `/var/run/atrium/fresco-activation.sock`): frescod's activation
+//! socket, where praecod (as `_praeco`) spends the press behind each
+//! notification action (tabula.md §5.3).
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
@@ -34,14 +38,22 @@ fn main() -> ExitCode {
     eprintln!("praecod: listening on {sock}; registry {registry}; subscribers {subscribers:?}; system posters {system:?}");
     // The registry changes as apps launch: read it per lookup (it is a
     // small file; posts are rate-limited).
+    let registry2 = registry.clone();
     let resolve = move |uid: u32| {
         if let Some((_, name)) = system.iter().find(|(u, _)| *u == uid) {
             return Some((praeco::proto::SYSTEM_USER.to_string(), name.clone()));
         }
-        let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
+        let reg = portcullis_peer::AppRegistry::load(&registry2).ok()?;
         reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string()))
     };
-    let shared = praeco::server::Shared::new(Box::new(resolve), subscribers);
+    let reg2 = registry.clone();
+    let persona_of = move |uid: u32| {
+        let reg = portcullis_peer::AppRegistry::load(&reg2).ok()?;
+        reg.persona(uid).flatten().map(str::to_string)
+    };
+    let act = std::env::var("PRAECO_FRESCOD_ACTIVATION").unwrap_or_else(|_| "/var/run/atrium/fresco-activation.sock".into());
+    let gate = tabula::gate::Frescod::new(&act);
+    let shared = praeco::server::Shared::with(Box::new(resolve), subscribers, Box::new(persona_of), Box::new(gate));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let Ok((uid, _)) = portcullis_peer::uid_gid(stream.as_raw_fd()) else { continue };

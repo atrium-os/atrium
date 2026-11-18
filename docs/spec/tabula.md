@@ -336,7 +336,7 @@ services that are not apps post as a name praecod is configured with, never one 
 (`proto::SYSTEM_USER`), which every user's shelf shows. Forum posts this way (forum-wm, as
 `Forum`) to name a monitor a span holds out for flapping (fresco-span.md §6);
 `praeco::client::post` is the poster's side. Not yet:
-actions (need `CLASS_BROKER` delivery and `ACTIVATION_GRANT`), images, per-app mute.
+images, per-app mute. Actions: §5.5.
 
 `forum-shelf/` draws the toasts (Pergola, `Notification` role, §5.2): it subscribes to praecod, shows its own
 user's only, three at a time from the top right, low 3 s, normal 5 s, high until dismissed and
@@ -417,7 +417,7 @@ matters so don't show if locked or logged out." Not built.
   up to the band's height, scrollable, and stops its timeout. Expanded, it still shows only
   the plain text the app posted: reading a whole short mail there needs no app switch, and
   pressing the body opens it in the app as before. Actions (Archive, Reply) sit under it
-  when CLASS_BROKER delivery exists.
+  (§5.5).
 - **History** in the shelf shows the same full text.
 - **When it shows less:**
   - **Locked** (the lock screen, lock-screen.md): app name and a count only ("Mail · 3
@@ -434,6 +434,54 @@ matters so don't show if locked or logged out." Not built.
 - **What Mail puts in a post**: subject as title, sender + verified mark as subtitle, the
   first 2 KiB of the new text (quoted text and signature removed, from the parse jail's
   plain-text summary, never HTML) as body.
+
+### 5.5 Actions, as built (2026-11-18)
+
+A notification can carry up to three buttons ("Archive", "Reply"). The press on one reaches
+the posting app only through praecod and only with frescod's word that a person pressed it in
+Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
+
+- **Posting.** `POST_ACTIONS` (op `0x02`) takes a postcard `Post { urgency, title, body,
+  actions }`. Each `Action { id, label }` needs an id of 1 to 32 characters from
+  `[a-z0-9._-]`, unique on that post. Its label is cleaned like a title, at most 24 bytes, and
+  can't be empty. A post with more than 3 actions, or with any bad one, gets `MALFORMED`. A
+  system poster (`SYSTEM_USER`) can't attach actions, since there is no app to start. The
+  `Notification` Forum receives also carries the actions, the posting app's `uid` and its
+  `persona` (from the registry). SDK: `praeco::client::post_with_actions(sock, urgency, title,
+  body, &[("archive", "Archive"), ("reply", "Reply")])`.
+- **The press.** The shelf draws the labels as buttons under the toast. A click takes the press
+  frescod minted for the shelf's window and asks frescod to `GRANT` it to the posting app's uid
+  for `ACTION`. Only `FRESCOD_FORUM_UID` may do this, and frescod checks the press was in that
+  uid's window and is fresh. The shelf then sends praecod `ACT { id, action, token }` (op
+  `0x03`, subscribers only, on a connection of its own) and dismisses the toast.
+- **praecod** finds the notification and checks that the action is one of its own, then spends
+  the token with frescod as `ACTION` for the posting app's uid (praecod is the `ACTION`
+  consumer, `_praeco`). A token frescod never minted, or one granted to another app, gets
+  `NO_PRESS` (7). A non-subscriber gets `NOT_ALLOWED`. A spent press can't be used twice.
+- **Delivery.** An app opens `praeco::client::Listener::connect(&praeco::client::socket())`
+  when it starts (op `LISTEN`, `0x11`) and reads `Acted { id, action }` (pushed as op `0x81`)
+  with `next(timeout)`. Only listeners of the posting app's own uid hear it. When none is
+  listening, praecod holds the action for 30 s (`HOLD_MS`) and answers `NOT_RUNNING` (6). The
+  shelf then asks portcullisd to start the app (`app-launch`, as the dock does) in the
+  notification's persona, and the app gets the held action as soon as it listens. A listener
+  whose app went stops counting within 0.1 s.
+- **Where apps find praecod**: `praeco::client::socket()` returns `PRAECO_SOCKET` if set.
+  Otherwise, in a jail with `notify = true`, it returns `/atrium/sockets/notify/notify.sock`,
+  else `/var/run/atrium/praecod.sock`. praecod's `PRAECO_FRESCOD_ACTIVATION` is frescod's
+  activation socket; the shelf's is `SHELF_FRESCOD_ACTIVATION`.
+- **Tests.** `praeco/tests/wire.rs` checks the limits and that only Forum may act. It also
+  checks that only a press granted to that app counts, that only its own listener hears the
+  action, that a press counts once, that an action is held and handed over when the app
+  starts, and that a gone listener doesn't count. `forum-shelf` checks that a toast's actions
+  are its buttons. `scripts/vm-notify-actions-check.sh` passes 13/13 in the amd64 cloud VM on
+  headless frescod with injected clicks. Two signed test apps (`praeco-demo`) run in their
+  jails. Chat posts with Archive and Reply, and a click on Archive reaches it through
+  frescod's grant and praecod's spend. Reminder posts and exits, and a click on Reply makes the
+  shelf start it through portcullisd; it hears "reply" from the hold. A forged action gets
+  status 7. frescod's `GRANT` now uses the same token lifetime as `CONSUME`.
+- **Not yet.** The app gets no press of its own, so a "Reply" that opens a window can't raise
+  it with this press. The jailed shelf needs a capability that mounts `fresco-activation/`;
+  the gate runs it on the host as Forum.
 
 ## 6. Pergola's part
 

@@ -22,3 +22,5 @@ fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 postcard = { version = "1", features = ["use-std"] }
+tabula = { path = "../tabula" }
+forum-dock = { path = "../forum-dock" }

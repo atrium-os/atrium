@@ -182,6 +182,21 @@ pub mod gate {
         }
     }
 
+    impl Frescod {
+        /// Forum only (tabula.md §2.4): spend Forum's own press to mint a
+        /// `GRANTED` press for `for_uid`, e.g. a click on a notification's
+        /// action for the app that posted it.
+        pub fn grant(&mut self, g: fresco_protocol::activation::Grant) -> fresco_protocol::activation::GrantResult {
+            match self.ask(fresco_protocol::activation::op::GRANT, &g) {
+                Ok(r) => r,
+                Err(_) => {
+                    self.conn = None;
+                    fresco_protocol::activation::GrantResult::Refused { reason: fresco_protocol::activation::refusal::NOT_ALLOWED }
+                }
+            }
+        }
+    }
+
     fn invalid<E: std::fmt::Display>(e: E) -> std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     }
@@ -272,6 +287,8 @@ pub mod gate {
             let fits = match c.purpose {
                 purpose::COPY | purpose::PASTE => k == kind::BUTTON || k == kind::KEY || k == kind::GRANTED,
                 purpose::DROP => k == kind::DROP,
+                // A press Forum's trusted UI granted to the app (§2.4).
+                purpose::SHARE | purpose::ACTION => k == kind::BUTTON || k == kind::GRANTED,
                 _ => k == kind::BUTTON,
             };
             if !fits {

@@ -84,7 +84,7 @@ week of use. None of it needs a server of ours.
 | saving | Scrinium picker, `EMIT_FD`, persona places | none |
 | signing | Sigillum §10.2 `identity.certificate`, Arca keys (`arca_sign`, `arca_decrypt`) | S/MIME glue (§10) |
 | work and personal | personas: an instance per persona, persona Arca, persona route | nothing new; Mail follows the instance model |
-| notifications | Praeco + Forum toasts | notification actions (CLASS_BROKER delivery, not built) for Archive / Reply |
+| notifications | Praeco + Forum toasts | notification actions (tabula.md §5.5) for Archive / Reply |
 | background | insula.md §11 resident background | none; sync runs as Mail's resident background |
 | rich text compose | `officina-text`, Tabula HTML subset | a compose profile (§9.1) |
 
@@ -764,8 +764,8 @@ Vacation replies through Sieve or JMAP `VacationResponse`.
   period. Switches: "let VIPs through" (off by default) and "let replies in my threads
   through" (off). The schedule is kept in the instance's settings and shown in Curia's
   notification page beside Atrium-wide Do Not Disturb, which always wins.
-- **Actions** (Archive, Mark read, Reply) when Praeco notification actions exist
-  (CLASS_BROKER delivery, not built); a press on the notification gives the press Mail needs.
+- **Actions** (Archive, Mark read, Reply): Praeco notification actions exist (tabula.md
+  §5.5, 2026-11-18); Mail still has to post them and listen.
 - Per persona; the persona badge comes from Forum (personas.md §7), not from Mail.
 
 ### 12.1 No storm of pings after a gap (Shankar 2026-11-16)
