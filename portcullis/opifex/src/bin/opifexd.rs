@@ -12,7 +12,10 @@
 //! `OPIFEX_CHECK` (/usr/local/libexec/opifex-check), `OPIFEX_SHEET_UID`
 //! (65042, the install sheet's uid, which may send `InstallApproved`),
 //! `OPIFEX_FETCH` (how to start the fetcher, `portcullis launch --no-prompt
-//! org.atrium.opifex.fetch`), `OPIFEX_CATALOG_URL` (the first sync's base).
+//! org.atrium.opifex.fetch`), `OPIFEX_CATALOG_URL` (the first sync's base),
+//! `PRAECO_SOCKET` (/var/run/atrium/praecod.sock, for the notice about
+//! waiting updates; `none` turns it off), `OPIFEX_DAILY` (`0` turns off the
+//! daily round of §8: sync, background updates, one notice).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
@@ -67,6 +70,25 @@ fn serve(d: &Daemon, mut s: UnixStream) {
 
 use std::io::Read;
 
+/// The daily round, at a time of day picked at random when opifexd starts so
+/// that machines don't all ask the catalog host at once; the first one comes
+/// 10 to 70 minutes after boot.
+fn daily(d: &Daemon) {
+    let mut b = [0u8; 4];
+    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    let r = u32::from_le_bytes(b) as u64;
+    std::thread::sleep(Duration::from_secs(600 + r % 3600));
+    loop {
+        match d.tick(true) {
+            Ok(Response::Ticked { installed, waiting }) =>
+                eprintln!("opifexd: daily: {} updated in the background, {waiting} waiting", installed.len()),
+            Ok(_) => {}
+            Err(e) => eprintln!("opifexd: daily: {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(86_400 - 1800 + (r >> 12) % 3600));
+    }
+}
+
 fn main() {
     let sock = env("OPIFEX_SOCKET", SOCKET);
     let d = Arc::new(Daemon {
@@ -88,8 +110,17 @@ fn main() {
             .unwrap_or_else(|_| opifex::fetch::FETCH_CMD.iter().map(|s| s.to_string()).collect()),
         catalog_url: std::env::var("OPIFEX_CATALOG_URL").unwrap_or_else(|_| opifex::fetch::CATALOG_URL.into()),
         sysroot: PathBuf::from("/"),
+        praeco: match std::env::var("PRAECO_SOCKET").ok().as_deref() {
+            Some("none") => None,
+            Some(p) => Some(p.into()),
+            None => Some("/var/run/atrium/praecod.sock".into()),
+        },
         lock: Mutex::new(()),
     });
+    if std::env::var("OPIFEX_DAILY").ok().as_deref() != Some("0") {
+        let d = Arc::clone(&d);
+        std::thread::spawn(move || daily(&d));
+    }
     if let Some(dir) = sock.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

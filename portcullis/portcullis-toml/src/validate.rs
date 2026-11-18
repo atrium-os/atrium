@@ -32,6 +32,11 @@ pub fn validate(m: &Manifest) -> Report {
     if m.app.version.trim().is_empty() {
         r.errors.push("[app].version: must be non-empty".into());
     }
+    if let Some(u) = &m.app.updates {
+        if !crate::schema::UPDATE_CLASSES.contains(&u.as_str()) {
+            r.errors.push(format!("[app].updates {u:?}: one of \"auto\", \"notify\", \"required\""));
+        }
+    }
     /* entry: relative path within the tree (no leading /, no ..) */
     let e = &m.app.entry;
     if e.starts_with('/') {

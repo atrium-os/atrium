@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use opifex::daemon::Daemon;
 use opifex::proto::{Request, Response};
+use opifex::updates::Action;
 use opifex_catalog as oc;
 use sha2::{Digest, Sha256};
 
@@ -43,19 +44,23 @@ fn world(tag: &str) -> W {
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
         fetch_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
         catalog_url: "https://example.org/cat/".into(),
+        praeco: None,
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
     };
     W { d, plat, cat, daemon }
 }
 
 /// Build, pack, sign, archive and publish version `v`; returns the archive's sha.
-fn publish(w: &W, v: &str, body: &[u8]) -> String {
+fn publish(w: &W, v: &str, body: &[u8]) -> String { publish_m(w, v, body, "", "clipboard = true\n") }
+
+/// The same, with extra `[app]` lines and the `[capabilities]` body.
+fn publish_m(w: &W, v: &str, body: &[u8], app_extra: &str, caps: &str) -> String {
     let b = w.d.join(format!("b{v}"));
     let _ = fs::remove_dir_all(&b);
     fs::create_dir_all(b.join("bin")).unwrap();
     fs::write(b.join("bin/hello"), body).unwrap();
     fs::write(b.join("atrium.toml"), format!(
-        "[app]\nid = \"{ID}\"\nname = \"Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\ndescription = \"Says hello\"\n\n[capabilities]\nclipboard = true\n")).unwrap();
+        "[app]\nid = \"{ID}\"\nname = \"Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\ndescription = \"Says hello\"\n{app_extra}\n[capabilities]\n{caps}")).unwrap();
     opifex::app::pack(&b, Some(&w.plat.sk)).unwrap();
     let bytes = opifex::archive::pack(&b).unwrap();
     let sha = oc::hex(&Sha256::digest(&bytes));
@@ -211,4 +216,67 @@ fn over_the_network() {
     assert!(err(ask(&w, 0, Request::Sync { from: "https://example.org/nothing/".into() })).contains("404"));
     // Only https.
     assert!(err(ask(&w, 0, Request::Sync { from: "https://someone@example.org/cat/".into() })).contains("not a plain https URL"));
+}
+
+#[test]
+fn updates_and_the_daily_round() {
+    let w = world("updates");
+    publish(&w, "1.0", &elf(1));
+    sync(&w);
+    assert!(matches!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { .. }));
+    let pending = |w: &W| match ask(w, 1001, Request::Updates) {
+        Response::Updates { items, .. } => items,
+        other => panic!("{other:?}"),
+    };
+    let tick = |w: &W| match w.daemon.tick(false).unwrap() {
+        Response::Ticked { installed, waiting } => (installed, waiting),
+        other => panic!("{other:?}"),
+    };
+    let version = |w: &W| w.daemon.store().get(ID).unwrap().unwrap().version;
+    assert!(pending(&w).is_empty());
+
+    // The publisher's default: in the background.
+    publish(&w, "1.1", &elf(2));
+    sync(&w);
+    let p = pending(&w);
+    assert_eq!((p.len(), p[0].action, p[0].name.as_str()), (1, Action::Background, "Hello"));
+    assert_eq!(tick(&w), (vec![format!("{ID} 1.1")], 0));
+    assert_eq!(version(&w), "1.1");
+
+    // The publisher asks to be waited on: nothing installed, one notice.
+    publish_m(&w, "1.2", &elf(3), "updates = \"notify\"\n", "clipboard = true\n");
+    sync(&w);
+    assert_eq!(pending(&w)[0].action, Action::Notify);
+    assert_eq!(tick(&w), (vec![], 1));
+    assert_eq!(version(&w), "1.1");
+    let announced = || opifex::updates::PrefStore::new(&w.daemon.state).load().announced;
+    assert_eq!(announced(), vec![format!("{ID} 1.2")]);
+    tick(&w);
+    assert_eq!(announced().len(), 1, "announced once per version");
+    assert!(matches!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { .. }));
+
+    // More capabilities: asked, whatever the class; the sheet sees the additions.
+    publish_m(&w, "1.3", &elf(4), "", "clipboard = true\ncamera = true\n");
+    sync(&w);
+    let p = pending(&w);
+    assert_eq!((p[0].action, p[0].added.clone()), (Action::Ask, vec!["camera".to_string()]));
+    match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+        Response::Described { app } => assert_eq!(app.added, vec!["camera".to_string()]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(tick(&w), (vec![], 1));
+    assert_eq!(version(&w), "1.2");
+    assert!(matches!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { .. }));
+
+    // A person may ask for more care, not less; only the installer or root.
+    publish(&w, "1.4", &elf(5));
+    sync(&w);
+    assert!(err(ask(&w, 1001, Request::SetUpdates { id: ID.into(), care: "notify".into() })).contains("administrator"));
+    assert_eq!(ask(&w, 0, Request::SetUpdates { id: ID.into(), care: "notify".into() }), Response::Ok);
+    assert_eq!(pending(&w)[0].action, Action::Notify);
+    assert!(err(ask(&w, 0, Request::SetUpdates { id: ID.into(), care: "never".into() })).contains("care"));
+    assert_eq!(ask(&w, 0, Request::SetUpdates { id: ID.into(), care: "auto".into() }), Response::Ok);
+    assert_eq!(pending(&w)[0].action, Action::Background);
+    // The daily round is root's.
+    assert!(err(ask(&w, 1001, Request::Tick)).contains("administrator"));
 }

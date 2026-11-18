@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 use crate::app;
 use crate::fetch;
+use crate::updates::{self, Action, Pending, PrefStore};
 use crate::installed::{Record, Store};
 use crate::proto::{Described, Request, Response};
 
@@ -43,6 +44,9 @@ pub struct Daemon {
     /// is served until it names its own locations (`fetch::CATALOG_URL`).
     pub fetch_cmd: Vec<String>,
     pub catalog_url: String,
+    /// praecod's socket, for the notice about updates waiting on a person
+    /// (opifexd posts as a system poster: `PRAECO_SYSTEM_POSTERS=0:Updates`).
+    pub praeco: Option<PathBuf>,
     /// Where side-loaded bundles' libraries are read from (`/`).
     pub sysroot: PathBuf,
     /// One change at a time.
@@ -64,6 +68,11 @@ impl Daemon {
             Request::Installed => self.store().load().map(|i| Response::Installed { apps: i.apps }),
             Request::Describe { id } => self.describe(&id).map(|app| Response::Described { app }),
             Request::Search { text } => self.search(&text).map(|ids| Response::Found { ids }),
+            Request::Updates => self.updates().map(|items| {
+                let p = self.prefs().load();
+                Response::Updates { items, last_sync: p.last_sync, last_error: p.last_error }
+            }),
+            Request::SetUpdates { id, care } => self.set_care(uid, &id, &care).map(|_| Response::Ok),
             Request::InstallApproved { id, manifest_sha256, for_uid } if admin || Some(uid) == self.sheet_uid =>
                 self.locked(|| self.install_catalog(&id, Some(&manifest_sha256), for_uid)),
             _ if !admin => Err("only an administrator, or a person on the install sheet, may change what is installed".into()),
@@ -73,6 +82,7 @@ impl Daemon {
             Request::Uninstall { id } => self.locked(|| self.uninstall(&id)),
             Request::Rollback { id } => self.locked(|| self.rollback(&id)),
             Request::Sync { from } => self.locked(|| self.sync(Path::new(&from))),
+            Request::Tick => self.tick(true),
         };
         res.unwrap_or_else(|message| Response::Error { message })
     }
@@ -91,17 +101,22 @@ impl Daemon {
         let v: toml::Value = r.manifest.parse().map_err(|e| format!("{id}: {e}"))?;
         let app = v.get("app");
         let s = |k: &str| app.and_then(|a| a.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let capabilities = v.get("capabilities").and_then(|c| c.as_table()).map(|t| {
-            // Every app has a window; `false` and `network = "none"` grant nothing.
-            t.iter().filter(|(k, v)| k.as_str() != "graphics" && v.as_bool() != Some(false) && v.as_str() != Some("none"))
-                .map(|(k, _)| k.clone()).collect()
-        }).unwrap_or_default();
+        let plain = |c: String| c.split('=').next().unwrap_or("").to_string();
+        let capabilities: Vec<String> = updates::caps(&r.manifest).into_iter().map(plain).collect();
+        let rec = self.store().get(id)?;
+        let added = match &rec {
+            Some(_) => {
+                let have = fs::read_to_string(self.root.join("apps").join(id).join("atrium.toml")).unwrap_or_default();
+                updates::decide(&have, &r.manifest, true, None).1.into_iter().map(plain).collect()
+            }
+            None => Vec::new(),
+        };
         Ok(Described {
             id: id.into(), kind: r.kind.clone(), name: s("name"), description: s("description"),
             latest: r.version.clone(), publisher: r.signer.clone(), catalog: local.name.clone(),
             capabilities, archive_size: r.archive_size,
-            installed: self.store().get(id)?.map(|x| x.version),
-            manifest_sha256: oc::hex(&Sha256::digest(r.manifest.as_bytes())),
+            installed: rec.map(|x| x.version),
+            manifest_sha256: oc::hex(&Sha256::digest(r.manifest.as_bytes())), added,
         })
     }
 
@@ -178,6 +193,108 @@ impl Daemon {
 
     /// Install the newest catalog release of `id` for `uid`. With `approved`,
     /// only if that release's manifest is the one the sheet showed.
+    // ── updates (C5) ────────────────────────────────────────────────────────
+
+    pub fn prefs(&self) -> PrefStore { PrefStore::new(&self.state) }
+
+    /// Whether `signer` publishes for the same publisher as `have`: from this
+    /// catalog, and the same key or, in the Atrium catalog where the platform
+    /// is the only publisher, a platform key of the current root (a rotated
+    /// platform key is still Atrium).
+    fn same_publisher(&self, have: &crate::installed::Record, signer: &str, catalog: &str, root: &oc::Root) -> bool {
+        if have.source != format!("catalog:{catalog}") {
+            return false;
+        }
+        let platform = |k: &str| root.key(k).is_some_and(|k| k.roles.iter().any(|r| r == "platform"));
+        have.publisher == signer || (platform(signer) && (platform(&have.publisher) || root.key(&have.publisher).is_none()))
+    }
+
+    /// Installed apps with a newer release, and what happens to each.
+    pub fn updates(&self) -> Result<Vec<Pending>, String> {
+        let c = self.catalog();
+        if !c.dir.join(oc::ROOT).is_file() {
+            return Ok(Vec::new());
+        }
+        let (local, root) = (c.local()?, c.root()?);
+        let prefs = self.prefs().load();
+        let mut out = Vec::new();
+        for rec in self.store().load()?.apps {
+            let Some(r) = local.latest(&rec.id, portcullis_toml::layer::host_arch()) else { continue };
+            if r.kind != "app" || oc::version_cmp(&r.version, &rec.version) != std::cmp::Ordering::Greater {
+                continue;
+            }
+            let have = fs::read_to_string(self.root.join("apps").join(&rec.id).join("atrium.toml")).unwrap_or_default();
+            let same = self.same_publisher(&rec, &r.signer, &local.name, &root);
+            let (action, added) = updates::decide(&have, &r.manifest, same, prefs.care.get(&rec.id).map(String::as_str));
+            let why = match (action, rec.source.as_str()) {
+                (Action::Refused, "side-load") => "side-loaded: update it by side-loading".to_string(),
+                (Action::Refused, _) => "another publisher".to_string(),
+                _ => String::new(),
+            };
+            let name = updates::name(&r.manifest).unwrap_or_else(|| rec.id.clone());
+            out.push(Pending { id: rec.id.clone(), name, from: rec.version.clone(), to: r.version.clone(), action, added, why });
+        }
+        Ok(out)
+    }
+
+    fn set_care(&self, uid: u32, id: &str, care: &str) -> Result<(), String> {
+        let rec = self.store().get(id)?.ok_or_else(|| format!("{id}: not installed"))?;
+        if uid != 0 && uid != rec.installed_by {
+            return Err("only an administrator or the person who installed it may change how it updates".into());
+        }
+        let ps = self.prefs();
+        let mut p = ps.load();
+        match care {
+            "notify" => { p.care.insert(id.into(), "notify".into()); }
+            "auto" => { p.care.remove(id); }
+            _ => return Err("care: \"notify\" or \"auto\"".into()),
+        }
+        ps.save(&p)
+    }
+
+    /// The daily round: sync (over the network when `net`), install what may
+    /// go in the background (each for the person who installed it), announce
+    /// what waits on a person, once per version.
+    pub fn tick(&self, net: bool) -> Result<Response, String> {
+        let ps = self.prefs();
+        if net {
+            let r = self.locked(|| self.sync(Path::new("")));
+            let mut p = ps.load();
+            p.last_sync = now();
+            p.last_error = match &r { Err(e) => e.clone(), Ok(_) => String::new() };
+            ps.save(&p)?;
+            r?;
+        }
+        let mut installed = Vec::new();
+        let mut waiting = Vec::new();
+        for u in self.updates()? {
+            match u.action {
+                Action::Background => {
+                    let by = self.store().get(&u.id)?.map(|r| r.installed_by).unwrap_or(0);
+                    match self.locked(|| self.install_catalog(&u.id, None, by)) {
+                        Ok(_) => installed.push(format!("{} {}", u.id, u.to)),
+                        Err(e) => eprintln!("opifexd: update {} {}: {e}", u.id, u.to),
+                    }
+                }
+                Action::Notify | Action::Ask => waiting.push(u),
+                Action::Refused => eprintln!("opifexd: update {} {} refused: {}", u.id, u.to, u.why),
+            }
+        }
+        let mut p = ps.load();
+        let new: Vec<Pending> = waiting.iter().filter(|u| !p.announced.contains(&format!("{} {}", u.id, u.to))).cloned().collect();
+        if !new.is_empty() {
+            let (title, body) = updates::notice(&new);
+            if let Some(sock) = &self.praeco {
+                if let Err(e) = praeco::client::post(sock, praeco::proto::urgency::LOW, &title, &body) {
+                    eprintln!("opifexd: praecod: {e}");
+                }
+            }
+            p.announced.extend(new.iter().map(|u| format!("{} {}", u.id, u.to)));
+            ps.save(&p)?;
+        }
+        Ok(Response::Ticked { installed, waiting: waiting.len() })
+    }
+
     /// Fetch `r`'s archive from its URLs into `to`, checked by size and hash
     /// before it is kept.
     fn download(&self, r: &oc::Release, to: &Path) -> Result<(), String> {
@@ -213,6 +330,11 @@ impl Daemon {
             }
         }
         let signer = root.key(&r.signer).ok_or("signer gone from root.toml")?.pem.clone();
+        if let Some(have) = self.store().get(id)? {
+            if !self.same_publisher(&have, &r.signer, &local.name, &root) {
+                return Err(format!("{id}: this release is from another publisher than the installed one; not installed"));
+            }
+        }
         // The archive: fetched by C4; for now it must be in the download folder.
         let archive = self.downloads().join(format!("{}.insula", r.archive_sha256));
         if !archive.is_file() {

@@ -158,7 +158,15 @@ pub struct AppSection {
     /// the shell falls back to a default. A bundle path is a relative `.svg`
     /// (see `icon::is_bundle_path`), read by `icon::read_bundle_svg`.
     pub icon:        Option<String>,
+    /// The least careful way the publisher allows its updates to be applied
+    /// (opifex.md §11, insula §14.3): `"auto"` (in the background; the
+    /// default), `"notify"` (the person picks when), `"required"` (installed
+    /// before the next start). A person may choose more care, never less.
+    pub updates:     Option<String>,
 }
+
+/// The update timing classes [`AppSection::updates`] may name.
+pub const UPDATE_CLASSES: [&str; 3] = ["auto", "notify", "required"];
 
 /// Capability set. Used in two places: top-level `[capabilities]`
 /// (runtime) and `[setup.capabilities]` (overrides during setup).
