@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use arca_courier::mail::{encode_hello, session, MailEndpoint, MailVault};
 use arca_courier::schema::Refusal;
@@ -199,6 +199,7 @@ disable_plaintext_auth = yes
 default_login_user = dovenull
 default_internal_user = dovecot
 mail_location = maildir:~/Maildir
+mailbox_idle_check_interval = 1 secs
 first_valid_uid = 1
 passdb {{
   driver = passwd-file
@@ -642,4 +643,75 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     assert!(engine.store.accounts().unwrap().is_empty());
     assert!(engine.configured().is_empty());
     assert!(engine.store.account_config(account).unwrap().is_none());
+}
+
+#[test]
+fn idle_reports_new_mail_in_the_inbox() {
+    use mail_engine::accounts::{watch_inbox, Watched};
+    use mail_store::{AccountConfig, Protocol, Reached, Server};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let cfg = AccountConfig {
+        address: "priya@example.org".into(),
+        name: "Priya".into(),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: HOST.into(), port: dc.port },
+            smtp: Server { scheme: "submissions".into(), host: HOST.into(), port: dc.sub_port },
+        },
+        incoming_item: Some([9; 16]),
+        outgoing_item: Some([9; 16]),
+        oauth: None,
+        reached: Reached::Never,
+    };
+    let home = dc.dir.path().join("home");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    std::thread::scope(|sc| {
+        let w = sc.spawn(|| {
+            let mut held = None;
+            watch_inbox(&cfg, &Couriers(&dc), &mut |s| held = Some(s), &mut || {
+                tx.send(()).unwrap();
+                false
+            })
+        });
+        // Nothing new: no change while it waits.
+        assert!(rx.recv_timeout(Duration::from_secs(3)).is_err());
+        deliver(&home, "", 7777, now() - 5, false, "Pushed.", "Pushed to you");
+        chown_r(&home, 65534, 65534);
+        rx.recv_timeout(Duration::from_secs(20)).expect("IDLE didn't report the new message");
+        assert_eq!(w.join().unwrap(), Ok(Watched::Stopped));
+    });
+    assert!(started.elapsed() < Duration::from_secs(30));
+}
+
+#[test]
+fn a_watch_ends_when_its_connection_is_shut() {
+    use mail_engine::accounts::watch_inbox;
+    use mail_store::{AccountConfig, Protocol, Reached, Server};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let cfg = AccountConfig {
+        address: "priya@example.org".into(),
+        name: "Priya".into(),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: HOST.into(), port: dc.port },
+            smtp: Server { scheme: "submissions".into(), host: HOST.into(), port: dc.sub_port },
+        },
+        incoming_item: Some([9; 16]),
+        outgoing_item: Some([9; 16]),
+        oauth: None,
+        reached: Reached::Never,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|sc| {
+        let w = sc.spawn(|| watch_inbox(&cfg, &Couriers(&dc), &mut |s| tx.send(s).unwrap(), &mut || true));
+        let s = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        s.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(w.join().unwrap().is_err());
+    });
 }

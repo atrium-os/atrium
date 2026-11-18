@@ -307,7 +307,7 @@ fn main() {
     };
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
-    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Box::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
+    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
     let mut engine = Engine::new(store, Parser { program: jail });
     // Senders whose key couldn't be fetched at arrival are checked again on opening.
     engine.set_dns(Box::new(atrium_mail::accounts::NuntiusDns::default()));
