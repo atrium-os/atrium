@@ -297,6 +297,18 @@ item.
     the token arriving and masked, the jail gone with its label retired and no mount
     left when the app closes, and the refusals.
 
+### 5.5 Event streams (2026-11-18)
+
+A `GET` whose `Accept` is `text/event-stream` (Mail's JMAP push, mail.md §5.2) is
+answered as a stream: a `Response::Events` frame with the status and headers (masked
+as usual), then one `Response::Event` frame per whole event (up to its blank line, at
+most 64 KiB, the filled values and cookies masked in it), then `Response::EventsEnd`
+when the server ends the stream or is quiet for 5 minutes (clients ask for a ping a
+minute). Any other answer to such a request (a refusal, a redirect) comes back as the
+one ordinary `Response::Http` frame. A stream's connection is never kept for another
+request. Old clients never send that `Accept` and never see the new frames. Gate:
+`tests/courier.rs` `an_event_stream_comes_one_event_at_a_time_masked`.
+
 ## 6. At rest and in memory
 
 ### 6.1 The key hierarchy

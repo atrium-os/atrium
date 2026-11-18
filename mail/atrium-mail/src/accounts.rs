@@ -81,31 +81,10 @@ struct CourierHttp {
 
 impl CourierHttp {
     fn request(&mut self, url: &str, method: Method, content_type: Option<&str>, body: &[u8], max: usize) -> Result<Vec<u8>, String> {
-        let (host, port, pq) = split_url(url).ok_or("not an https URL")?;
-        if host != self.host || port != self.port {
-            return Err(format!("the server sends Mail to another host ({host}) the sign-in isn't for"));
-        }
         if body.len() > arca_courier::schema::BODY_MAX {
             return Err("the message is larger than Mail can send through Arca yet (1 MiB)".into());
         }
-        let (path, query) = match pq.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (pq, String::new()),
-        };
-        let mut headers = vec![(Header::Accept, b"application/json".to_vec())];
-        if let Some(ct) = content_type {
-            headers.push((Header::ContentType, ct.as_bytes().to_vec()));
-        }
-        let req = Request {
-            method,
-            path: path.into_bytes(),
-            query: query.into_bytes(),
-            headers,
-            slots: vec![Slot { source: courier_op::SOURCE_ITEM, reference: self.item, place: Place::Bearer }],
-            body: if body.is_empty() { vec![] } else { vec![arca_courier::schema::Segment::Literal(body.to_vec())] },
-            ticket: None,
-        };
-        let frame = req.encode();
+        let frame = self.frame(url, method, "application/json", content_type, body)?;
         for attempt in 0..2 {
             if self.conn.is_none() {
                 let s = arca_courierd::open_scheme(&self.socket, arca_store::Scheme::Https, &self.host, self.port, None).map_err(|c| format!("courierd refused ({c})"))?;
@@ -127,7 +106,7 @@ impl CourierHttp {
                         Some(Response::Http { status: 401 | 403, .. }) => Err("AUTHENTICATIONFAILED: the server refused the sign-in".into()),
                         Some(Response::Http { status, .. }) => Err(format!("the server said {status}")),
                         Some(Response::Refused(r)) => Err(format!("Arca refused: {r:?}")),
-                        None => Err("a bad answer from the courier".into()),
+                        _ => Err("a bad answer from the courier".into()),
                     };
                 }
                 // The courier ended (idle, or one request per courier):
@@ -140,7 +119,68 @@ impl CourierHttp {
     }
 }
 
+impl CourierHttp {
+    /// The request for `url` (on this courier's host), as courier frames.
+    fn frame(&self, url: &str, method: Method, accept: &str, content_type: Option<&str>, body: &[u8]) -> Result<Vec<u8>, String> {
+        let (host, port, pq) = split_url(url).ok_or("not an https URL")?;
+        if host != self.host || port != self.port {
+            return Err(format!("the server sends Mail to another host ({host}) the sign-in isn't for"));
+        }
+        let (path, query) = match pq.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (pq, String::new()),
+        };
+        let mut headers = vec![(Header::Accept, accept.as_bytes().to_vec())];
+        if let Some(ct) = content_type {
+            headers.push((Header::ContentType, ct.as_bytes().to_vec()));
+        }
+        Ok(Request {
+            method,
+            path: path.into_bytes(),
+            query: query.into_bytes(),
+            headers,
+            slots: vec![Slot { source: courier_op::SOURCE_ITEM, reference: self.item, place: Place::Bearer }],
+            body: if body.is_empty() { vec![] } else { vec![arca_courier::schema::Segment::Literal(body.to_vec())] },
+            ticket: None,
+        }
+        .encode())
+    }
+}
+
+/// How long Mail waits on a quiet event stream: past the courier's own
+/// wait, which ends it first.
+const EVENTS_READ: Duration = Duration::from_secs(6 * 60);
+
+/// An event stream's frames from a courier, to `on_event`.
+pub fn read_events(c: &mut impl std::io::Read, on_event: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), String> {
+    let mut begun = false;
+    loop {
+        let f = arca_courier::send::read_frame(c).map_err(|e| format!("the event stream broke: {e}"))?.ok_or("the courier ended")?;
+        match Response::decode(&f) {
+            Some(Response::Events { status, .. }) if !begun && (200..300).contains(&status) => begun = true,
+            Some(Response::Event(e)) if begun => {
+                if !on_event(&e) {
+                    return Ok(());
+                }
+            }
+            Some(Response::EventsEnd) if begun => return Ok(()),
+            Some(Response::Http { status: 401 | 403, .. }) => return Err("AUTHENTICATIONFAILED: the server refused the sign-in".into()),
+            Some(Response::Http { status, .. }) => return Err(format!("the server said {status} to the event stream")),
+            Some(Response::Refused(r)) => return Err(format!("Arca refused: {r:?}")),
+            _ => return Err("a bad answer from the courier".into()),
+        }
+    }
+}
+
 impl mail_sync::jmap::Http for CourierHttp {
+    fn events(&mut self, url: &str, on_event: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), String> {
+        let frame = self.frame(url, Method::Get, "text/event-stream", None, &[])?;
+        // A courier of its own: the stream holds it until it ends.
+        let mut c = arca_courierd::open_scheme(&self.socket, arca_store::Scheme::Https, &self.host, self.port, None).map_err(|c| format!("courierd refused ({c})"))?;
+        c.set_read_timeout(Some(EVENTS_READ)).ok();
+        arca_courier::send::write_frame(&mut c, &frame).map_err(|e| e.to_string())?;
+        read_events(&mut c, on_event)
+    }
     fn get(&mut self, url: &str, max: usize) -> Result<Vec<u8>, String> {
         self.request(url, Method::Get, None, &[], max)
     }
@@ -398,9 +438,10 @@ impl Watcher {
                         }
                         idling.store(true, Ordering::Release);
                     },
-                    &mut || {
+                    &mut |changed| {
                         failures = 0;
-                        !stop.load(Ordering::Acquire) && wake.send(Wake::Changed(account)).is_ok()
+                        idling.store(true, Ordering::Release);
+                        !stop.load(Ordering::Acquire) && (!changed || wake.send(Wake::Changed(account)).is_ok())
                     },
                 );
                 idling.store(false, Ordering::Release);
@@ -471,7 +512,7 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Conn
                 }
                 // A watch for each IMAP account that signs in, restarted
                 // when its settings change.
-                let wanted = matches!(cfg.protocol, Protocol::Imap { .. }) && !matches!(r, Err(Reached::SignInAgain { .. }));
+                let wanted = !matches!(r, Err(Reached::SignInAgain { .. }));
                 let stale = watchers.get(id).is_some_and(|(c, _)| !same_servers(c, cfg));
                 if stale || !wanted {
                     watchers.remove(id);
@@ -635,5 +676,32 @@ mod tests {
         }
         assert!(rx.try_recv().is_err());
         assert_eq!((watch_backoff(0), watch_backoff(1), watch_backoff(3), watch_backoff(9)), (60, 120, 480, 900));
+    }
+
+    #[test]
+    fn an_event_stream_from_the_courier() {
+        let mut b = Vec::new();
+        for r in [Response::Events { status: 200, headers: vec![] }, Response::Event(b"event: ping\n\n".to_vec()), Response::Event(b"event: state\n\n".to_vec()), Response::EventsEnd] {
+            arca_courier::send::write_frame(&mut b, &r.encode()).unwrap();
+        }
+        let mut got = Vec::new();
+        read_events(&mut &b[..], &mut |e| {
+            got.push(e.to_vec());
+            true
+        })
+        .unwrap();
+        assert_eq!(got, vec![b"event: ping\n\n".to_vec(), b"event: state\n\n".to_vec()]);
+        // Stopping at the first.
+        let mut n = 0;
+        read_events(&mut &b[..], &mut |_| {
+            n += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(n, 1);
+        // A refused sign-in reads as one, so the account says "sign in again".
+        let mut b = Vec::new();
+        arca_courier::send::write_frame(&mut b, &Response::Http { status: 401, headers: vec![], body: vec![] }.encode()).unwrap();
+        assert!(read_events(&mut &b[..], &mut |_| true).unwrap_err().starts_with("AUTHENTICATIONFAILED"));
     }
 }

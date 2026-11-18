@@ -18,6 +18,11 @@ pub trait Http {
     fn get(&mut self, url: &str, max: usize) -> std::result::Result<Vec<u8>, String>;
     /// POST `body` as `content_type`; the body of a 2xx answer.
     fn post(&mut self, url: &str, content_type: &str, body: &[u8], max: usize) -> std::result::Result<Vec<u8>, String>;
+    /// GET `url` as an event stream: `on_event` for each whole event while
+    /// it returns `true`. `Ok` when the server ends the stream.
+    fn events(&mut self, _url: &str, _on_event: &mut dyn FnMut(&[u8]) -> bool) -> std::result::Result<(), String> {
+        Err("no push here".into())
+    }
 }
 
 impl<T: Http + ?Sized> Http for Box<T> {
@@ -27,7 +32,24 @@ impl<T: Http + ?Sized> Http for Box<T> {
     fn post(&mut self, url: &str, content_type: &str, body: &[u8], max: usize) -> std::result::Result<Vec<u8>, String> {
         (**self).post(url, content_type, body, max)
     }
+    fn events(&mut self, url: &str, on_event: &mut dyn FnMut(&[u8]) -> bool) -> std::result::Result<(), String> {
+        (**self).events(url, on_event)
+    }
 }
+
+/// How a push watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pushed {
+    /// The server has no event source.
+    NoPush,
+    /// The caller said stop.
+    Stopped,
+    /// The server ended the stream (connect again).
+    Ended,
+}
+
+/// Seconds between the server's pings, so a quiet stream is known alive.
+pub const PING_SECS: u32 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -108,6 +130,37 @@ impl<H: Http> Client<H> {
         let body = h.get(url, 1 << 20).map_err(Error)?;
         let session = jmap::session(&body)?;
         Ok(Client { h, session, mailboxes: Vec::new() })
+    }
+
+    /// Listen on the session's event source (RFC 8620 §7.3) for changes to
+    /// mail and mailboxes: `on(true)` when the account's states move (and
+    /// once on connecting, as the stream's first states may be news),
+    /// `on(false)` for any other event (a ping); return `false` to stop.
+    pub fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed> {
+        let Some(t) = self.session.event_source_url.clone() else { return Ok(Pushed::NoPush) };
+        let url = jmap::event_source_url(&t, "Email,Mailbox,EmailDelivery", "no", PING_SECS);
+        let account = self.session.account.clone();
+        let mut last: Option<Vec<(String, String)>> = None;
+        let mut stopped = false;
+        self.h
+            .events(&url, &mut |raw| {
+                let news = match jmap::sse_event(raw) {
+                    Some((kind, data)) if kind == "state" => match jmap::state_change(&data, &account) {
+                        Some(states) if last.as_ref() != Some(&states) => {
+                            last = Some(states);
+                            true
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !on(news) {
+                    stopped = true;
+                }
+                !stopped
+            })
+            .map_err(Error)?;
+        Ok(if stopped { Pushed::Stopped } else { Pushed::Ended })
     }
 
     fn call(&mut self, body: Vec<u8>) -> Result<Answers> {

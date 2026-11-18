@@ -21,7 +21,7 @@
 use std::process::ExitCode;
 
 use arca_courier::mail::{self as mailc, MailEndpoint};
-use arca_courier::send::{read_frame, write_frame, Courier, Endpoint};
+use arca_courier::send::{read_frame, Courier, Endpoint};
 use arca_courier::vault::Arcad;
 use arca_store::Recipient;
 use navigator_fetch::{addr, Connect, Direct};
@@ -110,8 +110,7 @@ fn main() -> ExitCode {
             Ok(None) => return ExitCode::SUCCESS,
             Err(_) => return ExitCode::FAILURE,
         };
-        let reply = courier.handle(&frame, &mut vault);
-        if write_frame(&mut output, &reply.encode()).is_err() {
+        if courier.handle_to(&frame, &mut vault, &mut output).is_err() {
             return ExitCode::FAILURE;
         }
     }

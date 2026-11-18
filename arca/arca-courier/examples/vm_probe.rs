@@ -106,6 +106,7 @@ fn main() {
             println!("body={}", String::from_utf8_lossy(&body));
         }
         Response::Refused(r) => println!("refused={r:?}"),
+        other => println!("unexpected={other:?}"),
     }
     let got = seen.lock().unwrap().first().cloned().unwrap_or_default();
     println!("server_got_token={}", got.contains("Authorization: Bearer hunter2-token\r\n"));
@@ -115,6 +116,7 @@ fn main() {
             println!("redirect={status} {loc}");
         }
         Response::Refused(r) => println!("redirect_refused={r:?}"),
+        other => println!("redirect_unexpected={other:?}"),
     }
     println!("requests_at_server={}", seen.lock().unwrap().len());
     drop(tx);
