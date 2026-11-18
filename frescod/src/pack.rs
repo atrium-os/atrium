@@ -312,14 +312,14 @@ impl SceneState {
             }
             UploadRequest::TextureRegion { slot_id, bytes, dst_x, dst_y, width, height } => {
                 let Some(t) = self.slots.get_mut(&slot_id) else {
-                    log::warn!("compute: TextureRegion for empty slot {slot_id}; dropped");
+                    eprintln!("fresco: an update to slot {slot_id:#x}, which holds nothing, dropped");
                     return;
                 };
                 let bpp = t.format.bytes_per_texel();
                 if dst_x + width > t.width || dst_y + height > t.height
                     || bytes.len() != (width * height) as usize * bpp
                 {
-                    log::warn!("compute: slot {slot_id}: region out of bounds; dropped");
+                    eprintln!("fresco: slot {slot_id:#x}: an update outside it ({dst_x},{dst_y} {width}x{height} into {}x{}) dropped", t.width, t.height);
                     return;
                 }
                 let row = width as usize * bpp;
@@ -768,7 +768,11 @@ impl SceneState {
                 glyph_remap.push(None);
                 continue;
             }
-            glyph_remap.push(tex_index(b.atlas_slot_id, &mut scene).map(|atlas| {
+            let atlas = tex_index(b.atlas_slot_id, &mut scene);
+            if atlas.is_none() {
+                note_once(f.id, b.atlas_slot_id, 2, || format!("glyph atlas slot {:#x} was never uploaded: its text is left out", b.atlas_slot_id));
+            }
+            glyph_remap.push(atlas.map(|atlas| {
                 let runs = b.nodes.iter().map(|n| {
                     let (count, off) = (n.meta[0].max(0) as usize, n.meta[1].max(0) as usize);
                     let glyphs = b.glyphs.get(off..off + count).unwrap_or(&[]);
@@ -1059,6 +1063,7 @@ fn grouped_frame_but(
             emit(w, &mut order, id, x, op, clip);
         }
     }
+    note_lost(state, w.id, &kids);
     if promote.is_some() {
         // Each sprite within the window's size in its own space, and
         // nothing that is not a sprite drawn over one.
@@ -1372,6 +1377,45 @@ fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
 /// A run's glyphs by atlas: its own (slot, size) and, for frescod's text
 /// with colour glyphs (`GLYPH_COLOR`), the paired colour atlas
 /// (docs/spec/fonts.md §6). Empty parts left out.
+/// Say once (per window, node and reason) when a node frescod holds is
+/// drawn nowhere because its parent group is gone, or drawn under
+/// everything because it was never placed in a window that uses groups:
+/// a label that does not show can then be traced to its node.
+fn note_lost(
+    state: &fresco_scene_server::command::envelope_frontend::WindowSceneState,
+    window: u32,
+    kids: &HashMap<Option<u32>, Vec<(u32, u32)>>,
+) {
+    let mut reached: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(state.placements.len() + state.group_nodes.len());
+    let mut stack: Vec<Option<u32>> = vec![None];
+    while let Some(of) = stack.pop() {
+        for &(_, id) in kids.get(&of).map(Vec::as_slice).unwrap_or(&[]) {
+            if reached.insert(id) && state.group_nodes.contains_key(&id) {
+                stack.push(Some(id));
+            }
+        }
+    }
+    for (&id, p) in &state.placements {
+        if !reached.contains(&id) {
+            note_once(window, id, 0, || format!("node {id} is placed under group {:?}, which is not in the window's tree: drawn nowhere", p.parent));
+        }
+    }
+    for &id in state.glyph_run_nodes.keys() {
+        if !state.placements.contains_key(&id) {
+            note_once(window, id, 1, || format!("text run {id} has no place: drawn under everything"));
+        }
+    }
+}
+
+fn note_once(window: u32, id: u32, why: u8, say: impl FnOnce() -> String) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<(u32, u32, u8)>>> = std::sync::Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    let said = said.get_or_insert_with(Default::default);
+    if said.len() < 4096 && said.insert((window, id, why)) {
+        eprintln!("fresco: window {window}: {}", say());
+    }
+}
+
 fn run_parts(p: &fresco_protocol::GlyphRunParams) -> Vec<(u32, [f32; 2], Vec<GlyphInstance>)> {
     let inst = |g: &fresco_protocol::GlyphInstance| GlyphInstance {
         d_offset: [g.dx, g.dy],
