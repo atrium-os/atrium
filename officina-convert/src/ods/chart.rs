@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
+#[cfg(feature = "read")]
 use quick_xml::Reader;
 
 use officina_grid::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
@@ -40,6 +42,7 @@ pub(crate) struct FrameIn {
 const PT_PX: f64 = 72.0 / 96.0;
 const MAX_TEXT: usize = officina_grid::charts::MAX_TITLE;
 
+#[cfg(feature = "read")]
 fn attrs(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for a in e.attributes().with_checks(false).flatten() {
@@ -50,6 +53,7 @@ fn attrs(e: &quick_xml::events::BytesStart) -> HashMap<String, String> {
     m
 }
 
+#[cfg(feature = "read")]
 /// `Data.B2:Data.B13`, `'My sheet'.$B$2:.$B$13` → the range.
 fn range(wb: &Workbook, a: &str) -> Option<Rect> {
     // Several ranges (space-separated): the first.
@@ -63,10 +67,12 @@ fn range(wb: &Workbook, a: &str) -> Option<Rect> {
     Some(Rect { sheet: wb.sheet_id(&sh)?, r0, c0, r1, c1 })
 }
 
+#[cfg(feature = "read")]
 fn line(r: &Rect) -> bool {
     r.r0 == r.r1 || r.c0 == r.c1
 }
 
+#[cfg(feature = "read")]
 /// The cell under sheet position (x, y) px and the offset into it, in points.
 fn cell_at(wb: &Workbook, sheet: u16, x: f64, y: f64) -> (u32, u32, f32, f32) {
     let sh = wb.sheet(sheet);
@@ -78,6 +84,7 @@ fn cell_at(wb: &Workbook, sheet: u16, x: f64, y: f64) -> (u32, u32, f32, f32) {
     (r, c, dx as f32, dy as f32)
 }
 
+#[cfg(feature = "read")]
 /// Turns the frames read into charts.
 pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, rep: &mut Report) {
     for f in frames {
@@ -119,6 +126,7 @@ pub(crate) fn read_frames(wb: &mut Workbook, z: &Archive, frames: Vec<FrameIn>, 
     }
 }
 
+#[cfg(feature = "read")]
 #[derive(Default, Clone, Copy)]
 struct Props {
     vertical: bool,
@@ -126,6 +134,7 @@ struct Props {
     percent: bool,
 }
 
+#[cfg(feature = "read")]
 /// One chart sub-document. `None`: not a chart of a kind Officina draws.
 fn chart_doc(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> Option<Chart> {
     let mut r = Reader::from_reader(data);

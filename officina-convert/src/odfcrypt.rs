@@ -57,6 +57,7 @@ struct Enc {
     checksum: Vec<u8>,
 }
 
+#[cfg(feature = "read")]
 fn manifest(z: &Archive) -> Result<HashMap<String, Enc>, CryptError> {
     let Ok(Some(data)) = z.read_name("META-INF/manifest.xml") else { return Ok(HashMap::new()) };
     let root = xml::parse(&data).map_err(|e| CryptError::Damaged(format!("manifest: {e}")))?;
@@ -73,6 +74,7 @@ fn num<T: std::str::FromStr>(e: &El, name: &str) -> Option<T> {
     e.attr(name).and_then(|v| v.trim().parse().ok())
 }
 
+#[cfg(feature = "read")]
 fn enc(fe: &El, ed: &El) -> Result<Enc, CryptError> {
     let mut e = Enc { size: num(fe, "manifest:size"), ..Enc::default() };
     e.checksum_type = ed.attr("manifest:checksum-type").unwrap_or_default().to_string();
@@ -97,6 +99,7 @@ fn enc(fe: &El, ed: &El) -> Result<Enc, CryptError> {
 }
 
 /// Whether `file` is an ODF package with encrypted parts.
+#[cfg(feature = "read")]
 pub fn is_encrypted_odf(file: &[u8]) -> bool {
     Archive::open(file).ok().and_then(|z| manifest(&z).ok()).is_some_and(|m| !m.is_empty())
 }
@@ -142,6 +145,7 @@ fn key(e: &Enc, password: &str, keys: &mut Keys) -> Result<Vec<u8>, CryptError> 
     Ok(k)
 }
 
+#[cfg(feature = "read")]
 /// One part decrypted and inflated.
 fn open_part(e: &Enc, body: &[u8], password: &str, keys: &mut Keys) -> Result<Vec<u8>, CryptError> {
     let k = key(e, password, keys)?;
@@ -195,6 +199,7 @@ fn open_part(e: &Enc, body: &[u8], password: &str, keys: &mut Keys) -> Result<Ve
     }
 }
 
+#[cfg(feature = "read")]
 /// The plain package inside `file`, an encrypted ODF package. A file with
 /// nothing encrypted comes back as it is.
 pub fn decrypt(file: &[u8], password: &str) -> Result<Vec<u8>, CryptError> {
@@ -321,21 +326,51 @@ pub fn encrypt_with(package: &[u8], password: &str, iterations: u32) -> Result<V
     w.finish().map_err(io)
 }
 
+/// `<name ...>` start tags in `m` (one we wrote), each as its attributes
+/// with their values still escaped. Enough for our own manifest, which the
+/// writers made; the document process has no XML parser.
+fn tags<'a>(m: &'a str, name: &str) -> Vec<Vec<(&'a str, &'a str)>> {
+    let open = format!("<{name}");
+    let mut found = Vec::new();
+    let mut rest = m;
+    while let Some(i) = rest.find(&open) {
+        let tail = &rest[i + open.len()..];
+        if !tail.starts_with(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+            rest = tail;
+            continue;
+        }
+        let end = tail.find('>').unwrap_or(tail.len());
+        let mut attrs = Vec::new();
+        let mut a = &tail[..end];
+        while let Some(eq) = a.find("=\"") {
+            let key = a[..eq].trim().trim_end_matches('/');
+            let v = &a[eq + 2..];
+            let Some(close) = v.find('"') else { break };
+            attrs.push((key, &v[..close]));
+            a = &v[close + 1..];
+        }
+        found.push(attrs);
+        rest = &tail[end..];
+    }
+    found
+}
+
 /// The manifest with each encrypted part's entry given its size and
 /// encryption data (parts the manifest doesn't list are added).
 fn rewrite_manifest(m: &str, data_for: &HashMap<String, String>) -> Result<String, CryptError> {
-    let root = xml::parse(m.as_bytes()).map_err(|e| CryptError::Damaged(format!("manifest: {e}")))?;
+    let Some(root) = tags(m, "manifest:manifest").into_iter().next() else { return damaged("manifest: no root element") };
     let mut out = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0""#);
-    if let Some(v) = root.attr("manifest:version") {
-        out += &format!(r#" manifest:version="{}""#, xml::esc(v));
+    if let Some((_, v)) = root.iter().find(|(k, _)| *k == "manifest:version") {
+        out += &format!(r#" manifest:version="{v}""#);
     }
     out.push('>');
     let mut seen = std::collections::HashSet::new();
-    let entry = |out: &mut String, path: &str, attrs: &[(String, String)]| {
+    // Values are escaped already; `path` is the unescaped one.
+    let entry = |out: &mut String, path: &str, attrs: &[(&str, String)]| {
         out.push_str("<manifest:file-entry");
         for (k, v) in attrs {
-            if k != "manifest:size" && k.starts_with("manifest:") {
-                out.push_str(&format!(r#" {k}="{}""#, xml::esc(v)));
+            if *k != "manifest:size" && k.starts_with("manifest:") {
+                out.push_str(&format!(r#" {k}="{v}""#));
             }
         }
         if let Some(d) = data_for.get(path) {
@@ -344,19 +379,46 @@ fn rewrite_manifest(m: &str, data_for: &HashMap<String, String>) -> Result<Strin
             out.push_str("/>");
         }
     };
-    for fe in root.children("manifest:file-entry") {
-        let path = fe.attr("manifest:full-path").unwrap_or_default().to_string();
-        entry(&mut out, &path, &fe.attrs);
+    for fe in tags(m, "manifest:file-entry") {
+        let raw = fe.iter().find(|(k, _)| *k == "manifest:full-path").map_or("", |(_, v)| *v);
+        let path = unesc(raw);
+        let attrs: Vec<(&str, String)> = fe.iter().map(|(k, v)| (*k, v.to_string())).collect();
+        entry(&mut out, &path, &attrs);
         seen.insert(path);
     }
     let mut extra: Vec<&String> = data_for.keys().filter(|k| !k.contains('\0') && !seen.contains(*k)).collect();
     extra.sort();
     for p in extra {
-        let attrs = vec![("manifest:full-path".to_string(), p.clone()), ("manifest:media-type".to_string(), String::new())];
+        let attrs = vec![("manifest:full-path", xml::esc(p)), ("manifest:media-type", String::new())];
         entry(&mut out, p, &attrs);
     }
     out += "</manifest:manifest>";
     Ok(out)
+}
+
+/// The five predefined entities and numeric references, undone.
+fn unesc(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut o = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        o.push_str(&rest[..i]);
+        let t = &rest[i..];
+        let Some(semi) = t.find(';') else { o.push_str(t); return o };
+        let ent = &t[1..semi];
+        let c = match ent {
+            "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "apos" => Some('\''),
+            _ if ent.starts_with("#x") => u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32),
+            _ if ent.starts_with('#') => ent[1..].parse().ok().and_then(char::from_u32),
+            _ => None,
+        };
+        match c { Some(c) => o.push(c), None => o.push_str(&t[..=semi]) }
+        rest = &t[semi + 1..];
+    }
+    o.push_str(rest);
+    o
 }
 
 #[cfg(test)]

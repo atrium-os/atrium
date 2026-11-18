@@ -13,6 +13,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "officina-convert"
 path = "src/bin/officina_convert.rs"
+required-features = ["read"]
+
+[features]
+# The readers of foreign files. They run in the converter; an app's core
+# links the crate without them (default-features = false): the writers,
+# protection and the launcher only, so no XML parser.
+default = ["read"]
+read = ["dep:quick-xml"]
 
 [dependencies]
 officina-core = { path = "../officina-core" }
@@ -24,7 +32,7 @@ officina-pict = { path = "../officina-pict", default-features = false }
 # Pure Rust deflate (MIT OR Zlib OR Apache-2.0); the repo already uses it via navigator-fonts.
 miniz_oxide = "0.8"
 # Streaming XML (MIT); bounded by our own limits on top.
-quick-xml = "0.37"
+quick-xml = { version = "0.37", optional = true }
 libc = "0.2"
 # Run as the app's `convert` worker when installed (dev-tools-plan.md M5).
 atrium-worker = { path = "../sdk/atrium-worker" }

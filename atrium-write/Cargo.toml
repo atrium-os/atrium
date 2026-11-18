@@ -17,7 +17,8 @@ path = "src/bin/atrium_write.rs"
 [dependencies]
 navigator-image = { path = "../navigator-image", features = ["office"] }
 officina-core = { path = "../officina-core" }
-officina-convert = { path = "../officina-convert" }
+# Writers, protection and the launcher: the readers run in the convert worker.
+officina-convert = { path = "../officina-convert", default-features = false }
 officina-text = { path = "../officina-text" }
 officina-pdf = { path = "../officina-pdf" }
 officina-spell = { path = "../officina-spell" }
@@ -45,4 +46,6 @@ debug = 1
 strip = false
 
 [dev-dependencies]
+# Tests make foreign sample files with the readers' crate.
+officina-convert = { path = "../officina-convert", features = ["read"] }
 png = "0.17"

@@ -144,6 +144,7 @@ pub struct TableIn {
     pub other_source: bool,
 }
 
+#[cfg(feature = "read")]
 /// The data pilots read into pivots over the cells they wrote.
 pub fn make(wb: &mut Workbook, tables: Vec<TableIn>, rep: &mut Report) {
     for t in tables {

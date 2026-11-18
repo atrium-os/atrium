@@ -1,8 +1,10 @@
 //! `.docx` (WordprocessingML) in and out (docs/spec/officina.md §7.6, O3e).
 
+#[cfg(feature = "read")]
 pub mod read;
 pub mod write;
 
+#[cfg(feature = "read")]
 pub use read::{read, DocxError, Loaded};
 pub use write::write;
 

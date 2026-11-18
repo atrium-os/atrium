@@ -10,8 +10,10 @@ use std::sync::Arc;
 use officina_grid::addr::{a1, Rect};
 use officina_grid::pivot::{Agg, DataField, Pivot, PivotField};
 use officina_grid::{CellAddr, ErrorKind, Value, Workbook};
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
 
+#[cfg(feature = "read")]
 use super::read::{attr, parse_ref, xml, XlsxError};
 use crate::report::{Kind, Report};
 
@@ -41,6 +43,7 @@ fn agg_name(a: Agg) -> &'static str {
     }
 }
 
+#[cfg(feature = "read")]
 fn agg_of(s: &str) -> Option<Agg> {
     Agg::ALL.into_iter().find(|a| agg_name(*a) == s)
 }
@@ -238,6 +241,7 @@ pub fn table_xml(wb: &Workbook, p: &Pivot, i: usize, cache_id: usize) -> String 
 // ---------------------------------------------------------------------------
 // Reading.
 
+#[cfg(feature = "read")]
 /// A cache definition as read: source range (sheet, rect) and each field's items.
 struct Cache {
     sheet: Option<String>,
@@ -247,6 +251,7 @@ struct Cache {
     calculated: bool,
 }
 
+#[cfg(feature = "read")]
 fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
     let mut c = Cache { sheet: None, rf: None, name: None, items: Vec::new(), calculated: false };
     let mut r = xml(data);
@@ -296,6 +301,7 @@ fn read_cache(data: &[u8]) -> Result<Cache, XlsxError> {
     Ok(c)
 }
 
+#[cfg(feature = "read")]
 #[derive(Default)]
 struct FieldIn {
     hidden: Vec<u32>,
@@ -305,6 +311,7 @@ struct FieldIn {
     subtotal: bool,
 }
 
+#[cfg(feature = "read")]
 /// One pivot table part (with its cache) into the workbook.
 pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep: &mut Report) -> Result<(), XlsxError> {
     let c = read_cache(cache)?;
@@ -455,6 +462,7 @@ pub fn read_table(wb: &mut Workbook, sheet: u16, data: &[u8], cache: &[u8], rep:
     Ok(())
 }
 
+#[cfg(feature = "read")]
 /// Every pivot table, from each sheet's relationships, in their parts' order.
 pub fn read_all(wb: &mut Workbook, z: &crate::zip::Archive, sheets: &[String], rep: &mut Report) -> Result<(), XlsxError> {
     let mut parts: Vec<(u16, String)> = Vec::new();

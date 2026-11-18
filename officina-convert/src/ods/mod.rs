@@ -6,8 +6,10 @@ pub(crate) mod condfmt;
 pub mod formula;
 pub(crate) mod macros;
 pub(crate) mod pivot;
+#[cfg(feature = "read")]
 pub mod read;
 pub mod write;
 
+#[cfg(feature = "read")]
 pub use read::{read, OdsError};
 pub use write::write;

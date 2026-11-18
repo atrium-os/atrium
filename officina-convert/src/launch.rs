@@ -145,6 +145,7 @@ pub fn protect(kind: &str, file: &[u8], password: &str) -> Result<Vec<u8>, crate
     }
 }
 
+#[cfg(feature = "read")]
 /// `input` (a foreign file, as read) opened for a reader of `kind`:
 /// decrypted when it is password-protected. Runs in the converter, after
 /// it has sandboxed itself. The error is the stderr line's text.
