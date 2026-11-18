@@ -129,7 +129,7 @@ F=$(Q follow $URL $SHA --everyone)
 check "root follows it" "1" "$(echo "$F" | grep -c 'following Example Apps as apps.example.test')"
 check "one release offered" "1" "$(echo "$F" | grep -c '1 releases offered')"
 check "the unproven publisher named" "1" "$(echo "$F" | grep -c 'not proven: bank.test')"
-check "alice can describe the app" "1" "$(A describe $APP | grep -c 'C7 $APP')"
+check "alice can describe the app" "1" "$(A describe $APP | grep -c "C7 $APP")"
 check "not the unproven one" "1" "$(A describe test.bank.app | grep -c 'not in the catalog')"
 check "two catalogs listed" "1" "$(A catalogs | grep -c 'apps.example.test')"
 
@@ -155,7 +155,7 @@ echo "=== refusals"
 V "cd $B && cp -R web/apps.example.test/cat cat.good && f=\$(ls web/apps.example.test/cat/entries | head -1) && \
    sed -i '' 's/C7 $APP/C7 forged/' web/apps.example.test/cat/entries/\$f && opifex catalog head web/apps.example.test/cat --key keys/catalog.pem >/dev/null 2>&1; true"
 check "a forged entry is refused" "1" "$(Q sync | grep 'apps.example.test' | grep -c 'not signed\|history rewritten\|differs\|entry')"
-check "the copy is unchanged" "1" "$(A describe $APP | grep -c 'C7 $APP')"
+check "the copy is unchanged" "1" "$(A describe $APP | grep -c "C7 $APP")"
 V "cd $B && rm -rf web/apps.example.test/cat && mv cat.good web/apps.example.test/cat"
 check "alice can't unfollow it" "1" "$(A unfollow apps.example.test | grep -c 'only an administrator')"
 Q unfollow apps.example.test >/dev/null
