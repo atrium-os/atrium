@@ -802,10 +802,16 @@ font on demand and a driver from a `nobody` device's notice.
   device (46f4:0004); the driver installed with its firmware, its rule loaded and taking the
   device after a restart, the offer gone; uninstall. The driver's jail itself was refused by
   jaild (`devfs_ruleset 30 not in policy`): jaild pins each ruleset to named jails and
-  binaries, and a catalog driver can't add to jaild's policy. **Open:** how a catalog driver
-  gets a devfs ruleset and its uid into jaild's policy (a per-package policy fragment
-  checked like `devices.d`, or a generic driver ruleset); until then only drivers whose
-  jail the base policy already names can run.
+  binaries, and a catalog driver can't add to jaild's policy. **Decided (Shankar 2026-11-18): one
+  shared ruleset**, packages never add to jaild's policy. Built: ruleset 33
+  (`atrium_driver`, the basics only) pinned in `etc/jaild.policy.toml` to jails named
+  `atrium-driver-…`, running a program in a package folder directly under
+  `/usr/local/libexec/atrium/drivers/` (`exec_dir`), as a uid in 61000-61499 (`uid_last`),
+  shown only `ugen#.#`, `usb/#.#.0` or `hidraw#` through devfs_grant (jaild now grants the
+  node to the request's uid). opifex refuses a driver file with another ruleset, a uid
+  outside the range or not equal to its gid, another jail name, or a uid another installed
+  driver has. The VM gate checks the driver's jail starts and runs as its uid once this
+  tree's jaild, policy and devfs rules are deployed (not yet run).
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked

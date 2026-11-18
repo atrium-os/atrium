@@ -398,8 +398,8 @@ fn a_driver_with_its_firmware() {
     fs::create_dir_all(&t).unwrap();
     fs::write(t.join("rtl"), elf(3)).unwrap();
     fs::write(t.join("devices.toml"), format!("[[rule]]\nname = \"rtl\"\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\nnodes = [\"ugen{{bus}}.{{addr}}\"]\n\
-        owner = \"driver:rtl\"\n\n[driver.rtl]\nexec = \"/usr/local/libexec/atrium/drivers/{drv}/rtl\"\nargv = [\"rtl\"]\nuid = 65060\ngid = 65060\n\
-        jail = \"atrium-rtl-{{usb}}\"\nroot = \"/var/lib/atrium/jails/rtl-{{usb}}\"\ndevfs_ruleset = 30\nsysfil = \"device\"\n")).unwrap();
+        owner = \"driver:rtl\"\n\n[driver.rtl]\nexec = \"/usr/local/libexec/atrium/drivers/{drv}/rtl\"\nargv = [\"rtl\"]\nuid = 61060\ngid = 61060\n\
+        jail = \"atrium-driver-rtl-{{usb}}\"\nroot = \"/var/lib/atrium/jails/driver-rtl-{{usb}}\"\ndevfs_ruleset = 33\nsysfil = \"device\"\n")).unwrap();
     opifex::driver::pack_driver(&t, &format!("kind = \"driver\"\n[driver]\nid = \"{drv}\"\nname = \"Realtek USB Ethernet\"\nversion = \"1.0\"\n\
         license = \"BSD-2-Clause\"\nfirmware = [\"org.atrium.firmware.rtl\"]\n\n[[match]]\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\n"), Some(&w.plat.sk)).unwrap();
     publish_dir(&w, &t, opifex_arch(), "d1");

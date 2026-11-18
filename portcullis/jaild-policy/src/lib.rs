@@ -354,9 +354,38 @@ pub struct PinnedRuleset {
     /// e.g. `/media`. Required with `fuse_devices`.
     #[serde(default)]
     pub fuse_mount_prefix: Option<String>,
+    /// `exec_path` is a FOLDER (ending in `/`): the jail runs a program in
+    /// a package folder directly under it (`<exec_path><package>/<file>`),
+    /// as for the catalog's drivers (opifex.md §8.2), each package its own.
+    #[serde(default)]
+    pub exec_dir: bool,
+    /// With it, `uid` is the first of a range `uid..=uid_last`: one uid per
+    /// package, chosen by the package and checked unique at install.
+    #[serde(default)]
+    pub uid_last: Option<u32>,
 }
 
 impl PinnedRuleset {
+    /// May a jail on this ruleset run `path`?
+    pub fn allows_exec(&self, path: &str) -> bool {
+        if !self.exec_dir {
+            return path == self.exec_path;
+        }
+        let Some(rest) = path.strip_prefix(&self.exec_path) else { return false };
+        let parts: Vec<&str> = rest.split('/').collect();
+        self.exec_path.ends_with('/') && parts.len() == 2
+            && parts.iter().all(|c| !c.is_empty() && c.len() <= 128 && !c.starts_with('.')
+                && c.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    }
+
+    /// May a jail on this ruleset run as `uid`?
+    pub fn allows_uid(&self, uid: u32) -> bool {
+        match self.uid_last {
+            Some(last) => (self.uid..=last).contains(&uid),
+            None => uid == self.uid,
+        }
+    }
+
     /// Does this pin allow `name` as a request's jail name?
     pub fn matches_name(&self, name: &str) -> bool {
         if self.name_prefix {

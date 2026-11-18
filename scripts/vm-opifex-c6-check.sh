@@ -128,11 +128,11 @@ owner    = "driver:c6mtp"
 [driver.c6mtp]
 exec          = "/usr/local/libexec/atrium/drivers/\$D/c6mtp"
 argv          = ["c6mtp", "600"]
-uid           = 65061
-gid           = 65061
-jail          = "atrium-c6mtp-{usb}"
-root          = "/var/lib/atrium/jails/c6mtp-{usb}"
-devfs_ruleset = 30
+uid           = 61061
+gid           = 61061
+jail          = "atrium-driver-c6mtp-{usb}"
+root          = "/var/lib/atrium/jails/driver-c6mtp-{usb}"
+devfs_ruleset = 33
 sysfil        = "device"
 mounts_ro     = ["/libexec", "/lib", "/usr/local/libexec/atrium/drivers/\$D"]
 DEV
@@ -200,6 +200,11 @@ sleep 8
 check "dispensatord loaded its rule" "$((R0+1))" "$(RULES)"
 check "its rule takes the device" "1" "$(NEW | grep 'c6mtp' | grep -vc 'the catalog has a driver' | awk '{print ($1>0)}')"
 check "and no catalog offer this time" "0" "$(NEW | grep -c 'the catalog has a driver')"
+# jaild's shared pin for catalog drivers (ruleset 33): needs this tree's jaild,
+# policy and devfs rules deployed (scripts/deploy-portcullis.sh, then a reboot
+# or `service devfs restart` for the ruleset).
+check "jaild started the driver's jail" "1" "$(NEW | grep -c '> atrium-driver-c6mtp-.* via ' | awk '{print ($1>0)}')"
+check "the driver runs as its uid" "1" "$(V "ps -axo uid,command | grep -c '^ *61061 .*c6mtp 600'" | tr -d '\r ' | awk '{print ($1>0)}')"
 NEW | grep c6mtp | head -3 | sed 's/^/    /'
 mon "device_del c6mtp" >/dev/null; sleep 3
 check "uninstall the driver" "1" "$(Q remove $DR | grep -c 'done')"

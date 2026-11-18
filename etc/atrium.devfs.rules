@@ -150,3 +150,9 @@ add include $devfsrules_unhide_basic
 add path 'tesserakeys' unhide
 # user 65020 = _arca
 add path 'tesserakeys' mode 0600 user 65020
+
+# The package catalog's drivers (opifex.md §8.2): the basics and nothing
+# else; each driver jail is shown its own device through devfs_grant.
+[atrium_driver=33]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic

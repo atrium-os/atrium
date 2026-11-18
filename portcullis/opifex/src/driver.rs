@@ -35,6 +35,11 @@ pub const DEVICES_D: &str = "usr/local/etc/atrium/devices.d";
 pub const FIRMWARE_JAILED: &str = "usr/local/share/atrium/firmware";
 pub const FIRMWARE_KERNEL: &str = "boot/firmware";
 pub const IDX: &str = "devices.idx";
+/// What jaild's pin for catalog drivers allows (etc/jaild.policy.toml,
+/// ruleset 33): the ruleset, the uid range, the jail name's start.
+pub const DRIVER_RULESET: u32 = 33;
+pub const DRIVER_UIDS: (u32, u32) = (61000, 61499);
+pub const DRIVER_JAIL: &str = "atrium-driver-";
 
 fn write_signed(tree: &Path, idx: &str, text: &str, key_pem: Option<&str>) -> Result<(), String> {
     fs::write(tree.join(CONTENT_INDEX), idx).map_err(|e| format!("write {CONTENT_INDEX}: {e}"))?;
@@ -87,6 +92,16 @@ pub fn check_devices(m: &DriverManifest, text: &str) -> Result<(), String> {
         let exec = d.get("exec").and_then(|x| x.as_str()).unwrap_or("");
         if !exec.starts_with(&home) || exec.contains("/../") {
             return Err(format!("{DEVICES_FILE}: driver {name}: exec must be under {home}"));
+        }
+        // jaild's one ruleset for the catalog's drivers (etc/jaild.policy.toml).
+        let int = |k: &str| d.get(k).and_then(|x| x.as_integer()).unwrap_or(-1);
+        let uid = int("uid");
+        if int("devfs_ruleset") != DRIVER_RULESET as i64 || !(DRIVER_UIDS.0 as i64..=DRIVER_UIDS.1 as i64).contains(&uid) || int("gid") != uid {
+            return Err(format!("{DEVICES_FILE}: driver {name}: devfs_ruleset {DRIVER_RULESET}, uid = gid in {}..={}",
+                               DRIVER_UIDS.0, DRIVER_UIDS.1));
+        }
+        if !d.get("jail").and_then(|x| x.as_str()).unwrap_or("").starts_with(DRIVER_JAIL) {
+            return Err(format!("{DEVICES_FILE}: driver {name}: jail name starts {DRIVER_JAIL}"));
         }
     }
     let rules = t.get("rule").and_then(|r| r.as_array()).cloned().unwrap_or_default();
@@ -202,6 +217,13 @@ fn loads_with_others(dir: &Path, ours: &Path, text: &str) -> Result<(), String> 
         let t = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         r.add_toml(&p.display().to_string(), &t).map_err(|e| e.0)?;
     }
+    // A uid is one package's: no other installed driver may run as it.
+    let theirs: Vec<u32> = r.drivers.values().map(|d| d.uid).collect();
+    let mut mine = dispensator::rules::Rules::default();
+    mine.add_toml("", text).map_err(|e| e.0)?;
+    if let Some(d) = mine.drivers.values().find(|d| theirs.contains(&d.uid)) {
+        return Err(format!("uid {} is another installed driver's", d.uid));
+    }
     r.add_toml(&ours.display().to_string(), text).map_err(|e| e.0)?;
     r.finish().map(|_| ()).map_err(|e| e.0)
 }
@@ -309,7 +331,7 @@ mod tests {
         license = \"BSD-2-Clause\"\n\n[[match]]\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\n";
     pub const DEVICES_T: &str = "[[rule]]\nname = \"rtl\"\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\ndetach_kernel = true\n\
         nodes = [\"ugen{bus}.{addr}\"]\nowner = \"driver:rtl\"\n\n[driver.rtl]\nexec = \"/usr/local/libexec/atrium/drivers/org.atrium.driver.rtl/rtl\"\n\
-        argv = [\"rtl\"]\nuid = 65060\ngid = 65060\njail = \"atrium-rtl-{usb}\"\nroot = \"/var/lib/atrium/jails/rtl-{usb}\"\ndevfs_ruleset = 30\nsysfil = \"device\"\n";
+        argv = [\"rtl\"]\nuid = 61060\ngid = 61060\njail = \"atrium-driver-rtl-{usb}\"\nroot = \"/var/lib/atrium/jails/driver-rtl-{usb}\"\ndevfs_ruleset = 33\nsysfil = \"device\"\n";
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("opifex-driver-{tag}-{}", std::process::id()));
@@ -327,6 +349,9 @@ mod tests {
             ("class = \"usb\"\nusb_ids", "class = \"disk\"\nusb_ids", "don't show"),
             ("drivers/org.atrium.driver.rtl/rtl", "drivers/org.atrium.driver.other/rtl", "exec must be under"),
             ("owner = \"driver:rtl\"", "owner = \"service:storage\"", "owner must be"),
+            ("devfs_ruleset = 33", "devfs_ruleset = 23", "devfs_ruleset 33"),
+            ("uid = 61060", "uid = 65010", "uid = gid"),
+            ("jail = \"atrium-driver-rtl-{usb}\"", "jail = \"atrium-frescod-{usb}\"", "jail name starts"),
         ] {
             let e = check_devices(&m, &DEVICES_T.replace(a, b)).unwrap_err();
             assert!(e.contains(why), "{b}: {e}");
@@ -344,7 +369,7 @@ mod tests {
         fs::write(t.join("rtl"), b"\x7fELF driver").unwrap();
         fs::write(t.join(DEVICES_FILE), DEVICES_T).unwrap();
         // A file dispensatord would refuse (and with it every rule) is refused here.
-        fs::write(t.join(DEVICES_FILE), DEVICES_T.replace("devfs_ruleset = 30", "devfs_ruleset = 0")).unwrap();
+        fs::write(t.join(DEVICES_FILE), DEVICES_T.replace("jail = \"atrium-driver-rtl-{usb}\"", "jail = \"atrium-driver-rtl\"")).unwrap();
         pack_driver(&t, MANIFEST_T, Some(&sk)).unwrap();
         assert!(install_driver(&t, &sys, &[pk.clone()]).unwrap_err().contains("would not load in dispensatord"));
         assert!(!sys.join(DRIVERS).join("org.atrium.driver.rtl").exists());
