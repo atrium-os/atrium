@@ -508,6 +508,30 @@ fn find_manifest(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Each member's binaries and what they link as built: the member's own
+/// `cargo tree -e normal` for Atrium (no features turned on only by
+/// dev-dependencies), falling back to the metadata's merged resolve.
+fn built_binaries(dir: &Path, md: &serde_json::Value) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, check::Linked>>, String> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let members: Vec<String> = md.get("workspace_members").and_then(|m| m.as_array()).into_iter().flatten()
+        .filter_map(|m| m.as_str()).map(str::to_string).collect();
+    let mut out = std::collections::BTreeMap::new();
+    for id in &members {
+        let Some(p) = md["packages"].as_array().and_then(|ps| ps.iter().find(|p| p["id"] == id.as_str())) else { continue };
+        let spec = format!("{}@{}", p["name"].as_str().unwrap_or(""), p["version"].as_str().unwrap_or(""));
+        let tree = Command::new(&cargo)
+            .args(["tree", "-e", "normal", "--target", "x86_64-unknown-freebsd", "--prefix", "depth", "-f", "{p}", "-p", &spec])
+            .current_dir(dir).output().ok().filter(|o| o.status.success());
+        let mut one = md.clone();
+        one["workspace_members"] = serde_json::json!([id]);
+        if let Some(t) = tree {
+            one["resolve"]["nodes"] = serde_json::Value::Array(check::nodes_from_tree(&String::from_utf8_lossy(&t.stdout), md));
+        }
+        out.extend(check::binaries(&one)?);
+    }
+    Ok(out)
+}
+
 fn cmd_check(args: &[String]) -> ExitCode {
     let mut manifest: Option<PathBuf> = None;
     let mut json = false;
@@ -541,7 +565,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         match Command::new(cargo).args(["metadata", "--format-version", "1"]).current_dir(dir).output() {
             Ok(o) if o.status.success() => match serde_json::from_slice::<serde_json::Value>(&o.stdout).map_err(|e| e.to_string())
-                .and_then(|v| Ok((check::binaries(&v)?, cargo_atrium::programs::locate(dir, &text, Some(&v))?))) {
+                .and_then(|v| Ok((built_binaries(dir, &v)?, cargo_atrium::programs::locate(dir, &text, Some(&v))?))) {
                 Ok((bins, progs)) => {
                     // Workers built in another crate (programs.rs): their
                     // links are their own business, as for any worker.

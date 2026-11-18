@@ -124,7 +124,7 @@ pub const SDK_CRATES: &[&str] = &["pergola", "fresco-client", "fresco-protocol",
 /// First-party crates that only read fonts (the system's, or ones an app
 /// ships) for drawing text. What only these reach (font parsers, and
 /// WOFF's flate2 and brotli) is system-font input, not hostile input.
-pub const TEXT_STACK: &[&str] = &["fresco-text", "navigator-fonts", "folium-font", "atrium-colr", "atrium-fonts"];
+pub const TEXT_STACK: &[&str] = &["fresco-text", "navigator-fonts", "navigator-fontset", "folium-font", "atrium-colr", "atrium-fonts"];
 
 /// First-party crates that lay out text with a font parser on those same
 /// fonts, but parse other things too: they don't make a font parser
@@ -346,6 +346,37 @@ pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, Li
         }
     }
     Ok(out)
+}
+
+/// `cargo metadata`'s resolve merges features across normal and dev
+/// edges, so a feature only the tests turn on shows up as linked. `cargo
+/// tree -e normal --prefix depth -f "{p}" -p <member>` resolves what the
+/// build really links; this turns its lines into resolve nodes (ids as
+/// the metadata's packages have them) to put in place of the metadata's.
+pub fn nodes_from_tree(tree: &str, metadata: &Value) -> Vec<Value> {
+    let pkgs = metadata.get("packages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let id_of = |name: &str, version: &str| pkgs.iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(name) && p.get("version").and_then(Value::as_str) == Some(version))
+        .and_then(|p| p.get("id").and_then(Value::as_str)).map(str::to_string);
+    let mut deps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    for line in tree.lines() {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(depth) = line[..digits].parse::<usize>() else { continue };
+        let mut words = line[digits..].split_whitespace();
+        let (Some(name), Some(v)) = (words.next(), words.next()) else { continue };
+        let Some(id) = id_of(name, v.trim_start_matches('v')) else { continue };
+        stack.truncate(depth);
+        if let Some(parent) = stack.last() {
+            deps.entry(parent.clone()).or_default().insert(id.clone());
+        }
+        deps.entry(id.clone()).or_default();
+        stack.push(id);
+    }
+    deps.into_iter().map(|(id, ds)| serde_json::json!({
+        "id": id,
+        "deps": ds.into_iter().map(|d| serde_json::json!({"pkg": d, "dep_kinds": [{"kind": null}]})).collect::<Vec<_>>(),
+    })).collect()
 }
 
 /// The crate-graph findings for an app.
@@ -573,5 +604,18 @@ input = "fd"
         let id = t.lines().find(|l| l.starts_with("id")).unwrap().to_string();
         let (f, _, _) = manifest(&t.replace(&id, "id = \"org.atrium.photos\""));
         assert!(!f.iter().any(|x| x.code == "restricted-capability" || x.code == "manifest-warning"), "{f:?}");
+    }
+
+    #[test]
+    fn the_tree_replaces_the_merged_resolve() {
+        let md = serde_json::json!({"packages": [
+            {"id": "a#1", "name": "app", "version": "0.1.0"}, {"id": "b#1", "name": "officina-convert", "version": "0.1.0"},
+            {"id": "c#1", "name": "libc", "version": "0.2.191"}]});
+        let tree = "0app v0.1.0 (/x/app)\n1officina-convert v0.1.0 (/x/oc)\n2libc v0.2.191\n1libc v0.2.191\n";
+        let n = nodes_from_tree(tree, &md);
+        let a = n.iter().find(|x| x["id"] == "a#1").unwrap();
+        let ds: Vec<&str> = a["deps"].as_array().unwrap().iter().map(|d| d["pkg"].as_str().unwrap()).collect();
+        assert_eq!(ds, ["b#1", "c#1"]);
+        assert_eq!(n.iter().find(|x| x["id"] == "b#1").unwrap()["deps"][0]["pkg"], "c#1");
     }
 }
