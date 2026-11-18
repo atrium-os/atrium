@@ -4,6 +4,7 @@
 //! atrium-prelumd [--socket PATH] [--state DIR] [--spool DIR] [--network NAME]
 //!         [--direct BIN_DIR] [--jaild PATH] [--rctl]
 //!         [--netconf DIR | --mdns-legacy ADDR:PORT]
+//!         [--sheet-uid UID] [--registry PATH]
 //! ```
 //!
 //! Serves `CLASS_PRINT` on `--socket`. Workers run through jaild
@@ -18,6 +19,10 @@
 //! for printers by asking one mDNS responder by unicast (RFC 6762 §6.7;
 //! `127.0.0.1:5353` reaches the host's Avahi): development and the Linux
 //! tests, where atrium-net isn't there to hand over the LAN's sockets.
+//!
+//! `--sheet-uid` is prelum-sheet's uid (`_prelum-sheet`), the one peer
+//! that may act for an app (`FOR`); the app's person and persona come from
+//! the launch registry at `--registry` (portcullis-peer's default).
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -43,6 +48,8 @@ fn main() -> ExitCode {
     let mut jaild = "/var/run/atrium/jaild.sock".to_string();
     let mut mdns_legacy: Option<std::net::SocketAddr> = None;
     let mut netconf = PathBuf::from("/atrium/sockets");
+    let mut sheet_uid: Option<u32> = None;
+    let mut registry = portcullis_peer::DEFAULT_REGISTRY.to_string();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         if k == "--rctl" {
@@ -61,6 +68,14 @@ fn main() -> ExitCode {
             "--direct" => direct = Some(v.into()),
             "--jaild" => jaild = v,
             "--netconf" => netconf = v.into(),
+            "--registry" => registry = v,
+            "--sheet-uid" => match v.parse() {
+                Ok(u) => sheet_uid = Some(u),
+                Err(_) => {
+                    eprintln!("prelumd: --sheet-uid UID");
+                    return ExitCode::from(2);
+                }
+            },
             "--mdns-legacy" => match v.parse() {
                 Ok(a) => mdns_legacy = Some(a),
                 Err(_) => {
@@ -111,7 +126,15 @@ fn main() -> ExitCode {
             Ok(MdnsSockets { recv, send, legacy: false })
         })),
     };
-    let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()), mdns }, launcher);
+    // An app's uid to its person (the registry's owning user) and persona,
+    // read fresh each time: apps come and go.
+    let person_of = Box::new(move |app: u32| {
+        let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
+        let (user, _) = reg.resolve(app)?;
+        let person = uid_of(user)?;
+        Some((person, reg.persona(app).flatten().map(str::to_string)))
+    });
+    let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()), mdns, sheet_uid, person_of }, launcher);
     if let Some(dir) = socket.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -138,4 +161,16 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// A user name's uid (getpwnam_r).
+fn uid_of(user: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(user).ok()?;
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: a zeroed passwd is a valid out-parameter; buf outlives the call.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to a live buffer of the size given.
+    let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    (r == 0 && !out.is_null()).then_some(pw.pw_uid)
 }

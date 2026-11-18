@@ -12,6 +12,9 @@
 //! by prelumd through jaild with no network and no filesystem; on FreeBSD
 //! it enters Capsicum before it reads a byte of the document.
 //!
+//! `--format preview --first N --count C --longest PX` draws small images
+//! of sheets N.. for the print sheet (§5.2) instead of printing anything.
+//!
 //! `--format pdf` writes the rewritten PDF (§6.2 1.) when the document
 //! allows it, else the `--fallback` raster: the first frame says which.
 
@@ -88,6 +91,9 @@ struct Args {
     sheet_back: String,
     scale: Scale,
     quality: u8,
+    first: u32,
+    count: u32,
+    longest: u32,
 }
 
 fn keyword(s: &str) -> Result<String, String> {
@@ -109,6 +115,9 @@ fn args() -> Result<Args, String> {
         sheet_back: "normal".into(),
         scale: Scale::ShrinkToFit,
         quality: 4,
+        first: 1,
+        count: 1,
+        longest: 300,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -137,11 +146,14 @@ fn args() -> Result<Args, String> {
                     p => Scale::Percent(p.parse::<u16>().ok().filter(|p| (10..=400).contains(p)).ok_or("bad --scale")? as f64),
                 }
             }
+            "--first" => a.first = v.parse().ok().filter(|n| *n >= 1).ok_or("bad --first")?,
+            "--count" => a.count = v.parse().ok().filter(|n| (1..=prelum_render::MAX_PREVIEWS).contains(n)).ok_or("bad --count")?,
+            "--longest" => a.longest = v.parse().ok().filter(|n| (16..=prelum_render::MAX_PREVIEW).contains(n)).ok_or("bad --longest")?,
             "--quality" => a.quality = v.parse().ok().filter(|q| (3..=5).contains(q)).ok_or("bad --quality")?,
             _ => return Err(format!("unknown option {k}")),
         }
     }
-    if !["pdf", "pwg", "urf"].contains(&a.format.as_str()) || !["pwg", "urf"].contains(&a.fallback.as_str()) {
+    if !["pdf", "pwg", "urf", "preview"].contains(&a.format.as_str()) || !["pwg", "urf"].contains(&a.fallback.as_str()) {
         return Err("bad --format or --fallback".into());
     }
     Ok(a)
@@ -190,6 +202,16 @@ fn run(out: &Rc<RefCell<Out>>) -> Result<(), String> {
     };
     let sheets = sheet_count(&s);
     let io = |e: io::Error| format!("prelumd went away: {e}");
+    if a.format == "preview" {
+        let (sheets, v) = prelum_render::preview(&doc, &s, a.first, a.count, a.longest, &|| false).map_err(|e| e.to_string())?;
+        let mut o = out.borrow_mut();
+        o.ev(&Ev::Sheets(sheets)).map_err(io)?;
+        let n = v.len() as u32;
+        for p in v {
+            o.ev(&Ev::Preview { sheet: p.sheet, w: p.w, h: p.h, rgb: p.rgb }).map_err(io)?;
+        }
+        return o.ev(&Ev::Done { sheets: n, bytes: 0 }).map_err(io);
+    }
     if a.format == "pdf" {
         match pdf::rewrite(&doc, &s, Vec::new(), &|| false) {
             Ok(bytes) if bytes.len() <= MAX_PDF => {
