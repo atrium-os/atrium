@@ -142,6 +142,11 @@ pub mod gate {
         fn note(&mut self, _n: Note) -> bool {
             false
         }
+        /// Bring forward `uid`'s top window: allowed once per `LINK` or
+        /// `ACTION` press this broker spent in the last two minutes.
+        fn raise(&mut self, _uid: u32) -> bool {
+            false
+        }
     }
 
     /// No frescod: refuse everything.
@@ -212,6 +217,16 @@ pub mod gate {
             }
         }
 
+        fn raise(&mut self, uid: u32) -> bool {
+            match self.ask::<_, fresco_protocol::activation::RaiseResult>(fresco_protocol::activation::op::RAISE, &fresco_protocol::activation::Raise { uid }) {
+                Ok(r) => matches!(r, fresco_protocol::activation::RaiseResult::Ok { .. }),
+                Err(_) => {
+                    self.conn = None;
+                    false
+                }
+            }
+        }
+
         fn note(&mut self, n: Note) -> bool {
             match self.ask::<_, fresco_protocol::activation::NoteResult>(fresco_protocol::activation::op::NOTE, &n) {
                 Ok(r) => r == fresco_protocol::activation::NoteResult::Ok,
@@ -235,6 +250,7 @@ pub mod gate {
         live: std::collections::HashMap<Token, (u32, u8, std::time::Instant, u64)>,
         next: u64,
         notes: Vec<Note>,
+        raises: Vec<u32>,
     }
 
     impl Fake {
@@ -259,6 +275,11 @@ pub mod gate {
         /// The strip notes asked for so far.
         pub fn notes(&self) -> Vec<Note> {
             self.0.lock().unwrap().notes.clone()
+        }
+
+        /// The uids whose windows were raised so far.
+        pub fn raised(&self) -> Vec<u32> {
+            self.0.lock().unwrap().raises.clone()
         }
 
         /// Age a token past its lifetime.
@@ -300,6 +321,11 @@ pub mod gate {
 
         fn note(&mut self, n: Note) -> bool {
             self.0.lock().unwrap().notes.push(n);
+            true
+        }
+
+        fn raise(&mut self, uid: u32) -> bool {
+            self.0.lock().unwrap().raises.push(uid);
             true
         }
     }

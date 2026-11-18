@@ -465,6 +465,14 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
   shelf then asks portcullisd to start the app (`app-launch`, as the dock does) in the
   notification's persona, and the app gets the held action as soon as it listens. A listener
   whose app went stops counting within 0.1 s.
+- **Its window forward** (2026-11-18). A Reply that opens a compose window must be able to
+  bring it to the front. When praecod spends an action's press, frescod gives praecod one
+  `RAISE` of that app's top window for two minutes, as it does for portcullisd's `LINK`.
+  After hearing the action, the app calls `praeco::client::raise(&socket(), id)` (op `RAISE`,
+  `0x12`, `RaiseMe { id }`). praecod accepts this only from the posting app's uid, once per
+  press, within 110 s (`RAISE_MS`), and then asks frescod to raise it. Asked before a press,
+  or a second time, it answers `NOT_ALLOWED`. frescod sends the WM a `WindowActivate`, and
+  forum-wm focuses the window.
 - **Where apps find praecod**: `praeco::client::socket()` returns `PRAECO_SOCKET` if set.
   Otherwise, in a jail with `notify = true`, it returns `/atrium/sockets/notify/notify.sock`,
   else `/var/run/atrium/praecod.sock`. praecod's `PRAECO_FRESCOD_ACTIVATION` is frescod's
@@ -472,16 +480,18 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
 - **Tests.** `praeco/tests/wire.rs` checks the limits and that only Forum may act. It also
   checks that only a press granted to that app counts, that only its own listener hears the
   action, that a press counts once, that an action is held and handed over when the app
-  starts, and that a gone listener doesn't count. `forum-shelf` checks that a toast's actions
-  are its buttons. `scripts/vm-notify-actions-check.sh` passes 13/13 in the amd64 cloud VM on
-  headless frescod with injected clicks. Two signed test apps (`praeco-demo`) run in their
-  jails. Chat posts with Archive and Reply, and a click on Archive reaches it through
-  frescod's grant and praecod's spend. Reminder posts and exits, and a click on Reply makes the
-  shelf start it through portcullisd; it hears "reply" from the hold. A forged action gets
-  status 7. frescod's `GRANT` now uses the same token lifetime as `CONSUME`.
-- **Not yet.** The app gets no press of its own, so a "Reply" that opens a window can't raise
-  it with this press. The jailed shelf needs a capability that mounts `fresco-activation/`;
-  the gate runs it on the host as Forum.
+  starts, that a gone listener doesn't count, and that a raise works once, for the posting app
+  only, after a press. `forum-shelf` checks that a toast's actions are its buttons.
+  `scripts/vm-notify-actions-check.sh` passes 17/17 in the amd64 cloud VM on headless frescod
+  with forum-wm and injected clicks. Three signed test apps (`praeco-demo`, in
+  `forum-shelf/src/bin`) run in their jails. Chat opens a window and posts with Archive and
+  Reply, and a raise asked before any press is refused. Cover's window then covers Chat's. A
+  click on Reply reaches Chat through frescod's grant and praecod's spend, and Chat's raise
+  makes forum-wm bring its window forward. Reminder posts and exits; a click on Archive makes
+  the shelf start it through portcullisd, and it hears "archive" from the hold. A forged
+  action gets status 7. frescod's `GRANT` now uses the same token lifetime as `CONSUME`.
+- **Not yet.** The jailed shelf needs a capability that mounts `fresco-activation/`; the gate
+  runs it on the host as Forum.
 
 ## 6. Pergola's part
 

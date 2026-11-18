@@ -232,3 +232,25 @@ fn without_frescod_no_action_goes_through() {
     let (_, id) = post_actions(&mut mail, &[("archive", "Archive")]);
     assert_eq!(act(&mut desk, id, "archive", [1; 16]), status::NO_PRESS);
 }
+
+#[test]
+fn an_action_lets_its_app_raise_its_window_once() {
+    let frescod = Fake::default();
+    let s = with_gate(frescod.clone());
+    let mut forum = conn(&s, FORUM);
+    rpc(&mut forum, op::SUBSCRIBE, &[]);
+    let mut desk = conn(&s, FORUM);
+    let mut mail = conn(&s, MAIL);
+    let (_, id) = post_actions(&mut mail, &[("reply", "Reply")]);
+    let raise = |c: &mut Connection, id: u64| rpc(c, op::RAISE, &postcard::to_stdvec(&proto::RaiseMe { id }).unwrap()).0;
+    // No press yet: nothing to raise for.
+    assert_eq!(raise(&mut mail, id), status::NOT_ALLOWED);
+    let mut ear = conn(&s, MAIL);
+    rpc(&mut ear, op::LISTEN, &[]);
+    assert_eq!(act(&mut desk, id, "reply", frescod.mint(MAIL, kind::GRANTED)), status::OK);
+    // Another app can't use Mail's press.
+    assert_eq!(raise(&mut conn(&s, ROGUE), id), status::NOT_ALLOWED);
+    assert_eq!(raise(&mut mail, id), status::OK);
+    assert_eq!(frescod.raised(), vec![MAIL]);
+    assert_eq!(raise(&mut mail, id), status::NOT_ALLOWED, "once per press");
+}

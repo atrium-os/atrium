@@ -30,6 +30,9 @@ pub mod proto {
         /// Apps: this connection hears the app's own actions
         /// ([`super::Acted`], op `ACTED`) from here on, the held ones first.
         pub const LISTEN: u16 = 0x11;
+        /// Apps: [`super::RaiseMe`], bring my window forward for the action
+        /// I was just told of (within [`super::RAISE_MS`], once).
+        pub const RAISE: u16 = 0x12;
         /// Pushed to subscribers.
         pub const EV: u16 = 0x80;
         /// Pushed to a listening app.
@@ -58,6 +61,16 @@ pub mod proto {
     pub const LABEL_MAX: usize = 24;
     /// How long an action waits for its app to start and listen.
     pub const HOLD_MS: u64 = 30_000;
+    /// How long after the press an app may ask for its window forward
+    /// (frescod's own limit for the raise is two minutes).
+    pub const RAISE_MS: u64 = 110_000;
+
+    /// An app: raise my window now, for the action pressed on my
+    /// notification `id` (a Reply that opened a compose window).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RaiseMe {
+        pub id: u64,
+    }
 
     /// A button on a notification: the app's id for it and its label.
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +302,8 @@ pub mod server {
         listeners: Vec<(u32, mpsc::Sender<Acted>)>,
         /// Actions whose app wasn't listening yet.
         held: Vec<(u32, Acted, Instant)>,
+        /// (uid, notification) whose press may still raise that app's window.
+        raisable: Vec<(u32, u64, Instant)>,
     }
 
     impl Shared {
@@ -396,6 +411,9 @@ pub mod server {
             }
             let acted = Acted { id: a.id, action: a.action };
             let mut st = self.state.lock().unwrap();
+            let keep = Duration::from_millis(proto::RAISE_MS);
+            st.raisable.retain(|(_, _, at)| now.saturating_duration_since(*at) < keep);
+            st.raisable.push((uid, acted.id, now));
             let mut heard = false;
             st.listeners.retain(|(u, tx)| *u != uid || match tx.send(acted.clone()) {
                 Ok(()) => { heard = true; true }
@@ -408,6 +426,25 @@ pub mod server {
             st.held.retain(|(_, _, at)| now.saturating_duration_since(*at) < Duration::from_millis(proto::HOLD_MS));
             st.held.push((uid, acted, now));
             status::NOT_RUNNING
+        }
+
+        /// `uid` asks for its window forward, for the action on its
+        /// notification `id`: once, within `RAISE_MS` of the press.
+        pub fn raise(&self, uid: u32, id: u64, now: Instant) -> u8 {
+            {
+                let mut st = self.state.lock().unwrap();
+                let keep = Duration::from_millis(proto::RAISE_MS);
+                st.raisable.retain(|(_, _, at)| now.saturating_duration_since(*at) < keep);
+                let Some(i) = st.raisable.iter().position(|(u, n, _)| *u == uid && *n == id) else { return status::NOT_ALLOWED };
+                st.raisable.remove(i);
+            }
+            if self.gate.lock().unwrap().raise(uid) {
+                eprintln!("praecod: raised uid {uid}'s window for its action on {id}");
+                status::OK
+            } else {
+                eprintln!("praecod: frescod raised nothing for uid {uid} ({id})");
+                status::NO_PRESS
+            }
         }
 
         /// An app listens for its actions: those held for it first.
@@ -497,6 +534,13 @@ pub mod server {
                         // (an error) ends the listener.
                         conn.recv_message_or_timeout(Duration::from_millis(100))?;
                     }
+                }
+                op::RAISE => {
+                    let st = match postcard::from_bytes::<proto::RaiseMe>(&m.payload) {
+                        Ok(r) => shared.raise(uid, r.id, Instant::now()),
+                        Err(_) => status::MALFORMED,
+                    };
+                    reply(&mut conn, op::RAISE, st, 0)?;
                 }
                 op::WITHDRAW => {
                     let st = match postcard::from_bytes::<proto::Withdraw>(&m.payload) {
@@ -644,6 +688,25 @@ pub mod client {
             let m = c.recv_message()?;
             if m.opcode_class == proto::CLASS && m.op == op::ACT && m.flags & flag::IS_RESPONSE != 0 {
                 return m.payload.first().copied().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short reply"));
+            }
+        }
+    }
+
+    /// After an action on notification `id` (say Reply, which opened a
+    /// window): ask for the app's top window to come forward. Once per
+    /// press, within [`proto::RAISE_MS`]; the press is the person's.
+    pub fn raise(sock: &Path, id: u64) -> io::Result<()> {
+        let p = postcard::to_stdvec(&proto::RaiseMe { id }).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut c = Connection::connect(sock)?;
+        c.send_message(proto::CLASS, op::RAISE, flag::RESPONSE_EXPECTED, &p)?;
+        loop {
+            let m = c.recv_message()?;
+            if m.opcode_class == proto::CLASS && m.op == op::RAISE && m.flags & flag::IS_RESPONSE != 0 {
+                return match m.payload.first() {
+                    Some(&status::OK) => Ok(()),
+                    Some(&st) => Err(io::Error::other(format!("praecod raised nothing (status {st})"))),
+                    None => Err(io::Error::new(io::ErrorKind::InvalidData, "short reply")),
+                };
             }
         }
     }

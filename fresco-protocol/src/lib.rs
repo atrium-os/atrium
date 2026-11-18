@@ -2658,8 +2658,9 @@ pub mod activation {
         /// `Grant` → `GrantResult`; Forum's uid only.
         pub const GRANT: u16 = 0x0901;
         /// `Raise` → `RaiseResult`: bring forward a window of the app a
-        /// link was just handed to. Only by a caller that spent a `LINK`
-        /// press in the last two minutes, once per press.
+        /// link was just handed to, or whose notification action was
+        /// pressed. Only by a caller that spent a `LINK` or `ACTION` press
+        /// in the last two minutes, once per press.
         pub const RAISE: u16 = 0x0902;
         /// `Note` → `NoteResult`: a note in the strip over the window a
         /// paste or drop press was just spent for (personas.md §6). Only

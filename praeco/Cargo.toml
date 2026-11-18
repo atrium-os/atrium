@@ -21,7 +21,3 @@ serde           = { version = "1", features = ["derive"] }
 postcard        = { version = "1", features = ["use-std"] }
 fresco-protocol = { path = "../fresco-protocol" }
 tabula          = { path = "../tabula" }
-
-[[bin]]
-name = "praeco-demo"
-path = "src/bin/praeco_demo.rs"

@@ -736,7 +736,9 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                     let now = now_ns();
                     let r = table().lock().unwrap().consume(now, &c.token, c.presenter_uid, c.purpose, focused, |w, minted| crate::credential::visible_for_purpose(c.purpose, w, minted, now));
                     // A link press spent: one raise of the app it goes to.
-                    if c.purpose == purpose::LINK && matches!(r, ConsumeResult::Ok { .. }) {
+                    // A notification action spent (tabula.md §5.5): one too,
+                    // for praecod to raise the app's window when it asks.
+                    if matches!(c.purpose, purpose::LINK | purpose::ACTION) && matches!(r, ConsumeResult::Ok { .. }) {
                         raises().lock().unwrap().add(uid, now);
                     }
                     // A paste or drop spent: one strip note, should the

@@ -24,3 +24,7 @@ portcullis-peer = { path = "../portcullis/portcullis-peer" }
 postcard = { version = "1", features = ["use-std"] }
 tabula = { path = "../tabula" }
 forum-dock = { path = "../forum-dock" }
+
+[[bin]]
+name = "praeco-demo"
+path = "src/bin/praeco_demo.rs"
