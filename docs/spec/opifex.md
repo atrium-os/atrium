@@ -181,11 +181,36 @@ change later.
 |---|---|---|---|
 | **root** (3 keys, any 2 sign) | Shankar, offline, on hardware tokens (YubiKey PIV, P-256) | `root.toml`: the other keys and their scopes; publisher recovery | years; rotated by 2-of-3 of the old set |
 | **catalog** | the publishing CI (§10.1) | tree heads of the log, with an expiry | months; replaced by a new `root.toml` |
-| **platform** | Shankar's build machine, in Arca | `org.atrium.*` packages, all non-app kinds, the SDK registry | years |
+| **platform** | Shankar, on its own hardware token (§10.4) | `org.atrium.*` packages, all non-app kinds, the SDK registry | years; retired by a new `root.toml` (§5.1.1) |
 | **publisher** | each publisher, in their own Arca (or any P-256 signer, e.g. cosign keyed) | their own packages | until they rotate |
 
 `root.toml` ships in the base system at `/etc/atrium/opifex/root.toml` and is the one trust
 anchor. A new `root.toml` is accepted only if 2 of the current root keys signed it.
+
+#### 5.1.1 Replacing and revoking keys
+
+Every key is replaced or revoked by a new `root.toml`, signed as above; machines take it at
+their next sync (daily, and when Updates is opened). Until then a machine still trusts the
+old key, and a catalog head older than 14 days is refused anyway.
+
+- **Root key** lost or stolen: the next `root.toml` names a new one in its place, signed by
+  two of the remaining keys (and two of the new set). Losing two before that leaves no way to
+  sign (a reinstall with a new `root.toml`).
+- **Catalog key**: dropped and replaced. It only signs heads, and a new head under the new
+  key covers the whole log, so nothing it signed before needs it.
+- **Platform key**: never dropped, because the log keeps everything it signed and a new
+  machine checks the whole log. It is **retired** instead: kept with `until = <log index>`,
+  next to the new platform key. Its releases and yanks before that entry still count; from
+  that entry on they are skipped, listed as revoked, and never offered. Lost: `until` is the
+  log's size when the new root is written (the default of `opifex catalog root-new --next yes`,
+  which keeps the replaced key retired by itself). Stolen: `--retire-at` the first entry not
+  trusted. Only a platform key can be retired, a retired key never comes back, and at least
+  one platform key stays current.
+- A machine taking a new `root.toml` checks the whole log again under it, so a machine that
+  synced the thief's releases drops them as a new machine would. An installed version that
+  is revoked gets a high-urgency Praeco notice once, and Updates offers the newest release
+  that still counts in its place, even an older version, for a person to approve.
+- **Publisher keys**: rotated or recovered through publisher records (§5.2).
 
 ### 5.2 Publishers
 
@@ -999,6 +1024,19 @@ opifexd, and `fdpass`.)
   (host, SoftHSM + pkcs11-tool, PINs through a pty): the ceremony with three token keys, a
   handover to three new tokens adopted by a machine, a root signed by the old keys alone
   refused, a wrong PIN signing nothing. 0 failed. Not yet tried on a real YubiKey.
+
+### 14.10 Retired and revoked keys (2026-11-18)
+
+- `opifex-catalog`: `Key::until`, `Local::revoked`; entries signed by a retired key at or
+  after `until` are skipped on machines and refused by `Log::append`; a new `root.toml`
+  replays the log from entry 0 (against the leaves already seen).
+- `opifex catalog root-new --next yes [--retire-at N]` keeps a replaced platform key, retired.
+- opifexd: `revoked_installed`, the round's high-urgency notice, Updates offering the newest
+  release that counts.
+- Checked: unit test `retired_platform_key` (a stolen key's release and yank skipped, the same
+  catalog on a synced machine, a fresh machine and the publishing side), opifexd test
+  `a_revoked_install`, `scripts/opifex-token-check.sh` (root-new keeps the old platform key
+  retired; a retired key can't come back): 0 failed.
 
 ## 15. Decisions, with recommendations
 

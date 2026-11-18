@@ -12,7 +12,8 @@
 #   - a handover: a next root.toml with three new token keys, signed by two of
 #     the old and two of the new; the machine adopts it;
 #   - a root.toml after that signed by old keys only is refused;
-#   - a wrong PIN signs nothing.
+#   - a wrong PIN signs nothing;
+#   - a new platform key: the old one stays in root.toml, retired.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 fails=0
@@ -109,5 +110,16 @@ for k in r1 r2 r3; do P 123456 "$O" catalog root-sign site --key $k.key >/dev/nu
 "$O" catalog head site --key catalog.pem >/dev/null
 check "a root signed by the old keys only is refused" "1" "$("$O" catalog sync state --from site 2>&1 | grep -c 'not signed by 2 of the current root keys')"
 check "the machine keeps version 2" "1" "$(grep -c '^version = 2' state/root.toml)"
+
+echo "=== a lost platform key is retired, not dropped"
+openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out platform2.pem
+"$O" catalog root-new site --next yes --name Atrium --root r4.key --root r5.key --root r6.key \
+    --catalog catalog.pem --platform platform2.pem >/dev/null
+check "the old platform key stays, retired at the log's end" "1" "$(grep -c '^until = 0' site/root.toml)"
+for k in r4 r5; do P 123456 "$O" catalog root-sign site --key $k.key >/dev/null; done
+"$O" catalog head site --key catalog.pem >/dev/null
+check "the machine adopts it" "1" "$("$O" catalog sync state --from site 2>&1 | grep -c 'checked')"
+check "a retired key never comes back" "1" "$("$O" catalog root-new site --next yes --name Atrium --root r4.key --root r5.key --root r6.key \
+    --catalog catalog.pem --platform platform.pem 2>&1 | grep -c 'never comes back')"
 
 echo "opifex-token: $fails failed"

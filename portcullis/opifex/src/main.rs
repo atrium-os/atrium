@@ -114,7 +114,7 @@ fn usage() {
            layer list [--root <dir>]\n  \
            layer remove <name@version> [--root <dir>]\n      \
              Toolchain layers (dev-tools-plan.md M3), signed by the platform key.\n  \
-           catalog root-new <cat> --name <n> --root <key>… --catalog <key> [--platform <key>] [--threshold 2] [--next yes]\n  \
+           catalog root-new <cat> --name <n> --root <key>… --catalog <key> [--platform <key>] [--threshold 2] [--next yes [--retire-at <entry>]]\n  \
            catalog root-sign <cat> --key <key> [--pub <pem>]\n  \
            catalog add <cat> <pkg-dir> --arch <a> --archive <file> --url <https://...>\n  \
            catalog yank <cat> <id> <version> --reason <text> --key <pem> [--pub <pem>]\n  \

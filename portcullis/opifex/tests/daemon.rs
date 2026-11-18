@@ -640,3 +640,36 @@ fn a_file_opened_through_the_sheet() {
     c.put(rec).unwrap();
     assert!(err(preview(65042)).contains("updates from there"));
 }
+
+/// The platform key was stolen and 1.1 is the thief's: root.toml version 2
+/// retires the key at entry 1. The installed 1.1 is revoked, told once,
+/// loudly, and the newest release that still counts (the older 1.0) is
+/// offered in its place.
+#[test]
+fn a_revoked_install() {
+    let w = world("revoked");
+    publish(&w, "1.0", &elf(1));
+    publish(&w, "1.1", &elf(2));
+    sync(&w);
+    assert_eq!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { id: ID.into(), version: "1.1".into() });
+
+    let (r1, new_plat) = (key(1), key(9));
+    let old = fs::read_to_string(w.d.join("cat/root.toml")).unwrap();
+    let text = old.replace("version = 1\n", "version = 2\n").replace(&w.plat.pk, &new_plat.pk)
+        + &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\"]\nuntil = 1\n", w.plat.pk);
+    fs::write(w.d.join("cat/root.toml"), &text).unwrap();
+    fs::write(w.d.join("cat/root.toml.sig"), oc::sign_root(&text, &r1.sk, &r1.pk).unwrap()).unwrap();
+    oc::Log::open(&w.d.join("cat")).sign_head(&w.cat.sk, now(), 14).unwrap();
+    assert!(matches!(sync(&w), Response::Synced { releases: 1, .. }));
+
+    assert_eq!(w.daemon.revoked_installed().unwrap(), vec![format!("{ID} 1.1")]);
+    let items = match ask(&w, 1001, Request::Updates) { Response::Updates { items, .. } => items, o => panic!("{o:?}") };
+    assert_eq!((items.len(), items[0].to.as_str(), items[0].action), (1, "1.0", Action::Notify));
+    assert!(items[0].why.contains("revoked"));
+    w.daemon.tick(false).unwrap();
+    w.daemon.tick(false).unwrap();
+    let announced = opifex::updates::PrefStore::new(&w.daemon.state).load().announced;
+    assert_eq!(announced.iter().filter(|a| a.starts_with("revoked ")).count(), 1, "told once");
+    assert_eq!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { id: ID.into(), version: "1.0".into() });
+    assert!(w.daemon.revoked_installed().unwrap().is_empty());
+}

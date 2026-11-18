@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! opifex catalog root-new <cat> --name <n> --root <key> --root <key> --root <key> [--threshold 2]
-//!                            --catalog <key> [--platform <key>] [--years 5] [--next yes]
+//!                            --catalog <key> [--platform <key>] [--years 5] [--next yes [--retire-at <entry>]]
 //! opifex catalog root-sign <cat> --key <root key> [--pub <root.pub.pem>]
 //! opifex catalog add <cat> <pkg-dir> --arch <a> --archive <file> --url <https://…> [--url …]
 //! opifex catalog yank <cat> <id> <version> --reason <text> --key <pem> [--pub <pem>]
@@ -243,6 +243,9 @@ fn write_key(dir: &Path, name: &str) -> Result<(String, String), String> {
 /// old signatures cleared) when keys change hands. Each root key holder then
 /// runs `root-sign`; a next root needs the threshold of the old keys *and* of
 /// its own.
+#[derive(serde::Serialize)]
+struct RetiredKey { key: Vec<oc::Key> }
+
 fn root_new(cat: &Path, flags: &Flags) -> Result<(), String> {
     let next = flags.get("next").and_then(|v| v.last()).is_some_and(|v| v == "yes");
     let rp = cat.join(oc::ROOT);
@@ -265,16 +268,46 @@ fn root_new(cat: &Path, flags: &Flags) -> Result<(), String> {
         text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n", public_of(r)?);
     }
     text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"catalog\"]\n", public_of(&catalog)?);
-    if let Some(p) = flags.get("platform").and_then(|v| v.last()) {
-        let kinds: Vec<String> = oc::KINDS.iter().map(|k| format!("{k:?}")).collect();
-        text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [{}]\ndevices = true\n",
-                         public_of(p)?, kinds.join(", "));
+    let kinds: Vec<String> = oc::KINDS.iter().map(|k| format!("{k:?}")).collect();
+    let platform = flags.get("platform").and_then(|v| v.last()).map(|p| public_of(p)).transpose()?;
+    if let Some(pem) = &platform {
+        text += &format!("\n[[key]]\npem = \"\"\"{pem}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [{}]\ndevices = true\n",
+                         kinds.join(", "));
+    }
+    // A platform key is never dropped: the one being replaced stays, retired
+    // at the log's current size (or --retire-at, for a key that was stolen
+    // earlier), so machines can still check what it signed before.
+    let mut retired = Vec::new();
+    if version > 1 {
+        let old = oc::Root::parse(&read(&rp.display().to_string())?)?;
+        let size = oc::Log::open(cat).entries()?.len() as u64;
+        let at = match flags.get("retire-at").and_then(|v| v.last()) {
+            Some(n) => n.parse::<u64>().map_err(|_| "--retire-at: a log entry index")?.min(size),
+            None => size,
+        };
+        for k in old.with_role("platform") {
+            let kept = platform.as_deref().map(oc::key_id).transpose()? == Some(oc::key_id(&k.pem)?);
+            if kept {
+                if k.until.is_some() {
+                    return Err("--platform: that key is retired, and a retired key never comes back".into());
+                }
+                continue;
+            }
+            let mut k = k.clone();
+            let until = k.until.map_or(at, |u| u.min(at));
+            k.until = Some(until);
+            retired.push((oc::key_id(&k.pem)?, until));
+            text += &format!("\n{}", toml::to_string(&RetiredKey { key: vec![k] }).map_err(|e| e.to_string())?);
+        }
     }
     oc::Root::parse(&text)?;
     std::fs::create_dir_all(cat).map_err(|e| format!("{}: {e}", cat.display()))?;
     std::fs::write(&rp, &text).map_err(|e| e.to_string())?;
     std::fs::write(cat.join(oc::ROOT_SIG), "").map_err(|e| e.to_string())?;
     println!("opifex: {} version {version} for {name:?}: {} root keys, any {threshold} sign.", rp.display(), roots.len());
+    for (id, until) in &retired {
+        println!("  platform key {} retired: what it signed from log entry {until} on is revoked.", &id[..16.min(id.len())]);
+    }
     println!("  Next: each root key holder runs  opifex catalog root-sign {} --key <their key>", cat.display());
     Ok(())
 }

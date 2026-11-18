@@ -397,7 +397,12 @@ impl Daemon {
             let (local, root) = (cat.client.local()?, cat.client.root()?);
             let Some(r) = cat.offer(&local, &rec.id, portcullis_toml::layer::host_arch()) else { continue };
             let r = &r;
-            if r.kind != rec.kind || oc::version_cmp(&r.version, &rec.version) != std::cmp::Ordering::Greater {
+            // An installed version its signer's key no longer vouches for
+            // (root.toml `until`) is replaced by the newest one that still
+            // counts, even an older one.
+            let revoked = rec.source != "side-load" && local.is_revoked(&rec.id, &rec.version);
+            let newer = oc::version_cmp(&r.version, &rec.version) == std::cmp::Ordering::Greater;
+            if r.kind != rec.kind || !(newer || revoked && r.version != rec.version) {
                 continue;
             }
             let same = self.same_publisher(&rec, r, cat, &local, &root);
@@ -418,7 +423,9 @@ impl Daemon {
                 // Layers, drivers, firmware: an administrator applies them.
                 _ => (Action::Notify, Vec::new()),
             };
+            let action = if revoked && action == Action::Background { Action::Notify } else { action };
             let why = match (action, rec.source.as_str()) {
+                _ if revoked => "the installed version was signed by a revoked key".to_string(),
                 (Action::Refused, "side-load") => "side-loaded: update it by side-loading".to_string(),
                 (Action::Refused, _) => "another publisher".to_string(),
                 (Action::Ask, _) if recovered => "its publisher's key was replaced by a recovery".to_string(),
@@ -426,6 +433,19 @@ impl Daemon {
             };
             let name = updates::name(&r.manifest).unwrap_or_else(|| rec.id.clone());
             out.push(Pending { id: rec.id.clone(), name, from: rec.version.clone(), to: r.version.clone(), action, added, why });
+        }
+        Ok(out)
+    }
+
+    /// Installed catalog packages whose version is revoked: "id version".
+    pub fn revoked_installed(&self) -> Result<Vec<String>, String> {
+        let cats = catalogs::all(&self.state);
+        let mut out = Vec::new();
+        for rec in self.store().load()?.apps {
+            let Some(cat) = catalogs::of_source(&cats, &rec.source) else { continue };
+            if cat.client.dir.join(oc::ROOT).is_file() && cat.client.local()?.is_revoked(&rec.id, &rec.version) {
+                out.push(format!("{} {}", rec.id, rec.version));
+            }
         }
         Ok(out)
     }
@@ -474,6 +494,20 @@ impl Daemon {
             }
         }
         let mut p = ps.load();
+        // Installed versions signed by a revoked key: told at once, loudly.
+        let revoked: Vec<String> = self.revoked_installed()?.into_iter()
+            .filter(|k| !p.announced.contains(&format!("revoked {k}"))).collect();
+        if !revoked.is_empty() {
+            let title = if revoked.len() == 1 { format!("{} was revoked", revoked[0]) } else { format!("{} installed packages were revoked", revoked.len()) };
+            let body = format!("{}\nTheir signing key was revoked by Atrium. Update or remove them in Settings, Updates.", revoked.join("\n"));
+            if let Some(sock) = &self.praeco {
+                if let Err(e) = praeco::client::post(sock, praeco::proto::urgency::HIGH, &title, &body) {
+                    eprintln!("opifexd: praecod: {e}");
+                }
+            }
+            p.announced.extend(revoked.iter().map(|k| format!("revoked {k}")));
+            ps.save(&p)?;
+        }
         let new: Vec<Pending> = waiting.iter().filter(|u| !p.announced.contains(&format!("{} {}", u.id, u.to))).cloned().collect();
         if !new.is_empty() {
             let (title, body) = updates::notice(&new);
