@@ -33,7 +33,9 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
   conflict | noconflict     -- a host 02:4e:00:00:00:77 already has 10.88.0.50 and
                                answers ARP for it; after a DHCPDECLINE the server
                                offers 10.88.0.51 (noconflict: back to .50)
-  web-ok | web-dead | web-captive  -- what 198.51.100.80:80 does (default ok)
+  web-ok | web-dead | web-captive  -- what 198.51.100.80:80 does (default ok);
+                               the router's 10.88.0.1:80 serves the sign-in page
+                               (GET /login: one form; POST /accept: web-ok)
   stats                     -- counters
 """
 import json, random, socket, struct, sys
@@ -370,6 +372,31 @@ def tcp_seg(s, d, sport, dport, seq, ack, flags, data=b""):
     return ip(s, d, 6, h[:16] + struct.pack("!H", c) + h[18:])
 
 
+PORTAL_PAGE = (b"<!doctype html><title>Gate Cafe Wi-Fi</title><h1>Gate Cafe Wi-Fi</h1>"
+               b"<form method=post action=/accept><input type=hidden name=terms value=yes>"
+               b"<button>Accept and connect</button></form>")
+DONE_PAGE = b"<!doctype html><title>Connected</title><p>You are online."
+
+
+def page(code, body, extra=b""):
+    return (b"HTTP/1.1 " + code + b"\r\nContent-Type: text/html\r\n" + extra +
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+
+
+def portal_answer(req):
+    """The router's own sign-in page (10.88.0.1:80): GET /login shows one
+    form; POST /accept lets the client through (web-ok)."""
+    global web
+    if req.startswith(b"POST /accept"):
+        stats["portal_accept"] = stats.get("portal_accept", 0) + 1
+        web = "web-ok"
+        return page(b"200 OK", DONE_PAGE)
+    if req.startswith(b"GET /login") or req.startswith(b"GET / "):
+        stats["portal_page"] = stats.get("portal_page", 0) + 1
+        return page(b"200 OK", PORTAL_PAGE)
+    return page(b"404 Not Found", b"")
+
+
 def http_answer():
     if web == "web-captive":
         return (b"HTTP/1.1 302 Found\r\nLocation: http://10.88.0.1/login?from=atrium\r\n"
@@ -377,29 +404,32 @@ def http_answer():
     return b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 
-def handle_tcp(src_mac, s, body):
-    if len(body) < 20 or web == "web-dead":
+def handle_tcp(src_mac, s, body, srv=WEB):
+    if len(body) < 20 or (web == "web-dead" and srv == WEB):
         return []
     sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", body[:14])
     if dport != 80:
-        return [eth(src_mac, RMAC, 0x0800, tcp_seg(WEB, s, 80, sport, 0, seq + 1, 0x14))]  # RST
+        return [eth(src_mac, RMAC, 0x0800, tcp_seg(srv, s, 80, sport, 0, seq + 1, 0x14))]  # RST
     data = body[(off >> 4) * 4:]
     key = (s, sport)
     out = []
     if flags & 0x02:  # SYN
         stats["web_syn"] = stats.get("web_syn", 0) + 1
         tcp[key] = None
-        out.append(tcp_seg(WEB, s, 80, sport, 1000, seq + 1, 0x12))
+        out.append(tcp_seg(srv, s, 80, sport, 1000, seq + 1, 0x12))
     elif data and key in tcp and tcp[key] is None:
-        a = http_answer()
+        if srv == WEB:
+            a = http_answer()
+            stats["web_get"] = stats.get("web_get", 0) + 1
+        else:
+            a = portal_answer(data)
         tcp[key] = a
-        stats["web_get"] = stats.get("web_get", 0) + 1
         # Data, then FIN with it: the client reads to the end.
-        out.append(tcp_seg(WEB, s, 80, sport, 1001, seq + len(data), 0x18, a))
-        out.append(tcp_seg(WEB, s, 80, sport, 1001 + len(a), seq + len(data), 0x11))
+        out.append(tcp_seg(srv, s, 80, sport, 1001, seq + len(data), 0x18, a))
+        out.append(tcp_seg(srv, s, 80, sport, 1001 + len(a), seq + len(data), 0x11))
     elif flags & 0x01 and key in tcp:  # FIN
         a = tcp.pop(key) or b""
-        out.append(tcp_seg(WEB, s, 80, sport, 1002 + len(a), seq + len(data) + 1, 0x10))
+        out.append(tcp_seg(srv, s, 80, sport, 1002 + len(a), seq + len(data) + 1, 0x10))
     return [eth(src_mac, RMAC, 0x0800, o) for o in out]
 
 
@@ -660,6 +690,8 @@ def frame(f):
                 return [eth(src, RMAC, 0x0800, ip(DNS, s, 17, udp(DNS, s, 53, sport, a)))]
     if proto == 6 and d == WEB:
         return handle_tcp(src, s, body)
+    if proto == 6 and d == ROUTER:
+        return handle_tcp(src, s, body, ROUTER)
     if proto == 1 and len(body) >= 8 and body[0] == 8 and d in (ROUTER, DNS, WEB):
         stats["ping"] += 1
         r = b"\0\0\0\0" + body[4:]

@@ -38,6 +38,9 @@ pub struct NetShown {
 pub enum NetAction {
     Join { ssid: Vec<u8>, open: bool },
     Leave,
+    /// The network's sign-in page (atrium-net.md §8.1): portcullisd's
+    /// `PortalWindow`.
+    SignIn,
 }
 
 pub enum NetMsg {
@@ -91,6 +94,12 @@ pub fn menu(n: &NetShown) -> (Vec<MenuItem>, Vec<Option<NetAction>>) {
     if let Some(note) = &n.note {
         items.push(MenuItem::new(note.clone()).enabled(false));
         acts.push(None);
+    }
+    // Signing in is offered whenever a link is up: a portal is only known
+    // for sure when the probe runs, and it is off by default (§8.1 P3).
+    if n.status.as_ref().is_some_and(|s| s.link != Link::None) {
+        items.push(MenuItem::new("Sign in to this network…"));
+        acts.push(Some(NetAction::SignIn));
     }
     let current = n.status.as_ref().filter(|s| s.link == Link::Wifi).and_then(|s| s.ssid.clone());
     if current.is_some() {
@@ -153,15 +162,40 @@ pub fn scan(tx: Sender<NetMsg>) {
 
 pub fn act(tx: Sender<NetMsg>, a: NetAction) {
     std::thread::spawn(move || {
+        if a == NetAction::SignIn {
+            let _ = tx.send(NetMsg::Done(portal_window()));
+            return;
+        }
         let r = connect(Grant::Wifi).and_then(|mut c| {
             match &a {
                 NetAction::Join { ssid, open } => c.join(&Join { ssid: ssid.clone(), passphrase: None, handle: None, open: *open }),
                 NetAction::Leave => c.leave(),
+                NetAction::SignIn => unreachable!(),
             }
             .map_err(|f| f.1)
         });
         let _ = tx.send(NetMsg::Done(r));
     });
+}
+
+/// portcullisd's `PortalWindow`: the person's sign-in window, started if it
+/// is not open. A menu pick carries no press, so an open one stays where it is.
+fn portal_window() -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not reachable")?;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+        Ok(other) => return Err(format!("portcullisd: {other:?}")),
+        Err(e) => return Err(format!("portcullisd is not answering ({e})")),
+    }
+    match round_trip(&mut s, &Request::PortalWindow { activation: None }) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message }) => Err(format!("Sign-in page: {message}")),
+        Ok(other) => Err(format!("portcullisd: {other:?}")),
+        Err(e) => Err(format!("portcullisd is not answering ({e})")),
+    }
 }
 
 #[cfg(test)]
@@ -194,10 +228,21 @@ mod tests {
         let (items, acts) = menu(&n);
         assert_eq!(items.len(), acts.len());
         assert_eq!(acts[0], None, "the heading");
-        assert_eq!(acts[1], Some(NetAction::Leave));
-        assert_eq!(acts[2], Some(NetAction::Join { ssid: b"cafe".to_vec(), open: true }));
-        assert_eq!(acts[3], Some(NetAction::Join { ssid: b"office".to_vec(), open: false }));
-        assert_eq!(acts[4], None, "a new secured network needs Settings");
-        assert_eq!(acts.len(), 5, "the current network is not offered again");
+        assert_eq!(acts[1], Some(NetAction::SignIn), "signing in offered while linked");
+        assert_eq!(acts[2], Some(NetAction::Leave));
+        assert_eq!(acts[3], Some(NetAction::Join { ssid: b"cafe".to_vec(), open: true }));
+        assert_eq!(acts[4], Some(NetAction::Join { ssid: b"office".to_vec(), open: false }));
+        assert_eq!(acts[5], None, "a new secured network needs Settings");
+        assert_eq!(acts.len(), 6, "the current network is not offered again");
+    }
+
+    #[test]
+    fn no_sign_in_without_a_link() {
+        let n = NetShown { status: Some(Status::offline()), ..Default::default() };
+        assert!(!menu(&n).1.contains(&Some(NetAction::SignIn)));
+        let n = NetShown { status: Some(st(Link::Wired, Online::Captive, None, None)), ..Default::default() };
+        let (items, acts) = menu(&n);
+        assert_eq!(acts[1], Some(NetAction::SignIn));
+        assert_eq!(items.len(), 2);
     }
 }

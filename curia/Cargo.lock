@@ -150,6 +150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-netconf"
 version = "0.1.0"
 dependencies = [
@@ -422,6 +429,7 @@ dependencies = [
  "lyra-protocol",
  "pergola",
  "portcullis-ipc",
+ "prelum-proto",
  "vinculum-control",
 ]
 
@@ -992,6 +1000,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",
@@ -1213,6 +1222,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "prelum-dnssd"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "prelum-ipp-codec"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "prelum-proto"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "prelum-dnssd",
+ "prelum-ipp-codec",
+ "serde",
 ]
 
 [[package]]

@@ -28,6 +28,9 @@ pub enum Want {
     SetDns(Vec<IpAddr>),
     /// The machine's own DNS servers, asked only over TLS (§6).
     SetDnsTls(DnsTls),
+    /// Open the network's sign-in page (atrium-net.md §8.1): portcullisd's
+    /// `PortalWindow`, with the press so an open window comes forward.
+    SignIn { activation: Option<[u8; 16]> },
 }
 
 impl std::fmt::Debug for Want {
@@ -45,6 +48,7 @@ impl std::fmt::Debug for Want {
             Want::SetStatic(s) => write!(f, "SetStatic({:?})", s.target),
             Want::SetDns(v) => write!(f, "SetDns({v:?})"),
             Want::SetDnsTls(t) => write!(f, "SetDnsTls({:?}, {})", t.servers, t.name),
+            Want::SignIn { .. } => write!(f, "SignIn"),
         }
     }
 }
@@ -309,6 +313,19 @@ impl NetPage {
         self.wants.push(Want::Leave);
     }
 
+    /// "Sign in to this network": the network's sign-in page in its own
+    /// window. Offered whenever a link is up (a portal is only known for
+    /// sure when the probe runs, and it is off by default).
+    pub fn sign_in(&mut self, activation: Option<[u8; 16]>) {
+        self.wants.push(Want::SignIn { activation });
+    }
+
+    /// Whether to offer signing in, and whether it is the thing to do now.
+    pub fn sign_in_offer(&self) -> Option<bool> {
+        let s = self.status.as_ref().filter(|_| self.reachable)?;
+        (s.link != Link::None).then_some(s.online == Online::Captive)
+    }
+
     /// Forget asks once, then forgets on the second press.
     pub fn forget(&mut self, ssid: &[u8]) {
         if self.confirm_forget.as_deref() == Some(ssid) {
@@ -466,6 +483,8 @@ impl NetPage {
                         };
                         self.notice = Some(Notice { text: format!("Could not join {}: {why}", name(ssid)), error: true });
                     }
+                    (Want::SignIn { .. }, Ok(())) => self.notice = Some(Notice { text: "Opening the network's sign-in page".into(), error: false }),
+                    (Want::SignIn { .. }, Err(e)) => self.notice = Some(Notice { text: format!("Could not open the sign-in page: {e}"), error: true }),
                     (Want::Forget(ssid), Ok(())) => self.notice = Some(Notice { text: format!("Forgot {}", name(ssid)), error: false }),
                     (Want::SetStatic(s), r) => {
                         let what = match &s.target {
@@ -532,6 +551,21 @@ mod tests {
         p.apply(Got::Nearby(Ok(vec![near("cafe", "open", false), near("neighbour", "wpa2", false), near("office", "wpa3", false), near("home", "wpa2", false)])));
         p.take_wants();
         p
+    }
+
+    #[test]
+    fn sign_in_is_offered_while_linked_and_wanted_on_a_portal() {
+        let mut p = page();
+        assert_eq!(p.sign_in_offer(), Some(false), "offered quietly: the probe is off");
+        p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Captive, metered: false, bars: Some(3), ssid: Some(b"cafe".to_vec()), portal: None })));
+        p.take_wants();
+        assert_eq!(p.sign_in_offer(), Some(true));
+        p.sign_in(Some([7; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SignIn { activation: Some([7; 16]) }]);
+        p.apply(Got::Done { what: Want::SignIn { activation: Some([7; 16]) }, result: Err("no installed app holds network-portal".into()) });
+        assert!(p.notice.as_ref().is_some_and(|n| n.error && n.text.contains("network-portal")));
+        p.apply(Got::Status(Some(Status::offline())));
+        assert_eq!(p.sign_in_offer(), None, "nothing to sign in to");
     }
 
     #[test]

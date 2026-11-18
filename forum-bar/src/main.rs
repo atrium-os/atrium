@@ -1418,7 +1418,7 @@ fn main() -> std::io::Result<()> {
                         n.scanning = false;
                         n.nearby = r.unwrap_or_default();
                     }
-                    network::NetMsg::Done(r) => n.note = r.err().map(|e| format!("Could not join: {e}")),
+                    network::NetMsg::Done(r) => n.note = r.err().map(|e| if e.starts_with("Sign-in page") { e } else { format!("Could not join: {e}") }),
                 }
             }
             let open = net_open.get().open;
