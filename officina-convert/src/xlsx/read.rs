@@ -11,7 +11,7 @@
 //!
 //! Reported, not carried (O4c–O4e): charts and
 //! drawings, defined names, tables, conditional formats, data validation,
-//! hyperlinks. Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
+//! Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -136,6 +136,31 @@ pub(crate) fn rels(z: &Archive, part: &str) -> Result<HashMap<String, (String, S
         buf.clear();
     }
     Ok(out)
+}
+
+/// The sheet's links that name a relationship, given its target (an external
+/// address, with `#place` after it when the link has a location too).
+fn resolve_links(wb: &mut Workbook, s: u16, z: &Archive, part: &str) -> Result<(), XlsxError> {
+    use officina_grid::links::Link;
+    let pending: Vec<_> = wb.links(s).iter().filter(|(_, l)| l.target.starts_with('\u{1}')).map(|(&k, l)| (k, l.target.to_string())).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let rel = rels(z, part)?;
+    let set = pending
+        .into_iter()
+        .map(|((r, c), t)| {
+            let t = &t[1..];
+            let (id, place) = t.split_once('#').map_or((t, None), |(a, b)| (a, Some(b)));
+            let to = rel.get(id).filter(|(ty, _)| ty.ends_with("/hyperlink")).map(|(_, target)| match place {
+                Some(p) => format!("{target}#{p}"),
+                None => target.clone(),
+            });
+            (r, c, to.and_then(|t| Link::new(&t)))
+        })
+        .collect();
+    wb.set_links(s, set);
+    Ok(())
 }
 
 /// What came out of a file, besides the workbook.
@@ -366,6 +391,8 @@ struct Seg {
     tab: Option<u32>,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
+    /// `<hyperlink>`s: cells, relationship id, location.
+    links: Vec<((u32, u32, u32, u32), Option<String>, Option<String>)>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -598,7 +625,13 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
             }
             b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
             b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules"),
-            b"hyperlink" => seg.rep.note(Kind::Dropped, "hyperlinks"),
+            b"hyperlink" => {
+                if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
+                    if seg.links.len() < officina_grid::links::MAX_LINKS {
+                        seg.links.push((rect, attr(&e, b"id")?, attr(&e, b"location")?));
+                    }
+                }
+            }
             b"autoFilter" => {
                 if let Some(rf) = attr(&e, b"ref")? {
                     seg.filter = Some((rf, Vec::new()));
@@ -730,6 +763,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut heights = Vec::new();
         let mut hidden: Vec<u32> = Vec::new();
         let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut links = Vec::new();
         let mut filter = None;
         let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
         let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
@@ -769,6 +803,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 heights.extend(seg.heights);
                 hidden.extend(seg.hidden);
                 merges.extend(seg.merges);
+                links.extend(seg.links);
                 filter = seg.filter.or(filter);
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
@@ -801,6 +836,28 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         cutter.join().map_err(|_| bad("the reader stopped"))??;
         if let Some(e) = failed {
             return Err(e);
+        }
+        // Links for now name their relationship (`\u{1}rId3#place`); resolved
+        // once the sheet's relationships are read ([`resolve_links`]).
+        if !links.is_empty() {
+            let mut set = Vec::new();
+            'all: for ((r0, c0, r1, c1), rid, loc) in links {
+                let t = match (rid, loc) {
+                    (Some(id), loc) => format!("\u{1}{id}{}", loc.map(|l| format!("#{l}")).unwrap_or_default()),
+                    (None, Some(l)) => format!("#{l}"),
+                    (None, None) => continue,
+                };
+                let Some(link) = officina_grid::links::Link::new(&t) else { continue };
+                for r in r0..=r1 {
+                    for c in c0..=c1 {
+                        if set.len() >= officina_grid::links::MAX_LINKS {
+                            break 'all;
+                        }
+                        set.push((r, c, Some(link.clone())));
+                    }
+                }
+            }
+            wb.set_links(s, set);
         }
         if !merges.is_empty() {
             let n = merges.len();
@@ -1041,6 +1098,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     for (i, (_, part)) in sheets.iter().enumerate() {
         super::chart::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
         super::comments::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
+        resolve_links(&mut wb, i as u16, &z, part)?;
     }
 
     // Formulas, once every sheet exists (they name each other).

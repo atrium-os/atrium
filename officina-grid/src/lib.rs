@@ -24,6 +24,7 @@ pub mod deps;
 pub mod eval;
 pub mod fast;
 pub mod filter;
+pub mod links;
 pub mod macros;
 pub mod merges;
 pub mod formula;

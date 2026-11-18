@@ -157,16 +157,19 @@ pub fn sort_op(wb: &Workbook, rect: Rect, keys: &[SortKey]) -> Option<GridOp> {
         }
         ops.push(GridOp::Restyle(StyleRegion { rect, spans }));
     }
-    // Comments go with their rows.
-    let cm: Vec<_> = wb.comments(s).range((rect.r0, 0)..=(rect.r1, u32::MAX)).filter(|(&(_, c), _)| (rect.c0..=rect.c1).contains(&c)).map(|(&k, v)| (k, v.clone())).collect();
-    if !cm.is_empty() {
-        let mut dest_of = std::collections::HashMap::with_capacity(cm.len());
-        for (i, &src) in ord.iter().enumerate() {
-            dest_of.insert(src, rect.r0 + i as u32);
-        }
-        let mut set: Vec<_> = cm.iter().map(|&((r, c), _)| (r, c, None)).collect();
-        set.extend(cm.into_iter().map(|((r, c), k)| (dest_of.get(&r).copied().unwrap_or(r), c, Some(k))));
+    // Comments and links go with their rows.
+    let mut dest_of = std::collections::HashMap::with_capacity(ord.len());
+    for (i, &src) in ord.iter().enumerate() {
+        dest_of.insert(src, rect.r0 + i as u32);
+    }
+    let to = |r: u32, c: u32| Some(if (rect.r0..=rect.r1).contains(&r) && (rect.c0..=rect.c1).contains(&c) { (dest_of.get(&r).copied().unwrap_or(r), c) } else { (r, c) });
+    let set = crate::links::moved(wb.comments(s), to);
+    if !set.is_empty() {
         ops.push(GridOp::Comments { sheet: s, set });
+    }
+    let set = crate::links::moved(wb.links(s), to);
+    if !set.is_empty() {
+        ops.push(GridOp::Links { sheet: s, set });
     }
     Some(if ops.len() == 1 { ops.pop().unwrap() } else { GridOp::Batch(ops) })
 }

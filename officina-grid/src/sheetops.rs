@@ -109,6 +109,9 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if wb.sheet(s).tab_color.is_some() {
         ops.push(GridOp::TabColor { sheet: s, color: None });
     }
+    if !wb.links(s).is_empty() {
+        ops.push(GridOp::Links { sheet: s, set: wb.links(s).keys().map(|&(r, c)| (r, c, None)).collect() });
+    }
     if !wb.comments(s).is_empty() {
         ops.push(GridOp::Comments { sheet: s, set: wb.comments(s).keys().map(|&(r, c)| (r, c, None)).collect() });
     }

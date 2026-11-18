@@ -83,6 +83,7 @@ pub static FUNCS: &[FuncSpec] = &[
     f!("IF", 1, 3, iff),
     f!("IFS", 2, N, ifs),
     f!("IFERROR", 2, 2, iferror),
+    f!("HYPERLINK", 1, 2, hyperlink),
     f!("IFNA", 2, 2, ifna),
     f!("AND", 1, N, and),
     f!("OR", 1, N, or),
@@ -888,6 +889,14 @@ fn ifs(c: &Ctx, a: &[Expr]) -> Ev {
         }
     }
     e(ErrorKind::NA)
+}
+/// HYPERLINK(address, [shown]): shows `shown` (else the address); the cell
+/// links to the address ([`crate::book::Workbook::link_at`]).
+fn hyperlink(c: &Ctx, a: &[Expr]) -> Ev {
+    if a.len() > 1 && !missing(&a[1]) {
+        return Ev::V(c.scalar(&a[1]));
+    }
+    Ev::V(c.scalar(&a[0]))
 }
 fn iferror(c: &Ctx, a: &[Expr]) -> Ev {
     match c.eval(&a[0]) {

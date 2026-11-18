@@ -18,6 +18,7 @@
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 15 | TAB_COLORS | sheets' tab colours: count; per sheet, its index and 0xRRGGBB |
 //! | 16 | MERGES | one sheet's merged cells: sheet, count, each area's corners |
+//! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -44,6 +45,7 @@ pub const STRINGS: u16 = 2;
 pub const TAB_COLORS: u16 = 15;
 pub const MERGES: u16 = 16;
 pub const COMMENTS: u16 = 17;
+pub const LINKS: u16 = 18;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -298,6 +300,13 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             let set: Vec<_> = sh.comments.iter().map(|(&(r, c), k)| (r, c, Some(k.clone()))).collect();
             crate::comments::encode(&mut w, &set);
             c.add(COMMENTS, &w.into_bytes())?;
+        }
+        if !sh.links.is_empty() {
+            let mut w = Writer::new();
+            w.u16(si as u16);
+            let set: Vec<_> = sh.links.iter().map(|(&(r, c), k)| (r, c, Some(k.clone()))).collect();
+            crate::links::encode(&mut w, &set);
+            c.add(LINKS, &w.into_bytes())?;
         }
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
@@ -760,6 +769,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             return Err(LoadError::Bad("a sheet's comments twice"));
         }
         wb.set_comments(s, set);
+    }
+
+    for i in of(LINKS) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let s = r.u16()?;
+        let set = crate::links::decode(&mut r)?;
+        done(&r)?;
+        let Some(sh) = wb.sheets.get(s as usize) else { return Err(LoadError::Bad("links on a sheet that does not exist")) };
+        if !sh.links.is_empty() || set.iter().any(|x| x.2.is_none()) {
+            return Err(LoadError::Bad("a sheet's links twice"));
+        }
+        wb.set_links(s, set);
     }
 
     // Pivot tables: their output is in the cells already.
