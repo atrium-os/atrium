@@ -44,3 +44,5 @@ nuntius = { path = "../../nuntius" }
 praeco  = { path = "../../praeco" }
 atrium-fonts = { path = "../../atrium-fonts" }
 blake3 = { version = "1", features = ["pure"] }
+# Its devices.d rules, to check a driver package's file the way dispensatord will load it.
+dispensator = { path = "../../dispensator" }

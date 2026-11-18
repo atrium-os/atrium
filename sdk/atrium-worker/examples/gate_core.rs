@@ -60,6 +60,8 @@ fn main() {
     say("nest", ask(&w, "nest", None));
     say("crash", ask(&w, "crash", None));
     say("timeout", ask(&w, "sleep", None));
+    say("memory", ask(&w, "hog", None));
+    say("after-memory", ask(&w, "uid", None));
     match w.call::<Ask, Answer>("nope", &Ask { what: "uid".into() }, None) {
         Err(Error::NoSuchWorker(_)) => say("nope", "no-such-worker".into()),
         r => say("nope", format!("{r:?}")),

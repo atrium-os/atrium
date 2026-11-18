@@ -32,6 +32,9 @@ pub struct LoadInfo {
     pub owner_uid: u32,
     /// `user/persona`, cut to 31 bytes.
     pub owner_label: String,
+    /// `TKEY_LOAD_OLDER_RO` (§8): the person verified opening an older
+    /// copy; the key opens it below `high_water`, read-only only.
+    pub older_read_only: bool,
 }
 
 /// The kernel keyring, or a stand-in for tests.
@@ -139,7 +142,7 @@ pub mod dev {
                 key: *key,
                 high_water: info.high_water,
                 owner_uid: info.owner_uid,
-                flags: 0,
+                flags: if info.older_read_only { 1 } else { 0 },
                 owner_label: [0; 32],
             };
             let lb = info.owner_label.as_bytes();

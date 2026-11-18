@@ -199,6 +199,14 @@ impl Library {
         let c = ch as u32;
         SCRIPTS.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&c)).map(|s| s.2)
     }
+
+    /// The colour family that stands in for `family` where colour glyphs
+    /// can be drawn: Noto Color Emoji (COLRv1) for the Noto Emoji outlines.
+    /// Text that ends up as outlines only (PDF, a one-channel atlas) keeps
+    /// the outline family, which every SCRIPTS row and fallback names.
+    pub fn color_twin(family: &str) -> Option<&'static str> {
+        (family == "Noto Emoji").then_some("Noto Color Emoji")
+    }
 }
 
 /// The class of a family we ship.

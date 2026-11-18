@@ -368,6 +368,19 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let limits = (memory_mb, cpu_pct, require_memory_limit);
             let mut rule = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
                 .and_then(|p| p.worker_rule_for(&app_id, &owner, registry.resolve(uid).map(|(_, a)| a)).cloned());
+            /* ★ A Limen provider from its manifest (app-composition.md §5.1,
+             * dev-tools-plan.md M6): an installed app whose `[roles]
+             * implements` names a role, started by limend for a parent it
+             * serves, runs per instance (a uid of that parent's person and
+             * persona), as a system `[workers."id"] callers = ["_limen"],
+             * per_instance = true` rule would have it. Only for limend. */
+            if rule.is_none() && owner == LIMEN_USER && serves.is_some()
+                && launch::installed_manifest(&app_id).and_then(|m| m.roles).is_some_and(|r| !r.implements.is_empty()) {
+                rule = Some(portcullis_policy::WorkerRule {
+                    callers: vec![LIMEN_USER.to_string()], caller_apps: Vec::new(), run_as: String::new(),
+                    per_instance: true, concurrent: Some(PROVIDERS_PER_APP),
+                });
+            }
             /* ★ An app with no system rule starts only its own id, or an id
              * under it (the Navigator's `org.atrium.navigator.converter`),
              * and only as itself: not another app's bundle as its own uid,
@@ -981,6 +994,12 @@ fn handle_exec_instance(
     if let Some(done) = watch { done.store(true, std::sync::atomic::Ordering::Release) }
     write_response(writer, &resp)
 }
+
+/// limend's user: the only caller a manifest's `[roles]` provider is
+/// started for without a system rule.
+const LIMEN_USER: &str = "_limen";
+/// How many embeds of one manifest provider may run at once.
+const PROVIDERS_PER_APP: usize = 32;
 
 /// How many calls of one app's workers may run at once.
 const WORKER_CALLS_PER_APP: usize = 16;
@@ -1751,6 +1770,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
         // The Terminal too, for `make run` in a workspace's console
         // (atrium-run, OSC 7770 `run`), on the person's press.
         Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => true,
+        // An IDE (`workspace-exec`), in a workspace the person gave it
+        // (dev-tools.md §3.4: its Run of a windowed app is W5's).
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == ws) => true,
+        Some(a) if launch::app_execs_in_workspaces(a) => return refuse(format!("cap.workspace.denied: {a} wasn't given workspace {ws}")),
         Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
         None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
         None => return refuse("cap.workspace.denied: not a person or a launcher".into()),

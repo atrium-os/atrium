@@ -957,8 +957,11 @@ fn handle_create(
          * no such node, so a grant that fails leaves the jail without its
          * device, never with someone else's. */
         let pin = policy.devfs_rulesets.pin(req.devfs_ruleset);
-        for (node, pin) in req.devfs_grant.iter().chain(&req.devfs_grants).filter_map(|n| Some((n, pin?))) {
-            if let Err(e) = ffi::devfs_grant(&devdir, node, pin.uid) {
+        // The jail's own uid, which the validator held to the pin's uid (or
+        // its range, for the catalog's drivers).
+        let owner = req.exec.as_ref().map(|e| e.uid).filter(|u| pin.is_some_and(|p| p.allows_uid(*u)));
+        for (node, uid) in req.devfs_grant.iter().chain(&req.devfs_grants).filter_map(|n| Some((n, owner?))) {
+            if let Err(e) = ffi::devfs_grant(&devdir, node, uid) {
                 if let Some(addr) = &lo0_alias {
                     let _ = ffi::ifconfig_lo0_alias_del(addr);
                 }
@@ -969,7 +972,7 @@ fn handle_create(
                     msg:   format!("grant {node} in {devdir}: {e}"),
                 });
             }
-            info!("jaild: granted {node} to uid {} in {devdir}", pin.uid);
+            info!("jaild: granted {node} to uid {uid} in {devdir}");
         }
 
         /* A pinned ruleset's device leases (the display lease): name this jail

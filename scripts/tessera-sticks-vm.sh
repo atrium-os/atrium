@@ -136,6 +136,11 @@ sleep 5
 check "the old copy isn't mounted" "" "$(mounted)"
 check "…the kernel said why" yes "$(g "dmesg | tail -40 | grep -q 'below the key.s high-water' && echo yes || echo no")"
 check "…and it shows Locked" yes "$(list_as alice | grep -q "^$PART - .* locked" && echo yes || echo no)"
+check "…as her older copy" yes "$(list_as alice | grep -q "^$PART - .* locked older persona=work" && echo yes || echo no)"
+# No Sigillum in this VM: arcad can't verify her, so it stays shut.
+r=$(g "su -m alice -c '$D --media-socket $S --open-older $PART'")
+check "open read-only needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still not mounted" "" "$(mounted)"
 
 echo "=== 7. a recovery code opens it elsewhere (§7.4)"
 g "mdconfig -d -u $MD3"; sleep 3
@@ -168,7 +173,7 @@ r=$(g "echo $WRONG | su -m bob -c '$D --media-socket $S --adopt $PART personal k
 check "a wrong code: refused" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 check "…still not mounted" "" "$(mounted)"
 r=$(g "echo $CODE | su -m bob -c '$D --media-socket $S --adopt $PART personal keep'")
-check "the right code opens it" ok "${r%% *}"
+check "the right code opens it" "ok $PART opened for personal" "$r"
 check "…mounted" tessera "$(mounted)"
 check "…alice's note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
 check "…listed as bob's personal stick" yes "$(list_as bob | grep -q "^$PART /media/$PART .*persona=personal" && echo yes || echo no)"

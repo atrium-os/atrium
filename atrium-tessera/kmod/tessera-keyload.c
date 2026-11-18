@@ -49,7 +49,7 @@ static void
 usage(void)
 {
 	fprintf(stderr, "usage: tessera-keyload load KEY_FILE KEY_ID UUID "
-	    "[HIGH_WATER]\n       tessera-keyload drop KEY_ID\n"
+	    "[HIGH_WATER [older-ro]]\n       tessera-keyload drop KEY_ID\n"
 	    "       tessera-keyload gen KEY_ID\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
@@ -67,7 +67,7 @@ main(int argc, char **argv)
 		perror("/dev/" TESSERA_KEYRING_DEV);
 		return (1);
 	}
-	if (strcmp(argv[1], "load") == 0 && (argc == 5 || argc == 6)) {
+	if (strcmp(argv[1], "load") == 0 && (argc >= 5 && argc <= 7)) {
 		struct tkey_load l;
 		int kf;
 		ssize_t n;
@@ -78,7 +78,7 @@ main(int argc, char **argv)
 			fprintf(stderr, "key id and uuid: 32 hex digits\n");
 			return (2);
 		}
-		if (argc == 6)
+		if (argc >= 6)
 			l.high_water = strtoull(argv[5], NULL, 0);
 		l.owner_uid = (uint32_t)getuid();
 		strlcpy(l.owner_label, "dev", sizeof l.owner_label);
@@ -93,7 +93,9 @@ main(int argc, char **argv)
 			explicit_bzero(&l, sizeof l);
 			return (1);
 		}
-		l.flags = 0;
+		/* "older-ro": as arcad loads it once the person verified (§8). */
+		l.flags = (argc == 7 && strcmp(argv[6], "older-ro") == 0)
+		    ? TKEY_LOAD_OLDER_RO : 0;
 		close(kf);
 		int r = ioctl(fd, TKEY_LOAD, &l);
 		explicit_bzero(&l, sizeof l);

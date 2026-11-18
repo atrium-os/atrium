@@ -24,6 +24,13 @@ monochrome outline emoji, static instances of Google Fonts' build as carried
 by the npm package `@expo-google-fonts/noto-emoji` 0.4.8 (name table:
 "Version 3.006", "Copyright 2013 Google LLC", OFL 1.1), files renamed only.
 
+Noto Color Emoji 2.057 (`NotoColorEmoji-Regular.ttf`): the upstream COLRv1
+build, `2D/fonts/Noto-COLRv1.ttf` from `github.com/googlefonts/noto-emoji`
+(name table: "Version 2.057;GOOG;noto-emoji:20260911:fc4ca365",
+"Copyright 2022 Google Inc.", OFL 1.1), file renamed only. Vector colour
+glyphs (COLR/CPAL over `glyf`), 5 MB; Google Fonts' copy of the same family
+adds an SVG table and is 25 MB.
+
 Noto script families: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil,
 Telugu, Kannada, Malayalam, Sinhala, Thai, Lao, Khmer, Myanmar, Georgian,
 Armenian, Hebrew, Ethiopic, Thaana, Syriac, Cherokee (Noto Sans), Tibetan (Noto
@@ -37,8 +44,8 @@ its own copyright line in its name table ("The Noto Project Authors").
   designs with the same metrics, so they would be second copies.
 - **CJK** (Noto Sans/Serif CJK): about 6 MB a weight as static TrueType.
   Installed on demand as font packages (`docs/spec/fonts.md` §5).
-- **Colour emoji**: the drawing path has no colour glyph tables yet; Noto
-  Emoji (outlines, in the text's colour) stands in.
+- **Bitmap colour emoji** (CBDT, the 10 MB `NotoColorEmoji.ttf`): the
+  COLRv1 build draws sharp at any size and is half the size.
 - **Liberation 1.x**: GPL with a font exception. 2.x is OFL.
 - Variable-only releases (Gelasio, current Roboto and Inter): the library maps
   static files, so a family comes in only when it ships static TTFs.

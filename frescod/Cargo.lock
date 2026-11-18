@@ -182,6 +182,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-colr"
+version = "0.1.0"
+dependencies = [
+ "skrifa",
+ "tiny-skia",
+]
+
+[[package]]
 name = "atrium-devevents"
 version = "0.1.0"
 dependencies = [
@@ -939,6 +947,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "ash",
+ "atrium-colr",
  "atrium-fonts",
  "bytemuck",
  "env_logger",

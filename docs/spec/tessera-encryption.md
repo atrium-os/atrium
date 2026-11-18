@@ -581,12 +581,22 @@ Personal:
   the volume. Still to come: the Arca credential field the code is typed into
   (arca.md §8.3; for now the client sends it), removing a code later, and Curia's
   wording.
-- **Not yet:** opening an older copy read-only after
-  verification (§8), grants of a trusted stick's folders into app jails (the FUSE
+- **Older copies (§8):** the kernel refuses a copy below the key's high-water mark with
+  `ESTALE` (an authentication failure stays `EINTEGRITY`), and dispensatord lists it
+  `locked older` with its persona. Media op `OPEN_OLDER` (0x0C) has arcad `VK_OLDER`
+  0xB7, behind Sigillum's `VERIFY_USER`, reload the key `TKEY_LOAD_OLDER_RO`: the
+  kernel then opens the copy below the mark, read-only only (a writable mount or a
+  ro→rw remount with that key is `EROFS`). Adopting the copy as current (the second
+  verified step that lowers the mark) is not built yet.
+- **Not yet:** grants of a trusted stick's folders into app jails (the FUSE
   server's control socket does that for FAT; a trusted stick has no server), and
   Scrinium's and Forum's Locked display and "Make this a Work stick".
-- Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): 25/25 in
-  the VM on 2026-11-18 (514f551), with `arca-vm-test.sh` §9 66/66.
+- Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): all 43
+  checks in the VM on 2026-11-18 (e61b9c0: format, lock, Locked for another person,
+  eject, replug, an older copy refused and not opened unverified, a recovery code
+  adopting the stick into another person's Arca), with `arca-vm-test.sh` §9 66/66 and
+  `tessera-sealed-vm.sh` §10 (an older copy opens read-only only with a key loaded
+  `OLDER_RO`). A forgotten key leaving its stick Locked is an arcad host test.
 
 ### 7.3 Not mine, but a person here has the key
 

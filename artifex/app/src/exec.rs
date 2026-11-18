@@ -117,6 +117,9 @@ pub trait Exec {
     fn spawn(&self, ws: &str, argv: &[String], cwd: &str) -> Result<Proc, String>;
     /// Open the workspace's terminal with a press.
     fn terminal(&self, ws: &str, activation: [u8; 16]) -> Result<(), String>;
+    /// Run folder `folder` of `ws`'s work as a dev app (W5), with a press:
+    /// the app's id.
+    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, String>;
     /// Where picked workspaces' `work` folders are (`/work`).
     fn work_root(&self) -> PathBuf;
 }
@@ -183,6 +186,13 @@ impl Exec for Portcullis {
         }
     }
 
+    fn run(&self, ws: &str, folder: &str, activation: [u8; 16]) -> Result<String, String> {
+        match ask(&Request::WorkspaceRun { name: ws.into(), project: folder.into(), activation })? {
+            Response::WorkspaceRan { app_id, .. } => Ok(app_id),
+            other => Err(format!("unexpected answer: {other:?}")),
+        }
+    }
+
     fn work_root(&self) -> PathBuf {
         PathBuf::from("/work")
     }
@@ -240,6 +250,10 @@ impl Exec for Local {
 
     fn terminal(&self, _ws: &str, _activation: [u8; 16]) -> Result<(), String> {
         Err("No terminal off Atrium".into())
+    }
+
+    fn run(&self, _ws: &str, _folder: &str, _activation: [u8; 16]) -> Result<String, String> {
+        Err("No Run off Atrium".into())
     }
 
     fn work_root(&self) -> PathBuf {

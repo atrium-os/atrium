@@ -13,6 +13,7 @@
 #   - a file the core passes is read by the worker;
 #   - the worker's error, a crash (exit 3) and a call past 3 s come back as
 #     errors, and the core carries on;
+#   - past its memory (128M) it is killed, and that is an error too;
 #   - the worker has no network and cannot call workers itself;
 #   - the core's jail has the worker-call socket, which refuses anything
 #     but WorkerCall, and no portcullisd socket;
@@ -92,6 +93,8 @@ chown -R alice:files-alice $P
 EOS
 
 echo "=== Run, and the core's calls"
+# The rctl rules on the worker jails while they run.
+V "rm -f $B/rctl.txt; (i=0; while [ \$i -lt 240 ]; do rctl | grep 'w-echo' >> $B/rctl.txt; sleep 0.5; i=\$((i+1)); done) >/dev/null 2>&1 &"
 out=$(A "run scratch wk")
 case "$out" in dev.alice.scratch.org.example.wk*) ok "Run installs it" ;; *) bad "run: $out"; echo "workers: $fails failed"; exit 1 ;; esac
 APP=/var/lib/atrium/apps/dev.alice.scratch.org.example.wk
@@ -111,6 +114,9 @@ r=$(line net); case "$r" in "ok refused"*) ok "no network: $r" ;; *) bad "net: $
 r=$(line nest); case "$r" in "ok refused"*) ok "it calls no workers: $r" ;; *) bad "nest: $r" ;; esac
 r=$(line crash); case "$r" in "crashed Some(3)") ok "a crash is an error: $r" ;; *) bad "crash: $r" ;; esac
 r=$(line timeout); case "$r" in "timeout 3") ok "a call past 3 s is ended" ;; *) bad "timeout: $r" ;; esac
+r=$(line memory); case "$r" in "crashed None") ok "past its 128M it is killed, and that is an error" ;; *) bad "memory: $r ($(V "dmesg | grep -i -e rctl -e 'out of swap' | tail -2"))" ;; esac
+r=$(V "grep -m1 'memoryuse' $B/rctl.txt"); case "$r" in *memoryuse:sigkill=134217728*) ok "the worker's jail had the rule: $r" ;; *) bad "no memoryuse rule seen on a worker jail ($(V "sort -u $B/rctl.txt | head -3"))" ;; esac
+r=$(line after-memory); [ "$r" = "$u1" ] && ok "and the next call works" || bad "after-memory: $r"
 r=$(line nope); case "$r" in no-such-worker) ok "an undeclared worker is refused" ;; *) bad "nope: $r" ;; esac
 r=$(line exec-other); case "$r" in "workers.sock"*"only WorkerCall"*) ok "the core has only the worker-call socket: $r" ;; *) bad "exec-other: $r" ;; esac
 sleep 3

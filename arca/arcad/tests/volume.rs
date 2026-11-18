@@ -348,3 +348,28 @@ fn a_forgotten_key_leaves_its_stick_locked() {
     assert_eq!(load(&mut s, &dispensatord(), "alice", "work", &key_id, UUID, 0), status::DENIED);
     assert!(k.lock().unwrap().loaded.is_empty());
 }
+
+#[test]
+fn an_older_copy_opens_read_only_after_verification() {
+    let (_d, mut s, k) = setup();
+    let (_, key_id) = mint(&mut s, &dispensatord(), "alice", "work", UUID);
+    let b = body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); w.raw(&UUID); });
+    // Not without Sigillum's VERIFY_USER, and the prompt says what for.
+    assert_eq!(s.handle(&dispensatord(), volume_op::VK_OLDER, &b).status, status::NEEDS_VERIFICATION);
+    assert!(!k.lock().unwrap().loaded[0].0.older_read_only);
+    let (user, what) = s.verify_prompt(&dispensatord(), volume_op::VK_OLDER, &b).unwrap();
+    assert_eq!(user, "alice");
+    assert!(what.starts_with("Open an older copy of"), "{what}");
+    // Verified: reloaded marked, the same key, the mark unchanged.
+    let key = k.lock().unwrap().loaded[0].1;
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &b).status, status::OK);
+    let l = k.lock().unwrap().loaded.clone();
+    assert_eq!(l.len(), 1);
+    assert!(l[0].0.older_read_only);
+    assert_eq!(l[0].1, key);
+    // Another person, another volume: no.
+    let bob = body(|w| { w.str("bob"); w.str("work"); w.raw(&key_id); w.raw(&UUID); });
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &bob).status, status::DENIED);
+    let other = body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); w.raw(&[1; 16]); });
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &other).status, status::DENIED);
+}

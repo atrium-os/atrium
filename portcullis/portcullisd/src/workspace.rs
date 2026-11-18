@@ -216,18 +216,25 @@ p=${1:-.}
 case "$p" in
 ""|/*|*..*|*[!A-Za-z0-9._/-]*) echo "atrium-run: "$p" isn't a folder in ~/work" >&2; exit 64 ;;
 esac
-if [ ! -t 0 ] || [ ! -t 1 ]; then
+# A terminal asks the person; so does an IDE that runs this as a task
+# (ATRIUM_ASK=1: Artifex reads the request in the output and answers).
+tty=
+if [ -t 0 ] && [ -t 1 ]; then
+    tty=1
+elif [ "${ATRIUM_ASK:-}" != 1 ]; then
     echo "atrium-run: Run needs your OK; run it in a Terminal window" >&2
     exit 1
 fi
-old=$(stty -g)
-trap 'stty "$old"; echo; exit 130' INT TERM
-echo "atrium-run: asking for your OK in this window (Ctrl-C to cancel)"
-stty -echo
+if [ -n "$tty" ]; then
+    old=$(stty -g)
+    trap 'stty "$old"; echo; exit 130' INT TERM
+    echo "atrium-run: asking for your OK in this window (Ctrl-C to cancel)"
+    stty -echo
+fi
 printf ']7770;run;%s' "$p"
 IFS= read -r reply
-stty "$old"
-printf '[1A
+[ -z "$tty" ] || stty "$old"
+[ -z "$tty" ] || printf '[1A
 [2K'
 case "$reply" in
 *"]7770;ok;"*) s=${reply##*;}; s=${s%%[!0-9]*}; exit "${s:-1}" ;;

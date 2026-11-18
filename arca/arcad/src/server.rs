@@ -165,7 +165,7 @@ impl State {
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
         }
         if let Label::Service(name) = who {
-            if op != volume_op::VK_FORGET || !crate::volume::SERVICES.contains(&name.as_str()) {
+            if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER) || !crate::volume::SERVICES.contains(&name.as_str()) {
                 return None;
             }
             let mut r = Reader::new(body);
@@ -174,6 +174,9 @@ impl State {
             let key_id = r.array::<16>().ok()?;
             let store = if user == MACHINE_USER { self.machine.as_ref()? } else { self.stores.get(&user)? };
             let m = Self::volume_item(store, &persona, &key_id).ok()??;
+            if op == volume_op::VK_OLDER {
+                return Some((user, format!("Open an older copy of \u{201c}{}\u{201d} read-only", m.account)));
+            }
             return Some((user, format!("Forget the key of \u{201c}{}\u{201d}", m.account)));
         }
         let (Label::App { user, publisher, app_id } | Label::WebBroker { user, publisher, app_id } | Label::FileManager { user, publisher, app_id }) = who else { return None };
@@ -218,7 +221,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB6).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB7).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -605,7 +608,7 @@ impl State {
                     return reply(status::INTERNAL);
                 }
                 let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
-                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona) };
+                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona), older_read_only: false };
                 let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
                 return match self.keyring.as_mut().unwrap().load(&info, key) {
                     Ok(()) => ok(persona.into_bytes()),
@@ -647,7 +650,7 @@ impl State {
                     value: value.as_ref(),
                 }));
                 *item = Some(m.id);
-                let info = LoadInfo { key_id, uuid, group, high_water: 0, owner_uid: 0, owner_label: label };
+                let info = LoadInfo { key_id, uuid, group, high_water: 0, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = value.as_ref()[..32].try_into().unwrap();
                 if self.keyring.as_mut().unwrap().load(&info, key).is_err() {
                     // Not usable: don't keep a key the kernel never saw.
@@ -679,7 +682,7 @@ impl State {
                     return reply(status::INTERNAL);
                 }
                 let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
-                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: label };
+                let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
                 match self.keyring.as_mut().unwrap().load(&info, key) {
                     Ok(()) => ok(Vec::new()),
@@ -728,6 +731,41 @@ impl State {
                 match self.keyring.as_mut().unwrap().drop_key(&key_id) {
                     Ok(()) => ok(Vec::new()),
                     Err(e) if e == libc::ENOENT => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            volume_op::VK_OLDER => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                field!(r.end());
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                if decode_scope(&m.scope) != Some((key_id, uuid, 0)) {
+                    return reply(status::DENIED);
+                }
+                if !verified {
+                    return reply(status::NEEDS_VERIFICATION);
+                }
+                let (_, v) = tri!(store.release(&m.id, &Access { persona: &persona, recipient: &me }, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                let info = LoadInfo { key_id, uuid, group: 0, high_water, owner_uid: 0, owner_label: label, older_read_only: true };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                let ring = self.keyring.as_mut().unwrap();
+                // Loaded as usual (the stick was found): reload it marked.
+                match ring.drop_key(&key_id) {
+                    Ok(()) => {}
+                    Err(e) if e == libc::ENOENT => {}
+                    Err(_) => return reply(status::INTERNAL),
+                }
+                match ring.load(&info, key) {
+                    Ok(()) => ok(Vec::new()),
                     Err(_) => reply(status::INTERNAL),
                 }
             }
@@ -798,7 +836,7 @@ impl State {
                         }
                     }
                 }
-                let info = LoadInfo { key_id, uuid, group: 0, high_water: 0, owner_uid: 0, owner_label: label };
+                let info = LoadInfo { key_id, uuid, group: 0, high_water: 0, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = vk.as_ref().try_into().unwrap();
                 match self.keyring.as_mut().unwrap().load(&info, key) {
                     Ok(()) => ok(Vec::new()),

@@ -556,3 +556,19 @@ fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
     assert_eq!(refused(app.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_parent_embeds_only_the_roles_its_manifest_names() {
+    let w = World::new();
+    // As limend's check would answer for a manifest with embeds = ["doc-viewer"].
+    w.shared.set_embed_check(Box::new(|app: &str, role: &str| app == "org.example.mail" && role == "doc-viewer"));
+    let mut app = w.parent(APP);
+    assert_eq!(refused(app.request("map", W_APP)), refusal::NOT_EMBEDDABLE);
+    assert_eq!(refused(app.request("picker", W_APP)), refusal::NOT_EMBEDDABLE);
+    let mut other = w.parent(OTHER);
+    assert_eq!(refused(other.request("doc-viewer", W_OTHER)), refusal::NOT_EMBEDDABLE);
+    // The named role goes on to its provider.
+    let e = app.request("doc-viewer", W_APP).unwrap();
+    let (spawned, _child) = w.spawned();
+    assert_eq!(e, spawned);
+}

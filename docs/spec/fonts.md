@@ -17,8 +17,14 @@ short: 108 static TrueType faces (about 33 MB on disk).
   Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala,
   Thai, Lao, Khmer, Myanmar, Tibetan, Georgian, Armenian, Hebrew, Arabic
   (Naskh), Syriac, Thaana, Ethiopic and Cherokee.
-- **Emoji**: Noto Emoji (Regular, Bold), outlines drawn in the text's colour,
-  until the drawing path has colour glyphs. Emoji blocks are a "script" in
+- **Emoji**: Noto Color Emoji (the upstream COLRv1 build, `Noto-COLRv1.ttf`
+  from `googlefonts/noto-emoji`, 5 MB: COLR paint graphs over `glyf`
+  outlines, no bitmap or SVG tables) where colour glyphs can be drawn, and
+  Noto Emoji (Regular, Bold) outlines in the text's colour everywhere else.
+  `SCRIPTS` and the fallbacks name the outline family; a drawer with colour
+  takes `Library::color_twin` of it first. A character followed by VS16
+  (U+FE0F) takes the emoji face even when a text face has it (❤️, ☺️,
+  keycaps). Emoji blocks are a "script" in
   `SCRIPTS`, so a run of them is shaped whole: ZWJ sequences, skin tones and
   flags come out as one glyph; joiners, variation selectors, skin tone
   modifiers and tag characters stay with the face of what they follow.
@@ -95,7 +101,14 @@ Sans, Symbols, Symbols 2, Math and Serif.
   script, are shaped whole with rustybuzz (conjuncts, vowel signs, Arabic
   joining, right-to-left order within the run); the run's own Latin text stays
   one glyph per character, as Pergola measures it. Fallback glyphs share the
-  run's atlas page, so a run is still one slot.
+  run's atlas page, so a run is still one slot. Emoji take Noto Color Emoji:
+  `atrium-colr` draws the COLRv1 (or v0) glyph to RGBA (skrifa's paint
+  graph, tiny-skia; sweep gradients are drawn as their middle stop), into a
+  512×512 RGBA twin of the run's page at `color_atlas_slot(slot)`; the
+  glyph's `atlas_u` carries `GLYPH_COLOR`, and the renderer takes the texel's
+  colour (times the run's alpha) instead of the run's colour. A space after
+  an emoji is the run font's, not the emoji face's (whose space is as wide as
+  an emoji).
 
 ## 5. Installed font packages
 
@@ -167,7 +180,9 @@ a Japanese label in the VM.
   paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
-- Colour emoji waits on colour glyph support (Noto Emoji outlines meanwhile). Opifex installs font
+- Colour emoji is drawn by frescod (Pergola `Text` nodes, labels).
+  officina-text's drawing (Write, Slides, the PDF export) and Pergola's
+  client-side glyph atlas still draw the Noto Emoji outlines. Opifex installs font
   packages (opifex.md §14.7: `opifex font pack`, the pin list written by
   opifexd); the CJK packages wait on being published to the catalog. Han forms follow the run's kana or Hangul and
   the document's language, then the locale; a per-person language setting

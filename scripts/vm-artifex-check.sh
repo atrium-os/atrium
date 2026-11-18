@@ -41,6 +41,7 @@ xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bi
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex --bin artifex"
+[ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
 
 echo "=== install"
 B=/var/tmp/artifexchk
@@ -174,9 +175,12 @@ fi
 [ -z "${KEEP_RUST:-}" ] || RUST=kept
 
 echo "=== the workspace"
+V "rm -rf $B/c-app; mkdir -p $B/c-app" && scp -q $K -P 2222 "$ROOT"/sdk/templates/c-app/*.tmpl root@localhost:$B/c-app/
 V "service atrium-jaild status >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1; sleep 1; test -S /var/run/atrium/jaild.sock" && ok "jaild is up" || bad "no jaild"
 W=/home/alice/.atrium/workspaces
 for w in scratch proj; do V "su -m alice -c 'portcullis workspace stop $w'" >/dev/null 2>&1; done
+# A dev app an earlier run started (Run refuses while it runs).
+V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
 V "for m in \$(mount -p | awk '\$2 ~ /workspaces\/alice|jails\/$ART\/work/ {print \$2}' | sort -r); do umount -f \$m; done; rm -rf $W /var/lib/atrium/workspaces/alice /var/db/atrium/alice/workspace-picks /var/run/atrium/ide"
 V "su -m alice -c 'portcullis workspace list'" >/dev/null 2>&1
 V "su -m alice -c 'portcullis workspace new proj --network none${RUST:+ --toolchain rust}'" >/dev/null 2>&1
@@ -196,6 +200,15 @@ printf '# proj\n' > $W/proj/work/README.md
 mkdir -p $W/proj/work/rs
 printf '[package]\nname = "rs"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "rs"\npath = "main.rs"\n' > $W/proj/work/rs/Cargo.toml
 printf 'mod missing;\n\nfn main() {\n    let n: i32 = "one";\n    println!("{n}");\n}\n' > $W/proj/work/rs/main.rs
+# A C app from the c-app template (cargo atrium new --template c-app), for
+# the composition panel and Run.
+if [ -f /usr/share/mk/atrium.app.mk ]; then
+    mkdir -p $W/proj/work/app
+    T=$B/c-app
+    sed 's/{{name}}/app/g' \$T/Makefile.tmpl > $W/proj/work/app/Makefile
+    sed 's/{{name}}/app/g; s/{{title}}/App/g; s/{{id}}/org.example.app/g' \$T/atrium.toml.tmpl > $W/proj/work/app/atrium.toml
+    sed 's/{{name}}/app/g; s/{{title}}/App/g' \$T/main.c.tmpl > $W/proj/work/app/app.c
+fi
 chown -R alice:files-alice $W/proj/work; chmod -R g+rwX $W/proj/work
 EOS
 check "proj made with hello.c" "1" "$(V "test -f $W/proj/work/hello.c && echo 1")"
@@ -258,11 +271,60 @@ else
     echo "  (RUST not set: skipped)"
 fi
 
+echo "=== composition and Run"
+if V "test -f $W/proj/work/app/Makefile"; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    ROW=$(rows | grep -n '^app$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'rows=\[[^]]*app/app.c' 20 || bad "app: $(state)"
+    ROW=$(rows | grep -n '^app/app.c$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[[^]]*app/app.c\]' 20 && ok "app.c of a c-app project opens" || bad "app.c: $(state)"
+    waitstate 'comp=Some(("org.example.app", 0))' 20 && ok "the composition panel has its core (org.example.app, no workers)" || bad "composition: $(state)"
+    ctrl 0x15                  # Ctrl+R: the project's Run task (make run)
+    waitstate 'ask=Some("app")' 300 && ok "make run builds it and asks to Run app in Artifex" || bad "ask: $(state) $(V "tail -5 $B/artifex.log")"
+    shot artifex-6-ask
+    # The question's Run button (ui.rs: over the output, right-aligned).
+    GAP=8 press 980 520
+    DEV=dev.alice.proj.org.example.app
+    waitstate "note=Some(\"Running $DEV\")" 120 && ok "a press on Run starts it as a dev app ($DEV)" || bad "run: $(state) $(V "grep -i 'Run\|REFUSED' $LOG | tail -3")"
+    waitstate 'running=None' 60 && ok "and make run ends" || bad "make run still running: $(state)"
+    sleep 15
+    V "grep -q 'no window' $LOG" && bad "the app has no window: $(V "grep -A2 'atrium_init' $LOG | tail -3")"
+    V "grep -q '$DEV (a Run) exited' $LOG" && bad "it ended: $(V "grep '$DEV (a Run) exited' $LOG")" || ok "its window stays up"
+    shot artifex-7-dev-app
+else
+    echo "  (no C SDK in the base (install-c-sdk.sh): skipped)"
+fi
+
 echo "=== terminal"
+GAP=8 press 700 640       # Artifex has the focus again (a dev app may have it)
 press 1080 52              # the bar's Terminal button
 i=0; while [ $i -lt 30 ] && ! V "grep -q 'console in workspace/proj' $LOG"; do sleep 2; i=$((i+2)); done
 V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's terminal" || bad "terminal: $(V "grep -i console $LOG | tail -2")"
 shot artifex-4-terminal
+
+echo "=== under Forum"
+if [ -n "${FORUM:-}" ]; then
+    # Forum's WM core over the same frescod: it places every window by role
+    # (forum.md §2). The dev app is started again, from the person's CLI.
+    V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+    scp -q $K -P 2222 "$ROOT/forum-wm/target/$TARGET/release/forum-wm" root@localhost:$B/
+    V "cd $B && env FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock FRESCO_WM_SOCKET=$B/wm.sock FORUM_CTL_SOCKET=$B/ctl.sock \
+       FORUM_STATUS_SOCKET=$B/status.sock FORUM_STATE=$B/forum-state daemon -f -o $B/wm.log $B/forum-wm </dev/null"
+    sleep 20
+    V "pgrep -x forum-wm >/dev/null" && ok "forum-wm is up" || bad "forum-wm: $(V "tail -5 $B/wm.log")"
+    shot artifex-8-forum
+    n=$(V "wc -l < $LOG" | tr -d ' ')
+    out=$(V "su -m alice -c 'portcullis workspace run proj app'" 2>&1)
+    echo "$out" | grep -q '^dev.alice.proj.org.example.app' && ok "Run again from the CLI" || bad "cli run: $out"
+    sleep 25
+    V "tail -n +$((n+1)) $LOG | grep -q 'dev.alice.proj.org.example.app (a Run) exited\|no window'" && bad "it ended: $(V "tail -3 $LOG")" || ok "the dev app runs under Forum"
+    shot artifex-9-forum-dev-app
+    V "tail -15 $B/wm.log" | sed 's/^/  wm: /'
+else
+    echo "  (FORUM not set: skipped)"
+fi
 
 echo "artifex: $fails failed"
 [ $fails = 0 ]

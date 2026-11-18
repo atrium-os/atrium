@@ -5,7 +5,13 @@
 //!   /var/run/atrium/limend.sock)
 //! - `LIMEN_APP_REGISTRY` (default the launch registry)
 //! - `LIMEN_DEFAULTS`: `role=app-id,...`, the provider of each user role
-//!   until Curia holds the user's choice (limen.md §3.2).
+//!   until Curia holds the user's choice (limen.md §3.2); a role it doesn't
+//!   name goes to an installed app whose `[roles] implements` has it
+//!   ([`limen::manifests::Installed::provider`]).
+//!
+//! A parent may embed only the roles its installed manifest's
+//! `[capabilities] embeds` names (a platform bundle without `embeds` keeps
+//! every role, as before).
 //!
 //! - `LIMEN_ARCA_UID`: the uid of arca-ui, the `credential` provider
 //!   (default 65021, `_arca-ui`); only it may provide that role.
@@ -36,14 +42,21 @@ fn main() -> std::io::Result<()> {
         let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
         reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string()))
     });
-    let defaults = Box::new(move |_user: &str, role: &str| {
+    // A role's provider: LIMEN_DEFAULTS, else from installed manifests'
+    // [roles] implements (app-composition.md §5.1).
+    let installed = limen::manifests::Installed::default();
+    let inst = installed.clone();
+    let defaults = Box::new(move |user: &str, role: &str| {
         defaults.iter().find(|(r, _)| r == role).map(|(_, a)| a.clone())
+            .or_else(|| inst.provider(user, role))
     });
     let arca_uid: u32 = std::env::var("LIMEN_ARCA_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(65021);
     let shared = Shared::new(Box::new(limen::fresco::Frescod::new(std::env::var("LIMEN_FRESCOD_ACTIVATION").unwrap_or_else(|_| limen::fresco::DEFAULT_SOCKET.into()))), Box::new(limen::launch::Portcullis::new(std::env::var("LIMEN_USER").unwrap_or_else(|_| "_limen".into()))), resolve, defaults);
     // arca-ui, the credential provider, is a system service (`_arca-ui`),
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
+    // Who may embed what: the parent's installed manifest (`embeds`).
+    shared.set_embed_check(Box::new(move |app: &str, role: &str| installed.may_embed(app, role)));
     shared.set_attribution(Box::new(limen::audio::Choragus::new(
         std::env::var("LIMEN_CHORAGUS").unwrap_or_else(|_| limen::audio::DEFAULT_SOCKET.into()))));
     if let Some(d) = std::path::Path::new(&path).parent() {
