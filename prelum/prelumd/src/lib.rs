@@ -9,4 +9,5 @@ pub mod jail;
 pub mod launch;
 pub mod nearby;
 pub mod server;
+pub mod sheet;
 pub mod store;

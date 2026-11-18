@@ -428,6 +428,7 @@ enum Job {
     Apps(scrinium::browser::OpenReq, Result<Vec<scrinium::browser::Choice>, String>),
     /// How handing it to its app went.
     Handed(scrinium::browser::OpenReq, Result<String, String>),
+    Installed(scrinium::browser::OpenReq, Result<scrinium::install::Outcome, String>),
     /// Quick look's read: what to show, and the file for a viewer.
     Looked(std::path::PathBuf, std::io::Result<(scrinium::browser::LookBody, Option<std::fs::File>)>),
     /// A share's "connect at login", as dispensatord answered.
@@ -760,6 +761,11 @@ impl Network {
                     });
                     let _ = tx.send(Job::Handed(req, r));
                 }
+                OpenStep::Install(req) => {
+                    let r = scrinium::fs::open_for_app(&req.path, false).map_err(|e| scrinium::browser::err_text(&e))
+                        .and_then(|(f, _)| scrinium::install::side_load(&f));
+                    let _ = tx.send(Job::Installed(req, r));
+                }
             });
         }
         // Quick look: read off this thread; a viewer gets the file.
@@ -813,6 +819,7 @@ impl Network {
                 Job::Typed(req, r) => b.typed(req, r),
                 Job::Apps(req, r) => b.apps(req, r),
                 Job::Handed(req, r) => b.handed(&req, r),
+                Job::Installed(req, r) => b.installed(&req, r),
                 Job::Looked(path, r) => match r {
                     Ok((body, file)) => {
                         b.looked(&path, Ok(body));

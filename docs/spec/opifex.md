@@ -397,7 +397,8 @@ which `opifexd` refuses.
 
 Through the sheet (built 2026-11-18): the asker (Scrinium, for a double-clicked `.insula`)
 sends `Ask::SideLoad` with the open file attached (`SCM_RIGHTS`, `opifex::fdpass`), never a
-path; `opifex_sheet::side_load(&file)` does it. The sheet passes the descriptor to opifexd
+path; `opifex_sheet::side_load(&file)` does it, and Scrinium does the same for a double-clicked
+bundle (`scrinium::install`; the file manager's `removable-files` mounts the sheet's socket). The sheet passes the descriptor to opifexd
 (`PreviewLocal { for_uid }`, from the sheet's uid or root only), which copies it (at most 4 GB)
 into `state/held/<token>.insula`, unpacks it with the worker, and answers `LocalPreview` only
 for an app signed by a key on the side-load list and not installed from a catalog. The sheet

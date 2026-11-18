@@ -7,7 +7,10 @@
 //! is embedded once as a TrueType subset of the glyphs used (CIDs are glyph
 //! ids, with a ToUnicode map so text copies and searches); each picture is
 //! embedded once (JPEG as it is, anything else decoded and deflated); links
-//! become URI annotations (http, https and mailto only).
+//! become URI annotations (http, https and mailto only). Colour glyphs
+//! (emoji of Noto Color Emoji) are drawn as pictures, each glyph once
+//! ([`EMOJI_PX`] to the em), over their text written invisibly, so the
+//! text still copies and searches.
 
 /// The TrueType subsetter, now Folium's (folium.md §5.1).
 pub use folium_font::subset as font;
@@ -27,6 +30,20 @@ use officina_text::{twips, LU};
 
 /// Layouts are dropped after this many pages (memory stays flat).
 pub const CACHE_PAGES: usize = 64;
+
+/// A colour glyph's picture: pixels to the em.
+pub const EMOJI_PX: f32 = 160.0;
+
+/// A colour glyph written as a picture: its object, size and where it
+/// hangs off the pen (pixels at [`EMOJI_PX`]).
+#[derive(Clone, Copy)]
+struct Emoji {
+    obj: Ref,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+}
 
 /// Where face files come from.
 pub trait FontFiles {
@@ -134,6 +151,8 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
     let mut kids = Vec::with_capacity(total);
     let mut fonts_used: BTreeMap<u16, FontUse> = BTreeMap::new();
     let mut images: HashMap<u32, Option<Ref>> = HashMap::new();
+    let mut color_faces: HashMap<u16, bool> = HashMap::new();
+    let mut emoji: HashMap<(u16, u16), Option<Emoji>> = HashMap::new();
     let mut stats = Stats { pages: total, ..Default::default() };
 
     for (i, pg) in pages.iter().enumerate() {
@@ -147,6 +166,7 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
         let mut annots = Vec::new();
         let mut page_fonts: BTreeSet<u16> = BTreeSet::new();
         let mut page_images: BTreeSet<u32> = BTreeSet::new();
+        let mut page_emoji: BTreeSet<(u16, u16)> = BTreeSet::new();
         for it in items {
             match it {
                 Item::Rect { x, y, w, h, color } => {
@@ -234,7 +254,11 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
                     if size <= 0.0 {
                         continue;
                     }
+                    let color = *color_faces.entry(r.face).or_insert_with(|| atrium_colr::is_color_font(bytes));
                     c.extend([Op::BeginText, Op::Font(format!("F{}", r.face), size), Op::FillRgb(rgb(r.color))]);
+                    if color {
+                        c.push(Op::TextRender(3));
+                    }
                     // Glyphs on the baseline in one TJ; a glyph raised or
                     // lowered starts a new one with a rise.
                     let mut k = 0;
@@ -273,7 +297,36 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
                         }
                         c.push(Op::ShowArray(parts));
                     }
+                    if color {
+                        c.push(Op::TextRender(0));
+                    }
                     c.push(Op::EndText);
+                    if color {
+                        // The pictures, each on its glyph's pen position.
+                        let [ta, tb, tc, td] = r.turn.unwrap_or([1.0, 0.0, 0.0, 1.0]);
+                        let px = size / EMOJI_PX as f64;
+                        for g in &r.glyphs {
+                            let e = match emoji.get(&(r.face, g.id)) {
+                                Some(e) => *e,
+                                None => {
+                                    let e = write_emoji(&mut o, bytes, g.id)?;
+                                    emoji.insert((r.face, g.id), e);
+                                    e
+                                }
+                            };
+                            let Some(e) = e else { continue };
+                            page_emoji.insert((r.face, g.id));
+                            let gx = g.x as f64;
+                            let (sx, sy) = (r.x as f64 + ta * gx, r.y as f64 + tb * gx);
+                            c.extend([
+                                Op::Save,
+                                Op::Transform([ta, -tb, -tc, td, pt_f(sx), ph - pt_f(sy)]),
+                                Op::Transform([e.w as f64 * px, 0.0, 0.0, e.h as f64 * px, e.left as f64 * px, (e.top as f64 - e.h as f64) * px - pt(g.dy)]),
+                                Op::XObject(format!("Em{}_{}", r.face, g.id)),
+                                Op::Restore,
+                            ]);
+                        }
+                    }
                 }
             }
         }
@@ -288,10 +341,13 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
             }
             res.insert("Font", Object::Dict(f));
         }
-        if !page_images.is_empty() {
+        if !page_images.is_empty() || !page_emoji.is_empty() {
             let mut x = Dict::new();
             for im in &page_images {
                 x.insert(&format!("Im{im}"), reference(images[im].expect("written")));
+            }
+            for k in &page_emoji {
+                x.insert(&format!("Em{}_{}", k.0, k.1), reference(emoji[k].expect("written").obj));
             }
             res.insert("XObject", Object::Dict(x));
         }
@@ -385,6 +441,27 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
     Ok((w, stats))
 }
 
+/// Colour glyph `gid` of `face` as an image XObject (RGB with a soft mask);
+/// None when the face has no colour version of it.
+fn write_emoji<W: Write>(o: &mut Writer<W>, face: &[u8], gid: u16) -> io::Result<Option<Emoji>> {
+    let Some(bm) = atrium_colr::render(face, gid as u32, EMOJI_PX, [0.0, 0.0, 0.0, 1.0]) else { return Ok(None) };
+    let (w, h) = (bm.width, bm.height);
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    let mut alpha = Vec::with_capacity((w * h) as usize);
+    for p in bm.rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&p[..3]);
+        alpha.push(p[3]);
+    }
+    let head = |cs: &str| dict([("Type", name("XObject")), ("Subtype", name("Image")), ("Width", int(w as i64)), ("Height", int(h as i64)), ("ColorSpace", name(cs)), ("BitsPerComponent", int(8))]);
+    let m = o.reserve();
+    o.stream(m, head("DeviceGray"), &alpha, true)?;
+    let mut d = head("DeviceRGB");
+    d.insert("SMask", reference(m));
+    let n = o.reserve();
+    o.stream(n, d, &rgb, true)?;
+    Ok(Some(Emoji { obj: n, w, h, left: bm.left, top: bm.top }))
+}
+
 /// Picture `image` as an image XObject; None when it can't be read.
 fn write_image<W: Write>(o: &mut Writer<W>, doc: &TextDoc, image: u32) -> io::Result<Option<Ref>> {
     let Some(data) = doc.images.get(image) else { return Ok(None) };
@@ -447,5 +524,19 @@ mod tests {
         assert_eq!(stats.pages, 1);
         assert_eq!(stats.fonts, 3, "Carlito, Noto Sans Devanagari, Noto Sans Tamil");
         assert!(pdf.len() > 1000);
+    }
+
+    /// Emoji: the colour face's text written invisibly (still copies), each
+    /// glyph once as a picture with a soft mask.
+    #[test]
+    fn emoji_are_pictures_over_invisible_text() {
+        let fonts = PinnedFonts::new().unwrap();
+        let mut d = TextDoc::new();
+        d.blocks.update(0, |b| b.as_para_mut().unwrap().text = "Hi 😀🚀😀".to_string());
+        let (pdf, stats) = export(&d, &fonts, &fonts, &Info::default(), Vec::new(), &mut |_, _| {}).unwrap();
+        assert_eq!(stats.fonts, 2, "IBM Plex Sans, Noto Color Emoji");
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("/Em"), "the page names the pictures");
+        assert_eq!(text.matches("/SMask").count(), 2, "two emoji pictures, one each");
     }
 }

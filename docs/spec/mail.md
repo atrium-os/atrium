@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP sync runs in a jailed worker.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1382,6 +1382,22 @@ Stalwart in the cloud VM, and later a real account):
    not running, the account and its mail are still removed and the note says to remove
    the password in Arca. Tests: arcad 1 (own endpoint only, not another app's, plain
    DELETE refused), app 2.
+   **IMAP sync in its own process (2026-11-18)**: `mail-sync-worker` is Mail's `sync`
+   worker (`[[workers]]`, `lifetime = "session"`, app-composition.md §4): a jail of its
+   own as a uid of its own with no capability, one per IMAP session. It runs the
+   session and parses every byte the server sends. The engine keeps the courier and
+   relays its bytes to the worker over the worker's standard input and output, and the
+   worker asks the engine for what sync needs from the store, call by call
+   (`mail_sync::remote`: framed postcard, 64 MiB at most; a quiet server's wait is the
+   engine's, passed on so an `IDLE` renews). Sync, the draft copies, the Sent copy and
+   the IDLE watch all go through it. Off Atrium, Mail runs `mail-sync-worker` beside
+   itself as a plain child, and with neither, the session runs in Mail's process as
+   before. Tests: the wire 3 (the same store calls as in-process, APPEND, IDLE with news
+   and with a passed wait, a dead worker is an error), Dovecot 1 (two passes with sync
+   in the worker; the whole Dovecot suite passes that way too). **Not yet**: one uid per
+   account (workers have one uid per app worker, not per account); SMTP submission and
+   JMAP still parse their answers in Mail's process; the engine is not yet a process of
+   its own apart from the window.
 
 ## 17. Decisions, with recommendations
 

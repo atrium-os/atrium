@@ -292,3 +292,32 @@ fn content_sanitizer() {
     pdf::sanitize_content(b"q 1 0 0 1 5 5 cm (a\\)b) Tj 1 2 3 4 5 6 7 8 9 10 bogus 3 0 R w Q %comment\n[1 (x)] TJ", &mut out).unwrap();
     assert_eq!(String::from_utf8_lossy(&out), "q\n1 0 0 1 5 5 cm\n(a\\)b) Tj\nQ\n[1 (x)] TJ\n");
 }
+
+#[test]
+fn previews_are_small_and_laid_out_like_the_print() {
+    let doc = open(pdf(&[(612.0, 792.0, 0, SQUARE), (612.0, 792.0, 0, SQUARE), (612.0, 792.0, 0, ""), (612.0, 792.0, 0, SQUARE), (612.0, 792.0, 0, SQUARE)]));
+    let mut s = settings(vec![0, 1, 2, 3, 4]);
+    s.dpi = 300;
+    s.per_sheet = 2;
+    let (sheets, v) = preview(&doc, &s, 2, 2, 200, &|| false).unwrap();
+    assert_eq!(sheets, 3);
+    assert_eq!(v.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![2, 3], "only the sheets asked for");
+    let p = &v[0];
+    assert!(p.h <= 200 && p.h >= 190 && p.w < p.h, "{}x{}", p.w, p.h);
+    assert_eq!(p.rgb.len(), (p.w * p.h * 3) as usize);
+    let dark_in = |p: &Preview, top: bool| {
+        let (a, b) = if top { (0, p.h / 2) } else { (p.h / 2, p.h) };
+        (a..b).flat_map(|y| (0..p.w).map(move |x| (x, y))).filter(|&(x, y)| p.rgb[((y * p.w + x) * 3) as usize] < 64).count()
+    };
+    // Sheet 2 holds pages 3 (empty) and 4.
+    assert_eq!(dark_in(p, true), 0);
+    assert!(dark_in(p, false) > 0);
+    // Past the end: nothing, but the count.
+    let (sheets, v) = preview(&doc, &s, 9, 4, 200, &|| false).unwrap();
+    assert_eq!((sheets, v.len()), (3, 0));
+    // Never larger than the cap, never more than MAX_PREVIEWS.
+    s.per_sheet = 1;
+    let (_, v) = preview(&doc, &s, 1, 50, 5000, &|| false).unwrap();
+    assert_eq!(v.len(), 5);
+    assert!(v.iter().all(|p| p.w.max(p.h) <= MAX_PREVIEW));
+}

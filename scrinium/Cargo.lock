@@ -833,6 +833,7 @@ dependencies = [
  "log",
  "pergola",
  "portcullis-ipc",
+ "serde_json",
 ]
 
 [[package]]

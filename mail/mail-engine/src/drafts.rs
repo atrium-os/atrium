@@ -2,7 +2,6 @@
 //! (a crash loses nothing) and the engine copies them to the server's
 //! Drafts folder now and then, each copy replacing the last.
 
-use std::io::{Read, Write};
 
 use mail_compose::{Draft, Stamp};
 use mail_store::{AccountId, OpKind, Role};
@@ -60,7 +59,7 @@ impl Engine {
     /// each draft that rested `rest` seconds and changed since its last
     /// copy, and queue the deletion of copies it replaced (sync makes them
     /// once it has seen them). How many were copied.
-    pub fn copy_drafts<S: Read + Write>(&self, account: AccountId, imap: &mut mail_sync::Session<S>, rest: i64) -> Result<usize, Error> {
+    pub fn copy_drafts(&self, account: AccountId, imap: &mut dyn mail_sync::remote::Imap, rest: i64) -> Result<usize, Error> {
         let Some((folder, f)) = self.store.folders(account)?.into_iter().find(|(_, f)| f.role == Role::Drafts && !f.hidden) else {
             return Ok(0);
         };

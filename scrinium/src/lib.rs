@@ -16,6 +16,7 @@ pub mod browser;
 pub mod connect;
 pub mod shares;
 pub mod fs;
+pub mod install;
 pub mod open;
 pub mod places;
 pub mod view;

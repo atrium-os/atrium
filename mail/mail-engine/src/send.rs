@@ -213,7 +213,7 @@ impl Engine {
 
     /// File a sent message's `copy` in the account's Sent folder (seen), on
     /// `imap`. False when the account has no Sent folder.
-    pub fn file_sent<S: Read + Write>(&self, account: AccountId, imap: &mut mail_sync::Session<S>, copy: &[u8]) -> Result<bool, Error> {
+    pub fn file_sent(&self, account: AccountId, imap: &mut dyn mail_sync::remote::Imap, copy: &[u8]) -> Result<bool, Error> {
         let Some(name) = self.sent_folder(account)? else { return Ok(false) };
         imap.append(&name, &["\\Seen"], copy).map_err(|e| Error::Sync(e.to_string()))?;
         Ok(true)
