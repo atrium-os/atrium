@@ -16,6 +16,9 @@ notify   = true
 # Starts an app whose notification action was pressed while it wasn't
 # running (tabula.md §5.3); portcullisd does the checks, as for the dock.
 app-launch = true
+# frescod's activation socket, to grant a press on a toast's action to the
+# app that posted it (restricted: Forum's shelf only).
+notification-shelf = true
 network  = "none"
 # Limen roles it embeds. Without this key a platform bundle keeps every role.
 embeds = []

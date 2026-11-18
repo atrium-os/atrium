@@ -1,12 +1,12 @@
 //! forum-shelf — subscribes to praecod and draws toasts.
 //!
-//! `PRAECO_SOCKET` (default `/var/run/atrium/praecod.sock`). Runs as a
+//! praecod: `praeco::client::socket()`. Runs as a
 //! chrome surface; frescod's notification layer (Fresco thread) is where
 //! it will sit above every app, clamped to its band.
 //!
 //! A click on a toast's action (tabula.md §5.3): the shelf has frescod
-//! (`SHELF_FRESCOD_ACTIVATION`, default
-//! `/var/run/atrium/fresco-activation.sock`) grant that press to the
+//! (`SHELF_FRESCOD_ACTIVATION`; by default the jail's
+//! `/atrium/sockets/fresco-activation/`, else `/var/run/atrium/`) grant that press to the
 //! posting app's uid, which only Forum's uid may (`FRESCOD_FORUM_UID`),
 //! and hands it to praecod with the action. If the app isn't listening,
 //! the shelf starts it through portcullisd (`app-launch`), in its
@@ -85,8 +85,13 @@ fn act(praeco: &str, activation: &str, n: &proto::Notification, p: Pressed) {
 }
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::var("PRAECO_SOCKET").unwrap_or_else(|_| "/var/run/atrium/praecod.sock".into());
-    let activation = std::env::var("SHELF_FRESCOD_ACTIVATION").unwrap_or_else(|_| "/var/run/atrium/fresco-activation.sock".into());
+    let path = praeco::client::socket().to_string_lossy().into_owned();
+    // In its jail (`notification-shelf`), frescod's activation socket is
+    // under /atrium/sockets; on the host, /var/run/atrium.
+    let jailed = "/atrium/sockets/fresco-activation/fresco-activation.sock";
+    let activation = std::env::var("SHELF_FRESCOD_ACTIVATION").unwrap_or_else(|_| {
+        if std::path::Path::new(jailed).exists() { jailed.into() } else { "/var/run/atrium/fresco-activation.sock".into() }
+    });
     let praeco_path = path.clone();
     let user = portcullis_peer::current_username().unwrap_or_default();
     let (tx, rx) = mpsc::channel();
@@ -121,6 +126,9 @@ fn main() -> std::io::Result<()> {
             match ev {
                 Event::Posted(n) => s.posted(n, now()),
                 Event::Withdrawn { id } => s.withdrawn(id, now()),
+                // praecod names the person a jailed shelf is for (its own
+                // uid's user is the app's, not the person's).
+                Event::Person { user } => s.user = user,
             }
             changed = true;
         }

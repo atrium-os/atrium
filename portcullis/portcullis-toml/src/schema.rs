@@ -419,6 +419,11 @@ pub struct Capabilities {
     /// `arca-courier/`). Restricted to the Navigator's bundle.
     #[serde(rename = "navigator-broker")]
     pub navigator_broker: Option<bool>,
+    /// Forum's notification shelf (tabula.md §5.5): frescod's
+    /// `fresco-activation/`, where it has a press on a toast's action
+    /// granted to the app that posted it. Restricted to the shelf.
+    #[serde(rename = "notification-shelf")]
+    pub notification_shelf: Option<bool>,
     /// The file manager's standing grant (device-assignment.md §4.8): every
     /// served stick, read-write, in its own jail at `/media/<part>`, for as
     /// long as the jail runs. Implies the `removable-media/` socket (it asks
@@ -541,7 +546,7 @@ impl Capabilities {
             ("display-settings", self.display_settings), ("network-details", self.network_details),
             ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
             ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
-            ("navigator-broker", self.navigator_broker),
+            ("navigator-broker", self.navigator_broker), ("notification-shelf", self.notification_shelf),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
             ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
@@ -753,6 +758,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         network_configure: ovr.network_configure.or(base.network_configure),
         navigator_page:   ovr.navigator_page.or(base.navigator_page),
         navigator_broker: ovr.navigator_broker.or(base.navigator_broker),
+        notification_shelf: ovr.notification_shelf.or(base.notification_shelf),
         removable_files:  ovr.removable_files.or(base.removable_files),
         file_picker:      ovr.file_picker.or(base.file_picker),
         home_files:       ovr.home_files.or(base.home_files),

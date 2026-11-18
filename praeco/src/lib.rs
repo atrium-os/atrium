@@ -149,6 +149,10 @@ pub mod proto {
     pub enum Event {
         Posted(Notification),
         Withdrawn { id: u64 },
+        /// First on a subscription by an app Portcullis launched (Forum's
+        /// shelf, jailed): the person it is for. Only that person's
+        /// notifications (and system services') follow.
+        Person { user: String },
     }
 
     /// `Notification::user` of a post from a system service (praecod's
@@ -297,7 +301,8 @@ pub mod server {
         next_id: u64,
         rate: RateLimit,
         history: VecDeque<(u32, Notification)>,
-        subscribers: Vec<mpsc::Sender<Event>>,
+        /// Each with the person it is for (None: a host subscriber, all).
+        subscribers: Vec<(Option<String>, mpsc::Sender<Event>)>,
         /// Apps listening for their actions, by uid.
         listeners: Vec<(u32, mpsc::Sender<Acted>)>,
         /// Actions whose app wasn't listening yet.
@@ -319,7 +324,10 @@ pub mod server {
         }
 
         fn broadcast(st: &mut State, ev: Event) {
-            st.subscribers.retain(|s| s.send(ev.clone()).is_ok());
+            st.subscribers.retain(|(p, s)| match (&ev, p) {
+                (Event::Posted(n), Some(p)) if n.user != *p && n.user != proto::SYSTEM_USER => true,
+                _ => s.send(ev.clone()).is_ok(),
+            });
         }
 
         /// Post as `uid`: the v0 payload. Returns `(status, id)`.
@@ -469,14 +477,17 @@ pub mod server {
         }
 
         /// A subscriber's stream: the history so far, then what comes.
-        fn subscribe(&self, uid: u32) -> Option<(Vec<Notification>, mpsc::Receiver<Event>)> {
+        fn subscribe(&self, uid: u32) -> Option<(Option<String>, Vec<Notification>, mpsc::Receiver<Event>)> {
             if !self.subscribers_allowed.contains(&uid) {
                 return None;
             }
+            let person = (self.resolve)(uid).map(|(u, _)| u).filter(|u| u != proto::SYSTEM_USER);
             let (tx, rx) = mpsc::channel();
             let mut st = self.state.lock().unwrap();
-            st.subscribers.push(tx);
-            Some((st.history.iter().map(|(_, n)| n.clone()).collect(), rx))
+            st.subscribers.push((person.clone(), tx));
+            let history = st.history.iter().map(|(_, n)| n.clone())
+                .filter(|n| person.as_ref().is_none_or(|p| n.user == *p || n.user == proto::SYSTEM_USER)).collect();
+            Some((person, history, rx))
         }
     }
 
@@ -550,12 +561,15 @@ pub mod server {
                     reply(&mut conn, op::WITHDRAW, st, 0)?;
                 }
                 op::SUBSCRIBE => {
-                    let Some((history, rx)) = shared.subscribe(uid) else {
+                    let Some((person, history, rx)) = shared.subscribe(uid) else {
                         reply(&mut conn, op::SUBSCRIBE, status::NOT_ALLOWED, 0)?;
                         continue;
                     };
                     reply(&mut conn, op::SUBSCRIBE, status::OK, 0)?;
                     // From here this connection only streams.
+                    if let Some(user) = person {
+                        send_ev(&mut conn, &Event::Person { user })?;
+                    }
                     for n in history {
                         send_ev(&mut conn, &Event::Posted(n))?;
                     }

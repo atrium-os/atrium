@@ -1,8 +1,8 @@
 #!/bin/sh
 # Notification actions (docs/spec/tabula.md §5.3) in the amd64 cloud VM, on
 # headless frescod with its real activation table and injected clicks.
-# portcullisd launches two signed test apps (praeco-demo) in their jails;
-# praecod and Forum's shelf run on the host. Runs on the HOST; ends
+# portcullisd launches Forum's shelf (with `notification-shelf`) and three
+# signed test apps (praeco-demo) in their jails; praecod runs on the host. Runs on the HOST; ends
 # "notify-actions: N failed".
 #
 #   ARCH=amd64 QEMU_BIN=$HOME/qemu-atrium/build/qemu-system-x86_64 \
@@ -82,11 +82,17 @@ for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
   g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
 done
 
-echo "== install signed bundles: Chat, Cover and Reminder"
+put "$ROOT/forum-shelf/atrium.toml" "$W/shelf.toml" || die "copy the shelf's manifest"
+echo "== install signed bundles: Forum's shelf, Chat, Cover and Reminder"
 g "set -e
   test -f /root/e2e-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out /root/e2e-key.pem
   openssl ec -in /root/e2e-key.pem -pubout -out /root/e2e-pub.pem 2>/dev/null
   mkdir -p /etc/atrium/publishers && cp /root/e2e-pub.pem /etc/atrium/publishers/e2e.pem
+  /usr/local/bin/opifex uninstall org.atrium.forum-shelf >/dev/null 2>&1 || true
+  B=$W/b-shelf; mkdir -p \$B/bin; cp $W/forum-shelf \$B/bin/; cp $W/shelf.toml \$B/atrium.toml
+  openssl dgst -sha256 -sign /root/e2e-key.pem -out \$B/atrium.toml.sig \$B/atrium.toml
+  /usr/local/bin/opifex install \$B
+  /usr/local/bin/portcullis policy grant org.atrium.forum-shelf
   for n in chat:Chat cover:Cover reminder:Reminder; do
     id=\${n%%:*}; name=\${n#*:}
     /usr/local/bin/opifex uninstall org.example.\$id >/dev/null 2>&1 || true
@@ -96,32 +102,42 @@ g "set -e
     /usr/local/bin/opifex install \$B
     /usr/local/bin/portcullis policy grant org.example.\$id
   done" > "$OUT/install.log" 2>&1 || die "install: $(tail -5 "$OUT/install.log")"
-ok "three signed bundles installed"
+g "grep -q 'notification-shelf = true' /var/lib/atrium/apps/org.atrium.forum-shelf/atrium.toml" && ok "four signed bundles installed (the shelf with notification-shelf)" || bad "bundles: $(tail -3 "$OUT/install.log")"
 
 echo "== portcullisd, frescod, forum-wm, praecod, the shelf"
 # praecod runs as _praeco when the VM has it (frescod lets it spend ACTION);
-# the shelf runs as root here, so root is Forum (grants) and subscriber.
+# the shelf runs jailed as its own app uid, which is Forum to frescod (it
+# may grant), to frescod's notification layer, and to praecod (subscriber).
 PU=$(g "id -u _praeco 2>/dev/null" | tr -d '\r')
 if [ -n "$PU" ]; then AS="-u _praeco"; USES="0=open+console+approve+link,$PU=action"; else PU=0; AS=""; USES="0=open+console+approve+link+action"; fi
 g "mkdir -p /atrium/sockets/fresco /atrium/sockets/portcullis /atrium/sockets/notify /atrium/sockets/fresco-wm /atrium/sockets/forum-ctl
   rm -f $FSOCK $NSOCK /atrium/sockets/fresco-wm/fresco-wm.sock /atrium/sockets/forum-ctl/forum-ctl.sock
   pkill -x portcullisd; sleep 1; rm -f $PSOCK
   daemon -f -o $S/portcullisd.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3; test -S $PSOCK" || die "portcullisd start"
+# The shelf's uid: portcullisd gives each (person, app) a lasting one. A
+# first launch, before frescod is up, only finds it out.
+g "cd $S && timeout 60 /usr/local/bin/portcullis launch --no-prompt org.atrium.forum-shelf </dev/null >$S/shelf-dry.log 2>&1; true"
+SU=$(g "grep -o 'org.atrium.forum-shelf as uid [0-9]*' $S/portcullisd.log | tail -1 | grep -o '[0-9]*\$'" | tr -d '\r')
+[ -n "$SU" ] || die "no uid for the shelf: $(g "tail -3 $S/portcullisd.log $S/shelf-dry.log")"
+g "pkill -x forum-shelf; sleep 2; for j in \$(jls name | grep forum-shelf); do jail -r \$j; done 2>/dev/null; true"
 g "cd $S && env RUST_LOG=${RUST_LOG:-warn} FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute FRESCOD_RENDERER_LAUNCHER=unconfined FRESCOD_RENDERER_BIN=$W/fresco-renderer \
     FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$FSOCK FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 \
-    FRESCOD_NOTIFY_UIDS=0 FRESCOD_FORUM_UID=0 FRESCOD_ACTIVATION_UIDS=$USES \
+    FRESCOD_NOTIFY_UIDS=$SU FRESCOD_FORUM_UID=$SU FRESCOD_ACTIVATION_UIDS=$USES \
     FRESCOD_WM_SOCK=/atrium/sockets/fresco-wm/fresco-wm.sock \
     FRESCOD_INPUT_SOCK=$S/inject.sock daemon -f -o $S/frescod.log $W/frescod </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "test -S $FSOCK && test -S $ACT"; do sleep 2; i=$((i+1)); done
 sleep 20
 g "pgrep -x frescod >/dev/null" || die "frescod is not running: $(g "tail -3 $S/frescod.log")"
 g "chmod 666 $FSOCK $ACT; cd $S && env FRESCO_WM_SOCKET=/atrium/sockets/fresco-wm/fresco-wm.sock FORUM_CTL_SOCKET=/atrium/sockets/forum-ctl/forum-ctl.sock daemon -f -o $S/wm.log $W/forum-wm </dev/null"
-g "mkdir -p /var/run/atrium; chown ${PU} /atrium/sockets/notify; cd $S && env PRAECO_SOCKET=$NSOCK PRAECO_SUBSCRIBERS=0 PRAECO_FRESCOD_ACTIVATION=$ACT \
+g "mkdir -p /var/run/atrium; chown ${PU} /atrium/sockets/notify; cd $S && env PRAECO_SOCKET=$NSOCK PRAECO_SUBSCRIBERS=$SU PRAECO_FRESCOD_ACTIVATION=$ACT \
    daemon -f -o $S/praecod.log $AS $W/praecod </dev/null; for i in \$(seq 20); do [ -S $NSOCK ] && break; sleep 0.5; done; chmod 666 $NSOCK; test -S $NSOCK" \
   && ok "praecod up (uid $PU)" || die "praecod: $(g "cat $S/praecod.log")"
-g "cd $S && env FRESCO_SOCKET=$FSOCK PRAECO_SOCKET=$NSOCK SHELF_FRESCOD_ACTIVATION=$ACT daemon -f -o $S/shelf.log $W/forum-shelf </dev/null"
-sleep 25
-g "pgrep -x forum-shelf >/dev/null" && ok "the shelf runs" || die "shelf: $(g "tail -3 $S/shelf.log")"
+g "cd $S && daemon -f -o $S/shelf.log /usr/local/bin/portcullis launch --no-prompt org.atrium.forum-shelf </dev/null"
+sleep 40
+SH=$(g "ps -o jid= -o uid= -p \$(pgrep -x forum-shelf | head -1) 2>/dev/null" | tr -d '\r' | awk '{print $1, $2}')
+[ -n "${SH% *}" ] && [ "${SH% *}" != 0 ] && [ "${SH#* }" = "$SU" ] && ok "the shelf runs in a jail as its app uid ($SU)" || die "shelf: '$SH' $(g "tail -3 $S/shelf.log $S/portcullisd.log")"
+SM=$(g "mount -p | awk '{print \$2}' | grep 'forum-shelf.*/atrium/sockets/' | sed 's#.*/atrium/sockets/##' | sort | tr '\n' ' '" | tr -d '\r')
+case "$SM" in *fresco-activation*) ok "its jail has frescod's activation socket (mounts: $SM)" ;; *) bad "shelf mounts: '$SM'" ;; esac
 
 inj() { g "printf '$1\\n' | nc -N -U $S/inject.sock"; sleep ${KGAP:-2}; }
 press() { inj "MOVE $1 $2"; inj "BTN 1 1"; inj "BTN 1 0"; }
@@ -151,7 +167,10 @@ shot 2-raised
 echo "== an action without a granted press"
 NID=$(g "grep -o 'chat posted [0-9]*' $S/chat.log | grep -o '[0-9]*\$'" | tr -d '\r')
 R=$(g "cd $S && env PRAECO_SOCKET=$NSOCK $W/praeco-demo --forge $NID 2>&1" | tr -d '\r')
-case "$R" in *"status 7"*) ok "refused: no press (status 7)" ;; *) bad "forged act: $R" ;; esac
+case "$R" in *"status 5"*) ok "root, not Forum, acting: refused (status 5)" ;; *) bad "root's act: $R" ;; esac
+# As the shelf's uid (Forum), with a press frescod never minted.
+R=$(g "cp $W/praeco-demo /tmp/praeco-demo-forge; chmod 755 /tmp/praeco-demo-forge; cd /tmp && env PRAECO_SOCKET=$NSOCK su -m \$(id -nu $SU) -c '/tmp/praeco-demo-forge --forge $NID' 2>&1" | tr -d '\r')
+case "$R" in *"status 7"*) ok "Forum's uid with a forged press: refused (status 7)" ;; *) bad "forged act: $R" ;; esac
 
 echo "== Reminder posts and exits; a click on Archive starts it"
 g "cd $S && daemon -f -o $S/reminder.log /usr/local/bin/portcullis launch --no-prompt org.example.reminder </dev/null"

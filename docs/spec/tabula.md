@@ -482,16 +482,21 @@ Forum (§2.4). Built in `praeco/`, `forum-shelf/` and frescod's `GRANT`.
   action, that a press counts once, that an action is held and handed over when the app
   starts, that a gone listener doesn't count, and that a raise works once, for the posting app
   only, after a press. `forum-shelf` checks that a toast's actions are its buttons.
-  `scripts/vm-notify-actions-check.sh` passes 17/17 in the amd64 cloud VM on headless frescod
-  with forum-wm and injected clicks. Three signed test apps (`praeco-demo`, in
+  `scripts/vm-notify-actions-check.sh` passes 19/19 in the amd64 cloud VM on headless frescod
+  with forum-wm and injected clicks. The shelf itself runs in its jail as its app uid, with
+  `fresco`, `fresco-activation`, `notify` and `portcullis` mounted. Three signed test apps (`praeco-demo`, in
   `forum-shelf/src/bin`) run in their jails. Chat opens a window and posts with Archive and
   Reply, and a raise asked before any press is refused. Cover's window then covers Chat's. A
   click on Reply reaches Chat through frescod's grant and praecod's spend, and Chat's raise
   makes forum-wm bring its window forward. Reminder posts and exits; a click on Archive makes
   the shelf start it through portcullisd, and it hears "archive" from the hold. A forged
-  action gets status 7. frescod's `GRANT` now uses the same token lifetime as `CONSUME`.
-- **Not yet.** The jailed shelf needs a capability that mounts `fresco-activation/`; the gate
-  runs it on the host as Forum.
+  action from root gets status 5 (only the subscriber may act), and one from the shelf's uid
+  without a real press gets status 7. frescod's `GRANT` now uses the same token lifetime as `CONSUME`.
+- **The shelf in its jail (2026-11-18).** Its manifest asks for `notification-shelf = true`, a
+  system-only permission that mounts frescod's activation socket (`fresco-activation/`) so the
+  shelf can hand a press to the app that posted. Because the shelf runs as its app uid,
+  praecod tells a subscriber whose person it is (`Event::Person { user }`, from the persona
+  registry) and sends it only that person's notifications.
 
 ## 6. Pergola's part
 

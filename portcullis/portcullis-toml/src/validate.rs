@@ -362,6 +362,12 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.navigator-page = true: restricted to the Navigator's page child (redeems \
              page tickets at navigatord); requires explicit policy approval"));
     }
+    if c.notification_shelf == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.notification-shelf = true: restricted to Forum's notification shelf (frescod's \
+             activation socket, to grant a press on a toast's action to its app); requires \
+             explicit policy approval"));
+    }
     if c.navigator_broker == Some(true) {
         r.warnings.push(format!(
             "{ctx}.navigator-broker = true: restricted to the Navigator (its broker's sockets, \

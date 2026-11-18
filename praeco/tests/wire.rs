@@ -39,10 +39,20 @@ fn rpc(c: &mut Connection, o: u16, payload: &[u8]) -> (u8, u64) {
     }
 }
 
-fn next_event(c: &mut Connection) -> Event {
+fn any_event(c: &mut Connection) -> Event {
     let m = c.recv_message_or_timeout(Duration::from_secs(5)).unwrap().expect("event");
     assert_eq!(m.op, op::EV);
     postcard::from_bytes(&m.payload).unwrap()
+}
+
+/// The next event but the subscription's opening `Person`.
+fn next_event(c: &mut Connection) -> Event {
+    loop {
+        match any_event(c) {
+            Event::Person { .. } => continue,
+            e => return e,
+        }
+    }
 }
 
 #[test]
@@ -253,4 +263,27 @@ fn an_action_lets_its_app_raise_its_window_once() {
     assert_eq!(raise(&mut mail, id), status::OK);
     assert_eq!(frescod.raised(), vec![MAIL]);
     assert_eq!(raise(&mut mail, id), status::NOT_ALLOWED, "once per press");
+}
+
+#[test]
+fn a_shelf_launched_as_an_app_hears_only_its_persons_notifications() {
+    const BOB_APP: u32 = 1005;
+    const SHELF: u32 = 901;
+    let resolve = |uid: u32| match uid {
+        MAIL => Some(("shankar".to_string(), "org.atrium.mail".to_string())),
+        BOB_APP => Some(("bob".to_string(), "org.atrium.mail".to_string())),
+        SHELF => Some(("shankar".to_string(), "org.atrium.forum-shelf".to_string())),
+        _ => None,
+    };
+    let s = Shared::new(Box::new(resolve), vec![SHELF]);
+    let mut bob = conn(&s, BOB_APP);
+    rpc(&mut bob, op::POST, &proto::encode_post(1, "bob's", ""));
+    let mut shelf = conn(&s, SHELF);
+    assert_eq!(rpc(&mut shelf, op::SUBSCRIBE, &[]).0, status::OK);
+    assert_eq!(any_event(&mut shelf), Event::Person { user: "shankar".into() }, "first, who it is for");
+    rpc(&mut bob, op::POST, &proto::encode_post(1, "bob's again", ""));
+    let mut mail = conn(&s, MAIL);
+    let (_, id) = rpc(&mut mail, op::POST, &proto::encode_post(1, "shankar's", ""));
+    // Not bob's, from the history or after.
+    assert!(matches!(any_event(&mut shelf), Event::Posted(n) if n.id == id));
 }

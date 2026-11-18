@@ -114,6 +114,11 @@ pub fn apply_all(
     if caps.navigator_broker == Some(true) {
         apply_navigator_broker(jc, opts);
     }
+    if caps.notification_shelf == Some(true) {
+        // Forum's shelf grants a press on a toast's action (tabula.md §5.5);
+        // frescod lets only Forum's uid grant.
+        apply_socket("fresco-activation.sock", jc, opts);
+    }
     if caps.audio_device == Some(true) {
         apply_audio_device(jc, opts);
     }
