@@ -8,7 +8,9 @@
 //! charts, pivot tables, conditional formats, filter and hidden rows moved
 //! along. Its inverse is the inverse of each, so undo needs nothing new.
 //!
-//! Not moved yet: defined names, row heights and column widths.
+//! Defined names follow as formulas do, and row heights or column widths
+//! move with their rows or columns. Not moved yet: the formulas inside
+//! conditional-format rules (their ranges move).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -444,6 +446,30 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::Filter(st2));
     }
 
+    // Defined names.
+    let defs: Vec<_> = wb.names().iter().cloned().collect();
+    let moved: Vec<_> = defs
+        .iter()
+        .map(|d| {
+            let a = Adjust { own: d.scope.unwrap_or(0), target: sheet, s, or: 0, oc: 0, nr: 0, nc: 0 };
+            crate::names::NameDef { expr: Arc::new(a.expr(&d.expr)), ..d.clone() }
+        })
+        .collect();
+    if moved.iter().zip(&defs).any(|(a, b)| a.expr != b.expr) {
+        ops.push(GridOp::names(wb, &moved));
+    }
+
+    // Row heights or column widths.
+    let sh = wb.sheet(sheet);
+    let sizes = match axis {
+        Axis::Rows => &sh.row_sizes,
+        Axis::Cols => &sh.col_sizes,
+    };
+    let over: Vec<(u32, f64)> = sizes.overrides().iter().filter_map(|&(i, v)| s.map(i).map(|j| (j, v))).collect();
+    if over != sizes.overrides() {
+        ops.push(GridOp::Sizes { sheet, rows: axis == Axis::Rows, over });
+    }
+
     if ops.is_empty() {
         return None;
     }
@@ -639,5 +665,35 @@ mod tests {
         inv.apply(&mut wb);
         eprintln!("insert a row in 200,000: built {built:?}, applied {applied:?}");
         assert!(applied.as_secs_f64() < 5.0);
+    }
+
+    #[test]
+    fn names_and_sizes_move_too() {
+        let mut wb = book(&[&["1"], &["2"], &["3"], &["=SUM(Total)"]]);
+        wb.define_name("Total", None, "=Sheet1!$A$1:$A$3").unwrap();
+        wb.define_name("Last", Some(0), "=$A$3").unwrap();
+        wb.sheet_mut(0).row_sizes.set(2, 40.0);
+        wb.sheet_mut(0).col_sizes.set(1, 120.0);
+        wb.recalc();
+        let op = shift_op(&wb, 0, Axis::Rows, 1, 2).unwrap();
+        let inv = apply(&mut wb, op);
+        let text = |wb: &Workbook, n: &str| wb.name_text(wb.names().get(0, n).unwrap());
+        assert_eq!(text(&wb, "Total"), "=Sheet1!$A$1:$A$5");
+        assert_eq!(text(&wb, "Last"), "=$A$5");
+        assert_eq!(wb.value(0, 5, 0), Value::Num(6.0));
+        assert_eq!(wb.sheet(0).row_sizes.size(4), 40.0);
+        assert_eq!(wb.sheet(0).row_sizes.size(2), wb.sheet(0).row_sizes.default);
+        // The op survives the journal.
+        let back = GridOp::decode(&inv.encode()).unwrap();
+        apply(&mut wb, back);
+        assert_eq!(text(&wb, "Total"), "=Sheet1!$A$1:$A$3");
+        assert_eq!(wb.sheet(0).row_sizes.size(2), 40.0);
+        // Deleting column B takes its width; deleting the named rows breaks the name.
+        let op = shift_op(&wb, 0, Axis::Cols, 1, -1).unwrap();
+        apply(&mut wb, op);
+        assert_eq!(wb.sheet(0).col_sizes.size(1), wb.sheet(0).col_sizes.default);
+        let op = shift_op(&wb, 0, Axis::Rows, 0, -3).unwrap();
+        apply(&mut wb, op);
+        assert_eq!(text(&wb, "Total"), "=#REF!");
     }
 }

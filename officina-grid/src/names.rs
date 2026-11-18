@@ -150,3 +150,55 @@ mod tests {
         }
     }
 }
+
+impl crate::book::Workbook {
+    /// `defs` as bytes for [`crate::ops::GridOp::Names`]: scope (0xFFFF for
+    /// the workbook), name, and formula text as if in A1 of its sheet.
+    pub fn encode_names(&self, defs: &[NameDef]) -> Vec<u8> {
+        let mut w = officina_core::wire::Writer::new();
+        w.var(defs.len() as u64);
+        for d in defs {
+            w.u16(d.scope.unwrap_or(0xFFFF));
+            w.str(&d.name);
+            w.str(&self.name_text(d));
+        }
+        w.into_bytes()
+    }
+
+    /// Reads names written by [`encode_names`](Self::encode_names).
+    pub fn decode_names(&self, b: &[u8]) -> Result<Vec<NameDef>, officina_core::wire::WireError> {
+        use officina_core::wire::{Reader, WireError};
+        let mut r = Reader::new(b);
+        let n = r.count("names", MAX_NAMES as u64, 3)?;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            let scope = match r.u16()? {
+                0xFFFF => None,
+                s if (s as usize) < self.sheet_count() => Some(s),
+                _ => return Err(WireError::Invalid("name scope")),
+            };
+            let name = r.str("name", MAX_NAME_LEN as u64)?;
+            let src = r.str("name formula", 1 << 16)?;
+            if !valid_name(name) {
+                return Err(WireError::Invalid("name"));
+            }
+            let e = self.parse_stored(src, 0, 0).map_err(|_| WireError::Invalid("name formula"))?;
+            v.push(NameDef { name: Arc::from(name), scope, expr: Arc::new(e) });
+        }
+        if !r.is_empty() {
+            return Err(WireError::Invalid("trailing bytes"));
+        }
+        Ok(v)
+    }
+
+    /// Puts `defs` in place of the defined names; the old ones back.
+    pub fn replace_names(&mut self, defs: Vec<NameDef>) -> Vec<NameDef> {
+        let old: Vec<NameDef> = self.names.iter().cloned().collect();
+        self.names = Names::default();
+        for d in defs {
+            self.names.set(d);
+        }
+        self.rebind_names();
+        old
+    }
+}

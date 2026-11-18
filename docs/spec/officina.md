@@ -3529,7 +3529,8 @@ Sheets had no way to insert or delete rows or columns. `officina-grid::shift::sh
 - The sheet's cells are replaced with themselves moved; formula fills are rewritten row by row and joined again where their relative form is the same (a fill the insert cuts through becomes two pieces that still read `=A1+1`).
 - Every reference to the sheet, on it or from other sheets, follows: a reference into deleted cells becomes `#REF!`; a range loses its deleted part, and grows by rows inserted inside it (inserted at its first row, it moves); whole-column ranges don't move with rows nor whole-row ranges with columns.
 - Styles move with their cells (inserted rows start plain); tables (a table whose header row is deleted goes; columns inserted inside get new names), charts (data and anchor), pivot tables (source and output), conditional-format ranges, the auto-filter and hidden rows move along.
-- Not yet: defined names, row heights and column widths, and the formulas inside conditional-format rules.
+- Defined names follow as formulas do, and row heights and column widths move with their rows and columns (added the same day: two new ops, `GridOp::Names`, journal tag 9, the names as formula text read against the workbook when applied, and `GridOp::Sizes`, tag 10, a sheet's row or column size overrides swapped whole; test `names_and_sizes_move_too`, which also round-trips the inverse through the journal encoding).
+- Not yet: the absolute references inside conditional-format rules (their ranges move, and relative references with them).
 
 Sheets' Data menu gains Insert Rows Above, Insert Columns Left, Delete Rows and Delete Columns, as many as the selection spans, each one undo step. Compare with… (§16.68) now takes rows added as rows inserted with the other copy's cells, and rows removed as rows deleted, instead of the whole sheet (Take All still takes a sheet with rows added or removed whole).
 
