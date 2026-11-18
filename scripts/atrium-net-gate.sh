@@ -340,8 +340,14 @@ n0)
     # Renewal at T1 (half the lease). The network now says MTU 1400, in
     # DHCP and in its RAs.
     lanctl 'mtu 1400' >/dev/null
-    i=0; while [ "$(stat renew)" -lt 1 ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done
-    [ "$(stat renew)" -ge 1 ] && wait_addr 10.88.0.50 10 && ok "lease renewed at T1, address kept" || fail "no renewal"
+    # Unicast to the server and answered: a rebind (broadcast, after an
+    # unanswered renewal) or a new DISCOVER would mean the ACK was refused.
+    rb0=$(stat rebind); dc0=$(stat discover); rn0=$(stat renew)
+    i=0; while [ "$(stat renew)" -le "$rn0" ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done
+    sleep 5
+    [ "$(stat renew)" -gt "$rn0" ] && [ "$(stat rebind)" = "$rb0" ] && [ "$(stat discover)" = "$dc0" ] && wait_addr 10.88.0.50 10 \
+        && ok "lease renewed at T1 by unicast, ACK taken (no rebind, no DISCOVER), address kept" \
+        || fail "renewal: renew $rn0->$(stat renew) rebind $rb0->$(stat rebind) discover $dc0->$(stat discover)"
     mtu() { "$V" 'ifconfig vtnet1 | sed -n "s/.*mtu \([0-9]*\).*/\1/p"'; }
     mtu6() { "$V" 'ndp -i vtnet1 | sed -n "s/.*linkmtu=\([0-9]*\).*/\1/p"'; }
     i=0; until [ "$(mtu)" = 1400 ] && [ "$(mtu6)" = 1400 ]; do i=$((i + 1)); [ $i -lt 20 ] || fail "network MTU not applied: mtu $(mtu) linkmtu $(mtu6)"; sleep 1; done
