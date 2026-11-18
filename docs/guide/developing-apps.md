@@ -193,6 +193,15 @@ A crash, a limit or a timeout comes back as an `Err`, never as a panic in
 the core. Off Atrium, `ATRIUM_WORKERS=local ATRIUM_APP_ROOT=.` runs the
 workers as plain children (`cargo run` in a workspace).
 
+A worker with a protocol of its own that passes descriptors (a decoder
+fed frame buffers) starts with `workers.spawn_socket(name, &[extra fds])`:
+the core keeps one end of a Unix stream socket, the worker gets the other
+on descriptor 0 and the extras from 3, and takes them with
+`atrium_worker::socket_worker(n)` (its `capsicum` flag says to call
+`enter_capability_mode()` once it has set up). In a jail, extras need
+`isolation = "capsicum"` until portcullisd's WorkerCall carries more than
+the three standard descriptors.
+
 ### Moving code into a worker: `cargo atrium worker add`
 
 `cargo atrium worker add <name>` makes a new worker in an existing
