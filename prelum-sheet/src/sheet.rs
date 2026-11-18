@@ -79,8 +79,15 @@ pub struct Sheet {
 
 impl Sheet {
     pub fn new(title: &str, can_relayout: bool, hint: Option<limen::print::Paper>) -> Sheet {
-        // The app's own paper if the sheet knows it, else A4.
-        let media = hint.and_then(|p| PAPERS.iter().find(|(k, _)| paper_pt(k).is_some_and(|(w, h)| w.abs_diff(p.w_pt) <= 2 && h.abs_diff(p.h_pt) <= 2))).map(|(k, _)| k.to_string());
+        // The app's own paper if the sheet knows it, else A4; a hint wider
+        // than high is that paper turned (a deck's slides).
+        let near = |a: u32, b: u32, w: u32, h: u32| a.abs_diff(w) <= 2 && b.abs_diff(h) <= 2;
+        let find = |turned: bool| hint.and_then(|p| PAPERS.iter().find(|(k, _)| paper_pt(k).is_some_and(|(w, h)| if turned { near(p.h_pt, p.w_pt, w, h) } else { near(p.w_pt, p.h_pt, w, h) })));
+        let (media, landscape) = match find(false) {
+            Some((k, _)) => (Some(k.to_string()), false),
+            None => (find(true).map(|(k, _)| k.to_string()), hint.is_some_and(|p| p.w_pt > p.h_pt)),
+        };
+        let landscape = landscape && media.is_some();
         Sheet {
             title: title.into(),
             can_relayout,
@@ -94,7 +101,7 @@ impl Sheet {
             sides: Sides::OneSided,
             media_hinted: media.is_some(),
             media: media.unwrap_or_else(|| PAPERS[0].0.into()),
-            landscape: false,
+            landscape,
             per_sheet: 1,
             fit: false,
             sheets: 0,
@@ -393,6 +400,15 @@ pub fn pdf_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_turned_paper_hint_starts_landscape() {
+        let s = Sheet::new("Deck", true, Some(limen::print::Paper { w_pt: 842, h_pt: 595 }));
+        assert!(s.landscape);
+        assert!(s.media_hinted);
+        let s = Sheet::new("Doc", true, Some(limen::print::Paper::A4));
+        assert!(!s.landscape);
+    }
+
     use super::*;
     use prelum_ipp_codec::printer::StateReason;
 

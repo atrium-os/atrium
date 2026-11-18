@@ -612,7 +612,7 @@ fn main() {
                     let title = print_deck.as_ref().map(|d| d.1.clone()).unwrap_or_default();
                     let r = match (r, &embeds, win.embed_token(), again) {
                         (Ok(pdf), Some(e), _, true) => printing.as_mut().map(|p| p.document_bytes(e, &pdf).map_err(|e| format!("{e:?}"))).unwrap_or(Ok(())),
-                        (Ok(pdf), Some(e), Some(token), false) => Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, true, Some(Paper::A4))
+                        (Ok(pdf), Some(e), Some(token), false) => Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, true, Some(Paper { w_pt: Paper::A4.h_pt, h_pt: Paper::A4.w_pt }))
                             .map(|p| {
                                 printing = Some(p);
                                 run.set_status("");
