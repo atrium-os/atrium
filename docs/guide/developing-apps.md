@@ -204,9 +204,8 @@ fed frame buffers) starts with `workers.spawn_socket(name, &[extra fds])`:
 the core keeps one end of a Unix stream socket, the worker gets the other
 on descriptor 0 and the extras from 3, and takes them with
 `atrium_worker::socket_worker(n)` (its `capsicum` flag says to call
-`enter_capability_mode()` once it has set up). In a jail, extras need
-`isolation = "capsicum"` until portcullisd's WorkerCall carries more than
-the three standard descriptors.
+`enter_capability_mode()` once it has set up). Up to
+`atrium_worker::MAX_EXTRA_FDS` (8) extras go through, in a jail too.
 
 ### Moving code into a worker: `cargo atrium worker add`
 
