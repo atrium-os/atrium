@@ -7,6 +7,10 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 /// A regular file or a pipe, open for reading only: nothing that reaches
 /// anywhere else (sockets, devices, directories), and nothing writable.
+/// A memory file sealed against every change (`memfd_create` with
+/// `F_SEAL_WRITE`, `F_SEAL_GROW` and `F_SEAL_SHRINK`) counts as read-only
+/// though it was opened read-write: nobody can change it now. That is how
+/// an app hands over a document it made in memory (`pergola::print`).
 pub fn check(fd: &OwnedFd) -> Result<(), &'static str> {
     // SAFETY: fstat and fcntl(F_GETFL) on a descriptor we own, into a stat
     // we own.
@@ -28,10 +32,54 @@ pub fn check(fd: &OwnedFd) -> Result<(), &'static str> {
     // makes one read-only there is `narrow`, which every passed descriptor
     // gets. Elsewhere a pipe end says which way it goes.
     let pipe_rw_ok = cfg!(target_os = "freebsd") && kind == libc::S_IFIFO;
-    if flags & libc::O_ACCMODE != libc::O_RDONLY && !pipe_rw_ok {
+    if flags & libc::O_ACCMODE != libc::O_RDONLY && !pipe_rw_ok && !(kind == libc::S_IFREG && sealed(fd)) {
         return Err("not read-only");
     }
     Ok(())
+}
+
+/// Seals that make a memory file unchangeable.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+const SEALED: libc::c_int = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+
+/// Whether `fd` is a memory file sealed against writing, growing and
+/// shrinking.
+pub fn sealed(fd: &OwnedFd) -> bool {
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    {
+        // SAFETY: fcntl(F_GET_SEALS) on a descriptor we own; no memory.
+        let s = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        s >= 0 && s & SEALED == SEALED
+    }
+    #[cfg(not(any(target_os = "freebsd", target_os = "linux")))]
+    {
+        let _ = fd;
+        false
+    }
+}
+
+/// A memory file holding `bytes`, sealed against any change: what
+/// [`check`] takes as read-only. `name` shows only in debugging.
+#[cfg(any(target_os = "freebsd", target_os = "linux"))]
+pub fn sealed_file(name: &str, bytes: &[u8]) -> io::Result<OwnedFd> {
+    use std::io::{Seek, Write};
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(name).map_err(|_| io::Error::other("name"))?;
+    // SAFETY: a valid C string; the flags are memfd_create's.
+    let raw = unsafe { libc::memfd_create(c.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: memfd_create returned a new descriptor that nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut f = std::fs::File::from(fd);
+    f.write_all(bytes)?;
+    f.rewind()?;
+    // SAFETY: fcntl(F_ADD_SEALS) on a descriptor we own; no memory.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_ADD_SEALS, SEALED | libc::F_SEAL_SEAL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f.into())
 }
 
 /// Narrow `fd` to read, seek and fstat (FreeBSD Capsicum); rights travel
@@ -99,4 +147,25 @@ pub fn narrow_returned(fd: &OwnedFd, writable: bool) -> io::Result<()> {
     #[cfg(not(target_os = "freebsd"))]
     let _ = (fd, writable);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    #[test]
+    fn a_sealed_memory_file_counts_as_read_only() {
+        let fd = sealed_file("doc.pdf", b"%PDF-1.7").unwrap();
+        assert!(sealed(&fd));
+        assert_eq!(check(&fd), Ok(()));
+        // Not sealed: refused like any read-write file.
+        let c = std::ffi::CString::new("open").unwrap();
+        // SAFETY: as in sealed_file.
+        let raw = unsafe { libc::memfd_create(c.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        use std::os::fd::FromRawFd;
+        // SAFETY: a new descriptor nothing else owns.
+        let open = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(check(&open), Err("not read-only"));
+    }
 }

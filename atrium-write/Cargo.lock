@@ -135,6 +135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-colr"
+version = "0.1.0"
+dependencies = [
+ "skrifa",
+ "tiny-skia 0.11.4",
+]
+
+[[package]]
 name = "atrium-fonts"
 version = "0.1.0"
 dependencies = [
@@ -1407,6 +1415,7 @@ dependencies = [
 name = "officina-pdf"
 version = "0.1.0"
 dependencies = [
+ "atrium-colr",
  "folium-content",
  "folium-font",
  "folium-syntax",
@@ -1555,6 +1564,7 @@ name = "pergola"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-colr",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",

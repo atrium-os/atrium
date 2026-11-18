@@ -180,9 +180,15 @@ a Japanese label in the VM.
   paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
-- Colour emoji is drawn by frescod (Pergola `Text` nodes, labels).
-  officina-text's drawing (Write, Slides, the PDF export) and Pergola's
-  client-side glyph atlas still draw the Noto Emoji outlines. Opifex installs font
+- Colour emoji is drawn everywhere text is: frescod's own text (Pergola
+  `Text` nodes, labels); officina-text lays emoji out in Noto Color Emoji,
+  and Pergola's glyph atlas (Write, Slides and other app-shaped text) puts
+  them on an RGBA twin bound at `color_atlas_slot(atlas slot)`, the run
+  marking them `GLYPH_COLOR` (frescod keeps the mark only when the window
+  bound that slot); the PDF export draws each emoji once as a picture
+  (160 px to the em, soft mask) over its text written invisibly (`3 Tr`),
+  so the text copies and searches. Left: the colour atlas is 512² per
+  window, so very many large emoji drop the rest (logged). Opifex installs font
   packages (opifex.md §14.7: `opifex font pack`, the pin list written by
   opifexd). The CJK packages (`org.atrium.font.noto-sans-{jp,sc,tc,hk,kr}`
   2.004, regular and bold, 11 to 21 MB each) are built by

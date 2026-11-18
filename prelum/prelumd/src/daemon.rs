@@ -54,6 +54,12 @@ pub struct Config {
     /// Where prelum-browse's sockets come from (§7.1): atrium-net, asked
     /// each time the list opens. `None`: no discovery here.
     pub mdns: Option<Box<dyn Fn() -> io::Result<crate::nearby::MdnsSockets> + Send + Sync>>,
+    /// prelum-sheet's uid: the one peer that may act for an app's person
+    /// (`FOR`, §5.2).
+    pub sheet_uid: Option<u32>,
+    /// An app's uid to its person's uid and persona (the launch registry):
+    /// whose printers a sheet opened for that app uses.
+    pub person_of: Box<dyn Fn(u32) -> Option<(u32, Option<String>)> + Send + Sync>,
 }
 
 pub type Fail = (u8, String);
@@ -139,7 +145,7 @@ fn now() -> u64 {
 }
 
 /// A PWG media keyword whose size Prelum knows how to read (`..._210x297mm`).
-fn media_ok(k: &str) -> bool {
+pub(crate) fn media_ok(k: &str) -> bool {
     let Some(d) = k.rsplit('_').next() else { return false };
     let Some(d) = d.strip_suffix("mm").or_else(|| d.strip_suffix("in")) else { return false };
     let mut it = d.split('x');
@@ -369,6 +375,10 @@ impl Daemon {
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
         p.file.printer.iter().find(|o| o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
+    }
+
+    pub(crate) fn cfg(&self) -> &Config {
+        &self.cfg
     }
 
     pub(crate) fn launcher(&self) -> &dyn Launcher {
@@ -1163,6 +1173,7 @@ fn read_render(mut sock: UnixStream, mut spool: File, prog: Arc<(Mutex<Progress>
                 return finish(Ok(()));
             }
             render::Ev::Failed(e) => return finish(Err(short(&e))),
+            render::Ev::Sheets(_) | render::Ev::Preview { .. } => return finish(Err("the renderer answered out of turn".into())),
         }
     }
 }

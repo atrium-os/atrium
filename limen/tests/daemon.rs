@@ -20,6 +20,8 @@ const SHARE_UID: u32 = 1800;
 const NOTES_UID: u32 = 1900;
 const W_SHEET: WindowToken = [8; 16];
 const W_NOTES: WindowToken = [9; 16];
+const PRELUM_UID: u32 = 2000;
+const W_PRINT: WindowToken = [10; 16];
 const W_PICKER: WindowToken = [7; 16];
 const W_APP: WindowToken = [1; 16];
 const W_OTHER: WindowToken = [2; 16];
@@ -92,6 +94,7 @@ impl World {
             g.0.insert(W_PICKER, SCRINIUM_UID);
             g.0.insert(W_SHEET, SHARE_UID);
             g.0.insert(W_NOTES, NOTES_UID);
+            g.0.insert(W_PRINT, PRELUM_UID);
         }
         let (tx, rx) = mpsc::channel();
         let ended = Arc::new(Mutex::new(Vec::new()));
@@ -101,6 +104,7 @@ impl World {
             ARCA_UID => Some(("ana".into(), catalogue::ARCA.into())),
             SCRINIUM_UID => Some(("ana".into(), catalogue::SCRINIUM.into())),
             SHARE_UID => Some(("ana".into(), catalogue::SHARE.into())),
+            PRELUM_UID => Some(("ana".into(), catalogue::PRELUM.into())),
             _ => None,
         });
         let defaults = Box::new(|_: &str, role: &str| match role {
@@ -654,4 +658,58 @@ fn a_share_target_is_only_ever_the_app_the_person_chose_in_the_parents_share_she
     notes.emit(t, limen::share_target::ToParent::Accepted.encode()).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Message { embed: t, bytes: limen::share_target::ToParent::Accepted.encode() });
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_print_sheet_takes_a_sealed_pdf_hands_back_save_as_pdf_and_opens_once_per_window() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use limen::print::{ToChild, ToParent};
+    let w = World::new();
+    let mut app = w.parent(APP);
+    assert_eq!(refused(app.request("print", W_APP)), refusal::NO_PROVIDER);
+    assert!(matches!(provider(w.connect(SCRINIUM_UID), "print"), Err(Error::Refused(r)) if r == refusal::NOT_PROVIDER));
+    let mut sheet = provider(w.connect(PRELUM_UID), "print").unwrap();
+
+    let e = app.request("print", W_APP).unwrap();
+    assert_eq!(next_c(&mut sheet), ChildEvent::Attach { embed: e, role: "print".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    // One sheet per window at a time.
+    assert_eq!(refused(app.request("print", W_APP)), refusal::TOO_MANY);
+
+    // A document made in memory, sealed, counts as read-only.
+    let pdf = limen::fdpass::sealed_file("doc.pdf", b"%PDF-1.7 made in memory").unwrap();
+    let ask = ToChild::Print { title: "Q4".into(), page_size_hint: None, can_relayout: false };
+    app.send_fd(e, ask.encode(), pdf.as_fd()).unwrap();
+    assert_eq!(next_c(&mut sheet), ChildEvent::MessageFd { embed: e, bytes: ask.encode() });
+    let mut got = std::fs::File::from(sheet.take_fd().expect("the document"));
+    let mut b = String::new();
+    got.read_to_string(&mut b).unwrap();
+    assert_eq!(b, "%PDF-1.7 made in memory");
+    // An unsealed read-write file is not.
+    let path = std::env::temp_dir().join(format!("limen-print-{}", std::process::id()));
+    std::fs::write(&path, b"%PDF").unwrap();
+    let rw = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    assert_eq!(refused(app.send_fd(e, ask.encode(), rw.as_fd())), refusal::BAD_FD);
+
+    // Save as PDF comes back read-only.
+    sheet.ready(e, W_PRINT).unwrap();
+    app.place(e, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: e });
+    let ro = std::fs::File::open(&path).unwrap();
+    let save = ToParent::SavePdf { name: "Q4.pdf".into() };
+    sheet.emit_fd(e, save.encode(), ro.as_fd()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::MessageFd { embed: e, bytes: save.encode() });
+    assert!(app.take_fd().is_some());
+    let _ = std::fs::remove_file(&path);
+
+    // Closed, it opens again; a window that keeps opening it is slowed.
+    app.detach(e).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let e2 = app.request("print", W_APP).unwrap();
+    app.detach(e2).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let e3 = app.request("print", W_APP).unwrap();
+    app.detach(e3).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(refused(app.request("print", W_APP)), refusal::RATE, "the fourth in a minute, at once");
 }

@@ -24,6 +24,8 @@ unicode-linebreak = "0.1.5"
 hyphenation = { version = "0.8", features = ["embed_en-us"] }
 # Glyph rastering for app-shaped text (src/glyphs.rs); pure Rust.
 swash = "0.1"
+# Colour glyphs (emoji, COLR) to RGBA for the colour atlas (src/glyphs.rs).
+atrium-colr = { path = "../atrium-colr" }
 # The stroker (strokes and dashes to fills) the Navigator's SVG uses; BSD-3.
 tiny-skia-path = "0.12"
 log             = "0.4"

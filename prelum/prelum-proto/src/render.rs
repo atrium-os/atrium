@@ -17,4 +17,9 @@ pub enum Ev {
     Done { sheets: u32, bytes: u64 },
     /// The job can't be prepared (plain text for the person).
     Failed(String),
+    /// `--format preview`: the document makes this many sheets; the
+    /// [`Ev::Preview`]s asked for follow, then [`Ev::Done`].
+    Sheets(u32),
+    /// One sheet's preview (printing.md §5.2): 8-bit sRGB, `w` x `h`.
+    Preview { sheet: u32, w: u32, h: u32, rgb: Vec<u8> },
 }
