@@ -13,6 +13,8 @@ icon        = "media"
 graphics = "fresco"
 audio    = true
 network  = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [[opens]]
 types = ["audio/flac", "audio/mpeg", "audio/ogg", "audio/wav", "audio/aac", "audio/mp4",

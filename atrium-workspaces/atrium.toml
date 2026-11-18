@@ -12,6 +12,8 @@ icon        = "code"
 graphics   = "fresco"
 workspaces = true   # make, change, delete workspaces; open their terminals (restricted)
 network    = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [supervision]
 restart   = "on-crash"

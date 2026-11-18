@@ -21,6 +21,8 @@ audio-control     = true   # the volume, apps' levels, outputs (restricted: Foru
 app-grants        = true   # what each app may do; allow, remove (restricted: Curia only)
 bluetooth-control = true   # pair, connect, forget Bluetooth devices (restricted: Curia, Forum bar)
 network           = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = ["credential"]
 
 [supervision]
 restart   = "on-crash"

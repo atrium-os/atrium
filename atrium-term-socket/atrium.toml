@@ -1,0 +1,22 @@
+# The Terminal (docs/spec/stoa.md, homes.md §5.5, tabula.md §2.2): the window
+# for consoles. stoad (a system service) runs the shells; the Terminal draws
+# them and sends keys. `consoles` lets it attach to the consoles portcullisd
+# opens for it. The clipboard is Tabula's: copy and paste each spend a press.
+[app]
+id          = "org.atrium.terminal"
+name        = "Terminal"
+version     = "0.1.0"
+entry       = "bin/atrium-term-socket"
+description = "Shells for your workspaces and apps."
+icon        = "terminal"
+
+[capabilities]
+graphics  = "fresco"
+consoles  = true
+clipboard = true
+network   = "none"
+# No Limen roles. Without this key a platform bundle keeps every role.
+embeds    = []
+
+[supervision]
+restart   = "on-crash"
