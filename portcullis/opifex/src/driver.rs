@@ -179,12 +179,31 @@ pub fn install_driver(src: &Path, system: &Path, keys: &[String]) -> Result<Driv
     let file = devices_file(system, &id);
     let dir = file.parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // dispensatord loads the folder whole and refuses all of it on one bad
+    // file: check this one with the others, as it will.
+    if let Err(e) = loads_with_others(dir, &file, &devices) {
+        let _ = fs::remove_dir_all(&dest);
+        return Err(format!("{id}: {DEVICES_FILE} would not load in dispensatord: {e}"));
+    }
     let tmp = dir.join(format!(".60-{id}.{}", std::process::id()));
     fs::write(&tmp, &devices).map_err(|e| format!("{}: {e}", tmp.display()))?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
     own(&tmp)?;
     fs::rename(&tmp, &file).map_err(|e| format!("{}: {e}", file.display()))?;
     Ok(m)
+}
+
+fn loads_with_others(dir: &Path, ours: &Path, text: &str) -> Result<(), String> {
+    let mut r = dispensator::rules::Rules::default();
+    let mut names: Vec<PathBuf> = fs::read_dir(dir).map_err(|e| e.to_string())?.flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "toml") && p != ours).collect();
+    names.sort();
+    for p in names {
+        let t = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        r.add_toml(&p.display().to_string(), &t).map_err(|e| e.0)?;
+    }
+    r.add_toml(&ours.display().to_string(), text).map_err(|e| e.0)?;
+    r.finish().map(|_| ()).map_err(|e| e.0)
 }
 
 pub fn remove_driver(system: &Path, id: &str) -> Result<(), String> {
@@ -323,6 +342,12 @@ mod tests {
         let t = d.join("drv");
         fs::create_dir_all(&t).unwrap();
         fs::write(t.join("rtl"), b"\x7fELF driver").unwrap();
+        fs::write(t.join(DEVICES_FILE), DEVICES_T).unwrap();
+        // A file dispensatord would refuse (and with it every rule) is refused here.
+        fs::write(t.join(DEVICES_FILE), DEVICES_T.replace("devfs_ruleset = 30", "devfs_ruleset = 0")).unwrap();
+        pack_driver(&t, MANIFEST_T, Some(&sk)).unwrap();
+        assert!(install_driver(&t, &sys, &[pk.clone()]).unwrap_err().contains("would not load in dispensatord"));
+        assert!(!sys.join(DRIVERS).join("org.atrium.driver.rtl").exists());
         fs::write(t.join(DEVICES_FILE), DEVICES_T).unwrap();
         pack_driver(&t, MANIFEST_T, Some(&sk)).unwrap();
         install_driver(&t, &sys, &[pk.clone()]).unwrap();

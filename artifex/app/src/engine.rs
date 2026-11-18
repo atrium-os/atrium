@@ -49,7 +49,7 @@ struct Server {
 
 /// A command whose output is wanted whole.
 enum Job {
-    Task { label: String, cwd: String },
+    Task { label: String, cwd: String, kind: tasks::Kind },
     Git,
     Home,
     Check { project: String },
@@ -83,6 +83,8 @@ pub struct Engine {
     debugger: Option<(dap::Session, Proc)>,
     /// Start debugging when the build that's running succeeds.
     debug_after_build: bool,
+    /// The dev app the running Run task started (for its note).
+    ran: Option<String>,
 }
 
 fn title_of(rel: &str) -> String {
@@ -122,6 +124,7 @@ impl Engine {
             rows: 40,
             debugger: None,
             debug_after_build: false,
+            ran: None,
         }
     }
 
@@ -205,9 +208,16 @@ impl Engine {
             }
             Act::Save => self.save(s),
             Act::Task(i) => self.run_task(i, s),
+            Act::AnswerRun(press) => self.answer_run(press, s),
+            Act::Run => {
+                if let Some(i) = s.tasks.iter().position(|t| t.kind == tasks::Kind::Run) {
+                    self.run_task(i, s);
+                }
+            }
             Act::Stop => {
                 self.jobs.retain(|(j, _, _)| !matches!(j, Job::Task { .. }));
                 s.running = None;
+                s.ask = None;
                 s.output.push_str("\n[stopped]\n");
             }
             Act::Panel(p) => {
@@ -789,9 +799,19 @@ impl Engine {
 
     fn start_job(&mut self, job: Job, argv: &[String], cwd: &str, s: &mut State) -> bool {
         let Some(ws) = self.ws.clone() else { return false };
-        match self.exec.spawn(&ws, argv, cwd) {
+        // A Run task may ask (atrium-run): it is told so, and its stdin
+        // stays open for the answer.
+        let asks = matches!(&job, Job::Task { kind: tasks::Kind::Run, .. });
+        let argv: Vec<String> = if asks {
+            ["env", "ATRIUM_ASK=1"].iter().map(|a| a.to_string()).chain(argv.iter().cloned()).collect()
+        } else {
+            argv.to_vec()
+        };
+        match self.exec.spawn(&ws, &argv, cwd) {
             Ok(mut p) => {
-                p.close_stdin();
+                if !asks {
+                    p.close_stdin();
+                }
                 self.jobs.push((job, p, Vec::new()));
                 true
             }
@@ -801,6 +821,33 @@ impl Engine {
                 }
                 false
             }
+        }
+    }
+
+    /// The person's answer to a Run task's question: with a press, Run the
+    /// folder as a dev app (portcullisd checks the press and that the
+    /// workspace was given to Artifex); without, cancel. The task hears
+    /// the answer as atrium-run reads it.
+    fn answer_run(&mut self, press: Option<[u8; 16]>, s: &mut State) {
+        let Some(folder) = s.ask.take() else { return };
+        let answer = match (press, self.ws.clone()) {
+            (Some(token), Some(ws)) => match self.exec.run(&ws, &folder, token) {
+                Ok(app) => {
+                    s.output.push_str(&format!("[Running {app}]\n"));
+                    s.note = Some((format!("Running {app}"), false));
+                    self.ran = Some(app);
+                    tasks::ask_ok(0)
+                }
+                Err(e) => {
+                    s.output.push_str(&format!("[Run: {e}]\n"));
+                    s.note = Some((format!("Can't Run {folder}: {e}"), true));
+                    tasks::ask_ok(1)
+                }
+            },
+            _ => tasks::ASK_CANCEL.to_vec(),
+        };
+        if let Some((_, p, _)) = self.jobs.iter_mut().find(|(j, _, _)| matches!(j, Job::Task { .. })) {
+            p.write(&answer);
         }
     }
 
@@ -822,7 +869,9 @@ impl Engine {
         s.problems.clear();
         s.panel = Panel::Output;
         s.panel_open = true;
-        if self.start_job(Job::Task { label: t.label.clone(), cwd: t.cwd.clone() }, &t.argv, &t.cwd, s) {
+        s.ask = None;
+        self.ran = None;
+        if self.start_job(Job::Task { label: t.label.clone(), cwd: t.cwd.clone(), kind: t.kind }, &t.argv, &t.cwd, s) {
             s.running = Some(t.label);
         }
     }
@@ -970,7 +1019,30 @@ impl Engine {
             let (got, done) = p.read(1 << 20);
             match job {
                 Job::Task { .. } => {
-                    s.output.push_str(&String::from_utf8_lossy(&got));
+                    // Output goes through `buf`, where a request can be
+                    // whole before it is taken out; the rest is shown.
+                    buf.extend_from_slice(&got);
+                    while let Some(ask) = tasks::take_ask(buf) {
+                        match ask {
+                            Ok(folder) if s.ask.is_none() => {
+                                s.ask = Some(folder);
+                                s.panel = Panel::Output;
+                                s.panel_open = true;
+                            }
+                            Ok(_) => p.write(tasks::ASK_CANCEL),
+                            Err(kind) => {
+                                p.write(tasks::ASK_CANCEL);
+                                s.output.push_str(&format!("[{kind}: answer it in the Terminal]\n"));
+                            }
+                        }
+                    }
+                    // Keep back what may be the start of a request.
+                    let keep = match buf.iter().rposition(|&b| b == 0x1b) {
+                        Some(e) if !done && buf.len() - e < 300 && !buf[e..].contains(&0x07) => e,
+                        _ => buf.len(),
+                    };
+                    let shown: Vec<u8> = buf.drain(..keep).collect();
+                    s.output.push_str(&String::from_utf8_lossy(&shown));
                     if s.output.len() > OUTPUT_MAX {
                         let mut cut = s.output.len() - OUTPUT_MAX;
                         while !s.output.is_char_boundary(cut) {
@@ -1003,13 +1075,16 @@ impl Engine {
             }
             let (job, _p, buf) = self.jobs.remove(i);
             match job {
-                Job::Task { label, cwd } => {
+                Job::Task { label, cwd, .. } => {
                     s.running = None;
+                    s.ask = None;
                     s.problems = tasks::problems(&s.output);
                     let _ = cwd;
                     let errors = s.problems.iter().filter(|p| p.severity == Severity::Error).count();
                     s.note = Some(if errors > 0 {
                         (format!("{label}: {errors} errors"), true)
+                    } else if let Some(app) = self.ran.take() {
+                        (format!("Running {app}"), false)
                     } else {
                         (format!("{label} finished"), false)
                     });
@@ -1346,6 +1421,38 @@ mod tests {
         // Not out of work.
         e.act(Act::Open("../../etc/passwd".into()), &mut s);
         assert_eq!(s.tabs.len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_run_task_asks_and_hears_the_answer() {
+        let (d, mut e, mut s) = setup("ask");
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        // What atrium-run does under an IDE: ask in the output, read the answer.
+        let script = "[ \"$ATRIUM_ASK\" = 1 ] || exit 9; printf 'building\\n\\033]7770;run;app\\007'; read -r r; case \"$r\" in *7770\\;cancel*) echo cancelled;; *) echo other;; esac";
+        s.tasks = vec![crate::tasks::Task {
+            kind: crate::tasks::Kind::Run,
+            label: "Run (fake)".into(),
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            cwd: String::new(),
+        }];
+        e.act(Act::Task(0), &mut s);
+        for _ in 0..300 {
+            if s.ask.is_some() {
+                break;
+            }
+            e.tick(&mut s);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(s.ask.as_deref(), Some("app"), "{}", s.output);
+        assert!(s.output.contains("building\n") && !s.output.lines().skip(1).any(|l| l.contains("7770")), "{:?}", s.output);
+        assert_eq!(s.panel, Panel::Output);
+        e.act(Act::AnswerRun(None), &mut s);
+        assert!(s.ask.is_none());
+        e.wait_jobs(&mut s);
+        assert!(s.output.contains("cancelled"), "{:?}", s.output);
+        assert!(s.running.is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 

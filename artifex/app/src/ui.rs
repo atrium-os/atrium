@@ -46,6 +46,8 @@ pub enum Act {
     CloseTab(usize),
     Save,
     Task(usize),
+    /// The project's Run task (Ctrl+R).
+    Run,
     Stop,
     Panel(Panel),
     HidePanel,
@@ -53,6 +55,8 @@ pub enum Act {
     Definition,
     Hover,
     Terminal([u8; 16]),
+    /// The Run task's question: Run (with the press) or Cancel.
+    AnswerRun(Option<[u8; 16]>),
     Refresh,
     /// Next or previous tab.
     CycleTab(bool),
@@ -167,6 +171,8 @@ pub struct State {
     pub breakpoints: std::collections::BTreeMap<String, Vec<usize>>,
     pub debug: Option<Debug>,
     pub fuzz: Option<crate::fuzz::Fuzz>,
+    /// A Run task's question (atrium-run, W5): the folder it asks to Run.
+    pub ask: Option<String>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -194,6 +200,7 @@ pub fn shortcut(key: Key, m: Modifiers, chars: &str) -> Option<Act> {
     match (key, m.ctrl, m.shift) {
         (Key::Char, true, false) if c == Some('s') => Some(Act::Save),
         (Key::Char, true, false) if c == Some('b') => Some(Act::Task(0)),
+        (Key::Char, true, false) if c == Some('r') => Some(Act::Run),
         (Key::Char, true, false) if c == Some('w') => Some(Act::CloseTab(usize::MAX)),
         (Key::Char, true, false) if c == Some('j') => Some(Act::Panel(Panel::Output)),
         (Key::Char, true, true) if c == Some('m') => Some(Act::Panel(Panel::Problems)),
@@ -493,6 +500,20 @@ impl View for ArtifexView {
             let width = w - side_w() - em(24.0);
             match s.panel {
                 Panel::Output => {
+                    let mut body_y = body_y;
+                    let mut lines_fit = lines_fit;
+                    if let (Some(folder), Some(ws)) = (&s.ask, &s.ws) {
+                        // What atrium-run asks, as the Terminal asks it.
+                        let y = body_y + em(10.0);
+                        ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        text(ctx, side_w() + em(16.0), y, &format!("{ws} asks to Run {folder}"), type_size::SM, Weight::Medium, t.text_primary());
+                        ctx.key(4030);
+                        Button::primary("Run").at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(pressed(q, |t| Act::AnswerRun(Some(t)))).render(ctx);
+                        ctx.key(4031);
+                        Button::ghost("Cancel").at(w - em(112.0), y - em(14.0)).width(em(90.0)).on_click(plain(q, Act::AnswerRun(None))).render(ctx);
+                        body_y += em(40.0);
+                        lines_fit = lines_fit.saturating_sub(2).max(1);
+                    }
                     let all: Vec<&str> = s.output.lines().collect();
                     for (i, l) in all.iter().skip(all.len().saturating_sub(lines_fit)).enumerate() {
                         mono(ctx, side_w() + em(12.0), body_y + i as f32 * em(18.0), &fit(l, width, type_size::SM), t.text_primary());

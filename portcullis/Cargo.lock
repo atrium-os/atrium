@@ -139,6 +139,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-devevents"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "atrium-devices"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "atrium-fonts"
 version = "0.1.0"
 dependencies = [
@@ -152,6 +169,15 @@ version = "0.1.0"
 dependencies = [
  "idna",
  "url",
+]
+
+[[package]]
+name = "atrium-media"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
@@ -423,6 +449,23 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "dispensator"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "atrium-devevents",
+ "atrium-devices",
+ "atrium-media",
+ "jaild",
+ "libc",
+ "portcullis-identity",
+ "portcullis-peer",
+ "praeco",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -983,6 +1026,7 @@ dependencies = [
  "atrium-fonts",
  "base64",
  "blake3",
+ "dispensator",
  "libc",
  "nuntius",
  "opifex-catalog",

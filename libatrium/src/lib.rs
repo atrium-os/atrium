@@ -1110,10 +1110,19 @@ static FRESCO_CONN: Mutex<Option<fresco_client::Connection>> = Mutex::new(None);
 fn fresco_ensure_open() -> bool {
     let mut g = FRESCO_CONN.lock().unwrap();
     if g.is_some() { return true; }
-    let Some(path) = std::env::var_os("ATRIUM_FRESCO_SOCKET") else {
-        return false;
+    // `$ATRIUM_FRESCO_SOCKET`, else where Portcullis puts Fresco in an app's
+    // jail (an app it launched, a dev app from Run, has no variable).
+    let path = match std::env::var_os("ATRIUM_FRESCO_SOCKET") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let jailed = std::path::Path::new(fresco_client::JAILED_FRESCO_SOCKET);
+            if !jailed.exists() {
+                return false;
+            }
+            jailed.to_path_buf()
+        }
     };
-    if let Ok(c) = fresco_client::Connection::connect(std::path::Path::new(&path)) {
+    if let Ok(c) = fresco_client::Connection::connect(&path) {
         *g = Some(c);
         true
     } else {
