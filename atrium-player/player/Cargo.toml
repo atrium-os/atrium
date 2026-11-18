@@ -40,6 +40,8 @@ hospes-proto = { path = "../../hospes/hospes-proto", features = ["std"] }
 portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
 # Files opened in the player from Scrinium (opening-files.md §6.2).
 atrium-open = { path = "../../atrium-open" }
+# The decode worker as a declared worker (app-composition.md §4).
+atrium-worker = { path = "../../sdk/atrium-worker" }
 
 [features]
 # Start hospes-codec beside the worker when OpenH264 is installed (hospes.md §9).

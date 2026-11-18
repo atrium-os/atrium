@@ -16,6 +16,19 @@ network  = "none"
 # Limen roles it embeds. Without this key a platform bundle keeps every role.
 embeds = []
 
+# The decoder (docs/spec/atrium-player.md §2): demux and decode of the file
+# the person opened, in capability mode, with no files, no network and a
+# memory limit. One per playback (a session), started by atrium-worker's
+# spawn_socket with the codec and CDM hosts' sockets. Capsicum for now: a
+# jail's WorkerCall carries only three descriptors, and a jail per playback
+# must first be as quick to start as a fork (app-composition.md C4).
+[[workers]]
+name      = "decode"
+entry     = "bin/atrium-player-decode"
+lifetime  = "session"
+isolation = "capsicum"
+memory    = "768M"
+
 [[opens]]
 types = ["audio/flac", "audio/mpeg", "audio/ogg", "audio/wav", "audio/aac", "audio/mp4",
          "video/mp4", "video/webm", "video/x-matroska", "video/quicktime"]
