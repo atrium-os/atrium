@@ -25,8 +25,12 @@
 //! **Selection and editing** draw in an overlay above the tiles, so
 //! moving the selection never touches a tile.
 //!
-//! Not yet: frozen panes of the sheet's own rows and columns (only the
-//! headers are frozen), row resizing, auto-scroll while dragging a
+//! **Frozen panes** ([`GridSource::frozen`]): bands over the body, each a
+//! viewport that moves on one axis (the corner on none), draw the frozen
+//! rows and columns and their labels; presses there map to the unscrolled
+//! cells ([`Geom::content`]), and moving the cursor keeps it clear of them.
+//!
+//! Not yet: row resizing, auto-scroll while dragging a
 //! selection past the edge, Ctrl+arrow data edges beyond what the source
 //! says, and placing the caret by pointer in the editor.
 
@@ -312,6 +316,11 @@ pub trait GridSource {
     fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
         Vec::new()
     }
+    /// Rows and columns frozen at the top and left, kept in view while the
+    /// rest scrolls ((0, 0): none).
+    fn frozen(&self) -> (u32, u32) {
+        (0, 0)
+    }
     /// The last used cell (Ctrl + End).
     fn last_used(&self) -> (u32, u32) {
         (self.rows().saturating_sub(1), self.cols().saturating_sub(1))
@@ -469,6 +478,19 @@ struct Geom {
     rows: u32,
     cols: u32,
     ext: [f64; 2],
+    /// The frozen rows and columns, and their size in px (width, height), at
+    /// most the body's.
+    frozen: (u32, u32),
+    fz: [f64; 2],
+}
+
+impl Geom {
+    /// The content point under window point `p`: in the frozen bands, the
+    /// unscrolled place; elsewhere, the scrolled one.
+    fn content(&self, st: &ScrollState, p: crate::geom::Point) -> (f64, f64) {
+        let (dx, dy) = ((p.x - self.body.x()) as f64, (p.y - self.body.y()) as f64);
+        (if dx < self.fz[0] { dx } else { st.physics_x.y + dx }, if dy < self.fz[1] { dy } else { st.physics.y + dy })
+    }
 }
 
 pub struct GridView {
@@ -532,7 +554,10 @@ impl GridView {
         let (tiles_r, _) = Self::tiles(&*src, st.physics_x.y, st.physics.y, r.w() as f64, r.h() as f64);
         let header_w = Self::header_width((tiles_r.1 + 1) * TILE_ROWS);
         let body = Rect::new(r.x() + header_w, r.y() + HEADER_H, (r.w() - header_w).max(0.0), (r.h() - HEADER_H).max(0.0));
-        let geom = Geom { body, rows, cols, ext };
+        let frozen = src.frozen();
+        let frozen = (frozen.0.min(rows), frozen.1.min(cols));
+        let fz = [src.col_left(frozen.1).min(body.w() as f64 * 0.75), src.row_top(frozen.0).min(body.h() as f64 * 0.75)];
+        let geom = Geom { body, rows, cols, ext, frozen, fz };
 
         // The scroll state knows the extent (and keeps a grid's zoom).
         if st.extent != Some(ext) || !st.fixed_zoom {
@@ -644,45 +669,7 @@ impl GridView {
                 // The selection, cut to the resident tiles (it can be a
                 // whole column of a billion rows).
                 let vis = CellRange { r0: tiles_r.0 * TILE_ROWS, c0: tiles_c.0 * TILE_COLS, r1: ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1, c1: ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 };
-                // A selection meeting part of a merged area shows all of it.
-                let sel = grow_to_merges(&*src, sel);
-                let one = src.merge_at(gs.cursor.0, gs.cursor.1).unwrap_or(CellRange::of(gs.cursor, gs.cursor));
-                let cut = CellRange { r0: sel.r0.max(vis.r0), c0: sel.c0.max(vis.c0), r1: sel.r1.min(vis.r1), c1: sel.c1.min(vis.c1) };
-                if sel != one && cut.r0 <= cut.r1 && cut.c0 <= cut.c1 {
-                    let (sx, sy) = at(src.col_left(cut.c0), src.row_top(cut.r0));
-                    let (ex, ey) = at(src.col_left(cut.c1 + 1), src.row_top(cut.r1 + 1));
-                    let mut fill = t.accent_fill();
-                    fill.a = 0.12;
-                    ctx.add(Node::Rect { rect: Rect::new(sx, sy, ex - sx, ey - sy), fill, radius: 0.0 });
-                }
-                let (ar, ac) = gs.cursor;
-                if vis.contains(ar, ac) {
-                    // The active cell, or the whole merged area it is in.
-                    let (sx, sy) = at(src.col_left(one.c0), src.row_top(one.r0));
-                    let (ex, ey) = at(src.col_left(one.c1 + 1), src.row_top(one.r1 + 1));
-                    let (w, h) = (ex - sx, ey - sy);
-                    if let Some(ed) = &gs.edit {
-                        // The editor: as wide as its text needs, from the cell.
-                        let style = text(TEXT_SIZE, Weight::Regular, t.text_primary());
-                        let tw = crate::text::measure(ed.text(), &style).w;
-                        let ew = w.max(tw + 2.0 * PAD + 2.0);
-                        ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, h), fill: t.bg_canvas(), radius: 0.0 });
-                        let lh = TEXT_SIZE * 1.3;
-                        let ty = sy + ((h - lh) / 2.0).max(0.0);
-                        if ed.has_selection() {
-                            let s = ed.selection();
-                            let a = crate::text::measure(&ed.text()[..s.start], &style).w;
-                            let b = crate::text::measure(&ed.text()[..s.end], &style).w;
-                            ctx.add(Node::Rect { rect: Rect::new(sx + PAD + a, ty, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
-                        }
-                        let cx = crate::text::measure(&ed.text()[..ed.caret()], &style).w;
-                        ctx.add(Node::Text { rect: Rect::new(sx + PAD, ty, tw, lh), content: ed.text().to_string(), style });
-                        ctx.add(Node::Rect { rect: Rect::new(sx + PAD + cx, ty, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
-                        ring(ctx, Rect::new(sx, sy, ew, h), t.accent_fg());
-                    } else {
-                        ring(ctx, Rect::new(sx, sy, w, h), t.accent_fg());
-                    }
-                }
+                emit_overlay(ctx, &*src, &t, &gs, vis, &at);
             }
             ctx.pop();
             // Floats (charts) over the cells, those meeting the view.
@@ -731,13 +718,12 @@ impl GridView {
             }
             more
         });
-        {
+        let drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
             let placed = placed.clone();
-            ctx.on_drag(body_id, move |phase, p| {
+            Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 let st = sc.get();
-                let cx = st.physics_x.y + (p.x - geom.body.x()) as f64;
-                let cy = st.physics.y + (p.y - geom.body.y()) as f64;
+                let (cx, cy) = geom.content(&st, p);
                 if geom.rows == 0 || geom.cols == 0 {
                     return;
                 }
@@ -793,11 +779,15 @@ impl GridView {
                     _ => return,
                 }
                 gst.set(g);
-            });
-        }
+            })
+        };
         {
+            let d = drag.clone();
+            ctx.on_drag(body_id, move |ph, p| d(ph, p));
+        }
+        let keys: Rc<dyn Fn(&Event)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
-            ctx.on_key(body_id, move |ev| {
+            Rc::new(move |ev: &Event| {
                 let Event::Key { kind, key, modifiers, chars } = ev else { return };
                 if !kind.pressed() {
                     return;
@@ -810,7 +800,79 @@ impl GridView {
                         sc.set(st);
                     }
                 }
-            });
+            })
+        };
+        {
+            let k = keys.clone();
+            ctx.on_key(body_id, move |ev| k(ev));
+        }
+
+        // ---- frozen rows and columns: bands over the body that keep them in view ----
+        if frozen != (0, 0) && rows > 0 && cols > 0 {
+            let (fw, fh) = (fz[0] as f32, fz[1] as f32);
+            let scroll_node = Node::Scroll { rect: body, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: None, content_h: 0.0, offset_x: 0.0, content_w: 0.0 };
+            let all_c = (tiles_c.0 * TILE_COLS, (((tiles_c.1 + 1) * TILE_COLS).min(cols)).saturating_sub(1));
+            let all_r = (tiles_r.0 * TILE_ROWS, (((tiles_r.1 + 1) * TILE_ROWS).min(rows)).saturating_sub(1));
+            // (key, viewport, rows, columns, scrolls across, scrolls down)
+            let mut bands: Vec<(u64, Rect, (u32, u32), (u32, u32), bool, bool)> = Vec::new();
+            if frozen.0 > 0 && fh > 0.0 && tiles_c.0 <= tiles_c.1 {
+                bands.push((3, Rect::new(body.x(), body.y(), body.w(), fh), (0, frozen.0 - 1), (all_c.0.max(frozen.1), all_c.1), true, false));
+            }
+            if frozen.1 > 0 && fw > 0.0 && tiles_r.0 <= tiles_r.1 {
+                bands.push((4, Rect::new(body.x(), body.y(), fw, body.h()), (all_r.0.max(frozen.0), all_r.1), (0, frozen.1 - 1), false, true));
+            }
+            if frozen.0 > 0 && frozen.1 > 0 && fw > 0.0 && fh > 0.0 {
+                bands.push((5, Rect::new(body.x(), body.y(), fw, fh), (0, frozen.0 - 1), (0, frozen.1 - 1), false, false));
+            }
+            for (k, rect, rr, cr, across, down) in bands {
+                if rr.0 > rr.1 || cr.0 > cr.1 {
+                    continue;
+                }
+                let (ox, oy) = (if across { bx } else { 0.0 }, if down { by } else { 0.0 });
+                ctx.key(self.key + k);
+                let id = ctx.push(Node::Scroll {
+                    rect,
+                    offset: if down { (y - by) as f32 } else { 0.0 },
+                    zoom: 1.0,
+                    stretch: 1.0,
+                    backdrop: Some(t.bg_canvas()),
+                    content_h: 0.0,
+                    offset_x: if across { (x - bx) as f32 } else { 0.0 },
+                    content_w: 0.0,
+                });
+                {
+                    ctx.key(1);
+                    let page = ctx.push(Node::vstack(Rect::new(rect.x(), rect.y(), ((ext[0] - ox).clamp(0.0, 3.0 * REBASE)) as f32, ((ext[1] - oy).clamp(0.0, 3.0 * REBASE)) as f32), 0.0));
+                    ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
+                    let at = |px: f64, py: f64| (q(body.x() as f64 + (px - ox)), q(body.y() as f64 + (py - oy)));
+                    emit_cells(ctx, &*src, &t, rr, cr, &at);
+                    ctx.key(u64::MAX);
+                    let over = ctx.push(Node::vstack(rect, 0.0));
+                    ctx.set_flex(over, FlexStyle { free: true, ..FlexStyle::default() });
+                    emit_overlay(ctx, &*src, &t, &gs, CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 }, &at);
+                    ctx.pop();
+                    ctx.pop();
+                }
+                ctx.pop();
+                ctx.focusable(id);
+                let d = drag.clone();
+                ctx.on_drag(id, move |ph, p| d(ph, p));
+                let kk = keys.clone();
+                ctx.on_key(id, move |ev| kk(ev));
+                let (s, n) = (self.scroll.clone(), scroll_node.clone());
+                ctx.on_scroll(id, move |inp: &ScrollInput| {
+                    let mut st = s.get();
+                    st.input(inp.kind, inp.t, &n);
+                    s.set(st);
+                });
+            }
+            // The freeze lines.
+            if fh > 0.0 {
+                ctx.add(Node::Rect { rect: Rect::new(body.x(), body.y() + fh - 1.0, body.w(), 1.5), fill: t.border_strong(), radius: 0.0 });
+            }
+            if fw > 0.0 {
+                ctx.add(Node::Rect { rect: Rect::new(body.x() + fw - 1.0, body.y(), 1.5, body.h()), fill: t.border_strong(), radius: 0.0 });
+            }
         }
 
         // ---- column headers: a viewport that moves across only ----
@@ -858,14 +920,14 @@ impl GridView {
             ctx.pop();
         }
         ctx.pop();
-        {
+        let col_drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
-            ctx.on_drag(colh, move |phase, p| {
+            Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 if geom.cols == 0 || geom.rows == 0 {
                     return;
                 }
                 let st = sc.get();
-                let cx = st.physics_x.y + (p.x - geom.body.x()) as f64;
+                let (cx, _) = geom.content(&st, crate::geom::Point::new(p.x, geom.body.y() + geom.fz[1] as f32));
                 let c = src.col_at(cx.max(0.0));
                 let mut g = gst.get_cloned();
                 match (phase, g.drag) {
@@ -900,7 +962,11 @@ impl GridView {
                     _ => return,
                 }
                 gst.set(g);
-            });
+            })
+        };
+        {
+            let d = col_drag.clone();
+            ctx.on_drag(colh, move |ph, p| d(ph, p));
         }
 
         // ---- row headers: a viewport that moves down only ----
@@ -946,14 +1012,14 @@ impl GridView {
             ctx.pop();
         }
         ctx.pop();
-        {
+        let row_drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
-            ctx.on_drag(rowh, move |phase, p| {
+            Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 if geom.cols == 0 || geom.rows == 0 {
                     return;
                 }
                 let st = sc.get();
-                let cy = st.physics.y + (p.y - geom.body.y()) as f64;
+                let (_, cy) = geom.content(&st, crate::geom::Point::new(geom.body.x() + geom.fz[0] as f32, p.y));
                 let row = src.row_at(cy.max(0.0));
                 let mut g = gst.get_cloned();
                 match phase {
@@ -968,7 +1034,60 @@ impl GridView {
                     _ => return,
                 }
                 gst.set(g);
-            });
+            })
+        };
+        {
+            let d = row_drag.clone();
+            ctx.on_drag(rowh, move |ph, p| d(ph, p));
+        }
+
+        // ---- the frozen columns' and rows' labels, kept in view ----
+        if fz[0] > 0.0 && frozen.1 > 0 {
+            ctx.key(self.key + 6);
+            let fr = Rect::new(body.x(), r.y(), fz[0] as f32, HEADER_H);
+            let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
+            for c in 0..frozen.1 {
+                let (xl, xr) = (src.col_left(c), src.col_left(c + 1));
+                let (cx, w) = (q(body.x() as f64 + xl), (xr - xl) as f32);
+                let on = c >= sel.c0 && c <= sel.c1;
+                if on {
+                    ctx.add(Node::Rect { rect: Rect::new(cx, r.y(), w, HEADER_H), fill: t.accent_bg(), radius: 0.0 });
+                }
+                let label = src.col_label(c);
+                let st = if on { hstyle_on.clone() } else { hstyle.clone() };
+                let lw = crate::text::measure_chars(&label, &st);
+                if lw <= w {
+                    ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), r.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
+                }
+                ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, r.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
+            }
+            ctx.pop();
+            let d = col_drag.clone();
+            ctx.on_drag(id, move |ph, p| d(ph, p));
+        }
+        if fz[1] > 0.0 && frozen.0 > 0 {
+            ctx.key(self.key + 7);
+            let fr = Rect::new(r.x(), body.y(), header_w, fz[1] as f32);
+            let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
+            for row in 0..frozen.0 {
+                let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
+                if yb <= yt {
+                    continue;
+                }
+                let (cy, h) = (q(body.y() as f64 + yt), (yb - yt) as f32);
+                let on = row >= sel.r0 && row <= sel.r1;
+                if on {
+                    ctx.add(Node::Rect { rect: Rect::new(r.x(), cy, header_w, h), fill: t.accent_bg(), radius: 0.0 });
+                }
+                let label = src.row_label(row);
+                let st = if on { hstyle_on.clone() } else { hstyle.clone() };
+                let lw = crate::text::measure_chars(&label, &st);
+                ctx.add(Node::Text { rect: Rect::new(r.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
+                ctx.add(Node::Rect { rect: Rect::new(r.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
+            }
+            ctx.pop();
+            let d = row_drag.clone();
+            ctx.on_drag(id, move |ph, p| d(ph, p));
         }
 
         // ---- the corner and the header edges ----
@@ -1016,6 +1135,116 @@ pub fn grow_to_merges(src: &dyn GridSource, mut r: CellRange) -> CellRange {
         r = g;
     }
     r
+}
+
+/// The selection (cut to `vis`) and, when it is in `vis`, the active cell or
+/// its editor, placed by `at` (content px to window px).
+fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32)) {
+    // A selection meeting part of a merged area shows all of it.
+    let sel = grow_to_merges(src, gs.selection());
+    let one = src.merge_at(gs.cursor.0, gs.cursor.1).unwrap_or(CellRange::of(gs.cursor, gs.cursor));
+    let cut = CellRange { r0: sel.r0.max(vis.r0), c0: sel.c0.max(vis.c0), r1: sel.r1.min(vis.r1), c1: sel.c1.min(vis.c1) };
+    if sel != one && cut.r0 <= cut.r1 && cut.c0 <= cut.c1 {
+        let (sx, sy) = at(src.col_left(cut.c0), src.row_top(cut.r0));
+        let (ex, ey) = at(src.col_left(cut.c1 + 1), src.row_top(cut.r1 + 1));
+        let mut fill = t.accent_fill();
+        fill.a = 0.12;
+        ctx.add(Node::Rect { rect: Rect::new(sx, sy, ex - sx, ey - sy), fill, radius: 0.0 });
+    }
+    let (ar, ac) = gs.cursor;
+    if !vis.contains(ar, ac) {
+        return;
+    }
+    // The active cell, or the whole merged area it is in.
+    let (sx, sy) = at(src.col_left(one.c0), src.row_top(one.r0));
+    let (ex, ey) = at(src.col_left(one.c1 + 1), src.row_top(one.r1 + 1));
+    let (w, h) = (ex - sx, ey - sy);
+    let Some(ed) = &gs.edit else {
+        ring(ctx, Rect::new(sx, sy, w, h), t.accent_fg());
+        return;
+    };
+    // The editor: as wide as its text needs, from the cell.
+    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: t.text_primary() };
+    let tw = crate::text::measure(ed.text(), &style).w;
+    let ew = w.max(tw + 2.0 * PAD + 2.0);
+    ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, h), fill: t.bg_canvas(), radius: 0.0 });
+    let lh = TEXT_SIZE * 1.3;
+    let ty = sy + ((h - lh) / 2.0).max(0.0);
+    if ed.has_selection() {
+        let s = ed.selection();
+        let a = crate::text::measure(&ed.text()[..s.start], &style).w;
+        let b = crate::text::measure(&ed.text()[..s.end], &style).w;
+        ctx.add(Node::Rect { rect: Rect::new(sx + PAD + a, ty, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
+    }
+    let cx = crate::text::measure(&ed.text()[..ed.caret()], &style).w;
+    ctx.add(Node::Text { rect: Rect::new(sx + PAD, ty, tw, lh), content: ed.text().to_string(), style });
+    ctx.add(Node::Rect { rect: Rect::new(sx + PAD + cx, ty, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+    ring(ctx, Rect::new(sx, sy, ew, h), t.accent_fg());
+}
+
+/// Cells `rr` × `cr` (inclusive): grid lines, contents and the merged areas
+/// meeting them, placed by `at`, in groups keyed by tile as the body's.
+fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), at: &dyn Fn(f64, f64) -> (f32, f32)) {
+    let line = t.border_default();
+    for tr in rr.0 / TILE_ROWS..=rr.1 / TILE_ROWS {
+        for tc in cr.0 / TILE_COLS..=cr.1 / TILE_COLS {
+            let (r0, r1) = ((tr * TILE_ROWS).max(rr.0), ((tr + 1) * TILE_ROWS - 1).min(rr.1));
+            let (c0, c1) = ((tc * TILE_COLS).max(cr.0), ((tc + 1) * TILE_COLS - 1).min(cr.1));
+            let (top, bottom) = (src.row_top(r0), src.row_top(r1 + 1));
+            let (left, right) = (src.col_left(c0), src.col_left(c1 + 1));
+            let (tx, ty) = at(left, top);
+            let (tw, th) = ((right - left) as f32, (bottom - top) as f32);
+            ctx.key(2 + ((tr as u64) << 20 | tc as u64));
+            let tile = ctx.push(Node::vstack(Rect::new(tx, ty, tw, th), 0.0));
+            ctx.set_flex(tile, FlexStyle { free: true, ..FlexStyle::default() });
+            for row in r0..=r1 {
+                let (_, yb) = at(left, src.row_top(row + 1));
+                ctx.add(Node::Rect { rect: Rect::new(tx, yb - 1.0, tw, 1.0), fill: line, radius: 0.0 });
+            }
+            for col in c0..=c1 {
+                let (xr, _) = at(src.col_left(col + 1), top);
+                ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
+            }
+            for row in r0..=r1 {
+                let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
+                if yb <= yt {
+                    continue;
+                }
+                for col in c0..=c1 {
+                    if src.merge_at(row, col).is_some() {
+                        continue;
+                    }
+                    let Some(cv) = src.cell(row, col) else { continue };
+                    let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
+                    let (cx, cy) = at(xl, yt);
+                    draw_cell(ctx, t, &cv, cx, cy, (xr - xl) as f32, (yb - yt) as f32);
+                }
+            }
+            ctx.pop();
+        }
+    }
+    let merged = src.merges_in(CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 });
+    if merged.is_empty() {
+        return;
+    }
+    ctx.key(u64::MAX - 1);
+    let (lx, ly) = at(src.col_left(cr.0), src.row_top(rr.0));
+    let (lx1, ly1) = at(src.col_left(cr.1 + 1), src.row_top(rr.1 + 1));
+    let layer = ctx.push(Node::vstack(Rect::new(lx, ly, lx1 - lx, ly1 - ly), 0.0));
+    ctx.set_flex(layer, FlexStyle { free: true, ..FlexStyle::default() });
+    for m in merged {
+        let (cx, cy) = at(src.col_left(m.c0), src.row_top(m.r0));
+        let (ex, ey) = at(src.col_left(m.c1 + 1), src.row_top(m.r1 + 1));
+        let (cw, ch) = (ex - cx, ey - cy);
+        if cw <= 1.0 || ch <= 1.0 {
+            continue;
+        }
+        ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw - 1.0, ch - 1.0), fill: t.bg_canvas(), radius: 0.0 });
+        if let Some(cv) = src.cell(m.r0, m.c0) {
+            draw_cell(ctx, t, &cv, cx, cy, cw, ch);
+        }
+    }
+    ctx.pop();
 }
 
 /// One cell's ground, bar, borders, icon and text in the box (`cx`, `cy`,
@@ -1130,20 +1359,26 @@ fn reveal(src: &dyn GridSource, geom: &Geom, st: &mut ScrollState, cell: (u32, u
     st.physics_x.set_max(geom.ext[0] - geom.body.w() as f64);
     let (top, bottom) = (src.row_top(r), src.row_top(r + 1));
     let (h, w) = (geom.body.h() as f64, geom.body.w() as f64);
-    if top < st.physics.y {
-        st.physics.stop();
-        st.physics.set_position(top);
-    } else if bottom > st.physics.y + h {
-        st.physics.stop();
-        st.physics.set_position(bottom - h);
+    // Frozen rows and columns are always in view; the others must clear them.
+    let [fw, fh] = geom.fz;
+    if r >= geom.frozen.0 {
+        if top < st.physics.y + fh {
+            st.physics.stop();
+            st.physics.set_position((top - fh).max(0.0));
+        } else if bottom > st.physics.y + h {
+            st.physics.stop();
+            st.physics.set_position((bottom - h).min(top - fh));
+        }
     }
     let (left, right) = (src.col_left(c), src.col_left(c + 1));
-    if left < st.physics_x.y {
-        st.physics_x.stop();
-        st.physics_x.set_position(left);
-    } else if right > st.physics_x.y + w {
-        st.physics_x.stop();
-        st.physics_x.set_position((right - w).min(left));
+    if c >= geom.frozen.1 {
+        if left < st.physics_x.y + fw {
+            st.physics_x.stop();
+            st.physics_x.set_position((left - fw).max(0.0));
+        } else if right > st.physics_x.y + w {
+            st.physics_x.stop();
+            st.physics_x.set_position((right - w).min(left - fw));
+        }
     }
 }
 
@@ -1350,11 +1585,12 @@ mod tests {
         widths: RefCell<HashMap<u32, f64>>,
         cells: RefCell<HashMap<(u32, u32), String>>,
         merges: RefCell<Vec<CellRange>>,
+        frozen: std::cell::Cell<(u32, u32)>,
     }
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default() }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -1400,6 +1636,9 @@ mod tests {
         }
         fn merges_in(&self, g: CellRange) -> Vec<CellRange> {
             self.merges.borrow().iter().filter(|m| m.r0 <= g.r1 && g.r0 <= m.r1 && m.c0 <= g.c1 && g.c0 <= m.c1).copied().collect()
+        }
+        fn frozen(&self) -> (u32, u32) {
+            self.frozen.get()
         }
     }
 
@@ -1488,6 +1727,51 @@ mod tests {
         assert!(d.iter().any(|d| matches!(d, NodeDelta::Added { node: Node::Text { content, .. }, .. } if content == "here")), "the cell at row 999,999,001 sent");
         let row_label = "999999001".to_string();
         assert!(app.tree().iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if *content == row_label)), "its row header");
+    }
+
+    #[test]
+    fn frozen_rows_and_columns_stay_in_view() {
+        let (mut app, grid, scroll, state, _) = host(200, 40);
+        grid.frozen.set((1, 1));
+        app.tick();
+        let mut st = scroll.get();
+        st.physics.set_position(400.0);
+        st.physics_x.set_position(640.0);
+        scroll.set(st);
+        app.tick();
+        // The frozen row's and column's cells and labels are drawn, though
+        // scrolled past: row 0 shows its numbers, and "A" and "1" label them.
+        let shown: Vec<String> = app.tree().iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        for want in ["0", "A", "1", "12", "21000"] {
+            assert!(shown.iter().any(|t| t == want), "{want} in {shown:?}");
+        }
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let click = |app: &mut App<Host>, x: f32, y: f32| {
+            app.handle_event(Event::PointerDown { at: Point::new(x, y) });
+            app.handle_event(Event::PointerUp { at: Point::new(x, y) });
+            app.tick();
+        };
+        // A press in the frozen row picks row 0, in the column scrolled to.
+        click(&mut app, hw + 64.0 + 2.0 * 64.0 + 10.0, HEADER_H + 5.0);
+        assert_eq!(state.get_cloned().cursor, (0, 13));
+        // In the frozen column: column 0, in the row scrolled to.
+        click(&mut app, hw + 10.0, HEADER_H + 3.0 * 20.0 + 5.0);
+        assert_eq!(state.get_cloned().cursor, (23, 0));
+        // Up to row 20 from 21: it scrolls to show it just under the frozen row.
+        let mut g = state.get_cloned();
+        g.select(21, 12);
+        state.set(g);
+        app.tick();
+        key(&mut app, Key::Up, "", Modifiers::default());
+        assert_eq!(state.get_cloned().cursor, (20, 12));
+        assert_eq!(scroll.get().physics.y, 380.0);
+        // Moving into the frozen row doesn't scroll.
+        let mut g = state.get_cloned();
+        g.select(1, 12);
+        state.set(g);
+        key(&mut app, Key::Up, "", Modifiers::default());
+        assert_eq!(state.get_cloned().cursor, (0, 12));
+        assert_eq!(scroll.get().physics.y, 380.0);
     }
 
     #[test]

@@ -3622,7 +3622,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
 - **Sorting** a range with merged cells works when every row is merged across the same columns, one row high and inside the range (`sort::merges_allow_sort`); the merges stay put as the rows move. Anything else is refused with "To sort, every row needs the same merged cells; unmerge them first." Excel also sorts blocks of rows merged to the same height; we don't yet.
 - **Printing** merged areas as one cell: done by the printing thread (c7af758b).
-- **Not yet:** the editor spanning the area while typing, and Excel's "Center Across Selection" without merging.
+- **Not yet:** Excel's "Center Across Selection" without merging. (The editor already spans the merged area while typing.)
 - **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.
 
 ### 16.80 Cell comments (2026-11-18)
@@ -3655,6 +3655,22 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - With the cursor on a link cell and no edit open, the target shows beside the cell ("Go to Sheet2!B4" for a place) with "Ctrl+click to open". It shares the comment box when the cell has both.
 - **Not yet:** link styles in printing.
 - **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`; pergola `ctrl_click_selects_and_asks_to_follow`.
+
+### 16.82 Frozen panes (2026-11-18)
+
+- **Engine.** `Sheet::freeze` holds the rows and columns frozen at the top and left ((0, 0): none). `GridOp::Freeze` (journal tag 19) sets it as one undo step, and the native file keeps it in chunk `FREEZE` (19). A frozen sheet isn't bare (DropSheet leaves it), and deleting a sheet undoes its panes with it.
+- **Files.**
+  - **.xlsx:** `<sheetView><pane xSplit ySplit topLeftCell activePane state="frozen"/>`. Split (not frozen) panes are noted as dropped.
+  - **.ods:** LibreOffice's `settings.xml` view settings, per sheet (`HorizontalSplitMode`/`VerticalSplitMode` 2 and their positions). LibreOffice reads them only when the root declares its `xlink` and `ooo` namespaces too, which we do.
+  - **LibreOffice:** it keeps our panes both ways (`officina-convert/tests/freeze.rs`). Headless conversion has no view, so LibreOffice writes no view settings at all and the panes are lost. The test therefore opens each file with a view: `tests/lo_view.py` runs under Xvfb through Python's `uno`, and the test skips without them.
+- **Grid** (`pergola` `GridSource::frozen`).
+  - Bands drawn over the body keep the frozen cells in view. The frozen rows' band moves only across, the frozen columns' band only down, and their corner not at all. Each band draws its cells, merged areas, the selection and the editor. The frozen labels stay in the headers, and a darker line marks the freeze.
+  - A press in a band means the unscrolled cell. Keys, drags and the wheel work there as on the body.
+  - Moving the cursor scrolls so that it clears the frozen rows and columns, and moving into them doesn't scroll.
+  - The frozen area is at most three quarters of the view.
+- **Sheets.** Data ▸ Freeze Panes keeps the rows above the cursor and the columns left of it in view. Freeze Top Row keeps the first row. With panes frozen, the item reads Unfreeze Panes. Each is one undo step.
+- **Not yet:** charts over the frozen area (drawn under the bands), freezing from a row other than the first (Excel freezes from the row at the top of the view), and repeating frozen rows when printing.
+- **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
