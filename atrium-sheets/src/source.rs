@@ -25,6 +25,9 @@ pub struct SheetSource {
     /// Row sizes with hidden rows zero high, while the sheet hides any, keyed by what
     /// they were built from.
     view: RefCell<Option<(ViewKey, officina_grid::column::Sizes)>>,
+    /// The cell whose comment is shown beside it (the cursor's, while not
+    /// editing); the window sets it each frame.
+    pub note_at: std::cell::Cell<Option<(u32, u32)>>,
 }
 
 type ViewKey = (u16, usize, usize, usize, usize, u64);
@@ -32,7 +35,7 @@ type ChartKey = (u16, u32, u32, u64, bool);
 
 impl SheetSource {
     pub fn new(doc: Rc<RefCell<Doc>>) -> Self {
-        Self { doc, view: RefCell::new(None), charts: RefCell::new(Vec::new()) }
+        Self { doc, view: RefCell::new(None), charts: RefCell::new(Vec::new()), note_at: std::cell::Cell::new(None) }
     }
 
     /// `f` over the sheet's row sizes as laid out (hidden rows zero high).
@@ -372,6 +375,92 @@ impl SheetSource {
     }
 }
 
+/// The comment box's width, px, and its most lines.
+const NOTE_W: f32 = 220.0;
+const NOTE_LINES: usize = 10;
+
+/// `text` broken into lines at most `w` wide (words longer than a line are cut
+/// by characters), at most `max` of them (the last ending in "…" when cut).
+pub fn wrap_lines(text: &str, style: &pergola::TextStyle, w: f32, max: usize) -> Vec<String> {
+    let fits = |s: &str| pergola::text::measure(s, style).w <= w;
+    let mut out: Vec<String> = Vec::new();
+    'paras: for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split(' ') {
+            let tried = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if fits(&tried) {
+                line = tried;
+                continue;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            // A word wider than a line goes in pieces.
+            let mut piece = String::new();
+            for ch in word.chars() {
+                piece.push(ch);
+                if !fits(&piece) && piece.chars().count() > 1 {
+                    piece.pop();
+                    out.push(std::mem::replace(&mut piece, ch.to_string()));
+                }
+            }
+            line = piece;
+            if out.len() > max {
+                break 'paras;
+            }
+        }
+        out.push(line);
+        if out.len() > max {
+            break;
+        }
+    }
+    if out.len() > max {
+        out.truncate(max);
+        if let Some(l) = out.last_mut() {
+            l.push('…');
+        }
+    }
+    out
+}
+
+impl SheetSource {
+    /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
+    fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
+        let (r, c) = self.note_at.get()?;
+        let (author, text) = {
+            let d = self.doc.borrow();
+            let k = d.wb.comment(d.sheet, r, c)?;
+            (k.author.to_string(), k.text.to_string())
+        };
+        let ink = Color::rgba(0.11, 0.11, 0.09, 1.0);
+        let st = |bold: bool| pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: 12.0, weight: if bold { pergola::theme::Weight::Semibold } else { pergola::theme::Weight::Regular }, color: ink };
+        let pad = 8.0;
+        let lh = 16.0;
+        let mut lines: Vec<(String, bool)> = Vec::new();
+        if !author.is_empty() {
+            lines.push((author, true));
+        }
+        lines.extend(wrap_lines(&text, &st(false), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, false)));
+        let h = 2.0 * pad + lh * lines.len() as f32;
+        let mut nodes = vec![
+            pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, NOTE_W, h), fill: Color::rgba(0.55, 0.5, 0.3, 1.0), radius: 3.0 },
+            pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, NOTE_W - 2.0, h - 2.0), fill: Color::rgba(1.0, 0.97, 0.78, 1.0), radius: 2.0 },
+        ];
+        for (i, (l, bold)) in lines.into_iter().enumerate() {
+            let w = pergola::text::measure(&l, &st(bold)).w.min(NOTE_W - 2.0 * pad);
+            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad + i as f32 * lh, w, lh), content: l, style: st(bold) });
+        }
+        // Beside the cell (or its merged area), level with its top.
+        let (c1, r0) = {
+            let d = self.doc.borrow();
+            d.wb.merge_at(CellAddr::new(d.sheet, r, c)).map_or((c, r), |m| (m.c1, m.r0))
+        };
+        let x = self.col_left(c1 + 1) + 6.0;
+        let y = self.row_top(r0);
+        Some(pergola::widgets::GridFloat { key: 1 << 62, at: [x, y, NOTE_W as f64, h as f64], nodes: std::rc::Rc::new(nodes), movable: false })
+    }
+}
+
 impl GridSource for SheetSource {
     fn merge_at(&self, r: u32, c: u32) -> Option<CellRange> {
         let d = self.doc.borrow();
@@ -384,6 +473,7 @@ impl GridSource for SheetSource {
     }
     fn floats(&self, view: [f64; 4], theme: &pergola::theme::Semantic) -> Vec<pergola::widgets::GridFloat> {
         let mut out = self.data_marks(view, theme);
+        out.extend(self.note_float());
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {
@@ -482,6 +572,11 @@ impl GridSource for SheetSource {
             }
         }
         let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v) };
+        if d.wb.comment(d.sheet, r, c).is_some() {
+            let mut v = cv.unwrap_or_else(|| CellView::text(""));
+            v.note = true;
+            cv = Some(v);
+        }
         // Still to be recalculated: the old value, greyed (§8.4).
         if d.wb.is_stale(d.sheet, r, c) {
             if let Some(v) = cv.as_mut() {

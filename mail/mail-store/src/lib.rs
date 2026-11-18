@@ -279,6 +279,7 @@ impl Store {
             tx.open_table(later::LATER)?;
             tx.open_table(later::LATER_BY_THREAD)?;
             tx.open_table(later::FOLLOW_UPS)?;
+            tx.open_table(later::LATER_DROPPED)?;
             tx.open_table(people::PEOPLE)?;
             tx.open_table(people::PEOPLE_COUNTED)?;
             let mut meta = tx.open_table(META)?;

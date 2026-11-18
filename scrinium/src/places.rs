@@ -76,6 +76,34 @@ pub fn home_in(dir: &Path) -> Vec<Place> {
         .collect()
 }
 
+/// The named personas' folders (personas.md §4.1): portcullisd puts
+/// `~/.atrium/personas` in the jail at `/atrium/personas`
+/// (`SCRINIUM_PERSONAS` in a development run), a folder per persona with
+/// the same five folders, each one's own.
+pub fn personas() -> Vec<Place> {
+    let dir = std::env::var_os("SCRINIUM_PERSONAS").map(PathBuf::from).unwrap_or_else(|| "/atrium/personas".into());
+    personas_in(&dir)
+}
+
+pub fn personas_in(dir: &Path) -> Vec<Place> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.is_empty() && n != "personal" && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+            .collect())
+        .unwrap_or_default();
+    names.sort();
+    let mut out = Vec::new();
+    for n in names {
+        for f in HOME_FOLDERS {
+            let root = dir.join(&n).join(f);
+            if root.is_dir() {
+                out.push(Place { id: format!("persona:{n}:{}", f.to_ascii_lowercase()), label: (*f).into(), root, stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() });
+            }
+        }
+    }
+    out
+}
+
 /// The person's workspaces (homes.md §5), one place: each workspace's
 /// folder holds its `work`. `SCRINIUM_WORKSPACES`, else `/atrium/workspaces`.
 pub fn workspaces() -> Option<Place> {

@@ -41,11 +41,13 @@ pub struct Sheet {
     pub tab_color: Option<u32>,
     /// Merged areas ([`crate::merges`]): disjoint, sorted by top row then left column.
     pub(crate) merges: Vec<Rect>,
+    /// Cell comments ([`crate::comments`]).
+    pub(crate) comments: crate::comments::Comments,
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new() }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -230,6 +232,7 @@ impl Workbook {
             n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
             n += sh.hidden.len() as u64 * 8;
             n += sh.merges.len() as u64 * 20;
+            n += sh.comments.values().map(|k| 64 + k.author.len() as u64 + k.text.len() as u64).sum::<u64>();
         }
         n += self.strings.bytes();
         for (_, g) in self.groups() {
@@ -273,7 +276,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty();
+        let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty();
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;

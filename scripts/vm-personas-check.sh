@@ -31,7 +31,7 @@
 #     the VM too.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-export ARCH=amd64
+export ARCH=${ARCH:-amd64}   # ARCH=arm64: the arm64 cloud VM (~/atrium-vm)
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
@@ -45,7 +45,7 @@ TGT=${CARGO_TARGET_DIR:-$ROOT/portcullis/target}
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p portcullisd -p portcullis-cli -p opifex \
-    --bin portcullisd --bin portcullis --bin opifex --example home_probe) || { echo "build failed"; echo "personas: 1 failed"; exit 1; }
+    --bin portcullisd --bin portcullis --bin opifex --example home_probe --example download_probe) || { echo "build failed"; echo "personas: 1 failed"; exit 1; }
 if [ -z "${NO_UI:-}" ]; then
     (cd "$ROOT/frescod" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin frescod) || { echo "frescod build failed"; echo "personas: 1 failed"; exit 1; }
     (cd "$ROOT/forum-dock" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin forum-dock --example sample_app) || { echo "forum-dock build failed"; echo "personas: 1 failed"; exit 1; }
@@ -55,7 +55,7 @@ fi
 echo "=== install"
 B=/var/tmp/personas
 V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B"
-for b in release/portcullisd release/portcullis release/opifex release/examples/home_probe; do
+for b in release/portcullisd release/portcullis release/opifex release/examples/home_probe release/examples/download_probe; do
     scp -q $K -P 2222 "$TGT/$TARGET/$b" root@localhost:$B/ || exit 1
 done
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
@@ -131,6 +131,49 @@ check "an invalid name" "yes" "$(run alice $PROBE Work | grep -q 'no persona' &&
 check "bob has no work persona" "yes" "$(run bob $PROBE work | grep -q 'no persona' && echo yes)"
 check "the file manager spans personas" "yes" "$(run alice $FM work | grep -q 'runs once for every persona' && echo yes)"
 check "and none of them left an overlay" "" "$(V "ls -d /home/alice/.atrium/apps/$PROBE@home /home/alice/.atrium/apps/$FM@work /home/bob/.atrium/apps/$PROBE@work 2>/dev/null")"
+
+echo "=== storage per persona (P2)"
+# The file manager (home-files) spans the personas: portcullisd makes
+# Work's folders under ~/.atrium/personas/work, gives the file manager's
+# uid Work's files group and mounts them at /atrium/personas.
+L=$(run alice $FM); echo "  $L"
+check "the file manager sees Work's folders" "personas=[work]" "$(echo " $L" | grep -o 'personas=\[[^]]*\]')"
+check "…and can make a file in Work's Documents" "persona_made=ok" "$(echo " $L" | grep -o 'persona_made=[^ ]*')"
+check "~/.atrium/personas is root's" "root 755" "$(V "stat -f '%Su %Lp' /home/alice/.atrium/personas")"
+check "Work's Downloads: alice's, Work's group, 2770" "alice files-alice-work 2770" "$(V "stat -f '%Su %Sg %Mp%Lp' /home/alice/.atrium/personas/work/Downloads")"
+check "the file manager's file keeps Work's group" "files-alice-work" "$(V "stat -f '%Sg' /home/alice/.atrium/personas/work/Documents/probe.txt")"
+# Downloads (navigator-ui.md §6.4): the Navigator hands portcullisd the
+# file and portcullisd puts it in the Downloads of the Navigator's
+# persona. A probe holding navigator-broker stands in for navigatord; one
+# without it is refused.
+NAVP=org.test.navprobe; DLP=org.test.dlprobe
+V 'sh -s' <<EOS
+for s in navigator navigator-page fresco-chrome fresco-activation limen arca arca-courier monstrator opifex; do mkdir -p /atrium/sockets/\$s; done
+rm -f /home/alice/Downloads/report*.pdf /home/alice/.atrium/personas/work/Downloads/report*.pdf
+for id in $NAVP $DLP; do
+  opifex uninstall \$id >/dev/null 2>&1 || true
+  rm -rf /home/alice/.atrium/apps/\$id /home/alice/.atrium/apps/\$id@*
+  O=$B/\$id; rm -rf \$O; mkdir -p \$O/bin; cp $B/download_probe \$O/bin/
+  printf '[app]\nid = "%s"\nname = "Download probe"\nversion = "1"\nentry = "bin/download_probe"\n' \$id > \$O/atrium.toml
+  [ \$id = $NAVP ] && printf '\n[capabilities]\nnavigator-broker = true\n' >> \$O/atrium.toml
+  # The other reaches portcullisd's socket as a launcher does, no more.
+  [ \$id = $DLP ] && printf '\n[capabilities]\napp-launch = true\n' >> \$O/atrium.toml
+  openssl dgst -sha256 -sign /root/of-key.pem -out \$O/atrium.toml.sig \$O/atrium.toml
+  opifex install \$O >/dev/null
+done
+EOS
+V "su -m alice -c 'portcullis policy grant $NAVP; portcullis policy grant $DLP' >/dev/null 2>&1; portcullis policy grant --system $NAVP >/dev/null 2>&1; portcullis policy grant --system $DLP >/dev/null 2>&1"
+dl() { V "su -m alice -c 'portcullis launch --no-prompt ${2:+--persona $2 }$1' 2>&1" | grep -E 'download-probe:|portcullis launch' | tail -1; }
+L=$(dl $NAVP); echo "  $L"
+check "a Personal download goes to alice's Downloads" "saved name=report.pdf place=Downloads" "$(echo "$L" | sed 's/.*download-probe: //')"
+check "…alice's, her files group, 0660" "alice files-alice 660" "$(V "stat -f '%Su %Sg %Lp' /home/alice/Downloads/report.pdf")"
+check "…with where it came from" "https://example.org/files/report.pdf" "$(V "getextattr -q user atrium.origin /home/alice/Downloads/report.pdf")"
+L=$(dl $NAVP); check "another of that name sits beside it" "saved name=report (2).pdf place=Downloads" "$(echo "$L" | sed 's/.*download-probe: //')"
+L=$(dl $NAVP work); echo "  $L"
+check "a Work download goes to Work's Downloads" "saved name=report.pdf place=Work's Downloads" "$(echo "$L" | sed 's/.*download-probe: //')"
+check "…alice's, Work's files group, 0660" "alice files-alice-work 660" "$(V "stat -f '%Su %Sg %Lp' /home/alice/.atrium/personas/work/Downloads/report.pdf")"
+check "…and Personal's Downloads still has only its two" "report (2).pdf|report.pdf" "$(V "ls /home/alice/Downloads/ | grep report | paste -sd'|' -")"
+L=$(dl $DLP); check "an app that isn't the Navigator is refused" "yes" "$(echo "$L" | grep -q 'cap.navigator_broker.denied' && echo yes)"
 
 echo "=== the launch question's list"
 check "alice: Personal, Work (last used, blue)" "personal -|* work blue" "$(V "su -m alice -c 'portcullis personas $PROBE'" | sed 's/  */ /g; s/^ *//; s/ *$//' | paste -sd'|' -)"

@@ -165,7 +165,9 @@ In Atrium nothing runs as the person's own uid: an app runs as its per-app uid f
    old paths kept as symlinks), portcullisd's socket (converters, fetchers, Arca couriers and
    the UI worker, by `ExecInstance` in-process instead of the `portcullis` CLI), arcad's
    socket, limend's, and the ticket socket directory it serves; plus its state folder and the
-   person's Downloads (`filesystem`). No network: pages come through fetcher jails.
+   no folder of the person's: Save hands the file to portcullisd, which writes it into the
+   Downloads of the window's persona (`SaveDownload`, personas.md §4.1, built 2026-11-18).
+   No network: pages come through fetcher jails.
 5. **Configuration** comes from the bundle (`etc/navigatord.conf`, the same keys as today's
    environment), since a jail gets no environment of the caller's.
 6. **Hand-offs** go through `open-uri` (Monstrator, [opening-links.md](opening-links.md)) instead of `NAVIGATORD_OPENER`.
@@ -195,7 +197,8 @@ Steps, each checked by `scripts/navigator-confined-vm.sh`:
   limend connection (`Hello { limen }`, `NAVIGATORD_LIMEN`), so limend's parent is the owner of
   the UI's windows whoever runs the UI, and spends prompt presses as that owner. Left for later:
   portcullisd making a served socket's directory the app's own (the script opens `navigator/`
-  and `navigator-page/` 1777), and Downloads in the person's folder (the jail's own for now).
+  and `navigator-page/` 1777). Downloads reach the person's folder through portcullisd's
+  `SaveDownload` (2026-11-18).
 - **J3.** navigator-ui as navigatord's worker jail (`_navui`), trails kept by navigatord.
   *Built 2026-11-15:* `NAVIGATORD_UI=jail:org.atrium.navigator.ui` makes navigatord start the UI
   by `ExecInstance` on one end of a socket pair (its stdin), send it its `NAVIGATOR_UI_*`
@@ -295,7 +298,9 @@ so rctl limits, and anything that tells instances apart by uid, follow the insta
   until the answer, because frescod spends a press only while its window still has the focus.
   Gate: `navigator-confined-vm.sh` (116/116). With no other persona the chip switches new
   trails between the window's persona and Unrecorded, as before.
-- Not yet: downloads into the persona's folder (P2), and a Work window's network routes (vpn.md V2).
+- Downloads go into the persona's own Downloads (P2, 2026-11-18): portcullisd writes them for the
+  Navigator, into `~/.atrium/personas/work/Downloads` for a Work window (personas.md §4.1).
+- Not yet: a Work window's network routes (vpn.md V2).
 
 ---
 
@@ -1397,10 +1402,13 @@ Each step runs in the VM on headless frescod before the next.
      - The UI takes the would-be page back out of the trail and asks on the page the link
        was on: *Cancel* · *Save*, with the name, size, kind and origin. A typed address with
        nowhere to go back to stays as a page that says it is a file.
-     - *Save* has navigatord write it to `NAVIGATORD_DOWNLOADS` (default `~/Downloads`). The
+     - *Save* has navigatord hand the file to portcullisd (`SaveDownload`, a sealed memory
+       file), which writes it into the Downloads of the window's persona; a development run's
+       `NAVIGATORD_DOWNLOADS` has navigatord write it there itself. The
        name is made safe (no path, no leading dot, no control characters, bounded, the
        extension kept or added), the file is created new (never over a file, `name (2).ext`,
-       no link followed) with mode 0644 so it is never executable, and the address it came
+       no link followed), never executable (0660 with the folder's group from portcullisd,
+       0644 in a development run), and the address it came
        from is recorded on it as the user extended attribute `atrium.origin`. *Open in
        viewer* waits for a jailed viewer.
    - **Hand-offs** (threat model §2.10). `NAVIGATORD_SCHEMES` lists the schemes the person

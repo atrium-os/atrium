@@ -267,7 +267,7 @@ impl State {
     fn app_op(&mut self, user: &str, me: &Recipient, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         if !matches!(
             op,
-            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR | op::DELETE_FOR
+            op::MINT | op::PUBKEY | op::SIGN | op::STORE | op::RELEASE | op::LIST | op::DELETE | op::STORE_FOR | op::LIST_FOR | op::KEEP_FOR | op::DELETE_FOR | op::DH_X25519
         ) {
             return reply(status::DENIED);
         }
@@ -303,16 +303,20 @@ impl State {
                 let class = rep!(class_for_app(field!(r.u8())));
                 let account = field!(r.str(caps::ACCOUNT));
                 field!(r.end());
-                if Kind::from_u16(kind).ok() != Some(Kind::Ed25519) {
-                    return reply(status::UNSUPPORTED);
-                }
+                let kind = match Kind::from_u16(kind) {
+                    Ok(k @ Kind::Ed25519) => k,
+                    // A WireGuard key is used at every handshake, every two
+                    // minutes: never "verify each use" (vpn.md §4.3).
+                    Ok(k @ Kind::WireGuardKey) if class != Class::VerifyEachUse => k,
+                    _ => return reply(status::UNSUPPORTED),
+                };
                 let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
-                let pk = signing_key(&seed).verifying_key().to_bytes();
+                let pk = public_of(kind, &seed);
                 let m = tri!(store.add(NewItem {
                     persona: PERSONA,
                     recipient: me.clone(),
                     class,
-                    kind: Kind::Ed25519,
+                    kind,
                     provenance: Provenance::AppMinted,
                     account,
                     scope: b"",
@@ -329,6 +333,9 @@ impl State {
                 let msg = if op == op::SIGN { field!(r.bytes(MAX_SIGN_MSG)) } else { &[][..] };
                 field!(r.end());
                 let (m, seed) = tri!(store.release(&i, &who, uv()));
+                if op == op::PUBKEY && m.kind == Kind::WireGuardKey {
+                    return ok(public_of(m.kind, &seed).to_vec());
+                }
                 if m.kind != Kind::Ed25519 {
                     return reply(status::UNSUPPORTED);
                 }
@@ -338,6 +345,19 @@ impl State {
                     ok(sk.verifying_key().to_bytes().to_vec())
                 } else {
                     ok(sk.sign(msg).to_bytes().to_vec())
+                }
+            }
+            op::DH_X25519 => {
+                let i = rep!(id(&mut r));
+                let point = field!(r.array::<32>());
+                field!(r.end());
+                let (m, secret) = tri!(store.release(&i, &who, uv()));
+                if m.kind != Kind::WireGuardKey {
+                    return reply(status::UNSUPPORTED);
+                }
+                match x25519(&secret, &point) {
+                    Some(shared) => ok(shared.to_vec()),
+                    None => malformed(),
                 }
             }
             op::STORE => {
@@ -2206,6 +2226,31 @@ fn generate_password() -> Result<LockedBuf, Error> {
         }
     }
     Ok(out)
+}
+
+/// The public half of a minted key item.
+fn public_of(kind: Kind, seed: &LockedBuf) -> [u8; 32] {
+    match kind {
+        Kind::WireGuardKey => {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(seed.as_ref());
+            let s = x25519_dalek::StaticSecret::from(b);
+            zeroize_array(&mut b);
+            x25519_dalek::PublicKey::from(&s).to_bytes()
+        }
+        _ => signing_key(seed).verifying_key().to_bytes(),
+    }
+}
+
+/// X25519 with a stored private key; `None` for a low-order point (an
+/// all-zero result), which WireGuard refuses too.
+fn x25519(secret: &LockedBuf, point: &[u8; 32]) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    let mut b = [0u8; 32];
+    b.copy_from_slice(secret.as_ref());
+    let s = x25519_dalek::StaticSecret::from(b);
+    zeroize_array(&mut b);
+    let shared = s.diffie_hellman(&x25519_dalek::PublicKey::from(*point));
+    shared.was_contributory().then(|| zeroize::Zeroizing::new(shared.to_bytes()))
 }
 
 fn signing_key(seed: &LockedBuf) -> SigningKey {

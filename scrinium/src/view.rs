@@ -513,6 +513,11 @@ impl ScriniumView {
                 if p.read_only { format!("{free} · read-only") } else { free }
             } else if p.stick {
                 place_sub(p, &b.persona)
+            } else if let Some(who) = p.persona_folder() {
+                // Both personas' folders are labelled (personas.md §4.1).
+                crate::browser::persona_name(who)
+            } else if p.id.starts_with("home:") && b.places.iter().any(|o| o.persona_folder().is_some()) {
+                "Personal".into()
             } else {
                 p.root.to_string_lossy().into_owned()
             };

@@ -10,7 +10,7 @@
 //! Styles and number formats come from `xl/styles.xml` ([`super::styles`]).
 //!
 //! Reported, not carried (O4c–O4e): charts and
-//! drawings, defined names, tables, conditional formats, data validation, comments,
+//! drawings, defined names, tables, conditional formats, data validation,
 //! hyperlinks. Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
 
 use std::collections::HashMap;
@@ -599,7 +599,6 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
             b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
             b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules"),
             b"hyperlink" => seg.rep.note(Kind::Dropped, "hyperlinks"),
-            b"legacyDrawing" => seg.rep.note(Kind::Dropped, "comments"),
             b"autoFilter" => {
                 if let Some(rf) = attr(&e, b"ref")? {
                     seg.filter = Some((rf, Vec::new()));
@@ -1038,9 +1037,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         }
     }
 
-    // Charts.
+    // Charts and comments.
     for (i, (_, part)) in sheets.iter().enumerate() {
         super::chart::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
+        super::comments::read_sheet(&mut wb, i as u16, &z, part, &mut rep)?;
     }
 
     // Formulas, once every sheet exists (they name each other).

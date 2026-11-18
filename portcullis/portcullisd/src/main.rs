@@ -620,6 +620,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             handle_open_attachment(uid, &owner, &name, activation, &shared, &mut writer, &reader)?;
             continue;
         }
+        /* ★ Downloads (personas.md §4.1): from the Navigator, into its
+         * persona's Downloads; a sealed memory file follows. */
+        if let Request::SaveDownload { name, origin } = req {
+            handle_save_download(uid, &owner, &name, &origin, &mut writer, &reader)?;
+            continue;
+        }
         /* ★ Opening links (opening-links.md §5): only from Monstrator, by
          * its system user; the person is the asking app's. */
         if matches!(req, Request::LinkGrant { .. } | Request::DeliverLink { .. }) {
@@ -1412,6 +1418,71 @@ fn handle_open(
     }
 }
 
+/// The most a download may be (navigator-control's `FILE_MAX` is lower).
+const DOWNLOAD_MAX: u64 = 4 << 30;
+
+/// SaveDownload (personas.md §4.1): the Navigator's file, written into the
+/// Downloads of the persona the caller runs in.
+fn handle_save_download(
+    uid:    u32,
+    owner:  &str,
+    name:   &str,
+    origin: &str,
+    writer: &mut UnixStream,
+    reader: &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    let refuse = |w: &mut UnixStream, why: String| {
+        eprintln!("portcullisd: download REFUSED to uid {uid}: {why}");
+        write_response(w, &Response::Error { message: why })
+    };
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
+    if !caller.as_deref().is_some_and(launch::app_is_navigator) {
+        return refuse(writer, format!("cap.navigator_broker.denied: {} may not save downloads",
+                                      caller.as_deref().unwrap_or("a process that is not a launched app")));
+    }
+    let persona = reg.persona(uid).flatten().map(String::from);
+    if name.is_empty() || name.contains(['/', '\0']) || name.len() > atrium_open::MAX_NAME || name.starts_with('.') || name.chars().any(char::is_control) {
+        return refuse(writer, "the file's name, not a path".into());
+    }
+    if origin.len() > 2048 || origin.chars().any(char::is_control) {
+        return refuse(writer, "the file's origin".into());
+    }
+    write_response(writer, &Response::ReadyForFds)?;
+    if !reader.buffer().is_empty() {
+        return refuse(writer, "protocol violation: data buffered before the descriptor".into());
+    }
+    let mut fds = match portcullis_ipc::recv_fds(reader.get_ref(), 1) {
+        Ok(v) if v.len() == 1 => v,
+        Ok(v) => return refuse(writer, format!("expected one descriptor, got {}", v.len())),
+        Err(e) => return refuse(writer, format!("recv_fds: {e}")),
+    };
+    let fd = fds.pop().unwrap();
+    if let Err(why) = portcullisd::opens::check_sealed(&fd) {
+        return refuse(writer, format!("“{name}”: {why}"));
+    }
+    let (dir, gid) = match portcullisd::home::downloads_for(owner, persona.as_deref()) {
+        Ok(d) => d,
+        Err(e) => return refuse(writer, format!("{owner}'s Downloads: {e}")),
+    };
+    let person_uid = match portcullisd::home::person_uid(owner) {
+        Some(u) => u,
+        None => return refuse(writer, format!("no such person {owner}")),
+    };
+    match portcullisd::home::save_into(&dir, name, std::fs::File::from(fd), DOWNLOAD_MAX, person_uid, gid, origin) {
+        Ok(saved) => {
+            let place = match &persona {
+                Some(p) => format!("{}'s Downloads", portcullisd::home::persona_words(p)),
+                None => "Downloads".into(),
+            };
+            eprintln!("portcullisd: a download from {} saved for {owner} in {place} as “{saved}”",
+                      caller.as_deref().unwrap_or("?"));
+            write_response(writer, &Response::Downloaded { name: saved, place })
+        }
+        Err(e) => refuse(writer, e),
+    }
+}
+
 /// OpenAttachment (mail.md §8.2): the caller holds `open-attachments`;
 /// the descriptor is a sealed, read-only memory file; its type comes from
 /// its bytes and name, decided here; it goes read-only to the person's
@@ -1959,8 +2030,23 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
     publish_colours(&owner, &tp.policy);
     if removing {
         let gone = portcullis_overlay::remove_persona_places(&owner, &name);
-        eprintln!("portcullisd: {owner} removed persona {name} (from {caller}, verified): {} app folder(s) deleted", gone.len());
+        // Its files too (personas.md §4.1): deleted until Tessera's keys
+        // make it the key that goes.
+        let files = match portcullisd::home::remove_persona(&owner, &name) {
+            Ok(true) => "its folders deleted",
+            Ok(false) => "it had no folders",
+            Err(e) => {
+                eprintln!("portcullisd: {owner}'s {name} folders: {e}");
+                "its folders NOT deleted"
+            }
+        };
+        eprintln!("portcullisd: {owner} removed persona {name} (from {caller}, verified): {} app folder(s) deleted, {files}", gone.len());
     } else {
+        if tp.policy.personas.contains_key(&name) {
+            if let Err(e) = portcullisd::home::ensure_persona(&owner, &name) {
+                eprintln!("portcullisd: {owner}'s {name} folders not made: {e}");
+            }
+        }
         eprintln!("portcullisd: {owner}'s persona {name} is now {:?} (from {caller})", tp.policy.personas.get(&name).map(|d| d.colour.as_str()));
     }
     Response::Ok
@@ -3138,7 +3224,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::LinkGrant { .. } | Request::DeliverLink { .. } => Response::Error {
             message: "internal: link verbs must go through handle_link".into(),
         },
-        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } => Response::Error {
+        Request::OpenApps { .. } | Request::OpenFile { .. } | Request::OpenAttachment { .. } | Request::SaveDownload { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_open). */
             message: "internal: open verbs must go through handle_open".into(),
         },

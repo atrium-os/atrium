@@ -6,7 +6,7 @@
 //! number formats from ODF data styles (turned into Excel format codes), bold, italic,
 //! underline, strike, font colour, background, borders, alignment, wrap.
 //!
-//! Reported, not carried: comments, charts and images, conditional
+//! Reported, not carried: charts and images, conditional
 //! formats, validation, named ranges, hidden rows and columns (shown), other formula
 //! namespaces (kept as values).
 
@@ -717,7 +717,17 @@ struct CellIn {
     matrix: Option<(u32, u32)>,
 }
 
+/// An `office:annotation` being read.
+#[derive(Default)]
+struct Annotation {
+    author: String,
+    text: String,
+    in_creator: bool,
+    paras: usize,
+}
+
 /// Reads an `.ods` package into a workbook.
+
 pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let z = Archive::open(data)?;
     let mut out = Loaded::default();
@@ -774,6 +784,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut runs: Vec<Vec<(u32, u32, StyleId)>> = Vec::new();
     let mut expanded: u64 = 0;
     let mut annotation_depth = 0u32;
+    // The comment being read, and the sheet's comments so far.
+    let mut ann: Option<Annotation> = None;
+    let mut comments: Vec<(u32, u32, Option<officina_grid::comments::Comment>)> = Vec::new();
     // Frames (charts, images) and the one being read, with its depth.
     let mut frames: Vec<super::chart::FrameIn> = Vec::new();
     let mut frame: Option<super::chart::FrameIn> = None;
@@ -831,6 +844,21 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     continue;
                 }
                 if annotation_depth > 0 {
+                    if let Some(a) = ann.as_mut() {
+                        match name {
+                            b"dc:creator" => a.in_creator = !empty,
+                            b"text:p" | b"text:h" => {
+                                if a.paras > 0 {
+                                    a.text.push('\n');
+                                }
+                                a.paras += 1;
+                            }
+                            b"text:line-break" => a.text.push('\n'),
+                            b"text:s" => a.text.push(' '),
+                            b"text:tab" => a.text.push('\t'),
+                            _ => {}
+                        }
+                    }
                     if !empty {
                         annotation_depth += 1;
                     }
@@ -948,9 +976,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         }
                     }
                     b"office:annotation" => {
-                        rep.note(Kind::Dropped, "comments");
                         if !empty {
                             annotation_depth = 1;
+                            ann = Some(Annotation::default());
                         }
                     }
                     b"draw:frame" if sheet.is_some() && frames.len() < officina_grid::charts::MAX_CHARTS => {
@@ -1167,6 +1195,15 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     _ => {}
                 }
             }
+            Event::Text(t) if annotation_depth > 0 => {
+                if let Some(a) = ann.as_mut() {
+                    let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
+                    let into = if a.in_creator { &mut a.author } else if a.paras > 0 { &mut a.text } else { continue };
+                    if into.len() + s.len() <= officina_grid::comments::MAX_TEXT {
+                        into.push_str(&s);
+                    }
+                }
+            }
             Event::Text(t) if in_p && annotation_depth == 0 && frame_depth == 0 => {
                 if let Some(c) = cell.as_mut() {
                     let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
@@ -1187,6 +1224,19 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                 }
                 if annotation_depth > 0 {
                     annotation_depth -= 1;
+                    if let Some(a) = ann.as_mut() {
+                        if name == b"dc:creator" {
+                            a.in_creator = false;
+                        }
+                    }
+                    if annotation_depth == 0 {
+                        if let (Some(a), Some(s)) = (ann.take(), sheet) {
+                            if row < MAX_ROWS as u64 && col < MAX_COLS as u64 && comments.len() < officina_grid::comments::MAX_COMMENTS {
+                                comments.push((row as u32, col as u32, Some(officina_grid::comments::Comment::new(a.author.trim(), &a.text))));
+                            }
+                            let _ = s;
+                        }
+                    }
                     continue;
                 }
                 match name {
@@ -1291,6 +1341,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
                             wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
                             wb.set_merges(s, std::mem::take(&mut merges));
+                            wb.set_comments(s, std::mem::take(&mut comments));
                         }
                     }
                     _ => {}

@@ -70,6 +70,11 @@ pub enum DataCmd {
     Merge,
     /// The merged areas the selection meets, back to separate cells.
     Unmerge,
+    /// Write or change the cursor's cell comment; the window runs it (a bar
+    /// under the grid).
+    Comment,
+    /// Take the comments off the selection's cells.
+    DeleteComments,
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
@@ -182,6 +187,11 @@ fn chart_at(wb: &Workbook, sheet: u16, row: u32, col: u32) -> Option<usize> {
     })
 }
 
+/// The cells of `sel` with comments.
+fn comments_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u32, u32)> + '_ {
+    wb.comments(s).range((sel.r0, 0)..=(sel.r1, u32::MAX)).map(|(&k, _)| k).filter(move |&(_, c)| (sel.c0..=sel.c1).contains(&c))
+}
+
 /// The most cells one merge may span (a whole column of a million rows is
 /// fine; a whole sheet is not).
 const MAX_MERGE_CELLS: u64 = 1 << 24;
@@ -207,6 +217,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
+        (MenuItem::new(if wb.comment(s, row, col).is_some() { "Edit Comment…" } else { "New Comment…" }).separated(), Some(DataCmd::Comment)),
+        (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
         if wb.merges_in(&Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }).next().is_some() {
             (MenuItem::new("Unmerge Cells").separated(), Some(DataCmd::Unmerge))
         } else {
@@ -400,6 +412,15 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 n => format!("Cells merged; the {n} other values in them were cleared."),
             })
         }
+        DataCmd::DeleteComments => {
+            let set: Vec<_> = comments_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+            if set.is_empty() {
+                return Ok("No comments there.".into());
+            }
+            let n = set.len();
+            d.run(if n == 1 { "Delete Comment" } else { "Delete Comments" }, vec![GridOp::Comments { sheet: s, set }]);
+            Ok(if n == 1 { "Comment deleted.".into() } else { format!("{n} comments deleted.") })
+        }
         DataCmd::Unmerge => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
             let list: Vec<Rect> = d.wb.merges(s).iter().filter(|m| !m.intersects(&r)).copied().collect();
@@ -445,6 +466,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
             if rect.r0 > rect.r1 {
                 return Err("There is nothing under the header to sort.".into());
+            }
+            if d.wb.merges_in(&rect).next().is_some() {
+                return Err("Unmerge the merged cells in the range before sorting it.".into());
             }
             let key = col.clamp(rect.c0, rect.c1);
             let descending = cmd == DataCmd::SortDesc;
@@ -508,7 +532,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
@@ -698,6 +722,9 @@ mod tests {
         assert_eq!(d.wb.merges(0), &[Rect { sheet: 0, r0: 1, c0: 0, r1: 2, c1: 1 }]);
         assert_eq!(cell(&d, 1, 0), before.0);
         assert_eq!(cell(&d, 1, 1), "");
+        // Sorting across it is refused.
+        run(&mut d, one(3, 0), (3, 0), DataCmd::SortAsc);
+        assert!(d.status.starts_with("Unmerge the merged cells"), "{}", d.status);
         // The cursor in it offers Unmerge.
         let titles = menu(&d, one(2, 1), (2, 1)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
         assert!(titles.iter().any(|t| t == "Unmerge Cells"), "{titles:?}");

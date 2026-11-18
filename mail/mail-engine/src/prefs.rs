@@ -1,6 +1,6 @@
 //! Mail's own settings (mail.md §12, §15.6): notifications on or off, quiet
-//! hours, and VIPs. Kept in the store under account 0 (no account has id 0),
-//! so they belong to this Mail instance, that is, to its persona.
+//! hours, VIPs, and Later's weekly look. Kept in the store under account 0
+//! (no account has id 0), so they belong to this Mail instance, that is, to its persona.
 
 use crate::{Engine, Error};
 
@@ -8,6 +8,7 @@ const NOTIFY_OFF: &str = "notify_off";
 /// `from * 10_000 + to + 1`, minutes after local midnight; absent: none.
 const QUIET: &str = "quiet_hours";
 const VIPS_THROUGH: &str = "vips_through_quiet";
+const WEEKLY_OFF: &str = "weekly_look_off";
 /// Newline-separated addresses, lower case.
 const VIPS: &str = "vips";
 const ALL: u32 = 0;
@@ -23,11 +24,13 @@ pub struct Prefs {
     /// VIPs notify inside quiet hours too.
     pub vips_through: bool,
     pub vips: Vec<String>,
+    /// The Later weekly look on Friday afternoon (§11.4).
+    pub weekly: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new() }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true }
     }
 }
 
@@ -56,6 +59,7 @@ impl Engine {
             notify: s.setting(ALL, NOTIFY_OFF).ok().flatten().unwrap_or(0) == 0,
             quiet,
             vips_through: s.setting(ALL, VIPS_THROUGH).ok().flatten().unwrap_or(0) != 0,
+            weekly: s.setting(ALL, WEEKLY_OFF).ok().flatten().unwrap_or(0) == 0,
             vips: s.sync_state(ALL, VIPS).ok().flatten().map(|v| v.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
         }
     }
@@ -70,6 +74,7 @@ impl Engine {
             w.set_setting(ALL, NOTIFY_OFF, (!p.notify).then_some(1))?;
             w.set_setting(ALL, QUIET, quiet)?;
             w.set_setting(ALL, VIPS_THROUGH, p.vips_through.then_some(1))?;
+            w.set_setting(ALL, WEEKLY_OFF, (!p.weekly).then_some(1))?;
             w.set_sync_state(ALL, VIPS, (!vips.is_empty()).then(|| vips.join("\n")).as_deref())
         })?;
         Ok(())
