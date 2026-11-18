@@ -63,6 +63,11 @@ pub struct Daemon {
     pub lock: Mutex<()>,
 }
 
+/// The largest file the sheet installs from (§7.4).
+const LOCAL_MAX: u64 = 4 << 30;
+/// How long a previewed file waits for the person's press.
+const HOLD_SECS: u64 = 15 * 60;
+
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -71,6 +76,17 @@ impl Daemon {
     pub fn catalog(&self) -> oc::Client { oc::Client::open(&self.state.join("catalog")) }
     pub fn store(&self) -> Store { Store::new(&self.state.join("installed.toml")) }
     pub fn downloads(&self) -> PathBuf { self.state.join("dl") }
+
+    /// [`Daemon::handle`], for a request that may have come with a file
+    /// (fdpass): only `PreviewLocal` takes one, and only it needs one.
+    pub fn handle_with(&self, uid: u32, r: Request, file: Option<std::os::fd::OwnedFd>) -> Response {
+        match (r, file) {
+            (Request::PreviewLocal { for_uid }, Some(f)) if uid == 0 || Some(uid) == self.sheet_uid =>
+                self.preview_local(f, for_uid).unwrap_or_else(|message| Response::Error { message }),
+            (Request::PreviewLocal { .. }, Some(_)) => Response::Error { message: "only the install sheet previews a file".into() },
+            (r, _) => self.handle(uid, r),
+        }
+    }
 
     pub fn handle(&self, uid: u32, r: Request) -> Response {
         let admin = uid == 0;
@@ -108,10 +124,14 @@ impl Daemon {
             Request::SetUpdates { id, care } => self.set_care(uid, &id, &care).map(|_| Response::Ok),
             Request::InstallApproved { id, manifest_sha256, for_uid } if admin || Some(uid) == self.sheet_uid =>
                 self.locked(|| self.install_catalog(&id, Some(&manifest_sha256), for_uid)),
+            Request::PreviewLocal { .. } => Err("a preview comes with the file itself".into()),
+            Request::InstallLocalApproved { token, manifest_sha256, for_uid } if admin || Some(uid) == self.sheet_uid =>
+                self.locked(|| self.install_held(&token, &manifest_sha256, for_uid)),
             _ if !admin => Err("only an administrator, or a person on the install sheet, may change what is installed".into()),
-            Request::InstallApproved { .. } | Request::AddCatalog { .. } => unreachable!("matched above"),
+            Request::InstallApproved { .. } | Request::AddCatalog { .. } | Request::InstallLocalApproved { .. } =>
+                unreachable!("matched above"),
             Request::Install { id } => self.locked(|| self.install_catalog(&id, None, uid)),
-            Request::InstallLocal { path } => self.locked(|| self.install_local(Path::new(&path), uid)),
+            Request::InstallLocal { path } => self.locked(|| self.install_local(Path::new(&path), uid, None)),
             Request::Uninstall { id } => self.locked(|| self.uninstall(&id)),
             Request::Rollback { id } => self.locked(|| self.rollback(&id)),
             Request::Sync { from } => self.locked(|| self.sync(Path::new(&from))),
@@ -181,7 +201,7 @@ impl Daemon {
             manifest_sha256: oc::hex(&Sha256::digest(r.manifest.as_bytes())), added,
             publisher_name: pubrec.map(|p| p.name.clone()).unwrap_or_default(),
             publisher_domains: pubrec.map(|p| p.domains.clone()).unwrap_or_default(),
-            third_party: cat.third_party(), recovered,
+            third_party: cat.third_party(), recovered, local: false,
         })
     }
 
@@ -617,7 +637,110 @@ impl Daemon {
         res
     }
 
-    fn install_local(&self, path: &Path, uid: u32) -> Result<Response, String> {
+    // ── side-loading through the sheet (§7.4) ───────────────────────────────
+
+    fn held(&self) -> PathBuf { self.state.join("held") }
+
+    /// Forget previews nobody approved within [`HOLD_SECS`].
+    fn prune_held(&self) {
+        let Ok(rd) = fs::read_dir(self.held()) else { return };
+        for e in rd.flatten() {
+            let old = e.metadata().ok().and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok()).map_or(true, |age| age.as_secs() > HOLD_SECS);
+            if old {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+
+    /// Copy the file the sheet was handed, check it as a side-load, and hold
+    /// it under a token for the person to approve.
+    fn preview_local(&self, file: std::os::fd::OwnedFd, for_uid: u32) -> Result<Response, String> {
+        use std::io::Read;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        self.prune_held();
+        let held = self.held();
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(&held).map_err(|e| format!("{}: {e}", held.display()))?;
+        let mut t = [0u8; 16];
+        fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut t)).map_err(|e| format!("/dev/urandom: {e}"))?;
+        let token = oc::hex(&t);
+        let path = held.join(format!("{token}.insula"));
+        let mut dst = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = std::io::copy(&mut fs::File::from(file).take(LOCAL_MAX + 1), &mut dst);
+        let res = (|| {
+            let n = n.map_err(|e| format!("reading the file: {e}"))?;
+            if n > LOCAL_MAX {
+                return Err(format!("larger than {} GB", LOCAL_MAX >> 30));
+            }
+            let dir = self.unpack(&path, n)?;
+            let app = self.describe_local(&dir, n, for_uid);
+            let _ = fs::remove_dir_all(&dir);
+            let app = app?;
+            fs::write(held.join(format!("{token}.toml")), format!("{}\n{for_uid}\n", app.manifest_sha256))
+                .map_err(|e| e.to_string())?;
+            Ok(Response::LocalPreview { token: token.clone(), app })
+        })();
+        if res.is_err() {
+            let _ = fs::remove_file(&path);
+        }
+        res
+    }
+
+    /// What the sheet shows for an unpacked side-load: an app signed by a
+    /// key on the side-load list, and not one a catalog keeps up to date.
+    fn describe_local(&self, dir: &Path, size: u64, uid: u32) -> Result<Described, String> {
+        let text = fs::read_to_string(dir.join("atrium.toml")).map_err(|_| "not an app bundle (no atrium.toml)".to_string())?;
+        let v: toml::Value = text.parse().map_err(|e| format!("atrium.toml: {e}"))?;
+        let a = v.get("app").ok_or("only apps install from a file")?;
+        let s = |k: &str| a.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let id = s("id");
+        let publisher = match self.trust.verify_publisher(dir, &text, portcullis_trust::Demand::PolicyDefault) {
+            Ok(Some(h)) => oc::hex(&h),
+            Ok(None) => return Err(format!("{id}: not signed; a file installs only when signed by a publisher this machine trusts")),
+            Err(e) => return Err(format!("{id}: {e}")),
+        };
+        let rec = self.store().get(&id)?;
+        if let Some(r) = rec.as_ref().filter(|r| r.source != "side-load") {
+            return Err(format!("{id} is installed from {}; it updates from there", r.source));
+        }
+        let plain = |c: String| c.split('=').next().unwrap_or("").to_string();
+        let added = match &rec {
+            Some(_) => {
+                let have = fs::read_to_string(self.root.join("apps").join(&id).join("atrium.toml")).unwrap_or_default();
+                updates::decide(&have, &text, true, None).1.into_iter().map(plain).collect()
+            }
+            None => Vec::new(),
+        };
+        let _ = uid;
+        Ok(Described {
+            id: id.clone(), kind: "app".into(), name: s("name"), description: s("description"), latest: s("version"),
+            publisher, capabilities: updates::caps(&text).into_iter().map(plain).collect(), archive_size: size,
+            installed: rec.map(|x| x.version), manifest_sha256: oc::hex(&Sha256::digest(text.as_bytes())), added,
+            local: true, ..Default::default()
+        })
+    }
+
+    fn install_held(&self, token: &str, manifest_sha256: &str, for_uid: u32) -> Result<Response, String> {
+        if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("not a token".into());
+        }
+        self.prune_held();
+        let (path, meta) = (self.held().join(format!("{token}.insula")), self.held().join(format!("{token}.toml")));
+        let held = fs::read_to_string(&meta).map_err(|_| "that file is no longer held; open it again".to_string())?;
+        let _ = fs::remove_file(&meta);
+        let res = (|| {
+            let mut l = held.lines();
+            if l.next() != Some(manifest_sha256) || l.next() != Some(for_uid.to_string().as_str()) {
+                return Err("not the file the sheet showed".to_string());
+            }
+            self.install_local(&path, for_uid, Some(manifest_sha256))
+        })();
+        let _ = fs::remove_file(&path);
+        res
+    }
+
+    fn install_local(&self, path: &Path, uid: u32, expect: Option<&str>) -> Result<Response, String> {
         let meta = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (dir, temp) = if meta.is_file() {
             (self.unpack(path, meta.len())?, true)
@@ -625,6 +748,12 @@ impl Daemon {
             (path.to_path_buf(), false)
         };
         let res = (|| {
+            if let Some(want) = expect {
+                let text = fs::read(dir.join("atrium.toml")).map_err(|e| e.to_string())?;
+                if oc::hex(&Sha256::digest(&text)) != want {
+                    return Err("not the file the sheet showed".into());
+                }
+            }
             let opts = app::Opts { root: &self.root, trust: &self.trust, allow_unsigned: false,
                                    require_content: self.require_content, catalog_key: None };
             let (m, stage) = app::stage(&dir, &opts)?;

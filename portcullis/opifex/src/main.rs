@@ -325,6 +325,7 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Response::Ok => Ok(()),
+        Response::LocalPreview { .. } => Err("opifexd: a preview, which only the sheet asks for".into()),
     }
 }
 

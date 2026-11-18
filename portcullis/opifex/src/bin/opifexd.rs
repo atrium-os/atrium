@@ -18,7 +18,7 @@
 //! waiting updates; `none` turns it off), `OPIFEX_DAILY` (`0` turns off the
 //! daily round of §8: sync, background updates, one notice).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -49,15 +49,15 @@ fn env(k: &str, d: &str) -> PathBuf { std::env::var_os(k).map(PathBuf::from).unw
 fn serve(d: &Daemon, mut s: UnixStream) {
     let Some(uid) = peer_uid(&s) else { return };
     s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    let mut line = String::new();
-    let mut r = BufReader::new(s.try_clone().expect("clone")).take(MAX_LINE as u64);
-    if r.read_line(&mut line).is_err() || line.is_empty() {
+    // A side-load preview carries the file itself (fdpass).
+    let Ok((line, file)) = opifex::fdpass::read_line(&s, MAX_LINE) else { return };
+    if line.is_empty() {
         return;
     }
     let answer = match serde_json::from_str::<Request>(line.trim()) {
         Ok(req) => {
             let what = format!("{req:?}");
-            let a = d.handle(uid, req);
+            let a = d.handle_with(uid, req, file);
             eprintln!("opifexd: uid {uid}: {} -> {}", what.split([' ', '{']).next().unwrap_or(""),
                       match &a { Response::Error { message } => format!("error: {message}"), _ => "ok".into() });
             a
