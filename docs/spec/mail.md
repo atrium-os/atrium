@@ -1443,7 +1443,13 @@ Stalwart in the cloud VM, and later a real account):
    OpenPGP encryption of outgoing mail. Signatures are checked in the parse jail, and
    decrypting isn't built. One thing to watch: `give_pgp_key`, a key the person pastes,
    would parse in the core once the UI calls it. It belongs in the parse worker when that
-   comes.
+   comes. Mail was then installed from its signed bundle on the arm64
+   VM (2026-11-18): `cargo atrium bundle` (37 MB: atrium-mail, mail-parse-jail,
+   mail-sync-worker), `opifex side-load` (trusted publisher). On kernel.atrium with the
+   filter in deny mode, Mail started from the bundle, and parse and sync spawned as uids
+   of their own in jails with no addresses and only unix sockets. Start time was the
+   same before and after. Not yet: an amd64 bundle (no amd64 sysroot on the Mac), and
+   `vm-workers-check.sh` as written (amd64 cloud VM).
 
 ## 17. Decisions, with recommendations
 
