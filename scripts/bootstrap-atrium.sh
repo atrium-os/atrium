@@ -177,8 +177,9 @@ FreeBSD's make; both must come from Homebrew, not Xcode.)"
 Then re-run this script."
     # The tree pins nightly + rust-src in rust-toolchain.toml; rustup honours it
     # automatically, but rust-src must actually be fetched or build-std fails.
-    rustup component add rust-src --toolchain nightly >/dev/null 2>&1 || true
-    ok "rustup (tree pins nightly + rust-src)"
+    TC=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")
+    rustup toolchain install "$TC" --profile minimal --component rust-src >/dev/null 2>&1 || true
+    ok "rustup (tree pins $TC + rust-src)"
 
     # Disk. The kernel objdir, QEMU build and FreeBSD sets are large.
     avail=$(df -g "$REPO" | awk 'NR==2 {print $4}')

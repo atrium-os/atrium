@@ -99,8 +99,8 @@ if ! env | grep -q "^CC_$T="; then
     AR=$(command -v /opt/homebrew/opt/llvm/bin/llvm-ar || command -v llvm-ar || command -v ar)
     export "AR_$T=$AR"
 fi
-B="cargo +nightly build --quiet --release --target $TARGET -Z build-std=std,panic_abort"
-(cd "$ROOT/portcullis" && cargo +nightly build --quiet --target "$TARGET" -Z build-std=std,panic_abort \
+B="cargo build --quiet --release --target $TARGET -Z build-std=std,panic_abort"
+(cd "$ROOT/portcullis" && cargo build --quiet --target "$TARGET" -Z build-std=std,panic_abort \
     -p portcullis-cli -p portcullisd -p opifex) || die "portcullis cross-build"
 # ★ RELEASE for the converter: Boa under a debug build is slow enough that the
 # deadline, not the jail, would decide the comparison.
