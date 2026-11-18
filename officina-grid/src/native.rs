@@ -67,6 +67,9 @@ pub enum LoadError {
     Container(ContainerError),
     Wire(WireError),
     Bad(&'static str),
+    /// Loading it would take more memory than the budget it was given
+    /// ([`load_within`]): about this many bytes when it stopped.
+    TooBig(u64),
 }
 
 impl std::fmt::Display for LoadError {
@@ -75,6 +78,7 @@ impl std::fmt::Display for LoadError {
             LoadError::Container(e) => write!(f, "{e}"),
             LoadError::Wire(e) => write!(f, "{e}"),
             LoadError::Bad(w) => write!(f, "bad spreadsheet file: {w}"),
+            LoadError::TooBig(b) => write!(f, "it needs more than {:.1} GB of memory open, past this app's limit", *b as f64 / (1u64 << 30) as f64),
         }
     }
 }
@@ -346,6 +350,18 @@ pub fn save_to_vec(wb: &Workbook) -> Vec<u8> {
 
 /// Reads a native file. Never panics on any input.
 pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
+    load_within(data, u64::MAX)
+}
+
+/// Column chunks loaded between checks of the workbook's size.
+const CHECK_EVERY: usize = 256;
+
+/// [`load`], stopping with [`LoadError::TooBig`] once the workbook would hold
+/// more than `budget` bytes ([`Workbook::memory_bytes`]). A small file can
+/// describe a big workbook (a chunk of a few bytes fills 4,096 rows), so the
+/// size is checked as cells arrive, every [`CHECK_EVERY`] column chunks, not
+/// guessed from the file.
+pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     let c = ContainerReader::open(data, Limits::default())?;
     if c.kind != DocKind::Sheets {
         return Err(LoadError::Bad("not a spreadsheet"));
@@ -499,7 +515,15 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
 
     // Cells.
     let max_chunk = (MAX_ROWS - 1) / CHUNK_ROWS;
-    for i in of(COLUMN) {
+    let over = |wb: &Workbook| -> Result<(), LoadError> {
+        let b = wb.memory_bytes();
+        if b > budget { Err(LoadError::TooBig(b)) } else { Ok(()) }
+    };
+    over(&wb)?;
+    for (k, i) in of(COLUMN).enumerate() {
+        if k % CHECK_EVERY == CHECK_EVERY - 1 {
+            over(&wb)?;
+        }
         let mut r = Reader::new(c.chunk(i)?);
         let s = r.u16()?;
         if s as usize >= wb.sheets.len() {
@@ -584,6 +608,8 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
         }
         done(&r)?;
     }
+
+    over(&wb)?;
 
     // Formulas.
     for i in of(FORMULAS) {
@@ -717,6 +743,7 @@ pub fn load(data: &[u8]) -> Result<Workbook, LoadError> {
     for (id, a, b) in spilling {
         wb.pending.entry(id).or_default().add(a, b);
     }
+    over(&wb)?;
     Ok(wb)
 }
 

@@ -298,7 +298,7 @@ pub fn recover_with(dir: &Path, password: Option<&str>) -> io::Result<(Doc, Reco
         base = plain;
         protection = Some(Protection { password: pw.to_string(), sealer });
     }
-    let wb = native::load(&base).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let wb = native::load_within(&base, default_memory_budget()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let name = fs::read_to_string(dir.join(META)).unwrap_or_else(|_| "Recovered".into());
     let mut doc = Doc::from_workbook(wb, &name);
     let data = fs::read(dir.join(format!("journal.{g}"))).unwrap_or_default();
@@ -403,7 +403,7 @@ impl Doc {
 
     /// A native file.
     pub fn from_native(name: &str, data: &[u8]) -> Result<Self, native::LoadError> {
-        let mut wb = native::load(data)?;
+        let mut wb = native::load_within(data, default_memory_budget())?;
         wb.recalc();
         Ok(Self::from_workbook(wb, name))
     }

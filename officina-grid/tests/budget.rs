@@ -60,3 +60,23 @@ fn sliced_recalc_stops_in_time_and_ends_where_one_call_does() {
     assert!(!wb.is_stale(0, 5, 2));
     assert_eq!(values(&wb, rows), values(&want, rows));
 }
+
+#[test]
+fn a_workbook_past_the_budget_is_refused_while_loading() {
+    use officina_grid::{CellAddr, Value, Workbook};
+    let mut wb = Workbook::new();
+    wb.add_sheet("Sparse").unwrap();
+    // 300 columns of 8,192 numbers: about 20 MB open.
+    for c in 0..300 {
+        wb.set_numbers(0, c, 0, &vec![1.0; 8192]);
+    }
+    let file = officina_grid::native::save_to_vec(&wb);
+    let full = wb.memory_bytes();
+    assert!(full > 16 << 20, "{full} in memory");
+    match officina_grid::native::load_within(&file, 4 << 20) {
+        Err(officina_grid::native::LoadError::TooBig(b)) => assert!(b > 4 << 20 && b < full),
+        other => panic!("{:?}", other.map(|w| w.memory_bytes())),
+    }
+    let back = officina_grid::native::load_within(&file, full + (1 << 20)).unwrap();
+    assert_eq!(back.value(0, 8191, 299), Value::Num(1.0));
+}

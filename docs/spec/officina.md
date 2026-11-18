@@ -3584,6 +3584,10 @@ Left: Slides links `png` only to encode its own previews, and the checker lists 
 
 A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab Colour…, a bar in the tab strip's place with eight colours, None and Cancel (`TabCmd::Coloring`, `Color`, `ColorCancel`). It is drawn as a bar along the bottom of the tab, thicker on the sheet on screen. `GridOp::TabColor` (tag 15) sets it and is its own inverse; it moves with its sheet, a coloured sheet isn't bare (so `DropSheet` keeps it), and Delete Sheet takes the colour off first so undo brings it back. Native chunk 15 (TAB_COLORS). `.xlsx`: `<sheetPr><tabColor rgb>`, read also as a theme or indexed colour with its tint. `.ods`: a table style's `tableooo:tab-color`. Gates: officina-grid `tab_colours_are_set_undone_and_saved`, officina-convert `tests/tabs.rs`, atrium-sheets `sheets_are_added_switched_renamed_and_tabbed`.
 
+### 16.76 Native files loaded within the memory budget (2026-11-18)
+
+`native::load_within(data, budget)` checks the workbook's size (`Workbook::memory_bytes`) after the strings, every 256 column chunks, after the formulas and at the end, and stops with `LoadError::TooBig` once it is past `budget`; `load` is the same without a limit. Sheets opens and recovers native files (and what the converter hands back) within its memory budget (§16.70), so a workbook too big for it is refused while loading, off the window's thread, with the reason in words, instead of after it has taken the memory. Gate: officina-grid `tests/budget.rs` `a_workbook_past_the_budget_is_refused_while_loading`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.
