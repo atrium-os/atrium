@@ -816,6 +816,29 @@ E4 is mostly kernel work, so it is built in steps that each pass on their own:
 | E4.5 | GC: group packs are kept while the group is locked and collected by group when it's loaded; crypto-erase retires a group's packs without its key | VM: GC on a volume with a locked group frees nothing of it |
 | E4.6 | atrium-volumes `encrypt = "persona"` with expected groups, arcad group keys (`VK_MINT`/`VK_LOAD` with a group scope) at login and dropped at logout | VM: two people, the §13 E4 gate |
 
+**E4.3 as built (2026-11-18, kernel).** Every write carries a write context
+(`struct tessera_fs_wctx`): the keys of the domain of the inode it is for, taken
+once at the write's entry point (file content, directory updates, create, mkdir,
+symlink, xattrs). In a group that is the group's `K_gmeta`/`K_gblob` and
+`K_gid[d]` as the id key; outside, the volume's own (sealed) or none (plain). A
+write whose group is locked or doesn't verify is refused, never made under the
+volume's keys. Group packs are single-extent, flagged `KEY_GROUP` in the
+registry (bit 3), kept out of the location and byte caches, and never batched
+with other manifests: the pending-manifest drain publishes a group's manifests
+one per pack under that group's keys. Reads open a group's pack under the group
+its prelude names (EACCES without the key); on an unsealed volume the blob index
+is tried first, then the plain path, then a scan of the groups' packs. GC keeps
+every group pack until E4.5, and a grouped domain can't be detached or change
+its dedup policy. With groups on a mount the dirty-content drain is serial
+(the parallel prepare uses the volume's keys). Names in journal dirent records
+of a group's directories are sealed under `K_gmeta`, bound to parent and inode
+(`reserved[0] = 1`); replay keeps them sealed, and the journal drain opens them
+once the key is loaded (journaling them again until then). Directory manifests
+are sealed blobs, so their plain name hashes are never on disk in the clear;
+keyed name hashes (`K_name`) and the keyed gear table (`K_cdc`; the kernel
+chunks at fixed sizes) are left to userspace writers. Host tools (fsck, the
+reader) don't open group packs yet. VM gate: `tessera-sealed-vm.sh` check 12.
+
 ## 14. Decisions
 
 Accepted 2026-11-17, all as recommended.

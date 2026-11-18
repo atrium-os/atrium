@@ -752,6 +752,11 @@ typedef struct TESSERA_PACKED {
  *           extent containing the whole pack — fast path, identical
  *           to the v1/v2 layout. */
 #define TESSERA_REGISTRY_FLAG_MULTI_EXTENT  (1u << 2)
+/* KEY_GROUP: the pack belongs to a key group (tessera-encryption §5.5): its
+ * front is sealed under the group's K_gmeta and every blob under K_gblob,
+ * whatever the volume. Readers open it with the group named in its prelude;
+ * GC and repack leave it alone until they can handle groups (E4.5). */
+#define TESSERA_REGISTRY_FLAG_KEY_GROUP     (1u << 3)
 
 /* Pack extent list (PEL) — one sector. Lives in the data zone,
  * allocated whenever a pack publish falls back to multi-extent.

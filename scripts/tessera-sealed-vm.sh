@@ -41,7 +41,11 @@
 #      can't be made without its key; made once; an empty quota domain goes
 #      into it, a non-empty one or a plain directory doesn't; after a
 #      remount the domain is in the group and open, locked with the key
-#      dropped, BAD with a wrong key, open again with the right one.
+#      dropped, BAD with a wrong key, open again with the right one;
+#  12. writing in a key group (E4.3) on a plain image: names and bytes not
+#      in the clear, read back after a remount, dedup inside the group and
+#      not across, nothing read with the key dropped, a sealed journal name
+#      survives a crash.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-arm64}"
@@ -312,6 +316,85 @@ mdconfig -d -u ${DEV#/dev/md}
 tessera-keyload drop $GKID >/dev/null
 rm -f $IMG $T/gkey $T/gwrong $T/key $T/wrong
 echo "key groups: ok"
+
+# 12. writing in a key group (E4.3) on a plain (unsealed) image: a domain's
+#     files, names and directory names are sealed under the group's keys;
+#     they read back after a remount; a copy dedups inside the group and
+#     not across; nothing of them reads with the group's key dropped; a
+#     crash keeps a name journaled sealed, and it comes back with the key.
+U3=a1b2c3d4e5f60718293a4b5c6d7e8f90
+rm -f $IMG
+tessera-mkfs-sealed --plain --create -s 64 -j 64 --uuid $U3 $IMG >/dev/null ||
+    fail "mkfs plain for groups"
+head -c 32 /dev/random > $T/gkey
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+mount -t tessera $DEV $M || fail "plain mount for groups"
+mkdir $M/persona $M/other || fail "dirs"
+tessera-quota-set $M/persona 1000000000 >/dev/null || fail "quota persona"
+tessera-quota-set $M/other 1000000000 >/dev/null || fail "quota other"
+tessera-keyload load-group $T/gkey $GKID $U3 9 >/dev/null || fail "load-group 9"
+tessera-keyload group-create $M $GKID 9 >/dev/null || fail "group-create 9"
+tessera-keyload quota-group $M/persona 9 >/dev/null || fail "quota-group 9"
+jot -w 'persona private line %06d' 40000 > $T/pcontent
+mkdir $M/persona/holiday-plans-folder || fail "mkdir in group"
+cp $T/pcontent $M/persona/holiday-plans-folder/itinerary-secret.txt || fail "write in group"
+echo 'persona tiny note' > $M/persona/tiny-persona-note.txt || fail "small write in group"
+ln -s itinerary-target-name $M/persona/symlink-persona-name || fail "symlink in group"
+jot -w 'shared plain line %06d' 20000 > $M/other/plain.txt
+sync; sleep 1; sync
+f0=$(df -k $M | awk 'NR==2 {print $4}')
+cp $T/pcontent $M/persona/copy-in-group.txt || fail "copy in group"
+sync; sleep 1; sync
+f1=$(df -k $M | awk 'NR==2 {print $4}')
+cp $T/pcontent $M/other/copy-outside.txt || fail "copy outside"
+sync; sleep 1; sync
+f2=$(df -k $M | awk 'NR==2 {print $4}')
+echo "free KiB: $f0 -> $f1 (copy in group) -> $f2 (copy outside)"
+[ $((f0 - f1)) -lt 200 ] || fail "a copy inside the group didn't dedup ($f0 -> $f1)"
+[ $((f1 - f2)) -gt 900 ] || fail "a copy outside the group dedup'd against it ($f1 -> $f2)"
+umount $M || fail "umount after group writes"
+for w in itinerary-secret holiday-plans-folder tiny-persona-note symlink-persona-name \
+    itinerary-target-name copy-in-group; do
+    grep -qa "$w" $IMG && fail "'$w' in the clear"
+done
+grep -qa 'persona private line' $IMG && fail "group file bytes in the clear"
+grep -qa 'persona tiny note' $IMG && fail "group small file in the clear"
+grep -qa 'shared plain line' $IMG || fail "plain bytes not found (the grep is blind)"
+mount -t tessera $DEV $M || fail "remount with group"
+cmp -s $M/persona/holiday-plans-folder/itinerary-secret.txt $T/pcontent ||
+    fail "group file differs after remount"
+cmp -s $M/persona/copy-in-group.txt $T/pcontent || fail "group copy differs"
+cmp -s $M/other/copy-outside.txt $T/pcontent || fail "outside copy differs"
+[ "$(cat $M/persona/tiny-persona-note.txt)" = 'persona tiny note' ] ||
+    fail "group small file differs"
+[ "$(readlink $M/persona/symlink-persona-name)" = itinerary-target-name ] ||
+    fail "group symlink differs"
+umount $M
+tessera-keyload drop $GKID >/dev/null || fail "drop group 9"
+mount -t tessera -r $DEV $M || fail "ro mount with the group locked"
+cat $M/persona/holiday-plans-folder/itinerary-secret.txt > $T/got 2>/dev/null &&
+    cmp -s $T/got $T/pcontent && fail "read a group's file without its key"
+cmp -s $M/other/copy-outside.txt $T/pcontent || fail "plain file with the group locked"
+umount $M
+tessera-keyload load-group $T/gkey $GKID $U3 9 >/dev/null || fail "reload group 9"
+# a crash after a create in the group: the name is journaled sealed
+mount -t tessera $DEV $M || fail "rw mount for the group crash"
+echo 'written just before the crash' > $M/persona/crash-persona-name.txt
+sysctl kern.tessera.skip_next_sb=1 >/dev/null
+sync
+cp $IMG $IMG.crash
+umount $M; mdconfig -d -u ${DEV#/dev/md}
+grep -qa crash-persona-name $IMG.crash && fail "a journaled group name in the clear"
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG.crash)
+mount -t tessera $DEV $M || fail "mount after the group crash"
+sync; sleep 1; sync
+[ "$(cat $M/persona/crash-persona-name.txt 2>/dev/null)" = 'written just before the crash' ] ||
+    fail "the group's crash file is lost"
+cmp -s $M/persona/copy-in-group.txt $T/pcontent || fail "group file after the crash"
+umount $M; mdconfig -d -u ${DEV#/dev/md}
+tessera-keyload drop $GKID >/dev/null
+rm -f $IMG $IMG.crash $T/gkey $T/pcontent $T/got
+echo "writing in a key group: ok"
 
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload

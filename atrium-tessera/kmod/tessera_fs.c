@@ -2339,6 +2339,11 @@ static int tessera_blake3_ok;
 #define TESSERA_MP_HASH(tmp, buf, len, out) \
 	tessera_fs_content_id((tmp)->sb.hash_alg, TESSERA_MP_IDKEY(tmp), \
 	    (buf), (len), (out))
+/* A write's content ids: under its write context's id key (K_gid[d] in a
+ * key group, K_id on a sealed volume, none otherwise). */
+#define TESSERA_W_HASH(tmp, w, buf, len, out) \
+	tessera_fs_content_id((tmp)->sb.hash_alg, (w)->idkey, \
+	    (buf), (len), (out))
 static __inline void
 tessera_fs_content_id(uint32_t alg, const uint8_t *id_key, const uint8_t *buf,
     size_t len, tessera_hash_t out)
@@ -2584,7 +2589,30 @@ struct tessera_chunk_in {
 	const uint8_t  *bytes;
 	uint32_t        len;
 };
+/*
+ * The keys a write uses (tessera-encryption §5.5, §6.1): a pack never mixes
+ * key groups, so every pack, blob and content id is made under the keys of
+ * the domain whose inode it is for.
+ *   group 0: the volume's own — on a sealed volume K_meta/K_blob/K_id, on
+ *            an unsealed one plain packs and plain ids;
+ *   group g: the group's K_gmeta/K_gblob (gk, a private copy) and, for a
+ *            write from an inode, K_gid[d] of its domain as the id key.
+ * A write context made from a group id alone (the pending-manifest drain)
+ * has no id key: the ids it publishes were made when the bytes were.
+ */
+/* A journal dirent record's name sealed under its parent's key group
+ * (tessera_jrec_dirent_t.reserved[0]); the seal binds parent and inode. */
+#define TESSERA_JREC_NAME_SEALED  1u
+#define TESSERA_JNAME_BIND(parent, ino) \
+	(((uint64_t)(uint32_t)(parent) << 32) | (uint32_t)(ino))
+struct tessera_fs_wctx {
+	uint64_t              group;
+	tessera_group_keys_t *gk;
+	const uint8_t        *idkey;
+	uint8_t               idbuf[32];
+};
 static int tessera_fs_publish_chunked(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const struct tessera_chunk_in *chunks, uint32_t n_chunks,
     const uint8_t *manifest_bytes, size_t mlen,
     tessera_hash_t out_manifest_hash, uint32_t owner_inode_no);
@@ -2604,9 +2632,11 @@ static int tessera_fs_write_grow_range(struct tessera_mount *tmp_,
 static int tessera_fs_replace_range(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t off, const uint8_t *buf, size_t len);
 static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
     size_t append_len, uint32_t cs);
 static int tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no);
 static uint32_t tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
     const tessera_inode_record_t *ino);
@@ -2750,8 +2780,10 @@ struct tessera_append_prep {
 #define TAPP_TREE     1   /* delegate to append_chunk_tree */
 #define TAPP_PROMOTE  2   /* wrap_list_as_tree, then chunk_tree */
 static int tessera_fs_append_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, struct tessera_append_prep *pp);
 static int tessera_fs_append_prepare(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
     size_t append_len, uint32_t cs, struct tessera_append_prep *pp,
     int *delegate);
@@ -2913,6 +2945,7 @@ struct tessera_pending_manifest {
 	 * durable although superseded is just a GC-able orphan). */
 	int             draining;
 	uint64_t        round;     /* drain-sweep stamp, see dc_drain_round */
+	uint64_t        group;     /* key group whose keys publish it (§5.5) */
 };
 
 /* v2.6 dirent log entry. Variable-length: name bytes follow the
@@ -3020,28 +3053,33 @@ static int tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
                                            const tessera_hash_t hash,
                                            const uint8_t *bytes,
                                            uint32_t len,
-                                           uint32_t owner_inode_no);
+                                           uint32_t owner_inode_no,
+                                           uint64_t group);
 static int tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
-    uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
+    const struct tessera_fs_wctx *w, uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
     uint32_t owner_inode_no, const uint8_t *precomputed_hash);
 static int tessera_fs_replace_content_build(uint32_t hash_alg,
     const uint8_t *id_key, const uint8_t *new_bytes, size_t new_len, uint8_t **out_mft,
     size_t *out_mlen, tessera_hash_t out_mhash);
 static int tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, uint8_t *mft, size_t mlen, size_t new_len,
     const uint8_t *precomputed_hash);
 static void tessera_fs_dc_prep_worker(void *ctx, int pending);
 static int tessera_fs_chunked_prepare(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len,
     struct tessera_chunk_in **out_dirty, uint32_t *out_ndirty,
     uint8_t **out_mft, size_t *out_mlen);
 static int tessera_fs_replace_range_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, const tessera_inode_record_t *ino_in, uint32_t cs,
     uint32_t n_chunks, uint64_t off, const uint8_t *buf, size_t len);
 /* task #68: range-scoped in-place overwrite; ENOTSUP => use whole-file path. */
 static int tessera_fs_replace_range(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t off, const uint8_t *buf, size_t len);
 static int tessera_fs_chunked_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, struct tessera_chunk_in *dirty, uint32_t n_dirty,
     uint8_t *mft, size_t mlen, size_t new_len);
 static int tessera_fs_pending_manifest_lookup(struct tessera_mount *tmp_,
@@ -3053,6 +3091,7 @@ static int tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_);
  * the drain. Splits out the bytes-to-pack-on-disk work from the
  * cache-or-disk decision. */
 static int tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
+                                               const struct tessera_fs_wctx *w,
                                                const uint8_t *manifest_bytes,
                                                size_t mlen,
                                                const tessera_hash_t hash,
@@ -3065,6 +3104,7 @@ struct tessera_aggr_entry {
 static int tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
     const struct tessera_aggr_entry *entries, uint32_t n);
 static int tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+                                             const struct tessera_fs_wctx *w,
                                              const uint8_t *manifest_bytes,
                                              size_t mlen,
                                              tessera_hash_t out_hash,
@@ -3099,6 +3139,7 @@ static int tessera_fs_read_into_uio(struct tessera_mount *tmp_,
                                     uint64_t scratch_cap,
                                     struct tessera_node *tn);
 static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
                                          uint32_t owner_inode_no,
                                          const uint8_t *flat_mft,
                                          size_t flat_mlen,
@@ -3114,13 +3155,16 @@ static int tessera_fs_dir_btree_decode(uint8_t *blob, uint32_t blob_len,
     int *out_leaf, const uint8_t **out_body, size_t *out_body_len,
     uint32_t *out_count);
 static int tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t root_hash, int root_is_empty,
     const char *name, uint16_t namelen, uint64_t inode_no,
     tessera_hash_t out_new_root);
 static int tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t root_hash, const char *name, uint16_t namelen,
     uint64_t verify_inode, int *out_dropped, tessera_hash_t out_new_root);
 static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t old_dir_hash, tessera_hash_t out_new_root,
     int *out_empty);
 
@@ -4427,6 +4471,12 @@ struct tessera_mount {
 	 * On crash + remount, replay re-creates entries in the
 	 * in-memory log; the first post-mount flush applies them. */
 	LIST_HEAD(, tessera_dirent_log_entry) journal_pending;
+	/* Journal dirent records whose names are sealed under a key group
+	 * (tessera-encryption §5.3), waiting for the group's key: name holds
+	 * the sealed name. Replay puts them here; the journal drain opens
+	 * them once the key is loaded and journals them again until then.
+	 * Under the flush gate. */
+	LIST_HEAD(, tessera_dirent_log_entry) jname_backlog;
 	uint32_t                  journal_pending_count;
 	/* Inode-body counterpart: enqueued by tessera_fs_inode_put /
 	 * tessera_fs_inode_delete and drained alongside the dirent
@@ -5606,17 +5656,19 @@ tessera_fs_blob_index_ov_flush(struct tessera_mount *tmp_)
 	return (0);
 }
 
-/* Manifest builder pre-set to the volume's hash_alg so finalize's
- * out_hash matches the volume's content addressing. Every kmod
- * manifest build must come through here, not tessera_manifest_begin. */
+/* Manifest builder pre-set to the volume's hash_alg and the write's id key
+ * (tessera_fs_wctx) so finalize's out_hash matches the content addressing
+ * of the domain it is for. Every kmod manifest build must come through
+ * here, not tessera_manifest_begin. */
 static inline tessera_manifest_builder_t *
-tessera_fs_mft_begin(struct tessera_mount *tmp, tessera_manifest_kind_t kind)
+tessera_fs_mft_begin(struct tessera_mount *tmp,
+    const struct tessera_fs_wctx *w, tessera_manifest_kind_t kind)
 {
 	tessera_manifest_builder_t *b = tessera_manifest_begin(kind);
 	if (b != NULL) {
 		(void)tessera_manifest_set_hash_alg(b, tmp->sb.hash_alg);
-		if (tmp->seal != NULL)
-			(void)tessera_manifest_set_id_key(b, tmp->seal->id);
+		if (w->idkey != NULL)
+			(void)tessera_manifest_set_id_key(b, w->idkey);
 	}
 	return (b);
 }
@@ -5758,6 +5810,102 @@ tessera_quota_for_inode(struct tessera_mount *tmp_,
 	uint64_t id = (ino->quota_domain != 0)
 	    ? ino->quota_domain : tmp_->quota_default_domain;
 	return (tessera_quota_find(tmp_, id));
+}
+
+
+static void
+tessera_fs_wctx_vol(struct tessera_mount *tmp_, struct tessera_fs_wctx *w)
+{
+	memset(w, 0, sizeof(*w));
+	w->idkey = tmp_->seal != NULL ? (const uint8_t *)tmp_->seal->id : NULL;
+}
+
+static void
+tessera_fs_wctx_done(struct tessera_fs_wctx *w)
+{
+	if (w->gk != NULL) {
+		tessera_group_keys_clear(w->gk);
+		zfree(w->gk, M_TESSERA);
+	}
+	explicit_bzero(w, sizeof(*w));
+}
+
+/* The keys for a write by (or for) inode_no's domain. EACCES when the
+ * domain's group is locked, EINTEGRITY when its record doesn't verify: the
+ * write is refused, never made under the volume's keys instead. */
+static int
+tessera_fs_wctx_domain(struct tessera_mount *tmp_, uint64_t domain_id,
+    struct tessera_fs_wctx *w)
+{
+	tessera_quota_domain_t *qd;
+	tessera_quota_domain_t dcopy;
+	int e;
+
+	tessera_fs_wctx_vol(tmp_, w);
+	qd = tessera_quota_find(tmp_, domain_id);
+	if (qd == NULL || qd->key_group == 0)
+		return (0);
+	dcopy = *qd;
+	w->gk = malloc(sizeof(*w->gk), M_TESSERA, M_WAITOK | M_ZERO);
+	e = tessera_fs_domain_keys(tmp_, domain_id, w->gk);
+	if (e == 0 && tessera_group_domain_id_key(w->gk, &dcopy, w->idbuf) !=
+	    TESSERA_OK)
+		e = EIO;
+	if (e != 0) {
+		tessera_fs_wctx_done(w);
+		return (e == ENOENT ? EINTEGRITY : e);
+	}
+	w->group = dcopy.key_group;
+	w->idkey = w->idbuf;
+	return (0);
+}
+
+static int
+tessera_fs_wctx_inode(struct tessera_mount *tmp_, uint32_t inode_no,
+    struct tessera_fs_wctx *w)
+{
+	tessera_inode_record_t ino;
+
+	tessera_fs_wctx_vol(tmp_, w);
+	if (inode_no == 0 || tmp_->ngroups == 0)
+		return (0);
+	if (tessera_fs_inode_get(tmp_, inode_no, &ino) != TESSERA_OK)
+		return (EIO);
+	return (tessera_fs_wctx_domain(tmp_, ino.quota_domain != 0 ?
+	    ino.quota_domain : tmp_->quota_default_domain, w));
+}
+
+/* The keys of group g alone, for publishing bytes whose ids exist. */
+static int
+tessera_fs_wctx_group(struct tessera_mount *tmp_, uint64_t group,
+    struct tessera_fs_wctx *w)
+{
+	struct tessera_fs_group *g;
+	int e = 0;
+
+	tessera_fs_wctx_vol(tmp_, w);
+	if (group == 0)
+		return (0);
+	w->idkey = NULL;
+	if (!tmp_->groups_sx_init)
+		return (EINTEGRITY);
+	w->gk = malloc(sizeof(*w->gk), M_TESSERA, M_WAITOK | M_ZERO);
+	sx_xlock(&tmp_->groups_sx);
+	tessera_fs_groups_refresh(tmp_);
+	g = tessera_fs_group_find(tmp_, group);
+	if (g == NULL || g->bad)
+		e = EINTEGRITY;
+	else if (g->keys == NULL)
+		e = EACCES;
+	else
+		*w->gk = *g->keys;
+	sx_xunlock(&tmp_->groups_sx);
+	if (e != 0) {
+		tessera_fs_wctx_done(w);
+		return (e);
+	}
+	w->group = group;
+	return (0);
 }
 
 /* Is this writer's quota domain on a `deferred` dedup policy
@@ -8327,6 +8475,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tessera_cas_cache_init(&tmp_->cas_cache);
 	LIST_INIT(&tmp_->journal_pending);
 	tmp_->journal_pending_count = 0;
+	LIST_INIT(&tmp_->jname_backlog);
 	LIST_INIT(&tmp_->journal_pending_inodes);
 	tmp_->journal_pending_inode_count = 0;
 	callout_init(&tmp_->journal_log_co, 1);
@@ -9539,6 +9688,11 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 					free(_jp, M_TESSERA);
 				}
 				tmp_->journal_pending_count = 0;
+				while ((_jp = LIST_FIRST(
+				    &tmp_->jname_backlog)) != NULL) {
+					LIST_REMOVE(_jp, link);
+					free(_jp, M_TESSERA);
+				}
 			}
 			tmp_->dirty_init = 0;
 		}
@@ -14656,6 +14810,7 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
                                 const tessera_hash_t hash,
                                 const uint8_t *bytes, uint32_t len,
                                 uint32_t owner_inode_no,
+                                uint64_t group,
                                 uint8_t *own_bytes)
 {
 	if (!tmp_->dirty_init) {
@@ -14676,6 +14831,7 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 	memcpy(e->hash, hash, sizeof e->hash);
 	e->bytes = buf;
 	e->len   = len;
+	e->group = group;
 	LIST_INIT(&e->owners);
 
 	struct tessera_pending_owner *new_own = NULL;
@@ -14816,10 +14972,10 @@ static int
 tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
                                 const tessera_hash_t hash,
                                 const uint8_t *bytes, uint32_t len,
-                                uint32_t owner_inode_no)
+                                uint32_t owner_inode_no, uint64_t group)
 {
 	return (tessera_fs_pending_manifest_put_impl(tmp_, hash, bytes, len,
-	    owner_inode_no, NULL));
+	    owner_inode_no, group, NULL));
 }
 
 /* Returns 1 (and copies bytes into a freshly malloc'd buffer) on hit;
@@ -14994,8 +15150,10 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			}
 
 			/* Eligibility: only batch small manifests. Larger
-			 * ones publish as single-blob packs. */
-			if (e->len > (uint32_t)tessera_aggregation_blob_max) {
+			 * ones publish as single-blob packs, and so does a
+			 * key group's: a batch never mixes groups (§5.5). */
+			if (e->len > (uint32_t)tessera_aggregation_blob_max ||
+			    e->group != 0) {
 				/* Deferred if ANY owner's domain is deferred:
 				 * one entry can be referenced by several
 				 * inodes, and the weaker policy must not
@@ -15014,9 +15172,14 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 						break;
 					}
 				}
-				int r = tessera_fs_publish_manifest_to_disk(
-				    tmp_, e->bytes, e->len, e->hash,
-				    owner_for_policy);
+				struct tessera_fs_wctx gw;
+				int r = tessera_fs_wctx_group(tmp_, e->group,
+				    &gw);
+				if (r == 0)
+					r = tessera_fs_publish_manifest_to_disk(
+					    tmp_, &gw, e->bytes, e->len,
+					    e->hash, owner_for_policy);
+				tessera_fs_wctx_done(&gw);
 				mtx_lock(&tmp_->flush_mtx);
 				e->draining = 0;
 				if (r == 0)
@@ -16242,7 +16405,8 @@ tessera_fs_window_seal(struct tessera_mount *tmp_, uint32_t inode_no)
 }
 
 static int
-tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
+tessera_fs_window_publish_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no)
 {
 	mtx_lock(&tmp_->flush_mtx);
 	struct tessera_dirty_content *dc =
@@ -16276,7 +16440,7 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 			if (cs == 0)
 				cs = tessera_chunk_size_for(tmp_,
 				    dc->base_off + dc->size);
-			prc = tessera_fs_append_prepare(tmp_, inode_no,
+			prc = tessera_fs_append_prepare(tmp_, w, inode_no,
 			    dc->base_off, dc->bytes, dc->size, cs, &pp,
 			    &delegate);
 		}
@@ -16285,7 +16449,7 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 	int rc;
 	tessera_fs_flush_gate_enter(tmp_);
 	if (prc == 0 && delegate == TAPP_NONE)
-		rc = tessera_fs_append_apply(tmp_, inode_no, &pp);
+		rc = tessera_fs_append_apply(tmp_, w, inode_no, &pp);
 	else
 		rc = tessera_fs_dirty_content_publish(tmp_, dc);
 	tessera_fs_flush_gate_exit(tmp_);
@@ -16312,6 +16476,20 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 	wakeup(dc);
 	mtx_unlock(&tmp_->flush_mtx);
 	return (rc);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_window_publish_wk(tmp_, &wv, inode_no);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /* ── Pessimistic space admission (Option C groundwork) ──────────
@@ -16817,20 +16995,26 @@ tessera_fs_dc_prep_worker(void *ctx, int pending)
 		 * (draining) for the whole job lifetime. Batched so the
 		 * queue/wakeup overhead amortizes over ~32 files (per-file
 		 * jobs were SLOWER than the serial drain). */
+		/* The volume's keys only: with key groups on the mount the
+		 * drain is serial (the write's keys come from its inode). */
+		struct tessera_fs_wctx wv, *w = &wv;
+		tessera_fs_wctx_vol(tmp_, w);
 		for (int i = 0; i < j->n; i++) {
 			struct tessera_dirty_content *dc = j->it[i].dc;
-			if (dc->size <= (256u * 1024u)) {
+			if (tmp_->ngroups != 0) {
+				j->it[i].error = EAGAIN;  /* serial publish */
+			} else if (dc->size <= (256u * 1024u)) {
 				j->it[i].kind = 0;
 				j->it[i].error =
 				    tessera_fs_replace_content_build(
-				    tmp_->sb.hash_alg, TESSERA_MP_IDKEY(tmp_),
+				    tmp_->sb.hash_alg, w->idkey,
 				    dc->bytes, dc->size,
 				    &j->it[i].mft, &j->it[i].mlen,
 				    j->it[i].mhash);
 			} else {
 				j->it[i].kind = 1;
 				j->it[i].error = tessera_fs_chunked_prepare(
-				    tmp_, dc->inode_no, dc->bytes, dc->size,
+				    tmp_, w, dc->inode_no, dc->bytes, dc->size,
 				    &j->it[i].dirty, &j->it[i].n_dirty,
 				    &j->it[i].mft, &j->it[i].mlen);
 			}
@@ -16852,6 +17036,9 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 {
 	sbintime_t _ct0 = TPROF_T0();
 	int last = 0;
+	/* Prepared under the volume's keys (dc_prep_worker). */
+	struct tessera_fs_wctx wv, *w = &wv;
+	tessera_fs_wctx_vol(tmp_, w);
 	for (int i = 0; i < j->n; i++) {
 		struct tessera_dirty_content *dc = j->it[i].dc;
 		int rc;
@@ -16860,7 +17047,7 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 			 * serial publish from the intact dc. */
 			rc = tessera_fs_dirty_content_publish(tmp_, dc);
 		} else if (j->it[i].kind == 0) {
-			rc = tessera_fs_replace_content_apply(tmp_,
+			rc = tessera_fs_replace_content_apply(tmp_, w,
 			    dc->inode_no, j->it[i].mft, j->it[i].mlen,
 			    dc->size, j->it[i].mhash);   /* consumes mft */
 			if (rc == 0) {
@@ -16868,7 +17055,7 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 				tessera_stat_dirty_content_flushes++;
 			}
 		} else {
-			rc = tessera_fs_chunked_apply(tmp_, dc->inode_no,
+			rc = tessera_fs_chunked_apply(tmp_, w, dc->inode_no,
 			    j->it[i].dirty, j->it[i].n_dirty,
 			    j->it[i].mft, j->it[i].mlen, dc->size);
 			if (rc == 0) {
@@ -17063,6 +17250,8 @@ tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 	 * bounded job window caps the extra manifest RAM. */
 	int workers = tessera_dc_prep_workers;
 	if (workers > 4) workers = 4;
+	if (tmp_->ngroups != 0)
+		workers = 0;    /* key groups: serial, see dc_prep_worker */
 	/* Energy-posture derating (coordinated, not coupled — the same
 	 * read-only-intent pattern the Tier-2/3 router and display use):
 	 * under a powersave posture the drain must not wake parked cores
@@ -19865,10 +20054,17 @@ tessera_fs_fetch_reloc_ok(struct tessera_mount *tmp_, uint64_t reloc_gen0,
  * Read and open a sealed pack's front (prelude, header, index, bloom) against
  * the registry's tag. 0 with *out_front (malloc'd, zfree) holding the plain
  * front and *geom its geometry; EIO or EINTEGRITY with *why naming the check.
+ *
+ * A key group's pack (§5.5) opens under the group its prelude names, which
+ * must agree with the registry's KEY_GROUP flag; *rk then holds that group's
+ * keys for the blobs (tessera_fs_wctx_done it whatever the result). Without
+ * the group's key the answer is EACCES. On an unsealed volume front_tag is
+ * NULL: the registry holds no tag and the front's own tag authenticates it.
  */
 static int
 tessera_fs_sealed_front_open(struct tessera_mount *tmp_,
     const tessera_registry_entry_t *re, const uint8_t front_tag[16],
+    struct tessera_fs_wctx *rk,
     uint8_t **out_front, size_t *out_fbytes, tessera_pack_geom_t *geom,
     const char **why)
 {
@@ -19880,6 +20076,7 @@ tessera_fs_sealed_front_open(struct tessera_mount *tmp_,
 	size_t fbytes;
 	int rc;
 
+	tessera_fs_wctx_vol(tmp_, rk);
 	*out_front = NULL;
 	*why = NULL;
 	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0 ||
@@ -19893,10 +20090,20 @@ tessera_fs_sealed_front_open(struct tessera_mount *tmp_,
 		goto fail;
 	}
 	if (tessera_pack_sealed_prelude(front, TESSERA_SECTOR_SIZE, &grp,
-	    &flen) != TESSERA_OK || grp != 0) {
+	    &flen) != TESSERA_OK ||
+	    (grp != 0) != ((re->flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) != 0) ||
+	    (grp == 0 && tmp_->seal == NULL)) {
 		rc = EINTEGRITY;
 		*why = "prelude";
 		goto fail;
+	}
+	if (grp != 0) {
+		rc = tessera_fs_wctx_group(tmp_, grp, rk);
+		if (rc != 0) {
+			if (rc != EACCES)
+				*why = "key group";
+			goto fail;
+		}
 	}
 	fbytes = roundup2((size_t)TESSERA_SEALED_PACK_PRELUDE + flen,
 	    TESSERA_SECTOR_SIZE);
@@ -19912,8 +20119,10 @@ tessera_fs_sealed_front_open(struct tessera_mount *tmp_,
 		rc = EIO;
 		goto fail;
 	}
-	if (tessera_pack_open_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
-	    front_tag, front, fbytes) != TESSERA_OK) {
+	if ((grp != 0 ? tessera_pack_open_front(&rk->gk->gmeta, rk->gk->uuid,
+	    grp, tmp_->seal != NULL ? front_tag : NULL, front, fbytes) :
+	    tessera_pack_open_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
+	    front_tag, front, fbytes)) != TESSERA_OK) {
 		rc = EINTEGRITY;
 		*why = "front open";
 		goto fail;
@@ -19957,6 +20166,7 @@ tessera_fs_gc_sealed_index_hashes(struct tessera_mount *tmp_,
     tessera_hash_t **out_bh, uint32_t *out_n)
 {
 	tessera_pack_geom_t geom;
+	struct tessera_fs_wctx rk;
 	uint8_t *front;
 	size_t fbytes;
 	const char *why;
@@ -19964,8 +20174,9 @@ tessera_fs_gc_sealed_index_hashes(struct tessera_mount *tmp_,
 
 	*out_bh = NULL;
 	*out_n = 0;
-	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &front, &fbytes,
-	    &geom, &why);
+	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &rk, &front,
+	    &fbytes, &geom, &why);
+	tessera_fs_wctx_done(&rk);
 	if (rc != 0) {
 		if (why != NULL)
 			tessera_fs_sealed_refused(re, why);
@@ -20004,6 +20215,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 {
 	tessera_pack_extent_t ext = { re->start_sector, re->length_sectors };
 	tessera_pack_geom_t geom;
+	struct tessera_fs_wctx rk;
 	uint8_t *front = NULL, *unit = NULL, *pt = NULL;
 	uint64_t desc_off;
 	uint32_t dsize;
@@ -20011,8 +20223,8 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	const char *why = NULL;
 	int rc;
 
-	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &front, &fbytes,
-	    &geom, &why);
+	rc = tessera_fs_sealed_front_open(tmp_, re, front_tag, &rk, &front,
+	    &fbytes, &geom, &why);
 	if (rc != 0)
 		goto out;
 	rc = tessera_pack_index_find(front + geom.index_off,
@@ -20034,8 +20246,10 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 		goto out;
 	}
 	pt = malloc(dsize - TESSERA_SEAL_OVERHEAD + 1, M_TESSERA, M_WAITOK);
-	if (tessera_blob_open(&tmp_->seal->blob, tmp_->seal->uuid, 0, id,
-	    unit, dsize, pt) != TESSERA_OK) {
+	if ((rk.group != 0 ? tessera_blob_open(&rk.gk->gblob, rk.gk->uuid,
+	    rk.group, id, unit, dsize, pt) :
+	    tessera_blob_open(&tmp_->seal->blob, tmp_->seal->uuid, 0, id,
+	    unit, dsize, pt)) != TESSERA_OK) {
 		rc = EINTEGRITY;
 		why = "blob open";
 		goto out;
@@ -20045,6 +20259,7 @@ tessera_fs_sealed_pack_find(struct tessera_mount *tmp_,
 	pt = NULL;
 	rc = 0;
 out:
+	tessera_fs_wctx_done(&rk);
 	if (why != NULL)
 		tessera_fs_sealed_refused(re, why);
 	if (front != NULL)
@@ -20067,6 +20282,10 @@ tessera_fs_sealed_fetch_from(struct tessera_mount *tmp_, const uint8_t pid[16],
 	if (tessera_fs_registry_get(tmp_, pid, val) != TESSERA_OK ||
 	    tessera_decode_registry_entry(val, &re) != TESSERA_OK)
 		return (ENOENT);
+	/* On an unsealed volume only a key group's packs are sealed. */
+	if (tmp_->seal == NULL &&
+	    (re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) == 0)
+		return (ENOENT);
 	return (tessera_fs_sealed_pack_find(tmp_, &re,
 	    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf, out_len));
 }
@@ -20077,10 +20296,15 @@ tessera_fs_sealed_fetch_from(struct tessera_mount *tmp_, const uint8_t pid[16],
  * pack in the registry. A sealed pack's front opens only under the tag its
  * registry entry holds, and its blob only under the id asked for, so a stale
  * index entry costs a read, never a wrong answer.
+ *
+ * On an unsealed volume with key groups the same search covers the groups'
+ * packs only (tessera_fs_fetch_blob_ex): first without the scans (scan 0),
+ * which answers ENOENT for anything the index doesn't place in a group's
+ * pack, then, once the plain search has missed too, with them.
  */
 static int
 tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
-    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len)
+    const tessera_hash_t id, uint8_t **out_buf, uint32_t *out_len, int scan)
 {
 	uint8_t key[16], val[TESSERA_REGISTRY_ENTRY_SIZE_SEALED], pid[16];
 	tessera_registry_entry_t re;
@@ -20121,6 +20345,8 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 		if (r != ENOENT)
 			bad = r;
 	}
+	if (!scan)
+		return (bad != 0 ? bad : ENOENT);
 
 	/* Packs not yet in the tree: copy their ids out of the overlay. */
 	if (tmp_->flush_mtx_init) {
@@ -20168,8 +20394,13 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 			rc = EIO;
 			break;
 		}
-		r = tessera_fs_sealed_pack_find(tmp_, &re,
-		    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf, out_len);
+		if (tmp_->seal == NULL &&
+		    (re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) == 0)
+			r = ENOENT;     /* a plain pack: not this search's */
+		else
+			r = tessera_fs_sealed_pack_find(tmp_, &re,
+			    val + TESSERA_REGISTRY_ENTRY_SIZE, id, out_buf,
+			    out_len);
 		if (r == 0) {
 			rc = 0;
 			break;
@@ -20188,6 +20419,9 @@ tessera_fs_fetch_blob_sealed(struct tessera_mount *tmp_,
 	return (rc == ENOENT && bad != 0 ? bad : rc);
 }
 
+static int tessera_fs_fetch_blob_plain(struct tessera_mount *tmp_,
+    tessera_btree_t *reg_override, const tessera_hash_t hash, uint8_t *dst,
+    uint64_t dst_cap, uint8_t **out_buf, uint32_t *out_len);
 static int
 tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
                       tessera_btree_t *reg_override,
@@ -20226,7 +20460,33 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 		return (0);
 	if (tmp_->seal != NULL)
 		return (tessera_fs_fetch_blob_sealed(tmp_, hash, out_buf,
-		    out_len));
+		    out_len, 1));
+	/* Key groups on an unsealed volume (§5.5): a blob the index places
+	 * in a group's pack opens there; anything else takes the plain path,
+	 * and only when that misses are the groups' packs searched. */
+	if (tmp_->ngroups != 0) {
+		int gr = tessera_fs_fetch_blob_sealed(tmp_, hash, out_buf,
+		    out_len, 0);
+		if (gr != ENOENT)
+			return (gr);
+		gr = tessera_fs_fetch_blob_plain(tmp_, reg_override, hash, dst,
+		    dst_cap, out_buf, out_len);
+		if (gr != ENOENT)
+			return (gr);
+		return (tessera_fs_fetch_blob_sealed(tmp_, hash, out_buf,
+		    out_len, 1));
+	}
+	return (tessera_fs_fetch_blob_plain(tmp_, reg_override, hash, dst,
+	    dst_cap, out_buf, out_len));
+}
+
+/* The plain fetch: packs outside any key group on an unsealed volume. */
+static int
+tessera_fs_fetch_blob_plain(struct tessera_mount *tmp_,
+                      tessera_btree_t *reg_override,
+                      const tessera_hash_t hash, uint8_t *dst, uint64_t dst_cap,
+                      uint8_t **out_buf, uint32_t *out_len)
+{
 	/*
 	 * NOT ENOENT: with the registry unavailable we know nothing about
 	 * what is on this volume, and ENOENT now MEANS "definitively absent"
@@ -22286,6 +22546,11 @@ snap_next:
 			 */
 			if (re.length_sectors == 0 ||
 			    re.length_sectors > 4096u) goto next_p; /* sanity */
+			/* A key group's pack is kept whole until GC handles
+			 * groups (tessera-encryption §13.1 E4.5): its blobs
+			 * are reached through keys this pass may not have. */
+			if ((re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) != 0)
+				goto next_p;
 
 			/* Shared by both enumeration arms below. */
 			tessera_hash_t bh;              /* blob 0 */
@@ -23173,6 +23438,7 @@ tessera_fs_gc_arm(struct tessera_mount *tmp_)
  */
 static int
 tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
+                                  const struct tessera_fs_wctx *w,
                                   const uint8_t *manifest_bytes, size_t mlen,
                                   tessera_hash_t out_hash,
                                   uint32_t owner_inode_no,
@@ -23181,7 +23447,7 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
 
-	TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_hash);
+	TESSERA_W_HASH(tmp_, w, manifest_bytes, mlen, out_hash);
 
 	/* ★ #72 SATB barrier, covering all three outcomes below in one
 	 * place: the dedup short-circuit (which takes a NEW reference to an
@@ -23259,9 +23525,9 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	    tmp_->pending_manifest_bytes <
 	        TESSERA_PENDING_MANIFEST_BYTES_MAX) {
 		return (tessera_fs_pending_manifest_put(tmp_, out_hash,
-		    manifest_bytes, (uint32_t)mlen, owner_inode_no));
+		    manifest_bytes, (uint32_t)mlen, owner_inode_no, w->group));
 	}
-	return (tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
+	return (tessera_fs_publish_manifest_to_disk(tmp_, w, manifest_bytes,
 	    mlen, out_hash, owner_inode_no));
 }
 
@@ -23272,6 +23538,7 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
  * instead of copying it — one full manifest memcpy per file saved. */
 static int
 tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
     uint32_t owner_inode_no, const uint8_t *precomputed_hash)
 {
@@ -23283,7 +23550,7 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 	if (precomputed_hash != NULL)
 		memcpy(out_hash, precomputed_hash, sizeof(tessera_hash_t));
 	else
-		TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_hash);
+		TESSERA_W_HASH(tmp_, w, manifest_bytes, mlen, out_hash);
 
 	/* ★ #72 SATB barrier — see publish_manifest_owned_ex. */
 	tessera_fs_gc_note_hash(tmp_, out_hash);
@@ -23311,11 +23578,12 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 	        TESSERA_PENDING_MANIFEST_BYTES_MAX) {
 		sbintime_t _tc = TPROF_T0();
 		int _rc = tessera_fs_pending_manifest_put_impl(tmp_, out_hash,
-		    NULL, (uint32_t)mlen, owner_inode_no, manifest_bytes);
+		    NULL, (uint32_t)mlen, owner_inode_no, w->group,
+		    manifest_bytes);
 		TPROF_ADD(TPROF_C_PENDPUT, _tc);
 		return (_rc);
 	}
-	int rc = tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
+	int rc = tessera_fs_publish_manifest_to_disk(tmp_, w, manifest_bytes,
 	    mlen, out_hash, owner_inode_no);
 	free(manifest_bytes, M_TESSERA);
 	return (rc);
@@ -23326,10 +23594,11 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
  * publish_manifest_owned(..., 0). */
 static int
 tessera_fs_publish_manifest(struct tessera_mount *tmp_,
+                            const struct tessera_fs_wctx *w,
                             const uint8_t *manifest_bytes, size_t mlen,
                             tessera_hash_t out_hash)
 {
-	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, w, manifest_bytes,
 	    mlen, out_hash, /*owner_inode_no=*/0, /*known_new=*/0));
 }
 
@@ -23337,11 +23606,12 @@ tessera_fs_publish_manifest(struct tessera_mount *tmp_,
  * (pack_registry pre-check enabled). */
 static int
 tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
+                                  const struct tessera_fs_wctx *w,
                                   const uint8_t *manifest_bytes, size_t mlen,
                                   tessera_hash_t out_hash,
                                   uint32_t owner_inode_no)
 {
-	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, w, manifest_bytes,
 	    mlen, out_hash, owner_inode_no, /*known_new=*/0));
 }
 
@@ -23353,12 +23623,13 @@ tessera_fs_publish_manifest_owned(struct tessera_mount *tmp_,
  * tessera_fs_publish_manifest_owned_ex for the safety argument. */
 static int
 tessera_fs_publish_manifest_owned_known_new(struct tessera_mount *tmp_,
+                                            const struct tessera_fs_wctx *w,
                                             const uint8_t *manifest_bytes,
                                             size_t mlen,
                                             tessera_hash_t out_hash,
                                             uint32_t owner_inode_no)
 {
-	return (tessera_fs_publish_manifest_owned_ex(tmp_, manifest_bytes,
+	return (tessera_fs_publish_manifest_owned_ex(tmp_, w, manifest_bytes,
 	    mlen, out_hash, owner_inode_no, /*known_new=*/1));
 }
 
@@ -24450,33 +24721,46 @@ tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
  * Sealed packs take one contiguous extent: there is no sealed PEL.
  */
 static tessera_pack_builder_t *
-tessera_fs_pack_begin(struct tessera_mount *tmp_, uint32_t kind,
+tessera_fs_pack_begin(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t kind,
     const uint8_t pack_id[16], uint64_t creator_tx)
 {
 	tessera_pack_builder_t *pb = tessera_pack_begin(kind, pack_id,
 	    creator_tx);
 
-	if (pb != NULL && tmp_->seal != NULL)
+	if (pb != NULL && (tmp_->seal != NULL || w->group != 0))
 		tessera_pack_set_sealed(pb);
 	return (pb);
 }
 
 static int
-tessera_fs_pack_add(struct tessera_mount *tmp_, tessera_pack_builder_t *pb,
+tessera_fs_pack_add(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, tessera_pack_builder_t *pb,
     const tessera_hash_t id, const uint8_t *bytes, uint32_t len,
     uint32_t flags)
 {
+	if (w->group != 0)
+		return (tessera_pack_add_sealed_blob(pb, &w->gk->gblob,
+		    w->gk->uuid, w->group, id, bytes, len, flags));
 	if (tmp_->seal != NULL)
 		return (tessera_pack_add_sealed_blob(pb, &tmp_->seal->blob,
 		    tmp_->seal->uuid, 0, id, bytes, len, flags));
 	return (tessera_pack_add_blob(pb, id, bytes, len, flags));
 }
 
+/* A group's pack (§5.5): its front sealed under K_gmeta. On a sealed
+ * volume the registry records the tag as for any pack; on an unsealed one
+ * the registry entry is the plain 40 bytes, flagged KEY_GROUP, and the
+ * front is authenticated by its own tag. */
 static int
-tessera_fs_pack_seal(struct tessera_mount *tmp_, uint8_t *pack, size_t len,
+tessera_fs_pack_seal(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint8_t *pack, size_t len,
     uint8_t front_tag[16])
 {
 	memset(front_tag, 0, 16);
+	if (w->group != 0)
+		return (tessera_pack_seal_front(&w->gk->gmeta, w->gk->uuid,
+		    w->group, pack, len, front_tag) == TESSERA_OK ? 0 : EIO);
 	if (tmp_->seal == NULL)
 		return (0);
 	return (tessera_pack_seal_front(&tmp_->seal->meta, tmp_->seal->uuid, 0,
@@ -24484,10 +24768,12 @@ tessera_fs_pack_seal(struct tessera_mount *tmp_, uint8_t *pack, size_t len,
 }
 
 static int tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint8_t *manifest_bytes, size_t mlen, const tessera_hash_t hash,
     uint32_t owner_inode_no);
 static int
 tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
+                                    const struct tessera_fs_wctx *w,
                                     const uint8_t *manifest_bytes,
                                     size_t mlen,
                                     const tessera_hash_t hash,
@@ -24495,8 +24781,8 @@ tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
 {
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_publish_manifest_to_disk_inner(tmp_, manifest_bytes,
-	    mlen, hash, owner_inode_no);
+	int rc = tessera_fs_publish_manifest_to_disk_inner(tmp_, w,
+	    manifest_bytes, mlen, hash, owner_inode_no);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
@@ -24508,6 +24794,7 @@ tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
  * 0 = no identified owner (GC, mount-time work) ⇒ global. */
 static int
 tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
+                                    const struct tessera_fs_wctx *w,
                                     const uint8_t *manifest_bytes,
                                     size_t mlen,
                                     const tessera_hash_t hash,
@@ -24516,9 +24803,10 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	uint8_t pack_id[16];
 	memcpy(pack_id, hash, 16);
 
-	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 0, pack_id, 0);
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, w, 0, pack_id,
+	    0);
 	if (pb == NULL) return (ENOMEM);
-	if (tessera_fs_pack_add(tmp_, pb, hash, manifest_bytes,
+	if (tessera_fs_pack_add(tmp_, w, pb, hash, manifest_bytes,
 	    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
 		tessera_pack_free(pb);
 		return (EIO);
@@ -24535,7 +24823,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
 	uint8_t front_tag[16];
-	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+	if (tessera_fs_pack_seal(tmp_, w, pack_bytes, pack_size, front_tag) != 0) {
 		free(pack_bytes, M_TESSERA);
 		return (EIO);
 	}
@@ -24543,7 +24831,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL || w->group != 0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -24562,7 +24850,8 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	 * which correctly gets NO grace. */
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = 1;
-	re.flags           = pa.flags;
+	re.flags           = pa.flags |
+	    (w->group != 0 ? TESSERA_REGISTRY_FLAG_KEY_GROUP : 0);
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
@@ -24623,8 +24912,11 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 
 	/* CAS-cache insert for the manifest blob. Single-blob pack ⇒ one
 	 * extent. Multi-extent layout (PEL) defers extent resolution to
-	 * read time. */
-	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+	 * read time. A group's pack is read only through its sealed front
+	 * (tessera_fs_fetch_blob_group), never through the location cache. */
+	if (w->group != 0) {
+		/* nothing */
+	} else if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 		tessera_pack_extent_t one = {
 			.start_sector   = pa.start_sector,
 			.length_sectors = pa.length_sectors,
@@ -24670,9 +24962,11 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 		 * reference recorded nowhere else — same reasoning as the
 		 * other two sites. A MISS is always safe to act on (it just
 		 * publishes), so only the hit side needed the guard. */
+		struct tessera_fs_wctx wv;
+		tessera_fs_wctx_vol(tmp_, &wv);
 		if (tessera_fs_registry_get_stable(tmp_, pack_id,
 		    reg, h) != TESSERA_OK)
-			(void)tessera_fs_publish_manifest_to_disk(tmp_,
+			(void)tessera_fs_publish_manifest_to_disk(tmp_, &wv,
 			    buf, mlen, h, 0);
 	}
 	tessera_manifest_free(mb);
@@ -24689,8 +24983,11 @@ tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_)
 {
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return;
+	/* The volume's constants: outside every key group. */
+	struct tessera_fs_wctx wv;
+	tessera_fs_wctx_vol(tmp_, &wv);
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_INLINE);
+	    tessera_fs_mft_begin(tmp_, &wv, TESSERA_MFT_INLINE);
 	if (mb != NULL &&
 	    tessera_manifest_set_inline(mb, NULL, 0) != TESSERA_OK) {
 		tessera_manifest_free(mb);
@@ -24698,7 +24995,7 @@ tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_)
 	}
 	tessera_fs_seed_one_constant(tmp_, mb);
 	tessera_fs_seed_one_constant(tmp_,
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY));
+	    tessera_fs_mft_begin(tmp_, &wv, TESSERA_MFT_DIRECTORY));
 }
 
 /* Multi-blob aggregation: bundle N small INLINE manifests into
@@ -24721,6 +25018,10 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
                                    const struct tessera_aggr_entry *entries,
                                    uint32_t n)
 {
+	/* Batched manifests are outside any key group: the drain publishes a
+	 * group's manifests one per pack under the group's keys. */
+	struct tessera_fs_wctx wv, *w = &wv;
+	tessera_fs_wctx_vol(tmp_, w);
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
 	if (n == 0) return (0);
@@ -24770,12 +25071,12 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 		}
 	}
 
-	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 0 /* manifest pack */,
-	    pack_id, 0);
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, w,
+	    0 /* manifest pack */, pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
 	uint32_t n_pack_blobs = 0;
 	for (uint32_t i = 0; i < n; i++) {
-		int ar = tessera_fs_pack_add(tmp_, pb, entries[i].hash,
+		int ar = tessera_fs_pack_add(tmp_, w, pb, entries[i].hash,
 		    entries[i].bytes, entries[i].len,
 		    TESSERA_BLOB_FLAG_MANIFEST);
 		if (ar != TESSERA_OK) {
@@ -24800,7 +25101,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
 	uint8_t front_tag[16];
-	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+	if (tessera_fs_pack_seal(tmp_, w, pack_bytes, pack_size, front_tag) != 0) {
 		free(pack_bytes, M_TESSERA);
 		return (EIO);
 	}
@@ -24808,7 +25109,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL || w->group != 0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -24827,7 +25128,8 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	 * which correctly gets NO grace. */
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
-	re.flags           = pa.flags;
+	re.flags           = pa.flags |
+	    (w->group != 0 ? TESSERA_REGISTRY_FLAG_KEY_GROUP : 0);
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
@@ -24886,19 +25188,20 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
  */
 static int
 tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint8_t pack_id[16],
     const struct tessera_chunk_in *chunks, uint32_t n,
     const uint8_t *manifest_bytes, size_t mlen,
     const tessera_hash_t manifest_hash,
     uint32_t owner_inode_no)
 {
-	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, 2 /* mixed */,
-	    pack_id, 0);
+	tessera_pack_builder_t *pb = tessera_fs_pack_begin(tmp_, w,
+	    2 /* mixed */, pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
 
 	uint32_t n_pack_blobs = 0;
 	for (uint32_t i = 0; i < n; i++) {
-		if (tessera_fs_pack_add(tmp_, pb, chunks[i].hash, chunks[i].bytes,
+		if (tessera_fs_pack_add(tmp_, w, pb, chunks[i].hash, chunks[i].bytes,
 		    chunks[i].len, TESSERA_BLOB_FLAG_CHUNK) != TESSERA_OK) {
 			tessera_pack_free(pb);
 			return (EIO);
@@ -24906,7 +25209,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		n_pack_blobs++;
 	}
 	if (manifest_bytes != NULL) {
-		if (tessera_fs_pack_add(tmp_, pb, manifest_hash, manifest_bytes,
+		if (tessera_fs_pack_add(tmp_, w, pb, manifest_hash, manifest_bytes,
 		    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
 			tessera_pack_free(pb);
 			return (EIO);
@@ -24925,7 +25228,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	tessera_pack_free(pb);
 	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
 	uint8_t front_tag[16];
-	if (tessera_fs_pack_seal(tmp_, pack_bytes, pack_size, front_tag) != 0) {
+	if (tessera_fs_pack_seal(tmp_, w, pack_bytes, pack_size, front_tag) != 0) {
 		free(pack_bytes, M_TESSERA);
 		return (EIO);
 	}
@@ -24933,7 +25236,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL);
+	    n_sectors, &pa, /*contig_only=*/tmp_->seal != NULL || w->group != 0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -24952,7 +25255,8 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	 * which correctly gets NO grace. */
 	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
-	re.flags           = pa.flags;
+	re.flags           = pa.flags |
+	    (w->group != 0 ? TESSERA_REGISTRY_FLAG_KEY_GROUP : 0);
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE_SEALED];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
 		/* Pack is written but can't enter the registry — return
@@ -25008,13 +25312,16 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		cas_n = 0xFFu;
 	}
 	for (uint32_t i = 0; i < n; i++) {
-		tessera_cas_loc_insert(&tmp_->cas_cache, chunks[i].hash,
-		    pack_id, cas_extents, cas_n, pa.length_sectors);
+		if (w->group == 0)
+			tessera_cas_loc_insert(&tmp_->cas_cache,
+			    chunks[i].hash, pack_id, cas_extents, cas_n,
+			    pa.length_sectors);
 		tessera_fs_blob_index_put_pending(tmp_, chunks[i].hash, pack_id);
 	}
 	if (manifest_bytes != NULL) {
-		tessera_cas_loc_insert(&tmp_->cas_cache, manifest_hash,
-		    pack_id, cas_extents, cas_n, pa.length_sectors);
+		if (w->group == 0)
+			tessera_cas_loc_insert(&tmp_->cas_cache, manifest_hash,
+			    pack_id, cas_extents, cas_n, pa.length_sectors);
 		tessera_fs_blob_index_put_pending(tmp_, manifest_hash, pack_id);
 	}
 	return (0);
@@ -25037,6 +25344,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
  * means every chunk pack already landed. */
 static int
 tessera_fs_publish_chunked(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const struct tessera_chunk_in *chunks, uint32_t n_chunks,
     const uint8_t *manifest_bytes, size_t mlen,
     tessera_hash_t out_manifest_hash, uint32_t owner_inode_no)
@@ -25044,7 +25352,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
 
-	TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_manifest_hash);
+	TESSERA_W_HASH(tmp_, w, manifest_bytes, mlen, out_manifest_hash);
 
 	/* ★ #72 SATB barrier. Both the manifest AND every chunk hash: a
 	 * batch that holds a single chunk is emitted as a blob_count==1
@@ -25146,7 +25454,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		if (tessera_fs_dedup_is_deferred(tmp_, owner_inode_no) ||
 		    tessera_fs_registry_get_stable(tmp_,
 		    batch_pack_id, reg_value, uniq[first].hash) != TESSERA_OK) {
-			rc = tessera_fs_emit_chunk_pack(tmp_, batch_pack_id,
+			rc = tessera_fs_emit_chunk_pack(tmp_, w, batch_pack_id,
 			    &uniq[first], batch_n, NULL, 0, NULL,
 			    owner_inode_no);
 			if (rc != 0) break;
@@ -25159,7 +25467,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	/* Manifest rides in a final pack keyed by its own hash. Written
 	 * last so the dedup shortcut at the top (which keys on this id) only
 	 * fires once every chunk pack is already durable. */
-	return (tessera_fs_emit_chunk_pack(tmp_, pack_id, NULL, 0,
+	return (tessera_fs_emit_chunk_pack(tmp_, w, pack_id, NULL, 0,
 	    manifest_bytes, mlen, out_manifest_hash, owner_inode_no));
 }
 
@@ -25308,12 +25616,13 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
  * hash via out_hash. */
 static int
 tessera_fs_publish_directory(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
                              uint32_t owner_inode_no,
                              const uint8_t *flat_mft, size_t flat_mlen,
                              tessera_hash_t out_hash)
 {
 	if (flat_mlen <= TESSERA_DIR_PROMOTE_THRESHOLD) {
-		return (tessera_fs_publish_manifest_owned(tmp_, flat_mft,
+		return (tessera_fs_publish_manifest_owned(tmp_, w, flat_mft,
 		    flat_mlen, out_hash, owner_inode_no));
 	}
 
@@ -25334,7 +25643,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 	    M_TESSERA, M_WAITOK | M_ZERO);
 
 	for (uint32_t i = 0; i < K; i++) {
-		bucket_mb[i] = tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY);
+		bucket_mb[i] = tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY);
 		if (bucket_mb[i] == NULL) {
 			while (i-- > 0) tessera_manifest_free(bucket_mb[i]);
 			free(bucket_mb,        M_TESSERA);
@@ -25391,7 +25700,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 
 	/* Publish each non-empty bucket; collect (first_hash, hash) pairs. */
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY_2L);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY_2L);
 	if (outer == NULL) {
 		for (uint32_t i = 0; i < K; i++)
 			tessera_manifest_free(bucket_mb[i]);
@@ -25441,7 +25750,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 			err = EIO; break;
 		}
 		tessera_hash_t bpub;
-		if (tessera_fs_publish_manifest(tmp_, bbuf, bmlen, bpub)
+		if (tessera_fs_publish_manifest(tmp_, w, bbuf, bmlen, bpub)
 		    != 0) {
 			free(bbuf, M_TESSERA);
 			err = EIO; break;
@@ -25487,7 +25796,7 @@ tessera_fs_publish_directory(struct tessera_mount *tmp_,
 	/* Outer DIRECTORY_2L is owned by the parent inode; supersession
 	 * fires when the next dir mutation rewrites it. Inner buckets
 	 * stay untagged (multiple buckets per dir). */
-	int rc = tessera_fs_publish_manifest_owned(tmp_, obuf, omlen,
+	int rc = tessera_fs_publish_manifest_owned(tmp_, w, obuf, omlen,
 	    out_hash, owner_inode_no);
 	free(obuf, M_TESSERA);
 	return (rc);
@@ -25729,12 +26038,13 @@ tessera_fs_dir_btree_lookup(struct tessera_mount *tmp_,
 /* Build a leaf node from a sorted in-memory list of records. */
 static int
 tessera_fs_dir_btree_publish_leaf(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint64_t *hashes, const uint64_t *inos,
     const char *const *names, const uint16_t *nlens,
     uint32_t count, tessera_hash_t out_hash)
 {
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY_BTREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY_BTREE);
 	if (mb == NULL) return (ENOMEM);
 	if (tessera_manifest_dir_btree_set_leaf(mb, 1) != TESSERA_OK) {
 		tessera_manifest_free(mb);
@@ -25756,7 +26066,7 @@ tessera_fs_dir_btree_publish_leaf(struct tessera_mount *tmp_,
 	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
 	/* known_new: leaf bytes were just synthesised from the just-
 	 * mutated in-memory record list, so by construction unique. */
-	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, buf, mlen,
+	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, w, buf, mlen,
 	    out_hash, /*owner_inode_no=*/0);
 	free(buf, M_TESSERA);
 	return (rc == 0 ? 0 : EIO);
@@ -25765,11 +26075,12 @@ tessera_fs_dir_btree_publish_leaf(struct tessera_mount *tmp_,
 /* Build an inner node from a list of (max_hash, child_hash) pairs. */
 static int
 tessera_fs_dir_btree_publish_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint64_t *max_hashes, const tessera_hash_t *child_hashes,
     uint32_t count, tessera_hash_t out_hash)
 {
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY_BTREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY_BTREE);
 	if (mb == NULL) return (ENOMEM);
 	if (tessera_manifest_dir_btree_set_leaf(mb, 0) != TESSERA_OK) {
 		tessera_manifest_free(mb);
@@ -25789,7 +26100,7 @@ tessera_fs_dir_btree_publish_inner(struct tessera_mount *tmp_,
 	int rc = tessera_manifest_finalize(mb, buf, mlen, &mlen, mhash);
 	tessera_manifest_free(mb);
 	if (rc != TESSERA_OK) { free(buf, M_TESSERA); return (EIO); }
-	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, buf, mlen,
+	rc = tessera_fs_publish_manifest_owned_known_new(tmp_, w, buf, mlen,
 	    out_hash, /*owner_inode_no=*/0);
 	free(buf, M_TESSERA);
 	return (rc == 0 ? 0 : EIO);
@@ -25798,6 +26109,7 @@ tessera_fs_dir_btree_publish_inner(struct tessera_mount *tmp_,
 /* Forward decl — recursive insert. */
 static int
 tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
     const char *name, uint16_t namelen,
     struct tessera_btree_op_result *out, int depth);
@@ -25806,6 +26118,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
  * and either KEEPs (if size <= FANOUT) or SPLITs into two halves. */
 static int
 tessera_fs_dir_btree_leaf_insert(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint8_t *body, size_t body_len, uint32_t count,
     uint64_t key, uint64_t inode_no, const char *name, uint16_t namelen,
     struct tessera_btree_op_result *out)
@@ -25874,16 +26187,16 @@ tessera_fs_dir_btree_leaf_insert(struct tessera_mount *tmp_,
 	int rc = 0;
 	if (out_count <= TESSERA_DIR_BTREE_FANOUT_LEAF) {
 		out->kind = TESSERA_BTREE_KEEP;
-		rc = tessera_fs_dir_btree_publish_leaf(tmp_, hashes, inos,
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, w, hashes, inos,
 		    nptrs, nlens, out_count, out->left_hash);
 		out->left_max_hash = hashes[out_count - 1];
 	} else {
 		uint32_t half = out_count / 2;
-		rc = tessera_fs_dir_btree_publish_leaf(tmp_, hashes, inos,
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, w, hashes, inos,
 		    nptrs, nlens, half, out->left_hash);
 		if (rc == 0) {
 			out->left_max_hash = hashes[half - 1];
-			rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+			rc = tessera_fs_dir_btree_publish_leaf(tmp_, w,
 			    hashes + half, inos + half, nptrs + half,
 			    nlens + half, out_count - half, out->right_hash);
 			out->right_max_hash = hashes[out_count - 1];
@@ -25901,6 +26214,7 @@ tessera_fs_dir_btree_leaf_insert(struct tessera_mount *tmp_,
 
 static int
 tessera_fs_dir_btree_inner_insert_after_split(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint8_t *body, size_t body_len, uint32_t count,
     uint32_t target_idx, uint64_t left_max, const tessera_hash_t left_hash,
     uint64_t right_max, const tessera_hash_t right_hash,
@@ -25941,16 +26255,16 @@ tessera_fs_dir_btree_inner_insert_after_split(struct tessera_mount *tmp_,
 	int rc = 0;
 	if (k <= TESSERA_DIR_BTREE_FANOUT_INNER) {
 		out->kind = TESSERA_BTREE_KEEP;
-		rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children,
+		rc = tessera_fs_dir_btree_publish_inner(tmp_, w, maxes, children,
 		    k, out->left_hash);
 		out->left_max_hash = maxes[k - 1];
 	} else {
 		uint32_t half = k / 2;
-		rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children,
+		rc = tessera_fs_dir_btree_publish_inner(tmp_, w, maxes, children,
 		    half, out->left_hash);
 		if (rc == 0) {
 			out->left_max_hash = maxes[half - 1];
-			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			rc = tessera_fs_dir_btree_publish_inner(tmp_, w,
 			    maxes + half, children + half, k - half,
 			    out->right_hash);
 			out->right_max_hash = maxes[k - 1];
@@ -25965,6 +26279,7 @@ tessera_fs_dir_btree_inner_insert_after_split(struct tessera_mount *tmp_,
 
 static int
 tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t node_hash, uint64_t key, uint64_t inode_no,
     const char *name, uint16_t namelen,
     struct tessera_btree_op_result *out, int depth)
@@ -25987,7 +26302,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
 	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
 
 	if (leaf) {
-		rc = tessera_fs_dir_btree_leaf_insert(tmp_, body, body_len,
+		rc = tessera_fs_dir_btree_leaf_insert(tmp_, w, body, body_len,
 		    count, key, inode_no, name, namelen, out);
 		free(blob, M_TESSERA);
 		return (rc);
@@ -26013,7 +26328,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
 
 	struct tessera_btree_op_result child_res;
 	memset(&child_res, 0, sizeof child_res);
-	rc = tessera_fs_dir_btree_insert_at(tmp_, child, key, inode_no,
+	rc = tessera_fs_dir_btree_insert_at(tmp_, w, child, key, inode_no,
 	    name, namelen, &child_res, depth + 1);
 	if (rc != 0) {
 		free(blob, M_TESSERA);
@@ -26021,7 +26336,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
 	}
 
 	int split = (child_res.kind == TESSERA_BTREE_SPLIT);
-	rc = tessera_fs_dir_btree_inner_insert_after_split(tmp_, body,
+	rc = tessera_fs_dir_btree_inner_insert_after_split(tmp_, w, body,
 	    body_len, count, target,
 	    child_res.left_max_hash, child_res.left_hash,
 	    split ? child_res.right_max_hash : 0,
@@ -26034,6 +26349,7 @@ tessera_fs_dir_btree_insert_at(struct tessera_mount *tmp_,
 /* Top-level insert: handles the empty-tree, and root-split cases. */
 static int
 tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t root_hash, int root_is_empty,
     const char *name, uint16_t namelen, uint64_t inode_no,
     tessera_hash_t out_new_root)
@@ -26048,12 +26364,12 @@ tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
 		uint16_t nl = namelen;
 		uint64_t k = key;
 		uint64_t v = inode_no;
-		int rc = tessera_fs_dir_btree_publish_leaf(tmp_, &k, &v,
+		int rc = tessera_fs_dir_btree_publish_leaf(tmp_, w, &k, &v,
 		    &nptr, &nl, 1, out_new_root);
 		return (rc);
 	}
 
-	int rc = tessera_fs_dir_btree_insert_at(tmp_, root_hash, key,
+	int rc = tessera_fs_dir_btree_insert_at(tmp_, w, root_hash, key,
 	    inode_no, name, namelen, &res, 0);
 	if (rc != 0) return (rc);
 
@@ -26066,19 +26382,21 @@ tessera_fs_dir_btree_insert(struct tessera_mount *tmp_,
 	tessera_hash_t children[2];
 	memcpy(children[0], res.left_hash,  TESSERA_HASH_SIZE);
 	memcpy(children[1], res.right_hash, TESSERA_HASH_SIZE);
-	return (tessera_fs_dir_btree_publish_inner(tmp_, maxes, children, 2,
+	return (tessera_fs_dir_btree_publish_inner(tmp_, w, maxes, children, 2,
 	    out_new_root));
 }
 
 /* Forward decl — recursive remove. */
 static int
 tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t node_hash, uint64_t key,
     const char *name, uint16_t namelen, uint64_t verify_inode,
     struct tessera_btree_op_result *out, int depth);
 
 static int
 tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t node_hash, uint64_t key,
     const char *name, uint16_t namelen, uint64_t verify_inode,
     struct tessera_btree_op_result *out, int depth)
@@ -26146,7 +26464,7 @@ tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
 		if (k == 0) {
 			out->kind = TESSERA_BTREE_DROPPED;
 		} else {
-			rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+			rc = tessera_fs_dir_btree_publish_leaf(tmp_, w,
 			    hashes, inos, nptrs, nlens, k, out->left_hash);
 			out->kind = TESSERA_BTREE_KEEP;
 			out->left_max_hash = hashes[k - 1];
@@ -26176,7 +26494,7 @@ tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
 
 	struct tessera_btree_op_result child_res;
 	memset(&child_res, 0, sizeof child_res);
-	rc = tessera_fs_dir_btree_remove_at(tmp_, child, key, name,
+	rc = tessera_fs_dir_btree_remove_at(tmp_, w, child, key, name,
 	    namelen, verify_inode, &child_res, depth + 1);
 	if (rc != 0) { free(blob, M_TESSERA); return (rc); }
 
@@ -26213,7 +26531,7 @@ tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
 		}
 		off += 8 + TESSERA_HASH_SIZE;
 	}
-	rc = tessera_fs_dir_btree_publish_inner(tmp_, maxes, children, k,
+	rc = tessera_fs_dir_btree_publish_inner(tmp_, w, maxes, children, k,
 	    out->left_hash);
 	out->kind = TESSERA_BTREE_KEEP;
 	out->left_max_hash = (k > 0) ? maxes[k - 1] : 0;
@@ -26227,6 +26545,7 @@ tessera_fs_dir_btree_remove_at(struct tessera_mount *tmp_,
  * lone child so tree height shrinks naturally. */
 static int
 tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t root_hash,
     const char *name, uint16_t namelen, uint64_t verify_inode,
     int *out_dropped, tessera_hash_t out_new_root)
@@ -26234,7 +26553,7 @@ tessera_fs_dir_btree_remove(struct tessera_mount *tmp_,
 	uint64_t key = tessera_dir_name_hash(name, namelen);
 	struct tessera_btree_op_result res;
 	memset(&res, 0, sizeof res);
-	int rc = tessera_fs_dir_btree_remove_at(tmp_, root_hash, key,
+	int rc = tessera_fs_dir_btree_remove_at(tmp_, w, root_hash, key,
 	    name, namelen, verify_inode, &res, 0);
 	if (rc != 0) return (rc);
 	if (res.kind == TESSERA_BTREE_DROPPED) {
@@ -26293,6 +26612,7 @@ migrate_collect_cb(void *vctx, uint64_t inode_no, const char *name,
 
 static int
 tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const tessera_hash_t old_dir_hash, tessera_hash_t out_new_root,
     int *out_empty)
 {
@@ -26346,7 +26666,7 @@ tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
 		uint32_t take = c.count - start;
 		if (take > F) take = F;
 		const char *const *nptrs = (const char *const *)&c.names[start];
-		rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, w,
 		    c.hashes + start, c.inos + start, nptrs, c.nlens + start,
 		    take, layer[i]);
 		if (rc != 0) goto out;
@@ -26364,7 +26684,7 @@ tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
 			uint32_t start = i * IF;
 			uint32_t take = leaf_count - start;
 			if (take > IF) take = IF;
-			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			rc = tessera_fs_dir_btree_publish_inner(tmp_, w,
 			    layer_max + start, layer + start, take, next[i]);
 			if (rc != 0) {
 				free(next, M_TESSERA);
@@ -26470,6 +26790,7 @@ tessera_chunk_size_for(struct tessera_mount *tmp_, uint64_t file_size)
 
 static int
 tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len,
     uint32_t cs)
 {
@@ -26478,7 +26799,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 	const uint32_t n_groups = (n_chunks + fanout - 1) / fanout;
 
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_TREE);
 	if (outer == NULL) return (ENOMEM);
 
 	/* Publish each group as a CHUNK_LIST sub-manifest pack, then add
@@ -26495,7 +26816,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 		uint32_t n_dirty = 0;
 
 		tessera_manifest_builder_t *mb =
-		    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+		    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 		if (mb == NULL) {
 			free(dirty, M_TESSERA);
 			tessera_manifest_free(outer);
@@ -26530,7 +26851,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 			}
 
 			tessera_hash_t h;
-			TESSERA_MP_HASH(tmp_, new_bytes + off, len, h);
+			TESSERA_W_HASH(tmp_, w, new_bytes + off, len, h);
 
 			if (tessera_manifest_add_chunk(mb, h, off, len, 0)
 			    != TESSERA_OK) {
@@ -26561,7 +26882,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 		tessera_manifest_free(mb);
 
 		tessera_hash_t pub_hash;
-		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
+		if (tessera_fs_publish_chunked(tmp_, w, dirty, n_dirty, mft,
 		    mlen, pub_hash, inode_no) != 0) {
 			free(mft, M_TESSERA);
 			free(dirty, M_TESSERA);
@@ -26600,7 +26921,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 	 * manifest path (with supersession-tagging by inode_no so a
 	 * subsequent rewrite of the same file in the same flush window
 	 * supersedes this entry rather than stacking). */
-	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obuf, olen, ohash,
 	    inode_no) != 0) {
 		free(obuf, M_TESSERA);
 		return (EIO);
@@ -26654,7 +26975,8 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
  * On success the caller owns *out_dirty and *out_mft; out_dirty's
  * entries POINT INTO new_bytes and are only valid while it lives. */
 static int
-tessera_fs_chunked_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_chunked_prepare(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     const uint8_t *new_bytes, size_t new_len,
     struct tessera_chunk_in **out_dirty, uint32_t *out_ndirty,
     uint8_t **out_mft, size_t *out_mlen)
@@ -26728,7 +27050,7 @@ tessera_fs_chunked_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 	uint32_t n_dirty = 0;
 
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 	if (mb == NULL) {
 		free(dirty, M_TESSERA);
 		if (old_hashes) free(old_hashes, M_TESSERA);
@@ -26766,7 +27088,7 @@ tessera_fs_chunked_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 		}
 
 		tessera_hash_t h;
-		TESSERA_MP_HASH(tmp_, new_bytes + off, len, h);
+		TESSERA_W_HASH(tmp_, w, new_bytes + off, len, h);
 
 		if (tessera_manifest_add_chunk(mb, h, off, len, 0)
 		    != TESSERA_OK) {
@@ -26893,7 +27215,8 @@ tessera_fs_manifest_chunk_size(struct tessera_mount *tmp_,
 }
 
 static int
-tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_replace_range_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t off, const uint8_t *buf, size_t len)
 {
 	uint8_t key[4];
@@ -26970,7 +27293,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		 * groups instead of falling back to the whole-file path. */
 		tessera_manifest_parser_free(p);
 		free(omft, M_TESSERA);
-		return (tessera_fs_replace_range_tree(tmp_, inode_no, &ino, cs,
+		return (tessera_fs_replace_range_tree(tmp_, w, inode_no, &ino, cs,
 		    n_chunks, off, buf, len));
 	}
 
@@ -27017,7 +27340,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	int rc = 0;
 
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 	if (mb == NULL) { rc = ENOMEM; goto out; }
 
 	for (uint32_t i = 0; i < n_chunks; i++) {
@@ -27071,7 +27394,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 			continue;
 		}
 		tessera_hash_t h;
-		TESSERA_MP_HASH(tmp_, cb, slen, h);
+		TESSERA_W_HASH(tmp_, w, cb, slen, h);
 		if (tessera_manifest_add_chunk(mb, h, soff, slen, 0)
 		    != TESSERA_OK) { rc = ENOMEM; goto out; }
 		if (!(oflags[i] & TESSERA_CHUNK_FLAG_ZERO_HOLE) &&
@@ -27097,7 +27420,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		}
 		tessera_manifest_free(mb); mb = NULL;
 		/* apply consumes dirty+mft; size is unchanged. */
-		rc = tessera_fs_chunked_apply(tmp_, inode_no, dirty, n_dirty,
+		rc = tessera_fs_chunked_apply(tmp_, w, inode_no, dirty, n_dirty,
 		    mft, mlen, (size_t)fsize);
 		dirty = NULL;
 	}
@@ -27131,7 +27454,8 @@ out:
  * the file size.
  */
 static int
-tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_replace_range_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     const tessera_inode_record_t *ino_in, uint32_t cs, uint32_t n_chunks,
     uint64_t off, const uint8_t *buf, size_t len)
 {
@@ -27177,7 +27501,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 	const uint32_t g_last  = (uint32_t)(((off + len - 1) / cs) / fanout);
 
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_TREE);
 	if (outer == NULL) { free(ch, M_TESSERA); return (ENOMEM); }
 
 	for (uint32_t g = 0; g < n_groups && rc == 0; g++) {
@@ -27241,7 +27565,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 		    M_WAITOK | M_ZERO);
 		uint32_t n_dirty = 0;
 		tessera_manifest_builder_t *mb =
-		    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+		    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 		if (mb == NULL) rc = ENOMEM;
 
 		for (uint32_t i = c_first; i < c_last && rc == 0; i++) {
@@ -27286,7 +27610,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 				continue;
 			}
 			tessera_hash_t h;
-			TESSERA_MP_HASH(tmp_, cb, slen, h);
+			TESSERA_W_HASH(tmp_, w, cb, slen, h);
 			if (tessera_manifest_add_chunk(mb, h, soff, slen, 0)
 			    != TESSERA_OK) { rc = ENOMEM; break; }
 			if (!(ofl[k] & TESSERA_CHUNK_FLAG_ZERO_HOLE) &&
@@ -27311,7 +27635,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 			} else {
 				tessera_manifest_free(mb); mb = NULL;
 				tessera_hash_t pub;
-				if (tessera_fs_publish_chunked(tmp_, dirty,
+				if (tessera_fs_publish_chunked(tmp_, w, dirty,
 				    n_dirty, mft, mlen, pub, inode_no) != 0)
 					rc = EIO;
 				else if (tessera_manifest_add_tree_child(outer,
@@ -27343,7 +27667,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 		return (EIO);
 	}
 	tessera_manifest_free(outer);
-	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obuf, olen, ohash,
 	    inode_no) != 0) {
 		free(obuf, M_TESSERA);
 		return (EIO);
@@ -27374,28 +27698,45 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
  * is re-entrant for the owning thread, so callers already holding it are
  * fine. */
 static int
-tessera_fs_replace_range(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_replace_range_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t off, const uint8_t *buf, size_t len)
 {
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_replace_range_inner(tmp_, inode_no, off, buf, len);
+	int rc = tessera_fs_replace_range_inner(tmp_, w, inode_no, off, buf, len);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_replace_range(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t off, const uint8_t *buf, size_t len)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_replace_range_wk(tmp_, &wv, inode_no, off, buf, len);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /* APPLY half: publish the dirty chunks + manifest and repoint the
  * inode. Runs in publish/commit context (flush gate or vop path).
  * Consumes/frees dirty and mft. */
 static int
-tessera_fs_chunked_apply(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_chunked_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     struct tessera_chunk_in *dirty, uint32_t n_dirty,
     uint8_t *mft, size_t mlen, size_t new_len)
 {
 	uint8_t key[4];
 	encode_inode_key(inode_no, key);
 	tessera_hash_t pub_hash;
-	int prc = tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
+	int prc = tessera_fs_publish_chunked(tmp_, w, dirty, n_dirty, mft, mlen,
 	    pub_hash, inode_no);
 	if (prc != 0) {
 		/* Propagate the real errno — laundering ENOSPC into EIO hid
@@ -27428,7 +27769,8 @@ tessera_fs_chunked_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 }
 
 static int
-tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
+tessera_fs_replace_content_chunked_inner_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
 {
 	if (new_len == 0) {
@@ -27440,18 +27782,33 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
 	uint32_t n_dirty = 0;
 	uint8_t *mft = NULL;
 	size_t mlen = 0;
-	int rc = tessera_fs_chunked_prepare(tmp_, inode_no, new_bytes,
+	int rc = tessera_fs_chunked_prepare(tmp_, w, inode_no, new_bytes,
 	    new_len, &dirty, &n_dirty, &mft, &mlen);
 	if (rc == ENOTSUP) {
 		/* Fanout exceeded — CHUNK_TREE path. */
 		const uint32_t cs0 = tessera_chunk_size_for(tmp_, new_len);
-		return (tessera_fs_replace_content_chunk_tree(tmp_,
+		return (tessera_fs_replace_content_chunk_tree(tmp_, w,
 		    inode_no, new_bytes, new_len, cs0));
 	}
 	if (rc != 0)
 		return (rc);
-	return (tessera_fs_chunked_apply(tmp_, inode_no, dirty, n_dirty,
+	return (tessera_fs_chunked_apply(tmp_, w, inode_no, dirty, n_dirty,
 	    mft, mlen, new_len));
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_replace_content_chunked_inner_wk(tmp_, &wv, inode_no, new_bytes, new_len);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -27488,7 +27845,8 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	return (rc);
 }
 static int
-tessera_fs_append_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_append_prepare(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
     uint32_t cs, struct tessera_append_prep *pp, int *delegate)
 {
@@ -27627,7 +27985,7 @@ tessera_fs_append_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 
 	/* All eligibility checks passed. Build the new manifest. */
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 	if (mb == NULL) {
 		if (merge_buf) free(merge_buf, M_TESSERA);
 		free(old, M_TESSERA);
@@ -27673,7 +28031,7 @@ tessera_fs_append_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 			merge_buf = NULL;
 		} else {
 			tessera_hash_t h;
-			TESSERA_MP_HASH(tmp_, merge_buf, merged_sz, h);
+			TESSERA_W_HASH(tmp_, w, merge_buf, merged_sz, h);
 			if (tessera_manifest_add_chunk(mb, h, merged_off,
 			    merged_sz, 0) != TESSERA_OK) goto enomem;
 			dirty[n_dirty].bytes = merge_buf;
@@ -27706,7 +28064,7 @@ tessera_fs_append_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 			tessera_stat_chunk_zero_hole++;
 		} else {
 			tessera_hash_t h;
-			TESSERA_MP_HASH(tmp_, cb, this_len, h);
+			TESSERA_W_HASH(tmp_, w, cb, this_len, h);
 			if (tessera_manifest_add_chunk(mb, h, cur_off,
 			    this_len, 0) != TESSERA_OK) goto enomem;
 			dirty[n_dirty].bytes = cb;
@@ -27750,29 +28108,46 @@ enomem:
  * context (the gated wrapper above). Behavior-identical to the
  * pre-split monolith. */
 static int
-tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_append_chunked_inner_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
     uint32_t cs)
 {
 	struct tessera_append_prep pp;
 	int delegate = TAPP_NONE;
-	int rc = tessera_fs_append_prepare(tmp_, inode_no, append_off,
+	int rc = tessera_fs_append_prepare(tmp_, w, inode_no, append_off,
 	    append_bytes, append_len, cs, &pp, &delegate);
 	if (rc != 0)
 		return (rc);
 	switch (delegate) {
 	case TAPP_TREE:
-		return (tessera_fs_append_chunk_tree(tmp_, inode_no,
+		return (tessera_fs_append_chunk_tree(tmp_, w, inode_no,
 		    append_off, append_bytes, append_len, cs));
 	case TAPP_PROMOTE:
-		if (tessera_fs_wrap_list_as_tree(tmp_, inode_no) == 0)
-			return (tessera_fs_append_chunk_tree(tmp_,
+		if (tessera_fs_wrap_list_as_tree(tmp_, w, inode_no) == 0)
+			return (tessera_fs_append_chunk_tree(tmp_, w,
 			    inode_no, append_off, append_bytes,
 			    append_len, cs));
 		return (ENOTSUP);
 	default:
-		return (tessera_fs_append_apply(tmp_, inode_no, &pp));
+		return (tessera_fs_append_apply(tmp_, w, inode_no, &pp));
 	}
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_append_chunked_inner_wk(tmp_, &wv, inode_no, append_off, append_bytes, append_len, cs);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /* APPLY half of the chunked append: publish the prepared dirty chunks
@@ -27781,14 +28156,15 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
  * dirty). pp->dirty entries point into the caller's append bytes and
  * pp->merge_buf, which must both be alive across this call. */
 static int
-tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_append_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     struct tessera_append_prep *pp)
 {
 	uint8_t key[4];
 	encode_inode_key(inode_no, key);
 
 	tessera_hash_t pub_hash;
-	int rc = tessera_fs_publish_chunked(tmp_, pp->dirty, pp->n_dirty,
+	int rc = tessera_fs_publish_chunked(tmp_, w, pp->dirty, pp->n_dirty,
 	    pp->mft, pp->mlen, pub_hash, inode_no);
 	free(pp->mft, M_TESSERA);
 	if (pp->merge_buf) free(pp->merge_buf, M_TESSERA);
@@ -27856,7 +28232,8 @@ tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
  * quota reservation must be released.
  */
 static int
-tessera_fs_extend_sparse(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_extend_sparse_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t old_size, uint64_t new_size, uint64_t *out_reached)
 {
 	*out_reached = old_size;
@@ -27924,7 +28301,7 @@ tessera_fs_extend_sparse(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 
 	if (head_buf != NULL) {
-		rc = tessera_fs_replace_content_chunk_tree(tmp_, inode_no,
+		rc = tessera_fs_replace_content_chunk_tree(tmp_, w, inode_no,
 		    head_buf, (size_t)head, cs);
 		if (rc != 0)
 			goto out;
@@ -27934,14 +28311,14 @@ tessera_fs_extend_sparse(struct tessera_mount *tmp_, uint32_t inode_no,
 	}
 
 	while (cur < new_size) {
-		uint64_t w = new_size - cur;
-		if (w > TESSERA_EXTEND_WINDOW_BYTES)
-			w = TESSERA_EXTEND_WINDOW_BYTES;
+		uint64_t win = new_size - cur;
+		if (win > TESSERA_EXTEND_WINDOW_BYTES)
+			win = TESSERA_EXTEND_WINDOW_BYTES;
 		rc = tessera_fs_append_chunked(tmp_, inode_no, cur, zeros,
-		    (size_t)w, cs);
+		    (size_t)win, cs);
 		if (rc != 0)
 			break;
-		cur += w;
+		cur += win;
 		*out_reached = cur;
 		tessera_stat_extend_sparse_windows++;
 		/* The gate is a flag, not a held mutex, so yielding is safe;
@@ -27956,6 +28333,21 @@ out:
 	if (rc == 0)
 		tessera_stat_extend_sparse++;
 	return (rc);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_extend_sparse(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t old_size, uint64_t new_size, uint64_t *out_reached)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_extend_sparse_wk(tmp_, &wv, inode_no, old_size, new_size, out_reached);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -28041,7 +28433,8 @@ tessera_fs_write_grow_range(struct tessera_mount *tmp_, uint32_t inode_no,
  * truncated to end at new_size. On success the caller owns *out_mft and
  * *out_dirty and *out_buf (at most one dirty chunk, the trimmed boundary). */
 static int
-tessera_fs_trim_chunk_list(struct tessera_mount *tmp_, const uint8_t *cm,
+tessera_fs_trim_chunk_list(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, const uint8_t *cm,
     uint32_t cmlen, uint64_t base, uint32_t cs, uint64_t new_size,
     uint8_t **out_mft, size_t *out_mlen, struct tessera_chunk_in *out_dirty,
     uint32_t *out_ndirty, uint8_t **out_buf)
@@ -28054,7 +28447,7 @@ tessera_fs_trim_chunk_list(struct tessera_mount *tmp_, const uint8_t *cm,
 	}
 	const uint32_t n = tessera_manifest_parser_count(p);
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 	if (mb == NULL) { tessera_manifest_parser_free(p); return (ENOMEM); }
 
 	int rc = 0;
@@ -28101,7 +28494,7 @@ tessera_fs_trim_chunk_list(struct tessera_mount *tmp_, const uint8_t *cm,
 			free(b, M_TESSERA);
 		} else {
 			tessera_hash_t h;
-			TESSERA_MP_HASH(tmp_, b, keep, h);
+			TESSERA_W_HASH(tmp_, w, b, keep, h);
 			if (tessera_manifest_add_chunk(mb, h, cr.logical_offset,
 			    keep, 0) != TESSERA_OK) {
 				free(b, M_TESSERA);
@@ -28140,7 +28533,8 @@ tessera_fs_trim_chunk_list(struct tessera_mount *tmp_, const uint8_t *cm,
 }
 
 static int
-tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t new_size)
 {
 	uint8_t key[4];
@@ -28173,13 +28567,13 @@ tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		    M_TESSERA, M_WAITOK | M_ZERO);
 		uint32_t nd = 0; uint8_t *bbuf = NULL;
 		uint8_t *mft = NULL; size_t mlen = 0;
-		rc = tessera_fs_trim_chunk_list(tmp_, omft, omlen, 0, cs,
+		rc = tessera_fs_trim_chunk_list(tmp_, w, omft, omlen, 0, cs,
 		    new_size, &mft, &mlen, dirty, &nd, &bbuf);
 		free(omft, M_TESSERA);
 		if (rc != 0) { free(dirty, M_TESSERA); return (rc); }
 		/* chunked_apply publishes the dirty chunk + manifest, repoints the
 		 * inode at new_size, and frees mft and dirty (not the bytes). */
-		rc = tessera_fs_chunked_apply(tmp_, inode_no, dirty, nd, mft,
+		rc = tessera_fs_chunked_apply(tmp_, w, inode_no, dirty, nd, mft,
 		    mlen, (size_t)new_size);
 		if (bbuf != NULL) free(bbuf, M_TESSERA);
 		return (rc);
@@ -28208,7 +28602,7 @@ tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	}
 
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_TREE);
 	if (outer == NULL) {
 		tessera_manifest_parser_free(op);
 		free(omft, M_TESSERA);
@@ -28245,12 +28639,12 @@ tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 			    M_TESSERA, M_WAITOK | M_ZERO);
 			uint32_t nd = 0; uint8_t *bbuf = NULL;
 			uint8_t *gm = NULL; size_t gml = 0;
-			rc = tessera_fs_trim_chunk_list(tmp_, cm, cml, g_off, cs,
+			rc = tessera_fs_trim_chunk_list(tmp_, w, cm, cml, g_off, cs,
 			    new_size, &gm, &gml, dirty, &nd, &bbuf);
 			free(cm, M_TESSERA);
 			if (rc == 0) {
 				tessera_hash_t pub;
-				if (tessera_fs_publish_chunked(tmp_, dirty, nd,
+				if (tessera_fs_publish_chunked(tmp_, w, dirty, nd,
 				    gm, gml, pub, inode_no) != 0)
 					rc = EIO;
 				else if (tessera_manifest_add_tree_child(outer,
@@ -28279,7 +28673,7 @@ tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		return (EIO);
 	}
 	tessera_manifest_free(outer);
-	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obuf, olen, ohash,
 	    inode_no) != 0) {
 		free(obuf, M_TESSERA);
 		return (EIO);
@@ -28307,14 +28701,30 @@ tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
  * plus the record arrays, the same budget replace_range already runs under
  * the gate. */
 static int
-tessera_fs_truncate_prefix(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_truncate_prefix_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t new_size)
 {
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_truncate_prefix_inner(tmp_, inode_no, new_size);
+	int rc = tessera_fs_truncate_prefix_inner(tmp_, w, inode_no, new_size);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_truncate_prefix(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t new_size)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_truncate_prefix_wk(tmp_, &wv, inode_no, new_size);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -28374,7 +28784,8 @@ tessera_fs_truncate_prefix(struct tessera_mount *tmp_, uint32_t inode_no,
  * CHUNK_LIST of ≤ FANOUT chunks (caller falls back to the slow rewrite).
  */
 static int
-tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
+tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no)
 {
 	uint8_t key[4];
 	tessera_inode_record_t ino;
@@ -28409,7 +28820,7 @@ tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
 	/* Build a single-child CHUNK_TREE that references the old flat list
 	 * verbatim (child hash = old manifest hash, offset 0). */
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_TREE);
 	if (outer == NULL) { free(old_mft, M_TESSERA); return (ENOMEM); }
 	if (tessera_manifest_add_tree_child(outer, ino.manifest_hash, 0)
 	    != TESSERA_OK) {
@@ -28432,7 +28843,7 @@ tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
 	}
 	tessera_manifest_free(outer);
 
-	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obuf, olen, ohash,
 	    inode_no) != 0) {
 		free(obuf, M_TESSERA);
 		return (EIO);
@@ -28455,7 +28866,8 @@ tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
 }
 
 static int
-tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
     uint32_t cs)
 {
@@ -28609,7 +29021,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 	 * over verbatim. We then publish modified tail + spillover
 	 * groups, adding tree records as we go. */
 	tessera_manifest_builder_t *outer =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_TREE);
 	if (outer == NULL) {
 		if (merge_buf) free(merge_buf, M_TESSERA);
 		free(told, M_TESSERA);
@@ -28645,7 +29057,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 		uint32_t n_dirty = 0;
 
 		tessera_manifest_builder_t *mb =
-		    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+		    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_CHUNK_LIST);
 		if (mb == NULL) {
 			free(dirty, M_TESSERA);
 			tessera_manifest_free(outer);
@@ -28697,7 +29109,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 					tessera_stat_chunk_zero_hole++;
 				} else {
 					tessera_hash_t h;
-					TESSERA_MP_HASH(tmp_, merge_buf, merged_sz, h);
+					TESSERA_W_HASH(tmp_, w, merge_buf, merged_sz, h);
 					if (tessera_manifest_add_chunk(mb, h,
 					    told[M - 1].off, merged_sz, 0)
 					    != TESSERA_OK) goto et_enomem;
@@ -28744,7 +29156,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 				tessera_stat_chunk_zero_hole++;
 			} else {
 				tessera_hash_t h;
-				TESSERA_MP_HASH(tmp_, append_bytes + append_pos,
+				TESSERA_W_HASH(tmp_, w, append_bytes + append_pos,
 				    this_len, h);
 				if (tessera_manifest_add_chunk(mb, h, cur_off,
 				    this_len, 0) != TESSERA_OK)
@@ -28774,7 +29186,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 		mb = NULL;
 
 		tessera_hash_t pub_hash;
-		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
+		if (tessera_fs_publish_chunked(tmp_, w, dirty, n_dirty, mft,
 		    mlen, pub_hash, inode_no) != 0) {
 			free(mft, M_TESSERA);
 			free(dirty, M_TESSERA);
@@ -28830,7 +29242,7 @@ et_enomem:
 	}
 	tessera_manifest_free(outer);
 
-	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obuf, olen, ohash,
 	    inode_no) != 0) {
 		free(obuf, M_TESSERA);
 		return (EIO);
@@ -29100,9 +29512,11 @@ tessera_fs_read_full_content(struct tessera_mount *tmp_,
  * only once the mount's flush_mtx exists (mount-time GC publishes before
  * that, single-threaded). */
 static int tessera_fs_replace_content_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len);
 static int
-tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_replace_content_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
                            const uint8_t *new_bytes, size_t new_len)
 {
 	/*
@@ -29135,10 +29549,25 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
 
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_replace_content_inner(tmp_, inode_no, new_bytes,
+	int rc = tessera_fs_replace_content_inner(tmp_, w, inode_no, new_bytes,
 	    new_len);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
+                           const uint8_t *new_bytes, size_t new_len)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_replace_content_wk(tmp_, &wv, inode_no, new_bytes, new_len);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /* Build the INLINE manifest bytes for new content. PURE — no locks, no
@@ -29188,11 +29617,12 @@ tessera_fs_replace_content_build(uint32_t hash_alg, const uint8_t *id_key,
  * Must run in publish/commit context (flush gate or vop path). */
 static int
 tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t inode_no, uint8_t *mft, size_t mlen, size_t new_len,
     const uint8_t *precomputed_hash)
 {
 	tessera_hash_t pub_hash;
-	int prc = tessera_fs_publish_manifest_owned_move(tmp_, mft, mlen,
+	int prc = tessera_fs_publish_manifest_owned_move(tmp_, w, mft, mlen,
 	    pub_hash, inode_no, precomputed_hash);
 	/* mft consumed either way. */
 	if (prc != 0) {
@@ -29232,16 +29662,17 @@ tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
 }
 
 static int
-tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_replace_content_inner(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
                            const uint8_t *new_bytes, size_t new_len)
 {
 	uint8_t *mft = NULL;
 	size_t mlen = 0;
 	tessera_hash_t mhash;
 	int rc = tessera_fs_replace_content_build(tmp_->sb.hash_alg,
-	    TESSERA_MP_IDKEY(tmp_), new_bytes, new_len, &mft, &mlen, mhash);
+	    w->idkey, new_bytes, new_len, &mft, &mlen, mhash);
 	if (rc != 0) return (rc);
-	return (tessera_fs_replace_content_apply(tmp_, inode_no, mft, mlen,
+	return (tessera_fs_replace_content_apply(tmp_, w, inode_no, mft, mlen,
 	    new_len, mhash));
 }
 
@@ -29309,6 +29740,7 @@ dirent_rewrite_visit(void *vctx, uint64_t child_inode,
  */
 static int
 tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
                              uint32_t parent_inode_no,
                              tessera_inode_record_t *pino,
                              int op, uint64_t verify_inode,
@@ -29358,7 +29790,7 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 	 * REMOVE skip / detect EEXIST for ADD. Build a fresh bucket
 	 * builder while we go. */
 	tessera_manifest_builder_t *bmb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY);
 	if (bmb == NULL) {
 		tessera_manifest_parser_free(outer);
 		free(outer_blob, M_TESSERA);
@@ -29494,7 +29926,7 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 		 * Untagged entries accumulate until commit_sb drains
 		 * them to disk; the pending-manifest byte cap drives
 		 * flush cadence. */
-		if (tessera_fs_publish_manifest(tmp_, bbody, bmlen,
+		if (tessera_fs_publish_manifest(tmp_, w, bbody, bmlen,
 		    new_bucket_hash) != 0) {
 			free(bbody, M_TESSERA);
 			tessera_manifest_free(bmb);
@@ -29509,7 +29941,7 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 	/* Build the new outer: copy unchanged buckets, replace the
 	 * target one with the rewritten bucket (or drop if empty). */
 	tessera_manifest_builder_t *omb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY_2L);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY_2L);
 	if (omb == NULL) {
 		tessera_manifest_parser_free(outer);
 		free(outer_blob, M_TESSERA);
@@ -29582,7 +30014,7 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 	tessera_manifest_free(omb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest_owned(tmp_, obody, omlen,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, obody, omlen,
 	    pub_hash, parent_inode_no) != 0) {
 		free(obody, M_TESSERA);
 		return (EIO);
@@ -29779,6 +30211,7 @@ tessera_fs_dirent_log_lookup(struct tessera_mount *tmp_,
  * dir_walk. Caller MUST sort `hashes` ascending. */
 static int
 tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     const uint64_t *hashes, const uint64_t *inos,
     const char *const *names, const uint16_t *nlens,
     uint32_t count, tessera_hash_t out_root)
@@ -29786,7 +30219,7 @@ tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
 	if (count == 0) {
 		/* Empty dir → publish a zero-entry leaf. */
 		tessera_manifest_builder_t *mb =
-		    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY_BTREE);
+		    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY_BTREE);
 		if (mb == NULL) return (ENOMEM);
 		tessera_manifest_dir_btree_set_leaf(mb, 1);
 		size_t mlen = 0;
@@ -29795,7 +30228,7 @@ tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
 		uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
 		(void)tessera_manifest_finalize(mb, buf, mlen, &mlen, mh);
 		tessera_manifest_free(mb);
-		int prc = tessera_fs_publish_manifest_owned_known_new(tmp_,
+		int prc = tessera_fs_publish_manifest_owned_known_new(tmp_, w,
 		    buf, mlen, out_root, /*owner=*/0);
 		free(buf, M_TESSERA);
 		return (prc == 0 ? 0 : EIO);
@@ -29813,7 +30246,7 @@ tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
 		uint32_t start = i * F;
 		uint32_t take = count - start;
 		if (take > F) take = F;
-		rc = tessera_fs_dir_btree_publish_leaf(tmp_,
+		rc = tessera_fs_dir_btree_publish_leaf(tmp_, w,
 		    hashes + start, inos + start, names + start,
 		    nlens + start, take, layer[i]);
 		if (rc != 0) goto out;
@@ -29831,7 +30264,7 @@ tessera_fs_dir_btree_bulk_build(struct tessera_mount *tmp_,
 			uint32_t start = i * IF;
 			uint32_t take = leaf_count - start;
 			if (take > IF) take = IF;
-			rc = tessera_fs_dir_btree_publish_inner(tmp_,
+			rc = tessera_fs_dir_btree_publish_inner(tmp_, w,
 			    layer_max + start, layer + start, take, next[i]);
 			if (rc != 0) {
 				free(next, M_TESSERA);
@@ -29927,7 +30360,8 @@ tessera_dirent_log_collect_remove_at(
  * specific parent before readdir) or from tessera_fs_flush (drain
  * all dirty parents before commit_sb). */
 static int
-tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
+tessera_fs_dirent_log_checkpoint_parent_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t parent_inode_no, int wait_busy)
 {
 	if (!tmp_->dirty_init) return (0);
@@ -30151,7 +30585,7 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 
 	/* Bulk-build a fresh BTREE from the merged collection. */
 	tessera_hash_t new_root;
-	rc = tessera_fs_dir_btree_bulk_build(tmp_, col.hashes, col.inos,
+	rc = tessera_fs_dir_btree_bulk_build(tmp_, w, col.hashes, col.inos,
 	    (const char *const *)col.names, col.nlens, col.count,
 	    new_root);
 	if (rc != 0) goto out_free_col;
@@ -30233,6 +30667,21 @@ out_free:
 	}
 	free(logents, M_TESSERA);
 	return (rc);
+}
+
+/* The write keys of parent_inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no, int wait_busy)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, parent_inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_fs_dirent_log_checkpoint_parent_wk(tmp_, &wv, parent_inode_no, wait_busy);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /* Debug: dump live dirent-log state to console (read the sysctl). */
@@ -30718,12 +31167,59 @@ tessera_dirent_log_entry_clone(
  * (write_record can sleep / kbio_write). On success: free the
  * snapshot. On failure (journal full, etc.): re-queue at head so
  * the next callout retries. */
+/*
+ * Open the replayed names (jname_backlog) whose group's key is loaded and
+ * hand their ops to the dirent log, oldest first, so they are applied and
+ * journaled as any other op. The rest stay for a later drain. Under the
+ * flush gate, from the journal drain.
+ */
+static void
+tessera_fs_jname_backlog_open(struct tessera_mount *tmp_)
+{
+	struct tessera_dirent_log_entry *b, *bn;
+	char name[TESSERA_PATH_NAME_MAX + 1];
+
+	if (tmp_->ngroups == 0)
+		return;
+	LIST_FOREACH_SAFE(b, &tmp_->jname_backlog, link, bn) {
+		struct tessera_fs_wctx nw;
+		size_t len = b->name_len - TESSERA_SEAL_OVERHEAD;
+		int ge = tessera_fs_wctx_inode(tmp_, b->parent_inode_no, &nw);
+
+		if (ge == 0 && nw.group != 0 &&
+		    tessera_group_name_open(nw.gk,
+		    TESSERA_JNAME_BIND(b->parent_inode_no, b->inode_no),
+		    (const uint8_t *)b->name, b->name_len,
+		    (uint8_t *)name) == TESSERA_OK) {
+			(void)tessera_fs_dirent_log_append(tmp_,
+			    b->parent_inode_no, b->op, name, (uint16_t)len,
+			    b->inode_no);
+			explicit_bzero(name, sizeof(name));
+			LIST_REMOVE(b, link);
+			free(b, M_TESSERA);
+		} else if (ge == 0 && nw.group != 0) {
+			/* The key is here and the name doesn't open: forged
+			 * or damaged. Dropped, as a bad record is at replay. */
+			printf("tessera_fs: sealed name in directory %u "
+			    "doesn't open; dropped\n",
+			    (unsigned)b->parent_inode_no);
+			LIST_REMOVE(b, link);
+			free(b, M_TESSERA);
+		}
+		tessera_fs_wctx_done(&nw);
+	}
+}
+
 static int
 tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 {
 	if (!tmp_->dirty_init || tmp_->journal == NULL ||
 	    tmp_->flush_unmounting)
 		return (0);
+
+	/* Replayed names of key groups whose keys are loaded now: into the
+	 * dirent log, and so into this drain's snapshot. */
+	tessera_fs_jname_backlog_open(tmp_);
 
 	/* Snapshot: move pending into a local list head under flush_mtx,
 	 * then release before doing the (potentially slow) journal IO. */
@@ -30752,7 +31248,8 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 	tmp_->journal_pending_inode_count = 0;
 	mtx_unlock(&tmp_->flush_mtx);
 
-	if (count == 0 && icount == 0) return (0);
+	if (count == 0 && icount == 0 && LIST_EMPTY(&tmp_->jname_backlog))
+		return (0);
 
 	/* Open a tx, append every record, commit. INODE_WRITE records
 	 * go in first so a replay applying them in walk order populates
@@ -30817,15 +31314,54 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 		struct tessera_dirent_log_entry *e = LIST_FIRST(&snap);
 		LIST_REMOVE(e, link);
 
-		size_t blen = sizeof(tessera_jrec_dirent_t) + e->name_len;
+		/* A name in a key group's directory is journaled sealed
+		 * under the group's K_gmeta (§5.3), bound to its parent and
+		 * inode; never in the clear. One the drain can't seal (the
+		 * key went away) is not journaled at all: the op is still in
+		 * the dirent log. */
+		uint8_t *sname = NULL;
+		uint16_t nlen = e->name_len;
+		uint8_t sealed = 0;
+		if (tmp_->ngroups != 0) {
+			struct tessera_fs_wctx nw;
+			int ge = tessera_fs_wctx_inode(tmp_,
+			    e->parent_inode_no, &nw);
+			if (ge == 0 && nw.group != 0) {
+				sname = malloc((size_t)nlen +
+				    TESSERA_SEAL_OVERHEAD, M_TESSERA,
+				    M_WAITOK);
+				if (tessera_group_name_seal(nw.gk,
+				    TESSERA_JNAME_BIND(e->parent_inode_no,
+				    e->inode_no), (const uint8_t *)e->name,
+				    nlen, sname) != TESSERA_OK)
+					ge = EIO;
+				nlen += TESSERA_SEAL_OVERHEAD;
+				sealed = 1;
+			}
+			tessera_fs_wctx_done(&nw);
+			if (ge != 0) {
+				printf("tessera_fs: dirent in key-group "
+				    "directory %u not journaled (%d)\n",
+				    (unsigned)e->parent_inode_no, ge);
+				if (sname != NULL)
+					free(sname, M_TESSERA);
+				free(e, M_TESSERA);
+				continue;
+			}
+		}
+		size_t blen = sizeof(tessera_jrec_dirent_t) + nlen;
 		uint8_t *body = malloc(blen, M_TESSERA, M_WAITOK);
 		tessera_jrec_dirent_t *hdr = (tessera_jrec_dirent_t *)body;
 		hdr->parent_inode_no = e->parent_inode_no;
 		hdr->inode_no        = e->inode_no;
-		hdr->name_len        = e->name_len;
-		hdr->reserved[0] = hdr->reserved[1] = 0;
+		hdr->name_len        = nlen;
+		hdr->reserved[0] = sealed;
+		hdr->reserved[1] = 0;
 		hdr->generation      = tmp_->sb.generation;   /* #137 */
-		memcpy(body + sizeof *hdr, e->name, e->name_len);
+		memcpy(body + sizeof *hdr, sealed ? (const char *)sname :
+		    e->name, nlen);
+		if (sname != NULL)
+			free(sname, M_TESSERA);
 
 		tessera_record_type_t rt = (e->op == 0) ?
 		    TESSERA_DIR_INSERT : TESSERA_DIR_REMOVE;
@@ -30835,6 +31371,31 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 		free(e, M_TESSERA);
 		if (ar != TESSERA_OK && rc == 0) rc = EIO;
 		tessera_stat_journal_log_records++;
+	}
+
+	/* Sealed names still waiting for their group's key: journaled again
+	 * as they are, at this generation, so a later replay keeps them. */
+	{
+		struct tessera_dirent_log_entry *b;
+		LIST_FOREACH(b, &tmp_->jname_backlog, link) {
+			size_t blen = sizeof(tessera_jrec_dirent_t) +
+			    b->name_len;
+			uint8_t *body = malloc(blen, M_TESSERA, M_WAITOK);
+			tessera_jrec_dirent_t *hdr =
+			    (tessera_jrec_dirent_t *)body;
+			hdr->parent_inode_no = b->parent_inode_no;
+			hdr->inode_no        = b->inode_no;
+			hdr->name_len        = b->name_len;
+			hdr->reserved[0]     = TESSERA_JREC_NAME_SEALED;
+			hdr->reserved[1]     = 0;
+			hdr->generation      = tmp_->sb.generation;
+			memcpy(body + sizeof *hdr, b->name, b->name_len);
+			int ar = tessera_journal_append(tmp_->journal, tx,
+			    b->op == 0 ? TESSERA_DIR_INSERT :
+			    TESSERA_DIR_REMOVE, body, (uint32_t)blen);
+			free(body, M_TESSERA);
+			if (ar != TESSERA_OK && rc == 0) rc = EIO;
+		}
 	}
 
 	if (tessera_journal_tx_commit(tmp_->journal, tx) != TESSERA_OK
@@ -31030,6 +31591,32 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 		tessera_stat_journal_redo_stale++;
 		return (1);
 	}
+	if (r.reserved[0] == TESSERA_JREC_NAME_SEALED) {
+		/* A key group's name: kept sealed for the journal drain,
+		 * which opens it once the group's key is loaded. */
+		if (r.name_len <= TESSERA_SEAL_OVERHEAD ||
+		    r.name_len > TESSERA_PATH_NAME_MAX + TESSERA_SEAL_OVERHEAD ||
+		    sizeof(tessera_jrec_dirent_t) + r.name_len >
+		    hdr->body_length)
+			return (1);
+		struct tessera_dirent_log_entry *b = malloc(sizeof(*b) +
+		    r.name_len, M_TESSERA, M_WAITOK | M_ZERO);
+		b->parent_inode_no = r.parent_inode_no;
+		b->inode_no = r.inode_no;
+		b->op = (hdr->record_type == TESSERA_DIR_INSERT) ? 0 : 1;
+		b->name_len = r.name_len;
+		memcpy(b->name, body + sizeof r, r.name_len);
+		/* In journal order: the backlog is replayed oldest first. */
+		struct tessera_dirent_log_entry *t, *last = NULL;
+		LIST_FOREACH(t, &tmp_->jname_backlog, link)
+			last = t;
+		if (last == NULL)
+			LIST_INSERT_HEAD(&tmp_->jname_backlog, b, link);
+		else
+			LIST_INSERT_AFTER(last, b, link);
+		tessera_stat_journal_log_replays++;
+		return (1);
+	}
 	if (r.name_len == 0 || r.name_len > TESSERA_PATH_NAME_MAX)
 		return (1);
 	if (sizeof(tessera_jrec_dirent_t) + r.name_len > hdr->body_length)
@@ -31043,6 +31630,7 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 }
 
 static int tessera_fs_dirent_rewrite_impl(struct tessera_mount *,
+    const struct tessera_fs_wctx *,
     uint32_t, int, uint64_t, uint64_t, const char *, size_t);
 
 /* Slow-path dirent_rewrite mutates the parent's manifest inline (get
@@ -31065,16 +31653,22 @@ tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
 		return (tessera_fs_dirent_log_append(tmp_, parent_inode_no,
 		    op, name, (uint16_t)namelen, ino));
 	}
+	struct tessera_fs_wctx wv;
+	int r = tessera_fs_wctx_inode(tmp_, parent_inode_no, &wv);
+	if (r != 0)
+		return (r);
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int r = tessera_fs_dirent_rewrite_impl(tmp_, parent_inode_no, op,
+	r = tessera_fs_dirent_rewrite_impl(tmp_, &wv, parent_inode_no, op,
 	    verify_inode, add_inode, name, namelen);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	tessera_fs_wctx_done(&wv);
 	return (r);
 }
 
 static int
 tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
                           uint32_t parent_inode_no,
                           int op, uint64_t verify_inode,
                           uint64_t add_inode,
@@ -31142,7 +31736,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 			 * the first mutation post-upgrade. */
 			int empty = 0;
 			tessera_hash_t new_root;
-			int rc = tessera_fs_dir_btree_migrate(tmp_,
+			int rc = tessera_fs_dir_btree_migrate(tmp_, w,
 			    pino.manifest_hash, new_root, &empty);
 			if (rc != 0) return (rc);
 			if (!empty) {
@@ -31159,7 +31753,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 		int rc;
 		if (op == 0) {
 			/* ADD */
-			rc = tessera_fs_dir_btree_insert(tmp_,
+			rc = tessera_fs_dir_btree_insert(tmp_, w,
 			    have_root ? btree_root :
 			        (const uint8_t *)pino.manifest_hash,
 			    /*root_is_empty=*/!have_root, name, namelen,
@@ -31171,7 +31765,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 		/* REMOVE */
 		if (!have_root) return (ENOENT);
 		int dropped = 0;
-		rc = tessera_fs_dir_btree_remove(tmp_, btree_root, name,
+		rc = tessera_fs_dir_btree_remove(tmp_, w, btree_root, name,
 		    namelen, verify_inode, &dropped, new_root);
 		if (rc != 0) return (rc);
 		if (dropped) {
@@ -31179,7 +31773,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 			 * needs a valid manifest_hash; build an empty
 			 * leaf. */
 			tessera_manifest_builder_t *mb =
-			    tessera_fs_mft_begin(tmp_,
+			    tessera_fs_mft_begin(tmp_, w,
 			        TESSERA_MFT_DIRECTORY_BTREE);
 			if (mb == NULL) return (ENOMEM);
 			tessera_manifest_dir_btree_set_leaf(mb, 1);
@@ -31192,7 +31786,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 			    &mlen, mh);
 			tessera_manifest_free(mb);
 			tessera_hash_t pub;
-			int prc = tessera_fs_publish_manifest(tmp_, buf,
+			int prc = tessera_fs_publish_manifest(tmp_, w, buf,
 			    mlen, pub);
 			free(buf, M_TESSERA);
 			if (prc != 0) return (EIO);
@@ -31204,7 +31798,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 	}
 
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY);
 	if (mb == NULL) return (ENOMEM);
 
 	struct dirent_rewrite_ctx ctx = {
@@ -31253,7 +31847,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 	 * parent_inode_no tags the cached entry so subsequent dirent
 	 * mutations on the same parent supersede the old bytes. */
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_directory(tmp_, parent_inode_no,
+	if (tessera_fs_publish_directory(tmp_, w, parent_inode_no,
 	    new_mft, mlen, pub_hash) != 0) {
 		free(new_mft, M_TESSERA);
 		return (EIO);
@@ -31363,7 +31957,7 @@ tessera_vop_mknod(struct vop_mknod_args *ap)
 }
 
 static int
-tessera_vop_create_impl(struct vop_create_args *ap)
+tessera_vop_create_impl_wk(struct vop_create_args *ap, const struct tessera_fs_wctx *w)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
@@ -31401,7 +31995,7 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 	/* 2. Build & publish the child's empty INLINE manifest. */
 	{
 		tessera_manifest_builder_t *mb =
-		    tessera_fs_mft_begin(tmp_, TESSERA_MFT_INLINE);
+		    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_INLINE);
 		if (mb == NULL) { err = ENOMEM; goto out; }
 		if (tessera_manifest_set_inline(mb, NULL, 0) != TESSERA_OK) {
 			tessera_manifest_free(mb);
@@ -31425,7 +32019,7 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		 * inode that shared the same pending entry got superseded —
 		 * this file's only reference then dangled (fsck: "in no pack").
 		 * See tessera_fs_pending_manifest_put supersession logic. */
-		if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+		if (tessera_fs_publish_manifest_owned(tmp_, w, child_mft, mlen,
 		    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 		/* 3. Compose & insert child inode record. */
@@ -31549,6 +32143,23 @@ out:
 	if (_cr_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
+}
+
+/* A new name is written under the keys of its directory's domain
+ * (tessera_fs_wctx); the new inode joins that domain. */
+static int
+tessera_vop_create_impl(struct vop_create_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_dvp->v_mount);
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_,
+	    (uint32_t)VTOTNODE(ap->a_dvp)->inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_vop_create_impl_wk(ap, &wv);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -31930,7 +32541,7 @@ write_done:
  * and v_type = VDIR.
  */
 static int
-tessera_vop_mkdir(struct vop_mkdir_args *ap)
+tessera_vop_mkdir_wk(struct vop_mkdir_args *ap, const struct tessera_fs_wctx *w)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
@@ -31960,7 +32571,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 
 	/* Empty DIRECTORY manifest. */
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY);
 	if (mb == NULL) { err = ENOMEM; goto out; }
 	size_t mlen = 0;
 	tessera_hash_t mhash;
@@ -31978,7 +32589,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	 * duplicate-symlink-target) manifest so supersession of some other
 	 * inode sharing the same pending hash can't drop it out from under
 	 * this reference. Mirrors the vop_create fix. */
-	if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, child_mft, mlen,
 	    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 	tessera_inode_record_t cino;
@@ -32056,6 +32667,23 @@ out:
 	if (_mk_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
+}
+
+/* A new name is written under the keys of its directory's domain
+ * (tessera_fs_wctx); the new inode joins that domain. */
+static int
+tessera_vop_mkdir(struct vop_mkdir_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_dvp->v_mount);
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_,
+	    (uint32_t)VTOTNODE(ap->a_dvp)->inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_vop_mkdir_wk(ap, &wv);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -32207,7 +32835,7 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
  * the parent. Same pattern as vop_create + vop_mkdir.
  */
 static int
-tessera_vop_symlink(struct vop_symlink_args *ap)
+tessera_vop_symlink_wk(struct vop_symlink_args *ap, const struct tessera_fs_wctx *w)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
@@ -32240,7 +32868,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 
 	/* Build SYMLINK manifest. */
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_SYMLINK);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_SYMLINK);
 	if (mb == NULL) { err = ENOMEM; goto out; }
 	if (tessera_manifest_set_symlink(mb, target) != TESSERA_OK) {
 		tessera_manifest_free(mb);
@@ -32262,7 +32890,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	 * duplicate-symlink-target) manifest so supersession of some other
 	 * inode sharing the same pending hash can't drop it out from under
 	 * this reference. Mirrors the vop_create fix. */
-	if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+	if (tessera_fs_publish_manifest_owned(tmp_, w, child_mft, mlen,
 	    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 	tessera_inode_record_t cino;
@@ -32328,6 +32956,23 @@ out:
 	if (_sl_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
+}
+
+/* A new name is written under the keys of its directory's domain
+ * (tessera_fs_wctx); the new inode joins that domain. */
+static int
+tessera_vop_symlink(struct vop_symlink_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_dvp->v_mount);
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_,
+	    (uint32_t)VTOTNODE(ap->a_dvp)->inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_vop_symlink_wk(ap, &wv);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 /*
@@ -32490,6 +33135,7 @@ rename_visit(void *vctx, uint64_t ch, const char *nm, uint16_t nl)
 }
 
 static int tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *,
+    const struct tessera_fs_wctx *,
     uint32_t, uint64_t, const char *, size_t, const char *, size_t);
 
 /* Inline same-dir rename rebuilds the parent manifest (RMW) — gate it
@@ -32501,17 +33147,23 @@ tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
     const char *old_name, size_t old_namelen,
     const char *new_name, size_t new_namelen)
 {
+	struct tessera_fs_wctx wv;
+	int r = tessera_fs_wctx_inode(tmp_, parent_inode_no, &wv);
+	if (r != 0)
+		return (r);
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int r = tessera_fs_dirent_rename_same_dir_impl(tmp_,
+	r = tessera_fs_dirent_rename_same_dir_impl(tmp_, &wv,
 	    parent_inode_no, target_inode, old_name, old_namelen,
 	    new_name, new_namelen);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	tessera_fs_wctx_done(&wv);
 	return (r);
 }
 
 static int
 tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w,
     uint32_t parent_inode_no,
     uint64_t target_inode,
     const char *old_name, size_t old_namelen,
@@ -32524,7 +33176,7 @@ tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *tmp_,
 		return (EIO);
 
 	tessera_manifest_builder_t *mb =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_DIRECTORY);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_DIRECTORY);
 	if (mb == NULL) return (ENOMEM);
 
 	struct rename_ctx ctx = {
@@ -32569,7 +33221,7 @@ tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *tmp_,
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_directory(tmp_, parent_inode_no,
+	if (tessera_fs_publish_directory(tmp_, w, parent_inode_no,
 	    new_mft, mlen, pub_hash) != 0) {
 		free(new_mft, M_TESSERA);
 		return (EIO);
@@ -33310,6 +33962,10 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		    tessera_quota_find(tmp_, dino.quota_domain);
 		if (qd == NULL)
 			return (ENOENT);
+		/* The policy is under a key group's MAC (§5.4); changing it
+		 * in a group needs a reseal, which E4 doesn't offer yet. */
+		if (qd->key_group != 0)
+			return (EPERM);
 
 		qd->dedup_policy = (uint8_t)pol;
 		tessera_fs_quota_recount_nonglobal(tmp_);
@@ -33401,6 +34057,10 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		/* The default domain is the mount's, not a volume's. */
 		if (dino.quota_domain == tmp_->quota_default_domain)
 			return (EBUSY);
+		/* A key group's domain stays: detached, its files would be
+		 * written outside the group (§5.4). */
+		if (tmp_->quota_domains[idx].key_group != 0)
+			return (EPERM);
 
 		uint64_t id = dino.quota_domain;
 		/* Clear the inode FIRST. If the retire succeeded and this
@@ -33637,12 +34297,13 @@ tessera_xattr_cred(struct vnode *vp, int ns, struct ucred *cred,
  * (del=1) drop sname. Publishes the new manifest + repoints ino->xattr_hash
  * in RAM; caller does inode_put. del with no match → ENOATTR. */
 static int
-tessera_xattr_rebuild(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_xattr_rebuild_wk(struct tessera_mount *tmp_,
+    const struct tessera_fs_wctx *w, uint32_t inode_no,
     tessera_inode_record_t *ino, const char *sname, size_t snl,
     const uint8_t *val, size_t vlen, int del)
 {
 	tessera_manifest_builder_t *b =
-	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_XATTR_STORE);
+	    tessera_fs_mft_begin(tmp_, w, TESSERA_MFT_XATTR_STORE);
 	if (b == NULL) return (ENOMEM);
 
 	int found = 0;
@@ -33701,12 +34362,28 @@ tessera_xattr_rebuild(struct tessera_mount *tmp_, uint32_t inode_no,
 	 * publish at flush supersede + drop this one before it hits disk.
 	 * xattr manifests aren't shared, so they need no owner tracking; a
 	 * superseded old one is just an orphan GC reclaims. */
-	int pr = tessera_fs_publish_manifest_owned(tmp_, mbuf, need, mhash,
+	int pr = tessera_fs_publish_manifest_owned(tmp_, w, mbuf, need, mhash,
 	    /*owner=*/0);
 	free(mbuf, M_TESSERA);
 	if (pr != 0) return (pr);
 	memcpy(ino->xattr_hash, mhash, sizeof(tessera_hash_t));
 	return (0);
+}
+
+/* The write keys of inode_no's domain (tessera_fs_wctx), then the work. */
+static int
+tessera_xattr_rebuild(struct tessera_mount *tmp_, uint32_t inode_no,
+    tessera_inode_record_t *ino, const char *sname, size_t snl,
+    const uint8_t *val, size_t vlen, int del)
+{
+	struct tessera_fs_wctx wv;
+	int e = tessera_fs_wctx_inode(tmp_, inode_no, &wv);
+
+	if (e != 0)
+		return (e);
+	e = tessera_xattr_rebuild_wk(tmp_, &wv, inode_no, ino, sname, snl, val, vlen, del);
+	tessera_fs_wctx_done(&wv);
+	return (e);
 }
 
 static int tessera_vop_setextattr_impl(struct vop_setextattr_args *ap);
