@@ -1,0 +1,581 @@
+//! IMAP sync in a process of its own (mail.md §4): the `sync` worker runs
+//! the [`Session`] and parses every byte the server sends; the engine keeps
+//! the store and the courier. The worker has no capability at all: the
+//! courier's bytes reach it relayed over its standard input and output,
+//! and what it would ask of the store ([`Sink`]) it asks the engine there
+//! too. So a server that breaks the IMAP parser holds a process that sees
+//! one account's session and can only ask the store what sync may ask.
+//!
+//! The wire, both ways: `u8 kind | u32 LE length | payload`.
+//! - `WIRE`: courier bytes (engine → worker: from the server; worker →
+//!   engine: to it).
+//! - `EOF`, `TIMEOUT` (engine → worker, empty): the courier ended; it was
+//!   quiet past the call's wait (an `IDLE` renews, anything else fails).
+//! - `CALL` (engine → worker) and `REPLY` (worker → engine): a [`Call`] and
+//!   its [`Reply`].
+//! - `SINK` (worker → engine) and `ANSWER` (engine → worker): a store call
+//!   made while a call runs, and its answer.
+//!
+//! Payloads are postcard.
+
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, AsRawFd};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Change, Error, Fetched, FolderState, RemoteFolder, Report, Result, Session, Sink};
+
+pub const WIRE: u8 = 0;
+pub const EOF: u8 = 1;
+pub const TIMEOUT: u8 = 2;
+pub const CALL: u8 = 3;
+pub const REPLY: u8 = 4;
+pub const SINK: u8 = 5;
+pub const ANSWER: u8 = 6;
+
+/// The largest frame: a page of whole messages (20 × 2 MiB) and room.
+pub const FRAME_MAX: usize = 64 << 20;
+
+/// What the engine asks the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Call {
+    /// Read the greeting; answers [`Reply::Started`].
+    Start,
+    Sync,
+    Append { folder: String, flags: Vec<String>, message: Vec<u8> },
+    Idle { folder: String },
+    Logout,
+}
+
+/// What [`Error`] was, across the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kind {
+    Io,
+    Protocol,
+    Bye,
+    Throttled,
+    No,
+    Sink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reply {
+    Started { caps: Vec<String> },
+    Synced(Report),
+    Appended(Option<u32>),
+    Idled(bool),
+    LoggedOut,
+    Failed(Kind, String),
+}
+
+/// A [`Sink`] call, from the worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SinkCall {
+    Folders(Vec<RemoteFolder>),
+    State(String),
+    Reset(String),
+    KnownUids(String),
+    Messages(String, Vec<Fetched>),
+    Flags(String, Vec<(u32, Vec<String>)>),
+    Vanished(String, Vec<u32>),
+    Checkpoint(String, FolderState),
+    TextWanted(String, u32),
+    Changes,
+    ChangeDone(u64, bool),
+    ServerState(String),
+    SetServerState(String, String),
+    Listed(String),
+    ServerIdAt(String, u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SinkAnswer {
+    Done(std::result::Result<(), String>),
+    State(FolderState),
+    Uids(Vec<u32>),
+    Wanted(Vec<(u32, u64)>),
+    Changes(Vec<Change>),
+    Text(Option<String>),
+    Listed(Vec<(String, u32)>),
+}
+
+fn bad(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
+}
+
+pub fn write_frame(w: &mut (impl Write + ?Sized), kind: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > FRAME_MAX {
+        return Err(bad("frame too large"));
+    }
+    let mut head = [0u8; 5];
+    head[0] = kind;
+    head[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    w.write_all(&head)?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+/// One frame; `Ok(None)` at a clean end.
+pub fn read_frame(r: &mut (impl Read + ?Sized)) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut head = [0u8; 5];
+    match r.read_exact(&mut head[..1]) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    r.read_exact(&mut head[1..])?;
+    let n = u32::from_le_bytes(head[1..].try_into().unwrap()) as usize;
+    if n > FRAME_MAX || head[0] > ANSWER {
+        return Err(bad("frame"));
+    }
+    let mut b = vec![0u8; n];
+    r.read_exact(&mut b)?;
+    Ok(Some((head[0], b)))
+}
+
+fn enc<T: Serialize>(v: &T) -> io::Result<Vec<u8>> {
+    postcard::to_stdvec(v).map_err(|_| bad("encode"))
+}
+
+fn dec<'a, T: Deserialize<'a>>(b: &'a [u8]) -> io::Result<T> {
+    postcard::from_bytes(b).map_err(|_| bad("decode"))
+}
+
+fn kind_of(e: &Error) -> (Kind, String) {
+    match e {
+        Error::Io(e) => (Kind::Io, e.to_string()),
+        Error::Protocol(t) => (Kind::Protocol, t.clone()),
+        Error::Bye(t) => (Kind::Bye, t.clone()),
+        Error::Throttled => (Kind::Throttled, String::new()),
+        Error::No(t) => (Kind::No, t.clone()),
+        Error::Sink(t) => (Kind::Sink, t.clone()),
+    }
+}
+
+fn error_of(k: Kind, t: String) -> Error {
+    match k {
+        Kind::Io => Error::Io(io::Error::other(t)),
+        Kind::Protocol => Error::Protocol(t),
+        Kind::Bye => Error::Bye(t),
+        Kind::Throttled => Error::Throttled,
+        Kind::No => Error::No(t),
+        Kind::Sink => Error::Sink(t),
+    }
+}
+
+// ── the worker ──────────────────────────────────────────────────────
+
+/// The worker's one channel to the engine, shared by the session's
+/// socket ([`Tunnel`]) and the store ([`RemoteSink`]).
+struct Chan<R: Read, W: Write> {
+    r: R,
+    w: W,
+    /// Server bytes that came while a store answer was awaited.
+    wire: VecDeque<u8>,
+    /// The courier ended / a wait passed, seen while awaiting an answer.
+    eof: bool,
+    timeouts: usize,
+}
+
+impl<R: Read, W: Write> Chan<R, W> {
+    /// The next frame that isn't server bytes or a courier event (those
+    /// are kept for the tunnel).
+    fn next_other(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        loop {
+            let (k, b) = read_frame(&mut self.r)?.ok_or_else(|| bad("the engine went away"))?;
+            match k {
+                WIRE => self.wire.extend(b),
+                EOF => self.eof = true,
+                TIMEOUT => self.timeouts += 1,
+                _ => return Ok((k, b)),
+            }
+        }
+    }
+}
+
+type Shared<R, W> = std::rc::Rc<std::cell::RefCell<Chan<R, W>>>;
+
+/// The session's socket, inside the worker.
+struct Tunnel<R: Read, W: Write>(Shared<R, W>);
+
+impl<R: Read, W: Write> Read for Tunnel<R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut c = self.0.borrow_mut();
+        loop {
+            if !c.wire.is_empty() {
+                let n = buf.len().min(c.wire.len());
+                for (i, b) in c.wire.drain(..n).enumerate() {
+                    buf[i] = b;
+                }
+                return Ok(n);
+            }
+            if c.eof {
+                return Ok(0);
+            }
+            if c.timeouts > 0 {
+                c.timeouts -= 1;
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let (k, b) = read_frame(&mut c.r)?.ok_or_else(|| bad("the engine went away"))?;
+            match k {
+                WIRE => c.wire.extend(b),
+                EOF => c.eof = true,
+                TIMEOUT => c.timeouts += 1,
+                _ => return Err(bad("a call while the server was awaited")),
+            }
+        }
+    }
+}
+
+impl<R: Read, W: Write> Write for Tunnel<R, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len().min(64 * 1024);
+        write_frame(&mut self.0.borrow_mut().w, WIRE, &buf[..n])?;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().w.flush()
+    }
+}
+
+/// The store, inside the worker: every call is asked of the engine.
+struct RemoteSink<R: Read, W: Write>(Shared<R, W>);
+
+impl<R: Read, W: Write> RemoteSink<R, W> {
+    fn ask(&mut self, call: SinkCall) -> std::result::Result<SinkAnswer, String> {
+        let mut c = self.0.borrow_mut();
+        let b = enc(&call).map_err(|e| e.to_string())?;
+        write_frame(&mut c.w, SINK, &b).map_err(|e| e.to_string())?;
+        let (k, b) = c.next_other().map_err(|e| e.to_string())?;
+        if k != ANSWER {
+            return Err("not an answer".into());
+        }
+        dec(&b).map_err(|e| e.to_string())
+    }
+    fn done(&mut self, call: SinkCall) -> std::result::Result<(), String> {
+        match self.ask(call)? {
+            SinkAnswer::Done(r) => r,
+            _ => Err("a wrong answer".into()),
+        }
+    }
+}
+
+impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
+    fn folders(&mut self, list: &[RemoteFolder]) -> std::result::Result<(), String> {
+        self.done(SinkCall::Folders(list.to_vec()))
+    }
+    fn state(&mut self, folder: &str) -> FolderState {
+        match self.ask(SinkCall::State(folder.into())) {
+            Ok(SinkAnswer::State(s)) => s,
+            _ => FolderState::default(),
+        }
+    }
+    fn reset(&mut self, folder: &str) -> std::result::Result<(), String> {
+        self.done(SinkCall::Reset(folder.into()))
+    }
+    fn known_uids(&mut self, folder: &str) -> Vec<u32> {
+        match self.ask(SinkCall::KnownUids(folder.into())) {
+            Ok(SinkAnswer::Uids(u)) => u,
+            _ => Vec::new(),
+        }
+    }
+    fn messages(&mut self, folder: &str, page: Vec<Fetched>) -> std::result::Result<(), String> {
+        self.done(SinkCall::Messages(folder.into(), page))
+    }
+    fn flags(&mut self, folder: &str, changes: &[(u32, Vec<String>)]) -> std::result::Result<(), String> {
+        self.done(SinkCall::Flags(folder.into(), changes.to_vec()))
+    }
+    fn vanished(&mut self, folder: &str, uids: &[u32]) -> std::result::Result<(), String> {
+        self.done(SinkCall::Vanished(folder.into(), uids.to_vec()))
+    }
+    fn checkpoint(&mut self, folder: &str, state: &FolderState) -> std::result::Result<(), String> {
+        self.done(SinkCall::Checkpoint(folder.into(), state.clone()))
+    }
+    fn text_wanted(&mut self, folder: &str, limit: usize) -> Vec<(u32, u64)> {
+        match self.ask(SinkCall::TextWanted(folder.into(), limit.min(u32::MAX as usize) as u32)) {
+            Ok(SinkAnswer::Wanted(w)) => w,
+            _ => Vec::new(),
+        }
+    }
+    fn changes(&mut self) -> Vec<Change> {
+        match self.ask(SinkCall::Changes) {
+            Ok(SinkAnswer::Changes(c)) => c,
+            _ => Vec::new(),
+        }
+    }
+    fn change_done(&mut self, id: u64, ok: bool) -> std::result::Result<(), String> {
+        self.done(SinkCall::ChangeDone(id, ok))
+    }
+    fn server_state(&mut self, key: &str) -> Option<String> {
+        match self.ask(SinkCall::ServerState(key.into())) {
+            Ok(SinkAnswer::Text(t)) => t,
+            _ => None,
+        }
+    }
+    fn set_server_state(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
+        self.done(SinkCall::SetServerState(key.into(), value.into()))
+    }
+    fn listed(&mut self, id: &str) -> Vec<(String, u32)> {
+        match self.ask(SinkCall::Listed(id.into())) {
+            Ok(SinkAnswer::Listed(l)) => l,
+            _ => Vec::new(),
+        }
+    }
+    fn server_id_at(&mut self, folder: &str, uid: u32) -> Option<String> {
+        match self.ask(SinkCall::ServerIdAt(folder.into(), uid)) {
+            Ok(SinkAnswer::Text(t)) => t,
+            _ => None,
+        }
+    }
+}
+
+/// The `sync` worker's main: serve calls on `r`/`w` until the engine
+/// closes them or after `Logout`.
+pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
+    let chan: Shared<R, W> = std::rc::Rc::new(std::cell::RefCell::new(Chan { r, w, wire: VecDeque::new(), eof: false, timeouts: 0 }));
+    let mut session: Option<Session<Tunnel<R, W>>> = None;
+    loop {
+        let next = {
+            let mut c = chan.borrow_mut();
+            match read_frame(&mut c.r)? {
+                None => return Ok(()),
+                Some((WIRE, b)) => {
+                    c.wire.extend(b);
+                    continue;
+                }
+                Some((EOF, _)) => {
+                    c.eof = true;
+                    continue;
+                }
+                Some((TIMEOUT, _)) => continue,
+                Some((CALL, b)) => {
+                    // A wait that passed between calls is no one's.
+                    c.timeouts = 0;
+                    dec::<Call>(&b)?
+                }
+                Some(_) => return Err(bad("not a call")),
+            }
+        };
+        let reply = match (next, session.as_mut()) {
+            (Call::Start, None) => match Session::start(Tunnel(chan.clone())) {
+                Ok(s) => {
+                    let caps = s.capabilities().to_vec();
+                    session = Some(s);
+                    Reply::Started { caps }
+                }
+                Err(e) => {
+                    let (k, t) = kind_of(&e);
+                    Reply::Failed(k, t)
+                }
+            },
+            (Call::Start, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
+            (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
+            (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
+            (Call::Append { folder, flags, message }, Some(s)) => {
+                let f: Vec<&str> = flags.iter().map(String::as_str).collect();
+                s.append(&folder, &f, &message).map(Reply::Appended).unwrap_or_else(|e| fail(&e))
+            }
+            (Call::Idle { folder }, Some(s)) => s.idle(&folder).map(Reply::Idled).unwrap_or_else(|e| fail(&e)),
+            (Call::Logout, Some(_)) => {
+                let _ = session.take().unwrap().logout();
+                Reply::LoggedOut
+            }
+        };
+        let done = reply == Reply::LoggedOut;
+        let b = enc(&reply)?;
+        write_frame(&mut chan.borrow_mut().w, REPLY, &b)?;
+        if done {
+            return Ok(());
+        }
+    }
+}
+
+fn fail(e: &Error) -> Reply {
+    let (k, t) = kind_of(e);
+    Reply::Failed(k, t)
+}
+
+// ── the engine's side ───────────────────────────────────────────────
+
+/// What the engine does with an IMAP session, here or in the worker.
+pub trait Imap {
+    fn capabilities(&self) -> &[String];
+    fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report>;
+    fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>>;
+    /// `IDLE` on `folder` until a change or `wait` passes.
+    fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool>;
+    fn logout(&mut self) -> Result<()>;
+}
+
+/// The session here, over the courier's socket (tests, and Mail without
+/// a `sync` worker).
+pub struct Local {
+    s: Option<Session<std::os::unix::net::UnixStream>>,
+    caps: Vec<String>,
+}
+
+impl Local {
+    pub fn start(courier: std::os::unix::net::UnixStream) -> Result<Local> {
+        let s = Session::start(courier)?;
+        Ok(Local { caps: s.capabilities().to_vec(), s: Some(s) })
+    }
+    fn s(&mut self) -> Result<&mut Session<std::os::unix::net::UnixStream>> {
+        self.s.as_mut().ok_or_else(|| Error::Protocol("logged out".into()))
+    }
+}
+
+impl Imap for Local {
+    fn capabilities(&self) -> &[String] {
+        &self.caps
+    }
+    fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
+        self.s()?.sync(sink)
+    }
+    fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
+        self.s()?.append(folder, flags, message)
+    }
+    fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool> {
+        let s = self.s()?;
+        s.socket().set_read_timeout(Some(wait))?;
+        s.idle(folder)
+    }
+    fn logout(&mut self) -> Result<()> {
+        match self.s.take() {
+            Some(s) => s.logout(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// How long the engine waits on a quiet server outside `IDLE`.
+pub const QUIET: Duration = Duration::from_secs(120);
+
+/// The session in the `sync` worker: the engine relays the courier's
+/// bytes and answers the store calls.
+pub struct Remote<I: Write + AsFd, O: Read + AsFd> {
+    courier: std::os::unix::net::UnixStream,
+    to_worker: I,
+    from_worker: O,
+    caps: Vec<String>,
+    gone: bool,
+}
+
+impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
+    /// Start the session in the worker (`to_worker` is its standard input,
+    /// `from_worker` its output) over `courier`.
+    pub fn start(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O) -> Result<Remote<I, O>> {
+        let mut r = Remote { courier, to_worker, from_worker, caps: Vec::new(), gone: false };
+        match r.call(&Call::Start, None, QUIET)? {
+            Reply::Started { caps } => r.caps = caps,
+            other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
+        }
+        Ok(r)
+    }
+
+    /// One call: relay until its reply.
+    fn call(&mut self, call: &Call, mut sink: Option<&mut dyn Sink>, wait: Duration) -> Result<Reply> {
+        let b = enc(call)?;
+        write_frame(&mut self.to_worker, CALL, &b)?;
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let mut fds = [
+                libc::pollfd { fd: self.from_worker.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: self.courier.as_raw_fd(), events: if self.gone { 0 } else { libc::POLLIN }, revents: 0 },
+            ];
+            let ms = wait.as_millis().min(i32::MAX as u128) as i32;
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e.into());
+            }
+            if n == 0 {
+                write_frame(&mut self.to_worker, TIMEOUT, &[])?;
+                continue;
+            }
+            if fds[0].revents != 0 {
+                let (k, b) = read_frame(&mut self.from_worker)?.ok_or_else(|| Error::Protocol("the sync worker ended".into()))?;
+                match k {
+                    WIRE => self.courier.write_all(&b)?,
+                    REPLY => return Ok(dec(&b)?),
+                    SINK => {
+                        let Some(s) = sink.as_deref_mut() else { return Err(Error::Protocol("a store call outside sync".into())) };
+                        let a = answer(s, dec(&b)?);
+                        write_frame(&mut self.to_worker, ANSWER, &enc(&a)?)?;
+                    }
+                    _ => return Err(Error::Protocol("a frame the worker doesn't send".into())),
+                }
+                continue;
+            }
+            if fds[1].revents != 0 {
+                match self.courier.read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        self.gone = true;
+                        write_frame(&mut self.to_worker, EOF, &[])?;
+                    }
+                    Ok(n) => write_frame(&mut self.to_worker, WIRE, &buf[..n])?,
+                }
+            }
+        }
+    }
+
+    fn reply<T>(&mut self, call: &Call, sink: Option<&mut dyn Sink>, wait: Duration, f: impl FnOnce(Reply) -> Option<T>) -> Result<T> {
+        match self.call(call, sink, wait)? {
+            Reply::Failed(k, t) => Err(error_of(k, t)),
+            r => f(r.clone()).ok_or_else(|| Error::Protocol(format!("the worker answered {r:?}"))),
+        }
+    }
+}
+
+/// The engine's answer to a store call.
+fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
+    match c {
+        SinkCall::Folders(l) => SinkAnswer::Done(s.folders(&l)),
+        SinkCall::State(f) => SinkAnswer::State(s.state(&f)),
+        SinkCall::Reset(f) => SinkAnswer::Done(s.reset(&f)),
+        SinkCall::KnownUids(f) => SinkAnswer::Uids(s.known_uids(&f)),
+        SinkCall::Messages(f, p) => SinkAnswer::Done(s.messages(&f, p)),
+        SinkCall::Flags(f, c) => SinkAnswer::Done(s.flags(&f, &c)),
+        SinkCall::Vanished(f, u) => SinkAnswer::Done(s.vanished(&f, &u)),
+        SinkCall::Checkpoint(f, st) => SinkAnswer::Done(s.checkpoint(&f, &st)),
+        SinkCall::TextWanted(f, n) => SinkAnswer::Wanted(s.text_wanted(&f, n as usize)),
+        SinkCall::Changes => SinkAnswer::Changes(s.changes()),
+        SinkCall::ChangeDone(id, ok) => SinkAnswer::Done(s.change_done(id, ok)),
+        SinkCall::ServerState(k) => SinkAnswer::Text(s.server_state(&k)),
+        SinkCall::SetServerState(k, v) => SinkAnswer::Done(s.set_server_state(&k, &v)),
+        SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),
+        SinkCall::ServerIdAt(f, u) => SinkAnswer::Text(s.server_id_at(&f, u)),
+    }
+}
+
+impl<I: Write + AsFd, O: Read + AsFd> Imap for Remote<I, O> {
+    fn capabilities(&self) -> &[String] {
+        &self.caps
+    }
+    fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
+        self.reply(&Call::Sync, Some(sink), QUIET, |r| match r {
+            Reply::Synced(x) => Some(x),
+            _ => None,
+        })
+    }
+    fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> Result<Option<u32>> {
+        let c = Call::Append { folder: folder.into(), flags: flags.iter().map(|f| f.to_string()).collect(), message: message.to_vec() };
+        self.reply(&c, None, QUIET, |r| match r {
+            Reply::Appended(x) => Some(x),
+            _ => None,
+        })
+    }
+    fn idle(&mut self, folder: &str, wait: Duration) -> Result<bool> {
+        self.reply(&Call::Idle { folder: folder.into() }, None, wait, |r| match r {
+            Reply::Idled(x) => Some(x),
+            _ => None,
+        })
+    }
+    fn logout(&mut self) -> Result<()> {
+        self.reply(&Call::Logout, None, QUIET, |r| (r == Reply::LoggedOut).then_some(()))
+    }
+}

@@ -524,8 +524,8 @@ fn sending_through_the_courier() {
     assert!(!text.to_ascii_lowercase().contains("\nbcc:"), "{text}");
     assert!(text.contains("\r\n.the numbers are in."), "dot-stuffing undone by the relay: {text}");
     // Filed in Sent, seen, and synced back.
-    let mut imap = Session::start(courier(&dc)).unwrap();
-    assert!(engine.file_sent(account, &mut imap, &copy).unwrap());
+    let mut imap = mail_engine::accounts::open_imap(courier(&dc)).unwrap();
+    assert!(engine.file_sent(account, imap.as_mut(), &copy).unwrap());
     let _ = imap.logout();
     Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     let sent = engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.role == Role::Sent).unwrap().0;
@@ -550,8 +550,8 @@ fn sending_through_the_courier() {
     let on_server = || ["cur", "new"].iter().map(|c| std::fs::read_dir(maildir(&dc.dir.path().join("home")).join(".Drafts").join(c)).map(|r| r.count()).unwrap_or(0)).sum::<usize>();
     let sync = || Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
     let copy = |rest| {
-        let mut s = Session::start(courier(&dc)).unwrap();
-        let n = engine.copy_drafts(account, &mut s, rest).unwrap();
+        let mut s = mail_engine::accounts::open_imap(courier(&dc)).unwrap();
+        let n = engine.copy_drafts(account, s.as_mut(), rest).unwrap();
         let _ = s.logout();
         n
     };
@@ -717,4 +717,46 @@ fn a_watch_ends_when_its_connection_is_shut() {
         s.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(w.join().unwrap().is_err());
     });
+}
+
+fn sync_worker() -> PathBuf {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-sync/Cargo.toml");
+    let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-sync-worker", "--manifest-path"]).arg(&manifest).status().unwrap();
+    assert!(st.success());
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-sync/target/debug/mail-sync-worker")
+}
+
+/// The same pass with the IMAP session in the `sync` worker (§4): the
+/// courier's bytes relayed to it, the store's calls answered here. (The
+/// other tests here may then use the worker too; both ways are the same.)
+#[test]
+fn a_pass_with_sync_in_its_worker() {
+    use mail_store::{AccountConfig, Protocol, Reached, Server};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    std::env::set_var("MAIL_SYNC_WORKER", sync_worker());
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let cfg = AccountConfig {
+        address: "priya@example.org".into(),
+        name: "Priya Raman".into(),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: HOST.into(), port: dc.port },
+            smtp: Server { scheme: "submissions".into(), host: HOST.into(), port: dc.sub_port },
+        },
+        incoming_item: Some([9; 16]),
+        outgoing_item: Some([9; 16]),
+        oauth: None,
+        reached: Reached::Never,
+    };
+    let account = engine.store.add_configured(&cfg).unwrap();
+    let p = engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert!(p.report.headers >= 300, "{p:?}");
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    // A second pass finds nothing new.
+    let p = engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert_eq!(p.report.headers, 0, "{p:?}");
 }
