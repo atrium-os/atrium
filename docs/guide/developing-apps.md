@@ -241,7 +241,9 @@ pkgconf; the base system has clang, lld and the Atrium headers and
 libraries (`pkg-config --cflags --libs atrium`) and `atrium.app.mk`:
 `PROG=`, `ATRIUM_LIBS=` and `.include <atrium.app.mk>` give `make`,
 `make atrium.toml` and `make run`. `cargo atrium new <dir> --template c-app`
-starts one. **Planned (M7):** `make bundle`.
+starts one. `make bundle` writes an installable bundle through
+`cargo-atrium bundle` (add the Rust toolchain to the workspace for it);
+`make bundle BUNDLE_FLAGS="--sign key.pem"` signs it.
 
 ## 7. Running, fuzzing and bundling
 
@@ -312,8 +314,10 @@ they come from the SDK sysroot (`--arch`, `--sysroot` as for `cross`), so
 the app can only need base libraries there, and packing needs `OPIFEX`
 pointing at an opifex. A `dev.` id isn't bundled: give `[app] id` one of
 your own. In a folder without `Cargo.toml` (a C project) it bundles what
-`make` put at the entries, into `bundle/`. **Planned:** the key from Arca instead of a file, and
-`[bundle] extra-libs` for libraries the app `dlopen`s.
+`make` put at the entries, into `bundle/`. A library the app only `dlopen`s
+isn't in its ELF, so list it: `[bundle] extra-libs = ["libjansson.so.4"]`
+(file names, `*` and `?` allowed); Run carries it too. **Planned:** the key
+from Arca instead of a file.
 
 ## 8. Reference
 
