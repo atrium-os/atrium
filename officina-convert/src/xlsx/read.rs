@@ -389,6 +389,8 @@ struct Seg {
     cond: Vec<super::condfmt::Raw>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
+    /// A frozen `<pane>`: rows and columns kept in view.
+    freeze: Option<(u32, u32)>,
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
@@ -679,7 +681,14 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                 }
             }
             b"dynamicFilter" | b"top10" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, top-10, colour and icon filters (rows stay as the file hid them)"),
-            b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => seg.rep.note(Kind::Dropped, "frozen panes"),
+            b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
+                let split = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite() && *x >= 0.0).map_or(0, |x| x as u32);
+                let (rows, cols) = (split(attr(&e, b"ySplit")?).min(officina_grid::addr::MAX_ROWS - 1), split(attr(&e, b"xSplit")?).min(officina_grid::addr::MAX_COLS - 1));
+                if (rows, cols) != (0, 0) {
+                    seg.freeze = Some((rows, cols));
+                }
+            }
+            b"pane" if attr(&e, b"xSplit")?.is_some() || attr(&e, b"ySplit")?.is_some() => seg.rep.note(Kind::Dropped, "split (not frozen) panes"),
             _ => {}
         }
     }
@@ -807,6 +816,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 filter = seg.filter.or(filter);
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
+                }
+                if let Some(f) = seg.freeze {
+                    wb.sheet_mut(s).freeze = f;
                 }
                 cond.extend(seg.cond);
                 dw = seg.default_w.or(dw);

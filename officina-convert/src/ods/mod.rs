@@ -6,6 +6,7 @@ pub(crate) mod condfmt;
 pub mod formula;
 pub(crate) mod macros;
 pub(crate) mod pivot;
+pub(crate) mod settings;
 #[cfg(feature = "read")]
 pub mod read;
 pub mod write;

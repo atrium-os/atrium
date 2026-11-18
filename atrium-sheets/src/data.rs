@@ -83,6 +83,12 @@ pub enum DataCmd {
     Link,
     /// Take the links off the selection's cells.
     RemoveLinks,
+    /// Keep the rows above the cursor and the columns left of it in view.
+    FreezePanes,
+    /// Keep the first row in view.
+    FreezeTopRow,
+    /// Let every row and column scroll again.
+    Unfreeze,
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
@@ -234,6 +240,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
         (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }), Some(DataCmd::Link)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Remove Links" } else { "Remove Link" }).enabled(links_in(wb, s, sel).next().is_some()), Some(DataCmd::RemoveLinks)),
+        if wb.sheet(s).freeze != (0, 0) {
+            (MenuItem::new("Unfreeze Panes").separated(), Some(DataCmd::Unfreeze))
+        } else {
+            (MenuItem::new("Freeze Panes").enabled(cursor != (0, 0)).separated(), Some(DataCmd::FreezePanes))
+        },
         if wb.merges_in(&Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }).next().is_some() {
             (MenuItem::new("Unmerge Cells").separated(), Some(DataCmd::Unmerge))
         } else {
@@ -248,6 +259,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Clear Filter in Column {}", officina_grid::addr::col_name(col))).enabled(col_filtered), Some(DataCmd::ClearColumn)),
         (MenuItem::new("Show All Rows").enabled(any_cond), Some(DataCmd::ShowAll)),
     ];
+    if let Some(i) = v.iter().position(|x| x.1 == Some(DataCmd::FreezePanes)) {
+        v.insert(i + 1, (MenuItem::new("Freeze Top Row"), Some(DataCmd::FreezeTopRow)));
+    }
     match table {
         Some(t) => v.push((MenuItem::new(format!("Convert “{}” to Range", short(&t.name))).separated(), Some(DataCmd::RemoveTable))),
         None => v.push((MenuItem::new("Format as Table").enabled(some).separated(), Some(DataCmd::FormatAsTable))),
@@ -435,6 +449,27 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let n = set.len();
             d.run(if n == 1 { "Delete Comment" } else { "Delete Comments" }, vec![GridOp::Comments { sheet: s, set }]);
             Ok(if n == 1 { "Comment deleted.".into() } else { format!("{n} comments deleted.") })
+        }
+        DataCmd::FreezePanes | DataCmd::FreezeTopRow | DataCmd::Unfreeze => {
+            let (rows, cols) = match cmd {
+                DataCmd::FreezePanes => cursor,
+                DataCmd::FreezeTopRow => (1, 0),
+                _ => (0, 0),
+            };
+            if d.wb.sheet(s).freeze == (rows, cols) {
+                return Ok(String::new());
+            }
+            d.run(if (rows, cols) == (0, 0) { "Unfreeze Panes" } else { "Freeze Panes" }, vec![GridOp::Freeze { sheet: s, rows, cols }]);
+            let rs = if rows == 1 { "top row".to_string() } else { format!("top {rows} rows") };
+            let cs = if cols == 1 { "first column".to_string() } else { format!("first {cols} columns") };
+            Ok(match (rows, cols) {
+                (0, 0) => "Every row and column scrolls again.".into(),
+                (1, 0) => "The top row stays in view.".into(),
+                (_, 0) => format!("The {rs} stay in view."),
+                (0, 1) => "The first column stays in view.".into(),
+                (0, _) => format!("The {cs} stay in view."),
+                _ => format!("The {rs} and {cs} stay in view."),
+            })
         }
         DataCmd::RemoveLinks => {
             let set: Vec<_> = links_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
@@ -732,6 +767,23 @@ mod tests {
     }
     fn cell(d: &Doc, r: u32, c: u32) -> String {
         d.wb.formatted(CellAddr::new(0, r, c)).text
+    }
+
+    #[test]
+    fn panes_freeze_at_the_cursor_and_unfreeze() {
+        let mut d = doc();
+        let titles = |d: &Doc| menu(d, one(2, 1), (2, 1)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
+        assert!(titles(&d).iter().any(|t| t == "Freeze Top Row"));
+        run(&mut d, one(2, 1), (2, 1), DataCmd::FreezePanes);
+        assert_eq!(d.wb.sheet(0).freeze, (2, 1));
+        assert_eq!(d.status, "The top 2 rows and first column stay in view.");
+        assert!(titles(&d).iter().any(|t| t == "Unfreeze Panes"));
+        run(&mut d, one(2, 1), (2, 1), DataCmd::Unfreeze);
+        assert_eq!(d.wb.sheet(0).freeze, (0, 0));
+        run(&mut d, one(2, 1), (2, 1), DataCmd::FreezeTopRow);
+        assert_eq!(d.status, "The top row stays in view.");
+        assert!(d.undo());
+        assert_eq!(d.wb.sheet(0).freeze, (0, 0));
     }
 
     #[test]

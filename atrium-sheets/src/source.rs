@@ -490,6 +490,10 @@ impl SheetSource {
 }
 
 impl GridSource for SheetSource {
+    fn frozen(&self) -> (u32, u32) {
+        let d = self.doc.borrow();
+        d.wb.sheet(d.sheet).freeze
+    }
     fn merge_at(&self, r: u32, c: u32) -> Option<CellRange> {
         let d = self.doc.borrow();
         d.wb.merge_at(CellAddr::new(d.sheet, r, c)).map(|m| CellRange { r0: m.r0, c0: m.c0, r1: m.r1, c1: m.c1 })

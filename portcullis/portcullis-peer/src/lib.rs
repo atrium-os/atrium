@@ -127,6 +127,18 @@ struct Entry {
 /// with a letter, never `personal` (Personal is the absence of a name).
 /// The name becomes part of paths (`apps/<id>@<persona>`) and jail names,
 /// so nothing else is allowed.
+/// The reserved persona of the Navigator's sign-in window for a captive
+/// portal (atrium-net.md §8.1): an instance of its own (uid, jail, overlay)
+/// that a person's persona can never be ([`valid_person_persona`]), started
+/// only by portcullisd's `PortalWindow`.
+pub const PORTAL_PERSONA: &str = "portal";
+
+/// A name a person may give one of their personas: [`valid_persona`], and
+/// not the reserved [`PORTAL_PERSONA`].
+pub fn valid_person_persona(name: &str) -> bool {
+    valid_persona(name) && name != PORTAL_PERSONA
+}
+
 pub fn valid_persona(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty() && b.len() <= 32 && b[0].is_ascii_lowercase()
@@ -599,6 +611,7 @@ mod tests {
         }
         assert_eq!(r.persona(50006), Some(Some("work")));
         assert_eq!(r.resolve(50007), None);
+        assert!(valid_persona(PORTAL_PERSONA) && !valid_person_persona(PORTAL_PERSONA) && valid_person_persona("work"));
         assert!(valid_persona("work") && valid_persona("acme-2") && !valid_persona("2acme")
             && !valid_persona("a.b") && !valid_persona(&"a".repeat(33)));
     }

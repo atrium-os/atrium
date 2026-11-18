@@ -52,6 +52,11 @@ pub enum Method {
     Head,
     /// With [`Open::body`]; never retried, never redirected (spec §3.1).
     Post,
+    /// A web form's POST (the captive portal sign-in window, atrium-net.md
+    /// §8.1): as `Post`, except that a 301, 302 or 303 answer is followed
+    /// as a GET without the body, as a browser does after a form (RFC 9110
+    /// §15.4). A 307 or 308 is still refused.
+    Form,
 }
 
 /// What a `Post` sends.
@@ -111,6 +116,12 @@ impl Open {
     pub fn post(id: u32, url: &str, content_type: &str, bytes: Vec<u8>) -> Open {
         Open { method: Method::Post, retry: Retry { max_attempts: 0, backoff_ms: 0 },
                body: Some(Body { content_type: content_type.to_string(), bytes }), ..Open::get(id, url) }
+    }
+
+    /// A form's `POST` ([`Method::Form`]): `application/x-www-form-urlencoded`
+    /// `bytes`, its 303 followed as a GET.
+    pub fn form(id: u32, url: &str, bytes: Vec<u8>) -> Open {
+        Open { method: Method::Form, ..Open::post(id, url, "application/x-www-form-urlencoded", bytes) }
     }
 }
 

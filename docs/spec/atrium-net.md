@@ -497,6 +497,20 @@ watch ending once online) and S2 (Nuntius resolvers, portcullisd `OpenPortalFetc
 gated on the `network-portal` manifest capability, `nuntius::launch::open_portal`).
 S3 and S4 are next.
 
+*S3, the window's shape (Navigator thread, 2026-11-18):* the Navigator runs one window per
+instance and `Launch` passes no arguments, so the sign-in window is its own Navigator
+instance in a reserved persona, `portal` (portcullis-peer `PORTAL_PERSONA`; no person's
+persona may take the name): its own uid, jail and overlay, no trails written, no folders.
+portcullisd's `PortalWindow { activation }` (for S4's bar, Curia and notice) starts it, or
+brings it forward on a press; the instance alone may ask `PortalStatus` (→ network name,
+start URL, online) and `OpenPortalFetcher`. Nuntius gained `Method::Form`: a form's POST
+whose 301/302/303 answer is followed as a GET without the body, as a browser does; plain
+`Post` still never follows.
+
+P5 (Shankar, 2026-11-18): the sign-in window may send the page's plain HTML forms (text,
+checkboxes, buttons), only on the person's press, and only in that window. Everywhere
+else the Navigator still sends no form (legacy-web §5.4.1e).
+
 **Decisions for Shankar**
 - P1. A portal window as an Unrecorded Navigator trail with the network's DNS and the
   private-network grant, nothing else changed. *Recommend yes.*

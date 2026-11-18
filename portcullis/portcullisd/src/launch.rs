@@ -1195,6 +1195,16 @@ pub fn app_may_fetch(app_id: &str) -> bool {
 
 /// Does this app's INSTALLED manifest hold `network-portal`
 /// (atrium-net.md §8.1)? Read from the app tree, never from the caller.
+/// The installed app that opens the captive portal's sign-in window: the
+/// one whose manifest holds `network-portal` (the Navigator); the first by
+/// id if more do.
+pub fn portal_app() -> Option<String> {
+    let mut v: Vec<String> = installed_texts().into_iter()
+        .filter(|(_, _, m)| m.capabilities.network_portal == Some(true)).map(|(_, _, m)| m.app.id).collect();
+    v.sort();
+    v.into_iter().next()
+}
+
 pub fn app_may_open_portal(app_id: &str) -> bool {
     let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
     let Ok(text) = fs::read_to_string(path) else { return false };

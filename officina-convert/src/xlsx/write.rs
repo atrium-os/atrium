@@ -176,6 +176,24 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
     if rows > 0 && cols > 0 {
         let _ = write!(o, r#"<dimension ref="A1:{}"/>"#, a1(rows - 1, cols - 1));
     }
+    let (fr, fc) = sh.freeze;
+    if (fr, fc) != (0, 0) {
+        let fr = fr.min(XLSX_ROWS - 1);
+        let fc = fc.min(XLSX_COLS - 1);
+        let pane = match (fr > 0, fc > 0) {
+            (true, true) => "bottomRight",
+            (true, false) => "bottomLeft",
+            _ => "topRight",
+        };
+        o.extend_from_slice(br#"<sheetViews><sheetView workbookViewId="0"><pane"#);
+        if fc > 0 {
+            let _ = write!(o, r#" xSplit="{fc}""#);
+        }
+        if fr > 0 {
+            let _ = write!(o, r#" ySplit="{fr}""#);
+        }
+        let _ = write!(o, r#" topLeftCell="{}" activePane="{pane}" state="frozen"/><selection pane="{pane}"/></sheetView></sheetViews>"#, a1(fr, fc));
+    }
     let dw = sh.col_sizes.default / MDW;
     let dh = sh.row_sizes.default * 72.0 / 96.0;
     let _ = write!(o, r#"<sheetFormatPr defaultRowHeight="{dh}" defaultColWidth="{dw}" customHeight="1"/>"#);

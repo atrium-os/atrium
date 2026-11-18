@@ -86,6 +86,8 @@ pub enum GridOp {
     Comments { sheet: u16, set: Vec<(u32, u32, Option<crate::comments::Comment>)> },
     /// Links set, or taken away (`None`), on cells of a sheet, in order.
     Links { sheet: u16, set: Vec<(u32, u32, Option<crate::links::Link>)> },
+    /// A sheet's frozen rows and columns ([`crate::book::Sheet::freeze`]).
+    Freeze { sheet: u16, rows: u32, cols: u32 },
 }
 
 impl GridOp {
@@ -239,6 +241,13 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::Freeze { sheet, rows, cols } => {
+                w.u8(19);
+                w.u16(*sheet);
+                w.u32(*rows);
+                w.u32(*cols);
+                return w.into_bytes();
+            }
             GridOp::Links { sheet, set } => {
                 w.u8(18);
                 w.u16(*sheet);
@@ -381,6 +390,16 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 19 {
+            let (sheet, rows, cols) = (r.u16()?, r.u32()?, r.u32()?);
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            if rows >= crate::addr::MAX_ROWS || cols >= crate::addr::MAX_COLS {
+                return Err(WireError::Invalid("frozen panes"));
+            }
+            return Ok(GridOp::Freeze { sheet, rows, cols });
         }
         if kind == 18 {
             let sheet = r.u16()?;
@@ -556,6 +575,14 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::Links { sheet, set: wb.set_links(sheet, set) }
+            }
+            GridOp::Freeze { sheet, rows, cols } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                let new = (rows.min(crate::addr::MAX_ROWS - 1), cols.min(crate::addr::MAX_COLS - 1));
+                let (rows, cols) = std::mem::replace(&mut wb.sheet_mut(sheet).freeze, new);
+                GridOp::Freeze { sheet, rows, cols }
             }
             GridOp::Comments { sheet, set } => {
                 if sheet as usize >= wb.sheet_count() {
@@ -759,6 +786,32 @@ mod tests {
         // A sheet that doesn't exist: nothing.
         h.run(&mut wb, "Tab Colour", vec![GridOp::TabColor { sheet: 9, color: Some(1) }]);
         assert_eq!(wb.sheet_count(), 2);
+    }
+
+    #[test]
+    fn frozen_panes_are_set_undone_and_saved() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("One").unwrap();
+        wb.add_sheet("Two").unwrap();
+        let op = GridOp::Freeze { sheet: 1, rows: 1, cols: 2 };
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        assert!(GridOp::decode(&GridOp::Freeze { sheet: 0, rows: crate::addr::MAX_ROWS, cols: 0 }.encode()).is_err());
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Freeze Panes", vec![op]);
+        assert_eq!(wb.sheet(1).freeze, (1, 2));
+        let back = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+        assert_eq!((back.sheet(0).freeze, back.sheet(1).freeze), ((0, 0), (1, 2)));
+        // A frozen sheet isn't bare; undo unfreezes it.
+        assert_eq!(wb.drop_last_sheet(), None);
+        h.undo(&mut wb);
+        assert_eq!(wb.sheet(1).freeze, (0, 0));
+        // Deleting a frozen sheet, then undoing, brings the panes back.
+        h.run(&mut wb, "Freeze Panes", vec![GridOp::Freeze { sheet: 1, rows: 3, cols: 0 }]);
+        let del = crate::sheetops::delete_sheet_op(&wb, 1).unwrap();
+        h.run(&mut wb, "Delete Sheet", vec![del]);
+        assert_eq!(wb.sheet_count(), 1);
+        h.undo(&mut wb);
+        assert_eq!(wb.sheet(1).freeze, (3, 0));
     }
 
     #[test]

@@ -1331,7 +1331,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         let n = i + 1;
         let _ = write!(objects, r#"<manifest:file-entry manifest:full-path="Object {n}/" manifest:version="1.3" manifest:media-type="application/vnd.oasis.opendocument.chart"/><manifest:file-entry manifest:full-path="Object {n}/content.xml" manifest:media-type="text/xml"/>"#);
     }
-    let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>{objects}</manifest:manifest>"#);
+    let settings = super::settings::settings_xml(wb);
+    let settings_entry = if settings.is_some() { r#"<manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/>"# } else { "" };
+    let manifest = format!(r#"<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3"><manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="{MIME}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/>{settings_entry}{objects}</manifest:manifest>"#);
     let meta = format!(r#"<?xml version="1.0" encoding="UTF-8"?><office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" office:version="1.3"><office:meta><meta:generator>Officina</meta:generator></office:meta></office:document-meta>"#);
     let mut z = ZipWriter::new(out);
     // The mimetype first and stored, so the file can be recognised by its bytes.
@@ -1340,6 +1342,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     z.add("meta.xml", meta.as_bytes())?;
     z.add("styles.xml", styles.as_bytes())?;
     z.add("content.xml", content.as_bytes())?;
+    if let Some(s) = &settings {
+        z.add("settings.xml", s.as_bytes())?;
+    }
     for (i, ch) in wb.charts().iter().enumerate() {
         z.add(&format!("Object {}/content.xml", i + 1), super::chart::object_xml(wb, ch).as_bytes())?;
     }

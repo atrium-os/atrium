@@ -216,6 +216,22 @@ pub enum Request {
     /// every 5 s; the handoff and lifetime are `OpenFetcher`'s.
     OpenPortalFetcher,
 
+    /// ★ Open the sign-in window for the network the machine is on
+    /// (atrium-net.md §8.1 S3/S4): the person's Navigator in its reserved
+    /// `portal` persona ([`portcullis_peer`]'s `PORTAL_PERSONA`), started, or
+    /// brought forward when `activation` (a press, purpose LINK) is given.
+    /// From the bar, Curia or a notice, for the person the caller runs for.
+    /// Answer: `Ok`.
+    PortalWindow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<[u8; 16]>,
+    },
+
+    /// ★ The sign-in window's network (atrium-net.md §8.1 S3), from
+    /// atrium-net through portcullisd. Only from the portal instance.
+    /// Answer: `PortalStatus`.
+    PortalStatus,
+
     /// ★ A content decryption module of the caller's own (docs/spec/hospes.md
     /// §3, §8.4): `hospes-cdm` (`HOSPES_CDM_APP`) in a one-shot jail of its
     /// own, as its own uid, never as the caller. Requires the caller's
@@ -887,6 +903,10 @@ pub enum Response {
     /// A download saved: the name it has, and its folder in words
     /// ("Downloads", "Work's Downloads").
     Downloaded { name: String, place: String },
+    /// PortalStatus → the network's name (the Wi-Fi network's, else the
+    /// interface's), where its sign-in starts (`None`: atrium-net knows no
+    /// router), and whether it is online now (the window closes then).
+    PortalStatus { network: String, start_url: Option<String>, online: bool },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.

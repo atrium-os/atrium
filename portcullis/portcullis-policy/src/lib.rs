@@ -106,7 +106,7 @@ pub enum PersonaError {
 impl std::fmt::Display for PersonaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PersonaError::BadName(n) => write!(f, "persona name {n:?}: use 1-32 of a-z, 0-9 and -, starting with a letter, not \"personal\""),
+            PersonaError::BadName(n) => write!(f, "persona name {n:?}: use 1-32 of a-z, 0-9 and -, starting with a letter, not \"personal\" or \"portal\""),
             PersonaError::BadColour(c) => write!(f, "persona colour {c:?}: one of {}", PERSONA_COLOURS.join(", ")),
             PersonaError::SameColour(a, b) => write!(f, "personas {a:?} and {b:?} have the same colour"),
             PersonaError::TooMany => write!(f, "at most {MAX_PERSONAS} personas"),
@@ -157,7 +157,7 @@ pub fn check_persona_map(personas: &BTreeMap<String, PersonaDef>) -> Result<(), 
     }
     let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, def) in personas {
-        if !portcullis_peer::valid_persona(name) {
+        if !portcullis_peer::valid_person_persona(name) {
             return Err(PersonaError::BadName(name.clone()));
         }
         if !PERSONA_COLOURS.contains(&def.colour.as_str()) {
@@ -910,6 +910,10 @@ mod tests {
         p.personas.insert("Personal".into(), PersonaDef { colour: "red".into(), vpn: None });
         assert_eq!(p.check_personas(), Err(PersonaError::BadName("Personal".into())));
         p.personas.remove("Personal");
+        // The sign-in window's reserved persona is never a person's.
+        p.personas.insert("portal".into(), PersonaDef { colour: "red".into(), vpn: None });
+        assert_eq!(p.check_personas(), Err(PersonaError::BadName("portal".into())));
+        p.personas.remove("portal");
         // A policy without personas writes none.
         let empty = Policy::default();
         assert!(!toml::to_string_pretty(&empty).unwrap().contains("personas"));
