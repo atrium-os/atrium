@@ -334,6 +334,17 @@ fn streamed(req: Request) -> DaemonResult<()> {
     Ok(Some(()))
 }
 
+/// The launch question's list (personas.md §3): personas, Personal first,
+/// the one `app_id` last ran in, and whether it spans personas.
+pub fn personas(app_id: Option<&str>) -> DaemonResult<(Vec<portcullis_ipc::PersonaOption>, Option<String>, bool)> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    match round_trip(&mut s, &Request::PersonaList { app_id: app_id.map(String::from) })? {
+        Response::PersonaList { personas, last, spans } => Ok(Some((personas, last, spans))),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected persona reply: {other:?}"))),
+    }
+}
+
 pub fn workspaces(req: Request) -> DaemonResult<(Vec<portcullis_ipc::WorkspaceInfo>, Vec<portcullis_ipc::Toolchain>)> {
     let Some(mut s) = opened()? else { return Ok(None) };
     match round_trip(&mut s, &req)? {

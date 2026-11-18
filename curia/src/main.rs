@@ -372,7 +372,7 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
         return;
     }
     // Turning a crossing on waits for the person on Sigillum's sheet.
-    let wait = Duration::from_secs(if matches!(w, Want::SetCrossing { on: true, .. }) { 11 * 60 } else { 10 });
+    let wait = Duration::from_secs(if matches!(w, Want::SetCrossing { on: true, .. } | Want::RemovePersona { .. }) { 11 * 60 } else { 10 });
     std::thread::spawn(move || {
         let ask = |req: &Request| -> Result<Response, String> {
             let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
@@ -425,6 +425,30 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                     Err(e) => eprintln!("curia: {words}: {e}"),
                 }
                 Got::CrossingDone { switch, result: r }
+            }
+            Want::AddPersona { name, colour, activation } => {
+                let r = done(ask(&Request::AddPersona { name: name.clone(), colour: colour.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: persona {name} added ({colour})"),
+                    Err(e) => eprintln!("curia: add persona {name}: {e}"),
+                }
+                Got::PersonaDone { name: String::new(), result: r }
+            }
+            Want::SetColour { name, colour, activation } => {
+                let r = done(ask(&Request::SetPersonaColour { name: name.clone(), colour: colour.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: persona {name} is now {colour}"),
+                    Err(e) => eprintln!("curia: colour of {name}: {e}"),
+                }
+                Got::PersonaDone { name, result: r }
+            }
+            Want::RemovePersona { name, activation } => {
+                let r = done(ask(&Request::RemovePersona { name: name.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: persona {name} removed"),
+                    Err(e) => eprintln!("curia: remove persona {name}: {e}"),
+                }
+                Got::PersonaDone { name, result: r }
             }
             Want::SetLink { scheme, app, activation } => {
                 let r = done(ask(&Request::SetLinkDefault { scheme: scheme.clone(), app: app.clone(), activation }));
@@ -489,7 +513,7 @@ fn main() {
     let (atx, arx) = channel();
     let apps_refreshing = Arc::new(AtomicBool::new(false));
     let mut next_apps = Instant::now();
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -641,10 +665,11 @@ fn main() {
                 a.apply(g);
                 ach = true;
             }
-            if which.get() == curia::view::Which::Apps && Instant::now() >= next_apps {
+            let shown = matches!(which.get(), curia::view::Which::Apps | curia::view::Which::Personas);
+            if shown && Instant::now() >= next_apps {
                 next_apps = Instant::now() + Duration::from_secs(10);
                 a.refresh();
-            } else if which.get() != curia::view::Which::Apps {
+            } else if !shown {
                 // Shown again: asked at once.
                 next_apps = Instant::now();
             }

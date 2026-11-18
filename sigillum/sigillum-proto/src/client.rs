@@ -73,6 +73,9 @@ pub enum Purpose {
     /// that lets `kind` (`links`, `files`, `clipboard`) cross from persona
     /// `from` to `to` (`personal` for Personal).
     Crossing { from: String, to: String, kind: String },
+    /// portcullisd only (personas.md §4.1): Settings' Remove on persona
+    /// `name`, which deletes that persona's app data for good.
+    RemovePersona { name: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

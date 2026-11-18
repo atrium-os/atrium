@@ -493,13 +493,19 @@ impl Broker {
                 if matches!(v.purpose, Purpose::ArcaItem { .. }) && *label != Label::Arca {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
-                // portcullisd asks only for a crossing switch, and only it does.
-                if matches!(v.purpose, Purpose::Crossing { .. }) != (*label == Label::Portcullis) {
+                // portcullisd asks only for a crossing switch or removing a
+                // persona, and only it does.
+                if matches!(v.purpose, Purpose::Crossing { .. } | Purpose::RemovePersona { .. }) != (*label == Label::Portcullis) {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
+                let name = |s: &str| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
                 if let Purpose::Crossing { from, to, kind } = &v.purpose {
-                    let name = |s: &str| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
                     if !name(from) || !name(to) || !matches!(kind.as_str(), "links" | "files" | "clipboard") {
+                        return vec![refused(conn, id, Refusal::Malformed)];
+                    }
+                }
+                if let Purpose::RemovePersona { name: p } = &v.purpose {
+                    if !name(p) || p == "personal" {
                         return vec![refused(conn, id, Refusal::Malformed)];
                     }
                 }

@@ -3163,3 +3163,37 @@ mod tests {
         assert_eq!(decode::<WmEnumerateReply>(&encode(&en).unwrap()).unwrap(), en);
     }
 }
+
+/// Persona colours (personas.md §7): the chip, frame and badges frescod,
+/// forum-wm and Forum draw for a named persona. The names are
+/// portcullis-policy's `PERSONA_COLOURS`; the persona comes from the launch
+/// registry by the client's uid, never from the app.
+pub mod persona {
+    /// sRGB for each persona colour, chosen far apart and readable as a
+    /// 3 px frame on light and dark windows.
+    pub const COLOURS: &[(&str, [u8; 3])] = &[
+        ("blue", [0x25, 0x63, 0xeb]),
+        ("green", [0x16, 0xa3, 0x4a]),
+        ("orange", [0xea, 0x58, 0x0c]),
+        ("purple", [0x93, 0x33, 0xea]),
+        ("red", [0xdc, 0x26, 0x26]),
+        ("teal", [0x0d, 0x94, 0x88]),
+        ("pink", [0xdb, 0x27, 0x77]),
+        ("yellow", [0xca, 0x8a, 0x04]),
+    ];
+
+    /// The colour named `name`, if it is one.
+    pub fn rgb(name: &str) -> Option<[u8; 3]> {
+        COLOURS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+    }
+
+    /// How a persona is written for people: `personal` is "Personal",
+    /// a named one gets a capital first letter ("work" → "Work").
+    pub fn label(name: &str) -> String {
+        let mut c = name.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().chain(c).collect(),
+            None => String::new(),
+        }
+    }
+}

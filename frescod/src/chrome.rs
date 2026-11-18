@@ -184,6 +184,14 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn build(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, note: Option<&str>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)], islands: &[Island]) -> WindowFrame {
+    build_with(px, screen_w, focus, origin, note, shown, slots, covers, hosted, islands, None)
+}
+
+/// [`build`] with the persona chip (personas.md §7): the focused window's
+/// persona and its colour, at the strip's left end before the origin.
+/// `None`: no named persona is in use, so no chip.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, note: Option<&str>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)], islands: &[Island], chip: Option<(&str, [u8; 3])>) -> WindowFrame {
     let sw = screen_w as i32;
     let strip = px.strip();
     let ring = px.p(RING);
@@ -218,10 +226,21 @@ pub fn build(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> 
             }
             bottom = bottom.max(y1);
         }
+        // The persona chip: a pill in the persona's colour with its name.
+        let mut left = 0;
+        if let Some((name, colour)) = chip {
+            let h = strip - 2 * px.p(3);
+            let w = text_width(px, name) + px.p(4 * PAD);
+            let mut pill = rect(px.p(PAD), px.p(3), w, h, rgb(colour));
+            pill.radius = h as f32 / 2.0;
+            rects.push(pill);
+            text(&mut rects, px, name, px.p(3 * PAD), (strip - line(px)) / 2, w);
+            left = w + px.p(PAD);
+        }
         if let Some(o) = origin(f).filter(|o| !o.is_empty()) {
-            rects.push(rect(px.p(PAD), px.p(3), ring, strip - 2 * px.p(3), RING_COLOR)); // ties the text to the ring
+            rects.push(rect(left + px.p(PAD), px.p(3), ring, strip - 2 * px.p(3), RING_COLOR)); // ties the text to the ring
             let room = note.map_or(0, |n| text_width(px, n) + px.p(6 * PAD));
-            text(&mut rects, px, &o, px.p(3 * PAD), (strip - line(px)) / 2, sw - px.p(4 * PAD) - room);
+            text(&mut rects, px, &o, left + px.p(3 * PAD), (strip - line(px)) / 2, sw - left - px.p(4 * PAD) - room);
         }
         // A note over the focused window (`activation::Notes`, frescod's
         // words), at the strip's right end in the warning colour.
@@ -330,24 +349,28 @@ fn island_frame(out: &mut Vec<SceneNode>, px: Px, i: &Island, top: i32) -> i32 {
 /// registry's id for `uid` (`uid-N` when it has none), in the characters
 /// the chrome font draws. The registry is read again every few seconds.
 pub fn app_label(uid: u32) -> String {
+    let id = with_registry(uid, |r| r.resolve(uid).map(|(_, app)| app.to_ascii_lowercase()));
+    match id {
+        Some(a) => a.bytes().filter(|&c| fresco_split::chrome::origin_char(c)).map(char::from).collect(),
+        None => format!("uid-{uid}"),
+    }
+}
+
+/// `f` on the launch registry, read again every 5 s, and sooner (at most
+/// every 200 ms) for a uid it doesn't know: a window composed once, just
+/// after its app was registered, must not keep the stale answer.
+fn with_registry<T>(uid: u32, f: impl FnOnce(&portcullis_peer::AppRegistry) -> Option<T>) -> Option<T> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     static REG: Mutex<Option<(Instant, portcullis_peer::AppRegistry)>> = Mutex::new(None);
     let mut g = REG.lock().unwrap();
-    /* Read again every 5 s, and sooner (at most every 200 ms) for a uid it
-     * doesn't know: a window composed once, just after its app was
-     * registered, must not keep the stale answer. */
     let stale = g.as_ref().is_none_or(|(at, r)| at.elapsed() > Duration::from_secs(5)
         || (r.resolve(uid).is_none() && at.elapsed() > Duration::from_millis(200)));
     if stale {
         let path = std::env::var("FRESCOD_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
         *g = Some((Instant::now(), portcullis_peer::AppRegistry::load(&path).unwrap_or_default()));
     }
-    let id = g.as_ref().and_then(|(_, r)| r.resolve(uid)).map(|(_, app)| app.to_ascii_lowercase());
-    match id {
-        Some(a) => a.bytes().filter(|&c| fresco_split::chrome::origin_char(c)).map(char::from).collect(),
-        None => format!("uid-{uid}"),
-    }
+    f(&g.as_ref()?.1)
 }
 
 /// The parts of `r` (`[x0, y0, x1, y1]`) outside every rect of `covers`.
@@ -406,12 +429,18 @@ pub struct Sheet {
     /// Not a sheet: a window of a dev build (homes.md §5.3, W5), framed
     /// the same way in amber so it is never taken for the real app.
     pub dev: bool,
+    /// Not a sheet: a window of a named persona (personas.md §7), framed
+    /// in that persona's colour and tagged with its name (`app` holds the
+    /// name). No app draws it: the persona is the launch registry's.
+    pub persona: Option<[u8; 3]>,
 }
 
 impl Sheet {
     /// What its tag says, in the characters the chrome font draws.
     pub fn tag(&self) -> String {
-        if self.dev {
+        if self.persona.is_some() {
+            self.app.clone()
+        } else if self.dev {
             // dev.<person>.<workspace>.<id>
             let rest = self.app.strip_prefix("dev.").unwrap_or(&self.app);
             match rest.splitn(3, '.').collect::<Vec<_>>()[..] {
@@ -424,8 +453,65 @@ impl Sheet {
     }
 
     fn color(&self) -> [f32; 4] {
-        if self.dev { ISLAND_COLOR } else { SHEET_COLOR }
+        match self.persona {
+            Some(c) => rgb(c),
+            None if self.dev => ISLAND_COLOR,
+            None => SHEET_COLOR,
+        }
     }
+
+    /// Its frame's width in points: a persona's is 3 (personas.md §7).
+    fn ring_pt(&self) -> i32 {
+        if self.persona.is_some() { PERSONA_RING } else { RING }
+    }
+}
+
+/// A persona frame's width, points.
+const PERSONA_RING: i32 = 3;
+
+/// An sRGB colour as the renderer takes it: linear light (it encodes to
+/// sRGB on output), so `#2563eb` shows as `#2563eb`.
+fn rgb([r, g, b]: [u8; 3]) -> [f32; 4] {
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    [lin(r), lin(g), lin(b), 1.0]
+}
+
+/// The colour frescod draws a persona in when its own colour isn't known
+/// (the colours file is missing): still framed, in grey.
+const PERSONA_UNKNOWN: [u8; 3] = [0x9c, 0xa3, 0xaf];
+
+/// The named persona `uid` runs in, from the launch registry, and its
+/// colour from portcullisd's colours file (personas.md §7): `None` for
+/// Personal and for a uid the registry doesn't know.
+pub fn persona_of(uid: u32) -> Option<(String, [u8; 3])> {
+    let (user, name) = with_registry(uid, |r| {
+        let p = r.persona(uid)??.to_string();
+        Some((r.resolve(uid)?.0.to_string(), p))
+    })?;
+    let colour = persona_colour(&user, &name).unwrap_or(PERSONA_UNKNOWN);
+    Some((name, colour))
+}
+
+/// The colour of `user`'s persona `name`, from the file portcullisd keeps
+/// (`/var/run/atrium/persona-colours`, `<user> <persona> <colour>` lines;
+/// `FRESCOD_PERSONA_COLOURS` overrides), read again every 2 s.
+fn persona_colour(user: &str, name: &str) -> Option<[u8; 3]> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static FILE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    let mut g = FILE.lock().unwrap();
+    if g.as_ref().is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(2)) {
+        let path = std::env::var("FRESCOD_PERSONA_COLOURS").unwrap_or_else(|_| "/var/run/atrium/persona-colours".into());
+        *g = Some((Instant::now(), std::fs::read_to_string(path).unwrap_or_default()));
+    }
+    let text = &g.as_ref()?.1;
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(' ').collect();
+        (f.len() == 3 && f[0] == user && f[1] == name).then(|| fresco_protocol::persona::rgb(f[2])).flatten()
+    })
 }
 
 /// A sheet's frame: the focus ring's blue, which no window may draw over.
@@ -458,8 +544,9 @@ pub fn dim_id(sheet: u32) -> u32 {
 /// `top`), added to the chrome layer `c`.
 pub fn sheet_frames(c: &mut WindowFrame, px: Px, sheets: &[Sheet], top: i32) {
     let (mut right, mut bottom) = (c.size.0 as i32, c.size.1 as i32);
-    let (ring, label_h) = (px.p(RING), px.p(LABEL_H));
+    let label_h = px.p(LABEL_H);
     for sh in sheets {
+        let ring = px.p(sh.ring_pt());
         let [x0, y0, x1, y1] = sh.rect;
         let (w, h) = (x1 - x0, y1 - y0);
         let col = sh.color();
@@ -487,7 +574,7 @@ mod tests {
 
     #[test]
     fn a_dev_build_is_tagged_with_its_workspace() {
-        let d = Sheet { rect: [0, 40, 100, 100], app: "dev.alice.scratch.org.example.hello".into(), dev: true };
+        let d = Sheet { rect: [0, 40, 100, 100], app: "dev.alice.scratch.org.example.hello".into(), dev: true, persona: None };
         assert_eq!(d.tag(), "dev build: org.example.hello from scratch");
         assert_eq!(d.color(), ISLAND_COLOR);
     }
@@ -610,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_sheet_is_framed_and_tagged_above_and_its_parent_dimmed() {
-        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false };
+        let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false, persona: None };
         assert_eq!(sh.tag(), "system: org.atrium.scrinium");
         let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
         let before = c.rects.len();
@@ -632,5 +719,31 @@ mod tests {
         assert_eq!((d.pos, d.size), ((0.0, 24.0), (760, 540)));
         assert!(d.rects[0].color[3] > 0.0 && d.rects[0].color[3] < 1.0, "see-through");
         assert!(dim_id(1) > u16::MAX as u32 && dim_id(1) != CHROME_ID, "never a window's id, nor the chrome's");
+    }
+
+    #[test]
+    fn a_persona_window_is_framed_in_its_colour_and_the_strip_names_it() {
+        let blue = [0x25, 0x63, 0xeb];
+        let w = Sheet { rect: [100, 200, 700, 600], app: "work".into(), dev: false, persona: Some(blue) };
+        assert_eq!(w.tag(), "work");
+        let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
+        let before = c.rects.len();
+        sheet_frames(&mut c, Px::ONE, &[w], 24);
+        let sides: Vec<_> = c.rects[before..].iter().filter(|n| n.color == rgb(blue) && n.radius == 0.0).collect();
+        assert_eq!(sides.len(), 4);
+        assert!(sides.iter().any(|n| n.size[1] as i32 == PERSONA_RING), "3 pt wide");
+        assert!(sides.iter().all(|n| {
+            let (x0, y0, x1, y1) = (n.position[0] as i32, n.position[1] as i32, (n.position[0] + n.size[0]) as i32, (n.position[1] + n.size[1]) as i32);
+            x1 <= 100 || x0 >= 700 || y1 <= 200 || y0 >= 600
+        }), "outside the window");
+        // The chip: a pill in the strip, in the colour, before the origin.
+        let shown = [(5u32, [100, 200, 700, 600])];
+        let f = build_with(Px::ONE, 1280, Some(5), |_| Some("mail.example".into()), None, &shown, &[], &[], &[], &[], Some(("work", blue)));
+        let pill = f.rects.iter().find(|n| n.color == rgb(blue) && n.radius > 0.0).expect("a chip");
+        assert!((pill.position[1] + pill.size[1]) as i32 <= Px::ONE.strip(), "in the strip");
+        let tie = f.rects.iter().find(|n| n.color == RING_COLOR && n.position[1] as i32 == 3 && n.size[0] as i32 == RING).expect("the origin's tie");
+        assert!(tie.position[0] > pill.position[0] + pill.size[0], "origin after the chip");
+        let none = build(Px::ONE, 1280, Some(5), |_| Some("mail.example".into()), None, &shown, &[], &[], &[], &[]);
+        assert!(!none.rects.iter().any(|n| n.color == rgb(blue)));
     }
 }

@@ -182,27 +182,52 @@ case "$R" in *"not a launched app"*) ok "root turning a switch: refused" ;; *) b
 L=$(V "grep 'crossings -> $CURIA' $LOG | tail -1")
 case "$L" in *"for alice: 1 persona(s), 0 switch(es) on"*) ok "Curia's Between personas section: Work, all off" ;; *) bad "crossings: $L" ;; esac
 press ${LX:-400} ${LY:-356}                      # close the mailto row
+press 70 301                                     # the Personas page
 shot persona-0
-press ${CX:-880} ${CY:-488}                      # Turn on: Personal may send links to Work
+press ${CX:-880} ${CY:-484}                      # Turn on: Personal may send links to Work
 i=0; while [ $i -lt 30 ] && [ "$(count "switch for links from personal to work is now on")" = 0 ]; do sleep 2; i=$((i+2)); done
 V "grep -q 'verify alice for Crossing { from: \"personal\", to: \"work\", kind: \"links\" }: confirmed' $B/sigillum.log" && ok "Sigillum asked to confirm it's alice" || bad "no verify: $(V "cat $B/sigillum.log")"
 [ "$(count "switch for links from personal to work is now on (from $CURIA, verified)")" = 1 ] && ok "confirmed: the switch is on" || bad "not on: $(V "grep -i 'crossing\|switch\|REFUSED' $LOG | tail -3")"
 V "grep -A3 '^\[\[crossings\]\]' $POL | grep -q links" && ok "written to her policy" || bad "policy: $(V "cat $POL")"
 shot persona-1
 V "touch $B/sigillum.sock.refuse"
-press ${CX:-880} ${KY:-528}                      # Turn on: clipboard, refused this time
+press ${CX:-880} ${KY:-524}                      # Turn on: clipboard, refused this time
 i=0; while [ $i -lt 30 ] && ! V "grep -q 'kind: \"clipboard\" }: refused' $B/sigillum.log"; do sleep 2; i=$((i+2)); done
 sleep 3
 [ "$(count "for clipboard from personal to work is now on")" = 0 ] && ok "not confirmed: the clipboard switch stays off" || bad "clipboard on without confirming"
 V "grep -q clipboard $POL" && bad "clipboard in her policy" || ok "nothing written for it"
 shot persona-2
 V "rm -f $B/sigillum.sock.refuse"
-press ${CX:-880} ${CY:-488}                      # Turn off: links
+press ${CX:-880} ${CY:-484}                      # Turn off: links
 i=0; while [ $i -lt 30 ] && [ "$(count "from personal to work is now off")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "switch for links from personal to work is now off")" = 1 ] && ok "Turn off: off, with no confirming" || bad "not off: $(V "grep -i 'switch\|REFUSED' $LOG | tail -3")"
 [ "$(V "grep -c 'kind: \"links\"' $B/sigillum.log" | tr -d ' ')" = 1 ] && ok "Sigillum was asked once for links" || bad "sigillum: $(V "cat $B/sigillum.log")"
 V "grep -q links $POL" && bad "still in her policy: $(V "cat $POL")" || ok "not in her policy"
 shot persona-3
+
+echo "=== Personas: colour, add, remove"
+key() { for k in "$@"; do inj "KEY $k 1" "KEY $k 0"; done; sleep 2; }
+press ${GX:-372} ${GY:-220}                      # Work's colour: green
+i=0; while [ $i -lt 20 ] && [ "$(count "persona work is now Some(\"green\")")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "persona work is now Some(\"green\")")" = 1 ] && ok "Work is green now" || bad "colour: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
+V "grep -A1 '^\[personas.work\]' $POL | grep -q green" && ok "in her policy" || bad "policy: $(V "cat $POL")"
+press ${FX:-300} ${FY:-326}                      # the name field
+key 0x16 0x06 0x0b 0x12 0x12 0x0f                # "school"
+press ${AX2:-484} ${AY2:-325}                    # Add
+i=0; while [ $i -lt 20 ] && [ "$(count "persona school is now")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "persona school is now Some(\"blue\")")" = 1 ] && ok "School added, in the first free colour" || bad "add: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
+shot persona-4
+V "mkdir -p /home/alice/.atrium/apps/org.test.new@work/var && touch /home/alice/.atrium/apps/org.test.new@work/var/data /home/alice/.atrium/apps/org.test.new@school"
+press ${CX:-880} ${RY:-288}                      # Work's Remove…
+shot persona-5
+press ${DX:-330} ${DY:-379}                      # Remove Work
+i=0; while [ $i -lt 30 ] && [ "$(count "removed persona work")" = 0 ]; do sleep 2; i=$((i+2)); done
+V "grep -q 'verify alice for RemovePersona { name: \"work\" }: confirmed' $B/sigillum.log" && ok "Sigillum asked to confirm it's alice" || bad "no verify: $(V "tail -3 $B/sigillum.log")"
+[ "$(count "removed persona work (from $CURIA, verified): ")" = 1 ] && ok "Work removed, its app folder deleted" || bad "remove: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
+V "test -e /home/alice/.atrium/apps/org.test.new@work" && bad "Work's folder is still there" || ok "Work's folder is gone"
+V "test -e /home/alice/.atrium/apps/org.test.new@school" && ok "School's is kept" || bad "School's folder went too"
+V "grep -q 'personas.work' $POL" && bad "Work still in her policy" || ok "Work out of her policy"
+shot persona-6
 
 V "pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
 # Its own test apps go (they take mailto:, which other gates count on).

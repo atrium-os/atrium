@@ -149,26 +149,31 @@ pub struct WorkerRule {
     pub concurrent: Option<usize>,
 }
 
+/// [`Policy::check_personas`] on a persona map.
+pub fn check_persona_map(personas: &BTreeMap<String, PersonaDef>) -> Result<(), PersonaError> {
+    if personas.len() > MAX_PERSONAS {
+        return Err(PersonaError::TooMany);
+    }
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for (name, def) in personas {
+        if !portcullis_peer::valid_persona(name) {
+            return Err(PersonaError::BadName(name.clone()));
+        }
+        if !PERSONA_COLOURS.contains(&def.colour.as_str()) {
+            return Err(PersonaError::BadColour(def.colour.clone()));
+        }
+        if let Some(other) = seen.insert(def.colour.as_str(), name.as_str()) {
+            return Err(PersonaError::SameColour(other.to_string(), name.clone()));
+        }
+    }
+    Ok(())
+}
+
 impl Policy {
     /// Check the persona list: valid names, colours from the set, no two
     /// personas sharing a colour, at most [`MAX_PERSONAS`].
     pub fn check_personas(&self) -> Result<(), PersonaError> {
-        if self.personas.len() > MAX_PERSONAS {
-            return Err(PersonaError::TooMany);
-        }
-        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
-        for (name, def) in &self.personas {
-            if !portcullis_peer::valid_persona(name) {
-                return Err(PersonaError::BadName(name.clone()));
-            }
-            if !PERSONA_COLOURS.contains(&def.colour.as_str()) {
-                return Err(PersonaError::BadColour(def.colour.clone()));
-            }
-            if let Some(other) = seen.insert(def.colour.as_str(), name.as_str()) {
-                return Err(PersonaError::SameColour(other.to_string(), name.clone()));
-            }
-        }
-        Ok(())
+        check_persona_map(&self.personas)
     }
 
     /// Whether `kind` may cross from persona `from` to `to` (`None`:
@@ -219,6 +224,46 @@ impl Policy {
             }
             (false, true, None) => unreachable!(),
         }
+    }
+
+    /// Add persona `name` in `colour` (Settings' Add, personas.md §2): the
+    /// list must stay valid (a good name, a colour no other persona has, at
+    /// most [`MAX_PERSONAS`]).
+    pub fn add_persona(&mut self, name: &str, colour: &str) -> Result<(), String> {
+        self.check_personas().map_err(|e| format!("your personas need fixing first: {e}"))?;
+        if self.personas.contains_key(name) {
+            return Err(format!("you have a persona {name:?} already"));
+        }
+        let mut next = self.personas.clone();
+        next.insert(name.into(), PersonaDef { colour: colour.into(), vpn: None });
+        check_persona_map(&next).map_err(|e| e.to_string())?;
+        self.personas = next;
+        Ok(())
+    }
+
+    /// Give persona `name` another colour; `Ok(false)`: it had that one.
+    pub fn set_persona_colour(&mut self, name: &str, colour: &str) -> Result<bool, String> {
+        let Some(old) = self.personas.get(name).map(|d| d.colour.clone()) else {
+            return Err(format!("{name}: not one of your personas"));
+        };
+        if old == colour {
+            return Ok(false);
+        }
+        let mut next = self.personas.clone();
+        next.get_mut(name).unwrap().colour = colour.into();
+        check_persona_map(&next).map_err(|e| e.to_string())?;
+        self.personas = next;
+        Ok(true)
+    }
+
+    /// Take persona `name` out, and every crossing switch naming it.
+    /// Personal can't be removed.
+    pub fn remove_persona(&mut self, name: &str) -> Result<(), String> {
+        if self.personas.remove(name).is_none() {
+            return Err(format!("{name}: not one of your personas"));
+        }
+        self.crossings.retain(|c| c.from != name && c.to != name);
+        Ok(())
     }
 
     /// Whether `persona` may be launched in: `None` (Personal) always; a
@@ -798,6 +843,32 @@ pub fn decide(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn personas_are_added_recoloured_and_removed() {
+        let mut p = Policy::default();
+        p.add_persona("work", "blue").unwrap();
+        assert!(p.add_persona("work", "green").unwrap_err().contains("already"));
+        assert!(p.add_persona("school", "blue").is_err(), "same colour");
+        assert!(p.add_persona("personal", "green").is_err());
+        assert!(p.add_persona("Work2", "green").is_err());
+        assert!(p.add_persona("school", "mauve").is_err());
+        p.add_persona("school", "green").unwrap();
+        assert_eq!(p.set_persona_colour("work", "blue"), Ok(false));
+        assert!(p.set_persona_colour("work", "green").is_err(), "school's");
+        assert_eq!(p.set_persona_colour("work", "teal"), Ok(true));
+        p.set_crossing("work", PERSONAL, "links", true).unwrap();
+        p.set_crossing("school", PERSONAL, "links", true).unwrap();
+        p.remove_persona("work").unwrap();
+        assert!(!p.has_persona(Some("work")));
+        assert_eq!(p.crossings.len(), 1, "work's switches went with it");
+        assert!(p.remove_persona("work").is_err());
+        assert!(p.remove_persona(PERSONAL).is_err());
+        for i in 0..7 {
+            p.add_persona(&format!("p{i}"), PERSONA_COLOURS.iter().find(|c| p.personas.values().all(|d| &d.colour != *c)).unwrap()).unwrap();
+        }
+        assert!(p.add_persona("more", "blue").is_err(), "eight at most");
+    }
+
     #[test]
     fn personas_are_checked() {
         let mut p: Policy = toml::from_str(r#"

@@ -13,7 +13,7 @@
 //! Usage:
 //!   forum-dock              # the dock
 //!   forum-dock list         # list installed apps
-//!   forum-dock launch <id>  # ask the TCB to launch app <id>
+//!   forum-dock launch <id> [--persona <name> | --ask]  # ask the TCB to launch app <id>
 //!
 //! Apps dir: FORUM_APPS_DIR (default /var/lib/atrium/apps). Pins: §6.1.
 
@@ -30,6 +30,7 @@ use forum_dock::apps::{self, Move};
 use forum_dock::apps_view::{self, Action, AppsState, AppsView, Note};
 use forum_dock::dock_view::{reserve_pt, DockAction, DockState, DockView};
 use forum_dock::launch::{self, PreLaunch};
+use forum_dock::persona_view::{self, Answer, PersonaView, Question};
 use forum_dock::pins::{self, Pins};
 use forum_dock::{AppEntry, APPS_DIR};
 
@@ -117,7 +118,18 @@ fn start_launch(id: String, name: String, to_apps: Sender<ToApps>) {
     std::thread::spawn(move || {
         // The app gets the dock's stdio: the session's log.
         let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
-        match launch::request(&id, stdio) {
+        let persona = match choose_persona(&id, &name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                let _ = to_apps.send(ToApps::Launched(Report::Done(id)));
+                return;
+            }
+            Err(e) => {
+                let _ = to_apps.send(ToApps::Launched(Report::Note(id, format!("{name} could not ask which persona: {e}"))));
+                return;
+            }
+        };
+        match launch::request_in(&id, persona.as_deref(), stdio) {
             PreLaunch::Started(run) => {
                 eprintln!("forum-dock: launched '{id}'");
                 let _ = to_apps.send(ToApps::Launched(Report::Done(id.clone())));
@@ -146,6 +158,97 @@ fn start_launch(id: String, name: String, to_apps: Sender<ToApps>) {
             }
         }
     });
+}
+
+/// Which persona to open `id` in (personas.md §3), asked only when there is
+/// a choice: `Ok(Some(None))` Personal or nothing to ask, `Ok(None)` the
+/// person said no.
+fn choose_persona(id: &str, name: &str) -> Result<Option<Option<String>>, String> {
+    let (list, last, spans) = match launch::personas(id) {
+        Ok(v) => v,
+        // An older portcullisd, or none: the launch says what's wrong.
+        Err(e) => {
+            eprintln!("forum-dock: no persona list for '{id}' ({e}); Personal");
+            return Ok(Some(None));
+        }
+    };
+    let Some(q) = Question::new(name, list, last.as_deref(), spans) else { return Ok(Some(None)) };
+    match ask_persona(q) {
+        Ok(Answer::In(p)) => {
+            eprintln!("forum-dock: '{id}' in persona {p}");
+            Ok(Some(Some(p)))
+        }
+        Ok(Answer::Cancel) => {
+            eprintln!("forum-dock: '{id}': no persona chosen, not opened");
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("forum-dock: '{id}': the persona question failed: {e}");
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Ask which persona, in a small dialog of its own, until answered. Losing
+/// focus is no. `FORUM_DOCK_PERSONA_AUTO=<name>` answers it once drawn (for
+/// checks without a person).
+fn ask_persona(q: Question) -> io::Result<Answer> {
+    let (w, h) = persona_view::size(q.personas.len());
+    let mut desc = WindowDesc::new(q.title(), SizeSpec::Fixed(w.ceil() as u32, h.ceil() as u32));
+    desc.hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), ..Default::default() };
+    let mut win = Window::open(&desc)?;
+    let names: Vec<&str> = q.personas.iter().map(|p| p.name.as_str()).collect();
+    eprintln!("forum-dock: persona question for {}: [{}], {} preselected, {:.0}x{:.0} pt", q.app_name, names.join(", "), q.personas[q.selected].name, w, h);
+    let auto = std::env::var("FORUM_DOCK_PERSONA_AUTO").ok();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let qm = Mutable::with_dirty(q, dirty.clone());
+    let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
+    let picks: std::rc::Rc<std::cell::RefCell<Vec<usize>>> = Default::default();
+    let mut app = App::new_with_flag(PersonaView { q: qm.clone(), size: size.clone(), picks: picks.clone() }, dirty);
+    win.paint(&mut app)?;
+    if let Some(a) = auto {
+        let mut q = qm.get_cloned();
+        if let Some(i) = q.personas.iter().position(|p| p.name == a) {
+            q.pick(i);
+            qm.set(q);
+        }
+    }
+    let mut had_focus = false;
+    loop {
+        if let Some(a) = qm.get_cloned().answer {
+            return Ok(a);
+        }
+        let ev = match win.step(&mut app, Some(Duration::from_millis(100)))? {
+            StepResult::Closed => return Ok(Answer::Cancel),
+            StepResult::Event(ev) => Some(ev),
+            StepResult::Timeout => None,
+        };
+        if size.get() != (win.width, win.height) {
+            size.set((win.width, win.height));
+        }
+        use fresco_client::Event as E;
+        match ev {
+            Some(E::Key { hid_usage, pressed: true, modifiers, .. }) if modifiers & 0x88 == 0 => {
+                let mut q = qm.get_cloned();
+                q.key(hid_usage);
+                qm.set(q);
+            }
+            Some(E::FocusChanged { window_id, gained, .. }) if window_id == win.id() => {
+                if gained {
+                    had_focus = true;
+                } else if had_focus {
+                    return Ok(Answer::Cancel);
+                }
+            }
+            _ => {}
+        }
+        for i in std::mem::take(&mut *picks.borrow_mut()) {
+            let mut q = qm.get_cloned();
+            q.pick(i);
+            qm.set(q);
+        }
+        win.paint(&mut app)?;
+    }
 }
 
 fn name_of(shared: &SharedRef, id: &str) -> String {
@@ -602,11 +705,32 @@ fn main() -> io::Result<()> {
         }
         Some("launch") => {
             let Some(id) = args.get(1) else {
-                eprintln!("usage: forum-dock launch <app-id>");
+                eprintln!("usage: forum-dock launch <app-id> [--persona <name> | --ask]");
                 std::process::exit(2);
             };
+            let asked;
+            let persona = match (args.get(2).map(String::as_str), args.get(3)) {
+                (Some("--persona"), Some(p)) => Some(p.as_str()),
+                // As the dock would: ask which persona when there's a choice.
+                (Some("--ask"), None) => match choose_persona(id, id) {
+                    Ok(Some(p)) => {
+                        asked = p;
+                        asked.as_deref()
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        eprintln!("forum-dock: {e}");
+                        std::process::exit(1);
+                    }
+                },
+                (None, _) => None,
+                _ => {
+                    eprintln!("usage: forum-dock launch <app-id> [--persona <name> | --ask]");
+                    std::process::exit(2);
+                }
+            };
             let stdio = [io::stdin().as_raw_fd(), io::stdout().as_raw_fd(), io::stderr().as_raw_fd()];
-            match launch::request(id, stdio) {
+            match launch::request_in(id, persona, stdio) {
                 PreLaunch::Started(run) => match run.wait() {
                     Ok(code) => {
                         println!("forum-dock: '{id}' exited (code {code:?})");

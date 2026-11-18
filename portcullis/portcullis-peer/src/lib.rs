@@ -246,6 +246,15 @@ impl AppRegistry {
             .map(|(uid, _)| *uid)
     }
 
+    /// Every uid of `user`'s persona `persona` (its app instances and
+    /// workers), with the app each is for.
+    pub fn persona_uids(&self, user: &str, persona: &str) -> Vec<(u32, &str)> {
+        self.map.iter()
+            .filter(|(_, e)| !e.session && e.user == user && e.persona.as_deref() == Some(persona))
+            .map(|(uid, e)| (*uid, e.app_id.as_str()))
+            .collect()
+    }
+
     /// Whether `uid` is a declared session component portcullisd launched
     /// (see [`register_session`]).
     pub fn is_session(&self, uid: u32) -> bool {

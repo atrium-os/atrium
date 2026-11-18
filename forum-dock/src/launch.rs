@@ -47,6 +47,13 @@ impl Started {
 /// Mirrors the portcullis CLI's wire dance: Hello → Launch → ReadyForFds →
 /// stdio over SCM_RIGHTS; the exit comes later ([`Started::wait`]).
 pub fn request(app_id: &str, stdio: [RawFd; 3]) -> PreLaunch {
+    request_in(app_id, None, stdio)
+}
+
+/// [`request`] in `persona` (personas.md §3): `None` or `personal` is
+/// Personal.
+pub fn request_in(app_id: &str, persona: Option<&str>, stdio: [RawFd; 3]) -> PreLaunch {
+    let persona = persona.filter(|p| *p != "personal").map(String::from);
     // Resolve the daemon's socket rather than hardcoding the flat path: inside a
     // jail only the per-service directory is mounted (by `app-launch`).
     let Some(path) = portcullis_ipc::resolve_socket_path() else {
@@ -68,7 +75,7 @@ pub fn request(app_id: &str, stdio: [RawFd; 3]) -> PreLaunch {
         Ok(other) => return PreLaunch::Failed(format!("unexpected handshake reply: {other:?}")),
         Err(e) => return PreLaunch::Failed(format!("handshake: {e}")),
     }
-    if let Err(e) = write_request(&mut s, &Request::Launch { app_id: app_id.into(), bypass_policy: false, persona: None }) {
+    if let Err(e) = write_request(&mut s, &Request::Launch { app_id: app_id.into(), bypass_policy: false, persona }) {
         return PreLaunch::Failed(format!("send: {e}"));
     }
     match read_response(&mut s) {
@@ -161,6 +168,17 @@ fn portcullisd() -> Result<UnixStream, String> {
     match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
         Ok(Response::Hello { version }) if version == PROTO_VERSION => Ok(s),
         other => Err(format!("handshake: {other:?}")),
+    }
+}
+
+/// The launch question's list for `app_id` (personas.md §3): personas,
+/// Personal first, the one it last ran in, and whether it spans personas.
+pub fn personas(app_id: &str) -> Result<(Vec<portcullis_ipc::PersonaOption>, Option<String>, bool), String> {
+    let mut s = portcullisd()?;
+    match round_trip(&mut s, &Request::PersonaList { app_id: Some(app_id.into()) }) {
+        Ok(Response::PersonaList { personas, last, spans }) => Ok((personas, last, spans)),
+        Ok(Response::Error { message }) => Err(message),
+        other => Err(format!("unexpected reply: {other:?}")),
     }
 }
 

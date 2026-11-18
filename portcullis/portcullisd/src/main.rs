@@ -227,11 +227,20 @@ impl Tenants {
         if !self.cache.contains_key(user) {
             let path = Policy::user_path(user);
             let policy = Policy::load(&path)?;
+            publish_colours(user, &policy);
             self.cache.insert(user.to_string(), TenantPolicy {
                 policy, policy_path: path,
             });
         }
         Ok(self.cache.get_mut(user).unwrap())
+    }
+}
+
+/// Tell frescod `user`'s persona colours (personas.md §7).
+fn publish_colours(user: &str, policy: &Policy) {
+    let (named, _) = portcullisd::crossing::listing(policy);
+    if let Err(e) = portcullisd::persona_colours::publish(user, &named) {
+        eprintln!("portcullisd: persona colours for {user} not written: {e}");
     }
 }
 
@@ -681,6 +690,19 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Crossings) {
             let resp = handle_access(uid, req, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        /* ★ Settings' Personas page (personas.md §2, §4.1). */
+        if matches!(req, Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. }) {
+            let resp = handle_persona_change(uid, req, &shared, &portcullisd::crossing::Sigillum::default());
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        /* ★ The launch question (personas.md §3): a launcher, Settings or
+         * the person, about the person the caller runs for. */
+        if let Request::PersonaList { app_id } = req {
+            let resp = handle_persona_list(uid, &owner, app_id.as_deref(), &shared);
             write_response(&mut writer, &resp)?;
             continue;
         }
@@ -1149,6 +1171,7 @@ fn handle_launch(
     if launch::is_single_instance(&app_id) {
         if let Some(jid) = launch::running_jid_instance(&app_id, persona) {
             let uid = launch::instance_uid(user, &app_id, persona).unwrap_or(0);
+            remember_persona(user, &app_id, persona, shared);
             eprintln!("portcullisd: {app_id} already running (jid {jid}, uid {uid}) \
                        — refusing a second instance");
             return write_response(writer, &Response::AlreadyRunning {
@@ -1214,6 +1237,7 @@ fn handle_launch(
     }
 
     /* 2. ReadyForFds round-trip. */
+    remember_persona(user, &app_id, persona, shared);
     write_response(writer, &Response::ReadyForFds)?;
 
     /* 3. recv_fds. */
@@ -1800,6 +1824,149 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
     }
 }
 
+/// Settings adds, recolours or removes a persona (personas.md §2, §4.1):
+/// `app-grants` by peer uid, about the person the app runs for, with a press
+/// portcullisd spends (APPROVE). Removing also asks the person on
+/// Sigillum's sheet, with no lock held, and is refused while any of the
+/// persona's apps runs: their data is about to go.
+fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify: &dyn portcullisd::crossing::Verify) -> Response {
+    use portcullisd::opens;
+    let refuse = |why: String| {
+        eprintln!("portcullisd: persona change REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let Some((owner, caller)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+        return refuse("cap.app_grants.denied: caller is not a launched app".into());
+    };
+    if !launch::app_manages_grants(&caller) {
+        return refuse(format!("cap.app_grants.denied: {caller} may not change personas"));
+    }
+    let (name, activation) = match &req {
+        Request::AddPersona { name, activation, .. } | Request::SetPersonaColour { name, activation, .. } | Request::RemovePersona { name, activation } => (name.clone(), *activation),
+        _ => return refuse("not a persona change".into()),
+    };
+    // Checked on a copy before the press is spent: a refusal spends nothing.
+    let check = |p: &mut Policy| -> Result<bool, String> {
+        match &req {
+            Request::AddPersona { name, colour, .. } => p.add_persona(name, colour).map(|_| true),
+            Request::SetPersonaColour { name, colour, .. } => p.set_persona_colour(name, colour),
+            Request::RemovePersona { name, .. } => p.remove_persona(name).map(|_| true),
+            _ => unreachable!(),
+        }
+    };
+    {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let tp = match s.get_or_load(&owner) {
+            Ok(tp) => tp,
+            Err(e) => return refuse(format!("policy for {owner}: {e}")),
+        };
+        let mut copy = Policy::default();
+        copy.personas = tp.policy.personas.clone();
+        copy.crossings = tp.policy.crossings.clone();
+        if let Err(why) = check(&mut copy) {
+            return refuse(why);
+        }
+    }
+    let removing = matches!(req, Request::RemovePersona { .. });
+    if removing {
+        let running = launch::running_in_persona(&owner, &name);
+        if !running.is_empty() {
+            return refuse(format!("{} is still open in {name}: close it first", running.join(", ")));
+        }
+    }
+    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+        return refuse(why);
+    }
+    if removing {
+        eprintln!("portcullisd: {owner} removing persona {name}: asking Sigillum");
+        if let Err(why) = verify.verify(&owner, sigillum_proto::client::Purpose::RemovePersona { name: name.clone() }) {
+            return refuse(why);
+        }
+        // Again: an app may have started while the sheet was up.
+        let running = launch::running_in_persona(&owner, &name);
+        if !running.is_empty() {
+            return refuse(format!("{} opened in {name} meanwhile: close it first; nothing was removed", running.join(", ")));
+        }
+    }
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = match s.get_or_load(&owner) {
+        Ok(tp) => tp,
+        Err(e) => return refuse(format!("policy for {owner}: {e}")),
+    };
+    match check(&mut tp.policy) {
+        Ok(false) => return Response::Ok,
+        Ok(true) => {}
+        Err(why) => return refuse(why),
+    }
+    if let Err(e) = tp.policy.save(&tp.policy_path.clone()) {
+        return refuse(format!("save: {e}"));
+    }
+    publish_colours(&owner, &tp.policy);
+    if removing {
+        let gone = portcullis_overlay::remove_persona_places(&owner, &name);
+        eprintln!("portcullisd: {owner} removed persona {name} (from {caller}, verified): {} app folder(s) deleted", gone.len());
+    } else {
+        eprintln!("portcullisd: {owner}'s persona {name} is now {:?} (from {caller})", tp.policy.personas.get(&name).map(|d| d.colour.as_str()));
+    }
+    Response::Ok
+}
+
+/// The launch question (personas.md §3): the person's personas, Personal
+/// first, and for `app_id` the one last used and whether it spans personas.
+/// Only for a launcher, Settings, or the person's own CLI.
+fn handle_persona_list(uid: u32, owner: &str, app_id: Option<&str>, shared: &Mutex<Tenants>) -> Response {
+    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    let allowed = match &caller {
+        Some(app) => launch::app_may_launch_apps(app) || launch::app_manages_grants(app),
+        None => portcullis_overlay::home_of(owner).is_some() && uid >= 1000,
+    };
+    if !allowed {
+        eprintln!("portcullisd: persona list REFUSED to uid {uid} ({})", caller.as_deref().unwrap_or("?"));
+        return Response::Error { message: format!("cap.app_launch.denied: only a launcher, Settings or the person lists personas (caller {})",
+                                                   caller.as_deref().unwrap_or("unknown")) };
+    }
+    let mut personas = vec![portcullis_ipc::PersonaOption { name: portcullis_policy::PERSONAL.into(), colour: None }];
+    let dir = {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match s.get_or_load(owner) {
+            Ok(tp) => {
+                let (named, _) = portcullisd::crossing::listing(&tp.policy);
+                personas.extend(named.into_iter().map(|(name, colour)| portcullis_ipc::PersonaOption { name, colour: Some(colour) }));
+                tp.policy_path.parent().map(|d| d.to_path_buf())
+            }
+            Err(e) => return Response::Error { message: format!("policy for {owner}: {e}") },
+        }
+    };
+    let (last, spans) = match app_id {
+        Some(a) => {
+            let last = dir.as_deref().and_then(|d| portcullisd::persona_last::get(d, a))
+                .filter(|p| personas.iter().any(|q| &q.name == p));
+            (last, launch::not_instanced(a).is_some())
+        }
+        None => (None, false),
+    };
+    Response::PersonaList { personas, last, spans }
+}
+
+/// Remember the persona `app_id` ran in, for the next launch question; only
+/// for a person with a named persona (nothing is asked otherwise).
+fn remember_persona(user: &str, app_id: &str, persona: Option<&str>, shared: &Mutex<Tenants>) {
+    let dir = {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match s.get_or_load(user) {
+            Ok(tp) if tp.policy.check_personas().is_ok() && !tp.policy.personas.is_empty() => tp.policy_path.parent().map(|d| d.to_path_buf()),
+            _ => None,
+        }
+    };
+    if let Some(d) = dir {
+        if let Err(e) = portcullisd::persona_last::set(&d, app_id, persona.unwrap_or(portcullis_policy::PERSONAL)) {
+            eprintln!("portcullisd: could not remember {user}'s persona for {app_id}: {e}");
+        }
+    }
+}
+
 /// Settings turns a crossing switch (personas.md §6): `app-grants` by peer
 /// uid, about the person that app runs for, with a press portcullisd
 /// spends (APPROVE); turning one on then asks the person on Sigillum's
@@ -1836,7 +2003,7 @@ fn handle_set_crossing(uid: u32, from: &str, to: &str, kind: &str, on: bool, act
     }
     if on {
         eprintln!("portcullisd: {owner} turning on {kind} from {from} to {to}: asking Sigillum");
-        if let Err(why) = verify.verify(&owner, from, to, kind) {
+        if let Err(why) = verify.verify(&owner, sigillum_proto::client::Purpose::Crossing { from: from.into(), to: to.into(), kind: kind.into() }) {
             return refuse(why);
         }
     }
@@ -2886,7 +3053,7 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "internal: session verbs must go through handle_session".into(),
         },
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
-        | Request::Crossings | Request::SetCrossing { .. } => Response::Error {
+        | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

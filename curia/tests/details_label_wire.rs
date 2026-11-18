@@ -81,7 +81,7 @@ fn the_details_label_is_held_once_after_a_resize_and_a_change_in_one_tick() {
     p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"aura-test".to_vec()), portal: None })));
     let page = m!(p.clone());
     let cred = pergola::widgets::CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-    let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(Default::default()), dev_scroll: m!(Default::default()), disp: m!(Default::default()), disp_scroll: m!(Default::default()), sound: m!(Default::default()), sound_scroll: m!(Default::default()), apps: m!(Default::default()), apps_scroll: m!(Default::default()), bt: m!(Default::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((1080.0, 682.0)) };
+    let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(Default::default()), dev_scroll: m!(Default::default()), disp: m!(Default::default()), disp_scroll: m!(Default::default()), sound: m!(Default::default()), sound_scroll: m!(Default::default()), apps: m!(Default::default()), apps_scroll: m!(Default::default()), bt: m!(Default::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), persona_field: m!(Default::default()), persona_scroll: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((1080.0, 682.0)) };
     let mut app = pergola::App::new_with_flag(v, dirty.clone());
     pergola::commit(&mut surface, &app.tick()).unwrap();
     wait(1);

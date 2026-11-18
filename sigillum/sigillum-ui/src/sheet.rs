@@ -122,6 +122,11 @@ impl State {
                         let p = |s: &str| if s == "personal" { "Personal".to_string() } else { s.to_string() };
                         format!("to let {} send {kind} to {}", p(from), p(to))
                     }
+                    Purpose::RemovePersona { name } => {
+                        let mut c = name.chars();
+                        let n: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+                        format!("to remove {n} and delete its apps\u{2019} data")
+                    }
                 };
                 ("Confirm it\u{2019}s you".into(), vec![format!("{requester} asks {why}"), format!("User: {user}")])
             }

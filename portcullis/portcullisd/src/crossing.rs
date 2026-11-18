@@ -12,9 +12,10 @@ use portcullis_ipc::{CrossingSwitch, CROSSING_KINDS};
 use portcullis_policy::Policy;
 use sigillum_proto::client::{self, Purpose, Reply, Request, Strength, VerifyUser};
 
-/// Asks the person to confirm it's them, for a crossing.
+/// Asks the person to confirm it's them, for a crossing switch or removing
+/// a persona.
 pub trait Verify {
-    fn verify(&self, user: &str, from: &str, to: &str, kind: &str) -> Result<(), String>;
+    fn verify(&self, user: &str, purpose: Purpose) -> Result<(), String>;
 }
 
 /// sigillumd's client socket (`PORTCULLIS_SIGILLUM`, default its own).
@@ -30,13 +31,13 @@ impl Default for Sigillum {
 const WAIT: Duration = Duration::from_secs(11 * 60);
 
 impl Verify for Sigillum {
-    fn verify(&self, user: &str, from: &str, to: &str, kind: &str) -> Result<(), String> {
+    fn verify(&self, user: &str, purpose: Purpose) -> Result<(), String> {
         let mut s = UnixStream::connect(&self.0).map_err(|e| format!("user verification isn't available ({e})"))?;
         s.set_read_timeout(Some(WAIT)).map_err(|e| e.to_string())?;
         let req = Request::VerifyUser(VerifyUser {
             ceremony: 1,
             user: user.into(),
-            purpose: Purpose::Crossing { from: from.into(), to: to.into(), kind: kind.into() },
+            purpose,
             // The passcode, a key with UV or a secure sensor (sigillum.md decision 6).
             min_strength: Strength::BiometricSecure,
         });

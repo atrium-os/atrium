@@ -40,6 +40,7 @@ pub enum Which {
     Sound,
     Devices,
     Apps,
+    Personas,
 }
 
 pub struct CuriaView {
@@ -57,6 +58,9 @@ pub struct CuriaView {
     pub bt_scroll: Mutable<ScrollState>,
     /// The code a device being paired shows, typed here.
     pub bt_code: Mutable<pergola::text_edit::TextEdit>,
+    /// The Personas page's name field (Add a persona) and its scroll.
+    pub persona_field: Mutable<TextEdit>,
+    pub persona_scroll: Mutable<ScrollState>,
     /// The IP settings row's address, router and DNS fields, then the DNS
     /// servers row's field.
     pub net_fields: [Mutable<TextEdit>; 4],
@@ -159,7 +163,7 @@ impl View for CuriaView {
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
         let now = self.which.get();
-        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Bluetooth, ph::BLUETOOTH, "Bluetooth"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps")].into_iter().enumerate() {
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Bluetooth, ph::BLUETOOTH, "Bluetooth"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps"), (Which::Personas, ph::USERS, "Personas")].into_iter().enumerate() {
             let y = em(56.0) + i as f32 * em(38.0);
             let on = now == which;
             let sel = self.which.clone();
@@ -175,6 +179,7 @@ impl View for CuriaView {
             Which::Sound => self.sound(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Apps => self.apps(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Personas => self.personas(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
         }
     }
 }
@@ -1086,10 +1091,178 @@ impl CuriaView {
                     y += em(8.0);
                 }
             }
+            if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
+                rect.size.h = y;
+            }
+            ctx.pop();
+        });
+        ScrollView::new(self.apps_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
+            .key(94)
+            .backdrop(t.bg_canvas())
+            .emit(ctx);
+    }
+
+    /// The Personas page (personas.md §2, §6): Personal and the named
+    /// personas with their colours, Add a persona, Remove (which asks
+    /// twice, then Sigillum's sheet), and the switches between personas.
+    fn personas(&self, ctx: &mut Ctx, x0: f32, pw: f32, h: f32) {
+        let p = self.apps.get_cloned();
+        let t = ctx.theme;
+        let mut y = em(20.0);
+        text(ctx, x0, y + em(16.0), "Personas", type_size::XL, Weight::Semibold, t.text_primary());
+        y += em(48.0);
+        match &p.crossings {
+            None => {
+                text(ctx, x0, y + em(10.0), "Asking for your personas…", type_size::SM, Weight::Regular, t.text_tertiary());
+                return;
+            }
+            Some(Err(why)) => {
+                let ch = em(64.0);
+                rect(ctx, x0, y, pw, ch, t.bg_surface(), 8.0);
+                icon(ctx, x0 + em(16.0), y + em(20.0), ph::USERS, em(24.0), t.text_secondary());
+                text(ctx, x0 + em(56.0), y + em(24.0), "Personas are not available", type_size::MD, Weight::Medium, t.text_primary());
+                text(ctx, x0 + em(56.0), y + em(44.0), &format!("{why}; trying again"), type_size::SM, Weight::Regular, t.text_secondary());
+                return;
+            }
+            Some(Ok(_)) => {}
+        }
+        text(ctx, x0, y + em(8.0), "Each persona's apps keep their own data, accounts and network.", type_size::SM, Weight::Regular, t.text_secondary());
+        y += em(28.0);
+        let top = y;
+        let swatch = |ctx: &mut Ctx, x: f32, y: f32, d: f32, colour: Option<&str>| {
+            match colour.and_then(fresco_protocol::persona::rgb) {
+                Some([r, g, b]) => { rect(ctx, x, y, d, d, Color::from_hex(&format!("#{r:02x}{g:02x}{b:02x}")), d / 2.0); }
+                None => {
+                    rect(ctx, x, y, d, d, ctx.theme.border_strong(), d / 2.0);
+                    let k = em(2.0);
+                    rect(ctx, x + k, y + k, d - 2.0 * k, d - 2.0 * k, ctx.theme.bg_surface(), d / 2.0);
+                }
+            }
+        };
+        let content = pergola::view::Draw(|ctx: &mut Ctx| {
+            let t = ctx.theme;
+            let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
+            ctx.set_flex(g, FlexStyle { free: true, ..FlexStyle::default() });
+            let mut y = 0.0;
+            // Personal: always there.
+            let rh = em(56.0);
+            rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);
+            swatch(ctx, em(16.0), y + (rh - em(16.0)) / 2.0, em(16.0), None);
+            text(ctx, em(44.0), y + em(20.0), "Personal", type_size::MD, Weight::Medium, t.text_primary());
+            text(ctx, em(44.0), y + em(40.0), "Always here; your home folders", type_size::SM, Weight::Regular, t.text_secondary());
+            y += rh + em(8.0);
+            let free = p.free_colours();
+            for (name, colour) in p.named() {
+                let busy = p.persona_busy.as_deref() == Some(name.as_str());
+                let confirm = p.persona_confirm.as_deref() == Some(name.as_str());
+                let rh = em(if confirm { 132.0 } else { 92.0 });
+                rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);
+                swatch(ctx, em(16.0), y + em(20.0), em(16.0), Some(colour));
+                text(ctx, em(44.0), y + em(28.0), &apps::persona_name(name), type_size::MD, Weight::Medium, t.text_primary());
+                let lab = "Remove…";
+                let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                if !confirm {
+                    let (pg, n) = (self.apps.clone(), name.clone());
+                    button(ctx, bx, y + em(13.0), lab, Look::Secondary, p.persona_busy.is_none(), move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.remove_persona(&n, token))
+                    });
+                }
+                // Its colour: the other free colours, a press each.
+                text(ctx, em(44.0), y + em(60.0), "Colour", type_size::SM, Weight::Regular, t.text_secondary());
+                let mut cx = em(100.0);
+                let d = em(20.0);
+                for c in std::iter::once(colour.as_str()).chain(free.iter().copied()) {
+                    let here = c == colour;
+                    if here {
+                        rect(ctx, cx - em(3.0), y + em(50.0) - em(3.0), d + em(6.0), d + em(6.0), t.focus_ring(), (d + em(6.0)) / 2.0);
+                    }
+                    let (pg, n, cc) = (self.apps.clone(), name.clone(), c.to_string());
+                    area(ctx, Rect::new(cx, y + em(50.0), d, d), d / 2.0, Color::TRANSPARENT, Color::TRANSPARENT, move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.set_colour(&n, &cc, token))
+                    });
+                    swatch(ctx, cx, y + em(50.0), d, Some(c));
+                    ctx.pop();
+                    cx += d + em(10.0);
+                }
+                if busy {
+                    text(ctx, cx + em(8.0), y + em(60.0), "Changing…", type_size::SM, Weight::Regular, t.text_tertiary());
+                }
+                if confirm {
+                    let w1 = format!("Removing {} deletes its apps\u{2019} data on this computer.", apps::persona_name(name));
+                    text(ctx, em(44.0), y + em(90.0), &w1, type_size::SM, Weight::Regular, t.danger_fg());
+                    let l2 = format!("Remove {}", apps::persona_name(name));
+                    let (pg, n) = (self.apps.clone(), name.clone());
+                    let bw = button(ctx, em(44.0), y + em(102.0) - em(4.0) + em(6.0), &l2, Look::Danger, true, move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.remove_persona(&n, token))
+                    });
+                    let pg = self.apps.clone();
+                    button(ctx, em(52.0) + bw, y + em(104.0), "Cancel", Look::Ghost, true, move || with_apps(&pg, |a| a.cancel_remove_persona()));
+                }
+                y += rh;
+                if let Some((_, why)) = p.persona_note.as_ref().filter(|(n, _)| n == name) {
+                    text(ctx, em(16.0), y + em(12.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                    y += em(24.0);
+                }
+                y += em(8.0);
+            }
+            // Add a persona: a name, a free colour, Add.
+            y += em(12.0);
+            text(ctx, 0.0, y + em(14.0), "Add a persona", type_size::LG, Weight::Semibold, t.text_primary());
+            y += em(36.0);
+            match p.new_colour() {
+                None => {
+                    text(ctx, 0.0, y + em(10.0), "Eight personas at most: every colour is taken.", type_size::SM, Weight::Regular, t.text_secondary());
+                    y += em(28.0);
+                }
+                Some(chosen) => {
+                    let (pg, field) = (self.apps.clone(), self.persona_field.clone());
+                    pergola::widgets::TextField::new(self.persona_field.clone())
+                        .placeholder("Name, like Work or School")
+                        .at(0.0, y)
+                        .width(em(220.0))
+                        .on_submit(move |v| {
+                            let token = pergola::clipboard::current_activation();
+                            let v = v.to_string();
+                            with_apps(&pg, |a| a.add_persona(&v, token));
+                            if pg.get_cloned().persona_busy.is_some() { field.set(Default::default()); }
+                        })
+                        .render(ctx);
+                    let (pg, field) = (self.apps.clone(), self.persona_field.clone());
+                    let lab = if p.persona_busy.as_deref() == Some("") { "Adding…" } else { "Add" };
+                    button(ctx, em(232.0), y + em(2.0), lab, Look::Primary, p.persona_busy.is_none(), move || {
+                        let token = pergola::clipboard::current_activation();
+                        let v = field.get_cloned().text().to_string();
+                        with_apps(&pg, |a| a.add_persona(&v, token));
+                        if pg.get_cloned().persona_busy.is_some() { field.set(Default::default()); }
+                    });
+                    y += em(44.0);
+                    text(ctx, 0.0, y + em(10.0), "Colour", type_size::SM, Weight::Regular, t.text_secondary());
+                    let mut cx = em(56.0);
+                    let d = em(20.0);
+                    for c in free.iter().copied() {
+                        if c == chosen {
+                            rect(ctx, cx - em(3.0), y - em(3.0), d + em(6.0), d + em(6.0), t.focus_ring(), (d + em(6.0)) / 2.0);
+                        }
+                        let (pg, cc) = (self.apps.clone(), c.to_string());
+                        area(ctx, Rect::new(cx, y, d, d), d / 2.0, Color::TRANSPARENT, Color::TRANSPARENT, move || with_apps(&pg, |a| a.choose_new_colour(&cc)));
+                        swatch(ctx, cx, y, d, Some(c));
+                        ctx.pop();
+                        cx += d + em(10.0);
+                    }
+                    y += em(32.0);
+                    if let Some((_, why)) = p.persona_note.as_ref().filter(|(n, _)| n.is_empty()) {
+                        text(ctx, 0.0, y + em(8.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                        y += em(24.0);
+                    }
+                }
+            }
             // Between personas (personas.md §6): a switch per direction
             // and kind, off by default; on asks Sigillum's sheet too.
             let dirs = p.directions();
-            if !dirs.is_empty() || matches!(p.crossings, Some(Err(_))) {
+            if !dirs.is_empty() {
                 y += em(20.0);
                 text(ctx, 0.0, y + em(14.0), "Between personas", type_size::LG, Weight::Semibold, t.text_primary());
                 y += em(32.0);
@@ -1134,8 +1307,8 @@ impl CuriaView {
             }
             ctx.pop();
         });
-        ScrollView::new(self.apps_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
-            .key(94)
+        ScrollView::new(self.persona_scroll.clone(), Rect::new(x0, top, pw, (h - top - em(8.0)).max(em(60.0))), content)
+            .key(95)
             .backdrop(t.bg_canvas())
             .emit(ctx);
     }
@@ -1366,7 +1539,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false, manual: None }])));
@@ -1427,7 +1600,7 @@ mod tests {
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         let page = m!(p.clone());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
+        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), persona_field: m!(Default::default()), persona_scroll: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
         let mut app = pergola::App::new_with_flag(v, dirty.clone());
         let mut s = Model::default();
         let labels = |s: &Model| s.0.values().filter_map(|v| v.0.clone()).filter(|t| t.ends_with(" details")).collect::<Vec<_>>();
@@ -1459,7 +1632,7 @@ mod tests {
         p.edit_ip(atrium_netconf::Target::Wired("em0".into()));
         p.edit_error = Some("\"10.0.0.300\" is not an IPv4 address".into());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         let all = texts(&v);
         for want in ["IP settings", "home (Wi-Fi)", "Fixed: 10.0.0.5/24", "em0 (Ethernet)", "Automatic (DHCP)", "Use this address", "Automatic", "Close", "DNS servers", "9.9.9.9", "\"10.0.0.300\" is not an IPv4 address"] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
@@ -1471,7 +1644,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -1490,7 +1663,7 @@ mod tests {
     fn the_sound_page_shows_volume_outputs_and_apps() {
         use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
         with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
@@ -1510,7 +1683,7 @@ mod tests {
         use crate::apps::Got;
         use portcullis_ipc::{AccessBy, AccessEntry};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
@@ -1535,7 +1708,7 @@ mod tests {
     fn the_bluetooth_page_shows_the_prompt_paired_and_nearby() {
         use vinculum_control::{Addr, DeviceInfo, Event};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking vinculumd for Bluetooth…"));
         with_bt(&v.bt, |p| p.lost("vinculumd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "vinculumd is not running; trying again"));
@@ -1559,7 +1732,7 @@ mod tests {
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

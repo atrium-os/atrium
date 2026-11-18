@@ -567,6 +567,39 @@ pub fn destroy(pl: &Place) -> Result<(), String> {
     Ok(())
 }
 
+/// Destroy every app instance place of `person`'s persona `persona`
+/// (`apps/<id>@<persona>` and its image; personas.md §4.1, Remove). The
+/// app ids whose places went; one that couldn't go is logged and left.
+pub fn remove_persona_places(person: &str, persona: &str) -> Vec<String> {
+    let mut gone = Vec::new();
+    if !plain_segment(persona) || persona.contains('@') {
+        return gone;
+    }
+    let Some(home) = home_of(person) else { return gone };
+    let apps = home.join(".atrium").join("apps");
+    let suffix = format!("@{persona}");
+    let mut ids = std::collections::BTreeSet::new();
+    if let Ok(rd) = fs::read_dir(&apps) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let key = name.strip_suffix(".img").unwrap_or(&name);
+            if let Some(id) = key.strip_suffix(&suffix) {
+                if plain_segment(id) && !id.contains('@') {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    for id in ids {
+        let Some(pl) = persona_place(person, &id, persona) else { continue };
+        match destroy(&pl) {
+            Ok(()) => gone.push(id),
+            Err(e) => eprintln!("portcullis: {person}'s {id}@{persona} not removed: {e}"),
+        }
+    }
+    gone
+}
+
 /// Move an overlay from the machine-wide place into `pl` (a person's home),
 /// the first time that person launches the app after homes.md (§3,
 /// "Migration"). Only when `pl` holds nothing yet: a home that already has

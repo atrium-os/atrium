@@ -578,6 +578,11 @@ fn verify_user_is_for_arca_and_ostiarius_only() {
     assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
     r.request(&Label::Portcullis, v(Purpose::Crossing { from: "Work!".into(), to: "personal".into(), kind: "links".into() }));
     assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Malformed });
+    // Removing a persona too: portcullisd's only, never Personal.
+    r.request(&Label::Ostiarius, v(Purpose::RemovePersona { name: "work".into() }));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
+    r.request(&Label::Portcullis, v(Purpose::RemovePersona { name: "personal".into() }));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Malformed });
     r.request(&Label::Portcullis, v(cross()));
     assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { requester, purpose: Purpose::Crossing { .. }, .. } if requester == "Settings"));
     let key = r.sheets.last().unwrap().0;

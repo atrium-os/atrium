@@ -26,6 +26,10 @@ pub enum Want {
     SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
     /// Turn one crossing switch on or off.
     SetCrossing { switch: CrossingSwitch, on: bool, activation: [u8; 16] },
+    /// The Personas page (personas.md §2): add one, recolour one, remove one.
+    AddPersona { name: String, colour: String, activation: [u8; 16] },
+    SetColour { name: String, colour: String, activation: [u8; 16] },
+    RemovePersona { name: String, activation: [u8; 16] },
 }
 
 /// The person's named personas (name, colour) and the switches that are on.
@@ -42,6 +46,8 @@ pub enum Got {
     Crossings(Result<Crossings, String>),
     /// A SetCrossing came back.
     CrossingDone { switch: CrossingSwitch, result: Result<(), String> },
+    /// An AddPersona, SetColour or RemovePersona came back, for `name`.
+    PersonaDone { name: String, result: Result<(), String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,7 +77,28 @@ pub struct AppsPage {
     pub crossing_busy: Option<(CrossingSwitch, bool)>,
     /// What went wrong for a switch.
     pub crossing_note: Option<(CrossingSwitch, String)>,
+    /// The Personas page: a change on its way, for this persona.
+    pub persona_busy: Option<String>,
+    /// What went wrong for a persona (or `""`: for Add).
+    pub persona_note: Option<(String, String)>,
+    /// Remove asks once more, saying what goes.
+    pub persona_confirm: Option<String>,
+    /// The colour chosen for a new persona.
+    pub new_colour: Option<String>,
     pub wants: Vec<Want>,
+}
+
+/// The colours a persona may take (portcullis-policy's `PERSONA_COLOURS`).
+pub const COLOURS: &[&str] = &["blue", "green", "orange", "purple", "red", "teal", "pink", "yellow"];
+
+/// A persona name from what the person typed: "Work" is `work`, "Side
+/// project" is `side-project`; `None` when it can't be one.
+pub fn persona_key(typed: &str) -> Option<String> {
+    let k: String = typed.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join("-");
+    let ok = !k.is_empty() && k.len() <= 32 && k != "personal"
+        && k.starts_with(|c: char| c.is_ascii_lowercase())
+        && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok.then_some(k)
 }
 
 /// "Opens in Mail", "Asks each time".
@@ -184,6 +211,21 @@ impl AppsPage {
                 self.refresh();
             }
             Got::Crossings(r) => self.crossings = Some(r),
+            Got::PersonaDone { name, result } => {
+                if self.persona_busy.as_deref() == Some(&name) {
+                    self.persona_busy = None;
+                }
+                match result {
+                    Ok(()) => {
+                        self.persona_note = None;
+                        if name.is_empty() {
+                            self.new_colour = None;
+                        }
+                    }
+                    Err(why) => self.persona_note = Some((name, why)),
+                }
+                self.refresh();
+            }
             Got::CrossingDone { switch, result } => {
                 if self.crossing_busy.as_ref().is_some_and(|(s, _)| *s == switch) {
                     self.crossing_busy = None;
@@ -211,6 +253,98 @@ impl AppsPage {
             }
         }
         v
+    }
+
+    /// The person's named personas, (name, colour).
+    pub fn named(&self) -> &[(String, String)] {
+        match &self.crossings {
+            Some(Ok((n, _))) => n,
+            _ => &[],
+        }
+    }
+
+    /// Colours no persona has yet.
+    pub fn free_colours(&self) -> Vec<&'static str> {
+        COLOURS.iter().copied().filter(|c| !self.named().iter().any(|(_, k)| k == c)).collect()
+    }
+
+    /// The colour a new persona gets: the one chosen, else the first free.
+    pub fn new_colour(&self) -> Option<String> {
+        let free = self.free_colours();
+        self.new_colour.clone().filter(|c| free.contains(&c.as_str())).or_else(|| free.first().map(|c| c.to_string()))
+    }
+
+    pub fn choose_new_colour(&mut self, c: &str) {
+        if self.free_colours().contains(&c) {
+            self.new_colour = Some(c.into());
+        }
+    }
+
+    /// Add: the name as typed, with the press that made it. The note for
+    /// Add is under the empty name.
+    pub fn add_persona(&mut self, typed: &str, activation: Option<[u8; 16]>) {
+        if self.persona_busy.is_some() || self.crossings.as_ref().is_none_or(|r| r.is_err()) {
+            return;
+        }
+        let Some(name) = persona_key(typed) else {
+            let why = if typed.trim().eq_ignore_ascii_case("personal") { "Personal is always there" } else { "Use letters, digits and spaces, starting with a letter (up to 32)" };
+            self.persona_note = Some((String::new(), why.into()));
+            return;
+        };
+        if self.named().iter().any(|(n, _)| *n == name) {
+            self.persona_note = Some((String::new(), format!("You have {} already", persona_name(&name))));
+            return;
+        }
+        let Some(colour) = self.new_colour() else {
+            self.persona_note = Some((String::new(), "Every colour is taken: eight personas at most".into()));
+            return;
+        };
+        let Some(activation) = activation else {
+            self.persona_note = Some((String::new(), "Press Add with the pointer or Enter".into()));
+            return;
+        };
+        self.persona_note = None;
+        self.persona_busy = Some(String::new());
+        self.wants.push(Want::AddPersona { name, colour, activation });
+    }
+
+    pub fn set_colour(&mut self, name: &str, colour: &str, activation: Option<[u8; 16]>) {
+        let has = self.named().iter().any(|(n, k)| n == name && k != colour);
+        if self.persona_busy.is_some() || !has || !self.free_colours().contains(&colour) {
+            return;
+        }
+        let Some(activation) = activation else {
+            self.persona_note = Some((name.into(), "Press with the pointer or Enter".into()));
+            return;
+        };
+        self.persona_note = None;
+        self.persona_busy = Some(name.into());
+        self.wants.push(Want::SetColour { name: name.into(), colour: colour.into(), activation });
+    }
+
+    /// Remove: the first press asks, saying what goes; the second, with
+    /// its press, asks portcullisd (and Sigillum's sheet).
+    pub fn remove_persona(&mut self, name: &str, activation: Option<[u8; 16]>) {
+        if self.persona_busy.is_some() || !self.named().iter().any(|(n, _)| n == name) {
+            return;
+        }
+        if self.persona_confirm.as_deref() != Some(name) {
+            self.persona_confirm = Some(name.into());
+            self.persona_note = None;
+            return;
+        }
+        let Some(activation) = activation else {
+            self.persona_note = Some((name.into(), "Press with the pointer or Enter".into()));
+            return;
+        };
+        self.persona_confirm = None;
+        self.persona_note = None;
+        self.persona_busy = Some(name.into());
+        self.wants.push(Want::RemovePersona { name: name.into(), activation });
+    }
+
+    pub fn cancel_remove_persona(&mut self) {
+        self.persona_confirm = None;
     }
 
     pub fn crossing_on(&self, s: &CrossingSwitch) -> bool {
@@ -448,5 +582,62 @@ mod tests {
         assert_eq!(p.take_wants(), vec![Want::Refresh]);
         p.set_crossing(sw("work", "personal", "links"), false, Some([3; 16]));
         assert_eq!(p.take_wants(), vec![Want::SetCrossing { switch: sw("work", "personal", "links"), on: false, activation: [3; 16] }]);
+    }
+
+    fn with_work() -> AppsPage {
+        let mut p = AppsPage::default();
+        p.apply(Got::Crossings(Ok((vec![("work".into(), "blue".into())], vec![]))));
+        p.wants.clear();
+        p
+    }
+
+    #[test]
+    fn names_as_typed_become_persona_keys() {
+        assert_eq!(persona_key(" Side  project ").as_deref(), Some("side-project"));
+        assert_eq!(persona_key("Work").as_deref(), Some("work"));
+        assert_eq!(persona_key("personal"), None);
+        assert_eq!(persona_key("2nd job"), None);
+        assert_eq!(persona_key("Ünïcode"), None);
+        assert_eq!(persona_key(""), None);
+    }
+
+    #[test]
+    fn add_takes_a_press_a_new_name_and_a_free_colour() {
+        let mut p = with_work();
+        assert_eq!(p.free_colours().len(), 7);
+        assert_eq!(p.new_colour().as_deref(), Some("green"));
+        p.choose_new_colour("blue");
+        assert_eq!(p.new_colour().as_deref(), Some("green"), "work's");
+        p.choose_new_colour("teal");
+        p.add_persona("School", None);
+        assert!(p.wants.is_empty() && p.persona_note.is_some());
+        p.add_persona("Work", Some([1; 16]));
+        assert!(p.wants.is_empty() && p.persona_note.as_ref().unwrap().1.contains("already"));
+        p.add_persona("School", Some([1; 16]));
+        assert_eq!(p.wants, vec![Want::AddPersona { name: "school".into(), colour: "teal".into(), activation: [1; 16] }]);
+        p.add_persona("Other", Some([1; 16]));
+        assert_eq!(p.wants.len(), 1, "one at a time");
+        p.apply(Got::PersonaDone { name: String::new(), result: Ok(()) });
+        assert_eq!(p.persona_busy, None);
+        assert!(p.wants.contains(&Want::Refresh));
+    }
+
+    #[test]
+    fn remove_asks_twice_and_recolour_needs_a_free_colour() {
+        let mut p = with_work();
+        p.remove_persona("work", Some([2; 16]));
+        assert!(p.wants.is_empty());
+        assert_eq!(p.persona_confirm.as_deref(), Some("work"));
+        p.remove_persona("work", Some([2; 16]));
+        assert_eq!(p.wants, vec![Want::RemovePersona { name: "work".into(), activation: [2; 16] }]);
+        p.apply(Got::PersonaDone { name: "work".into(), result: Err("Mail is still open in work: close it first".into()) });
+        assert!(p.persona_note.as_ref().unwrap().1.contains("close it first"));
+        p.wants.clear();
+        p.set_colour("work", "blue", Some([3; 16]));
+        assert!(p.wants.is_empty(), "its own colour already");
+        p.set_colour("work", "red", Some([3; 16]));
+        assert_eq!(p.wants, vec![Want::SetColour { name: "work".into(), colour: "red".into(), activation: [3; 16] }]);
+        p.remove_persona("school", Some([2; 16]));
+        assert_eq!(p.persona_confirm, None, "not one of hers");
     }
 }

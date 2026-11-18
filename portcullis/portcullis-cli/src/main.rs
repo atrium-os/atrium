@@ -102,6 +102,10 @@ usage:
         Grant ALL capabilities the app's manifest declares. Phase 4
         bootstrap: replaces the prompt UI until portcullisd lands.
 
+    portcullis personas [app-id]
+        Your personas, Personal first; with an app, the one it last ran
+        in (marked *) or that it runs once for every persona.
+
     portcullis workspace [list]
     portcullis workspace new <name> [--toolchain c|shell] [--network outbound|registries|none] [--uses a,b]
     portcullis workspace set <name> [--network outbound|registries|none] [--hosts a,b] [--uses a,b | --no-uses] [--object-cache on|off]
@@ -198,6 +202,10 @@ fn main() -> ExitCode {
             cmd_remove(id, keep_overlay)
         }
         "workspace" => cmd_workspace(&args[2..]),
+        "personas" => {
+            if args.len() > 3 { usage(); }
+            cmd_personas(args.get(2).map(String::as_str))
+        }
         "--help" | "-h" => usage(),
         other => {
             eprintln!("portcullis: unknown subcommand {other:?}");
@@ -1503,6 +1511,29 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("portcullis workspace: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_personas(app: Option<&str>) -> ExitCode {
+    match daemon::personas(app) {
+        Ok(Some((list, last, spans))) => {
+            for p in &list {
+                let mark = if last.as_deref() == Some(p.name.as_str()) { "*" } else { " " };
+                println!("{mark} {:<32} {}", p.name, p.colour.as_deref().unwrap_or("-"));
+            }
+            if spans {
+                println!("{} runs once for every persona", app.unwrap_or("?"));
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("portcullis: portcullisd is not running");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("portcullis: personas: {e}");
+            ExitCode::FAILURE
         }
     }
 }

@@ -66,3 +66,5 @@ pub const BLUETOOTH_SLASH: char = '\u{e0de}';
 pub const EJECT: char = '\u{e212}';
 pub const CARET_DOWN: char = '\u{e136}';
 pub const CARET_RIGHT: char = '\u{e13a}';
+/// Personas (Settings' Personas page).
+pub const USERS: char = '\u{e4d6}';

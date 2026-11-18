@@ -520,6 +520,42 @@ pub enum Request {
     /// that runs once per persona (the Navigator) names its windows by
     /// it. Answer: `Persona`.
     Persona,
+
+    /// ★ The launch question (personas.md §3): the person's personas,
+    /// Personal first, and for `app_id` the one last used and whether it
+    /// spans personas (then nothing is asked). From a launcher (its
+    /// INSTALLED manifest holds `app-launch`), Settings (`app-grants`), or
+    /// the person's own CLI; about the person the caller runs for.
+    /// Answer: `PersonaList`.
+    PersonaList {
+        #[serde(default)]
+        app_id: Option<String>,
+    },
+
+    /// ★ Settings' Personas page (personas.md §2): add persona `name` in
+    /// `colour` (one of the persona colours no other persona has).
+    /// `app-grants` only, about the person that app runs for, with
+    /// `activation`, a press portcullisd spends with frescod (APPROVE).
+    /// Answer: `Ok`.
+    AddPersona { name: String, colour: String, activation: [u8; 16] },
+    /// ★ Give persona `name` another colour. As `AddPersona`.
+    SetPersonaColour { name: String, colour: String, activation: [u8; 16] },
+    /// ★ Remove persona `name` (personas.md §4.1): refused while any of its
+    /// apps runs; then, after a press (APPROVE) and the person's
+    /// verification on Sigillum's sheet (`VERIFY_USER`), its apps' data
+    /// (`~/.atrium/apps/<id>@<name>`) is deleted, its crossing switches go
+    /// and it leaves the policy file. `app-grants` only. Answer: `Ok`.
+    RemovePersona { name: String, activation: [u8; 16] },
+}
+
+/// A persona in the launch question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaOption {
+    /// By name; `personal` for Personal.
+    pub name: String,
+    /// One of the persona colours (Personal: none).
+    #[serde(default)]
+    pub colour: Option<String>,
 }
 
 /// Who allowed what an app has now (curia.md §13).
@@ -788,6 +824,18 @@ pub enum Response {
     /// persona and its colour (one of portcullis-policy's
     /// `PERSONA_COLOURS`).
     Persona { name: Option<String>, colour: Option<String> },
+
+    /// PersonaList → Personal first, then the named personas (just
+    /// Personal: nothing to ask). `last`: the one `app_id` last ran in, by
+    /// name. `spans`: `app_id` runs once for every persona, so a launch
+    /// names none.
+    PersonaList {
+        personas: Vec<PersonaOption>,
+        #[serde(default)]
+        last:     Option<String>,
+        #[serde(default)]
+        spans:    bool,
+    },
 }
 
 /// Send one request and read one response over a connected stream.

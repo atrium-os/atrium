@@ -1606,7 +1606,7 @@ fn render_one_frame(
             if let Some(at) = windows.iter().position(|w| w.id == sheet) {
                 windows.insert(at, chrome::dim_layer(chrome::dim_id(sheet), pr));
             }
-            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid), dev: false });
+            out.push(chrome::Sheet { rect: sr, app: chrome::app_label(uid), dev: false, persona: None });
         }
         /* Dev builds (homes.md §5.3): every window of one framed in amber
          * and tagged with the workspace it came from. */
@@ -1616,10 +1616,13 @@ fn render_one_frame(
         };
         for (id, uid) in owners {
             let app = chrome::app_label(uid);
+            let Some(&(_, r)) = rects.iter().find(|(l, _)| *l == id) else { continue };
             if app.starts_with("dev.") {
-                if let Some(&(_, r)) = rects.iter().find(|(l, _)| *l == id) {
-                    out.push(chrome::Sheet { rect: r, app, dev: true });
-                }
+                out.push(chrome::Sheet { rect: r, app, dev: true, persona: None });
+            } else if let Some((name, colour)) = chrome::persona_of(uid) {
+                /* A named persona's window (personas.md §7): framed in its
+                 * colour and tagged with its name, from the registry. */
+                out.push(chrome::Sheet { rect: r, app: name, dev: false, persona: Some(colour) });
             }
         }
         out
@@ -1670,7 +1673,21 @@ fn render_one_frame(
         let origin = |id: u16| b.origin(id).or_else(|| focus_parent.filter(|_| focus.map(|f| f as u16) == Some(id)).and_then(|p| b.origin(p)));
         let islands: Vec<chrome::Island> = island_ids.iter().filter_map(|&id| island_at(id, u16::try_from(id).ok().and_then(|w| b.origin(w)))).collect();
         let note = focus.and_then(|f| activation::strip_note(u32::from(f)));
-        let mut c = chrome::build(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands);
+        /* The persona chip (personas.md §7): the focused window's named
+         * persona, from the registry by its owner (a slot child's own, else
+         * the window it is bound into); "personal" while any other window
+         * on screen is a named persona's, so both sides are labelled. */
+        let chip: Option<(String, [u8; 3])> = {
+            let c = comp.lock().unwrap();
+            let owner = |id: u16| c.windows.get(&id).map(|w| w.owner_uid);
+            let mine = focus.and_then(|f| owner(f as u16)).and_then(chrome::persona_of)
+                .or_else(|| focus_parent.and_then(owner).and_then(chrome::persona_of));
+            mine.or_else(|| {
+                let any = rects.iter().any(|&(id, _)| u16::try_from(id).ok().and_then(owner).is_some_and(|u| chrome::persona_of(u).is_some()));
+                (any && focus.is_some()).then(|| ("personal".to_string(), [0x9c, 0xa3, 0xaf]))
+            })
+        };
+        let mut c = chrome::build_with(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands, chip.as_ref().map(|(n, c)| (n.as_str(), *c)));
         chrome::sheet_frames(&mut c, px, &sheets, px.strip());
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));

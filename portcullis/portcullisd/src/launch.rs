@@ -1212,6 +1212,19 @@ pub fn running_jid_instance(app_id: &str, persona: Option<&str>) -> Option<i32> 
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// The apps of `user`'s persona `persona` with a process running now (any
+/// of the persona's uids), by app id.
+pub fn running_in_persona(user: &str, persona: &str) -> Vec<String> {
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let mut v: Vec<String> = reg.persona_uids(user, persona).into_iter()
+        .filter(|(uid, _)| Command::new("pgrep").args(["-U", &uid.to_string()]).output().map(|o| o.status.success()).unwrap_or(false))
+        .map(|(_, app)| app.to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// The uid of `user`'s instance of `app_id` in `persona`, if one was ever
 /// registered (any publisher).
 pub fn instance_uid(user: &str, app_id: &str, persona: Option<&str>) -> Option<u32> {
