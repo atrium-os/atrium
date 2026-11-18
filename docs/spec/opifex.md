@@ -815,8 +815,10 @@ font on demand and a driver from a `nobody` device's notice.
   loaded: jaild then refused dispensatord's read-only mount of the driver's package folder
   (read-only sources were exact paths only). Fixed in jaild: `[mount_sources] ro_subtrees`
   takes a folder directly inside a listed one, never the listed folder itself, so a driver
-  sees only its own package (`/usr/local/libexec/atrium/drivers/`). Every other check
-  passed; the gate's two driver-jail checks wait for the next VM run.
+  sees only its own package (`/usr/local/libexec/atrium/drivers/`). Rerun the same day with
+  that jaild: **0 failed** (31 checks); jaild started the driver's jail
+  (`atrium-driver-c6mtp-0-2-0` via `ugen0.2,usb/0.2.0`) and it runs as its uid. (The
+  `jid 0` in dispensatord's line is jaild's sentinel for exec'd jails, not a failure.)
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
