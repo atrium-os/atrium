@@ -97,13 +97,20 @@ fn net_view() -> String {
         if s >= 0 { libc::close(s); }
         if r == 0 { format!("{} bytes", ifc.len) } else { "refused".into() }
     };
+    // The host's network counters and settings under net. (here the IP
+    // statistics): an empty vnet showed its own, a netblind jail none.
+    let mut st = [0u8; 4096];
+    let mut stlen = st.len();
+    // SAFETY: st and stlen describe a writable buffer.
+    let ipstats = if unsafe { libc::sysctlbyname(c"net.inet.ip.stats".as_ptr(), st.as_mut_ptr().cast(), &mut stlen, std::ptr::null(), 0) } == 0 {
+        format!("read {stlen}") } else { "refused".into() };
     let mut open = Vec::new();
     for (name, af) in [("inet", libc::AF_INET), ("inet6", libc::AF_INET6), ("route", libc::AF_ROUTE), ("netlink", 38)] {
         // SAFETY: plain socket(2); closed at once.
         let s = unsafe { libc::socket(af, if af == 38 { libc::SOCK_RAW } else { libc::SOCK_DGRAM }, 0) };
         if s >= 0 { open.push(name); unsafe { libc::close(s) }; }
     }
-    format!("ifs=[{}] macs=[{}] getifaddrs={} ifmib={ifmib} ifconf={ifconf} sockets=[{}]",
+    format!("ifs=[{}] macs=[{}] getifaddrs={} ifmib={ifmib} ifconf={ifconf} ipstats={ipstats} sockets=[{}]",
         names.join(","), macs.join(","), if gia == 0 { "ok" } else { "refused" }, open.join(","))
 }
 

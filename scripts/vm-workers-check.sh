@@ -121,7 +121,9 @@ r=$(line ifs)
 case "$r" in "ok ifs=["*) ;; *) bad "ifs: $r" ;; esac
 case "$r" in *"ifs=[] "*|*"ifs=[lo0] "*) ok "it lists no host interface: ${r#ok }" ;; *) bad "host interfaces: $r" ;; esac
 case "$r" in *"macs=[] "*) ok "and reads no MAC" ;; *) bad "MAC visible: $r" ;; esac
-case "$r" in *"ifmib=refused ifconf=refused sockets=[]"*) ok "no interface MIB, no SIOCGIFCONF, no inet/inet6/route/netlink socket" ;; *) bad "network view: $r" ;; esac
+case "$r" in *"ifmib=refused ifconf=refused "*"sockets=[]"*) ok "no interface MIB, no SIOCGIFCONF, no inet/inet6/route/netlink socket" ;; *) bad "network view: $r" ;; esac
+nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null")
+if [ "$nb" = 1 ]; then case "$r" in *"ipstats=refused"*) ok "and none of the host's network counters" ;; *) bad "host counters readable: $r" ;; esac; fi
 nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null"); [ "$nb" = 1 ] && echo "  (kernel has jail_netblind: worker jails without vnet)" || echo "  (kernel without jail_netblind: worker jails get an empty vnet)"
 r=$(line timing); case "$r" in p50*) ok "20 calls: $r" ;; *) bad "timing: $r" ;; esac
 echo "  where a call's time goes (median of the 20 timed calls, ms; teardown runs after the answer):"

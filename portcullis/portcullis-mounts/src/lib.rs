@@ -31,6 +31,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod sys;
+
 pub use portcullis_jail::JailConfig;
 
 /// Whether to force-unmount.
@@ -51,11 +53,17 @@ pub enum Force { No, Yes }
 /// tested on a host with none of these filesystems — the subtle part is the
 /// prefix rule, not the subprocess.
 pub fn parse_mounts(output: &str, roots: &[&Path]) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = output
+    filter_under(output
         .lines()
         // fstab-style: field 2 is the mount point.
         .filter_map(|l| l.split_whitespace().nth(1))
         .map(PathBuf::from)
+        .collect(), roots)
+}
+
+/// The mount points at or under any of `roots`, deepest first.
+fn filter_under(points: Vec<PathBuf>, roots: &[&Path]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = points.into_iter()
         // ★ `Path::starts_with` is COMPONENT-wise, so `/a/bc` is not under
         // `/a/b`. A string prefix test would have unmounted a sibling whose
         // name merely began with the root's.
@@ -77,6 +85,9 @@ pub fn parse_mounts(output: &str, roots: &[&Path]) -> Vec<PathBuf> {
 
 /// Every mount point at or under any of `roots`, deepest first.
 pub fn under(roots: &[&Path]) -> Vec<PathBuf> {
+    if let Some(points) = sys::mount_points() {
+        return filter_under(points, roots);
+    }
     let out = match Command::new("mount").arg("-p").output() {
         Ok(o) => o.stdout,
         // ★ Unreadable reads as EMPTY, and the caller's convergence loop then
@@ -99,6 +110,10 @@ pub fn converge(roots: &[&Path], force: Force) -> Vec<PathBuf> {
         if ms.is_empty() { return Vec::new() }
         let before = ms.len();
         for m in &ms {
+            match sys::unmount(m, force == Force::Yes) {
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                _ => continue,
+            }
             let mut c = Command::new("umount");
             if force == Force::Yes { c.arg("-f"); }
             let _ = c.arg(m).stderr(std::process::Stdio::null()).status();
@@ -120,6 +135,16 @@ pub fn converge(roots: &[&Path], force: Force) -> Vec<PathBuf> {
 pub fn wait_jail_gone(name: &str, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
+        if let Ok(id) = sys::jail_id(name, true) {
+            if id.is_none() { return true }
+            if start.elapsed() >= timeout {
+                eprintln!("portcullis: jail {name} is still dying after {}s — its mounts \
+                           stay pinned until it is freed", timeout.as_secs());
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
         let exists = Command::new("jls").args(["-d", "-j", name, "jid"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false);

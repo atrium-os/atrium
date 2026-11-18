@@ -2269,11 +2269,17 @@ the interface MIB sysctl and every interface ioctl fail, and routing and netlink
 open. On such a kernel jaild makes `Isolated` as `ip4=disable ip6=disable` with no vnet. It
 still uses the empty vnet on a kernel without the feature. Checked from inside a worker by
 `vm-workers-check.sh`: no interface at all (the empty vnet showed its own `lo0`), no MAC, no
-interface MIB, no SIOCGIFCONF, no inet, inet6, route or netlink socket. On the cloud VM (TCG)
+interface MIB, no SIOCGIFCONF, no inet, inet6, route or netlink socket. A first check found
+the host's traffic counters, forwarding setting and interface count still readable under
+`net.`, which the empty vnet hid; freebsd-src 9f2eed03a makes every read under `net.` fail for
+such a jail (except `net.route`, already empty), and the gate checks it. On the cloud VM (TCG)
 a WorkerCall's p50 went from 1141 to 1128 ms: the vnet is a few percent there. Most of a call
-is spent in the helper programs it runs (`mount` three times, `jail -r` before and after;
-`ATRIUM_ONESHOT_TIMING=1` logs each phase). The jail(8) lane (launched apps) still uses the
-empty vnet.
+was the helper programs it ran (`mount` three times, `umount`, `mount -p`, `jls`, `jail -r`
+before and after). portcullis-mounts' `sys` module now does those with nmount(2), unmount(2),
+getfsstat(2), jail_get(2) and jail_remove(2), and a one-shot skips the cleanup before a run
+when nothing of an earlier one is there: p50 1037 → 495 ms, the one-shot's whole life 1876 →
+570 ms (`ATRIUM_ONESHOT_TIMING=1` logs each phase). The jail(8) lane (launched apps) still
+uses the empty vnet.
 
 **Found on the way — the `loopback` capability never worked.** It set `ip4.addr`/`ip6.addr` on a
 vnet jail, which the kernel refuses; its unit test pinned exactly that recipe and passed. Now:
