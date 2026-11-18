@@ -19,6 +19,7 @@
 //! | 15 | TAB_COLORS | sheets' tab colours: count; per sheet, its index and 0xRRGGBB |
 //! | 16 | MERGES | one sheet's merged cells: sheet, count, each area's corners |
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
+//! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
@@ -46,6 +47,7 @@ pub const TAB_COLORS: u16 = 15;
 pub const MERGES: u16 = 16;
 pub const COMMENTS: u16 = 17;
 pub const LINKS: u16 = 18;
+pub const FREEZE: u16 = 19;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -286,6 +288,17 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u32(c & 0xFF_FFFF);
         }
         c.add(TAB_COLORS, &w.into_bytes())?;
+    }
+    let frozen: Vec<(usize, (u32, u32))> = wb.sheets.iter().enumerate().filter(|(_, sh)| sh.freeze != (0, 0)).map(|(i, sh)| (i, sh.freeze)).collect();
+    if !frozen.is_empty() {
+        let mut w = Writer::new();
+        w.var(frozen.len() as u64);
+        for (i, (r, c)) in frozen {
+            w.u16(i as u16);
+            w.u32(r);
+            w.u32(c);
+        }
+        c.add(FREEZE, &w.into_bytes())?;
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if !sh.merges.is_empty() {
@@ -743,6 +756,26 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             if sh.tab_color.replace(color & 0xFF_FFFF).is_some() {
                 return Err(LoadError::Bad("a sheet's tab colour twice"));
             }
+        }
+        done(&r)?;
+    }
+
+    for i in of(FREEZE) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more frozen panes than sheets"));
+        }
+        for _ in 0..n {
+            let (s, rows, cols) = (r.u16()? as usize, r.u32()?, r.u32()?);
+            if rows >= MAX_ROWS || cols >= MAX_COLS || (rows, cols) == (0, 0) {
+                return Err(LoadError::Bad("frozen panes"));
+            }
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("frozen panes on a sheet that does not exist")) };
+            if sh.freeze != (0, 0) {
+                return Err(LoadError::Bad("a sheet's frozen panes twice"));
+            }
+            sh.freeze = (rows, cols);
         }
         done(&r)?;
     }

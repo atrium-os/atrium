@@ -1489,6 +1489,10 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     super::chart::read_frames(&mut wb, &z, frames, &mut rep);
     // Macros, kept inert.
     super::macros::read(&z, &mut wb, &mut rep)?;
+    // Frozen panes, from the view settings.
+    if let Some(s) = z.read_name("settings.xml")? {
+        super::settings::read(&mut wb, &s);
+    }
     out.report.merge(rep);
     Ok((wb, out))
 }
