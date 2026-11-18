@@ -5885,8 +5885,11 @@ prompt row, naming "L5 hello by Atrium", what it asks for and that it isn't inst
 App probe (`link-probe` reading `atrium-app://org.atrium.l5hello` from its bundle's
 `link-probe.url`) asks with Enter, portcullisd answers "to install first", the install sheet
 shows (`confined-10-install.png`), Up and Enter on Install installs it for App probe's uid
-(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 108/108 on 2026-11-18
-(106/106 before the app prompt); 98/98 earlier that day. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
+(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 110/110 on 2026-11-18 with the
+refused paste (App probe, Personal, pastes with Ctrl-V what Copy address copied in Work: tabulad
+refuses and frescod's strip says "paste refused: copied in work", `confined-10-paste-refused.png`;
+App probe's bundle has `clipboard = true`; the script stops tabulad before copying it, as a running
+binary can't be overwritten); 108/108 before that, 106/106 before the app prompt; 98/98 earlier that day. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds

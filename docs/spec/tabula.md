@@ -240,8 +240,9 @@ another app, in that app's persona: only from the uids in `TABULA_FOR_OTHERS` (d
 Pergola's and the Terminal's clients default to it) and runs as `_tabula` (65039), the uid
 frescod lets spend copy and paste presses. Tested in `tabula/tests/wire.rs` (Work to Personal
 and back, a drag, the switch one way only, Copy address and a stranger's `for_uid`) and in the
-VM by `scripts/navigator-confined-vm.sh`. Not yet: frescod's strip note "copied in Work" on a
-refused paste, and tabulad in a jail of its own (the person's `policy.toml` must stay readable
+VM by `scripts/navigator-confined-vm.sh`. A paste or drop refused this way asks frescod for the
+strip note "paste refused: copied in <persona>" over the pressed window (frescod's `NOTE`, only
+for the press tabulad just spent; personas.md §6, built 2026-11-18). Not yet: tabulad in a jail of its own (the person's `policy.toml` must stay readable
 to it).
 
 ## 4. Drag and drop
