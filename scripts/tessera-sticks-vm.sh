@@ -36,7 +36,8 @@ fails=0
 check() { # name expected actual
     if [ "$2" = "$3" ]; then echo "  PASS $1"; else echo "  FAIL $1: expected [$2] got [$3]"; fails=$((fails+1)); fi
 }
-T=/root/stick-test
+# Not under /root (0700): alice and bob must reach the media socket.
+T=/var/tmp/stick-test
 S=$T/media.sock
 D=/usr/local/bin/atrium-dispensatord
 KL=/root/sealed/tessera-keyload
@@ -49,7 +50,7 @@ BIN="$ROOT/dispensator/target/$TARGET/release/atrium-dispensatord"
 g "test -c /dev/tesserakeys && test -x $KL && test -S $A" || { echo "sticks: needs tessera_fs, /root/sealed and arcad (see the header)"; exit 1; }
 
 echo "=== setup"
-g "service atrium-dispensatord onestop >/dev/null 2>&1; pkill -f 'atrium-dispensatord --rules $T' ; rm -rf $T; mkdir -p $T/rules /media"
+g "service atrium-dispensatord onestop >/dev/null 2>&1; pkill -f 'atrium-dispensatord --rules $T' ; rm -rf $T; mkdir -p $T/rules /media; chmod 755 $T"
 scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q "$BIN" root@localhost:/tmp/atrium-dispensatord
 g "install -m 755 /tmp/atrium-dispensatord $D"
 g "id _dispensator-vk >/dev/null 2>&1 || pw useradd _dispensator-vk -u 65043 -d /nonexistent -s /usr/sbin/nologin"
@@ -136,5 +137,6 @@ echo "=== cleanup"
 g "umount /media/$PART 2>/dev/null; pkill -f 'atrium-dispensatord --rules $T'; sleep 1; mdconfig -d -u $MD3; $KL drop $K >/dev/null 2>&1; true"
 echo "--- dispensatord log"
 g "cat $T/d.log" | tail -30
+g "rm -rf $T"
 echo "sticks: $fails failed"
 [ "$fails" = 0 ]
