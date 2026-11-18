@@ -1,6 +1,6 @@
 # The share sheet: handing one item to an app the person picks
 
-Status: built 2026-11-18; VM gate `scripts/vm-share-check.sh` 16/16 on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18. Crate `share-sheet/`
+Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 16/16 (limend-dev) and `scripts/vm-share-jail-check.sh` 13/13 (real jails). Crate `share-sheet/`
 (the service and two demo apps), role messages `limen::share` and `limen::share_target`,
 limend's `CHOOSE`. Assigned to the Pergola thread on 2026-11-06 (pergola.md §1), built by
 the share-sheet thread.
@@ -166,14 +166,28 @@ Built and tested on Linux:
   the chosen app is what portcullisd is asked to start; a cancel chooses nothing.
 - `limen` unit tests for both message sets and `Incoming`; portcullis-toml for the manifest.
 
+In the amd64 cloud VM, on headless frescod with its real activation table (only `_share` 65045
+may spend `SHARE`) and injected clicks:
+
+- `scripts/vm-share-check.sh` (16/16, limend-dev, targets unconfined as `sharetgt`): no press
+  gives `Failed`; Photos and Scraps are listed but not Maps nor the app itself; a press beside
+  the sheet does nothing; the picture arrives by descriptor; Cancel starts nothing.
+- `scripts/vm-share-jail-check.sh` (13/13) runs it confined: the real limend as `_limen`
+  (65022), portcullisd, the share sheet as `_share`, and three dev builds Run from a Scratch
+  workspace (Notes with `embeds = ["share"]`, Scraps and Photos as targets). A click in jailed
+  Notes brings the sheet up; it lists alice's Photos and Scraps from their manifests; a click on
+  Scraps makes portcullisd start it for Notes' instance as its own uid (`atrium-app-5000N`,
+  not Notes' and not limend's); Scraps gets the title, the picture by descriptor and the text,
+  and Keep answers `Accepted`.
+
+  Found on the way: a provider is started in portcullisd's one-shot lane, which needs a
+  memory limit, so a `share-target` manifest needs `[resources] memory`. A Run installs only
+  the entry and its libraries, not other files in the project (share-demo writes its picture in
+  its home when the bundle has none).
+
 Not done yet:
 
-- **The VM gate with real jails**: `scripts/vm-share-check.sh` (16/16) runs frescod's real
-  activation table (only `_share` 65045 may spend `SHARE`), injected clicks (Share, Scraps,
-  Keep, Cancel) and `pergola::share`, but limend is `limend-dev` (targets start unconfined as
-  `sharetgt`) and nothing runs in a jail or under Forum yet. It also checks: no press gives
-  `Failed`; Photos and Scraps are listed but not Maps nor the app itself; a press beside the
-  sheet does nothing; the picture arrives by descriptor; Cancel starts nothing.
+- Under Forum: the gates click straight into frescod; no launcher or Forum session is running.
 - Escape and keyboard choice in the sheet; app icons in the list (names only now).
 - Sharing across personas (refused by construction: targets run in the parent's persona).
 - Curia: the person's ordering or hiding of targets.

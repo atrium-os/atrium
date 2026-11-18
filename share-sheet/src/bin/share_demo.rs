@@ -13,7 +13,9 @@
 //! The app never learns which apps could take it, nor which one did.
 //!
 //!   SHARE_TEXT=...        [a line of notes] the text shared
-//!   SHARE_FILE=path       also share this file by descriptor
+//!   SHARE_FILE=path       also share this file by descriptor (else
+//!                         `share-me.png` in the bundle, else a small
+//!                         one it writes in its home)
 //!   SHARE_FILE_MIME=type  [image/png] its type
 //!   SHARE_UNASKED=1       open the sheet at start, without a press (the
 //!                         gate's check that the sheet refuses it)
@@ -38,6 +40,9 @@ use pergola::theme::{font, size::em, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::window::StepResult;
 use pergola::{App, Color, Mutable, SizeSpec, TextStyle, Window, WindowDesc};
+
+/// The picture shared when nothing else is: a PNG signature and a mark.
+const PICTURE: &[u8] = b"\x89PNG\r\n\x1a\n-a-picture-";
 
 /// The sheet's slot, then the target's.
 const SLOTS: (u64, u64) = (1, 2);
@@ -76,7 +81,19 @@ impl View for Demo {
 
 fn main() {
     let text = std::env::var("SHARE_TEXT").unwrap_or_else(|_| "Groceries: rice, lentils, coriander".into());
-    let file = std::env::var("SHARE_FILE").ok();
+    // Without SHARE_FILE, a `share-me.png` in the app's own bundle (beside
+    // `bin/`), else one it writes in its home: how the jailed gate, which
+    // can't set the environment (and whose Run installs only `bin/`), gets a
+    // picture to share.
+    let file = std::env::var("SHARE_FILE").ok().or_else(|| {
+        let p = std::env::current_exe().ok()?.parent()?.parent()?.join("share-me.png");
+        p.exists().then(|| p.to_string_lossy().into_owned())
+    }).or_else(|| {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let p = home.join("share-me.png");
+        std::fs::write(&p, PICTURE).map_err(|e| eprintln!("share-demo: {}: {e}", p.display())).ok()?;
+        Some(p.to_string_lossy().into_owned())
+    });
     let file_mime = std::env::var("SHARE_FILE_MIME").unwrap_or_else(|_| "image/png".into());
     let until = std::env::var("SHARE_SECS").ok().and_then(|s| s.parse::<u64>().ok()).map(|s| Instant::now() + Duration::from_secs(s));
     let mut unasked = std::env::var_os("SHARE_UNASKED").is_some();

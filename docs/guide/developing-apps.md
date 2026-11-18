@@ -96,6 +96,9 @@ Two templates show an app split into a core and a worker
   press Keep. It asks for no network and no graphics of its own; its
   window comes from the app that shares. Try it with `share-demo` from
   `share-sheet/`.
+  A provider is started as a one-shot jail, so its manifest needs
+  `[resources] memory` (for example `memory = "256M"`); portcullisd
+  refuses to start one without.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
