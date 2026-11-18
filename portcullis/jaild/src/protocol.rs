@@ -25,6 +25,10 @@ use crate::JaildError;
 /// we'd reasonably build.
 pub const MAX_FRAME_BYTES: u32 = 64 * 1024;
 
+/// How many descriptors a one-shot's caller may pass past its stdio, for the
+/// program at 3, 4, ... (ExecSpec::stdio).
+pub const MAX_EXTRA_FDS: usize = 8;
+
 /// All requests jaild accepts. New variants are additive — older
 /// jaild fails with `Response::Error` on unknown variants.
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -949,20 +949,26 @@ fn handle_exec_instance(
             message: "protocol violation: data buffered before fd handoff".into(),
         });
     }
-    let fds = match portcullis_ipc::recv_fds(reader.get_ref(), 3) {
+    /* A worker (WorkerCall) may get a few descriptors past its stdio, at 3,
+     * 4, ... in its jail: what its app hands it (the Player's codec and CDM
+     * sockets). Everything else takes exactly three. */
+    let most = if worker.is_some() { 3 + jaild::protocol::MAX_EXTRA_FDS } else { 3 };
+    let fds = match portcullis_ipc::recv_fds(reader.get_ref(), most) {
         Ok(v) => v,
         Err(e) => return write_response(writer, &Response::LaunchFailed {
             stage: "fdpass".into(), message: format!("recv_fds: {e}"),
         }),
     };
-    if fds.len() != 3 {
+    if fds.len() < 3 || fds.len() > most {
         return write_response(writer, &Response::LaunchFailed {
             stage: "fdpass".into(),
-            message: format!("expected 3 fds, got {}", fds.len()),
+            message: if most > 3 { format!("expected 3 to {most} fds, got {}", fds.len()) }
+                     else { format!("expected 3 fds, got {}", fds.len()) },
         });
     }
     let mut it = fds.into_iter();
     let stdio = [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()];
+    let extra_fds: Vec<OwnedFd> = it.collect();
     let stdio = match prepare {
         None => stdio,
         Some(f) => match f(stdio) {
@@ -1000,7 +1006,7 @@ fn handle_exec_instance(
     let watch = jail_name_for(&spec).and_then(|name| {
         reader.get_ref().try_clone().ok().map(|c| end_jail_on_hangup(c, name))
     });
-    let resp = match portcullis_oneshot::run_with_stdio(&spec, Some(stdio)) {
+    let resp = match portcullis_oneshot::run_with_fds(&spec, Some(stdio), extra_fds) {
         // The worker's own status (jaild reaps it); None = killed by a signal.
         portcullis_oneshot::OneShot::Exit { code, .. } =>
             Response::LaunchExit { code },
