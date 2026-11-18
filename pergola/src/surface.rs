@@ -174,6 +174,10 @@ pub struct FrescoSurface {
     atlas_seen: Option<u64>,
     /// The atlas's texture slot.
     atlas_slot: u32,
+    /// The same for the atlas's colour twin (slot
+    /// `color_atlas_slot(atlas_slot)`).
+    color_gen: u64,
+    color_seen: Option<u64>,
     /// Images bound to texture slots, by image id.
     images: std::collections::HashSet<u32>,
     /// Where this window's drawn edges went.
@@ -196,6 +200,7 @@ pub struct FrescoSurface {
 struct WindowState {
     scrolls: std::collections::HashMap<u32, (fresco_protocol::GroupParams, Option<[f32; 9]>)>,
     atlas_seen: Option<u64>,
+    color_seen: Option<u64>,
     images: std::collections::HashSet<u32>,
     edges: Edges,
     sent: std::collections::HashMap<u32, (Node, Option<NodeId>, u32)>,
@@ -551,7 +556,7 @@ impl FrescoSurface {
         let scale = conn.window_scale(window_id);
         Self {
             conn, window_id, fonts: std::collections::HashMap::new(), scale, scrolls: Default::default(),
-            atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, atlas_slot: next_atlas_slot(), images: Default::default(),
+            atlas: crate::glyphs::Atlas::new(), atlas_gen: 0, atlas_seen: None, atlas_slot: next_atlas_slot(), color_gen: 0, color_seen: None, images: Default::default(),
             edges: Default::default(),
             sent: Default::default(),
             others: Default::default(),
@@ -593,6 +598,7 @@ impl FrescoSurface {
         let mine = WindowState {
             scrolls: std::mem::take(&mut self.scrolls),
             atlas_seen: self.atlas_seen,
+            color_seen: self.color_seen,
             images: std::mem::take(&mut self.images),
             edges: std::mem::take(&mut self.edges),
             sent: std::mem::take(&mut self.sent),
@@ -601,6 +607,7 @@ impl FrescoSurface {
         let w = self.others.remove(&window).unwrap_or_default();
         self.scrolls = w.scrolls;
         self.atlas_seen = w.atlas_seen;
+        self.color_seen = w.color_seen;
         self.images = w.images;
         self.edges = w.edges;
         self.sent = w.sent;
@@ -650,7 +657,7 @@ impl FrescoSurface {
                 out.push(fresco_protocol::GlyphInstance {
                     // Whole device pixels: the atlas has no sub-pixel variants.
                     dx: (g.dx * k).round(), dy: (g.dy * k).round(),
-                    atlas_u: e.u, atlas_v: e.v, atlas_w: e.w, atlas_h: e.h,
+                    atlas_u: if e.color { e.u | fresco_protocol::GLYPH_COLOR } else { e.u }, atlas_v: e.v, atlas_w: e.w, atlas_h: e.h,
                     bearing_x: e.left, bearing_y: e.top,
                 });
             }
@@ -669,6 +676,23 @@ impl FrescoSurface {
             self.atlas_gen += 1;
         }
         self.atlas_seen = Some(self.atlas_gen);
+        // The colour twin, the same way, once an emoji made it.
+        let cslot = fresco_protocol::color_atlas_slot(self.atlas_slot);
+        if self.color_seen != Some(self.color_gen) {
+            if self.atlas.take_color_dirty().is_some() {
+                self.color_gen += 1;
+            }
+            if let Some(px) = self.atlas.color_pixels() {
+                let hash = self.conn.upload_blob(px)?;
+                self.conn.slot_set_texture(cslot, hash, crate::glyphs::COLOR_W, crate::glyphs::COLOR_H, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
+                self.color_seen = Some(self.color_gen);
+            }
+        } else if let Some((y, rows, px)) = self.atlas.take_color_dirty() {
+            let px = px.to_vec();
+            self.conn.slot_update_region(cslot, 0, y, crate::glyphs::COLOR_W, rows, px)?;
+            self.color_gen += 1;
+            self.color_seen = Some(self.color_gen);
+        }
         Ok(fresco_protocol::GlyphRunParams {
             x: (origin.x * k).round(), y: (origin.y * k).round(),
             atlas_slot_id: self.atlas_slot, atlas_width: ATLAS_W, atlas_height: ATLAS_H,

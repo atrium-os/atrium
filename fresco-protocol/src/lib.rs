@@ -2438,8 +2438,9 @@ pub struct GlyphRunParams {
 /// `GlyphInstance::atlas_u` bit: the glyph is a colour glyph (emoji) on
 /// the run's colour atlas, slot [`color_atlas_slot`] of the run's
 /// `atlas_slot_id`, an RGBA8 texture drawn in its own colours at the run's
-/// opacity (docs/spec/fonts.md §6). Only frescod's own text sets it; a
-/// client's run has it cleared.
+/// opacity (docs/spec/fonts.md §6). frescod's own text sets it, and so
+/// does a client's app-shaped text (Pergola's atlas) once the window has
+/// bound the colour slot; otherwise frescod clears it.
 pub const GLYPH_COLOR: u32 = 0x8000_0000;
 
 /// A colour atlas's size in texels.

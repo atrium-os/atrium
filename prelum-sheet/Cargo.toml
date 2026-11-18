@@ -1,0 +1,34 @@
+[package]
+name = "prelum-sheet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "The print sheet (docs/spec/printing.md §5.2): Limen's print role, drawn over the app's window. It lists the person's printers, printers nearby and Save as PDF, shows previews a render jail drew, and sends the job to prelumd only on the person's own press."
+
+[lib]
+name = "prelum_sheet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-prelum-sheet"
+path = "src/bin/prelum-sheet.rs"
+
+# An app that prints: the other end of the sheet, for the VM check and as
+# the example of how an app prints with pergola::print.
+[[bin]]
+name = "prelum-print-demo"
+path = "src/bin/print-demo.rs"
+
+[dependencies]
+prelum-proto = { path = "../prelum/prelum-proto" }
+prelum-ipp-codec = { path = "../prelum/prelum-ipp-codec", features = ["serde"] }
+limen = { path = "../limen" }
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
+aqueduct = { path = "../aqueduct" }
+postcard = { version = "1", features = ["use-std"] }
+libc = "0.2"
+
+[workspace]

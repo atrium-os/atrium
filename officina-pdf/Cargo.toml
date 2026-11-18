@@ -14,6 +14,8 @@ navigator-image = { path = "../navigator-image", features = ["office"] }
 folium-syntax = { path = "../folium-syntax" }
 folium-font = { path = "../folium-font" }
 folium-content = { path = "../folium-content" }
+# Colour glyphs (emoji) drawn as pictures.
+atrium-colr = { path = "../atrium-colr" }
 
 [profile.release]
 debug = 1

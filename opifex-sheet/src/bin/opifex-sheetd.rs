@@ -373,8 +373,13 @@ fn main() {
     // `opifex-sheetd ask <id>`: a caller, for tests and scripts.
     let args: Vec<String> = std::env::args().collect();
     if let [_, ask, id] = &args[..] {
-        if ask == "ask" || ask == "add-catalog" {
-            let r = if ask == "ask" { opifex_sheet::install(id) } else { opifex_sheet::add_catalog(id) };
+        if ask == "ask" || ask == "add-catalog" || ask == "side-load" {
+            let r = match ask.as_str() {
+                "ask" => opifex_sheet::install(id),
+                "add-catalog" => opifex_sheet::add_catalog(id),
+                // The file opened here, by the asker, and handed over (§7.4).
+                _ => std::fs::File::open(id).and_then(|f| opifex_sheet::side_load(&f)),
+            };
             match r {
                 Ok(a) => println!("{a:?}"),
                 Err(e) => {

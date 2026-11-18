@@ -1373,10 +1373,14 @@ impl EnvelopeFrontend {
             scene_ops::ATRIUM_TEXT_GLYPH_RUN => {
                 let mut inner: GlyphRunParams = decode(&p.params)
                     .map_err(|_| DispatchError::BadPayload)?;
-                // Colour glyphs are frescod's own text's: a client's run
-                // names only its own atlas.
-                for g in &mut inner.glyphs {
-                    g.atlas_u &= !fresco_protocol::GLYPH_COLOR;
+                // A client's colour glyphs (emoji in app-shaped text) are
+                // on its atlas's colour twin, which this window must have
+                // bound itself; otherwise the mark is dropped.
+                let twin = fresco_protocol::color_atlas_slot(inner.atlas_slot_id);
+                if !s.slot_table.contains_key(&twin) {
+                    for g in &mut inner.glyphs {
+                        g.atlas_u &= !fresco_protocol::GLYPH_COLOR;
+                    }
                 }
                 s.leaf_replaces(p.node_id);
                 s.glyph_run_nodes.insert(p.node_id, inner);

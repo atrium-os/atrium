@@ -216,12 +216,19 @@ pub fn back_transform(duplex: Duplex, sheet_back: &str, back: bool) -> (i32, i32
     }
 }
 
+/// Where drawn sheets go: a raster writer, or [`preview`]'s images.
+trait Sheets {
+    fn begin(&mut self, h: &PageHeader) -> Result<(), Error>;
+    fn row(&mut self, r: &[u8]) -> Result<(), Error>;
+    fn end(&mut self) -> Result<(), Error>;
+}
+
 enum Sink<W: Write> {
     Pwg(PwgWriter<W>),
     Urf(UrfWriter<W>),
 }
 
-impl<W: Write> Sink<W> {
+impl<W: Write> Sheets for Sink<W> {
     fn begin(&mut self, h: &PageHeader) -> Result<(), Error> {
         match self {
             Sink::Pwg(w) => w.begin_page(h)?,
@@ -243,6 +250,9 @@ impl<W: Write> Sink<W> {
         }
         Ok(())
     }
+}
+
+impl<W: Write> Sink<W> {
     fn finish(self) -> Result<W, Error> {
         Ok(match self {
             Sink::Pwg(w) => w.finish()?,
@@ -264,6 +274,19 @@ pub fn sheet_count(s: &Settings) -> u32 {
     s.pages.len().div_ceil(per) as u32
 }
 
+fn check(doc: &Doc, s: &Settings) -> Result<(f64, f64), Error> {
+    if s.pages.is_empty() {
+        return Err(Error::Empty);
+    }
+    if s.pages.iter().any(|p| *p >= doc.page_count()) {
+        return Err(Error::Settings("page out of range"));
+    }
+    if !matches!(s.per_sheet, 1 | 2 | 4) {
+        return Err(Error::Settings("pages per sheet"));
+    }
+    media_size_pt(&s.media).ok_or(Error::Settings("media"))
+}
+
 /// Draws the selected pages of `doc` into `out` as PWG Raster or URF.
 /// `progress` is called after each sheet with (sheets done, sheets).
 pub fn render<W: Write>(
@@ -274,26 +297,92 @@ pub fn render<W: Write>(
     cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(u32, u32),
 ) -> Result<(W, Stats), Error> {
-    if s.pages.is_empty() {
-        return Err(Error::Empty);
-    }
-    if s.pages.iter().any(|p| *p >= doc.page_count()) {
-        return Err(Error::Settings("page out of range"));
-    }
-    if !matches!(s.per_sheet, 1 | 2 | 4) {
-        return Err(Error::Settings("pages per sheet"));
-    }
+    check(doc, s)?;
     if !(72..=1200).contains(&s.dpi) {
         return Err(Error::Settings("resolution"));
     }
-    let (mw, mh) = media_size_pt(&s.media).ok_or(Error::Settings("media"))?;
-    let dpi = s.dpi as f64;
-    let (sw, sh) = ((mw * dpi / 72.0).round() as u32, (mh * dpi / 72.0).round() as u32);
     let sheets = sheet_count(s);
     let mut sink = match format {
         RasterFormat::Pwg => Sink::Pwg(PwgWriter::new(out)?),
         RasterFormat::Urf => Sink::Urf(UrfWriter::new(out, sheets)?),
     };
+    let stats = draw_sheets(doc, s, &mut sink, 0..sheets, cancel, progress)?;
+    Ok((sink.finish()?, stats))
+}
+
+/// One sheet as the print sheet shows it (printing.md §5.2): 8-bit sRGB,
+/// `w` x `h`, rows top to bottom, no transform for the back of a sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    /// 1-based.
+    pub sheet: u32,
+    pub w: u32,
+    pub h: u32,
+    pub rgb: Vec<u8>,
+}
+
+/// The longest side of a preview, in pixels.
+pub const MAX_PREVIEW: u32 = 400;
+/// The most sheets one [`preview`] call draws.
+pub const MAX_PREVIEWS: u32 = 8;
+
+struct Collect {
+    out: Vec<Preview>,
+    next: u32,
+}
+
+impl Sheets for Collect {
+    fn begin(&mut self, h: &PageHeader) -> Result<(), Error> {
+        self.next += 1;
+        self.out.push(Preview { sheet: self.next, w: h.width, h: h.height, rgb: Vec::with_capacity((h.width * h.height * 3) as usize) });
+        Ok(())
+    }
+    fn row(&mut self, r: &[u8]) -> Result<(), Error> {
+        if let Some(p) = self.out.last_mut() {
+            p.rgb.extend_from_slice(r);
+        }
+        Ok(())
+    }
+    fn end(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Small images of sheets `first..first+count` (from 1) laid out as `s`
+/// would print them, the longer side at most `longest` pixels (at most
+/// [`MAX_PREVIEW`]); and how many sheets there are in all. `s.dpi`,
+/// `s.duplex` and `s.color` are ignored: previews are sRGB and face up.
+pub fn preview(doc: &Doc, s: &Settings, first: u32, count: u32, longest: u32, cancel: &dyn Fn() -> bool) -> Result<(u32, Vec<Preview>), Error> {
+    let (mw, mh) = check(doc, s)?;
+    let longest = longest.clamp(16, MAX_PREVIEW) as f64;
+    let mut p = s.clone();
+    // A resolution the long side comes out at, at most `longest`.
+    p.dpi = ((longest * 72.0 / mw.max(mh)).floor() as u32).max(1);
+    p.color = ColorSpace::SRgb8;
+    p.duplex = Duplex::Simplex;
+    let sheets = sheet_count(&p);
+    let first = first.max(1);
+    let last = first.saturating_add(count.min(MAX_PREVIEWS)).min(sheets + 1);
+    let mut c = Collect { out: Vec::new(), next: first - 1 };
+    if first <= sheets {
+        draw_sheets(doc, &p, &mut c, first - 1..last - 1, cancel, &mut |_, _| {})?;
+    }
+    Ok((sheets, c.out))
+}
+
+/// Draws sheets `range` (from 0) of `s` into `sink`.
+fn draw_sheets(
+    doc: &Doc,
+    s: &Settings,
+    sink: &mut dyn Sheets,
+    range: std::ops::Range<u32>,
+    cancel: &dyn Fn() -> bool,
+    progress: &mut dyn FnMut(u32, u32),
+) -> Result<Stats, Error> {
+    let (mw, mh) = check(doc, s)?;
+    let dpi = s.dpi as f64;
+    let (sw, sh) = ((mw * dpi / 72.0).round() as u32, (mh * dpi / 72.0).round() as u32);
+    let sheets = sheet_count(s);
     let shared = Shared::new();
     let renderer = Renderer::new();
     let bpp = s.color.bytes_per_pixel();
@@ -301,6 +390,9 @@ pub fn render<W: Write>(
     let grid = cells(sw as f64, sh as f64, s.per_sheet);
 
     for (sheet_no, chunk) in s.pages.chunks(s.per_sheet as usize).enumerate() {
+        if !range.contains(&(sheet_no as u32)) {
+            continue;
+        }
         // Read and lay out this sheet's pages.
         let mut placed: Vec<(Placement, DisplayList)> = Vec::new();
         for (slot, &index) in chunk.iter().enumerate() {
@@ -373,7 +465,7 @@ pub fn render<W: Write>(
         stats.sheets += 1;
         progress(stats.sheets, sheets);
     }
-    Ok((sink.finish()?, stats))
+    Ok(stats)
 }
 
 fn mirror(row: &mut [u8], bpp: usize) {
