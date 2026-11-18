@@ -25,6 +25,8 @@ use pergola::{App, Color, Mutable, SizeSpec, TextStyle, Window, WindowDesc};
 
 use {{crate}}::{Ask, Picture};
 
+/// The window's size when it opens; Forum may give it another, and the
+/// picture follows.
 const W: f32 = 800.0;
 const H: f32 = 600.0;
 
@@ -37,6 +39,8 @@ enum Shown {
 
 struct Main {
     shown: Mutable<Shown>,
+    /// The window's size, in points.
+    size: Mutable<(f32, f32)>,
 }
 
 fn text(ctx: &mut Ctx, y: f32, s: String, size: f32, weight: Weight) {
@@ -60,10 +64,11 @@ impl View for Main {
             }
             Shown::Picture(image) => {
                 // Fit it into the window, never larger than it is.
+                let (ww, wh) = self.size.get();
                 let (pw, ph) = (image.data().width as f32, image.data().height as f32);
-                let s = (W / pw).min(H / ph).min(1.0);
+                let s = (ww / pw).min(wh / ph).min(1.0);
                 let (w, h) = (pw * s, ph * s);
-                ctx.add(Node::Image { rect: Rect::new((W - w) / 2.0, (H - h) / 2.0, w, h), image });
+                ctx.add(Node::Image { rect: Rect::new((ww - w) / 2.0, (wh - h) / 2.0, w, h), image });
             }
         }
     }
@@ -124,7 +129,8 @@ fn main() {
     std::thread::spawn(move || opener(tx));
     let dirty = Arc::new(AtomicBool::new(true));
     let shown = Mutable::with_dirty(Shown::Nothing, dirty.clone());
-    let mut app = App::new_with_flag(Main { shown: shown.clone() }, dirty);
+    let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
+    let mut app = App::new_with_flag(Main { shown: shown.clone(), size: size.clone() }, dirty);
     loop {
         match win.step(&mut app, Some(Duration::from_millis(100))) {
             Ok(StepResult::Closed) => break,
@@ -136,6 +142,9 @@ fn main() {
         }
         while let Ok(s) = rx.try_recv() {
             shown.set(s);
+        }
+        if size.get() != (win.width, win.height) {
+            size.set((win.width, win.height));
         }
     }
 }
