@@ -84,6 +84,9 @@ pub enum Kind {
     /// process. Scope `key_id[16] | volume uuid[16] | group u64 LE`; value
     /// `key[32] | high_water u64 LE`; account is the label.
     VolumeKey = 0x103,
+    /// A WireGuard static key (X25519, vpn.md §4.3): used only through
+    /// `DH_X25519`, never released. Value: the 32-byte private scalar.
+    WireGuardKey = 0x104,
 }
 
 impl Kind {
@@ -102,6 +105,7 @@ impl Kind {
             0x101 => P256,
             0x102 => Symmetric,
             0x103 => VolumeKey,
+            0x104 => WireGuardKey,
             _ => return Err(Error::Corrupt("unknown kind")),
         })
     }
