@@ -11,7 +11,13 @@
 //!     [--per-sheet 1|2|4] [--scale fit|shrink|PERCENT] [--title T] [--wait]
 //! prelumctl jobs
 //! prelumctl cancel|release JOB
+//! prelumctl preview FILE.pdf OUT_DIR [--media KEYWORD] [--pages 1-3] [--per-sheet N]
+//!     [--first N] [--count N] [--longest PX]  sheets as OUT_DIR/sheet-N.ppm
+//! prelumctl save-pdf FILE.pdf OUT.pdf [--media KEYWORD] [--pages 1-3] [--per-sheet N]
 //! ```
+//!
+//! `--for APP_UID` (before the command) asks prelumd to act for that app's
+//! person first, as prelum-sheet does; only prelum-sheet's uid may.
 //!
 //! PRINTER is a printer's number or name. `print --wait` follows the job
 //! and exits 0 only when it is done.
@@ -21,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use prelum_ipp_codec::ops::{ColorMode, Quality, Sides};
-use prelum_proto::print::{client::Client, Add, Phase, Print, Printer, Rename, Scale};
+use prelum_proto::print::{client::Client, Add, Layout, Phase, PreviewReq, Print, Printer, Rename, Scale};
 
 const SOCKET: &str = "/atrium/sockets/print/print.sock";
 
@@ -71,6 +77,11 @@ fn main() -> ExitCode {
         socket = a[1].clone().into();
         a.drain(..2);
     }
+    let mut act_for: Option<u32> = None;
+    if a.first().map(String::as_str) == Some("--for") && a.len() > 1 {
+        act_for = a[1].parse().ok();
+        a.drain(..2);
+    }
     let Some(cmd) = a.first().cloned() else {
         return die("usage: prelumctl printers|nearby|add|remove|rename|repin|identify|refresh|print|jobs|cancel|release …");
     };
@@ -78,6 +89,12 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return die(format!("{}: {e}", socket.display())),
     };
+    if let Some(app) = act_for {
+        match c.act_for(app) {
+            Ok(persona) => eprintln!("prelumctl: acting for app uid {app} (persona {:?})", if persona.is_empty() { "Personal" } else { &persona }),
+            Err(e) => return die(e),
+        }
+    }
     let arg = |i: usize| a.get(i).cloned().unwrap_or_default();
     let r: Result<(), String> = (|| match cmd.as_str() {
         "printers" => {
@@ -217,6 +234,44 @@ fn main() -> ExitCode {
                     _ => {}
                 }
             }
+        }
+        "preview" | "save-pdf" => {
+            let (file, out) = (arg(1), arg(2));
+            let mut l = Layout::new("iso_a4_210x297mm");
+            let (mut first, mut count, mut longest) = (1u32, 8u8, 300u16);
+            let mut i = 3;
+            while i < a.len() {
+                let (k, v) = (a[i].as_str(), arg(i + 1));
+                i += 2;
+                match k {
+                    "--media" => l.media = v,
+                    "--pages" => l.pages = Some(v),
+                    "--per-sheet" => l.per_sheet = v.parse().map_err(|_| "bad --per-sheet")?,
+                    "--first" => first = v.parse().map_err(|_| "bad --first")?,
+                    "--count" => count = v.parse().map_err(|_| "bad --count")?,
+                    "--longest" => longest = v.parse().map_err(|_| "bad --longest")?,
+                    _ => return Err(format!("unknown option {k}")),
+                }
+            }
+            let f = std::fs::File::open(&file).map_err(|e| format!("{file}: {e}"))?;
+            if cmd == "save-pdf" {
+                let (n, mut pdf) = c.save_pdf(&l, &f).map_err(|e| e.to_string())?;
+                let mut o = std::fs::File::create(&out).map_err(|e| format!("{out}: {e}"))?;
+                std::io::copy(&mut pdf, &mut o).map_err(|e| format!("{out}: {e}"))?;
+                println!("saved {n} bytes");
+                return Ok(());
+            }
+            let p = c.preview(&PreviewReq { layout: l, first, count, longest }, &f).map_err(|e| e.to_string())?;
+            println!("{} sheets", p.sheets);
+            std::fs::create_dir_all(&out).map_err(|e| format!("{out}: {e}"))?;
+            for im in p.images {
+                let mut b = format!("P6\n{} {}\n255\n", im.w, im.h).into_bytes();
+                b.extend_from_slice(&im.rgb);
+                let path = format!("{out}/sheet-{}.ppm", im.sheet);
+                std::fs::write(&path, b).map_err(|e| format!("{path}: {e}"))?;
+                println!("sheet {} {}x{}", im.sheet, im.w, im.h);
+            }
+            Ok(())
         }
         _ => Err(format!("unknown command {cmd}")),
     })();

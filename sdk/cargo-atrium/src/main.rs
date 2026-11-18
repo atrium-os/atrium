@@ -24,6 +24,13 @@ Commands:
       In a workspace: build, put the core and each worker where
       atrium.toml's entries say, and ask (in the Terminal, with your press) to Run the project as an
       app, with the capabilities its manifest asks for.
+  worker add <name> [--input fd|bytes|message] [--from <path::fn>]
+             [--lifetime call|session] [--dry-run] [--json]
+      Move a part of the app into a [[workers]] entry: the manifest entry,
+      a [[bin]], src/<name>_worker.rs (the messages, the handler and the
+      core's call) and src/bin/<name>.rs. --from runs that library
+      function in the worker and lists the core's calls to it to replace
+      with <name>_worker::call. --json: what changed, for Artifex.
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer
@@ -55,6 +62,7 @@ fn main() -> ExitCode {
         Some("registry") => cmd_registry(&args[1..]),
         Some("fuzz") => cmd_fuzz(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("worker") => cmd_worker(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -64,6 +72,79 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cmd_worker(args: &[String]) -> ExitCode {
+    use cargo_atrium::worker;
+    if args.first().map(String::as_str) != Some("add") {
+        eprintln!("cargo atrium worker: add <name> [--input fd|bytes|message] [--from <path::fn>] [--lifetime call|session] [--dry-run] [--json]");
+        return ExitCode::from(2);
+    }
+    let (mut name, mut input, mut from, mut lifetime) = (None, "fd".to_string(), None, "call".to_string());
+    let (mut json, mut dry) = (false, false);
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--dry-run" => dry = true,
+            "--input" => input = it.next().cloned().unwrap_or_default(),
+            "--from" => from = it.next().cloned(),
+            "--lifetime" => lifetime = it.next().cloned().unwrap_or_default(),
+            o if o.starts_with("--") => {
+                eprintln!("cargo atrium worker add: unknown flag {o}");
+                return ExitCode::from(2);
+            }
+            o => name = Some(o.to_string()),
+        }
+    }
+    let fail = |e: String| {
+        if json {
+            println!("{}", serde_json::json!({"ok": false, "error": e}));
+        } else {
+            eprintln!("cargo atrium worker add: {e}");
+        }
+        ExitCode::FAILURE
+    };
+    let Some(name) = name else { return fail("a name, e.g. cargo atrium worker add decode".into()) };
+    let Some(input) = worker::Input::parse(&input) else { return fail(format!("--input {input:?}: fd, bytes or message")) };
+    let o = worker::AddOpts { name: &name, input, from: from.as_deref(), lifetime: &lifetime };
+    let proj = PathBuf::from(".");
+    let plan = match worker::plan(&proj, &o) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    if !dry {
+        if let Err(e) = worker::apply(&proj, &plan) {
+            return fail(e);
+        }
+    }
+    if json {
+        let v = serde_json::json!({
+            "ok": true,
+            "dry_run": dry,
+            "worker": name,
+            "input": input.as_str(),
+            "changed": plan.writes.iter().map(|w| serde_json::json!({"path": w.path, "action": if w.created { "created" } else { "edited" }})).collect::<Vec<_>>(),
+            "core_call": plan.core_call,
+            "fuzz_target": plan.fuzz_target,
+            "calls": plan.calls.iter().map(|c| serde_json::json!({"path": c.path, "line": c.line, "text": c.text})).collect::<Vec<_>>(),
+            "notes": plan.notes,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        println!("cargo atrium: {} worker {name:?} (input {}):", if dry { "would add" } else { "added" }, input.as_str());
+        for w in &plan.writes {
+            println!("  {} {}", if w.created { "created" } else { "edited " }, w.path);
+        }
+        println!("  the core calls it with {}(...); fuzz it with cargo atrium fuzz {}", plan.core_call, plan.fuzz_target);
+        for c in &plan.calls {
+            println!("  call to replace: {}:{}: {}", c.path, c.line, c.text);
+        }
+        for n in &plan.notes {
+            println!("  note: {n}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_new(args: &[String]) -> ExitCode {

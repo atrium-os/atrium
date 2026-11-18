@@ -56,6 +56,12 @@ pub fn apply_all(
         // dispensatord's media socket (device-assignment.md §6.6).
         apply_socket("removable-media.sock", jc, opts);
     }
+    if caps.removable_files == Some(true) {
+        // The install sheet's: the file manager hands it a double-clicked
+        // `.insula` as a descriptor (opifex.md §7.4). Asking only shows
+        // the person the sheet; it installs nothing by itself.
+        apply_socket("opifex-sheet", jc, opts);
+    }
     if caps.arca == Some(true) {
         // arcad (arca.md §9, app-composition.md §3 C8): the app API, which
         // arcad scopes by the peer's launch-registry identity to the app's

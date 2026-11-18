@@ -45,7 +45,7 @@ xb artifex "-p artifex --bin artifex"
 
 echo "=== install"
 B=/var/tmp/artifexchk
-V "pkill -x portcullisd; pkill -x frescod; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+V "pkill -x portcullisd; pkill -x frescod; pkill -x forum-wm; pkill -x stoad; pkill -f atrium-term-socket; pkill -x artifex; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 V "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     V "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || scp -q $K -P 2222 "$f" root@localhost:/usr/local/share/fonts/ibm-plex/
@@ -280,7 +280,10 @@ if V "test -f $W/proj/work/app/Makefile"; then
     ROW=$(rows | grep -n '^app/app.c$' | cut -d: -f1)
     press 100 $((89 + 22 * (${ROW:-1} - 1)))
     waitstate 'tabs=\[[^]]*app/app.c\]' 20 && ok "app.c of a c-app project opens" || bad "app.c: $(state)"
-    waitstate 'comp=Some(("org.example.app", 0))' 20 && ok "the composition panel has its core (org.example.app, no workers)" || bad "composition: $(state)"
+    waitstate 'comp=Some(("org.example.app", 0,' 20 && ok "the composition panel has its core (org.example.app, no workers)" || bad "composition: $(state)"
+    if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
+        waitstate 'comp=Some(("org.example.app", 0, true, true))' 300 && ok "cargo atrium check answers for it" || bad "check: $(state)"
+    fi
     ctrl 0x15                  # Ctrl+R: the project's Run task (make run)
     waitstate 'ask=Some("app")' 300 && ok "make run builds it and asks to Run app in Artifex" || bad "ask: $(state) $(V "tail -5 $B/artifex.log")"
     shot artifex-6-ask
@@ -297,8 +300,31 @@ else
     echo "  (no C SDK in the base (install-c-sdk.sh): skipped)"
 fi
 
+# The dev app took the focus, and frescod alone (no Forum) doesn't move
+# it on a click: close it, and click Artifex.
+V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+GAP=8 press 700 640
+
+echo "=== New project"
+if V "jexec ws_alice_proj test -x /atrium/toolchains/rust/bin/cargo-atrium"; then
+    press 962 52               # the bar's New project (ui.rs)
+    waitstate 'templates=[2-9]' 300 && ok "New project lists the SDK's templates ($(state | sed 's/.*templates=//'))" || bad "templates: $(state)"
+    shot artifex-11-new-project
+    # The form (ui.rs: 460 wide, centred; rows 40 apart from 72 down): c-app,
+    # the name field, Create.
+    N=$(state | sed 's/.*templates=//')
+    CY=$(( (660 - 220 - 40 * N) / 2 + 30 ))
+    press 590 $((CY + 72 + 40 + 18))
+    press 590 $((CY + 72 + 40 * N + 12 + 14 + 16))
+    typ "made"
+    press 650 $((CY + 72 + 40 * N + 12 + 14 + 52 + 16))
+    waitstate 'rows=\[[^]]*made' 120 && ok "Create makes made/ from c-app" || bad "create: $(state)"
+    check "with its Makefile and made.c" "1" "$(V "test -f $W/proj/work/made/Makefile -a -f $W/proj/work/made/made.c && echo 1")"
+else
+    echo "  (no cargo-atrium in proj: skipped)"
+fi
+
 echo "=== terminal"
-GAP=8 press 700 640       # Artifex has the focus again (a dev app may have it)
 press 1080 52              # the bar's Terminal button
 i=0; while [ $i -lt 30 ] && ! V "grep -q 'console in workspace/proj' $LOG"; do sleep 2; i=$((i+2)); done
 V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's terminal" || bad "terminal: $(V "grep -i console $LOG | tail -2")"

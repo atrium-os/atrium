@@ -105,7 +105,11 @@ impl Sheet {
         if !a.description.is_empty() {
             v.push((a.description.clone(), Tone::Body));
         }
-        if a.third_party {
+        if a.local {
+            let key: String = a.publisher.chars().take(12).collect();
+            v.push((format!("{} {} from a file, signed by key {key}", a.id, a.latest), Tone::Quiet));
+            v.push(("Not from a catalog: it won't update by itself. Install it only if you know where the file came from.".into(), Tone::Marked));
+        } else if a.third_party {
             let who = if a.publisher_domains.is_empty() { a.publisher_name.clone() }
                       else { format!("{} ({})", a.publisher_name, a.publisher_domains.join(", ")) };
             v.push((format!("{} {} from {who}, in the {} catalog you added", a.id, a.latest, a.catalog), Tone::Quiet));

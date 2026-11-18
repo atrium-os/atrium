@@ -201,6 +201,15 @@ impl PinnedFonts {
         self.get(k).map(|_| k)
     }
 
+    /// `family`'s face for `ch`, its colour twin first (emoji: the screen
+    /// and the PDF writer both draw colour glyphs), when it has `ch`.
+    fn lib_face_for(&self, family: &str, f: &CharFormat, ch: char) -> Option<usize> {
+        atrium_fonts::Library::color_twin(family)
+            .into_iter()
+            .chain([family])
+            .find_map(|fam| self.lib_face(fam, f.bold, f.italic).filter(|&k| self.has(k, ch)))
+    }
+
     /// The faces for a format, in order: the family's face (or the pinned
     /// stack's), then the pinned fallbacks.
     fn stack(&self, f: &CharFormat) -> Vec<usize> {
@@ -222,7 +231,7 @@ impl PinnedFonts {
         if ch.is_whitespace() || ch.is_control() || self.has(stack[0], ch) {
             return stack[0];
         }
-        let lib = |fam: &str| self.lib_face(fam, f.bold, f.italic).filter(|&k| self.has(k, ch));
+        let lib = |fam: &str| self.lib_face_for(fam, f, ch);
         if let Some(k) = atrium_fonts::Library::script_family(ch).and_then(lib) {
             return k;
         }
@@ -276,7 +285,7 @@ impl Fonts for PinnedFonts {
             let emoji_vs = text[i + ch.len_utf8()..].starts_with('\u{FE0F}');
             let face = match segs.last() {
                 Some(&(fc, _, _)) if joins && self.has(fc, ch) => fc,
-                _ => match emoji_vs.then(|| self.lib_face("Noto Emoji", f.bold, f.italic).filter(|&k| self.has(k, ch))).flatten() {
+                _ => match emoji_vs.then(|| self.lib_face_for("Noto Emoji", f, ch)).flatten() {
                     Some(k) => k,
                     None => self.face_for(&stack, ch, f, han),
                 },
@@ -1013,10 +1022,10 @@ mod tests {
         assert_eq!(family("Arial", "नमस्ते"), ["Noto Sans Devanagari".to_string()].into());
         assert_eq!(family("", "வணக்கம் abc"), ["IBM Plex Sans".to_string(), "Noto Sans Tamil".to_string()].into());
         assert_eq!(family("", "שלום"), ["Noto Sans Hebrew".to_string()].into());
-        // Emoji draw (outlines), and a ZWJ family or a skin tone is one glyph.
-        assert_eq!(family("", "😀"), ["Noto Emoji".to_string()].into());
+        // Emoji take the colour face, and a ZWJ family or a skin tone is one glyph.
+        assert_eq!(family("", "😀"), ["Noto Color Emoji".to_string()].into());
         // VS16 takes the emoji face for a character a text face also has.
-        assert_eq!(family("", "\u{2764}\u{FE0F}"), ["Noto Emoji".to_string()].into());
+        assert_eq!(family("", "\u{2764}\u{FE0F}"), ["Noto Color Emoji".to_string()].into());
         for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇮🇳"] {
             let l = layout_para(&doc(seq), doc(seq).para(0).unwrap(), 1_000_000, &f);
             assert_eq!(l.glyphs.len(), 1, "{seq}: {:?}", l.glyphs);

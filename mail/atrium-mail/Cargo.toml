@@ -50,6 +50,7 @@ monstrator = { path = "../../monstrator" }
 # the password from its own field (KEEP_FOR).
 mail-sync = { path = "../mail-sync" }
 arca-courier = { path = "../../arca/arca-courier" }
+atrium-worker = { path = "../../sdk/atrium-worker" }
 arca-courierd = { path = "../../arca/arca-courierd" }
 arca-store = { path = "../../arca/arca-store" }
 arcad = { path = "../../arca/arcad" }

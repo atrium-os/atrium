@@ -8,3 +8,7 @@ description = "Mail's account sync (docs/spec/mail.md §6.1, §6.4): IMAP over t
 
 [dependencies]
 mail-proto = { path = "../mail-proto" }
+# The `sync` worker's wire (remote.rs).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+libc = "0.2"

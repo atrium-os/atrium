@@ -14,7 +14,7 @@
 //! (opifexd), `OPIFEX_SHEET_ACTIVATION` (frescod's activation socket).
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -42,13 +42,16 @@ fn peer_uid(s: &UnixStream) -> Option<u32> {
 }
 
 /// One request to opifexd.
-fn opifexd(r: &Request, wait: Duration) -> Result<Response, String> {
+fn opifexd(r: &Request, wait: Duration) -> Result<Response, String> { opifexd_with(r, wait, None) }
+
+/// One request to opifexd, with a file beside it (fdpass).
+fn opifexd_with(r: &Request, wait: Duration, file: Option<std::os::fd::RawFd>) -> Result<Response, String> {
     let path = std::env::var_os("OPIFEX_SOCKET").map(PathBuf::from).unwrap_or_else(|| opifex::proto::SOCKET.into());
-    let mut s = UnixStream::connect(&path).map_err(|e| format!("opifexd: {e}"))?;
+    let s = UnixStream::connect(&path).map_err(|e| format!("opifexd: {e}"))?;
     s.set_read_timeout(Some(wait)).ok();
     let mut line = serde_json::to_vec(r).map_err(|e| e.to_string())?;
     line.push(b'\n');
-    s.write_all(&line).map_err(|e| format!("opifexd: {e}"))?;
+    opifex::fdpass::write_line(&s, &line, file).map_err(|e| format!("opifexd: {e}"))?;
     let mut back = String::new();
     BufReader::new(s).read_line(&mut back).map_err(|e| format!("opifexd: {e}"))?;
     serde_json::from_str(back.trim_end()).map_err(|e| format!("opifexd: {e}"))
@@ -117,6 +120,40 @@ fn decide_catalog(asker: u32, url: &str, show: impl FnOnce(Sheet) -> Result<Outc
             let r = Request::AddCatalog { url: url.into(), root_sha256: sha, machine: false, for_uid: asker };
             match opifexd(&r, Duration::from_secs(300)) {
                 Ok(Response::CatalogAdded { name, .. }) => Answer::Added { name },
+                Ok(Response::Error { message }) => Answer::Failed { why: message },
+                Ok(other) => Answer::Failed { why: format!("opifexd: {other:?}") },
+                Err(why) => Answer::Failed { why },
+            }
+        }
+    }
+}
+
+/// A file the person opened (Scrinium hands it over): opifexd checks and
+/// holds a copy, the sheet shows it as from a file, and a counted press
+/// installs exactly that copy for the asker (opifex.md §7.4).
+fn decide_local(asker: u32, file: Option<std::os::fd::OwnedFd>, show: impl FnOnce(Sheet) -> Result<Outcome, String>) -> Answer {
+    let Some(file) = file else {
+        return Answer::Failed { why: "no file came with the request".into() };
+    };
+    let r = Request::PreviewLocal { for_uid: asker };
+    let (token, app) = match opifexd_with(&r, Duration::from_secs(120), Some(file.as_raw_fd())) {
+        Ok(Response::LocalPreview { token, app }) => (token, app),
+        Ok(Response::Error { message }) => return Answer::Failed { why: message },
+        Ok(other) => return Answer::Failed { why: format!("opifexd: {other:?}") },
+        Err(why) => return Answer::Failed { why },
+    };
+    drop(file);
+    if app.installed.as_deref() == Some(app.latest.as_str()) {
+        return Answer::Installed;
+    }
+    let manifest_sha256 = app.manifest_sha256.clone();
+    match show(Sheet::new(app)) {
+        Ok(Outcome::NotNow) => Answer::Declined,
+        Err(why) => Answer::Failed { why },
+        Ok(Outcome::Install) => {
+            let r = Request::InstallLocalApproved { token, manifest_sha256, for_uid: asker };
+            match opifexd(&r, Duration::from_secs(300)) {
+                Ok(Response::Done { .. }) => Answer::Installed,
                 Ok(Response::Error { message }) => Answer::Failed { why: message },
                 Ok(other) => Answer::Failed { why: format!("opifexd: {other:?}") },
                 Err(why) => Answer::Failed { why },
@@ -281,9 +318,9 @@ fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
         let _ = s.write_all(&line);
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut line = String::new();
-    let read = BufReader::new((&s).take(MAX_LINE as u64)).read_line(&mut line);
-    let Some(ask) = read.ok().and_then(|_| serde_json::from_str::<Ask>(line.trim_end()).ok()) else {
+    // A side-load comes with the file itself (fdpass).
+    let (line, file) = opifex::fdpass::read_line(&s, MAX_LINE).unwrap_or_default();
+    let Some(ask) = serde_json::from_str::<Ask>(line.trim_end()).ok() else {
         return answer(&s, Answer::Failed { why: "not a request".into() });
     };
     // Whom it is for (the asker, or Monstrator's asker for an install):
@@ -293,7 +330,7 @@ fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
             Ok(u) => u,
             Err(why) => return answer(&s, Answer::Failed { why }),
         },
-        Ask::AddCatalog { .. } => peer,
+        Ask::AddCatalog { .. } | Ask::SideLoad => peer,
     };
     {
         let mut a = askers.lock().unwrap();
@@ -316,6 +353,11 @@ fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
             eprintln!("opifex-sheetd: catalog {url} for uid {uid}: {a:?}");
             a
         }
+        Ask::SideLoad => {
+            let a = decide_local(uid, file, show);
+            eprintln!("opifex-sheetd: a file for uid {uid}: {a:?}");
+            a
+        }
     };
     {
         let mut st = askers.lock().unwrap();
@@ -331,8 +373,13 @@ fn main() {
     // `opifex-sheetd ask <id>`: a caller, for tests and scripts.
     let args: Vec<String> = std::env::args().collect();
     if let [_, ask, id] = &args[..] {
-        if ask == "ask" || ask == "add-catalog" {
-            let r = if ask == "ask" { opifex_sheet::install(id) } else { opifex_sheet::add_catalog(id) };
+        if ask == "ask" || ask == "add-catalog" || ask == "side-load" {
+            let r = match ask.as_str() {
+                "ask" => opifex_sheet::install(id),
+                "add-catalog" => opifex_sheet::add_catalog(id),
+                // The file opened here, by the asker, and handed over (§7.4).
+                _ => std::fs::File::open(id).and_then(|f| opifex_sheet::side_load(&f)),
+            };
             match r {
                 Ok(a) => println!("{a:?}"),
                 Err(e) => {
@@ -368,6 +415,9 @@ mod tests {
 
     /// A stand-in opifexd: answers each request in turn with `answers`, and
     /// gives back what it was asked.
+    /// What came beside the requests the fake opifexd took.
+    static FILES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
     fn fake(tag: &str, answers: Vec<Response>) -> (PathBuf, std::thread::JoinHandle<Vec<Request>>) {
         let d = std::env::temp_dir().join(format!("opifex-sheet-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -378,8 +428,12 @@ mod tests {
             let mut got = Vec::new();
             for a in answers {
                 let (s, _) = l.accept().unwrap();
-                let mut line = String::new();
-                BufReader::new(&s).read_line(&mut line).unwrap();
+                let (line, file) = opifex::fdpass::read_line(&s, 64 * 1024).unwrap();
+                if let Some(f) = file {
+                    let mut t = String::new();
+                    std::io::Read::read_to_string(&mut std::fs::File::from(f), &mut t).unwrap();
+                    FILES.lock().unwrap().push(t);
+                }
                 got.push(serde_json::from_str(line.trim_end()).unwrap());
                 let mut out = serde_json::to_vec(&a).unwrap();
                 out.push(b'\n');
@@ -455,6 +509,29 @@ mod tests {
         let got = h.join().unwrap();
         assert_eq!(got[1], Request::AddCatalog { url: "https://apps.example.com/".into(), root_sha256: "cd".repeat(32), machine: false, for_uid: 1001 });
         assert_eq!(decide_catalog(1001, "http://x/", |_| panic!("no sheet")), Answer::Failed { why: "not an https address".into() });
+
+        // A file: handed to opifexd as a descriptor, shown as from a file, the held copy installed.
+        let local = Described { local: true, catalog: String::new(), ..app(None) };
+        let (p, h) = fake("file", vec![
+            Response::LocalPreview { token: "ef".repeat(16), app: local.clone() },
+            Response::Done { id: "org.atrium.hello".into(), version: "1.1".into() },
+        ]);
+        std::env::set_var("OPIFEX_SOCKET", &p);
+        let f = std::env::temp_dir().join(format!("opifex-sheet-{}-hello.insula", std::process::id()));
+        std::fs::write(&f, "the bundle's bytes").unwrap();
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&f).unwrap());
+        let a = decide_local(1001, Some(fd), |s| {
+            assert!(s.lines().iter().any(|(x, _)| x.contains("from a file, signed by key")));
+            assert!(s.lines().iter().any(|(x, _)| x.starts_with("Not from a catalog")));
+            Ok(Outcome::Install)
+        });
+        assert_eq!(a, Answer::Installed);
+        let got = h.join().unwrap();
+        assert_eq!(got[0], Request::PreviewLocal { for_uid: 1001 });
+        assert_eq!(got[1], Request::InstallLocalApproved { token: "ef".repeat(16), manifest_sha256: "ab".repeat(32), for_uid: 1001 });
+        assert_eq!(FILES.lock().unwrap().as_slice(), ["the bundle's bytes"], "the file itself went to opifexd, once");
+        assert_eq!(decide_local(1001, None, |_| panic!("no sheet")), Answer::Failed { why: "no file came with the request".into() });
+        let _ = std::fs::remove_file(&f);
 
         // Junk ids never reach opifexd.
         std::env::set_var("OPIFEX_SOCKET", "/nonexistent/opifex.sock");

@@ -57,6 +57,10 @@ pub enum Act {
     Terminal([u8; 16]),
     /// The Run task's question: Run (with the press) or Cancel.
     AnswerRun(Option<[u8; 16]>),
+    /// Move the function a core crash is in into a worker (a preview first).
+    MoveToWorker(usize),
+    /// The preview's answer.
+    ConfirmMove(bool),
     Refresh,
     /// Next or previous tab.
     CycleTab(bool),
@@ -173,6 +177,9 @@ pub struct State {
     pub fuzz: Option<crate::fuzz::Fuzz>,
     /// A Run task's question (atrium-run, W5): the folder it asks to Run.
     pub ask: Option<String>,
+    /// Move into a worker: what `cargo atrium worker add --dry-run` would do,
+    /// waiting for the person's yes.
+    pub moving: Option<crate::fuzz::Move>,
 }
 
 pub type Queue = Arc<Mutex<Vec<Act>>>;
@@ -502,7 +509,17 @@ impl View for ArtifexView {
                 Panel::Output => {
                     let mut body_y = body_y;
                     let mut lines_fit = lines_fit;
-                    if let (Some(folder), Some(ws)) = (&s.ask, &s.ws) {
+                    if let Some(m) = s.moving.as_ref().filter(|m| m.dry_run) {
+                        let y = body_y + em(10.0);
+                        ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
+                        text(ctx, side_w() + em(16.0), y, &fit(&format!("Move {} into a worker, {}", m.from, m.worker), width - em(220.0), type_size::SM), type_size::SM, Weight::Medium, t.text_primary());
+                        ctx.key(4032);
+                        Button::primary("Move").at(w - em(200.0), y - em(14.0)).width(em(80.0)).on_click(plain(q, Act::ConfirmMove(true))).render(ctx);
+                        ctx.key(4033);
+                        Button::ghost("Cancel").at(w - em(112.0), y - em(14.0)).width(em(90.0)).on_click(plain(q, Act::ConfirmMove(false))).render(ctx);
+                        body_y += em(40.0);
+                        lines_fit = lines_fit.saturating_sub(2).max(1);
+                    } else if let (Some(folder), Some(ws)) = (&s.ask, &s.ws) {
                         // What atrium-run asks, as the Terminal asks it.
                         let y = body_y + em(10.0);
                         ctx.add(Node::Rect { rect: Rect::new(side_w() + em(8.0), body_y - em(8.0), width + em(8.0), em(36.0)), fill: t.accent_bg(), radius: radius::SM });
@@ -581,6 +598,11 @@ impl View for ArtifexView {
                                 ctx.key(1);
                                 Button::ghost("Debug it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
                                     .on_click(plain(q, Act::ReplayCrash(c))).render(ctx);
+                            } else if f.crashes.get(c).is_some_and(|x| x.in_core && x.frame.is_some()) {
+                                // The fix line under a core crash.
+                                ctx.key(2);
+                                Button::ghost("Move it").at(side_w() + width - em(86.0), y - em(14.0)).width(em(84.0))
+                                    .on_click(plain(q, Act::MoveToWorker(c))).render(ctx);
                             }
                             ctx.pop();
                         } else {

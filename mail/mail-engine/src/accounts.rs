@@ -7,6 +7,7 @@
 use std::os::unix::net::UnixStream;
 
 use mail_store::{AccountConfig, AccountId, Protocol, Reached, Server};
+pub use mail_sync::remote::Imap;
 
 use crate::send::Delivery;
 use crate::Engine;
@@ -45,6 +46,79 @@ fn reached_from(e: &str, now: i64) -> Reached {
     } else {
         Reached::Failed { at: now, why: e.chars().filter(|c| !c.is_control()).take(200).collect() }
     }
+}
+
+/// Mail's `sync` worker (§4), in its manifest.
+pub const SYNC_WORKER: &str = "sync";
+
+/// An IMAP session in the `sync` worker, with the worker it runs in.
+struct InWorker<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd> {
+    remote: mail_sync::remote::Remote<I, O>,
+    proc: SyncProc,
+}
+
+enum SyncProc {
+    Worker(atrium_worker::Stdio),
+    Child(std::process::Child),
+}
+
+impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd> Drop for InWorker<I, O> {
+    fn drop(&mut self) {
+        match &mut self.proc {
+            SyncProc::Worker(w) => w.kill(),
+            SyncProc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
+impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd> Imap for InWorker<I, O> {
+    fn capabilities(&self) -> &[String] {
+        self.remote.capabilities()
+    }
+    fn sync(&mut self, sink: &mut dyn mail_sync::Sink) -> mail_sync::Result<mail_sync::Report> {
+        self.remote.sync(sink)
+    }
+    fn append(&mut self, folder: &str, flags: &[&str], message: &[u8]) -> mail_sync::Result<Option<u32>> {
+        self.remote.append(folder, flags, message)
+    }
+    fn idle(&mut self, folder: &str, wait: std::time::Duration) -> mail_sync::Result<bool> {
+        self.remote.idle(folder, wait)
+    }
+    fn logout(&mut self) -> mail_sync::Result<()> {
+        self.remote.logout()
+    }
+}
+
+/// An IMAP session over `courier`: in Mail's `sync` worker when the app
+/// has one (a jail of its own, no capability, §4), in the program
+/// `MAIL_SYNC_WORKER` names (development, tests), else here.
+pub fn open_imap(courier: UnixStream) -> Result<Box<dyn Imap>, String> {
+    use mail_sync::remote::Remote;
+    let named = std::env::var_os("MAIL_SYNC_WORKER");
+    if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| named.is_none() && w.has(SYNC_WORKER)) {
+        let mut p = w.spawn_stdio(SYNC_WORKER).map_err(|e| format!("start the sync worker: {e}"))?;
+        let (i, o) = (p.stdin.take().ok_or("no worker input")?, p.stdout.take().ok_or("no worker output")?);
+        drop(p.stderr.take());
+        let proc = SyncProc::Worker(p);
+        let remote = Remote::start(courier, i, o).map_err(|e| e.to_string())?;
+        return Ok(Box::new(InWorker { remote, proc }));
+    }
+    if let Some(program) = named {
+        let mut c = std::process::Command::new(program)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("start the sync worker: {e}"))?;
+        let (i, o) = (c.stdin.take().ok_or("no worker input")?, c.stdout.take().ok_or("no worker output")?);
+        let proc = SyncProc::Child(c);
+        let remote = Remote::start(courier, i, o).map_err(|e| e.to_string())?;
+        return Ok(Box::new(InWorker { remote, proc }));
+    }
+    Ok(Box::new(mail_sync::remote::Local::start(courier).map_err(|e| e.to_string())?))
 }
 
 /// Seconds one `IDLE` waits before it is renewed: under the 29 minutes
@@ -90,15 +164,14 @@ pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(
         }
     };
     let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(IDLE_RENEW))).map_err(|e| e.to_string())?;
     held(s.try_clone().map_err(|e| e.to_string())?);
-    let mut session = mail_sync::Session::start(s).map_err(|e| e.to_string())?;
+    let mut session = open_imap(s)?;
     if !session.capabilities().iter().any(|c| c.eq_ignore_ascii_case("IDLE")) {
         let _ = session.logout();
         return Ok(Watched::NoIdle);
     }
     loop {
-        let changed = session.idle("INBOX").map_err(|e| e.to_string())?;
+        let changed = session.idle("INBOX", std::time::Duration::from_secs(IDLE_RENEW)).map_err(|e| e.to_string())?;
         if !on(changed) {
             let _ = session.logout();
             return Ok(Watched::Stopped);
@@ -129,14 +202,11 @@ impl Engine {
 
     fn pass_imap(&self, account: AccountId, cfg: &AccountConfig, imap: &Server, smtp: &Server, net: &dyn Connect) -> Result<Pass, String> {
         let item = cfg.incoming_item.ok_or("no sign-in for the incoming server")?;
-        let open = || -> Result<mail_sync::Session<UnixStream>, String> {
-            let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
-            mail_sync::Session::start(s).map_err(|e| e.to_string())
-        };
+        let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+        let mut s = open_imap(s)?;
         let mut pass = Pass::default();
-        let mut s = open()?;
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
-        self.copy_drafts(account, &mut s, DRAFT_REST).map_err(|e| e.to_string())?;
+        self.copy_drafts(account, s.as_mut(), DRAFT_REST).map_err(|e| e.to_string())?;
         let mut copies = Vec::new();
         if let Some(out) = cfg.outgoing_item {
             for (id, o) in self.due_sends().map_err(|e| e.to_string())? {
@@ -154,7 +224,7 @@ impl Engine {
             }
         }
         for c in copies {
-            self.file_sent(account, &mut s, &c).map_err(|e| e.to_string())?;
+            self.file_sent(account, s.as_mut(), &c).map_err(|e| e.to_string())?;
         }
         let _ = s.logout();
         Ok(pass)

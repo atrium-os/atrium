@@ -38,6 +38,11 @@ pub enum Ask {
     /// Follow the catalog served at `url` (https), for the asking person,
     /// if they agree (opifex.md §6.5; C7).
     AddCatalog { url: String },
+    /// Install the app in the `.insula` file sent with this line (fdpass:
+    /// the asker hands over the file the person opened, never a path), if
+    /// the person agrees and a publisher this machine trusts signed it
+    /// (opifex.md §7.4). Scrinium asks it for a double-clicked bundle.
+    SideLoad,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +79,20 @@ pub fn add_catalog(url: &str) -> io::Result<Answer> {
     let mut line = serde_json::to_vec(&Ask::AddCatalog { url: url.into() })?;
     line.push(b'\n');
     s.write_all(&line)?;
+    let mut back = String::new();
+    BufReader::new(s).read_line(&mut back)?;
+    serde_json::from_str(back.trim_end()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Ask for the app in `file` (an `.insula` the person opened) to be installed
+/// for this person; waits for them.
+pub fn side_load(file: &std::fs::File) -> io::Result<Answer> {
+    use std::os::fd::AsRawFd;
+    let s = UnixStream::connect(socket())?;
+    s.set_read_timeout(Some(Duration::from_secs(150)))?;
+    let mut line = serde_json::to_vec(&Ask::SideLoad)?;
+    line.push(b'\n');
+    opifex::fdpass::write_line(&s, &line, Some(file.as_raw_fd()))?;
     let mut back = String::new();
     BufReader::new(s).read_line(&mut back)?;
     serde_json::from_str(back.trim_end()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))

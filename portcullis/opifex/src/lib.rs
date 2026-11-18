@@ -7,6 +7,7 @@ pub mod catalogs;
 pub mod content;
 pub mod daemon;
 pub mod driver;
+pub mod fdpass;
 pub mod fetch;
 pub mod font;
 pub mod installed;

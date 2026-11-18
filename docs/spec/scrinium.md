@@ -66,6 +66,12 @@ folder, Rename, Delete (asks first), Copy, Cut, Paste and Show hidden files;
 the list (name, size, modified); a status line with the item count and free
 space. Double-click or Enter opens a folder.
 
+A double-clicked app bundle (`.insula`, by its bytes) goes to the install sheet
+(opifex.md §7.4, 2026-11-18): Scrinium opens it read-only and sends it as a
+descriptor with the ask `"SideLoad"` (`scrinium::install`), never a path; the
+sheet shows the person what it is and who signed it, and the status line says
+what they decided. `removable-files` mounts the sheet's socket for this.
+
 ### 2.4 Keys
 
 Up/Down move, Shift extends, Home/End, Enter opens, Backspace or Alt-Up goes

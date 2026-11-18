@@ -10,6 +10,8 @@
 //! Environment:
 //!   MAIL_STORE        [$HOME/.local/share/atrium-mail] the engine's store
 //!   MAIL_PARSE_JAIL   [mail-parse-jail beside this program] the parse jail
+//!   MAIL_SYNC_WORKER  [the app's `sync` worker, else mail-sync-worker beside
+//!                     this program, else in this process] where IMAP runs
 //!   MAIL_TRACE        print the window's state after each change (VM gates)
 
 use std::fs::File;
@@ -299,6 +301,14 @@ fn main() {
     let jail = std::env::var_os("MAIL_PARSE_JAIL").map(PathBuf::from).unwrap_or_else(|| {
         std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("mail-parse-jail"))).unwrap_or_else(|| PathBuf::from("mail-parse-jail"))
     });
+    // Off Atrium (no installed manifest), IMAP still runs in a process of
+    // its own when the worker's program is beside this one. Set before any
+    // thread starts.
+    if std::env::var_os("MAIL_SYNC_WORKER").is_none() && !atrium_worker::Workers::get().is_ok_and(|w| w.has(mail_engine::accounts::SYNC_WORKER)) {
+        if let Some(w) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("mail-sync-worker"))).filter(|p| p.exists()) {
+            std::env::set_var("MAIL_SYNC_WORKER", w);
+        }
+    }
     let store = match Store::open(&store_dir) {
         Ok(s) => s,
         Err(e) => {

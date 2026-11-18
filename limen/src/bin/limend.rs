@@ -18,6 +18,8 @@
 //! - `LIMEN_SHARE_UID`: the uid of the share sheet, the `share` provider
 //!   (default 65045, `_share`); only it may provide that role, and it may
 //!   choose only installed `share-target`s for the parent's person.
+//! - `LIMEN_PRELUM_UID`: the uid of prelum-sheet, the `print` provider
+//!   (default 65046, `_prelum-sheet`); only it may provide that role.
 //! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
 //! - `LIMEN_CHORAGUS`: choragusd's attribution socket, for embedded players'
 //!   audio tickets (default /atrium/sockets/audio-attribution/audio-attribution.sock).
@@ -64,6 +66,9 @@ fn main() -> std::io::Result<()> {
     shared.set_system_uid(limen::catalogue::SHARE, share_uid);
     let targets = installed.clone();
     shared.set_target_check(Box::new(move |person: &str, app: &str| targets.may_target(person, app)));
+    // So is prelum-sheet, the print sheet (`_prelum-sheet`, printing.md §5).
+    let prelum_uid: u32 = std::env::var("LIMEN_PRELUM_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(65046);
+    shared.set_system_uid(limen::catalogue::PRELUM, prelum_uid);
     // Who may embed what: the parent's installed manifest (`embeds`).
     shared.set_embed_check(Box::new(move |app: &str, role: &str| installed.may_embed(app, role)));
     shared.set_attribution(Box::new(limen::audio::Choragus::new(

@@ -1,6 +1,7 @@
 //! `CLASS_PRINT` (prelum_proto::print): one thread per client connection,
 //! the caller known by its uid (getpeereid), each seeing only its own
-//! printers and jobs.
+//! printers and jobs. prelum-sheet's connection says first, with `FOR`,
+//! which app it is open for; from then on it acts for that app's person.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -18,15 +19,52 @@ fn arg<T: DeserializeOwned>(p: &[u8]) -> Result<T, (u8, String)> {
 }
 
 pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
-    let (uid, _) = portcullis_peer::uid_gid(stream.as_raw_fd())?;
+    let (peer, _) = portcullis_peer::uid_gid(stream.as_raw_fd())?;
     let mut conn = Connection::wrap(stream)?;
+    // Whose printers and jobs: the peer's own, or after FOR, the person's.
+    let mut uid = peer;
+    let mut acting = false;
+    let sheet = d.cfg().sheet_uid == Some(peer);
     loop {
         let m = conn.recv_message()?;
         if m.opcode_class != CLASS {
             continue;
         }
         let p = &m.payload;
+        // The sheet acts only for an app: nothing before FOR.
+        if sheet && !acting && m.op != op::FOR {
+            let _ = conn.take_fds(1);
+            let out = reply::<String>(Err((status::NOT_ALLOWED, "say which app first".into())));
+            conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?;
+            continue;
+        }
+        let mut back: Option<std::fs::File> = None;
         let out = match m.op {
+            op::FOR if acting => reply::<String>(Err((status::NOT_ALLOWED, "already acting for an app".into()))),
+            op::FOR => reply(arg::<u32>(p).and_then(|app| d.act_for(peer, app)).map(|(person, persona)| {
+                uid = person;
+                acting = true;
+                persona
+            })),
+            op::PREVIEW => {
+                let fd = conn.take_fds(1).and_then(|mut v| v.pop());
+                reply(match (arg::<print::PreviewReq>(p), fd) {
+                    (Ok(req), Some(fd)) => d.preview(&req, fd),
+                    (Err(e), _) => Err(e),
+                    (_, None) => Err((status::MALFORMED, "no document".into())),
+                })
+            }
+            op::SAVE_PDF => {
+                let fd = conn.take_fds(1).and_then(|mut v| v.pop());
+                reply(match (arg::<print::Layout>(p), fd) {
+                    (Ok(l), Some(fd)) => d.save_pdf(&l, fd).map(|(n, f)| {
+                        back = Some(f);
+                        n
+                    }),
+                    (Err(e), _) => Err(e),
+                    (_, None) => Err((status::MALFORMED, "no document".into())),
+                })
+            }
             op::PRINTERS => reply::<Vec<print::Printer>>(Ok(d.printers(uid))),
             op::ADD => reply(arg::<print::Add>(p).and_then(|a| d.add(uid, &a))),
             op::REMOVE => reply(arg::<u32>(p).and_then(|id| d.remove(uid, id))),
@@ -48,6 +86,9 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
             op::RELEASE => reply(arg::<u64>(p).and_then(|j| d.release(uid, j))),
             _ => reply::<String>(Err((status::MALFORMED, "unknown request".into()))),
         };
-        conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?;
+        match back {
+            Some(f) => conn.send_message_with_fds(CLASS, m.op, flag::IS_RESPONSE, &out, &[f.as_raw_fd()])?,
+            None => conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?,
+        }
     }
 }

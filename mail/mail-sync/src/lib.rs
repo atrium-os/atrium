@@ -26,6 +26,7 @@
 //! marks anything read.
 
 pub mod jmap;
+pub mod remote;
 pub mod setup;
 pub mod submit;
 
@@ -79,10 +80,10 @@ impl From<std::io::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A folder's role from SPECIAL-USE (RFC 6154) or its name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role { Inbox, Sent, Drafts, Archive, Junk, Trash, All, Flagged, Other }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteFolder {
     pub name: String,
     pub role: Role,
@@ -90,7 +91,7 @@ pub struct RemoteFolder {
 }
 
 /// Where a folder's sync stands, as the sink keeps it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FolderState {
     pub uidvalidity: u32,
     /// Every UID ≥ this one (that the server had) has been fetched; 0 when
@@ -102,7 +103,7 @@ pub struct FolderState {
 }
 
 /// One message as fetched.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Fetched {
     pub uid: u32,
     pub flags: Vec<String>,
@@ -164,7 +165,7 @@ pub trait Sink {
 }
 
 /// A change the person made, to make on the server (mail.md §6.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Change {
     pub id: u64,
     pub folder: String,
@@ -172,7 +173,7 @@ pub struct Change {
     pub what: What,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum What {
     /// IMAP system flags (`\Seen`, `\Flagged`) to add and remove.
     Flags { add: Vec<String>, remove: Vec<String> },
@@ -182,7 +183,7 @@ pub enum What {
 }
 
 /// What one pass did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub folders: usize,
     pub headers: usize,
@@ -233,6 +234,9 @@ impl<S: Read + Write> Session<S> {
     }
 
     pub fn capabilities(&self) -> &[String] { &self.caps }
+
+    /// The socket under the session (to set its read timeout).
+    pub fn socket(&self) -> &S { &self.s }
 
     fn read(&mut self) -> Result<Response> {
         loop {

@@ -146,6 +146,9 @@ struct State {
     /// parent → the app the person chose for its next `share-target`, and
     /// when (share-sheet.md §3).
     choices: HashMap<ConnId, (String, Instant)>,
+    /// When each window last opened a print sheet, within the last minute
+    /// (printing.md §5.2).
+    print_opens: HashMap<WindowToken, Vec<Instant>>,
 }
 
 impl State {
@@ -363,6 +366,23 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     if st.embeds.values().filter(|e| e.parent == conn).count() >= catalogue::MAX_EMBEDS_PER_PARENT {
         return refuse(refusal::TOO_MANY);
     }
+    if role.name == "print" {
+        // One print sheet per window, and a window that keeps opening it
+        // is slowed (printing.md §5.2).
+        if st.embeds.values().any(|e| e.role.name == "print" && e.parent_window == req.window) {
+            return refuse(refusal::TOO_MANY);
+        }
+        let now = Instant::now();
+        let opens = st.print_opens.entry(req.window).or_default();
+        opens.retain(|t| now.duration_since(*t) < catalogue::PRINT_WINDOW);
+        if opens.len() >= catalogue::PRINT_FREE && opens.last().is_some_and(|t| now.duration_since(*t) < catalogue::PRINT_SLOWED) {
+            return refuse(refusal::RATE);
+        }
+        let stale: Vec<WindowToken> = st.print_opens.iter().filter(|(_, v)| v.iter().all(|t| now.duration_since(*t) >= catalogue::PRINT_WINDOW)).map(|(k, _)| *k).collect();
+        for k in stale {
+            st.print_opens.remove(&k);
+        }
+    }
     st.next_embed = st.next_embed.wrapping_add(1);
     let embed = st.next_embed;
     let (child, child_uid, spawned) = match role.provider {
@@ -425,6 +445,9 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
     if let Some(ticket) = audio_ticket {
         st.to_child(&e, ChildEvent::AudioTicket { embed, ticket });
+    }
+    if role.name == "print" {
+        st.print_opens.entry(req.window).or_default().push(Instant::now());
     }
     st.embeds.insert(embed, e);
     Ok(Reply::Embed { embed })
