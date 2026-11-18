@@ -185,11 +185,20 @@ pub fn new_key(seed: [u8; 32]) -> Result<(String, String), SigError> {
     Ok((private, public))
 }
 
+/// The public SPKI PEM of a PKCS#8 PEM private key.
+pub fn public_pem(key_pem: &str) -> Result<String, SigError> {
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+    let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
+    k.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|_| SigError::BadKey)
+}
+
 #[cfg(test)]
 mod sign_tests {
     #[test]
     fn a_signature_of_ours_verifies_and_only_for_its_text() {
         let (k, p) = super::new_key([7; 32]).unwrap();
+        assert_eq!(super::public_pem(&k).unwrap(), p);
         let s = super::sign(b"[app]\nid = \"dev.scratch.hello\"\n", &k).unwrap();
         super::verify_one(b"[app]\nid = \"dev.scratch.hello\"\n", &s, &p).unwrap();
         assert!(super::verify_one(b"[app]\nid = \"dev.scratch.other\"\n", &s, &p).is_err());

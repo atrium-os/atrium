@@ -115,7 +115,12 @@ fn usage() {
            catalog head <cat> --key <catalog.pem> [--days 14]\n  \
            catalog sync <state> --from <cat> [--root <root.toml>]\n  \
            catalog list <state>\n      \
-             The signed catalog (opifex.md §6): publish into a folder, check a copy.\n\n\
+             The signed catalog (opifex.md §6): publish into a folder, check a copy.\n  \
+           catalog init <cat> --name <n> --keys <key-dir> [--roots 3] [--threshold 2] [--years 5]\n  \
+           catalog register <cat> --name <n> --domain <d> --key <pub.pem> --sign <key.pem>\n  \
+           catalog publisher <cat> rotate|scope|recover --id <pub:…> [--key <pub.pem>] --sign <pem>…\n  \
+           catalog publishers <cat> | catalog publish <cat> --key <catalog.pem>\n      \
+             A catalog of your own (§6.5): apps only, under domains its publishers prove.\n\n\
          Through opifexd (OPIFEX_SOCKET, default /atrium/sockets/opifex/opifex.sock):\n  \
            describe <id> | search <text> | installed\n  \
            get <id>            install the newest catalog release (root)\n  \
