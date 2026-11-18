@@ -1,14 +1,16 @@
 //! The library closure for side-loaded bundles (the bring-up exception in
-//! atrium-bundle-format.md): walk the entry's DT_NEEDED graph and copy the
+//! atrium-bundle-format.md): walk the DT_NEEDED graph of every program in the
+//! bundle (the entry, helpers it execs, workers) and copy the
 //! libraries and the rtld from a sysroot into the app tree.
 
 use std::path::{Path, PathBuf};
 
 // ── filesystem ──────────────────────────────────────────────────────────────
 
-/// Resolve the entry binary's shared-library closure into the app tree so it can
-/// run inside a jail whose rootfs is only that tree. Walks the entry binary's
-/// DT_NEEDED closure, copies each library to the SAME absolute path under `dest`,
+/// Resolve the shared-library closure of every program in the app tree so it
+/// can run inside a jail whose rootfs is only that tree. Walks the DT_NEEDED
+/// closure of the entry and of every other ELF file the bundle ships (helpers
+/// in `bin/` it execs, `[[workers]]` programs, its own libraries), copies each library to the SAME absolute path under `dest`,
 /// and copies the rtld (`/libexec/ld-elf.so.1`). Returns the count copied.
 /// Idempotent: a lib the bundle already shipped is left as-is (but is still
 /// walked, so ITS dependencies are resolved too).
@@ -32,6 +34,18 @@ pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usiz
     // diamond (two libs both needing libc) is resolved once.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut queue: Vec<PathBuf> = vec![entry.to_path_buf()];
+    // The bundle's other ELF files: an ELF the walk can't read (another
+    // class or byte order, say a firmware blob) is skipped; the entry's
+    // must parse.
+    let mut shipped = Vec::new();
+    elf_files(dest, &mut shipped);
+    shipped.sort();
+    for f in shipped {
+        if f != entry && std::fs::read(&f).is_ok_and(|b| elf_needed(&b, &f).is_ok()) {
+            queue.push(f);
+        }
+    }
+    queue.reverse(); // the entry first
     while let Some(obj) = queue.pop() {
         let bytes = match std::fs::read(&obj) {
             Ok(b) => b,
@@ -58,6 +72,26 @@ pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usiz
         }
     }
     Ok(count)
+}
+
+/// Regular files under `dir` (symlinks not followed) that start with the ELF
+/// magic.
+fn elf_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        let p = e.path();
+        if t.is_dir() {
+            elf_files(&p, out);
+        } else if t.is_file() {
+            let mut magic = [0u8; 4];
+            let is_elf = std::fs::File::open(&p)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_ok() && &magic == b"\x7fELF";
+            if is_elf {
+                out.push(p);
+            }
+        }
+    }
 }
 
 /// Absolute directories searched for a DT_NEEDED soname, relative to the sysroot.
@@ -205,4 +239,86 @@ fn elf_needed(b: &[u8], what: &Path) -> Result<Vec<String>, String> {
         out.push(String::from_utf8_lossy(&b[start..end]).into_owned());
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal ELF64 LE with one PT_LOAD over the file, a PT_DYNAMIC, and
+    /// DT_NEEDED entries for `needed`.
+    fn elf(needed: &[&str]) -> Vec<u8> {
+        let mut strtab = vec![0u8];
+        let offs: Vec<u64> = needed.iter().map(|n| {
+            let o = strtab.len() as u64;
+            strtab.extend_from_slice(n.as_bytes());
+            strtab.push(0);
+            o
+        }).collect();
+        let (ph, str_off) = (64usize, 64 + 2 * 56);
+        let dyn_off = str_off + strtab.len();
+        let mut dynv: Vec<(u64, u64)> = offs.iter().map(|o| (1, *o)).collect();
+        dynv.push((5, str_off as u64));
+        dynv.push((0, 0));
+        let total = dyn_off + dynv.len() * 16;
+        let mut b = vec![0u8; total];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2;
+        b[5] = 1;
+        b[0x20..0x28].copy_from_slice(&(ph as u64).to_le_bytes());
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        b[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        let mut phdr = |i: usize, t: u32, off: u64, sz: u64| {
+            let p = ph + i * 56;
+            b[p..p + 4].copy_from_slice(&t.to_le_bytes());
+            b[p + 8..p + 16].copy_from_slice(&off.to_le_bytes());
+            b[p + 16..p + 24].copy_from_slice(&off.to_le_bytes());
+            b[p + 32..p + 40].copy_from_slice(&sz.to_le_bytes());
+        };
+        phdr(0, 1, 0, total as u64);
+        phdr(1, 2, dyn_off as u64, (dynv.len() * 16) as u64);
+        b[str_off..dyn_off].copy_from_slice(&strtab);
+        for (i, (t, v)) in dynv.iter().enumerate() {
+            let p = dyn_off + i * 16;
+            b[p..p + 8].copy_from_slice(&t.to_le_bytes());
+            b[p + 8..p + 16].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    fn put(root: &Path, rel: &str, bytes: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+
+    /// The Player case: the entry needs libc, a helper it execs needs libm,
+    /// a worker needs libc++ (which needs libcxxrt). All of them land.
+    #[test]
+    fn every_program_in_the_bundle() {
+        let d = std::env::temp_dir().join(format!("opifex-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (sys, app) = (d.join("sys"), d.join("app"));
+        put(&sys, "libexec/ld-elf.so.1", &elf(&[]));
+        put(&sys, "lib/libc.so.7", &elf(&[]));
+        put(&sys, "lib/libm.so.5", &elf(&["libc.so.7"]));
+        put(&sys, "usr/lib/libc++.so.1", &elf(&["libcxxrt.so.1", "libm.so.5"]));
+        put(&sys, "lib/libcxxrt.so.1", &elf(&["libc.so.7"]));
+        put(&sys, "usr/lib/libunused.so.1", &elf(&[]));
+        put(&app, "bin/player", &elf(&["libc.so.7"]));
+        put(&app, "bin/helper", &elf(&["libm.so.5"]));
+        put(&app, "workers/decode", &elf(&["libc++.so.1"]));
+        put(&app, "share/firmware.bin", b"\x7fELF\x01\x02 not ours");
+        put(&app, "share/readme", b"text");
+        let n = resolve_runtime(&app.join("bin/player"), &app, &sys).unwrap();
+        for f in ["libexec/ld-elf.so.1", "lib/libc.so.7", "lib/libm.so.5", "usr/lib/libc++.so.1", "lib/libcxxrt.so.1"] {
+            assert!(app.join(f).is_file(), "{f} missing");
+        }
+        assert!(!app.join("usr/lib/libunused.so.1").exists());
+        assert_eq!(n, 5);
+        // A missing library of a helper is an error, not a jail that fails later.
+        put(&app, "bin/other", &elf(&["libnope.so.1"]));
+        assert!(resolve_runtime(&app.join("bin/player"), &app, &sys).unwrap_err().contains("libnope.so.1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

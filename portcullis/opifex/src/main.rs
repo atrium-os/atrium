@@ -250,7 +250,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let id = manifest.app.id.clone();
     let entry = manifest.entry();
 
-    // 3. Make it self-contained for its jail: resolve the entry's lib closure +
+    // 3. Make it self-contained for its jail: resolve every program's lib closure +
     //    the rtld into the tree (the jail rootfs has no shared /lib). Bring-up
     //    exception for side-loads (atrium-bundle-format.md); catalog packages
     //    will have to ship their closure.
