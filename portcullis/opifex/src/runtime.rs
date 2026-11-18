@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 // ── filesystem ──────────────────────────────────────────────────────────────
 
 /// Resolve the shared-library closure of every program in the app tree so it
@@ -29,9 +31,47 @@ use std::path::{Path, PathBuf};
 /// reports 5 libraries but the binary's own DT_NEEDED names 4 — libsys.so.7
 /// arrives through libc.
 pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usize, String> {
-    let mut count = 0;
+    resolve(entry, dest, sysroot, true).map(|r| r.copied)
+}
+
+/// What [`resolve`] did: files copied, and the base-system files now in the
+/// tree (path in the tree, sha256), which [`refresh_base`] replaces after a
+/// base update.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Resolved {
+    pub copied: usize,
+    pub base: Vec<(String, String)>,
+}
+
+/// The base system's library directories (the rtld's built-in path), and
+/// pkg's, which only side-loads may take from.
+const BASE_DIRS: [&str; 2] = ["lib", "usr/lib"];
+const RTLD: &str = "libexec/ld-elf.so.1";
+
+/// Resolve every program's library closure into `dest`:
+/// - the rtld and every base-system library (`/lib`, `/usr/lib`) come from
+///   the base, always, replacing a copy the bundle shipped (a publisher can't
+///   pass off its own libc as the base's); they are listed in `base`;
+/// - a library the bundle ships under `lib/` or `usr/lib/` that the base
+///   doesn't have is the bundle's own, covered by its signature;
+/// - with `local` (side-loads), pkg's `/usr/local/lib` too, copied to
+///   `usr/lib/`; catalog packages must ship those themselves.
+pub fn resolve(entry: &Path, dest: &Path, sysroot: &Path, local: bool) -> Result<Resolved, String> {
+    let mut out = Resolved::default();
+    let put_base = |rel: &str, out: &mut Resolved| -> Result<(), String> {
+        let from = sysroot.join(rel);
+        let bytes = std::fs::read(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+        let to = dest.join(rel);
+        let same = std::fs::read(&to).is_ok_and(|b| b == bytes);
+        if !same {
+            let _ = std::fs::remove_file(&to);
+            out.copied += stage_to(&Path::new("/").join(rel), Path::new(rel), dest, sysroot)?;
+        }
+        out.base.push((rel.to_string(), hex(&Sha256::digest(&bytes))));
+        Ok(())
+    };
     // The dynamic loader the kernel execs first.
-    count += stage_sysroot_file(Path::new("/libexec/ld-elf.so.1"), dest, sysroot)?;
+    put_base(RTLD, &mut out)?;
 
     // Breadth-first over the DT_NEEDED graph. `seen` is keyed on the soname so a
     // diamond (two libs both needing libc) is resolved once.
@@ -52,39 +92,82 @@ pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usiz
     while let Some(obj) = queue.pop() {
         let bytes = match std::fs::read(&obj) {
             Ok(b) => b,
-            // A lib named in DT_NEEDED that we already staged may be unreadable
-            // only if something raced us; treat as fatal rather than guess.
             Err(e) => return Err(format!("read {}: {e}", obj.display())),
         };
         for soname in elf_needed(&bytes, &obj)? {
             if !seen.insert(soname.clone()) {
                 continue;
             }
-            // Shipped by the bundle where the jail's loader looks: use it.
-            if let Some(have) = ["lib", "usr/lib"].iter().map(|d| dest.join(d).join(&soname)).find(|p| p.is_file()) {
+            // The base's: always the base's own copy.
+            if let Some(d) = BASE_DIRS.iter().find(|d| sysroot.join(d).join(&soname).is_file()) {
+                let rel = format!("{d}/{soname}");
+                put_base(&rel, &mut out)?;
+                queue.push(dest.join(&rel));
+                continue;
+            }
+            // Shipped by the bundle where the jail's loader looks: its own.
+            if let Some(have) = BASE_DIRS.iter().map(|d| dest.join(d).join(&soname)).find(|p| p.is_file()) {
                 queue.push(have);
                 continue;
             }
-            let abs = find_lib(&soname, sysroot).ok_or_else(|| {
-                format!(
-                    "{}: needs {soname}, not found under sysroot {} (searched {})",
-                    obj.display(),
-                    sysroot.display(),
-                    LIB_SEARCH_DIRS.join(", ")
-                )
-            })?;
-            // An app's jail has no ld-elf.so.hints, so its loader looks only
-            // in /lib and /usr/lib: pkg's /usr/local/lib (and anything else)
-            // goes to usr/lib.
-            let to = if abs.starts_with("/lib") { PathBuf::from("lib") } else { PathBuf::from("usr/lib") }.join(&soname);
-            count += stage_to(&abs, &to, dest, sysroot)?;
-            // Recurse through the copy in the app tree (identical bytes, and it
-            // is guaranteed present now).
+            // pkg's, for a side-load. An app's jail has no ld-elf.so.hints, so
+            // its loader looks only in /lib and /usr/lib: it goes to usr/lib.
+            let abs = Path::new("/usr/local/lib").join(&soname);
+            if !local || !sysroot.join("usr/local/lib").join(&soname).is_file() {
+                return Err(format!(
+                    "{}: needs {soname}, which is neither in the base system ({}) nor in the bundle{}",
+                    obj.display(), sysroot.display(),
+                    if local { " nor under /usr/local/lib" } else { " (a catalog package ships its own libraries)" }));
+            }
+            let to = Path::new("usr/lib").join(&soname);
+            out.copied += stage_to(&abs, &to, dest, sysroot)?;
             queue.push(dest.join(&to));
         }
     }
-    Ok(count)
+    out.base.sort();
+    out.base.dedup();
+    Ok(out)
 }
+
+/// After a base-system update: does `base` (an app's recorded base files)
+/// still match the base under `sysroot`? An empty list (an app installed
+/// before these were recorded) never does.
+pub fn base_current(base: &[(String, String)], sysroot: &Path) -> bool {
+    !base.is_empty() && base.iter().all(|(rel, sha)| {
+        std::fs::read(sysroot.join(rel)).is_ok_and(|b| hex(&Sha256::digest(&b)) == *sha)
+    })
+}
+
+/// Build `new` as the app tree `app` with its base files taken from the
+/// current base: every file hard-linked (no copy), then [`resolve`], which
+/// unlinks and copies only the base files whose bytes changed. `app` itself is
+/// never written. The caller swaps `new` in whole, so a launch sees the old
+/// set or the new one, never a mix.
+pub fn rebase(app: &Path, new: &Path, entry: &str, sysroot: &Path, local: bool) -> Result<Resolved, String> {
+    link_tree(app, new)?;
+    resolve(&new.join(entry), new, sysroot, local)
+}
+
+fn link_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    for e in std::fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))?.flatten() {
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        let t = e.file_type().map_err(|e| e.to_string())?;
+        if t.is_dir() {
+            link_tree(&from, &to)?;
+        } else if t.is_symlink() {
+            let l = std::fs::read_link(&from).map_err(|e| e.to_string())?;
+            std::os::unix::fs::symlink(l, &to).map_err(|e| format!("{}: {e}", to.display()))?;
+        } else {
+            std::fs::hard_link(&from, &to).map_err(|e| format!("{}: {e}", to.display()))?;
+        }
+    }
+    let mode = std::fs::metadata(src).map_err(|e| e.to_string())?.permissions().mode();
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|e| e.to_string())
+}
+
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
 
 /// Regular files under `dir` (symlinks not followed) that start with the ELF
 /// magic.
@@ -104,35 +187,6 @@ fn elf_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
-}
-
-/// Absolute directories searched for a DT_NEEDED soname, relative to the sysroot.
-/// FreeBSD's default rtld path; we do not honour DT_RPATH/DT_RUNPATH because an
-/// Atrium bundle's libs are staged to their canonical absolute paths anyway.
-const LIB_SEARCH_DIRS: [&str; 3] = ["/lib", "/usr/lib", "/usr/local/lib"];
-
-/// Resolve a soname to its absolute (target-namespace) path under `sysroot`.
-fn find_lib(soname: &str, sysroot: &Path) -> Option<PathBuf> {
-    for dir in LIB_SEARCH_DIRS {
-        let abs = PathBuf::from(dir).join(soname);
-        let on_disk = sysroot.join(abs.strip_prefix("/").unwrap_or(&abs));
-        if on_disk.exists() {
-            return Some(abs);
-        }
-    }
-    None
-}
-
-/// Copy `<sysroot>/<abs>` to `<dest>/<abs>`, preserving the absolute layout the
-/// rtld will look for inside the jail. Returns 1 if copied, 0 if the bundle
-/// already shipped it.
-///
-/// A missing source is an ERROR. It used to return Ok(0), which meant that on a
-/// host without FreeBSD libs opifex reported success and emitted a bundle with no
-/// libraries in it at all — the failure only surfaced later as an exec failure
-/// inside a jail, which is a miserable place to debug it.
-fn stage_sysroot_file(abs: &Path, dest: &Path, sysroot: &Path) -> Result<usize, String> {
-    stage_to(abs, abs.strip_prefix("/").unwrap_or(abs), dest, sysroot)
 }
 
 /// Copy `abs` (a path on the target, read under `sysroot`) to `dest/to`.
@@ -341,6 +395,46 @@ mod tests {
         // A missing library of a helper is an error, not a jail that fails later.
         put(&app, "bin/other", &elf(&["libnope.so.1"]));
         assert!(resolve_runtime(&app.join("bin/player"), &app, &sys).unwrap_err().contains("libnope.so.1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The base's files always come from the base: a bundle's own "libc"
+    /// is replaced, and only pkg libraries a side-load may take.
+    #[test]
+    fn base_files_are_the_base() {
+        let d = std::env::temp_dir().join(format!("opifex-runtime-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (sys, app) = (d.join("sys"), d.join("app"));
+        put(&sys, "libexec/ld-elf.so.1", &elf(&[]));
+        put(&sys, "lib/libc.so.7", &elf(&[]));
+        put(&sys, "usr/local/lib/libpkg.so.1", &elf(&["libc.so.7"]));
+        put(&app, "bin/x", &elf(&["libc.so.7", "libown.so.1"]));
+        put(&app, "lib/libc.so.7", b"\x7fELF a publisher's libc");
+        put(&app, "usr/lib/libown.so.1", &elf(&[]));
+        let r = resolve(&app.join("bin/x"), &app, &sys, false).unwrap();
+        assert_eq!(std::fs::read(app.join("lib/libc.so.7")).unwrap(), elf(&[]));
+        let names: Vec<&str> = r.base.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, ["lib/libc.so.7", "libexec/ld-elf.so.1"]);
+        assert!(base_current(&r.base, &sys));
+        // A catalog package doesn't get pkg's libraries; a side-load does.
+        put(&app, "bin/y", &elf(&["libpkg.so.1"]));
+        assert!(resolve(&app.join("bin/x"), &app, &sys, false).unwrap_err().contains("ships its own"));
+        resolve(&app.join("bin/x"), &app, &sys, true).unwrap();
+        assert!(app.join("usr/lib/libpkg.so.1").is_file());
+
+        // A base update: libc changes. The rebased tree has the new libc and
+        // a new dependency of it; the installed tree is untouched.
+        put(&sys, "lib/libsys.so.7", &elf(&[]));
+        put(&sys, "lib/libc.so.7", &elf(&["libsys.so.7"]));
+        assert!(!base_current(&r.base, &sys));
+        let new = d.join("new");
+        let r2 = rebase(&app, &new, "bin/x", &sys, true).unwrap();
+        assert!(r2.copied >= 2);
+        assert_eq!(std::fs::read(new.join("lib/libc.so.7")).unwrap(), elf(&["libsys.so.7"]));
+        assert!(new.join("lib/libsys.so.7").is_file());
+        assert_eq!(std::fs::read(app.join("lib/libc.so.7")).unwrap(), elf(&[]), "the old tree is never written");
+        assert_eq!(std::fs::read(new.join("usr/lib/libown.so.1")).unwrap(), elf(&[]));
+        assert!(base_current(&r2.base, &sys));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

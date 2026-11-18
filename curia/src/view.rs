@@ -1128,6 +1128,57 @@ impl CuriaView {
                     y += em(8.0);
                 }
             }
+            // Share (share-sheet.md §4.4): the apps the share sheet
+            // offers, in its order; Hide and Move up, each on a press.
+            y += em(20.0);
+            text(ctx, 0.0, y + em(14.0), "Share", type_size::LG, Weight::Semibold, t.text_primary());
+            y += em(32.0);
+            match &p.share {
+                None => {
+                    text(ctx, 0.0, y + em(10.0), "Asking which apps take shares…", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(28.0);
+                }
+                Some(Err(why)) => {
+                    text(ctx, 0.0, y + em(10.0), &format!("The share sheet's apps are not available: {why}"), type_size::SM, Weight::Regular, t.text_secondary());
+                    y += em(28.0);
+                }
+                Some(Ok(v)) if v.is_empty() => {
+                    text(ctx, 0.0, y + em(10.0), "No app here takes shares.", type_size::SM, Weight::Regular, t.text_tertiary());
+                    y += em(28.0);
+                }
+                Some(Ok(_)) => {
+                    text(ctx, 0.0, y + em(10.0), "The share sheet lists these apps in this order.", type_size::SM, Weight::Regular, t.text_secondary());
+                    y += em(28.0);
+                }
+            }
+            if let Some(why) = &p.share_note {
+                text(ctx, 0.0, y + em(10.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                y += em(28.0);
+            }
+            for (i, r) in p.share_targets().iter().enumerate() {
+                let rh = em(48.0);
+                rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);
+                let fg = if r.hidden { t.text_tertiary() } else { t.text_primary() };
+                text(ctx, em(16.0), y + em(18.0), &r.name, type_size::MD, Weight::Medium, fg);
+                text(ctx, em(16.0), y + em(36.0), &if r.hidden { "Not on the share sheet".to_string() } else { r.id.clone() }, type_size::XS, Weight::Regular, t.text_tertiary());
+                let lab = if r.hidden { "Show" } else { "Hide" };
+                let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                let (pg, id, hide) = (self.apps.clone(), r.id.clone(), !r.hidden);
+                button(ctx, bx, y + em(9.0), lab, Look::Secondary, !p.share_busy, move || {
+                    let token = pergola::clipboard::current_activation();
+                    with_apps(&pg, |a| a.share_hide(&id, hide, token))
+                });
+                if i > 0 {
+                    let up = "Move up";
+                    let ux = bx - em(8.0) - width(up, type_size::SM, Weight::Medium) - em(24.0);
+                    let (pg, id) = (self.apps.clone(), r.id.clone());
+                    button(ctx, ux, y + em(9.0), up, Look::Secondary, !p.share_busy, move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.share_up(&id, token))
+                    });
+                }
+                y += rh + em(4.0);
+            }
             if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
                 rect.size.h = y;
             }

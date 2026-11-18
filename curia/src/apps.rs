@@ -10,12 +10,16 @@
 //! takes, the app that opens it, and a press to change that or to ask
 //! each time, as Monstrator's "Always use this app" would.
 //!
+//! Its Share section (share-sheet.md §4.4): the apps the share sheet
+//! offers, in its order; Hide takes one off the sheet, Move up puts it
+//! higher. Each change goes with a press, which portcullisd spends.
+//!
 //! Its Between personas section (personas.md §6): a switch per persona,
 //! direction and kind ("Work may send links to Personal"). Off by default;
 //! turning one on goes with a press and then the person confirming it's
 //! them on Sigillum's sheet, which portcullisd asks for.
 
-use portcullis_ipc::{AccessBy, AccessEntry, CrossingSwitch, LinkScheme, CROSSING_KINDS};
+use portcullis_ipc::{AccessBy, AccessEntry, CrossingSwitch, LinkScheme, ShareTargetRow, CROSSING_KINDS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -24,6 +28,8 @@ pub enum Want {
     Remove { app_id: String },
     /// Make `app` the default for `scheme` links; `None`: ask each time.
     SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
+    /// The share sheet's order and hidden apps, all of them.
+    SetShare { order: Vec<String>, hidden: Vec<String>, activation: [u8; 16] },
     /// Turn one crossing switch on or off.
     SetCrossing { switch: CrossingSwitch, on: bool, activation: [u8; 16] },
     /// The Personas page (personas.md §2): add one, recolour one, remove one.
@@ -43,6 +49,9 @@ pub enum Got {
     Links(Result<Vec<LinkScheme>, String>),
     /// A SetLink came back.
     LinkDone { scheme: String, result: Result<(), String> },
+    Share(Result<Vec<ShareTargetRow>, String>),
+    /// A SetShare came back.
+    ShareDone(Result<(), String>),
     Crossings(Result<Crossings, String>),
     /// A SetCrossing came back.
     CrossingDone { switch: CrossingSwitch, result: Result<(), String> },
@@ -70,6 +79,12 @@ pub struct AppsPage {
     pub link_busy: Option<String>,
     /// What went wrong for a scheme.
     pub link_note: Option<(String, String)>,
+    /// The Share section: None until portcullisd answers.
+    pub share: Option<Result<Vec<ShareTargetRow>, String>>,
+    /// A SetShare on its way.
+    pub share_busy: bool,
+    /// What went wrong, for the section.
+    pub share_note: Option<String>,
     /// The Between personas section: None until portcullisd answers.
     pub crossings: Option<Result<Crossings, String>>,
     /// A SetCrossing on its way (turning on waits for the person's
@@ -208,6 +223,12 @@ impl AppsPage {
                     Ok(()) => self.link_note = None,
                     Err(why) => self.link_note = Some((scheme, why)),
                 }
+                self.refresh();
+            }
+            Got::Share(r) => self.share = Some(r),
+            Got::ShareDone(result) => {
+                self.share_busy = false;
+                self.share_note = result.err();
                 self.refresh();
             }
             Got::Crossings(r) => self.crossings = Some(r),
@@ -401,6 +422,51 @@ impl AppsPage {
         self.wants.push(Want::SetLink { scheme: scheme.into(), app: app.map(str::to_string), activation });
     }
 
+    /// The share sheet's apps, in its order.
+    pub fn share_targets(&self) -> &[ShareTargetRow] {
+        match &self.share {
+            Some(Ok(v)) => v,
+            _ => &[],
+        }
+    }
+
+    /// Hide `app` from the share sheet, or show it again.
+    pub fn share_hide(&mut self, app: &str, hide: bool, activation: Option<[u8; 16]>) {
+        let mut rows = self.share_targets().to_vec();
+        let Some(r) = rows.iter_mut().find(|r| r.id == app) else { return };
+        if r.hidden == hide {
+            return;
+        }
+        r.hidden = hide;
+        self.set_share(rows, activation);
+    }
+
+    /// Put `app` one place higher on the share sheet.
+    pub fn share_up(&mut self, app: &str, activation: Option<[u8; 16]>) {
+        let mut rows = self.share_targets().to_vec();
+        let Some(i) = rows.iter().position(|r| r.id == app) else { return };
+        if i == 0 {
+            return;
+        }
+        rows.swap(i - 1, i);
+        self.set_share(rows, activation);
+    }
+
+    fn set_share(&mut self, rows: Vec<ShareTargetRow>, activation: Option<[u8; 16]>) {
+        if self.share_busy {
+            return;
+        }
+        let Some(activation) = activation else {
+            self.share_note = Some("Press with the pointer or Enter".into());
+            return;
+        };
+        self.share_busy = true;
+        self.share_note = None;
+        let order = rows.iter().map(|r| r.id.clone()).collect();
+        let hidden = rows.iter().filter(|r| r.hidden).map(|r| r.id.clone()).collect();
+        self.wants.push(Want::SetShare { order, hidden, activation });
+    }
+
     pub fn toggle_open(&mut self, id: &str) {
         self.open = if self.open.as_deref() == Some(id) { None } else { Some(id.into()) };
         self.confirm = None;
@@ -525,6 +591,33 @@ mod tests {
         p.toggle_open("mine");
         p.apply(Got::List(Ok(vec![e("new", None, &["Play audio"], false, &[])])));
         assert_eq!(p.open, None);
+    }
+
+    #[test]
+    fn share_targets_hide_and_move_up_with_a_press() {
+        let row = |id: &str, hidden: bool| ShareTargetRow { id: id.into(), name: id.to_uppercase(), hidden };
+        let mut p = AppsPage::default();
+        p.apply(Got::Share(Ok(vec![row("a", false), row("b", false), row("c", true)])));
+        // No press, nothing asked.
+        p.share_up("b", None);
+        assert!(p.take_wants().is_empty());
+        assert!(p.share_note.is_some());
+        p.share_up("b", Some([1; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetShare { order: vec!["b".into(), "a".into(), "c".into()], hidden: vec!["c".into()], activation: [1; 16] }]);
+        // One at a time.
+        p.share_hide("a", true, Some([2; 16]));
+        assert!(p.take_wants().is_empty());
+        p.apply(Got::ShareDone(Ok(())));
+        let _ = p.take_wants(); // the refresh
+        p.apply(Got::Share(Ok(vec![row("b", false), row("a", false), row("c", true)])));
+        p.share_hide("c", false, Some([3; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetShare { order: vec!["b".into(), "a".into(), "c".into()], hidden: vec![], activation: [3; 16] }]);
+        p.apply(Got::ShareDone(Err("no".into())));
+        // The top one doesn't move up; an unknown app changes nothing.
+        let _ = p.take_wants();
+        p.share_up("b", Some([4; 16]));
+        p.share_hide("zzz", true, Some([4; 16]));
+        assert!(p.take_wants().is_empty());
     }
 
     #[test]

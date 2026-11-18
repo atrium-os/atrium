@@ -30,6 +30,8 @@ tabula          = { path = "../tabula" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client   = { path = "../fresco-client" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
+# The person's hidden and ordered share-targets (share.toml).
+portcullis-policy = { path = "../portcullis/portcullis-policy" }
 pergola         = { path = "../pergola" }
 aqueduct        = { path = "../aqueduct" }
 # App icons as the dock draws them: system glyphs, letter tiles, and an

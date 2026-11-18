@@ -20,7 +20,8 @@
 # the sheet over it, which lists Photos and Scraps (not Maps, not Notes);
 # Down Down Return chooses Scraps; Scraps starts in a jail of its own as its
 # own uid and gets the item; Keep answers Accepted; a second share and
-# Escape cancels, starting nothing.
+# Escape cancels, starting nothing; with Photos hidden in the person's
+# share.toml the sheet lists Scraps only.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/scratch/share-forum}
@@ -157,8 +158,8 @@ SH=$(g "ps -o jid= -o uid= -p \$(pgrep -f atrium-share-sheet | head -1)" | tr -d
 SJ=${SH% *}; SU=${SH#* }
 [ -n "$SJ" ] && [ "$SJ" != 0 ] && [ "$SU" = 65045 ] && ok "the share sheet runs in a jail (jid $SJ) as _share (65045)" || bad "share sheet: '$SH' $(g "tail -3 $S/bootstrap.log")"
 SM=$(g "mount -p | awk '{print \$2}' | grep '/jails/share-sheet/' | sed 's#.*/jails/share-sheet/##' | grep -v -e '^dev$' -e '^lib' -e '^usr' | sort | tr '\n' ' '" | tr -d '\r')
-[ "$SM" = "atrium/sockets/fresco atrium/sockets/fresco-activation atrium/sockets/limen var/lib/atrium/apps var/run/atrium/app-registry " ] \
-  && ok "its jail sees frescod's two sockets, limend's, the app tree and the registry, nothing else" || bad "share sheet mounts: '$SM'"
+[ "$SM" = "atrium/sockets/fresco atrium/sockets/fresco-activation atrium/sockets/limen var/db/atrium var/lib/atrium/apps var/run/atrium/app-registry " ] \
+  && ok "its jail sees frescod's two sockets, limend's, the app tree, people's settings and the registry, nothing else" || bad "share sheet mounts: '$SM'"
 SN=$(g "jls -n -j ${SJ:-0} ip4 ip6 vnet 2>&1" | tr -d '\r')
 case "$SN" in *vnet=new*|*ip4=disable*ip6=disable*) ok "no network in its jail" ;; *) bad "share sheet's jail network: '$SN'" ;; esac
 i=0; while [ $i -lt 30 ] && ! g "grep -q 'providing share' $SL $S/bootstrap.log 2>/dev/null"; do sleep 2; i=$((i+2)); done
@@ -223,6 +224,16 @@ sleep 10
 g "grep -h 'share-demo' $S/dock.log" | grep -q 'share-demo: cancelled' && ok "Escape: Notes hears Cancelled" || bad "escape: $(g "tail -3 $SL | tr '\n' ';'")"
 [ "$(g "grep -c 'chose ' $SL" | tr -d '\r')" = "$n" ] && ok "and nothing was chosen" || bad "a target was chosen after Escape"
 shot 5-cancelled
+
+echo "== the person hid Photos (share.toml, as Settings writes it)"
+g "mkdir -p /var/db/atrium/root; printf 'order = [\"org.example.scraps\"]\nhidden = [\"org.example.photos\"]\n' > /var/db/atrium/root/share.toml"
+press $((X0 + 688)) $((Y0 + 28))
+sleep 20
+g "tail -2 $SL" | grep -q '2 types, 1 targets for root' && ok "the jailed sheet read it: Scraps only" || bad "hidden: $(g "tail -2 $SL | tr '\n' ';'")"
+shot 6-hidden
+key 0x29
+sleep 5
+g "rm -f /var/db/atrium/root/share.toml"
 
 echo "== clean up"
 g "pkill -f atrium-portcullisd-bootstrap; pkill -f atrium-share-sheet; pkill -x forum-dock; pkill -x notes; pkill -x scraps; pkill -f atrium-limend; pkill -x forum-wm; pkill -x frescod; sleep 3; $GONE"

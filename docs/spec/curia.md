@@ -355,6 +355,13 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   portcullisd words "the window was covered or had just moved; press again". Ordinary
   windows count for `APPROVE` alone: `FILL` and `IDENTITY` still need a slot or a sheet.
 
+### 13.0 Share (2026-11-18)
+
+Below Links, a Share section lists the share-targets installed for the person in the share
+sheet's order, with Hide or Show and Move up on each; each change is one press, spent by
+portcullisd (`SetShareTargets`), written to the person's `share.toml`. See
+[share-sheet.md](share-sheet.md) §4.4.
+
 ### 13.1 Between personas (2026-11-18)
 
 Below Links, once the person has a named persona: a switch per direction and kind

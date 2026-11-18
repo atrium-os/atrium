@@ -409,6 +409,13 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                     Err(e) => Err(e),
                 };
                 let _ = tx.send(Got::Links(l));
+                let sh = match ask(&Request::ShareTargets) {
+                    Ok(Response::ShareTargets { targets }) => Ok(targets),
+                    Ok(Response::Error { message }) => Err(message),
+                    Ok(other) => Err(format!("unexpected reply: {other:?}")),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(Got::Share(sh));
                 let c = match ask(&Request::Crossings) {
                     Ok(Response::Crossings { personas, on }) => Ok((personas, on)),
                     Ok(Response::Error { message }) => Err(message),
@@ -459,6 +466,14 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                     Err(e) => eprintln!("curia: {scheme} links: {e}"),
                 }
                 Got::LinkDone { scheme, result: r }
+            }
+            Want::SetShare { order, hidden, activation } => {
+                let r = done(ask(&Request::SetShareTargets { order: order.clone(), hidden: hidden.clone(), activation }));
+                match &r {
+                    Ok(()) => eprintln!("curia: share sheet: order {order:?}, hidden {hidden:?}"),
+                    Err(e) => eprintln!("curia: share sheet: {e}"),
+                }
+                Got::ShareDone(r)
             }
             Want::Allow { app_id, activation } => {
                 let r = done(ask(&Request::ApproveAccess { app_id: app_id.clone(), activation }));

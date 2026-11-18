@@ -132,6 +132,18 @@ embed-only frescod connection limend hands them, and do their work there. A targ
 do more (Mail sending a message) needs the courier and broker paths its own app has; v1 targets
 keep what they get (save it, show it, put it in a draft the person sends from the app).
 
+### 4.4 What the person chooses
+
+Settings' Apps page has a Share section: every share-target installed for the person, in the
+order the sheet lists them, each with Hide (or Show) and Move up. A change goes with a press
+that portcullisd spends with frescod (purpose `APPROVE`), as Links' does: `ShareTargets` and
+`SetShareTargets { order, hidden, activation }`, `app-grants` only, about the person that app
+belongs to. portcullisd keeps only installed share-targets for the person and writes
+`/var/db/atrium/<person>/share.toml` (`portcullis_policy::share::SharePrefs`: `order`,
+`hidden`). The share sheet reads it (its jail mounts `/var/db/atrium` read-only): the apps
+the person ordered come first, in their order, then the rest by name; a hidden app isn't
+listed, so it can't be chosen. A newly installed target is listed, after the ordered ones.
+
 ## 5. For app developers
 
 Sharing, with Pergola (`pergola::share`; `share-sheet/src/bin/share_demo.rs` uses it):
@@ -203,8 +215,12 @@ may spend `SHARE`) and injected clicks:
   jail and uid and gets the item; Keep answers `Accepted`; Escape on a second share chooses
   nothing.
 
+- Settings' Share section (§4.4): `scripts/vm-apps-access-check.sh` clicks Hide on one target
+  and Move up on another and finds them in the person's `share.toml`; root can't read or change
+  it. `vm-share-forum-check.sh` writes a `share.toml` hiding Photos and the jailed sheet then
+  lists Scraps only.
+
 Not done yet:
 
 - Sharing across personas (refused by construction: targets run in the parent's persona).
-- Curia: the person's ordering or hiding of targets.
 - Notification actions over `CLASS_BROKER` (tabula.md §5) are a separate path, still not built.

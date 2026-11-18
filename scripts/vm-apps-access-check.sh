@@ -24,6 +24,8 @@
 #   - Links (opening-links.md §4.4): New and Sys both take mailto: links;
 #     the mailto row lists them, Use on one makes it alice's default
 #     (links.toml), Ask each time takes it away; root can't do either.
+#   - Share (share-sheet.md §4.4): New and Sys are share-targets; Hide on
+#     New and Move up on Sys land in alice's share.toml; root can't.
 #   - Between personas (personas.md §6): alice has a Work persona; Turn on
 #     for "Personal may send links to Work" asks Sigillum to confirm it's
 #     her (a stand-in answers, sigillum_stand_in) and writes the
@@ -83,9 +85,9 @@ mk() { # id name binary-in-B entry-name capabilities
   openssl dgst -sha256 -sign /root/of-key.pem -out \$O/atrium.toml.sig \$O/atrium.toml
   opifex install \$O >/dev/null
 }
-mk $NEW New home_probe stay_probe 'clipboard = true\nnotify = true' '\n[[links]]\nschemes = ["mailto"]\n'
-mk $SYS Sys home_probe stay_probe 'audio-control = true' '\n[[links]]\nschemes = ["mailto"]\n'
-rm -f /var/db/atrium/alice/links.toml
+mk $NEW New home_probe stay_probe 'clipboard = true\nnotify = true' '\n[[links]]\nschemes = ["mailto"]\n\n[roles]\nimplements = ["share-target"]\n'
+mk $SYS Sys home_probe stay_probe 'audio-control = true' '\n[[links]]\nschemes = ["mailto"]\n\n[roles]\nimplements = ["share-target"]\n'
+rm -f /var/db/atrium/alice/links.toml /var/db/atrium/alice/share.toml
 mkdir -p $ASIDE
 for d in /var/lib/atrium/apps/*; do case \${d##*/} in $NEW|$SYS|$CURIA) ;; *) mv \$d $ASIDE/ ;; esac; done
 mk $CURIA Settings curia curia 'graphics = "fresco"\napp-grants = true'
@@ -175,6 +177,25 @@ i=0; while [ $i -lt 30 ] && [ "$(count "mailto links is now ask each time")" = 0
 [ "$(count "default for mailto links is now ask each time")" = 1 ] && ok "Ask each time: the default is gone" || bad "not cleared: $(V "grep -i 'link\|REFUSED' $LOG | tail -3")"
 V "grep -q mailto $LT" && bad "still in links.toml" || ok "not in her links.toml"
 shot links-2
+
+echo "=== Share"
+ST=/var/db/atrium/alice/share.toml
+R=$(V "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"share_targets\"}\n' | nc -N -U $PSOCK")
+case "$R" in *"not a launched app"*) ok "root asking for the share targets: refused" ;; *) bad "root share targets: $R" ;; esac
+L=$(V "grep 'share targets -> $CURIA' $LOG | tail -1")
+case "$L" in *"for alice: 2"*) ok "Curia's Share section: New and Sys" ;; *) bad "share targets: $L" ;; esac
+press ${LX:-400} ${LY:-356}                      # close the mailto row
+shot share-0
+press ${HX:-906} ${HY:-${SHY:-500}}              # Hide, on New (the first row)
+i=0; while [ $i -lt 30 ] && [ "$(count "alice's share sheet")" = 0 ]; do sleep 2; i=$((i+2)); done
+V "grep -q 'hidden = \[\"$NEW\"\]' $ST" && ok "Hide on New: off alice's share sheet (share.toml)" || bad "hide: $(V "cat $ST 2>&1; grep -i 'share\|REFUSED' $LOG | tail -2")"
+shot share-1
+press ${MX:-800} ${MY:-$(( ${SHY:-500} + 52 ))}   # Move up, on Sys (the second row)
+i=0; while [ $i -lt 30 ] && [ "$(count "alice's share sheet")" -lt 2 ]; do sleep 2; i=$((i+2)); done
+V "tr -d ' \n' < $ST" | grep -q "order=\[\"$SYS\",\"$NEW\",*\]" && ok "Move up on Sys: first, New still hidden" || bad "move up: $(V "cat $ST 2>&1")"
+shot share-2
+R=$(V "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"set_share_targets\",\"order\":[],\"hidden\":[],\"activation\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]}\n' | nc -N -U $PSOCK")
+case "$R" in *"not a launched app"*) ok "root can't change it" ;; *) bad "root set share: $R" ;; esac
 
 echo "=== Between personas"
 R=$(V "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"set_crossing\",\"from\":\"personal\",\"to\":\"work\",\"kind\":\"links\",\"on\":true,\"activation\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]}\n' | nc -N -U $PSOCK")

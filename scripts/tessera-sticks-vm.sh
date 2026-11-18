@@ -226,8 +226,36 @@ MD6=$(g "mdconfig -a -t vnode -f $T/stick2.img")
 PART=${MD6}p1
 sleep 5
 check "kept: replugged, it opens for bob by itself" tessera "$(mounted)"
+# "Forget this stick's key" (§9). No Sigillum in this VM, so arcad can't
+# verify bob: refused, and the stick is mounted again as it was.
+r=$(g "su -m bob -c '$D --media-socket $S --forget $PART'")
+check "forget the key: needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still mounted" tessera "$(mounted)"
+check "…still bob's, with its recovery code" yes "$(list_as bob | grep -q "^$PART /media/$PART .* recovery persona=personal" && echo yes || echo no)"
+check "…alice's note still reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
+r=$(g "su -m alice -c '$D --media-socket $S --forget $PART'")
+check "…not by another user" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+# Removing its recovery code (§7.4): the kernel zeroes the slot in both
+# superblock copies; bob's kept key still opens it.
+r=$(g "su -m alice -c '$D --media-socket $S --remove-code $PART'")
+check "remove the code: not by another user" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+r=$(g "su -m bob -c '$D --media-socket $S --remove-code $PART'")
+check "remove the code" "ok $PART's recovery code is removed" "$r"
+slot() { g "dd if=/dev/$PART bs=4096 skip=$1 count=1 2>/dev/null | dd bs=1 skip=280 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'"; }
+check "…gone from superblock A" 00 "$(slot 0)"
+check "…and B" 00 "$(slot 1)"
+check "…listed without one" no "$(list_as bob | grep -q "^$PART .* recovery" && echo yes || echo no)"
+check "…still mounted, the note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
+r=$(g "su -m bob -c '$D --media-socket $S --remove-code $PART'")
+check "…a second time: nothing to remove" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
 check "ejected" "" "$(mounted)"
+MD7=$(g "mdconfig -d -u $MD6; mdconfig -a -t vnode -f $T/stick2.img")
+PART=${MD7}p1; MD6=$MD7
+sleep 5
+check "replugged after: it opens with bob's key" tessera "$(mounted)"
+check "…and has no recovery code" no "$(list_as bob | grep -q "^$PART .* recovery" && echo yes || echo no)"
+r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
 
 echo "=== cleanup"
 g "for j in $JW $JP; do $JC $JS remove \$j >/dev/null 2>&1; done; sed -i '' '/^5070[12] /d' $REG; true"

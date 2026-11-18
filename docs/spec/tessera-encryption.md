@@ -579,8 +579,8 @@ Personal:
   session only), then the kernel mounts it. The AEAD tag stands in for comparing
   `check`: a wrong code fails the unwrap, and the kernel still checks the key against
   the volume. Still to come: the Arca credential field the code is typed into
-  (arca.md §8.3; for now the client sends it), removing a code later, and Curia's
-  wording.
+  (arca.md §8.3; for now the client sends it; since built), removing a code later (since built, below),
+  and Curia's wording.
 - **Older copies (§8):** the kernel refuses a copy below the key's high-water mark with
   `ESTALE` (an authentication failure stays `EINTEGRITY`), and dispensatord lists it
   `locked older` with its persona. Media op `OPEN_OLDER` (0x0C) has arcad `VK_OLDER`
@@ -593,6 +593,20 @@ Personal:
   notes every mounted generation in the keyring, read back with `TKEY_GEN`;
   never a number from dispensatord) and reload the key as usual; the kernel then
   mounts it writable. Refused or unverified, it goes back read-only.
+- **Forgetting a stick's key (§9):** media op `FORGET` (0x0E, `--forget PART`) for an
+  open sealed stick of the session's person: dispensatord stops its server, unmounts
+  it, records its generation, and has arcad `VK_FORGET` 0xB3, behind Sigillum's
+  `VERIFY_USER`, delete the item and drop the key; the stick is then listed `locked`.
+  Refused or unverified, it is mounted again as it was. An open stick is listed
+  `recovery` when it has a slot, so Scrinium's "Forget this stick's key…" sheet says
+  whether its recovery code would still open it (and points to Erase and format).
+- **Removing a recovery code (§7.4):** media op `REMOVE_CODE` (0x0F, `--remove-code
+  PART`) for an open, writable sealed stick of the person's that has one. dispensatord
+  opens the mount's root and issues `TESSERA_IOC_CLEAR_RECOVERY` (`_IO('T', 6)`, unjailed
+  root only): the kernel zeroes every type-3 slot in the in-core superblock and marks it
+  dirty, and the fsync that follows commits both superblock copies under the HMAC. No
+  verification: it only takes a way in away. Scrinium's "Remove recovery code…" says
+  that only this machine's key opens it afterwards.
 - **Grants of its folders** (built; `tessera-sticks-vm.sh` §5b, 12 checks, all pass in the VM on 2026-11-18 at 908973d): a trusted stick has no
   FUSE server of its own, so dispensatord starts one per mounted stick,
   `atrium-capsa-local`, in a jail of jaild's `[stick_servers]` class: named
