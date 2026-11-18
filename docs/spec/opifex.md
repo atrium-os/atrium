@@ -405,7 +405,10 @@ for an app signed by a key on the side-load list and not installed from a catalo
 says it is from a file and won't update by itself; a counted press sends
 `InstallLocalApproved { token, manifest_sha256, for_uid }`, which installs that held copy
 only if its manifest is the one shown, for that person, and uses the token up. Unapproved
-copies go after 15 minutes.
+copies go after 15 minutes. VM gate `scripts/vm-opifex-c3-check.sh` 0 failed on the Mac VM
+(2026-11-18, with real presses): a file signed by a key off the side-load list refused with no
+sheet, the sheet for a listed key's file ("Not from a catalog: it won't update by itself"),
+Install putting that copy in as a side-load for the asker, nothing left held.
 
 ### 7.5 On disk
 
