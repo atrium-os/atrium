@@ -348,13 +348,17 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   socket per running workspace. portcullisd asks the agent to open the workspace's socket
   at each start, mounts its folder read-only at `/atrium/ssh-agent` and sets
   `SSH_AUTH_SOCK`; stop closes it, delete ends its grants. The person uses `arca-ssh
-  new|list|grant|revoke|delete`. Gate `scripts/vm-ssh-agent-check.sh`: 25/25 (an ssh
+  new|list|grant|revoke|delete`. Gate `scripts/vm-ssh-agent-check.sh`: 25/25, 35/35 with tokens (an ssh
   login and `ssh-keygen -Y sign` through the agent, the signature checked on the host;
   another workspace lists nothing and can't sign or log in; no private key in the
   workspace; the socket refuses any uid but the workspace's; revoke and lock end it). The
   login is to an sshd of the workspace's own on its loopback, which is what `git push`
-  over SSH does too; git itself isn't on the cloud VM. Not done: grants in Curia (the CLI
-  stands in), `git-credential-arca` for HTTPS tokens, and the agent run jailed from its
+  over SSH does too; git itself isn't on the cloud VM. HTTPS tokens (later the same day):
+  `arca-ssh token HOST USERNAME`, granted like keys; `git-credential-arca` is copied into
+  each workspace's `/atrium/bin` from the host's install and set as git's credential
+  helper whenever the workspace has the agent; it gets only that workspace's token for
+  that host. The gate checks it with the helper itself and `git credential fill` where
+  git is present. Not done: grants in Curia (the CLI stands in), and the agent run jailed from its
   services.d entry (it passes the shipped policy; the gate runs it unjailed as `_arca-ssh`).
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on

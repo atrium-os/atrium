@@ -5,6 +5,9 @@
 //!     arca-ssh grant [--persona P] ID WORKSPACE
 //!     arca-ssh revoke [--persona P] ID WORKSPACE
 //!     arca-ssh delete [--persona P] ID
+//!     arca-ssh token [--persona P] HOST USERNAME   an HTTPS token (git, a
+//!                                           registry), read from stdin;
+//!                                           grant it like a key
 //!
 //! The persona defaults to personal. The agent acts as whoever runs this
 //! (the kernel's peer uid); the private key never leaves Arca.
@@ -30,6 +33,19 @@ fn main() -> ExitCode {
         ("list", 0) => format!("list {persona}"),
         ("grant" | "revoke", 2) => format!("{verb} {persona} {} {}", rest[0], rest[1]),
         ("delete", 1) => format!("delete {persona} {}", rest[0]),
+        ("token", 2) => {
+            let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            if tty {
+                eprintln!("arca-ssh: paste the token for {} and press Return (not shown)", rest[0]);
+            }
+            let mut t = String::new();
+            let read = no_echo(tty, || std::io::stdin().read_line(&mut t));
+            if read.is_err() || t.trim().is_empty() {
+                eprintln!("arca-ssh: no token on stdin");
+                return ExitCode::FAILURE;
+            }
+            format!("token {persona} {} {}\n{}", rest[0], rest[1], t.trim())
+        }
         _ => return usage(),
     };
     let root = std::env::var("SSH_AGENT_ROOT").unwrap_or_else(|_| arca_ssh_agent::SOCKET_ROOT.into());
@@ -59,7 +75,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// Run `f` with the terminal's echo off (the token isn't shown).
+fn no_echo<T>(tty: bool, f: impl FnOnce() -> T) -> T {
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let off = tty && unsafe { libc::tcgetattr(0, &mut old) } == 0 && {
+        let mut t = old;
+        t.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) == 0 }
+    };
+    let r = f();
+    if off {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &old) };
+        eprintln!();
+    }
+    r
+}
+
 fn usage() -> ExitCode {
-    eprintln!("usage: arca-ssh [--persona P] new COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID");
+    eprintln!("usage: arca-ssh [--persona P] new COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID | token HOST USERNAME");
     ExitCode::from(2)
 }

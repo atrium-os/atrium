@@ -18,6 +18,10 @@ path = "src/bin/atrium-ssh-agent.rs"
 name = "arca-ssh"
 path = "src/bin/arca-ssh.rs"
 
+[[bin]]
+name = "git-credential-arca"
+path = "src/bin/git-credential-arca.rs"
+
 [dependencies]
 arca-store      = { path = "../arca-store" }
 arcad           = { path = "../arcad" }

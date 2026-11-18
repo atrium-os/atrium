@@ -1,7 +1,14 @@
-//! The ssh-agent protocol (draft-miller-ssh-agent), the two requests a
-//! workspace may make: list identities and sign. Everything else fails.
+//! The ssh-agent protocol (draft-miller-ssh-agent), the three requests a
+//! workspace may make: list identities, sign, and Atrium's own extension
+//! [`GIT_CREDENTIAL`] (an HTTPS token granted to it, for git's credential
+//! helper). Everything else fails.
 
 pub const FAILURE: u8 = 5;
+pub const SUCCESS: u8 = 6;
+pub const EXTENSION: u8 = 27;
+/// `string "git-credential@atrium" | string host` → `SUCCESS | string
+/// username | string token`; FAILURE if no token for that host is granted.
+pub const GIT_CREDENTIAL: &[u8] = b"git-credential@atrium";
 pub const REQUEST_IDENTITIES: u8 = 11;
 pub const IDENTITIES_ANSWER: u8 = 12;
 pub const SIGN_REQUEST: u8 = 13;
@@ -70,21 +77,45 @@ pub fn frame(body: &[u8]) -> Vec<u8> {
     o
 }
 
-/// Answer one request (`type | payload`, unframed). `keys` lists the
-/// workspace's granted keys (`None`: Arca refused or is locked); `sign`
-/// asks Arca to sign with one of them.
-pub fn answer(
-    req: &[u8],
-    keys: &mut dyn FnMut() -> Option<Vec<Key>>,
-    sign: &mut dyn FnMut(&Key, &[u8]) -> Option<[u8; 64]>,
-) -> Vec<u8> {
+/// The request git-credential-arca sends.
+pub fn credential_request(host: &str) -> Vec<u8> {
+    let mut o = vec![EXTENSION];
+    put_string(&mut o, GIT_CREDENTIAL);
+    put_string(&mut o, host.as_bytes());
+    o
+}
+
+/// Its answer: the username and token, or `None` (none granted, locked).
+pub fn credential_answer(reply: &[u8]) -> Option<(String, Vec<u8>)> {
+    let (&t, rest) = reply.split_first()?;
+    if t != SUCCESS {
+        return None;
+    }
+    let mut r = R(rest);
+    let (u, tok) = (r.string()?, r.string()?);
+    r.0.is_empty().then_some(())?;
+    Some((String::from_utf8(u.to_vec()).ok()?, tok.to_vec()))
+}
+
+/// The callbacks [`answer`] uses, each asking Arca for this workspace.
+pub trait Ask {
+    /// Its granted keys (`None`: Arca refused or is locked).
+    fn keys(&mut self) -> Option<Vec<Key>>;
+    /// Sign with one of them.
+    fn sign(&mut self, k: &Key, data: &[u8]) -> Option<[u8; 64]>;
+    /// The token for `host` granted to it.
+    fn token(&mut self, host: &str) -> Option<(String, Vec<u8>)>;
+}
+
+/// Answer one request (`type | payload`, unframed).
+pub fn answer(req: &[u8], ask: &mut dyn Ask) -> Vec<u8> {
     let fail = vec![FAILURE];
     let Some((&t, rest)) = req.split_first() else { return fail };
     match t {
         REQUEST_IDENTITIES if rest.is_empty() => {
             // Locked or refused: no identities, so ssh moves on to its
             // other methods rather than failing.
-            let ks = keys().unwrap_or_default();
+            let ks = ask.keys().unwrap_or_default();
             let mut o = vec![IDENTITIES_ANSWER];
             o.extend_from_slice(&(ks.len() as u32).to_be_bytes());
             for k in &ks {
@@ -99,11 +130,24 @@ pub fn answer(
             if !r.0.is_empty() {
                 return fail;
             }
-            let Some(ks) = keys() else { return fail };
+            let Some(ks) = ask.keys() else { return fail };
             let Some(k) = ks.iter().find(|k| key_blob(&k.pk) == blob) else { return fail };
-            let Some(sig) = sign(k, data) else { return fail };
+            let Some(sig) = ask.sign(k, data) else { return fail };
             let mut o = vec![SIGN_RESPONSE];
             put_string(&mut o, &sig_blob(&sig));
+            o
+        }
+        EXTENSION => {
+            let mut r = R(rest);
+            let (Some(name), Some(host)) = (r.string(), r.string()) else { return fail };
+            if name != GIT_CREDENTIAL || !r.0.is_empty() {
+                return fail;
+            }
+            let Some(host) = std::str::from_utf8(host).ok().filter(|h| arcad::ssh::valid_host(h)) else { return fail };
+            let Some((user, tok)) = ask.token(host) else { return fail };
+            let mut o = vec![SUCCESS];
+            put_string(&mut o, user.as_bytes());
+            put_string(&mut o, &tok);
             o
         }
         _ => fail,
@@ -123,20 +167,50 @@ mod tests {
         o
     }
 
+    struct T {
+        sk: SigningKey,
+        k: Option<Key>,
+    }
+
+    impl Ask for T {
+        fn keys(&mut self) -> Option<Vec<Key>> {
+            self.k.clone().map(|k| vec![k])
+        }
+        fn sign(&mut self, key: &Key, d: &[u8]) -> Option<[u8; 64]> {
+            (key.id == [1; 16]).then(|| self.sk.sign(d).to_bytes())
+        }
+        fn token(&mut self, host: &str) -> Option<(String, Vec<u8>)> {
+            (host == "github.com").then(|| ("alice".into(), b"ghp_x".to_vec()))
+        }
+    }
+
+    #[test]
+    fn hands_over_only_a_granted_token() {
+        let mut t = T { sk: SigningKey::from_bytes(&[9; 32]), k: None };
+        let a = answer(&credential_request("github.com"), &mut t);
+        assert_eq!(credential_answer(&a), Some(("alice".into(), b"ghp_x".to_vec())));
+        assert_eq!(answer(&credential_request("gitlab.com"), &mut t), vec![FAILURE]);
+        assert_eq!(answer(&credential_request("GitHub.com:443"), &mut t), vec![FAILURE]);
+        let mut other = vec![EXTENSION];
+        put_string(&mut other, b"session-bind@openssh.com");
+        put_string(&mut other, b"github.com");
+        assert_eq!(answer(&other, &mut t), vec![FAILURE]);
+        assert_eq!(credential_answer(&[FAILURE]), None);
+    }
+
     #[test]
     fn lists_and_signs_only_granted_keys() {
         let sk = SigningKey::from_bytes(&[9; 32]);
         let k = Key { id: [1; 16], pk: sk.verifying_key().to_bytes(), comment: "alice@web".into() };
-        let mut keys = || Some(vec![k.clone()]);
-        let mut sign = |key: &Key, d: &[u8]| (key.id == [1; 16]).then(|| sk.sign(d).to_bytes());
-        let a = answer(&[REQUEST_IDENTITIES], &mut keys, &mut sign);
+        let mut t = T { sk: sk.clone(), k: Some(k.clone()) };
+        let a = answer(&[REQUEST_IDENTITIES], &mut t);
         assert_eq!(a[0], IDENTITIES_ANSWER);
         assert_eq!(&a[1..5], &1u32.to_be_bytes());
         let mut r = R(&a[5..]);
         assert_eq!(r.string().unwrap(), key_blob(&k.pk).as_slice());
         assert_eq!(r.string().unwrap(), b"alice@web");
 
-        let s = answer(&req_sign(&key_blob(&k.pk), b"data"), &mut keys, &mut sign);
+        let s = answer(&req_sign(&key_blob(&k.pk), b"data"), &mut t);
         assert_eq!(s[0], SIGN_RESPONSE);
         let mut r = R(&s[1..]);
         let mut sr = R(r.string().unwrap());
@@ -146,13 +220,13 @@ mod tests {
 
         // A key it doesn't have, trailing bytes, an add-identity request,
         // a locked store: failure.
-        assert_eq!(answer(&req_sign(&key_blob(&[3; 32]), b"d"), &mut keys, &mut sign), vec![FAILURE]);
+        assert_eq!(answer(&req_sign(&key_blob(&[3; 32]), b"d"), &mut t), vec![FAILURE]);
         let mut bad = req_sign(&key_blob(&k.pk), b"d");
         bad.push(0);
-        assert_eq!(answer(&bad, &mut keys, &mut sign), vec![FAILURE]);
-        assert_eq!(answer(&[17, 0, 0, 0, 0], &mut keys, &mut sign), vec![FAILURE]);
-        assert_eq!(answer(&[], &mut keys, &mut sign), vec![FAILURE]);
-        let mut none = || None;
-        assert_eq!(answer(&[REQUEST_IDENTITIES], &mut none, &mut sign), vec![IDENTITIES_ANSWER, 0, 0, 0, 0]);
+        assert_eq!(answer(&bad, &mut t), vec![FAILURE]);
+        assert_eq!(answer(&[17, 0, 0, 0, 0], &mut t), vec![FAILURE]);
+        assert_eq!(answer(&[], &mut t), vec![FAILURE]);
+        t.k = None;
+        assert_eq!(answer(&[REQUEST_IDENTITIES], &mut t), vec![IDENTITIES_ANSWER, 0, 0, 0, 0]);
     }
 }

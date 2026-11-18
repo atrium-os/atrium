@@ -225,7 +225,7 @@ impl State {
                 }
             }
             Label::Service(name) if (0xB0..=0xB8).contains(&op) => self.volume_op(name, op, body, &mut item),
-            Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC7).contains(&op) => self.ssh_op(op, body, &mut item),
+            Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC9).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -2177,7 +2177,7 @@ impl State {
     /// agent's recipient; a workspace sees and signs with only those
     /// granted to it by name.
     fn ssh_op(&mut self, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
-        use crate::ssh::{granted, valid_workspace, with_grant, SERVICE};
+        use crate::ssh::{granted, token_account, valid_host, valid_workspace, with_grant, SERVICE};
         let mut r = Reader::new(body);
         macro_rules! field {
             ($e:expr) => {
@@ -2240,11 +2240,22 @@ impl State {
                 let mut n = 0u32;
                 let mut w = Writer::new();
                 for m in tri!(store.list(&who)) {
-                    if m.kind != Kind::Ed25519 || ws.is_some_and(|ws| !granted(&m.scope, ws)) {
+                    let listed = match ws {
+                        Some(ws) => m.kind == Kind::Ed25519 && granted(&m.scope, ws),
+                        None => matches!(m.kind, Kind::Ed25519 | Kind::ApiKey),
+                    };
+                    if !listed {
                         continue;
                     }
                     w.raw(&m.id.0);
-                    w.raw(&tri!(pubkey(store, &m.id)));
+                    if ws.is_none() {
+                        w.u16(m.kind as u16);
+                    }
+                    if m.kind == Kind::Ed25519 {
+                        w.raw(&tri!(pubkey(store, &m.id)));
+                    } else {
+                        w.raw(&[0; 32]);
+                    }
                     w.str(&m.account);
                     if ws.is_none() {
                         w.str(std::str::from_utf8(&m.scope).unwrap_or(""));
@@ -2267,6 +2278,60 @@ impl State {
                 let m = tri!(store.meta(&id, &who));
                 tri!(store.set_scope(&id, &who, &with_grant(&m.scope, ws, op == ssh_op::SA_GRANT)));
                 ok(Vec::new())
+            }
+            ssh_op::SA_TOKEN_ADD => {
+                let host = field!(r.str(253));
+                let username = field!(r.str(128));
+                let token = field!(r.bytes(ssh_op::TOKEN_MAX));
+                field!(r.end());
+                if !valid_host(host) || username.is_empty() || username.chars().any(|c| c.is_control() || c == ' ') || token.is_empty() {
+                    return malformed();
+                }
+                let account = token_account(host, username);
+                // Replaced, grants kept.
+                let mut scope = Vec::new();
+                for m in tri!(store.list(&who)) {
+                    if m.kind == Kind::ApiKey && m.account == account {
+                        scope = m.scope.clone();
+                        tri!(store.delete(&m.id, &who));
+                    }
+                }
+                let m = tri!(store.add(NewItem {
+                    persona: &persona,
+                    recipient: me.clone(),
+                    class: Class::WhileUnlocked,
+                    kind: Kind::ApiKey,
+                    provenance: Provenance::UserTyped,
+                    account: &account,
+                    scope: &scope,
+                    value: token,
+                }));
+                *item = Some(m.id);
+                ok(m.id.0.to_vec())
+            }
+            ssh_op::SA_TOKEN_GET => {
+                let ws = field!(r.str(64));
+                let host = field!(r.str(253));
+                field!(r.end());
+                if !valid_workspace(ws) || !valid_host(host) {
+                    return malformed();
+                }
+                let prefix = format!("{host} ");
+                let Some(m) = tri!(store.list(&who)).into_iter()
+                    .find(|m| m.kind == Kind::ApiKey && m.account.starts_with(&prefix) && granted(&m.scope, ws)) else {
+                    return reply(status::DENIED);
+                };
+                *item = Some(m.id);
+                let (_, v) = tri!(store.release(&m.id, &who, None));
+                let user = &m.account[prefix.len()..];
+                let mut out = tri!(LockedBuf::zeroed(4 + user.len() + 4 + v.len()).map_err(Error::Io));
+                let b = out.as_mut();
+                b[..4].copy_from_slice(&(user.len() as u32).to_le_bytes());
+                b[4..4 + user.len()].copy_from_slice(user.as_bytes());
+                let o = 4 + user.len();
+                b[o..o + 4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+                b[o + 4..].copy_from_slice(v.as_ref());
+                Reply { status: status::OK, body: Body::Secret(out) }
             }
             ssh_op::SA_FORGET => {
                 let ws = field!(r.str(64));

@@ -156,14 +156,32 @@ fn serve(a: &Agent, owner: &str, ws: &str, e: &Open, mut c: UnixStream) {
         if c.read_exact(&mut req).is_err() {
             return;
         }
-        let mut keys = || match a.arca.keys(owner, &e.persona, ws) {
-            Ok(k) => Some(k),
-            Err(err) => {
-                eprintln!("ssh-agent: {owner}/{ws}: keys: {err}");
-                None
-            }
-        };
-        let mut sign = |k: &Key, d: &[u8]| match a.arca.sign(owner, &e.persona, ws, &k.id, d) {
+        let r = wire::answer(&req, &mut Ws { a, owner, ws, e });
+        if c.write_all(&wire::frame(&r)).is_err() {
+            return;
+        }
+    }
+}
+
+/// One workspace's view of Arca, for [`wire::answer`].
+struct Ws<'a> {
+    a: &'a Agent,
+    owner: &'a str,
+    ws: &'a str,
+    e: &'a Open,
+}
+
+impl wire::Ask for Ws<'_> {
+    fn keys(&mut self) -> Option<Vec<Key>> {
+        let (owner, ws) = (self.owner, self.ws);
+        self.a.arca.keys(owner, &self.e.persona, ws)
+            .map_err(|err| eprintln!("ssh-agent: {owner}/{ws}: keys: {err}"))
+            .ok()
+    }
+
+    fn sign(&mut self, k: &Key, d: &[u8]) -> Option<[u8; 64]> {
+        let (owner, ws) = (self.owner, self.ws);
+        match self.a.arca.sign(owner, &self.e.persona, ws, &k.id, d) {
             Ok(s) => {
                 eprintln!("ssh-agent: {owner}/{ws}: signed with {} ({})", &hex(&k.id)[..8], k.comment);
                 Some(s)
@@ -172,10 +190,20 @@ fn serve(a: &Agent, owner: &str, ws: &str, e: &Open, mut c: UnixStream) {
                 eprintln!("ssh-agent: {owner}/{ws}: sign: {err}");
                 None
             }
-        };
-        let r = wire::answer(&req, &mut keys, &mut sign);
-        if c.write_all(&wire::frame(&r)).is_err() {
-            return;
+        }
+    }
+
+    fn token(&mut self, host: &str) -> Option<(String, Vec<u8>)> {
+        let (owner, ws) = (self.owner, self.ws);
+        match self.a.arca.token_get(owner, &self.e.persona, ws, host) {
+            Ok(t) => {
+                eprintln!("ssh-agent: {owner}/{ws}: gave its {host} token");
+                Some(t)
+            }
+            Err(err) => {
+                eprintln!("ssh-agent: {owner}/{ws}: token for {host}: {err}");
+                None
+            }
         }
     }
 }
@@ -234,7 +262,19 @@ fn control(a: &Arc<Agent>, c: UnixStream) {
             }
             None => Err("bad request".into()),
         },
-        Some(Caller::Person(user)) => person(a, &user, &line),
+        Some(Caller::Person(user)) => {
+            // A token comes on the line after its request.
+            let mut token = String::new();
+            if matches!(parse_person(&line), Some(Person::Token { .. }))
+                && (rd.by_ref().take(arcad::proto::ssh_op::TOKEN_MAX as u64 + 2).read_line(&mut token).is_err() || !token.ends_with('\n'))
+            {
+                token.clear();
+            }
+            let r = person(a, &user, &line, token.trim_end_matches(['\r', '\n']));
+            // Not kept in this heap longer than it takes.
+            unsafe { token.as_bytes_mut().fill(0) };
+            r
+        }
     };
     let mut w = &c;
     let text = match out {
@@ -244,7 +284,7 @@ fn control(a: &Arc<Agent>, c: UnixStream) {
     let _ = writeln!(w, "{text}");
 }
 
-fn person(a: &Agent, user: &str, line: &str) -> Result<Vec<String>, String> {
+fn person(a: &Agent, user: &str, line: &str, token: &str) -> Result<Vec<String>, String> {
     let e = |e: arca_ssh_agent::arca::Error| e.to_string();
     match parse_person(line).ok_or("bad request")? {
         Person::New { persona, comment } => {
@@ -254,12 +294,24 @@ fn person(a: &Agent, user: &str, line: &str) -> Result<Vec<String>, String> {
         }
         Person::List { persona } => Ok(a.arca.list(user, &persona).map_err(e)?
             .into_iter()
-            .map(|l| format!("{} {} granted={}", hex(&l.key.id), public_line(&l.key.pk, &l.key.comment), l.grants.join(",")))
+            .map(|l| if l.token {
+                format!("{} token {} granted={}", hex(&l.key.id), l.key.comment, l.grants.join(","))
+            } else {
+                format!("{} {} granted={}", hex(&l.key.id), public_line(&l.key.pk, &l.key.comment), l.grants.join(","))
+            })
             .collect()),
         Person::Grant { persona, id, ws, on } => {
             a.arca.grant(user, &persona, &id, &ws, on).map_err(e)?;
             eprintln!("ssh-agent: {user} {} key {} {} {ws}", if on { "granted" } else { "revoked" }, &hex(&id)[..8], if on { "to" } else { "from" });
             Ok(vec![])
+        }
+        Person::Token { persona, host, username } => {
+            if token.is_empty() || token.chars().any(char::is_control) {
+                return Err("the token goes on the next line".into());
+            }
+            let id = a.arca.token_add(user, &persona, &host, &username, token.as_bytes()).map_err(e)?;
+            eprintln!("ssh-agent: {user} stored a {host} token {} in {persona}", &hex(&id)[..8]);
+            Ok(vec![hex(&id)])
         }
         Person::Delete { persona, id } => {
             a.arca.delete(user, &persona, &id).map_err(e)?;

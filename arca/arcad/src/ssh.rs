@@ -18,6 +18,17 @@ pub fn valid_workspace(n: &str) -> bool {
     !b.is_empty() && b.len() <= 32 && b[0] != b'-' && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
+/// A host a token may be for: a lowercase DNS name, no port, no wildcard.
+pub fn valid_host(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 253 && !h.starts_with('.') && !h.ends_with('.') && !h.contains("..")
+        && h.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+}
+
+/// A token item's account: `host username`.
+pub fn token_account(host: &str, user: &str) -> String {
+    format!("{host} {user}")
+}
+
 /// The workspaces in a scope.
 pub fn grants(scope: &[u8]) -> Vec<&str> {
     std::str::from_utf8(scope).unwrap_or("").lines().filter(|l| valid_workspace(l)).collect()

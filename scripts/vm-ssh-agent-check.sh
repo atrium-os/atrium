@@ -20,6 +20,10 @@
 #     (as git over SSH would), and not from the other;
 #   - no private key is anywhere in the workspace's files;
 #   - the socket refuses a uid other than the workspace's (alice herself);
+#   - an HTTPS token stored with `arca-ssh token` and granted to a
+#     workspace: git there has credential.helper=arca, and
+#     git-credential-arca hands it over for that host only, not to the
+#     other workspace;
 #   - revoke ends it; stopping a workspace closes its socket; a locked
 #     store lists nothing. (Deleting a workspace needs a person's gesture,
 #     so its grants ending is arcad's test, tests/ssh.rs.)
@@ -53,6 +57,7 @@ V "pkill -x portcullisd; pkill -f $B/; sleep 1; rm -rf $B $G; mkdir -p $B $G; ch
 for b in portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          arca/arcad/target/$TARGET/release/arcad arca/arcad/target/$TARGET/release/arca-probe \
          arca/arca-ssh-agent/target/$TARGET/release/atrium-ssh-agent arca/arca-ssh-agent/target/$TARGET/release/arca-ssh \
+         arca/arca-ssh-agent/target/$TARGET/release/git-credential-arca \
          etc/jaild.policy.toml; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "ssh-agent: 1 failed"; exit 1; }
 done
@@ -60,7 +65,7 @@ PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 V 'sh -s' <<EOS
 set -e
-for b in portcullisd portcullis arca-ssh; do install -m 0755 $B/\$b /usr/local/bin/\$b; done
+for b in portcullisd portcullis arca-ssh git-credential-arca; do install -m 0755 $B/\$b /usr/local/bin/\$b; done
 mkdir -p /etc/atrium; cp $B/jaild.policy.toml /etc/atrium/jaild.policy.toml
 grep -q '^allow_rctl' /etc/atrium/jaild.policy.toml || printf '\n[resource_control]\nallow_rctl = true\n' >> /etc/atrium/jaild.policy.toml
 id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
@@ -154,6 +159,30 @@ out=$(run keys 'grep -rl "PRIVATE KEY" $HOME /tmp /root /var /usr/local 2>/dev/n
 check "no private key file in the workspace" "" "$out"
 r=$(V "su -m alice -c 'SSH_AUTH_SOCK=$AR/alice.keys/agent.sock ssh-add -L 2>&1'")
 hasnt "the socket refuses alice's own uid" "ssh-ed25519" "$r"
+
+echo "=== HTTPS token (git)"
+r=$(V "echo ghp_gate_token | su -m alice -c 'cd /tmp; arca-ssh token github.com alice'" 2>&1)
+TID=$(echo "$r" | head -1)
+check "arca-ssh token: an id" 32 "${#TID}"
+has "arca-ssh list shows it" "$TID token github.com alice granted=" "$(SSHA list)"
+CRED='printf "protocol=https\nhost=$1\n\n" | git-credential-arca get; echo "helper=$GIT_CONFIG_KEY_0=$GIT_CONFIG_VALUE_0"; command -v git >/dev/null && printf "protocol=https\nhost=$1\n\n" | git credential fill 2>&1 | sed s/^/git:/ </dev/null'
+out=$(run keys "set -- github.com; $CRED")
+has "git's helper is arca in the workspace" "helper=credential.helper=arca" "$out"
+hasnt "nothing before a grant" "ghp_gate_token" "$out"
+SSHA grant $TID keys >/dev/null
+out=$(run keys "set -- github.com; $CRED")
+has "the granted workspace gets the token" "username=alice
+password=ghp_gate_token" "$out"
+case "$out" in *git:*) has "git credential fill uses it" "git:password=ghp_gate_token" "$out" ;; *) echo "  (no git in the workspace; git credential fill skipped)" ;; esac
+hasnt "not for another host" "ghp_gate_token" "$(run keys 'set -- gitlab.com; '"$CRED")"
+hasnt "not in another workspace" "ghp_gate_token" "$(run other "set -- github.com; $CRED")"
+has "the hand-over is logged" "gave its github.com token" "$(V "cat $G/agent.log")"
+V "echo ghp_gate_token2 | su -m alice -c 'cd /tmp; arca-ssh token github.com alice'" >/dev/null 2>&1
+has "a replaced token keeps its grant" "password=ghp_gate_token2" "$(run keys "set -- github.com; $CRED")"
+SSHA revoke $TID keys >/dev/null
+TID2=$(SSHA list | awk '/ token github.com /{print $1}')
+SSHA revoke $TID2 keys >/dev/null
+hasnt "revoked: none" "ghp_gate_token" "$(run keys "set -- github.com; $CRED")"
 
 echo "=== revoke, lock, delete"
 SSHA revoke $ID keys >/dev/null

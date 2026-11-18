@@ -18,6 +18,8 @@ pub struct Arca {
 /// A key as the person sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
+    /// An HTTPS token (its comment is `host username`, pk zeros), not a key.
+    pub token: bool,
     pub key: Key,
     pub grants: Vec<String>,
 }
@@ -91,12 +93,40 @@ impl Arca {
         let n = r.u32()?;
         let mut v = Vec::new();
         for _ in 0..n {
-            let key = Key { id: r.array()?, pk: r.array()?, comment: r.str(ssh_op::COMMENT_MAX)?.into() };
+            let id = r.array()?;
+            let token = r.u16()? == arca_store::model::Kind::ApiKey as u16;
+            let key = Key { id, pk: r.array()?, comment: r.str(arca_store::model::caps::ACCOUNT)?.into() };
             let grants = arcad::ssh::grants(r.str(arca_store::model::caps::SCOPE)?.as_bytes()).into_iter().map(String::from).collect();
-            v.push(Listed { key, grants });
+            v.push(Listed { token, key, grants });
         }
         r.end()?;
         Ok(v)
+    }
+
+    /// Store an HTTPS token for `host` (replacing one for the same host and
+    /// username, its grants kept); its id.
+    pub fn token_add(&self, user: &str, persona: &str, host: &str, username: &str, token: &[u8]) -> Result<[u8; 16], Error> {
+        let mut w = Writer::new();
+        owner(&mut w, user, persona);
+        w.str(host);
+        w.str(username);
+        w.bytes(token);
+        let b = self.call(ssh_op::SA_TOKEN_ADD, &w.buf)?;
+        b.as_slice().try_into().map_err(|_| Error::Malformed)
+    }
+
+    /// The token for `host` granted to workspace `ws`: username and token.
+    pub fn token_get(&self, user: &str, persona: &str, ws: &str, host: &str) -> Result<(String, Vec<u8>), Error> {
+        let mut w = Writer::new();
+        owner(&mut w, user, persona);
+        w.str(ws);
+        w.str(host);
+        let b = self.call(ssh_op::SA_TOKEN_GET, &w.buf)?;
+        let mut r = Reader::new(&b);
+        let u = r.str(arca_store::model::caps::ACCOUNT)?.to_string();
+        let t = r.bytes(ssh_op::TOKEN_MAX)?.to_vec();
+        r.end()?;
+        Ok((u, t))
     }
 
     pub fn grant(&self, user: &str, persona: &str, id: &[u8; 16], ws: &str, on: bool) -> Result<(), Error> {

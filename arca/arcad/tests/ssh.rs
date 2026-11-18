@@ -99,3 +99,62 @@ fn a_workspace_signs_with_only_its_granted_keys() {
     assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_eq!(sign(&mut s, &agent(), "main", "web", id, b"m").0, status::LOCKED);
 }
+
+fn token_add(s: &mut State, host: &str, user: &str, tok: &[u8]) -> (u8, Vec<u8>) {
+    let r = s.handle(&agent(), ssh_op::SA_TOKEN_ADD, &body(|w| { w.str("alice"); w.str("main"); w.str(host); w.str(user); w.bytes(tok); }));
+    (r.status, r.body.bytes().to_vec())
+}
+
+fn token_get(s: &mut State, who: &Label, persona: &str, ws: &str, host: &str) -> (u8, Option<(String, Vec<u8>)>) {
+    let r = s.handle(who, ssh_op::SA_TOKEN_GET, &body(|w| { w.str("alice"); w.str(persona); w.str(ws); w.str(host); }));
+    if r.status != status::OK {
+        return (r.status, None);
+    }
+    let mut rd = Reader::new(r.body.bytes());
+    let u = rd.str(128).unwrap().to_string();
+    let t = rd.bytes(4096).unwrap().to_vec();
+    rd.end().unwrap();
+    (r.status, Some((u, t)))
+}
+
+#[test]
+fn a_workspace_gets_only_its_granted_https_token() {
+    let (_d, mut s) = setup();
+    let (st, id) = token_add(&mut s, "github.com", "alice", b"ghp_one");
+    assert_eq!(st, status::OK);
+    let id: [u8; 16] = id.try_into().unwrap();
+    assert_eq!(token_get(&mut s, &agent(), "main", "web", "github.com").0, status::DENIED, "not granted yet");
+
+    assert_eq!(grant(&mut s, "main", id, "web", true), status::OK);
+    assert_eq!(token_get(&mut s, &agent(), "main", "web", "github.com").1, Some(("alice".into(), b"ghp_one".to_vec())));
+    // Another workspace, host, persona: nothing.
+    assert_eq!(token_get(&mut s, &agent(), "main", "lib", "github.com").0, status::DENIED);
+    assert_eq!(token_get(&mut s, &agent(), "main", "web", "gitlab.com").0, status::DENIED);
+    assert_eq!(token_get(&mut s, &agent(), "work", "web", "github.com").0, status::DENIED);
+    // Not a key: not listed for signing, can't sign.
+    assert!(keys(&mut s, "main", "web").is_empty());
+    assert_eq!(sign(&mut s, &agent(), "main", "web", id, b"m").0, status::DENIED);
+
+    // Replacing keeps the grant.
+    assert_eq!(token_add(&mut s, "github.com", "alice", b"ghp_two").0, status::OK);
+    assert_eq!(token_get(&mut s, &agent(), "main", "web", "github.com").1, Some(("alice".into(), b"ghp_two".to_vec())));
+    let r = s.handle(&agent(), ssh_op::SA_LIST, &body(|w| { w.str("alice"); w.str("main"); }));
+    let mut rd = Reader::new(r.body.bytes());
+    assert_eq!(rd.u32().unwrap(), 1);
+    let _id: [u8; 16] = rd.array().unwrap();
+    assert_eq!(rd.u16().unwrap(), 4, "ApiKey");
+    assert_eq!(rd.array::<32>().unwrap(), [0; 32]);
+    assert_eq!(rd.str(512).unwrap(), "github.com alice");
+    assert_eq!(rd.str(4096).unwrap(), "web");
+
+    // Bad hosts and usernames are refused; only the agent may ask.
+    assert_eq!(token_add(&mut s, "GitHub.com", "alice", b"x").0, status::MALFORMED);
+    assert_eq!(token_add(&mut s, "github.com:443", "alice", b"x").0, status::MALFORMED);
+    assert_eq!(token_add(&mut s, "github.com", "a b", b"x").0, status::MALFORMED);
+    assert_eq!(token_add(&mut s, "github.com", "alice", b"").0, status::MALFORMED);
+    assert_ne!(token_get(&mut s, &Label::Service("vinculumd".into()), "main", "web", "github.com").0, status::OK);
+
+    // A deleted workspace loses it.
+    s.handle(&agent(), ssh_op::SA_FORGET, &body(|w| { w.str("alice"); w.str("main"); w.str("web"); }));
+    assert_eq!(token_get(&mut s, &agent(), "main", "web", "github.com").0, status::DENIED);
+}

@@ -320,8 +320,10 @@ pub mod ssh_op {
     /// The person (through the agent's control socket): `owner | str
     /// comment` → `id[16] | pubkey[32]`.
     pub const SA_MINT: u16 = 0xC0;
-    /// The person: `owner` → `u32 n | n × (id[16] | pubkey[32] | str
-    /// comment | str grants)`, grants newline-separated.
+    /// The person: `owner` → `u32 n | n × (id[16] | u16 kind | pubkey[32]
+    /// | str comment | str grants)`, grants newline-separated: keys
+    /// (`Ed25519`) and HTTPS tokens (`ApiKey`, pubkey zeros, comment `host
+    /// username`).
     pub const SA_LIST: u16 = 0xC1;
     /// The person: `owner | id[16] | str workspace` → nothing.
     pub const SA_GRANT: u16 = 0xC2;
@@ -338,6 +340,16 @@ pub mod ssh_op {
     /// portcullisd, through the agent, when a workspace is deleted: `owner |
     /// str workspace` → `u32 n`, the keys whose grant to it went.
     pub const SA_FORGET: u16 = 0xC7;
+    /// The person: an HTTPS token for git or a registry on `host` (dev-tools.md
+    /// §8): `owner | str host | str username | bytes token` → `id[16]`. A
+    /// token for the same host and username is replaced (its grants kept).
+    pub const SA_TOKEN_ADD: u16 = 0xC8;
+    /// A workspace's agent connection (git-credential-arca): `owner | str
+    /// workspace | str host` → `str username | bytes token`, the first token
+    /// for that host granted to it. `DENIED` if none is.
+    pub const SA_TOKEN_GET: u16 = 0xC9;
+    /// Longest token.
+    pub const TOKEN_MAX: usize = 4096;
     /// Longest comment.
     pub const COMMENT_MAX: usize = 256;
 }

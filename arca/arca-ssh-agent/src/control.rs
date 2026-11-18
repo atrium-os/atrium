@@ -5,7 +5,8 @@
 //!   WORKSPACE`, `forget OWNER WORKSPACE PERSONA` (deleted: its grants go);
 //! - a person (a uid with a passwd entry that is not a launched app's):
 //!   `new PERSONA COMMENT...`, `list PERSONA`, `grant|revoke PERSONA ID
-//!   WORKSPACE`, `delete PERSONA ID`, acting on their own keys only.
+//!   WORKSPACE`, `delete PERSONA ID`, `token PERSONA HOST USERNAME` (the
+//!   token on the next line), acting on their own keys only.
 
 use crate::{unhex16, valid_owner, valid_persona};
 
@@ -23,6 +24,8 @@ pub enum Person {
     List { persona: String },
     Grant { persona: String, id: [u8; 16], ws: String, on: bool },
     Delete { persona: String, id: [u8; 16] },
+    /// An HTTPS token for `host`; the token itself follows on the next line.
+    Token { persona: String, host: String, username: String },
 }
 
 fn ws_ok(w: &str) -> bool {
@@ -61,6 +64,9 @@ pub fn parse_person(line: &str) -> Option<Person> {
             Some(Person::Grant { persona: p(persona)?, id: unhex16(id)?, ws: ws.to_string(), on: verb == "grant" })
         }
         ("delete", [persona, id]) => Some(Person::Delete { persona: p(persona)?, id: unhex16(id)? }),
+        ("token", [persona, host, user]) if arcad::ssh::valid_host(host) && user.len() <= 128 && !user.chars().any(char::is_control) => {
+            Some(Person::Token { persona: p(persona)?, host: host.to_string(), username: user.to_string() })
+        }
         _ => None,
     }
 }
@@ -88,5 +94,10 @@ mod tests {
         assert_eq!(parse_person(&format!("grant work {id} We")), None);
         assert!(matches!(parse_person(&format!("delete personal {id}")), Some(Person::Delete { .. })));
         assert_eq!(parse_person("open alice web personal 5"), None);
+        assert_eq!(parse_person("token personal github.com alice"),
+                   Some(Person::Token { persona: "personal".into(), host: "github.com".into(), username: "alice".into() }));
+        assert_eq!(parse_person("token personal GitHub.com alice"), None);
+        assert_eq!(parse_person("token personal github.com:443 alice"), None);
+        assert_eq!(parse_person("token personal github.com"), None);
     }
 }
