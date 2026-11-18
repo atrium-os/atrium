@@ -179,7 +179,7 @@ allow_rctl = true
 echo "  jaild (rctl allowed) and portcullisd on $PSOCK"
 
 echo "=== binaries"
-g "pkill -x navigator-ui; pkill -x forum-wm; pkill -x limend; pkill -x navigatord; pkill -x frescod; sleep 1; rm -rf $S; mkdir -p $D $S /var/run/atrium; chmod 777 $S; true"
+g "pkill -x navigator-ui; pkill -x forum-wm; pkill -x limend; pkill -x navigatord; pkill -x frescod; pkill -x tabulad; pkill -x link-probe; pkill -x opifexd; sleep 1; rm -rf $S; mkdir -p $D $S /var/run/atrium; chmod 777 $S; true"
 for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-renderer" "$ROOT/forum-wm/target/$R/forum-wm" \
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
          "$ROOT/limen/target/$R/limend" "$ROOT/navigator-prerender/target/$R/prerender" \
