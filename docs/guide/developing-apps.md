@@ -119,13 +119,19 @@ cargo atrium check --json   # {manifest, consent[], findings[{level, code, messa
 It reports:
 
 - what the validator rejects (errors, exit status 1);
-- restricted capabilities and the review they need;
+- restricted capabilities and the review they need (not for `org.atrium.*`
+  ids: only the platform key signs those, and the system policy grants
+  what they ask);
 - **the consent text**: exactly what the person will be asked to allow;
 - **the crate-graph lint**: parsers of outside data (image, font, archive,
   document, media formats) and network clients linked into the **core**,
   the process that holds the capabilities. The fix it suggests is to move
   that work into a worker, which runs with no capabilities, or to use a
-  system service. SDK crates are trusted and not walked.
+  system service. SDK crates are trusted and not walked. What only the
+  font stack reaches (fresco-text, navigator-fonts and the font parsers
+  under them, WOFF's flate2 and brotli included) reads the system's fonts
+  and the app's own, so it isn't flagged; the same crate by any other
+  path is. A font parser the core links itself is a note.
 
 ## 4. Messages between processes: `atrium-message`
 
@@ -298,6 +304,18 @@ reads. Without AddressSanitizer (stable Rust), comparisons that go through
 `memcmp` (slice equality) aren't traced, so magic numbers are found slowly;
 seed the corpus with a valid file.
 
+### Workers built in another crate
+
+A worker's binary is found by its entry's file name: among the project's
+own binaries, then in the crates it depends on (built with `-p`). A
+worker the app doesn't link, like Mail's parse jail, is named in
+`Cargo.toml`, and `run`, `bundle` and `check` build or find it there:
+
+```toml
+[package.metadata.atrium.workers]
+parse = "../mail-parse"      # its folder, or its Cargo.toml
+```
+
 ### Bundling: `cargo atrium bundle`
 
 `cargo atrium bundle --sign <key.pem>` makes the installable bundle
@@ -307,7 +325,8 @@ tree, and adds the runtime closure: every library the programs need,
 read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
 the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others
 go to `usr/lib/`. Then `opifex pack` writes the content index and the
-signature, and `opifex archive` the `.insula` beside the tree
+signature, and `opifex archive` the `.insula` beside the tree (the key may be PKCS#8 or
+SEC1 PEM)
 (`target/atrium-bundle/<id>-<version>-<arch>`), which installs through
 the install sheet.
 

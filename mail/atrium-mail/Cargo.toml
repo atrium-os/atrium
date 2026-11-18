@@ -6,6 +6,11 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Mail's windows (docs/spec/mail.md §9, §15): places, the message list, the reader, and compose windows (drafts, Send as a press, Send later, mailto: links)."
 
+# Workers built in a crate this one doesn't link (cargo atrium run, bundle
+# and check): the parse jail talks to the engine over its socket.
+[package.metadata.atrium.workers]
+parse = "../mail-parse"
+
 [lib]
 name = "atrium_mail"
 path = "src/lib.rs"

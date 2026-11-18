@@ -121,6 +121,32 @@ pub const PARSERS: &[(&str, Kind)] = &[
 pub const SDK_CRATES: &[&str] = &["pergola", "fresco-client", "fresco-protocol", "atrium-message", "atrium-worker",
     "limen", "tabula", "aqueduct", "libatrium", "atrium-fonts", "nuntius", "pergola-document", "pergola-richtext"];
 
+/// First-party crates that only read fonts (the system's, or ones an app
+/// ships) for drawing text. What only these reach (font parsers, and
+/// WOFF's flate2 and brotli) is system-font input, not hostile input.
+pub const TEXT_STACK: &[&str] = &["fresco-text", "navigator-fonts", "folium-font", "atrium-colr", "atrium-fonts"];
+
+/// First-party crates that lay out text with a font parser on those same
+/// fonts, but parse other things too: they don't make a font parser
+/// the app's, while what else they link still counts.
+pub const FONT_USERS: &[&str] = &["officina-text", "officina-pict", "officina-draw", "navigator-render", "folium-render",
+    "pergola-richtext", "pergola-document"];
+
+/// A crate a binary links.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Linked {
+    pub version: String,
+    /// The binary's own package depends on it directly.
+    pub own: bool,
+    /// Other crates that bring it in on a path that doesn't run through
+    /// the font stack ([`TEXT_STACK`] and the font parsers): empty, and
+    /// not `own`, when only the font stack reaches it.
+    pub outside: BTreeSet<String>,
+}
+
+/// The font stack: the text crates and the font parsers.
+fn font_stack(name: &str) -> bool { TEXT_STACK.contains(&name) || kind_of(name) == Some(Kind::Font) }
+
 pub fn kind_of(name: &str) -> Option<Kind> { PARSERS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k) }
 
 /// What a manifest says the app holds, as the lint needs it.
@@ -191,10 +217,14 @@ pub fn manifest(text: &str) -> (Vec<Finding>, Vec<String>, Option<Reach>) {
     for e in &r.errors {
         f.push(Finding::new(Level::Error, "manifest-invalid", e.clone(), None));
     }
-    for w in &r.warnings {
+    // org.atrium.* is the platform key's prefix (opifex.md §6.5): no third
+    // party can install under it, and the system policy grants what it
+    // asks. What would be a warning for anyone else is how it works.
+    let platform = m.app.id.starts_with("org.atrium.");
+    for w in r.warnings.iter().filter(|_| !platform) {
         f.push(Finding::new(Level::Warning, "manifest-warning", w.clone(), None));
     }
-    for c in m.capabilities.restricted() {
+    for c in m.capabilities.restricted().into_iter().filter(|_| !platform) {
         f.push(Finding::new(Level::Warning, "restricted-capability",
             format!("{c} is restricted: only the system policy grants it, never a person at install"),
             Some("drop it, or use the system service that holds it".into())));
@@ -234,7 +264,7 @@ pub fn manifest(text: &str) -> (Vec<Finding>, Vec<String>, Option<Reach>) {
 /// The crate graph from `cargo metadata --format-version 1`: for each
 /// binary target of the workspace's own packages, every crate it links
 /// (normal dependencies, transitively), name → version.
-pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, String>>, String> {
+pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, Linked>>, String> {
     let pkgs = metadata.get("packages").and_then(Value::as_array).ok_or("metadata: packages")?;
     let members: BTreeSet<&str> = metadata.get("workspace_members").and_then(Value::as_array).ok_or("metadata: workspace_members")?
         .iter().filter_map(Value::as_str).collect();
@@ -267,10 +297,14 @@ pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, St
         }
         // Everything this package links, from its id; not through the
         // SDK's own crates (they are listed, what they link is not).
+        let pname = p.get("name").and_then(Value::as_str).unwrap_or("");
+        let sdk = |x: &str| x != id && by_id.get(x).is_some_and(|(n, _)| SDK_CRATES.contains(n));
+        let name_of = |x: &str| by_id.get(x).map(|(n, _)| n.to_string()).unwrap_or_default();
+        // Everything it links (not through the SDK's own crates).
         let mut seen = BTreeSet::new();
         let mut q = VecDeque::from([id]);
         while let Some(x) = q.pop_front() {
-            if x != id && by_id.get(x).is_some_and(|(n, _)| SDK_CRATES.contains(n)) {
+            if sdk(x) {
                 continue;
             }
             for d in deps.get(x).into_iter().flatten() {
@@ -279,7 +313,29 @@ pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, St
                 }
             }
         }
-        let linked: BTreeMap<String, String> = seen.iter().filter_map(|i| by_id.get(i)).map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        // Again, without going through the font stack: who brings each in.
+        let mut parents: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        let mut seen2 = BTreeSet::from([id]);
+        let mut q = VecDeque::from([id]);
+        while let Some(x) = q.pop_front() {
+            if sdk(x) || (x != id && font_stack(&name_of(x))) {
+                continue;
+            }
+            for d in deps.get(x).into_iter().flatten() {
+                parents.entry(d).or_default().insert(name_of(x));
+                if seen2.insert(*d) {
+                    q.push_back(d);
+                }
+            }
+        }
+        let linked: BTreeMap<String, Linked> = seen.iter().filter_map(|i| by_id.get(i).map(|(n, v)| {
+            let ps = parents.get(i).cloned().unwrap_or_default();
+            (n.to_string(), Linked {
+                version: v.to_string(),
+                own: ps.contains(pname),
+                outside: ps.into_iter().filter(|x| x != pname).collect(),
+            })
+        })).collect();
         for t in p.get("targets").and_then(Value::as_array).into_iter().flatten() {
             let is_bin = t.get("kind").and_then(Value::as_array).is_some_and(|k| k.iter().any(|x| x == "bin"));
             if is_bin {
@@ -293,7 +349,7 @@ pub fn binaries(metadata: &Value) -> Result<BTreeMap<String, BTreeMap<String, St
 }
 
 /// The crate-graph findings for an app.
-pub fn graph(reach: &Reach, bins: &BTreeMap<String, BTreeMap<String, String>>) -> Vec<Finding> {
+pub fn graph(reach: &Reach, bins: &BTreeMap<String, BTreeMap<String, Linked>>, built_elsewhere: &BTreeSet<String>) -> Vec<Finding> {
     let mut f = Vec::new();
     let Some(core) = bins.get(&reach.core) else {
         f.push(Finding::new(Level::Warning, "core-not-found",
@@ -302,14 +358,30 @@ pub fn graph(reach: &Reach, bins: &BTreeMap<String, BTreeMap<String, String>>) -
         return f;
     };
     for (_, wbin) in &reach.workers {
-        if !bins.contains_key(wbin) {
-            f.push(Finding::new(Level::Warning, "worker-not-found", format!("no binary named {wbin:?} for a [[workers]] entry"), None));
+        if !bins.contains_key(wbin) && !built_elsewhere.contains(wbin) {
+            f.push(Finding::new(Level::Warning, "worker-not-found", format!("no binary named {wbin:?} for a [[workers]] entry"),
+                Some("name a [[bin]] after the entry's file, or say which crate builds it under [package.metadata.atrium.workers]".into())));
         }
     }
     let worker_names: Vec<&str> = reach.workers.iter().map(|w| w.0.as_str()).collect();
-    for (name, version) in core {
+    for (name, l) in core {
         let Some(kind) = kind_of(name) else { continue };
+        let version = &l.version;
         let bin = &reach.core;
+        // Reached only through the font stack: system fonts and the
+        // fonts apps ship (WOFF's flate2 and brotli included).
+        if !l.own && l.outside.is_empty() {
+            continue;
+        }
+        if kind == Kind::Font && l.outside.iter().all(|x| FONT_USERS.contains(&x.as_str())) {
+            if !l.own {
+                continue;
+            }
+            f.push(Finding::new(Level::Note, "font-parser-in-core",
+                format!("`{bin}` links {name} {version} itself: fine for the fonts it ships or the system's"),
+                Some("a font from a document or the network belongs in a worker (template: viewer)".into())));
+            continue;
+        }
         if kind == Kind::Network {
             let (msg, fix) = if reach.network {
                 (format!("`{bin}` links {name} {version} ({}) and holds the network: what it parses arrives in the process holding the app's grants",
@@ -409,7 +481,7 @@ input = "fd"
         assert_eq!(reach.core, "photos");
         assert_eq!(reach.workers, vec![("decode".to_string(), "photos-decode".to_string())]);
         assert!(consent.iter().any(|l| l.contains("graphics")), "{consent:?}");
-        let g = graph(&reach, &binaries(&meta()).unwrap());
+        let g = graph(&reach, &binaries(&meta()).unwrap(), &BTreeSet::new());
         let p: Vec<&Finding> = g.iter().filter(|x| x.code == "parser-in-core").collect();
         assert_eq!(p.len(), 2, "{g:?}"); // image and png, through image
         assert!(p.iter().all(|x| x.level == Level::Warning));
@@ -431,7 +503,7 @@ input = "fd"
         let mut m = meta();
         m["resolve"]["nodes"][0]["deps"] = serde_json::json!([{"pkg": "pergola 1", "dep_kinds": [{"kind": null}]}]);
         let (_, _, reach) = manifest(&PHOTOS.replace("net-fetch = true", "filesystem = [\"documents\"]"));
-        let g = graph(&reach.unwrap(), &binaries(&m).unwrap());
+        let g = graph(&reach.unwrap(), &binaries(&m).unwrap(), &BTreeSet::new());
         assert!(g.iter().all(|x| x.level != Level::Warning), "{g:?}");
     }
 
@@ -441,7 +513,7 @@ input = "fd"
         m["packages"][2]["name"] = "reqwest".into();
         let (f, _, reach) = manifest(&PHOTOS.replace("net-fetch = true", "network = \"full\"\nwindow-management = true"));
         assert!(f.iter().any(|x| x.code == "restricted-capability" && x.message.contains("window-management")), "{f:?}");
-        let g = graph(&reach.unwrap(), &binaries(&m).unwrap());
+        let g = graph(&reach.unwrap(), &binaries(&m).unwrap(), &BTreeSet::new());
         assert!(g.iter().any(|x| x.code == "network-client-in-core" && x.message.contains("holds the network")), "{g:?}");
     }
 
@@ -453,5 +525,53 @@ input = "fd"
         assert!(f.iter().any(|x| x.code == "worker-capabilities"));
         let (f, _, r) = manifest(&PHOTOS.replace("[capabilities]", "[capabilitiez]"));
         assert!(r.is_none() && f.iter().any(|x| x.code == "manifest-schema"), "{f:?}");
+    }
+
+    #[test]
+    fn the_font_stack_is_system_font_input() {
+        // core -> fresco-text -> rustybuzz -> ttf-parser; fresco-text -> allsorts -> flate2;
+        // core -> officina-text -> ttf-parser; core -> navigator-render -> png -> flate2? no:
+        // core -> navigator-render -> pulldown-cmark; core -> swash (its own font).
+        let node = |id: &str, deps: &[&str]| serde_json::json!({"id": id, "deps":
+            deps.iter().map(|d| serde_json::json!({"pkg": d, "dep_kinds": [{"kind": null}]})).collect::<Vec<_>>()});
+        let pkg = |id: &str| serde_json::json!({"id": id, "name": id.split(' ').next().unwrap(), "version": "1",
+            "targets": if id == "app 1" { serde_json::json!([{"kind": ["bin"], "name": "app"}]) } else { serde_json::json!([]) }});
+        let ids = ["app 1", "fresco-text 1", "rustybuzz 1", "ttf-parser 1", "allsorts 1", "flate2 1", "officina-text 1",
+                   "navigator-render 1", "pulldown-cmark 1", "swash 1"];
+        let m = serde_json::json!({
+            "workspace_members": ["app 1"],
+            "packages": ids.iter().map(|i| pkg(i)).collect::<Vec<_>>(),
+            "resolve": {"nodes": [
+                node("app 1", &["fresco-text 1", "officina-text 1", "navigator-render 1", "swash 1"]),
+                node("fresco-text 1", &["rustybuzz 1", "allsorts 1"]), node("rustybuzz 1", &["ttf-parser 1"]),
+                node("allsorts 1", &["flate2 1"]), node("officina-text 1", &["ttf-parser 1"]),
+                node("navigator-render 1", &["pulldown-cmark 1"]),
+                node("ttf-parser 1", &[]), node("flate2 1", &[]), node("pulldown-cmark 1", &[]), node("swash 1", &[]),
+            ]}
+        });
+        let (_, _, reach) = manifest(&PHOTOS.replace("net-fetch = true", "filesystem = [\"documents\"]").replace("entry = \"bin/photos\"", "entry = \"bin/app\""));
+        let g = graph(&reach.unwrap(), &binaries(&m).unwrap(), &BTreeSet::new());
+        let named = |n: &str| g.iter().filter(|x| x.message.contains(n)).collect::<Vec<_>>();
+        assert!(named("rustybuzz").is_empty() && named("ttf-parser").is_empty() && named("allsorts").is_empty(), "{g:?}");
+        assert!(named("flate2").is_empty(), "WOFF's flate2, only through the font stack: {g:?}");
+        assert_eq!(named("pulldown-cmark").len(), 1, "{g:?}");
+        let sw = named("swash");
+        assert!(sw.len() == 1 && sw[0].level == Level::Note, "{g:?}");
+        // flate2 by another path too: flagged.
+        let mut m2 = m.clone();
+        m2["resolve"]["nodes"][7] = node("navigator-render 1", &["pulldown-cmark 1", "flate2 1"]);
+        let (_, _, reach) = manifest(&PHOTOS.replace("net-fetch = true", "filesystem = [\"documents\"]").replace("entry = \"bin/photos\"", "entry = \"bin/app\""));
+        let g = graph(&reach.unwrap(), &binaries(&m2).unwrap(), &BTreeSet::new());
+        assert!(g.iter().any(|x| x.message.contains("flate2") && x.level == Level::Warning), "{g:?}");
+    }
+
+    #[test]
+    fn platform_ids_are_quiet_about_restricted_capabilities() {
+        let t = PHOTOS.replace("net-fetch = true", "network = \"full\"\nwindow-management = true");
+        let (f, _, _) = manifest(&t);
+        assert!(f.iter().any(|x| x.code == "restricted-capability"));
+        let id = t.lines().find(|l| l.starts_with("id")).unwrap().to_string();
+        let (f, _, _) = manifest(&t.replace(&id, "id = \"org.atrium.photos\""));
+        assert!(!f.iter().any(|x| x.code == "restricted-capability" || x.code == "manifest-warning"), "{f:?}");
     }
 }

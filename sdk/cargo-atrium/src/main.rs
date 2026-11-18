@@ -156,6 +156,80 @@ fn cmd_worker(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The project's `target_directory` (of `manifest`, or the one here).
+fn target_dir(manifest: Option<&Path>) -> PathBuf {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut c = Command::new(&cargo);
+    c.args(["metadata", "--no-deps", "--format-version", "1"]);
+    if let Some(m) = manifest {
+        c.arg("--manifest-path").arg(m);
+    }
+    c.output().ok()
+        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+        .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| manifest.and_then(Path::parent).unwrap_or(Path::new(".")).join("target"))
+}
+
+/// The core and the workers, and where each is built (programs.rs).
+fn project_programs(proj: &Path, atrium_toml: &str) -> Result<Vec<cargo_atrium::programs::Program>, String> {
+    let md = if proj.join("Cargo.toml").is_file() {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let o = Command::new(&cargo).args(["metadata", "--format-version", "1"]).current_dir(proj).output()
+            .map_err(|e| format!("{cargo}: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("cargo metadata failed:\n{}", String::from_utf8_lossy(&o.stderr)));
+        }
+        Some(serde_json::from_slice::<serde_json::Value>(&o.stdout).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    cargo_atrium::programs::locate(proj, atrium_toml, md.as_ref())
+}
+
+/// Build every program, natively or with `cargo atrium cross` (arch and
+/// sysroot): (entry, the built binary). `args` go to each cargo build.
+fn build_programs(progs: &[cargo_atrium::programs::Program], release: bool, cross: Option<(&cargo_atrium::cross::Target, &Path)>,
+                  args: &[String]) -> Result<Vec<(String, PathBuf)>, String> {
+    use cargo_atrium::programs::{self, Source};
+    if let Some(p) = progs.iter().find(|p| p.source.is_none()) {
+        return Err(format!("no binary {:?} for {} (entry {}): name a [[bin]] after it, or say where it is built under [package.metadata.atrium.workers]",
+            p.bin, p.worker.as_deref().map(|w| format!("the {w} worker")).unwrap_or_else(|| "the core".into()), p.entry));
+    }
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    for b in programs::builds(progs) {
+        let mut c = match cross {
+            Some((t, root)) => {
+                let mut c = Command::new(std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cargo-atrium")));
+                c.args(["atrium", "cross", t.arch, "--sysroot"]).arg(root);
+                c
+            }
+            None => {
+                let mut c = Command::new(&cargo);
+                c.arg("build");
+                c
+            }
+        };
+        if let Some(m) = &b.manifest {
+            c.arg("--manifest-path").arg(m);
+        }
+        c.args(&b.args).args(args);
+        match c.status() {
+            Ok(s) if s.success() => {}
+            _ => return Err(format!("the build failed ({}{})", b.manifest.as_ref().map(|m| format!("{}: ", m.display())).unwrap_or_default(), b.args.join(" "))),
+        }
+    }
+    let profile = if release { "release" } else { "debug" };
+    let here = target_dir(None);
+    Ok(progs.iter().map(|p| {
+        let base = match &p.source {
+            Some(Source::Elsewhere(m)) => target_dir(Some(m)),
+            _ => here.clone(),
+        };
+        let dir = match cross { Some((t, _)) => base.join(t.triple), None => base };
+        (p.entry.clone(), dir.join(profile).join(&p.bin))
+    }).collect())
+}
+
 fn cmd_bundle(args: &[String]) -> ExitCode {
     use cargo_atrium::{bundle, cross};
     let (mut arch, mut sign, mut out, mut sysroot, mut json, mut rest) = (None, None, None, None, false, Vec::new());
@@ -201,50 +275,39 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
     if id.starts_with("dev.") {
         return fail(format!("{id}: a dev. id is Run from its workspace, not bundled; give [app] an id of your own (reverse DNS of a domain you control)"));
     }
-    let progs = match bundle::programs(&manifest) {
-        Ok(p) => p,
-        Err(e) => return fail(e),
-    };
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     // Without Cargo.toml (a C project, after `make`): the programs are
     // already at their entries.
     let prebuilt = !Path::new("Cargo.toml").is_file();
-    let tdir = if prebuilt { PathBuf::from("bundle") } else {
-        Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).output().ok()
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-            .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("target"))
+    let tdir = if prebuilt { PathBuf::from("bundle") } else { target_dir(None) };
+    let progs = match project_programs(Path::new("."), &manifest) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
     };
 
     // 1. Build.
-    let mut bins: Vec<String> = Vec::new();
-    for (_, b) in &progs {
-        bins.extend(["--bin".to_string(), b.clone()]);
-    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let (status, rel_dir, root) = if prebuilt {
-        let root = if cfg!(target_os = "freebsd") { PathBuf::from("/") } else {
-            match cross::sysroot(t, sysroot.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
-                Ok(s) => s,
-                Err(e) => return fail(e),
-            }
-        };
-        (Command::new("true").status(), PathBuf::new(), root)
-    } else if native {
-        (Command::new(&cargo).args(["build", "--release"]).args(&bins).args(&rest).status(), tdir.join("release"), PathBuf::from("/"))
+    let root = if native {
+        PathBuf::from("/")
+    } else if prebuilt && cfg!(target_os = "freebsd") {
+        PathBuf::from("/")
     } else {
-        let root = match cross::sysroot(t, sysroot.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
+        match cross::sysroot(t, sysroot.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
             Ok(s) => std::fs::canonicalize(&s).unwrap_or(s),
             Err(e) => return fail(e),
-        };
-        let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cargo-atrium"));
-        let st = Command::new(me).args(["atrium", "cross", t.arch, "--sysroot"]).arg(&root).arg("--release").args(&bins).args(&rest).status();
-        (st, tdir.join(t.triple).join("release"), root)
+        }
     };
-    match status {
-        Ok(s) if s.success() => {}
-        _ => return fail("the build failed".into()),
-    }
+    let built: Vec<(String, PathBuf)> = if prebuilt {
+        progs.iter().map(|p| (p.entry.clone(), PathBuf::from(&p.entry))).collect()
+    } else {
+        let mut rest = rest.clone();
+        rest.insert(0, "--release".into());
+        match build_programs(&progs, true, (!native).then_some((t, root.as_path())), &rest) {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        }
+    };
+    let _ = &cargo;
 
     // 2. The tree.
     let name = format!("{id}-{version}-{}", t.arch);
@@ -265,13 +328,12 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
     };
     let mut programs = Vec::new();
     let mut steps = vec![(PathBuf::from("atrium.toml"), "atrium.toml".to_string())];
-    for (entry, bin) in &progs {
-        let from = if prebuilt { PathBuf::from(entry) } else { rel_dir.join(bin) };
+    for (entry, from) in &built {
         if !from.is_file() {
             return fail(format!("{} isn't there{}", from.display(), if prebuilt { " (build it first, e.g. make)" } else { "" }));
         }
         steps.push((from.clone(), entry.clone()));
-        programs.push(from);
+        programs.push(from.clone());
     }
     for f in bundle::named_files(&manifest) {
         steps.push((PathBuf::from(&f), f.clone()));
@@ -305,7 +367,17 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
     let mut packed = false;
     match &opifex {
         Some(op) => {
+            // With --json, stdout is the JSON alone: opifex's lines go to stderr.
+            let quiet = |c: &mut Command| {
+                if json {
+                    use std::os::fd::AsFd;
+                    if let Ok(e) = std::io::stderr().as_fd().try_clone_to_owned() {
+                        c.stdout(std::process::Stdio::from(e));
+                    }
+                }
+            };
             let mut c = Command::new(op);
+            quiet(&mut c);
             c.arg("pack").arg(&tree);
             if let Some(k) = &sign {
                 c.arg("--sign").arg(k);
@@ -314,7 +386,9 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
                 Ok(s) if s.success() => {}
                 _ => return fail("opifex pack failed".into()),
             }
-            match Command::new(op).arg("archive").arg(&tree).arg(&insula).status() {
+            let mut c = Command::new(op);
+            quiet(&mut c);
+            match c.arg("archive").arg(&tree).arg(&insula).status() {
                 Ok(s) if s.success() => {}
                 _ => return fail("opifex archive failed".into()),
             }
@@ -438,8 +512,16 @@ fn cmd_check(args: &[String]) -> ExitCode {
     if let Some(reach) = reach.as_ref().filter(|_| dir.join("Cargo.toml").is_file()) {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         match Command::new(cargo).args(["metadata", "--format-version", "1"]).current_dir(dir).output() {
-            Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout).map_err(|e| e.to_string()).and_then(|v| check::binaries(&v)) {
-                Ok(bins) => findings.extend(check::graph(reach, &bins)),
+            Ok(o) if o.status.success() => match serde_json::from_slice::<serde_json::Value>(&o.stdout).map_err(|e| e.to_string())
+                .and_then(|v| Ok((check::binaries(&v)?, cargo_atrium::programs::locate(dir, &text, Some(&v))?))) {
+                Ok((bins, progs)) => {
+                    // Workers built in another crate (programs.rs): their
+                    // links are their own business, as for any worker.
+                    let elsewhere: std::collections::BTreeSet<String> = progs.into_iter()
+                        .filter(|p| matches!(p.source, Some(cargo_atrium::programs::Source::Dependency(_) | cargo_atrium::programs::Source::Elsewhere(_))))
+                        .map(|p| p.bin).collect();
+                    findings.extend(check::graph(reach, &bins, &elsewhere))
+                }
                 Err(e) => eprintln!("cargo atrium check: crate graph: {e}"),
             },
             Ok(o) => eprintln!("cargo atrium check: cargo metadata failed:\n{}", String::from_utf8_lossy(&o.stderr)),
@@ -872,37 +954,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if entry.starts_with('/') || entry.split('/').any(|c| c == ".." || c.is_empty()) {
         return fail(format!("entry {entry:?} isn't a path in the project"));
     }
-    // The core, then each worker: (bin, where it goes in the project).
-    let mut entries = vec![entry];
-    for w in m.get("workers").and_then(|w| w.as_array()).into_iter().flatten() {
-        if let Some(e) = w.get("entry").and_then(|e| e.as_str()) {
-            if e.starts_with('/') || e.split('/').any(|c| c == ".." || c.is_empty()) {
-                return fail(format!("worker entry {e:?} isn't a path in the project"));
-            }
-            entries.push(e.to_string());
-        }
-    }
-    let bins: Vec<(String, String)> = entries.iter().map(|e| (e.rsplit('/').next().unwrap_or(e).to_string(), e.clone())).collect();
+    let _ = &m;
+    let text = std::fs::read_to_string(&mpath).unwrap_or_default();
+    let progs = match project_programs(&proj, &text) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
     let release = args.iter().any(|a| a == "--release");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut build = Command::new(&cargo);
-    build.arg("build");
-    for (b, _) in &bins {
-        build.args(["--bin", b]);
-    }
-    match build.args(args).current_dir(&proj).status() {
-        Ok(s) if s.success() => {}
-        _ => return fail("build failed".into()),
-    }
-    let tdir = Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).current_dir(&proj).output().ok()
-        .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-        .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
-        .unwrap_or_else(|| proj.join("target"));
-    for (bin, entry) in &bins {
-        let built = tdir.join(if release { "release" } else { "debug" }).join(bin);
+    let prev = std::env::current_dir().unwrap_or_default();
+    let _ = std::env::set_current_dir(&proj);
+    let built = build_programs(&progs, release, None, args);
+    let _ = std::env::set_current_dir(prev);
+    let built = match built {
+        Ok(b) => b,
+        Err(e) => return fail(e),
+    };
+    for (entry, built) in &built {
         let dest = proj.join(entry);
         let copied = dest.parent().map(std::fs::create_dir_all).unwrap_or(Ok(()))
-            .and_then(|_| std::fs::copy(&built, &dest).map(|_| ()));
+            .and_then(|_| std::fs::copy(built, &dest).map(|_| ()));
         if let Err(e) = copied {
             return fail(format!("{} -> {}: {e}", built.display(), dest.display()));
         }

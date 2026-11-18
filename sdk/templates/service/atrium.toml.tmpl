@@ -17,3 +17,8 @@ implements = ["share-target"]
 
 [roles.share-target]
 mime = ["text/*"]
+
+# Limen's providers start in portcullisd's one-shot lane, which needs a
+# memory ceiling: without one the target never starts when it's chosen.
+[resources]
+memory = "256M"
