@@ -41,6 +41,9 @@ struct Pending {
     write: bool,
     /// A file, or (`None`) the link in `name` (opening-links.md §5).
     fd: Option<OwnedFd>,
+    /// A link the person sent from another persona: its name
+    /// (personas.md §6).
+    from: Option<String>,
 }
 
 #[derive(Default)]
@@ -175,7 +178,10 @@ impl Hub {
             }
             let sent = match &p.fd {
                 Some(fd) => atrium_open::send(c, &p.name, &p.mime, p.write, fd.as_raw_fd()),
-                None => atrium_open::send_link(c, &p.name),
+                None => match &p.from {
+                    None => atrium_open::send_link(c, &p.name),
+                    Some(f) => atrium_open::send_crossed_link(c, &p.name, f),
+                },
             };
             match sent {
                 Ok(()) => {
@@ -196,18 +202,30 @@ impl Hub {
     /// Hand `fd` to `owner`'s `app`, now or once it connects. Refused while
     /// the app runs for someone else.
     pub fn deliver(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: OwnedFd) -> io::Result<Delivery> {
-        self.push(owner, app, name, mime, write, Some(fd))
+        self.push(owner, app, name, mime, write, Some(fd), None)
     }
 
     /// Hand `url` (a link of `scheme`) to `owner`'s `app`, as [`Hub::deliver`].
     pub fn deliver_link(&self, owner: &str, app: &str, scheme: &str, url: &str) -> io::Result<Delivery> {
-        if atrium_open::encode_link(url).is_none() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"));
-        }
-        self.push(owner, app, url, scheme, false, None)
+        self.deliver_link_from(owner, app, scheme, url, None)
     }
 
-    fn push(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: Option<OwnedFd>) -> io::Result<Delivery> {
+    /// [`Hub::deliver_link`], for a link the person sent from persona
+    /// `from` (`personal` for Personal): the app is told so, and a Work
+    /// app opens it as a stranger would (personas.md §6).
+    pub fn deliver_link_from(&self, owner: &str, app: &str, scheme: &str, url: &str, from: Option<&str>) -> io::Result<Delivery> {
+        let ok = match from {
+            None => atrium_open::encode_link(url).is_some(),
+            Some(f) => atrium_open::encode_crossed_link(url, f).is_some(),
+        };
+        if !ok {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"));
+        }
+        self.push(owner, app, url, scheme, false, None, from.map(String::from))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(&self, owner: &str, app: &str, name: &str, mime: &str, write: bool, fd: Option<OwnedFd>, from: Option<String>) -> io::Result<Delivery> {
         let mut apps = self.apps.lock().unwrap();
         let slot = apps.entry(app.to_string()).or_default();
         if let Some((_, _, o)) = &slot.conn {
@@ -219,7 +237,7 @@ impl Hub {
         if slot.pending.len() >= MAX_PENDING {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, format!("{MAX_PENDING} files or links are already waiting for {app}")));
         }
-        slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd });
+        slot.pending.push(Pending { at: Instant::now(), owner: owner.into(), name: name.into(), mime: mime.into(), write, fd, from });
         Self::flush(app, slot);
         Ok(if slot.pending.is_empty() { Delivery::Sent } else { Delivery::Queued })
     }
@@ -455,6 +473,12 @@ mod tests {
         let mut ch = atrium_open::Channel::connect_to(&work.join("opens.sock")).unwrap();
         match ch.recv_any(Some(Duration::from_secs(2))).unwrap() {
             Some(atrium_open::Message::Link(u)) => assert_eq!(u, "https://work.example/"),
+            other => panic!("{other:?}"),
+        }
+        // A link the person sent from Personal says so (personas.md §6).
+        assert_eq!(hub.deliver_link_from("alice", "org.test.player@work", "https", "https://x.example/", Some("personal")).unwrap(), Delivery::Sent);
+        match ch.recv_any(Some(Duration::from_secs(2))).unwrap() {
+            Some(atrium_open::Message::Crossed { url, from }) => assert_eq!((url.as_str(), from.as_str()), ("https://x.example/", "personal")),
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_dir_all(d);

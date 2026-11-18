@@ -1527,6 +1527,9 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             } else if app == g.asker_app {
                 return refuse("an app's link to itself".into());
             }
+            // Crossed: the app hears from which persona (a Work app opens it
+            // as a stranger would, personas.md §6).
+            let crossed_from = (target != g.persona).then(|| g.persona.clone().unwrap_or_else(|| PERSONAL.to_string()));
             let persona = if launch::not_instanced(&app).is_some() { None } else { target };
             let persona = persona.as_deref();
             let key = opens::channel_key(&app, persona);
@@ -1547,7 +1550,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             if let Err(e) = hub.listen(&key) {
                 return refuse(format!("{key}'s document channel: {e}"));
             }
-            match hub.deliver_link(&g.person, &key, &g.scheme, &url) {
+            match hub.deliver_link_from(&g.person, &key, &g.scheme, &url, crossed_from.as_deref()) {
                 // Running: bring its window forward, as a new one would be.
                 Ok(Delivery::Sent) => match launch::instance_uid(&g.person, &app, persona) {
                     Some(uid) => match opens::raise(&opens::activation_socket(), uid) {
