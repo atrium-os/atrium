@@ -192,7 +192,7 @@ resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout`
   `ATRIUM_NUNTIUS_RESOLVERS` (at most three; no loopback, multicast or unspecified
   address), with the private-network grant, since portals sit on the router. That
   instance resolves through those servers instead of the machine's resolver, so the
-  portal's own DNS answers. `nuntius::launch::open_portal`. (Built 2026-11-18.)
+  portal's own DNS answers. The private-network grant there never reaches the machine itself: loopback, the unspecified address and the host's own addresses (portcullisd passes them in `ATRIUM_NUNTIUS_OWN`, since the jail sees only its own) are refused. `nuntius::launch::open_portal`. (Built 2026-11-18.)
 
 ## 5. Clients, first to last
 

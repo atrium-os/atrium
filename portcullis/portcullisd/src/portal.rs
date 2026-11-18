@@ -28,3 +28,40 @@ pub fn watch(on: bool) {
         eprintln!("portcullisd: portal watch {}: {e}", if on { "on" } else { "off" });
     }
 }
+
+/// The host's own addresses (every interface's, link-local zones dropped),
+/// comma-separated, for the fetcher's `ATRIUM_NUNTIUS_OWN`: its jail sees
+/// only its own interfaces, and the window must reach none of the machine's.
+#[allow(unsafe_code)]
+pub fn host_addresses() -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut ifa: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `ifa` with a list freed below; each entry's
+    // address is read according to its family.
+    unsafe {
+        if libc::getifaddrs(&mut ifa) != 0 {
+            return String::new();
+        }
+        let mut p = ifa;
+        while !p.is_null() {
+            let a = (*p).ifa_addr;
+            if !a.is_null() {
+                match (*a).sa_family as i32 {
+                    libc::AF_INET => {
+                        let s = &*(a as *const libc::sockaddr_in);
+                        out.push(std::net::Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr)).to_string());
+                    }
+                    libc::AF_INET6 => {
+                        let s = &*(a as *const libc::sockaddr_in6);
+                        out.push(std::net::Ipv6Addr::from(s.sin6_addr.s6_addr).to_string());
+                    }
+                    _ => {}
+                }
+            }
+            p = (*p).ifa_next;
+        }
+        libc::freeifaddrs(ifa);
+    }
+    out.dedup();
+    out.join(",")
+}

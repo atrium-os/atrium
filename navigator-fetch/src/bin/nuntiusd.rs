@@ -108,7 +108,7 @@ fn main() {
     let tls = std::fs::read(&trust).map_err(|e| e.to_string()).and_then(|p| tls_config(&p)).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     eprintln!("nuntiusd: ★ UNCONFINED, for testing: no sandbox");
     if let Some(p) = portal_resolvers() {
-        let via: &'static navigator_fetch::dns::ViaDns = Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: &navigator_fetch::Direct, dns: p.clone() }));
+        let via: &'static navigator_fetch::dns::ViaDns = Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: &navigator_fetch::Direct, dns: p.clone(), own: navigator_fetch::dns::own_addresses() }));
         serve(Conversation::new(via, tls, policy).with_sites(sites()).with_dns(p));
     }
     serve(with_dns(Conversation::new(&navigator_fetch::Direct, tls, policy).with_sites(sites())))
@@ -126,6 +126,8 @@ fn main() {
     // A portal window's servers, or the system's: connected now, as
     // afterwards nothing can be.
     let portal = portal_resolvers();
+    // The machine's own addresses, read while getifaddrs still works.
+    let own = navigator_fetch::dns::own_addresses();
     let dns = match &portal {
         Some(p) => Some(p.clone()),
         None => navigator_fetch::dns::Udp::system().map(std::sync::Arc::new).map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok(),
@@ -134,7 +136,7 @@ fn main() {
     if !sandbox::in_capability_mode() { fail("kernel reports NOT in capability mode — refusing to serve".into()) }
     let locked: &'static navigator_fetch::Locked<sandbox::Net> = Box::leak(Box::new(navigator_fetch::Locked(std::sync::Mutex::new(net))));
     let connect: &'static (dyn navigator_fetch::Connect + Sync) = match &portal {
-        Some(p) => Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: locked, dns: p.clone() })),
+        Some(p) => Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: locked, dns: p.clone(), own })),
         None => locked,
     };
     // (fstat on the channel is allowed in capability mode.)

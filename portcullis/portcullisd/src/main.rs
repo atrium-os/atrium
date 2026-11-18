@@ -632,6 +632,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 ("ATRIUM_NUNTIUS_RESOLVERS".to_string(), dns.clone()),
                 // Workers' environments carry ATRIUM_ keys only.
                 ("ATRIUM_NUNTIUS_PRIVATE_NETWORK".to_string(), "1".to_string()),
+                // The LAN, but never the machine: its jail cannot see these.
+                ("ATRIUM_NUNTIUS_OWN".to_string(), portcullisd::portal::host_addresses()),
             ];
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: portal fetcher {instance} for {app} (uid {uid}) on {iface}, DNS {dns}");
