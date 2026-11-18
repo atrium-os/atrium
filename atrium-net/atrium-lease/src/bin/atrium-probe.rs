@@ -25,7 +25,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-const PROBE_UID: u32 = 65035;
+const PROBE_UID: u32 = 65048;
 const DNS_TRY: Duration = Duration::from_secs(2);
 const CONNECT: Duration = Duration::from_secs(4);
 const HTTP_TOTAL: Duration = Duration::from_secs(5);

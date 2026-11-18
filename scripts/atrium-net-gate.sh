@@ -88,7 +88,7 @@ n0)
         mkdir -p /var/unbound/conf.d
         printf 'server:\n    local-zone: \"test.\" nodefault\n    domain-insecure: \"atrium.test\"\n' > /var/unbound/conf.d/atrium-test.conf
         cp /tmp/atrium-net/unbound-atrium-local.conf /var/unbound/conf.d/atrium-local.conf
-        id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
+        id -u _atrium-mdns 2>/dev/null | grep -qx 65049 || { pw userdel _atrium-mdns 2>/dev/null || true; pw useradd _atrium-mdns -u 65049 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'; }
         sysrc local_unbound_enable=YES >/dev/null
         service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
         cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
@@ -369,7 +369,7 @@ n0)
     # window where to start and which DNS to ask; the watch re-probes every
     # 5 s and ends itself once online.
     lanctl web-captive >/dev/null
-    "$V" 'id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c "atrium-net connectivity probe"
+    "$V" 'id -u _atrium-probe 2>/dev/null | grep -qx 65048 || { pw userdel _atrium-probe 2>/dev/null || true; pw useradd _atrium-probe -u 65048 -d /nonexistent -s /usr/sbin/nologin -c "atrium-net connectivity probe"; }
         pkill -f "atrium-net -v"; sleep 1
         daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --capsicum --lease /tmp/atrium-net/atrium-lease --probe http://probe.atrium.test/generate_204 --probe-bin /tmp/atrium-net/atrium-probe --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
     stl() { "$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep 'name=vtnet1'; }

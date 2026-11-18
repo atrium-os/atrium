@@ -136,8 +136,8 @@ run)
         install -m 755 atrium-crypta-wg /usr/local/bin/atrium-crypta-wg
         install -m 755 arcad /usr/local/bin/atrium-arcad-gate
         id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
-        id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
-        [ "$(id -u _crypta-key 2>/dev/null)" = 65052 ] || { pw userdel _crypta-key 2>/dev/null || true; pw useradd _crypta-key -u 65052 -d /nonexistent -s /usr/sbin/nologin -c 'cryptad key helper'; }
+        id -u _atrium-mdns 2>/dev/null | grep -qx 65049 || { pw userdel _atrium-mdns 2>/dev/null || true; pw useradd _atrium-mdns -u 65049 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'; }
+        id -u _crypta-key 2>/dev/null | grep -qx 65052 || { pw userdel _crypta-key 2>/dev/null || true; pw useradd _crypta-key -u 65052 -d /nonexistent -s /usr/sbin/nologin -c 'cryptad key helper'; }
         mkdir -p /var/empty /var/run/atrium
         if [ ! -f /var/unbound/unbound.conf ]; then local-unbound-setup >/dev/null || true; fi
         mkdir -p /var/unbound/conf.d
