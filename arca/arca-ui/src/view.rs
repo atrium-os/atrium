@@ -199,14 +199,30 @@ pub fn draw(conn: &mut Connection, font: Font, f: &Field, recipient: &str, look:
         px.raw(inset(slot, halo + line), edge, 4.0)?;
         px.raw(inset(slot, halo + 2.0 * line), t.bg_canvas(), 3.0)?;
     }
-    let shown = f.bullets().min(l.bullets_max);
-    let (bullet, step) = bullet(h, tx);
-    let cy = (h - bullet) / 2.0;
-    for i in 0..shown {
-        px.rect(2.0 * PAD + i as f32 * step, cy, bullet, bullet, t.text_primary(), bullet / 2.0)?;
+    let mut end = 2.0 * PAD;
+    match f.shown_text().filter(|_| font.id != 0) {
+        Some(s) => {
+            // The end of what was typed stays in view.
+            let size = (FONT_PT * tx).min(h * 0.6);
+            let right = l.chip.map_or(w - PAD, |c| c.x - PAD);
+            let max = (((right - 3.0 * PAD) / (CHAR_PT * size / FONT_PT)).floor().max(1.0)) as usize;
+            let n = s.chars().count();
+            let s: String = if n > max { std::iter::once('…').chain(s.chars().skip(n + 1 - max)).collect() } else { s };
+            end += s.chars().count() as f32 * CHAR_PT * size / FONT_PT;
+            px.text(font, size, 2.0 * PAD, h / 2.0 + size * 0.35, t.text_primary(), s)?;
+        }
+        None => {
+            let shown = f.bullets().min(l.bullets_max);
+            let (bullet, step) = bullet(h, tx);
+            let cy = (h - bullet) / 2.0;
+            for i in 0..shown {
+                px.rect(2.0 * PAD + i as f32 * step, cy, bullet, bullet, t.text_primary(), bullet / 2.0)?;
+            }
+            end += shown as f32 * step;
+        }
     }
     if f.focused && l.chip.is_none() {
-        let x = 2.0 * PAD + shown as f32 * step;
+        let x = end;
         px.rect(x, h * 0.25, 1.5, h * 0.5, t.accent_fg(), 0.0)?;
     }
     if let (Some(c), Some(text)) = (l.chip, chip_text(f, recipient)) {

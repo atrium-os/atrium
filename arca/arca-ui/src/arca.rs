@@ -131,12 +131,14 @@ impl Arcad {
 
     /// Hold what the user typed. The request is built in locked memory and
     /// written straight to the socket: the value is never in a `Vec`.
-    /// `wifi`: a Wi-Fi passphrase field's, which only aura-keys may redeem.
-    pub fn hold(&self, p: &Parent, value: &[u8], wifi: bool) -> Result<[u8; 16], Error> {
+    /// `hold`: 0, or the field's kind when only one party may redeem it
+    /// (`HOLD_FOR_WIFI`: aura-keys; `HOLD_FOR_RECOVERY`: a stick's
+    /// `VK_ADOPT`).
+    pub fn hold(&self, p: &Parent, value: &[u8], hold: u8) -> Result<[u8; 16], Error> {
         let mut w = Writer::new();
         p.write(&mut w);
         let head = w.buf;
-        let n = 2 + head.len() + 4 + value.len() + wifi as usize;
+        let n = 2 + head.len() + 4 + value.len() + (hold != 0) as usize;
         let mut frame = LockedBuf::zeroed(4 + n)?;
         {
             let f = frame.as_mut();
@@ -148,8 +150,8 @@ impl Arcad {
             f[at..at + 4].copy_from_slice(&(value.len() as u32).to_le_bytes());
             at += 4;
             f[at..at + value.len()].copy_from_slice(value);
-            if wifi {
-                f[at + value.len()] = op::HOLD_FOR_WIFI;
+            if hold != 0 {
+                f[at + value.len()] = hold;
             }
         }
         let mut s = UnixStream::connect(&self.path)?;

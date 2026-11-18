@@ -861,11 +861,24 @@ impl State {
                 let uuid = field!(r.array::<16>());
                 let slot = field!(r.array::<{ volume_op::SLOT_LEN }>());
                 let keep = field!(r.u8());
-                let code = field!(r.str(volume_op::CODE_MAX)).to_string();
+                let typed = field!(r.str(volume_op::CODE_MAX)).to_string();
+                // No code: a handle for what was typed into Arca's own
+                // field follows, so the app that asked never saw it.
+                let held = if typed.is_empty() { Some(field!(r.array::<16>())) } else { None };
                 field!(r.end());
                 if keep > 1 {
                     return malformed();
                 }
+                let code = match held {
+                    None => typed,
+                    Some(h) => {
+                        let Some(v) = self.handles.take_recovery(&h, &user) else { return reply(status::DENIED) };
+                        match std::str::from_utf8(v.as_ref()) {
+                            Ok(c) if c.len() <= volume_op::CODE_MAX => c.trim().to_string(),
+                            _ => return malformed(),
+                        }
+                    }
+                };
                 // The person's own store must be open either way: the key
                 // is loaded as theirs.
                 if let Err(r) = self.volume_store(&user, &persona, false) {
@@ -1198,14 +1211,14 @@ impl State {
         let Ok(app) = Recipient::app(publisher, &app_id) else { return malformed() };
         let Some(store) = self.stores.get(&user) else { return reply(status::LOCKED) };
         let who = Access { persona: PERSONA, recipient: &app };
-        let entry = |source, generated, wifi| Entry {
+        let entry = |source, generated, hold| Entry {
             user: user.clone(),
             persona: PERSONA.into(),
             recipient: app.clone(),
             source,
             expires: std::time::Instant::now() + crate::handles::TTL,
             generated,
-            wifi,
+            hold,
         };
         let issued = |h: Option<[u8; 16]>| match h {
             Some(h) => ok(h.to_vec()),
@@ -1228,10 +1241,10 @@ impl State {
             }
             op::U_HOLD => {
                 let Ok(v) = r.bytes(caps::VALUE) else { return malformed() };
-                let wifi = match r.remaining() {
-                    0 => false,
+                let hold = match r.remaining() {
+                    0 => 0,
                     _ => match r.u8() {
-                        Ok(op::HOLD_FOR_WIFI) => true,
+                        Ok(h @ (op::HOLD_FOR_WIFI | op::HOLD_FOR_RECOVERY)) => h,
                         _ => return malformed(),
                     },
                 };
@@ -1242,7 +1255,7 @@ impl State {
                     return reply(status::LOCKED); // passwords are while-unlocked
                 }
                 let v = tri!(LockedBuf::from_slice(v).map_err(Error::Io));
-                issued(self.handles.issue(entry(Source::Pending(v), false, wifi)))
+                issued(self.handles.issue(entry(Source::Pending(v), false, hold)))
             }
             op::U_HANDLE => {
                 let Ok(id) = r.array::<16>() else { return malformed() };
@@ -1265,7 +1278,7 @@ impl State {
                 if m.class != Class::AfterFirstUnlock && store.state() != LockState::Unlocked {
                     return reply(status::LOCKED);
                 }
-                issued(self.handles.issue(entry(Source::Item(id), false, false)))
+                issued(self.handles.issue(entry(Source::Item(id), false, 0)))
             }
             op::U_GENERATE => {
                 if r.end().is_err() {
@@ -1275,7 +1288,7 @@ impl State {
                     return reply(status::LOCKED);
                 }
                 let v = tri!(generate_password());
-                issued(self.handles.issue(entry(Source::Pending(v), true, false)))
+                issued(self.handles.issue(entry(Source::Pending(v), true, 0)))
             }
             _ => reply(status::DENIED),
         }

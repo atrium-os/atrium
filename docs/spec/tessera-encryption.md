@@ -613,8 +613,26 @@ Personal:
   `jail_attach`, over a socket at fd 3: the kernel refuses to attach a process
   holding a directory descriptor. Needs `fusefs.ko` on the Atrium kernel
   (kernel-hardening.md keeps it loadable).
-- **Not yet:** Scrinium's and Forum's Locked display and "Make this a Work
-  stick", and the Arca field for typing a recovery code.
+- **Screens (host tests, 2026-11-18):** Scrinium lists a sealed stick with its
+  state. Another persona's stick shows that persona's name and isn't opened
+  ("Open it from a Work window"). This window's own sticks say "Encrypted". A
+  Locked stick shows "Encrypted stick from another machine or persona" in place
+  of its files, with **Enter recovery code…** when it has a slot, and **Erase and
+  format…**. An older copy offers **Open read-only…**; once open, a strip offers
+  **Use this copy as current…**. "Make this a Work stick" (or "Encrypt this stick"
+  in a Personal window, `SCRINIUM_PERSONA`) is on the stick's actions. Its sheet
+  says what will be erased, with a recovery code ticked by default for Personal
+  only, and the code it makes is shown once. Every request goes to dispensatord
+  off the window's thread, because arcad may wait for verification.
+  Forum's stick menu shows whose a stick is, or Locked, and points to Scrinium.
+- **The recovery code is typed into Arca's field** (a Limen `credential` slot,
+  purpose `RecoveryCode`). arca-ui draws it as typed (the code is long, and the slot is
+  Arca's own surface) and holds it with `U_HOLD … HOLD_FOR_RECOVERY`. Scrinium
+  passes only the handle in the media op `ADOPT { handle }`. dispensatord sends
+  `VK_ADOPT` with an empty code and the handle, and arcad redeems it
+  (`take_recovery`): once, for the user who typed it, and only from that kind
+  of field. No fill, courier or `TAKE_WIFI` takes it. root's `--adopt` still
+  passes a typed code.
 - Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): all 43
   checks in the VM on 2026-11-18 (e61b9c0: format, lock, Locked for another person,
   eject, replug, an older copy refused and not opened unverified, a recovery code

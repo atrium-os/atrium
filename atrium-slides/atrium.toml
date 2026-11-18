@@ -1,0 +1,32 @@
+# Atrium Slides — Officina's presentations (docs/spec/officina.md §16.35).
+# It draws through Fresco and gets decks only as descriptors: from the
+# picker, or handed over by portcullisd when the user opens one in Scrinium
+# (opening-files.md §6.2). It reads no folder by itself and has no network.
+[app]
+id          = "org.atrium.slides"
+name        = "Slides"
+version     = "0.1.0"
+entry       = "bin/atrium-slides"
+description = "Make and present slides."
+icon        = "presentation"
+
+[capabilities]
+graphics = "fresco"
+network  = "none"
+# Limen roles it embeds (app-composition.md §3): the picker for Open and Save, the media player for video in a show.
+embeds   = ["picker", "media-player"]
+
+# The converter (officina.md §5.2): a foreign file is read here, in a jail
+# of its own as a uid of its own, with no capability (app-composition.md §4).
+[[workers]]
+name   = "convert"
+entry  = "bin/officina-convert"
+memory = "2G"
+cpu    = "2m"
+
+[[opens]]
+types = [
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.presentation",
+]
+mode = "edit"

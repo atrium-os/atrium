@@ -104,6 +104,10 @@ pub struct ScriniumView {
     pub cred: CredentialField,
     /// What that field told the app: filled, and its handle.
     pub cred_state: Mutable<CredentialState>,
+    /// Arca's recovery-code field on "Enter recovery code" (tessera-
+    /// encryption.md §7.4): typed into Arca, redeemed by arcad.
+    pub rcode: CredentialField,
+    pub rcode_state: Mutable<CredentialState>,
     /// The actions row's "More" menu, where actions go that no longer fit.
     pub more: Mutable<pergola::widgets::MenuState>,
     /// The cursor row last kept in view: a move of the cursor (the
@@ -117,9 +121,37 @@ impl ScriniumView {
         // field and moving in the More menu repaint.
         let cred_state = state.sibling(CredentialState::default());
         let cred = CredentialField::password(cred_state.clone());
+        let rcode_state = state.sibling(CredentialState::default());
+        let rcode = CredentialField::recovery_code(rcode_state.clone());
         let more = state.sibling(Default::default());
-        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, more, shown_cursor: Arc::new(Mutex::new(None)) }
+        Self { state, field, scroll, size, mods: Arc::new(Mutex::new(Mods::default())), clock: Instant::now(), cred, cred_state, rcode, rcode_state, more, shown_cursor: Arc::new(Mutex::new(None)) }
     }
+}
+
+/// A stick's second line in the sidebar: Locked, an older copy, whose
+/// (another persona's chip; this window's own sealed sticks say
+/// "Encrypted"), its free space.
+pub fn place_sub(p: &crate::browser::Place, persona: &str) -> String {
+    use crate::browser::persona_name;
+    let sealed = !p.seal.persona.is_empty();
+    let theirs = (sealed && p.seal.persona != persona).then(|| persona_name(&p.seal.persona));
+    if p.seal.locked {
+        return match (p.seal.older, theirs) {
+            (true, _) => "Older copy · Locked".into(),
+            (false, Some(w)) => format!("{w} · Locked"),
+            (false, None) => "Locked".into(),
+        };
+    }
+    if p.seal.older {
+        return "Older copy".into();
+    }
+    let free = if p.size > 0 { format!("{} free", fs::size_text(p.free)) } else { "USB stick".into() };
+    let free = match theirs {
+        Some(w) => format!("{w} · {free}"),
+        None if sealed => format!("Encrypted · {free}"),
+        None => free,
+    };
+    if p.read_only { format!("{free} · read-only") } else { free }
 }
 
 /// Change the browser from a handler.
@@ -422,6 +454,9 @@ impl View for ScriniumView {
                 if b.open_sheet.is_some() {
                     self.open_sheet(ctx, &b, w, h);
                 }
+                if b.stick_sheet.is_some() {
+                    self.stick_sheet(ctx, &b, w, h);
+                }
             }
             Mode::Picker { .. } => {
                 // The sheet grows to this when the text outgrows the
@@ -463,7 +498,7 @@ impl ScriniumView {
             let s = self.state.clone();
             ctx.key(1000 + i as u64);
             area(ctx, Rect::new(8.0, y, sw - 16.0, place_h()), 6.0, if on { t.selection_idle() } else { Color::TRANSPARENT }, t.state_hover(), move || with(&s, |b| b.open_place(i)));
-            let g = if p.network { ph::GLOBE } else if p.stick { ph::USB } else { ph::FOLDER };
+            let g = if p.seal.locked { ph::LOCK_SIMPLE } else if p.network { ph::GLOBE } else if p.stick { ph::USB } else { ph::FOLDER };
             icon(ctx, 16.0, y + em(7.0), g, 20.0, if on { t.accent_fg() } else { t.text_secondary() });
             let room = sw - 16.0 - text_x() - if p.stick && manager { em(30.0) } else { 0.0 };
             text(ctx, text_x(), y + em(15.0), &fit(&p.label, type_size::SM, Weight::Medium, room), type_size::SM, Weight::Medium, t.text_primary());
@@ -477,8 +512,7 @@ impl ScriniumView {
                 };
                 if p.read_only { format!("{free} · read-only") } else { free }
             } else if p.stick {
-                let free = if p.size > 0 { format!("{} free", fs::size_text(p.free)) } else { "USB stick".into() };
-                if p.read_only { format!("{free} · read-only") } else { free }
+                place_sub(p, &b.persona)
             } else {
                 p.root.to_string_lossy().into_owned()
             };
@@ -570,6 +604,176 @@ impl ScriniumView {
         let fw = width(label, type_size::SM, Weight::Medium) + 28.0;
         let s = self.state.clone();
         button(ctx, x + cw - pad - close - 8.0 - fw, by, label, Look::Ghost, true, move || with(&s, Browser::forget_changed));
+    }
+
+    /// In place of the file list: a Locked stick (§7.2 step 4) and what
+    /// can be done with it, or another persona's stick.
+    #[allow(clippy::too_many_arguments)]
+    fn sealed_pane(&self, ctx: &mut Ctx, b: &Browser, i: usize, p: &crate::browser::Place, x0: f32, w: f32, y0: f32, y1: f32) {
+        use crate::browser::persona_name;
+        let t = ctx.theme;
+        let cx = x0 + (w - x0) / 2.0;
+        let room = (w - x0 - 48.0).max(0.0);
+        let mut y = y0 + ((y1 - y0) * 0.3).min(em(140.0));
+        icon(ctx, cx - 16.0, y, ph::LOCK_SIMPLE, 32.0, t.text_tertiary());
+        y += em(56.0);
+        let centred = |ctx: &mut Ctx, y: f32, s: &str, size: f32, weight: Weight, c: Color| {
+            let s = fit(s, size, weight, room);
+            let tw = width(&s, size, weight);
+            text(ctx, cx - tw / 2.0, y, &s, size, weight, c);
+        };
+        if !p.seal.locked {
+            let who = persona_name(&p.seal.persona);
+            centred(ctx, y, &format!("This is a {who} stick"), type_size::LG, Weight::Semibold, t.text_primary());
+            centred(ctx, y + em(28.0), &format!("Open it from a {who} window. Only {who} apps get its files."), type_size::SM, Weight::Regular, t.text_secondary());
+            return;
+        }
+        let (title, line) = if p.seal.older {
+            ("This stick is older than the last time it was used here", "Someone may have put back an earlier copy of it. You can open it read-only to look.")
+        } else {
+            ("Encrypted stick from another machine or persona", "Nothing on it can be read without its key.")
+        };
+        centred(ctx, y, title, type_size::LG, Weight::Semibold, t.text_primary());
+        centred(ctx, y + em(28.0), line, type_size::SM, Weight::Regular, t.text_secondary());
+        if b.picker().is_some() {
+            return;
+        }
+        // Its actions, centred in a row.
+        let mut acts: Vec<(&str, Look, Box<dyn Fn()>)> = Vec::new();
+        let s = self.state.clone();
+        if p.seal.older {
+            acts.push(("Open read-only…", Look::Primary, Box::new(move || with(&s, |b| b.ask_about(i)))));
+        } else if p.seal.recovery {
+            acts.push(("Enter recovery code…", Look::Primary, Box::new(move || with(&s, |b| {
+                b.ask_about(i);
+                b.ask_recovery();
+            }))));
+        }
+        let s = self.state.clone();
+        acts.push(("Erase and format…", Look::Ghost, Box::new(move || with(&s, |b| b.ask_format(i)))));
+        let total: f32 = acts.iter().map(|(l, ..)| button_w(l)).sum::<f32>() + 8.0 * (acts.len() as f32 - 1.0);
+        let mut x = cx - total / 2.0;
+        let free = b.stick_sheet.is_none();
+        for (label, look, on) in acts {
+            x += button(ctx, x, y + em(52.0), label, look, free, on) + 8.0;
+        }
+    }
+
+    /// A sealed stick's sheet (tessera-encryption.md §7, §8).
+    fn stick_sheet(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
+        use crate::browser::{persona_name, StickAsk};
+        let t = ctx.theme;
+        let Some(sh) = &b.stick_sheet else { return };
+        ctx.key(4300);
+        area(ctx, Rect::new(0.0, 0.0, w, h), 0.0, Color::rgba(0.0, 0.0, 0.0, 0.33), Color::rgba(0.0, 0.0, 0.0, 0.33), || {});
+        ctx.pop();
+        let pad = 24.0;
+        let (cw, ch) = (520.0_f32.min(w - 16.0), em(236.0));
+        let (x, y) = (((w - cw) / 2.0).max(8.0), ((h - ch) / 2.0).max(8.0));
+        let danger = matches!(sh.ask, StickAsk::Format { .. });
+        rect(ctx, x - 1.0, y - 1.0, cw + 2.0, ch + 2.0, if danger { t.danger_fg() } else { t.border_strong() }, 11.0);
+        rect(ctx, x, y, cw, ch, t.bg_surface(), 10.0);
+        let (lx, inner) = (x + pad, cw - 2.0 * pad);
+        let title = |ctx: &mut Ctx, s: &str| text(ctx, lx, y + em(32.0), &fit(s, type_size::LG, Weight::Semibold, inner), type_size::LG, Weight::Semibold, t.text_primary());
+        let line = |ctx: &mut Ctx, row: f32, s: &str, c: Color| text(ctx, lx, y + em(row), &fit(s, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, c);
+        // A tick box: drawn (the UI fonts have no ballot-box glyphs).
+        let tick = |ctx: &mut Ctx, row: f32, label: &str, on: bool, key: u64, press: Box<dyn Fn()>| {
+            ctx.key(key);
+            area(ctx, Rect::new(lx - 6.0, y + em(row) - em(14.0), inner.min(em(320.0)), em(28.0)), 6.0, Color::TRANSPARENT, t.state_hover(), press);
+            rect(ctx, lx, y + em(row) - 8.0, 16.0, 16.0, t.border_strong(), 4.0);
+            rect(ctx, lx + 1.0, y + em(row) - 7.0, 14.0, 14.0, if on { t.accent_fg() } else { t.bg_surface() }, 3.0);
+            text(ctx, lx + 24.0, y + em(row), label, type_size::SM, Weight::Regular, t.text_primary());
+            ctx.pop();
+        };
+        let by = y + ch - em(32.0) - pad;
+        let mut right = x + cw - pad;
+        let mut btn = |ctx: &mut Ctx, label: &str, look: Look, enabled: bool, on: Box<dyn Fn()>| {
+            let bw = button_w(label);
+            right -= bw;
+            button(ctx, right, by, label, look, enabled, on);
+            right -= 8.0;
+        };
+        let busy = sh.busy;
+        let s = self.state.clone();
+        let close: Box<dyn Fn()> = Box::new(move || with(&s, Browser::close_stick_sheet));
+        let s = self.state.clone();
+        let confirm: Box<dyn Fn()> = Box::new(move || with(&s, |b| b.confirm_stick(None)));
+        match &sh.ask {
+            StickAsk::Format { persona, recovery } => {
+                title(ctx, &if persona == "personal" { format!("Encrypt “{}”?", sh.label) } else { format!("Make “{}” a {} stick?", sh.label, persona_name(persona)) });
+                icon(ctx, lx, y + em(52.0), ph::WARNING, 18.0, t.danger_fg());
+                text(ctx, lx + 26.0, y + em(62.0), &fit("Everything on it now will be erased.", type_size::SM, Weight::Medium, inner - 26.0), type_size::SM, Weight::Medium, t.danger_fg());
+                let whose = if persona == "personal" { "you".to_string() } else { format!("{} apps", persona_name(persona)) };
+                line(ctx, 88.0, &format!("Its key stays in Arca on this machine. Only {whose} can open it here;"), t.text_secondary());
+                line(ctx, 108.0, "anywhere else it's unreadable without its key or a recovery code.", t.text_secondary());
+                let s = self.state.clone();
+                tick(ctx, 140.0, "Make a recovery code", *recovery, 4301, Box::new(move || with(&s, Browser::toggle_recovery)));
+                if !recovery && persona == "personal" {
+                    line(ctx, 164.0, "Without one, losing this machine loses the stick's files.", t.text_tertiary());
+                } else if *recovery && persona != "personal" {
+                    line(ctx, 164.0, "While a code exists, forgetting the key here doesn't lock the stick.", t.text_tertiary());
+                }
+                btn(ctx, if busy { "Erasing…" } else { "Erase and encrypt" }, Look::Danger, !busy, confirm);
+                btn(ctx, "Cancel", Look::Ghost, !busy, close);
+            }
+            StickAsk::Code { code } => {
+                title(ctx, "Write down this recovery code");
+                line(ctx, 66.0, "It opens the stick on any machine. Scrinium shows it only this once.", t.text_secondary());
+                rect(ctx, lx, y + em(84.0), inner, em(44.0), t.bg_canvas(), 6.0);
+                // Never cut: smaller type before that.
+                let mut style = TextStyle { family: font::MONO.into(), size: type_size::LG, weight: Weight::Medium, color: t.text_primary() };
+                for size in [type_size::MD, type_size::SM, type_size::XS] {
+                    if Node::measure_text(code, &style).w <= inner - 20.0 {
+                        break;
+                    }
+                    style.size = size;
+                }
+                ctx.add(Node::Text { rect: Rect::new(lx + 10.0, y + em(84.0), 0.0, em(44.0)), content: code.clone(), style });
+                line(ctx, 150.0, "Keep it somewhere other than with the stick.", t.text_tertiary());
+                btn(ctx, "I've written it down", Look::Primary, true, close);
+            }
+            StickAsk::Locked => {
+                title(ctx, &format!("“{}” is locked", sh.label));
+                line(ctx, 66.0, "Encrypted stick from another machine or persona.", t.text_secondary());
+                btn(ctx, "Close", Look::Ghost, true, close);
+            }
+            StickAsk::Recovery { keep } => {
+                title(ctx, &format!("Recovery code for “{}”", sh.label));
+                line(ctx, 66.0, "Type it into Arca's field: Scrinium never sees it.", t.text_secondary());
+                self.rcode.clone().at(lx, y + em(84.0)).size(inner, 36.0).render(ctx);
+                let s = self.state.clone();
+                let who = persona_name(&b.persona);
+                tick(ctx, 146.0, &format!("Keep its key in {who} on this machine"), *keep, 4302, Box::new(move || with(&s, Browser::toggle_keep)));
+                if !keep {
+                    line(ctx, 170.0, "It opens for this session only; the code is needed again next time.", t.text_tertiary());
+                }
+                let (s, st) = (self.state.clone(), self.rcode_state.clone());
+                btn(ctx, if busy { "Opening…" } else { "Open" }, Look::Primary, !busy, Box::new(move || {
+                    let h = st.get_cloned().handle;
+                    with(&s, |b| b.confirm_stick(h));
+                }));
+                btn(ctx, "Cancel", Look::Ghost, !busy, close);
+            }
+            StickAsk::Older => {
+                title(ctx, "Open an older copy read-only?");
+                line(ctx, 66.0, &format!("“{}” is older than the last time it was used here.", sh.label), t.text_secondary());
+                line(ctx, 86.0, "Restoring a backup does this; so could someone putting back an old copy.", t.text_secondary());
+                line(ctx, 106.0, "You'll be asked to confirm it's you. Nothing on it can be changed.", t.text_tertiary());
+                btn(ctx, if busy { "Waiting for you…" } else { "Open read-only" }, Look::Primary, !busy, confirm);
+                btn(ctx, "Cancel", Look::Ghost, !busy, close);
+            }
+            StickAsk::MakeCurrent => {
+                title(ctx, "Use this copy as current?");
+                line(ctx, 66.0, &format!("“{}” becomes writable, and this machine forgets that it", sh.label), t.text_secondary());
+                line(ctx, 86.0, "saw a newer copy: the newer copy won't open here afterwards.", t.text_secondary());
+                line(ctx, 106.0, "You'll be asked to confirm it's you.", t.text_tertiary());
+                btn(ctx, if busy { "Waiting for you…" } else { "Use as current" }, Look::Primary, !busy, confirm);
+                btn(ctx, "Cancel", Look::Ghost, !busy, close);
+            }
+        }
+        if let Some(e) = &sh.error {
+            text(ctx, lx, by - em(14.0), &fit(e, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.danger_fg());
+        }
     }
 
     /// Opening a file (opening-files.md §6.1, D3): Open with, or the
@@ -980,7 +1184,8 @@ impl ScriniumView {
 
         // What can be done here.
         let ay = if compact { 4.0 } else { toolbar_h() + 4.0 };
-        let open = b.place().is_some() && b.unreadable.is_none();
+        // A Locked stick, or another persona's, has no folder to act in.
+        let open = b.dir().is_some() && b.unreadable.is_none();
         let writable = open && !b.place().is_some_and(|p| p.read_only);
         let n = b.selected.len();
         // A toolbar: when the text grows or the window narrows, what no
@@ -1001,6 +1206,12 @@ impl ScriniumView {
             ToolItem::new("Cut", move || with(&s5, |b| b.copy(true))).priority(2).enabled(writable && n > 0),
             ToolItem::new("Paste", move || with(&s6, Browser::paste)).priority(3).enabled(writable && b.clip.is_some()),
         ];
+        // A USB stick (not a share) can be sealed for this persona
+        // (tessera-encryption.md §7.1); first into More.
+        if let Some(i) = b.at.filter(|_| b.place().is_some_and(|p| p.stick && !p.network)) {
+            let s = self.state.clone();
+            items.push(ToolItem::new(&b.format_words(), move || with(&s, |b| b.ask_format(i))).priority(0).enabled(b.stick_sheet.is_none()));
+        }
         if compact {
             // The hidden-files switch joins them, first into More.
             items.push(ToolItem::new(hid, move || with(&s9, Browser::toggle_hidden)).priority(0).enabled(open));
@@ -1063,12 +1274,31 @@ impl ScriniumView {
             y += strip_h();
         }
 
-        // Quick look takes the right of the list (opening-files.md §7).
-        let lw = if b.look.is_some() { ((w - x0) * 0.45).clamp(em(260.0), em(480.0)).min((w - x0) * 0.6) } else { 0.0 };
-        // Room for the Kind and Modified columns (em-sized) beside a useful name.
-        self.list(ctx, b, x0, w - lw, y, h - status_h(), w - lw - x0 > em(620.0));
-        if let Some(l) = &b.look {
-            self.look_pane(ctx, l, w - lw, y, w, h - status_h());
+        // An older copy, open read-only (§8): it can be made current.
+        if let Some(i) = b.at.filter(|_| b.place().is_some_and(|p| p.seal.older && !p.seal.locked)) {
+            rect(ctx, x0, y, w - x0, strip_h(), t.accent_bg(), 0.0);
+            icon(ctx, x0 + 14.0, y + em(14.0), ph::CLOCK, 20.0, t.text_secondary());
+            let tx = x0 + 14.0 + em(28.0);
+            let label = "Use this copy as current…";
+            let room = (w - tx - 12.0 - button_w(label) - 12.0).max(0.0);
+            let q = fit("This is an older copy of this stick, open read-only", type_size::SM, Weight::Medium, room);
+            text(ctx, tx, y + strip_h() / 2.0, &q, type_size::SM, Weight::Medium, t.text_primary());
+            let s = self.state.clone();
+            button(ctx, w - 12.0 - button_w(label), y + em(8.0), label, Look::Secondary, b.stick_sheet.is_none(), move || with(&s, |b| b.ask_about(i)));
+            y += strip_h();
+        }
+
+        // A Locked stick, or another persona's: what it is, not its files.
+        if let Some((i, p)) = b.at.zip(b.place()).filter(|(_, p)| !p.browsable(&b.persona)) {
+            self.sealed_pane(ctx, b, i, p, x0, w, y, h - status_h());
+        } else {
+            // Quick look takes the right of the list (opening-files.md §7).
+            let lw = if b.look.is_some() { ((w - x0) * 0.45).clamp(em(260.0), em(480.0)).min((w - x0) * 0.6) } else { 0.0 };
+            // Room for the Kind and Modified columns (em-sized) beside a useful name.
+            self.list(ctx, b, x0, w - lw, y, h - status_h(), w - lw - x0 > em(620.0));
+            if let Some(l) = &b.look {
+                self.look_pane(ctx, l, w - lw, y, w, h - status_h());
+            }
         }
 
         // The status line.
@@ -1191,7 +1421,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn place(d: &std::path::Path) -> Place {
-        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000, network: false, offline: false }
+        Place { id: "da0s1".into(), label: "16 GB stick".into(), root: d.to_path_buf(), stick: true, read_only: false, size: 16_000_000_000, free: 9_000_000_000, network: false, offline: false, seal: Default::default() }
     }
 
     fn texts(app: &App<ScriniumView>) -> Vec<String> {
@@ -1307,6 +1537,84 @@ mod tests {
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t == "Reconnecting…"), "{tx:?}");
         assert!(tx.iter().any(|t| t == "Connect at login"), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_locked_stick_shows_what_it_is_and_its_actions() {
+        use crate::browser::{Seal, StickAsk};
+        let d = std::env::temp_dir().join(format!("scrinium-view-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("secret.txt"), "x").unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        let locked = Place { seal: Seal { locked: true, recovery: true, ..Default::default() }, ..place(&d) };
+        let work = Place { id: "da1s1".into(), label: "8 GB stick".into(), seal: Seal { persona: "work".into(), ..Default::default() }, ..place(&d) };
+        b.set_places(vec![locked, work]);
+        let (mut app, state) = app_for(b, (960.0, 600.0));
+        let tx = texts(&app);
+        for want in ["Locked", "Encrypted stick from another machine or persona", "Enter recovery code…", "Erase and format…", "Work · 9.0 GB free"] {
+            assert!(tx.iter().any(|t| t == want), "{want}: {tx:?}");
+        }
+        assert!(!tx.iter().any(|t| t == "secret.txt"), "nothing on it is listed");
+        // Another persona's stick: shown, not opened.
+        with(&state, |b| b.open_place(1));
+        app.tick();
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "This is a Work stick"), "{tx:?}");
+        assert!(!tx.iter().any(|t| t == "secret.txt"));
+        // The recovery sheet holds Arca's field, not a text field of ours.
+        with(&state, |b| {
+            b.open_place(0);
+            b.ask_about(0);
+            b.ask_recovery();
+        });
+        app.tick();
+        assert!(matches!(state.get_cloned().stick_sheet.map(|s| s.ask), Some(StickAsk::Recovery { keep: true })));
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "Type it into Arca's field: Scrinium never sees it."), "{tx:?}");
+        // Format: what will be erased, in this persona's words.
+        with(&state, |b| {
+            b.stick_sheet = None;
+            b.persona = "work".into();
+            b.ask_format(0);
+        });
+        app.tick();
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "Make “16 GB stick” a Work stick?"), "{tx:?}");
+        assert!(tx.iter().any(|t| t == "Everything on it now will be erased."), "{tx:?}");
+        // The code made with it: shown once, whole.
+        with(&state, |b| {
+            b.toggle_recovery();
+            b.confirm_stick(None);
+            b.media_done(Ok("da0s1 is now work's sealed stick; recovery code ABCDE-FGHJK-LMNPQ-RSTVW-XYZ23-45679".into()));
+        });
+        app.tick();
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "ABCDE-FGHJK-LMNPQ-RSTVW-XYZ23-45679"), "{tx:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_older_copy_offers_to_open_then_to_become_current() {
+        use crate::browser::Seal;
+        let d = std::env::temp_dir().join(format!("scrinium-view-older-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("old.txt"), "x").unwrap();
+        let mut b = Browser::new(Mode::Manager);
+        b.set_places(vec![Place { seal: Seal { persona: "personal".into(), locked: true, older: true, ..Default::default() }, ..place(&d) }]);
+        let (mut app, state) = app_for(b, (960.0, 600.0));
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "Open read-only…"), "{tx:?}");
+        assert!(tx.iter().any(|t| t == "Older copy · Locked"), "{tx:?}");
+        // Opened: read-only, listed, with the way to make it current.
+        with(&state, |b| b.set_places(vec![Place { read_only: true, seal: Seal { persona: "personal".into(), older: true, ..Default::default() }, ..place(&d) }]));
+        app.tick();
+        let tx = texts(&app);
+        assert!(tx.iter().any(|t| t == "old.txt"), "{tx:?}");
+        assert!(tx.iter().any(|t| t == "Use this copy as current…"), "{tx:?}");
+        assert!(tx.iter().any(|t| t == "Older copy"), "{tx:?}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

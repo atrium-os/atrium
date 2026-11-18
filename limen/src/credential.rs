@@ -16,6 +16,9 @@ pub enum Purpose {
     /// A Wi-Fi passphrase (curia.md §4): typed, never offered, and held so
     /// that only the Wi-Fi key service can redeem it, never a courier.
     WifiPassphrase,
+    /// A sealed stick's recovery code (tessera-encryption.md §7.4): typed,
+    /// never offered, held so that only arcad's `VK_ADOPT` redeems it.
+    RecoveryCode,
 }
 
 /// One submit's worth of reference to the value, meaningful only on this

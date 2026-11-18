@@ -160,7 +160,8 @@ pub mod arca {
     /// `record USER PERSONA KEYID`, `recovery USER PERSONA KEYID UUID`,
     /// `older|current USER PERSONA KEYID UUID`,
     /// `adopt USER PERSONA KEYID UUID SLOT KEEP` (the code is `code`, which
-    /// the child reads from its stdin, never its arguments): the request
+    /// the child reads from its stdin, never its arguments; `held:HEX` is
+    /// a handle from Arca's field instead): the request
     /// the child sends.
     pub fn request(args: &[String], code: &str) -> Option<(u16, Vec<u8>)> {
         let a = |i: usize| args.get(i).map(String::as_str);
@@ -178,7 +179,13 @@ pub mod arca {
                     "once" => 0,
                     _ => return None,
                 };
-                Some((VK_ADOPT, Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).raw(&super::unhex16(a(4)?)?).raw(&slot).raw(&[keep]).str(code).0))
+                let body = Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).raw(&super::unhex16(a(4)?)?).raw(&slot).raw(&[keep]);
+                // `held:HEX`: a handle for what was typed into Arca's own
+                // field; arcad redeems it (no code is ever `held:`).
+                Some((VK_ADOPT, match code.strip_prefix("held:") {
+                    Some(h) => body.str("").raw(&super::unhex16(h)?).0,
+                    None => body.str(code).0,
+                }))
             }
             ("find", 4) => Some((VK_FIND, Body::default().str(a(1)?).raw(&super::unhex16(a(2)?)?).raw(&super::unhex16(a(3)?)?).u64(0).0)),
             ("mint", 5) => Some((VK_MINT, Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).u64(0).str(a(4)?).0)),
@@ -302,6 +309,11 @@ mod tests {
         assert_eq!(op, arca::VK_ADOPT);
         assert_eq!(b.len(), 4 + 5 + 4 + 8 + 16 + 16 + 256 + 1 + 4 + 11);
         assert!(arca::request(&s(&["adopt", "alice", "personal", k, k, &h, "keep"]), "").is_none(), "no code");
+        // A handle from Arca's field: an empty code, then the handle.
+        let (_, held) = arca::request(&s(&["adopt", "alice", "personal", k, k, &h, "keep"]), &format!("held:{k}")).unwrap();
+        assert_eq!(held.len(), 4 + 5 + 4 + 8 + 16 + 16 + 256 + 1 + 4 + 16);
+        assert_eq!(&held[held.len() - 20..held.len() - 16], &[0, 0, 0, 0]);
+        assert!(arca::request(&s(&["adopt", "alice", "personal", k, k, &h, "keep"]), "held:zz").is_none());
         assert!(arca::request(&s(&["adopt", "alice", "personal", k, k, "00", "keep"]), "x").is_none(), "short slot");
         assert!(arca::request(&s(&["adopt", "alice", "personal", k, k, &h, "maybe"]), "x").is_none());
         assert!(arca::request(&s(&["recovery", "alice", "personal", k, k]), "").is_some());

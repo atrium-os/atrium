@@ -2443,9 +2443,12 @@ pub struct GlyphRunParams {
 /// bound the colour slot; otherwise frescod clears it.
 pub const GLYPH_COLOR: u32 = 0x8000_0000;
 
-/// A colour atlas's size in texels.
-pub const COLOR_ATLAS_W: u32 = 512;
-pub const COLOR_ATLAS_H: u32 = 512;
+/// A colour atlas's size in texels: half its glyph atlas's each way
+/// (a quarter of the texels, at four bytes each), so an app with a large
+/// glyph atlas gets a large colour one.
+pub const fn color_atlas_dims(atlas_w: u32, atlas_h: u32) -> (u32, u32) {
+    (atlas_w / 2, atlas_h / 2)
+}
 
 /// The colour atlas slot paired with glyph atlas slot `slot`.
 pub const fn color_atlas_slot(slot: u32) -> u32 {

@@ -20,6 +20,8 @@
 //!   SCRINIUM_TRACE          [unset] log what is shown after each change
 //!   SCRINIUM_OPEN           [unset] open this place id (`da0s1`) and path at start
 //!   SCRINIUM_ARCA_SOCKET    [/atrium/sockets/arca/arcad.sock] saved network shares
+//!   SCRINIUM_PERSONA        [personal] whose window this is: the sticks it
+//!                           seals are this persona's (tessera-encryption.md §7)
 //!
 //! "Connect to server" (network-shares.md §5.2): dispensatord learns the
 //! server's key in a jail of its own, the user accepts it, types the
@@ -67,6 +69,8 @@ fn size_of(s: &str, d: (u32, u32)) -> (u32, u32) {
 struct Pane {
     cred: pergola::widgets::CredentialField,
     cred_state: Mutable<pergola::widgets::CredentialState>,
+    rcode: pergola::widgets::CredentialField,
+    rcode_state: Mutable<pergola::widgets::CredentialState>,
     win: Window,
     app: App<ScriniumView>,
     state: Mutable<Browser>,
@@ -87,8 +91,9 @@ impl Pane {
         let view = ScriniumView::new(state.clone(), field.clone(), scroll, size.clone());
         let mods = view.mods.clone();
         let (cred, cred_state) = (view.cred.clone(), view.cred_state.clone());
+        let (rcode, rcode_state) = (view.rcode.clone(), view.rcode_state.clone());
         let app = App::new_with_flag(view, dirty);
-        Pane { cred, cred_state, win, app, state, field, size, mods, gen: u64::MAX, trace: std::env::var_os("SCRINIUM_TRACE").map(|_| String::new()) }
+        Pane { cred, cred_state, rcode, rcode_state, win, app, state, field, size, mods, gen: u64::MAX, trace: std::env::var_os("SCRINIUM_TRACE").map(|_| String::new()) }
     }
 
     /// One turn: an event (or `wait`), then the places if they changed.
@@ -422,6 +427,8 @@ enum Job {
     /// A share's size and free space (its server answers over the network,
     /// so it is asked off the window's thread).
     Space(String, Option<(u64, u64)>),
+    /// dispensatord's answer to a sealed stick's sheet.
+    Media(Result<String, String>),
     /// A file to open, what its bytes say it is, and whether they are text.
     Typed(scrinium::browser::OpenReq, std::io::Result<(atrium_types::Detected, bool)>),
     /// The apps that open its type.
@@ -442,6 +449,33 @@ enum Job {
 const SHARE_SPACE_EVERY: Duration = Duration::from_secs(30);
 const SHARE_OFFLINE_EVERY: Duration = Duration::from_secs(5);
 
+/// One of Arca's fields (a Limen `credential` slot): asked for while
+/// `want`, let go after. `code`: the recovery-code field, else the
+/// password field.
+fn arca_slot(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, pane: &mut Pane, want: bool, cur: &mut Option<EmbedId>, code: bool) {
+    let (field, state) = if code { (&pane.rcode, &pane.rcode_state) } else { (&pane.cred, &pane.cred_state) };
+    match (want, *cur) {
+        (true, None) => {
+            if let Some(token) = pane.win.embed_token() {
+                let asked = embeds.borrow_mut().request("credential", token, field.slot_key());
+                match asked {
+                    Ok(e) => {
+                        let _ = embeds.borrow_mut().send(e, field.configure().encode());
+                        *cur = Some(e);
+                    }
+                    Err(e) => eprintln!("scrinium: Arca's {} field: {e:?}", if code { "recovery-code" } else { "password" }),
+                }
+            }
+        }
+        (false, Some(e)) => {
+            let _ = embeds.borrow_mut().detach_embed(e);
+            *cur = None;
+            state.set(pergola::widgets::CredentialState::default());
+        }
+        _ => {}
+    }
+}
+
 /// "Connect to server" and the saved shares, for the manager's window.
 struct Network {
     media: std::path::PathBuf,
@@ -449,6 +483,8 @@ struct Network {
     embeds: Option<std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>>,
     /// Arca's password field, while the form shows it.
     cred_embed: Option<EmbedId>,
+    /// Arca's recovery-code field, while a stick's sheet asks for it.
+    rcode_embed: Option<EmbedId>,
     /// Quick look's viewer (opening-files.md §7), for this file.
     look_embed: Option<(std::path::PathBuf, EmbedId)>,
     /// The file read for the viewer, until it is handed over.
@@ -482,7 +518,7 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, look_embed: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
     }
@@ -663,27 +699,11 @@ impl Network {
         }
         // Arca's field: asked for when the form gets to the password, let go after.
         let wants_field = matches!(b.connect.as_ref().map(|f| &f.step), Some(Step::Password { .. }));
+        // Arca's recovery-code field: while a stick's sheet asks for the code.
+        let wants_code = matches!(b.stick_sheet.as_ref().map(|s| &s.ask), Some(scrinium::browser::StickAsk::Recovery { .. }));
         if let Some(embeds) = &self.embeds {
-            match (wants_field, self.cred_embed) {
-                (true, None) => {
-                    if let Some(token) = pane.win.embed_token() {
-                        let asked = embeds.borrow_mut().request("credential", token, pane.cred.slot_key());
-                        match asked {
-                            Ok(e) => {
-                                let _ = embeds.borrow_mut().send(e, pane.cred.configure().encode());
-                                self.cred_embed = Some(e);
-                            }
-                            Err(e) => eprintln!("scrinium: Arca's password field: {e:?}"),
-                        }
-                    }
-                }
-                (false, Some(e)) => {
-                    let _ = embeds.borrow_mut().detach_embed(e);
-                    self.cred_embed = None;
-                    pane.cred_state.set(pergola::widgets::CredentialState::default());
-                }
-                _ => {}
-            }
+            arca_slot(embeds, pane, wants_field, &mut self.cred_embed, false);
+            arca_slot(embeds, pane, wants_code, &mut self.rcode_embed, true);
             loop {
                 // Not zero: a zero read timeout is refused (EINVAL), and
                 // that lost limend, so the password field never came.
@@ -701,7 +721,14 @@ impl Network {
                             }
                         }
                     }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.rcode_embed => {
+                        if let Some(m) = limen::credential::ToParent::decode(&bytes) {
+                            pane.rcode.apply(m);
+                            changed = true;
+                        }
+                    }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.cred_embed => self.cred_embed = None,
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.rcode_embed => self.rcode_embed = None,
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if self.look_embed.as_ref().is_some_and(|(_, e)| *e == embed) => {
                         let (p, _) = self.look_embed.take().unwrap();
                         let words = look_words(&b);
@@ -737,6 +764,23 @@ impl Network {
             std::thread::spawn(move || {
                 let r = atrium_media::client::at_login(&media, &atrium_media::AtLogin { part: part.0.clone(), on: part.1 }).map(|m| m == "on").map_err(|(_, m)| m);
                 let _ = tx.send(Job::AtLogin(part.0, r, part.1.is_some()));
+            });
+        }
+        // A sealed stick's sheet: dispensatord, off this thread (arcad may
+        // wait for the person to verify).
+        if let Some(ask) = b.want_media.take() {
+            use scrinium::browser::MediaAsk;
+            changed = true;
+            let (media, tx) = (self.media.clone(), self.tx.clone());
+            std::thread::spawn(move || {
+                let eject = |part: String| atrium_media::Eject { part };
+                let r = match ask {
+                    MediaAsk::Format(f) => atrium_media::client::format(&media, &f),
+                    MediaAsk::Adopt { part, persona, keep, handle } => atrium_media::client::adopt(&media, &atrium_media::Adopt { part, persona, keep, code: String::new(), handle }),
+                    MediaAsk::OpenOlder(part) => atrium_media::client::open_older(&media, &eject(part)),
+                    MediaAsk::MakeCurrent(part) => atrium_media::client::make_current(&media, &eject(part)),
+                };
+                let _ = tx.send(Job::Media(r.map_err(|(_, m)| m)));
             });
         }
         // A file being opened: each step off this thread.
@@ -829,6 +873,13 @@ impl Network {
                     }
                     Err(e) => b.looked(&path, Err(e)),
                 },
+                Job::Media(r) => {
+                    // A code that didn't open it: type it again.
+                    if r.is_err() {
+                        pane.rcode_state.set(pergola::widgets::CredentialState::default());
+                    }
+                    b.media_done(r);
+                }
                 Job::AtLogin(part, r, set) => match r {
                     Ok(on) => {
                         b.at_login.insert(part, on);
@@ -943,6 +994,9 @@ fn main() {
         }
     };
     let mut pane = Pane::new(win, Mode::Manager);
+    if let Some(p) = std::env::var("SCRINIUM_PERSONA").ok().filter(|p| !p.is_empty() && p.len() <= 32 && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')) {
+        with(&pane.state, |b| b.persona = p);
+    }
     let mut opened = std::env::var("SCRINIUM_OPEN").ok();
     let mut net = Network::new(&mut pane, media_sock.clone());
     if let Err(e) = pane.win.paint(&mut pane.app) {

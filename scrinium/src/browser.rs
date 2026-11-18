@@ -28,6 +28,83 @@ pub struct Place {
     /// A share whose server can't be reached just now (S4): its server
     /// keeps the mount and connects again on its own.
     pub offline: bool,
+    /// A sealed stick (tessera-encryption.md §7): whose, and what it needs.
+    pub seal: Seal,
+}
+
+/// A sealed stick's state, as dispensatord lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Seal {
+    /// The persona whose key opened it (its chip); empty for a stick that
+    /// isn't sealed, or one Locked with no owner known.
+    pub persona: String,
+    /// Sealed with a key this session doesn't hold: listed, not mounted,
+    /// nothing on it read (§7.2 step 4).
+    pub locked: bool,
+    /// Locked, with a recovery slot: "Enter recovery code" opens it.
+    pub recovery: bool,
+    /// The person's, but older than the last time it was used here (§8):
+    /// while Locked, "Open read-only?"; once open, "Use this copy as
+    /// current".
+    pub older: bool,
+}
+
+impl Place {
+    /// A place whose files can be listed in this window: not a Locked
+    /// stick, nor another persona's (its own windows get it).
+    pub fn browsable(&self, persona: &str) -> bool {
+        !self.seal.locked && (self.seal.persona.is_empty() || self.seal.persona == persona)
+    }
+}
+
+/// The capitalised name of a persona, for words ("work" → "Work").
+pub fn persona_name(p: &str) -> String {
+    let mut c = p.chars();
+    c.next().map(|f| f.to_uppercase().to_string() + c.as_str()).unwrap_or_default()
+}
+
+/// A sheet about one stick (tessera-encryption.md §7, §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickSheet {
+    pub part: String,
+    /// What the sidebar calls it.
+    pub label: String,
+    pub ask: StickAsk,
+    /// Asked of dispensatord; waiting for its answer.
+    pub busy: bool,
+    /// What went wrong last, shown on the sheet.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StickAsk {
+    /// "Make this a Work stick" / "Encrypt this stick": erase it and seal
+    /// it for `persona`, with a recovery code or not (§7.1, §7.4).
+    Format { persona: String, recovery: bool },
+    /// The recovery code it was made with, shown once.
+    Code { code: String },
+    /// A Locked stick: what it is, and what can be done with it.
+    Locked,
+    /// "Enter recovery code": typed into Arca's field, never Scrinium's.
+    /// `keep` stores its key in this persona ("Keep on this machine").
+    Recovery { keep: bool },
+    /// "This stick is older than the last time it was used here. Open
+    /// read-only?"
+    Older,
+    /// "Use this copy as current?"
+    MakeCurrent,
+}
+
+/// What the app asks dispensatord for, off the window's thread (arcad
+/// may wait on user verification).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaAsk {
+    Format(atrium_media::Format),
+    /// The recovery code is the handle Arca's field gave; dispensatord has
+    /// arcad redeem it.
+    Adopt { part: String, persona: String, keep: bool, handle: [u8; 16] },
+    OpenOlder(String),
+    MakeCurrent(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +212,14 @@ pub struct Browser {
     /// answers [`Browser::looked`].
     pub look: Option<Look>,
     pub want_look: Option<PathBuf>,
+    /// Whose window this is (`SCRINIUM_PERSONA`, "personal" by default):
+    /// the sticks it makes are this persona's, and another persona's
+    /// sticks are shown, not opened.
+    pub persona: String,
+    pub stick_sheet: Option<StickSheet>,
+    /// A stick sheet's button: the app asks dispensatord and answers
+    /// [`Browser::media_done`].
+    pub want_media: Option<MediaAsk>,
 }
 
 /// The quick look pane.
@@ -311,6 +396,9 @@ impl Browser {
             open_sheet: None,
             look: None,
             want_look: None,
+            persona: "personal".into(),
+            stick_sheet: None,
+            want_media: None,
         }
     }
 
@@ -327,7 +415,8 @@ impl Browser {
 
     /// The open folder's path in Scrinium's jail.
     pub fn dir(&self) -> Option<PathBuf> {
-        fs::join(&self.place()?.root, &self.path).ok()
+        let p = self.place().filter(|p| p.browsable(&self.persona))?;
+        fs::join(&p.root, &self.path).ok()
     }
 
     fn read_only(&self) -> bool {
@@ -935,6 +1024,133 @@ impl Browser {
         }
     }
 
+    // -- sealed sticks (tessera-encryption.md §7, §8) -----------------------
+
+    fn sheet_for(&self, i: usize, ask: StickAsk) -> Option<StickSheet> {
+        let p = self.places.get(i).filter(|p| p.stick && !p.network)?;
+        (self.picker().is_none()).then(|| StickSheet { part: p.id.clone(), label: p.label.clone(), ask, busy: false, error: None })
+    }
+
+    /// "Make this a Work stick" (or "Encrypt this stick" for Personal):
+    /// the sheet that says what will be erased. A recovery code is on by
+    /// default for Personal only (§7.4).
+    pub fn ask_format(&mut self, i: usize) {
+        let persona = self.persona.clone();
+        let recovery = persona == "personal";
+        self.stick_sheet = self.sheet_for(i, StickAsk::Format { persona, recovery });
+    }
+
+    /// The words for the format action in this window.
+    pub fn format_words(&self) -> String {
+        if self.persona == "personal" { "Encrypt this stick".into() } else { format!("Make this a {} stick", persona_name(&self.persona)) }
+    }
+
+    pub fn toggle_recovery(&mut self) {
+        if let Some(StickSheet { ask: StickAsk::Format { recovery, .. }, busy: false, .. }) = &mut self.stick_sheet {
+            *recovery = !*recovery;
+        }
+    }
+
+    /// The Locked sheet, the older-copy question, or "Use this copy as
+    /// current": what a press on a sealed stick that can't be browsed (or
+    /// on the banner of an older copy) asks.
+    pub fn ask_about(&mut self, i: usize) {
+        let Some(p) = self.places.get(i) else { return };
+        let ask = match (&p.seal, p.read_only) {
+            (s, _) if s.locked && s.older => StickAsk::Older,
+            (s, _) if s.locked => StickAsk::Locked,
+            (s, true) if s.older => StickAsk::MakeCurrent,
+            _ => return,
+        };
+        self.stick_sheet = self.sheet_for(i, ask);
+    }
+
+    /// From the Locked sheet: type the recovery code.
+    pub fn ask_recovery(&mut self) {
+        let Some(sh) = &mut self.stick_sheet else { return };
+        let has = self.places.iter().any(|p| p.id == sh.part && p.seal.locked && p.seal.recovery);
+        if has && !sh.busy {
+            sh.ask = StickAsk::Recovery { keep: true };
+            sh.error = None;
+        }
+    }
+
+    /// From the Locked sheet: "Erase and format".
+    pub fn ask_erase(&mut self) {
+        let Some(i) = self.stick_sheet.as_ref().filter(|s| !s.busy).and_then(|s| self.places.iter().position(|p| p.id == s.part)) else { return };
+        self.ask_format(i);
+    }
+
+    pub fn toggle_keep(&mut self) {
+        if let Some(StickSheet { ask: StickAsk::Recovery { keep }, busy: false, .. }) = &mut self.stick_sheet {
+            *keep = !*keep;
+        }
+    }
+
+    /// The sheet's main button. For the recovery code, `handle` is what
+    /// Arca's field gave for what was typed (`None`: nothing typed yet).
+    pub fn confirm_stick(&mut self, handle: Option<[u8; 16]>) {
+        let persona = self.persona.clone();
+        let Some(sh) = self.stick_sheet.as_mut().filter(|s| !s.busy) else { return };
+        let ask = match &sh.ask {
+            StickAsk::Format { persona, recovery } => MediaAsk::Format(atrium_media::Format { part: sh.part.clone(), persona: persona.clone(), label: sh.label.clone(), recovery: *recovery }),
+            StickAsk::Recovery { keep } => match handle {
+                Some(h) => MediaAsk::Adopt { part: sh.part.clone(), persona, keep: *keep, handle: h },
+                None => {
+                    sh.error = Some("Type the recovery code in the field first".into());
+                    return;
+                }
+            },
+            StickAsk::Older => MediaAsk::OpenOlder(sh.part.clone()),
+            StickAsk::MakeCurrent => MediaAsk::MakeCurrent(sh.part.clone()),
+            StickAsk::Code { .. } | StickAsk::Locked => {
+                self.stick_sheet = None;
+                return;
+            }
+        };
+        sh.busy = true;
+        sh.error = None;
+        self.want_media = Some(ask);
+    }
+
+    pub fn close_stick_sheet(&mut self) {
+        if !self.stick_sheet.as_ref().is_some_and(|s| s.busy) {
+            self.stick_sheet = None;
+        }
+    }
+
+    /// dispensatord's answer to [`Browser::want_media`]. A format that
+    /// made a recovery code shows it, once.
+    pub fn media_done(&mut self, r: Result<String, String>) {
+        let Some(sh) = self.stick_sheet.as_mut().filter(|s| s.busy) else { return };
+        sh.busy = false;
+        match r {
+            Err(e) => sh.error = Some(e),
+            Ok(m) => {
+                let code = m.split_once("recovery code ").map(|(_, c)| c.trim().to_string()).filter(|c| !c.is_empty());
+                let (label, ask) = (sh.label.clone(), sh.ask.clone());
+                match (ask, code) {
+                    (StickAsk::Format { .. }, Some(code)) => {
+                        sh.ask = StickAsk::Code { code };
+                        sh.error = None;
+                    }
+                    (ask, _) => {
+                        self.stick_sheet = None;
+                        let words = match ask {
+                            StickAsk::Format { persona, .. } if persona == "personal" => format!("{label} is encrypted"),
+                            StickAsk::Format { persona, .. } => format!("{label} is now a {} stick", persona_name(&persona)),
+                            StickAsk::Recovery { .. } => format!("{label} is open"),
+                            StickAsk::Older => format!("{label} is open read-only"),
+                            StickAsk::MakeCurrent => format!("{label} is now the current copy"),
+                            _ => String::new(),
+                        };
+                        self.say(words, false);
+                    }
+                }
+            }
+        }
+    }
+
     // -- the picker ----------------------------------------------------------
 
     /// The pick the Choose button would make now, if any.
@@ -1036,7 +1252,7 @@ mod tests {
         std::fs::write(d.join("Docs/note.txt"), "a note").unwrap();
         std::fs::write(d.join("Docs/plan.md"), "a plan").unwrap();
         std::fs::write(d.join("hello.txt"), "hello").unwrap();
-        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29, network: false, offline: false };
+        let p = Place { id: "da0s1".into(), label: "USB stick".into(), root: d.clone(), stick: true, read_only: false, size: 1 << 30, free: 1 << 29, network: false, offline: false, seal: Default::default() };
         (d, p)
     }
 
@@ -1381,6 +1597,77 @@ mod tests {
         std::fs::remove_file(d.join("hello.txt")).unwrap();
         b.reload();
         assert!(b.look.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sealed_sticks_ask_dispensatord_only_through_their_sheets() {
+        let (d, p) = stick("sealed");
+        let mut b = Browser::new(Mode::Manager);
+        let locked = Place { seal: Seal { locked: true, recovery: true, ..Default::default() }, ..p.clone() };
+        let older = Place { id: "da1s1".into(), seal: Seal { persona: "personal".into(), locked: true, older: true, ..Default::default() }, ..p.clone() };
+        let theirs = Place { id: "da2s1".into(), seal: Seal { persona: "work".into(), ..Default::default() }, ..p.clone() };
+        b.set_places(vec![locked, older, theirs, p.clone()]);
+        // Nothing on a Locked stick is read, nor on another persona's.
+        assert!(b.entries.is_empty() && b.dir().is_none());
+        b.open_place(2);
+        assert!(b.entries.is_empty() && b.dir().is_none());
+        b.persona = "work".into();
+        b.reload();
+        assert!(!b.entries.is_empty(), "its own persona's window lists it");
+        b.persona = "personal".into();
+
+        // The recovery code: only a handle from Arca's field, never text.
+        b.ask_about(0);
+        assert_eq!(b.stick_sheet.as_ref().map(|s| s.ask.clone()), Some(StickAsk::Locked));
+        b.ask_recovery();
+        b.confirm_stick(None);
+        assert!(b.want_media.is_none());
+        assert!(b.stick_sheet.as_ref().unwrap().error.is_some());
+        b.toggle_keep();
+        b.confirm_stick(Some([5; 16]));
+        assert_eq!(b.want_media.take(), Some(MediaAsk::Adopt { part: "da0s1".into(), persona: "personal".into(), keep: false, handle: [5; 16] }));
+        b.close_stick_sheet();
+        assert!(b.stick_sheet.is_some(), "not while dispensatord is asked");
+        b.media_done(Err("that isn't this stick's recovery code".into()));
+        assert_eq!(b.stick_sheet.as_ref().unwrap().error.as_deref(), Some("that isn't this stick's recovery code"));
+        b.confirm_stick(Some([6; 16]));
+        b.media_done(Ok("da0s1 opened for personal".into()));
+        assert!(b.stick_sheet.is_none());
+        assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("USB stick is open"));
+
+        // An older copy: open read-only, then make it current.
+        b.ask_about(1);
+        b.confirm_stick(None);
+        assert_eq!(b.want_media.take(), Some(MediaAsk::OpenOlder("da1s1".into())));
+        b.media_done(Ok(String::new()));
+        let opened = Place { id: "da1s1".into(), read_only: true, seal: Seal { persona: "personal".into(), older: true, ..Default::default() }, ..p.clone() };
+        b.set_places(vec![opened]);
+        b.ask_about(0);
+        b.confirm_stick(None);
+        assert_eq!(b.want_media.take(), Some(MediaAsk::MakeCurrent("da1s1".into())));
+
+        // Format: this window's persona; a recovery code by default only for Personal.
+        b.media_done(Ok(String::new()));
+        b.ask_format(0);
+        assert_eq!(b.format_words(), "Encrypt this stick");
+        b.confirm_stick(None);
+        assert_eq!(b.want_media.take(), Some(MediaAsk::Format(atrium_media::Format { part: "da1s1".into(), persona: "personal".into(), label: "USB stick".into(), recovery: true })));
+        b.media_done(Ok("da1s1 is now personal's sealed stick; recovery code AAAAA-BBBBB".into()));
+        assert_eq!(b.stick_sheet.as_ref().map(|s| s.ask.clone()), Some(StickAsk::Code { code: "AAAAA-BBBBB".into() }));
+        b.confirm_stick(None);
+        assert!(b.stick_sheet.is_none() && b.want_media.is_none(), "the code's sheet only closes");
+        b.persona = "work".into();
+        assert_eq!(b.format_words(), "Make this a Work stick");
+        b.ask_format(0);
+        assert_eq!(b.stick_sheet.as_ref().map(|s| s.ask.clone()), Some(StickAsk::Format { persona: "work".into(), recovery: false }));
+
+        // A picker offers none of it.
+        let mut pk = picker(Filter { kind: Kind::Folder, ..Filter::file() });
+        pk.set_places(vec![Place { seal: Seal { locked: true, recovery: true, ..Default::default() }, ..p.clone() }]);
+        pk.ask_format(0);
+        pk.ask_about(0);
+        assert!(pk.stick_sheet.is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

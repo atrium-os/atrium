@@ -77,8 +77,8 @@ struct ColorPage {
     dirty: Option<(u32, u32, u32, u32)>,
 }
 
-const COLOR_W: u32 = fresco_protocol::COLOR_ATLAS_W;
-const COLOR_H: u32 = fresco_protocol::COLOR_ATLAS_H;
+const COLOR_W: u32 = fresco_protocol::color_atlas_dims(ATLAS_W, ATLAS_H).0;
+const COLOR_H: u32 = fresco_protocol::color_atlas_dims(ATLAS_W, ATLAS_H).1;
 
 impl ColorPage {
     fn new(slot_id: u32) -> Self {
@@ -1170,7 +1170,7 @@ mod tests {
         assert!(t.fonts[&font].color, "{items:?}");
         let (slot, w, px) = rgba[0];
         assert_eq!(slot, fresco_protocol::color_atlas_slot(run.atlas_slot_id));
-        assert_eq!(w, fresco_protocol::COLOR_ATLAS_W);
+        assert_eq!(w, fresco_protocol::color_atlas_dims(run.atlas_width, run.atlas_height).0);
         // Something coloured was drawn: a texel whose channels differ.
         assert!(px.chunks(4).any(|p| p[3] > 0 && (p[0] != p[1] || p[1] != p[2])));
         // A second run reuses the page and uploads nothing new for 😀.

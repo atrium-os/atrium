@@ -453,7 +453,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
             println!("error malformed: keep or once");
             return ExitCode::FAILURE;
         }
-        return answer(atrium_media::client::adopt(sock, &atrium_media::Adopt { part: part.into(), persona: persona.into(), keep: keep == "keep", code: code.trim().into() }));
+        return answer(atrium_media::client::adopt(sock, &atrium_media::Adopt { part: part.into(), persona: persona.into(), keep: keep == "keep", code: code.trim().into(), handle: [0; 16] }));
     }
     if let Some(rest) = cmd.strip_prefix("at-login ") {
         let (part, on) = rest.split_once(' ').unwrap_or((rest, "ask"));
@@ -2756,7 +2756,8 @@ mod run {
                 return (mstatus::NOT_FOUND, format!("{} has no recovery code", a.part));
             };
             let keep = if a.keep { "keep" } else { "once" };
-            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&a.code)) {
+            let code = if a.handle == [0; 16] { a.code.clone() } else { format!("held:{}", hex(&a.handle)) };
+            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
                 Ok(_) => {}
                 Err(st) if st == arca::DENIED => return (mstatus::NOT_ALLOWED, "that isn't this stick's recovery code".into()),
                 Err(st) if st == arca::MALFORMED => return (mstatus::MALFORMED, "that isn't a recovery code: check it for typos".into()),

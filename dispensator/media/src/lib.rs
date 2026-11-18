@@ -112,7 +112,12 @@ pub struct Adopt {
     pub part: String,
     pub persona: String,
     pub keep: bool,
+    /// The code as typed (root's command line); empty when `handle` is set.
     pub code: String,
+    /// What Arca's recovery-code field gave the app for what was typed
+    /// into it (zero: none). The app never sees the code; arcad redeems
+    /// the handle.
+    pub handle: [u8; 16],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,7 +344,8 @@ pub mod server {
                 return (status::NOT_ALLOWED, "only the session's user may open a stick".into());
             }
             let ok = |s: &str, max: usize| !s.is_empty() && s.len() <= max && !s.contains('\n') && !s.contains('\0');
-            if !ok(&a.part, 32) || !ok(&a.persona, 64) || !ok(&a.code, 64) {
+            let code_ok = if a.handle == [0; 16] { ok(&a.code, 64) } else { a.code.is_empty() };
+            if !ok(&a.part, 32) || !ok(&a.persona, 64) || !code_ok {
                 return (status::MALFORMED, "malformed".into());
             }
             if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == a.part && v.locked && v.recovery) {
@@ -922,12 +928,15 @@ mod tests {
         let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
         let locked = |p: &str, recovery: bool| Volume { mountpoint: String::new(), locked: true, recovery, ..vol(p) };
         shared.update(vec![vol("da0p1"), locked("da1p1", true), locked("da2p1", false)], &[]);
-        let a = |part: &str| Adopt { part: part.into(), persona: "personal".into(), keep: true, code: "ABCDE".into() };
+        let a = |part: &str| Adopt { part: part.into(), persona: "personal".into(), keep: true, code: "ABCDE".into(), handle: [0; 16] };
         assert_eq!(shared.adopt(1000, &a("da1p1")).0, status::OK);
         assert_eq!(shared.adopt(2000, &a("da1p1")).0, status::NOT_ALLOWED);
         assert_eq!(shared.adopt(1000, &a("da0p1")).0, status::NOT_FOUND, "not Locked");
         assert_eq!(shared.adopt(1000, &a("da2p1")).0, status::NOT_FOUND, "no slot");
         assert_eq!(shared.adopt(1000, &Adopt { code: String::new(), ..a("da1p1") }).0, status::MALFORMED);
+        // A handle from Arca's field instead of the code, never both.
+        assert_eq!(shared.adopt(1000, &Adopt { code: String::new(), handle: [7; 16], ..a("da1p1") }).0, status::OK);
+        assert_eq!(shared.adopt(1000, &Adopt { handle: [7; 16], ..a("da1p1") }).0, status::MALFORMED);
     }
 
     #[test]
