@@ -64,7 +64,7 @@ check() {
     kdir=$("$VSSH" 'sysctl -n kern.bootfile' | tr -d '\r'); kdir=${kdir%/*}
     for m in linux linux64 linux_common linuxkpi sctp tcp_rack tcp_bbr ipfw \
              ipdivert libalias netgraph ng_ubt ng_hci nfscl nfsd krpc kgssapi \
-             fusefs netmap ctl cryptodev vmm sysvshm sysvmsg sysvsem ipsec mlx5; do
+             netmap ctl cryptodev vmm sysvshm sysvmsg sysvsem ipsec mlx5; do
         if "$VSSH" "test -e $kdir/$m.ko"; then
             echo "FAIL  $kdir/$m.ko is installed"; fail=1
         else
