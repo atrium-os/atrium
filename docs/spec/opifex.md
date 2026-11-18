@@ -795,8 +795,21 @@ font on demand and a driver from a `nobody` device's notice.
   approval).
 - SDK registry: as the toolchains thread built it; the catalog repo's publish step runs
   `cargo atrium registry verify sdk --keys keys/platform` before copying it to Pages (§14.5).
-- Not yet: a VM gate (a CJK font from the catalog drawn by frescod; a driver offered for a
-  `nobody` USB device and installed); the notice opening Curia's install page for a driver
+- VM gate `scripts/vm-opifex-c6-check.sh` (boot with `QEMU_EXTRA="-device qemu-xhci"`) on
+  the Mac VM (arm64) 2026-11-18: **0 failed** (31 checks): a font package's pin line, the
+  library's kana fallback to it and its mapping, a changed file refused, removal; a catalog
+  layer; devices.idx, dispensatord offering the catalog driver for a hot-plugged QEMU MTP
+  device (46f4:0004); the driver installed with its firmware, its rule loaded and taking the
+  device after a restart, the offer gone; uninstall. The driver's jail itself was refused by
+  jaild (`devfs_ruleset 30 not in policy`): jaild pins each ruleset to named jails and
+  binaries, and a catalog driver can't add to jaild's policy. **Open:** how a catalog driver
+  gets a devfs ruleset and its uid into jaild's policy (a per-package policy fragment
+  checked like `devices.d`, or a generic driver ruleset); until then only drivers whose
+  jail the base policy already names can run.
+- opifex checks a driver's `devices.d` file together with the installed ones through
+  `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
+- Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
+  frescod with an installed package; the gate checks the library); the notice opening Curia's install page for a driver
   (it names the command for now); PCI devices in the lookup (dispensatord sees USB and HID
   only); the driver jails' uids in jaild's policy are the package's to have accepted at review
   (§10.2), not checked by the installer.
