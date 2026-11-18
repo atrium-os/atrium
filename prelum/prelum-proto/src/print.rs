@@ -9,6 +9,7 @@
 //! | `REPIN` 0x04 | postcard `u32` | postcard [`Printer`] with its new identity, or a `String`: "Use the new identity" (§7.3) |
 //! | `IDENTIFY` 0x05 | postcard `u32` | postcard `String` |
 //! | `REFRESH` 0x06 | postcard `u32` | postcard [`Printer`]: asked again now |
+//! | `NEARBY` 0x07 | postcard `u8`: seconds to listen (at most 10) | postcard `Vec<Nearby>`: printers found by mDNS and confirmed over IPP (§7.1) |
 //! | `PRINT` 0x10 | postcard [`Print`], the PDF as the message's one descriptor | postcard `u64` (the job) or a `String` |
 //! | `JOBS` 0x11 | empty | postcard `Vec<Job>` |
 //! | `CANCEL` 0x12 | postcard `u64` | postcard `String` |
@@ -33,6 +34,7 @@ pub mod op {
     pub const REPIN: u16 = 0x04;
     pub const IDENTIFY: u16 = 0x05;
     pub const REFRESH: u16 = 0x06;
+    pub const NEARBY: u16 = 0x07;
     pub const PRINT: u16 = 0x10;
     pub const JOBS: u16 = 0x11;
     pub const CANCEL: u16 = 0x12;
@@ -100,6 +102,28 @@ pub struct Printer {
 pub struct Changed {
     pub fingerprint: Option<String>,
     pub uuid: Option<String>,
+}
+
+/// A printer found on the LAN (§7.1), as the printer itself described it
+/// when asked over IPP; multicast only said where to ask.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nearby {
+    /// What to `ADD`: `ipps://address:port/path` (or `ipp://`).
+    pub uri: String,
+    /// The printer's `printer-info`, or its model, or the mDNS name.
+    pub name: String,
+    pub make_and_model: String,
+    pub location: String,
+    /// The name it announced over mDNS (cut and cleaned).
+    pub announced: String,
+    pub tls: bool,
+    /// Its TLS key's fingerprint, IPPS only.
+    pub fingerprint: Option<String>,
+    pub uuid: Option<String>,
+    pub color: bool,
+    pub duplex: bool,
+    /// One of this person's saved printers, with the same identity.
+    pub saved: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +288,9 @@ pub mod client {
         }
         pub fn refresh(&mut self, id: u32) -> Res<Printer> {
             self.call(op::REFRESH, &Self::enc(&id), None)
+        }
+        pub fn nearby(&mut self, seconds: u8) -> Res<Vec<Nearby>> {
+            self.call(op::NEARBY, &Self::enc(&seconds), None)
         }
         pub fn print(&mut self, p: &Print, pdf: &dyn AsRawFd) -> Res<u64> {
             self.call(op::PRINT, &Self::enc(p), Some(pdf))

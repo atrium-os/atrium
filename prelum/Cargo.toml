@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["prelum-ipp-codec", "prelum-dnssd", "prelum-raster", "prelum-render", "prelum-proto", "prelum-ipp", "prelumd"]
+members = ["prelum-ipp-codec", "prelum-dnssd", "prelum-raster", "prelum-render", "prelum-proto", "prelum-ipp", "prelum-browse", "prelumd"]
 
 [workspace.package]
 edition = "2021"

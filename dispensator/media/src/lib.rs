@@ -16,6 +16,7 @@
 //! | `CONNECT` 0x07 | postcard [`Connect`] | `u8 status`, then postcard `String`: the share's `part` (`share-<uid>`), or why not. The file manager connects a network share it saved in Arca (network-shares.md §6.1); `EJECT` of that part disconnects |
 //! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; SMB, `smb 3.1.1 <cipher>`, the fingerprint of the server's GUID, `guid <text>`; or why not (a server below the SMB floor: why) |
 //! | `FORMAT` 0x0A | postcard [`Format`] | `u8 status`, then postcard `String`: erase a stick and make it a sealed one for a persona (tessera-encryption.md §7.1); the key never leaves Arca and the kernel |
+//! | `ADOPT` 0x0B | postcard [`Adopt`] | `u8 status`, then postcard `String`: open a Locked stick with its recovery code (tessera-encryption.md §7.4); arcad unwraps its key, keeps it in the persona or loads it for this session only |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -43,6 +44,7 @@ pub mod op {
     /// Whether a connected share comes back at login, asked or set.
     pub const AT_LOGIN: u16 = 0x09;
     pub const FORMAT: u16 = 0x0A;
+    pub const ADOPT: u16 = 0x0B;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -77,6 +79,8 @@ pub struct Volume {
     /// A sealed stick this session holds no key for: shown, not mounted
     /// (`mountpoint` empty). It can be erased with `FORMAT`.
     pub locked: bool,
+    /// A Locked stick with a recovery slot: `ADOPT` can open it.
+    pub recovery: bool,
 }
 
 /// Erase `part` and make it a sealed stick for `persona` (root or the
@@ -86,6 +90,20 @@ pub struct Format {
     pub part: String,
     pub persona: String,
     pub label: String,
+    /// Also make a recovery code (§7.4): the reply's message carries it,
+    /// to be shown once.
+    pub recovery: bool,
+}
+
+/// Open the Locked stick `part` with its recovery `code`, as `persona`'s:
+/// `keep` stores its key in that persona ("Keep on this machine"),
+/// otherwise it's loaded for this session only. The session's user only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopt {
+    pub part: String,
+    pub persona: String,
+    pub keep: bool,
+    pub code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +243,9 @@ pub mod server {
         fn at_login(&self, uid: u32, a: &AtLogin) -> (u8, String);
         /// Erase and seal a stick (checked here: who, and the request).
         fn format(&self, f: &Format) -> (u8, String);
+        /// Open a Locked stick with its recovery code (checked here: who,
+        /// the request, and that it's listed Locked with a slot).
+        fn adopt(&self, a: &Adopt) -> (u8, String);
     }
 
     pub struct Shared {
@@ -294,6 +315,22 @@ pub mod server {
                 return (status::MALFORMED, "malformed".into());
             }
             self.host.format(f)
+        }
+
+        /// The same rule as format; the stick must be listed Locked with a
+        /// recovery slot.
+        pub fn adopt(&self, uid: u32, a: &Adopt) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may open a stick".into());
+            }
+            let ok = |s: &str, max: usize| !s.is_empty() && s.len() <= max && !s.contains('\n') && !s.contains('\0');
+            if !ok(&a.part, 32) || !ok(&a.persona, 64) || !ok(&a.code, 64) {
+                return (status::MALFORMED, "malformed".into());
+            }
+            if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == a.part && v.locked && v.recovery) {
+                return (status::NOT_FOUND, format!("{} is not a Locked stick with a recovery code", a.part));
+            }
+            self.host.adopt(a)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -438,6 +475,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::FORMAT, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::ADOPT => {
+                    let (st, msg) = match postcard::from_bytes::<Adopt>(&m.payload) {
+                        Ok(a) => shared.adopt(uid, &a),
+                        Err(_) => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::ADOPT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -513,6 +557,10 @@ pub mod client {
 
     pub fn format(sock: &Path, f: &Format) -> Result<String, (u8, String)> {
         status_call(sock, op::FORMAT, f)
+    }
+
+    pub fn adopt(sock: &Path, a: &Adopt) -> Result<String, (u8, String)> {
+        status_call(sock, op::ADOPT, a)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -653,10 +701,13 @@ mod tests {
         fn format(&self, f: &Format) -> (u8, String) {
             (status::OK, format!("{} sealed for {}", f.part, f.persona))
         }
+        fn adopt(&self, a: &Adopt) -> (u8, String) {
+            (status::OK, format!("{} opened for {}", a.part, a.persona))
+        }
     }
 
     fn vol(p: &str) -> Volume {
-        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new(), persona: String::new(), locked: false }
+        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new(), persona: String::new(), locked: false, recovery: false }
     }
 
     /// Over a real socket: list, subscribe, eject, a session change.
@@ -795,11 +846,24 @@ mod tests {
     fn format_is_the_session_users_or_roots() {
         let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
         shared.update(vec![vol("da0p1"), Volume { mountpoint: String::new(), locked: true, ..vol("da1p1") }], &[]);
-        let f = |part: &str| Format { part: part.into(), persona: "work".into(), label: "Work stick".into() };
+        let f = |part: &str| Format { part: part.into(), persona: "work".into(), label: "Work stick".into(), recovery: false };
         assert_eq!(shared.format(1000, &f("da0p1")).0, status::OK);
         assert_eq!(shared.format(0, &f("da1p1")).0, status::OK, "a locked stick can be erased");
         assert_eq!(shared.format(2000, &f("da0p1")).0, status::NOT_ALLOWED);
         assert_eq!(shared.format(1000, &Format { persona: String::new(), ..f("da0p1") }).0, status::MALFORMED);
         assert_eq!(shared.format(1000, &f("share-1001")).0, status::MALFORMED);
+    }
+
+    #[test]
+    fn adopt_needs_a_locked_stick_with_a_slot() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        let locked = |p: &str, recovery: bool| Volume { mountpoint: String::new(), locked: true, recovery, ..vol(p) };
+        shared.update(vec![vol("da0p1"), locked("da1p1", true), locked("da2p1", false)], &[]);
+        let a = |part: &str| Adopt { part: part.into(), persona: "personal".into(), keep: true, code: "ABCDE".into() };
+        assert_eq!(shared.adopt(1000, &a("da1p1")).0, status::OK);
+        assert_eq!(shared.adopt(2000, &a("da1p1")).0, status::NOT_ALLOWED);
+        assert_eq!(shared.adopt(1000, &a("da0p1")).0, status::NOT_FOUND, "not Locked");
+        assert_eq!(shared.adopt(1000, &a("da2p1")).0, status::NOT_FOUND, "no slot");
+        assert_eq!(shared.adopt(1000, &Adopt { code: String::new(), ..a("da1p1") }).0, status::MALFORMED);
     }
 }

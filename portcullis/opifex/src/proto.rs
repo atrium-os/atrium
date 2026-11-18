@@ -79,3 +79,16 @@ pub enum Response {
     Ok,
     Error { message: String },
 }
+
+/// Ask opifexd (`OPIFEX_SOCKET`, else [`SOCKET`]) one thing.
+pub fn ask(req: &Request) -> Result<Response, String> {
+    use std::io::{BufRead, Write};
+    let sock = std::env::var("OPIFEX_SOCKET").unwrap_or_else(|_| SOCKET.into());
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("opifexd ({sock}): {e}"))?;
+    let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
+    line.push('\n');
+    s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    std::io::BufReader::new(s).read_line(&mut out).map_err(|e| e.to_string())?;
+    serde_json::from_str::<Response>(out.trim()).map_err(|e| format!("opifexd: {e}"))
+}

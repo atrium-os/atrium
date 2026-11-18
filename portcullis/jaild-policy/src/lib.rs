@@ -224,15 +224,19 @@ impl ShareServerPolicy {
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md
 /// §6.1, §6.3), named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
 /// running exactly `render_exec` (no network) or `ipp_exec` (a routed vnet
-/// whose grants name only printer addresses and ports) as that uid. Either
-/// takes its caller's stdio, prelumd's socket (and the job's document);
-/// nothing else beyond an ordinary service.
+/// whose grants name only printer addresses and ports) or `browse_exec` (no
+/// network; it is handed atrium-net's mDNS sockets over its stdio) as that
+/// uid. Each takes its caller's stdio, prelumd's socket (and the job's
+/// document); nothing else beyond an ordinary service.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrintWorkerPolicy {
     pub name_prefix: String,
     pub render_exec: String,
     pub ipp_exec:    String,
+    /// Absent: no browse worker (policy files from before printing R3).
+    #[serde(default)]
+    pub browse_exec: Option<String>,
     pub uid_first:   u32,
     pub uid_last:    u32,
 }

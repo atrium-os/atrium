@@ -37,12 +37,15 @@ pub const JAILS_DIR: &str = "/var/lib/atrium/jails";
 pub const NAME_PREFIX: &str = "system-prelum-";
 pub const RENDER_EXEC: &str = "/usr/local/bin/atrium-prelum-render";
 pub const IPP_EXEC: &str = "/usr/local/bin/atrium-prelum-ipp";
+pub const BROWSE_EXEC: &str = "/usr/local/bin/atrium-prelum-browse";
 pub const UID_FIRST: u32 = 62000;
 pub const UID_LAST: u32 = 62499;
 /// The app devfs ruleset (portcullis_jail::APP_DEVFS_RULESET).
 const DEVFS_RULESET: u32 = 22;
 /// prelum-render's memory cap (§6.1: 1 GB by default).
 const RENDER_MEMORY_MB: u64 = 1024;
+/// prelum-browse's: its cache is a few hundred small entries.
+const BROWSE_MEMORY_MB: u64 = 64;
 
 pub fn name(uid: u32) -> String {
     format!("{NAME_PREFIX}{uid}")
@@ -153,6 +156,22 @@ impl Launcher for Jailed {
         let mac = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(e.to_string()))?.mac;
         let err = io::stderr();
         let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants) }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None);
+        drop(theirs);
+        match r {
+            Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),
+            Err(e) => {
+                self.give_back(uid);
+                Err(e)
+            }
+        }
+    }
+
+    fn browse(&self, args: &[String]) -> io::Result<Proc> {
+        let uid = self.take()?;
+        let (ours, theirs) = UnixStream::pair()?;
+        let err = io::stderr();
+        let rctl = self.rctl.then(|| RctlLimits { memoryuse_mb: Some(BROWSE_MEMORY_MB), pcpu: Some(25) });
+        let r = self.start(uid, BROWSE_EXEC, args, NetworkConfig::Disable, "renderer", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], rctl);
         drop(theirs);
         match r {
             Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),

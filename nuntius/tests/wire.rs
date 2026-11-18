@@ -98,3 +98,24 @@ fn a_post_carries_a_bounded_body_and_nothing_else_does() {
         assert_eq!(Request::decode(&Request::Open(o).encode()), None, "{why}");
     }
 }
+
+#[test]
+fn lookups_and_records_on_the_wire() {
+    let l = Request::Lookup(Lookup { id: 9, name: "sel._domainkey.example.com".into(), kind: RecordKind::Txt });
+    assert_eq!(Request::decode(&l.encode()), Some(l));
+    for bad in ["example", "a..example", "-x.example.", "a b.example", &format!("{}.example", "a".repeat(64))] {
+        let r = Request::Lookup(Lookup { id: 1, name: bad.into(), kind: RecordKind::Mx });
+        assert_eq!(Request::decode(&r.encode()), None, "{bad}");
+    }
+    let recs = vec![Record::Txt("v=DKIM1; k=ed25519; p=abc".into()), Record::Srv { priority: 0, weight: 5, port: 993, target: "imap.example.com".into() },
+                    Record::Mx { preference: 10, host: "mx.example.com".into() }];
+    let (w, _) = WireEvent::from_event(Event::Records { id: 9, records: recs.clone(), secure: true });
+    let back = WireEvent::decode(&w.encode()).unwrap().into_event(None).unwrap();
+    assert!(matches!(&back, Event::Records { id: 9, records, secure: true } if *records == recs));
+    assert!(back.is_last());
+    // Too many, or too long, from a fetcher: refused whole by the client.
+    let many = WireEvent::Records { id: 1, records: vec![Record::Txt(String::new()); RECORDS_MAX + 1], secure: false };
+    assert_eq!(WireEvent::decode(&many.encode()), None);
+    let long = WireEvent::Records { id: 1, records: vec![Record::Txt("x".repeat(TXT_MAX + 1))], secure: false };
+    assert_eq!(WireEvent::decode(&long.encode()), None);
+}

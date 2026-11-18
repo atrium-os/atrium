@@ -1,0 +1,25 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+# What the core and its worker share: the messages between them, and the
+# index the worker keeps.
+[lib]
+path = "src/lib.rs"
+
+# The core: holds atrium.toml's capabilities and never parses a file.
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+# The index worker: no capabilities; one for the app's whole run.
+[[bin]]
+name = "{{name}}-index"
+path = "src/bin/index.rs"
+
+[dependencies]
+pergola = {{dep:pergola}}
+atrium-open = {{dep:atrium-open}}
+atrium-message = {{dep:atrium-message}}
+atrium-worker = {{dep:atrium-worker}}

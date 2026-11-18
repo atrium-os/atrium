@@ -44,6 +44,12 @@ pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 /// clients (the CLI, anything holding `SOCKET_PATH`) keep working unchanged.
 pub const SERVICE_SOCKET_PATH: &str = "/atrium/sockets/portcullis/portcullis.sock";
 
+/// ★ The worker-call socket (app-composition.md §4): mounted into the jail
+/// of an app that declares `[[workers]]`, and answering only `Hello` and
+/// `WorkerCall`, so declaring workers gives an app nothing else of
+/// portcullisd's.
+pub const WORKERS_SOCKET_PATH: &str = "/atrium/sockets/workers/workers.sock";
+
 /// Where a client should look for portcullisd: the per-service path first (the
 /// only one that exists inside a jail), then the flat compat path.
 ///
@@ -166,6 +172,20 @@ pub enum Request {
         /// Asked, the answer is `ReadyForFdsAs` with the worker's uid.
         #[serde(default)]
         serves: Option<u32>,
+    },
+
+    /// ★ One of the caller's own workers (app-composition.md §4.1,
+    /// dev-tools-plan.md M5): `worker` names a `[[workers]]` entry of the
+    /// caller's INSTALLED manifest, the caller being the launched app its
+    /// peer uid resolves to, never anything it sends. The worker runs from
+    /// the app's own signed bundle in a one-shot jail with no capability, as
+    /// a uid of its own per (person, app, worker). `instance` keeps
+    /// concurrent calls apart (portcullisd adds its own count). The handoff
+    /// is `ExecInstance`'s: `ReadyForFds`, then three descriptors (the
+    /// worker's stdin, stdout, stderr), then `LaunchExit` when it ends; the
+    /// jail goes when the caller hangs up.
+    WorkerCall {
+        worker: String,
     },
 
     /// ★ A fetcher of the caller's own: Nuntius (docs/spec/nuntius.md §2),

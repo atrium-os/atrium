@@ -151,9 +151,58 @@ impl mail_sync::jmap::Http for CourierHttp {
 
 // ── settings discovery through Nuntius ──────────────────────────────
 
-/// HTTP through Mail's fetcher; DNS SRV and MX aren't reachable from an
-/// app yet, so those steps find nothing and known providers, JMAP and
-/// autoconfig carry the search.
+/// One lookup through a fetcher (nuntius.md §3.6): its records, waiting
+/// at most 8 s; other events (none are expected) are passed over.
+pub fn lookup(c: &mut nuntius::Client, id: u32, name: &str, kind: nuntius::RecordKind) -> Result<Vec<nuntius::Record>, String> {
+    use nuntius::{Event, Lookup};
+    c.lookup(Lookup { id, name: name.to_string(), kind }).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no answer in time".into());
+        }
+        match c.recv_timeout(left) {
+            Ok(Some(Event::Records { id: i, records, .. })) if i == id => return Ok(records),
+            Ok(Some(Event::Error { id: i, code })) if i == id => return Err(format!("{code:?}")),
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// DKIM and DMARC lookups (§7.5) through a fetcher of Mail's own, opened
+/// the first time one is needed and again if it stops.
+#[derive(Default)]
+pub struct NuntiusDns {
+    fetcher: std::cell::RefCell<Option<(nuntius::Client, nuntius::launch::FetcherGuard)>>,
+    next: std::cell::Cell<u32>,
+}
+
+impl mail_engine::dns::Dns for NuntiusDns {
+    fn txt(&self, name: &str) -> Result<Vec<String>, String> {
+        let mut f = self.fetcher.borrow_mut();
+        if f.as_ref().is_some_and(|(_, g)| g.exited()) {
+            *f = None;
+        }
+        if f.is_none() {
+            *f = Some(nuntius::launch::open().map_err(|e| e.to_string())?.into_parts());
+        }
+        let id = self.next.get().wrapping_add(1);
+        self.next.set(id);
+        let (c, _) = f.as_mut().unwrap();
+        match lookup(c, id, name, nuntius::RecordKind::Txt) {
+            Ok(r) => Ok(r.into_iter().filter_map(|r| match r { nuntius::Record::Txt(t) => Some(t), _ => None }).collect()),
+            Err(e) => {
+                // A fetcher that went quiet is not asked again.
+                *f = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// HTTP, SRV and MX through Mail's fetcher.
 pub struct NuntiusLookup<'a>(pub &'a mut nuntius::client::Client);
 
 impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
@@ -184,11 +233,21 @@ impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
             }
         }
     }
-    fn srv(&mut self, _: &str) -> Vec<(u16, u16, u16, String)> {
-        Vec::new()
+    fn srv(&mut self, name: &str) -> Vec<(u16, u16, u16, String)> {
+        lookup(self.0, 2, name, nuntius::RecordKind::Srv)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r { nuntius::Record::Srv { priority, weight, port, target } => Some((priority, weight, port, target)), _ => None })
+            .collect()
     }
-    fn mx(&mut self, _: &str) -> Vec<String> {
-        Vec::new()
+    fn mx(&mut self, domain: &str) -> Vec<String> {
+        let mut v: Vec<(u16, String)> = lookup(self.0, 3, domain, nuntius::RecordKind::Mx)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r { nuntius::Record::Mx { preference, host } => Some((preference, host)), _ => None })
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, h)| h).collect()
     }
 }
 
@@ -250,7 +309,7 @@ pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) ->
     let eps = endpoints(c)?;
     let mut w = Writer::new();
     w.raw(handle);
-    w.u8(2); // after first unlock: sync runs in the background
+    w.u8(arca_store::model::Class::AfterFirstUnlock as u8); // sync runs in the background
     w.str(&c.address);
     w.u8(eps.len() as u8);
     for (s, h, p) in &eps {
@@ -274,14 +333,20 @@ pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) ->
 
 // ── background sync ─────────────────────────────────────────────────
 
-/// How often each account is looked at when nothing is due (§6.1; IDLE
-/// and EventSource push come later).
+/// How often each account is looked at when nothing is due and it has
+/// no push (§6.1).
 pub const IDLE_SECS: i64 = 5 * 60;
 
-/// What the window tells the sync thread.
+/// With push for every account, a pass still runs this often (sends,
+/// drafts, folders other than the inbox).
+pub const PUSHED_SECS: i64 = 30 * 60;
+
+/// What the window (or a watcher) tells the sync thread.
 pub enum Wake {
     /// Look now (a send, an action, a new account, "Get mail").
     Now,
+    /// The server said this account's inbox changed.
+    Changed(AccountId),
     Stop,
 }
 
@@ -294,45 +359,165 @@ pub struct Syncer {
     pub status: Arc<Mutex<Vec<(AccountId, Result<mail_engine::accounts::Pass, Reached>)>>>,
 }
 
+/// One account's IDLE watch (§6.1), on a thread and a connection of its
+/// own.
+pub struct Watcher {
+    stop: Arc<AtomicBool>,
+    conn: Arc<Mutex<Option<UnixStream>>>,
+    /// Connected for push (cleared when the connection ends or the
+    /// server turns out to have no IDLE).
+    pub idling: Arc<AtomicBool>,
+    /// The server has no IDLE: this account is polled.
+    pub no_idle: Arc<AtomicBool>,
+}
+
+/// Seconds to wait after a watch's connection fails: doubling from one
+/// minute to fifteen.
+pub fn watch_backoff(failures: u32) -> u64 {
+    (60u64 << failures.min(4)).min(15 * 60)
+}
+
+impl Watcher {
+    /// Watch `account`'s inbox, waking `wake` with [`Wake::Changed`] on news.
+    pub fn start(account: AccountId, cfg: AccountConfig, net: Arc<dyn Connect + Send + Sync>, wake: mpsc::Sender<Wake>) -> Watcher {
+        let w = Watcher { stop: Arc::default(), conn: Arc::default(), idling: Arc::default(), no_idle: Arc::default() };
+        let (stop, conn, idling, no_idle) = (w.stop.clone(), w.conn.clone(), w.idling.clone(), w.no_idle.clone());
+        std::thread::spawn(move || {
+            let mut failures = 0;
+            while !stop.load(Ordering::Acquire) {
+                let r = mail_engine::accounts::watch_inbox(
+                    &cfg,
+                    net.as_ref(),
+                    &mut |s| {
+                        *conn.lock().unwrap() = Some(s);
+                        // Stopped while connecting: end it now.
+                        if stop.load(Ordering::Acquire) {
+                            if let Some(s) = conn.lock().unwrap().take() {
+                                let _ = s.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
+                        idling.store(true, Ordering::Release);
+                    },
+                    &mut || {
+                        failures = 0;
+                        !stop.load(Ordering::Acquire) && wake.send(Wake::Changed(account)).is_ok()
+                    },
+                );
+                idling.store(false, Ordering::Release);
+                conn.lock().unwrap().take();
+                match r {
+                    Ok(mail_engine::accounts::Watched::NoIdle) => {
+                        no_idle.store(true, Ordering::Release);
+                        return;
+                    }
+                    Ok(mail_engine::accounts::Watched::Stopped) => return,
+                    Err(e) => {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        eprintln!("atrium-mail: account {account}: push: {e}");
+                        let until = Instant::now() + Duration::from_secs(watch_backoff(failures));
+                        failures += 1;
+                        while Instant::now() < until && !stop.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                    }
+                }
+            }
+        });
+        w
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(s) = self.conn.lock().unwrap().take() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Start syncing every configured account, on a thread with its own
-/// engine over the same store.
-pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Box<dyn Connect + Send>) -> Syncer {
+/// engine over the same store; IMAP accounts whose servers take IDLE are
+/// watched for new mail in their inbox.
+pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Arc<dyn Connect + Send + Sync>) -> Syncer {
     let (wake, rx) = mpsc::channel();
     let changed = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(Vec::new()));
-    let (ch, st) = (changed.clone(), status.clone());
+    let (ch, st, waker) = (changed.clone(), status.clone(), wake.clone());
     std::thread::spawn(move || {
         let mut engine = Engine::new(store, Parser { program: jail });
         engine.set_roots(roots);
+        engine.set_dns(Box::new(NuntiusDns::default()));
         let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut watchers: std::collections::HashMap<AccountId, (AccountConfig, Watcher)> = Default::default();
+        // `None`: every account.
+        let mut only: Option<AccountId> = None;
         loop {
-            let mut out = Vec::new();
-            for (id, _) in engine.configured() {
-                let r = engine.pass(id, net.as_ref(), now());
+            let configured = engine.configured();
+            let mut out = if only.is_some() { st.lock().unwrap().clone() } else { Vec::new() };
+            for (id, cfg) in &configured {
+                if only.is_some_and(|o| o != *id) {
+                    continue;
+                }
+                let r = engine.pass(*id, net.as_ref(), now());
                 if let Err(e) = &r {
                     eprintln!("atrium-mail: account {id}: {e:?}");
                 }
-                out.push((id, r));
+                // A watch for each IMAP account that signs in, restarted
+                // when its settings change.
+                let wanted = matches!(cfg.protocol, Protocol::Imap { .. }) && !matches!(r, Err(Reached::SignInAgain { .. }));
+                let stale = watchers.get(id).is_some_and(|(c, _)| !same_servers(c, cfg));
+                if stale || !wanted {
+                    watchers.remove(id);
+                }
+                if wanted && !watchers.contains_key(id) {
+                    watchers.insert(*id, (cfg.clone(), Watcher::start(*id, cfg.clone(), net.clone(), waker.clone())));
+                }
+                out.retain(|(a, _)| a != id);
+                out.push((*id, r));
                 ch.store(true, Ordering::Release);
             }
+            watchers.retain(|id, _| configured.iter().any(|(c, _)| c == id));
             *st.lock().unwrap() = out;
-            let next = engine.next_pass(now(), IDLE_SECS);
-            let wait = Duration::from_secs((next - now()).clamp(1, IDLE_SECS) as u64);
+            // Every account pushed: passes can be rarer.
+            let pushed = !configured.is_empty() && configured.iter().all(|(id, _)| watchers.get(id).is_some_and(|(_, w)| w.idling.load(Ordering::Acquire)));
+            let idle = if pushed { PUSHED_SECS } else { IDLE_SECS };
+            let next = engine.next_pass(now(), idle);
+            let wait = Duration::from_secs((next - now()).clamp(1, idle) as u64);
+            only = None;
             match rx.recv_timeout(wait) {
                 Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Ok(Wake::Now) => {
-                    // Several wakes at once are one pass.
+                Ok(w) => {
+                    // Several wakes at once are one pass, of one account
+                    // when only its inbox changed.
+                    let mut one = match w { Wake::Changed(a) => Some(a), _ => None };
+                    let mut all = one.is_none();
                     while let Ok(w) = rx.try_recv() {
-                        if matches!(w, Wake::Stop) {
-                            return;
+                        match w {
+                            Wake::Stop => return,
+                            Wake::Now => all = true,
+                            Wake::Changed(a) if one.is_none_or(|o| o == a) => one = Some(a),
+                            Wake::Changed(_) => all = true,
                         }
                     }
+                    only = if all { None } else { one };
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
     });
     Syncer { wake, changed, status }
+}
+
+/// Whether two settings reach the same servers with the same sign-in.
+fn same_servers(a: &AccountConfig, b: &AccountConfig) -> bool {
+    a.protocol == b.protocol && a.incoming_item == b.incoming_item
 }
 
 #[cfg(test)]
@@ -356,5 +541,99 @@ mod tests {
         assert_eq!(e, vec![(arca_store::Scheme::Imaps, "outlook.office365.com".into(), 993), (arca_store::Scheme::Submission, "smtp.office365.com".into(), 587)]);
         let j = AccountConfig { protocol: Protocol::Jmap { session: "https://api.fastmail.com/jmap/session".into() }, ..c };
         assert_eq!(endpoints(&j).unwrap(), vec![(arca_store::Scheme::Https, "api.fastmail.com".into(), 443)]);
+    }
+
+    /// An IMAP server on one end of a pair: `idle` says whether it takes
+    /// IDLE; the first IDLE reports a new message.
+    struct FakeImap {
+        idle: bool,
+    }
+
+    impl Connect for FakeImap {
+        fn mail(&self, _: &Server, _: &[u8; 16]) -> std::io::Result<UnixStream> {
+            use std::io::{BufRead, BufReader};
+            let (mine, theirs) = UnixStream::pair()?;
+            let idle = self.idle;
+            std::thread::spawn(move || {
+                let mut w = theirs.try_clone().unwrap();
+                let caps = if idle { "IMAP4rev1 IDLE" } else { "IMAP4rev1" };
+                let _ = write!(w, "* PREAUTH [CAPABILITY {caps}] ready\r\n");
+                let mut first = true;
+                let mut tag = String::new();
+                for l in BufReader::new(theirs).lines() {
+                    let Ok(l) = l else { return };
+                    if l == "DONE" {
+                        let _ = write!(w, "{tag} OK idle done\r\n");
+                        continue;
+                    }
+                    let mut p = l.splitn(3, ' ');
+                    tag = p.next().unwrap_or("").to_string();
+                    match p.next().unwrap_or("") {
+                        "IDLE" if first => {
+                            first = false;
+                            let _ = write!(w, "+ idling\r\n* 3 EXISTS\r\n");
+                        }
+                        "IDLE" => {
+                            let _ = write!(w, "+ idling\r\n");
+                        }
+                        "LOGOUT" => {
+                            let _ = write!(w, "* BYE\r\n{tag} OK bye\r\n");
+                            return;
+                        }
+                        _ => {
+                            let _ = write!(w, "* 2 EXISTS\r\n{tag} OK [READ-WRITE] done\r\n");
+                        }
+                    }
+                }
+            });
+            Ok(mine)
+        }
+        fn jmap(&self, _: &str, _: &[u8; 16]) -> Result<Box<dyn mail_sync::jmap::Http>, String> {
+            Err("no".into())
+        }
+    }
+
+    fn imap_account() -> AccountConfig {
+        let server = |h: &str, p| Server { scheme: "imaps".into(), host: h.into(), port: p };
+        AccountConfig {
+            address: "ada@example.org".into(),
+            name: "Ada".into(),
+            protocol: Protocol::Imap { imap: server("imap.example.org", 993), smtp: server("smtp.example.org", 465) },
+            incoming_item: Some([1; 16]),
+            outgoing_item: Some([2; 16]),
+            oauth: None,
+            reached: Reached::Never,
+        }
+    }
+
+    #[test]
+    fn a_watcher_wakes_the_sync_for_its_account_and_stops() {
+        let (tx, rx) = mpsc::channel();
+        let w = Watcher::start(7, imap_account(), Arc::new(FakeImap { idle: true }), tx);
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Wake::Changed(a) => assert_eq!(a, 7),
+            _ => panic!("not a change"),
+        }
+        assert!(w.idling.load(Ordering::Acquire));
+        w.stop();
+        let until = Instant::now() + Duration::from_secs(10);
+        while w.idling.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "still watching");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!w.no_idle.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_server_without_idle_is_polled() {
+        let (tx, rx) = mpsc::channel();
+        let w = Watcher::start(7, imap_account(), Arc::new(FakeImap { idle: false }), tx);
+        let until = Instant::now() + Duration::from_secs(10);
+        while !w.no_idle.load(Ordering::Acquire) {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!((watch_backoff(0), watch_backoff(1), watch_backoff(3), watch_backoff(9)), (60, 120, 480, 900));
     }
 }

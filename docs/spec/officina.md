@@ -3511,6 +3511,30 @@ A picked shape that sits in line with the text now shows its yellow adjust handl
 
 Write's alignment menu, after the paragraph direction, sets the East Asian language of text (the model's `lang_ea`, added with fonts.md §5): Asian Text as Document, Chinese (Simplified), Chinese (Traditional), Japanese, Korean. It picks which Han forms the same characters are drawn in. With a selection it sets the selected text; with none, the caret's paragraph and what is typed next. One undo step; the menu marks the language at the caret. `.docx` and `.odt` keep it (`w:lang w:eastAsia`, `style:language-asian`). Test: `atrium-write` `east_asian_language_is_set_from_the_menu`.
 
+### 16.68 Compare workbooks in Sheets (2026-11-18)
+
+The first step of spreadsheet change review (§16.22's "spreadsheets get the same idea later"): Data ▸ Compare with… asks for another copy (`.xlsx`, `.xlsm`, `.xls`, `.ods`, `.csv`, `.osheet`; read-only) and a Compare pane lists what would turn this workbook into it.
+
+- **Engine** (`officina-grid::compare`). Sheets match by name. In a sheet, rows match by their contents: each row is hashed over its cells, values by value and formulas in relative form (printed for a fixed row), so a row that moved still matches; a longest common subsequence of row hashes runs between the common start and end (up to 4 M row pairs, else rows go in order). In each gap between matched rows, rows are paired by how many cells they share (a dynamic programme over the gap, up to 10,000 pairs) and compared cell by cell; the rest are rows added or removed, in runs. Changes are a cell (ours and theirs, their formula rewritten for our cell), rows added (before which of our rows, with a preview of their first cells), rows removed, or a sheet added or removed. Spilled cells belong to their formula; styles are not compared. At most 100,000 changes are listed. 200,000 rows with a fill compare in 0.6 s.
+- **Taking** a cell change sets that cell; rows added or removed take the whole sheet (cells, formulas as fills, styles), so references stay as the other copy wrote them rather than shifting under formulas elsewhere. Each is one undo step; Take All takes everything takeable as one. Sheets added or removed are listed but not taken.
+- **The pane** lists the changes in words ("B3: 4 → 9", "1 row added before row 5 (clips, 2)"); a click shows the change's cell; Take (Take Sheet for rows), Keep Mine (left out of the list from then on), Take All, Close. The list is worked out again after each.
+- **Not yet:** tracked cell edits in change sets with authors, merging copies (and three-way with a separate base), comparing styles, charts, names and other workbook parts, and adding or removing sheets from the pane.
+
+Tests: `officina-grid` `compare::tests` (cells, rows and sheets; formulas taken for our row; taking rows and undo; 300 random pairs where taking every change gives the other copy; the 200,000-row timing), `atrium-sheets` `compare_with_lists_and_takes_changes`.
+
+### 16.69 Inserting and deleting rows and columns in Sheets (2026-11-18)
+
+Sheets had no way to insert or delete rows or columns. `officina-grid::shift::shift_op(wb, sheet, axis, at, n)` now builds that edit (`n` > 0 inserts before `at`, `n` < 0 deletes from it) out of the ops that already exist, so undo, redo, the journal and crash recovery need nothing new:
+
+- The sheet's cells are replaced with themselves moved; formula fills are rewritten row by row and joined again where their relative form is the same (a fill the insert cuts through becomes two pieces that still read `=A1+1`).
+- Every reference to the sheet, on it or from other sheets, follows: a reference into deleted cells becomes `#REF!`; a range loses its deleted part, and grows by rows inserted inside it (inserted at its first row, it moves); whole-column ranges don't move with rows nor whole-row ranges with columns.
+- Styles move with their cells (inserted rows start plain); tables (a table whose header row is deleted goes; columns inserted inside get new names), charts (data and anchor), pivot tables (source and output), conditional-format ranges, the auto-filter and hidden rows move along.
+- Not yet: defined names, row heights and column widths, and the formulas inside conditional-format rules.
+
+Sheets' Data menu gains Insert Rows Above, Insert Columns Left, Delete Rows and Delete Columns, as many as the selection spans, each one undo step. Compare with… (§16.68) now takes rows added as rows inserted with the other copy's cells, and rows removed as rows deleted, instead of the whole sheet (Take All still takes a sheet with rows added or removed whole).
+
+Gates: `shift::tests` (insert and delete with references on and from other sheets, columns with a table, a fill cut in two, 200 random inserts and deletes undoing exactly, a row inserted into 200,000 rows with a fill: built in 89 ms, applied in 121 ms), `compare::tests` now taking changes one at a time until none are left, `atrium-sheets` `rows_and_columns_are_inserted_and_deleted`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

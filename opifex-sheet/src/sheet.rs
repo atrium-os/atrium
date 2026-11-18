@@ -77,7 +77,9 @@ impl Sheet {
         }
         // An update shows only what it adds: the rest was agreed to already.
         let (head, list) = if self.update() { ("It now also asks to:", &a.added) } else { ("It may:", &a.capabilities) };
-        if self.update() && list.is_empty() {
+        if a.kind == "font" {
+            v.push(("Fonts run nothing and see nothing; every app can draw with them.".into(), Tone::Body));
+        } else if self.update() && list.is_empty() {
             v.push(("It asks for nothing new.".into(), Tone::Body));
         } else if list.is_empty() {
             v.push(("It may use nothing beyond its own window.".into(), Tone::Body));
@@ -213,5 +215,8 @@ mod tests {
         assert!(l.iter().any(|(x, _)| x == "It now also asks to:"));
         assert!(l.contains(&("  use the network".into(), Tone::Marked)));
         assert!(!l.iter().any(|(x, _)| x.contains("clipboard")));
+        let f = Sheet::new(Described { kind: "font".into(), capabilities: vec![], ..described(None) });
+        assert_eq!(f.title(), "Install Hello?");
+        assert!(f.lines().iter().any(|(x, _)| x.starts_with("Fonts run nothing")));
     }
 }

@@ -221,6 +221,15 @@ float glyph_texel(uvec4 t, uint u, uint v, int gw, int gh, int x, int y) {
     return texel(t, int(u) + x, int(v) + y).r;
 }
 
+// A colour glyph's texel, premultiplied, zero outside the glyph.
+vec4 glyph_rgba(uvec4 t, uint u, uint v, int gw, int gh, int x, int y) {
+    if (x < 0 || y < 0 || x >= gw || y >= gh) {
+        return vec4(0.0);
+    }
+    vec4 c = texel(t, int(u) + x, int(v) + y);
+    return vec4(c.rgb * c.a, c.a);
+}
+
 vec4 glyph_xf(vec4 p0, vec4 p1, vec4 p2, uvec4 meta, vec2 pc) {
     vec2 d = pc - p0.xy;
     float lx = p2.x * d.x + p2.y * d.y;
@@ -250,6 +259,22 @@ vec4 glyph_xf(vec4 p0, vec4 p1, vec4 p2, uvec4 meta, vec2 pc) {
     float ay = ty - fly;
     int x = int(clamp_(flx, -1.0, fw));
     int y = int(clamp_(fly, -1.0, fh));
+    if (t.w == 0u) {
+        // A colour glyph (an RGBA atlas): its own colours, premultiplied
+        // while interpolating so the faded edge keeps them, at the run's
+        // opacity.
+        vec4 q00 = glyph_rgba(t, u, v, gw, gh, x, y);
+        vec4 q10 = glyph_rgba(t, u, v, gw, gh, x + 1, y);
+        vec4 q01 = glyph_rgba(t, u, v, gw, gh, x, y + 1);
+        vec4 q11 = glyph_rgba(t, u, v, gw, gh, x + 1, y + 1);
+        vec4 qa = mix_(q00, q10, ax);
+        vec4 qb = mix_(q01, q11, ax);
+        vec4 q = mix_(qa, qb, ay);
+        if (q.a <= 0.0) {
+            return vec4(0.0);
+        }
+        return vec4(q.rgb / q.a, q.a * p1.a);
+    }
     float c00 = glyph_texel(t, u, v, gw, gh, x, y);
     float c10 = glyph_texel(t, u, v, gw, gh, x + 1, y);
     float c01 = glyph_texel(t, u, v, gw, gh, x, y + 1);
@@ -320,8 +345,12 @@ vec4 shade(uint oi, vec2 pc) {
     }
     // KIND_GLYPH
     vec2 uv = p2.xy + t * (p2.zw - p2.xy); // mix_, per component
-    float cov = sample_bilinear(meta.y, uv).r;
-    return vec4(p1.rgb, p1.a * cov);
+    vec4 c = sample_bilinear(meta.y, uv);
+    if (meta.y < F.tex_count && texw[meta.y * 4u + 3u] == 0u) {
+        // A colour glyph (an RGBA atlas): its own colours at the run's opacity.
+        return vec4(c.rgb, c.a * p1.a);
+    }
+    return vec4(p1.rgb, p1.a * c.r);
 }
 
 // The open layers, newest first: what was under each (s<k>) and its

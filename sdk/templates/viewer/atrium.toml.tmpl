@@ -1,0 +1,28 @@
+# {{name}}: made by `cargo atrium new` (template: viewer).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A window and nothing else. The files the person opens in it come as
+# descriptors ([[opens]]), so it needs no access to their files.
+[capabilities]
+graphics = "fresco"
+network = "none"
+
+# Files offers "Open with {{title}}" for BMP pictures.
+[[opens]]
+types = ["image/bmp"]
+
+# The decoder runs here: a jail of its own for each picture, with no
+# capabilities, a memory ceiling and a time limit. A crash or a hang there
+# is an error in the core, not a compromised app.
+[[workers]]
+name = "decode"
+entry = "bin/{{name}}-decode"
+input = "fd"
+lifetime = "call"
+memory = "256M"
+cpu = "10s"

@@ -35,6 +35,10 @@ fn main() {
                 println!("open-probe: link url={u}");
                 continue;
             }
+            Ok(Some(atrium_open::Message::Crossed { url, from })) => {
+                println!("open-probe: link url={url} from={from}");
+                continue;
+            }
             Ok(None) => return println!("open-probe: idle, bye"),
             Err(e) => return println!("open-probe: channel: {e}"),
         };

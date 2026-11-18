@@ -242,6 +242,32 @@ crash, a timeout and a memory limit each come back as errors; the app can't call
 another app's worker or start a system bundle; `vm-sheets`/Officina converter gates
 and Mail's host tests pass with real jails.
 
+**As built (2026-11-18).** The manifest has `[[workers]]`, `[roles]`, `[ipc]`,
+`embeds` and `arca` (`portcullis-toml`, validated; the consent delta names `arca`
+and new `embeds`). portcullisd answers `WorkerCall { worker }`: the caller is found
+by peer uid in the launch registry, the worker in its **installed** manifest, and it
+runs through the `ExecInstance` path with `portcullis_oneshot::as_worker` making the
+manifest the worker's (its entry, no capability, only its `memory`), as a uid
+registered under `worker:<app>:<name>` per person and persona. An app reaches it on
+a second socket, `/atrium/sockets/workers/workers.sock`, mounted only into the jail
+of an app that declares workers and answering nothing but `WorkerCall`; the app does
+not get portcullisd's own socket. `ExecInstance` from an app with no system rule may
+start only its own id or one under it. A Run copies each worker's entry and its
+libraries into the bundle. The base syscall profile gained `getgroups` (jaild's
+`verify_dropped` calls it; without it every one-shot failed in deny mode).
+`sdk/atrium-worker`: `Workers::get()?.call(name, &req, file)`, `.session(name)`,
+`.spawn_stdio(name)` for a worker with its own stream protocol, and
+`atrium_worker::main!(handler)` (a macro in place of `#[worker::main]`); modes jail,
+capsicum (a child that calls `cap_enter`), local (`ATRIUM_WORKERS=local`) and
+in-process. Officina's converter is Write's `convert` worker and Mail's parser is
+its `parse` worker, through `spawn_stdio`, falling back to a child process off
+Atrium. Gate `vm-workers-check.sh` 16/16 in deny mode: the worker's own uid, stable
+across calls; a file passed in; its error, a crash, a timeout as errors; no network;
+no nested calls; only the worker-call socket in the core; no jail left. Not done: a
+memory-limit kill in the gate (needs racct on the VM), a second worker and the
+overlay check, `vm-sheets`/converter gates on real jails, Sheets and Slides (no
+manifests yet), and the ~25 hand-written `cap_enter` blocks.
+
 ## 8. M6–M12 in brief
 
 - **M6 (M).** `embeds = [roles]` capability: portcullis-jail mounts limend's socket

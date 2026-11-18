@@ -610,6 +610,37 @@ run(uint32_t suite)
 		v = NULL;
 	}
 
+	/* 7: a recovery slot (§7.4) goes in key_slots[0], under the HMAC */
+	{
+		static uint8_t slot[256];
+		tessera_superblock_t sb;
+		memset(slot, 0x5a, sizeof slot);
+		slot[0] = 3; slot[1] = 1;
+		memset(disk, 0, sizeof disk);
+		CHECK(tessera_volume_format_sealed_recovery(&IO, &o, &k, slot) ==
+		    TESSERA_OK);
+		CHECK(read_back(&k) == 0);
+		CHECK(tessera_decode_superblock(disk[0], &sb) == TESSERA_OK);
+		CHECK(memcmp(&sb.key_slots[0], slot, 256) == 0);
+		CHECK(sb.active_slot_count == 1);
+		/* at the fixed offset dispensatord reads */
+		CHECK(memcmp(disk[0] + 280, slot, 256) == 0);
+		/* changed with a fresh CRC in both copies: refused */
+		for (int c = 0; c < 2; c++) {
+			CHECK(tessera_decode_superblock(disk[c], &sb) == TESSERA_OK);
+			sb.key_slots[0].kdf_salt[0] ^= 1;
+			CHECK(tessera_encode_superblock(&sb, disk[c]) == TESSERA_OK);
+		}
+		CHECK(tessera_volume_open_sealed(&IO, &k, &v) == TESSERA_EAUTH);
+		/* not a recovery slot, or not sealed: refused */
+		slot[0] = 7;
+		CHECK(tessera_volume_format_sealed_recovery(&IO, &o, &k, slot) ==
+		    TESSERA_EINVAL);
+		slot[0] = 3; slot[1] = 2;
+		CHECK(tessera_volume_format_sealed_recovery(&IO, &o, &k, slot) ==
+		    TESSERA_EINVAL);
+	}
+
 	/* an unsealed volume through open_sealed */
 	memset(disk, 0, sizeof disk);
 	CHECK(tessera_volume_format(&IO, &o) == TESSERA_OK);

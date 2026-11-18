@@ -5870,9 +5870,12 @@ navtest`, and the Navigator logs `not handed on: address copied`;
 with `[[crossings]] from = "work" to = "personal" kinds = ["links"]` added and `portcullis daemon
 reload`, the same opens the page in the Personal Navigator in a new trail (`crosses from Work to
 Personal` in portcullisd's log). navtest having a Work persona adds an "In:" row to the mailto
-sheet too (and a Copy address row), so the keys there step past them. The run first deletes any
+sheet too (and a Copy address row), so the keys there step past them. Then the switch from Personal to Work: Open
+with… in the Personal window, In: Work, sends the page to the Work Navigator, which opens it in
+a new trail marked anonymous (`a link sent from personal: a new trail, anonymous` in Work's log,
+`confined-9-into-work.png`). The run first deletes any
 `[[crossings]]` left in navtest's `policy.toml` by an earlier run. jaild's policy needs
-`/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it). 96/96 on
+`/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it). 98/98 on
 2026-11-18. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d

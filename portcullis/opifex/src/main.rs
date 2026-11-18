@@ -76,6 +76,9 @@ fn main() -> ExitCode {
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
+        "font" | "driver" | "firmware" => cmd_pack_kind(&args[1], &args[2..]),
+        "driver-for" => driver_for(&args[2..]),
+        "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
         | "updates" | "update-care" | "tick" => ask_daemon(&args[1..]),
@@ -120,7 +123,10 @@ fn usage() {
            remove <id> | sync [https://… | <catalog-dir>]   (root; no argument: the network)\n  \
            updates             what is waiting, and why\n  \
            update-care <id> notify|auto   wait for me / the publisher's timing\n  \
-           tick                the daily round now (root)\n\n\
+           tick                the daily round now (root)\n  \
+           update-all          apply every waiting update (root)\n\n\
+         font|driver|firmware pack <tree> --manifest <atrium.toml> [--sign <key.pem>]   (opifex.md §8)\n  \
+           driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>   look a device up in the synced catalog\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -215,7 +221,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
 
 fn ask_daemon(args: &[String]) -> Result<(), String> {
     use opifex::proto::{Request, Response};
-    use std::io::{BufRead, Write};
+
     let arg = |i: usize| args.get(i).cloned().ok_or_else(|| format!("{}: missing argument", args[0]));
     let req = match args[0].as_str() {
         "describe" => Request::Describe { id: arg(1)? },
@@ -235,14 +241,7 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         "tick" => Request::Tick,
         _ => unreachable!(),
     };
-    let sock = std::env::var("OPIFEX_SOCKET").unwrap_or_else(|_| opifex::proto::SOCKET.into());
-    let mut s = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("opifexd ({sock}): {e}"))?;
-    let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-    line.push('\n');
-    s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    std::io::BufReader::new(s).read_line(&mut out).map_err(|e| e.to_string())?;
-    match serde_json::from_str::<Response>(out.trim()).map_err(|e| format!("opifexd: {e}"))? {
+    match opifex::proto::ask(&req)? {
         Response::Error { message } => Err(message),
         Response::Installed { apps } => {
             for a in apps { println!("  {:<32} {:<10} {}", a.id, a.version, a.source); }
@@ -289,6 +288,73 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
     let dest = app::rollback(&root, id)?;
     println!("opifex: {id} rolled back -> {}", dest.display());
     Ok(())
+}
+
+/// `opifex driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>`: what the
+/// synced catalog has for a device (devices.idx; nothing leaves the machine).
+fn driver_for(args: &[String]) -> Result<(), String> {
+    let state = std::env::var("OPIFEX_STATE").unwrap_or_else(|_| "/var/db/atrium/opifex".into());
+    let idx = std::fs::read_to_string(Path::new(&state).join(opifex::driver::IDX)).map_err(|e| format!("{state}/devices.idx: {e} (sync first)"))?;
+    let hex = |s: &str| u16::from_str_radix(s, 16).map_err(|_| format!("{s}: not hex"));
+    let hits = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["usb", ids, ref rest @ ..] => {
+            let id = opifex_catalog::driver::usb_id(ids).ok_or("usb: vvvv:pppp")?;
+            let mut c = [0u8; 3];
+            if let Some(cl) = rest.first() {
+                for (i, p) in cl.split('/').take(3).enumerate() { c[i] = hex(p)? as u8; }
+            }
+            opifex::driver::lookup(&idx, Some((id, c)), &[])
+        }
+        ["hid", page] => opifex::driver::lookup(&idx, None, &[hex(page)?]),
+        _ => return Err("driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>".into()),
+    };
+    if hits.is_empty() { println!("opifex: no driver in the catalog for it"); }
+    for h in hits { println!("  {h}"); }
+    Ok(())
+}
+
+/// `opifex font|driver|firmware pack <tree> --manifest <toml> [--sign <key.pem>]`.
+fn cmd_pack_kind(kind: &str, args: &[String]) -> Result<(), String> {
+    let (mut manifest, mut sign, mut pos) = (None::<String>, None::<String>, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--manifest" => manifest = it.next().cloned(),
+            "--sign" => sign = it.next().cloned(),
+            o if o.starts_with("--") => return Err(format!("font: unknown flag {o}")),
+            o => pos.push(o.to_string()),
+        }
+    }
+    let ["pack", tree] = pos.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
+        return Err(format!("{kind} pack <tree> --manifest <atrium.toml> [--sign <key.pem>]"));
+    };
+    let t = std::fs::read_to_string(manifest.ok_or(format!("{kind} pack: --manifest <toml>"))?).map_err(|e| e.to_string())?;
+    let key = match sign { Some(k) => Some(std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?), None => None };
+    let tree = Path::new(tree);
+    let (id, version, content) = match kind {
+        "font" => { let m = opifex::font::pack(tree, &t, key.as_deref())?; (m.font.id, m.font.version, m.font.content) }
+        "driver" => { let m = opifex::driver::pack_driver(tree, &t, key.as_deref())?; (m.driver.id, m.driver.version, m.driver.content) }
+        _ => { let m = opifex::driver::pack_firmware(tree, &t, key.as_deref())?; (m.firmware.id, m.firmware.version, m.firmware.content) }
+    };
+    println!("opifex: packed {kind} {id} {version} (content {content}){}", if key.is_some() { ", signed" } else { ", NOT signed" });
+    Ok(())
+}
+
+/// `opifex update-all` (root): apply every waiting update that isn't
+/// refused, the administrator's batched approval (§11).
+fn update_all() -> Result<(), String> {
+    use opifex::proto::{Request, Response};
+    use opifex::updates::Action;
+    let Response::Updates { items, .. } = opifex::proto::ask(&Request::Updates)? else { return Err("opifexd: unexpected answer".into()) };
+    let mut failed = 0;
+    for u in items.iter().filter(|u| u.action != Action::Refused) {
+        match opifex::proto::ask(&Request::Install { id: u.id.clone() })? {
+            Response::Done { id, version } => println!("opifex: {id} {version}: done"),
+            Response::Error { message } => { eprintln!("opifex: {}: {message}", u.id); failed += 1; }
+            other => { eprintln!("opifex: {}: {other:?}", u.id); failed += 1; }
+        }
+    }
+    if failed > 0 { Err(format!("{failed} update(s) failed")) } else { Ok(()) }
 }
 
 fn cmd_layer(args: &[String]) -> Result<(), String> {

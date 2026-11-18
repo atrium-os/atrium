@@ -285,6 +285,10 @@ pub struct Trail {
     pub jar: u64,
     /// Muted by the person (§8a): trail level × player level.
     pub muted: bool,
+    /// Anonymous: no site knows you in it, whatever the persona's jar
+    /// says, until the person lets one (a link sent into Work from another
+    /// persona, personas.md §6).
+    pub anonymous: bool,
     /// Logical clock of the last navigation, for the rail's order.
     pub active: u64,
 }
@@ -314,7 +318,7 @@ impl Trail {
     }
 
     pub fn new(id: u64, unrecorded: bool) -> Self {
-        Trail { id, pages: vec![], current: None, unrecorded, jar: if unrecorded { random_jar() } else { 0 }, muted: false, active: 0 }
+        Trail { id, pages: vec![], current: None, unrecorded, jar: if unrecorded { random_jar() } else { 0 }, muted: false, anonymous: false, active: 0 }
     }
 
     pub fn page(&self) -> Option<&Page> {
@@ -691,11 +695,11 @@ impl TrailStore {
     pub fn make_own_trail(&mut self, index: usize, page: PageId) -> Option<Vec<((u64, PageId), (u64, PageId))>> {
         let (pages, current, order) = self.trails.get_mut(index)?.split_off(page)?;
         let old = &self.trails[index];
-        let (old_id, unrecorded, jar, muted) = (old.id, old.unrecorded, old.jar, old.muted);
+        let (old_id, unrecorded, jar, muted, anonymous) = (old.id, old.unrecorded, old.jar, old.muted, old.anonymous);
         let id = self.next_id;
         self.next_id += 1;
         let n = pages.len();
-        let t = Trail { id, pages, current: Some(current.unwrap_or(0)), unrecorded, jar, muted, active: self.tick() };
+        let t = Trail { id, pages, current: Some(current.unwrap_or(0)), unrecorded, jar, muted, anonymous, active: self.tick() };
         self.trails.push(t);
         if current.is_some() && self.current == index {
             self.current = self.trails.len() - 1;
@@ -826,7 +830,7 @@ impl TrailStore {
     /// knows you in it (§2.4, §6.2).
     pub fn presence_of(&self, trail: u64, url: &str) -> Option<(navigator_control::Jar, bool)> {
         let t = self.trails.iter().find(|t| t.id == trail)?;
-        Some((t.jar(), self.known.contains(&(Self::jar_of(t), site(url).to_string()))))
+        Some((t.jar(), !t.anonymous && self.known.contains(&(Self::jar_of(t), site(url).to_string()))))
     }
 
     /// The reading choices for `url`'s site in trail `trail`'s persona
@@ -858,7 +862,7 @@ impl TrailStore {
 
     /// Whether `site` knows you in the current trail's jar (§6.2).
     pub fn knows(&self, site: &str) -> bool {
-        self.known.contains(&(Self::jar_of(self.trail()), site.to_string()))
+        !self.trail().anonymous && self.known.contains(&(Self::jar_of(self.trail()), site.to_string()))
     }
 
     /// Let `site` remember you, or forget it, in the current trail's jar.
@@ -866,6 +870,8 @@ impl TrailStore {
     pub fn set_knows(&mut self, site: &str, on: bool) {
         let key = (Self::jar_of(self.trail()), site.to_string());
         if on {
+            // The person lets it: the trail is no longer anonymous.
+            self.trail_mut().anonymous = false;
             self.known.insert(key);
         } else {
             self.known.remove(&key);

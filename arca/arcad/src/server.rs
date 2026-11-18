@@ -218,7 +218,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB4).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB6).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -728,6 +728,81 @@ impl State {
                 match self.keyring.as_mut().unwrap().drop_key(&key_id) {
                     Ok(()) => ok(Vec::new()),
                     Err(e) if e == libc::ENOENT => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            volume_op::VK_RECOVERY => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                field!(r.end());
+                let kdf = self.kdf_default;
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                if decode_scope(&m.scope) != Some((key_id, uuid, 0)) {
+                    return reply(status::DENIED);
+                }
+                let (_, v) = tri!(store.release(&m.id, &Access { persona: &persona, recipient: &me }, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let Some((code, slot)) = crate::recovery::make(&v.as_ref()[..32], &uuid, &key_id, kdf) else {
+                    return reply(status::INTERNAL);
+                };
+                let mut out = tri!(LockedBuf::zeroed(slot.len() + code.len()).map_err(Error::Io));
+                out.as_mut()[..slot.len()].copy_from_slice(&slot);
+                out.as_mut()[slot.len()..].copy_from_slice(code.as_bytes());
+                Reply { status: status::OK, body: Body::Secret(out) }
+            }
+            volume_op::VK_ADOPT => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                let slot = field!(r.array::<{ volume_op::SLOT_LEN }>());
+                let keep = field!(r.u8());
+                let code = field!(r.str(volume_op::CODE_MAX)).to_string();
+                field!(r.end());
+                if keep > 1 {
+                    return malformed();
+                }
+                // The person's own store must be open either way: the key
+                // is loaded as theirs.
+                if let Err(r) = self.volume_store(&user, &persona, false) {
+                    return r;
+                }
+                let vk = match crate::recovery::open(&slot, &uuid, &key_id, &code) {
+                    Ok(k) => k,
+                    Err(crate::recovery::OpenError::BadCode) => return malformed(),
+                    Err(_) => return reply(status::DENIED),
+                };
+                if keep == 1 {
+                    let store = self.volume_store(&user, &persona, false).ok().unwrap();
+                    match tri!(Self::volume_item(store, &persona, &key_id)) {
+                        Some(m) => *item = Some(m.id),
+                        None => {
+                            let mut value = tri!(LockedBuf::zeroed(VALUE_LEN).map_err(Error::Io));
+                            value.as_mut()[..32].copy_from_slice(vk.as_ref());
+                            let m = tri!(store.add(NewItem {
+                                persona: &persona,
+                                recipient: me.clone(),
+                                class: Class::AfterFirstUnlock,
+                                kind: Kind::VolumeKey,
+                                provenance: Provenance::UserTyped,
+                                account: "recovered stick",
+                                scope: &encode_scope(&key_id, &uuid, 0),
+                                value: value.as_ref(),
+                            }));
+                            *item = Some(m.id);
+                        }
+                    }
+                }
+                let info = LoadInfo { key_id, uuid, group: 0, high_water: 0, owner_uid: 0, owner_label: label };
+                let key: &[u8; 32] = vk.as_ref().try_into().unwrap();
+                match self.keyring.as_mut().unwrap().load(&info, key) {
+                    Ok(()) => ok(Vec::new()),
+                    Err(e) if e == libc::EEXIST => ok(Vec::new()),
                     Err(_) => reply(status::INTERNAL),
                 }
             }

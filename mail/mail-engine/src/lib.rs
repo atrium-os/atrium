@@ -33,6 +33,7 @@ pub mod prefs;
 pub mod lanes;
 pub mod private;
 pub mod pgp;
+pub mod dns;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};
@@ -87,34 +88,57 @@ pub(crate) fn now() -> i64 {
 
 /// One running jail.
 struct Jail {
-    child: Child,
-    r: BufReader<std::process::ChildStdout>,
-    w: BufWriter<std::process::ChildStdin>,
+    proc: Proc,
+    r: BufReader<Box<dyn std::io::Read + Send>>,
+    w: BufWriter<Box<dyn std::io::Write + Send>>,
+}
+
+/// How it runs: the app's `parse` worker (dev-tools-plan.md M5), or a child.
+enum Proc {
+    Worker(atrium_worker::Stdio),
+    Child(Child),
 }
 
 impl Drop for Jail {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.proc {
+            Proc::Worker(w) => w.kill(),
+            Proc::Child(c) => { let _ = c.kill(); let _ = c.wait(); }
+        }
     }
 }
 
+/// The worker's name in Mail's `[[workers]]`.
+pub const PARSE_WORKER: &str = "parse";
+
 impl Parser {
+    /// Installed, Mail declares the parser as its `parse` worker: a jail of
+    /// its own, as a uid of its own, with no capability (app-composition.md
+    /// §4). Elsewhere (development, tests) `program` runs as a child.
     fn start(&self) -> Result<Jail, Error> {
+        let named = std::env::var_os("MAIL_PARSE_JAIL").is_some();
+        if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| !named && w.has(PARSE_WORKER)) {
+            let mut p = w.spawn_stdio(PARSE_WORKER).map_err(|e| Error::Jail(format!("start the parse worker: {e}")))?;
+            let r: Box<dyn std::io::Read + Send> = Box::new(p.stdout.take().expect("piped"));
+            let w: Box<dyn std::io::Write + Send> = Box::new(p.stdin.take().expect("piped"));
+            // Its stderr is dropped, as the child's is.
+            drop(p.stderr.take());
+            return Ok(Jail { proc: Proc::Worker(p), r: BufReader::new(r), w: BufWriter::new(w) });
+        }
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| Error::Jail(format!("start {}: {e}", self.program.display())))?;
-        let r = BufReader::new(child.stdout.take().unwrap());
-        let w = BufWriter::new(child.stdin.take().unwrap());
-        Ok(Jail { child, r, w })
+        let r: Box<dyn std::io::Read + Send> = Box::new(child.stdout.take().unwrap());
+        let w: Box<dyn std::io::Write + Send> = Box::new(child.stdin.take().unwrap());
+        Ok(Jail { proc: Proc::Child(child), r: BufReader::new(r), w: BufWriter::new(w) })
     }
 
     /// Frames until `Done`, answering lookups (none yet: DKIM keys come from
     /// mail-sync's resolver in a later step, so signed mail stays Pending).
-    fn exchange(j: &mut Jail, lens: &dyn Fn(u64) -> Option<u64>) -> Result<Vec<FromJail>, Error> {
+    fn exchange(j: &mut Jail, lens: &dyn Fn(u64) -> Option<u64>, dns: &dyn Fn(&str) -> Option<String>) -> Result<Vec<FromJail>, Error> {
         let caps = Caps::default();
         let mut out = Vec::new();
         loop {
@@ -125,8 +149,10 @@ impl Parser {
             };
             f.check(&caps, raw_len).map_err(|e| Error::Jail(e.to_string()))?;
             match f {
-                FromJail::Query { query, .. } => {
-                    wire::write_frame(&mut j.w, &ToJail::Answer { query, txt: None }).map_err(|e| Error::Jail(e.to_string()))?;
+                FromJail::Query { query, name } => {
+                    // mail-schema's check held the name to DKIM and DMARC records.
+                    let txt = dns(&name).filter(|t| t.len() <= 4096);
+                    wire::write_frame(&mut j.w, &ToJail::Answer { query, txt }).map_err(|e| Error::Jail(e.to_string()))?;
                 }
                 FromJail::Done => return Ok(out),
                 other => out.push(other),
@@ -143,12 +169,17 @@ impl Parser {
     /// As [`Parser::summarize`], with the OpenPGP keys the messages carried
     /// in `Autocrypt:` for their From addresses: `(index in batch, addr, key)`.
     pub fn summarize_keyed(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>]) -> Result<(Vec<Option<Summary>>, Vec<(usize, String, Vec<u8>)>), Error> {
+        self.summarize_with(batch, headers_only, roots, &|_| None)
+    }
+
+    /// As [`Parser::summarize_keyed`], answering DKIM/DMARC lookups with `dns`.
+    pub fn summarize_with(&self, batch: &[(u64, &[u8])], headers_only: bool, roots: &[Vec<u8>], dns: &dyn Fn(&str) -> Option<String>) -> Result<(Vec<Option<Summary>>, Vec<(usize, String, Vec<u8>)>), Error> {
         let mut j = self.start()?;
         let msgs: Vec<wire::Raw> = batch.iter().map(|(id, b)| wire::Raw { id: *id, bytes: b.to_vec() }).collect();
         wire::write_frame(&mut j.w, &ToJail::Summarize { authserv_id: None, me: Vec::new(), now: now(), headers_only, roots: if headers_only { Vec::new() } else { roots.to_vec() }, batch: msgs })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let lens = |id: u64| batch.iter().find(|(i, _)| *i == id).map(|(_, b)| b.len() as u64);
-        let frames = Self::exchange(&mut j, &lens)?;
+        let frames = Self::exchange(&mut j, &lens, dns)?;
         let mut out = vec![None; batch.len()];
         let mut keys = Vec::new();
         let mut seen = 0;
@@ -191,7 +222,7 @@ impl Parser {
         wire::write_frame(&mut j.w, &ToJail::Attachment { message: wire::Raw { id: 1, bytes: raw.to_vec() }, which: which.clone(), key })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
-        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
+        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len), &|_| None)?;
         match frames.into_iter().next() {
             Some(FromJail::Attachment { result, .. }) => Ok(result.ok()),
             _ => Err(Error::Jail("no answer".into())),
@@ -204,7 +235,7 @@ impl Parser {
         let certs: Vec<Vec<u8>> = certs.iter().take(wire::MY_CERTS_MAX).cloned().collect();
         let mut j = self.start()?;
         wire::write_frame(&mut j.w, &ToJail::KeyFor { message: wire::Raw { id: 1, bytes: raw.to_vec() }, certs: certs.clone() }).map_err(|e| Error::Jail(e.to_string()))?;
-        let frames = Self::exchange(&mut j, &|_| Some(raw.len() as u64))?;
+        let frames = Self::exchange(&mut j, &|_| Some(raw.len() as u64), &|_| None)?;
         match frames.into_iter().next() {
             Some(FromJail::KeyFor { which, .. }) => match which {
                 Some((i, w)) if (i as usize) < certs.len() => Ok(Some((i as usize, w))),
@@ -216,12 +247,17 @@ impl Parser {
     }
 
     pub fn open(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>, pgp_keys: Vec<Vec<u8>>) -> Result<Option<Opened>, Error> {
+        self.open_with(raw, loaded, roots, key, pgp_keys, &|_| None)
+    }
+
+    /// As [`Parser::open`], answering DKIM/DMARC lookups with `dns`.
+    pub fn open_with(&self, raw: &[u8], loaded: Vec<(String, Vec<u8>)>, roots: &[Vec<u8>], key: Option<Vec<u8>>, pgp_keys: Vec<Vec<u8>>, dns: &dyn Fn(&str) -> Option<String>) -> Result<Option<Opened>, Error> {
         let mut j = self.start()?;
         let pgp_keys = pgp_keys.into_iter().filter(|k| k.len() <= wire::PGP_KEY_MAX).take(wire::PGP_KEYS_MAX).collect();
         wire::write_frame(&mut j.w, &ToJail::Open { authserv_id: None, me: Vec::new(), now: now(), roots: roots.to_vec(), key, message: wire::Raw { id: 1, bytes: raw.to_vec() }, loaded, pgp_keys })
             .map_err(|e| Error::Jail(e.to_string()))?;
         let len = raw.len() as u64;
-        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len))?;
+        let frames = Self::exchange(&mut j, &|id| (id == 1).then_some(len), dns)?;
         match frames.into_iter().next() {
             Some(FromJail::Opened { result, .. }) => Ok(result.ok()),
             _ => Err(Error::Jail("no answer".into())),
@@ -237,6 +273,9 @@ pub struct Engine {
     /// Content keys of encrypted messages unlocked this session, in memory
     /// only; their text is never kept (§10.1).
     keys: std::cell::RefCell<std::collections::HashMap<mail_store::MsgId, Vec<u8>>>,
+    /// DKIM/DMARC lookups ([`dns`]), and what they answered.
+    dns: Option<Box<dyn dns::Dns>>,
+    dns_cache: std::cell::RefCell<dns::Cache>,
 }
 
 /// What the reading pane shows (§7.2, §7.3).
@@ -284,7 +323,7 @@ fn verified_card(s: &Summary, card: Option<wire::Card>) -> Option<wire::Card> {
 
 impl Engine {
     pub fn new(store: Store, parser: Parser) -> Engine {
-        Engine { store, parser, roots: smime::system_roots(), keys: Default::default() }
+        Engine { store, parser, roots: smime::system_roots(), keys: Default::default(), dns: None, dns_cache: Default::default() }
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {
@@ -306,7 +345,7 @@ impl Engine {
                 return Ok(Reading::bare(m.summary, Some(String::new())));
             };
             let raw = self.store.blob(&full)?;
-            return match self.parser.open(&raw, Vec::new(), &self.roots, Some(key), self.pgp_keys_of(&m.summary))? {
+            return match self.parser.open_with(&raw, Vec::new(), &self.roots, Some(key), self.pgp_keys_of(&m.summary), &|n| self.answer(n))? {
                 Some(o) => {
                     let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
                     let card = verified_card(&o.summary, o.card);
@@ -318,7 +357,9 @@ impl Engine {
         let pgp_keys = self.pgp_keys_of(&m.summary);
         // Kept from a parse that had no key for the signer, while there is
         // one now: parse again.
-        let stale = |sh: &Shown| matches!(&sh.pgp, Some(p) if p.state == wire::PgpState::NoKey) && !pgp_keys.is_empty();
+        // A sender check that waited for a key: check again now lookups can run.
+        let recheck = m.summary.sender_check == wire::SenderCheck::Pending && self.dns.is_some();
+        let stale = |sh: &Shown| recheck || matches!(&sh.pgp, Some(p) if p.state == wire::PgpState::NoKey) && !pgp_keys.is_empty();
         if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()).filter(|sh| !stale(sh)) {
             let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
@@ -333,11 +374,18 @@ impl Engine {
             .take(wire::LOADED_MAX)
             .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
             .collect();
-        match self.parser.open(&raw, loaded, &self.roots, None, pgp_keys)? {
+        match self.parser.open_with(&raw, loaded, &self.roots, None, pgp_keys, &|n| self.answer(n))? {
             Some(o) => {
                 let sh = Shown { document: o.document, attachments: o.attachments, card: o.card, pgp: o.pgp, pgp_encrypted: o.pgp_encrypted };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
-                self.store.write(|w| w.set_document(msg, Some(h)))?;
+                let checked = (recheck && o.summary.sender_check != wire::SenderCheck::Pending).then(|| o.summary.sender_check.clone());
+                self.store.write(|w| {
+                    w.set_document(msg, Some(h))?;
+                    match checked {
+                        Some(c) => w.set_sender_check(msg, c),
+                        None => Ok(()),
+                    }
+                })?;
                 let has_html = sh.document.is_some();
                 let text = o.summary.text.clone().or_else(|| sh.document.as_ref().map(|_| String::new()));
                 let card = verified_card(&o.summary, sh.card);
@@ -442,7 +490,7 @@ impl Sink for AccountSink<'_> {
             let chunk = &page[i..end];
             let full = chunk[0].full;
             let input: Vec<(u64, &[u8])> = chunk.iter().enumerate().map(|(k, f)| (k as u64, f.bytes.as_slice())).collect();
-            let (sums, found) = self.e.parser.summarize_keyed(&input, !full, &self.e.roots).map_err(|e| e.to_string())?;
+            let (sums, found) = self.e.parser.summarize_with(&input, !full, &self.e.roots, &|n| self.e.answer(n)).map_err(|e| e.to_string())?;
             for (k, addr, key) in found {
                 let when = sums[k].as_ref().and_then(|s| s.date).or(chunk[k].internal_date).unwrap_or_else(now).min(now());
                 keys.push((addr, key, when, chunk[k].uid));

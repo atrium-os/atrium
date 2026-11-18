@@ -5,4 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }

@@ -184,7 +184,8 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
 /// Whether `req` is one of Prelum's workers (`[print_workers]`, printing.md
 /// §6.1, §6.3), named and rooted like a courier's, taking its caller's
 /// stdio, in one of two shapes:
-/// - `render_exec`: no network at all (`Disable` or `Isolated`);
+/// - `render_exec` and `browse_exec`: no network at all (`Disable` or
+///   `Isolated`; the browser's mDNS sockets come over its stdio);
 /// - `ipp_exec`: a routed vnet whose grants pass only TCP to single
 ///   addresses on stated ports (the pinned printer), nothing inbound, no
 ///   peers, and no resolver (the address arrives resolved).
@@ -199,7 +200,8 @@ pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
     let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
         return false;
     };
-    let network_ok = if exec.path == c.render_exec {
+    let no_net = exec.path == c.render_exec || c.browse_exec.as_deref() == Some(exec.path.as_str());
+    let network_ok = if no_net {
         matches!(req.network, NetworkConfig::Disable | NetworkConfig::Isolated)
     } else if exec.path == c.ipp_exec {
         match &req.network {
@@ -1040,8 +1042,9 @@ mod tests {
     }
 
     /// Prelum's workers: exactly the policy's name, root, binaries and uid,
-    /// render with no network and ipp reaching only stated printer
-    /// addresses, may take the caller's stdio; anything else is refused.
+    /// render and browse with no network and ipp reaching only stated
+    /// printer addresses, may take the caller's stdio; anything else is
+    /// refused.
     #[test]
     fn a_print_worker_jail_and_only_a_print_worker_jail() {
         use crate::protocol::{NetDest, NetGrants, NetworkConfig};
@@ -1065,6 +1068,9 @@ mod tests {
         let ipp = worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(grants(printer())));
         assert!(is_print_worker(&ipp, &p));
         validate_create(&ipp, &p).expect("an ipp worker");
+        let browse = worker("system-prelum-62003", "/usr/local/bin/atrium-prelum-browse", 62003, NetworkConfig::Disable);
+        assert!(is_print_worker(&browse, &p));
+        validate_create(&browse, &p).expect("a browse worker");
         let mut any = grants(vec![]);
         any.outbound_any = true;
         let mut dns = grants(printer());
@@ -1075,6 +1081,7 @@ mod tests {
             (worker("system-prelum-62001", "/usr/local/bin/atrium-prelum-render", 62001, routed(grants(printer()))), "render with a network"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None }), "ipp reaching anywhere"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(any)), "ipp with outbound_any"),
+            (worker("system-prelum-62003", "/usr/local/bin/atrium-prelum-browse", 62003, routed(grants(printer()))), "browse with a network"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002, routed(dns)), "ipp with a resolver"),
             (worker("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002,
                     routed(grants(vec![NetDest { cidr: "192.168.1.0/24".into(), port: Some(631), udp: false }]))), "a whole subnet"),

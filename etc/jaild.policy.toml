@@ -355,6 +355,7 @@ mount_prefix = "/media"
 name_prefix = "system-prelum-"
 render_exec = "/usr/local/bin/atrium-prelum-render"
 ipp_exec    = "/usr/local/bin/atrium-prelum-ipp"
+browse_exec = "/usr/local/bin/atrium-prelum-browse"
 uid_first   = 62000
 uid_last    = 62499
 
@@ -694,8 +695,9 @@ syscalls = [
     "shm_open2",
     # the launcher, which runs inside the jail before execve: jaild's
     # (setgroups, setgid, setuid) and jail(8)'s setusercontext(3), which also
-    # sets the login class, priority, limits and effective ids
-    "setgroups", "setgid", "setuid", "execve", "setloginclass",
+    # sets the login class, priority, limits and effective ids; jaild then
+    # reads the groups back (getgroups) to check the drop took
+    "setgroups", "getgroups", "setgid", "setuid", "execve", "setloginclass",
     "setpriority", "setrlimit", "seteuid", "setegid",
     # threads and signals (libthr)
     "thr_new", "thr_exit", "thr_self", "thr_kill", "thr_wake",

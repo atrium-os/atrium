@@ -754,6 +754,58 @@ font on demand and a driver from a `nobody` device's notice.
   asked with `added` on `Describe`, more care set and cleared, only root or the installer may
   set it, only root may tick); the sheet's update lines.
 
+### 14.7 C6 as built (2026-11-18)
+
+- **Fonts** (`opifex-catalog/src/font.rs`, `opifex/src/font.rs`): `kind = "font"`, a
+  `[font]` table (id, name, version, licence OFL-1.1 or Apache-2.0, description,
+  `languages`, content) and one `[[face]]` per file (family, `<name>.ttf` at the package's
+  top, weight, italic, code point ranges). Releases are for arch `any` (the catalog's
+  `latest` takes them on every machine). `opifex font pack` refuses CFF (`OTTO`), folders and
+  a face the folder lacks. opifexd copies the package against its signed index into
+  `/usr/share/fonts/atrium-extra/<id>/` (`OPIFEX_FONTS`), swaps it in, and rewrites `pins`
+  atomically with each face's BLAKE3 and size as placed; an update replaces the package's
+  lines where they were, so install order (and Han fallback order) stays; the list must read
+  back whole in `atrium_fonts::extra::parse` or nothing is written. Any person installs a
+  font, through the sheet ("Fonts run nothing and see nothing; every app can draw with
+  them."); updates go in the background. frescod picks the list up by itself (fonts.md §5).
+- **Layers**: opifexd installs a catalog layer with the toolchains thread's
+  `layer::install` (platform signature, index, `layers/<name>@<version>`); an update installs
+  the new version beside the old, which stays for workspaces that name it; uninstall removes
+  the recorded version unless a workspace has it mounted. Administrators only.
+- **Drivers and firmware** (`opifex-catalog/src/driver.rs`, `opifex/src/driver.rs`): a driver
+  manifest carries `[[match]]` tables (`usb`: `usb_ids` and/or `usb_interface`; `hid`:
+  `any_page`), so the catalog itself says which devices each driver is for. The package holds
+  `devices.toml` (its `devices.d` file) and its files; the installer refuses rules that claim
+  devices the matches don't show, classes other than usb and hid, owners other than the
+  file's own driver jails, and a driver `exec` outside
+  `/usr/local/libexec/atrium/drivers/<id>/`, where its files go; the rules go to
+  `/usr/local/etc/atrium/devices.d/60-<id>.toml` (root, 0644). A driver's `firmware` ids are
+  installed first, from the catalog. Firmware (`place = "jailed"` or `"kernel"`, `dir`) goes
+  to `/usr/local/share/atrium/firmware/<dir>/` or `/boot/firmware/<dir>/` and never replaces
+  a folder it didn't place. Administrators only (`opifex get`), not through the sheet.
+  dispensatord takes a new driver's devices from its next start.
+- **devices.idx**: opifexd writes `/var/db/atrium/opifex/devices.idx` after every sync (not
+  opifex-check: it is derived from the checked catalog). dispensatord looks a USB interface
+  or HID device nobody drives up in it (`dispensator/src/catalog.rs`, nothing leaves the
+  machine), adds "the catalog has <id>" to the Devices list's why, and posts one Praeco
+  notice per device and package ("A driver is available"). `opifex driver-for usb
+  <vvvv:pppp> [<cc/ss/pp>] | hid <page>` does the same lookup by hand.
+- Updates: fonts in the background; layers, drivers and firmware wait for an administrator;
+  `opifex update-all` (root) applies every waiting update that isn't refused (§11's batched
+  approval).
+- SDK registry: as the toolchains thread built it; the catalog repo's publish step runs
+  `cargo atrium registry verify sdk --keys keys/platform` before copying it to Pages (§14.5).
+- Not yet: a VM gate (a CJK font from the catalog drawn by frescod; a driver offered for a
+  `nobody` USB device and installed); the notice opening Curia's install page for a driver
+  (it names the command for now); PCI devices in the lookup (dispensatord sees USB and HID
+  only); the driver jails' uids in jaild's policy are the package's to have accepted at review
+  (§10.2), not checked by the installer.
+- Checked: host tests (font manifest and pin list round trip, update in place, refusals;
+  layers from the catalog with an update beside the old; a driver installed with its firmware
+  from the catalog, devices.idx after sync, the sheet refused for it, uninstall; rule
+  coverage; firmware placement; lookups; dispensator's planner offering a catalog driver for
+  a nobody device).
+
 ## 15. Decisions, with recommendations
 
 1. **Each catalog downloaded whole** for all lookups, not per-publisher DNS manifests or

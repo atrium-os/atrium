@@ -870,7 +870,8 @@ fn open_chrome(path: &Path) -> std::io::Result<(fresco_split::chan::Chan, u32, s
 /// UIs to tell, newest last, and links that came before any UI did.
 struct Incoming {
     uis: Vec<std::sync::Weak<Mutex<UnixStream>>>,
-    held: Vec<String>,
+    /// Each with the persona it was sent from, if another.
+    held: Vec<(String, Option<String>)>,
 }
 
 static INCOMING: Mutex<Incoming> = Mutex::new(Incoming { uis: Vec::new(), held: Vec::new() });
@@ -879,12 +880,12 @@ static INCOMING: Mutex<Incoming> = Mutex::new(Incoming { uis: Vec::new(), held: 
 const HELD_MAX: usize = 16;
 
 /// A link from another app: to the newest UI, else held for the first.
-fn incoming_link(url: String) {
+fn incoming_link(url: String, from: Option<String>) {
     let mut g = INCOMING.lock().unwrap_or_else(|e| e.into_inner());
     g.uis.retain(|w| w.strong_count() > 0);
     match g.uis.last().and_then(std::sync::Weak::upgrade) {
-        Some(w) => send(&w, &Event::Incoming { url }),
-        None if g.held.len() < HELD_MAX => g.held.push(url),
+        Some(w) => send(&w, &Event::Incoming { url, from }),
+        None if g.held.len() < HELD_MAX => g.held.push((url, from)),
         None => eprintln!("navigatord: a link from another app dropped: {HELD_MAX} already wait for the window"),
     }
 }
@@ -893,8 +894,8 @@ fn incoming_link(url: String) {
 fn ui_ready(w: &Arc<Mutex<UnixStream>>) {
     let mut g = INCOMING.lock().unwrap_or_else(|e| e.into_inner());
     g.uis.push(Arc::downgrade(w));
-    for url in std::mem::take(&mut g.held) {
-        send(w, &Event::Incoming { url });
+    for (url, from) in std::mem::take(&mut g.held) {
+        send(w, &Event::Incoming { url, from });
     }
 }
 
@@ -926,8 +927,13 @@ fn document_channel() {
             match ch.recv_any(None) {
                 Ok(Some(atrium_open::Message::Link(url))) if web_link(&url) => {
                     eprintln!("navigatord: a link from another app: a new trail");
-                    incoming_link(url);
+                    incoming_link(url, None);
                 }
+                Ok(Some(atrium_open::Message::Crossed { url, from })) if web_link(&url) => {
+                    eprintln!("navigatord: a link the person sent from {from}: a new trail");
+                    incoming_link(url, Some(from));
+                }
+                Ok(Some(atrium_open::Message::Crossed { .. })) => eprintln!("navigatord: a link from another persona refused: not a web address"),
                 Ok(Some(atrium_open::Message::Link(_))) => eprintln!("navigatord: a link from another app refused: not a web address"),
                 Ok(Some(atrium_open::Message::File(_))) => eprintln!("navigatord: a file on the document channel: the Navigator opens none"),
                 Ok(None) => {}

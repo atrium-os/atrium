@@ -9,7 +9,7 @@
 #
 #   archive = "https://github.com/atrium-os/catalog-blobs/releases/download/<tag>/<file>.insula"
 #   sha256  = "<hex of the archive>"
-#   arch    = "aarch64"            # or amd64
+#   arch    = "aarch64"            # or amd64; "any" for a font package
 #
 # The archive must already be uploaded. Each request is downloaded, checked
 # against its sha256, unpacked, and added with `opifex catalog add`, which
@@ -39,7 +39,7 @@ for req in incoming/*.toml; do
     [ -f "$req" ] || continue
     url=$(val archive "$req"); sha=$(val sha256 "$req"); arch=$(val arch "$req")
     case "$url" in https://*) ;; *) echo "publish: $req: archive must be an https URL"; exit 1 ;; esac
-    case "$arch" in amd64|aarch64) ;; *) echo "publish: $req: arch is amd64 or aarch64"; exit 1 ;; esac
+    case "$arch" in amd64|aarch64|any) ;; *) echo "publish: $req: arch is amd64, aarch64 or any"; exit 1 ;; esac
     a="$WORK/$n.insula"
     curl -fsSL --proto '=https' -o "$a" "$url"
     got=$( (sha256sum "$a" 2>/dev/null || shasum -a 256 "$a") | cut -d' ' -f1)

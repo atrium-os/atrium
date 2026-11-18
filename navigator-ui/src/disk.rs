@@ -69,6 +69,8 @@ struct TrailRec {
     muted: bool,
     #[serde(default)]
     active: u64,
+    #[serde(default)]
+    anonymous: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -142,6 +144,7 @@ fn trail_rec(t: &Trail) -> TrailRec {
         current: t.current,
         muted: t.muted,
         active: t.active,
+        anonymous: t.anonymous,
     }
 }
 
@@ -190,6 +193,7 @@ fn trail_of(r: TrailRec, facts: &dyn Fn(&str) -> Facts) -> Result<Trail, String>
     t.current = r.current;
     t.muted = r.muted;
     t.active = r.active;
+    t.anonymous = r.anonymous;
     Ok(t)
 }
 

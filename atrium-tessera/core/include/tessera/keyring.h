@@ -56,8 +56,13 @@ struct tkey_format {
 	int32_t  fd;
 	uint32_t suite;
 	uint32_t hash_alg;
-	uint32_t flags;               /* none yet; must be 0 */
+	uint32_t flags;               /* TKEY_FORMAT_RECOVERY or 0 */
+	/* With TKEY_FORMAT_RECOVERY: arcad's recovery slot (§7.4; type 3,
+	 * Argon2id, the key wrapped under the code), put in key_slots[0]
+	 * under the superblock's HMAC. */
+	uint8_t  recovery_slot[256];
 };
+#define TKEY_FORMAT_RECOVERY 0x1u
 
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
