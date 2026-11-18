@@ -317,10 +317,102 @@ pub struct Ui {
     pub gen: u64,
     /// The quick filters on (§11.7; `mail_engine::quick` bits).
     pub quick: u16,
+    /// Section headers in the list (§11.7), off by default.
+    pub group: Group,
+    /// Sections folded, by label.
+    pub folded: Vec<String>,
     pub error: Option<String>,
 }
 
 const PAGE: usize = 100;
+
+/// How the list is grouped (§11.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Group {
+    #[default]
+    None,
+    /// Today, Yesterday, This week, Earlier this month, then by month.
+    Date,
+    /// One person's mail together, the newest sender first.
+    Sender,
+}
+
+impl Group {
+    pub fn label(self) -> &'static str {
+        match self {
+            Group::None => "No grouping",
+            Group::Date => "By date",
+            Group::Sender => "By sender",
+        }
+    }
+    fn next(self) -> Group {
+        match self {
+            Group::None => Group::Date,
+            Group::Date => Group::Sender,
+            Group::Sender => Group::None,
+        }
+    }
+}
+
+/// A section's header in a grouped list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Header {
+    pub label: String,
+    /// Rows in it, and unread ones (kept when folded).
+    pub rows: usize,
+    pub unread: usize,
+    pub folded: bool,
+}
+
+/// A line of a grouped list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    Header(Header),
+    Row(ListRow),
+}
+
+/// The date section of wall-clock time `t` seen at wall-clock `now`.
+pub fn date_section(t: i64, now: i64) -> String {
+    let day = |x: i64| x.div_euclid(86_400);
+    let ago = day(now) - day(t);
+    let (y, m, _, _, _) = crate::civil_of(t);
+    let (ny, nm, _, _, _) = crate::civil_of(now);
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    match ago {
+        i64::MIN..=0 => "Today".into(),
+        1 => "Yesterday".into(),
+        2..=6 => "This week".into(),
+        _ if (y, m) == (ny, nm) => "Earlier this month".into(),
+        _ => format!("{} {y}", MONTHS[m as usize - 1]),
+    }
+}
+
+/// `rows` (newest first) in sections, folded ones without their rows.
+pub fn sections(rows: &[ListRow], group: Group, now: i64, folded: &[String]) -> Vec<Entry> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by: HashMap<String, Vec<&ListRow>> = HashMap::new();
+    for r in rows {
+        let label = match group {
+            Group::Date => date_section(mail_engine::clock::to_local(r.date), mail_engine::clock::to_local(now)),
+            _ => r.people.split(", ").next().unwrap_or("").to_string(),
+        };
+        let label = if label.is_empty() { "(no sender)".to_string() } else { label };
+        if !by.contains_key(&label) {
+            order.push(label.clone());
+        }
+        by.entry(label).or_default().push(r);
+    }
+    let mut out = Vec::new();
+    for label in order {
+        let rs = &by[&label];
+        let folded = folded.contains(&label);
+        out.push(Entry::Header(Header { label: label.clone(), rows: rs.len(), unread: rs.iter().filter(|r| r.unread).count(), folded }));
+        if !folded {
+            out.extend(rs.iter().map(|r| Entry::Row((*r).clone())));
+        }
+    }
+    out
+}
 
 /// Rows read from the index a page at a time, for one `gen`.
 #[derive(Default)]
@@ -329,6 +421,8 @@ struct Pages {
     folder: Option<FolderId>,
     pages: HashMap<usize, Vec<ListRow>>,
 }
+
+type GroupKey = (u64, FolderId, bool, u16, Group, Vec<String>);
 
 /// The engine and the state, shared by the view and its handlers.
 #[derive(Clone)]
@@ -339,6 +433,9 @@ pub struct Mail {
     /// The chosen folder's rows that pass the quick filters, for one
     /// (gen, folder, conversations, filters).
     filtered: Rc<RefCell<Option<((u64, FolderId, bool, u16), Rc<Vec<ListRow>>)>>>,
+    /// The grouped list, for one (gen, folder, conversations, filters,
+    /// grouping, folded).
+    grouped: Rc<RefCell<Option<(GroupKey, Rc<Vec<Entry>>)>>>,
     /// The chips' height as last drawn, above the list.
     chips_h: Rc<std::cell::Cell<f32>>,
     /// The list's scroll, to keep the cursor in view on j/k.
@@ -436,6 +533,12 @@ impl Mail {
             });
         }
         let folder = ui.folder?;
+        if ui.group != Group::None {
+            return match self.entries(folder, &ui).get(i) {
+                Some(Entry::Row(r)) => Some(r.clone()),
+                _ => None,
+            };
+        }
         if ui.quick != 0 {
             return self.filtered_rows(folder, ui.conversations, ui.quick).get(i).cloned();
         }
@@ -475,6 +578,68 @@ impl Mail {
         rows
     }
 
+    /// The grouped list's lines for `ui`'s grouping.
+    fn entries(&self, folder: FolderId, ui: &Ui) -> Rc<Vec<Entry>> {
+        let key = (ui.gen, folder, ui.conversations, ui.quick, ui.group, ui.folded.clone());
+        if let Some((k, e)) = &*self.grouped.borrow() {
+            if *k == key {
+                return e.clone();
+            }
+        }
+        let rows = self.filtered_rows(folder, ui.conversations, ui.quick);
+        let e = Rc::new(sections(&rows, ui.group, (self.now)(), &ui.folded));
+        *self.grouped.borrow_mut() = Some((key, e.clone()));
+        e
+    }
+
+    /// The section header at line `i` of a grouped list.
+    pub fn header(&self, i: usize) -> Option<Header> {
+        let ui = self.ui.get_cloned();
+        if ui.group == Group::None || ui.search.is_some() {
+            return None;
+        }
+        match self.entries(ui.folder?, &ui).get(i) {
+            Some(Entry::Header(h)) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
+    /// Group the list the next way: none, by date, by sender (§11.7).
+    pub fn next_group(&self) {
+        let g = self.ui.get_cloned().group.next();
+        self.set_group(g);
+    }
+
+    pub fn set_group(&self, g: Group) {
+        let mut ui = self.ui.get_cloned();
+        ui.group = g;
+        ui.folded.clear();
+        self.relist(ui);
+    }
+
+    /// Fold or unfold the section `label`.
+    pub fn fold(&self, label: &str) {
+        let mut ui = self.ui.get_cloned();
+        match ui.folded.iter().position(|l| l == label) {
+            Some(k) => {
+                ui.folded.remove(k);
+            }
+            None => ui.folded.push(label.to_string()),
+        }
+        self.relist(ui);
+    }
+
+    /// Set `ui` with the list read again from the top.
+    fn relist(&self, mut ui: Ui) {
+        ui.gen += 1;
+        self.ui.set(ui.clone());
+        ui.count = ui.folder.map_or(0, |f| self.count_with(f, ui.conversations, ui.quick));
+        ui.cursor = None;
+        ui.reading = None;
+        self.ui.set(ui);
+        self.list.set(ScrollState::default());
+    }
+
     /// Where the list's first row starts, as last drawn: under the
     /// heading and the quick-filter chips.
     pub fn list_top(&self) -> f32 {
@@ -485,13 +650,7 @@ impl Mail {
     pub fn toggle_quick(&self, bit: u16) {
         let mut ui = self.ui.get_cloned();
         ui.quick ^= bit;
-        ui.gen += 1;
-        self.ui.set(ui.clone());
-        ui.count = ui.folder.map_or(0, |f| self.count_with(f, ui.conversations, ui.quick));
-        ui.cursor = None;
-        ui.reading = None;
-        self.ui.set(ui);
-        self.list.set(ScrollState::default());
+        self.relist(ui);
     }
 
     fn count_of(&self, folder: FolderId, conversations: bool) -> usize {
@@ -499,6 +658,11 @@ impl Mail {
     }
 
     fn count_with(&self, folder: FolderId, conversations: bool, quick: u16) -> usize {
+        let ui = self.ui.get_cloned();
+        if ui.group != Group::None && ui.search.is_none() {
+            let ui = Ui { conversations, quick, folder: Some(folder), ..ui };
+            return self.entries(folder, &ui).len();
+        }
         if quick != 0 {
             return self.filtered_rows(folder, conversations, quick).len();
         }
@@ -701,6 +865,10 @@ impl Mail {
     /// Select row `i` and show its conversation or message: the newest
     /// message and any unread ones open, the others folded (§15.2).
     pub fn open(&self, i: usize) {
+        if let Some(h) = self.header(i) {
+            self.fold(&h.label);
+            return;
+        }
         let Some(row) = self.row(i) else { return };
         let store = &self.engine.store;
         // A search result is read where it was found: its first folder.
@@ -1876,6 +2044,16 @@ impl Mail {
             (Key::End, _) => ui.count - 1,
             _ => return false,
         };
+        // Section headers are passed over, in the direction moved.
+        let down = ui.cursor.is_none() || !matches!((key, chars.as_str()), (Key::Up, _) | (Key::Char, "k") | (Key::End, _));
+        let mut next = next;
+        while self.header(next).is_some() {
+            match (down, next) {
+                (true, n) if n + 1 < ui.count => next = n + 1,
+                (false, n) if n > 0 => next = n - 1,
+                _ => return true,
+            }
+        }
         if ui.cursor != Some(next) {
             self.open(next);
             let shown = self.size.get().1 - head_h() - self.chips_h.get();
@@ -2085,6 +2263,7 @@ impl MailView {
             ui,
             pages: Rc::default(),
             filtered: Rc::default(),
+            grouped: Rc::default(),
             chips_h: Rc::default(),
             now: Rc::new(now),
             dark: Rc::default(),
@@ -2351,6 +2530,17 @@ impl MailView {
             ctx.pop();
             x += lw + gap;
         }
+        // Grouping (§11.7): a press moves to the next way.
+        let label = ui.group.label();
+        let lw = width(label, type_size::XS, Weight::Medium) + em(28.0);
+        if x + lw > x0 + w - 12.0 && x > x0 + 12.0 {
+            x = x0 + 12.0;
+            y += ch + gap;
+        }
+        let m = self.mail.clone();
+        area(ctx, Rect::new(x, y, lw, ch), Color::TRANSPARENT, move || m.next_group());
+        text(ctx, x + em(8.0), y + ch / 2.0, &format!("{label} ⌄"), type_size::XS, Weight::Medium, if ui.group == Group::None { t.text_secondary() } else { t.accent_fg() });
+        ctx.pop();
         y + ch + em(8.0) - head_h()
     }
 
@@ -2450,6 +2640,24 @@ impl MailView {
         VirtualList::new(self.mail.list.clone(), Rect::new(x0, top, w - 1.0, h - top), ui.count, row_h(), move |i, ctx| {
             let t = ctx.theme;
             row(ctx, w - 1.0, row_h());
+            // A section header (§11.7): its name, its unread count, and a
+            // press folds it.
+            if let Some(hd) = m.header(i) {
+                let mm = m.clone();
+                let label = hd.label.clone();
+                area(ctx, Rect::new(6.0, 1.0, w - 13.0, row_h() - 2.0), if cursor == Some(i) { t.selection_bg() } else { Color::TRANSPARENT }, move || mm.fold(&label));
+                let cy = row_h() - em(18.0);
+                let mark = if hd.folded { "▸" } else { "▾" };
+                text(ctx, 16.0, cy, mark, type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, 16.0 + em(18.0), cy, &fit(&hd.label, type_size::SM, Weight::Semibold, w - 120.0), type_size::SM, Weight::Semibold, t.text_primary());
+                let n = if hd.unread > 0 { format!("{} unread", hd.unread) } else { hd.rows.to_string() };
+                let nw = width(&n, type_size::XS, Weight::Regular);
+                text(ctx, w - 17.0 - nw, cy, &n, type_size::XS, Weight::Regular, t.text_secondary());
+                ctx.add(Node::Rect { rect: Rect::new(12.0, row_h() - 1.0, w - 25.0, 1.0), fill: t.border_default(), radius: 0.0 });
+                ctx.pop();
+                ctx.pop();
+                return;
+            }
             let Some(r) = m.row(i) else {
                 ctx.pop();
                 return;

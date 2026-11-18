@@ -851,3 +851,83 @@ fn quick_filters_narrow_the_list() {
     app.tick();
     assert_eq!(mail.ui.get_cloned().count, 0, "{:?}", subjects(&mail));
 }
+
+#[test]
+fn grouped_by_date_and_by_sender_and_folded() {
+    use atrium_mail::view::{date_section, Group};
+    // Sections of local wall-clock times (Mon 23 Nov 2026).
+    let now = NOW;
+    let d = 86_400;
+    assert_eq!(date_section(now - 60, now), "Today");
+    assert_eq!(date_section(now - d, now), "Yesterday");
+    assert_eq!(date_section(now - 4 * d, now), "This week");
+    assert_eq!(date_section(now - 20 * d, now), "Earlier this month");
+    assert_eq!(date_section(now - 40 * d, now), "October 2026");
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let at = |uid: u32, from: &str, subject: &str, t: i64, seen: bool| {
+        let mut f = threaded(uid, from, subject, "Hi.", t, &format!("<g{uid}@x>"), "");
+        f.flags = if seen { vec!["\\Seen".into()] } else { vec![] };
+        // threaded() writes every date on 23 Nov; the stored date is the
+        // server's arrival time.
+        f.internal_date = Some(t);
+        f
+    };
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![
+            at(1, "Lena <lena@partner.example>", "Today 1", NOW - 600, false),
+            at(2, "Arun <arun@acme.example>", "Today 2", NOW - 1200, true),
+        ]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "No grouping ⌄"));
+    // By date: one header, then both.
+    mail.set_group(Group::Date);
+    app.tick();
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.count, 3);
+    let h = mail.header(0).unwrap();
+    assert_eq!((h.label.as_str(), h.rows, h.unread), ("Today", 2, 1));
+    assert!(mail.row(0).is_none() && mail.row(1).is_some());
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Today") && t.iter().any(|x| x == "1 unread") && t.iter().any(|x| x == "By date ⌄"), "{t:?}");
+    // A press on the header folds it; its unread count stays.
+    mail.open(0);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 1);
+    assert!(mail.header(0).unwrap().folded);
+    assert!(texts(&app).iter().any(|x| x == "1 unread"));
+    mail.open(0);
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    // j passes over the header to the first message.
+    assert!(mail.key(&key("j"), None));
+    assert_eq!(mail.ui.get_cloned().cursor, Some(1));
+    assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Today 1");
+    // By sender: a section each, the newest sender first.
+    mail.next_group();
+    app.tick();
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.group, Group::Sender);
+    assert_eq!(ui.count, 4);
+    assert_eq!(mail.header(0).unwrap().label, "Lena");
+    assert_eq!(mail.header(2).unwrap().label, "Arun");
+    // With a filter on, only what passes is grouped: Lena's was read
+    // above, so nothing is unread and no section is left.
+    mail.toggle_quick(mail_engine::quick::FROM_PEOPLE);
+    assert_eq!(mail.ui.get_cloned().count, 4);
+    mail.toggle_quick(mail_engine::quick::FROM_PEOPLE);
+    mail.toggle_quick(mail_engine::quick::UNREAD);
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    mail.toggle_quick(mail_engine::quick::UNREAD);
+    mail.next_group();
+    assert_eq!(mail.ui.get_cloned().group, Group::None);
+    assert_eq!(mail.ui.get_cloned().count, 2);
+}

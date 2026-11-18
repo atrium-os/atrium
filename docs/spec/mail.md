@@ -1197,7 +1197,7 @@ Stalwart in the cloud VM, and later a real account):
    **Not yet**: a settings page (screener switch, review time, quiet hours, sounds,
    VIPs), times in the person's time zone (built later, see M8), Later notes typed in the sheet,
    the weekly look and the 7/30-day overdue rules, `$Snoozed` and a server *Snoozed*
-   folder, grouping (§11.7; quick filters built later, see M8), server-side search outside the offline
+   folder, (quick filters and grouping, §11.7, built later, see M8), server-side search outside the offline
    window, Praeco's longer posts and event times (tabula.md §5.3–5.4, so freshness uses
    the message's date), notification actions, and a VM run.
 8. **M7** S/MIME with Sigillum tokens and Arca certificates; JMAP; OAuth (Microsoft first).
@@ -1471,9 +1471,15 @@ Stalwart in the cloud VM, and later a real account):
    back* (Later items come back). They run on the local index (`mail_engine::quick`), in
    Conversations or Messages, looking through at most 5,000 rows; the count follows, and
    "Nothing matches these filters" says why a list is empty. Tests: the window 1 (each
-   chip, two combined, none matching, and a reply in Sent ending *Needs reply*). **Not
-   yet**: grouping (§11.7), saving a filter set as a smart folder, and the chips in a
-   search's results.
+   chip, two combined, none matching, and a reply in Sent ending *Needs reply*). **Grouping** (the same day): a control after the chips
+   moves through no grouping, *By date* (Today, Yesterday, This week, Earlier this month,
+   then by month, in local time) and *By sender* (one section per first sender, the
+   newest sender first). Headers are lines of the list: a press folds one, a folded one
+   keeps its row and unread count, and j/k pass over headers. Grouping runs after the
+   filters. Tests: the window 1 (date sections, folding, j over a header, by sender, with
+   a filter). **Not yet**: grouping by account and by lane, remembering the grouping per
+   folder, saving a filter set as a smart folder, and the chips in a search's
+   results.
 
 ## 17. Decisions, with recommendations
 

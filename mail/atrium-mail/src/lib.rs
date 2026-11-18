@@ -54,6 +54,11 @@ pub fn full_date_local(t: i64) -> String {
     format!("{d} {} {y}, {hh:02}:{mm:02}", MONTHS[m as usize - 1])
 }
 
+/// (year, month, day, hour, minute) of seconds since the epoch as UTC.
+pub fn civil_of(t: i64) -> (i64, u32, u32, u32, u32) {
+    civil(t)
+}
+
 /// (year, month, day, hour, minute) of seconds since the epoch as UTC
 /// (Howard Hinnant's civil_from_days).
 fn civil(t: i64) -> (i64, u32, u32, u32, u32) {
