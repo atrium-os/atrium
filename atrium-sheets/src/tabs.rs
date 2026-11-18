@@ -46,6 +46,9 @@ pub enum TabCmd {
     Linking,
     LinkDone,
     LinkCancel,
+    /// The value a validation rule warned about: kept, or taken back.
+    WarnKeep,
+    WarnUndo,
 }
 
 /// The colours the tab colour bar offers, 0xRRGGBB, with their names.

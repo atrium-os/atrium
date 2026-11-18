@@ -23,6 +23,7 @@ use officina_grid::addr::{CellAddr, Rect};
 use officina_grid::csv::{self, CsvOptions, CsvStats};
 use officina_grid::native;
 use officina_grid::ops::GridOp;
+use officina_grid::validation::{ErrorStyle, Refusal};
 use officina_grid::{Input, Workbook};
 
 /// Undo steps kept.
@@ -368,6 +369,9 @@ pub struct Doc {
     /// ([`Workbook::memory_bytes`]): a change that would take it past is undone
     /// and the user told. [`MAKE_LIMIT`], so a workbook made here opens anywhere.
     pub memory_budget: u64,
+    /// A value a validation rule warns about, just typed: the window asks
+    /// whether to keep it (§16.83).
+    pub warned: Option<(CellAddr, String)>,
 }
 
 /// The most a workbook may grow to by editing: the least that any machine
@@ -390,6 +394,27 @@ pub fn default_memory_budget() -> u64 {
 /// The app's recalculation slice: well under a frame at 30 Hz.
 pub const RECALC_SLICE: std::time::Duration = std::time::Duration::from_millis(12);
 
+/// What a refused or warned value is told: the rule's own message, or what
+/// it allows.
+pub fn refusal_text(r: &Refusal) -> String {
+    let title = r.error.title.trim();
+    let text = r.error.text.trim();
+    let own = match (title.is_empty(), text.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => title.to_string(),
+        (true, false) => text.to_string(),
+        (false, false) => format!("{title}: {text}"),
+    };
+    let own = own.replace('\n', " ");
+    if !own.is_empty() {
+        return own;
+    }
+    match r.style {
+        ErrorStyle::Stop => format!("This cell takes {}.", r.wants),
+        _ => format!("This cell expects {}.", r.wants),
+    }
+}
+
 impl Doc {
     pub fn new(name: &str) -> Self {
         let mut wb = Workbook::new();
@@ -398,7 +423,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -553,8 +578,40 @@ impl Doc {
             return true;
         }
         self.status.clear();
-        self.run("Typing", vec![GridOp::set(CellAddr::new(self.sheet, row, col), input)]);
+        self.warned = None;
+        let a = CellAddr::new(self.sheet, row, col);
+        self.run("Typing", vec![GridOp::set(a, input)]);
+        // A validation rule over the cell: refuse, warn, or tell (§16.83).
+        if let Err(r) = self.wb.check_cell(a) {
+            let msg = refusal_text(&r);
+            match r.style {
+                ErrorStyle::Stop => {
+                    self.undo();
+                    self.status = msg;
+                    return false;
+                }
+                ErrorStyle::Warning => {
+                    self.status = msg.clone();
+                    self.warned = Some((a, msg));
+                }
+                ErrorStyle::Information => self.status = msg,
+            }
+        }
         true
+    }
+
+    /// Keeps the value a rule warned about.
+    pub fn keep_warned(&mut self) {
+        self.warned = None;
+        self.status.clear();
+    }
+
+    /// Takes back the value a rule warned about (if it is still the last change).
+    pub fn undo_warned(&mut self) {
+        if self.warned.take().is_some() && self.history.undo_label() == Some("Typing") {
+            self.undo();
+            self.status = "Taken back.".into();
+        }
     }
 
     pub fn clear(&mut self, r0: u32, c0: u32, r1: u32, c1: u32) {

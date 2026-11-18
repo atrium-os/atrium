@@ -3672,6 +3672,33 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** charts over the frozen area (drawn under the bands), freezing from a row other than the first (Excel freezes from the row at the top of the view), and repeating frozen rows when printing.
 - **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
 
+### 16.83 Data validation (2026-11-18)
+
+- **Engine** (`officina-grid/src/validation.rs`).
+  - A rule covers ranges of one sheet and allows any value, a whole or decimal number, a value from a list, a date, a time, a text length, or a formula that must be TRUE. Numbers, dates, times and lengths compare against one formula or two (between).
+  - A rule also has an input prompt and an error message. Its error style says whether a disallowed value is stopped, warned about or only told.
+  - A list is a range or a text of items split by commas, as Excel keeps it.
+  - Formulas are written for the first range's top-left and move with rows and columns as conditional formats' do.
+  - `check_cell` runs after an entry goes in, because a custom formula may read the cell itself. A refused entry is undone.
+  - `GridOp::Validations` (journal tag 20) sets the rules as one undo step, and the native file keeps them in chunk `VALIDATIONS` (20). Deleting a sheet takes its rules with it, and undo brings them back.
+  - Limits: 65,536 rules, 1,024 ranges a rule, 1 KiB a message, 4,096 list items.
+- **Files.**
+  - **.xlsx:** `<dataValidations>`. Excel's `showDropDown="1"` means the drop-down is hidden. Excel 2010's `x14` rules (lists on other sheets in old files) are noted as dropped.
+  - **.ods:** `table:content-validations` before the tables, and each covered cell names its rule (`table:content-validation-name`). Conditions use OpenDocument's text, such as `cell-content-is-whole-number() and cell-content-is-between(1,100)`, `cell-content-is-in-list("Yes";"No")` or `is-true-formula(…)`. Their formulas are relative to the base cell.
+  - Writing names at most 10,000 rows past a sheet's last used row (a whole-column rule would otherwise name a million cells), and 500,000 cells per file.
+  - **LibreOffice:** it reads our .xlsx and writes .ods, and reads our .ods and writes .xlsx, with every rule coming back the same (`officina-convert/tests/validation.rs`). LibreOffice writes a second formula of `0` for one-formula rules, and we drop it.
+- **Sheets.**
+  - A value a Stop rule refuses is taken back, and the status line gives the rule's own message, or what the cell takes ("This cell takes one of: Yes, No.").
+  - A Warning rule keeps the value and asks in a bar under the grid: Keep, or Undo.
+  - An Information rule keeps the value and says why in the status line.
+  - The cursor cell's input prompt shows beside it, as a comment does. A list cell adds the hint "Data ▸ Choose from List…", which opens the list at the right of the grid, with a search. A press types the item in, and the rule checks it as it checks typing.
+- **Not yet:**
+  - A dialog to make or change rules (rules come from files for now).
+  - A drop-down button in the cell, and Alt+↓.
+  - Checking pasted values (Excel doesn't either).
+  - Circling invalid data.
+- **Gates:** officina-grid `rules_allow_and_refuse_values` and `rules_are_undone_saved_and_move_with_rows`; officina-convert `tests/validation.rs`; atrium-sheets `validation_refuses_warns_and_offers_its_list`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

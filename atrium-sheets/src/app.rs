@@ -73,6 +73,10 @@ pub enum Cmd {
     FilterAll(bool),
     FilterApply,
     FilterCancel,
+    /// The validation list: item `i` (of those the search shows) typed into
+    /// the cell; closed.
+    ListPick(usize),
+    ListCancel,
     /// The conditional-format panel.
     Cond(CondCmd),
     /// The pivot field list.
@@ -136,6 +140,24 @@ pub const COND_ROW_H: f32 = 44.0;
 pub const FILTER_W: f32 = 300.0;
 /// A value's row in the list.
 pub const FILTER_ROW_H: f32 = 28.0;
+
+/// A validation rule's list, to pick the cell's value from (§16.83).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListPanel {
+    pub open: bool,
+    pub sheet: u16,
+    pub row: u32,
+    pub col: u32,
+    pub items: Vec<String>,
+}
+
+impl ListPanel {
+    /// The items the search `q` shows (ignoring case), by index.
+    pub fn shown(&self, q: &str) -> Vec<usize> {
+        let q = q.trim().to_lowercase();
+        (0..self.items.len()).filter(|&i| q.is_empty() || self.items[i].to_lowercase().contains(&q)).collect()
+    }
+}
 
 /// The value list of a filter column: what Apply keeps.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -250,6 +272,9 @@ pub struct Sheets {
     /// The link bar: the cell it writes the link of, and its field.
     pub linking: Mutable<Option<(u16, u32, u32)>>,
     pub link_text: Mutable<TextEdit>,
+    pub list: Mutable<ListPanel>,
+    pub list_search: Mutable<TextEdit>,
+    pub list_scroll: Mutable<ScrollState>,
     /// The activation of the press on Open Link, for the link opener.
     pub link_press: Rc<Cell<Option<fresco_protocol::activation::Token>>>,
     /// The link opener's answer, from its thread.
@@ -260,7 +285,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -915,7 +940,48 @@ impl Sheets {
                 self.linking.set(None);
                 self.changed();
             }
+            TabCmd::WarnKeep => {
+                self.doc.borrow_mut().keep_warned();
+                self.changed();
+            }
+            TabCmd::WarnUndo => {
+                self.doc.borrow_mut().undo_warned();
+                self.changed();
+            }
         }
+    }
+
+    /// Opens the cursor cell's validation list, or says why not.
+    pub fn choose_from_list(&self) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let mut d = self.doc.borrow_mut();
+        let a = officina_grid::addr::CellAddr::new(d.sheet, r, c);
+        let items: Vec<String> = d.wb.list_items(a).iter().map(|v| v.display()).filter(|t| !t.is_empty()).collect();
+        if items.is_empty() {
+            d.status = "This cell has no list to choose from.".into();
+            return;
+        }
+        let sheet = d.sheet;
+        drop(d);
+        self.list.set(ListPanel { open: true, sheet, row: r, col: c, items });
+        self.list_search.set(TextEdit::new(""));
+        self.list_scroll.set(ScrollState::default());
+    }
+
+    /// Types item `k` of those the list's search shows into its cell.
+    pub fn list_pick(&self, k: usize) {
+        let p = self.list.get_cloned();
+        let shown = p.shown(self.list_search.get_cloned().text());
+        self.list.set(ListPanel::default());
+        let Some(text) = shown.get(k).and_then(|&i| p.items.get(i)) else { return };
+        let mut d = self.doc.borrow_mut();
+        if d.sheet != p.sheet {
+            return;
+        }
+        // A text that would read as a formula or a number stays the item's text.
+        d.type_into(p.row, p.col, text);
+        drop(d);
+        self.rev.set(self.rev.get().wrapping_add(1));
     }
 
     /// The tab strip at `y`: add, earlier, later, then the tabs that fit; or
@@ -937,6 +1003,16 @@ impl Sheets {
             TextField::new(self.rename_text.clone()).autofocus(true).at(116.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::RenameDone))).render(ctx);
             Button::primary("Rename").at(124.0 + fw, y + 2.0).width(80.0).on_click(push(TabCmd::RenameDone)).render(ctx);
             Button::secondary("Cancel").at(212.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::RenameCancel)).render(ctx);
+            return;
+        }
+        let warned = self.doc.borrow().warned.clone();
+        if let Some((a, msg)) = warned {
+            let st = crate::tabs::style(t.text_primary(), true);
+            let label = format!("{}: {msg} Keep it?", officina_grid::addr::a1(a.row, a.col));
+            let lw = (w - 180.0).max(80.0);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, lw, 18.0), content: label, style: st });
+            Button::primary("Keep").at(w - 160.0, y + 2.0).width(72.0).on_click(push(TabCmd::WarnKeep)).render(ctx);
+            Button::secondary("Undo").at(w - 80.0, y + 2.0).width(72.0).on_click(push(TabCmd::WarnUndo)).render(ctx);
             return;
         }
         if let Some((_, r, c)) = self.commenting.get() {
@@ -1310,6 +1386,47 @@ impl View for Sheets {
             ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, FILTER_W, 1.0), fill: t.border_default(), radius: 0.0 });
             Button::secondary("Cancel").at(x0 + FILTER_W - 164.0, by).width(72.0).on_click(push(Cmd::FilterCancel)).render(ctx);
             Button::primary("Apply").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(push(Cmd::FilterApply)).render(ctx);
+        }
+
+        // A validation list, at the right over the grid: a press types an item.
+        let lp = self.list.get_cloned();
+        if lp.open && !pb.open {
+            let (x0, y0) = ((w - FILTER_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(160.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, FILTER_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            let title = format!("Choose for {}", officina_grid::addr::a1(lp.row, lp.col));
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, FILTER_W - 24.0, 20.0), content: title, style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            let cmds = self.cmds.clone();
+            TextField::new(self.list_search.clone()).placeholder("Search the list").autofocus(true).at(x0 + 12.0, y0 + 38.0).width(FILTER_W - 24.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::ListPick(0))).render(ctx);
+            let shown = lp.shown(self.list_search.get_cloned().text());
+            let ly = y0 + 80.0;
+            let lh = (ph - 80.0 - 56.0).max(FILTER_ROW_H);
+            let (items, cmds) = (Rc::new(lp.items.clone()), self.cmds.clone());
+            let rows = Rc::new(shown);
+            let n = rows.len();
+            pergola::widgets::VirtualList::new(self.list_scroll.clone(), Rect::new(x0 + 1.0, ly, FILTER_W - 1.0, lh), n, FILTER_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, FILTER_W - 1.0, FILTER_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let label: String = items[rows[k]].chars().take(60).collect();
+                let hit = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, FILTER_W - 1.0, FILTER_ROW_H), fill: Color::TRANSPARENT, radius: 0.0 });
+                let cmds = cmds.clone();
+                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::ListPick(k)));
+                ctx.add(Node::Text { rect: Rect::new(12.0, 6.0, FILTER_W - 24.0, 16.0), content: label, style: TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() } });
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0xF118)
+            .emit(ctx);
+            if n == 0 {
+                ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, ly + 8.0, FILTER_W - 24.0, 18.0), content: "No item matches.".into(), style: st(type_size::SM, Weight::Regular, t.text_secondary()) });
+            }
+            let by = y0 + ph - 48.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, by - 8.0, FILTER_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            let cmds = self.cmds.clone();
+            Button::secondary("Cancel").at(x0 + FILTER_W - 84.0, by).width(72.0).on_click(move || cmds.lock().unwrap().push(Cmd::ListCancel)).render(ctx);
         }
 
         // The conditional-format panel, at the right over the grid.
@@ -1688,6 +1805,21 @@ impl Sheets {
                     self.pivot_cmd(c);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::ChooseFromList) => {
+                    self.choose_from_list();
+                    self.changed();
+                    false
+                }
+                Cmd::ListPick(k) => {
+                    self.list_pick(k);
+                    self.changed();
+                    false
+                }
+                Cmd::ListCancel => {
+                    self.list.set(ListPanel::default());
+                    self.changed();
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::ChooseValues) => {
                     self.choose_values(self.grid.get_cloned().cursor.1);
                     false
@@ -1945,6 +2077,67 @@ mod tests {
         run(DataCmd::DeleteRows);
         assert_eq!(f(2, 0).as_deref(), Some("=SUM(A1:A2)"));
         assert_eq!(s.doc.borrow().wb.value(0, 2, 0), officina_grid::Value::Num(5.0));
+    }
+
+    #[test]
+    fn validation_refuses_warns_and_offers_its_list() {
+        use crate::data::DataCmd;
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, ErrorStyle, Message, Validation};
+        use officina_grid::{Rect as R, Value};
+        let mut d = Doc::new("v");
+        let r = |r0, c0, r1, c1| R { sheet: 0, r0, c0, r1, c1 };
+        let f = |d: &Doc, s: &str| Some(d.wb.validation_formula(s, 0, (0, 0)).unwrap());
+        let mut list = Validation::new(0, vec![r(0, 0, 9, 0)], Allow::List, CmpOp::Between, f(&d, "\"Yes,No,Maybe later\""), None);
+        list.prompt = Message::new("Answer", "Yes or no.");
+        let mut whole = Validation::new(0, vec![r(0, 1, 9, 1)], Allow::Whole, CmpOp::Between, f(&d, "1"), f(&d, "10"));
+        whole.error = Message::new("Too many", "Ten at most.");
+        let mut warn = Validation::new(0, vec![r(0, 2, 9, 2)], Allow::Decimal, CmpOp::LessOrEqual, f(&d, "100"), None);
+        warn.style = ErrorStyle::Warning;
+        for v in [list, whole, warn] {
+            d.wb.add_validation(v).unwrap();
+        }
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let v = |r: u32, c: u32| s.doc.borrow().wb.value(0, r, c);
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        // Not in the list: refused, with what it takes.
+        assert!(!s.doc.borrow_mut().type_into(0, 0, "Perhaps"));
+        assert_eq!(v(0, 0), Value::Empty);
+        assert_eq!(s.doc.borrow().status, "This cell takes one of: Yes, No, Maybe later.");
+        assert!(s.doc.borrow_mut().type_into(0, 0, "yes"));
+        // Out of range: refused with the rule's own message.
+        assert!(!s.doc.borrow_mut().type_into(0, 1, "12"));
+        assert_eq!(s.doc.borrow().status, "Too many: Ten at most.");
+        assert!(s.doc.borrow_mut().type_into(0, 1, "7"));
+        assert_eq!(v(0, 1), Value::Num(7.0));
+        // A warning keeps the value and asks; Undo takes it back.
+        assert!(s.doc.borrow_mut().type_into(0, 2, "150"));
+        assert_eq!(v(0, 2), Value::Num(150.0));
+        assert!(texts().iter().any(|t| t == "C1: This cell expects a number at most 100. Keep it?"), "{:?}", texts());
+        s.tab_cmd(crate::tabs::TabCmd::WarnUndo);
+        assert_eq!(v(0, 2), Value::Empty);
+        assert!(s.doc.borrow().warned.is_none());
+        assert!(s.doc.borrow_mut().type_into(0, 2, "150"));
+        s.tab_cmd(crate::tabs::TabCmd::WarnKeep);
+        assert_eq!(v(0, 2), Value::Num(150.0));
+        // The list's cell shows its prompt; the list picks a value.
+        let mut g = s.grid.get_cloned();
+        g.select(3, 0);
+        s.grid.set(g);
+        let t = texts();
+        assert!(t.iter().any(|x| x == "Answer") && t.iter().any(|x| x == "Yes or no."), "{t:?}");
+        s.cmds.lock().unwrap().push(Cmd::Data(DataCmd::ChooseFromList));
+        s.take_cmds();
+        assert!(s.list.get_cloned().open);
+        assert!(texts().iter().any(|x| x == "Choose for A4"));
+        s.list_search.set(TextEdit::new("later"));
+        s.cmds.lock().unwrap().push(Cmd::ListPick(0));
+        s.take_cmds();
+        assert_eq!(v(3, 0), Value::str("Maybe later"));
+        assert!(!s.list.get_cloned().open);
     }
 
     #[test]
