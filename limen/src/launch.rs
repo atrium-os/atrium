@@ -11,7 +11,9 @@
 //! rule for the app naming the caller. A provider must never run as
 //! `_limen`, so a launch without a rule `[workers."<app>"] callers =
 //! ["_limen"], run_as = "<its own user>"` is refused here, before
-//! portcullisd is asked. That uid is what limend then expects to own the
+//! portcullisd is asked, unless the app's manifest implements a role
+//! (`[roles]`, app-composition.md §5.1): portcullisd then runs it as a uid
+//! of the parent's instance and answers which. That uid is what limend then expects to own the
 //! child's window.
 
 use std::collections::HashMap;
@@ -61,6 +63,11 @@ fn no_app_socket(app: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `app`'s installed manifest implements a role.
+fn implements_a_role(app: &str) -> bool {
+    crate::catalogue::ROLES.iter().any(|r| crate::manifests::Installed::default().implements(app, r.name))
+}
+
 fn uid_of(name: &str) -> Option<u32> {
     let c = std::ffi::CString::new(name).ok()?;
     // SAFETY: getpwnam with a valid C string; the result is read at once.
@@ -90,7 +97,14 @@ impl Launcher for Portcullis {
 impl Portcullis {
     fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
-        let mut uid = self.run_as(app)?;
+        // A provider from its manifest's [roles] implements has no system
+        // rule: portcullisd runs it as a uid of the parent's instance (as a
+        // per-instance rule would) and says which.
+        let mut uid = match self.run_as(app) {
+            Ok(u) => Some(u),
+            Err(_) if serves.is_some() && implements_a_role(app) => None,
+            Err(e) => return Err(e),
+        };
         no_app_socket(app)?;
         let mut go = || -> io::Result<UnixStream> {
             let path = portcullis_ipc::resolve_socket_path()
@@ -114,7 +128,7 @@ impl Portcullis {
             })?;
             match read_response(&mut s)? {
                 Response::ReadyForFds => {}
-                Response::ReadyForFdsAs { uid: u } => uid = u,
+                Response::ReadyForFdsAs { uid: u } => uid = Some(u),
                 Response::LaunchFailed { stage, message } => return Err(io::Error::other(format!("{stage}: {message}"))),
                 Response::Error { message } => return Err(io::Error::other(message)),
                 other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
@@ -126,6 +140,7 @@ impl Portcullis {
         };
         let s = go().map_err(|e| e.to_string())?;
         drop(channel);
+        let uid = uid.ok_or_else(|| format!("portcullisd didn't say whom {app} runs as"))?;
         self.jails.insert(embed, s);
         Ok(uid)
     }

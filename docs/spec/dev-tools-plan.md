@@ -261,10 +261,11 @@ libraries into the bundle. The base syscall profile gained `getgroups` (jaild's
 capsicum (a child that calls `cap_enter`), local (`ATRIUM_WORKERS=local`) and
 in-process. Officina's converter is Write's `convert` worker and Mail's parser is
 its `parse` worker, through `spawn_stdio`, falling back to a child process off
-Atrium. Gate `vm-workers-check.sh` 16/16 in deny mode: the worker's own uid, stable
-across calls; a file passed in; its error, a crash, a timeout as errors; no network;
-no nested calls; only the worker-call socket in the core; no jail left. Not done: a
-memory-limit kill in the gate (needs racct on the VM), a second worker and the
+Atrium. Gate `vm-workers-check.sh` 19/19 in deny mode: the worker's own uid, stable
+across calls; a file passed in; its error, a crash, a timeout as errors; its `memory`
+as an rctl `memoryuse:sigkill` rule on its jail, and a worker past it killed and
+reported as an error, the next call working; no network;
+no nested calls; only the worker-call socket in the core; no jail left. Not done: a second worker and the
 overlay check, `vm-sheets`/converter gates on real jails, Sheets and Slides (no
 manifests yet), and the ~25 hand-written `cap_enter` blocks.
 
@@ -278,6 +279,26 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   capability scoped to the app's own items. Gate: a third-party app opens a picker
   and a `doc-viewer`; an app without `embeds` is refused; a third-party
   `share-target` provider is used.
+
+  **As built (2026-11-18).** `embeds` mounts `/atrium/sockets/limen/` (portcullis-jail),
+  and limend checks each request against the parent's installed manifest
+  (`limen::manifests::Installed::may_embed`; refusal 15, `NOT_EMBEDDABLE`). A platform
+  bundle (`org.atrium.*`, a prefix no third party is verified for, opifex.md §6.5)
+  with no `embeds` key keeps every role, as before; every other app must name the
+  role. A user role with no `LIMEN_DEFAULTS` entry goes to an installed app whose
+  `[roles] implements` has it: a platform one first, else the only one (a dev build
+  counts only for its own person); two third-party providers and no platform one give
+  none rather than choosing for the person. portcullisd runs such a provider for
+  limend (`_limen`, with `serves`) as a per-instance uid of the parent's person and
+  persona, with no system rule; providers must still ask for no capability (and no
+  `graphics`). `arca = true` mounts `/atrium/sockets/arca/`; arcad already scopes app
+  ops to the caller's own items by its registry identity. Gate `vm-embeds-check.sh`
+  13/13 in deny mode, without frescod (an embed that passes the checks ends at the
+  embed connection): sockets present only when declared, roles outside `embeds`
+  refused, a third-party `share-target` provider found from its manifest and started
+  as its own uid for the parent. Not done: the gate with frescod and Scrinium (a real
+  picker and doc-viewer on screen), Curia's choice of provider, Arca couriers for
+  third-party requests.
 - **M7 (L).** `cargo-atrium` (new, check, run, bundle, cross, fuzz) and
   `atrium-bundle` for C; templates (viewer, client, media, service; Rust and C);
   `#[derive(atrium::Message)]` with a schema file and `atrium-schema` generating C;

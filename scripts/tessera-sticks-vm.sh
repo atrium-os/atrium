@@ -173,7 +173,7 @@ r=$(g "echo $WRONG | su -m bob -c '$D --media-socket $S --adopt $PART personal k
 check "a wrong code: refused" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 check "…still not mounted" "" "$(mounted)"
 r=$(g "echo $CODE | su -m bob -c '$D --media-socket $S --adopt $PART personal keep'")
-check "the right code opens it" ok "${r%% *}"
+check "the right code opens it" "ok $PART opened for personal" "$r"
 check "…mounted" tessera "$(mounted)"
 check "…alice's note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
 check "…listed as bob's personal stick" yes "$(list_as bob | grep -q "^$PART /media/$PART .*persona=personal" && echo yes || echo no)"

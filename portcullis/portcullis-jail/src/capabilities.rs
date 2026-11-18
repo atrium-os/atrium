@@ -56,6 +56,12 @@ pub fn apply_all(
         // dispensatord's media socket (device-assignment.md §6.6).
         apply_socket("removable-media.sock", jc, opts);
     }
+    if caps.arca == Some(true) {
+        // arcad (arca.md §9, app-composition.md §3 C8): the app API, which
+        // arcad scopes by the peer's launch-registry identity to the app's
+        // own items; there is no call for another app's.
+        apply_socket("arca", jc, opts);
+    }
     if caps.session_lock == Some(true) {
         // ostiarius's lock-only socket (docs/spec/lock-screen.md §2).
         apply_socket("ostiarius-lock.sock", jc, opts);

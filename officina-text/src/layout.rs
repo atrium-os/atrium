@@ -272,9 +272,14 @@ impl Fonts for PinnedFonts {
             // stay with what they follow, so an emoji sequence is shaped
             // whole by one face.
             let joins = matches!(ch as u32, 0x200C | 0x200D | 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0x20E3);
+            // VS16 asks for the emoji form (❤️, ☺️, keycaps).
+            let emoji_vs = text[i + ch.len_utf8()..].starts_with('\u{FE0F}');
             let face = match segs.last() {
                 Some(&(fc, _, _)) if joins && self.has(fc, ch) => fc,
-                _ => self.face_for(&stack, ch, f, han),
+                _ => match emoji_vs.then(|| self.lib_face("Noto Emoji", f.bold, f.italic).filter(|&k| self.has(k, ch))).flatten() {
+                    Some(k) => k,
+                    None => self.face_for(&stack, ch, f, han),
+                },
             };
             match segs.last_mut() {
                 Some((fc, _, e)) if *fc == face => *e = i + ch.len_utf8(),
@@ -1010,6 +1015,8 @@ mod tests {
         assert_eq!(family("", "שלום"), ["Noto Sans Hebrew".to_string()].into());
         // Emoji draw (outlines), and a ZWJ family or a skin tone is one glyph.
         assert_eq!(family("", "😀"), ["Noto Emoji".to_string()].into());
+        // VS16 takes the emoji face for a character a text face also has.
+        assert_eq!(family("", "\u{2764}\u{FE0F}"), ["Noto Emoji".to_string()].into());
         for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇮🇳"] {
             let l = layout_para(&doc(seq), doc(seq).para(0).unwrap(), 1_000_000, &f);
             assert_eq!(l.glyphs.len(), 1, "{seq}: {:?}", l.glyphs);

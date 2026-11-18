@@ -54,6 +54,9 @@ pub mod refusal {
     pub const BAD_FD: u8 = 13;
     /// PiP: not this role, no recent press, not shown, or Forum said no.
     pub const NO_PIP: u8 = 14;
+    /// The parent's manifest doesn't name this role in `embeds`
+    /// (app-composition.md §5.1).
+    pub const NOT_EMBEDDABLE: u8 = 15;
 }
 
 pub type EmbedId = u64;

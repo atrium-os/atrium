@@ -60,6 +60,13 @@ pub enum GridOp {
     /// [`Workbook::encode_cond_formats`] writes them (their formulas are text, read
     /// against the workbook when the op is applied). Made by [`GridOp::cond_formats`].
     CondFormats(std::sync::Arc<[u8]>),
+    /// The workbook's defined names, swapped in whole, as
+    /// [`Workbook::encode_names`] writes them (formula text, read against the
+    /// workbook when applied). Made by [`GridOp::names`].
+    Names(std::sync::Arc<[u8]>),
+    /// A sheet's row heights (`rows`) or column widths that differ from the
+    /// default, swapped in whole: (index, size), sorted.
+    Sizes { sheet: u16, rows: bool, over: Vec<(u32, f64)> },
 }
 
 impl GridOp {
@@ -99,6 +106,11 @@ impl GridOp {
     /// Puts `fs` in place of the workbook's conditional formats.
     pub fn cond_formats(wb: &Workbook, fs: &[crate::condfmt::CondFormat]) -> Self {
         GridOp::CondFormats(wb.encode_cond_formats(fs).into())
+    }
+
+    /// Puts `defs` in place of the workbook's defined names.
+    pub fn names(wb: &Workbook, defs: &[crate::names::NameDef]) -> Self {
+        GridOp::Names(wb.encode_names(defs).into())
     }
 
     /// Empties a rectangle.
@@ -168,6 +180,22 @@ impl GridOp {
             GridOp::CondFormats(b) => {
                 w.u8(8);
                 w.bytes(b);
+                return w.into_bytes();
+            }
+            GridOp::Names(b) => {
+                w.u8(9);
+                w.bytes(b);
+                return w.into_bytes();
+            }
+            GridOp::Sizes { sheet, rows, over } => {
+                w.u8(10);
+                w.u16(*sheet);
+                w.u8(u8::from(*rows));
+                w.var(over.len() as u64);
+                for (i, v) in over {
+                    w.var(*i as u64);
+                    w.f64(*v);
+                }
                 return w.into_bytes();
             }
             GridOp::Batch(ops) => {
@@ -253,12 +281,32 @@ impl GridOp {
             }
             return Ok(GridOp::Pivots(v));
         }
-        if kind == 8 {
+        if kind == 8 || kind == 9 {
             let v = r.bytes("conditional formats", b.len() as u64)?;
             if !r.is_empty() {
                 return Err(WireError::Invalid("trailing bytes"));
             }
-            return Ok(GridOp::CondFormats(v.into()));
+            return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
+        }
+        if kind == 10 {
+            let sheet = r.u16()?;
+            let rows = r.u8()? != 0;
+            let n = r.count("sizes", MAX_ROWS as u64, 9)?;
+            let mut over = Vec::with_capacity(n);
+            let mut last = None;
+            for _ in 0..n {
+                let i = r.var()?;
+                let v = r.f64()?;
+                if i >= MAX_ROWS as u64 || last.is_some_and(|l| i <= l) || !v.is_finite() || v < 0.0 {
+                    return Err(WireError::Invalid("size"));
+                }
+                last = Some(i);
+                over.push((i as u32, v));
+            }
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Sizes { sheet, rows, over });
         }
         if kind == 4 {
             let f = crate::filter::FilterState::decode(&mut r)?;
@@ -351,6 +399,23 @@ impl Op<Workbook> for GridOp {
                     wb.replace_cond_formats(fs);
                 }
                 GridOp::CondFormats(old.into())
+            }
+            GridOp::Names(b) => {
+                let old = wb.encode_names(&wb.names.iter().cloned().collect::<Vec<_>>());
+                if let Ok(defs) = wb.decode_names(&b) {
+                    wb.replace_names(defs);
+                }
+                GridOp::Names(old.into())
+            }
+            GridOp::Sizes { sheet, rows, over } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Sizes { sheet, rows, over };
+                }
+                let sh = wb.sheet_mut(sheet);
+                let sizes = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
+                let old = sizes.overrides().to_vec();
+                *sizes = crate::column::Sizes::from_overrides(sizes.default, over);
+                GridOp::Sizes { sheet, rows, over: old }
             }
             GridOp::Batch(ops) => {
                 // The inverse undoes them in reverse order.

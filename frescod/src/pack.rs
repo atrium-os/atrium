@@ -539,30 +539,23 @@ fn window_frame_as(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, 
     glyph_ids.sort_unstable();
     for id in glyph_ids {
         let p = &state.glyph_run_nodes[id];
-        let (entry, ids) = glyph_by_slot
-            .entry(p.atlas_slot_id)
-            .or_insert_with(|| (GlyphRunBatch {
-                atlas_slot_id: p.atlas_slot_id,
-                nodes:  Vec::new(),
-                glyphs: Vec::new(),
-            }, Vec::new()));
-        ids.push(*id);
-        let glyph_offset = entry.glyphs.len() as i32;
-        entry.nodes.push(turned(GlyphRunNode {
-            origin: [p.x, p.y, 0.0, 0.0],
-            atlas_dim: [p.atlas_width as f32,
-                        p.atlas_height as f32, 0.0, 0.0],
-            color: [p.r, p.g, p.b, p.a],
-            meta: [p.glyphs.len() as i32, glyph_offset, 0, 0],
-        }, state.glyph_turns.get(id)));
-        for g in &p.glyphs {
-            entry.glyphs.push(GlyphInstance {
-                d_offset: [g.dx, g.dy],
-                atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
-                           g.atlas_w as f32, g.atlas_h as f32],
-                bearing:  [g.bearing_x, g.bearing_y],
-                ..Default::default()
-            });
+        for (slot, dim, glyphs) in run_parts(p) {
+            let (entry, ids) = glyph_by_slot
+                .entry(slot)
+                .or_insert_with(|| (GlyphRunBatch {
+                    atlas_slot_id: slot,
+                    nodes:  Vec::new(),
+                    glyphs: Vec::new(),
+                }, Vec::new()));
+            ids.push(*id);
+            let glyph_offset = entry.glyphs.len() as i32;
+            entry.nodes.push(turned(GlyphRunNode {
+                origin: [p.x, p.y, 0.0, 0.0],
+                atlas_dim: [dim[0], dim[1], 0.0, 0.0],
+                color: [p.r, p.g, p.b, p.a],
+                meta: [glyphs.len() as i32, glyph_offset, 0, 0],
+            }, state.glyph_turns.get(id)));
+            entry.glyphs.extend(glyphs);
         }
     }
     for (b, ids) in glyph_by_slot.into_values() {
@@ -917,23 +910,29 @@ fn grouped_frame_but(
             // Glyphs are atlas bitmaps at the size they were shaped: a run
             // moves with its group but does not scale (§3 step 1); its own
             // turn (GLYPH_TURN) is kept as sent.
-            let glyphs = p.glyphs.iter().map(|g| GlyphInstance {
-                d_offset: [g.dx, g.dy],
-                atlas_uv: [g.atlas_u as f32, g.atlas_v as f32, g.atlas_w as f32, g.atlas_h as f32],
-                bearing: [g.bearing_x, g.bearing_y],
-                ..Default::default()
-            }).collect::<Vec<_>>();
-            w.glyph_batches.push(GlyphRunBatch {
-                atlas_slot_id: p.atlas_slot_id,
-                nodes: vec![turned(GlyphRunNode {
-                    origin: [x.x(p.x), x.y(p.y), 0.0, 0.0],
-                    atlas_dim: [p.atlas_width as f32, p.atlas_height as f32, 0.0, 0.0],
-                    color: [p.r, p.g, p.b, p.a * op],
-                    meta: [glyphs.len() as i32, 0, 0, 0],
-                }, state.glyph_turns.get(&id))],
-                glyphs,
-            });
-            Item::Run(w.glyph_batches.len() - 1, 0)
+            // A run with colour glyphs is two batches, its own atlas's
+            // and the colour atlas's, drawn in that order.
+            let mut last = None;
+            for (slot, dim, glyphs) in run_parts(p) {
+                if let Some(prev) = last.take() {
+                    order.push(OrderItem { item: prev, clip, node: id });
+                }
+                w.glyph_batches.push(GlyphRunBatch {
+                    atlas_slot_id: slot,
+                    nodes: vec![turned(GlyphRunNode {
+                        origin: [x.x(p.x), x.y(p.y), 0.0, 0.0],
+                        atlas_dim: [dim[0], dim[1], 0.0, 0.0],
+                        color: [p.r, p.g, p.b, p.a * op],
+                        meta: [glyphs.len() as i32, 0, 0, 0],
+                    }, state.glyph_turns.get(&id))],
+                    glyphs,
+                });
+                last = Some(Item::Run(w.glyph_batches.len() - 1, 0));
+            }
+            match last {
+                Some(i) => i,
+                None => return,
+            }
         } else {
             return;
         };
@@ -1370,6 +1369,29 @@ fn item_box(w: &WindowFrame, item: fresco_compute::Node) -> Option<[f32; 4]> {
 /// A run's turn (`ATRIUM_TEXT_GLYPH_TURN`) rides in lanes of its
 /// [`GlyphRunNode`] the Vulkan kernel does not read: `meta[2] = 1`, then
 /// `[a, b]` in `origin[2..4]` and `[c, d]` in `atlas_dim[2..4]`.
+/// A run's glyphs by atlas: its own (slot, size) and, for frescod's text
+/// with colour glyphs (`GLYPH_COLOR`), the paired colour atlas
+/// (docs/spec/fonts.md §6). Empty parts left out.
+fn run_parts(p: &fresco_protocol::GlyphRunParams) -> Vec<(u32, [f32; 2], Vec<GlyphInstance>)> {
+    let inst = |g: &fresco_protocol::GlyphInstance| GlyphInstance {
+        d_offset: [g.dx, g.dy],
+        atlas_uv: [(g.atlas_u & !fresco_protocol::GLYPH_COLOR) as f32, g.atlas_v as f32, g.atlas_w as f32, g.atlas_h as f32],
+        bearing: [g.bearing_x, g.bearing_y],
+        ..Default::default()
+    };
+    let colored = |g: &&fresco_protocol::GlyphInstance| g.atlas_u & fresco_protocol::GLYPH_COLOR != 0;
+    let mono: Vec<GlyphInstance> = p.glyphs.iter().filter(|g| !colored(g)).map(inst).collect();
+    let color: Vec<GlyphInstance> = p.glyphs.iter().filter(colored).map(inst).collect();
+    let mut out = Vec::with_capacity(2);
+    if !mono.is_empty() || color.is_empty() {
+        out.push((p.atlas_slot_id, [p.atlas_width as f32, p.atlas_height as f32], mono));
+    }
+    if !color.is_empty() {
+        out.push((fresco_protocol::color_atlas_slot(p.atlas_slot_id), [fresco_protocol::COLOR_ATLAS_W as f32, fresco_protocol::COLOR_ATLAS_H as f32], color));
+    }
+    out
+}
+
 fn turned(mut n: GlyphRunNode, turn: Option<&[f32; 4]>) -> GlyphRunNode {
     if let Some(&[a, b, c, d]) = turn {
         n.meta[2] = 1;

@@ -186,6 +186,7 @@ allowed = [
     "atrium-wifi-mlme",  # baseline + aura/ctl*; pinned to aura-mlme
     "atrium-wifi-keys",  # baseline + aura/key*; pinned to aura-keys
     "atrium-arca",       # baseline + tesserakeys; pinned to arcad
+    "atrium-driver",     # baseline (+ one device per jail); catalog drivers
 ]
 # Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
 # themselves live in etc/atrium.devfs.rules (installed and loaded at boot by
@@ -217,7 +218,9 @@ allowed = [
 # 28 = atrium_wifi_mlme — basics + aura/ctl*: aura-mlme's alone (pinned below).
 # 29 = atrium_wifi_keys — basics + aura/key*: aura-keys' alone (pinned below).
 # 32 = atrium_arca     — basics + tesserakeys: arcad's alone (pinned below).
-allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31, 32]
+# 33 = atrium_driver   — basics only: the catalog's drivers, one jail per
+#      device, each shown its own device through devfs_grant (pinned below).
+allowed_ids = [4, 20, 22, 23, 24, 26, 27, 28, 29, 31, 32, 33]
 
 # The display belongs to frescod. Only the frescod service may mount the
 # ruleset that shows /dev/atrium-display0, and before it starts jaild writes
@@ -297,6 +300,22 @@ jail_name = "atrium-arcad"
 exec_path = "/usr/local/bin/atrium-arcad"
 uid       = 65020
 
+# Drivers from the package catalog (opifex.md §8.2, decided by Shankar
+# 2026-11-18: one shared ruleset, packages never add to this policy). One
+# jail per device, named atrium-driver-<package's name>-<instance>, running a
+# program from its package's own folder as that package's uid (61000-61499,
+# checked unique at install by opifex), shown only the USB device or HID node
+# dispensatord grants it.
+[[devfs_rulesets.pinned]]
+id          = 33
+jail_name   = "atrium-driver-"
+name_prefix = true
+exec_path   = "/usr/local/libexec/atrium/drivers/"
+exec_dir    = true
+uid         = 61000
+uid_last    = 61499
+grant_nodes = ["ugen#.#", "usb/#.#.0", "hidraw#"]
+
 
 # ---------------------------------------------------------------
 # Binary paths jaild may execve. Prefix match.
@@ -306,6 +325,7 @@ allowed_prefixes = [
     "/usr/local/bin/atrium-",
     "/usr/local/sbin/atrium-",
     "/usr/local/share/atrium/apps/",   # installed Atrium apps
+    "/usr/local/libexec/atrium/drivers/",   # catalog drivers (ruleset 33 holds them to their package folder)
 ]
 # ★ One-shot INSTANCE ROOTS (portcullis.md §6.5.4): a jail named `app-...` whose
 # root is exactly <instance_root_dir>/<name> runs the entry of an app tree

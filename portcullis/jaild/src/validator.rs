@@ -433,8 +433,8 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
     }
     match &req.exec {
         None => deny("the request runs nothing".into()),
-        Some(e) if e.path != pin.exec_path => deny(format!("exec path is {:?}", e.path)),
-        Some(e) if e.uid != pin.uid => deny(format!("uid is {}", e.uid)),
+        Some(e) if !pin.allows_exec(&e.path) => deny(format!("exec path is {:?}", e.path)),
+        Some(e) if !pin.allows_uid(e.uid) => deny(format!("uid is {}", e.uid)),
         Some(_) => Ok(()),
     }
 }
@@ -1733,6 +1733,39 @@ mod tests {
         let mut r = req(Some("ugen0.2"), &["usb/0.2.0"]);
         r.devfs_ruleset = 21;
         assert!(refused(r), "unpinned");
+    }
+
+    /// The catalog's drivers (opifex.md §8.2): one shared pin, any program
+    /// in a package folder under the drivers folder, any uid of the range.
+    #[test]
+    fn catalog_drivers_share_one_pin() {
+        let mut p = pinned_policy();
+        p.devfs_rulesets.allowed_ids.push(33);
+        p.devfs_rulesets.pinned.push(jaild_policy::PinnedRuleset {
+            id: 33,
+            jail_name: "atrium-driver-".into(),
+            exec_path: "/usr/local/libexec/atrium/drivers/".into(),
+            exec_dir: true,
+            uid: 61000,
+            uid_last: Some(61499),
+            name_prefix: true,
+            grant_nodes: vec!["ugen#.#".into(), "usb/#.#.0".into()],
+            ..Default::default()
+        });
+        let req = |exec: &str, uid: u32| {
+            let mut r = frescod_req("atrium-driver-rtl-0-2-0", exec, uid);
+            r.devfs_ruleset = 33;
+            r.devfs_grant = Some("ugen0.2".into());
+            r
+        };
+        validate_devfs_pin(&req("/usr/local/libexec/atrium/drivers/org.atrium.driver.rtl/rtl", 61007), &p).unwrap();
+        let refused = |r: CreateJailRequest| validate_devfs_pin(&r, &p).is_err();
+        assert!(refused(req("/usr/local/libexec/atrium/drivers/org.atrium.driver.rtl/rtl", 61500)), "uid past the range");
+        assert!(refused(req("/usr/local/libexec/atrium/drivers/org.atrium.driver.rtl/rtl", 65010)), "frescod's uid");
+        assert!(refused(req("/usr/local/libexec/atrium/drivers/../../../bin/sh", 61007)), "climbing out");
+        assert!(refused(req("/usr/local/libexec/atrium/drivers/rtl", 61007)), "not in a package folder");
+        assert!(refused(req("/usr/local/libexec/atrium/drivers/a/b/c", 61007)), "deeper");
+        assert!(refused(req("/usr/local/bin/atrium-frescod", 61007)), "another program");
     }
 
     /// FUSE serving (device-assignment.md §6.4): only a pin naming the

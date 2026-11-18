@@ -1,0 +1,13 @@
+[package]
+name = "atrium-colr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Colour glyphs (COLR v1 and v0, CPAL) to RGBA bitmaps: colour emoji for frescod's text, Pergola's document views and the PDF writer (docs/spec/fonts.md §6)."
+
+[dependencies]
+# LICENCE: skrifa MIT OR Apache-2.0 (fontations, Google); tiny-skia BSD-3
+# (already in the tree through officina-pict, folium-render).
+skrifa = "0.22"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

@@ -55,6 +55,92 @@ struct LoadedFont {
     bytes:    Arc<[u8]>,
     metrics:  FontMetrics,
     refcount: u32,
+    /// Has colour glyphs (COLR and CPAL): emoji go on a colour atlas.
+    color:    bool,
+}
+
+/// A colour atlas page (docs/spec/fonts.md §6): RGBA8 colour glyphs of one
+/// (font, size) page, slot `color_atlas_slot` of that page's. Filled
+/// shelf by shelf; when full it starts again empty (runs that still name
+/// old places draw wrong until they are shaped again, as after the mono
+/// page's compaction).
+struct ColorPage {
+    slot_id: u32,
+    pixels:  Vec<u8>,
+    shelf_x: u32,
+    shelf_y: u32,
+    shelf_h: u32,
+    /// (font, size key, glyph id, foreground) to its place.
+    glyphs:  HashMap<(u32, u32, u32, u32), GlyphCacheEntry>,
+    allocated_on_gpu: bool,
+    needs_full_resync: bool,
+    dirty: Option<(u32, u32, u32, u32)>,
+}
+
+const COLOR_W: u32 = fresco_protocol::COLOR_ATLAS_W;
+const COLOR_H: u32 = fresco_protocol::COLOR_ATLAS_H;
+
+impl ColorPage {
+    fn new(slot_id: u32) -> Self {
+        ColorPage { slot_id, pixels: vec![0; (COLOR_W * COLOR_H * 4) as usize], shelf_x: 1, shelf_y: 1, shelf_h: 0, glyphs: HashMap::new(), allocated_on_gpu: false, needs_full_resync: false, dirty: None }
+    }
+
+    fn ensure(&mut self, font_id: u32, size_px: f32, gid: u16, fg: [f32; 4], bytes: &[u8], clock: u64) -> Option<GlyphCacheEntry> {
+        let fgk = u32::from_le_bytes(fg.map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8));
+        let key = (font_id, (size_px * 100.0) as u32, gid as u32, fgk);
+        if let Some(e) = self.glyphs.get_mut(&key) {
+            e.last_used = clock;
+            return Some(*e);
+        }
+        let bm = atrium_colr::render(bytes, gid as u32, size_px, fg)?;
+        let (w, h) = (bm.width, bm.height);
+        if w + 2 > COLOR_W || h + 2 > COLOR_H {
+            return None;
+        }
+        if self.shelf_x + w + 1 > COLOR_W {
+            self.shelf_x = 1;
+            self.shelf_y += self.shelf_h + 1;
+            self.shelf_h = 0;
+        }
+        if self.shelf_y + h + 1 > COLOR_H {
+            // Full: start again.
+            self.pixels.fill(0);
+            self.glyphs.clear();
+            (self.shelf_x, self.shelf_y, self.shelf_h) = (1, 1, 0);
+            self.needs_full_resync = true;
+        }
+        let (u, v) = (self.shelf_x, self.shelf_y);
+        for row in 0..h {
+            let src = &bm.rgba[(row * w * 4) as usize..((row + 1) * w * 4) as usize];
+            let d = (((v + row) * COLOR_W + u) * 4) as usize;
+            self.pixels[d..d + src.len()].copy_from_slice(src);
+        }
+        self.shelf_x += w + 1;
+        self.shelf_h = self.shelf_h.max(h);
+        self.dirty = Some(match self.dirty {
+            None => (u, v, u + w, v + h),
+            Some((a, b, c, d)) => (a.min(u), b.min(v), c.max(u + w), d.max(v + h)),
+        });
+        let e = GlyphCacheEntry { atlas_u: u, atlas_v: v, atlas_w: w, atlas_h: h, bearing_x: bm.left as f32, bearing_y: bm.top as f32, advance: 0.0, last_used: clock };
+        self.glyphs.insert(key, e);
+        Some(e)
+    }
+
+    fn drain(&mut self) -> Option<PendingAtlasUpload> {
+        let (x0, y0, x1, y1) = self.dirty.take()?;
+        if !self.allocated_on_gpu || self.needs_full_resync {
+            self.allocated_on_gpu = true;
+            self.needs_full_resync = false;
+            return Some(PendingAtlasUpload::Full { slot_id: self.slot_id, width: COLOR_W, height: COLOR_H, pixels: self.pixels.clone(), rgba: true });
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in y0..y1 {
+            let s = ((row * COLOR_W + x0) * 4) as usize;
+            out.extend_from_slice(&self.pixels[s..s + (w * 4) as usize]);
+        }
+        Some(PendingAtlasUpload::Region { slot_id: self.slot_id, dst_x: x0, dst_y: y0, width: w, height: h, pixels: out })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -407,6 +493,8 @@ pub enum PendingAtlasUpload {
         width:   u32,
         height:  u32,
         pixels:  Vec<u8>,
+        /// RGBA8 (a colour atlas), else R8.
+        rgba:    bool,
     },
     Region {
         slot_id: u32,
@@ -426,6 +514,8 @@ pub struct TextEngine {
     /// its own page; future M6.4 will share pages across sizes via
     /// signed-distance-field rendering.
     pages:  HashMap<(u32, u32), AtlasPage>,
+    /// Colour pages, by the same key as `pages`.
+    color_pages: HashMap<(u32, u32), ColorPage>,
     search_paths: Vec<PathBuf>,
     /// System font library faces loaded as fallbacks: library id to font id.
     fallbacks: HashMap<usize, u32>,
@@ -450,6 +540,7 @@ impl TextEngine {
             next_slot_id: SERVER_SLOT_BASE,
             fonts: HashMap::new(),
             pages: HashMap::new(),
+            color_pages: HashMap::new(),
             search_paths: paths,
             fallbacks: HashMap::new(),
             lru_clock: 0,
@@ -506,7 +597,8 @@ impl TextEngine {
         let fid = self.next_font_id;
         self.next_font_id += 1;
         log::info!("font {} '{}': units_per_em={}", fid, name, metrics.units_per_em);
-        self.fonts.insert(fid, LoadedFont { name, bytes, metrics, refcount });
+        let color = atrium_colr::is_color_font(&bytes);
+        self.fonts.insert(fid, LoadedFont { name, bytes, metrics, refcount, color });
         Some(fid)
     }
 
@@ -522,6 +614,24 @@ impl TextEngine {
         Some(fid)
     }
 
+    /// `family`'s face for `ch`, its colour twin first (frescod draws
+    /// colour glyphs), when the face has the character.
+    fn library_pick(&mut self, family: &str, bold: bool, ch: char) -> Option<u32> {
+        atrium_fonts::Library::color_twin(family)
+            .into_iter()
+            .chain([family])
+            .find_map(|fam| self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)))
+    }
+
+    /// A system emoji face (outline or colour).
+    fn is_emoji_face(&self, font: u32) -> bool {
+        self.fonts
+            .get(&font)
+            .and_then(|f| f.name.strip_prefix("atrium-fonts:")?.parse::<usize>().ok())
+            .and_then(|id| atrium_fonts::extra::faces().get(id))
+            .is_some_and(|f| f.family.contains("Emoji"))
+    }
+
     fn has_glyph(&self, font: u32, ch: char) -> bool {
         self.fonts.get(&font).and_then(|f| ttf_parser::Face::parse(&f.bytes, 0).ok()).is_some_and(|f| f.glyph_index(ch).is_some())
     }
@@ -535,7 +645,7 @@ impl TextEngine {
             if prim_has && self.fonts.get(&primary).is_some_and(|f| atrium_fonts::Library::resolve(&f.name).is_some_and(|r| r.family == fam)) {
                 return primary;
             }
-            if let Some(f) = self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)) {
+            if let Some(f) = self.library_pick(fam, bold, ch) {
                 return f;
             }
         }
@@ -543,7 +653,7 @@ impl TextEngine {
             return primary;
         }
         for fam in atrium_fonts::Library::fallback_in(ch, han) {
-            if let Some(f) = self.library_fallback(fam, bold).filter(|&f| self.has_glyph(f, ch)) {
+            if let Some(f) = self.library_pick(fam, bold, ch) {
                 return f;
             }
         }
@@ -594,8 +704,11 @@ impl TextEngine {
         let han = atrium_fonts::Han::for_text(text);
         // (font, shaped, text)
         let mut segs: Vec<(u32, bool, String)> = Vec::new();
-        for ch in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             let cp = ch as u32;
+            // VS16 asks for the emoji form (❤️, ☺️, keycaps).
+            let emoji_vs = chars.peek() == Some(&'\u{FE0F}');
             /* A text run is a single shaped baseline. Line breaks,
              * tabs, and other C0/C1 control codes have no defined
              * meaning here — apps split into multiple runs and
@@ -603,9 +716,14 @@ impl TextEngine {
              * than let the shaper emit a `.notdef` box. */
             if cp < 0x20 || cp == 0x7f { continue; }
             let (font, shaped) = match segs.last() {
-                Some(&(f, sh, _)) if ch.is_whitespace() || (sh && is_mark(ch) && self.has_glyph(f, ch)) => (f, sh),
+                // A space stays in the stretch it is in (shaping needs it),
+                // except after emoji: their faces' spaces are emoji-wide.
+                Some(&(f, sh, _)) if (ch.is_whitespace() && !self.is_emoji_face(f)) || (sh && is_mark(ch) && self.has_glyph(f, ch)) => (f, sh),
                 _ => {
-                    let f = self.face_for(font_id, prim_face.as_ref(), ch, bold, han);
+                    let f = match emoji_vs.then(|| self.library_pick("Noto Emoji", bold, ch)).flatten() {
+                        Some(f) => f,
+                        None => self.face_for(font_id, prim_face.as_ref(), ch, bold, han),
+                    };
                     (f, rtl || f != font_id || atrium_fonts::Library::script_family(ch).is_some())
                 }
             };
@@ -679,6 +797,14 @@ impl TextEngine {
             }
             keep
         });
+        let pages = &self.pages;
+        self.color_pages.retain(|k, p| {
+            let keep = pages.contains_key(k);
+            if !keep {
+                gone.push(p.slot_id);
+            }
+            keep
+        });
         gone
     }
 
@@ -696,7 +822,7 @@ impl TextEngine {
         color: [f32; 4],
         text: &str,
         weight: u16,
-    ) -> Option<(GlyphRunParams, Option<PendingAtlasUpload>)> {
+    ) -> Option<(GlyphRunParams, Vec<PendingAtlasUpload>)> {
         /* Wire convention: `y` is the top of the text em-box (so apps
          * compute it as e.g. `field_y + (field_h - text_h)/2` for
          * vertical centering, without needing font metrics). The
@@ -715,6 +841,7 @@ impl TextEngine {
             Item::Glyph { font, .. } => self.fonts.get(&font).map(|f| (font, f.bytes.clone())),
             Item::Cp(_) => None,
         }).collect();
+        let color_faces: std::collections::HashSet<u32> = faces.keys().copied().filter(|f| self.fonts.get(f).is_some_and(|l| l.color)).collect();
 
         let size_key = (size_px * 100.0) as u32;
         let page_key = (font_id, size_key);
@@ -727,7 +854,11 @@ impl TextEngine {
             id
         };
         let mut clock = self.lru_clock;
+        if !color_faces.is_empty() && !self.color_pages.contains_key(&page_key) {
+            self.color_pages.insert(page_key, ColorPage::new(fresco_protocol::color_atlas_slot(slot_id)));
+        }
         let page = self.pages.get_mut(&page_key).unwrap();
+        let mut cpage = self.color_pages.get_mut(&page_key);
 
         /* The run's own characters go one glyph per character with the
          * font's advance (what Pergola's per-character measuring
@@ -743,10 +874,26 @@ impl TextEngine {
                     Some(e) => (e, 0.0, 0.0, e.advance),
                     None => continue,
                 },
-                Item::Glyph { font, gid, dx, dy, adv } => match page.ensure_glyph(font, size_px, weight, gid, &faces[&font], clock) {
-                    Some(e) => (e, dx, dy, adv),
-                    None => { pen_x += adv; continue }
-                },
+                Item::Glyph { font, gid, dx, dy, adv } => {
+                    // A colour glyph (emoji) on the colour page, its place
+                    // marked GLYPH_COLOR; else (or when it has no colour
+                    // version) the mono page.
+                    let colored = if color_faces.contains(&font) {
+                        cpage.as_mut().and_then(|c| c.ensure(font, size_px, gid, color, &faces[&font], clock))
+                    } else {
+                        None
+                    };
+                    match colored {
+                        Some(mut e) => {
+                            e.atlas_u |= fresco_protocol::GLYPH_COLOR;
+                            (e, dx, dy, adv)
+                        }
+                        None => match page.ensure_glyph(font, size_px, weight, gid, &faces[&font], clock) {
+                            Some(e) => (e, dx, dy, adv),
+                            None => { pen_x += adv; continue }
+                        },
+                    }
+                }
             };
             if entry.atlas_w > 0 && entry.atlas_h > 0 {
                 glyphs.push(GlyphInstance {
@@ -780,6 +927,7 @@ impl TextEngine {
                     width:   ATLAS_W,
                     height:  ATLAS_H,
                     pixels:  page.pixels.clone(),
+                    rgba:    false,
                 })
             } else {
                 let (dst_x, dst_y, w, h, bytes) = page.extract_dirty().unwrap();
@@ -801,7 +949,11 @@ impl TextEngine {
             r: color[0], g: color[1], b: color[2], a: color[3],
             glyphs,
         };
-        Some((run, pending))
+        let mut ups: Vec<PendingAtlasUpload> = pending.into_iter().collect();
+        if let Some(up) = self.color_pages.get_mut(&page_key).and_then(ColorPage::drain) {
+            ups.push(up);
+        }
+        Some((run, ups))
     }
 
     /// Shape `text` with `font_id` at `size_px` and return the run's
@@ -954,7 +1106,7 @@ mod tests {
         assert_eq!(t.fonts[&tamil[0]].name, format!("atrium-fonts:{}", atrium_fonts::Library::face("Noto Sans Tamil", true, false).unwrap()));
         // One page, the run's: glyphs from the fallback land on it.
         let (run, up) = t.shape_text_run(f, 16.0, 0.0, 0.0, [1.0; 4], "नमस्ते abc", 400).unwrap();
-        assert!(run.glyphs.len() >= 6 && up.is_some());
+        assert!(run.glyphs.len() >= 6 && !up.is_empty());
         assert_eq!(t.page_count(), 1);
         let (w, _, _) = t.measure(f, 16.0, 400, "नमस्ते abc").unwrap();
         let last = run.glyphs.last().unwrap();
@@ -964,7 +1116,7 @@ mod tests {
             let items = t.layout(f, 16.0, 400, seq);
             assert_eq!(items.len(), 1, "{seq}: {items:?}");
             let Item::Glyph { font, .. } = items[0] else { panic!("{items:?}") };
-            assert_eq!(t.fonts[&font].name, format!("atrium-fonts:{}", atrium_fonts::Library::face("Noto Emoji", false, false).unwrap()));
+            assert_eq!(t.fonts[&font].name, format!("atrium-fonts:{}", atrium_fonts::Library::face("Noto Color Emoji", false, false).unwrap()));
         }
         // A character no face has is dropped, not a crash.
         assert!(t.shape_text_run(f, 16.0, 0.0, 0.0, [1.0; 4], "\u{10FFFD}", 400).is_some());
@@ -993,6 +1145,35 @@ mod tests {
         let a = items.iter().position(|i| gid(&t, i, 'a')).unwrap();
         let c = items.iter().position(|i| gid(&t, i, 'c')).unwrap();
         assert!(a < c && gid(&t, &items[0], 'ם'));
+    }
+
+    /// Emoji take the colour face: their glyphs are marked GLYPH_COLOR and
+    /// drawn into the page's RGBA twin, Latin beside them stays on the R8 page.
+    #[test]
+    fn emoji_land_on_the_colour_page() {
+        let mut t = TextEngine::new();
+        let f = plex(&mut t);
+        let (run, up) = t.shape_text_run(f, 24.0, 0.0, 0.0, [1.0; 4], "ab😀🚀", 400).unwrap();
+        let color: Vec<_> = run.glyphs.iter().filter(|g| g.atlas_u & fresco_protocol::GLYPH_COLOR != 0).collect();
+        assert_eq!((run.glyphs.len(), color.len()), (4, 2), "{:?}", run.glyphs);
+        let rgba: Vec<_> = up.iter().filter_map(|u| match u { PendingAtlasUpload::Full { slot_id, width, rgba: true, pixels, .. } => Some((*slot_id, *width, pixels)), _ => None }).collect();
+        assert_eq!(rgba.len(), 1, "one colour page");
+        // A space after an emoji is the run font's, not an emoji-wide one.
+        let (two, _) = t.shape_text_run(f, 24.0, 0.0, 0.0, [1.0; 4], "😀 🚀", 400).unwrap();
+        let gap = two.glyphs[1].dx - two.glyphs[0].dx;
+        assert!(gap < 24.0 * 1.6, "{gap}");
+        // VS16 picks the emoji form of a character a text face also has.
+        let items = t.layout(f, 24.0, 400, "\u{2764}\u{FE0F}");
+        let Item::Glyph { font, .. } = items[0] else { panic!("{items:?}") };
+        assert!(t.fonts[&font].color, "{items:?}");
+        let (slot, w, px) = rgba[0];
+        assert_eq!(slot, fresco_protocol::color_atlas_slot(run.atlas_slot_id));
+        assert_eq!(w, fresco_protocol::COLOR_ATLAS_W);
+        // Something coloured was drawn: a texel whose channels differ.
+        assert!(px.chunks(4).any(|p| p[3] > 0 && (p[0] != p[1] || p[1] != p[2])));
+        // A second run reuses the page and uploads nothing new for 😀.
+        let (_, up2) = t.shape_text_run(f, 24.0, 0.0, 0.0, [1.0; 4], "😀", 400).unwrap();
+        assert!(up2.iter().all(|u| !matches!(u, PendingAtlasUpload::Full { rgba: true, .. })), "page already sent");
     }
 
     #[test]
