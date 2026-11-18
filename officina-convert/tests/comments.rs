@@ -57,6 +57,36 @@ Second sheet</t></r></text>"#);
     assert_eq!(back.comment(1, 0, 2).map(|k| k.text.to_string()), Some("Second sheet".into()));
 }
 
+/// Excel 365's threaded comments: the conversation replaces the legacy
+/// stand-in note, replies as "Name: text" paragraphs.
+#[test]
+fn threaded_comments_are_read_as_their_conversation() {
+    let wb = book();
+    let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
+    let z = officina_convert::zip::Archive::open(&x).unwrap();
+    let mut w = officina_convert::zip::ZipWriter::new(Vec::new());
+    let rel = |id: &str, ty: &str, target: &str| format!(r#"<Relationship Id="{id}" Type="http://schemas.microsoft.com/office/2017/10/relationships/{ty}" Target="{target}"/></Relationships>"#);
+    for e in &z.entries {
+        let mut d = z.read(e).unwrap();
+        let t = String::from_utf8(d.clone()).unwrap_or_default();
+        match e.name.as_str() {
+            "xl/comments1.xml" => d = t.replace("Check this against March.\nThe total looks high &amp; &lt;odd&gt;.", "[Threaded comment]\n\nYour version of Excel allows you to read this threaded comment").into_bytes(),
+            "xl/worksheets/_rels/sheet1.xml.rels" => d = t.replace("</Relationships>", &rel("rIdTc", "threadedComment", "../threadedComments/threadedComment1.xml")).into_bytes(),
+            "xl/_rels/workbook.xml.rels" => d = t.replace("</Relationships>", &rel("rIdP", "person", "persons/person.xml")).into_bytes(),
+            _ => {}
+        }
+        w.add(&e.name, &d).unwrap();
+    }
+    w.add("xl/persons/person.xml", br#"<?xml version="1.0" encoding="UTF-8"?><personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><person displayName="Ana Ruiz" id="{A1}" userId="ana" providerId="None"/><person displayName="Bo Chen" id="{B2}" userId="bo" providerId="None"/></personList>"#).unwrap();
+    w.add("xl/threadedComments/threadedComment1.xml", br#"<?xml version="1.0" encoding="UTF-8"?><ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><threadedComment ref="B2" dT="2026-11-18T10:00:00.00" personId="{A1}" id="{T1}"><text>Is this right?</text></threadedComment><threadedComment ref="B2" dT="2026-11-18T10:05:00.00" personId="{B2}" id="{T2}" parentId="{T1}"><text>Yes, checked &amp; fixed.</text></threadedComment></ThreadedComments>"#).unwrap();
+    let (back, rep) = officina_convert::xlsx::read(&w.finish().unwrap()).unwrap();
+    let k = back.comment(0, 1, 1).unwrap();
+    assert_eq!((&*k.author, &*k.text), ("Ana Ruiz", "Is this right?\n\nBo Chen: Yes, checked & fixed."));
+    // The other notes are as they were.
+    assert_eq!(back.comment(0, 4, 3).map(|k| k.text.to_string()), Some("Fill in by Friday".into()));
+    assert!(format!("{rep:?}").contains("threaded comments"), "{rep:?}");
+}
+
 /// LibreOffice opens our file and saves it as the other format; we read that.
 #[test]
 fn libreoffice_keeps_our_comments() {
