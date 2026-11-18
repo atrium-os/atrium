@@ -387,6 +387,8 @@ struct Seg {
     filter: Option<(String, Vec<(u32, Cond)>)>,
     /// `<conditionalFormatting>`s, read once the workbook's formulas can be.
     cond: Vec<super::condfmt::Raw>,
+    /// `<dataValidations>`' inner XML, read once formulas can be.
+    valid: Vec<u8>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
     /// A frozen `<pane>`: rows and columns kept in view.
@@ -626,7 +628,14 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                 }
             }
             b"conditionalFormatting" | b"conditionalFormattings" => seg.rep.note(Kind::Dropped, "conditional formats from Excel 2010's extensions"),
-            b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules"),
+            b"dataValidations" if !empty && e.name().as_ref() == b"dataValidations" => {
+                let end = e.name().as_ref().to_vec();
+                let span = r.read_to_end(quick_xml::name::QName(&end))?;
+                if seg.valid.is_empty() {
+                    seg.valid = data.get(span.start as usize..span.end as usize).unwrap_or_default().to_vec();
+                }
+            }
+            b"dataValidations" | b"dataValidation" => seg.rep.note(Kind::Dropped, "data validation rules from Excel 2010's extensions"),
             b"hyperlink" => {
                 if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
                     if seg.links.len() < officina_grid::links::MAX_LINKS {
@@ -702,7 +711,7 @@ const PIECE: usize = 8 << 20;
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>) -> Result<(), XlsxError> {
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>, valid: &mut Vec<u8>) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -821,6 +830,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                     wb.sheet_mut(s).freeze = f;
                 }
                 cond.extend(seg.cond);
+                if valid.is_empty() {
+                    *valid = seg.valid;
+                }
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
                 out.cells += seg.cells;
@@ -1085,14 +1097,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     }
     let mut all_f: Vec<(u16, Vec<FCell>, HashMap<u32, (u32, u32, String)>)> = Vec::new();
     let mut conds: Vec<(u16, Vec<super::condfmt::Raw>)> = Vec::new();
+    let mut valids: Vec<(u16, Vec<u8>)> = Vec::new();
     for (i, (_, part)) in sheets.iter().enumerate() {
         let e = z.find(part).ok_or_else(|| bad(format!("missing {part}")))?.clone();
         let mut fcells = Vec::new();
         let mut shared = HashMap::new();
         let mut cond = Vec::new();
-        sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond)?;
+        let mut valid = Vec::new();
+        sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond, &mut valid)?;
         all_f.push((i as u16, fcells, shared));
         conds.push((i as u16, cond));
+        valids.push((i as u16, valid));
     }
 
     // Tables, before the formulas that use them.
@@ -1124,6 +1139,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
     // Conditional formats, once formulas (and the names they use) can be read.
     for (s, raws) in &conds {
         super::condfmt::read_sheet(&mut wb, *s, raws, &dxfs, &theme, &mut rep);
+    }
+    for (s, inner) in &valids {
+        if !inner.is_empty() {
+            super::validation::read_sheet(&mut wb, *s, inner, &mut rep);
+        }
     }
     wb.recalc();
     // The differential: our results against the file's.

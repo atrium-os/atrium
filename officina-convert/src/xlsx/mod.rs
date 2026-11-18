@@ -13,6 +13,7 @@ pub mod pivot;
 #[cfg(feature = "read")]
 pub mod read;
 pub mod styles;
+pub mod validation;
 pub mod write;
 
 #[cfg(feature = "read")]

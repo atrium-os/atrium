@@ -456,6 +456,7 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         o.extend_from_slice(b"</mergeCells>");
     }
     super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb), &mut o);
+    super::validation::sheet_xml(wb, s, &mut o);
     let links = wb.links(s);
     if !links.is_empty() {
         o.extend_from_slice(b"<hyperlinks>");

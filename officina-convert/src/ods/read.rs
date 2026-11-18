@@ -67,7 +67,7 @@ fn bad(s: impl Into<String>) -> OdsError {
 }
 
 /// Attributes by qualified name (`office:value`), unescaped.
-fn attrs(e: &BytesStart) -> HashMap<String, String> {
+pub(super) fn attrs(e: &BytesStart) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for a in e.attributes().with_checks(false).flatten() {
         if let Ok(v) = a.unescape_value() {
@@ -717,6 +717,8 @@ struct CellIn {
     paras: u32,
     /// A matrix (array) formula's rows and columns.
     matrix: Option<(u32, u32)>,
+    /// The data validation rule it names.
+    validation: Option<String>,
 }
 
 /// An ODF link target as ours: a place `#Sheet2.A1` becomes `#Sheet2!A1`
@@ -807,6 +809,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut frames: Vec<super::chart::FrameIn> = Vec::new();
     let mut frame: Option<super::chart::FrameIn> = None;
     let mut frame_depth = 0u32;
+    // Data validation rules, the ranges whose cells name each, and the range
+    // still growing down for (name, sheet, first column, last column).
+    let mut val_rules: Vec<super::validation::RuleIn> = Vec::new();
+    let mut val_cells: HashMap<String, Vec<officina_grid::addr::Rect>> = HashMap::new();
+    let mut val_open: HashMap<(String, u16, u32, u32), usize> = HashMap::new();
 
     let finish_sheet = |wb: &mut Workbook, s: u16, widths: &mut Vec<(u32, f64)>, heights: &mut Vec<(u32, f64)>, runs: &mut Vec<Vec<(u32, u32, StyleId)>>| {
         let sh = wb.sheet_mut(s);
@@ -958,7 +965,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             (None, None) => None,
                             (r, c) => Some((r.unwrap_or(1), c.unwrap_or(1))),
                         };
-                        let c = CellIn { link: None, vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix };
+                        let c = CellIn { link: None, vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix, validation: a.get("table:content-validation-name").cloned() };
                         if empty {
                             row_cells.push((col, repeat, c));
                             col += repeat as u64;
@@ -1149,7 +1156,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             f.entries.push(CfEntry::Other(String::from_utf8_lossy(name).into_owned()));
                         }
                     }
-                    b"table:content-validations" => rep.note(Kind::Dropped, "data validation"),
+                    b"table:content-validations" if !empty => {
+                        let end = name.to_vec();
+                        let mut b2 = Vec::new();
+                        let span = r.read_to_end_into(quick_xml::name::QName(&end), &mut b2)?;
+                        let inner = content.get(span.start as usize..span.end as usize).unwrap_or_default();
+                        val_rules = super::validation::read_rules(inner);
+                    }
                     b"table:database-range" => {
                         let a = attrs(e);
                         db = None;
@@ -1319,6 +1332,34 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 }
                             }
                         }
+                        // Cells naming a validation rule: runs across, grown down.
+                        if !val_rules.is_empty() && row < MAX_ROWS as u64 {
+                            let r1 = (row + row_repeat as u64 - 1).min(MAX_ROWS as u64 - 1) as u32;
+                            let mut across: Vec<(&str, u32, u32)> = Vec::new();
+                            for (c0, n, c) in &row_cells {
+                                let Some(v) = c.validation.as_deref() else { continue };
+                                if *c0 >= MAX_COLS as u64 {
+                                    break;
+                                }
+                                let c1 = (c0 + *n as u64 - 1).min(MAX_COLS as u64 - 1) as u32;
+                                match across.last_mut() {
+                                    Some(l) if l.0 == v && l.2 as u64 + 1 == *c0 => l.2 = c1,
+                                    _ => across.push((v, *c0 as u32, c1)),
+                                }
+                            }
+                            for (v, c0, c1) in across {
+                                let list = val_cells.entry(v.to_string()).or_default();
+                                let key = (v.to_string(), s, c0, c1);
+                                match val_open.get(&key) {
+                                    Some(&i) if list[i].r1 + 1 == row as u32 => list[i].r1 = r1,
+                                    _ if list.len() <= officina_grid::validation::MAX_RANGES => {
+                                        val_open.insert(key, list.len());
+                                        list.push(officina_grid::addr::Rect { sheet: s, r0: row as u32, c0, r1, c1 });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         // Styles: the cell's, or the row's, or the column's default.
                         if runs.len() < col as usize {
                             runs.resize_with((col as usize).min(MAX_COLS as usize), Vec::new);
@@ -1443,6 +1484,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             Err(why) => rep.note_at(Kind::Dropped, "conditional formats this engine can't use", || format!("{}: {why}", f.target)),
         }
     }
+
+    // Data validation, once every sheet exists.
+    super::validation::make(&mut wb, val_rules, val_cells, &mut rep);
 
     // Formulas, once every sheet exists.
     let mut cached = Vec::new();

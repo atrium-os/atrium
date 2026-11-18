@@ -803,8 +803,11 @@ fn note(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32) {
 }
 
 /// One cell's attributes and content (without the element's name).
-fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, span: Option<officina_grid::addr::Rect>, bools: &mut BTreeSet<StyleId>) {
+fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, span: Option<officina_grid::addr::Rect>, bools: &mut BTreeSet<StyleId>, val: Option<usize>) {
     out.push_str("<table:table-cell");
+    if let Some(i) = val {
+        let _ = write!(out, r#" table:content-validation-name="{}""#, super::validation::name(i));
+    }
     if let Some(m) = span {
         let _ = write!(out, r#" table:number-columns-spanned="{}" table:number-rows-spanned="{}""#, m.c1 - m.c0 + 1, m.r1 - m.r0 + 1);
     }
@@ -922,7 +925,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
     out.push_str("</table:table-cell>");
 }
 
-fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u64, usize>, col_style: &mut BTreeMap<u64, usize>, bools: &mut BTreeSet<StyleId>) -> io::Result<()> {
+fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u64, usize>, col_style: &mut BTreeMap<u64, usize>, bools: &mut BTreeSet<StyleId>, budget: &mut usize) -> io::Result<()> {
     let (rows, cols) = wb.extent(s);
     let name = wb.sheet_name(s);
     if rows > ODS_ROWS || cols > ODS_COLS {
@@ -975,6 +978,9 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             cells.push((m.r0, m.c0));
         }
     }
+    // Cells a validation rule covers, written even when empty, to name it.
+    let vals = super::validation::sheet_cells(wb, s, rows, budget);
+    cells.extend(vals.keys().copied());
     cells.sort_unstable();
     cells.dedup();
 
@@ -1105,7 +1111,7 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             let id = sh.style_id(r, cc);
             let style = (id != tail(cc)).then_some(id);
             let span = wb.merge_at(officina_grid::CellAddr::new(s, r, cc)).filter(|m| (m.r0, m.c0) == (r, cc));
-            cell_xml(out, wb, s, r, cc, &wb.value(s, r, cc), style, span, bools);
+            cell_xml(out, wb, s, r, cc, &wb.value(s, r, cc), style, span, bools, vals.get(&(r, cc)).copied());
             col = cc + 1;
             any = true;
             k += 1;
@@ -1257,8 +1263,9 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     let mut col_style: BTreeMap<u64, usize> = BTreeMap::new();
     let mut tables = String::with_capacity(1 << 16);
     let mut bools: BTreeSet<StyleId> = BTreeSet::new();
+    let mut budget = super::validation::MAX_NAMED;
     for s in 0..wb.sheet_count() {
-        sheet_xml(&mut tables, wb, s as u16, &mut row_style, &mut col_style, &mut bools)?;
+        sheet_xml(&mut tables, wb, s as u16, &mut row_style, &mut col_style, &mut bools, &mut budget)?;
     }
     // Styles: data styles and cell styles for every style in the table.
     let mut auto = String::new();
@@ -1319,6 +1326,7 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
     }
     let mut content = String::with_capacity(tables.len() + auto.len() + 1024);
     let _ = write!(content, r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content {NS}><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet><table:calculation-settings table:case-sensitive="false" table:search-criteria-must-apply-to-whole-cell="true" table:use-wildcards="true" table:use-regular-expressions="false" table:automatic-find-labels="false"/>"#);
+    content.push_str(&super::validation::content_xml(wb));
     content.push_str(&tables);
     content.push_str(&names_xml(wb, None));
     content.push_str(&filters_xml(wb));

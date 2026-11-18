@@ -74,7 +74,7 @@ pub fn styles_xml(list: &[Dxf]) -> String {
     data + &cells
 }
 
-fn cell_addr(sheet: &str, r: u32, c: u32) -> String {
+pub(super) fn cell_addr(sheet: &str, r: u32, c: u32) -> String {
     format!("{sheet}.{}{}", col_name(c), r + 1)
 }
 
@@ -89,7 +89,7 @@ fn rect_addr(sheet: &str, r: &Rect) -> String {
 
 /// A rule formula as LibreOffice writes one in a condition: OpenFormula without
 /// its namespace, relative to the base cell.
-fn of(wb: &Workbook, e: &officina_grid::formula::Expr, origin: (u32, u32)) -> String {
+pub(super) fn of(wb: &Workbook, e: &officina_grid::formula::Expr, origin: (u32, u32)) -> String {
     let t = to_of(&format!("={}", wb.cond_formula_text(e, origin)));
     t.strip_prefix("of:=").unwrap_or(&t).to_string()
 }
@@ -275,7 +275,7 @@ fn call(s: &str) -> Option<(&str, Vec<String>)> {
     Some((&s[..open], args))
 }
 
-fn unquote(s: &str) -> Option<String> {
+pub(super) fn unquote(s: &str) -> Option<String> {
     let s = s.trim();
     Some(s.strip_prefix('"')?.strip_suffix('"')?.replace("\"\"", "\""))
 }
