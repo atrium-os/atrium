@@ -13,7 +13,7 @@ URL=${2:?url OUT is served at}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # The crates the SDK offers to apps (dev-tools.md §5.4); everything they
 # reach through path dependencies comes along.
-CRATES="pergola libatrium atrium-fonts fresco-client fresco-protocol atrium-message atrium-worker atrium-open"
+CRATES="pergola libatrium atrium-fonts fresco-client fresco-protocol atrium-message atrium-worker atrium-open limen nuntius"
 SEED=$(mktemp -d)
 trap 'rm -rf "$SEED"' EXIT
 mkdir -p "$SEED/src"

@@ -80,8 +80,18 @@ Two templates show an app split into a core and a worker
   kept for the app's run (`lifetime = "session"`, `input = "message"`): the
   core sends each file's text as a message, the worker keeps the counts.
 
-**Planned:** `client`, `media` and `service` templates, with M6 (`embeds`,
-roles, Nuntius from the manifest).
+- `client`: a JSON Feed reader. The core has no network: it asks Nuntius
+  (`net-fetch`, `net-fetch-sites`) for the feed, gets the response as a
+  descriptor and hands it unread to the `parse` worker, which parses it
+  with serde_json (any crate can parse there; it's caged).
+- `media`: plays the audio and video you open with it, in the system's
+  media player embedded through Limen (`embeds = ["media-player"]`). The
+  core sends the opened file's descriptor to the player and draws the
+  controls; it never demuxes or decodes.
+
+**Planned:** a `service` template, an app that provides a role
+(`[roles] implements`), once `share-target` has its messages and the share
+sheet sends them.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
@@ -173,8 +183,8 @@ workers as plain children (`cargo run` in a workspace).
 ## 5. Crates and the registry
 
 SDK crates (`pergola`, `libatrium`, `atrium-fonts`, `fresco-client`,
-`fresco-protocol`, `atrium-message`, `atrium-worker`, `atrium-open` and
-what they use) come from the Atrium
+`fresco-protocol`, `atrium-message`, `atrium-worker`, `atrium-open`,
+`limen`, `nuntius` and what they use) come from the Atrium
 crate registry, a static cargo sparse registry; everything else comes from
 crates.io as usual. All SDK crates are `MIT OR Apache-2.0` and versioned
 together.

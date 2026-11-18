@@ -1,0 +1,15 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+# The core: holds atrium.toml's capabilities. It never demuxes or decodes:
+# the system's media player does, embedded in its window.
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+[dependencies]
+pergola = {{dep:pergola}}
+limen = {{dep:limen}}
+atrium-open = {{dep:atrium-open}}
