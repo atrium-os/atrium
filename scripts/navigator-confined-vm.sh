@@ -238,7 +238,7 @@ g "set -e
         NAVIGATORD_STORE=/var/db/navigatord/store NAVIGATORD_DOWNLOADS=/var/db/navigatord/downloads \
         NAVIGATORD_UI=jail:org.atrium.navigator.ui NAVIGATORD_TRAILS=/var/db/navigatord/trails.json \
         NAVIGATORD_SCHEMES=mailto \
-        NAVIGATOR_UI_TRACE=1 NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium > /root/navigatord.conf
+        NAVIGATOR_UI_TRACE=1 NAVIGATOR_UI_WIRE_LOG=1 NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium > /root/navigatord.conf
     chmod +x $D/navigator-ui
     sh $D/navigator-ui-bundle.sh $D/navigator-ui /root/e2e-key.pem /usr/local/bin/opifex
     chmod +x $D/navigatord
