@@ -769,4 +769,16 @@ fn a_pass_with_sync_in_its_worker() {
     // A second pass finds nothing new.
     let p = engine.pass(account, &Couriers(&dc), now()).unwrap();
     assert_eq!(p.report.headers, 0, "{p:?}");
+
+    // Searching the server (§11.2): Message 250 is too old for its text to
+    // be here, so "body 250" finds nothing locally; the server finds it,
+    // its text is fetched, and then it is found here.
+    let q = mail_engine::search::parse("body 250", false);
+    assert!(engine.search(&q).unwrap().is_empty());
+    assert_eq!(engine.search_server(account, &q.server_words(), &Couriers(&dc)).unwrap(), 1);
+    let hits = engine.search(&q).unwrap();
+    assert_eq!(hits.iter().map(|h| h.subject.as_str()).collect::<Vec<_>>(), ["Message 250"]);
+    // Again: found on the server, nothing fetched (its text is here now).
+    assert_eq!(engine.search_server(account, &q.server_words(), &Couriers(&dc)).unwrap(), 1);
+    assert_eq!(engine.store.count(inbox).unwrap(), 300);
 }

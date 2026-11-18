@@ -559,6 +559,28 @@ fn search_as_you_type_and_a_saved_search() {
     mail.forget_search(id);
     assert!(mail.ui.get_cloned().saved.is_empty());
     assert!(engine.store.saved_searches().unwrap().is_empty());
+
+    // Search server (§11.2): the words go to the sync thread; what it
+    // stored joins the results, with a note.
+    mail.search_for("zanzibar contract", None);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Search server"), "{:?}", texts(&app));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    mail.search_server();
+    assert_eq!(mail.take_server_search(), Some(vec!["zanzibar".to_string(), "contract".to_string()]));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Searching server…"));
+    {
+        let bytes = message(10, "Arun <arun@acme.example>", "Old deal", "The zanzibar contract.", false, NOW - 900 * 86_400);
+        engine.sink(account).messages("Archive", vec![Fetched { uid: 10, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW - 900 * 86_400), server_id: None, bytes, full: true }]).unwrap();
+    }
+    mail.server_searched(Ok(1));
+    let ui = mail.ui.get_cloned();
+    assert_eq!(subjects(&mail), ["Old deal"]);
+    assert_eq!(ui.file_note.map(|n| n.0).as_deref(), Some("1 more found on the server"));
+    assert_eq!(ui.search.unwrap().server, Some(false));
+    mail.search_server();
+    assert_eq!(mail.take_server_search(), None, "once per query");
 }
 
 #[test]

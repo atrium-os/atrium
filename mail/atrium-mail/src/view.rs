@@ -258,6 +258,11 @@ pub struct Search {
     pub saved: Option<u32>,
     /// A view in place of a query (the newsletter lane, the screener's).
     pub view: Option<Lane>,
+    /// The server was searched too: `Some(true)` while it is, `Some(false)`
+    /// once it has been (§11.2).
+    pub server: Option<bool>,
+    /// Results before the server was searched.
+    pub server_base: usize,
 }
 
 /// An answer to a Later item.
@@ -518,6 +523,9 @@ pub struct Mail {
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
     unsubs: Rc<RefCell<Vec<(MsgId, String)>>>,
+    /// A server search asked for (§11.2): its words, for the app's sync
+    /// thread.
+    server_ask: Rc<RefCell<Option<Vec<String>>>>,
     /// Unwraps an encrypted message's content key with the person's
     /// private key (S/MIME, §10.1); none until the token or Arca can.
     pub unwrapper: Rc<RefCell<Option<Unwrapper>>>,
@@ -1345,7 +1353,7 @@ impl Mail {
     pub fn search_for(&self, query: &str, saved: Option<u32>) {
         let mut ui = self.ui.get_cloned();
         self.find.borrow_mut().set_text(query);
-        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved, view: None });
+        ui.search = Some(Search { query: query.into(), caret: query.len(), typing: false, hits: Vec::new(), saved, view: None, server: None, server_base: 0 });
         self.run_search(&mut ui);
         self.ui.set(ui);
     }
@@ -1705,6 +1713,45 @@ impl Mail {
         self.get_asked.take()
     }
 
+    /// Search the server for the search's words (§11.2), for mail outside
+    /// what is kept here; what it finds joins the results.
+    pub fn search_server(&self) {
+        let mut ui = self.ui.get_cloned();
+        let Some(s) = &mut ui.search else { return };
+        if s.view.is_some() || s.server.is_some() {
+            return;
+        }
+        let words = mail_engine::search::parse(&s.query, false).server_words();
+        if words.is_empty() {
+            return;
+        }
+        s.server = Some(true);
+        s.server_base = s.hits.len();
+        *self.server_ask.borrow_mut() = Some(words);
+        self.ui.set(ui);
+    }
+
+    pub fn take_server_search(&self) -> Option<Vec<String>> {
+        self.server_ask.borrow_mut().take()
+    }
+
+    /// What the server search found: the results again, and a note.
+    pub fn server_searched(&self, r: Result<usize, String>) {
+        let mut ui = self.ui.get_cloned();
+        let Some(s) = &mut ui.search else { return };
+        s.server = Some(false);
+        let before = s.server_base;
+        self.run_search(&mut ui);
+        let more = ui.count.saturating_sub(before);
+        let note = match r {
+            Ok(_) if more > 0 => format!("{more} more found on the server"),
+            Ok(_) => "Nothing more on the server".to_string(),
+            Err(e) => format!("Couldn't search the server: {e}"),
+        };
+        ui.file_note = Some((note, (self.now)() + 5));
+        self.ui.set(ui);
+    }
+
     pub fn take_unsubscribes(&self) -> Vec<(MsgId, String)> {
         std::mem::take(&mut *self.unsubs.borrow_mut())
     }
@@ -1890,6 +1937,7 @@ impl Mail {
         if changed && text != s.query {
             s.query = text;
             s.saved = None;
+            s.server = None;
             self.run_search(&mut ui);
         }
         self.ui.set(ui);
@@ -2571,6 +2619,7 @@ impl MailView {
             print: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
+            server_ask: Rc::default(),
             unwrapper: Rc::default(),
             settings_asked: Rc::default(),
             get_asked: Rc::default(),
@@ -2882,6 +2931,15 @@ impl MailView {
                     buttons.push(("Save", Box::new(move || m.save_search())));
                 }
                 None => {}
+            }
+            // Mail outside what is kept here (§11.2).
+            if s.view.is_none() && !s.typing && !s.query.trim().is_empty() {
+                let m = self.mail.clone();
+                match s.server {
+                    None => buttons.push(("Search server", Box::new(move || m.search_server()))),
+                    Some(true) => buttons.push(("Searching server…", Box::new(|| {}))),
+                    Some(false) => {}
+                }
             }
             for (label, on) in buttons {
                 let lw = width(label, type_size::XS, Weight::Medium) + em(16.0);

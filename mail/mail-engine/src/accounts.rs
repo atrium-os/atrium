@@ -90,6 +90,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn logout(&mut self) -> mail_sync::Result<()> {
         self.remote.logout()
     }
+    fn search(&mut self, words: &[String], sink: &mut dyn mail_sync::Sink, limit: usize) -> mail_sync::Result<usize> {
+        self.remote.search(words, sink, limit)
+    }
 }
 
 /// Mail's `sync` worker when the app has one (a jail of its own, no
@@ -175,6 +178,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     }
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> mail_sync::jmap::Result<mail_sync::jmap::Pushed> {
         mail_sync::jmap::Jmap::watch(&mut self.remote, on)
+    }
+    fn search(&mut self, text: &str, sink: &mut dyn mail_sync::Sink, limit: usize) -> mail_sync::jmap::Result<usize> {
+        mail_sync::jmap::Jmap::search(&mut self.remote, text, sink, limit)
     }
 }
 
@@ -317,6 +323,37 @@ impl Engine {
             }
         }
         Ok(pass)
+    }
+
+    /// Search `account`'s server for `words` (§11.2): what it finds that
+    /// isn't here with its text is fetched and indexed, so the local search
+    /// finds it next. How many the server found.
+    pub fn search_server(&self, account: AccountId, words: &[String], net: &dyn Connect) -> Result<usize, String> {
+        let Some(cfg) = self.store.account_config(account).ok().flatten() else { return Err("no settings".into()) };
+        let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
+        match &cfg.protocol {
+            Protocol::Imap { imap, .. } => {
+                let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+                let mut s = open_imap(s)?;
+                let n = self.search_imap(account, s.as_mut(), words)?;
+                let _ = s.logout();
+                Ok(n)
+            }
+            Protocol::Jmap { session } => {
+                let mut c = open_jmap(net.jmap(session, &item)?, session)?;
+                self.search_jmap(account, c.as_mut(), words)
+            }
+        }
+    }
+
+    /// [`Engine::search_server`] on an IMAP session already open.
+    pub fn search_imap(&self, account: AccountId, s: &mut dyn Imap, words: &[String]) -> Result<usize, String> {
+        s.search(words, &mut self.sink(account), mail_sync::SERVER_HITS).map_err(|e| e.to_string())
+    }
+
+    /// [`Engine::search_server`] on a JMAP client already connected.
+    pub fn search_jmap(&self, account: AccountId, c: &mut dyn mail_sync::jmap::Jmap, words: &[String]) -> Result<usize, String> {
+        c.search(&words.join(" "), &mut self.sink(account), mail_sync::SERVER_HITS).map_err(|e| e.to_string())
     }
 
     /// When the next pass should run at the latest: the next due send,

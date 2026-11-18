@@ -162,7 +162,16 @@ pub trait Sink {
         let _ = (folder, uid);
         None
     }
+    /// Whether the message at `folder`/`uid` is here with its text (so a
+    /// server search needn't fetch it).
+    fn has_text(&mut self, folder: &str, uid: u32) -> bool {
+        let _ = (folder, uid);
+        false
+    }
 }
+
+/// A server search (§11.2) brings at most this many messages.
+pub const SERVER_HITS: usize = 50;
 
 /// A change the person made, to make on the server (mail.md §6.3).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -400,6 +409,61 @@ impl<S: Read + Write> Session<S> {
             self.texts(&f.name, sink, &mut report)?;
         }
         Ok(report)
+    }
+
+    /// Search the server for messages with every one of `words` (IMAP
+    /// `UID SEARCH TEXT`, §11.2), newest first in each folder the pass
+    /// walks, at most `limit`; those not here with their text are fetched
+    /// into `sink`: their headers, then the whole message when it is at
+    /// most [`TEXT_MAX`]. How many the server found (up to `limit`).
+    pub fn search_server(&mut self, words: &[String], sink: &mut dyn Sink, limit: usize) -> Result<usize> {
+        if words.is_empty() || limit == 0 {
+            return Ok(0);
+        }
+        let all = self.folders()?;
+        sink.folders(&all).map_err(Error::Sink)?;
+        let q = Search::And(words.iter().map(|w| Search::Text(w.clone())).collect());
+        let mut found = 0;
+        for f in self.walk(&all) {
+            if found >= limit {
+                break;
+            }
+            let cmd = self.enc.select(&f.name, true, None, false);
+            match self.run(cmd) {
+                Ok(_) => {}
+                Err(Error::No(_)) => continue,
+                Err(e) => return Err(e),
+            }
+            let cmd = self.enc.uid_search(&q);
+            let (rs, _) = self.run(cmd)?;
+            let mut uids: Vec<u32> = rs.into_iter().flat_map(|r| match r { Response::Search { ids, .. } => ids, _ => Vec::new() }).collect();
+            uids.sort_unstable_by(|a, b| b.cmp(a));
+            uids.dedup();
+            uids.truncate(limit - found);
+            found += uids.len();
+            let want: Vec<u32> = uids.into_iter().filter(|u| !sink.has_text(&f.name, *u)).collect();
+            if want.is_empty() {
+                continue;
+            }
+            let cmd = self.enc.uid_fetch(&Set::of(&want), &self.header_items(), None, false);
+            let (rs, _) = self.run(cmd)?;
+            let (heads, _) = self.fetched(rs, false);
+            let small: Vec<u32> = heads.iter().filter(|m| m.size <= TEXT_MAX).map(|m| m.uid).collect();
+            sink.messages(&f.name, heads).map_err(Error::Sink)?;
+            let mut items = vec![FetchWant::Uid, FetchWant::Flags, FetchWant::Size, FetchWant::InternalDate, FetchWant::BodyPeek { section: String::new(), partial: None }];
+            if has(&self.caps, "X-GM-EXT-1") {
+                items.push(FetchWant::GmMsgId);
+            } else if has(&self.caps, "OBJECTID") {
+                items.push(FetchWant::EmailId);
+            }
+            for batch in small.chunks(TEXT_BATCH) {
+                let cmd = self.enc.uid_fetch(&Set::of(batch), &items, None, false);
+                let (rs, _) = self.run(cmd)?;
+                let (msgs, _) = self.fetched(rs, true);
+                sink.messages(&f.name, msgs).map_err(Error::Sink)?;
+            }
+        }
+        Ok(found)
     }
 
     /// Put a message in `folder` (a sent copy, a draft); its new UID when

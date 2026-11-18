@@ -613,6 +613,9 @@ fn main() {
         while let Ok(note) = file_done.try_recv() {
             mail.file_note(note);
         }
+        if let Some(words) = mail.take_server_search() {
+            let _ = syncer.wake.send(atrium_mail::accounts::Wake::Search(words));
+        }
         for (msg, url) in mail.take_unsubscribes() {
             let tx = unsub_tx.clone();
             std::thread::spawn(move || {
@@ -907,6 +910,10 @@ fn main() {
                     }
                 }
             }
+        }
+        // A server search's result first: it counts what it added.
+        if let Some(r) = syncer.searched.lock().unwrap().take() {
+            mail.server_searched(r);
         }
         // The index changes under the window as sync stores mail.
         let synced = syncer.changed.swap(false, std::sync::atomic::Ordering::AcqRel);

@@ -40,6 +40,17 @@ pub struct Query {
     pub conds: Vec<Cond>,
 }
 
+impl Query {
+    /// The words a server search looks for (§11.2): every plain or field
+    /// word, as typed.
+    pub fn server_words(&self) -> Vec<String> {
+        self.conds.iter().filter_map(|c| match c {
+            Cond::Word { word, .. } => Some(word.clone()),
+            _ => None,
+        }).collect()
+    }
+}
+
 /// The most results returned.
 pub const RESULTS_MAX: usize = 500;
 
