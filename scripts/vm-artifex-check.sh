@@ -8,7 +8,9 @@
 # jumps to its line; the Terminal button opens proj's terminal; with clangd
 # on the workspace's PATH (the c-dev layer) a diagnostic comes from it too.
 # Runs on the HOST after cloud-vm.sh up (QEMU fork, TCG_CPU=Haswell-noTSX).
-# CDEV=<c-dev layer tree> installs it first (build-c-dev-layer.sh's output).
+# CDEV=<c-dev layer tree> installs it first (build-c-dev-layer.sh's output);
+# RUST=<Rust layer tree> installs that too, makes proj a Rust workspace and
+# checks rust-analyzer on rs/main.rs.
 # Ends "artifex: N failed".
 #
 #   sh scripts/vm-artifex-check.sh [out-dir]
@@ -122,32 +124,54 @@ waitstate() { # pattern [secs]
     state | grep -q -- "$1"
 }
 
-# The c-dev layer (clangd), when CDEV names its tree: signed with a gate
-# key standing in for the platform key, as vm-layers-check.sh does. A C
-# workspace made after it gets it on PATH.
+# The c-dev layer (clangd) when CDEV names its tree, and the Rust layer
+# (rust-analyzer) when RUST does: signed with a gate key standing in for
+# the platform key, as vm-layers-check.sh does. A workspace made after
+# them has them on PATH (proj is a Rust workspace when RUST is set: Rust
+# gets c-dev too).
 CDEV=${CDEV:-}
-if [ -n "$CDEV" ] && [ -f "$CDEV/atrium.toml" ]; then
-    echo "=== the c-dev layer"
+RUST=${RUST:-}
+[ -n "$CDEV" ] && [ -f "$CDEV/atrium.toml" ] || CDEV=
+[ -n "$RUST" ] && [ -f "$RUST/atrium.toml" ] || RUST=
+RVER=$( [ -z "$RUST" ] || sed -n 's/^version = "\(.*\)"/\1/p' "$RUST/atrium.toml" | head -1)
+# Installed already (from an earlier run): kept, unless FRESH_LAYERS=1.
+if [ -z "${FRESH_LAYERS:-}" ]; then
+    L=$(V "opifex layer list")
+    [ -z "$CDEV" ] || ! echo "$L" | grep -q " c-dev@1 " || { ok "c-dev already installed"; CDEV=; KEEP_CDEV=1; }
+    [ -z "$RUST" ] || ! echo "$L" | grep -q " rust@$RVER " || { ok "rust already installed"; RUST=; KEEP_RUST=1; }
+fi
+if [ -n "$CDEV$RUST" ]; then
+    echo "=== the layers"
     (cd "$ROOT/portcullis" && cargo build -q -p opifex) || { echo "host opifex failed"; exit 1; }
     LH=$(mktemp -d)
     openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out "$LH/gate.key"
     openssl ec -in "$LH/gate.key" -pubout -out "$LH/gate.pem" 2>/dev/null
-    # The manifest without its content line (the [layer.env] after it stays).
-    grep -v '^content = ' "$CDEV/atrium.toml" > "$LH/c-dev.toml"
-    "$ROOT/portcullis/target/debug/opifex" layer pack "$CDEV" --manifest "$LH/c-dev.toml" --sign "$LH/gate.key" >/dev/null || bad "pack c-dev"
-    (cd "$(dirname "$CDEV")" && tar -czf "$LH/c-dev.tar.gz" "$(basename "$CDEV")")
-    want=$(sha256sum "$LH/c-dev.tar.gz" | cut -d' ' -f1)
-    scp -q $K -P 2222 "$LH/c-dev.tar.gz" "$LH/gate.pem" root@localhost:$B/
-    [ "$want" = "$(V "sha256 -q $B/c-dev.tar.gz")" ] || bad "c-dev arrived damaged (TCG scp); run again"
-    out=$(V "cd $B && tar -xf c-dev.tar.gz && rm c-dev.tar.gz && mkdir -p /etc/atrium/platform-keys && cp gate.pem /etc/atrium/platform-keys/artifex-gate.pem && \
+    scp -q $K -P 2222 "$LH/gate.pem" root@localhost:$B/
+    # Nothing may hold the old layers: stop the workspaces, drop their mounts.
+    V "mkdir -p /etc/atrium/platform-keys && cp $B/gate.pem /etc/atrium/platform-keys/artifex-gate.pem && \
        for w in scratch proj; do su -m alice -c \"portcullis workspace stop \$w\" >/dev/null 2>&1; done; \
        for j in \$(jls name | grep '^ws_alice_'); do jail -r \$j; done; \
-       for m in \$(mount -p | awk '\$2 ~ /toolchains/ {print \$2}' | sort -r); do umount -f \$m; done; \
-       (opifex layer remove c-dev@1 >/dev/null 2>&1; opifex layer install $B/$(basename "$CDEV"))" 2>&1)
-    V "opifex layer list" | grep -q " c-dev@1 " && V "grep -q LD_LIBRARY_PATH /var/lib/atrium/layers/c-dev@1/atrium.toml" \
-        && ok "c-dev installed" || bad "c-dev: $out"
+       for m in \$(mount -p | awk '\$2 ~ /toolchains/ {print \$2}' | sort -r); do umount -f \$m; done" >/dev/null 2>&1
+    layer() { # tree name@version check
+        n=${2%@*}
+        # The manifest without its content line (the [layer.env] after it stays).
+        grep -v '^content = ' "$1/atrium.toml" > "$LH/$n.toml"
+        "$ROOT/portcullis/target/debug/opifex" layer pack "$1" --manifest "$LH/$n.toml" --sign "$LH/gate.key" >/dev/null || { bad "pack $n"; return; }
+        (cd "$(dirname "$1")" && tar -czf "$LH/$n.tar.gz" "$(basename "$1")")
+        want=$(sha256sum "$LH/$n.tar.gz" | cut -d' ' -f1)
+        scp -q $K -P 2222 "$LH/$n.tar.gz" root@localhost:$B/
+        rm -f "$LH/$n.tar.gz"
+        [ "$want" = "$(V "sha256 -q $B/$n.tar.gz")" ] || { bad "$n arrived damaged (TCG scp); run again"; return; }
+        out=$(V "cd $B && rm -rf $(basename "$1") && tar -xf $n.tar.gz && rm $n.tar.gz && \
+           (opifex layer remove $2 >/dev/null 2>&1; opifex layer install $B/$(basename "$1")) && rm -rf $B/$(basename "$1")" 2>&1)
+        V "opifex layer list" | grep -q " $2 " && V "grep -q $3 /var/lib/atrium/layers/$2/atrium.toml" \
+            && ok "$n installed" || bad "$n: $out"
+    }
+    [ -z "$CDEV" ] || layer "$CDEV" c-dev@1 LD_LIBRARY_PATH
+    [ -z "$RUST" ] || layer "$RUST" "rust@$RVER" RUST_SRC_PATH
     rm -rf "$LH"
 fi
+[ -z "${KEEP_RUST:-}" ] || RUST=kept
 
 echo "=== the workspace"
 V "service atrium-jaild status >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1; sleep 1; test -S /var/run/atrium/jaild.sock" && ok "jaild is up" || bad "no jaild"
@@ -155,7 +179,7 @@ W=/home/alice/.atrium/workspaces
 for w in scratch proj; do V "su -m alice -c 'portcullis workspace stop $w'" >/dev/null 2>&1; done
 V "for m in \$(mount -p | awk '\$2 ~ /workspaces\/alice|jails\/$ART\/work/ {print \$2}' | sort -r); do umount -f \$m; done; rm -rf $W /var/lib/atrium/workspaces/alice /var/db/atrium/alice/workspace-picks /var/run/atrium/ide"
 V "su -m alice -c 'portcullis workspace list'" >/dev/null 2>&1
-V "su -m alice -c 'portcullis workspace new proj --network none'" >/dev/null 2>&1
+V "su -m alice -c 'portcullis workspace new proj --network none${RUST:+ --toolchain rust}'" >/dev/null 2>&1
 V 'sh -s' <<EOS
 set -e
 cat > $W/proj/work/hello.c <<'C'
@@ -167,6 +191,11 @@ int main(void) {
 }
 C
 printf '# proj\n' > $W/proj/work/README.md
+# A Cargo project for rust-analyzer: a module it can't find is its own
+# diagnostic, and the type error is cargo check's.
+mkdir -p $W/proj/work/rs
+printf '[package]\nname = "rs"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "rs"\npath = "main.rs"\n' > $W/proj/work/rs/Cargo.toml
+printf 'mod missing;\n\nfn main() {\n    let n: i32 = "one";\n    println!("{n}");\n}\n' > $W/proj/work/rs/main.rs
 chown -R alice:files-alice $W/proj/work; chmod -R g+rwX $W/proj/work
 EOS
 check "proj made with hello.c" "1" "$(V "test -f $W/proj/work/hello.c && echo 1")"
@@ -206,18 +235,34 @@ shot artifex-3-problems
 GAP=6 press 440 508        # the first problem (panel under the editor)
 waitstate 'caret=(6, 9)' 20 && ok "a click on it goes to line 6, column 9" || bad "jump: $(state)"
 
-echo "=== terminal"
-press 1080 52              # the bar's Terminal button
-i=0; while [ $i -lt 30 ] && ! V "grep -q 'console in workspace/proj' $LOG"; do sleep 2; i=$((i+2)); done
-V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's terminal" || bad "terminal: $(V "grep -i console $LOG | tail -2")"
-shot artifex-4-terminal
-
 echo "=== clangd"
 if V "jexec ws_alice_proj test -x /atrium/toolchains/c-dev/bin/clangd"; then
     waitstate 'lsp=Some("clangd") diags=[2-9]' 120 && ok "clangd answers, with its own diagnostic" || bad "clangd: $(state)"
 else
     echo "  (no clangd in proj: the c-dev layer isn't installed here; skipped)"
 fi
+
+echo "=== rust-analyzer"
+if [ -n "$RUST" ]; then
+    rows() { state | sed 's/.*rows=\[\([^]]*\)\].*/\1/' | tr ',' '\n'; }
+    ROW=$(rows | grep -n '^rs$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'rows=\[[^]]*rs/main.rs' 20 && ok "a click opens the rs folder" || bad "rs: $(state)"
+    ROW=$(rows | grep -n '^rs/main.rs$' | cut -d: -f1)
+    press 100 $((89 + 22 * (${ROW:-1} - 1)))
+    waitstate 'tabs=\[hello.c,rs/main.rs\]' 20 && ok "and main.rs opens" || bad "main.rs: $(state)"
+    # Its first answer indexes std under TCG: minutes.
+    waitstate 'lsp=Some("rust-analyzer") diags=[1-9]' 1500 && ok "rust-analyzer answers, with a diagnostic ($(state | sed 's/.*\(lsp=.*diags=[0-9]*\).*/\1/'))" || bad "rust-analyzer: $(state)"
+    shot artifex-5-rust
+else
+    echo "  (RUST not set: skipped)"
+fi
+
+echo "=== terminal"
+press 1080 52              # the bar's Terminal button
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'console in workspace/proj' $LOG"; do sleep 2; i=$((i+2)); done
+V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's terminal" || bad "terminal: $(V "grep -i console $LOG | tail -2")"
+shot artifex-4-terminal
 
 echo "artifex: $fails failed"
 [ $fails = 0 ]

@@ -18,7 +18,7 @@ use pergola::node::Node;
 use pergola::theme::{font, radius, type_size, Weight};
 use pergola::view::{Ctx, View};
 use pergola::text_edit::TextEdit;
-use pergola::widgets::{Button, CodeGrid, CodeView, TextField};
+use pergola::widgets::{phosphor, Button, CodeGrid, CodeView, TextField};
 use pergola::{Color, Mutable, TextStyle};
 use portcullis_ipc::WorkspaceInfo;
 
@@ -353,8 +353,16 @@ impl View for ArtifexView {
             }
             ctx.on_click(id, plain(q, if row.dir { Act::Toggle(row.rel.clone()) } else { Act::Open(row.rel.clone()) }));
             let indent = em(10.0) + row.depth as f32 * em(14.0);
-            let icon = if row.dir { if row.open { "▾" } else { "▸" } } else { " " };
-            text(ctx, r.x() + indent - em(8.0), y + row_h() / 2.0, icon, type_size::SM, Weight::Regular, t.text_tertiary());
+            if row.dir {
+                // Phosphor's carets: the UI face (Plex) has no triangles.
+                let icon = if row.open { phosphor::CARET_DOWN } else { phosphor::CARET_RIGHT };
+                let h = em(type_size::XS) * 1.5;
+                ctx.add(Node::Text {
+                    rect: Rect::new(r.x() + indent - em(9.0), y + (row_h() - h) / 2.0, 0.0, h),
+                    content: icon.to_string(),
+                    style: style(font::ICONS, type_size::XS, Weight::Regular, t.text_tertiary()),
+                });
+            }
             let change = s.git.as_ref().and_then(|g| {
                 if row.dir {
                     g.dir_changed(&row.rel).then_some('•')
