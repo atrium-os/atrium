@@ -300,10 +300,12 @@ echo 'persona note' > $M/persona/note.txt || fail "write in the group's domain"
 sync
 umount $M || fail "umount after groups"
 # dump DIR WANT: the console listing after a quota dump has WANT
+# (dmesg -c, not a line count: the message buffer stops growing once full;
+# /var/log/messages keeps the whole console)
 dump() {
-    n0=$(dmesg | wc -l)
+    dmesg -c >/dev/null
     tessera-keyload quota-dump $1 || fail "quota-dump"
-    dmesg | tail -n +$((n0 + 1)) > $T/dump
+    dmesg > $T/dump
     grep -qE "$2" $T/dump || { cat $T/dump; fail "dump lacks: $2"; }
 }
 mount -t tessera $DEV $M || fail "remount with groups"
@@ -454,9 +456,9 @@ P=$M/homes/persona
 # the key dropped on a live mount
 exec 3< $P/b.txt
 echo 'written just before the drop' > $P/late.txt
-n0=$(dmesg | wc -l)
+dmesg -c >/dev/null
 tessera-keyload drop $GKID >/dev/null || fail "drop group 9 while mounted"
-dmesg | tail -n +$((n0 + 1)) | grep -q 'key group 9 closing on' ||
+dmesg | grep -q 'key group 9 closing on' ||
     fail "no flush when the key was dropped"
 ls $P >/dev/null 2>&1 && fail "listed a locked group"
 cat $P/sub/a.txt >/dev/null 2>&1 && fail "read a locked group's file"
@@ -466,7 +468,7 @@ touch $P/new.txt 2>/dev/null && fail "created in a locked group"
 stat $P >/dev/null || fail "no stat of a locked group's root"
 [ "$(cat $M/team/t.txt)" = 'team file' ] || fail "the other group with one locked"
 [ "$(cat $M/other/p.txt)" = 'plain file' ] || fail "a plain file with a group locked"
-dmesg | tail -n +$((n0 + 1)) | grep -q 'key group 9 is locked; refused' ||
+dmesg | grep -q 'key group 9 is locked; refused' ||
     fail "no 'locked' on the console"
 exec 3<&-
 tessera-keyload load-group $T/gkey $GKID $U4 9 >/dev/null || fail "reload group 9"
@@ -480,9 +482,9 @@ sysctl kern.tessera.test_cross_domain_link=0 >/dev/null
 [ $r = 0 ] || fail "the test link wasn't made"
 umount $M || fail "umount after the rules"
 mount -t tessera $DEV $M || fail "remount after the rules"
-n0=$(dmesg | wc -l)
+dmesg -c >/dev/null
 cat $M/other/stolen >/dev/null 2>&1 && fail "read a group's file through a plain directory"
-dmesg | tail -n +$((n0 + 1)) | grep -q 'breaks the key-group domain rule' ||
+dmesg | grep -q 'breaks the key-group domain rule' ||
     fail "no 'domain rule' on the console"
 [ "$(cat $M/homes/persona/late.txt)" = 'written just before the drop' ] ||
     fail "late file after remount"

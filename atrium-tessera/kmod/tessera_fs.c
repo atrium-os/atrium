@@ -5920,13 +5920,17 @@ tessera_fs_wctx_group(struct tessera_mount *tmp_, uint64_t group,
 /* Rate limit for the "locked" and "refused" console lines: a walk over a
  * locked tree asks once per name. */
 static int
-tessera_fs_e44_log_ok(void)
+tessera_fs_e44_log_ok(int which)
 {
-	static struct timeval last;
-	static int pps;
+	/* One budget per kind: routine "locked" lines must never hide a
+	 * domain-rule refusal, which points at an edited volume. */
+	static struct timeval last[2];
+	static int pps[2];
 
-	return (ppsratecheck(&last, &pps, 2));
+	return (ppsratecheck(&last[which], &pps[which], 2));
 }
+#define TESSERA_E44_LOG_LOCKED 0
+#define TESSERA_E44_LOG_RULE   1
 
 /*
  * kern.tessera.test_cross_domain_link: lets link(2) make a name for a file
@@ -6023,7 +6027,7 @@ tessera_fs_entry_ok(struct tessera_mount *tmp_, uint64_t dir_ino,
 	qd = tessera_quota_find(tmp_, cd);
 	if (qd != NULL && qd->root_inode_no == child_ino)
 		return (0);
-	if (tessera_fs_e44_log_ok())
+	if (tessera_fs_e44_log_ok(TESSERA_E44_LOG_RULE))
 		printf("tessera_fs: inode %ju (domain %ju) under directory "
 		    "%ju (domain %ju) breaks the key-group domain rule; "
 		    "refused\n", (uintmax_t)child_ino, (uintmax_t)cd,
@@ -7130,7 +7134,7 @@ tessera_fs_vp_keycheck(struct vnode *vp)
 	if ((e = tessera_fs_vp_group(vp, &group)) != 0 || group == 0)
 		return (e);
 	e = tessera_fs_group_state(VFSTOTESSERA(vp->v_mount), group);
-	if (e == EACCES && tessera_fs_e44_log_ok())
+	if (e == EACCES && tessera_fs_e44_log_ok(TESSERA_E44_LOG_LOCKED))
 		printf("tessera_fs: inode %ju: key group %ju is locked; "
 		    "refused\n", (uintmax_t)tn->inode_no, (uintmax_t)group);
 	return (e);
