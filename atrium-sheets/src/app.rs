@@ -1043,8 +1043,7 @@ impl View for Sheets {
             .emit(ctx);
             let by = ly + lh + 12.0;
             ctx.add(Node::Rect { rect: Rect::new(x0, by - 6.0, REVIEW_W, 1.0), fill: t.border_default(), radius: 0.0 });
-            let whole = rv.picked.and_then(|i| rv.changes.get(i)).is_some_and(|c| c.whole_sheet());
-            Button::primary(if whole { "Take Sheet" } else { "Take" }).at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
+            Button::primary("Take").at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
             Button::secondary("Keep Mine").at(x0 + 120.0, by).width(96.0).on_click(push(ReviewCmd::Keep)).render(ctx);
             Button::secondary("Take All").at(x0 + REVIEW_W - 100.0, by).width(88.0).on_click(push(ReviewCmd::TakeAll)).render(ctx);
         }
@@ -1367,6 +1366,43 @@ mod tests {
         assert!(s.doc.borrow().wb.value(0, 2, 0).is_empty());
         run(ReviewCmd::Close);
         assert!(!s.review.get_cloned().open && s.theirs.borrow().is_none());
+    }
+
+    #[test]
+    fn rows_and_columns_are_inserted_and_deleted() {
+        use crate::data::DataCmd;
+        let (mut d, _) = Doc::from_csv("r.csv", b"a,1\nb,2\nc,3\n").unwrap();
+        d.type_into(3, 1, "=SUM(B1:B3)");
+        d.wb.recalc();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: DataCmd| {
+            s.cmds.lock().unwrap().push(Cmd::Data(c));
+            s.take_cmds();
+        };
+        let f = |r: u32, c: u32| s.doc.borrow().wb.formula_text(officina_grid::CellAddr::new(0, r, c));
+        // Rows 2–3 selected: two rows inserted above them.
+        let mut g = s.grid.get_cloned();
+        g.anchor = (1, 0);
+        g.cursor = (2, 1);
+        s.grid.set(g);
+        let items = crate::data::menu(&s.doc.borrow(), s.grid.get_cloned().selection(), (2, 1));
+        assert!(items.iter().any(|(m, c)| *c == Some(DataCmd::InsertRows) && m.label == "Insert 2 Rows Above"), "{:?}", items.iter().map(|x| x.0.label.clone()).collect::<Vec<_>>());
+        run(DataCmd::InsertRows);
+        assert_eq!(f(5, 1).as_deref(), Some("=SUM(B1:B5)"));
+        assert_eq!(s.doc.borrow().wb.value(0, 3, 0), officina_grid::Value::Str("b".into()));
+        assert_eq!(s.doc.borrow().status, "2 rows inserted.");
+        // Undo puts it back; deleting column A moves the sum left.
+        s.cmds.lock().unwrap().push(Cmd::Undo);
+        s.take_cmds();
+        assert_eq!(f(3, 1).as_deref(), Some("=SUM(B1:B3)"));
+        s.grid.set(GridState::default());
+        run(DataCmd::DeleteCols);
+        assert_eq!(f(3, 0).as_deref(), Some("=SUM(A1:A3)"));
+        assert_eq!(s.doc.borrow().wb.value(0, 3, 0), officina_grid::Value::Num(6.0));
+        // Deleting a row the sum covers narrows it.
+        run(DataCmd::DeleteRows);
+        assert_eq!(f(2, 0).as_deref(), Some("=SUM(A1:A2)"));
+        assert_eq!(s.doc.borrow().wb.value(0, 2, 0), officina_grid::Value::Num(5.0));
     }
 
     #[test]

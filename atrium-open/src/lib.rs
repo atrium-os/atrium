@@ -99,6 +99,32 @@ pub fn encode_link(url: &str) -> Option<Vec<u8>> {
     Some(v)
 }
 
+/// `XLINK\0from\0url`: a link the person sent here from another of their
+/// personas (personas.md §6), `from` its name (`personal` for Personal).
+pub fn encode_crossed_link(url: &str, from: &str) -> Option<Vec<u8>> {
+    let ok = !from.is_empty() && from.len() <= 32 && from.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !ok {
+        return None;
+    }
+    let link = encode_link(url)?;
+    let mut v = b"XLINK\0".to_vec();
+    v.extend_from_slice(from.as_bytes());
+    v.push(0);
+    v.extend_from_slice(&link[5..]);
+    Some(v)
+}
+
+/// The link and its persona of an `XLINK` message.
+pub fn decode_crossed_link(b: &[u8]) -> Option<(String, String)> {
+    let rest = b.strip_prefix(b"XLINK\0")?;
+    let i = rest.iter().position(|c| *c == 0)?;
+    let from = std::str::from_utf8(&rest[..i]).ok()?;
+    let mut link = b"LINK\0".to_vec();
+    link.extend_from_slice(&rest[i + 1..]);
+    let url = decode_link(&link)?;
+    encode_crossed_link(&url, from).map(|_| (url, from.to_string()))
+}
+
 /// The link of a `LINK` message.
 pub fn decode_link(b: &[u8]) -> Option<String> {
     let u = std::str::from_utf8(b.strip_prefix(b"LINK\0")?).ok()?;
@@ -106,9 +132,18 @@ pub fn decode_link(b: &[u8]) -> Option<String> {
 }
 
 /// Send one link (no descriptor).
-pub fn send_link(mut s: &UnixStream, url: &str) -> io::Result<()> {
+pub fn send_link(s: &UnixStream, url: &str) -> io::Result<()> {
+    send_body(s, encode_link(url))
+}
+
+/// Send one link the person sent from persona `from` (no descriptor).
+pub fn send_crossed_link(s: &UnixStream, url: &str, from: &str) -> io::Result<()> {
+    send_body(s, encode_crossed_link(url, from))
+}
+
+fn send_body(mut s: &UnixStream, body: Option<Vec<u8>>) -> io::Result<()> {
     use std::io::Write;
-    let body = encode_link(url).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"))?;
+    let body = body.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a link to pass on"))?;
     let mut data = (body.len() as u16).to_le_bytes().to_vec();
     data.extend_from_slice(&body);
     s.write_all(&data)
@@ -120,6 +155,10 @@ pub enum Message {
     File(Opened),
     /// A link the person opened in this app (opening-links.md §5).
     Link(String),
+    /// A link the person sent here from another of their personas
+    /// (personas.md §6): `from` is its name, `personal` for Personal. A
+    /// Work app opens it as a stranger would (no sign-ins, no cookies).
+    Crossed { url: String, from: String },
 }
 
 /// Send one open: `fd` with its name and type.
@@ -190,7 +229,7 @@ impl Channel {
         loop {
             match self.recv_any(wait)? {
                 Some(Message::File(o)) => return Ok(Some(o)),
-                Some(Message::Link(_)) => continue,
+                Some(Message::Link(_) | Message::Crossed { .. }) => continue,
                 None => return Ok(None),
             }
         }
@@ -263,6 +302,13 @@ impl Channel {
         }
         let mut body = vec![0u8; want];
         self.s.read_exact(&mut body)?;
+        if body.starts_with(b"XLINK\0") {
+            if !fds.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "a link with descriptors"));
+            }
+            return decode_crossed_link(&body).map(|(url, from)| Some(Message::Crossed { url, from }))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a link message"));
+        }
         if body.starts_with(b"LINK\0") {
             if !fds.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "a link with descriptors"));
@@ -342,6 +388,14 @@ mod tests {
         }
         assert!(send_link(&a, &format!("mailto:{}", "a".repeat(MAX_LINK))).is_err(), "too long");
         assert!(encode_link("a\0b").is_none());
+        // One the person sent from another persona says which.
+        send_crossed_link(&a, "https://intra.example/", "personal").unwrap();
+        match ch.recv_any(Some(Duration::from_secs(1))).unwrap() {
+            Some(Message::Crossed { url, from }) => assert_eq!((url.as_str(), from.as_str()), ("https://intra.example/", "personal")),
+            other => panic!("{other:?}"),
+        }
+        assert!(encode_crossed_link("https://a/", "Work\0").is_none() && encode_crossed_link("https://a/", "").is_none());
+        assert_eq!(decode_crossed_link(&encode_crossed_link("https://a/", "work").unwrap()), Some(("https://a/".into(), "work".into())));
         // recv() passes links over to the next file.
         send_link(&a, "mailto:b@example.org").unwrap();
         let p = std::env::temp_dir().join(format!("atrium-open-link-{}", std::process::id()));
