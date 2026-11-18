@@ -262,6 +262,50 @@ As built (N2):
 - The Insula broker and Nuntius already resolve on the host; they now get the cache and
   validation for free.
 
+### 6.1 `.local` names (accepted 2026-11-18)
+
+So that `ssh nas.local`, a printer's or another machine's `.local` name resolves like any
+other name, through the same resolver.
+
+- **Path:** unbound gets a stub zone for `local.` pointing at `127.0.0.1@5354`
+  (`/var/unbound/conf.d/atrium-local.conf`: `stub-zone`, `domain-insecure: "local."`,
+  `do-not-query-localhost: no`). Everything else keeps forwarding as now; unbound caches
+  the answers.
+- **`atrium-mdns`** answers that stub. One process, uid `_atrium-mdns` (65037), chroot
+  `/var/empty`, capability mode, started by atrium-net's spawner like `atrium-lease`. It
+  holds three descriptors, all made in the spawner and handed over its fd 3: a TCP socket
+  listening on 127.0.0.1:5354 (unbound talks TCP to it: `stub-tcp-upstream`, since capability
+  mode forbids `sendto` to an address) and a receive/send pair like §7.1's, but on a port of
+  its own rather than 5353: one-shot queries (RFC 6762 §5.1) whose answers come back unicast.
+  Two sockets connected alike on 5353 are refused on FreeBSD, and a unicast datagram to 5353
+  reaches only one socket, so printer discovery keeps 5353 to itself.
+  It can't open others and can't send anywhere but 224.0.0.251:5353 and back to unbound.
+  It is started again with new sockets when the egress changes, and not run when there is
+  none (or only a VPN tunnel): then `.local` gets SERVFAIL.
+- **What it answers:** A queries (AAAA with the IPv6 pair, later) for names of one to
+  four labels under `local.`, nothing else (no PTR, no SRV: printers have prelum-browse).
+  One query per question, answers collected for 1 s, at most 8 queries in flight and
+  a negative-cache of 10 s per name so a loop in some program can't flood the LAN.
+- **Checks on answers** (in `atrium-mdns`, the only parser of them): the record's name is
+  the question's; addresses must be on the active interface's subnet or link-local
+  (169.254/16), so a `.local` answer can never point a program at the internet or at
+  loopback; at most 4 addresses; TTL clamped to 120 s. Bounded parser, fuzzed, as
+  prelum-dnssd.
+- **Privacy:** Atrium still announces nothing and answers no mDNS queries (other machines
+  can't find it by name); asking leaks the name asked for to the local link only.
+- **Build:** L1 `atrium-mdns` + its parser and checks with host tests; L2 spawner,
+  restart on egress change, unbound stub, gate in `atrium-net-gate.sh` (lan.py answers
+  `gatebox.local`, hostile answers refused); L3 AAAA over ff02::fb.
+- **As built (2026-11-18), L1 + L2:** crate `atrium-net/atrium-mdns` (lib: query, answer
+  checks, resolver; 7 host tests incl. a fuzz loop), spawner requests `b'S'` (the stub
+  listener, made once at start) and `b'U'` (the one-shot pair), atrium-net runs one
+  atrium-mdns per active network (`mdns=1` on its status line; a dead one is started
+  again after 5 s; `--no-mdns`, and none without unbound or when the binary is missing).
+  `atrium-net/etc/unbound-atrium-local.conf` is installed by `atrium-net-service.sh`.
+  Gates: `atrium-net-gate.sh n0` 53/53 (gatebox.local through unbound and one mDNS
+  question, the cache, evil/loopy/nothere.local NXDOMAIN, getent, kill and restart),
+  `aura-sim-gate.sh svc` 23/23 (the installed service resolves `.local`). Not yet: L3.
+
 ## 7. Interfaces to others
 
 

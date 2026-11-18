@@ -6,7 +6,8 @@
 #   sh atrium-net-service.sh DIR
 #
 # DIR holds the binaries atrium-net, atrium-lease, atrium-probe,
-# atrium-netconf, atrium-netctl and the rc.d scripts atrium-net and
+# atrium-netconf, atrium-netctl (and atrium-mdns with
+# unbound-atrium-local.conf for .local names, §6.1) and the rc.d scripts atrium-net and
 # atrium-netconf (from atrium-net/etc). Creates the users, installs the
 # binaries and scripts, sets up local-unbound (the system resolver; it makes
 # /etc/resolv.conf point at 127.0.0.1), and enables both services. Starting
@@ -25,12 +26,14 @@ done
 id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
 id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'
 id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net settings front'
+id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
 # atrium-lease and atrium-probe chroot here.
 install -d -m 0555 /var/empty
 
 install -m 0755 "$D/atrium-net" "$D/atrium-netconf" "$D/atrium-netctl" /usr/local/bin/
 install -d /usr/local/libexec
 install -m 0755 "$D/atrium-lease" "$D/atrium-probe" /usr/local/libexec/
+[ -x "$D/atrium-mdns" ] && install -m 0755 "$D/atrium-mdns" /usr/local/libexec/
 install -d /usr/local/etc/rc.d
 install -m 0555 "$D/rc.d/atrium-net" /usr/local/etc/rc.d/atrium-net
 install -m 0555 "$D/rc.d/atrium-netconf" /usr/local/etc/rc.d/atrium-netconf
@@ -40,6 +43,10 @@ install -d -m 0700 /var/db/atrium-net
 # so dhclient on a port rc.conf keeps cannot take the resolver back.
 if [ ! -f /var/unbound/unbound.conf ] || ! grep -q '^nameserver 127.0.0.1' /etc/resolv.conf; then
     local-unbound-setup >/dev/null
+fi
+if [ -f "$D/unbound-atrium-local.conf" ]; then
+    install -d /var/unbound/conf.d
+    install -m 0644 "$D/unbound-atrium-local.conf" /var/unbound/conf.d/atrium-local.conf
 fi
 sysrc local_unbound_enable=YES atrium_net_enable=YES atrium_netconf_enable=YES >/dev/null
 echo "atrium-net commissioned: $(rcorder /etc/rc.d/* /usr/local/etc/rc.d/* 2>/dev/null | grep -nE '/(local_unbound|atrium-net|atrium-netconf)$' | sed 's|.*/||' | tr '\n' ' ')"

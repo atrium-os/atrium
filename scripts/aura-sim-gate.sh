@@ -87,9 +87,9 @@ setup() {
     fi
     # atrium-net is the network manager here (Wi-Fi policy, DHCP through its
     # sandboxed atrium-lease); atrium-netctl is the command line.
-    (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease -p atrium-netconf --target "$T" >&2)
+    (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease -p atrium-netconf -p atrium-mdns --target "$T" >&2)
     N="$ROOT/atrium-net/target/$T/release"
-    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$N/atrium-netconf" "$B/"
+    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$N/atrium-netconf" "$N/atrium-mdns" "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$B/"
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 
@@ -776,10 +776,13 @@ svc() {
     case "$a" in *"--iface vtnet1 --wifi wlan0 --capsicum"*) ;; *) fail "atrium-net started as: $a" ;; esac
     case "$a" in *vtnet0*) fail "atrium-net took vtnet0 (rc.conf's DHCP): $a" ;; esac
     ok "AUTO: vtnet1 (ifconfig_vtnet1=up) and wlan0 taken, vtnet0 left to rc.conf: $a"
-    "$V" "procstat -s \$(pgrep -x atrium-net) | awk 'NR==2{print \$10}'" | grep -q C && ok "atrium-net in capability mode" || fail "atrium-net capmode"
+    # The oldest atrium-net is the daemon (the spawner is its child); it
+    # enters capability mode once its ports are open.
+    i=0; until "$V" "procstat -s \$(pgrep -ox atrium-net) | awk 'NR==2{print \$10}'" | grep -q C; do i=$((i + 1)); [ $i -lt 15 ] || fail "atrium-net capmode"; sleep 1; done
+    ok "atrium-net in capability mode"
     u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
     [ "$u" = _atrium-netconf ] && ok "atrium-netconf runs as _atrium-netconf" || fail "atrium-netconf runs as '$u'"
-    s=$("$V" 'ls /atrium/sockets | grep -E "^(network|wifi)-" | tr "\n" " "')
+    s=$("$V" 'ls /atrium/sockets | grep -E "^(network|wifi|print)-" | tr "\n" " "')
     [ "$s" = "network-configure network-details network-read network-wifi print-discovery wifi-nearby " ] && ok "its six sockets under /atrium/sockets" || fail "sockets: $s"
     "$V" 'stat -f %Sp /atrium/sockets/atrium-net' | grep -q '^drwx------' && ok "atrium-net's control socket dir is root's alone (0700)" || fail "ctl dir: $("$V" 'ls -ld /atrium/sockets/atrium-net')"
     i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.'; do i=$((i + 1)); [ $i -lt 40 ] || fail "vtnet1: no lease ($("$V" "$APP network-details interfaces"))"; sleep 3; done
@@ -788,6 +791,8 @@ svc() {
     "$V" 'grep -q "^nameserver 127.0.0.1" /etc/resolv.conf' && ok "local-unbound is the resolver and forwards to the LAN's DNS" || fail "resolv.conf: $("$V" 'cat /etc/resolv.conf')"
     a=$("$V" 'drill gate.atrium.test @127.0.0.1 | awk "/^gate.atrium.test/{print \$5}"')
     [ "$a" = 10.88.0.77 ] && ok "a name resolved through unbound: gate.atrium.test = $a" || fail "resolve: $a"
+    i=0; until a=$("$V" 'local-unbound-control flush_zone local >/dev/null; drill gatebox.local @127.0.0.1 | awk "/^gatebox.local/{print \$5}"') && [ "$a" = 10.88.0.77 ]; do i=$((i + 1)); [ $i -lt 20 ] || break; sleep 1; done
+    [ "$a" = 10.88.0.77 ] && ok "and .local names (installed atrium-mdns, stub zone): gatebox.local = $a" || fail ".local: '$a' $("$V" 'pgrep -lx atrium-mdns; ls /var/unbound/conf.d')"
 
     out=$("$V" "echo '$PASS' | $APP network-wifi join aura-test" 2>&1) && [ "$out" = joined ] && ok "joined aura-test through the service's sockets" || fail "join: $out"
     i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=wlan0 .*addr=10\.77\.0\.'; do i=$((i + 1)); [ $i -lt 40 ] || fail "wlan0: no lease"; sleep 3; done

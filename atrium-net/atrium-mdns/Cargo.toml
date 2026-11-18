@@ -1,0 +1,10 @@
+[package]
+name = "atrium-mdns"
+version = "0.1.0"
+description = "Sandboxed .local resolver behind unbound's stub zone (docs/spec/atrium-net.md §6.1)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aura-ipc = { path = "../../aura/aura-ipc" }
+libc = "0.2"

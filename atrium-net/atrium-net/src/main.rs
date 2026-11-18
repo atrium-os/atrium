@@ -9,7 +9,7 @@
 //!                   [--aura-dir DIR] [--keys-dir DIR]
 //!                   [--no-unbound] [--unbound-dir DIR] [--capsicum]
 //!                   [--probe URL | --no-probe] [--probe-expect TEXT]
-//!                   [--probe-every SECS] [--probe-bin PATH] [--netd-dir DIR]
+//!                   [--probe-every SECS] [--probe-bin PATH] [--mdns-bin PATH | --no-mdns] [--netd-dir DIR]
 //!
 //! With more than one interface, one carries the default route (egress.rs:
 //! Ethernet over Wi-Fi, working internet over broken, doubling hold-down);
@@ -135,6 +135,8 @@ mod imp {
         probe_expect: Option<String>,
         probe_every: u64,
         probe_bin: String,
+        /// atrium-mdns for `.local` names (§6.1); None: not run.
+        mdns_bin: Option<String>,
         netd: Option<String>,
         egress_group: Option<String>,
         /// Exit (status 75) when a port arrives or a managed one goes away,
@@ -185,6 +187,7 @@ mod imp {
             probe_expect: None,
             probe_every: 300,
             probe_bin: "/usr/local/libexec/atrium-probe".into(),
+            mdns_bin: Some("/usr/local/libexec/atrium-mdns".into()),
             netd: None,
             egress_group: Some("atrium_egress".into()),
             follow: false,
@@ -206,6 +209,8 @@ mod imp {
                 "--unbound-dir" => o.unbound = Some(val(&mut a, "--unbound-dir")),
                 "--probe" => o.probe = Some(val(&mut a, "--probe")),
                 "--no-probe" => o.probe = None,
+                "--mdns-bin" => o.mdns_bin = Some(val(&mut a, "--mdns-bin")),
+                "--no-mdns" => o.mdns_bin = None,
                 "--probe-expect" => o.probe_expect = Some(val(&mut a, "--probe-expect")),
                 "--probe-every" => o.probe_every = val(&mut a, "--probe-every").parse().unwrap_or_else(|_| die("--probe-every SECS")),
                 "--probe-bin" => o.probe_bin = val(&mut a, "--probe-bin"),
@@ -329,6 +334,11 @@ mod imp {
         /// Descriptors for the ctl reply being made (`mdns4`), sent with its
         /// first line.
         reply_fds: Vec<std::os::fd::OwnedFd>,
+        /// unbound's `.local` stub listener (127.0.0.1:5354), made once.
+        mdns_listener: Option<std::os::fd::OwnedFd>,
+        /// The running atrium-mdns: its socket and the network it serves.
+        mdns: Option<(UnixStream, String, Ipv4Addr, u8)>,
+        mdns_again_at: u64,
         netd: Option<Dir>,
         /// The interface group pf's NAT rule names (`nat on atrium_egress`):
         /// the egress interface alone is in it. Every interface there was
@@ -749,6 +759,57 @@ mod imp {
             // DHCP is in use (the applied lease stays until a new one comes).
             if self.ifs[k].link && self.manual_for(k).is_none() {
                 let _ = self.ifs[k].lease.send(&Line::new("up"));
+            }
+        }
+
+        /// atrium-mdns follows the active network (§6.1): one per network,
+        /// with that interface's mDNS sockets; none without one. A dead one
+        /// is started again after 5 s.
+        fn mdns_tick(&mut self) {
+            let Some(lis) = &self.mdns_listener else { return };
+            let want = self.announced.and_then(|k| self.ifs.get(k)).and_then(|i| i.applied.lease.as_ref().map(|x| (i.name.clone(), x.addr, x.prefix)));
+            if let Some((s, ..)) = &self.mdns {
+                let mut b = [0u8; 16];
+                let dead = match std::io::Read::read(&mut &*s, &mut b) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+                };
+                if dead {
+                    self.log("atrium-mdns died");
+                    self.mdns = None;
+                    self.mdns_again_at = self.now() + 5000;
+                }
+            }
+            let have = self.mdns.as_ref().map(|(_, n, a, p)| (n.clone(), *a, *p));
+            if have == want {
+                return;
+            }
+            if self.mdns.take().is_some() {
+                self.log("atrium-mdns stopped (network changed)");
+            }
+            let Some((name, addr, prefix)) = want else { return };
+            let now = self.now();
+            if now < self.mdns_again_at {
+                return;
+            }
+            let r = (|| -> io::Result<UnixStream> {
+                let lis = lis.try_clone()?;
+                let child = self.spawner.spawn(b'D')?;
+                let (rx, tx) = self.spawner.oneshot4(addr)?;
+                send_line_fds(&child, &Line::new("start").with("addr", format!("{addr}/{prefix}")), &[lis, rx, tx])?;
+                child.set_nonblocking(true)?;
+                Ok(child)
+            })();
+            match r {
+                Ok(c) => {
+                    self.log(&format!("atrium-mdns: .local on {name} ({addr}/{prefix})"));
+                    self.mdns = Some((c, name, addr, prefix));
+                }
+                Err(e) => {
+                    eprintln!("atrium-net: atrium-mdns on {name}: {e}");
+                    self.mdns_again_at = now + 10_000;
+                }
             }
         }
 
@@ -1303,6 +1364,9 @@ mod imp {
                 if k.is_some() && self.announced == k {
                     l = l.with("egress", 1);
                 }
+                if self.mdns.as_ref().is_some_and(|m| m.1 == i.name) {
+                    l = l.with("mdns", 1);
+                }
                 l = l.with("refused", i.refusals).with("sends_refused", i.sends_refused).with("lease_restarts", i.lease_restarts);
                 if !i.last_refusal.is_empty() {
                     l = l.with("last_refusal", &i.last_refusal);
@@ -1560,7 +1624,26 @@ mod imp {
         // First, while nothing else is open: the spawner that starts the
         // sandboxed helpers now and again later (spawn.rs).
         let vflag: &[&str] = if o.verbose { &["-v"] } else { &[] };
-        let spawner = Spawner::start(&[(b'L', o.lease.as_str(), vflag), (b'P', o.probe_bin.as_str(), vflag)]).unwrap_or_else(|e| die(&format!("spawner: {e}")));
+        // Not installed: no .local names, and no retrying every few seconds.
+        let mut o = o;
+        if o.unbound.is_none() {
+            o.mdns_bin = None;
+        } else if o.mdns_bin.as_ref().is_some_and(|m| !std::path::Path::new(m).exists()) {
+            eprintln!("atrium-net: {} not there: no .local names", o.mdns_bin.take().unwrap());
+        }
+        let mut mdns_args: Vec<&str> = vec!["--uid", "65037"];
+        mdns_args.extend_from_slice(vflag);
+        let mut progs: Vec<(u8, &str, &[&str])> = vec![(b'L', o.lease.as_str(), vflag), (b'P', o.probe_bin.as_str(), vflag)];
+        if let Some(m) = &o.mdns_bin {
+            progs.push((b'D', m.as_str(), &mdns_args));
+        }
+        let spawner = Spawner::start(&progs).unwrap_or_else(|e| die(&format!("spawner: {e}")));
+        // No unbound, no stub zone to answer.
+        let mdns_listener = if o.mdns_bin.is_some() && o.unbound.is_some() {
+            spawner.stub_listener(5354).map_err(|e| eprintln!("atrium-net: .local listener: {e}")).ok()
+        } else {
+            None
+        };
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
@@ -1598,6 +1681,9 @@ mod imp {
             unbound_check_at: 0,
             spawner,
             reply_fds: Vec::new(),
+            mdns_listener,
+            mdns: None,
+            mdns_again_at: 0,
             netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
             egress_group: o.egress_group.clone(),
             ports_seen: all.iter().map(|i| i.name.clone()).collect(),
@@ -1866,6 +1952,7 @@ mod imp {
             net.probe_restart();
             net.lease_restart_tick();
             net.unbound_tick();
+            net.mdns_tick();
         }
     }
 
