@@ -52,7 +52,7 @@ fn at_200_the_picker_fits_its_sheet() {
     std::fs::write(d.join("hello.txt"), "hello").unwrap();
     let f = limen::picker::Filter { title: "Open a note".into(), ..limen::picker::Filter::file() };
     let mut b = Browser::new(Mode::Picker { filter: f, app: "org.test.notes".into() });
-    b.set_places(vec![Place { id: "place:0".into(), label: "Documents".into(), root: d.clone(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false }]);
+    b.set_places(vec![Place { id: "place:0".into(), label: "Documents".into(), root: d.clone(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() }]);
     let (w, h) = (640.0, 440.0);
     let dirty = Arc::new(AtomicBool::new(true));
     let v = ScriniumView::new(Mutable::with_dirty(b, dirty.clone()), Mutable::with_dirty(TextEdit::new(""), dirty.clone()), Mutable::with_dirty(ScrollState::default(), dirty.clone()), Mutable::with_dirty((w, h), dirty.clone()));
@@ -123,7 +123,7 @@ fn at_200_an_arrow_shows_the_cursor_row_and_does_not_scroll_past_it() {
         std::fs::write(d.join(format!("f{i:02}.txt")), "x").unwrap();
     }
     let mut b = Browser::new(Mode::Picker { filter: limen::picker::Filter::file(), app: "org.test.notes".into() });
-    b.set_places(vec![Place { id: "place:0".into(), label: "Documents".into(), root: d.clone(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false }]);
+    b.set_places(vec![Place { id: "place:0".into(), label: "Documents".into(), root: d.clone(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() }]);
     // The list 0.8 of a row, as live.
     let lh = 0.8 * row_h() as f64;
     let h = pick_title_h() + pick_path_h() + header_h() + lh as f32 + pick_foot_h();

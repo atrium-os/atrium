@@ -462,6 +462,25 @@ fn write_emoji<W: Write>(o: &mut Writer<W>, face: &[u8], gid: u16) -> io::Result
     Ok(Some(Emoji { obj: n, w, h, left: bm.left, top: bm.top }))
 }
 
+struct Px {
+    rgba: Vec<u8>,
+}
+
+/// `bytes` decoded at their natural size: by the app's installed decoder
+/// (officina_text::picture), else here when built with `local-decode`.
+fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(d) = officina_text::picture::decoder() {
+        return d.decode(bytes, None).map(|p| (p.width, p.height, p.rgba));
+    }
+    #[cfg(feature = "local-decode")]
+    {
+        use navigator_image::image::{decode_unaddressed, Ceilings};
+        decode_unaddressed(bytes, Ceilings::default()).ok().map(|p| (p.width, p.height, p.rgba))
+    }
+    #[cfg(not(feature = "local-decode"))]
+    None
+}
+
 /// Picture `image` as an image XObject; None when it can't be read.
 fn write_image<W: Write>(o: &mut Writer<W>, doc: &TextDoc, image: u32) -> io::Result<Option<Ref>> {
     let Some(data) = doc.images.get(image) else { return Ok(None) };
@@ -473,8 +492,8 @@ fn write_image<W: Write>(o: &mut Writer<W>, doc: &TextDoc, image: u32) -> io::Re
         o.stream(n, d, &data.bytes, false)?;
         return Ok(Some(n));
     }
-    let Ok(px) = navigator_image::image::decode_unaddressed(&data.bytes, navigator_image::image::Ceilings::default()) else { return Ok(None) };
-    let (w, h) = (px.width, px.height);
+    let Some((w, h, rgba)) = decode(&data.bytes) else { return Ok(None) };
+    let px = Px { rgba };
     let count = (w as usize) * (h as usize);
     if px.rgba.len() < count * 4 || count == 0 {
         return Ok(None);

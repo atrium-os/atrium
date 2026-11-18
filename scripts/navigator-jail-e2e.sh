@@ -105,10 +105,10 @@ say "$STAGE  (host only — the VM is for RUNNING)"
 # paths are the Mac's. Set ONLY for the cross-build: as plain RUSTFLAGS it
 # would also link the host test binaries against FreeBSD's crt objects.
 [ -n "${CROSS_RUSTFLAGS:-}" ] && export RUSTFLAGS="$CROSS_RUSTFLAGS"
-(cd "$ROOT/portcullis" && cargo +nightly build --quiet --target "$TARGET" \
+(cd "$ROOT/portcullis" && cargo build --quiet --target "$TARGET" \
     -Z build-std=std,panic_abort -p portcullis-cli -p portcullisd -p opifex) \
     || die "portcullis cross-build"
-(cd "$ROOT/navigator-backend" && cargo +nightly build --quiet --target "$TARGET" \
+(cd "$ROOT/navigator-backend" && cargo build --quiet --target "$TARGET" \
     -Z build-std=std,panic_abort --bin navigator-worker --example jailed_corpus) \
     || die "navigator cross-build"
 echo "  built"

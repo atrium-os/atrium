@@ -2,8 +2,10 @@
 //! sizes, not pixels).
 //!
 //! A picture is decoded the first time a page showing it is drawn, at about
-//! the size it is drawn (never above its natural size), by the Navigator's
-//! memory-safe decoders with their ceilings checked on the header. Decoded
+//! the size it is drawn (never above its natural size), by the app's
+//! installed decoder (officina_text::picture: Write's runs in its convert
+//! worker), or else, built with `local-decode`, by the Navigator's
+//! memory-safe decoders here, with their ceilings checked on the header. Decoded
 //! pixels stay in a least-recently-used cache with a fixed budget; a picture
 //! that can't be decoded draws a placeholder in its frame, and since layout
 //! used only the frame, nothing moves either way.
@@ -12,7 +14,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use navigator_image::image::{decode_unaddressed, Ceilings};
 use officina_text::model::ImageData;
 use pergola::node::Image;
 
@@ -62,8 +63,7 @@ pub fn picture(data: &ImageData, w: f64, h: f64) -> Option<Image> {
             c.bytes -= old.bytes;
         }
         c.decodes += 1;
-        let ceil = Ceilings { target: Some(target), ..Ceilings::default() };
-        let image = decode_unaddressed(&data.bytes, ceil).ok().map(|px| Image::new(px.width, px.height, px.rgba));
+        let image = decode(&data.bytes, target).map(|(w, h, rgba)| Image::new(w, h, rgba));
         let bytes = image.as_ref().map_or(0, |i| i.data().rgba.len());
         // Make room, least recently used first.
         while c.bytes + bytes > BUDGET && !c.map.is_empty() {
@@ -75,6 +75,21 @@ pub fn picture(data: &ImageData, w: f64, h: f64) -> Option<Image> {
         c.map.insert(key, Entry { source: Arc::downgrade(&data.bytes), image: image.clone(), bytes, used: tick });
         image
     })
+}
+
+/// `bytes` decoded at about `target`: by the installed decoder, else here.
+fn decode(bytes: &[u8], target: (u32, u32)) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(d) = officina_text::picture::decoder() {
+        return d.decode(bytes, Some(target)).map(|p| (p.width, p.height, p.rgba));
+    }
+    #[cfg(feature = "local-decode")]
+    {
+        use navigator_image::image::{decode_unaddressed, Ceilings};
+        let ceil = Ceilings { target: Some(target), ..Ceilings::default() };
+        decode_unaddressed(bytes, ceil).ok().map(|px| (px.width, px.height, px.rgba))
+    }
+    #[cfg(not(feature = "local-decode"))]
+    None
 }
 
 /// Decodes so far, for tests.

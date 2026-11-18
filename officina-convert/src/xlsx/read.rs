@@ -32,9 +32,7 @@ use officina_grid::{ErrorKind, Value, Workbook};
 use crate::report::{Kind, Report};
 use crate::zip::{Archive, ZipError};
 
-/// Excel's maximum digit width for Calibri 11 at 96 dpi, px: column widths are in
-/// these units.
-pub const MDW: f64 = 7.0;
+pub use super::MDW;
 /// Shared strings a file may hold.
 pub const MAX_SHARED: usize = 1 << 26;
 /// Formula cells per workbook the reader takes.

@@ -6,6 +6,7 @@ members = [
     "atrium-lease",
     "atrium-net",
     "netconf",
+    "atrium-mdns",
 ]
 
 [workspace.package]

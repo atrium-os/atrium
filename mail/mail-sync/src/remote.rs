@@ -56,6 +56,10 @@ pub enum Call {
     JmapConnect { url: String },
     JmapSync,
     JmapSend { message: Vec<u8>, from: String, rcpts: Vec<String>, send_at: Option<i64> },
+    /// Watch the account's event source; the stream is asked of the engine
+    /// ([`SinkCall::Events`]), each event's verdict told to it
+    /// ([`SinkCall::Pushed`]). Answers [`Reply::Watched`].
+    JmapWatch,
 }
 
 /// What [`Error`] was, across the wire.
@@ -80,6 +84,7 @@ pub enum Reply {
     /// The session's `maxDelayedSend` (seconds).
     JmapReady { max_delayed_send: u64 },
     JmapSent(std::result::Result<String, String>),
+    Watched(std::result::Result<crate::jmap::Pushed, String>),
     Failed(Kind, String),
 }
 
@@ -104,6 +109,12 @@ pub enum SinkCall {
     /// JMAP's HTTP, which the engine does through Arca's courier.
     Get { url: String, max: u64 },
     Post { url: String, content_type: String, body: Vec<u8>, max: u64 },
+    /// Open `url` as an event stream: the engine answers
+    /// [`SinkAnswer::Event`] for each event, then [`SinkAnswer::EventsEnd`].
+    Events { url: String },
+    /// An event was news (`true`) or a sign of life; answered
+    /// [`SinkAnswer::Go`]: whether to keep watching.
+    Pushed(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +127,9 @@ pub enum SinkAnswer {
     Text(Option<String>),
     Listed(Vec<(String, u32)>),
     Body(std::result::Result<Vec<u8>, String>),
+    Event(Vec<u8>),
+    EventsEnd(std::result::Result<(), String>),
+    Go(bool),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -271,6 +285,14 @@ impl<R: Read, W: Write> RemoteSink<R, W> {
         }
         dec(&b).map_err(|e| e.to_string())
     }
+    /// The engine's next answer, unasked (an event stream's).
+    fn next(&mut self) -> std::result::Result<SinkAnswer, String> {
+        let (k, b) = self.0.borrow_mut().next_other().map_err(|e| e.to_string())?;
+        if k != ANSWER {
+            return Err("not an answer".into());
+        }
+        dec(&b).map_err(|e| e.to_string())
+    }
     fn done(&mut self, call: SinkCall) -> std::result::Result<(), String> {
         match self.ask(call)? {
             SinkAnswer::Done(r) => r,
@@ -364,6 +386,22 @@ impl<R: Read, W: Write> crate::jmap::Http for RemoteHttp<R, W> {
             _ => Err("a wrong answer".into()),
         }
     }
+    fn events(&mut self, url: &str, on_event: &mut dyn FnMut(&[u8]) -> bool) -> std::result::Result<(), String> {
+        let mut a = RemoteSink(self.0.clone());
+        let mut next = a.ask(SinkCall::Events { url: url.into() })?;
+        loop {
+            match next {
+                // The verdict reaches the engine through the watcher's
+                // `Pushed`; a `false` ends its stream, then `EventsEnd`.
+                SinkAnswer::Event(raw) => {
+                    on_event(&raw);
+                }
+                SinkAnswer::EventsEnd(r) => return r,
+                _ => return Err("a wrong answer".into()),
+            }
+            next = a.next()?;
+        }
+    }
 }
 
 /// The `sync` worker's main: serve calls on `r`/`w` until the engine
@@ -408,8 +446,13 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch => {
                 let reply = match (next, jmap.as_mut()) {
+                    (Call::JmapWatch, Some(c)) => {
+                        let mut a = RemoteSink(chan.clone());
+                        let mut on = |news: bool| matches!(a.ask(SinkCall::Pushed(news)), Ok(SinkAnswer::Go(true)));
+                        Reply::Watched(c.watch(&mut on).map_err(|e| e.0))
+                    }
                     (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
@@ -440,7 +483,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
             (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. }, _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch, _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -574,6 +617,56 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
         Ok(r)
     }
 
+    /// Watch a JMAP account's event source in the worker: the stream comes
+    /// from this side's HTTP, its events go to the worker, and `on` hears
+    /// the worker's verdict on each (see [`crate::jmap::Client::watch`]).
+    pub fn watch_jmap(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<crate::jmap::Pushed> {
+        let Remote { to_worker, from_worker, http, .. } = self;
+        let Some(http) = http.as_mut() else { return Err(Error::Protocol("not a JMAP worker".into())) };
+        write_frame(to_worker, CALL, &enc(&Call::JmapWatch)?)?;
+        let next = |from: &mut O| -> Result<(u8, Vec<u8>)> { read_frame(from)?.ok_or_else(|| Error::Protocol("the sync worker ended".into())) };
+        loop {
+            let (k, b) = next(from_worker)?;
+            match (k, if k == SINK { Some(dec::<SinkCall>(&b)?) } else { None }) {
+                (REPLY, _) => {
+                    return match dec::<Reply>(&b)? {
+                        Reply::Watched(r) => r.map_err(Error::Protocol),
+                        Reply::Failed(k, t) => Err(error_of(k, t)),
+                        other => Err(Error::Protocol(format!("the worker answered {other:?}"))),
+                    };
+                }
+                (SINK, Some(SinkCall::Events { url })) => {
+                    let mut broken: Option<Error> = None;
+                    let r = http.events(&url, &mut |raw| {
+                        let go = (|| -> Result<bool> {
+                            write_frame(to_worker, ANSWER, &enc(&SinkAnswer::Event(raw.to_vec()))?)?;
+                            let (k, b) = next(from_worker)?;
+                            match (k, dec::<SinkCall>(&b)) {
+                                (SINK, Ok(SinkCall::Pushed(news))) => {
+                                    let go = on(news);
+                                    write_frame(to_worker, ANSWER, &enc(&SinkAnswer::Go(go))?)?;
+                                    Ok(go)
+                                }
+                                _ => Err(Error::Protocol("the worker didn't judge an event".into())),
+                            }
+                        })();
+                        go.unwrap_or_else(|e| {
+                            broken = Some(e);
+                            false
+                        })
+                    });
+                    if let Some(e) = broken {
+                        return Err(e);
+                    }
+                    write_frame(to_worker, ANSWER, &enc(&SinkAnswer::EventsEnd(r))?)?;
+                }
+                (SINK, Some(SinkCall::Get { .. } | SinkCall::Post { .. })) => write_frame(to_worker, ANSWER, &enc(&SinkAnswer::Body(Err("not while watching".into())))?)?,
+                (SINK, Some(_)) => return Err(Error::Protocol("a store call while watching".into())),
+                _ => return Err(Error::Protocol("a frame the worker doesn't send".into())),
+            }
+        }
+    }
+
     /// One call: relay until its reply.
     fn call(&mut self, call: &Call, mut sink: Option<&mut dyn Sink>, wait: Duration) -> Result<Reply> {
         let b = enc(call)?;
@@ -668,6 +761,8 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),
         SinkCall::ServerIdAt(f, u) => SinkAnswer::Text(s.server_id_at(&f, u)),
         SinkCall::Get { .. } | SinkCall::Post { .. } => SinkAnswer::Body(Err("no HTTP here".into())),
+        SinkCall::Events { .. } => SinkAnswer::EventsEnd(Err("not watching".into())),
+        SinkCall::Pushed(_) => SinkAnswer::Go(false),
     }
 }
 
@@ -716,6 +811,9 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
             Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
             Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
         }
+    }
+    fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> crate::jmap::Result<crate::jmap::Pushed> {
+        self.watch_jmap(on).map_err(|e| crate::jmap::Error(e.to_string()))
     }
     fn can_hold(&self, secs: i64) -> bool {
         secs > 0 && (secs as u64) <= self.max_delayed_send

@@ -973,6 +973,9 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
     launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
+    for id in crate::dev::bundles_of(owner, name) {
+        show_bundle(owner, name, &id);
+    }
     if r.network == "registries" {
         // ★ Before anything runs in it: the port is the proxy's, not
         // something the workspace could bind first.
@@ -984,6 +987,40 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?}, layers {:?}, objects {:?})", r.network, r.uses,
               r.layers, objects.as_ref().map(|o| o.display().to_string()));
     Ok(Running { jid, ..running })
+}
+
+/// Where the workspace sees its own dev bundles: at the path they have on
+/// the host, which is the path the kernel gives for what they map (a
+/// jail's nullfs root hides nothing from it), so lldb finds the files a
+/// debugged process or a core names (dev-tools-plan.md M10).
+const BUNDLES_IN_JAIL: &str = "var/lib/atrium/apps";
+
+/// Show dev bundle `id` (one of this workspace's) in it, read-only, if it
+/// runs; again after each Run, which replaces the bundle.
+pub fn show_bundle(owner: &str, name: &str, id: &str) {
+    if running_jid(owner, name).is_none() || !id.starts_with(&crate::dev::dev_id(owner, name, "")) || id.contains('/') {
+        return;
+    }
+    let at = jail_path(owner, name).join(BUNDLES_IN_JAIL).join(id);
+    let _ = launch::umount_silent(&at);
+    let src = Path::new(crate::dev::APPS_DIR).join(id);
+    if !src.is_dir() {
+        return;
+    }
+    if let Err(e) = fs::create_dir_all(&at) {
+        eprintln!("portcullisd: workspace {name}: {}: {e}", at.display());
+        return;
+    }
+    if let Err(e) = launch::run("mount", &["-t", "nullfs", "-o", "ro", src.to_str().unwrap_or(""), at.to_str().unwrap_or("")]) {
+        eprintln!("portcullisd: workspace {name}: show {id}: {e}");
+    }
+}
+
+/// Take it away again (before a Run replaces it).
+pub fn hide_bundle(owner: &str, name: &str, id: &str) {
+    if running_jid(owner, name).is_some() && !id.contains('/') {
+        let _ = launch::umount_silent(&jail_path(owner, name).join(BUNDLES_IN_JAIL).join(id));
+    }
 }
 
 /// Stop it: its processes end, its mounts go; its files stay.

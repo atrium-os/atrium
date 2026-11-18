@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     // The registries proxy's helper (egress.rs): bind in a workspace's
     // jail and hand the socket back; never the daemon.
     if args.get(1).map(String::as_str) == Some(egress::BIND_ARG) {
-        egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""));
+        egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""), args.get(3).map(String::as_str));
     }
     let mut i = 1;
     while i < args.len() {
@@ -620,7 +620,24 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Workspaces (homes.md §5): a launcher, or the person. */
         if let Request::WorkspaceRun { name, project, activation } = req {
-            let resp = handle_run(uid, &owner, &name, &project, activation, &shared);
+            let resp = handle_run(uid, &owner, &name, &project, activation, false, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        /* ★ Under the debugger (dev-tools-plan.md M10): as Run. */
+        if let Request::WorkspaceDebug { name, project, activation } = req {
+            let resp = handle_run(uid, &owner, &name, &project, activation, true, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if let Request::WorkspaceCores { name } = req {
+            let resp = match run_caller(uid, &owner, &name) {
+                Ok(_) => match dev::take_cores(&owner, &name) {
+                    Ok(files) => Response::WorkspaceCores { files },
+                    Err(message) => Response::Error { message },
+                },
+                Err(message) => Response::Error { message },
+            };
             write_response(&mut writer, &resp)?;
             continue;
         }
@@ -657,7 +674,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * settings app by its installed manifest (`app-grants`), and about
          * the person it belongs to (the registry's owner), never the
          * caller's own uid. Allow also needs a press frescod confirms. */
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. }) {
+        if let Request::SetCrossing { from, to, kind, on, activation } = req {
+            let resp = handle_set_crossing(uid, &from, &to, &kind, on, activation, &shared, &portcullisd::crossing::Sigillum::default());
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Crossings) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1760,7 +1782,70 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Err(e) => refuse(format!("save: {e}")),
             }
         }
+        Request::Crossings => {
+            let (personas, on) = portcullisd::crossing::listing(&tp.policy);
+            eprintln!("portcullisd: crossings -> {caller} (uid {uid}) for {owner}: {} persona(s), {} switch(es) on", personas.len(), on.len());
+            Response::Crossings { personas, on }
+        }
         _ => Response::Error { message: "not an access request".into() },
+    }
+}
+
+/// Settings turns a crossing switch (personas.md §6): `app-grants` by peer
+/// uid, about the person that app runs for, with a press portcullisd
+/// spends (APPROVE); turning one on then asks the person on Sigillum's
+/// sheet, which can take minutes, so no lock is held while it does, and
+/// the policy is read again after.
+#[allow(clippy::too_many_arguments)]
+fn handle_set_crossing(uid: u32, from: &str, to: &str, kind: &str, on: bool, activation: [u8; 16], shared: &Mutex<Tenants>, verify: &dyn portcullisd::crossing::Verify) -> Response {
+    use portcullisd::{crossing, opens};
+    let refuse = |why: String| {
+        eprintln!("portcullisd: crossing switch REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let Some((owner, caller)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+        return refuse("cap.app_grants.denied: caller is not a launched app".into());
+    };
+    if !launch::app_manages_grants(&caller) {
+        return refuse(format!("cap.app_grants.denied: {caller} may not change crossings"));
+    }
+    {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match s.get_or_load(&owner) {
+            Ok(tp) => {
+                if let Err(why) = crossing::check(&tp.policy, from, to, kind) {
+                    return refuse(why);
+                }
+            }
+            Err(e) => return refuse(format!("policy for {owner}: {e}")),
+        }
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+        return refuse(why);
+    }
+    if on {
+        eprintln!("portcullisd: {owner} turning on {kind} from {from} to {to}: asking Sigillum");
+        if let Err(why) = verify.verify(&owner, from, to, kind) {
+            return refuse(why);
+        }
+    }
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = match s.get_or_load(&owner) {
+        Ok(tp) => tp,
+        Err(e) => return refuse(format!("policy for {owner}: {e}")),
+    };
+    match tp.policy.set_crossing(from, to, kind, on) {
+        Ok(false) => Response::Ok,
+        Ok(true) => match tp.policy.save(&tp.policy_path.clone()) {
+            Ok(()) => {
+                eprintln!("portcullisd: {owner}'s switch for {kind} from {from} to {to} is now {} (from {caller}{})", if on { "on" } else { "off" }, if on { ", verified" } else { "" });
+                Response::Ok
+            }
+            Err(e) => refuse(format!("save: {e}")),
+        },
+        Err(why) => refuse(why),
     }
 }
 
@@ -1772,24 +1857,37 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
 /// Run (homes.md §5.3, W5): install what workspace `ws` built as a dev app
 /// and start it. Asked by the Workspaces app or a launcher (with a press) or
 /// by the person's own CLI.
-fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], shared: &Mutex<Tenants>) -> Response {
-    let refuse = |why: String| {
-        eprintln!("portcullisd: Run of {ws}/{project} for {owner} REFUSED: {why}");
-        Response::Error { message: why }
-    };
+/// Who may Run a workspace's builds: `Ok(true)` an app (it needs a press),
+/// `Ok(false)` the person's own CLI.
+fn run_caller(uid: u32, owner: &str, ws: &str) -> Result<bool, String> {
     let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
-    let app = match &caller {
+    match &caller {
         // The Terminal too, for `make run` in a workspace's console
         // (atrium-run, OSC 7770 `run`), on the person's press.
-        Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => true,
+        Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => Ok(true),
         // An IDE (`workspace-exec`), in a workspace the person gave it
         // (dev-tools.md §3.4: its Run of a windowed app is W5's).
-        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == ws) => true,
-        Some(a) if launch::app_execs_in_workspaces(a) => return refuse(format!("cap.workspace.denied: {a} wasn't given workspace {ws}")),
-        Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
-        None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
-        None => return refuse("cap.workspace.denied: not a person or a launcher".into()),
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == ws) => Ok(true),
+        Some(a) if launch::app_execs_in_workspaces(a) => Err(format!("cap.workspace.denied: {a} wasn't given workspace {ws}")),
+        Some(a) => Err(format!("cap.workspace.denied: {a} may not Run builds")),
+        None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => Ok(false),
+        None => Err("cap.workspace.denied: not a person or a launcher".into()),
+    }
+}
+
+/// How long a debug run waits for its debugger.
+const DEBUG_WAIT_MS: i32 = 5 * 60 * 1000;
+
+fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 16], debug: bool, shared: &Mutex<Tenants>) -> Response {
+    let what = if debug { "Debug" } else { "Run" };
+    let refuse = |why: String| {
+        eprintln!("portcullisd: {what} of {ws}/{project} for {owner} REFUSED: {why}");
+        Response::Error { message: why }
+    };
+    let app = match run_caller(uid, owner, ws) {
+        Ok(a) => a,
+        Err(why) => return refuse(why),
     };
     let p = match dev::prepare(owner, ws, project) {
         Ok(p) => p,
@@ -1798,6 +1896,20 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     if launch::running_jid(&p.id).is_some() {
         return refuse(format!("{} is running: close it first", p.id));
     }
+    /* The debugger's way in: a socket listening on the workspace's own
+     * loopback, so only what runs in the workspace reaches it. */
+    let listener = if debug {
+        let jid = match workspace::start(owner, ws) {
+            Ok(r) => r.jid,
+            Err(why) => return refuse(why),
+        };
+        match egress::bind_in(jid, 0) {
+            Ok(l) => Some(l),
+            Err(why) => return refuse(why),
+        }
+    } else {
+        None
+    };
     // Last of the checks: a refusal above doesn't spend the press.
     if app {
         if let Err(why) = portcullisd::opens::spend_press_for(&portcullisd::opens::activation_socket(), activation, uid,
@@ -1805,7 +1917,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
             return refuse(why);
         }
     }
-    if let Err(why) = dev::install(&p) {
+    workspace::hide_bundle(owner, ws, &p.id);
+    let installed = dev::install(&p);
+    workspace::show_bundle(owner, ws, &p.id);
+    if let Err(why) = installed {
         return refuse(why);
     }
     let m = match portcullis_toml::Manifest::from_str(&p.manifest) {
@@ -1832,9 +1947,54 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
     let caps: Vec<String> = p.manifest.parse::<toml::Value>().ok()
         .and_then(|v| v.get("capabilities").and_then(|c| c.as_table()).map(|t| t.keys().cloned().collect()))
         .unwrap_or_default();
-    eprintln!("portcullisd: Run: {} for {owner} from {ws}/{project}, granted {caps:?}", p.id);
-    start_for(&p.id, owner, "a Run");
-    Response::WorkspaceRan { app_id: p.id, capabilities: caps }
+    eprintln!("portcullisd: {what}: {} for {owner} from {ws}/{project}, granted {caps:?}", p.id);
+    let Some(listener) = listener else {
+        start_for(&p.id, owner, "a Run");
+        return Response::WorkspaceRan { app_id: p.id, capabilities: caps };
+    };
+    let port = match local_port(&listener) {
+        Ok(p) => p,
+        Err(why) => return refuse(why),
+    };
+    let (id, o) = (p.id.clone(), owner.to_string());
+    thread::spawn(move || {
+        let mut pfd = libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd we own, then accept on the same descriptor.
+        let conn = unsafe {
+            if libc::poll(&mut pfd, 1, DEBUG_WAIT_MS) != 1 {
+                eprintln!("portcullisd: debug of {id}: no debugger came; not started");
+                return;
+            }
+            let c = libc::accept4(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC);
+            if c < 0 {
+                eprintln!("portcullisd: debug of {id}: accept: {}", std::io::Error::last_os_error());
+                return;
+            }
+            <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(c)
+        };
+        drop(listener);
+        eprintln!("portcullisd: debug of {id}: a debugger connected");
+        match launch::launch_debug(&id, &o, conn) {
+            Ok(out) => eprintln!("portcullisd: {id} (debug) exited {:?}", out.exit_code),
+            Err(e) => eprintln!("portcullisd: {id} (debug) failed at {}: {}", e.stage(), e.message()),
+        }
+    });
+    let address = format!("127.0.0.1:{port}");
+    let program = format!("{}/{}/{}", dev::APPS_DIR, p.id, m.entry());
+    Response::WorkspaceDebugging { app_id: p.id, capabilities: caps, address, program }
+}
+
+/// The port a listening socket has.
+fn local_port(s: &OwnedFd) -> Result<u16, String> {
+    // SAFETY: getsockname into a sockaddr_in we own.
+    unsafe {
+        let mut sin: libc::sockaddr_in = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        if libc::getsockname(s.as_raw_fd(), (&mut sin as *mut libc::sockaddr_in).cast(), &mut len) != 0 {
+            return Err(format!("getsockname: {}", std::io::Error::last_os_error()));
+        }
+        Ok(u16::from_be(sin.sin_port))
+    }
 }
 
 /// The IDE asking (by its uid), if it is one.
@@ -2716,10 +2876,12 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona => Response::Error {
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        | Request::Crossings | Request::SetCrossing { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
+        | Request::WorkspaceDebug { .. } | Request::WorkspaceCores { .. }
         | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } | Request::WorkspaceAdmin { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),
         },

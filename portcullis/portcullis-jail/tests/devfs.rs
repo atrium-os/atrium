@@ -99,7 +99,7 @@ fn audio_capabilities_get_their_socket_and_no_sound_device() {
         ("wifi-nearby = true\n", ["wifi-nearby"].as_slice()),
         ("network-configure = true\n", ["network-configure"].as_slice()),
         ("navigator-page = true\n", ["navigator-page"].as_slice()),
-        ("navigator-broker = true\n", ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator"].as_slice()),
+        ("navigator-broker = true\n", ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator", "opifex"].as_slice()),
         ("open-uri = true\n", ["monstrator"].as_slice()),
         ("audio-device = true\n", ["audio-device"].as_slice()),
         ("audio = true\nmicrophone = true\naudio-monitor = true\n", ["audio", "audio-capture", "audio-monitor"].as_slice()),

@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -271,7 +271,128 @@ impl Workers {
         };
         Ok(Stdio { stdin: Some(in_w), stdout: Some(out_r), stderr: Some(err_r), proc })
     }
+
+    /// Start worker `name` on a Unix stream socket of its own, for a worker
+    /// with a protocol of its own that passes descriptors (SCM_RIGHTS) on
+    /// it: a decoder fed a frame's buffers. The worker gets its end on
+    /// descriptor 0, as every worker does, its standard error on 2, and
+    /// `extra` from descriptor 3 on, in order (other services it was
+    /// given: [`socket_worker`] takes them). Isolated as
+    /// [`session`](Self::session) is; not in-process. In a jail,
+    /// portcullisd's WorkerCall carries the three standard descriptors
+    /// only, so `extra` needs `isolation = "capsicum"` until it carries more.
+    pub fn spawn_socket(&self, name: &str, extra: &[BorrowedFd<'_>]) -> Result<SocketWorker, Error> {
+        let def = self.defs.get(name).ok_or_else(|| Error::NoSuchWorker(name.into()))?.clone();
+        let (ours, theirs) = UnixStream::pair()?;
+        let err = dup_stderr()?;
+        let extra: Vec<OwnedFd> = extra.iter().map(|f| f.try_clone_to_owned()).collect::<io::Result<_>>()?;
+        let proc = match &self.mode {
+            Mode::InProcess { .. } => return Err(Error::Start("an in-process worker has no socket of its own".into())),
+            Mode::Local { root } => Proc::Child(spawn_with(root, &def, [theirs.into(), err.try_clone()?, err], &extra, false)?),
+            Mode::Atrium { root } => {
+                if def.isolation.as_deref() == Some("capsicum") {
+                    Proc::Child(spawn_with(root, &def, [theirs.into(), err.try_clone()?, err], &extra, true)?)
+                } else if !extra.is_empty() {
+                    return Err(Error::Start(format!(
+                        "worker {name:?}: a jail's WorkerCall carries three descriptors, not {} more; use isolation = \"capsicum\" for now",
+                        extra.len())));
+                } else {
+                    let conn = worker_call_fds(name, [theirs.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])?;
+                    drop((theirs, err));
+                    Proc::Jail(conn)
+                }
+            }
+        };
+        Ok(SocketWorker { sock: ours, proc })
+    }
 }
+
+/// A worker started by [`Workers::spawn_socket`]: the core's end of its
+/// socket, and its end.
+pub struct SocketWorker {
+    pub sock: UnixStream,
+    proc: Proc,
+}
+
+impl SocketWorker {
+    /// Wait for it to end: `Some(code)`, or `None` when it was killed.
+    pub fn wait(mut self) -> Option<i32> {
+        let _ = self.sock.shutdown(std::net::Shutdown::Write);
+        proc_wait(&mut self.proc)
+    }
+    /// End it now.
+    pub fn kill(&mut self) { proc_kill(&mut self.proc) }
+}
+
+impl Drop for SocketWorker {
+    fn drop(&mut self) { proc_drop(&mut self.proc) }
+}
+
+fn proc_wait(p: &mut Proc) -> Option<i32> {
+    match p {
+        Proc::Jail(c) => {
+            let _ = c.set_read_timeout(None);
+            match read_line(c) {
+                Ok(v) if v["kind"] == "launch_exit" => v["code"].as_i64().map(|c| c as i32),
+                _ => None,
+            }
+        }
+        Proc::Child(c) => {
+            use std::os::unix::process::ExitStatusExt;
+            c.wait().ok().and_then(|s| if s.signal().is_some() { None } else { s.code() })
+        }
+        Proc::Thread(_) => None,
+    }
+}
+
+fn proc_kill(p: &mut Proc) {
+    match p {
+        Proc::Jail(c) => { let _ = c.shutdown(std::net::Shutdown::Both); }
+        Proc::Child(c) => { let _ = c.kill(); }
+        Proc::Thread(_) => {}
+    }
+}
+
+fn proc_drop(p: &mut Proc) {
+    match p {
+        Proc::Jail(c) => { let _ = c.shutdown(std::net::Shutdown::Both); }
+        Proc::Child(c) => { let _ = c.kill(); let _ = c.wait(); }
+        Proc::Thread(_) => {}
+    }
+}
+
+/// The worker's side of [`Workers::spawn_socket`]: the socket on 0 and the
+/// `extra` descriptors the core passed (3, 4, ...). `capsicum` says the
+/// worker must enter capability mode itself once it has set up (open
+/// what it needs, then `cap_enter`): [`enter_capability_mode`].
+pub struct SocketStart {
+    pub sock: UnixStream,
+    pub extra: Vec<OwnedFd>,
+    pub capsicum: bool,
+}
+
+/// Take what [`Workers::spawn_socket`] gave this worker: its socket and
+/// `extra` descriptors. Call it once, first thing in `main`.
+pub fn socket_worker(extra: usize) -> io::Result<SocketStart> {
+    let mut fds = Vec::with_capacity(extra);
+    for i in 0..extra {
+        let fd = 3 + i as i32;
+        // SAFETY: fcntl(F_GETFD) only asks whether the descriptor is open.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("descriptor {fd} wasn't given (expected {extra} extra)")));
+        }
+        // SAFETY: open, and given to this process for it to own.
+        fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    // SAFETY: standard input is the socket the core gave us; nothing else
+    // in this process owns descriptor 0.
+    let sock = unsafe { UnixStream::from_raw_fd(0) };
+    Ok(SocketStart { sock, extra: fds, capsicum: std::env::var_os(wire::CAPSICUM_ENV).is_some() })
+}
+
+/// Enter capability mode (FreeBSD's cap_enter; nothing elsewhere), for a
+/// worker that sets up first.
+pub fn enter_capability_mode() -> io::Result<()> { wire::cap_enter() }
 
 /// A worker started by [`Workers::spawn_stdio`]: its three pipes, and its
 /// end.
@@ -330,6 +451,44 @@ fn dup_stderr() -> io::Result<OwnedFd> {
 fn spawn(root: &Path, def: &WorkerDef, sock: UnixStream, err: OwnedFd, capsicum: bool) -> Result<std::process::Child, Error> {
     let out: OwnedFd = err.try_clone()?;
     spawn_fds(root, def, [OwnedFd::from(sock), out, err], capsicum)
+}
+
+/// As [`spawn_fds`], with `extra` on descriptors 3, 4, ... in the child.
+fn spawn_with(root: &Path, def: &WorkerDef, std: [OwnedFd; 3], extra: &[OwnedFd], capsicum: bool) -> Result<std::process::Child, Error> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let [i, o, e] = std;
+    let prog = root.join(def.entry.trim_start_matches('/'));
+    let mut c = Command::new(&prog);
+    c.stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e))
+        .env_clear().env("PATH", "/usr/bin:/bin");
+    if capsicum { c.env(wire::CAPSICUM_ENV, "1"); }
+    let raw: Vec<i32> = extra.iter().map(|f| f.as_raw_fd()).collect();
+    if !raw.is_empty() {
+        let high = 3 + raw.len() as i32 + 16;
+        // SAFETY: between fork and exec, only fcntl and dup2 (async-signal
+        // safe), on descriptors this process holds; nothing is allocated.
+        unsafe {
+            c.pre_exec(move || {
+                // First out of the way of 3..3+n, then into place (dup2
+                // clears close-on-exec on the copy).
+                let mut tmp = [0i32; 64];
+                if raw.len() > tmp.len() {
+                    return Err(io::Error::other("too many descriptors"));
+                }
+                for (k, fd) in raw.iter().enumerate() {
+                    let t = libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, high);
+                    if t < 0 { return Err(io::Error::last_os_error()) }
+                    tmp[k] = t;
+                }
+                for k in 0..raw.len() {
+                    if libc::dup2(tmp[k], 3 + k as i32) < 0 { return Err(io::Error::last_os_error()) }
+                }
+                Ok(())
+            });
+        }
+    }
+    c.spawn().map_err(|e| Error::Start(format!("{}: {e}", prog.display())))
 }
 
 fn spawn_fds(root: &Path, def: &WorkerDef, [i, o, e]: [OwnedFd; 3], capsicum: bool) -> Result<std::process::Child, Error> {

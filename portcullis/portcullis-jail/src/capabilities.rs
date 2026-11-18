@@ -254,10 +254,11 @@ pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
 /// spends the prompt row's presses), limend (it opens the UI's limend
 /// connection), portcullisd (its converter and fetcher jails) and Arca
 /// (cookies for sites that know you, through the couriers), and Monstrator
-/// (hand-offs, opening-links.md §7). No network:
+/// (hand-offs, opening-links.md §7), and opifexd (read-only: the
+/// open-an-app prompt's publisher and capabilities, §6.4). No network:
 /// pages come through the fetcher jails.
 pub fn apply_navigator_broker(jc: &mut JailConfig, opts: &BuildOpts) {
-    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator"] {
+    for s in ["navigator", "navigator-page", "fresco-chrome", "fresco-activation", "limen", "portcullis", "arca", "arca-courier", "monstrator", "opifex"] {
         apply_socket(s, jc, opts);
     }
 }

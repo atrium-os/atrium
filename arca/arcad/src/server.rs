@@ -165,7 +165,7 @@ impl State {
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
         }
         if let Label::Service(name) = who {
-            if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER) || !crate::volume::SERVICES.contains(&name.as_str()) {
+            if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER | volume_op::VK_CURRENT) || !crate::volume::SERVICES.contains(&name.as_str()) {
                 return None;
             }
             let mut r = Reader::new(body);
@@ -176,6 +176,9 @@ impl State {
             let m = Self::volume_item(store, &persona, &key_id).ok()??;
             if op == volume_op::VK_OLDER {
                 return Some((user, format!("Open an older copy of \u{201c}{}\u{201d} read-only", m.account)));
+            }
+            if op == volume_op::VK_CURRENT {
+                return Some((user, format!("Use this older copy of \u{201c}{}\u{201d} as current", m.account)));
             }
             return Some((user, format!("Forget the key of \u{201c}{}\u{201d}", m.account)));
         }
@@ -221,7 +224,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB7).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB8).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -779,6 +782,54 @@ impl State {
                     Err(_) => reply(status::INTERNAL),
                 }
             }
+            volume_op::VK_CURRENT => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                field!(r.end());
+                // What the kernel saw mounted: the older copy, opened
+                // read-only under a key loaded for that (VK_OLDER).
+                let gen = match self.keyring.as_mut().unwrap().generation(&key_id) {
+                    Ok(g) if g > 0 => g,
+                    _ => return reply(status::DENIED),
+                };
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                if decode_scope(&m.scope) != Some((key_id, uuid, 0)) {
+                    return reply(status::DENIED);
+                }
+                if !verified {
+                    return reply(status::NEEDS_VERIFICATION);
+                }
+                let who = Access { persona: &persona, recipient: &me };
+                let (_, mut v) = tri!(store.release(&m.id, &who, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let hw = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                // Only ever lowered here; a copy at or above the mark is
+                // current already.
+                if gen < hw {
+                    v.as_mut()[32..].copy_from_slice(&gen.to_le_bytes());
+                    tri!(store.update(&m.id, &who, v.as_ref(), None));
+                }
+                let mark = gen.min(hw);
+                let info = LoadInfo { key_id, uuid, group: 0, high_water: mark, owner_uid: 0, owner_label: label, older_read_only: false };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                let ring = self.keyring.as_mut().unwrap();
+                match ring.drop_key(&key_id) {
+                    Ok(()) => {}
+                    Err(e) if e == libc::ENOENT => {}
+                    Err(_) => return reply(status::INTERNAL),
+                }
+                match ring.load(&info, key) {
+                    Ok(()) => ok(mark.to_le_bytes().to_vec()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
             volume_op::VK_RECOVERY => {
                 let key_id = field!(r.array::<16>());
                 let uuid = field!(r.array::<16>());
@@ -810,11 +861,24 @@ impl State {
                 let uuid = field!(r.array::<16>());
                 let slot = field!(r.array::<{ volume_op::SLOT_LEN }>());
                 let keep = field!(r.u8());
-                let code = field!(r.str(volume_op::CODE_MAX)).to_string();
+                let typed = field!(r.str(volume_op::CODE_MAX)).to_string();
+                // No code: a handle for what was typed into Arca's own
+                // field follows, so the app that asked never saw it.
+                let held = if typed.is_empty() { Some(field!(r.array::<16>())) } else { None };
                 field!(r.end());
                 if keep > 1 {
                     return malformed();
                 }
+                let code = match held {
+                    None => typed,
+                    Some(h) => {
+                        let Some(v) = self.handles.take_recovery(&h, &user) else { return reply(status::DENIED) };
+                        match std::str::from_utf8(v.as_ref()) {
+                            Ok(c) if c.len() <= volume_op::CODE_MAX => c.trim().to_string(),
+                            _ => return malformed(),
+                        }
+                    }
+                };
                 // The person's own store must be open either way: the key
                 // is loaded as theirs.
                 if let Err(r) = self.volume_store(&user, &persona, false) {
@@ -1147,14 +1211,14 @@ impl State {
         let Ok(app) = Recipient::app(publisher, &app_id) else { return malformed() };
         let Some(store) = self.stores.get(&user) else { return reply(status::LOCKED) };
         let who = Access { persona: PERSONA, recipient: &app };
-        let entry = |source, generated, wifi| Entry {
+        let entry = |source, generated, hold| Entry {
             user: user.clone(),
             persona: PERSONA.into(),
             recipient: app.clone(),
             source,
             expires: std::time::Instant::now() + crate::handles::TTL,
             generated,
-            wifi,
+            hold,
         };
         let issued = |h: Option<[u8; 16]>| match h {
             Some(h) => ok(h.to_vec()),
@@ -1177,10 +1241,10 @@ impl State {
             }
             op::U_HOLD => {
                 let Ok(v) = r.bytes(caps::VALUE) else { return malformed() };
-                let wifi = match r.remaining() {
-                    0 => false,
+                let hold = match r.remaining() {
+                    0 => 0,
                     _ => match r.u8() {
-                        Ok(op::HOLD_FOR_WIFI) => true,
+                        Ok(h @ (op::HOLD_FOR_WIFI | op::HOLD_FOR_RECOVERY)) => h,
                         _ => return malformed(),
                     },
                 };
@@ -1191,7 +1255,7 @@ impl State {
                     return reply(status::LOCKED); // passwords are while-unlocked
                 }
                 let v = tri!(LockedBuf::from_slice(v).map_err(Error::Io));
-                issued(self.handles.issue(entry(Source::Pending(v), false, wifi)))
+                issued(self.handles.issue(entry(Source::Pending(v), false, hold)))
             }
             op::U_HANDLE => {
                 let Ok(id) = r.array::<16>() else { return malformed() };
@@ -1214,7 +1278,7 @@ impl State {
                 if m.class != Class::AfterFirstUnlock && store.state() != LockState::Unlocked {
                     return reply(status::LOCKED);
                 }
-                issued(self.handles.issue(entry(Source::Item(id), false, false)))
+                issued(self.handles.issue(entry(Source::Item(id), false, 0)))
             }
             op::U_GENERATE => {
                 if r.end().is_err() {
@@ -1224,7 +1288,7 @@ impl State {
                     return reply(status::LOCKED);
                 }
                 let v = tri!(generate_password());
-                issued(self.handles.issue(entry(Source::Pending(v), true, false)))
+                issued(self.handles.issue(entry(Source::Pending(v), true, 0)))
             }
             _ => reply(status::DENIED),
         }

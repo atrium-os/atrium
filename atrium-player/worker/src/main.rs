@@ -22,7 +22,7 @@ use atrium_media_decode as decode;
 use atrium_media_demux::{self as demux, Codec, Demuxer, Event, Kind, TrackInfo};
 use atrium_player::ring::PcmRing;
 use atrium_player::sys::{self, Map};
-use atrium_player::wire::{decode_frame, err, Format, Limits, Mode, Record, ToWorker};
+use atrium_player::wire::{decode_frame, err, Format, Limits, Mode, Record, SdkStart, ToWorker};
 use store::Store;
 
 /// Read ahead of the decode cursor in `Load` mode.
@@ -260,13 +260,43 @@ fn main() {
             _ => {}
         }
     }
-    let Some(fd) = fd else {
-        eprintln!("atrium-player-decode: started without --fd; it is run by atrium-player");
-        std::process::exit(2);
+    // Started by hand (`--fd`), or as the bundle's declared `decode` worker
+    // through atrium-worker: the socket on standard input, a SdkStart on it
+    // first, the codec and CDM sockets it names from descriptor 3 on.
+    let sock = match fd {
+        #[allow(unsafe_code)]
+        // SAFETY: the supervisor gave us this descriptor for exactly this.
+        Some(fd) => UnixStream::from(unsafe { sys::adopt(fd) }),
+        None => {
+            let st = match atrium_worker::socket_worker(0) {
+                Ok(st) => st,
+                Err(e) => {
+                    eprintln!("atrium-player-decode: started without --fd and not as a worker ({e}); it is run by atrium-player");
+                    std::process::exit(2);
+                }
+            };
+            let mut b = [0u8; SdkStart::LEN];
+            let start = (&st.sock).read_exact(&mut b).ok().and_then(|_| SdkStart::decode(&b));
+            let Some(start) = start else {
+                eprintln!("atrium-player-decode: no start from the supervisor");
+                std::process::exit(2);
+            };
+            let mut next = 3;
+            let mut take = |on: bool| on.then(|| { let f = next; next += 1; f });
+            h264_fd = take(start.h264);
+            cdm_fd = take(start.cdm);
+            for f in h264_fd.iter().chain(cdm_fd.iter()) {
+                // SAFETY: fcntl(F_GETFD) only asks whether it is open.
+                #[allow(unsafe_code)]
+                if unsafe { libc::fcntl(*f, libc::F_GETFD) } < 0 {
+                    eprintln!("atrium-player-decode: descriptor {f} wasn't given");
+                    std::process::exit(2);
+                }
+            }
+            mem = u64::from(start.mem_mib) << 20;
+            st.sock
+        }
     };
-    #[allow(unsafe_code)]
-    // SAFETY: the supervisor gave us this descriptor for exactly this.
-    let sock = UnixStream::from(unsafe { sys::adopt(fd) });
     // The socket can only carry messages: no ioctl, fcntl or shutdown games.
     if let Err(e) = sys::limit(&std::os::fd::OwnedFd::from(sock.try_clone().unwrap()), sys::Rights::Socket) {
         eprintln!("atrium-player-decode: cap_rights_limit: {e}");

@@ -16,6 +16,9 @@ graphics       = "fresco"
 workspace-exec = true
 clipboard      = true
 network        = "none"
+# No Limen roles: the terminal button asks portcullisd for the workspace's
+# console, not an embed. Without this key a platform bundle keeps every role.
+embeds         = []
 
 [supervision]
 restart   = "on-crash"

@@ -11,9 +11,12 @@
 #   sh scripts/vm-scrinium-check.sh [out-dir]
 #
 # Checks:
-#   - the file manager (uid 50603, org.atrium.scrinium, removable-files +
-#     file-picker) gets the stick in its jail and lists it; keys open Docs
-#     and make a folder there, which alice sees on her own mount;
+#   - the file manager (uid 50603, org.atrium.scrinium, with what
+#     scrinium/atrium.toml asks: removable-files, file-picker, home-files,
+#     arca) gets the stick in its jail and lists it; keys open Docs and make
+#     a folder there, which alice sees on her own mount; alice's folders
+#     and workspaces come first (home-files mounts them as portcullisd
+#     does); with arcad's app socket mounted it reads the saved shares;
 #   - dispensatord's PICKED: alice and an app without file-picker are
 #     refused; Scrinium may put a folder into the notes app's jail;
 #   - the picker: a notes app (uid 50601, in its own jail) asks limend for
@@ -112,7 +115,7 @@ rm -rf /tmp/sc; mkdir -p /tmp/sc; chmod 777 /tmp/sc
 mkdir -p $APPS/org.atrium.scrinium $APPS/org.test.notes /var/run/atrium
 sed -i '' '/ org.atrium.scrinium\$/d; / org.test.notes\$/d' $REG 2>/dev/null || true
 printf '50603 alice org.atrium.scrinium\n50601 alice org.test.notes\n' >> $REG
-printf '[app]\nid = "org.atrium.scrinium"\n[capabilities]\ngraphics = "fresco"\nremovable-files = true\nfile-picker = true\n' > $APPS/org.atrium.scrinium/atrium.toml
+printf '[app]\nid = "org.atrium.scrinium"\n[capabilities]\ngraphics = "fresco"\nremovable-files = true\nfile-picker = true\nhome-files = true\narca = true\nnetwork = "none"\nembeds = ["doc-viewer", "pdf-viewer", "media-player", "credential"]\n' > $APPS/org.atrium.scrinium/atrium.toml
 printf '[app]\nid = "org.test.notes"\n[capabilities]\ngraphics = "fresco"\n' > $APPS/org.test.notes/atrium.toml
 for J in "$JF $RF scrinium" "$JN $RN scrinium-pick-demo"; do
   set -- \$J
@@ -124,6 +127,15 @@ for J in "$JF $RF scrinium" "$JN $RN scrinium-pick-demo"; do
   mount_nullfs /tmp/sc \$2/tmp/sc
 done
 mount_nullfs -o ro /atrium/sockets/removable-media $RF/sock
+# home-files, as portcullisd mounts it: alice's folders at /atrium/home and
+# her workspaces at /atrium/workspaces, read-write (homes.md §2, §5).
+rm -rf /tmp/sc-home; mkdir -p /tmp/sc-home/Documents /tmp/sc-home/Downloads /tmp/sc-home/ws/proj/work
+printf 'from home\n' > /tmp/sc-home/Documents/letter.txt
+chown -R 50603 /tmp/sc-home
+mkdir -p $RF/atrium/home $RF/atrium/workspaces $RF/atrium/sockets/arca
+mount_nullfs /tmp/sc-home $RF/atrium/home; mount_nullfs /tmp/sc-home/ws $RF/atrium/workspaces
+# arca: arcad's socket directory, if arcad runs here.
+if [ -d /atrium/sockets/arca ]; then mount_nullfs -o ro /atrium/sockets/arca $RF/atrium/sockets/arca; fi
 EOS
 [ $? = 0 ] && ok "jails $JF and $JN, the registry and manifests" || bad "setup"
 
@@ -161,10 +173,20 @@ press() { inj "MOVE $1 $2"; sleep 1; inj "BTN 1 1"; sleep 1; inj "BTN 1 0"; slee
 key() { inj "KEY $1 1 ${2:-0}"; sleep 1; inj "KEY $1 0 ${2:-0}"; sleep ${GAP:-6}; }
 shot() { sleep ${1:-8}; get /tmp/sc/screen.png "$OUT/$2.png" 2>/dev/null || get "/tmp/sc/screen" "$OUT/$2.png" 2>/dev/null; [ -s "$OUT/$2.png" ] && echo "  screenshot $2.png" || echo "  (no screenshot for $2)"; }
 SENV="FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock SCRINIUM_MEDIA_SOCKET=/sock/removable-media.sock SCRINIUM_TRACE=1"
+# The window opens on alice's Documents (her folders come first); the
+# stick checks then open the stick.
+FMENV="$SENV SCRINIUM_OPEN=$PART"
 
 echo "== the file manager"
-V "daemon -f -o /tmp/sc/scrinium.log jexec -u grantfm $JF env $SENV /bin/scrinium --no-picker"
+V "daemon -f -o /tmp/sc/scrinium.log jexec -u grantfm $JF env $FMENV /bin/scrinium --no-picker"
 sleep $WAIT
+V "grep -q 'window: place=home:documents path=/ entries=\[letter.txt\]' /tmp/sc/scrinium.log" && ok "home-files: alice's Documents first" || bad "home: $(V "grep 'window:' /tmp/sc/scrinium.log | head -2 | tr '\n' ';'")"
+V "grep -q 'places=\[[^]]*home:workspaces' /tmp/sc/scrinium.log" && ok "home-files: her workspaces are a place" || bad "workspaces: $(V "grep 'window:' /tmp/sc/scrinium.log | head -1")"
+if V "test -S $RF/atrium/sockets/arca/arcad.sock"; then
+  V "grep -q 'saved servers:' /tmp/sc/scrinium.log" && bad "arca: $(V "grep 'saved servers:' /tmp/sc/scrinium.log | head -1")" || ok "arca: it reads its saved shares"
+else
+  echo "  (arcad isn't running in this VM: the arca socket check is skipped)"
+fi
 V "grep -q 'sticks: 1 sticks in $JF' /tmp/sc/scrinium.log" && ok "it holds the stick in its jail ($(V "grep 'sticks:' /tmp/sc/scrinium.log | head -1"))" || bad "attach-all: $(V 'head -5 /tmp/sc/scrinium.log | tr "\n" ";"')"
 V "grep -q 'window: place=$PART path=/ entries=\[Docs,Photos,hello.txt\]' /tmp/sc/scrinium.log" && ok "lists the stick: Docs, Photos, hello.txt" || bad "listing: $(V "grep 'window:' /tmp/sc/scrinium.log | tail -2 | tr '\n' ';'")"
 shot 5 scrinium-manager
@@ -237,7 +259,7 @@ V "pkill -f scrinium-pick-demo; umount $RN/tmp/sc; $JC $JS remove $JN >/dev/null
 V "mount -p | grep -q '$RN/media'" && bad "the grant outlived the app's jail" || ok "gone with the jail"
 
 echo "== clean up"
-V "pkill -f scrinium; pkill -x limend; pkill -x frescod; umount $RF/sock; umount $RF/tmp/sc; $JC $JS remove $JF >/dev/null"
+V "pkill -f scrinium; pkill -x limend; pkill -x frescod; umount $RF/sock; umount $RF/tmp/sc; umount $RF/atrium/home; umount $RF/atrium/workspaces; umount $RF/atrium/sockets/arca 2>/dev/null; $JC $JS remove $JF >/dev/null; rm -rf /tmp/sc-home"
 V "sed -i '' '/ org.atrium.scrinium\$/d; / org.test.notes\$/d' $REG; rm -rf $APPS/org.atrium.scrinium $APPS/org.test.notes"
 mon "device_del scs$RUN" >/dev/null; sleep 4
 for f in frescod limend scrinium picker demo demo2 demo3 demo4; do get /tmp/sc/$f.log "$OUT/$f.log" 2>/dev/null; done

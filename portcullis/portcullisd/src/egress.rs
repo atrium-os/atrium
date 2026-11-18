@@ -41,15 +41,17 @@ fn jail_name(ws_jail: &str) -> Option<String> {
     portcullis_jail::jaild_instance_name(EGRESS_APP, Some(&instance(ws_jail)))
 }
 
-/// The helper's half (`portcullisd --bind-in-jail <jid>`, stdout a Unix
-/// socket): attach to the jail, bind 127.0.0.1:3128 there, listen, send
-/// the socket back, exit. Runs in a fresh process, never in the daemon.
-pub fn bind_in_jail_main(jid: &str) -> ! {
+/// The helper's half (`portcullisd --bind-in-jail <jid> [port]`, stdout a
+/// Unix socket): attach to the jail, bind 127.0.0.1:<port> (3128; 0 is any)
+/// there, listen, send the socket back, exit. Runs in a fresh process,
+/// never in the daemon.
+pub fn bind_in_jail_main(jid: &str, port: Option<&str>) -> ! {
     let fail = |w: &str| -> ! {
         eprintln!("portcullisd {BIND_ARG}: {w}: {}", std::io::Error::last_os_error());
         std::process::exit(1)
     };
     let Ok(jid) = jid.parse::<i32>() else { fail("not a jid") };
+    let Ok(port) = port.map_or(Ok(PROXY_PORT), str::parse::<u16>) else { fail("not a port") };
     // SAFETY: plain syscalls on values we made.
     unsafe {
         if libc::jail_attach(jid) != 0 { fail("jail_attach") }
@@ -60,9 +62,9 @@ pub fn bind_in_jail_main(jid: &str) -> ! {
         let mut sin: libc::sockaddr_in = std::mem::zeroed();
         sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
         sin.sin_family = libc::AF_INET as libc::sa_family_t;
-        sin.sin_port = PROXY_PORT.to_be();
+        sin.sin_port = port.to_be();
         sin.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-        if libc::bind(s, (&sin as *const libc::sockaddr_in).cast(), sin.sin_len as libc::socklen_t) != 0 { fail("bind 127.0.0.1:3128") }
+        if libc::bind(s, (&sin as *const libc::sockaddr_in).cast(), sin.sin_len as libc::socklen_t) != 0 { fail("bind") }
         if libc::listen(s, 64) != 0 { fail("listen") }
         let out = UnixStream::from_raw_fd(1);
         if portcullis_ipc::send_fds(&out, &[s]).is_err() { fail("send") }
@@ -70,15 +72,16 @@ pub fn bind_in_jail_main(jid: &str) -> ! {
     std::process::exit(0)
 }
 
-/// Bind the proxy's port in jail `jid`'s network stack.
-fn bind_in(jid: i32) -> Result<OwnedFd, String> {
+/// A socket listening on 127.0.0.1:`port` (0: any) in jail `jid`'s network
+/// stack: the proxy's here, a debugger's way in for M10.
+pub fn bind_in(jid: i32, port: u16) -> Result<OwnedFd, String> {
     let (ours, theirs) = UnixStream::pair().map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let st = std::process::Command::new(exe).arg(BIND_ARG).arg(jid.to_string())
+    let st = std::process::Command::new(exe).arg(BIND_ARG).arg(jid.to_string()).arg(port.to_string())
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::from(OwnedFd::from(theirs)))
         .status().map_err(|e| format!("helper: {e}"))?;
     if !st.success() {
-        return Err(format!("the helper could not bind 127.0.0.1:{PROXY_PORT} in the workspace ({st})"));
+        return Err(format!("the helper could not bind 127.0.0.1:{port} in the workspace ({st})"));
     }
     let mut fds = portcullis_ipc::recv_fds(&ours, 1).map_err(|e| format!("helper's socket: {e}"))?;
     fds.pop().ok_or_else(|| "the helper sent no socket".to_string())
@@ -90,7 +93,7 @@ pub fn start(ws_jail: &str, jid: i32, hosts: &[String]) -> Result<(), String> {
     let rule = portcullis_policy::Policy::load_system(std::path::Path::new(portcullis_policy::SYSTEM_PATH)).ok()
         .and_then(|p| p.workers.get(EGRESS_APP).cloned())
         .ok_or_else(|| format!("no system worker rule for {EGRESS_APP}: the proxy never runs as the workspace or as root"))?;
-    let listener = bind_in(jid)?;
+    let listener = bind_in(jid, PROXY_PORT)?;
     let err = std::os::fd::AsFd::as_fd(&std::io::stderr()).try_clone_to_owned().map_err(|e| e.to_string())?;
     let err2 = err.try_clone().map_err(|e| e.to_string())?;
     stop(ws_jail);

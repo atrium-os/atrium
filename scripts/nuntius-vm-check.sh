@@ -119,9 +119,9 @@ export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroo
 # binaries, and would otherwise deploy a stale portcullisd.
 (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" \
     cargo build --quiet --release --target $TARGET) || die "portcullis cross-build"
-(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo +nightly build --quiet --release \
+(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --quiet --release \
     --target $TARGET -Z build-std=std,panic_abort --bin nuntiusd) || die "nuntiusd cross-build"
-(cd "$ROOT/nuntius" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo +nightly build --quiet --release \
+(cd "$ROOT/nuntius" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --quiet --release \
     --target $TARGET -Z build-std=std,panic_abort --example nuntius-probe) || die "nuntius-probe cross-build"
 ND="$ROOT/navigator-fetch/target/$TARGET/release/nuntiusd"
 NP="$ROOT/nuntius/target/$TARGET/release/examples/nuntius-probe"

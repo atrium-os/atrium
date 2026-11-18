@@ -25,6 +25,7 @@ pub mod native;
 pub mod ops;
 pub mod paginate;
 pub mod paint;
+pub mod picture;
 pub mod track;
 pub mod tree;
 

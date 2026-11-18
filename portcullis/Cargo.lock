@@ -1225,6 +1225,7 @@ dependencies = [
 name = "portcullis-mounts"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "portcullis-jail",
 ]
 
@@ -1351,6 +1352,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "sigillum-proto",
  "sockmux",
  "tempfile",
  "toml",

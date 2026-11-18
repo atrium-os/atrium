@@ -1387,7 +1387,8 @@ fn run_parts(p: &fresco_protocol::GlyphRunParams) -> Vec<(u32, [f32; 2], Vec<Gly
         out.push((p.atlas_slot_id, [p.atlas_width as f32, p.atlas_height as f32], mono));
     }
     if !color.is_empty() {
-        out.push((fresco_protocol::color_atlas_slot(p.atlas_slot_id), [fresco_protocol::COLOR_ATLAS_W as f32, fresco_protocol::COLOR_ATLAS_H as f32], color));
+        let (cw, ch) = fresco_protocol::color_atlas_dims(p.atlas_width, p.atlas_height);
+        out.push((fresco_protocol::color_atlas_slot(p.atlas_slot_id), [cw as f32, ch as f32], color));
     }
     out
 }

@@ -45,17 +45,7 @@ pub fn stem_of(name: &str) -> &str {
 
 /// A picture's MIME type from its first bytes, for the pictures Slides takes.
 pub fn picture_mime(b: &[u8]) -> Option<&'static str> {
-    use navigator_image::image::{sniff, Format as F};
-    Some(match sniff(b).ok()? {
-        F::Png => "image/png",
-        F::Jpeg => "image/jpeg",
-        F::Gif => "image/gif",
-        F::Webp => "image/webp",
-        F::Svg => "image/svg+xml",
-        F::Wmf => "image/wmf",
-        F::Emf => "image/emf",
-        F::Bmp => "image/bmp",
-    })
+    officina_text::picture::mime(b)
 }
 
 /// Runs the converter process (`officina-convert KIND`, sandboxed, next to

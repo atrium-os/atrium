@@ -29,6 +29,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-mdns"
+version = "0.1.0"
+dependencies = [
+ "aura-ipc",
+ "libc",
+]
+
+[[package]]
 name = "atrium-net"
 version = "0.1.0"
 dependencies = [

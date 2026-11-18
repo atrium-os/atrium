@@ -330,6 +330,10 @@ fn main() {
         Ok(n) => eprintln!("atrium-mail: {n} message(s) may not have been sent; they wait in the outbox"),
         Err(e) => eprintln!("atrium-mail: outbox: {e}"),
     }
+    // A store from before the address book fills it from Sent once.
+    if let Err(e) = engine.people_from_sent() {
+        eprintln!("atrium-mail: address book: {e}");
+    }
     let loads = loader();
     let incoming = links();
 

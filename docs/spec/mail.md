@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1129,7 +1129,7 @@ Stalwart in the cloud VM, and later a real account):
    **Not yet**: the app runs no sync or send loop of its own (no account setup §5.1 yet,
    so deliver/copy_drafts are called by tests), so the press's token isn't spent by a
    trusted spender (§9.4 needs the separate engine process) and the courier's hourly cap
-   isn't reached; attachments in compose (M5 picker), address completion (§14.2), per
+   isn't reached; attachments in compose (M5 picker), address completion (§14.2; built later, see M8), per
    recipient plain text, inline images and tables in the profile, a link button, time
    zones, and a VM run with frescod.
 6. **M5** attachments: quick look, `OpenAttachment`, Save via picker, attachment search
@@ -1402,9 +1402,54 @@ Stalwart in the cloud VM, and later a real account):
    the wire 1 (sent, and a refused sender), and the Dovecot sends through the worker. *JMAP* followed: the worker runs the JMAP client and reads every JSON answer,
    and asks Mail for each HTTP exchange (`SinkCall::Get`/`Post`), which Mail makes
    through Arca's courier as before, so the worker still has no network and no token.
-   Sync and sending go through it; the EventSource watch still runs in Mail's process
-   (it only reads state-change events). Tests: the wire 1 (the same session, errors and
-   HTTP exchanges as in-process), and the engine's JMAP suite passes through the worker.
+   Sync and sending go through it, and so does the EventSource watch: Mail opens the
+   stream through the courier and hands each event to the worker
+   (`SinkCall::Events`, `SinkAnswer::Event`), which parses it and says whether it was
+   news (`SinkCall::Pushed`); Mail answers whether to keep watching. So Mail's own
+   process reads no mail server's replies at all. Tests: the wire 2 (the same session,
+   errors and HTTP exchanges as in-process; the same verdicts on a scripted stream,
+   stopped and ended), and the engine's JMAP suite, push included, passes through the
+   worker.
+
+   **Address book and recipient completion (2026-11-18, §14.2)**: the store keeps the
+   persona's address book (`mail_store::people`): each address the person wrote to, the
+   name it was last written with, how many messages and when last. A message counts once
+   by its Message-ID, so sending it and later seeing its copy in Sent doesn't count
+   twice. It fills when a send is handed over (names from the draft), from new mail in
+   Sent folders as sync stores it, and once at start from the Sent mail already synced
+   when the book is empty (a store from before). Completion matches the start of the
+   address, its domain, a part of its local name, or a word of the name, and ranks by
+   messages halved for each month of quiet. In compose, the To, Cc and Bcc fields show up
+   to five people under the field with the caret, for the address being typed at its
+   end. The arrows pick, Enter or Tab or a click takes one (a comma follows for the
+   next), and Escape puts them away for what was typed. Tests: store 1 (counting, names,
+   matching, ranking, forgetting), the engine's JMAP send (in the book once, Bcc too), and
+   the compose window 1 (typing, arrows, Enter, Tab, Escape, no suggestions without the
+   caret). **Not yet**: imported vCards and CardDAV (§17 D8), and a page to see and
+   forget people (`forget_person` exists).
+
+   **Platform SDK (2026-11-18)**: the manifest names the roles Mail embeds
+   (`embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential"]`), so it
+   no longer keeps every role as an unlisted first-party app. `cargo atrium check` lists
+   nine parsers linked into the core; none of them runs on received bytes. They arrive with
+   the compose editor (pergola-richtext, officina-text). html5ever and pulldown-cmark come
+   in through navigator-render and navigator-dom, which the editor uses only for the font
+   set and image limits; Mail never asks them for HTML or Markdown. Its own drafts' HTML is
+   read back by `rich::from_html`, and a received HTML body is only ever text-scanned
+   after the parse jail has normalized it. usvg and roxmltree come with navigator-image,
+   which decodes only pictures in a document, and Mail's mail profile has none. Paste is
+   plain text. allsorts, rustybuzz and ttf-parser read the system's pinned fonts, never a
+   message's. flate2 and brotli serve those fonts' WOFF tables, and flate2 also serves
+   OpenPGP encryption of outgoing mail. Signatures are checked in the parse jail, and
+   decrypting isn't built. One thing to watch: `give_pgp_key`, a key the person pastes,
+   would parse in the core once the UI calls it. It belongs in the parse worker when that
+   comes. Mail was then installed from its signed bundle on the arm64
+   VM (2026-11-18): `cargo atrium bundle` (37 MB: atrium-mail, mail-parse-jail,
+   mail-sync-worker), `opifex side-load` (trusted publisher). On kernel.atrium with the
+   filter in deny mode, Mail started from the bundle, and parse and sync spawned as uids
+   of their own in jails with no addresses and only unix sockets. Start time was the
+   same before and after. Not yet: an amd64 bundle (no amd64 sysroot on the Mac), and
+   `vm-workers-check.sh` as written (amd64 cloud VM).
 
 ## 17. Decisions, with recommendations
 

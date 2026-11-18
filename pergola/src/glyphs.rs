@@ -10,7 +10,7 @@
 //!   sub-pixel variants yet). New glyphs reach frescod as one region update
 //!   just before the run that needs them.
 //! - Colour glyphs (a COLR face: Noto Color Emoji) go to the atlas's RGBA
-//!   twin, [`fresco_protocol::COLOR_ATLAS_W`] square, drawn by `atrium-colr`;
+//!   twin, [`COLOR_W`] square (1024², allocated on the first one), drawn by `atrium-colr`;
 //!   their entries say `color`, and the run marks them `GLYPH_COLOR`.
 
 use std::collections::HashMap;
@@ -98,8 +98,8 @@ pub struct Entry {
     pub color: bool,
 }
 
-pub const COLOR_W: u32 = fresco_protocol::COLOR_ATLAS_W;
-pub const COLOR_H: u32 = fresco_protocol::COLOR_ATLAS_H;
+pub const COLOR_W: u32 = fresco_protocol::color_atlas_dims(ATLAS_W, ATLAS_H).0;
+pub const COLOR_H: u32 = fresco_protocol::color_atlas_dims(ATLAS_W, ATLAS_H).1;
 
 /// Shelf packing: where the next `w`×`h` goes in a `aw`×`ah` page.
 #[derive(Default)]

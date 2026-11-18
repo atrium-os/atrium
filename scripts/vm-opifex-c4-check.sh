@@ -90,7 +90,7 @@ export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd="${AR_X:-llvm
 export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$VMDIR/sysroot"
 (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" \
     cargo build -q --release --target "$TARGET") || die "portcullis cross-build"
-(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo +nightly build -q --release \
+(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release \
     --target "$TARGET" -Z build-std=std,panic_abort --bin nuntiusd) || die "nuntiusd cross-build"
 T="$ROOT/portcullis/target/$TARGET/release"
 ND="$ROOT/navigator-fetch/target/$TARGET/release/nuntiusd"

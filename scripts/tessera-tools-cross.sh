@@ -51,7 +51,7 @@ echo "core: $(ls "$OUT"/*.o | wc -l) objects -> $OUT/libtessera_core.a ($DEFS)"
 S="$SYSROOT"
 CROSS_RUSTFLAGS="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
 (cd "$RS" && TESSERA_CORE_LIB="$OUT" RUSTFLAGS="$CROSS_RUSTFLAGS" \
-    cargo +nightly build --quiet --release --target "$TRIPLE" \
+    cargo build --quiet --release --target "$TRIPLE" \
     -Z build-std=std,panic_abort -p tessera-tools)
 
 BIN="$RS/target/$TRIPLE/release"

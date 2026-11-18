@@ -254,6 +254,7 @@ impl Engine {
         let mut block = Vec::new();
         let mut hold = Vec::new();
         let mut wrote = Vec::new();
+        let mut people = Vec::new();
         let mut lane_in = Vec::new();
         let mut received: Vec<String> = Vec::new();
         let mut private_in = Vec::new();
@@ -262,6 +263,7 @@ impl Engine {
             let s = &m.summary;
             if f.role == Role::Sent {
                 wrote.extend(s.to.iter().chain(&s.cc).chain(&s.bcc).map(|a| a.addr.clone()));
+                people.push((s.message_id.clone(), s.to.iter().chain(&s.cc).chain(&s.bcc).map(|a| (a.name.clone(), a.addr.clone())).collect::<Vec<_>>(), m.date));
                 continue;
             }
             if matches!(f.role, Role::Drafts | Role::Trash | Role::Junk) {
@@ -300,6 +302,10 @@ impl Engine {
         self.store.write(|w| {
             for a in &wrote {
                 w.mark_contact(account, a, contact::WROTE, 0)?;
+            }
+            for (id, to, at) in &people {
+                let to: Vec<(&str, &str)> = to.iter().map(|(n, a)| (n.as_str(), a.as_str())).collect();
+                w.wrote_to(id.as_deref(), &to, *at)?;
             }
             for a in &received {
                 w.mark_contact(account, a, contact::KNOWN, 0)?;

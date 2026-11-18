@@ -276,6 +276,27 @@ pub fn run(name: String, project: String) -> DaemonResult<(String, Vec<String>)>
     }
 }
 
+/// Run under the debugger (dev-tools-plan.md M10): the app id and where a
+/// debugger in the workspace connects.
+pub fn debug(name: String, project: String) -> DaemonResult<(String, String, String)> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    match round_trip(&mut s, &Request::WorkspaceDebug { name, project, activation: [0; 16] })? {
+        Response::WorkspaceDebugging { app_id, address, program, .. } => Ok(Some((app_id, address, program))),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected Debug reply: {other:?}"))),
+    }
+}
+
+/// Copy a dev build's cores into the workspace.
+pub fn cores(name: String) -> DaemonResult<Vec<String>> {
+    let Some(mut s) = opened()? else { return Ok(None) };
+    match round_trip(&mut s, &Request::WorkspaceCores { name })? {
+        Response::WorkspaceCores { files } => Ok(Some(files)),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected Cores reply: {other:?}"))),
+    }
+}
+
 /// Run a command in one of the person's workspaces (homes.md W6), its
 /// output copied to stdout until it ends.
 pub fn exec(name: String, argv: Vec<String>, cwd: String) -> DaemonResult<()> {

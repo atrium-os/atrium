@@ -93,7 +93,7 @@ impl Sheet {
         let Some(p) = self.personas.get(self.into) else { return Ok(()) };
         let here = &self.personas[0];
         if !p.allowed {
-            return Err(format!("Links from {} to {} are off. Settings, Personas has the switch.", Self::persona_name(here), Self::persona_name(p)));
+            return Err(format!("Links from {} to {} are off. Settings, Apps, Between personas has the switch.", Self::persona_name(here), Self::persona_name(p)));
         }
         let only_elsewhere = self.personas.iter().any(|q| q.also.iter().any(|a| a.id == self.apps[i].id));
         if p.here && only_elsewhere {

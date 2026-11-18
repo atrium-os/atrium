@@ -16,7 +16,8 @@ pub mod bands;
 pub mod conformance;
 pub mod find;
 pub mod flag;
-pub mod fontset;
+/// The pinned font set, its own crate so text layout can use it alone.
+pub use navigator_fontset as fontset;
 pub mod html;
 pub mod nsg;
 pub mod path;

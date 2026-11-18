@@ -1198,7 +1198,8 @@ milliseconds, and invisible to a reader. It becomes visible only when many jails
 stop together, such as a burst at init. If that ever matters, the levers are known:
 
 1. No vnet for jails without network access, with the kernel hiding link-layer addresses
-   from non-vnet jails.
+   from non-vnet jails. **Done 2026-11-18** for jaild's lane (one-shots and workers):
+   portcullis.md §9.1c.
 2. A cheaper vnet teardown, by profiling the 54 ms. It is unmeasured whether Laminar
    contributes; that needs an A/B against ULE.
 3. Taking the destroy off any waiting path.

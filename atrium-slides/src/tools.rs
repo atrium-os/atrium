@@ -80,7 +80,7 @@ pub fn rehearse(deck: &mut Deck, screen: (u32, u32), mut progress: impl FnMut(us
             for (media, w, h) in pictures(deck, i, k) {
                 let t = Instant::now();
                 let bytes = deck.media_bytes(media).ok();
-                let natural = bytes.as_ref().and_then(|b| navigator_image::image::natural_size(b).ok()).map(|(_, w, h)| (w, h)).unwrap_or((0, 0));
+                let natural = bytes.as_ref().and_then(|b| crate::decode::natural_size(b)).unwrap_or((0, 0));
                 let _ = bytes.and_then(|b| crate::decode::decode(&b, w, h));
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 cost.ms += ms;
@@ -145,16 +145,15 @@ pub fn reduce(deck: &mut Deck, longest: u32, mut progress: impl FnMut(usize, usi
         progress(n, ids.len());
         let (w, h) = need[id];
         let Ok(bytes) = deck.media_bytes(*id) else { continue };
-        let Ok((fmt, nw, nh)) = navigator_image::image::natural_size(&bytes) else {
+        let Some((nw, nh)) = crate::decode::natural_size(&bytes) else {
             r.kept += 1;
             continue;
         };
-        use navigator_image::image::Format;
         // Vector pictures are drawn at any size; a GIF may move.
         // The scale a decode for (w, h) takes (it fills the box): close to
         // 1, the picture is already about the size it is shown at.
         let scale = (w as f64 / nw.max(1) as f64).max(h as f64 / nh.max(1) as f64);
-        if matches!(fmt, Format::Svg | Format::Gif) || scale >= 0.95 {
+        if matches!(officina_text::picture::mime(&bytes), Some("image/svg+xml" | "image/gif")) || scale >= 0.95 {
             r.kept += 1;
             continue;
         }
@@ -187,11 +186,7 @@ pub fn recompress(bytes: &[u8], w: u32, h: u32) -> Option<(&'static str, Vec<u8>
         jpeg_encoder::Encoder::new(&mut out, 85).encode(&px.rgba, px.width as u16, px.height as u16, jpeg_encoder::ColorType::Rgba).ok()?;
         Some(("image/jpeg", out))
     } else {
-        let mut e = png::Encoder::new(&mut out, px.width, px.height);
-        e.set_color(png::ColorType::Rgba);
-        e.set_depth(png::BitDepth::Eight);
-        e.write_header().ok()?.write_image_data(&px.rgba).ok()?;
-        Some(("image/png", out))
+        Some(("image/png", crate::decode::encode_png(px.width, px.height, &px.rgba)?))
     }
 }
 

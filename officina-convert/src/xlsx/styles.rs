@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+#[cfg(feature = "read")]
 use quick_xml::events::{BytesStart, Event};
+#[cfg(feature = "read")]
 use quick_xml::Reader;
 
 use officina_grid::numfmt::{self, PALETTE};
@@ -20,6 +22,7 @@ use crate::report::{Kind, Report};
 /// `cellXfs` entries a file may have (Excel's limit is 64,000).
 pub const MAX_XFS: usize = 65_536;
 
+#[cfg(feature = "read")]
 fn attrs(e: &BytesStart) -> HashMap<Vec<u8>, String> {
     let mut m = HashMap::new();
     for a in e.attributes().with_checks(false).flatten() {
@@ -30,10 +33,12 @@ fn attrs(e: &BytesStart) -> HashMap<Vec<u8>, String> {
     m
 }
 
+#[cfg(feature = "read")]
 fn truthy(v: Option<&String>) -> bool {
     v.is_some_and(|v| v != "0" && v != "false")
 }
 
+#[cfg(feature = "read")]
 /// The theme's twelve colours, in `theme="n"` order (light 1 and dark 1 swapped, as
 /// Excel reads them: 0 is lt1, 1 dk1, 2 lt2, 3 dk2, then accents and links).
 pub fn theme_colors(xml: &[u8]) -> Vec<u32> {
@@ -133,11 +138,13 @@ pub fn tint(rgb: u32, t: f64) -> u32 {
     c(r) << 16 | c(g) << 8 | c(b)
 }
 
+#[cfg(feature = "read")]
 struct Colors<'a> {
     theme: &'a [u32],
     indexed: &'a [u32],
 }
 
+#[cfg(feature = "read")]
 impl Colors<'_> {
     /// A `<color>`-like element's colour; `None` for automatic.
     fn of(&self, a: &HashMap<Vec<u8>, String>) -> Option<u32> {
@@ -163,6 +170,7 @@ impl Colors<'_> {
     }
 }
 
+#[cfg(feature = "read")]
 #[derive(Default, Clone)]
 struct FontIn {
     name: Option<String>,
@@ -174,6 +182,7 @@ struct FontIn {
     color: Option<u32>,
 }
 
+#[cfg(feature = "read")]
 /// One [`Style`] per `cellXfs` entry. Never fails: what it cannot read is the default,
 /// with a note.
 pub fn read(xml: &[u8], theme: &[u32], rep: &mut Report) -> Vec<Style> {

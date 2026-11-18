@@ -4,10 +4,11 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cdm::{CdmEvent, CdmOptions, CdmProc};
@@ -87,6 +88,10 @@ pub struct Options {
     pub h264: Option<H264>,
     /// Encrypted media through Hospes: start `hospes-cdm` beside every worker (hospes.md §8).
     pub cdm: Option<CdmOptions>,
+    /// The bundle's declared workers (atrium.toml `[[workers]] decode`), when
+    /// the worker is started through the platform SDK rather than at
+    /// `worker` by hand. See [`Options::sdk_workers`].
+    pub workers: Option<Arc<atrium_worker::Workers>>,
 }
 
 /// Where `hospes-codec` and the user-installed OpenH264 binary are (hospes.md §12).
@@ -128,14 +133,38 @@ impl Options {
     }
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Options { worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768, h264: H264::from_env(), cdm: CdmOptions::from_env() }
+impl Options {
+    /// The bundle's workers, when it declares `decode` and no
+    /// `ATRIUM_PLAYER_DECODE` overrides it: the installed Player (its
+    /// atrium.toml at `ATRIUM_APP_ROOT`, else `/` in its jail). Off Atrium,
+    /// in tests and in a build tree there is none, and the worker is started
+    /// by hand as before.
+    pub fn sdk_workers() -> Option<Arc<atrium_worker::Workers>> {
+        if std::env::var_os("ATRIUM_PLAYER_DECODE").is_some() {
+            return None;
+        }
+        atrium_worker::Workers::get().ok().filter(|w| w.has("decode")).map(Arc::new)
     }
 }
 
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            worker: Self::default_worker(), limits: Limits::default(), buffers: 4, worker_mem_mib: 768,
+            h264: H264::from_env(), cdm: CdmOptions::from_env(), workers: Self::sdk_workers(),
+        }
+    }
+}
+
+/// How the decode worker runs: a child started by hand, or the bundle's
+/// declared `decode` worker started by atrium-worker.
+enum WorkerProc {
+    Child(Child),
+    Sdk(atrium_worker::SocketWorker),
+}
+
 struct Proc {
-    child: Child,
+    child: WorkerProc,
     /// hospes-codec, started with the worker and killed with it.
     codec: Option<Child>,
     /// hospes-cdm, likewise; its sessions live and die with this worker.
@@ -147,6 +176,9 @@ struct Proc {
 
 impl Proc {
     fn spawn(o: &Options) -> io::Result<Proc> {
+        if let Some(w) = &o.workers {
+            return Self::spawn_sdk(o, w);
+        }
         let (mine, theirs) = UnixStream::pair()?;
         let mut cmd = Command::new(&o.worker);
         cmd.arg("--fd").arg(theirs.as_raw_fd().to_string()).arg("--mem-mib").arg(o.worker_mem_mib.to_string()).stdin(std::process::Stdio::null());
@@ -195,7 +227,45 @@ impl Proc {
         drop(theirs);
         drop(worker_end);
         drop(cdm_end);
-        Ok(Proc { child, codec, cdm, sock: mine, partial: Vec::new() })
+        Ok(Proc { child: WorkerProc::Child(child), codec, cdm, sock: mine, partial: Vec::new() })
+    }
+
+    /// The declared `decode` worker (app-composition.md §4), started by
+    /// atrium-worker with the codec and CDM hosts' sockets as its extra
+    /// descriptors, then told which it has and its memory limit in a
+    /// [`crate::wire::SdkStart`] before anything else.
+    fn spawn_sdk(o: &Options, workers: &atrium_worker::Workers) -> io::Result<Proc> {
+        let mut codec = None;
+        let mut extra: Vec<OwnedFd> = Vec::new();
+        let mut start = crate::wire::SdkStart { h264: false, cdm: false, mem_mib: o.worker_mem_mib as u32 };
+        if let Some(h) = &o.h264 {
+            let (w_end, c_end) = UnixStream::pair()?;
+            let lib = File::open(&h.library)?;
+            let mut c = Command::new(&h.codec);
+            c.arg("--sock").arg(c_end.as_raw_fd().to_string()).arg("--lib").arg(lib.as_raw_fd().to_string());
+            c.arg("--mem").arg(h.mem_mib.to_string());
+            c.arg("--max").arg(format!("{}x{}", o.limits.max_width, o.limits.max_height));
+            c.stdin(std::process::Stdio::null());
+            sys::pass_fd(&mut c, c_end.as_raw_fd());
+            sys::pass_fd(&mut c, lib.as_raw_fd());
+            codec = Some(c.spawn()?);
+            extra.push(w_end.into());
+            start.h264 = true;
+        }
+        let mut cdm = None;
+        if let Some(co) = &o.cdm {
+            let (p, w_end) = CdmProc::spawn(co)?;
+            cdm = Some(p);
+            extra.push(w_end.into());
+            start.cdm = true;
+        }
+        let fds: Vec<_> = extra.iter().map(|f| f.as_fd()).collect();
+        let w = workers.spawn_socket("decode", &fds).map_err(|e| io::Error::other(format!("the decode worker: {e}")))?;
+        drop(fds);
+        drop(extra);
+        let mine = w.sock.try_clone()?;
+        (&mine).write_all(&start.encode())?;
+        Ok(Proc { child: WorkerProc::Sdk(w), codec, cdm, sock: mine, partial: Vec::new() })
     }
 
     fn send(&self, m: &ToWorker, fds: &[&OwnedFd]) -> io::Result<()> {
@@ -222,8 +292,13 @@ impl Proc {
     }
 
     fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.child {
+            WorkerProc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            WorkerProc::Sdk(w) => w.kill(),
+        }
         if let Some(c) = &mut self.codec {
             let _ = c.kill();
             let _ = c.wait();
@@ -686,7 +761,11 @@ impl<S: Sink> Player<S> {
     }
 
     pub fn worker_pid(&self) -> Option<u32> {
-        self.w.as_ref().map(|w| w.child.id())
+        self.w.as_ref().and_then(|w| match &w.child {
+            WorkerProc::Child(c) => Some(c.id()),
+            // A declared worker may be in a jail of its own: no pid here.
+            WorkerProc::Sdk(_) => None,
+        })
     }
 
     /// The next event, waiting at most `timeout` for the worker. Returns

@@ -15,14 +15,15 @@ name = "atrium-write"
 path = "src/bin/atrium_write.rs"
 
 [dependencies]
-navigator-image = { path = "../navigator-image", features = ["office"] }
 officina-core = { path = "../officina-core" }
-officina-convert = { path = "../officina-convert" }
+# Writers, protection and the launcher: the readers run in the convert worker.
+officina-convert = { path = "../officina-convert", default-features = false }
 officina-text = { path = "../officina-text" }
-officina-pdf = { path = "../officina-pdf" }
+# Pictures come from the convert worker (officina_convert::pictures).
+officina-pdf = { path = "../officina-pdf", default-features = false }
 officina-spell = { path = "../officina-spell" }
 pergola = { path = "../pergola" }
-pergola-richtext = { path = "../pergola-richtext" }
+pergola-richtext = { path = "../pergola-richtext", default-features = false }
 limen = { path = "../limen" }
 # Files opened in Write from Scrinium (opening-files.md §6.2).
 atrium-open = { path = "../atrium-open" }
@@ -34,7 +35,17 @@ libc = "0.2"
 pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
+# What ships in the bundle: no debug info, symbols stripped.
+strip = true
+
+# `--profile profiling`: release code with line tables, for perf and the
+# stall probes.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
 
 [dev-dependencies]
+# Tests make foreign sample files with the readers' crate.
+officina-convert = { path = "../officina-convert", features = ["read"] }
 png = "0.17"

@@ -7,7 +7,9 @@
 //! elements, which are reported, not trusted. Limits: element count, depth and
 //! text bytes, so a hostile part can't make the tree unbounded.
 
+#[cfg(feature = "read")]
 use quick_xml::events::{BytesStart, Event};
+#[cfg(feature = "read")]
 use quick_xml::Reader;
 
 /// Most elements one part may hold.
@@ -78,6 +80,7 @@ impl El {
     }
 }
 
+#[cfg(feature = "read")]
 fn start(e: &BytesStart) -> Result<El, String> {
     let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
     let mut attrs = Vec::new();
@@ -90,6 +93,7 @@ fn start(e: &BytesStart) -> Result<El, String> {
     Ok(El { name, attrs, kids: Vec::new() })
 }
 
+#[cfg(feature = "read")]
 /// Parses one XML part into its root element.
 pub fn parse(data: &[u8]) -> Result<El, String> {
     let mut r = Reader::from_reader(data);

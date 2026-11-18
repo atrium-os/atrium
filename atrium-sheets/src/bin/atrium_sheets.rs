@@ -486,6 +486,14 @@ fn main() {
     let mut close_after_save = false;
     let mut discard = false;
     let mut recalculating = false;
+    // Files the user opens in Sheets from Scrinium (opening-files.md §6.2).
+    let mut channel = match atrium_open::Channel::connect() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("atrium-sheets: the document channel: {e}");
+            None
+        }
+    };
     'main: loop {
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
@@ -609,6 +617,19 @@ fn main() {
                 // Saved on the way out: close; cancelled: stay open.
                 if std::mem::take(&mut close_after_save) && !run.sheets.doc.borrow().dirty {
                     break 'main;
+                }
+            }
+        }
+        if let Some(ch) = channel.as_mut() {
+            match ch.recv(Some(Duration::ZERO)) {
+                Ok(Some(o)) => {
+                    eprintln!("atrium-sheets: “{}” opened from Scrinium{}", o.name, if o.write { " (write)" } else { "" });
+                    run.opened(o.name, o.write, o.file.into());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("atrium-sheets: the document channel: {e}");
+                    channel = None;
                 }
             }
         }

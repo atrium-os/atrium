@@ -1068,7 +1068,7 @@ fn handle_create(
         devfs_ruleset:  req.devfs_ruleset,
         ip4_addr:       ip4_addr_no_cidr.as_deref(),
         ip4_inherit,
-        isolated:       matches!(req.network, NetworkConfig::Isolated),
+        isolated:       isolated_needs_vnet(&req.network),
         hostname:       req.hostname.as_deref().unwrap_or(&req.name),
         hostid:         req.hostid,
         hostuuid:       req.hostuuid.as_deref(),
@@ -1213,6 +1213,14 @@ fn create_loopback(req: &CreateJailRequest, sysfil: Option<&SysfilParams>) -> Re
     }
     info!("jaild: loopback-only stack for {} jid={jid}", req.name);
     Ok(jid)
+}
+
+/// `Isolated` is an empty vnet only on a kernel that would otherwise show a
+/// jail without IP the host's interfaces and MACs (portcullis.md §9.1c). On
+/// a netblind kernel it is `ip4=disable ip6=disable` on the host's stack,
+/// which hides the same things without a vnet to create and destroy.
+fn isolated_needs_vnet(n: &NetworkConfig) -> bool {
+    matches!(n, NetworkConfig::Isolated) && !ffi::netblind_supported()
 }
 
 /// The persistent vnet=new jail both pre-networked modes start from.
@@ -1534,7 +1542,7 @@ fn handle_create_with_exec(
             devfs_ruleset:  req.devfs_ruleset,
             ip4_addr:       ip4_addr.as_deref(),
             ip4_inherit,
-            isolated:       matches!(req.network, NetworkConfig::Isolated),
+            isolated:       isolated_needs_vnet(&req.network),
             hostname:       req.hostname.as_deref().unwrap_or(&req.name),
             hostid:         req.hostid,
             hostuuid:       req.hostuuid.as_deref(),

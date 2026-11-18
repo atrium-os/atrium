@@ -49,10 +49,14 @@ pub fn caps(manifest: &str) -> Vec<String> {
     let v: toml::Value = manifest.parse().unwrap_or(toml::Value::Table(Default::default()));
     v.get("capabilities").and_then(|c| c.as_table()).map(|t| {
         t.iter().filter(|(k, v)| k.as_str() != "graphics" && v.as_bool() != Some(false) && v.as_str() != Some("none"))
-            .map(|(k, v)| match v.as_str() {
+            .flat_map(|(k, v)| match (k.as_str(), v) {
                 // A changed network mode or grant list is a change worth asking about.
-                Some(s) if k == "network" => format!("network={s}"),
-                _ => k.clone(),
+                ("network", toml::Value::String(s)) => vec![format!("network={s}")],
+                // One line per role it embeds, so an update that adds a role
+                // asks about that role (portcullis.md, embeds).
+                ("embeds", toml::Value::Array(a)) => a.iter().filter_map(|r| r.as_str())
+                    .map(|r| format!("embeds:{r}")).collect(),
+                _ => vec![k.clone()],
             })
             .collect()
     }).unwrap_or_default()
@@ -73,6 +77,19 @@ pub fn class(manifest: &str) -> String {
 }
 
 /// What to do with `new` over `installed`, for a person who chose `pref`.
+#[cfg(test)]
+mod embeds_tests {
+    #[test]
+    fn each_embedded_role_is_its_own_line_and_an_added_one_is_asked() {
+        let m = |e: &str| format!("[app]\nid = \"org.a.b\"\nname = \"B\"\nversion = \"1\"\nentry = \"x\"\n[capabilities]\nembeds = [{e}]\n");
+        assert_eq!(super::caps(&m("\"picker\", \"doc-viewer\"")), ["embeds:picker", "embeds:doc-viewer"]);
+        let (_, added) = super::decide(&m("\"picker\""), &m("\"picker\", \"doc-viewer\""), true, None);
+        assert_eq!(added, ["embeds:doc-viewer"]);
+        let (_, added) = super::decide(&m("\"picker\", \"doc-viewer\""), &m("\"picker\""), true, None);
+        assert!(added.is_empty(), "dropping a role asks nothing");
+    }
+}
+
 pub fn decide(installed: &str, new: &str, same_publisher: bool, pref: Option<&str>) -> (Action, Vec<String>) {
     let have = caps(installed);
     let added: Vec<String> = caps(new).into_iter().filter(|c| !have.contains(c)).collect();

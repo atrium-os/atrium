@@ -15,7 +15,11 @@
 #     anything is installed;
 #   - Scratch uses Liba: a program linking Liba's libgreet through
 #     /workspaces/liba (pkg-config finds it by PKG_CONFIG_PATH) Runs, with
-#     libgreet in its bundle.
+#     libgreet in its bundle;
+#   - [bundle] extra-libs: a program that dlopens jansson (it doesn't link
+#     it) Runs with jansson in its bundle and loads it; a pattern that
+#     matches nothing is refused; make bundle (cargo-atrium, cross-built
+#     here and copied in) writes a tree with it too.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=amd64
@@ -38,6 +42,9 @@ echo "=== cross-build"
 echo "=== install"
 B=/var/tmp/run-closure
 V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+(cd "$ROOT/sdk" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p cargo-atrium) \
+    || { echo "cargo-atrium build failed"; echo "run-closure: 1 failed"; exit 1; }
+scp -q $K -P 2222 "$ROOT/sdk/target/$TARGET/release/cargo-atrium" root@localhost:/var/tmp/cargo-atrium-rc
 for b in portcullisd portcullis; do
     scp -q $K -P 2222 "$ROOT/portcullis/target/$TARGET/release/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "run-closure: 1 failed"; exit 1; }
 done
@@ -167,6 +174,49 @@ case "$out" in dev.alice.scratch.org.example.hi*) ok "Run installs it" ;; *) bad
 check "its bundle has libgreet" "1" "$(V "test -f /var/lib/atrium/apps/dev.alice.scratch.org.example.hi/usr/lib/libgreet.so.1 && echo 1")"
 L=$(logline 'closure-uses')
 case "$L" in *"hello from liba"*) ok "it ran as an app: $L" ;; *) bad "no line from hi: $(V "tail -5 $LOG")" ;; esac
+
+echo "=== [bundle] extra-libs: a library the app dlopens"
+V "mkdir -p $W/scratch/work/.bin && install -o alice -g files-alice -m 0755 /var/tmp/cargo-atrium-rc $W/scratch/work/.bin/cargo-atrium"
+out=$(ws_sh scratch <<'SH'
+set -e
+mkdir -p ~/work/dl && cd ~/work/dl
+cat > dl.c <<'C'
+#include <stdio.h>
+#include <dlfcn.h>
+int main(void) {
+    void *h = dlopen("libjansson.so.4", RTLD_NOW);
+    printf("closure-dl %s\n", h && dlsym(h, "json_object") ? "loaded" : dlerror());
+    return 0;
+}
+C
+printf 'PROG= dl\nLDFLAGS+= -Wl,-rpath,/usr/local/lib\n.include <atrium.app.mk>\n' > Makefile
+make >/dev/null
+printf '[app]\nid = "org.example.dl"\nname = "Dl"\nversion = "1"\nentry = "dl"\n\n[bundle]\nextra-libs = ["libnothere*.so*"]\n' > atrium.toml
+./dl
+SH
+)
+case "$out" in *"closure-dl loaded"*) ok "dl builds and loads jansson in Scratch" ;; *) bad "dl build: $out" ;; esac
+out=$(A "run scratch dl")
+case "$out" in *"libnothere"*) ok "Run refuses a pattern that matches nothing: $(echo "$out" | cut -c1-100)" ;; *) bad "dl nothere: $out" ;; esac
+ws_sh scratch >/dev/null <<'SH'
+cd ~/work/dl && sed -i '' 's/libnothere\*\.so\*/libjansson.so.*/' atrium.toml
+SH
+out=$(A "run scratch dl")
+case "$out" in dev.alice.scratch.org.example.dl*) ok "Run installs it with extra-libs" ;; *) bad "dl run: $out" ;; esac
+check "its bundle has jansson, which nothing links" "1" "$(V "test -f /var/lib/atrium/apps/dev.alice.scratch.org.example.dl/usr/lib/libjansson.so.4 && echo 1")"
+L=$(logline 'closure-dl')
+case "$L" in *loaded*) ok "it dlopens it as an app: $L" ;; *) bad "dl as an app: $L $(V "tail -5 $LOG")" ;; esac
+out=$(ws_sh scratch <<'SH'
+cd ~/work/dl && make bundle CARGO_ATRIUM=$HOME/work/.bin/cargo-atrium 2>&1 | tail -4
+find bundle -name 'libjansson*' | head -3
+SH
+)
+case "$out" in *"lib/libjansson.so.4"*) ok "make bundle carries it: $(echo "$out" | grep libjansson | head -1)" ;; *) bad "make bundle: $out" ;; esac
+out=$(ws_sh scratch <<'SH'
+cd ~/work/dl && make bundle CARGO_ATRIUM=no-such-tool 2>&1 | head -2
+SH
+)
+case "$out" in *"needs cargo-atrium"*) ok "without cargo-atrium make bundle says what to add" ;; *) bad "no cargo-atrium: $out" ;; esac
 
 for w in scratch liba; do A "stop $w" >/dev/null; done
 V "[ -f /etc/ssl/cert.pem.pkg-bak ] && cp /etc/ssl/cert.pem.pkg-bak /etc/ssl/cert.pem; true"

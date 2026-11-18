@@ -173,6 +173,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn can_hold(&self, secs: i64) -> bool {
         self.remote.can_hold(secs)
     }
+    fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> mail_sync::jmap::Result<mail_sync::jmap::Pushed> {
+        mail_sync::jmap::Jmap::watch(&mut self.remote, on)
+    }
 }
 
 /// Send one message over a submission `courier`, its replies read in the
@@ -220,8 +223,7 @@ pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(
     let imap = match &cfg.protocol {
         Protocol::Imap { imap, .. } => imap,
         Protocol::Jmap { session } => {
-            let h = net.jmap(session, &item)?;
-            let mut client = mail_sync::jmap::Client::connect(h, session).map_err(|e| e.to_string())?;
+            let mut client = open_jmap(net.jmap(session, &item)?, session)?;
             loop {
                 let began = std::time::Instant::now();
                 match client.watch(on).map_err(|e| e.to_string())? {

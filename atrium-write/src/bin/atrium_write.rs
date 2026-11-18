@@ -376,6 +376,8 @@ impl Run {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Pictures are decoded in the convert worker, never here.
+    officina_convert::pictures::install();
 
     let root = state_root();
     let _ = fs::create_dir_all(&root);

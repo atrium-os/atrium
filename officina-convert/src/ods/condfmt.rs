@@ -280,6 +280,7 @@ fn unquote(s: &str) -> Option<String> {
     Some(s.strip_prefix('"')?.strip_suffix('"')?.replace("\"\"", "\""))
 }
 
+#[cfg(feature = "read")]
 /// The rules of a format read, or why not.
 pub fn make(wb: &Workbook, f: &FormatIn, style: &dyn Fn(&str) -> Dxf) -> Result<CondFormat, String> {
     let mut ranges = Vec::new();

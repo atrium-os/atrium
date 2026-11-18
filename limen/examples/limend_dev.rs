@@ -14,6 +14,9 @@
 //! runs as `LIMEN_DEV_UID` (limend-dev as root; frescod gives embed
 //! connections only to uids that may not bind slots) with its channel on
 //! stdin and limend's environment.
+//!
+//! `LIMEN_DEV_SHARE_UID`: the share sheet's uid, which then provides `share`
+//! (as `LIMEN_SHARE_UID` in limend); any app may be chosen as a target.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -75,6 +78,9 @@ fn main() -> std::io::Result<()> {
     let launcher = Spawn { apps: pairs("LIMEN_DEV_APPS"), kids: HashMap::new(), uid };
     let fresco = limen::fresco::Frescod::new(std::env::var("LIMEN_FRESCOD_ACTIVATION").unwrap_or_else(|_| limen::fresco::DEFAULT_SOCKET.into()));
     let shared = Shared::new(Box::new(fresco), Box::new(launcher), resolve, defaults);
+    if let Some(u) = std::env::var("LIMEN_DEV_SHARE_UID").ok().and_then(|v| v.parse().ok()) {
+        shared.set_system_uid(limen::catalogue::SHARE, u);
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     {

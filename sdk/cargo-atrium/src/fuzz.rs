@@ -91,6 +91,16 @@ pub fn targets(cargo_toml: &str, atrium_toml: Option<&str>) -> Result<Vec<Target
         if out.iter().any(|t| t.name == tname) {
             continue;
         }
+        // A worker built in another crate (programs.rs) has its handler
+        // there: fuzz it in that crate, or declare the target here.
+        let elsewhere = v.get("package").and_then(|p| p.get("metadata")).and_then(|m| m.get("atrium"))
+            .and_then(|a| a.get("workers")).and_then(|w| w.get(name)).is_some();
+        let bin = w.get("entry").and_then(|e| e.as_str()).and_then(|e| e.rsplit('/').next()).unwrap_or("");
+        let bins: Vec<&str> = v.get("bin").and_then(|b| b.as_array()).into_iter().flatten()
+            .filter_map(|b| b.get("name").and_then(|n| n.as_str())).collect();
+        if elsewhere || (!bins.is_empty() && !bins.contains(&bin)) {
+            continue;
+        }
         let shape = match w.get("input").and_then(|i| i.as_str()).unwrap_or("fd") {
             "message" => Shape::Frame,
             _ => Shape::File,

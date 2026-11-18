@@ -31,6 +31,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod sys;
+
 pub use portcullis_jail::JailConfig;
 
 /// Whether to force-unmount.
@@ -51,11 +53,17 @@ pub enum Force { No, Yes }
 /// tested on a host with none of these filesystems — the subtle part is the
 /// prefix rule, not the subprocess.
 pub fn parse_mounts(output: &str, roots: &[&Path]) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = output
+    filter_under(output
         .lines()
         // fstab-style: field 2 is the mount point.
         .filter_map(|l| l.split_whitespace().nth(1))
         .map(PathBuf::from)
+        .collect(), roots)
+}
+
+/// The mount points at or under any of `roots`, deepest first.
+fn filter_under(points: Vec<PathBuf>, roots: &[&Path]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = points.into_iter()
         // ★ `Path::starts_with` is COMPONENT-wise, so `/a/bc` is not under
         // `/a/b`. A string prefix test would have unmounted a sibling whose
         // name merely began with the root's.
@@ -77,6 +85,9 @@ pub fn parse_mounts(output: &str, roots: &[&Path]) -> Vec<PathBuf> {
 
 /// Every mount point at or under any of `roots`, deepest first.
 pub fn under(roots: &[&Path]) -> Vec<PathBuf> {
+    if let Some(points) = sys::mount_points() {
+        return filter_under(points, roots);
+    }
     let out = match Command::new("mount").arg("-p").output() {
         Ok(o) => o.stdout,
         // ★ Unreadable reads as EMPTY, and the caller's convergence loop then
@@ -99,6 +110,10 @@ pub fn converge(roots: &[&Path], force: Force) -> Vec<PathBuf> {
         if ms.is_empty() { return Vec::new() }
         let before = ms.len();
         for m in &ms {
+            match sys::unmount(m, force == Force::Yes) {
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                _ => continue,
+            }
             let mut c = Command::new("umount");
             if force == Force::Yes { c.arg("-f"); }
             let _ = c.arg(m).stderr(std::process::Stdio::null()).status();
@@ -120,6 +135,16 @@ pub fn converge(roots: &[&Path], force: Force) -> Vec<PathBuf> {
 pub fn wait_jail_gone(name: &str, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
+        if let Ok(id) = sys::jail_id(name, true) {
+            if id.is_none() { return true }
+            if start.elapsed() >= timeout {
+                eprintln!("portcullis: jail {name} is still dying after {}s — its mounts \
+                           stay pinned until it is freed", timeout.as_secs());
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
         let exists = Command::new("jls").args(["-d", "-j", name, "jid"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false);
@@ -204,15 +229,21 @@ pub fn ensure_network_ready(jc: &JailConfig) -> Result<(), String> {
 /// file onto a directory fails, and so does the reverse.
 pub fn ensure_mountpoints(jc: &JailConfig) -> Result<(), String> {
     for m in &jc.mounts {
+        // ★ A source that isn't there (a service whose socket folder is
+        // missing, say) says nothing about the mountpoint's kind. Guessing
+        // "file" left a 0-byte file where a folder belongs, and every later
+        // launch failed on it with "File exists" once the service was back.
+        // Nothing is made; the mount itself reports the missing source.
+        let Ok(src) = std::fs::metadata(&m.src) else { continue };
         if let Some(parent) = m.dst.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir mountpoint parent {}: {e}", parent.display()))?;
         }
-        let src_is_dir = std::fs::metadata(&m.src).map(|md| md.is_dir()).unwrap_or(false);
-        if src_is_dir {
+        replace_wrong_kind(&m.dst, src.is_dir())?;
+        if src.is_dir() {
             std::fs::create_dir_all(&m.dst)
                 .map_err(|e| format!("mkdir mountpoint {}: {e}", m.dst.display()))?;
-        } else if !m.dst.exists() {
+        } else if std::fs::symlink_metadata(&m.dst).is_err() {
             std::fs::File::create(&m.dst)
                 .map_err(|e| format!("touch mountpoint {}: {e}", m.dst.display()))?;
         }
@@ -220,9 +251,51 @@ pub fn ensure_mountpoints(jc: &JailConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// A mountpoint left behind as the other kind (an empty file where the
+/// source is now a folder, or an empty folder where it is a file or socket)
+/// is a placeholder from an earlier launch: it is removed so the right kind
+/// can be made. Anything else in the way, a symlink or something with
+/// content, is refused rather than touched.
+fn replace_wrong_kind(dst: &Path, want_dir: bool) -> Result<(), String> {
+    let Ok(md) = std::fs::symlink_metadata(dst) else { return Ok(()) };
+    let ft = md.file_type();
+    if ft.is_dir() == want_dir && !ft.is_symlink() { return Ok(()) }
+    if !want_dir && !ft.is_dir() && !ft.is_symlink() { return Ok(()) }
+    let r = if ft.is_file() && md.len() == 0 {
+        std::fs::remove_file(dst)
+    } else if ft.is_dir() {
+        std::fs::remove_dir(dst)
+    } else {
+        return Err(format!("mountpoint {} is in the way: not a {}", dst.display(), if want_dir { "folder" } else { "file" }));
+    };
+    r.map_err(|e| format!("mountpoint {} is the wrong kind and can't be replaced: {e}", dst.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wrong_kind_placeholder_is_replaced_and_content_is_not() {
+        let d = std::env::temp_dir().join(format!("atrium-mp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("limen");
+        std::fs::write(&f, b"").unwrap();
+        replace_wrong_kind(&f, true).unwrap();
+        assert!(!f.exists(), "the empty file was left");
+        std::fs::create_dir(&f).unwrap();
+        replace_wrong_kind(&f, true).unwrap();
+        assert!(f.is_dir(), "a folder where a folder belongs was touched");
+        replace_wrong_kind(&f, false).unwrap();
+        assert!(!f.exists(), "the empty folder was left where a file belongs");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(replace_wrong_kind(&f, true).is_err(), "a file with content was replaced");
+        std::fs::remove_file(&f).unwrap();
+        std::os::unix::fs::symlink("/", &f).unwrap();
+        assert!(replace_wrong_kind(&f, true).is_err(), "a symlink was accepted");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     const SAMPLE: &str = "\
 /dev/gpt/atrium-root / ufs rw 1 1

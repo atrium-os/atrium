@@ -62,9 +62,9 @@ vm)
     ;;
 n0)
     CROSS_RUSTFLAGS=$(set -- env; . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
-    (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease -p atrium-netconf >&2)
+    (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease -p atrium-netconf -p atrium-mdns >&2)
     R="$ROOT/atrium-net/target/$T/release"
-    tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
+    { cp "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$R/"; tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl atrium-mdns unbound-atrium-local.conf; } | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
 
     pkill -f atrium-net/sim/lan.py 2>/dev/null || true
     python3 "$ROOT/atrium-net/sim/lan.py" "$LEASE_S" > "$LAN_LOG" 2>&1 &
@@ -87,12 +87,14 @@ n0)
         if [ ! -f /var/unbound/unbound.conf ]; then local-unbound-setup >/dev/null; fi
         mkdir -p /var/unbound/conf.d
         printf 'server:\n    local-zone: \"test.\" nodefault\n    domain-insecure: \"atrium.test\"\n' > /var/unbound/conf.d/atrium-test.conf
+        cp /tmp/atrium-net/unbound-atrium-local.conf /var/unbound/conf.d/atrium-local.conf
+        id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
         sysrc local_unbound_enable=YES >/dev/null
         service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
         cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
         printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
         route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > /tmp/atrium-net/default.saved
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock
         sleep 1"
 
     wait_addr 10.88.0.50 120 && ok "DHCPv4 through atrium-lease: vtnet1 has 10.88.0.50" || fail "no address (have: $(addrs))"
@@ -168,7 +170,7 @@ n0)
     # id. A fresh atrium-net so the client is soliciting again.
     lanctl d6-hostile >/dev/null
     "$V" 'pkill -f "atrium-net -v"; sleep 1
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
     bad=""
     i=0
     while [ $i -lt 120 ] && [ "$(stat d6_hostile_sent)" -lt 60 ]; do
@@ -186,7 +188,7 @@ n0)
     # clean so the good server has to give the address again.)
     lanctl d6-addr >/dev/null
     "$V" 'pkill -f "atrium-net -v"; sleep 1; ifconfig vtnet1 inet6 fd77:0:0:88::1:50 -alias 2>/dev/null
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
     i=0; while [ $i -lt 60 ] && ! has6; do sleep 3; i=$((i + 3)); done
     has6 && ok "good server again: DHCPv6 address back" || fail "no DHCPv6 recovery"
     lanctl d6-off >/dev/null
@@ -243,6 +245,42 @@ n0)
     "$V" 'pgrep -x atrium-netconf >/dev/null && pgrep -f "atrium-net -v" >/dev/null' && [ "${n:-0}" -ge 100 ] \
         && ok "a flood of hostile answers ($(stat mdns_answer) sent) reaches only the socket ($n datagrams); atrium-net and atrium-netconf untouched" || fail "flood: n=$n"
     lanctl mdns-off >/dev/null
+
+    # .local names (§6.1): unbound's stub zone -> atrium-mdns -> one mDNS
+    # question on vtnet1; answers checked in the sandbox.
+    i=0; until "$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep -q 'name=vtnet1 .*mdns=1'; do i=$((i + 1)); [ $i -lt 20 ] || fail "atrium-mdns not running: $("$V" 'tail -n 20 /tmp/atrium-net/net.log')"; sleep 1; done
+    mp=$("$V" 'pgrep -x atrium-mdns')
+    u=$("$V" "ps -o user= -p $mp" | tr -d ' ')
+    capmode "$mp" && [ "$u" = _atrium-mdns ] && ok "atrium-mdns on vtnet1, $u in capability mode" || fail "atrium-mdns: user $u"
+    look() { "$V" "drill $1 A @127.0.0.1" 2>&1 || true; }
+    a0=$(stat mdns_a)
+    r=$(look gatebox.local)
+    echo "$r" | grep -qE '^gatebox\.local\.[[:space:]]+[0-9]+[[:space:]]+IN[[:space:]]+A[[:space:]]+10\.88\.0\.77' && [ "$(stat mdns_a)" -gt "$a0" ] \
+        && ok "gatebox.local = 10.88.0.77 through unbound and one mDNS question" || fail "gatebox.local: $r $("$V" 'tail -n 5 /tmp/atrium-net/net.log')"
+    a1=$(stat mdns_a)
+    r=$(look gatebox.local)
+    echo "$r" | grep -q '10\.88\.0\.77' && [ "$(stat mdns_a)" = "$a1" ] && ok "asked again: from unbound's cache, nothing on the link" || fail "cache: $r"
+    for h in evil loopy nothere; do
+        r=$(look $h.local)
+        echo "$r" | grep -q 'rcode: NXDOMAIN' && ! echo "$r" | grep -qE 'IN[[:space:]]+A[[:space:]]' || fail "$h.local: $r"
+    done
+    ok "evil.local (8.8.8.8, 127.0.0.1, broadcast), loopy.local (pointer loop), nothere.local: NXDOMAIN"
+    # AAAA (§6.1 L3): asked over the same IPv4 socket; only addresses in
+    # vtnet1's /64s count.
+    "$V" 'grep "atrium-mdns: .local on vtnet1" /tmp/atrium-net/net.log | tail -n 1' | grep -q 'fd77:0:0:88::/64' \
+        || fail "atrium-mdns without the IPv6 prefix: $("$V" 'grep atrium-mdns /tmp/atrium-net/net.log | tail -n 3')"
+    a0=$(stat mdns_a)
+    r=$("$V" 'drill gatebox.local AAAA @127.0.0.1' 2>&1 || true)
+    echo "$r" | grep -qE '^gatebox\.local\.[[:space:]]+[0-9]+[[:space:]]+IN[[:space:]]+AAAA[[:space:]]+fd77:0:0:88::77' && [ "$(stat mdns_a)" -gt "$a0" ] \
+        && ok "gatebox.local AAAA = fd77:0:0:88::77 (prefix from SLAAC)" || fail "gatebox.local AAAA: $r"
+    r=$("$V" 'drill evil.local AAAA @127.0.0.1' 2>&1 || true)
+    echo "$r" | grep -q 'rcode: NOERROR' && ! echo "$r" | grep -qE 'IN[[:space:]]+AAAA[[:space:]]' \
+        && ok "evil.local AAAA (::1, 2001:db8::1, fe80::1, the prefix's anycast): no address" || fail "evil.local AAAA: $r"
+    r=$("$V" 'getent hosts gatebox.local' 2>&1 || true)
+    echo "$r" | grep -qE '^(10\.88\.0\.77|fd77:0:0:88::77)[[:space:]]' && ok "programs resolve it too: getent hosts gatebox.local = $r" || fail "getent: $r"
+    "$V" "kill -9 $mp"
+    i=0; until [ -n "$("$V" 'pgrep -x atrium-mdns' || true)" ] && "$V" 'local-unbound-control flush gatebox.local >/dev/null; local-unbound-control flush_bogus >/dev/null; local-unbound-control flush_negative >/dev/null' && look gatebox.local | grep -q 10.88.0.77; do i=$((i + 1)); [ $i -lt 30 ] || fail "atrium-mdns not back"; sleep 1; done
+    ok "atrium-mdns killed: started again (${i} s), atrium-net running"
     u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
     capmode "$("$V" 'pgrep -x atrium-netconf')" && [ "$u" = _atrium-netconf ] && ok "atrium-netconf still $u in capability mode" || fail "netconf: $u"
 
@@ -253,7 +291,7 @@ n0)
     # Hostile server: restart atrium-net into a LAN that sends bad leases.
     lanctl hostile >/dev/null
     "$V" 'pkill -f "atrium-net -v"; sleep 1; for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
     bad=""
     i=0
     while [ $i -lt 300 ] && [ "$(stat hostile_sent)" -lt 34 ]; do
@@ -285,7 +323,7 @@ n0)
     lanctl conflict >/dev/null
     "$V" 'pkill -f "atrium-net -v"; sleep 1; for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
         arp -d 10.88.0.50 >/dev/null 2>&1
-        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --sock /tmp/atrium-net/ctl.sock'
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
     bad=""; i=0
     while [ $i -lt 60 ]; do
         a=$(addrs)

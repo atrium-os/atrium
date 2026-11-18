@@ -19,9 +19,11 @@ name = "scroll_cost"
 path = "examples/scroll_cost.rs"
 
 [dependencies]
+atrium-open = { path = "../atrium-open" }
 officina-core = { path = "../officina-core" }
 officina-grid = { path = "../officina-grid" }
-officina-convert = { path = "../officina-convert" }
+# Writers, protection and the launcher: the readers run in the convert worker.
+officina-convert = { path = "../officina-convert", default-features = false }
 officina-draw = { path = "../officina-draw" }
 pergola = { path = "../pergola" }
 limen = { path = "../limen" }
@@ -29,4 +31,16 @@ fresco-protocol = { path = "../fresco-protocol" }
 libc = "0.2"
 
 [profile.release]
+# What ships in the bundle: no debug info, symbols stripped.
+strip = true
+
+# `--profile profiling`: release code with line tables, for perf and the
+# stall probes.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
+
+[dev-dependencies]
+# Tests make foreign sample files with the readers' crate.
+officina-convert = { path = "../officina-convert", features = ["read"] }

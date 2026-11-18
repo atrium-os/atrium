@@ -14,20 +14,28 @@ path = "src/lib.rs"
 name = "atrium-slides"
 path = "src/bin/atrium_slides.rs"
 
+[features]
+local-decode = ["dep:navigator-image"]
+
 [dependencies]
+atrium-open = { path = "../atrium-open" }
 officina-core = { path = "../officina-core" }
-officina-convert = { path = "../officina-convert" }
+# Writers, protection and the launcher: the readers run in the convert worker.
+officina-convert = { path = "../officina-convert", default-features = false }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
-navigator-image = { path = "../navigator-image", features = ["office"] }
+# Pictures are decoded in the convert worker (officina_convert::pictures);
+# `local-decode` decodes them here instead (benchmarks, tests).
+navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
 pergola = { path = "../pergola" }
-pergola-document = { path = "../pergola-document" }
+pergola-document = { path = "../pergola-document", default-features = false }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
 limen = { path = "../limen" }
 libc = "0.2"
 jpeg-encoder = "0.7.1"
-png = "0.17"
+# Previews saved as PNG are deflated here (decode::encode_png).
+miniz_oxide = "0.8"
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch.
@@ -35,4 +43,23 @@ png = "0.17"
 pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
+# What ships in the bundle: no debug info, symbols stripped.
+strip = true
+
+# `--profile profiling`: release code with line tables, for perf and the
+# stall probes.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
+
+[dev-dependencies]
+png = "0.17"
+navigator-image = { path = "../navigator-image", features = ["office"] }
+# Tests make foreign sample files with the readers' crate.
+officina-convert = { path = "../officina-convert", features = ["read"] }
+
+# Decodes pictures in its own process: `--features local-decode`.
+[[example]]
+name = "big_deck"
+required-features = ["local-decode"]

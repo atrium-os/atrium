@@ -143,6 +143,7 @@ dependencies = [
  "arcad",
  "libc",
  "navigator-fetch",
+ "ring",
  "rustls",
  "rustls-pki-types",
 ]
@@ -176,6 +177,7 @@ name = "arcad"
 version = "0.1.0"
 dependencies = [
  "arca-store",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom",
  "libc",
@@ -220,6 +222,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-links"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "url",
+]
+
+[[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
 
@@ -245,6 +255,10 @@ version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-runtime"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-types"
 version = "0.1.0"
 
 [[package]]
@@ -1386,6 +1400,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-fontset"
+version = "0.1.0"
+dependencies = [
+ "navigator-fonts",
+ "ttf-parser",
+]
+
+[[package]]
 name = "navigator-image"
 version = "0.1.0"
 dependencies = [
@@ -1422,6 +1444,7 @@ dependencies = [
  "icu_segmenter",
  "navigator-dom",
  "navigator-fonts",
+ "navigator-fontset",
  "navigator-style",
  "navigator-svg",
  "pulldown-cmark",
@@ -1754,7 +1777,10 @@ dependencies = [
 name = "portcullis-policy"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
+ "atrium-types",
  "hex",
+ "portcullis-peer",
  "portcullis-toml",
  "serde",
  "sha2",
@@ -1765,6 +1791,8 @@ dependencies = [
 name = "portcullis-toml"
 version = "0.1.0"
 dependencies = [
+ "atrium-links",
+ "atrium-types",
  "serde",
  "thiserror 1.0.69",
  "toml",

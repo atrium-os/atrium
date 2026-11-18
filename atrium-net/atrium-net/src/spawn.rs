@@ -86,7 +86,7 @@ impl Spawner {
 
     /// Start program `kind`; our end of its socket.
     pub fn spawn(&self, kind: u8) -> io::Result<UnixStream> {
-        assert!(kind != b'M');
+        assert!(!matches!(kind, b'M' | b'S' | b'U'));
         let mut v = self.ask(&[kind], 1, "spawner could not start it")?;
         Ok(UnixStream::from(v.remove(0)))
     }
@@ -102,6 +102,28 @@ impl Spawner {
         let mut v = self.ask(&req, 2, "spawner could not make the mDNS sockets")?;
         let send = v.pop().unwrap();
         Ok((v.pop().unwrap(), send))
+    }
+
+    /// atrium-mdns's pair (spec §6.1): like [`Spawner::mdns4`] but on a
+    /// port of its own instead of 5353, so answers come back unicast to it
+    /// (one-shot "legacy" queries, RFC 6762 §5.1) and never compete with
+    /// printer discovery for 5353 (FreeBSD hands a unicast datagram to one
+    /// socket only, and refuses two sockets connected the same way).
+    /// Receive: bound 0.0.0.0:P, no group; send: bound P, connected.
+    pub fn oneshot4(&self, addr: Ipv4Addr) -> io::Result<(OwnedFd, OwnedFd)> {
+        let mut req = vec![b'U'];
+        req.extend_from_slice(&addr.octets());
+        let mut v = self.ask(&req, 2, "spawner could not make the one-shot mDNS sockets")?;
+        let send = v.pop().unwrap();
+        Ok((v.pop().unwrap(), send))
+    }
+
+    /// A TCP listener on 127.0.0.1:`port` (unbound's stub zone for
+    /// `.local` talks to atrium-mdns over it; spec §6.1).
+    pub fn stub_listener(&self, port: u16) -> io::Result<OwnedFd> {
+        let mut req = vec![b'S'];
+        req.extend_from_slice(&port.to_be_bytes());
+        Ok(self.ask(&req, 1, "spawner could not make the stub listener")?.remove(0))
     }
 
     fn ask(&self, req: &[u8], want: usize, why: &str) -> io::Result<Vec<OwnedFd>> {
@@ -150,11 +172,47 @@ fn sin(a: [u8; 4], port: u16) -> libc::sockaddr_in {
     x
 }
 
+fn stub_listener(port: u16) -> io::Result<OwnedFd> {
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if s < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let s = unsafe { OwnedFd::from_raw_fd(s) };
+    let one: libc::c_int = 1;
+    sockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, &one)?;
+    let a = sin([127, 0, 0, 1], port);
+    if unsafe { libc::bind(s.as_raw_fd(), (&a as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as _) } != 0
+        || unsafe { libc::listen(s.as_raw_fd(), 16) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(s)
+}
+
 const MDNS_GROUP: [u8; 4] = [224, 0, 0, 251];
 const MDNS_PORT: u16 = 5353;
 
 /// One of the two mDNS sockets (in the spawner, before any capability mode).
-fn mdns_socket(ifaddr: [u8; 4], send: bool) -> io::Result<OwnedFd> {
+/// A port nobody uses now (the kernel's pick for a socket bound to 0).
+fn free_port() -> io::Result<u16> {
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if s < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let s = unsafe { OwnedFd::from_raw_fd(s) };
+    let a = sin([0; 4], 0);
+    if unsafe { libc::bind(s.as_raw_fd(), (&a as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as _) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut b: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut n = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    if unsafe { libc::getsockname(s.as_raw_fd(), (&mut b as *mut libc::sockaddr_in).cast(), &mut n) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u16::from_be(b.sin_port))
+}
+
+fn mdns_socket(ifaddr: [u8; 4], send: bool, port: u16, join: bool) -> io::Result<OwnedFd> {
     let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if s < 0 {
         return Err(io::Error::last_os_error());
@@ -164,7 +222,7 @@ fn mdns_socket(ifaddr: [u8; 4], send: bool) -> io::Result<OwnedFd> {
     let one: libc::c_int = 1;
     sockopt(f, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one)?;
     sockopt(f, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one)?;
-    let any = sin([0; 4], MDNS_PORT);
+    let any = sin([0; 4], port);
     if unsafe { libc::bind(f, (&any as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as _) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -179,14 +237,14 @@ fn mdns_socket(ifaddr: [u8; 4], send: bool) -> io::Result<OwnedFd> {
         if unsafe { libc::connect(f, (&g as *const libc::sockaddr_in).cast(), std::mem::size_of::<libc::sockaddr_in>() as _) } != 0 {
             return Err(io::Error::last_os_error());
         }
-    } else {
+    } else if join {
         let m = libc::ip_mreq { imr_multiaddr: libc::in_addr { s_addr: u32::from_ne_bytes(MDNS_GROUP) }, imr_interface: ifa };
         sockopt(f, libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP, &m)?;
         // FreeBSD shuts an unconnected datagram socket's sending side and
         // still says ENOTCONN; Linux only says ENOTCONN (host tests).
-        if unsafe { libc::shutdown(f, libc::SHUT_WR) } != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOTCONN) {
-            return Err(io::Error::last_os_error());
-        }
+    }
+    if !send && unsafe { libc::shutdown(f, libc::SHUT_WR) } != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ENOTCONN) {
+        return Err(io::Error::last_os_error());
     }
     Ok(s)
 }
@@ -201,16 +259,34 @@ fn serve(s: RawFd, progs: &[Prog]) -> ! {
         if n != 1 {
             continue;
         }
-        if k == b'M' {
+        if k == b'M' || k == b'U' {
             let mut a = [0u8; 4];
             if !read_exact(s, &mut a) {
                 unsafe { libc::_exit(0) };
             }
-            match (mdns_socket(a, false), mdns_socket(a, true)) {
-                (Ok(r), Ok(w)) => {
+            let port = if k == b'M' { Ok(MDNS_PORT) } else { free_port() };
+            let pair = port.and_then(|p| Ok((mdns_socket(a, false, p, k == b'M')?, p))).and_then(|(r, p)| Ok((r, mdns_socket(a, true, p, false)?)));
+            match pair {
+                Ok((r, w)) => {
                     let _ = send_fds(s, b'K', &[r.as_raw_fd(), w.as_raw_fd()]);
                 }
-                _ => {
+                Err(e) => {
+                    eprintln!("atrium-net spawner: mDNS sockets: {e}");
+                    let _ = send_fd(s, b'E', None);
+                }
+            }
+            continue;
+        }
+        if k == b'S' {
+            let mut p = [0u8; 2];
+            if !read_exact(s, &mut p) {
+                unsafe { libc::_exit(0) };
+            }
+            match stub_listener(u16::from_be_bytes(p)) {
+                Ok(l) => {
+                    let _ = send_fds(s, b'K', &[l.as_raw_fd()]);
+                }
+                Err(_) => {
                     let _ = send_fd(s, b'E', None);
                 }
             }
@@ -397,6 +473,28 @@ mod tests {
         assert!(sp.mdns4(*a.ip()).is_ok());
         assert!(sp.mdns4(Ipv4Addr::new(192, 0, 2, 99)).is_err());
         assert!(sp.mdns4(*a.ip()).is_ok());
+        // The one-shot pair: its own port, both sockets on it, alongside.
+        let (r2, w2) = sp.oneshot4(*a.ip()).unwrap();
+        let (r2, w2) = (UdpSocket::from(r2), UdpSocket::from(w2));
+        let p = r2.local_addr().unwrap().port();
+        assert!(p != 5353 && w2.local_addr().unwrap().port() == p);
+        assert_eq!(w2.peer_addr().unwrap(), "224.0.0.251:5353".parse().unwrap());
+        // An answer sent to that port lands on the receive socket.
+        let other = UdpSocket::bind("0.0.0.0:0").unwrap();
+        other.send_to(b"answer", (*a.ip(), p)).unwrap();
+        r2.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let mut b = [0u8; 16];
+        assert_eq!(r2.recv(&mut b).unwrap(), 6);
+    }
+
+    #[test]
+    fn stub_listener() {
+        let sp = Spawner::start(&[]).unwrap();
+        let l = std::net::TcpListener::from(sp.stub_listener(0).unwrap());
+        let a = l.local_addr().unwrap();
+        assert!(a.ip().is_loopback() && a.port() != 0);
+        let _c = std::net::TcpStream::connect(a).unwrap();
+        assert!(l.accept().is_ok());
     }
 
     #[test]

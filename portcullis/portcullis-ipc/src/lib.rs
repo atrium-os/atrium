@@ -412,6 +412,24 @@ pub enum Request {
         app:        Option<String>,
         activation: [u8; 16],
     },
+    /// ★ Settings' Personas section (personas.md §6): the person's named
+    /// personas and which crossing switches are on. `app-grants` only,
+    /// about the person that app belongs to. Answer: `Crossings`.
+    Crossings,
+    /// ★ Turn one crossing switch on or off: `from` may send `kind`
+    /// (`links`, `files`, `clipboard`) to `to`, personas by name
+    /// (`personal` for Personal). `app-grants` only, with `activation`, a
+    /// press in the asking app's window that portcullisd spends with
+    /// frescod (purpose APPROVE); turning one on then needs the person's
+    /// verification on Sigillum's sheet (`VERIFY_USER`), so a moment at an
+    /// unlocked machine can't open a path. Answer: `Ok`.
+    SetCrossing {
+        from:       String,
+        to:         String,
+        kind:       String,
+        on:         bool,
+        activation: [u8; 16],
+    },
 
     /// The person's workspaces (homes.md §5), Scratch made at the first
     /// ask. Asked by a launcher or by the person (not an app). Answer:
@@ -461,6 +479,18 @@ pub enum Request {
     /// From an app, only with `activation`, a press on Run (purpose
     /// LAUNCH); the person's own CLI needs none. Answer: `WorkspaceRan`.
     WorkspaceRun { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// Run under the debugger (dev-tools.md §7.2, dev-tools-plan.md M10):
+    /// as `WorkspaceRun`, but the dev app starts under `lldb-server` in its
+    /// own jail once a debugger connects to `address` (on the workspace's
+    /// own loopback, from inside it: `gdb-remote <address>`). Only dev
+    /// builds: installed apps are never debuggable (D9). Answer:
+    /// `WorkspaceDebugging`.
+    WorkspaceDebug { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// Move the cores the workspace's dev builds left in their own overlays
+    /// into its `work/.atrium/cores/` (dev-tools.md §7.2), as
+    /// `<app id>.<core name>`. Answer: `WorkspaceCores`, the copies' paths
+    /// relative to `work`.
+    WorkspaceCores { name: String },
     /// An IDE (`workspace-exec`, homes.md §5.3, W6) is given workspace
     /// `name`: only with `activation`, a press in the IDE's window that
     /// portcullisd spends with frescod (purpose APPROVE). Its `work` is then
@@ -572,6 +602,17 @@ pub struct PersonaChoice {
     #[serde(default)]
     pub also: Vec<LinkChoice>,
 }
+
+/// One crossing switch that is on: `from` may send `kind` to `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossingSwitch {
+    pub from: String,
+    pub to:   String,
+    pub kind: String,
+}
+
+/// The kinds a crossing switch names in Settings (personas.md §6).
+pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files"];
 
 /// A link scheme in Settings' Links section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,12 +737,22 @@ pub enum Response {
     LinkDelivered { app: String },
     /// Links → each scheme an app takes, by scheme.
     Links { schemes: Vec<LinkScheme> },
+    /// Crossings → the person's named personas (by name, with colour) and
+    /// the switches that are on.
+    Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.
     WorkspaceRan { app_id: String, capabilities: Vec<String> },
+    /// A Run under the debugger: the dev app starts when a debugger in the
+    /// workspace connects to `address` (`127.0.0.1:<port>`). `program` is
+    /// the path the app runs from, which the workspace sees too: the
+    /// debugger's target (`lldb <program> -o 'gdb-remote <address>'`).
+    WorkspaceDebugging { app_id: String, capabilities: Vec<String>, address: String, #[serde(default)] program: String },
+    /// The cores copied, relative to the workspace's `work`.
+    WorkspaceCores { files: Vec<String> },
     /// A `WorkspaceExec` started (pid in the workspace's jail); three
     /// descriptors follow.
     WorkspaceExecStarted { pid: i32 },

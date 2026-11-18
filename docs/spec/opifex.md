@@ -109,7 +109,7 @@ The specs disagree. This spec picks:
 |---|---|---|
 | CJK fonts on demand, colour emoji (fonts thread) | `kind = "font"` packages, a coverage field to find the right one, a pin list the font library trusts | §8.1 |
 | `atrium-app://` for apps not installed (Monstrator L5) | look up an app id, then the install sheet | §7.1, §9 |
-| Navigator's app prompt | a pre-install query: publisher and capabilities for an id, no network | §7.1 |
+| Navigator's app prompt | a pre-install query: publisher and capabilities for an id, no network (built 2026-11-18 on `Describe`, navigator-ui.md §6.4) | §7.1 |
 | Driver lookup (device-assignment §4.7, decision 16) | every driver package's `devices.d` matches in the local catalog; install through the trusted sheet | §8.2 |
 | Firmware (device-assignment §4.4, wifi) | `kind = "firmware"`, platform-signed | §8.2 |
 | Toolchain layers (toolchains thread) | `kind = "layer"`, platform key only, the layer contract that thread defines | §8.3 |
@@ -553,6 +553,25 @@ to run themselves; Atrium runs nothing for them.
 The catalog accepts any licence, shown on the sheet as SPDX. The base system's no-GPL rule is
 about the base, which never depends on a catalog package. Platform-published packages follow
 the base rule except dev layers, which dev-tools already allows to carry GPL tools.
+
+### 10.4 Built elsewhere, signed here
+
+The platform key never needs to be on the machine that builds. The signature covers only
+`atrium.toml`, which names the archive's contents by the hash of `content.index`, so a remote
+or cloud builder packs unsigned and the key holder signs the manifests alone, without the
+archives:
+
+- on the builder: `opifex sign --list <dir>…` prints `id version content-hash` per package;
+- a second, independent build (another machine or CI runner) prints its own list;
+- locally: `opifex sign <dir>… --key platform.key --expect list.txt` reads every manifest
+  first, refuses all of them if any id, version or content hash differs from the list, then
+  signs each `atrium.toml` (a token key file asks for the PIN once) and writes
+  `atrium.toml.sig` next to it, checked against the key's public key;
+- the `.sig` files go back to the builder, which publishes.
+
+Only the few-KB manifests travel to the key, and the `--expect` list makes two builds agree
+before anything is signed (a reproducible-build check). The platform key sits on its own
+token, separate from the three root tokens.
 
 ## 11. Updates
 

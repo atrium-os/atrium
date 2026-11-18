@@ -371,11 +371,13 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
     if w == Want::Refresh && refreshing.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Turning a crossing on waits for the person on Sigillum's sheet.
+    let wait = Duration::from_secs(if matches!(w, Want::SetCrossing { on: true, .. }) { 11 * 60 } else { 10 });
     std::thread::spawn(move || {
         let ask = |req: &Request| -> Result<Response, String> {
             let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
             let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
-            s.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+            s.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
             match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
                 Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
                 Ok(other) => return Err(format!("portcullisd: {other:?}")),
@@ -404,8 +406,25 @@ fn apps_work(w: curia::apps::Want, tx: Sender<curia::apps::Got>, refreshing: Arc
                     Ok(other) => Err(format!("unexpected reply: {other:?}")),
                     Err(e) => Err(e),
                 };
+                let _ = tx.send(Got::Links(l));
+                let c = match ask(&Request::Crossings) {
+                    Ok(Response::Crossings { personas, on }) => Ok((personas, on)),
+                    Ok(Response::Error { message }) => Err(message),
+                    Ok(other) => Err(format!("unexpected reply: {other:?}")),
+                    Err(e) => Err(e),
+                };
                 refreshing.store(false, Ordering::SeqCst);
-                Got::Links(l)
+                Got::Crossings(c)
+            }
+            Want::SetCrossing { switch, on, activation } => {
+                let req = Request::SetCrossing { from: switch.from.clone(), to: switch.to.clone(), kind: switch.kind.clone(), on, activation };
+                let r = done(ask(&req));
+                let words = curia::apps::crossing_words(&switch);
+                match &r {
+                    Ok(()) => eprintln!("curia: {words}: {}", if on { "on" } else { "off" }),
+                    Err(e) => eprintln!("curia: {words}: {e}"),
+                }
+                Got::CrossingDone { switch, result: r }
             }
             Want::SetLink { scheme, app, activation } => {
                 let r = done(ask(&Request::SetLinkDefault { scheme: scheme.clone(), app: app.clone(), activation }));

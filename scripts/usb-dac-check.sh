@@ -43,7 +43,7 @@ else
     # shellcheck disable=SC1091
     . "$ROOT/scripts/cloud-vm.sh" env
     for c in lyra choragus; do
-        (cd "$ROOT/$c" && RUSTFLAGS="${CROSS_RUSTFLAGS:-}" cargo +nightly build --quiet --target "$TARGET" \
+        (cd "$ROOT/$c" && RUSTFLAGS="${CROSS_RUSTFLAGS:-}" cargo build --quiet --target "$TARGET" \
             -Z build-std=std,panic_abort --bins --release) || die "$c cross-build"
     done
     SRC=""

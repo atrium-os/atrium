@@ -115,6 +115,40 @@ pub struct ComposeUi {
     pub want_attach: bool,
     /// The picker is up, over the window.
     pub attaching: bool,
+    /// The suggestion picked with the arrows, for what was typed (§14.2).
+    pub pick: (String, usize),
+    /// Suggestions put away with Escape, for what was typed.
+    pub dismissed: Option<String>,
+}
+
+/// Suggestions under a recipient field (§14.2): the field (0 To, 1 Cc,
+/// 2 Bcc), the address being typed as its key, and who it could be.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completing {
+    pub field: Option<usize>,
+    pub key: String,
+    pub people: Vec<mail_store::people::Person>,
+}
+
+/// Suggestions shown at most.
+pub const SUGGESTIONS: usize = 5;
+
+/// The address being typed at the end of a recipient field: where it
+/// starts, and it (trimmed). None when it is empty or already complete
+/// (`Name <addr>`).
+pub fn typing(text: &str) -> Option<(usize, &str)> {
+    let (mut start, mut quoted, mut angle) = (0, false, false);
+    for (i, c) in text.char_indices() {
+        match c {
+            '"' if !angle => quoted = !quoted,
+            '<' if !quoted => angle = true,
+            '>' if !quoted => angle = false,
+            ',' | ';' if !quoted && !angle => start = i + 1,
+            _ => {}
+        }
+    }
+    let t = text[start..].trim();
+    (!t.is_empty() && !t.contains(['<', '>'])).then_some((start, t))
 }
 
 /// The picker's slot in a compose window, while files are attached.
@@ -210,6 +244,8 @@ pub struct Composer {
     /// How to sign as an address (the app's Sigillum ceremony), when this
     /// person can sign at all.
     pub signer: Rc<RefCell<Option<SignWith>>>,
+    /// The suggestions showing, as last drawn.
+    pub completing: Rc<RefCell<Completing>>,
 }
 
 /// Makes a signer for a From address: the token's certificate and a
@@ -254,6 +290,7 @@ impl Composer {
             saved: Rc::new(RefCell::new((d.clone(), t))),
             now: Rc::new(now),
             signer: Rc::default(),
+            completing: Rc::default(),
             rich: Rc::default(),
             original: Rc::new(RefCell::new(c.original.clone().map(Rc::new))),
         };
@@ -595,6 +632,73 @@ impl Composer {
         }
     }
 
+    fn address_field(&self, i: usize) -> Option<&Mutable<TextEdit>> {
+        [&self.to, &self.cc, &self.bcc].get(i).copied()
+    }
+
+    /// Who the address being typed in recipient field `field` could be,
+    /// from the address book; nothing while the caret isn't at the end, or
+    /// after Escape. Kept as [`Composer::completing`].
+    pub fn suggest(&self, field: Option<usize>) -> Completing {
+        let typed = field.and_then(|f| {
+            let e = self.address_field(f)?.get_cloned();
+            let (_, t) = typing(e.text())?;
+            (e.caret() == e.text().len() && e.selection().is_empty()).then(|| t.to_string())
+        });
+        let mut c = self.completing.borrow_mut();
+        let Some(typed) = typed.filter(|t| self.ui.get_cloned().dismissed.as_deref() != Some(t.as_str())) else {
+            *c = Completing::default();
+            return c.clone();
+        };
+        if c.field != field || c.key != typed {
+            let people = self.engine.complete(&typed, SUGGESTIONS).unwrap_or_default();
+            // Nothing to add when the one suggestion is what was typed.
+            let people = if people.len() == 1 && people[0].addr.eq_ignore_ascii_case(&typed) { Vec::new() } else { people };
+            *c = Completing { field, key: typed, people };
+        }
+        c.clone()
+    }
+
+    /// The suggestion picked with the arrows.
+    pub fn picked(&self) -> usize {
+        let c = self.completing.borrow();
+        let (key, i) = self.ui.get_cloned().pick;
+        if key == c.key { i.min(c.people.len().saturating_sub(1)) } else { 0 }
+    }
+
+    /// Put `person` in place of the address being typed in `field`, and a
+    /// comma for the next.
+    pub fn accept(&self, field: usize, person: &mail_store::people::Person) {
+        let Some(f) = self.address_field(field) else { return };
+        let mut e = f.get_cloned();
+        let text = e.text().to_string();
+        let start = typing(&text).map_or(text.len(), |(s, _)| s);
+        let lead = if start == 0 { "" } else { " " };
+        e.set_text(&format!("{}{lead}{}, ", &text[..start], format_list(&[Mailbox::new(&person.name, &person.addr)])));
+        f.set(e);
+        *self.completing.borrow_mut() = Completing::default();
+    }
+
+    /// The suggestions' keys: arrows pick, Enter or Tab takes, Escape puts
+    /// them away. True when taken.
+    fn completion_key(&self, key: &Key) -> bool {
+        let c = self.completing.borrow().clone();
+        let Some(field) = c.field.filter(|_| !c.people.is_empty()) else { return false };
+        let n = c.people.len();
+        let i = self.picked();
+        match key {
+            Key::Down => self.ui.update(|u| u.pick = (c.key.clone(), (i + 1) % n)),
+            Key::Up => self.ui.update(|u| u.pick = (c.key.clone(), (i + n - 1) % n)),
+            Key::Enter | Key::Tab => self.accept(field, &c.people[i]),
+            Key::Escape => {
+                self.ui.update(|u| u.dismissed = Some(c.key.clone()));
+                *self.completing.borrow_mut() = Completing::default();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// The window's own keys: Ctrl+Enter sends (with the key's
     /// activation), Escape closes the Send later choices. True when taken.
     pub fn key(&self, ev: &Event, activation: Option<[u8; 16]>) -> bool {
@@ -611,6 +715,7 @@ impl Composer {
                 self.ui.update(|u| u.later = false);
                 true
             }
+            k if !modifiers.ctrl && !modifiers.meta && !modifiers.alt && !modifiers.shift => self.completion_key(k),
             _ => false,
         }
     }
@@ -785,11 +890,15 @@ impl View for ComposeView {
             fields.push(("Bcc", &self.c.bcc));
         }
         fields.push(("Subject", &self.c.subject));
+        let mut slots: Vec<(usize, pergola::node::NodeId, Rect)> = Vec::new();
         for (i, (label, state)) in fields.into_iter().enumerate() {
             line(ctx, 16.0, y + row_h / 2.0, label, type_size::SM, Weight::Regular, t.text_secondary());
             let fy = y + (row_h - pergola::theme::size::input_height()) / 2.0;
             let f = TextField::new(state.clone()).at(16.0 + label_w, fy).width(field_w).autofocus(i == 0 && state.get_cloned().text().is_empty());
-            ctx.place(f);
+            let slot = ctx.place(f);
+            if let Some(n) = ["To", "Cc", "Bcc"].iter().position(|l| *l == label) {
+                slots.push((n, slot, Rect::new(16.0 + label_w, fy, field_w, pergola::theme::size::input_height())));
+            }
             if label == "Cc" && !ui.show_bcc {
                 let c = self.c.clone();
                 let lw = em(40.0);
@@ -885,6 +994,50 @@ impl View for ComposeView {
         if let Some(s) = &ui.status {
             line(ctx, 16.0, h - em(14.0), s, type_size::XS, Weight::Regular, t.text_tertiary());
         }
+        // Who the address being typed could be, under its field (§14.2):
+        // drawn once the fields are, so the focused one is known.
+        let c = self.c.clone();
+        ctx.overlay(move |ctx| {
+            let t = ctx.theme;
+            let under = |mut n: Option<pergola::node::NodeId>, slot| {
+                while let Some(id) = n {
+                    if id == slot {
+                        return true;
+                    }
+                    n = ctx.tree.parent_of(id);
+                }
+                false
+            };
+            let focused = slots.iter().find(|(_, slot, _)| under(ctx.state.focused, *slot)).copied();
+            let shown = c.suggest(focused.map(|(f, _, _)| f));
+            let (Some((field, _, r)), false) = (focused, shown.people.is_empty()) else { return };
+            let picked = c.picked();
+            let ih = em(40.0);
+            let (mx, my, mw) = (r.x(), r.y() + r.h() + em(2.0), r.w().min(em(420.0)));
+            let mh = ih * shown.people.len() as f32;
+            ctx.add(Node::Rect { rect: Rect::new(mx - 1.0, my - 1.0, mw + 2.0, mh + 2.0), fill: t.border_default(), radius: 6.0 });
+            ctx.add(Node::Rect { rect: Rect::new(mx, my, mw, mh), fill: t.bg_window(), radius: 6.0 });
+            for (i, p) in shown.people.iter().enumerate() {
+                let row = Rect::new(mx, my + ih * i as f32, mw, ih);
+                let id = ctx.push(Node::Rect { rect: row, fill: if i == picked { t.state_hover() } else { Color::TRANSPARENT }, radius: 6.0 });
+                if ctx.is_hovered(id) {
+                    if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                        *fill = t.state_hover();
+                    }
+                }
+                let c2 = c.clone();
+                let person = p.clone();
+                ctx.on_click(id, move || c2.accept(field, &person));
+                let (first, second) = if p.name.is_empty() { (p.addr.as_str(), "") } else { (p.name.as_str(), p.addr.as_str()) };
+                let st = sans(type_size::SM, Weight::Medium, t.text_primary());
+                ctx.add(Node::Text { rect: Rect::new(mx + em(12.0), row.y() + em(3.0), mw - em(24.0), em(19.0)), content: first.into(), style: st });
+                if !second.is_empty() {
+                    let st = sans(type_size::XS, Weight::Regular, t.text_secondary());
+                    ctx.add(Node::Text { rect: Rect::new(mx + em(12.0), row.y() + em(21.0), mw - em(24.0), em(17.0)), content: second.into(), style: st });
+                }
+                ctx.pop();
+            }
+        });
         // Send later's choices, under its button.
         if ui.later {
             let choices = later_choices((self.c.now)());

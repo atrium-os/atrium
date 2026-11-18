@@ -9,12 +9,14 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
 
 use officina_grid::addr::{col_name, CellAddr, Rect};
 use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, LegendPos, Series};
 use officina_grid::Workbook;
 
+#[cfg(feature = "read")]
 use super::read::{attr, decode_escapes, parse_ref, rels, xml, XlsxError};
 use crate::report::{Kind, Report};
 use crate::zip::Archive;
@@ -24,6 +26,7 @@ const EMU_PT: f64 = 12_700.0;
 /// Text read from a chart part, at most.
 const MAX_TEXT: usize = officina_grid::charts::MAX_TITLE;
 
+#[cfg(feature = "read")]
 /// `Sheet 1!$B$2:$B$9` → the range, on a sheet of `wb`.
 fn range(wb: &Workbook, f: &str) -> Option<Rect> {
     let f = f.trim().trim_start_matches('=');
@@ -35,6 +38,7 @@ fn range(wb: &Workbook, f: &str) -> Option<Rect> {
     Some(Rect { sheet, r0, c0, r1, c1 })
 }
 
+#[cfg(feature = "read")]
 /// Reads the charts of sheet `sheet` (its part is `part`).
 pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str, rep: &mut Report) -> Result<(), XlsxError> {
     let drawings: Vec<String> = rels(z, part)?.into_values().filter(|(t, _)| t.ends_with("/drawing")).map(|(_, p)| p).collect();
@@ -124,6 +128,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
     Ok(())
 }
 
+#[cfg(feature = "read")]
 #[derive(Default)]
 struct SerIn {
     name: Option<ChartText>,
@@ -131,6 +136,7 @@ struct SerIn {
     vals: Option<Rect>,
 }
 
+#[cfg(feature = "read")]
 /// One chart part. `None`: no group of a kind Officina draws.
 fn chart_part(wb: &Workbook, data: &[u8], anchor: Anchor, rep: &mut Report) -> Result<Option<Chart>, XlsxError> {
     let mut r = xml(data);

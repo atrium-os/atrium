@@ -52,6 +52,14 @@ pub fn validate(m: &Manifest) -> Report {
         r.errors.push("[app].entry: must be non-empty".into());
     }
 
+    if let Some(b) = &m.bundle {
+        for p in &b.extra_libs {
+            if !crate::schema::valid_extra_lib(p) {
+                r.errors.push(format!("[bundle] extra-libs {p:?}: a library's file name (`*` and `?` allowed), not a path"));
+            }
+        }
+    }
+
     /* ── [capabilities] ─────────────────────────────────────── */
 
     validate_capabilities(&m.capabilities, "[capabilities]", &mut r);
@@ -572,5 +580,26 @@ pub fn is_mime_pattern(t: &str) -> bool {
         Some((ty, "*")) => part(ty),
         Some((ty, sub)) => part(ty) && part(sub),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod extra_libs_tests {
+    use crate::schema::{glob_match, valid_extra_lib};
+
+    #[test]
+    fn extra_libs() {
+        let m = crate::Manifest::from_str("[app]\nid = \"a.b\"\nname = \"A\"\nversion = \"1\"\nentry = \"bin/a\"\n\n[bundle]\nextra-libs = [\"libvulkan.so.1\", \"libp_*.so\"]\n").unwrap();
+        assert_eq!(m.bundle.as_ref().unwrap().extra_libs, vec!["libvulkan.so.1", "libp_*.so"]);
+        assert!(crate::validate(&m).is_ok());
+        let bad = crate::Manifest::from_str("[app]\nid = \"a.b\"\nname = \"A\"\nversion = \"1\"\nentry = \"bin/a\"\n\n[bundle]\nextra-libs = [\"../../etc/x.so\"]\n").unwrap();
+        assert!(!crate::validate(&bad).is_ok());
+        for p in ["/lib/libc.so.7", "libx", ".so", "lib x.so", ""] {
+            assert!(!valid_extra_lib(p), "{p}");
+        }
+        assert!(glob_match("libp_*.so", "libp_alsa.so"));
+        assert!(glob_match("libvulkan.so.?", "libvulkan.so.1"));
+        assert!(!glob_match("libp_*.so", "libp_alsa.so.1"));
+        assert!(!glob_match("libp_*.so", "libq_alsa.so"));
     }
 }
