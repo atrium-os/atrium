@@ -160,6 +160,12 @@ rw_patterns = [
     # jail and into apps the user grants the `home` capability to.
     "/usr/home/*",
 
+    # A session component's state in the person's home
+    # (~/.atrium/state/<component>, homes.md §2; `.atrium` and `state` are
+    # root's). root's own home on dev machines, where root logs in.
+    "/usr/home/*/.atrium/state/*",
+    "/root/.atrium/state/*",
+
     # Per-user persistent state under Atrium control (db, prefs).
     "/var/db/atrium/users/*",
 ]

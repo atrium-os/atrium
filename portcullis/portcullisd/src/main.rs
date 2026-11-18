@@ -2780,6 +2780,14 @@ fn plain_segment(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b))
 }
 
+/// Homes whose `.atrium/state/<component>` jaild's policy takes as a mount
+/// source (`/usr/home/*/.atrium/state/*`, `/root/.atrium/state/*`): a
+/// person whose home is elsewhere keeps state at STATE_ROOT.
+fn home_for_state(home: &std::path::Path) -> bool {
+    let s = home.to_string_lossy();
+    s == "/root" || s.strip_prefix("/usr/home/").is_some_and(plain_segment)
+}
+
 /// Make (or re-own) STATE_ROOT/<owner>/<app_id> for `uid`, 0700, and return it.
 /// The person's folder is root's (0755), so one component can't reach another's.
 fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<String> {
@@ -2792,13 +2800,21 @@ fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<Str
      * machine-wide STATE_ROOT/<person> otherwise. A folder left at the old
      * place is moved in the first time. */
     let legacy = std::path::Path::new(STATE_ROOT).join(owner);
-    let person = match portcullis_overlay::home_of(owner) {
+    let person = match portcullis_overlay::home_of(owner).and_then(|h| std::fs::canonicalize(h).ok()).filter(|h| home_for_state(h)) {
         Some(home) => {
+            use std::os::unix::fs::MetadataExt;
             portcullis_overlay::apps_root(&home).map_err(std::io::Error::other)?;
             let st = home.join(".atrium").join("state");
-            if std::fs::symlink_metadata(&st).is_err() {
-                std::fs::DirBuilder::new().mode(0o755).create(&st)?;
-                std::os::unix::fs::chown(&st, Some(0), Some(0))?;
+            match std::fs::symlink_metadata(&st) {
+                // root's real folder, so the person can't point it at
+                // another person's state (or anywhere else).
+                Ok(m) if m.is_dir() && m.uid() == 0 => {}
+                Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                    format!("{} is not root's own folder", st.display()))),
+                Err(_) => {
+                    std::fs::DirBuilder::new().mode(0o755).create(&st)?;
+                    std::os::unix::fs::chown(&st, Some(0), Some(0))?;
+                }
             }
             st
         }

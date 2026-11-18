@@ -865,19 +865,20 @@ fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier:
 /// Deliberately *not* a general glob library: keeps the dep set
 /// small and the surface auditable.
 fn matches_glob(pattern: &str, path: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        if let Some(rest) = path.strip_prefix(prefix) {
-            // Must have exactly one '/' followed by a non-empty
-            // component, and no further slashes (so /usr/home/x
-            // matches but /usr/home/x/y doesn't — that'd be a
-            // sub-mount and the user-supervisor isn't allowed it).
-            if let Some(after) = rest.strip_prefix('/') {
-                return !after.is_empty() && !after.contains('/');
-            }
-        }
-        return false;
+    // Segment by segment: a `*` segment matches exactly one plain name (not
+    // empty, `.` or `..`), anything else matches itself. So `/usr/home/*`
+    // takes /usr/home/x but not /usr/home/x/y (that'd be a sub-mount the
+    // user-supervisor isn't allowed), and `/usr/home/*/.atrium/state/*`
+    // takes one component's state folder in one person's home.
+    if !pattern.contains('*') {
+        return pattern == path;
     }
-    pattern == path
+    let (ps, xs): (Vec<&str>, Vec<&str>) = (pattern.split('/').collect(), path.split('/').collect());
+    ps.len() == xs.len()
+        && ps.iter().zip(&xs).all(|(p, x)| match *p {
+            "*" => !x.is_empty() && *x != "." && *x != "..",
+            lit => lit == *x,
+        })
 }
 
 #[cfg(test)]
@@ -2227,6 +2228,21 @@ mod tests {
     #[test]
     fn the_tmpfs_ceiling_has_a_default_for_older_policy_files() {
         assert_eq!(load_sample_policy().mount_sources.max_tmpfs_mb, 256);
+    }
+
+    #[test]
+    fn glob_star_is_one_plain_segment_anywhere() {
+        assert!(matches_glob("/usr/home/*", "/usr/home/alice"));
+        assert!(!matches_glob("/usr/home/*", "/usr/home/alice/x"));
+        assert!(!matches_glob("/usr/home/*", "/usr/home/"));
+        assert!(!matches_glob("/usr/home/*", "/usr/home"));
+        let st = "/usr/home/*/.atrium/state/*";
+        assert!(matches_glob(st, "/usr/home/alice/.atrium/state/org.atrium.forum-dock"));
+        assert!(!matches_glob(st, "/usr/home/alice/.atrium/state"));
+        assert!(!matches_glob(st, "/usr/home/alice/.atrium/state/a/b"));
+        assert!(!matches_glob(st, "/usr/home/../.atrium/state/x"));
+        assert!(!matches_glob(st, "/usr/home/alice/.atrium/apps/x"));
+        assert!(!matches_glob(st, "/usr/home/alice/.atrium/state/.."));
     }
 }
 
