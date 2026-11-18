@@ -390,6 +390,10 @@ fn clone_manifest_with(
         supervision:  None,
         opens:        Vec::new(),
         links:        Vec::new(),
+        /* The setup script is no app: no workers, roles or IPC of its own. */
+        workers:      Vec::new(),
+        roles:        None,
+        ipc:          None,
     }
 }
 
