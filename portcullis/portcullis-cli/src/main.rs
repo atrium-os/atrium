@@ -108,6 +108,8 @@ usage:
     portcullis workspace stop <name>
     portcullis workspace duplicate <name> <new-name>
     portcullis workspace run <name> [folder]
+    portcullis workspace debug <name> [folder]    run it under lldb-server; prints the address to connect to
+    portcullis workspace cores <name>             move its dev builds' cores into work/.atrium/cores
     portcullis workspace exec <name> [--cwd <folder>] -- <command...>
     portcullis workspace pkg <name> install|delete|upgrade|update|info|search|autoremove|clean [args]
         Your workspaces (homes.md §5). Their terminals open from Forum.
@@ -1413,6 +1415,44 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("portcullis workspace pkg: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("debug") {
+        return match daemon::debug(name, args.get(2).cloned().unwrap_or_default()) {
+            Ok(Some((id, addr, program))) => {
+                println!("{id}\t{addr}\t{program}");
+                eprintln!("in the workspace: lldb {program} -o 'gdb-remote {addr}'");
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!("portcullis workspace: portcullisd is not running");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("portcullis workspace debug: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("cores") {
+        return match daemon::cores(name) {
+            Ok(Some(files)) => {
+                for f in &files {
+                    println!("{f}");
+                }
+                if files.is_empty() {
+                    eprintln!("no cores");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => {
+                eprintln!("portcullis workspace: portcullisd is not running");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("portcullis workspace cores: {e}");
                 ExitCode::from(1)
             }
         };

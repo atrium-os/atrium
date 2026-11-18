@@ -15,6 +15,10 @@
 #     errors, and the core carries on;
 #   - past its memory (128M) it is killed, and that is an error too;
 #   - the worker has no network and cannot call workers itself;
+#   - it sees none of the host's network: no interface but its own lo0, no
+#     MAC, no interface MIB or SIOCGIFCONF, only AF_UNIX sockets. On a
+#     kernel with jail_netblind its jail has no vnet at all (portcullis.md
+#     §9.1c); 20 calls are timed either way;
 #   - the core's jail has the worker-call socket, which refuses anything
 #     but WorkerCall, and no portcullisd socket;
 #   - and after it all no worker jail is left.
@@ -32,7 +36,7 @@ bad() { echo "  FAIL $1"; fails=$((fails+1)); }
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
-    -p portcullisd -p portcullis-cli --bin portcullisd --bin portcullis) \
+    -p portcullisd -p portcullis-cli -p jaild --bin portcullisd --bin portcullis --bin atrium-jaild) \
     || { echo "build failed"; echo "workers: 1 failed"; exit 1; }
 (cd "$ROOT/sdk" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
     -p atrium-worker --example gate_core --example gate_worker) \
@@ -42,6 +46,7 @@ echo "=== install"
 B=/var/tmp/workers-gate
 V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 for f in "$ROOT/portcullis/target/$TARGET/release/portcullisd" "$ROOT/portcullis/target/$TARGET/release/portcullis" \
+         "$ROOT/portcullis/target/$TARGET/release/atrium-jaild" \
          "$ROOT/sdk/target/$TARGET/release/examples/gate_core" "$ROOT/sdk/target/$TARGET/release/examples/gate_worker" \
          "$ROOT/etc/jaild.policy.toml"; do
     scp -q $K -P 2222 "$f" root@localhost:$B/ || { echo "copy $f failed"; echo "workers: 1 failed"; exit 1; }
@@ -52,6 +57,7 @@ V 'sh -s' <<EOS
 set -e
 install -m 0755 $B/portcullisd /usr/local/bin/portcullisd
 install -m 0755 $B/portcullis /usr/local/bin/portcullis
+install -m 0755 $B/atrium-jaild /usr/local/bin/atrium-jaild
 mkdir -p /etc/atrium
 sed -e 's/^mode     = 1/mode     = 2/' $B/jaild.policy.toml > /etc/atrium/jaild.policy.toml
 grep -q '^allow_rctl' /etc/atrium/jaild.policy.toml || printf '\n[resource_control]\nallow_rctl = true\n' >> /etc/atrium/jaild.policy.toml
@@ -59,7 +65,7 @@ id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
 service atrium-jaild restart >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1 || true
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
 : > $LOG
-daemon -f -o $LOG /usr/local/bin/portcullisd --socket $PSOCK
+daemon -f -o $LOG env ATRIUM_ONESHOT_TIMING=1 /usr/local/bin/portcullisd --socket $PSOCK
 sleep 3; test -S $PSOCK; chmod 666 $PSOCK
 test -S /atrium/sockets/workers/workers.sock
 EOS
@@ -111,6 +117,25 @@ case "$reg" in "${wu:-x} alice "*) ok "registered: $reg" ;; *) bad "registry: $r
 r=$(line read); case "$r" in "ok [app]") ok "it reads the file the core passed" ;; *) bad "read: $r" ;; esac
 r=$(line fail); case "$r" in "worker-error asked to fail") ok "its error comes back" ;; *) bad "fail: $r" ;; esac
 r=$(line net); case "$r" in "ok refused"*) ok "no network: $r" ;; *) bad "net: $r" ;; esac
+r=$(line ifs)
+case "$r" in "ok ifs=["*) ;; *) bad "ifs: $r" ;; esac
+case "$r" in *"ifs=[] "*|*"ifs=[lo0] "*) ok "it lists no host interface: ${r#ok }" ;; *) bad "host interfaces: $r" ;; esac
+case "$r" in *"macs=[] "*) ok "and reads no MAC" ;; *) bad "MAC visible: $r" ;; esac
+case "$r" in *"ifmib=refused ifconf=refused "*"sockets=[]"*) ok "no interface MIB, no SIOCGIFCONF, no inet/inet6/route/netlink socket" ;; *) bad "network view: $r" ;; esac
+nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null")
+if [ "$nb" = 1 ]; then case "$r" in *"ipstats=refused"*) ok "and none of the host's network counters" ;; *) bad "host counters readable: $r" ;; esac; fi
+nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null"); [ "$nb" = 1 ] && echo "  (kernel has jail_netblind: worker jails without vnet)" || echo "  (kernel without jail_netblind: worker jails get an empty vnet)"
+r=$(line timing); case "$r" in p50*) ok "20 calls: $r" ;; *) bad "timing: $r" ;; esac
+echo "  where a call's time goes (median of the 20 timed calls, ms; teardown runs after the answer):"
+V "grep 'oneshot-timing.*w-echo' $LOG | sed -n 8,27p" | python3 -c '
+import sys, statistics
+v = {}
+for l in sys.stdin:
+    head, _, rest = l.strip().rpartition(" ms: ")
+    v.setdefault("total", []).append(float(head.split("total ")[-1]))
+    for part in rest.split(", "):
+        k, ms = part.rsplit(" ", 1); v.setdefault(k, []).append(float(ms))
+print("    " + ", ".join(f"{k} {statistics.median(x):.0f}" for k, x in v.items()))'
 r=$(line nest); case "$r" in "ok refused"*) ok "it calls no workers: $r" ;; *) bad "nest: $r" ;; esac
 r=$(line crash); case "$r" in "crashed Some(3)") ok "a crash is an error: $r" ;; *) bad "crash: $r" ;; esac
 r=$(line timeout); case "$r" in "timeout 3") ok "a call past 3 s is ended" ;; *) bad "timeout: $r" ;; esac

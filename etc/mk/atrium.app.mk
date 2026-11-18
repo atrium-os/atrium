@@ -9,6 +9,10 @@
 # make		builds ${PROG}
 # make run	asks you, in the Terminal, to Run it as an app (its atrium.toml)
 # make atrium.toml	writes a first manifest if there is none
+# make bundle	an installable bundle of ${PROG} (cargo-atrium bundle, from
+#		the Rust toolchain): its libraries, the loader, and any
+#		[bundle] extra-libs it loads with dlopen; BUNDLE_FLAGS passes
+#		--sign <key.pem>, --out <dir> and the rest
 # make clean
 #
 # The SDK's libraries are in the base (/usr/lib, /usr/include/atrium); the
@@ -55,7 +59,15 @@ atrium.toml:
 	@test -f ${.TARGET} || printf '[app]\nid = "org.example.%s"\nname = "%s"\nversion = "0.1"\nentry = "%s"\n\n[capabilities]\n' ${PROG} ${PROG} ${PROG} > ${.TARGET}
 	@echo "wrote ${.TARGET}: add the capabilities ${PROG} needs"
 
+CARGO_ATRIUM?=	cargo-atrium
+BUNDLE_FLAGS?=
+
+bundle: ${PROG} atrium.toml
+	@command -v ${CARGO_ATRIUM} >/dev/null 2>&1 || { echo "make bundle needs cargo-atrium: add the Rust toolchain to this workspace" >&2; exit 1; }
+	${CARGO_ATRIUM} bundle ${BUNDLE_FLAGS}
+
 clean:
 	rm -f ${PROG} ${OBJS}
+	rm -rf bundle
 
-.PHONY: all run clean
+.PHONY: all run bundle clean

@@ -96,6 +96,9 @@ Two templates show an app split into a core and a worker
   press Keep. It asks for no network and no graphics of its own; its
   window comes from the app that shares. Try it with `share-demo` from
   `share-sheet/`.
+  A provider is started as a one-shot jail, so its manifest needs
+  `[resources] memory` (for example `memory = "256M"`); portcullisd
+  refuses to start one without.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
@@ -116,13 +119,19 @@ cargo atrium check --json   # {manifest, consent[], findings[{level, code, messa
 It reports:
 
 - what the validator rejects (errors, exit status 1);
-- restricted capabilities and the review they need;
+- restricted capabilities and the review they need (not for `org.atrium.*`
+  ids: only the platform key signs those, and the system policy grants
+  what they ask);
 - **the consent text**: exactly what the person will be asked to allow;
 - **the crate-graph lint**: parsers of outside data (image, font, archive,
   document, media formats) and network clients linked into the **core**,
   the process that holds the capabilities. The fix it suggests is to move
   that work into a worker, which runs with no capabilities, or to use a
-  system service. SDK crates are trusted and not walked.
+  system service. SDK crates are trusted and not walked. What only the
+  font stack reaches (fresco-text, navigator-fonts and the font parsers
+  under them, WOFF's flate2 and brotli included) reads the system's fonts
+  and the app's own, so it isn't flagged; the same crate by any other
+  path is. A font parser the core links itself is a note.
 
 ## 4. Messages between processes: `atrium-message`
 
@@ -184,6 +193,15 @@ A crash, a limit or a timeout comes back as an `Err`, never as a panic in
 the core. Off Atrium, `ATRIUM_WORKERS=local ATRIUM_APP_ROOT=.` runs the
 workers as plain children (`cargo run` in a workspace).
 
+A worker with a protocol of its own that passes descriptors (a decoder
+fed frame buffers) starts with `workers.spawn_socket(name, &[extra fds])`:
+the core keeps one end of a Unix stream socket, the worker gets the other
+on descriptor 0 and the extras from 3, and takes them with
+`atrium_worker::socket_worker(n)` (its `capsicum` flag says to call
+`enter_capability_mode()` once it has set up). In a jail, extras need
+`isolation = "capsicum"` until portcullisd's WorkerCall carries more than
+the three standard descriptors.
+
 ### Moving code into a worker: `cargo atrium worker add`
 
 `cargo atrium worker add <name>` makes a new worker in an existing
@@ -241,7 +259,9 @@ pkgconf; the base system has clang, lld and the Atrium headers and
 libraries (`pkg-config --cflags --libs atrium`) and `atrium.app.mk`:
 `PROG=`, `ATRIUM_LIBS=` and `.include <atrium.app.mk>` give `make`,
 `make atrium.toml` and `make run`. `cargo atrium new <dir> --template c-app`
-starts one. **Planned (M7):** `make bundle`.
+starts one. `make bundle` writes an installable bundle through
+`cargo-atrium bundle` (add the Rust toolchain to the workspace for it);
+`make bundle BUNDLE_FLAGS="--sign key.pem"` signs it.
 
 ## 7. Running, fuzzing and bundling
 
@@ -293,6 +313,18 @@ reads. Without AddressSanitizer (stable Rust), comparisons that go through
 `memcmp` (slice equality) aren't traced, so magic numbers are found slowly;
 seed the corpus with a valid file.
 
+### Workers built in another crate
+
+A worker's binary is found by its entry's file name: among the project's
+own binaries, then in the crates it depends on (built with `-p`). A
+worker the app doesn't link, like Mail's parse jail, is named in
+`Cargo.toml`, and `run`, `bundle` and `check` build or find it there:
+
+```toml
+[package.metadata.atrium.workers]
+parse = "../mail-parse"      # its folder, or its Cargo.toml
+```
+
 ### Bundling: `cargo atrium bundle`
 
 `cargo atrium bundle --sign <key.pem>` makes the installable bundle
@@ -301,8 +333,11 @@ and each worker at their `entry` paths and the icon (an SVG path) in a
 tree, and adds the runtime closure: every library the programs need,
 read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
 the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others
-go to `usr/lib/`. Then `opifex pack` writes the content index and the
-signature, and `opifex archive` the `.insula` beside the tree
+go to `usr/lib/`. The programs are stripped (`--no-strip` keeps them as
+built); their debug info goes to `<tree>.debug/`, linked by
+`.gnu_debuglink`, for the debugger. Then `opifex pack` writes the content
+index and the signature (the key may be PKCS#8 or SEC1 PEM), and `opifex
+archive` the `.insula` beside the tree
 (`target/atrium-bundle/<id>-<version>-<arch>`), which installs through
 the install sheet.
 
@@ -312,8 +347,10 @@ they come from the SDK sysroot (`--arch`, `--sysroot` as for `cross`), so
 the app can only need base libraries there, and packing needs `OPIFEX`
 pointing at an opifex. A `dev.` id isn't bundled: give `[app] id` one of
 your own. In a folder without `Cargo.toml` (a C project) it bundles what
-`make` put at the entries, into `bundle/`. **Planned:** the key from Arca instead of a file, and
-`[bundle] extra-libs` for libraries the app `dlopen`s.
+`make` put at the entries, into `bundle/`. A library the app only `dlopen`s
+isn't in its ELF, so list it: `[bundle] extra-libs = ["libjansson.so.4"]`
+(file names, `*` and `?` allowed); Run carries it too. **Planned:** the key
+from Arca instead of a file.
 
 ## 8. Reference
 
@@ -324,7 +361,7 @@ your own. In a folder without `Cargo.toml` (a C project) it bundles what
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
 | `cargo atrium run [--release] [cargo args]` | build the core and workers, and Run the project as a dev app (asks for your press) |
-| `cargo atrium bundle [--arch a] [--sign key.pem] [--out dir] [--json]` | a release bundle with its closure, packed, signed, and an `.insula` |
+| `cargo atrium bundle [--arch a] [--sign key.pem] [--out dir] [--no-strip] [--json]` | a release bundle with its closure, packed, signed, and an `.insula` |
 | `cargo atrium worker add <name> [--input fd\|bytes\|message] [--from path::fn] [--dry-run] [--json]` | move part of the app into a new worker |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |

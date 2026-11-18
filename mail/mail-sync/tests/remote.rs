@@ -218,3 +218,95 @@ fn a_message_is_submitted_through_the_worker() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A JMAP server that serves its session and answers every API call with
+/// an error, recording what it was asked.
+struct Jmap(Arc<Mutex<Vec<String>>>);
+
+impl mail_sync::jmap::Http for Jmap {
+    fn get(&mut self, url: &str, _: usize) -> Result<Vec<u8>, String> {
+        self.0.lock().unwrap().push(format!("GET {url}"));
+        if url != "https://jmap.test/session" {
+            return Err(format!("404 {url}"));
+        }
+        Ok(br#"{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:mail":{},"urn:ietf:params:jmap:submission":{}},
+            "accounts":{"u1":{"name":"ada","accountCapabilities":{"urn:ietf:params:jmap:mail":{},"urn:ietf:params:jmap:submission":{"maxDelayedSend":3600}}}},
+            "primaryAccounts":{"urn:ietf:params:jmap:mail":"u1"},"apiUrl":"https://jmap.test/api/",
+            "downloadUrl":"https://jmap.test/d/{accountId}/{blobId}/{name}?type={type}","uploadUrl":"https://jmap.test/u/{accountId}/","state":"s"}"#
+            .to_vec())
+    }
+    fn post(&mut self, url: &str, _: &str, _: &[u8], _: usize) -> Result<Vec<u8>, String> {
+        self.0.lock().unwrap().push(format!("POST {url}"));
+        Err("503 busy".into())
+    }
+}
+
+#[test]
+fn jmap_runs_in_the_worker_with_the_http_here() {
+    use mail_sync::jmap::{Client, Jmap as _};
+    let url = "https://jmap.test/session";
+    let (here, there) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+    let mut l = Client::connect(Jmap(here.clone()), url).unwrap();
+    let (i, o) = worker();
+    let mut r = Remote::connect_jmap(Box::new(Jmap(there.clone())), i, o, url).unwrap();
+    assert!(r.can_hold(600) && !r.can_hold(7200));
+    assert_eq!(l.can_hold(600), r.can_hold(600));
+    let (le, re) = (mail_sync::jmap::Jmap::sync(&mut l, &mut Log::default()).unwrap_err(), mail_sync::jmap::Jmap::sync(&mut r, &mut Log::default()).unwrap_err());
+    assert_eq!(le.0, re.0, "the same error as here");
+    let rcpts = ["b@x.example".to_string()];
+    let (le, re) = (l.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err(), r.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err());
+    assert_eq!(le.0, re.0);
+    // Every exchange the worker wanted went over Mail's HTTP, the same as here.
+    assert_eq!(*here.lock().unwrap(), *there.lock().unwrap());
+}
+
+/// A JMAP server with an event source and a scripted stream.
+struct Pushing(Vec<String>);
+
+impl mail_sync::jmap::Http for Pushing {
+    fn get(&mut self, _: &str, _: usize) -> Result<Vec<u8>, String> {
+        Ok(br#"{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:mail":{}},
+            "accounts":{"u1":{"name":"ada","accountCapabilities":{"urn:ietf:params:jmap:mail":{}}}},
+            "primaryAccounts":{"urn:ietf:params:jmap:mail":"u1"},"apiUrl":"https://jmap.test/api/",
+            "downloadUrl":"https://jmap.test/d/{accountId}/{blobId}/{name}?type={type}","uploadUrl":"https://jmap.test/u/{accountId}/",
+            "eventSourceUrl":"https://jmap.test/events/","state":"s"}"#
+            .to_vec())
+    }
+    fn post(&mut self, url: &str, _: &str, _: &[u8], _: usize) -> Result<Vec<u8>, String> {
+        Err(format!("404 {url}"))
+    }
+    fn events(&mut self, _: &str, on_event: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), String> {
+        for e in &self.0 {
+            if !on_event(e.as_bytes()) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn jmap_push_is_judged_in_the_worker() {
+    use mail_sync::jmap::{Client, Pushed};
+    let state = |e: &str| format!("event: state\ndata: {{\"@type\":\"StateChange\",\"changed\":{{\"u1\":{{\"Email\":\"{e}\"}}}}}}\n\n");
+    let events = vec![state("e1"), "event: ping\ndata: {}\n\n".into(), state("e1"), state("e2"), state("e3")];
+    let url = "https://jmap.test/session";
+    let run = |j: &mut dyn mail_sync::jmap::Jmap, stop_after: usize| {
+        let mut seen = Vec::new();
+        let r = j.watch(&mut |news| {
+            seen.push(news);
+            seen.iter().filter(|n| **n).count() < stop_after
+        });
+        (r, seen)
+    };
+    for stop_after in [2, 9] {
+        let mut l = Client::connect(Pushing(events.clone()), url).unwrap();
+        let (i, o) = worker();
+        let mut r = Remote::connect_jmap(Box::new(Pushing(events.clone())), i, o, url).unwrap();
+        let (here, there) = (run(&mut l, stop_after), run(&mut r, stop_after));
+        assert_eq!(here, there);
+        assert_eq!(there.0, Ok(if stop_after == 2 { Pushed::Stopped } else { Pushed::Ended }));
+        // The worker is still there for the next stream.
+        assert_eq!(run(&mut r, 1).0, Ok(Pushed::Stopped));
+    }
+}

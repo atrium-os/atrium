@@ -252,8 +252,9 @@ fn jmap_sync_changes_and_send() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
     let account = engine.store.add_account("ada@example.org").unwrap();
-    let mut client = Client::connect(Fake(server.clone()), SESSION).unwrap();
-    assert!(client.session.can_submit);
+    assert!(Client::connect(Fake(server.clone()), SESSION).unwrap().session.can_submit);
+    // In the sync worker when MAIL_SYNC_WORKER names one, else here.
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
 
     // ── first sync ──
     let r = client.sync(&mut engine.sink(account)).unwrap();
@@ -340,7 +341,7 @@ fn jmap_sync_changes_and_send() {
     };
     let id = engine.send(account, &draft, When::default()).unwrap();
     assert!(engine.send_now(id).unwrap());
-    let d = engine.deliver_jmap(id, &mut client).unwrap();
+    let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert_eq!(d, Delivery::Sent { copy: None, rejected: vec![], held: false });
     assert!(engine.store.outbox().unwrap().is_empty());
     {
@@ -356,12 +357,18 @@ fn jmap_sync_changes_and_send() {
     let sent = engine.store.list(fid("Sent"), 0, 5).unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].subject, "Re: Plan");
+    // In the address book once (sent here, then seen in Sent), with the
+    // name it was written to by.
+    let people = engine.complete("gra", 5).unwrap();
+    assert_eq!(people.iter().map(|p| (p.name.as_str(), p.addr.as_str(), p.count)).collect::<Vec<_>>(), [("Grace", "grace@example.net", 1)]);
+    assert_eq!(engine.complete("sam", 5).unwrap().len(), 1, "Bcc too");
+    assert_eq!(engine.people_from_sent().unwrap(), 0, "not empty: nothing to fill");
 
     // As someone the server doesn't know: refused for good.
     let other = Draft { from: Mailbox::new("Ada", "ada@elsewhere.example"), subject: "x".into(), ..draft };
     let id = engine.send(account, &other, When::default()).unwrap();
     assert!(engine.send_now(id).unwrap());
-    let d = engine.deliver_jmap(id, &mut client).unwrap();
+    let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert!(matches!(d, Delivery::Failed { transient: false, .. }), "{d:?}");
 }
 
@@ -412,7 +419,7 @@ fn jmap_push_reports_state_changes_only() {
         events: vec![state("e1"), "event: ping\ndata: {\"interval\":60}\n\n", state("e1"), "event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"x\"}}}\n\n", state("e2"), state("e3")],
         asked: vec![],
     };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     let mut seen = Vec::new();
     let r = client.watch(&mut |changed| {
         seen.push(changed);
@@ -424,11 +431,11 @@ fn jmap_push_reports_state_changes_only() {
     assert_eq!(seen, vec![true, false, false, false, true]);
 
     let h = Pushing { es: None, events: vec![], asked: vec![] };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     assert_eq!(client.watch(&mut |_| true), Ok(Pushed::NoPush));
 
     // A stream the server ends: Ended, to connect again.
     let h = Pushing { es: Some("https://jmap.test/events/"), events: vec![state("e1")], asked: vec![] };
-    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(h), SESSION).unwrap();
     assert_eq!(client.watch(&mut |_| true), Ok(Pushed::Ended));
 }

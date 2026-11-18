@@ -133,6 +133,7 @@ fn args() -> Result<Args, String> {
             // (never an argument): keep its key in PERSONA, or `once`.
             // "Open read-only?" for an older copy (§8).
             "--open-older" => a.media_cmd = Some(format!("open-older {}", val()?)),
+            "--make-current" => a.media_cmd = Some(format!("make-current {}", val()?)),
             "--adopt" => {
                 let part = val()?;
                 let persona = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
@@ -435,6 +436,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
         };
         return answer(atrium_media::client::format(sock, &atrium_media::Format { part: part.into(), persona: persona.into(), label: label.into(), recovery }));
     }
+    if let Some(part) = cmd.strip_prefix("make-current ") {
+        return answer(atrium_media::client::make_current(sock, &atrium_media::Eject { part: part.into() }));
+    }
     if let Some(part) = cmd.strip_prefix("open-older ") {
         return answer(atrium_media::client::open_older(sock, &atrium_media::Eject { part: part.into() }));
     }
@@ -449,7 +453,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
             println!("error malformed: keep or once");
             return ExitCode::FAILURE;
         }
-        return answer(atrium_media::client::adopt(sock, &atrium_media::Adopt { part: part.into(), persona: persona.into(), keep: keep == "keep", code: code.trim().into() }));
+        return answer(atrium_media::client::adopt(sock, &atrium_media::Adopt { part: part.into(), persona: persona.into(), keep: keep == "keep", code: code.trim().into(), handle: [0; 16] }));
     }
     if let Some(rest) = cmd.strip_prefix("at-login ") {
         let (part, on) = rest.split_once(' ').unwrap_or((rest, "ask"));
@@ -678,6 +682,7 @@ mod run {
         Adopt(atrium_media::Adopt),
         /// Open an older copy read-only, once Sigillum verified (§8).
         OpenOlder(String),
+        MakeCurrent(String),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -1003,6 +1008,10 @@ mod run {
 
         fn open_older(&self, part: &str) -> (u8, String) {
             self.ask(Req::OpenOlder(part.to_string()))
+        }
+
+        fn make_current(&self, part: &str) -> (u8, String) {
+            self.ask(Req::MakeCurrent(part.to_string()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1837,7 +1846,8 @@ mod run {
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
                 let persona = self.trusted.get(&part).map(|t| t.persona.clone()).unwrap_or_default();
                 let read_only = read_only || self.trusted.get(&part).is_some_and(|t| t.read_only);
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false, older: false });
+                let older = self.trusted.get(&part).is_some_and(|t| t.read_only);
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false, older });
             }
             for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
                 let recovery = self.recoverable.contains(part);
@@ -1883,6 +1893,7 @@ mod run {
                     Req::Format(f) => self.format(&f),
                     Req::Adopt(a) => self.adopt(&a),
                     Req::OpenOlder(p) => self.open_older(&p),
+                    Req::MakeCurrent(p) => self.make_current(&p),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -2627,8 +2638,8 @@ mod run {
         /// "This stick is older than the last time it was used here. Open
         /// read-only?" (§8): arcad asks Sigillum to verify the person, then
         /// reloads the key for read-only use below its high-water mark, and
-        /// the kernel mounts the copy read-only. Writing to it, or adopting
-        /// it as current, is not built yet.
+        /// the kernel mounts the copy read-only. `make_current` can then
+        /// make it the current copy.
         fn open_older(&mut self, part: &str) -> (u8, String) {
             use dispensator::sealed::{arca, hex};
             let Session::Active { user, .. } = self.session.clone() else {
@@ -2660,6 +2671,74 @@ mod run {
             (mstatus::OK, format!("{part} opened read-only"))
         }
 
+        /// "Use this copy as current" (§8) for an older copy opened
+        /// read-only: its read-only mount and server go, arcad (once Sigillum
+        /// verifies the person) lowers the key's high-water mark to the
+        /// generation the kernel saw mounted and reloads the key as usual,
+        /// and the kernel mounts it writable. Refused or unverified, it goes
+        /// back as it was.
+        fn make_current(&mut self, part: &str) -> (u8, String) {
+            use dispensator::sealed::{arca, hex, Header};
+            let Session::Active { user, .. } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            };
+            let Some((mnt, persona, key_id)) = self.trusted.get(part).filter(|t| t.read_only && t.user == user).map(|t| (t.mnt.clone(), t.persona.clone(), t.key_id)) else {
+                return (mstatus::NOT_FOUND, format!("{part} is not an older copy opened read-only"));
+            };
+            let Header::Sealed { key_id: on_disk, uuid, .. } = dispensator::sealed::header(&read_sectors(part)) else {
+                return (mstatus::FAILED, format!("{part}: no sealed header"));
+            };
+            if on_disk != key_id {
+                return (mstatus::FAILED, format!("{part} changed under us"));
+            }
+            self.stop_stick_server(part);
+            if let Err(e) = jaild::ffi::unmount_at(&mnt, 0) {
+                self.serve_trusted(part);
+                self.sync_standing();
+                return if e.raw_os_error() == Some(libc::EBUSY) {
+                    (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"))
+                } else {
+                    (mstatus::FAILED, format!("unmount {mnt}: {e}"))
+                };
+            }
+            let back = |me: &mut Self| {
+                if mount_tessera_flags(part, &mnt, libc::MNT_RDONLY).is_ok() {
+                    me.serve_trusted(part);
+                    me.sync_standing();
+                } else {
+                    me.trusted.remove(part);
+                    me.locked.insert(part.to_string());
+                }
+                me.publish();
+            };
+            let gen = match vk_call(&["current", &user, &persona, &hex(&key_id), &hex(&uuid)]) {
+                Ok(g) => g,
+                Err(st) => {
+                    back(self);
+                    return match st {
+                        s if s == arca::NEEDS_VERIFICATION => (mstatus::NOT_ALLOWED, "not verified".into()),
+                        s if s == arca::LOCKED => (mstatus::FAILED, format!("{user}'s Arca is locked")),
+                        s => (mstatus::FAILED, format!("arcad refused (status {s})")),
+                    };
+                }
+            };
+            if let Err(e) = mount_tessera(part, &mnt) {
+                // The key now opens it writable, or nothing does: Locked.
+                self.trusted.remove(part);
+                self.locked.insert(part.to_string());
+                self.publish();
+                return (mstatus::FAILED, format!("the kernel refused it writable: {e}"));
+            }
+            if let Some(t) = self.trusted.get_mut(part) {
+                t.read_only = false;
+            }
+            self.serve_trusted(part);
+            self.sync_standing();
+            self.publish();
+            eprintln!("atrium-dispensatord: {part}: now {user}/{persona}'s current copy (high-water {gen}), mounted writable at {mnt}");
+            (mstatus::OK, format!("{part} is now the current copy"))
+        }
+
         /// A Locked stick opened with its recovery code (§7.4): arcad
         /// unwraps its key from the slot (and keeps it, if asked), then the
         /// kernel mounts it as for a stick found in Arca.
@@ -2677,7 +2756,8 @@ mod run {
                 return (mstatus::NOT_FOUND, format!("{} has no recovery code", a.part));
             };
             let keep = if a.keep { "keep" } else { "once" };
-            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&a.code)) {
+            let code = if a.handle == [0; 16] { a.code.clone() } else { format!("held:{}", hex(&a.handle)) };
+            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
                 Ok(_) => {}
                 Err(st) if st == arca::DENIED => return (mstatus::NOT_ALLOWED, "that isn't this stick's recovery code".into()),
                 Err(st) if st == arca::MALFORMED => return (mstatus::MALFORMED, "that isn't a recovery code: check it for typos".into()),

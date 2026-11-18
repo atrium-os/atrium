@@ -46,9 +46,8 @@ atrium_netconf_start() {
         return 0
     fi
     install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium /atrium/sockets
-    # atrium-net makes its socket a moment after it starts.
-    for _ in $(seq 1 20); do [ -S "${ctl}" ] && break; sleep 1; done
-    [ -S "${ctl}" ] || warn "${name}: ${ctl} not there yet; it will be tried again"
+    # atrium-netconf waits for atrium-net's socket itself (fast-boot.md §4.2),
+    # so rc does not: atrium-net makes it only once it has a port.
     echo "Starting ${name}."
     /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_netconf_logfile}" -t "${name}" \
         "${command}" --ctl "${ctl}" --dir /atrium/sockets --uid 65036 --capsicum ${atrium_netconf_flags}
@@ -59,9 +58,9 @@ atrium_netconf_stop() {
     pid=$(cat "${pidfile}")
     echo "Stopping ${name}."
     kill -TERM "${pid}" 2>/dev/null
-    for _ in 1 2 3 4 5; do
-        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
-    done
+    # pwait returns the moment it exits (a `sleep 1` loop cost a full second
+    # per script at every shutdown: fast-boot.md §2.0).
+    pwait -t 5 "${pid}" 2>/dev/null
     kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
     pkill -KILL -x atrium-netconf 2>/dev/null
     rm -f "${pidfile}"

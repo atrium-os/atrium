@@ -221,6 +221,31 @@ pub fn sysfil_supported() -> bool {
 #[cfg(not(target_os = "freebsd"))]
 pub fn sysfil_supported() -> bool { false }
 
+/// Does the running kernel hide the host's network from a jail with
+/// neither IPv4 nor IPv6 (atrium-os/freebsd-src `prison_netblind`)? Then
+/// such a jail lists no interface, MAC, route or neighbour, and
+/// [`NetworkConfig::Isolated`](crate::protocol::NetworkConfig::Isolated)
+/// needs no empty vnet: about 1 ms to create and remove instead of ~70.
+/// Asked once; the answer can't change while the kernel runs.
+#[cfg(target_os = "freebsd")]
+pub fn netblind_supported() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        let name = c"kern.features.jail_netblind";
+        let mut v: libc::c_int = 0;
+        let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
+        // SAFETY: v and len are valid for an int-sized read.
+        let r = unsafe {
+            libc::sysctlbyname(name.as_ptr(), (&mut v as *mut libc::c_int).cast(), &mut len,
+                               std::ptr::null(), 0)
+        };
+        r == 0 && v == 1
+    })
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn netblind_supported() -> bool { false }
+
 /// Is tessera.ko loaded, with its `allow.tessera_keys` jail parameter?
 #[cfg(target_os = "freebsd")]
 pub fn tessera_keys_supported() -> bool {
@@ -551,9 +576,11 @@ impl IovBuilder {
         }
         match ip4_addr {
             None => {
-                /* `ip4=disable`. Value is the integer constant
-                 * JAIL_SYS_DISABLE = 0 (per <sys/jail.h>). */
+                /* `ip4=disable` and `ip6=disable`. Value is the integer
+                 * constant JAIL_SYS_DISABLE = 0 (per <sys/jail.h>). Both,
+                 * so a netblind kernel hides the host's network too. */
                 self.add_i32("ip4", 0);
+                self.add_i32("ip6", 0);
                 Ok(())
             }
             Some(addr) => {

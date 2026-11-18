@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use officina_grid::macros::{path_ok, MacroFamily, MacroPart, Macros, MAX_PART, MAX_TOTAL};
 use officina_grid::Workbook;
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
 
+#[cfg(feature = "read")]
 use super::read::{attr, rels, xml, XlsxError};
 use crate::report::{Kind, Report};
 use crate::zip::Archive;
@@ -24,6 +26,7 @@ pub const SIGNATURES: [(&str, &str); 3] = [
 pub const VBA_REL: &str = "http://schemas.microsoft.com/office/2006/relationships/vbaProject";
 pub const MAIN_MACRO: &str = "application/vnd.ms-excel.sheet.macroEnabled.main+xml";
 
+#[cfg(feature = "read")]
 /// `[Content_Types].xml`: part name (no leading `/`) → media type, and
 /// extension → media type.
 fn content_types(z: &Archive) -> Result<(HashMap<String, String>, HashMap<String, String>), XlsxError> {
@@ -54,6 +57,7 @@ fn content_types(z: &Archive) -> Result<(HashMap<String, String>, HashMap<String
     Ok((over, def))
 }
 
+#[cfg(feature = "read")]
 /// The `codeName` on the first `elem` (`workbookPr`, `sheetPr`) before `stop`.
 fn code_name(data: &[u8], elem: &[u8], stop: &[u8]) -> Option<String> {
     let mut r = xml(data);
@@ -76,6 +80,7 @@ fn code_name(data: &[u8], elem: &[u8], stop: &[u8]) -> Option<String> {
     }
 }
 
+#[cfg(feature = "read")]
 /// Keeps the package's VBA project, if it has one, on `wb`.
 pub(crate) fn read(z: &Archive, wb: &mut Workbook, wb_xml: &[u8], wb_rels: &HashMap<String, (String, String)>, sheet_parts: &[String], rep: &mut Report) -> Result<(), XlsxError> {
     let Some(vba) = wb_rels.values().find(|(t, _)| t.ends_with("/vbaProject")).map(|(_, p)| p.clone()) else {

@@ -235,6 +235,7 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
+    activation::set_redraw(redraw.clone());
     lock::watch(comp.clone(), redraw.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
@@ -1668,7 +1669,8 @@ fn render_one_frame(
         };
         let origin = |id: u16| b.origin(id).or_else(|| focus_parent.filter(|_| focus.map(|f| f as u16) == Some(id)).and_then(|p| b.origin(p)));
         let islands: Vec<chrome::Island> = island_ids.iter().filter_map(|&id| island_at(id, u16::try_from(id).ok().and_then(|w| b.origin(w)))).collect();
-        let mut c = chrome::build(px, screen_w, focus, origin, &rects, &slots, &covers, &hosted, &islands);
+        let note = focus.and_then(|f| activation::strip_note(u32::from(f)));
+        let mut c = chrome::build(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands);
         chrome::sheet_frames(&mut c, px, &sheets, px.strip());
         c.size = (c.size.0.min(screen_w), c.size.1.min(screen_h));
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));

@@ -195,12 +195,31 @@ pub const FILE_MAX: u64 = 64 << 20;
 /// The longest file name navigatord reports or writes.
 pub const NAME_MAX: usize = 128;
 
+/// What the open-an-app prompt shows of an `atrium-app:` link's app
+/// (navigator-ui.md §6.4), from opifexd's `Describe`: who publishes it and
+/// what it will ask for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppAbout {
+    /// Its name in the catalog.
+    pub name: String,
+    /// The publisher's name and the domains it proved, or "Atrium".
+    pub publisher: String,
+    /// The capabilities its newest release asks for.
+    pub capabilities: Vec<String>,
+    /// Installed: Open starts it; otherwise Open asks to install it first.
+    pub installed: bool,
+    /// From a catalog someone added, not the Atrium catalog.
+    pub third_party: bool,
+}
+
 /// What a link does (backend `links::LinkAction`, and refusals).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkAction {
     Navigate { url: String, insecure: bool },
     InDocument { fragment: String },
-    Handoff { url: String, scheme: String },
+    /// `app`: for an `atrium-app:` link, what the package catalog says of
+    /// the app (navigator-ui.md §6.4), when it knows it.
+    Handoff { url: String, scheme: String, app: Option<AppAbout> },
     Blocked { why: String },
     /// A consent wall's control (`atrium-consent:<n>`, legacy-web
     /// §5.4.1e): the reader's press kept what it writes in the page's

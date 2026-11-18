@@ -8,7 +8,9 @@ use std::fmt::Write as _;
 
 use officina_grid::macros::{path_ok, MacroFamily, MacroPart, Macros, MAX_PART, MAX_PARTS, MAX_TOTAL};
 use officina_grid::Workbook;
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
+#[cfg(feature = "read")]
 use quick_xml::Reader;
 
 use crate::report::{Kind, Report};
@@ -20,6 +22,7 @@ pub(crate) fn is_macro_path(p: &str) -> bool {
     FOLDERS.iter().any(|f| p.starts_with(f)) && path_ok(p)
 }
 
+#[cfg(feature = "read")]
 /// `META-INF/manifest.xml`: path → media type.
 fn manifest(z: &Archive) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -52,6 +55,7 @@ fn manifest(z: &Archive) -> HashMap<String, String> {
     out
 }
 
+#[cfg(feature = "read")]
 /// Keeps the package's macro folders, if it has any, on `wb`.
 pub(crate) fn read(z: &Archive, wb: &mut Workbook, rep: &mut Report) -> Result<(), crate::zip::ZipError> {
     let entries: Vec<_> = z.entries.iter().filter(|e| FOLDERS.iter().any(|f| e.name.starts_with(f)) && !e.name.ends_with('/')).cloned().collect();

@@ -11,6 +11,11 @@
 # CDEV=<c-dev layer tree> installs it first (build-c-dev-layer.sh's output);
 # RUST=<Rust layer tree> installs that too, makes proj a Rust workspace and
 # checks rust-analyzer on rs/main.rs.
+# BUNDLE=1 installs Artifex and the Terminal the platform-SDK way instead:
+# `cargo atrium bundle --sign` on the host makes each .insula (programs,
+# library closure, loader), and the VM unarchives and installs it through
+# opifex's trust gate (needs cargo-atrium and opifex built for the host:
+# sdk/target/release and portcullis/target/release).
 # Ends "artifex: N failed".
 #
 #   sh scripts/vm-artifex-check.sh [out-dir]
@@ -57,6 +62,22 @@ for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/releas
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "artifex: 1 failed"; exit 1; }
 done
 scp -q $K -P 2222 "$ROOT/artifex/app/atrium.toml" root@localhost:$B/artifex.toml
+scp -q $K -P 2222 "$ROOT/atrium-term-socket/atrium.toml" root@localhost:$B/terminal.toml
+if [ -n "${BUNDLE:-}" ]; then
+    echo "=== cargo atrium bundle"
+    BK=$ROOT/scratch/artifexchk-bundle; mkdir -p "$BK"
+    [ -f "$BK/key8.pem" ] || { openssl ecparam -name prime256v1 -genkey -noout -out "$BK/key.pem" && openssl pkcs8 -topk8 -nocrypt -in "$BK/key.pem" -out "$BK/key8.pem"; }
+    openssl ec -in "$BK/key8.pem" -pubout -out "$BK/pub.pem" 2>/dev/null
+    # The sysroot pulled from the guest has no loader; the bundle carries it.
+    [ -f "$S/libexec/ld-elf.so.1" ] || { mkdir -p "$S/libexec" && scp -q $K -P 2222 root@localhost:/libexec/ld-elf.so.1 "$S/libexec/"; }
+    for d in artifex/app atrium-term-socket; do
+        (cd "$ROOT/$d" && PATH="$ROOT/sdk/target/release:$PATH" OPIFEX="$ROOT/portcullis/target/release/opifex" RUSTFLAGS= \
+            cargo atrium bundle --arch amd64 --sysroot "$S" --sign "$BK/key8.pem" --out "$BK/$(basename $d)" >"$BK/$(basename $d).log" 2>&1) \
+            || { echo "bundle of $d failed: $(tail -2 "$BK/$(basename $d).log")"; echo "artifex: 1 failed"; exit 1; }
+    done
+    scp -q $K -P 2222 "$BK/app.insula" root@localhost:$B/artifex.insula && scp -q $K -P 2222 "$BK/atrium-term-socket.insula" root@localhost:$B/terminal.insula \
+        && scp -q $K -P 2222 "$BK/pub.pem" root@localhost:$B/sdk-gate.pem || { echo "copy of the bundles failed"; echo "artifex: 1 failed"; exit 1; }
+fi
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 TERM_ID=org.atrium.terminal; ART=org.atrium.artifex
@@ -69,14 +90,28 @@ test -f /root/of-key.pem || openssl ecparam -name prime256v1 -genkey -noout -out
 mkdir -p /etc/atrium/publishers; openssl ec -in /root/of-key.pem -pubout -out /etc/atrium/publishers/of-gate.pem 2>/dev/null
 sign() { openssl dgst -sha256 -sign /root/of-key.pem -out \$1/atrium.toml.sig \$1/atrium.toml; }
 for id in $TERM_ID $ART; do opifex uninstall \$id >/dev/null 2>&1 || true; rm -rf /home/alice/.atrium/apps/\$id; done
-O=$B/b-$TERM_ID; mkdir -p \$O/bin; cp $B/atrium-term-socket \$O/bin/
-printf '[app]\nid = "$TERM_ID"\nname = "Terminal"\nversion = "1"\nentry = "bin/atrium-term-socket"\n\n[capabilities]\ngraphics = "fresco"\nconsoles = true\n' > \$O/atrium.toml
+if [ -n "${BUNDLE:-}" ]; then
+  # The SDK's archives, as a publisher would ship them. The index covers every
+  # file, so the check's two files (trace on, the window at 40,30) go into
+  # the installed folder afterwards, as they would on a developer's machine.
+  cp $B/sdk-gate.pem /etc/atrium/publishers/sdk-gate.pem
+  for x in terminal:$TERM_ID artifex:$ART; do
+    n=\${x%%:*}; id=\${x#*:}; rm -rf $B/u-\$n; opifex unarchive $B/\$n.insula $B/u-\$n >/dev/null
+    opifex install $B/u-\$n > $B/install-\$n.log 2>&1
+    grep -q "installed \$id" $B/install-\$n.log
+    echo on > /var/lib/atrium/apps/\$id/.trace
+  done
+  echo 40,30 > /var/lib/atrium/apps/$ART/.at
+else
+# Both with their checked-in manifests (the Terminal with trace on; Artifex
+# with trace on and the window at (40, 30)).
+O=$B/b-$TERM_ID; mkdir -p \$O/bin; cp $B/atrium-term-socket \$O/bin/; cp $B/terminal.toml \$O/atrium.toml
+echo on > \$O/.trace
 sign \$O; opifex install \$O >/dev/null
-# Artifex with its own manifest, plus the check's two files: trace on, and
-# the window at (40, 30).
 O=$B/b-$ART; mkdir -p \$O/bin; cp $B/artifex \$O/bin/; cp $B/artifex.toml \$O/atrium.toml
 echo on > \$O/.trace; echo 40,30 > \$O/.at
 sign \$O; opifex install \$O >/dev/null
+fi
 mkdir -p /atrium/sockets/portcullis /atrium/sockets/clipboard /var/run/atrium; rm -f $PSOCK /var/run/atrium/stoad.sock
 : > $LOG
 daemon -f -o $B/stoad.log env STOA_CTL=/var/run/atrium/stoad.sock STOA_STATE=off $B/stoad

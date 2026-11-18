@@ -2,7 +2,10 @@
 //! click or Enter in it asks Monstrator to open a link (the first argument,
 //! else `link-probe.url` in its bundle, else the confined gate's fixture page) with that press. Prints
 //! `link-probe: up`, then `link-probe: opened` or `link-probe: not opened:
-//! <why>` for each ask. Exits after five idle minutes.
+//! <why>` for each ask. Ctrl-V pastes from Tabula with that press instead
+//! (with the bundle's `clipboard` capability) and prints `link-probe:
+//! pasted` or `link-probe: paste refused: <reply>`. Exits after
+//! five idle minutes.
 use std::time::{Duration, Instant};
 
 use fresco_client::{Connection, Event};
@@ -14,6 +17,28 @@ fn draw(c: &mut Connection, w: f32, h: f32) {
     let Ok(mut fr) = c.frame() else { return };
     let _ = fr.rect(RectParams { x: 0.0, y: 0.0, w, h, r: 0.2, g: 0.4, b: 0.8, a: 1.0, radius: 0.0 });
     let _ = fr.finish();
+}
+
+/// Ask Tabula for `text/plain` with the press `token`.
+fn paste(token: [u8; 16]) {
+    use tabula::proto::{op, Get, Reply, CLASS};
+    let path = std::env::var("TABULA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/clipboard/clipboard.sock".into());
+    let go = || -> Result<Reply, String> {
+        let mut c = aqueduct::Connection::connect(&path).map_err(|e| format!("the clipboard: {e}"))?;
+        let payload = postcard::to_stdvec(&Get { token, accept: vec!["text/plain".into()] }).map_err(|e| e.to_string())?;
+        c.send_message(CLASS, op::GET, aqueduct::flag::RESPONSE_EXPECTED, &payload).map_err(|e| e.to_string())?;
+        loop {
+            let m = c.recv_message_or_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?.ok_or("the clipboard did not answer")?;
+            if m.flags & aqueduct::flag::IS_RESPONSE != 0 && m.op == op::GET {
+                return postcard::from_bytes(&m.payload).map_err(|e| e.to_string());
+            }
+        }
+    };
+    match go() {
+        Ok(Reply::Got { .. }) => println!("link-probe: pasted"),
+        Ok(r) => println!("link-probe: paste refused: {r:?}"),
+        Err(e) => println!("link-probe: paste refused: {e}"),
+    }
 }
 
 fn main() {
@@ -47,6 +72,14 @@ fn main() {
             }
             Err(e) => return println!("link-probe: frescod: {e}"),
         };
+        // Ctrl-V (either hand): a paste.
+        if let Event::Key { hid_usage: 0x19, pressed: true, repeat: false, modifiers, activation, .. } = ev {
+            if modifiers & 0x11 != 0 {
+                idle = Instant::now();
+                paste(activation);
+                continue;
+            }
+        }
         let press = match ev {
             Event::PointerButton { pressed: true, activation, .. } => Some(activation),
             Event::Key { hid_usage: 0x28, pressed: true, repeat: false, activation, .. } => Some(activation),

@@ -583,6 +583,82 @@ pub fn serve(path: &std::path::Path, allowed: Callers, focused: Arc<dyn Fn(u32) 
     Ok(())
 }
 
+/// Strip notes owed for `PASTE` and `DROP` presses spent (spender uid,
+/// window, when), one each for [`NOTE_FOR_NS`], and the note showing.
+#[derive(Default)]
+pub struct Notes {
+    owed: Vec<(u32, u32, u64)>,
+    shown: Option<(u32, String, u64)>,
+}
+
+/// How long after the press a broker may ask for its note.
+pub const NOTE_FOR_NS: u64 = 5_000_000_000;
+/// How long a note shows.
+pub const NOTE_SHOWN_NS: u64 = 4_000_000_000;
+
+impl Notes {
+    pub fn owe(&mut self, uid: u32, window: u32, now: u64) {
+        self.owed.retain(|&(_, _, at)| now.saturating_sub(at) < NOTE_FOR_NS);
+        if self.owed.len() < 64 {
+            self.owed.push((uid, window, now));
+        }
+    }
+
+    /// Show `n` if `uid` spent a press for its window lately (once).
+    pub fn show(&mut self, uid: u32, n: &fresco_protocol::activation::Note, now: u64) -> bool {
+        self.owed.retain(|&(_, _, at)| now.saturating_sub(at) < NOTE_FOR_NS);
+        let Some(i) = self.owed.iter().position(|&(u, w, _)| u == uid && w == n.window_id) else { return false };
+        let Some(text) = note_text(n) else { return false };
+        self.owed.remove(i);
+        self.shown = Some((n.window_id, text, now + NOTE_SHOWN_NS));
+        true
+    }
+
+    /// The note over `window`, while it shows.
+    pub fn over(&self, window: u32, now: u64) -> Option<String> {
+        self.shown.as_ref().filter(|&&(w, _, until)| w == window && now < until).map(|(_, t, _)| t.clone())
+    }
+}
+
+/// A note's words, frescod's own: only the persona's name comes from the
+/// broker, cut to the strip's characters.
+pub fn note_text(n: &fresco_protocol::activation::Note) -> Option<String> {
+    let persona: String = n.persona.to_ascii_lowercase().bytes()
+        .filter(|&c| fresco_split::chrome::origin_char(c)).take(32).map(char::from).collect();
+    match n.kind {
+        fresco_protocol::activation::note::COPIED_IN if !persona.is_empty() => Some(format!("paste refused: copied in {persona}")),
+        _ => None,
+    }
+}
+
+fn notes() -> &'static Mutex<Notes> {
+    static N: std::sync::OnceLock<Mutex<Notes>> = std::sync::OnceLock::new();
+    N.get_or_init(Default::default)
+}
+
+/// The strip note over `window`, if one shows now.
+pub fn strip_note(window: u32) -> Option<String> {
+    notes().lock().unwrap().over(window, now_ns())
+}
+
+/// The display loop's redraw signal, so a note shows and goes on time.
+static REDRAW: std::sync::OnceLock<crate::redraw::Redraw> = std::sync::OnceLock::new();
+
+pub fn set_redraw(r: crate::redraw::Redraw) {
+    let _ = REDRAW.set(r);
+}
+
+fn note_shown() {
+    if let Some(r) = REDRAW.get() {
+        r.wake();
+        let r = r.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_nanos(NOTE_SHOWN_NS + 50_000_000));
+            r.wake();
+        });
+    }
+}
+
 /// Raises owed for `LINK` presses spent: (spender uid, when), one each,
 /// for two minutes (a link grant's life, opening-links.md §5).
 #[derive(Default)]
@@ -665,6 +741,11 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                     if c.purpose == purpose::LINK && matches!(r, ConsumeResult::Ok { .. }) {
                         raises().lock().unwrap().add(uid, now);
                     }
+                    // A paste or drop spent: one strip note, should the
+                    // broker refuse it after all (personas.md §6).
+                    if let (purpose::PASTE | purpose::DROP, ConsumeResult::Ok { window_id, .. }) = (c.purpose, r) {
+                        notes().lock().unwrap().owe(uid, window_id, now);
+                    }
                     r
                 }
                 Ok(_) => refused(refusal::NOT_ALLOWED),
@@ -679,6 +760,15 @@ fn conn_loop(s: std::os::unix::net::UnixStream, uid: u32, may_consume: Option<Op
                 Ok(r) if raises().lock().unwrap().take(uid, now_ns()) => raise(comp, r.uid),
                 Ok(_) => RaiseResult::Refused { reason: refusal::NOT_ALLOWED },
                 Err(_) => RaiseResult::Refused { reason: refusal::UNKNOWN },
+            }),
+            op::NOTE => fresco_protocol::encode(&match fresco_protocol::decode::<fresco_protocol::activation::Note>(&msg.payload) {
+                Ok(n) if notes().lock().unwrap().show(uid, &n, now_ns()) => {
+                    eprintln!("frescod: a strip note over window {} for uid {uid}: {}", n.window_id, note_text(&n).unwrap_or_default());
+                    note_shown();
+                    fresco_protocol::activation::NoteResult::Ok
+                }
+                Ok(_) => fresco_protocol::activation::NoteResult::Refused { reason: refusal::NOT_ALLOWED },
+                Err(_) => fresco_protocol::activation::NoteResult::Refused { reason: refusal::UNKNOWN },
             }),
             fresco_protocol::slot::op::PRESSED => {
                 use fresco_protocol::slot::{refusal as no, PressedQuery, PressedResult};
@@ -717,6 +807,25 @@ mod tests {
     }
     const YES: fn(u32) -> bool = |_| true;
     const NOVIS: fn(u32, u64) -> bool = |_, _| false;
+
+    #[test]
+    fn a_strip_note_is_owed_once_per_paste_press_and_worded_here() {
+        use fresco_protocol::activation::{note, Note};
+        let n = |w: u32, p: &str| Note { window_id: w, kind: note::COPIED_IN, persona: p.into() };
+        let mut s = Notes::default();
+        assert!(!s.show(65039, &n(5, "Work"), 10), "nothing spent");
+        s.owe(65039, 5, 10);
+        assert!(!s.show(1001, &n(5, "Work"), 11), "another uid's");
+        assert!(!s.show(65039, &n(6, "Work"), 11), "another window");
+        assert!(!s.show(65039, &Note { kind: 9, ..n(5, "Work") }, 11), "no such note");
+        assert!(s.show(65039, &n(5, "Work Stuff!\u{202e}"), 12));
+        assert_eq!(s.over(5, 13).as_deref(), Some("paste refused: copied in workstuff"));
+        assert_eq!(s.over(6, 13), None, "only over its window");
+        assert_eq!(s.over(5, 12 + NOTE_SHOWN_NS), None, "gone");
+        assert!(!s.show(65039, &n(5, "Work"), 14), "once");
+        s.owe(65039, 5, 20);
+        assert!(!s.show(65039, &n(5, "Work"), 20 + NOTE_FOR_NS), "too late");
+    }
 
     #[test]
     fn a_raise_is_owed_once_per_link_press_for_two_minutes() {

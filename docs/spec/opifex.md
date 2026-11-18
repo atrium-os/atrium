@@ -109,7 +109,7 @@ The specs disagree. This spec picks:
 |---|---|---|
 | CJK fonts on demand, colour emoji (fonts thread) | `kind = "font"` packages, a coverage field to find the right one, a pin list the font library trusts | §8.1 |
 | `atrium-app://` for apps not installed (Monstrator L5) | look up an app id, then the install sheet | §7.1, §9 |
-| Navigator's app prompt | a pre-install query: publisher and capabilities for an id, no network | §7.1 |
+| Navigator's app prompt | a pre-install query: publisher and capabilities for an id, no network (built 2026-11-18 on `Describe`, navigator-ui.md §6.4) | §7.1 |
 | Driver lookup (device-assignment §4.7, decision 16) | every driver package's `devices.d` matches in the local catalog; install through the trusted sheet | §8.2 |
 | Firmware (device-assignment §4.4, wifi) | `kind = "firmware"`, platform-signed | §8.2 |
 | Toolchain layers (toolchains thread) | `kind = "layer"`, platform key only, the layer contract that thread defines | §8.3 |

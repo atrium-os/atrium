@@ -731,7 +731,7 @@ Questions that need the person, drawn by the UI in the prompt row between toolba
 
 | prompt | when | answers |
 |---|---|---|
-| open an app | an `atrium-app://` link (navigator.md §2.2) | *Try it* (ephemeral jail, insula trial-launch) · *Open* · *Not now*. Shows the publisher and the capabilities it will ask for |
+| open an app | an `atrium-app://` link (navigator.md §2.2) | *Try it* (ephemeral jail, insula trial-launch) · *Open* · *Not now*. Shows the publisher and the capabilities it will ask for, and whether it is installed (Open on one that isn't goes to Opifex's install sheet). *Built 2026-11-18:* navigatord asks opifexd's read-only `Describe` (the `navigator-broker` capability mounts `/atrium/sockets/opifex/`, one-second limit) and sends it with the hand-off as `AppAbout`; an id the catalog doesn't know (a side-loaded app) is named by its id alone. navigatord asks as the Navigator's own uid, so a catalog a person added for themselves isn't seen here; the install sheet shows those |
 | hand off a link | an allowlisted scheme (`mailto:`), threat model §2.10 | *Open* · *Not now*; names no app, since Monstrator chooses it (opening-links.md §7) |
 | save a download | a link to a file | *Save* · *Open in viewer* (a jailed viewer, threat model §2.10) · *Cancel*; the row shows the file's origin |
 | not private | a form on an `http:` page | *Go back* · *Continue* |

@@ -114,7 +114,7 @@ V "CON=${CON:+/root/t/tactus-console} sh -s" <<'EOF'
 cd /root/t
 pkill -f "tactusd" ; pkill -x frescod; pkill -f atrium-input-probe
 install -m 0644 atrium.devfs.rules /usr/local/etc/atrium/devfs.rules
-service devfs restart >/dev/null 2>&1
+sh -c ". /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets" >/dev/null 2>&1
 devfs rule -s 26 show | grep -q hidraw && echo "  ok ruleset 26 loaded" || echo "  FAIL ruleset 26 not loaded"
 P=/etc/atrium/jaild.policy.toml
 grep -q 'atrium-tactusd' $P || {

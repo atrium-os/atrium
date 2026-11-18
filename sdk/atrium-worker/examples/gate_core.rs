@@ -58,6 +58,16 @@ fn main() {
     say("fail", ask(&w, "fail", None));
     say("net", ask(&w, "net", None));
     say("nest", ask(&w, "nest", None));
+    say("ifs", ask(&w, "ifs", None));
+    // 20 calls, one jail each: how long a call takes, start to answer.
+    let mut ms: Vec<f64> = (0..20).map(|_| {
+        let t = std::time::Instant::now();
+        let _ = ask(&w, "uid", None);
+        t.elapsed().as_secs_f64() * 1000.0
+    }).collect();
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    say("timing", format!("p50 {:.1} ms, p90 {:.1} ms, mean {:.1} ms over {}",
+        ms[ms.len() / 2], ms[ms.len() * 9 / 10], ms.iter().sum::<f64>() / ms.len() as f64, ms.len()));
     say("crash", ask(&w, "crash", None));
     say("timeout", ask(&w, "sleep", None));
     say("memory", ask(&w, "hog", None));

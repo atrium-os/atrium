@@ -55,7 +55,7 @@ mod worker;
 
 use navigator_backend::links::SchemeAllowlist;
 use navigator_backend::store::{DirStore, MemoryStore, Store};
-use navigator_control::{self as ctl, Event, Jar, LinkAction, Request, Source, Ticket};
+use navigator_control::{self as ctl, AppAbout, Event, Jar, LinkAction, Request, Source, Ticket};
 use navigator_cookies::{Arca as _, ArcadSocket, Broker, Fetch, Launcher, Why};
 use navigator_prerender::fetch::{FetchBudget, FetchdFetcher, Reply};
 use navigator_prerender::serve::{self, Ask, Job};
@@ -117,6 +117,10 @@ struct Config {
     /// Monstrator, the link opener, that hand-offs go to with their press
     /// (`NAVIGATORD_MONSTRATOR`, default its socket; opening-links.md §7).
     monstrator: PathBuf,
+    /// opifexd's socket (`NAVIGATORD_OPIFEX`, default its own): the
+    /// open-an-app prompt asks it who publishes an `atrium-app:` link's app
+    /// and what it asks for (navigator-ui.md §6.4). Read-only; no network.
+    opifex: PathBuf,
     /// Schemes handed on (`NAVIGATORD_SCHEMES`, comma-separated, e.g.
     /// `mailto,tel`); `atrium-app` always is (navigator.md §2.2).
     schemes: SchemeAllowlist,
@@ -147,6 +151,7 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("/nonexistent/Downloads")),
             monstrator: var("NAVIGATORD_MONSTRATOR").map(PathBuf::from).unwrap_or_else(|| monstrator::SOCKET.into()),
             activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
+            opifex: var("NAVIGATORD_OPIFEX").map(PathBuf::from).unwrap_or_else(|| OPIFEX_SOCKET.into()),
             schemes: {
                 let mut a = SchemeAllowlist::default();
                 for sch in std::iter::once("atrium-app".to_string()).chain(var("NAVIGATORD_SCHEMES").unwrap_or_default().split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from)) {
@@ -1308,6 +1313,13 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     Some(p) if href.starts_with(CONSENT_SCHEME) => consent(&p, &href, jar, cookies.as_ref()),
                     Some(p) => activate(&p, &href, &cfg.schemes),
                 };
+                let action = match action {
+                    LinkAction::Handoff { url, scheme, .. } if scheme == "atrium-app" => {
+                        let app = app_id(&url).and_then(|id| app_about(&cfg.opifex, id));
+                        LinkAction::Handoff { url, scheme, app }
+                    }
+                    a => a,
+                };
                 if let LinkAction::Handoff { url, .. } = &action {
                     if handed.len() >= 32 {
                         handed.remove(0);
@@ -1403,6 +1415,55 @@ fn hand_how(cfg: &Config, url: &str, press: ctl::Press, with: bool) -> Event {
     }
 }
 
+/// opifexd's socket (opifex proto::SOCKET).
+const OPIFEX_SOCKET: &str = "/atrium/sockets/opifex/opifex.sock";
+
+/// The app an `atrium-app://<id>[/…]` link names.
+fn app_id(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("atrium-app:")?.trim_start_matches("//");
+    let id = rest.split(['/', '?', '#']).next()?;
+    (!id.is_empty() && id.len() <= 255 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))).then_some(id)
+}
+
+/// What the package catalog says of app `id` (opifexd's `Describe`, which
+/// anyone may ask; opifex.md §7.1), for the open-an-app prompt. None when
+/// opifexd isn't there, doesn't answer within a second, or doesn't know
+/// the id (a side-loaded app): the prompt then names only the id.
+fn app_about(sock: &Path, id: &str) -> Option<AppAbout> {
+    use std::io::{BufRead, BufReader};
+    let mut s = UnixStream::connect(sock).ok()?;
+    let t = Some(std::time::Duration::from_secs(1));
+    s.set_read_timeout(t).ok()?;
+    s.set_write_timeout(t).ok()?;
+    let mut ask = serde_json::to_vec(&serde_json::json!({ "op": "describe", "id": id })).ok()?;
+    ask.push(b'\n');
+    s.write_all(&ask).ok()?;
+    let mut line = String::new();
+    BufReader::new(s.take(64 * 1024)).read_line(&mut line).ok()?;
+    about_of(&serde_json::from_str(&line).ok()?)
+}
+
+/// opifexd's `Described` answer, as the prompt shows it.
+fn about_of(v: &serde_json::Value) -> Option<AppAbout> {
+    if v.get("answer")?.as_str()? != "described" {
+        return None;
+    }
+    let a = v.get("app")?;
+    let s = |k: &str| a.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let third_party = a.get("third_party").and_then(|x| x.as_bool()).unwrap_or(false);
+    let domains: Vec<String> = a.get("publisher_domains").and_then(|x| x.as_array()).map(|d| d.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    let name = s("publisher_name");
+    let publisher = match (name.is_empty(), domains.is_empty()) {
+        (false, false) => format!("{name} ({})", domains.join(", ")),
+        (false, true) => name,
+        (true, _) if !third_party => "Atrium".into(),
+        (true, false) => domains.join(", "),
+        (true, true) => match s("publisher") { p if p.is_empty() => "an unnamed publisher".into(), p => p },
+    };
+    let capabilities = a.get("capabilities").and_then(|x| x.as_array()).map(|c| c.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    Some(AppAbout { name: s("name"), publisher, capabilities, installed: a.get("installed").is_some_and(|x| !x.is_null()), third_party })
+}
+
 /// What activating `href` in `page` does: only a link the recording
 /// carries (threat model §2.10), decided by the backend's link rules.
 fn activate(page: &Page, href: &str, schemes: &SchemeAllowlist) -> LinkAction {
@@ -1417,7 +1478,7 @@ fn activate(page: &Page, href: &str, schemes: &SchemeAllowlist) -> LinkAction {
     match links::decide(&page.url, href, schemes) {
         Ok(links::LinkAction::Navigate { url, insecure }) => LinkAction::Navigate { url, insecure },
         Ok(links::LinkAction::InDocument { fragment }) => LinkAction::InDocument { fragment },
-        Ok(links::LinkAction::Handoff { url, scheme }) => LinkAction::Handoff { url, scheme },
+        Ok(links::LinkAction::Handoff { url, scheme }) => LinkAction::Handoff { url, scheme, app: None },
         Err(e) => LinkAction::Blocked { why: e.to_string() },
     }
 }
@@ -1610,6 +1671,24 @@ mod tests {
     fn page(url: &str, doc: &str) -> Page {
         let rec = format!(r#"{{"format":"atrium-navigator-recording/3","url":"{url}","document":"{doc}"}}"#);
         Page { url: url.into(), title: title(rec.as_bytes()), recording: rec.into_bytes(), insecure: false, saved: String::new(), ctx: Ctx::ANON, images: Default::default(), consents: Default::default() }
+    }
+
+    #[test]
+    fn an_app_link_is_described_by_the_catalog() {
+        assert_eq!(app_id("atrium-app://org.example.photos/x?y"), Some("org.example.photos"));
+        assert_eq!(app_id("atrium-app:org.example.photos"), Some("org.example.photos"));
+        assert_eq!(app_id("atrium-app://"), None);
+        assert_eq!(app_id("atrium-app://a b"), None);
+        let v = serde_json::json!({"answer": "described", "app": {"id": "org.example.photos", "name": "Photos",
+            "publisher": "k1", "publisher_name": "Example Ltd", "publisher_domains": ["example.com"],
+            "capabilities": ["network-read", "files"], "installed": null, "third_party": true}});
+        assert_eq!(about_of(&v), Some(AppAbout { name: "Photos".into(), publisher: "Example Ltd (example.com)".into(),
+            capabilities: vec!["network-read".into(), "files".into()], installed: false, third_party: true }));
+        let v = serde_json::json!({"answer": "described", "app": {"name": "Write", "publisher": "", "capabilities": [], "installed": "3"}});
+        assert_eq!(about_of(&v).map(|a| (a.publisher, a.installed)), Some(("Atrium".into(), true)));
+        assert_eq!(about_of(&serde_json::json!({"answer": "error", "message": "x: not in the catalog"})), None);
+        // No opifexd: no description, and no wait.
+        assert_eq!(app_about(Path::new("/nonexistent/opifex.sock"), "org.example.photos"), None);
     }
 
     #[test]

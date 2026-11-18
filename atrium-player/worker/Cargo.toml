@@ -16,6 +16,8 @@ atrium-media-demux  = { path = "../demux" }
 atrium-media-decode = { path = "../decode" }
 hospes-proto        = { path = "../../hospes/hospes-proto", features = ["std"] }
 libc = "0.2"
+# The decode worker as a declared worker (app-composition.md §4).
+atrium-worker = { path = "../../sdk/atrium-worker" }
 
 [features]
 h264 = ["atrium-media-decode/h264", "atrium-player/h264"]

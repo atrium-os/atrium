@@ -88,6 +88,7 @@ fn typing_is_held_on_leaving_and_any_edit_voids_the_handle() {
     }
     assert_eq!(f.typed(), b"hunter2");
     assert_eq!(f.bullets(), 7);
+    assert_eq!(f.shown_text(), None, "a password is bullets");
     assert_eq!(f.chip(), None, "typing hides the chip");
     // Tab holds the value at arcad, then moves focus on.
     let d = f.key(Key::Tab { back: false }, [0; 16]);
@@ -210,8 +211,13 @@ fn the_client_against_arcad() {
     a.drop_handle(&h).unwrap();
     assert!(st.lock().unwrap().redeem(&h, "alice", &rcp).is_none(), "dropped");
 
-    let h = a.hold(&mail(), b"typed by hand", false).unwrap();
+    let h = a.hold(&mail(), b"typed by hand", 0).unwrap();
     assert_eq!(st.lock().unwrap().redeem(&h, "alice", &rcp).unwrap().as_ref(), b"typed by hand");
+
+    // A recovery code's field: no app's endpoint redeems it.
+    assert_eq!(arca_ui::field::hold_tag(limen::credential::Purpose::RecoveryCode), op::HOLD_FOR_RECOVERY);
+    let h = a.hold(&mail(), b"ABCDE", arca_ui::field::hold_tag(limen::credential::Purpose::RecoveryCode)).unwrap();
+    assert!(st.lock().unwrap().redeem(&h, "alice", &rcp).is_none());
 
     let h = a.generate(&mail()).unwrap();
     let v = st.lock().unwrap().redeem(&h, "alice", &rcp).unwrap();
@@ -221,7 +227,7 @@ fn the_client_against_arcad() {
     assert_eq!(st.lock().unwrap().handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     let e = a.handle_for(&mail(), &accts[0].id).unwrap_err();
     assert!(e.locked(), "{e:?}");
-    assert!(a.hold(&mail(), b"x", false).unwrap_err().locked());
+    assert!(a.hold(&mail(), b"x", 0).unwrap_err().locked());
 }
 
 #[test]
@@ -236,4 +242,16 @@ fn the_parent_comes_from_the_registry() {
     assert_eq!(Parent::resolve(reg, 50802, false), None, "unsigned");
     assert_eq!(Parent::resolve(reg, 50802, true).unwrap().publisher, arcad::label::UNSIGNED_PUBLISHER);
     assert_eq!(Parent::resolve(reg, 50803, true), None, "not registered");
+}
+
+#[test]
+fn a_recovery_code_is_shown_as_typed_and_offers_nothing() {
+    let mut f = sign_in();
+    f.configure(Purpose::RecoveryCode, false);
+    assert_eq!(f.chip(), None);
+    for c in b"abcde-fg" {
+        f.key(Key::Char(*c), [0; 16]);
+    }
+    assert_eq!(f.shown_text().as_deref(), Some("ABCDE-FG"));
+    assert_eq!(f.key(Key::Tab { back: false }, [0; 16])[0], Do::Hold);
 }

@@ -132,8 +132,8 @@ sh "$ROOT/scripts/hospes-build.sh" cdm "$T" >/dev/null || die "hospes-cdm cross-
     "CC_$TU=clang --target=$T --sysroot=$S" "CFLAGS_$TU=-I$S/usr/local/include" RUSTFLAGS="$X -C link-arg=-L$S/usr/local/lib" \
     cargo build --release --target "$T" -p atrium-player -p atrium-player-decode --bins --example atrium-player-bundle-launch >&2) || die "player cross-build (disk full?)"
 export "CC_$TU=clang" "AR_$TU=llvm-ar" "CFLAGS_$TU=--target=$T --sysroot=$S"
-(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --bin nuntiusd >&2) || die "nuntiusd cross-build"
-(cd "$ROOT/nuntius" && RUSTFLAGS="$X" cargo +nightly build --quiet --release --target "$T" -Z build-std=std,panic_abort --example fetcher-standin >&2) || die "fetcher-standin cross-build"
+(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$X" cargo build --quiet --release --target "$T" -Z build-std=std,panic_abort --bin nuntiusd >&2) || die "nuntiusd cross-build"
+(cd "$ROOT/nuntius" && RUSTFLAGS="$X" cargo build --quiet --release --target "$T" -Z build-std=std,panic_abort --example fetcher-standin >&2) || die "fetcher-standin cross-build"
 
 if [ "${JAILED:-0}" = 1 ]; then
     # The Portcullis stack (portcullisd, jaild, opifex) as the system runs it.

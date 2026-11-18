@@ -15,7 +15,7 @@ use officina_grid::formula;
 use officina_grid::filter::Cond;
 use officina_grid::{ErrorKind, Value, Workbook};
 
-use crate::xlsx::read::MDW;
+use crate::xlsx::MDW;
 use crate::zip::ZipWriter;
 
 pub const XLSX_ROWS: u32 = 1 << 20;

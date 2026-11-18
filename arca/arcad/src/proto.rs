@@ -66,6 +66,9 @@ pub mod op {
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.
     pub const HOLD_FOR_WIFI: u8 = 1;
+    /// A trailing byte on `U_HOLD`: the field is a stick recovery code's
+    /// (tessera-encryption.md §7.4); only `VK_ADOPT` redeems it.
+    pub const HOLD_FOR_RECOVERY: u8 = 2;
 
     /// `str user | root[32]` → nothing. First login: make the user's store.
     pub const V_CREATE: u16 = 0x40;
@@ -94,9 +97,11 @@ pub mod op {
 
     /// → `u32 n | n × (id[16] | str account)`: the passwords the chip offers.
     pub const U_ACCOUNTS: u16 = 0x62;
-    /// `parent | bytes value [| u8 HOLD_FOR_WIFI]` → `handle[16]`: hold what
-    /// the user typed. With `HOLD_FOR_WIFI`, only the Wi-Fi key service can
-    /// redeem it (`TAKE_WIFI`); no courier, fill or save takes it.
+    /// `parent | bytes value [| u8 HOLD_FOR_WIFI | HOLD_FOR_RECOVERY]` →
+    /// `handle[16]`: hold what the user typed. With `HOLD_FOR_WIFI`, only
+    /// the Wi-Fi key service can redeem it (`TAKE_WIFI`); with
+    /// `HOLD_FOR_RECOVERY`, only `VK_ADOPT`. No courier, fill or save
+    /// takes either.
     pub const U_HOLD: u16 = 0x63;
     /// `parent | id[16]` → `handle[16]`: the item the user picked on the chip.
     pub const U_HANDLE: u16 = 0x64;
@@ -262,8 +267,11 @@ pub mod volume_op {
     /// is ASCII, `XXXXX-` × 6, shown to the person once; arcad keeps
     /// neither.
     pub const VK_RECOVERY: u16 = 0xB5;
-    /// `owner | key_id[16] | uuid[16] | slot[256] | u8 keep | str code` →
-    /// nothing: a stick from elsewhere, opened with its recovery code.
+    /// `owner | key_id[16] | uuid[16] | slot[256] | u8 keep | str code
+    /// [| handle[16] when code is empty]` → nothing: a stick from
+    /// elsewhere, opened with its recovery code. With a handle, the code is
+    /// what the person typed into Arca's field (`U_HOLD` with
+    /// `HOLD_FOR_RECOVERY`, as the same user); `DENIED` if it isn't one.
     /// arcad unwraps the key from the slot; with `keep` it stores it in the
     /// owner's persona (high-water 0) as if minted here. Then it loads it.
     /// `DENIED`: the code isn't this slot's; `MALFORMED`: not a code.
@@ -275,6 +283,13 @@ pub mod volume_op {
     /// mark, and the kernel refuses every writable mount with it. The
     /// item's mark is unchanged.
     pub const VK_OLDER: u16 = 0xB7;
+    /// `owner | key_id[16] | uuid[16]` → `u64` generation: "Use this copy
+    /// as current" for an older copy opened read-only (§8), and unmounted
+    /// since. Needs Sigillum's `VERIFY_USER`. arcad lowers the item's
+    /// high-water mark to the generation the kernel saw mounted (`TKEY_GEN`,
+    /// never a number from the caller) and reloads the key as usual, so
+    /// the copy mounts writable. `DENIED` if no older copy was opened.
+    pub const VK_CURRENT: u16 = 0xB8;
     pub const SLOT_LEN: usize = crate::recovery::SLOT_LEN;
     pub const CODE_MAX: usize = 64;
     /// Longest label.

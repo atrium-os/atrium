@@ -132,11 +132,16 @@ pub mod proto {
 }
 
 pub mod gate {
-    use fresco_protocol::activation::{Consume, ConsumeResult, Token};
+    use fresco_protocol::activation::{Consume, ConsumeResult, Note, Token};
 
     /// Proof of a user gesture: frescod's `ACTIVATION_CONSUME`.
     pub trait Gate: Send {
         fn consume(&mut self, c: Consume) -> ConsumeResult;
+        /// A strip note over the window a paste or drop press was just
+        /// spent for (frescod's `NOTE`, personas.md §6). Whether it shows.
+        fn note(&mut self, _n: Note) -> bool {
+            false
+        }
     }
 
     /// No frescod: refuse everything.
@@ -160,22 +165,17 @@ pub mod gate {
             Self { conn: None, path: path.into() }
         }
 
-        fn ask(&mut self, c: Consume) -> std::io::Result<ConsumeResult> {
+        fn ask<Q: serde::Serialize, A: serde::de::DeserializeOwned>(&mut self, op: u16, q: &Q) -> std::io::Result<A> {
             use aqueduct::flag;
             if self.conn.is_none() {
                 self.conn = Some(aqueduct::Connection::connect(&self.path)?);
             }
             let conn = self.conn.as_mut().unwrap();
-            let payload = postcard::to_stdvec(&c).map_err(invalid)?;
-            conn.send_message(
-                aqueduct::classes::CLASS_DISPLAY,
-                fresco_protocol::activation::op::CONSUME,
-                flag::RESPONSE_EXPECTED,
-                &payload,
-            )?;
+            let payload = postcard::to_stdvec(q).map_err(invalid)?;
+            conn.send_message(aqueduct::classes::CLASS_DISPLAY, op, flag::RESPONSE_EXPECTED, &payload)?;
             conn.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
             let m = conn.recv_message()?;
-            if m.op != fresco_protocol::activation::op::CONSUME || m.flags & flag::IS_RESPONSE == 0 {
+            if m.op != op || m.flags & flag::IS_RESPONSE == 0 {
                 return Err(invalid("unexpected reply"));
             }
             postcard::from_bytes(&m.payload).map_err(invalid)
@@ -188,11 +188,21 @@ pub mod gate {
 
     impl Gate for Frescod {
         fn consume(&mut self, c: Consume) -> ConsumeResult {
-            match self.ask(c) {
+            match self.ask(fresco_protocol::activation::op::CONSUME, &c) {
                 Ok(r) => r,
                 Err(_) => {
                     self.conn = None;
                     ConsumeResult::Refused { reason: fresco_protocol::activation::refusal::NOT_ALLOWED }
+                }
+            }
+        }
+
+        fn note(&mut self, n: Note) -> bool {
+            match self.ask::<_, fresco_protocol::activation::NoteResult>(fresco_protocol::activation::op::NOTE, &n) {
+                Ok(r) => r == fresco_protocol::activation::NoteResult::Ok,
+                Err(_) => {
+                    self.conn = None;
+                    false
                 }
             }
         }
@@ -209,6 +219,7 @@ pub mod gate {
     pub struct FakeTable {
         live: std::collections::HashMap<Token, (u32, u8, std::time::Instant, u64)>,
         next: u64,
+        notes: Vec<Note>,
     }
 
     impl Fake {
@@ -228,6 +239,11 @@ pub mod gate {
             let tok = self.mint(uid, fresco_protocol::activation::kind::DROP);
             self.0.lock().unwrap().live.get_mut(&tok).unwrap().3 = drag_id;
             tok
+        }
+
+        /// The strip notes asked for so far.
+        pub fn notes(&self) -> Vec<Note> {
+            self.0.lock().unwrap().notes.clone()
         }
 
         /// Age a token past its lifetime.
@@ -263,6 +279,11 @@ pub mod gate {
             }
             t.live.remove(&c.token);
             ConsumeResult::Ok { window_id: 1, kind: k, minted_ns: 0, drag_id }
+        }
+
+        fn note(&mut self, n: Note) -> bool {
+            self.0.lock().unwrap().notes.push(n);
+            true
         }
     }
 }
@@ -590,6 +611,22 @@ pub mod server {
             let t = p.side(taker);
             may_take(p.as_ref(), owner, &t)
         }
+
+        /// A paste or drop of `owner`'s entry was refused to `taker`: the
+        /// strip over `window` notes the persona it was copied in, when
+        /// it is the same person's (another person's is never named).
+        fn note_refused(&self, owner: &Side, taker: u32, window: u32) {
+            let t = self.personas.lock().unwrap().side(taker);
+            if let (Side::Person { person: a, persona }, Side::Person { person: b, .. }) = (owner, &t) {
+                if a == b {
+                    let persona = persona.clone().unwrap_or_else(|| "personal".into());
+                    let n = fresco_protocol::activation::Note { window_id: window, kind: fresco_protocol::activation::note::COPIED_IN, persona };
+                    if !self.gate.lock().unwrap().note(n) {
+                        eprintln!("tabulad: frescod did not show the strip note");
+                    }
+                }
+            }
+        }
     }
 
     /// Serve one client until it hangs up. `uid` is the kernel's answer
@@ -626,10 +663,11 @@ pub mod server {
         }
     }
 
-    fn gesture(shared: &Shared, uid: u32, token: proto::Token, p: u8) -> Result<(), Reply> {
+    /// The press spent; its window.
+    fn gesture(shared: &Shared, uid: u32, token: proto::Token, p: u8) -> Result<u32, Reply> {
         let r = shared.gate.lock().unwrap().consume(Consume { token, presenter_uid: uid, purpose: p });
         match r {
-            ConsumeResult::Ok { .. } => Ok(()),
+            ConsumeResult::Ok { window_id, .. } => Ok(window_id),
             ConsumeResult::Refused { reason } => Err(Reply::Refused { reason: refusal::NO_GESTURE, detail: reason }),
         }
     }
@@ -711,14 +749,16 @@ pub mod server {
                 if req.accept.len() > store::MAX_FORMATS || req.accept.iter().any(|a| !store::valid_mime(a)) {
                     return malformed();
                 }
-                if let Err(r) = gesture(shared, uid, req.token, purpose::PASTE) {
-                    return r;
-                }
+                let window = match gesture(shared, uid, req.token, purpose::PASTE) {
+                    Ok(w) => w,
+                    Err(r) => return r,
+                };
                 // Copied in another persona: only with the person's switch.
                 let owner = shared.store.lock().unwrap().side().cloned();
                 if let Some(o) = owner {
                     if let Err(r) = shared.may_take(&o, uid) {
                         eprintln!("tabulad: a paste by uid {uid} refused: copied {}", say(&o));
+                        shared.note_refused(&o, uid, window);
                         return Reply::Refused { reason: r, detail: 0 };
                     }
                 }
@@ -753,11 +793,21 @@ pub mod server {
                 // drag that was dropped there: the target cannot name
                 // another drag.
                 let r = shared.gate.lock().unwrap().consume(Consume { token: req.token, presenter_uid: uid, purpose: purpose::DROP });
-                let drag_id = match r {
-                    ConsumeResult::Ok { drag_id, .. } => drag_id,
+                let (drag_id, window) = match r {
+                    ConsumeResult::Ok { drag_id, window_id, .. } => (drag_id, window_id),
                     ConsumeResult::Refused { reason } => return Reply::Refused { reason: refusal::NO_GESTURE, detail: reason },
                 };
-                let got = shared.store.lock().unwrap().drop_take(drag_id, &req.accept, now, |s| shared.may_take(s, uid));
+                let mut refused = None;
+                let got = shared.store.lock().unwrap().drop_take(drag_id, &req.accept, now, |s| {
+                    let r = shared.may_take(s, uid);
+                    if r.is_err() {
+                        refused = Some(s.clone());
+                    }
+                    r
+                });
+                if let Some(o) = refused {
+                    shared.note_refused(&o, uid, window);
+                }
                 match got {
                     Err(r) => Reply::Refused { reason: r, detail: 0 },
                     Ok(None) => Reply::Empty,

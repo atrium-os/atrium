@@ -104,7 +104,8 @@ Sans, Symbols, Symbols 2, Math and Serif.
   run's atlas page, so a run is still one slot. Emoji take Noto Color Emoji:
   `atrium-colr` draws the COLRv1 (or v0) glyph to RGBA (skrifa's paint
   graph, tiny-skia; sweep gradients are drawn as their middle stop), into a
-  512×512 RGBA twin of the run's page at `color_atlas_slot(slot)`; the
+  RGBA twin of the run's page at `color_atlas_slot(slot)`, half the page's
+  size each way (`color_atlas_dims`: 512² for frescod's 1024² pages); the
   glyph's `atlas_u` carries `GLYPH_COLOR`, and the renderer takes the texel's
   colour (times the run's alpha) instead of the run's colour. A space after
   an emoji is the run font's, not the emoji face's (whose space is as wide as
@@ -176,8 +177,10 @@ a Japanese label in the VM.
   (.pptx); LibreOffice keeps it both ways in both formats
   (`officina-convert/examples/bidi_lo.rs`, 4/4). A selection across
   directions highlights each stretch as drawn (`ParaLayout::range_spans`).
-  Left: arrow keys move in logical order; no command yet to set a
-  paragraph's direction in Write.
+  On a line with right-to-left text, Left and Right move on screen (the
+  nearest caret place to that side; past the edge, the next line in the
+  paragraph's reading order); Shift extends the same way. Write's
+  alignment menu sets a paragraph's direction (officina.md §16.58).
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - Colour emoji is drawn everywhere text is: frescod's own text (Pergola
@@ -187,8 +190,12 @@ a Japanese label in the VM.
   marking them `GLYPH_COLOR` (frescod keeps the mark only when the window
   bound that slot); the PDF export draws each emoji once as a picture
   (160 px to the em, soft mask) over its text written invisibly (`3 Tr`),
-  so the text copies and searches. Left: the colour atlas is 512² per
-  window, so very many large emoji drop the rest (logged). Opifex installs font
+  so the text copies and searches. Pergola's colour twin is 1024² (its
+  glyph atlas is 2048²), made on a window's first emoji: about 600
+  distinct emoji at one large size; past that the rest are dropped
+  (logged), like coverage glyphs when that atlas fills. A COLRv1 sweep
+  gradient is drawn per pixel (tiny-skia has none); Noto Color Emoji uses
+  none, other COLR fonts may. Opifex installs font
   packages (opifex.md §14.7: `opifex font pack`, the pin list written by
   opifexd). The CJK packages (`org.atrium.font.noto-sans-{jp,sc,tc,hk,kr}`
   2.004, regular and bold, 11 to 21 MB each) are built by

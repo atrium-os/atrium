@@ -211,7 +211,7 @@ into the base with `scripts/install-c-sdk.sh` (`libfresco.so.0` built natively,
 `/usr/share/mk/atrium.app.mk`). `make run` calls `/atrium/bin/atrium-run`, which
 asks the Terminal with OSC 7770 `run` the same way `pkg` does. The Terminal may now
 send `WorkspaceRun` on the person's press. `make bundle` and `[bundle] extra-libs`
-aren't done yet. Found on the way: a workspace had no loader hints, so programs from
+followed with M6 (below). Found on the way: a workspace had no loader hints, so programs from
 pkg that link `/usr/local/lib` didn't start. pkg runs now end with `ldconfig`. The
 gate `scripts/vm-run-closure-check.sh` passes 17 of 17 with the filter denying.
 
@@ -312,8 +312,12 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   `portcullis workspace bundle` verb; it packs, signs and archives with opifex, and
   bundles a C project's `make` output when there is no Cargo.toml. Gate
   `scripts/vm-bundle-check.sh` 8/8: new, worker add, bundle --sign, the .insula
-  installs with nothing left to resolve, and both workers answer jailed. Not done:
-  the Arca-held key, `[bundle] extra-libs`, `make bundle` in `atrium.app.mk`.
+  installs with nothing left to resolve, and both workers answer jailed. Then
+  `[bundle] extra-libs` (library file names, `*` and `?`, for what an app `dlopen`s),
+  carried by both Run and `cargo atrium bundle`, and `make bundle` in
+  `atrium.app.mk` (runs `cargo-atrium bundle`, so the workspace needs the Rust
+  toolchain; `BUNDLE_FLAGS` passes `--sign` and the rest). `vm-run-closure-check.sh`
+  covers both, 24/24. Not done: the Arca-held key.
 - **M8 (M).** `registries` mode: a jailed `nuntius-egress` CONNECT proxy reusing
   `navigator-fetch`'s address policy; the workspace gets no route out, only the
   proxy; per-workspace host list in its record and the Workspaces app. Gate: cargo
@@ -342,6 +346,28 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;
   refused for an installed app.
+  **As built (2026-11-18).** `WorkspaceDebug` (`portcullis workspace debug NAME
+  [folder]`) does what Run does, then binds a socket on the workspace's own loopback
+  (the M8 helper) and answers its address and the program's path. When a debugger in
+  the workspace connects, the dev app's jail starts with `lldb-server gdbserver` on
+  that connection as its entry, the app its child: the app's filter plus the
+  `develop` class's, `allow.unprivileged_proc_debug` in that jail alone, and
+  lldb-server, sh and the base's /lib and /usr/lib mounted read-only at
+  /atrium/debug (the loader is told with `-o LIBRARY_PATH=`, so the app's
+  environment is untouched). Dev builds now run from their bundle's own path
+  (/var/lib/atrium/apps/<id>/<entry>, mounted there in their jail), and a workspace
+  sees its own dev bundles at that path: the kernel names what a jailed process
+  maps by the host's path, and the base lldb (21, -CURRENT with assertions) aborts
+  when the program isn't where the process says it started and it can't see the
+  process. `WorkspaceCores` (`portcullis workspace cores NAME`) moves `*.core`
+  from the workspace's dev bundles' overlays into `work/.atrium/cores/`, the
+  workspace's, opened without following links. Gate `scripts/vm-debug-check.sh`:
+  25/25 in deny mode (a breakpoint, its argument and stack from lldb in Scratch;
+  an installed app can't be seen or attached; a core read there). The gate's
+  crashing app gets a tmpfs overlay: FreeBSD 16-CURRENT fails every core on ZFS
+  with EFAULT, GENERIC too. Not done: Run under debugger from the Terminal's
+  `atrium-run` and Artifex's DAP launch (both can send `WorkspaceDebug`), the frame
+  tag ("dev build, debugging").
 - **M11 (L+).** Artifex v0 as a new app `artifex/` (org.atrium.artifex,
   `workspace-exec`, `embeds = ["terminal"]`): a code-grid text widget in Pergola
   (rope buffer, monospace fast path, multi-cursor) (P4); tree-sitter grammars in a

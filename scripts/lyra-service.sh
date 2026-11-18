@@ -18,12 +18,17 @@ id _lyra >/dev/null 2>&1 || pw useradd _lyra -u 65016 -d /nonexistent -s /usr/sb
 id _choragus >/dev/null 2>&1 || pw useradd _choragus -u 65017 -d /nonexistent -s /usr/sbin/nologin -c "Choragus audio policy"
 
 # Bit-perfect sound(4): no in-kernel vchan mixing or feeder resampling.
-sysctl hw.snd.maxautovchans=0 >/dev/null
+# 16-CURRENT replaced hw.snd.maxautovchans with hw.snd.vchans_enable; set
+# whichever this kernel has.
+if sysctl -N hw.snd.vchans_enable >/dev/null 2>&1; then VCH=hw.snd.vchans_enable; else VCH=hw.snd.maxautovchans; fi
+sysctl $VCH=0 >/dev/null
 for u in $(sysctl -N dev.pcm 2>/dev/null | sed -n 's/^dev\.pcm\.\([0-9]*\)\.bitperfect$/\1/p'); do
     sysctl dev.pcm.$u.bitperfect=1 >/dev/null
     grep -q "^dev.pcm.$u.bitperfect=" /etc/sysctl.conf 2>/dev/null || echo "dev.pcm.$u.bitperfect=1" >> /etc/sysctl.conf
 done
-grep -q '^hw.snd.maxautovchans=' /etc/sysctl.conf 2>/dev/null || echo 'hw.snd.maxautovchans=0' >> /etc/sysctl.conf
+grep -q "^$VCH=" /etc/sysctl.conf 2>/dev/null || echo "$VCH=0" >> /etc/sysctl.conf
+# lyrad needs a sound(4) driver at boot, before its jail launches.
+grep -q '^snd_hda_load=' /boot/loader.conf 2>/dev/null || echo 'snd_hda_load="YES"' >> /boot/loader.conf
 
 # lyrad binds here; only _choragus (group) may reach it.
 install -d -m 0755 /atrium/sockets

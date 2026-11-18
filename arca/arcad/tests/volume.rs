@@ -329,6 +329,47 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
     assert_eq!(k2.lock().unwrap().loaded[0].1, key);
 
+    // Typed into Arca's recovery-code field (Scrinium never sees it): the
+    // handle, once, for the user who typed it, and only from that field.
+    k2.lock().unwrap().loaded.clear();
+    let hold = |t: &mut State, user: &str, v: &str, tag: Option<u8>| -> [u8; 16] {
+        let r = t.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| {
+            w.str(user);
+            w.raw(&[7; 32]);
+            w.str("org.atrium.scrinium");
+            w.bytes(v.as_bytes());
+            if let Some(b) = tag {
+                w.u8(b);
+            }
+        }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().try_into().unwrap()
+    };
+    let by_handle = |t: &mut State, user: &str, h: [u8; 16]| {
+        t.handle(&dispensatord(), volume_op::VK_ADOPT, &body(|w| {
+            w.str(user);
+            w.str("personal");
+            w.raw(&key_id);
+            w.raw(&UUID);
+            w.raw(slot);
+            w.u8(0);
+            w.str("");
+            w.raw(&h);
+        }))
+        .status
+    };
+    let h = hold(&mut t, "alice", &code, None);
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "a password field's value");
+    let h = hold(&mut t, "bob", &code, Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "another user's");
+    let h = hold(&mut t, "alice", &format!(" {code} "), Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(by_handle(&mut t, "alice", h), status::OK);
+    assert_eq!(k2.lock().unwrap().loaded[0].1, key);
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "once");
+    // Nor is a recovery code's handle any app's to redeem.
+    let h = hold(&mut t, "alice", &code, Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(t.handle(&Label::Service(op::WIFI_SERVICE.into()), op::TAKE_WIFI, &h).status, status::DENIED);
+
     // A locked store adopts nothing.
     assert_eq!(t.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code), status::LOCKED);
@@ -372,4 +413,47 @@ fn an_older_copy_opens_read_only_after_verification() {
     assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &bob).status, status::DENIED);
     let other = body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); w.raw(&[1; 16]); });
     assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &other).status, status::DENIED);
+}
+
+#[test]
+fn an_older_copy_becomes_current_after_verification() {
+    let (_d, mut s, k) = setup();
+    let (_, key_id) = mint(&mut s, &dispensatord(), "alice", "work", UUID);
+    let kid: [u8; 16] = key_id.clone().try_into().unwrap();
+    // The stick reached generation 57 here.
+    k.lock().unwrap().generations.push((kid, 57));
+    owner_op(&mut s, volume_op::VK_RECORD, "alice", "work", &key_id);
+    let b = body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); w.raw(&UUID); });
+    // An older copy, opened read-only: the kernel saw generation 12.
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_OLDER, &b).status, status::OK);
+    k.lock().unwrap().generations[0].1 = 12;
+    // Not without Sigillum, and the prompt says what for.
+    assert_eq!(s.handle(&dispensatord(), volume_op::VK_CURRENT, &b).status, status::NEEDS_VERIFICATION);
+    let (user, what) = s.verify_prompt(&dispensatord(), volume_op::VK_CURRENT, &b).unwrap();
+    assert_eq!(user, "alice");
+    assert!(what.starts_with("Use this older copy of"), "{what}");
+    // Another person, another volume: no.
+    let bob = body(|w| { w.str("bob"); w.str("work"); w.raw(&key_id); w.raw(&UUID); });
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &bob).status, status::DENIED);
+    let other = body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); w.raw(&[1; 16]); });
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &other).status, status::DENIED);
+    // Verified: the mark drops to what was mounted, the key is reloaded as usual.
+    let r = s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &b);
+    assert_eq!(r.status, status::OK);
+    assert_eq!(u64::from_le_bytes(r.body.bytes().try_into().unwrap()), 12);
+    let l = k.lock().unwrap().loaded.clone();
+    assert_eq!(l.len(), 1);
+    assert!(!l[0].0.older_read_only);
+    assert_eq!(l[0].0.high_water, 12);
+    // And it stays: a later load carries 12.
+    k.lock().unwrap().loaded.clear();
+    assert_eq!(load(&mut s, &dispensatord(), "alice", "work", &key_id, UUID, 0), status::OK);
+    assert_eq!(k.lock().unwrap().loaded[0].0.high_water, 12);
+    // Never raised by it: a copy at the mark stays at the mark.
+    k.lock().unwrap().generations[0].1 = 30;
+    let r = s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &b);
+    assert_eq!(u64::from_le_bytes(r.body.bytes().try_into().unwrap()), 12);
+    // No key in the kernel (nothing was opened): no.
+    k.lock().unwrap().loaded.clear();
+    assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &b).status, status::DENIED);
 }

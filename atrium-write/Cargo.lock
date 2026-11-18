@@ -1312,6 +1312,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-fontset"
+version = "0.1.0"
+dependencies = [
+ "navigator-fonts",
+ "ttf-parser",
+]
+
+[[package]]
 name = "navigator-image"
 version = "0.1.0"
 dependencies = [
@@ -1338,6 +1346,7 @@ dependencies = [
  "icu_segmenter",
  "navigator-dom",
  "navigator-fonts",
+ "navigator-fontset",
  "navigator-style",
  "navigator-svg",
  "pulldown-cmark",
@@ -1453,7 +1462,7 @@ name = "officina-text"
 version = "0.1.0"
 dependencies = [
  "atrium-fonts",
- "navigator-render",
+ "navigator-fontset",
  "officina-core",
  "officina-shapes",
  "rustybuzz",

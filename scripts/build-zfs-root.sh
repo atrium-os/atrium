@@ -138,6 +138,11 @@ EOF
 # ── 7. /boot/loader.conf — ZFS root, no atrium kmod preload ───────────
 echo "=== 7. Writing /boot/loader.conf ==="
 cat > $ALTROOT/boot/loader.conf <<EOF
+# Boot without the 10 s countdown (docs/spec/fast-boot.md §2.0); 1 s keeps
+# the window to press a key for the loader prompt (RUNBOOK).
+autoboot_delay="1"
+beastie_disable="YES"
+
 # ZFS root
 zfs_load="YES"
 vfs.root.mountfrom="zfs:$POOL/ROOT/default"

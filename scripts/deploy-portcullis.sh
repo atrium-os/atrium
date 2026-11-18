@@ -116,7 +116,8 @@ scp $SSHOPT -P 2222 "$BSD/etc/atrium.devfs.rules" root@localhost:/root/atrium.de
   && g 'mkdir -p /usr/local/etc/atrium &&
         install -m 644 /root/atrium.devfs.rules /usr/local/etc/atrium/devfs.rules &&
         sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null &&
-        service devfs restart >/dev/null &&
+        sysrc -q devfs_load_rulesets=NO >/dev/null &&
+        sh -c ". /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets" >/dev/null &&
         for id in 20 21 22 33; do [ -n "$(devfs rule -s $id show)" ] || exit 1; done' >/dev/null 2>&1 \
   && echo "  rulesets 20 21 22 33 loaded" || { echo "  devfs rulesets FAILED to load"; rc=1; }
 echo "=== pf isolation -> /usr/local/etc/atrium/pf.conf ==="

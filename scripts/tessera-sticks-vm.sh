@@ -182,6 +182,8 @@ check "…as her older copy" yes "$(list_as alice | grep -q "^$PART - .* locked 
 r=$(g "su -m alice -c '$D --media-socket $S --open-older $PART'")
 check "open read-only needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 check "…still not mounted" "" "$(mounted)"
+r=$(g "su -m alice -c '$D --media-socket $S --make-current $PART'")
+check "a Locked copy can't be made current" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 
 echo "=== 7. a recovery code opens it elsewhere (§7.4)"
 g "mdconfig -d -u $MD3"; sleep 3

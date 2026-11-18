@@ -683,11 +683,15 @@ impl Shell {
     }
 
     /// navigatord decided a link is for another program: ask first.
-    pub fn handoff(&mut self, url: &str, scheme: &str, now: f64) {
+    /// `about`: for an `atrium-app:` link, what navigatord learned of the
+    /// app from the package catalog (§6.4).
+    pub fn handoff(&mut self, url: &str, scheme: &str, about: Option<navigator_control::AppAbout>, now: f64) {
         let p = if scheme == "atrium-app" {
             let name = url.trim_start_matches("atrium-app:").trim_start_matches("//");
             let name = name.split(['/', '?', '#']).next().unwrap_or("").to_string();
-            Prompt::OpenApp { url: url.into(), name }
+            let p = Prompt::OpenApp { url: url.into(), name, about };
+            eprintln!("navigator-ui: asking: {}", crate::ax::prompt_text(&p));
+            p
         } else {
             Prompt::Handoff { url: url.into(), scheme: scheme.into() }
         };
@@ -1814,15 +1818,28 @@ mod tests {
     fn hand_offs_ask_and_name_the_app() {
         let mut s = shell();
         s.live = Some(LivePage::Shown(String::new()));
-        s.handoff("atrium-app://example.com/photos?path=/x", "atrium-app", 0.0);
+        s.handoff("atrium-app://example.com/photos?path=/x", "atrium-app", None, 0.0);
         let a = s.store.trail().page().unwrap().asked.clone().unwrap();
-        assert_eq!(a.prompt, Prompt::OpenApp { url: "atrium-app://example.com/photos?path=/x".into(), name: "example.com".into() });
+        assert_eq!(a.prompt, Prompt::OpenApp { url: "atrium-app://example.com/photos?path=/x".into(), name: "example.com".into(), about: None });
         assert!(s.answer(2, 600.0), "Try it");
         assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "atrium-app://example.com/photos?path=/x".into(), how: navigator_control::Hand::Try, press: [0; 16] }));
-        s.handoff("mailto:a@atlas.example", "mailto", 2000.0);
+        s.handoff("mailto:a@atlas.example", "mailto", None, 2000.0);
         assert_eq!(s.store.trail().page().unwrap().asked.as_ref().unwrap().prompt.answers(), &["Not now", "Open"]);
         assert!(s.answer(1, 2600.0));
         assert_eq!(s.outbox.pop(), Some(Out::Hand { url: "mailto:a@atlas.example".into(), how: navigator_control::Hand::Open, press: [0; 16] }));
+    }
+
+    #[test]
+    fn the_app_prompt_says_who_publishes_it_and_what_it_asks_for() {
+        use navigator_control::AppAbout;
+        let about = |caps: &[&str], installed| AppAbout { name: "Photos".into(), publisher: "Example Ltd (example.com)".into(),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(), installed, third_party: true };
+        let p = Prompt::OpenApp { url: "atrium-app://org.example.photos".into(), name: "org.example.photos".into(), about: Some(about(&["files", "network-read"], true)) };
+        assert_eq!(crate::ax::prompt_text(&p), "This link opens the app Photos by Example Ltd (example.com); it asks for files, network-read");
+        let w = crate::trail::app_words("x", Some(&about(&["a", "b", "c", "d", "e"], false)));
+        assert_eq!(w.2, "asks for a, b, c and 2 more; not installed, Open asks to install it");
+        let p = Prompt::OpenApp { url: "atrium-app://org.example.side".into(), name: "org.example.side".into(), about: None };
+        assert_eq!(crate::ax::prompt_text(&p), "This link opens the app org.example.side, not in the package catalog");
     }
 
     #[test]

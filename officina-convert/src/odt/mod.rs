@@ -1,8 +1,10 @@
 //! OpenDocument Text (`.odt`): reader and writer for officina-text.
 
+#[cfg(feature = "read")]
 pub mod read;
 pub mod write;
 
+#[cfg(feature = "read")]
 pub use read::{read, OdtError};
 pub use write::write;
 

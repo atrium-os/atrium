@@ -1233,11 +1233,19 @@ fn prompt_row(ctx: &mut Ctx, r: Rect, p: &Prompt, st: &Mutable<Shell>) {
             (format!("This link is for another program ({scheme}):"), body(t.text_secondary(), Weight::Regular)),
             (url.trim_start_matches(&format!("{scheme}:")).chars().take(80).collect(), body(t.text_primary(), Weight::Semibold)),
         ]),
-        Prompt::OpenApp { name, .. } => (ph::ARROW_RIGHT, vec![
-            ("This link opens the app".into(), body(t.text_secondary(), Weight::Regular)),
-            (name.chars().take(80).collect(), body(t.text_primary(), Weight::Semibold)),
-            ("· Try it keeps nothing".into(), body(t.text_secondary(), Weight::Regular)),
-        ]),
+        Prompt::OpenApp { name, about, .. } => {
+            let (n, by, asks) = crate::trail::app_words(name, about.as_ref());
+            let mut v = vec![
+                ("This link opens the app".into(), body(t.text_secondary(), Weight::Regular)),
+                (n.chars().take(60).collect(), body(t.text_primary(), Weight::Semibold)),
+            ];
+            if let Some(by) = by {
+                v.push(("by".into(), body(t.text_secondary(), Weight::Regular)));
+                v.push((by.chars().take(60).collect(), body(t.text_primary(), Weight::Semibold)));
+            }
+            v.push((format!("· {asks} · Try it keeps nothing"), body(t.text_secondary(), Weight::Regular)));
+            (ph::ARROW_RIGHT, v)
+        }
         Prompt::NotPrivate { origin } => (ph::WARNING, vec![
             ("This form is on".into(), body(t.text_secondary(), Weight::Regular)),
             (origin.clone(), body(t.text_primary(), Weight::Semibold)),

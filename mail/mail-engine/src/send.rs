@@ -123,6 +123,55 @@ impl Engine {
         self.draft_of(&o).map(Some)
     }
 
+    /// Add a sent message's recipients to the address book (§14.2), with
+    /// the names the draft gave them.
+    fn note_wrote(&self, w: &mut mail_store::Writer<'_>, o: &Outgoing) -> mail_store::Result<()> {
+        let draft = self.draft_of(o).unwrap_or_default();
+        let named: Vec<(&str, &str)> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc).map(|m| (m.name.as_str(), m.addr.as_str())).collect();
+        let to: Vec<(&str, &str)> = o
+            .rcpts
+            .iter()
+            .map(|r| named.iter().find(|(_, a)| a.eq_ignore_ascii_case(r)).copied().unwrap_or(("", r.as_str())))
+            .collect();
+        w.wrote_to(Some(&o.message_id), &to, o.later.unwrap_or_else(now))
+    }
+
+    /// Who `typed` could mean, from the address book (§14.2): at most `n`,
+    /// most likely first.
+    pub fn complete(&self, typed: &str, n: usize) -> Result<Vec<mail_store::people::Person>, Error> {
+        Ok(self.store.complete(typed, now(), n)?)
+    }
+
+    /// Fill an empty address book from the Sent folders already synced
+    /// (a store from before the address book). The people added.
+    pub fn people_from_sent(&self) -> Result<u64, Error> {
+        if self.store.people_count()? > 0 {
+            return Ok(0);
+        }
+        for (account, _) in self.store.accounts()? {
+            let Some((sent, _)) = self.store.folders(account)?.into_iter().find(|(_, f)| f.role == Role::Sent && !f.hidden) else { continue };
+            let mut offset = 0;
+            loop {
+                let rows = self.store.list(sent, offset, 500)?;
+                if rows.is_empty() {
+                    break;
+                }
+                offset += rows.len();
+                self.store.write(|w| {
+                    for r in &rows {
+                        if let Ok(m) = self.store.message(r.msg) {
+                            let s = &m.summary;
+                            let to: Vec<(&str, &str)> = s.to.iter().chain(&s.cc).chain(&s.bcc).map(|a| (a.name.as_str(), a.addr.as_str())).collect();
+                            w.wrote_to(s.message_id.as_deref(), &to, m.date)?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(self.store.people_count()?)
+    }
+
     /// The draft a send was written from.
     pub fn draft_of(&self, o: &Outgoing) -> Result<Draft, Error> {
         let b = self.store.blob(&o.draft)?;
@@ -156,7 +205,10 @@ impl Engine {
         };
         match crate::accounts::submit(s, &submit::Outgoing { from: &o.from, rcpts: &o.rcpts, bytes: &bytes, hold_for }) {
             Ok(sent) => {
-                self.store.write(|w| w.send_done(id))?;
+                self.store.write(|w| {
+                    w.send_done(id)?;
+                    self.note_wrote(w, &o)
+                })?;
                 let held = hold_for.is_some();
                 Ok(Delivery::Sent { copy: (!files_sent).then_some(bytes), rejected: sent.rejected, held })
             }
@@ -171,7 +223,7 @@ impl Engine {
 
     /// [`Engine::deliver`] over JMAP (§6.1): the server files the copy in
     /// Sent itself, and holds it until later when it can.
-    pub fn deliver_jmap<H: mail_sync::jmap::Http>(&self, id: u64, client: &mut mail_sync::jmap::Client<H>) -> Result<Delivery, Error> {
+    pub fn deliver_jmap(&self, id: u64, client: &mut dyn mail_sync::jmap::Jmap) -> Result<Delivery, Error> {
         let t = now();
         if !self.store.write(|w| w.claim_send(id, t))? {
             return Ok(Delivery::NotDue);
@@ -197,7 +249,10 @@ impl Engine {
         };
         match client.send(&bytes, &o.from, &o.rcpts, send_at) {
             Ok(_) => {
-                self.store.write(|w| w.send_done(id))?;
+                self.store.write(|w| {
+                    w.send_done(id)?;
+                    self.note_wrote(w, &o)
+                })?;
                 Ok(Delivery::Sent { copy: None, rejected: Vec::new(), held: send_at.is_some() })
             }
             // The server said no to this message: trying again won't help.

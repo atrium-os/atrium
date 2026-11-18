@@ -23,6 +23,10 @@ open-attachments = true
 # New mail and the Later review through Praeco (§12): quiet by default,
 # never a storm after a gap.
 notify = true
+# The roles Mail embeds through limend: the system picker (attach, Save),
+# a doc-viewer for HTML bodies and the quote under a reply, a pdf-viewer
+# and a media-player for quick look, and the credential sheet (sign-in).
+embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential"]
 
 # The parser (§4): every message is parsed here, in a jail of its own as
 # a uid of its own, with no capability (app-composition.md §4).
@@ -31,10 +35,11 @@ name   = "parse"
 entry  = "bin/mail-parse-jail"
 memory = "512M"
 
-# Sync (§4): one account's IMAP session, in a jail of its own with no
-# capability. The engine relays the courier's bytes to it and answers its
-# store calls; it parses every byte the server sends. One per session,
-# kept while the session lasts (an IDLE waits up to 25 minutes).
+# Sync (§4): one account's session (IMAP, SMTP submission or JMAP), in a
+# jail of its own with no capability. The engine relays the courier's
+# bytes (or makes its HTTP requests) and answers its store calls; it parses
+# every byte the server sends. One per session, kept while the session
+# lasts (an IDLE waits up to 25 minutes).
 [[workers]]
 name     = "sync"
 entry    = "bin/mail-sync-worker"

@@ -1,0 +1,38 @@
+# Atrium Sheets — Officina's spreadsheet (docs/spec/officina.md §16.2).
+# It draws through Fresco and gets workbooks only as descriptors: from the
+# picker, or handed over by portcullisd when the user opens one in Scrinium
+# (opening-files.md §6.2). It reads no folder by itself and has no network.
+[app]
+id          = "org.atrium.sheets"
+name        = "Sheets"
+version     = "0.1.0"
+entry       = "bin/atrium-sheets"
+description = "Work with spreadsheets."
+icon        = "table"
+
+[capabilities]
+graphics = "fresco"
+network  = "none"
+# Limen roles it embeds (app-composition.md §3): the picker for Open and Save.
+embeds   = ["picker"]
+
+# The converter (officina.md §5.2): a foreign file is read here, in a jail
+# of its own as a uid of its own, with no capability (app-composition.md §4).
+[[workers]]
+name   = "convert"
+entry  = "bin/officina-convert"
+memory = "2G"
+cpu    = "2m"
+
+[[opens]]
+types = [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "text/csv",
+]
+mode = "edit"
+
+# Excel 97–2003 files are read, not written: a copy is saved elsewhere.
+[[opens]]
+types = ["application/vnd.ms-excel"]
+mode = "view"

@@ -386,3 +386,64 @@ mod tests {
         }
     }
 }
+
+/// What the supervisor tells a decode worker started through the platform
+/// SDK (`[[workers]] decode`), first thing on its socket: which extra
+/// descriptors it was given (from 3 on: the codec host's socket, then the
+/// CDM's) and its memory limit. A worker started by hand gets the same as
+/// arguments (`--h264-fd`, `--cdm-fd`, `--mem-mib`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdkStart {
+    pub h264: bool,
+    pub cdm: bool,
+    pub mem_mib: u32,
+}
+
+impl SdkStart {
+    pub const LEN: usize = 12;
+    const MAGIC: [u8; 4] = *b"APD1";
+
+    pub fn encode(&self) -> [u8; Self::LEN] {
+        let mut b = [0u8; Self::LEN];
+        b[..4].copy_from_slice(&Self::MAGIC);
+        b[4] = u8::from(self.h264) | u8::from(self.cdm) << 1;
+        b[8..].copy_from_slice(&self.mem_mib.to_le_bytes());
+        b
+    }
+
+    /// `None` for anything but a start this supervisor would send.
+    pub fn decode(b: &[u8; Self::LEN]) -> Option<SdkStart> {
+        if b[..4] != Self::MAGIC || b[4] & !3 != 0 || b[5..8] != [0, 0, 0] {
+            return None;
+        }
+        let mem_mib = u32::from_le_bytes(b[8..].try_into().ok()?);
+        if mem_mib == 0 || mem_mib > 16 << 10 {
+            return None;
+        }
+        Some(SdkStart { h264: b[4] & 1 != 0, cdm: b[4] & 2 != 0, mem_mib })
+    }
+
+    /// How many extra descriptors it names.
+    pub fn extra(&self) -> usize { usize::from(self.h264) + usize::from(self.cdm) }
+}
+
+#[cfg(test)]
+mod sdk_start_tests {
+    use super::SdkStart;
+
+    #[test]
+    fn round_trips_and_refuses_the_rest() {
+        for (h264, cdm) in [(false, false), (true, false), (false, true), (true, true)] {
+            let s = SdkStart { h264, cdm, mem_mib: 768 };
+            assert_eq!(SdkStart::decode(&s.encode()), Some(s));
+            assert_eq!(s.extra(), usize::from(h264) + usize::from(cdm));
+        }
+        let mut b = SdkStart { h264: true, cdm: false, mem_mib: 768 }.encode();
+        b[4] |= 4;
+        assert_eq!(SdkStart::decode(&b), None);
+        let mut b = SdkStart { h264: false, cdm: false, mem_mib: 0 }.encode();
+        assert_eq!(SdkStart::decode(&b), None);
+        b[0] = b'X';
+        assert_eq!(SdkStart::decode(&b), None);
+    }
+}

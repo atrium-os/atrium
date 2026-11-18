@@ -75,7 +75,7 @@ else
 say "cross-build (host)"
 : "${TARGET:?run through scripts/cloud-vm.sh lyra}"
 for c in lyra choragus; do
-    (cd "$ROOT/$c" && RUSTFLAGS="${CROSS_RUSTFLAGS:-}" cargo +nightly build --quiet --target "$TARGET" \
+    (cd "$ROOT/$c" && RUSTFLAGS="${CROSS_RUSTFLAGS:-}" cargo build --quiet --target "$TARGET" \
         -Z build-std=std,panic_abort --bins ${LYRA_RELEASE:+--release}) || die "$c cross-build"
 done
 echo "  built"

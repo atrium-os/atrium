@@ -1,0 +1,16 @@
+[package]
+name = "navigator-fontset"
+version = "0.1.0"
+edition = "2021"
+description = "Navigator's pinned font set (navigator-backend §4.1a): the shipped faces, canonicalized and checked against pinned addresses. navigator-render re-exports it as `fontset`."
+publish = false
+
+[dependencies]
+navigator-fonts = { path = "../navigator-fonts" }
+ttf-parser = "0.25"
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd (see its
+# vendor/README.md); a dependent crate must repeat the patch, because
+# [patch] only applies at the root of the build.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }

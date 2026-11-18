@@ -15,8 +15,10 @@ name = "atrium-slides"
 path = "src/bin/atrium_slides.rs"
 
 [dependencies]
+atrium-open = { path = "../atrium-open" }
 officina-core = { path = "../officina-core" }
-officina-convert = { path = "../officina-convert" }
+# Writers, protection and the launcher: the readers run in the convert worker.
+officina-convert = { path = "../officina-convert", default-features = false }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
 navigator-image = { path = "../navigator-image", features = ["office"] }
@@ -35,4 +37,16 @@ png = "0.17"
 pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 
 [profile.release]
+# What ships in the bundle: no debug info, symbols stripped.
+strip = true
+
+# `--profile profiling`: release code with line tables, for perf and the
+# stall probes.
+[profile.profiling]
+inherits = "release"
 debug = 1
+strip = false
+
+[dev-dependencies]
+# Tests make foreign sample files with the readers' crate.
+officina-convert = { path = "../officina-convert", features = ["read"] }

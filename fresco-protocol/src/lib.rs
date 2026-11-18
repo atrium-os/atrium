@@ -2443,9 +2443,12 @@ pub struct GlyphRunParams {
 /// bound the colour slot; otherwise frescod clears it.
 pub const GLYPH_COLOR: u32 = 0x8000_0000;
 
-/// A colour atlas's size in texels.
-pub const COLOR_ATLAS_W: u32 = 512;
-pub const COLOR_ATLAS_H: u32 = 512;
+/// A colour atlas's size in texels: half its glyph atlas's each way
+/// (a quarter of the texels, at four bytes each), so an app with a large
+/// glyph atlas gets a large colour one.
+pub const fn color_atlas_dims(atlas_w: u32, atlas_h: u32) -> (u32, u32) {
+    (atlas_w / 2, atlas_h / 2)
+}
 
 /// The colour atlas slot paired with glyph atlas slot `slot`.
 pub const fn color_atlas_slot(slot: u32) -> u32 {
@@ -2658,6 +2661,18 @@ pub mod activation {
         /// link was just handed to. Only by a caller that spent a `LINK`
         /// press in the last two minutes, once per press.
         pub const RAISE: u16 = 0x0902;
+        /// `Note` → `NoteResult`: a note in the strip over the window a
+        /// paste or drop press was just spent for (personas.md §6). Only
+        /// by the caller that spent it, once per press, within
+        /// five seconds; frescod writes the words.
+        pub const NOTE: u16 = 0x0903;
+    }
+
+    /// What a strip note says; frescod words it.
+    pub mod note {
+        /// "paste refused: copied in <persona>": the entry is in another
+        /// persona and the person's switch doesn't let it cross.
+        pub const COPIED_IN: u8 = 1;
     }
 
     /// What a broker spends a token on (§2.2's table decides which kinds fit).
@@ -2752,6 +2767,22 @@ pub mod activation {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Raise {
         pub uid: u32,
+    }
+
+    /// A strip note over `window_id`: `kind` from [`note`], `persona` the
+    /// one named (lower case, at most 32 bytes of an origin's characters;
+    /// frescod drops the rest).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Note {
+        pub window_id: u32,
+        pub kind: u8,
+        pub persona: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum NoteResult {
+        Ok,
+        Refused { reason: u8 },
     }
 
     /// `NOT_ALLOWED`: no `LINK` press spent lately; `UNKNOWN`: `uid` has

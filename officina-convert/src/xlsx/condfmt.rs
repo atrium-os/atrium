@@ -9,6 +9,7 @@ use officina_grid::addr::{a1, Rect};
 use officina_grid::condfmt::{Cfvo, CmpOp, CondFormat, Dxf, Rule, RuleKind, TextOp};
 use officina_grid::formula;
 use officina_grid::Workbook;
+#[cfg(feature = "read")]
 use quick_xml::events::Event;
 
 use crate::report::{Kind, Report};
@@ -205,10 +206,12 @@ pub fn sheet_xml(wb: &Workbook, s: u16, dxfs: &[Dxf], o: &mut Vec<u8>) {
     }
 }
 
+#[cfg(feature = "read")]
 fn attrs(e: &quick_xml::events::BytesStart) -> HashMap<Vec<u8>, String> {
     e.attributes().flatten().map(|a| (a.key.local_name().as_ref().to_vec(), a.unescape_value().map(|v| v.into_owned()).unwrap_or_default())).collect()
 }
 
+#[cfg(feature = "read")]
 fn rgb(a: &HashMap<Vec<u8>, String>, theme: &[u32]) -> Option<u32> {
     let t = a.get(b"tint".as_slice()).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     let base = if let Some(v) = a.get(b"rgb".as_slice()) {
@@ -223,6 +226,7 @@ fn rgb(a: &HashMap<Vec<u8>, String>, theme: &[u32]) -> Option<u32> {
     Some(super::styles::tint(base, t))
 }
 
+#[cfg(feature = "read")]
 /// The `<dxfs>` of a styles part.
 pub fn read_dxfs(xml: &[u8], theme: &[u32]) -> Vec<Dxf> {
     let mut out = Vec::new();
@@ -297,6 +301,7 @@ pub struct Raw {
     pub inner: Vec<u8>,
 }
 
+#[cfg(feature = "read")]
 /// Turns a sheet's `<conditionalFormatting>`s into the workbook's formats.
 pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: &[u32], rep: &mut Report) {
     // Excel orders rules by priority across the sheet; keep that order per format.
@@ -393,6 +398,7 @@ pub fn read_sheet(wb: &mut Workbook, s: u16, raws: &[Raw], dxfs: &[Dxf], theme: 
     }
 }
 
+#[cfg(feature = "read")]
 #[allow(clippy::too_many_arguments)]
 fn make(wb: &Workbook, s: u16, origin: (u32, u32), a: HashMap<Vec<u8>, String>, formulas: &[String], cfvos: &[(String, Option<String>)], gtes: &[bool], colors: &[u32], dxfs: &[Dxf], rep: &mut Report) -> Option<(u32, Rule)> {
     let get = |k: &str| a.get(k.as_bytes()).map(String::as_str);

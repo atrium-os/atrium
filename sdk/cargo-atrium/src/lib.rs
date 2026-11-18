@@ -9,3 +9,4 @@ pub mod registry;
 pub mod fuzz;
 pub mod worker;
 pub mod bundle;
+pub mod programs;

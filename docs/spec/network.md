@@ -40,7 +40,7 @@ stands; what changes is the plumbing under it.
 
 | app's capability | its stack holds |
 |---|---|
-| none (default) | only its own `lo0`, down — nothing to reach, nothing to read |
+| none (default) | only its own `lo0`, down — nothing to reach, nothing to read. Jaild's one-shots and workers on a netblind kernel get no stack at all instead: `ip4`/`ip6` disabled, and the kernel shows them none of the host's network (portcullis.md §9.1c) |
 | `loopback` | its own `lo0` up on 127.0.0.1/::1 (configured from the host after creation) |
 | network | its own `lo0` plus ONE end of an epair, with a **per-app derived MAC** (`02:…`, locally administered, stable, from the same machine secret as the hostid) and a **point-to-point /30** from `100.64.0.0/16`: host end `.1`, app `.2`, default route via `.1` |
 

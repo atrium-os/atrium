@@ -227,6 +227,7 @@ const BK_HMAC_KEY: [u8; 8] = [0x5f, 0xb2, 0xad, 0x01, 0x0c, 0xb9, 0xe1, 0xf6];
 const BK_HMAC_VALUE: [u8; 8] = [0xa0, 0x67, 0x7f, 0x02, 0xb2, 0x2c, 0x84, 0x33];
 const SEGMENT: usize = 4096;
 
+#[cfg(feature = "read")]
 /// The attributes of an Agile `EncryptionInfo`'s elements.
 #[derive(Default)]
 struct Params {
@@ -242,6 +243,7 @@ struct Params {
     cipher_ok: bool,
 }
 
+#[cfg(feature = "read")]
 fn params(e: &quick_xml::events::BytesStart, p: &mut Params) -> Result<(), CryptError> {
     let (mut alg, mut chain) = (String::new(), String::new());
     for a in e.attributes().flatten() {
@@ -268,6 +270,7 @@ fn params(e: &quick_xml::events::BytesStart, p: &mut Params) -> Result<(), Crypt
     Ok(())
 }
 
+#[cfg(feature = "read")]
 /// Decrypts a password-protected OOXML file to its ZIP package.
 pub fn decrypt(file: &[u8], password: &str) -> Result<Vec<u8>, CryptError> {
     let c = cfb::Cfb::open(file).map_err(|e| CryptError::Damaged(e.to_string()))?;
@@ -285,6 +288,7 @@ pub fn decrypt(file: &[u8], password: &str) -> Result<Vec<u8>, CryptError> {
     }
 }
 
+#[cfg(feature = "read")]
 fn agile(xml: &[u8], pkg: &[u8], password: &str) -> Result<Vec<u8>, CryptError> {
     let (mut data, mut pw) = (Params::default(), Params::default());
     let (mut hmac_key, mut hmac_value) = (Vec::new(), Vec::new());
@@ -380,6 +384,7 @@ fn agile(xml: &[u8], pkg: &[u8], password: &str) -> Result<Vec<u8>, CryptError> 
     Ok(out)
 }
 
+#[cfg(feature = "read")]
 fn standard(b: &[u8], pkg: &[u8], password: &str) -> Result<Vec<u8>, CryptError> {
     // Flags, header size, header (8 u32s and the CSP name), verifier.
     if b.len() < 8 {

@@ -132,3 +132,44 @@ fn stdio_worker() {
     assert_eq!(p.wait(), Some(4));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The child side of `socket_worker_with_extra`: this test binary, re-run.
+#[test]
+fn socket_child() {
+    if std::env::var_os("ATRIUM_WORKER_SOCKET_CHILD").is_none() { return }
+    let mut st = atrium_worker::socket_worker(1).unwrap();
+    let mut extra = String::new();
+    std::fs::File::from(st.extra.remove(0)).read_to_string(&mut extra).unwrap();
+    let mut line = [0u8; 5];
+    st.sock.read_exact(&mut line).unwrap();
+    write!(st.sock, "{} {} {}", String::from_utf8_lossy(&line), extra.trim(), st.capsicum).unwrap();
+    std::process::exit(5);
+}
+
+#[test]
+fn socket_worker_with_extra() {
+    let dir = std::env::temp_dir().join(format!("atrium-worker-socket-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let sh = format!("#!/bin/sh\nATRIUM_WORKER_SOCKET_CHILD=1 exec {} --exact socket_child --nocapture --test-threads 1 >/dev/null\n", exe.display());
+    std::fs::write(dir.join("bin/dec"), sh).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("bin/dec"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("atrium.toml"), "[[workers]]\nname = \"dec\"\nentry = \"bin/dec\"\nisolation = \"capsicum\"\n").unwrap();
+    let w = Workers::from_root(&dir, true).unwrap();
+    // The extra descriptor: a pipe with a line in it (another service's socket, in the Player).
+    let (r, mut wr) = std::io::pipe().unwrap();
+    wr.write_all(b"codec\n").unwrap();
+    drop(wr);
+    use std::os::fd::AsFd;
+    let mut p = w.spawn_socket("dec", &[r.as_fd()]).unwrap();
+    drop(r);
+    p.sock.write_all(b"frame").unwrap();
+    p.sock.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut out = String::new();
+    p.sock.read_to_string(&mut out).unwrap();
+    // Local mode: no capability mode asked for, whatever the manifest says.
+    assert_eq!(out, "frame codec false");
+    assert_eq!(p.wait(), Some(5));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -177,8 +177,9 @@ FreeBSD's make; both must come from Homebrew, not Xcode.)"
 Then re-run this script."
     # The tree pins nightly + rust-src in rust-toolchain.toml; rustup honours it
     # automatically, but rust-src must actually be fetched or build-std fails.
-    rustup component add rust-src --toolchain nightly >/dev/null 2>&1 || true
-    ok "rustup (tree pins nightly + rust-src)"
+    TC=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")
+    rustup toolchain install "$TC" --profile minimal --component rust-src >/dev/null 2>&1 || true
+    ok "rustup (tree pins $TC + rust-src)"
 
     # Disk. The kernel objdir, QEMU build and FreeBSD sets are large.
     avail=$(df -g "$REPO" | awk 'NR==2 {print $4}')
@@ -783,18 +784,21 @@ if [ -f "$D/kmod/tessera_fs.ko" ]; then
 fi
 
 echo "== devfs rulesets =="
-# rc.d/devfs loads every file in devfs_rulesets at boot; `service devfs
-# restart` loads them now. jaild and portcullis refuse a jail whose ruleset has
-# no rules, so an Atrium jail cannot start until this has run.
+# jaild and portcullis refuse a jail whose ruleset has no rules. Atrium's
+# services launch before netif, ahead of rc.d/devfs, so the atrium_jaild rc
+# script loads every file in devfs_rulesets at boot, and rc.d/devfs is told not
+# to load them again (its delete-and-re-add would leave a gap under jails
+# launching at that moment: docs/spec/fast-boot.md §4.1). Loaded now as well.
 mkdir -p /usr/local/etc/atrium
 install -m 644 "$D/etc/atrium.devfs.rules" /usr/local/etc/atrium/devfs.rules
 sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null
-service devfs restart >/dev/null
+sysrc -q devfs_load_rulesets=NO >/dev/null
+sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets' >/dev/null
 for id in 20 21 22; do
     [ -n "$(devfs rule -s $id show 2>/dev/null)" ] \
         || { echo "  FATAL: devfs ruleset $id did not load"; exit 1; }
 done
-echo "  loaded rulesets 20 21 22 (and on every boot via devfs_rulesets)"
+echo "  loaded rulesets 20 21 22 (and on every boot by the atrium_jaild rc script)"
 
 echo "== pf isolation =="
 # jaild refuses to create a networked jail unless pf is enabled with the app->host

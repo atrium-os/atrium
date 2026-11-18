@@ -117,7 +117,7 @@ service atrium-jaild stop >/dev/null 2>&1
 install -m 0755 atrium-jaild /usr/local/bin/atrium-jaild
 install -m 0755 atrium-dispensatord /usr/local/bin/atrium-dispensatord
 install -m 0644 atrium.devfs.rules /usr/local/etc/atrium/devfs.rules
-service devfs restart >/dev/null 2>&1
+sh -c ". /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets" >/dev/null 2>&1
 devfs rule -s 31 show | grep -q . && echo "  ok ruleset 31 (atrium_capsa) loaded" || echo "  FAIL ruleset 31 not loaded"
 # The shipped pin, uid and profile (deploy-portcullis.sh writes its own policy).
 [ -f $P.automount-bak ] || cp $P $P.automount-bak

@@ -124,11 +124,11 @@ set -- env; . "$ROOT/scripts/cloud-vm.sh"
 S="$VMDIR/sysroot"
 export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
 export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$S"
-(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo +nightly build --quiet --release \
+(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --quiet --release \
     --target $TARGET -Z build-std=std,panic_abort --bin navigator-fetchd) || die "fetchd cross-build"
 # Tests need unwinding, so their own std build.
 TESTBIN=$(cd "$ROOT/navigator-fetch" && RUSTFLAGS="$CROSS_RUSTFLAGS" CARGO_TARGET_DIR=target/xtest \
-    cargo +nightly test --release --target $TARGET -Z build-std --lib --no-run --message-format=json 2>/dev/null \
+    cargo test --release --target $TARGET -Z build-std --lib --no-run --message-format=json 2>/dev/null \
     | python3 -I -c 'import json,sys
 for l in sys.stdin:
     try: m=json.loads(l)

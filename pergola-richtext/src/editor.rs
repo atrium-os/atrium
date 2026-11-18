@@ -2593,6 +2593,47 @@ impl Editor {
         self.doc.para(p.block).is_some_and(|q| q.text[p.at.min(q.text.len() as u32) as usize..].starts_with(OBJECT_CHAR) && { let x = self.doc.attrs.get(q.attr_at(p.at)); x.deleted.is_some() || x.conflict.is_some() })
     }
 
+    /// Left and Right on a line with right-to-left text move on screen:
+    /// to the nearest caret place to that side. At the line's edge, on to
+    /// the line after (or before) in the paragraph's own direction. `None`
+    /// on an all left-to-right line, where moving is logical.
+    fn visual_step(&mut self, c: Pos, right: bool) -> Option<Pos> {
+        let (l, li) = self.line_of(c);
+        let line = &l.lines[li];
+        if line.visual.is_empty() {
+            return None;
+        }
+        let text = self.text(c.block);
+        let (start, end) = (line.start as usize, (line.end as usize).min(text.len()));
+        let here = l.caret_x(li, c.at, text);
+        let mut best: Option<(i64, u32)> = None;
+        let places = text[start..end].grapheme_indices(true).map(|(i, _)| (start + i) as u32).chain([end as u32]);
+        for at in places {
+            if at == c.at || self.tomb_at(Pos::new(c.block, at)) {
+                continue;
+            }
+            let x = l.caret_x(li, at, text);
+            let d = if right { x - here } else { here - x };
+            if d > 0 && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, at));
+            }
+        }
+        Some(match best {
+            Some((_, at)) => Pos::new(c.block, at),
+            // Past the edge: the next line in reading order, which for a
+            // right-to-left paragraph is past its left edge.
+            None if right != l.rtl => {
+                if line.end > c.at && (line.end as usize) < text.len() {
+                    // A wrapped line's end is the next line's start.
+                    Pos::new(c.block, line.end)
+                } else {
+                    self.grapheme_right(Pos::new(c.block, line.end.max(c.at)))
+                }
+            }
+            None => self.grapheme_left(Pos::new(c.block, line.start.min(c.at))),
+        })
+    }
+
     fn grapheme_right(&self, p: Pos) -> Pos {
         let t = self.text(p.block);
         if p.at as usize >= t.len() {
@@ -2730,8 +2771,8 @@ impl Editor {
         let to = match m {
             Motion::Left if collapse => a,
             Motion::Right if collapse => b,
-            Motion::Left => self.grapheme_left(c),
-            Motion::Right => self.grapheme_right(c),
+            Motion::Left => self.visual_step(c, false).unwrap_or_else(|| self.grapheme_left(c)),
+            Motion::Right => self.visual_step(c, true).unwrap_or_else(|| self.grapheme_right(c)),
             Motion::WordLeft => self.word_left(c),
             Motion::WordRight => self.word_right(c),
             Motion::LineStart | Motion::LineEnd => {
@@ -3027,6 +3068,49 @@ pub(crate) mod tests {
     const SHIFT: Modifiers = Modifiers { shift: true, ctrl: false, alt: false, meta: false };
     const CTRL: Modifiers = Modifiers { shift: false, ctrl: true, alt: false, meta: false };
     const CTRL_SHIFT: Modifiers = Modifiers { shift: true, ctrl: true, alt: false, meta: false };
+
+    /// Arrow keys on a line with right-to-left text move on screen: each
+    /// Right press is further right, every caret place is visited once, and
+    /// Left comes back the same way; past the edge, the next paragraph.
+    #[test]
+    fn arrows_move_visually_across_directions() {
+        let text = "ab \u{5E9}\u{5DC}\u{5D5}\u{5DD} cd";
+        let mut e = ed(&[text, "next"]);
+        let x = |e: &mut Editor| {
+            let c = e.caret;
+            let (l, li) = e.line_of(c);
+            e.x_in_line(c.block, &l, &l.lines[li], c.at)
+        };
+        e.set_caret(Pos::new(0, 0), false);
+        let mut seen = vec![(x(&mut e), e.caret.at)];
+        for _ in 0..20 {
+            e.key(Key::Right, NO, "", 0);
+            if e.caret.block != 0 {
+                break;
+            }
+            let now = (x(&mut e), e.caret.at);
+            assert!(now.0 > seen.last().unwrap().0, "{seen:?} then {now:?}");
+            seen.push(now);
+        }
+        assert_eq!(e.caret, Pos::new(1, 0), "past the right edge: the next paragraph");
+        let mut places: Vec<u32> = seen.iter().map(|s| s.1).collect();
+        places.sort();
+        places.dedup();
+        assert!(places.len() >= text.chars().count(), "each place once: {seen:?}");
+        // A right-to-left paragraph starts at the right: Left reads on.
+        let mut r = ed(&["\u{5E9}\u{5DC}\u{5D5}\u{5DD}"]);
+        r.set_caret(Pos::new(0, 0), false);
+        r.key(Key::Left, NO, "", 0);
+        assert_eq!(r.caret.at, 2, "one Hebrew letter on (two bytes)");
+        r.key(Key::Right, NO, "", 0);
+        assert_eq!(r.caret.at, 0);
+        // And back: Left retraces the same places.
+        e.set_caret(Pos::new(0, seen.last().unwrap().1), false);
+        for want in seen.iter().rev().skip(1) {
+            e.key(Key::Left, NO, "", 0);
+            assert_eq!(e.caret.at, want.1, "{seen:?}");
+        }
+    }
 
     fn typ(e: &mut Editor, s: &str) {
         for c in s.chars() {

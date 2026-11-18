@@ -197,7 +197,12 @@ pub fn sign(manifest: &[u8], key_pem: &str) -> Result<Vec<u8>, SigError> {
         };
     }
     use p256::pkcs8::DecodePrivateKey;
-    let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
+    // PKCS#8 ("BEGIN PRIVATE KEY"), or SEC1 ("BEGIN EC PRIVATE KEY", what
+    // `openssl ecparam -genkey` writes).
+    let k = match SigningKey::from_pkcs8_pem(key_pem) {
+        Ok(k) => k,
+        Err(_) => p256::SecretKey::from_sec1_pem(key_pem).map(SigningKey::from).map_err(|_| SigError::BadKey)?,
+    };
     let s: Signature = k.sign(manifest);
     Ok(s.to_der().as_bytes().to_vec())
 }
@@ -228,6 +233,18 @@ pub fn public_pem(key_pem: &str) -> Result<String, SigError> {
 
 #[cfg(test)]
 mod sign_tests {
+    #[test]
+    fn signs_with_a_sec1_key_too() {
+        use p256::pkcs8::LineEnding;
+        let (pkcs8, public) = super::new_key([7u8; 32]).unwrap();
+        let sec1 = p256::SecretKey::from_bytes(&[7u8; 32].into()).unwrap().to_sec1_pem(LineEnding::LF).unwrap();
+        assert!(sec1.contains("BEGIN EC PRIVATE KEY"));
+        for k in [pkcs8.as_str(), sec1.as_str()] {
+            let sig = super::sign(b"m", k).unwrap();
+            super::verify_one(b"m", &sig, &public).unwrap();
+        }
+    }
+
     #[test]
     fn a_signature_of_ours_verifies_and_only_for_its_text() {
         let (k, p) = super::new_key([7; 32]).unwrap();

@@ -146,7 +146,7 @@ pub fn size_lu(f: &CharFormat) -> i64 {
 /// lacks goes to its script's Noto face, then the pinned fallbacks, then the
 /// broad Noto faces.
 pub struct PinnedFonts {
-    set: &'static navigator_render::fontset::FontSet,
+    set: &'static navigator_fontset::FontSet,
     lib: &'static atrium_fonts::Library,
     faces: Vec<std::sync::OnceLock<Option<Loaded>>>,
 }
@@ -170,7 +170,7 @@ impl Loaded {
 
 impl PinnedFonts {
     pub fn new() -> Result<PinnedFonts, String> {
-        let set = navigator_render::fontset::FontSet::shared()?;
+        let set = navigator_fontset::FontSet::shared()?;
         let fonts = PinnedFonts { set, lib: atrium_fonts::Library::system(), faces: (0..set.faces.len() + atrium_fonts::faces().len()).map(|_| Default::default()).collect() };
         for i in 0..set.faces.len() {
             fonts.get(i).ok_or("a pinned face doesn't parse")?;
@@ -213,7 +213,7 @@ impl PinnedFonts {
     /// The faces for a format, in order: the family's face (or the pinned
     /// stack's), then the pinned fallbacks.
     fn stack(&self, f: &CharFormat) -> Vec<usize> {
-        use navigator_render::fontset::Family;
+        use navigator_fontset::Family;
         let class = atrium_fonts::Library::class(&f.family);
         let pinned = self.set.stack_of(if class == Some(atrium_fonts::Class::Mono) { Family::Mono } else { Family::Sans }, f.bold, f.italic);
         match atrium_fonts::Library::resolve(&f.family).and_then(|r| self.lib_face(r.family, f.bold, f.italic)) {

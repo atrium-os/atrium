@@ -30,7 +30,9 @@ pub fn media_socket() -> PathBuf {
     std::env::var_os("SCRINIUM_MEDIA_SOCKET").map(PathBuf::from).unwrap_or_else(|| MEDIA_SOCKET.into())
 }
 
-/// A stick as a place: named by its size, as the bar names it.
+/// A stick as a place: named by its size, as the bar names it. A sealed
+/// stick keeps its persona and state (Locked, recovery, older): a Locked
+/// one has no mount, and is shown, not opened.
 pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
     // A network share (`share-<uid>`) is named by where it is.
     let network = v.part.starts_with("share-") && !v.label.is_empty();
@@ -51,6 +53,7 @@ pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
         free: v.free_bytes,
         network,
         offline: false,
+        seal: crate::browser::Seal { persona: v.persona.clone(), locked: v.locked, recovery: v.recovery, older: v.older },
     }
 }
 
@@ -68,7 +71,7 @@ pub fn home_in(dir: &Path) -> Vec<Place> {
     HOME_FOLDERS
         .iter()
         .filter(|f| dir.join(f).is_dir())
-        .map(|f| Place { id: format!("home:{}", f.to_ascii_lowercase()), label: (*f).into(), root: dir.join(f), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
+        .map(|f| Place { id: format!("home:{}", f.to_ascii_lowercase()), label: (*f).into(), root: dir.join(f), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() })
         .collect()
 }
 
@@ -76,7 +79,7 @@ pub fn home_in(dir: &Path) -> Vec<Place> {
 /// folder holds its `work`. `SCRINIUM_WORKSPACES`, else `/atrium/workspaces`.
 pub fn workspaces() -> Option<Place> {
     let dir = std::env::var_os("SCRINIUM_WORKSPACES").map(PathBuf::from).unwrap_or_else(|| "/atrium/workspaces".into());
-    dir.is_dir().then(|| Place { id: "home:workspaces".into(), label: "Workspaces".into(), root: dir, stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
+    dir.is_dir().then(|| Place { id: "home:workspaces".into(), label: "Workspaces".into(), root: dir, stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() })
 }
 
 /// `SCRINIUM_PLACES`.
@@ -90,7 +93,7 @@ pub fn parse_places(s: &str) -> Vec<Place> {
         .filter_map(|kv| kv.split_once('='))
         .filter(|(l, p)| !l.trim().is_empty() && p.starts_with('/'))
         .enumerate()
-        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false })
+        .map(|(i, (l, p))| Place { id: format!("place:{i}"), label: l.trim().into(), root: p.into(), stick: false, read_only: false, size: 0, free: 0, network: false, offline: false, seal: Default::default() })
         .collect()
 }
 
