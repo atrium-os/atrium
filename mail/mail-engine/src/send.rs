@@ -8,7 +8,7 @@
 //! session for this account), so a send happens only where the caller's
 //! policy allows (a press, or the person's own schedule).
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 use mail_compose::{Draft, Stamp};
 use mail_store::{AccountId, Outgoing, Role, SendState};
@@ -132,7 +132,7 @@ impl Engine {
     /// Hand send `id` to the server over `conn` (a courier submission
     /// session for its account, already signed in), if it is due.
     /// `files_sent`: the provider files sent mail itself (Gmail).
-    pub fn deliver<S: Read + Write>(&self, id: u64, conn: impl FnOnce() -> std::io::Result<S>, files_sent: bool) -> Result<Delivery, Error> {
+    pub fn deliver(&self, id: u64, conn: impl FnOnce() -> std::io::Result<std::os::unix::net::UnixStream>, files_sent: bool) -> Result<Delivery, Error> {
         let t = now();
         if !self.store.write(|w| w.claim_send(id, t))? {
             return Ok(Delivery::NotDue);
@@ -154,7 +154,7 @@ impl Engine {
             Ok(s) => s,
             Err(e) => return failed(format!("couldn't reach the server: {e}"), true),
         };
-        match submit::submit(s, &submit::Outgoing { from: &o.from, rcpts: &o.rcpts, bytes: &bytes, hold_for }) {
+        match crate::accounts::submit(s, &submit::Outgoing { from: &o.from, rcpts: &o.rcpts, bytes: &bytes, hold_for }) {
             Ok(sent) => {
                 self.store.write(|w| w.send_done(id))?;
                 let held = hold_for.is_some();
