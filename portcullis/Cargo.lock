@@ -213,6 +213,7 @@ version = "0.1.0"
 name = "atrium-volumes"
 version = "0.1.0"
 dependencies = [
+ "atrium-listen",
  "env_logger",
  "libc",
  "log",

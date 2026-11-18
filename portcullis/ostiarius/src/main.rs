@@ -66,19 +66,16 @@ fn wait_for_frescod() {
     let path = std::env::var("FRESCO_SOCK")
         .unwrap_or_else(|_| "/atrium/sockets/fresco/fresco.sock".into());
     let start = std::time::Instant::now();
-    let mut pause = std::time::Duration::from_millis(20);
-    let mut next_note = std::time::Duration::ZERO;
+    // Waits on the socket's directory (fast-boot.md §7), a note a minute.
     loop {
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            eprintln!("ostiarius: frescod ready at {path} after {} ms", start.elapsed().as_millis());
-            return;
+        match atrium_listen::connect(&path, Some(std::time::Duration::from_secs(60))) {
+            Ok(_) => {
+                eprintln!("ostiarius: frescod ready at {path} after {} ms", start.elapsed().as_millis());
+                return;
+            }
+            Err(e) => eprintln!("ostiarius: waiting for frescod at {path} ({} s so far): {e}",
+                start.elapsed().as_secs()),
         }
-        if start.elapsed() >= next_note {
-            eprintln!("ostiarius: waiting for frescod at {path} ({} s so far)…", start.elapsed().as_secs());
-            next_note += std::time::Duration::from_secs(60);
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(std::time::Duration::from_secs(1));
     }
 }
 

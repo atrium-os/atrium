@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+atrium-listen = { path = "../../atrium-listen" }
 net-proto = { path = "../net-proto" }
 aura-ipc = { path = "../../aura/aura-ipc" }
 atrium-netconf = { path = "../netconf" }

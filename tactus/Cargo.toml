@@ -19,6 +19,7 @@ name = "tactus-console"
 path = "src/bin/tactus-console.rs"
 
 [dependencies]
+atrium-listen = { path = "../atrium-listen" }
 serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 libc     = "0.2"

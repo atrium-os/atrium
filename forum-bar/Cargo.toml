@@ -15,6 +15,7 @@ name = "forum-bar"
 path = "src/main.rs"
 
 [dependencies]
+atrium-listen = { path = "../atrium-listen" }
 # Now playing (choragusd media-control, atrium-player-pip-keys.md §4).
 lyra-protocol = { path = "../lyra-protocol" }
 forum-ctl = { path = "../forum-ctl" }

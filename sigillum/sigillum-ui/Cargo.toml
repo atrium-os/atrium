@@ -15,6 +15,7 @@ name = "sigillum-ui"
 path = "src/bin/sigillum-ui.rs"
 
 [dependencies]
+atrium-listen = { path = "../../atrium-listen" }
 sigillum-proto  = { path = "../sigillum-proto" }
 fresco-client   = { path = "../../fresco-client" }
 fresco-protocol = { path = "../../fresco-protocol" }

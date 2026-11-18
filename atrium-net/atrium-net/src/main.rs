@@ -1778,7 +1778,19 @@ mod imp {
         if let Some(d) = o.sock.parent() {
             let _ = std::fs::create_dir_all(d);
         }
-        let listener: UnixListener = sock::listen(&o.sock, 0o600).unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
+        // Started through atrium-bind (its rc script), the socket is already
+        // bound and waits at fd 3, so netconf could connect from the start
+        // (fast-boot.md §6.4); run by hand, bind it here.
+        let listener: UnixListener = match atrium_listen::listener(&o.sock) {
+            Ok((l, atrium_listen::Origin::Inherited)) => l,
+            Ok((l, atrium_listen::Origin::Bound)) => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&o.sock, std::fs::Permissions::from_mode(0o600))
+                    .unwrap_or_else(|e| die(&format!("{}: {e}", o.sock.display())));
+                l
+            }
+            Err(e) => die(&format!("{}: {e}", o.sock.display())),
+        };
         listener.set_nonblocking(true).ok();
         if o.capsicum {
             sys::cap_enter().unwrap_or_else(|e| die(&e.to_string()));
