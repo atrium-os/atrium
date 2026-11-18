@@ -371,6 +371,48 @@ pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) ->
     }
 }
 
+/// The Arca items an account signs in with, each with its server.
+pub fn items_of(c: &AccountConfig) -> Vec<((arca_store::Scheme, String, u16), [u8; 16])> {
+    let Ok(eps) = endpoints(c) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (i, ep) in eps.into_iter().enumerate() {
+        let item = if i == 0 { c.incoming_item } else { c.outgoing_item };
+        if let Some(item) = item.filter(|it| !out.iter().any(|(_, o)| o == it)) {
+            out.push((ep, item));
+        }
+    }
+    out
+}
+
+/// Have Arca delete an account's items (arcad `DELETE_FOR`), as the
+/// account is removed. Each is tried; the first failure is said.
+pub fn forget(arca: &std::path::Path, c: &AccountConfig) -> Result<(), String> {
+    use arca_store::codec::Writer;
+    let mut first = None;
+    for ((scheme, host, port), item) in items_of(c) {
+        let mut w = Writer::new();
+        arcad::proto::write_endpoint_scheme(&mut w, scheme, &host, port);
+        w.raw(&item);
+        let r = (|| {
+            let mut s = UnixStream::connect(arca).map_err(|e| format!("Arca isn't reachable: {e}"))?;
+            s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            arcad::proto::write_request(&mut s, op::DELETE_FOR, &w.buf).map_err(|e| e.to_string())?;
+            let (st, _) = arcad::proto::read_reply(&mut s).map_err(|e| e.to_string())?;
+            match st {
+                status::OK => Ok(()),
+                status::LOCKED => Err("Arca is locked".to_string()),
+                // Already gone, or never Mail's: nothing left to remove.
+                status::DENIED => Ok(()),
+                _ => Err("Arca didn't remove it".to_string()),
+            }
+        })();
+        if let Err(e) = r {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
 // ── background sync ─────────────────────────────────────────────────
 
 /// How often each account is looked at when nothing is due and it has
@@ -703,5 +745,49 @@ mod tests {
         let mut b = Vec::new();
         arca_courier::send::write_frame(&mut b, &Response::Http { status: 401, headers: vec![], body: vec![] }.encode()).unwrap();
         assert!(read_events(&mut &b[..], &mut |_| true).unwrap_err().starts_with("AUTHENTICATIONFAILED"));
+    }
+
+    /// arcad on a socket: answers each request with the next status, and
+    /// keeps what it was asked.
+    fn fake_arcad(dir: &std::path::Path, answers: Vec<u8>) -> (PathBuf, Arc<Mutex<Vec<(u16, Vec<u8>)>>>) {
+        let path = dir.join("arcad.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            for (st, c) in answers.into_iter().zip(l.incoming()) {
+                let mut c = c.unwrap();
+                let f = arcad::proto::read_frame(&mut c).unwrap().unwrap();
+                let b = f.as_ref();
+                s2.lock().unwrap().push((u16::from_le_bytes([b[0], b[1]]), b[2..].to_vec()));
+                arcad::proto::write_reply(&mut c, st, &[]).unwrap();
+            }
+        });
+        (path, seen)
+    }
+
+    #[test]
+    fn removing_an_account_asks_arca_to_delete_each_item() {
+        let d = tempfile::tempdir().unwrap();
+        let (sock, seen) = fake_arcad(d.path(), vec![status::OK, status::LOCKED]);
+        let c = imap_account();
+        assert_eq!(items_of(&c).len(), 2);
+        assert_eq!(forget(&sock, &c), Err("Arca is locked".into()));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        let want = |sc, h: &str, p, item: [u8; 16]| {
+            let mut w = arca_store::codec::Writer::new();
+            arcad::proto::write_endpoint_scheme(&mut w, sc, h, p);
+            w.raw(&item);
+            (op::DELETE_FOR, w.buf)
+        };
+        assert_eq!(seen[0], want(arca_store::Scheme::Imaps, "imap.example.org", 993, [1; 16]));
+        assert_eq!(seen[1], want(arca_store::Scheme::Imaps, "smtp.example.org", 465, [2; 16]));
+        // One item for both servers is deleted once; none, nothing asked.
+        let one = AccountConfig { outgoing_item: Some([1; 16]), ..imap_account() };
+        assert_eq!(items_of(&one).len(), 1);
+        let none = AccountConfig { incoming_item: None, outgoing_item: None, ..imap_account() };
+        assert!(items_of(&none).is_empty());
+        assert_eq!(forget(&d.path().join("none.sock"), &none), Ok(()));
     }
 }

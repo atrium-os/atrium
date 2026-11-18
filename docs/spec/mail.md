@@ -1298,7 +1298,7 @@ Stalwart in the cloud VM, and later a real account):
    IMAP and SMTP without the app seeing it; settings window without a display; quiet
    hours, notifications off and VIPs in the notifier. **Not yet**: DNS SRV/MX from the
    app (Nuntius is HTTP only, so those steps find nothing), removing an account's Arca
-   items with it, the OAuth sign-in sheet (Microsoft accounts are found but can't be
+   items with it (built later: arcad `DELETE_FOR`, see M8), the OAuth sign-in sheet (Microsoft accounts are found but can't be
    added; SRV and MX came later with Nuntius lookups), JMAP needing an API token as its password (bearer only; an API host other
    than the session's is refused; uploads up to 1 MiB), IMAP IDLE (built later, see M8).
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
@@ -1374,6 +1374,14 @@ Stalwart in the cloud VM, and later a real account):
    changes only, other accounts ignored, no event source, a stream ended), app 1. **Not
    yet**: IDLE on folders other than the inbox, mains/battery intervals, a VM run of
    either push against real servers.
+   **Removing an account removes its sign-in (2026-11-18)**: arcad has a new app op,
+   `DELETE_FOR` (`endpoint | id`), for the app's own items bound to a server (Arca's
+   plain `DELETE` reaches only items whose recipient is the app). When an account is
+   removed, Mail asks Arca to delete each of its items, IMAP's and SMTP's (or JMAP's),
+   off the window's thread, and says whether the password went too; if Arca is locked or
+   not running, the account and its mail are still removed and the note says to remove
+   the password in Arca. Tests: arcad 1 (own endpoint only, not another app's, plain
+   DELETE refused), app 2.
 
 ## 17. Decisions, with recommendations
 

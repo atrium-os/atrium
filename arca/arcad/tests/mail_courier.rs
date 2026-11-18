@@ -180,3 +180,33 @@ fn a_typed_password_is_kept_for_imap_and_smtp_without_the_app_seeing_it() {
     assert_eq!(keep(&mut s, h, &[]).0, status::MALFORMED);
     assert_eq!(keep(&mut s, h, &[(Scheme::Https, "x.example", 443); 5]).0, status::MALFORMED);
 }
+
+fn delete_for(s: &mut State, who: &Label, ep: (Scheme, &str, u16), id: [u8; 16]) -> u8 {
+    s.handle(who, op::DELETE_FOR, &body(|w| {
+        write_endpoint_scheme(w, ep.0, ep.1, ep.2);
+        w.raw(&id);
+    }))
+    .status
+}
+
+#[test]
+fn removing_an_account_deletes_its_kept_passwords() {
+    let (_d, mut s) = setup();
+    let h = hold(&mut s, MAIL, b"typed-in-arca");
+    let imap = (Scheme::Imaps, "imap.example.org", 993);
+    let smtp = (Scheme::Submissions, "smtp.example.org", 465);
+    let (_, ids) = keep(&mut s, h, &[imap, smtp]);
+    // The item has to be named with its own endpoint.
+    assert_eq!(delete_for(&mut s, &app(), smtp, ids[0]), status::DENIED);
+    // Another app can't delete Mail's.
+    let other = Label::App { user: "alice".into(), publisher: [7; 32], app_id: "org.example.other".into() };
+    assert_eq!(delete_for(&mut s, &other, imap, ids[0]), status::DENIED);
+    // Plain DELETE is for the app's own items, not endpoint-bound ones.
+    assert_eq!(s.handle(&app(), op::DELETE, &ids[0]).status, status::DENIED);
+    assert_eq!(delete_for(&mut s, &app(), imap, ids[0]), status::OK);
+    assert_eq!(login(&mut s, &courier(imap.0, imap.1, imap.2), ids[0]).0, status::DENIED);
+    // The other server's item is still there until it is deleted too.
+    assert_eq!(login(&mut s, &courier(smtp.0, smtp.1, smtp.2), ids[1]).0, status::OK);
+    assert_eq!(delete_for(&mut s, &app(), smtp, ids[1]), status::OK);
+    assert_eq!(delete_for(&mut s, &app(), smtp, ids[1]), status::DENIED);
+}
