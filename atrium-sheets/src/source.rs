@@ -572,6 +572,12 @@ impl GridSource for SheetSource {
             }
         }
         let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v) };
+        // A link reads as one: blue, unless the cell has a colour of its own.
+        if let Some(v) = cv.as_mut().filter(|v| v.color.is_none() && !v.text.is_empty()) {
+            if d.wb.link_at(CellAddr::new(d.sheet, r, c)).is_some() {
+                v.color = Some(palette::info_600());
+            }
+        }
         if d.wb.comment(d.sheet, r, c).is_some() {
             let mut v = cv.unwrap_or_else(|| CellView::text(""));
             v.note = true;

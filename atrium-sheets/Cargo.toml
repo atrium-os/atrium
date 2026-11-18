@@ -29,6 +29,7 @@ officina-draw = { path = "../officina-draw" }
 officina-pdf = { path = "../officina-pdf", default-features = false }
 pergola = { path = "../pergola" }
 limen = { path = "../limen" }
+monstrator = { path = "../monstrator" }
 fresco-protocol = { path = "../fresco-protocol" }
 # Ctrl+P, caught before the window sees it.
 fresco-client = { path = "../fresco-client" }
