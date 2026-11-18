@@ -364,7 +364,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 message: "this socket takes only WorkerCall".into() })?;
             return Ok(());
         }
-        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves } = req {
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves, persona: into } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
              * fetcher's own network would make it anyone's raw fetch. */
@@ -420,6 +420,18 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
              * embed's parent: limend has it from that parent's peer cred).
              * Neither resolving in the launch registry: refused, never the
              * shared `run_as`. */
+            /* ★ A share across personas (share-sheet.md §7): limend, for a
+             * provider it starts for an instance, may ask for it in another
+             * of that instance's person's personas, and only while the
+             * person's `share` switch from the instance's persona to that
+             * one is on (Settings, Between personas, turned on only after
+             * Sigillum confirmed it's them). Anyone else: refused. */
+            if into.is_some() && !(owner == LIMEN_USER && serves.is_some() && rule.as_ref().is_some_and(|r| r.per_instance)) {
+                eprintln!("portcullisd: ExecInstance of {app_id} in persona {into:?} DENIED to uid {uid}: only limend, for a provider");
+                write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                    message: "only limend starts a provider in another persona".into() })?;
+                continue;
+            }
             let mut as_uid = None;
             if let Some(r) = rule.as_mut().filter(|r| r.per_instance) {
                 let served = match serves {
@@ -428,11 +440,26 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 };
                 let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
                 let inst = reg.resolve(served).map(|(o, a)| (o.to_string(), a.to_string(), reg.persona(served).flatten().map(String::from)));
-                let Some((person, served_app, persona)) = inst else {
+                let Some((person, served_app, mut persona)) = inst else {
                     write_response(&mut writer, &Response::LaunchFailed { stage: "worker".into(),
                         message: format!("{app_id} serves an app instance, and uid {served} is none") })?;
                     continue;
                 };
+                if let Some(to) = into.as_deref() {
+                    let to = (to != portcullis_policy::PERSONAL).then_some(to);
+                    let pol = Policy::load(&Policy::user_path(&person)).unwrap_or_default();
+                    let shown = |p: Option<&str>| p.unwrap_or(portcullis_policy::PERSONAL).to_string();
+                    if to == persona.as_deref() || !pol.has_persona(to) || !pol.may_cross(persona.as_deref(), to, "share") {
+                        eprintln!("portcullisd: {app_id} for {person}'s {served_app} in {} REFUSED: sharing from {} to {} is off",
+                                  shown(to), shown(persona.as_deref()), shown(to));
+                        write_response(&mut writer, &Response::LaunchFailed { stage: "policy".into(),
+                            message: format!("cap.share.crossing: sharing from {} to {} is off (Settings, Apps, Between personas)",
+                                             shown(persona.as_deref()), shown(to)) })?;
+                        continue;
+                    }
+                    eprintln!("portcullisd: {app_id} for {person}'s {served_app}: a share from {} to {}", shown(persona.as_deref()), shown(to));
+                    persona = to.map(str::to_string);
+                }
                 // One allocation at a time: two pages at once must not both
                 // allocate a uid for the same instance.
                 static WORKER_UIDS: Mutex<()> = Mutex::new(());

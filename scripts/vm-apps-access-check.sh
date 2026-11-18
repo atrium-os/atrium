@@ -30,7 +30,8 @@
 #     for "Personal may send links to Work" asks Sigillum to confirm it's
 #     her (a stand-in answers, sigillum_stand_in) and writes the
 #     [[crossings]] switch; refused, nothing is written; Turn off needs no
-#     confirming; root can't turn one.
+#     confirming; root can't turn one. "Personal may share to Work's apps"
+#     turns on and off the same way.
 # WX/WY: where frescod puts Curia's window (0 0 with no window manager).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -225,6 +226,14 @@ i=0; while [ $i -lt 30 ] && [ "$(count "from personal to work is now off")" = 0 
 [ "$(V "grep -c 'kind: \"links\"' $B/sigillum.log" | tr -d ' ')" = 1 ] && ok "Sigillum was asked once for links" || bad "sigillum: $(V "cat $B/sigillum.log")"
 V "grep -q links $POL" && bad "still in her policy: $(V "cat $POL")" || ok "not in her policy"
 shot persona-3
+press ${CX:-880} ${SY:-604}                      # Turn on: Personal may share to Work's apps
+i=0; while [ $i -lt 30 ] && [ "$(count "switch for share from personal to work is now on")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "switch for share from personal to work is now on (from $CURIA, verified)")" = 1 ] && ok "the share switch: on, confirmed" || bad "share switch: $(V "grep -i 'switch\|REFUSED' $LOG | tail -3")"
+V "grep -A3 '^\[\[crossings\]\]' $POL | grep -q share" && ok "written to her policy" || bad "policy: $(V "cat $POL")"
+shot persona-share
+press ${CX:-880} ${SY:-604}                      # and off again
+i=0; while [ $i -lt 30 ] && [ "$(count "switch for share from personal to work is now off")" = 0 ]; do sleep 2; i=$((i+2)); done
+V "grep -q share $POL" && bad "share still in her policy" || ok "the share switch: off again"
 
 echo "=== Personas: colour, add, remove"
 key() { for k in "$@"; do inj "KEY $k 1" "KEY $k 0"; done; sleep 2; }

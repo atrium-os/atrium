@@ -23,6 +23,7 @@ const BOB_APP: u32 = 1003;
 const SHARE_UID: u32 = 65045;
 const W_MAIL: WindowToken = [1; 16];
 const W_BOB: WindowToken = [3; 16];
+const W_PHOTOS: WindowToken = [2; 16];
 
 #[derive(Clone, Default)]
 struct Fresco(Arc<Mutex<HashMap<WindowToken, u32>>>);
@@ -47,6 +48,10 @@ impl Launcher for Launch {
     fn launch(&mut self, app: &str, _embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
         self.0.send((app.to_string(), ch)).unwrap();
         Ok(2000)
+    }
+    fn launch_in(&mut self, app: &str, _embed: EmbedId, ch: UnixStream, _parent: u32, persona: &str) -> Result<u32, String> {
+        self.0.send((format!("{app}@{persona}"), ch)).unwrap();
+        Ok(2001)
     }
     fn end(&mut self, _embed: EmbedId) {}
 }
@@ -80,6 +85,7 @@ impl World {
             let mut g = fresco.0.lock().unwrap();
             g.insert(W_MAIL, MAIL);
             g.insert(W_BOB, BOB_APP);
+            g.insert(W_PHOTOS, PHOTOS);
         }
         let (tx, rx) = mpsc::channel();
         let resolve = Box::new(|uid: u32| match uid {
@@ -101,7 +107,10 @@ impl World {
             _ => None,
         });
         let frescod = Fake::default();
-        let sheet = Sheet::new(child, Box::new(frescod.clone()), installed, person).with_prefs(dir.join("prefs"));
+        let sheet = Sheet::new(child, Box::new(frescod.clone()), installed, person)
+            .with_prefs(dir.join("prefs"))
+            // Ana's Photos runs in her Work persona; the rest are Personal.
+            .with_personas(Box::new(|uid| (uid == PHOTOS).then(|| "work".to_string())));
         World { shared, launched: rx, frescod, sheet, dir }
     }
 
@@ -211,7 +220,7 @@ fn the_persons_order_and_hidden_apps_from_settings() {
     // Ana's order, without the app she hid.
     assert_eq!(targets(ev), ["org.example.photos", "org.example.notes"]);
     // A hidden app wasn't shown, so it can't be chosen.
-    assert!(w.sheet.chose(e, "dev.ana.scratch.org.example.mine").is_err());
+    assert!(w.sheet.chose(e, "dev.ana.scratch.org.example.mine", None).is_err());
     // Bob's sheet is his own: nothing hidden.
     let mut bob = Parent::wrap(w.connect(BOB_APP));
     let press = w.frescod.mint(BOB_APP, kind::BUTTON);
@@ -227,12 +236,12 @@ fn the_person_chooses_and_only_that_app_gets_the_share() {
     let (e, ev) = w.open(&mut mail, W_MAIL, p, &["text/plain"]);
     targets(ev);
     // Only what was shown.
-    assert!(w.sheet.chose(e, "org.example.photos").is_err());
-    assert!(w.sheet.chose(e, "org.example.evil").is_err());
-    w.sheet.chose(e, "org.example.notes").unwrap();
+    assert!(w.sheet.chose(e, "org.example.photos", None).is_err());
+    assert!(w.sheet.chose(e, "org.example.evil", None).is_err());
+    w.sheet.chose(e, "org.example.notes", None).unwrap();
     assert_eq!(sheet_says(&mut mail), ToParent::Chosen);
     // Once.
-    assert!(w.sheet.chose(e, "dev.ana.scratch.org.example.mine").is_err());
+    assert!(w.sheet.chose(e, "dev.ana.scratch.org.example.mine", None).is_err());
     mail.detach(e).unwrap();
     assert!(matches!(w.event(), Some(Event::Close { embed }) if embed == e));
     let t = mail.request("share-target", W_MAIL).unwrap();
@@ -252,6 +261,63 @@ fn closing_the_sheet_cancels_and_chooses_nothing() {
     targets(ev);
     w.sheet.cancelled(e);
     assert_eq!(sheet_says(&mut mail), ToParent::Cancelled);
-    assert!(w.sheet.chose(e, "org.example.notes").is_err(), "after a cancel");
+    assert!(w.sheet.chose(e, "org.example.notes", None).is_err(), "after a cancel");
     assert!(matches!(mail.request("share-target", W_MAIL), Err(Error::Refused(r)) if r == refusal::NO_PROVIDER));
+}
+
+fn rows(ev: Option<Event>) -> (Option<(String, Option<String>)>, Vec<String>) {
+    match ev {
+        Some(Event::Show { from_persona, targets, .. }) => (from_persona, targets.into_iter().map(|t| match t.persona {
+            Some(q) => format!("{}@{q}", t.app),
+            None => t.app,
+        }).collect()),
+        other => panic!("expected the sheet shown, got {other:?}"),
+    }
+}
+
+#[test]
+fn another_personas_apps_only_while_the_share_switch_is_on() {
+    let mut w = World::new("persona");
+    let policy = w.dir.join("prefs/ana/policy.toml");
+    let mut pol = portcullis_policy::Policy::default();
+    pol.add_persona("work", "blue").unwrap();
+    pol.save(&policy).unwrap();
+    let mut mail = Parent::wrap(w.connect(MAIL));
+    // Personas but no switch: Personal's own apps, and the sheet says
+    // which persona it shares from.
+    let press = w.frescod.mint(MAIL, kind::BUTTON);
+    let (e, ev) = w.open(&mut mail, W_MAIL, press, &["text/plain"]);
+    let (from, list) = rows(ev);
+    assert_eq!(from, Some(("personal".into(), None)));
+    assert_eq!(list, ["dev.ana.scratch.org.example.mine", "org.example.notes"]);
+    assert!(w.sheet.chose(e, "org.example.notes", Some("work")).is_err(), "not offered");
+    w.sheet.cancelled(e);
+    sheet_says(&mut mail);
+
+    // Personal may share to Work: Work's apps below, Mail's own Work
+    // instance among them.
+    pol.set_crossing("personal", "work", "share", true).unwrap();
+    pol.save(&policy).unwrap();
+    let press = w.frescod.mint(MAIL, kind::BUTTON);
+    let (e, ev) = w.open(&mut mail, W_MAIL, press, &["text/plain"]);
+    let (_, list) = rows(ev);
+    assert_eq!(list, ["dev.ana.scratch.org.example.mine", "org.example.notes",
+        "dev.ana.scratch.org.example.mine@work", "org.example.mail@work", "org.example.notes@work"]);
+    assert!(w.sheet.chose(e, "org.example.notes", Some("home")).is_err(), "no such row");
+    w.sheet.chose(e, "org.example.notes", Some("work")).unwrap();
+    assert_eq!(sheet_says(&mut mail), ToParent::Chosen);
+    mail.detach(e).unwrap();
+    w.event();
+    // limend hands the persona to the launcher, which checks the switch.
+    let _t = mail.request("share-target", W_MAIL).unwrap();
+    let (started, _ch) = w.launched.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(started, "org.example.notes@work");
+
+    // One way only: Work's Photos sees no Personal apps.
+    let mut photos = Parent::wrap(w.connect(PHOTOS));
+    let press = w.frescod.mint(PHOTOS, kind::BUTTON);
+    let (_, ev) = w.open(&mut photos, W_PHOTOS, press, &["image/png"]);
+    let (from, list) = rows(ev);
+    assert_eq!(from, Some(("work".into(), Some("blue".into()))));
+    assert_eq!(list, ["dev.ana.scratch.org.example.mine", "org.example.mail", "org.example.notes"]);
 }

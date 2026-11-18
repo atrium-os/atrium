@@ -365,7 +365,9 @@ portcullisd (`SetShareTargets`), written to the person's `share.toml`. See
 ### 13.1 Between personas (2026-11-18)
 
 Below Links, once the person has a named persona: a switch per direction and kind
-(personas.md §6), "Personal may send links to Work", each with Turn on or Turn off.
+(personas.md §6), "Personal may send links to Work", each with Turn on or Turn off. The
+`share` kind reads "Personal may share to Work's apps": the share sheet then lists Work's
+apps too (share-sheet.md §7).
 Turning one on goes with the press, then the person confirms it's them on Sigillum's sheet
 (portcullisd asks `VERIFY_USER`); while it waits the row says "Confirm it's you…", and a
 refusal shows under the row ("not confirmed (NotAllowed); nothing changed"). Curia waits up

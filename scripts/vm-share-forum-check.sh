@@ -21,7 +21,10 @@
 # Down Down Return chooses Scraps; Scraps starts in a jail of its own as its
 # own uid and gets the item; Keep answers Accepted; a second share and
 # Escape cancels, starting nothing; with Photos hidden in the person's
-# share.toml the sheet lists Scraps only.
+# share.toml the sheet lists Scraps only. Across personas (§7): with root's
+# Work persona and its Personal-to-Work share switch on, the sheet adds
+# Work's apps; Scraps in Work starts as its Work instance; with the switch
+# turned off while the sheet is up, portcullisd refuses the start.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/scratch/share-forum}
@@ -234,6 +237,47 @@ shot 6-hidden
 key 0x29
 sleep 5
 g "rm -f /var/db/atrium/root/share.toml"
+
+echo "== across personas: root has Work, and Personal may share to it"
+POL=/var/db/atrium/root/policy.toml
+CROSS='\n[personas.work]\ncolour = "blue"\n\n[[crossings]]\nfrom = "personal"\nto = "work"\nkinds = ["share"]\n'
+g "cp $POL $S/policy.toml.orig && printf '$CROSS' >> $POL"
+GOT() { g "cat $S/dock.log /var/log/atrium/atrium-limend.log | grep -c 'share-target-demo: got \"Groceries'" | tr -d ' \r'; }
+G0=$(GOT)
+press $((X0 + 688)) $((Y0 + 28))
+sleep 20
+g "tail -2 $SL" | grep -q '2 types, 5 targets for root (3 in other personas)' && ok "the sheet adds Work's Notes, Photos and Scraps below" || bad "work rows: $(g "tail -2 $SL | tr '\n' ';'")"
+shot 7-personas
+key 0x51; key 0x51; key 0x51; key 0x51; key 0x51; key 0x28
+sleep 10
+g "grep -q 'chose org.example.scraps in work' $SL" && ok "the fifth row: Scraps in Work" || bad "choose: $(g "tail -3 $SL | tr '\n' ';'")"
+sleep 40
+g "grep -q 'org.example.scraps for root.s org.example.notes: a share from personal to work' $S/portcullisd.log" && ok "portcullisd found the switch on" || bad "portcullisd: $(g "grep -h 'scraps' $S/portcullisd.log | tail -3 | tr '\n' ';'")"
+WU=$(g "ps -o uid= -p \$(pgrep -n -x scraps) 2>/dev/null" | tr -d ' \r')
+WR=$(g "grep -rh '^$WU ' /var/run/atrium/app-registry 2>/dev/null" | tr -d '\r')
+case "$WR" in *org.example.scraps*persona=work*) ok "Scraps runs as its Work instance (uid $WU, not the Personal one's ${SC#* })" ;; *) bad "Work Scraps: uid '$WU' registry '$WR'" ;; esac
+[ -n "$WU" ] && [ "$WU" != "${SC#* }" ] || bad "the same uid as Personal's Scraps"
+[ "$(GOT)" = $((G0 + 1)) ] && ok "and got the item" || bad "item: $(g "grep -h share-target-demo $S/dock.log /var/log/atrium/atrium-limend.log | tail -3 | tr '\n' ';'")"
+shot 8-work-target
+press $((X0 + (PW - 560) / 2 + 488)) $((Y0 + 452))
+sleep 15
+g "pkill -x scraps"; sleep 2
+
+echo "== the switch turned off while the sheet is up: portcullisd refuses"
+press $((X0 + 688)) $((Y0 + 28))
+sleep 20
+g "cp $S/policy.toml.orig $POL && printf '\n[personas.work]\ncolour = \"blue\"\n' >> $POL"
+key 0x51; key 0x51; key 0x51; key 0x51; key 0x51; key 0x28
+sleep 30
+g "grep -q 'org.example.scraps for root.s org.example.notes in work REFUSED: sharing from personal to work is off' $S/portcullisd.log" && ok "refused: the switch is off" || bad "not refused: $(g "grep -h 'scraps' $S/portcullisd.log | tail -3 | tr '\n' ';'")"
+[ -z "$(g "pgrep -x scraps")" ] && ok "and no Scraps started" || bad "a Scraps runs: $(g "pgrep -lx scraps")"
+shot 9-refused
+press $((X0 + 688)) $((Y0 + 28))
+sleep 20
+g "tail -2 $SL" | grep -q '2 types, 2 targets for root (0 in other personas)' && ok "the next sheet lists Personal's apps only" || bad "after off: $(g "tail -2 $SL | tr '\n' ';'")"
+key 0x29
+sleep 5
+g "cp $S/policy.toml.orig $POL"
 
 echo "== clean up"
 g "pkill -f atrium-portcullisd-bootstrap; pkill -f atrium-share-sheet; pkill -x forum-dock; pkill -x notes; pkill -x scraps; pkill -f atrium-limend; pkill -x forum-wm; pkill -x frescod; sleep 3; $GONE"

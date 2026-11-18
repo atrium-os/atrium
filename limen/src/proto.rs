@@ -123,7 +123,16 @@ pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
 /// `app` (a registry app id). The parent's next `share-target` request,
 /// within `catalogue::CHOICE_MS`, starts that app; nothing else can.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Choose { pub embed: EmbedId, pub app: String }
+pub struct Choose {
+    pub embed: EmbedId,
+    pub app: String,
+    /// Another of the person's personas to start `app` in (share-sheet.md
+    /// §7: "personal" or a named one); `None` is the parent's own. Only
+    /// while the person's `share` crossing switch is on, which portcullisd
+    /// checks when it starts the target.
+    #[serde(default)]
+    pub persona: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {

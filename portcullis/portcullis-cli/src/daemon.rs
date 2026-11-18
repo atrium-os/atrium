@@ -236,6 +236,7 @@ pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32, limits
         cpu_pct: limits.cpu_pct,
         require_memory_limit: limits.require_memory_limit,
         serves: None,
+        persona: None,
     })?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}

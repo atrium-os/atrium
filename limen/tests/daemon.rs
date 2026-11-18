@@ -72,6 +72,14 @@ impl Launcher for Launch {
         self.0.send((embed, ch)).unwrap();
         Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
+    /// A share across personas: this stand-in for portcullisd has the
+    /// person's `share` switch on into Work only.
+    fn launch_in(&mut self, app: &str, embed: EmbedId, ch: UnixStream, _parent: u32, persona: &str) -> Result<u32, String> {
+        if persona != "work" {
+            return Err(format!("sharing into {persona} is off"));
+        }
+        self.launch(app, embed, ch)
+    }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
 }
 
@@ -662,6 +670,36 @@ fn a_share_target_is_only_ever_the_app_the_person_chose_in_the_parents_share_she
     notes.emit(t, limen::share_target::ToParent::Accepted.encode()).unwrap();
     assert_eq!(next_p(&mut app), ParentEvent::Message { embed: t, bytes: limen::share_target::ToParent::Accepted.encode() });
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_choice_in_another_persona_goes_to_the_launcher_which_decides() {
+    let w = World::new();
+    w.shared.set_target_check(Box::new(|person: &str, app: &str| person == "ana" && app == "org.example.notes"));
+    let mut app = w.parent(APP);
+    let mut sheet = provider(w.connect(SHARE_UID), "share").unwrap();
+    let mut open = |app: &mut Parent, sheet: &mut Child| {
+        let s = app.request("share", W_APP).unwrap();
+        let _ = next_c(sheet);
+        s
+    };
+    // Not a persona's name: refused by limend.
+    let s = open(&mut app, &mut sheet);
+    assert_eq!(refused(sheet.choose_in(s, "org.example.notes", "Work!")), refusal::NOT_A_TARGET);
+    assert_eq!(refused(sheet.choose_in(s, "org.example.notes", "")), refusal::NOT_A_TARGET);
+    // Into Work: the launcher (portcullisd) has the switch on.
+    sheet.choose_in(s, "org.example.notes", "work").unwrap();
+    app.detach(s).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: s });
+    let t = app.request("share-target", W_APP).unwrap();
+    let (te, _notes) = w.spawned();
+    assert_eq!(te, t);
+    // Into School: the launcher says the switch is off; nothing starts.
+    let s = open(&mut app, &mut sheet);
+    sheet.choose_in(s, "org.example.notes", "school").unwrap();
+    app.detach(s).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: s });
+    assert_eq!(refused(app.request("share-target", W_APP)), refusal::LAUNCH_FAILED);
 }
 
 #[test]

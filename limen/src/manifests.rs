@@ -40,6 +40,12 @@ pub struct Target {
     /// That SVG's text, read safely from the bundle
     /// (`portcullis_toml::icon::read_bundle_svg`); the drawer still checks it.
     pub icon_svg: Option<String>,
+    /// Set by the share sheet for a row that opens the app in another of
+    /// the person's personas than the sharing app's ("personal" for
+    /// Personal; share-sheet.md §7). None: the sharer's own persona.
+    pub persona: Option<String>,
+    /// That persona's colour name (`PERSONA_COLOURS`), if it has one.
+    pub colour: Option<String>,
 }
 
 /// Installed manifests under one folder.
@@ -98,7 +104,7 @@ impl Installed {
                     return None;
                 }
                 let icon_svg = m.app.icon.as_deref().and_then(|i| portcullis_toml::icon::read_bundle_svg(&self.dir.join(&id), i));
-                Some(Target { app: id, name: m.app.name.clone(), takes, icon: m.app.icon.clone(), icon_svg })
+                Some(Target { app: id, name: m.app.name.clone(), takes, icon: m.app.icon.clone(), icon_svg, persona: None, colour: None })
             })
             .collect()
     }

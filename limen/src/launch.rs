@@ -77,14 +77,21 @@ fn uid_of(name: &str) -> Option<u32> {
 
 impl Launcher for Portcullis {
     fn launch(&mut self, app: &str, embed: EmbedId, channel: UnixStream) -> Result<u32, String> {
-        self.start(app, embed, channel, None)
+        self.start(app, embed, channel, None, None)
     }
 
     /// The child serves `parent_uid`: under a `per_instance` worker rule it
     /// runs as a uid of the parent's instance (its person and persona), and
     /// portcullisd says which.
     fn launch_for(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32) -> Result<u32, String> {
-        self.start(app, embed, channel, Some(parent_uid))
+        self.start(app, embed, channel, Some(parent_uid), None)
+    }
+
+    /// The child in another of the parent's person's personas: portcullisd
+    /// starts it only while that person's `share` crossing switch from the
+    /// parent's persona to `persona` is on (share-sheet.md §7).
+    fn launch_in(&mut self, app: &str, embed: EmbedId, channel: UnixStream, parent_uid: u32, persona: &str) -> Result<u32, String> {
+        self.start(app, embed, channel, Some(parent_uid), Some(persona))
     }
 
     fn end(&mut self, embed: EmbedId) {
@@ -95,7 +102,7 @@ impl Launcher for Portcullis {
 }
 
 impl Portcullis {
-    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>) -> Result<u32, String> {
+    fn start(&mut self, app: &str, embed: EmbedId, channel: UnixStream, serves: Option<u32>, persona: Option<&str>) -> Result<u32, String> {
         use portcullis_ipc::{read_response, round_trip, send_fds, write_request, Request, Response};
         // A provider from its manifest's [roles] implements has no system
         // rule: portcullisd runs it as a uid of the parent's instance (as a
@@ -125,6 +132,7 @@ impl Portcullis {
                 cpu_pct: None,
                 require_memory_limit: true,
                 serves,
+                persona: persona.map(str::to_string),
             })?;
             match read_response(&mut s)? {
                 Response::ReadyForFds => {}
