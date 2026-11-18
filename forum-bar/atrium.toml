@@ -20,6 +20,8 @@ network-read  = true   # the network icon: online, how, Wi-Fi bars
 network-wifi  = true   # its menu: the network's name, join a remembered one, disconnect
 wifi-nearby   = true   # its menu: the networks around
 network       = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [supervision]
 restart    = "on-crash"

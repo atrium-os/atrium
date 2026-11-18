@@ -19,6 +19,8 @@ forum-control = true
 # TCB does the verify, the policy check, the uid and the jail.
 app-launch    = true
 network       = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [supervision]
 restart    = "on-crash"

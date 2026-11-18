@@ -17,6 +17,8 @@ notify             = true
 media-control      = true   # media keys and focus to choragusd (now-playing)
 audio-control      = true   # volume keys: the master level, never samples
 network            = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
 
 [supervision]
 restart    = "on-crash"
