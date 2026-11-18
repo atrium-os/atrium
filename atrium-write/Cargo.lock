@@ -1309,6 +1309,7 @@ dependencies = [
  "folium-content",
  "folium-font",
  "folium-syntax",
+ "navigator-image",
  "officina-text",
 ]
 
@@ -1488,6 +1489,7 @@ dependencies = [
 name = "pergola-richtext"
 version = "0.1.0"
 dependencies = [
+ "navigator-image",
  "officina-core",
  "officina-shapes",
  "officina-text",

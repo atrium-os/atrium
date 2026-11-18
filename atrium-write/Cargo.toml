@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "atrium-write"
 path = "src/bin/atrium_write.rs"
 
+[features]
+# Decode pictures in this process instead of the convert worker (A/B timing).
+local-pictures = ["pergola-richtext/local-decode", "officina-pdf/local-decode"]
+
 [dependencies]
 officina-core = { path = "../officina-core" }
 # Writers, protection and the launcher: the readers run in the convert worker.

@@ -63,6 +63,14 @@ pub fn password_prefix(password: &str) -> Vec<u8> {
 /// (a jail of its own, dev-tools-plan.md M5); otherwise, as in development
 /// and tests, it is a child process.
 pub fn convert(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
+    let t = std::time::Instant::now();
+    let r = convert_in(kind, data, password);
+    // One line per conversion, for open-time measurements.
+    eprintln!("officina: converted {} KB of {kind} in {:.0} ms", data.len() / 1024, t.elapsed().as_secs_f64() * 1000.0);
+    r
+}
+
+fn convert_in(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
     if std::env::var_os("OFFICINA_CONVERT").is_none() {
         if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| w.has(WORKER)) {
             let mut p = w.spawn_stdio(WORKER)
