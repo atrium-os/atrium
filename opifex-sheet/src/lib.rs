@@ -115,9 +115,36 @@ pub fn words(cap: &str) -> (String, bool) {
         "window-management" | "window_management" => ("manage other apps' windows", true),
         "arca" => ("keep secrets in your keychain (Arca)", false),
         "embeds" => ("show parts of other apps inside its window", false),
-        _ => return (cap.replace(['-', '_'], " "), true),
+        _ => {
+            if let Some(role) = cap.strip_prefix("embeds:") {
+                return (embed_words(role), false);
+            }
+            return (cap.replace(['-', '_'], " "), true);
+        }
     };
     (w.into(), risky)
+}
+
+/// One role an app shows inside its window (limen.md §3.1), in words. The
+/// part runs as its own app; the line says what the person will see.
+fn embed_words(role: &str) -> String {
+    let what = match role {
+        "credential" => "your keychain's sign-in prompts (Arca)",
+        "sign-in" => "sign-in sheets",
+        "doc-viewer" => "a document viewer",
+        "picker" => "the file picker",
+        "share" => "the share sheet",
+        "share-target" => "apps you share to",
+        "media-player" => "a media player",
+        "pdf-viewer" => "a PDF viewer",
+        "payment" => "a payment app",
+        "web-island" => "live web content",
+        "map" => "a map app",
+        "editor-extension" => "editor extensions",
+        "print" => "the print sheet",
+        other => return format!("show {} inside its window", other.replace(['-', '_'], " ")),
+    };
+    format!("show {what} inside its window")
 }
 
 /// Bytes in words ("3.4 MB").
@@ -139,6 +166,8 @@ mod tests {
         assert_eq!(words("camera"), ("use the camera".into(), true));
         assert_eq!(words("clipboard").1, false);
         assert_eq!(words("tessera-cas-read"), ("tessera cas read".into(), true), "unknown ones are marked");
+        assert_eq!(words("embeds:picker"), ("show the file picker inside its window".into(), false));
+        assert_eq!(words("embeds:new-role").0, "show new role inside its window");
         assert_eq!(size(512), "512 bytes");
         assert_eq!(size(3_400_000), "3.4 MB");
     }

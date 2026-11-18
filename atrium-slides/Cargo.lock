@@ -191,6 +191,7 @@ dependencies = [
  "jpeg-encoder",
  "libc",
  "limen",
+ "miniz_oxide 0.8.9",
  "navigator-image",
  "officina-convert",
  "officina-core",

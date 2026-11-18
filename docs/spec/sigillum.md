@@ -335,6 +335,11 @@ The check Arca's verify-each-use class needs, and the step-up any system UI can 
   trusts it because of the peer uid; there is no bearer token to replay. Strength is
   `passcode` > `key-uv` > `biometric-secure` > `biometric-plain`, and an Arca item may name
   a minimum (decision 6).
+- **Crossing switches (2026-11-18).** portcullisd asks with `Purpose::Crossing { from, to,
+  kind }` when Settings turns a switch between personas on (personas.md §6); the sheet says
+  "to let work send links to personal". Only portcullisd (label `Portcullis`, its uid from
+  `SIGILLUM_PORTCULLIS_UID`, default 0, `none` to turn it off) may ask it, and it may ask
+  nothing else.
 - **Rate:** five failed biometric matches in a row disable biometrics until the passcode is
   entered; a burst of verify requests is an anomaly reported to the monitor (arca.md §10).
 

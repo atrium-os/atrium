@@ -5602,7 +5602,7 @@ N3, Ethernet and Wi-Fi together, runs from the Aura gate script (it needs the AP
     sh scripts/curia-vm.sh away          # after `arca`: kill/hang atrium-netconf, dispensatord, arca-ui, limend; Curia must recover alone (frames scratch/curia-away-*.png)
     sh scripts/curia-vm.sh display       # forum-wm with its settings socket ($Sx/display.sock), then Curia's Display page
     sh scripts/curia-vm.sh sound         # VM booted with lyra-vm-check.sh qemu-args, after cloud-vm.sh lyra: lyrad, choragusd, a tone, Curia's Sound page
-    sh scripts/vm-apps-access-check.sh   # after cloud-vm.sh up: portcullisd, frescod headless, Curia's Apps page as alice; Allow (a real press), Remove; the Links section (Use, Ask each time on mailto:); other gates' apps set aside meanwhile; ends "apps-access: N failed"
+    sh scripts/vm-apps-access-check.sh   # after cloud-vm.sh up: portcullisd, frescod headless, Curia's Apps page as alice; Allow (a real press), Remove; the Links section (Use, Ask each time on mailto:); Between personas (alice has Work; Turn on asks a sigillumd stand-in, refused writes nothing, Turn off); other gates' apps set aside meanwhile; ends "apps-access: N failed"
     sh scripts/curia-bt-check.sh         # Linux host: Rootcanal + vinculumd + Bumble peers; the Bluetooth page model pairs (3 prompt kinds, plus Classic keyboards found by inquiry, named or asked), reconnects, turns Bluetooth off and on, forgets; vinculumd --control-apps admits or refuses by registry + manifest; ends "curia-bt: N failed"
     # Devices page: needs atrium-dispensatord with the devices socket on the VM (curia.md §9); then shot, click the sidebar's Devices
 

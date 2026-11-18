@@ -251,6 +251,7 @@ fn requester(label: &Label, cfg: &Config) -> String {
         Label::App { app, .. } => app.app_id.clone(),
         Label::Arca => "Arca".into(),
         Label::Ostiarius => "Lock screen".into(),
+        Label::Portcullis => "Settings".into(),
         Label::Unknown => "?".into(),
     }
 }
@@ -282,7 +283,7 @@ impl Broker {
                 }
             }
             Label::Unknown => Err(Refusal::UnknownPeer),
-            Label::Arca | Label::Ostiarius => Err(Refusal::Denied),
+            Label::Arca | Label::Ostiarius | Label::Portcullis => Err(Refusal::Denied),
         }
     }
 
@@ -486,11 +487,21 @@ impl Broker {
                 self.start(conn, id, Kind::Assert(a), &rp, uv, now, limit, who, user)
             }
             Request::VerifyUser(v) => {
-                if !matches!(label, Label::Arca | Label::Ostiarius) {
+                if !matches!(label, Label::Arca | Label::Ostiarius | Label::Portcullis) {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
                 if matches!(v.purpose, Purpose::ArcaItem { .. }) && *label != Label::Arca {
                     return vec![refused(conn, id, Refusal::Denied)];
+                }
+                // portcullisd asks only for a crossing switch, and only it does.
+                if matches!(v.purpose, Purpose::Crossing { .. }) != (*label == Label::Portcullis) {
+                    return vec![refused(conn, id, Refusal::Denied)];
+                }
+                if let Purpose::Crossing { from, to, kind } = &v.purpose {
+                    let name = |s: &str| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+                    if !name(from) || !name(to) || !matches!(kind.as_str(), "links" | "files" | "clipboard") {
+                        return vec![refused(conn, id, Refusal::Malformed)];
+                    }
                 }
                 if v.user.is_empty() || v.user.len() > 64 {
                     return vec![refused(conn, id, Refusal::Malformed)];

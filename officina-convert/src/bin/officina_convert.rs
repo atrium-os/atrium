@@ -106,7 +106,7 @@ fn pictures(mut stdin: impl Read) -> ! {
             let target = (tw > 0 && th > 0).then_some((tw, th));
             match decode_unaddressed(&bytes, Ceilings { target, ..Ceilings::default() }) {
                 Ok(px) if px.rgba.len() as u64 == px.width as u64 * px.height as u64 * 4 => {
-                    answer(&mut out, true, px.width, px.height).and_then(|_| out.write_all(&px.rgba))
+                    answer(&mut out, true, px.width, px.height).and_then(|_| out.flush()).and_then(|_| out.get_mut().write_all(&px.rgba))
                 }
                 _ => answer(&mut out, false, 0, 0),
             }

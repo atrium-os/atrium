@@ -125,16 +125,55 @@ pub fn make_preview(bytes: &[u8]) -> Option<(&'static str, u32, u32, Vec<u8>)> {
         enc.encode(&px.rgba, w as u16, h as u16, jpeg_encoder::ColorType::Rgba).ok()?;
         Some(("image/jpeg", w, h, out))
     } else {
-        let mut out = Vec::new();
-        {
-            let mut enc = png::Encoder::new(&mut out, w, h);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            let mut wr = enc.write_header().ok()?;
-            wr.write_image_data(&px.rgba).ok()?;
-        }
-        Some(("image/png", w, h, out))
+        Some(("image/png", w, h, encode_png(w, h, &px.rgba)?))
     }
+}
+
+/// Our own RGBA pixels as a PNG (8-bit RGBA, no filter, deflated): an
+/// encoder only, so the window's process links no PNG decoder.
+pub fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let row = w as usize * 4;
+    if w == 0 || h == 0 || rgba.len() != row * h as usize {
+        return None;
+    }
+    let mut raw = Vec::with_capacity((row + 1) * h as usize);
+    for r in rgba.chunks_exact(row) {
+        raw.push(0);
+        raw.extend_from_slice(r);
+    }
+    let z = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut chunk = |kind: &[u8], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    };
+    let mut ihdr = w.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(b"IHDR", &ihdr);
+    chunk(b"IDAT", &z);
+    chunk(b"IEND", &[]);
+    Some(out)
+}
+
+fn crc32(b: &[u8]) -> u32 {
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        t
+    });
+    !b.iter().fold(!0u32, |c, &x| t[((c ^ x as u32) & 0xFF) as usize] ^ (c >> 8))
 }
 
 /// Decodes `bytes` for `key` on a worker.
@@ -176,4 +215,19 @@ pub fn clear() {
     let mut q = p.q.lock().unwrap_or_else(|e| e.into_inner());
     q.decode.clear();
     q.preview.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn our_png_reads_back() {
+        let px: Vec<u8> = (0..7 * 5).flat_map(|i| [i as u8, 2 * i as u8, 90, (i * 7) as u8]).collect();
+        let b = super::encode_png(7, 5, &px).unwrap();
+        let d = png::Decoder::new(std::io::Cursor::new(b));
+        let mut r = d.read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size()];
+        let info = r.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (7, 5));
+        assert_eq!(&buf[..info.buffer_size()], &px[..]);
+    }
 }

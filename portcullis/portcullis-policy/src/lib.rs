@@ -185,6 +185,42 @@ impl Policy {
         self.crossings.iter().any(|c| c.from == f && c.to == t && c.kinds.iter().any(|k| k == kind))
     }
 
+    /// Turn the switch letting `kind` cross from `from` to `to` on or off
+    /// (personas by name, [`PERSONAL`] for Personal). Refused unless both
+    /// are the person's and differ. Returns whether anything changed.
+    pub fn set_crossing(&mut self, from: &str, to: &str, kind: &str, on: bool) -> Result<bool, String> {
+        fn named(p: &str) -> Option<&str> { if p == PERSONAL { None } else { Some(p) } }
+        if from == to {
+            return Err("a persona doesn't cross to itself".into());
+        }
+        for p in [from, to] {
+            if !self.has_persona(named(p)) {
+                return Err(format!("{p}: not one of your personas"));
+            }
+        }
+        let i = self.crossings.iter().position(|c| c.from == from && c.to == to);
+        let has = i.is_some_and(|i| self.crossings[i].kinds.iter().any(|k| k == kind));
+        match (on, has, i) {
+            (true, true, _) | (false, false, _) => Ok(false),
+            (true, false, Some(i)) => {
+                self.crossings[i].kinds.push(kind.into());
+                Ok(true)
+            }
+            (true, false, None) => {
+                self.crossings.push(Crossing { from: from.into(), to: to.into(), kinds: vec![kind.into()] });
+                Ok(true)
+            }
+            (false, true, Some(i)) => {
+                self.crossings[i].kinds.retain(|k| k != kind);
+                if self.crossings[i].kinds.is_empty() {
+                    self.crossings.remove(i);
+                }
+                Ok(true)
+            }
+            (false, true, None) => unreachable!(),
+        }
+    }
+
     /// Whether `persona` may be launched in: `None` (Personal) always; a
     /// name only if it is one of the person's personas and the list is valid.
     pub fn has_persona(&self, persona: Option<&str>) -> bool {
@@ -808,6 +844,24 @@ kinds = ["links"]
         assert!(!p.may_cross(Some("work"), None, "files"), "and each kind");
         assert!(!p.may_cross(Some("school"), None, "links"), "not a persona of theirs");
         assert!(!Policy::default().may_cross(None, Some("work"), "links"));
+    }
+
+    #[test]
+    fn a_switch_turns_on_and_off_one_kind_one_way() {
+        let mut p: Policy = toml::from_str("[personas.work]\ncolour = \"blue\"\n").unwrap();
+        assert_eq!(p.set_crossing("work", "personal", "links", true), Ok(true));
+        assert_eq!(p.set_crossing("work", "personal", "links", true), Ok(false), "already on");
+        assert_eq!(p.set_crossing("work", "personal", "clipboard", true), Ok(true));
+        assert!(p.may_cross(Some("work"), None, "clipboard") && !p.may_cross(None, Some("work"), "clipboard"));
+        assert_eq!(p.crossings.len(), 1, "one entry per direction");
+        assert_eq!(p.set_crossing("work", "personal", "links", false), Ok(true));
+        assert_eq!(p.set_crossing("work", "personal", "clipboard", false), Ok(true));
+        assert!(p.crossings.is_empty(), "an entry with no kinds goes");
+        assert_eq!(p.set_crossing("work", "personal", "links", false), Ok(false));
+        assert!(p.set_crossing("work", "work", "links", true).is_err());
+        assert!(p.set_crossing("school", "personal", "links", true).is_err());
+        let text = toml::to_string(&p).unwrap();
+        assert!(!text.contains("crossings"), "{text}");
     }
 
     #[test]

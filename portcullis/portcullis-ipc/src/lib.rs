@@ -412,6 +412,24 @@ pub enum Request {
         app:        Option<String>,
         activation: [u8; 16],
     },
+    /// ★ Settings' Personas section (personas.md §6): the person's named
+    /// personas and which crossing switches are on. `app-grants` only,
+    /// about the person that app belongs to. Answer: `Crossings`.
+    Crossings,
+    /// ★ Turn one crossing switch on or off: `from` may send `kind`
+    /// (`links`, `files`, `clipboard`) to `to`, personas by name
+    /// (`personal` for Personal). `app-grants` only, with `activation`, a
+    /// press in the asking app's window that portcullisd spends with
+    /// frescod (purpose APPROVE); turning one on then needs the person's
+    /// verification on Sigillum's sheet (`VERIFY_USER`), so a moment at an
+    /// unlocked machine can't open a path. Answer: `Ok`.
+    SetCrossing {
+        from:       String,
+        to:         String,
+        kind:       String,
+        on:         bool,
+        activation: [u8; 16],
+    },
 
     /// The person's workspaces (homes.md §5), Scratch made at the first
     /// ask. Asked by a launcher or by the person (not an app). Answer:
@@ -585,6 +603,17 @@ pub struct PersonaChoice {
     pub also: Vec<LinkChoice>,
 }
 
+/// One crossing switch that is on: `from` may send `kind` to `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossingSwitch {
+    pub from: String,
+    pub to:   String,
+    pub kind: String,
+}
+
+/// The kinds a crossing switch names in Settings (personas.md §6).
+pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files"];
+
 /// A link scheme in Settings' Links section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkScheme {
@@ -708,6 +737,9 @@ pub enum Response {
     LinkDelivered { app: String },
     /// Links → each scheme an app takes, by scheme.
     Links { schemes: Vec<LinkScheme> },
+    /// Crossings → the person's named personas (by name, with colour) and
+    /// the switches that are on.
+    Crossings { personas: Vec<(String, String)>, on: Vec<CrossingSwitch> },
     /// OpenFile → handed to `app` (started for it, or already running).
     Opened { app: String, name: String },
     /// Console → the shell runs; its terminal window is `title`.

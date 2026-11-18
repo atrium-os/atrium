@@ -9,8 +9,13 @@
 //! Its Links section (opening-links.md §4.4): each link scheme some app
 //! takes, the app that opens it, and a press to change that or to ask
 //! each time, as Monstrator's "Always use this app" would.
+//!
+//! Its Between personas section (personas.md §6): a switch per persona,
+//! direction and kind ("Work may send links to Personal"). Off by default;
+//! turning one on goes with a press and then the person confirming it's
+//! them on Sigillum's sheet, which portcullisd asks for.
 
-use portcullis_ipc::{AccessBy, AccessEntry, LinkScheme};
+use portcullis_ipc::{AccessBy, AccessEntry, CrossingSwitch, LinkScheme, CROSSING_KINDS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -19,7 +24,12 @@ pub enum Want {
     Remove { app_id: String },
     /// Make `app` the default for `scheme` links; `None`: ask each time.
     SetLink { scheme: String, app: Option<String>, activation: [u8; 16] },
+    /// Turn one crossing switch on or off.
+    SetCrossing { switch: CrossingSwitch, on: bool, activation: [u8; 16] },
 }
+
+/// The person's named personas (name, colour) and the switches that are on.
+pub type Crossings = (Vec<(String, String)>, Vec<CrossingSwitch>);
 
 #[derive(Clone, Debug)]
 pub enum Got {
@@ -29,6 +39,9 @@ pub enum Got {
     Links(Result<Vec<LinkScheme>, String>),
     /// A SetLink came back.
     LinkDone { scheme: String, result: Result<(), String> },
+    Crossings(Result<Crossings, String>),
+    /// A SetCrossing came back.
+    CrossingDone { switch: CrossingSwitch, result: Result<(), String> },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -51,6 +64,13 @@ pub struct AppsPage {
     pub link_busy: Option<String>,
     /// What went wrong for a scheme.
     pub link_note: Option<(String, String)>,
+    /// The Between personas section: None until portcullisd answers.
+    pub crossings: Option<Result<Crossings, String>>,
+    /// A SetCrossing on its way (turning on waits for the person's
+    /// verification).
+    pub crossing_busy: Option<(CrossingSwitch, bool)>,
+    /// What went wrong for a switch.
+    pub crossing_note: Option<(CrossingSwitch, String)>,
     pub wants: Vec<Want>,
 }
 
@@ -61,6 +81,17 @@ pub fn link_status(l: &LinkScheme) -> String {
         Some(c) => format!("Opens in {} (the system's choice)", c.name),
         None => "Asks which app each time".into(),
     }
+}
+
+/// "Personal", "Work": a persona's name as the chip shows it.
+pub fn persona_name(p: &str) -> String {
+    let mut c = p.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// "Work may send links to Personal".
+pub fn crossing_words(s: &CrossingSwitch) -> String {
+    format!("{} may send {} to {}", persona_name(&s.from), s.kind, persona_name(&s.to))
 }
 
 /// One line on what an app may do now.
@@ -152,7 +183,54 @@ impl AppsPage {
                 }
                 self.refresh();
             }
+            Got::Crossings(r) => self.crossings = Some(r),
+            Got::CrossingDone { switch, result } => {
+                if self.crossing_busy.as_ref().is_some_and(|(s, _)| *s == switch) {
+                    self.crossing_busy = None;
+                }
+                match result {
+                    Ok(()) => self.crossing_note = None,
+                    Err(why) => self.crossing_note = Some((switch, why)),
+                }
+                self.refresh();
+            }
         }
+    }
+
+    /// Each direction between two personas, Personal first: none until
+    /// the person has a named persona.
+    pub fn directions(&self) -> Vec<(String, String)> {
+        let Some(Ok((named, _))) = &self.crossings else { return Vec::new() };
+        let all: Vec<&str> = std::iter::once("personal").chain(named.iter().map(|(n, _)| n.as_str())).collect();
+        let mut v = Vec::new();
+        for a in &all {
+            for b in &all {
+                if a != b {
+                    v.push((a.to_string(), b.to_string()));
+                }
+            }
+        }
+        v
+    }
+
+    pub fn crossing_on(&self, s: &CrossingSwitch) -> bool {
+        matches!(&self.crossings, Some(Ok((_, on))) if on.contains(s))
+    }
+
+    /// Turn a switch on or off, with the press that made it; one at a
+    /// time, and only a switch the section shows.
+    pub fn set_crossing(&mut self, switch: CrossingSwitch, on: bool, activation: Option<[u8; 16]>) {
+        let shown = CROSSING_KINDS.contains(&switch.kind.as_str()) && self.directions().iter().any(|(f, t)| *f == switch.from && *t == switch.to);
+        if self.crossing_busy.is_some() || !shown || self.crossing_on(&switch) == on {
+            return;
+        }
+        let Some(activation) = activation else {
+            self.crossing_note = Some((switch, "Press with the pointer or Enter".into()));
+            return;
+        };
+        self.crossing_note = None;
+        self.crossing_busy = Some((switch.clone(), on));
+        self.wants.push(Want::SetCrossing { switch, on, activation });
     }
 
     pub fn schemes(&self) -> &[LinkScheme] {
@@ -344,5 +422,31 @@ mod tests {
         assert!(p.take_wants().is_empty(), "already");
         p.set_link("mailto", None, Some([5; 16]));
         assert_eq!(p.take_wants(), vec![Want::SetLink { scheme: "mailto".into(), app: None, activation: [5; 16] }]);
+    }
+
+    #[test]
+    fn crossing_switches_go_one_way_one_kind_with_a_press() {
+        let sw = |f: &str, t: &str, k: &str| CrossingSwitch { from: f.into(), to: t.into(), kind: k.into() };
+        let mut p = AppsPage::default();
+        p.apply(Got::Crossings(Ok((vec![], vec![]))));
+        assert!(p.directions().is_empty(), "only Personal: nothing crosses");
+        p.apply(Got::Crossings(Ok((vec![("work".into(), "blue".into())], vec![sw("work", "personal", "links")]))));
+        assert_eq!(p.directions(), [("personal".to_string(), "work".to_string()), ("work".into(), "personal".into())]);
+        assert!(p.crossing_on(&sw("work", "personal", "links")));
+        assert_eq!(crossing_words(&sw("work", "personal", "links")), "Work may send links to Personal");
+        p.set_crossing(sw("personal", "work", "clipboard"), true, None);
+        assert!(p.take_wants().is_empty() && p.crossing_note.is_some(), "no press");
+        p.set_crossing(sw("work", "personal", "links"), true, Some([1; 16]));
+        p.set_crossing(sw("personal", "school", "links"), true, Some([1; 16]));
+        p.set_crossing(sw("personal", "work", "workspace-links"), true, Some([1; 16]));
+        assert!(p.take_wants().is_empty(), "already on, no such persona, not a kind shown");
+        p.set_crossing(sw("personal", "work", "clipboard"), true, Some([2; 16]));
+        p.set_crossing(sw("work", "personal", "links"), false, Some([3; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetCrossing { switch: sw("personal", "work", "clipboard"), on: true, activation: [2; 16] }], "one at a time");
+        p.apply(Got::CrossingDone { switch: sw("personal", "work", "clipboard"), result: Err("not confirmed (Cancelled); nothing changed".into()) });
+        assert!(p.crossing_busy.is_none() && p.crossing_note.is_some());
+        assert_eq!(p.take_wants(), vec![Want::Refresh]);
+        p.set_crossing(sw("work", "personal", "links"), false, Some([3; 16]));
+        assert_eq!(p.take_wants(), vec![Want::SetCrossing { switch: sw("work", "personal", "links"), on: false, activation: [3; 16] }]);
     }
 }

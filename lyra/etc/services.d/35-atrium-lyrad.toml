@@ -57,3 +57,9 @@ path = "/usr/local/bin/atrium-lyrad"
 argv = ["atrium-lyrad", "--serve"]
 uid  = 65016   # _lyra
 gid  = 65016
+
+# The jail has no /etc/passwd, so the trusted peer is given by uid: a name
+# such as the default "_choragus" cannot resolve in here and lyrad would exit.
+[[exec.env]]
+key   = "ATRIUM_LYRAD_PEERS"
+value = "65017"   # _choragus

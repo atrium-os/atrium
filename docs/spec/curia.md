@@ -351,6 +351,16 @@ that frescod confirms; restricted capabilities stay the system policy's alone.
   portcullisd words "the window was covered or had just moved; press again". Ordinary
   windows count for `APPROVE` alone: `FILL` and `IDENTITY` still need a slot or a sheet.
 
+### 13.1 Between personas (2026-11-18)
+
+Below Links, once the person has a named persona: a switch per direction and kind
+(personas.md §6), "Personal may send links to Work", each with Turn on or Turn off.
+Turning one on goes with the press, then the person confirms it's them on Sigillum's sheet
+(portcullisd asks `VERIFY_USER`); while it waits the row says "Confirm it's you…", and a
+refusal shows under the row ("not confirmed (NotAllowed); nothing changed"). Curia waits up
+to eleven minutes for that answer. Model `AppsPage::directions`, `set_crossing`; portcullisd
+`Crossings`, `SetCrossing`. Checked in `vm-apps-access-check.sh` "Between personas".
+
 ## 14. C4d as built: the Bluetooth page (2026-11-15)
 
 - Over vinculumd's control socket (bluetooth.md §13), `bluetooth-control/control.sock`,

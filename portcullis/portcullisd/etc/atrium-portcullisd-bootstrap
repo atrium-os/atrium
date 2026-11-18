@@ -56,6 +56,10 @@ atrium_portcullisd_bootstrap_prepare_dirs() {
     install -d -m 0755 -o root -g wheel /var/run/atrium
     install -d -m 0755 -o root -g wheel /var/log/atrium
     install -d -m 0755 -o root -g wheel "${atrium_portcullisd_bootstrap_services_dir}"
+    # Services mount the app registry read-only (a nullfs file mount, whose
+    # source must exist). /var/run is emptied at boot and portcullisd, which
+    # fills it, starts after the network, well after these services launch.
+    [ -e /var/run/atrium/app-registry ] || install -m 0644 -o root -g wheel /dev/null /var/run/atrium/app-registry
 }
 
 atrium_portcullisd_bootstrap_start() {

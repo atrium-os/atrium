@@ -1086,6 +1086,49 @@ impl CuriaView {
                     y += em(8.0);
                 }
             }
+            // Between personas (personas.md §6): a switch per direction
+            // and kind, off by default; on asks Sigillum's sheet too.
+            let dirs = p.directions();
+            if !dirs.is_empty() || matches!(p.crossings, Some(Err(_))) {
+                y += em(20.0);
+                text(ctx, 0.0, y + em(14.0), "Between personas", type_size::LG, Weight::Semibold, t.text_primary());
+                y += em(32.0);
+            }
+            if let Some(Err(why)) = &p.crossings {
+                text(ctx, 0.0, y + em(10.0), &format!("The switches are not available: {why}"), type_size::SM, Weight::Regular, t.text_secondary());
+                y += em(28.0);
+            }
+            for (from, to) in dirs {
+                text(ctx, 0.0, y + em(14.0), &format!("{} to {}", apps::persona_name(&from), apps::persona_name(&to)), type_size::MD, Weight::Medium, t.text_primary());
+                y += em(28.0);
+                for kind in portcullis_ipc::CROSSING_KINDS {
+                    let sw = portcullis_ipc::CrossingSwitch { from: from.clone(), to: to.clone(), kind: kind.to_string() };
+                    let on = p.crossing_on(&sw);
+                    let busy = p.crossing_busy.as_ref().filter(|(s, _)| *s == sw).map(|(_, to_on)| *to_on);
+                    let bh = em(40.0);
+                    text(ctx, em(16.0), y + em(16.0), &apps::crossing_words(&sw), type_size::SM, Weight::Regular, t.text_primary());
+                    let state = match busy {
+                        Some(true) => "Confirm it's you…",
+                        Some(false) => "Turning off…",
+                        None if on => "On",
+                        None => "Off",
+                    };
+                    text(ctx, em(16.0), y + em(32.0), state, type_size::XS, Weight::Regular, t.text_secondary());
+                    let lab = if on { "Turn off" } else { "Turn on" };
+                    let bx = pw - em(12.0) - width(lab, type_size::SM, Weight::Medium) - em(24.0);
+                    let pg = self.apps.clone();
+                    button(ctx, bx, y + em(5.0), lab, Look::Secondary, p.crossing_busy.is_none(), move || {
+                        let token = pergola::clipboard::current_activation();
+                        with_apps(&pg, |a| a.set_crossing(sw.clone(), !on, token))
+                    });
+                    y += bh;
+                    if let Some((_, why)) = p.crossing_note.as_ref().filter(|(s, _)| s.from == from && s.to == to && s.kind == *kind) {
+                        text(ctx, em(16.0), y + em(6.0), why, type_size::SM, Weight::Regular, t.danger_fg());
+                        y += em(24.0);
+                    }
+                }
+                y += em(8.0);
+            }
             if let Some(Node::Stack { rect, .. }) = ctx.tree.get_mut(g) {
                 rect.size.h = y;
             }

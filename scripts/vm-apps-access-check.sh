@@ -24,6 +24,11 @@
 #   - Links (opening-links.md §4.4): New and Sys both take mailto: links;
 #     the mailto row lists them, Use on one makes it alice's default
 #     (links.toml), Ask each time takes it away; root can't do either.
+#   - Between personas (personas.md §6): alice has a Work persona; Turn on
+#     for "Personal may send links to Work" asks Sigillum to confirm it's
+#     her (a stand-in answers, sigillum_stand_in) and writes the
+#     [[crossings]] switch; refused, nothing is written; Turn off needs no
+#     confirming; root can't turn one.
 # WX/WY: where frescod puts Curia's window (0 0 with no window manager).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,15 +49,15 @@ echo "=== cross-build"
 xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2) || { echo "build of $1 failed"; echo "apps-access: 1 failed"; exit 1; }; }
 [ -n "${NO_BUILD:-}" ] || {
     xb frescod "--bin frescod"
-    xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bin portcullis --bin opifex --example home_probe"
+    xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bin portcullis --bin opifex --example home_probe --example sigillum_stand_in"
     xb curia "--bin curia"
 }
 
 echo "=== install"
 B=/var/tmp/apps-access
-V "pkill -x portcullisd; pkill -x frescod; pkill -x curia; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
+V "pkill -x portcullisd; pkill -x frescod; pkill -x curia; pkill -f sigillum_stand_in; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 for b in frescod/target/$TARGET/release/frescod portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
-         portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/examples/home_probe curia/target/$TARGET/release/curia; do
+         portcullis/target/$TARGET/release/opifex portcullis/target/$TARGET/release/examples/home_probe portcullis/target/$TARGET/release/examples/sigillum_stand_in curia/target/$TARGET/release/curia; do
     scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "apps-access: 1 failed"; exit 1; }
 done
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
@@ -84,10 +89,11 @@ rm -f /var/db/atrium/alice/links.toml
 mkdir -p $ASIDE
 for d in /var/lib/atrium/apps/*; do case \${d##*/} in $NEW|$SYS|$CURIA) ;; *) mv \$d $ASIDE/ ;; esac; done
 mk $CURIA Settings curia curia 'graphics = "fresco"\napp-grants = true'
-rm -f $POL
+printf '[personas.work]\ncolour = "blue"\n' > $POL
+daemon -f -o $B/sigillum.log $B/sigillum_stand_in $B/sigillum.sock
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
 : > $LOG
-daemon -f -o $LOG env PORTCULLISD_FRESCO_ACTIVATION=$B/activation.sock /usr/local/bin/portcullisd --socket $PSOCK
+daemon -f -o $LOG env PORTCULLISD_FRESCO_ACTIVATION=$B/activation.sock PORTCULLIS_SIGILLUM=$B/sigillum.sock /usr/local/bin/portcullisd --socket $PSOCK
 sleep 3; test -S $PSOCK; chmod 666 $PSOCK
 portcullis policy grant --system $SYS >/dev/null 2>&1
 portcullis policy grant --system $CURIA >/dev/null 2>&1
@@ -170,7 +176,35 @@ i=0; while [ $i -lt 30 ] && [ "$(count "mailto links is now ask each time")" = 0
 V "grep -q mailto $LT" && bad "still in links.toml" || ok "not in her links.toml"
 shot links-2
 
-V "pkill -x curia" >/dev/null 2>&1
+echo "=== Between personas"
+R=$(V "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"set_crossing\",\"from\":\"personal\",\"to\":\"work\",\"kind\":\"links\",\"on\":true,\"activation\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]}\n' | nc -N -U $PSOCK")
+case "$R" in *"not a launched app"*) ok "root turning a switch: refused" ;; *) bad "root crossing: $R" ;; esac
+L=$(V "grep 'crossings -> $CURIA' $LOG | tail -1")
+case "$L" in *"for alice: 1 persona(s), 0 switch(es) on"*) ok "Curia's Between personas section: Work, all off" ;; *) bad "crossings: $L" ;; esac
+press ${LX:-400} ${LY:-356}                      # close the mailto row
+shot persona-0
+press ${CX:-880} ${CY:-488}                      # Turn on: Personal may send links to Work
+i=0; while [ $i -lt 30 ] && [ "$(count "switch for links from personal to work is now on")" = 0 ]; do sleep 2; i=$((i+2)); done
+V "grep -q 'verify alice for Crossing { from: \"personal\", to: \"work\", kind: \"links\" }: confirmed' $B/sigillum.log" && ok "Sigillum asked to confirm it's alice" || bad "no verify: $(V "cat $B/sigillum.log")"
+[ "$(count "switch for links from personal to work is now on (from $CURIA, verified)")" = 1 ] && ok "confirmed: the switch is on" || bad "not on: $(V "grep -i 'crossing\|switch\|REFUSED' $LOG | tail -3")"
+V "grep -A3 '^\[\[crossings\]\]' $POL | grep -q links" && ok "written to her policy" || bad "policy: $(V "cat $POL")"
+shot persona-1
+V "touch $B/sigillum.sock.refuse"
+press ${CX:-880} ${KY:-528}                      # Turn on: clipboard, refused this time
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'kind: \"clipboard\" }: refused' $B/sigillum.log"; do sleep 2; i=$((i+2)); done
+sleep 3
+[ "$(count "for clipboard from personal to work is now on")" = 0 ] && ok "not confirmed: the clipboard switch stays off" || bad "clipboard on without confirming"
+V "grep -q clipboard $POL" && bad "clipboard in her policy" || ok "nothing written for it"
+shot persona-2
+V "rm -f $B/sigillum.sock.refuse"
+press ${CX:-880} ${CY:-488}                      # Turn off: links
+i=0; while [ $i -lt 30 ] && [ "$(count "from personal to work is now off")" = 0 ]; do sleep 2; i=$((i+2)); done
+[ "$(count "switch for links from personal to work is now off")" = 1 ] && ok "Turn off: off, with no confirming" || bad "not off: $(V "grep -i 'switch\|REFUSED' $LOG | tail -3")"
+[ "$(V "grep -c 'kind: \"links\"' $B/sigillum.log" | tr -d ' ')" = 1 ] && ok "Sigillum was asked once for links" || bad "sigillum: $(V "cat $B/sigillum.log")"
+V "grep -q links $POL" && bad "still in her policy: $(V "cat $POL")" || ok "not in her policy"
+shot persona-3
+
+V "pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
 # Its own test apps go (they take mailto:, which other gates count on).
 V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
 echo "apps-access: $fails failed"

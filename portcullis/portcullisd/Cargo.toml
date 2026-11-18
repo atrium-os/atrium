@@ -69,6 +69,8 @@ atrium-open         = { path = "../../atrium-open" }
 atrium-types        = { path = "../../atrium-types" }
 atrium-links        = { path = "../../atrium-links" }
 fresco-protocol     = { path = "../../fresco-protocol" }
+# Settings' crossing switches ask the person on Sigillum's sheet (personas.md §6).
+sigillum-proto      = { path = "../../sigillum/sigillum-proto" }
 postcard            = { version = "1", features = ["use-std"] }
 libc                = "0.2"
 serde               = { version = "1", features = ["derive"] }
