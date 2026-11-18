@@ -17,6 +17,16 @@
 #   atrium_jaild_state="/var/run/atrium/jaild.state.toml"
 #   atrium_jaild_logfile="/var/log/atrium/jaild.log"
 #   atrium_jaild_log_level="info"
+#
+# devfs rulesets: jaild refuses any jail whose devfs ruleset has no rules
+# (server.rs, "devfs_ruleset.not_loaded"). The services launch before netif
+# (docs/spec/fast-boot.md §4.1), long before /etc/rc.d/devfs, so this script
+# loads every file in devfs_rulesets itself, before jaild starts. Set
+#   devfs_load_rulesets="NO"
+# on Atrium hosts so rc.d/devfs does not load them a second time: it deletes
+# and re-adds each ruleset, and a jail mounted in that gap would get an empty
+# ruleset (the host's whole /dev). `service atrium_jaild devfsrules` reloads
+# them after the rules file changes.
 
 . /etc/rc.subr
 
@@ -43,7 +53,8 @@ pidfile="/var/run/atrium/jaild.pid"
 start_cmd="atrium_jaild_start"
 stop_cmd="atrium_jaild_stop"
 status_cmd="atrium_jaild_status"
-extra_commands="checkpolicy reload"
+extra_commands="checkpolicy reload devfsrules"
+devfsrules_cmd="atrium_jaild_devfsrules"
 checkpolicy_cmd="atrium_jaild_checkpolicy"
 reload_cmd=":"   # restart instead; no SIGHUP handler in jaild yet
 
@@ -53,8 +64,23 @@ atrium_jaild_prepare_dirs() {
     install -d -m 0755 -o root -g wheel /etc/atrium
 }
 
+# Load (or reload) every ruleset file in devfs_rulesets, the defaults
+# included: Atrium's rules `include` the stock ones by name.
+atrium_jaild_devfsrules() {
+    devfs_init_rulesets || err 1 "could not load the devfs rulesets in: ${devfs_rulesets}"
+}
+
 atrium_jaild_start() {
     atrium_jaild_prepare_dirs
+    # Ruleset 4 (devfsrules_jail) is one every Atrium jail builds on; when it
+    # has rules, the rulesets are already loaded (a restart while jails run
+    # must not delete and re-add them under those jails).
+    if [ -z "$(/sbin/devfs rule -s 4 show 2>/dev/null)" ]; then
+        atrium_jaild_devfsrules
+    fi
+    if checkyesno devfs_load_rulesets; then
+        warn "devfs_load_rulesets is YES: rc.d/devfs will reload the devfs rulesets while services launch; set it to NO"
+    fi
     if [ ! -f "${atrium_jaild_policy}" ]; then
         err 1 "policy file ${atrium_jaild_policy} missing"
     fi

@@ -132,7 +132,7 @@ put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 g "mkdir -p /etc/atrium/services.d.off && mv /etc/atrium/services.d/*-atrium-smoke-*.toml /etc/atrium/services.d.off/ 2>/dev/null; true"
 # arcad's devfs ruleset (32, atrium_arca: basics + tesserakeys) must be loaded.
 put "$ROOT/etc/atrium.devfs.rules" /usr/local/etc/atrium/devfs.rules
-g "service devfs restart >/dev/null 2>&1; true"
+g "sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets' >/dev/null 2>&1; true"
 check "arcad's devfs ruleset is loaded" yes "$(g 'test -n "$(devfs rule -s 32 show 2>/dev/null)" && echo yes || echo no')"
 # A stale socket from an earlier run would pass "socket bound" with no arcad.
 g "rm -f /atrium/sockets/arca/arcad.sock; service atrium-jaild restart >/dev/null 2>&1; sleep 2; service atrium-portcullisd-bootstrap onestart >/dev/null 2>&1; true"
