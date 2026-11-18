@@ -811,7 +811,12 @@ font on demand and a driver from a `nobody` device's notice.
   node to the request's uid). opifex refuses a driver file with another ruleset, a uid
   outside the range or not equal to its gid, another jail name, or a uid another installed
   driver has. The VM gate checks the driver's jail starts and runs as its uid once this
-  tree's jaild, policy and devfs rules are deployed (not yet run).
+  tree's jaild, policy and devfs rules are deployed. Rerun 2026-11-18 with ruleset 33
+  loaded: jaild then refused dispensatord's read-only mount of the driver's package folder
+  (read-only sources were exact paths only). Fixed in jaild: `[mount_sources] ro_subtrees`
+  takes a folder directly inside a listed one, never the listed folder itself, so a driver
+  sees only its own package (`/usr/local/libexec/atrium/drivers/`). Every other check
+  passed; the gate's two driver-jail checks wait for the next VM run.
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
@@ -824,6 +829,89 @@ font on demand and a driver from a `nobody` device's notice.
   from the catalog, devices.idx after sync, the sheet refused for it, uninstall; rule
   coverage; firmware placement; lookups; dispensator's planner offering a catalog driver for
   a nobody device).
+
+### 14.8 C7 as built (2026-11-18)
+
+- **Publisher records** (`opifex-catalog/src/publisher.rs`): log entries of type
+  `publisher` with an action. `register` gives a stable id (`pub:` + the first 16 hex of
+  its key's id), a name, domains (lowercase host names; prefixes are the reversed domains),
+  kinds and a key; it is signed by that key. `rotate` names a new key, signed by the current
+  and the new key; a past key never comes back. `scope` changes name, domains or kinds,
+  signed by the current key. `recover` replaces a lost key, signed by the catalog's
+  root-key threshold and the new key, and counts a recovery. No two publishers share a key
+  or a domain. A release may name a `publisher`; its signer must be that publisher's
+  current key, the id in its prefixes, the kind in its kinds. A publisher's current key
+  yanks any of its releases. Publishers keep past keys' PEMs (`past_keys`), so a tree
+  signed before a rotation still checks.
+- **Third-party catalogs**: the machine decides by location (the system's catalog in
+  `catalog/`, the others in `catalogs/<slug>/`), never by what a catalog says. A
+  third-party catalog carries apps only, never `org.atrium.`, never `devices`, and
+  releases only through publisher records (`Scope`, `Client::third_party`,
+  `Log::third_party`). `Log::append` replays the log exactly as a machine does
+  (`Log::replay`).
+- **Following catalogs** (`opifex/src/catalogs.rs`): `catalogs/<slug>/` holds the client
+  state, `source.toml` (URL, the approved root.toml's sha256, for everyone or for the
+  person who added it, who, when) and `proofs.toml`. The slug is the host name (`-2`,
+  `-3` for more on one host), and the installed record's source is `catalog:<slug>`, which
+  has a dot, so it never meets the Atrium catalog's `catalog:Atrium`. `Describe`, `Search`
+  and installs look in the catalog an id came from if it is installed (never replaced from
+  another), else the Atrium catalog, then the person's other catalogs in order. A
+  catalog someone adds for themselves is seen by them only.
+- **Domain proofs, per machine**: after each sync of an added catalog, opifexd checks every
+  publisher domain it hasn't checked yet: the TXT record `_atrium-publisher.<domain>`
+  through Nuntius (opifex-fetch's new `Txt` ask, `nuntius::Lookup`), else
+  `https://<domain>/.well-known/atrium-publisher`, either holding the line
+  `atrium-publisher pub:…`. The proof names the publisher id, so a rotation needs no new
+  proof; a domain added by `scope` does. A release is offered only once the domain whose
+  prefix holds its id is proven; proofs of domains a publisher dropped are forgotten.
+- **Two fetchers**: the Atrium catalog keeps `org.atrium.opifex.fetch`, narrowed to its
+  hosts. Everything else (added catalogs, their archives, proofs, WebAuthn files) goes
+  through `org.atrium.opifex.fetch-any`, the same binary with `net-fetch` to any https host
+  (`scripts/opifex-fetch-bundle.sh --any`; `OPIFEX_FETCH_ANY`). Neither is trusted for
+  anything it brings.
+- **opifexd requests**: `Catalogs`; `PreviewCatalog { url }` (anyone: name, root.toml
+  sha256, the warning); `AddCatalog { url, root_sha256, machine, for_uid }` (from the sheet
+  for one person, `machine` only from root), refused if root.toml changed since the
+  preview, undone if the first sync fails; `RemoveCatalog { slug }` (root, or the person
+  who added it): the catalog's apps stay installed and their updates stop. A full `Sync`
+  syncs every followed catalog and reports each in `others`; an Atrium failure no longer
+  stops the others. `Describe { id, for_uid }`: the sheet describes as the person sees it.
+  Described gains `publisher_name`, `publisher_domains`, `third_party`, `recovered`.
+- **Updates**: the installed record keeps the publisher id, so a rotated key updates as the
+  same publisher; after a recovery (record's `recoveries` behind the publisher's) the next
+  update asks on the sheet even with nothing new asked for (§7.7), with "its publisher's
+  key was replaced by a recovery".
+- **The sheet** (`opifex-sheet`): `Ask::AddCatalog { url }` (`opifex_sheet::add_catalog`)
+  shows "Add the catalog <name>?", its address, the warning (marked), "Its apps will be
+  offered to you only", and its keys' hash; a counted press on Add follows exactly that
+  root.toml for the asker (`Answer::Added`). An app from an added catalog names its
+  publisher and proven domains and says "Atrium has not reviewed this catalog's apps."; an
+  update after a recovery is marked.
+- **Running a catalog** (`opifex catalog …`): `init` (root keys, a catalog key, a root.toml
+  signed by the threshold, a first head), `register` (prints the TXT and `.well-known`
+  lines), `publisher rotate|scope|recover`, `publishers`, `publish` (= `head`); `add` finds
+  a publisher by its signature; a catalog with no platform key is handled as a third
+  party's by the tools (`Log::for_dir`). The `catalog-repo` template, its workflow and
+  `publish.sh` are the recipe for anyone (README, "Running a catalog of your own").
+  CLI for machines: `opifex catalogs | follow <url> [<sha> [--everyone]] | unfollow <slug>`.
+- **WebAuthn RP ids** (`opifex/src/rp.rs`, §7.3): an app's `identity.webauthn` RP ids are
+  each checked against `https://<rp>/.well-known/atrium-apps` (lines `<publisher> <app id>`:
+  the publisher id, or the platform key's id), at most 8; the ones that name the app go
+  into the record's `verified_rps`, the rest are dropped and logged.
+- Checked: host tests (publisher lifecycle and refusals in `opifex-catalog`; opifexd end to
+  end with an added catalog served through the fetcher: preview, add from the sheet,
+  visibility per person, an unproven publisher's app never offered, install for the person,
+  a WebAuthn RP verified and one dropped, a rotation updating in the background, a recovery
+  asking, removal keeping the app; the sheet's lines and its add-a-catalog decision; TXT
+  answers in the fetcher; jaild's `ro_subtrees` refusals); the publishing tools run by hand
+  (init, register, add, publish, rotate, a past key refused, sync).
+- Not yet: launch trust for apps from added catalogs (portcullis-trust's gate knows only
+  `/etc/atrium/publishers`; reading opifexd's record and the publisher's keys is the
+  platform thread's, told 2026-11-18); Sigillum reading `verified_rps` and keying private
+  RPs on the publisher id; Curia's add-a-catalog page and a link that opens the sheet
+  (both call `opifex_sheet::add_catalog`); per-persona catalogs (personas.md, later);
+  atrium-ax coverage in the publishing check, which needs an ax measurement tool that
+  doesn't exist yet (atrium-ax.md §5.3); a VM gate for C7.
 
 ## 15. Decisions, with recommendations
 
