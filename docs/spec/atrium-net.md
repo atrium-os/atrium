@@ -558,8 +558,18 @@ VM from the Aura gates cover them.
 - IPv6 over Wi-Fi checked 2026-11-17 (`aura-sim-gate.sh wifi6`, 11/11): the AP VM's
   `ra6.py` advertises fd77:0:0:77::/64 and RDNSS on br0; RAs arrive as group frames
   under the GTK; SLAAC stable and temporary addresses, the AP as default router, ping6
-  both ways, `dns6=` from RDNSS, and the addresses gone when we leave. Not yet: RA MTU
-  beyond what the kernel applies.
+  both ways, `dns6=` from RDNSS, and the addresses gone when we leave. MTU since 2026-11-18: a
+  network's MTU no longer outlives it. atrium-net puts the port back to 1500 when the
+  lease that set an MTU is lost, when a renewal stops carrying one, and on the first
+  lease after a restart (`ResetMtu`, only if it differs). The RA's MTU is the kernel's
+  (`nd6_ra_opt_mtu`: 1280 up to the port's MTU) and shows as `mtu6=` beside `mtu=` on
+  the status line. Found: the kernel keeps an RA's lowered link MTU after the network
+  is gone and refuses to raise it from userland (`SIOCSIFINFO_IN6` checks against
+  `in6_ifmtu`, which is the lowered value), so only a later RA with an MTU option
+  raises it; most routers send one. Lower is only slower, never broken, so this is
+  left to the kernel; a fork fix would compare against the port's MTU instead. Gate
+  `atrium-net-gate.sh n0` 63/63 (MTU 1400 by DHCP and RA applied and shown; back to
+  1500 after a restart on a network without one).
 
 ### 10.4 N3 as built (2026-11-14)
 

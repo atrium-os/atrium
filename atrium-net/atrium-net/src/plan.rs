@@ -12,8 +12,14 @@ pub enum Action {
     AddRoute(Route),
     DelRoute(Route),
     SetMtu(u16),
+    /// Back to the port's own MTU ([`DEFAULT_MTU`]): a network's MTU does
+    /// not follow the port to the next network. Done only if it differs.
+    ResetMtu,
     SetDns(Vec<Ipv4Addr>),
 }
+
+/// A port's MTU when no network says otherwise (Ethernet and Wi-Fi).
+pub const DEFAULT_MTU: u16 = 1500;
 
 /// What this interface currently has applied.
 #[derive(Clone, Debug, Default)]
@@ -58,6 +64,11 @@ impl Applied {
         if old.as_ref().map(|o| &o.dns) != Some(&new.dns) && !new.dns.is_empty() {
             a.push(Action::SetDns(new.dns.clone()));
         }
+        // No MTU now, but one before (or unknown: the first lease, maybe
+        // after a restart that left an earlier network's MTU on the port).
+        if new.mtu.is_none() && old.as_ref().map_or(true, |o| o.mtu.is_some()) {
+            a.push(Action::ResetMtu);
+        }
         self.lease = Some(new);
         a
     }
@@ -66,6 +77,9 @@ impl Applied {
         let Some(o) = self.lease.take() else { return vec![] };
         let mut a: Vec<Action> = routes_of(&o).into_iter().map(Action::DelRoute).collect();
         a.push(Action::DelAddr { addr: o.addr });
+        if o.mtu.is_some() {
+            a.push(Action::ResetMtu);
+        }
         a
     }
 }
@@ -112,7 +126,8 @@ mod tests {
         assert_eq!(first[0], Action::AddAddr { addr: Ipv4Addr::new(10, 77, 0, 5), prefix: 24 });
         assert!(matches!(first[1], Action::AddRoute(Route { prefix: 16, .. })));
         assert!(matches!(first[2], Action::SetDns(_)));
-        assert_eq!(first.len(), 3, "no default route: egress.rs places it");
+        assert_eq!(first[3], Action::ResetMtu, "the first lease: whatever MTU the port had goes");
+        assert_eq!(first.len(), 4, "no default route: egress.rs places it");
         // Renewal with identical values: nothing.
         assert!(a.bind(l([10, 77, 0, 5], 1)).is_empty());
         // New DNS only.
@@ -125,5 +140,18 @@ mod tests {
         let lost = a.lose();
         assert_eq!(lost.last(), Some(&Action::DelAddr { addr: Ipv4Addr::new(192, 168, 7, 9) }));
         assert!(a.lose().is_empty());
+    }
+
+    #[test]
+    fn a_networks_mtu_stays_with_it() {
+        let mut a = Applied::default();
+        let with = |m| LeaseV4 { mtu: m, ..l([10, 77, 0, 5], 1) };
+        assert!(a.bind(with(Some(1400))).contains(&Action::SetMtu(1400)));
+        assert!(a.bind(with(Some(1400))).is_empty(), "renewal: nothing");
+        assert_eq!(a.bind(with(None)), vec![Action::ResetMtu], "the network stopped saying");
+        assert!(a.bind(with(None)).is_empty());
+        a.bind(with(Some(9000)));
+        assert_eq!(a.lose().last(), Some(&Action::ResetMtu), "left: not onto the next network");
+        assert!(!a.bind(with(None)).contains(&Action::SetMtu(9000)));
     }
 }

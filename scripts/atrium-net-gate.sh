@@ -337,9 +337,26 @@ n0)
     ok "turned off: the network's DNS servers again"
     "$V" 'kill $(cat /tmp/atrium-net/dot/pid); ifconfig lo1 destroy'
 
-    # Renewal at T1 (half the lease).
+    # Renewal at T1 (half the lease). The network now says MTU 1400, in
+    # DHCP and in its RAs.
+    lanctl 'mtu 1400' >/dev/null
     i=0; while [ "$(stat renew)" -lt 1 ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done
     [ "$(stat renew)" -ge 1 ] && wait_addr 10.88.0.50 10 && ok "lease renewed at T1, address kept" || fail "no renewal"
+    mtu() { "$V" 'ifconfig vtnet1 | sed -n "s/.*mtu \([0-9]*\).*/\1/p"'; }
+    mtu6() { "$V" 'ndp -i vtnet1 | sed -n "s/.*linkmtu=\([0-9]*\).*/\1/p"'; }
+    i=0; until [ "$(mtu)" = 1400 ] && [ "$(mtu6)" = 1400 ]; do i=$((i + 1)); [ $i -lt 20 ] || fail "network MTU not applied: mtu $(mtu) linkmtu $(mtu6)"; sleep 1; done
+    st=$("$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep 'name=vtnet1')
+    echo "$st" | grep -q ' mtu=1400' && echo "$st" | grep -q ' mtu6=1400' \
+        && ok "the network's MTU 1400 applied (DHCP option 26 and the RA's), shown as mtu=1400 mtu6=1400" || fail "mtu status: $st"
+    # The network stops saying so; atrium-net restarted: its MTU does not
+    # stay on the port (§5.1). The RA's 1500 raises IPv6's again.
+    lanctl 'mtu off' >/dev/null
+    "$V" 'pkill -f "atrium-net -v"; sleep 1
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease /tmp/atrium-net/atrium-lease --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
+    wait_addr 10.88.0.50 60 || fail "no lease after restart"
+    i=0; until [ "$(mtu)" = 1500 ] && [ "$(mtu6)" = 1500 ]; do i=$((i + 1)); [ $i -lt 60 ] || fail "MTU stayed: mtu $(mtu) linkmtu $(mtu6) $("$V" 'grep -i mtu /tmp/atrium-net/net.log | tail -n 3')"; sleep 1; done
+    "$V" 'grep -q "vtnet1: ResetMtu" /tmp/atrium-net/net.log' \
+        && ok "a network without an MTU after a restart: back to 1500 (IPv4 by atrium-net, IPv6 by the next RA)" || fail "no ResetMtu in the log"
 
     # Hostile server: restart atrium-net into a LAN that sends bad leases.
     lanctl hostile >/dev/null

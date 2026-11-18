@@ -454,6 +454,10 @@ mod imp {
                         x => x,
                     },
                     Action::SetMtu(m) => self.ifc.set_mtu(ifname, *m),
+                    Action::ResetMtu => match self.ifc.mtu(ifname) {
+                        Ok(m) if m == atrium_net::plan::DEFAULT_MTU as u32 => continue,
+                        _ => self.ifc.set_mtu(ifname, atrium_net::plan::DEFAULT_MTU),
+                    },
                     // Merged with every interface's servers once the lease is applied.
                     Action::SetDns(_) => Ok(()),
                 };
@@ -1429,6 +1433,13 @@ mod imp {
                 }
                 if i.wifi {
                     l = l.with("wifi", 1);
+                }
+                if let Ok(m) = self.ifc.mtu(&i.name) {
+                    l = l.with("mtu", m);
+                }
+                // An RA's MTU, while it is lower than the port's.
+                if let Some(m) = self.ifc.linkmtu6(&i.name).ok().filter(|&m| m > 0) {
+                    l = l.with("mtu6", m);
                 }
                 if let Some(m) = k.and_then(|k| self.manual_for(k)) {
                     l = nlines::with_manual(l, &m);
