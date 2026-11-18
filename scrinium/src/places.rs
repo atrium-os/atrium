@@ -36,8 +36,9 @@ pub fn media_socket() -> PathBuf {
 pub fn stick(v: &atrium_media::Volume, media: &Path) -> Place {
     // A network share (`share-<uid>`) is named by where it is.
     let network = v.part.starts_with("share-") && !v.label.is_empty();
-    let label = if network {
-        v.label.clone()
+    // A sealed stick carries the name it was given at format.
+    let label = if network || !v.label.trim().is_empty() {
+        v.label.trim().to_string()
     } else if v.size_bytes > 0 {
         format!("{} stick", size_text(v.size_bytes))
     } else {
@@ -205,6 +206,8 @@ mod tests {
         assert_eq!((p.label.as_str(), p.root.as_path(), p.stick), ("16 GB stick", Path::new("/media/da0s1"), true));
         let two = distinct(vec![p.clone(), Place { id: "da1s1".into(), ..p.clone() }]);
         assert_eq!(two[1].label, "16 GB stick (da1s1)");
+        let named = stick(&atrium_media::Volume { label: "Holiday".into(), persona: "personal".into(), ..v.clone() }, Path::new("/media"));
+        assert_eq!((named.label.as_str(), named.network), ("Holiday", false));
         let c = parse_places("Documents=/home/ana/Documents; bad ;Rel=relative;=/x");
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].label.as_str(), c[0].stick), ("Documents", false));

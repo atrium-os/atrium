@@ -201,7 +201,11 @@ pub mod arca {
             return format!("status {st}");
         }
         match op {
-            VK_FIND => format!("ok {}", String::from_utf8_lossy(body)),
+            // The persona, then the stick's name in hex (any bytes).
+            VK_FIND => match body.iter().position(|&b| b == 0) {
+                Some(i) => format!("ok {} {}", String::from_utf8_lossy(&body[..i]), super::hex(&body[i + 1..])),
+                None => format!("ok {}", String::from_utf8_lossy(body)),
+            },
             VK_MINT if body.len() == 16 => format!("ok {}", super::hex(body)),
             VK_RECORD | VK_CURRENT if body.len() == 8 => format!("ok {}", u64::from_le_bytes(body.try_into().unwrap())),
             // The slot (hex), then the code.
@@ -212,6 +216,16 @@ pub mod arca {
             _ => "status 255".into(),
         }
     }
+}
+
+/// `VK_FIND`'s answer as the child prints it (`PERSONA [LABELHEX]`): the
+/// persona, and the name the stick was given, made fit to show (control
+/// characters become spaces, at most 64 characters).
+pub fn find_answer(a: &str) -> (String, String) {
+    let (persona, label) = a.split_once(' ').unwrap_or((a, ""));
+    let bytes = (0..label.len() / 2).filter_map(|i| u8::from_str_radix(label.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Vec<_>>();
+    let label: String = String::from_utf8_lossy(&bytes).chars().map(|c| if c.is_control() { ' ' } else { c }).take(64).collect();
+    (persona.to_string(), label.trim().to_string())
 }
 
 #[cfg(test)]
@@ -281,6 +295,10 @@ mod tests {
         assert!(arca::request(&s(&["mint", "alice", "work", "zz", "x"]), "").is_none());
         assert!(arca::request(&s(&["release", "x"]), "").is_none());
         assert_eq!(arca::answer(arca::VK_FIND, 0, b"work"), "ok work");
+        assert_eq!(arca::answer(arca::VK_FIND, 0, b"work\0Hi"), "ok work 4869");
+        assert_eq!(find_answer("work 4869"), ("work".to_string(), "Hi".to_string()));
+        assert_eq!(find_answer("work"), ("work".to_string(), String::new()));
+        assert_eq!(find_answer("work 410a42"), ("work".to_string(), "A B".to_string()));
         assert_eq!(arca::answer(arca::VK_MINT, 0, &[0x11; 16]), format!("ok {}", "11".repeat(16)));
         assert_eq!(arca::answer(arca::VK_RECORD, 0, &57u64.to_le_bytes()), "ok 57");
         assert_eq!(arca::answer(arca::VK_FIND, arca::DENIED, b""), "status 1");

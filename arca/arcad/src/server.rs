@@ -623,9 +623,14 @@ impl State {
                 let high_water = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
                 let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: owner_label(&user, &persona), older_read_only: false };
                 let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                // The persona, then the name the stick was given (the item's
+                // account), for Scrinium and the bar to call it by.
+                let mut answer = persona.into_bytes();
+                answer.push(0);
+                answer.extend_from_slice(m.account.as_bytes());
                 return match self.keyring.as_mut().unwrap().load(&info, key) {
-                    Ok(()) => ok(persona.into_bytes()),
-                    Err(e) if e == libc::EEXIST => ok(persona.into_bytes()),
+                    Ok(()) => ok(answer),
+                    Err(e) if e == libc::EEXIST => ok(answer),
                     Err(_) => reply(status::INTERNAL),
                 };
             }
@@ -902,7 +907,8 @@ impl State {
                                 class: Class::AfterFirstUnlock,
                                 kind: Kind::VolumeKey,
                                 provenance: Provenance::UserTyped,
-                                account: "recovered stick",
+                                // No name: the stick's own isn't known here.
+                                account: "",
                                 scope: &encode_scope(&key_id, &uuid, 0),
                                 value: value.as_ref(),
                             }));

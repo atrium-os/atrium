@@ -245,9 +245,9 @@ fn a_plugged_in_stick_finds_its_persona() {
     k.lock().unwrap().loaded.clear();
 
     let (st, p) = find(&mut s, &dispensatord(), "alice", &work, UUID, 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"work"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"work\0Work stick, 64 GB"[..]));
     let (st, p) = find(&mut s, &dispensatord(), "alice", &personal, [0x77; 16], 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal\0Work stick, 64 GB"[..]));
     assert_eq!(k.lock().unwrap().loaded.len(), 2);
     assert_eq!(k.lock().unwrap().loaded[0].0.owner_label, "alice/work");
     k.lock().unwrap().loaded.clear();
@@ -326,7 +326,7 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code.to_lowercase()), status::OK);
     k2.lock().unwrap().loaded.clear();
     let (st, p) = find(&mut t, &dispensatord(), "alice", &key_id, UUID, 0);
-    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal\0"[..]));
     assert_eq!(k2.lock().unwrap().loaded[0].1, key);
 
     // Typed into Arca's recovery-code field (Scrinium never sees it): the

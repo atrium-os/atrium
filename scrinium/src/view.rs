@@ -616,6 +616,11 @@ impl ScriniumView {
         let room = (w - x0 - 48.0).max(0.0);
         let mut y = y0 + ((y1 - y0) * 0.3).min(em(140.0));
         icon(ctx, cx - 16.0, y, ph::LOCK_SIMPLE, 32.0, t.text_tertiary());
+        // Under a stick sheet the sheet says it: a heading centred on the
+        // pane (right of the window's centre) would show past its edge.
+        if b.stick_sheet.is_some() {
+            return;
+        }
         y += em(56.0);
         let centred = |ctx: &mut Ctx, y: f32, s: &str, size: f32, weight: Weight, c: Color| {
             let s = fit(s, size, weight, room);
@@ -653,9 +658,8 @@ impl ScriniumView {
         acts.push(("Erase and format…", Look::Ghost, Box::new(move || with(&s, |b| b.ask_format(i)))));
         let total: f32 = acts.iter().map(|(l, ..)| button_w(l)).sum::<f32>() + 8.0 * (acts.len() as f32 - 1.0);
         let mut x = cx - total / 2.0;
-        let free = b.stick_sheet.is_none();
         for (label, look, on) in acts {
-            x += button(ctx, x, y + em(52.0), label, look, free, on) + 8.0;
+            x += button(ctx, x, y + em(52.0), label, look, true, on) + 8.0;
         }
     }
 
@@ -1573,6 +1577,8 @@ mod tests {
         assert!(matches!(state.get_cloned().stick_sheet.map(|s| s.ask), Some(StickAsk::Recovery { keep: true })));
         let tx = texts(&app);
         assert!(tx.iter().any(|t| t == "Type it into Arca's field: Scrinium never sees it."), "{tx:?}");
+        // Under the sheet the pane keeps only its lock: its heading would show past the sheet.
+        assert!(!tx.iter().any(|t| t.starts_with("Encrypted stick from another")), "{tx:?}");
         // Format: what will be erased, in this persona's words.
         with(&state, |b| {
             b.stick_sheet = None;
