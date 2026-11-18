@@ -1,4 +1,6 @@
-//! The pinned font set (navigator-backend §4.1a).
+//! The pinned font set (navigator-backend §4.1a), on its own so a crate that
+//! lays out text with it (Officina's officina-text) links the fonts and not the
+//! Markdown, HTML and SVG parsers of navigator-render, which re-exports it.
 //!
 //! ★ SHIPPED, VERSIONED, NEVER THE SYSTEM'S. The fonts are compiled into the
 //! binary, put through the SAME canonicalization as a web font (static,

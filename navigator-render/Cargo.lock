@@ -1062,6 +1062,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "navigator-fontset"
+version = "0.1.0"
+dependencies = [
+ "navigator-fonts",
+ "ttf-parser",
+]
+
+[[package]]
 name = "navigator-render"
 version = "0.1.0"
 dependencies = [
@@ -1074,6 +1082,7 @@ dependencies = [
  "libc",
  "navigator-dom",
  "navigator-fonts",
+ "navigator-fontset",
  "navigator-style",
  "navigator-svg",
  "png",
