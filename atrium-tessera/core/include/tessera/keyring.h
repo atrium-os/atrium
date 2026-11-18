@@ -30,9 +30,13 @@ struct tkey_load {
 	uint8_t  key[32];
 	uint64_t high_water;          /* §8: lowest generation a mount accepts */
 	uint32_t owner_uid;
-	uint32_t flags;               /* none yet; must be 0 */
+	uint32_t flags;               /* TKEY_LOAD_OLDER_RO or 0 */
 	char     owner_label[32];     /* persona label, NUL-padded */
 };
+/* §8 "Open read-only?": the person verified opening an older copy. The
+ * key opens its volume below high_water, and only read-only: a mount that
+ * would write is refused with EROFS, whatever its generation. */
+#define TKEY_LOAD_OLDER_RO 0x1u
 
 struct tkey_id {
 	uint8_t  key_id[16];
@@ -72,11 +76,12 @@ struct tkey_format {
 #define TKEY_FORMAT _IOW('K', 4, struct tkey_format)
 
 #ifdef _KERNEL
-/* For the mount path. Copies the key for (key_id, uuid, group) into vk and
- * its high-water into *high_water: 0, or ENOENT (no such key for this
- * scope). The caller wipes vk after deriving its keys. */
+/* For the mount path. Copies the key for (key_id, uuid, group) into vk, its
+ * high-water into *high_water and its TKEY_LOAD_* flags into *flags (either
+ * may be NULL): 0, or ENOENT (no such key for this scope). The caller wipes
+ * vk after deriving its keys. */
 int  tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
-         uint64_t group, uint8_t vk[32], uint64_t *high_water);
+         uint64_t group, uint8_t vk[32], uint64_t *high_water, uint32_t *flags);
 /* Record a committed generation under key_id (TKEY_GEN reports the max). */
 void tessera_keyring_note_gen(const uint8_t key_id[16], uint64_t gen);
 struct thread;

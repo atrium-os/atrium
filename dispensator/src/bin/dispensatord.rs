@@ -131,6 +131,8 @@ fn args() -> Result<Args, String> {
             "--recovery" => a.recovery = true,
             // Open a Locked stick with its recovery code, read from stdin
             // (never an argument): keep its key in PERSONA, or `once`.
+            // "Open read-only?" for an older copy (§8).
+            "--open-older" => a.media_cmd = Some(format!("open-older {}", val()?)),
             "--adopt" => {
                 let part = val()?;
                 let persona = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
@@ -433,6 +435,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
         };
         return answer(atrium_media::client::format(sock, &atrium_media::Format { part: part.into(), persona: persona.into(), label: label.into(), recovery }));
     }
+    if let Some(part) = cmd.strip_prefix("open-older ") {
+        return answer(atrium_media::client::open_older(sock, &atrium_media::Eject { part: part.into() }));
+    }
     if let Some(rest) = cmd.strip_prefix("adopt ") {
         let f: Vec<&str> = rest.split(' ').collect();
         let code = std::io::stdin().lines().next().and_then(Result::ok);
@@ -502,7 +507,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                 println!("ok");
                 for v in vs {
                     println!(
-                        "{} {} {} {}{}{}{}{}",
+                        "{} {} {} {}{}{}{}{}{}",
                         v.part,
                         if v.mountpoint.is_empty() { "-" } else { &v.mountpoint },
                         v.size_bytes,
@@ -510,6 +515,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                         if v.read_only { " ro" } else { "" },
                         if v.locked { " locked" } else { "" },
                         if v.recovery { " recovery" } else { "" },
+                        if v.older { " older" } else { "" },
                         if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) }
                     );
                 }
@@ -602,6 +608,8 @@ mod run {
         locked: std::collections::BTreeSet<String>,
         /// Sealed sticks here that carry a recovery slot (§7.4).
         recoverable: std::collections::BTreeSet<String>,
+        /// Locked sticks that are this person's, only older (§8).
+        older: BTreeMap<String, Older>,
         /// /dev/tesserakeys, for TKEY_FORMAT and TKEY_DROP (None: no
         /// tessera_fs, so no sealed sticks).
         keyring: Option<std::fs::File>,
@@ -614,6 +622,17 @@ mod run {
         user: String,
         persona: String,
         key_id: [u8; 16],
+        /// An older copy opened read-only, as the person verified (§8).
+        read_only: bool,
+    }
+
+    /// A stick of this person's that is older than its key's high-water
+    /// mark (§8): Locked, with "Open read-only?".
+    #[derive(Clone)]
+    struct Older {
+        persona: String,
+        key_id: [u8; 16],
+        uuid: [u8; 16],
     }
 
     /// One connected share: its jail runs while `pd` is held.
@@ -654,6 +673,8 @@ mod run {
         Format(atrium_media::Format),
         /// Open a Locked stick with its recovery code (§7.4).
         Adopt(atrium_media::Adopt),
+        /// Open an older copy read-only, once Sigillum verified (§8).
+        OpenOlder(String),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -846,6 +867,10 @@ mod run {
     /// `mount -t tessera -o nosuid,noexec /dev/<dev> <mnt>`: the kernel
     /// finds the key by the superblock's key id and refuses without it.
     fn mount_tessera(dev: &str, mnt: &str) -> std::io::Result<()> {
+        mount_tessera_flags(dev, mnt, 0)
+    }
+
+    fn mount_tessera_flags(dev: &str, mnt: &str, extra: libc::c_int) -> std::io::Result<()> {
         use std::ffi::CString;
         let kv = [("fstype", "tessera".to_string()), ("fspath", mnt.to_string()), ("from", format!("/dev/{dev}"))];
         let mut owned = Vec::new();
@@ -855,7 +880,7 @@ mod run {
         }
         let mut iov: Vec<libc::iovec> = owned.iter().map(|c| libc::iovec { iov_base: c.as_ptr() as *mut _, iov_len: c.as_bytes_with_nul().len() }).collect();
         // SAFETY: iov points into `owned`, alive for the call.
-        if unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as libc::c_uint, libc::MNT_NOSUID | libc::MNT_NOEXEC) } != 0 {
+        if unsafe { libc::nmount(iov.as_mut_ptr(), iov.len() as libc::c_uint, libc::MNT_NOSUID | libc::MNT_NOEXEC | extra) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
@@ -967,6 +992,10 @@ mod run {
 
         fn adopt(&self, a: &atrium_media::Adopt) -> (u8, String) {
             self.ask(Req::Adopt(a.clone()))
+        }
+
+        fn open_older(&self, part: &str) -> (u8, String) {
+            self.ask(Req::OpenOlder(part.to_string()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1521,6 +1550,7 @@ mod run {
             trusted: BTreeMap::new(),
             locked: Default::default(),
             recoverable: Default::default(),
+            older: Default::default(),
             keyring: std::fs::OpenOptions::new().read(true).write(true).open("/dev/tesserakeys").ok(),
         };
         a.retire_stale_shares();
@@ -1772,11 +1802,13 @@ mod run {
                 };
                 let read_only = self.media.driver_of(&part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only);
                 let persona = self.trusted.get(&part).map(|t| t.persona.clone()).unwrap_or_default();
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false });
+                let read_only = read_only || self.trusted.get(&part).is_some_and(|t| t.read_only);
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label: String::new(), persona, locked: false, recovery: false, older: false });
             }
             for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
                 let recovery = self.recoverable.contains(part);
-                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona: String::new(), locked: true, recovery });
+                let (older, persona) = self.older.get(part).map_or((false, String::new()), |o| (true, o.persona.clone()));
+                vols.push(Volume { part: part.clone(), mountpoint: String::new(), size_bytes: 0, free_bytes: 0, read_only: true, label: String::new(), persona, locked: true, recovery, older });
             }
             // A share's server answers only once it has logged in, so it is
             // never statfs'd here (that would wait on the network): its
@@ -1794,6 +1826,7 @@ mod run {
                     persona: String::new(),
                     locked: false,
                     recovery: false,
+                    older: false,
                 });
             }
             shared.update(vols, &std::mem::take(&mut self.ejected_now));
@@ -1815,6 +1848,7 @@ mod run {
                     Req::Eject(part) => self.eject(&part),
                     Req::Format(f) => self.format(&f),
                     Req::Adopt(a) => self.adopt(&a),
+                    Req::OpenOlder(p) => self.open_older(&p),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -2275,6 +2309,7 @@ mod run {
         fn start_sealed(&mut self, device: &str, dev: &str, mnt: &str, key_id: [u8; 16], uuid: [u8; 16]) {
             use dispensator::sealed::{arca, hex};
             self.locked.remove(device);
+            self.older.remove(device);
             let Session::Active { user, .. } = self.session.clone() else { return };
             if self.keyring.is_none() {
                 eprintln!("atrium-dispensatord: {device}: a sealed stick, but no Tessera keyring here; Locked");
@@ -2287,7 +2322,7 @@ mod run {
                     match mount_tessera(dev, mnt) {
                         Ok(()) => {
                             eprintln!("atrium-dispensatord: {device}: sealed stick of {user}/{persona}, mounted at {mnt}");
-                            self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id });
+                            self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id, read_only: false });
                         }
                         Err(e) => {
                             // The key is this person's, but the stick doesn't
@@ -2295,6 +2330,9 @@ mod run {
                             eprintln!("atrium-dispensatord: {device}: the kernel refused the sealed stick: {e}; Locked");
                             if let Some(r) = &self.keyring {
                                 tkey_drop(r, key_id);
+                            }
+                            if e.raw_os_error() == Some(libc::ESTALE) {
+                                self.older.insert(device.to_string(), Older { persona, key_id, uuid });
                             }
                             self.locked.insert(device.to_string());
                         }
@@ -2313,6 +2351,7 @@ mod run {
         /// and drop the key from the kernel.
         fn stop_sealed(&mut self, device: &str) {
             self.locked.remove(device);
+            self.older.remove(device);
             let Some(t) = self.trusted.remove(device) else { return };
             if jaild::ffi::unmount_at(&t.mnt, 0).is_err() {
                 let _ = jaild::ffi::unmount_at(&t.mnt, libc::MNT_FORCE);
@@ -2390,13 +2429,48 @@ mod run {
             // The new stick is its person's: a private top folder.
             let _ = std::os::unix::fs::chown(&mnt, Some(uid), Some(gid));
             let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-            self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id });
+            self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id, read_only: false });
             self.publish();
             eprintln!("atrium-dispensatord: {}: sealed for {user}/{}{}, mounted at {mnt}", f.part, f.persona, if code.is_some() { " with a recovery code" } else { "" });
             match code {
                 Some(c) => (mstatus::OK, format!("{} is now {}'s sealed stick; recovery code {c}", f.part, f.persona)),
                 None => (mstatus::OK, format!("{} is now {}'s sealed stick", f.part, f.persona)),
             }
+        }
+
+        /// "This stick is older than the last time it was used here. Open
+        /// read-only?" (§8): arcad asks Sigillum to verify the person, then
+        /// reloads the key for read-only use below its high-water mark, and
+        /// the kernel mounts the copy read-only. Writing to it, or adopting
+        /// it as current, is not built yet.
+        fn open_older(&mut self, part: &str) -> (u8, String) {
+            use dispensator::sealed::{arca, hex};
+            let Session::Active { user, .. } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            };
+            let Some(o) = self.older.get(part).cloned() else {
+                return (mstatus::NOT_FOUND, format!("{part} is not an older copy of a stick of yours"));
+            };
+            let Some(mnt) = self.mountpoint(part) else { return (mstatus::NOT_FOUND, format!("{part} has no mount point")) };
+            match vk_call(&["older", &user, &o.persona, &hex(&o.key_id), &hex(&o.uuid)]) {
+                Ok(_) => {}
+                Err(st) if st == arca::NEEDS_VERIFICATION => return (mstatus::NOT_ALLOWED, "not verified".into()),
+                Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
+                Err(st) => return (mstatus::FAILED, format!("arcad refused (status {st})")),
+            }
+            let _ = std::fs::create_dir_all(&mnt);
+            if let Err(e) = mount_tessera_flags(part, &mnt, libc::MNT_RDONLY) {
+                if let Some(r) = &self.keyring {
+                    tkey_drop(r, o.key_id);
+                }
+                return (mstatus::FAILED, format!("the kernel refused it: {e}"));
+            }
+            self.locked.remove(part);
+            self.older.remove(part);
+            self.trusted.insert(part.to_string(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: o.persona.clone(), key_id: o.key_id, read_only: true });
+            self.publish();
+            eprintln!("atrium-dispensatord: {part}: an older copy of {user}/{}, opened read-only at {mnt}", o.persona);
+            (mstatus::OK, format!("{part} opened read-only"))
         }
 
         /// A Locked stick opened with its recovery code (§7.4): arcad
@@ -2431,7 +2505,7 @@ mod run {
                 return (mstatus::FAILED, format!("the code opened its key, but the kernel refused the stick: {e}"));
             }
             self.locked.remove(&a.part);
-            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id });
+            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false });
             self.publish();
             eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);
             (mstatus::OK, format!("{} opened for {}", a.part, a.persona))

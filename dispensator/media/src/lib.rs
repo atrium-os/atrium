@@ -17,6 +17,7 @@
 //! | `LEARN` 0x08 | postcard [`Learn`] | `u8 status`, then postcard `String`: SFTP, the server's host key fingerprint (`SHA256:...`) for the user to accept; WebDAV, lines `trusted` or `untrusted <why>`, the certificate key's fingerprint, `subject`, `issuer`, `expires`; SMB, `smb 3.1.1 <cipher>`, the fingerprint of the server's GUID, `guid <text>`; or why not (a server below the SMB floor: why) |
 //! | `FORMAT` 0x0A | postcard [`Format`] | `u8 status`, then postcard `String`: erase a stick and make it a sealed one for a persona (tessera-encryption.md §7.1); the key never leaves Arca and the kernel |
 //! | `ADOPT` 0x0B | postcard [`Adopt`] | `u8 status`, then postcard `String`: open a Locked stick with its recovery code (tessera-encryption.md §7.4); arcad unwraps its key, keeps it in the persona or loads it for this session only |
+//! | `OPEN_OLDER` 0x0C | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Open read-only?" for a Locked stick that is an older copy of one of the person's (tessera-encryption.md §8); Sigillum verifies the person first |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -45,6 +46,7 @@ pub mod op {
     pub const AT_LOGIN: u16 = 0x09;
     pub const FORMAT: u16 = 0x0A;
     pub const ADOPT: u16 = 0x0B;
+    pub const OPEN_OLDER: u16 = 0x0C;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -81,6 +83,10 @@ pub struct Volume {
     pub locked: bool,
     /// A Locked stick with a recovery slot: `ADOPT` can open it.
     pub recovery: bool,
+    /// A Locked stick that is the person's, but older than the last time
+    /// it was used here (§8): `OPEN_OLDER` opens it read-only. `persona`
+    /// names whose.
+    pub older: bool,
 }
 
 /// Erase `part` and make it a sealed stick for `persona` (root or the
@@ -246,6 +252,9 @@ pub mod server {
         /// Open a Locked stick with its recovery code (checked here: who,
         /// the request, and that it's listed Locked with a slot).
         fn adopt(&self, a: &Adopt) -> (u8, String);
+        /// "Open read-only?" for an older copy (checked here: who, and that
+        /// it's listed as one).
+        fn open_older(&self, part: &str) -> (u8, String);
     }
 
     pub struct Shared {
@@ -331,6 +340,16 @@ pub mod server {
                 return (status::NOT_FOUND, format!("{} is not a Locked stick with a recovery code", a.part));
             }
             self.host.adopt(a)
+        }
+
+        pub fn open_older(&self, uid: u32, part: &str) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may open a stick".into());
+            }
+            if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == part && v.locked && v.older) {
+                return (status::NOT_FOUND, format!("{part} is not an older copy of a stick of yours"));
+            }
+            self.host.open_older(part)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -482,6 +501,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::ADOPT, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::OPEN_OLDER => {
+                    let (st, msg) = match postcard::from_bytes::<Eject>(&m.payload) {
+                        Ok(e) if !e.part.is_empty() && e.part.len() <= 32 => shared.open_older(uid, &e.part),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::OPEN_OLDER, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -561,6 +587,10 @@ pub mod client {
 
     pub fn adopt(sock: &Path, a: &Adopt) -> Result<String, (u8, String)> {
         status_call(sock, op::ADOPT, a)
+    }
+
+    pub fn open_older(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
+        status_call(sock, op::OPEN_OLDER, part)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -704,10 +734,13 @@ mod tests {
         fn adopt(&self, a: &Adopt) -> (u8, String) {
             (status::OK, format!("{} opened for {}", a.part, a.persona))
         }
+        fn open_older(&self, part: &str) -> (u8, String) {
+            (status::OK, format!("{part} opened read-only"))
+        }
     }
 
     fn vol(p: &str) -> Volume {
-        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new(), persona: String::new(), locked: false, recovery: false }
+        Volume { part: p.into(), mountpoint: format!("/media/{p}"), size_bytes: 1 << 26, free_bytes: 1 << 25, read_only: false, label: String::new(), persona: String::new(), locked: false, recovery: false, older: false }
     }
 
     /// Over a real socket: list, subscribe, eject, a session change.
@@ -865,5 +898,16 @@ mod tests {
         assert_eq!(shared.adopt(1000, &a("da0p1")).0, status::NOT_FOUND, "not Locked");
         assert_eq!(shared.adopt(1000, &a("da2p1")).0, status::NOT_FOUND, "no slot");
         assert_eq!(shared.adopt(1000, &Adopt { code: String::new(), ..a("da1p1") }).0, status::MALFORMED);
+    }
+
+    #[test]
+    fn open_older_needs_a_listed_older_copy() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        let locked = |p: &str, older: bool| Volume { mountpoint: String::new(), locked: true, older, ..vol(p) };
+        shared.update(vec![vol("da0p1"), locked("da1p1", true), locked("da2p1", false)], &[]);
+        assert_eq!(shared.open_older(1000, "da1p1").0, status::OK);
+        assert_eq!(shared.open_older(2000, "da1p1").0, status::NOT_ALLOWED);
+        assert_eq!(shared.open_older(1000, "da0p1").0, status::NOT_FOUND);
+        assert_eq!(shared.open_older(1000, "da2p1").0, status::NOT_FOUND);
     }
 }

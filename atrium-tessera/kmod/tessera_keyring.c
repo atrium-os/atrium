@@ -33,6 +33,7 @@ struct tkey {
 	uint8_t  key[32];
 	uint64_t high_water;
 	uint64_t committed;           /* highest generation noted */
+	uint32_t flags;               /* TKEY_LOAD_* */
 	uint32_t owner_uid;
 	char     owner_label[32];
 	int      used;
@@ -61,7 +62,7 @@ drop_slot(struct tkey *k)
 
 int
 tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
-    uint64_t group, uint8_t vk[32], uint64_t *high_water)
+    uint64_t group, uint8_t vk[32], uint64_t *high_water, uint32_t *flags)
 {
 	struct tkey *k;
 	int error = ENOENT;
@@ -74,6 +75,8 @@ tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
 		memcpy(vk, k->key, 32);
 		if (high_water != NULL)
 			*high_water = k->high_water;
+		if (flags != NULL)
+			*flags = k->flags;
 		error = 0;
 	}
 	mtx_unlock(&ring_mtx);
@@ -111,7 +114,7 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 
 		if ((fflag & FWRITE) == 0) {
 			error = EBADF;
-		} else if (l->flags != 0) {
+		} else if ((l->flags & ~TKEY_LOAD_OLDER_RO) != 0) {
 			error = EINVAL;
 		} else {
 			mtx_lock(&ring_mtx);
@@ -132,6 +135,7 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 					k->group = l->scope_group;
 					memcpy(k->key, l->key, 32);
 					k->high_water = l->high_water;
+					k->flags = l->flags;
 					k->committed = 0;
 					k->owner_uid = l->owner_uid;
 					memcpy(k->owner_label, l->owner_label,

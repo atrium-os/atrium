@@ -221,6 +221,25 @@ mount -t tessera -r $DEV $M || fail "remount after the crash"
 umount $M
 echo "crash replay: ok"
 
+# 10. an older copy (§8): below the key's high-water mark it's refused;
+#     with the key loaded older-ro (what arcad does once Sigillum verified
+#     the person) it opens read-only only
+tessera-keyload drop $KID >/dev/null
+tessera-keyload load $T/key $KID $U 1000000 >/dev/null || fail "load with a high mark"
+mount -t tessera -r $DEV $M 2>/dev/null && fail "an older copy mounted"
+dmesg | tail -5 | grep -q "below the key's high-water" || fail "no high-water message"
+tessera-keyload drop $KID >/dev/null
+tessera-keyload load $T/key $KID $U 1000000 older-ro >/dev/null || fail "load older-ro"
+mount -t tessera $DEV $M 2>/dev/null && fail "an older-ro key mounted read-write"
+mount -t tessera -r $DEV $M || fail "older copy, read-only"
+cmp -s $M/$NAME2 $T/content2 || fail "older copy reads wrong"
+mount -u -o rw $M 2>/dev/null && fail "older copy remounted read-write"
+touch $M/x 2>/dev/null && fail "wrote to an older copy"
+umount $M
+tessera-keyload drop $KID >/dev/null
+tessera-keyload load $T/key $KID $U >/dev/null || fail "reload plain"
+echo "older copy: ok"
+
 # kept for the host's fsck --key-file (the fsck subcommand)
 mdconfig -d -u ${DEV#/dev/md}
 cp $IMG.crash $T/kept-$1.img && cp $T/key $T/kept-$1.key
