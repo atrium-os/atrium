@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod files;
+mod portal;
 mod press;
 mod settings;
 mod worker;
@@ -129,6 +130,10 @@ struct Config {
     /// hand-offs act only on a press spent there (`press.rs`). Required
     /// unless `--unconfined-for-testing`.
     activation: Option<PathBuf>,
+    /// The captive portal's sign-in window (atrium-net.md §8.1 S3): set
+    /// when portcullisd started us in the reserved `portal` persona. Every
+    /// page then comes through its fetcher, and its forms may be sent.
+    portal: Option<Arc<portal::Portal>>,
 }
 
 impl Config {
@@ -151,6 +156,7 @@ impl Config {
             monstrator: var("NAVIGATORD_MONSTRATOR").map(PathBuf::from).unwrap_or_else(|| monstrator::SOCKET.into()),
             activation: var("NAVIGATORD_ACTIVATION").map(PathBuf::from),
             opifex: var("NAVIGATORD_OPIFEX").map(PathBuf::from).unwrap_or_else(|| OPIFEX_SOCKET.into()),
+            portal: None,
             schemes: {
                 let mut a = SchemeAllowlist::default();
                 for sch in std::iter::once("atrium-app".to_string()).chain(var("NAVIGATORD_SCHEMES").unwrap_or_default().split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from)) {
@@ -455,6 +461,9 @@ enum Upstream {
     /// A page whose site knows you: its https requests through Arca's
     /// couriers with the broker's tickets; the rest the plain way.
     Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, plain: Box<Upstream> },
+    /// The sign-in window's fetcher; the first navigation is a form's POST
+    /// of these bytes when there are any.
+    Portal(Arc<portal::Portal>, Option<Vec<u8>>),
 }
 
 impl Upstream {
@@ -483,6 +492,10 @@ impl Upstream {
             Upstream::Fetchd(f, _) => match ask {
                 Ask::Fetch(u) => f.exchange(u).unwrap_or_else(Reply::Err),
                 Ask::Peek { url, start, len } => f.exchange_peek(url, start, len).unwrap_or_else(Reply::Err),
+            },
+            Upstream::Portal(p, _) => match ask {
+                Ask::Fetch(u) => p.fetch(u, None, None),
+                Ask::Peek { url, start, len } => p.fetch(url, Some((start, len)), None),
             },
             Upstream::Fixtures(dir) => {
                 let url = ask.url();
@@ -523,6 +536,7 @@ impl Upstream {
                 None => (self.reply(Ask::Fetch(url)), vec![]),
             },
             Upstream::Cookied { .. } => (self.reply(Ask::Fetch(url)), vec![]),
+            Upstream::Portal(p, form) => (p.fetch(url, None, form.take()), vec![]),
         }
     }
 }
@@ -576,6 +590,9 @@ fn instance() -> String {
 }
 
 fn upstream(cfg: &Config, inst: &str) -> Result<Upstream, String> {
+    if let Some(p) = &cfg.portal {
+        return Ok(Upstream::Portal(p.clone(), None));
+    }
     if let Some(d) = &cfg.fixtures {
         return Ok(Upstream::Fixtures(d.clone()));
     }
@@ -606,8 +623,17 @@ enum Got {
 }
 
 fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -> Result<Got, String> {
+    convert_with(cfg, url, ctx, cookies, None)
+}
+
+/// [`convert`]; with `form`, the page is the answer to a form's POST of
+/// those bytes to `url` (the sign-in window only).
+fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<Vec<u8>>) -> Result<Got, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
+    if let (Upstream::Portal(_, f), Some(b)) = (&mut up, form) {
+        *f = Some(b);
+    }
     let jar = cookies.as_ref().map(|(c, v)| (c.clone(), *v));
     if let Some((cookies, view)) = cookies {
         let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
@@ -620,7 +646,8 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
         hops = h;
         r
     }) {
-        Reply::Ok { status, rest, body } if (200..300).contains(&status) => {
+        // A portal may answer its sign-in page as 511 (RFC 6585 §6).
+        Reply::Ok { status, rest, body } if (200..300).contains(&status) || (status == 511 && cfg.portal.is_some()) => {
             let fin = rest.splitn(3, ' ').nth(2).filter(|f| !f.is_empty()).unwrap_or(url).to_string();
             (fin, body)
         }
@@ -1063,6 +1090,8 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
                 ui_ready(&w);
             }
+            // The sign-in window keeps no trails.
+            Request::SaveTrails { .. } if cfg.portal.is_some() => {}
             Request::SaveTrails { part, last } => {
                 // Kept whole or not at all: a store over its bound is refused
                 // rather than cut.
@@ -1327,6 +1356,67 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 }
                 send(&w, &Event::Link { id, action });
             }
+            Request::SubmitForm { id, page, jar, action, post, fields, press } => {
+                let refuse = |why: String| {
+                    eprintln!("navigatord: a form not sent: {why}");
+                    send(&w, &Event::Link { id, action: LinkAction::Blocked { why } });
+                };
+                let Some(portal) = cfg.portal.clone() else {
+                    refuse("only the sign-in window sends a page's form".into());
+                    continue;
+                };
+                if !ctl::form_ok(&action, &fields) {
+                    refuse("the form is out of shape".into());
+                    continue;
+                }
+                let Some(p) = state.lock().unwrap().page(&page) else {
+                    refuse("that page is not open".into());
+                    continue;
+                };
+                let target = match form_target(&p, &action, &fields, &cfg.schemes) {
+                    Ok(t) => t,
+                    Err(why) => {
+                        refuse(why);
+                        continue;
+                    }
+                };
+                if let Err(why) = spend(press) {
+                    eprintln!("navigatord: form {id} refused: {why}");
+                    send(&w, &Event::PressRefused { why });
+                    continue;
+                }
+                let pairs: Vec<(String, String)> = fields.into_iter().map(|f| (f.name, f.value)).collect();
+                if !post {
+                    match portal::get_target(&target, &pairs) {
+                        Some(url) => {
+                            eprintln!("navigatord: a form sent as a GET to {}", origin(&url).unwrap_or_default());
+                            send(&w, &Event::Link { id, action: LinkAction::Navigate { insecure: url.starts_with("http:"), url } });
+                        }
+                        None => refuse("the form's address isn't one".into()),
+                    }
+                    continue;
+                }
+                // A POST: its answer converted as a page in the trail's jar,
+                // then opened from the cache as the link it leads to.
+                let (cfg, state, w) = (cfg.clone(), state.clone(), w.clone());
+                let _ = portal;
+                std::thread::spawn(move || {
+                    let body = portal::encode(&pairs).into_bytes();
+                    let ctx = Ctx { jar, knows: false };
+                    eprintln!("navigatord: a form sent as a POST to {} ({} bytes)", origin(&target).unwrap_or_default(), body.len());
+                    let action = match convert_with(&cfg, &target, ctx, None, Some(body)) {
+                        Ok(Got::Page(p)) => {
+                            let mut st = state.lock().unwrap();
+                            let p = Arc::new(st.stored(Page { ctx, ..p }));
+                            st.keep(p.clone(), &p.url.clone());
+                            LinkAction::Navigate { insecure: p.url.starts_with("http:"), url: p.url.clone() }
+                        }
+                        Ok(Got::File { .. }) => LinkAction::Blocked { why: "the network answered the form with a file".into() },
+                        Ok(Got::NeedsCookies(why)) | Err(why) => LinkAction::Blocked { why: format!("the form wasn't taken: {why}") },
+                    };
+                    send(&w, &Event::Link { id, action });
+                });
+            }
             Request::Save { id, press } => {
                 if !waiting.lock().unwrap().holds(id) {
                     send(&w, &Event::NotSaved { id, why: "that file is no longer held".into() });
@@ -1516,6 +1606,33 @@ fn about_of(v: &serde_json::Value) -> Option<AppAbout> {
 
 /// What activating `href` in `page` does: only a link the recording
 /// carries (threat model §2.10), decided by the backend's link rules.
+/// Where a form of `page` goes: its `action` (empty: the page itself)
+/// resolved as a link would be, an http or https address. The action and
+/// every name, and every value the person didn't type, must be spelled in
+/// the page's recording, as a link's href must (`activate`): the UI can only
+/// send what the page holds, plus what the person typed.
+fn form_target(page: &Page, action: &str, fields: &[ctl::FormField], schemes: &SchemeAllowlist) -> Result<String, String> {
+    use navigator_backend::links;
+    let has = |n: &[u8]| page.recording.windows(n.len()).any(|w| w == n);
+    if !action.is_empty() && !has(&links::attr_spelling("action", action)) {
+        return Err("the page does not carry this form".into());
+    }
+    for f in fields {
+        if !has(&links::attr_spelling("name", &f.name)) {
+            return Err(format!("the page has no field {:?}", f.name));
+        }
+        if !f.typed && !f.value.is_empty() && f.value != "on" && !has(&links::attr_spelling("value", &f.value)) {
+            return Err(format!("{:?} isn't a value the page gives", f.name));
+        }
+    }
+    let href = if action.is_empty() { page.url.as_str() } else { action };
+    match links::decide(&page.url, href, schemes) {
+        Ok(links::LinkAction::Navigate { url, .. }) => Ok(url),
+        Ok(_) => Err("a form goes only to a web address".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn activate(page: &Page, href: &str, schemes: &SchemeAllowlist) -> LinkAction {
     use navigator_backend::links;
     if href.len() > links::MAX_HREF {
@@ -1597,10 +1714,20 @@ fn listen(path: &str) -> UnixListener {
 
 fn main() {
     let unconfined = std::env::args().any(|a| a == "--unconfined-for-testing");
-    let cfg = Arc::new(Config::from_env(unconfined).unwrap_or_else(|e| {
+    let mut cfg = Config::from_env(unconfined).unwrap_or_else(|e| {
         eprintln!("navigatord: {e}");
         std::process::exit(2)
-    }));
+    });
+    // Our persona (personas.md §3), from portcullisd by our uid; the
+    // reserved `portal` one makes us the network's sign-in window
+    // (atrium-net.md §8.1 S3).
+    let persona = (!unconfined).then(worker::persona);
+    if let Some(Ok((Some((name, _)), _))) = &persona {
+        if name == portcullis_ipc::PORTAL_PERSONA {
+            start_portal(&mut cfg);
+        }
+    }
+    let cfg = Arc::new(cfg);
     if unconfined {
         eprintln!("navigatord: UNCONFINED FOR TESTING: {}{}",
             if cfg.converter.is_none() { "the converter runs as an ordinary process; " } else { "" },
@@ -1622,7 +1749,7 @@ fn main() {
     let state = Arc::new(Mutex::new(state));
     // Arca, for sites that know you. An Unrecorded jar a crash left behind
     // is forgotten now: none outlives the navigatord that made it.
-    let cookies: Option<Cookies> = cfg.arca.as_ref().map(|(a, c)| {
+    let cookies: Option<Cookies> = cfg.arca.as_ref().filter(|_| cfg.portal.is_none()).map(|(a, c)| {
         let mut b = Broker::new(ArcadSocket { path: a.clone() }, Launcher::new(c.clone()));
         match b.arca.forget("u-", true) {
             Ok(n) => eprintln!("navigatord: Arca at {}; {n} Unrecorded cookie groups left over, forgotten", a.display()),
@@ -1657,6 +1784,9 @@ fn main() {
         let _ = std::fs::set_permissions(&ctl_path, std::fs::Permissions::from_mode(0o600));
     }
     eprintln!("navigatord: control on {ctl_path}, pages on {page_path}");
+    if cfg.portal.is_some() {
+        std::thread::spawn(watch_portal);
+    }
     document_channel();
     // The UI as our worker: its control channel is one end of a pair, and
     // the Navigator ends when it does.
@@ -1668,9 +1798,15 @@ fn main() {
         let mut pairs = settings::ui_pairs();
         // The window's persona (personas.md §3), for the rail; frescod
         // draws the strip chip itself, from our uid.
-        if !cfg.unconfined {
+        if let Some(p) = &cfg.portal {
+            // The sign-in window: the network's name for the title, its
+            // page in an Unrecorded trail, no persona and no other windows.
+            pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS" && k != "NAVIGATOR_UI_OPEN");
+            pairs.push(("NAVIGATOR_UI_PORTAL".into(), p.network.clone()));
+            pairs.push(("NAVIGATOR_UI_OPEN".into(), p.start_url.clone()));
+        } else if let Some(persona) = persona {
             pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS");
-            match worker::persona() {
+            match persona {
                 Ok((here, others)) => {
                     match here {
                         Some((name, colour)) => {
@@ -1711,6 +1847,48 @@ fn main() {
     for s in ui.incoming().flatten() {
         let (cfg, state, cookies) = (cfg.clone(), state.clone(), cookies.clone());
         std::thread::spawn(move || serve_ui(cfg, state, cookies, s));
+    }
+}
+
+/// Become the sign-in window: the network's fetcher and start page, and
+/// nothing of the person's (no trails kept, no Arca). Without them there is
+/// nothing to show, and the window doesn't open.
+fn start_portal(cfg: &mut Config) {
+    match portal::Portal::open() {
+        Ok(p) => {
+            eprintln!("navigatord: the sign-in window for {} at {}", p.network, p.start_url);
+            cfg.portal = Some(Arc::new(p));
+            cfg.trails = None;
+            cfg.store = None;
+            cfg.arca = None;
+            cfg.downloads = None;
+        }
+        Err(why) => {
+            eprintln!("navigatord: no sign-in window: {why}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The sign-in window ends when atrium-net says the network is online, or
+/// after its lifetime (atrium-net.md §8.1 P4); the UI and the fetcher end
+/// with us.
+fn watch_portal() {
+    let start = Instant::now();
+    loop {
+        std::thread::sleep(portal::POLL);
+        match portal::status() {
+            Ok(st) if st.online => {
+                eprintln!("navigatord: {} is online; the sign-in window closes", st.network);
+                std::process::exit(0);
+            }
+            Ok(_) => {}
+            Err(why) => eprintln!("navigatord: the network's state: {why}"),
+        }
+        if start.elapsed() >= portal::LIFETIME {
+            eprintln!("navigatord: the sign-in window closes after {} minutes", portal::LIFETIME.as_secs() / 60);
+            std::process::exit(0);
+        }
     }
 }
 
@@ -1757,6 +1935,20 @@ mod tests {
         assert_eq!(activate(&p, "#plan", &SchemeAllowlist::default()), LinkAction::InDocument { fragment: "plan".into() });
         assert!(matches!(activate(&p, "https://evil.example/", &SchemeAllowlist::default()), LinkAction::Blocked { .. }), "not in the page");
         assert!(matches!(activate(&p, "javascript:x()", &SchemeAllowlist::default()), LinkAction::Blocked { .. }), "a scheme no one allowed");
+    }
+
+    #[test]
+    fn a_form_goes_only_where_the_page_says_with_what_it_holds() {
+        let p = page("http://10.88.0.1/welcome", r#"<form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"t\" value=\"9f\"><input name=\"room\"><button name=\"go\" value=\"1\">Connect</button></form>"#);
+        let f = |name: &str, value: &str, typed| ctl::FormField { name: name.into(), value: value.into(), typed };
+        let ok = [f("t", "9f", false), f("room", "4 12", true), f("go", "1", false)];
+        let s = SchemeAllowlist::default();
+        assert_eq!(form_target(&p, "/login", &ok, &s).as_deref(), Ok("http://10.88.0.1/login"));
+        assert_eq!(form_target(&p, "", &ok, &s).as_deref(), Ok("http://10.88.0.1/welcome"), "no action: the page itself");
+        assert!(form_target(&p, "http://evil.example/steal", &ok, &s).is_err(), "an action the page doesn't carry");
+        assert!(form_target(&p, "/login", &[f("password", "x", true)], &s).is_err(), "a name the page doesn't have");
+        assert!(form_target(&p, "/login", &[f("t", "forged", false)], &s).is_err(), "a page value the page doesn't give");
+        assert!(form_target(&p, "/login", &[f("t", "typed is fine", true)], &s).is_ok());
     }
 
     #[test]

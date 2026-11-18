@@ -297,6 +297,9 @@ impl Run {
                 self.view.page.set(Some(Rc::new(p)));
                 eprintln!("navigator-page: laid out in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
                 out.send(ToParent::Loaded { title: prepared.title.clone(), anchors: prepared.anchors.clone(), sections: prepared.sections.clone() });
+                if !prepared.forms.is_empty() {
+                    out.send(ToParent::Forms { forms: prepared.forms.clone() });
+                }
             }
             Err(e) => {
                 eprintln!("navigator-page: layout: {e}");

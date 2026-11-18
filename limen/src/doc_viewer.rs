@@ -152,6 +152,69 @@ pub enum ToParent {
     /// The answer to `Print`, with the PDF as the descriptor: how many
     /// pages, and whether it was cut at `PRINT_PAGES_MAX`.
     Printed { pages: u32, cut: bool },
+    /// The document's plain HTML forms (navigator-ui.md "Forms in the
+    /// sign-in window"; atrium-net.md §8.1 P5), after `Loaded` when it has
+    /// any: their fields as the document spells them, never what the
+    /// person typed, which the parent's own form panel holds. Only the
+    /// Navigator's sign-in window shows them and sends one, and navigatord
+    /// checks the document carries every name, value and action it is told.
+    Forms { forms: Vec<Form> },
+}
+
+/// One `<form>` (at most [`FORMS_MAX`] a document): its `action` as the
+/// document spells it (empty: the document's own address), whether it is a
+/// POST, and its fields in document order (at most [`FIELDS_MAX`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Form {
+    pub action: String,
+    pub post: bool,
+    pub fields: Vec<Field>,
+}
+
+/// A form's field. `name` is what it is sent as (a button or a checkbox may
+/// have none: it is then not sent); `label` what the person reads (its
+/// `<label>`, placeholder, button text, or name); `value` its value as the
+/// document gives it; `checked` for a checkbox or radio button.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Field {
+    pub kind: FieldKind,
+    pub name: String,
+    pub label: String,
+    pub value: String,
+    pub checked: bool,
+}
+
+/// The fields a form panel shows. A `<select>` comes as `Fixed` with its
+/// chosen option's value; anything else the panel can't offer (a file, a
+/// script-driven control) keeps the form out of `Forms` altogether.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldKind {
+    Text,
+    /// Typed, shown as dots.
+    Password,
+    Checkbox,
+    Radio,
+    /// Sent as the document gives it, never shown (`type=hidden`, a select).
+    Fixed,
+    /// A submit button: pressing it sends the form, with its own name and
+    /// value when it has a name.
+    Submit,
+}
+
+pub const FORMS_MAX: usize = 4;
+pub const FIELDS_MAX: usize = 32;
+pub const FIELD_NAME_MAX: usize = 256;
+pub const FIELD_LABEL_MAX: usize = 128;
+pub const FIELD_VALUE_MAX: usize = 1024;
+
+impl Form {
+    /// In shape: bounded, clean, and with a button to send it.
+    pub fn ok(&self) -> bool {
+        clean_text(&self.action, URL_MAX) && self.fields.len() <= FIELDS_MAX
+            && self.fields.iter().any(|f| f.kind == FieldKind::Submit)
+            && self.fields.iter().all(|f| clean_text(&f.name, FIELD_NAME_MAX) && clean_text(&f.label, FIELD_LABEL_MAX)
+                && clean_text(&f.value, FIELD_VALUE_MAX))
+    }
 }
 
 /// The most pages a `Printed` PDF has, and the paper sizes `Print` takes.
@@ -243,6 +306,7 @@ impl ToParent {
             }
             ToParent::Zoomed { zoom_64 } => (Reading::ZOOM_MIN..=Reading::ZOOM_MAX).contains(zoom_64),
             ToParent::Printed { pages, .. } => (1..=PRINT_PAGES_MAX).contains(pages),
+            ToParent::Forms { forms } => !forms.is_empty() && forms.len() <= FORMS_MAX && forms.iter().all(Form::ok),
             ToParent::Key { key, chars, ctrl, alt, .. } => {
                 clean_text(chars, KEY_CHARS_MAX) && chars.chars().count() <= 1 && (*key != ChromeKey::Char || !chars.is_empty())
                     && (matches!(key, ChromeKey::Escape | ChromeKey::F6) || *ctrl || *alt)
@@ -306,6 +370,16 @@ mod tests {
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: String::new() }.encode()), None);
         assert_eq!(ToParent::decode(&ToParent::LinkActivated { url: "a\nb".into() }.encode()), None);
         assert_eq!(ToParent::decode(&[0xff, 0x00]), None);
+        let f = |kind, name: &str, value: &str| Field { kind, name: name.into(), label: name.into(), value: value.into(), checked: false };
+        let form = Form { action: "/login".into(), post: true, fields: vec![f(FieldKind::Fixed, "t", "9"), f(FieldKind::Checkbox, "terms", "1"), f(FieldKind::Submit, "", "Connect")] };
+        let m = ToParent::Forms { forms: vec![form.clone()] };
+        assert_eq!(ToParent::decode(&m.encode()), Some(m));
+        assert_eq!(ToParent::decode(&ToParent::Forms { forms: vec![] }.encode()), None, "none: nothing is sent");
+        let no_button = Form { fields: vec![f(FieldKind::Text, "room", "")], ..form.clone() };
+        assert_eq!(ToParent::decode(&ToParent::Forms { forms: vec![no_button] }.encode()), None, "a form without a button can't be sent");
+        let dirty = Form { fields: vec![f(FieldKind::Submit, "a\nb", "x")], ..form.clone() };
+        assert_eq!(ToParent::decode(&ToParent::Forms { forms: vec![dirty] }.encode()), None);
+        assert_eq!(ToParent::decode(&ToParent::Forms { forms: vec![form; FORMS_MAX + 1] }.encode()), None);
         for y in [f32::NAN, f32::INFINITY, -1.0, SCROLL_MAX * 2.0] {
             assert_eq!(ToParent::decode(&ToParent::Parked { scroll: y }.encode()), None);
             assert_eq!(ToChild::decode(&ToChild::Open { ticket: [0; 16], reading: Reading::plain(false), scroll: y }.encode()), None);

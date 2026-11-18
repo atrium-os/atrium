@@ -162,6 +162,10 @@ pub fn classify_v6(ip: Ipv6Addr) -> Option<Range> {
 /// Name of the environment variable that grants the private network. The
 /// name is the grant: it should read as a decision someone made, not a knob.
 pub const GRANT_PRIVATE_NETWORK_ENV: &str = "NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK";
+/// The same grant as portcullisd gives a captive portal's Nuntius
+/// (atrium-net.md §8.1): a worker's environment may only carry `ATRIUM_`
+/// keys.
+pub const PORTAL_PRIVATE_NETWORK_ENV: &str = "ATRIUM_NUNTIUS_PRIVATE_NETWORK";
 
 /// What a fetch may reach. `Default` is the safe one: public addresses only.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -178,7 +182,8 @@ impl Policy {
     /// `NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK=1` and nothing else turns it on;
     /// any other value, or none, leaves the default.
     pub fn from_env() -> Policy {
-        Policy { grant_private_network: std::env::var(GRANT_PRIVATE_NETWORK_ENV).ok().as_deref() == Some("1") }
+        let on = |k| std::env::var(k).ok().as_deref() == Some("1");
+        Policy { grant_private_network: on(GRANT_PRIVATE_NETWORK_ENV) || on(PORTAL_PRIVATE_NETWORK_ENV) }
     }
 
     /// `Ok` if this policy lets a fetch connect to `ip`.

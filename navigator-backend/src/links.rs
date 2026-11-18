@@ -150,6 +150,13 @@ pub fn recording_spellings(href: &str) -> [Vec<u8>; 2] {
     [attr.into_bytes(), token.into_bytes()]
 }
 
+/// How a recording spells attribute `attr` with value `v` in its
+/// document (`name=\"room\"`), for checking a form's names and values are
+/// the page's own, as [`recording_spellings`] does a link's.
+pub fn attr_spelling(attr: &str, v: &str) -> Vec<u8> {
+    format!("{attr}=\\\"{}\\\"", json_body(&navigator_dom::dom::escape(v))).into_bytes()
+}
+
 /// A JSON string's body as the converter's emitter writes it
 /// (navigator-prerender `artifact::json_str`, without the quotes).
 fn json_body(v: &str) -> String {

@@ -182,6 +182,33 @@ pub enum Request {
     /// it read-only in the person's default app for its type, in this
     /// window's persona; nothing is written. Answered by `FileOpened`.
     OpenFile { id: u32, press: Press },
+    /// Send a form of the page at `page` (navigator-ui.md "Forms in the
+    /// sign-in window"; atrium-net.md §8.1 P5), on the person's press on
+    /// one of its buttons in the window's form panel. Only the sign-in
+    /// window's navigatord sends one. `action` as the page spells it (empty:
+    /// the page's own address); `fields` in order, each typed by the person
+    /// or as the page gave it, which navigatord checks the page carries.
+    /// Answered by `Link` with the same `id`: `Navigate` to the answer.
+    SubmitForm { id: u32, page: String, jar: Jar, action: String, post: bool, fields: Vec<FormField>, press: Press },
+}
+
+/// One field of a form sent: its name and value, and whether the person
+/// typed the value (else it is the page's, and navigatord checks it is).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormField {
+    pub name: String,
+    pub value: String,
+    pub typed: bool,
+}
+
+/// The most fields a form sent has, and the longest name or value.
+pub const FORM_FIELDS_MAX: usize = 32;
+pub const FORM_TEXT_MAX: usize = 1024;
+
+/// A `SubmitForm` in shape.
+pub fn form_ok(action: &str, fields: &[FormField]) -> bool {
+    clean(action, URL_MAX) && fields.len() <= FORM_FIELDS_MAX
+        && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, FORM_TEXT_MAX))
 }
 
 /// frescod's activation token for a press (zero: none).

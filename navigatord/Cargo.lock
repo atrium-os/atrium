@@ -2524,6 +2524,7 @@ dependencies = [
  "navigator-control",
  "navigator-cookies",
  "navigator-prerender",
+ "nuntius",
  "portcullis-ipc",
  "postcard",
  "serde",

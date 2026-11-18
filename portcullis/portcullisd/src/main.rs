@@ -630,7 +630,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             };
             let extra_env = vec![
                 ("ATRIUM_NUNTIUS_RESOLVERS".to_string(), dns.clone()),
-                ("NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK".to_string(), "1".to_string()),
+                // Workers' environments carry ATRIUM_ keys only.
+                ("ATRIUM_NUNTIUS_PRIVATE_NETWORK".to_string(), "1".to_string()),
             ];
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: portal fetcher {instance} for {app} (uid {uid}) on {iface}, DNS {dns}");
@@ -3510,6 +3511,11 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sign_in_persona_is_named_alike_on_both_sides() {
+        assert_eq!(portcullis_ipc::PORTAL_PERSONA, portcullis_peer::PORTAL_PERSONA);
+    }
     use portcullis_ipc::{round_trip, write_request};
     use std::io::Read;
     use std::time::Duration;

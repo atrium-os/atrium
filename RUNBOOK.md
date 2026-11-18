@@ -5885,7 +5885,13 @@ prompt row, naming "L5 hello by Atrium", what it asks for and that it isn't inst
 App probe (`link-probe` reading `atrium-app://org.atrium.l5hello` from its bundle's
 `link-probe.url`) asks with Enter, portcullisd answers "to install first", the install sheet
 shows (`confined-10-install.png`), Up and Enter on Install installs it for App probe's uid
-(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 130/130 on 2026-11-18 with a download (the survey PDF: Save, written by portcullisd's
+(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 144/144 on 2026-11-18 with the Wi-Fi sign-in window (atrium-net.md §8.1 S3:
+`portal_standin`, a netconf stand-in on `PORTCULLISD_NETCONF_DIR=$S/pstand`, says "Hotel Guest", the fixture's
+/portal/ and DNS 1.2.3.3; navtest is refused `PortalStatus`, asks `PortalWindow`, and the Navigator starts in the
+`portal` persona with a Nuntius fetcher of the network's own; the window shows the page's form, the gate types a room,
+ticks the terms and presses Connect, the fixture server gets `session=a1b2c3&room=412&terms=yes&connect=1` and its 303
+page shows, `confined-15-portal-form.png`, `confined-16-portal-online.png`; touching the online file closes the window
+and ends `PORTAL_WATCH`). 130/130 before that, with a download (the survey PDF: Save, written by portcullisd's
 `SaveDownload` into navtest's Downloads 0660 with its origin; Open, through `OpenDownload` into org.test.pdfview, an
 open-probe for application/pdf, read-only, nothing written). 122/122 before that, with printing (the print sheet,
 `atrium-prelum-sheet` as `_prelum-sheet` 65046 with no prelumd, provides Limen's `print` role; Ctrl-P in the Personal

@@ -123,7 +123,9 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let desc = WindowDesc::new("Navigator", SizeSpec::Fixed(w, h));
+    // The sign-in window says whose page it shows in its own title.
+    let title = navigator_ui::shell::window_portal().map_or("Navigator".to_string(), |n| format!("Sign in to {n}"));
+    let desc = WindowDesc::new(&title, SizeSpec::Fixed(w, h));
     // Live: navigatord first, since it may open the window's connection.
     let mut live = None;
     let mut limen_fd: Option<std::os::fd::OwnedFd> = None;
@@ -177,6 +179,12 @@ fn main() -> std::io::Result<()> {
             };
             let mut s = Shell::new(store, window.width, window.height);
             s.live = Some(navigator_ui::shell::LivePage::Loading(String::new()));
+            if s.portal.is_some() {
+                // The sign-in window: Unrecorded, whatever was kept.
+                s.store = navigator_ui::trail::TrailStore::empty();
+                s.store.persona = navigator_ui::trail::Persona::Unrecorded;
+                s.store.new_trail(true);
+            }
             if let Ok(u) = std::env::var("NAVIGATOR_UI_OPEN") {
                 if s.store.trail().page().is_some() {
                     s.store.new_trail(false);
@@ -259,7 +267,10 @@ fn main() -> std::io::Result<()> {
             let to_page = std::mem::take(&mut s.focus_page);
             // frescod watches the prompt row for other windows over it;
             // navigatord spends an answer's press only if it saw it clear.
-            let row = s.geo().prompt.map(|r| [r.x().ceil() as i32, r.y().ceil() as i32, r.w().floor() as i32 - 1, r.h().floor() as i32 - 1]);
+            // The sign-in window's form, when no prompt shows, is guarded
+            // the same way: its button's press is spent only if seen clear.
+            let g = s.geo();
+            let row = g.prompt.or(g.form).map(|r| [r.x().ceil() as i32, r.y().ceil() as i32, r.w().floor() as i32 - 1, r.h().floor() as i32 - 1]);
             if changed || to_page {
                 state.set(s);
             }
@@ -430,6 +441,8 @@ fn event(raw: &fresco_client::Event, main: u32, state: &Mutable<Shell>) {
                 s.history_key(*key, *modifiers, chars);
             } else if s.find.is_some() {
                 s.find_key(*key, *modifiers, chars);
+            } else if s.form.is_some() {
+                s.form_key(*key, *modifiers, chars);
             }
             if kind.pressed() {
                 navigator_ui::ui::trace(&mut s);

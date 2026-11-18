@@ -28,6 +28,8 @@ pub struct Prepared {
     /// The headings a reader can jump to (navigator-ui.md §7 "Jump to
     /// section"): (anchor, heading text), at most `SECTIONS_MAX`.
     pub sections: Vec<(String, String)>,
+    /// The document's plain forms ([`forms`]).
+    pub forms: Vec<limen::doc_viewer::Form>,
 }
 
 /// Read all of `r`, refusing more than `DOC_MAX` bytes.
@@ -151,7 +153,120 @@ pub fn prepare_with(kind: DocKind, bytes: &[u8], provided: &BTreeMap<String, (u3
     let html = navigator_normalize::normalize_and_measure(&doc, &inputs, fonts, &env).0;
     let anchors = anchors(&doc);
     let sections = sections(&doc, &anchors);
-    Ok(Prepared { title: title(&doc), anchors, sections, html, subs })
+    let forms = forms(&doc);
+    Ok(Prepared { title: title(&doc), anchors, sections, forms, html, subs })
+}
+
+/// The document's plain HTML forms (limen `ToParent::Forms`; atrium-net.md
+/// §8.1 P5): those a form panel can offer, each with a button to send it.
+/// A form with a field the panel can't show (a file, a textarea is shown as
+/// a line, an image button is a button) is left out; so is one with no
+/// button. A `<select>` is sent as its chosen option, as a page would send it
+/// untouched.
+pub fn forms(doc: &str) -> Vec<limen::doc_viewer::Form> {
+    use limen::doc_viewer::{cut, Field, FieldKind, Form, FIELDS_MAX, FIELD_LABEL_MAX, FIELD_NAME_MAX, FIELD_VALUE_MAX, FORMS_MAX, URL_MAX};
+    if !doc.get(..doc.len().min(8 << 20)).unwrap_or(doc).to_ascii_lowercase().contains("<form") {
+        return Vec::new();
+    }
+    let dom = navigator_dom::parse(doc);
+    let fold = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    // `<label for=id>` texts, by id.
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    for l in dom.by_tag("label") {
+        if let Some(id) = dom.attr(l, "for") {
+            labels.entry(id.to_string()).or_insert_with(|| fold(&dom.visible_text(l)));
+        }
+    }
+    // A control's label: its `<label for>`, an enclosing `<label>`, its
+    // placeholder or title, else its name.
+    let label_of = |h: navigator_dom::dom::Handle| -> String {
+        if let Some(t) = dom.attr(h, "id").and_then(|id| labels.get(id)).filter(|t| !t.is_empty()) {
+            return t.clone();
+        }
+        let mut up = dom.get(h).and_then(|n| n.parent);
+        while let Some(p) = up {
+            if dom.tag(p).is_some_and(|t| t.eq_ignore_ascii_case("label")) {
+                let t = fold(&dom.visible_text(p));
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+            up = dom.get(p).and_then(|n| n.parent);
+        }
+        ["aria-label", "placeholder", "title", "name"].iter().find_map(|a| dom.attr(h, a).map(fold).filter(|t| !t.is_empty())).unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    'forms: for f in dom.by_tag("form") {
+        if out.len() == FORMS_MAX {
+            break;
+        }
+        let post = dom.attr(f, "method").is_some_and(|m| m.trim().eq_ignore_ascii_case("post"));
+        let enctype = dom.attr(f, "enctype").map(|e| e.trim().to_ascii_lowercase());
+        if enctype.as_deref().is_some_and(|e| e != "application/x-www-form-urlencoded") {
+            continue;
+        }
+        let action = dom.attr(f, "action").unwrap_or("").trim().to_string();
+        if action.len() > URL_MAX || action.to_ascii_lowercase().starts_with("javascript:") {
+            continue;
+        }
+        let mut fields = Vec::new();
+        let mut stack: Vec<navigator_dom::dom::Handle> = dom.element_children(f).into_iter().rev().collect();
+        while let Some(h) = stack.pop() {
+            let tag = dom.tag(h).unwrap_or("").to_ascii_lowercase();
+            if tag == "form" {
+                continue;
+            }
+            if dom.attr(h, "disabled").is_some() && matches!(tag.as_str(), "input" | "button" | "select" | "textarea") {
+                continue;
+            }
+            let name = dom.attr(h, "name").unwrap_or("").to_string();
+            let value = |d: &str| dom.attr(h, "value").unwrap_or(d).to_string();
+            let field = |kind, label: String, value: String, checked| Field {
+                kind, name: cut(&name, FIELD_NAME_MAX), label: cut(&label, FIELD_LABEL_MAX), value: cut(&value, FIELD_VALUE_MAX), checked,
+            };
+            let got = match tag.as_str() {
+                "input" => match dom.attr(h, "type").map(|t| t.trim().to_ascii_lowercase()).as_deref().unwrap_or("text") {
+                    "hidden" => Some(field(FieldKind::Fixed, String::new(), value(""), false)),
+                    "text" | "email" | "tel" | "number" | "search" | "url" | "" => Some(field(FieldKind::Text, label_of(h), value(""), false)),
+                    "password" => Some(field(FieldKind::Password, label_of(h), value(""), false)),
+                    "checkbox" => Some(field(FieldKind::Checkbox, label_of(h), value("on"), dom.attr(h, "checked").is_some())),
+                    "radio" => Some(field(FieldKind::Radio, label_of(h), value("on"), dom.attr(h, "checked").is_some())),
+                    "submit" | "image" => Some(field(FieldKind::Submit, dom.attr(h, "value").or(dom.attr(h, "alt")).map(fold).filter(|t| !t.is_empty()).unwrap_or_else(|| "Submit".into()), value(""), false)),
+                    "button" | "reset" => None,
+                    _ => continue 'forms,
+                },
+                "button" => match dom.attr(h, "type").map(|t| t.trim().to_ascii_lowercase()).as_deref().unwrap_or("submit") {
+                    "submit" => {
+                        let t = fold(&dom.visible_text(h));
+                        Some(field(FieldKind::Submit, if t.is_empty() { "Submit".into() } else { t }, value(""), false))
+                    }
+                    _ => None,
+                },
+                "textarea" => Some(field(FieldKind::Text, label_of(h), fold(&dom.text_content(h)), false)),
+                "select" => {
+                    let opts = dom.by_tag_anywhere("option").into_iter().filter(|&o| dom.contains(h, o)).collect::<Vec<_>>();
+                    let chosen = opts.iter().copied().find(|&o| dom.attr(o, "selected").is_some()).or(opts.first().copied());
+                    let v = chosen.map(|o| dom.attr(o, "value").map(String::from).unwrap_or_else(|| fold(&dom.text_content(o)))).unwrap_or_default();
+                    Some(field(FieldKind::Fixed, String::new(), v, false))
+                }
+                _ => {
+                    stack.extend(dom.element_children(h).into_iter().rev());
+                    None
+                }
+            };
+            if let Some(g) = got {
+                if fields.len() == FIELDS_MAX {
+                    continue 'forms;
+                }
+                fields.push(g);
+            }
+        }
+        let form = Form { action, post, fields };
+        if form.ok() {
+            out.push(form);
+        }
+    }
+    out
 }
 
 /// The first `<title>`'s text, whitespace folded, the common entities
@@ -498,5 +613,25 @@ mod print_tests {
         let letter = print::pdf(p.html.clone(), p.subs.clone(), &p.title, print::Paper::new(612, 792), &|_| None).unwrap();
         assert!(letter.pages <= out.pages + 1);
         assert!(print::pdf(p.html, p.subs, "", print::Paper::new(100, 100), &|_| None).is_err(), "too small");
+    }
+
+    #[test]
+    fn a_sign_in_pages_forms_are_read_as_spelled() {
+        use limen::doc_viewer::FieldKind::*;
+        let doc = r#"<html><body><form method="POST" action="/login">
+            <input type="hidden" name="t" value="9f">
+            <label for="room">Room number</label><input id="room" name="room">
+            <label><input type="checkbox" name="terms" value="yes"> I accept the terms</label>
+            <select name="plan"><option value="free">Free</option><option value="day" selected>Day</option></select>
+            <button>Connect</button></form>
+            <form action="/up" enctype="multipart/form-data"><input type="file" name="f"><button>Up</button></form>
+            <form action="/q"><input name="q" placeholder="Search"></form></body></html>"#;
+        let f = forms(doc);
+        assert_eq!(f.len(), 1, "multipart and buttonless forms are left out: {f:?}");
+        assert_eq!((f[0].action.as_str(), f[0].post), ("/login", true));
+        let k: Vec<_> = f[0].fields.iter().map(|x| (x.kind, x.name.as_str(), x.label.as_str(), x.value.as_str())).collect();
+        assert_eq!(k, vec![(Fixed, "t", "", "9f"), (Text, "room", "Room number", ""), (Checkbox, "terms", "I accept the terms", "yes"),
+                           (Fixed, "plan", "", "day"), (Submit, "", "Connect", "")]);
+        assert!(forms("<p>no forms</p>").is_empty());
     }
 }

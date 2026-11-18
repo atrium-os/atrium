@@ -89,6 +89,15 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body))); self.send_header("Connection", "close")
         self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        # The sign-in window's form (atrium-net.md §8.1 P5): logged, then
+        # 303 to the "online" page, as a portal does.
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(min(n, 65536)).decode("utf-8", "replace")
+        sys.stderr.write("POST %s %s body=%s\n" % (self.path, self.headers.get("Content-Type"), body)); sys.stderr.flush()
+        self.send_response(303 if self.path == "/portal/login" else 404)
+        self.send_header("Location", "/portal/online.html"); self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close"); self.end_headers()
     def log_message(self, f, *a): sys.stderr.write((f % a) + "\n"); sys.stderr.flush()
 class S(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = True; allow_reuse_address = True
 d = sys.argv[1]
@@ -135,13 +144,16 @@ if [ "${BUILD:-1}" = 1 ]; then
     # missing binaries, and would otherwise leave a stale portcullisd.
     (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" \
         cargo build -q --release --target "$TARGET") || die "portcullis cross-build"
+    # atrium-net's network-portal socket, a stand-in (the sign-in window).
+    (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" \
+        cargo build -q --release --target "$TARGET" -p portcullisd --example portal_standin) || die "portal_standin"
     xb frescod "--bin frescod --bin fresco-renderer"
     xb forum-wm "--bin forum-wm"
     xb navigator-ui "--bin navigator-ui"
     xb navigator-page "--bin navigator-page"
     xb limen "--bin limend"
     xb navigator-prerender "--bin prerender"
-    xb navigator-fetch "--bin navigator-fetchd"
+    xb navigator-fetch "--bin navigator-fetchd --bin nuntiusd"
     xb navigatord "--bin navigatord"
     xb monstrator "--bin monstratord --example monctl --example link-probe"
     xb tabula "--bin tabulad"
@@ -175,7 +187,9 @@ allow_rctl = true
     service atrium-jaild restart >/dev/null 2>&1; sleep 2
     pkill -x portcullisd; sleep 1; mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
     : > /var/log/atrium/portcullisd-navigator.log
-    daemon -f -o /var/log/atrium/portcullisd-navigator.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
+    # atrium-net's network-portal socket is portal_standin's here (the
+    # sign-in window's section).
+    env PORTCULLISD_NETCONF_DIR=$S/pstand daemon -f -o /var/log/atrium/portcullisd-navigator.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
     pgrep -f atrium-jaild >/dev/null && test -S $PSOCK" || die "jaild restart / portcullisd start"
 echo "  jaild (rctl allowed) and portcullisd on $PSOCK"
 
@@ -185,6 +199,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
          "$ROOT/limen/target/$R/limend" "$ROOT/navigator-prerender/target/$R/prerender" \
          "$ROOT/navigator-fetch/target/$R/navigator-fetchd" "$ROOT/navigatord/target/$R/navigatord" \
+         "$ROOT/navigator-fetch/target/$R/nuntiusd" "$ROOT/scripts/nuntius-bundle.sh" "$ROOT/portcullis/target/$R/examples/portal_standin" \
          "$ROOT/scripts/navigator-page-bundle.sh" "$ROOT/scripts/fresco-renderer-bundle.sh" \
          "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem" \
          "$ROOT/monstrator/target/$R/monstratord" "$ROOT/monstrator/target/$R/examples/monctl" \
@@ -241,6 +256,9 @@ g "set -e
         NAVIGATOR_UI_TRACE=1 NAVIGATOR_UI_WIRE_LOG=1 NAVIGATOR_UI_LIVE=1 NAVIGATOR_UI_OPEN=https://atlas.example/wiki/Atrium > /root/navigatord.conf
     chmod +x $D/navigator-ui
     sh $D/navigator-ui-bundle.sh $D/navigator-ui /root/e2e-key.pem /usr/local/bin/opifex
+    # Nuntius, the system fetcher: the sign-in window's (OpenPortalFetcher).
+    chmod +x $D/nuntiusd $D/portal_standin
+    sh $D/nuntius-bundle.sh $D/nuntiusd /root/e2e-key.pem /usr/local/bin/opifex
     chmod +x $D/navigatord
     sh $D/navigator-broker-bundle.sh $D/navigatord /root/navigatord.conf /root/e2e-key.pem /usr/local/bin/opifex
     # A mail app for the hand-off (opening-links.md L4): atrium-open's
@@ -803,6 +821,55 @@ g "test -x /var/lib/atrium/apps/$L5ID/bin/hello" && ok "$L5ID is installed" || b
 g "grep -q '$L5ID opened from org.test.appprobe for navtest' $PL" && ok "…and portcullisd opened it" || bad "open: $(g "grep -h '$L5ID' $PL | tail -2" | tr '\n' ';')"
 g "pkill -x link-probe; pkill -x opifex-sheetd; pkill -x opifexd; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; true"
 
+echo "=== the network's sign-in window (atrium-net.md §8.1 S3, P5)"
+# atrium-net's network-portal socket is portal_standin's: a Wi-Fi network
+# "Hotel Guest" captive at the fixture server's /portal/, online once
+# $PSD/online exists. navtest asks portcullisd for the sign-in window, as
+# the bar will (S4); portcullisd starts navtest's Navigator in the reserved
+# portal persona, which fetches through a Nuntius of the network's own.
+PSD=$S/pstand
+PSTART=http://$PUB/portal/
+g "rm -rf $PSD; mkdir -p $PSD; daemon -f -o $S/pstand.log $D/portal_standin $PSD $PSTART 1.2.3.3 $PSD/online </dev/null"
+i=0; while [ $i -lt 20 ] && ! g "test -S $PSD/network-portal/network-portal.sock"; do sleep 1; i=$((i+1)); done
+asks() { g "printf '%s\\n%s\\n' '{\"op\":\"hello\",\"version\":1}' '$1' | su -m navtest -c 'nc -U -w 5 $PSOCK'" | tr -d '\r' | tail -1; }
+r=$(asks '{"op":"portal_status"}')
+case "$r" in *"only the sign-in window"*) ok "the network's state is the sign-in window's alone: navtest is refused" ;; *) bad "PortalStatus as navtest: $r" ;; esac
+r=$(asks '{"op":"portal_window"}')
+[ "$r" = '{"kind":"ok"}' ] && ok "navtest asks for the sign-in window" || bad "PortalWindow: $r $(g "tail -3 $PL" | tr '\n' ';')"
+i=0; while [ $i -lt 90 ] && ! g "grep -q 'the sign-in window for Hotel Guest at $PSTART' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'navigatord: the sign-in window for Hotel Guest at $PSTART' $PL" && ok "portcullisd started the Navigator as the sign-in window for Hotel Guest, at the network's page" || bad "no sign-in window: $(g "grep -h -e 'sign-in window' -e 'portal' $PL | tail -3" | tr '\n' ';')"
+g "grep -q '^[0-9]* navtest org.atrium.navigator .*persona=portal' /var/run/atrium/app-registry" && ok "in the reserved portal persona: a uid of its own" || bad "registry: $(g "grep -a navigator /var/run/atrium/app-registry" | tr '\n' ';')"
+g "grep -q 'portal fetcher .* for org.atrium.navigator (uid [0-9]*) on vtnet0, DNS 1.2.3.3' $PL" && ok "its fetcher is Nuntius with the network's DNS server" || bad "portal fetcher: $(g "grep -h -i 'portal fetcher' $PL | tail -2" | tr '\n' ';')"
+g "grep -q 'PORTAL_WATCH on' $S/pstand.log" && ok "…and atrium-net is told to watch for the sign-in" || bad "watch: $(g "tail -3 $S/pstand.log" | tr '\n' ';')"
+PLAST() { g "grep 'navigator-ui: trace' $PL | tail -1"; }
+i=0; while [ $i -lt 90 ] && ! PLAST | grep -q "url=$PSTART live=shown"; do sleep 3; i=$((i+3)); done
+PLAST | grep -q "url=$PSTART live=shown" && ok "the window shows the network's page" || bad "portal page: $(PLAST)"
+grep -q "GET /portal/ " "$FIX/server.log" && ok "fetched from the network, not through the Navigator's own fetcher" || bad "no GET /portal/ at the fixture server"
+i=0; while [ $i -lt 60 ] && ! PLAST | grep -q 'form=[0-9]'; do sleep 3; i=$((i+3)); done
+g "grep -q 'navigator-ui: the page has 1 form' $PL" && ok "its page child read the page's form" || bad "forms: $(g "grep -h -e 'form' $PL | tail -3" | tr '\n' ';')"
+F=$(PLAST | sed -n 's/.* form=\([^ ]*\).*/\1/p')
+[ -n "$F" ] && [ "$F" != - ] || F="0,0;0,0|0,0"
+ROOM=${F%%;*}; REST=${F#*;}; TERMS=${REST%%|*}; BTN=${F#*|}; BTN=${BTN%%;*}
+echo "  form rows and button: room $ROOM, terms $TERMS, Connect $BTN"
+press "${ROOM%,*}" $((TOP + ${ROOM#*,}))
+key 0x21; key 0x1e; key 0x1f            # 4 1 2
+press "${TERMS%,*}" $((TOP + ${TERMS#*,}))
+shot confined-15-portal-form
+press "${BTN%,*}" $((TOP + ${BTN#*,}))   # Connect
+i=0; while [ $i -lt 60 ] && ! grep -q "POST /portal/login" "$FIX/server.log"; do sleep 3; i=$((i+3)); done
+grep -q "POST /portal/login application/x-www-form-urlencoded body=session=a1b2c3&room=412&terms=yes&connect=1" "$FIX/server.log" \
+    && ok "Connect sent the form as typed and ticked, with the page's own hidden field and the button's value" || bad "POST: $(grep POST "$FIX/server.log" | tail -2 | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! PLAST | grep -q 'url=http://1.2.3.100/portal/online.html live=shown'; do sleep 3; i=$((i+3)); done
+PLAST | grep -q 'url=http://1.2.3.100/portal/online.html live=shown' && ok "the network's answer (303 to its online page) shows in the window" || bad "after POST: $(PLAST) $(g "grep -h 'form' $PL | tail -2" | tr '\n' ';')"
+shot confined-16-portal-online
+PU2=$(g "awk '\$2==\"navtest\" && \$3==\"org.atrium.navigator\" && \$4==\"persona=portal\" {print \$1}' /var/run/atrium/app-registry" | tr -d '\r')
+g "touch $PSD/online"
+i=0; while [ $i -lt 40 ] && ! g "grep -q 'Hotel Guest is online; the sign-in window closes' $PL"; do sleep 2; i=$((i+2)); done
+g "grep -q 'Hotel Guest is online; the sign-in window closes' $PL" && ok "atrium-net said online: the sign-in window closed itself" || bad "online: $(g "grep -h -e 'online' -e 'sign-in' $PL | tail -3" | tr '\n' ';')"
+sleep 10
+g "pgrep -u ${PU2:-0} -x navigatord >/dev/null" && bad "the sign-in window's navigatord is still running" || ok "…its navigatord and window are gone"
+g "grep -q 'PORTAL_WATCH off' $S/pstand.log" && ok "…and the watch ended with its fetcher" || bad "watch off: $(g "tail -2 $S/pstand.log" | tr '\n' ';')"
+
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"
 g "jls name | grep -qx atrium-monstratord" && bad "monstratord's jail outlived the bootstrap" || ok "monstratord's jail ended with the bootstrap"
@@ -813,7 +880,7 @@ N=$(jails)
 [ "${N:-0}" = 0 ] && ok "the page jails ended with the Navigator" || bad "$N page jails left"
 LEFT=$(g "jls name | grep -cE 'navigator[-_](converter|fetcher)' || true" | tr -d '\r')
 [ "${LEFT:-0}" = 0 ] && ok "no converter or fetcher jail left" || bad "$LEFT converter/fetcher jails left"
-for f in ui limend navigatord navigatord-work frescod bootstrap sheet; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
+for f in ui limend navigatord navigatord-work frescod bootstrap sheet pstand; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
 get /var/log/atrium/portcullisd-navigator.log "$OUT/portcullisd.log" 2>/dev/null
 g "pkill -x limend; pkill -x navigatord; pkill -x forum-wm; pkill -x frescod; true"
 sleep 5

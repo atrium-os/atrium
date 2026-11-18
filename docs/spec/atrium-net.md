@@ -513,6 +513,16 @@ start URL, online) and `OpenPortalFetcher`. Nuntius gained `Method::Form`: a for
 whose 301/302/303 answer is followed as a GET without the body, as a browser does; plain
 `Post` still never follows.
 
+*S3 built (Navigator thread, 2026-11-18):* the window reads the page's plain forms in its page
+jail and sends one only on a press of its button (navigator-ui.md §7 "Forms in the Wi-Fi
+sign-in window"), polls `PortalStatus` every 5 s and closes when online or after ten minutes.
+Workers' environments carry `ATRIUM_` keys only, so the private grant is
+`ATRIUM_NUNTIUS_PRIVATE_NETWORK=1`. In the sandbox casper connects only to addresses it
+resolved (`CAPNET_CONNECTDNS`), so `ViaDns` has casper resolve each address numerically before
+connecting. The confined VM gate runs it against `portal_standin` (a netconf stand-in: "Hotel
+Guest", the fixture server's /portal/, online once a file exists); the joint run on the
+network thread's portal LAN is next.
+
 P5 (Shankar, 2026-11-18): the sign-in window may send the page's plain HTML forms (text,
 checkboxes, buttons), only on the person's press, and only in that window. Everywhere
 else the Navigator still sends no form (legacy-web §5.4.1e).

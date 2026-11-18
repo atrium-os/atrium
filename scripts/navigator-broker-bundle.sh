@@ -29,6 +29,8 @@ entry = "bin/navigatord"
 
 [capabilities]
 navigator-broker = true
+# The captive portal's sign-in window (atrium-net.md §8.1 S3), restricted.
+network-portal = true
 
 # Web links other apps open come here (opening-links.md §4.1, D5).
 [[links]]

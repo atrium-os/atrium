@@ -71,6 +71,11 @@ pub const PROTO_VERSION: u32 = 1;
 /// The fetcher `OpenFetcher` starts (docs/spec/nuntius.md).
 pub const NUNTIUS_APP: &str = "org.atrium.nuntius";
 
+/// The reserved persona of the captive portal's sign-in window
+/// (atrium-net.md §8.1 S3): portcullis-peer's `PORTAL_PERSONA`, for the
+/// Navigator to know itself by.
+pub const PORTAL_PERSONA: &str = "portal";
+
 /// The content decryption module host `OpenCdm` starts (docs/spec/hospes.md).
 pub const HOSPES_CDM_APP: &str = "org.atrium.hospes-cdm";
 

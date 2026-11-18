@@ -325,6 +325,11 @@ impl crate::Connect for ViaDns {
         Ok(addresses(&*self.dns, host)?.into_iter().map(|a| SocketAddr::new(a, port)).collect())
     }
     fn connect_addr(&self, addr: SocketAddr) -> io::Result<std::net::TcpStream> {
+        // In the sandbox casper connects only where it resolved
+        // (CAPNET_CONNECTDNS), and these addresses came from the network's
+        // servers or the URL. Its resolving the literal (numeric: nothing
+        // is asked of anyone) is what lets the connect through.
+        self.net.resolve(&addr.ip().to_string(), addr.port())?;
         self.net.connect_addr(addr)
     }
 }
