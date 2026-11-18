@@ -12,6 +12,8 @@
  *   tessera-keyload group-create DIR KEY_ID_HEX GROUP
  *   tessera-keyload quota-group DIR GROUP
  *       (on a mounted volume: make the group; put DIR's quota domain in it)
+ *   tessera-keyload quota-dump DIR
+ *       (the mount's domains and key groups, to the console)
  *   tessera-keyload format KEY_ID_HEX UUID_HEX DEVICE [JOURNAL_SECTORS]
  *       (the kernel formats DEVICE sealed with the loaded key; the key
  *       never reaches this process)
@@ -59,6 +61,7 @@ usage(void)
 	    "       tessera-keyload load-group KEY_FILE KEY_ID UUID GROUP\n"
 	    "       tessera-keyload group-create DIR KEY_ID GROUP\n"
 	    "       tessera-keyload quota-group DIR GROUP\n"
+	    "       tessera-keyload quota-dump DIR\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
 }
@@ -103,6 +106,20 @@ main(int argc, char **argv)
 			return (1);
 		}
 		printf("in group %ju\n", (uintmax_t)gid);
+		return (0);
+	}
+	if (strcmp(argv[1], "quota-dump") == 0 && argc == 3) {
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		/* TESSERA_IOC_QUOTA_DUMP: the listing goes to the console. */
+		if (ioctl(dfd, _IO('T', 4)) != 0) {
+			perror("TESSERA_IOC_QUOTA_DUMP");
+			return (1);
+		}
 		return (0);
 	}
 	fd = open("/dev/" TESSERA_KEYRING_DEV, O_RDWR);

@@ -247,13 +247,20 @@ pub struct Sheets {
     /// column), and its field (lines shown joined by ¶).
     pub commenting: Mutable<Option<(u16, u32, u32)>>,
     pub comment_text: Mutable<TextEdit>,
+    /// The link bar: the cell it writes the link of, and its field.
+    pub linking: Mutable<Option<(u16, u32, u32)>>,
+    pub link_text: Mutable<TextEdit>,
+    /// The activation of the press on Open Link, for the link opener.
+    pub link_press: Rc<Cell<Option<fresco_protocol::activation::Token>>>,
+    /// The link opener's answer, from its thread.
+    pub opened: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -567,6 +574,12 @@ impl Sheets {
     }
 
     /// The document changed outside the grid (opened, saved, recovered).
+    /// Puts `s` on the status line.
+    pub fn set_status(&self, s: impl Into<String>) {
+        self.doc.borrow_mut().status = s.into();
+        self.changed();
+    }
+
     pub fn changed(&self) {
         self.rev.set(self.rev.get().wrapping_add(1));
     }
@@ -586,6 +599,71 @@ impl Sheets {
         st.physics_x.set_position(0.0);
         self.scroll.set(st);
         self.changed();
+    }
+
+    /// Follows the cursor's link: a place in the workbook is shown and
+    /// selected; an address goes to the link opener (Monstrator) with the
+    /// press that asked, from a thread, as it may ask the person first.
+    pub fn open_link(&self, press: Option<fresco_protocol::activation::Token>) {
+        let (r, c) = self.grid.get_cloned().cursor;
+        let (link, place) = {
+            let d = self.doc.borrow();
+            let l = d.wb.link_at(officina_grid::addr::CellAddr::new(d.sheet, r, c));
+            let p = l.as_ref().and_then(|l| l.place(&d.wb, d.sheet));
+            (l, p)
+        };
+        let Some(link) = link else {
+            self.set_status("There's no link in this cell.");
+            return;
+        };
+        if !link.is_external() {
+            match place {
+                Some(a) => {
+                    self.show_sheet(a.sheet);
+                    self.show_cell(a.row, a.col);
+                    self.set_status(format!("Went to {}.", link.target.trim_start_matches('#')));
+                }
+                None => self.set_status(format!("There's no {} in this workbook.", link.target.trim_start_matches('#'))),
+            }
+            return;
+        }
+        let Some(token) = press else {
+            self.set_status("Choose Open Link in the Data menu to open this link.");
+            return;
+        };
+        let (url, out) = (link.target.to_string(), self.opened.clone());
+        *out.lock().unwrap() = None;
+        std::thread::spawn(move || {
+            let r = match monstrator::open_link(&monstrator::socket(), &url, token, std::time::Duration::from_secs(120)) {
+                Ok(r) => r,
+                Err(e) => Err(format!("the link opener isn't reachable ({e})")),
+            };
+            *out.lock().unwrap() = Some(r);
+        });
+        self.set_status(format!("Opening {}…", short_url(&link.target)));
+    }
+
+    /// The link opener answered: the status says so, or why not.
+    fn poll_link(&self) {
+        let Some(r) = self.opened.lock().unwrap().take() else { return };
+        self.set_status(match r {
+            Ok(()) => "Link opened.".to_string(),
+            Err(why) => format!("The link didn't open: {why}."),
+        });
+    }
+
+    /// Selects cell (`r`, `c`) of the sheet on screen and scrolls it into view.
+    fn show_cell(&self, r: u32, c: u32) {
+        use pergola::widgets::GridSource;
+        let mut g = self.grid.get_cloned();
+        g.select(r, c);
+        self.grid.set(g);
+        let mut st = self.scroll.get();
+        st.physics.stop();
+        st.physics_x.stop();
+        st.physics.set_position((self.source.row_top(r) - 3.0 * (self.source.row_top(r + 1) - self.source.row_top(r))).max(0.0));
+        st.physics_x.set_position((self.source.col_left(c) - 60.0).max(0.0));
+        self.scroll.set(st);
     }
 
     /// Shows sheet `s`: at its top left, the strip moved to show its tab,
@@ -783,6 +861,57 @@ impl Sheets {
                 self.commenting.set(None);
                 self.changed();
             }
+            TabCmd::Linking => {
+                let (r, c) = self.grid.get_cloned().cursor;
+                let (s, text) = {
+                    let d = self.doc.borrow();
+                    (d.sheet, d.wb.link(d.sheet, r, c).map(|k| k.target.to_string()).unwrap_or_default())
+                };
+                self.renaming.set(false);
+                self.coloring.set(false);
+                self.commenting.set(None);
+                let mut ed = TextEdit::new(&text);
+                ed.set_caret(ed.text().len(), false);
+                self.link_text.set(ed);
+                self.linking.set(Some((s, r, c)));
+                self.changed();
+            }
+            TabCmd::LinkDone => {
+                let Some((s, r, c)) = self.linking.get() else { return };
+                let typed = self.link_text.get_cloned().text().to_string();
+                let mut d = self.doc.borrow_mut();
+                let new = match link_from_bar(&d.wb, s, &typed) {
+                    Ok(l) => l,
+                    Err(why) => {
+                        d.status = why;
+                        drop(d);
+                        self.changed();
+                        return;
+                    }
+                };
+                let old = d.wb.link(s, r, c).cloned();
+                if new != old {
+                    let label = match (&old, &new) {
+                        (None, _) => "Insert Link",
+                        (_, None) => "Remove Link",
+                        _ => "Edit Link",
+                    };
+                    let mut ops = vec![officina_grid::ops::GridOp::Links { sheet: s, set: vec![(r, c, new.clone())] }];
+                    // An empty cell shows where it goes.
+                    if let Some(l) = new.filter(|_| d.wb.input(officina_grid::addr::CellAddr::new(s, r, c)) == officina_grid::Input::Empty) {
+                        let shown = l.target.strip_prefix('#').unwrap_or(&l.target);
+                        ops.push(officina_grid::ops::GridOp::set(officina_grid::addr::CellAddr::new(s, r, c), officina_grid::Input::Value(officina_grid::Value::Str(shown.into()))));
+                    }
+                    d.run(label, ops);
+                }
+                drop(d);
+                self.linking.set(None);
+                self.changed();
+            }
+            TabCmd::LinkCancel => {
+                self.linking.set(None);
+                self.changed();
+            }
         }
     }
 
@@ -816,6 +945,17 @@ impl Sheets {
             TextField::new(self.comment_text.clone()).autofocus(true).at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
             Button::primary("Save").at(154.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::CommentDone)).render(ctx);
             Button::secondary("Cancel").at(234.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::CommentCancel)).render(ctx);
+            return;
+        }
+        if let Some((_, r, c)) = self.linking.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            let label = format!("Link from {}", officina_grid::addr::a1(r, c));
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 130.0, 18.0), content: label, style: st });
+            let fw = (w - 150.0 - 180.0).clamp(120.0, 640.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.link_text.clone()).autofocus(true).placeholder("https://… or Sheet2!B4").at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::LinkDone))).render(ctx);
+            Button::primary("Save").at(154.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::LinkDone)).render(ctx);
+            Button::secondary("Cancel").at(234.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::LinkCancel)).render(ctx);
             return;
         }
         if self.coloring.get() {
@@ -975,8 +1115,12 @@ impl View for Sheets {
             let entries = crate::data::menu(&self.doc.borrow(), g.selection(), g.cursor);
             let (items, cmds_of): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
             let cmds = self.cmds.clone();
+            let press = self.link_press.clone();
             MenuButton::new("Data", self.data_menu.clone(), items, move |i| {
                 if let Some(Some(c)) = cmds_of.get(i) {
+                    if *c == crate::data::DataCmd::OpenLink {
+                        press.set(pergola::clipboard::current_activation());
+                    }
                     cmds.lock().unwrap().push(Cmd::Data(*c));
                 }
             })
@@ -1019,7 +1163,7 @@ impl View for Sheets {
         ctx.add(Node::Text { rect: Rect::new(124.0, y + 6.0, (w - 136.0).max(0.0), 20.0), content: shown, style: TextStyle { family: font::MONO.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() } });
 
         // The grid, with the cursor cell's comment beside it while not editing.
-        self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none()).then_some(g.cursor));
+        self.source.note_at.set((g.edit.is_none() && self.commenting.get().is_none() && self.linking.get().is_none()).then_some(g.cursor));
         let doc = self.doc.clone();
         let rev = self.rev.clone();
         let src = self.source.clone();
@@ -1456,6 +1600,7 @@ impl View for Sheets {
 impl Sheets {
     /// The toolbar's file commands since the last call; undo and redo are run here.
     pub fn take_cmds(&self) -> Vec<Cmd> {
+        self.poll_link();
         let cmds = std::mem::take(&mut *self.cmds.lock().unwrap());
         cmds.into_iter()
             .filter(|&c| match c {
@@ -1486,6 +1631,15 @@ impl Sheets {
                 }
                 Cmd::Data(crate::data::DataCmd::Comment) => {
                     self.tab_cmd(crate::tabs::TabCmd::Commenting);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::Link) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Linking);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::OpenLink) => {
+                    let press = self.link_press.take();
+                    self.open_link(press);
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::DeleteSheet) => {
@@ -1636,6 +1790,47 @@ impl Sheets {
 /// trimmed.
 fn from_bar(s: &str) -> String {
     s.split('¶').map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+/// The link bar's text as a link: `#Sheet2!B4`, or `Sheet2!B4` / `B4` naming
+/// a place in the workbook; else an address, `https://` put in front of a
+/// bare host. Empty: no link. Err: why it can't be one.
+fn link_from_bar(wb: &officina_grid::Workbook, own: u16, s: &str) -> Result<Option<officina_grid::links::Link>, String> {
+    use officina_grid::links::Link;
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.starts_with('#') {
+        let l = Link::new(t).ok_or_else(String::new)?;
+        return match l.place(wb, own) {
+            Some(_) => Ok(Some(l)),
+            None => Err(format!("There's no {} in this workbook.", &t[1..])),
+        };
+    }
+    if let Some(l) = Link::new(&format!("#{t}")).filter(|_| !t.contains(':') || t.contains('!')).filter(|l| l.place(wb, own).is_some()) {
+        return Ok(Some(l));
+    }
+    let scheme = t.split_once(':').map(|(a, _)| a).filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)));
+    if scheme.is_some() {
+        return Ok(Link::new(t));
+    }
+    if t.contains('@') && !t.contains('/') {
+        return Ok(Link::new(&format!("mailto:{t}")));
+    }
+    if t.contains('.') && !t.contains(char::is_whitespace) {
+        return Ok(Link::new(&format!("https://{t}")));
+    }
+    Err(format!("“{t}” isn't an address or a place in this workbook."))
+}
+
+/// `u` short enough for the status line.
+fn short_url(u: &str) -> String {
+    if u.chars().count() > 60 {
+        format!("{}…", u.chars().take(59).collect::<String>())
+    } else {
+        u.to_string()
+    }
 }
 
 /// Who new comments are by: `$USER`, else "Me" (as Write writes them).
@@ -1899,6 +2094,68 @@ mod tests {
             assert!(s.doc.borrow_mut().undo());
         }
         assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn links_are_inserted_followed_and_removed() {
+        use crate::tabs::TabCmd;
+        let (mut d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
+        d.wb.add_sheet("Totals").unwrap();
+        d.wb.recalc();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        let at = |r: u32, c: u32| {
+            let mut g = grid.get_cloned();
+            g.select(r, c);
+            grid.set(g);
+        };
+        // A place on another sheet: the bar takes it without the #.
+        at(0, 0);
+        run(Cmd::Data(crate::data::DataCmd::Link));
+        assert_eq!(s.linking.get(), Some((0, 0, 0)));
+        s.link_text.set(TextEdit::new("Totals!C5"));
+        run(Cmd::Tab(TabCmd::LinkDone));
+        assert!(s.linking.get().is_none());
+        assert_eq!(&*s.doc.borrow().wb.link(0, 0, 0).unwrap().target, "#Totals!C5");
+        assert_eq!(pergola::widgets::GridSource::cell(&*s.source, 0, 0).unwrap().color, Some(pergola::theme::palette::info_600()));
+        run(Cmd::Data(crate::data::DataCmd::OpenLink));
+        assert_eq!(s.doc.borrow().sheet, 1);
+        assert_eq!(grid.get_cloned().cursor, (4, 2));
+        // An address on an empty cell: https:// put in front, and shown.
+        s.show_sheet(0);
+        at(3, 0);
+        run(Cmd::Data(crate::data::DataCmd::Link));
+        s.link_text.set(TextEdit::new("example.org/x"));
+        run(Cmd::Tab(TabCmd::LinkDone));
+        let d = s.doc.borrow();
+        assert_eq!(&*d.wb.link(0, 3, 0).unwrap().target, "https://example.org/x");
+        assert_eq!(d.wb.value(0, 3, 0), officina_grid::Value::Str("https://example.org/x".into()));
+        drop(d);
+        // Without a press it isn't handed on.
+        run(Cmd::Data(crate::data::DataCmd::OpenLink));
+        assert_eq!(s.doc.borrow().status, "Choose Open Link in the Data menu to open this link.");
+        // Not a link: refused, the bar stays.
+        at(1, 0);
+        run(Cmd::Data(crate::data::DataCmd::Link));
+        s.link_text.set(TextEdit::new("not a link"));
+        run(Cmd::Tab(TabCmd::LinkDone));
+        assert!(s.linking.get().is_some());
+        assert!(s.doc.borrow().wb.link(0, 1, 0).is_none());
+        run(Cmd::Tab(TabCmd::LinkCancel));
+        // Remove, then undo brings it back with its text.
+        let mut g = grid.get_cloned();
+        g.select(0, 0);
+        g.cursor = (3, 1);
+        grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::RemoveLinks));
+        assert_eq!(s.doc.borrow().status, "2 links removed.");
+        assert!(s.doc.borrow().wb.links(0).is_empty());
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(s.doc.borrow().wb.links(0).len(), 2);
     }
 
     #[test]
