@@ -207,6 +207,15 @@ pub enum Request {
     /// as its own uid under the system worker rule, never as the caller.
     OpenFetcher,
 
+    /// ★ A captive portal's sign-in window (atrium-net.md §8.1): a Nuntius
+    /// like `OpenFetcher`'s, but one that asks the NETWORK's DNS servers
+    /// (from atrium-net's `network-portal`) instead of the system's
+    /// resolver, and may reach private addresses, where portals live.
+    /// Requires the caller's INSTALLED manifest to hold `network-portal`
+    /// (restricted to the Navigator). While it runs, atrium-net re-probes
+    /// every 5 s; the handoff and lifetime are `OpenFetcher`'s.
+    OpenPortalFetcher,
+
     /// ★ A content decryption module of the caller's own (docs/spec/hospes.md
     /// §3, §8.4): `hospes-cdm` (`HOSPES_CDM_APP`) in a one-shot jail of its
     /// own, as its own uid, never as the caller. Requires the caller's

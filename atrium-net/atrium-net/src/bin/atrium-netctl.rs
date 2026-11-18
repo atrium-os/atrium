@@ -398,6 +398,21 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
                 _ => die("dns [A,B,C [tls NAME]]"),
             }
         }
+        // network-portal: what a sign-in window would get, and the watch.
+        "portal" => match args.get(1).map(String::as_str) {
+            Some("watch") => c.portal_watch(args.get(2).map(String::as_str) != Some("off")).map(|_| println!("ok")),
+            _ => c.portal_info().map(|p| {
+                let ssid = p.ssid.as_ref().map(|s| format!(" ssid={}", name(s))).unwrap_or_default();
+                println!(
+                    "portal iface={}{ssid} online={:?} start={} dns={} watching={}",
+                    p.iface,
+                    p.online,
+                    p.start_url().unwrap_or_else(|| "-".into()),
+                    p.dns.join(","),
+                    p.watching as u8
+                )
+            }),
+        },
         "printers" => {
             let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
             c.print_discovery().map(|(iface, r, w)| printers(&iface, r, w, secs))
@@ -418,7 +433,7 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
             }
             Ok(())
         }
-        _ => die("--app CAP status|interfaces|routes|list|join SSID [--open|--known]|leave|forget SSID|nearby|country CC|static|watch SECS|printers SECS"),
+        _ => die("--app CAP status|interfaces|routes|list|join SSID [--open|--known]|leave|forget SSID|nearby|country CC|static|watch SECS|printers SECS|portal [watch on|off]"),
     };
     match r {
         Ok(()) => exit(0),

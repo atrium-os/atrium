@@ -366,6 +366,15 @@ impl Backend for Front {
         self.call(&l).map(|_| ())
     }
 
+    fn portal_info(&self) -> Res<atrium_netconf::PortalInfo> {
+        lines::portal(&self.call(&Line::new("status"))?).ok_or_else(|| Fail::new(status::FAILED, "no-network"))
+    }
+
+    fn portal_watch(&self, on: bool) -> Res<()> {
+        self.log(&format!("portal-watch {}", if on { "on" } else { "off" }));
+        self.call(&Line::new("portal-watch").with("on", on as u8)).map(|_| ())
+    }
+
     fn print_discovery(&self) -> Res<(String, [OwnedFd; 2])> {
         // Holding the lock across the call: the fds that come belong to it.
         let mut p = self.calls.lock().unwrap();
@@ -386,8 +395,9 @@ impl Backend for Front {
 fn listen(dir: &Path, g: Grant) -> UnixListener {
     let d = dir.join(g.name());
     std::fs::create_dir_all(&d).unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
-    // print-discovery is root's (prelumd) alone: no jail gets it either.
-    let root_only = g == Grant::PrintDiscovery;
+    // print-discovery (prelumd) and network-portal (the portal launcher)
+    // are root's alone: no jail gets them either.
+    let root_only = g.root_only();
     let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if root_only { 0o700 } else { 0o755 }));
     let p: PathBuf = d.join(format!("{}.sock", g.name()));
     let _ = std::fs::remove_file(&p);
@@ -472,7 +482,7 @@ fn main() {
         hs.push(std::thread::spawn(move || {
             for s in l.incoming() {
                 let Ok(s) = s else { continue };
-                if g == Grant::PrintDiscovery && aura_ipc::sock::peer_uid(&s) != Some(0) {
+                if g.root_only() && aura_ipc::sock::peer_uid(&s) != Some(0) {
                     continue;
                 }
                 let f = f.clone();

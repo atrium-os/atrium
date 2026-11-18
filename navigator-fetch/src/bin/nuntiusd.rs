@@ -8,6 +8,12 @@
 //!                                     CGNAT and ULA (also
 //!                                     NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK=1).
 //!                                     Off by default. Never admits metadata.
+//!   ATRIUM_NUNTIUS_RESOLVERS=A,B      a captive portal's sign-in window
+//!                                     (atrium-net.md §8.1; set only by
+//!                                     portcullisd): names are asked of these
+//!                                     servers (the network's own), not of
+//!                                     the system's resolver. A bad list
+//!                                     refuses to start.
 //!   ATRIUM_NUNTIUS_SITES=a.com,*.b.org  narrow every hop to these sites
 //!                                     (nuntius.md §4; set by portcullisd from
 //!                                     the app's `net-fetch-sites`). A list
@@ -80,6 +86,15 @@ fn serve(conv: Conversation<'static>) -> ! {
     }
 }
 
+/// `ATRIUM_NUNTIUS_RESOLVERS`: a portal window's own servers, connected.
+fn portal_resolvers() -> Option<std::sync::Arc<navigator_fetch::dns::Udp>> {
+    use navigator_fetch::dns;
+    let v = std::env::var(dns::RESOLVERS_ENV).ok()?;
+    let addrs = dns::resolvers(&v).unwrap_or_else(|e| fail(e.to_string()));
+    eprintln!("nuntiusd: a portal sign-in window: names asked of {v}, not the system's resolver");
+    Some(std::sync::Arc::new(dns::Udp::to(&addrs).unwrap_or_else(|e| fail(format!("{}: {e}", dns::RESOLVERS_ENV)))))
+}
+
 /// ★ Off FreeBSD there is no Capsicum, so there is no sandboxed fetcher: it
 /// refuses, unless asked by name for what it then is (the same channel,
 /// address rule and pins, with NO sandbox), for tests and development.
@@ -92,6 +107,10 @@ fn main() {
     }
     let tls = std::fs::read(&trust).map_err(|e| e.to_string()).and_then(|p| tls_config(&p)).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     eprintln!("nuntiusd: ★ UNCONFINED, for testing: no sandbox");
+    if let Some(p) = portal_resolvers() {
+        let via: &'static navigator_fetch::dns::ViaDns = Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: &navigator_fetch::Direct, dns: p.clone() }));
+        serve(Conversation::new(via, tls, policy).with_sites(sites()).with_dns(p));
+    }
     serve(with_dns(Conversation::new(&navigator_fetch::Direct, tls, policy).with_sites(sites())))
 }
 
@@ -104,15 +123,24 @@ fn main() {
     let sites = sites();
     let pem = std::fs::read(&trust).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     let tls = tls_config(&pem).unwrap_or_else(|e| fail(e));
-    // The resolver's sockets, connected now: afterwards nothing can be.
-    let dns = navigator_fetch::dns::Udp::system().map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok();
+    // A portal window's servers, or the system's: connected now, as
+    // afterwards nothing can be.
+    let portal = portal_resolvers();
+    let dns = match &portal {
+        Some(p) => Some(p.clone()),
+        None => navigator_fetch::dns::Udp::system().map(std::sync::Arc::new).map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok(),
+    };
     let net = sandbox::enter().unwrap_or_else(|e| fail(format!("sandbox: {e}")));
     if !sandbox::in_capability_mode() { fail("kernel reports NOT in capability mode — refusing to serve".into()) }
     let locked: &'static navigator_fetch::Locked<sandbox::Net> = Box::leak(Box::new(navigator_fetch::Locked(std::sync::Mutex::new(net))));
+    let connect: &'static (dyn navigator_fetch::Connect + Sync) = match &portal {
+        Some(p) => Box::leak(Box::new(navigator_fetch::dns::ViaDns { net: locked, dns: p.clone() })),
+        None => locked,
+    };
     // (fstat on the channel is allowed in capability mode.)
-    let conv = Conversation::new(locked, tls, policy).with_sites(sites);
+    let conv = Conversation::new(connect, tls, policy).with_sites(sites);
     serve(match dns {
-        Some(d) => conv.with_dns(std::sync::Arc::new(d)),
+        Some(d) => conv.with_dns(d),
         None => conv,
     })
 }

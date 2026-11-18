@@ -585,6 +585,53 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                                  &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None)?;
             continue;
         }
+        /* ★ OpenPortalFetcher (atrium-net.md §8.1): a captive portal's
+         * sign-in window. Gated on the PEER UID like OpenFetcher, on the
+         * restricted `network-portal` capability. WE ask atrium-net (root
+         * only `network-portal` socket) for the network's DNS servers; the
+         * caller names nothing. The fetcher gets them and the private-network
+         * grant in its environment, and atrium-net watches (5 s probes) for as
+         * long as it runs. */
+        if matches!(req, Request::OpenPortalFetcher) {
+            let app = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+                .unwrap_or_default().resolve(uid).map(|(_, app)| app.to_string());
+            let refuse = |why: String| Response::LaunchFailed { stage: "network-portal".into(), message: why };
+            let Some(app) = app.filter(|a| launch::app_may_open_portal(a)) else {
+                eprintln!("portcullisd: portal fetcher DENIED to uid {uid}: no network-portal capability");
+                write_response(&mut writer, &refuse("cap.network_portal.denied: the caller's manifest does not hold network-portal".into()))?;
+                continue;
+            };
+            let info = portcullisd::portal::info();
+            let (dns, iface) = match info {
+                Ok(i) if !i.dns.is_empty() => (i.dns.join(","), i.iface),
+                Ok(i) => {
+                    write_response(&mut writer, &refuse(format!("{} has no DNS servers of its own", i.iface)))?;
+                    continue;
+                }
+                Err(why) => {
+                    eprintln!("portcullisd: portal fetcher for {app}: {why}");
+                    write_response(&mut writer, &refuse(why))?;
+                    continue;
+                }
+            };
+            let Some(rule) = Policy::load_system(std::path::Path::new(SYSTEM_PATH)).ok()
+                .and_then(|p| p.workers.get(portcullis_ipc::NUNTIUS_APP).cloned()) else {
+                write_response(&mut writer, &refuse(format!("no system worker rule for {}", portcullis_ipc::NUNTIUS_APP)))?;
+                continue;
+            };
+            let extra_env = vec![
+                ("ATRIUM_NUNTIUS_RESOLVERS".to_string(), dns.clone()),
+                ("NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK".to_string(), "1".to_string()),
+            ];
+            let instance = fetcher_instance(uid);
+            eprintln!("portcullisd: portal fetcher {instance} for {app} (uid {uid}) on {iface}, DNS {dns}");
+            portcullisd::portal::watch(true);
+            let r = handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
+                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None);
+            portcullisd::portal::watch(false);
+            r?;
+            continue;
+        }
         /* ★ OpenCdm (docs/spec/hospes.md §3, §8.4): a content decryption
          * module of the caller's own. Gated like OpenFetcher, on the PEER UID:
          * the caller's INSTALLED manifest must hold `protected-media`. The
@@ -3321,6 +3368,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::WorkerCall { .. } => Response::Error {
             message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),
+        },
+        Request::OpenPortalFetcher => Response::Error {
+            message: "OpenPortalFetcher must be routed through the peer-uid, fd-passing path".into(),
         },
         Request::OpenFetcher => Response::Error {
             message: "OpenFetcher must be routed through the peer-uid, fd-passing path".into(),

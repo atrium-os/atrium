@@ -86,3 +86,21 @@ fn an_app_without_net_fetch_is_refused() {
     assert!(e.to_string().contains("net_fetch"), "{e}");
     assert!(!d.join().unwrap());
 }
+
+#[test]
+fn the_portal_window_asks_for_its_own_verb() {
+    let (app, d) = UnixStream::pair().unwrap();
+    let h = std::thread::spawn(move || {
+        let mut r = BufReader::new(d.try_clone().unwrap());
+        let mut w = d;
+        read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::Hello { version: portcullis_ipc::PROTO_VERSION }).unwrap();
+        let req = read_request(&mut r).unwrap();
+        write_response(&mut w, &Response::LaunchFailed { stage: "network-portal".into(), message: "cap.network_portal.denied".into() }).unwrap();
+        matches!(req, P::OpenPortalFetcher)
+    });
+    let e = nuntius::launch::open_portal_at(app).err().expect("refused");
+    assert!(h.join().unwrap(), "OpenPortalFetcher, not OpenFetcher");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(e.to_string().contains("network_portal"), "{e}");
+}

@@ -191,6 +191,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-netconf"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "aura-ipc",
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "atrium-open"
 version = "0.1.0"
 dependencies = [
@@ -225,6 +236,14 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+]
+
+[[package]]
+name = "aura-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zeroize",
 ]
 
 [[package]]
@@ -1338,6 +1357,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "atrium-links",
+ "atrium-netconf",
  "atrium-open",
  "atrium-types",
  "atrium-volumes",

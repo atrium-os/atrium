@@ -346,12 +346,7 @@ f0=$(df -k $M | awk 'NR==2 {print $4}')
 cp $T/pcontent $M/persona/copy-in-group.txt || fail "copy in group"
 sync; sleep 1; sync
 f1=$(df -k $M | awk 'NR==2 {print $4}')
-cp $T/pcontent $M/other/copy-outside.txt || fail "copy outside"
-sync; sleep 1; sync
-f2=$(df -k $M | awk 'NR==2 {print $4}')
-echo "free KiB: $f0 -> $f1 (copy in group) -> $f2 (copy outside)"
 [ $((f0 - f1)) -lt 200 ] || fail "a copy inside the group didn't dedup ($f0 -> $f1)"
-[ $((f1 - f2)) -gt 900 ] || fail "a copy outside the group dedup'd against it ($f1 -> $f2)"
 umount $M || fail "umount after group writes"
 for w in itinerary-secret holiday-plans-folder tiny-persona-note symlink-persona-name \
     itinerary-target-name copy-in-group; do
@@ -361,6 +356,12 @@ grep -qa 'persona private line' $IMG && fail "group file bytes in the clear"
 grep -qa 'persona tiny note' $IMG && fail "group small file in the clear"
 grep -qa 'shared plain line' $IMG || fail "plain bytes not found (the grep is blind)"
 mount -t tessera $DEV $M || fail "remount with group"
+# the same bytes outside the group: written in full (and in the clear)
+cp $T/pcontent $M/other/copy-outside.txt || fail "copy outside"
+sync; sleep 1; sync
+f2=$(df -k $M | awk 'NR==2 {print $4}')
+echo "free KiB: $f0 -> $f1 (copy in group) -> $f2 (copy outside)"
+[ $((f1 - f2)) -gt 900 ] || fail "a copy outside the group dedup'd against it ($f1 -> $f2)"
 cmp -s $M/persona/holiday-plans-folder/itinerary-secret.txt $T/pcontent ||
     fail "group file differs after remount"
 cmp -s $M/persona/copy-in-group.txt $T/pcontent || fail "group copy differs"

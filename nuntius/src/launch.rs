@@ -70,14 +70,34 @@ pub fn open() -> io::Result<Fetcher> {
     open_at(UnixStream::connect(path)?)
 }
 
+/// A fetcher for a captive portal's sign-in window (atrium-net.md §8.1):
+/// portcullisd's `OpenPortalFetcher`. The manifest must hold
+/// `network-portal`; the fetcher asks the network's own DNS servers and may
+/// reach private addresses, and atrium-net watches for the sign-in while it
+/// runs. Everything else is as [`open`].
+pub fn open_portal() -> io::Result<Fetcher> {
+    let path = portcullis_ipc::resolve_socket_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nuntius: portcullisd's socket is not reachable"))?;
+    open_with(UnixStream::connect(path)?, Request::OpenPortalFetcher)
+}
+
 /// [`open`] over an already connected portcullisd socket.
-pub fn open_at(mut s: UnixStream) -> io::Result<Fetcher> {
+pub fn open_at(s: UnixStream) -> io::Result<Fetcher> {
+    open_with(s, Request::OpenFetcher)
+}
+
+/// [`open_portal`] over an already connected portcullisd socket.
+pub fn open_portal_at(s: UnixStream) -> io::Result<Fetcher> {
+    open_with(s, Request::OpenPortalFetcher)
+}
+
+fn open_with(mut s: UnixStream, req: Request) -> io::Result<Fetcher> {
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
     match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
         Response::Hello { .. } => {}
         r => return Err(other(format!("portcullisd hello: {r:?}"))),
     }
-    write_request(&mut s, &Request::OpenFetcher)?;
+    write_request(&mut s, &req)?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}
         Response::LaunchFailed { stage, message } => return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("nuntius: {stage}: {message}"))),
