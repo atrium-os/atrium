@@ -501,7 +501,14 @@ portal), both whenever a link is up, both asking portcullisd's `PortalWindow` (S
 with the press, so an open window comes forward). `network-wifi` now reaches
 portcullisd's socket for this. lan.py's router serves the sign-in page (GET /login, one
 form; POST /accept lets the machine through), and gate n0 (70/70) sends that form.
-Left: the automatic offer when DNS over TLS fails on a new network (P3), and S3.
+The automatic offer (P3) built the same day: with DNS over TLS on, atrium-net asks
+unbound, on a socket opened before capability mode, for the TLS server's own name
+(flushed from its cache first, so the answer has to come over TLS) every 5 s for a minute
+after the network or the settings change, and while it fails. Unanswered for 10 s, the
+egress line says `dot=failing`; answered, `dot=ok`. With the probe off (online unknown),
+netconf turns those into `Captive` (the bar's "sign-in needed", Settings' primary Sign in)
+and `Yes` (which also ends a sign-in window's watch). The probe's word, when there is
+one, wins. Gate n0 72/72.
 
 *S3, the window's shape (Navigator thread, 2026-11-18):* the Navigator runs one window per
 instance and `Launch` passes no arguments, so the sign-in window is its own Navigator

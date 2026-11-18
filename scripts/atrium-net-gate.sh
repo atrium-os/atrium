@@ -319,12 +319,23 @@ n0)
     st=$(ctl status)
     echo "$st" | grep -q '^dns own=192.0.2.53 tls=dot.atrium.test' && "$V" 'grep -q "^dns servers=192.0.2.53 tls=dot.atrium.test" /var/db/atrium-net/settings' \
         && ok "shown on the status line and kept in the settings" || fail "status/settings: $(echo "$st" | grep '^dns')"
+    # §8.1 P3: with the probe off, the TLS server answering is the word on
+    # this network (netconf: online), and its silence would offer sign-in.
+    eg() { ctl status | grep 'name=vtnet1'; }
+    PQ="/tmp/atrium-net/atrium-netctl --dir /tmp/atrium-net/sockets --app network-portal portal"
+    i=0; until eg | grep -q ' dot=ok'; do i=$((i + 1)); [ $i -lt 20 ] || fail "no dot=ok: $(eg) $("$V" 'grep -i "tls check\|DNS over TLS" /tmp/atrium-net/net.log | tail -n 3')"; sleep 1; done
+    r=$("$V" "$PQ" 2>&1 || true)
+    echo "$r" | grep -q 'online=Yes' && ok "DNS over TLS answering on this network: online, as far as netconf can tell ($i s)" || fail "dot ok: $r"
     # A certificate for another name: no answers, and never plain DNS instead.
     r=$(ctl 'dns servers=192.0.2.53 tls=wrong.atrium.test')
     flush
     r=$(look4 gate.atrium.test)
     echo "$r" | grep -q 'rcode: SERVFAIL' && [ "$(stat dns)" = "$d0" ] \
         && ok "a certificate for another name: SERVFAIL, nothing in the clear" || fail "wrong name: $r (lan dns $d0 -> $(stat dns))"
+    i=0; until eg | grep -q ' dot=failing'; do i=$((i + 1)); [ $i -lt 40 ] || fail "no dot=failing: $(eg)"; sleep 1; done
+    r=$("$V" "$PQ" 2>&1 || true)
+    echo "$r" | grep -q 'online=Captive' \
+        && ok "the TLS server silent for 10 s: sign-in offered (Captive) without a probe ($i s)" || fail "dot failing: $i s, $r"
     # unbound restarted: list_forwards can't show TLS, so atrium-net sees the
     # restart by its uptime and sets the servers again.
     ctl 'dns servers=192.0.2.53 tls=dot.atrium.test' >/dev/null

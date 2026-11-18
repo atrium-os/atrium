@@ -62,7 +62,13 @@ pub fn iface(l: &Line) -> Option<Iface> {
         dns: list(l, "dns"),
         addrs6: list(l, "inet6"),
         dns6: list(l, "dns6"),
-        online: online(l.get("internet")),
+        online: match (online(l.get("internet")), l.get("dot")) {
+            // No probe, but DNS over TLS on this network (§8.1 P3): not
+            // answering hints at a sign-in page; answering means through.
+            (Online::Unknown, Some("failing")) => Online::Captive,
+            (Online::Unknown, Some("ok")) => Online::Yes,
+            (o, _) => o,
+        },
         metered: l.get("metered") == Some("1"),
         egress: l.get("egress") == Some("1"),
         manual: manual(l),

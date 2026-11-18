@@ -119,6 +119,30 @@ mod imp {
     /// While a portal sign-in window is open (§8.1).
     const PORTAL_PROBE_MS: u64 = 5_000;
     const PORTAL_WATCH_MS: u64 = 10 * 60_000;
+    /// DNS over TLS on a new network (§8.1 P3): checked every DOT_CHECK_MS
+    /// for DOT_NEW_MS after the egress changes (and while failing); failing
+    /// for DOT_FAIL_MS hints at a portal in the way.
+    const DOT_CHECK_MS: u64 = 5_000;
+    const DOT_NEW_MS: u64 = 60_000;
+    const DOT_FAIL_MS: u64 = 10_000;
+
+    /// The DNS-over-TLS check (§8.1 P3): unbound asked, on a socket opened
+    /// before capability mode, for the TLS server's own name, flushed from
+    /// its cache first so the answer has to come over TLS. Nothing else is
+    /// asked of anyone.
+    struct DotCheck {
+        sock: std::net::UdpSocket,
+        id: u16,
+        /// A question is out, sent at this time.
+        asked: Option<u64>,
+        /// When the egress last changed: checks run for DOT_NEW_MS after.
+        since_new: u64,
+        failing_since: Option<u64>,
+        failing: bool,
+        /// The server answered over TLS on this network.
+        answered: bool,
+        next: u64,
+    }
 
     /// The root zone's forwarders in `unbound-control list_forwards` output
     /// (". IN forward A B ..."), without scope suffixes.
@@ -374,6 +398,7 @@ mod imp {
         /// A portal sign-in window is open (§8.1): probe every
         /// PORTAL_PROBE_MS until online, or until this time.
         portal_watch_until: Option<u64>,
+        dot: Option<DotCheck>,
         egress: Egress,
         /// The default route we installed (interface, router), and the
         /// interface last announced as the egress.
@@ -680,6 +705,7 @@ mod imp {
                 let name = cur.map_or("none".to_string(), |k| self.ifs[k].name.clone());
                 self.log(&format!("egress {name}{}", cur.map_or(String::new(), |k| format!(" (hold-down {} s)", self.egress.hold_ms(k, now) / 1000))));
                 self.egress6(cur);
+                self.dot_restart();
                 let ev = Line::new("egress").with("iface", &name);
                 self.event(&ev);
                 if let Some(d) = &self.netd {
@@ -745,6 +771,105 @@ mod imp {
 
         /// Start the next probe that is due (one at a time), and give up on
         /// one that has hung.
+        /// §8.1 P3: on a new network with DNS over TLS on, a TLS server
+        /// that does not answer for DOT_FAIL_MS is shown as `dot_failing`
+        /// on the egress line, and the bar and Settings offer sign-in.
+        fn dot_tick(&mut self) {
+            let now = self.now();
+            let active = self.dns_tls.is_some() && !self.own_dns.is_empty() && self.announced.is_some() && self.full_tunnel().is_none();
+            let name = self.dns_tls.clone().unwrap_or_default();
+            let Some(d) = self.dot.as_mut() else { return };
+            // Answers: any rcode from the server (NOERROR, NXDOMAIN) is an
+            // answer; SERVFAIL is unbound saying it got none over TLS.
+            let mut buf = [0u8; 512];
+            let mut answered = None;
+            while let Ok(n) = d.sock.recv(&mut buf) {
+                if n >= 12 && u16::from_be_bytes([buf[0], buf[1]]) == d.id && buf[2] & 0x80 != 0 {
+                    answered = Some(buf[3] & 0x0f != 2);
+                    d.asked = None;
+                }
+            }
+            if !active {
+                if std::mem::take(&mut d.failing) {
+                    self.log("DNS over TLS check: off");
+                    self.event(&Line::new("dot").with("failing", 0));
+                }
+                let d = self.dot.as_mut().unwrap();
+                d.failing_since = None;
+                d.asked = None;
+                d.answered = false;
+                return;
+            }
+            let was = d.failing;
+            match answered {
+                Some(true) => {
+                    d.failing_since = None;
+                    d.failing = false;
+                    d.answered = true;
+                }
+                Some(false) => {
+                    d.failing_since.get_or_insert(now);
+                }
+                None => {}
+            }
+            if now < d.next {
+                return self.dot_changed(was);
+            }
+            // A question still out at the next check went unanswered.
+            if d.asked.is_some() {
+                d.failing_since.get_or_insert(d.asked.unwrap());
+            }
+            if d.failing_since.is_some_and(|t| now >= t + DOT_FAIL_MS) {
+                d.failing = true;
+            }
+            if now >= d.since_new + DOT_NEW_MS && !d.failing && d.failing_since.is_none() {
+                d.next = u64::MAX; // settled on this network
+                return self.dot_changed(was);
+            }
+            d.next = now + DOT_CHECK_MS;
+            d.id = d.id.wrapping_add(0x3b1d);
+            let q = atrium_net::dot_query(d.id, &name);
+            let id = d.id;
+            if let Some(u) = &self.unbound {
+                let _ = u.cmd(&format!("flush {name}"));
+            }
+            let d = self.dot.as_mut().unwrap();
+            if !q.is_empty() && d.sock.send(&q).is_ok() {
+                d.asked = Some(now);
+            } else {
+                eprintln!("atrium-net: DNS over TLS check: cannot ask unbound (id {id})");
+            }
+            self.dot_changed(was);
+        }
+
+        /// A new network, or new DNS-over-TLS settings: check afresh.
+        fn dot_restart(&mut self) {
+            let now = self.now();
+            let was = self.dot.as_ref().is_some_and(|d| d.failing);
+            if let Some(d) = self.dot.as_mut() {
+                d.since_new = now;
+                d.failing_since = None;
+                d.failing = false;
+                d.answered = false;
+                d.asked = None;
+                d.next = now;
+            }
+            self.dot_changed(was);
+        }
+
+        fn dot_changed(&mut self, was: bool) {
+            let now_failing = self.dot.as_ref().is_some_and(|d| d.failing);
+            if now_failing != was {
+                self.log(&format!("DNS over TLS {}", if now_failing { "not answering on this network: a sign-in page may be in the way" } else { "answering" }));
+                self.event(&Line::new("dot").with("failing", now_failing as u8));
+                // Signed in, as far as DNS over TLS can tell: a watch for the
+                // sign-in window ends (with the probe on, the probe says so).
+                if !now_failing && self.prober.is_none() && self.portal_watch_until.take().is_some() {
+                    self.log("portal watch: DNS over TLS answers again, off");
+                }
+            }
+        }
+
         fn probe_tick(&mut self) {
             let now = self.now();
             let Some(p) = &self.prober else { return };
@@ -1459,6 +1584,7 @@ mod imp {
                     self.own_dns = v;
                     self.dns_tls = tls;
                     self.save_settings();
+                    self.dot_restart();
                     // Back to the networks' own: forward() keeps the list
                     // when it is unchanged, so clear what it compares with.
                     self.forwarders.clear();
@@ -1551,6 +1677,13 @@ mod imp {
                     l = l.with("egress", 1);
                     if self.portal_watch_until.is_some() {
                         l = l.with("portal_watch", 1);
+                    }
+                    // What the DNS-over-TLS check found on this network, when
+                    // it found anything (§8.1 P3).
+                    match self.dot.as_ref().filter(|_| self.dns_tls.is_some() && !self.own_dns.is_empty()) {
+                        Some(d) if d.failing => l = l.with("dot", "failing"),
+                        Some(d) if d.answered => l = l.with("dot", "ok"),
+                        _ => {}
                     }
                 }
                 if self.mdns.as_ref().is_some_and(|m| m.1 == i.name) {
@@ -2160,6 +2293,7 @@ mod imp {
             dns_tls,
             unbound_up: 0,
             portal_watch_until: None,
+            dot: None,
             egress: Egress::new(o.ifaces.len()),
             def4: None,
             announced: None,
@@ -2264,6 +2398,13 @@ mod imp {
             Err(e) => die(&format!("{}: {e}", o.sock.display())),
         };
         listener.set_nonblocking(true).ok();
+        // The DNS-over-TLS check's socket to unbound, while connect works.
+        if net.unbound.is_some() {
+            match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| s.connect("127.0.0.1:53").map(|_| s)).and_then(|s| s.set_nonblocking(true).map(|_| s)) {
+                Ok(sock) => net.dot = Some(DotCheck { sock, id: (std::process::id() as u16) ^ 0x5a5a, asked: None, since_new: 0, failing_since: None, failing: false, answered: false, next: 0 }),
+                Err(e) => eprintln!("atrium-net: no DNS over TLS check: {e}"),
+            }
+        }
         if o.capsicum {
             sys::cap_enter().unwrap_or_else(|e| die(&e.to_string()));
             net.log("in capability mode");
@@ -2455,6 +2596,7 @@ mod imp {
                 net.log("portal watch: 10 minutes, off");
             }
             net.probe_tick();
+            net.dot_tick();
             net.probe_restart();
             net.lease_restart_tick();
             net.unbound_tick();

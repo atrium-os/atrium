@@ -101,6 +101,18 @@ fn portal_info_from_lines() {
     assert!(lines::portal(&[parse(&STATUS[1].replace(" egress=1", ""))]).is_none());
 }
 
+#[test]
+fn dns_over_tls_stands_in_for_the_probe() {
+    let l = |extra: &str| parse(&format!("iface name=em0 mac=x state=bound addr=10.0.0.5/24 router=10.0.0.1 dns=10.0.0.1 link=up egress=1 {extra}").trim_end());
+    let on = |extra: &str| lines::portal(&[l(extra)]).unwrap().online;
+    assert_eq!(on(""), Online::Unknown);
+    assert_eq!(on("dot=failing"), Online::Captive, "TLS server not answering on a new network: offer sign-in");
+    assert_eq!(on("dot=ok"), Online::Yes, "answering over TLS: through");
+    assert_eq!(on("internet=no dot=failing"), Online::No, "the probe's word wins");
+    assert_eq!(on("internet=yes dot=failing"), Online::Yes);
+    assert_eq!(lines::status(&[l("dot=failing")], None).online, Online::Captive);
+}
+
 #[derive(Default)]
 struct Fake {
     log: Mutex<Vec<String>>,
