@@ -3636,7 +3636,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Seeing them:** a commented cell has a small red triangle in its top-right corner (`CellView::note`). With the cursor on it and no edit open, the comment shows in a pale yellow box beside the cell or its merged area, author in bold, wrapped, ten lines at most. This is a grid float from `SheetSource::note_at`.
   - **Writing them:** Data ▸ New Comment… / Edit Comment… opens a bar where the tabs are. Lines show joined by ¶. Save writes the comment as `$USER` (an edit keeps the original author), and an empty one deletes it. Data ▸ Delete Comment(s) removes those in the selection. Each is one undo step.
 - **Sorting** moves comments with their rows (`sort::tests::comments_move_with_their_rows`).
-- **Not yet:** threaded comments (Excel 365's `threadedComments`, read as their legacy note when the file has one), rich text in comments, and printing them.
+- **Threaded comments** (Excel 365's `threadedComments` and `persons`): read as one note per cell, replacing Excel's "[Threaded comment] Your version of Excel..." stand-in. The note's author is the first message's person, and each reply follows as a "Name: text" paragraph; a file with replies gets a report note. Saving writes plain notes, which Excel shows as notes. Gate: `threaded_comments_are_read_as_their_conversation`.
+- **Not yet:** writing threads back as threads, rich text in comments, and printing them.
 - **Gates:** officina-grid `comments::tests`; officina-convert `tests/comments.rs` (round trips, Excel's author prefix, LibreOffice both ways); atrium-sheets `comments_are_written_shown_beside_the_cell_edited_and_deleted`.
 
 ### 16.81 Cell hyperlinks (2026-11-18)
