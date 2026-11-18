@@ -73,6 +73,9 @@ pub struct Policy {
     /// Absent = none.
     #[serde(default)]
     pub print_workers: Option<PrintWorkerPolicy>,
+    /// Crypta's tunnel engines (vpn.md §3). Absent = none.
+    #[serde(default)]
+    pub crypta_engines: Option<CryptaEnginePolicy>,
     /// Per-jail system call filter profiles (jail-sysfil.md §5). Absent =
     /// no profiles, and a request that names one is refused.
     #[serde(default)]
@@ -251,6 +254,21 @@ impl StickServerPolicy {
     pub fn mountpoint(&self, part: &str) -> String {
         format!("{}/.sticks/{part}", self.media_prefix.trim_end_matches('/'))
     }
+}
+
+/// `[crypta_engines]`: cryptad asks for one jail per live VPN tunnel
+/// (vpn.md §3), named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
+/// running exactly `exec_path` as that uid with cryptad's socket as its
+/// stdio and the tunnel's tun as one more descriptor; its network a routed
+/// vnet passing only UDP to the gateway, tagged so the host's `atrium/vpn`
+/// anchor can let exactly those flows past block-when-not-connected.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CryptaEnginePolicy {
+    pub name_prefix: String,
+    pub exec_path:   String,
+    pub uid_first:   u32,
+    pub uid_last:    u32,
 }
 
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md

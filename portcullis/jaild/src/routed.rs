@@ -135,6 +135,11 @@ pub fn validate_grants(g: &crate::protocol::NetGrants) -> Result<(), String> {
         if !valid_key(&p.app_key) || p.port == 0 { return Err(format!("peer {p:?} is malformed")) }
     }
     if g.inbound.contains(&0) { return Err("inbound port 0".into()) }
+    if let Some(t) = &g.tag {
+        if t.is_empty() || t.len() > 31 || !t.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+            return Err(format!("tag {t:?} is not 1-31 of A-Z and _"));
+        }
+    }
     Ok(())
 }
 
@@ -163,10 +168,11 @@ fn host_resolvers() -> Vec<String> {
 /// 0/0 outbound worked.)
 pub fn render_anchor(ea: &str, app: &str, g: Option<&crate::protocol::NetGrants>) -> String {
     let mut r = String::new();
+    let tag = g.and_then(|g| g.tag.as_deref()).map(|t| format!(" tag {t}")).unwrap_or_default();
     let pass = |proto: &str, to: &str, port: Option<u16>| {
         let proto = if proto.is_empty() { String::new() } else { format!(" proto {proto}") };
         let port = port.map(|p| format!(" port {p}")).unwrap_or_default();
-        format!("pass in quick on {ea} inet{proto} from {app} to {to}{port} keep state\n")
+        format!("pass in quick on {ea} inet{proto} from {app} to {to}{port}{tag} keep state\n")
     };
     if let Some(g) = g {
         for p in &g.peers {
@@ -265,6 +271,7 @@ mod tests {
             peers: vec![crate::protocol::NetPeer { app_key: "fedcba9876543210".into(), port: 5432 }],
             inbound: vec![8080],
             no_resolver: false,
+            tag: None,
         }
     }
 
@@ -286,6 +293,17 @@ mod tests {
         let a = render_anchor("epair3a", "100.64.0.14", Some(&g));
         assert_eq!(a, "block in quick on epair3a inet from any to 100.64.0.0/16\n\
                        pass in quick on epair3a inet proto tcp from 100.64.0.14 to 140.82.112.3/32 port 443 keep state\n");
+    }
+
+    #[test]
+    fn a_tag_rides_on_every_outbound_pass() {
+        let mut g = grants(); g.peers.clear(); g.no_resolver = true; g.tag = Some("CRYPTA_OUTER".into());
+        g.outbound = vec![crate::protocol::NetDest { cidr: "198.51.100.51/32".into(), port: Some(51820), udp: true }];
+        let a = render_anchor("epair3a", "100.64.0.14", Some(&g));
+        assert_eq!(a, "block in quick on epair3a inet from any to 100.64.0.0/16\n\
+                       pass in quick on epair3a inet proto udp from 100.64.0.14 to 198.51.100.51/32 port 51820 tag CRYPTA_OUTER keep state\n");
+        g.tag = Some("bad tag".into());
+        assert!(validate_grants(&g).is_err());
     }
 
     #[test]

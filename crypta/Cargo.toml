@@ -1,0 +1,9 @@
+# Crypta, Atrium's VPN (docs/spec/vpn.md).
+[workspace]
+resolver = "2"
+members = ["crypta-wg", "crypta-proto", "crypta-engine", "cryptad"]
+exclude = ["crypta-wg/fuzz", "crypta-proto/fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

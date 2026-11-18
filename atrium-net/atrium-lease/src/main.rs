@@ -93,6 +93,7 @@ fn main() {
     let now = || t0.elapsed().as_millis() as u64;
     let mut client: Option<Client> = None;
     let mut dmac = [0xffu8; 6];
+    let mut heard = [0xffu8; 6];
     let mut rdnss = Rdnss::default();
     let mut c6: Option<Client6> = None;
     let mut told6: Vec<std::net::Ipv6Addr> = Vec::new();
@@ -167,9 +168,12 @@ fn main() {
                             continue;
                         }
                         if let Some((src_mac, _src, p)) = frame::dhcp_from_frame_mac(&f) {
+                            // The MAC of the server whose message the client took, for unicast renewals. The
+                            // lease binds later, after the ARP probe (tick),
+                            // so it is taken at Bound below, not here.
                             let o = cl.rx(p, now());
-                            if o.iter().any(|x| matches!(x, Out::Bound(_))) {
-                                dmac = src_mac;
+                            if !o.is_empty() {
+                                heard = src_mac;
                             }
                             outs.extend(o);
                         }
@@ -224,7 +228,10 @@ fn main() {
                     };
                     Line::new("send").with("dest", dest).with("dmac", fmt_mac(&m)).with_hex("hex", &payload)
                 }
-                Out::Bound(l) => l.to_line(),
+                Out::Bound(l) => {
+                    dmac = heard;
+                    l.to_line()
+                }
                 Out::Lost(why) => Line::new("lost").with("why", why),
                 Out::Probe(a) => Line::new("probe").with("addr", a.to_string()),
             };

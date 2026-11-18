@@ -72,6 +72,9 @@ pub enum Kind {
     /// A Wi-Fi network credential (WPA passphrase or PSK): a machine-store
     /// item that `aura-keys` turns into a PMK for one join (wifi.md §3.4).
     WifiCredential = 8,
+    /// A WireGuard preshared key (vpn.md §4.3): 32 bytes, released to the
+    /// tunnel's engine through cryptad when it starts.
+    WireGuardPsk = 9,
     /// An ed25519 signing key (per-service keypairs, insula.md §13.3).
     Ed25519 = 0x100,
     /// A P-256 key (passkeys, ES256).
@@ -101,6 +104,7 @@ impl Kind {
             6 => Totp,
             7 => BluetoothKey,
             8 => WifiCredential,
+            9 => WireGuardPsk,
             0x100 => Ed25519,
             0x101 => P256,
             0x102 => Symmetric,

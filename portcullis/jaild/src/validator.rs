@@ -30,6 +30,7 @@ pub fn validate_create(
     validate_devfs_ruleset(req.devfs_ruleset, policy)?;
     validate_devfs_pin(req, policy)?;
     validate_network(&req.network, &req.name, policy)?;
+    validate_tag(req, policy)?;
     validate_mlock(req, policy)?;
     validate_tessera_keys(req, policy)?;
     for m in &req.mounts {
@@ -38,7 +39,8 @@ pub fn validate_create(
     }
     if let Some(exec) = &req.exec {
         validate_exec(exec, policy, is_instance_root(req, policy),
-                      is_courier(req, policy) || is_share_server(req, policy) || is_print_worker(req, policy))?;
+                      is_courier(req, policy) || is_share_server(req, policy) || is_print_worker(req, policy)
+                          || is_crypta_engine(req, policy))?;
     }
     validate_host_identity(req)?;
     resolve_sysfil(req, policy)?;
@@ -272,6 +274,64 @@ pub fn is_print_worker(req: &CreateJailRequest, policy: &Policy) -> bool {
         && !req.allow_mlock
         && !req.allow_tessera_keys
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// The pf tag the `CRYPTA_OUTER` rules key on (vpn.md §5.4).
+pub const CRYPTA_TAG: &str = "CRYPTA_OUTER";
+
+/// Whether `req` is one of Crypta's tunnel engines (`[crypta_engines]`,
+/// vpn.md §3), named and rooted like a courier's, taking its caller's
+/// stdio (cryptad's socket, and the tun as one more descriptor): a routed
+/// vnet whose grants pass only UDP to single addresses on stated ports
+/// (the gateway), tagged `CRYPTA_OUTER`, nothing inbound, no peers, no
+/// resolver. No devices, no FUSE, no child jails, no locked memory.
+pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
+    use crate::protocol::NetworkConfig;
+    let (Some(c), Some(dir), Some(exec)) =
+        (policy.crypta_engines.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref())
+    else {
+        return false;
+    };
+    let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
+        return false;
+    };
+    let network_ok = match &req.network {
+        NetworkConfig::Routed { grants: Some(g), .. } => {
+            !g.outbound_any && g.no_resolver && g.peers.is_empty() && g.inbound.is_empty() && !g.outbound.is_empty()
+                && g.outbound.len() <= 8
+                && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && d.udp)
+                && g.tag.as_deref() == Some(CRYPTA_TAG)
+        }
+        _ => false,
+    };
+    network_ok
+        && req.name == format!("{}{uid}", c.name_prefix)
+        && (c.uid_first..=c.uid_last).contains(&uid)
+        && exec.uid == uid
+        && exec.gid == uid
+        && exec.path == c.exec_path
+        && exec.stdio
+        && req.fuse.is_none()
+        && req.devfs_grant.is_none()
+        && req.devfs_grants.is_empty()
+        && req.children_max == 0
+        && !req.allow_mlock
+        && !req.allow_tessera_keys
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// A pf tag on a jail's flows is Crypta's engines' alone: it is what lets
+/// them past block-when-not-connected to a VPN gateway.
+fn validate_tag(req: &CreateJailRequest, policy: &Policy) -> Result<(), JaildError> {
+    use crate::protocol::NetworkConfig;
+    let tagged = matches!(&req.network, NetworkConfig::Routed { grants: Some(g), .. } if g.tag.is_some());
+    if tagged && !is_crypta_engine(req, policy) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "network.tag",
+            detail: format!("jail {:?} is not a Crypta engine; only those may tag their flows", req.name),
+        });
+    }
+    Ok(())
 }
 
 /// `allow.mlock` lets a jail wire memory, so it is allowlisted per jail
@@ -1178,7 +1238,7 @@ mod tests {
         use crate::protocol::{NetDest, NetGrants, NetworkConfig};
         let p = load_sample_policy();
         let grants = |outbound: Vec<NetDest>| NetGrants {
-            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true,
+            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true, tag: None,
         };
         let printer = || vec![NetDest { cidr: "192.168.1.20/32".into(), port: Some(631), udp: false }];
         let worker = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
@@ -1223,6 +1283,58 @@ mod tests {
             assert!(!is_print_worker(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
+    }
+
+    /// Crypta's engines: exactly the policy's name, root, binary and uid, a
+    /// routed vnet passing only tagged UDP to stated gateway addresses; and
+    /// no other jail may tag its flows.
+    #[test]
+    fn a_crypta_engine_jail_and_only_a_crypta_engine_jail() {
+        use crate::protocol::{NetDest, NetGrants, NetworkConfig};
+        let p = load_sample_policy();
+        let grants = |outbound: Vec<NetDest>, tag: Option<&str>| NetGrants {
+            app_key: "0123456789abcdef".into(), outbound_any: false, outbound, peers: vec![], inbound: vec![], no_resolver: true,
+            tag: tag.map(str::to_string),
+        };
+        let gw = || vec![NetDest { cidr: "198.51.100.51/32".into(), port: Some(51820), udp: true }];
+        let routed = |g: NetGrants| NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(g) };
+        let engine = |name: &str, exe: &str, uid: u32, net: NetworkConfig| {
+            let mut r = instance_req(name, &format!("/var/lib/atrium/jails/{name}"), exe, true);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.network = net;
+            r
+        };
+        let wg = "/usr/local/bin/atrium-crypta-wg";
+        let ok = engine("system-crypta-61001", wg, 61001, routed(grants(gw(), Some("CRYPTA_OUTER"))));
+        assert!(is_crypta_engine(&ok, &p));
+        validate_create(&ok, &p).expect("an engine");
+        let mut mlock = ok.clone();
+        mlock.allow_mlock = true;
+        for (r, why) in [
+            (engine("system-crypta-61001", wg, 61001, routed(grants(gw(), None))), "untagged"),
+            (engine("system-crypta-61001", wg, 61001, routed(grants(gw(), Some("OTHER")))), "another tag"),
+            (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.51/32".into(), port: Some(443), udp: false }], Some("CRYPTA_OUTER")))), "tcp"),
+            (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.0/24".into(), port: Some(51820), udp: true }], Some("CRYPTA_OUTER")))), "a subnet"),
+            (engine("system-crypta-61001", wg, 61001, routed(grants(vec![NetDest { cidr: "198.51.100.51/32".into(), port: None, udp: true }], Some("CRYPTA_OUTER")))), "any port"),
+            (engine("system-crypta-61001", wg, 61001, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: None }), "anywhere"),
+            (engine("system-crypta-61001", wg, 61002, routed(grants(gw(), Some("CRYPTA_OUTER")))), "uid not the name's"),
+            (engine("system-crypta-60999", wg, 60999, routed(grants(gw(), Some("CRYPTA_OUTER")))), "below the range"),
+            (engine("system-crypta-61001", "/usr/local/bin/atrium-svc", 61001, routed(grants(gw(), Some("CRYPTA_OUTER")))), "another binary"),
+            (mlock, "locked memory"),
+        ] {
+            assert!(!is_crypta_engine(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+        // A print worker asking for the engines' tag: refused.
+        let mut ipp = engine("system-prelum-62002", "/usr/local/bin/atrium-prelum-ipp", 62002,
+            routed(grants(vec![NetDest { cidr: "192.168.1.20/32".into(), port: Some(631), udp: false }], Some("CRYPTA_OUTER"))));
+        assert!(validate_create(&ipp, &p).is_err(), "only engines tag their flows");
+        if let NetworkConfig::Routed { grants: Some(g), .. } = &mut ipp.network {
+            g.tag = None;
+        }
+        validate_create(&ipp, &p).expect("the same worker untagged");
     }
 
     /// Network share servers: exactly the policy's name, root, binary, uid

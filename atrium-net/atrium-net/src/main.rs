@@ -42,6 +42,7 @@ mod imp {
     use aura_ipc::sock::{self, poll_read, Conn};
     use aura_ipc::{fmt_mac, Got, Line, Reader};
     use net_proto::{check_dns6, check_lease6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
+    use net_proto::tunnel::{check_tunnel, render_anchor, AnchorTunnel, Net4, Tunnel};
     use std::io;
     use atrium_netconf::{check_dns, lines as nlines, tls_name_ok, Manual};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -314,6 +315,26 @@ mod imp {
         subscribed: bool,
     }
 
+    /// A VPN tunnel held for cryptad (vpn.md §5): its tun stays open here
+    /// while the tunnel is on, so its routes outlive an engine that dies
+    /// and nothing goes around it meanwhile.
+    struct Tun {
+        id: String,
+        iface: String,
+        fd: std::os::fd::OwnedFd,
+        /// Includes sent with `tunnel-routes`, for the next `tunnel-apply`.
+        staged: Vec<Net4>,
+        applied: Option<Tunnel>,
+        /// Routes added into the tunnel: (destination, prefix, via).
+        routes: Vec<(Ipv4Addr, u8, Ipv4Addr)>,
+        /// The gateway's host route: (gateway, router, our address).
+        pin: Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>,
+        /// unbound forward zones set for it.
+        zones: Vec<String>,
+    }
+
+    const MAX_TUNNELS: usize = 8;
+
     struct Net {
         v: bool,
         t0: Instant,
@@ -378,6 +399,11 @@ mod imp {
         egress_group: Option<String>,
         ports_seen: Vec<String>,
         group_synced: bool,
+        tunnels: Vec<Tun>,
+        /// The `atrium/vpn` anchor as last loaded, and the egress it named.
+        anchor: Option<(String, Option<String>)>,
+        /// unbound restarted: the tunnels' zones are to be set again.
+        zones_lost: bool,
     }
 
     /// How long a Wi-Fi address outlives the link.
@@ -445,6 +471,12 @@ mod imp {
                         Err(e) if matches!(e.raw_os_error(), Some(libc::EADDRNOTAVAIL) | Some(libc::ESRCH)) => Ok(()),
                         r => r,
                     },
+                    Action::AddRoute(r) if r.prefix > 0 && self.full_tunnel().is_some() => {
+                        // TunnelVision (vpn.md §6): while a full tunnel is
+                        // up, no route from a lease beyond its own subnet.
+                        self.log(&format!("{ifname}: route {}/{} from the lease not applied: a full tunnel is up", r.dst, r.prefix));
+                        continue;
+                    }
                     Action::AddRoute(r) => {
                         // With multipath routing (on by default) RTM_ADD of a
                         // second default adds a path beside the old one; the
@@ -481,6 +513,28 @@ mod imp {
         /// after '%'). Kept as is when nothing is known (an empty list would
         /// leave unbound resolving from the roots).
         fn forward(&mut self) {
+            // A full tunnel's DNS servers take every name (vpn.md §5.5);
+            // without any, unbound resolves from the roots, through it.
+            if let Some(dns) = self.full_tunnel().map(|t| t.dns.clone()) {
+                let list: Vec<String> = if dns.is_empty() { vec!["off".into()] } else { dns.iter().map(|a| a.to_string()).collect() };
+                if list == self.forwarders {
+                    return;
+                }
+                let c = format!("forward {}", list.join(" "));
+                match self.unbound.as_ref().map(|u| u.cmd(&c)) {
+                    None => {
+                        self.log(&format!("no unbound: would {c}"));
+                        self.forwarders = list;
+                    }
+                    Some(Ok(s)) if s.trim_end() == "ok" => {
+                        self.log(&format!("unbound: {c} (tunnel)"));
+                        self.forwarders = list;
+                    }
+                    Some(Ok(s)) => eprintln!("atrium-net: unbound said {:?}", s.trim_end()),
+                    Some(Err(e)) => eprintln!("atrium-net: unbound: {e}"),
+                }
+                return;
+            }
             // Own servers over TLS: port 853 and the name unbound checks the
             // certificate against.
             let tls = self.dns_tls.clone().filter(|_| !self.own_dns.is_empty());
@@ -544,7 +598,10 @@ mod imp {
             let up = u.cmd("status").ok().and_then(|s| unbound_uptime(&s));
             let restarted = up.is_some_and(|t| t < self.unbound_up);
             self.unbound_up = up.unwrap_or(0);
-            let mut want: Vec<String> = self.forwarders.iter().map(|x| x.split(['%', '@']).next().unwrap_or(x).to_string()).collect();
+            if restarted {
+                self.zones_lost = true;
+            }
+            let mut want: Vec<String> = self.forwarders.iter().filter(|x| *x != "off").map(|x| x.split(['%', '@']).next().unwrap_or(x).to_string()).collect();
             let mut have = have;
             want.sort();
             have.sort();
@@ -552,6 +609,12 @@ mod imp {
                 self.log(&format!("unbound forwards {:?}{}, not ours: setting them again", have, if restarted { " (restarted)" } else { "" }));
                 self.forwarders.clear();
                 self.forward();
+            }
+            if std::mem::take(&mut self.zones_lost) {
+                for k in 0..self.tunnels.len() {
+                    self.tunnels[k].zones.clear();
+                    self.tunnel_zones(k);
+                }
             }
         }
 
@@ -607,6 +670,10 @@ mod imp {
             }
             if cur != self.announced || !self.group_synced {
                 self.sync_egress_group(cur);
+            }
+            if !self.tunnels.is_empty() {
+                self.tunnel_pins();
+                self.tunnel_anchor();
             }
             if cur != self.announced {
                 self.announced = cur;
@@ -689,6 +756,11 @@ mod imp {
                     self.unpin(&j.pins);
                     self.prober = None;
                 }
+                return;
+            }
+            // Under a full tunnel the probe's packets would go into it (or
+            // be blocked): what it found would say nothing about this network.
+            if self.full_tunnel().is_some() {
                 return;
             }
             let Some(k) = (0..self.ifs.len()).find(|&k| {
@@ -1248,6 +1320,7 @@ mod imp {
             }
             match l.verb.as_str() {
                 "status" => self.status(),
+                "tunnel-open" | "tunnel-routes" | "tunnel-apply" | "tunnel-close" => self.tunnel_ctl(l),
                 // Printer discovery's sockets (printing.md §7.1) on the
                 // active interface; only atrium-netconf's root-only
                 // `print-discovery` socket asks for them.
@@ -1503,8 +1576,299 @@ mod imp {
                 }
                 v.push(l);
             }
+            for t in &self.tunnels {
+                let mut l = Line::new("tunnel").with("id", &t.id).with("iface", &t.iface).with("applied", t.applied.is_some() as u8);
+                if let Some(a) = &t.applied {
+                    l = l
+                        .with("addr", a.addrs.iter().map(Net4::to_string).collect::<Vec<_>>().join(","))
+                        .with("full", a.full as u8)
+                        .with("block", a.block as u8)
+                        .with("gw", format!("{}:{}", a.gateway, a.port))
+                        .with("routes", t.routes.len())
+                        .with("pinned", t.pin.is_some() as u8)
+                        .with("zones", t.zones.len());
+                }
+                v.push(l);
+            }
             v.push(Line::new("ok"));
             v
+        }
+
+        /// The applied full tunnel, if there is one (there is at most one).
+        fn full_tunnel(&self) -> Option<&Tunnel> {
+            self.tunnels.iter().filter_map(|t| t.applied.as_ref()).find(|a| a.full)
+        }
+
+        /// `tunnel-open`, `tunnel-routes`, `tunnel-apply`, `tunnel-close`
+        /// (vpn.md §5): cryptad's proposals, checked here before anything
+        /// changes.
+        fn tunnel_ctl(&mut self, l: &Line) -> Vec<Line> {
+            let err = |why: &str| vec![Line::new("error").with("why", why)];
+            let Some(id) = l.get("id").filter(|i| !i.is_empty() && i.len() <= 32 && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')).map(str::to_string) else {
+                return err("bad-id");
+            };
+            let k = self.tunnels.iter().position(|t| t.id == id);
+            match (l.verb.as_str(), k) {
+                ("tunnel-open", Some(k)) => match self.tunnels[k].fd.try_clone() {
+                    Ok(fd) => {
+                        self.reply_fds = vec![fd];
+                        vec![Line::new("tunnel").with("id", &id).with("iface", &self.tunnels[k].iface), Line::new("ok")]
+                    }
+                    Err(_) => err("dup"),
+                },
+                ("tunnel-open", None) => {
+                    if self.tunnels.len() >= MAX_TUNNELS {
+                        return err("too-many");
+                    }
+                    let (fd, iface) = match self.spawner.tun() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            eprintln!("atrium-net: tunnel {id}: {e}");
+                            return err("no-tun");
+                        }
+                    };
+                    if let Err(e) = self.ifc.up(&iface) {
+                        eprintln!("atrium-net: {iface}: up: {e}");
+                    }
+                    let dup = match fd.try_clone() {
+                        Ok(d) => d,
+                        Err(_) => return err("dup"),
+                    };
+                    self.log(&format!("tunnel {id}: {iface} opened"));
+                    self.tunnels.push(Tun { id: id.clone(), iface: iface.clone(), fd, staged: Vec::new(), applied: None, routes: Vec::new(), pin: None, zones: Vec::new() });
+                    self.reply_fds = vec![dup];
+                    vec![Line::new("tunnel").with("id", &id).with("iface", &iface), Line::new("ok")]
+                }
+                (_, None) => err("no-tunnel"),
+                ("tunnel-routes", Some(k)) => {
+                    let add: Option<Vec<Net4>> = l.get("add").unwrap_or("").split(',').filter(|s| !s.is_empty()).map(Net4::parse).collect();
+                    let Some(add) = add else { return err("malformed") };
+                    let t = &mut self.tunnels[k];
+                    if t.staged.len() + add.len() > net_proto::tunnel::MAX_INCLUDES {
+                        t.staged.clear();
+                        return err("routes");
+                    }
+                    t.staged.extend(add);
+                    vec![Line::new("ok")]
+                }
+                ("tunnel-apply", Some(k)) => {
+                    let staged = std::mem::take(&mut self.tunnels[k].staged);
+                    let Some(mut t) = Tunnel::from_line(l, staged) else { return err("malformed") };
+                    let iface = self.tunnels[k].iface.clone();
+                    if let Err(r) = check_tunnel(&mut t, &self.host_view(&iface)) {
+                        eprintln!("atrium-net: tunnel {id}: refused ({})", r.word());
+                        return err(r.word());
+                    }
+                    // One full tunnel at a time; and no two tunnels with the
+                    // same network.
+                    let others = self.tunnels.iter().enumerate().filter(|(j, _)| *j != k).filter_map(|(_, o)| o.applied.as_ref());
+                    for o in others {
+                        if (t.full && o.full) || t.includes.iter().chain(&t.addrs).any(|n| o.includes.iter().chain(&o.addrs).any(|m| m.contains(n.net()) || n.contains(m.net()))) {
+                            return err("overlap");
+                        }
+                    }
+                    self.tunnel_withdraw(k);
+                    self.tunnels[k].applied = Some(t);
+                    // pf before routes: with block, nothing goes out the
+                    // physical interface from here on but the engine.
+                    if !self.tunnel_anchor() {
+                        self.tunnels[k].applied = None;
+                        self.tunnel_anchor();
+                        return err("pf");
+                    }
+                    self.tunnel_apply(k);
+                    vec![Line::new("ok")]
+                }
+                ("tunnel-close", Some(k)) => {
+                    self.tunnel_withdraw(k);
+                    let t = self.tunnels.remove(k);
+                    self.log(&format!("tunnel {id}: {} closed", t.iface));
+                    drop(t);
+                    self.tunnel_anchor();
+                    self.forward();
+                    vec![Line::new("ok")]
+                }
+                _ => err("bad-request"),
+            }
+        }
+
+        /// Addresses, routes, the gateway's pin and DNS for tunnel k.
+        fn tunnel_apply(&mut self, k: usize) {
+            let Some(t) = self.tunnels[k].applied.clone() else { return };
+            let iface = self.tunnels[k].iface.clone();
+            if let Err(e) = self.ifc.set_mtu(&iface, t.mtu) {
+                eprintln!("atrium-net: {iface}: mtu {}: {e}", t.mtu);
+            }
+            for a in &t.addrs {
+                match self.ifc.add_addr_p2p(&iface, a.addr, a.prefix, a.addr) {
+                    Err(e) if e.raw_os_error() != Some(libc::EEXIST) => eprintln!("atrium-net: {iface}: {a}: {e}"),
+                    _ => {}
+                }
+            }
+            // The gateway's host route first, so the engine's packets never
+            // follow the tunnel's own routes into it.
+            self.tunnel_pins();
+            let via = t.addrs[0].addr;
+            let mut want: Vec<(Ipv4Addr, u8)> = t.addrs.iter().filter(|a| a.prefix < 32).map(|a| (a.net(), a.prefix)).collect();
+            want.extend(t.includes.iter().map(|n| (n.net(), n.prefix)));
+            if t.full {
+                // Two halves, not the default: more specific than any
+                // default route, which stays the egress policy's.
+                want.push((Ipv4Addr::new(0, 0, 0, 0), 1));
+                want.push((Ipv4Addr::new(128, 0, 0, 0), 1));
+            }
+            for (dst, prefix) in want {
+                let r = match self.rt.route(sys::RTM_ADD, dst, prefix, via, via) {
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.rt.route(sys::RTM_CHANGE, dst, prefix, via, via),
+                    r => r,
+                };
+                match r {
+                    Ok(()) => self.tunnels[k].routes.push((dst, prefix, via)),
+                    Err(e) => eprintln!("atrium-net: {iface}: route {dst}/{prefix}: {e}"),
+                }
+            }
+            if t.full {
+                self.lease_routes(false);
+            }
+            self.refresh_host();
+            self.forward();
+            self.tunnel_zones(k);
+            self.log(&format!(
+                "tunnel {}: applied on {iface}: {} route(s){}{}, gateway {}:{}",
+                self.tunnels[k].id,
+                self.tunnels[k].routes.len(),
+                if t.full { ", all traffic" } else { "" },
+                if t.block { ", blocking when not connected" } else { "" },
+                t.gateway,
+                t.port
+            ));
+        }
+
+        /// Undo tunnel k's routes, pin and zones (its tun stays open, its
+        /// pf rules stay until the anchor is written again).
+        fn tunnel_withdraw(&mut self, k: usize) {
+            let was_full = self.tunnels[k].applied.as_ref().is_some_and(|a| a.full);
+            for (dst, prefix, via) in std::mem::take(&mut self.tunnels[k].routes) {
+                let _ = self.rt.route(sys::RTM_DELETE, dst, prefix, via, via);
+            }
+            if let Some((gw, r, ia)) = self.tunnels[k].pin.take() {
+                let _ = self.rt.route(sys::RTM_DELETE, gw, 32, r, ia);
+            }
+            let iface = self.tunnels[k].iface.clone();
+            if let Some(a) = self.tunnels[k].applied.take() {
+                for n in &a.addrs {
+                    let _ = self.ifc.del_addr(&iface, n.addr);
+                }
+            }
+            for z in std::mem::take(&mut self.tunnels[k].zones) {
+                if let Some(u) = &self.unbound {
+                    let _ = u.cmd(&format!("forward_remove {z}"));
+                }
+            }
+            if was_full {
+                self.lease_routes(true);
+                self.forwarders.clear();
+            }
+            self.refresh_host();
+        }
+
+        /// The leases' own routes (DHCP option 121), taken out while a full
+        /// tunnel is up and put back after (vpn.md §6, TunnelVision).
+        fn lease_routes(&mut self, add: bool) {
+            for k in 0..self.ifs.len() {
+                let Some(l) = self.ifs[k].applied.lease.clone() else { continue };
+                for r in l.routes.iter().filter(|r| r.prefix > 0) {
+                    let res = if add { self.rt.route(sys::RTM_ADD, r.dst, r.prefix, r.gw, l.addr) } else { self.rt.route(sys::RTM_DELETE, r.dst, r.prefix, r.gw, l.addr) };
+                    match res {
+                        Ok(()) => self.log(&format!("{}: lease route {}/{} {}", self.ifs[k].name, r.dst, r.prefix, if add { "back" } else { "out while the full tunnel is up" })),
+                        Err(e) if matches!(e.raw_os_error(), Some(libc::EEXIST) | Some(libc::ESRCH)) => {}
+                        Err(e) => eprintln!("atrium-net: {}: lease route {}/{}: {e}", self.ifs[k].name, r.dst, r.prefix),
+                    }
+                }
+            }
+        }
+
+        /// Each applied tunnel's gateway pinned through the current egress
+        /// router (vpn.md §5.3), moved when the egress moves (§5.6).
+        fn tunnel_pins(&mut self) {
+            let via = self.def4.and_then(|(k, r)| self.ifs[k].applied.lease.as_ref().map(|l| (r, l.addr, l.prefix)));
+            for k in 0..self.tunnels.len() {
+                let Some(gw) = self.tunnels[k].applied.as_ref().map(|a| a.gateway) else { continue };
+                // On the egress's own subnet: its connected route is already
+                // more specific than anything of the tunnel's.
+                let want = via.filter(|&(_, ia, p)| !in_net(gw, ia, p)).map(|(r, ia, _)| (gw, r, ia));
+                if self.tunnels[k].pin == want {
+                    continue;
+                }
+                if let Some((g, r, ia)) = self.tunnels[k].pin.take() {
+                    let _ = self.rt.route(sys::RTM_DELETE, g, 32, r, ia);
+                }
+                if let Some((g, r, ia)) = want {
+                    let res = match self.rt.route(sys::RTM_ADD, g, 32, r, ia) {
+                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.rt.route(sys::RTM_CHANGE, g, 32, r, ia),
+                        x => x,
+                    };
+                    match res {
+                        Ok(()) => {
+                            self.log(&format!("tunnel {}: gateway {g} pinned via {r}", self.tunnels[k].id));
+                            self.tunnels[k].pin = want;
+                        }
+                        Err(e) => eprintln!("atrium-net: tunnel {}: gateway route {g}: {e}", self.tunnels[k].id),
+                    }
+                }
+            }
+        }
+
+        /// unbound forward zones for tunnel k's domains (vpn.md §5.5).
+        fn tunnel_zones(&mut self, k: usize) {
+            let Some(a) = self.tunnels[k].applied.clone() else { return };
+            if a.dns.is_empty() {
+                return;
+            }
+            let servers = a.dns.iter().map(Ipv4Addr::to_string).collect::<Vec<_>>().join(" ");
+            for d in &a.domains {
+                if self.tunnels[k].zones.contains(d) {
+                    continue;
+                }
+                let c = format!("forward_add{} {d} {servers}", if a.insecure { " +i" } else { "" });
+                match self.unbound.as_ref().map(|u| u.cmd(&c)) {
+                    Some(Ok(s)) if s.trim_end() == "ok" => {
+                        self.log(&format!("unbound: {c}"));
+                        self.tunnels[k].zones.push(d.clone());
+                    }
+                    Some(Ok(s)) => eprintln!("atrium-net: unbound said {:?} to {c}", s.trim_end()),
+                    Some(Err(e)) => eprintln!("atrium-net: unbound: {e}"),
+                    None => {
+                        self.log(&format!("no unbound: would {c}"));
+                        self.tunnels[k].zones.push(d.clone());
+                    }
+                }
+            }
+        }
+
+        /// Write the `atrium/vpn` anchor for the applied tunnels if it
+        /// changed (vpn.md §5.4). False if pf refused it.
+        fn tunnel_anchor(&mut self) -> bool {
+            let phys = self.def4.map(|(k, _)| self.ifs[k].name.clone());
+            let ts: Vec<(String, Tunnel)> = self.tunnels.iter().filter_map(|t| Some((t.iface.clone(), t.applied.clone()?))).collect();
+            let at: Vec<AnchorTunnel> = ts.iter().map(|(i, a)| AnchorTunnel { iface: i, gateway: a.gateway, port: a.port, full: a.full, block: a.block }).collect();
+            let text = render_anchor(&at, phys.as_deref());
+            if self.anchor.as_ref().is_some_and(|(t, p)| *t == text && *p == phys) {
+                return true;
+            }
+            let blocking = at.iter().any(|t| t.full && t.block);
+            let flush = if blocking { phys.clone().unwrap_or_default() } else { String::new() };
+            match self.spawner.pf_anchor(&text, &flush) {
+                Ok(()) => {
+                    self.log(&format!("pf: atrium/vpn {} ({} tunnel(s){})", if text.is_empty() { "flushed" } else { "loaded" }, at.len(), if blocking { ", blocking when not connected" } else { "" }));
+                    self.anchor = Some((text, phys));
+                    true
+                }
+                Err(e) => {
+                    eprintln!("atrium-net: pf atrium/vpn: {e}");
+                    false
+                }
+            }
         }
 
         /// A checked lease (DHCP's, or a fixed setting's) bound to
@@ -1811,6 +2175,9 @@ mod imp {
             egress_group: o.egress_group.clone(),
             ports_seen: all.iter().map(|i| i.name.clone()).collect(),
             group_synced: false,
+            tunnels: Vec::new(),
+            anchor: None,
+            zones_lost: false,
         };
         // Temporary addresses (RFC 8981) preferred for outgoing connections;
         // stable-private (RFC 7217) for the rest. Before capability mode.

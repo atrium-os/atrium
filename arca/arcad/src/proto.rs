@@ -64,9 +64,16 @@ pub mod op {
     pub const DELETE_FOR: u16 = 0x0C;
     /// X25519 with one of this app's `WireGuardKey` items (vpn.md §4.3):
     /// `id[16] | point[32]` → `shared[32]`. The private key never leaves
-    /// Arca; a low-order point is refused (`MALFORMED`). V1 binds the item
-    /// to a Crypta profile (`crypta:<profile>`) instead of the app.
+    /// Arca; a low-order point is refused (`MALFORMED`). Also the
+    /// `CRYPTA_SERVICE`'s, on its machine-store items.
     pub const DH_X25519: u16 = 0x0D;
+    /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
+    /// machine store (vpn.md §4.3, as built in V1): `MINT` a `WireGuardKey`,
+    /// `STORE` one imported from a `.conf` (32 bytes; the only key kind
+    /// ever stored rather than minted, since the file already held it),
+    /// `PUBKEY` and `DH_X25519` on it. The account is the profile's name;
+    /// cryptad answers each engine only for its own profile's item.
+    pub const CRYPTA_SERVICE: &str = "cryptad";
     /// The service name in `ARCA_SERVICES` that may `TAKE_WIFI`.
     pub const WIFI_SERVICE: &str = "aura-keys";
     /// A trailing byte on `U_HOLD`: the field is a Wi-Fi passphrase field.

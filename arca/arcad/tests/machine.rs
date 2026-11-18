@@ -179,3 +179,64 @@ fn services_are_configured_by_uid() {
     r.registry = reg;
     assert_eq!(r.resolve(65023), Label::Unknown);
 }
+
+/// Crypta's WireGuard keys (vpn.md §4.3): the `cryptad` service mints or
+/// imports one per profile in the machine store and uses it for X25519;
+/// nobody reads it back, and no other service may hold one.
+#[test]
+fn cryptad_keeps_wireguard_keys_it_can_use_and_never_read() {
+    const WG_KEY: u16 = 0x104;
+    const WG_PSK: u16 = 9;
+    let crypta = Label::Service(op::CRYPTA_SERVICE.into());
+    let d = tempfile::tempdir().unwrap();
+    let mut s = machine(&d);
+
+    // Minted: an id and the public key.
+    let r = s.handle(&crypta, op::MINT, &body(|w| { w.u16(WG_KEY); w.u8(AFTER_BOOT); w.str("home"); }));
+    assert_eq!(r.status, status::OK);
+    let (id, public) = (r.body.bytes()[..16].to_vec(), r.body.bytes()[16..48].to_vec());
+    let r = s.handle(&crypta, op::PUBKEY, &id);
+    assert_eq!((r.status, r.body.bytes()), (status::OK, &public[..]));
+
+    // DH with it agrees with the peer's side.
+    let peer = x25519_dalek::StaticSecret::from([9u8; 32]);
+    let peer_pub = x25519_dalek::PublicKey::from(&peer);
+    let mut b = id.clone();
+    b.extend_from_slice(peer_pub.as_bytes());
+    let r = s.handle(&crypta, op::DH_X25519, &b);
+    assert_eq!(r.status, status::OK);
+    let their: [u8; 32] = public.clone().try_into().unwrap();
+    assert_eq!(r.body.bytes(), peer.diffie_hellman(&x25519_dalek::PublicKey::from(their)).as_bytes());
+    // A low-order point: refused.
+    let mut b = id.clone();
+    b.extend_from_slice(&[0u8; 32]);
+    assert_eq!(s.handle(&crypta, op::DH_X25519, &b).status, status::MALFORMED);
+    // Never released.
+    assert_eq!(release(&mut s, &crypta, &id).0, status::NOT_RELEASABLE);
+
+    // Imported from a .conf: stored once, answered with its public key.
+    let secret = [0x42u8; 32];
+    let (st, b) = store(&mut s, &crypta, WG_KEY, AFTER_BOOT, "provider", &secret);
+    assert_eq!(st, status::OK);
+    let want = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
+    assert_eq!(&b[16..48], want.as_bytes());
+    assert_eq!(release(&mut s, &crypta, &b[..16]).0, status::NOT_RELEASABLE);
+    assert_eq!(store(&mut s, &crypta, WG_KEY, AFTER_BOOT, "short", &[1u8; 31]).0, status::MALFORMED);
+    assert_eq!(store(&mut s, &crypta, WG_KEY, AFTER_BOOT, "zero", &[0u8; 32]).0, status::MALFORMED);
+
+    // The preshared key is a bearer item: released to cryptad for the engine.
+    let (st, psk) = store(&mut s, &crypta, WG_PSK, AFTER_BOOT, "provider psk", &[7u8; 32]);
+    assert_eq!(st, status::OK);
+    let (st, v) = release(&mut s, &crypta, &psk);
+    assert_eq!(st, status::OK);
+    assert_eq!(&v[4..], &[7u8; 32]);
+
+    // Another service: no keys of this kind, and none of cryptad's items.
+    let r = s.handle(&vinculum(), op::MINT, &body(|w| { w.u16(WG_KEY); w.u8(AFTER_BOOT); w.str("x"); }));
+    assert_ne!(r.status, status::OK);
+    assert_ne!(store(&mut s, &vinculum(), WG_KEY, AFTER_BOOT, "x", &secret).0, status::OK);
+    let mut b = id.clone();
+    b.extend_from_slice(peer_pub.as_bytes());
+    assert_ne!(s.handle(&vinculum(), op::DH_X25519, &b).status, status::OK);
+    assert_ne!(s.handle(&vinculum(), op::PUBKEY, &id).status, status::OK);
+}

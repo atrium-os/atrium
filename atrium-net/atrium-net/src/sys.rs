@@ -257,6 +257,20 @@ impl Ifc {
         Ok(())
     }
 
+    /// A point-to-point address (a tunnel's): `a` with `prefix`, its far
+    /// end `dst`.
+    pub fn add_addr_p2p(&self, name: &str, a: Ipv4Addr, prefix: u8, dst: Ipv4Addr) -> io::Result<()> {
+        let mut r = [0u8; 68];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        r[16..32].copy_from_slice(&sin(a));
+        r[32..48].copy_from_slice(&sin(dst));
+        r[48..64].copy_from_slice(&sin(Ipv4Addr::from(net_proto::mask(prefix))));
+        if unsafe { ioctl(self.s.as_raw_fd(), SIOCAIFADDR, r.as_mut_ptr()) } != 0 {
+            return err("SIOCAIFADDR");
+        }
+        Ok(())
+    }
+
     pub fn del_addr(&self, name: &str, a: Ipv4Addr) -> io::Result<()> {
         let mut r = ifreq(name);
         r[16..32].copy_from_slice(&sin(a));

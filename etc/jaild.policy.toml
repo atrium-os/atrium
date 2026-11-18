@@ -416,6 +416,22 @@ uid_first   = 62000
 uid_last    = 62499
 
 # ---------------------------------------------------------------
+# Crypta's tunnel engines (docs/spec/vpn.md §3): cryptad (root) asks for one
+# jail per live tunnel, named <name_prefix><uid> at
+# <instance_root_dir>/<name>, running exactly exec_path as that uid with
+# cryptad's socket as its stdio and the tunnel's tun as fd 3 (no device
+# node). Its network is a routed vnet passing only UDP to the gateway's
+# address and port, tagged CRYPTA_OUTER so atrium-net's atrium/vpn anchor
+# lets exactly those flows out past block-when-not-connected. No resolver,
+# nothing inbound. Only these may tag their flows.
+# ---------------------------------------------------------------
+[crypta_engines]
+name_prefix = "system-crypta-"
+exec_path   = "/usr/local/bin/atrium-crypta-wg"
+uid_first   = 61000
+uid_last    = 61499
+
+# ---------------------------------------------------------------
 # Environment variable allow-list for execve. Anything not
 # matching is dropped.
 # ---------------------------------------------------------------

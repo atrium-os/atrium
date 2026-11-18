@@ -1,0 +1,28 @@
+[package]
+name = "crypta-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+crypta-proto = { path = ".." }
+
+[[bin]]
+name = "conf"
+path = "fuzz_targets/conf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

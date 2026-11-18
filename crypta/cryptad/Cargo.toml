@@ -1,0 +1,28 @@
+[package]
+name        = "cryptad"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish     = false
+description = "Crypta's manager (docs/spec/vpn.md §3): WireGuard profiles, one jailed engine per live tunnel, its key's work through Arca, and tunnel proposals to atrium-net."
+
+[[bin]]
+name = "atrium-cryptad"
+path = "src/main.rs"
+
+[dependencies]
+crypta-proto = { path = "../crypta-proto" }
+net-proto    = { path = "../../atrium-net/net-proto" }
+aura-ipc     = { path = "../../aura/aura-ipc" }
+arcad        = { path = "../../arca/arcad" }
+arca-store   = { path = "../../arca/arca-store" }
+libc         = "0.2"
+zeroize      = "1"
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+jaild               = { path = "../../portcullis/jaild" }
+portcullis-identity = { path = "../../portcullis/portcullis-identity" }
+portcullis-mounts   = { path = "../../portcullis/portcullis-mounts" }
+
+[dev-dependencies]
+tempfile = "3"

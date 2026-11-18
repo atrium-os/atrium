@@ -1,0 +1,20 @@
+[package]
+name        = "crypta-engine"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish     = false
+description = "Crypta's WireGuard engine process (docs/spec/vpn.md §3): one per tunnel, in its own jail, on a tun descriptor and one UDP socket; its static key through cryptad, never held."
+
+[[bin]]
+name = "atrium-crypta-wg"
+path = "src/main.rs"
+
+[dependencies]
+crypta-wg    = { path = "../crypta-wg" }
+crypta-proto = { path = "../crypta-proto" }
+libc         = "0.2"
+zeroize      = "1"
+
+[dev-dependencies]
+crypta-wg = { path = "../crypta-wg" }

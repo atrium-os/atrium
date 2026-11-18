@@ -19,6 +19,8 @@ fe80::1, fd77:0:0:88::1 and fd77:0:0:88::53.
 
 Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
   good | hostile | silent   -- DHCP behaviour
+  tunnelvision              -- good leases carrying option 121 routes 128/1,
+                               1/8 and 203.0.113.0/24 via the router
   hostile6 | good6          -- a rogue router fe80::66 sends bad RAs every 2 s
   d6-off | d6-info | d6-addr -- the RAs' O / M+O flags; the DHCPv6 server on
                                fe80::1 answers Information-Requests with DNS
@@ -37,6 +39,14 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
                                the router's 10.88.0.1:80 serves the sign-in page
                                (GET /login: one form; POST /accept: web-ok)
   stats                     -- counters
+  seen                      -- (and seen-reset) every IPv4/IPv6 packet the guest
+                               sent since the last reset, as {"proto dst[:port]": n}
+                               (ARP, DHCP, ND and router solicitations left out):
+                               the VPN gate's leak check (vpn.md §11)
+
+A WireGuard gateway "beyond the router" at 198.51.100.51:51820: the guest's
+UDP to it is relayed to 127.0.0.1:51820 (where crypta-wg-linux-vm.sh's Ubuntu
+VM listens) and the answers come back from 198.51.100.51.
 """
 import json, random, socket, struct, sys
 
@@ -57,6 +67,11 @@ def you():
     return YOU2 if declined else YOU
 
 WEB = bytes([198, 51, 100, 80])  # beyond the router
+WG_GW = bytes([198, 51, 100, 51])  # a WireGuard gateway, also beyond it
+WG_PORT = 51820
+WG_RELAY = ("127.0.0.1", 51820)
+wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
+seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 MAGIC = bytes([99, 130, 83, 99])
 
@@ -148,6 +163,14 @@ HOSTILE = [
 ]
 
 
+# TunnelVision (CVE-2024-3661): a lease whose classless static routes
+# (option 121) are as or more specific than a VPN's 0/1 + 128/1: 128/1,
+# 1/8 and 203.0.113.0/24 (none over the app range, which atrium-net refuses
+# outright).
+TV = [(121, bytes([0]) + ROUTER + bytes([1, 128]) + ROUTER + bytes([8, 1]) + ROUTER
+       + bytes([24, 203, 0, 113]) + ROUTER)]
+
+
 def handle_dhcp(src_mac, req):
     if len(req) < 240 or req[0] != 1 or req[236:240] != MAGIC:
         return []
@@ -184,14 +207,14 @@ def handle_dhcp(src_mac, req):
         stats["last_hostile"] = name
         r = dhcp_reply(req, 2 if kind == 1 else 5, **kw)
     elif kind == 1:
-        r = dhcp_reply(req, 2)
+        r = dhcp_reply(req, 2, extra=TV if mode == "tunnelvision" else None)
     elif kind == 3:
         want = o.get(50, ciaddr)
-        r = dhcp_reply(req, 5 if want == you() else 6)
+        r = dhcp_reply(req, 5 if want == you() else 6, extra=TV if mode == "tunnelvision" else None)
     else:
         return []
-    return [eth(src_mac, RMAC, 0x0800, ip(ROUTER, b"\xff" * 4 if ciaddr == b"\0\0\0\0" else ciaddr, 17,
-                                         udp(ROUTER, b"\xff" * 4, 67, 68, r)))]
+    to = b"\xff" * 4 if ciaddr == b"\0\0\0\0" else ciaddr
+    return [eth(src_mac, RMAC, 0x0800, ip(ROUTER, to, 17, udp(ROUTER, to, 67, 68, r)))]
 
 
 def dns_answer(q):
@@ -653,12 +676,41 @@ def dhcp6(cmac, cll, m):
     return [d6_send(cmac, cll, d6_good(2 if typ == 1 else 7, xid, cid, iaid))]
 
 
-def frame(f):
+def see(typ, p):
+    """Count what the guest sent, by protocol and destination."""
+    if typ == 0x0800 and len(p) >= 20:
+        proto, d = p[9], socket.inet_ntoa(p[16:20])
+        body = p[(p[0] & 15) * 4:]
+        if proto == 17 and len(body) >= 4 and struct.unpack("!H", body[2:4])[0] == 67:
+            return
+        # The kernel's port unreachable for our unicast DHCP answer (atrium-net
+        # takes DHCP by BPF; nothing listens on 68): DHCP's, not a leak.
+        if proto == 1 and len(body) >= 8 + 20 + 4 and body[0] == 3 and body[17] == 17:
+            q = body[8 + (body[8] & 15) * 4:]
+            if len(q) >= 4 and struct.unpack("!HH", q[:4]) == (67, 68):
+                return
+        port = f":{struct.unpack('!H', body[2:4])[0]}" if proto in (6, 17) and len(body) >= 4 else ""
+        k = f"{ {1: 'icmp', 6: 'tcp', 17: 'udp'}.get(proto, proto)} {d}{port}"
+    elif typ == 0x86DD and len(p) >= 40:
+        nxt, d = p[6], socket.inet_ntop(socket.AF_INET6, p[24:40])
+        if nxt == 58 and len(p) > 40 and p[40] in (133, 135, 136, 143):
+            return
+        if nxt == 17 and len(p) >= 44 and struct.unpack("!H", p[42:44])[0] == 547:
+            return
+        k = f"ip6/{nxt} {d}"
+    else:
+        return
+    seen[k] = seen.get(k, 0) + 1
+
+
+def frame(f, relay=None):
+    global wg_peer
     stats["frames"] += 1
     if len(f) < 14:
         return []
     dst, src, typ = f[:6], f[6:12], struct.unpack("!H", f[12:14])[0]
     p = f[14:]
+    see(typ, p)
     if typ == 0x86DD:
         return frame6(src, p)
     if typ == 0x0806 and len(p) >= 28 and p[6:8] == b"\0\x01":
@@ -681,6 +733,11 @@ def frame(f):
         sport, dport = struct.unpack("!HH", body[:4])
         if dport == 67:
             return handle_dhcp(src, body[8:])
+        if d == WG_GW and dport == WG_PORT and relay is not None:
+            stats["wg_out"] = stats.get("wg_out", 0) + 1
+            wg_peer = (src, s, sport)
+            relay.sendto(body[8:], WG_RELAY)
+            return []
         if dport == 5353 and d == MDNS_GROUP:
             return handle_mdns(src, s, sport, body[8:])
         if dport == 53 and d == DNS:
@@ -706,6 +763,8 @@ def main():
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ctl.bind(CTL)
+    relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    relay.bind(("127.0.0.1", 0))
     import select
     print(f"lan: up, lease {LEASE} s", flush=True)
     import time
@@ -727,15 +786,21 @@ def main():
             for out in d6_hostile_push():
                 lan.sendto(out, GUEST)
             next_d6 = now + 1
-        r, _, _ = select.select([lan, ctl], [], [], 0.1 if mode6 == "flap6" else 1.0)
+        r, _, _ = select.select([lan, ctl, relay], [], [], 0.1 if mode6 == "flap6" else 1.0)
         if lan in r:
             f, _ = lan.recvfrom(65536)
-            for out in frame(f):
+            for out in frame(f, relay):
                 lan.sendto(out, GUEST)
+        if relay in r:
+            m, a = relay.recvfrom(65536)
+            if a == WG_RELAY and wg_peer:
+                stats["wg_in"] = stats.get("wg_in", 0) + 1
+                gmac, gip, gport = wg_peer
+                lan.sendto(eth(gmac, RMAC, 0x0800, ip(WG_GW, gip, 17, udp(WG_GW, gip, WG_PORT, gport, m))), GUEST)
         if ctl in r:
             c, a = ctl.recvfrom(256)
             w = c.decode().strip()
-            if w in ("good", "hostile", "silent"):
+            if w in ("good", "hostile", "silent", "tunnelvision"):
                 mode = w
                 print(f"lan: mode {w}", flush=True)
             if w in ("web-ok", "web-dead", "web-captive"):
@@ -749,6 +814,11 @@ def main():
                 d6 = w
                 print(f"lan: {w}", flush=True)
                 lan.sendto(good_ra(), GUEST)
+            if w in ("seen", "seen-reset"):
+                ctl.sendto(json.dumps(seen).encode(), a)
+                if w == "seen-reset":
+                    seen.clear()
+                continue
             ws = w.split()
             if len(ws) == 2 and ws[0] == "mtu":
                 net_mtu = None if ws[1] == "off" else int(ws[1])

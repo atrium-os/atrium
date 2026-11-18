@@ -10,6 +10,10 @@
 //! are reaped by the kernel (SIGCHLD ignored). The spawner exits when
 //! atrium-net's end of its socket closes.
 //!
+//! It also opens tunnels' tun devices (`b'T'`, vpn.md §5) and loads the
+//! `atrium/vpn` pf anchor (`b'F'`, §5.4): capability mode forbids opening
+//! a device by name and running pfctl.
+//!
 //! It also makes printer discovery's two mDNS sockets (`b'M'` and the
 //! interface's IPv4 address; printing.md §7.1): capability mode forbids
 //! bind, and the worker that uses them may not send anywhere else.
@@ -86,7 +90,7 @@ impl Spawner {
 
     /// Start program `kind`; our end of its socket.
     pub fn spawn(&self, kind: u8) -> io::Result<UnixStream> {
-        assert!(!matches!(kind, b'M' | b'S' | b'U'));
+        assert!(!matches!(kind, b'M' | b'S' | b'U' | b'T' | b'F'));
         let mut v = self.ask(&[kind], 1, "spawner could not start it")?;
         Ok(UnixStream::from(v.remove(0)))
     }
@@ -124,6 +128,55 @@ impl Spawner {
         let mut req = vec![b'S'];
         req.extend_from_slice(&port.to_be_bytes());
         Ok(self.ask(&req, 1, "spawner could not make the stub listener")?.remove(0))
+    }
+
+    /// A new tun (`/dev/tun` clones one), in point-to-point mode with the
+    /// 4-byte address family header (TUNSIFHEAD): its descriptor and name.
+    pub fn tun(&self) -> io::Result<(OwnedFd, String)> {
+        let fd = self.ask(&[b'T'], 1, "spawner could not open a tun")?.remove(0);
+        let mut n = [0u8; 1];
+        let s = self.s.as_raw_fd();
+        if !read_exact(s, &mut n) {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let mut name = vec![0u8; n[0] as usize];
+        if !read_exact(s, &mut name) {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let name = String::from_utf8(name).map_err(|_| io::Error::other("tun name"))?;
+        // tunN only: the name goes into ioctls and pf rules.
+        if !name.strip_prefix("tun").is_some_and(|d| !d.is_empty() && d.len() <= 4 && d.bytes().all(|b| b.is_ascii_digit())) {
+            return Err(io::Error::other("tun name"));
+        }
+        Ok((fd, name))
+    }
+
+    /// Load `rules` as the whole `atrium/vpn` anchor (empty: flush it), then
+    /// drop every pf state on `flush_on` (interface name, may be empty), so
+    /// flows opened before a block cannot carry on past it.
+    pub fn pf_anchor(&self, rules: &str, flush_on: &str) -> io::Result<()> {
+        if flush_on.len() > 15 || !flush_on.bytes().all(|b| b.is_ascii_alphanumeric()) || rules.len() > 1 << 20 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut req = vec![b'F', flush_on.len() as u8];
+        req.extend_from_slice(flush_on.as_bytes());
+        req.extend_from_slice(&(rules.len() as u32).to_be_bytes());
+        req.extend_from_slice(rules.as_bytes());
+        let fd = self.s.as_raw_fd();
+        let mut off = 0;
+        while off < req.len() {
+            let n = unsafe { libc::write(fd, req[off..].as_ptr().cast(), req.len() - off) };
+            if n <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            off += n as usize;
+        }
+        let (b, _) = recv_fds(fd)?;
+        if b == b'K' {
+            Ok(())
+        } else {
+            Err(io::Error::other("pfctl refused the anchor"))
+        }
     }
 
     fn ask(&self, req: &[u8], want: usize, why: &str) -> io::Result<Vec<OwnedFd>> {
@@ -277,6 +330,40 @@ fn serve(s: RawFd, progs: &[Prog]) -> ! {
             }
             continue;
         }
+        if k == b'T' {
+            match open_tun() {
+                Ok((t, name)) => {
+                    if send_fds(s, b'K', &[t.as_raw_fd()]).is_ok() {
+                        let mut b = vec![name.len() as u8];
+                        b.extend_from_slice(name.as_bytes());
+                        unsafe { libc::write(s, b.as_ptr().cast(), b.len()) };
+                    }
+                }
+                Err(e) => {
+                    eprintln!("atrium-net spawner: tun: {e}");
+                    let _ = send_fd(s, b'E', None);
+                }
+            }
+            continue;
+        }
+        if k == b'F' {
+            let mut n = [0u8; 1];
+            if !read_exact(s, &mut n) {
+                unsafe { libc::_exit(0) };
+            }
+            let mut iface = vec![0u8; n[0] as usize];
+            let mut len = [0u8; 4];
+            if !read_exact(s, &mut iface) || !read_exact(s, &mut len) {
+                unsafe { libc::_exit(0) };
+            }
+            let mut rules = vec![0u8; u32::from_be_bytes(len) as usize];
+            if !read_exact(s, &mut rules) {
+                unsafe { libc::_exit(0) };
+            }
+            let ok = load_anchor(&rules, &String::from_utf8_lossy(&iface));
+            let _ = send_fd(s, if ok { b'K' } else { b'E' }, None);
+            continue;
+        }
         if k == b'S' {
             let mut p = [0u8; 2];
             if !read_exact(s, &mut p) {
@@ -326,6 +413,77 @@ fn serve(s: RawFd, progs: &[Prog]) -> ! {
         }
         unsafe { libc::close(sv[0]) };
     }
+}
+
+const PFCTL: &str = "/sbin/pfctl";
+const VPN_ANCHOR: &str = "atrium/vpn";
+
+/// `pfctl -a atrium/vpn -f -` with `rules` on its stdin (empty: `-F all`),
+/// then `pfctl -i IFACE -F states` when an interface is named.
+fn load_anchor(rules: &[u8], iface: &str) -> bool {
+    // The spawner ignores SIGCHLD so its children are reaped by the kernel;
+    // pfctl's status is wanted here, so the default for the while. A helper
+    // that exits meanwhile is reaped below.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let ok = run_pfctl(rules, iface);
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+    }
+    ok
+}
+
+fn run_pfctl(rules: &[u8], iface: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let ok = if rules.is_empty() {
+        Command::new(PFCTL).args(["-a", VPN_ANCHOR, "-F", "all"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    } else {
+        match Command::new(PFCTL).args(["-a", VPN_ANCHOR, "-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn() {
+            Ok(mut c) => {
+                let wrote = c.stdin.take().is_some_and(|mut i| i.write_all(rules).is_ok());
+                c.wait().is_ok_and(|s| s.success()) && wrote
+            }
+            Err(_) => false,
+        }
+    };
+    if ok && !iface.is_empty() {
+        let _ = Command::new(PFCTL).args(["-i", iface, "-F", "states"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    ok
+}
+
+#[cfg(target_os = "freebsd")]
+extern "C" {
+    fn fdevname_r(fd: libc::c_int, buf: *mut libc::c_char, len: libc::c_int) -> *mut libc::c_char;
+}
+
+/// TUNSIFHEAD: `_IOW('t', 96, int)`.
+#[cfg(target_os = "freebsd")]
+const TUNSIFHEAD: libc::c_ulong = 0x8000_0000 | (4 << 16) | ((b't' as libc::c_ulong) << 8) | 96;
+
+#[cfg(target_os = "freebsd")]
+fn open_tun() -> io::Result<(OwnedFd, String)> {
+    let fd = unsafe { libc::open(c"/dev/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut buf = [0 as libc::c_char; 32];
+    if unsafe { fdevname_r(fd.as_raw_fd(), buf.as_mut_ptr(), buf.len() as libc::c_int) }.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+    let one: libc::c_int = 1;
+    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSIFHEAD, &one) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fd, name))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn open_tun() -> io::Result<(OwnedFd, String)> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 const CMSG_SPACE: usize = 48;

@@ -1214,6 +1214,7 @@ mod run {
             inbound: vec![],
             // The server is handed the address (share::argv): no DNS.
             no_resolver: true,
+            tag: None,
         };
         let stdio = fuse.is_none();
         Ok(CreateJailRequest {

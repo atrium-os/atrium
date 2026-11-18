@@ -1,0 +1,4 @@
+target
+corpus/*/*
+!corpus/conf/provider.conf
+artifacts

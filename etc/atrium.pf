@@ -18,6 +18,10 @@
 # networked jail unless the host block, the anchor point and the final block
 # are all loaded (jaild/src/routed.rs isolation_loaded).
 set skip on lo0
+# VPN tunnels (docs/spec/vpn.md §5): atrium-net loads atrium/vpn with each
+# up tunnel's nat (apps' traffic it carries leaves as the tunnel's address),
+# so it comes before the egress nat. Its filter rules ride on "atrium/*".
+nat-anchor "atrium/vpn"
 nat on atrium_egress inet from 100.64.0.0/16 to any -> (atrium_egress:0)
 
 # An app never reaches the host itself — any of the host's addresses. First,

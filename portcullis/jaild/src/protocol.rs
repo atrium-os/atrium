@@ -775,6 +775,12 @@ pub struct NetGrants {
     /// (a print worker), where DNS would only be a way out.
     #[serde(default)]
     pub no_resolver: bool,
+    /// A pf tag on the outbound passes, so a later rule can tell these
+    /// flows apart after NAT: Crypta's engines only (`CRYPTA_OUTER`,
+    /// vpn.md §5.4), which alone may reach a VPN gateway outside its
+    /// tunnel. Uppercase letters and `_`, at most 31.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 /// An outbound destination, already resolved: an IPv4 CIDR (`a.b.c.d/n`).

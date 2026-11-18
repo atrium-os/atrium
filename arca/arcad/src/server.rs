@@ -974,7 +974,56 @@ impl State {
                 }
             };
         }
+        let crypta = name == op::CRYPTA_SERVICE;
         match op {
+            // Crypta's WireGuard keys (vpn.md §4.3): minted here, or stored
+            // once from an imported file; then only used.
+            op::MINT if crypta => {
+                let kind = field!(r.u16());
+                let class = field!(r.u8());
+                let account = field!(r.str(caps::ACCOUNT));
+                field!(r.end());
+                if kind != Kind::WireGuardKey as u16 {
+                    return reply(status::UNSUPPORTED);
+                }
+                if class != Class::AfterFirstUnlock as u8 {
+                    return reply(status::UNSUPPORTED);
+                }
+                let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
+                let pk = public_of(Kind::WireGuardKey, &seed);
+                let m = tri!(store.add(NewItem {
+                    persona: MACHINE_PERSONA,
+                    recipient: me.clone(),
+                    class: Class::AfterFirstUnlock,
+                    kind: Kind::WireGuardKey,
+                    provenance: Provenance::ArcaGenerated,
+                    account,
+                    scope: b"",
+                    value: seed.as_ref(),
+                }));
+                *item = Some(m.id);
+                let mut w = Writer::new();
+                w.raw(&m.id.0);
+                w.raw(&pk);
+                ok(w.buf)
+            }
+            op::PUBKEY | op::DH_X25519 if crypta => {
+                let id = ItemId(field!(r.array::<16>()));
+                let point = if op == op::DH_X25519 { Some(field!(r.array::<32>())) } else { None };
+                field!(r.end());
+                *item = Some(id);
+                let (m, secret) = tri!(store.release(&id, &who, None));
+                if m.kind != Kind::WireGuardKey {
+                    return reply(status::UNSUPPORTED);
+                }
+                match point {
+                    None => ok(public_of(m.kind, &secret).to_vec()),
+                    Some(p) => match x25519(&secret, &p) {
+                        Some(shared) => ok(shared.to_vec()),
+                        None => malformed(),
+                    },
+                }
+            }
             op::STORE => {
                 let kind = field!(r.u16());
                 let class = field!(r.u8());
@@ -985,6 +1034,30 @@ impl State {
                 // The machine store has one class: after boot.
                 if class != Class::AfterFirstUnlock as u8 {
                     return reply(status::UNSUPPORTED);
+                }
+                if crypta && kind == Kind::WireGuardKey {
+                    // A key from an imported .conf: 32 bytes, a usable
+                    // scalar (not all zero), answered with its public key.
+                    let Ok(b) = <[u8; 32]>::try_from(value) else { return malformed() };
+                    if b == [0; 32] {
+                        return malformed();
+                    }
+                    let m = tri!(store.add(NewItem {
+                        persona: MACHINE_PERSONA,
+                        recipient: me.clone(),
+                        class: Class::AfterFirstUnlock,
+                        kind,
+                        provenance: Provenance::UserTyped,
+                        account,
+                        scope: b"",
+                        value,
+                    }));
+                    *item = Some(m.id);
+                    let (_, secret) = tri!(store.release(&m.id, &who, None));
+                    let mut w = Writer::new();
+                    w.raw(&m.id.0);
+                    w.raw(&public_of(kind, &secret));
+                    return ok(w.buf);
                 }
                 if kind.shape() != Shape::Bearer || kind == Kind::Cookie {
                     return reply(status::UNSUPPORTED);

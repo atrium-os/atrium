@@ -152,6 +152,7 @@ impl Launcher for Jailed {
             peers: vec![],
             inbound: vec![],
             no_resolver: true,
+            tag: None,
         };
         let mac = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(e.to_string()))?.mac;
         let err = io::stderr();

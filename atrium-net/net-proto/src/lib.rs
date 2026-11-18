@@ -6,6 +6,8 @@
 //! applied only if [`check_v4`] accepts it, and the interface otherwise keeps
 //! its last good state.
 
+pub mod tunnel;
+
 use aura_ipc::Line;
 use std::net::Ipv4Addr;
 
