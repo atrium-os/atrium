@@ -273,7 +273,7 @@ As built (N2):
   can't show TLS). `atrium-netctl dns A,B tls NAME`. Gate `atrium-net-gate.sh n0`
   61/61: a second unbound on 192.0.2.53:853 (lo1) with a test CA answers; nothing
   reaches the LAN's DNS; refused without a bundle; a wrong name SERVFAILs; back after an
-  unbound restart; off again. Not yet: a Curia switch for it.
+  unbound restart; off again. Curia's DNS servers row has the name field (curia.md §3).
 - The Insula broker and Nuntius already resolve on the host; they now get the cache and
   validation for free.
 

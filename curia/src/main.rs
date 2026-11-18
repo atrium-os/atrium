@@ -270,9 +270,10 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
             Want::Leave => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.leave().map_err(e)) },
             Want::Forget(s) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.forget(s).map_err(e)) },
             Want::Save(p) => Got::Done { what: w.clone(), result: connect(Grant::Wifi).and_then(|mut c| c.set_profile(p).map_err(e)) },
-            Want::Routes => Got::OwnDns(connect(Grant::Details).and_then(|mut c| c.routes().map(|r| r.own_dns).map_err(e))),
+            Want::Routes => Got::OwnDns(connect(Grant::Details).and_then(|mut c| c.routes().map(|r| (r.own_dns, r.dns_tls)).map_err(e))),
             Want::SetStatic(s) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_static(s).map_err(e)) },
             Want::SetDns(v) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_dns(v).map_err(e)) },
+            Want::SetDnsTls(t) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_dns_tls(t).map_err(e)) },
         };
         let _ = tx.send(g);
     });

@@ -63,7 +63,8 @@ pub struct CuriaView {
     pub persona_scroll: Mutable<ScrollState>,
     /// The IP settings row's address, router and DNS fields, then the DNS
     /// servers row's field.
-    pub net_fields: [Mutable<TextEdit>; 4],
+    /// Address, router, DNS of a fixed setting; own DNS servers; their TLS name.
+    pub net_fields: [Mutable<TextEdit>; 5],
     pub net_scroll: Mutable<ScrollState>,
     /// Arca's Wi-Fi passphrase field (curia.md §4): Arca draws it and takes
     /// its keys; Curia only reserves its place and gets a handle.
@@ -453,14 +454,19 @@ impl CuriaView {
             }
         }
         // The machine's own DNS servers.
-        let now = if p.own_dns.is_empty() { "Each network's own".to_string() } else { p.own_dns.join(", ") };
+        let now = match (&p.dns_tls, p.own_dns.is_empty()) {
+            (_, true) => "Each network's own".to_string(),
+            (Some(n), false) => format!("{}, encrypted ({n})", p.own_dns.join(", ")),
+            (None, false) => p.own_dns.join(", "),
+        };
         text(ctx, x0 + em(12.0), y + rh / 2.0, "DNS servers", type_size::SM, Weight::Medium, t.text_primary());
         text(ctx, x0 + em(220.0), y + rh / 2.0, &now, type_size::SM, Weight::Regular, t.text_secondary());
         let label = if p.dns_editing { "Close" } else { "Change" };
         let bw = width(label, type_size::SM, Weight::Medium) + em(24.0);
-        let (pg, f, cur) = (self.page.clone(), self.net_fields[3].clone(), p.own_dns.join(", "));
+        let (pg, f, ft, cur, curt) = (self.page.clone(), self.net_fields[3].clone(), self.net_fields[4].clone(), p.own_dns.join(", "), p.dns_tls.clone().unwrap_or_default());
         button(ctx, x0 + pw - bw, y + (rh - em(30.0)) / 2.0, label, Look::Ghost, true, move || {
             f.set(TextEdit::new(&cur));
+            ft.set(TextEdit::new(&curt));
             with(&pg, NetPage::edit_dns);
         });
         y += rh;
@@ -474,17 +480,41 @@ impl CuriaView {
                 .autofocus(true)
                 .at(fx, fy)
                 .width(fw)
-                .on_submit(move |v| with(&pg, |p| p.save_dns(v)))
+                .on_submit({
+                    let ft = self.net_fields[4].clone();
+                    move |v| {
+                        let n = ft.get_cloned().text().to_string();
+                        with(&pg, |p| p.save_dns(v, &n))
+                    }
+                })
                 .render(ctx);
+            // Encrypted DNS (DNS over TLS): the name on the servers'
+            // certificate. Strict: no plain DNS if it doesn't match.
+            let ty = fy + em(40.0);
+            text(ctx, fx, ty + em(8.0), "Encrypted (DNS over TLS)", type_size::SM, Weight::Medium, t.text_primary());
+            let ty = ty + em(22.0);
             let (pg, f) = (self.page.clone(), self.net_fields[3].clone());
+            pergola::widgets::TextField::new(self.net_fields[4].clone())
+                .placeholder("server name, e.g. dns.quad9.net (empty: off)")
+                .at(fx, ty)
+                .width(fw)
+                .on_submit(move |n| {
+                    let v = f.get_cloned().text().to_string();
+                    with(&pg, |p| p.save_dns(&v, n))
+                })
+                .render(ctx);
+            let (pg, f, ft) = (self.page.clone(), self.net_fields[3].clone(), self.net_fields[4].clone());
             let bx = fx + fw + em(8.0);
             let sw = button(ctx, bx, fy + em(1.0), "Save", Look::Primary, true, move || {
                 let v = f.get_cloned().text().to_string();
-                with(&pg, |p| p.save_dns(&v));
+                let n = ft.get_cloned().text().to_string();
+                with(&pg, |p| p.save_dns(&v, &n));
             });
             let pg = self.page.clone();
             button(ctx, bx + sw + em(8.0), fy + em(1.0), "Cancel", Look::Ghost, true, move || with(&pg, NetPage::cancel_edit));
-            y = fy + em(40.0);
+            y = ty + em(40.0);
+            text(ctx, fx, y + em(6.0), "With a name, lookups go only to these servers over TLS. If their certificate doesn't match, nothing resolves.", type_size::XS, Weight::Regular, t.text_secondary());
+            y += em(22.0);
             if let Some(e) = &p.edit_error {
                 text(ctx, fx, y + em(6.0), e, type_size::XS, Weight::Regular, t.danger_fg());
                 y += em(22.0);
@@ -1627,14 +1657,22 @@ mod tests {
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 0, metered: false, manual: Some(m) }])));
         let em0 = Iface { name: "em0".into(), wifi: false, link: "up".into(), addr: Some("192.168.1.9/24".into()), router: None, dns: vec![], mac: String::new(), addrs6: vec![], dns6: vec![], online: Online::Yes, metered: false, egress: true, manual: None };
         p.apply(Got::Details(Ok(vec![em0])));
-        p.apply(Got::OwnDns(Ok(vec!["9.9.9.9".into()])));
+        p.apply(Got::OwnDns(Ok((vec!["9.9.9.9".into()], Some("dns.quad9.net".into())))));
         p.toggle_details();
         p.edit_ip(atrium_netconf::Target::Wired("em0".into()));
         p.edit_error = Some("\"10.0.0.300\" is not an IPv4 address".into());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
         let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
         let all = texts(&v);
-        for want in ["IP settings", "home (Wi-Fi)", "Fixed: 10.0.0.5/24", "em0 (Ethernet)", "Automatic (DHCP)", "Use this address", "Automatic", "Close", "DNS servers", "9.9.9.9", "\"10.0.0.300\" is not an IPv4 address"] {
+        for want in ["IP settings", "home (Wi-Fi)", "Fixed: 10.0.0.5/24", "em0 (Ethernet)", "Automatic (DHCP)", "Use this address", "Automatic", "Close", "DNS servers", "9.9.9.9, encrypted (dns.quad9.net)", "\"10.0.0.300\" is not an IPv4 address"] {
+            assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
+        }
+        // The DNS servers row open: the encrypted DNS field and what it does.
+        let mut p = v.page.get_cloned();
+        p.edit_dns();
+        v.page.set(p);
+        let all = texts(&v);
+        for want in ["Encrypted (DNS over TLS)", "Save", "With a name, lookups go only to these servers over TLS. If their certificate doesn't match, nothing resolves."] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
         }
     }

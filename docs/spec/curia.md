@@ -59,6 +59,10 @@ service is not reachable says so in place ("atrium-net is not running") and offe
   page, DNS servers 9.9.9.9, back to Automatic (a fresh DHCP lease).
 - **DNS servers** (`network-configure`): "Each network's own" or the machine's own list,
   and Change: one field (up to 3, IPv4 or IPv6; empty goes back to each network's).
+  Below it, **Encrypted (DNS over TLS)**: the name on the servers' certificate (e.g.
+  `dns.quad9.net`; empty: off), sent as `SET_DNS_TLS` (atrium-net.md §6). Strict, and the
+  row says so: with a name, nothing resolves if the certificate doesn't match. The row
+  reads "9.9.9.9, encrypted (dns.quad9.net)" while on. Built 2026-11-18.
 - **Wi-Fi country** (`network-configure`): a list of countries.
 
 ## 4. The passphrase

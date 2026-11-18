@@ -3,7 +3,7 @@
 //! the requests the page wants made. `main.rs` makes them on a thread and
 //! feeds the answers back with [`NetPage::apply`].
 
-use atrium_netconf::{check_dns, Iface, Link, Manual, Nearby, Online, Profile, SetStatic, Status, Target};
+use atrium_netconf::{check_dns, tls_name_ok, DnsTls, Iface, Link, Manual, Nearby, Online, Profile, SetStatic, Status, Target};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// A request to atrium-netconf.
@@ -26,6 +26,8 @@ pub enum Want {
     SetStatic(SetStatic),
     /// The machine's own DNS servers; empty: each network's.
     SetDns(Vec<IpAddr>),
+    /// The machine's own DNS servers, asked only over TLS (§6).
+    SetDnsTls(DnsTls),
 }
 
 impl std::fmt::Debug for Want {
@@ -42,6 +44,7 @@ impl std::fmt::Debug for Want {
             Want::Routes => write!(f, "Routes"),
             Want::SetStatic(s) => write!(f, "SetStatic({:?})", s.target),
             Want::SetDns(v) => write!(f, "SetDns({v:?})"),
+            Want::SetDnsTls(t) => write!(f, "SetDnsTls({:?}, {})", t.servers, t.name),
         }
     }
 }
@@ -54,7 +57,8 @@ pub enum Got {
     Profiles(Result<Vec<Profile>, String>),
     Details(Result<Vec<Iface>, String>),
     /// The machine's own DNS servers (from the routes).
-    OwnDns(Result<Vec<String>, String>),
+    /// The own DNS servers and, if they are asked over TLS, their name.
+    OwnDns(Result<(Vec<String>, Option<String>), String>),
     /// A join, leave, forget or save finished.
     Done { what: Want, result: Result<(), String> },
 }
@@ -95,6 +99,8 @@ pub struct NetPage {
     pub wants: Vec<Want>,
     /// The machine's own DNS servers (empty: each network's).
     pub own_dns: Vec<String>,
+    /// Set: `own_dns` are asked only over TLS, as this name.
+    pub dns_tls: Option<String>,
     /// The IP settings row that is open: a saved network or a wired port.
     pub ip_editing: Option<Target>,
     /// The DNS servers row is open.
@@ -145,6 +151,23 @@ pub fn parse_dns(s: &str) -> Result<Vec<IpAddr>, String> {
     let v = list(s, "an IP address")?;
     check_dns(&v).map_err(|f| f.1)?;
     Ok(v)
+}
+
+/// The DNS servers row: the servers, and the name to ask them as over TLS
+/// (empty: plain DNS).
+pub fn parse_dns_row(servers: &str, tls: &str) -> Result<Want, String> {
+    let v = parse_dns(servers)?;
+    let name = tls.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return Ok(Want::SetDns(v));
+    }
+    if v.is_empty() {
+        return Err("Encrypted DNS needs the servers' addresses too".into());
+    }
+    if !tls_name_ok(&name) {
+        return Err(format!("\"{}\" is not a server name like dns.example.net", tls.trim()));
+    }
+    Ok(Want::SetDnsTls(DnsTls { servers: v, name }))
 }
 
 /// How long a press on Join waits for Arca's handle.
@@ -375,13 +398,14 @@ impl NetPage {
         self.dns_editing = !self.dns_editing;
     }
 
-    /// Save pressed on the DNS servers row; empty: each network's again.
-    pub fn save_dns(&mut self, typed: &str) {
-        match parse_dns(typed) {
-            Ok(v) => {
+    /// Save pressed on the DNS servers row; no servers: each network's
+    /// again. A server name: asked only over TLS, as that name.
+    pub fn save_dns(&mut self, typed: &str, tls: &str) {
+        match parse_dns_row(typed, tls) {
+            Ok(w) => {
                 self.edit_error = None;
                 self.dns_editing = false;
-                self.wants.push(Want::SetDns(v));
+                self.wants.push(w);
             }
             Err(e) => self.edit_error = Some(e),
         }
@@ -416,7 +440,10 @@ impl NetPage {
             Got::Profiles(Err(_)) => {}
             Got::Details(Ok(v)) => self.ifaces = v,
             Got::Details(Err(_)) => {}
-            Got::OwnDns(Ok(v)) => self.own_dns = v,
+            Got::OwnDns(Ok((v, tls))) => {
+                self.own_dns = v;
+                self.dns_tls = tls;
+            }
             Got::OwnDns(Err(_)) => {}
             Got::Done { what, result } => {
                 match (&what, &result) {
@@ -458,6 +485,18 @@ impl NetPage {
                             error: false,
                         });
                         self.wants.push(Want::Routes);
+                    }
+                    (Want::SetDnsTls(t), Ok(())) => {
+                        let a = t.servers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                        self.notice = Some(Notice { text: format!("DNS servers: {a}, encrypted ({})", t.name), error: false });
+                        self.wants.push(Want::Routes);
+                    }
+                    (Want::SetDnsTls(_), Err(e)) => {
+                        let why = match e.as_str() {
+                            "no-tls-bundle" => "the system has no certificates to check the servers with".to_string(),
+                            w => w.replace('-', " "),
+                        };
+                        self.notice = Some(Notice { text: format!("Could not turn on encrypted DNS: {why}"), error: true });
                     }
                     (_, Err(e)) => self.notice = Some(Notice { text: format!("Did not work: {e}"), error: true }),
                     _ => {}
@@ -582,15 +621,36 @@ mod tests {
         assert_eq!(p.take_wants(), vec![Want::SetStatic(SetStatic { target: Target::Wired("em0".into()), manual: None })], "automatic ignores the fields");
 
         p.edit_dns();
-        p.save_dns("9.9.9.9");
+        p.save_dns("9.9.9.9", "");
         let w = p.take_wants();
         assert_eq!(w, vec![Want::SetDns(vec!["9.9.9.9".parse().unwrap()])]);
         p.apply(Got::Done { what: w[0].clone(), result: Ok(()) });
         assert!(p.take_wants().contains(&Want::Routes));
-        p.apply(Got::OwnDns(Ok(vec!["9.9.9.9".into()])));
+        p.apply(Got::OwnDns(Ok((vec!["9.9.9.9".into()], None))));
         assert_eq!(p.own_dns, vec!["9.9.9.9".to_string()]);
         p.apply(Got::Done { what: Want::SetDns(vec![]), result: Err("not-allowed".into()) });
         assert!(p.notice.as_ref().unwrap().error);
+
+        // Encrypted: a server name with the addresses.
+        p.take_wants();
+        p.edit_dns();
+        p.save_dns("9.9.9.9, 149.112.112.112", " DNS.Quad9.net. ");
+        let w = p.take_wants();
+        let t = DnsTls { servers: vec!["9.9.9.9".parse().unwrap(), "149.112.112.112".parse().unwrap()], name: "dns.quad9.net".into() };
+        assert_eq!(w, vec![Want::SetDnsTls(t.clone())]);
+        p.apply(Got::Done { what: w[0].clone(), result: Ok(()) });
+        assert_eq!(p.notice.as_ref().unwrap().text, "DNS servers: 9.9.9.9, 149.112.112.112, encrypted (dns.quad9.net)");
+        assert!(p.take_wants().contains(&Want::Routes));
+        p.apply(Got::OwnDns(Ok((vec!["9.9.9.9".into()], Some("dns.quad9.net".into())))));
+        assert_eq!(p.dns_tls.as_deref(), Some("dns.quad9.net"));
+        p.apply(Got::Done { what: Want::SetDnsTls(t), result: Err("no-tls-bundle".into()) });
+        assert_eq!(p.notice.as_ref().unwrap().text, "Could not turn on encrypted DNS: the system has no certificates to check the servers with");
+        p.take_wants();
+        for (servers, name) in [("", "dns.quad9.net"), ("9.9.9.9", "quad9"), ("9.9.9.9", "9.9.9.9"), ("9.9.9.9", "dns quad9.net")] {
+            p.edit_dns();
+            p.save_dns(servers, name);
+            assert!(p.edit_error.is_some() && p.take_wants().is_empty(), "{servers} {name}");
+        }
     }
 
     #[test]
