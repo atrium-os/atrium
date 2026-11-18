@@ -11,6 +11,8 @@ name = "choragus"
 path = "src/lib.rs"
 
 [dependencies]
+# Supervisor-bound listening sockets (docs/spec/fast-boot.md §5).
+atrium-listen = { path = "../atrium-listen" }
 lyra-protocol = { path = "../lyra-protocol" }
 libc = "0.2"
 # The user volume store (<state>/<user>.toml).

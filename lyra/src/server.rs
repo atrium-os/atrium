@@ -31,7 +31,7 @@ use lyra_protocol::device::{DeviceReader, DeviceState, STATE_STREAMING};
 use lyra_protocol::wire::{self, FromEngine, ToEngine};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -880,9 +880,10 @@ fn serve_session(mut conn: UnixStream, gen: u64, cfg: Config, tx: mpsc::Sender<C
 
 /// Bind the socket and accept trusted peers forever (on its own thread).
 pub fn listen(cfg: &Config, tx: mpsc::Sender<Cmd>, writer: Writer) -> io::Result<()> {
-    let _ = std::fs::remove_file(&cfg.socket);
-    let listener = UnixListener::bind(&cfg.socket)?;
-    {
+    // The supervisor's socket if it bound one for us (it may already hold
+    // choragusd's connection in its backlog), else our own.
+    let (listener, origin) = atrium_listen::listener(&cfg.socket)?;
+    if origin == atrium_listen::Origin::Bound {
         // Group-connectable; the directory (owned _lyra, group _choragus, 0750)
         // and the peer-uid check below are what keep everyone else out.
         use std::os::unix::fs::PermissionsExt;

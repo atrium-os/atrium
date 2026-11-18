@@ -439,7 +439,23 @@ pub struct ExecSpec {
     /// `jaild_policy::ExecPaths::instance_root_dir`.
     #[serde(default)]
     pub stdio: bool,
+    /// ★ Listening sockets the supervisor bound for this service before
+    /// starting it (fast-boot.md §5): exactly this many descriptors ride the
+    /// request, in this order, and the service gets them at fd 3, 4, … A
+    /// client that connects before the service is up waits in the listen
+    /// backlog instead of failing, and the supervisor keeps its copies, so a
+    /// restarted service gets the same sockets. Each entry is the socket's
+    /// bound host path; jaild checks that each descriptor is a listening
+    /// AF_UNIX stream socket bound there, under the source of one of this
+    /// request's rw_nullfs mounts (server::check_listen); the service finds them through ATRIUM_LISTEN_FDS and
+    /// ATRIUM_LISTEN_PATHS (in-jail paths). Not with `stdio`
+    /// or FUSE serving. At most [`MAX_LISTEN_FDS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<String>,
 }
+
+/// The most listening sockets one service may be handed (choragusd has 8).
+pub const MAX_LISTEN_FDS: usize = 12;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvPair {

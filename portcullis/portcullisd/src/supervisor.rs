@@ -98,12 +98,35 @@ pub struct ServiceState {
     /// volume-resolved mounts (those live in bootstrap's local
     /// state, not back in the manifest).
     pub create_req: CreateJailRequest,
+    /// The service's supervisor-bound listening sockets (fast-boot.md §5),
+    /// held for its whole life and sent again with every relaunch, so
+    /// clients never see the socket vanish across a restart.
+    pub listeners: Vec<std::os::fd::OwnedFd>,
     /// Tombstone flag. Set by `retire()` instead of removing the
     /// entry, because kqueue's per-kevent `udata` we use is the
     /// services-vec index — removing would invalidate other
     /// services' udata. Skipped by run() / process_pending_restarts
     /// / process_kqueue_exit.
     pub retired: bool,
+}
+
+/// Send a CreateJail, with the service's listening sockets riding on it
+/// when it has any (ExecSpec::listen). Same reply shape as `Client::send`:
+/// the response and the procdesc, if one came back.
+pub fn send_create(c: &mut Client, req: &Request, listeners: &[std::os::fd::OwnedFd])
+    -> io::Result<(Response, Option<i32>)>
+{
+    if listeners.is_empty() {
+        return c.send(req);
+    }
+    use std::os::fd::AsFd;
+    let fds: Vec<_> = listeners.iter().map(|f| f.as_fd()).collect();
+    let (resp, mut got) = c.send_with_fds(req, &fds, 1)?;
+    let procdesc = if got.is_empty() { None } else { Some(got.remove(0)) };
+    for extra in got {
+        let _ = crate::host_mount::close_fd(extra);
+    }
+    Ok((resp, procdesc))
 }
 
 #[cfg(target_os = "freebsd")]
@@ -280,6 +303,7 @@ impl Supervisor {
         procdesc_fd: i32,
         pid:         i32,
         create_req:  CreateJailRequest,
+        listeners:   Vec<std::os::fd::OwnedFd>,
     ) -> io::Result<()> {
         let idx = self.services.len();
         ffi::register_procdesc_exit(self.kq, procdesc_fd, idx)?;
@@ -294,6 +318,7 @@ impl Supervisor {
             burst_pause_until: None,
             failure_budget_remaining: initial_budget,
             create_req,
+            listeners,
             retired: false,
         });
         Ok(())
@@ -609,14 +634,18 @@ impl Supervisor {
         info!("{}: restarting", name);
 
         debug!("{}: sending CreateJail", name);
+        // Take the sockets out for the call (ensure_client borrows self).
+        let listeners = std::mem::take(&mut self.services[idx].listeners);
         let send_result = match self.ensure_client() {
-            Ok(c)  => c.send(&req),
+            Ok(c)  => send_create(c, &req, &listeners),
             Err(e) => {
                 error!("{}: relaunch reconnect to jaild: {e}", name);
                 self.services[idx].procdesc_fd = -1;
+                self.services[idx].listeners = listeners;
                 return;
             }
         };
+        self.services[idx].listeners = listeners;
         match send_result {
             Ok((Response::JailCreated(r), Some(fd))) => {
                 debug!("{}: jaild ok, registering new fd={fd} pid={}",
@@ -683,6 +712,7 @@ mod tests {
                 uid:  1001, gid: 1001,
                 env:  vec![],
             }),
+            sockets: vec![],
             supervision: crate::system_services::Supervision {
                 restart: RestartPolicy::Never,
                 ..Default::default()

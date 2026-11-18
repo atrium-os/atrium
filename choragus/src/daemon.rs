@@ -31,7 +31,7 @@ use portcullis_peer::AppRegistry;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1407,12 +1407,11 @@ pub fn run(cfg: Config) -> io::Error {
         });
     }
     for (path, caps) in &cfg.listeners {
-        let _ = std::fs::remove_file(path);
-        let listener = match UnixListener::bind(path) {
+        let (listener, origin) = match atrium_listen::listener(path) {
             Ok(l) => l,
             Err(e) => return io::Error::new(e.kind(), format!("bind {path}: {e}")),
         };
-        {
+        if origin == atrium_listen::Origin::Bound {
             // Reaching the socket is not what authorizes; the directory (mounted
             // only for jails holding the capability), the registry identity and
             // the grant are.

@@ -70,6 +70,46 @@ source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one
 dest   = "var/run/atrium/app-registry"
 kind   = "ro_nullfs"
 
+# Bound by the supervisor before anything starts (fast-boot.md §5): apps,
+# the bar and limend can connect at once, whatever order services come up in.
+# 0666 as before: the directory (mounted only into jails holding the
+# capability), the registry identity and the grant are what authorize.
+[[sockets]]
+path  = "/atrium/sockets/audio/audio.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/audio-capture/audio-capture.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/audio-monitor/audio-monitor.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/audio-control/audio-control.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/media-control/media-control.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/audio-device/audio-device.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+[[sockets]]
+path  = "/atrium/sockets/audio-attribution/audio-attribution.sock"
+owner = 65017   # _choragus
+group = 65017
+mode  = "0666"
+
 [exec]
 path = "/usr/local/bin/atrium-choragusd"
 argv = ["atrium-choragusd", "--serve", "--limen-uid", "65022"]   # _limen (limen.md §2)

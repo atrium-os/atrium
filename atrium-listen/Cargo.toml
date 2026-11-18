@@ -1,0 +1,12 @@
+[package]
+name        = "atrium-listen"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "A service's listening sockets: the ones its supervisor bound and handed over (docs/spec/fast-boot.md §5), else bound here."
+publish     = false
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

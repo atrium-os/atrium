@@ -143,9 +143,12 @@ pub fn serve(
             }
             return None;
         }
-        /* Up to 3 descriptors per request: a one-shot's stdio (ExecSpec::stdio).
-         * Every other request must carry none — dispatch refuses them. */
-        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES).with_fds(3))
+        /* Up to 3 descriptors per request for a one-shot's stdio
+         * (ExecSpec::stdio), or up to MAX_LISTEN_FDS for a service's
+         * listening sockets (ExecSpec::listen). Every other request must
+         * carry none — dispatch refuses them. */
+        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES)
+            .with_fds(protocol::MAX_LISTEN_FDS.max(3)))
     };
 
     loop {
@@ -221,7 +224,32 @@ fn dispatch(
      * Nothing else rides along. */
     let fuse_control = !wants_stdio && matches!(&req,
         Request::CreateJail(r) if r.fuse.as_ref().is_some_and(|f| f.control));
+    /* ★ And a service's listening sockets (ExecSpec::listen, fast-boot.md
+     * §5): exactly as many as it names. Never with stdio or FUSE serving. */
+    let listen_n = match &req {
+        Request::CreateJail(r) => r.exec.as_ref().map_or(0, |e| e.listen.len()),
+        _ => 0,
+    };
+    if listen_n > 0 && (wants_stdio || matches!(&req, Request::CreateJail(r) if r.fuse.is_some())) {
+        return (Response::PolicyDenied {
+            rule:   "exec.listen.combined".into(),
+            detail: "exec.listen cannot be combined with exec.stdio or fuse".into(),
+        }, Vec::new());
+    }
     let mut fds = fds;
+    let listen: Vec<OwnedFd> = if listen_n > 0 {
+        if listen_n > protocol::MAX_LISTEN_FDS || fds.len() != listen_n {
+            return (Response::PolicyDenied {
+                rule:   "exec.listen.fd_count".into(),
+                detail: format!("exec.listen names {listen_n} socket(s) (at most {}); \
+                                 the request carries {} descriptor(s)",
+                                protocol::MAX_LISTEN_FDS, fds.len()),
+            }, Vec::new());
+        }
+        std::mem::take(&mut fds)
+    } else {
+        Vec::new()
+    };
     let control: Option<OwnedFd> = if fuse_control {
         match <[OwnedFd; 1]>::try_from(std::mem::take(&mut fds)) {
             Ok([fd]) if ffi::is_socket(&fd) => Some(fd),
@@ -260,7 +288,7 @@ fn dispatch(
         Request::Ping => (Response::Ok, Vec::new()),
 
         Request::CreateJail(spec) => {
-            match handle_create(&spec, stdio, control, policy, dry_run, state, state_path) {
+            match handle_create(&spec, stdio, control, listen, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
                     (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
                 }
@@ -794,12 +822,16 @@ fn handle_create(
     req:        &CreateJailRequest,
     stdio:      Option<[OwnedFd; 3]>,
     control:    Option<OwnedFd>,
+    listen:     Vec<OwnedFd>,
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
     state_path: &Path,
 ) -> Result<CreateOutcome, JaildError> {
     validator::validate_create(req, policy)?;
+    if let Some(exec) = &req.exec {
+        check_listen(req, &exec.listen, &listen)?;
+    }
     // The filter the kernel will hold for the jail's whole life
     // (jail-sysfil.md §5.3), resolved once here from the policy.
     let sysfil = validator::resolve_sysfil(req, policy)?;
@@ -1006,7 +1038,7 @@ fn handle_create(
 
     if let Some(exec) = &req.exec {
         let r = handle_create_with_exec(
-            req, exec, stdio, control, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
+            req, exec, stdio, control, listen, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
             policy.mount_sources.max_tmpfs_mb, pre_created, sysfil,
         );
         match &r {
@@ -1316,11 +1348,36 @@ fn stick_root(dir: &str) -> Result<std::fs::File, JaildError> {
     }
 }
 
+/// ExecSpec::listen (fast-boot.md §5.2): every descriptor must be a
+/// listening AF_UNIX stream socket bound at exactly the path named for it,
+/// and that path must lie under the source of one of the request's rw_nullfs
+/// mounts, i.e. in a socket directory the service's jail already sees. So a
+/// caller can hand a service only its own sockets, never an arbitrary one.
+fn check_listen(req: &CreateJailRequest, paths: &[String], fds: &[OwnedFd]) -> Result<(), JaildError> {
+    let refuse = |detail: String| JaildError::PolicyViolation { rule: "exec.listen", detail };
+    if paths.len() != fds.len() {
+        return Err(refuse(format!("{} path(s) for {} descriptor(s)", paths.len(), fds.len())));
+    }
+    for (p, fd) in paths.iter().zip(fds) {
+        if !validator::listen_path_allowed(req, p) {
+            return Err(refuse(format!("{p}: not under one of this jail's rw_nullfs mount sources")));
+        }
+        match ffi::listening_unix_path(fd) {
+            Ok(Some(bound)) if bound == *p => {}
+            Ok(Some(bound)) => return Err(refuse(format!("{p}: the descriptor is bound at {bound}"))),
+            Ok(None) => return Err(refuse(format!("{p}: not a listening AF_UNIX stream socket"))),
+            Err(e) => return Err(refuse(format!("{p}: {e}"))),
+        }
+    }
+    Ok(())
+}
+
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
     stdio:       Option<[OwnedFd; 3]>,
     control:     Option<OwnedFd>,
+    listen:      Vec<OwnedFd>,
     lo0_alias:   Option<String>,
     ip4_addr:    Option<String>,
     ip4_inherit: bool,
@@ -1405,6 +1462,18 @@ fn handle_create_with_exec(
                 [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()])
             {
                 eprintln!("jaild-child[{}]: install caller stdio: {e}", req.name);
+                ffi::child_exit(105);
+            }
+        }
+
+        /* A service's listening sockets (ExecSpec::listen) at fd 3, 4, …,
+         * before jail_attach like every other fd setup. Never together with
+         * FUSE's descriptors (dispatch refuses that), so the slots are free. */
+        if !listen.is_empty() {
+            use std::os::unix::io::AsRawFd;
+            let raw: Vec<i32> = listen.iter().map(|f| f.as_raw_fd()).collect();
+            if let Err(e) = ffi::install_child_fds(&raw) {
+                eprintln!("jaild-child[{}]: install listening sockets: {e}", req.name);
                 ffi::child_exit(105);
             }
         }
@@ -1513,9 +1582,19 @@ fn handle_create_with_exec(
                 exec.uid, exec.gid);
             ffi::child_exit(103);
         }
-        let env_pairs: Vec<(String, String)> = exec.env.iter()
+        let mut env_pairs: Vec<(String, String)> = exec.env.iter()
+            .filter(|p| !p.key.starts_with("ATRIUM_LISTEN_"))
             .map(|p| (p.key.clone(), p.value.clone()))
             .collect();
+        /* Set by jaild, never by the caller: how many sockets sit at fd 3…
+         * and, in order, the path each is bound at as seen inside the jail
+         * (atrium-listen's listener() reads them). */
+        if !exec.listen.is_empty() {
+            env_pairs.push(("ATRIUM_LISTEN_FDS".into(), exec.listen.len().to_string()));
+            env_pairs.push(("ATRIUM_LISTEN_PATHS".into(), exec.listen.iter()
+                .map(|p| validator::listen_path_in_jail(req, p).unwrap_or_default())
+                .collect::<Vec<_>>().join(":")));
+        }
         match ffi::execve(&exec.path, &exec.argv, &env_pairs) {
             Ok(_) => unreachable!("execve returned Ok on success"),
             Err(e) => {
@@ -1541,6 +1620,9 @@ fn handle_create_with_exec(
     /* Likewise the partition and /dev/fuse: the server holds them now. */
     drop(fuse);
     drop(control);
+    /* The service holds its listening sockets now; the supervisor that sent
+     * them keeps its own copies for restarts. */
+    drop(listen);
     /* ★ A pre-created (Routed) jail was made persistent so it could be
      * networked before anything ran in it. Clear that now, so it dies with its
      * processes exactly like a create-and-attach jail. If the child has

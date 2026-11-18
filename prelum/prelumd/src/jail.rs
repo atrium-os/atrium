@@ -216,7 +216,7 @@ impl Jailed {
             mounts: vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")],
             devfs_ruleset: DEVFS_RULESET,
             network,
-            exec: Some(ExecSpec { path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true }),
+            exec: Some(ExecSpec { path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new() }),
             rctl,
             hostname: Some(name(uid)),
             hostid: Some(id.hostid),

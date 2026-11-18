@@ -702,6 +702,34 @@ fn below(path: &str, base: &str) -> bool {
     !base.is_empty() && !rest.is_empty() && !rest.contains('/') && rest != "." && rest != ".."
 }
 
+/// Where a listening socket bound at host `path` appears inside the jail
+/// `req` (ExecSpec::listen), or `None` if it may not be handed to it. It must
+/// be an absolute path with no `.`/`..`/empty segment and no `:` (the
+/// separator of ATRIUM_LISTEN_NAMES), strictly under the source of one of the
+/// request's rw_nullfs mounts, so it lies in a socket directory that jail
+/// already sees and may bind in; the answer is that mount's dest joined with
+/// the rest of the path.
+pub fn listen_path_in_jail(req: &CreateJailRequest, path: &str) -> Option<String> {
+    let rel = path.strip_prefix('/')?;
+    if path.contains(':') || rel.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return None;
+    }
+    req.mounts.iter().filter(|m| m.kind == MountKind::RwNullfs).find_map(|m| {
+        let base = m.source.trim_end_matches('/');
+        let rest = path.strip_prefix(base)?.strip_prefix('/')?;
+        if base.is_empty() || rest.is_empty() {
+            return None;
+        }
+        let dest = m.dest.trim_matches('/');
+        Some(if dest.is_empty() { format!("/{rest}") } else { format!("/{dest}/{rest}") })
+    })
+}
+
+/// Whether [`listen_path_in_jail`] has an answer.
+pub fn listen_path_allowed(req: &CreateJailRequest, path: &str) -> bool {
+    listen_path_in_jail(req, path).is_some()
+}
+
 fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier: bool) -> Result<(), JaildError> {
     if instance_root {
         /* A one-shot's entry: anywhere inside the verified tree it runs in —
@@ -734,6 +762,16 @@ fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier:
         return Err(JaildError::PolicyViolation {
             rule:   "exec.stdio.not_instance",
             detail: "only a one-shot instance root may take the caller's stdio".into(),
+        });
+    }
+
+    /* ★ Listening sockets (ExecSpec::listen) are for long-running services
+     * the supervisor starts, not one-shots. The descriptors themselves are
+     * checked in the server (check_listen), against listen_path_allowed. */
+    if !exec.listen.is_empty() && (instance_root || courier) {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.listen.not_service",
+            detail: "only a service may be handed listening sockets".into(),
         });
     }
 
@@ -956,6 +994,29 @@ mod tests {
         validate_create(&req, &p).unwrap();
     }
 
+    #[test]
+    fn listen_paths_must_lie_under_an_rw_nullfs_source() {
+        let mut r = instance_req("atrium-lyrad", "/var/lib/atrium/jails/lyrad", "/usr/local/bin/atrium-lyrad", false);
+        let m = |source: &str, kind| MountSpec { source: source.into(), dest: "x".into(), kind, size_mb: None, owner: None };
+        r.mounts = vec![m("/usr/local/bin", MountKind::RoNullfs), m("/atrium/sockets/", MountKind::RwNullfs)];
+        assert!(listen_path_allowed(&r, "/atrium/sockets/lyrad/lyrad.sock"));
+        // dest "x" in the helper: where the service finds it inside its jail
+        assert_eq!(listen_path_in_jail(&r, "/atrium/sockets/lyrad/lyrad.sock").as_deref(), Some("/x/lyrad/lyrad.sock"));
+        assert!(!listen_path_allowed(&r, "/atrium/sockets/a:b.sock"));
+        assert!(listen_path_allowed(&r, "/atrium/sockets/x.sock"));
+        // read-only source, outside every source, the source itself, traversal
+        assert!(!listen_path_allowed(&r, "/usr/local/bin/x.sock"));
+        assert!(!listen_path_allowed(&r, "/var/run/atrium/jaild.sock"));
+        assert!(!listen_path_allowed(&r, "/atrium/sockets"));
+        assert!(!listen_path_allowed(&r, "/atrium/sockets/"));
+        assert!(!listen_path_allowed(&r, "/atrium/sockets/../../etc/x.sock"));
+        assert!(!listen_path_allowed(&r, "/atrium/sockets//x.sock"));
+        assert!(!listen_path_allowed(&r, "/atrium/socketsX/x.sock"));
+        assert!(!listen_path_allowed(&r, "atrium/sockets/x.sock"));
+        r.mounts = vec![];
+        assert!(!listen_path_allowed(&r, "/atrium/sockets/x.sock"));
+    }
+
     fn instance_req(name: &str, path: &str, entry: &str, stdio: bool) -> CreateJailRequest {
         CreateJailRequest {
             rctl: None,
@@ -972,6 +1033,7 @@ mod tests {
                 uid:  1001,
                 gid:  1001,
                 stdio,
+                listen: Vec::new(),
             }),
             hostname: None,
             hostid: None,
@@ -1547,6 +1609,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
+            listen: Vec::new(),
         });
         validate_create(&r, &p).unwrap();
     }
@@ -1562,6 +1625,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
+            listen: Vec::new(),
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1579,6 +1643,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
+            listen: Vec::new(),
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1596,6 +1661,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
+            listen: Vec::new(),
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1616,6 +1682,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
+            listen: Vec::new(),
         });
         validate_create(&r, &p).unwrap();
     }
@@ -1807,6 +1874,7 @@ mod tests {
         r.exec = Some(ExecSpec {
             path: path.into(), argv: vec![path.into()], env: vec![],
             uid, gid: uid, stdio: false,
+            listen: Vec::new(),
         });
         r
     }
@@ -2011,6 +2079,7 @@ mod tests {
             uid:  100, // below min_user_uid=1000 and not system
             gid:  100,
             stdio: false,
+            listen: Vec::new(),
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -2025,6 +2094,7 @@ mod tests {
             env:  vec![],
             uid, gid,
             stdio: false,
+            listen: Vec::new(),
         });
         r
     }

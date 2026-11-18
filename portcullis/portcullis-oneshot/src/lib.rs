@@ -443,6 +443,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
             uid:   pw.uid,
             gid:   pw.gid,
             stdio: true,
+            listen: Vec::new(),
         }),
         rctl,
         hostname: Some(manifest.app.id.clone()),

@@ -54,25 +54,32 @@ impl Launcher for AllocLauncher {
     }
 }
 
-/// Wait (bounded) for frescod to become *connectable* — a connect, not a stat
-/// (a socket file can exist while stale or mid-bind and still refuse). Returns
-/// `true` once it's accepting, `false` if it never came up within the budget.
+/// Wait for frescod to become *connectable* — a connect, not a stat (a socket
+/// file can exist while stale or mid-bind and still refuse). Waits as long as
+/// it takes, quietly: exiting after a deadline only made the supervisor
+/// restart us every 16 s for as long as frescod was missing (a headless host,
+/// a slow GPU init), a crash loop that fixed nothing (fast-boot.md §2.0).
+/// Once the supervisor binds frescod's socket ahead of time (§5) the first
+/// connect succeeds at once. Says so every minute while it waits.
 /// $FRESCO_SOCK overrides the path; default is the canonical in-jail socket.
-fn wait_for_frescod() -> bool {
-    // ~15s budget: enough for frescod's cold-boot renderer init, bounded so a
-    // broken/never-starting frescod doesn't make us spin forever.
-    const TRIES: u32 = 30;
+fn wait_for_frescod() {
     let path = std::env::var("FRESCO_SOCK")
         .unwrap_or_else(|_| "/atrium/sockets/fresco/fresco.sock".into());
-    for n in 1..=TRIES {
+    let start = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(20);
+    let mut next_note = std::time::Duration::ZERO;
+    loop {
         if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            eprintln!("ostiarius: frescod ready at {path}");
-            return true;
+            eprintln!("ostiarius: frescod ready at {path} after {} ms", start.elapsed().as_millis());
+            return;
         }
-        if n == 1 { eprintln!("ostiarius: waiting for frescod at {path}…"); }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if start.elapsed() >= next_note {
+            eprintln!("ostiarius: waiting for frescod at {path} ({} s so far)…", start.elapsed().as_secs());
+            next_note += std::time::Duration::from_secs(60);
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_secs(1));
     }
-    false
 }
 
 /// Serve Sigillum's passcode checks (ostiarius::verify) on their own thread,
@@ -160,19 +167,11 @@ fn main() {
         let arca = std::env::var("ARCA_SOCKET")
             .unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
         let mut o = with_sigillum(Ostiarius::new(launcher).with_seat_path(seat).with_arca(arca)); // stub auth (no with_pam)
-        // Gate on the display server being READY before booting the login UI: as
-        // the supervisor, ostiarius sequences startup rather than launching a
-        // doomed vestibulum into a not-yet-up frescod. If frescod never comes up
-        // within the bounded window, GIVE UP cleanly (exit) — there's no useful
-        // GUI session without it, and spinning forever helps no one; the operator
-        // investigates via the serial/ssh console (the CLI fallback) and restarts.
-        if !wait_for_frescod() {
-            eprintln!(
-                "ostiarius: frescod did not come up; giving up. \
-                 Investigate via the serial/ssh console and restart atrium-frescod + atrium-ostiarius."
-            );
-            std::process::exit(1);
-        }
+        // Gate on the display server being READY before booting the login UI:
+        // as the supervisor, ostiarius sequences startup rather than launching
+        // a doomed vestibulum into a not-yet-up frescod. It waits, however
+        // long; the verify and lock sockets above already answer meanwhile.
+        wait_for_frescod();
         // Boot the login UI (vestibulum) first, like the real daemon — so this is
         // a complete boot-to-vestibulum path (jailed), minus PAM. OSTIARIUS_NO_BOOT
         // skips it (e.g. driving login by hand against an already-running UI).

@@ -34,6 +34,7 @@ use log::{error, info, warn};
 use portcullisd::host_mount;
 use portcullisd::init_phase::{self, InitOutcome};
 use portcullisd::jaild_client::Client;
+use portcullisd::listeners;
 use portcullisd::supervisor::{self, Supervisor};
 use portcullisd::system_services::{self, LoadOutcome, ManifestVolumeKind, ServiceManifest};
 use portcullisd::volumes_client;
@@ -220,12 +221,34 @@ fn main() -> ExitCode {
      * persist=0 jail dies. We also remember the jail's mount
      * destinations + name so we can RemoveJail and unmount the
      * leaked host-namespace mounts before exiting. */
-    struct HeldJail { fd: i32, name: String, jail_path: String, mount_dests: Vec<(String, MountKind)> }
+    struct HeldJail { fd: i32, name: String, jail_path: String, mount_dests: Vec<(String, MountKind)>,
+                      _listeners: Vec<std::os::fd::OwnedFd> }
     let mut held: Vec<HeldJail> = Vec::new();
     let mut launch_failures = 0;
 
+    /* Bind every service's [[sockets]] BEFORE starting any service
+     * (fast-boot.md §5): from here on a client's connect succeeds whatever
+     * order the services come up in, and waits until the service accepts.
+     * A service whose sockets cannot be bound starts the old way (binding
+     * them itself) rather than not at all. */
+    let mut bound: std::collections::HashMap<String, Vec<std::os::fd::OwnedFd>> = Default::default();
+    for m in &enabled {
+        if m.sockets.is_empty() { continue; }
+        match listeners::bind_all(&m.sockets) {
+            Ok(fds) => {
+                info!("{}: bound {} socket(s) ahead of launch", m.name, fds.len());
+                bound.insert(m.name.clone(), fds);
+            }
+            Err(e) => warn!("{}: binding its sockets: {e}; it will bind them itself", m.name),
+        }
+    }
+
     'manifest: for m in enabled {
         let mut create_req = m.to_create_request();
+        let listen_fds = bound.remove(&m.name).unwrap_or_default();
+        if listen_fds.is_empty() {
+            if let Some(e) = create_req.exec.as_mut() { e.listen.clear(); }
+        }
 
         /* Resolve [[volumes]] before launching: ask atrium-volumes
          * to provision each persistent volume, then append the
@@ -284,6 +307,7 @@ fn main() -> ExitCode {
                     value: p.value.clone(),
                 }).collect(),
                 stdio: false,
+                listen: Vec::new(),
             };
             let client = match &mut driver {
                 Driver::Once(c)      => c,
@@ -322,8 +346,8 @@ fn main() -> ExitCode {
 
         let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
-            Driver::Once(c)       => c.send(&req),
-            Driver::Supervise(s)  => s.client_mut().send(&req),
+            Driver::Once(c)       => supervisor::send_create(c, &req, &listen_fds),
+            Driver::Supervise(s)  => supervisor::send_create(s.client_mut(), &req, &listen_fds),
         };
         match send_result {
             Ok((Response::JailCreated(r), fd)) => {
@@ -331,13 +355,14 @@ fn main() -> ExitCode {
                     m.name, r.jid, r.pid, r.procdesc_attached);
                 match (fd, &mut driver) {
                     (Some(fd), Driver::Supervise(sup)) => {
-                        if let Err(e) = sup.watch(m, fd, r.pid, saved_req) {
+                        if let Err(e) = sup.watch(m, fd, r.pid, saved_req, listen_fds) {
                             error!("watch register failed: {e}");
                             launch_failures += 1;
                         }
                     }
                     (Some(fd), Driver::Once(_)) => held.push(HeldJail {
                         fd, name: jail_name_for_held, jail_path: jail_path_for_held, mount_dests,
+                        _listeners: listen_fds,
                     }),
                     (None, _) => { /* persistent jail, no fd */ }
                 }

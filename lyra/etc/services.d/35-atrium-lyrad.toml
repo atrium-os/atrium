@@ -52,6 +52,16 @@ source = "/atrium/sockets"                        # rw: lyrad BINDS lyrad/lyrad.
 dest   = "atrium/sockets"
 kind   = "rw_nullfs"
 
+# Bound by the supervisor before anything starts (fast-boot.md §5), so
+# choragusd's connect succeeds however the two are ordered, and survives a
+# lyrad restart. lyrad takes it through atrium-listen (and binds it itself if
+# started by hand).
+[[sockets]]
+path  = "/atrium/sockets/lyrad/lyrad.sock"
+owner = 65016   # _lyra
+group = 65017   # _choragus
+mode  = "0660"
+
 [exec]
 path = "/usr/local/bin/atrium-lyrad"
 argv = ["atrium-lyrad", "--serve"]

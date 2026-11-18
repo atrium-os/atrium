@@ -105,6 +105,12 @@ pub struct ServiceManifest {
     pub allow_tessera_keys: bool,
 
     pub exec: Option<ManifestExec>,
+    /// Listening sockets the supervisor binds BEFORE starting anything and
+    /// hands to the service at fd 3, 4, … (fast-boot.md §5): a client that
+    /// connects early waits in the backlog instead of failing, and a
+    /// restarted service gets the same sockets back.
+    #[serde(default)]
+    pub sockets: Vec<ManifestSocket>,
 
     #[serde(default)]
     pub supervision: Supervision,
@@ -438,6 +444,28 @@ pub struct ManifestExec {
     pub env:  Vec<ManifestEnv>,
 }
 
+/// One `[[sockets]]` entry: a listening Unix socket at a host path under
+/// one of the service's rw_nullfs mount sources, owned and moded as given.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManifestSocket {
+    pub path:  String,
+    #[serde(default)]
+    pub owner: u32,
+    #[serde(default)]
+    pub group: u32,
+    /// Octal, as a string: "0660".
+    #[serde(default = "default_socket_mode")]
+    pub mode:  String,
+}
+
+fn default_socket_mode() -> String { "0600".into() }
+
+impl ManifestSocket {
+    pub fn mode_bits(&self) -> Option<u32> {
+        u32::from_str_radix(self.mode.trim_start_matches("0o"), 8).ok().filter(|m| *m <= 0o777)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ManifestEnv {
     pub key:   String,
@@ -479,6 +507,7 @@ impl ServiceManifest {
                     value: p.value.clone(),
                 }).collect(),
                 stdio: false,
+                listen: self.sockets.iter().map(|k| k.path.clone()).collect(),
             }),
             hostname: None,
             hostid: None,
@@ -663,6 +692,7 @@ mod tests {
             allow_mlock: false,
             allow_tessera_keys: false,
             exec: None,
+            sockets: vec![],
             supervision: Supervision::default(),
             capabilities: Capabilities::default(),
         };
@@ -915,6 +945,22 @@ mod tests {
                     path = "/""#;
         let m2: ServiceManifest = toml::from_str(s2).unwrap();
         assert!(matches!(check_detach_mount(&m2), CapabilityCheck::Denied { .. }));
+    }
+
+    #[test]
+    fn shipped_socket_manifests_parse_and_reach_the_request() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lyrad = ServiceManifest::load(&root.join("lyra/etc/services.d/35-atrium-lyrad.toml")).unwrap();
+        assert_eq!(lyrad.sockets.len(), 1);
+        assert_eq!(lyrad.sockets[0].mode_bits(), Some(0o660));
+        assert_eq!(lyrad.to_create_request().exec.unwrap().listen,
+                   vec!["/atrium/sockets/lyrad/lyrad.sock".to_string()]);
+        let chor = ServiceManifest::load(&root.join("choragus/etc/services.d/36-atrium-choragusd.toml")).unwrap();
+        assert_eq!(chor.sockets.len(), 7);
+        assert!(chor.sockets.iter().all(|k| k.owner == 65017 && k.mode_bits() == Some(0o666)));
+        // A manifest without [[sockets]] hands nothing over.
+        let plain: ServiceManifest = toml::from_str("name = \"atrium-x\"\npath = \"/\"\n[exec]\npath = \"/x\"\nargv = [\"x\"]\nuid = 1\ngid = 1\n").unwrap();
+        assert!(plain.to_create_request().exec.unwrap().listen.is_empty());
     }
 
     #[test]

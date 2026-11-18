@@ -349,6 +349,7 @@ Gate for each milestone below: three boots, median T-login and T-settled, plus
 | **B0** | Measure today's boot (§8). Write the numbers into §2. | `boot-trace.sh` 3 runs on the dev VM |
 | **B1** | rc stage: bootstrap enabled and BEFORE netif, no DHCP/accept_rtadv lines (atrium-net owns ports), no sync-ntpd, loader delay 1, VM boot order, fast stop functions, netconf and bootstrap wait loops gone (§4) | T-login no longer includes netif/defaultroute/local_unbound in boottrace |
 | **B2** | Supervisor-bound sockets: manifest `[[sockets]]`, jaild fd passing + policy, `libatrium` `listener()`, lyrad/choragusd/frescod/ostiarius converted first | choragusd never exits at boot over 20 boots; restart of lyrad does not drop choragusd |
+|  | *B2 status 2026-11-18: built (jaild `ExecSpec::listen` + check, bootstrap `[[sockets]]`, `atrium-listen` crate, lyrad and choragusd converted, ostiarius waits for frescod instead of exiting after 15 s). frescod's own sockets still to convert. Not yet run in the VM.* | |
 | **B3** | Parallel launch + readiness fd + `after` + boot classes (§6) | all services launched within one jaild round-trip window; `portcullis status` shows held services and why |
 | **B4** | Clients: `service::connect`, forum-bar push subscriptions, remove fixed sleeps (§7) | grep finds no `sleep` in a connect path; bar icons right at first frame |
 | **B5** | Host rc daemons bind first via `atrium-bind` (§6.4); parallel shutdown in bootstrap | T-settled and shutdown time measured; shutdown has no serial 5 s waits |

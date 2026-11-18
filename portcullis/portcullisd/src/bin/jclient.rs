@@ -109,6 +109,7 @@ fn main() -> ExitCode {
                     uid,
                     gid,
                     stdio: false,
+                    listen: Vec::new(),
                 }),
                 hostname: None,
                 hostid: None,

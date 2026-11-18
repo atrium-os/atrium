@@ -1107,6 +1107,43 @@ pub fn is_socket(fd: &impl std::os::fd::AsRawFd) -> bool {
     }
 }
 
+/// If `fd` is a listening AF_UNIX stream socket bound to a path, that path;
+/// `None` for any other descriptor (ExecSpec::listen's check).
+pub fn listening_unix_path(fd: &impl std::os::fd::AsRawFd) -> io::Result<Option<String>> {
+    if !is_socket(fd) {
+        return Ok(None);
+    }
+    let raw = fd.as_raw_fd();
+    // SAFETY: getsockopt/getsockname fill buffers we own, sized as passed.
+    #[allow(unsafe_code)]
+    unsafe {
+        let int_opt = |opt: libc::c_int| -> io::Result<libc::c_int> {
+            let mut v: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            if libc::getsockopt(raw, libc::SOL_SOCKET, opt, (&mut v as *mut libc::c_int).cast(), &mut len) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(v)
+        };
+        if int_opt(libc::SO_TYPE)? != libc::SOCK_STREAM || int_opt(libc::SO_ACCEPTCONN)? == 0 {
+            return Ok(None);
+        }
+        let mut sun: libc::sockaddr_un = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if libc::getsockname(raw, (&mut sun as *mut libc::sockaddr_un).cast(), &mut len) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::c_int::from(sun.sun_family) != libc::AF_UNIX {
+            return Ok(None);
+        }
+        let bytes: Vec<u8> = sun.sun_path.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+}
+
 /// Unmount, ignoring errors (cleanup after a failed create).
 pub fn unmount_quiet(path: &str) {
     let _ = unmount_at(path, 0);
