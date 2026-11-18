@@ -915,14 +915,46 @@ font on demand and a driver from a `nobody` device's notice.
   a WebAuthn RP verified and one dropped, a rotation updating in the background, a recovery
   asking, removal keeping the app; the sheet's lines and its add-a-catalog decision; TXT
   answers in the fetcher; jaild's `ro_subtrees` refusals); the publishing tools run by hand
-  (init, register, add, publish, rotate, a past key refused, sync).
+  (init, register, add, publish, rotate, a past key refused, sync). VM gate
+  `scripts/vm-opifex-c7-check.sh` 0 failed on the Mac VM (2026-11-18, 56c424a): a third-party
+  catalog made with `opifex catalog init`, followed after its preview, a proven publisher's app
+  offered and installed for one person, an unproven publisher's never offered, WebAuthn RPs
+  verified, rotation and recovery, a forged entry refused with the copy unchanged.
 - Not yet: launch trust for apps from added catalogs (portcullis-trust's gate knows only
   `/etc/atrium/publishers`; reading opifexd's record and the publisher's keys is the
   platform thread's, told 2026-11-18); Sigillum reading `verified_rps` and keying private
   RPs on the publisher id; Curia's add-a-catalog page and a link that opens the sheet
   (both call `opifex_sheet::add_catalog`); per-persona catalogs (personas.md, later);
   atrium-ax coverage in the publishing check, which needs an ax measurement tool that
-  doesn't exist yet (atrium-ax.md §5.3); a VM gate for C7.
+  doesn't exist yet (atrium-ax.md §5.3).
+
+### 14.9 Root keys on hardware tokens (2026-11-18)
+
+- `portcullis-token`: a key on a PKCS#11 token (YubiKey PIV through Yubico's `libykcs11`,
+  Nitrokey or any module, loaded at run time) signs with ECDSA P-256 over the SHA-256 digest;
+  the signature is checked against the token's public key before use and comes out in the
+  same DER form as a PEM key's. A small **key file** names the key (`atrium-token-key = 1`,
+  `module`, `serial`, `id`); it holds nothing secret.
+- `portcullis_sig::set_external_signer`: `sign` and `public_pem` hand a non-PEM key file to
+  the signer a tool installed. Only the `opifex` CLI installs it, so every `--key`/`--sign`
+  (`root-sign`, `yank`, `register`, `publisher`, `pack`, `head`) takes a token key file;
+  daemons never install it.
+- The PIN is typed at the terminal with echo off, once per token per run, never an argument,
+  file or environment variable. A key that wants the PIN for every signature (YubiKey slot
+  9c) gets a context-specific login; slot 9a needs only the one.
+- `opifex token list|ref|pub`; `opifex catalog root-new` writes an unsigned `root.toml` from
+  public keys or key files (three root keys, a catalog key, the platform key with every kind
+  under `org.atrium.`), `--next yes` the one after it (version + 1, signatures cleared).
+  `root-sign`'s `--pub` is now optional.
+- Handover (a new owner, or admins holding root slots): a next `root.toml` naming the new
+  keys, signed by the threshold of the old root keys and of its own; machines adopt it at
+  their next sync. After that the old keys alone can change nothing. Losing more root keys
+  than the threshold allows before a handover leaves only a reinstall with a new `root.toml`.
+- Checked: unit tests on SoftHSM (listing, public key, signing, a wrong PIN, a missing
+  token, a catalog root through `portcullis_sig`), and `scripts/opifex-token-check.sh`
+  (host, SoftHSM + pkcs11-tool, PINs through a pty): the ceremony with three token keys, a
+  handover to three new tokens adopted by a machine, a root signed by the old keys alone
+  refused, a wrong PIN signing nothing. 0 failed. Not yet tried on a real YubiKey.
 
 ## 15. Decisions, with recommendations
 

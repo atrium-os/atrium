@@ -54,3 +54,56 @@ carries apps only, never `org.atrium.` ids, and only ids under domains its publi
 5. People add it from a link or Curia with a press on the install sheet
    (`opifex_sheet::add_catalog("https://<you>.github.io/<repo>/")`); an administrator can add
    it for everyone with `opifex follow <url> <root sha256> --everyone`.
+
+## The key ceremony: root keys on hardware tokens (opifex.md §5.1, §14.9)
+
+The three root keys live on three hardware tokens; any two sign. A YubiKey 5 does it
+through its PIV application (Yubico's `ykman` and `libykcs11`: `brew install ykman yubico-piv-tool`).
+
+1. On each YubiKey, make a P-256 key in slot 9a that never leaves the key, with a
+   certificate so PKCS#11 shows its public key, and a touch for every signature:
+
+   ```
+   ykman piv access change-pin            # and change-puk, change-management-key --protect
+   ykman piv keys generate --algorithm ECCP256 --pin-policy once --touch-policy always 9a root1.pub.pem
+   ykman piv certificates generate --subject "CN=Atrium root 1" 9a root1.pub.pem
+   ```
+
+2. Name each key in a key file (no secret in it) and keep the public keys:
+
+   ```
+   M=$(brew --prefix)/lib/libykcs11.dylib
+   opifex token list --module $M                       # serials and key ids (9a is id 01)
+   opifex token ref --module $M --serial <serial> --id 01 --out root1.key --pub root1.pub.pem
+   ```
+
+3. Write the root and sign it with two of the tokens (each asks for its PIN and a touch):
+
+   ```
+   opifex catalog root-new site --name Atrium --root root1.key --root root2.key --root root3.key \
+       --catalog catalog.pub.pem --platform platform.pub.pem
+   opifex catalog root-sign site --key root1.key
+   opifex catalog root-sign site --key root2.key
+   ```
+
+   `site/root.toml` also goes into the base system as `/etc/atrium/opifex/root.toml`.
+   Keep the three tokens in three places: losing two before a handover leaves no way to sign.
+
+**Adding admins or handing over.** Trust follows the current `root.toml`. Write the next
+one with the new set of root keys (an admin's own token in one slot, or three new owners'
+tokens), have two of the old keys and two of the new sign it, and publish:
+
+```
+opifex catalog root-new site --next yes --name Atrium --root a.key --root b.key --root c.key \
+    --catalog catalog.pub.pem --platform platform.pub.pem
+opifex catalog root-sign site --key root1.key   # old
+opifex catalog root-sign site --key root2.key   # old
+opifex catalog root-sign site --key a.key       # new
+opifex catalog root-sign site --key b.key       # new
+opifex catalog publish site --key catalog.pem
+```
+
+Machines adopt it at their next sync; from then on the old keys alone change nothing. A new
+catalog or platform key goes in the same way. `scripts/opifex-token-check.sh` rehearses all of
+this on software tokens.
+

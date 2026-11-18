@@ -1,0 +1,18 @@
+[package]
+name = "portcullis-token"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Sign with a P-256 key held on a hardware token (YubiKey PIV, Nitrokey, any PKCS#11 module) for the catalog's offline root keys. Loaded at run time; the module is the token vendor's."
+
+[dependencies]
+cryptoki = "0.12"
+p256   = { version = "0.13", features = ["ecdsa", "pem"] }
+sha2   = "0.10"
+serde  = { version = "1", features = ["derive"] }
+toml   = "0.8"
+portcullis-sig = { path = "../portcullis-sig" }
+
+[dev-dependencies]
+opifex-catalog = { path = "../opifex-catalog" }

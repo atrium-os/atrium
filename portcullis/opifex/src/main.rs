@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod catalog;
+mod token;
 
 use opifex::{app, layer, runtime::resolve_runtime};
 
@@ -46,6 +47,8 @@ const DEFAULT_ROOT: &str = "/var/lib/atrium";
 /// cross-build host.
 const DEFAULT_SYSROOT: &str = "/";
 fn main() -> ExitCode {
+    // Key files may name a key on a hardware token (opifex token ref).
+    portcullis_token::install();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         usage();
@@ -80,6 +83,7 @@ fn main() -> ExitCode {
         "driver-for" => driver_for(&args[2..]),
         "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
+        "token"     => token::cmd(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
         | "updates" | "update-care" | "tick" | "catalogs" | "follow" | "unfollow" => ask_daemon(&args[1..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
@@ -109,9 +113,10 @@ fn usage() {
            layer list [--root <dir>]\n  \
            layer remove <name@version> [--root <dir>]\n      \
              Toolchain layers (dev-tools-plan.md M3), signed by the platform key.\n  \
-           catalog root-sign <cat> --key <pem> --pub <pem>\n  \
+           catalog root-new <cat> --name <n> --root <key>… --catalog <key> [--platform <key>] [--threshold 2] [--next yes]\n  \
+           catalog root-sign <cat> --key <key> [--pub <pem>]\n  \
            catalog add <cat> <pkg-dir> --arch <a> --archive <file> --url <https://...>\n  \
-           catalog yank <cat> <id> <version> --reason <text> --key <pem> --pub <pem>\n  \
+           catalog yank <cat> <id> <version> --reason <text> --key <pem> [--pub <pem>]\n  \
            catalog head <cat> --key <catalog.pem> [--days 14]\n  \
            catalog sync <state> --from <cat> [--root <root.toml>]\n  \
            catalog list <state>\n      \
@@ -120,7 +125,10 @@ fn usage() {
            catalog register <cat> --name <n> --domain <d> --key <pub.pem> --sign <key.pem>\n  \
            catalog publisher <cat> rotate|scope|recover --id <pub:…> [--key <pub.pem>] --sign <pem>…\n  \
            catalog publishers <cat> | catalog publish <cat> --key <catalog.pem>\n      \
-             A catalog of your own (§6.5): apps only, under domains its publishers prove.\n\n\
+             A catalog of your own (§6.5): apps only, under domains its publishers prove.\n  \
+           token list --module <pkcs11 lib> | token pub <key file>\n  \
+           token ref --module <lib> --serial <s> --id <hex> --out <key file> [--pub <pem>]\n      \
+             Keys on hardware tokens (YubiKey PIV): a key file names one; any --key/--sign takes it.\n\n\
          Through opifexd (OPIFEX_SOCKET, default /atrium/sockets/opifex/opifex.sock):\n  \
            describe <id> | search <text> | installed\n  \
            get <id>            install the newest catalog release (root)\n  \

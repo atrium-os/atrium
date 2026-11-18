@@ -3,9 +3,17 @@
 //! network through Nuntius is C4; here the source is a folder.
 //!
 //! ```text
-//! opifex catalog root-sign <cat> --key <root.pem> --pub <root.pub.pem>
+//! opifex catalog root-new <cat> --name <n> --root <key> --root <key> --root <key> [--threshold 2]
+//!                            --catalog <key> [--platform <key>] [--years 5] [--next yes]
+//! opifex catalog root-sign <cat> --key <root key> [--pub <root.pub.pem>]
 //! opifex catalog add <cat> <pkg-dir> --arch <a> --archive <file> --url <https://…> [--url …]
-//! opifex catalog yank <cat> <id> <version> --reason <text> --key <pem> --pub <pem>
+//! opifex catalog yank <cat> <id> <version> --reason <text> --key <pem> [--pub <pem>]
+//! ```
+//!
+//! A key is a PEM file or a token key file (`opifex token ref`): the catalog's
+//! root keys live on hardware tokens (opifex.md §5.1, §10.3).
+//!
+//! ```text
 //! opifex catalog head <cat> --key <catalog.pem> [--days 14]
 //! opifex catalog sync <state> --from <cat> [--root <root.toml>]
 //! opifex catalog list <state>
@@ -33,6 +41,24 @@ fn now() -> u64 {
 
 fn read(p: &str) -> Result<String, String> { std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}")) }
 
+/// The public PEM a key file stands for: a public PEM as it is, a private PEM's
+/// or a token key's (`opifex token ref`) worked out.
+fn public_of(p: &str) -> Result<String, String> {
+    let t = read(p)?;
+    if t.contains("-----BEGIN PUBLIC KEY-----") {
+        return Ok(t);
+    }
+    portcullis_sig::public_pem(&t).map_err(|e| format!("{p}: {e:?}"))
+}
+
+/// `--pub` if given, else the signing key's own public key.
+fn pub_for(flags: &Flags, key: &str) -> Result<String, String> {
+    match flags.get("pub").and_then(|v| v.last()) {
+        Some(p) => read(p),
+        None => public_of(key),
+    }
+}
+
 pub fn cmd(args: &[String]) -> Result<(), String> {
     let mut pos: Vec<String> = Vec::new();
     let mut flags: std::collections::HashMap<String, Vec<String>> = Default::default();
@@ -51,7 +77,8 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
         ["root-sign", cat] => {
             let text = read(&format!("{cat}/{}", oc::ROOT))?;
             oc::Root::parse(&text)?;
-            let line = oc::sign_root(&text, &read(&one("key")?)?, &read(&one("pub")?)?)?;
+            let key = one("key")?;
+            let line = oc::sign_root(&text, &read(&key)?, &pub_for(&flags, &key)?)?;
             let sigp = Path::new(cat).join(oc::ROOT_SIG);
             let mut s = std::fs::read_to_string(&sigp).unwrap_or_default();
             s.push_str(&line);
@@ -85,7 +112,8 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         ["yank", cat, id, version] => {
-            let e = oc::yank_entry(id, version, &one("reason")?, &read(&one("key")?)?, &read(&one("pub")?)?, now())?;
+            let key = one("key")?;
+            let e = oc::yank_entry(id, version, &one("reason")?, &read(&key)?, &pub_for(&flags, &key)?, now())?;
             oc::Log::for_dir(Path::new(cat))?.append(&[e])?;
             println!("opifex: yanked {id} {version}; sign a new head to publish it");
             Ok(())
@@ -120,10 +148,11 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["root-new", cat] => root_new(Path::new(cat), &flags),
         ["init", cat] => init(Path::new(cat), &one("name")?, Path::new(&one("keys")?),
                               num(&flags, "roots", 3)?, num(&flags, "threshold", 2)?, num(&flags, "years", 5)?),
         ["register", cat] => {
-            let key = read(&one("key")?)?;
+            let key = public_of(&one("key")?)?;
             let id = oc::publisher::publisher_id(&key)?;
             let p = publisher_entry(&flags, &id, "register", &key, None)?;
             let log = oc::Log::for_dir(Path::new(cat))?;
@@ -136,7 +165,7 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
             let log = oc::Log::for_dir(Path::new(cat))?;
             let id = one("id")?;
             let cur = log.replay()?.publishers.into_iter().find(|p| p.id == id).ok_or_else(|| format!("{id}: not registered"))?;
-            let key = match flags.get("key").and_then(|v| v.last()) { Some(k) => read(k)?, None => cur.key.clone() };
+            let key = match flags.get("key").and_then(|v| v.last()) { Some(k) => public_of(k)?, None => cur.key.clone() };
             let p = publisher_entry(&flags, &id, action, &key, Some(&cur))?;
             log.append(&[p.clone().entry(now())])?;
             println!("opifex: {action} of {id} added; sign a new head to publish it.");
@@ -152,7 +181,7 @@ pub fn cmd(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("catalog: root-sign | add | yank | head | publish | sync | list | init | register | publisher | publishers (see opifex help)".into()),
+        _ => Err("catalog: root-new | root-sign | add | yank | head | publish | sync | list | init | register | publisher | publishers (see opifex help)".into()),
     }
 }
 
@@ -175,7 +204,7 @@ fn publisher_entry(flags: &Flags, id: &str, action: &str, key: &str, cur: Option
     let signers = flags.get("sign").ok_or("--sign <key.pem> is needed (the keys that sign this record)")?;
     for s in signers {
         let sk = read(s)?;
-        let pk = portcullis_sig::public_pem(&sk).map_err(|e| format!("{s}: {e:?}"))?;
+        let pk = public_of(s)?;
         p.sign_with(&sk, &pk)?;
     }
     Ok(p)
@@ -207,6 +236,47 @@ fn write_key(dir: &Path, name: &str) -> Result<(String, String), String> {
     f.write_all(sk.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(format!("{name}.pub.pem")), &pk).map_err(|e| e.to_string())?;
     Ok((sk, pk))
+}
+
+/// An unsigned root.toml from public keys (or token key files): the key
+/// ceremony's first step, and a next root.toml (`--next`: version + 1, the
+/// old signatures cleared) when keys change hands. Each root key holder then
+/// runs `root-sign`; a next root needs the threshold of the old keys *and* of
+/// its own.
+fn root_new(cat: &Path, flags: &Flags) -> Result<(), String> {
+    let next = flags.get("next").and_then(|v| v.last()).is_some_and(|v| v == "yes");
+    let rp = cat.join(oc::ROOT);
+    let version = if rp.exists() {
+        if !next {
+            return Err(format!("{}: has a root.toml already (--next yes for the one after it)", cat.display()));
+        }
+        oc::Root::parse(&read(&rp.display().to_string())?)?.version + 1
+    } else {
+        1
+    };
+    let name = flags.get("name").and_then(|v| v.last()).cloned().ok_or("--name is needed")?;
+    let roots = flags.get("root").cloned().unwrap_or_default();
+    let threshold = num(flags, "threshold", 2)?;
+    let years = num(flags, "years", 5)?;
+    let catalog = flags.get("catalog").and_then(|v| v.last()).cloned().ok_or("--catalog <key> is needed (the key that signs heads)")?;
+    let mut text = format!("schema = \"{}\"\nname = {:?}\nversion = {version}\nexpires = {}\nthreshold = {threshold}\n",
+                           oc::ROOT_SCHEMA, name, now() + years * 365 * 86400);
+    for r in &roots {
+        text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n", public_of(r)?);
+    }
+    text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"catalog\"]\n", public_of(&catalog)?);
+    if let Some(p) = flags.get("platform").and_then(|v| v.last()) {
+        let kinds: Vec<String> = oc::KINDS.iter().map(|k| format!("{k:?}")).collect();
+        text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [{}]\ndevices = true\n",
+                         public_of(p)?, kinds.join(", "));
+    }
+    oc::Root::parse(&text)?;
+    std::fs::create_dir_all(cat).map_err(|e| format!("{}: {e}", cat.display()))?;
+    std::fs::write(&rp, &text).map_err(|e| e.to_string())?;
+    std::fs::write(cat.join(oc::ROOT_SIG), "").map_err(|e| e.to_string())?;
+    println!("opifex: {} version {version} for {name:?}: {} root keys, any {threshold} sign.", rp.display(), roots.len());
+    println!("  Next: each root key holder runs  opifex catalog root-sign {} --key <their key>", cat.display());
+    Ok(())
 }
 
 /// A new catalog: root keys and a catalog key in `keys`, a root.toml signed

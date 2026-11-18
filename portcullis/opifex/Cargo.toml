@@ -32,6 +32,7 @@ path = "src/bin/opifex-fetch.rs"
 [dependencies]
 portcullis-toml = { path = "../portcullis-toml" }
 portcullis-sig  = { path = "../portcullis-sig" }
+portcullis-token = { path = "../portcullis-token" }
 portcullis-trust = { path = "../portcullis-trust" }
 opifex-catalog  = { path = "../opifex-catalog" }
 sha2   = "0.10"
