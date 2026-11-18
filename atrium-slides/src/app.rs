@@ -624,11 +624,11 @@ fn Color_accent() -> officina_slides::model::Color {
 
 /// A picture's size in pixels, from its header.
 pub fn picture_size(b: &[u8]) -> Option<(u32, u32)> {
-    if let Ok((_, w, h)) = navigator_image::image::natural_size(b) {
-        return Some((w, h));
+    if let Some(wh) = crate::decode::natural_size(b) {
+        return Some(wh);
     }
     // No natural size in the header (SVG): decode to find out it is one.
-    let px = navigator_image::image::decode_unaddressed(b, navigator_image::image::Ceilings { target: Some((1024, 1024)), ..Default::default() }).ok()?;
+    let px = crate::decode::decode(b, 1024, 1024)?;
     Some((px.width, px.height))
 }
 

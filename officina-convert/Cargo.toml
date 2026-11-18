@@ -20,7 +20,7 @@ required-features = ["read"]
 # links the crate without them (default-features = false): the writers,
 # protection and the launcher only, so no XML parser.
 default = ["read"]
-read = ["dep:quick-xml"]
+read = ["dep:quick-xml", "dep:navigator-image"]
 
 [dependencies]
 officina-core = { path = "../officina-core" }
@@ -33,6 +33,9 @@ officina-pict = { path = "../officina-pict", default-features = false }
 miniz_oxide = "0.8"
 # Streaming XML (MIT); bounded by our own limits on top.
 quick-xml = { version = "0.37", optional = true }
+# The pictures mode of the worker (pictures.rs): the Navigator's memory-safe
+# decoders, with Office's WMF/EMF/BMP.
+navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
 libc = "0.2"
 # Run as the app's `convert` worker when installed (dev-tools-plan.md M5).
 atrium-worker = { path = "../sdk/atrium-worker" }

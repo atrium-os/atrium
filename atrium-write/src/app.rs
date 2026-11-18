@@ -1561,10 +1561,14 @@ impl Write {
 
     /// Places a picture from its encoded bytes at the caret.
     pub fn insert_picture(&self, bytes: Vec<u8>) -> Result<(), String> {
-        if bytes.len() > navigator_image::image::MAX_ENCODED_IMAGE_BYTES {
+        if bytes.len() > officina_convert::pictures::MAX_INPUT {
             return Err("it is over 16 MB".into());
         }
-        let (_, w, h) = navigator_image::image::natural_size(&bytes).map_err(|k| format!("not a picture this app can show ({k})"))?;
+        // Its size from the convert worker: Write's own process reads no picture.
+        let (w, h) = officina_text::picture::decoder()
+            .ok_or("pictures can't be read here")?
+            .size(&bytes)
+            .ok_or("not a picture this app can show")?;
         let d = self.doc.borrow();
         d.ed.borrow_mut().insert_image(officina_text::model::ImageData { bytes: bytes.into(), width: w, height: h });
         drop(d);

@@ -12,47 +12,13 @@
 use std::sync::Arc;
 
 use fresco_protocol::{FillPaint, FillParams, GradientStop};
-use navigator_render::fontset::FontSet;
 use navigator_render::{path, Attrs, Scene, Tiling, U};
 use pergola::geom::{Point, Rect};
-use pergola::glyphs::{Face, Glyph};
+use pergola::glyphs::Glyph;
+
+use crate::Faces;
 use pergola::node::{Image, Node};
 use pergola::Color;
-
-/// The document's faces registered with Pergola, by `FontSet` index.
-pub struct Faces {
-    pinned: Vec<Face>,
-    /// The system font library's faces, registered when a glyph first
-    /// names one (officina-text's face `pinned.len() + id`).
-    library: Vec<std::sync::OnceLock<Option<Face>>>,
-}
-
-impl Faces {
-    pub fn new(fonts: &FontSet) -> Self {
-        Faces {
-            pinned: fonts.faces.iter().map(|f| Face::new(f.bytes.clone(), 0)).collect(),
-            library: atrium_fonts::faces().iter().map(|_| Default::default()).collect(),
-        }
-    }
-
-    /// The face registered for `FontSet` index `i`, or past the set, for
-    /// library face `i - set length`.
-    pub fn get(&self, i: usize) -> Option<&Face> {
-        match i.checked_sub(self.pinned.len()) {
-            None => self.pinned.get(i),
-            Some(id) => self.library.get(id)?
-                .get_or_init(|| atrium_fonts::Library::system().bytes(id).ok().map(|b| Face::from_static(b, 0)))
-                .as_ref(),
-        }
-    }
-
-    /// The shared set's faces, registered once per process (so every
-    /// document in a window shares atlas entries).
-    pub fn shared() -> Result<&'static Faces, String> {
-        static F: std::sync::OnceLock<Result<Faces, String>> = std::sync::OnceLock::new();
-        F.get_or_init(|| FontSet::shared().map(Faces::new)).as_ref().map_err(Clone::clone)
-    }
-}
 
 /// What a conversion left out, counted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

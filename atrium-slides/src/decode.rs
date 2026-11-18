@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use navigator_image::image::{decode_unaddressed, Ceilings, Pixels};
+pub use officina_text::picture::Pixels;
 use officina_slides::model::{MediaId, PREVIEW_SIDE};
 
 /// What a job is for: (deck key, media, width, height) of a decode.
@@ -77,9 +77,34 @@ fn work(p: &'static Pool) {
     }
 }
 
-/// `bytes` decoded to at most `w` × `h` px (one scale for both axes).
+/// `bytes` decoded to at most `w` × `h` px (one scale for both axes): by
+/// the convert worker (the installed officina_text::picture decoder), or,
+/// in tests and with `local-decode`, here.
 pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Pixels> {
-    decode_unaddressed(bytes, Ceilings { target: Some((w, h)), ..Ceilings::default() }).ok()
+    if let Some(d) = officina_text::picture::decoder() {
+        return d.decode(bytes, Some((w, h)));
+    }
+    #[cfg(any(test, feature = "local-decode"))]
+    {
+        use navigator_image::image::{decode_unaddressed, Ceilings};
+        let px = decode_unaddressed(bytes, Ceilings { target: Some((w, h)), ..Ceilings::default() }).ok()?;
+        Some(Pixels { width: px.width, height: px.height, rgba: px.rgba })
+    }
+    #[cfg(not(any(test, feature = "local-decode")))]
+    None
+}
+
+/// A picture's natural size from its header (None for SVG, which has none).
+pub fn natural_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if let Some(d) = officina_text::picture::decoder() {
+        return d.size(bytes);
+    }
+    #[cfg(any(test, feature = "local-decode"))]
+    {
+        navigator_image::image::natural_size(bytes).ok().map(|(_, w, h)| (w, h))
+    }
+    #[cfg(not(any(test, feature = "local-decode")))]
+    None
 }
 
 /// A picture's preview: decoded to [`PREVIEW_SIDE`] on its longer side,
@@ -87,7 +112,7 @@ pub fn decode(bytes: &[u8], w: u32, h: u32) -> Option<Pixels> {
 pub fn make_preview(bytes: &[u8]) -> Option<(&'static str, u32, u32, Vec<u8>)> {
     // The decoder fills its target box (one scale, the larger), so ask for
     // the box the longer side makes.
-    let (_, nw, nh) = navigator_image::image::natural_size(bytes).ok()?;
+    let (nw, nh) = natural_size(bytes)?;
     let k = (PREVIEW_SIDE as f64 / nw.max(nh).max(1) as f64).min(1.0);
     let px = decode(bytes, ((nw as f64 * k).round() as u32).max(1), ((nh as f64 * k).round() as u32).max(1))?;
     let (w, h) = (px.width, px.height);

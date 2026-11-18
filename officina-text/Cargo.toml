@@ -7,6 +7,8 @@ publish = false
 description = "Officina's word-processing engine (docs/spec/officina.md §7): the document model (an indexed tree of blocks, rich text runs, named styles), undoable ops, paragraph layout cached per paragraph, and pagination with checkpoints that stops when page breaks line up again. No UI."
 
 [dependencies]
+# Headers only: which picture a file is (picture::mime).
+officina-pict = { path = "../officina-pict", default-features = false }
 officina-core = { path = "../officina-core" }
 officina-shapes = { path = "../officina-shapes" }
 navigator-fontset = { path = "../navigator-fontset" }
