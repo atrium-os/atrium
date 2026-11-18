@@ -78,14 +78,6 @@ for iso in cap jail; do
   O=$B/b-\$iso; rm -rf \$O; mkdir -p \$O/bin \$O/clips
   install -m 0755 \$U/atrium-player-bundle-launch \$O/bin/launch
   install -m 0755 \$U/atrium-player \$U/atrium-player-decode \$O/bin/
-  # opifex's side-load install stages only the entry's library closure; the
-  # player and its decoder need more (libm, libc++, the codec libraries), so
-  # the bundle ships them. A jail has no ld-elf.so.hints, so the rtld looks
-  # only in /lib and /usr/lib: /usr/local/lib's go to usr/lib.
-  for l in \$(ldd -f '%p\n' \$O/bin/atrium-player \$O/bin/atrium-player-decode | grep '^/' | sort -u); do
-    d=\$(dirname \$l); [ \$d = /usr/local/lib ] && d=/usr/lib
-    mkdir -p \$O\$d; cp \$l \$O\$d/
-  done
   printf '[app]\nid = "%s"\nname = "Player %s"\nversion = "1"\nentry = "bin/launch"\n\n[capabilities]\nnetwork = "none"\nembeds = []\n\n[[workers]]\nname = "decode"\nentry = "bin/atrium-player-decode"\nlifetime = "session"\nisolation = "%s"\nmemory = "768M"\n' \$id \$iso \$i > \$O/atrium.toml
   for c in $CLIPS; do cp \$U/\$c \$O/clips/; done
   printf 'clip\n' > \$O/play.conf
