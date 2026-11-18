@@ -132,6 +132,7 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         require_memory_limit,
         cpu_pct,
         extra_env: vec![],
+        worker: None,
         // ★★ Never from the environment. This path needs root, and `$USER`
         // is whatever the caller's shell left behind — `su -m` keeps root's,
         // so it silently named root (and a sudo'd shell could name anyone).

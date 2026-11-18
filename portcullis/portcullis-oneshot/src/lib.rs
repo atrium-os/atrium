@@ -88,6 +88,12 @@ pub struct Spec {
     /// itself (the fetcher's site list, nuntius.md §4), never from a
     /// requester. Keys must start with `ATRIUM_` (jaild's allow-list).
     pub extra_env: Vec<(String, String)>,
+    /// ★ A `[[workers]]` entry of the app (app-composition.md §4.1, M5):
+    /// run that worker's entry in place of the app's, under the same
+    /// signature, with NO capability at all (decision C3) and the worker's
+    /// own `memory`. Set only by portcullisd, from the caller's installed
+    /// manifest; the app's capabilities are never consulted for it.
+    pub worker: Option<String>,
 }
 
 /// Whether the kernel can enforce an rctl rule at all.
@@ -218,6 +224,28 @@ pub fn run(spec: &Spec) -> OneShot { run_with_stdio(spec, None) }
 /// arrived over SCM_RIGHTS and are what the jailed process must actually
 /// speak on. Handing jaild the daemon's own would send a worker's protocol frames to the system
 /// log and leave the broker waiting forever.
+/// The app's manifest made into its worker `name`'s: the worker's entry,
+/// no capability, `[resources]` holding only the worker's memory, and no
+/// workers of its own. What the jail is built from, after the signature
+/// check of the whole bundle (the entry is in the same signed tree).
+pub fn as_worker(m: &mut portcullis_toml::Manifest, name: &str) -> Result<(), String> {
+    let Some(w) = m.worker(name).cloned() else {
+        return Err(format!("{} has no worker {name:?}", m.app.id));
+    };
+    if w.isolation != portcullis_toml::WorkerIsolation::Jail {
+        return Err(format!("worker {name:?} is isolation = capsicum: the SDK runs it in the core's own process tree, not here"));
+    }
+    m.app.entry = w.entry.clone();
+    m.capabilities = Default::default();
+    m.resources = Some(portcullis_toml::ResourcesSection {
+        memory: w.memory.clone(), cpu: None, files: None, storage: None, pool: None,
+    });
+    m.setup = None;
+    m.supervision = None;
+    m.workers.clear();
+    Ok(())
+}
+
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
     // ★ This lane builds the instance root and reads the machine's identity
     // secret in THIS process, so it needs root — and says so first. Without
@@ -250,10 +278,13 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         return OneShot::Refused(e);
     }
 
-    let manifest = match portcullis_toml::Manifest::from_str(&text) {
+    let mut manifest = match portcullis_toml::Manifest::from_str(&text) {
         Ok(m) => m,
         Err(e) => return OneShot::Failed(format!("{}: {e:?}", manifest_path.display())),
     };
+    if let Some(name) = &spec.worker {
+        if let Err(e) = as_worker(&mut manifest, name) { return OneShot::Refused(e) }
+    }
 
     // ★ The jaild-lane name: jaild-valid by construction, and the last
     // component of the root — jaild trusts a one-shot's entry only when its
