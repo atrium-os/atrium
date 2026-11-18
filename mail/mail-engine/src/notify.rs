@@ -10,20 +10,24 @@
 //! - more than [`BURST`] within [`BURST_SECS`] is one grouped post;
 //! - a first sync (an inbox that was empty) never notifies;
 //! - a message read elsewhere since is withdrawn;
-//! - Later: once a day after [`REVIEW_HOUR`], "3 due today, 2 overdue",
+//! - mail that isn't announced (lists, automated) is said in one silent
+//!   digest at the person's times (9:00 and 17:00 unless they pick), the
+//!   ones still unread then;
+//! - Later: once a day at the review time (9:00 unless the person picks),
+//!   "3 due today, 2 overdue",
 //!   naming every item a week overdue or pushed back three times, every
 //!   day until it is answered; and, when the weekly look is on, once on
 //!   Friday after [`WEEKLY_HOUR`]: what is due next week and who has been
 //!   waited on for more than a week.
 //!
 //! - Settings ([`crate::prefs`]): notifications off (only withdrawals),
-//!   VIPs always one by one, and quiet hours: what arrives inside them is
-//!   held back and said in one silent summary when they end (VIPs only get
-//!   through if the person lets them).
+//!   VIPs always one by one, and quiet hours (and, if asked, whole
+//!   weekends): what arrives inside them is held back and said in one
+//!   silent summary when they end (VIPs, and replies in the person's
+//!   conversations, only get through if the person lets them).
 //!
-//! Not yet: quiet hours per persona (one Mail instance is one persona, so
-//! the instance's quiet hours are the persona's), sounds per account, the
-//! digest of everything else.
+//! One Mail instance is one persona, so the instance's quiet hours are the
+//! persona's. Not yet: sounds per account (Praeco's post has no sound).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -34,7 +38,7 @@ use crate::Engine;
 pub const FRESH_SECS: i64 = 600;
 pub const BURST: usize = 2;
 pub const BURST_SECS: i64 = 30;
-/// The daily review's hour, local time.
+/// The daily review's hour unless the person picks another time.
 pub const REVIEW_HOUR: i64 = 9;
 /// The weekly look's hour on Friday, local time.
 pub const WEEKLY_HOUR: i64 = 15;
@@ -89,6 +93,12 @@ pub struct Notifier {
     looked: Option<i64>,
     /// Arrivals held back during quiet hours, said when they end.
     quiet: Vec<Arrival>,
+    /// Fresh mail not announced (lists, automated), for the digest.
+    other: Vec<Arrival>,
+    /// Local wall-clock time of the last look, to see a digest time pass.
+    looked_at: Option<i64>,
+    /// A digest time passed while it was quiet: said when it ends.
+    digest_due: bool,
 }
 
 impl Notifier {
@@ -106,14 +116,43 @@ impl Notifier {
     /// for quiet hours and the review's day and hour.
     pub fn check_local(&mut self, e: &Engine, now: i64, offset: i64) -> Vec<Post> {
         let prefs = e.prefs();
-        let minute = ((now + offset).rem_euclid(86_400) / 60) as u16;
-        let quiet = prefs.is_quiet(minute);
+        let local = now + offset;
+        let minute = (local.rem_euclid(86_400) / 60) as u16;
+        let weekday = (local.div_euclid(86_400) + 3).rem_euclid(7) as u8;
+        let quiet = prefs.is_quiet_on(weekday, minute);
         let mut out = self.look(e, now, offset, &prefs, quiet);
+        // A digest time passed since the last look.
+        if let Some(last) = self.looked_at {
+            let (d0, d1) = (last.div_euclid(86_400), local.div_euclid(86_400));
+            let passed = (d0..=d1).any(|d| prefs.digest.iter().any(|t| {
+                let at = d * 86_400 + *t as i64 * 60;
+                at > last && at <= local
+            }));
+            self.digest_due |= passed;
+        }
+        self.looked_at = Some(local);
         if !prefs.notify {
             // Off: only take back what was said before.
             self.quiet.clear();
+            self.other.clear();
+            self.digest_due = false;
             out.retain(|p| matches!(p, Post::Withdraw { .. }));
             return out;
+        }
+        if prefs.digest.is_empty() {
+            self.other.clear();
+        }
+        if self.digest_due && !quiet {
+            self.digest_due = false;
+            // The ones still unread.
+            let other: Vec<Arrival> = std::mem::take(&mut self.other).into_iter().filter(|a| {
+                e.store.message(a.msg).is_ok_and(|m| !m.locations.iter().any(|(f, u)| e.store.at(*f, *u).ok().flatten().is_some_and(|(_, fl)| fl & flag::SEEN != 0)))
+            }).collect();
+            if !other.is_empty() {
+                let n = other.len();
+                let body = format!("{n} {}, from {}", if n == 1 { "message" } else { "messages" }, first_names(other.iter().map(|a| a.from.as_str())));
+                out.push(Post::Summary { title: "Other mail".into(), body });
+            }
         }
         if !quiet && !self.quiet.is_empty() {
             let held = std::mem::take(&mut self.quiet);
@@ -136,7 +175,7 @@ impl Notifier {
             for a in &accounts {
                 self.had_mail.insert(*a, self.inbox_has_mail(e, *a));
             }
-            self.review(e, now, offset, &mut out);
+            self.review(e, now, offset, prefs.review, &mut out);
             if prefs.weekly {
                 self.week(e, now, offset, &mut out);
             }
@@ -187,7 +226,7 @@ impl Notifier {
             let person = vip || (!s.automated && !crate::senders::is_list(s));
             let from = s.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
             let a = Arrival { msg: id, person: person || wrote_in, from, subject: s.subject.clone(), text: new_text(s.text.as_deref().unwrap_or(&s.preview)) };
-            if quiet && !(vip && prefs.vips_through) {
+            if quiet && !(vip && prefs.vips_through) && !(wrote_in && prefs.replies_through) {
                 if self.quiet.len() < SCAN_MAX {
                     self.quiet.push(a);
                 }
@@ -199,7 +238,12 @@ impl Notifier {
                 stale.push(a);
             }
         }
-        // Lists and automated mail are counted, not announced.
+        // Lists and automated mail are counted, not announced: the digest.
+        for a in fresh.iter().filter(|a| !a.person) {
+            if self.other.len() < SCAN_MAX {
+                self.other.push(a.clone());
+            }
+        }
         let pings: Vec<&Arrival> = fresh.iter().filter(|a| a.person).collect();
         while self.recent.front().is_some_and(|t| now - *t > BURST_SECS) {
             self.recent.pop_front();
@@ -229,7 +273,7 @@ impl Notifier {
             }
             out.push(Post::Summary { title: "While you were away".into(), body });
         }
-        self.review(e, now, offset, &mut out);
+        self.review(e, now, offset, prefs.review, &mut out);
         if prefs.weekly {
             self.week(e, now, offset, &mut out);
         }
@@ -242,10 +286,11 @@ impl Notifier {
 
     /// Once a day after the review hour: what Later has due. Days and the
     /// hour are local (`offset` seconds east of UTC).
-    fn review(&mut self, e: &Engine, now: i64, offset: i64, out: &mut Vec<Post>) {
+    fn review(&mut self, e: &Engine, now: i64, offset: i64, at: u16, out: &mut Vec<Post>) {
+        let at = at as i64 * 60;
         let now = now + offset;
         let day = now.div_euclid(86_400);
-        if self.reviewed == Some(day) || now - day * 86_400 < REVIEW_HOUR * 3600 {
+        if self.reviewed == Some(day) || now - day * 86_400 < at {
             return;
         }
         self.reviewed = Some(day);
@@ -254,8 +299,8 @@ impl Notifier {
             (id, l)
         }).collect();
         let end = (day + 1) * 86_400;
-        let overdue = items.iter().filter(|(_, l)| l.due < day * 86_400 + REVIEW_HOUR * 3600 && !l.back).count() + items.iter().filter(|(_, l)| l.back).count();
-        let today = items.iter().filter(|(_, l)| !l.back && l.due >= day * 86_400 + REVIEW_HOUR * 3600 && l.due < end).count();
+        let overdue = items.iter().filter(|(_, l)| l.due < day * 86_400 + at && !l.back).count() + items.iter().filter(|(_, l)| l.back).count();
+        let today = items.iter().filter(|(_, l)| !l.back && l.due >= day * 86_400 + at && l.due < end).count();
         let asking = e.later_asking(now - offset).unwrap_or_default();
         if overdue + today == 0 && asking.is_empty() {
             return;

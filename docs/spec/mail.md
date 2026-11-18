@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1538,6 +1538,27 @@ Stalwart in the cloud VM, and later a real account):
    and the hidden server `Snoozed` folder (moving messages out of the server's inbox
    needs folder creation and a move back at the due time; `$Snoozed` alone covers
    clients that know the keyword).
+
+   **The rest of the notification settings built on the host (2026-11-18, §12, E5).**
+   **Quiet all weekend**: Saturday and Sunday are quiet all day, alone or with quiet
+   hours, which together make the working week of §12 ("weekdays 9:00–19:00"); what
+   comes in is summed up when the quiet ends, as before. **Replies in my conversations
+   notify too**: beside "VIPs notify in quiet hours too", off by default, it lets mail in
+   a conversation the person wrote in through quiet hours. **The digest**: mail that
+   isn't announced (lists, automated senders) is kept and said in one silent post,
+   "Other mail · 4 messages, from …", at the person's times, 9:00 and 17:00 unless they
+   type others ("08:30, 13:00, 18:00", at most six; empty: only counted); only what is
+   still unread then is in it, and a time that falls in quiet hours waits for them to
+   end. **The review's time**: the Later review comes at a typed time instead of 9:00.
+   Settings has the two switches and the two time fields; a typed time takes effect once
+   it reads as one. One Mail instance is one persona, so these are the persona's.
+   Tests: engine 1 (the digest at 17:00 with only the unread and only once, no times
+   meaning counted only, a Saturday held back but for a reply let through and summed up
+   on Monday at 9:00, the review at 10:30, the settings kept), the window's time
+   parsing. **Not yet**: Archive,
+   Mark read and Reply on the notification (Praeco's actions need CLASS_BROKER delivery,
+   tabula.md §5.1, not built), sounds per account (a Praeco post has no sound yet), and
+   showing the schedule in Curia's notification page.
 
 ## 17. Decisions, with recommendations
 

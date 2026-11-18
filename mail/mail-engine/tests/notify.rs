@@ -126,3 +126,70 @@ fn settings_off_quiet_hours_and_vips() {
     engine.set_prefs(&Prefs { notify: true, quiet: None, ..engine.prefs() }).unwrap();
     assert!(n.check_local(&engine, NOW + 150, 0).is_empty());
 }
+
+#[test]
+fn digest_weekends_replies_and_the_review_time() {
+    use mail_engine::prefs::Prefs;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    sink.messages("INBOX", vec![msg(1, "Arun <arun@example.org>", "Plan", NOW - 86_400, "Message-ID: <a1@x>\r\n", "Thoughts?")]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let day = NOW.div_euclid(86_400) * 86_400;
+
+    // Lists and automated mail wait for the digest (9:00 and 17:00 by
+    // default); one read before then isn't in it.
+    assert_eq!(engine.prefs().digest, [540, 1020]);
+    let mut n = Notifier::new();
+    assert!(n.check_local(&engine, NOW, 0).is_empty());
+    sink.messages("INBOX", vec![
+        msg(2, "News <news@list.example>", "This week", NOW - 10, "List-Id: <news.list.example>\r\n", "Hi."),
+        msg(3, "Shop <orders@shop.example>", "Shipped", NOW - 5, "Auto-Submitted: auto-generated\r\n", "Hi."),
+        msg(4, "Forum <forum@lists.example>", "Digest", NOW - 3, "List-Id: <forum.lists.example>\r\n", "Hi."),
+    ]).unwrap();
+    assert!(n.check_local(&engine, NOW + 60, 0).is_empty());
+    engine.store.write(|w| w.set_flags(inbox, 4, flag::SEEN)).unwrap();
+    assert!(n.check_local(&engine, day + 16 * 3600, 0).is_empty());
+    let p = n.check_local(&engine, day + 17 * 3600 + 30, 0);
+    assert_eq!(p, [Post::Summary { title: "Other mail".into(), body: "2 messages, from News, Shop".into() }]);
+    assert!(n.check_local(&engine, day + 17 * 3600 + 90, 0).is_empty(), "once");
+    // No times: counted only.
+    engine.set_prefs(&Prefs { digest: vec![], ..engine.prefs() }).unwrap();
+    assert!(engine.prefs().digest.is_empty());
+    sink.messages("INBOX", vec![msg(5, "News <news@list.example>", "Next week", day + 17 * 3600 + 100, "List-Id: <news.list.example>\r\n", "Hi.")]).unwrap();
+    assert!(n.check_local(&engine, day + 17 * 3600 + 120, 0).is_empty());
+    assert!(n.check_local(&engine, day + 86_400 + 9 * 3600 + 30, 0).is_empty());
+
+    // Quiet hours 19:00–09:00 and weekends: a working week. Replies in
+    // Arun's own conversation get through when he lets them.
+    let p = Prefs { quiet: Some((19 * 60, 9 * 60)), quiet_weekends: true, replies_through: true, ..engine.prefs() };
+    engine.set_prefs(&p).unwrap();
+    let got = engine.prefs();
+    assert!(got.quiet_weekends && got.replies_through);
+    assert!(got.is_quiet_on(5, 12 * 60) && got.is_quiet_on(6, 12 * 60) && !got.is_quiet_on(4, 12 * 60) && got.is_quiet_on(4, 20 * 60));
+    let sat = day + 5 * 86_400 + 12 * 3600;
+    let mut n = Notifier::new();
+    assert!(n.check_local(&engine, sat, 0).is_empty());
+    sink.messages("INBOX", vec![
+        msg(6, "Priya <priya@example.com>", "Weekend", sat - 30, "", "Hi."),
+        msg(7, "Lena <lena@partner.example>", "Re: Plan", sat - 20, "In-Reply-To: <a1@x>\r\nReferences: <a1@x>\r\n", "Yes."),
+    ]).unwrap();
+    let p = n.check_local(&engine, sat + 10, 0);
+    assert!(matches!(&p[..], [Post::One { title, .. }] if title == "Re: Plan"), "{p:?}");
+    // Monday 9:00: what waited is one summary.
+    let p = n.check_local(&engine, day + 7 * 86_400 + 9 * 3600 + 30, 0);
+    assert!(p.contains(&Post::Summary { title: "During quiet hours".into(), body: "1 new, 1 from people (Priya)".into() }), "{p:?}");
+
+    // The review at the person's time: 10:30, not 9:00.
+    engine.set_prefs(&Prefs { quiet: None, quiet_weekends: false, review: 10 * 60 + 30, ..engine.prefs() }).unwrap();
+    assert_eq!(engine.prefs().review, 630);
+    let plan = engine.store.at(inbox, 1).unwrap().unwrap().0;
+    engine.set_later(plan, mail_store::later::kind::REPLY, day + 8 * 86_400 + 8 * 3600, "").unwrap();
+    let mut n = Notifier::new();
+    let tue = day + 8 * 86_400;
+    assert!(n.check_local(&engine, tue + 10 * 3600, 0).iter().all(|p| !matches!(p, Post::Review { .. })));
+    let p = n.check_local(&engine, tue + 10 * 3600 + 31 * 60, 0);
+    assert!(p.contains(&Post::Review { title: "Later".into(), body: "1 overdue".into() }), "{p:?}");
+}

@@ -9,6 +9,17 @@ const NOTIFY_OFF: &str = "notify_off";
 const QUIET: &str = "quiet_hours";
 const VIPS_THROUGH: &str = "vips_through_quiet";
 const WEEKLY_OFF: &str = "weekly_look_off";
+const QUIET_WEEKENDS: &str = "quiet_weekends";
+const REPLIES_THROUGH: &str = "replies_through_quiet";
+/// The review's minute after local midnight, plus one; absent: 9:00.
+const REVIEW: &str = "review_minute";
+/// The digest's times, comma-separated minutes after local midnight; "-"
+/// for none; absent: [`DIGEST_DEFAULT`].
+const DIGEST: &str = "digest_times";
+/// The digest of other mail at 9:00 and 17:00 unless the person picks.
+pub const DIGEST_DEFAULT: [u16; 2] = [9 * 60, 17 * 60];
+/// Most digest times kept.
+pub const DIGEST_MAX: usize = 6;
 /// Newline-separated addresses, lower case.
 const VIPS: &str = "vips";
 const ALL: u32 = 0;
@@ -26,11 +37,21 @@ pub struct Prefs {
     pub vips: Vec<String>,
     /// The Later weekly look on Friday afternoon (§11.4).
     pub weekly: bool,
+    /// Saturday and Sunday are quiet all day: with quiet hours, a working
+    /// week ("weekdays 9:00–19:00", §12).
+    pub quiet_weekends: bool,
+    /// Replies in conversations the person wrote in notify in quiet hours.
+    pub replies_through: bool,
+    /// When the digest of other mail comes, minutes after local midnight,
+    /// ascending; empty: never (it is only counted).
+    pub digest: Vec<u16>,
+    /// When the Later review comes, minutes after local midnight.
+    pub review: u16,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60 }
     }
 }
 
@@ -43,6 +64,11 @@ impl Prefs {
             Some((f, t)) => m >= f || m < t,
             None => false,
         }
+    }
+
+    /// Whether it is quiet on `weekday` (0 = Monday) at minute `m`.
+    pub fn is_quiet_on(&self, weekday: u8, m: u16) -> bool {
+        (self.quiet_weekends && weekday >= 5) || self.is_quiet(m)
     }
 
     pub fn is_vip(&self, addr: &str) -> bool {
@@ -60,6 +86,13 @@ impl Engine {
             quiet,
             vips_through: s.setting(ALL, VIPS_THROUGH).ok().flatten().unwrap_or(0) != 0,
             weekly: s.setting(ALL, WEEKLY_OFF).ok().flatten().unwrap_or(0) == 0,
+            quiet_weekends: s.setting(ALL, QUIET_WEEKENDS).ok().flatten().unwrap_or(0) != 0,
+            replies_through: s.setting(ALL, REPLIES_THROUGH).ok().flatten().unwrap_or(0) != 0,
+            review: s.setting(ALL, REVIEW).ok().flatten().filter(|v| (1..=1440).contains(v)).map_or(9 * 60, |v| (v - 1) as u16),
+            digest: match s.sync_state(ALL, DIGEST).ok().flatten() {
+                None => DIGEST_DEFAULT.to_vec(),
+                Some(v) => clean_times(v.split(',').filter_map(|t| t.trim().parse().ok())),
+            },
             vips: s.sync_state(ALL, VIPS).ok().flatten().map(|v| v.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
         }
     }
@@ -75,10 +108,25 @@ impl Engine {
             w.set_setting(ALL, QUIET, quiet)?;
             w.set_setting(ALL, VIPS_THROUGH, p.vips_through.then_some(1))?;
             w.set_setting(ALL, WEEKLY_OFF, (!p.weekly).then_some(1))?;
+            w.set_setting(ALL, QUIET_WEEKENDS, p.quiet_weekends.then_some(1))?;
+            w.set_setting(ALL, REPLIES_THROUGH, p.replies_through.then_some(1))?;
+            w.set_setting(ALL, REVIEW, (p.review < 1440 && p.review != 9 * 60).then_some(p.review as u64 + 1))?;
+            let times = clean_times(p.digest.iter().copied());
+            let digest = if times == DIGEST_DEFAULT { None } else if times.is_empty() { Some("-".to_string()) } else { Some(times.iter().map(u16::to_string).collect::<Vec<_>>().join(",")) };
+            w.set_sync_state(ALL, DIGEST, digest.as_deref())?;
             w.set_sync_state(ALL, VIPS, (!vips.is_empty()).then(|| vips.join("\n")).as_deref())
         })?;
         Ok(())
     }
+}
+
+/// Times of day kept: valid, ascending, each once, at most [`DIGEST_MAX`].
+fn clean_times(t: impl Iterator<Item = u16>) -> Vec<u16> {
+    let mut v: Vec<u16> = t.filter(|m| *m < 1440).collect();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(DIGEST_MAX);
+    v
 }
 
 #[cfg(test)]

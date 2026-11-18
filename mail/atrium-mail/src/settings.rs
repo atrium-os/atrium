@@ -88,6 +88,22 @@ pub fn parse_hm(s: &str) -> Option<u16> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
+/// "09:00, 17:00" as minutes, ascending, each once; empty: none. `None`
+/// while any part is not yet a time, or there are too many.
+pub fn parse_times(s: &str) -> Option<Vec<u16>> {
+    let mut v = Vec::new();
+    for part in s.split([',', ' ']).filter(|p| !p.trim().is_empty()) {
+        v.push(parse_hm(part)?);
+    }
+    v.sort_unstable();
+    v.dedup();
+    (v.len() <= mail_engine::prefs::DIGEST_MAX).then_some(v)
+}
+
+pub fn format_times(t: &[u16]) -> String {
+    t.iter().map(|m| format_hm(*m)).collect::<Vec<_>>().join(", ")
+}
+
 pub fn format_hm(m: u16) -> String {
     format!("{:02}:{:02}", m / 60, m % 60)
 }
@@ -119,6 +135,10 @@ pub struct Settings {
     pub name: Mutable<TextEdit>,
     pub quiet_from: Mutable<TextEdit>,
     pub quiet_to: Mutable<TextEdit>,
+    /// When the digest of other mail comes: "09:00, 17:00"; empty: never.
+    pub digest_at: Mutable<TextEdit>,
+    /// When the Later review comes: "09:00".
+    pub review_at: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
     pub domain: Mutable<TextEdit>,
@@ -147,6 +167,8 @@ impl Settings {
             name: ui.sibling(TextEdit::new("")),
             quiet_from: ui.sibling(TextEdit::new(&f)),
             quiet_to: ui.sibling(TextEdit::new(&t)),
+            digest_at: ui.sibling(TextEdit::new(&format_times(&prefs.digest))),
+            review_at: ui.sibling(TextEdit::new(&format_hm(prefs.review))),
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
             domain: ui.sibling(TextEdit::new("")),
@@ -387,6 +409,15 @@ impl Settings {
         self.set_prefs(|p| p.weekly = !p.weekly);
     }
 
+    /// Saturday and Sunday quiet all day (§12).
+    pub fn toggle_quiet_weekends(&self) {
+        self.set_prefs(|p| p.quiet_weekends = !p.quiet_weekends);
+    }
+
+    pub fn toggle_replies_through(&self) {
+        self.set_prefs(|p| p.replies_through = !p.replies_through);
+    }
+
     pub fn toggle_vips_through(&self) {
         self.set_prefs(|p| p.vips_through = !p.vips_through);
     }
@@ -567,6 +598,17 @@ impl Settings {
                 if p.quiet != Some((f, t)) {
                     self.set_prefs(|p| p.quiet = Some((f, t)));
                 }
+            }
+        }
+        // Typed times take effect once they read as times.
+        if let Some(d) = parse_times(self.digest_at.get_cloned().text()) {
+            if d != p.digest {
+                self.set_prefs(|p| p.digest = d.clone());
+            }
+        }
+        if let Some(r) = parse_hm(self.review_at.get_cloned().text()) {
+            if r != p.review {
+                self.set_prefs(|p| p.review = r);
             }
         }
     }
@@ -847,13 +889,29 @@ impl View for SettingsView {
             ctx.place(TextField::new(self.s.quiet_to.clone()).at(fx + fw + em(32.0), fy).width(fw));
         }
         y += em(32.0);
-        if ui.prefs.quiet.is_some() {
+        let s = self.s.clone();
+        switch(ctx, x, y + em(14.0), "Quiet all weekend", ui.prefs.quiet_weekends, move || s.toggle_quiet_weekends());
+        y += em(32.0);
+        if ui.prefs.quiet.is_some() || ui.prefs.quiet_weekends {
             text(ctx, x, y + em(8.0), "Mail that comes in quiet hours is summed up when they end.", type_size::XS, Weight::Regular, t.text_tertiary());
             y += em(22.0);
             let s = self.s.clone();
             switch(ctx, x, y + em(14.0), "VIPs notify in quiet hours too", ui.prefs.vips_through, move || s.toggle_vips_through());
             y += em(32.0);
+            let s = self.s.clone();
+            switch(ctx, x, y + em(14.0), "Replies in my conversations notify too", ui.prefs.replies_through, move || s.toggle_replies_through());
+            y += em(32.0);
         }
+        // The digest of other mail and the Later review: typed times.
+        let fy = |y: f32| y + (em(28.0) - pergola::theme::size::input_height()) / 2.0;
+        text(ctx, x, y + em(14.0), "Other mail, summed up at", type_size::SM, Weight::Regular, t.text_primary());
+        ctx.place(TextField::new(self.s.digest_at.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(80.0))));
+        y += em(32.0);
+        text(ctx, x, y + em(8.0), "Times like 09:00, 17:00; leave it empty to only count it.", type_size::XS, Weight::Regular, t.text_tertiary());
+        y += em(22.0);
+        text(ctx, x, y + em(14.0), "Later: the morning review at", type_size::SM, Weight::Regular, t.text_primary());
+        ctx.place(TextField::new(self.s.review_at.clone()).at(x + em(190.0), fy(y)).width(em(72.0)));
+        y += em(32.0);
         let s = self.s.clone();
         switch(ctx, x, y + em(14.0), "Later: a weekly look on Friday afternoon", ui.prefs.weekly, move || s.toggle_weekly());
         y += em(32.0);
@@ -913,5 +971,9 @@ mod tests {
         assert_eq!(parse_hm("7"), None);
         assert_eq!(parse_hm("23:3"), None);
         assert_eq!(format_hm(425), "07:05");
+        assert_eq!(parse_times("17:00, 09:00"), Some(vec![540, 1020]));
+        assert_eq!(parse_times(" "), Some(vec![]));
+        assert_eq!(parse_times("09:00, 17"), None);
+        assert_eq!(format_times(&[540, 1020]), "09:00, 17:00");
     }
 }
