@@ -159,6 +159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-message"
 version = "0.1.0"
 dependencies = [
@@ -190,6 +197,7 @@ dependencies = [
  "fresco-protocol",
  "libc",
  "limen",
+ "monstrator",
  "officina-convert",
  "officina-core",
  "officina-draw",
@@ -1082,6 +1090,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",
@@ -1189,6 +1198,23 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "monstrator"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "atrium-links",
+ "fresco-client",
+ "fresco-protocol",
+ "libc",
+ "pergola",
+ "portcullis-ipc",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tabula",
 ]
 
 [[package]]

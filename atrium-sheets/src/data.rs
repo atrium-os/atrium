@@ -75,6 +75,14 @@ pub enum DataCmd {
     Comment,
     /// Take the comments off the selection's cells.
     DeleteComments,
+    /// Follow the cursor's link: a place in the workbook, or an address
+    /// handed to the link opener; the window runs it.
+    OpenLink,
+    /// Write or change the cursor's cell link; the window runs it (a bar
+    /// under the grid).
+    Link,
+    /// Take the links off the selection's cells.
+    RemoveLinks,
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
@@ -192,6 +200,10 @@ fn comments_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u
     wb.comments(s).range((sel.r0, 0)..=(sel.r1, u32::MAX)).map(|(&k, _)| k).filter(move |&(_, c)| (sel.c0..=sel.c1).contains(&c))
 }
 
+fn links_in(wb: &Workbook, s: u16, sel: CellRange) -> impl Iterator<Item = (u32, u32)> + '_ {
+    wb.links(s).range((sel.r0, 0)..=(sel.r1, u32::MAX)).map(|(&k, _)| k).filter(move |&(_, c)| (sel.c0..=sel.c1).contains(&c))
+}
+
 /// The most cells one merge may span (a whole column of a million rows is
 /// fine; a whole sheet is not).
 const MAX_MERGE_CELLS: u64 = 1 << 24;
@@ -219,6 +231,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
         (MenuItem::new(if wb.comment(s, row, col).is_some() { "Edit Comment…" } else { "New Comment…" }).separated(), Some(DataCmd::Comment)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
+        (MenuItem::new("Open Link").enabled(wb.link_at(CellAddr::new(s, row, col)).is_some()).separated(), Some(DataCmd::OpenLink)),
+        (MenuItem::new(if wb.link(s, row, col).is_some() { "Edit Link…" } else { "Insert Link…" }), Some(DataCmd::Link)),
+        (MenuItem::new(if nr > 1 || nc > 1 { "Remove Links" } else { "Remove Link" }).enabled(links_in(wb, s, sel).next().is_some()), Some(DataCmd::RemoveLinks)),
         if wb.merges_in(&Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 }).next().is_some() {
             (MenuItem::new("Unmerge Cells").separated(), Some(DataCmd::Unmerge))
         } else {
@@ -421,6 +436,15 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run(if n == 1 { "Delete Comment" } else { "Delete Comments" }, vec![GridOp::Comments { sheet: s, set }]);
             Ok(if n == 1 { "Comment deleted.".into() } else { format!("{n} comments deleted.") })
         }
+        DataCmd::RemoveLinks => {
+            let set: Vec<_> = links_in(&d.wb, s, sel).map(|(r, c)| (r, c, None)).collect();
+            if set.is_empty() {
+                return Ok("No links there.".into());
+            }
+            let n = set.len();
+            d.run(if n == 1 { "Remove Link" } else { "Remove Links" }, vec![GridOp::Links { sheet: s, set }]);
+            Ok(if n == 1 { "Link removed.".into() } else { format!("{n} links removed.") })
+        }
         DataCmd::Unmerge => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
             let list: Vec<Rect> = d.wb.merges(s).iter().filter(|m| !m.intersects(&r)).copied().collect();
@@ -532,7 +556,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

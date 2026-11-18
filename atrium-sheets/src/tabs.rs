@@ -42,6 +42,10 @@ pub enum TabCmd {
     Commenting,
     CommentDone,
     CommentCancel,
+    /// The link bar for the cursor's cell; its field submitted; closed.
+    Linking,
+    LinkDone,
+    LinkCancel,
 }
 
 /// The colours the tab colour bar offers, 0xRRGGBB, with their names.

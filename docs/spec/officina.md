@@ -2805,7 +2805,7 @@ codes with multi-byte characters near the end, fixed in `numfmt.rs`). A 65,536
 record by record, plain and RC4 CryptoAPI protected (`xls::sample`), and Sheets
 opens both through the real converter.
 
-Open: the missing functions above (merged cells: §16.79; comments: §16.80); `.xls` charts and pictures; Excel 4 macro sheets.
+Open: the missing functions above (merged cells: §16.79; comments: §16.80; hyperlinks: §16.81); `.xls` charts and pictures; Excel 4 macro sheets.
 
 ### 16.43 O7c as built (2026-11-15): `.doc` import
 
@@ -3638,6 +3638,20 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Sorting** moves comments with their rows (`sort::tests::comments_move_with_their_rows`).
 - **Not yet:** threaded comments (Excel 365's `threadedComments`, read as their legacy note when the file has one), rich text in comments, and printing them.
 - **Gates:** officina-grid `comments::tests`; officina-convert `tests/comments.rs` (round trips, Excel's author prefix, LibreOffice both ways); atrium-sheets `comments_are_written_shown_beside_the_cell_edited_and_deleted`.
+
+### 16.81 Cell hyperlinks (2026-11-18)
+
+- **Engine** (`officina-grid::links`). A cell may carry a link: an address (`https:`, `mailto:`, ...) or, starting `#`, a place in the workbook (`#Sheet2!B4`, `#B4`). `GridOp::Links` (journal tag 18) sets them as one undo step; the native file keeps them in chunk `LINKS` (18). Links move with inserted and deleted rows and columns and with sorted rows, as comments do. Limits: 8 KB a target, 1M links a sheet. `HYPERLINK(address, [label])` works too: `Workbook::link_at` reads either.
+- **Files.**
+  - **.xlsx:** `<hyperlinks>`; an address is an external relationship (`TargetMode="External"`), a place is the `location` attribute.
+  - **.ods:** `text:a xlink:href` in the cell's paragraph; places are written `#Sheet.A1` and read back.
+  - **LibreOffice** reads both and writes both back to us unchanged (`officina-convert/tests/links.rs`).
+- **Sheets.**
+  - A link cell is drawn in blue, unless it has a colour of its own.
+  - Data ▸ Open Link follows the cursor's link. A place shows its sheet and selects the cell. An address goes to Monstrator with the activation of that press (`open-uri` in the manifest), from a thread, and the status line says what happened. Sheets never opens an address without a press.
+  - Data ▸ Insert Link… / Edit Link… opens a bar where the tabs are. It takes `Sheet2!B4` or `B4` as a place, a bare host as `https://`, and an address as given; anything else is refused with a reason and the bar stays. An empty cell gets the target as its text, in the same undo step. An empty field removes the link, as does Data ▸ Remove Link(s) for the selection.
+- **Not yet:** Ctrl+click to follow, a tooltip with the target, link styles in printing.
+- **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
