@@ -23,6 +23,7 @@
 
 enabled       = true
 name          = "atrium-monstratord"
+class         = "idle"                          # boot class (fast-boot.md §6.3): nothing needs it before someone is logged in
 path          = "/var/lib/atrium/jails/monstratord"
 children_max  = 0
 devfs_ruleset = 4                                # devfsrules_jail: no devices

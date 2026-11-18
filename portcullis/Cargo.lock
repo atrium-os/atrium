@@ -173,6 +173,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-media"
 version = "0.1.0"
 dependencies = [
@@ -1091,6 +1098,7 @@ name = "ostiarius"
 version = "0.1.0"
 dependencies = [
  "arcad",
+ "atrium-listen",
  "libc",
  "portcullis-ipc",
  "portcullis-peer",

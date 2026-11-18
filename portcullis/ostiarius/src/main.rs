@@ -177,7 +177,12 @@ fn main() {
         // skips it (e.g. driving login by hand against an already-running UI).
         if std::env::var_os("OSTIARIUS_NO_BOOT").is_none() {
             match o.boot() {
-                Ok(pid) => eprintln!("ostiarius(prod-test): booted vestibulum (pid {pid})"),
+                Ok(pid) => {
+                    eprintln!("ostiarius(prod-test): booted vestibulum (pid {pid})");
+                    // The login screen is up: idle-class services may start
+                    // (fast-boot.md §6.3).
+                    let _ = atrium_listen::ready();
+                }
                 Err(e) => eprintln!("ostiarius(prod-test): boot vestibulum failed: {e}"),
             }
         }
@@ -204,8 +209,10 @@ fn main() {
     spawn_verify(launcher.broker_sock.clone());
     spawn_lock(SOCK);
     let mut o = with_sigillum(Ostiarius::new(launcher));
-    if let Err(e) = o.boot() {
-        eprintln!("ostiarius: boot (launch vestibulum): {e}");
+    match o.boot() {
+        Err(e) => eprintln!("ostiarius: boot (launch vestibulum): {e}"),
+        // The login screen is up: idle-class services may start (fast-boot.md §6.3).
+        Ok(_) => { let _ = atrium_listen::ready(); }
     }
     eprintln!("ostiarius: serving on {SOCK} (vestibulum-only)");
     if let Err(e) = ostiarius::control::serve(&mut o, SOCK, ostiarius::control::vestibulum_gate) {

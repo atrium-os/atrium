@@ -48,6 +48,7 @@
 
 enabled       = true
 name          = "atrium-frescod"
+class         = "login"                          # boot class (fast-boot.md §6.3): the login screen draws here
 path          = "/var/lib/atrium/jails/frescod"
 children_max  = 0
 devfs_ruleset = 23                               # atrium_display: basics + gpu/display (frescod only)

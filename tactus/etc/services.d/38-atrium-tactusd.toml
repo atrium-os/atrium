@@ -31,6 +31,7 @@
 
 enabled       = true
 name          = "atrium-tactusd"
+class         = "login"                          # boot class (fast-boot.md §6.3): keyboard and pointer for the login screen
 path          = "/var/lib/atrium/jails/tactusd"
 children_max  = 0
 devfs_ruleset = 26                               # atrium_input: basics + PS/2 (+ input hidraw, per node)

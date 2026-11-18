@@ -9,6 +9,8 @@
 
 #![deny(unsafe_code)]
 
+/// Boot order: `after` edges, classes, held dependents (fast-boot.md §6).
+pub mod boot_graph;
 pub mod cdm;
 pub mod home;
 pub mod host_mount;

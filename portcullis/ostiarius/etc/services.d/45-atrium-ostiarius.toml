@@ -26,9 +26,18 @@
 
 enabled       = true
 name          = "atrium-ostiarius"
+class         = "login"                          # boot class (fast-boot.md §6.3): the login screen
 path          = "/var/lib/atrium/jails/ostiarius"
 children_max  = 0
 devfs_ruleset = 4
+
+
+# Ready once vestibulum (the login screen) is launched: idle-class services
+# wait for that (fast-boot.md §6.3). Without frescod it never is; after the
+# timeout the idle ones start anyway.
+[ready]
+notify       = true
+timeout_secs = 60
 
 [[mounts]]
 source = "/libexec"

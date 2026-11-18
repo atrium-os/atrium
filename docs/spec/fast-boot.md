@@ -286,12 +286,15 @@ after = ["atrium-volumes", "atrium-arcad"]   # wait for these to be READY
 ```
 
 The launcher builds the graph from every enabled manifest, refuses a cycle
-(naming it), and starts each service as soon as everything it is `after` is
-ready. Services with no edges start at once. File-name order (`NN-`) stops
+(naming it: every service in the cycle counts as failed, the rest boot), and
+starts each service as soon as everything it is `after` is ready. An `after`
+name that is not an enabled manifest (a host rc daemon such as atrium-volumes)
+is ignored with a warning. Services with no edges start at once. File-name order (`NN-`) stops
 meaning anything; the numbers stay as a readable hint.
 
 If a dependency fails or gives up, its dependents are **held, not started**,
-and `portcullis status` says "waiting for atrium-arcad (failed: …)". Nothing
+and the boot status (`/var/run/atrium/boot-status`, one line per service,
+rewritten on every change) says "held, waiting for atrium-arcad (failed: …)". Nothing
 crash-loops on a missing dependency.
 
 Expected use is small: most edges disappear under §5. Likely real edges:
@@ -360,6 +363,7 @@ Gate for each milestone below: three boots, median T-login and T-settled, plus
 | **B2** | Supervisor-bound sockets: manifest `[[sockets]]`, jaild fd passing + policy, `libatrium` `listener()`, lyrad/choragusd/frescod/ostiarius converted first | choragusd never exits at boot over 20 boots; restart of lyrad does not drop choragusd |
 |  | *B2 status 2026-11-18: on main. VM gate run 3: lyrad's and choragusd's sockets bound ahead of launch, lyrad.sock keeps its inode across a restart and choragusd stays up, ostiarius waits for frescod. Boot to ssh 14–17 s (was 27 s); rc 6.5 s on GENERIC, 6.5 s on ATRIUM (WITNESS), 6.0 s on ATRIUM-NODEBUG; netif still ~4.3 s. Runs 2–3 found start-up gaps the old late start hid (lyrad's peer by name in a jail with no /etc/passwd; app- and courier-registry wiped from /var/run), now fixed. frescod's own sockets still to convert.* | |
 | **B3** | Parallel launch + readiness fd + `after` + boot classes (§6) | all services launched within one jaild round-trip window; `portcullis status` shows held services and why |
+|  | *B3 status 2026-11-18: built (portcullisd `boot_graph`: `after`, classes, cycles, held dependents, unit-tested; jaild `ExecSpec::ready` passes a pipe at the fd after the sockets as `ATRIUM_READY_FD`; `atrium_listen::ready()`; the supervisor launches from the graph, waits on readiness pipes with a timeout, writes boot-status and logs "boot settled"). frescod, ostiarius and tactusd are `login`; opifex-sheetd and monstratord `idle`; ostiarius reports ready once vestibulum is launched. Launches stay one jaild round trip each (jaild is single-threaded); the gain is that nothing waits for what it does not need. VM gate pending.* | |
 | **B4** | Clients: `service::connect`, forum-bar push subscriptions, remove fixed sleeps (§7) | grep finds no `sleep` in a connect path; bar icons right at first frame |
 | **B5** | Host rc daemons bind first via `atrium-bind` (§6.4); parallel shutdown in bootstrap | T-settled and shutdown time measured; shutdown has no serial 5 s waits |
 

@@ -44,6 +44,8 @@ const DEFAULT_SVCDIR: &str = "/etc/atrium/services.d";
 const DEFAULT_VOLUMES_SOCKET: &str = "/var/run/atrium/atrium-volumes.sock";
 
 /// How long to wait for jaild's and atrium-volumes' sockets at boot.
+/// One line per service: ready, or why not (fast-boot.md §6.2).
+const BOOT_STATUS: &str = "/var/run/atrium/boot-status";
 const JAILD_WAIT:   Duration = Duration::from_secs(30);
 const VOLUMES_WAIT: Duration = Duration::from_secs(10);
 
@@ -243,11 +245,23 @@ fn main() -> ExitCode {
         }
     }
 
+    /* The boot order (fast-boot.md §6), over every enabled manifest: one
+     * whose preparation below fails counts as failed, so whatever is
+     * `after` it is held rather than started against a missing service. */
+    let graph = portcullisd::boot_graph::BootGraph::new(enabled.iter().map(|m| {
+        portcullisd::boot_graph::Node { name: m.name.clone(), after: m.after.clone(), class: m.class }
+    }).collect());
+    let mut pending: Vec<supervisor::Pending> = Vec::new();
+
     'manifest: for m in enabled {
         let mut create_req = m.to_create_request();
         let listen_fds = bound.remove(&m.name).unwrap_or_default();
         if listen_fds.is_empty() {
             if let Some(e) = create_req.exec.as_mut() { e.listen.clear(); }
+        }
+        /* --once launches in order and waits for nothing: no readiness pipe. */
+        if matches!(driver, Driver::Once(_)) {
+            if let Some(e) = create_req.exec.as_mut() { e.ready = false; }
         }
 
         /* Resolve [[volumes]] before launching: ask atrium-volumes
@@ -307,7 +321,7 @@ fn main() -> ExitCode {
                     value: p.value.clone(),
                 }).collect(),
                 stdio: false,
-                listen: Vec::new(),
+                listen: Vec::new(), ready: false,
             };
             let client = match &mut driver {
                 Driver::Once(c)      => c,
@@ -337,6 +351,11 @@ fn main() -> ExitCode {
          * relaunch (manifest.to_create_request() alone drops
          * [[volumes]] mounts); Once mode keeps the dests for
          * teardown unmount. */
+        /* Supervised: the boot order decides when it starts (sup.start). */
+        if matches!(driver, Driver::Supervise(_)) {
+            pending.push(supervisor::Pending { manifest: m, create_req, listeners: listen_fds });
+            continue;
+        }
         let saved_req = create_req.clone();
         let mount_dests: Vec<(String, MountKind)> = saved_req.mounts.iter()
             .map(|x| (x.dest.clone(), x.kind))
@@ -346,8 +365,8 @@ fn main() -> ExitCode {
 
         let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
-            Driver::Once(c)       => supervisor::send_create(c, &req, &listen_fds),
-            Driver::Supervise(s)  => supervisor::send_create(s.client_mut(), &req, &listen_fds),
+            Driver::Once(c)       => supervisor::send_create(c, &req, &listen_fds, None),
+            Driver::Supervise(s)  => supervisor::send_create(s.client_mut(), &req, &listen_fds, None),
         };
         match send_result {
             Ok((Response::JailCreated(r), fd)) => {
@@ -389,6 +408,9 @@ fn main() -> ExitCode {
 
     match driver {
         Driver::Supervise(mut sup) => {
+            /* Launch in boot order: login class first, each service once
+             * what it is `after` is ready, idle ones after the login ones. */
+            sup.start(graph, pending, Some(PathBuf::from(BOOT_STATUS)));
             /* Drop the persistent jaild connection now that the
              * launch loop is done. While the supervisor is
              * blocked on kqueue, no one in this process holds

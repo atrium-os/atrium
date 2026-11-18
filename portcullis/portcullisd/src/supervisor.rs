@@ -61,6 +61,7 @@ pub fn install_shutdown_handlers() -> io::Result<()> {
 use jaild::protocol::{CreateJailRequest, Request, Response};
 use log::{debug, error, info, warn};
 
+use crate::boot_graph::{BootGraph, State as BootState};
 use crate::host_mount;
 use crate::jaild_client::Client;
 use crate::system_services::{RestartPolicy, ServiceManifest};
@@ -102,6 +103,12 @@ pub struct ServiceState {
     /// held for its whole life and sent again with every relaunch, so
     /// clients never see the socket vanish across a restart.
     pub listeners: Vec<std::os::fd::OwnedFd>,
+    /// The read end of the readiness pipe (fast-boot.md §6.1) while the
+    /// supervisor waits for "READY"; registered with EVFILT_READ.
+    pub ready_rd: Option<std::os::fd::OwnedFd>,
+    /// When to stop waiting for "READY" and count it failed for its
+    /// dependents (the process is left running).
+    pub ready_deadline: Option<Instant>,
     /// Tombstone flag. Set by `retire()` instead of removing the
     /// entry, because kqueue's per-kevent `udata` we use is the
     /// services-vec index — removing would invalidate other
@@ -111,22 +118,33 @@ pub struct ServiceState {
 }
 
 /// Send a CreateJail, with the service's listening sockets riding on it
-/// when it has any (ExecSpec::listen). Same reply shape as `Client::send`:
-/// the response and the procdesc, if one came back.
-pub fn send_create(c: &mut Client, req: &Request, listeners: &[std::os::fd::OwnedFd])
+/// when it has any (ExecSpec::listen), then its readiness pipe's write end
+/// (ExecSpec::ready). Same reply shape as `Client::send`: the response and
+/// the procdesc, if one came back.
+pub fn send_create(c: &mut Client, req: &Request, listeners: &[std::os::fd::OwnedFd],
+                   ready: Option<&std::os::fd::OwnedFd>)
     -> io::Result<(Response, Option<i32>)>
 {
-    if listeners.is_empty() {
+    if listeners.is_empty() && ready.is_none() {
         return c.send(req);
     }
     use std::os::fd::AsFd;
-    let fds: Vec<_> = listeners.iter().map(|f| f.as_fd()).collect();
+    let mut fds: Vec<_> = listeners.iter().map(|f| f.as_fd()).collect();
+    if let Some(r) = ready { fds.push(r.as_fd()); }
     let (resp, mut got) = c.send_with_fds(req, &fds, 1)?;
     let procdesc = if got.is_empty() { None } else { Some(got.remove(0)) };
     for extra in got {
         let _ = crate::host_mount::close_fd(extra);
     }
     Ok((resp, procdesc))
+}
+
+/// A service prepared for launch (mounts and volumes resolved) that the boot
+/// order has not started yet (fast-boot.md §6).
+pub struct Pending {
+    pub manifest:   ServiceManifest,
+    pub create_req: CreateJailRequest,
+    pub listeners:  Vec<std::os::fd::OwnedFd>,
 }
 
 #[cfg(target_os = "freebsd")]
@@ -207,6 +225,7 @@ mod ffi {
         for i in 0..n as usize {
             events.push(KqEvent {
                 udata:  out[i].udata as usize,
+                filter: out[i].filter,
                 fflags: out[i].fflags,
                 data:   out[i].data as isize,
             });
@@ -216,8 +235,51 @@ mod ffi {
 
     pub struct KqEvent {
         pub udata:  usize,
+        pub filter: i16,
         pub fflags: u32,
         pub data:   isize,
+    }
+
+    /// A readiness pipe: (read end, non-blocking; write end). Both CLOEXEC.
+    pub fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (rd, wr) = unsafe {
+            (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+        };
+        let fl = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        if fl < 0 || unsafe { libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((rd, wr))
+    }
+
+    /// Watch `fd` for reading (a readiness pipe). Closing the fd removes it.
+    pub fn register_read(kq: i32, fd: i32, udata: usize) -> io::Result<()> {
+        let mut ev = libc::kevent {
+            ident:  fd as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags:  libc::EV_ADD,
+            fflags: 0,
+            data:   0,
+            udata:  udata as *mut libc::c_void,
+            ext:    [0; 4],
+        };
+        if unsafe { libc::kevent(kq, &mut ev, 1, ptr::null_mut(), 0, ptr::null()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Read what is there without blocking. Ok(empty) is end of file.
+    pub fn read_nb(fd: i32) -> io::Result<Vec<u8>> {
+        let mut buf = [0u8; 256];
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 { return Err(io::Error::last_os_error()); }
+        Ok(buf[..n as usize].to_vec())
     }
 
     pub fn close_fd(fd: i32) -> io::Result<()> {
@@ -232,7 +294,14 @@ mod ffi {
 mod ffi {
     use std::io;
     use std::time::Duration;
-    pub struct KqEvent { pub udata: usize, pub fflags: u32, pub data: isize }
+    pub struct KqEvent { pub udata: usize, pub filter: i16, pub fflags: u32, pub data: isize }
+    pub fn pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "FreeBSD only"))
+    }
+    pub fn register_read(_kq: i32, _fd: i32, _udata: usize) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "FreeBSD only"))
+    }
+    pub fn read_nb(_fd: i32) -> io::Result<Vec<u8>> { Ok(Vec::new()) }
     pub fn kqueue() -> io::Result<i32> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "EVFILT_PROCDESC: FreeBSD only"))
     }
@@ -253,6 +322,11 @@ mod ffi {
 /// just exits, which closes the kqueue, which closes the
 /// procdescs, which kills the persist=0 jails. Clean enough for
 /// V2; V3 can add SIGTERM handling).
+#[cfg(target_os = "freebsd")]
+const READ_FILTER: i16 = libc::EVFILT_READ;
+#[cfg(not(target_os = "freebsd"))]
+const READ_FILTER: i16 = -1;
+
 pub struct Supervisor {
     kq:        i32,
     /// All services ever supervised in this Supervisor's lifetime.
@@ -276,6 +350,14 @@ pub struct Supervisor {
     client:    Option<Client>,
     /// Where to reconnect if `client` was released.
     jaild_socket_path: std::path::PathBuf,
+    /// Boot order (fast-boot.md §6) and what it has not launched yet.
+    graph:     Option<BootGraph>,
+    pending:   std::collections::HashMap<String, Pending>,
+    /// Where the boot status is written (one line per service that is not
+    /// ready, and why), e.g. /var/run/atrium/boot-status.
+    status_path: Option<std::path::PathBuf>,
+    boot_started: Instant,
+    settled_logged: bool,
 }
 
 impl Supervisor {
@@ -286,6 +368,11 @@ impl Supervisor {
             services: Vec::new(),
             client:   Some(client),
             jaild_socket_path,
+            graph:    None,
+            pending:  Default::default(),
+            status_path: None,
+            boot_started: Instant::now(),
+            settled_logged: false,
         })
     }
 
@@ -319,9 +406,178 @@ impl Supervisor {
             failure_budget_remaining: initial_budget,
             create_req,
             listeners,
+            ready_rd: None,
+            ready_deadline: None,
             retired: false,
         });
         Ok(())
+    }
+
+    /// Hand the boot order and the prepared services to the supervisor and
+    /// launch whatever may start now (fast-boot.md §6). The rest is launched
+    /// from `run()` as what they are `after` becomes ready.
+    pub fn start(&mut self, graph: BootGraph, pending: Vec<Pending>,
+                 status_path: Option<std::path::PathBuf>) {
+        for c in &graph.cycles {
+            error!("{c}: none of these services is started");
+        }
+        for (svc, dep) in &graph.unknown {
+            warn!("{svc}: after = {dep:?} is not an enabled service; ignored");
+        }
+        self.graph = Some(graph);
+        self.pending = pending.into_iter().map(|p| (p.manifest.name.clone(), p)).collect();
+        self.status_path = status_path;
+        self.boot_started = Instant::now();
+        self.launch_ready();
+    }
+
+    /// Launch every service the boot order allows now, until nothing more
+    /// can start (a service without `[ready] notify` is ready at launch,
+    /// which can unblock others at once).
+    fn launch_ready(&mut self) {
+        let mut any = false;
+        loop {
+            let names = match &self.graph { Some(g) => g.launchable(), None => return };
+            if names.is_empty() { break; }
+            any = true;
+            for name in names {
+                let Some(p) = self.pending.remove(&name) else {
+                    // Prepared nowhere (its preparation failed): count it failed.
+                    self.fail(&name, "not prepared");
+                    continue;
+                };
+                if let Err(why) = self.launch(p) {
+                    error!("{name}: {why}");
+                    self.fail(&name, &why);
+                }
+            }
+        }
+        if any {
+            /* Leave jaild free for other clients between boot steps
+             * (see release_client); the next launch reconnects. */
+            self.release_client();
+            self.write_status();
+        }
+    }
+
+    fn launch(&mut self, p: Pending) -> Result<(), String> {
+        let name = p.manifest.name.clone();
+        let notify = p.create_req.exec.as_ref().is_some_and(|e| e.ready);
+        let (rd, wr) = if notify {
+            let (r, w) = ffi::pipe().map_err(|e| format!("readiness pipe: {e}"))?;
+            (Some(r), Some(w))
+        } else { (None, None) };
+        let req = Request::CreateJail(p.create_req.clone());
+        let c = self.ensure_client().map_err(|e| format!("connect jaild: {e}"))?;
+        let res = send_create(c, &req, &p.listeners, wr.as_ref());
+        drop(wr);
+        match res {
+            Ok((Response::JailCreated(r), Some(fd))) => {
+                info!("launched {name}: pid={} ({:.0} ms into boot)", r.pid,
+                    self.boot_started.elapsed().as_secs_f64() * 1000.0);
+                let timeout = Duration::from_secs(p.manifest.ready.as_ref().map_or(30, |r| r.timeout_secs));
+                self.watch(p.manifest, fd, r.pid, p.create_req, p.listeners)
+                    .map_err(|e| format!("watch register failed: {e}"))?;
+                let idx = self.services.len() - 1;
+                if let Some(g) = &mut self.graph { g.launched(&name); }
+                match rd {
+                    Some(rd) => {
+                        use std::os::fd::AsRawFd;
+                        ffi::register_read(self.kq, rd.as_raw_fd(), idx)
+                            .map_err(|e| format!("watch readiness pipe: {e}"))?;
+                        self.services[idx].ready_rd = Some(rd);
+                        self.services[idx].ready_deadline = Some(Instant::now() + timeout);
+                    }
+                    None => if let Some(g) = &mut self.graph { g.ready(&name); },
+                }
+                Ok(())
+            }
+            Ok((Response::JailCreated(_), None)) => Err("launched without a procdesc".into()),
+            Ok((Response::PolicyDenied { rule, detail }, _)) => Err(format!("policy denied: {rule}: {detail}")),
+            Ok((Response::SyscallFailed { name: sc, errno, msg }, _)) => Err(format!("syscall {sc} failed: errno={errno} {msg}")),
+            Ok((other, _)) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(format!("rpc to jaild: {e}")),
+        }
+    }
+
+    /// Count a service failed for the boot order and hold what waits for it.
+    fn fail(&mut self, name: &str, why: &str) {
+        let Some(g) = &mut self.graph else { return };
+        for h in g.failed(name, why) {
+            if let Some(BootState::Held { because }) = g.state(&h) {
+                warn!("{h}: held, {because}");
+            }
+            self.pending.remove(&h);
+        }
+        self.write_status();
+    }
+
+    /// A readiness pipe has something: "READY" marks the service ready;
+    /// end of file (it exited before saying so) just closes our end.
+    fn handle_ready_event(&mut self, idx: usize) {
+        use std::os::fd::AsRawFd;
+        let Some(rd) = self.services[idx].ready_rd.as_ref() else { return };
+        let got = ffi::read_nb(rd.as_raw_fd());
+        let name = self.services[idx].manifest.name.clone();
+        match got {
+            Ok(b) if b.windows(5).any(|w| w == b"READY") => {
+                let t = self.services[idx].launched_at.elapsed().as_secs_f64();
+                self.services[idx].ready_rd = None;
+                self.services[idx].ready_deadline = None;
+                let first = self.graph.as_ref().is_some_and(|g| g.state(&name) == Some(&BootState::Starting));
+                if first {
+                    info!("{name}: ready {:.0} ms after launch", t * 1000.0);
+                } else {
+                    debug!("{name}: ready again {:.0} ms after relaunch", t * 1000.0);
+                }
+                if let Some(g) = &mut self.graph { g.ready(&name); }
+                self.launch_ready();
+            }
+            Ok(b) if b.is_empty() => { self.services[idx].ready_rd = None; }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => { warn!("{name}: readiness pipe: {e}"); self.services[idx].ready_rd = None; }
+        }
+    }
+
+    /// Services that did not report ready in time are counted failed for
+    /// their dependents (fast-boot.md §6.1); they keep running.
+    fn check_ready_deadlines(&mut self) {
+        let now = Instant::now();
+        let late: Vec<usize> = (0..self.services.len()).filter(|&i| {
+            let s = &self.services[i];
+            !s.retired && s.ready_deadline.is_some_and(|d| now >= d)
+        }).collect();
+        for i in late {
+            self.services[i].ready_deadline = None;
+            let name = self.services[i].manifest.name.clone();
+            let starting = self.graph.as_ref().is_some_and(|g| g.state(&name) == Some(&BootState::Starting));
+            if starting {
+                let t = self.services[i].manifest.ready.as_ref().map_or(30, |r| r.timeout_secs);
+                warn!("{name}: not ready after {t} s; counting it failed for the services after it");
+                self.fail(&name, &format!("not ready after {t} s"));
+            }
+        }
+    }
+
+    fn write_status(&mut self) {
+        let Some(g) = &self.graph else { return };
+        let mut text = String::new();
+        for n in g.ready_names() { text.push_str(&format!("{n}: ready\n")); }
+        for l in g.not_ready() { text.push_str(&l); text.push('\n'); }
+        if let Some(p) = &self.status_path {
+            let tmp = p.with_extension("tmp");
+            if std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, p)).is_err() {
+                debug!("boot status: could not write {}", p.display());
+            }
+        }
+        if !self.settled_logged && g.settled() {
+            self.settled_logged = true;
+            let not_ready = g.not_ready();
+            info!("boot settled {:.0} ms after the first launch: {} ready{}",
+                self.boot_started.elapsed().as_secs_f64() * 1000.0, g.ready_names().len(),
+                if not_ready.is_empty() { String::new() } else { format!("; {}", not_ready.join("; ")) });
+        }
     }
 
     pub fn watched_count(&self) -> usize {
@@ -362,7 +618,9 @@ impl Supervisor {
     /// services (all have retired into "never restart" state)
     /// OR a shutdown signal flips `SHUTDOWN_REQUESTED`.
     pub fn run(&mut self) -> io::Result<()> {
-        while self.services.iter().any(|s| !s.retired) {
+        while self.services.iter().any(|s| !s.retired)
+            || self.graph.as_ref().is_some_and(|g| !g.launchable().is_empty())
+        {
             if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 info!("supervisor: shutdown signal received; tearing down \
                        {} live service(s)", self.watched_count());
@@ -384,6 +642,12 @@ impl Supervisor {
                 Err(e) => return Err(e),
             };
             for ev in evs {
+                if ev.filter == READ_FILTER {
+                    if ev.udata < self.services.len() && !self.services[ev.udata].retired {
+                        self.handle_ready_event(ev.udata);
+                    }
+                    continue;
+                }
                 if ev.fflags & libc::NOTE_EXIT == 0 {
                     debug!("kevent fflags={:#x} data={} udata={}",
                         ev.fflags, ev.data, ev.udata);
@@ -401,7 +665,9 @@ impl Supervisor {
                 }
                 self.handle_exit(idx, exit_status);
             }
+            self.check_ready_deadlines();
             self.process_pending_restarts();
+            self.launch_ready();
         }
         info!("supervisor: all services retired; exit");
         Ok(())
@@ -594,6 +860,12 @@ impl Supervisor {
     /// would alias kqueue events to the wrong service.
     fn retire(&mut self, idx: usize) {
         self.services[idx].retired = true;
+        self.services[idx].ready_rd = None;
+        self.services[idx].ready_deadline = None;
+        // A service that stopped for good no longer serves, whether or not it
+        // was ready once; anything still waiting for it is held.
+        let name = self.services[idx].manifest.name.clone();
+        self.fail(&name, "stopped for good (see its exits above)");
     }
 
     /// Walk supervised services with a closed procdesc and
@@ -634,10 +906,22 @@ impl Supervisor {
         info!("{}: restarting", name);
 
         debug!("{}: sending CreateJail", name);
+        // A fresh readiness pipe for each launch.
+        let notify = self.services[idx].create_req.exec.as_ref().is_some_and(|e| e.ready);
+        let (rd, wr) = if notify {
+            match ffi::pipe() {
+                Ok((r, w)) => (Some(r), Some(w)),
+                Err(e) => {
+                    error!("{}: readiness pipe: {e}", name);
+                    self.services[idx].procdesc_fd = -1;
+                    return;
+                }
+            }
+        } else { (None, None) };
         // Take the sockets out for the call (ensure_client borrows self).
         let listeners = std::mem::take(&mut self.services[idx].listeners);
         let send_result = match self.ensure_client() {
-            Ok(c)  => send_create(c, &req, &listeners),
+            Ok(c)  => send_create(c, &req, &listeners, wr.as_ref()),
             Err(e) => {
                 error!("{}: relaunch reconnect to jaild: {e}", name);
                 self.services[idx].procdesc_fd = -1;
@@ -646,6 +930,7 @@ impl Supervisor {
             }
         };
         self.services[idx].listeners = listeners;
+        drop(wr);
         match send_result {
             Ok((Response::JailCreated(r), Some(fd))) => {
                 debug!("{}: jaild ok, registering new fd={fd} pid={}",
@@ -657,7 +942,7 @@ impl Supervisor {
                     error!("{}: re-register kevent: {e}",
                         self.services[idx].manifest.name);
                     let _ = ffi::close_fd(fd);
-                    self.services[idx].retired = true;
+                    self.retire(idx);
                     return;
                 }
                 let s = &mut self.services[idx];
@@ -665,12 +950,18 @@ impl Supervisor {
                 s.pid               = r.pid;
                 s.launched_at       = Instant::now();
                 s.burst_pause_until = None;
+                if let Some(rd) = rd {
+                    use std::os::fd::AsRawFd;
+                    if ffi::register_read(self.kq, rd.as_raw_fd(), idx).is_ok() {
+                        self.services[idx].ready_rd = Some(rd);
+                    }
+                }
             }
             Ok((Response::JailCreated(_), None)) => {
                 warn!("{}: relaunch returned no procdesc (was a persistent-jail manifest?). \
                        Dropping from supervised set.",
                     self.services[idx].manifest.name);
-                self.services[idx].retired = true;
+                self.retire(idx);
             }
             Ok((other, _)) => {
                 error!("{}: relaunch jaild rejected: {other:?}",
@@ -713,6 +1004,9 @@ mod tests {
                 env:  vec![],
             }),
             sockets: vec![],
+            after: vec![],
+            class: Default::default(),
+            ready: None,
             supervision: crate::system_services::Supervision {
                 restart: RestartPolicy::Never,
                 ..Default::default()

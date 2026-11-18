@@ -768,10 +768,10 @@ fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier:
     /* ★ Listening sockets (ExecSpec::listen) are for long-running services
      * the supervisor starts, not one-shots. The descriptors themselves are
      * checked in the server (check_listen), against listen_path_allowed. */
-    if !exec.listen.is_empty() && (instance_root || courier) {
+    if (!exec.listen.is_empty() || exec.ready) && (instance_root || courier) {
         return Err(JaildError::PolicyViolation {
             rule:   "exec.listen.not_service",
-            detail: "only a service may be handed listening sockets".into(),
+            detail: "only a service may be handed listening sockets or a readiness pipe".into(),
         });
     }
 
@@ -1033,7 +1033,7 @@ mod tests {
                 uid:  1001,
                 gid:  1001,
                 stdio,
-                listen: Vec::new(),
+                listen: Vec::new(), ready: false,
             }),
             hostname: None,
             hostid: None,
@@ -1609,7 +1609,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -1625,7 +1625,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1643,7 +1643,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1661,7 +1661,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -1682,7 +1682,7 @@ mod tests {
             uid:  1001,
             gid:  1001,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -1874,7 +1874,7 @@ mod tests {
         r.exec = Some(ExecSpec {
             path: path.into(), argv: vec![path.into()], env: vec![],
             uid, gid: uid, stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         r
     }
@@ -2079,7 +2079,7 @@ mod tests {
             uid:  100, // below min_user_uid=1000 and not system
             gid:  100,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -2094,7 +2094,7 @@ mod tests {
             env:  vec![],
             uid, gid,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         });
         r
     }

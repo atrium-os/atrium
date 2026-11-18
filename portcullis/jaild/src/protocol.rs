@@ -456,6 +456,14 @@ pub struct ExecSpec {
     /// or FUSE serving. At most [`MAX_LISTEN_FDS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<String>,
+    /// ★ Readiness (fast-boot.md §6.1): one more descriptor rides the
+    /// request after the listening sockets, the write end of a pipe. The
+    /// service gets it at the next fd and its number in ATRIUM_READY_FD, and
+    /// writes "READY\n" there once it serves; the supervisor holds the read
+    /// end and starts the services that are `after` it. jaild checks it is a
+    /// pipe open for writing. Services only, never with `stdio` or FUSE.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready: bool,
 }
 
 /// The most listening sockets one service may be handed (choragusd has 8).

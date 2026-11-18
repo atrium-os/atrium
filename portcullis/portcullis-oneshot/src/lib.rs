@@ -462,7 +462,7 @@ pub fn run_with_fds(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra
             uid:   pw.uid,
             gid:   pw.gid,
             stdio: true,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         }),
         rctl,
         hostname: Some(manifest.app.id.clone()),

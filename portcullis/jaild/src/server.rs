@@ -231,6 +231,18 @@ fn dispatch(
         Request::CreateJail(r) => r.exec.as_ref().map_or(0, |e| e.listen.len()),
         _ => 0,
     };
+    /* ★ And its readiness pipe (ExecSpec::ready, fast-boot.md §6.1), one
+     * descriptor after the sockets; both ride in `listen` from here on. */
+    let ready_n = match &req {
+        Request::CreateJail(r) => r.exec.as_ref().map_or(0, |e| e.ready as usize),
+        _ => 0,
+    };
+    if ready_n > 0 && (wants_stdio || matches!(&req, Request::CreateJail(r) if r.fuse.is_some())) {
+        return (Response::PolicyDenied {
+            rule:   "exec.ready.combined".into(),
+            detail: "exec.ready cannot be combined with exec.stdio or fuse".into(),
+        }, Vec::new());
+    }
     if listen_n > 0 && (wants_stdio || matches!(&req, Request::CreateJail(r) if r.fuse.is_some())) {
         return (Response::PolicyDenied {
             rule:   "exec.listen.combined".into(),
@@ -238,12 +250,12 @@ fn dispatch(
         }, Vec::new());
     }
     let mut fds = fds;
-    let listen: Vec<OwnedFd> = if listen_n > 0 {
-        if listen_n > protocol::MAX_LISTEN_FDS || fds.len() != listen_n {
+    let listen: Vec<OwnedFd> = if listen_n + ready_n > 0 {
+        if listen_n > protocol::MAX_LISTEN_FDS || fds.len() != listen_n + ready_n {
             return (Response::PolicyDenied {
                 rule:   "exec.listen.fd_count".into(),
-                detail: format!("exec.listen names {listen_n} socket(s) (at most {}); \
-                                 the request carries {} descriptor(s)",
+                detail: format!("exec.listen names {listen_n} socket(s) (at most {}) and exec.ready \
+                                 {ready_n} pipe; the request carries {} descriptor(s)",
                                 protocol::MAX_LISTEN_FDS, fds.len()),
             }, Vec::new());
         }
@@ -844,7 +856,17 @@ fn handle_create(
 ) -> Result<CreateOutcome, JaildError> {
     validator::validate_create(req, policy)?;
     if let Some(exec) = &req.exec {
-        check_listen(req, &exec.listen, &listen)?;
+        let n = exec.listen.len().min(listen.len());
+        check_listen(req, &exec.listen, &listen[..n])?;
+        if exec.ready {
+            match listen.get(n).map(|fd| ffi::is_write_pipe(fd)) {
+                Some(Ok(true)) => {}
+                _ => return Err(JaildError::PolicyViolation {
+                    rule:   "exec.ready",
+                    detail: "exec.ready's descriptor must be a pipe open for writing".into(),
+                }),
+            }
+        }
     }
     // The filter the kernel will hold for the jail's whole life
     // (jail-sysfil.md §5.3), resolved once here from the policy.
@@ -1496,6 +1518,7 @@ fn handle_create_with_exec(
         }
 
         /* A service's listening sockets (ExecSpec::listen) at fd 3, 4, …,
+         * then its readiness pipe (ExecSpec::ready) if it has one,
          * before jail_attach like every other fd setup. Never together with
          * FUSE's descriptors (dispatch refuses that), so the slots are free. */
         if !listen.is_empty() {
@@ -1612,7 +1635,7 @@ fn handle_create_with_exec(
             ffi::child_exit(103);
         }
         let mut env_pairs: Vec<(String, String)> = exec.env.iter()
-            .filter(|p| !p.key.starts_with("ATRIUM_LISTEN_"))
+            .filter(|p| !p.key.starts_with("ATRIUM_LISTEN_") && p.key != "ATRIUM_READY_FD")
             .map(|p| (p.key.clone(), p.value.clone()))
             .collect();
         /* Set by jaild, never by the caller: how many sockets sit at fd 3…
@@ -1623,6 +1646,9 @@ fn handle_create_with_exec(
             env_pairs.push(("ATRIUM_LISTEN_PATHS".into(), exec.listen.iter()
                 .map(|p| validator::listen_path_in_jail(req, p).unwrap_or_default())
                 .collect::<Vec<_>>().join(":")));
+        }
+        if exec.ready {
+            env_pairs.push(("ATRIUM_READY_FD".into(), (3 + exec.listen.len()).to_string()));
         }
         match ffi::execve(&exec.path, &exec.argv, &env_pairs) {
             Ok(_) => unreachable!("execve returned Ok on success"),

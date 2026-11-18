@@ -85,7 +85,7 @@ fn main() {
             uid,
             gid: uid,
             stdio: false,
-            listen: Vec::new(),
+            listen: Vec::new(), ready: false,
         }),
         hostname: None,
         hostid: None,

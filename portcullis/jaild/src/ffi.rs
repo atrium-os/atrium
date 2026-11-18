@@ -1068,6 +1068,21 @@ pub fn install_child_fds(fds: &[i32]) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `fd` is a pipe (or FIFO) open for writing: ExecSpec::ready's
+/// readiness descriptor.
+pub fn is_write_pipe(fd: &impl std::os::fd::AsRawFd) -> io::Result<bool> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: fstat into a zeroed stat and fcntl(F_GETFL) on a borrowed fd.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 { return Err(io::Error::last_os_error()); }
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl < 0 { return Err(io::Error::last_os_error()); }
+        Ok((st.st_mode & libc::S_IFMT) == libc::S_IFIFO && (fl & libc::O_ACCMODE) != libc::O_RDONLY)
+    }
+}
+
 /// Send one descriptor over a Unix socket (SCM_RIGHTS), with one byte.
 pub fn send_one_fd(sock: i32, fd: i32) -> io::Result<()> {
     #[allow(unsafe_code)]

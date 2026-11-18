@@ -10,6 +10,10 @@
 //! [`listener`] gives the service the inherited socket for a path if it has
 //! one, and otherwise binds the path itself, so the same code runs under the
 //! supervisor, by hand, in tests and on macOS.
+//!
+//! [`ready`] tells the supervisor the service now serves (fast-boot.md §6.1),
+//! for services whose manifest has `[ready] notify = true`: the ones other
+//! services are `after`. Without a readiness pipe it does nothing.
 
 #![deny(unsafe_code)]
 
@@ -94,6 +98,27 @@ fn set_cloexec(fd: i32) {
     }
 }
 
+/// Report readiness: write "READY\n" to `$ATRIUM_READY_FD` and close it.
+/// Call once the service serves (its listeners are taken and its state is
+/// loaded). A no-op when there is no readiness pipe (run by hand, in tests,
+/// or a manifest without `[ready] notify`), and only the first call writes.
+pub fn ready() -> io::Result<()> {
+    use std::io::Write;
+    static DONE: Mutex<bool> = Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if *done { return Ok(()); }
+    *done = true;
+    let Some(fd) = std::env::var("ATRIUM_READY_FD").ok().and_then(|v| v.parse::<i32>().ok()) else {
+        return Ok(());
+    };
+    if fd < 3 { return Ok(()); }
+    // SAFETY: jaild put the pipe's write end at this fd for us, and only
+    // this function (guarded by DONE) takes it.
+    #[allow(unsafe_code)]
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(b"READY\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +160,25 @@ mod tests {
         let l = UnixListener::from(fd);
         let _c = std::os::unix::net::UnixStream::connect(&host).unwrap();
         l.accept().unwrap();
+    }
+
+    #[test]
+    fn ready_writes_once_to_the_pipe() {
+        use std::io::Read;
+        let mut fds = [0i32; 2];
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            assert_eq!(libc::dup2(fds[1], 302), 302);
+            libc::close(fds[1]);
+        }
+        std::env::set_var("ATRIUM_READY_FD", "302");
+        ready().unwrap();
+        ready().unwrap(); // second call: nothing more, fd already closed
+        #[allow(unsafe_code)]
+        let mut r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut got = String::new();
+        r.read_to_string(&mut got).unwrap(); // EOF: ready() closed the write end
+        assert_eq!(got, "READY\n");
     }
 }

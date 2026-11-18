@@ -112,6 +112,22 @@ pub struct ServiceManifest {
     #[serde(default)]
     pub sockets: Vec<ManifestSocket>,
 
+    /// Services (by manifest `name`) that must be ready before this one is
+    /// launched (fast-boot.md §6.2). Names that are not enabled manifests
+    /// are ignored with a warning; a cycle refuses the whole set.
+    #[serde(default)]
+    pub after: Vec<String>,
+
+    /// Boot class (fast-boot.md §6.3): `login`, `system` (default) or `idle`.
+    #[serde(default)]
+    pub class: crate::boot_graph::BootClass,
+
+    /// `[ready] notify = true`: the service reports readiness itself by
+    /// writing "READY\n" to $ATRIUM_READY_FD (fast-boot.md §6.1). Without it,
+    /// a service is ready once launched (its sockets are already bound).
+    #[serde(default)]
+    pub ready: Option<ManifestReady>,
+
     #[serde(default)]
     pub supervision: Supervision,
 
@@ -444,6 +460,19 @@ pub struct ManifestExec {
     pub env:  Vec<ManifestEnv>,
 }
 
+/// `[ready]`: how a service reports that it serves.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ManifestReady {
+    #[serde(default)]
+    pub notify: bool,
+    /// How long to wait for "READY" before counting it as failed for the
+    /// services that are `after` it (it is not killed for that).
+    #[serde(default = "default_ready_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_ready_timeout() -> u64 { 30 }
+
 /// One `[[sockets]]` entry: a listening Unix socket at a host path under
 /// one of the service's rw_nullfs mount sources, owned and moded as given.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -508,6 +537,7 @@ impl ServiceManifest {
                 }).collect(),
                 stdio: false,
                 listen: self.sockets.iter().map(|k| k.path.clone()).collect(),
+                ready: self.ready.as_ref().is_some_and(|r| r.notify),
             }),
             hostname: None,
             hostid: None,
@@ -693,6 +723,9 @@ mod tests {
             allow_tessera_keys: false,
             exec: None,
             sockets: vec![],
+            after: vec![],
+            class: Default::default(),
+            ready: None,
             supervision: Supervision::default(),
             capabilities: Capabilities::default(),
         };
