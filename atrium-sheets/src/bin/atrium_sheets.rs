@@ -167,6 +167,18 @@ struct Run {
     target: Option<Target>,
     locked: Option<Locked>,
     root: PathBuf,
+    /// A file being read (converted, loaded and recalculated) on its own
+    /// thread, so the window keeps answering however big the file is.
+    opening: Option<Opening>,
+}
+
+struct Opening {
+    name: String,
+    /// Read to compare with (Compare with…), not to open.
+    compare: bool,
+    target: Option<Target>,
+    read_only: bool,
+    loading: atrium_sheets::files::Loading,
 }
 
 impl Run {
@@ -277,14 +289,17 @@ impl Run {
         }
     }
 
-    /// Compares the window's workbook with the picked copy.
+    /// Compares the window's workbook with the picked copy, read on its own
+    /// thread as an open is.
     fn compare(&mut self, name: String, fd: std::os::fd::OwnedFd) {
         let mut f = File::from(fd);
-        match read_all(&mut f).map_err(|e| e.to_string()).and_then(|data| load_with(&name, &data, None).map_err(|e| match e {
-            ConvertError::NeedsPassword | ConvertError::WrongPassword => format!("“{name}” is protected; open it and save an unprotected copy to compare with."),
-            ConvertError::Failed(e) => e,
-        })) {
-            Ok(d) => self.sheets.compare_with(&name, d.wb),
+        match read_all(&mut f) {
+            Ok(data) => {
+                self.open_bytes(name, data, None, true, None);
+                if let Some(o) = &mut self.opening {
+                    o.compare = true;
+                }
+            }
             Err(e) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
         }
     }
@@ -292,7 +307,33 @@ impl Run {
     /// Opens `data` (named `name`), with `password` when it is protected;
     /// without the right one, the password bar asks and the file waits.
     fn open_bytes(&mut self, name: String, data: Vec<u8>, target: Option<Target>, read_only: bool, password: Option<&str>) {
-        match load_with(&name, &data, password) {
+        let loading = match atrium_sheets::files::Loading::start(&name, data, password) {
+            Ok(l) => l,
+            Err(e) => {
+                self.set_status(format!("Couldn't open “{name}”: {e}"));
+                return;
+            }
+        };
+        // A file still opening is dropped for this one (its thread finishes unheard).
+        self.set_status(format!("Reading “{name}”…"));
+        self.opening = Some(Opening { name, compare: false, target, read_only, loading });
+    }
+
+    /// The file being opened, if its thread is done: on screen, or the
+    /// password asked for, or why not. True while one is still opening.
+    fn poll_open(&mut self) -> bool {
+        let Some(o) = &self.opening else { return false };
+        let Some((r, data)) = o.loading.poll() else { return true };
+        let Opening { name, compare, target, read_only, .. } = self.opening.take().unwrap();
+        if compare {
+            match r {
+                Ok(d) => self.sheets.compare_with(&name, d.wb),
+                Err(ConvertError::NeedsPassword | ConvertError::WrongPassword) => self.set_status(format!("Couldn't compare with “{name}”: it is protected; open it and save an unprotected copy to compare with.")),
+                Err(ConvertError::Failed(e)) => self.set_status(format!("Couldn't compare with “{name}”: {e}")),
+            }
+            return false;
+        }
+        match r {
             Ok(mut d) => {
                 if read_only {
                     d.status = format!("{} It opened read-only: Save asks where to put a copy.", d.status);
@@ -306,6 +347,7 @@ impl Run {
             }
             Err(ConvertError::Failed(e)) => self.set_status(e),
         }
+        false
     }
 
     /// Restores a protected document's autosave folder, asking for its
@@ -427,7 +469,7 @@ fn main() {
         Mutable::with_dirty(0u64, dirty.clone()),
         (win.width, win.height),
     );
-    let mut run = Run { sheets, target: None, locked: None, root: root.clone() };
+    let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None };
     run.show(doc, target);
     if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
@@ -449,7 +491,8 @@ fn main() {
     'main: loop {
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
-        let wait = if recalculating { 1 } else if asking.is_some() { 20 } else { 250 };
+        let opening = run.poll_open();
+        let wait = if recalculating { 1 } else if asking.is_some() || opening { 20 } else { 250 };
         match win.step(&mut app, Some(Duration::from_millis(wait))) {
             // Unsaved changes: ask first. Asked to close again while asking (or
             // while picking), the changes stay in the autosave folder.
