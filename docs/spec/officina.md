@@ -3650,8 +3650,10 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - A link cell is drawn in blue, unless it has a colour of its own.
   - Data ▸ Open Link follows the cursor's link. A place shows its sheet and selects the cell. An address goes to Monstrator with the activation of that press (`open-uri` in the manifest), from a thread, and the status line says what happened. Sheets never opens an address without a press.
   - Data ▸ Insert Link… / Edit Link… opens a bar where the tabs are. It takes `Sheet2!B4` or `B4` as a place, a bare host as `https://`, and an address as given; anything else is refused with a reason and the bar stays. An empty cell gets the target as its text, in the same undo step. An empty field removes the link, as does Data ▸ Remove Link(s) for the selection.
-- **Not yet:** Ctrl+click to follow, a tooltip with the target, link styles in printing.
-- **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`.
+  - Ctrl+click (or Cmd+click) on a cell selects it and follows its link, with that click's activation. Pointer events carry no modifiers, so `pergola::input::pointer_modifiers()` keeps those of the last button event, and the grid sends `GridAction::Follow`.
+  - With the cursor on a link cell and no edit open, the target shows beside the cell ("Go to Sheet2!B4" for a place) with "Ctrl+click to open". It shares the comment box when the cell has both.
+- **Not yet:** link styles in printing.
+- **Gates:** officina-grid `links::tests`; officina-convert `tests/links.rs` (round trips, LibreOffice both ways); atrium-sheets `links_are_inserted_followed_and_removed`; pergola `ctrl_click_selects_and_asks_to_follow`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

@@ -433,6 +433,9 @@ pub enum GridAction {
     PlaceFloat { key: u64, at: [f64; 4] },
     /// Delete with float `key` picked.
     DeleteFloat(u64),
+    /// Ctrl (or Cmd) + click on cell (`row`, `col`): follow what it links
+    /// to, if anything. The click's activation is current.
+    Follow { row: u32, col: u32 },
 }
 
 impl GridState {
@@ -775,6 +778,14 @@ impl GridView {
                         commit(&mut g, &act);
                         let at = src.merge_at(cell.0, cell.1).map_or(cell, |m| (m.r0, m.c0));
                         g.select(at.0, at.1);
+                        let m = crate::input::pointer_modifiers();
+                        if m.ctrl || m.meta {
+                            gst.set(g);
+                            if let Some(f) = &act {
+                                f(GridAction::Follow { row: at.0, col: at.1 });
+                            }
+                            return;
+                        }
                         g.drag = Drag::Cells;
                     }
                     DragPhase::Move if g.drag == Drag::Cells => g.cursor = cell,
@@ -1660,6 +1671,28 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(hw + 158.0 + 30.0, HEADER_H / 2.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 2, r1: 99, c1: 2 });
+    }
+
+    #[test]
+    fn ctrl_click_selects_and_asks_to_follow() {
+        let (mut app, _, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let p = Point::new(hw + 2.0 * 64.0 + 10.0, HEADER_H + 3.0 * 20.0 + 5.0);
+        crate::input::set_pointer_modifiers(Modifiers { ctrl: true, ..Default::default() });
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerMove { at: Point::new(p.x + 80.0, p.y + 40.0) });
+        app.handle_event(Event::PointerUp { at: p });
+        crate::input::set_pointer_modifiers(Modifiers::default());
+        app.tick();
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 3, c0: 2, r1: 3, c1: 2 });
+        assert_eq!(log.borrow().last(), Some(&GridAction::Follow { row: 3, col: 2 }));
+        // A plain click doesn't.
+        log.borrow_mut().clear();
+        app.handle_event(Event::PointerDown { at: p });
+        app.handle_event(Event::PointerUp { at: p });
+        app.tick();
+        assert!(!log.borrow().iter().any(|a| matches!(a, GridAction::Follow { .. })));
     }
 
     #[test]

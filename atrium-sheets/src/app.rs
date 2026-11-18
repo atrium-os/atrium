@@ -613,7 +613,10 @@ impl Sheets {
             (l, p)
         };
         let Some(link) = link else {
-            self.set_status("There's no link in this cell.");
+            // A Ctrl+click on a plain cell just selects it.
+            if press.is_none() {
+                self.set_status("There's no link in this cell.");
+            }
             return;
         };
         if !link.is_external() {
@@ -628,7 +631,7 @@ impl Sheets {
             return;
         }
         let Some(token) = press else {
-            self.set_status("Choose Open Link in the Data menu to open this link.");
+            self.set_status("Ctrl+click the cell, or choose Open Link in the Data menu, to open this link.");
             return;
         };
         let (url, out) = (link.target.to_string(), self.opened.clone());
@@ -1023,6 +1026,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
+            GridAction::Follow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1167,7 +1171,17 @@ impl View for Sheets {
         let doc = self.doc.clone();
         let rev = self.rev.clone();
         let src = self.source.clone();
-        GridView::new(self.source.clone(), self.scroll.clone(), self.grid.clone(), Self::grid_rect(w, h)).on_action(move |a| Self::act(&doc, &src, &rev, a)).emit(ctx);
+        let (cmds, press) = (self.cmds.clone(), self.link_press.clone());
+        GridView::new(self.source.clone(), self.scroll.clone(), self.grid.clone(), Self::grid_rect(w, h))
+            .on_action(move |a| match a {
+                // Ctrl+click: the cell is selected; follow its link with this click.
+                GridAction::Follow { .. } => {
+                    press.set(pergola::clipboard::current_activation());
+                    cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
+                }
+                a => Self::act(&doc, &src, &rev, a),
+            })
+            .emit(ctx);
 
         self.render_tabs(ctx, w, h - STATUS_H - crate::tabs::TABS_H);
 
@@ -2122,6 +2136,10 @@ mod tests {
         assert!(s.linking.get().is_none());
         assert_eq!(&*s.doc.borrow().wb.link(0, 0, 0).unwrap().target, "#Totals!C5");
         assert_eq!(pergola::widgets::GridSource::cell(&*s.source, 0, 0).unwrap().color, Some(pergola::theme::palette::info_600()));
+        // With the cursor on it, where it goes shows beside the cell.
+        let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+        let shown: Vec<String> = tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        assert!(shown.iter().any(|t| t == "Go to Totals!C5") && shown.iter().any(|t| t == "Ctrl+click to open"), "{shown:?}");
         run(Cmd::Data(crate::data::DataCmd::OpenLink));
         assert_eq!(s.doc.borrow().sheet, 1);
         assert_eq!(grid.get_cloned().cursor, (4, 2));
@@ -2137,7 +2155,7 @@ mod tests {
         drop(d);
         // Without a press it isn't handed on.
         run(Cmd::Data(crate::data::DataCmd::OpenLink));
-        assert_eq!(s.doc.borrow().status, "Choose Open Link in the Data menu to open this link.");
+        assert!(s.doc.borrow().status.starts_with("Ctrl+click the cell"));
         // Not a link: refused, the bar stays.
         at(1, 0);
         run(Cmd::Data(crate::data::DataCmd::Link));

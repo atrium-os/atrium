@@ -427,28 +427,56 @@ impl SheetSource {
     /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
     fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
-        let (author, text) = {
+        let (comment, link) = {
             let d = self.doc.borrow();
-            let k = d.wb.comment(d.sheet, r, c)?;
-            (k.author.to_string(), k.text.to_string())
+            let k = d.wb.comment(d.sheet, r, c).map(|k| (k.author.to_string(), k.text.to_string()));
+            let l = d.wb.link_at(CellAddr::new(d.sheet, r, c)).map(|l| l.target.to_string());
+            (k, l)
         };
+        if comment.is_none() && link.is_none() {
+            return None;
+        }
         let ink = Color::rgba(0.11, 0.11, 0.09, 1.0);
-        let st = |bold: bool| pergola::TextStyle { family: pergola::theme::font::SANS.into(), size: 12.0, weight: if bold { pergola::theme::Weight::Semibold } else { pergola::theme::Weight::Regular }, color: ink };
+        // 0 plain, 1 bold, 2 the link, 3 the hint under it.
+        let st = |kind: u8| pergola::TextStyle {
+            family: pergola::theme::font::SANS.into(),
+            size: if kind == 3 { 11.0 } else { 12.0 },
+            weight: if kind == 1 { pergola::theme::Weight::Semibold } else { pergola::theme::Weight::Regular },
+            color: match kind {
+                2 => palette::info_600(),
+                3 => Color::rgba(0.4, 0.38, 0.3, 1.0),
+                _ => ink,
+            },
+        };
         let pad = 8.0;
         let lh = 16.0;
-        let mut lines: Vec<(String, bool)> = Vec::new();
-        if !author.is_empty() {
-            lines.push((author, true));
+        let mut lines: Vec<(String, u8)> = Vec::new();
+        if let Some((author, text)) = comment {
+            if !author.is_empty() {
+                lines.push((author, 1));
+            }
+            lines.extend(wrap_lines(&text, &st(0), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, 0)));
         }
-        lines.extend(wrap_lines(&text, &st(false), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, false)));
+        let linked = link.is_some();
+        if let Some(t) = link {
+            let shown = t.strip_prefix('#').map_or_else(|| t.clone(), |p| format!("Go to {p}"));
+            lines.extend(wrap_lines(&shown, &st(2), NOTE_W - 2.0 * pad, 3).into_iter().map(|l| (l, 2)));
+            lines.push(("Ctrl+click to open".into(), 3));
+        }
         let h = 2.0 * pad + lh * lines.len() as f32;
+        // A comment's pale yellow; a link alone, a plain white box.
+        let (edge, fill) = if lines.iter().any(|l| l.1 < 2) || !linked {
+            (Color::rgba(0.55, 0.5, 0.3, 1.0), Color::rgba(1.0, 0.97, 0.78, 1.0))
+        } else {
+            (Color::rgba(0.62, 0.64, 0.68, 1.0), Color::rgba(1.0, 1.0, 1.0, 1.0))
+        };
         let mut nodes = vec![
-            pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, NOTE_W, h), fill: Color::rgba(0.55, 0.5, 0.3, 1.0), radius: 3.0 },
-            pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, NOTE_W - 2.0, h - 2.0), fill: Color::rgba(1.0, 0.97, 0.78, 1.0), radius: 2.0 },
+            pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, NOTE_W, h), fill: edge, radius: 3.0 },
+            pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, NOTE_W - 2.0, h - 2.0), fill, radius: 2.0 },
         ];
-        for (i, (l, bold)) in lines.into_iter().enumerate() {
-            let w = pergola::text::measure(&l, &st(bold)).w.min(NOTE_W - 2.0 * pad);
-            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad + i as f32 * lh, w, lh), content: l, style: st(bold) });
+        for (i, (l, kind)) in lines.into_iter().enumerate() {
+            let w = pergola::text::measure(&l, &st(kind)).w.min(NOTE_W - 2.0 * pad);
+            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad + i as f32 * lh, w, lh), content: l, style: st(kind) });
         }
         // Beside the cell (or its merged area), level with its top.
         let (c1, r0) = {

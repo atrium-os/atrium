@@ -10,12 +10,28 @@
 use crate::event::{Event, Key, KeyEventKind, Modifiers, ScrollPhase};
 use crate::geom::Point;
 
+thread_local! {
+    static POINTER_MODS: std::cell::Cell<Modifiers> = const { std::cell::Cell::new(Modifiers { ctrl: false, shift: false, alt: false, meta: false }) };
+}
+
+/// The modifier keys held at the last pointer press or release (a
+/// Ctrl+click on a link, say): pointer events don't carry them.
+pub fn pointer_modifiers() -> Modifiers {
+    POINTER_MODS.with(|m| m.get())
+}
+
+/// Sets what [`pointer_modifiers`] answers ([`translate`] does, and tests).
+pub fn set_pointer_modifiers(m: Modifiers) {
+    POINTER_MODS.with(|c| c.set(m));
+}
+
 /// Map a fresco-client event to Pergola's input model. Returns `None`
 /// when the input is irrelevant to the toolkit (e.g. window-resize
 /// events, which the App handles separately).
 pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
     match ev {
-        fresco_client::Event::PointerButton { x, y, pressed, .. } => {
+        fresco_client::Event::PointerButton { x, y, pressed, modifiers, .. } => {
+            set_pointer_modifiers(decode_modifiers(*modifiers));
             let at = Point::new(*x, *y);
             Some(if *pressed {
                 Event::PointerDown { at }
