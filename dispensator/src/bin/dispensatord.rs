@@ -1532,7 +1532,8 @@ mod run {
         // SAFETY: f_fstypename and f_mntonname are NUL-terminated by the kernel.
         let ty = unsafe { std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr()) };
         let on = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
-        (ty.to_bytes() == b"fusefs" && on.to_bytes() == mnt.as_bytes())
+        // A FUSE server's mount, or a trusted stick's (the kernel's tessera).
+        (matches!(ty.to_bytes(), b"fusefs" | b"tessera") && on.to_bytes() == mnt.as_bytes())
             .then(|| (st.f_blocks * st.f_bsize, st.f_bavail.max(0) as u64 * st.f_bsize))
     }
 
