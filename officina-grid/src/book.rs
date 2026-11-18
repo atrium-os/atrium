@@ -37,11 +37,13 @@ pub struct Sheet {
     pub hidden: Vec<(u32, u32)>,
     /// The auto-filter, if the sheet has one.
     pub filter: Option<crate::filter::AutoFilter>,
+    /// The colour of its tab, 0xRRGGBB.
+    pub tab_color: Option<u32>,
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -268,7 +270,7 @@ impl Workbook {
     pub fn drop_last_sheet(&mut self) -> Option<String> {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
-        let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none();
+        let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none();
         let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;

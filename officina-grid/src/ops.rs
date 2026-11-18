@@ -78,6 +78,8 @@ pub enum GridOp {
     /// Sheet `from` moved to place `to` ([`Workbook::move_sheet`]); its inverse
     /// moves it back.
     MoveSheet { from: u16, to: u16 },
+    /// A sheet's tab colour (0xRRGGBB), or none.
+    TabColor { sheet: u16, color: Option<u32> },
 }
 
 impl GridOp {
@@ -213,6 +215,18 @@ impl GridOp {
                 w.u16(*to);
                 return w.into_bytes();
             }
+            GridOp::TabColor { sheet, color } => {
+                w.u8(15);
+                w.u16(*sheet);
+                match color {
+                    Some(c) => {
+                        w.u8(1);
+                        w.u32(*c & 0xFF_FFFF);
+                    }
+                    None => w.u8(0),
+                }
+                return w.into_bytes();
+            }
             GridOp::RenameSheet { sheet, name } => {
                 w.u8(13);
                 w.u16(*sheet);
@@ -320,8 +334,17 @@ impl GridOp {
             }
             return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
         }
-        if (11..=14).contains(&kind) {
+        if (11..=15).contains(&kind) {
             let op = match kind {
+                15 => {
+                    let sheet = r.u16()?;
+                    let color = match r.u8()? {
+                        0 => None,
+                        1 => Some(r.u32()? & 0xFF_FFFF),
+                        _ => return Err(WireError::Invalid("tab colour")),
+                    };
+                    GridOp::TabColor { sheet, color }
+                }
                 14 => GridOp::MoveSheet { from: r.u16()?, to: r.u16()? },
                 11 => GridOp::AddSheet(r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string()),
                 12 => GridOp::DropSheet,
@@ -468,6 +491,13 @@ impl Op<Workbook> for GridOp {
                 } else {
                     GridOp::Batch(Vec::new())
                 }
+            }
+            GridOp::TabColor { sheet, color } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                let old = std::mem::replace(&mut wb.sheet_mut(sheet).tab_color, color);
+                GridOp::TabColor { sheet, color: old }
             }
             GridOp::RenameSheet { sheet, name } => match wb.rename_sheet(sheet, &name) {
                 Ok(old) => GridOp::RenameSheet { sheet, name: old },
@@ -636,6 +666,33 @@ mod tests {
     fn a(s: &str) -> CellAddr {
         let (r, c) = crate::addr::parse_a1(s).unwrap();
         CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn tab_colours_are_set_undone_and_saved() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("One").unwrap();
+        wb.add_sheet("Two").unwrap();
+        let op = GridOp::TabColor { sheet: 1, color: Some(0x2E7D32) };
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        let none = GridOp::TabColor { sheet: 0, color: None };
+        assert_eq!(GridOp::decode(&none.encode()).unwrap(), none);
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Tab Colour", vec![op]);
+        assert_eq!(wb.sheet(1).tab_color, Some(0x2E7D32));
+        // It goes with the sheet when sheets move, and into the file.
+        h.run(&mut wb, "Move Sheet", vec![GridOp::MoveSheet { from: 1, to: 0 }]);
+        assert_eq!((wb.sheet(0).tab_color, wb.sheet(1).tab_color), (Some(0x2E7D32), None));
+        let back = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+        assert_eq!((back.sheet(0).tab_color, back.sheet(1).tab_color), (Some(0x2E7D32), None));
+        // A coloured sheet isn't bare: DropSheet leaves it.
+        h.undo(&mut wb);
+        assert_eq!(wb.drop_last_sheet(), None);
+        h.undo(&mut wb);
+        assert_eq!(wb.sheet(1).tab_color, None);
+        // A sheet that doesn't exist: nothing.
+        h.run(&mut wb, "Tab Colour", vec![GridOp::TabColor { sheet: 9, color: Some(1) }]);
+        assert_eq!(wb.sheet_count(), 2);
     }
 
     #[test]

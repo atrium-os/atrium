@@ -77,6 +77,8 @@ pub enum DataCmd {
     DeleteSheet,
     MoveSheetLeft,
     MoveSheetRight,
+    /// The tab colour bar for the sheet on screen; the window runs it.
+    TabColor,
 }
 
 /// The block of non-empty cells around (`row`, `col`), bounded by empty rows and
@@ -238,6 +240,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
+    v.push((MenuItem::new("Tab Colour…"), Some(DataCmd::TabColor)));
     let n = wb.sheet_count() as u16;
     v.push((MenuItem::new("Move Sheet Left").enabled(s > 0), Some(DataCmd::MoveSheetLeft)));
     v.push((MenuItem::new("Move Sheet Right").enabled(s + 1 < n), Some(DataCmd::MoveSheetRight)));
@@ -450,7 +453,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

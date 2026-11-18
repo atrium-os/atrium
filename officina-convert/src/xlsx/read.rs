@@ -362,10 +362,12 @@ struct Seg {
     filter: Option<(String, Vec<(u32, Cond)>)>,
     /// `<conditionalFormatting>`s, read once the workbook's formulas can be.
     cond: Vec<super::condfmt::Raw>,
+    /// `<sheetPr><tabColor>`, 0xRRGGBB.
+    tab: Option<u32>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
-fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError> {
+fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<Seg, XlsxError> {
     let mut seg = Seg::default();
     let mut r = xml(data);
     r.config_mut().check_end_names = false;
@@ -387,6 +389,7 @@ fn segment(data: &[u8], sst: &[Arc<str>], first: bool) -> Result<Seg, XlsxError>
             _ => continue,
         };
         match e.local_name().as_ref() {
+            b"tabColor" if first => seg.tab = super::styles::color_of(&e, theme),
             b"sheetFormatPr" => {
                 seg.default_h = attr(&e, b"defaultRowHeight")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v < 410.0);
                 seg.default_w = attr(&e, b"defaultColWidth")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v <= 255.0);
@@ -650,7 +653,7 @@ const PIECE: usize = 8 << 20;
 /// Reads one sheet part into sheet `s`: inflated on one thread and cut into pieces of
 /// whole rows, the pieces parsed on all the others, merged here in order.
 #[allow(clippy::too_many_arguments)]
-fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>) -> Result<(), XlsxError> {
+fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: &[Arc<str>], theme: &[u32], xf_ids: &[StyleId], out: &mut Loaded, rep: &mut Report, fcells: &mut Vec<FCell>, shared: &mut HashMap<u32, (u32, u32, String)>, cond: &mut Vec<super::condfmt::Raw>) -> Result<(), XlsxError> {
     use std::io::Read;
     use std::sync::mpsc::{channel, sync_channel};
     use std::sync::Mutex;
@@ -706,7 +709,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             sc.spawn(move || loop {
                 let next = piece_rx.lock().unwrap().recv();
                 let Ok((i, data)) = next else { return };
-                if seg_tx.send((i, segment(&data, sst, i == 0))).is_err() {
+                if seg_tx.send((i, segment(&data, sst, theme, i == 0))).is_err() {
                     return;
                 }
             });
@@ -758,6 +761,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 heights.extend(seg.heights);
                 hidden.extend(seg.hidden);
                 filter = seg.filter.or(filter);
+                if seg.tab.is_some() {
+                    wb.sheet_mut(s).tab_color = seg.tab;
+                }
                 cond.extend(seg.cond);
                 dw = seg.default_w.or(dw);
                 dh = seg.default_h.or(dh);
@@ -997,7 +1003,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), XlsxError> {
         let mut fcells = Vec::new();
         let mut shared = HashMap::new();
         let mut cond = Vec::new();
-        sheet(&mut wb, i as u16, &z, &e, &sst, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond)?;
+        sheet(&mut wb, i as u16, &z, &e, &sst, &theme, &xf_ids, &mut out, &mut rep, &mut fcells, &mut shared, &mut cond)?;
         all_f.push((i as u16, fcells, shared));
         conds.push((i as u16, cond));
     }
