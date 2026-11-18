@@ -611,6 +611,12 @@ pub struct WorkspaceInfo {
     /// Shares compiled objects with linked workspaces (§5.4, W9).
     #[serde(default)]
     pub object_cache: bool,
+    /// The hosts a `registries` workspace's proxy admits (dev-tools.md
+    /// §5.2): its own list, or the default registries when `hosts_default`.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub hosts_default: bool,
 }
 
 /// A toolchain New workspace offers; `available` false until its layer

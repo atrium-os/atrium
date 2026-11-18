@@ -67,8 +67,8 @@ fn run(w: Want, tx: Sender<Got>) {
             Want::New { name, toolchain, network, activation } => Some(
                 listed(ask(&Request::WorkspaceNew { name: name.clone(), toolchain, network: Some(network), uses: vec![] }))
                     .and_then(|_| open(&name, activation).map(|m| format!("{} made. {m}", title(&name))))),
-            Want::Set { name, network, uses, object_cache } => Some(
-                listed(ask(&Request::WorkspaceSet { name: name.clone(), network, uses, object_cache, hosts: None }))
+            Want::Set { name, network, uses, object_cache, hosts } => Some(
+                listed(ask(&Request::WorkspaceSet { name: name.clone(), network, uses, object_cache, hosts }))
                     .map(|_| format!("{} changed", title(&name)))),
             Want::Stop(name) => Some(
                 listed(ask(&Request::WorkspaceStop { name: name.clone() })).map(|_| format!("{} stopped", title(&name)))),
@@ -108,9 +108,10 @@ fn main() {
     let state = Mutable::with_dirty(State::default(), dirty.clone());
     let name = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
     let project = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
+    let host = Mutable::with_dirty(TextEdit::new(""), dirty.clone());
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
     let queue: Queue = Arc::new(Mutex::new(Vec::new()));
-    let view = WorkspacesView { state: state.clone(), name: name.clone(), project: project.clone(), size: size.clone(), queue: queue.clone() };
+    let view = WorkspacesView { state: state.clone(), name: name.clone(), project: project.clone(), host: host.clone(), size: size.clone(), queue: queue.clone() };
     let mut app = App::new_with_flag(view, dirty);
     let (tx, rx) = channel();
     run(Want::List, tx.clone());
@@ -136,8 +137,16 @@ fn main() {
         for a in acts {
             let mut s = state.get_cloned();
             let creating = matches!(a, atrium_workspaces::Act::Create(_));
-            let text = if matches!(a, atrium_workspaces::Act::Run(..)) { project.get_cloned().text().to_string() } else { name.get_cloned().text().to_string() };
+            let adding = matches!(a, atrium_workspaces::Act::AddHost(_));
+            let text = match a {
+                atrium_workspaces::Act::Run(..) => project.get_cloned().text().to_string(),
+                atrium_workspaces::Act::AddHost(_) => host.get_cloned().text().to_string(),
+                _ => name.get_cloned().text().to_string(),
+            };
             let want = s.act(a, &text);
+            if adding && want.is_some() {
+                host.set(TextEdit::new(""));
+            }
             if creating && want.is_some() {
                 s.creating = false;
                 s.selected = name.get_cloned().text().trim().to_string().into();

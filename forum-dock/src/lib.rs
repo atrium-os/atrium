@@ -257,7 +257,8 @@ mod workspace_tests {
     #[test]
     fn new_workspace_tile_only_for_a_free_valid_name() {
         let w = portcullis_ipc::WorkspaceInfo { name: "scratch".into(), toolchain: "c".into(), persona: "personal".into(),
-                                                network: "outbound".into(), uses: vec![], running: false, object_cache: false };
+                                                network: "outbound".into(), uses: vec![], running: false, object_cache: false,
+                                                hosts: vec![], hosts_default: true };
         let apps = vec![workspace_entry(&w)];
         assert_eq!(apps[0].id, "workspace/scratch");
         assert_eq!(apps[0].name, "Scratch");
