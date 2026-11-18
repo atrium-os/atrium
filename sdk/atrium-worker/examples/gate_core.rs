@@ -83,6 +83,7 @@ fn main() {
     say("nest", ask(&w, "nest", None));
     say("ifs", ask(&w, "ifs", None));
     say("tz", ask(&w, "tz", None));
+    say("open", ask(&w, "open", None));
     // 20 calls, one jail each: how long a call takes, start to answer.
     let mut ms: Vec<f64> = (0..20).map(|_| {
         let t = std::time::Instant::now();

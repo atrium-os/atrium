@@ -48,12 +48,15 @@ fn handle(a: Ask, f: Option<std::fs::File>) -> Result<Answer, String> {
             unsafe { libc::localtime_r(&now, &mut tm) };
             let off = tm.tm_gmtoff / 60;
             let z = format!("{}{:02}{:02}", if off < 0 { '-' } else { '+' }, off.abs() / 60, off.abs() % 60);
-            match std::fs::metadata("/etc/localtime") {
-                Ok(m) if m.len() > 0 => z,
-                Ok(m) => format!("{z} (/etc/localtime is {} bytes)", m.len()),
-                Err(e) => format!("{z} (/etc/localtime: {e})"),
-            }
+            // The zone was read before capability mode (atrium-worker's
+            // tzset); the file itself can't be reached by name any more.
+            z
         }
+        // A path the jail has: capability mode refuses it by name.
+        "open" => match std::fs::File::open("/atrium.toml") {
+            Ok(_) => "opened /atrium.toml".into(),
+            Err(e) => format!("refused: errno {}", e.raw_os_error().unwrap_or(0)),
+        },
         "fail" => return Err("asked to fail".into()),
         "crash" => std::process::exit(3),
         "sleep" => { std::thread::sleep(std::time::Duration::from_secs(60)); String::new() }

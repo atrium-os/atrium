@@ -10,5 +10,10 @@ fn main() {
     let pipe = std::fs::File::from(st.extra.remove(0));
     let mut line = String::new();
     let _ = BufReader::new(pipe).read_line(&mut line);
-    let _ = writeln!(st.sock, "from-extra {}", line.trim());
+    // Its jail has the bundle's atrium.toml; in capability mode it can't open it.
+    let open = match std::fs::File::open("/atrium.toml") {
+        Ok(_) => "opened".to_string(),
+        Err(e) => format!("errno {}", e.raw_os_error().unwrap_or(0)),
+    };
+    let _ = writeln!(st.sock, "from-extra {} (open {open})", line.trim());
 }

@@ -25,8 +25,17 @@
 //! - **jail** (`isolation = "jail"`, the default): portcullisd's
 //!   `WorkerCall`, a one-shot jail per call (or per [`Session`]).
 //! - **capsicum** (`isolation = "capsicum"`): a child process of the core,
-//!   in the core's jail, that enters capability mode before it reads
-//!   anything (decision C4: for many tiny calls).
+//!   in the core's jail (decision C4: for many tiny calls).
+//!
+//! In every mode the worker enters capability mode (FreeBSD's
+//! `cap_enter`) before it reads a call: [`serve`] and [`socket_worker`] do
+//! it. The jail and capability mode do different jobs: the jail decides
+//! what exists, and capability mode stops the worker reaching any of it by
+//! name (no `open`, no `connect`, no new sockets on an address), so it has
+//! only the descriptors it was given. A worker that must open things after
+//! it starts opts out with [`serve_jail_only`] or
+//! [`socket_worker_jail_only`]; under `isolation = "capsicum"` there is no
+//! jail of its own, so it enters capability mode anyway.
 //! - **local** (`ATRIUM_WORKERS=local`): a plain child, unconfined, for
 //!   development and tests off Atrium.
 //! - **in-process** ([`Workers::in_process`]): a thread, for unit tests.
@@ -364,18 +373,56 @@ fn proc_drop(p: &mut Proc) {
 }
 
 /// The worker's side of [`Workers::spawn_socket`]: the socket on 0 and the
-/// `extra` descriptors the core passed (3, 4, ...). `capsicum` says the
-/// worker must enter capability mode itself once it has set up (open
-/// what it needs, then `cap_enter`): [`enter_capability_mode`].
+/// `extra` descriptors the core passed (3, 4, ...). `capability_mode` says
+/// whether the process is in capability mode now (always on FreeBSD after
+/// [`socket_worker`]).
 pub struct SocketStart {
     pub sock: UnixStream,
     pub extra: Vec<OwnedFd>,
-    pub capsicum: bool,
+    pub capability_mode: bool,
 }
 
-/// Take what [`Workers::spawn_socket`] gave this worker: its socket and
-/// `extra` descriptors. Call it once, first thing in `main`.
+/// Take what [`Workers::spawn_socket`] gave this worker, its socket and
+/// `extra` descriptors, then enter capability mode: from here on it has
+/// only those. Call it once, first thing in `main`. On FreeBSD a failure to
+/// enter capability mode is an error, never a worker left without it.
 pub fn socket_worker(extra: usize) -> io::Result<SocketStart> {
+    let mut st = take_socket(extra)?;
+    confine()?;
+    st.capability_mode = cfg!(target_os = "freebsd");
+    Ok(st)
+}
+
+/// [`socket_worker`] without capability mode, for a worker that has to
+/// open things after it starts: its jail alone confines it. Call
+/// [`enter_capability_mode`] as soon as it has set up. Under
+/// `isolation = "capsicum"` it enters capability mode here regardless,
+/// since it has no jail of its own.
+pub fn socket_worker_jail_only(extra: usize) -> io::Result<SocketStart> {
+    let mut st = take_socket(extra)?;
+    if std::env::var_os(wire::CAPSICUM_ENV).is_some() {
+        confine()?;
+        st.capability_mode = true;
+    }
+    Ok(st)
+}
+
+/// What libc reads by name the first time it's asked, read now, while
+/// names still work: the time zone, for localtime(3) in a parser.
+fn preload() {
+    extern "C" { fn tzset(); }
+    // SAFETY: tzset only reads the zone file and sets libc's own state.
+    unsafe { tzset() };
+}
+
+/// Enter capability mode where there is one (FreeBSD); elsewhere (local
+/// mode off Atrium) there's nothing to enter.
+fn confine() -> io::Result<()> {
+    preload();
+    if cfg!(target_os = "freebsd") { wire::cap_enter() } else { Ok(()) }
+}
+
+fn take_socket(extra: usize) -> io::Result<SocketStart> {
     let mut fds = Vec::with_capacity(extra);
     for i in 0..extra {
         let fd = 3 + i as i32;
@@ -389,12 +436,12 @@ pub fn socket_worker(extra: usize) -> io::Result<SocketStart> {
     // SAFETY: standard input is the socket the core gave us; nothing else
     // in this process owns descriptor 0.
     let sock = unsafe { UnixStream::from_raw_fd(0) };
-    Ok(SocketStart { sock, extra: fds, capsicum: std::env::var_os(wire::CAPSICUM_ENV).is_some() })
+    Ok(SocketStart { sock, extra: fds, capability_mode: false })
 }
 
-/// Enter capability mode (FreeBSD's cap_enter; nothing elsewhere), for a
-/// worker that sets up first.
-pub fn enter_capability_mode() -> io::Result<()> { wire::cap_enter() }
+/// Enter capability mode (FreeBSD's cap_enter; an error elsewhere), for a
+/// worker that started with [`socket_worker_jail_only`] and has set up.
+pub fn enter_capability_mode() -> io::Result<()> { preload(); wire::cap_enter() }
 
 /// A worker started by [`Workers::spawn_stdio`]: its three pipes, and its
 /// end.
@@ -670,13 +717,28 @@ impl Drop for Session {
     }
 }
 
-/// The worker's side: answer calls on standard input until it closes,
-/// then exit. Under `isolation = "capsicum"` it enters capability mode
-/// first. A handler's `Err` goes back to the core as [`Error::Worker`].
-pub fn serve<Req, Resp, F>(mut f: F) -> !
+/// The worker's side: enter capability mode, then answer calls on
+/// standard input until it closes, and exit. The handler has the call and
+/// the descriptor that came with it, and can open nothing by name. A
+/// handler's `Err` goes back to the core as [`Error::Worker`].
+pub fn serve<Req, Resp, F>(f: F) -> !
 where Req: Message, Resp: Message, F: FnMut(Req, Option<File>) -> Result<Resp, String> {
-    if std::env::var_os(wire::CAPSICUM_ENV).is_some() {
-        if let Err(e) = wire::cap_enter() {
+    serve_confined(true, f)
+}
+
+/// [`serve`] without capability mode, for a handler that must open things
+/// by name: its jail alone confines it. Under `isolation = "capsicum"` it
+/// enters capability mode regardless, since it has no jail of its own.
+/// `atrium_worker::main!(handler, jail_only)`.
+pub fn serve_jail_only<Req, Resp, F>(f: F) -> !
+where Req: Message, Resp: Message, F: FnMut(Req, Option<File>) -> Result<Resp, String> {
+    serve_confined(std::env::var_os(wire::CAPSICUM_ENV).is_some(), f)
+}
+
+fn serve_confined<Req, Resp, F>(cap: bool, mut f: F) -> !
+where Req: Message, Resp: Message, F: FnMut(Req, Option<File>) -> Result<Resp, String> {
+    if cap {
+        if let Err(e) = confine() {
             eprintln!("atrium-worker: capability mode: {e}");
             std::process::exit(70);
         }
@@ -693,10 +755,14 @@ where Req: Message, Resp: Message, F: FnMut(Req, Option<File>) -> Result<Resp, S
 }
 
 /// `fn main` for a worker: `atrium_worker::main!(handler);`, where
-/// `handler(req, file) -> Result<Resp, String>`.
+/// `handler(req, file) -> Result<Resp, String>`; it runs in capability
+/// mode. `atrium_worker::main!(handler, jail_only);` is [`serve_jail_only`].
 #[macro_export]
 macro_rules! main {
     ($f:path) => {
         fn main() { $crate::serve($f) }
+    };
+    ($f:path, jail_only) => {
+        fn main() { $crate::serve_jail_only($f) }
     };
 }

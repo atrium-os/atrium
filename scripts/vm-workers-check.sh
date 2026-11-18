@@ -136,6 +136,9 @@ if [ "$nb" = 1 ]; then case "$r" in *"ipstats=refused"*) ok "and none of the hos
 nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null"); [ "$nb" = 1 ] && echo "  (kernel has jail_netblind: worker jails without vnet)" || echo "  (kernel without jail_netblind: worker jails get an empty vnet)"
 r=$(line tz); want=$(V "date +%z")
 [ "$r" = "ok $want" ] && ok "it tells local time ($want), from the machine's zone file" || bad "tz: worker $r, machine $want"
+# The jail decides what exists; capability mode stops the worker reaching
+# it by name. ECAPMODE is 94.
+r=$(line open); case "$r" in "ok refused: errno 94") ok "it can't open a path its jail has (capability mode)" ;; *) bad "open: $r" ;; esac
 r=$(line timing); case "$r" in p50*) ok "20 calls: $r" ;; *) bad "timing: $r" ;; esac
 echo "  where a call's time goes (median of the 20 timed calls, ms; teardown runs after the answer):"
 V "grep 'oneshot-timing.*w-echo' $LOG | sed -n 8,27p" | python3 -c '
@@ -155,7 +158,7 @@ r=$(V "grep -m1 'memoryuse' $B/rctl.txt"); case "$r" in *memoryuse:sigkill=13421
 r=$(line after-memory); [ "$r" = "$u1" ] && ok "and the next call works" || bad "after-memory: $r"
 r=$(line nope); case "$r" in no-such-worker) ok "an undeclared worker is refused" ;; *) bad "nope: $r" ;; esac
 r=$(line exec-other); case "$r" in "workers.sock"*"only WorkerCall"*) ok "the core has only the worker-call socket: $r" ;; *) bad "exec-other: $r" ;; esac
-r=$(line extra-fd); case "$r" in "from-extra a line through the pipe (exit Some(0))") ok "a socket worker reads the descriptor passed at 3 in its jail" ;; *) bad "extra-fd: $r" ;; esac
+r=$(line extra-fd); case "$r" in "from-extra a line through the pipe (open errno 94) (exit Some(0))") ok "a socket worker reads the descriptor passed at 3 in its jail, and opens nothing by name" ;; *) bad "extra-fd: $r" ;; esac
 sleep 3
 left=$(V "jls name | grep -c 'org.example.wk.*w-'" | tr -d ' ')
 [ "$left" = 0 ] && ok "no worker jail left" || bad "$left worker jails left: $(V "jls name | grep w-echo")"

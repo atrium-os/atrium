@@ -231,7 +231,8 @@ pub fn plan(project: &Path, o: &AddOpts) -> Result<Plan, String> {
         created: true,
         text: format!(
             "//! The {} worker (atrium.toml's `[[workers]]`): no capabilities; it\n\
-             //! answers the core's calls with [`{lib}::{module}`]'s handler.\n\n\
+             //! answers the core's calls with [`{lib}::{module}`]'s handler, in\n\
+             //! capability mode: it opens nothing by name, only what it is given.\n\n\
              atrium_worker::main!({lib}::workers::{snake});\n",
             o.name
         ),

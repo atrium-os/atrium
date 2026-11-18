@@ -199,13 +199,25 @@ A crash, a limit or a timeout comes back as an `Err`, never as a panic in
 the core. Off Atrium, `ATRIUM_WORKERS=local ATRIUM_APP_ROOT=.` runs the
 workers as plain children (`cargo run` in a workspace).
 
+A worker runs in capability mode (FreeBSD's `cap_enter`), whatever its
+`isolation`: `atrium_worker::main!` enters it before the first call. The
+jail decides what exists; capability mode stops the worker reaching any of
+it by name, so a handler has the call and the descriptor that came with it,
+and can't `open` a path or `connect` anywhere. The time zone is read
+before, so `localtime` still works. A handler that has to open files by
+name opts out with `atrium_worker::main!(handler, jail_only)`: its jail
+alone confines it. Under `isolation = "capsicum"` there's no jail of its
+own, so it enters capability mode anyway.
+
 A worker with a protocol of its own that passes descriptors (a decoder
 fed frame buffers) starts with `workers.spawn_socket(name, &[extra fds])`:
 the core keeps one end of a Unix stream socket, the worker gets the other
 on descriptor 0 and the extras from 3, and takes them with
-`atrium_worker::socket_worker(n)` (its `capsicum` flag says to call
-`enter_capability_mode()` once it has set up). Up to
-`atrium_worker::MAX_EXTRA_FDS` (8) extras go through, in a jail too.
+`atrium_worker::socket_worker(n)`, which then enters capability mode. One
+that must set up first (open what it needs) uses
+`socket_worker_jail_only(n)` and calls `enter_capability_mode()` when it's
+ready. Up to `atrium_worker::MAX_EXTRA_FDS` (8) extras go through, in a
+jail too.
 
 ### Moving code into a worker: `cargo atrium worker add`
 

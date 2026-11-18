@@ -142,7 +142,7 @@ fn socket_child() {
     std::fs::File::from(st.extra.remove(0)).read_to_string(&mut extra).unwrap();
     let mut line = [0u8; 5];
     st.sock.read_exact(&mut line).unwrap();
-    write!(st.sock, "{} {} {}", String::from_utf8_lossy(&line), extra.trim(), st.capsicum).unwrap();
+    write!(st.sock, "{} {} {}", String::from_utf8_lossy(&line), extra.trim(), st.capability_mode).unwrap();
     std::process::exit(5);
 }
 
@@ -168,7 +168,7 @@ fn socket_worker_with_extra() {
     p.sock.shutdown(std::net::Shutdown::Write).unwrap();
     let mut out = String::new();
     p.sock.read_to_string(&mut out).unwrap();
-    // Local mode: no capability mode asked for, whatever the manifest says.
+    // Off FreeBSD there is no capability mode to enter.
     assert_eq!(out, "frame codec false");
     assert_eq!(p.wait(), Some(5));
     std::fs::remove_dir_all(&dir).unwrap();
