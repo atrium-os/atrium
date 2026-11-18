@@ -256,10 +256,12 @@ fn spawn(root: &Path, def: &WorkerDef, sock: UnixStream, err: OwnedFd, capsicum:
     c.spawn().map_err(|e| Error::Start(format!("{}: {e}", prog.display())))
 }
 
-/// portcullisd's socket: `PORTCULLIS_SOCKET`, else where it is in a jail.
+/// portcullisd: `PORTCULLIS_SOCKET`, else its worker-call socket.
 fn portcullisd() -> io::Result<UnixStream> {
     let path = std::env::var("PORTCULLIS_SOCKET").ok().or_else(|| {
-        ["/atrium/sockets/portcullis/portcullis.sock", "/var/run/portcullis.sock"]
+        // The worker-call socket an app with [[workers]] has in its jail,
+        // then portcullisd's own (outside a jail).
+        ["/atrium/sockets/workers/workers.sock", "/atrium/sockets/portcullis/portcullis.sock", "/atrium/sockets/portcullis.sock"]
             .into_iter().find(|p| Path::new(p).exists()).map(String::from)
     }).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "portcullisd's socket is not there"))?;
     UnixStream::connect(path)

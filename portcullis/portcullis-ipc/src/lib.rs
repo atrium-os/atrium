@@ -44,6 +44,12 @@ pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 /// clients (the CLI, anything holding `SOCKET_PATH`) keep working unchanged.
 pub const SERVICE_SOCKET_PATH: &str = "/atrium/sockets/portcullis/portcullis.sock";
 
+/// ★ The worker-call socket (app-composition.md §4): mounted into the jail
+/// of an app that declares `[[workers]]`, and answering only `Hello` and
+/// `WorkerCall`, so declaring workers gives an app nothing else of
+/// portcullisd's.
+pub const WORKERS_SOCKET_PATH: &str = "/atrium/sockets/workers/workers.sock";
+
 /// Where a client should look for portcullisd: the per-service path first (the
 /// only one that exists inside a jail), then the flat compat path.
 ///
