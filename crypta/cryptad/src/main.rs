@@ -43,7 +43,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const KEY_UID: u32 = 65047;
+const KEY_UID: u32 = 65052;
 const MAX_TUNNELS: usize = 8;
 const BACKOFF_MAX_S: u64 = 30;
 

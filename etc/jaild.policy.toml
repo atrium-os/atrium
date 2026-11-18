@@ -537,6 +537,8 @@ allowed_system_uids = [
              # (share-sheet.md; share-sheet-service.sh creates it)
     65047,   # _arca-ssh: Arca's SSH agent, atrium-ssh-agent (arca.md §9.1;
              # ssh-agent-service.sh creates it)
+    # 65052 = _crypta-key      (cryptad's Arca key helper: setuid by cryptad
+    #                           itself, no jail; vpn.md "V1 as built")
 ]
 
 [gid]

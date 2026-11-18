@@ -11,7 +11,7 @@
 # guest puts on the LAN (`seen`): the leak checks read that, not the guest.
 #
 # In the VM: atrium-net on vtnet1, a gate arcad (machine store, cryptad's
-# key helper as uid 65047), cryptad, and the new jaild and pf base rules.
+# key helper as uid 65052), cryptad, and the new jaild and pf base rules.
 # On Ubuntu: wg0 10.99.0.1/24, HTTP on :80 (also on 203.0.113.80, a dummy
 # address only reachable through the tunnel) and DNS on 10.99.0.1:53.
 set -eu
@@ -137,7 +137,7 @@ run)
         install -m 755 arcad /usr/local/bin/atrium-arcad-gate
         id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
         id _atrium-mdns >/dev/null 2>&1 || pw useradd _atrium-mdns -u 65037 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net .local names'
-        id _crypta-key >/dev/null 2>&1 || pw useradd _crypta-key -u 65047 -d /nonexistent -s /usr/sbin/nologin -c 'cryptad key helper'
+        [ "$(id -u _crypta-key 2>/dev/null)" = 65052 ] || { pw userdel _crypta-key 2>/dev/null || true; pw useradd _crypta-key -u 65052 -d /nonexistent -s /usr/sbin/nologin -c 'cryptad key helper'; }
         mkdir -p /var/empty /var/run/atrium
         if [ ! -f /var/unbound/unbound.conf ]; then local-unbound-setup >/dev/null || true; fi
         mkdir -p /var/unbound/conf.d
@@ -153,7 +153,7 @@ run)
         daemon -f -o $G/net.log $G/atrium-net -v --iface vtnet1 --no-probe --capsicum --lease $G/atrium-lease --mdns-bin $G/atrium-mdns --sock $G/net.sock
         mkdir -p -m 700 $G/arca; chmod 755 $G
         : > $G/apps.registry
-        env ARCA_DIR=$G/arca ARCA_SOCKET=$G/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry ARCA_SERVICES=cryptad=65047 ARCA_SIGILLUM_SOCKET=none \
+        env ARCA_DIR=$G/arca ARCA_SOCKET=$G/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry ARCA_SERVICES=cryptad=65052 ARCA_SIGILLUM_SOCKET=none \
             daemon -f -o $G/arcad.log /usr/local/bin/atrium-arcad-gate
         sleep 1
         daemon -f -o $G/cryptad.log /usr/local/bin/atrium-cryptad -v --sock $G/crypta.sock --state $G/state --net-sock $G/net.sock --arca $G/arcad.sock
@@ -162,7 +162,7 @@ run)
     "$V" 'pfctl -sn' | grep -q 'nat-anchor "atrium/vpn"' && ok "pf base rules carry nat-anchor atrium/vpn" || fail "no nat-anchor"
     "$V" 'pgrep -f "atrium-cryptad -v" >/dev/null' && ok "cryptad up" || fail "cryptad not running"
     kh=$("$V" 'procstat -s $(pgrep -f -- "cryptad --arca-key") | tail -1' | awk '{print $3, $4, $6, $NF}')
-    [ "$kh" = "65047 65047 65047 65047" ] && ok "key helper runs as _crypta-key with no other groups" || fail "key helper: $kh"
+    [ "$kh" = "65052 65052 65052 65052" ] && ok "key helper runs as _crypta-key with no other groups" || fail "key helper: $kh"
 
     echo "== import a .conf: split tunnel to 10.99.0.0/24, DNS for corp.test"
     IMP=$(mktemp)
