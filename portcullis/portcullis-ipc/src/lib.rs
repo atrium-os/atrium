@@ -348,6 +348,19 @@ pub enum Request {
         origin: String,
     },
 
+    /// ★ Open a download in an app (navigator-ui.md §6.4 "Open"). Only from
+    /// the Navigator (`navigator-broker`), after the person's press on Open,
+    /// which it spent itself. Then `ReadyForFds` and one sealed memory file,
+    /// as `OpenAttachment`: portcullisd decides the type from the bytes and
+    /// `name`, refuses programs and names that lie, and hands it read-only
+    /// to the person's default app for the type, its instance in the
+    /// Navigator's persona. Nothing is written to the person's folders.
+    /// Answer: `Opened`.
+    OpenDownload {
+        /// The file's name: never a path.
+        name: String,
+    },
+
     /// ★ A link to open (opening-links.md §5), first step. Only from
     /// Monstrator (peer uid `_monstrator`). `asker_uid` is the app the
     /// person pressed in, `activation` that press, spent here with frescod

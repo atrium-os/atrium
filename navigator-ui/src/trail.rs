@@ -191,10 +191,10 @@ pub fn app_words(name: &str, about: Option<&navigator_control::AppAbout>) -> (St
 
 impl Prompt {
     /// The answers, left to right; the last is the primary one.
-    /// ("Open in viewer" for a download waits for a jailed viewer.)
     pub fn answers(&self) -> &'static [&'static str] {
         match self {
-            Prompt::Download { .. } => &["Cancel", "Save"],
+            // Open: in the person's app for it, through portcullisd.
+            Prompt::Download { .. } => &["Cancel", "Open", "Save"],
             Prompt::NotPrivate { .. } => &["Continue", "Go back"],
             Prompt::FetchAgain => &["Fetch now"],
             Prompt::Play { .. } => &["Not now", "Play"],

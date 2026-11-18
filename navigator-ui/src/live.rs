@@ -556,6 +556,14 @@ impl Live {
                 }
                 Event::Saved { path, .. } => s.last_note = Some(format!("saved as {path}")),
                 Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
+                Event::FileOpened { app, why, .. } => {
+                    let note = match (app, why) {
+                        (Some(a), _) => format!("opened in {a}"),
+                        (None, w) => format!("not opened: {}", w.unwrap_or_default()),
+                    };
+                    eprintln!("navigator-ui: download {note}");
+                    s.last_note = Some(note);
+                }
                 Event::PressRefused { why } => s.press_refused(&why, crate::ui::now_ms()),
                 Event::WindowIn { persona, ok, why } => {
                     let note = if ok { format!("a window in {persona}") } else { format!("no window in {persona}: {}", why.unwrap_or_default()) };
@@ -791,6 +799,7 @@ impl Live {
                 Out::Accounts { url } => send(&mut self.w, &Request::Accounts { url }),
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
+                Out::OpenFile { id, press } => send(&mut self.w, &Request::OpenFile { id, press }),
                 Out::Hand { url, how, press } => send(&mut self.w, &Request::Hand { url, how, press }),
                 Out::NewWindow { persona, press } => send(&mut self.w, &Request::NewWindow { persona, press }),
                 Out::Reload { key } => {
