@@ -104,9 +104,11 @@ fn convert_in(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u8
 pub const WORKER: &str = "convert";
 
 /// Feed the converter `prefix` then `data`, and read its file and notes;
-/// `wait` says whether it ended well.
+/// `wait` says whether it ended well. A converter that wrote `done` last has
+/// ended well whatever its end costs: `wait` then runs on a thread of its
+/// own, so a jail's teardown doesn't hold up the document.
 fn finish(mut stdin: impl Write + Send, mut stdout: impl Read, mut err: impl Read + Send, prefix: Vec<u8>, data: &[u8],
-          wait: impl FnOnce() -> bool) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
+          wait: impl FnOnce() -> bool + Send + 'static) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
     std::thread::scope(|sc| {
         sc.spawn(move || {
             let _ = stdin.write_all(&prefix).and_then(|_| stdin.write_all(data));
@@ -118,8 +120,16 @@ fn finish(mut stdin: impl Write + Send, mut stdout: impl Read, mut err: impl Rea
         });
         let mut out = Vec::new();
         let r = stdout.read_to_end(&mut out);
-        let status = wait();
         let errs = e.join().unwrap_or_default();
+        let done = errs.lines().last() == Some("done");
+        let status = if done {
+            std::thread::spawn(move || {
+                let _ = wait();
+            });
+            true
+        } else {
+            wait()
+        };
         let mut notes = Vec::new();
         let mut failure = None;
         for l in errs.lines() {
