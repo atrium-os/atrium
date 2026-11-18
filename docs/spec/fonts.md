@@ -177,8 +177,10 @@ a Japanese label in the VM.
   (.pptx); LibreOffice keeps it both ways in both formats
   (`officina-convert/examples/bidi_lo.rs`, 4/4). A selection across
   directions highlights each stretch as drawn (`ParaLayout::range_spans`).
-  Left: arrow keys move in logical order; no command yet to set a
-  paragraph's direction in Write.
+  On a line with right-to-left text, Left and Right move on screen (the
+  nearest caret place to that side; past the edge, the next line in the
+  paragraph's reading order); Shift extends the same way. Write's
+  alignment menu sets a paragraph's direction (officina.md §16.58).
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
 - Colour emoji is drawn everywhere text is: frescod's own text (Pergola
