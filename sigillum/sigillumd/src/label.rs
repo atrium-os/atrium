@@ -26,6 +26,9 @@ pub enum Label {
     Arca,
     /// ostiarius, by its fixed uid.
     Ostiarius,
+    /// portcullisd, by its uid (`SIGILLUM_PORTCULLIS_UID`): Settings'
+    /// crossing switches (personas.md §6), `VERIFY_USER` for those only.
+    Portcullis,
     /// No registry entry: gets nothing.
     Unknown,
 }

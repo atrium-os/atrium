@@ -522,6 +522,7 @@ fn label_kind(l: &Label) -> String {
         Label::App { app, .. } => format!("app:{}", app.app_id),
         Label::Arca => "arca".into(),
         Label::Ostiarius => "ostiarius".into(),
+        Label::Portcullis => "portcullis".into(),
         Label::Unknown => "unknown".into(),
     }
 }

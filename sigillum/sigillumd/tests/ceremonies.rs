@@ -570,6 +570,20 @@ fn verify_user_is_for_arca_and_ostiarius_only() {
     assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
     r.request(&Label::Ostiarius, v(Purpose::ArcaItem { description: "x".into() }));
     assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
+    // A crossing switch is portcullisd's to ask, and nothing else is.
+    let cross = || Purpose::Crossing { from: "work".into(), to: "personal".into(), kind: "links".into() };
+    r.request(&Label::Ostiarius, v(cross()));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
+    r.request(&Label::Portcullis, v(Purpose::Unlock));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Denied });
+    r.request(&Label::Portcullis, v(Purpose::Crossing { from: "Work!".into(), to: "personal".into(), kind: "links".into() }));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 3, reason: Refusal::Malformed });
+    r.request(&Label::Portcullis, v(cross()));
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { requester, purpose: Purpose::Crossing { .. }, .. } if requester == "Settings"));
+    let key = r.sheets.last().unwrap().0;
+    let a = r.broker.press(key, Choice::Cancel, false);
+    r.run(a);
+    assert!(matches!(r.reply(), Reply::Refused { ceremony: 3, .. }));
 
     r.request(&Label::Arca, v(Purpose::ArcaItem { description: "Bank password".into() }));
     let key = r.sheets.last().unwrap().0;

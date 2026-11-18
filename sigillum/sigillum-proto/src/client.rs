@@ -69,6 +69,10 @@ pub enum Purpose {
     Unlock,
     /// A privileged system change.
     Admin,
+    /// portcullisd, for Settings (personas.md §6): turning on the switch
+    /// that lets `kind` (`links`, `files`, `clipboard`) cross from persona
+    /// `from` to `to` (`personal` for Personal).
+    Crossing { from: String, to: String, kind: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

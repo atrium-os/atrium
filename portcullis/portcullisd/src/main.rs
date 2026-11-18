@@ -674,7 +674,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
          * settings app by its installed manifest (`app-grants`), and about
          * the person it belongs to (the registry's owner), never the
          * caller's own uid. Allow also needs a press frescod confirms. */
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. }) {
+        if let Request::SetCrossing { from, to, kind, on, activation } = req {
+            let resp = handle_set_crossing(uid, &from, &to, &kind, on, activation, &shared, &portcullisd::crossing::Sigillum::default());
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Crossings) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -1777,7 +1782,70 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Err(e) => refuse(format!("save: {e}")),
             }
         }
+        Request::Crossings => {
+            let (personas, on) = portcullisd::crossing::listing(&tp.policy);
+            eprintln!("portcullisd: crossings -> {caller} (uid {uid}) for {owner}: {} persona(s), {} switch(es) on", personas.len(), on.len());
+            Response::Crossings { personas, on }
+        }
         _ => Response::Error { message: "not an access request".into() },
+    }
+}
+
+/// Settings turns a crossing switch (personas.md §6): `app-grants` by peer
+/// uid, about the person that app runs for, with a press portcullisd
+/// spends (APPROVE); turning one on then asks the person on Sigillum's
+/// sheet, which can take minutes, so no lock is held while it does, and
+/// the policy is read again after.
+#[allow(clippy::too_many_arguments)]
+fn handle_set_crossing(uid: u32, from: &str, to: &str, kind: &str, on: bool, activation: [u8; 16], shared: &Mutex<Tenants>, verify: &dyn portcullisd::crossing::Verify) -> Response {
+    use portcullisd::{crossing, opens};
+    let refuse = |why: String| {
+        eprintln!("portcullisd: crossing switch REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let Some((owner, caller)) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default().resolve(uid).map(|(o, a)| (o.to_string(), a.to_string())) else {
+        return refuse("cap.app_grants.denied: caller is not a launched app".into());
+    };
+    if !launch::app_manages_grants(&caller) {
+        return refuse(format!("cap.app_grants.denied: {caller} may not change crossings"));
+    }
+    {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        match s.get_or_load(&owner) {
+            Ok(tp) => {
+                if let Err(why) = crossing::check(&tp.policy, from, to, kind) {
+                    return refuse(why);
+                }
+            }
+            Err(e) => return refuse(format!("policy for {owner}: {e}")),
+        }
+    }
+    // Last of the checks: a refusal above doesn't spend the press.
+    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
+        return refuse(why);
+    }
+    if on {
+        eprintln!("portcullisd: {owner} turning on {kind} from {from} to {to}: asking Sigillum");
+        if let Err(why) = verify.verify(&owner, from, to, kind) {
+            return refuse(why);
+        }
+    }
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let tp = match s.get_or_load(&owner) {
+        Ok(tp) => tp,
+        Err(e) => return refuse(format!("policy for {owner}: {e}")),
+    };
+    match tp.policy.set_crossing(from, to, kind, on) {
+        Ok(false) => Response::Ok,
+        Ok(true) => match tp.policy.save(&tp.policy_path.clone()) {
+            Ok(()) => {
+                eprintln!("portcullisd: {owner}'s switch for {kind} from {from} to {to} is now {} (from {caller}{})", if on { "on" } else { "off" }, if on { ", verified" } else { "" });
+                Response::Ok
+            }
+            Err(e) => refuse(format!("save: {e}")),
+        },
+        Err(why) => refuse(why),
     }
 }
 
@@ -2808,7 +2876,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
-        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona => Response::Error {
+        Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
+        | Request::Crossings | Request::SetCrossing { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

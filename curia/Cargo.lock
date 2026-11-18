@@ -117,6 +117,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-colr"
+version = "0.1.0"
+dependencies = [
+ "skrifa",
+ "tiny-skia",
+]
+
+[[package]]
 name = "atrium-devices"
 version = "0.1.0"
 dependencies = [
@@ -581,6 +589,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "ash",
+ "atrium-colr",
  "atrium-fonts",
  "bytemuck",
  "env_logger",
@@ -590,8 +599,11 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
+ "rustybuzz",
  "sha2",
+ "swash",
  "ttf-parser",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -1071,6 +1083,7 @@ name = "pergola"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-colr",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",
@@ -1079,13 +1092,15 @@ dependencies = [
  "limen",
  "log",
  "postcard",
+ "ropey",
  "serde",
  "swash",
  "tabula",
  "taffy",
- "tiny-skia-path",
+ "tiny-skia-path 0.12.0",
  "unicode-linebreak",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1282,6 +1297,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "ropey"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+dependencies = [
+ "smallvec",
+ "str_indices",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1442,6 +1467,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "str_indices"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1498,6 +1529,7 @@ dependencies = [
  "aqueduct",
  "fresco-protocol",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "serde",
 ]
@@ -1552,6 +1584,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tiny-skia"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "bytemuck",
+ "cfg-if",
+ "log",
+ "tiny-skia-path 0.11.4",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
 ]
 
 [[package]]
@@ -1632,6 +1689,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
 name = "unicode-bidi-mirroring"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1672,6 +1735,12 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "url"

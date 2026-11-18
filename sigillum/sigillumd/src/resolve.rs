@@ -23,6 +23,7 @@ pub struct Resolver {
     pub registry: PathBuf,
     pub arca_uid: Option<u32>,
     pub ostiarius_uid: Option<u32>,
+    pub portcullis_uid: Option<u32>,
 }
 
 /// `SIGILLUM_WEB_BROKER`: `app_id publisher-hex` (64 hex), as
@@ -43,11 +44,12 @@ pub fn parse_web_broker(s: &str) -> Option<AppId> {
 impl Resolver {
     /// The label for `uid` given the registry's text.
     pub fn label_in(&self, reg: &portcullis_peer::AppRegistry, uid: u32) -> Label {
-        let system = Some(uid) == self.arca_uid || Some(uid) == self.ostiarius_uid;
+        let system = Some(uid) == self.arca_uid || Some(uid) == self.ostiarius_uid || Some(uid) == self.portcullis_uid;
         let Some((user, app_id)) = reg.resolve(uid) else {
             return match () {
                 _ if Some(uid) == self.arca_uid => Label::Arca,
                 _ if Some(uid) == self.ostiarius_uid => Label::Ostiarius,
+                _ if Some(uid) == self.portcullis_uid => Label::Portcullis,
                 _ => Label::Unknown,
             };
         };
@@ -81,7 +83,7 @@ mod tests {
     const P: &str = "abababababababababababababababababababababababababababababababab";
 
     fn r() -> Resolver {
-        Resolver { registry: "/nonexistent".into(), arca_uid: Some(65003), ostiarius_uid: Some(65010) }
+        Resolver { registry: "/nonexistent".into(), arca_uid: Some(65003), ostiarius_uid: Some(65010), portcullis_uid: Some(0) }
     }
 
     #[test]
@@ -103,6 +105,7 @@ mod tests {
         assert_eq!(r.label_in(&reg, 65003), Label::Unknown, "system uid also an app");
         assert_eq!(r.label_in(&reg, 70003), Label::Unknown, "session component");
         assert_eq!(r.label_in(&reg, 65010), Label::Ostiarius);
+        assert_eq!(r.label_in(&reg, 0), Label::Portcullis);
         assert_eq!(r.label_in(&reg, 99999), Label::Unknown);
         let empty = portcullis_peer::AppRegistry::parse("");
         assert_eq!(r.label_in(&empty, 65003), Label::Arca);

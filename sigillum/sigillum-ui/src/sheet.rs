@@ -118,6 +118,10 @@ impl State {
                     Purpose::ArcaItem { description } => format!("to use \u{201c}{description}\u{201d}"),
                     Purpose::Unlock => "to unlock".into(),
                     Purpose::Admin => "to change a system setting".into(),
+                    Purpose::Crossing { from, to, kind } => {
+                        let p = |s: &str| if s == "personal" { "Personal".to_string() } else { s.to_string() };
+                        format!("to let {} send {kind} to {}", p(from), p(to))
+                    }
                 };
                 ("Confirm it\u{2019}s you".into(), vec![format!("{requester} asks {why}"), format!("User: {user}")])
             }

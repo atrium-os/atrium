@@ -67,6 +67,12 @@ fn main() -> ExitCode {
         registry: std::env::var("SIGILLUM_APP_REGISTRY").unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into()).into(),
         arca_uid: env_uid("SIGILLUM_ARCA_UID"),
         ostiarius_uid: env_uid("SIGILLUM_OSTIARIUS_UID"),
+        // portcullisd runs as root; `SIGILLUM_PORTCULLIS_UID=none` turns it off.
+        portcullis_uid: match std::env::var("SIGILLUM_PORTCULLIS_UID").as_deref() {
+            Ok("none") => None,
+            Ok(_) => env_uid("SIGILLUM_PORTCULLIS_UID"),
+            Err(_) => Some(0),
+        },
     };
     // `SIGILLUM_MAIL_SIGNERS`: `app_id publisher-hex` entries, `;` between.
     let mail_signers = std::env::var("SIGILLUM_MAIL_SIGNERS").map(|v| v.split(';').filter(|e| !e.trim().is_empty()).filter_map(parse_web_broker).collect()).unwrap_or_default();
