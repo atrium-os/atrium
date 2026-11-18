@@ -267,3 +267,69 @@ fn a_plugged_in_stick_finds_its_persona() {
     assert_eq!(find(&mut s, &dispensatord(), "alice", &work, UUID, 0).0, status::LOCKED);
     assert!(k.lock().unwrap().loaded.is_empty());
 }
+
+fn recovery(s: &mut State, user: &str, persona: &str, key_id: &[u8], uuid: [u8; 16]) -> (u8, Vec<u8>) {
+    let r = s.handle(&dispensatord(), volume_op::VK_RECOVERY, &body(|w| { w.str(user); w.str(persona); w.raw(key_id); w.raw(&uuid); }));
+    (r.status, r.body.bytes().to_vec())
+}
+
+fn adopt(s: &mut State, user: &str, persona: &str, key_id: &[u8], uuid: [u8; 16], slot: &[u8], keep: bool, code: &str) -> u8 {
+    s.handle(&dispensatord(), volume_op::VK_ADOPT, &body(|w| {
+        w.str(user);
+        w.str(persona);
+        w.raw(key_id);
+        w.raw(&uuid);
+        w.raw(slot);
+        w.u8(keep as u8);
+        w.str(code);
+    }))
+    .status
+}
+
+#[test]
+fn a_recovery_code_adopts_a_stick_from_elsewhere() {
+    // The stick is made on one machine...
+    let (_d, mut s, k) = setup();
+    s.kdf_default = arca_store::KdfParams::TEST;
+    let (_, key_id) = mint(&mut s, &dispensatord(), "alice", "personal", UUID);
+    let key = k.lock().unwrap().loaded[0].1;
+    let (st, b) = recovery(&mut s, "alice", "personal", &key_id, UUID);
+    assert_eq!(st, status::OK);
+    let (slot, code) = b.split_at(volume_op::SLOT_LEN);
+    let code = std::str::from_utf8(code).unwrap().to_string();
+    assert_eq!((slot[0], code.len()), (3, 35));
+    assert!(!slot.windows(32).any(|w| w == key), "the slot holds the key wrapped");
+    // Only for the owner's key and its exact volume.
+    assert_eq!(recovery(&mut s, "bob", "personal", &key_id, UUID).0, status::DENIED);
+    assert_eq!(recovery(&mut s, "alice", "personal", &key_id, [1; 16]).0, status::DENIED);
+
+    // ...and plugged into another, where Arca has never seen it.
+    let (_d2, mut t, k2) = setup();
+    assert_eq!(find(&mut t, &dispensatord(), "alice", &key_id, UUID, 0).0, status::DENIED);
+    let mut wrong = code.clone().into_bytes();
+    wrong[0] = if wrong[0] == b'7' { b'8' } else { b'7' };
+    let wrong = String::from_utf8(wrong).unwrap();
+    let other = arcad::recovery::encode(&[0x11; 16]);
+    assert_ne!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &other), status::OK);
+    assert_ne!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &wrong), status::OK);
+    assert_eq!(adopt(&mut t, "alice", "personal", &key_id, [9; 16], slot, true, &code), status::DENIED, "another volume");
+    assert!(k2.lock().unwrap().loaded.is_empty());
+
+    // This session only: loaded, not kept.
+    assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, false, &code), status::OK);
+    assert_eq!(k2.lock().unwrap().loaded[0].1, key);
+    assert_eq!(k2.lock().unwrap().loaded[0].0.owner_label, "alice/personal");
+    k2.lock().unwrap().loaded.clear();
+    assert_eq!(find(&mut t, &dispensatord(), "alice", &key_id, UUID, 0).0, status::DENIED);
+
+    // Kept: from now on it's found like a stick made here.
+    assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code.to_lowercase()), status::OK);
+    k2.lock().unwrap().loaded.clear();
+    let (st, p) = find(&mut t, &dispensatord(), "alice", &key_id, UUID, 0);
+    assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
+    assert_eq!(k2.lock().unwrap().loaded[0].1, key);
+
+    // A locked store adopts nothing.
+    assert_eq!(t.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
+    assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code), status::LOCKED);
+}
