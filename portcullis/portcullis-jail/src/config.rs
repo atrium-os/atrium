@@ -45,6 +45,10 @@ pub struct JailConfig {
 
     pub mounts:        Vec<MountSpec>,
     pub devfs_actions: Vec<DevfsAction>,
+    /// Host files COPIED into the jail's writable root before it starts
+    /// (source, destination under the root): the machine's time zone. A
+    /// read-only file mount isn't seen through a layered (unionfs) root.
+    pub copies:        Vec<(PathBuf, PathBuf)>,
 
     /// ★ The `full` network capability's pending network (network.md §0):
     /// `Some(mac)` when this jail needs a point-to-point epair from jaild,
@@ -68,6 +72,7 @@ impl JailConfig {
             set_keys: HashSet::new(),
             mounts: Vec::new(),
             devfs_actions: Vec::new(),
+            copies: Vec::new(),
             needs_routed_net: None,
             routed_net_spec: None,
             routed_net_attached: false,

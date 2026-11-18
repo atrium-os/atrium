@@ -21,6 +21,7 @@
 #     §9.1c); 20 calls are timed either way;
 #   - the core's jail has the worker-call socket, which refuses anything
 #     but WorkerCall, and no portcullisd socket;
+#   - it tells the machine's local time (a copy of its zone file);
 #   - a socket worker gets a descriptor past its three (a pipe, at 3 in
 #     its jail) and reads from it;
 #   - and after it all no worker jail is left.
@@ -133,6 +134,8 @@ case "$r" in *"ifmib=refused ifconf=refused "*"sockets=[]"*) ok "no interface MI
 nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null")
 if [ "$nb" = 1 ]; then case "$r" in *"ipstats=refused"*) ok "and none of the host's network counters" ;; *) bad "host counters readable: $r" ;; esac; fi
 nb=$(V "sysctl -n kern.features.jail_netblind 2>/dev/null"); [ "$nb" = 1 ] && echo "  (kernel has jail_netblind: worker jails without vnet)" || echo "  (kernel without jail_netblind: worker jails get an empty vnet)"
+r=$(line tz); want=$(V "date +%z")
+[ "$r" = "ok $want" ] && ok "it tells local time ($want), from the machine's zone file" || bad "tz: worker $r, machine $want"
 r=$(line timing); case "$r" in p50*) ok "20 calls: $r" ;; *) bad "timing: $r" ;; esac
 echo "  where a call's time goes (median of the 20 timed calls, ms; teardown runs after the answer):"
 V "grep 'oneshot-timing.*w-echo' $LOG | sed -n 8,27p" | python3 -c '
