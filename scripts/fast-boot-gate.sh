@@ -25,6 +25,8 @@
 #   shutdown B4: stopping the bootstrap takes the whole stack down at once
 #            (procdescs closed together); prints the time it took
 #   netif    rc.conf's interface lines and the netif share of rc, for trimming
+#   NETIF_TRIM=1 also sets the dev VM's rc.conf to DHCP in the background
+#            with no IPv6 autoconf before the reboots (backup kept)
 #   efi      print the firmware boot entries (the 5 s "X64 image" detour)
 #
 # KERNELS=1 also boots, once each through nextboot (falls back by itself):
@@ -63,6 +65,7 @@ say "build (host, cross)"
 (cd "$ROOT/portcullis" && cargo build -q --release --target "$TARGET" \
     -p jaild -p portcullisd -p ostiarius -p atrium-volumes) || die "portcullis build"
 (cd "$ROOT/atrium-listen" && cargo build -q --release --target "$TARGET" --bin atrium-bind) || die "atrium-bind build"
+(cd "$ROOT/limen" && cargo build -q --release --target "$TARGET" --bin limend) || die "limend build"
 for c in lyra choragus; do
     (cd "$ROOT/$c" && cargo build -q --release --target "$TARGET" --bins) || die "$c build"
 done
@@ -94,7 +97,21 @@ put "$ROOT/lyra/etc/devices.d/35-lyra.toml" /var/tmp/fbg/lyra/etc/devices.d/35-l
 put "$ROOT/choragus/etc/services.d/36-atrium-choragusd.toml" /var/tmp/fbg/choragus/etc/services.d/36-atrium-choragusd.toml
 V 'kldload -n snd_hda; sh /var/tmp/fbg/scripts/lyra-service.sh /var/tmp/lyrad /var/tmp/choragusd' >"$OUT/commission.txt" 2>&1 \
     && ok "lyrad + choragusd commissioned" || { bad "commission (see commission.txt)"; cat "$OUT/commission.txt"; }
+put "$ROOT/limen/target/$TARGET/release/limend" /var/tmp/limend || bad "limend copy"
+put "$ROOT/scripts/limen-service.sh" /var/tmp/fbg/scripts/limen-service.sh
+V 'mkdir -p /var/tmp/fbg/limen/etc/services.d'
+put "$ROOT/limen/etc/services.d/41-atrium-limend.toml" /var/tmp/fbg/limen/etc/services.d/41-atrium-limend.toml
+V 'sh /var/tmp/fbg/scripts/limen-service.sh /var/tmp/limend' >"$OUT/limen-commission.txt" 2>&1 \
+    && ok "limend commissioned" || { bad "limend commission (see limen-commission.txt)"; cat "$OUT/limen-commission.txt"; }
 V 'sysrc -q atrium_portcullisd_bootstrap_enable=YES >/dev/null' && ok "bootstrap enabled at boot"
+# NETIF_TRIM=1 (Shankar 2026-11-18): the dev VM gets its lease in the
+# background and no IPv6 autoconf, so rc.d/netif waits for neither the
+# DHCP lease nor the DAD sleep. Backup: /etc/rc.conf.pre-netif-trim.
+if [ "${NETIF_TRIM:-0}" = 1 ]; then
+    V '[ -f /etc/rc.conf.pre-netif-trim ] || cp -p /etc/rc.conf /etc/rc.conf.pre-netif-trim
+       sysrc -q ifconfig_DEFAULT="DHCP" background_dhclient=YES >/dev/null' \
+        && ok "netif trim: ifconfig_DEFAULT=DHCP, background_dhclient=YES" || bad "netif trim"
+fi
 # The atrium_jaild rc script loads the devfs rulesets before the services
 # launch; rc.d/devfs must not reload them under jails launching at that moment.
 V 'sysrc -q devfs_load_rulesets=NO >/dev/null' && ok "rc.d/devfs leaves the rulesets to atrium_jaild"
@@ -129,6 +146,7 @@ V 'cat /var/run/atrium/boot-status' > "$OUT/boot-status.txt" 2>&1
 awk '/enabled service manifest/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$OUT/bootstrap.log" > "$OUT/bootstrap-lastboot.log"
 grep -q "atrium-lyrad: bound 1 socket" "$OUT/bootstrap-lastboot.log" && ok "lyrad's socket bound ahead of launch" || bad "lyrad socket not bound by the bootstrap"
 grep -q "atrium-choragusd: bound 7 socket" "$OUT/bootstrap-lastboot.log" && ok "choragusd's 7 sockets bound ahead of launch" || bad "choragusd sockets not bound by the bootstrap"
+grep -q "atrium-limend: bound 1 socket" "$OUT/bootstrap-lastboot.log" && ok "limend's socket bound ahead of launch" || bad "limend socket not bound by the bootstrap"
 grep -q "launched [1-9]" "$OUT/bootstrap-lastboot.log" && ok "the bootstrap launched services" || bad "the bootstrap launched nothing: $(grep -m1 "launched" "$OUT/bootstrap-lastboot.log")"
 grep -q "not_loaded" "$OUT/bootstrap-lastboot.log" && bad "jaild refused a jail: devfs ruleset not loaded"
 grep "boot settled" "$OUT/bootstrap-lastboot.log" | tail -1 | sed 's/^/  /'
@@ -143,6 +161,7 @@ grep -q "atrium-ostiarius: ready\|atrium-ostiarius: not ready after" "$OUT/boots
 ex=$(grep -c "exited after" "$OUT/bootstrap-lastboot.log")
 [ "$ex" = 0 ] && ok "no service exited during boot" || { bad "$ex service exit(s) during boot:"; grep "exited after" "$OUT/bootstrap-lastboot.log" | head; }
 V 'pgrep -x atrium-lyrad >/dev/null && pgrep -x atrium-choragusd >/dev/null' && ok "lyrad and choragusd running" || bad "lyrad/choragusd not running"
+V 'pgrep -x atrium-limend >/dev/null && [ -S /atrium/sockets/limen/limend.sock ]' && ok "limend running, limend.sock present" || bad "limend not running or no limend.sock"
 V 'tail -n 5 /var/log/atrium/atrium-ostiarius.log 2>/dev/null' > "$OUT/ostiarius-tail.txt"
 if grep -q "giving up" "$OUT/ostiarius-tail.txt"; then bad "ostiarius gave up on frescod (old binary?)"
 elif grep -q "waiting for frescod" "$OUT/ostiarius-tail.txt"; then ok "ostiarius waits for frescod"
