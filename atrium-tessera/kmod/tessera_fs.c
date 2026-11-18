@@ -33660,7 +33660,15 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	/* Rename needs VWRITE on both parent dirs (source's for the
 	 * unlink, target's for the new dirent). UFS does the same. */
 	{
-		int aerr = VOP_ACCESS(fdvp, VWRITE, fcnp->cn_cred, curthread);
+		/* fdvp is unlocked here (VOP_RENAME locks only tdvp and tvp),
+		 * so VOP_ACCESS would trip its lock assertion on a debug
+		 * kernel. tessera_vop_access reads the inode record only and
+		 * needs no vnode lock: call it directly. */
+		struct vop_access_args _aa = {
+			.a_vp = fdvp, .a_accmode = VWRITE,
+			.a_cred = fcnp->cn_cred, .a_td = curthread,
+		};
+		int aerr = tessera_vop_access(&_aa);
 		if (aerr != 0) { err = aerr; goto release; }
 		if (tdvp != fdvp) {
 			aerr = VOP_ACCESS(tdvp, VWRITE, tcnp->cn_cred,
