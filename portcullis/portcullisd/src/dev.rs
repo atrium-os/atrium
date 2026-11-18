@@ -167,7 +167,9 @@ pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String>
         let bytes = read_file(open_beneath(&proj, &entry, libc::O_RDONLY)?, &entry, ENTRY_MAX)?;
         let in_jail = format!("{home_in}/{}/{}{entry}", workspace::WORK,
                               if project.is_empty() || project == "." { String::new() } else { format!("{project}/") });
-        for (at, b) in closure(&bytes, &in_jail, &view)? {
+        // `[bundle] extra-libs`, what it dlopens, once, with the entry's.
+        let extra: &[String] = if entries.is_empty() { m.bundle.as_ref().map_or(&[], |b| &b.extra_libs) } else { &[] };
+        for (at, b) in closure(&bytes, &in_jail, &view, extra)? {
             if !libs.iter().any(|(p, _)| *p == at) { libs.push((at, b)) }
         }
         if libs.len() > LIBS_MAX {
@@ -379,9 +381,40 @@ fn dir_of(p: &str) -> &str {
 /// The loader and the entry's `DT_NEEDED` closure, found as the workspace's
 /// loader would, read now: (path in the bundle, bytes). `entry_in_jail` is
 /// where the entry is in the workspace, for `$ORIGIN`. Parsed, never run.
-fn closure(entry: &[u8], entry_in_jail: &str, view: &[workspace::ViewMount]) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+/// The file names in folder `dir` of the view matching `pat`.
+fn matching_in_view(view: &[workspace::ViewMount], dir: &str, pat: &str) -> Result<Vec<String>, String> {
+    let Some((fd, _)) = open_in_view(view, dir)? else { return Ok(Vec::new()) };
+    // SAFETY: fdopendir takes a descriptor of ours (a dup), closedir frees it.
+    unsafe {
+        let d = libc::dup(fd.as_raw_fd());
+        if d < 0 {
+            return Err(format!("{dir}: {}", std::io::Error::last_os_error()));
+        }
+        let dp = libc::fdopendir(d);
+        if dp.is_null() {
+            libc::close(d);
+            return Ok(Vec::new()); // not a folder
+        }
+        let mut out = Vec::new();
+        loop {
+            let e = libc::readdir(dp);
+            if e.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*e).d_name.as_ptr()).to_string_lossy().into_owned();
+            if portcullis_toml::schema::glob_match(pat, &name) {
+                out.push(name);
+            }
+        }
+        libc::closedir(dp);
+        out.sort();
+        Ok(out)
+    }
+}
+
+fn closure(entry: &[u8], entry_in_jail: &str, view: &[workspace::ViewMount], extra: &[String]) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
     let first = elf_dynamic(entry, Path::new("the entry"))?;
-    if first.needed.is_empty() {
+    if first.needed.is_empty() && extra.is_empty() {
         return Ok(Vec::new()); // static
     }
     let mut out: Vec<(PathBuf, Vec<u8>)> = Vec::new();
@@ -402,6 +435,28 @@ fn closure(entry: &[u8], entry_in_jail: &str, view: &[workspace::ViewMount]) -> 
     };
     let mut queue: Vec<(String, String, Vec<String>)> = first.needed.iter()
         .map(|n| (n.clone(), entry_in_jail.to_string(), paths(&first, dir_of(entry_in_jail)))).collect();
+    // What it loads at run time: looked up where the loader looks, a
+    // pattern by listing those folders.
+    for pat in extra {
+        if !portcullis_toml::schema::valid_extra_lib(pat) {
+            return Err(format!("[bundle] extra-libs {pat:?}: not a library's file name"));
+        }
+        let dirs = paths(&first, dir_of(entry_in_jail));
+        let mut names = Vec::new();
+        if pat.contains(['*', '?']) {
+            for d in &dirs {
+                names.extend(matching_in_view(view, d, pat)?);
+            }
+            if names.is_empty() {
+                return Err(format!("[bundle] extra-libs {pat:?} matches nothing in {}", dirs.join(", ")));
+            }
+        } else {
+            names.push(pat.clone());
+        }
+        for n in names {
+            queue.push((n, "[bundle] extra-libs".into(), dirs.clone()));
+        }
+    }
     while let Some((so, by, dirs)) = queue.pop() {
         if !seen.insert(so.clone()) {
             continue;

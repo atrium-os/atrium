@@ -282,7 +282,11 @@ fn cmd_bundle(args: &[String]) -> ExitCode {
         }
     }
     // 3. The closure.
-    let libs = match bundle::closure(&programs, &root) {
+    let extra = match bundle::extra_libs(&manifest) {
+        Ok(e) => e,
+        Err(e) => return fail(e),
+    };
+    let libs = match bundle::closure(&programs, &root, &extra) {
         Ok(c) => c,
         Err(e) => return fail(if native { e } else { format!("{e}; from outside Atrium an app can only need base libraries (bundle in a workspace for the others)") }),
     };

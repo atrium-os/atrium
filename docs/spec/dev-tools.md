@@ -290,7 +290,12 @@ libraries only (gap 4). Proposed:
 - Each library lands in the bundle's `lib/`, where rtld finds it by its default
   path; nothing is rewritten.
 - Libraries a program `dlopen`s by name can't be found by reading the ELF; the
-  manifest lists them (`[bundle] extra-libs = ["lib/plugins/*.so"]`).
+  manifest lists them by file name, `*` and `?` allowed
+  (`[bundle] extra-libs = ["libjansson.so.4", "libgdk_pixbuf-*.so*"]`). Each is looked
+  up where a linked library would be (`lib`, `usr/lib`, `usr/local/lib`, and the
+  entry's run paths), goes in with what it needs in turn, and a pattern that matches
+  nothing is an error. Name the soname rather than `.so.*`, which also matches the
+  versioned file and carries it twice.
 - `make bundle` and `cargo atrium bundle` do the same resolution to produce an
   installable bundle for Opifex (§5.5).
 

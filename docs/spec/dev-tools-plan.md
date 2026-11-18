@@ -211,7 +211,7 @@ into the base with `scripts/install-c-sdk.sh` (`libfresco.so.0` built natively,
 `/usr/share/mk/atrium.app.mk`). `make run` calls `/atrium/bin/atrium-run`, which
 asks the Terminal with OSC 7770 `run` the same way `pkg` does. The Terminal may now
 send `WorkspaceRun` on the person's press. `make bundle` and `[bundle] extra-libs`
-aren't done yet. Found on the way: a workspace had no loader hints, so programs from
+followed with M6 (below). Found on the way: a workspace had no loader hints, so programs from
 pkg that link `/usr/local/lib` didn't start. pkg runs now end with `ldconfig`. The
 gate `scripts/vm-run-closure-check.sh` passes 17 of 17 with the filter denying.
 
@@ -312,8 +312,12 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   `portcullis workspace bundle` verb; it packs, signs and archives with opifex, and
   bundles a C project's `make` output when there is no Cargo.toml. Gate
   `scripts/vm-bundle-check.sh` 8/8: new, worker add, bundle --sign, the .insula
-  installs with nothing left to resolve, and both workers answer jailed. Not done:
-  the Arca-held key, `[bundle] extra-libs`, `make bundle` in `atrium.app.mk`.
+  installs with nothing left to resolve, and both workers answer jailed. Then
+  `[bundle] extra-libs` (library file names, `*` and `?`, for what an app `dlopen`s),
+  carried by both Run and `cargo atrium bundle`, and `make bundle` in
+  `atrium.app.mk` (runs `cargo-atrium bundle`, so the workspace needs the Rust
+  toolchain; `BUNDLE_FLAGS` passes `--sign` and the rest). `vm-run-closure-check.sh`
+  covers both, 24/24. Not done: the Arca-held key.
 - **M8 (M).** `registries` mode: a jailed `nuntius-egress` CONNECT proxy reusing
   `navigator-fetch`'s address policy; the workspace gets no route out, only the
   proxy; per-workspace host list in its record and the Workspaces app. Gate: cargo

@@ -108,19 +108,57 @@ pub struct Staged {
     pub to: String,
 }
 
+/// `[bundle] extra-libs` (what the programs dlopen): file names, `*` and
+/// `?` allowed.
+pub fn extra_libs(atrium_toml: &str) -> Result<Vec<String>, String> {
+    let m: toml::Value = atrium_toml.parse().map_err(|e| format!("atrium.toml: {e}"))?;
+    let mut out = Vec::new();
+    for v in m.get("bundle").and_then(|b| b.get("extra-libs")).and_then(|e| e.as_array()).into_iter().flatten() {
+        let p = v.as_str().ok_or("[bundle] extra-libs: strings only")?;
+        if !portcullis_toml::schema::valid_extra_lib(p) {
+            return Err(format!("[bundle] extra-libs {p:?}: a library's file name (`*` and `?` allowed), not a path"));
+        }
+        out.push(p.to_string());
+    }
+    Ok(out)
+}
+
 /// The runtime closure of `programs`: the rtld and every library they
-/// need, breadth-first, each soname once. `root` is where the base
-/// libraries are (`/` in a workspace, the SDK sysroot elsewhere).
-pub fn closure(programs: &[PathBuf], root: &Path) -> Result<Vec<Staged>, String> {
+/// need, breadth-first, each soname once, and each `extra` library (a
+/// pattern matched in [`LIB_DIRS`]) with what it needs. `root` is where
+/// the base libraries are (`/` in a workspace, the SDK sysroot elsewhere).
+pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Vec<Staged>, String> {
     let mut out: Vec<Staged> = Vec::new();
     let mut seen = BTreeMap::new();
     let mut queue: Vec<(PathBuf, String)> = programs.iter().map(|p| (p.clone(), p.display().to_string())).collect();
+    for pat in extra {
+        let mut hit = false;
+        for d in LIB_DIRS {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(d)).into_iter().flatten().flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| portcullis_toml::schema::glob_match(pat, n)).collect();
+            names.sort();
+            for n in names {
+                let from = root.join(d).join(&n);
+                if !from.is_file() || seen.contains_key(&n) {
+                    continue;
+                }
+                hit = true;
+                seen.insert(n.clone(), ());
+                queue.push((from.clone(), n.clone()));
+                out.push(Staged { from, to: format!("{d}/{n}") });
+            }
+        }
+        if !hit {
+            return Err(format!("[bundle] extra-libs {pat:?} matches nothing in {} ({})", root.display(), LIB_DIRS.join(", ")));
+        }
+    }
     let mut need_rtld = None;
     while !queue.is_empty() {
         let (obj, label) = queue.remove(0);
         let bytes = std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?;
         let d = dynamic(&bytes).map_err(|e| format!("{label}: {e}"))?;
-        if need_rtld.is_none() {
+        if need_rtld.is_none() && programs.iter().any(|p| *p == obj) {
             need_rtld = d.interp.clone();
         }
         let origin = obj.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -316,11 +354,19 @@ mod tests {
         std::fs::write(dir.join("app/vendor/libmine.so.1"), elf(&["libz.so.6"], None)).unwrap();
         let prog = dir.join("app/prog");
         std::fs::write(&prog, elf(&["libthr.so.3", "libmine.so.1"], Some("$ORIGIN/vendor"))).unwrap();
-        let c = closure(&[prog.clone()], &root).unwrap();
+        let c = closure(&[prog.clone()], &root, &[]).unwrap();
         let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
         assert_eq!(tos, ["libexec/ld-elf.so.1", "lib/libthr.so.3", "usr/lib/libmine.so.1", "lib/libc.so.7", "usr/lib/libz.so.6"]);
+        std::fs::write(root.join("usr/lib/libp_a.so"), elf(&["libc.so.7"], None)).unwrap();
+        std::fs::write(root.join("usr/lib/libp_b.so"), elf(&["libthr.so.3"], None)).unwrap();
+        let c = closure(&[prog.clone()], &root, &["libp_*.so".into()]).unwrap();
+        let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
+        assert!(tos.contains(&"usr/lib/libp_a.so") && tos.contains(&"usr/lib/libp_b.so"), "{tos:?}");
+        assert_eq!(tos.iter().filter(|t| **t == "lib/libthr.so.3").count(), 1, "{tos:?}");
+        let e = closure(&[prog.clone()], &root, &["libq_*.so".into()]).unwrap_err();
+        assert!(e.contains("libq_*.so"), "{e}");
         std::fs::write(&prog, elf(&["libnope.so.1"], None)).unwrap();
-        let e = closure(&[prog], &root).unwrap_err();
+        let e = closure(&[prog], &root, &[]).unwrap_err();
         assert!(e.contains("needs libnope.so.1"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }

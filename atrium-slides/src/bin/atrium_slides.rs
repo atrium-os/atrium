@@ -486,6 +486,14 @@ fn main() {
     // Closing waits on Save As (true), and Don't Save drops the changes.
     let mut close_after_save = false;
     let mut discard = false;
+    // Files the user opens in Slides from Scrinium (opening-files.md §6.2).
+    let mut channel = match atrium_open::Channel::connect() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("atrium-slides: the document channel: {e}");
+            None
+        }
+    };
     'main: loop {
         let busy = atrium_slides::render::decoding() + atrium_slides::render::previewing() > 0 || run.background.is_some();
         match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() || busy { 20 } else { 250 }))) {
@@ -638,6 +646,19 @@ fn main() {
             let p = b.progress();
             if p != run.slides.doc.borrow().status {
                 run.set_status(p);
+            }
+        }
+        if let Some(ch) = channel.as_mut() {
+            match ch.recv(Some(Duration::ZERO)) {
+                Ok(Some(o)) => {
+                    eprintln!("atrium-slides: “{}” opened from Scrinium{}", o.name, if o.write { " (write)" } else { "" });
+                    run.opened(o.name, o.write, o.file.into());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("atrium-slides: the document channel: {e}");
+                    channel = None;
+                }
             }
         }
         if last_sync.elapsed() >= SYNC_EVERY {

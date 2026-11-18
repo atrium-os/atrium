@@ -221,6 +221,34 @@ pub struct BundleSection {
     /// byte (opifex.md §4.2). Written by `opifex pack`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Libraries the programs load at run time (`dlopen`) that no
+    /// `DT_NEEDED` names (dev-tools-plan.md M4): file names, `*` and `?`
+    /// allowed (`libvulkan.so.1`, `libfoo_plugin_*.so`), looked up where
+    /// the loader looks; each comes into the bundle with its own
+    /// libraries. Read by `cargo atrium bundle` and Run.
+    #[serde(default, rename = "extra-libs", skip_serializing_if = "Vec::is_empty")]
+    pub extra_libs: Vec<String>,
+}
+
+/// An `[bundle] extra-libs` entry: a library's file name, with `*` and `?`
+/// for any characters, never a path.
+pub fn valid_extra_lib(p: &str) -> bool {
+    !p.is_empty() && p.len() <= 128 && p.contains(".so") && !p.starts_with('.')
+        && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-*?".contains(&b))
+}
+
+/// Whether file name `name` matches pattern `pat` (`*` any run, `?` one).
+pub fn glob_match(pat: &str, name: &str) -> bool {
+    fn m(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => m(&p[1..], n) || (!n.is_empty() && m(p, &n[1..])),
+            (Some(b'?'), Some(_)) => m(&p[1..], &n[1..]),
+            (Some(a), Some(b)) if a == b => m(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    m(pat.as_bytes(), name.as_bytes())
 }
 
 /// How the entry artifact is shipped: a native ELF per arch, or a portable IR
