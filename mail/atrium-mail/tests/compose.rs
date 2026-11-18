@@ -442,3 +442,59 @@ fn sign_through_sigillum() {
     assert_eq!(opened.summary.smime.unwrap().state, mail_schema::SmimeState::Valid);
     assert_eq!(opened.summary.text.as_deref().map(str::trim), Some("Hello Ada."));
 }
+
+#[test]
+fn recipients_complete_from_the_address_book() {
+    use atrium_mail::compose::typing;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: "/nonexistent".into() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    engine.store.set_identities(account, &[Identity { name: "Priya Raman".into(), addr: "priya@example.org".into(), signature: String::new() }]).unwrap();
+    // Each of these written to once a day ago; Grace twice.
+    engine.store.write(|w| {
+        w.wrote_to(Some("<1@x>"), &[("Grace Hopper", "grace@navy.example"), ("", "greg@acme.example")], NOW - 86_400)?;
+        w.wrote_to(Some("<2@x>"), &[("Grace Hopper", "grace@navy.example"), ("Arun", "arun@acme.example")], NOW - 86_400)
+    }).unwrap();
+    assert_eq!(typing("Arun <arun@acme.example>, gr"), Some((25, "gr")));
+    assert_eq!(typing("Arun <arun@acme.example>, "), None);
+    assert_eq!(typing("\"Raman, Priya\" <p@x>"), None);
+
+    let c = engine.compose_new(account, 0).unwrap();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    app.tick();
+    assert!(app.focused().is_some(), "To has the caret");
+    app.handle_event(typed("gr"));
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Grace Hopper") && t.iter().any(|x| x == "greg@acme.example"), "{t:?}");
+    assert_eq!(k.completing.borrow().people[0].addr, "grace@navy.example", "the most written to first");
+    let key = |key: Key| Event::Key { kind: KeyEventKind::Down, key, modifiers: Modifiers::default(), chars: String::new() };
+    // Down picks the second; Enter takes it, with a comma for the next.
+    assert!(k.key(&key(Key::Down), None));
+    app.tick();
+    assert!(k.key(&key(Key::Enter), None));
+    assert_eq!(k.to.get_cloned().text(), "greg@acme.example, ");
+    app.tick();
+    assert!(k.completing.borrow().people.is_empty());
+    // By a word of the name; Tab takes the first.
+    app.handle_event(typed("hop"));
+    app.tick();
+    assert!(k.key(&key(Key::Tab), None));
+    assert_eq!(k.to.get_cloned().text(), "greg@acme.example, Grace Hopper <grace@navy.example>, ");
+    assert_eq!(k.draft().to.len(), 2);
+    // Escape puts them away for what was typed; Enter is the field's again.
+    app.handle_event(typed("ar"));
+    app.tick();
+    assert!(k.key(&key(Key::Escape), None));
+    app.tick();
+    assert!(!texts(&app).iter().any(|x| x == "Arun"));
+    assert!(!k.key(&key(Key::Enter), None));
+    // Nothing is suggested in a field without the caret.
+    app.handle_event(typed("u"));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Arun"));
+    k.subject.set(TextEdit::new("x"));
+    assert!(k.suggest(None).people.is_empty());
+}

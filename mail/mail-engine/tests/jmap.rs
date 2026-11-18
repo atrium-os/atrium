@@ -357,6 +357,12 @@ fn jmap_sync_changes_and_send() {
     let sent = engine.store.list(fid("Sent"), 0, 5).unwrap();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].subject, "Re: Plan");
+    // In the address book once (sent here, then seen in Sent), with the
+    // name it was written to by.
+    let people = engine.complete("gra", 5).unwrap();
+    assert_eq!(people.iter().map(|p| (p.name.as_str(), p.addr.as_str(), p.count)).collect::<Vec<_>>(), [("Grace", "grace@example.net", 1)]);
+    assert_eq!(engine.complete("sam", 5).unwrap().len(), 1, "Bcc too");
+    assert_eq!(engine.people_from_sent().unwrap(), 0, "not empty: nothing to fill");
 
     // As someone the server doesn't know: refused for good.
     let other = Draft { from: Mailbox::new("Ada", "ada@elsewhere.example"), subject: "x".into(), ..draft };

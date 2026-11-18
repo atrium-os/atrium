@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1129,7 +1129,7 @@ Stalwart in the cloud VM, and later a real account):
    **Not yet**: the app runs no sync or send loop of its own (no account setup §5.1 yet,
    so deliver/copy_drafts are called by tests), so the press's token isn't spent by a
    trusted spender (§9.4 needs the separate engine process) and the courier's hourly cap
-   isn't reached; attachments in compose (M5 picker), address completion (§14.2), per
+   isn't reached; attachments in compose (M5 picker), address completion (§14.2; built later, see M8), per
    recipient plain text, inline images and tables in the profile, a link button, time
    zones, and a VM run with frescod.
 6. **M5** attachments: quick look, `OpenAttachment`, Save via picker, attachment search
@@ -1410,6 +1410,23 @@ Stalwart in the cloud VM, and later a real account):
    errors and HTTP exchanges as in-process; the same verdicts on a scripted stream,
    stopped and ended), and the engine's JMAP suite, push included, passes through the
    worker.
+
+   **Address book and recipient completion (2026-11-18, §14.2)**: the store keeps the
+   persona's address book (`mail_store::people`): each address the person wrote to, the
+   name it was last written with, how many messages and when last. A message counts once
+   by its Message-ID, so sending it and later seeing its copy in Sent doesn't count
+   twice. It fills when a send is handed over (names from the draft), from new mail in
+   Sent folders as sync stores it, and once at start from the Sent mail already synced
+   when the book is empty (a store from before). Completion matches the start of the
+   address, its domain, a part of its local name, or a word of the name, and ranks by
+   messages halved for each month of quiet. In compose, the To, Cc and Bcc fields show up
+   to five people under the field with the caret, for the address being typed at its
+   end. The arrows pick, Enter or Tab or a click takes one (a comma follows for the
+   next), and Escape puts them away for what was typed. Tests: store 1 (counting, names,
+   matching, ranking, forgetting), the engine's JMAP send (in the book once, Bcc too), and
+   the compose window 1 (typing, arrows, Enter, Tab, Escape, no suggestions without the
+   caret). **Not yet**: imported vCards and CardDAV (§17 D8), and a page to see and
+   forget people (`forget_person` exists).
 
 ## 17. Decisions, with recommendations
 
