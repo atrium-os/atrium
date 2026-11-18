@@ -123,6 +123,12 @@ bundle byte-identical everywhere. Closure assembly is a deterministic **build/pa
 step (the missing bundle-assembly tool, the counterpart to Opifex-the-installer),
 NOT an install-time action.
 
+> **Base files (2026-11-18, opifex.md §7.5).** The rtld and the base system's own
+> libraries (`/lib`, `/usr/lib`) are not part of the bundle's closure: Opifex puts this
+> machine's base copies into the app tree at install, outside the signature, and refreshes
+> them after every base update. A bundle ships only the libraries the base lacks, under
+> `lib/` or `usr/lib/`; base copies it ships anyway are replaced.
+
 > **Bring-up exception (explicit, temporary).** `opifex install` today resolves the
 > closure at install time via `ldd` on the *host's* libraries (see
 > `opifex/src/main.rs::resolve_runtime`). That is convenient for VM bring-up but

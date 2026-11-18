@@ -34,6 +34,12 @@ pub struct Record {
     /// recovery makes the next update ask again (opifex.md §7.7).
     #[serde(default)]
     pub recoveries: u64,
+    /// The base-system files in its tree (rtld, libc, …): path in the tree and
+    /// sha256 of the base's copy they came from. Not covered by the
+    /// publisher's signature; refreshed after every base update
+    /// (opifex.md §7.5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

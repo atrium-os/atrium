@@ -136,6 +136,7 @@ impl Daemon {
             Request::Rollback { id } => self.locked(|| self.rollback(&id)),
             Request::Sync { from } => self.locked(|| self.sync(Path::new(&from))),
             Request::Tick => self.tick(true),
+            Request::RefreshBase => self.locked(|| self.refresh_base()),
         };
         res.unwrap_or_else(|message| Response::Error { message })
     }
@@ -450,6 +451,54 @@ impl Daemon {
         Ok(out)
     }
 
+    // ── base-system files in app trees (§7.5) ───────────────────────────────
+
+    /// After a base update (and at every start): give each installed app the
+    /// base's current rtld and libraries, swapping its tree whole. Run by
+    /// whatever installs the base, as `opifex refresh-base`.
+    pub fn refresh_base(&self) -> Result<Response, String> {
+        let (mut apps, mut failed) = (Vec::new(), Vec::new());
+        for rec in self.store().load()?.apps.into_iter().filter(|r| r.kind == "app") {
+            if crate::runtime::base_current(&rec.base, &self.sysroot) {
+                continue;
+            }
+            match self.rebase_one(&rec.id) {
+                Ok(true) => apps.push(rec.id),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("opifexd: {}: base files: {e}", rec.id);
+                    failed.push(format!("{}: {e}", rec.id));
+                }
+            }
+        }
+        Ok(Response::Refreshed { apps, failed })
+    }
+
+    /// Refresh one app's base files; true when its tree was swapped.
+    fn rebase_one(&self, id: &str) -> Result<bool, String> {
+        let mut rec = self.store().get(id)?.ok_or_else(|| format!("{id}: not installed"))?;
+        let dest = self.root.join("apps").join(id);
+        let text = fs::read_to_string(dest.join("atrium.toml")).map_err(|e| format!("{}: {e}", dest.display()))?;
+        let m = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{e:?}"))?;
+        let staging = self.root.join("opifex/staging");
+        fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        let new = staging.join(format!("{id}.rebase.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&new);
+        let r = match crate::runtime::rebase(&dest, &new, m.entry(), &self.sysroot, rec.source == "side-load") {
+            Ok(r) => r,
+            Err(e) => { let _ = fs::remove_dir_all(&new); return Err(e); }
+        };
+        let swapped = r.copied > 0;
+        if swapped {
+            app::replace(&self.root, id, &new)?;
+        } else {
+            let _ = fs::remove_dir_all(&new);
+        }
+        rec.base = r.base;
+        self.store().put(rec)?;
+        Ok(swapped)
+    }
+
     fn set_care(&self, uid: u32, id: &str, care: &str) -> Result<(), String> {
         let rec = self.store().get(id)?.ok_or_else(|| format!("{id}: not installed"))?;
         if uid != 0 && uid != rec.installed_by {
@@ -603,6 +652,7 @@ impl Daemon {
                 id: id.into(), version: version.into(), kind: r.kind.clone(), publisher: publisher.clone(),
                 source: source.clone(), archive_sha256: r.archive_sha256.clone(),
                 content: content.into(), installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries,
+                base: Vec::new(),
             };
             match r.kind.as_str() {
                 "font" => {
@@ -645,11 +695,17 @@ impl Daemon {
             let opts = app::Opts { root: &self.root, trust: &self.trust, allow_unsigned: false,
                                    require_content: true, catalog_key: Some(&signer) };
             let (m, stage) = app::stage(&dir, &opts)?;
-            // Catalog packages carry their own closure (no install-time resolving).
             if !stage.join(m.entry()).is_file() {
                 let _ = fs::remove_dir_all(&stage);
                 return Err(format!("{id}: entry {} missing", m.entry()));
             }
+            // A catalog package ships its own libraries; the base's (rtld,
+            // libc, …) always come from this machine's base, never the
+            // package's (§7.5).
+            let base = match crate::runtime::resolve(&stage.join(m.entry()), &stage, &self.sysroot, false) {
+                Ok(r) => r.base,
+                Err(e) => { let _ = fs::remove_dir_all(&stage); return Err(format!("{id}: {e}")); }
+            };
             // WebAuthn RP ids: only those whose site names this app (§7.3).
             let verified_rps = if crate::rp::rp_ids(&r.manifest).is_empty() { Vec::new() } else {
                 let mut net = fetch::Fetcher::new(self.fetch_any_cmd.clone());
@@ -663,7 +719,7 @@ impl Daemon {
                 id: m.app.id.clone(), version: m.app.version.clone(), kind: r.kind.clone(), publisher: publisher.clone(),
                 source: source.clone(), archive_sha256: r.archive_sha256.clone(),
                 content: m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
-                installed_by: uid, time: now(), verified_rps, recoveries,
+                installed_by: uid, time: now(), verified_rps, recoveries, base,
             };
             self.finish(&m, &stage, rec)
         })();
@@ -796,10 +852,10 @@ impl Daemon {
                 let _ = fs::remove_dir_all(&stage);
                 return Err(format!("entry {} missing", m.entry()));
             }
-            if let Err(e) = crate::runtime::resolve_runtime(&entry, &stage, &self.sysroot) {
-                let _ = fs::remove_dir_all(&stage);
-                return Err(e);
-            }
+            let base = match crate::runtime::resolve(&entry, &stage, &self.sysroot, true) {
+                Ok(r) => r.base,
+                Err(e) => { let _ = fs::remove_dir_all(&stage); return Err(e); }
+            };
             let text = fs::read_to_string(dir.join("atrium.toml")).map_err(|e| e.to_string())?;
             let publisher = self.trust.verify_publisher(&dir, &text, portcullis_trust::Demand::PolicyDefault)
                 .ok().flatten().map(|h| oc::hex(&h)).unwrap_or_default();
@@ -807,7 +863,7 @@ impl Daemon {
                 id: m.app.id.clone(), version: m.app.version.clone(), kind: "app".into(), publisher,
                 source: "side-load".into(), archive_sha256: String::new(),
                 content: m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
-                installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries: 0,
+                installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries: 0, base,
             };
             self.finish(&m, &stage, rec)
         })();
@@ -866,7 +922,11 @@ impl Daemon {
         rec.version = m.app.version.clone();
         rec.content = m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default();
         rec.time = now();
+        rec.base = Vec::new(); // the kept tree's base files: refreshed now
         self.store().put(rec)?;
+        if let Err(e) = self.rebase_one(id) {
+            eprintln!("opifexd: {id}: base files after the rollback: {e}");
+        }
         Ok(Response::Done { id: id.into(), version: m.app.version })
     }
 }

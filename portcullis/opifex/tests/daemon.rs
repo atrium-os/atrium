@@ -673,3 +673,33 @@ fn a_revoked_install() {
     assert_eq!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { id: ID.into(), version: "1.0".into() });
     assert!(w.daemon.revoked_installed().unwrap().is_empty());
 }
+
+/// A base update reaches installed apps: `refresh-base` swaps in a tree with
+/// the base's new rtld, once, and a rollback gets the current one too.
+#[test]
+fn base_files_follow_the_base() {
+    let w = world("rebase");
+    publish(&w, "1.0", &elf(1));
+    sync(&w);
+    assert!(matches!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { .. }));
+    publish(&w, "1.1", &elf(2));
+    sync(&w);
+    assert!(matches!(ask(&w, 0, Request::Install { id: ID.into() }), Response::Done { .. }));
+    let app = w.daemon.root.join("apps").join(ID);
+    assert_eq!(fs::read(app.join("libexec/ld-elf.so.1")).unwrap(), b"rtld");
+    assert_eq!(w.daemon.store().get(ID).unwrap().unwrap().base.len(), 1);
+    assert_eq!(ask(&w, 0, Request::RefreshBase), Response::Refreshed { apps: vec![], failed: vec![] });
+
+    fs::write(w.daemon.sysroot.join("libexec/ld-elf.so.1"), b"rtld 2").unwrap();
+    assert!(err(ask(&w, 1001, Request::RefreshBase)).contains("administrator"));
+    assert_eq!(ask(&w, 0, Request::RefreshBase), Response::Refreshed { apps: vec![ID.into()], failed: vec![] });
+    assert_eq!(fs::read(app.join("libexec/ld-elf.so.1")).unwrap(), b"rtld 2");
+    assert_eq!(fs::read(app.join("bin/hello")).unwrap(), elf(2));
+    assert_eq!(ask(&w, 0, Request::RefreshBase), Response::Refreshed { apps: vec![], failed: vec![] });
+
+    // The kept 1.0 tree has the old rtld; rolling back refreshes it.
+    assert_eq!(ask(&w, 0, Request::Rollback { id: ID.into() }), Response::Done { id: ID.into(), version: "1.0".into() });
+    assert_eq!(fs::read(app.join("libexec/ld-elf.so.1")).unwrap(), b"rtld 2");
+    assert_eq!(fs::read(app.join("bin/hello")).unwrap(), elf(1));
+    assert_eq!(fs::read_dir(w.daemon.root.join("opifex/staging")).unwrap().count(), 0);
+}

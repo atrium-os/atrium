@@ -201,6 +201,21 @@ pub fn commit(root: &Path, id: &str, stage: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Put `new` in place of `apps/<id>` (the same version, its base files
+/// refreshed); the kept previous version is left alone.
+pub fn replace(root: &Path, id: &str, new: &Path) -> Result<PathBuf, String> {
+    let dest = root.join("apps").join(id);
+    let old = state(root).join("staging").join(format!("{id}.old.{}", std::process::id()));
+    let _ = fs::remove_dir_all(&old);
+    fs::rename(&dest, &old).map_err(|e| format!("{}: {e}", dest.display()))?;
+    if let Err(e) = fs::rename(new, &dest) {
+        let _ = fs::rename(&old, &dest);
+        return Err(format!("{} -> {}: {e}", new.display(), dest.display()));
+    }
+    let _ = fs::remove_dir_all(&old);
+    Ok(dest)
+}
+
 /// `opifex rollback <id>`: swap `apps/<id>` and the kept previous version.
 pub fn rollback(root: &Path, id: &str) -> Result<PathBuf, String> {
     let dest = root.join("apps").join(id);

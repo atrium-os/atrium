@@ -122,6 +122,16 @@ fn main() {
         },
         lock: Mutex::new(()),
     });
+    // Base files in app trees: a base update since the last start is caught
+    // here even if its installer didn't run `opifex refresh-base`.
+    {
+        let d = Arc::clone(&d);
+        std::thread::spawn(move || match d.handle(0, opifex::proto::Request::RefreshBase) {
+            opifex::proto::Response::Refreshed { apps, failed } if !apps.is_empty() || !failed.is_empty() =>
+                eprintln!("opifexd: base files refreshed for {} app(s), {} failed", apps.len(), failed.len()),
+            _ => {}
+        });
+    }
     if std::env::var("OPIFEX_DAILY").ok().as_deref() != Some("0") {
         let d = Arc::clone(&d);
         std::thread::spawn(move || daily(&d));
