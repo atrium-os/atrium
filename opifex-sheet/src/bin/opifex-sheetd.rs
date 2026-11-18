@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use opifex::proto::{Described, Request, Response};
-use opifex_sheet::sheet::Outcome;
+use opifex_sheet::sheet::{Adding, Outcome, Sheet};
 use opifex_sheet::{Answer, Ask, MAX_LINE};
 
 #[cfg(not(target_os = "linux"))]
@@ -62,7 +62,7 @@ fn plain_id(id: &str) -> bool {
 
 /// What happens to one ask, with `show` putting the sheet in front of the
 /// person (a parameter so tests can stand in for them).
-fn decide(asker: u32, id: &str, show: impl FnOnce(Described) -> Result<Outcome, String>) -> Answer {
+fn decide(asker: u32, id: &str, show: impl FnOnce(Sheet) -> Result<Outcome, String>) -> Answer {
     if !plain_id(id) {
         return Answer::Failed { why: "not an app id".into() };
     }
@@ -81,13 +81,42 @@ fn decide(asker: u32, id: &str, show: impl FnOnce(Described) -> Result<Outcome, 
         return Answer::Installed;
     }
     let manifest_sha256 = app.manifest_sha256.clone();
-    match show(app) {
+    match show(Sheet::new(app)) {
         Ok(Outcome::NotNow) => Answer::Declined,
         Err(why) => Answer::Failed { why },
         Ok(Outcome::Install) => {
             let r = Request::InstallApproved { id: id.into(), manifest_sha256, for_uid: asker };
             match opifexd(&r, Duration::from_secs(300)) {
                 Ok(Response::Done { .. }) => Answer::Installed,
+                Ok(Response::Error { message }) => Answer::Failed { why: message },
+                Ok(other) => Answer::Failed { why: format!("opifexd: {other:?}") },
+                Err(why) => Answer::Failed { why },
+            }
+        }
+    }
+}
+
+/// Adding a catalog for the asker (opifex.md §6.5): opifexd fetches its
+/// root.toml, the sheet shows its name, address and the warning, and a
+/// counted press adds exactly the root.toml that was shown.
+fn decide_catalog(asker: u32, url: &str, show: impl FnOnce(Sheet) -> Result<Outcome, String>) -> Answer {
+    if !opifex::fetch::plain_https(url) || url.len() > 512 {
+        return Answer::Failed { why: "not an https address".into() };
+    }
+    let (name, root_sha256, warning) = match opifexd(&Request::PreviewCatalog { url: url.into() }, Duration::from_secs(60)) {
+        Ok(Response::CatalogPreview { name, root_sha256, warning, .. }) => (name, root_sha256, warning),
+        Ok(Response::Error { message }) => return Answer::Failed { why: message },
+        Ok(other) => return Answer::Failed { why: format!("opifexd: {other:?}") },
+        Err(why) => return Answer::Failed { why },
+    };
+    let sha = root_sha256.clone();
+    match show(Sheet::catalog(Adding { name, url: url.into(), root_sha256, warning })) {
+        Ok(Outcome::NotNow) => Answer::Declined,
+        Err(why) => Answer::Failed { why },
+        Ok(Outcome::Install) => {
+            let r = Request::AddCatalog { url: url.into(), root_sha256: sha, machine: false, for_uid: asker };
+            match opifexd(&r, Duration::from_secs(300)) {
+                Ok(Response::CatalogAdded { name, .. }) => Answer::Added { name },
                 Ok(Response::Error { message }) => Answer::Failed { why: message },
                 Ok(other) => Answer::Failed { why: format!("opifexd: {other:?}") },
                 Err(why) => Answer::Failed { why },
@@ -137,13 +166,12 @@ fn counted(token: [u8; 16]) -> bool {
 static SHEET: Mutex<()> = Mutex::new(());
 
 /// The sheet in front of the person: opifex-sheetd's own window on frescod.
-fn show(app: Described) -> Result<Outcome, String> {
+fn show(mut s: Sheet) -> Result<Outcome, String> {
     use fresco_client::{Connection, Event};
     use fresco_protocol::{WindowHints, WmRole};
-    use opifex_sheet::sheet::{Do, Key, Sheet};
+    use opifex_sheet::sheet::{Do, Key};
     use opifex_sheet::view;
     let _one = SHEET.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = Sheet::new(app);
     // Room for every line and the notice, fixed now so the guard never moves.
     let lines = s.lines().len() + 1;
     let fresco = fresco_client::default_socket_path();
@@ -151,7 +179,7 @@ fn show(app: Described) -> Result<Outcome, String> {
     let text = win.appearance().map(|a| a.text_scale()).unwrap_or(1.0);
     let (w, h) = view::size(lines, text);
     let hints = WindowHints { role: Some(WmRole::Dialog), server_decorations: Some(false), min_size: Some((w.ceil() as u32, h.ceil() as u32)), ..Default::default() };
-    let id = win.window_create(w.ceil() as u32, h.ceil() as u32, "Install", hints).map_err(|e| format!("frescod: {e}"))?;
+    let id = win.window_create(w.ceil() as u32, h.ceil() as u32, s.window_title(), hints).map_err(|e| format!("frescod: {e}"))?;
     win.set_default_window(id as u16);
     let font = view::Font::open(&mut win);
     let (mut size, mut k) = ((w, h), win.window_scale(id));
@@ -166,7 +194,7 @@ fn show(app: Described) -> Result<Outcome, String> {
     let at = |r: view::Rect| (((r.x + 24.0) * k) as i32, ((r.y + r.h / 2.0) * k) as i32);
     let rs = view::rows(lines, size.0, text);
     let (a, b) = (at(rs[0]), at(rs[1]));
-    eprintln!("opifex-sheetd: asking about {} {} (install={},{} notnow={},{})", s.app.id, s.app.latest, a.0, a.1, b.0, b.1);
+    eprintln!("opifex-sheetd: asking about {} {} (install={},{} notnow={},{})", s.adding.as_ref().map(|c| c.url.as_str()).unwrap_or(&s.app.id), s.app.latest, a.0, a.1, b.0, b.1);
     let until = Instant::now() + SHEET_FOR;
     let mut dirty = true;
     let out = 'run: loop {
@@ -253,6 +281,11 @@ fn serve(s: UnixStream, askers: Arc<Mutex<Askers>>) {
             eprintln!("opifex-sheetd: {id} for uid {uid}: {a:?}");
             a
         }
+        Some(Ask::AddCatalog { url }) => {
+            let a = decide_catalog(uid, &url, show);
+            eprintln!("opifex-sheetd: catalog {url} for uid {uid}: {a:?}");
+            a
+        }
         None => Answer::Failed { why: "not a request".into() },
     };
     {
@@ -269,8 +302,9 @@ fn main() {
     // `opifex-sheetd ask <id>`: a caller, for tests and scripts.
     let args: Vec<String> = std::env::args().collect();
     if let [_, ask, id] = &args[..] {
-        if ask == "ask" {
-            match opifex_sheet::install(id) {
+        if ask == "ask" || ask == "add-catalog" {
+            let r = if ask == "ask" { opifex_sheet::install(id) } else { opifex_sheet::add_catalog(id) };
+            match r {
                 Ok(a) => println!("{a:?}"),
                 Err(e) => {
                     eprintln!("opifex-sheetd: {e}");
@@ -345,7 +379,7 @@ mod tests {
         ]);
         std::env::set_var("OPIFEX_SOCKET", &p);
         let mut shown = None;
-        assert_eq!(decide(1001, "org.atrium.hello", |a| { shown = Some(a.latest.clone()); Ok(Outcome::Install) }), Answer::Installed);
+        assert_eq!(decide(1001, "org.atrium.hello", |a| { shown = Some(a.app.latest.clone()); Ok(Outcome::Install) }), Answer::Installed);
         assert_eq!(shown.as_deref(), Some("1.1"));
         let got = h.join().unwrap();
         assert_eq!(got[1], Request::InstallApproved { id: "org.atrium.hello".into(), manifest_sha256: "ab".repeat(32), for_uid: 1001 });
@@ -367,6 +401,22 @@ mod tests {
         std::env::set_var("OPIFEX_SOCKET", &p);
         assert!(matches!(decide(1001, "org.atrium.hello", |_| panic!("no sheet")), Answer::Failed { why } if why.contains("not an app")));
         h.join().unwrap();
+
+        // A catalog: the sheet shows what opifexd previewed; the press adds that root.toml, for the asker.
+        let (p, h) = fake("cat", vec![
+            Response::CatalogPreview { url: "https://apps.example.com/".into(), name: "Example Apps".into(),
+                                       root_sha256: "cd".repeat(32), warning: "w".into() },
+            Response::CatalogAdded { slug: "apps.example.com".into(), name: "Example Apps".into(), summary: String::new() },
+        ]);
+        std::env::set_var("OPIFEX_SOCKET", &p);
+        let a = decide_catalog(1001, "https://apps.example.com/", |s| {
+            assert_eq!(s.title(), "Add the catalog Example Apps?");
+            Ok(Outcome::Install)
+        });
+        assert_eq!(a, Answer::Added { name: "Example Apps".into() });
+        let got = h.join().unwrap();
+        assert_eq!(got[1], Request::AddCatalog { url: "https://apps.example.com/".into(), root_sha256: "cd".repeat(32), machine: false, for_uid: 1001 });
+        assert_eq!(decide_catalog(1001, "http://x/", |_| panic!("no sheet")), Answer::Failed { why: "not an https address".into() });
 
         // Junk ids never reach opifexd.
         std::env::set_var("OPIFEX_SOCKET", "/nonexistent/opifex.sock");
