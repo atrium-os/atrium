@@ -135,7 +135,7 @@ impl Pane {
         if self.trace.is_some() {
             let b = self.state.get_cloned();
             let line = format!(
-                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} look={} open={} seals=[{}] stick={}",
+                "place={} path=/{} entries=[{}] selected=[{}] notice={} connect={} servers=[{}] places=[{}] unreadable={} look={} open={} seals=[{}] stick={} names=[{}]",
                 b.place().map_or("-", |p| p.id.as_str()),
                 b.path.join("/"),
                 b.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(","),
@@ -149,6 +149,7 @@ impl Pane {
                 open_trace(&b),
                 seals_trace(&b),
                 stick_trace(&b),
+                b.places.iter().filter(|p| p.seal != Default::default()).map(|p| format!("{}={}", p.id, p.label)).collect::<Vec<_>>().join(","),
             );
             if self.trace.as_deref() != Some(&line) {
                 eprintln!("scrinium: {who}: {line}");

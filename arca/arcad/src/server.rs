@@ -853,7 +853,7 @@ impl State {
                 if v.len() != VALUE_LEN {
                     return reply(status::INTERNAL);
                 }
-                let Some((code, slot)) = crate::recovery::make(&v.as_ref()[..32], &uuid, &key_id, kdf) else {
+                let Some((code, slot)) = crate::recovery::make(&v.as_ref()[..32], &uuid, &key_id, &m.account, kdf) else {
                     return reply(status::INTERNAL);
                 };
                 let mut out = tri!(LockedBuf::zeroed(slot.len() + code.len()).map_err(Error::Io));
@@ -889,7 +889,7 @@ impl State {
                 if let Err(r) = self.volume_store(&user, &persona, false) {
                     return r;
                 }
-                let vk = match crate::recovery::open(&slot, &uuid, &key_id, &code) {
+                let (vk, name) = match crate::recovery::open(&slot, &uuid, &key_id, &code) {
                     Ok(k) => k,
                     Err(crate::recovery::OpenError::BadCode) => return malformed(),
                     Err(_) => return reply(status::DENIED),
@@ -907,8 +907,8 @@ impl State {
                                 class: Class::AfterFirstUnlock,
                                 kind: Kind::VolumeKey,
                                 provenance: Provenance::UserTyped,
-                                // No name: the stick's own isn't known here.
-                                account: "",
+                                // The name it was given at format, from the slot.
+                                account: &name,
                                 scope: &encode_scope(&key_id, &uuid, 0),
                                 value: value.as_ref(),
                             }));
@@ -919,8 +919,8 @@ impl State {
                 let info = LoadInfo { key_id, uuid, group: 0, high_water: 0, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = vk.as_ref().try_into().unwrap();
                 match self.keyring.as_mut().unwrap().load(&info, key) {
-                    Ok(()) => ok(Vec::new()),
-                    Err(e) if e == libc::EEXIST => ok(Vec::new()),
+                    Ok(()) => ok(name.into_bytes()),
+                    Err(e) if e == libc::EEXIST => ok(name.into_bytes()),
                     Err(_) => reply(status::INTERNAL),
                 }
             }

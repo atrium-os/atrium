@@ -661,7 +661,10 @@ lets the owner open the stick elsewhere.
 - **Using it:** the code is typed into an Arca credential field in a system sheet
   (arca.md §8.3; the app never sees it). dispensatord passes the slot's 256 bytes to
   arcad's `ADOPT_RECOVERY`. arcad parses the slot, a fixed record, derives the key,
-  unwraps the VK and checks `check`. Then it either keeps the VK in the persona the
+  unwraps the VK and checks `check`. The slot also carries the stick's name (its
+  `label`, at most 63 bytes), sealed under the same key in the slot's reserved bytes and
+  padded so its length doesn't show, so the stick keeps its name wherever the code opens
+  it; a slot without one opens all the same. Then it either keeps the VK in the persona the
   person picks ("Keep on this machine") or loads it for this session only.
 - **Removing the code** later (Scrinium, stick settings) overwrites the slot in both
   superblock pairs, through the mounted volume.

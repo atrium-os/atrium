@@ -212,7 +212,10 @@ pub mod arca {
             VK_RECOVERY if body.len() > super::SLOT_LEN && body[super::SLOT_LEN..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-') => {
                 format!("ok {} {}", super::hex(&body[..super::SLOT_LEN]), String::from_utf8_lossy(&body[super::SLOT_LEN..]))
             }
-            VK_ADOPT | VK_OLDER if body.is_empty() => "ok".into(),
+            VK_OLDER if body.is_empty() => "ok".into(),
+            // The stick's name from its recovery slot, in hex (any bytes).
+            VK_ADOPT if body.is_empty() => "ok".into(),
+            VK_ADOPT if body.len() <= 64 => format!("ok {}", super::hex(body)),
             _ => "status 255".into(),
         }
     }
@@ -223,9 +226,15 @@ pub mod arca {
 /// characters become spaces, at most 64 characters).
 pub fn find_answer(a: &str) -> (String, String) {
     let (persona, label) = a.split_once(' ').unwrap_or((a, ""));
-    let bytes = (0..label.len() / 2).filter_map(|i| u8::from_str_radix(label.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Vec<_>>();
+    (persona.to_string(), label_from_hex(label))
+}
+
+/// A stick's name sent as hex (`VK_FIND`, `VK_ADOPT`), made fit to show:
+/// control characters become spaces, at most 64 characters, trimmed.
+pub fn label_from_hex(h: &str) -> String {
+    let bytes = (0..h.len() / 2).filter_map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Vec<_>>();
     let label: String = String::from_utf8_lossy(&bytes).chars().map(|c| if c.is_control() { ' ' } else { c }).take(64).collect();
-    (persona.to_string(), label.trim().to_string())
+    label.trim().to_string()
 }
 
 #[cfg(test)]
@@ -296,6 +305,9 @@ mod tests {
         assert!(arca::request(&s(&["release", "x"]), "").is_none());
         assert_eq!(arca::answer(arca::VK_FIND, 0, b"work"), "ok work");
         assert_eq!(arca::answer(arca::VK_FIND, 0, b"work\0Hi"), "ok work 4869");
+        assert_eq!(arca::answer(arca::VK_ADOPT, 0, b""), "ok");
+        assert_eq!(arca::answer(arca::VK_ADOPT, 0, b"Hi"), "ok 4869");
+        assert_eq!(label_from_hex("486901"), "Hi");
         assert_eq!(find_answer("work 4869"), ("work".to_string(), "Hi".to_string()));
         assert_eq!(find_answer("work"), ("work".to_string(), String::new()));
         assert_eq!(find_answer("work 410a42"), ("work".to_string(), "A B".to_string()));

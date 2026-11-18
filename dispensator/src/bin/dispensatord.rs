@@ -511,7 +511,7 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                 println!("ok");
                 for v in vs {
                     println!(
-                        "{} {} {} {}{}{}{}{}{}",
+                        "{} {} {} {}{}{}{}{}{}{}",
                         v.part,
                         if v.mountpoint.is_empty() { "-" } else { &v.mountpoint },
                         v.size_bytes,
@@ -520,7 +520,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
                         if v.locked { " locked" } else { "" },
                         if v.recovery { " recovery" } else { "" },
                         if v.older { " older" } else { "" },
-                        if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) }
+                        if v.persona.is_empty() { String::new() } else { format!(" persona={}", v.persona) },
+                        // Last: a name may hold spaces.
+                        if v.label.is_empty() { String::new() } else { format!(" name={}", v.label) }
                     );
                 }
                 ExitCode::SUCCESS
@@ -2762,13 +2764,14 @@ mod run {
             };
             let keep = if a.keep { "keep" } else { "once" };
             let code = if a.handle == [0; 16] { a.code.clone() } else { format!("held:{}", hex(&a.handle)) };
-            match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
-                Ok(_) => {}
+            // arcad answers the name the stick was given, sealed in its slot.
+            let label = match vk_call_in(&["adopt", &user, &a.persona, &hex(&key_id), &hex(&uuid), &hex(&slot), keep], Some(&code)) {
+                Ok(n) => dispensator::sealed::label_from_hex(&n),
                 Err(st) if st == arca::DENIED => return (mstatus::NOT_ALLOWED, "that isn't this stick's recovery code".into()),
                 Err(st) if st == arca::MALFORMED => return (mstatus::MALFORMED, "that isn't a recovery code: check it for typos".into()),
                 Err(st) if st == arca::LOCKED => return (mstatus::FAILED, format!("{user}'s Arca is locked")),
                 Err(st) => return (mstatus::FAILED, format!("arcad couldn't open it (status {st})")),
-            }
+            };
             let _ = std::fs::create_dir_all(&mnt);
             if let Err(e) = mount_tessera(&a.part, &mnt) {
                 if let Some(r) = &self.keyring {
@@ -2777,7 +2780,7 @@ mod run {
                 return (mstatus::FAILED, format!("the code opened its key, but the kernel refused the stick: {e}"));
             }
             self.locked.remove(&a.part);
-            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false, label: String::new() });
+            self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false, label });
             self.serve_trusted(&a.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);
