@@ -108,6 +108,12 @@ impl Engine {
             ..Draft::default()
         };
         let mut c = Compose { account, draft, identity, notes: Vec::new(), original: r.document };
+        // Replying to a first contact or a look-alike: the reader's note (§9.1).
+        if kind != Kind::Forward {
+            if let Some(n) = self.sender_note(msg)? {
+                c.notes.push(n.line().0);
+            }
+        }
         // A forward carries the original's files (§9.1).
         if kind == Kind::Forward {
             for a in &r.attachments {

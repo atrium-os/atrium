@@ -23,6 +23,11 @@ serde = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 # Remote pictures (§7.4) go through the caller's Nuntius channel.
 nuntius = { path = "../../nuntius", default-features = false }
+# First contact and look-alikes (§7.5): UTS #39 skeletons, domains in
+# their own letters.
+unicode-security = "0.1"
+idna = "1"
+atrium-links = { path = "../../atrium-links" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -131,6 +131,9 @@ pub struct Msg {
     pub lane: Option<(mail_engine::lanes::LaneKind, String)>,
     /// It came to one of the person's private addresses (§13.3).
     pub came_to: Option<mail_engine::private::CameTo>,
+    /// "First message from this address", or "Looks like example.com, but
+    /// is examp1e.com" (§7.5), and whether it warns.
+    pub who: Option<(String, bool)>,
 }
 
 /// What the reader shows: a conversation, or one message.
@@ -976,6 +979,7 @@ impl Mail {
             smime: sender::smime_line(s),
             lane: self.engine.lane_of(msg).ok(),
             came_to: self.engine.came_to(msg),
+            who: self.engine.sender_note(msg).ok().flatten().and_then(|n| who_line(&n, !m.held.is_empty())),
         }
     }
 
@@ -2407,6 +2411,12 @@ impl Mail {
     }
 }
 
+/// The line for a sender note (§7.5); a held message's screener line
+/// already says it is new.
+pub fn who_line(n: &mail_engine::contact::SenderNote, held: bool) -> Option<(String, bool)> {
+    (!(held && *n == mail_engine::contact::SenderNote::FirstContact)).then(|| n.line())
+}
+
 /// One line of the reader.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
@@ -2416,6 +2426,8 @@ pub enum Item {
     From(usize),
     To(usize),
     RepliesTo(usize),
+    /// A first contact or a look-alike sender (§7.5).
+    Who(usize),
     /// "Signed by …" (§10.1).
     Smime(usize),
     /// "Signed with OpenPGP by …" (§10.2).
@@ -2473,6 +2485,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         out.push(Item::From(k));
         if !m.to.is_empty() {
             out.push(Item::To(k));
+        }
+        if m.who.is_some() {
+            out.push(Item::Who(k));
         }
         if m.sender.replies_to.is_some() {
             out.push(Item::RepliesTo(k));
@@ -3410,6 +3425,10 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::To(k) => {
             text(ctx, x, cy, &fit(&format!("To {}", s.msgs[*k].to), type_size::XS, Weight::Regular, tw), type_size::XS, Weight::Regular, t.text_secondary());
+        }
+        Item::Who(k) => {
+            let Some((l, warn)) = &s.msgs[*k].who else { return };
+            text(ctx, x, cy, &fit(l, type_size::XS, if *warn { Weight::Semibold } else { Weight::Regular }, tw), type_size::XS, if *warn { Weight::Semibold } else { Weight::Regular }, if *warn { t.danger_fg() } else { t.text_secondary() });
         }
         Item::RepliesTo(k) => {
             let r = s.msgs[*k].sender.replies_to.clone().unwrap_or_default();

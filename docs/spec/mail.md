@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1559,6 +1559,26 @@ Stalwart in the cloud VM, and later a real account):
    Mark read and Reply on the notification (Praeco's actions need CLASS_BROKER delivery,
    tabula.md §5.1, not built), sounds per account (a Praeco post has no sound yet), and
    showing the schedule in Curia's notification page.
+
+   **First-contact and look-alike notes built on the host (2026-11-18, §7.5, §9.1).**
+   Under an open message's sender line: **"First message from this address"** when the
+   person has never written to it (the address book) and no other message here is from it
+   (the search index's From terms, stopping at the first), not for the person's own
+   addresses, and not on a message the screener holds (its line already says so). **"Looks
+   like example.com, but is examp1e.com"**, in the danger colour, when the sender's domain
+   isn't one the person corresponds with (domains written to, and the accounts' own) but
+   has the same UTS #39 skeleton as one (`unicode-security`, MIT/Apache-2.0: `examp1e`,
+   `rnicrosoft`, Cyrillic `а`) or is one edit from one (`exmaple.com`, `example.co`;
+   domains under 6 characters aren't compared by edits); a look-alike wins over a first
+   contact. Domains are shown as Monstrator shows them (`atrium_links::shown_host`: another
+   script's letters as `xn--`). **Replying** (Reply, Reply all, not Forward) to such a
+   sender puts the same line in the compose window's notes. Only what is here counts: a
+   sender last heard from before the offline window began is new again. Tests: engine 2
+   (edits and skeletons; a store with Priya written to: a stranger, `examp1e.com`,
+   `exmaple.com`, a Cyrillic look-alike shown as `xn--`, the person's own domain looked
+   like, the reply notes, a second message ending a first contact, the person's own mail),
+   window 1 (the line drawn in a conversation). **Not yet**: the persona-specific link
+   scanning of §7.6 and the recipient colouring for Work.
 
 ## 17. Decisions, with recommendations
 

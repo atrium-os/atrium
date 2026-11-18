@@ -186,6 +186,21 @@ impl Store {
         Ok(out)
     }
 
+    /// Whether a message other than `except` has `term` in one of the
+    /// `fields` (stops at the first).
+    pub fn term_elsewhere(&self, term: &str, fields: u8, except: MsgId) -> Result<bool> {
+        let term = term.to_lowercase();
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(TERMS)?;
+        for e in t.range((term.as_str(), 0u64)..=(term.as_str(), u64::MAX))? {
+            let (k, f) = e?;
+            if f.value() & fields != 0 && k.value().1 != except {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Messages stored after `after` (ids only grow), oldest first, at most
     /// `limit`: what arrived since the caller last looked.
     pub fn messages_after(&self, after: MsgId, limit: usize) -> Result<Vec<(MsgId, Message)>> {

@@ -74,6 +74,14 @@ impl Store {
         Ok(all)
     }
 
+    /// The person at `addr`, if the person has written to it.
+    pub fn person(&self, addr: &str) -> Result<Option<Person>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(PEOPLE)?;
+        let v = t.get(addr.trim().to_ascii_lowercase().as_str())?;
+        v.map(|v| dec::<Person>(v.value())).transpose()
+    }
+
     pub fn people_count(&self) -> Result<u64> {
         let tx = self.db.begin_read()?;
         Ok(tx.open_table(PEOPLE)?.len()?)

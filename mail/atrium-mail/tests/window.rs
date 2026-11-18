@@ -200,6 +200,11 @@ fn a_conversation() {
     assert!(matches!(items[1], Item::New));
     assert!(items.iter().any(|i| matches!(i, Item::Fold { quoted: true, shown: false, .. })));
     assert!(items.iter().any(|i| matches!(i, Item::Fold { quoted: false, shown: false, .. })));
+    // Arun has never written before (§7.5).
+    assert_eq!(s.msgs[1].who, Some(("First message from this address".into(), false)));
+    assert!(items.contains(&Item::Who(1)));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "First message from this address"));
     let link = items.iter().find_map(|i| match i { Item::Text { spans, .. } => spans.iter().find_map(|(_, l)| l.clone()), _ => None });
     assert_eq!(link.as_deref(), Some("https://hall.example/book"));
     let t = texts(&app);
