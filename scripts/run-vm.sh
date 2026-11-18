@@ -23,6 +23,9 @@
 #   NETDEV_EXTRA=<opts>  appended to the slirp -netdev (net=, guestfwd=), as
 #                in cloud-vm.sh: the hermetic fixture network of the fetch
 #                gates (scripts/vm-opifex-c4-check.sh prints its value).
+#   QEMU_EXTRA=<args>  more QEMU arguments, as in cloud-vm.sh: "-device
+#                qemu-xhci" gives a headless boot a USB controller for the
+#                hotplug gates (scripts/vm-opifex-c6-check.sh).
 #
 #                ★ Lowered from 12288 on 2026-08-07. 12 GiB was ~6x what this
 #                VM uses — measured in-guest: "15M Active, 524M Inact, 252M
@@ -479,7 +482,8 @@ if [ "${VM:-}" != devroot ] && { [ "${VM:-}" = atrium-vm ] || [ ! -f "$BSD_DIR/v
         $VIRTIO_GPU_ARGS \
         $GPUSIM_ARGS \
         $AUDIO_ARGS \
-        $KGDB_ARGS
+        $KGDB_ARGS \
+        ${QEMU_EXTRA:-}
 fi
 
 exec "$QEMU" \
@@ -509,4 +513,5 @@ exec "$QEMU" \
     $VIRTIO_GPU_ARGS \
     $GPUSIM_ARGS \
     $AUDIO_ARGS \
-    $KGDB_ARGS
+    $KGDB_ARGS \
+    ${QEMU_EXTRA:-}
