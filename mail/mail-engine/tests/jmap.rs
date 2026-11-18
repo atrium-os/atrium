@@ -266,10 +266,12 @@ fn jmap_sync_changes_and_send() {
     assert_eq!(role_of("Inbox"), Role::Inbox);
     assert_eq!(role_of("Archive"), Role::Archive);
     let (inbox, q4, archive) = (fid("Inbox"), fid("Projects/Q4"), fid("Archive"));
+    // Plan arrived flagged: a Later item (§11.4), out of the inbox.
     let rows = engine.store.list(inbox, 0, 10).unwrap();
-    assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["Scans", "Plan", "Lunch"]);
-    let plan = rows.iter().find(|r| r.subject == "Plan").unwrap();
+    assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["Scans", "Lunch"]);
+    let plan = engine.store.list(q4, 0, 10).unwrap().into_iter().find(|r| r.subject == "Plan").unwrap();
     assert!(plan.flags & flag::SEEN != 0 && plan.flags & flag::FLAGGED != 0);
+    assert_eq!(engine.later_items().unwrap().iter().map(|l| l.1.thread).collect::<Vec<_>>(), [engine.store.message(plan.msg).unwrap().thread]);
     assert!(rows.iter().find(|r| r.subject == "Scans").map(|r| !r.has_text).unwrap());
     assert!(rows.iter().find(|r| r.subject == "Lunch").map(|r| r.has_text).unwrap());
     // One message in two mailboxes is one message.
@@ -294,12 +296,13 @@ fn jmap_sync_changes_and_send() {
         let m = &s.mails[&a];
         assert_eq!(m.boxes.iter().collect::<Vec<_>>(), ["arch"]);
         assert!(m.keywords.contains("$seen"));
+        assert!(s.mails[&b].keywords.contains("$snoozed"), "set aside: snoozed for other clients");
     }
     let arch = engine.store.list(archive, 0, 10).unwrap();
     assert_eq!(arch.len(), 1, "back from the server in Archive");
     assert_eq!(arch[0].subject, "Lunch");
     assert!(arch[0].flags & flag::SEEN != 0);
-    assert_eq!(engine.store.count(inbox).unwrap(), 2);
+    assert_eq!(engine.store.count(inbox).unwrap(), 1);
 
     // ── changes made elsewhere ──
     let c = {
@@ -314,8 +317,10 @@ fn jmap_sync_changes_and_send() {
     let r = client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(r.headers, 1, "{r:?}");
     let rows = engine.store.list(inbox, 0, 10).unwrap();
+    // Unflagged elsewhere: Plan's item is done and it is back.
     assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["New one", "Plan"]);
     assert!(rows[1].flags & flag::FLAGGED == 0);
+    assert!(engine.later_items().unwrap().is_empty());
     assert_eq!(engine.store.count(q4).unwrap(), 0);
     let new_msg = engine.store.by_server_id(account, &c).unwrap().unwrap();
     assert_eq!(engine.store.message(new_msg).unwrap().summary.subject, "New one");

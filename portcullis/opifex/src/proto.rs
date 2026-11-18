@@ -48,6 +48,8 @@ pub enum Request {
     /// Sync over the network, install what may go in the background, and
     /// announce the rest (what the daily timer does). Root.
     Tick,
+    /// After a base update: refresh every app's base files (root).
+    RefreshBase,
     /// Check the catalog into the local copy: from the network (`from` empty:
     /// where the catalog says it lives; or an `https://` base) through the
     /// fetcher, or from a folder.
@@ -116,6 +118,7 @@ pub enum Response {
     CatalogAdded { slug: String, name: String, summary: String },
     Updates { items: Vec<crate::updates::Pending>, last_sync: u64, last_error: String },
     Ticked { installed: Vec<String>, waiting: usize },
+    Refreshed { apps: Vec<String>, failed: Vec<String> },
     Ok,
     Error { message: String },
 }

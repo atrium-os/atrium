@@ -86,7 +86,7 @@ fn main() -> ExitCode {
         "token"     => token::cmd(&args[2..]),
         "sign"      => cmd_sign(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
-        | "updates" | "update-care" | "tick" | "catalogs" | "follow" | "unfollow" => ask_daemon(&args[1..]),
+        | "updates" | "update-care" | "tick" | "refresh-base" | "catalogs" | "follow" | "unfollow" => ask_daemon(&args[1..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
         other => { eprintln!("opifex: unknown command: {other}"); usage(); return ExitCode::from(2); }
     };
@@ -140,6 +140,7 @@ fn usage() {
            updates             what is waiting, and why\n  \
            update-care <id> notify|auto   wait for me / the publisher's timing\n  \
            tick                the daily round now (root)\n  \
+           refresh-base        give every app the base's current rtld and libraries (root; after a base update)\n  \
            update-all          apply every waiting update (root)\n  \
            catalogs            the catalogs followed: the Atrium one and those people added\n  \
            follow <https://…> [<root sha256> [--everyone]]   show, then follow, a catalog (root)\n  \
@@ -290,6 +291,7 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         "updates" => Request::Updates,
         "update-care" => Request::SetUpdates { id: arg(1)?, care: arg(2)? },
         "tick" => Request::Tick,
+        "refresh-base" => Request::RefreshBase,
         "catalogs" => Request::Catalogs,
         // `opifex follow <url>` shows what it is; `opifex follow <url> <sha256>
         // [--everyone]` follows it (root; a person adds one on the sheet).
@@ -353,6 +355,12 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
                 println!("  {:<32} {} -> {}  {what}", u.id, u.from, u.to);
             }
             Ok(())
+        }
+        Response::Refreshed { apps, failed } => {
+            for a in &apps { println!("opifex: {a}: base files refreshed"); }
+            for f in &failed { eprintln!("opifex: {f}"); }
+            println!("opifex: {} refreshed, {} failed", apps.len(), failed.len());
+            if failed.is_empty() { Ok(()) } else { Err("some apps keep their old base files".into()) }
         }
         Response::Ticked { installed, waiting } => {
             for i in &installed { println!("opifex: updated {i}"); }

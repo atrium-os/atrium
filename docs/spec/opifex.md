@@ -456,10 +456,28 @@ class. No change to portcullisd's layout. Deduplication between versions and bet
 Tessera's, since `/var/lib/atrium` is on the Tessera root; when Tessera grows an ingest API,
 placing becomes a tree pointer swap with no copy, without changing anything above.
 
-The library closure: catalog packages must ship it (atrium-bundle-format §5, the packer and
-`[bundle] extra-libs`); `opifexd` refuses a catalog package whose entry needs a library not in
-its tree. The current install-time `DT_NEEDED` resolving stays for side-loaded bundles only, as
-the bring-up exception already says.
+The library closure (decided by Shankar 2026-11-18): an app's jail sees only its tree, so the
+base system's files it needs are copied into it, and kept current.
+
+- **Base files** (the rtld `/libexec/ld-elf.so.1`, and every library the app's programs need
+  from `/lib` and `/usr/lib`) always come from this machine's base, for catalog packages and
+  side-loads alike. A copy the bundle ships is replaced, so a publisher can't pass off its own
+  libc as the base's. They are outside the publisher's signature and recorded in the
+  installed record instead (`base`: path and the base copy's sha256).
+- **The app's own libraries** (pkg's and others) a catalog package ships under `lib/` or
+  `usr/lib/` (not `usr/local/lib`: an app's jail has no `ld-elf.so.hints`, so its loader
+  looks only in `/lib` and `/usr/lib`), covered by its signature; `opifexd` refuses a catalog
+  package that needs one it doesn't ship. A side-load may also take them from
+  `/usr/local/lib` (the bring-up exception).
+- **After a base update** every app gets the base's current files: `opifex refresh-base`
+  (root), run by whatever installs the base, and by `opifexd` at every start as a safety net.
+  It builds each changed app's tree beside the installed one (hard links, only the changed
+  base files copied; Tessera keeps one copy of the bytes either way) and swaps it in whole,
+  so a launch sees the old set or the new one, never a mix. Always, with no per-app hold:
+  FreeBSD keeps a library's interface for as long as its soname, and an incompatible change
+  gets a new soname that the old one stays beside. A rollback refreshes the kept tree's
+  base files too. Not mounted from the base with nullfs: it would cost every app and
+  one-shot worker jail more mounts at each start (platform thread, 2026-11-18).
 
 ### 7.6 People and personas
 
@@ -1099,6 +1117,20 @@ opifexd, and `fdpass`.)
   catalog on a synced machine, a fresh machine and the publishing side), opifexd test
   `a_revoked_install`, `scripts/opifex-token-check.sh` (root-new keeps the old platform key
   retired; a retired key can't come back): 0 failed.
+
+### 14.11 Base files kept current (2026-11-18)
+
+- `runtime::resolve` (rtld and `/lib`, `/usr/lib` libraries always from the base, recorded;
+  the bundle's own libraries; `/usr/local/lib` for side-loads only), `base_current`,
+  `rebase`; `app::replace`; `Record::base`; opifexd `RefreshBase` (root), at start, and after
+  a rollback; catalog installs now resolve base files too. Also 1c7a50b/679af05: every
+  program in the bundle is walked (helpers in `bin/`, `[[workers]]`), and pkg libraries go
+  to `usr/lib`.
+- Checked: unit tests `every_program_in_the_bundle`, `base_files_are_the_base` (a
+  publisher's libc replaced, a base update with a new dependency, the installed tree never
+  written), opifexd test `base_files_follow_the_base` (refresh swaps once; a rollback gets the
+  current rtld). Not yet run in the VM. Nothing installs the base yet: its installer must run
+  `opifex refresh-base`.
 
 ## 15. Decisions, with recommendations
 

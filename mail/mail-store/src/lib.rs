@@ -67,13 +67,16 @@ const SENDER_PICTURES: TableDefinition<(u32, &str), u8> = TableDefinition::new("
 /// account → its identities (postcard `Vec<Identity>`), the default first.
 pub(crate) const IDENTITIES: TableDefinition<u32, &[u8]> = TableDefinition::new("identities");
 
-/// Flags as bits; keywords are not kept yet.
+/// Flags as bits; of keywords only `$Snoozed` is kept.
 pub mod flag {
     pub const SEEN: u32 = 1;
     pub const ANSWERED: u32 = 2;
     pub const FLAGGED: u32 = 4;
     pub const DELETED: u32 = 8;
     pub const DRAFT: u32 = 16;
+    /// The `$Snoozed` keyword: set aside with *Later* (mail.md §11.4), so
+    /// other clients that know it show the conversation as snoozed.
+    pub const SNOOZED: u32 = 32;
 
     /// IMAP system flags → bits (others ignored).
     pub fn from_imap<S: AsRef<str>>(flags: &[S]) -> u32 {
@@ -84,6 +87,7 @@ pub mod flag {
                 "\\flagged" => FLAGGED,
                 "\\deleted" => DELETED,
                 "\\draft" => DRAFT,
+                "$snoozed" => SNOOZED,
                 _ => 0,
             }
         })
