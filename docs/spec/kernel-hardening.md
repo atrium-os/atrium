@@ -33,7 +33,13 @@ short:
 | GEOM_RAID | parses on-disk metadata from any attached disk |
 | evdev, uinput, EVDEV_SUPPORT | input is Tactus in user space (atrium-input.md) |
 | netmap | raw NIC access, unused |
-| linux, linuxkpi modules, fusefs, smbfs, ipfw, netgraph, ctl, cryptodev, vmm, hyperv, mlx | not loadable at all (`WITHOUT_MODULES`), so `kldload` cannot bring them back |
+| linux, linuxkpi modules, smbfs, ipfw, netgraph, ctl, cryptodev, vmm, hyperv, mlx | not loadable at all (`WITHOUT_MODULES`), so `kldload` cannot bring them back |
+
+`fusefs` stays loadable (Shankar, 2026-11-18): removable sticks, network shares and grants
+of trusted sticks' folders are all served by jailed, Capsicum-bound FUSE servers
+(device-assignment.md §4.6, network-shares.md, tessera-encryption.md §7.2a), and jaild loads
+the module when the first one starts. No jail is ever given `allow.mount.fusefs`: jaild
+mounts from outside.
 
 ZFS stays: the dev VM's root is ZFS. amd64 also drops COMPAT_FREEBSD4–10, Xen, legacy ISA and
 parallel-port devices, old HBAs, NICs and sound cards (see the file for the list kept).

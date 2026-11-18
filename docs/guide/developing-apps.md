@@ -89,10 +89,13 @@ Two templates show an app split into a core and a worker
   core sends the opened file's descriptor to the player and draws the
   controls; it never demuxes or decodes.
 
-**Planned:** a `service` template, an app that provides a role
-(`[roles] implements`). `share-target`'s messages and the share sheet exist
-since 2026-11-18 ([share-sheet.md](../spec/share-sheet.md));
-`share-sheet/src/bin/share_target_demo.rs` is the shape it will take.
+- `service`: provides a role to other apps (`[roles] implements =
+  ["share-target"]`). It shows up in the share sheet
+  ([share-sheet.md](../spec/share-sheet.md)) for text, shows what was
+  shared in an embedded window, and keeps it in `~/kept.txt` when you
+  press Keep. It asks for no network and no graphics of its own; its
+  window comes from the app that shares. Try it with `share-demo` from
+  `share-sheet/`.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
@@ -180,6 +183,34 @@ it takes (`input = "fd"` or `"message"`), `lifetime`, `memory` and `cpu`.
 A crash, a limit or a timeout comes back as an `Err`, never as a panic in
 the core. Off Atrium, `ATRIUM_WORKERS=local ATRIUM_APP_ROOT=.` runs the
 workers as plain children (`cargo run` in a workspace).
+
+### Moving code into a worker: `cargo atrium worker add`
+
+`cargo atrium worker add <name>` makes a new worker in an existing
+project (Artifex's "Move into a worker" runs it):
+
+```sh
+cargo atrium worker add thumb                                  # input = "fd"
+cargo atrium worker add raw --input bytes                      # bytes the core holds
+cargo atrium worker add count --from parse::lines              # run a lib function there
+cargo atrium worker add shout --input message --from parse::shout --json
+```
+
+It adds the `[[workers]]` entry and a `[[bin]]`, writes
+`src/<name>_worker.rs` (the messages, the handler, and `call`, the core's
+side) and `src/bin/<name>.rs`, and re-exports the handler from the lib's
+`workers` module so `cargo atrium fuzz worker:<name>` finds it. Comments
+and layout in your files stay as they were: every edit is an insertion.
+
+With `--from`, the handler runs that library function, and `call` takes
+the function's own arguments and returns `Result<what it returned,
+String>`, so a call in the core changes from `parse::lines(&bytes)` to
+`count_worker::call(file)`. The command lists those calls (`calls` in the
+JSON) but doesn't rewrite them. A function in `src/main.rs` has to move
+into the library first, since the worker is another binary. Parameter
+and answer types the wire doesn't carry on its own need
+`#[derive(Message)]`; the command says which. `--dry-run` shows what it
+would change.
 
 ## 5. Crates and the registry
 
@@ -277,6 +308,7 @@ seed the corpus with a valid file.
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
 | `cargo atrium run [--release] [cargo args]` | build the core and workers, and Run the project as a dev app (asks for your press) |
+| `cargo atrium worker add <name> [--input fd\|bytes\|message] [--from path::fn] [--dry-run] [--json]` | move part of the app into a new worker |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |
 | `cargo atrium registry build --out d --url u [--sign key] <seed>...` | for SDK maintainers: pack and sign the registry |

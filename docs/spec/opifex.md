@@ -395,6 +395,17 @@ press. This is how a bundle built in a workspace and signed by its developer's A
 goes away; unsigned bundles run only as `dev.` ids through the dev publisher (homes.md),
 which `opifexd` refuses.
 
+Through the sheet (built 2026-11-18): the asker (Scrinium, for a double-clicked `.insula`)
+sends `Ask::SideLoad` with the open file attached (`SCM_RIGHTS`, `opifex::fdpass`), never a
+path; `opifex_sheet::side_load(&file)` does it. The sheet passes the descriptor to opifexd
+(`PreviewLocal { for_uid }`, from the sheet's uid or root only), which copies it (at most 4 GB)
+into `state/held/<token>.insula`, unpacks it with the worker, and answers `LocalPreview` only
+for an app signed by a key on the side-load list and not installed from a catalog. The sheet
+says it is from a file and won't update by itself; a counted press sends
+`InstallLocalApproved { token, manifest_sha256, for_uid }`, which installs that held copy
+only if its manifest is the one shown, for that person, and uses the token up. Unapproved
+copies go after 15 minutes.
+
 ### 7.5 On disk
 
 ```
@@ -679,9 +690,7 @@ font on demand and a driver from a `nobody` device's notice.
   manifest the sheet showed (`Describe` now carries `manifest_sha256`); a release synced
   after the sheet opened is refused. The record names the asker's uid as `installed_by`.
   The sheet can't remove, roll back, side-load or sync.
-- Not yet: the Limen `install` role for windowed callers (Curia, Scrinium); side-loading
-  through the sheet (Scrinium's double-clicked `.insula`, which needs the file handed over
-  as a descriptor, not a path); "only what changed" on an update (needs the installed
+- Not yet: the Limen `install` role for windowed callers (Curia, Scrinium); "only what changed" on an update (needs the installed
   manifest's capabilities); recording the person's `ApproveAccess` with portcullisd; the
   callers themselves (Monstrator L5, the Navigator prompt), which their threads add.
 - Checked: host tests (sheet state and keys, layout, plain words, opifex-sheetd against a
@@ -830,6 +839,13 @@ font on demand and a driver from a `nobody` device's notice.
   `jid 0` in dispensatord's line is jaild's sentinel for exec'd jails, not a failure.)
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
+- CJK packages (2026-11-18): `scripts/opifex-cjk-fonts.sh <out> --sign <platform key>` builds
+  Noto Sans JP, SC, TC, HK and KR 2.004 (regular and bold, OFL) from the
+  `@expo-google-fonts/noto-sans-*` 0.4.4 tarballs, each pinned by its npm sha512, with
+  `incoming/<id>.toml` requests for the catalog-blobs release `fonts-noto-cjk-2.004`.
+  `opifex/tests/cjk_fonts.rs` installs all five and checks atrium-fonts picks each one's forms
+  by hint; a scratch catalog took all five (`catalog add`, sync). Published once the platform key
+  and the repositories exist.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
   frescod with an installed package; the gate checks the library); the notice opening Curia's install page for a driver
   (it names the command for now); PCI devices in the lookup (dispensatord sees USB and HID
@@ -929,6 +945,11 @@ font on demand and a driver from a `nobody` device's notice.
   doesn't exist yet (atrium-ax.md §5.3).
 
 ### 14.9 Root keys on hardware tokens (2026-11-18)
+
+(Side-loading through the sheet, built the same day, is described in §7.4; host tests
+`a_file_opened_through_the_sheet` in opifexd's tests, the sheet's `decide_local` with a stand-in
+opifexd, and `fdpass`.)
+
 
 - `portcullis-token`: a key on a PKCS#11 token (YubiKey PIV through Yubico's `libykcs11`,
   Nitrokey or any module, loaded at run time) signs with ECDSA P-256 over the SHA-256 digest;

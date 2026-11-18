@@ -56,11 +56,30 @@ pub struct Loading {
 impl Loading {
     /// Starts reading `data` as [`load_with`] does.
     pub fn start(name: &str, data: Vec<u8>, password: Option<&str>) -> std::io::Result<Loading> {
-        let (tx, rx) = std::sync::mpsc::channel();
         let (n, pw) = (name.to_string(), password.map(str::to_string));
-        std::thread::Builder::new().name("open".into()).stack_size(16 << 20).spawn(move || {
+        Self::spawn(move || {
             let r = load_with(&n, &data, pw.as_deref());
-            let _ = tx.send((r, data));
+            (r, data)
+        })
+    }
+
+    /// Restores the autosave folder `dir` (a document Sheets didn't close),
+    /// as [`crate::doc::recover`] does, named `name` in the status line.
+    pub fn restore(dir: std::path::PathBuf, name: &str) -> std::io::Result<Loading> {
+        let name = name.to_string();
+        Self::spawn(move || match crate::doc::recover(&dir) {
+            Ok((mut d, rec)) => {
+                d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
+                (Ok(d), Vec::new())
+            }
+            Err(e) => (Err(ConvertError::Failed(format!("Couldn't restore “{name}”: {e}"))), Vec::new()),
+        })
+    }
+
+    fn spawn(f: impl FnOnce() -> (Result<Doc, ConvertError>, Vec<u8>) + Send + 'static) -> std::io::Result<Loading> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("open".into()).stack_size(16 << 20).spawn(move || {
+            let _ = tx.send(f());
         })?;
         Ok(Loading { rx })
     }
@@ -189,5 +208,37 @@ mod tests {
         };
         assert!(matches!(r, Err(ConvertError::Failed(_))));
         assert_eq!(back, b"not a sheet");
+    }
+
+    #[test]
+    fn an_autosave_is_restored_on_its_own_thread() {
+        let dir = std::env::temp_dir().join(format!("atrium-sheets-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut d = Doc::new("Book");
+        d.autosave_to(&dir).unwrap();
+        d.type_into(0, 0, "21");
+        d.type_into(0, 1, "=A1*2");
+        d.autosave().unwrap().sync().unwrap();
+        drop(d);
+        let l = Loading::restore(dir.clone(), "Book").unwrap();
+        let (r, _) = loop {
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let back = r.unwrap();
+        assert_eq!(back.wb.value(0, 0, 1), officina_grid::Value::Num(42.0));
+        assert!(back.status.starts_with("Restored “Book”"), "{}", back.status);
+        drop(back);
+        let l = Loading::restore(dir.join("nothing"), "Gone").unwrap();
+        let (r, _) = loop {
+            if let Some(x) = l.poll() {
+                break x;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(r, Err(ConvertError::Failed(e)) if e.starts_with("Couldn't restore “Gone”")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

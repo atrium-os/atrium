@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use atrium_sheets::app::{Cmd, Sheets, Ui, PICKER_SLOT};
 use atrium_sheets::bench::{self, Frame, Pattern, Report};
 use atrium_sheets::doc::{self, Doc};
-use atrium_sheets::files::{format_of, load_with, stem_of, Format};
+use atrium_sheets::files::{format_of, stem_of, Format};
 use officina_convert::launch::ConvertError;
 use limen::picker::{Filter, Kind, ToChild, ToParent};
 use limen::proto::ParentEvent;
@@ -409,39 +409,29 @@ fn main() {
 
     let root = state_root();
     let _ = fs::create_dir_all(&root);
-    // A document a crash left comes back first.
-    let mut first: Option<(Doc, Option<Target>)> = None;
+    // A document a crash left comes back first; it, or a file named on the
+    // command line, is read on its own thread once the window shows.
     let mut locked: Option<(PathBuf, String)> = None;
-    let mut locked_file: Option<(String, Vec<u8>, Target)> = None;
+    let mut restore: Option<(PathBuf, String)> = None;
+    let mut start_file: Option<(String, Vec<u8>, Target)> = None;
     if let Some((dir, name)) = doc::pending(&root).pop() {
         if doc::recovery_locked(&dir) {
             locked = Some((dir, name));
         } else {
-            match doc::recover(&dir) {
-                Ok((mut d, rec)) => {
-                    d.status = format!("Restored “{name}” as it was before Sheets last stopped ({} changes since its last save).", rec.actions);
-                    first = Some((d, None));
-                }
-                Err(e) => eprintln!("atrium-sheets: couldn't restore {}: {e}", dir.display()),
-            }
+            restore = Some((dir, name));
         }
     }
-    if first.is_none() && locked.is_none() {
+    if restore.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
             match fs::read(&p) {
-                Ok(data) => match load_with(&name, &data, None) {
-                    Ok(d) => first = Some((d, Some(Target::Path { path: p, format: format_of(&name) }))),
-                    Err(ConvertError::Failed(e)) => eprintln!("atrium-sheets: {e}"),
-                    Err(_) => locked_file = Some((name.clone(), data, Target::Path { path: p.clone(), format: format_of(&name) })),
-                },
+                Ok(data) => start_file = Some((name.clone(), data, Target::Path { path: p.clone(), format: format_of(&name) })),
                 Err(e) => eprintln!("atrium-sheets: {e}"),
             }
         }
     }
-    let (mut doc, target) = first.unwrap_or_else(|| (Doc::new("Untitled"), None));
-    let target = keep_target(&mut doc, target);
+    let (doc, target) = (Doc::new("Untitled"), None);
 
     let mut win = match Window::open(&WindowDesc::new("Sheets", SizeSpec::Fixed(1100, 720))) {
         Ok(w) => w,
@@ -473,7 +463,15 @@ fn main() {
     run.show(doc, target);
     if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
-    } else if let Some((name, data, t)) = locked_file {
+    } else if let Some((dir, name)) = restore {
+        match atrium_sheets::files::Loading::restore(dir, &name) {
+            Ok(loading) => {
+                run.set_status(format!("Restoring “{name}”…"));
+                run.opening = Some(Opening { name, compare: false, target: None, read_only: false, loading });
+            }
+            Err(e) => eprintln!("atrium-sheets: couldn't restore {name}: {e}"),
+        }
+    } else if let Some((name, data, t)) = start_file {
         run.open_bytes(name, data, Some(t), false, None);
     }
     let size = run.sheets.size.clone();

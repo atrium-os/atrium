@@ -589,3 +589,54 @@ fn a_catalog_someone_added() {
     let ups = match ask(&w, 1001, Request::Updates) { Response::Updates { items, .. } => items, o => panic!("{o:?}") };
     assert!(!ups.iter().any(|u| u.id == TP));
 }
+
+/// Side-loading through the sheet (§7.4): the file comes as a descriptor,
+/// opifexd holds a checked copy, and installs exactly that for the person.
+#[test]
+fn a_file_opened_through_the_sheet() {
+    let w = world("sideload-sheet");
+    publish(&w, "1.0", &elf(1));
+    let file = w.d.join("web/example.org/1.0.insula");
+    let open = || Some(std::os::fd::OwnedFd::from(fs::File::open(&file).unwrap()));
+    let preview = |uid: u32| w.daemon.handle_with(uid, Request::PreviewLocal { for_uid: 1001 }, open());
+    // Nobody on the side-load list signed it.
+    assert!(err(preview(65042)).contains("trust"), "unsigned by a trusted key");
+    fs::create_dir_all(w.d.join("pubs")).unwrap();
+    fs::write(w.d.join("pubs/p.pem"), &w.plat.pk).unwrap();
+    // Only the sheet (or root) previews, and only with the file.
+    assert!(err(preview(1001)).contains("only the install sheet"));
+    assert!(err(ask(&w, 65042, Request::PreviewLocal { for_uid: 1001 })).contains("comes with the file"));
+    let (token, app) = match preview(65042) {
+        Response::LocalPreview { token, app } => (token, app),
+        other => panic!("{other:?}"),
+    };
+    assert!(app.local && app.kind == "app" && app.id == ID && app.latest == "1.0", "{app:?}");
+    assert!(app.capabilities.contains(&"clipboard".to_string()));
+    assert_eq!(app.archive_size, fs::metadata(&file).unwrap().len());
+    // A different manifest, or another person, installs nothing and uses the token up.
+    let approve = |token: &str, sha: &str, uid: u32| ask(&w, 65042, Request::InstallLocalApproved {
+        token: token.into(), manifest_sha256: sha.into(), for_uid: uid });
+    assert!(err(approve(&token, &"0".repeat(64), 1001)).contains("not the file the sheet showed"));
+    assert!(err(approve(&token, &app.manifest_sha256, 1001)).contains("no longer held"));
+    assert!(w.daemon.store().get(ID).unwrap().is_none());
+    let token = match preview(65042) { Response::LocalPreview { token, .. } => token, other => panic!("{other:?}") };
+    assert!(err(approve(&token, &app.manifest_sha256, 1002)).contains("not the file the sheet showed"));
+    // A person on the sheet: installed for them, as a side-load.
+    let token = match preview(65042) { Response::LocalPreview { token, .. } => token, other => panic!("{other:?}") };
+    assert!(err(ask(&w, 1001, Request::InstallLocalApproved { token: token.clone(), manifest_sha256: app.manifest_sha256.clone(), for_uid: 1001 }))
+        .contains("install sheet"), "a person can't approve their own");
+    let r = approve(&token, &app.manifest_sha256, 1001);
+    assert!(matches!(r, Response::Done { .. }), "{r:?}");
+    let rec = w.daemon.store().get(ID).unwrap().unwrap();
+    assert_eq!((rec.source.as_str(), rec.installed_by), ("side-load", 1001));
+    assert_eq!(fs::read(w.daemon.root.join("apps").join(ID).join("bin/hello")).unwrap(), elf(1));
+    // Nothing is left held.
+    assert_eq!(fs::read_dir(w.daemon.state.join("held")).unwrap().count(), 0);
+    // An app a catalog keeps up to date doesn't take a file over it.
+    sync(&w);
+    let c = w.daemon.store();
+    let mut rec = c.get(ID).unwrap().unwrap();
+    rec.source = "catalog:atrium".into();
+    c.put(rec).unwrap();
+    assert!(err(preview(65042)).contains("updates from there"));
+}

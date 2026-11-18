@@ -7,3 +7,4 @@ pub mod new;
 pub mod cross;
 pub mod registry;
 pub mod fuzz;
+pub mod worker;

@@ -31,6 +31,13 @@ pub enum Request {
     /// manifest hashes to `manifest_sha256` (what the sheet showed). A newer
     /// release synced meanwhile is refused, not installed (C3).
     InstallApproved { id: String, manifest_sha256: String, for_uid: u32 },
+    /// From the install sheet only, with the `.insula` file attached
+    /// (fdpass): check it as a side-load (its signer on the side-load list)
+    /// and hold it for `for_uid`; answered with `LocalPreview` (§7.4).
+    PreviewLocal { for_uid: u32 },
+    /// From the install sheet only: install the file held as `token` for
+    /// `for_uid`, if its manifest is still the one shown.
+    InstallLocalApproved { token: String, manifest_sha256: String, for_uid: u32 },
     Uninstall { id: String },
     Rollback { id: String },
     /// Installed apps with a newer release, and what will happen to each.
@@ -89,6 +96,9 @@ pub struct Described {
     /// Its publisher's key was replaced by a recovery since it was installed.
     #[serde(default)]
     pub recovered: bool,
+    /// From a file the person opened, not a catalog (side-load, §7.4).
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +106,8 @@ pub struct Described {
 pub enum Response {
     Installed { apps: Vec<crate::installed::Record> },
     Described { app: Described },
+    /// A side-load held for the sheet: what it is, and the token that installs it.
+    LocalPreview { token: String, app: Described },
     Found { ids: Vec<String> },
     Done { id: String, version: String },
     Synced { entries: u64, releases: usize, #[serde(default)] others: Vec<String> },
