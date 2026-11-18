@@ -76,6 +76,8 @@ fn main() -> ExitCode {
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
+        "font"      => cmd_font(&args[2..]),
+        "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
         | "updates" | "update-care" | "tick" => ask_daemon(&args[1..]),
@@ -120,7 +122,9 @@ fn usage() {
            remove <id> | sync [https://… | <catalog-dir>]   (root; no argument: the network)\n  \
            updates             what is waiting, and why\n  \
            update-care <id> notify|auto   wait for me / the publisher's timing\n  \
-           tick                the daily round now (root)\n\n\
+           tick                the daily round now (root)\n  \
+           update-all          apply every waiting update (root)\n\n\
+         font pack <tree> --manifest <atrium.toml> [--sign <key.pem>]   a font package (opifex.md §8.1)\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -215,7 +219,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
 
 fn ask_daemon(args: &[String]) -> Result<(), String> {
     use opifex::proto::{Request, Response};
-    use std::io::{BufRead, Write};
+
     let arg = |i: usize| args.get(i).cloned().ok_or_else(|| format!("{}: missing argument", args[0]));
     let req = match args[0].as_str() {
         "describe" => Request::Describe { id: arg(1)? },
@@ -235,14 +239,7 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         "tick" => Request::Tick,
         _ => unreachable!(),
     };
-    let sock = std::env::var("OPIFEX_SOCKET").unwrap_or_else(|_| opifex::proto::SOCKET.into());
-    let mut s = std::os::unix::net::UnixStream::connect(&sock).map_err(|e| format!("opifexd ({sock}): {e}"))?;
-    let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-    line.push('\n');
-    s.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-    let mut out = String::new();
-    std::io::BufReader::new(s).read_line(&mut out).map_err(|e| e.to_string())?;
-    match serde_json::from_str::<Response>(out.trim()).map_err(|e| format!("opifexd: {e}"))? {
+    match opifex::proto::ask(&req)? {
         Response::Error { message } => Err(message),
         Response::Installed { apps } => {
             for a in apps { println!("  {:<32} {:<10} {}", a.id, a.version, a.source); }
@@ -289,6 +286,46 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
     let dest = app::rollback(&root, id)?;
     println!("opifex: {id} rolled back -> {}", dest.display());
     Ok(())
+}
+
+/// `opifex font pack <tree> --manifest <toml> [--sign <key.pem>]`.
+fn cmd_font(args: &[String]) -> Result<(), String> {
+    let (mut manifest, mut sign, mut pos) = (None::<String>, None::<String>, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--manifest" => manifest = it.next().cloned(),
+            "--sign" => sign = it.next().cloned(),
+            o if o.starts_with("--") => return Err(format!("font: unknown flag {o}")),
+            o => pos.push(o.to_string()),
+        }
+    }
+    let ["pack", tree] = pos.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
+        return Err("font pack <tree> --manifest <atrium.toml> [--sign <key.pem>]".into());
+    };
+    let t = std::fs::read_to_string(manifest.ok_or("font pack: --manifest <toml>")?).map_err(|e| e.to_string())?;
+    let key = match sign { Some(k) => Some(std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?), None => None };
+    let m = opifex::font::pack(Path::new(tree), &t, key.as_deref())?;
+    println!("opifex: packed font {} {} ({} faces, content {}){}", m.font.id, m.font.version, m.faces.len(), m.font.content,
+             if key.is_some() { ", signed" } else { ", NOT signed" });
+    Ok(())
+}
+
+/// `opifex update-all` (root): apply every waiting update that isn't
+/// refused, the administrator's batched approval (§11).
+fn update_all() -> Result<(), String> {
+    use opifex::proto::{Request, Response};
+    use opifex::updates::Action;
+    let Response::Updates { items, .. } = opifex::proto::ask(&Request::Updates)? else { return Err("opifexd: unexpected answer".into()) };
+    let mut failed = 0;
+    for u in items.iter().filter(|u| u.action != Action::Refused) {
+        match opifex::proto::ask(&Request::Install { id: u.id.clone() })? {
+            Response::Done { id, version } => println!("opifex: {id} {version}: done"),
+            Response::Error { message } => { eprintln!("opifex: {}: {message}", u.id); failed += 1; }
+            other => { eprintln!("opifex: {}: {other:?}", u.id); failed += 1; }
+        }
+    }
+    if failed > 0 { Err(format!("{failed} update(s) failed")) } else { Ok(()) }
 }
 
 fn cmd_layer(args: &[String]) -> Result<(), String> {

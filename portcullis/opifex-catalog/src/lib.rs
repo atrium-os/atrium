@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod font;
+
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -357,10 +359,15 @@ pub struct Described {
     pub content: Option<String>,
 }
 
-/// Read the identifying fields of a signed `atrium.toml` (an app bundle or a
-/// toolchain layer).
+/// Read the identifying fields of a signed `atrium.toml` (an app bundle, a
+/// toolchain layer or a font package).
 pub fn describe(manifest: &str) -> Result<Described, String> {
     let v: toml::Value = manifest.parse().map_err(|e| format!("manifest: {e}"))?;
+    if v.get("kind").and_then(|k| k.as_str()) == Some("font") {
+        let m = font::FontManifest::from_str(manifest)?;
+        let content = (!m.font.content.is_empty()).then(|| m.font.content.clone());
+        return Ok(Described { kind: "font".into(), id: m.font.id, version: m.font.version, arches: vec![font::ARCH.into()], content });
+    }
     if v.get("kind").and_then(|k| k.as_str()) == Some("layer") {
         let m = portcullis_toml::layer::LayerManifest::from_str(manifest)?;
         let content = (!m.layer.content.is_empty()).then(|| m.layer.content.clone());
@@ -590,10 +597,10 @@ pub struct Local {
 }
 
 impl Local {
-    /// The newest release of `id` for `arch` that isn't yanked.
+    /// The newest release of `id` for `arch` (or for any arch) that isn't yanked.
     pub fn latest(&self, id: &str, arch: &str) -> Option<&Release> {
         self.releases.iter()
-            .filter(|r| r.id == id && r.arch == arch && !self.yanked.iter().any(|(i, v)| i == id && *v == r.version))
+            .filter(|r| r.id == id && (r.arch == arch || r.arch == font::ARCH) && !self.yanked.iter().any(|(i, v)| i == id && *v == r.version))
             .max_by(|a, b| version_cmp(&a.version, &b.version))
     }
 }

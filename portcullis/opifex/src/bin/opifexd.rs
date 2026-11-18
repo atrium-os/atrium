@@ -13,7 +13,7 @@
 //! (65042, the install sheet's uid, which may send `InstallApproved`),
 //! `OPIFEX_FETCH` (how to start the fetcher, `portcullis launch --no-prompt
 //! org.atrium.opifex.fetch`), `OPIFEX_CATALOG_URL` (the first sync's base),
-//! `PRAECO_SOCKET` (/var/run/atrium/praecod.sock, for the notice about
+//! `OPIFEX_FONTS` (/usr/share/fonts/atrium-extra), `PRAECO_SOCKET` (/var/run/atrium/praecod.sock, for the notice about
 //! waiting updates; `none` turns it off), `OPIFEX_DAILY` (`0` turns off the
 //! daily round of §8: sync, background updates, one notice).
 
@@ -109,6 +109,7 @@ fn main() {
         fetch_cmd: std::env::var("OPIFEX_FETCH").map(|v| v.split_whitespace().map(String::from).collect())
             .unwrap_or_else(|_| opifex::fetch::FETCH_CMD.iter().map(|s| s.to_string()).collect()),
         catalog_url: std::env::var("OPIFEX_CATALOG_URL").unwrap_or_else(|_| opifex::fetch::CATALOG_URL.into()),
+        fonts: env("OPIFEX_FONTS", opifex::font::SYSTEM_FONTS),
         sysroot: PathBuf::from("/"),
         praeco: match std::env::var("PRAECO_SOCKET").ok().as_deref() {
             Some("none") => None,

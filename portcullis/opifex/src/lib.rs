@@ -6,6 +6,7 @@ pub mod archive;
 pub mod content;
 pub mod daemon;
 pub mod fetch;
+pub mod font;
 pub mod installed;
 pub mod layer;
 pub mod proto;

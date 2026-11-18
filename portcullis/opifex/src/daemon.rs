@@ -47,6 +47,9 @@ pub struct Daemon {
     /// praecod's socket, for the notice about updates waiting on a person
     /// (opifexd posts as a system poster: `PRAECO_SYSTEM_POSTERS=0:Updates`).
     pub praeco: Option<PathBuf>,
+    /// Installed font packages and their pin list
+    /// (`/usr/share/fonts/atrium-extra`, font.rs).
+    pub fonts: PathBuf,
     /// Where side-loaded bundles' libraries are read from (`/`).
     pub sysroot: PathBuf,
     /// One change at a time.
@@ -99,7 +102,7 @@ impl Daemon {
         let r = local.latest(id, portcullis_toml::layer::host_arch())
             .ok_or_else(|| format!("{id}: not in the catalog"))?;
         let v: toml::Value = r.manifest.parse().map_err(|e| format!("{id}: {e}"))?;
-        let app = v.get("app");
+        let app = v.get("app").or_else(|| v.get("font")).or_else(|| v.get("layer"));
         let s = |k: &str| app.and_then(|a| a.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let plain = |c: String| c.split('=').next().unwrap_or("").to_string();
         let capabilities: Vec<String> = updates::caps(&r.manifest).into_iter().map(plain).collect();
@@ -220,12 +223,22 @@ impl Daemon {
         let mut out = Vec::new();
         for rec in self.store().load()?.apps {
             let Some(r) = local.latest(&rec.id, portcullis_toml::layer::host_arch()) else { continue };
-            if r.kind != "app" || oc::version_cmp(&r.version, &rec.version) != std::cmp::Ordering::Greater {
+            if r.kind != rec.kind || oc::version_cmp(&r.version, &rec.version) != std::cmp::Ordering::Greater {
                 continue;
             }
-            let have = fs::read_to_string(self.root.join("apps").join(&rec.id).join("atrium.toml")).unwrap_or_default();
             let same = self.same_publisher(&rec, &r.signer, &local.name, &root);
-            let (action, added) = updates::decide(&have, &r.manifest, same, prefs.care.get(&rec.id).map(String::as_str));
+            let care = prefs.care.get(&rec.id).map(String::as_str);
+            let (action, added) = match rec.kind.as_str() {
+                "app" => {
+                    let have = fs::read_to_string(self.root.join("apps").join(&rec.id).join("atrium.toml")).unwrap_or_default();
+                    updates::decide(&have, &r.manifest, same, care)
+                }
+                _ if !same => (Action::Refused, Vec::new()),
+                // Fonts hold no power: like an app that asks for nothing.
+                "font" if care != Some("notify") => (Action::Background, Vec::new()),
+                // Layers, drivers, firmware: an administrator applies them.
+                _ => (Action::Notify, Vec::new()),
+            };
             let why = match (action, rec.source.as_str()) {
                 (Action::Refused, "side-load") => "side-loaded: update it by side-loading".to_string(),
                 (Action::Refused, _) => "another publisher".to_string(),
@@ -321,8 +334,13 @@ impl Daemon {
         let root = c.root()?;
         let r = local.latest(id, portcullis_toml::layer::host_arch())
             .ok_or_else(|| format!("{id}: not in the catalog for this machine"))?.clone();
-        if r.kind != "app" {
-            return Err(format!("{id}: a {} (installed by its own path)", r.kind));
+        if !["app", "font", "layer"].contains(&r.kind.as_str()) {
+            return Err(format!("{id}: a {} (not installed by opifexd yet)", r.kind));
+        }
+        // The sheet asks for anyone, and only apps and fonts are anyone's to
+        // install (§7.6, decision 11); the rest is an administrator's.
+        if approved.is_some() && uid != 0 && !["app", "font"].contains(&r.kind.as_str()) {
+            return Err(format!("{id}: a {} is installed by an administrator", r.kind));
         }
         if let Some(want) = approved {
             if oc::hex(&Sha256::digest(r.manifest.as_bytes())) != want {
@@ -360,6 +378,26 @@ impl Daemon {
             let got = fs::read_to_string(dir.join("atrium.toml")).map_err(|e| format!("atrium.toml: {e}"))?;
             if got != r.manifest {
                 return Err(format!("{id}: the archive's manifest differs from the catalog's"));
+            }
+            let record = |version: &str, content: &str| Record {
+                id: id.into(), version: version.into(), kind: r.kind.clone(), publisher: r.signer.clone(),
+                source: format!("catalog:{}", local.name), archive_sha256: r.archive_sha256.clone(),
+                content: content.into(), installed_by: uid, time: now(), verified_rps: Vec::new(),
+            };
+            match r.kind.as_str() {
+                "font" => {
+                    let (m, _) = crate::font::install(&dir, &self.fonts, std::slice::from_ref(&signer))?;
+                    self.store().put(record(&m.font.version, &m.font.content))?;
+                    return Ok(Response::Done { id: id.into(), version: m.font.version });
+                }
+                "layer" => {
+                    let o = crate::layer::InstallOpts { root: &self.root, keys: std::slice::from_ref(&signer),
+                                                        arch: portcullis_toml::layer::host_arch(), allow_unsigned: false };
+                    let (m, _) = crate::layer::install(&dir, &o)?;
+                    self.store().put(record(&m.layer.version, &m.layer.content))?;
+                    return Ok(Response::Done { id: id.into(), version: m.layer.version });
+                }
+                _ => {}
             }
             let opts = app::Opts { root: &self.root, trust: &self.trust, allow_unsigned: false,
                                    require_content: true, catalog_key: Some(&signer) };
@@ -419,6 +457,13 @@ impl Daemon {
     }
 
     fn uninstall(&self, id: &str) -> Result<Response, String> {
+        match self.store().get(id)? {
+            Some(r) if r.kind == "font" => crate::font::remove(&self.fonts, id)?,
+            // Older versions a workspace still names stay; this one goes,
+            // unless a running workspace has it mounted.
+            Some(r) if r.kind == "layer" => { crate::layer::remove(&self.root, &format!("{id}@{}", r.version))?; }
+            _ => {}
+        }
         let rec = self.store().remove(id)?;
         let mut gone = false;
         for p in [self.root.join("apps").join(id), app::state(&self.root).join("prev").join(id)] {
@@ -434,6 +479,11 @@ impl Daemon {
     }
 
     fn rollback(&self, id: &str) -> Result<Response, String> {
+        if let Some(r) = self.store().get(id)? {
+            if r.kind != "app" {
+                return Err(format!("{id}: only apps keep the version before"));
+            }
+        }
         let dest = app::rollback(&self.root, id)?;
         let text = fs::read_to_string(dest.join("atrium.toml")).map_err(|e| e.to_string())?;
         let m = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("{e:?}"))?;

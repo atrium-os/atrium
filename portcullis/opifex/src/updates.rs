@@ -61,7 +61,8 @@ pub fn caps(manifest: &str) -> Vec<String> {
 /// The app's display name, if the manifest gives one.
 pub fn name(manifest: &str) -> Option<String> {
     let v: toml::Value = manifest.parse().ok()?;
-    v.get("app")?.get("name")?.as_str().map(str::to_string)
+    let sec = v.get("app").or_else(|| v.get("font"))?;
+    sec.get("name")?.as_str().map(str::to_string)
 }
 
 /// The publisher's timing class (`auto` when it names none or an unknown one).
