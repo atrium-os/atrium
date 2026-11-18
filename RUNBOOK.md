@@ -5877,12 +5877,16 @@ a new trail marked anonymous (`a link sent from personal: a new trail, anonymous
 `[[crossings]]` left in navtest's `policy.toml` by an earlier run. jaild's policy needs
 `/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it), and `/atrium/sockets/opifex-sheet` too. Last, L5: a test catalog
 (signed with throwaway keys, as `vm-opifex-c3-check.sh`, so it rewrites
-`/etc/atrium/opifex/root.toml`), opifexd on its own socket and opifex-sheetd as `_opifexsheet`;
+`/etc/atrium/opifex/root.toml` and starts from an empty `/var/db/atrium/opifex`), made before the
+drive with opifexd on its default socket, `/atrium/sockets/opifex/opifex.sock`, which the
+Navigator's jail mounts: the Atrium page's `atrium-app://org.atrium.l5hello` link asks in the
+prompt row, naming "L5 hello by Atrium", what it asks for and that it isn't installed
+(`confined-3-app.png`), and Try it clears it. Then opifex-sheetd as `_opifexsheet`;
 App probe (`link-probe` reading `atrium-app://org.atrium.l5hello` from its bundle's
 `link-probe.url`) asks with Enter, portcullisd answers "to install first", the install sheet
 shows (`confined-10-install.png`), Up and Enter on Install installs it for App probe's uid
-(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 106/106 on 2026-11-18;
-98/98 earlier that day. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
+(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 108/108 on 2026-11-18
+(106/106 before the app prompt); 98/98 earlier that day. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds
