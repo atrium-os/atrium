@@ -93,14 +93,7 @@ pub fn format_hm(m: u16) -> String {
 }
 
 /// Seconds east of UTC here at `now` (for quiet hours).
-pub fn local_offset(now: i64) -> i64 {
-    let t = now as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return 0;
-    }
-    tm.tm_gmtoff as i64
-}
+pub use mail_engine::clock::local_offset;
 
 fn status(r: &Reached) -> (String, bool) {
     match r {

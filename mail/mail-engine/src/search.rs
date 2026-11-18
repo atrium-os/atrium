@@ -4,7 +4,7 @@
 //!
 //! Operators: `from:` `to:` `subject:` `filename:` (terms in that field),
 //! `has:attachment`, `is:unread` `is:read` `is:flagged`, `in:<folder>`,
-//! `before:` / `after:` (YYYY-MM-DD, UTC), `larger:` / `smaller:` (`10k`,
+//! `before:` / `after:` (YYYY-MM-DD, local days), `larger:` / `smaller:` (`10k`,
 //! `2M`). A quoted value is several words.
 
 use std::collections::BTreeSet;
@@ -137,8 +137,9 @@ pub fn parse(q: &str, typing: bool) -> Query {
             ("is", "read") => Some(Cond::Unread(false)),
             ("is", "flagged" | "starred") => Some(Cond::Flagged),
             ("in", f) if !f.is_empty() => Some(Cond::In(f.to_string())),
-            ("before", d) => day(d).map(Cond::Before),
-            ("after", d) => day(d).map(|t| Cond::After(t + 86_400)),
+            // Days are the person's local days.
+            ("before", d) => day(d).map(|t| Cond::Before(crate::clock::from_local(t))),
+            ("after", d) => day(d).map(|t| Cond::After(crate::clock::from_local(t + 86_400))),
             ("larger", s) => size(s).map(Cond::Larger),
             ("smaller", s) => size(s).map(Cond::Smaller),
             _ => None,
@@ -242,7 +243,7 @@ mod tests {
         assert_eq!(q.conds[1], Cond::Word { word: "q4".into(), fields: field::SUBJECT, prefix: false });
         assert_eq!(q.conds[2], Cond::Word { word: "numbers".into(), fields: field::SUBJECT, prefix: false });
         assert_eq!(q.conds[3], Cond::HasAttachment);
-        assert_eq!(q.conds[4], Cond::Before(day("2026-11-20").unwrap()));
+        assert_eq!(q.conds[4], Cond::Before(crate::clock::from_local(day("2026-11-20").unwrap())));
         assert_eq!(q.conds[5], Cond::Word { word: "nort".into(), fields: field::ANY, prefix: true });
         assert_eq!(day("1970-01-02"), Some(86_400));
         assert_eq!(day("2026-11-15"), Some(1_763_164_800 + 365 * 86_400));
