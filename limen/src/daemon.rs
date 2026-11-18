@@ -77,6 +77,8 @@ pub trait Attribution: Send {
 
 /// uid → (user, app id), from the launch registry.
 pub type Resolve = Box<dyn Fn(u32) -> Option<(String, String)> + Send + Sync>;
+/// A uid's named persona (`None`: Personal).
+pub type PersonaOf = Box<dyn Fn(u32) -> Option<String> + Send + Sync>;
 /// (user, role) → the app that provides it (the user's default; limen.md §3.2).
 pub type Defaults = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 /// (parent app id, role) → whether its manifest lets it embed the role.
@@ -183,6 +185,8 @@ pub struct Shared {
     /// System providers known by a fixed system uid rather than a registry
     /// app id (arca-ui runs as `_arca-ui`, not as a Portcullis app).
     system_uids: Mutex<HashMap<&'static str, u32>>,
+    /// A uid's persona, from the launch registry (`None`: Personal).
+    persona: Mutex<Option<PersonaOf>>,
     attribution: Mutex<Option<Box<dyn Attribution>>>,
     /// Without one (tests), any app may embed any role.
     embed_check: Mutex<Option<EmbedCheck>>,
@@ -203,6 +207,7 @@ impl Shared {
             resolve,
             defaults,
             system_uids: Mutex::new(HashMap::new()),
+            persona: Mutex::new(None),
             attribution: Mutex::new(None),
             embed_check: Mutex::new(None),
             target_check: Mutex::new(None),
@@ -213,6 +218,12 @@ impl Shared {
     /// by `uid`, for a service that isn't a registry app.
     pub fn set_system_uid(&self, app: &'static str, uid: u32) {
         self.system_uids.lock().unwrap().insert(app, uid);
+    }
+
+    /// How a parent's persona is found, for [`catalogue::PERSONA_ROLES`].
+    /// Without one every parent counts as Personal.
+    pub fn set_persona_lookup(&self, f: PersonaOf) {
+        *self.persona.lock().unwrap() = Some(f);
     }
 
     /// Where attribution tickets come from (choragusd). Without one, an
@@ -445,6 +456,10 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     st.to_child(&e, ChildEvent::Attach { embed, role: role.name.into(), parent_app: app, parent_uid: uid });
     if let Some(ticket) = audio_ticket {
         st.to_child(&e, ChildEvent::AudioTicket { embed, ticket });
+    }
+    if catalogue::PERSONA_ROLES.contains(&role.name) {
+        let persona = shared.persona.lock().unwrap().as_ref().and_then(|f| f(uid));
+        st.to_child(&e, ChildEvent::ParentPersona { embed, persona });
     }
     if role.name == "print" {
         st.print_opens.entry(req.window).or_default().push(Instant::now());

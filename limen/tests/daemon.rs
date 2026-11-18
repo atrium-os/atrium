@@ -114,6 +114,8 @@ impl World {
             _ => None,
         });
         let shared = Shared::new(Box::new(fresco.clone()), Box::new(Launch(tx, ended.clone())), resolve, defaults);
+        // The mail app runs in Work (personas.md §3), everyone else in Personal.
+        shared.set_persona_lookup(Box::new(|uid: u32| (uid == APP).then(|| "work".to_string())));
         World { shared, fresco, launched: rx, ended }
     }
 
@@ -515,6 +517,8 @@ fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
 
     let e = app.request("picker", W_APP).unwrap();
     assert_eq!(next_c(&mut picker), ChildEvent::Attach { embed: e, role: "picker".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    // The picker hears whose persona it picks for (personas.md §4.1).
+    assert_eq!(next_c(&mut picker), ChildEvent::ParentPersona { embed: e, persona: Some("work".into()) });
     let ask = limen::picker::ToChild::Open(limen::picker::Filter::file());
     app.send(e, ask.encode()).unwrap();
     assert!(matches!(next_c(&mut picker), ChildEvent::Message { .. }));
