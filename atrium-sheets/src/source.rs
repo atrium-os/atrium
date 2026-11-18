@@ -427,13 +427,19 @@ impl SheetSource {
     /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
     fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
-        let (comment, link) = {
+        let (comment, link, prompt) = {
             let d = self.doc.borrow();
             let k = d.wb.comment(d.sheet, r, c).map(|k| (k.author.to_string(), k.text.to_string()));
             let l = d.wb.link_at(CellAddr::new(d.sheet, r, c)).map(|l| l.target.to_string());
-            (k, l)
+            // A validation rule's input prompt, and whether it offers a list.
+            let p = d.wb.validation_at(CellAddr::new(d.sheet, r, c)).and_then(|v| {
+                let list = v.allow == officina_grid::validation::Allow::List && v.dropdown;
+                let msg = (v.show_prompt && !v.prompt.is_empty()).then(|| (v.prompt.title.to_string(), v.prompt.text.to_string()));
+                (list || msg.is_some()).then_some((msg, list))
+            });
+            (k, l, p)
         };
-        if comment.is_none() && link.is_none() {
+        if comment.is_none() && link.is_none() && prompt.is_none() {
             return None;
         }
         let ink = Color::rgba(0.11, 0.11, 0.09, 1.0);
@@ -456,6 +462,17 @@ impl SheetSource {
                 lines.push((author, 1));
             }
             lines.extend(wrap_lines(&text, &st(0), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, 0)));
+        }
+        if let Some((msg, list)) = &prompt {
+            if let Some((title, text)) = msg {
+                if !title.trim().is_empty() {
+                    lines.push((title.trim().to_string(), 1));
+                }
+                lines.extend(wrap_lines(text, &st(0), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, 0)));
+            }
+            if *list {
+                lines.push(("Data ▸ Choose from List…".into(), 3));
+            }
         }
         let linked = link.is_some();
         if let Some(t) = link {
