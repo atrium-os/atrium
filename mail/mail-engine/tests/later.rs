@@ -113,3 +113,98 @@ fn remind_me_if_nobody_replies() {
     sink.messages("INBOX", vec![f(1, msg("Sam <sam@acme.example>", "arun@example.org", "Re: Contract", 20, "s9@x", &mid))]).unwrap();
     assert!(engine.later_items().unwrap().is_empty());
 }
+
+/// The next Friday 16:00 UTC at least 8 days from now, so items set aside
+/// now have waited more than a week by then.
+fn friday_afternoon() -> i64 {
+    let real = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let day = (real + 8 * 86_400).div_euclid(86_400);
+    let fri = day + (4 - (day + 3).rem_euclid(7)).rem_euclid(7);
+    fri * 86_400 + 16 * 3600
+}
+
+#[test]
+fn overdue_is_asked_then_dropped_and_the_weekly_look() {
+    use mail_engine::later::{Ask, When};
+    use mail_engine::notify::{Notifier, Post};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let me = "Arun <arun@example.org>";
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    sink.messages("INBOX", vec![
+        f(1, msg("Priya <priya@example.com>", me, "Numbers?", 10, "p1@x", "")),
+        f(2, msg("Lena <lena@partner.example>", me, "Lunch", 11, "l1@x", "")),
+        f(3, msg("Sam <sam@acme.example>", me, "Contract", 12, "s1@x", "")),
+        f(4, msg("Dev <dev@acme.example>", me, "Deploy", 13, "d1@x", "")),
+    ]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let subjects = || engine.store.list(inbox, 0, 50).unwrap().into_iter().map(|r| r.subject).collect::<Vec<_>>();
+    let id_of = |uid| engine.store.at(inbox, uid).unwrap().unwrap().0;
+    let now = friday_afternoon();
+
+    // A note is one line.
+    engine.set_later(id_of(1), kind::REPLY, now - 10 * 86_400, "  send the\nnumbers ").unwrap();
+    assert_eq!(engine.later_of(id_of(1)).unwrap().unwrap().1.note, "send the numbers");
+    let lena = engine.set_later(id_of(2), kind::READ, now - 31 * 86_400, "").unwrap();
+    engine.set_later(id_of(3), kind::WAITING, now + 30 * 86_400, "").unwrap();
+    // Deploy: next Tuesday, pushed back three times.
+    let tuesday = When::NextWeek.at_local(now) + 86_400;
+    for _ in 0..4 {
+        engine.set_later(id_of(4), kind::DO, tuesday, "").unwrap();
+    }
+    assert!(subjects().is_empty());
+    let asking: Vec<_> = engine.later_asking(now).unwrap().into_iter().map(|(_, l, a)| (l.msg, a)).collect();
+    assert_eq!(asking, [(id_of(2), Ask::Stale), (id_of(1), Ask::Stale), (id_of(4), Ask::Pushed)]);
+
+    // 30 days overdue: dropped, back where it was, unflagged; undo brings
+    // it back open; dropping by hand keeps it in Dropped too.
+    assert_eq!(engine.later_drop_stale(now).unwrap(), [lena]);
+    assert_eq!(subjects(), ["Lunch"]);
+    assert!(engine.later_of(id_of(2)).unwrap().is_none());
+    assert_eq!(engine.later_dropped_of(id_of(2)).unwrap().unwrap().0, lena);
+    assert!(engine.later_undrop(lena).unwrap());
+    let (_, back) = engine.later_of(id_of(2)).unwrap().unwrap();
+    assert!(back.back);
+    assert!(engine.later_dropped().unwrap().is_empty());
+    engine.later_drop(lena, now).unwrap();
+    assert_eq!(engine.later_dropped().unwrap().len(), 1);
+    assert!(engine.later_drop_stale(now + 91 * 86_400).unwrap().len() >= 1, "Priya's is 30 days overdue by then");
+    assert!(engine.later_dropped().unwrap().iter().all(|d| d.0 != lena), "dropped 90 days ago: forgotten");
+
+    // The review names what has waited a week and what keeps being pushed;
+    // on Friday afternoon the weekly look says what's next week and who is
+    // waited on.
+    let dir2 = tempfile::tempdir().unwrap();
+    let e2 = Engine::new(Store::open(dir2.path()).unwrap(), Parser { program: jail() });
+    let a2 = e2.store.add_account("arun@example.org").unwrap();
+    let mut s2 = e2.sink(a2);
+    s2.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    s2.messages("INBOX", vec![
+        f(1, msg("Priya <priya@example.com>", me, "Numbers?", 10, "p1@x", "")),
+        f(3, msg("Sam <sam@acme.example>", me, "Contract", 12, "s1@x", "")),
+        f(4, msg("Dev <dev@acme.example>", me, "Deploy", 13, "d1@x", "")),
+    ]).unwrap();
+    let in2 = e2.store.folder_id(a2, "INBOX", Role::Inbox).unwrap();
+    let id2 = |uid| e2.store.at(in2, uid).unwrap().unwrap().0;
+    e2.set_later(id2(1), kind::REPLY, now - 10 * 86_400, "send the numbers").unwrap();
+    // Waiting on Sam, set aside over a week before `now` (set_at is real time).
+    e2.set_later(id2(3), kind::WAITING, now + 30 * 86_400, "").unwrap();
+    for _ in 0..4 {
+        e2.set_later(id2(4), kind::DO, tuesday, "").unwrap();
+    }
+    let mut n = Notifier::new();
+    let posts = n.check_local(&e2, now, 0);
+    let review = posts.iter().find_map(|p| if let Post::Review { body, .. } = p { Some(body.clone()) } else { None }).unwrap();
+    assert_eq!(review, "1 overdue\nOver a week overdue: send the numbers\nPushed back 3 times or more: Deploy");
+    let week = posts.iter().find_map(|p| if let Post::Week { body, .. } = p { Some(body.clone()) } else { None }).unwrap();
+    assert_eq!(week, "1 due next week: Deploy\nWaiting over a week: Contract");
+    assert!(n.check_local(&e2, now + 3600, 0).is_empty(), "once a day, once a week");
+    // Turned off: no weekly look.
+    let mut p = e2.prefs();
+    p.weekly = false;
+    e2.set_prefs(&p).unwrap();
+    let mut n = Notifier::new();
+    assert!(n.check_local(&e2, now, 0).iter().all(|p| !matches!(p, Post::Week { .. })));
+}

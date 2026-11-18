@@ -113,7 +113,7 @@ fn notifications() -> mpsc::Sender<mail_engine::notify::Post> {
                     by_msg.insert(msg, id);
                 }),
                 Post::Group { title, body } => praeco::client::post(&sock, urgency::NORMAL, &title, &body).map(|_| ()),
-                Post::Review { title, body } => praeco::client::post(&sock, urgency::LOW, &title, &body).map(|_| ()),
+                Post::Review { title, body } | Post::Week { title, body } => praeco::client::post(&sock, urgency::LOW, &title, &body).map(|_| ()),
                 Post::Summary { title, body } => {
                     if let Some(old) = summary.take() {
                         let _ = praeco::client::withdraw(&sock, old);

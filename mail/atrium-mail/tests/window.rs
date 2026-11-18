@@ -705,6 +705,82 @@ fn later_sets_aside_and_done_closes() {
 }
 
 #[test]
+fn later_note_drop_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    use atrium_mail::view::Lane;
+    let ev = |k: Key| Event::Key { kind: KeyEventKind::Down, key: k, modifiers: Modifiers::default(), chars: String::new() };
+    mail.open(0);
+    // l, then n: a note; typing "2" goes into it, not to the times.
+    assert!(mail.key(&key("l"), None));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Add a note"), "{:?}", texts(&app));
+    assert!(mail.key(&key("n"), None));
+    for c in ["c", "a", "l", "l", " ", "S", "a", "m", "x"] {
+        assert!(mail.key(&key(c), None));
+    }
+    assert!(mail.key(&ev(Key::Backspace), None));
+    assert!(mail.key(&key(" "), None));
+    assert!(mail.key(&key("2"), None));
+    assert_eq!(mail.ui.get_cloned().later_note, "call Sam 2");
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "call Sam 2|"), "{:?}", texts(&app));
+    assert!(mail.key(&ev(Key::Enter), None));
+    assert!(mail.ui.get_cloned().later_sheet.is_some(), "Enter ends the note, the sheet stays");
+    assert!(mail.key(&key("2"), None));
+    let (_, item) = engine.later_items().unwrap()[0].clone();
+    assert_eq!(item.note, "call Sam 2");
+
+    // In the Later list, x drops it: it goes to Dropped, which appears.
+    mail.show_view(Lane::Later);
+    mail.open(0);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Drop"), "{:?}", texts(&app));
+    assert!(mail.key(&key("x"), None));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    assert!(engine.later_items().unwrap().is_empty());
+    assert!(mail.ui.get_cloned().views.contains(&(Lane::Dropped, 1)));
+    mail.show_view(Lane::Dropped);
+    let r = mail.row(0).unwrap();
+    assert_eq!((r.subject.as_str(), r.preview.as_str()), ("Two", "Dropped 09:21 · was Reply · call Sam 2"));
+    mail.open(0);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Restore"), "{:?}", texts(&app));
+    // u restores it, open again.
+    assert!(mail.key(&key("u"), None));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    assert_eq!(engine.later_items().unwrap().len(), 1);
+    assert!(!mail.ui.get_cloned().views.iter().any(|v| v.0 == Lane::Dropped));
+
+    // A month overdue: dropped on the next refresh, with an Undo.
+    let (id, mut l) = engine.later_items().unwrap()[0].clone();
+    l.due = NOW - 31 * 86_400;
+    engine.store.write(|w| w.put_later(Some(id), &l)).unwrap();
+    mail.end_search();
+    mail.refresh();
+    let ui = mail.ui.get_cloned();
+    assert_eq!(ui.undo.as_ref().map(|u| u.label.as_str()), Some("1 item 30 days overdue dropped"));
+    assert!(engine.later_items().unwrap().is_empty());
+    assert!(mail.key(&key("z"), None));
+    assert_eq!(engine.later_items().unwrap().len(), 1);
+}
+
+#[test]
 fn a_signed_message_says_who_signed_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });

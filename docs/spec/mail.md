@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list and weekly look built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1480,6 +1480,23 @@ Stalwart in the cloud VM, and later a real account):
    a filter). **Not yet**: grouping by account and by lane, remembering the grouping per
    folder, saving a filter set as a smart folder, and the chips in a search's
    results.
+
+   **Later's remaining rules built on the host (2026-11-18, §11.4).** The daily review
+   names every item a week or more overdue and every item pushed back three times or
+   more ("Over a week overdue: send the numbers"), every day until it is answered. At 30
+   days overdue an item moves to **Dropped** on the next refresh, with "1 item 30 days
+   overdue dropped · Undo"; `x` drops an item by hand too. Dropped items are a sidebar
+   view while there are any ("Dropped 09:21 · was Reply · note") and `u` (*Restore*) opens
+   one again, back in the inbox with its flag; a drop is kept 90 days. An item pushed back
+   three times shows *Do it now*, *Drop* and *Someday* in the reader in place of Done and
+   Later. The **weekly look** posts once on Friday after 15:00 local time: what is due next
+   week (Monday to Sunday) and *Waiting* items set aside more than 7 days ago; a switch in
+   Settings turns it off. The Later sheet has a one-line **note** (`n`, typed in place;
+   Enter ends it), shown when the item comes back. Tests: engine 1 (asked, dropped, undo,
+   forgotten after 90 days, review and weekly texts, the setting), window 1 (note typed,
+   `x`, Dropped view, `u`, the 30-day drop and its Undo). **Not yet**: a *Read* item closing
+   when read to the end, the review's time as a setting, `$Snoozed` and a server
+   `Snoozed` folder, and a flag set elsewhere arriving as a *Reply* item.
 
 ## 17. Decisions, with recommendations
 

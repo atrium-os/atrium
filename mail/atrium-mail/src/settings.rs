@@ -382,6 +382,11 @@ impl Settings {
         self.set_prefs(|p| p.quiet = if p.quiet.is_some() { None } else { Some((f.unwrap_or(22 * 60), t.unwrap_or(7 * 60))) });
     }
 
+    /// Later's weekly look (§11.4): what is due next week, who is waited on.
+    pub fn toggle_weekly(&self) {
+        self.set_prefs(|p| p.weekly = !p.weekly);
+    }
+
     pub fn toggle_vips_through(&self) {
         self.set_prefs(|p| p.vips_through = !p.vips_through);
     }
@@ -849,6 +854,9 @@ impl View for SettingsView {
             switch(ctx, x, y + em(14.0), "VIPs notify in quiet hours too", ui.prefs.vips_through, move || s.toggle_vips_through());
             y += em(32.0);
         }
+        let s = self.s.clone();
+        switch(ctx, x, y + em(14.0), "Later: a weekly look on Friday afternoon", ui.prefs.weekly, move || s.toggle_weekly());
+        y += em(32.0);
 
         // Lanes (E10): the person's rules, then what Mail does by itself.
         y += em(8.0);
