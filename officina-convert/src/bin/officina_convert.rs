@@ -18,9 +18,10 @@
 //! fidelity note (`note<TAB>kind<TAB>count<TAB>what<TAB>examples`), `stats<TAB>...`, and
 //! on failure `error<TAB>why` with exit status 1.
 //!
-//! This is the converter process of docs/spec/officina.md §5.2; launching it in a
-//! throwaway jail (portcullis one-shot) is the next step, and the sandbox here stays as
-//! a second wall.
+//! This is the converter process of docs/spec/officina.md §5.2. Installed, it is
+//! the app's `convert` worker (`[[workers]]`, app-composition.md §4): a one-shot jail of
+//! its own as a uid of its own, with no capability; started that way it takes its
+//! arguments as the first line on stdin. The sandbox here stays as a second wall.
 
 use std::io::{Read, Write};
 
@@ -48,10 +49,26 @@ fn sandbox() {
     }
 }
 
+/// Started as the app's `convert` worker (dev-tools-plan.md M5), it has no
+/// arguments: the first line on stdin is them (`xlsx` or `xlsx --password`).
+fn header(stdin: &mut impl Read) -> (String, bool) {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    while line.len() < 64 && stdin.read(&mut b).is_ok_and(|n| n == 1) && b[0] != b'\n' {
+        line.push(b[0]);
+    }
+    let line = String::from_utf8_lossy(&line).into_owned();
+    let mut w = line.split(' ');
+    let what = w.next().unwrap_or_default().to_string();
+    (what, w.next() == Some("--password"))
+}
+
 fn main() {
-    let what = std::env::args().nth(1).unwrap_or_default();
-    let with_password = std::env::args().nth(2).is_some_and(|a| a == "--password");
     let mut stdin = std::io::stdin().lock();
+    let (what, with_password) = match std::env::args().nth(1) {
+        Some(w) => (w, std::env::args().nth(2).is_some_and(|a| a == "--password")),
+        None => header(&mut stdin),
+    };
     let mut password = None;
     if with_password {
         let mut n = [0u8; 4];

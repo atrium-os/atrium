@@ -26,6 +26,8 @@ miniz_oxide = "0.8"
 # Streaming XML (MIT); bounded by our own limits on top.
 quick-xml = "0.37"
 libc = "0.2"
+# Run as the app's `convert` worker when installed (dev-tools-plan.md M5).
+atrium-worker = { path = "../sdk/atrium-worker" }
 # Password-protected documents (O7a): RustCrypto, MIT OR Apache-2.0.
 aes = "0.8"
 aes-gcm = "0.10"

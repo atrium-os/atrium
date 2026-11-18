@@ -14,6 +14,14 @@ icon        = "files"
 graphics = "fresco"
 network  = "none"
 
+# The converter (officina.md §5.2): a foreign file is read here, in a jail
+# of its own as a uid of its own, with no capability (app-composition.md §4).
+[[workers]]
+name   = "convert"
+entry  = "bin/officina-convert"
+memory = "2G"
+cpu    = "2m"
+
 [[opens]]
 types = [
     "application/vnd.oasis.opendocument.text",

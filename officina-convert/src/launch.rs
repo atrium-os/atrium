@@ -58,7 +58,21 @@ pub fn password_prefix(password: &str) -> Vec<u8> {
 
 /// Runs `officina-convert KIND` over `data`: the native file and the
 /// fidelity notes, in words.
+///
+/// An installed app that declares the `convert` worker runs it that way
+/// (a jail of its own, dev-tools-plan.md M5); otherwise, as in development
+/// and tests, it is a child process.
 pub fn convert(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
+    if std::env::var_os("OFFICINA_CONVERT").is_none() {
+        if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| w.has(WORKER)) {
+            let mut p = w.spawn_stdio(WORKER)
+                .map_err(|e| ConvertError::Failed(format!("the converter didn't start: {e}")))?;
+            let mut head = format!("{kind}{}\n", if password.is_some() { " --password" } else { "" }).into_bytes();
+            head.extend(password.map(password_prefix).unwrap_or_default());
+            let (stdin, stdout, err) = (p.stdin.take().expect("piped"), p.stdout.take().expect("piped"), p.stderr.take().expect("piped"));
+            return finish(stdin, stdout, err, head, data, move || p.wait() == Some(0));
+        }
+    }
     let exe = converter();
     let mut cmd = Command::new(&exe);
     cmd.arg(kind);
@@ -71,10 +85,20 @@ pub fn convert(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ConvertError::Failed(format!("the converter ({}) didn't start: {e}", exe.display())))?;
-    let mut stdin = child.stdin.take().expect("piped");
-    let mut err = child.stderr.take().expect("piped");
-    let mut stdout = child.stdout.take().expect("piped");
+    let stdin = child.stdin.take().expect("piped");
+    let err = child.stderr.take().expect("piped");
+    let stdout = child.stdout.take().expect("piped");
     let prefix = password.map(password_prefix).unwrap_or_default();
+    finish(stdin, stdout, err, prefix, data, move || child.wait().is_ok_and(|s| s.success()))
+}
+
+/// The worker's name in the app's `[[workers]]`.
+pub const WORKER: &str = "convert";
+
+/// Feed the converter `prefix` then `data`, and read its file and notes;
+/// `wait` says whether it ended well.
+fn finish(mut stdin: impl Write + Send, mut stdout: impl Read, mut err: impl Read + Send, prefix: Vec<u8>, data: &[u8],
+          wait: impl FnOnce() -> bool) -> Result<(Vec<u8>, Vec<String>), ConvertError> {
     std::thread::scope(|sc| {
         sc.spawn(move || {
             let _ = stdin.write_all(&prefix).and_then(|_| stdin.write_all(data));
@@ -86,7 +110,7 @@ pub fn convert(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u
         });
         let mut out = Vec::new();
         let r = stdout.read_to_end(&mut out);
-        let status = child.wait();
+        let status = wait();
         let errs = e.join().unwrap_or_default();
         let mut notes = Vec::new();
         let mut failure = None;
@@ -105,7 +129,7 @@ pub fn convert(kind: &str, data: &[u8], password: Option<&str>) -> Result<(Vec<u
             }
         }
         match (r, status) {
-            (Ok(_), Ok(st)) if st.success() => Ok((out, notes)),
+            (Ok(_), true) => Ok((out, notes)),
             _ => Err(failure.unwrap_or_else(|| ConvertError::Failed("the converter stopped".into()))),
         }
     })
