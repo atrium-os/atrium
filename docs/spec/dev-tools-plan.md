@@ -361,7 +361,16 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   (portcullisd lets an IDE Run in a workspace it was given). In the gate a c-app
   project shows its core in the composition panel, and Run opens its window in the
   amber dev frame. libatrium now finds Fresco at the jail's socket when
-  `ATRIUM_FRESCO_SOCKET` is unset, as a Run's dev app has it. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
+  `ATRIUM_FRESCO_SOCKET` is unset, as a Run's dev app has it. With the Rust layer's
+  `cargo-atrium` in the workspace, the gate also makes a project with New project
+  (six templates) and sees `cargo atrium check` answer in the composition panel;
+  `FORUM=1` runs the dev app again under forum-wm, which zooms it to the work area
+  in its amber frame (the c-app template now follows resize events). Move into a
+  worker: a core crash with a frame has a **Move it** button that previews
+  `cargo atrium worker add <fn> --from crate::<path> --dry-run --json` in Output
+  (files it changes, call sites to update) and moves on **Move**; the composition
+  and fuzz panels reload with the new worker as a target (end-to-end on Linux
+  against the real fuzzer and CLI). M12's Artifex half is built too: the debugger panel on `lldb-dap` over
   `WorkspaceExec` (breakpoints in the gutter, stack, locals, stepping; end-to-end on
   Linux), and the fuzz panel running `cargo atrium fuzz` in the background, core
   crashes first with "Move into a worker", a crash opening at its line and replaying
