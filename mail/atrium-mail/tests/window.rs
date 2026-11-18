@@ -781,6 +781,40 @@ fn later_note_drop_and_restore() {
 }
 
 #[test]
+fn a_read_item_closes_when_read_to_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        let bytes = message(1, "Arun <arun@example.org>", "Essay", "A short text.", false, NOW - 100);
+        sink.messages("INBOX", vec![Fetched { uid: 1, flags: vec![], size: bytes.len() as u64, internal_date: Some(NOW - 100), server_id: None, bytes, full: true }]).unwrap();
+    }
+    let clock = Rc::new(std::cell::Cell::new(NOW));
+    let c = clock.clone();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), move || c.get());
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    mail.open(0);
+    assert!(mail.key(&key("l"), None));
+    mail.later_kind(mail_store::later::kind::READ);
+    assert!(mail.key(&key("2"), None));
+    mail.show_view(atrium_mail::view::Lane::Later);
+    mail.open(0);
+    app.tick();
+    mail.tick();
+    assert_eq!(engine.later_items().unwrap().len(), 1, "not yet: just opened");
+    clock.set(NOW + atrium_mail::view::READ_SECS);
+    app.tick();
+    mail.tick();
+    assert!(engine.later_items().unwrap().is_empty(), "open 5 s, all of it on screen");
+    assert_eq!(mail.ui.get_cloned().file_note.map(|n| n.0).as_deref(), Some("Read: closed"));
+}
+
+#[test]
 fn a_signed_message_says_who_signed_it() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });

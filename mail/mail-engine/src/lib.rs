@@ -537,12 +537,24 @@ impl Sink for AccountSink<'_> {
 
     fn flags(&mut self, folder: &str, changes: &[(u32, Vec<String>)]) -> Result<(), String> {
         let id = self.fid(folder)?;
+        // Flagged elsewhere since the last look: a Later item (§11.4).
+        let flagged: Vec<(u32, mail_store::MsgId)> = changes.iter().filter(|(_, f)| flag::from_imap(f) & flag::FLAGGED != 0).filter_map(|(uid, _)| match self.e.store.at(id, *uid) {
+            Ok(Some((m, fl))) if fl & flag::FLAGGED == 0 => Some((*uid, m)),
+            _ => None,
+        }).collect();
         self.e.store.write(|w| {
             for (uid, f) in changes {
                 w.set_flags(id, *uid, flag::from_imap(f))?;
             }
             Ok(())
-        }).map_err(|e| e.to_string())
+        }).map_err(|e| e.to_string())?;
+        if !flagged.is_empty() {
+            let role = self.e.store.folder(id).map_err(|e| e.to_string())?.role;
+            for (uid, m) in flagged {
+                self.e.later_flagged(id, role, uid, m).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     fn vanished(&mut self, folder: &str, uids: &[u32]) -> Result<(), String> {

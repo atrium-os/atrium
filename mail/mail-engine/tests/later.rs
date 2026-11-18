@@ -208,3 +208,45 @@ fn overdue_is_asked_then_dropped_and_the_weekly_look() {
     let mut n = Notifier::new();
     assert!(n.check_local(&e2, now, 0).iter().all(|p| !matches!(p, Post::Week { .. })));
 }
+
+#[test]
+fn a_flag_from_elsewhere_gets_a_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let me = "Arun <arun@example.org>";
+    let mut sink = engine.sink(account);
+    sink.folders(&[
+        RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true },
+        RemoteFolder { name: "Trash".into(), role: mail_sync::Role::Trash, selectable: true },
+    ]).unwrap();
+    // Arrives flagged (a phone flagged it): a Reply item, out of the inbox.
+    let mut one = f(1, msg("Priya <priya@example.com>", me, "Numbers?", 10, "p1@x", ""));
+    one.flags = vec!["\\Flagged".into()];
+    sink.messages("INBOX", vec![one, f(2, msg("Lena <lena@partner.example>", me, "Lunch", 11, "l1@x", ""))]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let id_of = |uid| engine.store.at(inbox, uid).unwrap().unwrap().0;
+    let items = engine.later_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].1.msg, items[0].1.kind), (id_of(1), kind::REPLY));
+    let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    assert!(items[0].1.due > soon && items[0].1.due <= soon + 2 * 86_400, "tomorrow morning");
+    assert_eq!(engine.store.ops_pending().unwrap(), 0, "already flagged on the server");
+
+    // Flagged later elsewhere: the next flags report makes one too.
+    sink.flags("INBOX", &[(2, vec!["\\Flagged".into()])]).unwrap();
+    assert!(engine.later_of(id_of(2)).unwrap().is_some_and(|(_, l)| l.kind == kind::REPLY));
+
+    // Done in Mail: the unflag is still to be sent, so a report that still
+    // says flagged doesn't bring the item back.
+    let (lid, _) = engine.later_of(id_of(2)).unwrap().unwrap();
+    engine.later_done(lid).unwrap();
+    sink.flags("INBOX", &[(2, vec!["\\Flagged".into()])]).unwrap();
+    assert!(engine.later_of(id_of(2)).unwrap().is_none());
+
+    // Flagged in Trash: nothing.
+    let mut t = f(1, msg("Sam <sam@acme.example>", me, "Old", 9, "s1@x", ""));
+    t.flags = vec!["\\Flagged".into()];
+    sink.messages("Trash", vec![t]).unwrap();
+    assert_eq!(engine.later_items().unwrap().len(), 1);
+}

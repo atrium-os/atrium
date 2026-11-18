@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list and weekly look built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look and flags from other clients built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1494,9 +1494,18 @@ Stalwart in the cloud VM, and later a real account):
    Settings turns it off. The Later sheet has a one-line **note** (`n`, typed in place;
    Enter ends it), shown when the item comes back. Tests: engine 1 (asked, dropped, undo,
    forgotten after 90 days, review and weekly texts, the setting), window 1 (note typed,
-   `x`, Dropped view, `u`, the 30-day drop and its Undo). **Not yet**: a *Read* item closing
-   when read to the end, the review's time as a setting, `$Snoozed` and a server
-   `Snoozed` folder, and a flag set elsewhere arriving as a *Reply* item.
+   `x`, Dropped view, `u`, the 30-day drop and its Undo). The same day: **a flag set
+   elsewhere** (a message arriving flagged, or a flags report turning `\Flagged` on)
+   becomes a *Reply* item due tomorrow morning, except in Sent, Drafts, Junk and Trash,
+   when the conversation has an item, or while an op of Mail's own on that message is
+   still to be sent (so a Done's unflag isn't undone by a stale report). A **Read item
+   closes** once its conversation has been open 5 s with the reader at its end (all on
+   screen or scrolled to the bottom), where Mail draws the message itself. Tests: engine 1
+   (arrives flagged, flagged later, a stale report after Done, Trash), the Dovecot suite
+   (a message flagged on the server leaves the inbox as a Later item), window 1. **Not
+   yet**: an HTML message read to its end (the doc-viewer doesn't report how far it was
+   scrolled), a flag removed elsewhere closing the item, the review's time as a setting,
+   and `$Snoozed` with a server `Snoozed` folder.
 
 ## 17. Decisions, with recommendations
 
