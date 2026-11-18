@@ -5684,7 +5684,9 @@ tessera_fs_groups_refresh(struct tessera_mount *tmp_)
 			g->bad = 0;
 			continue;
 		}
-		if (g->keys == NULL && !g->bad) {
+		/* A bad group is checked again: the keyring moved, and a
+		 * drop and a load can both land between two looks. */
+		if (g->keys == NULL) {
 			tessera_group_keys_t *k = malloc(sizeof(*k), M_TESSERA,
 			    M_WAITOK | M_ZERO);
 			int r = tessera_group_keys_init(k, g->rec.suite, gk,
@@ -5693,6 +5695,7 @@ tessera_fs_groups_refresh(struct tessera_mount *tmp_)
 				r = tessera_key_group_verify(k, &g->rec);
 			if (r == TESSERA_OK) {
 				g->keys = k;
+				g->bad = 0;
 			} else {
 				printf("tessera_fs: key group %ju: %s; it stays "
 				    "locked\n", (uintmax_t)g->rec.group_id,
