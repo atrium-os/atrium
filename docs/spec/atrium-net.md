@@ -435,7 +435,71 @@ Stays as a test and debug tool. The gates switch to `atrium-net` once N1 lands.
 ## 8. Not in v1
 
 VPN tunnels (designed in [vpn.md](vpn.md): atrium-net applies checked tunnel proposals and owns the `atrium/vpn` pf anchor), DHCPv6 prefix delegation, captive portal sign-in (v1 only detects
-it, §9 decision 8), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
+it, §9 decision 8; proposed in §8.1), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
+
+### 8.1 Captive portal sign-in (proposed 2026-11-18)
+
+Hotels, trains and cafés hold traffic until a web page is accepted. v1 detects that
+(`internet=captive`, `portal=`) and the bar says "sign-in needed"; nothing opens the page.
+It matters more now: with DNS over TLS on (§6) nothing resolves behind a portal, and
+with a VPN's block-when-not-connected (vpn.md §5.4) nothing leaves at all.
+
+**What the user sees.** When the egress interface turns captive, one notification
+"Sign in to <network>" (and the same line in the bar's network menu and Curia's Network
+page). Pressing it opens a **portal window**: a Navigator Unrecorded trail (throwaway
+jar, nothing kept) at the probe's `Location`, or, with none, at plain HTTP to the
+network's router (`http://<router>/`): portals catch any plain-HTTP request, and this one
+tells no third party anything. The window title says it is the network's page, not a site's.
+When the probe says `internet=yes` the window closes itself and a notice says
+"Connected to <network>". Closing it early just stops the fast re-probe.
+
+**What is different about that one window** (and nothing else):
+- **DNS:** it asks the network's own DHCP/RA servers directly, not unbound: portals
+  answer every name with their own address, and the user's own or encrypted servers
+  are unreachable until sign-in. Its Nuntius instance is started with those servers
+  as its resolvers (a new launch option, `ATRIUM_NUNTIUS_RESOLVERS`, set only by
+  portcullisd for a portal window) instead of `/etc/resolv.conf`.
+- **Addresses:** the private-network grant, for that instance only: most portals
+  are on 10/8, 172.16/12 or 192.168/16. Loopback and the host's own addresses stay
+  refused.
+- **Path:** out the captive interface (its FIB when the VPN's app scope uses FIBs),
+  and with block-when-not-connected on, it is the one tagged exception the VPN spec
+  already reserves (vpn.md §6, captive portal row). It carries no cookies, no
+  passwords from Arca, no persona: the portal never learns who the user is beyond what
+  they type.
+- **Lifetime:** the window, its jar and the exception end when it closes, when the
+  probe says online, or after 10 minutes.
+
+**atrium-net's part (S1).** A new `network-portal` capability (its own socket, granted
+only to the Navigator's portal launcher in portcullisd, never to apps) with
+`PORTAL_INFO` → {interface, network name, portal URL, the interface's DNS servers,
+router} and `PORTAL_WATCH on|off`: while on, the egress interface is re-probed every
+5 s instead of every 5 min, and the `internet` event ends the flow.
+
+**The catch: detection needs the probe, and the probe is off** (§4.2: no third party
+learns when the machine joins a network, until Atrium runs an endpoint). Without a
+probe nothing turns captive, so nothing offers sign-in. Until the endpoint exists,
+"Sign in to this network" is offered by hand: in the bar's network menu whenever the
+link is up, and automatically when DNS over TLS has failed for 10 s on a new network
+(a strong hint of a portal, learned without contacting anyone).
+
+**Build:** S1 atrium-net `PORTAL_INFO`/`PORTAL_WATCH` + lan.py portal mode (DNS answers
+everything with 10.88.0.1, HTTP 302 to a sign-in page, a POST lets the client through);
+S2 Nuntius `ATRIUM_NUNTIUS_RESOLVERS` and the per-instance private grant; S3 Navigator
+portal window (Navigator thread); S4 bar/Curia/notification entry points; gate: join
+the portal LAN with DNS over TLS on, open the window, accept, online, window closed,
+DNS over TLS working again.
+
+**Decisions for Shankar**
+- P1. A portal window as an Unrecorded Navigator trail with the network's DNS and the
+  private-network grant, nothing else changed. *Recommend yes.*
+- P2. `network-portal` as its own capability, held only by the portal launcher.
+  *Recommend yes.*
+- P3. Without a probe: a manual "Sign in to this network", plus the automatic offer
+  when DNS over TLS fails on a new network. *Recommend yes.* Alternative: turn the
+  probe on against a third party (rejected on 2026-11-14).
+- P4. The window closes itself when online, and after 10 minutes at most.
+  *Recommend yes.*
 
 ## 9. Decisions
 
