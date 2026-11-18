@@ -2000,7 +2000,10 @@ fn handle_portal_status(uid: u32) -> Response {
     match portcullisd::portal::info() {
         Ok(i) => {
             let network = i.ssid.as_deref().map(|b| String::from_utf8_lossy(b).into_owned())
-                .filter(|n| !n.trim().is_empty()).unwrap_or_else(|| i.iface.clone());
+                .filter(|n| !n.trim().is_empty())
+                // A wired network has no name of its own; an interface's
+                // name (vtnet1) means nothing to the person.
+                .unwrap_or_else(|| "the wired network".to_string());
             Response::PortalStatus { start_url: i.start_url(), online: i.online == atrium_netconf::Online::Yes, network }
         }
         Err(why) => Response::Error { message: why },

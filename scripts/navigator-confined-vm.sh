@@ -6,6 +6,13 @@
 #
 #   sh scripts/cloud-vm.sh down     # if it was booted without the fixture net
 #   sh scripts/navigator-confined-vm.sh [out-dir]
+#   PORTAL_LAN=1 sh scripts/navigator-confined-vm.sh [out-dir]
+#
+# PORTAL_LAN=1: the sign-in window's section runs on a real portal LAN
+# instead of portal_standin: a second NIC (vtnet1) on atrium-net/sim/lan.py
+# (router, DHCP, DNS, the web held behind a captive portal), atrium-net
+# with its probe on vtnet1 and atrium-netconf's network-portal socket, as
+# scripts/atrium-net-gate.sh runs them.
 #
 # - The page child (org.atrium.navigator.page) is started by the real
 #   limend, as _limen, through portcullisd's ExecInstance: one jail per
@@ -55,7 +62,12 @@ fails=0
 ok() { echo "  ok: $*"; }
 bad() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 die() { echo "ABORT: $*"; exit 1; }
-cleanup() { [ -n "${SRVPID:-}" ] && kill "$SRVPID" 2>/dev/null; }
+PORTAL_LAN="${PORTAL_LAN:-0}"
+cleanup() {
+    [ -n "${SRVPID:-}" ] && kill "$SRVPID" 2>/dev/null
+    [ -n "${LANPID:-}" ] && kill "$LANPID" 2>/dev/null
+    true
+}
 trap cleanup EXIT INT TERM
 
 mkdir -p "$OUT"
@@ -122,7 +134,28 @@ NETDEV_EXTRA="net=1.2.3.0/24,host=1.2.3.2,dns=1.2.3.3,guestfwd=tcp:$PUB:80-cmd:$
 if pgrep -f "file=$VMDIR/vm.qcow2" >/dev/null && ! pgrep -f "guestfwd=tcp:$PUB:80-cmd:$FIX" >/dev/null; then
     die "the VM is running without this fixture network: sh scripts/cloud-vm.sh down"
 fi
-NETDEV_EXTRA="$NETDEV_EXTRA" sh "$ROOT/scripts/cloud-vm.sh" up || die "boot"
+QX=""
+if [ "$PORTAL_LAN" = 1 ]; then
+    # The portal LAN on a second NIC (atrium-net-gate.sh's), its control
+    # on 127.0.0.1:7803. lan.py runs to the end: with resolv.conf on
+    # unbound forwarding to the LAN, sshd's lookups stall without it.
+    QX="-netdev socket,id=lan,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802 -device virtio-net-pci,netdev=lan,mac=02:4e:00:00:00:01"
+    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    python3 "$ROOT/atrium-net/sim/lan.py" 3600 > "$OUT/lan.log" 2>&1 &
+    LANPID=$!
+    sleep 1
+    kill -0 "$LANPID" 2>/dev/null || die "lan.py: $(tail -3 "$OUT/lan.log")"
+fi
+lanctl() {
+    python3 - "$1" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+s.sendto(sys.argv[1].encode(), ("127.0.0.1", 7803)); print(s.recv(4096).decode())
+PY
+}
+lanstat() { lanctl stats | python3 -c "import json,sys; print(json.load(sys.stdin).get('$1', 0))"; }
+QEMU_EXTRA="$QX" NETDEV_EXTRA="$NETDEV_EXTRA" sh "$ROOT/scripts/cloud-vm.sh" up || die "boot"
+[ "$PORTAL_LAN" != 1 ] || g "ifconfig vtnet1 >/dev/null 2>&1" || die "no vtnet1: the VM was booted without the portal LAN (sh scripts/cloud-vm.sh down)"
 [ "$(g "sysctl -n kern.racct.enable" | tr -d '\r')" = 1 ] || die "kern.racct.enable is 0 (loader.conf, then reboot)"
 
 set -- env
@@ -160,9 +193,13 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb opifex-sheet "--bin opifex-sheetd"
     xb prelum-sheet "--bin atrium-prelum-sheet"
     xb atrium-open "--example open-probe"
+    [ "$PORTAL_LAN" != 1 ] || xb atrium-net "-p atrium-net -p atrium-lease -p atrium-netconf"
 fi
 
 echo "=== portcullis"
+# atrium-net's sockets: portal_standin's, or atrium-netconf's on the LAN.
+NETCONF=$S/pstand
+[ "$PORTAL_LAN" = 1 ] && NETCONF=/tmp/atrium-net/sockets
 # The portcullisd this script started last time holds its binary (ETXTBSY).
 g "pkill -x portcullisd; sleep 1; true"
 sh "$ROOT/scripts/deploy-portcullis.sh" 2>&1 | grep -v -e '^warning' -e '^ *|' -e '^ \+= ' | tail -2
@@ -189,7 +226,7 @@ allow_rctl = true
     : > /var/log/atrium/portcullisd-navigator.log
     # atrium-net's network-portal socket is portal_standin's here (the
     # sign-in window's section).
-    env PORTCULLISD_NETCONF_DIR=$S/pstand daemon -f -o /var/log/atrium/portcullisd-navigator.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
+    env PORTCULLISD_NETCONF_DIR=$NETCONF daemon -f -o /var/log/atrium/portcullisd-navigator.log /usr/local/bin/portcullisd --socket $PSOCK; sleep 3
     pgrep -f atrium-jaild >/dev/null && test -S $PSOCK" || die "jaild restart / portcullisd start"
 echo "  jaild (rctl allowed) and portcullisd on $PSOCK"
 
@@ -218,6 +255,18 @@ g "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
 done
+if [ "$PORTAL_LAN" = 1 ]; then
+    AN="$ROOT/atrium-net/target/$R"
+    g "mkdir -p /tmp/atrium-net"
+    for b in "$AN/atrium-net" "$AN/atrium-lease" "$AN/atrium-probe" "$AN/atrium-netconf" \
+             "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$ROOT/atrium-net/etc/unbound-atrium-tls.conf"; do
+        h=$(sha256sum "$b" | cut -d' ' -f1)
+        n=0  # TCG scp sometimes lands a run of zeros: send again.
+        until put "$b" /tmp/atrium-net/ && [ "$h" = "$(g "sha256 -q /tmp/atrium-net/$(basename "$b")")" ]; do
+            n=$((n + 1)); [ $n -lt 3 ] || die "hash mismatch for $(basename "$b")"
+        done
+    done
+fi
 echo "  staged in $D"
 
 echo "=== bundles"
@@ -821,6 +870,79 @@ g "test -x /var/lib/atrium/apps/$L5ID/bin/hello" && ok "$L5ID is installed" || b
 g "grep -q '$L5ID opened from org.test.appprobe for navtest' $PL" && ok "…and portcullisd opened it" || bad "open: $(g "grep -h '$L5ID' $PL | tail -2" | tr '\n' ';')"
 g "pkill -x link-probe; pkill -x opifex-sheetd; pkill -x opifexd; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; true"
 
+asks() { g "printf '%s\\n%s\\n' '{\"op\":\"hello\",\"version\":1}' '$1' | su -m navtest -c 'nc -U -w 5 $PSOCK'" | tr -d '\r' | tail -1; }
+PLAST() { g "grep 'navigator-ui: trace' $PL | tail -1"; }
+if [ "$PORTAL_LAN" = 1 ]; then
+echo "=== the network's sign-in window on a portal LAN (atrium-net.md §8.1 S3, lan.py)"
+# atrium-net on vtnet1 with its probe, the LAN holding the web behind its
+# portal (the router's /login: one form, POST /accept lets the machine
+# through), atrium-netconf's network-portal socket for portcullisd.
+lanctl web-captive >/dev/null
+g "set -e
+    pkill -f 'dhclient.*vtnet1' 2>/dev/null || true
+    for a in \$(ifconfig vtnet1 inet | awk '/inet /{print \$2}'); do ifconfig vtnet1 inet \$a -alias; done
+    id _atrium-lease >/dev/null 2>&1 || pw useradd _atrium-lease -u 65034 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net lease parser'
+    id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65048 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net connectivity probe'
+    id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net settings front'
+    mkdir -p /var/empty
+    # local-unbound-setup refuses until local_unbound is enabled.
+    sysrc local_unbound_enable=YES >/dev/null
+    if [ ! -f /var/unbound/unbound.conf ] || ! grep -q conf.d /var/unbound/unbound.conf; then local-unbound-setup >/dev/null; fi
+    mkdir -p /var/unbound/conf.d
+    printf 'server:\n    local-zone: \"test.\" nodefault\n    domain-insecure: \"atrium.test\"\n' > /var/unbound/conf.d/atrium-test.conf
+    cp /tmp/atrium-net/unbound-atrium-local.conf /var/unbound/conf.d/atrium-local.conf
+    service local_unbound restart >/dev/null 2>&1 || service local_unbound start >/dev/null
+    cp /etc/resolv.conf /tmp/atrium-net/resolv.conf.saved
+    printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+    route -n get default 2>/dev/null | awk '/gateway/{print \$2}' > /tmp/atrium-net/default.saved
+    pkill -f 'atrium-net -v' 2>/dev/null || true; sleep 1
+    daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --capsicum --lease /tmp/atrium-net/atrium-lease --probe http://probe.atrium.test/generate_204 --probe-bin /tmp/atrium-net/atrium-probe --no-mdns --sock /tmp/atrium-net/ctl.sock" 2>&1 | tail -5 || true
+g "pgrep -f 'atrium-net -v' >/dev/null" || bad "atrium-net did not start"
+lanback() {
+    g "pkill -x atrium-netconf; pkill -f 'atrium-net -v'; sleep 1
+        for a in \$(ifconfig vtnet1 inet | awk '/inet /{print \$2}'); do ifconfig vtnet1 inet \$a -alias; done
+        ifconfig vtnet1 inet6 -accept_rtadv
+        for a in \$(ifconfig vtnet1 inet6 | awk '/inet6 fd77:/{print \$2}'); do ifconfig vtnet1 inet6 \$a -alias; done
+        g=\$(cat /tmp/atrium-net/default.saved 2>/dev/null); [ -n \"\$g\" ] && { while route -q delete default 2>/dev/null; do :; done; route -q add default \$g; }
+        [ -f /tmp/atrium-net/resolv.conf.saved ] && cp /tmp/atrium-net/resolv.conf.saved /etc/resolv.conf
+        true"
+}
+stl() { g "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep 'name=vtnet1'; }
+i=0; while [ $i -lt 90 ] && ! stl | grep -q 'internet=captive'; do sleep 3; i=$((i+3)); done
+stl | grep -q 'internet=captive' && ok "atrium-net on vtnet1: the LAN's web is behind a portal" || bad "not captive: $(stl) $(g 'tail -n 5 /tmp/atrium-net/net.log' | tr '\n' ';')"
+g "pkill -x atrium-netconf 2>/dev/null || true; sleep 1; rm -rf /tmp/atrium-net/sockets
+    daemon -f -o /tmp/atrium-net/netconf.log /tmp/atrium-net/atrium-netconf -v --ctl /tmp/atrium-net/ctl.sock --dir /tmp/atrium-net/sockets --uid 65036 --capsicum"
+i=0; while [ $i -lt 20 ] && ! g "test -S /tmp/atrium-net/sockets/network-portal/network-portal.sock"; do sleep 1; i=$((i+1)); done
+LSTART='http://10.88.0.1/login?from=atrium'
+r=$(asks '{"op":"portal_window"}')
+[ "$r" = '{"kind":"ok"}' ] && ok "navtest asks for the sign-in window" || bad "PortalWindow: $r $(g "tail -3 $PL" | tr '\n' ';')"
+i=0; while [ $i -lt 90 ] && ! g "grep -q 'navigatord: the sign-in window for .* at $LSTART' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'navigatord: the sign-in window for .* at $LSTART' $PL" && ok "the sign-in window opened at the portal's own page: $(g "grep -h 'navigatord: the sign-in window for' $PL | tail -1" | tr -d '\r')" || bad "no sign-in window: $(g "grep -h -e 'sign-in window' -e 'portal' $PL | tail -3" | tr '\n' ';')"
+g "grep -q 'portal fetcher .* for org.atrium.navigator (uid [0-9]*) on vtnet1, DNS 10.88.0.53' $PL" && ok "its fetcher is Nuntius on vtnet1 with the LAN's DNS servers" || bad "portal fetcher: $(g "grep -h -i 'portal fetcher' $PL | tail -2" | tr '\n' ';')"
+i=0; while [ $i -lt 90 ] && ! PLAST | grep -q "url=$LSTART live=shown"; do sleep 3; i=$((i+3)); done
+PLAST | grep -q "url=$LSTART live=shown" && [ "$(lanstat portal_page)" -ge 1 ] && ok "the window shows the router's sign-in page ($(lanstat portal_page) GET /login at lan.py)" \
+    || bad "portal page: $(PLAST) portal_page=$(lanstat portal_page) web_syn=$(lanstat web_syn) $(g 'pfctl -s nat 2>&1 | head -5; ifconfig -g atrium_egress 2>&1; route -n get 10.88.0.1 | grep interface' | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! PLAST | grep -q 'form=[0-9|]'; do sleep 3; i=$((i+3)); done
+F=$(PLAST | sed -n 's/.* form=\([^ ]*\).*/\1/p')
+BTN=${F#*|}; BTN=${BTN%%;*}
+case "$BTN" in [0-9]*,[0-9]*) ok "its page child read the form: Accept and connect at $BTN" ;; *) BTN=0,0; bad "forms: $F $(g "grep -h 'form' $PL | tail -2" | tr '\n' ';')" ;; esac
+shot confined-15-portal-lan
+press "${BTN%,*}" $((TOP + ${BTN#*,}))
+i=0; while [ $i -lt 60 ] && [ "$(lanstat portal_accept)" -lt 1 ]; do sleep 3; i=$((i+3)); done
+[ "$(lanstat portal_accept)" -ge 1 ] && ok "the press sent the form: lan.py's portal let the machine through" || bad "no POST /accept: $(g "grep -h 'form' $PL | tail -2" | tr '\n' ';')"
+i=0; while [ $i -lt 60 ] && ! PLAST | grep -q 'url=http://10.88.0.1/accept live=shown'; do sleep 3; i=$((i+3)); done
+PLAST | grep -q 'url=http://10.88.0.1/accept live=shown' && ok "the portal's answer shows in the window" || bad "after POST: $(PLAST)"
+shot confined-16-portal-lan-online
+PU2=$(g "awk '\$2==\"navtest\" && \$3==\"org.atrium.navigator\" && \$4==\"persona=portal\" {print \$1}' /var/run/atrium/app-registry" | tr -d '\r')
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'is online; the sign-in window closes' $PL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'is online; the sign-in window closes' $PL" && ok "atrium-net's probe saw the web: the sign-in window closed itself" || bad "online: $(stl) $(g "grep -h -e 'online' -e 'sign-in' $PL | tail -3" | tr '\n' ';')"
+sleep 10
+g "pgrep -u ${PU2:-0} -x navigatord >/dev/null" && bad "the sign-in window's navigatord is still running" || ok "…its navigatord and window are gone"
+stl | grep -q 'internet=yes' && ok "atrium-net: online" || bad "atrium-net after sign-in: $(stl)"
+get /tmp/atrium-net/net.log "$OUT/atrium-net.log" 2>/dev/null
+get /tmp/atrium-net/netconf.log "$OUT/netconf.log" 2>/dev/null
+lanback
+else
 echo "=== the network's sign-in window (atrium-net.md §8.1 S3, P5)"
 # atrium-net's network-portal socket is portal_standin's: a Wi-Fi network
 # "Hotel Guest" captive at the fixture server's /portal/, online once
@@ -831,7 +953,6 @@ PSD=$S/pstand
 PSTART=http://$PUB/portal/
 g "rm -rf $PSD; mkdir -p $PSD; daemon -f -o $S/pstand.log $D/portal_standin $PSD $PSTART 1.2.3.3 $PSD/online </dev/null"
 i=0; while [ $i -lt 20 ] && ! g "test -S $PSD/network-portal/network-portal.sock"; do sleep 1; i=$((i+1)); done
-asks() { g "printf '%s\\n%s\\n' '{\"op\":\"hello\",\"version\":1}' '$1' | su -m navtest -c 'nc -U -w 5 $PSOCK'" | tr -d '\r' | tail -1; }
 r=$(asks '{"op":"portal_status"}')
 case "$r" in *"only the sign-in window"*) ok "the network's state is the sign-in window's alone: navtest is refused" ;; *) bad "PortalStatus as navtest: $r" ;; esac
 r=$(asks '{"op":"portal_window"}')
@@ -841,7 +962,6 @@ g "grep -q 'navigatord: the sign-in window for Hotel Guest at $PSTART' $PL" && o
 g "grep -q '^[0-9]* navtest org.atrium.navigator .*persona=portal' /var/run/atrium/app-registry" && ok "in the reserved portal persona: a uid of its own" || bad "registry: $(g "grep -a navigator /var/run/atrium/app-registry" | tr '\n' ';')"
 g "grep -q 'portal fetcher .* for org.atrium.navigator (uid [0-9]*) on vtnet0, DNS 1.2.3.3' $PL" && ok "its fetcher is Nuntius with the network's DNS server" || bad "portal fetcher: $(g "grep -h -i 'portal fetcher' $PL | tail -2" | tr '\n' ';')"
 g "grep -q 'PORTAL_WATCH on' $S/pstand.log" && ok "…and atrium-net is told to watch for the sign-in" || bad "watch: $(g "tail -3 $S/pstand.log" | tr '\n' ';')"
-PLAST() { g "grep 'navigator-ui: trace' $PL | tail -1"; }
 i=0; while [ $i -lt 90 ] && ! PLAST | grep -q "url=$PSTART live=shown"; do sleep 3; i=$((i+3)); done
 PLAST | grep -q "url=$PSTART live=shown" && ok "the window shows the network's page" || bad "portal page: $(PLAST)"
 grep -q "GET /portal/ " "$FIX/server.log" && ok "fetched from the network, not through the Navigator's own fetcher" || bad "no GET /portal/ at the fixture server"
@@ -869,6 +989,7 @@ g "grep -q 'Hotel Guest is online; the sign-in window closes' $PL" && ok "atrium
 sleep 10
 g "pgrep -u ${PU2:-0} -x navigatord >/dev/null" && bad "the sign-in window's navigatord is still running" || ok "…its navigatord and window are gone"
 g "grep -q 'PORTAL_WATCH off' $S/pstand.log" && ok "…and the watch ended with its fetcher" || bad "watch off: $(g "tail -2 $S/pstand.log" | tr '\n' ';')"
+fi
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"

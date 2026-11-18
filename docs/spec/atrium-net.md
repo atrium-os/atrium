@@ -520,8 +520,13 @@ Workers' environments carry `ATRIUM_` keys only, so the private grant is
 `ATRIUM_NUNTIUS_PRIVATE_NETWORK=1`. In the sandbox casper connects only to addresses it
 resolved (`CAPNET_CONNECTDNS`), so `ViaDns` has casper resolve each address numerically before
 connecting. The confined VM gate runs it against `portal_standin` (a netconf stand-in: "Hotel
-Guest", the fixture server's /portal/, online once a file exists); the joint run on the
-network thread's portal LAN is next.
+Guest", the fixture server's /portal/, online once a file exists), and with `PORTAL_LAN=1` on
+lan.py's portal LAN with the real atrium-net, probe and atrium-netconf (141/141, 2026-11-18).
+That run found two more: nuntiusd gave up when one of the network's DNS servers was
+unreachable from its jail (an IPv6 one; the routed jail has IPv4 only), and now passes over
+it; and the fetcher wrote each request in pieces, which lan.py's router took for a request
+cut short, and now writes it at once. A wired network has no name, so the window says "Sign
+in to the wired network".
 
 P5 (Shankar, 2026-11-18): the sign-in window may send the page's plain HTML forms (text,
 checkboxes, buttons), only on the person's press, and only in that window. Everywhere

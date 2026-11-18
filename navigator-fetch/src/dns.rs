@@ -53,17 +53,21 @@ impl Udp {
     }
 
     /// Resolvers at `addrs` (tests use one of their own).
+    /// A server this machine cannot reach (an IPv6 one in a jail without
+    /// IPv6) is passed over; only none at all is an error.
     pub fn to(addrs: &[SocketAddr]) -> io::Result<Udp> {
         let mut socks = Vec::new();
+        let mut last = None;
         for a in addrs {
             let any: SocketAddr = if a.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
-            let s = UdpSocket::bind(any)?;
-            s.connect(a)?;
-            s.set_read_timeout(Some(Duration::from_millis(250)))?;
-            socks.push(s);
+            let s = UdpSocket::bind(any).and_then(|s| s.connect(a).map(|()| s)).and_then(|s| s.set_read_timeout(Some(Duration::from_millis(250))).map(|()| s));
+            match s {
+                Ok(s) => socks.push(s),
+                Err(e) => last = Some(io::Error::new(e.kind(), format!("{a}: {e}"))),
+            }
         }
         if socks.is_empty() {
-            return Err(io::Error::other("no resolver"));
+            return Err(last.unwrap_or_else(|| io::Error::other("no resolver")));
         }
         Ok(Udp { socks: Mutex::new(socks) })
     }

@@ -5891,7 +5891,12 @@ shows (`confined-10-install.png`), Up and Enter on Install installs it for App p
 `portal` persona with a Nuntius fetcher of the network's own; the window shows the page's form, the gate types a room,
 ticks the terms and presses Connect, the fixture server gets `session=a1b2c3&room=412&terms=yes&connect=1` and its 303
 page shows, `confined-15-portal-form.png`, `confined-16-portal-online.png`; touching the online file closes the window
-and ends `PORTAL_WATCH`). 130/130 before that, with a download (the survey PDF: Save, written by portcullisd's
+and ends `PORTAL_WATCH`). `PORTAL_LAN=1` runs that section on atrium-net's simulated portal LAN instead (a
+second NIC on `atrium-net/sim/lan.py`, its log `lan.log` in the out dir; atrium-net with its probe and `--no-mdns` on
+vtnet1, local-unbound, atrium-netconf's sockets for portcullisd): the window opens at the router's
+`/login?from=atrium`, Accept and connect sends the form, lan.py counts `portal_accept`, atrium-net's probe sees the
+web and the window closes; the section puts vtnet1, the default route and resolv.conf back. 141/141 on 2026-11-18
+(`confined-15-portal-lan.png`, `confined-16-portal-lan-online.png`). 130/130 before that, with a download (the survey PDF: Save, written by portcullisd's
 `SaveDownload` into navtest's Downloads 0660 with its origin; Open, through `OpenDownload` into org.test.pdfview, an
 open-probe for application/pdf, read-only, nothing written). 122/122 before that, with printing (the print sheet,
 `atrium-prelum-sheet` as `_prelum-sheet` 65046 with no prelumd, provides Limen's `print` role; Ctrl-P in the Personal

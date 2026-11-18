@@ -61,9 +61,10 @@ pub fn write_request_range(w: &mut impl Write, host_header: &str, path_and_query
                            range: Option<(u64, u64)>) -> io::Result<()> {
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let range = match range { Some((s, n)) if n > 0 => format!("Range: bytes={s}-{}\r\n", s + n - 1), _ => String::new() };
-    write!(w, "GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
+    // One write (see write_request_full).
+    w.write_all(format!("GET {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
                User-Agent: atrium-navigator-fetch/0.1\r\nAccept: */*\r\n\
-               Accept-Encoding: identity\r\n{range}Connection: {conn}\r\n\r\n")?;
+               Accept-Encoding: identity\r\n{range}Connection: {conn}\r\n\r\n").as_bytes())?;
     w.flush()
 }
 
@@ -268,12 +269,16 @@ pub fn write_request_full(w: &mut impl Write, host_header: &str, path_and_query:
         Some((ct, b)) => format!("Content-Type: {}\r\nContent-Length: {}\r\n", clean(ct), b.len()),
         None => String::new(),
     };
-    write!(w, "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
+    // One write for the whole request: `write!` straight to a socket sends
+    // each piece as its own segment, which simple servers (a portal's
+    // router) read as a request cut short.
+    let mut req = format!("{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\n\
                User-Agent: atrium-navigator-fetch/0.1\r\nAccept: {accept}\r\n\
-               Accept-Encoding: identity\r\n{range}{if_range}{body}Connection: close\r\n\r\n")?;
+               Accept-Encoding: identity\r\n{range}{if_range}{body}Connection: close\r\n\r\n").into_bytes();
     if let Some((_, b)) = post {
-        w.write_all(b)?;
+        req.extend_from_slice(b);
     }
+    w.write_all(&req)?;
     w.flush()
 }
 
