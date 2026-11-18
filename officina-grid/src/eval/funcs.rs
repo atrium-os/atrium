@@ -601,6 +601,19 @@ fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
             return n(a.sum);
         }
     }
+    if let Some(b) = crit.bound() {
+        let built = ifcache::lookup_sorted((vec![range], target), &[], &[b], true, |emit| {
+            pairs(c, &range, target.as_ref(), false, &mut |x, y| {
+                if let Value::Num(x) = x {
+                    emit(vec![], *x, if let Value::Num(z) = y { Some(z) } else { None });
+                }
+            });
+            true
+        });
+        if let Some(a) = built {
+            return n(a.sum);
+        }
+    }
     pairs(c, &range, target.as_ref(), crit.matches_empty(), &mut |x, y| {
         if crit.test(x) {
             if let Value::Num(z) = y {
@@ -614,6 +627,50 @@ fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
 /// SUMIFS / COUNTIFS / AVERAGEIF(S): walks the first criteria range (stored cells, or all
 /// cells when an empty cell can match) and tests the others at the same offsets.
 fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn FnMut(Value)) -> Result<Option<ifcache::Agg>, ErrorKind> {
+    multi_if_with(c, value_range, pairs_args, true, f)
+}
+
+/// Ordered criteria on one range, with equality criteria on any others:
+/// answered from that range's numbers sorted once (see [`ifcache::lookup_sorted`]).
+fn sorted_if(c: &Ctx, value_range: Option<Rect>, crits: &[(Rect, Criterion)], sum: bool) -> Option<ifcache::Agg> {
+    let mut on: Option<Rect> = None;
+    let mut bounds = Vec::new();
+    let (mut eq_rects, mut keys) = (Vec::new(), Vec::new());
+    for (r, cr) in crits {
+        if let Some(b) = cr.bound() {
+            if on.is_some_and(|o| o != *r) {
+                return None;
+            }
+            on = Some(*r);
+            bounds.push(b);
+        } else {
+            keys.push(cr.eq_key()?);
+            eq_rects.push(*r);
+        }
+    }
+    let on = on?;
+    let shape = (std::iter::once(on).chain(eq_rects.iter().copied()).collect(), value_range);
+    ifcache::lookup_sorted(shape, &keys, &bounds, sum, |emit| {
+        let Some(cl) = c.clip(&on) else { return true };
+        c.wb.each(&cl, &mut |row, col, x| {
+            let Value::Num(x) = x else { return };
+            let (dr, dc) = (row - on.r0, col - on.c0);
+            let mut ks = Vec::with_capacity(eq_rects.len());
+            for r in &eq_rects {
+                let Some(k) = Key::of(&c.wb.value(r.sheet, r.r0 + dr, r.c0 + dc)) else { return };
+                ks.push(k);
+            }
+            let v = value_range.and_then(|vr| match c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc) {
+                Value::Num(z) => Some(z),
+                _ => None,
+            });
+            emit(ks, x, v);
+        });
+        true
+    })
+}
+
+fn multi_if_with(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], sum: bool, f: &mut dyn FnMut(Value)) -> Result<Option<ifcache::Agg>, ErrorKind> {
     let mut crits = Vec::new();
     for p in pairs_args.chunks(2) {
         if p.len() < 2 {
@@ -665,6 +722,9 @@ fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn
             return Ok(built);
         }
     }
+    if let Some(a) = sorted_if(c, value_range, &crits, sum) {
+        return Ok(Some(a));
+    }
     let with_empty = fc.matches_empty();
     let mut visit = |row: u32, col: u32, x: &Value| {
         if !fc.test(x) {
@@ -712,7 +772,7 @@ fn countif(c: &Ctx, a: &[Expr]) -> Ev {
 }
 fn countifs(c: &Ctx, a: &[Expr]) -> Ev {
     let mut k = 0u64;
-    if let Some(a) = tri!(multi_if(c, None, a, &mut |_| k += 1)) {
+    if let Some(a) = tri!(multi_if_with(c, None, a, false, &mut |_| k += 1)) {
         return n(a.count as f64);
     }
     n(k as f64)

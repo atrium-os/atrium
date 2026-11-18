@@ -14,6 +14,15 @@ enum Op {
     Ge,
 }
 
+/// Which side of a number an ordered criterion accepts (see [`Criterion::bound`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Side {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
 /// What an equality criterion compares by (see [`Criterion::eq_key`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
@@ -107,6 +116,25 @@ impl Criterion {
             return (!n.is_nan()).then(|| Key::num(n));
         }
         Some(if self.text.is_empty() { Key::Empty } else { Key::Text(self.text.chars().flat_map(char::to_lowercase).collect()) })
+    }
+
+    /// The bound a cell's number must meet, when this criterion is `<`, `<=`,
+    /// `>` or `>=` a number: matching is then "the cell holds a number (not
+    /// text that reads as one) and it meets the bound", so a range can be
+    /// sorted once and every criterion answered by a binary search.
+    pub fn bound(&self) -> Option<(Side, f64)> {
+        if self.boolean.is_some() {
+            return None;
+        }
+        let x = self.num.filter(|x| !x.is_nan())?;
+        let side = match self.op {
+            Op::Lt => Side::Lt,
+            Op::Le => Side::Le,
+            Op::Gt => Side::Gt,
+            Op::Ge => Side::Ge,
+            _ => return None,
+        };
+        Some((side, x))
     }
 
     /// Whether an empty cell can match (so callers walking only stored cells know to
