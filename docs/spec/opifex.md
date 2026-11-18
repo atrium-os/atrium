@@ -598,6 +598,62 @@ Only the few-KB manifests travel to the key, and the `--expect` list makes two b
 before anything is signed (a reproducible-build check). The platform key sits on its own
 token, separate from the three root tokens.
 
+### 10.5 Rebuild from source (accepted 2026-11-18)
+
+For people who would rather run what they built themselves. Not a ports tree and not a
+build system of Atrium's own: the release says what it was built from, and a workspace
+builds it (decision 7 stands: source builds belong to workspaces).
+
+**What a release names** (in its catalog entry, so the catalog's signature covers it):
+
+- `source`: a git URL and a full commit id;
+- `lock`: the SHA-256 of the `Cargo.lock` at that commit (or the language's lock file);
+- `toolchain`: the toolchain layers and their versions (§8.3), e.g. `rust 1.91.0`,
+  `c-dev 2026.11`;
+- `vendor` (optional): the SHA-256 and URL of a `cargo vendor` tarball, for a rebuild that
+  must not depend on crates.io still serving every crate;
+- `packages` (rare): FreeBSD packages outside the layers, each with an exact version and
+  hash. Atrium's own tools need none: no crate of ours links a system C library; the few
+  that compile C (`ring`, `zstd-sys`, `spirv-tools-sys`) carry it inside the crate, pinned
+  by the lock file, and need only the layer's compiler.
+
+**What a rebuild does** (`opifex source <id>`, or *Rebuild from source* on the sheet):
+
+1. Makes a throwaway workspace with the named layers, network `registries` limited to
+   the source's git host, crates.io (or the vendor URL) and the SDK registry.
+2. Clones the commit, checks the lock file's hash, and builds with
+   `cargo atrium bundle --locked` (or the release's own build line), `SOURCE_DATE_EPOCH`
+   set from the commit and the workspace path fixed, so builds are reproducible.
+3. Compares the result's `content.index` hash with the release's:
+   - **the same**: the published `atrium.toml` and its signature are installed over the
+     bundle the person built. The app keeps its publisher's identity, its Arca items and
+     its updates, and the person has verified the published binary on the way;
+   - **different**, or the person changed the source: the bundle is installed as a dev
+     app (`dev.` id, signed by the machine's dev publisher, §7.4). It works, but Arca,
+     Sigillum and updates don't treat it as the publisher's app. The sheet says which
+     files differ.
+4. The workspace is deleted unless the person keeps it (to change the source, say).
+
+**Dependencies.** Atrium apps don't link one another (they use system services), so there
+is no build graph between packages to solve. A missing dependency is reported by name
+(a crate no longer served, a package version gone) rather than replaced by a newer one.
+
+**Publishing side.** `opifex catalog add` fills `source`, `lock` and `toolchain` from the
+bundle's workspace when the build ran in one; the Atrium catalog's CI does the same, and
+§10.4's second build is the same check run by Atrium.
+
+**Release packaging.** Atrium's own app and service releases are built by this same path,
+not by a separate release script: a clean workspace from the named layers, `--locked`,
+`SOURCE_DATE_EPOCH`, the fixed path. The build only makes the bundle; signing is a
+separate step afterwards with the release keys (key ceremony, §10.4), on a machine that
+never runs the build. Because the shipped bundle and a person's rebuild come from one
+recipe, a rebuild that matches is a check anyone can run on Atrium's releases. The base
+system (kernel, world, base daemons) stays on `make.py` (decision 12) and is outside this.
+
+Not decided: whether a catalog must name its source for every release (recommend:
+required for the Atrium catalog, optional for third-party catalogs, shown on the sheet as
+"source not published" when absent).
+
 ## 11. Updates
 
 - `opifex-fetch` syncs the catalog once a day, at a random time, and when the person opens
@@ -1083,3 +1139,9 @@ opifexd, and `fdpass`.)
     yes.*
 15. **Build C0 now** (it is shared with the layer work and fixes a real gap: files are not
     covered by any signature today), the rest after acceptance. *Recommend yes.*
+16. **Rebuild from source** as in §10.5: releases name source commit, lock hash, toolchain
+    layers (and optional vendor tarball, extra packages); a workspace rebuilds; an
+    identical result keeps the publisher's identity, any other installs as a dev app. No
+    ports tree or Atrium build system. Source required for the Atrium catalog, optional
+    for third-party ones. Atrium's own app releases are packaged by the same path, then
+    signed as a separate step. *Accepted 2026-11-18.*

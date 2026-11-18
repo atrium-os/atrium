@@ -9,6 +9,7 @@
 //! portcullisd's socket (the Apps page; portcullis_ipc::resolve_socket_path),
 //! `CURIA_BT_SOCK` (vinculumd's control socket,
 //! /atrium/sockets/bluetooth-control/control.sock),
+//! `CURIA_PRINT_SOCK` (prelumd, /atrium/sockets/print/print.sock),
 //! `CURIA_SIZE` (960x720), `CURIA_SECS` (quit after, for checks).
 
 use std::path::PathBuf;
@@ -514,7 +515,10 @@ fn main() {
     let (atx, arx) = channel();
     let apps_refreshing = Arc::new(AtomicBool::new(false));
     let mut next_apps = Instant::now();
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone() };
+    let printers = Mutable::with_dirty(curia::printers::PrintersPage::default(), dirty.clone());
+    let (prtx, prrx) = channel();
+    let mut next_printers = Instant::now();
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())) };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -680,6 +684,35 @@ fn main() {
             }
             for w in wants {
                 apps_work(w, atx.clone(), apps_refreshing.clone());
+            }
+        }
+        // The Printers page: asked again every 5 s while it shows, and
+        // after each change.
+        {
+            let mut pp = printers.get_cloned();
+            let mut pch = false;
+            while let Ok(g) = prrx.try_recv() {
+                pp.apply(g);
+                pch = true;
+            }
+            if which.get() == curia::view::Which::Printers {
+                if Instant::now() >= next_printers {
+                    next_printers = Instant::now() + Duration::from_secs(5);
+                    pp.refresh();
+                }
+            } else {
+                next_printers = Instant::now();
+            }
+            let wants = pp.take_wants();
+            let names: Vec<(u32, String)> = match &pp.printers {
+                Some(Ok(v)) => v.iter().map(|p| (p.id, p.name.clone())).collect(),
+                _ => Vec::new(),
+            };
+            if pch || !wants.is_empty() {
+                printers.set(pp);
+            }
+            for w in wants {
+                curia::printers::work(w, names.clone(), prtx.clone());
             }
         }
         let mut changed = false;

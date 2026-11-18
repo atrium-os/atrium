@@ -6,10 +6,13 @@
 //! prelumctl add URI [NAME]                 ipps://host[:port]/path, ipp://…, or a host
 //! prelumctl remove|repin|identify|refresh PRINTER
 //! prelumctl rename PRINTER NAME
+//! prelumctl share|unshare PRINTER
+//! prelumctl history | clear-history
 //! prelumctl print FILE.pdf --printer PRINTER [--copies N] [--sides one|long|short]
 //!     [--gray] [--media KEYWORD] [--quality draft|normal|high] [--pages 1-3]
 //!     [--per-sheet 1|2|4] [--scale fit|shrink|PERCENT] [--title T] [--wait]
 //! prelumctl jobs
+//! prelumctl watch [GENERATION]            the jobs once they change (at most 25 s)
 //! prelumctl cancel|release JOB
 //! prelumctl preview FILE.pdf OUT_DIR [--media KEYWORD] [--pages 1-3] [--per-sheet N]
 //!     [--first N] [--count N] [--longest PX]  sheets as OUT_DIR/sheet-N.ppm
@@ -27,7 +30,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use prelum_ipp_codec::ops::{ColorMode, Quality, Sides};
-use prelum_proto::print::{client::Client, Add, Layout, Phase, PreviewReq, Print, Printer, Rename, Scale};
+use prelum_proto::print::{client::Client, Add, Job, Layout, Phase, PreviewReq, Print, Printer, Rename, Scale, Share};
 
 const SOCKET: &str = "/atrium/sockets/print/print.sock";
 
@@ -43,7 +46,8 @@ fn show(p: &Printer) {
         (_, _, None) => "offline".to_string(),
         (_, _, Some(s)) => format!("{s:?}").to_lowercase(),
     };
-    println!("{:>3}  {}  [{}]{}", p.id, p.name, state, if p.new { " new" } else { "" });
+    let whose = if p.shared { " shared".to_string() } else if p.persona.is_empty() { String::new() } else { format!(" {}'s", p.persona) };
+    println!("{:>3}  {}  [{}]{}{}", p.id, p.name, state, if p.new { " new" } else { "" }, whose);
     println!("     {}  {}", p.uri, if p.tls { "encrypted" } else { "NOT ENCRYPTED" });
     if let Some(f) = &p.fingerprint {
         println!("     key {f}");
@@ -60,6 +64,11 @@ fn show(p: &Printer) {
     for r in &p.reasons {
         println!("     {:?} ({:?})", r.reason, r.severity);
     }
+}
+
+fn show_job(j: &Job) {
+    let alert = j.alert.map(|a| format!("  alert {a:?} since {}", j.alert_since)).unwrap_or_default();
+    println!("{:>4}  printer {}  {:?}  {}/{}  {}  {}{}", j.id, j.printer, j.phase, j.sheets, j.of, j.title, j.message, alert);
 }
 
 fn find(c: &mut Client, which: &str) -> Result<u32, String> {
@@ -149,9 +158,33 @@ fn main() -> ExitCode {
             println!("{}", c.rename(&Rename { printer: id, name: arg(2) }).map_err(|e| e.to_string())?);
             Ok(())
         }
+        "share" | "unshare" => {
+            let id = find(&mut c, &arg(1))?;
+            println!("{}", c.share(&Share { printer: id, shared: cmd == "share" }).map_err(|e| e.to_string())?);
+            Ok(())
+        }
+        "history" => {
+            for e in c.history().map_err(|e| e.to_string())? {
+                let persona = if e.persona.is_empty() { "Personal" } else { &e.persona };
+                println!("{:>4}  {}  {:?}  {} sheets  {}  on {}  ({persona})  {}", e.job, e.at, e.result, e.sheets, e.title, e.printer, e.message);
+            }
+            Ok(())
+        }
+        "clear-history" => {
+            println!("{}", c.clear_history().map_err(|e| e.to_string())?);
+            Ok(())
+        }
         "jobs" => {
             for j in c.jobs().map_err(|e| e.to_string())? {
-                println!("{:>4}  printer {}  {:?}  {}/{}  {}  {}", j.id, j.printer, j.phase, j.sheets, j.of, j.title, j.message);
+                show_job(&j);
+            }
+            Ok(())
+        }
+        "watch" => {
+            let w = c.watch(arg(1).parse().unwrap_or(0)).map_err(|e| e.to_string())?;
+            println!("generation {}", w.generation);
+            for j in &w.jobs {
+                show_job(j);
             }
             Ok(())
         }

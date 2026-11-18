@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub rows: Vec<f64>,
     /// Row by row.
     pub cells: Vec<Option<Cell>>,
+    /// Merged areas, `[r0, c0, r1, c1]` inclusive, cut to the snapshot.
+    pub merges: Vec<[u32; 4]>,
 }
 
 fn srgb(c: Color) -> u32 {
@@ -56,7 +58,13 @@ pub fn cell_of(v: CellView) -> Cell {
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
     let (rows, cols, name, col_px, row_px) = {
         let d = doc.borrow();
-        let (r, c) = d.wb.extent(d.sheet);
+        let (mut r, mut c) = d.wb.extent(d.sheet);
+        // A merged area that starts in the used range counts in full.
+        let (r0, c0) = (r, c);
+        for m in d.wb.merges(d.sheet).iter().filter(|m| m.r0 < r0 && m.c0 < c0) {
+            r = r.max(m.r1 + 1);
+            c = c.max(m.c1 + 1);
+        }
         let sh = d.wb.sheet(d.sheet);
         let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
         let col_px: Vec<f64> = (0..c).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect();
@@ -79,20 +87,33 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             cells.push(v.map(cell_of));
         }
     }
+    // A merged area whose first cell shows something is printed whole.
+    let merges = doc.borrow().wb.merges(doc.borrow().sheet).to_vec();
+    for m in &merges {
+        if cells[(m.r0 * cols + m.c0) as usize].is_some() {
+            last_r = last_r.max((m.r1 + 1).min(rows));
+            last_c = last_c.max((m.c1 + 1).min(cols));
+        }
+    }
+    let merges: Vec<[u32; 4]> = merges
+        .iter()
+        .filter(|m| m.r0 < last_r && m.c0 < last_c)
+        .map(|m| [m.r0, m.c0, m.r1.min(last_r.saturating_sub(1)), m.c1.min(last_c.saturating_sub(1))])
+        .collect();
     // Only up to the last cell that shows anything.
     let mut kept = Vec::with_capacity((last_r * last_c) as usize);
     for r in 0..last_r {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept })
+    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges })
 }
 
 /// The snapshot as PDF on paper `w` × `h` points.
 pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String> {
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
-    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true };
+    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone() };
     officina_pdf::sheet::print(&sheet, &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
@@ -116,6 +137,24 @@ mod tests {
         assert_eq!(s.cols[0], 64.0);
         let pdf = pdf(&s, 595.0, 842.0, "Q3").unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn a_merged_title_is_printed_whole() {
+        use officina_grid::addr::Rect;
+        use officina_grid::ops::GridOp;
+        let doc = Rc::new(RefCell::new(Doc::new("Q3")));
+        {
+            let mut d = doc.borrow_mut();
+            d.type_into(0, 0, "Quarter");
+            d.type_into(2, 1, "5");
+            d.run("Merge Cells", vec![GridOp::Merges { sheet: 0, list: vec![Rect { sheet: 0, r0: 0, c0: 0, r1: 0, c1: 3 }] }]);
+        }
+        let s = snapshot(&doc).unwrap();
+        // The title reaches D, past the last value (B3).
+        assert_eq!((s.rows.len(), s.cols.len()), (3, 4));
+        assert_eq!(s.merges, vec![[0, 0, 0, 3]]);
+        assert!(pdf(&s, 595.0, 842.0, "Q3").unwrap().starts_with(b"%PDF"));
     }
 
     #[test]

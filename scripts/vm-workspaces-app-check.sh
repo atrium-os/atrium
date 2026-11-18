@@ -168,6 +168,25 @@ press 457 182
 waitfor "row scratch | cut -f4" "none" 30 && ok "Scratch: None" || bad "network: $(row scratch)"
 press 347 182
 waitfor "row scratch | cut -f4" "outbound" 30 && ok "Scratch: Outbound again" || bad "network: $(row scratch)"
+# Registries (dev-tools.md §5.2): the proxy's host list, edited in place.
+# Layout: the network row's top is 166; the list starts at y 228, a row
+# every 26 (8 default hosts); the field and Add sit below it.
+press 402 182          # Network: Registries
+waitfor "row scratch | cut -f4" "registries" 30 && ok "Scratch: Registries" || bad "network: $(row scratch)"
+check "the default hosts listed" "8 (default)" "$(row scratch | cut -f8 | sed 's/^hosts=//' | awk -F' ' '{n=split($1,a,","); print n, $2}')"
+shot registries-1
+press 407 452          # the host field
+typ "proxy.golang.org"
+press 572 452          # Add
+waitfor "row scratch | cut -f8" "proxy.golang.org" 30 && ok "a host added" || bad "hosts: $(row scratch | cut -f8)"
+check "the list is its own now" "9" "$(row scratch | cut -f8 | sed 's/^hosts=//' | awk -F, '{print NF}')"
+shot registries-2
+press 572 232          # Remove crates.io
+waitfor "row scratch | cut -f8 | grep -c 'hosts=crates.io,' || true" "^0$" 30 && ok "a host removed" || bad "hosts: $(row scratch | cut -f8)"
+press 697 452          # Use the defaults
+waitfor "row scratch | cut -f8" "(default)" 30 && ok "back to the defaults" || bad "hosts: $(row scratch | cut -f8)"
+press 347 182
+waitfor "row scratch | cut -f4" "outbound" 30 && ok "Scratch: Outbound once more" || bad "network: $(row scratch)"
 
 echo "=== open and stop"
 press 367 104

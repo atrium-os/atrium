@@ -272,6 +272,8 @@ impl Daemon {
             raster_only: false,
             titles_off: false,
             jobs_sent: 0,
+            persona: String::new(),
+            shared: false,
             info: PrinterInfo::default(),
         };
         let (info, key) = self.learn_within(&s, Some(CONFIRM_LIMIT)).ok()?;
