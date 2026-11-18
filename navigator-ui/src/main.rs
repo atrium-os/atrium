@@ -80,6 +80,11 @@ fn worker_channel() -> Option<std::os::unix::net::UnixStream> {
 }
 
 fn main() -> std::io::Result<()> {
+    // navigatord passes on only NAVIGATOR_UI_* settings: this one turns on
+    // Pergola's log of each line of text sent to frescod.
+    if std::env::var_os("NAVIGATOR_UI_WIRE_LOG").is_some() {
+        std::env::set_var("PERGOLA_WIRE_LOG", "1");
+    }
     let channel = worker_channel();
     if let Some(p) = navigator_ui::shell::window_persona() {
         eprintln!("navigator-ui: window persona {p}");

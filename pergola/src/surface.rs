@@ -828,6 +828,15 @@ impl Surface for FrescoSurface {
                 // this id in the group's device coordinates.
                 let font_id = self.font_id(&style.family)?;
                 let color = [style.color.r, style.color.g, style.color.b, style.color.a];
+                // PERGOLA_WIRE_LOG: each line of text as it goes to frescod,
+                // to trace one that does not show.
+                static WIRE_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *WIRE_LOG.get_or_init(|| std::env::var_os("PERGOLA_WIRE_LOG").is_some()) {
+                    eprintln!(
+                        "pergola: window {} text {} {content:?} font {font_id} {} px at {:.1},{:.1} in {:?} order {order} colour {color:?}",
+                        self.window_id, id.0, style.em() * k, rect.x() * k, rect.y() * k, group.map(|g| g.0),
+                    );
+                }
                 // The baseline on a device pixel; x stays fractional.
                 self.conn.text_run_install(
                     id.0, font_id, style.em() * k,
