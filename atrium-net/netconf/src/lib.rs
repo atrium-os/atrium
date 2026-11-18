@@ -14,6 +14,7 @@
 //! | `network-wifi` | those of `network-read` with the network's name, `WIFI_PROFILES`, `WIFI_JOIN`, `WIFI_LEAVE`, `WIFI_FORGET`, `WIFI_SET_PROFILE` |
 //! | `wifi-nearby` | those of `network-read`, `WIFI_NEARBY` (SSID, security, signal bars; never BSSIDs). Nearby networks tell where you are, so it is its own capability with its own consent line |
 //! | `network-configure` | those of `network-read`, `SET_COUNTRY`, `SET_STATIC`, `SET_DNS`, `SET_DNS_TLS`. Restricted to the settings app |
+//! | `network-portal` | `PORTAL_INFO`, `PORTAL_WATCH`: what a captive-portal sign-in window needs (atrium-net.md §8.1). Root only (the portal launcher in portcullisd), never granted to an app |
 //! | `print-discovery` | `PRINT_DISCOVERY`: printer discovery's two mDNS sockets on the active interface (printing.md §7.1). Root only (prelumd), never granted to an app |
 //!
 //! Every reply (`IS_RESPONSE`) is `u8 status`, then on `OK` the postcard
@@ -51,6 +52,12 @@ pub mod op {
     /// interface with TTL 255, no loopback, connected to 224.0.0.251:5353).
     /// `FAILED` "no-network" when no interface has an IPv4 address.
     pub const PRINT_DISCOVERY: u16 = 0x50;
+    /// [`PortalInfo`] for the egress interface; `FAILED` "no-network"
+    /// without one.
+    pub const PORTAL_INFO: u16 = 0x60;
+    /// `bool`: while on (10 minutes at most), the egress interface is
+    /// re-probed every 5 s, so a sign-in shows as `online` at once.
+    pub const PORTAL_WATCH: u16 = 0x61;
     pub const EV: u16 = 0x80;
 }
 
@@ -79,10 +86,17 @@ pub enum Grant {
     Configure,
     /// Root only: its socket is mode 0600 and the front checks the peer.
     PrintDiscovery,
+    /// Root only, like `PrintDiscovery`: the portal launcher.
+    Portal,
 }
 
 impl Grant {
-    pub const ALL: [Grant; 6] = [Grant::Read, Grant::Details, Grant::Wifi, Grant::Nearby, Grant::Configure, Grant::PrintDiscovery];
+    pub const ALL: [Grant; 7] = [Grant::Read, Grant::Details, Grant::Wifi, Grant::Nearby, Grant::Configure, Grant::PrintDiscovery, Grant::Portal];
+
+    /// Root's alone: no jail is ever given the socket's directory.
+    pub fn root_only(self) -> bool {
+        matches!(self, Grant::PrintDiscovery | Grant::Portal)
+    }
 
     /// The capability's name, which is also its socket directory and file
     /// (`/atrium/sockets/<name>/<name>.sock`).
@@ -94,6 +108,7 @@ impl Grant {
             Grant::Nearby => "wifi-nearby",
             Grant::Configure => "network-configure",
             Grant::PrintDiscovery => "print-discovery",
+            Grant::Portal => "network-portal",
         }
     }
 
@@ -106,6 +121,7 @@ impl Grant {
             WIFI_NEARBY => self == Grant::Nearby,
             SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS => self == Grant::Configure,
             PRINT_DISCOVERY => self == Grant::PrintDiscovery,
+            PORTAL_INFO | PORTAL_WATCH => self == Grant::Portal,
             _ => false,
         }
     }
@@ -194,6 +210,33 @@ pub struct Routes {
     /// Set by `SET_DNS_TLS`: `own_dns` are asked only over TLS, checked
     /// against this name.
     pub dns_tls: Option<String>,
+}
+
+/// What a captive-portal sign-in window needs (`PORTAL_INFO`): where to
+/// start, and the network's own DNS servers to ask instead of unbound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalInfo {
+    pub iface: String,
+    /// The Wi-Fi network's name; None on Ethernet.
+    pub ssid: Option<Vec<u8>>,
+    pub online: Online,
+    /// The probe's `Location`, if it saw one.
+    pub portal: Option<String>,
+    pub router: Option<String>,
+    /// The network's DHCP and RA DNS servers (not link-local ones, which
+    /// need a zone), never the machine's own (`SET_DNS`).
+    pub dns: Vec<String>,
+    /// `PORTAL_WATCH` is on.
+    pub watching: bool,
+}
+
+impl PortalInfo {
+    /// Where the window starts: the portal's page, else plain HTTP to the
+    /// router (a portal catches any plain-HTTP request; no third party
+    /// learns of it).
+    pub fn start_url(&self) -> Option<String> {
+        self.portal.clone().or_else(|| self.router.as_ref().map(|r| format!("http://{r}/")))
+    }
 }
 
 /// `SET_DNS_TLS`: DNS over TLS (RFC 7858) to these servers, which must
@@ -419,6 +462,12 @@ pub mod server {
         fn set_dns_tls(&self, _t: DnsTls) -> Res<()> {
             Err(Fail::new(status::UNSUPPORTED, "no DNS over TLS here"))
         }
+        fn portal_info(&self) -> Res<PortalInfo> {
+            Err(Fail::new(status::UNSUPPORTED, "no portal sign-in here"))
+        }
+        fn portal_watch(&self, _on: bool) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no portal sign-in here"))
+        }
         /// The active interface's name and the two mDNS sockets (receive, send).
         fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
             Err(Fail::new(status::UNSUPPORTED, "no printer discovery here"))
@@ -501,6 +550,8 @@ pub mod server {
                     b.set_profile(x)
                 })),
                 op::WIFI_NEARBY => enc(&b.nearby()),
+                op::PORTAL_INFO => enc(&b.portal_info()),
+                op::PORTAL_WATCH => enc(&arg::<bool>(p).and_then(|on| b.portal_watch(on))),
                 op::PRINT_DISCOVERY => match b.print_discovery() {
                     Ok((name, fds)) => {
                         use std::os::fd::AsRawFd;
@@ -606,6 +657,13 @@ pub mod client {
         }
         pub fn interfaces(&mut self) -> Res<Vec<Iface>> {
             self.call(op::INTERFACES, &())
+        }
+        /// `network-portal` only.
+        pub fn portal_info(&mut self) -> Res<PortalInfo> {
+            self.call(op::PORTAL_INFO, &())
+        }
+        pub fn portal_watch(&mut self, on: bool) -> Res<()> {
+            self.call(op::PORTAL_WATCH, &on)
         }
         pub fn routes(&mut self) -> Res<Routes> {
             self.call(op::ROUTES, &())

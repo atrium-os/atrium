@@ -400,6 +400,11 @@ pub struct Capabilities {
     /// (atrium-net.md §7.1). Restricted to the settings app.
     #[serde(rename = "network-configure")]
     pub network_configure: Option<bool>,
+    /// Open a captive portal's sign-in window (atrium-net.md §8.1): a
+    /// fetcher on the network's own DNS that may reach private addresses
+    /// (`OpenPortalFetcher`). Restricted to the Navigator.
+    #[serde(rename = "network-portal")]
+    pub network_portal: Option<bool>,
     /// navigatord's page socket (`navigator-page/`, navigator-ui.md §2.1):
     /// the Navigator's doc-viewer child redeems a page's one-shot ticket
     /// there for its recording, and can do nothing else on it. Restricted
@@ -540,7 +545,7 @@ impl Capabilities {
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
             ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
             ("audio-device", self.audio_device), ("net-fetch", self.net_fetch),
-            ("protected-media", self.protected_media),
+            ("protected-media", self.protected_media), ("network-portal", self.network_portal),
         ];
         all.into_iter().filter(|(_, v)| *v == Some(true)).map(|(n, _)| n).collect()
     }
@@ -763,6 +768,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         net_fetch:        ovr.net_fetch.or(base.net_fetch),
         net_fetch_sites:  ovr.net_fetch_sites.clone().or_else(|| base.net_fetch_sites.clone()),
         protected_media:  ovr.protected_media.or(base.protected_media),
+        network_portal:   ovr.network_portal.or(base.network_portal),
         embeds:           ovr.embeds.clone().or_else(|| base.embeds.clone()),
         arca:             ovr.arca.or(base.arca),
         syscalls:         ovr.syscalls.clone().or_else(|| base.syscalls.clone()),

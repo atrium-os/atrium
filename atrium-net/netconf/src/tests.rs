@@ -80,6 +80,25 @@ fn grants() {
     assert!(Grant::Nearby.allows(WIFI_NEARBY) && !Grant::Nearby.allows(WIFI_JOIN));
     assert!(!Grant::Wifi.allows(SET_COUNTRY) && Grant::Configure.allows(SET_COUNTRY));
     assert!(!Grant::Configure.allows(WIFI_JOIN));
+    for g in Grant::ALL {
+        assert_eq!(g.allows(PORTAL_INFO) || g.allows(PORTAL_WATCH), g == Grant::Portal, "{g:?}");
+        assert_eq!(g.root_only(), matches!(g, Grant::Portal | Grant::PrintDiscovery));
+    }
+}
+
+#[test]
+fn portal_info_from_lines() {
+    let p = lines::portal(&status_lines()).unwrap();
+    assert_eq!((p.iface.as_str(), p.ssid.as_deref(), p.online, p.watching), ("wlan0", Some(&b"aura-test"[..]), Online::Captive, false));
+    assert_eq!((p.portal.as_deref(), p.router.as_deref(), p.dns.clone()), (Some("http://x/"), Some("10.77.0.1"), vec!["10.77.0.1".to_string()]));
+    assert_eq!(p.start_url().as_deref(), Some("http://x/"));
+    let p = PortalInfo { portal: None, ..p };
+    assert_eq!(p.start_url().as_deref(), Some("http://10.77.0.1/"), "no Location: the router, never a third party");
+    // RA servers too, but not link-local ones; the watch flag.
+    let v: Vec<Line> = vec![parse("iface name=em0 mac=x state=bound addr=10.0.0.5/24 router=10.0.0.1 dns=10.0.0.1 dns6=fd00::53,fe80::1 link=up internet=captive egress=1 portal_watch=1")];
+    let p = lines::portal(&v).unwrap();
+    assert_eq!((p.dns, p.ssid, p.watching), (vec!["10.0.0.1".to_string(), "fd00::53".into()], None, true));
+    assert!(lines::portal(&[parse(&STATUS[1].replace(" egress=1", ""))]).is_none());
 }
 
 #[derive(Default)]
@@ -140,6 +159,13 @@ impl Backend for Fake {
     }
     fn set_dns_tls(&self, t: DnsTls) -> Res<()> {
         self.log.lock().unwrap().push(format!("dns-tls {:?} {}", t.servers, t.name));
+        Ok(())
+    }
+    fn portal_info(&self) -> Res<PortalInfo> {
+        lines::portal(&status_lines()).ok_or_else(|| Fail::new(status::FAILED, "no-network"))
+    }
+    fn portal_watch(&self, on: bool) -> Res<()> {
+        self.log.lock().unwrap().push(format!("portal-watch {on}"));
         Ok(())
     }
     fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
@@ -273,6 +299,12 @@ fn over_sockets() {
     assert_eq!(s, Status::offline());
     let mut ch = c(Grant::Wifi).subscribe().unwrap();
     assert_eq!(ch.next().unwrap().ssid, Some(b"aura-test".to_vec()));
+
+    // Portal sign-in: its own socket only.
+    assert_eq!(c(Grant::Details).portal_info().unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(c(Grant::Portal).portal_info().unwrap().start_url().as_deref(), Some("http://x/"));
+    c(Grant::Portal).portal_watch(true).unwrap();
+    assert_eq!(fake.log.lock().unwrap().last().map(String::as_str), Some("portal-watch true"));
 
     // Printer discovery: its own socket only, the two fds in order.
     assert_eq!(c(Grant::Configure).print_discovery().unwrap_err().0, status::NOT_ALLOWED);

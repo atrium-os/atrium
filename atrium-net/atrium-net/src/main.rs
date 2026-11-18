@@ -115,6 +115,9 @@ mod imp {
     /// A dead probe process is started again after this long.
     const PROBE_AGAIN_MS: u64 = 10_000;
     const UNBOUND_CHECK_MS: u64 = 10_000;
+    /// While a portal sign-in window is open (§8.1).
+    const PORTAL_PROBE_MS: u64 = 5_000;
+    const PORTAL_WATCH_MS: u64 = 10 * 60_000;
 
     /// The root zone's forwarders in `unbound-control list_forwards` output
     /// (". IN forward A B ..."), without scope suffixes.
@@ -347,6 +350,9 @@ mod imp {
         /// (and lost what it was told, which list_forwards can't show for
         /// TLS).
         unbound_up: u64,
+        /// A portal sign-in window is open (§8.1): probe every
+        /// PORTAL_PROBE_MS until online, or until this time.
+        portal_watch_until: Option<u64>,
         egress: Egress,
         /// The default route we installed (interface, router), and the
         /// interface last announced as the egress.
@@ -955,8 +961,18 @@ mod imp {
             }
             i.probe_fails = if inet == Inet::No { i.probe_fails.saturating_add(1) } else { 0 };
             i.next_probe = now + if inet == Inet::Yes { every } else { PROBE_RETRY_MS.min(every) };
+            let watching = self.portal_watch_until.is_some_and(|t| now < t);
+            let i = &mut self.ifs[k];
+            if watching && inet != Inet::Yes {
+                i.next_probe = now + PORTAL_PROBE_MS;
+            }
             let old = i.inet;
             i.inet = inet;
+            if watching && inet == Inet::Yes && self.announced == Some(k) {
+                self.portal_watch_until = None;
+                self.log(&format!("{}: online: portal watch ends", self.ifs[k].name));
+            }
+            let i = &mut self.ifs[k];
             if old == inet && i.portal == portal {
                 return;
             }
@@ -1376,6 +1392,20 @@ mod imp {
                     self.forward();
                     ok()
                 }
+                // A portal sign-in window opened or closed (§8.1).
+                "portal-watch" => {
+                    let now = self.now();
+                    if l.get("on") == Some("1") {
+                        self.portal_watch_until = Some(now + PORTAL_WATCH_MS);
+                        if let Some(k) = self.announced {
+                            self.ifs[k].next_probe = now;
+                        }
+                        self.log(&format!("portal watch on{}", if self.prober.is_none() { " (no probe: nothing to watch with)" } else { "" }));
+                    } else if self.portal_watch_until.take().is_some() {
+                        self.log("portal watch off");
+                    }
+                    ok()
+                }
                 "wifi-forget" => {
                     let Some(s) = ssid() else { return err("bad-ssid") };
                     let _ = self.keys_call(&Line::new("forget").with_hex("ssid", &s));
@@ -1446,6 +1476,9 @@ mod imp {
                 }
                 if k.is_some() && self.announced == k {
                     l = l.with("egress", 1);
+                    if self.portal_watch_until.is_some() {
+                        l = l.with("portal_watch", 1);
+                    }
                 }
                 if self.mdns.as_ref().is_some_and(|m| m.1 == i.name) {
                     l = l.with("mdns", 1);
@@ -1762,6 +1795,7 @@ mod imp {
             own_dns,
             dns_tls,
             unbound_up: 0,
+            portal_watch_until: None,
             egress: Egress::new(o.ifaces.len()),
             def4: None,
             announced: None,
@@ -2049,6 +2083,10 @@ mod imp {
             }
             net.mlme_connect();
             net.route_default();
+            if net.portal_watch_until.is_some_and(|t| net.now() >= t) {
+                net.portal_watch_until = None;
+                net.log("portal watch: 10 minutes, off");
+            }
             net.probe_tick();
             net.probe_restart();
             net.lease_restart_tick();

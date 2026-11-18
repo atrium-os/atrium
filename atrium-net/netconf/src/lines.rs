@@ -3,7 +3,7 @@
 
 use aura_ipc::Line;
 
-use crate::{bars, Iface, Link, Manual, Nearby, Online, Profile, Routes, Status};
+use crate::{bars, Iface, Link, Manual, Nearby, Online, PortalInfo, Profile, Routes, Status};
 
 /// A fixed setting's fields on a line: `maddr=a.b.c.d/p [mrouter=..]
 /// [mdns=a,b]`.
@@ -85,6 +85,22 @@ pub fn status(lines: &[Line], rssi: Option<i32>) -> Status {
         ssid: if i.wifi { wifi.and_then(|w| w.hex("ssid")) } else { None },
         portal: l.hex("portal").and_then(|p| String::from_utf8(p).ok()),
     }
+}
+
+/// The egress interface as a portal window needs it (atrium-net.md §8.1).
+pub fn portal(lines: &[Line]) -> Option<PortalInfo> {
+    let (i, l) = lines.iter().filter_map(|l| Some((iface(l)?, l))).find(|(i, _)| i.egress)?;
+    let wifi = lines.iter().find(|l| l.verb == "wifi");
+    let dns = i.dns.iter().chain(i.dns6.iter().filter(|a| !a.to_ascii_lowercase().starts_with("fe80"))).cloned().collect();
+    Some(PortalInfo {
+        ssid: if i.wifi { wifi.and_then(|w| w.hex("ssid")) } else { None },
+        online: i.online,
+        portal: l.hex("portal").and_then(|p| String::from_utf8(p).ok()),
+        router: i.router.clone(),
+        dns,
+        watching: l.get("portal_watch") == Some("1"),
+        iface: i.name,
+    })
 }
 
 pub fn routes(lines: &[Line]) -> Routes {

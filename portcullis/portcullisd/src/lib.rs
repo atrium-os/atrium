@@ -25,6 +25,7 @@ pub mod listeners;
 pub mod opens;
 pub mod persona_colours;
 pub mod persona_last;
+pub mod portal;
 /// The manifest trust gate, re-exported so existing call sites keep working.
 /// It lives in `portcullis-trust` so the CLI and `atrium-launch` share it
 /// rather than each carrying their own answer (they did).

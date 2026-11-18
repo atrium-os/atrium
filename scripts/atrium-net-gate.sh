@@ -64,7 +64,7 @@ n0)
     CROSS_RUSTFLAGS=$(set -- env; . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
     (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease -p atrium-netconf -p atrium-mdns >&2)
     R="$ROOT/atrium-net/target/$T/release"
-    { cp "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$ROOT/atrium-net/etc/unbound-atrium-tls.conf" "$R/"; tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl atrium-mdns unbound-atrium-local.conf unbound-atrium-tls.conf; } | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
+    { cp "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$ROOT/atrium-net/etc/unbound-atrium-tls.conf" "$R/"; tar czf - -C "$R" atrium-net atrium-lease atrium-probe atrium-netconf atrium-netctl atrium-mdns unbound-atrium-local.conf unbound-atrium-tls.conf; } | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
 
     pkill -f atrium-net/sim/lan.py 2>/dev/null || true
     python3 "$ROOT/atrium-net/sim/lan.py" "$LEASE_S" > "$LAN_LOG" 2>&1 &
@@ -278,7 +278,7 @@ n0)
         && ok "evil.local AAAA (::1, 2001:db8::1, fe80::1, the prefix's anycast): no address" || fail "evil.local AAAA: $r"
     r=$("$V" 'getent hosts gatebox.local' 2>&1 || true)
     echo "$r" | grep -qE '^(10\.88\.0\.77|fd77:0:0:88::77)[[:space:]]' && ok "programs resolve it too: getent hosts gatebox.local = $r" || fail "getent: $r"
-    "$V" "kill -9 $mp"
+    "$V" "pkill -9 -x atrium-mdns" || true
     i=0; until [ -n "$("$V" 'pgrep -x atrium-mdns' || true)" ] && "$V" 'local-unbound-control flush gatebox.local >/dev/null; local-unbound-control flush_bogus >/dev/null; local-unbound-control flush_negative >/dev/null' && look gatebox.local | grep -q 10.88.0.77; do i=$((i + 1)); [ $i -lt 30 ] || fail "atrium-mdns not back"; sleep 1; done
     ok "atrium-mdns killed: started again (${i} s), atrium-net running"
     u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
@@ -357,6 +357,40 @@ n0)
     i=0; until [ "$(mtu)" = 1500 ] && [ "$(mtu6)" = 1500 ]; do i=$((i + 1)); [ $i -lt 60 ] || fail "MTU stayed: mtu $(mtu) linkmtu $(mtu6) $("$V" 'grep -i mtu /tmp/atrium-net/net.log | tail -n 3')"; sleep 1; done
     "$V" 'grep -q "vtnet1: ResetMtu" /tmp/atrium-net/net.log' \
         && ok "a network without an MTU after a restart: back to 1500 (IPv4 by atrium-net, IPv6 by the next RA)" || fail "no ResetMtu in the log"
+
+    # Captive portal sign-in, atrium-net's part (§8.1): the probe on, the
+    # LAN holding the web behind a portal; network-portal tells a sign-in
+    # window where to start and which DNS to ask; the watch re-probes every
+    # 5 s and ends itself once online.
+    lanctl web-captive >/dev/null
+    "$V" 'id _atrium-probe >/dev/null 2>&1 || pw useradd _atrium-probe -u 65035 -d /nonexistent -s /usr/sbin/nologin -c "atrium-net connectivity probe"
+        pkill -f "atrium-net -v"; sleep 1
+        daemon -f -o /tmp/atrium-net/net.log /tmp/atrium-net/atrium-net -v --iface vtnet1 --capsicum --lease /tmp/atrium-net/atrium-lease --probe http://probe.atrium.test/generate_204 --probe-bin /tmp/atrium-net/atrium-probe --mdns-bin /tmp/atrium-net/atrium-mdns --sock /tmp/atrium-net/ctl.sock'
+    stl() { "$V" "printf 'status\n' | nc -U -w 2 /tmp/atrium-net/ctl.sock" | grep 'name=vtnet1'; }
+    i=0; until stl | grep -q 'internet=captive'; do i=$((i + 1)); [ $i -lt 60 ] || fail "not captive: $(stl) $("$V" 'tail -n 5 /tmp/atrium-net/net.log')"; sleep 1; done
+    # atrium-netconf ends with atrium-net's control socket: start it again.
+    "$V" "pkill -x atrium-netconf 2>/dev/null || true; sleep 1; rm -rf /tmp/atrium-net/sockets
+        daemon -f -o /tmp/atrium-net/netconf.log /tmp/atrium-net/atrium-netconf -v --ctl /tmp/atrium-net/ctl.sock --dir /tmp/atrium-net/sockets --uid 65036 --capsicum
+        sleep 2"
+    PP=/tmp/atrium-net/sockets/network-portal
+    m=$("$V" "stat -f '%Sp %Su' $PP $PP/network-portal.sock | tr '\n' ' '")
+    [ "$m" = "drwx------ root srw------- root " ] && ok "network-portal: root-only directory and socket ($m)" || fail "network-portal permissions: $m"
+    PC="/tmp/atrium-net/atrium-netctl --dir /tmp/atrium-net/sockets --app network-portal"
+    r=$("$V" "$PC portal" 2>&1 || true)
+    [ "$r" = "portal iface=vtnet1 online=Captive start=http://10.88.0.1/login?from=atrium dns=10.88.0.53,fd77:0:0:88::53 watching=0" ] \
+        && ok "portal info: start at the portal's page, the network's own DNS servers ($r)" || fail "portal info: $r"
+    r=$("$V" "su -m nobody -c '$PC portal'" 2>&1 || true)
+    echo "$r" | grep -q 'Permission denied' && ok "network-portal refused to another user" || fail "network-portal as nobody: $r"
+    g0=$(stat web_get)
+    "$V" "$PC portal watch on" >/dev/null
+    sleep 16
+    g1=$(stat web_get)
+    [ $((g1 - g0)) -ge 3 ] && "$V" "$PC portal" | grep -q 'watching=1' \
+        && ok "portal watch on: probed every 5 s ($((g1 - g0)) probes in 16 s)" || fail "portal watch: $g0 -> $g1 $("$V" "$PC portal")"
+    lanctl web-ok >/dev/null
+    i=0; until stl | grep -q 'internet=yes'; do i=$((i + 1)); [ $i -lt 20 ] || fail "not online after sign-in: $(stl)"; sleep 1; done
+    "$V" "$PC portal" | grep -q 'online=Yes .*watching=0' \
+        && ok "signed in: online within ${i} s of the portal letting go, and the watch ended by itself" || fail "after sign-in: $("$V" "$PC portal")"
 
     # Hostile server: restart atrium-net into a LAN that sends bad leases.
     lanctl hostile >/dev/null

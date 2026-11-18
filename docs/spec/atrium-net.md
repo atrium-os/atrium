@@ -437,7 +437,7 @@ Stays as a test and debug tool. The gates switch to `atrium-net` once N1 lands.
 VPN tunnels (designed in [vpn.md](vpn.md): atrium-net applies checked tunnel proposals and owns the `atrium/vpn` pf anchor), DHCPv6 prefix delegation, captive portal sign-in (v1 only detects
 it, §9 decision 8; proposed in §8.1), Wi-Fi hotspot, bridges, 802.1X on Ethernet, mDNS.
 
-### 8.1 Captive portal sign-in (proposed 2026-11-18)
+### 8.1 Captive portal sign-in (accepted 2026-11-18, P1–P4 as recommended)
 
 Hotels, trains and cafés hold traffic until a web page is accepted. v1 detects that
 (`internet=captive`, `portal=`) and the bar says "sign-in needed"; nothing opens the page.
@@ -489,6 +489,13 @@ S2 Nuntius `ATRIUM_NUNTIUS_RESOLVERS` and the per-instance private grant; S3 Nav
 portal window (Navigator thread); S4 bar/Curia/notification entry points; gate: join
 the portal LAN with DNS over TLS on, open the window, accept, online, window closed,
 DNS over TLS working again.
+
+*Built 2026-11-18:* S1 (the root-only `network-portal` socket, `PORTAL_INFO`,
+`PORTAL_WATCH`, `atrium-netctl portal [watch on|off]`; gate n0 checks the portal LAN's
+302, the socket's permissions, refusal to another user, 5 s probes while watched and the
+watch ending once online) and S2 (Nuntius resolvers, portcullisd `OpenPortalFetcher`
+gated on the `network-portal` manifest capability, `nuntius::launch::open_portal`).
+S3 and S4 are next.
 
 **Decisions for Shankar**
 - P1. A portal window as an Unrecorded Navigator trail with the network's DNS and the

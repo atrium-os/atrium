@@ -186,6 +186,13 @@ resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout`
   included, before any lookup, and a refusal is an `Error` with code `Policy`. The
   Navigator's instances are unrestricted, since the reader chooses where to go. (Built
   2026-11-07.)
+- **A captive portal's sign-in window** (atrium-net.md §8.1) gets its own verb,
+  `OpenPortalFetcher`, behind the restricted `network-portal` capability. portcullisd asks
+  atrium-net for the network's DNS servers (never the caller) and passes them in
+  `ATRIUM_NUNTIUS_RESOLVERS` (at most three; no loopback, multicast or unspecified
+  address), with the private-network grant, since portals sit on the router. That
+  instance resolves through those servers instead of the machine's resolver, so the
+  portal's own DNS answers. `nuntius::launch::open_portal`. (Built 2026-11-18.)
 
 ## 5. Clients, first to last
 
