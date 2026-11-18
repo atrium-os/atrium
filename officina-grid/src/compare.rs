@@ -67,8 +67,9 @@ impl Change {
         }
     }
 
-    /// Whether taking it takes the whole sheet (rows added or removed).
-    pub fn whole_sheet(&self) -> bool {
+    /// Whether it is rows added or removed (taken as rows inserted or
+    /// deleted; Take All takes such a sheet whole).
+    pub fn is_rows(&self) -> bool {
         matches!(self, Change::RowsAdded { .. } | Change::RowsRemoved { .. })
     }
 
@@ -404,19 +405,45 @@ fn theirs_sheet(theirs: &Workbook, ours: &Workbook, s: u16) -> u16 {
     theirs.sheet_id(&ours.sheet_name(s)).unwrap_or(0)
 }
 
-/// The edit that takes `ch` from theirs: a cell takes their cell; rows
-/// added or removed take their whole sheet (cells and styles), so that
-/// references stay as they wrote them. Sheets added or removed can't be
-/// taken (None), nor anything that no longer applies.
-pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<GridOp> {
+/// The edits that take `ch` from theirs, in order: a cell takes their
+/// cell; rows added are inserted (references to the rows below follow)
+/// and given their cells; rows removed are deleted. Sheets added or
+/// removed can't be taken (None).
+pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridOp>> {
+    use crate::shift::{shift_op, Axis};
     match ch {
         Change::Cell { sheet, row, col, theirs: input, .. } => {
             if (*sheet as usize) >= ours.sheet_count() {
                 return None;
             }
-            Some(GridOp::set(CellAddr::new(*sheet, *row, *col), input.clone()))
+            Some(vec![GridOp::set(CellAddr::new(*sheet, *row, *col), input.clone())])
         }
-        Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } => take_sheet(ours, theirs, *sheet),
+        Change::RowsAdded { sheet, at, n, theirs_row } => {
+            let t = theirs.sheet_id(&ours.sheet_name(*sheet))?;
+            let mut ops: Vec<GridOp> = shift_op(ours, *sheet, Axis::Rows, *at, *n as i64).into_iter().collect();
+            let cols = theirs.extent(t).1;
+            let spills: Vec<Rect> = theirs.spills().filter(|(a, _)| a.sheet == t).filter_map(|(a, _)| theirs.spill_area(*a)).collect();
+            let rows: Vec<Vec<Input>> = (0..*n)
+                .map(|k| {
+                    let (j, r) = (theirs_row + k, at + k);
+                    (0..cols)
+                        .map(|c| match theirs.group_at(t, j, c) {
+                            Some(g) => Input::Formula(formula::to_a1(&theirs.group(g).expr, r, c, &|id| theirs.sheet_name(id))),
+                            None if spills.iter().any(|a| a.contains(CellAddr::new(t, j, c)) && !(a.r0 == j && a.c0 == c)) => Input::Empty,
+                            None => match theirs.value(t, j, c) {
+                                Value::Empty => Input::Empty,
+                                v => Input::Value(v),
+                            },
+                        })
+                        .collect()
+                })
+                .collect();
+            if rows.iter().flatten().any(|i| *i != Input::Empty) {
+                ops.push(GridOp::block(*sheet, *at, 0, rows));
+            }
+            (!ops.is_empty()).then_some(ops)
+        }
+        Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
         Change::SheetAdded { .. } | Change::SheetRemoved { .. } => None,
     }
 }
@@ -529,11 +556,13 @@ mod tests {
         let c = ch.iter().find(|c| matches!(c, Change::Cell { .. })).unwrap().clone();
         assert_eq!(c, Change::Cell { sheet: 0, row: 0, col: 1, ours: Input::Formula("=A1+1".into()), theirs: Input::Formula("=A1*10".into()) });
         let mut w = book(rows);
-        let op = take(&w, &b, &c).unwrap();
-        let inv = op.apply(&mut w);
+        let ops = take(&w, &b, &c).unwrap();
+        let inv: Vec<GridOp> = ops.into_iter().map(|op| op.apply(&mut w)).collect();
         w.recalc();
         assert_eq!(w.value(0, 0, 1), Value::Num(10.0));
-        inv.apply(&mut w);
+        for op in inv.into_iter().rev() {
+            op.apply(&mut w);
+        }
         w.recalc();
         assert_eq!(texts(&w), texts(&a));
     }
@@ -544,14 +573,16 @@ mod tests {
         let a = book(rows);
         let b = book(&[&["Name", "Qty"], &["Clips", "9"], &["Pens", "3"], &["Ink", "=B3+1"]]);
         let (ch, _) = compare(&a, &b);
-        let added = ch.iter().find(|c| c.whole_sheet()).unwrap();
+        let added = ch.iter().find(|c| c.is_rows()).unwrap();
         let mut w = book(rows);
-        let inv = take(&w, &b, added).unwrap().apply(&mut w);
+        let inv: Vec<GridOp> = take(&w, &b, added).unwrap().into_iter().map(|op| op.apply(&mut w)).collect();
         w.recalc();
         assert_eq!(texts(&w), texts(&b));
         assert_eq!(w.value(0, 3, 1), Value::Num(4.0));
         assert_eq!(compare(&w, &b).0, vec![]);
-        inv.apply(&mut w);
+        for op in inv.into_iter().rev() {
+            op.apply(&mut w);
+        }
         w.recalc();
         assert_eq!(texts(&w), texts(&a));
     }
@@ -599,11 +630,20 @@ mod tests {
             let (wa, wb) = (make(&a), make(&b));
             let (ch, _) = compare(&wa, &wb);
             let mut w = make(&a);
-            if let Some(c) = ch.iter().find(|c| c.whole_sheet()) {
-                take(&w, &wb, c).unwrap().apply(&mut w);
+            if rnd(2) == 0 && ch.iter().any(|c| c.is_rows()) {
+                take_sheet(&w, &wb, 0).unwrap().apply(&mut w);
             } else {
-                for c in &ch {
-                    take(&w, &wb, c).unwrap().apply(&mut w);
+                // One at a time, comparing again after each.
+                let mut left = ch.clone();
+                let mut rounds = 0;
+                while let Some(c) = left.first().cloned() {
+                    for op in take(&w, &wb, &c).unwrap() {
+                        op.apply(&mut w);
+                    }
+                    w.recalc();
+                    left = compare(&w, &wb).0;
+                    rounds += 1;
+                    assert!(rounds < 100, "{a:?} -> {b:?}");
                 }
             }
             w.recalc();
