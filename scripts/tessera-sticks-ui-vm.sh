@@ -178,7 +178,7 @@ shot 2 3-wrong
 press 480 284
 typ "$(printf '\b%.0s' $(seq 40))$(echo "$CODE" | tr 'A-Z' 'a-z')"
 press 690 378
-waitfor "seals=\\[$PART:personal\\] stick=-" 120 && ok "the right code opens it: bob's personal stick" || bad "right code: $(trace) / $(g "tail -4 $T/d.log" | tr '\n' ';')"
+waitfor "seals=\\[$PART:personal[^]]*\\] stick=-" 120 && ok "the right code opens it: bob's personal stick" || bad "right code: $(trace) / $(g "tail -4 $T/d.log" | tr '\n' ';')"
 check "…mounted" tessera "$(mounted)"
 check "…alice's note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
 check "…listed as bob's" yes "$(list_as bob | grep -q "^$PART /media/$PART .*persona=personal" && echo yes || echo no)"
