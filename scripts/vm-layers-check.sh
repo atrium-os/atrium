@@ -121,6 +121,7 @@ echo "$L" | grep -q " rust@$RVER " && echo "$L" | grep -q " c-dev@1 " && ok "bot
 check "installed trees are root's, not writable by others" "root 755" "$(V "stat -f '%Su %Lp' /var/lib/atrium/layers/rust@$RVER")"
 
 echo "=== portcullisd"
+V "id alice >/dev/null 2>&1 || pw useradd alice -u 1011 -m -d /home/alice -s /bin/sh"
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 V "mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK; daemon -f -o $LOG /usr/local/bin/portcullisd --socket $PSOCK; sleep 3; chmod 666 $PSOCK; test -S $PSOCK" \
