@@ -32,6 +32,12 @@ fn handle(a: Ask, f: Option<std::fs::File>) -> Result<Answer, String> {
             Ok(a) => format!("called: {}", a.text),
             Err(e) => format!("refused: {e}"),
         },
+        // Past its 128M: rctl ends the jail.
+        "hog" => {
+            let mut v: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..64 { v.push(vec![1u8; 16 << 20]); }
+            format!("held {} MiB", v.iter().map(|b| b.len()).sum::<usize>() >> 20)
+        }
         "fail" => return Err("asked to fail".into()),
         "crash" => std::process::exit(3),
         "sleep" => { std::thread::sleep(std::time::Duration::from_secs(60)); String::new() }

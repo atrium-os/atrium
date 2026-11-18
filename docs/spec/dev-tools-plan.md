@@ -261,10 +261,11 @@ libraries into the bundle. The base syscall profile gained `getgroups` (jaild's
 capsicum (a child that calls `cap_enter`), local (`ATRIUM_WORKERS=local`) and
 in-process. Officina's converter is Write's `convert` worker and Mail's parser is
 its `parse` worker, through `spawn_stdio`, falling back to a child process off
-Atrium. Gate `vm-workers-check.sh` 16/16 in deny mode: the worker's own uid, stable
-across calls; a file passed in; its error, a crash, a timeout as errors; no network;
-no nested calls; only the worker-call socket in the core; no jail left. Not done: a
-memory-limit kill in the gate (needs racct on the VM), a second worker and the
+Atrium. Gate `vm-workers-check.sh` 19/19 in deny mode: the worker's own uid, stable
+across calls; a file passed in; its error, a crash, a timeout as errors; its `memory`
+as an rctl `memoryuse:sigkill` rule on its jail, and a worker past it killed and
+reported as an error, the next call working; no network;
+no nested calls; only the worker-call socket in the core; no jail left. Not done: a second worker and the
 overlay check, `vm-sheets`/converter gates on real jails, Sheets and Slides (no
 manifests yet), and the ~25 hand-written `cap_enter` blocks.
 
