@@ -412,3 +412,60 @@ mod tests {
         assert_eq!(first_names(["Priya Raman", "Arun", "Priya R", "Lena", "Sam"].into_iter()), "Priya, Arun, Lena…");
     }
 }
+
+/// The buttons on a one-message notification (tabula.md §5.5): (verb,
+/// label). Group and summary posts have none.
+pub const ACTIONS: [(&str, &str); 3] = [("archive", "Archive"), ("read", "Mark read"), ("reply", "Reply")];
+
+/// The buttons for `msg`'s notification: the action id carries the
+/// message ("archive.42"), so a press that starts Mail again, or comes
+/// after a restart, still knows which message it was for.
+pub fn actions_for(msg: MsgId) -> Vec<(String, &'static str)> {
+    ACTIONS.iter().map(|(v, l)| (format!("{v}.{msg}"), *l)).collect()
+}
+
+/// A pressed action id back as (message, verb).
+pub fn action_of(id: &str) -> Option<(MsgId, &str)> {
+    let (v, m) = id.split_once('.')?;
+    let m: MsgId = m.parse().ok()?;
+    ACTIONS.iter().find(|(x, _)| *x == v).map(|(x, _)| (m, *x))
+}
+
+/// What a button press did.
+#[derive(Debug)]
+pub enum Acted {
+    /// Archived or marked read: the op ids, for Undo in the window.
+    Done { ops: Vec<u64>, label: &'static str },
+    /// A reply to open in a compose window.
+    Reply(Box<crate::compose::Compose>),
+    /// Nothing to do: the message is gone, or the action isn't one of
+    /// [`ACTIONS`].
+    Nothing,
+}
+
+impl Engine {
+    /// The person pressed `action` on the notification for `msg` (§12):
+    /// Archive takes the message out of the inbox, Mark read reads it
+    /// everywhere it is, Reply makes a reply. Like the same press in the
+    /// window, it goes to the server after the undo window.
+    pub fn notification_action(&self, msg: MsgId, action: &str) -> Result<Acted, crate::Error> {
+        let Ok(m) = self.store.message(msg) else { return Ok(Acted::Nothing) };
+        match action {
+            "archive" => {
+                let inbox = m.locations.iter().find(|(f, _)| self.store.folder(*f).is_ok_and(|x| x.role == Role::Inbox)).copied();
+                let Some((f, uid)) = inbox else { return Ok(Acted::Nothing) };
+                let ops = self.act(f, &[uid], crate::Action::Archive)?;
+                Ok(if ops.is_empty() { Acted::Nothing } else { Acted::Done { ops, label: "Message archived" } })
+            }
+            "read" => {
+                let mut ops = Vec::new();
+                for (f, uid) in &m.locations {
+                    ops.extend(self.act(*f, &[*uid], crate::Action::Read(true))?);
+                }
+                Ok(if ops.is_empty() { Acted::Nothing } else { Acted::Done { ops, label: "Marked read" } })
+            }
+            "reply" => Ok(Acted::Reply(Box::new(self.compose_reply(msg, mail_compose::reply::Kind::Reply)?))),
+            _ => Ok(Acted::Nothing),
+        }
+    }
+}

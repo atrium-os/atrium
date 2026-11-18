@@ -193,3 +193,54 @@ fn digest_weekends_replies_and_the_review_time() {
     let p = n.check_local(&engine, tue + 10 * 3600 + 31 * 60, 0);
     assert!(p.contains(&Post::Review { title: "Later".into(), body: "1 overdue".into() }), "{p:?}");
 }
+
+#[test]
+fn the_notification_s_buttons() {
+    use mail_engine::notify::{action_of, actions_for, Acted};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[
+        RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true },
+        RemoteFolder { name: "Archive".into(), role: mail_sync::Role::Archive, selectable: true },
+    ]).unwrap();
+    sink.messages("INBOX", vec![
+        msg(1, "Priya <priya@example.com>", "Numbers", NOW - 60, "Message-ID: <p1@x>\r\n", "Here."),
+        msg(2, "Lena <lena@partner.example>", "Lunch", NOW - 50, "Message-ID: <l1@x>\r\n", "Noon?"),
+        msg(3, "Sam <sam@acme.example>", "Contract", NOW - 40, "Message-ID: <s1@x>\r\n", "Signed."),
+    ]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let id = |uid| engine.store.at(inbox, uid).unwrap().unwrap().0;
+
+    // The buttons name their message, within Praeco's rules.
+    let a = actions_for(id(1));
+    assert_eq!(a.iter().map(|(_, l)| *l).collect::<Vec<_>>(), ["Archive", "Mark read", "Reply"]);
+    for (i, _) in &a {
+        assert!(i.len() <= 32 && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.'), "{i}");
+        assert_eq!(action_of(i).map(|(m, _)| m), Some(id(1)));
+    }
+    assert_eq!(action_of(&format!("archive.{}", u64::MAX)), Some((u64::MAX, "archive")));
+    assert_eq!(action_of("delete.1"), None);
+    assert_eq!(action_of("archive"), None);
+
+    // Archive: out of the inbox, with ops for Undo.
+    let Acted::Done { ops, label } = engine.notification_action(id(1), "archive").unwrap() else { panic!() };
+    assert!(!ops.is_empty());
+    assert_eq!(label, "Message archived");
+    assert!(engine.store.list(inbox, 0, 10).unwrap().iter().all(|r| r.subject != "Numbers"));
+    // An action Mail never offered: nothing.
+    assert!(matches!(engine.notification_action(id(2), "nonsense").unwrap(), Acted::Nothing));
+
+    // Mark read.
+    let Acted::Done { label, .. } = engine.notification_action(id(2), "read").unwrap() else { panic!() };
+    assert_eq!(label, "Marked read");
+    assert!(engine.store.at(inbox, 2).unwrap().unwrap().1 & flag::SEEN != 0);
+
+    // Reply: a reply to Sam, to open in a window.
+    let Acted::Reply(c) = engine.notification_action(id(3), "reply").unwrap() else { panic!() };
+    assert_eq!(c.draft.subject, "Re: Contract");
+    assert_eq!(c.draft.to[0].addr, "sam@acme.example");
+    // A message that's gone: nothing.
+    assert!(matches!(engine.notification_action(999_999, "archive").unwrap(), Acted::Nothing));
+}

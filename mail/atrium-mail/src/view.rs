@@ -2118,6 +2118,30 @@ impl Mail {
         }
     }
 
+    /// A button pressed on a new-mail notification (§12, tabula.md §5.5):
+    /// Archive and Mark read happen with Undo in the window; Reply opens a
+    /// compose window.
+    pub fn notification_action(&self, msg: MsgId, action: &str) {
+        use mail_engine::notify::Acted;
+        match self.engine.notification_action(msg, action) {
+            Ok(Acted::Done { ops, label }) => {
+                let mut ui = self.ui.get_cloned();
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: label.into(), until: (self.now)() + mail_engine::UNDO_SECS });
+                // The one being read leaves the reader once archived.
+                if action == "archive" && ui.reading.as_ref().is_some_and(|r| r.msgs.iter().any(|m| m.msg == msg)) {
+                    ui.reading = None;
+                    ui.cursor = None;
+                    ui.link = None;
+                }
+                self.ui.set(ui);
+                self.refresh();
+            }
+            Ok(Acted::Reply(c)) => self.composes.borrow_mut().push((*c, None)),
+            Ok(Acted::Nothing) => {}
+            Err(e) => self.set_error(e.to_string()),
+        }
+    }
+
     /// A `mailto:` link from another app (Monstrator, on the document
     /// channel): a compose window filled from it, shown in full.
     pub fn mailto(&self, link: &str) {

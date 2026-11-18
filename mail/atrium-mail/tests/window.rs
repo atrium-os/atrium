@@ -1102,3 +1102,56 @@ fn grouped_by_date_and_by_sender_and_folded() {
     assert_eq!(ui.count, 2);
     assert_eq!(mail.ui.get_cloned().count, 2);
 }
+
+#[test]
+fn a_notification_s_buttons_act_in_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
+        ]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200), f(3, "Three", NOW - 100)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    let inbox = engine.store.folder_id(account, "INBOX", mail_store::Role::Inbox).unwrap();
+    let id = |uid| engine.store.at(inbox, uid).unwrap().unwrap().0;
+
+    // Reading Three when its notification's Archive is pressed: it leaves
+    // the list and the reader, with Undo.
+    mail.open(0);
+    mail.notification_action(id(3), "archive");
+    assert_eq!(subjects(&mail), ["Two", "One"]);
+    let ui = mail.ui.get_cloned();
+    assert!(ui.reading.is_none());
+    assert_eq!(ui.undo.as_ref().unwrap().label, "Message archived");
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Message archived"));
+    assert!(mail.key(&key("z"), None));
+    assert_eq!(subjects(&mail), ["Three", "Two", "One"]);
+
+    // Mark read: the row is read.
+    assert!(mail.row(1).unwrap().unread);
+    mail.notification_action(id(2), "read");
+    assert!(!mail.row(1).unwrap().unread);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Marked read");
+
+    // Reply: a compose window to Arun.
+    assert!(mail.take_composes().is_empty());
+    mail.notification_action(id(1), "reply");
+    let c = mail.take_composes();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].0.draft.subject, "Re: One");
+}

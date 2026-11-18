@@ -98,20 +98,58 @@ fn now_secs() -> i64 {
 /// absent; Mail never waits on it). Remembers which post was for which
 /// message, to withdraw it when read elsewhere, and replaces the last
 /// "while you were away" summary rather than stacking another.
-fn notifications() -> mpsc::Sender<mail_engine::notify::Post> {
+///
+/// A one-message post has Archive, Mark read and Reply (tabula.md §5.5);
+/// a press comes back on the receiver as (message, action), heard by a
+/// listener opened at start, so a press that started Mail isn't lost.
+fn notifications() -> (mpsc::Sender<mail_engine::notify::Post>, mpsc::Receiver<(u64, String)>) {
     use mail_engine::notify::Post;
     use praeco::proto::urgency;
     let (tx, rx) = mpsc::channel::<Post>();
+    let sock = praeco::client::socket();
+    let (acted_tx, acted) = mpsc::channel();
+    {
+        let sock = sock.clone();
+        std::thread::spawn(move || {
+            let mut said = false;
+            loop {
+                match praeco::client::Listener::connect(&sock) {
+                    Ok(mut l) => loop {
+                        match l.next(Duration::from_secs(60)) {
+                            Ok(Some(a)) => {
+                                if let Some((msg, verb)) = mail_engine::notify::action_of(&a.action) {
+                                    if acted_tx.send((msg, verb.to_string())).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(_) => break,
+                        }
+                    },
+                    Err(e) if !said => {
+                        eprintln!("atrium-mail: notification buttons: {e}");
+                        said = true;
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
     std::thread::spawn(move || {
-        let sock = std::path::PathBuf::from(std::env::var("PRAECO_SOCKET").unwrap_or_else(|_| "/var/run/atrium/praecod.sock".into()));
         let mut by_msg: std::collections::HashMap<u64, u64> = Default::default();
         let mut summary: Option<u64> = None;
         let mut said = false;
         for p in rx {
             let r = match p {
-                Post::One { msg, title, body } => praeco::client::post(&sock, urgency::NORMAL, &title, &body).map(|id| {
-                    by_msg.insert(msg, id);
-                }),
+                Post::One { msg, title, body } => {
+                    let actions = mail_engine::notify::actions_for(msg);
+                    let actions: Vec<(&str, &str)> = actions.iter().map(|(i, l)| (i.as_str(), *l)).collect();
+                    praeco::client::post_with_actions(&sock, urgency::NORMAL, &title, &body, &actions).map(|id| {
+                        by_msg.insert(msg, id);
+                    })
+                }
                 Post::Group { title, body } => praeco::client::post(&sock, urgency::NORMAL, &title, &body).map(|_| ()),
                 Post::Review { title, body } | Post::Week { title, body } => praeco::client::post(&sock, urgency::LOW, &title, &body).map(|_| ()),
                 Post::Summary { title, body } => {
@@ -133,7 +171,7 @@ fn notifications() -> mpsc::Sender<mail_engine::notify::Post> {
             }
         }
     });
-    tx
+    (tx, acted)
 }
 
 /// Hand the doc-viewer pictures by resource id (before `Load`, for its
@@ -409,7 +447,7 @@ fn main() {
         mail.ask_settings();
     }
     let mut notifier = mail_engine::notify::Notifier::new();
-    let notes = notifications();
+    let (notes, pressed) = notifications();
     let mut ticked = Instant::now();
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
@@ -437,6 +475,9 @@ fn main() {
         // Compose windows: links from other apps, replies, Undo of a send.
         while let Ok(url) = incoming.try_recv() {
             mail.mailto(&url);
+        }
+        while let Ok((msg, action)) = pressed.try_recv() {
+            mail.notification_action(msg, &action);
         }
         let asked = mail.take_composes();
         let opened = !asked.is_empty();
