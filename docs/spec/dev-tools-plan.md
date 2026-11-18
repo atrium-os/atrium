@@ -305,6 +305,15 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   the crate-graph lint with a curated parser list. Gate: each template builds, runs
   and fuzzes in a workspace; the lint flags `image` in a networked core and is silent
   for the viewer template.
+  **As built (2026-11-18).** Templates app, c-app, viewer, indexer, client, media and
+  service; `cargo atrium worker add` moves a library function into a new worker.
+  `cargo atrium bundle` reads the programs' `DT_NEEDED`/`DT_RUNPATH` itself (in the
+  workspace's own view, or the SDK sysroot off Atrium), so it doesn't wait on a
+  `portcullis workspace bundle` verb; it packs, signs and archives with opifex, and
+  bundles a C project's `make` output when there is no Cargo.toml. Gate
+  `scripts/vm-bundle-check.sh` 8/8: new, worker add, bundle --sign, the .insula
+  installs with nothing left to resolve, and both workers answer jailed. Not done:
+  the Arca-held key, `[bundle] extra-libs`, `make bundle` in `atrium.app.mk`.
 - **M8 (M).** `registries` mode: a jailed `nuntius-egress` CONNECT proxy reusing
   `navigator-fetch`'s address policy; the workspace gets no route out, only the
   proxy; per-workspace host list in its record and the Workspaces app. Gate: cargo

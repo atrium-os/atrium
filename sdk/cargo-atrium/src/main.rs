@@ -31,6 +31,14 @@ Commands:
       core's call) and src/bin/<name>.rs. --from runs that library
       function in the worker and lists the core's calls to it to replace
       with <name>_worker::call. --json: what changed, for Artifex.
+  bundle [--arch amd64|aarch64] [--sign <key.pem>] [--out <dir>]
+         [--sysroot <dir>] [--json] [-- cargo build args]
+      Build release and write an installable bundle: atrium.toml, the core
+      and each worker at their entries, the icon, and every library they
+      need with the loader (read from the programs, never run). Then
+      opifex pack (with --sign, the publisher's signature) and opifex
+      archive to <out>.insula, which installs through the install sheet.
+      Without Cargo.toml (a C project) it bundles what make built.
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer
@@ -63,6 +71,7 @@ fn main() -> ExitCode {
         Some("fuzz") => cmd_fuzz(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("worker") => cmd_worker(&args[1..]),
+        Some("bundle") => cmd_bundle(&args[1..]),
         None | Some("help") | Some("-h") | Some("--help") => {
             println!("{HELP}");
             ExitCode::SUCCESS
@@ -142,6 +151,188 @@ fn cmd_worker(args: &[String]) -> ExitCode {
         }
         for n in &plan.notes {
             println!("  note: {n}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_bundle(args: &[String]) -> ExitCode {
+    use cargo_atrium::{bundle, cross};
+    let (mut arch, mut sign, mut out, mut sysroot, mut json, mut rest) = (None, None, None, None, false, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--arch" => arch = it.next().cloned(),
+            "--sign" => sign = it.next().map(PathBuf::from),
+            "--out" => out = it.next().map(PathBuf::from),
+            "--sysroot" => sysroot = it.next().map(PathBuf::from),
+            "--json" => json = true,
+            "--" => rest.extend(it.by_ref().cloned()),
+            o => {
+                eprintln!("cargo atrium bundle: unknown argument {o} (cargo's go after --)");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let fail = |e: String| {
+        if json {
+            println!("{}", serde_json::json!({"ok": false, "error": e}));
+        } else {
+            eprintln!("cargo atrium bundle: {e}");
+        }
+        ExitCode::FAILURE
+    };
+    let host = if cfg!(target_arch = "aarch64") { "aarch64" } else { "amd64" };
+    let Some(t) = cross::target(arch.as_deref().unwrap_or(host)) else { return fail("--arch: amd64 or aarch64".into()) };
+    let native = cfg!(target_os = "freebsd") && t.arch == host;
+    let manifest = match std::fs::read_to_string("atrium.toml") {
+        Ok(m) => m,
+        Err(e) => return fail(format!("atrium.toml: {e} (run it in the project folder)")),
+    };
+    let mv: toml::Value = match manifest.parse() {
+        Ok(v) => v,
+        Err(e) => return fail(format!("atrium.toml: {e}")),
+    };
+    let app = |k: &str| mv.get("app").and_then(|a| a.get(k)).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (id, version) = (app("id"), app("version"));
+    if id.is_empty() || version.is_empty() {
+        return fail("atrium.toml: [app] needs an id and a version".into());
+    }
+    if id.starts_with("dev.") {
+        return fail(format!("{id}: a dev. id is Run from its workspace, not bundled; give [app] an id of your own (reverse DNS of a domain you control)"));
+    }
+    let progs = match bundle::programs(&manifest) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    // Without Cargo.toml (a C project, after `make`): the programs are
+    // already at their entries.
+    let prebuilt = !Path::new("Cargo.toml").is_file();
+    let tdir = if prebuilt { PathBuf::from("bundle") } else {
+        Command::new(&cargo).args(["metadata", "--no-deps", "--format-version", "1"]).output().ok()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("target"))
+    };
+
+    // 1. Build.
+    let mut bins: Vec<String> = Vec::new();
+    for (_, b) in &progs {
+        bins.extend(["--bin".to_string(), b.clone()]);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (status, rel_dir, root) = if prebuilt {
+        let root = if cfg!(target_os = "freebsd") { PathBuf::from("/") } else {
+            match cross::sysroot(t, sysroot.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
+                Ok(s) => s,
+                Err(e) => return fail(e),
+            }
+        };
+        (Command::new("true").status(), PathBuf::new(), root)
+    } else if native {
+        (Command::new(&cargo).args(["build", "--release"]).args(&bins).args(&rest).status(), tdir.join("release"), PathBuf::from("/"))
+    } else {
+        let root = match cross::sysroot(t, sysroot.as_deref(), std::env::var("ATRIUM_SYSROOT").ok().as_deref(), home.as_deref()) {
+            Ok(s) => std::fs::canonicalize(&s).unwrap_or(s),
+            Err(e) => return fail(e),
+        };
+        let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cargo-atrium"));
+        let st = Command::new(me).args(["atrium", "cross", t.arch, "--sysroot"]).arg(&root).arg("--release").args(&bins).args(&rest).status();
+        (st, tdir.join(t.triple).join("release"), root)
+    };
+    match status {
+        Ok(s) if s.success() => {}
+        _ => return fail("the build failed".into()),
+    }
+
+    // 2. The tree.
+    let name = format!("{id}-{version}-{}", t.arch);
+    let tree = out.unwrap_or_else(|| if prebuilt { tdir.join(&name) } else { tdir.join("atrium-bundle").join(&name) });
+    if tree.exists() {
+        if !tree.join("atrium.toml").is_file() {
+            return fail(format!("{} exists and isn't a bundle; give --out another folder", tree.display()));
+        }
+        if let Err(e) = std::fs::remove_dir_all(&tree) {
+            return fail(format!("{}: {e}", tree.display()));
+        }
+    }
+    let mut placed: Vec<String> = Vec::new();
+    let mut place = |from: &Path, to: &str| -> Result<(), String> {
+        bundle::place(from, &tree, to)?;
+        placed.push(to.to_string());
+        Ok(())
+    };
+    let mut programs = Vec::new();
+    let mut steps = vec![(PathBuf::from("atrium.toml"), "atrium.toml".to_string())];
+    for (entry, bin) in &progs {
+        let from = if prebuilt { PathBuf::from(entry) } else { rel_dir.join(bin) };
+        if !from.is_file() {
+            return fail(format!("{} isn't there{}", from.display(), if prebuilt { " (build it first, e.g. make)" } else { "" }));
+        }
+        steps.push((from.clone(), entry.clone()));
+        programs.push(from);
+    }
+    for f in bundle::named_files(&manifest) {
+        steps.push((PathBuf::from(&f), f.clone()));
+    }
+    for (from, to) in &steps {
+        if let Err(e) = place(from, to) {
+            return fail(e);
+        }
+    }
+    // 3. The closure.
+    let libs = match bundle::closure(&programs, &root) {
+        Ok(c) => c,
+        Err(e) => return fail(if native { e } else { format!("{e}; from outside Atrium an app can only need base libraries (bundle in a workspace for the others)") }),
+    };
+    for s in &libs {
+        if let Err(e) = place(&s.from, &s.to) {
+            return fail(e);
+        }
+    }
+    // 4. Pack, sign, archive.
+    let path = std::env::var("PATH").unwrap_or_default();
+    let opifex = std::env::var_os("OPIFEX").map(PathBuf::from)
+        .or_else(|| cross::find_tool(&["opifex"], &path))
+        .or_else(|| ["/usr/local/bin/opifex", "/usr/bin/opifex", "/usr/sbin/opifex"].iter().map(PathBuf::from).find(|p| p.is_file()));
+    let insula = tree.with_extension("insula");
+    let insula = if tree.extension().is_some() { PathBuf::from(format!("{}.insula", tree.display())) } else { insula };
+    let mut packed = false;
+    match &opifex {
+        Some(op) => {
+            let mut c = Command::new(op);
+            c.arg("pack").arg(&tree);
+            if let Some(k) = &sign {
+                c.arg("--sign").arg(k);
+            }
+            match c.status() {
+                Ok(s) if s.success() => {}
+                _ => return fail("opifex pack failed".into()),
+            }
+            match Command::new(op).arg("archive").arg(&tree).arg(&insula).status() {
+                Ok(s) if s.success() => {}
+                _ => return fail("opifex archive failed".into()),
+            }
+            packed = true;
+        }
+        None if sign.is_some() => return fail("--sign needs opifex (on Atrium it's in the base; elsewhere set OPIFEX)".into()),
+        None => {}
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true, "id": id, "version": version, "arch": t.arch,
+            "tree": tree.display().to_string(),
+            "insula": packed.then(|| insula.display().to_string()),
+            "signed": packed && sign.is_some(),
+            "files": placed,
+        })).unwrap_or_default());
+    } else {
+        println!("cargo atrium: bundle {} ({} programs, {} libraries and the loader)", tree.display(), progs.len(), libs.len().saturating_sub(1));
+        if packed {
+            println!("  {}{}", insula.display(), if sign.is_some() { ", signed" } else { ", NOT signed: it installs only with --allow-unsigned" });
+        } else {
+            println!("  not packed: no opifex here (set OPIFEX); on Atrium: opifex pack {} --sign <key>", tree.display());
         }
     }
     ExitCode::SUCCESS
