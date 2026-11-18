@@ -4,9 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Prelum's messages (docs/spec/printing.md §6): what prelumd says to its jailed workers (prelum-ipp, prelum-render) over their one socket, and CLASS_PRINT, the Aqueduct surface its clients use."
+description = "Prelum's messages (docs/spec/printing.md §6): what prelumd says to its jailed workers (prelum-ipp, prelum-render, prelum-browse) over their one socket, and CLASS_PRINT, the Aqueduct surface its clients use."
 
 [dependencies]
+prelum-dnssd = { path = "../prelum-dnssd", features = ["serde"] }
 prelum-ipp-codec = { path = "../prelum-ipp-codec", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }

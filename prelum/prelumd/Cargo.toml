@@ -8,6 +8,7 @@ description = "Prelum's daemon (docs/spec/printing.md §6.4): saved printers per
 
 [dependencies]
 prelum-proto = { path = "../prelum-proto" }
+prelum-dnssd = { path = "../prelum-dnssd", features = ["serde"] }
 prelum-ipp-codec = { path = "../prelum-ipp-codec", features = ["serde"] }
 aqueduct = { path = "../../aqueduct" }
 portcullis-peer = { path = "../../portcullis/portcullis-peer" }

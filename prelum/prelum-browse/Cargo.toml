@@ -1,0 +1,16 @@
+[package]
+name = "prelum-browse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Prelum's printer finder (docs/spec/printing.md §7.1): DNS-SD queries over mDNS on two sockets atrium-net made, answers read into a bounded cache, complete services reported to prelumd. Query-only; runs jailed with no network of its own, in capability mode, only while someone is looking."
+
+[dependencies]
+prelum-dnssd = { path = "../prelum-dnssd", features = ["serde"] }
+prelum-proto = { path = "../prelum-proto" }
+libc = "0.2"
+
+[[bin]]
+name = "atrium-prelum-browse"
+path = "src/bin/prelum-browse.rs"

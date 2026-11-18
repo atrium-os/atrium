@@ -3,6 +3,7 @@
 //! ```text
 //! atrium-prelumd [--socket PATH] [--state DIR] [--spool DIR] [--network NAME]
 //!         [--direct BIN_DIR] [--jaild PATH] [--rctl]
+//!         [--mdns-legacy ADDR:PORT]
 //! ```
 //!
 //! Serves `CLASS_PRINT` on `--socket`. Workers run through jaild
@@ -10,7 +11,10 @@
 //! directory (development and the Linux tests only: no jail at all).
 //! `--network` names the network for the pin (§7.3) until atrium-net
 //! says it (R3). `--rctl` caps each render jail (1 GB, one CPU); it needs
-//! `kern.racct.enable=1` and jaild's `allow_rctl`.
+//! `kern.racct.enable=1` and jaild's `allow_rctl`. `--mdns-legacy` looks
+//! for printers by asking one mDNS responder by unicast (RFC 6762 §6.7;
+//! `127.0.0.1:5353` reaches the host's Avahi): development and the Linux
+//! tests, where atrium-net isn't there to hand over the LAN's sockets.
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -19,6 +23,7 @@ use std::process::ExitCode;
 
 use prelumd::daemon::{Config, Daemon};
 use prelumd::launch::{Direct, Launcher};
+use prelumd::nearby::MdnsSockets;
 
 const SOCKET: &str = "/atrium/sockets/print/print.sock";
 const STATE: &str = "/var/db/atrium/prelum";
@@ -33,6 +38,7 @@ fn main() -> ExitCode {
     let mut direct: Option<PathBuf> = None;
     let mut rctl = false;
     let mut jaild = "/var/run/atrium/jaild.sock".to_string();
+    let mut mdns_legacy: Option<std::net::SocketAddr> = None;
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         if k == "--rctl" {
@@ -50,6 +56,13 @@ fn main() -> ExitCode {
             "--network" => network = v,
             "--direct" => direct = Some(v.into()),
             "--jaild" => jaild = v,
+            "--mdns-legacy" => match v.parse() {
+                Ok(a) => mdns_legacy = Some(a),
+                Err(_) => {
+                    eprintln!("prelumd: --mdns-legacy ADDR:PORT");
+                    return ExitCode::from(2);
+                }
+            },
             _ => {
                 eprintln!("prelumd: unknown option {k}");
                 return ExitCode::from(2);
@@ -79,7 +92,16 @@ fn main() -> ExitCode {
             }
         }
     };
-    let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()) }, launcher);
+    let mdns: Option<Box<dyn Fn() -> std::io::Result<MdnsSockets> + Send + Sync>> = match mdns_legacy {
+        Some(a) => Some(Box::new(move || {
+            let s = std::net::UdpSocket::bind(if a.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+            s.connect(a)?;
+            let r = s.try_clone()?;
+            Ok(MdnsSockets { recv: r.into(), send: s.into(), legacy: true })
+        })),
+        None => None,
+    };
+    let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()), mdns }, launcher);
     if let Some(dir) = socket.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

@@ -51,6 +51,9 @@ pub struct Config {
     pub spool: PathBuf,
     /// The network we are on now, as atrium-net names it (§7.3).
     pub network: Box<dyn Fn() -> String + Send + Sync>,
+    /// Where prelum-browse's sockets come from (§7.1): atrium-net, asked
+    /// each time the list opens. `None`: no discovery here.
+    pub mdns: Option<Box<dyn Fn() -> io::Result<crate::nearby::MdnsSockets> + Send + Sync>>,
 }
 
 pub type Fail = (u8, String);
@@ -97,6 +100,8 @@ pub struct Daemon {
     st: Mutex<State>,
     /// Woken when a job is released or cancelled.
     cv: Condvar,
+    /// Discovery (§7.1): its own lock, never held with `st`'s.
+    pub(crate) near: Mutex<crate::nearby::Near>,
 }
 
 /// One worker conversation: send a request, read its events.
@@ -282,7 +287,7 @@ pub fn plan(info: &PrinterInfo, raster_only: bool, req: &print::Print) -> Result
 }
 
 /// A worker's message, as plain text to show.
-fn short(m: &str) -> String {
+pub(crate) fn short(m: &str) -> String {
     prelum_ipp_codec::display_text(m, 200)
 }
 
@@ -335,7 +340,13 @@ enum Outcome {
 
 impl Daemon {
     pub fn new(cfg: Config, launcher: Box<dyn Launcher>) -> Arc<Daemon> {
-        Arc::new(Daemon { cfg, launcher, st: Mutex::new(State { next_job: 1, ..Default::default() }), cv: Condvar::new() })
+        Arc::new(Daemon {
+            cfg,
+            launcher,
+            st: Mutex::new(State { next_job: 1, ..Default::default() }),
+            cv: Condvar::new(),
+            near: Mutex::new(Default::default()),
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -350,6 +361,26 @@ impl Daemon {
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
         p.file.printer.iter().find(|s| s.id == id).cloned().ok_or((status::NOT_FOUND, "no such printer".into()))
+    }
+
+    /// The saved printer of `uid` with this identity, if any.
+    pub(crate) fn saved_as(&self, uid: u32, uuid: Option<&str>, key: Option<&str>) -> Option<u32> {
+        uuid?;
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        p.file.printer.iter().find(|o| o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
+    }
+
+    pub(crate) fn launcher(&self) -> &dyn Launcher {
+        &*self.launcher
+    }
+
+    pub(crate) fn mdns_source(&self) -> Option<&(dyn Fn() -> io::Result<crate::nearby::MdnsSockets> + Send + Sync)> {
+        self.cfg.mdns.as_deref()
+    }
+
+    pub(crate) fn network_now(&self) -> String {
+        (self.cfg.network)()
     }
 
     fn persist(&self, uid: u32, st: &mut State) {
@@ -406,8 +437,17 @@ impl Daemon {
     }
 
     /// Ask a printer who it is, learning its key (§7.2).
-    fn learn(&self, s: &Saved) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
+    pub(crate) fn learn(&self, s: &Saved) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
+        self.learn_within(s, None)
+    }
+
+    /// [`Self::learn`], giving up after `limit` (a printer found on the LAN,
+    /// which may never answer).
+    pub(crate) fn learn_within(&self, s: &Saved, limit: Option<Duration>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
         let mut w = self.worker(s, true)?;
+        if limit.is_some() {
+            w.p.sock.set_read_timeout(limit).map_err(|e| (status::FAILED, e.to_string()))?;
+        }
         match w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))? {
             ipp::Ev::Printer { info, key } => {
                 if s.tls && key.is_none() {

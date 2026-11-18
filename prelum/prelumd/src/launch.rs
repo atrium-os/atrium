@@ -7,7 +7,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -37,6 +37,43 @@ pub trait Launcher: Send + Sync {
     fn ipp(&self, printer: SocketAddr) -> io::Result<Proc>;
     /// A `prelum-render` reading `pdf`, with these arguments.
     fn render(&self, pdf: OwnedFd, args: &[String]) -> io::Result<Proc>;
+    /// A `prelum-browse` with no network; prelumd then hands it the mDNS
+    /// sockets over its socket ([`send_fds`]).
+    fn browse(&self, args: &[String]) -> io::Result<Proc>;
+}
+
+/// One byte carrying `fds` (`SCM_RIGHTS`): how prelum-browse gets atrium-net's
+/// mDNS sockets.
+pub fn send_fds(s: &UnixStream, fds: &[&OwnedFd]) -> io::Result<()> {
+    let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let mut byte = 0u8;
+    let mut iov = libc::iovec { iov_base: (&mut byte as *mut u8).cast(), iov_len: 1 };
+    let mut cbuf = [0u64; 8];
+    let len = std::mem::size_of_val(&raw[..]) as u32;
+    // SAFETY: a zeroed msghdr is valid; the control buffer (64 bytes) holds
+    // one header and up to 8 descriptors, more than are ever sent here.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    if raw.is_empty() || raw.len() > 8 {
+        return Err(io::Error::other("1 to 8 descriptors"));
+    }
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast();
+    // SAFETY: CMSG_SPACE only computes a size.
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(len) } as _;
+    // SAFETY: the header fits in cbuf (see above); data is written within it.
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&msg);
+        (*c).cmsg_level = libc::SOL_SOCKET;
+        (*c).cmsg_type = libc::SCM_RIGHTS;
+        (*c).cmsg_len = libc::CMSG_LEN(len) as _;
+        std::ptr::copy_nonoverlapping(raw.as_ptr().cast::<u8>(), libc::CMSG_DATA(c), len as usize);
+    }
+    // SAFETY: msg points at live buffers of the sizes given.
+    if unsafe { libc::sendmsg(s.as_raw_fd(), &msg, 0) } != 1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Plain children: no jail. Development and the Linux tests only.
@@ -80,6 +117,19 @@ impl Launcher for Direct {
             Command::new(self.bin_dir.join("atrium-prelum-render"))
                 .args(args)
                 .stdin(Stdio::from(pdf))
+                .stdout(Stdio::from(theirs))
+                .stderr(Stdio::inherit()),
+        )?;
+        Ok(Proc { sock: ours, stop })
+    }
+
+    fn browse(&self, args: &[String]) -> io::Result<Proc> {
+        let (ours, theirs) = UnixStream::pair()?;
+        let theirs: OwnedFd = theirs.into();
+        let stop = spawn(
+            Command::new(self.bin_dir.join("atrium-prelum-browse"))
+                .args(args)
+                .stdin(Stdio::from(theirs.try_clone()?))
                 .stdout(Stdio::from(theirs))
                 .stderr(Stdio::inherit()),
         )?;
