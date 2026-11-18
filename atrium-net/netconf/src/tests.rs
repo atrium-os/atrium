@@ -138,6 +138,16 @@ impl Backend for Fake {
         self.log.lock().unwrap().push(format!("dns {v:?}"));
         Ok(())
     }
+    fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
+        // Stand-ins for the two sockets: each end of a pair says which it is.
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (c, d) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::Write;
+        (&b).write_all(b"recv").unwrap();
+        (&d).write_all(b"send").unwrap();
+        std::mem::forget((b, d));
+        Ok(("wlan0".into(), [a.into(), c.into()]))
+    }
 }
 
 fn serve_all(dir: &Path, b: Arc<Fake>) {
@@ -242,6 +252,17 @@ fn over_sockets() {
     assert_eq!(s, Status::offline());
     let mut ch = c(Grant::Wifi).subscribe().unwrap();
     assert_eq!(ch.next().unwrap().ssid, Some(b"aura-test".to_vec()));
+
+    // Printer discovery: its own socket only, the two fds in order.
+    assert_eq!(c(Grant::Configure).print_discovery().unwrap_err().0, status::NOT_ALLOWED);
+    let (name, r, w) = c(Grant::PrintDiscovery).print_discovery().unwrap();
+    let said = |f: std::os::fd::OwnedFd| {
+        use std::io::Read;
+        let mut b = [0u8; 4];
+        std::os::unix::net::UnixStream::from(f).read_exact(&mut b).unwrap();
+        b
+    };
+    assert_eq!((name.as_str(), &said(r), &said(w)), ("wlan0", b"recv", b"send"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

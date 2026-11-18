@@ -111,6 +111,15 @@ mod imp {
     }
     const PROBE_CONFIRM_MS: u64 = 5_000;
 
+    /// A ctl reply line with descriptors attached to its first byte.
+    fn send_line_fds(s: &UnixStream, l: &Line, fds: &[std::os::fd::OwnedFd]) -> io::Result<()> {
+        use std::io::Write;
+        let b = l.encode().ok_or_else(|| io::Error::other("line"))?;
+        let raw: Vec<i32> = fds.iter().map(|f| f.as_raw_fd()).collect();
+        let n = atrium_net::spawn::send_bytes_fds(s.as_raw_fd(), &b, &raw)?;
+        (&*s).write_all(&b[n..])
+    }
+
     struct Opts {
         verbose: bool,
         ifaces: Vec<String>,
@@ -317,6 +326,9 @@ mod imp {
         probe_again: Option<(ProbeCfg, u64)>,
         unbound_check_at: u64,
         spawner: Spawner,
+        /// Descriptors for the ctl reply being made (`mdns4`), sent with its
+        /// first line.
+        reply_fds: Vec<std::os::fd::OwnedFd>,
         netd: Option<Dir>,
         /// The interface group pf's NAT rule names (`nat on atrium_egress`):
         /// the egress interface alone is in it. Every interface there was
@@ -1094,6 +1106,25 @@ mod imp {
             }
             match l.verb.as_str() {
                 "status" => self.status(),
+                // Printer discovery's sockets (printing.md §7.1) on the
+                // active interface; only atrium-netconf's root-only
+                // `print-discovery` socket asks for them.
+                "mdns4" => {
+                    let Some(i) = self.announced.and_then(|k| self.ifs.get(k)) else { return err("no-network") };
+                    let Some(addr) = i.applied.lease.as_ref().map(|x| x.addr) else { return err("no-network") };
+                    let name = i.name.clone();
+                    match self.spawner.mdns4(addr) {
+                        Ok((r, w)) => {
+                            self.log(&format!("mdns4: discovery sockets on {name} ({addr})"));
+                            self.reply_fds = vec![r, w];
+                            vec![Line::new("mdns4").with("iface", name), Line::new("ok")]
+                        }
+                        Err(e) => {
+                            eprintln!("atrium-net: mdns4 on {name}: {e}");
+                            err("failed")
+                        }
+                    }
+                }
                 "subscribe" => {
                     self.ctls[j].subscribed = true;
                     ok()
@@ -1566,6 +1597,7 @@ mod imp {
             probe_again: None,
             unbound_check_at: 0,
             spawner,
+            reply_fds: Vec::new(),
             netd: o.netd.as_ref().map(|d| Dir::open(d).unwrap_or_else(|e| die(&format!("{d}: {e}")))),
             egress_group: o.egress_group.clone(),
             ports_seen: all.iter().map(|i| i.name.clone()).collect(),
@@ -1803,8 +1835,13 @@ mod imp {
                         Got::Line(l) => net.ctl(j, &l),
                         _ => vec![Line::new("error").with("why", "bad-line")],
                     };
+                    let fds = std::mem::take(&mut net.reply_fds);
                     for r in reply {
-                        if j < net.ctls.len() && net.ctls[j].c.send(&r).is_err() {
+                        if j >= net.ctls.len() {
+                            break;
+                        }
+                        let sent = if fds.is_empty() || r.verb == "ok" { net.ctls[j].c.send(&r) } else { send_line_fds(&net.ctls[j].c.s, &r, &fds) };
+                        if sent.is_err() {
                             gone.push(j);
                             break;
                         }
