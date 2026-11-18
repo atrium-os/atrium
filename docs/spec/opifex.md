@@ -598,7 +598,7 @@ Only the few-KB manifests travel to the key, and the `--expect` list makes two b
 before anything is signed (a reproducible-build check). The platform key sits on its own
 token, separate from the three root tokens.
 
-### 10.5 Rebuild from source (proposed 2026-11-18)
+### 10.5 Rebuild from source (accepted 2026-11-18)
 
 For people who would rather run what they built themselves. Not a ports tree and not a
 build system of Atrium's own: the release says what it was built from, and a workspace
@@ -1144,4 +1144,4 @@ opifexd, and `fdpass`.)
     identical result keeps the publisher's identity, any other installs as a dev app. No
     ports tree or Atrium build system. Source required for the Atrium catalog, optional
     for third-party ones. Atrium's own app releases are packaged by the same path, then
-    signed as a separate step. *Recommend yes.*
+    signed as a separate step. *Accepted 2026-11-18.*
