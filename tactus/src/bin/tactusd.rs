@@ -453,12 +453,13 @@ fn ps2_start(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &'static str, mut
 
 const BT_SOCKET: &str = "/atrium/sockets/bluetooth-hid/hid.sock";
 
-/// Connects to vinculumd's HID socket, retrying every 2 s while the
-/// Bluetooth service is down or absent.
+/// Connects to vinculumd's HID socket, waiting for it while the Bluetooth
+/// service is down or absent.
 fn bluetooth(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &str) {
     let mut said = false;
     loop {
-        match UnixStream::connect(path) {
+        // Waits on the socket's directory instead of a 2 s poll (fast-boot.md §7).
+        match atrium_listen::connect(path, Some(Duration::from_secs(60))) {
             Ok(c) => {
                 eprintln!("tactusd: Bluetooth HID from {path}");
                 said = false;
@@ -471,7 +472,8 @@ fn bluetooth(hub: &Arc<Hub>, devs: &Arc<Mutex<Devices>>, path: &str) {
             }
             Err(_) => {}
         }
-        std::thread::sleep(Duration::from_secs(2));
+        // After a session ends, a moment before reconnecting.
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

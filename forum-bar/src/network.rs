@@ -123,7 +123,9 @@ pub fn menu(n: &NetShown) -> (Vec<MenuItem>, Vec<Option<NetAction>>) {
 pub fn follow() -> (Receiver<NetMsg>, Sender<NetMsg>) {
     let (tx, rx) = channel();
     let t = tx.clone();
+    let mut backoff = atrium_listen::Backoff::new(Duration::from_secs(3));
     std::thread::spawn(move || loop {
+        let began = std::time::Instant::now();
         let sub = connect(Grant::Wifi).or_else(|_| connect(Grant::Read)).and_then(|c| c.subscribe().map_err(|f| f.1));
         if let Ok(mut ch) = sub {
             while let Ok(s) = ch.next() {
@@ -135,7 +137,8 @@ pub fn follow() -> (Receiver<NetMsg>, Sender<NetMsg>) {
         if t.send(NetMsg::Status(None)).is_err() {
             return;
         }
-        std::thread::sleep(Duration::from_secs(3));
+        // Back as soon as atrium-netconf is (fast-boot.md §7), paced.
+        backoff.after(Client::path(&dir(), Grant::Read), began.elapsed());
     });
     (rx, tx)
 }

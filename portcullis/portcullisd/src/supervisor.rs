@@ -684,17 +684,25 @@ impl Supervisor {
             .filter(|&i| !self.services[i].retired)
             .collect();
 
-        for idx in live_indices {
-            let name = self.services[idx].manifest.name.clone();
-            info!("supervisor: shutting down {}", name);
-
+        /* Phase 1: close every procdesc at once (fast-boot.md §7, B4).
+         * Close → kernel SIGKILLs the jailed proc + reaps the persist=0
+         * jail. Doing this one service at a time, interleaved with its
+         * unmounts and RPCs, serialised every service's exit. */
+        for &idx in &live_indices {
+            info!("supervisor: shutting down {}", self.services[idx].manifest.name);
             let pdfd = self.services[idx].procdesc_fd;
             if pdfd >= 0 {
-                /* Close → kernel SIGKILLs the jailed proc + reaps
-                 * the persist=0 jail. */
                 let _ = ffi::close_fd(pdfd);
                 self.services[idx].procdesc_fd = -1;
             }
+        }
+
+        /* Phase 2: unmount + RemoveJail. A mount can stay busy for a
+         * moment while the killed processes drain; all services share
+         * one 2 s budget for that, not 2 s each. */
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for idx in live_indices {
+            let name = self.services[idx].manifest.name.clone();
 
             /* Unmount this service's create-time mounts (the
              * runtime AttachMount-applied ones are jaild-side
@@ -702,8 +710,19 @@ impl Supervisor {
             let jail_path = self.services[idx].create_req.path.clone();
             let mounts = self.services[idx].create_req.mounts.clone();
             for m in &mounts {
-                if let Err(e) = host_mount::unmount_jail_dest(&jail_path, &m.dest) {
-                    warn!("{}: shutdown unmount {:?} {}: {e}", name, m.kind, m.dest);
+                loop {
+                    match host_mount::unmount_jail_dest(&jail_path, &m.dest) {
+                        Ok(()) => break,
+                        Err(e) if e.raw_os_error() == Some(libc::EBUSY)
+                            && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => {
+                            warn!("{}: shutdown unmount {:?} {}: {e}", name, m.kind, m.dest);
+                            break;
+                        }
+                    }
                 }
             }
 

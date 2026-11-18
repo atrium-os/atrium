@@ -114,13 +114,11 @@ fn main() -> ExitCode {
     let fresco = std::env::var("FRESCO_SOCKET")
         .unwrap_or_else(|_| fresco_client::default_socket_path().to_string_lossy().into_owned());
     let sock = env("SIGILLUM_UI_SOCKET", ui::SOCKET);
+    // Waits on the socket's directory until sigillumd binds (fast-boot.md §7).
     let stream = loop {
-        match UnixStream::connect(&sock) {
+        match atrium_listen::connect(&sock, Some(Duration::from_secs(60))) {
             Ok(s) => break s,
-            Err(e) => {
-                eprintln!("sigillum-ui: {sock}: {e}; retrying in 2 s");
-                std::thread::sleep(Duration::from_secs(2));
-            }
+            Err(e) => eprintln!("sigillum-ui: {sock}: {e}; still waiting"),
         }
     };
     let (tx, rx) = mpsc::channel::<ToUi>();

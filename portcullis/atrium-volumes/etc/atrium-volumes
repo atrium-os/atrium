@@ -55,11 +55,17 @@ atrium_volumes_start() {
         err 1 "policy file ${atrium_volumes_policy} missing"
     fi
 
+    # The socket is bound before the daemon starts (atrium-bind, fast-boot.md
+    # §6.4): the bootstrap's connect queues from now on instead of retrying.
+    _bind=""
+    [ -x /usr/local/bin/atrium-bind ] && \
+        _bind="/usr/local/bin/atrium-bind --path ${atrium_volumes_socket} --mode 0600 --"
+
     echo "Starting ${name}."
     /usr/sbin/daemon -f -p "${pidfile}" \
         -o "${atrium_volumes_logfile}" \
         -t "${name}" \
-        env RUST_LOG="${atrium_volumes_log_level}" \
+        ${_bind} env RUST_LOG="${atrium_volumes_log_level}" \
         "${command}" ${command_args}
 }
 

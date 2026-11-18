@@ -280,13 +280,15 @@ fn now_unix() -> u64 {
 
 /// Bind the listener at `socket_path` (mode 0600). Same shape
 /// as jaild's helper.
+///
+/// Started through `atrium-bind` (its rc script), the socket is already
+/// bound, owned and moded, and waits at fd 3 (fast-boot.md §6.4).
 pub fn bind(socket_path: &Path) -> Result<UnixListener, VolumesError> {
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
+    let (listener, origin) = atrium_listen::listener(socket_path)?;
+    if origin == atrium_listen::Origin::Bound {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(socket_path, perms)?;
     }
-    let listener = UnixListener::bind(socket_path)?;
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(socket_path, perms)?;
     Ok(listener)
 }

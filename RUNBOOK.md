@@ -5972,6 +5972,19 @@ Print service (R2, spec §11.2), against the same oracle:
   `sh scripts/prelum-r3-vm.sh`. That runs atrium-net on vtnet1 with
   `--no-egress-group` so the ipp jails' NAT stays on vtnet0, and lan.py's
   `mdns-printer 10.0.2.2 8661` / `mdns-flood`. Ends with `PASS`.
+- Printing from apps (R4, spec §11.4): `sh scripts/cloud-vm.sh up`, then
+  `sh scripts/prelum-r4-vm.sh [out-dir]` (`NO_BUILD=1` to skip the cross
+  builds, which share `~/ct-x` as their target folder). It runs frescod
+  headless, limend, `atrium-prelum-sheet` as `_prelum-sheet` (65046),
+  prelumd with `--sheet-uid 65046 --registry`, the demo app, Write and
+  Atrium PDF as registry uids, and clicks through the sheet by frescod's
+  inject socket. The sheet sits centred over the app, 48 points down; Print
+  is 80, 36 in from its bottom right. Under TCG a press reaches the sheet
+  seconds later, so the vouched part runs frescod with
+  `FRESCOD_TOKEN_LIFE_MS=15000`. A third-party app must list `print` in its
+  manifest's `embeds`, and a manifest needs `name`, `version` and `entry`
+  or limend can't read it. Run it with `setsid nohup` and never edit the
+  script while it runs (sh reads it as it goes). Ends with `PASS`.
 - By hand: `atrium-prelumd --socket S --state D --spool D [--direct BIN]`,
   then `prelumctl --socket S add ipps://HOST/ipp/print`, `print FILE
   --printer 1 [--wait]`, `jobs`, `cancel N`, `repin 1`.

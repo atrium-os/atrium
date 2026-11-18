@@ -916,7 +916,9 @@ const MEDIA_SOCKET: &str = "/atrium/sockets/media-control/media-control.sock";
 /// choragusd is away.
 fn follow_now_playing() -> std::sync::mpsc::Receiver<Option<NowPlaying>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut backoff = atrium_listen::Backoff::new(Duration::from_secs(5));
     std::thread::spawn(move || loop {
+        let began = std::time::Instant::now();
         if let Ok(mut m) = lyra_protocol::client::Media::connect(MEDIA_SOCKET, false) {
             if m.send(&ToMedia::NowPlaying).is_ok() {
                 while let Ok(ev) = m.recv() {
@@ -931,7 +933,8 @@ fn follow_now_playing() -> std::sync::mpsc::Receiver<Option<NowPlaying>> {
                 return;
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        // Back as soon as choragusd is (fast-boot.md §7), paced.
+        backoff.after(MEDIA_SOCKET, began.elapsed());
     });
     rx
 }
@@ -1005,7 +1008,9 @@ impl AudioAction {
 /// goes into `send` for the bar's own requests, whose answers come back here.
 fn follow_audio(send: Arc<std::sync::Mutex<Option<lyra_protocol::client::Control>>>) -> std::sync::mpsc::Receiver<Option<FromControl>> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut backoff = atrium_listen::Backoff::new(Duration::from_secs(5));
     std::thread::spawn(move || loop {
+        let began = std::time::Instant::now();
         if let Ok(mut c) = lyra_protocol::client::Control::connect(AUDIO_CONTROL_SOCKET) {
             *send.lock().unwrap() = c.try_clone().ok();
             if c.send(&ToControl::List).is_ok() && c.send(&ToControl::ListOutputs).is_ok() {
@@ -1020,7 +1025,7 @@ fn follow_audio(send: Arc<std::sync::Mutex<Option<lyra_protocol::client::Control
                 return;
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        backoff.after(AUDIO_CONTROL_SOCKET, began.elapsed());
     });
     rx
 }
@@ -1044,7 +1049,9 @@ enum StickMsg {
 fn follow_sticks() -> (std::sync::mpsc::Receiver<StickMsg>, std::sync::mpsc::Sender<StickMsg>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let t = tx.clone();
+    let mut backoff = atrium_listen::Backoff::new(Duration::from_secs(2));
     std::thread::spawn(move || loop {
+        let began = std::time::Instant::now();
         if let Ok(mut ev) = atrium_media::client::Events::open(std::path::Path::new(STICKS_SOCKET)) {
             if t.send(StickMsg::Reset).is_err() {
                 return;
@@ -1058,7 +1065,7 @@ fn follow_sticks() -> (std::sync::mpsc::Receiver<StickMsg>, std::sync::mpsc::Sen
                 return;
             }
         }
-        std::thread::sleep(Duration::from_secs(2));
+        backoff.after(STICKS_SOCKET, began.elapsed());
     });
     (rx, tx)
 }

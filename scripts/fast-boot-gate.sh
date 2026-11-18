@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fast-boot gate for B1 + B2 (docs/spec/fast-boot.md §9), on the Mac dev VM.
+# Fast-boot gate for B1-B5 (docs/spec/fast-boot.md §9), on the Mac dev VM.
 # Runs on the HOST with the VM up, started with a sound card so lyrad has a
 # device:
 #
@@ -20,6 +20,11 @@
 #              race to lyrad)
 #   restart  kill lyrad: its socket keeps its inode (the supervisor's copy),
 #            lyrad comes back, choragusd is running again within 10 s
+#   bind     B5: atrium-volumes started through atrium-bind holds the socket
+#            at fd 3 with ATRIUM_LISTEN_FDS=1
+#   shutdown B4: stopping the bootstrap takes the whole stack down at once
+#            (procdescs closed together); prints the time it took
+#   netif    rc.conf's interface lines and the netif share of rc, for trimming
 #   efi      print the firmware boot entries (the 5 s "X64 image" detour)
 #
 # KERNELS=1 also boots, once each through nextboot (falls back by itself):
@@ -56,7 +61,8 @@ V true >/dev/null 2>&1 || die "the VM does not answer on ssh"
 
 say "build (host, cross)"
 (cd "$ROOT/portcullis" && cargo build -q --release --target "$TARGET" \
-    -p jaild -p portcullisd -p ostiarius) || die "portcullis build"
+    -p jaild -p portcullisd -p ostiarius -p atrium-volumes) || die "portcullis build"
+(cd "$ROOT/atrium-listen" && cargo build -q --release --target "$TARGET" --bin atrium-bind) || die "atrium-bind build"
 for c in lyra choragus; do
     (cd "$ROOT/$c" && cargo build -q --release --target "$TARGET" --bins) || die "$c build"
 done
@@ -71,6 +77,8 @@ for b in atrium-jaild atrium-portcullisd-bootstrap atrium-portcullisd-daemon; do
 done
 # The services.d manifest runs ostiarius as atrium-ostiarius.
 put "$P/ostiarius" /usr/local/bin/atrium-ostiarius && ok "atrium-ostiarius" || bad "ostiarius copy"
+put "$P/atrium-volumes" /usr/local/bin/atrium-volumes && ok "atrium-volumes" || bad "atrium-volumes copy"
+put "$ROOT/atrium-listen/target/$TARGET/release/atrium-bind" /usr/local/bin/atrium-bind && ok "atrium-bind" || bad "atrium-bind copy"
 put "$ROOT/lyra/target/$TARGET/release/lyrad" /var/tmp/lyrad && put "$ROOT/choragus/target/$TARGET/release/choragusd" /var/tmp/choragusd \
     || bad "lyrad/choragusd copy"
 for f in portcullis/jaild/etc/atrium-jaild portcullis/atrium-volumes/etc/atrium-volumes \
@@ -110,7 +118,9 @@ done
 # B3: wait (up to 90 s: ostiarius's readiness times out after 60 s without
 # frescod) until the boot order has settled.
 for _ in $(seq 1 45); do
-    V 'grep -q "boot settled" /var/log/atrium/portcullisd-bootstrap.log' 2>/dev/null && break
+    # The log is appended across boots: look only after this boot's
+    # "loaded N enabled service manifest(s)" line.
+    V 'awk "/enabled service manifest/{s=0} /boot settled/{s=1} END{exit !s}" /var/log/atrium/portcullisd-bootstrap.log' 2>/dev/null && break
     sleep 2
 done
 V 'cat /var/log/atrium/portcullisd-bootstrap.log' > "$OUT/bootstrap.log" 2>&1
@@ -147,6 +157,41 @@ V 'pgrep -x atrium-lyrad >/dev/null' && ok "lyrad back" || bad "lyrad not restar
 V 'pgrep -x atrium-choragusd >/dev/null' && ok "choragusd running" || bad "choragusd not running after lyrad's restart"
 V 'tail -n 30 /var/log/atrium/portcullisd-bootstrap.log' > "$OUT/restart.log"
 
+say "bind (B5)"
+V 'sysrc -n atrium_volumes_enable 2>/dev/null' > "$OUT/volumes-enable.txt"
+echo "  atrium_volumes_enable=$(cat "$OUT/volumes-enable.txt")"
+V 'service atrium-volumes status >/dev/null 2>&1 || service atrium-volumes onestart' >/dev/null 2>&1
+sleep 1
+vp=$(V 'pgrep -x atrium-volumes' | head -1 | tr -d '\r')
+if [ -n "$vp" ]; then
+    V "procstat -f $vp; procstat -e $vp" > "$OUT/volumes-fds.txt" 2>&1
+    awk '$3 == 3 && $4 == "s"' "$OUT/volumes-fds.txt" | grep -q "atrium-volumes.sock" \
+        && ok "atrium-volumes holds its socket at fd 3" || bad "atrium-volumes fd 3 is not its socket (see volumes-fds.txt)"
+    grep -q "ATRIUM_LISTEN_FDS=1" "$OUT/volumes-fds.txt" && ok "atrium-volumes got ATRIUM_LISTEN_FDS=1" || bad "atrium-volumes has no ATRIUM_LISTEN_FDS"
+    V 'tail -n 5 /var/log/atrium/atrium-volumes.log' > "$OUT/volumes-tail.txt" 2>&1
+else
+    bad "atrium-volumes is not running"; V 'tail -n 20 /var/log/atrium/atrium-volumes.log' 2>&1 | sed 's/^/    /'
+fi
+
+say "shutdown (B4)"
+n0=$(V 'pgrep -f "^atrium-" | wc -l' | tr -d ' \r')
+t0=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
+V 'service atrium-portcullisd-bootstrap stop' > "$OUT/shutdown.txt" 2>&1
+t1=$(perl -MTime::HiRes=time -e 'printf "%d", time*1000')
+V 'tail -n 40 /var/log/atrium/portcullisd-bootstrap.log' > "$OUT/shutdown-log.txt" 2>&1
+grep -q "graceful shutdown complete" "$OUT/shutdown-log.txt" && ok "graceful shutdown complete" || bad "no \"graceful shutdown complete\" in the bootstrap log"
+grep "shutdown unmount\|shutdown RemoveJail" "$OUT/shutdown-log.txt" | head -5 | sed 's/^/    /'
+echo "  stop took $((t1 - t0)) ms (incl. one ssh round trip), $n0 atrium processes before"
+V 'service atrium-portcullisd-bootstrap start' >/dev/null 2>&1
+sleep 3
+V 'pgrep -x atrium-lyrad >/dev/null' && ok "stack back after the restart" || bad "lyrad not back after restarting the bootstrap"
+
+say "netif"
+V 'grep -E "^(ifconfig|ipv6|rtsol|dhclient|background_dhclient|synchronous_dhclient|defaultroute|netwait)" /etc/rc.conf; sysctl net.inet6.ip6.dad_count net.inet.ip.dad_count 2>/dev/null; ifconfig -a | grep -E "^[a-z]|inet6? "' > "$OUT/netif.txt" 2>&1
+sed 's/^/  /' "$OUT/netif.txt"
+r="$OUT/boot/run-3/boottrace.txt"
+[ -f "$r" ] && grep -E "netif|dhclient|routing|defaultroute|netwait" "$r" | sed 's/^/  /' > "$OUT/netif-trace.txt" && cat "$OUT/netif-trace.txt"
+
 say "efi"
 V 'efibootmgr -v' > "$OUT/efibootmgr.txt" 2>&1; cat "$OUT/efibootmgr.txt"
 
@@ -174,3 +219,4 @@ fi
 echo
 echo "results in $OUT"
 echo "fast-boot: $FAILS failed"
+[ "$FAILS" = 0 ]

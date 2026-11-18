@@ -106,9 +106,15 @@ atrium_net_start() {
     install -d -m 0700 -o root -g wheel /var/db/atrium-net /atrium/sockets/atrium-net
     args=$(atrium_net_args)
     echo "Starting ${name}:${args:- no port yet (waiting for one)}."
+    # The control socket is bound before atrium-net starts (atrium-bind,
+    # fast-boot.md §6.4), so atrium-netconf's connect queues instead of
+    # retrying while atrium-net comes up.
+    _bind=""
+    [ -x /usr/local/bin/atrium-bind ] && \
+        _bind="/usr/local/bin/atrium-bind --path /atrium/sockets/atrium-net/ctl.sock --mode 0600 --"
     # -r -R 2: started again 2 s after any exit; -P: the supervisor's pid.
     /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_net_logfile}" -t "${name}" \
-        /bin/sh /usr/local/etc/rc.d/atrium-net onerun
+        ${_bind} /bin/sh /usr/local/etc/rc.d/atrium-net onerun
 }
 
 atrium_net_stop() {

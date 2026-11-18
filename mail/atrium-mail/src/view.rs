@@ -200,6 +200,16 @@ pub enum LookBody {
 /// whole window, as Scrinium's picker draws there.
 pub const PICK_SLOT: pergola::slot::SlotKey = 0x4d41_5056;
 
+/// What prints for a message (printing.md §5.1): its subject, who and
+/// when, and its text, which the app lays out as a PDF for the print sheet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrintAsk {
+    pub msg: MsgId,
+    pub subject: String,
+    pub head: String,
+    pub text: String,
+}
+
 /// The quick look viewer's slot.
 pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4d41_4c4b;
 
@@ -350,6 +360,8 @@ pub struct Mail {
     composes: Rc<RefCell<Vec<(mail_engine::compose::Compose, Option<u64>)>>>,
     /// Attachment asks for the app.
     asks: Rc<RefCell<Vec<FileAsk>>>,
+    /// Print (⌃P) asked for, for the app.
+    print: Rc<RefCell<Option<PrintAsk>>>,
     /// The search being typed.
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
@@ -894,6 +906,37 @@ impl Mail {
     /// What the app should do with attachments now.
     pub fn take_file_asks(&self) -> Vec<FileAsk> {
         std::mem::take(&mut *self.asks.borrow_mut())
+    }
+
+    /// Print the message keys act on (⌃P): its text, as it reads.
+    pub fn print_current(&self) -> bool {
+        let ui = self.ui.get_cloned();
+        let Some(r) = &ui.reading else { return false };
+        let Some(m) = r.current() else { return false };
+        if ui.saving {
+            self.file_note("Finish saving first, then print".into());
+            return true;
+        }
+        let text = match &m.body {
+            Some(Body { plain: Some(p), .. }) => p.lines.iter().map(|l| format!("{}{}", "> ".repeat(l.depth as usize), l.text)).collect::<Vec<_>>().join("\n"),
+            Some(Body { document: Some(d), .. }) => mail_compose::quote::text_of(&d.0.html),
+            _ => m.preview.clone(),
+        };
+        let from = if m.from.is_empty() || m.sender.name == m.from { m.sender.name.clone() } else { format!("{} <{}>", m.sender.name, m.from) };
+        let mut head = format!("From: {from}");
+        if !m.to.is_empty() {
+            head.push_str(&format!("\nTo: {}", m.to));
+        }
+        if !m.date.is_empty() {
+            head.push_str(&format!("\nDate: {}", m.date));
+        }
+        *self.print.borrow_mut() = Some(PrintAsk { msg: m.msg, subject: r.subject.clone(), head, text });
+        true
+    }
+
+    /// The print asked for, for the app.
+    pub fn take_print(&self) -> Option<PrintAsk> {
+        self.print.borrow_mut().take()
     }
 
     /// The picker for a Save is up, or gone.
@@ -1745,6 +1788,9 @@ impl Mail {
         if ui.search.as_ref().is_some_and(|s| s.typing) {
             return self.search_key(key, *modifiers, chars);
         }
+        if modifiers.ctrl && !modifiers.alt && !modifiers.meta && *key == Key::Char && chars.eq_ignore_ascii_case("p") {
+            return self.print_current();
+        }
         if modifiers.ctrl || modifiers.alt || modifiers.meta {
             return false;
         }
@@ -2047,6 +2093,7 @@ impl MailView {
             monstrator: Rc::new(monstrator::socket()),
             composes: Rc::default(),
             asks: Rc::default(),
+            print: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
             unwrapper: Rc::default(),
@@ -2495,7 +2542,8 @@ impl MailView {
         let mut bx = x0 + w - 16.0;
         use mail_compose::reply::Kind;
         let m = &self.mail;
-        let buttons: [(&str, &str, Box<dyn Fn()>); 6] = [
+        let buttons: [(&str, &str, Box<dyn Fn()>); 7] = [
+            ("Print", "⌃P", { let m = m.clone(); Box::new(move || { m.print_current(); }) }),
             ("Delete", "#", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Delete)) }),
             ("Later", "l", { let m = m.clone(); Box::new(move || m.ask_later()) }),
             ("Archive", "e", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Archive)) }),

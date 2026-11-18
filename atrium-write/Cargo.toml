@@ -26,6 +26,7 @@ officina-text = { path = "../officina-text" }
 # Pictures come from the convert worker (officina_convert::pictures).
 officina-pdf = { path = "../officina-pdf", default-features = false }
 officina-spell = { path = "../officina-spell" }
+fresco-client = { path = "../fresco-client" }
 pergola = { path = "../pergola" }
 pergola-richtext = { path = "../pergola-richtext", default-features = false }
 limen = { path = "../limen" }

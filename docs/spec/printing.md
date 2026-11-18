@@ -706,6 +706,68 @@ persona rule (§7.1) waits for personas in R7; `_uscan` for scanners.
 
 Next: R4, the `print` role, `prelum-sheet` and the apps.
 
+### 11.4 R4 as built (2026-11-18)
+
+- **Limen `print` role** (`limen::print`): a system role served by `_prelum-sheet`
+  (uid 65046, `LIMEN_PRELUM_UID`), in a **sheet** slot (760 × 540) rather than §5.2's
+  plain slot, so frescod centres it over the app, dims the app and frames it as a
+  system sheet. `takes_fd` and `returns_fd`. Messages as in §5.1, plus `SavePdf { name }`
+  and `Saved` (child to parent, below). A third-party app names `print` in its
+  manifest's `embeds`; platform apps may embed any role. limend's rate rule as §5.2:
+  one sheet per window, and after three opens in a minute one each 2 s (`RATE`).
+  A sealed memfd (`F_SEAL_WRITE|GROW|SHRINK`) counts as read-only, so an app can hand
+  over a PDF it made in memory without a file.
+- **prelumd**: `PREVIEW` (small RGB images of the sheets asked for, from a
+  `prelum-render` jail, at most 8 at a time, 400 px on the long side), `SAVE_PDF` (the
+  §6.2 rewrite into an unlinked spool file, handed back as the reply's descriptor;
+  layouts the rewrite can't keep are refused with "try all pages, one per sheet") and
+  `FOR app-uid`: only `--sheet-uid` may send it, once per connection, and prelumd then
+  acts for the app's person from the launch registry (`--registry`). Printers stay
+  keyed by the person; per-persona printers are R7.
+- **`atrium-prelum-sheet`**: one process for every open sheet, with a thread per
+  sheet (§5.2 said a process per sheet; the sheet parses nothing, so one process is
+  enough). Each sheet has its own window and its own prelumd connection after `FOR`.
+  Left: previews from prelumd, with Previous and Next. Right: the destinations (saved
+  printers, then nearby ones, then Save as PDF), copies, pages (all or a range), paper,
+  pages per sheet, scale, with the printer's status line. Escape is Cancel.
+  **Print** counts only a press frescod vouches for: the sheet guards the button's
+  rect (`window_guard`) and spends the press as `PROMPT` on frescod's activation
+  socket, which refuses a token that is unknown, old, or for a guard that was covered,
+  moved or newly shown in the last 500 ms.
+- **Save as PDF** goes back through the app: the sheet sends `SavePdf` with the
+  rewritten PDF, then `Saved`, and `pergola::print` opens the picker's Save in the same
+  slot and copies the PDF into the file the person picks. The app still never learns
+  where it went.
+- **`pergola::print`**: `Printing::start` (a file) or `start_bytes` (bytes, sealed in
+  memory), then `handle` on every Embeds event, which gives `Relayout`, or the end:
+  queued, saved (the name), cancelled or failed.
+- **Apps**: Write (Print… and Ctrl+P: officina-pdf in memory, the document's own paper as
+  the hint). Mail (Print and ⌃P in the reader: the message's subject, sender, recipients,
+  date and text through `officina_pdf::plain`, laid out again when the sheet's paper
+  changes; the HTML stays in the doc-viewer's jail, so pictures and formatting don't
+  print yet. Ctrl+P in a PDF attachment's quick look prints the attachment). Atrium
+  PDF (the `pdf-viewer` child sends `PrintAsked` on Ctrl+P and the parent prints the
+  file it handed over; standalone, Ctrl+P prints the file). `prelum-print-demo` is the
+  test app.
+
+Checks:
+
+- Unit tests: limen (the role, sealed PDFs, Save as PDF through the parent, one sheet
+  per window and the rate), prelum-render previews, prelumd's layout checks and unnamed
+  spool files, the sheet's state and view, `pergola::print` with a picker, Mail's ⌃P
+  (in its window test with real parse jails), `officina_pdf::plain`.
+- `scripts/prelum-r4-vm.sh` in the FreeBSD VM, with frescod headless, limend, the sheet
+  as `_prelum-sheet`, prelumd's jailed workers and ippeveprinter on the host:
+  25/25 pass (press rule, print, cancel, Save as PDF, rate, Write, Atrium PDF).
+
+Not yet: Sheets, Slides and the Navigator have no PDF output to hand the sheet (the
+Navigator needs a paged rendering of a page in its jail); Mail prints text only;
+colour, two-sided and tray options wait for R5's attributes; Scrinium's
+quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
+Pergola (`officina_pdf::plain` is the text half).
+
+Next: R5.
+
 ## 12. Decisions, with recommendations
 
 1. **Driverless only** (IPP Everywhere, AirPrint, Mopria; network and IPP over USB); no

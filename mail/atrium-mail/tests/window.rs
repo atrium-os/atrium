@@ -119,10 +119,20 @@ fn list_and_read() {
     app.tick();
     assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Lunch on Friday?");
     assert!(texts(&app).iter().any(|x| x == "Shall we try the new place?"));
+    // ⌃P prints the message as it reads: its subject, who and when, its text.
+    assert!(mail.take_print().is_none());
+    let ctrl_p = Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Modifiers::default() }, chars: "p".into() };
+    assert!(mail.key(&ctrl_p, None));
+    let p = mail.take_print().unwrap();
+    assert_eq!((p.subject.as_str(), p.text.as_str()), ("Lunch on Friday?", "Shall we try the new place?"));
+    assert!(p.head.starts_with("From: Lena <lena@partner.example>\nTo: Priya"), "{:?}", p.head);
+    assert!(texts(&app).iter().any(|x| x == "Print"), "the reader has a Print button");
     assert!(mail.key(&key("k"), None));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "This week");
     assert_eq!(r.framed, Some(0), "an HTML-only message goes to the doc-viewer");
+    assert!(mail.key(&ctrl_p, None));
+    assert_eq!(mail.take_print().unwrap().text.trim(), "Only HTML here", "an HTML body prints its text");
     assert!(mail.key(&key("k"), None));
     let r = mail.ui.get_cloned().reading.unwrap();
     assert_eq!(r.subject, "Headers only so far");

@@ -365,12 +365,23 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
         let _ = tx.send(FromPane::End(embed, m));
     };
     loop {
-        match win.step(&mut app, Some(Duration::from_millis(30))) {
+        // Escape is Cancel.
+        let mut escape = false;
+        let stepped = win.step_with(&mut app, Some(Duration::from_millis(30)), |ev| {
+            let esc = matches!(ev, fresco_client::Event::Key { hid_usage: 0x29, pressed: true, .. });
+            escape |= esc;
+            esc
+        });
+        match stepped {
             Ok(StepResult::Closed) | Err(_) => {
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 return gone(&tx);
             }
             _ => {}
+        }
+        if escape {
+            eprintln!("prelum-sheet: {who}: Escape");
+            return end(&tx, &stop, ToParent::Cancelled);
         }
         if Instant::now() > until {
             return end(&tx, &stop, ToParent::Cancelled);
@@ -447,6 +458,9 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
                 Done::Nearby(n) => set(&|s| s.set_nearby(n.clone())),
                 Done::Preview { gen: g, r } if g == gen => match r {
                     Ok(p) => {
+                        if first_preview {
+                            eprintln!("prelum-sheet: {who}: previews: {} of {} sheets", p.images.len(), p.sheets);
+                        }
                         first_preview = false;
                         let pics: Vec<(u32, pergola::node::Image)> = p.images.iter().filter_map(|i| view::picture(i.w, i.h, &i.rgb).map(|im| (i.sheet, im))).collect();
                         v.pictures.set(pics);

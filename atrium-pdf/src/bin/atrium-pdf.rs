@@ -69,6 +69,16 @@ struct PdfView {
     tiles: Rc<RefCell<TileCache<Image>>>,
     wants: Rc<RefCell<Wants>>,
     sizes: Rc<RefCell<Vec<(f64, f64)>>>,
+    /// The print sheet is over the window (standalone only).
+    printing: Mutable<bool>,
+}
+
+/// The print sheet's slot, over the whole window.
+const PRINT_SLOT: pergola::slot::SlotKey = 0x5052_4e54;
+
+/// Ctrl+P, pressed.
+fn ctrl_p(ev: &fresco_client::Event) -> bool {
+    matches!(ev, fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 && modifiers & 0b1100_1100 == 0)
 }
 
 impl PdfView {
@@ -79,6 +89,17 @@ impl PdfView {
 
 impl View for PdfView {
     fn render(&self, ctx: &mut Ctx) {
+        self.render_pages(ctx);
+        if self.printing.get() {
+            let (w, h) = self.size.get();
+            let id = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, PRINT_SLOT);
+        }
+    }
+}
+
+impl PdfView {
+    fn render_pages(&self, ctx: &mut Ctx) {
         let _ = self.drawn.get();
         let (w, h) = self.size.get();
         let canvas = self.canvas();
@@ -372,6 +393,7 @@ fn new_app(size: (f32, f32), density: f32) -> (App<PdfView>, PdfView) {
         tiles: Rc::new(RefCell::new(TileCache::new(TILE_CACHE_BYTES))),
         wants: Rc::new(RefCell::new(Wants::default())),
         sizes: Rc::new(RefCell::new(Vec::new())),
+        printing: Mutable::with_dirty(false, dirty.clone()),
     };
     (App::new_with_flag(view.clone(), dirty), view)
 }
@@ -420,12 +442,47 @@ fn standalone(path: &str, dark: bool) {
     view.dark.set(dark);
     let mut run = Run::new(view);
     run.load(&mut LogOut, std::fs::File::open(path).ok());
+    // Ctrl+P prints the file through the system's print sheet.
+    let embeds = pergola::embed::Embeds::connect().map_err(|e| eprintln!("atrium-pdf: no limend ({e:?}); printing is off")).ok();
+    if let Some(e) = &embeds {
+        window.set_slot_binder(pergola::embed::Embeds::binder(e));
+    }
+    let title = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut printing: Option<pergola::print::Printing> = None;
     loop {
-        match window.step(&mut app, Some(TICK)) {
+        let mut asked = false;
+        match window.step_with(&mut app, Some(TICK), |ev| {
+            asked |= ctrl_p(ev);
+            ctrl_p(ev)
+        }) {
             Ok(StepResult::Event(ev)) => run.window_event(&ev),
             Ok(StepResult::Closed) => return,
             Ok(_) => {}
             Err(e) => die(format_args!("frescod: {e}")),
+        }
+        if let (true, None, Some(e), Some(token)) = (asked, &printing, &embeds, window.embed_token()) {
+            let started = std::fs::File::open(path).map_err(|e| format!("{e}")).and_then(|f| {
+                use std::os::fd::AsFd;
+                pergola::print::Printing::start(e, token, PRINT_SLOT, f.as_fd(), &title, false, None).map_err(|e| format!("{e:?}"))
+            });
+            match started {
+                Ok(p) => {
+                    printing = Some(p);
+                    run.view.printing.set(true);
+                }
+                Err(why) => eprintln!("atrium-pdf: print: the sheet didn't open: {why}"),
+            }
+        }
+        if let (Some(p), Some(e)) = (printing.as_mut(), &embeds) {
+            let ev = e.borrow_mut().poll(Duration::ZERO);
+            match ev.as_ref().ok().and_then(|ev| ev.as_ref()).and_then(|ev| p.handle(e, ev)) {
+                Some(pergola::print::Step::Done(o)) => {
+                    eprintln!("atrium-pdf: print: {o:?}");
+                    printing = None;
+                    run.view.printing.set(false);
+                }
+                _ => {}
+            }
         }
         run.tick(&mut LogOut);
     }
@@ -491,11 +548,19 @@ fn embedded() {
                 Err(e) => die(format_args!("limend: {e:?}")),
             }
         }
-        match window.step(&mut app, Some(TICK)) {
+        let mut asked = false;
+        match window.step_with(&mut app, Some(TICK), |ev| {
+            asked |= ctrl_p(ev);
+            ctrl_p(ev)
+        }) {
             Ok(StepResult::Event(ev)) => run.window_event(&ev),
             Ok(StepResult::Closed) => return,
             Ok(_) => {}
             Err(e) => die(format_args!("frescod: {e}")),
+        }
+        // Ctrl+P: the parent prints the PDF it handed over.
+        if asked && run.engine.is_some() {
+            out.send(ToParent::PrintAsked);
         }
         run.tick(&mut out);
     }

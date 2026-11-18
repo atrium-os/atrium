@@ -515,6 +515,50 @@ fn write_image<W: Write>(o: &mut Writer<W>, doc: &TextDoc, image: u32) -> io::Re
     Ok(Some(n))
 }
 
+/// One block of a [`plain`] document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plain<'a> {
+    /// A heading (the Heading 2 style).
+    Heading(&'a str),
+    /// Text, a paragraph for each line.
+    Text(&'a str),
+}
+
+/// The most characters of text [`plain`] lays out; the rest is cut.
+pub const PLAIN_MAX: usize = 4 << 20;
+
+/// Text that has no page layout of its own (a message, a reader page, a
+/// terminal) as a PDF on paper `w_pt` × `h_pt` points with 2 cm margins:
+/// what an app hands the print sheet (printing.md §5.1, `print_text`).
+pub fn plain(title: &str, blocks: &[Plain<'_>], w_pt: u32, h_pt: u32) -> io::Result<Vec<u8>> {
+    let mut d = TextDoc::new();
+    let heading = d.styles.by_name("Heading 2").unwrap_or(0);
+    let mut left = PLAIN_MAX;
+    for b in blocks {
+        let (text, style) = match *b {
+            Plain::Heading(t) => (t, heading),
+            Plain::Text(t) => (t, 0),
+        };
+        for line in text.split('\n') {
+            if left == 0 {
+                break;
+            }
+            let line: String = line.trim_end_matches('\r').chars().filter(|c| !c.is_control() || *c == '\t').take(left).collect();
+            left = left.saturating_sub(line.chars().count() + 1);
+            d.push_para(&line, style, Vec::new());
+        }
+    }
+    if d.blocks.len() > 1 {
+        d.blocks.remove(0);
+    }
+    // Points to twips, kept to a sane sheet.
+    let tw = |pt: u32| (pt.clamp(144, 14400) * 20) as i32;
+    let margin = 1134;
+    d.page = officina_text::model::PageSetup { width: tw(w_pt), height: tw(h_pt), margin_top: margin, margin_bottom: margin, margin_start: margin, margin_end: margin };
+    let fonts = PinnedFonts::new().map_err(io::Error::other)?;
+    export(&d, &fonts, &fonts, &Info { title: title.into() }, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +601,15 @@ mod tests {
         let text = String::from_utf8_lossy(&pdf);
         assert!(text.contains("/Em"), "the page names the pictures");
         assert_eq!(text.matches("/SMask").count(), 2, "two emoji pictures, one each");
+    }
+    #[test]
+    fn plain_text_is_paged_on_the_paper_asked_for() {
+        let body = "Hello,\n\nthe minutes are attached.\n".repeat(80);
+        let pdf = plain("Minutes", &[Plain::Heading("Minutes"), Plain::Text("From: Ana\nTo: Ben"), Plain::Text(&body)], 612, 792).unwrap();
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.starts_with("%PDF"));
+        assert!(text.contains("612 792"), "US Letter pages");
+        let n: usize = text.split("/Count").nth(1).and_then(|r| r.trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).unwrap_or(0);
+        assert!(n >= 2, "240 lines take more than a page ({n})");
     }
 }

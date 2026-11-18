@@ -196,6 +196,19 @@ fn look(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, engine
     Ok(e)
 }
 
+/// A message as a PDF on `paper`, made on a thread of its own (text only:
+/// the HTML stays in the doc-viewer's jail; its text is what prints).
+fn message_pdf(ask: &atrium_mail::view::PrintAsk, paper: pergola::print::Paper) -> mpsc::Receiver<Result<Vec<u8>, String>> {
+    let (tx, rx) = mpsc::channel();
+    let ask = ask.clone();
+    std::thread::spawn(move || {
+        use officina_pdf::Plain;
+        let r = officina_pdf::plain(&ask.subject, &[Plain::Heading(&ask.subject), Plain::Text(&ask.head), Plain::Text(""), Plain::Text(&ask.text)], paper.w_pt, paper.h_pt);
+        let _ = tx.send(r.map_err(|e| e.to_string()));
+    });
+    rx
+}
+
 /// A compose window and its state.
 struct ComposeWin {
     win: Window,
@@ -368,6 +381,11 @@ fn main() {
     let mut saving: Option<(limen::proto::EmbedId, u64, atrium_mail::files::File)> = None;
     // A message the viewer couldn't be asked for, not asked again.
     let mut failed: Option<u64> = None;
+    // Printing a message: what prints, its PDF being made (and whether
+    // that answers the sheet's Relayout), and the print sheet once up.
+    let mut print_ask: Option<atrium_mail::view::PrintAsk> = None;
+    let mut print_pdf: Option<(mpsc::Receiver<Result<Vec<u8>, String>>, bool)> = None;
+    let mut printing: Option<pergola::print::Printing> = None;
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine.clone(), dirty.clone(), (win.width, win.height), now);
     let mail = view.mail.clone();
@@ -648,6 +666,46 @@ fn main() {
                 },
             }
         }
+        if let Some(ask) = mail.take_print() {
+            if print_ask.is_some() || saving.is_some() {
+                mail.file_note("Already printing or saving".into());
+            } else if embeds.is_none() || win.embed_token().is_none() {
+                mail.file_note("Printing needs Limen, which isn't running".into());
+            } else {
+                print_pdf = Some((message_pdf(&ask, pergola::print::Paper::A4), false));
+                print_ask = Some(ask);
+            }
+        }
+        if let Some((rx, again)) = &print_pdf {
+            let again = *again;
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                r => {
+                    print_pdf = None;
+                    let r = r.map_err(|_| "the layout stopped".to_string()).and_then(|r| r);
+                    let r = match (r, &embeds, win.embed_token(), again) {
+                        (Ok(pdf), Some(e), _, true) => printing.as_mut().map(|p| p.document_bytes(e, &pdf).map_err(|e| format!("{e:?}"))).unwrap_or(Ok(())),
+                        (Ok(pdf), Some(e), Some(token), false) => {
+                            let title = print_ask.as_ref().map(|a| a.subject.clone()).unwrap_or_default();
+                            pergola::print::Printing::start_bytes(e, token, atrium_mail::view::PICK_SLOT, &pdf, &title, true, None).map(|p| {
+                                printing = Some(p);
+                                mail.set_saving(true);
+                            }).map_err(|e| format!("the print sheet didn't open ({e:?})"))
+                        }
+                        (Ok(_), ..) => Err("Limen isn't running".into()),
+                        (Err(e), ..) => Err(e),
+                    };
+                    if let Err(why) = r {
+                        mail.file_note(format!("Couldn't print: {why}"));
+                        if let (Some(p), Some(e)) = (printing.take(), &embeds) {
+                            p.cancel(e);
+                        }
+                        print_ask = None;
+                        mail.set_saving(false);
+                    }
+                }
+            }
+        }
         if let Some(embeds) = &embeds {
             let want = mail.looking();
             if want.as_ref().map(|(m, f)| (*m, &f.which)) != looked.as_ref().map(|(m, w, _)| (*m, w)) {
@@ -694,6 +752,38 @@ fn main() {
             }
             loop {
                 let ev = embeds.borrow_mut().poll(Duration::from_millis(0));
+                let step = match (&mut printing, &ev) {
+                    (Some(p), Ok(Some(pev))) => p.handle(embeds, pev),
+                    _ => None,
+                };
+                if let Some(step) = step {
+                    use pergola::print::{Orientation, Outcome, Paper, Step};
+                    match step {
+                        Step::Relayout { paper, orientation, .. } => {
+                            if let Some(ask) = &print_ask {
+                                let p = match orientation {
+                                    Orientation::Portrait => paper,
+                                    Orientation::Landscape => Paper { w_pt: paper.h_pt, h_pt: paper.w_pt },
+                                };
+                                print_pdf = Some((message_pdf(ask, p), true));
+                            }
+                        }
+                        Step::Done(o) => {
+                            printing = None;
+                            print_ask = None;
+                            print_pdf = None;
+                            mail.set_saving(false);
+                            match o {
+                                Outcome::Queued => mail.file_note("Sent to the printer".into()),
+                                Outcome::Saved(name) => mail.file_note(format!("Saved {name}")),
+                                Outcome::Cancelled => {}
+                                Outcome::Failed(why) => mail.file_note(format!("Couldn't print: {why}")),
+                            }
+                        }
+                        Step::Pending => {}
+                    }
+                    continue;
+                }
                 match ev {
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if frame.as_ref().is_some_and(|f| f.embed == embed) => {
                         match limen::doc_viewer::ToParent::decode(&bytes) {
@@ -769,6 +859,24 @@ fn main() {
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if saving.as_ref().is_some_and(|s| s.0 == embed) => {
                         saving = None;
                         mail.set_saving(false);
+                    }
+                    // Ctrl+P in a PDF's quick look: print the attachment as it is.
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if looked.as_ref().is_some_and(|l| l.2 == embed) => {
+                        let asked = limen::pdf_viewer::ToParent::decode(&bytes) == Some(limen::pdf_viewer::ToParent::PrintAsked);
+                        if let (true, None, None, Some((msg, f)), Some(token)) = (asked, &print_ask, &saving, mail.looking(), win.embed_token()) {
+                            let r = engine.attachment(msg, &f.which).map_err(|e| e.to_string()).and_then(|a| {
+                                let title = f.name.strip_suffix(".pdf").unwrap_or(&f.name).to_string();
+                                pergola::print::Printing::start_bytes(embeds, token, atrium_mail::view::PICK_SLOT, &a.bytes, &title, false, None).map_err(|e| format!("the print sheet didn't open ({e:?})"))
+                            });
+                            match r {
+                                Ok(p) => {
+                                    printing = Some(p);
+                                    print_ask = Some(atrium_mail::view::PrintAsk { msg, subject: f.name.clone(), head: String::new(), text: String::new() });
+                                    mail.set_saving(true);
+                                }
+                                Err(why) => mail.file_note(format!("Couldn't print {}: {why}", f.name)),
+                            }
+                        }
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if looked.as_ref().is_some_and(|l| l.2 == embed) => {
                         looked = None;
