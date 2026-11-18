@@ -5,11 +5,12 @@
 //! that can't change (the parallel path of recalculation), a range read with an
 //! equality criterion is walked once into a map from the cells' keys to their
 //! count and sums, and every later row is a lookup. Sums are added in the order
-//! the walk would add them, so results are the same to the last bit.
+//! the walk would add them, so results are the same to the last bit. One cache
+//! serves every thread and every slice of the group.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::criteria::Key;
 use crate::addr::Rect;
@@ -35,6 +36,10 @@ const MAX_INDEXES: usize = 8;
 /// Distinct keys an index may hold before the range is left unindexed.
 pub const MAX_KEYS: usize = 4 << 20;
 
+/// The indexes of one group's evaluation, shared by its threads.
+#[derive(Default)]
+pub struct Shared(Mutex<Cache>);
+
 #[derive(Default)]
 struct Cache {
     seen: HashMap<Shape, u32>,
@@ -42,16 +47,16 @@ struct Cache {
 }
 
 thread_local! {
-    static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+    static CACHE: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
 }
 
-/// While held, -IF calls on this thread may index their ranges: hold it only
-/// while the workbook can't change.
+/// While held, -IF calls on this thread may index their ranges into `shared`:
+/// hold it only while the ranges a group reads can't change.
 pub struct Frozen(());
 
 impl Frozen {
-    pub fn new() -> Frozen {
-        CACHE.with(|c| *c.borrow_mut() = Some(Cache::default()));
+    pub fn new(shared: &Arc<Shared>) -> Frozen {
+        CACHE.with(|c| *c.borrow_mut() = Some(shared.clone()));
         Frozen(())
     }
 }
@@ -66,9 +71,10 @@ impl Drop for Frozen {
 /// `build` (which walks the ranges calling its argument with each matching
 /// candidate's keys and value), or None to walk as usual.
 pub fn lookup(shape: Shape, keys: &[Key], build: impl FnOnce(&mut dyn FnMut(Vec<Key>, Option<f64>)) -> bool) -> Option<Agg> {
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        let cache = c.as_mut()?;
+    let shared = CACHE.with(|c| c.borrow().clone())?;
+    let mut cache = shared.0.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let cache = &mut *cache;
         if let Some((_, idx)) = cache.built.iter().find(|(s, _)| *s == shape) {
             let idx = idx.as_ref()?;
             return Some(idx.get(keys).copied().unwrap_or_default());
@@ -102,5 +108,5 @@ pub fn lookup(shape: Shape, keys: &[Key], build: impl FnOnce(&mut dyn FnMut(Vec<
         let out = idx.as_ref().map(|m| m.get(keys).copied().unwrap_or_default());
         cache.built.push((shape, idx));
         out
-    })
+    }
 }

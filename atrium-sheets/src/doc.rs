@@ -360,7 +360,14 @@ pub struct Doc {
     /// The password, while a protected document is open: saves and the
     /// journal are encrypted with it.
     pub protection: Option<Protection>,
+    /// How long an edit may recalculate before it hands the window back (the
+    /// app's event loop finishes the work a slice a frame). None: all at once,
+    /// as tests and batch work want.
+    pub recalc_budget: Option<std::time::Duration>,
 }
+
+/// The app's recalculation slice: well under a frame at 30 Hz.
+pub const RECALC_SLICE: std::time::Duration = std::time::Duration::from_millis(12);
 
 impl Doc {
     pub fn new(name: &str) -> Self {
@@ -370,7 +377,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -445,6 +452,27 @@ impl Doc {
         }
     }
 
+    /// Recalculates within the budget; what's left waits for [`Doc::settle`].
+    pub fn recalc(&mut self) {
+        match self.recalc_budget {
+            Some(b) => {
+                self.wb.recalc_for(b);
+            }
+            None => {
+                self.wb.recalc();
+            }
+        }
+    }
+
+    /// Another slice of unfinished recalculation: true when work remains.
+    pub fn settle(&mut self) -> bool {
+        if !self.wb.recalc_pending() {
+            return false;
+        }
+        self.recalc();
+        self.wb.recalc_pending()
+    }
+
     /// Runs `ops` as one undo step: applied, journaled, recalculated.
     pub fn run(&mut self, label: &str, ops: Vec<GridOp>) {
         if ops.is_empty() {
@@ -453,7 +481,7 @@ impl Doc {
         let r = Record::Run { label: label.into(), ops };
         self.journal(&r);
         self.replay(r);
-        self.wb.recalc();
+        self.recalc();
         self.dirty = true;
     }
 
@@ -531,7 +559,7 @@ impl Doc {
         }
         self.journal(&Record::Undo);
         self.history.undo(&mut self.wb);
-        self.wb.recalc();
+        self.recalc();
         self.dirty = true;
         true
     }
@@ -542,7 +570,7 @@ impl Doc {
         }
         self.journal(&Record::Redo);
         self.history.redo(&mut self.wb);
-        self.wb.recalc();
+        self.recalc();
         self.dirty = true;
         true
     }
@@ -612,6 +640,41 @@ mod tests {
         let d = std::env::temp_dir().join(format!("atrium-sheets-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_slow_edit_hands_the_window_back_and_greys_what_is_not_done() {
+        use pergola::widgets::GridSource;
+        let rows = 20_000u32;
+        let mut d = Doc::new("slow");
+        let a: Vec<f64> = (0..rows).map(|r| (r % 97) as f64).collect();
+        d.wb.set_numbers(0, 0, 0, &a);
+        d.wb.set_value(CellAddr::new(0, 0, 5), Value::Num(1.0));
+        d.wb.fill_formula(0, 1, 0, rows - 1, &format!("=COUNTIF($A$1:$A${rows},\">\"&A1)*$F$1")).unwrap();
+        d.wb.recalc();
+        let before = d.wb.value(0, rows - 1, 1);
+        d.recalc_budget = Some(RECALC_SLICE);
+        let t = std::time::Instant::now();
+        assert!(d.type_into(0, 5, "2"));
+        assert!(t.elapsed() < RECALC_SLICE * 5, "the edit held the window {:?}", t.elapsed());
+        assert!(d.wb.recalc_pending());
+        let doc = std::rc::Rc::new(std::cell::RefCell::new(d));
+        let src = crate::source::SheetSource::new(doc.clone());
+        let last = src.cell(rows - 1, 1).unwrap();
+        assert_eq!(last.color, Some(pergola::theme::palette::neutral_400()), "an old value is shown greyed");
+        let mut d = doc.borrow_mut();
+        assert_eq!(d.wb.value(0, rows - 1, 1), before);
+        let mut slices = 0;
+        while d.settle() {
+            slices += 1;
+        }
+        assert!(slices > 0);
+        drop(d);
+        let d = doc.borrow();
+        let Value::Num(x) = d.wb.value(0, rows - 1, 1) else { panic!() };
+        let Value::Num(y) = before else { panic!() };
+        assert_eq!(x, 2.0 * y);
+        assert_ne!(src.cell(rows - 1, 1).unwrap().color, Some(pergola::theme::palette::neutral_400()));
     }
 
     fn v(doc: &Doc, r: u32, c: u32) -> Value {

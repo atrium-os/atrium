@@ -262,6 +262,10 @@ pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid:
 
 /// Runs `cmd`; says what happened (or why nothing did) in the status line.
 pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
+    // Sorting, filtering and pivots read values: finish recalculating first.
+    if d.wb.recalc_pending() {
+        d.wb.recalc();
+    }
     let msg = match apply(d, sel, cursor, cmd) {
         Ok(m) | Err(m) => m,
     };

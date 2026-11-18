@@ -37,6 +37,11 @@ pub struct RecalcStats {
 /// Below this many rows a group is evaluated on one thread.
 const PAR_MIN: u64 = 8192;
 
+/// Rows in a slice of a group evaluated against a deadline.
+const SLICE: u64 = 8;
+/// A wave of slices quicker than this doubles the next one.
+const WAVE_QUICK: std::time::Duration = std::time::Duration::from_millis(4);
+
 /// Cell-graph edges one on-demand evaluation may walk (cycles among large fills).
 pub const MAX_DEMAND_EDGES: u64 = 64 << 20;
 
@@ -44,27 +49,65 @@ impl Workbook {
     /// Recalculates everything affected by changes since the last call: rounds of
     /// [`Workbook::recalc_pass`] while dynamic arrays spill into cells others read.
     pub fn recalc(&mut self) -> RecalcStats {
+        self.recalc_until(None).0
+    }
+
+    /// Recalculates for about `budget`, then stops between groups (or between
+    /// slices of a long group) and leaves the rest pending: true when everything
+    /// is done. Call it again, as the UI does each frame, while
+    /// [`Workbook::recalc_pending`]; cells not yet done keep their old values and
+    /// [`Workbook::is_stale`] says which. Edits made in between join the work.
+    pub fn recalc_for(&mut self, budget: std::time::Duration) -> (RecalcStats, bool) {
+        self.recalc_until(Some(Instant::now() + budget))
+    }
+
+    /// Whether recalculation has work left (a [`Workbook::recalc_for`] that ran out
+    /// of time, or edits since the last one).
+    pub fn recalc_pending(&self) -> bool {
+        !self.pending.is_empty() || !self.changed.is_empty()
+    }
+
+    /// Whether the formula in a cell has inputs that changed and hasn't been
+    /// recalculated since (its value is the old one).
+    pub fn is_stale(&self, sheet: u16, row: u32, col: u32) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        self.group_at(sheet, row, col).is_some_and(|g| self.pending.get(&g).is_some_and(|rs| rs.contains(row)))
+    }
+
+    fn recalc_until(&mut self, deadline: Option<Instant>) -> (RecalcStats, bool) {
         let t0 = Instant::now();
         let mut stats = RecalcStats::default();
         self.recalcs += 1;
         self.spill_edits();
         for _ in 0..crate::spill::MAX_SPILL_ROUNDS {
-            self.recalc_pass(&mut stats);
-            if !self.apply_spills() {
+            let done = self.recalc_pass(&mut stats, deadline);
+            let more = self.apply_spills();
+            if !done {
+                stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
+                return (stats, false);
+            }
+            if !more {
                 break;
             }
         }
         self.claims.clear();
         // Past the last round: the last writes' readers once more, without spilling.
         if !self.changed.is_empty() {
-            self.recalc_pass(&mut stats);
+            let done = self.recalc_pass(&mut stats, deadline);
             self.spill_out.lock().unwrap().clear();
+            if !done {
+                stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
+                return (stats, false);
+            }
         }
         stats.millis = t0.elapsed().as_secs_f64() * 1000.0;
-        stats
+        (stats, true)
     }
 
-    fn recalc_pass(&mut self, stats: &mut RecalcStats) {
+    /// One pass; false when `deadline` passed first (what is left is pending).
+    fn recalc_pass(&mut self, stats: &mut RecalcStats, deadline: Option<Instant>) -> bool {
         let mut dirty: HashMap<GroupId, RowSet> = HashMap::new();
         let mut edges: HashSet<(GroupId, GroupId)> = HashSet::new();
         // Work list: (source group, rows newly dirty) or (None, changed rect).
@@ -121,11 +164,29 @@ impl Workbook {
         let sccs = tarjan(&nodes, &adj);
 
         for scc in sccs.into_iter().rev() {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                // Out of time: what is still dirty waits for the next call.
+                for (g, rs) in dirty {
+                    let p = self.pending.entry(g).or_default();
+                    for (a, b) in rs.0 {
+                        p.add(a, b);
+                    }
+                }
+                return false;
+            }
             if scc.len() == 1 {
                 let g = scc[0];
                 let rows = dirty.remove(&g).unwrap_or_default();
                 if !edges.contains(&(g, g)) {
-                    self.eval_parallel(g, &rows, stats);
+                    if !self.eval_parallel(g, &rows, stats, deadline) {
+                        for (g, rs) in dirty {
+                            let p = self.pending.entry(g).or_default();
+                            for (a, b) in rs.0 {
+                                p.add(a, b);
+                            }
+                        }
+                        return false;
+                    }
                     continue;
                 }
                 match self.self_order(g) {
@@ -147,6 +208,7 @@ impl Workbook {
                 self.eval_demand(&m, stats);
             }
         }
+        true
     }
 
     /// For a group that reads itself: `Some(true)` if every self-reference is to rows
@@ -200,20 +262,23 @@ impl Workbook {
         (v, false)
     }
 
-    fn eval_parallel(&mut self, g: GroupId, rows: &RowSet, stats: &mut RecalcStats) {
+    /// False when `deadline` passed between slices (the rest is pending).
+    fn eval_parallel(&mut self, g: GroupId, rows: &RowSet, stats: &mut RecalcStats, deadline: Option<Instant>) -> bool {
         let total = rows.len();
         if total == 0 {
-            return;
+            return true;
         }
         stats.groups += 1;
         stats.cells += total;
         let (sheet, col) = (self.group(g).sheet, self.group(g).col);
         // Partition the runs into about 4 parts per thread.
         let threads = self.threads.max(1);
-        let parts: Vec<Vec<(u32, u32)>> = if total < PAR_MIN || threads == 1 {
+        // With a deadline: small slices, handed out in waves that grow while
+        // they are quick, so a slow formula stops near the deadline.
+        let parts: Vec<Vec<(u32, u32)>> = if deadline.is_none() && (total < PAR_MIN || threads == 1) {
             vec![rows.0.clone()]
         } else {
-            let per = total.div_ceil(threads as u64 * 4).max(PAR_MIN / 2);
+            let per = if deadline.is_some() { SLICE } else { total.div_ceil(threads as u64 * 4).max(PAR_MIN / 2) };
             let mut parts = vec![];
             let mut cur = vec![];
             let mut n = 0u64;
@@ -239,10 +304,11 @@ impl Workbook {
             }
             parts
         };
-        let this: &Workbook = self;
-        let compute = |part: &Vec<(u32, u32)>| -> (Vec<Value>, u64) {
-            // The workbook can't change until every part is done.
-            let _frozen = crate::eval::ifcache::Frozen::new();
+        let shared = std::sync::Arc::new(crate::eval::ifcache::Shared::default());
+        let compute = |this: &Workbook, part: &Vec<(u32, u32)>| -> (Vec<Value>, u64) {
+            // What the group reads can't change until every part is done (it
+            // doesn't read its own column).
+            let _frozen = crate::eval::ifcache::Frozen::new(&shared);
             let grp = this.group(g);
             let bound = grp.fast.as_ref().map(|f| f.bind(this));
             let mut out = Vec::with_capacity(part.iter().map(|&(a, b)| (b - a) as usize + 1).sum());
@@ -256,24 +322,52 @@ impl Workbook {
             }
             (out, fast)
         };
-        let results: Vec<(Vec<Value>, u64)> = if parts.len() == 1 {
-            vec![compute(&parts[0])]
-        } else {
-            std::thread::scope(|s| {
-                let hs: Vec<_> = parts.iter().map(|p| std::thread::Builder::new().stack_size(16 << 20).spawn_scoped(s, || compute(p)).unwrap()).collect();
-                hs.into_iter().map(|h| h.join().unwrap()).collect()
-            })
-        };
-        for (part, (vals, fast)) in parts.iter().zip(results) {
-            stats.fast_cells += fast;
-            let mut it = vals.into_iter();
-            for &(a, b) in part {
-                for r in a..=b {
-                    let v = it.next().unwrap();
-                    self.store(sheet, r, col, &v);
+        // Without a deadline, one wave of a thread a part; with one, waves of a
+        // run of parts per thread, the runs growing while waves are quick.
+        let mut per_thread = 1usize;
+        let mut i = 0;
+        while i < parts.len() {
+            if i > 0 && deadline.is_some_and(|d| Instant::now() >= d) {
+                let p = self.pending.entry(g).or_default();
+                for part in &parts[i..] {
+                    for &(a, b) in part {
+                        p.add(a, b);
+                    }
+                }
+                return false;
+            }
+            let n = if deadline.is_some() { (threads * per_thread).min(parts.len() - i) } else { parts.len() };
+            let these = &parts[i..i + n];
+            i += n;
+            let runs: Vec<&[Vec<(u32, u32)>]> = if deadline.is_some() { these.chunks(per_thread).collect() } else { these.chunks(1).collect() };
+            let t = Instant::now();
+            let this: &Workbook = self;
+            let run = |r: &[Vec<(u32, u32)>]| -> Vec<(Vec<Value>, u64)> { r.iter().map(|p| compute(this, p)).collect() };
+            let results: Vec<(Vec<Value>, u64)> = if runs.len() == 1 {
+                run(runs[0])
+            } else {
+                std::thread::scope(|s| {
+                    let hs: Vec<_> = runs.iter().map(|r| std::thread::Builder::new().stack_size(16 << 20).spawn_scoped(s, || run(r)).unwrap()).collect();
+                    hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+                })
+            };
+            if t.elapsed() < WAVE_QUICK {
+                per_thread = (per_thread * 2).min(1 << 14);
+            } else if t.elapsed() > WAVE_QUICK * 4 {
+                per_thread = (per_thread / 2).max(1);
+            }
+            for (part, (vals, fast)) in these.iter().zip(results) {
+                stats.fast_cells += fast;
+                let mut it = vals.into_iter();
+                for &(a, b) in part {
+                    for r in a..=b {
+                        let v = it.next().unwrap();
+                        self.store(sheet, r, col, &v);
+                    }
                 }
             }
         }
+        true
     }
 
     fn eval_sequential(&mut self, g: GroupId, rows: &RowSet, top_down: bool, stats: &mut RecalcStats) {

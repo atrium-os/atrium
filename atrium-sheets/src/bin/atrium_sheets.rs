@@ -206,6 +206,8 @@ impl Run {
         let format = match t {
             Target::Picked { format, .. } | Target::Path { format, .. } => *format,
         };
+        // A file keeps every value as it should be: finish recalculating first.
+        { let mut d = self.sheets.doc.borrow_mut(); if d.wb.recalc_pending() { d.wb.recalc(); } }
         let r = {
             let d = self.sheets.doc.borrow();
             encode(&d, format).and_then(|bytes| match t {
@@ -243,6 +245,7 @@ impl Run {
     }
 
     fn save_into(&mut self, dir: &Path) {
+        { let mut d = self.sheets.doc.borrow_mut(); if d.wb.recalc_pending() { d.wb.recalc(); } }
         let (stem, bytes) = {
             let d = self.sheets.doc.borrow();
             (stem_of(&d.name).to_string(), encode(&d, Format::Native))
@@ -442,8 +445,12 @@ fn main() {
     // Closing waits on Save As (true), and Don't Save drops the changes.
     let mut close_after_save = false;
     let mut discard = false;
+    let mut recalculating = false;
     'main: loop {
-        match win.step(&mut app, Some(Duration::from_millis(if asking.is_some() { 20 } else { 250 }))) {
+        // While a recalculation is unfinished, a slice of it each turn (the
+        // window answers in between) and no waiting for input.
+        let wait = if recalculating { 1 } else if asking.is_some() { 20 } else { 250 };
+        match win.step(&mut app, Some(Duration::from_millis(wait))) {
             // Unsaved changes: ask first. Asked to close again while asking (or
             // while picking), the changes stay in the autosave folder.
             Ok(StepResult::Closed) if run.sheets.doc.borrow().dirty && !run.sheets.closing.get() && asking.is_none() => {
@@ -452,6 +459,16 @@ fn main() {
             }
             Ok(StepResult::Closed) | Err(_) => break,
             _ => {}
+        }
+        {
+            let mut d = run.sheets.doc.borrow_mut();
+            d.recalc_budget = Some(atrium_sheets::doc::RECALC_SLICE);
+            let was = recalculating;
+            recalculating = d.settle();
+            drop(d);
+            if was || recalculating {
+                run.sheets.changed();
+            }
         }
         if size.get() != (win.width, win.height) {
             size.set((win.width, win.height));
