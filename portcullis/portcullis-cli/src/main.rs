@@ -22,6 +22,11 @@ usage:
     portcullis validate <atrium.toml>
         Parses and validates a manifest. Exits 0 on success.
 
+    portcullis trust <app-id|app-tree>
+        Runs the launch trust gate on an app tree as a launch that must be
+        signed would (an app from a third-party catalog: its publisher's
+        keys there). Prints whose key signed it; exits 1 if refused.
+
     portcullis launch [--dry-run | --no-prompt] [--persona NAME] <app-id|app-tree>
         Reads <tree>/atrium.toml, builds a jail.conf section, and
         launches the jail.
@@ -135,6 +140,10 @@ fn main() -> ExitCode {
             if args.len() != 3 { usage(); }
             cmd_validate(&args[2])
         }
+        "trust" => {
+            if args.len() != 3 { usage(); }
+            cmd_trust(&args[2])
+        }
         "launch" => {
             if args.len() < 3 { usage(); }
             let mut dry_run = false;
@@ -210,6 +219,31 @@ fn main() -> ExitCode {
         other => {
             eprintln!("portcullis: unknown subcommand {other:?}");
             usage();
+        }
+    }
+}
+
+fn cmd_trust(arg: &str) -> ExitCode {
+    let tree = resolve_app_tree(arg);
+    let text = match fs::read_to_string(tree.join("atrium.toml")) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("portcullis trust: {}: {e}", tree.join("atrium.toml").display());
+            return ExitCode::from(1);
+        }
+    };
+    match portcullis_trust::Trust::load().verify_publisher(&tree, &text, portcullis_trust::Demand::Required) {
+        Ok(Some(id)) => {
+            println!("{}: signed by {}", tree.display(), id.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("{}: unsigned, allowed", tree.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("portcullis trust: REFUSED: {e}");
+            ExitCode::from(1)
         }
     }
 }

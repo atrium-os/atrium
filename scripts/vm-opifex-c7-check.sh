@@ -22,7 +22,9 @@
 #   - a rotated key updates in the background on the daily round; after a
 #     recovery the next update waits for a person;
 #   - a forged entry under the catalog key is refused and the copy unchanged;
-#   - alice can't unfollow it; root can, and the app stays installed.
+#   - alice can't unfollow it; root can, and the app stays installed;
+#   - launch trust (portcullis trust, the launch gate) takes the installed
+#     app on its publisher's key in the catalog, before and after rotation.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ARCH=${ARCH:-amd64}
@@ -41,18 +43,19 @@ ARCHN=aarch64
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p opifex \
-    --bin opifex --bin opifexd --bin opifex-check --bin opifex-fetch) || { echo "build failed"; echo "opifex-c7: 1 failed"; exit 1; }
+    --bin opifex --bin opifexd --bin opifex-check --bin opifex-fetch -p portcullis-cli --bin portcullis) || { echo "build failed"; echo "opifex-c7: 1 failed"; exit 1; }
 
 B=/var/tmp/opifex-c7
 APP=test.example.hello
 V "pkill -x opifexd; sleep 1; rm -rf $B /var/db/atrium/opifex /var/lib/atrium/opifex; mkdir -p $B"
-for f in opifex opifexd opifex-check opifex-fetch; do
+for f in opifex opifexd opifex-check opifex-fetch portcullis; do
     scp -q $K -P 2222 "$TGT/$TARGET/release/$f" root@localhost:$B/ || { echo "copy $f failed"; echo "opifex-c7: 1 failed"; exit 1; }
 done
 V 'sh -s' <<EOS
 set -e
 install -m 0755 $B/opifex /usr/local/bin/opifex
 install -m 0755 $B/opifexd /usr/local/sbin/opifexd
+install -m 0755 $B/portcullis /usr/local/bin/portcullis
 mkdir -p /usr/local/libexec; install -m 0755 $B/opifex-check /usr/local/libexec/opifex-check
 chmod +x $B/opifex-fetch
 id _opifex >/dev/null 2>&1 || pw useradd _opifex -u 65041 -d /nonexistent -s /usr/sbin/nologin -c "Opifex worker"
@@ -142,10 +145,15 @@ check "only the RP that named the app" "1" "$(echo "$R" | grep -c 'verified_rps 
 check "the tree is in apps/" "yes" "$(V "cmp -s $B/b-$APP-1.0/bin/hello /var/lib/atrium/apps/$APP/bin/hello && echo yes")"
 check "the dropped RP logged" "1" "$(V "grep -c 'WebAuthn RP dropped: login.example.test' $B/opifexd.log" | awk '{print ($1>0)}')"
 
+check "launch trust: its publisher's key" "1" "$(V "portcullis trust $APP" 2>&1 | grep -c 'signed by')"
+
 echo "=== keys change"
 V "cd $B && opifex catalog publisher web/apps.example.test/cat rotate --id $PID --key ex2.pub.pem --sign ex1.pem --sign ex2.pem >/dev/null && sh publish.sh $APP 1.1 ex2"
 check "rotated: goes in on its own" "1" "$(Q sync >/dev/null; A updates | grep $APP | grep -c 'goes in on its own')"
 check "the daily round installs it" "1" "$(Q tick | grep -c "updated $APP 1.1")"
+check "launch trust: the rotated key" "1" "$(V "portcullis trust $APP" 2>&1 | grep -c 'signed by')"
+V "rm -rf /tmp/c7t && mkdir -p /tmp/c7t/$APP && cp $B/b-test.bank.app-1.0/atrium.toml $B/b-test.bank.app-1.0/atrium.toml.sig /tmp/c7t/$APP/"
+check "launch trust: another publisher's signature is refused" "1" "$(V "portcullis trust /tmp/c7t/$APP" 2>&1 | grep -c 'REFUSED')"
 V "cd $B && opifex catalog publisher web/apps.example.test/cat recover --id $PID --key ex3.pub.pem --sign keys/root1.pem --sign keys/root2.pem --sign ex3.pem >/dev/null && sh publish.sh $APP 1.2 ex3"
 Q sync >/dev/null
 check "after a recovery it waits for a person" "1" "$(A updates | grep $APP | grep -c 'asks for more')"

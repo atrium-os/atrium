@@ -53,6 +53,11 @@ pub const TRUST_CONFIG: &str = "/etc/atrium/trust.toml";
 /// this key alone, and this key verifies nothing else, so a third party's
 /// publisher can't pose as a dev build or the reverse.
 pub const DEV_PUBLISHER_DIR: &str = "/var/db/atrium/dev-publisher";
+/// opifexd's state (opifex.md §7.5, §6.5): `installed.toml` says where each
+/// app came from; `catalogs/<slug>/catalog.toml` holds a third-party
+/// catalog's publishers as this machine replayed them from its log.
+pub const OPIFEX_STATE: &str = "/var/db/atrium/opifex";
+
 /// App ids of dev bundles: `dev.<workspace>.<the manifest's id>`.
 pub const DEV_PREFIX: &str = "dev.";
 
@@ -74,6 +79,7 @@ pub struct Trust {
     publishers_dir: PathBuf,
     require_signatures: bool,
     dev_dir: PathBuf,
+    opifex_state: PathBuf,
 }
 
 impl Default for Trust {
@@ -84,7 +90,14 @@ impl Trust {
     /// Explicit settings — the constructor tests use, and the one to reach for
     /// when a caller already knows its policy.
     pub fn new(publishers_dir: impl Into<PathBuf>, require_signatures: bool) -> Self {
-        Trust { publishers_dir: publishers_dir.into(), require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR) }
+        Trust { publishers_dir: publishers_dir.into(), require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR),
+                opifex_state: PathBuf::from(OPIFEX_STATE) }
+    }
+
+    /// Where opifexd's state is (tests).
+    pub fn with_opifex_state(mut self, d: impl Into<PathBuf>) -> Self {
+        self.opifex_state = d.into();
+        self
     }
 
     /// Where the dev publisher's key is (tests).
@@ -115,7 +128,8 @@ impl Trust {
                 }
             },
         };
-        Trust { publishers_dir, require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR) }
+        Trust { publishers_dir, require_signatures, dev_dir: PathBuf::from(DEV_PUBLISHER_DIR),
+                opifex_state: PathBuf::from(OPIFEX_STATE) }
     }
 
     pub fn require_signatures(&self) -> bool { self.require_signatures }
@@ -147,6 +161,16 @@ impl Trust {
                 .map(Some)
                 .map_err(|e| format!("a dev build not signed by this machine's dev publisher ({e:?})"));
         }
+        // ★ An app from a third-party catalog: its publisher's keys in that
+        // catalog alone, never unsigned (opifex.md §6.5, C7).
+        if let Some(app_id) = tree.file_name().and_then(|n| n.to_str()) {
+            if let Some(keys) = self.catalog_publisher_keys(app_id)? {
+                let sig = manifest_signature(&tree.join("atrium.toml.sig"));
+                return portcullis_sig::verify_trusted_publisher(manifest_text.as_bytes(), &sig, &keys)
+                    .map(Some)
+                    .map_err(|e| format!("{app_id}: not signed by its catalog publisher's key ({e:?})"));
+            }
+        }
         let publishers = load_trusted_publishers(
             self.publishers_dir.to_str().unwrap_or(PUBLISHERS_DIR));
         if publishers.is_empty() {
@@ -169,6 +193,48 @@ impl Trust {
                 Some(id)
             })
             .map_err(|e| format!("manifest not signed by a trusted publisher ({e:?})"))
+    }
+}
+
+impl Trust {
+    /// For an app opifexd installed from a third-party catalog
+    /// (`installed.toml`: `source = "catalog:<slug>"` with
+    /// `catalogs/<slug>/` present), the keys its publisher signs with: the
+    /// current one and its past keys, so a tree installed before a rotation
+    /// still checks. `Ok(None)`: not such an app, the ordinary gate decides.
+    /// A record naming a publisher the catalog no longer has, or one whose
+    /// prefixes don't cover the app, is refused rather than passed on.
+    fn catalog_publisher_keys(&self, app_id: &str) -> Result<Option<Vec<String>>, String> {
+        let Ok(text) = std::fs::read_to_string(self.opifex_state.join("installed.toml")) else { return Ok(None) };
+        let installed: toml::Value = text.parse()
+            .map_err(|e| format!("{}/installed.toml is malformed ({e}); refusing catalog apps", self.opifex_state.display()))?;
+        let Some(rec) = installed.get("app").and_then(|a| a.as_array())
+            .and_then(|a| a.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(app_id))) else { return Ok(None) };
+        let field = |k: &str| rec.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let Some(slug) = field("source").strip_prefix("catalog:") else { return Ok(None) };
+        if slug.is_empty() || slug.contains('/') || slug.starts_with('.') {
+            return Err(format!("{app_id}: installed from {:?}, not a catalog this machine follows", field("source")));
+        }
+        let dir = self.opifex_state.join("catalogs").join(slug);
+        if !dir.is_dir() {
+            // The Atrium catalog (`catalog/`): its signers are the system's.
+            return Ok(None);
+        }
+        let local: toml::Value = std::fs::read_to_string(dir.join("catalog.toml"))
+            .map_err(|e| format!("{app_id}: catalog {slug}: {e}"))?
+            .parse().map_err(|e| format!("{app_id}: catalog {slug}: {e}"))?;
+        let want = field("publisher");
+        let p = local.get("publisher").and_then(|a| a.as_array())
+            .and_then(|a| a.iter().find(|p| !want.is_empty() && p.get("id").and_then(|v| v.as_str()) == Some(want)))
+            .ok_or_else(|| format!("{app_id}: its publisher {want:?} is no longer in catalog {slug}"))?;
+        let strs = |k: &str| p.get(k).and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+        if !strs("prefixes").iter().any(|pre| !pre.is_empty() && app_id.starts_with(pre.as_str())) {
+            return Err(format!("{app_id}: not under a domain its publisher {want} proved in catalog {slug}"));
+        }
+        let mut keys: Vec<String> = p.get("key").and_then(|v| v.as_str()).map(String::from).into_iter().collect();
+        keys.extend(strs("past_keys"));
+        Ok(Some(keys))
     }
 }
 
@@ -340,5 +406,59 @@ mod tests {
             t.verify(d.path(), "[app]\n", Demand::PolicyDefault)
                 .expect_err("an unsigned manifest must be refused once trust is configured");
         }
+    }
+
+    /// ★ An app from a third-party catalog launches on its publisher's key in
+    /// that catalog (current or past), whatever /etc/atrium/publishers holds,
+    /// and on nothing else.
+    #[test]
+    fn third_party_catalog_apps_take_their_publishers_keys() {
+        let d = tmp();
+        let (old, old_pem) = portcullis_sig::new_key([5; 32]).unwrap();
+        let (cur, cur_pem) = portcullis_sig::new_key([6; 32]).unwrap();
+        let (other, other_pem) = portcullis_sig::new_key([7; 32]).unwrap();
+        let st = d.path().join("opifex");
+        std::fs::create_dir_all(st.join("catalogs/acme")).unwrap();
+        let q = |s: &str| format!("{s:?}");
+        std::fs::write(st.join("catalogs/acme/catalog.toml"), format!(
+            "name = \"acme\"\nsize = 1\n[[publisher]]\nid = \"pub:00aa\"\nname = \"Acme\"\ndomains = [\"acme.example\"]\n\
+             prefixes = [\"example.acme.\"]\nkinds = [\"app\"]\nkey = {}\nkey_id = \"x\"\npast = [\"y\"]\npast_keys = [{}]\n",
+            q(&cur_pem), q(&old_pem))).unwrap();
+        let rec = |id: &str, source: &str, publisher: &str| format!(
+            "[[app]]\nid = \"{id}\"\nversion = \"1\"\nkind = \"app\"\npublisher = \"{publisher}\"\nsource = \"{source}\"\ninstalled_by = 0\ntime = 0\n");
+        std::fs::write(st.join("installed.toml"), [
+            rec("example.acme.notes", "catalog:acme", "pub:00aa"),
+            rec("org.other.app", "catalog:acme", "pub:00aa"),
+            rec("example.acme.gone", "catalog:acme", "pub:ffff"),
+            rec("org.side.load", "side-load", "abc"),
+        ].concat()).unwrap();
+        // A system publisher is configured: it signs nothing of the catalog's.
+        std::fs::create_dir_all(d.path().join("pubs")).unwrap();
+        std::fs::write(d.path().join("pubs/sys.pem"), &other_pem).unwrap();
+        let t = Trust::new(d.path().join("pubs"), true).with_opifex_state(&st);
+        let app = |id: &str, key: &str| {
+            let tree = d.path().join("apps").join(id);
+            std::fs::create_dir_all(&tree).unwrap();
+            let text = format!("[app]\nid = \"{id}\"\n");
+            std::fs::write(tree.join("atrium.toml.sig"), portcullis_sig::sign(text.as_bytes(), key).unwrap()).unwrap();
+            (tree, text)
+        };
+        let (tree, text) = app("example.acme.notes", &cur);
+        let id = t.verify_publisher(&tree, &text, Demand::PolicyDefault).expect("current key");
+        assert_eq!(id, Some(portcullis_sig::publisher_id(&cur_pem).unwrap()));
+        let (tree, text) = app("example.acme.notes", &old);
+        t.verify(&tree, &text, Demand::PolicyDefault).expect("a past key: installed before a rotation");
+        let (tree, text) = app("example.acme.notes", &other);
+        t.verify(&tree, &text, Demand::PolicyDefault).expect_err("a system publisher doesn't sign for the catalog's");
+        let (tree, text) = app("org.other.app", &cur);
+        let why = t.verify(&tree, &text, Demand::PolicyDefault).expect_err("outside its proved domains");
+        assert!(why.contains("proved"), "{why}");
+        let (tree, text) = app("example.acme.gone", &cur);
+        t.verify(&tree, &text, Demand::PolicyDefault).expect_err("a publisher the catalog dropped");
+        // Not from a third-party catalog: the ordinary gate.
+        let (tree, text) = app("org.side.load", &other);
+        t.verify(&tree, &text, Demand::PolicyDefault).expect("system publisher");
+        let (tree, text) = app("org.side.load", &cur);
+        t.verify(&tree, &text, Demand::PolicyDefault).expect_err("the catalog publisher's key isn't a system one");
     }
 }

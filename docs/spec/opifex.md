@@ -984,9 +984,15 @@ font on demand and a driver from a `nobody` device's notice.
   catalog made with `opifex catalog init`, followed after its preview, a proven publisher's app
   offered and installed for one person, an unproven publisher's never offered, WebAuthn RPs
   verified, rotation and recovery, a forged entry refused with the copy unchanged.
-- Not yet: launch trust for apps from added catalogs (portcullis-trust's gate knows only
-  `/etc/atrium/publishers`; reading opifexd's record and the publisher's keys is the
-  platform thread's, told 2026-11-18); Sigillum reading `verified_rps` and keying private
+- Launch trust for apps from added catalogs (2026-11-18): when `installed.toml` says an app
+  came from `catalog:<slug>` and `catalogs/<slug>/` exists, portcullis-trust's gate verifies
+  its `atrium.toml.sig` against that record's publisher in the catalog's `catalog.toml`,
+  its current key or a past one, and only if one of the publisher's prefixes covers the app
+  id. Never unsigned, and `/etc/atrium/publishers` doesn't sign for it. A publisher the
+  catalog no longer lists, or a malformed `installed.toml`, refuses the launch. Every
+  launch vector shares the gate (Launch, the session path, one-shots, atrium-launch).
+  Host test `third_party_catalog_apps_take_their_publishers_keys`.
+- Not yet: Sigillum reading `verified_rps` and keying private
   RPs on the publisher id; Curia's add-a-catalog page and a link that opens the sheet
   (both call `opifex_sheet::add_catalog`); per-persona catalogs (personas.md, later);
   atrium-ax coverage in the publishing check, which needs an ax measurement tool that
