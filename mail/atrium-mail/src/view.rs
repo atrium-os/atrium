@@ -22,6 +22,29 @@ use crate::plain::{self, Plain};
 use crate::sender::{self, Check, Sender};
 
 pub fn side_w() -> f32 { em(224.0) }
+/// The folded sidebar (§15.4): icons only.
+pub fn rail_w() -> f32 { em(56.0) }
+
+/// How the window is laid out for its width (§15.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// ≥ 1200 pt: places, list and reader side by side.
+    Wide,
+    /// 800–1200 pt: the places fold to icons; ≡ shows them over the list.
+    Medium,
+    /// < 800 pt: one column at a time, the list then the reader, with Back.
+    Narrow,
+}
+
+pub fn layout_for(w: f32) -> Layout {
+    if w >= em(1200.0) {
+        Layout::Wide
+    } else if w >= em(800.0) {
+        Layout::Medium
+    } else {
+        Layout::Narrow
+    }
+}
 /// The search box's row in the sidebar.
 pub fn search_h() -> f32 { em(44.0) }
 pub fn list_w() -> f32 { em(400.0) }
@@ -356,6 +379,8 @@ pub struct Ui {
     pub folded: Vec<String>,
     /// The command palette (Ctrl-K, §15.5) while it is up.
     pub palette: Option<crate::palette::Palette>,
+    /// The places shown over the list where they are folded (§15.4).
+    pub side_open: bool,
     pub error: Option<String>,
 }
 
@@ -2356,6 +2381,10 @@ impl Mail {
             }
             return true;
         }
+        if *key == Key::Escape && ui.side_open {
+            self.close_side();
+            return true;
+        }
         if ui.link.is_some() {
             match key {
                 Key::Enter => {
@@ -2398,6 +2427,8 @@ impl Mail {
                 self.start_search();
                 return true;
             }
+            // Narrow: Escape is Back, then ends a search.
+            (Key::Escape, _) if ui.reading.is_some() && ui.link.is_none() && self.layout() == Layout::Narrow => return self.back(),
             (Key::Escape, _) if ui.search.is_some() && ui.link.is_none() => {
                 self.end_search();
                 return true;
@@ -2445,6 +2476,43 @@ impl Mail {
             let shown = self.size.get().1 - head_h() - self.chips_h.get();
             VirtualList::reveal(&self.list, next, ui.count, row_h(), shown);
         }
+        true
+    }
+}
+
+impl Mail {
+    // ── window sizes (§15.4) ─────────────────────────────────────────
+
+    pub fn layout(&self) -> Layout {
+        layout_for(self.size.get().0)
+    }
+
+    /// ≡: the places over the list, or away again.
+    pub fn toggle_side(&self) {
+        let mut ui = self.ui.get_cloned();
+        ui.side_open = !ui.side_open;
+        self.ui.set(ui);
+    }
+
+    pub fn close_side(&self) {
+        let mut ui = self.ui.get_cloned();
+        if ui.side_open {
+            ui.side_open = false;
+            self.ui.set(ui);
+        }
+    }
+
+    /// Back from the reader to the list (narrow windows): the row stays
+    /// chosen.
+    pub fn back(&self) -> bool {
+        let mut ui = self.ui.get_cloned();
+        if ui.reading.is_none() {
+            return false;
+        }
+        ui.reading = None;
+        ui.link = None;
+        ui.later_sheet = None;
+        self.ui.set(ui);
         true
     }
 }
@@ -2926,16 +2994,43 @@ impl View for MailView {
         let (w, h) = self.mail.size.get();
         let t = ctx.theme;
         self.mail.dark.set(t.mode == pergola::theme::Mode::Dark);
-        ctx.min_size(pergola::geom::Size::new(em(160.0) + em(280.0) + em(320.0), head_h() + 4.0 * row_h()));
+        ctx.min_size(pergola::geom::Size::new(em(320.0), head_h() + 4.0 * row_h()));
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_canvas());
-        // The places and the list keep their widths while the reader has
-        // room; in a narrow window they give it up first.
-        let side = side_w().min(w * 0.22).max(em(160.0).min(w * 0.3));
-        let list = list_w().min(w * 0.36).max(em(280.0).min(w * 0.4));
-        self.places(ctx, &ui, side, h);
-        self.list(ctx, &ui, side, list, h);
-        self.toast(ctx, &ui, side, list, h);
-        self.reader(ctx, &ui, side + list, w - side - list, h);
+        let typing = ui.search.as_ref().is_some_and(|s| s.typing);
+        match layout_for(w) {
+            Layout::Wide => {
+                // The places and the list keep their widths; the reader
+                // takes the rest.
+                let side = side_w().min(w * 0.22);
+                let list = list_w().min(w * 0.36);
+                self.places(ctx, &ui, side, h);
+                self.list(ctx, &ui, side, list, h, false);
+                self.toast(ctx, &ui, side, list, h);
+                self.reader(ctx, &ui, side + list, w - side - list, h, false);
+            }
+            Layout::Medium => {
+                let rail = rail_w();
+                let list = list_w().min((w - rail) * 0.45);
+                self.rail(ctx, &ui, rail, h);
+                self.list(ctx, &ui, rail, list, h, false);
+                self.toast(ctx, &ui, rail, list, h);
+                self.reader(ctx, &ui, rail + list, w - rail - list, h, false);
+                if ui.side_open || typing {
+                    self.places(ctx, &ui, side_w(), h);
+                }
+            }
+            Layout::Narrow => {
+                if ui.reading.is_some() {
+                    self.reader(ctx, &ui, 0.0, w, h, true);
+                } else {
+                    self.list(ctx, &ui, 0.0, w, h, true);
+                }
+                self.toast(ctx, &ui, 0.0, w, h);
+                if ui.side_open || typing {
+                    self.places(ctx, &ui, side_w().min(w - em(48.0)), h);
+                }
+            }
+        }
         if let Some(p) = &ui.palette {
             self.palette(ctx, p, w);
         }
@@ -2946,7 +3041,56 @@ impl View for MailView {
     }
 }
 
+/// A place's short name on the folded sidebar: its first two letters
+/// ("In", "Se"), or its initials when it has words ("Saved Mail": "SM").
+pub fn short_name(label: &str) -> String {
+    let words: Vec<&str> = label.split_whitespace().collect();
+    if words.len() >= 2 {
+        words.iter().take(2).filter_map(|w| w.chars().next()).flat_map(char::to_uppercase).collect()
+    } else {
+        let mut c = label.chars();
+        c.next().map(|f| f.to_uppercase().chain(c.next()).collect()).unwrap_or_default()
+    }
+}
+
 impl MailView {
+    /// The folded sidebar (§15.4): ≡ for the places in full, Write, Search,
+    /// then each place by its short name, unread ones marked.
+    fn rail(&self, ctx: &mut Ctx, ui: &Ui, w: f32, h: f32) {
+        let t = ctx.theme;
+        rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
+        rect(ctx, Rect::new(w - 1.0, 0.0, 1.0, h), t.border_default());
+        let b = em(36.0);
+        let bx = (w - b) / 2.0;
+        let button = |ctx: &mut Ctx, y: f32, label: &str, fill: Color, color: Color, sel: bool, on: Box<dyn Fn()>| {
+            area(ctx, Rect::new(bx, y, b, b), if sel { t.selection_bg() } else { fill }, on);
+            text(ctx, bx + (b - width(label, type_size::SM, Weight::Medium)) / 2.0, y + b / 2.0, label, type_size::SM, Weight::Medium, color);
+            ctx.pop();
+        };
+        let m = self.mail.clone();
+        button(ctx, (head_h() - b) / 2.0, "≡", Color::TRANSPARENT, t.text_primary(), ui.side_open, Box::new(move || m.toggle_side()));
+        let mut y = head_h();
+        let m = self.mail.clone();
+        button(ctx, y, "+", t.accent_fg(), t.bg_canvas(), false, Box::new(move || m.write_new()));
+        y += b + em(6.0);
+        let m = self.mail.clone();
+        let searching = ui.search.as_ref().is_some_and(|s| s.view.is_none());
+        button(ctx, y, "/", Color::TRANSPARENT, t.text_secondary(), searching, Box::new(move || m.start_search()));
+        y += b + em(10.0);
+        for p in &ui.places {
+            if y + b > h {
+                break;
+            }
+            let sel = ui.folder == Some(p.folder) && ui.search.is_none();
+            let (m, f) = (self.mail.clone(), p.folder);
+            button(ctx, y, &short_name(&p.label), Color::TRANSPARENT, if sel { t.text_primary() } else { t.text_secondary() }, sel, Box::new(move || m.choose_folder(f)));
+            if p.count > 0 {
+                ctx.add(Node::Rect { rect: Rect::new(bx + b - em(9.0), y + em(3.0), em(6.0), em(6.0)), fill: t.accent_fg(), radius: em(3.0) });
+            }
+            y += b + em(2.0);
+        }
+    }
+
     fn places(&self, ctx: &mut Ctx, ui: &Ui, w: f32, h: f32) {
         let t = ctx.theme;
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
@@ -2955,7 +3099,10 @@ impl MailView {
         // Write (c): a new message.
         let ww = width("Write", type_size::XS, Weight::Medium) + em(18.0);
         let m = self.mail.clone();
-        area(ctx, Rect::new(w - 12.0 - ww, head_h() / 2.0 - em(12.0), ww, em(24.0)), t.accent_fg(), move || m.write_new());
+        area(ctx, Rect::new(w - 12.0 - ww, head_h() / 2.0 - em(12.0), ww, em(24.0)), t.accent_fg(), move || {
+            m.close_side();
+            m.write_new();
+        });
         text(ctx, w - 12.0 - ww + em(9.0), head_h() / 2.0, "Write", type_size::XS, Weight::Medium, t.bg_canvas());
         ctx.pop();
         let mut y = head_h();
@@ -2969,7 +3116,10 @@ impl MailView {
             }
             let sel = ui.folder == Some(p.folder) && ui.search.is_none();
             let (m, f) = (self.mail.clone(), p.folder);
-            area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.choose_folder(f));
+            area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || {
+                m.close_side();
+                m.choose_folder(f);
+            });
             let n = if p.count > 0 { p.count.to_string() } else { String::new() };
             let nw = width(&n, type_size::SM, Weight::Regular);
             let wt = if sel { Weight::Semibold } else { Weight::Regular };
@@ -2997,7 +3147,10 @@ impl MailView {
             for &(lane, n) in &ui.views {
                 let sel = ui.search.as_ref().is_some_and(|s| s.view == Some(lane));
                 let m = self.mail.clone();
-                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.show_view(lane));
+                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || {
+                    m.close_side();
+                    m.show_view(lane);
+                });
                 let wt = if sel { Weight::Semibold } else { Weight::Regular };
                 let n = if n > 0 { n.to_string() } else { String::new() };
                 let nw = width(&n, type_size::SM, Weight::Regular);
@@ -3017,7 +3170,10 @@ impl MailView {
             for p in &ui.saved {
                 let sel = ui.search.as_ref().is_some_and(|s| s.saved == Some(p.id));
                 let (m, q, id) = (self.mail.clone(), p.query.clone(), p.id);
-                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || m.search_for(&q, Some(id)));
+                area(ctx, Rect::new(8.0, y + 1.0, w - 16.0, place_h() - 2.0), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || {
+                    m.close_side();
+                    m.search_for(&q, Some(id));
+                });
                 let wt = if sel { Weight::Semibold } else { Weight::Regular };
                 text(ctx, 20.0, y + place_h() / 2.0, &fit(&p.name, type_size::SM, wt, w - 40.0), type_size::SM, wt, t.text_primary());
                 ctx.pop();
@@ -3139,9 +3295,20 @@ impl MailView {
         y + ch + em(8.0) - head_h()
     }
 
-    fn list(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
+    /// The list; `menu`: with ≡ for the places at the header's left
+    /// (narrow windows).
+    fn list(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32, menu: bool) {
         let t = ctx.theme;
         rect(ctx, Rect::new(x0 + w - 1.0, 0.0, 1.0, h), t.border_default());
+        let lead = if menu {
+            let m = self.mail.clone();
+            area(ctx, Rect::new(x0 + 8.0, head_h() / 2.0 - em(14.0), em(28.0), em(28.0)), Color::TRANSPARENT, move || m.toggle_side());
+            text(ctx, x0 + 8.0 + em(8.0), head_h() / 2.0, "≡", type_size::LG, Weight::Regular, t.text_primary());
+            ctx.pop();
+            em(32.0)
+        } else {
+            0.0
+        };
         let title = match &ui.search {
             Some(Search { view: Some(v), .. }) => v.label().to_string(),
             Some(s) => match s.saved.and_then(|id| ui.saved.iter().find(|p| p.id == id)) {
@@ -3199,7 +3366,7 @@ impl MailView {
                 sw_x -= em(2.0);
             }
         }
-        text(ctx, x0 + 16.0, head_h() / 2.0, &fit(&title, type_size::LG, Weight::Semibold, sw_x - x0 - 24.0), type_size::LG, Weight::Semibold, t.text_primary());
+        text(ctx, x0 + 16.0 + lead, head_h() / 2.0, &fit(&title, type_size::LG, Weight::Semibold, sw_x - x0 - 24.0 - lead), type_size::LG, Weight::Semibold, t.text_primary());
         // Quick filters (§11.7): chips under the header, combinable.
         let chips = if ui.folder.is_some() && ui.search.is_none() { self.chips(ctx, ui, x0, w) } else { 0.0 };
         self.mail.chips_h.set(chips);
@@ -3330,7 +3497,8 @@ impl MailView {
         }
     }
 
-    fn reader(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
+    /// The reader; `back`: alone in the window, with Back (narrow).
+    fn reader(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32, back: bool) {
         let t = ctx.theme;
         // The link bar takes the reader's foot (§7.6, §15.2).
         let h = match &ui.link {
@@ -3348,14 +3516,15 @@ impl MailView {
             }
             return;
         };
-        let col = w.min(read_max() + 64.0);
-        let x = x0 + (w - col) / 2.0 + 32.0;
-        let tw = col - 64.0;
+        let pad = if back { 32.0f32.min(w * 0.05).max(12.0) } else { 32.0 };
+        let col = w.min(read_max() + 2.0 * pad);
+        let x = x0 + (w - col) / 2.0 + pad;
+        let tw = col - 2.0 * pad;
         // Its actions at the right, each with its key (§15.5).
         let mut bx = x0 + w - 16.0;
         use mail_compose::reply::Kind;
         let m = &self.mail;
-        let buttons: [(&str, &str, Box<dyn Fn()>); 7] = [
+        let buttons: Vec<(&str, &str, Box<dyn Fn()>)> = vec![
             ("Print", "⌃P", { let m = m.clone(); Box::new(move || { m.print_current(); }) }),
             ("Delete", "#", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Delete)) }),
             ("Later", "l", { let m = m.clone(); Box::new(move || m.ask_later()) }),
@@ -3364,6 +3533,23 @@ impl MailView {
             ("Reply all", "a", { let m = m.clone(); Box::new(move || m.reply(Kind::ReplyAll)) }),
             ("Reply", "r", { let m = m.clone(); Box::new(move || m.reply(Kind::Reply)) }),
         ];
+        // Alone in a narrow window: Back at the left, and the main
+        // actions (the rest by key or Ctrl-K).
+        let mut lead = 0.0;
+        let buttons: Vec<_> = if back {
+            let bw = width("‹ Back", type_size::XS, Weight::Medium) + em(18.0);
+            let mm = m.clone();
+            area(ctx, Rect::new(x0 + 8.0, em(34.0) - em(12.0), bw, em(24.0)), t.bg_window(), move || {
+                mm.back();
+            });
+            text(ctx, x0 + 8.0 + em(9.0), em(34.0), "‹ Back", type_size::XS, Weight::Medium, t.text_primary());
+            ctx.pop();
+            lead = (x0 + 8.0 + bw + em(8.0) - x).max(0.0);
+            let keep = if w < em(560.0) { &["Archive", "Reply"][..] } else { &["Delete", "Later", "Archive", "Reply"][..] };
+            buttons.into_iter().filter(|b| keep.contains(&b.0)).collect()
+        } else {
+            buttons
+        };
         for (label, k, on) in buttons {
             let lw = width(label, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
             bx -= lw;
@@ -3374,8 +3560,8 @@ impl MailView {
             bx -= em(6.0);
         }
         // The heading: the subject in full, who is in it.
-        let sw = tw.min(bx - x - em(8.0));
-        text(ctx, x, em(34.0), &fit(&s.subject, type_size::XL, Weight::Semibold, sw), type_size::XL, Weight::Semibold, t.text_primary());
+        let sw = (tw - lead).min(bx - x - lead - em(8.0)).max(0.0);
+        text(ctx, x + lead, em(34.0), &fit(&s.subject, type_size::XL, Weight::Semibold, sw), type_size::XL, Weight::Semibold, t.text_primary());
         if !s.people.is_empty() {
             text(ctx, x, em(62.0), &fit(&s.people, type_size::SM, Weight::Regular, tw), type_size::SM, Weight::Regular, t.text_secondary());
         }

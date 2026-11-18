@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1615,6 +1615,22 @@ Stalwart in the cloud VM, and later a real account):
    archive from it with its key shown, Undo from it, a filter, nothing matching, Escape,
    Ctrl-K twice, a press on Write). **Not yet**: the palette in compose windows, the
    switch for single-key shortcuts, and screen-reader names for its rows.
+
+   **Window sizes built on the host (2026-11-18, §15.4).** **Wide** (≥ 1200 pt) is the
+   three columns as before. **Medium** (800–1200 pt): the places fold to a rail of short
+   names ("In", "Se", initials for names of two words) with a dot where there is unread
+   mail, under ≡, *+* (Write) and */* (Search); ≡ shows the places in full over the list
+   (Escape, or a choice, folds them), and they show while a search is typed so the box is
+   seen. **Narrow** (< 800 pt): one column at a time. The list fills the window with ≡ at
+   its header's left; opening a message gives the reader the whole window with *‹ Back*,
+   and only Archive and Reply (and Delete and Later from 560 pt), the rest by key or
+   Ctrl-K; Back or Escape returns to the list with the row still chosen, and j/k read on
+   from there. The undo toast follows the column shown. The reader's text stays capped at
+   about 80 characters and centred at every size (as before). The window can now be made
+   as small as 320 pt wide. Tests: window 1 (the three sizes: what is drawn, ≡ and Escape,
+   the search box over the list, Back, j after Back). **Not yet**: icons on the rail
+   (short names stand in until Mail has folder icons), and a look at the narrow layout on
+   a real display in the VM.
 
 ## 17. Decisions, with recommendations
 

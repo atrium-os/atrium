@@ -1252,3 +1252,76 @@ fn the_command_palette() {
     assert!(mail.palette_run(0));
     assert_eq!(mail.take_composes().len(), 1);
 }
+
+#[test]
+fn wide_medium_and_narrow_windows() {
+    use atrium_mail::view::{layout_for, short_name, Layout};
+    use pergola::theme::size::em;
+    assert_eq!((layout_for(em(1280.0)), layout_for(em(1000.0)), layout_for(em(600.0))), (Layout::Wide, Layout::Medium, Layout::Narrow));
+    assert_eq!((short_name("Inbox").as_str(), short_name("Sent").as_str(), short_name("Saved Mail").as_str(), short_name("").as_str()), ("In", "Se", "SM", ""));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Receipts".into(), role: Role::Other, selectable: true },
+        ]).unwrap();
+        let f = |uid: u32, subject: &str, t: i64| {
+            let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
+            Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
+        };
+        sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200)]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine.clone(), dirty.clone(), (em(1280.0), 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    let esc = Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() };
+    app.tick();
+    // Wide: the places in full, no ≡.
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Receipts") && !t.iter().any(|x| x == "≡"), "{t:?}");
+
+    // Medium: the places fold to short names; ≡ shows them in full, Escape folds them.
+    mail.set_size(em(1000.0), 800.0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "≡") && t.iter().any(|x| x == "Re") && !t.iter().any(|x| x == "Receipts"), "{t:?}");
+    mail.toggle_side();
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Receipts"));
+    assert!(mail.key(&esc, None));
+    app.tick();
+    assert!(!texts(&app).iter().any(|x| x == "Receipts"));
+    // Searching shows the box over the list while typing.
+    assert!(mail.key(&key("/"), None));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Receipts"));
+    assert!(mail.key(&esc, None));
+    assert!(mail.ui.get_cloned().search.is_none());
+
+    // Narrow: the list alone, then the reader alone with Back.
+    mail.set_size(em(600.0), 800.0);
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Two") && !t.iter().any(|x| x == "Re") && t.iter().any(|x| x == "≡"), "{t:?}");
+    assert!(mail.key(&key("j"), None));
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "‹ Back") && t.iter().any(|x| x == "Archive") && !t.iter().any(|x| x == "Forward"), "{t:?}");
+    // Back (Escape): the list again, the row still chosen; j reads the next.
+    assert!(mail.key(&esc, None));
+    let ui = mail.ui.get_cloned();
+    assert!(ui.reading.is_none() && ui.cursor == Some(0));
+    app.tick();
+    assert!(!texts(&app).iter().any(|x| x == "‹ Back"));
+    assert!(mail.key(&key("j"), None));
+    assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "One");
+    assert!(mail.back());
+    // ≡ in narrow: the places, a choice closes them.
+    mail.toggle_side();
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Receipts"));
+}
