@@ -268,7 +268,14 @@ impl Fonts for PinnedFonts {
         // language, else the locale.
         let han = atrium_fonts::Han::of_text(text).or_else(|| f.lang_ea.as_deref().and_then(atrium_fonts::Han::of_locale)).or_else(atrium_fonts::Han::of_system);
         for (i, ch) in text.char_indices() {
-            let face = self.face_for(&stack, ch, f, han);
+            // Joiners, variation selectors, skin tones and tag characters
+            // stay with what they follow, so an emoji sequence is shaped
+            // whole by one face.
+            let joins = matches!(ch as u32, 0x200C | 0x200D | 0xFE00..=0xFE0F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0x20E3);
+            let face = match segs.last() {
+                Some(&(fc, _, _)) if joins && self.has(fc, ch) => fc,
+                _ => self.face_for(&stack, ch, f, han),
+            };
             match segs.last_mut() {
                 Some((fc, _, e)) if *fc == face => *e = i + ch.len_utf8(),
                 _ => segs.push((face, i, i + ch.len_utf8())),
@@ -1001,6 +1008,12 @@ mod tests {
         assert_eq!(family("Arial", "नमस्ते"), ["Noto Sans Devanagari".to_string()].into());
         assert_eq!(family("", "வணக்கம் abc"), ["IBM Plex Sans".to_string(), "Noto Sans Tamil".to_string()].into());
         assert_eq!(family("", "שלום"), ["Noto Sans Hebrew".to_string()].into());
+        // Emoji draw (outlines), and a ZWJ family or a skin tone is one glyph.
+        assert_eq!(family("", "😀"), ["Noto Emoji".to_string()].into());
+        for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇮🇳"] {
+            let l = layout_para(&doc(seq), doc(seq).para(0).unwrap(), 1_000_000, &f);
+            assert_eq!(l.glyphs.len(), 1, "{seq}: {:?}", l.glyphs);
+        }
         // Devanagari shapes: the conjunct क्ष is fewer glyphs than characters.
         let mut d = doc("क्ष");
         let a = d.attrs.intern(CharAttrs { family: Some("Noto Sans Devanagari".into()), ..Default::default() });

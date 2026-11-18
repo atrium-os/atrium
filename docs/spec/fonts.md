@@ -7,7 +7,7 @@ permitting, and approved this design: files in one folder, no font server.
 ## 1. What ships
 
 The files, their licences and sources are listed in `fonts/README.md`. In
-short: 106 static TrueType faces (about 33 MB on disk).
+short: 108 static TrueType faces (about 33 MB on disk).
 
 - **Office stand-ins**: Liberation Serif, Sans and Mono 2.1.5 (metrics of
   Times New Roman, Arial and Courier New), Carlito (Calibri), Caladea
@@ -17,6 +17,11 @@ short: 106 static TrueType faces (about 33 MB on disk).
   Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala,
   Thai, Lao, Khmer, Myanmar, Tibetan, Georgian, Armenian, Hebrew, Arabic
   (Naskh), Syriac, Thaana, Ethiopic and Cherokee.
+- **Emoji**: Noto Emoji (Regular, Bold), outlines drawn in the text's colour,
+  until the drawing path has colour glyphs. Emoji blocks are a "script" in
+  `SCRIPTS`, so a run of them is shaped whole: ZWJ sequences, skin tones and
+  flags come out as one glyph; joiners, variation selectors, skin tone
+  modifiers and tag characters stay with the face of what they follow.
 - **Everyday families**: Source Sans 3, Source Serif 4, Source Code Pro, Fira
   Sans and Mono, Roboto, Inter.
 
@@ -162,7 +167,7 @@ a Japanese label in the VM.
   paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
-- Colour emoji waits on colour glyph support. CJK packages wait on Opifex
+- Colour emoji waits on colour glyph support (Noto Emoji outlines meanwhile). CJK packages wait on Opifex
   publishing them (its step C6). Han forms follow the run's kana or Hangul and
   the document's language, then the locale; a per-person language setting
   (Curia) would beat the locale. Write has no command yet to set a run's

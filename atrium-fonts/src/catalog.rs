@@ -30,6 +30,8 @@ pub const FACES: &[FaceInfo] = &[
     FaceInfo { family: "IBM Plex Serif", file: "ibm-plex-serif/IBMPlexSerif-BoldItalic.ttf", weight: 700, italic: true, address: "blake3:25ffd81902ff352694185d8d05ba61870453e1077aa877de41f9f95fb3dce737", size: 173032 },
     FaceInfo { family: "IBM Plex Serif", file: "ibm-plex-serif/IBMPlexSerif-Italic.ttf", weight: 400, italic: true, address: "blake3:ddf92074bbd26dd4502f98e519805dbf121e12801eacc488253ad1317ff17695", size: 173004 },
     FaceInfo { family: "IBM Plex Serif", file: "ibm-plex-serif/IBMPlexSerif-Regular.ttf", weight: 400, italic: false, address: "blake3:0afdbee795141a4497653697859e594910a8a885a197da9af6eb5e4a7d65aa2c", size: 163068 },
+    FaceInfo { family: "Noto Emoji", file: "noto/NotoEmoji-Bold.ttf", weight: 700, italic: false, address: "blake3:395e9a939875d4b09dbc7b9afd0023157bd7182eb124c3031e7be0c3eaf6302f", size: 885128 },
+    FaceInfo { family: "Noto Emoji", file: "noto/NotoEmoji-Regular.ttf", weight: 400, italic: false, address: "blake3:4fe982a88b92d5112003193b9202ae51e3485db8f219af93968f0ee0d993b0f2", size: 886572 },
     FaceInfo { family: "Noto Naskh Arabic", file: "noto/NotoNaskhArabic-Bold.ttf", weight: 700, italic: false, address: "blake3:8e4e20564d5bb0d5f2344f5ef7f9819e84871d0a407de777fc2e736bf13a35c6", size: 158172 },
     FaceInfo { family: "Noto Naskh Arabic", file: "noto/NotoNaskhArabic-Regular.ttf", weight: 400, italic: false, address: "blake3:50c39eb2bbf5258de8ce7797a3eb0f36b7ef354043b4438c02c78611448611fa", size: 158580 },
     FaceInfo { family: "Noto Sans", file: "noto/NotoSans-Bold.ttf", weight: 700, italic: false, address: "blake3:407b08be26d0bfc4ffc8454dd9c38f9ad5ac3ed042f333cd5dd1c0e76cdb199b", size: 432376 },

@@ -912,7 +912,7 @@ fn library_font(name: &str) -> Option<Vec<u8>> {
 /// general combining blocks and the Indic, Thai and other script ranges'
 /// vowel signs, which `layout` keeps in their base's face anyway.
 fn is_mark(ch: char) -> bool {
-    matches!(ch as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F | 0x200C | 0x200D)
+    matches!(ch as u32, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F | 0x200C | 0x200D | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F)
 }
 
 impl Default for TextEngine {
@@ -959,6 +959,13 @@ mod tests {
         let (w, _, _) = t.measure(f, 16.0, 400, "नमस्ते abc").unwrap();
         let last = run.glyphs.last().unwrap();
         assert!(w > last.dx, "{w} {}", last.dx);
+        // Emoji: a ZWJ family, a skin tone and a flag are one glyph each.
+        for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇮🇳"] {
+            let items = t.layout(f, 16.0, 400, seq);
+            assert_eq!(items.len(), 1, "{seq}: {items:?}");
+            let Item::Glyph { font, .. } = items[0] else { panic!("{items:?}") };
+            assert_eq!(t.fonts[&font].name, format!("atrium-fonts:{}", atrium_fonts::Library::face("Noto Emoji", false, false).unwrap()));
+        }
         // A character no face has is dropped, not a crash.
         assert!(t.shape_text_run(f, 16.0, 0.0, 0.0, [1.0; 4], "\u{10FFFD}", 400).is_some());
     }
