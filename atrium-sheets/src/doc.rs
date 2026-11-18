@@ -475,6 +475,14 @@ impl Doc {
         true
     }
 
+    /// The sheet on screen, kept to one that exists (undo can take a sheet away).
+    fn keep_sheet(&mut self) {
+        let n = self.wb.sheet_count().max(1);
+        if self.sheet as usize >= n {
+            self.sheet = (n - 1) as u16;
+        }
+    }
+
     /// Recalculates within the budget; what's left waits for [`Doc::settle`].
     pub fn recalc(&mut self) {
         match self.recalc_budget {
@@ -587,6 +595,7 @@ impl Doc {
         }
         self.journal(&Record::Undo);
         self.history.undo(&mut self.wb);
+        self.keep_sheet();
         self.recalc();
         self.dirty = true;
         true
@@ -598,6 +607,7 @@ impl Doc {
         }
         self.journal(&Record::Redo);
         self.history.redo(&mut self.wb);
+        self.keep_sheet();
         if self.over_budget() {
             self.journal(&Record::Undo);
             self.history.undo(&mut self.wb);

@@ -12,3 +12,4 @@ pub mod files;
 pub mod pivotpane;
 pub mod review;
 pub mod source;
+pub mod tabs;

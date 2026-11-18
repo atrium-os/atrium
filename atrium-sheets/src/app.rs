@@ -52,6 +52,8 @@ pub enum Cmd {
     Data(crate::data::DataCmd),
     /// A press in the Compare with… pane.
     Review(crate::review::ReviewCmd),
+    /// A press on the sheet tabs or their rename bar.
+    Tab(crate::tabs::TabCmd),
     /// The picked chart: its kind ([`ChartKind::ALL`]).
     ChartKind(usize),
     /// Its legend: none, or at [`LEGENDS`].
@@ -233,13 +235,17 @@ pub struct Sheets {
     pub pivot_pane: Mutable<crate::pivotpane::PivotPane>,
     pub pivot_scroll: Mutable<ScrollState>,
     pub pivot_agg_menus: Rc<Vec<Mutable<MenuState>>>,
+    /// The first sheet tab drawn, and the rename bar (open, and its field).
+    pub tab_first: Mutable<u16>,
+    pub renaming: Mutable<bool>,
+    pub rename_text: Mutable<TextEdit>,
 }
 
 impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -574,10 +580,148 @@ impl Sheets {
         self.changed();
     }
 
+    /// Shows sheet `s`: at its top left, the strip moved to show its tab,
+    /// panels about the last sheet closed.
+    pub fn show_sheet(&self, s: u16) {
+        {
+            let mut d = self.doc.borrow_mut();
+            if s as usize >= d.wb.sheet_count() || d.sheet == s {
+                return;
+            }
+            d.sheet = s;
+        }
+        self.filter.set(FilterPanel::default());
+        self.cond.set(Default::default());
+        self.renaming.set(false);
+        self.reveal_tab();
+        self.home();
+    }
+
+    /// Moves the tab strip, if need be, so the sheet on screen has its tab showing.
+    fn reveal_tab(&self) {
+        let room = (self.size.get().0 - crate::tabs::TABS_X - 8.0).max(0.0);
+        let d = self.doc.borrow();
+        let first = self.tab_first.get().min(d.wb.sheet_count().saturating_sub(1) as u16);
+        self.tab_first.set(crate::tabs::reveal(&d.wb, first, d.sheet, room));
+    }
+
+    pub fn tab_cmd(&self, c: crate::tabs::TabCmd) {
+        use crate::tabs::TabCmd;
+        match c {
+            TabCmd::Go(s) => self.show_sheet(s),
+            TabCmd::Add => {
+                let s = {
+                    let mut d = self.doc.borrow_mut();
+                    let n = d.wb.sheet_count();
+                    if n >= officina_grid::book::MAX_SHEETS {
+                        d.status = format!("A workbook holds at most {} sheets.", officina_grid::book::MAX_SHEETS);
+                        None
+                    } else {
+                        let name = crate::tabs::new_name(&d.wb);
+                        d.run("Add Sheet", vec![officina_grid::ops::GridOp::AddSheet(name)]);
+                        (d.wb.sheet_count() > n).then_some(n as u16)
+                    }
+                };
+                match s {
+                    Some(s) => self.show_sheet(s),
+                    None => self.changed(),
+                }
+            }
+            TabCmd::Earlier => {
+                self.tab_first.set(self.tab_first.get().saturating_sub(1));
+                self.changed();
+            }
+            TabCmd::Later => {
+                let n = self.doc.borrow().wb.sheet_count() as u16;
+                self.tab_first.set((self.tab_first.get() + 1).min(n.saturating_sub(1)));
+                self.changed();
+            }
+            TabCmd::Rename => {
+                let name = {
+                    let d = self.doc.borrow();
+                    d.wb.sheet_name(d.sheet)
+                };
+                self.rename_text.set(TextEdit::new(&name));
+                self.renaming.set(true);
+                self.changed();
+            }
+            TabCmd::RenameDone => {
+                let name = self.rename_text.get_cloned().text().trim().to_string();
+                let mut d = self.doc.borrow_mut();
+                let s = d.sheet;
+                if name == d.wb.sheet_name(s) {
+                    drop(d);
+                } else {
+                    match d.wb.sheet_name_ok(&name, Some(s)) {
+                        Ok(()) => d.run("Rename Sheet", vec![officina_grid::ops::GridOp::RenameSheet { sheet: s, name }]),
+                        Err(why) => {
+                            d.status = match why {
+                                "bad sheet name" => format!("A sheet name is 1 to {} characters, without [ ] : * ? / or \\.", officina_grid::book::MAX_SHEET_NAME),
+                                w => format!("{}{}.", w[..1].to_uppercase(), &w[1..]),
+                            };
+                            drop(d);
+                            self.changed();
+                            return;
+                        }
+                    }
+                    drop(d);
+                }
+                self.renaming.set(false);
+                self.reveal_tab();
+                self.changed();
+            }
+            TabCmd::RenameCancel => {
+                self.renaming.set(false);
+                self.changed();
+            }
+        }
+    }
+
+    /// The tab strip at `y`: add, earlier, later, then the tabs that fit; or
+    /// the rename bar in its place.
+    fn render_tabs(&self, ctx: &mut Ctx, w: f32, y: f32) {
+        use crate::tabs::{TabCmd, TABS_H, TABS_X};
+        let t = ctx.theme;
+        let push = |c: TabCmd| {
+            let cmds = self.cmds.clone();
+            move || cmds.lock().unwrap().push(Cmd::Tab(c))
+        };
+        ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, TABS_H), fill: t.bg_surface(), radius: 0.0 });
+        ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
+        if self.renaming.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 100.0, 18.0), content: "Rename sheet".into(), style: st });
+            let fw = (w - 120.0 - 180.0).clamp(80.0, 320.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.rename_text.clone()).autofocus(true).at(116.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::RenameDone))).render(ctx);
+            Button::primary("Rename").at(124.0 + fw, y + 2.0).width(80.0).on_click(push(TabCmd::RenameDone)).render(ctx);
+            Button::secondary("Cancel").at(212.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::RenameCancel)).render(ctx);
+            return;
+        }
+        Button::secondary("+").at(4.0, y + 2.0).width(28.0).on_click(push(TabCmd::Add)).render(ctx);
+        Button::secondary("‹").at(34.0, y + 2.0).width(26.0).on_click(push(TabCmd::Earlier)).render(ctx);
+        Button::secondary("›").at(62.0, y + 2.0).width(26.0).on_click(push(TabCmd::Later)).render(ctx);
+        let d = self.doc.borrow();
+        let first = self.tab_first.get().min(d.wb.sheet_count().saturating_sub(1) as u16);
+        for (s, x, tw) in crate::tabs::visible(&d.wb, first, (w - TABS_X - 8.0).max(0.0)) {
+            let on = s == d.sheet;
+            let r = Rect::new(TABS_X + x, y + 1.0, tw - 2.0, TABS_H - 2.0);
+            let hit = ctx.add(Node::Rect { rect: r, fill: if on { t.bg_canvas() } else { Color::TRANSPARENT }, radius: 0.0 });
+            if on {
+                ctx.add(Node::Rect { rect: Rect::new(TABS_X + x, y + TABS_H - 3.0, tw - 2.0, 2.0), fill: t.accent_bg(), radius: 0.0 });
+            }
+            let st = crate::tabs::style(if on { t.text_primary() } else { t.text_secondary() }, on);
+            let name = d.wb.sheet_name(s);
+            ctx.add(Node::Text { rect: Rect::new(TABS_X + x + 12.0, y + 6.0, tw - 24.0, 18.0), content: name, style: st });
+            let cmds = self.cmds.clone();
+            ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Tab(TabCmd::Go(s))));
+        }
+    }
+
     /// Where the grid sits in a window of `w` × `h`.
     pub fn grid_rect(w: f32, h: f32) -> Rect {
         let top = TOOLBAR_H + FORMULA_H;
-        Rect::new(0.0, top, w, (h - top - STATUS_H).max(40.0))
+        Rect::new(0.0, top, w, (h - top - STATUS_H - crate::tabs::TABS_H).max(40.0))
     }
 
     fn act(doc: &Rc<RefCell<Doc>>, src: &SheetSource, rev: &Mutable<u64>, a: GridAction) {
@@ -736,6 +880,8 @@ impl View for Sheets {
         let rev = self.rev.clone();
         let src = self.source.clone();
         GridView::new(self.source.clone(), self.scroll.clone(), self.grid.clone(), Self::grid_rect(w, h)).on_action(move |a| Self::act(&doc, &src, &rev, a)).emit(ctx);
+
+        self.render_tabs(ctx, w, h - STATUS_H - crate::tabs::TABS_H);
 
         // Status line.
         let sy = h - STATUS_H;
@@ -1178,6 +1324,18 @@ impl Sheets {
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::CompareWith) => true,
+                Cmd::Tab(t) => {
+                    self.tab_cmd(t);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::AddSheet) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Add);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::RenameSheet) => {
+                    self.tab_cmd(crate::tabs::TabCmd::Rename);
+                    false
+                }
                 Cmd::Review(c) => {
                     self.review_cmd(c);
                     false
@@ -1566,6 +1724,67 @@ mod tests {
             assert!(s.doc.borrow_mut().undo());
         }
         assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn sheets_are_added_switched_renamed_and_tabbed() {
+        use crate::tabs::TabCmd;
+        let (mut d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
+        d.wb.recalc();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        assert!(texts().iter().any(|t| t == "Sheet1"));
+        run(Cmd::Data(crate::data::DataCmd::AddSheet));
+        assert_eq!((s.doc.borrow().wb.sheet_count(), s.doc.borrow().sheet), (2, 1));
+        assert!(s.doc.borrow_mut().type_into(0, 0, "=Sheet1!B2*10"));
+        assert_eq!(s.doc.borrow().wb.value(1, 0, 0), officina_grid::Value::Num(20.0));
+        assert!(texts().iter().any(|t| t == "Sheet2"));
+        // Rename: a taken name is refused and said; a good one follows into formulas.
+        run(Cmd::Data(crate::data::DataCmd::RenameSheet));
+        assert!(s.renaming.get());
+        s.rename_text.set(TextEdit::new("sheet1"));
+        run(Cmd::Tab(TabCmd::RenameDone));
+        assert!(s.renaming.get());
+        assert!(s.doc.borrow().status.contains("exists"), "{}", s.doc.borrow().status);
+        s.rename_text.set(TextEdit::new("  Totals "));
+        run(Cmd::Tab(TabCmd::RenameDone));
+        assert!(!s.renaming.get());
+        assert_eq!(s.doc.borrow().wb.sheet_name(1), "Totals");
+        run(Cmd::Tab(TabCmd::Go(0)));
+        assert_eq!(s.doc.borrow().sheet, 0);
+        {
+            let mut d = s.doc.borrow_mut();
+            assert!(d.type_into(2, 0, "=Totals!A1+1"));
+            assert_eq!(d.wb.value(0, 2, 0), officina_grid::Value::Num(21.0));
+        }
+        run(Cmd::Tab(TabCmd::Go(1)));
+        // Undo back past the sheet's making: the view moves to a sheet that's there.
+        for _ in 0..4 {
+            run(Cmd::Undo);
+        }
+        assert_eq!(s.doc.borrow().wb.sheet_count(), 1);
+        assert_eq!(s.doc.borrow().sheet, 0);
+        // Thousands of sheets: only the tabs that fit are drawn, quickly.
+        {
+            let mut d = s.doc.borrow_mut();
+            for i in 2..=3000 {
+                d.wb.add_sheet(&format!("Sheet{i}")).unwrap();
+            }
+        }
+        run(Cmd::Tab(TabCmd::Go(2999)));
+        let t0 = std::time::Instant::now();
+        let t = texts();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(200), "{:?}", t0.elapsed());
+        assert!(t.iter().any(|x| x == "Sheet3000"));
+        assert!(!t.iter().any(|x| x == "Sheet10"));
+        assert!(t.iter().filter(|x| x.starts_with("Sheet")).count() < 30);
     }
 
     #[test]

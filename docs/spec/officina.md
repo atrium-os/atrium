@@ -3548,6 +3548,14 @@ Shankar asked whether each sheet has a memory budget or only the workbook, and t
 
 Gates: `officina-grid` `tests/ifcache.rs`, `tests/budget.rs`; `atrium-sheets` `a_slow_edit_hands_the_window_back_and_greys_what_is_not_done`, `a_change_past_the_memory_budget_is_not_made`.
 
+### 16.71 Sheet tabs in Sheets (2026-11-18)
+
+Sheets showed only a workbook's first sheet. A tab strip now sits under the grid: a press on a tab shows that sheet (at its top left; the filter and conditional-format panels about the last sheet close), **+** adds a sheet at the end and shows it, and ‹ › move the strip a tab at a time. Only the tabs that fit are measured and drawn (`atrium-sheets::tabs::visible`, `reveal`), so 3,000 sheets render as a few do. The Data menu gains Add Sheet and Rename Sheet…, which opens a bar in the strip's place; a taken name (case aside) or one with `[ ] : * ? / \` is refused with the reason, and formulas follow a rename because they name sheets by number.
+
+Three new undoable ops, journaled like the rest: `GridOp::AddSheet(name)` (tag 11), its inverse `GridOp::DropSheet` (tag 12, takes away the last sheet only when it holds nothing and isn't the first), and `GridOp::RenameSheet { sheet, name }` (tag 13); a refused one changes nothing. Undo past a sheet's making moves the view to a sheet that exists. Not yet: deleting or moving sheets (every reference to later sheets would be renumbered), and tab colours.
+
+Gates: `officina-grid` `ops::tests::sheets_are_added_renamed_and_undone`; `atrium-sheets` `sheets_are_added_switched_renamed_and_tabbed`, `tabs::tests::only_the_tabs_that_fit_are_laid_out`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

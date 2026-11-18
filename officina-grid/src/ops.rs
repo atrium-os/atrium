@@ -67,6 +67,14 @@ pub enum GridOp {
     /// A sheet's row heights (`rows`) or column widths that differ from the
     /// default, swapped in whole: (index, size), sorted.
     Sizes { sheet: u16, rows: bool, over: Vec<(u32, f64)> },
+    /// A new empty sheet at the end, by this name (refused, changing nothing, if
+    /// the name is taken or bad). Its inverse is [`GridOp::DropSheet`].
+    AddSheet(String),
+    /// Takes away the last sheet (the inverse of [`GridOp::AddSheet`], which
+    /// undo order leaves empty again by then). The first sheet always stays.
+    DropSheet,
+    /// A sheet's new name; formulas name sheets by number, so they follow.
+    RenameSheet { sheet: u16, name: String },
 }
 
 impl GridOp {
@@ -187,6 +195,21 @@ impl GridOp {
                 w.bytes(b);
                 return w.into_bytes();
             }
+            GridOp::AddSheet(name) => {
+                w.u8(11);
+                w.str(name);
+                return w.into_bytes();
+            }
+            GridOp::DropSheet => {
+                w.u8(12);
+                return w.into_bytes();
+            }
+            GridOp::RenameSheet { sheet, name } => {
+                w.u8(13);
+                w.u16(*sheet);
+                w.str(name);
+                return w.into_bytes();
+            }
             GridOp::Sizes { sheet, rows, over } => {
                 w.u8(10);
                 w.u16(*sheet);
@@ -287,6 +310,20 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(if kind == 8 { GridOp::CondFormats(v.into()) } else { GridOp::Names(v.into()) });
+        }
+        if (11..=13).contains(&kind) {
+            let op = match kind {
+                11 => GridOp::AddSheet(r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string()),
+                12 => GridOp::DropSheet,
+                _ => {
+                    let sheet = r.u16()?;
+                    GridOp::RenameSheet { sheet, name: r.str("sheet name", crate::book::MAX_SHEET_NAME as u64)?.to_string() }
+                }
+            };
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(op);
         }
         if kind == 10 {
             let sheet = r.u16()?;
@@ -407,6 +444,18 @@ impl Op<Workbook> for GridOp {
                 }
                 GridOp::Names(old.into())
             }
+            GridOp::AddSheet(name) => match wb.add_sheet(&name) {
+                Ok(_) => GridOp::DropSheet,
+                Err(_) => GridOp::Batch(Vec::new()),
+            },
+            GridOp::DropSheet => match wb.drop_last_sheet() {
+                Some(name) => GridOp::AddSheet(name),
+                None => GridOp::Batch(Vec::new()),
+            },
+            GridOp::RenameSheet { sheet, name } => match wb.rename_sheet(sheet, &name) {
+                Ok(old) => GridOp::RenameSheet { sheet, name: old },
+                Err(_) => GridOp::Batch(Vec::new()),
+            },
             GridOp::Sizes { sheet, rows, over } => {
                 if sheet as usize >= wb.sheet_count() {
                     return GridOp::Sizes { sheet, rows, over };
@@ -570,6 +619,39 @@ mod tests {
     fn a(s: &str) -> CellAddr {
         let (r, c) = crate::addr::parse_a1(s).unwrap();
         CellAddr::new(0, r, c)
+    }
+
+    #[test]
+    fn sheets_are_added_renamed_and_undone() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet1").unwrap();
+        let mut h: History<GridOp> = History::new();
+        for op in [GridOp::AddSheet("Two".into()), GridOp::DropSheet, GridOp::RenameSheet { sheet: 1, name: "Zwei".into() }] {
+            assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        }
+        h.run(&mut wb, "Add Sheet", vec![GridOp::AddSheet("Two".into())]);
+        assert_eq!(wb.sheet_count(), 2);
+        wb.set_value(CellAddr::new(1, 0, 0), Value::Num(5.0));
+        wb.set_formula(a("A1"), "=Two!A1*2").unwrap();
+        wb.recalc();
+        h.run(&mut wb, "Rename Sheet", vec![GridOp::RenameSheet { sheet: 1, name: "Zwei".into() }]);
+        assert_eq!(wb.formula_text(a("A1")).as_deref(), Some("=Zwei!A1*2"));
+        // A name taken (case aside) or bad changes nothing.
+        h.run(&mut wb, "Rename Sheet", vec![GridOp::RenameSheet { sheet: 1, name: "sheet1".into() }]);
+        h.run(&mut wb, "Rename Sheet", vec![GridOp::RenameSheet { sheet: 1, name: "a/b".into() }]);
+        assert_eq!(wb.sheet_name(1), "Zwei");
+        h.undo(&mut wb);
+        h.undo(&mut wb);
+        h.undo(&mut wb);
+        assert_eq!(wb.sheet_name(1), "Two");
+        // The first sheet stays; a sheet with cells isn't taken away.
+        assert_eq!(wb.drop_last_sheet(), None);
+        wb.set_value(CellAddr::new(1, 0, 0), Value::Empty);
+        h.undo(&mut wb);
+        assert_eq!(wb.sheet_count(), 1);
+        assert_eq!(wb.drop_last_sheet(), None);
+        h.redo(&mut wb);
+        assert_eq!(wb.sheet_name(1), "Two");
     }
 
     #[test]
