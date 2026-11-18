@@ -335,6 +335,12 @@ impl View for ShellView {
             let (prefs, site) = (s.store.reading(), trail::site(&p.url).to_string());
             floating(ctx, r, g.aa, move || with(&st, |s| s.reading_open = false), move |ctx| reading_controls(ctx, r, prefs, &site, &st2));
         }
+        // The print sheet, over the whole window (printing.md §5.1).
+        if s.printing {
+            let id = ctx.push(Node::Rect { rect: Rect::new(0.0, 0.0, s.w, s.h), fill: Color::TRANSPARENT, radius: 0.0 });
+            ctx.slot(id, shell::PRINT_SLOT);
+            ctx.pop();
+        }
     }
 }
 

@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use limen::doc_viewer::{Reading, ToChild, ToParent};
 use navigator_control::{self as ctl, Event, Jar, LinkAction, Request, Source, Ticket};
 use pergola::embed::{EmbedId, Embeds, ParentEvent, WindowToken};
+use pergola::print::{Orientation, Outcome, Paper, Printing, Step};
 
 use crate::shell::{LivePage, Out, Shell, PAGE_SLOT};
 use crate::trail::PageId;
@@ -103,7 +104,18 @@ pub struct Live {
     fresh: HashSet<Key>,
     /// A page not looked at for this long is parked (`NAVIGATOR_UI_IDLE_S`).
     idle: Duration,
+    /// The print sheet, while it is open (printing.md §5.1).
+    printing: Option<Printing>,
+    /// The page child asked to lay its page out on paper: its embed, the
+    /// title, and whether the sheet is already open (a new paper size).
+    print_ask: Option<(EmbedId, String, bool)>,
 }
+
+/// The paper a page is first laid out on for the sheet; it asks again for
+/// another (`Step::Relayout`).
+const PRINT_FIRST: (u32, u32, u32) = (595, 842, 36);
+/// The most bytes of PDF a page child hands back.
+const PRINT_BYTES_MAX: u64 = 64 << 20;
 
 fn send(w: &mut UnixStream, r: &Request) {
     if let Err(e) = ctl::write_frame(w, r) {
@@ -235,6 +247,8 @@ impl Live {
                 history: false,
                 fresh: HashSet::new(),
                 idle,
+                printing: None,
+                print_ask: None,
             },
             Hello { frescod: fd, limen, measure, trails: kept },
         ))
@@ -266,6 +280,64 @@ impl Live {
         let Some(e) = &self.embeds else { return };
         if let Err(err) = e.borrow_mut().send(embed, m.encode()) {
             eprintln!("navigator-ui: limend: {err:?}");
+        }
+    }
+
+    /// Ask the page shown to lay itself out on `w`×`h` points.
+    fn ask_print(&mut self, s: &mut Shell, w: u32, h: u32, margin: u32, again: bool) {
+        let shown = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)).map(|c| c.embed);
+        let Some(embed) = shown else {
+            self.print_done(s, Outcome::Failed("the page isn't open any more".into()));
+            return;
+        };
+        let title = s.store.trail().page().map(|p| p.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "Page".into());
+        let margin = margin.min(w.min(h) / 4);
+        eprintln!("navigator-ui: print: the page laid out on {w}x{h} pt");
+        self.to_child(embed, &ToChild::Print { w_pt: w, h_pt: h, margin_pt: margin });
+        self.print_ask = Some((embed, title, again));
+    }
+
+    fn print_done(&mut self, s: &mut Shell, o: Outcome) {
+        if let (Some(p), Some(e)) = (self.printing.take(), &self.embeds) {
+            if matches!(o, Outcome::Failed(_)) {
+                p.cancel(e);
+            }
+        }
+        self.print_ask = None;
+        s.printing = false;
+        eprintln!("navigator-ui: print: {o:?}");
+        s.last_note = match o {
+            Outcome::Queued => Some("sent to the printer".into()),
+            Outcome::Saved(name) => Some(format!("saved “{name}”")),
+            Outcome::Cancelled => None,
+            Outcome::Failed(why) => Some(format!("couldn't print: {why}")),
+        };
+    }
+
+    /// The page child's PDF: the sheet opens with it, or takes it as its
+    /// answer to a new paper size.
+    fn printed(&mut self, s: &mut Shell, fd: Option<OwnedFd>, pages: u32, cut: bool) {
+        use std::io::Read;
+        let Some((_, title, again)) = self.print_ask.take() else { return };
+        let mut pdf = Vec::new();
+        let read = fd.ok_or_else(|| "no file came with it".to_string()).and_then(|fd| {
+            std::fs::File::from(fd).take(PRINT_BYTES_MAX + 1).read_to_end(&mut pdf).map_err(|e| e.to_string())
+        });
+        let r = match (read, &self.embeds, self.window) {
+            (Err(e), ..) => Err(e),
+            (Ok(n), ..) if n as u64 > PRINT_BYTES_MAX => Err("the page is too long to print".into()),
+            (Ok(_), Some(e), _) if again => match &mut self.printing {
+                Some(p) => p.document_bytes(e, &pdf).map_err(|e| format!("{e:?}")),
+                None => Ok(()),
+            },
+            (Ok(_), Some(e), Some(w)) => Printing::start_bytes(e, w, crate::shell::PRINT_SLOT, &pdf, &title, true, Some(Paper::A4)).map(|p| {
+                self.printing = Some(p);
+            }).map_err(|e| format!("the print sheet didn't open ({e:?})")),
+            _ => Err("Limen isn't running".into()),
+        };
+        match r {
+            Ok(()) => eprintln!("navigator-ui: print sheet {} ({pages} pages{}, {} bytes)", if again { "has the page again" } else { "open" }, if cut { ", cut short" } else { "" }, pdf.len()),
+            Err(why) => self.print_done(s, Outcome::Failed(why)),
         }
     }
 
@@ -538,9 +610,32 @@ impl Live {
                     break;
                 }
             };
+            // The print sheet's own events first.
+            if let (Some(p), Some(e)) = (self.printing.as_mut(), self.embeds.clone()) {
+                match p.handle(&e, &ev) {
+                    None => {}
+                    Some(Step::Pending) => continue,
+                    Some(Step::Relayout { paper, orientation, margins_pt }) => {
+                        let (w, h) = if orientation == Orientation::Landscape { (paper.h_pt, paper.w_pt) } else { (paper.w_pt, paper.h_pt) };
+                        self.ask_print(s, w, h, margins_pt, true);
+                        changed = true;
+                        continue;
+                    }
+                    Some(Step::Done(o)) => {
+                        self.print_done(s, o);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
             let embed = match &ev {
-                ParentEvent::Attached { embed } | ParentEvent::Message { embed, .. } | ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed } => *embed,
+                ParentEvent::Attached { embed } | ParentEvent::Message { embed, .. } | ParentEvent::MessageFd { embed, .. } | ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed } => *embed,
                 _ => continue,
+            };
+            // A descriptor only a print asked for: any other is closed.
+            let fd = match &ev {
+                ParentEvent::MessageFd { .. } => self.embeds.as_ref().and_then(|e| e.borrow_mut().take_fd()),
+                _ => None,
             };
             let Some(i) = self.children.iter().position(|c| c.embed == embed) else { continue };
             let on_screen = self.shown == Some(self.children[i].key);
@@ -552,6 +647,13 @@ impl Live {
                         self.give(i, t);
                     }
                 }
+                ParentEvent::MessageFd { bytes, .. } => match ToParent::decode(&bytes) {
+                    Some(ToParent::Printed { pages, cut }) if self.print_ask.as_ref().is_some_and(|a| a.0 == embed) => {
+                        self.printed(s, fd, pages, cut);
+                        changed = true;
+                    }
+                    _ => eprintln!("navigator-ui: a page child sent a file nobody asked for; closed"),
+                },
                 ParentEvent::Message { bytes, .. } => match ToParent::decode(&bytes) {
                     Some(ToParent::LinkActivated { url }) if on_screen => {
                         s.link_pressed(&url);
@@ -623,6 +725,11 @@ impl Live {
                         }
                     }
                     Some(ToParent::Key { .. }) => {}
+                    Some(ToParent::Error { code }) if code == limen::doc_viewer::error::PRINT_FAILED && self.print_ask.as_ref().is_some_and(|a| a.0 == embed) => {
+                        self.print_done(s, Outcome::Failed("the page couldn't be laid out on paper".into()));
+                        changed = true;
+                    }
+                    Some(ToParent::Printed { .. }) => eprintln!("navigator-ui: a print came without its file"),
                     Some(ToParent::Error { code }) => {
                         eprintln!("navigator-ui: a page child failed ({code})");
                         if on_screen {
@@ -637,6 +744,9 @@ impl Live {
                     // A lost page on screen gets a new child next (from
                     // the store: it was saved when it opened).
                     eprintln!("navigator-ui: a page child went away ({})", self.children[i].url);
+                    if self.print_ask.as_ref().is_some_and(|a| a.0 == embed) {
+                        self.print_done(s, Outcome::Failed("the page closed".into()));
+                    }
                     self.children.remove(i);
                     if on_screen {
                         self.shown = None;
@@ -706,6 +816,10 @@ impl Live {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {
                         self.to_child(c.embed, &ToChild::Find { query, step });
                     }
+                }
+                Out::Print => {
+                    let (w, h, m) = PRINT_FIRST;
+                    self.ask_print(s, w, h, m, false);
                 }
                 Out::Jump { anchor } => {
                     if let Some(c) = self.shown.and_then(|k| self.children.iter().find(|c| c.key == k && c.attached)) {

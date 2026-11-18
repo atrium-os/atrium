@@ -561,7 +561,7 @@ fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
 
     // Another role's child can't hand one back, and a parent can't send one
     // to the picker.
-    let v = app.request("doc-viewer", W_APP).unwrap();
+    let v = app.request("media-player", W_APP).unwrap();
     let (_, mut viewer) = w.spawned();
     assert_eq!(refused(viewer.emit_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);
     assert_eq!(refused(app.send_fd(e, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);

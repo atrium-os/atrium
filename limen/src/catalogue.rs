@@ -39,7 +39,8 @@ pub struct Role {
     pub takes_fd: bool,
     /// The child may pass one descriptor back with a message (`EMIT_FD`):
     /// a regular file, read-only or read-write, checked and narrowed by
-    /// limend. The picker's picked file (limen.md §2.3).
+    /// limend. The picker's picked file (limen.md §2.3); a doc-viewer's
+    /// printed PDF.
     pub returns_fd: bool,
 }
 
@@ -64,7 +65,8 @@ pub const PRELUM: &str = "org.atrium.prelum";
 pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
-    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
+    // Returns a descriptor: a printed page's PDF (`Printed`).
+    Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: true },
     Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Sheet { w: 640, h: 440 }, takes_fd: false, returns_fd: true },
     Role { name: "share", provider: Provider::System(SHARE), slot: SlotKind::Sheet { w: 480, h: 400 }, takes_fd: false, returns_fd: false },
     Role { name: "share-target", provider: Provider::Chosen, slot: SlotKind::Sheet { w: 560, h: 440 }, takes_fd: true, returns_fd: false },

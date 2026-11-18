@@ -5885,7 +5885,10 @@ prompt row, naming "L5 hello by Atrium", what it asks for and that it isn't inst
 App probe (`link-probe` reading `atrium-app://org.atrium.l5hello` from its bundle's
 `link-probe.url`) asks with Enter, portcullisd answers "to install first", the install sheet
 shows (`confined-10-install.png`), Up and Enter on Install installs it for App probe's uid
-(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 116/116 on 2026-11-18 with the New window menu (the Work window's
+(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 122/122 on 2026-11-18 with printing (the print sheet,
+`atrium-prelum-sheet` as `_prelum-sheet` 65046 with no prelumd, provides Limen's `print` role; Ctrl-P in the Personal
+window: the page child writes the page on A4 in its jail, 2 pages in about 0.4 s, and the sheet opens over the window,
+`confined-13-print-sheet.png`; Escape cancels). 116/116 before that, with the New window menu (the Work window's
 rail persona chip, then New Personal window: portcullisd `NewWindowIn` spends the press and brings
 the running Personal Navigator forward, `confined-11-new-window-menu.png`; root is refused). 110/110 before that, with the
 refused paste (App probe, Personal, pastes with Ctrl-V what Copy address copied in Work: tabulad

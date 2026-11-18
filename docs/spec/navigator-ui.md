@@ -950,6 +950,19 @@ it), at most 64, titles at most 128 characters, each anchor one it listed. A Sec
 in the find bar opens them as a list, narrowed to headings with the find text when any have
 it; a press scrolls the page to that anchor (`ScrollTo`).
 
+**Printing** (Ctrl-P, printing.md §5.1). The page child, which already holds the page,
+lays it out again at the paper's width (navigator-render's document worker, the same
+fonts, at the normal text size and in light colours) and writes the PDF itself
+with Officina's writer: one band per sheet, cut between lines of text where a line would
+straddle the foot, each sheet clipped to its margins, links kept, at most 500 sheets
+(`Printed { cut }` says when there were more). It hands the PDF back as a sealed memory
+file (limen.md `Print`/`Printed`); the UI never parses it, and opens the system's print
+sheet over its window with it (`pergola::print`, slot `PRNT`), first on A4 with 36 pt
+margins. When the person chooses another paper or orientation in the sheet, the UI asks
+the child again (`Relayout`) and the sheet gets the new layout. The page's HTML, its
+pictures and its fonts never leave the page's jail for this; only the PDF does. Built
+2026-11-18; the confined VM gate opens the sheet over a fixture page and cancels it.
+
 ---
 
 ## 8. Windows, split, fullscreen, picture-in-picture
@@ -1065,6 +1078,8 @@ System shortcuts go to Forum first (limen.md §6). Within the Navigator:
 | Ctrl-H | history view |
 | Ctrl-D | keep this page |
 | Ctrl-F, Esc | find, close find |
+| Ctrl-P | print the page (§7) |
+| Ctrl-R | the current version of the page, fetched again |
 | Ctrl-plus, Ctrl-minus, Ctrl-0 | zoom (ScrollView) |
 | Ctrl-Shift-N | new Unrecorded trail |
 | Ctrl-M | mute or unmute the current trail |

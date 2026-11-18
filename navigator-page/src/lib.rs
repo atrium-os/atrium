@@ -7,6 +7,8 @@
 //! network and no files (only the descriptor it was handed and its
 //! frescod connection), so what a bug here can reach is this one page.
 
+pub mod print;
+
 use std::collections::BTreeMap;
 use std::io::Read;
 
@@ -467,5 +469,34 @@ mod provided_tests {
         assert!(p.provide("mail-res:1".into(), b"<script>".to_vec(), true));
         assert!(p.resources().0.is_empty());
         assert!(!p.provide("big".into(), vec![0; navigator_image::image::MAX_ENCODED_IMAGE_BYTES + 1], true));
+    }
+}
+
+#[cfg(test)]
+mod print_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_page_prints_on_several_pages_between_lines() {
+        let mut body = String::from("<html><head><title>Atrium</title></head><body><h1>The atrium</h1>");
+        for i in 0..120 {
+            body.push_str(&format!("<p>Paragraph {i}: the impluvium is the sunken part of the atrium, designed to carry away the rainwater coming through the compluvium of the roof.</p>"));
+        }
+        body.push_str("<p><a href=\"https://atlas.example/wiki/Impluvium\">Impluvium</a></p></body></html>");
+        let p = prepare(DocKind::Html, body.as_bytes()).expect("prepared");
+        let a4 = print::Paper::new(595, 842);
+        let out = print::pdf(p.html.clone(), p.subs.clone(), &p.title, a4, &|_| None).expect("printed");
+        assert!(out.pdf.starts_with(b"%PDF-"), "a PDF");
+        assert!(out.pages >= 3 && out.pages < 40, "{} pages", out.pages);
+        assert!(!out.cut);
+        if let Ok(d) = std::env::var("PRINT_OUT") {
+            std::fs::write(d, &out.pdf).unwrap();
+        }
+        let text = String::from_utf8_lossy(&out.pdf);
+        assert!(text.contains("/FontFile2") && text.contains("/URI"), "a face embedded and the link kept");
+        // Letter is wider: fewer pages.
+        let letter = print::pdf(p.html.clone(), p.subs.clone(), &p.title, print::Paper::new(612, 792), &|_| None).unwrap();
+        assert!(letter.pages <= out.pages + 1);
+        assert!(print::pdf(p.html, p.subs, "", print::Paper::new(100, 100), &|_| None).is_err(), "too small");
     }
 }

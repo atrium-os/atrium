@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "aliasable"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -266,6 +277,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,6 +496,32 @@ name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+
+[[package]]
+name = "folium-content"
+version = "0.1.0"
+dependencies = [
+ "folium-font",
+ "folium-syntax",
+]
+
+[[package]]
+name = "folium-font"
+version = "0.1.0"
+dependencies = [
+ "folium-syntax",
+ "ttf-parser",
+]
+
+[[package]]
+name = "folium-syntax"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "md-5",
+ "miniz_oxide 0.8.9",
+ "sha2",
+]
 
 [[package]]
 name = "font-types"
@@ -906,6 +953,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1041,6 +1097,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1127,6 +1193,7 @@ dependencies = [
  "image-webp",
  "navigator-dom",
  "navigator-svg",
+ "officina-pict",
  "png 0.17.16",
  "resvg",
  "usvg",
@@ -1159,6 +1226,8 @@ dependencies = [
  "navigator-normalize",
  "navigator-render",
  "navigator-style",
+ "officina-pdf",
+ "officina-text",
  "pergola",
  "pergola-document",
  "png 0.17.16",
@@ -1211,6 +1280,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "officina-core"
+version = "0.1.0"
+
+[[package]]
+name = "officina-pdf"
+version = "0.1.0"
+dependencies = [
+ "atrium-colr",
+ "folium-content",
+ "folium-font",
+ "folium-syntax",
+ "navigator-image",
+ "officina-slides",
+ "officina-text",
+]
+
+[[package]]
+name = "officina-pict"
+version = "0.1.0"
+dependencies = [
+ "tiny-skia 0.11.4",
+ "ttf-parser",
+]
+
+[[package]]
+name = "officina-shapes"
+version = "0.1.0"
+
+[[package]]
+name = "officina-slides"
+version = "0.1.0"
+dependencies = [
+ "officina-core",
+ "officina-shapes",
+ "officina-text",
+]
+
+[[package]]
+name = "officina-text"
+version = "0.1.0"
+dependencies = [
+ "atrium-fonts",
+ "navigator-fontset",
+ "officina-core",
+ "officina-pict",
+ "officina-shapes",
+ "rustybuzz",
+ "ttf-parser",
+ "unicode-bidi",
+ "unicode-linebreak",
 ]
 
 [[package]]

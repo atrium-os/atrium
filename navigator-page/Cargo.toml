@@ -29,6 +29,10 @@ navigator-style = { path = "../navigator-style" }
 # the header before allocating): images decode here, in the page's jail.
 navigator-image = { path = "../navigator-image" }
 blake3 = { version = "1", features = ["pure"] }
+# Printing (navigator-ui.md "Printing"): the page as a PDF, written through
+# Officina's writer (faces subset, pictures once, links), here in the jail.
+officina-pdf = { path = "../officina-pdf" }
+officina-text = { path = "../officina-text" }
 
 [dev-dependencies]
 png = "0.17"

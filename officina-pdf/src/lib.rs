@@ -26,7 +26,7 @@ use officina_text::layout::{Fonts, LayoutCache, PinnedFonts};
 use officina_text::lists::Numbering;
 use officina_text::model::TextDoc;
 use officina_text::paginate::Paginator;
-use officina_text::paint::paint_page;
+use officina_text::paint::{paint_page, Item};
 use officina_text::{twips, LU};
 
 /// Layouts are dropped after this many pages (memory stays flat).
@@ -145,6 +145,43 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
         progress(i + 1, total);
     }
     pdf.finish(files, &info.title, "Atrium Write")
+}
+
+/// Pages another program painted, written through the same writer as
+/// Officina's (faces subset once, pictures once, links kept): the
+/// Navigator's page printed (navigator-ui.md "Printing"). Items are in
+/// layout units ([`officina_text::LU`] to the point), y down from the
+/// page's top; each page may be clipped to a rectangle, so what a page
+/// cut through doesn't spill into the margins.
+pub struct Painted<W: Write> {
+    pdf: Pdf<W>,
+}
+
+impl<W: Write> Painted<W> {
+    pub fn new(out: W) -> io::Result<Self> {
+        Ok(Self { pdf: Pdf::new(out)? })
+    }
+
+    /// One page `pw` × `ph` points. `clip`: x, y, w, h in layout units.
+    /// `picture(id)`: the bytes of an `Item::Image`'s picture (JPEG, or
+    /// what the installed decoder reads).
+    pub fn page(&mut self, items: Vec<Item>, pw: f64, ph: f64, clip: Option<[i64; 4]>, files: &dyn FontFiles, picture: &dyn Fn(u32) -> Option<Vec<u8>>) -> io::Result<()> {
+        use folium_content::ops::Op;
+        let mut page = Page::default();
+        if let Some([x, y, w, h]) = clip {
+            page.c.extend([Op::Save, Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Clip]);
+        }
+        self.pdf.items(&mut page, items, ph, files, picture)?;
+        if clip.is_some() {
+            page.c.push(Op::Restore);
+        }
+        self.pdf.end_page(page, pw, ph)
+    }
+
+    /// The faces, the page tree and the title; `creator` is the program.
+    pub fn finish(self, files: &dyn FontFiles, title: &str, creator: &str) -> io::Result<(W, Stats)> {
+        self.pdf.finish(files, title, creator)
+    }
 }
 
 /// One block of a [`plain`] document.

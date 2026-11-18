@@ -146,6 +146,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb monstrator "--bin monstratord --example monctl --example link-probe"
     xb tabula "--bin tabulad"
     xb opifex-sheet "--bin opifex-sheetd"
+    xb prelum-sheet "--bin atrium-prelum-sheet"
     xb atrium-open "--example open-probe"
 fi
 
@@ -179,7 +180,7 @@ allow_rctl = true
 echo "  jaild (rctl allowed) and portcullisd on $PSOCK"
 
 echo "=== binaries"
-g "pkill -x navigator-ui; pkill -x forum-wm; pkill -x limend; pkill -x navigatord; pkill -x frescod; pkill -x tabulad; pkill -x link-probe; pkill -x opifexd; sleep 1; rm -rf $S; mkdir -p $D $S /var/run/atrium; chmod 777 $S; true"
+g "pkill -x navigator-ui; pkill -f atrium-prelum-sheet; pkill -x forum-wm; pkill -x limend; pkill -x navigatord; pkill -x frescod; pkill -x tabulad; pkill -x link-probe; pkill -x opifexd; sleep 1; rm -rf $S; mkdir -p $D $S /var/run/atrium; chmod 777 $S; true"
 for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-renderer" "$ROOT/forum-wm/target/$R/forum-wm" \
          "$ROOT/navigator-ui/target/$R/navigator-ui" "$ROOT/navigator-page/target/$R/navigator-page" \
          "$ROOT/limen/target/$R/limend" "$ROOT/navigator-prerender/target/$R/prerender" \
@@ -188,7 +189,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem" \
          "$ROOT/monstrator/target/$R/monstratord" "$ROOT/monstrator/target/$R/examples/monctl" \
          "$ROOT/monstrator/target/$R/examples/link-probe" "$ROOT/tabula/target/$R/tabulad" \
-         "$ROOT/opifex-sheet/target/$R/opifex-sheetd" "$ROOT/portcullis/target/$R/opifexd" "$ROOT/portcullis/target/$R/opifex-check" \
+         "$ROOT/opifex-sheet/target/$R/opifex-sheetd" "$ROOT/prelum-sheet/target/$R/atrium-prelum-sheet" "$ROOT/portcullis/target/$R/opifexd" "$ROOT/portcullis/target/$R/opifex-check" \
          "$ROOT/atrium-open/target/$R/examples/open-probe" "$ROOT/scripts/monstrator-service.sh" \
          "$ROOT/monstrator/etc/services.d/38-atrium-monstratord.toml" \
          "$ROOT/portcullis/target/$R/atrium-portcullisd-bootstrap"; do
@@ -311,7 +312,9 @@ g "sed -i '' '/^\[\[crossings\]\]/,/^kinds/d' /var/db/atrium/navtest/policy.toml
 # Tabula's uid, before frescod starts: frescod lets _tabula spend copy
 # and paste presses (its consumers are read at start).
 g "id _tabula >/dev/null 2>&1 || pw useradd _tabula -u 65039 -d /nonexistent -s /usr/sbin/nologin -c 'Tabula, the clipboard'"
-g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute \
+# FRESCOD_EXTRA: more of frescod's settings for a variant run (e.g.
+# FRESCOD_SPLIT_PIXELS=0, frames to frescod's compositor).
+g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute ${FRESCOD_EXTRA:-} \
     FRESCOD_APP_REGISTRY=$S/none FRESCOD_HEADLESS_PNG=$S/screen FRESCOD_SOCK=$FS FRESCOD_WM_SOCK=$S/wm.sock \
     FRESCOD_INPUT_SOCK=$S/inject.sock FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000 FRESCOD_CHROME_SOCK=$CS FRESCOD_SLOT_UIDS=65022 FRESCOD_ACTIVATION_SOCK=$AS \
     daemon -f -o $S/frescod.log -u _frescod $D/frescod </dev/null"
@@ -544,6 +547,9 @@ sleep 3
 shot confined-3-app
 sleep 15
 shot confined-3-app-later   # the same row, a while on (a label drawn late?)
+inj "MOVE 1173 125"; sleep 3   # over the Open button: its tiles drawn again
+shot confined-3-app-hover
+inj "MOVE 700 400"
 press $((W - 40)) $((TOP + 41 + 22))                   # Try it
 until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
@@ -705,6 +711,30 @@ case "$R" in *"not a launched app"*) ok "root asking for a window: refused" ;; *
 sleep 3
 shot confined-12-personal-forward
 
+echo "=== printing (navigator-ui.md §7 Printing)"
+# The print sheet as _prelum-sheet, Limen's print provider (no prelumd
+# here: it offers no printer, and Escape cancels). Ctrl-P in the Personal
+# window: the page child lays the page out on A4 in its jail and hands
+# back a PDF, which the UI gives the sheet over its window.
+g "id _prelum-sheet >/dev/null 2>&1 || pw useradd _prelum-sheet -u 65046 -d /nonexistent -s /usr/sbin/nologin
+   pkill -f atrium-prelum-sheet; : > $S/sheet.log; chmod 666 $S/sheet.log
+   cd $S && daemon -f -o $S/sheet.log -u _prelum-sheet env HOME=/nonexistent LIMEN_SOCKET=$LS FRESCO_SOCKET=$FS PRELUM_SOCKET=/nonexistent \
+   PRELUM_SHEET_ACTIVATION=$AS PRELUM_SHEET_NEARBY=0 $D/atrium-prelum-sheet </dev/null"
+i=0; while [ $i -lt 30 ] && ! g "grep -q 'providing print' $S/sheet.log"; do sleep 2; i=$((i+2)); done
+g "grep -q 'providing print' $S/sheet.log" && ok "the print sheet provides Limen's print role" || bad "sheet: $(g "tail -3 $S/sheet.log" | tr '\n' ';')"
+inj "KEY 0x13 1 1"; sleep 1; inj "KEY 0x13 0 1"   # Ctrl-P
+i=0; while [ $i -lt 90 ] && ! g "grep -q -e 'print sheet open' -e 'print: Failed' $UL"; do sleep 3; i=$((i+3)); done
+g "grep -q 'navigator-page: printed on 595x842 pt: [1-9][0-9]* pages' $S/limend.log" && ok "the page child laid the page out on A4: $(g "grep -h 'navigator-page: printed' $S/limend.log | tail -1 | sed 's/.*: printed/printed/'")" || bad "page PDF: $(g "grep -h -e 'navigator-page: print' -e 'a page child' $S/limend.log $UL | tail -3" | tr '\n' ';')"
+g "grep -q 'navigator-ui: print sheet open ([1-9][0-9]* pages' $UL" && ok "…and the window opened the print sheet with it" || bad "sheet open: $(g "grep -h 'print' $UL | tail -3" | tr '\n' ';')"
+g "grep -q 'sheet [0-9]* for org.atrium.navigator' $S/sheet.log" && ok "the sheet is over the Navigator's window" || bad "sheet for: $(g "tail -3 $S/sheet.log" | tr '\n' ';')"
+g "grep -q 'limend refused the PDF' $S/sheet.log" && bad "limend refused the page's PDF" || ok "limend took the page's PDF"
+sleep 20
+shot confined-13-print-sheet
+key 0x29                  # Escape: the sheet goes, nothing printed
+i=0; while [ $i -lt 30 ] && ! g "grep -q 'navigator-ui: print: ' $UL"; do sleep 2; i=$((i+2)); done
+g "grep -q 'navigator-ui: print: Cancelled' $UL" && ok "Escape: the sheet closed, cancelled" || bad "cancel: $(g "grep -h -e 'print' $UL | tail -2; tail -2 $S/sheet.log" | tr '\n' ';')"
+shot confined-14-print-cancelled
+
 echo "=== atrium-app: an app that isn't installed (L5)"
 # The catalog above, opifexd and the install sheet as _opifexsheet. App probe asks for
 # atrium-app://org.atrium.l5hello: Monstrator asks the install sheet for it,
@@ -752,7 +782,7 @@ N=$(jails)
 [ "${N:-0}" = 0 ] && ok "the page jails ended with the Navigator" || bad "$N page jails left"
 LEFT=$(g "jls name | grep -cE 'navigator[-_](converter|fetcher)' || true" | tr -d '\r')
 [ "${LEFT:-0}" = 0 ] && ok "no converter or fetcher jail left" || bad "$LEFT converter/fetcher jails left"
-for f in ui limend navigatord navigatord-work frescod bootstrap; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
+for f in ui limend navigatord navigatord-work frescod bootstrap sheet; do get $S/$f.log "$OUT/$f.log" 2>/dev/null; done
 get /var/log/atrium/portcullisd-navigator.log "$OUT/portcullisd.log" 2>/dev/null
 g "pkill -x limend; pkill -x navigatord; pkill -x forum-wm; pkill -x frescod; true"
 sleep 5

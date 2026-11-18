@@ -308,6 +308,35 @@ impl Run {
     /// Lay the page out again for a new size or reading, keeping its
     /// place: the word at the top of the view stays there when the text
     /// size or measure changes; otherwise the same document px.
+    /// The page shown printed on paper `w` × `h` points (navigator-ui.md
+    /// "Printing"), handed to the parent as a sealed PDF.
+    fn print(&mut self, out: &mut LimenOut, w: u32, h: u32, margin: u32) {
+        let Some(p) = self.view.page.get_cloned() else {
+            eprintln!("navigator-page: nothing to print");
+            out.send(ToParent::Error { code: error::PRINT_FAILED });
+            return;
+        };
+        let t = Instant::now();
+        let paper = navigator_page::print::Paper { w_pt: w as f64, h_pt: h as f64, margin_pt: margin as f64 };
+        let images = p.images.clone();
+        let r = navigator_page::print::pdf(p.prepared.html.clone(), p.prepared.subs.clone(), &p.prepared.title, paper, &|a| images.encoded.get(a).cloned())
+            .and_then(|pr| limen::fdpass::sealed_file("page.pdf", &pr.pdf).map(|fd| (pr, fd)).map_err(|e| e.to_string()));
+        match r {
+            Ok((pr, fd)) => {
+                use std::os::fd::AsFd;
+                eprintln!("navigator-page: printed on {w}x{h} pt: {} pages, {} bytes, in {} ms", pr.pages, pr.pdf.len(), t.elapsed().as_millis());
+                let m = ToParent::Printed { pages: pr.pages.clamp(1, limen::doc_viewer::PRINT_PAGES_MAX as usize) as u32, cut: pr.cut };
+                if let Err(e) = out.0.emit_fd(out.1, m.encode(), fd.as_fd()) {
+                    eprintln!("navigator-page: limend took no PDF: {e:?}");
+                }
+            }
+            Err(why) => {
+                eprintln!("navigator-page: not printed: {why}");
+                out.send(ToParent::Error { code: error::PRINT_FAILED });
+            }
+        }
+    }
+
     fn relayout(&mut self, reading: Option<Reading>) {
         let Some(p) = self.view.page.get_cloned() else { return };
         let size = self.view.size.get();
@@ -652,6 +681,7 @@ fn embedded() {
                     Some(ToChild::ScrollTo { anchor }) => run.scroll_to(&anchor),
                     Some(ToChild::Load { .. }) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
                     Some(ToChild::Provide { .. }) => eprintln!("navigator-page: a picture came without its bytes"),
+                    Some(ToChild::Print { w_pt, h_pt, margin_pt }) => run.print(&mut out, w_pt, h_pt, margin_pt),
                     Some(ToChild::Park) => {
                         let y = run.view.scroll.get_cloned().physics.y as f32;
                         let y = if y.is_finite() { y.clamp(0.0, limen::doc_viewer::SCROLL_MAX) } else { 0.0 };

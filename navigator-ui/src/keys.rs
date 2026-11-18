@@ -33,6 +33,9 @@ pub enum Action {
     ZoomReset,
     /// Ctrl-R: the current version of the page, fetched again (§5.5).
     Reload,
+    /// Ctrl-P: the page on screen, printed through the system's print
+    /// sheet (printing.md §5.1).
+    Print,
     /// F6, Shift-F6: the keys go to the next (previous) of rail, toolbar
     /// and page (§9).
     NextRegion,
@@ -76,6 +79,7 @@ pub fn action(ev: &Event) -> Option<Action> {
         ("f", false) => Action::Find,
         ("h", false) => Action::History,
         ("r", false) => Action::Reload,
+        ("p", false) => Action::Print,
         ("+" | "=", _) => Action::ZoomIn,
         ("-", false) => Action::ZoomOut,
         ("0", false) => Action::ZoomReset,

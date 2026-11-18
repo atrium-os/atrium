@@ -54,6 +54,8 @@ pub fn history_clear_all(x: f32, col: f32) -> (f32, f32) {
 
 /// The page slot's key (pergola::slot): where Limen binds the page.
 pub const PAGE_SLOT: u64 = 0x5041_4745; // "PAGE"
+/// The print sheet's slot, over the whole window while it is open.
+pub const PRINT_SLOT: u64 = 0x5052_4e54; // "PRNT"
 
 /// The Where field while it is focused (§5.3).
 #[derive(Clone, Debug)]
@@ -114,6 +116,8 @@ pub struct Shell {
     /// The last thing a press did that has no visible effect yet in step 1
     /// (a prompt's answer, Reload), for the log.
     pub last_note: Option<String>,
+    /// The print sheet is open (or the page is being laid out for it).
+    pub printing: bool,
     /// Pages come from navigatord (step 2): `None` is the stand-in store.
     pub live: Option<LivePage>,
     /// What the UI asks navigatord next (drained by the main loop).
@@ -194,6 +198,9 @@ pub enum Out {
     SignOut { jar: navigator_control::Jar, url: String },
     /// "Jump to section" (§7): the page shown scrolls to `anchor`.
     Jump { anchor: String },
+    /// Print the page on screen (§7 "Print"): its child lays it out on
+    /// paper and the print sheet opens over the window.
+    Print,
     /// A branch made its own trail (§4.2): the moved pages' keys, old to
     /// new, so their live children follow them.
     Moved { keys: Vec<((u64, PageId), (u64, PageId))> },
@@ -304,7 +311,7 @@ pub fn fit_persona(p: &str) -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, printing: false, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -940,6 +947,19 @@ impl Shell {
         true
     }
 
+    /// Ctrl-P: only a page shown in its child prints, once at a time.
+    fn print(&mut self) {
+        if self.printing {
+            return;
+        }
+        if matches!(self.live, Some(LivePage::Shown(_))) {
+            self.printing = true;
+            self.outbox.push(Out::Print);
+        } else {
+            self.last_note = Some("nothing to print here".into());
+        }
+    }
+
     pub fn apply(&mut self, a: Action, _now: f64) {
         self.persona_open = a == Action::NewWindow && !self.persona_open && !self.other_personas.is_empty();
         self.popover = false;
@@ -1001,6 +1021,7 @@ impl Shell {
                 }
             }
             Action::Reload => self.reload(),
+            Action::Print => self.print(),
             Action::NextRegion | Action::PrevRegion => {
                 let from = if self.editing.is_some() {
                     Some(Region::Toolbar)
@@ -1542,6 +1563,24 @@ mod tests {
         s.consented("https://news.example/a");
         assert!(s.store.knows("news.example"));
         assert!(matches!(s.outbox.as_slice(), [Out::Reload { .. }]), "{:?}", s.outbox);
+    }
+
+    #[test]
+    fn ctrl_p_prints_only_a_page_shown_and_once_at_a_time() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.store.new_trail(false);
+        s.apply(Action::Print, 0.0);
+        assert!(s.outbox.is_empty() && !s.printing);
+        assert_eq!(s.last_note.as_deref(), Some("nothing to print here"));
+        s.live = Some(LivePage::Loading("https://example.org/".into()));
+        s.apply(Action::Print, 0.0);
+        assert!(s.outbox.is_empty(), "not until it is laid out");
+        s.live = Some(LivePage::Shown("https://example.org/".into()));
+        s.apply(Action::Print, 0.0);
+        assert_eq!(s.outbox, vec![Out::Print]);
+        assert!(s.printing);
+        s.apply(Action::Print, 0.0);
+        assert_eq!(s.outbox.len(), 1, "the sheet is already open");
     }
 
     #[test]

@@ -140,6 +140,7 @@ window (pergola.md §10).
 | parent → child | `Find` | `query: String` (at most 256 bytes, no control characters; empty clears), `step: i8` (0 the first match from the top of the view, 1 the next, -1 the one before); answered by `Found` |
 | parent → child | `Park` | the parent will close the child (navigator-ui.md §4.4); answered by `Parked` |
 | parent → child | `Provide` | `id: String` (at most 256 bytes) with a descriptor holding a picture's bytes (mail.md §7.3: a message's `cid:` part or `data:` picture, or a remote picture the person loaded). Before `Load` it is for the document `Load` brings; after, for the document shown, laid out again where the reader was. An `<img src>` (or CSS `url()`) spelled exactly `id` shows it, at its real size when the document declares none. At most 256 pictures, 16 MiB each, 64 MiB in all per document; bytes that aren't a picture are ignored. The child never fetches: an id never provided stays a placeholder of its declared size. Added 2026-11-17 at the end of the enum (§2's versioning) |
+| parent → child | `Print` | `w_pt`, `h_pt` (144–14400 points), `margin_pt` (at most a quarter of the shorter side): lay the document shown out again on that paper as a PDF (navigator-ui.md §7 "Printing"). Answered by `Printed` or `Error { PRINT_FAILED (4) }`. Added 2026-11-18 at the end of the enum |
 | child → parent | `Loaded` | `title: String` (at most 256 bytes), `anchors: Vec<String>` (at most 256 of them) |
 | child → parent | `LinkActivated` | `url: String`. Only after a press in the child; the parent decides whether to open it |
 | child → parent | `Error` | `code: u16` |
@@ -147,6 +148,7 @@ window (pergola.md §10).
 | child → parent | `Zoomed` | `zoom_64: u16`: the person zoomed in the child (keys, a pinch) and it settled, for the parent to remember |
 | child → parent | `Key` | `key: Char \| Tab \| Left \| Right \| Escape`, `chars` (one character), `ctrl`, `shift`, `alt`: a chrome shortcut the child does not use (Ctrl or Alt with a key, or Escape; not Ctrl-plus, -minus, -0, which are the child's zoom). The parent runs it through its own keyboard map, so it is no more than a press the person could have made with the chrome focused |
 | child → parent | `Parked` | `scroll: f32`, how far down the page is (finite, 0 to 10⁷). Only a number: the page's state that comes back is its address, kept by navigatord, and this offset |
+| child → parent | `Printed` | `pages: u32` (1–500), `cut: bool` (the document had more pages than that), with the PDF as a sealed memory file: the only descriptor a doc-viewer child hands back (the role's `returns_fd`). The parent passes the bytes to the print sheet and never parses them |
 | child → parent | `Embeds` | `list: Vec<{ key: u64, rect: Option<[x, y, w, h]>, role: String, src: EmbedSrc }>`, every embed the child has in view, `rect` in the child's window px (`None`: scrolled partly or wholly out). At most 64. Sent when the list or a rect changes, after the frame that shows it |
 
 The child never sends the parent document text.

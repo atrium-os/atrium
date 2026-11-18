@@ -770,8 +770,11 @@ with a new layout for the paper and orientation chosen. Gates in
 `officina-pdf/tests/print.rs` draw the PDFs back with Folium; the VM check has
 `sheets` and `slides` stages (`ONLY="sheets slides"` runs just those).
 
-Not yet: the Navigator has no PDF output to hand the sheet (it needs a paged rendering
-of a page in its jail; the Navigator thread is doing it); Sheets prints the current
+The Navigator prints too (2026-11-18, navigator-ui.md §7 "Printing"): the page's own
+jailed child lays it out on the paper and writes the PDF, handed back to the window as a
+sealed memory file, and it answers Relayout the same way.
+
+Not yet: Sheets prints the current
 sheet's used range only (no print areas, titles, charts or pictures yet); Mail prints text only;
 colour, two-sided and tray options wait for R5's attributes; Scrinium's
 quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in

@@ -78,6 +78,12 @@ pub enum ToChild {
     /// The child never fetches: what isn't provided stays a placeholder
     /// of its declared size.
     Provide { id: String },
+    /// Print the document shown (navigator-ui.md "Printing"): laid out
+    /// again on paper `w_pt` × `h_pt` points with `margin_pt` margins, as a
+    /// PDF. Answered by `Printed`, with the PDF as a sealed memory file, or
+    /// `Error { PRINT_FAILED }`. The parent hands the bytes to the print
+    /// sheet, which never parses them itself.
+    Print { w_pt: u32, h_pt: u32, margin_pt: u32 },
 }
 
 /// The most pictures one document is given, and the most bytes in all.
@@ -143,7 +149,15 @@ pub enum ToParent {
     /// Ctrl-0, a pinch) and it settled here, in 1/64: for the parent to
     /// remember (navigator-ui.md §7).
     Zoomed { zoom_64: u16 },
+    /// The answer to `Print`, with the PDF as the descriptor: how many
+    /// pages, and whether it was cut at `PRINT_PAGES_MAX`.
+    Printed { pages: u32, cut: bool },
 }
+
+/// The most pages a `Printed` PDF has, and the paper sizes `Print` takes.
+pub const PRINT_PAGES_MAX: u32 = 500;
+pub const PRINT_PT_MIN: u32 = 144;
+pub const PRINT_PT_MAX: u32 = 14400;
 
 /// The keys `Key` may carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +183,9 @@ pub mod error {
     pub const TOO_BIG: u16 = 2;
     /// The document could not be parsed or laid out.
     pub const UNREADABLE: u16 = 3;
+    /// The document shown could not be printed (nothing shown, or the
+    /// layout failed).
+    pub const PRINT_FAILED: u16 = 4;
 }
 
 fn clean_text(s: &str, max: usize) -> bool {
@@ -194,6 +211,10 @@ impl ToChild {
             ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
             ToChild::Park => true,
             ToChild::Provide { id } => !id.is_empty() && clean_text(id, ANCHOR_MAX),
+            ToChild::Print { w_pt, h_pt, margin_pt } => {
+                let r = PRINT_PT_MIN..=PRINT_PT_MAX;
+                r.contains(w_pt) && r.contains(h_pt) && *margin_pt * 4 <= *w_pt.min(h_pt)
+            }
         };
         ok.then_some(m)
     }
@@ -221,6 +242,7 @@ impl ToParent {
                     && rect.is_none_or(|r| r.iter().all(|v| v.is_finite() && v.abs() <= SCROLL_MAX))
             }
             ToParent::Zoomed { zoom_64 } => (Reading::ZOOM_MIN..=Reading::ZOOM_MAX).contains(zoom_64),
+            ToParent::Printed { pages, .. } => (1..=PRINT_PAGES_MAX).contains(pages),
             ToParent::Key { key, chars, ctrl, alt, .. } => {
                 clean_text(chars, KEY_CHARS_MAX) && chars.chars().count() <= 1 && (*key != ChromeKey::Char || !chars.is_empty())
                     && (matches!(key, ChromeKey::Escape | ChromeKey::F6) || *ctrl || *alt)
