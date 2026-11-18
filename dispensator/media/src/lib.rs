@@ -19,6 +19,7 @@
 //! | `ADOPT` 0x0B | postcard [`Adopt`] | `u8 status`, then postcard `String`: open a Locked stick with its recovery code (tessera-encryption.md §7.4); arcad unwraps its key, keeps it in the persona or loads it for this session only |
 //! | `OPEN_OLDER` 0x0C | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Open read-only?" for a Locked stick that is an older copy of one of the person's (tessera-encryption.md §8); Sigillum verifies the person first |
 //! | `MAKE_CURRENT` 0x0D | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Use this copy as current" for an older copy opened read-only (§8): Sigillum verifies the person, arcad lowers its key's high-water mark to this copy, and it is mounted writable |
+//! | `FORGET` 0x0E | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Forget this stick's key" for an open sealed stick of the person's (tessera-encryption.md §9): Sigillum verifies the person, arcad deletes the key and the kernel drops it; the stick is unmounted and shows Locked (openable again only with its recovery code, if it has one) |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -49,6 +50,7 @@ pub mod op {
     pub const ADOPT: u16 = 0x0B;
     pub const OPEN_OLDER: u16 = 0x0C;
     pub const MAKE_CURRENT: u16 = 0x0D;
+    pub const FORGET: u16 = 0x0E;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -267,6 +269,9 @@ pub mod server {
         /// "Use this copy as current" (checked here: who, and that it's
         /// listed as an older copy opened read-only).
         fn make_current(&self, part: &str) -> (u8, String);
+        /// "Forget this stick's key" (checked here: who, and that it's
+        /// listed as an open sealed stick).
+        fn forget(&self, part: &str) -> (u8, String);
     }
 
     pub struct Shared {
@@ -373,6 +378,16 @@ pub mod server {
                 return (status::NOT_FOUND, format!("{part} is not an older copy opened read-only"));
             }
             self.host.make_current(part)
+        }
+
+        pub fn forget(&self, uid: u32, part: &str) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may change a stick".into());
+            }
+            if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == part && !v.locked && !v.persona.is_empty() && !v.part.starts_with("share-")) {
+                return (status::NOT_FOUND, format!("{part} is not an open sealed stick"));
+            }
+            self.host.forget(part)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -538,6 +553,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::MAKE_CURRENT, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::FORGET => {
+                    let (st, msg) = match postcard::from_bytes::<Eject>(&m.payload) {
+                        Ok(e) if !e.part.is_empty() && e.part.len() <= 32 => shared.forget(uid, &e.part),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::FORGET, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -625,6 +647,10 @@ pub mod client {
 
     pub fn make_current(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
         status_call(sock, op::MAKE_CURRENT, part)
+    }
+
+    pub fn forget(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
+        status_call(sock, op::FORGET, part)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -773,6 +799,9 @@ mod tests {
         }
         fn make_current(&self, part: &str) -> (u8, String) {
             (status::OK, format!("{part} is now the current copy"))
+        }
+        fn forget(&self, part: &str) -> (u8, String) {
+            (status::OK, format!("{part}'s key is forgotten"))
         }
     }
 
@@ -961,5 +990,19 @@ mod tests {
         assert_eq!(shared.make_current(2000, "da1p1").0, status::NOT_ALLOWED);
         assert_eq!(shared.make_current(1000, "da0p1").0, status::NOT_FOUND, "a current stick");
         assert_eq!(shared.make_current(1000, "da2p1").0, status::NOT_FOUND, "not opened yet");
+    }
+
+    #[test]
+    fn forget_needs_an_open_sealed_stick() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        let mine = Volume { persona: "personal".into(), ..vol("da1p1") };
+        let locked = Volume { mountpoint: String::new(), locked: true, persona: "work".into(), ..vol("da2p1") };
+        let share = Volume { persona: "personal".into(), ..vol("share-1000") };
+        shared.update(vec![vol("da0p1"), mine, locked, share], &[]);
+        assert_eq!(shared.forget(1000, "da1p1").0, status::OK);
+        assert_eq!(shared.forget(2000, "da1p1").0, status::NOT_ALLOWED);
+        assert_eq!(shared.forget(1000, "da0p1").0, status::NOT_FOUND, "a plain stick");
+        assert_eq!(shared.forget(1000, "da2p1").0, status::NOT_FOUND, "already Locked");
+        assert_eq!(shared.forget(1000, "share-1000").0, status::NOT_FOUND, "a share");
     }
 }

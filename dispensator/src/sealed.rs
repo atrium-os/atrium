@@ -110,6 +110,7 @@ pub mod arca {
     pub const SOCKET: &str = "/atrium/sockets/arca/arcad.sock";
     pub const VK_MINT: u16 = 0xB0;
     pub const VK_RECORD: u16 = 0xB2;
+    pub const VK_FORGET: u16 = 0xB3;
     pub const VK_FIND: u16 = 0xB4;
     pub const VK_RECOVERY: u16 = 0xB5;
     pub const VK_ADOPT: u16 = 0xB6;
@@ -158,7 +159,7 @@ pub mod arca {
 
     /// `find USER KEYID UUID`, `mint USER PERSONA UUID LABEL`,
     /// `record USER PERSONA KEYID`, `recovery USER PERSONA KEYID UUID`,
-    /// `older|current USER PERSONA KEYID UUID`,
+    /// `older|current USER PERSONA KEYID UUID`, `forget USER PERSONA KEYID`,
     /// `adopt USER PERSONA KEYID UUID SLOT KEEP` (the code is `code`, which
     /// the child reads from its stdin, never its arguments; `held:HEX` is
     /// a handle from Arca's field instead): the request
@@ -189,6 +190,7 @@ pub mod arca {
             }
             ("find", 4) => Some((VK_FIND, Body::default().str(a(1)?).raw(&super::unhex16(a(2)?)?).raw(&super::unhex16(a(3)?)?).u64(0).0)),
             ("mint", 5) => Some((VK_MINT, Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).u64(0).str(a(4)?).0)),
+            ("forget", 4) => Some((VK_FORGET, Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).0)),
             ("record", 4) => Some((VK_RECORD, Body::default().str(a(1)?).str(a(2)?).raw(&super::unhex16(a(3)?)?).0)),
             _ => None,
         }
@@ -212,7 +214,7 @@ pub mod arca {
             VK_RECOVERY if body.len() > super::SLOT_LEN && body[super::SLOT_LEN..].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-') => {
                 format!("ok {} {}", super::hex(&body[..super::SLOT_LEN]), String::from_utf8_lossy(&body[super::SLOT_LEN..]))
             }
-            VK_OLDER if body.is_empty() => "ok".into(),
+            VK_OLDER | VK_FORGET if body.is_empty() => "ok".into(),
             // The stick's name from its recovery slot, in hex (any bytes).
             VK_ADOPT if body.is_empty() => "ok".into(),
             VK_ADOPT if body.len() <= 64 => format!("ok {}", super::hex(body)),

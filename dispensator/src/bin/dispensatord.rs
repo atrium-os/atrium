@@ -134,6 +134,8 @@ fn args() -> Result<Args, String> {
             // "Open read-only?" for an older copy (§8).
             "--open-older" => a.media_cmd = Some(format!("open-older {}", val()?)),
             "--make-current" => a.media_cmd = Some(format!("make-current {}", val()?)),
+            // "Forget this stick's key" (§9).
+            "--forget" => a.media_cmd = Some(format!("forget {}", val()?)),
             "--adopt" => {
                 let part = val()?;
                 let persona = it.next().ok_or("--adopt needs PART PERSONA keep|once")?;
@@ -439,6 +441,9 @@ fn media_client(sock: &std::path::Path, cmd: &str, recovery: bool) -> ExitCode {
     if let Some(part) = cmd.strip_prefix("make-current ") {
         return answer(atrium_media::client::make_current(sock, &atrium_media::Eject { part: part.into() }));
     }
+    if let Some(part) = cmd.strip_prefix("forget ") {
+        return answer(atrium_media::client::forget(sock, &atrium_media::Eject { part: part.into() }));
+    }
     if let Some(part) = cmd.strip_prefix("open-older ") {
         return answer(atrium_media::client::open_older(sock, &atrium_media::Eject { part: part.into() }));
     }
@@ -626,6 +631,7 @@ mod run {
 
     /// A trusted stick: whose key opened it, to record its generation and
     /// drop the key when it goes.
+    #[derive(Clone)]
     struct Trusted {
         mnt: String,
         user: String,
@@ -688,6 +694,8 @@ mod run {
         /// Open an older copy read-only, once Sigillum verified (§8).
         OpenOlder(String),
         MakeCurrent(String),
+        /// Forget an open sealed stick's key, once Sigillum verified (§9).
+        Forget(String),
     }
 
     /// The file manager's standing grant (§4.8): every served stick, whole,
@@ -1017,6 +1025,10 @@ mod run {
 
         fn make_current(&self, part: &str) -> (u8, String) {
             self.ask(Req::MakeCurrent(part.to_string()))
+        }
+
+        fn forget(&self, part: &str) -> (u8, String) {
+            self.ask(Req::Forget(part.to_string()))
         }
 
         fn grant(&self, g: &atrium_media::Grant) -> (u8, String) {
@@ -1853,7 +1865,9 @@ mod run {
                 let label = self.trusted.get(&part).map(|t| t.label.clone()).unwrap_or_default();
                 let read_only = read_only || self.trusted.get(&part).is_some_and(|t| t.read_only);
                 let older = self.trusted.get(&part).is_some_and(|t| t.read_only);
-                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label, persona, locked: false, recovery: false, older });
+                // Whether a recovery code would still open it, for "Forget this stick's key".
+                let recovery = self.recoverable.contains(&part);
+                vols.push(Volume { part, mountpoint: mnt, size_bytes, free_bytes, read_only, label, persona, locked: false, recovery, older });
             }
             for part in self.locked.iter().filter(|p| self.media.served().any(|s| s == p.as_str())) {
                 let recovery = self.recoverable.contains(part);
@@ -1900,6 +1914,7 @@ mod run {
                     Req::Adopt(a) => self.adopt(&a),
                     Req::OpenOlder(p) => self.open_older(&p),
                     Req::MakeCurrent(p) => self.make_current(&p),
+                    Req::Forget(p) => self.forget(&p),
                     Req::Grant(g) => self.grant(&g),
                     Req::Revoke(jail) => {
                         self.standing.retain(|s| s.jail != jail);
@@ -2632,6 +2647,11 @@ mod run {
             // The new stick is its person's: a private top folder.
             let _ = std::os::unix::fs::chown(&mnt, Some(uid), Some(gid));
             let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+            if code.is_some() {
+                self.recoverable.insert(f.part.clone());
+            } else {
+                self.recoverable.remove(&f.part);
+            }
             self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id, read_only: false, label: f.label.clone() });
             self.serve_trusted(&f.part);
             self.publish();
@@ -2744,6 +2764,64 @@ mod run {
             self.publish();
             eprintln!("atrium-dispensatord: {part}: now {user}/{persona}'s current copy (high-water {gen}), mounted writable at {mnt}");
             (mstatus::OK, format!("{part} is now the current copy"))
+        }
+
+        /// "Forget this stick's key" (§9): its server and mount go, arcad
+        /// (once Sigillum verifies the person) deletes the key and the
+        /// kernel drops it, and the stick shows Locked: openable again only
+        /// with its recovery code, if it has one. Refused or unverified, it
+        /// is mounted again as it was.
+        fn forget(&mut self, part: &str) -> (u8, String) {
+            use dispensator::sealed::{arca, hex};
+            let Session::Active { user, .. } = self.session.clone() else {
+                return (mstatus::NOT_ALLOWED, "no unlocked session".into());
+            };
+            let Some(t) = self.trusted.get(part).filter(|t| t.user == user).cloned() else {
+                return (mstatus::NOT_FOUND, format!("{part} is not an open sealed stick of yours"));
+            };
+            self.stop_stick_server(part);
+            if let Err(e) = jaild::ffi::unmount_at(&t.mnt, 0) {
+                self.serve_trusted(part);
+                self.sync_standing();
+                return if e.raw_os_error() == Some(libc::EBUSY) {
+                    (mstatus::BUSY, format!("{} is busy: close the files open on it first", t.mnt))
+                } else {
+                    (mstatus::FAILED, format!("unmount {}: {e}", t.mnt))
+                };
+            }
+            // Record where it got to first: if the person backs out, the
+            // key still knows the stick as it is now.
+            if !t.read_only {
+                let _ = vk_call(&["record", &user, &t.persona, &hex(&t.key_id)]);
+            }
+            if let Err(st) = vk_call(&["forget", &user, &t.persona, &hex(&t.key_id)]) {
+                let flags = if t.read_only { libc::MNT_RDONLY } else { 0 };
+                if mount_tessera_flags(part, &t.mnt, flags).is_ok() {
+                    self.serve_trusted(part);
+                    self.sync_standing();
+                } else {
+                    self.trusted.remove(part);
+                    self.locked.insert(part.to_string());
+                }
+                self.publish();
+                return match st {
+                    s if s == arca::NEEDS_VERIFICATION => (mstatus::NOT_ALLOWED, "not verified".into()),
+                    s if s == arca::LOCKED => (mstatus::FAILED, format!("{user}'s Arca is locked")),
+                    // Opened with its code for this session only: nothing kept.
+                    s if s == arca::DENIED => (mstatus::NOT_FOUND, format!("{part}'s key isn't kept on this machine: eject it")),
+                    s => (mstatus::FAILED, format!("arcad refused (status {s})")),
+                };
+            }
+            // arcad dropped it from the kernel too; this is belt and braces.
+            if let Some(r) = &self.keyring {
+                tkey_drop(r, t.key_id);
+            }
+            self.trusted.remove(part);
+            self.locked.insert(part.to_string());
+            self.publish();
+            let code = self.recoverable.contains(part);
+            eprintln!("atrium-dispensatord: {part}: {user}/{}'s key forgotten; Locked{}", t.persona, if code { " (it has a recovery code)" } else { "" });
+            (mstatus::OK, if code { format!("{part}'s key is forgotten; its recovery code still opens it") } else { format!("{part}'s key is forgotten") })
         }
 
         /// A Locked stick opened with its recovery code (§7.4): arcad

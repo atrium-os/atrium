@@ -226,6 +226,15 @@ MD6=$(g "mdconfig -a -t vnode -f $T/stick2.img")
 PART=${MD6}p1
 sleep 5
 check "kept: replugged, it opens for bob by itself" tessera "$(mounted)"
+# "Forget this stick's key" (§9). No Sigillum in this VM, so arcad can't
+# verify bob: refused, and the stick is mounted again as it was.
+r=$(g "su -m bob -c '$D --media-socket $S --forget $PART'")
+check "forget the key: needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still mounted" tessera "$(mounted)"
+check "…still bob's, with its recovery code" yes "$(list_as bob | grep -q "^$PART /media/$PART .* recovery persona=personal" && echo yes || echo no)"
+check "…alice's note still reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
+r=$(g "su -m alice -c '$D --media-socket $S --forget $PART'")
+check "…not by another user" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
 r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
 check "ejected" "" "$(mounted)"
 
