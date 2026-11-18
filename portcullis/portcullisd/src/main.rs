@@ -152,12 +152,39 @@ fn main() -> ExitCode {
 
     let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
 
+    /* ★ The worker-call socket (portcullis_ipc::WORKERS_SOCKET_PATH): what
+     * an app with [[workers]] gets in its jail. Same daemon, same peer-uid
+     * identity, but only Hello and WorkerCall are answered on it. */
+    {
+        let wpath = Path::new(portcullis_ipc::WORKERS_SOCKET_PATH);
+        let _ = std::fs::remove_file(wpath);
+        if let Some(d) = wpath.parent() { let _ = std::fs::create_dir_all(d); }
+        match UnixListener::bind(wpath) {
+            Ok(l) => {
+                let _ = std::fs::set_permissions(wpath, std::fs::Permissions::from_mode(0o666));
+                let shared = Arc::clone(&shared);
+                thread::spawn(move || {
+                    for conn in l.incoming().flatten() {
+                        let s = Arc::clone(&shared);
+                        thread::spawn(move || {
+                            if let Err(e) = serve(conn, s, true) {
+                                eprintln!("portcullisd: worker connection: {e}");
+                            }
+                        });
+                    }
+                });
+                eprintln!("portcullisd: worker calls on {}", wpath.display());
+            }
+            Err(e) => eprintln!("portcullisd: bind {}: {e} (no [[workers]] calls)", wpath.display()),
+        }
+    }
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let s = Arc::clone(&shared);
                 thread::spawn(move || {
-                    if let Err(e) = serve(stream, s) {
+                    if let Err(e) = serve(stream, s, false) {
                         eprintln!("portcullisd: connection: {e}");
                     }
                 });
@@ -254,7 +281,9 @@ fn launch_owner(peer_user: &str, registry_owner: Option<&str>) -> String {
     registry_owner.unwrap_or(peer_user).to_string()
 }
 
-fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()> {
+/// One connection. `workers_only`: the worker-call socket, where nothing
+/// but Hello and WorkerCall is answered.
+fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) -> std::io::Result<()> {
     /* Identify the peer before reading any protocol bytes. If we
      * can't, refuse the connection — we have no way to know whose
      * policy to consult. */
@@ -315,6 +344,11 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        if workers_only && !matches!(req, Request::WorkerCall { .. }) {
+            write_response(&mut writer, &Response::Error {
+                message: "this socket takes only WorkerCall".into() })?;
+            return Ok(());
+        }
         if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit, serves } = req {
             /* ★ The fetcher only through OpenFetcher: started here, it would
              * skip the caller's `net-fetch` check, and the system grant of the
@@ -2697,7 +2731,7 @@ mod tests {
             for conn in listener.incoming() {
                 let stream = conn.unwrap();
                 let s = Arc::clone(&shared);
-                thread::spawn(move || { let _ = serve(stream, s); });
+                thread::spawn(move || { let _ = serve(stream, s, false); });
             }
         });
         thread::sleep(Duration::from_millis(50));
