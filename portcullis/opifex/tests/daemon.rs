@@ -469,7 +469,7 @@ fn pub_app(w: &W, t: &Third, id: &str, v: &str, k: &K, publisher: &str) {
     fs::create_dir_all(b.join("bin")).unwrap();
     fs::write(b.join("bin/hello"), elf(v.len() as u8)).unwrap();
     fs::write(b.join("atrium.toml"), format!(
-        "[app]\nid = \"{id}\"\nname = \"Example Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\n\n[capabilities]\nclipboard = true\n")).unwrap();
+        "[app]\nid = \"{id}\"\nname = \"Example Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\n\n[capabilities]\nclipboard = true\nidentity.webauthn = [\"example.com\", \"login.example.com\"]\n")).unwrap();
     opifex::app::pack(&b, Some(&k.sk)).unwrap();
     let bytes = opifex::archive::pack(&b).unwrap();
     let sha = oc::hex(&Sha256::digest(&bytes));
@@ -499,6 +499,8 @@ fn a_catalog_someone_added() {
     // example.com proves its publisher (the .well-known file).
     fs::create_dir_all(w.d.join("web/example.com/.well-known")).unwrap();
     fs::write(w.d.join("web/example.com/.well-known/atrium-publisher"), oc::publisher::proof_text(&pid)).unwrap();
+    // example.com lets the app use its passkeys; login.example.com says nothing.
+    fs::write(w.d.join("web/example.com/.well-known/atrium-apps"), format!("# ours\n{pid} {TP}\n")).unwrap();
 
     let url = "https://apps.example.com/cat/";
     let sha = match ask(&w, 1001, Request::PreviewCatalog { url: url.into() }) {
@@ -555,6 +557,7 @@ fn a_catalog_someone_added() {
                Response::Done { id: TP.into(), version: "1.0".into() });
     let rec = w.daemon.store().get(TP).unwrap().unwrap();
     assert_eq!((rec.source.as_str(), rec.publisher.as_str(), rec.installed_by), ("catalog:apps.example.com", pid.as_str(), 1001));
+    assert_eq!(rec.verified_rps, vec!["example.com".to_string()]);
 
     // A rotated key is the same publisher: the update goes in the background.
     pub_entry(&t, "rotate", &pid, &["example.com"], &k2, &[&k1, &k2]);

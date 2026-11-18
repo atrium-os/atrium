@@ -12,5 +12,6 @@ pub mod font;
 pub mod installed;
 pub mod layer;
 pub mod proto;
+pub mod rp;
 pub mod runtime;
 pub mod updates;

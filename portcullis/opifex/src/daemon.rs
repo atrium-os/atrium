@@ -596,11 +596,20 @@ impl Daemon {
                 let _ = fs::remove_dir_all(&stage);
                 return Err(format!("{id}: entry {} missing", m.entry()));
             }
+            // WebAuthn RP ids: only those whose site names this app (§7.3).
+            let verified_rps = if crate::rp::rp_ids(&r.manifest).is_empty() { Vec::new() } else {
+                let mut net = fetch::Fetcher::new(self.fetch_any_cmd.clone());
+                let (ok, dropped) = crate::rp::verify(&r.manifest, &publisher, id, &mut |u| net.get(u, fetch::PROOF_MAX));
+                for d in dropped {
+                    eprintln!("opifexd: {id}: WebAuthn RP dropped: {d}");
+                }
+                ok
+            };
             let rec = Record {
                 id: m.app.id.clone(), version: m.app.version.clone(), kind: r.kind.clone(), publisher: publisher.clone(),
                 source: source.clone(), archive_sha256: r.archive_sha256.clone(),
                 content: m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
-                installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries,
+                installed_by: uid, time: now(), verified_rps, recoveries,
             };
             self.finish(&m, &stage, rec)
         })();
