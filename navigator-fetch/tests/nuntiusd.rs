@@ -231,3 +231,45 @@ fn nuntiusd_narrows_to_its_sites_and_refuses_a_bad_list() {
         .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(b))).stderr(std::process::Stdio::null()).status().unwrap();
     assert_eq!(st.code(), Some(1), "an unreadable list must not serve unlimited");
 }
+
+/// ★ `Lookup` over the channel (nuntius.md §3.6): answered from the
+/// resolver the conversation was given, one `Records` per lookup; with no
+/// resolver, `Error(Dns)`.
+#[test]
+fn lookups_over_the_channel() {
+    use nuntius::{Lookup, Record, RecordKind};
+    // A resolver on loopback that answers every TXT query with "v=DMARC1".
+    let dns = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let at = dns.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut b = [0u8; 512];
+        while let Ok((n, from)) = dns.recv_from(&mut b) {
+            let q = &b[..n];
+            let qend = 12 + q[12..].iter().position(|x| *x == 0).unwrap() + 5;
+            let mut m = q[..qend].to_vec();
+            m[2..4].copy_from_slice(&0x81a0u16.to_be_bytes());
+            m[6..8].copy_from_slice(&1u16.to_be_bytes());
+            m[10..12].copy_from_slice(&[0, 0]);
+            m.extend_from_slice(&[0xC0, 12, 0, 16, 0, 1, 0, 0, 0, 60, 0, 9, 8]);
+            m.extend_from_slice(b"v=DMARC1");
+            dns.send_to(&m, from).unwrap();
+        }
+    });
+    let (a, b) = UnixStream::pair().unwrap();
+    let net: &'static ToServer = Box::leak(Box::new(ToServer(server(0))));
+    let conv = Conversation::new(net, tls(), Policy { grant_private_network: true })
+        .with_dns(Arc::new(navigator_fetch::dns::Udp::to(&[at]).unwrap()));
+    std::thread::spawn(move || serve_channel(b, conv, 0));
+    let mut c = Client::from_stream(a).unwrap();
+    c.lookup(Lookup { id: 3, name: "_dmarc.example.com".into(), kind: RecordKind::Txt }).unwrap();
+    match next(&mut c) {
+        Event::Records { id: 3, records, secure: true } => assert_eq!(records, vec![Record::Txt("v=DMARC1".into())]),
+        e => panic!("{e:?}"),
+    }
+    assert!(c.lookup(Lookup { id: 4, name: "not a name".into(), kind: RecordKind::Txt }).is_err(), "refused before it is sent");
+
+    // No resolver given: Dns.
+    let (mut c, _) = fetcher(server(0), 0);
+    c.lookup(Lookup { id: 5, name: "_dmarc.example.com".into(), kind: RecordKind::Txt }).unwrap();
+    assert!(matches!(next(&mut c), Event::Error { id: 5, code: ErrorCode::Dns }));
+}

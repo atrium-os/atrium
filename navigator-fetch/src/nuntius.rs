@@ -90,6 +90,24 @@ impl Nuntius {
                     self.inner.credit.notify_all();
                 }
             }
+            Request::Lookup(l) => {
+                let mut live = self.inner.live.lock().unwrap();
+                if live.len() >= MAX_REQUESTS || live.contains_key(&l.id) {
+                    let _ = self.events.send(Event::Error { id: l.id, code: ErrorCode::Malformed });
+                    return;
+                }
+                live.insert(l.id, Arc::new(Ctl { cancelled: AtomicBool::new(false), sock: Mutex::new(None) }));
+                drop(live);
+                let (conv, inner, events) = (self.conv.sibling(), self.inner.clone(), self.events.clone());
+                std::thread::spawn(move || {
+                    let last = match conv.lookup(&l.name, l.kind) {
+                        Ok((records, secure)) => Event::Records { id: l.id, records, secure },
+                        Err(code) => Event::Error { id: l.id, code },
+                    };
+                    inner.live.lock().unwrap().remove(&l.id);
+                    let _ = events.send(last);
+                });
+            }
             Request::Open(o) => {
                 let mut live = self.inner.live.lock().unwrap();
                 if live.len() >= MAX_REQUESTS || live.contains_key(&o.id) {

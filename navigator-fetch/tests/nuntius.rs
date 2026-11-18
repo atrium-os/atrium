@@ -145,6 +145,7 @@ fn collect_from(rx: &Receiver<Event>, id: u32, start: usize) -> (Vec<String>, Ve
             Event::Done { .. } => { kinds.push("done".into()); break }
             Event::Error { code, .. } => { err = Some(code); kinds.push("error".into()); break }
             Event::Progress { .. } | Event::Fd { .. } => {}
+            Event::Records { .. } => panic!("records for a fetch"),
         }
     }
     (kinds, bytes, err)

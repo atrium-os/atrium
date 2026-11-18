@@ -151,9 +151,58 @@ impl mail_sync::jmap::Http for CourierHttp {
 
 // ── settings discovery through Nuntius ──────────────────────────────
 
-/// HTTP through Mail's fetcher; DNS SRV and MX aren't reachable from an
-/// app yet, so those steps find nothing and known providers, JMAP and
-/// autoconfig carry the search.
+/// One lookup through a fetcher (nuntius.md §3.6): its records, waiting
+/// at most 8 s; other events (none are expected) are passed over.
+pub fn lookup(c: &mut nuntius::Client, id: u32, name: &str, kind: nuntius::RecordKind) -> Result<Vec<nuntius::Record>, String> {
+    use nuntius::{Event, Lookup};
+    c.lookup(Lookup { id, name: name.to_string(), kind }).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no answer in time".into());
+        }
+        match c.recv_timeout(left) {
+            Ok(Some(Event::Records { id: i, records, .. })) if i == id => return Ok(records),
+            Ok(Some(Event::Error { id: i, code })) if i == id => return Err(format!("{code:?}")),
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// DKIM and DMARC lookups (§7.5) through a fetcher of Mail's own, opened
+/// the first time one is needed and again if it stops.
+#[derive(Default)]
+pub struct NuntiusDns {
+    fetcher: std::cell::RefCell<Option<(nuntius::Client, nuntius::launch::FetcherGuard)>>,
+    next: std::cell::Cell<u32>,
+}
+
+impl mail_engine::dns::Dns for NuntiusDns {
+    fn txt(&self, name: &str) -> Result<Vec<String>, String> {
+        let mut f = self.fetcher.borrow_mut();
+        if f.as_ref().is_some_and(|(_, g)| g.exited()) {
+            *f = None;
+        }
+        if f.is_none() {
+            *f = Some(nuntius::launch::open().map_err(|e| e.to_string())?.into_parts());
+        }
+        let id = self.next.get().wrapping_add(1);
+        self.next.set(id);
+        let (c, _) = f.as_mut().unwrap();
+        match lookup(c, id, name, nuntius::RecordKind::Txt) {
+            Ok(r) => Ok(r.into_iter().filter_map(|r| match r { nuntius::Record::Txt(t) => Some(t), _ => None }).collect()),
+            Err(e) => {
+                // A fetcher that went quiet is not asked again.
+                *f = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// HTTP, SRV and MX through Mail's fetcher.
 pub struct NuntiusLookup<'a>(pub &'a mut nuntius::client::Client);
 
 impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
@@ -184,11 +233,21 @@ impl mail_sync::setup::Lookup for NuntiusLookup<'_> {
             }
         }
     }
-    fn srv(&mut self, _: &str) -> Vec<(u16, u16, u16, String)> {
-        Vec::new()
+    fn srv(&mut self, name: &str) -> Vec<(u16, u16, u16, String)> {
+        lookup(self.0, 2, name, nuntius::RecordKind::Srv)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r { nuntius::Record::Srv { priority, weight, port, target } => Some((priority, weight, port, target)), _ => None })
+            .collect()
     }
-    fn mx(&mut self, _: &str) -> Vec<String> {
-        Vec::new()
+    fn mx(&mut self, domain: &str) -> Vec<String> {
+        let mut v: Vec<(u16, String)> = lookup(self.0, 3, domain, nuntius::RecordKind::Mx)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| match r { nuntius::Record::Mx { preference, host } => Some((preference, host)), _ => None })
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, h)| h).collect()
     }
 }
 
@@ -304,6 +363,7 @@ pub fn start(store: Store, jail: PathBuf, roots: Vec<Vec<u8>>, net: Box<dyn Conn
     std::thread::spawn(move || {
         let mut engine = Engine::new(store, Parser { program: jail });
         engine.set_roots(roots);
+        engine.set_dns(Box::new(NuntiusDns::default()));
         let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         loop {
             let mut out = Vec::new();

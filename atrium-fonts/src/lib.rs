@@ -189,7 +189,7 @@ impl Library {
         let script = SCRIPTS.iter().find(|(lo, hi, _)| (*lo..=*hi).contains(&c)).map(|s| s.2);
         // Installed packages (CJK and the like) come after the script's
         // shipped face and before the general ones.
-        script.into_iter().chain(extra::families_for(ch, han)).chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Serif"])
+        script.into_iter().chain(extra::families_for(ch, han)).chain(["Noto Sans", "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math", "Noto Emoji", "Noto Serif"])
     }
 
     /// The family a character's script asks for before any general
@@ -351,6 +351,14 @@ pub const SCRIPTS: &[(u32, u32, &str)] = &[
     (0xFE70, 0xFEFF, "Noto Naskh Arabic"),
     (0x11B00, 0x11B5F, "Noto Sans Devanagari"),
     (0x1D400, 0x1D7FF, "Noto Sans Math"),
+    // Emoji: shaped whole (ZWJ sequences, skin tones, flags, keycaps).
+    (0x1F000, 0x1F02F, "Noto Emoji"),
+    (0x1F0A0, 0x1F0FF, "Noto Emoji"),
+    (0x1F1E6, 0x1F1FF, "Noto Emoji"),
+    (0x1F300, 0x1F64F, "Noto Emoji"),
+    (0x1F680, 0x1F6FF, "Noto Emoji"),
+    (0x1F900, 0x1F9FF, "Noto Emoji"),
+    (0x1FA70, 0x1FAFF, "Noto Emoji"),
 ];
 
 #[cfg(test)]
@@ -391,7 +399,7 @@ mod tests {
     #[test]
     fn script_faces_cover_their_blocks() {
         let lib = repo();
-        for (ch, fam) in [('क', "Noto Sans Devanagari"), ('த', "Noto Sans Tamil"), ('ক', "Noto Sans Bengali"), ('ب', "Noto Naskh Arabic"), ('ש', "Noto Sans Hebrew"), ('ก', "Noto Sans Thai"), ('ა', "Noto Sans Georgian"), ('Ա', "Noto Sans Armenian"), ('ሀ', "Noto Sans Ethiopic"), ('ཀ', "Noto Serif Tibetan"), ('𝐀', "Noto Sans Math")] {
+        for (ch, fam) in [('क', "Noto Sans Devanagari"), ('த', "Noto Sans Tamil"), ('ক', "Noto Sans Bengali"), ('ب', "Noto Naskh Arabic"), ('ש', "Noto Sans Hebrew"), ('ก', "Noto Sans Thai"), ('ა', "Noto Sans Georgian"), ('Ա', "Noto Sans Armenian"), ('ሀ', "Noto Sans Ethiopic"), ('ཀ', "Noto Serif Tibetan"), ('𝐀', "Noto Sans Math"), ('😀', "Noto Emoji"), ('🚀', "Noto Emoji")] {
             assert_eq!(Library::script_family(ch), Some(fam));
             let id = Library::face(fam, false, false).unwrap();
             let f = ttf_parser::Face::parse(lib.bytes(id).unwrap(), 0).unwrap();

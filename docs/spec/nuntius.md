@@ -145,6 +145,25 @@ continues the same numbering.
 1 GiB for `Fd` and unbounded for `Stream` (flow control bounds it), `total_ms` at most 10 min
 for `Stream` media and 60 s otherwise. Numbers to tune by measurement.
 
+### 3.6 Lookups (added 2026-11-18, for Mail's DKIM checks)
+
+`Lookup { id, name, kind: Txt | Srv | Mx }` asks the system's resolver for records an app
+needs beside addresses (a fetch resolves addresses itself). The answer is one
+`Records { id, records, secure }` (no such name, or no records: empty; `secure`: the
+resolver validated it with DNSSEC, its AD bit), or `Error` with `Dns`, `Timeout` or `Policy`.
+
+- Names are letters, digits, `-` and `_`, labels of 1–63, at least two, at most 253
+  characters. The site list (§4) applies to the name as to a host.
+- At most 32 records; a TXT record's strings are joined and kept up to 4 KiB.
+- `nuntiusd` opens a UDP socket to each resolver in `/etc/resolv.conf` (up to 3, else
+  127.0.0.1) and connects it **before** `cap_enter`; in capability mode a connected socket
+  can still send and receive, and nothing else can be reached. Queries ask for recursion
+  and AD, with EDNS0 at 4 KiB; a truncated answer is `Dns` (TCP would need a new
+  connection). Answers must match the id and the question; names are decompressed with a
+  jump limit.
+- A lookup adds no reach: an app with `net-fetch` can already send any name to the
+  resolver by fetching it. Mail caches answers for hours (mail.md §7.5).
+
 ## 4. Who decides what a client may reach
 
 - **Public internet:** any client with `net.fetch`.
@@ -333,6 +352,14 @@ feed through it (fresco-video P3).
     need a portcullisd change.
   - The per-client private-network grant (§4); it needs a permissions UI first.
   - The Navigator's own instances, which stay in-process for now.
+
+### 6.4 Lookups (2026-11-18)
+
+§3.6 built: `nuntius` (`Lookup`, `RecordKind`, `Record`, `Event::Records`, checked on the
+wire both ways), `navigator_fetch::dns` (query, bounded answer reader, `Udp` over connected
+sockets, `Conversation::with_dns`), `nuntiusd` connecting the resolver's sockets before the
+sandbox. Tests: wire 1, DNS reader and a loopback resolver 2, lookups over the channel 1.
+Not yet: a VM run against local-unbound, TCP for truncated answers.
 
 ## 7. Open questions
 

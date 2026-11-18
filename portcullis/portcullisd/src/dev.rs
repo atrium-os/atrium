@@ -108,9 +108,9 @@ fn dev_key() -> Result<String, String> {
 pub struct Prepared {
     pub id:       String,
     pub manifest: String,
-    entry:        String,
-    bytes:        Vec<u8>,
-    /// The entry's libraries and the loader: (path in the bundle, bytes).
+    /// The entry, then each `[[workers]]` entry: (path in the bundle, bytes).
+    entries:      Vec<(String, Vec<u8>)>,
+    /// Their libraries and the loader: (path in the bundle, bytes).
     libs:         Vec<(PathBuf, Vec<u8>)>,
 }
 
@@ -154,13 +154,27 @@ pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String>
     if !asks.is_empty() {
         return Err(format!("a dev build can't have {}", asks.join(", ")));
     }
-    let entry = m.entry().trim_start_matches('/').to_string();
-    let bytes = read_file(open_beneath(&proj, &entry, libc::O_RDONLY)?, &entry, ENTRY_MAX)?;
-    // Its libraries, before the press is spent: a refusal costs nothing.
+    // The entry and its workers' (app-composition.md §4.1: the same bundle,
+    // the same signature), each with its libraries, before the press is
+    // spent: a refusal costs nothing.
     let (view, home_in) = workspace::view(owner, ws)?;
-    let in_jail = format!("{home_in}/{}/{}{entry}", workspace::WORK,
-                          if project.is_empty() || project == "." { String::new() } else { format!("{project}/") });
-    let libs = closure(&bytes, &in_jail, &view)?;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut libs: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let names = std::iter::once(m.entry().to_string()).chain(m.workers.iter().map(|w| w.entry.clone()));
+    for entry in names {
+        let entry = entry.trim_start_matches('/').to_string();
+        if entries.iter().any(|(e, _)| *e == entry) { continue }
+        let bytes = read_file(open_beneath(&proj, &entry, libc::O_RDONLY)?, &entry, ENTRY_MAX)?;
+        let in_jail = format!("{home_in}/{}/{}{entry}", workspace::WORK,
+                              if project.is_empty() || project == "." { String::new() } else { format!("{project}/") });
+        for (at, b) in closure(&bytes, &in_jail, &view)? {
+            if !libs.iter().any(|(p, _)| *p == at) { libs.push((at, b)) }
+        }
+        if libs.len() > LIBS_MAX {
+            return Err(format!("more than {LIBS_MAX} libraries"));
+        }
+        entries.push((entry, bytes));
+    }
     let dev = dev_id(owner, ws, &id);
     // The installed manifest: the same, under the dev id.
     let mut v: toml::Value = text.parse().map_err(|e| format!("atrium.toml: {e}"))?;
@@ -168,7 +182,7 @@ pub fn prepare(owner: &str, ws: &str, project: &str) -> Result<Prepared, String>
         .insert("id".into(), toml::Value::String(dev.clone()));
     let manifest = toml::to_string(&v).map_err(|e| e.to_string())?;
     portcullis_toml::Manifest::from_str(&manifest).map_err(|e| format!("the dev manifest: {e}"))?;
-    Ok(Prepared { id: dev, manifest, entry, bytes, libs })
+    Ok(Prepared { id: dev, manifest, entries, libs })
 }
 
 /// Install a prepared bundle (replacing the last Run's), signed by the dev
@@ -183,12 +197,14 @@ pub fn install(p: &Prepared) -> Result<PathBuf, String> {
     fs::write(tmp.join("atrium.toml"), &p.manifest).map_err(e)?;
     let sig = portcullis_sig::sign(p.manifest.as_bytes(), &key).map_err(|e| format!("sign: {e:?}"))?;
     fs::write(tmp.join("atrium.toml.sig"), sig).map_err(e)?;
-    let ep = tmp.join(&p.entry);
-    if let Some(d) = ep.parent() {
-        fs::create_dir_all(d).map_err(e)?;
+    for (entry, bytes) in &p.entries {
+        let ep = tmp.join(entry);
+        if let Some(d) = ep.parent() {
+            fs::create_dir_all(d).map_err(e)?;
+        }
+        fs::write(&ep, bytes).map_err(e)?;
+        fs::set_permissions(&ep, fs::Permissions::from_mode(0o555)).map_err(e)?;
     }
-    fs::write(&ep, &p.bytes).map_err(e)?;
-    fs::set_permissions(&ep, fs::Permissions::from_mode(0o555)).map_err(e)?;
     // An app's jail is its bundle: the entry's libraries and the loader go
     // in too, as the workspace's loader found them.
     for (at, bytes) in &p.libs {
