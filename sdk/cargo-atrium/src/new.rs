@@ -33,10 +33,35 @@ const C_APP: &[File] = &[
     ("gitignore.tmpl", ".gitignore", include_str!("../../templates/c-app/gitignore.tmpl")),
 ];
 
+const VIEWER: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/viewer/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/viewer/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/viewer/src/main.rs")),
+    ("src/lib.rs", "src/lib.rs", include_str!("../../templates/viewer/src/lib.rs")),
+    ("src/bin/decode.rs", "src/bin/decode.rs", include_str!("../../templates/viewer/src/bin/decode.rs")),
+    ("fuzz/seed.bmp", "fuzz/corpus/worker-decode/seed.bmp", include_str!("../../templates/viewer/fuzz/seed.bmp")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/viewer/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/viewer/cargo-config.toml.tmpl")),
+];
+
+const INDEXER: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/indexer/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/indexer/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/indexer/src/main.rs")),
+    ("src/lib.rs", "src/lib.rs", include_str!("../../templates/indexer/src/lib.rs")),
+    ("src/bin/index.rs", "src/bin/index.rs", include_str!("../../templates/indexer/src/bin/index.rs")),
+    ("fuzz/seed", "fuzz/corpus/worker-index/seed", include_str!("../../templates/indexer/fuzz/seed")),
+    ("fuzz/long-words", "fuzz/corpus/worker-index/long-words", include_str!("../../templates/indexer/fuzz/long-words")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/indexer/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/indexer/cargo-config.toml.tmpl")),
+];
+
 /// (template, what it is, its files).
 pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("app", "a window and nothing else: start here for an app that opens no files and uses no network", APP),
     ("c-app", "the same in C: a window on libatrium, a Makefile on atrium.app.mk (make, make run)", C_APP),
+    ("viewer", "opens files the person picks and parses them in a worker with no capabilities (a BMP viewer)", VIEWER),
+    ("indexer", "keeps one worker for the app's run and talks to it in messages (word counts of opened text)", INDEXER),
 ];
 
 /// Where an SDK crate is in an Atrium checkout.
@@ -82,7 +107,7 @@ pub fn render(o: &Opts) -> Result<Vec<(String, String)>, String> {
         if o.sdk_path.is_some() && *to == ".cargo/config.toml" {
             continue;
         }
-        let mut t = text.replace("{{name}}", o.name).replace("{{title}}", &title(o.name))
+        let mut t = text.replace("{{name}}", o.name).replace("{{crate}}", &o.name.replace('-', "_")).replace("{{title}}", &title(o.name))
             .replace("{{id}}", &id).replace("{{registry}}", o.registry);
         while let Some(at) = t.find("{{dep:") {
             let end = t[at..].find("}}").ok_or("a {{dep: without }}")? + at;
@@ -119,6 +144,26 @@ pub fn create(dir: &Path, o: &Opts) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_templates() {
+        for (t, worker) in [("viewer", "decode"), ("indexer", "index")] {
+            let o = Opts { name: "my-app", template: t, id: None, sdk_path: None, registry: REGISTRY };
+            let f = render(&o).unwrap();
+            assert!(f.iter().all(|x| !x.1.contains("{{")), "{t}: unfilled placeholder");
+            let bin = f.iter().find(|x| x.0 == format!("src/bin/{worker}.rs")).unwrap();
+            assert!(bin.1.contains(&format!("atrium_worker::main!(my_app::workers::{worker});")), "{}", bin.1);
+            assert!(f.iter().any(|x| x.0 == format!("fuzz/corpus/worker-{worker}/seed") || x.0 == format!("fuzz/corpus/worker-{worker}/seed.bmp")));
+            let m = &f.iter().find(|x| x.0 == "atrium.toml").unwrap().1;
+            let (findings, _, _) = crate::check::manifest(m);
+            assert!(findings.iter().all(|x| x.level != crate::check::Level::Error), "{t}: {findings:?}");
+            let cargo = &f.iter().find(|x| x.0 == "Cargo.toml").unwrap().1;
+            let targets = crate::fuzz::targets(cargo, Some(m)).unwrap();
+            assert_eq!(targets.len(), 1, "{t}");
+            assert_eq!(targets[0].name, format!("worker:{worker}"));
+            assert_eq!(targets[0].function, format!("my_app::workers::{worker}"));
+        }
+    }
 
     #[test]
     fn c_app() {

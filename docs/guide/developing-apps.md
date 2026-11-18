@@ -65,9 +65,23 @@ cargo atrium new --list                      # templates (--json for tools)
 
 The `app` template is a Pergola window with a button and a counter, an
 `atrium.toml` that asks for the display and nothing else, and a
-`.cargo/config.toml` naming the Atrium crate registry. **Planned (M7):**
-`viewer`, `client`, `media` and `service` templates with workers, once
-`atrium-worker` lands.
+`.cargo/config.toml` naming the Atrium crate registry.
+
+Two templates show an app split into a core and a worker
+(app-composition.md §4.3):
+
+- `viewer`: a BMP viewer. Files offers it for BMP pictures (`[[opens]]`);
+  the core hands each opened file's descriptor to the `decode` worker,
+  which runs in a jail of its own with no capabilities and answers with a
+  checked `Picture`. The decoder lives in the lib (`workers::decode`), the
+  worker binary is one line (`atrium_worker::main!`), and a seed picture
+  is in the fuzz corpus.
+- `indexer`: word counts of the text files you open. One `index` worker is
+  kept for the app's run (`lifetime = "session"`, `input = "message"`): the
+  core sends each file's text as a message, the worker keeps the counts.
+
+**Planned:** `client`, `media` and `service` templates, with M6 (`embeds`,
+roles, Nuntius from the manifest).
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
@@ -137,10 +151,30 @@ atrium-schema thumbnail.json --prefix thumb --out gen/
 The C decoder is held to the Rust one byte for byte (the SDK's parity test
 runs thousands of valid and broken inputs under ASan and UBSan).
 
+### Workers: `atrium-worker`
+
+```rust
+// The core
+let workers = atrium_worker::Workers::get()?;
+let pic: Picture = workers.call("decode", &Ask { max_side: 2048 }, Some(file))?;
+let mut index = workers.session("index")?;           // lifetime = "session"
+let top: Top = index.call(&Add { text }, None)?;
+
+// The worker's binary
+atrium_worker::main!(myapp::workers::decode);       // fn(Req, Option<File>) -> Result<Resp, String>
+```
+
+Each `[[workers]]` entry in `atrium.toml` names the binary (`entry`), what
+it takes (`input = "fd"` or `"message"`), `lifetime`, `memory` and `cpu`.
+A crash, a limit or a timeout comes back as an `Err`, never as a panic in
+the core. Off Atrium, `ATRIUM_WORKERS=local ATRIUM_APP_ROOT=.` runs the
+workers as plain children (`cargo run` in a workspace).
+
 ## 5. Crates and the registry
 
 SDK crates (`pergola`, `libatrium`, `atrium-fonts`, `fresco-client`,
-`fresco-protocol`, `atrium-message` and what they use) come from the Atrium
+`fresco-protocol`, `atrium-message`, `atrium-worker`, `atrium-open` and
+what they use) come from the Atrium
 crate registry, a static cargo sparse registry; everything else comes from
 crates.io as usual. All SDK crates are `MIT OR Apache-2.0` and versioned
 together.
@@ -170,16 +204,25 @@ starts one. **Planned (M7):** `make bundle`.
 ## 7. Running, fuzzing and bundling
 
 In a workspace's Terminal, `cargo atrium run [--release]` builds, puts the
-binary where `atrium.toml`'s `entry` says (the app template uses
-`bin/<name>`), and asks you to Run the project as an app: the Terminal shows
+core and each worker where `atrium.toml`'s entries say (the templates use
+`bin/<name>` and `bin/<name>-<worker>`), and asks you to Run the project as an app: the Terminal shows
 what it asks and Run needs your press. The app runs with the capabilities
 its manifest asks for and the libraries it links, in its own jail (amber
 window frame). For C, `make run` does the same.
 
 ### Fuzzing
 
-Declare what to fuzz in Cargo.toml; each target is a `fn(&[u8])` in the
-project's lib crate:
+Every `[[workers]]` entry is a target, `worker:<name>`, with nothing to
+declare: the harness calls the worker's handler, `<lib>::workers::<name>`
+(dashes as underscores), the function its `main!` serves. For
+`input = "fd"` each input is the file and the request is `Req::default()`;
+for `input = "message"` each input is a frame, decoded with its bounds as
+the worker decodes it. An answer that breaks its own message's bounds,
+which the core would refuse, counts as a crash.
+
+Other surfaces, above all the core's, are declared in Cargo.toml; each is a
+`fn(&[u8])` in the project's lib crate (a declared `worker:` name replaces
+the automatic one):
 
 ```toml
 [package.metadata.atrium.fuzz."worker:decode"]
@@ -208,9 +251,6 @@ reads. Without AddressSanitizer (stable Rust), comparisons that go through
 `memcmp` (slice equality) aren't traced, so magic numbers are found slowly;
 seed the corpus with a valid file.
 
-When workers land (M5), each `[[workers]]` entry gets its target without
-being declared.
-
 **Planned:**
 
 - `cargo atrium bundle [--sign]` (M7): a release bundle with its closure,
@@ -225,7 +265,7 @@ being declared.
 | `cargo atrium new --list [--json]` | the templates |
 | `cargo atrium check [--manifest p] [--json]` | manifest and crate-graph lint, consent text |
 | `cargo atrium cross <amd64\|aarch64> [--sysroot d] [cargo args]` | build for Atrium from another OS or arch |
-| `cargo atrium run [--release] [cargo args]` | build and Run the project as a dev app (asks for your press) |
+| `cargo atrium run [--release] [cargo args]` | build the core and workers, and Run the project as a dev app (asks for your press) |
 | `cargo atrium fuzz --list \| <target> [--max-time s] [--json]` | fuzz workers and the core's input surfaces |
 | `cargo atrium registry verify <dir\|url> [--keys d]` | check the registry's signed index |
 | `cargo atrium registry build --out d --url u [--sign key] <seed>...` | for SDK maintainers: pack and sign the registry |
