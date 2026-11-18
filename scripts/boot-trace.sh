@@ -73,6 +73,7 @@ while time.time() < end:
         print("%8.3f %s" % (time.time() - t0, line.decode("utf-8", "replace").rstrip("\r")), flush=True)
 EOF
         SER=$!
+        disown "$SER" 2>/dev/null || true
     fi
     V 'shutdown -r now' >/dev/null 2>&1
     sleep 5
@@ -102,8 +103,11 @@ print("\n-- sockets: seconds after kernel boottime that each was bound")
 for line in open(os.path.join(R, "sockets.txt")):
     p = line.split(None, 1)
     if len(p) == 2 and boot:
-        print("%8.2f  %s" % (float(p[0]) - boot, p[1].strip()))
-print("\n-- slowest rc.d entries in kern.boottrace.log (as logged)")
+        d = float(p[0]) - boot
+        # A socket older than this boot was left by an earlier one: its
+        # service did not bind this boot (not running, or not restarted).
+        print("%8.2f  %s%s" % (d, p[1].strip(), "   (stale: not bound this boot)" if d < 0 else ""))
+print("\n-- kern.boottrace.log in log order (deltas are ms; absolute times before sysinit 0x4800000 are not meaningful)")
 rows = []
 for line in open(os.path.join(R, "boottrace.txt")):
     rows.append(line.rstrip())

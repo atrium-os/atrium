@@ -1,7 +1,6 @@
 # Fast boot: parallel startup with readiness
 
-**Status:** proposal, 2026-11-18. Not accepted. Numbers in §2 are from reading
-the code; §8's measurement run replaces them with real ones before B1 starts.
+**Status:** accepted 2026-11-18 (all §10 recommendations). B0 measured 2026-11-18 (§2.0).
 **Owner:** portcullisd-bootstrap (launcher), jaild (descriptor passing), rc.d
 scripts of each host daemon.
 **Related:** `service-management.md` (§4.2 parallel boot, §4.9 socket
@@ -31,7 +30,47 @@ luck.** A client that connects to a service at boot either succeeds at once or
 is told by the supervisor why the service is not there. No fixed sleeps on the
 boot path, in rc scripts or in daemons.
 
-## 2. Where boot time goes today (from the code)
+## 2. Where boot time goes today
+
+### 2.0 Measured (B0, 2026-11-18, Mac dev VM, `boot-trace.sh`, 3 reboots)
+
+What was measured: the dev VM as it is, the stock 16.0-CURRENT **GENERIC**
+kernel (WITNESS on) on UFS, 4 vCPUs under HVF. rc enables jaild, volumes,
+portcullisd-daemon and dispensatord; **atrium-portcullisd-bootstrap is not
+enabled**, so no jailed service (frescod, ostiarius, lyrad, Arca, Sigillum …)
+starts at boot. So this measures the FreeBSD + host-daemon part only; T-login
+cannot be measured on this VM until B1 starts the jailed tree.
+
+Reboot request → login prompt on the serial console, run 1 (runs 2, 3 within
+±0.5 s; rc stage within 40 ms):
+
+| Stage | Time | Cause |
+|---|---|---|
+| shutdown | 5.5 s | each Atrium rc stop function waits in `sleep 1` steps, one after another (portcullisd-daemon, dispensatord, volumes, jaild: 1 s each), then the syncer 1 s |
+| UEFI firmware | 5.1 s | ≈ 5 s lost on "Image type X64 can't be loaded on AARCH64": the firmware's boot order tries a wrong entry first |
+| loader | 9.7 s | `autoboot_delay` unset → FreeBSD's 10 s countdown |
+| kernel to root mount | 0.13 s | |
+| rc | 6.5 s | **netif 4.3 s**, devd 0.7 s, every other script 7–30 ms |
+| **total** | **≈ 27 s** | |
+
+netif's 4.3 s: ≈ 2.3 s printing 52 WITNESS backtraces to the serial console
+(`uma_zalloc_debug` with the vtnet core lock held, `if_vtnet.c:1572`, a
+GENERIC-debug-only cost but a real vtnet locking bug), then ≈ 2 s silent, which
+matches netif's IPv6 DAD sleep (`ifconfig_DEFAULT="DHCP inet6 accept_rtadv"`).
+DHCP itself took 24 ms (DHCPREQUEST → bound) and defaultroute 15 ms.
+
+The crash case seen in the logs: under a manual bootstrap run, **ostiarius
+exited every 15.05 s (status 256) and was restarted forever**: its 15 s budget
+in `wait_for_frescod` ran out because frescod was not running, so the
+supervisor's restart policy turned a missing dependency into a crash loop.
+Every bootstrap shutdown also logs "Device busy" unmounting each service's
+`usr/local/bin` nullfs: a mount left behind, to fix with B5.
+
+Rough budget after the fixes below: shutdown < 1 s, firmware ≈ 0.1 s, loader
+1 s, rc < 1 s on a non-debug kernel: **≈ 3 s instead of 27 s** for this VM,
+before the jailed tree is added.
+
+### 2.0a From reading the code
 
 Boot today has three stages: rc(8) runs every rc.d script one after another in
 the foreground; some of those start Atrium host daemons; one of them,
@@ -145,6 +184,11 @@ descriptors ride jaild's exec path as §4.9 intended.
   can connect at once; until then netconf's connects queue.
 - **bootstrap → atrium-volumes**: the same: atrium-volumes' rc binds the
   socket first. bootstrap's wait loop goes.
+- **firmware (VMs)**: fix the UEFI boot order in each VM's `vars.fd` so the
+  first entry is the FreeBSD disk, not the "X64 image" entry that costs 5 s.
+- **stop functions**: poll the pid every 0.1 s instead of `sleep 1` first
+  (each Atrium rc stop costs a full second even when the daemon exits at once),
+  and stop host daemons that don't depend on each other together.
 - **loader**: `autoboot_delay="1"` and `beastie_disable="YES"` on every image
   (RUNBOOK's guidance, applied everywhere, including the dev VM).
 
@@ -303,7 +347,7 @@ Gate for each milestone below: three boots, median T-login and T-settled, plus
 | | What | Gate |
 |---|---|---|
 | **B0** | Measure today's boot (§8). Write the numbers into §2. | `boot-trace.sh` 3 runs on the dev VM |
-| **B1** | rc stage: bootstrap BEFORE netif, no DHCP lines, no sync-ntpd, loader delay 1, netconf and bootstrap wait loops gone (§4) | T-login no longer includes netif/defaultroute/local_unbound in boottrace |
+| **B1** | rc stage: bootstrap enabled and BEFORE netif, no DHCP/accept_rtadv lines (atrium-net owns ports), no sync-ntpd, loader delay 1, VM boot order, fast stop functions, netconf and bootstrap wait loops gone (§4) | T-login no longer includes netif/defaultroute/local_unbound in boottrace |
 | **B2** | Supervisor-bound sockets: manifest `[[sockets]]`, jaild fd passing + policy, `libatrium` `listener()`, lyrad/choragusd/frescod/ostiarius converted first | choragusd never exits at boot over 20 boots; restart of lyrad does not drop choragusd |
 | **B3** | Parallel launch + readiness fd + `after` + boot classes (§6) | all services launched within one jaild round-trip window; `portcullis status` shows held services and why |
 | **B4** | Clients: `service::connect`, forum-bar push subscriptions, remove fixed sleeps (§7) | grep finds no `sleep` in a connect path; bar icons right at first frame |
