@@ -2805,8 +2805,7 @@ codes with multi-byte characters near the end, fixed in `numfmt.rs`). A 65,536
 record by record, plain and RC4 CryptoAPI protected (`xls::sample`), and Sheets
 opens both through the real converter.
 
-Open: the missing functions above; comments once the grid has them (merged
-cells: §16.79); `.xls` charts and pictures; Excel 4 macro sheets.
+Open: the missing functions above (merged cells: §16.79; comments: §16.80); `.xls` charts and pictures; Excel 4 macro sheets.
 
 ### 16.43 O7c as built (2026-11-15): `.doc` import
 
@@ -3623,6 +3622,19 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
 - **Not yet:** printing merged areas as one cell (the printing thread, through `GridSource::merge_at`), the editor spanning the area while typing, and Excel's "Center Across Selection" without merging.
 - **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.
+
+### 16.80 Cell comments (2026-11-18)
+
+- **Engine** (`officina-grid::comments`). A cell may have a comment, made of an author and plain text with lines. `Workbook::comments`, `comment` and `set_comments` read and set them. `GridOp::Comments { sheet, set }` (journal tag 17) sets or removes them as one undo step, and the native file keeps them in chunk `COMMENTS` (17). Clearing or editing a cell keeps its comment, as Excel does. Inserted and deleted rows and columns move a comment, and one on a deleted cell goes. The limits are 32 KB of text, 255 bytes of author and 1M comments a sheet.
+- **Files.**
+  - **.xlsx:** we read and write `xl/commentsN.xml`. Writing also produces the VML drawing Excel needs to show the notes (a hidden yellow box per comment, linked by `legacyDrawing`). Excel's bold "Author:" first run is taken off on read, and authors are trimmed.
+  - **.ods:** we read and write `office:annotation` (`dc:creator` and one `text:p` a line). Empty commented cells are written so they can carry the comment.
+  - **LibreOffice:** it reads both our formats. It drops every author when it reads any `.xlsx`, its own included, so that round trip keeps cells and text only (`officina-convert/tests/comments.rs`).
+- **Sheets.**
+  - **Seeing them:** a commented cell has a small red triangle in its top-right corner (`CellView::note`). With the cursor on it and no edit open, the comment shows in a pale yellow box beside the cell or its merged area, author in bold, wrapped, ten lines at most. This is a grid float from `SheetSource::note_at`.
+  - **Writing them:** Data ▸ New Comment… / Edit Comment… opens a bar where the tabs are. Lines show joined by ¶. Save writes the comment as `$USER` (an edit keeps the original author), and an empty one deletes it. Data ▸ Delete Comment(s) removes those in the selection. Each is one undo step.
+- **Not yet:** comments moving with sorted rows, threaded comments (Excel 365's `threadedComments`, read as their legacy note when the file has one), rich text in comments, and printing them.
+- **Gates:** officina-grid `comments::tests`; officina-convert `tests/comments.rs` (round trips, Excel's author prefix, LibreOffice both ways); atrium-sheets `comments_are_written_shown_beside_the_cell_edited_and_deleted`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

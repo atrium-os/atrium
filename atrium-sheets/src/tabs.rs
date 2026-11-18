@@ -38,6 +38,10 @@ pub enum TabCmd {
     Coloring,
     Color(Option<u32>),
     ColorCancel,
+    /// The comment bar for the cursor's cell; its field submitted; closed.
+    Commenting,
+    CommentDone,
+    CommentCancel,
 }
 
 /// The colours the tab colour bar offers, 0xRRGGBB, with their names.
