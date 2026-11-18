@@ -12,6 +12,8 @@ local-decode = ["dep:navigator-image"]
 
 [dependencies]
 officina-text = { path = "../officina-text" }
+# Decks drawn as display lists (printing from Slides).
+officina-slides = { path = "../officina-slides" }
 # The in-process decoder, used only when the app installed none
 # (officina_text::picture): Write installs its worker's and builds without it.
 navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
@@ -28,3 +30,6 @@ debug = 1
 
 [dev-dependencies]
 png = "0.17"
+# Tests read the PDFs back and draw them, as Prelum's render jail does.
+folium-doc = { path = "../folium-doc" }
+folium-render = { path = "../folium-render" }

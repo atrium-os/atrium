@@ -13,6 +13,8 @@
 #   50621 org.test.printdemo  prelum-print-demo (prints a page it makes)
 #   50622 org.atrium.write    Write, Ctrl+P on a document
 #   50623 org.atrium.pdf      Atrium PDF, Ctrl+P on a PDF
+#   50624 org.atrium.sheets   Sheets, Ctrl+P on a sheet
+#   50625 org.atrium.slides   Slides, Ctrl+P on a deck
 #
 # Checks:
 #   - the press rule, the way Curia's Apps page is checked: with frescod not
@@ -26,7 +28,11 @@
 #   - Save as PDF: the sheet hands the app the rewritten PDF (the picker
 #     that would take it is Scrinium's own gate);
 #   - a window opening sheets as fast as it can is slowed by limend;
-#   - Write and Atrium PDF print, and the printer gets their jobs.
+#   - Write, Atrium PDF, Sheets and Slides print, and the printer gets
+#     their jobs.
+#
+#   ONLY="sheets slides" sh scripts/prelum-r4-vm.sh   # just those stages
+#   (press rule, print, cancel, save, rate, write, pdf, sheets, slides)
 # Ends "PASS: Prelum R4 in the VM" or "FAILED: N".
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,6 +52,7 @@ mkdir -p "$OUT"
 port_up() { python3 -I -c "import socket,sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), 1)" "$1" 2>/dev/null; }
 say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAILED [%s]: %s\n' "$STAGE" "$*" >&2; exit 1; }
+want() { [ -z "${ONLY:-}" ] || case " $ONLY " in *" $1 "*) true ;; *) false ;; esac; }
 check() { # check <label> <ok 0/1> <detail>
     if [ "$2" = 0 ]; then printf 'PASS %-62s %s\n' "$1" "$3"; else printf 'FAIL %-62s %s\n' "$1" "$3"; FAILS=$((FAILS+1)); fi
 }
@@ -59,8 +66,8 @@ put() { # SRC DEST (scp under TCG now and then cuts a file short: again)
 get() { $SCP "root@localhost:$1" "$2" >/dev/null 2>&1; }
 P=/tmp/pr
 cleanup() {
-    g "pkill -f prelum-print-demo; pkill -x atrium-write; pkill -x atrium-pdf; pkill -f atrium-prelum-sheet; pkill -x limend; pkill -x frescod; pkill -f 'prelumd --socket $P/prelum.sock'" >/dev/null 2>&1
-    for f in frescod limend sheet prelumd demo-forged demo demo-escape demo-save demo-rate write pdf; do get $P/$f.log "$OUT/$f.log"; done
+    g "pkill -f prelum-print-demo; pkill -x atrium-write; pkill -x atrium-pdf; pkill -x atrium-sheets; pkill -x atrium-slides; pkill -f atrium-prelum-sheet; pkill -x limend; pkill -x frescod; pkill -f 'prelumd --socket $P/prelum.sock'" >/dev/null 2>&1
+    for f in frescod limend sheet prelumd demo-forged demo demo-escape demo-save demo-rate write pdf sheets slides; do get $P/$f.log "$OUT/$f.log"; done
     for p in $pids; do kill "$p" 2>/dev/null; done
     [ -n "${KEEP:-}" ] && echo "work dir: $work" || rm -rf "$work"
 }
@@ -84,6 +91,8 @@ xb() { # DIR ARGS...
     xb prelum-sheet --bins
     xb atrium-pdf --bin atrium-pdf
     xb atrium-write --bin atrium-write
+    xb atrium-sheets --bin atrium-sheets
+    xb atrium-slides --bin atrium-slides
     (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TARGET -p jaild) || die "jaild cross-build"
 }
 B="$XT/$TARGET/release"
@@ -94,10 +103,18 @@ g true || die "no ssh to the VM (sh scripts/cloud-vm.sh up)"
 CROSS_RUSTFLAGS="$CROSS_RUSTFLAGS" RUSTFLAGS="$CROSS_RUSTFLAGS" START=1 sh "$ROOT/scripts/deploy-portcullis.sh" >"$work/deploy.log" 2>&1 \
     || grep -q "atrium-jaild  *RUNNING" "$work/deploy.log" \
     || { tail -20 "$work/deploy.log"; die "deploy-portcullis"; }
-g "pkill -f prelum-print-demo; pkill -x atrium-write; pkill -x atrium-pdf; pkill -f atrium-prelum-sheet; pkill -x limend; pkill -x frescod; pkill -f 'prelumd --socket $P/prelum.sock'; sleep 1; rm -rf $P; mkdir -p $P/bin; chmod 755 $P; true"
-for b in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render atrium-prelum-sheet prelum-print-demo frescod limend atrium-pdf atrium-write; do put "$B/$b" "$P/bin/$b"; done
+g "pkill -f prelum-print-demo; pkill -x atrium-write; pkill -x atrium-pdf; pkill -x atrium-sheets; pkill -x atrium-slides; pkill -f atrium-prelum-sheet; pkill -x limend; pkill -x frescod; pkill -f 'prelumd --socket $P/prelum.sock'; sleep 1; rm -rf $P; mkdir -p $P/bin; chmod 755 $P; true"
+for b in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render atrium-prelum-sheet prelum-print-demo frescod limend atrium-pdf atrium-write atrium-sheets atrium-slides; do put "$B/$b" "$P/bin/$b"; done
 put "$ROOT/prelum/prelum-ipp-codec/examples/min.pdf" $P/min.pdf
 put "$ROOT/scratch/Ben.owrite" $P/Ben.owrite
+# A sheet (CSV, read in the app) and a small deck with photos.
+[ -s "$ROOT/scratch/prelum-r4/Q3.csv" ] || { mkdir -p "$ROOT/scratch/prelum-r4"; python3 -I -c "
+import sys
+rows=['Region,Quarter,Units,Revenue,Margin']+[f'Region {i%7},Q{i%4+1},{100+i*13},{(100+i*13)*42.5:.2f},{(i*7)%30/100:.2f}' for i in range(120)]
+open(sys.argv[1],'w').write(chr(10).join(rows)+chr(10))" "$ROOT/scratch/prelum-r4/Q3.csv"; }
+[ -s "$ROOT/scratch/prelum-r4/Deck.oslides" ] || (cd "$ROOT/atrium-slides" && CARGO_TARGET_DIR="$HOME/ct" cargo run -q --release --features local-decode --example big_deck -- gen "$ROOT/scratch/prelum-r4/Deck.oslides" 3 2) || die "the test deck"
+put "$ROOT/scratch/prelum-r4/Q3.csv" $P/Q3.csv
+put "$ROOT/scratch/prelum-r4/Deck.oslides" $P/Deck.oslides
 g "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" "/usr/local/share/fonts/ibm-plex/$(basename "$f")"
@@ -107,22 +124,22 @@ REG=/var/run/atrium/app-registry; APPS=/var/lib/atrium/apps
 g 'sh -s' <<EOS || die "setup"
 set -e
 for b in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render; do install -m 0555 $P/bin/\$b /usr/local/bin/\$b; done
-chmod 0555 $P/bin/*; chmod 0444 $P/min.pdf $P/Ben.owrite
+chmod 0555 $P/bin/*; chmod 0444 $P/min.pdf $P/Ben.owrite $P/Q3.csv $P/Deck.oslides
 id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
 id _prelum-sheet >/dev/null 2>&1 || pw useradd _prelum-sheet -u 65046 -d /nonexistent -s /usr/sbin/nologin
-for u in "printdemo 50621" "printwrite 50622" "printpdf 50623"; do
+for u in "printdemo 50621" "printwrite 50622" "printpdf 50623" "printsheets 50624" "printslides 50625"; do
   set -- \$u
   id \$1 >/dev/null 2>&1 || pw useradd \$1 -u \$2 -d /nonexistent -s /usr/sbin/nologin
 done
 mkdir -p /var/run/atrium $APPS
-sed -i '' '/ org.test.printdemo\$/d; / org.atrium.write\$/d; / org.atrium.pdf\$/d' $REG 2>/dev/null || true
-printf '50621 alice org.test.printdemo\n50622 alice org.atrium.write\n50623 alice org.atrium.pdf\n' >> $REG
-for a in org.test.printdemo org.atrium.write org.atrium.pdf; do
+sed -i '' '/ org.test.printdemo\$/d; / org.atrium.write\$/d; / org.atrium.pdf\$/d; / org.atrium.sheets\$/d; / org.atrium.slides\$/d' $REG 2>/dev/null || true
+printf '50621 alice org.test.printdemo\n50622 alice org.atrium.write\n50623 alice org.atrium.pdf\n50624 alice org.atrium.sheets\n50625 alice org.atrium.slides\n' >> $REG
+for a in org.test.printdemo org.atrium.write org.atrium.pdf org.atrium.sheets org.atrium.slides; do
   mkdir -p $APPS/\$a; printf '[app]\nid = "%s"\nname = "%s"\nversion = "1"\nentry = "bin/app"\n\n[capabilities]\ngraphics = "fresco"\n' \$a \$a > $APPS/\$a/atrium.toml
 done
 # A third-party app names the roles it embeds (platform apps may embed any).
 printf 'embeds = ["print", "picker"]\n' >> $APPS/org.test.printdemo/atrium.toml
-mkdir -p $P/home-write $P/home-pdf; chown printwrite $P/home-write; chown printpdf $P/home-pdf
+mkdir -p $P/home-write $P/home-pdf $P/home-sheets $P/home-slides; chown printwrite $P/home-write; chown printpdf $P/home-pdf; chown printsheets $P/home-sheets; chown printslides $P/home-slides
 EOS
 check "binaries, users, the registry and manifests" 0 ""
 
@@ -168,6 +185,7 @@ waitfor() { # FILE PATTERN SECONDS
     g "grep -q '$2' $1"
 }
 start_desk() { # INJECT_ACTIVATION (0/1)
+    DESK=$1
     g "pkill -f atrium-prelum-sheet; pkill -x limend; pkill -x frescod; sleep 1; rm -f $P/*.sock.* $P/fresco.sock $P/limend.sock $P/activation.sock $P/inject.sock $P/wm.sock"
     # Under TCG a press takes seconds to reach the sheet: tokens live longer.
     act=""; [ "$1" = 1 ] && act="FRESCOD_INJECT_ACTIVATION=1 FRESCOD_TOKEN_LIFE_MS=15000"
@@ -192,6 +210,7 @@ SW=760; SH=540; TOP=48
 print_at() { echo "$(( ($1 - SW) / 2 + SW - 80 )) $(( TOP + SH - 36 ))"; }
 DEMO_W=900
 
+if want press; then
 STAGE="press rule"
 say "$STAGE: presses frescod doesn't vouch for"
 start_desk 0
@@ -206,7 +225,9 @@ before=$(jobs_got)
 sleep 10
 check "nothing reached the printer" "$([ "$(jobs_got)" = "$before" ] && ! g "grep -q queued $P/demo-forged.log"; echo $?)" ""
 g "pkill -f prelum-print-demo"; sleep 3
+fi
 
+if want print; then
 STAGE="print"
 say "$STAGE: real presses"
 start_desk 1
@@ -227,8 +248,11 @@ j=$(actl jobs 2>&1 | grep -c "Quarterly")
 check "it is alice's job, titled by the app" "$([ "$j" -ge 1 ]; echo $?)" "$(actl jobs 2>&1 | grep Quarterly | head -1)"
 shot queued
 g "pkill -f prelum-print-demo"; sleep 3
+fi
 
+if want cancel; then
 STAGE=cancel
+[ "${DESK:-}" = 1 ] || start_desk 1
 say "$STAGE"
 app printdemo demo-escape "PRINT_TITLE=Escape $P/bin/prelum-print-demo"
 waitfor $P/sheet.log "sheet .* for org.test.printdemo" 90; sleep ${WAIT:-40}
@@ -237,8 +261,11 @@ key 0x29
 waitfor $P/demo-escape.log "print-demo: cancelled" 30; check "Escape: the app hears cancelled" $? "$(g "tail -1 $P/demo-escape.log")"
 check "and nothing printed" "$([ "$(jobs_got)" = "$before" ]; echo $?)" ""
 g "pkill -f prelum-print-demo"; sleep 3
+fi
 
+if want save; then
 STAGE="save as pdf"
+[ "${DESK:-}" = 1 ] || start_desk 1
 say "$STAGE"
 app printdemo demo-save "PRINT_TITLE=Saved $P/bin/prelum-print-demo"
 waitfor $P/sheet.log "sheet .* for org.test.printdemo" 90; sleep ${WAIT:-40}
@@ -250,16 +277,22 @@ waitfor $P/sheet.log "saved as PDF, to the app" 120; check "Save as PDF: the she
 waitfor $P/demo-save.log "print-demo: \(saved\|failed\)" 30
 g "grep -q \"failed The picker didn't open\" $P/demo-save.log"; check "and asks the picker where it goes (none here: refused)" $? "$(g "tail -1 $P/demo-save.log")"
 g "pkill -f prelum-print-demo"; sleep 3
+fi
 
+if want rate; then
 STAGE="rate"
+[ "${DESK:-}" = 1 ] || start_desk 1
 say "$STAGE"
 app printdemo demo-rate "PRINT_AGAIN=6 PRINT_DROP=1 PRINT_SECS=60 $P/bin/prelum-print-demo"
 waitfor $P/demo-rate.log "refused" 120
 n=$(g "grep -c 'and closed it' $P/demo-rate.log"); r=$(g "grep 'refused' $P/demo-rate.log | head -1")
 check "a window opening sheets as fast as it can: refused after three" "$([ "$n" = 3 ] && echo "$r" | grep -q 'Refused'; echo $?)" "$n opened; $r"
 g "pkill -f prelum-print-demo"; sleep 3
+fi
 
+if want write; then
 STAGE=write
+[ "${DESK:-}" = 1 ] || start_desk 1
 say "$STAGE"
 app printwrite write "HOME=$P/home-write $P/bin/atrium-write $P/Ben.owrite"
 sleep ${WAIT_WRITE:-90}
@@ -274,8 +307,11 @@ i=0; while [ $i -lt 240 ] && [ "$(jobs_got)" = "$before" ]; do sleep 3; i=$((i+3
 check "Write's document printed" "$([ "$(jobs_got)" != "$before" ]; echo $?)" "$(g "grep 'sheet .*: queued' $P/sheet.log | tail -1")"
 shot write-done
 g "pkill -x atrium-write"; sleep 3
+fi
 
+if want pdf; then
 STAGE=pdf
+[ "${DESK:-}" = 1 ] || start_desk 1
 say "$STAGE"
 app printpdf pdf "HOME=$P/home-pdf $P/bin/atrium-pdf --file $P/min.pdf"
 sleep 30
@@ -288,6 +324,51 @@ press $(print_at 1000)
 waitfor $P/pdf.log "print: Queued" 120; check "Atrium PDF hears queued" $? "$(g "grep 'print:' $P/pdf.log | tail -1")"
 i=0; while [ $i -lt 180 ] && [ "$(jobs_got)" = "$before" ]; do sleep 3; i=$((i+3)); done
 check "the PDF printed" "$([ "$(jobs_got)" != "$before" ]; echo $?)" ""
+fi
+
+# Sheets and Slides (officina-pdf's sheet and deck output): a page per
+# 48 rows of the CSV, a page per slide; previews say how many.
+if want sheets; then
+STAGE=sheets
+[ "${DESK:-}" = 1 ] || start_desk 1
+say "$STAGE"
+app printsheets sheets "HOME=$P/home-sheets $P/bin/atrium-sheets $P/Q3.csv"
+sleep ${WAIT_SHEETS:-90}
+shot sheets-0
+key 0x13 0x01                                 # Ctrl+P
+waitfor $P/sheet.log "sheet .* for org.atrium.sheets" 120; check "Ctrl+P in Sheets opens the sheet" $? ""
+sleep ${WAIT:-40}
+shot sheets-sheet
+s=$(g "grep 'previews:' $P/sheet.log | tail -1")
+echo "$s" | grep -q "of 3 sheets"; check "the CSV's 121 rows are 3 pages" $? "$s"
+before=$(jobs_got)
+press $(print_at 1100)
+i=0; while [ $i -lt 240 ] && [ "$(jobs_got)" = "$before" ]; do sleep 3; i=$((i+3)); done
+check "Sheets' pages printed" "$([ "$(jobs_got)" != "$before" ]; echo $?)" "$(g "grep 'sheet .*: queued' $P/sheet.log | tail -1")"
+shot sheets-done
+g "pkill -x atrium-sheets"; sleep 3
+fi
+
+if want slides; then
+STAGE=slides
+[ "${DESK:-}" = 1 ] || start_desk 1
+say "$STAGE"
+app printslides slides "HOME=$P/home-slides $P/bin/atrium-slides $P/Deck.oslides"
+sleep ${WAIT_SLIDES:-120}
+shot slides-0
+key 0x13 0x01                                 # Ctrl+P
+waitfor $P/sheet.log "sheet .* for org.atrium.slides" 180; check "Ctrl+P in Slides opens the sheet" $? ""
+sleep ${WAIT:-40}
+shot slides-sheet
+s=$(g "grep 'previews:' $P/sheet.log | tail -1")
+echo "$s" | grep -q "of 3 sheets"; check "a page for each of the 3 slides" $? "$s"
+before=$(jobs_got)
+press $(print_at 1200)
+i=0; while [ $i -lt 300 ] && [ "$(jobs_got)" = "$before" ]; do sleep 3; i=$((i+3)); done
+check "Slides' pages printed" "$([ "$(jobs_got)" != "$before" ]; echo $?)" "$(g "grep 'sheet .*: queued' $P/sheet.log | tail -1")"
+shot slides-done
+g "pkill -x atrium-slides"; sleep 3
+fi
 
 echo
 if [ "$FAILS" = 0 ]; then echo "PASS: Prelum R4 in the VM"; else echo "FAILED: $FAILS"; exit 1; fi

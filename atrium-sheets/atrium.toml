@@ -13,8 +13,8 @@ icon        = "table"
 [capabilities]
 graphics = "fresco"
 network  = "none"
-# Limen roles it embeds (app-composition.md §3): the picker for Open and Save.
-embeds   = ["picker"]
+# Limen roles it embeds (app-composition.md §3): the picker for Open and Save, the print sheet.
+embeds   = ["picker", "print"]
 
 # The converter (officina.md §5.2): a foreign file is read here, in a jail
 # of its own as a uid of its own, with no capability (app-composition.md §4).

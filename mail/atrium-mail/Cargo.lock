@@ -2344,6 +2344,7 @@ dependencies = [
  "folium-font",
  "folium-syntax",
  "navigator-image",
+ "officina-slides",
  "officina-text",
 ]
 
@@ -2358,6 +2359,15 @@ dependencies = [
 [[package]]
 name = "officina-shapes"
 version = "0.1.0"
+
+[[package]]
+name = "officina-slides"
+version = "0.1.0"
+dependencies = [
+ "officina-core",
+ "officina-shapes",
+ "officina-text",
+]
 
 [[package]]
 name = "officina-text"

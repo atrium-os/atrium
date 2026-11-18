@@ -1,0 +1,307 @@
+//! A sheet as PDF (printing from Sheets): the used range cut into pages
+//! down, then across, the way Excel prints by default. Each cell shows what
+//! the grid shows: its formatted text (the app hands it over as drawn, so a
+//! number format or a conditional format prints as it looks), its fill,
+//! borders and data bar, in the screen's face, cut with "…" or shown as
+//! "###" when it doesn't fit. Pixels are the screen's (96 to the inch).
+
+use std::cell::RefCell;
+use std::io::{self, Write};
+
+use officina_text::layout::{layout_para, Fonts, ParaLayout};
+use officina_text::model::{AttrId, CharAttrs, Para, TextDoc};
+use officina_text::paint::{paint_para, Item};
+use officina_text::LU;
+
+use crate::out::{Page, Pdf};
+use crate::{FontFiles, Stats};
+
+/// Points to a screen pixel.
+pub const PT_PER_PX: f64 = 0.75;
+/// The face cells are drawn in on screen (Pergola's sans) and its size, px.
+pub const FACE: &str = "IBM Plex Sans";
+pub const TEXT_PX: f64 = 12.0;
+/// Room left and right of a cell's text, px; one indent step, px.
+pub const PAD_PX: f64 = 4.0;
+pub const INDENT_PX: f64 = 12.0;
+/// The most cells a sheet prints (a bound on time and size).
+pub const MAX_CELLS: u64 = 4_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// A cell as the grid draws it. Colours are sRGB 0xRRGGBB.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Cell {
+    pub text: String,
+    pub align: Align,
+    pub bold: bool,
+    /// A number: "###" when it doesn't fit, never cut.
+    pub numeric: bool,
+    pub color: Option<u32>,
+    pub fill: Option<u32>,
+    /// Left, right, top, bottom: width in px and colour.
+    pub borders: [Option<(f32, u32)>; 4],
+    /// A data bar: the share of the cell's width (0–1) and its colour.
+    pub bar: Option<(f32, u32)>,
+    pub indent: u8,
+}
+
+/// What to print: the column widths and row heights of the range from A1
+/// (px, 0 for hidden), and each cell.
+pub struct Sheet<'a> {
+    pub name: &'a str,
+    pub cols: Vec<f64>,
+    pub rows: Vec<f64>,
+    pub cell: &'a dyn Fn(u32, u32) -> Option<Cell>,
+    /// Light lines between cells, as the screen draws them.
+    pub gridlines: bool,
+}
+
+/// The paper, in points, and its margins.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Setup {
+    pub w: f64,
+    pub h: f64,
+    pub margin: f64,
+    /// Scales the sheet down so its columns fit one page across (never
+    /// below a third).
+    pub fit_width: bool,
+}
+
+impl Setup {
+    /// Paper `w` × `h` points with Excel's normal margins (0.75 in).
+    pub fn paper(w: f64, h: f64) -> Self {
+        Self { w: w.clamp(144.0, 14400.0), h: h.clamp(144.0, 14400.0), margin: 54.0, fit_width: false }
+    }
+}
+
+/// Cuts `sizes` (already in points) into runs that fit `room`: each run's
+/// first index and end. A size wider than the room gets a run of its own.
+fn bands(sizes: &[f64], room: f64) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut start, mut used) = (0, 0.0);
+    for (i, &s) in sizes.iter().enumerate() {
+        if used + s > room + 0.01 && i > start {
+            out.push((start, i));
+            start = i;
+            used = 0.0;
+        }
+        used += s;
+    }
+    if start < sizes.len() {
+        out.push((start, sizes.len()));
+    }
+    out
+}
+
+/// Cells' text shaped in the screen's face at one size.
+struct Shaper<'f> {
+    doc: RefCell<TextDoc>,
+    plain: AttrId,
+    bold: AttrId,
+    fonts: &'f dyn Fonts,
+}
+
+impl<'f> Shaper<'f> {
+    fn new(fonts: &'f dyn Fonts, size_pt: f64) -> Self {
+        let mut doc = TextDoc::new();
+        let half = (size_pt * 2.0).round().clamp(2.0, 3200.0) as u16;
+        let a = |bold| CharAttrs { family: Some(FACE.into()), size: Some(half), bold: Some(bold), ..Default::default() };
+        let plain = doc.attrs.intern(a(false));
+        let bold = doc.attrs.intern(a(true));
+        Self { doc: RefCell::new(doc), plain, bold, fonts }
+    }
+
+    fn para(&self, text: &str, bold: bool, color: Option<u32>) -> Para {
+        let base = if bold { self.bold } else { self.plain };
+        let id = match color {
+            Some(c) => {
+                let mut d = self.doc.borrow_mut();
+                let mut a = d.attrs.get(base).clone();
+                a.color = Some(c);
+                d.attrs.intern(a)
+            }
+            None => base,
+        };
+        let mut p = Para::new(0, text, 0);
+        p.runs = vec![(0, id)];
+        p
+    }
+
+    /// `text` laid out on one line, and its width (LU).
+    fn lay(&self, text: &str, bold: bool, color: Option<u32>) -> (Para, ParaLayout, i64) {
+        let p = self.para(text, bold, color);
+        let l = layout_para(&self.doc.borrow(), &p, i64::MAX / 4, self.fonts);
+        let w = l.lines.iter().map(|l| l.width).max().unwrap_or(0);
+        (p, l, w)
+    }
+
+    fn width(&self, text: &str, bold: bool) -> i64 {
+        self.lay(text, bold, None).2
+    }
+
+    /// A laid-out line painted from `left` (LU), its top where `top` puts
+    /// it given the line's height.
+    fn paint(&self, out: &mut Vec<Item>, p: &Para, l: &ParaLayout, left: i64, top: impl FnOnce(i64) -> i64) {
+        let top = top(l.lines.first().map_or(l.height, |x| x.ascent + x.descent));
+        let x0 = l.lines.first().map_or(0, |x| x.x);
+        paint_para(out, &self.doc.borrow(), self.fonts, l, &p.text, left - x0, top, None);
+    }
+}
+
+/// The cell's text laid out to fit `room` (LU): cut with "…", or "###"
+/// for a number; None when nothing fits.
+fn fit(s: &Shaper, c: &Cell, room: i64) -> Option<(Para, ParaLayout, i64)> {
+    let whole = s.lay(&c.text, c.bold, c.color);
+    if whole.2 <= room {
+        return Some(whole);
+    }
+    if room <= 0 {
+        return None;
+    }
+    if c.numeric {
+        let one = s.width("#", c.bold).max(1);
+        return Some(s.lay(&"#".repeat((room / one).max(1) as usize), c.bold, c.color));
+    }
+    let chars: Vec<char> = c.text.chars().collect();
+    let mut n = ((room as f64 / whole.2 as f64) * chars.len() as f64) as usize;
+    loop {
+        if n == 0 {
+            return None;
+        }
+        let t: String = chars[..n.min(chars.len())].iter().collect::<String>() + "…";
+        let cut = s.lay(&t, c.bold, c.color);
+        if cut.2 <= room {
+            return Some(cut);
+        }
+        n -= 1;
+    }
+}
+
+/// Writes `sheet` as PDF on `setup`'s paper to `out`, calling
+/// `progress(done, total)` after each page.
+pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Stats)> {
+    let (pw, ph) = (setup.w, setup.h);
+    let m = setup.margin.clamp(0.0, pw.min(ph) / 3.0);
+    let (room_w, room_h) = (pw - 2.0 * m, ph - 2.0 * m);
+    if sheet.rows.len() as u64 * sheet.cols.len() as u64 > MAX_CELLS {
+        return Err(io::Error::other(format!("more than {MAX_CELLS} cells to print")));
+    }
+    let total_w: f64 = sheet.cols.iter().sum::<f64>() * PT_PER_PX;
+    let k = if setup.fit_width && total_w > room_w { (room_w / total_w).max(1.0 / 3.0) } else { 1.0 } * PT_PER_PX;
+    let cols: Vec<f64> = sheet.cols.iter().map(|w| w.max(0.0) * k).collect();
+    let rows: Vec<f64> = sheet.rows.iter().map(|h| h.max(0.0) * k).collect();
+    let across = bands(&cols, room_w);
+    let down = bands(&rows, room_h);
+    let shaper = Shaper::new(fonts, TEXT_PX * k);
+    let lu = |v: f64| (v * LU as f64).round() as i64;
+    let total = (across.len() * down.len()).max(1);
+    let mut pdf = Pdf::new(out)?;
+    let none = |_: u32| None;
+    let mut done = 0;
+    // Down, then across.
+    for &(c0, c1) in &across {
+        for &(r0, r1) in &down {
+            let mut page = Page::default();
+            let mut items = Vec::new();
+            let mut lines = Vec::new();
+            let mut y = m;
+            for r in r0..r1 {
+                let ch = rows[r];
+                if ch <= 0.0 {
+                    continue;
+                }
+                let mut x = m;
+                for c in c0..c1 {
+                    let cw = cols[c];
+                    if cw <= 0.0 {
+                        continue;
+                    }
+                    if sheet.gridlines {
+                        lines.push((x, y, cw, ch));
+                    }
+                    if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
+                        // Fill and bar under the text; borders over it.
+                        if let Some(f) = cell.fill {
+                            items.push(Item::Rect { x: lu(x), y: lu(y), w: lu(cw), h: lu(ch), color: f });
+                        }
+                        if let Some((share, col)) = cell.bar {
+                            let bw = ((cw - 4.0 * k).max(0.0) * share.clamp(0.0, 1.0) as f64).max(0.0);
+                            items.push(Item::Rect { x: lu(x + 2.0 * k), y: lu(y + 2.0 * k), w: lu(bw), h: lu((ch - 5.0 * k).max(0.0)), color: col });
+                        }
+                        let lead = cell.indent as f64 * INDENT_PX * k;
+                        let room = lu(cw - 2.0 * PAD_PX * k - lead);
+                        if !cell.text.is_empty() {
+                            if let Some((p, l, tw)) = fit(&shaper, &cell, room) {
+                                let left = match cell.align {
+                                    Align::Left => lu(x + PAD_PX * k + lead),
+                                    Align::Center => lu(x) + (lu(cw) - tw) / 2,
+                                    Align::Right => lu(x + cw - PAD_PX * k) - tw,
+                                };
+                                let (cy, chl) = (lu(y), lu(ch));
+                                shaper.paint(&mut items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
+                            }
+                        }
+                        for (side, b) in cell.borders.iter().enumerate() {
+                            let Some((bw, col)) = *b else { continue };
+                            let bw = (bw as f64 * k).max(0.25);
+                            let (bx, by, bwid, bh) = match side {
+                                0 => (x, y, bw, ch),
+                                1 => (x + cw - bw, y, bw, ch),
+                                2 => (x, y, cw, bw),
+                                _ => (x, y + ch - bw, cw, bw),
+                            };
+                            items.push(Item::Rect { x: lu(bx), y: lu(by), w: lu(bwid), h: lu(bh), color: col });
+                        }
+                    }
+                    x += cw;
+                }
+                y += ch;
+            }
+            // Gridlines first, so fills and borders cover them.
+            if !lines.is_empty() {
+                use folium_content::ops::Op;
+                page.c.extend([Op::Save, Op::StrokeRgb([0.85, 0.86, 0.88]), Op::LineWidth(0.25)]);
+                for (x, y, w, h) in lines {
+                    page.c.push(Op::Rect(x, ph - y - h, w, h));
+                }
+                page.c.extend([Op::Stroke, Op::Restore]);
+            }
+            pdf.items(&mut page, items, ph, files, &none)?;
+            pdf.end_page(page, pw, ph)?;
+            done += 1;
+            progress(done, total);
+        }
+    }
+    if done == 0 {
+        // An empty sheet still prints a page.
+        pdf.end_page(Page::default(), pw, ph)?;
+        progress(1, 1);
+    }
+    pdf.finish(files, if title.is_empty() { sheet.name } else { title }, "Atrium Sheets")
+}
+
+/// [`export`] into memory in the system's fonts: what Sheets hands the
+/// print sheet.
+pub fn print(sheet: &Sheet, setup: &Setup, title: &str) -> io::Result<Vec<u8>> {
+    let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
+    export(sheet, setup, &fonts, &fonts, title, Vec::new(), &mut |_, _| {}).map(|(b, _)| b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bands_fit_the_room_and_wide_ones_stand_alone() {
+        assert_eq!(bands(&[10.0, 10.0, 10.0], 25.0), vec![(0, 2), (2, 3)]);
+        assert_eq!(bands(&[50.0, 10.0], 25.0), vec![(0, 1), (1, 2)]);
+        assert_eq!(bands(&[], 25.0), vec![]);
+    }
+}

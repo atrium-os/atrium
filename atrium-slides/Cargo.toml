@@ -24,6 +24,8 @@ officina-core = { path = "../officina-core" }
 officina-convert = { path = "../officina-convert", default-features = false }
 officina-text = { path = "../officina-text" }
 officina-slides = { path = "../officina-slides" }
+# Printing: the deck as PDF; pictures through the installed decoder.
+officina-pdf = { path = "../officina-pdf", default-features = false }
 # Pictures are decoded in the convert worker (officina_convert::pictures);
 # `local-decode` decodes them here instead (benchmarks, tests).
 navigator-image = { path = "../navigator-image", features = ["office"], optional = true }

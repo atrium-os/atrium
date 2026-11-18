@@ -25,9 +25,13 @@ officina-grid = { path = "../officina-grid" }
 # Writers, protection and the launcher: the readers run in the convert worker.
 officina-convert = { path = "../officina-convert", default-features = false }
 officina-draw = { path = "../officina-draw" }
+# Printing: the sheet as PDF (no in-process picture decoder).
+officina-pdf = { path = "../officina-pdf", default-features = false }
 pergola = { path = "../pergola" }
 limen = { path = "../limen" }
 fresco-protocol = { path = "../fresco-protocol" }
+# Ctrl+P, caught before the window sees it.
+fresco-client = { path = "../fresco-client" }
 libc = "0.2"
 
 [profile.release]

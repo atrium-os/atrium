@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atrium_sheets::app::{Cmd, Sheets, Ui, PICKER_SLOT};
+use pergola::print::{Orientation, Outcome, Paper, Printing, Step};
 use atrium_sheets::bench::{self, Frame, Pattern, Report};
 use atrium_sheets::doc::{self, Doc};
 use atrium_sheets::files::{format_of, stem_of, Format};
@@ -486,6 +487,12 @@ fn main() {
     let mut close_after_save = false;
     let mut discard = false;
     let mut recalculating = false;
+    // Printing: the sheet as it was asked for, the PDF being made (true once
+    // the print sheet is up: the answer to its Relayout), and the sheet.
+    let mut print_snap: Option<Arc<atrium_sheets::print::Snapshot>> = None;
+    let mut print_pdf: Option<(std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, bool)> = None;
+    let mut printing: Option<Printing> = None;
+    let mut want_print = false;
     // Files the user opens in Sheets from Scrinium (opening-files.md §6.2).
     let mut channel = match atrium_open::Channel::connect() {
         Ok(c) => c,
@@ -499,7 +506,16 @@ fn main() {
         // window answers in between) and no waiting for input.
         let opening = run.poll_open();
         let wait = if recalculating { 1 } else if asking.is_some() || opening { 20 } else { 250 };
-        match win.step(&mut app, Some(Duration::from_millis(wait))) {
+        let wait = if printing.is_some() || print_pdf.is_some() { wait.min(20) } else { wait };
+        // Ctrl+P prints, as the toolbar's Print… does.
+        let stepped = win.step_with(&mut app, Some(Duration::from_millis(wait)), |ev| match ev {
+            fresco_client::Event::Key { hid_usage: 0x13, pressed: true, modifiers, repeat: false, .. } if modifiers & 0b0001_0001 != 0 => {
+                want_print = true;
+                true
+            }
+            _ => false,
+        });
+        match stepped {
             // Unsaved changes: ask first. Asked to close again while asking (or
             // while picking), the changes stay in the autosave folder.
             Ok(StepResult::Closed) if run.sheets.doc.borrow().dirty && !run.sheets.closing.get() && asking.is_none() => {
@@ -530,6 +546,7 @@ fn main() {
                 Cmd::PasswordDone => run.password_done(),
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
+                Cmd::Print => want_print = true,
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
@@ -552,7 +569,55 @@ fn main() {
                 Cmd::CloseCancel | Cmd::Undo | Cmd::Redo | Cmd::RemoveMacros | Cmd::Data(_) | Cmd::PasswordOpen | Cmd::ChartKind(_) | Cmd::ChartLegend(_) | Cmd::ChartGroup(_) | Cmd::ChartTitle | Cmd::ChartDelete | Cmd::ChartDone | Cmd::FilterToggle(_) | Cmd::FilterAll(_) | Cmd::FilterApply | Cmd::FilterCancel | Cmd::Cond(_) | Cmd::Pivot(_) | Cmd::Review(_) | Cmd::Tab(_) => {}
             }
         }
-        if let (Some(what), None) = (want_picker.take(), asking) {
+        if std::mem::take(&mut want_print) {
+            if asking.is_some() || printing.is_some() || print_pdf.is_some() {
+                run.set_status("Finish what's open first, then print.");
+            } else if embeds.is_none() || win.embed_token().is_none() {
+                run.set_status("Printing isn't available here.");
+            } else {
+                match atrium_sheets::print::snapshot(&run.sheets.doc) {
+                    Ok(snap) => {
+                        run.set_status("Getting the sheet ready to print…");
+                        let snap = Arc::new(snap);
+                        print_pdf = Some((sheet_pdf(snap.clone(), Paper::A4), false));
+                        print_snap = Some(snap);
+                    }
+                    Err(why) => run.set_status(format!("Couldn't print: {why}.")),
+                }
+            }
+        }
+        if let Some((rx, again)) = &print_pdf {
+            let again = *again;
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                r => {
+                    print_pdf = None;
+                    let r = r.map_err(|_| "the layout stopped".to_string()).and_then(|r| r);
+                    let title = print_snap.as_ref().map(|s| stem_of(&run.sheets.doc.borrow().name).to_string() + if s.name.is_empty() { "" } else { " – " } + &s.name).unwrap_or_default();
+                    let r = match (r, &embeds, win.embed_token(), again) {
+                        (Ok(pdf), Some(e), _, true) => printing.as_mut().map(|p| p.document_bytes(e, &pdf).map_err(|e| format!("{e:?}"))).unwrap_or(Ok(())),
+                        (Ok(pdf), Some(e), Some(token), false) => Printing::start_bytes(e, token, PICKER_SLOT, &pdf, &title, true, Some(Paper::A4))
+                            .map(|p| {
+                                printing = Some(p);
+                                run.set_status("");
+                                run.sheets.ui.set(Ui { asking: true });
+                            })
+                            .map_err(|e| format!("the print sheet didn't open ({e:?})")),
+                        (Ok(_), ..) => Err("Limen isn't running".into()),
+                        (Err(e), ..) => Err(e),
+                    };
+                    if let Err(why) = r {
+                        run.set_status(format!("Couldn't print: {why}."));
+                        if let (Some(p), Some(e)) = (printing.take(), &embeds) {
+                            p.cancel(e);
+                        }
+                        print_snap = None;
+                        run.sheets.ui.set(Ui { asking: false });
+                    }
+                }
+            }
+        }
+        if let (Some(what), None, None) = (want_picker.take(), asking, &printing) {
             match (&embeds, win.embed_token()) {
                 (Some(e), Some(token)) => {
                     let name = run.sheets.doc.borrow().name.clone();
@@ -577,6 +642,36 @@ fn main() {
         if let Some(e) = &embeds {
             let ev = e.borrow_mut().poll(Duration::from_millis(0));
             let mut finish = false;
+            let step = match (&mut printing, &ev) {
+                (Some(p), Ok(Some(pev))) => p.handle(e, pev),
+                _ => None,
+            };
+            let ours = step.is_some();
+            match step {
+                Some(Step::Relayout { paper, orientation, .. }) => {
+                    if let Some(snap) = &print_snap {
+                        let p = match orientation {
+                            Orientation::Portrait => paper,
+                            Orientation::Landscape => Paper { w_pt: paper.h_pt, h_pt: paper.w_pt },
+                        };
+                        print_pdf = Some((sheet_pdf(snap.clone(), p), true));
+                    }
+                }
+                Some(Step::Done(o)) => {
+                    printing = None;
+                    print_snap = None;
+                    print_pdf = None;
+                    run.sheets.ui.set(Ui { asking: false });
+                    run.set_status(match o {
+                        Outcome::Queued => "Sent to the printer.".to_string(),
+                        Outcome::Saved(name) => format!("Saved “{name}”."),
+                        Outcome::Cancelled => String::new(),
+                        Outcome::Failed(why) => format!("{why}."),
+                    });
+                }
+                Some(Step::Pending) | None => {}
+            }
+            if !ours {
             match ev {
                 Ok(Some(ParentEvent::MessageFd { bytes, .. })) => {
                     let fd = e.borrow_mut().take_fd();
@@ -607,6 +702,7 @@ fn main() {
                     eprintln!("atrium-sheets: limend: {err:?}");
                     finish = asking.is_some();
                 }
+            }
             }
             if finish {
                 if let Some(id) = embed.take() {
@@ -787,4 +883,17 @@ fn bench_main(a: &[String]) -> i32 {
     } else {
         3
     }
+}
+
+/// The sheet as PDF on `paper`, made on another thread (printing.md §5.1).
+fn sheet_pdf(snap: Arc<atrium_sheets::print::Snapshot>, paper: Paper) -> std::sync::mpsc::Receiver<Result<Vec<u8>, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = tx.clone();
+    let spawned = std::thread::Builder::new().name("pdf-print".into()).spawn(move || {
+        let _ = t.send(atrium_sheets::print::pdf(&snap, paper.w_pt as f64, paper.h_pt as f64, ""));
+    });
+    if let Err(e) = spawned {
+        let _ = tx.send(Err(e.to_string()));
+    }
+    rx
 }

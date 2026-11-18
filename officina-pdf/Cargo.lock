@@ -384,11 +384,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "folium-doc"
+version = "0.1.0"
+dependencies = [
+ "folium-syntax",
+]
+
+[[package]]
 name = "folium-font"
 version = "0.1.0"
 dependencies = [
  "folium-syntax",
  "ttf-parser",
+]
+
+[[package]]
+name = "folium-render"
+version = "0.1.0"
+dependencies = [
+ "folium-content",
+ "folium-font",
+ "folium-syntax",
+ "tiny-skia 0.11.4",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -682,9 +701,12 @@ version = "0.1.0"
 dependencies = [
  "atrium-colr",
  "folium-content",
+ "folium-doc",
  "folium-font",
+ "folium-render",
  "folium-syntax",
  "navigator-image",
+ "officina-slides",
  "officina-text",
  "png 0.17.16",
 ]
@@ -700,6 +722,15 @@ dependencies = [
 [[package]]
 name = "officina-shapes"
 version = "0.1.0"
+
+[[package]]
+name = "officina-slides"
+version = "0.1.0"
+dependencies = [
+ "officina-core",
+ "officina-shapes",
+ "officina-text",
+]
 
 [[package]]
 name = "officina-text"
@@ -1189,6 +1220,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
+ "png 0.17.16",
  "tiny-skia-path 0.11.4",
 ]
 

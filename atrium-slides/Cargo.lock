@@ -195,6 +195,7 @@ dependencies = [
  "navigator-image",
  "officina-convert",
  "officina-core",
+ "officina-pdf",
  "officina-slides",
  "officina-text",
  "pergola",
@@ -585,6 +586,32 @@ name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+
+[[package]]
+name = "folium-content"
+version = "0.1.0"
+dependencies = [
+ "folium-font",
+ "folium-syntax",
+]
+
+[[package]]
+name = "folium-font"
+version = "0.1.0"
+dependencies = [
+ "folium-syntax",
+ "ttf-parser",
+]
+
+[[package]]
+name = "folium-syntax"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "md-5",
+ "miniz_oxide 0.8.9",
+ "sha2",
+]
 
 [[package]]
 name = "font-types"
@@ -1283,6 +1310,18 @@ name = "officina-grid"
 version = "0.1.0"
 dependencies = [
  "officina-core",
+]
+
+[[package]]
+name = "officina-pdf"
+version = "0.1.0"
+dependencies = [
+ "atrium-colr",
+ "folium-content",
+ "folium-font",
+ "folium-syntax",
+ "officina-slides",
+ "officina-text",
 ]
 
 [[package]]

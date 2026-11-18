@@ -25,8 +25,9 @@ open-attachments = true
 notify = true
 # The roles Mail embeds through limend: the system picker (attach, Save),
 # a doc-viewer for HTML bodies and the quote under a reply, a pdf-viewer
-# and a media-player for quick look, and the credential sheet (sign-in).
-embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential"]
+# and a media-player for quick look, the credential sheet (sign-in), and
+# the print sheet.
+embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential", "print"]
 
 # The parser (§4): every message is parsed here, in a jail of its own as
 # a uid of its own, with no capability (app-composition.md §4).

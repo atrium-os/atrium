@@ -1311,6 +1311,7 @@ dependencies = [
  "folium-font",
  "folium-syntax",
  "navigator-image",
+ "officina-slides",
  "officina-text",
 ]
 

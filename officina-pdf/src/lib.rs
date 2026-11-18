@@ -15,17 +15,18 @@
 /// The TrueType subsetter, now Folium's (folium.md §5.1).
 pub use folium_font::subset as font;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
 
-use folium_content::ops::{write_ops, Op, TjPart};
-use folium_syntax::write::{array, dict, int, name, nums, real, reference, text_string, Writer};
-use folium_syntax::{Dict, Object, Ref};
+mod out;
+pub mod sheet;
+pub mod slides;
+
+use out::{Page, Pdf};
 use officina_text::layout::{Fonts, LayoutCache, PinnedFonts};
 use officina_text::lists::Numbering;
 use officina_text::model::TextDoc;
 use officina_text::paginate::Paginator;
-use officina_text::paint::{paint_page, Item};
+use officina_text::paint::paint_page;
 use officina_text::{twips, LU};
 
 /// Layouts are dropped after this many pages (memory stays flat).
@@ -34,16 +35,6 @@ pub const CACHE_PAGES: usize = 64;
 /// A colour glyph's picture: pixels to the em.
 pub const EMOJI_PX: f32 = 160.0;
 
-/// A colour glyph written as a picture: its object, size and where it
-/// hangs off the pen (pixels at [`EMOJI_PX`]).
-#[derive(Clone, Copy)]
-struct Emoji {
-    obj: Ref,
-    w: u32,
-    h: u32,
-    left: i32,
-    top: i32,
-}
 
 /// Where face files come from.
 pub trait FontFiles {
@@ -73,11 +64,6 @@ pub struct Stats {
     pub bytes: u64,
 }
 
-/// A face used in the document.
-struct FontUse {
-    obj: Ref,
-    glyphs: BTreeMap<u16, String>,
-}
 
 /// Layout units to points.
 fn pt(v: i64) -> f64 {
@@ -144,17 +130,8 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
     let total = pages.len();
     let pages_text = total.to_string();
 
-    let mut o = Writer::new(out, "1.7")?;
-    let catalog = o.reserve();
-    let tree = o.reserve();
-    let info_obj = o.reserve();
-    let mut kids = Vec::with_capacity(total);
-    let mut fonts_used: BTreeMap<u16, FontUse> = BTreeMap::new();
-    let mut images: HashMap<u32, Option<Ref>> = HashMap::new();
-    let mut color_faces: HashMap<u16, bool> = HashMap::new();
-    let mut emoji: HashMap<(u16, u16), Option<Emoji>> = HashMap::new();
-    let mut stats = Stats { pages: total, ..Default::default() };
-
+    let mut pdf = Pdf::new(out)?;
+    let image = |i: u32| doc.images.get(i).map(|d| d.bytes.to_vec());
     for (i, pg) in pages.iter().enumerate() {
         // Each page its own size (a section may have its own).
         let (pw, ph) = (pt(twips(pg.setup.width as i64)), pt(twips(pg.setup.height as i64)));
@@ -162,357 +139,12 @@ pub fn export<W: Write>(doc: &TextDoc, fonts: &dyn Fonts, files: &dyn FontFiles,
             cache = LayoutCache::default();
         }
         let items = paint_page(doc, &pages, i, col_w, &mut cache, fonts, &numbering, &pages_text);
-        let mut c: Vec<Op> = Vec::new();
-        let mut annots = Vec::new();
-        let mut page_fonts: BTreeSet<u16> = BTreeSet::new();
-        let mut page_images: BTreeSet<u32> = BTreeSet::new();
-        let mut page_emoji: BTreeSet<(u16, u16)> = BTreeSet::new();
-        for it in items {
-            match it {
-                Item::Rect { x, y, w, h, color } => {
-                    c.extend([Op::FillRgb(rgb(color)), Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Fill]);
-                }
-                Item::Image { image, x, y, w, h } => {
-                    let obj = match images.get(&image) {
-                        Some(o) => *o,
-                        None => {
-                            let n = write_image(&mut o, doc, image)?;
-                            images.insert(image, n);
-                            n
-                        }
-                    };
-                    if obj.is_some() {
-                        page_images.insert(image);
-                        c.extend([Op::Save, Op::Transform([pt(w), 0.0, 0.0, pt(h), pt(x), ph - pt(y + h)]), Op::XObject(format!("Im{image}")), Op::Restore]);
-                    } else {
-                        c.extend([Op::FillRgb([0.85, 0.86, 0.88]), Op::Rect(pt(x), ph - pt(y + h), pt(w), pt(h)), Op::Fill]);
-                    }
-                }
-                // Comments stay out of the PDF.
-                Item::Mark { .. } | Item::Change { .. } | Item::Shape { .. } => {}
-                Item::Path { cmds, fill, line } => {
-                    use officina_text::model::{Dash, PathCmd};
-                    let p = |x: i64, y: i64| (pt(x), ph - pt(y));
-                    let mut path = Vec::with_capacity(cmds.len());
-                    for cm in &cmds {
-                        path.push(match *cm {
-                            PathCmd::Move(x, y) => {
-                                let (x, y) = p(x, y);
-                                Op::MoveTo(x, y)
-                            }
-                            PathCmd::Line(x, y) => {
-                                let (x, y) = p(x, y);
-                                Op::LineTo(x, y)
-                            }
-                            PathCmd::Cubic(a, b, cc, d, e, f) => {
-                                let ((a, b), (cc, d), (e, f)) = (p(a, b), p(cc, d), p(e, f));
-                                Op::CurveTo([a, b, cc, d, e, f])
-                            }
-                            PathCmd::Close => Op::ClosePath,
-                        });
-                    }
-                    if let Some(f) = fill {
-                        c.push(Op::FillRgb(rgb(f)));
-                        c.extend(path.iter().cloned());
-                        c.push(Op::Fill);
-                    }
-                    if let Some((color, width, dash)) = line {
-                        let w = pt(width);
-                        let pattern = match dash {
-                            Dash::Solid => vec![],
-                            Dash::Dot => vec![w, w],
-                            Dash::Dash => vec![4.0 * w, 3.0 * w],
-                            Dash::DashDot => vec![4.0 * w, 3.0 * w, w, 3.0 * w],
-                            Dash::LongDash => vec![8.0 * w, 3.0 * w],
-                        };
-                        c.extend([Op::Save, Op::StrokeRgb(rgb(color)), Op::LineWidth(w), Op::Dash(pattern, 0.0)]);
-                        c.extend(path);
-                        c.extend([Op::Stroke, Op::Restore]);
-                    }
-                }
-                Item::Link { x, y, w, h, uri } => {
-                    if uri_ok(&uri) {
-                        annots.push(Object::Dict(dict([
-                            ("Type", name("Annot")),
-                            ("Subtype", name("Link")),
-                            ("Rect", nums(&[pt(x), ph - pt(y + h), pt(x + w), ph - pt(y)])),
-                            ("Border", array([int(0), int(0), int(0)])),
-                            ("A", Object::Dict(dict([("S", name("URI")), ("URI", Object::String(uri.as_bytes().into()))]))),
-                        ])));
-                    }
-                }
-                Item::Glyphs(r) => {
-                    let Some(bytes) = files.face(r.face) else { continue };
-                    let Some(face) = font::Face::parse(bytes) else { continue };
-                    let upem = face.info.upem as f64;
-                    let fu = match fonts_used.entry(r.face) {
-                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(e) => e.insert(FontUse { obj: o.reserve(), glyphs: BTreeMap::new() }),
-                    };
-                    page_fonts.insert(r.face);
-                    let size = pt(r.size);
-                    if size <= 0.0 {
-                        continue;
-                    }
-                    let color = *color_faces.entry(r.face).or_insert_with(|| atrium_colr::is_color_font(bytes));
-                    c.extend([Op::BeginText, Op::Font(format!("F{}", r.face), size), Op::FillRgb(rgb(r.color))]);
-                    if color {
-                        c.push(Op::TextRender(3));
-                    }
-                    // Glyphs on the baseline in one TJ; a glyph raised or
-                    // lowered starts a new one with a rise.
-                    let mut k = 0;
-                    while k < r.glyphs.len() {
-                        let dy = r.glyphs[k].dy;
-                        c.push(Op::Rise(-pt(dy)));
-                        // Turned runs (a turned shape's words): the matrix
-                        // turns, the pen starts along the turned baseline
-                        // (y flips: the page's y is up).
-                        let [ta, tb, tc, td] = r.turn.unwrap_or([1.0, 0.0, 0.0, 1.0]);
-                        let gx = r.glyphs[k].x as f64;
-                        let (sx, sy) = (r.x as f64 + ta * gx, r.y as f64 + tb * gx);
-                        c.push(Op::TextMatrix([ta, -tb, -tc, td, pt_f(sx), ph - pt_f(sy)]));
-                        let x0 = r.glyphs[k].x;
-                        let mut pen = 0.0f64;
-                        let mut parts: Vec<TjPart> = Vec::new();
-                        while k < r.glyphs.len() && r.glyphs[k].dy == dy {
-                            let g = &r.glyphs[k];
-                            let want = pt(g.x - x0);
-                            let adj = (pen - want) * 1000.0 / size;
-                            if adj.abs() >= 0.001 {
-                                parts.push(TjPart::Adjust(adj));
-                            }
-                            match parts.last_mut() {
-                                Some(TjPart::Codes(b)) => b.extend(g.id.to_be_bytes()),
-                                _ => parts.push(TjPart::Codes(g.id.to_be_bytes().to_vec())),
-                            }
-                            pen = want + face.advance(g.id) as f64 / upem * size;
-                            let t = &r.text[g.text.start as usize..g.text.end as usize];
-                            if !t.is_empty() {
-                                fu.glyphs.entry(g.id).or_insert_with(|| t.to_string());
-                            } else {
-                                fu.glyphs.entry(g.id).or_default();
-                            }
-                            k += 1;
-                        }
-                        c.push(Op::ShowArray(parts));
-                    }
-                    if color {
-                        c.push(Op::TextRender(0));
-                    }
-                    c.push(Op::EndText);
-                    if color {
-                        // The pictures, each on its glyph's pen position.
-                        let [ta, tb, tc, td] = r.turn.unwrap_or([1.0, 0.0, 0.0, 1.0]);
-                        let px = size / EMOJI_PX as f64;
-                        for g in &r.glyphs {
-                            let e = match emoji.get(&(r.face, g.id)) {
-                                Some(e) => *e,
-                                None => {
-                                    let e = write_emoji(&mut o, bytes, g.id)?;
-                                    emoji.insert((r.face, g.id), e);
-                                    e
-                                }
-                            };
-                            let Some(e) = e else { continue };
-                            page_emoji.insert((r.face, g.id));
-                            let gx = g.x as f64;
-                            let (sx, sy) = (r.x as f64 + ta * gx, r.y as f64 + tb * gx);
-                            c.extend([
-                                Op::Save,
-                                Op::Transform([ta, -tb, -tc, td, pt_f(sx), ph - pt_f(sy)]),
-                                Op::Transform([e.w as f64 * px, 0.0, 0.0, e.h as f64 * px, e.left as f64 * px, (e.top as f64 - e.h as f64) * px - pt(g.dy)]),
-                                Op::XObject(format!("Em{}_{}", r.face, g.id)),
-                                Op::Restore,
-                            ]);
-                        }
-                    }
-                }
-            }
-        }
-        let content = o.reserve();
-        o.stream(content, Dict::new(), &write_ops(&c), true)?;
-        let page = o.reserve();
-        let mut res = Dict::new();
-        if !page_fonts.is_empty() {
-            let mut f = Dict::new();
-            for face in &page_fonts {
-                f.insert(&format!("F{face}"), reference(fonts_used[face].obj));
-            }
-            res.insert("Font", Object::Dict(f));
-        }
-        if !page_images.is_empty() || !page_emoji.is_empty() {
-            let mut x = Dict::new();
-            for im in &page_images {
-                x.insert(&format!("Im{im}"), reference(images[im].expect("written")));
-            }
-            for k in &page_emoji {
-                x.insert(&format!("Em{}_{}", k.0, k.1), reference(emoji[k].expect("written").obj));
-            }
-            res.insert("XObject", Object::Dict(x));
-        }
-        stats.links += annots.len();
-        let mut p = dict([
-            ("Type", name("Page")),
-            ("Parent", reference(tree)),
-            ("MediaBox", nums(&[0.0, 0.0, pw, ph])),
-            ("Resources", Object::Dict(res)),
-            ("Contents", reference(content)),
-        ]);
-        if !annots.is_empty() {
-            p.insert("Annots", Object::Array(annots));
-        }
-        o.obj(page, &Object::Dict(p))?;
-        kids.push(page);
+        let mut page = Page::default();
+        pdf.items(&mut page, items, ph, files, &image)?;
+        pdf.end_page(page, pw, ph)?;
         progress(i + 1, total);
     }
-
-    // The fonts, now that every glyph is known.
-    for (&face, fu) in &fonts_used {
-        let bytes = files.face(face).expect("parsed before");
-        let f = font::Face::parse(bytes).expect("parsed before");
-        let used: BTreeSet<u16> = fu.glyphs.keys().copied().collect();
-        let sub = f.subset(&used);
-        let scale = 1000.0 / f.info.upem as f64;
-        let s = |v: i16| v as f64 * scale;
-        let (file, desc, cid, uni) = (o.reserve(), o.reserve(), o.reserve(), o.reserve());
-        o.stream(file, dict([("Length1", int(sub.len() as i64))]), &sub, true)?;
-        // A subset's name: six letters from the face and its glyphs, then the face.
-        let tag: String = {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ face as u64;
-            for g in &used {
-                h = (h ^ *g as u64).wrapping_mul(0x100_0000_01b3);
-            }
-            (0..6).map(|k| (b'A' + ((h >> (k * 5)) % 26) as u8) as char).collect()
-        };
-        let base = name(&format!("{tag}+OfficinaFace{face}"));
-        let [x0, y0, x1, y1] = f.info.bbox;
-        let flags = 4 | if f.info.italic_angle != 0 { 64 } else { 0 };
-        let angle = (f.info.italic_angle >> 16) as f64 + (f.info.italic_angle & 0xffff) as f64 / 65536.0;
-        o.obj(desc, &Object::Dict(dict([
-            ("Type", name("FontDescriptor")),
-            ("FontName", base.clone()),
-            ("Flags", int(flags)),
-            ("FontBBox", nums(&[s(x0), s(y0), s(x1), s(y1)])),
-            ("ItalicAngle", real(angle)),
-            ("Ascent", real(s(f.info.ascent))),
-            ("Descent", real(s(f.info.descent))),
-            ("CapHeight", real(s(f.info.ascent))),
-            ("StemV", int(80)),
-            ("FontFile2", reference(file)),
-        ])))?;
-        let mut w = Vec::new();
-        for g in &used {
-            w.push(int(*g as i64));
-            w.push(array([real(f.advance(*g) as f64 * scale)]));
-        }
-        o.obj(cid, &Object::Dict(dict([
-            ("Type", name("Font")),
-            ("Subtype", name("CIDFontType2")),
-            ("BaseFont", base.clone()),
-            ("CIDSystemInfo", Object::Dict(dict([("Registry", Object::String(b"Adobe"[..].into())), ("Ordering", Object::String(b"Identity"[..].into())), ("Supplement", int(0))]))),
-            ("FontDescriptor", reference(desc)),
-            ("CIDToGIDMap", name("Identity")),
-            ("DW", int(1000)),
-            ("W", Object::Array(w)),
-        ])))?;
-        o.stream(uni, Dict::new(), &folium_font::cmap::write_to_unicode(&fu.glyphs), true)?;
-        o.obj(fu.obj, &Object::Dict(dict([
-            ("Type", name("Font")),
-            ("Subtype", name("Type0")),
-            ("BaseFont", base),
-            ("Encoding", name("Identity-H")),
-            ("DescendantFonts", array([reference(cid)])),
-            ("ToUnicode", reference(uni)),
-        ])))?;
-    }
-    stats.fonts = fonts_used.len();
-    stats.images = images.values().filter(|v| v.is_some()).count();
-
-    o.obj(tree, &Object::Dict(dict([("Type", name("Pages")), ("Kids", array(kids.iter().map(|k| reference(*k)))), ("Count", int(kids.len() as i64))])))?;
-    o.obj(catalog, &Object::Dict(dict([("Type", name("Catalog")), ("Pages", reference(tree))])))?;
-    let mut inf = dict([("Producer", Object::String(b"Officina"[..].into())), ("Creator", Object::String(b"Atrium Write"[..].into()))]);
-    if !info.title.is_empty() {
-        inf.insert("Title", text_string(&info.title));
-    }
-    o.obj(info_obj, &Object::Dict(inf))?;
-    let (w, bytes) = o.finish(catalog, Some(info_obj))?;
-    stats.bytes = bytes;
-    Ok((w, stats))
-}
-
-/// Colour glyph `gid` of `face` as an image XObject (RGB with a soft mask);
-/// None when the face has no colour version of it.
-fn write_emoji<W: Write>(o: &mut Writer<W>, face: &[u8], gid: u16) -> io::Result<Option<Emoji>> {
-    let Some(bm) = atrium_colr::render(face, gid as u32, EMOJI_PX, [0.0, 0.0, 0.0, 1.0]) else { return Ok(None) };
-    let (w, h) = (bm.width, bm.height);
-    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    let mut alpha = Vec::with_capacity((w * h) as usize);
-    for p in bm.rgba.chunks_exact(4) {
-        rgb.extend_from_slice(&p[..3]);
-        alpha.push(p[3]);
-    }
-    let head = |cs: &str| dict([("Type", name("XObject")), ("Subtype", name("Image")), ("Width", int(w as i64)), ("Height", int(h as i64)), ("ColorSpace", name(cs)), ("BitsPerComponent", int(8))]);
-    let m = o.reserve();
-    o.stream(m, head("DeviceGray"), &alpha, true)?;
-    let mut d = head("DeviceRGB");
-    d.insert("SMask", reference(m));
-    let n = o.reserve();
-    o.stream(n, d, &rgb, true)?;
-    Ok(Some(Emoji { obj: n, w, h, left: bm.left, top: bm.top }))
-}
-
-struct Px {
-    rgba: Vec<u8>,
-}
-
-/// `bytes` decoded at their natural size: by the app's installed decoder
-/// (officina_text::picture), else here when built with `local-decode`.
-fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    if let Some(d) = officina_text::picture::decoder() {
-        return d.decode(bytes, None).map(|p| (p.width, p.height, p.rgba));
-    }
-    #[cfg(feature = "local-decode")]
-    {
-        use navigator_image::image::{decode_unaddressed, Ceilings};
-        decode_unaddressed(bytes, Ceilings::default()).ok().map(|p| (p.width, p.height, p.rgba))
-    }
-    #[cfg(not(feature = "local-decode"))]
-    None
-}
-
-/// Picture `image` as an image XObject; None when it can't be read.
-fn write_image<W: Write>(o: &mut Writer<W>, doc: &TextDoc, image: u32) -> io::Result<Option<Ref>> {
-    let Some(data) = doc.images.get(image) else { return Ok(None) };
-    let head = |w: u32, h: u32, cs: &str| dict([("Type", name("XObject")), ("Subtype", name("Image")), ("Width", int(w as i64)), ("Height", int(h as i64)), ("ColorSpace", name(cs)), ("BitsPerComponent", int(8))]);
-    if let Some((w, h, comps)) = jpeg_info(&data.bytes) {
-        let n = o.reserve();
-        let mut d = head(w, h, if comps == 1 { "DeviceGray" } else { "DeviceRGB" });
-        d.insert("Filter", name("DCTDecode"));
-        o.stream(n, d, &data.bytes, false)?;
-        return Ok(Some(n));
-    }
-    let Some((w, h, rgba)) = decode(&data.bytes) else { return Ok(None) };
-    let px = Px { rgba };
-    let count = (w as usize) * (h as usize);
-    if px.rgba.len() < count * 4 || count == 0 {
-        return Ok(None);
-    }
-    let mut rgb = Vec::with_capacity(count * 3);
-    let mut alpha = Vec::with_capacity(count);
-    for p in px.rgba.chunks_exact(4).take(count) {
-        rgb.extend_from_slice(&p[..3]);
-        alpha.push(p[3]);
-    }
-    let mut d = head(w, h, "DeviceRGB");
-    if alpha.iter().any(|&a| a != 255) {
-        let m = o.reserve();
-        o.stream(m, head(w, h, "DeviceGray"), &alpha, true)?;
-        d.insert("SMask", reference(m));
-    }
-    let n = o.reserve();
-    o.stream(n, d, &rgb, true)?;
-    Ok(Some(n))
+    pdf.finish(files, &info.title, "Atrium Write")
 }
 
 /// One block of a [`plain`] document.

@@ -60,6 +60,8 @@ pub enum Cmd {
     Open,
     Save,
     SaveAs,
+    /// Print the deck through the print sheet (Ctrl+P too).
+    Print,
     Undo,
     Redo,
     /// A new slide after the current one, on layout `i` of the deck's.
@@ -588,7 +590,7 @@ impl Slides {
                 let to = if c == Cmd::BringForward { at + 1 } else { at.saturating_sub(1) };
                 d.run(if c == Cmd::BringForward { "Bring Forward" } else { "Send Backward" }, vec![DeckOp::MoveShape { target: Target::Slide(sid), id, to }]);
             }
-            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce | Cmd::PasswordOpen | Cmd::PasswordDone | Cmd::PasswordClose | Cmd::CloseSave | Cmd::CloseDiscard | Cmd::CloseCancel => return false,
+            Cmd::Open | Cmd::Save | Cmd::SaveAs | Cmd::Print | Cmd::Picture | Cmd::Present(_) | Cmd::Rehearse | Cmd::Reduce | Cmd::PasswordOpen | Cmd::PasswordDone | Cmd::PasswordClose | Cmd::CloseSave | Cmd::CloseDiscard | Cmd::CloseCancel => return false,
         }
         drop(d);
         self.changed();
@@ -1187,7 +1189,7 @@ impl View for Slides {
 
         // Toolbar.
         let mut x = 12.0;
-        for (label, c, wd) in [("Open…", Cmd::Open, 72.0), ("Save", Cmd::Save, 60.0), ("Save As…", Cmd::SaveAs, 88.0), ("Undo", Cmd::Undo, 60.0), ("Redo", Cmd::Redo, 60.0)] {
+        for (label, c, wd) in [("Open…", Cmd::Open, 72.0), ("Save", Cmd::Save, 60.0), ("Save As…", Cmd::SaveAs, 88.0), ("Print…", Cmd::Print, 64.0), ("Undo", Cmd::Undo, 60.0), ("Redo", Cmd::Redo, 60.0)] {
             Button::secondary(label).at(x, 8.0).width(wd).on_click(self.cmd(c)).render(ctx);
             x += wd + 8.0;
         }

@@ -37,6 +37,8 @@ pub enum Op {
     Clip,
     EndPath,
     XObject(String),
+    /// A named graphics state from the resources (`gs`): opacity.
+    GState(String),
     BeginText,
     EndText,
     Font(String, f64),
@@ -127,6 +129,10 @@ impl Op {
             Op::XObject(n) => {
                 write_name(out, n.as_bytes());
                 out.extend(b" Do");
+            }
+            Op::GState(n) => {
+                write_name(out, n.as_bytes());
+                out.extend(b" gs");
             }
             Op::BeginText => out.extend(b"BT"),
             Op::EndText => out.extend(b"ET"),

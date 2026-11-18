@@ -3602,6 +3602,16 @@ A sheet has a tab colour (`Sheet::tab_color`, 0xRRGGBB): set from Data ▸ Tab C
 - **Larger workbooks from elsewhere.** They open where memory allows. Changes that don't grow them, such as clearing or deleting, are still made.
 - **Gate:** `doc::tests::a_change_past_the_memory_budget_is_not_made`.
 
+### 16.79 Printing from Sheets and Slides (2026-11-18)
+
+- **Shared writer.** `officina-pdf` writes every export through one page writer (`out.rs`): faces subset once, pictures once, colour glyphs as pictures, opacity as graphics states. Write's export moved onto it unchanged.
+- **Sheets.** `officina_pdf::sheet::export` pages the used range down, then across (Excel's default), 0.75 pt to the screen's pixel, optional fit to width. Cells come from the app as the grid draws them (`atrium_sheets::print::snapshot` over `SheetSource::cell`), so number and conditional formats print as shown. Text is IBM Plex Sans at the grid's 12 px; numbers that don't fit show "###", text is cut with "…".
+- **Slides.** `officina_pdf::slides::export` draws each slide from `officina_slides::draw::draw_slide` (hidden slides left out), at the slide's size or fitted on the paper. Gradients are 128 bands of solid colour (Folium skips shadings, and Prelum rasterises with Folium); pictures go through the installed decoder (the apps build `officina-pdf` without `local-decode`).
+- **Apps.** Print… on the toolbar and Ctrl+P in both, through `pergola::print` (printing.md §5.1); the print sheet's Relayout gets a new layout for the paper and orientation chosen.
+- **Gates:** `officina-pdf/tests/print.rs` (pages, look and text read back and drawn by Folium); `atrium_sheets::print` tests; `scripts/prelum-r4-vm.sh` stages `sheets` and `slides`.
+
+Not yet: print areas, repeated titles, charts and pictures on sheets; speaker notes and handouts.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

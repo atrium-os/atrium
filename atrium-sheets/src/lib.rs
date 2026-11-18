@@ -10,6 +10,7 @@ pub mod data;
 pub mod doc;
 pub mod files;
 pub mod pivotpane;
+pub mod print;
 pub mod review;
 pub mod source;
 pub mod tabs;

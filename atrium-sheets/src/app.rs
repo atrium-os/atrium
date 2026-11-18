@@ -44,6 +44,8 @@ pub enum Cmd {
     Open,
     Save,
     SaveAs,
+    /// Print the sheet through the print sheet (Ctrl+P too).
+    Print,
     Undo,
     Redo,
     /// Drop the file's macros (kept inert; never run).
@@ -911,7 +913,7 @@ impl View for Sheets {
 
         // Toolbar.
         let mut x = 12.0;
-        for (label, cmd, wd) in [("Open…", Cmd::Open, 76.0), ("Save", Cmd::Save, 64.0), ("Save As…", Cmd::SaveAs, 92.0), ("Undo", Cmd::Undo, 64.0), ("Redo", Cmd::Redo, 64.0)] {
+        for (label, cmd, wd) in [("Open…", Cmd::Open, 76.0), ("Save", Cmd::Save, 64.0), ("Save As…", Cmd::SaveAs, 92.0), ("Print…", Cmd::Print, 64.0), ("Undo", Cmd::Undo, 64.0), ("Redo", Cmd::Redo, 64.0)] {
             let cmds = self.cmds.clone();
             Button::secondary(label).at(x, 8.0).width(wd).on_click(move || cmds.lock().unwrap().push(cmd)).render(ctx);
             x += wd + 8.0;

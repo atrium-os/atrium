@@ -557,7 +557,17 @@ impl CapabilityDelta {
         if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
         if self.arca            { out.push("Keep its own passwords and keys in Arca".into()); }
         for r in &self.embeds_added {
-            out.push(format!("Show the system's {r} inside its windows"));
+            // Roles read as what the person sees.
+            let what = match r.as_str() {
+                "print" => "print sheet",
+                "media-player" => "media player",
+                "doc-viewer" => "document viewer",
+                "pdf-viewer" => "PDF viewer",
+                "credential" => "sign-in sheet",
+                "share-target" => "share sheet",
+                r => r,
+            };
+            out.push(format!("Show the system's {what} inside its windows"));
         }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         if self.input_gamepad_exclusive { out.push("Keep a game controller when you switch to another window".into()); }

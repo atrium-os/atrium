@@ -760,8 +760,19 @@ Checks:
   as `_prelum-sheet`, prelumd's jailed workers and ippeveprinter on the host:
   25/25 pass (press rule, print, cancel, Save as PDF, rate, Write, Atrium PDF).
 
-Not yet: Sheets, Slides and the Navigator have no PDF output to hand the sheet (the
-Navigator needs a paged rendering of a page in its jail); Mail prints text only;
+Sheets and Slides print (2026-11-18): `officina_pdf::sheet` pages a sheet down, then
+across, each cell as the grid draws it (formatted text, fill, borders, data bars, "###"
+for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; and
+`officina_pdf::slides` draws a page per slide from the display list the editor draws
+(hidden slides left out), fitted on the paper. Gradients are bands of solid colour,
+since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout
+with a new layout for the paper and orientation chosen. Gates in
+`officina-pdf/tests/print.rs` draw the PDFs back with Folium; the VM check has
+`sheets` and `slides` stages (`ONLY="sheets slides"` runs just those).
+
+Not yet: the Navigator has no PDF output to hand the sheet (it needs a paged rendering
+of a page in its jail; the Navigator thread is doing it); Sheets prints the current
+sheet's used range only (no print areas, titles, charts or pictures yet); Mail prints text only;
 colour, two-sided and tray options wait for R5's attributes; Scrinium's
 quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
 Pergola (`officina_pdf::plain` is the text half).
