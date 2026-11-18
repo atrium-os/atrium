@@ -15,16 +15,25 @@ int main(void) {
         fprintf(stderr, "{{name}}: no window (%d)\n", w);
         return 1;
     }
+    /* The window manager decides the size (it places every window): draw
+     * to the size the last resize event gave. */
+    float width = 480, height = 320;
     struct timespec tick = { 0, 16 * 1000 * 1000 };
     for (unsigned n = 0;; n++) {
         atrium_window_event_t ev;
-        while (atrium_window_poll_event(&ev) == 1)
+        while (atrium_window_poll_event(&ev) == 1) {
             if (ev.kind == ATRIUM_EV_WINDOW_CLOSE_REQUESTED)
                 goto done;
-        float x = 40.0f + (float)(n % 200);
+            if (ev.kind == ATRIUM_EV_WINDOW_RESIZED && ev.arg1 > 0 && ev.arg2 > 0) {
+                width = (float)ev.arg1;
+                height = (float)ev.arg2;
+            }
+        }
+        float span = width > 160 ? width - 160 : 1;
+        float x = 40.0f + (float)(n % (unsigned)span);
         atrium_window_frame_begin((uint32_t)w);
-        atrium_window_frame_rect(1, 0, 0, 480, 320, 0.96f, 0.96f, 0.95f, 1);
-        atrium_window_frame_rect(2, x, 120, 80, 80, 0.20f, 0.45f, 0.85f, 1);
+        atrium_window_frame_rect(1, 0, 0, width, height, 0.96f, 0.96f, 0.95f, 1);
+        atrium_window_frame_rect(2, x, height / 2 - 40, 80, 80, 0.20f, 0.45f, 0.85f, 1);
         atrium_window_frame_end();
         nanosleep(&tick, NULL);
     }
