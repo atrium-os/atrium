@@ -154,7 +154,7 @@ impl Cache {
     }
 }
 
-fn image_of(px: navigator_image::image::Pixels) -> Image {
+fn image_of(px: crate::decode::Pixels) -> Image {
     Image::new(px.width, px.height, px.rgba)
 }
 

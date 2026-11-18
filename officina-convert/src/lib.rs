@@ -18,6 +18,7 @@ pub mod ppt;
 pub mod docx;
 pub mod launch;
 pub mod odt;
+pub mod pictures;
 pub mod odfcrypt;
 pub mod odp;
 pub mod ods;

@@ -708,6 +708,7 @@ dependencies = [
  "atrium-fonts",
  "navigator-fontset",
  "officina-core",
+ "officina-pict",
  "officina-shapes",
  "rustybuzz",
  "ttf-parser",

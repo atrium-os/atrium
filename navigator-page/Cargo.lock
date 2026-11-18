@@ -1314,6 +1314,7 @@ version = "0.1.0"
 dependencies = [
  "atrium-fonts",
  "fresco-protocol",
+ "navigator-fontset",
  "navigator-render",
  "pergola",
 ]

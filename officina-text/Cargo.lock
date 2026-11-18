@@ -352,6 +352,10 @@ name = "officina-core"
 version = "0.1.0"
 
 [[package]]
+name = "officina-pict"
+version = "0.1.0"
+
+[[package]]
 name = "officina-shapes"
 version = "0.1.0"
 
@@ -362,6 +366,7 @@ dependencies = [
  "atrium-fonts",
  "navigator-fontset",
  "officina-core",
+ "officina-pict",
  "officina-shapes",
  "rustybuzz",
  "ttf-parser",

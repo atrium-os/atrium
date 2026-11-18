@@ -6,9 +6,15 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "PDF export for Officina (docs/spec/officina.md §7.4, §14): pages from officina-text's painter, streamed page by page, fonts embedded as TrueType subsets, each picture once, links as annotations."
 
+[features]
+default = ["local-decode"]
+local-decode = ["dep:navigator-image"]
+
 [dependencies]
 officina-text = { path = "../officina-text" }
-navigator-image = { path = "../navigator-image", features = ["office"] }
+# The in-process decoder, used only when the app installed none
+# (officina_text::picture): Write installs its worker's and builds without it.
+navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
 # The shared base with Folium (docs/spec/folium.md §5.1): the object
 # writer, the TrueType subsetter and ToUnicode, the content operators.
 folium-syntax = { path = "../folium-syntax" }

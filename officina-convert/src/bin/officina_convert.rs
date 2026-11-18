@@ -30,10 +30,14 @@ fn rl(v: u64) -> libc::rlimit {
 }
 
 fn sandbox() {
-    // 60 s of CPU, 8 GiB of address space.
+    sandbox_cpu(60)
+}
+
+fn sandbox_cpu(cpu_secs: u64) {
+    // CPU seconds, 8 GiB of address space.
     // SAFETY: setrlimit with valid structs.
     unsafe {
-        libc::setrlimit(libc::RLIMIT_CPU, &rl(60));
+        libc::setrlimit(libc::RLIMIT_CPU, &rl(cpu_secs));
         libc::setrlimit(libc::RLIMIT_AS, &rl(8 << 30));
     }
     #[cfg(target_os = "freebsd")]
@@ -63,12 +67,65 @@ fn header(stdin: &mut impl Read) -> (String, bool) {
     (what, w.next() == Some("--password"))
 }
 
+/// `officina-convert pictures`: decodes pictures until stdin ends, in the
+/// sandbox (the protocol is in officina_convert::pictures). Its CPU limit is
+/// for the session; when it is spent the process ends and the app starts
+/// another.
+fn pictures(mut stdin: impl Read) -> ! {
+    use navigator_image::image::{decode_unaddressed, natural_size, Ceilings};
+    use officina_convert::pictures::{MAX_INPUT, OP_DECODE, OP_SIZE};
+    sandbox_cpu(600);
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let mut head = [0u8; 13];
+    let mut bytes = Vec::new();
+    loop {
+        if stdin.read_exact(&mut head).is_err() {
+            std::process::exit(0);
+        }
+        let u = |i: usize| u32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+        let (op, tw, th, len) = (head[0], u(1), u(5), u(9) as usize);
+        if len > MAX_INPUT || !matches!(op, OP_SIZE | OP_DECODE) {
+            std::process::exit(1);
+        }
+        bytes.resize(len, 0);
+        if stdin.read_exact(&mut bytes).is_err() {
+            std::process::exit(1);
+        }
+        let answer = |out: &mut dyn Write, ok: bool, w: u32, h: u32| {
+            let mut a = vec![ok as u8];
+            a.extend_from_slice(&w.to_le_bytes());
+            a.extend_from_slice(&h.to_le_bytes());
+            out.write_all(&a)
+        };
+        let r = if op == OP_SIZE {
+            match natural_size(&bytes) {
+                Ok((_, w, h)) => answer(&mut out, true, w, h),
+                Err(_) => answer(&mut out, false, 0, 0),
+            }
+        } else {
+            let target = (tw > 0 && th > 0).then_some((tw, th));
+            match decode_unaddressed(&bytes, Ceilings { target, ..Ceilings::default() }) {
+                Ok(px) if px.rgba.len() as u64 == px.width as u64 * px.height as u64 * 4 => {
+                    answer(&mut out, true, px.width, px.height).and_then(|_| out.write_all(&px.rgba))
+                }
+                _ => answer(&mut out, false, 0, 0),
+            }
+        };
+        if r.and_then(|_| out.flush()).is_err() {
+            std::process::exit(0);
+        }
+    }
+}
+
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let (what, with_password) = match std::env::args().nth(1) {
         Some(w) => (w, std::env::args().nth(2).is_some_and(|a| a == "--password")),
         None => header(&mut stdin),
     };
+    if what == "pictures" {
+        pictures(stdin);
+    }
     let mut password = None;
     if with_password {
         let mut n = [0u8; 4];
