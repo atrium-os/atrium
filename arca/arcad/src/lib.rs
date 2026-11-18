@@ -23,6 +23,7 @@ pub mod proto;
 pub mod recovery;
 pub mod server;
 pub mod share;
+pub mod ssh;
 pub mod tickets;
 pub mod verify;
 pub mod volume;

@@ -334,14 +334,28 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   under the system worker rule (`scripts/nuntius-egress-bundle.sh`). The workspace gets
   `HTTPS_PROXY` and the related variables. Its host list is `hosts` in its record
   (`portcullis workspace set NAME --hosts a,b`, `WorkspaceSet.hosts`), defaulting to
-  §5.2's list. Gate `scripts/vm-registries-check.sh`: 27/27 in deny mode. Not done:
-  the Workspaces app's host list editor, and a `cargo fetch` (the gate fetches with
+  §5.2's list. Gate `scripts/vm-registries-check.sh`: 27/27 in deny mode. The Workspaces app
+  offers Registries and edits the host list (host tests pass; its VM check,
+  `scripts/vm-workspaces-app-check.sh`, is not yet run). Not done: a `cargo fetch` (the gate fetches with
   `fetch(1)`, which uses the same proxy variables, because the cloud VM has no Rust
   layer).
 - **M9 (M).** Needs Arca's SSH agent (Arca A5); this thread builds the workspace side:
   agent socket mounted per workspace, per-key grants in Curia, `git-credential-arca`,
   `c-dev`'s git. Gate: `git push` over SSH to a test server with the key in Arca;
   no key material in the workspace; a workspace without the grant is refused.
+  **As built (2026-11-18).** Arca's side is arca.md §9.1: keys per persona in arcad,
+  grants by workspace name, the agent (`atrium-ssh-agent`, `_arca-ssh` 65047) with one
+  socket per running workspace. portcullisd asks the agent to open the workspace's socket
+  at each start, mounts its folder read-only at `/atrium/ssh-agent` and sets
+  `SSH_AUTH_SOCK`; stop closes it, delete ends its grants. The person uses `arca-ssh
+  new|list|grant|revoke|delete`. Gate `scripts/vm-ssh-agent-check.sh`: 25/25 (an ssh
+  login and `ssh-keygen -Y sign` through the agent, the signature checked on the host;
+  another workspace lists nothing and can't sign or log in; no private key in the
+  workspace; the socket refuses any uid but the workspace's; revoke and lock end it). The
+  login is to an sshd of the workspace's own on its loopback, which is what `git push`
+  over SSH does too; git itself isn't on the cloud VM. Not done: grants in Curia (the CLI
+  stands in), `git-credential-arca` for HTTPS tokens, and the agent run jailed from its
+  services.d entry (it passes the shipped policy; the gate runs it unjailed as `_arca-ssh`).
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;

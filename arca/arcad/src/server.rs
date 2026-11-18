@@ -16,7 +16,7 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::courier::{app_persona, CourierLabel};
 use crate::label::Label;
-use crate::proto::{broker_op, courier_op, op, share_op, status, volume_op, MAX_SIGN_MSG};
+use crate::proto::{broker_op, courier_op, op, share_op, ssh_op, status, volume_op, MAX_SIGN_MSG};
 use crate::share::ShareLabel;
 
 /// Personas arrive with the label once insula.md §13.6 lands; until then
@@ -225,6 +225,7 @@ impl State {
                 }
             }
             Label::Service(name) if (0xB0..=0xB8).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC7).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -2167,6 +2168,143 @@ impl State {
                 let store = self.stores.get_mut(user).expect("checked above");
                 tri!(store.delete(&id, &Access { persona: PERSONA, recipient: &share }));
                 ok(Vec::new())
+            }
+            _ => reply(status::DENIED),
+        }
+    }
+
+    /// The SSH agent (arca.md §9.1): keys in the owner's persona for the
+    /// agent's recipient; a workspace sees and signs with only those
+    /// granted to it by name.
+    fn ssh_op(&mut self, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        use crate::ssh::{granted, valid_workspace, with_grant, SERVICE};
+        let mut r = Reader::new(body);
+        macro_rules! field {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => return malformed(),
+                }
+            };
+        }
+        let user = field!(r.str(caps::USER)).to_string();
+        let persona = field!(r.str(caps::PERSONA)).to_string();
+        if !valid_user(&user) || !arca_store::model::valid_persona(&persona) {
+            return malformed();
+        }
+        let me = Recipient::Service(SERVICE.into());
+        let who = Access { persona: &persona, recipient: &me };
+        let Some(store) = self.stores.get_mut(&user).filter(|s| s.state() == LockState::Unlocked) else {
+            return reply(status::LOCKED);
+        };
+        let pubkey = |store: &Store, id: &ItemId| -> Result<[u8; 32], Error> {
+            let (_, seed) = store.release(id, &who, None)?;
+            Ok(signing_key(&seed).verifying_key().to_bytes())
+        };
+        match op {
+            ssh_op::SA_MINT => {
+                let comment = field!(r.str(ssh_op::COMMENT_MAX));
+                field!(r.end());
+                if comment.chars().any(|c| c.is_control()) {
+                    return malformed();
+                }
+                let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
+                let pk = signing_key(&seed).verifying_key().to_bytes();
+                let m = tri!(store.add(NewItem {
+                    persona: &persona,
+                    recipient: me.clone(),
+                    class: Class::WhileUnlocked,
+                    kind: Kind::Ed25519,
+                    provenance: Provenance::ArcaGenerated,
+                    account: comment,
+                    scope: b"",
+                    value: seed.as_ref(),
+                }));
+                *item = Some(m.id);
+                let mut w = Writer::new();
+                w.raw(&m.id.0);
+                w.raw(&pk);
+                ok(w.buf)
+            }
+            ssh_op::SA_LIST | ssh_op::SA_KEYS => {
+                let ws = if op == ssh_op::SA_KEYS {
+                    let ws = field!(r.str(64));
+                    if !valid_workspace(ws) {
+                        return malformed();
+                    }
+                    Some(ws)
+                } else {
+                    None
+                };
+                field!(r.end());
+                let mut n = 0u32;
+                let mut w = Writer::new();
+                for m in tri!(store.list(&who)) {
+                    if m.kind != Kind::Ed25519 || ws.is_some_and(|ws| !granted(&m.scope, ws)) {
+                        continue;
+                    }
+                    w.raw(&m.id.0);
+                    w.raw(&tri!(pubkey(store, &m.id)));
+                    w.str(&m.account);
+                    if ws.is_none() {
+                        w.str(std::str::from_utf8(&m.scope).unwrap_or(""));
+                    }
+                    n += 1;
+                }
+                let mut out = Writer::new();
+                out.u32(n);
+                out.raw(&w.buf);
+                ok(out.buf)
+            }
+            ssh_op::SA_GRANT | ssh_op::SA_REVOKE => {
+                let id = ItemId(field!(r.array::<16>()));
+                let ws = field!(r.str(64));
+                field!(r.end());
+                if !valid_workspace(ws) {
+                    return malformed();
+                }
+                *item = Some(id);
+                let m = tri!(store.meta(&id, &who));
+                tri!(store.set_scope(&id, &who, &with_grant(&m.scope, ws, op == ssh_op::SA_GRANT)));
+                ok(Vec::new())
+            }
+            ssh_op::SA_FORGET => {
+                let ws = field!(r.str(64));
+                field!(r.end());
+                if !valid_workspace(ws) {
+                    return malformed();
+                }
+                let mut n = 0u32;
+                for m in tri!(store.list(&who)) {
+                    if granted(&m.scope, ws) {
+                        tri!(store.set_scope(&m.id, &who, &with_grant(&m.scope, ws, false)));
+                        n += 1;
+                    }
+                }
+                ok(n.to_le_bytes().to_vec())
+            }
+            ssh_op::SA_DELETE => {
+                let id = ItemId(field!(r.array::<16>()));
+                field!(r.end());
+                *item = Some(id);
+                tri!(store.delete(&id, &who));
+                ok(Vec::new())
+            }
+            ssh_op::SA_SIGN => {
+                let ws = field!(r.str(64));
+                let id = ItemId(field!(r.array::<16>()));
+                let msg = field!(r.bytes(MAX_SIGN_MSG));
+                field!(r.end());
+                *item = Some(id);
+                let m = tri!(store.meta(&id, &who));
+                // Not granted reads as not there: DENIED either way.
+                if m.kind != Kind::Ed25519 || !granted(&m.scope, ws) {
+                    return reply(status::DENIED);
+                }
+                let (_, seed) = tri!(store.release(&id, &who, None));
+                let sk = signing_key(&seed);
+                drop(seed);
+                ok(sk.sign(msg).to_bytes().to_vec())
             }
             _ => reply(status::DENIED),
         }

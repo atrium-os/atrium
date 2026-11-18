@@ -668,6 +668,36 @@ without a grant; `arca_store` for an app saving a secret it was given (the recip
 required and shown to the user). There is deliberately no call that lists another app's
 items or reads a value by name.
 
+### 9.1 As built: the SSH agent (A5, 2026-11-18)
+
+For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
+
+- **Keys** are Ed25519 items in the person's store, in the workspace's persona (Personal is
+  Arca's `main`), recipient `Service("ssh-agent")`, class while-unlocked, made inside arcad.
+  The item's scope holds the workspaces the key is granted to, one name a line. Ops
+  `ssh_op` 0xC0–0xC7 (`SA_MINT`, `SA_LIST`, `SA_GRANT`, `SA_REVOKE`, `SA_DELETE`, `SA_KEYS`,
+  `SA_SIGN`, `SA_FORGET`), answered only for the `ARCA_SERVICES` entry `ssh-agent`
+  (`_arca-ssh`, 65047). `SA_SIGN` is `DENIED` unless the key is granted to the named
+  workspace in that persona. arcad never releases the seed.
+- **The agent** (`arca/arca-ssh-agent`, `atrium-ssh-agent`, jailed, no network) owns
+  `/atrium/sockets/ssh-agent`. At each workspace start portcullisd asks it (control socket,
+  as root) to `open OWNER WORKSPACE PERSONA UID`; it makes `<owner>.<workspace>/agent.sock`,
+  and portcullisd mounts that folder **read-only** at `/atrium/ssh-agent` in the workspace
+  and sets `SSH_AUTH_SOCK`. The socket a connection arrives on names the workspace: a jail
+  sees only its own folder, so even the workspace's root, which can take any uid inside its
+  jail, can't reach another workspace's agent. The peer must also be the workspace's own uid.
+  Stop closes the socket; delete ends the workspace's grants (`SA_FORGET`).
+- **Protocol**: the ssh-agent protocol's list and sign requests only; adding, removing and
+  locking keys from inside a workspace fail. Locked or refused: no identities. Each
+  signature is logged by the agent and audited by arcad.
+- **The person** manages keys with `arca-ssh new|list|grant|revoke|delete [--persona P]`
+  over the control socket, which serves a uid below the app range with a passwd entry that
+  no launch registered, acting on that person's own keys only. `new` prints the public line
+  for a forge or `authorized_keys`.
+- **Not yet**: grants in Curia (the CLI stands in), a Sigillum touch per use
+  (verify-each-use keys), and `git-credential-arca` for HTTPS tokens.
+- Gate: `scripts/vm-ssh-agent-check.sh`.
+
 ## 10. Audit
 
 Every release and every operation is logged with the item id, client label, recipient,

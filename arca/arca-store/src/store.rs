@@ -747,6 +747,32 @@ impl Store {
         Ok(meta)
     }
 
+    /// Replace an item's scope (the profile's narrowing, opaque here). Same
+    /// version rule as [`Store::update`].
+    pub fn set_scope(&mut self, id: &ItemId, who: &Access<'_>, scope: &[u8]) -> Result<ItemMeta, Error> {
+        if scope.len() > caps::SCOPE {
+            return Err(Error::BadInput("field too long"));
+        }
+        let (gid, idx) = self.locate(id, who)?;
+        let class = self.groups[&gid].class;
+        if class != Class::AfterFirstUnlock && self.master.is_none() {
+            return Err(Error::Locked);
+        }
+        let verified = (class == Class::VerifyEachUse).then(UserVerified::vouched_by_vestibulum);
+        let (mut meta, value) = self.release(id, who, verified)?;
+        meta.version += 1;
+        meta.updated = now();
+        meta.scope = scope.to_vec();
+        let rec = self.seal_item(&gid, &meta, value.as_ref())?;
+        drop(value);
+        let old = std::mem::replace(&mut self.groups.get_mut(&gid).unwrap().items[idx], rec);
+        if let Err(e) = self.write_group(&gid) {
+            self.groups.get_mut(&gid).unwrap().items[idx] = old;
+            return Err(e);
+        }
+        Ok(meta)
+    }
+
     /// Delete one item.
     pub fn delete(&mut self, id: &ItemId, who: &Access<'_>) -> Result<(), Error> {
         let (gid, idx) = self.locate(id, who)?;

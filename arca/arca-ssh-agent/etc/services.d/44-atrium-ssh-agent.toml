@@ -1,0 +1,62 @@
+# /etc/atrium/services.d/44-atrium-ssh-agent.toml
+#
+# Arca's SSH agent (docs/spec/arca.md §9.1, dev-tools.md §8): one agent
+# socket per running workspace, keys and signatures from arcad, only the
+# keys the person granted to that workspace. Numbered after arcad (42).
+#
+# Runs as _arca-ssh (65047) with no network. It sees its own socket tree
+# (rw: control.sock and a folder per workspace, which portcullisd mounts
+# read-only into that workspace), arcad's socket dir to connect, the launch
+# registry and pwd.db (who is on the control socket). Never a key: arcad
+# signs.
+#
+# REQUIRES (scripts/ssh-agent-service.sh does all):
+#   pw useradd _arca-ssh -u 65047 -d /nonexistent -s /usr/sbin/nologin
+#   mkdir -p /atrium/sockets/ssh-agent && chown _arca-ssh /atrium/sockets/ssh-agent
+#   ssh-agent=65047 in arcad's ARCA_SERVICES (42-atrium-arcad.toml)
+#   install the binaries as /usr/local/bin/atrium-ssh-agent and arca-ssh
+
+enabled       = true
+name          = "atrium-ssh-agent"
+path          = "/var/lib/atrium/jails/ssh-agent"
+children_max  = 0
+devfs_ruleset = 4
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/ssh-agent"             # rw: its control socket and one folder per workspace
+dest   = "atrium/sockets/ssh-agent"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/arca"                  # ro: connect to arcad
+dest   = "atrium/sockets/arca"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"          # ro: a control caller is a person, not an app
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/etc/pwd.db"                           # ro: the person's name for their uid (no hashes)
+dest   = "etc/pwd.db"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-ssh-agent"
+argv = ["atrium-ssh-agent"]
+uid  = 65047   # _arca-ssh
+gid  = 65047

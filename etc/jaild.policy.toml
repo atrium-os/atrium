@@ -116,6 +116,9 @@ rw_paths = [
     # aura-mlme's mlme.sock, aura-keys' keys.sock.
     "/atrium/sockets/aura",
     "/atrium/sockets/aura-keys",
+    # Arca's SSH agent (arca.md §9.1): its control socket and a folder per
+    # workspace, which portcullisd mounts read-only into that workspace.
+    "/atrium/sockets/ssh-agent",
     # navigatord's ticket socket, the Navigator page jail's one capability
     # (`navigator-page`, navigator-ui.md §2.1).
     "/atrium/sockets/navigator-page",
@@ -532,6 +535,8 @@ allowed_system_uids = [
              # system worker rule (nuntius-egress-bundle.sh; dev-tools.md §5.2)
     65045,   # _share: the share sheet, Limen's `share` provider
              # (share-sheet.md; share-sheet-service.sh creates it)
+    65047,   # _arca-ssh: Arca's SSH agent, atrium-ssh-agent (arca.md §9.1;
+             # ssh-agent-service.sh creates it)
 ]
 
 [gid]
@@ -560,6 +565,7 @@ allowed_system_gids = [
     65042,   # _opifexsheet
     65044,   # _egress
     65045,   # _share
+    65047,   # _arca-ssh
 ]
 
 

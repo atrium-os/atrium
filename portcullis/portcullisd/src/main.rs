@@ -57,6 +57,7 @@ mod egress;
 mod empty;
 mod ide;
 mod launch;
+mod ssh_agent;
 mod workspace;
 use portcullisd::manifest_trust;
 #[cfg(feature = "pam")]

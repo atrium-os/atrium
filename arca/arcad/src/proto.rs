@@ -309,6 +309,39 @@ pub mod volume_op {
     pub const LABEL_MAX: usize = 128;
 }
 
+/// The SSH agent's ops (0xC0..), arca.md §9.1: only the `ARCA_SERVICES`
+/// entry named [`crate::ssh::SERVICE`]. Keys are Ed25519 items in the
+/// owner's persona with that service as recipient, class while-unlocked;
+/// an item's scope holds the workspaces it is granted to, one name a line.
+/// `owner` is `str user | str persona`. The agent names the owner and the
+/// workspace from the kernel's peer uid and the launch registry (it is the
+/// one service trusted to); the private key never leaves arcad.
+pub mod ssh_op {
+    /// The person (through the agent's control socket): `owner | str
+    /// comment` → `id[16] | pubkey[32]`.
+    pub const SA_MINT: u16 = 0xC0;
+    /// The person: `owner` → `u32 n | n × (id[16] | pubkey[32] | str
+    /// comment | str grants)`, grants newline-separated.
+    pub const SA_LIST: u16 = 0xC1;
+    /// The person: `owner | id[16] | str workspace` → nothing.
+    pub const SA_GRANT: u16 = 0xC2;
+    /// The person: same body → nothing.
+    pub const SA_REVOKE: u16 = 0xC3;
+    /// The person: `owner | id[16]` → nothing.
+    pub const SA_DELETE: u16 = 0xC4;
+    /// A workspace's agent connection: `owner | str workspace` → `u32 n |
+    /// n × (id[16] | pubkey[32] | str comment)`, the keys granted to it.
+    pub const SA_KEYS: u16 = 0xC5;
+    /// A workspace's agent connection: `owner | str workspace | id[16] |
+    /// bytes msg` → `sig[64]`. `DENIED` unless the key is granted to it.
+    pub const SA_SIGN: u16 = 0xC6;
+    /// portcullisd, through the agent, when a workspace is deleted: `owner |
+    /// str workspace` → `u32 n`, the keys whose grant to it went.
+    pub const SA_FORGET: u16 = 0xC7;
+    /// Longest comment.
+    pub const COMMENT_MAX: usize = 256;
+}
+
 /// Courier ops (0x80..): only a courier's uid, for its own endpoint.
 pub mod courier_op {
     /// After TLS is up: `u8 n | n × (u8 source | ref[16])` → `n × bytes

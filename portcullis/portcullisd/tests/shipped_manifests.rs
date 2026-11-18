@@ -34,6 +34,7 @@ const MANIFEST_DIRS: &[&str] = &[
     "lyra/etc/services.d",
     "choragus/etc/services.d",
     "limen/etc/services.d",
+    "arca/arca-ssh-agent/etc/services.d",
 ];
 
 #[test]
@@ -121,4 +122,17 @@ fn limend_manifest_passes_the_shipped_policy() {
     assert_eq!(m.exec.as_ref().map(|e| e.uid), Some(65022));
     assert!(m.sockets.iter().any(|s| s.path == "/atrium/sockets/limen/limend.sock"),
         "limend.sock is not supervisor-bound");
+}
+
+/// Arca's SSH agent (arca.md §9.1): jaild takes it as shipped, as _arca-ssh.
+#[test]
+fn ssh_agent_manifest_passes_the_shipped_policy() {
+    let p = policy();
+    let out = load_dir(&repo().join("arca/arca-ssh-agent/etc/services.d")).expect("read its services.d");
+    assert!(out.errors.is_empty(), "unparseable: {:?}", out.errors);
+    let m = out.manifests.iter().find(|m| m.name == "atrium-ssh-agent").expect("atrium-ssh-agent manifest");
+    if let Err(e) = validate_create(&m.to_create_request(), &p) {
+        panic!("atrium-ssh-agent: jaild would refuse it: {e:?}");
+    }
+    assert_eq!(m.exec.as_ref().map(|e| e.uid), Some(65047));
 }

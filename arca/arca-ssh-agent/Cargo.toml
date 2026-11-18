@@ -1,0 +1,29 @@
+[package]
+name        = "arca-ssh-agent"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Arca's SSH agent (docs/spec/arca.md §9.1): one agent socket per workspace, keys and signatures from arcad, only the keys the person granted to that workspace. The private key never leaves arcad."
+
+[lib]
+name = "arca_ssh_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-ssh-agent"
+path = "src/bin/atrium-ssh-agent.rs"
+
+[[bin]]
+name = "arca-ssh"
+path = "src/bin/arca-ssh.rs"
+
+[dependencies]
+arca-store      = { path = "../arca-store" }
+arcad           = { path = "../arcad" }
+portcullis-peer = { path = "../../portcullis/portcullis-peer" }
+libc            = "0.2"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+tempfile = "3"
