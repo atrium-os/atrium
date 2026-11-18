@@ -333,3 +333,18 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!(t.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code), status::LOCKED);
 }
+
+#[test]
+fn a_forgotten_key_leaves_its_stick_locked() {
+    // §9: after "Forget this stick's key", plugging the stick in finds
+    // nothing (dispensatord shows it Locked) and the kernel holds no key.
+    let (_d, mut s, k) = setup();
+    let (_, key_id) = mint(&mut s, &dispensatord(), "alice", "work", UUID);
+    assert_eq!(owner_op(&mut s, volume_op::VK_FORGET, "alice", "work", &key_id).0, status::NEEDS_VERIFICATION);
+    let r = s.handle_verified(&dispensatord(), volume_op::VK_FORGET, &body(|w| { w.str("alice"); w.str("work"); w.raw(&key_id); }));
+    assert_eq!(r.status, status::OK);
+    assert!(k.lock().unwrap().loaded.is_empty());
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &key_id, UUID, 0).0, status::DENIED);
+    assert_eq!(load(&mut s, &dispensatord(), "alice", "work", &key_id, UUID, 0), status::DENIED);
+    assert!(k.lock().unwrap().loaded.is_empty());
+}
