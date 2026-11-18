@@ -21,6 +21,11 @@ tessera = ["dep:tessera-sys"]
 name = "atrium-capsa-fuse"
 path = "src/bin/capsa-fuse.rs"
 
+# A trusted (sealed) stick's folders, for grants (tessera-encryption.md §7.2a).
+[[bin]]
+name = "atrium-capsa-local"
+path = "src/bin/capsa-local.rs"
+
 # A hostile FUSE server that fuzzes the kernel's fusefs from the server side
 # (network-shares.md §4.4). Root, FreeBSD, test machines only.
 [[bin]]

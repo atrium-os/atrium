@@ -65,6 +65,10 @@ pub struct Policy {
     /// Network share servers (network-shares.md §4.1). Absent = none.
     #[serde(default)]
     pub share_servers: Option<ShareServerPolicy>,
+    /// Trusted sticks' pass-through servers (tessera-encryption.md §7.2a).
+    /// Absent = none.
+    #[serde(default)]
+    pub stick_servers: Option<StickServerPolicy>,
     /// Prelum's per-job and per-printer workers (printing.md §6.1, §6.3).
     /// Absent = none.
     #[serde(default)]
@@ -218,6 +222,34 @@ impl ShareServerPolicy {
     /// The one mountpoint a share server's jail may serve.
     pub fn mountpoint(&self, uid: u32) -> String {
         format!("{}/share-{uid}", self.mount_prefix.trim_end_matches('/'))
+    }
+}
+
+/// `[stick_servers]`: dispensatord asks for one jail per trusted (sealed,
+/// kernel-mounted) stick, named `<name_prefix><part>` at
+/// `<instance_root_dir>/<name>`, running exactly `exec_path` as the stick
+/// owner's uid (a person's, in `uid_first..=uid_last`), with no filesystem
+/// of its own: jaild hands it the stick's mount `<media_prefix>/<part>` as
+/// a directory descriptor and serves FUSE at `<media_prefix>/.sticks/<part>`,
+/// which only dispensatord's grants reach (tessera-encryption.md §7.2a).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StickServerPolicy {
+    pub name_prefix:  String,
+    pub exec_path:    String,
+    pub uid_first:    u32,
+    pub uid_last:     u32,
+    pub media_prefix: String,
+}
+
+impl StickServerPolicy {
+    /// The stick's own mount, which the server is handed.
+    pub fn root_dir(&self, part: &str) -> String {
+        format!("{}/{part}", self.media_prefix.trim_end_matches('/'))
+    }
+    /// Where the server's FUSE mount goes: out of the way, for grants.
+    pub fn mountpoint(&self, part: &str) -> String {
+        format!("{}/.sticks/{part}", self.media_prefix.trim_end_matches('/'))
     }
 }
 

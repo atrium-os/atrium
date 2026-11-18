@@ -588,9 +588,26 @@ Personal:
   kernel then opens the copy below the mark, read-only only (a writable mount or a
   ro→rw remount with that key is `EROFS`). Adopting the copy as current (the second
   verified step that lowers the mark) is not built yet.
-- **Not yet:** grants of a trusted stick's folders into app jails (the FUSE
-  server's control socket does that for FAT; a trusted stick has no server), and
-  Scrinium's and Forum's Locked display and "Make this a Work stick".
+- **Grants of its folders** (built, VM gate pending): a trusted stick has no
+  FUSE server of its own, so dispensatord starts one per mounted stick,
+  `atrium-capsa-local`, in a jail of jaild's `[stick_servers]` class: named
+  `system-stick-<part>`, running as the stick's person (a person's uid, never a
+  system one), with only its binary and libraries mounted and no network. jaild
+  opens `/media/<part>` itself, refuses it unless it is the root of a Tessera
+  mount, and hands it over as a directory descriptor (fd 3); the server enters
+  Capsicum and serves every path relative to it without following links (links
+  and device nodes aren't shown). Its own FUSE mount sits at
+  `/media/.sticks/<part>` (root's, 0700); grants arrive on its control socket
+  like a FAT stick's (device-assignment.md §4.8), so the kernel's permission
+  checks as the person still apply beneath every grant. A persona's stick is
+  granted only to that persona's instances, as the launch registry binds the
+  app's uid (personas.md §5.1); an older copy's grants are read-only. Eject
+  ends the grants and the server before the gentle unmount (and brings the
+  server back if the stick is busy); lock, unplug and session end do the same
+  through `stop_sealed`.
+- **Not yet:** Scrinium's and Forum's Locked display and "Make this a Work
+  stick", the Arca field for typing a recovery code, and adopting an older
+  copy as current.
 - Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): all 43
   checks in the VM on 2026-11-18 (e61b9c0: format, lock, Locked for another person,
   eject, replug, an older copy refused and not opened unverified, a recovery code

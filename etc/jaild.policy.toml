@@ -365,6 +365,24 @@ uid_last     = 63499
 mount_prefix = "/media"
 
 # ---------------------------------------------------------------
+# Trusted sticks' servers (tessera-encryption.md §7.2a): a sealed stick is
+# the kernel's to mount, at <media_prefix>/<part>, as its owner's. So that
+# apps can be given its folders like any stick's, dispensatord asks for one
+# jail per such stick, named <name_prefix><part> at
+# <instance_root_dir>/<name>, running exactly exec_path as the owner's uid
+# (a person's: uid_first..uid_last, clear of every system range). The jail
+# has no filesystem of its own: jaild opens the stick's mount (it must be
+# a Tessera mount's root) and hands it over as a directory descriptor, and
+# mounts fusefs at exactly <media_prefix>/.sticks/<part>, for grants.
+# ---------------------------------------------------------------
+[stick_servers]
+name_prefix  = "system-stick-"
+exec_path    = "/usr/local/bin/atrium-capsa-local"
+uid_first    = 1001
+uid_last     = 59999
+media_prefix = "/media"
+
+# ---------------------------------------------------------------
 # Prelum's workers (docs/spec/printing.md §6.1, §6.3): prelumd asks for one
 # jail per job conversion (render_exec, no network) and per printer
 # connection (ipp_exec, a routed vnet passing only the printer's address and
