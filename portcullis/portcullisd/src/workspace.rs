@@ -37,7 +37,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::launch;
+use crate::{egress, launch};
 
 /// The one made for everyone at the first ask.
 pub const SCRATCH: &str = "scratch";
@@ -274,7 +274,8 @@ pub struct Record {
     pub toolchain: String,
     #[serde(default = "personal")]
     pub persona:   String,
-    /// "outbound" or "none".
+    /// "outbound", "registries" (only the hosts below, through the proxy:
+    /// dev-tools.md §5.2) or "none".
     pub network:   String,
     #[serde(default)]
     pub uses:      Vec<String>,
@@ -286,6 +287,34 @@ pub struct Record {
     /// Toolchain layers it mounts, `name@version` (dev-tools-plan.md M3).
     #[serde(default)]
     pub layers: Vec<String>,
+    /// What a `registries` workspace may reach (port 443, names matched
+    /// exactly). Empty: [`DEFAULT_HOSTS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+}
+
+/// The registries a `registries` workspace reaches when it lists none:
+/// crates.io, GitHub (git and release downloads), rustup's and FreeBSD's
+/// package servers.
+pub const DEFAULT_HOSTS: &[&str] = &[
+    "crates.io", "index.crates.io", "static.crates.io",
+    "github.com", "codeload.github.com", "objects.githubusercontent.com",
+    "static.rust-lang.org", "pkg.freebsd.org",
+];
+
+impl Record {
+    /// The hosts its proxy admits.
+    pub fn egress_hosts(&self) -> Vec<String> {
+        if self.hosts.is_empty() { DEFAULT_HOSTS.iter().map(|h| h.to_string()).collect() } else { self.hosts.clone() }
+    }
+}
+
+/// A host name as the list takes it: letters, digits, dots and dashes, no
+/// wildcard, no address literal.
+pub fn valid_host(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 253 && !h.starts_with(['.', '-']) && !h.ends_with('.')
+        && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && h.bytes().any(|b| b.is_ascii_lowercase())
 }
 
 /// Where a workspace's group cache is in its jail.
@@ -341,7 +370,7 @@ pub fn valid_name(n: &str) -> bool {
         && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-pub fn valid_network(n: &str) -> bool { matches!(n, "outbound" | "none") }
+pub fn valid_network(n: &str) -> bool { matches!(n, "outbound" | "registries" | "none") }
 
 /// The console target of a workspace.
 pub fn target(name: &str) -> String { format!("{}{name}", crate::console::WORKSPACE_PREFIX) }
@@ -425,7 +454,7 @@ pub fn list(owner: &str) -> Result<Vec<(Record, bool)>, String> {
     if load(&root.join(SCRATCH)).is_none() {
         create(owner, Record {
             name: SCRATCH.into(), toolchain: "c".into(), persona: personal(),
-            network: "outbound".into(), uses: vec![], object_cache: false, layers: vec![],
+            network: "outbound".into(), uses: vec![], object_cache: false, layers: vec![], hosts: vec![],
         })?;
     }
     let mut v = Vec::new();
@@ -456,7 +485,10 @@ fn check(owner: &str, home: &Path, r: &Record) -> Result<(), String> {
     }
     compose_layers(r)?;
     if !valid_network(&r.network) {
-        return Err(format!("network {:?}: outbound or none", r.network));
+        return Err(format!("network {:?}: outbound, registries or none", r.network));
+    }
+    if let Some(h) = r.hosts.iter().find(|h| !valid_host(h)) {
+        return Err(format!("host {h:?}: a name in lowercase, no wildcard or address"));
     }
     for u in &r.uses {
         if *u == r.name {
@@ -499,7 +531,7 @@ pub fn create(owner: &str, mut r: Record) -> Result<Record, String> {
         let _ = std::os::unix::fs::chown(&meta, Some(uid), Some(gid));
         let _ = fs::set_permissions(&meta, fs::Permissions::from_mode(0o2770));
         let text = format!("# Made by New workspace (homes.md §5; atrium-devjail.md §3).\nname = {:?}\n\n[toolchain]\nlanguage = {:?}\nlayers = {:?}\n\n[network]\noutbound = {:?}\n",
-                           r.name, r.toolchain, r.layers, if r.network == "none" { "none" } else { "any" });
+                           r.name, r.toolchain, r.layers, match r.network.as_str() { "none" => "none", "registries" => "registries", _ => "any" });
         let f = meta.join("devjail.toml");
         if fs::write(&f, text).is_ok() {
             let _ = std::os::unix::fs::chown(&f, Some(uid), Some(gid));
@@ -568,7 +600,8 @@ pub fn duplicate(owner: &str, from: &str, to: &str) -> Result<Record, String> {
 }
 
 /// Change its settings; a running one is stopped so the change applies.
-pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool>) -> Result<Record, String> {
+pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<String>>, object_cache: Option<bool>,
+           hosts: Option<Vec<String>>) -> Result<Record, String> {
     let (home, gid) = person(owner)?;
     let dir = root_dir(&home, gid)?.join(name);
     let mut r = load(&dir).filter(|_| valid_name(name)).ok_or_else(|| format!("no workspace {name:?}"))?;
@@ -581,6 +614,9 @@ pub fn set(owner: &str, name: &str, network: Option<String>, uses: Option<Vec<St
     }
     if let Some(u) = uses {
         r.uses = u;
+    }
+    if let Some(h) = hosts {
+        r.hosts = h.into_iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect();
     }
     check(owner, &home, &r)?;
     stop(owner, name);
@@ -842,10 +878,16 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
         env.push(format!("PKG_CONFIG_PATH={}", pc.join(":")));
     }
     env.extend(layers.env);
+    // registries (dev-tools.md §5.2): its only way out is the proxy on its
+    // own loopback.
+    if r.network == "registries" {
+        env.extend(egress::proxy_env());
+    }
     let running = Running { jid: 0, uid, gid, files, home: home_in.clone(), env };
     if let Some(jid) = running_jid(owner, name) {
         return Ok(Running { jid, ..running });
     }
+    egress::stop(&jail_name(owner, name));
 
     // The writable root, kept between starts (what `pkg` or `make install`
     // put in /usr/local stays).
@@ -871,7 +913,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
 
     let mid = manifest_id(owner, name);
     let text = format!("[app]\nid = {mid:?}\nname = {name:?}\nversion = \"1\"\nentry = \"usr/bin/true\"\n\n[capabilities]\nnetwork = {:?}\n",
-                       if r.network == "outbound" { "full" } else { "none" });
+                       match r.network.as_str() { "outbound" => "full", "registries" => "loopback", _ => "none" });
     let manifest = portcullis_toml::Manifest::from_str(&text).map_err(|e| format!("its manifest: {e}"))?;
     let fail = |m: String| {
         launch::full_teardown(&jp, None);
@@ -931,6 +973,14 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     launch::ensure_mountpoints(&jc).map_err(|e| fail(format!("{e:?}")))?;
     launch::create_persistent(&jc, &jp).map_err(|e| fail(format!("{e:?}")))?;
     let jid = running_jid(owner, name).ok_or_else(|| fail(format!("workspace {name} did not start")))?;
+    if r.network == "registries" {
+        // ★ Before anything runs in it: the port is the proxy's, not
+        // something the workspace could bind first.
+        if let Err(e) = egress::start(&jail_name(owner, name), jid, &r.egress_hosts()) {
+            launch::remove_persistent(&jail_name(owner, name), &jp, false);
+            return Err(format!("its registries proxy: {e}"));
+        }
+    }
     eprintln!("portcullisd: workspace {name} of {owner} started (jid {jid}, uid {uid}, network {}, uses {:?}, layers {:?}, objects {:?})", r.network, r.uses,
               r.layers, objects.as_ref().map(|o| o.display().to_string()));
     Ok(Running { jid, ..running })
@@ -949,6 +999,7 @@ pub fn stop(owner: &str, name: &str) {
         .and_then(|d| load(&d.join(name)))
         .is_some_and(|r| r.network == "outbound");
     launch::remove_persistent(&jail_name(owner, name), &jail_path(owner, name), networked);
+    egress::stop(&jail_name(owner, name));
     eprintln!("portcullisd: workspace {name} of {owner} stopped");
 }
 

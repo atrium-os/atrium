@@ -53,6 +53,7 @@ use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTE
 
 mod console;
 mod dev;
+mod egress;
 mod empty;
 mod ide;
 mod launch;
@@ -80,6 +81,11 @@ usage:
 fn main() -> ExitCode {
     let mut socket_path: Option<PathBuf> = None;
     let args: Vec<String> = std::env::args().collect();
+    // The registries proxy's helper (egress.rs): bind in a workspace's
+    // jail and hand the socket back; never the daemon.
+    if args.get(1).map(String::as_str) == Some(egress::BIND_ARG) {
+        egress::bind_in_jail_main(args.get(2).map(String::as_str).unwrap_or(""));
+    }
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1943,9 +1949,9 @@ fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>
     let done = match req {
         Request::Workspaces => Ok(()),
         Request::WorkspaceNew { name, toolchain, network, uses } => workspace::create(owner, workspace::Record {
-            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses, object_cache: false, layers: vec![],
+            name, toolchain, persona: "personal".into(), network: network.unwrap_or_else(|| "outbound".into()), uses, object_cache: false, layers: vec![], hosts: vec![],
         }).map(|_| ()),
-        Request::WorkspaceSet { name, network, uses, object_cache } => workspace::set(owner, &name, network, uses, object_cache).map(|_| ()),
+        Request::WorkspaceSet { name, network, uses, object_cache, hosts } => workspace::set(owner, &name, network, uses, object_cache, hosts).map(|_| ()),
         Request::WorkspaceDuplicate { name, new_name } => workspace::duplicate(owner, &name, &new_name).map(|_| ()),
         Request::WorkspaceStop { name } => {
             if workspace::valid_name(&name) {

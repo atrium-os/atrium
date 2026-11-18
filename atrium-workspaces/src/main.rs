@@ -68,7 +68,7 @@ fn run(w: Want, tx: Sender<Got>) {
                 listed(ask(&Request::WorkspaceNew { name: name.clone(), toolchain, network: Some(network), uses: vec![] }))
                     .and_then(|_| open(&name, activation).map(|m| format!("{} made. {m}", title(&name))))),
             Want::Set { name, network, uses, object_cache } => Some(
-                listed(ask(&Request::WorkspaceSet { name: name.clone(), network, uses, object_cache }))
+                listed(ask(&Request::WorkspaceSet { name: name.clone(), network, uses, object_cache, hosts: None }))
                     .map(|_| format!("{} changed", title(&name)))),
             Want::Stop(name) => Some(
                 listed(ask(&Request::WorkspaceStop { name: name.clone() })).map(|_| format!("{} stopped", title(&name)))),

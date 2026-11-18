@@ -418,7 +418,8 @@ pub enum Request {
     /// `WorkspaceList`. A workspace's terminal is a `Console` whose
     /// `app_id` is `workspace/<name>`.
     Workspaces,
-    /// Make a workspace. `network`: "outbound" (the default) or "none".
+    /// Make a workspace. `network`: "outbound" (the default), "registries"
+    /// or "none".
     WorkspaceNew {
         name:      String,
         toolchain: String,
@@ -438,6 +439,10 @@ pub enum Request {
         /// Share compiled objects with linked workspaces (§5.4, W9).
         #[serde(default)]
         object_cache: Option<bool>,
+        /// The hosts a `registries` workspace reaches (dev-tools.md §5.2);
+        /// an empty list is the default registries.
+        #[serde(default)]
+        hosts: Option<Vec<String>>,
     },
     /// Stop its jail (its consoles end); its files stay.
     WorkspaceStop { name: String },

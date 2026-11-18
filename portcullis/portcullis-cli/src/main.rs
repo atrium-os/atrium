@@ -103,8 +103,8 @@ usage:
         bootstrap: replaces the prompt UI until portcullisd lands.
 
     portcullis workspace [list]
-    portcullis workspace new <name> [--toolchain c|shell] [--network outbound|none] [--uses a,b]
-    portcullis workspace set <name> [--network outbound|none] [--uses a,b | --no-uses] [--object-cache on|off]
+    portcullis workspace new <name> [--toolchain c|shell] [--network outbound|registries|none] [--uses a,b]
+    portcullis workspace set <name> [--network outbound|registries|none] [--hosts a,b] [--uses a,b | --no-uses] [--object-cache on|off]
     portcullis workspace stop <name>
     portcullis workspace duplicate <name> <new-name>
     portcullis workspace run <name> [folder]
@@ -1439,7 +1439,8 @@ fn cmd_workspace(args: &[String]) -> ExitCode {
             name, toolchain: flag("--toolchain").unwrap_or_else(|| "c".into()),
             network: flag("--network"), uses: uses.unwrap_or_default(),
         },
-        "set" => Request::WorkspaceSet { name, network: flag("--network"), uses, object_cache: flag("--object-cache").map(|v| v == "on") },
+        "set" => Request::WorkspaceSet { name, network: flag("--network"), uses, object_cache: flag("--object-cache").map(|v| v == "on"),
+                                         hosts: flag("--hosts").map(|v| v.split(',').map(String::from).collect()) },
         "stop" => Request::WorkspaceStop { name },
         "duplicate" => Request::WorkspaceDuplicate { name, new_name: args.get(2).cloned().unwrap_or_default() },
         other => {

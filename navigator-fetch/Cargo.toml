@@ -22,6 +22,10 @@ name = "nuntiusd"
 path = "src/bin/nuntiusd.rs"
 
 [[bin]]
+name = "nuntius-egress"
+path = "src/bin/nuntius-egress.rs"
+
+[[bin]]
 name = "navigator-fetchd"
 path = "src/bin/navigator-fetchd.rs"
 

@@ -499,6 +499,9 @@ allowed_system_uids = [
     #                           setuid by opifexd itself, no jail; opifex.md §7.2)
     65042,   # _opifexsheet: the install sheet, opifex-sheetd (opifex.md §7.1;
              # opifex-sheet-service.sh creates it)
+    65044,   # _egress: a `registries` workspace's proxy, nuntius-egress, one
+             # jail per running workspace, started by portcullisd under the
+             # system worker rule (nuntius-egress-bundle.sh; dev-tools.md §5.2)
 ]
 
 [gid]
@@ -525,6 +528,7 @@ allowed_system_gids = [
     65037,   # _navui
     65038,   # _monstrator
     65042,   # _opifexsheet
+    65044,   # _egress
 ]
 
 
