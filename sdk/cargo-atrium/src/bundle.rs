@@ -3,11 +3,13 @@
 //!
 //! The bundle is a tree as in atrium-bundle-format.md: `atrium.toml`, the
 //! core and each worker at their `entry` paths, the icon, and the runtime
-//! closure (§5 there): every library the programs need, found by reading
-//! their `DT_NEEDED` (never by running them), and the rtld. Base
-//! libraries keep their paths (`lib/`, `usr/lib/`); one found anywhere
-//! else (`usr/local/lib` from pkg, a `DT_RUNPATH`, `$ORIGIN`, a linked
-//! workspace) goes to `usr/lib/`. An app's jail has no
+//! closure (§5 there): every library the programs need that the base
+//! system lacks, found by reading their `DT_NEEDED` (never by running
+//! them). Base libraries (`lib/`, `usr/lib/`) and the rtld aren't shipped:
+//! opifex puts the machine's own copies into the app tree at install and
+//! refreshes them after each base update (opifex.md §7.5). A library found
+//! anywhere else (`usr/local/lib` from pkg, a `DT_RUNPATH`, `$ORIGIN`, a
+//! linked workspace) goes to `usr/lib/`: an app's jail has no
 //! `ld-elf.so.hints`, so the loader looks only in its built-in `/lib` and
 //! `/usr/lib`. `opifex pack` then writes the content
 //! index and, with `--sign`, the signature, and `opifex archive` the
@@ -110,6 +112,11 @@ fn staged_dir(dir: &str) -> &'static str {
     if dir == "lib" { "lib" } else { "usr/lib" }
 }
 
+/// Whether a library in `dir` (of [`LIB_DIRS`]) is the base system's.
+fn is_base_dir(dir: &str) -> bool {
+    dir == "lib" || dir == "usr/lib"
+}
+
 /// One file of the closure: where it is, and where it goes in the bundle.
 #[derive(Debug, PartialEq)]
 pub struct Staged {
@@ -132,10 +139,12 @@ pub fn extra_libs(atrium_toml: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// The runtime closure of `programs`: the rtld and every library they
-/// need, breadth-first, each soname once, and each `extra` library (a
-/// pattern matched in [`LIB_DIRS`]) with what it needs. `root` is where
-/// the base libraries are (`/` in a workspace, the SDK sysroot elsewhere).
+/// The runtime closure of `programs` that the bundle ships: every library
+/// they need that isn't base, breadth-first, each soname once, and each
+/// `extra` library (a pattern matched in [`LIB_DIRS`]) with what it needs.
+/// `root` is where the base libraries are (`/` in a workspace, the SDK
+/// sysroot elsewhere); what's found in its `lib` or `usr/lib` is base, so
+/// it's only checked for, as is the rtld.
 pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Vec<Staged>, String> {
     let mut out: Vec<Staged> = Vec::new();
     let mut seen = BTreeMap::new();
@@ -154,6 +163,9 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 }
                 hit = true;
                 seen.insert(n.clone(), ());
+                if is_base_dir(d) {
+                    continue;
+                }
                 queue.push((from.clone(), n.clone()));
                 out.push(Staged { from, to: format!("{}/{n}", staged_dir(d)) });
             }
@@ -187,7 +199,8 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 };
                 let p = dir.join(so);
                 if p.is_file() {
-                    found = Some((p, format!("usr/lib/{so}")));
+                    let base = ["lib", "usr/lib"].iter().any(|b| dir == root.join(b));
+                    found = Some((p, if base { format!("lib/{so}") } else { format!("usr/lib/{so}") }, base));
                     break;
                 }
             }
@@ -195,12 +208,12 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 for d in LIB_DIRS {
                     let p = root.join(d).join(so);
                     if p.is_file() {
-                        found = Some((p, format!("{}/{so}", staged_dir(d))));
+                        found = Some((p, format!("{}/{so}", staged_dir(d)), is_base_dir(d)));
                         break;
                     }
                 }
             }
-            let Some((from, to)) = found else {
+            let Some((from, to, base)) = found else {
                 return Err(format!(
                     "{label}: needs {so}, which isn't in {} (looked in {}{})",
                     root.display(),
@@ -209,17 +222,18 @@ pub fn closure(programs: &[PathBuf], root: &Path, extra: &[String]) -> Result<Ve
                 ));
             };
             seen.insert(so.clone(), ());
+            // A base library needs only base libraries, and isn't shipped.
+            if base {
+                continue;
+            }
             queue.push((from.clone(), so.clone()));
             out.push(Staged { from, to });
         }
     }
     if let Some(rtld) = need_rtld {
-        let rel = rtld.trim_start_matches('/').to_string();
-        let from = root.join(&rel);
-        if !from.is_file() {
+        if !root.join(rtld.trim_start_matches('/')).is_file() {
             return Err(format!("the programs' loader {rtld} isn't in {}", root.display()));
         }
-        out.insert(0, Staged { from, to: rel });
     }
     Ok(out)
 }
@@ -365,13 +379,13 @@ mod tests {
         std::fs::write(&prog, elf(&["libthr.so.3", "libmine.so.1"], Some("$ORIGIN/vendor"))).unwrap();
         let c = closure(&[prog.clone()], &root, &[]).unwrap();
         let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
-        assert_eq!(tos, ["libexec/ld-elf.so.1", "lib/libthr.so.3", "usr/lib/libmine.so.1", "lib/libc.so.7", "usr/lib/libz.so.6"]);
+        // Base libraries and the rtld come from the machine at install.
+        assert_eq!(tos, ["usr/lib/libmine.so.1"]);
         std::fs::write(root.join("usr/lib/libp_a.so"), elf(&["libc.so.7"], None)).unwrap();
         std::fs::write(root.join("usr/lib/libp_b.so"), elf(&["libthr.so.3"], None)).unwrap();
         let c = closure(&[prog.clone()], &root, &["libp_*.so".into()]).unwrap();
         let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
-        assert!(tos.contains(&"usr/lib/libp_a.so") && tos.contains(&"usr/lib/libp_b.so"), "{tos:?}");
-        assert_eq!(tos.iter().filter(|t| **t == "lib/libthr.so.3").count(), 1, "{tos:?}");
+        assert_eq!(tos, ["usr/lib/libmine.so.1"], "base extra-libs aren't shipped either");
         // pkg's libraries (usr/local/lib) go where the jail's loader looks.
         std::fs::create_dir_all(root.join("usr/local/lib")).unwrap();
         std::fs::write(root.join("usr/local/lib/libdav1d.so.7"), elf(&["libthr.so.3"], None)).unwrap();
@@ -380,8 +394,7 @@ mod tests {
         std::fs::write(&p2, elf(&["libdav1d.so.7"], None)).unwrap();
         let c = closure(&[p2], &root, &["libx_*.so".into()]).unwrap();
         let tos: Vec<&str> = c.iter().map(|s| s.to.as_str()).collect();
-        assert!(tos.contains(&"usr/lib/libdav1d.so.7") && tos.contains(&"usr/lib/libx_1.so"), "{tos:?}");
-        assert!(!tos.iter().any(|t| t.starts_with("usr/local")), "{tos:?}");
+        assert_eq!(tos, ["usr/lib/libx_1.so", "usr/lib/libdav1d.so.7"]);
         let e = closure(&[prog.clone()], &root, &["libq_*.so".into()]).unwrap_err();
         assert!(e.contains("libq_*.so"), "{e}");
         std::fs::write(&prog, elf(&["libnope.so.1"], None)).unwrap();

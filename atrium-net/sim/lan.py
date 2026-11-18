@@ -59,6 +59,7 @@ LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 MAGIC = bytes([99, 130, 83, 99])
 
 mode = "good"
+net_mtu = None  # the network's MTU, in DHCP option 26 and the RAs (`mtu N`, `mtu off`)
 stats = {"discover": 0, "request": 0, "renew": 0, "rebind": 0, "reboot": 0,
          "hostile_sent": 0, "dns": 0, "ping": 0, "arp": 0, "frames": 0,
          "decline": 0, "arp_conflict": 0,
@@ -114,6 +115,8 @@ def dhcp_reply(req, kind, extra=None, yi=None, mangle=None):
     o = [(53, bytes([kind])), (54, ROUTER)]
     if kind != 6:
         o += [(1, bytes([255, 255, 255, 0])), (3, ROUTER), (6, DNS), (51, struct.pack("!I", LEASE))]
+        if net_mtu:
+            o.append((26, struct.pack("!H", net_mtu)))
     if extra:
         o = [x for x in o if x[0] not in {k for k, _ in extra}] + extra
     b += opts(o)
@@ -442,7 +445,7 @@ def rdnss(life, servers):
 
 def good_ra():
     pi = bytes([3, 4, 64, 0xC0]) + struct.pack("!III", 86400, 14400, 0) + PREFIX
-    mtu = bytes([5, 1, 0, 0]) + struct.pack("!I", 1500)
+    mtu = bytes([5, 1, 0, 0]) + struct.pack("!I", net_mtu or 1500)
     sll = bytes([1, 1]) + RMAC
     flags = {"d6-info": 0x40, "d6-addr": 0xC0, "d6-hostile": 0xC0}.get(d6, 0)
     body = bytes([64, flags]) + struct.pack("!HII", 1800, 0, 0) + pi + mtu + sll + rdnss(600, [DNS6, R_LL])
@@ -666,7 +669,7 @@ def frame(f):
 
 
 def main():
-    global mode, mode6, web, d6, conflict, declined, mdns, mdns_printer
+    global mode, mode6, web, d6, conflict, declined, mdns, mdns_printer, net_mtu
     lan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -715,6 +718,10 @@ def main():
                 print(f"lan: {w}", flush=True)
                 lan.sendto(good_ra(), GUEST)
             ws = w.split()
+            if len(ws) == 2 and ws[0] == "mtu":
+                net_mtu = None if ws[1] == "off" else int(ws[1])
+                print(f"lan: mtu {net_mtu}", flush=True)
+                lan.sendto(good_ra(), GUEST)
             if ws and ws[0] in ("mdns-printer", "mdns-flood", "mdns-off"):
                 mdns = ws[0]
                 if ws[0] == "mdns-printer" and len(ws) == 3:

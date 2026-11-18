@@ -72,6 +72,28 @@ pub(super) fn num(x: f64) -> String {
 
 /// Text as `text:p` paragraphs: one per line, runs of spaces as `text:s`, tabs as
 /// `text:tab` (ODF collapses plain whitespace).
+/// A link's target as ODF writes it: a place in the workbook with `.` between
+/// sheet and cell (`#Sheet2.A1`).
+fn odf_href(t: &str) -> String {
+    match t.strip_prefix('#').and_then(|p| p.rsplit_once('!')) {
+        Some((sheet, cell)) => format!("#{sheet}.{cell}"),
+        None => t.to_string(),
+    }
+}
+
+/// The cell's text as paragraphs, inside a `text:a` when the cell has a link.
+fn cell_paras(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, text: &str) {
+    match wb.link(s, r, c) {
+        Some(l) => {
+            let mut inner = String::new();
+            paragraphs(&mut inner, text);
+            let open = format!(r#"<text:p><text:a xlink:type="simple" xlink:href="{}">"#, esc_attr(&odf_href(&l.target)));
+            out.push_str(&inner.replace("<text:p>", &open).replace("</text:p>", "</text:a></text:p>"));
+        }
+        None => paragraphs(out, text),
+    }
+}
+
 fn paragraphs(out: &mut String, s: &str) {
     for line in s.split('\n') {
         out.push_str("<text:p>");
@@ -869,7 +891,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
                 }
             }
             note(out, wb, s, r, c);
-            paragraphs(out, &wb.formatted(officina_grid::CellAddr::new(s, r, c)).text);
+            cell_paras(out, wb, s, r, c, &wb.formatted(officina_grid::CellAddr::new(s, r, c)).text);
         }
         Value::Str(t) => {
             out.push_str(r#" office:value-type="string""#);
@@ -880,12 +902,12 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
             }
             out.push_str(r#" calcext:value-type="string">"#);
             note(out, wb, s, r, c);
-            paragraphs(out, t);
+            cell_paras(out, wb, s, r, c, t);
         }
         Value::Bool(b) => {
             let _ = write!(out, r#" office:value-type="boolean" office:boolean-value="{b}" calcext:value-type="boolean">"#);
             note(out, wb, s, r, c);
-            paragraphs(out, if *b { "TRUE" } else { "FALSE" });
+            cell_paras(out, wb, s, r, c, if *b { "TRUE" } else { "FALSE" });
         }
         Value::Err(e) => {
             let t = match e {
@@ -894,7 +916,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
             };
             out.push_str(r#" office:value-type="string" office:string-value="" calcext:value-type="error">"#);
             note(out, wb, s, r, c);
-            paragraphs(out, t);
+            cell_paras(out, wb, s, r, c, t);
         }
     }
     out.push_str("</table:table-cell>");
@@ -941,8 +963,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             extra += (b - a + 1) as usize;
         }
     }
-    // Commented cells, written even when empty, to carry the comment.
-    for &(r, c) in wb.comments(s).keys() {
+    // Commented and linked cells, written even when empty, to carry them.
+    for &(r, c) in wb.comments(s).keys().chain(wb.links(s).keys()) {
         if r < ODS_ROWS && c < ODS_COLS {
             cells.push((r, c));
         }

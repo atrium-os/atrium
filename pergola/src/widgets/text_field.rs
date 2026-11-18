@@ -144,10 +144,23 @@ impl View for TextField {
 
         let style = |color| TextStyle { family: font::SANS.into(), size: type_size::MD, weight: Weight::Regular, color };
         let (display, map) = shown(&edit);
-        let text_x = rect.x() + space::SM;
+        // Text, selection and caret are cut to the field's inside; while
+        // focused, a line longer than the field slides left to keep the
+        // caret in view.
+        let clip = Rect::new(inner.x() + space::XS, inner.y(), (inner.w() - 2.0 * space::XS).max(0.0), inner.h());
+        let clip_id = ctx.tree.insert(Some(bg_id), Node::layer(clip, 1.0, true));
+        ctx.set_flex(clip_id, crate::layout::FlexStyle { free: true, ..Default::default() });
+        let width_of = |t: &str| Node::measure_text(t, &style(theme.text_primary())).w;
+        let caret_byte = match edit.preedit() {
+            Some(p) => map(edit.caret()) + if edit.is_secret() { 0 } else { p.cursor },
+            None => map(edit.caret()),
+        };
+        let room = clip.x() + clip.w() - (rect.x() + space::SM) - CARET_W;
+        let shift = if focused { (width_of(&display[..caret_byte.min(display.len())]) - room).max(0.0) } else { 0.0 };
+        let text_x = rect.x() + space::SM - shift;
         let line_h = Node::measure_text("Mg", &style(theme.text_primary())).h;
         let text_y = rect.y() + (rect.h() - line_h) / 2.0;
-        let x_at = |byte: usize| text_x + Node::measure_text(&display[..byte], &style(theme.text_primary())).w;
+        let x_at = |byte: usize| text_x + width_of(&display[..byte]);
 
         // Selection, behind the text (shown only while focused).
         let sel = edit.selection();
@@ -157,7 +170,7 @@ impl View for TextField {
         } else {
             Rect::new(text_x, text_y, 0.0, 0.0)
         };
-        ctx.tree.insert(Some(bg_id), Node::Rect { rect: sel_rect, fill: theme.selection_bg(), radius: 0.0 });
+        ctx.tree.insert(Some(clip_id), Node::Rect { rect: sel_rect, fill: theme.selection_bg(), radius: 0.0 });
 
         let (content, color) = if display.is_empty() {
             (self.placeholder.clone(), theme.text_tertiary())
@@ -165,19 +178,15 @@ impl View for TextField {
             (display.clone(), theme.text_primary())
         };
         let size = Node::measure_text(&content, &style(color));
-        ctx.tree.insert(Some(bg_id), Node::Text { rect: Rect::new(text_x, text_y, size.w, size.h), content, style: style(color) });
+        ctx.tree.insert(Some(clip_id), Node::Text { rect: Rect::new(text_x, text_y, size.w, size.h), content, style: style(color) });
 
         // The caret (and the composition's underline, while composing).
         let caret_rect = if focused && sel.is_empty() {
-            let at = match edit.preedit() {
-                Some(p) => map(edit.caret()) + if edit.is_secret() { 0 } else { p.cursor },
-                None => map(edit.caret()),
-            };
-            Rect::new(x_at(at), text_y, CARET_W, line_h)
+            Rect::new(x_at(caret_byte), text_y, CARET_W, line_h)
         } else {
             Rect::new(text_x, text_y, 0.0, 0.0)
         };
-        ctx.tree.insert(Some(bg_id), Node::Rect { rect: caret_rect, fill: theme.accent_fg(), radius: 0.0 });
+        ctx.tree.insert(Some(clip_id), Node::Rect { rect: caret_rect, fill: theme.accent_fg(), radius: 0.0 });
         let under = match edit.preedit() {
             Some(p) if focused => {
                 let a = x_at(map(edit.caret()));
@@ -186,7 +195,7 @@ impl View for TextField {
             }
             _ => Rect::new(text_x, text_y, 0.0, 0.0),
         };
-        ctx.tree.insert(Some(bg_id), Node::Rect { rect: under, fill: theme.text_primary(), radius: 0.0 });
+        ctx.tree.insert(Some(clip_id), Node::Rect { rect: under, fill: theme.text_primary(), radius: 0.0 });
 
         ctx.focusable(bg_id);
         if self.autofocus {
@@ -300,6 +309,32 @@ mod tests {
     }
 
     const T: Token = [3; 16];
+
+    /// The field's text node, and the clip box it sits in.
+    fn text_and_clip(tree: &crate::node::NodeTree) -> (Rect, Rect) {
+        let (id, t) = tree.iter().find(|(_, n)| matches!(n, Node::Text { .. })).unwrap();
+        let clip = tree.parent_of(id).and_then(|p| tree.get(p)).unwrap();
+        assert!(matches!(clip, Node::Stack { clip: true, .. }), "the text is cut to the field");
+        (t.rect(), clip.rect())
+    }
+
+    #[test]
+    fn a_long_line_is_cut_to_the_field_and_slides_to_keep_the_caret_in_view() {
+        let long = "ipps://printer.example.internal:631/ipp/print/a-very-long-queue";
+        // Not focused, as a placeholder: from the left, cut at the edge.
+        let field = TextField::new(Mutable::new(TextEdit::default())).placeholder(long).width(200.0);
+        let (tree, _) = crate::view::render(&Form { field }, crate::theme::Semantic::LIGHT);
+        let (t, clip) = text_and_clip(&tree);
+        assert_eq!(t.x(), space::SM);
+        assert!(t.w() > 200.0 && clip.x() + clip.w() <= 200.0, "{t:?} in {clip:?}");
+        // Typed and focused, the caret at the end: the line's end shows.
+        let (mut app, _, _) = setup(false, long);
+        app.handle_event(key(Key::End, Modifiers::default()));
+        app.tick();
+        let (t, clip) = text_and_clip(app.tree());
+        let end = t.x() + t.w();
+        assert!(end <= clip.x() + clip.w() && end > clip.x() + clip.w() - 10.0, "{t:?} in {clip:?}");
+    }
 
     #[test]
     fn a_chord_is_never_typed() {

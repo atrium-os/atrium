@@ -84,6 +84,8 @@ pub enum GridOp {
     Merges { sheet: u16, list: Vec<Rect> },
     /// Comments set, or taken away (`None`), on cells of a sheet, in order.
     Comments { sheet: u16, set: Vec<(u32, u32, Option<crate::comments::Comment>)> },
+    /// Links set, or taken away (`None`), on cells of a sheet, in order.
+    Links { sheet: u16, set: Vec<(u32, u32, Option<crate::links::Link>)> },
 }
 
 impl GridOp {
@@ -237,6 +239,12 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::Links { sheet, set } => {
+                w.u8(18);
+                w.u16(*sheet);
+                crate::links::encode(&mut w, set);
+                return w.into_bytes();
+            }
             GridOp::Comments { sheet, set } => {
                 w.u8(17);
                 w.u16(*sheet);
@@ -373,6 +381,14 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 18 {
+            let sheet = r.u16()?;
+            let set = crate::links::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Links { sheet, set });
         }
         if kind == 17 {
             let sheet = r.u16()?;
@@ -535,6 +551,12 @@ impl Op<Workbook> for GridOp {
                 Ok(old) => GridOp::RenameSheet { sheet, name: old },
                 Err(_) => GridOp::Batch(Vec::new()),
             },
+            GridOp::Links { sheet, set } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::Links { sheet, set: wb.set_links(sheet, set) }
+            }
             GridOp::Comments { sheet, set } => {
                 if sheet as usize >= wb.sheet_count() {
                     return GridOp::Batch(Vec::new());

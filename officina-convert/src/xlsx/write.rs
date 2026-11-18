@@ -438,6 +438,23 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
         o.extend_from_slice(b"</mergeCells>");
     }
     super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb), &mut o);
+    let links = wb.links(s);
+    if !links.is_empty() {
+        o.extend_from_slice(b"<hyperlinks>");
+        let mut ext = 0;
+        for (&(r, c), l) in links {
+            match l.target.strip_prefix('#') {
+                Some(place) => {
+                    let _ = write!(o, r#"<hyperlink ref="{}" location="{}"/>"#, a1(r, c), crate::xml::esc(place));
+                }
+                None => {
+                    ext += 1;
+                    let _ = write!(o, r#"<hyperlink ref="{}" r:id="rIdL{ext}"/>"#, a1(r, c));
+                }
+            }
+        }
+        o.extend_from_slice(b"</hyperlinks>");
+    }
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
     if wb.charts().iter().any(|c| c.anchor.sheet == s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
@@ -664,7 +681,8 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         let charts: Vec<usize> = (1..=wb.charts().len()).filter(|&i| wb.charts()[i - 1].anchor.sheet as usize == s).collect();
         let pivots: Vec<usize> = (0..wb.pivots().len()).filter(|&i| wb.pivots()[i].dest.sheet as usize == s).collect();
         let noted = !wb.comments(s as u16).is_empty();
-        if !mine.is_empty() || !charts.is_empty() || !pivots.is_empty() || noted {
+        let external: Vec<&str> = wb.links(s as u16).values().filter(|l| l.is_external()).map(|l| &*l.target).collect();
+        if !mine.is_empty() || !charts.is_empty() || !pivots.is_empty() || noted || !external.is_empty() {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
@@ -679,6 +697,9 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
                 }
                 dr.push_str("</Relationships>");
                 z.add(&format!("xl/drawings/_rels/drawing{}.xml.rels", s + 1), dr.as_bytes())?;
+            }
+            for (j, t) in external.iter().enumerate() {
+                r.push_str(&format!(r#"<Relationship Id="rIdL{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{}" TargetMode="External"/>"#, j + 1, crate::xml::esc(t)));
             }
             if noted {
                 r.push_str(&format!(r#"<Relationship Id="rIdCm" Type="{}" Target="../comments{}.xml"/><Relationship Id="rIdVml" Type="{}" Target="../drawings/vmlDrawing{}.vml"/>"#, super::comments::COMMENTS_REL, s + 1, super::comments::VML_REL, s + 1));

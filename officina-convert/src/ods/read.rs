@@ -706,6 +706,8 @@ use officina_grid::condfmt::Dxf;
 /// A cell being read.
 #[derive(Default)]
 struct CellIn {
+    /// The address of the first `text:a` in its text.
+    link: Option<String>,
     vtype: String,
     value: Option<String>,
     formula: Option<String>,
@@ -715,6 +717,18 @@ struct CellIn {
     paras: u32,
     /// A matrix (array) formula's rows and columns.
     matrix: Option<(u32, u32)>,
+}
+
+/// An ODF link target as ours: a place `#Sheet2.A1` becomes `#Sheet2!A1`
+/// when what follows the last `.` is a cell (sheets may not exist yet).
+fn from_odf_href(h: &str) -> String {
+    if let Some((sheet, cell)) = h.strip_prefix('#').and_then(|p| p.rsplit_once('.')) {
+        let first = cell.split(':').next().unwrap_or("").replace('$', "");
+        if !sheet.is_empty() && officina_grid::addr::parse_a1(&first).is_some() {
+            return format!("#{}!{cell}", sheet.trim_start_matches('$'));
+        }
+    }
+    h.to_string()
 }
 
 /// An `office:annotation` being read.
@@ -786,6 +800,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     let mut annotation_depth = 0u32;
     // The comment being read, and the sheet's comments so far.
     let mut ann: Option<Annotation> = None;
+    // Links of the sheet being read: cell and `xlink:href`.
+    let mut links: Vec<(u32, u32, String)> = Vec::new();
     let mut comments: Vec<(u32, u32, Option<officina_grid::comments::Comment>)> = Vec::new();
     // Frames (charts, images) and the one being read, with its depth.
     let mut frames: Vec<super::chart::FrameIn> = Vec::new();
@@ -942,12 +958,19 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             (None, None) => None,
                             (r, c) => Some((r.unwrap_or(1), c.unwrap_or(1))),
                         };
-                        let c = CellIn { vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix };
+                        let c = CellIn { link: None, vtype, value, formula: a.get("table:formula").cloned(), style: a.get("table:style-name").cloned(), repeat, text: String::new(), paras: 0, matrix };
                         if empty {
                             row_cells.push((col, repeat, c));
                             col += repeat as u64;
                         } else {
                             cell = Some(c);
+                        }
+                    }
+                    b"text:a" => {
+                        if let Some(c) = cell.as_mut() {
+                            if c.link.is_none() {
+                                c.link = attrs(e).get("xlink:href").cloned();
+                            }
                         }
                     }
                     b"text:p" | b"text:h" => {
@@ -1253,7 +1276,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:database-range" => filters.extend(db.take()),
                     b"text:p" | b"text:h" => in_p = false,
                     b"table:table-cell" | b"table:covered-table-cell" => {
-                        if let Some(c) = cell.take() {
+                        if let Some(mut c) = cell.take() {
+                            if let (Some(href), true) = (c.link.take(), row < MAX_ROWS as u64 && col < MAX_COLS as u64) {
+                                if links.len() < officina_grid::links::MAX_LINKS {
+                                    links.push((row as u32, col as u32, href));
+                                }
+                            }
                             let n = c.repeat;
                             row_cells.push((col, n, c));
                             col += n as u64;
@@ -1342,6 +1370,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
                             wb.set_merges(s, std::mem::take(&mut merges));
                             wb.set_comments(s, std::mem::take(&mut comments));
+                            let set = std::mem::take(&mut links).into_iter().map(|(r, c, h)| (r, c, officina_grid::links::Link::new(&from_odf_href(&h)))).filter(|x| x.2.is_some()).collect();
+                            wb.set_links(s, set);
                         }
                     }
                     _ => {}

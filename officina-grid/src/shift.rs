@@ -429,25 +429,14 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::cond_formats(wb, &cfs));
     }
 
-    // Comments: with their cells; those on deleted cells go.
-    let cm = wb.comments(sheet);
-    if !cm.is_empty() {
-        let mut set: Vec<_> = Vec::new();
-        let mut moved = Vec::new();
-        for (&(r, c), k) in cm {
-            match s.map_cell(r, c) {
-                Some(to) if to == (r, c) => {}
-                Some(to) => {
-                    set.push((r, c, None));
-                    moved.push((to.0, to.1, Some(k.clone())));
-                }
-                None => set.push((r, c, None)),
-            }
-        }
-        set.extend(moved);
-        if !set.is_empty() {
-            ops.push(GridOp::Comments { sheet, set });
-        }
+    // Comments and links: with their cells; those on deleted cells go.
+    let set = crate::links::moved(wb.comments(sheet), |r, c| s.map_cell(r, c));
+    if !set.is_empty() {
+        ops.push(GridOp::Comments { sheet, set });
+    }
+    let set = crate::links::moved(wb.links(sheet), |r, c| s.map_cell(r, c));
+    if !set.is_empty() {
+        ops.push(GridOp::Links { sheet, set });
     }
 
     // Merged cells: they move, grow by what's inserted inside and shrink by

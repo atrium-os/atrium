@@ -21,6 +21,7 @@ const SIOCGIFFLAGS: u64 = ioc(IOC_IN | IOC_OUT, b'i', 17, IFREQ);
 const SIOCDIFADDR: u64 = ioc(IOC_IN, b'i', 25, IFREQ);
 const SIOCAIFADDR: u64 = ioc(IOC_IN, b'i', 43, 68);
 const SIOCSIFMTU: u64 = ioc(IOC_IN, b'i', 52, IFREQ);
+const SIOCGIFMTU: u64 = ioc(IOC_IN | IOC_OUT, b'i', 51, IFREQ);
 const IFGROUPREQ: usize = 40;
 const SIOCAIFGROUP: u64 = ioc(IOC_IN, b'i', 135, IFGROUPREQ);
 const SIOCDIFGROUP: u64 = ioc(IOC_IN, b'i', 137, IFGROUPREQ);
@@ -137,6 +138,18 @@ impl Ifc {
         Ok(())
     }
 
+    /// The IPv6 link MTU a router advertised (0: none). The kernel keeps it
+    /// until a later RA says otherwise, and refuses to raise it from
+    /// userland (SIOCSIFINFO_IN6 checks against the lowered value).
+    pub fn linkmtu6(&self, name: &str) -> io::Result<u32> {
+        let mut r = [0u8; IN6_NDIREQ];
+        r[..16].copy_from_slice(&ifreq(name)[..16]);
+        if unsafe { ioctl(self.s6.as_raw_fd(), SIOCGIFINFO_IN6, r.as_mut_ptr()) } != 0 {
+            return err("SIOCGIFINFO_IN6");
+        }
+        Ok(u32::from_ne_bytes(r[16..20].try_into().unwrap()))
+    }
+
     fn nd6_flags(&self, name: &str, set: u32, clear: u32) -> io::Result<()> {
         let mut r = [0u8; IN6_NDIREQ];
         r[..16].copy_from_slice(&ifreq(name)[..16]);
@@ -251,6 +264,14 @@ impl Ifc {
             return err("SIOCDIFADDR");
         }
         Ok(())
+    }
+
+    pub fn mtu(&self, name: &str) -> io::Result<u32> {
+        let mut r = ifreq(name);
+        if unsafe { ioctl(self.s.as_raw_fd(), SIOCGIFMTU, r.as_mut_ptr()) } != 0 {
+            return err("SIOCGIFMTU");
+        }
+        Ok(i32::from_ne_bytes(r[16..20].try_into().unwrap()) as u32)
     }
 
     pub fn set_mtu(&self, name: &str, mtu: u16) -> io::Result<()> {

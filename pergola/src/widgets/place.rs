@@ -272,7 +272,7 @@ mod tests {
             ctx.pop();
         });
         let (tree, _) = render(&view, crate::theme::Semantic::LIGHT);
-        let slots: Vec<Rect> = tree.iter().filter(|(id, n)| matches!(n, Node::Stack { .. }) && tree.style(*id).is_some_and(|s| s.free)).map(|(_, n)| n.rect()).collect();
+        let slots: Vec<Rect> = tree.iter().filter(|(id, n)| matches!(n, Node::Stack { clip: false, .. }) && tree.style(*id).is_some_and(|s| s.free)).map(|(_, n)| n.rect()).collect();
         assert_eq!(slots.len(), 2);
         // Layout rounds to whole px.
         let label_w = text_w("Email address", type_size::MD, Weight::Regular).round();
