@@ -67,6 +67,8 @@ pub enum Cmd {
     ChartDelete,
     /// Lets the chart go.
     ChartDone,
+    /// The value list of filter column `col`, opened.
+    FilterOpen(u32),
     /// The value list: value `i` of the column chosen or not.
     FilterToggle(usize),
     /// Every value the search shows chosen (`true`) or none of them.
@@ -1188,7 +1190,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1341,6 +1343,10 @@ impl View for Sheets {
                     press.set(pergola::clipboard::current_activation());
                     cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::OpenLink));
                 }
+                // The cursor cell's list button, or Alt+Down: its list.
+                GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
+                // A filter column's button: its value list.
+                GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
                 a => Self::act(&doc, &src, &rev, a),
             })
             .emit(ctx);
@@ -2017,6 +2023,11 @@ impl Sheets {
                     self.changed();
                     false
                 }
+                Cmd::FilterOpen(col) => {
+                    self.choose_values(col);
+                    self.changed();
+                    false
+                }
                 Cmd::FilterApply => {
                     self.apply_values();
                     false
@@ -2354,6 +2365,41 @@ mod tests {
         run(Cmd::Valid(ValidCmd::Remove));
         assert!(s.doc.borrow().wb.validations().is_empty());
         assert!(s.doc.borrow_mut().type_into(4, 1, "9"));
+    }
+
+    #[test]
+    fn a_list_cell_s_button_and_alt_down_open_its_list() {
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, Validation};
+        let mut d = Doc::new("v");
+        let f = d.wb.validation_formula("\"Yes,No\"", 0, (1, 1)).unwrap();
+        d.wb.add_validation(Validation::new(0, vec![officina_grid::Rect { sheet: 0, r0: 1, c0: 1, r1: 5, c1: 1 }], Allow::List, CmpOp::Between, Some(f), None)).unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let buttons = |t: &pergola::NodeTree| t.iter().filter_map(|(_, n)| match n { Node::Rect { rect, radius, .. } if *radius == 3.0 && rect.w() == 16.0 && rect.h() == 16.0 => Some(*rect), _ => None }).collect::<Vec<_>>();
+        // No button away from the rule's cells.
+        assert!(buttons(&pergola::view::render(&s, pergola::theme::Semantic::LIGHT).0).is_empty());
+        let mut g = s.grid.get_cloned();
+        g.select(2, 1);
+        s.grid.set(g);
+        let mut app = App::new(s.clone());
+        app.tick();
+        let b = buttons(app.tree());
+        assert_eq!(b.len(), 1, "{b:?}");
+        let at = pergola::geom::Point::new(b[0].x() + 8.0, b[0].y() + 8.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        s.take_cmds();
+        let p = s.list.get_cloned();
+        assert!(p.open && (p.row, p.col) == (2, 1) && p.items == ["Yes", "No"], "{p:?}");
+        s.cmds.lock().unwrap().push(Cmd::ListCancel);
+        s.take_cmds();
+        // Alt+Down does the same.
+        app.handle_event(Event::Key { kind: KeyEventKind::Down, key: Key::Down, modifiers: Modifiers { alt: true, ..Modifiers::default() }, chars: String::new() });
+        app.tick();
+        s.take_cmds();
+        assert!(s.list.get_cloned().open);
+        assert_eq!(s.grid.get_cloned().cursor, (2, 1));
     }
 
     #[test]

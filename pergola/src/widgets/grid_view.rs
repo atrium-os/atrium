@@ -339,6 +339,9 @@ pub struct GridFloat {
     /// A click picks it, a drag moves it, its corner sizes it (charts);
     /// otherwise presses go to the cells under it.
     pub movable: bool,
+    /// A press on it is [`GridAction::PressFloat`] (a button in a cell), not
+    /// a press on the cells.
+    pub pressable: bool,
 }
 
 /// `n` moved by (dx, dy): rectangles, text and fills.
@@ -445,6 +448,10 @@ pub enum GridAction {
     /// Ctrl (or Cmd) + click on cell (`row`, `col`): follow what it links
     /// to, if anything. The click's activation is current.
     Follow { row: u32, col: u32 },
+    /// A press on pressable float `key`.
+    PressFloat(u64),
+    /// Alt+Down on cell (`row`, `col`): offer what it can hold (a list).
+    Choose { row: u32, col: u32 },
 }
 
 impl GridState {
@@ -544,6 +551,7 @@ impl GridView {
         let t = ctx.theme;
         // Movable floats as drawn this frame (key, content rect), for presses.
         let placed: Rc<std::cell::RefCell<Vec<(u64, [f64; 4])>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let buttons: Rc<std::cell::RefCell<Vec<(u64, [f64; 4])>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
         let (rows, cols) = (src.rows(), src.cols());
         let ext = [src.col_left(cols), src.row_top(rows)];
         let mut st = self.scroll.get();
@@ -697,6 +705,9 @@ impl GridView {
                 if f.movable {
                     placed.borrow_mut().push((f.key, f.at));
                 }
+                if f.pressable {
+                    buttons.borrow_mut().push((f.key, f.at));
+                }
                 ctx.pop();
             }
             ctx.pop();
@@ -721,6 +732,7 @@ impl GridView {
         let drag: Rc<dyn Fn(DragPhase, crate::geom::Point)> = {
             let (src, sc, gst, act) = (src.clone(), self.scroll.clone(), self.state.clone(), self.on_action.clone());
             let placed = placed.clone();
+            let buttons = buttons.clone();
             Rc::new(move |phase: DragPhase, p: crate::geom::Point| {
                 let st = sc.get();
                 let (cx, cy) = geom.content(&st, p);
@@ -748,6 +760,16 @@ impl GridView {
                     return;
                 }
                 if phase == DragPhase::Start {
+                    let pressed = buttons.borrow().iter().rev().find(|(_, a)| cx >= a[0] && cx < a[0] + a[2] && cy >= a[1] && cy < a[1] + a[3]).map(|b| b.0);
+                    if let Some(key) = pressed {
+                        commit(&mut g, &act);
+                        g.picked = None;
+                        gst.set(g);
+                        if let Some(f) = &act {
+                            f(GridAction::PressFloat(key));
+                        }
+                        return;
+                    }
                     let hit = placed.borrow().iter().rev().find(|(_, a)| cx >= a[0] && cx < a[0] + a[2] + 4.0 && cy >= a[1] && cy < a[1] + a[3] + 4.0).copied();
                     if let Some((key, a)) = hit {
                         commit(&mut g, &act);
@@ -1457,6 +1479,10 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         }
     }
 
+    if key == Key::Down && m.alt && !cmd {
+        send(GridAction::Choose { row: g.cursor.0, col: g.cursor.1 });
+        return true;
+    }
     let page = |st: &ScrollState| -> i64 {
         let h = geom.body.h() as f64;
         let a = src.row_at(st.physics.y);
@@ -1586,11 +1612,13 @@ mod tests {
         cells: RefCell<HashMap<(u32, u32), String>>,
         merges: RefCell<Vec<CellRange>>,
         frozen: std::cell::Cell<(u32, u32)>,
+        /// Pressable floats: key and where.
+        buttons: RefCell<Vec<(u64, [f64; 4])>>,
     }
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), buttons: Default::default() }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -1639,6 +1667,9 @@ mod tests {
         }
         fn frozen(&self) -> (u32, u32) {
             self.frozen.get()
+        }
+        fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
+            self.buttons.borrow().iter().map(|&(key, at)| GridFloat { key, at, nodes: Rc::new(Vec::new()), movable: false, pressable: true }).collect()
         }
     }
 
@@ -1727,6 +1758,28 @@ mod tests {
         assert!(d.iter().any(|d| matches!(d, NodeDelta::Added { node: Node::Text { content, .. }, .. } if content == "here")), "the cell at row 999,999,001 sent");
         let row_label = "999999001".to_string();
         assert!(app.tree().iter().any(|(_, n)| matches!(n, Node::Text { content, .. } if *content == row_label)), "its row header");
+    }
+
+    #[test]
+    fn a_button_in_a_cell_and_alt_down_reach_the_app() {
+        let (mut app, grid, _, state, log) = host(100, 10);
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        // A button at the right of B3 (64 px columns, 20 px rows).
+        grid.buttons.borrow_mut().push((7, [64.0 + 48.0, 40.0, 16.0, 20.0]));
+        app.tick();
+        let click = |app: &mut App<Host>, x: f32, y: f32| {
+            app.handle_event(Event::PointerDown { at: Point::new(x, y) });
+            app.handle_event(Event::PointerUp { at: Point::new(x, y) });
+            app.tick();
+        };
+        click(&mut app, hw + 64.0 + 56.0, HEADER_H + 45.0);
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::PressFloat(7))), "{:?}", log.borrow());
+        // Elsewhere in B3, the cell is chosen as usual.
+        click(&mut app, hw + 64.0 + 10.0, HEADER_H + 45.0);
+        assert_eq!(state.get_cloned().cursor, (2, 1));
+        key(&mut app, Key::Down, "", Modifiers { alt: true, ..Modifiers::default() });
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Choose { row: 2, col: 1 })));
+        assert_eq!(state.get_cloned().cursor, (2, 1));
     }
 
     #[test]

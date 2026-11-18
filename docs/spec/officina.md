@@ -3693,7 +3693,6 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - An Information rule keeps the value and says why in the status line.
   - The cursor cell's input prompt shows beside it, as a comment does. A list cell adds the hint "Data ▸ Choose from List…", which opens the list at the right of the grid, with a search. A press types the item in, and the rule checks it as it checks typing.
 - **Not yet:**
-  - A drop-down button in the cell, and Alt+↓.
   - Checking pasted values (Excel doesn't either).
   - Circling invalid data.
 - **Gates:** officina-grid `rules_allow_and_refuse_values` and `rules_are_undone_saved_and_move_with_rows`; officina-convert `tests/validation.rs`; atrium-sheets `validation_refuses_warns_and_offers_its_list`.
@@ -3713,8 +3712,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Saving:** a cell has one rule, as in Excel. A saved rule's cells leave every other rule, and a rule left with no cells goes. A new rule goes first; a changed one keeps its place.
   - **Deleting:** Delete Rule removes the rule being changed. Data ▸ Clear Validation takes rules off the selection's cells only.
   - Each change is one undo step.
+- **The list in the cell.** The cursor's cell shows a ▾ button at its right when its rule offers a list; a press on it, or Alt+↓, opens the list. A filter column's ▾ button opens its value list the same way. pergola: `GridFloat::pressable` floats report `GridAction::PressFloat` instead of choosing cells, and Alt+↓ reports `GridAction::Choose`.
 - **Not yet:** applying a changed rule to every cell with the same settings (Excel's "apply these changes to all other cells"), and choosing a range by dragging while the panel is open.
-- **Gates:** atrium-sheets `rules_are_made_changed_and_cleared` and `the_validation_panel_makes_changes_and_deletes_rules`.
+- **Gates:** atrium-sheets `rules_are_made_changed_and_cleared`, `the_validation_panel_makes_changes_and_deletes_rules` and `a_list_cell_s_button_and_alt_down_open_its_list`; pergola `a_button_in_a_cell_and_alt_down_reach_the_app`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
