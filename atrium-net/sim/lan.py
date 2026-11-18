@@ -374,7 +374,7 @@ def tcp_seg(s, d, sport, dport, seq, ack, flags, data=b""):
 
 PORTAL_PAGE = (b"<!doctype html><title>Gate Cafe Wi-Fi</title><h1>Gate Cafe Wi-Fi</h1>"
                b"<form method=post action=/accept><input type=hidden name=terms value=yes>"
-               b"<button>Accept and connect</button></form>")
+               b"<button type=submit>Accept and connect</button></form>")
 DONE_PAGE = b"<!doctype html><title>Connected</title><p>You are online."
 
 
