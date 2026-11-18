@@ -642,6 +642,14 @@ is no build graph between packages to solve. A missing dependency is reported by
 bundle's workspace when the build ran in one; the Atrium catalog's CI does the same, and
 §10.4's second build is the same check run by Atrium.
 
+**Release packaging.** Atrium's own app and service releases are built by this same path,
+not by a separate release script: a clean workspace from the named layers, `--locked`,
+`SOURCE_DATE_EPOCH`, the fixed path. The build only makes the bundle; signing is a
+separate step afterwards with the release keys (key ceremony, §10.4), on a machine that
+never runs the build. Because the shipped bundle and a person's rebuild come from one
+recipe, a rebuild that matches is a check anyone can run on Atrium's releases. The base
+system (kernel, world, base daemons) stays on `make.py` (decision 12) and is outside this.
+
 Not decided: whether a catalog must name its source for every release (recommend:
 required for the Atrium catalog, optional for third-party catalogs, shown on the sheet as
 "source not published" when absent).
@@ -1135,4 +1143,5 @@ opifexd, and `fdpass`.)
     layers (and optional vendor tarball, extra packages); a workspace rebuilds; an
     identical result keeps the publisher's identity, any other installs as a dev app. No
     ports tree or Atrium build system. Source required for the Atrium catalog, optional
-    for third-party ones. *Recommend yes.*
+    for third-party ones. Atrium's own app releases are packaged by the same path, then
+    signed as a separate step. *Recommend yes.*
