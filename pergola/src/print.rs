@@ -270,7 +270,15 @@ mod tests {
         aqueduct::Connection::wrap(a).unwrap()
     }
 
-    fn next(c: &mut Child) -> ChildEvent { c.poll(Duration::from_secs(2)).unwrap().expect("an event") }
+    /// The child's next event, past the parent's persona (sent on attach).
+    fn next(c: &mut Child) -> ChildEvent {
+        loop {
+            match c.poll(Duration::from_secs(2)).unwrap().expect("an event") {
+                ChildEvent::ParentPersona { .. } => continue,
+                e => return e,
+            }
+        }
+    }
 
     /// Poll the app's embeds until printing says something other than Pending.
     fn run(p: &mut Printing, e: &Rc<RefCell<Embeds>>) -> Step {
