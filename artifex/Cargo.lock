@@ -1094,6 +1094,7 @@ dependencies = [
  "aqueduct",
  "fresco-protocol",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "serde",
 ]

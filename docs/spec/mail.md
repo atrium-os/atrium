@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1299,7 +1299,7 @@ Stalwart in the cloud VM, and later a real account):
    app (Nuntius is HTTP only, so those steps find nothing), removing an account's Arca
    items with it, the OAuth sign-in sheet (Microsoft accounts are found but can't be
    added; SRV and MX came later with Nuntius lookups), JMAP needing an API token as its password (bearer only; an API host other
-   than the session's is refused; uploads up to 1 MiB), IMAP IDLE.
+   than the session's is refused; uploads up to 1 MiB), IMAP IDLE (built later, see M8).
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
    **Built on the host (2026-11-18)**: lanes, cards, private addresses and OpenPGP.
@@ -1349,6 +1349,20 @@ Stalwart in the cloud VM, and later a real account):
    a resolver that doesn't answer then a recheck on opening), fetcher 3, wire 1. **Not
    yet**: a VM run against local-unbound, keeping answers across restarts, the provider's
    own verdict (Authentication-Results) for accounts at known providers.
+   **Push by IMAP IDLE built on the host (2026-11-18)**: each IMAP account that signs in
+   gets a watcher on a courier connection of its own (`mail_engine::accounts::watch_inbox`),
+   waiting in `IDLE` on the inbox and renewing it every 25 minutes (RFC 2177's 29, the
+   courier's 31-minute limit). A change the server reports wakes the sync thread for that
+   account alone; several wakes at once are one pass. A server without `IDLE` is polled
+   every 5 minutes as before; a failed connection is retried after 1, 2, 4, 8 then 15
+   minutes; a watch is restarted when the account's servers or sign-in change, and
+   stopped when the account is removed or needs signing in again. With push for every
+   account, a full pass (sends, drafts, other folders) runs every 30 minutes instead of 5.
+   Tests: Dovecot 2 (a new message is reported within seconds; shutting the connection
+   ends the watch), app 2 (a watcher wakes its account and stops; a server without IDLE
+   is polled). The window's "Get mail" still runs a pass at once. Microsoft sign-in waits
+   for Navigator's sign-in sheet (Shankar, 2026-11-18). **Not yet**: JMAP push
+   (EventSource), IDLE on folders other than the inbox, mains/battery intervals.
 
 ## 17. Decisions, with recommendations
 

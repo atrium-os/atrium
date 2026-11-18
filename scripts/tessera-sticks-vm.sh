@@ -23,7 +23,11 @@
 #   4. alice again, then eject: unmounted, generation recorded, key dropped;
 #   5. replugged (a new md over the same image): back for alice;
 #   6. an older copy of the stick (taken before her last writes) is refused
-#      by the kernel (below the key's high-water mark) and shows Locked.
+#      by the kernel (below the key's high-water mark) and shows Locked;
+#   7. a stick alice formats with a recovery code is Locked in bob's session
+#      (his Arca stands in for another machine's), a wrong code is refused,
+#      the right one opens it and keeps its key in his Personal persona, and
+#      replugged it opens for him by itself.
 # Ends "sticks: N failed".
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -132,9 +136,58 @@ sleep 5
 check "the old copy isn't mounted" "" "$(mounted)"
 check "…the kernel said why" yes "$(g "dmesg | tail -40 | grep -q 'below the key.s high-water' && echo yes || echo no")"
 check "…and it shows Locked" yes "$(list_as alice | grep -q "^$PART - .* locked" && echo yes || echo no)"
+check "…as her older copy" yes "$(list_as alice | grep -q "^$PART - .* locked older persona=work" && echo yes || echo no)"
+# No Sigillum in this VM: arcad can't verify her, so it stays shut.
+r=$(g "su -m alice -c '$D --media-socket $S --open-older $PART'")
+check "open read-only needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still not mounted" "" "$(mounted)"
+
+echo "=== 7. a recovery code opens it elsewhere (§7.4)"
+g "mdconfig -d -u $MD3"; sleep 3
+session alice
+MD4=$(g "truncate -s 96m $T/stick2.img && mdconfig -a -t vnode -f $T/stick2.img && true")
+g "gpart create -s gpt $MD4 >/dev/null && gpart add -t ms-basic-data $MD4 >/dev/null"
+PART=${MD4}p1
+sleep 4
+r=$(g "su -m alice -c '$D --media-socket $S --format $PART personal Personal-stick --recovery'")
+CODE=${r##*recovery code }
+check "formatted with a recovery code" yes "$(echo "$CODE" | grep -Eq '^[0-9A-Z]{5}(-[0-9A-Z]{5}){5}$' && echo yes || echo no)"
+check "…and mounted" tessera "$(mounted)"
+K2=$(kid)
+check "the slot is on the stick" 03 "$(g "dd if=/dev/$PART bs=4096 count=1 2>/dev/null | dd bs=1 skip=280 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'")"
+check "the code isn't" 0 "$(g "grep -ac '$CODE' /dev/$PART")"
+g "chmod 755 /media/$PART; su -m alice -c 'echo holiday photos > /media/$PART/note.txt'; chmod 644 /media/$PART/note.txt; sync"
+r=$(g "su -m alice -c '$D --media-socket $S --eject $PART'")
+g "mdconfig -d -u $MD4"; sleep 3
+# Bob's Arca stands in for another machine's: it has never seen this key.
+session bob
+MD5=$(g "mdconfig -a -t vnode -f $T/stick2.img")
+PART=${MD5}p1
+sleep 5
+check "bob's session: Locked, with a recovery code" yes "$(list_as bob | grep -q "^$PART - .* locked recovery" && echo yes || echo no)"
+check "…not mounted" "" "$(mounted)"
+r=$(g "echo AAAAA-BBBBB | su -m bob -c '$D --media-socket $S --adopt $PART personal keep'")
+check "not a code: refused" yes "$(echo "$r" | grep -q 'status 1)' && echo yes || echo no)"
+WRONG=$(echo "$CODE" | sed 's/^./Z/'); [ "$WRONG" = "$CODE" ] && WRONG=$(echo "$CODE" | sed 's/^./Y/')
+r=$(g "echo $WRONG | su -m bob -c '$D --media-socket $S --adopt $PART personal keep'")
+check "a wrong code: refused" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still not mounted" "" "$(mounted)"
+r=$(g "echo $CODE | su -m bob -c '$D --media-socket $S --adopt $PART personal keep'")
+check "the right code opens it" ok "${r%% *}"
+check "…mounted" tessera "$(mounted)"
+check "…alice's note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
+check "…listed as bob's personal stick" yes "$(list_as bob | grep -q "^$PART /media/$PART .*persona=personal" && echo yes || echo no)"
+r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
+g "mdconfig -d -u $MD5"; sleep 3
+MD6=$(g "mdconfig -a -t vnode -f $T/stick2.img")
+PART=${MD6}p1
+sleep 5
+check "kept: replugged, it opens for bob by itself" tessera "$(mounted)"
+r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
+check "ejected" "" "$(mounted)"
 
 echo "=== cleanup"
-g "umount /media/$PART 2>/dev/null; pkill -f 'atrium-dispensatord --rules $T'; sleep 1; mdconfig -d -u $MD3; $KL drop $K >/dev/null 2>&1; true"
+g "umount /media/$PART 2>/dev/null; pkill -f 'atrium-dispensatord --rules $T'; sleep 1; mdconfig -d -u $MD6; $KL drop $K >/dev/null 2>&1; $KL drop $K2 >/dev/null 2>&1; true"
 echo "--- dispensatord log"
 g "cat $T/d.log" | tail -30
 g "rm -rf $T"

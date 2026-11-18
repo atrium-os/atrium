@@ -3522,6 +3522,20 @@ The first step of spreadsheet change review (§16.22's "spreadsheets get the sam
 
 Tests: `officina-grid` `compare::tests` (cells, rows and sheets; formulas taken for our row; taking rows and undo; 300 random pairs where taking every change gives the other copy; the 200,000-row timing), `atrium-sheets` `compare_with_lists_and_takes_changes`.
 
+### 16.69 Inserting and deleting rows and columns in Sheets (2026-11-18)
+
+Sheets had no way to insert or delete rows or columns. `officina-grid::shift::shift_op(wb, sheet, axis, at, n)` now builds that edit (`n` > 0 inserts before `at`, `n` < 0 deletes from it) out of the ops that already exist, so undo, redo, the journal and crash recovery need nothing new:
+
+- The sheet's cells are replaced with themselves moved; formula fills are rewritten row by row and joined again where their relative form is the same (a fill the insert cuts through becomes two pieces that still read `=A1+1`).
+- Every reference to the sheet, on it or from other sheets, follows: a reference into deleted cells becomes `#REF!`; a range loses its deleted part, and grows by rows inserted inside it (inserted at its first row, it moves); whole-column ranges don't move with rows nor whole-row ranges with columns.
+- Styles move with their cells (inserted rows start plain); tables (a table whose header row is deleted goes; columns inserted inside get new names), charts (data and anchor), pivot tables (source and output), conditional-format ranges, the auto-filter and hidden rows move along.
+- Defined names follow as formulas do, and row heights and column widths move with their rows and columns (added the same day: two new ops, `GridOp::Names`, journal tag 9, the names as formula text read against the workbook when applied, and `GridOp::Sizes`, tag 10, a sheet's row or column size overrides swapped whole; test `names_and_sizes_move_too`, which also round-trips the inverse through the journal encoding).
+- Not yet: the absolute references inside conditional-format rules (their ranges move, and relative references with them).
+
+Sheets' Data menu gains Insert Rows Above, Insert Columns Left, Delete Rows and Delete Columns, as many as the selection spans, each one undo step. Compare with… (§16.68) now takes rows added as rows inserted with the other copy's cells, and rows removed as rows deleted, instead of the whole sheet (Take All still takes a sheet with rows added or removed whole).
+
+Gates: `shift::tests` (insert and delete with references on and from other sheets, columns with a table, a fill cut in two, 200 random inserts and deletes undoing exactly, a row inserted into 200,000 rows with a fill: built in 89 ms, applied in 121 ms), `compare::tests` now taking changes one at a time until none are left, `atrium-sheets` `rows_and_columns_are_inserted_and_deleted`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

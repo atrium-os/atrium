@@ -47,6 +47,42 @@ fn reached_from(e: &str, now: i64) -> Reached {
     }
 }
 
+/// Seconds one `IDLE` waits before it is renewed: under the 29 minutes
+/// RFC 2177 allows, and the mail courier's 31-minute limit.
+pub const IDLE_RENEW: u64 = 25 * 60;
+
+/// How a watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// The server has no `IDLE`: the account is polled instead.
+    NoIdle,
+    /// The caller said stop.
+    Stopped,
+}
+
+/// Watch an IMAP account's inbox with `IDLE` (§6.1) on a connection of its
+/// own: `changed()` after each change the server reports (return `false`
+/// to stop). `held` gets a clone of the connection, so another thread can
+/// shut it down to end a wait early. An error is the connection failing.
+pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(UnixStream), changed: &mut dyn FnMut() -> bool) -> Result<Watched, String> {
+    let Protocol::Imap { imap, .. } = &cfg.protocol else { return Ok(Watched::NoIdle) };
+    let item = cfg.incoming_item.ok_or("no sign-in for the incoming server")?;
+    let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(IDLE_RENEW))).map_err(|e| e.to_string())?;
+    held(s.try_clone().map_err(|e| e.to_string())?);
+    let mut session = mail_sync::Session::start(s).map_err(|e| e.to_string())?;
+    if !session.capabilities().iter().any(|c| c.eq_ignore_ascii_case("IDLE")) {
+        let _ = session.logout();
+        return Ok(Watched::NoIdle);
+    }
+    loop {
+        if session.idle("INBOX").map_err(|e| e.to_string())? && !changed() {
+            let _ = session.logout();
+            return Ok(Watched::Stopped);
+        }
+    }
+}
+
 impl Engine {
     /// The accounts Mail can reach, with their settings.
     pub fn configured(&self) -> Vec<(AccountId, AccountConfig)> {

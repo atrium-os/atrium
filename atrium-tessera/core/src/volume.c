@@ -466,9 +466,14 @@ seed_root_dirent(const tessera_block_io_t *shim,
 
 static int
 format_impl(const tessera_block_io_t *io, const tessera_format_opts_t *opts,
-            const tessera_seal_keys_t *seal)
+            const tessera_seal_keys_t *seal, const uint8_t *recovery_slot)
 {
 	if (io == NULL || opts == NULL) return TESSERA_EINVAL;
+	/* A recovery slot (tessera-encryption.md §7.4) is arcad's wrapped
+	 * key: type 3, Argon2id. Only a sealed volume carries one. */
+	if (recovery_slot != NULL && (seal == NULL ||
+	    recovery_slot[0] != TESSERA_KEY_SLOT_RECOVERY || recovery_slot[1] != 1))
+		return TESSERA_EINVAL;
 	if (opts->hash_alg != TESSERA_HASH_ALG_SHA256 &&
 	    opts->hash_alg != TESSERA_HASH_ALG_BLAKE3_256)
 		return TESSERA_EINVAL;
@@ -672,6 +677,12 @@ format_impl(const tessera_block_io_t *io, const tessera_format_opts_t *opts,
 		memcpy(sbp->root_tags[TESSERA_BTREE_KIND_FREE_EXT], tag_free, 16);
 		memcpy(sbp->journal_anchor_tag, anchor, 16);
 		sbp->total_pack_count = 1;
+		if (recovery_slot != NULL) {
+			/* Inside the HMAC: a slot can't be swapped later. */
+			memcpy(&sbp->key_slots[0], recovery_slot,
+			    sizeof(sbp->key_slots[0]));
+			sbp->active_slot_count = 1;
+		}
 		r = tessera_sb_seal(seal, sbp, NULL);
 		if (r != TESSERA_OK) {
 			tessera_free(buf); tessera_free(sbp);
@@ -693,7 +704,7 @@ int
 tessera_volume_format(const tessera_block_io_t *io,
                       const tessera_format_opts_t *opts)
 {
-	return format_impl(io, opts, NULL);
+	return format_impl(io, opts, NULL, NULL);
 }
 
 int
@@ -702,7 +713,18 @@ tessera_volume_format_sealed(const tessera_block_io_t *io,
                              const struct tessera_seal_keys *seal)
 {
 	if (seal == NULL || !VOLUME_SEALING) return TESSERA_EINVAL;
-	return format_impl(io, opts, seal);
+	return format_impl(io, opts, seal, NULL);
+}
+
+int
+tessera_volume_format_sealed_recovery(const tessera_block_io_t *io,
+                                      const tessera_format_opts_t *opts,
+                                      const struct tessera_seal_keys *seal,
+                                      const uint8_t recovery_slot[256])
+{
+	if (seal == NULL || recovery_slot == NULL || !VOLUME_SEALING)
+		return TESSERA_EINVAL;
+	return format_impl(io, opts, seal, recovery_slot);
 }
 
 /* ── offline commit (fsck-repair) ─────────────────────────────────── */

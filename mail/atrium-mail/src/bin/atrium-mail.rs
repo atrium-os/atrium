@@ -273,12 +273,13 @@ fn links() -> mpsc::Receiver<String> {
         };
         loop {
             match ch.recv_any(None) {
-                Ok(Some(atrium_open::Message::Link(url))) if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
+                // From another persona too: a draft holds nothing of either.
+                Ok(Some(atrium_open::Message::Link(url) | atrium_open::Message::Crossed { url, .. })) if url.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) => {
                     if tx.send(url).is_err() {
                         return;
                     }
                 }
-                Ok(Some(atrium_open::Message::Link(_))) => eprintln!("atrium-mail: a link refused: not a mailto: link"),
+                Ok(Some(atrium_open::Message::Link(_) | atrium_open::Message::Crossed { .. })) => eprintln!("atrium-mail: a link refused: not a mailto: link"),
                 Ok(Some(atrium_open::Message::File(_))) => eprintln!("atrium-mail: a file on the document channel: Mail opens none"),
                 Ok(None) => {}
                 Err(e) => {
@@ -307,7 +308,7 @@ fn main() {
     };
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
-    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Box::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
+    let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
     let mut engine = Engine::new(store, Parser { program: jail });
     // Senders whose key couldn't be fetched at arrival are checked again on opening.
     engine.set_dns(Box::new(atrium_mail::accounts::NuntiusDns::default()));

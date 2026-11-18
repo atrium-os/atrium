@@ -3928,6 +3928,8 @@ struct tessera_mount {
 	 * tag): reg_vsize says which, and every registry buffer is sized for
 	 * the larger. */
 	struct tessera_seal_keys *seal;
+	/* Opened with a key loaded TKEY_LOAD_OLDER_RO (§8): never rw. */
+	int                       older_ro;
 	uint32_t                  reg_vsize;
 	/*
 	 * ★ The roots a crash would recover to. [0] = the superblock last
@@ -7737,15 +7739,16 @@ tessera_fs_journal_setup(struct tessera_mount *tmp_)
 static int
 tessera_fs_seal_select(tessera_superblock_t *a, int va,
     tessera_superblock_t *b, int vb, int ronly, uint64_t requested_gen,
-    struct tessera_seal_keys **out_seal, tessera_superblock_t **out_active)
+    struct tessera_seal_keys **out_seal, tessera_superblock_t **out_active,
+    int *out_older_ro)
 {
 	struct tessera_seal_keys *k = NULL;
 	tessera_superblock_t *cand[2] = { va ? a : NULL, vb ? b : NULL };
 	uint8_t vk[32];
 	uint64_t hw = 0;
+	uint32_t kflags = 0;
 	int ok[2] = { 0, 0 }, have = -1, r, why = EINTEGRITY;
 
-	(void)ronly;
 	if (requested_gen != 0) {
 		printf("tessera_fs: sealed volumes keep no snapshots yet "
 		    "(no tessera.gen); refusing\n");
@@ -7761,7 +7764,7 @@ tessera_fs_seal_select(tessera_superblock_t *a, int va,
 		    (cand[i]->incompat_flags & TESSERA_INCOMPAT_SEALED) == 0)
 			continue;
 		if (tessera_keyring_get(cand[i]->master_key_id,
-		    cand[i]->volume_uuid, 0, vk, &hw) == 0)
+		    cand[i]->volume_uuid, 0, vk, &hw, &kflags) == 0)
 			have = i;
 	}
 	if (have < 0) {
@@ -7802,19 +7805,36 @@ tessera_fs_seal_select(tessera_superblock_t *a, int va,
 		*out_active = a->generation >= b->generation ? a : b;
 	else
 		*out_active = ok[0] ? a : b;
-	if ((*out_active)->generation < hw) {
+	if ((kflags & TKEY_LOAD_OLDER_RO) != 0 && !ronly) {
+		/* Loaded for "Open read-only?" (§8): never written through. */
+		tessera_seal_keys_clear(k);
+		zfree(k, M_TESSERA);
+		printf("tessera_fs: sealed volume: its key was loaded to open an "
+		    "older copy read-only; refusing a writable mount\n");
+		return (EROFS);
+	}
+	if ((*out_active)->generation < hw &&
+	    (kflags & TKEY_LOAD_OLDER_RO) != 0) {
+		printf("tessera_fs: sealed volume at generation %ju, below the "
+		    "key's high-water %ju: an older copy, opened read-only as "
+		    "verified\n", (uintmax_t)(*out_active)->generation,
+		    (uintmax_t)hw);
+	} else if ((*out_active)->generation < hw) {
 		tessera_seal_keys_clear(k);
 		zfree(k, M_TESSERA);
 		printf("tessera_fs: sealed volume at generation %ju, below the "
 		    "key's high-water %ju (an older copy); refusing\n",
 		    (uintmax_t)(*out_active)->generation, (uintmax_t)hw);
-		return (EINTEGRITY);
+		/* ESTALE, not EINTEGRITY: it authenticates, it's just older,
+		 * and dispensatord offers "Open read-only?" for it (§8). */
+		return (ESTALE);
 	}
 	if (ok[0] != ok[1] && va && vb)
 		printf("tessera_fs: sealed volume: superblock %c does not "
 		    "authenticate; using %c\n", ok[0] ? 'B' : 'A',
 		    ok[0] ? 'A' : 'B');
 	*out_seal = k;
+	*out_older_ro = (kflags & TKEY_LOAD_OLDER_RO) != 0;
 	return (0);
 }
 
@@ -7832,6 +7852,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * frames (tree opens, GC, commit_sb) need. */
 	tessera_superblock_t *sb_a, *sb_b, *active = NULL;
 	struct tessera_seal_keys *seal = NULL;
+	int older_ro = 0;
 	sb_a = malloc(sizeof *sb_a, M_TESSERA, M_WAITOK | M_ZERO);
 	sb_b = malloc(sizeof *sb_b, M_TESSERA, M_WAITOK | M_ZERO);
 	int err;
@@ -7878,7 +7899,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	if ((valid_a && (sb_a->incompat_flags & TESSERA_INCOMPAT_SEALED)) ||
 	    (valid_b && (sb_b->incompat_flags & TESSERA_INCOMPAT_SEALED))) {
 		err = tessera_fs_seal_select(sb_a, valid_a, sb_b, valid_b, ronly,
-		    requested_gen, &seal, &active);
+		    requested_gen, &seal, &active, &older_ro);
 		if (err != 0)
 			goto fail_close;
 	}
@@ -7995,6 +8016,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 	tmp_->seal  = seal;
+	tmp_->older_ro = older_ro;
 	if (seal != NULL) {
 		/* Back into the clear fields, so the next seal keeps them. */
 		tessera_sb_stats_t st;
@@ -8812,6 +8834,11 @@ tessera_mount_impl(struct mount *mp)
 		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
 		if (tmp_ != NULL) {
 			int going_ro = vfs_flagopt(mp->mnt_optnew, "ro", NULL, 0);
+			if (tmp_->ronly && !going_ro && tmp_->older_ro) {
+				printf("tessera_fs: an older copy opened read-only "
+				    "stays read-only\n");
+				return (EROFS);
+			}
 			if (tmp_->ronly && !going_ro) {
 				/* ro -> rw: acquire write access before any write. */
 				g_topology_lock();

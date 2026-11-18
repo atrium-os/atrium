@@ -1527,6 +1527,9 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             } else if app == g.asker_app {
                 return refuse("an app's link to itself".into());
             }
+            // Crossed: the app hears from which persona (a Work app opens it
+            // as a stranger would, personas.md §6).
+            let crossed_from = (target != g.persona).then(|| g.persona.clone().unwrap_or_else(|| PERSONAL.to_string()));
             let persona = if launch::not_instanced(&app).is_some() { None } else { target };
             let persona = persona.as_deref();
             let key = opens::channel_key(&app, persona);
@@ -1547,7 +1550,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
             if let Err(e) = hub.listen(&key) {
                 return refuse(format!("{key}'s document channel: {e}"));
             }
-            match hub.deliver_link(&g.person, &key, &g.scheme, &url) {
+            match hub.deliver_link_from(&g.person, &key, &g.scheme, &url, crossed_from.as_deref()) {
                 // Running: bring its window forward, as a new one would be.
                 Ok(Delivery::Sent) => match launch::instance_uid(&g.person, &app, persona) {
                     Some(uid) => match opens::raise(&opens::activation_socket(), uid) {
@@ -1748,6 +1751,10 @@ fn handle_run(uid: u32, owner: &str, ws: &str, project: &str, activation: [u8; 1
         // The Terminal too, for `make run` in a workspace's console
         // (atrium-run, OSC 7770 `run`), on the person's press.
         Some(a) if launch::app_may_launch_apps(a) || launch::app_manages_workspaces(a) || launch::app_shows_consoles(a) => true,
+        // An IDE (`workspace-exec`), in a workspace the person gave it
+        // (dev-tools.md §3.4: its Run of a windowed app is W5's).
+        Some(a) if launch::app_execs_in_workspaces(a) && ide::picked(owner, a).iter().any(|w| w == ws) => true,
+        Some(a) if launch::app_execs_in_workspaces(a) => return refuse(format!("cap.workspace.denied: {a} wasn't given workspace {ws}")),
         Some(a) => return refuse(format!("cap.workspace.denied: {a} may not Run builds")),
         None if portcullis_overlay::home_of(owner).is_some() && uid >= 1000 => false,
         None => return refuse("cap.workspace.denied: not a person or a launcher".into()),

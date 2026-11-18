@@ -170,7 +170,7 @@ pub fn scan(media: &Path) -> Vec<Place> {
             continue;
         }
         let (size, free, ro) = statvfs(&e.path()).unwrap_or((0, 0, false));
-        out.push(stick(&atrium_media::Volume { part: name, mountpoint: String::new(), size_bytes: size, free_bytes: free, read_only: ro, label: String::new(), persona: String::new(), locked: false }, media));
+        out.push(stick(&atrium_media::Volume { part: name, mountpoint: String::new(), size_bytes: size, free_bytes: free, read_only: ro, label: String::new(), persona: String::new(), locked: false, recovery: false, older: false }, media));
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn sticks_and_configured_places() {
-        let v = atrium_media::Volume { part: "da0s1".into(), mountpoint: "/media/da0s1".into(), size_bytes: 16_000_000_000, free_bytes: 1, read_only: false, label: String::new(), persona: String::new(), locked: false };
+        let v = atrium_media::Volume { part: "da0s1".into(), mountpoint: "/media/da0s1".into(), size_bytes: 16_000_000_000, free_bytes: 1, read_only: false, label: String::new(), persona: String::new(), locked: false, recovery: false, older: false };
         let p = stick(&v, Path::new("/media"));
         assert_eq!((p.label.as_str(), p.root.as_path(), p.stick), ("16 GB stick", Path::new("/media/da0s1"), true));
         let two = distinct(vec![p.clone(), Place { id: "da1s1".into(), ..p.clone() }]);
