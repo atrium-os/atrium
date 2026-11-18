@@ -118,7 +118,9 @@ done
 # B3: wait (up to 90 s: ostiarius's readiness times out after 60 s without
 # frescod) until the boot order has settled.
 for _ in $(seq 1 45); do
-    V 'grep -q "boot settled" /var/log/atrium/portcullisd-bootstrap.log' 2>/dev/null && break
+    # The log is appended across boots: look only after this boot's
+    # "loaded N enabled service manifest(s)" line.
+    V 'awk "/enabled service manifest/{s=0} /boot settled/{s=1} END{exit !s}" /var/log/atrium/portcullisd-bootstrap.log' 2>/dev/null && break
     sleep 2
 done
 V 'cat /var/log/atrium/portcullisd-bootstrap.log' > "$OUT/bootstrap.log" 2>&1
@@ -217,3 +219,4 @@ fi
 echo
 echo "results in $OUT"
 echo "fast-boot: $FAILS failed"
+[ "$FAILS" = 0 ]
