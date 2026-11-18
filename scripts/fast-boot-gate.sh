@@ -83,6 +83,9 @@ put "$ROOT/choragus/etc/services.d/36-atrium-choragusd.toml" /var/tmp/fbg/chorag
 V 'kldload -n snd_hda; sh /var/tmp/fbg/scripts/lyra-service.sh /var/tmp/lyrad /var/tmp/choragusd' >"$OUT/commission.txt" 2>&1 \
     && ok "lyrad + choragusd commissioned" || { bad "commission (see commission.txt)"; cat "$OUT/commission.txt"; }
 V 'sysrc -q atrium_portcullisd_bootstrap_enable=YES >/dev/null' && ok "bootstrap enabled at boot"
+# The atrium_jaild rc script loads the devfs rulesets before the services
+# launch; rc.d/devfs must not reload them under jails launching at that moment.
+V 'sysrc -q devfs_load_rulesets=NO >/dev/null' && ok "rc.d/devfs leaves the rulesets to atrium_jaild"
 V 'ls /etc/atrium/services.d/' > "$OUT/services.d.txt"
 
 say "boot (3 reboots)"
@@ -102,6 +105,8 @@ V 'cat /var/log/atrium/portcullisd-bootstrap.log' > "$OUT/bootstrap.log" 2>&1
 awk '/enabled service manifest/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$OUT/bootstrap.log" > "$OUT/bootstrap-lastboot.log"
 grep -q "atrium-lyrad: bound 1 socket" "$OUT/bootstrap-lastboot.log" && ok "lyrad's socket bound ahead of launch" || bad "lyrad socket not bound by the bootstrap"
 grep -q "atrium-choragusd: bound 7 socket" "$OUT/bootstrap-lastboot.log" && ok "choragusd's 7 sockets bound ahead of launch" || bad "choragusd sockets not bound by the bootstrap"
+grep -q "launched [1-9]" "$OUT/bootstrap-lastboot.log" && ok "the bootstrap launched services" || bad "the bootstrap launched nothing: $(grep -m1 "launched" "$OUT/bootstrap-lastboot.log")"
+grep -q "not_loaded" "$OUT/bootstrap-lastboot.log" && bad "jaild refused a jail: devfs ruleset not loaded"
 ex=$(grep -c "exited after" "$OUT/bootstrap-lastboot.log")
 [ "$ex" = 0 ] && ok "no service exited during boot" || { bad "$ex service exit(s) during boot:"; grep "exited after" "$OUT/bootstrap-lastboot.log" | head; }
 V 'pgrep -x atrium-lyrad >/dev/null && pgrep -x atrium-choragusd >/dev/null' && ok "lyrad and choragusd running" || bad "lyrad/choragusd not running"
