@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 /// Resolve the shared-library closure of every program in the app tree so it
 /// can run inside a jail whose rootfs is only that tree. Walks the DT_NEEDED
 /// closure of the entry and of every other ELF file the bundle ships (helpers
-/// in `bin/` it execs, `[[workers]]` programs, its own libraries), copies each library to the SAME absolute path under `dest`,
+/// in `bin/` it execs, `[[workers]]` programs, its own libraries), copies each library
+/// under `dest` to `lib/` (base libraries from /lib) or `usr/lib/` (everything
+/// else, pkg's /usr/local/lib too: a jail has no ld-elf.so.hints, so its
+/// loader looks only there),
 /// and copies the rtld (`/libexec/ld-elf.so.1`). Returns the count copied.
 /// Idempotent: a lib the bundle already shipped is left as-is (but is still
 /// walked, so ITS dependencies are resolved too).
@@ -57,6 +60,11 @@ pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usiz
             if !seen.insert(soname.clone()) {
                 continue;
             }
+            // Shipped by the bundle where the jail's loader looks: use it.
+            if let Some(have) = ["lib", "usr/lib"].iter().map(|d| dest.join(d).join(&soname)).find(|p| p.is_file()) {
+                queue.push(have);
+                continue;
+            }
             let abs = find_lib(&soname, sysroot).ok_or_else(|| {
                 format!(
                     "{}: needs {soname}, not found under sysroot {} (searched {})",
@@ -65,10 +73,14 @@ pub fn resolve_runtime(entry: &Path, dest: &Path, sysroot: &Path) -> Result<usiz
                     LIB_SEARCH_DIRS.join(", ")
                 )
             })?;
-            count += stage_sysroot_file(&abs, dest, sysroot)?;
+            // An app's jail has no ld-elf.so.hints, so its loader looks only
+            // in /lib and /usr/lib: pkg's /usr/local/lib (and anything else)
+            // goes to usr/lib.
+            let to = if abs.starts_with("/lib") { PathBuf::from("lib") } else { PathBuf::from("usr/lib") }.join(&soname);
+            count += stage_to(&abs, &to, dest, sysroot)?;
             // Recurse through the copy in the app tree (identical bytes, and it
             // is guaranteed present now).
-            queue.push(dest.join(abs.strip_prefix("/").unwrap_or(&abs)));
+            queue.push(dest.join(&to));
         }
     }
     Ok(count)
@@ -120,8 +132,13 @@ fn find_lib(soname: &str, sysroot: &Path) -> Option<PathBuf> {
 /// libraries in it at all — the failure only surfaced later as an exec failure
 /// inside a jail, which is a miserable place to debug it.
 fn stage_sysroot_file(abs: &Path, dest: &Path, sysroot: &Path) -> Result<usize, String> {
+    stage_to(abs, abs.strip_prefix("/").unwrap_or(abs), dest, sysroot)
+}
+
+/// Copy `abs` (a path on the target, read under `sysroot`) to `dest/to`.
+fn stage_to(abs: &Path, to: &Path, dest: &Path, sysroot: &Path) -> Result<usize, String> {
     let rel = abs.strip_prefix("/").unwrap_or(abs);
-    let to = dest.join(rel);
+    let to = dest.join(to);
     if to.exists() {
         return Ok(0);
     }
@@ -305,17 +322,22 @@ mod tests {
         put(&sys, "usr/lib/libc++.so.1", &elf(&["libcxxrt.so.1", "libm.so.5"]));
         put(&sys, "lib/libcxxrt.so.1", &elf(&["libc.so.7"]));
         put(&sys, "usr/lib/libunused.so.1", &elf(&[]));
+        put(&sys, "usr/local/lib/libdav1d.so.7", &elf(&["libc.so.7"]));
         put(&app, "bin/player", &elf(&["libc.so.7"]));
         put(&app, "bin/helper", &elf(&["libm.so.5"]));
-        put(&app, "workers/decode", &elf(&["libc++.so.1"]));
+        put(&app, "workers/decode", &elf(&["libc++.so.1", "libdav1d.so.7", "libown.so.1"]));
+        put(&app, "usr/lib/libown.so.1", &elf(&["libc.so.7"]));
         put(&app, "share/firmware.bin", b"\x7fELF\x01\x02 not ours");
         put(&app, "share/readme", b"text");
         let n = resolve_runtime(&app.join("bin/player"), &app, &sys).unwrap();
-        for f in ["libexec/ld-elf.so.1", "lib/libc.so.7", "lib/libm.so.5", "usr/lib/libc++.so.1", "lib/libcxxrt.so.1"] {
+        for f in ["libexec/ld-elf.so.1", "lib/libc.so.7", "lib/libm.so.5", "usr/lib/libc++.so.1", "lib/libcxxrt.so.1",
+                  "usr/lib/libdav1d.so.7"] {
             assert!(app.join(f).is_file(), "{f} missing");
         }
+        // pkg's libraries go where the jail's loader looks; a shipped one is used as is.
+        assert!(!app.join("usr/local").exists());
         assert!(!app.join("usr/lib/libunused.so.1").exists());
-        assert_eq!(n, 5);
+        assert_eq!(n, 6);
         // A missing library of a helper is an error, not a jail that fails later.
         put(&app, "bin/other", &elf(&["libnope.so.1"]));
         assert!(resolve_runtime(&app.join("bin/player"), &app, &sys).unwrap_err().contains("libnope.so.1"));
