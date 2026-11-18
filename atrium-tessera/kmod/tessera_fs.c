@@ -7833,6 +7833,10 @@ tessera_fs_seal_select(tessera_superblock_t *a, int va,
 		printf("tessera_fs: sealed volume: superblock %c does not "
 		    "authenticate; using %c\n", ok[0] ? 'B' : 'A',
 		    ok[0] ? 'A' : 'B');
+	/* The keyring learns the generation mounted, not only those this
+	 * mount commits: "Use this copy as current" (§8) lowers the mark to
+	 * exactly what was opened, and arcad reads it back (TKEY_GEN). */
+	tessera_keyring_note_gen(k->key_id, (*out_active)->generation);
 	*out_seal = k;
 	*out_older_ro = (kflags & TKEY_LOAD_OLDER_RO) != 0;
 	return (0);

@@ -165,7 +165,7 @@ impl State {
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
         }
         if let Label::Service(name) = who {
-            if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER) || !crate::volume::SERVICES.contains(&name.as_str()) {
+            if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER | volume_op::VK_CURRENT) || !crate::volume::SERVICES.contains(&name.as_str()) {
                 return None;
             }
             let mut r = Reader::new(body);
@@ -176,6 +176,9 @@ impl State {
             let m = Self::volume_item(store, &persona, &key_id).ok()??;
             if op == volume_op::VK_OLDER {
                 return Some((user, format!("Open an older copy of \u{201c}{}\u{201d} read-only", m.account)));
+            }
+            if op == volume_op::VK_CURRENT {
+                return Some((user, format!("Use this older copy of \u{201c}{}\u{201d} as current", m.account)));
             }
             return Some((user, format!("Forget the key of \u{201c}{}\u{201d}", m.account)));
         }
@@ -221,7 +224,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB7).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB8).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
@@ -776,6 +779,54 @@ impl State {
                 }
                 match ring.load(&info, key) {
                     Ok(()) => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            volume_op::VK_CURRENT => {
+                let key_id = field!(r.array::<16>());
+                let uuid = field!(r.array::<16>());
+                field!(r.end());
+                // What the kernel saw mounted: the older copy, opened
+                // read-only under a key loaded for that (VK_OLDER).
+                let gen = match self.keyring.as_mut().unwrap().generation(&key_id) {
+                    Ok(g) if g > 0 => g,
+                    _ => return reply(status::DENIED),
+                };
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                if decode_scope(&m.scope) != Some((key_id, uuid, 0)) {
+                    return reply(status::DENIED);
+                }
+                if !verified {
+                    return reply(status::NEEDS_VERIFICATION);
+                }
+                let who = Access { persona: &persona, recipient: &me };
+                let (_, mut v) = tri!(store.release(&m.id, &who, None));
+                if v.len() != VALUE_LEN {
+                    return reply(status::INTERNAL);
+                }
+                let hw = u64::from_le_bytes(v.as_ref()[32..].try_into().unwrap());
+                // Only ever lowered here; a copy at or above the mark is
+                // current already.
+                if gen < hw {
+                    v.as_mut()[32..].copy_from_slice(&gen.to_le_bytes());
+                    tri!(store.update(&m.id, &who, v.as_ref(), None));
+                }
+                let mark = gen.min(hw);
+                let info = LoadInfo { key_id, uuid, group: 0, high_water: mark, owner_uid: 0, owner_label: label, older_read_only: false };
+                let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
+                let ring = self.keyring.as_mut().unwrap();
+                match ring.drop_key(&key_id) {
+                    Ok(()) => {}
+                    Err(e) if e == libc::ENOENT => {}
+                    Err(_) => return reply(status::INTERNAL),
+                }
+                match ring.load(&info, key) {
+                    Ok(()) => ok(mark.to_le_bytes().to_vec()),
                     Err(_) => reply(status::INTERNAL),
                 }
             }

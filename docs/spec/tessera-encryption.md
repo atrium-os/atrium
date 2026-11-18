@@ -586,8 +586,13 @@ Personal:
   `locked older` with its persona. Media op `OPEN_OLDER` (0x0C) has arcad `VK_OLDER`
   0xB7, behind Sigillum's `VERIFY_USER`, reload the key `TKEY_LOAD_OLDER_RO`: the
   kernel then opens the copy below the mark, read-only only (a writable mount or a
-  ro→rw remount with that key is `EROFS`). Adopting the copy as current (the second
-  verified step that lowers the mark) is not built yet.
+  ro→rw remount with that key is `EROFS`). Opened, it is listed `older` and read-only;
+  media op `MAKE_CURRENT` (0x0D, "Use this copy as current") stops its server,
+  unmounts it and has arcad `VK_CURRENT` 0xB8, behind a second `VERIFY_USER`,
+  lower the item's mark to the generation the kernel saw mounted (the kernel
+  notes every mounted generation in the keyring, read back with `TKEY_GEN`;
+  never a number from dispensatord) and reload the key as usual; the kernel then
+  mounts it writable. Refused or unverified, it goes back read-only.
 - **Grants of its folders** (built; `tessera-sticks-vm.sh` §5b, 12 checks, all pass in the VM on 2026-11-18 at 908973d): a trusted stick has no
   FUSE server of its own, so dispensatord starts one per mounted stick,
   `atrium-capsa-local`, in a jail of jaild's `[stick_servers]` class: named
@@ -609,8 +614,7 @@ Personal:
   holding a directory descriptor. Needs `fusefs.ko` on the Atrium kernel
   (kernel-hardening.md keeps it loadable).
 - **Not yet:** Scrinium's and Forum's Locked display and "Make this a Work
-  stick", the Arca field for typing a recovery code, and adopting an older
-  copy as current.
+  stick", and the Arca field for typing a recovery code.
 - Gate: `scripts/tessera-sticks-vm.sh` (an md disk stands in for the stick): all 43
   checks in the VM on 2026-11-18 (e61b9c0: format, lock, Locked for another person,
   eject, replug, an older copy refused and not opened unverified, a recovery code

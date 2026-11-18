@@ -275,6 +275,13 @@ pub mod volume_op {
     /// mark, and the kernel refuses every writable mount with it. The
     /// item's mark is unchanged.
     pub const VK_OLDER: u16 = 0xB7;
+    /// `owner | key_id[16] | uuid[16]` → `u64` generation: "Use this copy
+    /// as current" for an older copy opened read-only (§8), and unmounted
+    /// since. Needs Sigillum's `VERIFY_USER`. arcad lowers the item's
+    /// high-water mark to the generation the kernel saw mounted (`TKEY_GEN`,
+    /// never a number from the caller) and reloads the key as usual, so
+    /// the copy mounts writable. `DENIED` if no older copy was opened.
+    pub const VK_CURRENT: u16 = 0xB8;
     pub const SLOT_LEN: usize = crate::recovery::SLOT_LEN;
     pub const CODE_MAX: usize = 64;
     /// Longest label.
