@@ -15,6 +15,9 @@
 //!
 //! - `LIMEN_ARCA_UID`: the uid of arca-ui, the `credential` provider
 //!   (default 65021, `_arca-ui`); only it may provide that role.
+//! - `LIMEN_SHARE_UID`: the uid of the share sheet, the `share` provider
+//!   (default 65045, `_share`); only it may provide that role, and it may
+//!   choose only installed `share-target`s for the parent's person.
 //! - `LIMEN_USER`: limend's user name as worker rules name it (default `_limen`).
 //! - `LIMEN_CHORAGUS`: choragusd's attribution socket, for embedded players'
 //!   audio tickets (default /atrium/sockets/audio-attribution/audio-attribution.sock).
@@ -55,6 +58,12 @@ fn main() -> std::io::Result<()> {
     // arca-ui, the credential provider, is a system service (`_arca-ui`),
     // not a registry app.
     shared.set_system_uid(limen::catalogue::ARCA, arca_uid);
+    // The share sheet is a system service (`_share`), not a registry app;
+    // it may choose only installed share targets for the parent's person.
+    let share_uid: u32 = std::env::var("LIMEN_SHARE_UID").ok().and_then(|v| v.parse().ok()).unwrap_or(65045);
+    shared.set_system_uid(limen::catalogue::SHARE, share_uid);
+    let targets = installed.clone();
+    shared.set_target_check(Box::new(move |person: &str, app: &str| targets.may_target(person, app)));
     // Who may embed what: the parent's installed manifest (`embeds`).
     shared.set_embed_check(Box::new(move |app: &str, role: &str| installed.may_embed(app, role)));
     shared.set_attribution(Box::new(limen::audio::Choragus::new(

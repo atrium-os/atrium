@@ -32,6 +32,9 @@ pub mod op {
     /// [`Emit`](super::Emit) with one descriptor in the same frame, for a
     /// role that returns one (catalogue `returns_fd`: the picker's file).
     pub const EMIT_FD: u16 = 0x15;
+    /// [`Choose`](super::Choose): the share sheet names the app the person
+    /// chose for its parent's next `share-target`.
+    pub const CHOOSE: u16 = 0x16;
     // events
     pub const EV_PARENT: u16 = 0x80;
     pub const EV_CHILD: u16 = 0x81;
@@ -57,6 +60,9 @@ pub mod refusal {
     /// The parent's manifest doesn't name this role in `embeds`
     /// (app-composition.md §5.1).
     pub const NOT_EMBEDDABLE: u8 = 15;
+    /// `CHOOSE`: the app doesn't implement `share-target` for the parent's
+    /// person.
+    pub const NOT_A_TARGET: u8 = 16;
 }
 
 pub type EmbedId = u64;
@@ -112,6 +118,12 @@ pub struct FocusOut { pub embed: EmbedId, pub forward: bool }
 /// One embed is in PiP at a time: a new one ends the last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pip { pub embed: EmbedId, pub on: bool, pub aspect: [u32; 2] }
+
+/// From the share sheet, for one of its `share` embeds: the person chose
+/// `app` (a registry app id). The parent's next `share-target` request,
+/// within `catalogue::CHOICE_MS`, starts that app; nothing else can.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choose { pub embed: EmbedId, pub app: String }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {

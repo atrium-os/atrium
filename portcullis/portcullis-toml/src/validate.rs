@@ -96,6 +96,17 @@ pub fn validate(m: &Manifest) -> Report {
         for n in roles.implements.iter().filter(|n| !role_name(n)) {
             r.errors.push(format!("[roles].implements {n:?}: a role name, `a-z 0-9 -`"));
         }
+        if let Some(st) = &roles.share_target {
+            if !roles.implements.iter().any(|n| n == "share-target") {
+                r.errors.push("[roles.share-target] without \"share-target\" in [roles].implements".into());
+            }
+            if st.mime.is_empty() || st.mime.len() > 32 {
+                r.errors.push(format!("[roles.share-target].mime: {} types, 1 to 32", st.mime.len()));
+            }
+            for t in st.mime.iter().filter(|t| !is_mime_pattern(t)) {
+                r.errors.push(format!("[roles.share-target].mime {t:?}: a media type (`text/plain`), a family (`image/*`) or `*/*`"));
+            }
+        }
     }
     if let Some(ipc) = &m.ipc {
         for (k, list) in [("provides", &ipc.provides), ("uses", &ipc.uses)] {
@@ -490,6 +501,21 @@ uses     = ["org.atrium.notify/1"]
 "#;
 
     #[test]
+    fn share_target_types() {
+        let with = |mime: &str| PHOTOS.replace("implements = [\"share-target\"]", &format!("implements = [\"share-target\"]\n\n[roles.share-target]\nmime = {mime}"));
+        let m = Manifest::from_str(&with(r#"["text/plain", "image/*", "application/vnd.oasis.opendocument.text"]"#)).unwrap();
+        assert!(crate::validate(&m).is_ok());
+        assert_eq!(m.roles.as_ref().unwrap().share_target.as_ref().unwrap().mime.len(), 3);
+        for bad in [r#"[]"#, r#"["Text/Plain"]"#, r#"["text"]"#, r#"["*/plain"]"#, r#"["text/pl ain"]"#, r#"["image/**"]"#] {
+            let m = Manifest::from_str(&with(bad)).unwrap();
+            assert!(!crate::validate(&m).is_ok(), "{bad}");
+        }
+        let without = PHOTOS.replace("implements = [\"share-target\"]", "implements = []\n\n[roles.share-target]\nmime = [\"text/plain\"]");
+        assert!(!crate::validate(&Manifest::from_str(&without).unwrap()).is_ok(), "the section without the role");
+        assert!(Manifest::from_str(&with(r#"["text/plain"]\ntypes = 1"#)).is_err(), "an unknown key");
+    }
+
+    #[test]
     fn workers_roles_ipc_parse_and_validate() {
         let m = Manifest::from_str(PHOTOS).unwrap();
         let r = crate::validate(&m);
@@ -533,5 +559,18 @@ uses     = ["org.atrium.notify/1"]
         let m = Manifest::from_str("[app]\nid = \"org.x.y\"\nname = \"Y\"\nversion = \"1\"\nentry = \"y\"\n").unwrap();
         assert!(m.workers.is_empty() && m.roles.is_none() && m.ipc.is_none());
         assert!(crate::validate(&m).is_ok());
+    }
+}
+
+/// A media type a share target takes: `type/subtype` in `a-z 0-9 . + -`
+/// (lower case, as Tabula's offers are), `type/*`, or `*/*`.
+pub fn is_mime_pattern(t: &str) -> bool {
+    let part = |p: &str| !p.is_empty() && p.len() <= 63
+        && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'+' | b'-'));
+    match t.split_once('/') {
+        Some(("*", "*")) => true,
+        Some((ty, "*")) => part(ty),
+        Some((ty, sub)) => part(ty) && part(sub),
+        None => false,
     }
 }
