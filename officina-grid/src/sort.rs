@@ -97,6 +97,52 @@ pub fn order(wb: &Workbook, rect: &Rect, keys: &[SortKey]) -> Vec<u32> {
 
 /// The edit that sorts `rect` by `keys` (the caller leaves a header row out of
 /// `rect`). `None` when the rows are already in order or a key is outside the range.
+/// Whether `rect`'s rows can be sorted with the merged cells in it, as
+/// Excel allows: none, or every row merged across the same columns (one row
+/// high each, all inside the range), so the merges stay where they are.
+pub fn merges_allow_sort(wb: &Workbook, rect: &Rect) -> bool {
+    let mut first: Option<Vec<(u32, u32)>> = None;
+    let mut row = rect.r0;
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    let mut rows = 0u64;
+    let done = |spans: &mut Vec<(u32, u32)>, first: &mut Option<Vec<(u32, u32)>>| -> bool {
+        spans.sort_unstable();
+        match first {
+            None => {
+                *first = Some(std::mem::take(spans));
+                true
+            }
+            Some(f) => {
+                let same = f == spans;
+                spans.clear();
+                same
+            }
+        }
+    };
+    let mut any = false;
+    for m in wb.merges_in(rect) {
+        any = true;
+        if m.r0 != m.r1 || m.r0 < rect.r0 || m.r1 > rect.r1 || m.c0 < rect.c0 || m.c1 > rect.c1 {
+            return false;
+        }
+        if m.r0 != row {
+            if m.r0 != row + 1 || spans.is_empty() || !done(&mut spans, &mut first) {
+                return false;
+            }
+            rows += 1;
+            row = m.r0;
+        }
+        spans.push((m.c0, m.c1));
+    }
+    if !any {
+        return true;
+    }
+    if row != rect.r1 || !done(&mut spans, &mut first) {
+        return false;
+    }
+    rows + 1 == (rect.r1 - rect.r0 + 1) as u64
+}
+
 pub fn sort_op(wb: &Workbook, rect: Rect, keys: &[SortKey]) -> Option<GridOp> {
     if keys.is_empty() || keys.iter().any(|k| k.col < rect.c0 || k.col > rect.c1) || rect.sheet as usize >= wb.sheet_count() {
         return None;
@@ -263,5 +309,31 @@ mod tests {
         inv.apply(&mut wb);
         assert_eq!(wb.comment(0, 0, 1).map(|k| &*k.text), Some("three"));
         assert_eq!(wb.comment(0, 1, 0).map(|k| &*k.text), Some("one"));
+    }
+
+    #[test]
+    fn merges_allow_a_sort_only_when_every_row_is_merged_alike() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
+        let all = r(0, 0, 3, 3);
+        assert!(merges_allow_sort(&wb, &all));
+        // B:C merged on every row, D alone: fine.
+        wb.set_merges(0, (0..4).map(|k| r(k, 1, k, 2)).collect());
+        assert!(merges_allow_sort(&wb, &all));
+        // One row missing its merge.
+        wb.set_merges(0, (0..3).map(|k| r(k, 1, k, 2)).collect());
+        assert!(!merges_allow_sort(&wb, &all));
+        // A row merged differently.
+        wb.set_merges(0, (0..3).map(|k| r(k, 1, k, 2)).chain([r(3, 1, 3, 3)]).collect());
+        assert!(!merges_allow_sort(&wb, &all));
+        // Two spans a row, alike.
+        wb.set_merges(0, (0..4).flat_map(|k| [r(k, 0, k, 1), r(k, 2, k, 3)]).collect());
+        assert!(merges_allow_sort(&wb, &all));
+        // A merge two rows high, or one crossing the range's edge.
+        wb.set_merges(0, vec![r(0, 0, 1, 0)]);
+        assert!(!merges_allow_sort(&wb, &all));
+        wb.set_merges(0, (0..4).map(|k| r(k, 3, k, 4)).collect());
+        assert!(!merges_allow_sort(&wb, &all));
     }
 }

@@ -3620,7 +3620,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Moving around:** a press inside one puts the cursor on its top-left, and the arrows step over it as one cell. A selection that meets part of one shows all of it.
   - **Commands:** Data ▸ Merge Cells merges the selection (grown to whole merges). As Excel does, it keeps the top-left value, clears the others (the status says how many) and centres it. Data ▸ Unmerge Cells undoes merges the selection meets. Each is one undo step.
   - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
-- **Sorting** a range that holds merged cells is refused ("Unmerge the merged cells in the range before sorting it."); Excel sorts only when every merge is the same size.
+- **Sorting** a range with merged cells works when every row is merged across the same columns, one row high and inside the range (`sort::merges_allow_sort`); the merges stay put as the rows move. Anything else is refused with "To sort, every row needs the same merged cells; unmerge them first." Excel also sorts blocks of rows merged to the same height; we don't yet.
 - **Printing** merged areas as one cell: done by the printing thread (c7af758b).
 - **Not yet:** the editor spanning the area while typing, and Excel's "Center Across Selection" without merging.
 - **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.

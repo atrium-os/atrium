@@ -491,8 +491,8 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             if rect.r0 > rect.r1 {
                 return Err("There is nothing under the header to sort.".into());
             }
-            if d.wb.merges_in(&rect).next().is_some() {
-                return Err("Unmerge the merged cells in the range before sorting it.".into());
+            if !officina_grid::sort::merges_allow_sort(&d.wb, &rect) {
+                return Err("To sort, every row needs the same merged cells; unmerge them first.".into());
             }
             let key = col.clamp(rect.c0, rect.c1);
             let descending = cmd == DataCmd::SortDesc;
@@ -735,6 +735,19 @@ mod tests {
     }
 
     #[test]
+    fn rows_merged_alike_sort() {
+        let mut d = doc();
+        // Qty:Price merged on every data row: the rows sort, the merges stay.
+        let list: Vec<Rect> = (1..=4).map(|r| Rect { sheet: 0, r0: r, c0: 1, r1: r, c1: 2 }).collect();
+        d.run("Merge Cells", vec![GridOp::Merges { sheet: 0, list: list.clone() }]);
+        run(&mut d, one(2, 0), (2, 0), DataCmd::SortAsc);
+        assert!(d.status.starts_with("Sorted 4 rows"), "{}", d.status);
+        assert_eq!((1..=4).map(|r| cell(&d, r, 0)).collect::<Vec<_>>(), ["apple", "apple", "fig", "pear"]);
+        assert_eq!(cell(&d, 4, 1), "3");
+        assert_eq!(d.wb.merges(0), &list[..]);
+    }
+
+    #[test]
     fn merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back() {
         let mut d = doc();
         let sel = CellRange { r0: 1, c0: 0, r1: 2, c1: 1 };
@@ -748,7 +761,7 @@ mod tests {
         assert_eq!(cell(&d, 1, 1), "");
         // Sorting across it is refused.
         run(&mut d, one(3, 0), (3, 0), DataCmd::SortAsc);
-        assert!(d.status.starts_with("Unmerge the merged cells"), "{}", d.status);
+        assert!(d.status.starts_with("To sort, every row needs the same merged cells"), "{}", d.status);
         // The cursor in it offers Unmerge.
         let titles = menu(&d, one(2, 1), (2, 1)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
         assert!(titles.iter().any(|t| t == "Unmerge Cells"), "{titles:?}");
