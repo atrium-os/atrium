@@ -347,7 +347,18 @@ pub enum Refusal {
 pub enum Response {
     Http { status: u16, headers: Vec<(String, String)>, body: Vec<u8> },
     Refused(Refusal),
+    /// A `GET` that asked for `text/event-stream` and got one (mail.md
+    /// §5.4, RFC 8620 §7.3): the status and headers; its events follow,
+    /// one frame each, then [`Response::EventsEnd`] (or a refusal).
+    Events { status: u16, headers: Vec<(String, String)> },
+    /// One whole event, up to and including its blank line.
+    Event(Vec<u8>),
+    /// The server ended the stream, or it was quiet past the courier's wait.
+    EventsEnd,
 }
+
+/// The longest event passed on.
+pub const EVENT_MAX: usize = 64 * 1024;
 
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
@@ -367,6 +378,20 @@ impl Response {
                 w.u8(1);
                 w.u8(*r as u8);
             }
+            Response::Events { status, headers } => {
+                w.u8(2);
+                w.u16(*status);
+                w.u8(headers.len().min(255) as u8);
+                for (k, v) in headers.iter().take(255) {
+                    w.str(k);
+                    w.str(v);
+                }
+            }
+            Response::Event(e) => {
+                w.u8(3);
+                w.bytes(e);
+            }
+            Response::EventsEnd => w.u8(4),
         }
         w.buf
     }
@@ -398,6 +423,19 @@ impl Response {
                 10 => Refusal::SignInAgain,
                 _ => Refusal::Internal,
             }),
+            2 => {
+                let status = r.u16().ok()?;
+                let n = r.u8().ok()? as usize;
+                let mut headers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let k = r.str(64 * 1024).ok()?.to_string();
+                    let v = r.str(64 * 1024).ok()?.to_string();
+                    headers.push((k, v));
+                }
+                Response::Events { status, headers }
+            }
+            3 => Response::Event(r.bytes(EVENT_MAX).ok()?.to_vec()),
+            4 => Response::EventsEnd,
             _ => return None,
         };
         r.end().ok()?;

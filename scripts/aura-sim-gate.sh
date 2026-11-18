@@ -595,7 +595,7 @@ n4() {
     [ "$u" = _atrium-netconf ] && ok "atrium-netconf runs as _atrium-netconf" || fail "atrium-netconf runs as '$u'"
     "$V" "procstat -s \$(pgrep -x atrium-netconf) | awk 'NR==2{print \$10}'" | grep -q C && ok "atrium-netconf in capability mode" || fail "atrium-netconf capmode"
     s=$("$V" 'ls /tmp/aura/sockets | tr "\n" " "')
-    [ "$s" = "network-configure network-details network-read network-wifi wifi-nearby " ] && ok "one socket per capability: $s" || fail "sockets: $s"
+    [ "$s" = "network-configure network-details network-read network-wifi print-discovery wifi-nearby " ] && ok "one socket per capability: $s" || fail "sockets: $s"
 
     app network-read status
     [ "$rc" = 0 ] && echo "$out" | grep -q '^status link=none online=no' && ok "network-read before any network: $out" || fail "status: $out"
@@ -780,7 +780,7 @@ svc() {
     u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
     [ "$u" = _atrium-netconf ] && ok "atrium-netconf runs as _atrium-netconf" || fail "atrium-netconf runs as '$u'"
     s=$("$V" 'ls /atrium/sockets | grep -E "^(network|wifi)-" | tr "\n" " "')
-    [ "$s" = "network-configure network-details network-read network-wifi wifi-nearby " ] && ok "its five sockets under /atrium/sockets" || fail "sockets: $s"
+    [ "$s" = "network-configure network-details network-read network-wifi print-discovery wifi-nearby " ] && ok "its six sockets under /atrium/sockets" || fail "sockets: $s"
     "$V" 'stat -f %Sp /atrium/sockets/atrium-net' | grep -q '^drwx------' && ok "atrium-net's control socket dir is root's alone (0700)" || fail "ctl dir: $("$V" 'ls -ld /atrium/sockets/atrium-net')"
     i=0; until "$V" "$APP network-details interfaces" | grep -q '^iface name=vtnet1 .*addr=10\.88\.0\.'; do i=$((i + 1)); [ $i -lt 40 ] || fail "vtnet1: no lease ($("$V" "$APP network-details interfaces"))"; sleep 3; done
     ok "vtnet1 bound from lan.py's DHCP: $("$V" "$APP network-details interfaces" | grep -o 'name=vtnet1 .*addr=[^ ]*' | sed 's/ .* / /')"

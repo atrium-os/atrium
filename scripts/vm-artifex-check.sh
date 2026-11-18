@@ -41,6 +41,7 @@ xb portcullis "-p portcullisd -p portcullis-cli -p opifex --bin portcullisd --bi
 xb atrium-term-socket "--bin atrium-term-socket"
 xb stoa "-p stoa --bin stoad"
 xb artifex "-p artifex --bin artifex"
+[ -z "${FORUM:-}" ] || xb forum-wm "--bin forum-wm"
 
 echo "=== install"
 B=/var/tmp/artifexchk
@@ -297,11 +298,33 @@ else
 fi
 
 echo "=== terminal"
-press 700 640              # Artifex has the focus again (a dev app may have it)
+GAP=8 press 700 640       # Artifex has the focus again (a dev app may have it)
 press 1080 52              # the bar's Terminal button
 i=0; while [ $i -lt 30 ] && ! V "grep -q 'console in workspace/proj' $LOG"; do sleep 2; i=$((i+2)); done
 V "grep -q 'console in workspace/proj' $LOG" && ok "Terminal opens proj's terminal" || bad "terminal: $(V "grep -i console $LOG | tail -2")"
 shot artifex-4-terminal
+
+echo "=== under Forum"
+if [ -n "${FORUM:-}" ]; then
+    # Forum's WM core over the same frescod: it places every window by role
+    # (forum.md §2). The dev app is started again, from the person's CLI.
+    V "for j in \$(jls name | grep '^dev_alice_'); do jail -r \$j; done" >/dev/null 2>&1
+    scp -q $K -P 2222 "$ROOT/forum-wm/target/$TARGET/release/forum-wm" root@localhost:$B/
+    V "cd $B && env FRESCO_SOCKET=/atrium/sockets/fresco/fresco.sock FRESCO_WM_SOCKET=$B/wm.sock FORUM_CTL_SOCKET=$B/ctl.sock \
+       FORUM_STATUS_SOCKET=$B/status.sock FORUM_STATE=$B/forum-state daemon -f -o $B/wm.log $B/forum-wm </dev/null"
+    sleep 20
+    V "pgrep -x forum-wm >/dev/null" && ok "forum-wm is up" || bad "forum-wm: $(V "tail -5 $B/wm.log")"
+    shot artifex-8-forum
+    n=$(V "wc -l < $LOG" | tr -d ' ')
+    out=$(V "su -m alice -c 'portcullis workspace run proj app'" 2>&1)
+    echo "$out" | grep -q '^dev.alice.proj.org.example.app' && ok "Run again from the CLI" || bad "cli run: $out"
+    sleep 25
+    V "tail -n +$((n+1)) $LOG | grep -q 'dev.alice.proj.org.example.app (a Run) exited\|no window'" && bad "it ended: $(V "tail -3 $LOG")" || ok "the dev app runs under Forum"
+    shot artifex-9-forum-dev-app
+    V "tail -15 $B/wm.log" | sed 's/^/  wm: /'
+else
+    echo "  (FORUM not set: skipped)"
+fi
 
 echo "artifex: $fails failed"
 [ $fails = 0 ]

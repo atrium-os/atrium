@@ -377,3 +377,48 @@ fn hostile_client_bytes_read_no_item() {
     }
     assert!(refused > 15_000 && decoded > 0, "{refused} refused, {decoded} decoded");
 }
+
+#[test]
+fn an_event_stream_comes_one_event_at_a_time_masked() {
+    let p = pki(&["api.example"]);
+    let h: Handler = Arc::new(|req: &[u8]| {
+        let r = String::from_utf8_lossy(req);
+        if !r.contains("\r\nAccept: text/event-stream\r\n") {
+            return http("401 Unauthorized", &["Content-Type: application/json"], b"{}");
+        }
+        // Two events and a ping in chunks that split an event, one echoing
+        // the token; then the end.
+        let events = "event: state\ndata: {\"changed\":{\"a\":{\"Email\":\"s1\"}}}\n\nevent: ping\ndata: {\"interval\":60}\n\nevent: state\r\ndata: s3cret-token\r\n\r\n";
+        let (a, b) = events.split_at(30);
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n", a.len(), b.len()).into_bytes()
+    });
+    let (at, _) = serve(&p, "api.example", h);
+    let net = Net { map: HashMap::from([("api.example".into(), at)]), lookups: Default::default() };
+    let mut c = Courier::new(ep("api.example"), &net, tls(&p), LOOPBACK);
+    let mut v = vault();
+    let mut req = get_with_bearer("/events");
+    req.headers = vec![(Header::Accept, b"text/event-stream".to_vec())];
+    assert!(arca_courier::send::wants_events(&req));
+    let mut out = Vec::new();
+    c.handle_to(&req.encode(), &mut v, &mut out).unwrap();
+    let mut r = &out[..];
+    let mut frames = Vec::new();
+    while let Some(f) = arca_courier::send::read_frame(&mut r).unwrap() {
+        frames.push(Response::decode(&f).unwrap());
+    }
+    assert!(matches!(&frames[0], Response::Events { status: 200, .. }), "{frames:?}");
+    assert_eq!(frames[1], Response::Event(b"event: state\ndata: {\"changed\":{\"a\":{\"Email\":\"s1\"}}}\n\n".to_vec()));
+    assert_eq!(frames[2], Response::Event(b"event: ping\ndata: {\"interval\":60}\n\n".to_vec()));
+    assert_eq!(frames[3], Response::Event(b"event: state\r\ndata: ************\r\n\r\n".to_vec()));
+    assert_eq!(frames[4], Response::EventsEnd);
+    assert_eq!(frames.len(), 5);
+
+    // Not an event stream (here a refusal): one ordinary answer.
+    let mut req = get_with_bearer("/events");
+    req.headers = vec![(Header::Accept, b"application/json".to_vec())];
+    assert!(!arca_courier::send::wants_events(&req));
+    let mut out = Vec::new();
+    c.handle_to(&req.encode(), &mut v, &mut out).unwrap();
+    let f = arca_courier::send::read_frame(&mut &out[..]).unwrap().unwrap();
+    assert!(matches!(Response::decode(&f).unwrap(), Response::Http { status: 401, .. }));
+}

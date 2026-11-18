@@ -635,11 +635,12 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
 
     match m.kind {
         MountKind::RoNullfs => {
-            let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source);
+            let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source)
+                || policy.mount_sources.ro_subtrees.iter().any(|base| below(&m.source, base));
             if !allowed {
                 return Err(JaildError::PolicyViolation {
                     rule:   "mount.source.not_in_ro",
-                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths", m.source),
+                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths or ro_subtrees", m.source),
                 });
             }
         }
@@ -691,6 +692,14 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a folder directly in `base`: one plain segment below
+/// it (no `.`, `..` or empty segment), never `base` itself.
+fn below(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    let Some(rest) = path.strip_prefix(base).and_then(|r| r.strip_prefix('/')) else { return false };
+    !base.is_empty() && !rest.is_empty() && !rest.contains('/') && rest != "." && rest != ".."
 }
 
 fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier: bool) -> Result<(), JaildError> {
@@ -1467,6 +1476,24 @@ mod tests {
             owner: None,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_ro_subtree_is_one_package_folder() {
+        let mut p = load_sample_policy();
+        p.mount_sources.ro_subtrees = vec!["/usr/local/libexec/atrium/drivers/".into()];
+        let ro = |src: &str| {
+            let mut r = req_default();
+            r.mounts.push(MountSpec { source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
+            validate_create(&r, &p)
+        };
+        ro("/usr/local/libexec/atrium/drivers/org.atrium.driver.x").unwrap();
+        for bad in ["/usr/local/libexec/atrium/drivers", "/usr/local/libexec/atrium/drivers/",
+                    "/usr/local/libexec/atrium/drivers/../../../../etc", "/usr/local/libexec/atrium/driversX/a",
+                    "/usr/local/libexec/atrium/drivers//a", "/usr/local/libexec/atrium/drivers/./a",
+                    "/usr/local/libexec/atrium/drivers/a/b", "/usr/local/libexec/atrium/drivers/.."] {
+            assert!(matches!(ro(bad), Err(JaildError::PolicyViolation { rule: "mount.source.not_in_ro", .. })), "{bad}");
+        }
     }
 
     #[test]

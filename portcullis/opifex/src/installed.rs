@@ -30,6 +30,10 @@ pub struct Record {
     /// WebAuthn RP ids verified at install (sigillum.md; C7).
     #[serde(default)]
     pub verified_rps: Vec<String>,
+    /// Key recoveries its publisher had when it was installed (C7): a later
+    /// recovery makes the next update ask again (opifex.md §7.7).
+    #[serde(default)]
+    pub recoveries: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

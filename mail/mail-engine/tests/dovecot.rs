@@ -671,7 +671,10 @@ fn idle_reports_new_mail_in_the_inbox() {
     std::thread::scope(|sc| {
         let w = sc.spawn(|| {
             let mut held = None;
-            watch_inbox(&cfg, &Couriers(&dc), &mut |s| held = Some(s), &mut || {
+            watch_inbox(&cfg, &Couriers(&dc), &mut |s| held = Some(s), &mut |changed| {
+                if !changed {
+                    return true;
+                }
                 tx.send(()).unwrap();
                 false
             })
@@ -708,7 +711,7 @@ fn a_watch_ends_when_its_connection_is_shut() {
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|sc| {
-        let w = sc.spawn(|| watch_inbox(&cfg, &Couriers(&dc), &mut |s| tx.send(s).unwrap(), &mut || true));
+        let w = sc.spawn(|| watch_inbox(&cfg, &Couriers(&dc), &mut |s| tx.send(s).unwrap(), &mut |_| true));
         let s = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         std::thread::sleep(Duration::from_secs(1));
         s.shutdown(std::net::Shutdown::Both).unwrap();

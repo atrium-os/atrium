@@ -40,6 +40,10 @@ fn main() {
             let mut b = Vec::new();
             f.take(max + 1).read_to_end(&mut b).map_err(|e| e.to_string())?;
             Ok(b)
+        }, |name| {
+            // `<root>/dns/<name>`: one TXT record per line.
+            let p = local(&root, &format!("https://dns/{name}"))?;
+            Ok(std::fs::read_to_string(p).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default())
         })
     } else {
         let f = match nuntius::launch::open() {
@@ -49,10 +53,12 @@ fn main() {
                 std::process::exit(1)
             }
         };
-        let (mut c, guard) = f.into_parts();
-        let mut id = 0u32;
+        let (c, guard) = f.into_parts();
+        let (c, id) = (std::cell::RefCell::new(c), std::cell::Cell::new(0u32));
+        let next = || { id.set(id.get().wrapping_add(1)); id.get() };
         serve(stdin, stdout, |url, max| {
-            id += 1;
+            let mut c = c.borrow_mut();
+            let id = next();
             let mut o = nuntius::Open::get(id, url);
             o.deliver = nuntius::Deliver::Fd;
             o.limits.max_bytes = max;
@@ -75,6 +81,21 @@ fn main() {
             let mut b = Vec::new();
             file.ok_or("no body")?.take(max + 1).read_to_end(&mut b).map_err(|e| e.to_string())?;
             Ok(b)
+        }, |name| {
+            let mut c = c.borrow_mut();
+            let id = next();
+            c.lookup(nuntius::Lookup { id, name: name.into(), kind: nuntius::RecordKind::Txt }).map_err(|e| format!("nuntius: {e}"))?;
+            loop {
+                match c.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Some(nuntius::Event::Records { id: i, records, .. })) if i == id => {
+                        return Ok(records.into_iter().filter_map(|r| match r { nuntius::Record::Txt(t) => Some(t), _ => None }).collect());
+                    }
+                    Ok(Some(nuntius::Event::Error { id: i, code })) if i == id => return Err(format!("DNS {code:?}")),
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Err("DNS timed out".into()),
+                    Err(e) => return Err(format!("nuntius: {e}")),
+                }
+            }
         })
     };
     if let Err(e) = r {

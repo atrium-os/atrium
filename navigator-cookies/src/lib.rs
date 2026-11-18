@@ -329,6 +329,8 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             let (status, headers, body) = match resp {
                 Response::Http { status, headers, body } => (status, headers, body),
                 Response::Refused(r) => return Err(Refused::CourierRefused(format!("{r:?}"))),
+                // Navigator never asks a courier for an event stream.
+                other => return Err(Refused::CourierRefused(format!("{other:?}"))),
             };
             let location = headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone());
             match (status, location) {

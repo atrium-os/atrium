@@ -88,7 +88,76 @@ impl<'a> Courier<'a> {
         }
     }
 
-    fn send(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<Response, Refusal> {
+    /// Handle one request frame, writing the reply frames to `out`: one
+    /// frame, or for an event stream ([`wants_events`]) a frame per event
+    /// until the stream ends. `Err` only when `out` fails.
+    pub fn handle_to(&mut self, frame: &[u8], vault: &mut dyn Vault, out: &mut dyn Write) -> std::io::Result<()> {
+        match Request::decode(frame) {
+            Ok(req) if wants_events(&req) => {
+                let r = self.events(&req, vault, out);
+                // A stream's connection is never reused.
+                self.conn = None;
+                match r {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => write_frame(out, &Response::Refused(e).encode()),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => write_frame(out, &self.handle(frame, vault).encode()),
+        }
+    }
+
+    /// An event stream: the head, then each event as it comes, masked like
+    /// a body. The outer `Err` is the client gone; the inner one a refusal
+    /// to send in place of the rest.
+    fn events(&mut self, req: &Request, vault: &mut dyn Vault, out: &mut dyn Write) -> std::io::Result<Result<(), Refusal>> {
+        let (mut s, values, cookie, path) = match self.start(req, vault) {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
+        s.sock.set_read_timeout(Some(EVENTS_WAIT)).ok();
+        let Ok((head, rest)) = navigator_fetch::http::read_head(&mut s, false) else { return Ok(Err(Refusal::Http)) };
+        let is_events = head.header("content-type").is_some_and(|t| t.to_ascii_lowercase().starts_with("text/event-stream"));
+        let mut body = navigator_fetch::http::Body::new(&head, rest);
+        if !(200..300).contains(&head.status) || !is_events {
+            // An ordinary answer (a refusal, a redirect): whole, as usual.
+            let mut b = Vec::new();
+            loop {
+                match body.next(&mut s, 64 * 1024) {
+                    Ok(Some(c)) if b.len() + c.len() <= crate::schema::BODY_MAX => b.extend_from_slice(&c),
+                    Ok(None) => break,
+                    _ => return Ok(Err(Refusal::Http)),
+                }
+            }
+            let r = scrub(navigator_fetch::http::Response { status: head.status, headers: head.headers, body: b }, &values, cookie.as_ref(), &path, req.ticket.as_ref(), vault);
+            return write_frame(out, &r.encode()).map(|_| Ok(()));
+        }
+        let Response::Http { status, headers, .. } = scrub(navigator_fetch::http::Response { status: head.status, headers: head.headers, body: Vec::new() }, &values, cookie.as_ref(), &path, req.ticket.as_ref(), vault) else {
+            return Ok(Err(Refusal::Internal));
+        };
+        write_frame(out, &Response::Events { status, headers }.encode())?;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            // Each whole event (up to a blank line), masked, on its own.
+            while let Some(end) = event_end(&buf) {
+                let mut e: Vec<u8> = buf.drain(..end).collect();
+                mask_body(&mut e, &values, cookie.as_ref());
+                write_frame(out, &Response::Event(e).encode())?;
+            }
+            if buf.len() > crate::schema::EVENT_MAX {
+                return Ok(Err(Refusal::Http));
+            }
+            match body.next(&mut s, 16 * 1024) {
+                Ok(Some(c)) => buf.extend_from_slice(&c),
+                Ok(None) => return write_frame(out, &Response::EventsEnd.encode()).map(|_| Ok(())),
+                // Quiet past the wait, or cut off: the stream is over.
+                Err(_) => return write_frame(out, &Response::EventsEnd.encode()).map(|_| Ok(())),
+            }
+        }
+    }
+
+    /// Connect (or reuse), fill the slots and write the request.
+    fn start(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<(Tls, Vec<LockedBuf>, Option<LockedBuf>, String), Refusal> {
         // A kept-alive connection is already past TLS to this host; a
         // fresh one gets there before the vault is asked.
         let mut s = match self.conn.take() {
@@ -115,12 +184,42 @@ impl<'a> Courier<'a> {
             s.write_all(wire.as_ref()).and_then(|_| s.flush()).map_err(|_| Refusal::Http)?;
         }
         drop(wire);
+        Ok((s, values, cookie, path.to_string()))
+    }
+
+    fn send(&mut self, req: &Request, vault: &mut dyn Vault) -> Result<Response, Refusal> {
+        let (mut s, values, cookie, path) = self.start(req, vault)?;
+        let path = path.as_str();
         let (resp, keep) = read(&mut s, req.method)?;
         if keep {
             self.conn = Some(s);
         }
         Ok(scrub(resp, &values, cookie.as_ref(), path, req.ticket.as_ref(), vault))
     }
+}
+
+/// How long an event stream may be quiet: servers ping well within it
+/// (Mail asks for a ping a minute).
+pub const EVENTS_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// A `GET` asking for `text/event-stream`.
+pub fn wants_events(req: &Request) -> bool {
+    req.method == Method::Get && req.headers.iter().any(|(h, v)| *h == crate::schema::Header::Accept && v.eq_ignore_ascii_case(b"text/event-stream"))
+}
+
+/// Where the first whole event in `b` ends (after its blank line).
+fn event_end(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < b.len() {
+        match (b[i], b[i + 1]) {
+            (b'\n', b'\n') => return Some(i + 2),
+            (b'\r', b'\r') if b.get(i + 2) != Some(&b'\n') => return Some(i + 2),
+            (b'\r', b'\n') if b.get(i + 2..i + 4) == Some(b"\r\n") => return Some(i + 4),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn read(s: &mut Tls, method: Method) -> Result<(navigator_fetch::http::Response, bool), Refusal> {
@@ -338,18 +437,33 @@ fn scrub(
         }
         *v = String::from_utf8(vb).unwrap_or_default();
     }
+    mask_body(&mut body, values, cookie);
+    Response::Http { status, headers: out, body }
+}
+
+/// The filled values and the cookies sent, out of a body (as sent, form
+/// or JSON-escaped).
+fn mask_body(body: &mut [u8], values: &[LockedBuf], cookie: Option<&LockedBuf>) {
+    let cookie_values: Vec<&[u8]> = cookie
+        .map(|c| {
+            c.as_ref()
+                .split(|&b| b == b';')
+                .filter_map(|p| p.iter().position(|&b| b == b'=').map(|i| &p[i + 1..]))
+                .filter(|v| v.len() >= COOKIE_MASK_MIN)
+                .collect()
+        })
+        .unwrap_or_default();
     for c in &cookie_values {
-        mask(&mut body, c);
+        mask(body, c);
     }
     for val in values {
-        mask(&mut body, val.as_ref());
+        mask(body, val.as_ref());
         for e in [Encoding::Form, Encoding::JsonString] {
             if let Ok(enc) = encode(val.as_ref(), e) {
-                mask(&mut body, enc.as_ref());
+                mask(body, enc.as_ref());
             }
         }
     }
-    Response::Http { status, headers: out, body }
 }
 
 /// Read one client frame (`u32 LE length | bytes`) from `r`.
@@ -369,7 +483,7 @@ pub fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
     Ok(Some(b))
 }
 
-pub fn write_frame(w: &mut impl Write, b: &[u8]) -> std::io::Result<()> {
+pub fn write_frame<W: Write + ?Sized>(w: &mut W, b: &[u8]) -> std::io::Result<()> {
     w.write_all(&(b.len() as u32).to_le_bytes())?;
     w.write_all(b)?;
     w.flush()

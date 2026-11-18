@@ -556,6 +556,55 @@ pub fn utc_string(t: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
+// ── push (RFC 8620 §7.3) ─────────────────────────────────────────────
+
+/// The event-source URL from the session's template: these `types`,
+/// `closeafter`, and a ping every `ping` seconds.
+pub fn event_source_url(template: &str, types: &str, closeafter: &str, ping: u32) -> String {
+    template.replace("{types}", types).replace("{closeafter}", closeafter).replace("{ping}", &ping.to_string())
+}
+
+/// One server-sent event (up to its blank line): its type (`message` when
+/// unnamed) and its data lines joined by `\n`.
+pub fn sse_event(raw: &[u8]) -> Option<(String, String)> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let (mut kind, mut data, mut any) = (String::from("message"), String::new(), false);
+    for line in text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)) {
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = line.split_once(':').map(|(f, v)| (f, v.strip_prefix(' ').unwrap_or(v))).unwrap_or((line, ""));
+        match field {
+            "event" => kind = value.to_string(),
+            "data" => {
+                if any {
+                    data.push('\n');
+                }
+                data.push_str(value);
+                any = true;
+            }
+            _ => {}
+        }
+    }
+    any.then_some((kind, data))
+}
+
+/// A `StateChange`'s new states for `account`, by type, sorted; `None` if
+/// the data isn't one or doesn't name the account.
+pub fn state_change(data: &str, account: &str) -> Option<Vec<(String, String)>> {
+    if data.len() > 64 * 1024 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    if v.get("@type").and_then(Value::as_str) != Some("StateChange") {
+        return None;
+    }
+    let types = v.get("changed")?.get(account)?.as_object()?;
+    let mut out: Vec<(String, String)> = types.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).take(32).collect();
+    out.sort();
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +643,20 @@ mod tests {
         assert!(changes(&a).is_ok(), "created ids come from the gets");
         let a = answers(br#"{"methodResponses":[["Email/changes",{"newState":"2","destroyed":["../x"]},"c"],["Email/get",{"list":[],"state":"2"},"gc"],["Email/get",{"list":[],"state":"2"},"gu"]]}"#).unwrap();
         assert!(changes(&a).is_err());
+    }
+
+    #[test]
+    fn push_events() {
+        assert_eq!(
+            event_source_url("https://h/es?types={types}&closeafter={closeafter}&ping={ping}", "Email,Mailbox", "no", 60),
+            "https://h/es?types=Email,Mailbox&closeafter=no&ping=60"
+        );
+        let (k, d) = sse_event(b"event: state\r\ndata: {\"@type\":\"StateChange\",\r\ndata: \"changed\":{\"u1\":{\"Mailbox\":\"m2\",\"Email\":\"e9\"}}}\r\n\r\n").unwrap();
+        assert_eq!(k, "state");
+        assert_eq!(state_change(&d, "u1").unwrap(), vec![("Email".into(), "e9".into()), ("Mailbox".into(), "m2".into())]);
+        assert_eq!(state_change(&d, "u2"), None);
+        assert_eq!(sse_event(b"event: ping\ndata: {\"interval\":60}\n\n").unwrap().0, "ping");
+        assert_eq!(sse_event(b": just a comment\n\n"), None);
+        assert_eq!(state_change("{\"@type\":\"Other\"}", "u1"), None);
     }
 }

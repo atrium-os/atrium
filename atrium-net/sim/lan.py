@@ -64,7 +64,7 @@ stats = {"discover": 0, "request": 0, "renew": 0, "rebind": 0, "reboot": 0,
          "decline": 0, "arp_conflict": 0,
          "rs": 0, "ra": 0, "ns": 0, "ping6": 0, "dns6": 0, "hostile6_sent": 0,
          "d6_solicit": 0, "d6_request": 0, "d6_renew": 0, "d6_rebind": 0, "d6_info": 0,
-         "d6_hostile_sent": 0}
+         "d6_hostile_sent": 0, "mdns_query": 0, "mdns_answer": 0}
 mode6 = "good6"
 d6 = "d6-off"
 d6_last = None  # (client mac, client ll, xid, client id, iaid) of the last client message
@@ -211,6 +211,104 @@ def dns_answer(q):
     else:
         ans = b""
     return struct.pack("!HHHHHH", qid, rflags, 1, 1 if hit else 0, 0, 0) + question + ans
+
+
+# ---- mDNS: a printer on the LAN (printing.md §7.1, atrium-net print-discovery) ----
+# Control words: `mdns-printer IP PORT` answers _ipp/_ipps PTR queries with
+# PTR+SRV+TXT+A for one printer ("Gate Printer" at IP:PORT), unicast to the
+# asker when the question has the QU bit, else to 224.0.0.251; `mdns-flood`
+# answers each query with a burst of hostile answers; `mdns-off` is silent.
+MDNS_SRC = bytes([10, 88, 0, 60])
+MDNS_MAC = bytes.fromhex("024e0000003c")
+MDNS_GROUP = bytes([224, 0, 0, 251])
+mdns = "mdns-off"
+mdns_printer = (bytes([10, 0, 2, 2]), 8661)
+
+
+def dname(*labels):
+    return b"".join(bytes([len(l)]) + l for l in labels) + b"\0"
+
+
+def rr(name, typ, ttl, rdata, flush=True):
+    return name + struct.pack("!HHIH", typ, 0x8001 if flush else 1, ttl, len(rdata)) + rdata
+
+
+def mdns_questions(m):
+    """(service, QU) for each question naming _ipp._tcp.local or _ipps._tcp.local."""
+    if len(m) < 12:
+        return []
+    qd = struct.unpack("!H", m[4:6])[0]
+    i, out = 12, []
+    for _ in range(min(qd, 8)):
+        labels = []
+        while i < len(m) and m[i] and m[i] < 64:
+            labels.append(m[i + 1:i + 1 + m[i]].lower())
+            i += 1 + m[i]
+        i += 1
+        if i + 4 > len(m):
+            break
+        qt, qc = struct.unpack("!HH", m[i:i + 4])
+        i += 4
+        if qt in (12, 255) and labels[1:] == [b"_tcp", b"local"] and labels[:1] in ([b"_ipp"], [b"_ipps"]):
+            out.append((labels[0], bool(qc & 0x8000)))
+    return out
+
+
+def mdns_answer(svc):
+    ip_, port = mdns_printer
+    inst = dname(b"Gate Printer", svc, b"_tcp", b"local")
+    host = dname(b"gateprinter", b"local")
+    txt = b"".join(bytes([len(t)]) + t for t in [b"txtvers=1", b"rp=ipp/print", b"pdl=application/pdf,image/urf", b"UUID=6d5f3c8e-0d4a-4f43-9a8e-61a7f1b8c0de"])
+    ans = [rr(dname(svc, b"_tcp", b"local"), 12, 4500, inst, flush=False),
+           rr(inst, 33, 120, struct.pack("!HHH", 0, 0, port) + host),
+           rr(inst, 16, 4500, txt),
+           rr(host, 1, 120, ip_)]
+    return struct.pack("!HHHHHH", 0, 0x8400, 0, len(ans), 0, 0) + b"".join(ans)
+
+
+def mdns_flood():
+    """About 1000 hostile answers: distinct instances, pointer loops,
+    oversized names and TXT, TTL-0 churn, records claiming more than they hold."""
+    out = []
+    ptr = dname(b"_ipp", b"_tcp", b"local")
+    for k in range(1000):
+        kind = k % 6
+        if kind == 0:  # many distinct instances
+            body = rr(ptr, 12, 4500, dname(b"Junk %d" % k, b"_ipp", b"_tcp", b"local"), flush=False)
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + body
+        elif kind == 1:  # a name that points at itself
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + b"\xc0\x0c" + struct.pack("!HHIH", 12, 1, 120, 2) + b"\xc0\x0c"
+        elif kind == 2:  # labels that run past the end, 63-byte labels x 5
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + b"".join(bytes([63]) + b"x" * 63 for _ in range(5)) + bytes([63]) + b"y" * 10
+        elif kind == 3:  # TXT of ~1400 bytes in 255-byte strings
+            t = b"".join(bytes([255]) + bytes([0x41 + (k % 26)]) * 255 for _ in range(5))
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + rr(dname(b"Junk %d" % (k - 3), b"_ipp", b"_tcp", b"local"), 16, 120, t)
+        elif kind == 4:  # TTL 0: goodbye for an instance just announced
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0) + rr(ptr, 12, 0, dname(b"Junk %d" % (k - 4), b"_ipp", b"_tcp", b"local"), flush=False)
+        else:  # counts far beyond the records, and a record longer than the message
+            m = struct.pack("!HHHHHH", 0, 0x8400, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF) + ptr + struct.pack("!HHIH", 12, 1, 120, 0xFFFF)
+        out.append(m)
+    return out
+
+
+def handle_mdns(src_mac, s, sport, m):
+    qs = mdns_questions(m)
+    if not qs or mdns == "mdns-off":
+        return []
+    stats["mdns_query"] += 1
+    qu = any(u for _, u in qs)
+    if mdns == "mdns-flood":
+        msgs = mdns_flood()
+    else:
+        msgs = [mdns_answer(svc) for svc, _ in qs]
+    frames = []
+    for a in msgs:
+        stats["mdns_answer"] += 1
+        if qu:
+            frames.append(eth(src_mac, MDNS_MAC, 0x0800, ip(MDNS_SRC, s, 17, udp(MDNS_SRC, s, 5353, sport, a))))
+        else:
+            frames.append(eth(bytes.fromhex("01005e0000fb"), MDNS_MAC, 0x0800, ip(MDNS_SRC, MDNS_GROUP, 17, udp(MDNS_SRC, MDNS_GROUP, 5353, 5353, a))))
+    return frames
 
 
 # ---- "the internet": one HTTP answer per TCP connection ----------------------
@@ -502,6 +600,8 @@ def frame(f):
         sport, dport = struct.unpack("!HH", body[:4])
         if dport == 67:
             return handle_dhcp(src, body[8:])
+        if dport == 5353 and d == MDNS_GROUP:
+            return handle_mdns(src, s, sport, body[8:])
         if dport == 53 and d == DNS:
             stats["dns"] += 1
             a = dns_answer(body[8:])
@@ -518,7 +618,7 @@ def frame(f):
 
 
 def main():
-    global mode, mode6, web, d6, conflict, declined
+    global mode, mode6, web, d6, conflict, declined, mdns, mdns_printer
     lan = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     lan.bind(LAN)
     ctl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -566,10 +666,16 @@ def main():
                 d6 = w
                 print(f"lan: {w}", flush=True)
                 lan.sendto(good_ra(), GUEST)
+            ws = w.split()
+            if ws and ws[0] in ("mdns-printer", "mdns-flood", "mdns-off"):
+                mdns = ws[0]
+                if ws[0] == "mdns-printer" and len(ws) == 3:
+                    mdns_printer = (socket.inet_aton(ws[1]), int(ws[2]))
+                print(f"lan: {w}", flush=True)
             if w in ("good6", "hostile6", "flap6"):
                 mode6 = w
                 print(f"lan: mode {w}", flush=True)
-            ctl.sendto(json.dumps(dict(stats, mode=mode, web=web, d6=d6)).encode(), a)
+            ctl.sendto(json.dumps(dict(stats, mode=mode, web=web, d6=d6, mdns=mdns)).encode(), a)
 
 
 if __name__ == "__main__":

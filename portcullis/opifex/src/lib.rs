@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod archive;
+pub mod catalogs;
 pub mod content;
 pub mod daemon;
 pub mod driver;

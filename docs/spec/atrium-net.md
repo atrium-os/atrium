@@ -325,6 +325,21 @@ check on `network-wifi`; there is no separate grant store. `network-configure` i
 restricted (settings app only). Apps never reach atrium-net itself: `atrium-netconf`
 serves the five sockets.
 
+Printer discovery (2026-11-18, for printing.md §7.1): a sixth socket, `print-discovery`
+(directory 0700, socket 0600, peer must be root: prelumd only, never granted to an
+app), with one op, `PRINT_DISCOVERY` (0x50). Its answer is the active interface's name
+with two descriptors, in this order: **receive** (bound 0.0.0.0:5353 with SO_REUSEPORT,
+joined to 224.0.0.251 on that interface, sending side shut down) and **send** (bound
+5353, `IP_MULTICAST_IF` that interface, TTL 255, no loopback, connected to
+224.0.0.251:5353, so it reaches nothing else: FreeBSD refuses `sendto` elsewhere with
+EISCONN). A worker sends QU queries on the send socket and reads unicast and multicast
+answers on the receive one, without leaving capability mode. No interface with an IPv4
+address: `FAILED` "no-network". atrium-net cannot bind in capability mode, so its
+spawner (§10.1) makes the pair (`b'M'` + the interface's address) and atrium-net
+passes them up its control socket (`mdns4`) with SCM_RIGHTS. Client:
+`atrium_netconf::client::Client::print_discovery()`; check tool `atrium-netctl --app
+print-discovery printers SECS`. IPv6 (ff02::fb) can follow as an optional second pair.
+
 ### 7.2 atrium-netd
 
 One event, `egress-changed {iface}`, over atrium-netd's existing control socket; it

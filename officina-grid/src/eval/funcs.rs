@@ -2,7 +2,8 @@
 //! information, text, lookup and dates. Each function gets its argument expressions
 //! unevaluated, so IF, IFERROR and CHOOSE evaluate only what they use.
 
-use super::criteria::Criterion;
+use super::criteria::{Criterion, Key};
+use super::ifcache;
 use super::dates;
 use super::arrays::*;
 use super::{to_bool, to_num, to_text, Array, Ctx, Ev};
@@ -586,6 +587,20 @@ fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
     let sum_range = if a.len() > 2 && !missing(&a[2]) { Some(tri!(rect_arg(c, &a[2]))) } else { None };
     let mut s = 0.0;
     let target = sum_range.as_ref().or(Some(&range)).copied();
+    // One column: the index adds in the walk's order (rows down).
+    if let Some(k) = crit.eq_key().filter(|_| range.c0 == range.c1) {
+        let built = ifcache::lookup((vec![range], target), &[k], |emit| {
+            pairs(c, &range, target.as_ref(), true, &mut |x, y| {
+                if let Some(k) = Key::of(x) {
+                    emit(vec![k], if let Value::Num(z) = y { Some(z) } else { None });
+                }
+            });
+            true
+        });
+        if let Some(a) = built {
+            return n(a.sum);
+        }
+    }
     pairs(c, &range, target.as_ref(), crit.matches_empty(), &mut |x, y| {
         if crit.test(x) {
             if let Value::Num(z) = y {
@@ -598,7 +613,7 @@ fn sumif(c: &Ctx, a: &[Expr]) -> Ev {
 
 /// SUMIFS / COUNTIFS / AVERAGEIF(S): walks the first criteria range (stored cells, or all
 /// cells when an empty cell can match) and tests the others at the same offsets.
-fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn FnMut(Value)) -> Result<(), ErrorKind> {
+fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn FnMut(Value)) -> Result<Option<ifcache::Agg>, ErrorKind> {
     let mut crits = Vec::new();
     for p in pairs_args.chunks(2) {
         if p.len() < 2 {
@@ -614,6 +629,40 @@ fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn
     if let Some(vr) = &value_range {
         if vr.rows() != first.rows() || vr.cols() != first.cols() {
             return Err(ErrorKind::Value);
+        }
+    }
+    if let Some(keys) = crits.iter().map(|(_, cr)| cr.eq_key()).collect::<Option<Vec<Key>>>().filter(|_| first.c0 == first.c1) {
+        let shape = (crits.iter().map(|(r, _)| *r).collect(), value_range);
+        let built = ifcache::lookup(shape, &keys, |emit| {
+            let mut walk = |row: u32, col: u32, x: &Value| {
+                let Some(k0) = Key::of(x) else { return };
+                let (dr, dc) = (row - first.r0, col - first.c0);
+                let mut ks = Vec::with_capacity(crits.len());
+                ks.push(k0);
+                for (r, _) in &crits[1..] {
+                    let Some(k) = Key::of(&c.wb.value(r.sheet, r.r0 + dr, r.c0 + dc)) else { return };
+                    ks.push(k);
+                }
+                let v = match &value_range {
+                    Some(vr) => match c.wb.value(vr.sheet, vr.r0 + dr, vr.c0 + dc) {
+                        Value::Num(z) => Some(z),
+                        _ => None,
+                    },
+                    None => None,
+                };
+                emit(ks, v);
+            };
+            if let Some(cl) = c.clip(first) {
+                for row in cl.r0..=cl.r1 {
+                    for col in cl.c0..=cl.c1 {
+                        walk(row, col, &c.wb.value(first.sheet, row, col));
+                    }
+                }
+            }
+            true
+        });
+        if built.is_some() {
+            return Ok(built);
         }
     }
     let with_empty = fc.matches_empty();
@@ -643,17 +692,19 @@ fn multi_if(c: &Ctx, value_range: Option<Rect>, pairs_args: &[Expr], f: &mut dyn
     } else if let Some(cl) = c.clip(first) {
         c.wb.each(&cl, &mut |row, col, x| visit(row, col, &x));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn sumifs(c: &Ctx, a: &[Expr]) -> Ev {
     let vr = tri!(rect_arg(c, &a[0]));
     let mut s = 0.0;
-    tri!(multi_if(c, Some(vr), &a[1..], &mut |x| {
+    if let Some(a) = tri!(multi_if(c, Some(vr), &a[1..], &mut |x| {
         if let Value::Num(z) = x {
             s += z
         }
-    }));
+    })) {
+        return n(a.sum);
+    }
     n(s)
 }
 fn countif(c: &Ctx, a: &[Expr]) -> Ev {
@@ -661,19 +712,23 @@ fn countif(c: &Ctx, a: &[Expr]) -> Ev {
 }
 fn countifs(c: &Ctx, a: &[Expr]) -> Ev {
     let mut k = 0u64;
-    tri!(multi_if(c, None, a, &mut |_| k += 1));
+    if let Some(a) = tri!(multi_if(c, None, a, &mut |_| k += 1)) {
+        return n(a.count as f64);
+    }
     n(k as f64)
 }
 fn averageif(c: &Ctx, a: &[Expr]) -> Ev {
     let range = tri!(rect_arg(c, &a[0]));
     let vr = if a.len() > 2 && !missing(&a[2]) { tri!(rect_arg(c, &a[2])) } else { range };
     let (mut s, mut k) = (0.0, 0u64);
-    tri!(multi_if(c, Some(vr), &a[..2], &mut |x| {
+    if let Some(agg) = tri!(multi_if(c, Some(vr), &a[..2], &mut |x| {
         if let Value::Num(z) = x {
             s += z;
             k += 1;
         }
-    }));
+    })) {
+        (s, k) = (agg.sum, agg.nums);
+    }
     if k == 0 {
         e(ErrorKind::Div0)
     } else {

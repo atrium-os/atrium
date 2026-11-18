@@ -11,31 +11,45 @@
 # sites given. opifexd starts it with `portcullis launch --no-prompt`, so it
 # gets the system's grant here, once. The key must be on the side-load list
 # (/etc/atrium/publishers) until launch trust reads the catalog (C5).
+#
+#   sh opifex-fetch-bundle.sh --any <opifex-fetch binary> <signing key.pem>
+#
+# builds the second fetcher, org.atrium.opifex.fetch-any (C7): the same
+# binary with net-fetch to any https host, for the catalogs people add, their
+# archives, and publishers' domain proofs (DNS TXT through Nuntius, or
+# /.well-known/atrium-publisher). opifexd trusts nothing either brings.
 set -e
+ID=org.atrium.opifex.fetch NAME="Opifex fetcher" B=/root/opifex-fetch-bundle
+if [ "${1:-}" = --any ]; then
+    ID=org.atrium.opifex.fetch-any NAME="Opifex fetcher (other catalogs)" B=/root/opifex-fetch-any-bundle
+    shift
+fi
 BIN=$1 KEY=$2
-[ -x "$BIN" ] && [ -f "$KEY" ] || { echo "usage: $0 <opifex-fetch> <key.pem> [site…]"; exit 2; }
+[ -x "$BIN" ] && [ -f "$KEY" ] || { echo "usage: $0 [--any] <opifex-fetch> <key.pem> [site…]"; exit 2; }
 shift 2
 SITES='"atrium-os.github.io", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"'
 for s in "$@"; do SITES="$SITES, \"$s\""; done
-B=/root/opifex-fetch-bundle
+SITELINE="net-fetch-sites = [$SITES]"
+[ $ID = org.atrium.opifex.fetch-any ] && SITELINE="" SITES="any https host"
+
 rm -rf $B && mkdir -p $B/bin
 cp "$BIN" $B/bin/opifex-fetch
 cat > $B/atrium.toml <<T
 [app]
-id = "org.atrium.opifex.fetch"
-name = "Opifex fetcher"
+id = "$ID"
+name = "$NAME"
 version = "1"
 entry = "bin/opifex-fetch"
 description = "Brings opifexd the catalog and archives, through Nuntius"
 
 [capabilities]
 net-fetch = true
-net-fetch-sites = [$SITES]
+$SITELINE
 T
 openssl pkcs8 -topk8 -nocrypt -in "$KEY" -out $B.key8 2>/dev/null || cp "$KEY" $B.key8
 opifex pack $B --sign $B.key8 >/dev/null
 rm -f $B.key8
-opifex uninstall org.atrium.opifex.fetch >/dev/null 2>&1 || true
+opifex uninstall $ID >/dev/null 2>&1 || true
 opifex install $B
-portcullis policy grant --system org.atrium.opifex.fetch
-echo "opifex-fetch-bundle: installed (sites: $SITES)"
+portcullis policy grant --system $ID
+echo "opifex-fetch-bundle: $ID installed (sites: $SITES)"

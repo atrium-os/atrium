@@ -54,19 +54,41 @@ pub const IDLE_RENEW: u64 = 25 * 60;
 /// How a watch ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Watched {
-    /// The server has no `IDLE`: the account is polled instead.
+    /// The server has no push (`IDLE`, or a JMAP event source): the account
+    /// is polled instead.
     NoIdle,
     /// The caller said stop.
     Stopped,
 }
 
-/// Watch an IMAP account's inbox with `IDLE` (§6.1) on a connection of its
-/// own: `changed()` after each change the server reports (return `false`
-/// to stop). `held` gets a clone of the connection, so another thread can
-/// shut it down to end a wait early. An error is the connection failing.
-pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(UnixStream), changed: &mut dyn FnMut() -> bool) -> Result<Watched, String> {
-    let Protocol::Imap { imap, .. } = &cfg.protocol else { return Ok(Watched::NoIdle) };
+/// A JMAP stream that ends sooner than this after it began is a failure
+/// (backed off), not a renewal.
+pub const STREAM_MIN_SECS: u64 = 30;
+
+/// Watch an account for new mail (§6.1): an IMAP inbox with `IDLE` on a
+/// connection of its own, or a JMAP account's event source. `on(true)`
+/// after each change the server reports, `on(false)` at each sign of life
+/// (a renewed `IDLE`, a ping); return `false` to stop. `held` gets a clone
+/// of an IMAP connection, so another thread can shut it down to end a wait
+/// early. An error is the connection failing.
+pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(UnixStream), on: &mut dyn FnMut(bool) -> bool) -> Result<Watched, String> {
     let item = cfg.incoming_item.ok_or("no sign-in for the incoming server")?;
+    let imap = match &cfg.protocol {
+        Protocol::Imap { imap, .. } => imap,
+        Protocol::Jmap { session } => {
+            let h = net.jmap(session, &item)?;
+            let mut client = mail_sync::jmap::Client::connect(h, session).map_err(|e| e.to_string())?;
+            loop {
+                let began = std::time::Instant::now();
+                match client.watch(on).map_err(|e| e.to_string())? {
+                    mail_sync::jmap::Pushed::NoPush => return Ok(Watched::NoIdle),
+                    mail_sync::jmap::Pushed::Stopped => return Ok(Watched::Stopped),
+                    mail_sync::jmap::Pushed::Ended if began.elapsed().as_secs() < STREAM_MIN_SECS => return Err("the server ended its event stream at once".into()),
+                    mail_sync::jmap::Pushed::Ended => {}
+                }
+            }
+        }
+    };
     let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
     s.set_read_timeout(Some(std::time::Duration::from_secs(IDLE_RENEW))).map_err(|e| e.to_string())?;
     held(s.try_clone().map_err(|e| e.to_string())?);
@@ -76,7 +98,8 @@ pub fn watch_inbox(cfg: &AccountConfig, net: &dyn Connect, held: &mut dyn FnMut(
         return Ok(Watched::NoIdle);
     }
     loop {
-        if session.idle("INBOX").map_err(|e| e.to_string())? && !changed() {
+        let changed = session.idle("INBOX").map_err(|e| e.to_string())?;
+        if !on(changed) {
             let _ = session.logout();
             return Ok(Watched::Stopped);
         }

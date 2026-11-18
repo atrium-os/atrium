@@ -10,6 +10,7 @@
 //!
 //!   atrium-netconf [--ctl PATH] [--dir DIR] [--uid N] [--capsicum] [-v]
 
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -29,12 +30,53 @@ struct Peer {
     s: UnixStream,
     r: Reader,
     pending: Vec<Line>,
+    /// Descriptors atrium-net sent with a reply (`mdns4`), oldest first.
+    fds: Vec<OwnedFd>,
+}
+
+/// Reads with recvmsg so descriptors sent along are kept, not dropped.
+struct WithFds<'a> {
+    s: &'a UnixStream,
+    fds: &'a mut Vec<OwnedFd>,
+}
+
+impl std::io::Read for WithFds<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+        let mut cbuf = [0u64; 8];
+        // SAFETY: msghdr is plain data; the buffers outlive the call.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+        // SAFETY: valid socket and message.
+        let n = unsafe { libc::recvmsg(self.s.as_raw_fd(), &mut msg, 0) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the kernel filled the control buffer; only SCM_RIGHTS is read.
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let k = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+                    let d = libc::CMSG_DATA(c) as *const RawFd;
+                    for i in 0..k {
+                        self.fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(d.add(i))));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        Ok(n as usize)
+    }
 }
 
 impl Peer {
     fn connect(p: &str) -> Peer {
         let s = UnixStream::connect(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
-        Peer { s, r: Reader::default(), pending: Vec::new() }
+        Peer { s, r: Reader::default(), pending: Vec::new(), fds: Vec::new() }
     }
 
     /// The next line; atrium-net gone ends the process.
@@ -43,7 +85,8 @@ impl Peer {
             if !self.pending.is_empty() {
                 return Some(self.pending.remove(0));
             }
-            match self.r.fill(&mut self.s) {
+            let mut rd = WithFds { s: &self.s, fds: &mut self.fds };
+            match self.r.fill(&mut rd) {
                 Ok(v) => self.pending.extend(v.into_iter().filter_map(|g| if let Got::Line(l) = g { Some(l) } else { None })),
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return None,
                 Err(_) => die("atrium-net closed its control socket"),
@@ -75,6 +118,10 @@ impl Front {
     /// A request to atrium-net: its reply lines, the last `ok` left out.
     fn call(&self, l: &Line) -> Res<Vec<Line>> {
         let mut p = self.calls.lock().unwrap();
+        self.call_locked(&mut p, l)
+    }
+
+    fn call_locked(&self, p: &mut Peer, l: &Line) -> Res<Vec<Line>> {
         if l.send(&mut p.s).is_err() {
             die("atrium-net closed its control socket");
         }
@@ -295,17 +342,35 @@ impl Backend for Front {
         }
         self.call(&l).map(|_| ())
     }
+
+    fn print_discovery(&self) -> Res<(String, [OwnedFd; 2])> {
+        // Holding the lock across the call: the fds that come belong to it.
+        let mut p = self.calls.lock().unwrap();
+        p.fds.clear();
+        let v = self.call_locked(&mut p, &Line::new("mdns4"))?;
+        let name = v.iter().find(|l| l.verb == "mdns4").and_then(|l| l.get("iface")).unwrap_or("?").to_string();
+        if p.fds.len() != 2 {
+            p.fds.clear();
+            return Err(Fail::new(status::FAILED, "atrium-net sent no sockets"));
+        }
+        let w = p.fds.pop().unwrap();
+        let r = p.fds.pop().unwrap();
+        self.log(&format!("print-discovery: sockets on {name}"));
+        Ok((name, [r, w]))
+    }
 }
 
 fn listen(dir: &Path, g: Grant) -> UnixListener {
     let d = dir.join(g.name());
     std::fs::create_dir_all(&d).unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
-    let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+    // print-discovery is root's (prelumd) alone: no jail gets it either.
+    let root_only = g == Grant::PrintDiscovery;
+    let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(if root_only { 0o700 } else { 0o755 }));
     let p: PathBuf = d.join(format!("{}.sock", g.name()));
     let _ = std::fs::remove_file(&p);
     let l = UnixListener::bind(&p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
     // Who reaches the socket is decided by which jails get its directory.
-    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666));
+    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if root_only { 0o600 } else { 0o666 }));
     l
 }
 
@@ -384,6 +449,9 @@ fn main() {
         hs.push(std::thread::spawn(move || {
             for s in l.incoming() {
                 let Ok(s) = s else { continue };
+                if g == Grant::PrintDiscovery && aura_ipc::sock::peer_uid(&s) != Some(0) {
+                    continue;
+                }
                 let f = f.clone();
                 std::thread::spawn(move || {
                     if let Ok(c) = aqueduct::Connection::wrap(s) {

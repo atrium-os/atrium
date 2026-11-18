@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -226,7 +226,8 @@ reply.
 
 JMAP needs none of this: it is HTTP with a bearer token or Basic, so `mail-sync` uses the
 existing courier with a slot-filled `Authorization` (arca.md §4.3 class 2), and the push
-channel (EventSource, RFC 8620 §7.3) is one long-lived courier request.
+channel (EventSource, RFC 8620 §7.3) is one long-lived courier request, which the
+courier passes on one event at a time (arca.md §5.5).
 
 ### 5.3 OAuth providers
 
@@ -1361,8 +1362,18 @@ Stalwart in the cloud VM, and later a real account):
    Tests: Dovecot 2 (a new message is reported within seconds; shutting the connection
    ends the watch), app 2 (a watcher wakes its account and stops; a server without IDLE
    is polled). The window's "Get mail" still runs a pass at once. Microsoft sign-in waits
-   for Navigator's sign-in sheet (Shankar, 2026-11-18). **Not yet**: JMAP push
-   (EventSource), IDLE on folders other than the inbox, mains/battery intervals.
+   for Navigator's sign-in sheet (Shankar, 2026-11-18).
+   **JMAP push built on the host (2026-11-18)**: the HTTP courier passes an event
+   stream on one event at a time, secrets masked (arca.md §5.5). A JMAP account's
+   watcher listens on the session's `eventSourceUrl` for `Email`, `Mailbox` and
+   `EmailDelivery` with a ping a minute; when the account's states move it wakes a pass
+   for that account (once on connecting too, since the first states may be news). A
+   stream the server ends is opened again, unless it ended within 30 seconds, which
+   backs off like a failure; a session without an event source is polled. Tests:
+   courier 1 (events split across chunks, the token masked inside one), engine 1 (state
+   changes only, other accounts ignored, no event source, a stream ended), app 1. **Not
+   yet**: IDLE on folders other than the inbox, mains/battery intervals, a VM run of
+   either push against real servers.
 
 ## 17. Decisions, with recommendations
 

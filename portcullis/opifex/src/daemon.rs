@@ -18,6 +18,7 @@ use opifex_catalog as oc;
 use sha2::{Digest, Sha256};
 
 use crate::app;
+use crate::catalogs::{self, Cat};
 use crate::fetch;
 use crate::updates::{self, Action, Pending, PrefStore};
 use crate::installed::{Record, Store};
@@ -44,6 +45,9 @@ pub struct Daemon {
     /// is served until it names its own locations (`fetch::CATALOG_URL`).
     pub fetch_cmd: Vec<String>,
     pub catalog_url: String,
+    /// The fetcher for everything outside the Atrium catalog: catalogs people
+    /// added, their archives, domain proofs (`fetch::FETCH_ANY_CMD`, C7).
+    pub fetch_any_cmd: Vec<String>,
     /// praecod's socket, for the notice about updates waiting on a person
     /// (opifexd posts as a system poster: `PRAECO_SYSTEM_POSTERS=0:Updates`).
     pub praeco: Option<PathBuf>,
@@ -72,8 +76,31 @@ impl Daemon {
         let admin = uid == 0;
         let res = match r {
             Request::Installed => self.store().load().map(|i| Response::Installed { apps: i.apps }),
-            Request::Describe { id } => self.describe(&id).map(|app| Response::Described { app }),
-            Request::Search { text } => self.search(&text).map(|ids| Response::Found { ids }),
+            Request::Describe { id, for_uid } => {
+                let who = match for_uid { Some(u) if admin || Some(uid) == self.sheet_uid => u, _ => uid };
+                self.describe(&id, who).map(|app| Response::Described { app })
+            }
+            Request::Search { text } => self.search(&text, uid).map(|ids| Response::Found { ids }),
+            Request::Catalogs => Ok(Response::Catalogs {
+                items: catalogs::all(&self.state).iter().filter(|c| c.visible_to(uid)).map(catalogs::listed).collect() }),
+            Request::PreviewCatalog { url } => self.preview_catalog(&url),
+            Request::AddCatalog { url, root_sha256, machine, for_uid } if admin || Some(uid) == self.sheet_uid => {
+                if machine && !admin {
+                    Err("a catalog for everyone is added by an administrator".into())
+                } else {
+                    self.locked(|| self.add_catalog(&url, &root_sha256, machine, if admin && machine { 0 } else { for_uid }))
+                }
+            }
+            Request::RemoveCatalog { slug } => self.locked(|| {
+                let cats = catalogs::all(&self.state);
+                let c = cats.iter().find(|c| c.third_party() && c.slug == slug).ok_or_else(|| format!("{slug}: not followed"))?;
+                let s = c.source.as_ref().unwrap();
+                if !admin && (s.machine || s.added_by != uid) {
+                    return Err("only an administrator, or the person who added it, may remove a catalog".into());
+                }
+                catalogs::remove(&self.state, &slug)?;
+                Ok(Response::Ok)
+            }),
             Request::Updates => self.updates().map(|items| {
                 let p = self.prefs().load();
                 Response::Updates { items, last_sync: p.last_sync, last_error: p.last_error }
@@ -82,7 +109,7 @@ impl Daemon {
             Request::InstallApproved { id, manifest_sha256, for_uid } if admin || Some(uid) == self.sheet_uid =>
                 self.locked(|| self.install_catalog(&id, Some(&manifest_sha256), for_uid)),
             _ if !admin => Err("only an administrator, or a person on the install sheet, may change what is installed".into()),
-            Request::InstallApproved { .. } => unreachable!("matched above"),
+            Request::InstallApproved { .. } | Request::AddCatalog { .. } => unreachable!("matched above"),
             Request::Install { id } => self.locked(|| self.install_catalog(&id, None, uid)),
             Request::InstallLocal { path } => self.locked(|| self.install_local(Path::new(&path), uid)),
             Request::Uninstall { id } => self.locked(|| self.uninstall(&id)),
@@ -100,10 +127,36 @@ impl Daemon {
 
     // ── questions ───────────────────────────────────────────────────────────
 
-    pub fn describe(&self, id: &str) -> Result<Described, String> {
-        let local = self.catalog().local()?;
-        let r = local.latest(id, portcullis_toml::layer::host_arch())
-            .ok_or_else(|| format!("{id}: not in the catalog"))?;
+    /// The catalog `id` comes from for `uid`, and its newest release there:
+    /// the one it was installed from, if installed (an id is never replaced
+    /// from another catalog); else the Atrium catalog, then the others this
+    /// person sees, in order. Third-party releases only once this machine
+    /// checked their publisher's domain.
+    pub fn find(&self, id: &str, uid: u32) -> Result<(Cat, oc::Local, oc::Release), String> {
+        let arch = portcullis_toml::layer::host_arch();
+        let rec = self.store().get(id)?;
+        let mut cats = catalogs::all(&self.state);
+        if let Some(rec) = rec.filter(|r| r.source.starts_with("catalog:")) {
+            let i = cats.iter().position(|c| c.client.local().is_ok_and(|l| c.tag(&l) == rec.source))
+                .ok_or_else(|| format!("{id}: the catalog it came from ({}) is no longer followed", rec.source))?;
+            let c = cats.swap_remove(i);
+            let local = c.client.local()?;
+            let r = c.offer(&local, id, arch).ok_or_else(|| format!("{id}: not in {} any more", rec.source))?;
+            return Ok((c, local, r));
+        }
+        for c in cats.into_iter().filter(|c| c.visible_to(uid)) {
+            let local = c.client.local()?;
+            if let Some(r) = c.offer(&local, id, arch) {
+                return Ok((c, local, r));
+            }
+        }
+        Err(format!("{id}: not in the catalog"))
+    }
+
+    pub fn describe(&self, id: &str, uid: u32) -> Result<Described, String> {
+        let (cat, local, r) = self.find(id, uid)?;
+        let r = &r;
+        let pubrec = local.publishers.iter().find(|p| !r.publisher.is_empty() && p.id == r.publisher);
         let v: toml::Value = r.manifest.parse().map_err(|e| format!("{id}: {e}"))?;
         let app = ["app", "font", "driver", "firmware", "layer"].iter().find_map(|k| v.get(*k));
         let s = |k: &str| app.and_then(|a| a.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -117,21 +170,32 @@ impl Daemon {
             }
             None => Vec::new(),
         };
+        let recovered = match (&rec, pubrec) { (Some(x), Some(p)) => p.recoveries > x.recoveries, _ => false };
         Ok(Described {
             id: id.into(), kind: r.kind.clone(), name: s("name"), description: s("description"),
-            latest: r.version.clone(), publisher: r.signer.clone(), catalog: local.name.clone(),
+            latest: r.version.clone(),
+            publisher: if r.publisher.is_empty() { r.signer.clone() } else { r.publisher.clone() },
+            catalog: local.name.clone(),
             capabilities, archive_size: r.archive_size,
             installed: rec.map(|x| x.version),
             manifest_sha256: oc::hex(&Sha256::digest(r.manifest.as_bytes())), added,
+            publisher_name: pubrec.map(|p| p.name.clone()).unwrap_or_default(),
+            publisher_domains: pubrec.map(|p| p.domains.clone()).unwrap_or_default(),
+            third_party: cat.third_party(), recovered,
         })
     }
 
-    pub fn search(&self, text: &str) -> Result<Vec<String>, String> {
+    pub fn search(&self, text: &str, uid: u32) -> Result<Vec<String>, String> {
         let t = text.to_lowercase();
-        let local = self.catalog().local()?;
-        let mut ids: Vec<String> = oc::by_id(&local).into_iter()
-            .filter(|(id, rs)| id.to_lowercase().contains(&t) || rs.iter().any(|r| r.manifest.to_lowercase().contains(&t)))
-            .map(|(id, _)| id).collect();
+        let mut ids = Vec::new();
+        for c in catalogs::all(&self.state).iter().filter(|c| c.visible_to(uid)) {
+            let local = c.client.local()?;
+            ids.extend(oc::by_id(&local).into_iter()
+                .filter(|(id, rs)| (id.to_lowercase().contains(&t) || rs.iter().any(|r| r.manifest.to_lowercase().contains(&t)))
+                        && rs.iter().any(|r| c.proven(&local, r)))
+                .map(|(id, _)| id));
+        }
+        ids.sort();
         ids.dedup();
         Ok(ids)
     }
@@ -145,7 +209,10 @@ impl Daemon {
             oc::Client::init(&c.dir, &text)?;
         }
         let from = from.to_string_lossy().to_string();
-        let l = if from.is_empty() || from.starts_with("https://") {
+        let everything = from.is_empty();
+        // The Atrium catalog first; a failure there is reported after the
+        // others have had their turn.
+        let atrium: Result<oc::Local, String> = (|| Ok(if from.is_empty() || from.starts_with("https://") {
             // Over the network: the given base, else where the catalog says it
             // lives, else the default.
             let base = if !from.is_empty() { from } else {
@@ -158,12 +225,78 @@ impl Daemon {
             let src = PathBuf::from(from);
             let get = move |p: &str| fs::read(src.join(p)).map_err(|e| format!("{p}: {e}"));
             c.update(&get, now())?
-        };
+        }))();
         // What the catalog's drivers are for, for dispensatord's lookup.
-        if let Err(e) = crate::driver::write_idx(&self.state, &l, portcullis_toml::layer::host_arch()) {
-            eprintln!("opifexd: {e}");
+        if let Ok(l) = &atrium {
+            if let Err(e) = crate::driver::write_idx(&self.state, l, portcullis_toml::layer::host_arch()) {
+                eprintln!("opifexd: {e}");
+            }
         }
-        Ok(Response::Synced { entries: l.size, releases: l.releases.len() })
+        // The catalogs people added, each on its own; one failing stops none.
+        let mut others = Vec::new();
+        if everything {
+            for cat in catalogs::all(&self.state).into_iter().filter(Cat::third_party) {
+                let line = match self.sync_third(&cat) {
+                    Ok(s) => format!("{}: {s}", cat.slug),
+                    Err(e) => format!("{}: {e}", cat.slug),
+                };
+                eprintln!("opifexd: {line}");
+                others.push(line);
+            }
+        }
+        let l = atrium.map_err(|e| if others.is_empty() { e } else { format!("{e} (others: {})", others.join("; ")) })?;
+        Ok(Response::Synced { entries: l.size, releases: l.releases.len(), others })
+    }
+
+    /// Sync one added catalog through the open fetcher, then check the
+    /// domains of publishers this machine hasn't checked yet.
+    fn sync_third(&self, cat: &Cat) -> Result<String, String> {
+        let src = cat.source.as_ref().ok_or("not an added catalog")?;
+        let base = cat.client.local()?.locations.first().cloned().unwrap_or_else(|| src.url.clone());
+        let net = std::cell::RefCell::new(fetch::Fetcher::new(self.fetch_any_cmd.clone()));
+        let get = |p: &str| net.borrow_mut().get(&fetch::join(&base, p), fetch::CATALOG_FILE_MAX);
+        let l = cat.client.update(&get, now())?;
+        let missing = catalogs::prove(cat, &l, &mut |n| net.borrow_mut().txt(n),
+                                      &mut |u| net.borrow_mut().get(u, fetch::PROOF_MAX), now())?;
+        let offered = l.releases.iter().filter(|r| cat.proven(&l, r)).count();
+        let mut s = format!("{} entries, {offered} releases offered, {} publishers", l.size, l.publishers.len());
+        if !missing.is_empty() {
+            s += &format!("; not proven: {}", missing.join("; "));
+        }
+        Ok(s)
+    }
+
+    fn preview_catalog(&self, url: &str) -> Result<Response, String> {
+        catalogs::host_of(url)?;
+        let mut net = fetch::Fetcher::new(self.fetch_any_cmd.clone());
+        let text = String::from_utf8(net.get(&fetch::join(url, oc::ROOT), fetch::CATALOG_FILE_MAX)?)
+            .map_err(|_| "root.toml: not UTF-8")?;
+        let root = oc::Root::parse(&text)?;
+        if root.name.eq_ignore_ascii_case(&self.catalog().root().map(|r| r.name).unwrap_or_else(|_| "Atrium".into())) {
+            return Err(format!("{url}: calls itself {:?}, the name of the system's catalog", root.name));
+        }
+        Ok(Response::CatalogPreview { url: url.into(), name: root.name, root_sha256: oc::hex(&Sha256::digest(text.as_bytes())),
+                                      warning: catalogs::WARNING.into() })
+    }
+
+    fn add_catalog(&self, url: &str, sha: &str, machine: bool, uid: u32) -> Result<Response, String> {
+        let Response::CatalogPreview { root_sha256, name, .. } = self.preview_catalog(url)? else { unreachable!() };
+        if root_sha256 != sha {
+            return Err(format!("{url}: its root.toml changed since it was shown; look again"));
+        }
+        let mut net = fetch::Fetcher::new(self.fetch_any_cmd.clone());
+        let text = String::from_utf8(net.get(&fetch::join(url, oc::ROOT), fetch::CATALOG_FILE_MAX)?).map_err(|_| "root.toml")?;
+        if oc::hex(&Sha256::digest(text.as_bytes())) != sha {
+            return Err(format!("{url}: its root.toml changed since it was shown; look again"));
+        }
+        let cat = catalogs::add(&self.state, url, &text, machine, uid, now())?;
+        match self.sync_third(&cat) {
+            Ok(summary) => Ok(Response::CatalogAdded { slug: cat.slug.clone(), name, summary }),
+            Err(e) => {
+                let _ = catalogs::remove(&self.state, &cat.slug);
+                Err(format!("{url}: not added: {e}"))
+            }
+        }
     }
 
     /// Run the worker on an archive file: a fresh folder, owned by the
@@ -215,34 +348,49 @@ impl Daemon {
     /// catalog, and the same key or, in the Atrium catalog where the platform
     /// is the only publisher, a platform key of the current root (a rotated
     /// platform key is still Atrium).
-    fn same_publisher(&self, have: &crate::installed::Record, signer: &str, catalog: &str, root: &oc::Root) -> bool {
-        if have.source != format!("catalog:{catalog}") {
+    fn same_publisher(&self, have: &crate::installed::Record, r: &oc::Release, cat: &Cat, local: &oc::Local, root: &oc::Root) -> bool {
+        if have.source != cat.tag(local) {
             return false;
         }
+        // A publisher record: the same publisher id, whatever key signs now.
+        if !r.publisher.is_empty() {
+            return have.publisher == r.publisher;
+        }
+        let signer = r.signer.as_str();
         let platform = |k: &str| root.key(k).is_some_and(|k| k.roles.iter().any(|r| r == "platform"));
         have.publisher == signer || (platform(signer) && (platform(&have.publisher) || root.key(&have.publisher).is_none()))
     }
 
     /// Installed apps with a newer release, and what happens to each.
     pub fn updates(&self) -> Result<Vec<Pending>, String> {
-        let c = self.catalog();
-        if !c.dir.join(oc::ROOT).is_file() {
-            return Ok(Vec::new());
-        }
-        let (local, root) = (c.local()?, c.root()?);
+        let cats = catalogs::all(&self.state);
         let prefs = self.prefs().load();
         let mut out = Vec::new();
         for rec in self.store().load()?.apps {
-            let Some(r) = local.latest(&rec.id, portcullis_toml::layer::host_arch()) else { continue };
+            // From the catalog it came from; a side-loaded app is compared
+            // with the Atrium catalog only to say why it isn't updated.
+            let cat = if rec.source == "side-load" { cats.first() } else { catalogs::of_source(&cats, &rec.source) };
+            let Some(cat) = cat else { continue };
+            if !cat.client.dir.join(oc::ROOT).is_file() {
+                continue;
+            }
+            let (local, root) = (cat.client.local()?, cat.client.root()?);
+            let Some(r) = cat.offer(&local, &rec.id, portcullis_toml::layer::host_arch()) else { continue };
+            let r = &r;
             if r.kind != rec.kind || oc::version_cmp(&r.version, &rec.version) != std::cmp::Ordering::Greater {
                 continue;
             }
-            let same = self.same_publisher(&rec, &r.signer, &local.name, &root);
+            let same = self.same_publisher(&rec, r, cat, &local, &root);
+            let recovered = local.publishers.iter().any(|p| p.id == r.publisher && p.recoveries > rec.recoveries);
             let care = prefs.care.get(&rec.id).map(String::as_str);
             let (action, added) = match rec.kind.as_str() {
                 "app" => {
                     let have = fs::read_to_string(self.root.join("apps").join(&rec.id).join("atrium.toml")).unwrap_or_default();
-                    updates::decide(&have, &r.manifest, same, care)
+                    match updates::decide(&have, &r.manifest, same, care) {
+                        // After a key recovery the person is asked again (§7.7).
+                        (Action::Background | Action::Notify, a) if same && recovered => (Action::Ask, a),
+                        d => d,
+                    }
                 }
                 _ if !same => (Action::Refused, Vec::new()),
                 // Fonts hold no power: like an app that asks for nothing.
@@ -253,6 +401,7 @@ impl Daemon {
             let why = match (action, rec.source.as_str()) {
                 (Action::Refused, "side-load") => "side-loaded: update it by side-loading".to_string(),
                 (Action::Refused, _) => "another publisher".to_string(),
+                (Action::Ask, _) if recovered => "its publisher's key was replaced by a recovery".to_string(),
                 _ => String::new(),
             };
             let name = updates::name(&r.manifest).unwrap_or_else(|| rec.id.clone());
@@ -340,11 +489,12 @@ impl Daemon {
     }
 
     fn install_catalog(&self, id: &str, approved: Option<&str>, uid: u32) -> Result<Response, String> {
-        let c = self.catalog();
-        let local = c.local()?;
-        let root = c.root()?;
-        let r = local.latest(id, portcullis_toml::layer::host_arch())
-            .ok_or_else(|| format!("{id}: not in the catalog for this machine"))?.clone();
+        let (cat, local, r) = self.find(id, uid).map_err(|e| e.replace("not in the catalog", "not in the catalog for this machine"))?;
+        let root = cat.client.root()?;
+        let pubrec = local.publishers.iter().find(|p| !r.publisher.is_empty() && p.id == r.publisher).cloned();
+        if cat.third_party() && r.kind != "app" {
+            return Err(format!("{id}: catalogs people add carry apps only"));
+        }
         if !["app", "font", "layer", "driver", "firmware"].contains(&r.kind.as_str()) {
             return Err(format!("{id}: a {} (not installed by opifexd yet)", r.kind));
         }
@@ -358,9 +508,14 @@ impl Daemon {
                 return Err(format!("{id}: the catalog changed since the sheet was shown; ask again"));
             }
         }
-        let signer = root.key(&r.signer).ok_or("signer gone from root.toml")?.pem.clone();
+        let signer = match &pubrec {
+            Some(p) => p.key.clone(),
+            None => root.key(&r.signer).ok_or("signer gone from root.toml")?.pem.clone(),
+        };
+        let (publisher, recoveries) = match &pubrec { Some(p) => (p.id.clone(), p.recoveries), None => (r.signer.clone(), 0) };
+        let source = cat.tag(&local);
         if let Some(have) = self.store().get(id)? {
-            if !self.same_publisher(&have, &r.signer, &local.name, &root) {
+            if !self.same_publisher(&have, &r, &cat, &local, &root) {
                 return Err(format!("{id}: this release is from another publisher than the installed one; not installed"));
             }
         }
@@ -391,9 +546,9 @@ impl Daemon {
                 return Err(format!("{id}: the archive's manifest differs from the catalog's"));
             }
             let record = |version: &str, content: &str| Record {
-                id: id.into(), version: version.into(), kind: r.kind.clone(), publisher: r.signer.clone(),
-                source: format!("catalog:{}", local.name), archive_sha256: r.archive_sha256.clone(),
-                content: content.into(), installed_by: uid, time: now(), verified_rps: Vec::new(),
+                id: id.into(), version: version.into(), kind: r.kind.clone(), publisher: publisher.clone(),
+                source: source.clone(), archive_sha256: r.archive_sha256.clone(),
+                content: content.into(), installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries,
             };
             match r.kind.as_str() {
                 "font" => {
@@ -442,10 +597,10 @@ impl Daemon {
                 return Err(format!("{id}: entry {} missing", m.entry()));
             }
             let rec = Record {
-                id: m.app.id.clone(), version: m.app.version.clone(), kind: r.kind.clone(), publisher: r.signer.clone(),
-                source: format!("catalog:{}", local.name), archive_sha256: r.archive_sha256.clone(),
+                id: m.app.id.clone(), version: m.app.version.clone(), kind: r.kind.clone(), publisher: publisher.clone(),
+                source: source.clone(), archive_sha256: r.archive_sha256.clone(),
                 content: m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
-                installed_by: uid, time: now(), verified_rps: Vec::new(),
+                installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries,
             };
             self.finish(&m, &stage, rec)
         })();
@@ -480,7 +635,7 @@ impl Daemon {
                 id: m.app.id.clone(), version: m.app.version.clone(), kind: "app".into(), publisher,
                 source: "side-load".into(), archive_sha256: String::new(),
                 content: m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
-                installed_by: uid, time: now(), verified_rps: Vec::new(),
+                installed_by: uid, time: now(), verified_rps: Vec::new(), recoveries: 0,
             };
             self.finish(&m, &stage, rec)
         })();

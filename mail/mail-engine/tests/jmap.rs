@@ -364,3 +364,71 @@ fn jmap_sync_changes_and_send() {
     let d = engine.deliver_jmap(id, &mut client).unwrap();
     assert!(matches!(d, Delivery::Failed { transient: false, .. }), "{d:?}");
 }
+
+/// A session with an event source, and a scripted stream.
+struct Pushing {
+    es: Option<&'static str>,
+    events: Vec<&'static str>,
+    asked: Vec<String>,
+}
+
+impl Http for Pushing {
+    fn get(&mut self, url: &str, _: usize) -> Result<Vec<u8>, String> {
+        assert_eq!(url, SESSION);
+        let mut s = json!({
+            "capabilities": { "urn:ietf:params:jmap:core": {}, "urn:ietf:params:jmap:mail": {} },
+            "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": { "urn:ietf:params:jmap:mail": {} } } },
+            "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT },
+            "apiUrl": "https://jmap.test/api/",
+            "downloadUrl": "https://jmap.test/download/{accountId}/{blobId}/{name}?type={type}",
+            "uploadUrl": "https://jmap.test/upload/{accountId}/",
+            "state": "s"
+        });
+        if let Some(es) = self.es {
+            s["eventSourceUrl"] = json!(es);
+        }
+        Ok(serde_json::to_vec(&s).unwrap())
+    }
+    fn post(&mut self, url: &str, _: &str, _: &[u8], _: usize) -> Result<Vec<u8>, String> {
+        Err(format!("404 {url}"))
+    }
+    fn events(&mut self, url: &str, on_event: &mut dyn FnMut(&[u8]) -> bool) -> Result<(), String> {
+        self.asked.push(url.to_string());
+        for e in &self.events {
+            if !on_event(e.as_bytes()) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn jmap_push_reports_state_changes_only() {
+    use mail_sync::jmap::Pushed;
+    let state = |e: &str| -> &'static str { Box::leak(format!("event: state\ndata: {{\"@type\":\"StateChange\",\"changed\":{{\"{ACCOUNT}\":{{\"Email\":\"{e}\",\"Mailbox\":\"m1\"}}}}}}\n\n").into_boxed_str()) };
+    let h = Pushing {
+        es: Some("https://jmap.test/events/?types={types}&closeafter={closeafter}&ping={ping}"),
+        events: vec![state("e1"), "event: ping\ndata: {\"interval\":60}\n\n", state("e1"), "event: state\ndata: {\"@type\":\"StateChange\",\"changed\":{\"other\":{\"Email\":\"x\"}}}\n\n", state("e2"), state("e3")],
+        asked: vec![],
+    };
+    let mut client = Client::connect(h, SESSION).unwrap();
+    let mut seen = Vec::new();
+    let r = client.watch(&mut |changed| {
+        seen.push(changed);
+        seen.iter().filter(|c| **c).count() < 2
+    });
+    // The first states (news, maybe), a ping, the same states, another
+    // account's, then a change: stop there.
+    assert_eq!(r, Ok(Pushed::Stopped));
+    assert_eq!(seen, vec![true, false, false, false, true]);
+
+    let h = Pushing { es: None, events: vec![], asked: vec![] };
+    let mut client = Client::connect(h, SESSION).unwrap();
+    assert_eq!(client.watch(&mut |_| true), Ok(Pushed::NoPush));
+
+    // A stream the server ends: Ended, to connect again.
+    let h = Pushing { es: Some("https://jmap.test/events/"), events: vec![state("e1")], asked: vec![] };
+    let mut client = Client::connect(h, SESSION).unwrap();
+    assert_eq!(client.watch(&mut |_| true), Ok(Pushed::Ended));
+}
