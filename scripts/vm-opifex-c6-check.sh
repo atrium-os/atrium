@@ -96,7 +96,7 @@ mkdir -p /var/db/atrium/opifex/dl; cp \$3.insula /var/db/atrium/opifex/dl/\$(sha
 PUB
 
 # A font: a shipped TrueType face, as a package for kana.
-TTF=\$(ls /usr/share/fonts/atrium/noto/NotoSans-Regular.ttf /usr/share/fonts/atrium/*/*.ttf 2>/dev/null | head -1)
+TTF=\$(ls /usr/share/fonts/atrium/noto/NotoSans-Regular.ttf /usr/share/fonts/atrium/*/*.ttf /usr/local/share/fonts/*/*.ttf 2>/dev/null | head -1)
 test -n "\$TTF"
 mkdir font; cp "\$TTF" font/C6Test-Regular.ttf; echo "SIL Open Font License 1.1" > font/OFL.txt
 printf 'kind = "font"\n[font]\nid = "org.atrium.font.c6test"\nname = "C6 Test"\nversion = "1.0"\nlicense = "OFL-1.1"\nlanguages = ["ja"]\n\n[[face]]\nfamily = "C6 Test Kana"\nfile = "C6Test-Regular.ttf"\nweight = 400\nranges = "3040-309F"\n' > font.toml
@@ -175,7 +175,7 @@ check "uninstall" "gone" "$(Q remove c6tool >/dev/null; V "test -e /var/lib/atri
 echo "=== a device nobody drives"
 check "devices.idx after the sync" "1" "$(V "grep -c '^usb-id	46f4:0004	org.atrium.driver.c6mtp$' /var/db/atrium/opifex/devices.idx" | tr -d '\r ')"
 check "opifex driver-for finds it" "1" "$(Q driver-for usb 46f4:0004 06/01/01 | grep -c 'org.atrium.driver.c6mtp')"
-V "service atrium_dispensatord onerestart >/dev/null 2>&1; sleep 3; pgrep -f atrium-dispensatord >/dev/null" || die "dispensatord does not run"
+V "service atrium-dispensatord onerestart >/dev/null 2>&1; sleep 3; pgrep -f atrium-dispensatord >/dev/null" || die "dispensatord does not run"
 RULES() { V "grep 'atrium-dispensatord: [0-9]* rules,' $DLOG | tail -1 | sed 's/.*: \([0-9]*\) rules.*/\1/'" | tr -d '\r '; }
 R0=$(RULES)
 N0=$(V "wc -l < $DLOG" | tr -d '\r ')
@@ -193,12 +193,12 @@ check "opifex get installs it" "1" "$(Q get $DR | grep -c '1.0: done')"
 check "its firmware came first" "yes" "$(V "test -f /usr/local/share/atrium/firmware/c6fw/c6.fw && echo yes")"
 check "its devices.d file, root's, 0644" "0 644" "$(V "stat -f '%u %Lp' /usr/local/etc/atrium/devices.d/60-$DR.toml" | tr -d '\r')"
 check "its folder" "yes" "$(V "test -x /usr/local/libexec/atrium/drivers/$DR/c6mtp && echo yes")"
-V "service atrium_dispensatord onerestart >/dev/null 2>&1; sleep 3"
+V "service atrium-dispensatord onerestart >/dev/null 2>&1; sleep 3"
 N0=$(V "wc -l < $DLOG" | tr -d '\r ')
 mon "device_add usb-mtp,rootdir=/tmp,readonly=on,id=c6mtp" >/dev/null
 sleep 8
 check "dispensatord loaded its rule" "$((R0+1))" "$(RULES)"
-check "its rule takes the device" "1" "$(NEW | grep -c 'c6mtp' | awk '{print ($1>0)}')"
+check "its rule takes the device" "1" "$(NEW | grep 'c6mtp' | grep -vc 'the catalog has a driver' | awk '{print ($1>0)}')"
 check "and no catalog offer this time" "0" "$(NEW | grep -c 'the catalog has a driver')"
 NEW | grep c6mtp | head -3 | sed 's/^/    /'
 mon "device_del c6mtp" >/dev/null; sleep 3
@@ -207,6 +207,6 @@ check "uninstall the firmware" "1" "$(Q remove org.atrium.firmware.c6 | grep -c 
 check "all gone" "gone" "$(V "ls /usr/local/etc/atrium/devices.d/60-$DR.toml /usr/local/libexec/atrium/drivers/$DR /usr/local/share/atrium/firmware/c6fw 2>/dev/null | wc -l" | tr -d '\r ' | sed 's/^0$/gone/')"
 
 echo "=== clean up"
-V "pkill -f 'opifexd opifex-c6'; service atrium_dispensatord onerestart >/dev/null 2>&1; rm -rf /var/db/atrium/opifex/catalog /var/db/atrium/opifex/installed.toml /var/db/atrium/opifex/devices.idx /var/db/atrium/opifex/dl" >/dev/null 2>&1
+V "pkill -f 'opifexd opifex-c6'; service atrium-dispensatord onerestart >/dev/null 2>&1; rm -rf /var/db/atrium/opifex/catalog /var/db/atrium/opifex/installed.toml /var/db/atrium/opifex/devices.idx /var/db/atrium/opifex/dl" >/dev/null 2>&1
 echo "opifex-c6: $fails failed"
 [ "$fails" = 0 ]
