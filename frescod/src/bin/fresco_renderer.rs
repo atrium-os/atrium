@@ -652,6 +652,13 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
         // Pixel mode draws animated groups as sprites (sprites.rs).
         let wf = {
             let fe = fe.lock().unwrap();
+            // A client between FRAME_BEGIN and FRAME_END has sent only part
+            // of its frame (a run installed, not yet placed; a run before
+            // its atlas): drawn now, the window would show that half. Its
+            // FRAME_END wakes the loop again.
+            if fe.window_state(id).is_some_and(|s| s.in_frame) {
+                continue;
+            }
             let size = (width as f32, height as f32);
             if t2.is_some() {
                 let keep = w.sprites.as_ref().map(|s| s.keep()).unwrap_or_default();
