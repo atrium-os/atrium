@@ -121,7 +121,7 @@ impl Writer<'_> {
         self.thread_refresh(m.thread)
     }
 
-    fn store_folder(&self, id: FolderId) -> Result<crate::Folder> {
+    pub(crate) fn store_folder(&self, id: FolderId) -> Result<crate::Folder> {
         let t = self.tx.open_table(crate::FOLDERS)?;
         let v = t.get(id)?.ok_or(Error::NotFound)?;
         dec(v.value())

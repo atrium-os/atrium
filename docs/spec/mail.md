@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1477,9 +1477,16 @@ Stalwart in the cloud VM, and later a real account):
    newest sender first). Headers are lines of the list: a press folds one, a folded one
    keeps its row and unread count, and j/k pass over headers. Grouping runs after the
    filters. Tests: the window 1 (date sections, folding, j over a header, by sender, with
-   a filter). **Not yet**: grouping by account and by lane, remembering the grouping per
-   folder, saving a filter set as a smart folder, and the chips in a search's
-   results.
+   a filter). Later the same day: **the grouping is kept per folder** (with Conversations
+   or Messages, in the same store entry) and comes back after a restart; **by lane**
+   (People, then Updates, then Newsletters) is offered in inboxes; and **Save as
+   folder**, shown while filters are on, keeps them as a saved search named "Inbox ·
+   Unread, To me" with the query `in:"INBOX" is:unread is:to-me`, then shows it. Search
+   learned the filters that had no operator: `is:to-me`, `is:from-people`, `is:vip`,
+   `is:needs-reply`, `is:back`. Tests: window (by lane, kept per folder and after a
+   restart, Save as folder), engine 1 (the filters as operators and back). **Not yet**:
+   grouping by account (no list spans accounts yet; it comes with a unified inbox), and
+   the chips in a search's results.
 
    **Later's remaining rules built on the host (2026-11-18, §11.4).** The daily review
    names every item a week or more overdue and every item pushed back three times or

@@ -28,6 +28,10 @@ pub enum Cond {
     After(i64),
     Larger(u64),
     Smaller(u64),
+    /// The quick filters with no other operator (§11.7; `crate::quick`
+    /// bits): `is:to-me`, `is:from-people`, `is:vip`, `is:needs-reply`,
+    /// `is:back`.
+    Quick(u16),
 }
 
 /// A parsed query: every condition must hold.
@@ -136,6 +140,11 @@ pub fn parse(q: &str, typing: bool) -> Query {
             ("is", "unread") => Some(Cond::Unread(true)),
             ("is", "read") => Some(Cond::Unread(false)),
             ("is", "flagged" | "starred") => Some(Cond::Flagged),
+            ("is", "to-me" | "tome") => Some(Cond::Quick(crate::quick::TO_ME)),
+            ("is", "from-people" | "people") => Some(Cond::Quick(crate::quick::FROM_PEOPLE)),
+            ("is", "vip" | "vips") => Some(Cond::Quick(crate::quick::VIPS)),
+            ("is", "needs-reply") => Some(Cond::Quick(crate::quick::NEEDS_REPLY)),
+            ("is", "back" | "snoozed-back") => Some(Cond::Quick(crate::quick::BACK)),
             ("in", f) if !f.is_empty() => Some(Cond::In(f.to_string())),
             // Days are the person's local days.
             ("before", d) => day(d).map(|t| Cond::Before(crate::clock::from_local(t))),
@@ -202,6 +211,8 @@ impl Engine {
             None => self.store.all_messages()?,
         };
         let mut folder_names = std::collections::HashMap::new();
+        let bits = q.conds.iter().fold(0, |b, c| if let Cond::Quick(x) = c { b | x } else { b });
+        let mut quick = (bits != 0).then(|| self.quick(bits));
         let mut hits = Vec::new();
         for id in candidates {
             let Ok(m) = self.store.message(id) else { continue };
@@ -220,7 +231,9 @@ impl Engine {
                 Cond::After(t) => m.date >= *t,
                 Cond::Larger(n) => m.size > *n,
                 Cond::Smaller(n) => m.size < *n,
+                Cond::Quick(_) => true,
             });
+            let ok = ok && quick.as_mut().is_none_or(|qk| qk.passes(id, None, unread, flags.iter().any(|f| f & flag::FLAGGED != 0)));
             if ok {
                 let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
                 hits.push(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), unread });
@@ -235,6 +248,24 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_filters_as_operators() {
+        use crate::quick::*;
+        let all = UNREAD | FLAGGED | TO_ME | FROM_PEOPLE | VIPS | ATTACHMENT | NEEDS_REPLY | BACK;
+        let q = query_of(all);
+        assert_eq!(q, "is:unread is:flagged is:to-me is:from-people is:vip has:attachment is:needs-reply is:back");
+        let c = parse(&q, false).conds;
+        assert_eq!(c.len(), 8);
+        let bits = c.iter().fold(0, |b, c| match c {
+            Cond::Unread(true) => b | UNREAD,
+            Cond::Flagged => b | FLAGGED,
+            Cond::HasAttachment => b | ATTACHMENT,
+            Cond::Quick(x) => b | x,
+            _ => b,
+        });
+        assert_eq!(bits, all);
+    }
 
     #[test]
     fn queries() {

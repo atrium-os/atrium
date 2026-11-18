@@ -33,6 +33,22 @@ pub const CHIPS: [(u16, &str); 8] = [
     (BACK, "Snoozed back"),
 ];
 
+/// The search operators that ask for `bits` (§11.2, §11.7), so a set of
+/// quick filters can be kept as a saved search.
+pub fn query_of(bits: u16) -> String {
+    const OPS: [(u16, &str); 8] = [
+        (UNREAD, "is:unread"),
+        (FLAGGED, "is:flagged"),
+        (TO_ME, "is:to-me"),
+        (FROM_PEOPLE, "is:from-people"),
+        (VIPS, "is:vip"),
+        (ATTACHMENT, "has:attachment"),
+        (NEEDS_REPLY, "is:needs-reply"),
+        (BACK, "is:back"),
+    ];
+    OPS.iter().filter(|(b, _)| bits & b != 0).map(|(_, o)| *o).collect::<Vec<_>>().join(" ")
+}
+
 /// Rows a filtered list looks through at most.
 pub const SCAN_MAX: usize = 5000;
 
