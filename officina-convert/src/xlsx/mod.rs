@@ -6,6 +6,7 @@
 pub const MDW: f64 = 7.0;
 
 pub mod chart;
+pub mod comments;
 pub mod condfmt;
 pub mod macros;
 pub mod pivot;
