@@ -478,7 +478,8 @@ of v1 (§17 D17). Files from other suites that use them import as one document.
   arrays, not cell by cell, so `=A2*B2` over a million rows is a loop over two `f64` slices.
 - **Parallel.** Independent groups and partitions of large groups run on a thread pool
   inside the document process.
-- **Visible first, never blocking.** Recalculation runs off the UI thread. Cells on screen
+- **Visible first, never blocking.** Recalculation never holds the UI thread for more than
+  a slice (built as 12 ms slices between frames, §16.70; on-screen cells first not yet). Cells on screen
   are computed first; cells still dirty draw their previous value greyed with a small
   "calculating" mark in the status bar, so typing and scrolling never wait for a big
   recalc. A new edit cancels and restarts the affected part.
@@ -3535,6 +3536,17 @@ Sheets had no way to insert or delete rows or columns. `officina-grid::shift::sh
 Sheets' Data menu gains Insert Rows Above, Insert Columns Left, Delete Rows and Delete Columns, as many as the selection spans, each one undo step. Compare with… (§16.68) now takes rows added as rows inserted with the other copy's cells, and rows removed as rows deleted, instead of the whole sheet (Take All still takes a sheet with rows added or removed whole).
 
 Gates: `shift::tests` (insert and delete with references on and from other sheets, columns with a table, a fill cut in two, 200 random inserts and deletes undoing exactly, a row inserted into 200,000 rows with a fill: built in 89 ms, applied in 121 ms), `compare::tests` now taking changes one at a time until none are left, `atrium-sheets` `rows_and_columns_are_inserted_and_deleted`.
+
+### 16.70 Responsiveness and a memory budget in Sheets (2026-11-18)
+
+Shankar asked whether each sheet has a memory budget or only the workbook, and that Sheets stay responsive with a huge sheet or many sheets. Measured first (`atrium-sheets/examples/stall_probe.rs`, `stall_heavy.rs`, 4 cores): an edit read by 2 M rows held the UI 54 ms, an edit read by 4,000 sheets 41 ms, but `SUMIF(C:C,C1,B:B)` filled down 100,000 rows held it 132 s and `COUNTIF` 44 s, every row walking the whole column, and recalculation ran on the UI thread (against §8.4). There was no budget at all for typing, pasting or filling; only the file readers had caps.
+
+- **-IF range index.** `officina-grid::eval::ifcache`: while a formula group is evaluated, a criteria range read with an equality criterion (number, text, logical, empty; one column) is walked once into a map from the cells' keys to count and sums, shared by the group's threads and slices; later rows look it up. Keys follow `Criterion::test` exactly (numbers and numeric text by value, text case-folded), and sums are added in the walk's order, so results are the same to the bit (`tests/ifcache.rs`, 13 formulas against the walk). SUMIF down 100,000 rows: two edits 132 s to 0.1 s; COUNTIF 44 s to 36 ms. Ranges that move with the row (`$C$1:C1`) and other criteria (`">2"`, wildcards) still walk.
+- **Recalculation in slices.** `Workbook::recalc_for(budget)` stops between groups, or between slices of a long group (8 rows a slice per thread, waves doubling while under 4 ms), and leaves the rest pending; `recalc_pending` and `is_stale` say what is left, and edits in between join the work. Sheets recalculates an edit for 12 ms and its event loop does the rest a slice per turn, so the window keeps answering; cells not yet done show their old value greyed. Saving and Data commands (sort, filter, pivots, compare) finish recalculating first. Slices rather than a thread: the UI reads the workbook directly, and a slice ends within one wave past its budget (8 ms budget: worst call 16 ms over 318 calls in `tests/budget.rs`, ending equal to one full recalculation with an edit made midway).
+- **One budget per workbook, not per sheet.** A per-sheet cap would refuse one legitimately large sheet while thousands of small ones could still exhaust memory. `Workbook::memory_bytes()` estimates the cells' memory (chunks, strings, styles, sizes, and every formula cell's result whether computed yet or not) in about 0.2 ms at 20 M cells (167 MB estimated, 197 MB resident). Sheets' budget is half the machine's memory, between 1 and 16 GiB; a change (typing, paste, fill, insert, redo) that takes the workbook past it is undone at once and the status bar says so, so a formula filled down two billion rows is refused before anything computes it.
+- Not yet: opening a file still recalculates in one go, native files load without a cell cap (the converters have theirs: §5), the Sheets process has no memory limit of its own until documents run in their own jails, and wildcard and range criteria still walk their range per row.
+
+Gates: `officina-grid` `tests/ifcache.rs`, `tests/budget.rs`; `atrium-sheets` `a_slow_edit_hands_the_window_back_and_greys_what_is_not_done`, `a_change_past_the_memory_budget_is_not_made`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

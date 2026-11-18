@@ -311,6 +311,11 @@ pub struct StyleRuns {
 }
 
 impl StyleRuns {
+    /// About how many bytes the runs hold.
+    pub fn bytes(&self) -> u64 {
+        self.runs.capacity() as u64 * std::mem::size_of::<(u32, StyleId)>() as u64
+    }
+
     pub fn get(&self, row: u32) -> StyleId {
         match self.runs.partition_point(|&(r, _)| r <= row) {
             0 => 0,

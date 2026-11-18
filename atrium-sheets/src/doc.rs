@@ -364,6 +364,18 @@ pub struct Doc {
     /// app's event loop finishes the work a slice a frame). None: all at once,
     /// as tests and batch work want.
     pub recalc_budget: Option<std::time::Duration>,
+    /// The most memory the workbook's cells may take ([`Workbook::memory_bytes`]):
+    /// a change that would take it past is undone and the user told.
+    pub memory_budget: u64,
+}
+
+/// The workbook memory budget: half the machine's memory, between 1 and 16 GiB.
+/// One budget for the whole workbook, however its cells are spread over sheets.
+pub fn default_memory_budget() -> u64 {
+    // SAFETY: sysconf reads system configuration and has no preconditions.
+    let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    let ram = if pages > 0 && size > 0 { pages as u64 * size as u64 } else { 4 << 30 };
+    (ram / 2).clamp(1 << 30, 16 << 30)
 }
 
 /// The app's recalculation slice: well under a frame at 30 Hz.
@@ -377,7 +389,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: default_memory_budget() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -452,6 +464,17 @@ impl Doc {
         }
     }
 
+    /// Whether the workbook is past its memory budget; if so the status says so.
+    fn over_budget(&mut self) -> bool {
+        let used = self.wb.memory_bytes();
+        if used <= self.memory_budget {
+            return false;
+        }
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        self.status = format!("That change would make the workbook about {:.1} GB, past its {:.1} GB memory limit, so it wasn't made.", gib(used), gib(self.memory_budget));
+        true
+    }
+
     /// Recalculates within the budget; what's left waits for [`Doc::settle`].
     pub fn recalc(&mut self) {
         match self.recalc_budget {
@@ -481,6 +504,11 @@ impl Doc {
         let r = Record::Run { label: label.into(), ops };
         self.journal(&r);
         self.replay(r);
+        if self.over_budget() {
+            self.journal(&Record::Undo);
+            self.history.undo(&mut self.wb);
+            return;
+        }
         self.recalc();
         self.dirty = true;
     }
@@ -570,6 +598,11 @@ impl Doc {
         }
         self.journal(&Record::Redo);
         self.history.redo(&mut self.wb);
+        if self.over_budget() {
+            self.journal(&Record::Undo);
+            self.history.undo(&mut self.wb);
+            return false;
+        }
         self.recalc();
         self.dirty = true;
         true
@@ -640,6 +673,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("atrium-sheets-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_change_past_the_memory_budget_is_not_made() {
+        let mut d = Doc::new("big");
+        assert!(d.memory_budget >= 1 << 30);
+        d.memory_budget = 64 << 20;
+        assert!(d.type_into(0, 0, "1"));
+        let used = d.wb.memory_bytes();
+        // A formula down two billion rows: refused before anything computes it.
+        let fill = GridOp::fill(0, 1, 0, officina_grid::addr::MAX_ROWS - 1, "=A1*2");
+        d.run("Fill", vec![fill]);
+        assert!(d.status.contains("memory limit"), "{}", d.status);
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 5, 1)), None);
+        assert!(d.wb.memory_bytes() <= used + 4096);
+        d.status.clear();
+        // Ten million numbers (about 80 MB) are past it too; ten thousand are not.
+        let rows: Vec<Vec<Input>> = (0..10_000).map(|r| vec![Input::Value(Value::Num(r as f64))]).collect();
+        d.run("Paste", vec![GridOp::block(0, 0, 2, rows)]);
+        assert_eq!(d.wb.value(0, 9_999, 2), Value::Num(9_999.0), "{}", d.status);
+        d.status.clear();
+        let big: Vec<Vec<Input>> = (0..100).map(|_| (0..100_000).map(|c| Input::Value(Value::Num(c as f64))).collect()).collect();
+        d.run("Paste", vec![GridOp::block(0, 0, 3, big)]);
+        assert!(d.status.contains("memory limit"), "{}", d.status);
+        assert_eq!(d.wb.value(0, 5, 3), Value::Empty);
+        // Undo still takes back the last change that was made.
+        assert!(d.undo());
+        assert_eq!(d.wb.value(0, 9_999, 2), Value::Empty);
     }
 
     #[test]

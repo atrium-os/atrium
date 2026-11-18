@@ -13,6 +13,10 @@ fn main() {
     let t = Instant::now();
     let mut d = big_sheet(rows);
     println!("built {rows} rows x 10 in {:?}", t.elapsed());
+    let t = Instant::now();
+    let m = d.wb.memory_bytes();
+    let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS")).map(str::to_string)).unwrap_or_default();
+    println!("memory estimate {} MB in {:?}; {rss}", m >> 20, t.elapsed());
     d.wb.fill_formula(0, 10, 0, rows - 1, "=B1*$M$1").unwrap();
     d.wb.recalc();
     let t = Instant::now();

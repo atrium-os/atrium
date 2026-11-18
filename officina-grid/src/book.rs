@@ -203,6 +203,36 @@ impl Workbook {
         }
     }
 
+    // ---------- memory ----------
+
+    /// About how many bytes the workbook's cells hold: values, text, styles,
+    /// sizes, and every formula cell's result whether computed yet or not (so a
+    /// formula filled down two billion rows counts before recalculation makes
+    /// its results). An estimate to hold a budget against, not an allocator's
+    /// count; it walks chunks, not cells (about a millisecond at 100 M cells).
+    pub fn memory_bytes(&self) -> u64 {
+        let mut n = 0u64;
+        for sh in &self.sheets {
+            n += 256;
+            for c in &sh.cols {
+                n += c.bytes() as u64;
+            }
+            for r in &sh.styles {
+                n += 24 + r.bytes();
+            }
+            for f in &sh.fidx {
+                n += 24 + f.len() as u64 * 48;
+            }
+            n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
+            n += sh.hidden.len() as u64 * 8;
+        }
+        n += self.strings.bytes();
+        for (_, g) in self.groups() {
+            n += 256 + (g.r1 - g.r0) as u64 * 8;
+        }
+        n
+    }
+
     // ---------- sheets ----------
 
     pub fn add_sheet(&mut self, name: &str) -> Result<u16, &'static str> {

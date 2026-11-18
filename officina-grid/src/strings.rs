@@ -15,9 +15,16 @@ pub const MAX_TEXT: usize = 128 * 1024;
 pub struct StringPool {
     texts: Vec<Arc<str>>,
     ids: HashMap<Arc<str>, StrId>,
+    /// The texts' bytes, kept as they are added.
+    text_bytes: u64,
 }
 
 impl StringPool {
+    /// About how many bytes the pool holds.
+    pub fn bytes(&self) -> u64 {
+        self.text_bytes * 2 + self.texts.len() as u64 * 64
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,6 +38,7 @@ impl StringPool {
         assert!(self.texts.len() < MAX_STRINGS, "string pool full");
         let a: Arc<str> = Arc::from(s);
         let id = self.texts.len() as StrId;
+        self.text_bytes += a.len() as u64;
         self.texts.push(a.clone());
         self.ids.insert(a, id);
         id
