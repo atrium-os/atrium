@@ -162,9 +162,27 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 	}
 	case TKEY_DROP: {
 		struct tkey_id *d = (struct tkey_id *)data;
+		uint8_t uuid[16];
+		uint64_t group = 0;
 
 		if ((fflag & FWRITE) == 0)
 			return (EBADF);
+		mtx_lock(&ring_mtx);
+		k = find_locked(d->key_id);
+		if (k != NULL) {
+			memcpy(uuid, k->uuid, 16);
+			group = k->group;
+		}
+		mtx_unlock(&ring_mtx);
+		if (k == NULL) {
+			error = ENOENT;
+			break;
+		}
+		/* A key group's key (encryption §5.4, E4.4): its mounts write
+		 * back and forget the group's plaintext while the key is still
+		 * here, then wipe their keys once it is gone. */
+		if (group != 0)
+			tessera_fs_group_closing(uuid, group, 1);
 		mtx_lock(&ring_mtx);
 		k = find_locked(d->key_id);
 		if (k != NULL) {
@@ -173,6 +191,8 @@ ring_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		} else
 			error = ENOENT;
 		mtx_unlock(&ring_mtx);
+		if (group != 0)
+			tessera_fs_group_closing(uuid, group, 0);
 		break;
 	}
 	case TKEY_GEN: {

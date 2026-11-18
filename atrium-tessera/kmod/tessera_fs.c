@@ -4600,12 +4600,19 @@ struct tessera_mount {
 		tessera_key_group_t   rec;
 		tessera_group_keys_t *keys;
 		int                   bad;   /* the record failed its key's check */
+		/* E4.4: > 0 while the group's key is being dropped: vnode
+		 * ops answer EACCES, the flush still writes with its keys. */
+		int                   closing;
 	}                         groups[TESSERA_FS_MAX_GROUPS];
 	uint32_t                  ngroups;
 	int                       groups_dirty;
 	int                       groups_sx_init;
 	uint64_t                  groups_epoch;
 	struct sx                 groups_sx;
+	/* E4.4: bumped when a directory joins or leaves a quota domain or a
+	 * domain joins a group, so a vnode's cached group is looked up again
+	 * (struct tessera_node kgroup). */
+	volatile uint64_t         quota_gen;
 };
 
 /* The superblock's root for tree kind `kind` (0 for none). */
@@ -5908,6 +5915,159 @@ tessera_fs_wctx_group(struct tessera_mount *tmp_, uint64_t group,
 	return (0);
 }
 
+/* ── E4.4: locked groups and the parent-domain rule (§5.4) ──────── */
+
+/* Rate limit for the "locked" and "refused" console lines: a walk over a
+ * locked tree asks once per name. */
+static int
+tessera_fs_e44_log_ok(void)
+{
+	static struct timeval last;
+	static int pps;
+
+	return (ppsratecheck(&last, &pps, 2));
+}
+
+/*
+ * kern.tessera.test_cross_domain_link: lets link(2) make a name for a file
+ * in another domain's directory, as an offline edit of the volume would.
+ * For tessera-sealed-vm.sh check 13 only, which shows that lookups then
+ * refuse the name. Off by default; root outside a jail sets it.
+ */
+static int tessera_test_cross_domain_link = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, test_cross_domain_link, CTLFLAG_RW,
+    &tessera_test_cross_domain_link, 0,
+    "Test only: link(2) skips the key-group domain check");
+
+/* The quota domain inode_no is charged to (its own, else the mount's
+ * default; 0 for none). */
+static int
+tessera_fs_inode_domain(struct tessera_mount *tmp_, uint64_t inode_no,
+    uint64_t *out)
+{
+	tessera_inode_record_t ino;
+
+	if (tessera_fs_inode_get(tmp_, (uint32_t)inode_no, &ino) !=
+	    TESSERA_OK)
+		return (EIO);
+	*out = ino.quota_domain != 0 ? ino.quota_domain :
+	    tmp_->quota_default_domain;
+	return (0);
+}
+
+static uint64_t
+tessera_fs_domain_group(struct tessera_mount *tmp_, uint64_t domain_id)
+{
+	tessera_quota_domain_t *qd = tessera_quota_find(tmp_, domain_id);
+
+	return (qd != NULL ? qd->key_group : 0);
+}
+
+/*
+ * May a vnode op touch the contents, names or xattrs of an inode in
+ * `group`? 0, EACCES (its key isn't loaded, or is being dropped) or
+ * EINTEGRITY (the group's record didn't verify under the key).
+ */
+static int
+tessera_fs_group_state(struct tessera_mount *tmp_, uint64_t group)
+{
+	struct tessera_fs_group *g;
+	int e;
+
+	if (group == 0)
+		return (0);
+	if (!tmp_->groups_sx_init)
+		return (EINTEGRITY);
+	sx_slock(&tmp_->groups_sx);
+	if (tessera_keyring_epoch() != tmp_->groups_epoch) {
+		sx_sunlock(&tmp_->groups_sx);
+		sx_xlock(&tmp_->groups_sx);
+		tessera_fs_groups_refresh(tmp_);
+		sx_downgrade(&tmp_->groups_sx);
+	}
+	g = tessera_fs_group_find(tmp_, group);
+	if (g == NULL || g->bad)
+		e = EINTEGRITY;
+	else if (g->keys == NULL || g->closing > 0)
+		e = EACCES;
+	else
+		e = 0;
+	sx_sunlock(&tmp_->groups_sx);
+	return (e);
+}
+
+/*
+ * The parent-domain rule (§5.4): a directory entry whose inode is in
+ * another domain than its directory is refused when either domain is in a
+ * key group, unless the inode is the root of the domain it names. So an
+ * offline edit can't pull a file out of its group (or slip one in).
+ */
+static int
+tessera_fs_entry_ok(struct tessera_mount *tmp_, uint64_t dir_ino,
+    uint64_t child_ino)
+{
+	tessera_quota_domain_t *qd;
+	uint64_t pd, cd;
+	int e;
+
+	if (tmp_->ngroups == 0)
+		return (0);
+	if ((e = tessera_fs_inode_domain(tmp_, dir_ino, &pd)) != 0 ||
+	    (e = tessera_fs_inode_domain(tmp_, child_ino, &cd)) != 0)
+		return (e);
+	if (pd == cd)
+		return (0);
+	if (tessera_fs_domain_group(tmp_, pd) == 0 &&
+	    tessera_fs_domain_group(tmp_, cd) == 0)
+		return (0);
+	qd = tessera_quota_find(tmp_, cd);
+	if (qd != NULL && qd->root_inode_no == child_ino)
+		return (0);
+	if (tessera_fs_e44_log_ok())
+		printf("tessera_fs: inode %ju (domain %ju) under directory "
+		    "%ju (domain %ju) breaks the key-group domain rule; "
+		    "refused\n", (uintmax_t)child_ino, (uintmax_t)cd,
+		    (uintmax_t)dir_ino, (uintmax_t)pd);
+	return (EINTEGRITY);
+}
+
+/*
+ * May inode_no get a name in to_dir (rename from from_dir, or link with
+ * from_dir 0)? A rename into, out of or between key groups is EXDEV (the
+ * mover copies, which encrypts again, and deletes). A domain's root moves
+ * with its tree, so it may move between directories of one group (or of
+ * none).
+ */
+static int
+tessera_fs_move_ok(struct tessera_mount *tmp_, uint64_t from_dir,
+    uint64_t inode_no, uint64_t to_dir)
+{
+	tessera_quota_domain_t *qd;
+	uint64_t cd, td, fd;
+	int e;
+
+	if (tmp_->ngroups == 0)
+		return (0);
+	if ((e = tessera_fs_inode_domain(tmp_, inode_no, &cd)) != 0 ||
+	    (e = tessera_fs_inode_domain(tmp_, to_dir, &td)) != 0)
+		return (e);
+	qd = tessera_quota_find(tmp_, cd);
+	if (qd != NULL && qd->root_inode_no == inode_no) {
+		if (from_dir == 0)
+			return (EXDEV);
+		if ((e = tessera_fs_inode_domain(tmp_, from_dir, &fd)) != 0)
+			return (e);
+		return (tessera_fs_domain_group(tmp_, fd) ==
+		    tessera_fs_domain_group(tmp_, td) ? 0 : EXDEV);
+	}
+	if (cd == td)
+		return (0);
+	if (tessera_fs_domain_group(tmp_, cd) == 0 &&
+	    tessera_fs_domain_group(tmp_, td) == 0)
+		return (0);
+	return (EXDEV);
+}
+
 /* Is this writer's quota domain on a `deferred` dedup policy
  * (tessera-fs.md §20.2)? A deferred domain must NOT short-circuit a publish on
  * a registry hit: doing so is the dedup existence oracle (§20.1 channel 1),
@@ -6917,9 +7077,64 @@ struct tessera_node {
 	uint8_t       *chunk_bytes;
 	uint32_t       chunk_len;
 	tessera_hash_t chunk_hash;
+	/* E4.4: the key group of this inode's domain (0: none), valid while
+	 * kgroup_gen equals the mount's quota_gen. */
+	uint64_t       kgroup;
+	volatile uint64_t kgroup_gen;
 };
 
 #define VTOTNODE(vp) ((struct tessera_node *)(vp)->v_data)
+
+/*
+ * E4.4: may this vnode's contents, names or xattrs be used now? 0, or
+ * EACCES while its domain's key group is locked (logged as "locked"), or
+ * EINTEGRITY. Attributes (stat) don't ask. Snapshot and magic vnodes
+ * don't either: a group's old manifests are sealed under its keys, so
+ * reading them fails on their own.
+ */
+static int
+tessera_fs_vp_group(struct vnode *vp, uint64_t *out)
+{
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_;
+	uint64_t gen, d;
+	int e;
+
+	*out = 0;
+	if (tn == NULL || vp->v_mount == NULL ||
+	    tn->kind != TESSERA_NODE_REGULAR || tn->snapshot_gen != 0)
+		return (0);
+	tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_ == NULL || tmp_->ngroups == 0 || tmp_->inode_tree == NULL)
+		return (0);
+	gen = atomic_load_acq_64(&tmp_->quota_gen);
+	if (atomic_load_acq_64(&tn->kgroup_gen) == gen) {
+		*out = tn->kgroup;
+		return (0);
+	}
+	if ((e = tessera_fs_inode_domain(tmp_, tn->inode_no, &d)) != 0)
+		return (e);
+	*out = tessera_fs_domain_group(tmp_, d);
+	tn->kgroup = *out;
+	atomic_store_rel_64(&tn->kgroup_gen, gen);
+	return (0);
+}
+
+static int
+tessera_fs_vp_keycheck(struct vnode *vp)
+{
+	struct tessera_node *tn = VTOTNODE(vp);
+	uint64_t group;
+	int e;
+
+	if ((e = tessera_fs_vp_group(vp, &group)) != 0 || group == 0)
+		return (e);
+	e = tessera_fs_group_state(VFSTOTESSERA(vp->v_mount), group);
+	if (e == EACCES && tessera_fs_e44_log_ok())
+		printf("tessera_fs: inode %ju: key group %ju is locked; "
+		    "refused\n", (uintmax_t)tn->inode_no, (uintmax_t)group);
+	return (e);
+}
 
 extern struct vop_vector tessera_vnodeops;
 extern struct vop_vector tessera_fifoops;   /* #106 */
@@ -8454,6 +8669,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->flush_mtx_init = 1;
 	sx_init(&tmp_->groups_sx, "tess_groups");
 	tmp_->groups_sx_init = 1;
+	tmp_->quota_gen = 1;
 	mtx_init(&tmp_->legacy_sweep_mtx, "tess_lsweep", NULL, MTX_DEF);
 	tmp_->flush_co_init = 1;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_INODE_BUCKETS; _b++)
@@ -10267,6 +10483,14 @@ tessera_vop_access(struct vop_access_args *ap)
 		/* Pre-tree-open synthesized root: permissive. */
 		return (0);
 	}
+	/* E4.4: a locked group's inodes refuse every use, root's too
+	 * (VEXEC on a directory covers lookups served from the name
+	 * cache). */
+	if ((ap->a_accmode & (VREAD | VWRITE | VEXEC | VAPPEND)) != 0) {
+		int _ke = tessera_fs_vp_keycheck(vp);
+		if (_ke != 0)
+			return (_ke);
+	}
 
 	/* v2 slice-3: magic dirs are read-only; reject write access. */
 	if (tn->kind != TESSERA_NODE_REGULAR) {
@@ -10569,6 +10793,7 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	struct tessera_node *dn = VTOTNODE(dvp);
 
 	*vpp = NULL;
+	{ int _ke = tessera_fs_vp_keycheck(dvp); if (_ke != 0) return (_ke); }
 	if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
 		vref(dvp);
 		*vpp = dvp;
@@ -11003,6 +11228,12 @@ have_child_no:
 		    dn->inode_no, TESSERA_NODE_REGULAR,
 		    dn->snapshot_gen, vpp)); }
 	}
+	/* E4.4: the parent-domain rule (§5.4). */
+	{
+		int _de = tessera_fs_entry_ok(tmp_, dn->inode_no, child_no);
+		if (_de != 0)
+			return (_de);
+	}
 	int gerr = tessera_vget(dvp->v_mount, child_no, dn->inode_no, vpp);
 	/* Positive namecache entry (this is the .vop_cachedlookup backend
 	 * behind vfs_cache_lookup): repeated path components — usr/, lib/,
@@ -11085,6 +11316,7 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	 * initializer that is jumped over is left uninitialized, and
 	 * stop_walk reads this to decide whether to release the gate. */
 	int _rd_gated2 = 0;
+	{ int _ke = tessera_fs_vp_keycheck(ap->a_vp); if (_ke != 0) return (_ke); }
 
 	/* Multi-call readdir support. uio_offset is treated as a logical
 	 * directory cookie: total bytes returned by all prior readdir
@@ -11805,6 +12037,7 @@ tessera_vop_read(struct vop_read_args *ap)
 	if (uio->uio_offset < 0) return (EINVAL);
 	if (uio->uio_resid == 0) return (0);
 	if (tmp_->inode_tree == NULL) return (EIO);
+	{ int _ke = tessera_fs_vp_keycheck(vp); if (_ke != 0) return (_ke); }
 
 	tessera_stat_rd_calls++;
 	tessera_stat_rd_bytes += (unsigned long)uio->uio_resid;
@@ -12319,6 +12552,7 @@ static int
 tessera_vop_open(struct vop_open_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
+	{ int _ke = tessera_fs_vp_keycheck(vp); if (_ke != 0) return (_ke); }
 	if (vp->v_type == VREG) {
 		/* Seed the VM object with the REAL file size, not 0. A cold
 		 * vnode (just instantiated, never written this session) only
@@ -12370,6 +12604,7 @@ tessera_vop_getpages(struct vop_getpages_args *ap)
 	struct tessera_node  *tn   = VTOTNODE(vp);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
 	if (tmp_->inode_tree == NULL) return (VM_PAGER_FAIL);
+	if (tessera_fs_vp_keycheck(vp) != 0) return (VM_PAGER_ERROR);
 
 	/* mmap reads come from on-disk content via fetch_blob — drain
 	 * any coalesced INLINE writes first so the bytes match what
@@ -32183,6 +32418,7 @@ tessera_vop_write(struct vop_write_args *ap)
 {
 	if (tessera_vop_rdonly(ap->a_vp))
 		return (EROFS);
+	{ int _ke = tessera_fs_vp_keycheck(ap->a_vp); if (_ke != 0) return (_ke); }
 	sbintime_t _tp0 = TPROF_T0();
 	int _rc = tessera_vop_write_impl(ap);
 	TPROF_ADD(TPROF_WRITE, _tp0);
@@ -32985,6 +33221,7 @@ tessera_vop_readlink(struct vop_readlink_args *ap)
 	struct uio   *uio = ap->a_uio;
 	struct tessera_node *tn = VTOTNODE(vp);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	{ int _ke = tessera_fs_vp_keycheck(vp); if (_ke != 0) return (_ke); }
 
 	uint8_t key[4];
 	tessera_inode_record_t ino;
@@ -33038,6 +33275,13 @@ tessera_vop_link(struct vop_link_args *ap)
 	if (tmp_->inode_tree == NULL) return (EROFS);
 	if (vp->v_type == VDIR) return (EPERM);
 	if (tdvp->v_mount != vp->v_mount) return (EXDEV);
+	/* E4.4: no name for a file in another key group's (or no group's)
+	 * domain; the test knob stands in for an offline edit. */
+	if (!tessera_test_cross_domain_link) {
+		int _xe = tessera_fs_move_ok(tmp_, 0, cn->inode_no,
+		    dn->inode_no);
+		if (_xe != 0) return (_xe);
+	}
 
 	/* POSIX: linking a name into a directory requires write permission
 	 * on that directory. */
@@ -33442,6 +33686,12 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			    tcnp->cn_cred);
 			if (serr != 0) { err = serr; goto release; }
 		}
+	}
+	/* E4.4: into, out of or between key groups is EXDEV (§5.4). */
+	{
+		int xerr = tessera_fs_move_ok(tmp_, fdn->inode_no,
+		    fn->inode_no, tdn->inode_no);
+		if (xerr != 0) { err = xerr; goto release; }
 	}
 	/* POSIX: rename of a directory into itself or into a DESCENDANT of
 	 * itself must fail with EINVAL — otherwise the moved subtree becomes a
@@ -33861,6 +34111,12 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int r = tessera_vop_ioctl_impl(ap);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	/* E4.4: an inode's domain or a domain's group may have changed;
+	 * vnodes look their group up again. */
+	if (r == 0 && (ap->a_command == TESSERA_IOC_QUOTA_SET ||
+	    ap->a_command == TESSERA_IOC_QUOTA_DETACH ||
+	    ap->a_command == TESSERA_IOC_QUOTA_GROUP))
+		atomic_add_rel_64(&tmp_->quota_gen, 1);
 	return (r);
 }
 
@@ -33887,6 +34143,15 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		 * directory's inode to it. */
 		tessera_quota_domain_t *qd =
 		    tessera_quota_find(tmp_, dino.quota_domain);
+		/* E4.4: a directory in the mount's default domain can't start
+		 * a domain of its own when that domain is in a key group: its
+		 * new files would be written outside the group (§5.4). (A
+		 * directory in any other domain only changes that domain's
+		 * limit here.) */
+		if (qd == NULL && dino.quota_domain == 0 &&
+		    tmp_->ngroups != 0 && tessera_fs_domain_group(tmp_,
+		    tmp_->quota_default_domain) != 0)
+			return (EPERM);
 		if (qd != NULL) {
 			qd->limit_bytes = limit;
 			tmp_->quota_dirty = 1;
@@ -34288,6 +34553,7 @@ static int
 tessera_xattr_cred(struct vnode *vp, int ns, struct ucred *cred,
     struct thread *td, accmode_t accmode)
 {
+	{ int _ke = tessera_fs_vp_keycheck(vp); if (_ke != 0) return (_ke); }
 	if (ns == EXTATTR_NAMESPACE_SYSTEM)
 		return (priv_check_cred(cred, PRIV_VFS_EXTATTR_SYSTEM));
 	return (VOP_ACCESS(vp, accmode, cred, td));
@@ -34847,6 +35113,111 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, mounts,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     tessera_sysctl_mounts, "A",
     "Per-mount metadata-reserve admission inputs and pinscan state");
+
+/* ── E4.4: dropping a group's key (encryption §10, page cache) ───── */
+
+static void
+tessera_fs_group_closing_mount(struct mount *mp, const uint8_t uuid[16],
+    uint64_t group, int closing)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+	struct tessera_fs_group *g;
+	struct vnode *vp, *mvp;
+	uint64_t vg;
+	int found = 0, n = 0;
+
+	if (tmp_ == NULL || !tmp_->groups_sx_init ||
+	    memcmp(tmp_->sb.volume_uuid, uuid, 16) != 0)
+		return;
+	sx_xlock(&tmp_->groups_sx);
+	g = tessera_fs_group_find(tmp_, group);
+	if (g != NULL) {
+		found = 1;
+		if (closing) {
+			g->closing++;
+		} else {
+			if (g->closing > 0)
+				g->closing--;
+			/* The key is gone: wipe the derived keys now rather
+			 * than at the next look. */
+			tessera_fs_groups_refresh(tmp_);
+		}
+	}
+	sx_xunlock(&tmp_->groups_sx);
+	if (!found || !closing)
+		return;
+
+	/*
+	 * Vnode ops on the group now answer EACCES. Write back what it has
+	 * dirty while its keys are still here (mapped pages reach the
+	 * dirty-content buffers, the flush publishes those under the
+	 * group's keys), and throw its plaintext away: VM pages, the
+	 * vnodes' cached manifest and chunk, and their name-cache entries.
+	 * An open file stays open; its reads answer EACCES.
+	 */
+	MNT_VNODE_FOREACH_ALL(vp, mp, mvp) {
+		if (vp->v_type == VNON || vp->v_data == NULL) {
+			VI_UNLOCK(vp);
+			continue;
+		}
+		if (vget(vp, LK_EXCLUSIVE | LK_INTERLOCK) != 0)
+			continue;
+		if (!VN_IS_DOOMED(vp) && tessera_fs_vp_group(vp, &vg) == 0 &&
+		    vg == group) {
+			struct tessera_node *tn = VTOTNODE(vp);
+
+			if (vp->v_type == VREG && vp->v_object != NULL) {
+				VM_OBJECT_WLOCK(vp->v_object);
+				vm_object_page_clean(vp->v_object, 0, 0,
+				    OBJPC_SYNC);
+				VM_OBJECT_WUNLOCK(vp->v_object);
+				(void)vinvalbuf(vp, V_SAVE, 0, 0);
+			}
+			if (tmp_->flush_mtx_init)
+				tessera_fs_flush_gate_enter(tmp_);
+			tessera_vnode_blob_release(&tn->mft_bytes,
+			    &tn->mft_len);
+			tessera_vnode_blob_release(&tn->chunk_bytes,
+			    &tn->chunk_len);
+			if (tmp_->flush_mtx_init)
+				tessera_fs_flush_gate_exit(tmp_);
+			cache_purge(vp);
+			n++;
+		}
+		vput(vp);
+	}
+	if ((mp->mnt_flag & MNT_RDONLY) == 0 && tessera_fs_flush(tmp_) != 0)
+		printf("tessera_fs: key group %ju: the flush before its key "
+		    "is dropped failed\n", (uintmax_t)group);
+	printf("tessera_fs: key group %ju closing on %s: %d vnode(s) "
+	    "flushed and cleared\n", (uintmax_t)group,
+	    mp->mnt_stat.f_mntonname, n);
+}
+
+/*
+ * The keyring is about to drop (closing = 1) or has dropped (closing = 0)
+ * the key of `group` on volume `uuid` (tessera_keyring.c TKEY_DROP).
+ */
+void
+tessera_fs_group_closing(const uint8_t uuid[16], uint64_t group,
+    int closing)
+{
+	struct mount *mp, *nmp;
+
+	mtx_lock(&mountlist_mtx);
+	for (mp = TAILQ_FIRST(&mountlist); mp != NULL; mp = nmp) {
+		if (mp->mnt_op != &tessera_vfsops ||
+		    vfs_busy(mp, MBF_NOWAIT | MBF_MNTLSTLOCK) != 0) {
+			nmp = TAILQ_NEXT(mp, mnt_list);
+			continue;
+		}
+		tessera_fs_group_closing_mount(mp, uuid, group, closing);
+		mtx_lock(&mountlist_mtx);
+		nmp = TAILQ_NEXT(mp, mnt_list);
+		vfs_unbusy(mp);
+	}
+	mtx_unlock(&mountlist_mtx);
+}
 
 MODULE_VERSION(tessera_fs, 1);
 MODULE_DEPEND(tessera_fs, crypto, 1, 1, 1);

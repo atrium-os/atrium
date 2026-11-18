@@ -81,7 +81,8 @@ struct tessera_ioc_group {
 
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
-/* ENOENT if not loaded. Mounts keep their derived keys until unmount. */
+/* ENOENT if not loaded. Mounts keep a volume's derived keys until unmount;
+ * a key group's are flushed and wiped at the drop (E4.4). */
 #define TKEY_DROP  _IOW('K', 2, struct tkey_id)
 #define TKEY_GEN   _IOWR('K', 3, struct tkey_gen)
 #define TKEY_FORMAT _IOW('K', 4, struct tkey_format)
@@ -96,6 +97,12 @@ int  tessera_keyring_get(const uint8_t key_id[16], const uint8_t uuid[16],
 /* Bumped by every TKEY_LOAD and TKEY_DROP: a mount holding derived group
  * keys looks again when it changes (encryption §5.4, E4.2). */
 uint64_t tessera_keyring_epoch(void);
+/* In tessera_fs.c: TKEY_DROP of a group's key calls this with closing = 1
+ * before the key goes (its mounts refuse the group's vnode ops, write back
+ * and drop its plaintext) and closing = 0 after (they wipe its keys). May
+ * sleep; called without the keyring lock. */
+void tessera_fs_group_closing(const uint8_t uuid[16], uint64_t group,
+         int closing);
 /* Record a committed generation under key_id (TKEY_GEN reports the max). */
 void tessera_keyring_note_gen(const uint8_t key_id[16], uint64_t gen);
 struct thread;

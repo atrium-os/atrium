@@ -810,8 +810,8 @@ E4 is mostly kernel work, so it is built in steps that each pass on their own:
 | step | what | done when |
 |---|---|---|
 | E4.1 | Core: group keys from GK (`tessera_group_keys_init`), key-group records in the quota tree (prefix 0xFF, `tessera_key_group_t`, MAC under `K_gmeta`), a domain's `key_group` and `group_mac`, `K_gid[d]`, keyed directory-name hashes, sealed journal names. The kernel's domain loader skips group records | host tests (`test_keygroup`, plain and ASan) **done 2026-11-18** |
-| E4.2 | Keyring and mount: `TKEY_LOAD` with a group scope makes the group's keys; a mount reads its group records and verifies each against a loaded key; `TESSERA_IOC_GROUP_CREATE` (key id, group) writes a record and sets `INCOMPAT_KEY_GROUPS`; `TESSERA_IOC_QUOTA_SET` takes a group and seals the domain into it | VM: a group made, remounted, verified; a domain record edited offline is refused |
-| E4.3 | Writes and reads in a group: one open pack per group, blobs sealed under `K_gblob` with ids under `K_gid[d]`, the front under `K_gmeta`, directory names hashed under `K_name`, journal names sealed. On an unsealed volume the registry keeps its 40-byte entries: a group pack's front is authenticated by its own tag, and packs never change, so there is no older copy to swap in | VM: files and names written in a group are not in the clear on the device; read back after remount; dedup inside the group, none across |
+| E4.2 | Keyring and mount: `TKEY_LOAD` with a group scope makes the group's keys; a mount reads its group records and verifies each against a loaded key; `TESSERA_IOC_GROUP_CREATE` (key id, group) writes a record and sets `INCOMPAT_KEY_GROUPS`; `TESSERA_IOC_QUOTA_SET` takes a group and seals the domain into it | VM: a group made, remounted, verified; a domain record edited offline is refused. **Done** 2026-11-18 (3617ba7, 41f7a02, 0c625c3; tessera-sealed-vm.sh check 11) |
+| E4.3 | Writes and reads in a group: one open pack per group, blobs sealed under `K_gblob` with ids under `K_gid[d]`, the front under `K_gmeta`, directory names hashed under `K_name`, journal names sealed. On an unsealed volume the registry keeps its 40-byte entries: a group pack's front is authenticated by its own tag, and packs never change, so there is no older copy to swap in | VM: files and names written in a group are not in the clear on the device; read back after remount; dedup inside the group, none across. **Done** 2026-11-18 (e21928e, 378a656; check 12) |
 | E4.4 | Locked groups and the rules: without the key, contents, names and xattrs answer `EACCES` (root can still `stat`); the parent-domain rule; rename into, out of or between groups is `EXDEV`; dropping a key flushes and invalidates the group's vnodes and pages | VM: root can't read B's files while B's key is dropped; an offline edit that moves a file out of the group is refused |
 | E4.5 | GC: group packs are kept while the group is locked and collected by group when it's loaded; crypto-erase retires a group's packs without its key | VM: GC on a volume with a locked group frees nothing of it |
 | E4.6 | atrium-volumes `encrypt = "persona"` with expected groups, arcad group keys (`VK_MINT`/`VK_LOAD` with a group scope) at login and dropped at logout | VM: two people, the §13 E4 gate |
@@ -838,6 +838,32 @@ are sealed blobs, so their plain name hashes are never on disk in the clear;
 keyed name hashes (`K_name`) and the keyed gear table (`K_cdc`; the kernel
 chunks at fixed sizes) are left to userspace writers. Host tools (fsck, the
 reader) don't open group packs yet. VM gate: `tessera-sealed-vm.sh` check 12.
+
+**E4.4 as built (2026-11-18, kernel).** Every vnode op that uses an
+inode's contents, names or xattrs (access for read, write or search, so
+lookups served from the name cache too; open, read, write, readdir, lookup,
+readlink, getpages and the four xattr ops) asks whether the inode's group
+is open; a locked one answers `EACCES` for root too and is logged "locked"
+(rate-limited). `getattr` doesn't ask, so root can stat a group's root from
+its plain parent; below it, names need the key. A vnode caches its group,
+looked up again when a quota ioctl changes domains. The parent-domain rule
+is enforced at lookup when either domain is in a group: a name whose inode
+is in another domain than its directory is refused (`EINTEGRITY`, logged)
+unless the inode is its domain's root. Rename and link compare the moving
+inode's domain with the target directory's: into, out of or between groups
+is `EXDEV` (`mv` then copies and deletes); a group's root may move between
+directories of the same group or of none. A directory of a grouped default
+domain can't start a new domain. Dropping a group's key (`TKEY_DROP`)
+first calls into every mount of that volume: the group is marked closing
+(its vnode ops answer `EACCES`, while the flush still writes with its
+keys), dirty mapped pages are written back, the mount is flushed, and the
+group's VM pages, cached manifest and chunk and name-cache entries are
+thrown away; after the drop the derived keys are wiped at once. An open
+file stays open and its reads answer `EACCES`. Because the flush commits
+before the key goes, the E4.3 limit on journaled names only bites when a
+flush fails. Test hook: `kern.tessera.test_cross_domain_link` lets
+`link(2)` skip the domain check, standing in for an offline edit. VM gate:
+`tessera-sealed-vm.sh` check 13.
 
 ## 14. Decisions
 

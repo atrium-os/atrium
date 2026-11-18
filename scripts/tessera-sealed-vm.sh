@@ -46,6 +46,15 @@
 #      in the clear, read back after a remount, dedup inside the group and
 #      not across, nothing read with the key dropped, a sealed journal name
 #      survives a crash.
+#  13. locked groups and the rules (E4.4) on a plain image: a rename inside
+#      a group keeps the inode, into, out of or between groups it copies
+#      (EXDEV); link(2) across is refused; a group's root moves between
+#      plain directories; with the key dropped on a live mount, root can't
+#      list, read, write or read xattrs in the group (an open file too) but
+#      can stat its root, and the other group and plain files still read;
+#      what was written just before the drop is there after the reload; a
+#      name for a group's file in a plain directory (the test sysctl stands
+#      in for an offline edit) is refused after a remount.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-arm64}"
@@ -396,6 +405,92 @@ umount $M; mdconfig -d -u ${DEV#/dev/md}
 tessera-keyload drop $GKID >/dev/null
 rm -f $IMG $IMG.crash $T/gkey $T/pcontent $T/got
 echo "writing in a key group: ok"
+
+# 13. locked groups and the rules (E4.4)
+U4=b2c3d4e5f60718293a4b5c6d7e8f90a1
+GKID2=9e0000bb112233445566778899aabbcc
+rm -f $IMG
+tessera-mkfs-sealed --plain --create -s 64 -j 64 --uuid $U4 $IMG >/dev/null ||
+    fail "mkfs plain for the rules"
+head -c 32 /dev/random > $T/gkey; head -c 32 /dev/random > $T/gkey2
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+mount -t tessera $DEV $M || fail "plain mount for the rules"
+mkdir $M/persona $M/team $M/other $M/homes || fail "rule dirs"
+for d in persona team other; do
+    tessera-quota-set $M/$d 1000000000 >/dev/null || fail "quota $d"
+done
+tessera-keyload load-group $T/gkey $GKID $U4 9 >/dev/null || fail "load-group 9"
+tessera-keyload load-group $T/gkey2 $GKID2 $U4 10 >/dev/null || fail "load-group 10"
+tessera-keyload group-create $M $GKID 9 >/dev/null || fail "group-create 9"
+tessera-keyload group-create $M $GKID2 10 >/dev/null || fail "group-create 10"
+tessera-keyload quota-group $M/persona 9 >/dev/null || fail "quota-group 9"
+tessera-keyload quota-group $M/team 10 >/dev/null || fail "quota-group 10"
+mkdir $M/persona/sub || fail "mkdir in group 9"
+for f in a b c d; do echo "persona file $f" > $M/persona/$f.txt || fail "write $f"; done
+echo 'team file' > $M/team/t.txt || fail "write in group 10"
+echo 'plain file' > $M/other/p.txt || fail "write plain"
+setextattr user note 'persona xattr' $M/persona/b.txt || fail "setextattr in group"
+ino() { stat -f %i "$1"; }
+i0=$(ino $M/persona/a.txt)
+mv $M/persona/a.txt $M/persona/sub/a.txt || fail "rename in group"
+[ "$(ino $M/persona/sub/a.txt)" = "$i0" ] || fail "a rename inside the group copied"
+i0=$(ino $M/persona/c.txt)
+mv $M/persona/c.txt $M/other/c.txt || fail "move out of the group"
+[ "$(ino $M/other/c.txt)" != "$i0" ] || fail "a rename out of the group kept the inode"
+[ "$(cat $M/other/c.txt)" = 'persona file c' ] || fail "moved-out file differs"
+i0=$(ino $M/other/p.txt)
+cp $M/other/p.txt $M/other/p2.txt
+mv $M/other/p2.txt $M/persona/p2.txt || fail "move into the group"
+[ "$(ino $M/persona/p2.txt)" != "$(ino $M/other/p.txt)" ] || fail "into: same inode"
+i0=$(ino $M/persona/d.txt)
+mv $M/persona/d.txt $M/team/d.txt || fail "move between groups"
+[ "$(ino $M/team/d.txt)" != "$i0" ] || fail "a rename between groups kept the inode"
+ln $M/persona/b.txt $M/other/b-link 2>/dev/null && fail "link out of the group"
+ln $M/other/p.txt $M/persona/p-link 2>/dev/null && fail "link into the group"
+i0=$(ino $M/persona)
+mv $M/persona $M/homes/persona || fail "move the group's root"
+[ "$(ino $M/homes/persona)" = "$i0" ] || fail "the group's root was copied"
+P=$M/homes/persona
+# the key dropped on a live mount
+exec 3< $P/b.txt
+echo 'written just before the drop' > $P/late.txt
+n0=$(dmesg | wc -l)
+tessera-keyload drop $GKID >/dev/null || fail "drop group 9 while mounted"
+dmesg | tail -n +$((n0 + 1)) | grep -q 'key group 9 closing on' ||
+    fail "no flush when the key was dropped"
+ls $P >/dev/null 2>&1 && fail "listed a locked group"
+cat $P/sub/a.txt >/dev/null 2>&1 && fail "read a locked group's file"
+cat <&3 >/dev/null 2>&1 && fail "read a locked group's open file"
+getextattr -q user note $P/b.txt >/dev/null 2>&1 && fail "read a locked group's xattr"
+touch $P/new.txt 2>/dev/null && fail "created in a locked group"
+stat $P >/dev/null || fail "no stat of a locked group's root"
+[ "$(cat $M/team/t.txt)" = 'team file' ] || fail "the other group with one locked"
+[ "$(cat $M/other/p.txt)" = 'plain file' ] || fail "a plain file with a group locked"
+dmesg | tail -n +$((n0 + 1)) | grep -q 'key group 9 is locked; refused' ||
+    fail "no 'locked' on the console"
+exec 3<&-
+tessera-keyload load-group $T/gkey $GKID $U4 9 >/dev/null || fail "reload group 9"
+[ "$(cat $P/late.txt)" = 'written just before the drop' ] ||
+    fail "a write just before the drop is lost"
+[ "$(getextattr -q user note $P/b.txt)" = 'persona xattr' ] || fail "xattr after reload"
+# an offline edit stand-in: a plain directory names a group's file
+sysctl kern.tessera.test_cross_domain_link=1 >/dev/null || fail "test sysctl"
+ln $P/b.txt $M/other/stolen; r=$?
+sysctl kern.tessera.test_cross_domain_link=0 >/dev/null
+[ $r = 0 ] || fail "the test link wasn't made"
+umount $M || fail "umount after the rules"
+mount -t tessera $DEV $M || fail "remount after the rules"
+n0=$(dmesg | wc -l)
+cat $M/other/stolen >/dev/null 2>&1 && fail "read a group's file through a plain directory"
+dmesg | tail -n +$((n0 + 1)) | grep -q 'breaks the key-group domain rule' ||
+    fail "no 'domain rule' on the console"
+[ "$(cat $M/homes/persona/late.txt)" = 'written just before the drop' ] ||
+    fail "late file after remount"
+[ "$(cat $M/homes/persona/sub/a.txt)" = 'persona file a' ] || fail "moved file after remount"
+umount $M; mdconfig -d -u ${DEV#/dev/md}
+tessera-keyload drop $GKID >/dev/null; tessera-keyload drop $GKID2 >/dev/null
+rm -f $IMG $T/gkey $T/gkey2
+echo "locked groups and rules: ok"
 
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload
