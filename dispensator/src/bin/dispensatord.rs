@@ -808,6 +808,10 @@ mod run {
         }
         let out = child.wait_with_output().map_err(|_| 252u8)?;
         let line = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
+        // `ok ANSWER`, or a bare `ok` for ops that answer nothing.
+        if line == "ok" {
+            return Ok(String::new());
+        }
         if let Some(a) = line.strip_prefix("ok ") {
             return Ok(a.to_string());
         }
