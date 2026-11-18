@@ -163,6 +163,12 @@ rw_patterns = [
 # (/var/lib/atrium/storage/jails/<jail>/<vol>); rw_patterns'
 # trailing-* glob is single-segment, so we use the prefix
 # allow-list here.
+# A catalog driver's own package folder, read-only, in its jail (one folder
+# below, never the drivers folder itself: a driver sees only its own files).
+ro_subtrees = [
+    "/usr/local/libexec/atrium/drivers/",
+]
+
 rw_subtrees = [
     "/var/lib/atrium/storage/jails/",
     # Session components' own state, one folder per person and component

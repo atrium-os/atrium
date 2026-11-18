@@ -290,6 +290,12 @@ pub struct MountSources {
     /// allocator daemon producing the paths.
     #[serde(default)]
     pub rw_subtrees: Vec<String>,
+    /// Read-only package parents: a folder directly in one of these (never
+    /// the folder itself, so one package never sees its neighbours) is
+    /// permitted as an ro mount source. Catalog drivers' package folders
+    /// (`/usr/local/libexec/atrium/drivers/<id>`, opifex.md §8.2).
+    #[serde(default)]
+    pub ro_subtrees: Vec<String>,
     /// ★ The largest tmpfs any jail may mount, in MiB, and the size given to
     /// one that does not ask. tmpfs is RAM-backed and was mounted with no
     /// options at all, so every tmpfs jaild created could grow until the
