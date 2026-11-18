@@ -241,6 +241,8 @@ impl Workbook {
         };
         let this: &Workbook = self;
         let compute = |part: &Vec<(u32, u32)>| -> (Vec<Value>, u64) {
+            // The workbook can't change until every part is done.
+            let _frozen = crate::eval::ifcache::Frozen::new();
             let grp = this.group(g);
             let bound = grp.fast.as_ref().map(|f| f.bind(this));
             let mut out = Vec::with_capacity(part.iter().map(|&(a, b)| (b - a) as usize + 1).sum());
