@@ -270,7 +270,7 @@ g "set -e
     # that is only in the catalog (opening-links.md §4.3, L5).
     rm -rf /root/appprobe-bundle && mkdir -p /root/appprobe-bundle/bin && cp $D/link-probe /root/appprobe-bundle/bin/
     echo atrium-app://org.atrium.l5hello > /root/appprobe-bundle/link-probe.url
-    printf '[app]\nid = \"org.test.appprobe\"\nname = \"App probe\"\nversion = \"1\"\nentry = \"bin/link-probe\"\n\n[capabilities]\ngraphics = \"fresco\"\nopen-uri = true\n' > /root/appprobe-bundle/atrium.toml
+    printf '[app]\nid = \"org.test.appprobe\"\nname = \"App probe\"\nversion = \"1\"\nentry = \"bin/link-probe\"\n\n[capabilities]\ngraphics = \"fresco\"\nopen-uri = true\nclipboard = true\n' > /root/appprobe-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/appprobe-bundle/atrium.toml.sig /root/appprobe-bundle/atrium.toml
     opifex install /root/appprobe-bundle
     portcullis policy grant --system org.test.appprobe
@@ -542,6 +542,8 @@ g "grep -q 'asking: This link opens the app L5 hello by Atrium; it asks for noth
     && ok "…naming it L5 hello by Atrium, what it asks for, and that it isn't installed" || bad "app prompt: $(g "grep -h 'asking:' $UL | tail -1")"
 sleep 3
 shot confined-3-app
+sleep 15
+shot confined-3-app-later   # the same row, a while on (a label drawn late?)
 press $((W - 40)) $((TOP + 41 + 22))                   # Try it
 until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
@@ -698,6 +700,16 @@ g "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock" && ok "the install sh
 g "cd $S && daemon -f -o $S/appprobe.log -u navtest /usr/local/bin/portcullis launch --no-prompt org.test.appprobe </dev/null"
 i=0; while [ $i -lt 60 ] && ! g "grep -q 'link-probe: up' $S/appprobe.log"; do sleep 3; i=$((i+3)); done
 sleep 10
+# A paste refused across personas (personas.md §6): the clipboard still
+# holds the address Copy address copied in Work; App probe is Personal's
+# and navtest's switch lets no clipboard entry cross, so nothing pastes
+# and frescod's strip notes where it was copied (its words, Tabula's ask).
+inj "KEY 0x19 1 1"; sleep 1; inj "KEY 0x19 0 1"; sleep 3   # Ctrl-V
+i=0; while [ $i -lt 30 ] && ! g "grep -q 'link-probe: paste' $S/appprobe.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: paste refused: Refused { reason: 10' $S/appprobe.log" && ok "a paste in a Personal app of what was copied in Work is refused" || bad "paste: $(g "grep -h paste $S/appprobe.log | tail -1; tail -2 $S/tabulad.log" | tr '\n' ';')"
+g "grep -q 'a strip note over window [0-9]* for uid 65039: paste refused: copied in work' $S/frescod.log" && ok "…and the strip says it was copied in work" || bad "strip note: $(g "grep -h -e 'strip note' -e 'did not show' $S/frescod.log $S/tabulad.log | tail -2" | tr '\n' ';')"
+shot confined-10-paste-refused
+sleep 5
 key 0x28                  # Enter in App probe's window: open the link
 i=0; while [ $i -lt 60 ] && ! g "grep -q 'asking about' $L5/sheet.log"; do sleep 3; i=$((i+3)); done
 g "grep -q 'not installed: to install first' $PL" && ok "portcullisd: $L5ID isn't installed, so it is to be installed first" || bad "grant: $(g "grep -h 'atrium-app' $PL | tail -2; tail -2 $ML" | tr '\n' ';')"

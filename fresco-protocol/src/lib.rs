@@ -2661,6 +2661,18 @@ pub mod activation {
         /// link was just handed to. Only by a caller that spent a `LINK`
         /// press in the last two minutes, once per press.
         pub const RAISE: u16 = 0x0902;
+        /// `Note` → `NoteResult`: a note in the strip over the window a
+        /// paste or drop press was just spent for (personas.md §6). Only
+        /// by the caller that spent it, once per press, within
+        /// five seconds; frescod writes the words.
+        pub const NOTE: u16 = 0x0903;
+    }
+
+    /// What a strip note says; frescod words it.
+    pub mod note {
+        /// "paste refused: copied in <persona>": the entry is in another
+        /// persona and the person's switch doesn't let it cross.
+        pub const COPIED_IN: u8 = 1;
     }
 
     /// What a broker spends a token on (§2.2's table decides which kinds fit).
@@ -2755,6 +2767,22 @@ pub mod activation {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct Raise {
         pub uid: u32,
+    }
+
+    /// A strip note over `window_id`: `kind` from [`note`], `persona` the
+    /// one named (lower case, at most 32 bytes of an origin's characters;
+    /// frescod drops the rest).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Note {
+        pub window_id: u32,
+        pub kind: u8,
+        pub persona: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum NoteResult {
+        Ok,
+        Refused { reason: u8 },
     }
 
     /// `NOT_ALLOWED`: no `LINK` press spent lately; `UNKNOWN`: `uid` has

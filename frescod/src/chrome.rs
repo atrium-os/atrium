@@ -183,7 +183,7 @@ const STRIP_COLOR: [f32; 4] = [0.08, 0.08, 0.1, 1.0];
 /// frescod leaves between the icon and the panel names it.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub fn build(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)], islands: &[Island]) -> WindowFrame {
+pub fn build(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> Option<String>, note: Option<&str>, shown: &[(u32, [i32; 4])], slots: &[[i32; 4]], covers: &[[i32; 4]], hosted: &[([i32; 4], String, bool)], islands: &[Island]) -> WindowFrame {
     let sw = screen_w as i32;
     let strip = px.strip();
     let ring = px.p(RING);
@@ -220,7 +220,16 @@ pub fn build(px: Px, screen_w: u32, focus: Option<u16>, origin: impl Fn(u16) -> 
         }
         if let Some(o) = origin(f).filter(|o| !o.is_empty()) {
             rects.push(rect(px.p(PAD), px.p(3), ring, strip - 2 * px.p(3), RING_COLOR)); // ties the text to the ring
-            text(&mut rects, px, &o, px.p(3 * PAD), (strip - line(px)) / 2, sw - px.p(4 * PAD));
+            let room = note.map_or(0, |n| text_width(px, n) + px.p(6 * PAD));
+            text(&mut rects, px, &o, px.p(3 * PAD), (strip - line(px)) / 2, sw - px.p(4 * PAD) - room);
+        }
+        // A note over the focused window (`activation::Notes`, frescod's
+        // words), at the strip's right end in the warning colour.
+        if let Some(n) = note {
+            let w = text_width(px, n);
+            let x = (sw - px.p(3 * PAD) - w).max(px.p(3 * PAD));
+            rects.push(rect(x - px.p(2 * PAD), px.p(3), ring, strip - 2 * px.p(3), SLOT_COLOR));
+            text(&mut rects, px, n, x, (strip - line(px)) / 2, sw - x);
         }
     }
     WindowFrame {
@@ -490,11 +499,11 @@ mod tests {
             f.rects.iter().any(|n| n.color == RING_COLOR && (n.position[0] as i32..(n.position[0] + n.size[0]) as i32).contains(&x)
                 && (n.position[1] as i32..(n.position[1] + n.size[1]) as i32).contains(&y))
         };
-        let open = build(Px::ONE, 1280, Some(5), |_| None, &shown, &[], &[], &[], &[]);
+        let open = build(Px::ONE, 1280, Some(5), |_| None, None, &shown, &[], &[], &[], &[]);
         assert!(lit(&open, 800, 62) && lit(&open, 600, 62));
         // A bar menu over the window's top edge hides the ring under it only.
         let menu = [679, 56, 975, 92];
-        let under = build(Px::ONE, 1280, Some(5), |_| None, &shown, &[], &[menu], &[], &[]);
+        let under = build(Px::ONE, 1280, Some(5), |_| None, None, &shown, &[], &[menu], &[], &[]);
         assert!(!lit(&under, 800, 62) && !lit(&under, 679, 63) && !lit(&under, 974, 62));
         assert!(lit(&under, 678, 62) && lit(&under, 975, 62) && lit(&under, 0, 300) && lit(&under, 640, 669));
         assert_eq!(uncovered([0, 0, 10, 10], &[[2, 2, 4, 4]]).iter().map(|[a, b, c, d]| (c - a) * (d - b)).sum::<i32>(), 96);
@@ -503,7 +512,7 @@ mod tests {
     #[test]
     fn a_granted_panel_gets_a_label_naming_its_app() {
         let gap = fresco_scene_server::window::HOSTED_LABEL_GAP as i32;
-        let f = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[([900, 62 + gap, 1200, 362], "org.example.clip".into(), true)], &[]);
+        let f = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[([900, 62 + gap, 1200, 362], "org.example.clip".into(), true)], &[]);
         let pill = f.rects.iter().find(|n| n.color == STRIP_COLOR && n.position[0] == 900.0 && n.radius > 0.0).expect("a label");
         let (top, bottom) = (pill.position[1] as i32, (pill.position[1] + pill.size[1]) as i32);
         assert!(top >= 62 && bottom <= 62 + gap, "in the gap above the panel: {top}..{bottom}");
@@ -547,7 +556,7 @@ mod tests {
         assert_eq!(Px::new(1125).font().scale_milli, 1000, "the largest table not above the scale");
         assert_eq!(Px::new(2000).font().scale_milli, 2000);
         let shown = [(5u32, [0, 100, 1280, 600])];
-        let at = |px: Px| build(px, 3840, Some(5), |_| Some("example.org".into()), &shown, &[], &[], &[], &[]);
+        let at = |px: Px| build(px, 3840, Some(5), |_| Some("example.org".into()), None, &shown, &[], &[], &[], &[]);
         let (one, two) = (at(Px::ONE), at(Px::new(2000)));
         assert_eq!(two.rects[0].size[1], 48.0, "the strip");
         let glyph_h = |f: &WindowFrame| {
@@ -562,13 +571,26 @@ mod tests {
     }
 
     #[test]
+    fn a_note_sits_at_the_strips_right_end_over_the_focused_window() {
+        let shown = [(5u32, [0, 100, 1280, 600])];
+        let text_x = |f: &WindowFrame| f.rects.iter().filter(|n| n.color[..3] == TEXT_COLOR[..3]).map(|n| n.position[0] as i32).max();
+        let plain = build(Px::ONE, 1280, Some(5), |_| Some("example.org".into()), None, &shown, &[], &[], &[], &[]);
+        let noted = build(Px::ONE, 1280, Some(5), |_| Some("example.org".into()), Some("paste refused: copied in work"), &shown, &[], &[], &[], &[]);
+        assert!(text_x(&plain).unwrap() < 400, "the origin alone, at the left");
+        let x = text_x(&noted).unwrap();
+        assert!(x > 1280 - 40 && x < 1280, "the note ends at the right: {x}");
+        assert!(noted.rects.iter().any(|n| n.color == SLOT_COLOR && n.position[1] < 24.0), "its mark");
+        assert!(noted.rects.iter().filter(|n| n.color[..3] == TEXT_COLOR[..3]).all(|n| n.position[1] + n.size[1] <= 24.0), "inside the strip");
+    }
+
+    #[test]
     fn an_island_is_framed_and_tagged_and_dashed_while_covered() {
         let at = [200, 300, 600, 500];
         let clear = Island { rect: at, covered: false, origin: Some("media.example".into()) };
         assert_eq!(clear.tag(), "live code: media.example");
         assert_eq!(Island { origin: None, ..clear.clone() }.tag(), "live code");
         let sides = |f: &WindowFrame| f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).count();
-        let f = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[clear.clone()]);
+        let f = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[clear.clone()]);
         assert_eq!(sides(&f), 4, "four solid sides");
         // The frame is just outside the island: none of its pixels.
         assert!(f.rects.iter().filter(|n| n.color == ISLAND_COLOR && n.radius == 0.0).all(|n| {
@@ -577,10 +599,10 @@ mod tests {
         }));
         let pill = f.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).expect("a tag");
         assert_eq!(pill.position[1] as i32, at[1] - 1 - LABEL_H, "above the island");
-        let covered = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[Island { covered: true, ..clear.clone() }]);
+        let covered = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[Island { covered: true, ..clear.clone() }]);
         assert!(sides(&covered) > 20, "dashed");
         // No room above, under the strip: the tag goes below.
-        let high = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[Island { rect: [10, 30, 200, 100], ..clear.clone() }]);
+        let high = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[Island { rect: [10, 30, 200, 100], ..clear.clone() }]);
         let pill = high.rects.iter().find(|n| n.color == ISLAND_COLOR && n.radius > 0.0).unwrap();
         assert_eq!(pill.position[1] as i32, 101);
         assert!(super::slot_frames(Px::ONE, &[], &[clear]).is_some(), "direct mode frames islands too");
@@ -590,7 +612,7 @@ mod tests {
     fn a_sheet_is_framed_and_tagged_above_and_its_parent_dimmed() {
         let sh = Sheet { rect: [160, 200, 800, 640], app: "org.atrium.scrinium".into(), dev: false };
         assert_eq!(sh.tag(), "system: org.atrium.scrinium");
-        let mut c = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[]);
+        let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
         let before = c.rects.len();
         sheet_frames(&mut c, Px::ONE, &[sh.clone()], 24);
         let added = &c.rects[before..];
@@ -603,7 +625,7 @@ mod tests {
         let pill = added.iter().find(|n| n.radius > 0.0).expect("a tag");
         assert_eq!(pill.position[1] as i32, 200 - RING - LABEL_H, "above the sheet");
         // No room above: below it.
-        let mut c = build(Px::ONE, 1280, None, |_| None, &[], &[], &[], &[], &[]);
+        let mut c = build(Px::ONE, 1280, None, |_| None, None, &[], &[], &[], &[], &[]);
         sheet_frames(&mut c, Px::ONE, &[Sheet { rect: [10, 30, 300, 200], ..sh }], 24);
         assert!(c.rects.iter().any(|n| n.radius > 0.0 && n.color == SHEET_COLOR && n.position[1] as i32 == 200 + RING));
         let d = dim_layer(dim_id(7), [0, 24, 760, 564]);

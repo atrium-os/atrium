@@ -92,6 +92,11 @@ fn a_paste_takes_only_from_its_own_persona_without_the_switch() {
     let Reply::Dragging { drag_id } = drag(&mut work, f.mint(WORK_MAIL, kind::BUTTON), &[("text/plain", b"x")]) else { panic!() };
     assert_eq!(drop_get(&mut vw, f.mint_drop(VIEWER, drag_id), &["text/plain"]).0, Reply::Refused { reason: refusal::OTHER_PERSONA, detail: 0 });
 
+    // Each refusal asked frescod for a strip note naming where it was copied.
+    let named: Vec<String> = f.notes().iter().map(|n| n.persona.clone()).collect();
+    assert_eq!(named, ["work", "personal", "work"]);
+    assert!(f.notes().iter().all(|n| n.kind == fresco_protocol::activation::note::COPIED_IN && n.window_id == 1));
+
     // With ana's switch from Work to Personal, one way only.
     let (f, s) = personas(vec![("ana".into(), Some("work".into()), None)]);
     let (mut work, mut vw) = (app(&s, WORK_MAIL), app(&s, VIEWER));
