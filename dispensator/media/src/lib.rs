@@ -18,6 +18,7 @@
 //! | `FORMAT` 0x0A | postcard [`Format`] | `u8 status`, then postcard `String`: erase a stick and make it a sealed one for a persona (tessera-encryption.md §7.1); the key never leaves Arca and the kernel |
 //! | `ADOPT` 0x0B | postcard [`Adopt`] | `u8 status`, then postcard `String`: open a Locked stick with its recovery code (tessera-encryption.md §7.4); arcad unwraps its key, keeps it in the persona or loads it for this session only |
 //! | `OPEN_OLDER` 0x0C | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Open read-only?" for a Locked stick that is an older copy of one of the person's (tessera-encryption.md §8); Sigillum verifies the person first |
+//! | `MAKE_CURRENT` 0x0D | postcard [`Eject`] (the part) | `u8 status`, then postcard `String`: "Use this copy as current" for an older copy opened read-only (§8): Sigillum verifies the person, arcad lowers its key's high-water mark to this copy, and it is mounted writable |
 //! | `SUBSCRIBE` 0x10 | empty | `u8 status`; then `EV` 0x80 events (`ASYNC_EVENT`), postcard [`Event`]: an `Added` per volume served now, then changes |
 //!
 //! Only the session's own user and its desktop components (Forum) may ask;
@@ -47,6 +48,7 @@ pub mod op {
     pub const FORMAT: u16 = 0x0A;
     pub const ADOPT: u16 = 0x0B;
     pub const OPEN_OLDER: u16 = 0x0C;
+    pub const MAKE_CURRENT: u16 = 0x0D;
     pub const SUBSCRIBE: u16 = 0x10;
     pub const EV: u16 = 0x80;
 }
@@ -85,7 +87,8 @@ pub struct Volume {
     pub recovery: bool,
     /// A Locked stick that is the person's, but older than the last time
     /// it was used here (§8): `OPEN_OLDER` opens it read-only. `persona`
-    /// names whose.
+    /// names whose. Once opened (mounted, `read_only`), still `older`:
+    /// `MAKE_CURRENT` makes it the current copy.
     pub older: bool,
 }
 
@@ -255,6 +258,9 @@ pub mod server {
         /// "Open read-only?" for an older copy (checked here: who, and that
         /// it's listed as one).
         fn open_older(&self, part: &str) -> (u8, String);
+        /// "Use this copy as current" (checked here: who, and that it's
+        /// listed as an older copy opened read-only).
+        fn make_current(&self, part: &str) -> (u8, String);
     }
 
     pub struct Shared {
@@ -350,6 +356,16 @@ pub mod server {
                 return (status::NOT_FOUND, format!("{part} is not an older copy of a stick of yours"));
             }
             self.host.open_older(part)
+        }
+
+        pub fn make_current(&self, uid: u32, part: &str) -> (u8, String) {
+            if uid != 0 && !self.host.allowed(uid) {
+                return (status::NOT_ALLOWED, "only the session's user may change a stick".into());
+            }
+            if !self.state.lock().unwrap().volumes.iter().any(|v| v.part == part && !v.locked && v.older) {
+                return (status::NOT_FOUND, format!("{part} is not an older copy opened read-only"));
+            }
+            self.host.make_current(part)
         }
 
         pub fn eject(&self, uid: u32, part: &str) -> (u8, String) {
@@ -508,6 +524,13 @@ pub mod server {
                     };
                     conn.send_message(CLASS, op::OPEN_OLDER, flag::IS_RESPONSE, &enc(st, &msg))?;
                 }
+                op::MAKE_CURRENT => {
+                    let (st, msg) = match postcard::from_bytes::<Eject>(&m.payload) {
+                        Ok(e) if !e.part.is_empty() && e.part.len() <= 32 => shared.make_current(uid, &e.part),
+                        _ => (status::MALFORMED, "malformed".into()),
+                    };
+                    conn.send_message(CLASS, op::MAKE_CURRENT, flag::IS_RESPONSE, &enc(st, &msg))?;
+                }
                 op::SUBSCRIBE => {
                     let Some((now, rx)) = shared.subscribe(uid) else {
                         conn.send_message(CLASS, op::SUBSCRIBE, flag::IS_RESPONSE, &[status::NOT_ALLOWED])?;
@@ -591,6 +614,10 @@ pub mod client {
 
     pub fn open_older(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
         status_call(sock, op::OPEN_OLDER, part)
+    }
+
+    pub fn make_current(sock: &Path, part: &Eject) -> Result<String, (u8, String)> {
+        status_call(sock, op::MAKE_CURRENT, part)
     }
 
     fn status_call<T: Serialize>(sock: &Path, o: u16, v: &T) -> Result<String, (u8, String)> {
@@ -736,6 +763,9 @@ mod tests {
         }
         fn open_older(&self, part: &str) -> (u8, String) {
             (status::OK, format!("{part} opened read-only"))
+        }
+        fn make_current(&self, part: &str) -> (u8, String) {
+            (status::OK, format!("{part} is now the current copy"))
         }
     }
 
@@ -909,5 +939,17 @@ mod tests {
         assert_eq!(shared.open_older(2000, "da1p1").0, status::NOT_ALLOWED);
         assert_eq!(shared.open_older(1000, "da0p1").0, status::NOT_FOUND);
         assert_eq!(shared.open_older(1000, "da2p1").0, status::NOT_FOUND);
+    }
+
+    #[test]
+    fn make_current_needs_an_opened_older_copy() {
+        let shared = server::Shared::new(Box::new(H(Arc::new(AtomicU32::new(1000)))));
+        let opened = Volume { read_only: true, older: true, ..vol("da1p1") };
+        let locked = Volume { mountpoint: String::new(), locked: true, older: true, ..vol("da2p1") };
+        shared.update(vec![vol("da0p1"), opened, locked], &[]);
+        assert_eq!(shared.make_current(1000, "da1p1").0, status::OK);
+        assert_eq!(shared.make_current(2000, "da1p1").0, status::NOT_ALLOWED);
+        assert_eq!(shared.make_current(1000, "da0p1").0, status::NOT_FOUND, "a current stick");
+        assert_eq!(shared.make_current(1000, "da2p1").0, status::NOT_FOUND, "not opened yet");
     }
 }

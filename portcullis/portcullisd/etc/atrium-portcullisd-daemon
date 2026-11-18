@@ -81,9 +81,9 @@ atrium_portcullisd_daemon_stop() {
     pid=$(cat "${pidfile}")
     echo "Stopping ${name}."
     kill -TERM "${pid}" 2>/dev/null
-    for _ in 1 2 3 4 5; do
-        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
-    done
+    # pwait returns the moment it exits (a `sleep 1` loop cost a full second
+    # per script at every shutdown: fast-boot.md §2.0).
+    pwait -t 5 "${pid}" 2>/dev/null
     if kill -0 "${pid}" 2>/dev/null; then
         echo "Force-killing ${name}."
         kill -KILL "${pid}" 2>/dev/null

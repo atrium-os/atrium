@@ -461,6 +461,18 @@ pub enum Request {
     /// From an app, only with `activation`, a press on Run (purpose
     /// LAUNCH); the person's own CLI needs none. Answer: `WorkspaceRan`.
     WorkspaceRun { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// Run under the debugger (dev-tools.md §7.2, dev-tools-plan.md M10):
+    /// as `WorkspaceRun`, but the dev app starts under `lldb-server` in its
+    /// own jail once a debugger connects to `address` (on the workspace's
+    /// own loopback, from inside it: `gdb-remote <address>`). Only dev
+    /// builds: installed apps are never debuggable (D9). Answer:
+    /// `WorkspaceDebugging`.
+    WorkspaceDebug { name: String, #[serde(default)] project: String, #[serde(default)] activation: [u8; 16] },
+    /// Move the cores the workspace's dev builds left in their own overlays
+    /// into its `work/.atrium/cores/` (dev-tools.md §7.2), as
+    /// `<app id>.<core name>`. Answer: `WorkspaceCores`, the copies' paths
+    /// relative to `work`.
+    WorkspaceCores { name: String },
     /// An IDE (`workspace-exec`, homes.md §5.3, W6) is given workspace
     /// `name`: only with `activation`, a press in the IDE's window that
     /// portcullisd spends with frescod (purpose APPROVE). Its `work` is then
@@ -702,6 +714,13 @@ pub enum Response {
     ConsoleOpened { title: String },
     /// A Run started: the dev app's id and what it was granted.
     WorkspaceRan { app_id: String, capabilities: Vec<String> },
+    /// A Run under the debugger: the dev app starts when a debugger in the
+    /// workspace connects to `address` (`127.0.0.1:<port>`). `program` is
+    /// the path the app runs from, which the workspace sees too: the
+    /// debugger's target (`lldb <program> -o 'gdb-remote <address>'`).
+    WorkspaceDebugging { app_id: String, capabilities: Vec<String>, address: String, #[serde(default)] program: String },
+    /// The cores copied, relative to the workspace's `work`.
+    WorkspaceCores { files: Vec<String> },
     /// A `WorkspaceExec` started (pid in the workspace's jail); three
     /// descriptors follow.
     WorkspaceExecStarted { pid: i32 },

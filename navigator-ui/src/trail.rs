@@ -164,11 +164,29 @@ pub enum Prompt {
     /// threat model §2.10).
     Handoff { url: String, scheme: String },
     /// An `atrium-app:` link (navigator.md §2.2): try it in a jail that
-    /// keeps nothing, or open it.
-    OpenApp { url: String, name: String },
+    /// keeps nothing, or open it. `about`: what the package catalog says
+    /// of it (who publishes it, what it asks for), when it knows the id.
+    OpenApp { url: String, name: String, about: Option<navigator_control::AppAbout> },
     /// Opened from history (§5.5): this is the version stored when it was
     /// seen (`at_s`), offline; the current one is a press away.
     Stored { at_s: u64 },
+}
+
+/// The open-an-app prompt's facts (§6.4), as words: the app's name, who
+/// publishes it, and what it asks for (at most three capabilities named,
+/// then how many more), or that it isn't known to the catalog.
+pub fn app_words(name: &str, about: Option<&navigator_control::AppAbout>) -> (String, Option<String>, String) {
+    let Some(a) = about else { return (name.to_string(), None, "not in the package catalog".into()) };
+    let shown = if a.name.is_empty() { name.to_string() } else { a.name.clone() };
+    let mut asks = match a.capabilities.len() {
+        0 => "asks for nothing".to_string(),
+        n if n <= 3 => format!("asks for {}", a.capabilities.join(", ")),
+        n => format!("asks for {} and {} more", a.capabilities[..3].join(", "), n - 3),
+    };
+    if !a.installed {
+        asks.push_str("; not installed, Open asks to install it");
+    }
+    (shown, Some(a.publisher.clone()), asks)
 }
 
 impl Prompt {

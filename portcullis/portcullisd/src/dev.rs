@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use crate::workspace;
 
-const APPS_DIR: &str = "/var/lib/atrium/apps";
+pub const APPS_DIR: &str = "/var/lib/atrium/apps";
 const MANIFEST_MAX: u64 = 64 * 1024;
 const ENTRY_MAX: u64 = 512 * 1024 * 1024;
 
@@ -225,6 +225,90 @@ pub fn bundles_of(owner: &str, ws: &str) -> Vec<String> {
     let pre = dev_id(owner, ws, "");
     fs::read_dir(APPS_DIR).map(|d| d.flatten().filter_map(|e| e.file_name().to_str().map(str::to_string))
         .filter(|n| n.starts_with(&pre)).collect()).unwrap_or_default()
+}
+
+/// The most one core may be, copied out.
+const MAX_CORE: u64 = 4 << 30;
+/// Where cores go, in a workspace's `work`.
+pub const CORES: &str = ".atrium/cores";
+
+/// Move the cores the workspace's dev builds left in their overlays (a
+/// crashed app writes `<name>.core` where it runs, kern.corefile `%N.core`)
+/// into `work/.atrium/cores/<app id>.<name>.core`, the workspace's own
+/// (dev-tools.md §7.2). Only dev bundles: nothing of an installed app's
+/// leaves its overlay. The overlay is the app uid's, so nothing in it is
+/// followed: a core must be a plain file, opened without following links.
+pub fn take_cores(owner: &str, ws: &str) -> Result<Vec<String>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let work = workspace::work_dir(owner, ws)?;
+    let wm = fs::metadata(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    let dst = work.join(CORES);
+    for d in [work.join(".atrium"), dst.clone()] {
+        if fs::symlink_metadata(&d).is_err() {
+            fs::create_dir(&d).map_err(|e| format!("{}: {e}", d.display()))?;
+            let _ = std::os::unix::fs::chown(&d, Some(wm.uid()), Some(wm.gid()));
+            let _ = fs::set_permissions(&d, fs::Permissions::from_mode(0o2770));
+        }
+        if !fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) {
+            return Err(format!("{} is not a folder", d.display()));
+        }
+    }
+    let mut out = Vec::new();
+    for id in bundles_of(owner, ws) {
+        let place = portcullis_overlay::place(Some(owner), &id);
+        if !place.dir.exists() && !place.img.exists() {
+            continue;
+        }
+        if let Err(e) = portcullis_overlay::ensure_mounted(&place, &id, portcullis_overlay::DEFAULT_QUOTA_BYTES) {
+            eprintln!("portcullisd: cores of {id}: {e}");
+            continue;
+        }
+        let mut found = Vec::new();
+        find_cores(&place.dir, 0, &mut found);
+        for src in found {
+            let Some(name) = src.file_name().and_then(|n| n.to_str()) else { continue };
+            let to = dst.join(format!("{id}.{name}"));
+            match copy_core(&src, &to, wm.uid(), wm.gid()) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&src);
+                    eprintln!("portcullisd: core {} of {id} moved to {}", src.display(), to.display());
+                    out.push(format!("{CORES}/{id}.{name}"));
+                }
+                Err(e) => eprintln!("portcullisd: core {} of {id}: {e}", src.display()),
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn find_cores(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+        if m.is_dir() && depth < 4 {
+            find_cores(&e.path(), depth + 1, out);
+        } else if m.is_file() && e.file_name().to_str().is_some_and(|n| n.ends_with(".core")) {
+            out.push(e.path());
+        }
+    }
+}
+
+fn copy_core(src: &Path, to: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(src).map_err(|e| e.to_string())?;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if !m.is_file() {
+        return Err("not a plain file".into());
+    }
+    if m.len() > MAX_CORE {
+        return Err(format!("{} bytes: over {MAX_CORE}", m.len()));
+    }
+    let _ = fs::remove_file(to);
+    let mut t = fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW)
+        .open(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    std::io::copy(&mut f, &mut t).map_err(|e| e.to_string())?;
+    std::os::unix::fs::fchown(&t, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Remove a dev bundle.

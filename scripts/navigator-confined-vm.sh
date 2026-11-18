@@ -299,7 +299,7 @@ LS=/atrium/sockets/limen/limend.sock
 # Navigator instance's).
 NS="/atrium/sockets/navigator/[0-9]*.sock"
 g "mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome /atrium/sockets/limen /atrium/sockets/navigator \
-      /atrium/sockets/navigator-page /atrium/sockets/arca /atrium/sockets/arca-courier
+      /atrium/sockets/navigator-page /atrium/sockets/arca /atrium/sockets/arca-courier /atrium/sockets/opifex
    chown _frescod /atrium/sockets/fresco /atrium/sockets/fresco-activation /atrium/sockets/fresco-chrome; chown _limen /atrium/sockets/limen
    rm -f /atrium/sockets/navigator/*.sock /atrium/sockets/navigator-page/*.sock
    # Bound by the Navigator's per-app uid, which portcullisd allocates at its
@@ -368,7 +368,7 @@ NAVTEST=$(g "id -u navtest" | tr -d '\r')
 g "grep -q \"^$NUID navtest org.atrium.navigator\" /var/run/atrium/app-registry" && ok "the launch registry names it (navtest, org.atrium.navigator)" || bad "registry: $(g "grep -a navigator /var/run/atrium/app-registry")"
 NM=$(g "mount -p | awk '{print \$2}' | grep -E \"/jails/[^/]*navigator[^/.]*/\" | grep -v -e '/dev\$' -e '/tmp\$' | sed 's#.*/atrium/sockets/#sockets/#' | sort | tr '\n' ' '" | tr -d '\r')
 echo "  navigator jail mounts: $NM"
-for d in navigator navigator-page fresco-chrome fresco-activation limen portcullis arca arca-courier; do
+for d in navigator navigator-page fresco-chrome fresco-activation limen portcullis arca arca-courier opifex; do
     echo "$NM" | grep -q "sockets/$d " || bad "no $d socket directory in the Navigator's jail"
 done
 echo "$NM" | grep -qE 'sockets/(fresco|forum|clipboard|audio)( |$)' && bad "the Navigator's jail has a socket it was not given" || ok "the Navigator's jail has its broker's sockets and no others"
@@ -388,6 +388,49 @@ last() { g "grep 'trace' $UL | tail -1"; }
 until_trace() { i=0; while [ $i -lt "$WAIT" ]; do last | grep -q "$1" && return 0; sleep 3; i=$((i+3)); done; return 1; }
 # The page jails and who runs in them.
 jails() { g "jls name | grep -c 'limen-' || true" | tr -d '\r'; }
+
+echo "=== the package catalog"
+# A catalog signed with test keys (as vm-opifex-c3-check.sh) with
+# org.atrium.l5hello in it, and opifexd on its own socket: the Navigator's
+# open-an-app prompt asks it who publishes an app (navigator-ui.md §6.4),
+# and the L5 section below installs from it.
+L5=$S/l5; L5ID=org.atrium.l5hello; OX=/atrium/sockets/opifex/opifex.sock; ARCHN=$(echo "$TARGET" | cut -d- -f1); [ "$ARCHN" = x86_64 ] && ARCHN=amd64
+# A fresh opifex state each run (as vm-opifex-c3-check.sh): the catalog's
+# keys are new each time, and the last run installed $L5ID.
+g "pkill -x opifex-sheetd; pkill -x opifexd; rm -f $OX; rm -rf $L5 /var/lib/atrium/apps/$L5ID /var/db/atrium/opifex /var/lib/atrium/opifex; mkdir -p $L5; chmod 755 $L5
+   install -m 0755 $D/opifexd /usr/local/sbin/opifexd; install -m 0755 $D/opifex-sheetd /usr/local/bin/opifex-sheetd
+   mkdir -p /usr/local/libexec; install -m 0755 $D/opifex-check /usr/local/libexec/opifex-check"
+g 'sh -s' > "$OUT.l5.log" 2>&1 <<EOS
+set -e
+cd $L5
+for k in root1 root2 catalog platform; do
+  openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out \$k.pem
+  openssl ec -in \$k.pem -pubout -out \$k.pub 2>/dev/null
+done
+{
+  echo 'schema = "atrium-catalog-root/1"'; echo 'name = "Atrium"'; echo 'version = 1'
+  echo 'expires = 4000000000'; echo 'threshold = 2'
+  for k in root1 root2; do printf '\n[[key]]\npem = """%s"""\nroles = ["root"]\n' "\$(cat \$k.pub)"; done
+  printf '\n[[key]]\npem = """%s"""\nroles = ["catalog"]\n' "\$(cat catalog.pub)"
+  printf '\n[[key]]\npem = """%s"""\nroles = ["platform"]\nprefixes = ["org.atrium."]\nkinds = ["app"]\n' "\$(cat platform.pub)"
+} > root.toml
+mkdir -p cat /etc/atrium/opifex
+cp root.toml cat/root.toml; cp root.toml /etc/atrium/opifex/root.toml
+opifex catalog root-sign cat --key root1.pem --pub root1.pub >/dev/null
+opifex catalog root-sign cat --key root2.pem --pub root2.pub >/dev/null
+mkdir -p b/bin; cp /bin/echo b/bin/hello
+printf '[app]\nid = "$L5ID"\nname = "L5 hello"\nversion = "1.0"\nentry = "bin/hello"\ndescription = "Says hello"\n' > b/atrium.toml
+opifex pack b --sign platform.pem >/dev/null
+opifex archive b 1.0.insula >/dev/null
+opifex catalog add cat b --arch $ARCHN --archive 1.0.insula --url https://example.org/1.0.insula >/dev/null
+opifex catalog head cat --key catalog.pem >/dev/null
+mkdir -p /var/db/atrium/opifex/dl; cp 1.0.insula /var/db/atrium/opifex/dl/\$(sha256 -q 1.0.insula).insula
+(OPIFEX_SOCKET=$OX /usr/local/sbin/opifexd > $L5/opifexd.log 2>&1 &)
+sleep 1
+OPIFEX_SOCKET=$OX opifex sync cat >/dev/null
+chmod 666 $OX
+EOS
+[ $? = 0 ] && ok "a catalog with $L5ID, and opifexd" || bad "catalog: $(tail -3 "$OUT.l5.log" | tr '\n' ';')"
 
 echo "=== drive"
 # navigatord started the UI as its worker (navigator-ui.md §2.3a J3), with
@@ -490,6 +533,17 @@ i=0; while [ $i -lt 90 ] && [ "$(links)" != 2 ]; do sleep 3; i=$((i+3)); done
 [ "$(links)" = 2 ] && ok "the next mailto: link went straight to the default, no sheet" || bad "second hand-off: $(links) links; $(g "tail -3 $ML" | tr '\n' ';')"
 g "grep -c 'asking which' $ML" | grep -qx 1 && ok "…asked once" || bad "sheets: $(g "grep -c 'asking which' $ML")"
 g "grep -h -e monstratord $S/bootstrap.log $ML 2>/dev/null | grep -q curator" && bad "monstratord logged the link itself" || ok "nothing logged the address but the app"
+# An atrium-app: link (navigator-ui.md §6.4): the prompt names the app,
+# its publisher and what it asks for, from opifexd's Describe through the
+# Navigator jail's opifex socket. Try it, the primary answer, clears it.
+press $((PX + 50)) $((TOP + PY + 64 + 20 + 6 * 40))    # atrium-app:
+until_trace 'prompt=app' && ok "an atrium-app: link asked before going anywhere" || bad "app link: $(last)"
+g "grep -q 'asking: This link opens the app L5 hello by Atrium; it asks for nothing; not installed, Open asks to install it' $UL" \
+    && ok "…naming it L5 hello by Atrium, what it asks for, and that it isn't installed" || bad "app prompt: $(g "grep -h 'asking:' $UL | tail -1")"
+sleep 3
+shot confined-3-app
+press $((W - 40)) $((TOP + 41 + 22))                   # Try it
+until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "back on Atrium: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 120))
@@ -633,47 +687,11 @@ sleep 5
 shot confined-9-into-work
 
 echo "=== atrium-app: an app that isn't installed (L5)"
-# A catalog signed with test keys (as vm-opifex-c3-check.sh), opifexd and
-# the install sheet as _opifexsheet. App probe asks for
+# The catalog above, opifexd and the install sheet as _opifexsheet. App probe asks for
 # atrium-app://org.atrium.l5hello: Monstrator asks the install sheet for it,
 # Install on the sheet installs it, and portcullisd opens it.
-L5=$S/l5; L5ID=org.atrium.l5hello; ARCHN=$(echo "$TARGET" | cut -d- -f1); [ "$ARCHN" = x86_64 ] && ARCHN=amd64
-g "pkill -x opifex-sheetd; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; rm -rf $L5 /var/lib/atrium/apps/$L5ID; mkdir -p $L5; chmod 755 $L5
-   install -m 0755 $D/opifexd /usr/local/sbin/opifexd; install -m 0755 $D/opifex-sheetd /usr/local/bin/opifex-sheetd
-   mkdir -p /usr/local/libexec; install -m 0755 $D/opifex-check /usr/local/libexec/opifex-check"
-g 'sh -s' > "$OUT.l5.log" 2>&1 <<EOS
-set -e
-cd $L5
-for k in root1 root2 catalog platform; do
-  openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out \$k.pem
-  openssl ec -in \$k.pem -pubout -out \$k.pub 2>/dev/null
-done
-{
-  echo 'schema = "atrium-catalog-root/1"'; echo 'name = "Atrium"'; echo 'version = 1'
-  echo 'expires = 4000000000'; echo 'threshold = 2'
-  for k in root1 root2; do printf '\n[[key]]\npem = """%s"""\nroles = ["root"]\n' "\$(cat \$k.pub)"; done
-  printf '\n[[key]]\npem = """%s"""\nroles = ["catalog"]\n' "\$(cat catalog.pub)"
-  printf '\n[[key]]\npem = """%s"""\nroles = ["platform"]\nprefixes = ["org.atrium."]\nkinds = ["app"]\n' "\$(cat platform.pub)"
-} > root.toml
-mkdir -p cat /etc/atrium/opifex
-cp root.toml cat/root.toml; cp root.toml /etc/atrium/opifex/root.toml
-opifex catalog root-sign cat --key root1.pem --pub root1.pub >/dev/null
-opifex catalog root-sign cat --key root2.pem --pub root2.pub >/dev/null
-mkdir -p b/bin; cp /bin/echo b/bin/hello
-printf '[app]\nid = "$L5ID"\nname = "L5 hello"\nversion = "1.0"\nentry = "bin/hello"\ndescription = "Says hello"\n' > b/atrium.toml
-opifex pack b --sign platform.pem >/dev/null
-opifex archive b 1.0.insula >/dev/null
-opifex catalog add cat b --arch $ARCHN --archive 1.0.insula --url https://example.org/1.0.insula >/dev/null
-opifex catalog head cat --key catalog.pem >/dev/null
-mkdir -p /var/db/atrium/opifex/dl; cp 1.0.insula /var/db/atrium/opifex/dl/\$(sha256 -q 1.0.insula).insula
-(OPIFEX_SOCKET=$L5/opifex.sock /usr/local/sbin/opifexd > $L5/opifexd.log 2>&1 &)
-sleep 1
-OPIFEX_SOCKET=$L5/opifex.sock opifex sync cat >/dev/null
-chmod 666 $L5/opifex.sock
-EOS
-[ $? = 0 ] && ok "a catalog with $L5ID, and opifexd" || bad "catalog: $(tail -3 "$OUT.l5.log" | tr '\n' ';')"
 g "rm -f /atrium/sockets/opifex-sheet/opifex-sheet.sock
-   cd $S && daemon -f -u _opifexsheet -o $L5/sheet.log env OPIFEX_SHEET_SOCKET=/atrium/sockets/opifex-sheet/opifex-sheet.sock OPIFEX_SOCKET=$L5/opifex.sock \
+   cd $S && daemon -f -u _opifexsheet -o $L5/sheet.log env OPIFEX_SHEET_SOCKET=/atrium/sockets/opifex-sheet/opifex-sheet.sock OPIFEX_SOCKET=$OX \
    OPIFEX_SHEET_ACTIVATION=$AS FRESCO_SOCKET=$FS /usr/local/bin/opifex-sheetd </dev/null"
 i=0; while [ $i -lt 20 ] && ! g "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock"; do sleep 1; i=$((i+1)); done
 g "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock" && ok "the install sheet is up" || bad "opifex-sheetd: $(g "tail -3 $L5/sheet.log")"

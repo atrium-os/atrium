@@ -235,10 +235,19 @@ mount -t tessera -r $DEV $M || fail "older copy, read-only"
 cmp -s $M/$NAME2 $T/content2 || fail "older copy reads wrong"
 mount -u -o rw $M 2>/dev/null && fail "older copy remounted read-write"
 touch $M/x 2>/dev/null && fail "wrote to an older copy"
+# "Use this copy as current": the keyring tells arcad the generation the
+# kernel mounted; with the mark lowered to it, the copy mounts writable.
+G=$(tessera-keyload gen $KID 2>/dev/null | tr -dc 0-9)
+[ -n "$G" ] && [ "$G" -gt 0 ] && [ "$G" -lt 1000000 ] || fail "the mounted generation isn't in the keyring ($G)"
+umount $M
+tessera-keyload drop $KID >/dev/null
+tessera-keyload load $T/key $KID $U $G >/dev/null || fail "load with the mark at $G"
+mount -t tessera $DEV $M || fail "as current, read-write"
+touch $M/current || fail "write to the copy made current"
 umount $M
 tessera-keyload drop $KID >/dev/null
 tessera-keyload load $T/key $KID $U >/dev/null || fail "reload plain"
-echo "older copy: ok"
+echo "older copy: ok (made current at generation $G)"
 
 # kept for the host's fsck --key-file (the fsck subcommand)
 mdconfig -d -u ${DEV#/dev/md}
