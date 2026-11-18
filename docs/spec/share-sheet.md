@@ -1,6 +1,6 @@
 # The share sheet: handing one item to an app the person picks
 
-Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 21/21 (limend-dev) and `scripts/vm-share-jail-check.sh` 13/13 (real jails). Crate `share-sheet/`
+Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 21/21 (limend-dev) `scripts/vm-share-jail-check.sh` 13/13 (real jails) and `scripts/vm-share-forum-check.sh` 18/18 (under Forum, services from services.d). Crate `share-sheet/`
 (the service and two demo apps), role messages `limen::share` and `limen::share_target`,
 limend's `CHOOSE`. Assigned to the Pergola thread on 2026-11-06 (pergola.md §1), built by
 the share-sheet thread.
@@ -193,9 +193,18 @@ may spend `SHARE`) and injected clicks:
   the entry and its libraries, not other files in the project (share-demo writes its picture in
   its home when the bundle has none).
 
+- `scripts/vm-share-forum-check.sh` (18/18) runs it under Forum: frescod in split mode with forum-wm,
+  the dock jailed, limend and the share sheet started by the boot supervisor from their
+  services.d entries (`41-atrium-limend.toml`, `share-sheet/etc/services.d/42-atrium-share-sheet.toml`,
+  commissioned by `limen-service.sh` and `share-sheet-service.sh`). The sheet's jail sees only
+  frescod's two sockets, limend's, the app tree and the registry, with no network. Notes,
+  launched from the dock (Super+A, "notes", Return), shares over its WM-placed window: Photos
+  and Scraps listed with their icons, Down Down Return chooses Scraps, which starts in its own
+  jail and uid and gets the item; Keep answers `Accepted`; Escape on a second share chooses
+  nothing.
+
 Not done yet:
 
-- Under Forum: the gates click straight into frescod; no launcher or Forum session is running.
 - Sharing across personas (refused by construction: targets run in the parent's persona).
 - Curia: the person's ordering or hiding of targets.
 - Notification actions over `CLASS_BROKER` (tabula.md §5) are a separate path, still not built.
