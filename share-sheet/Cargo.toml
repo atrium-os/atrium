@@ -1,0 +1,34 @@
+[package]
+name        = "share-sheet"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "The share sheet (docs/spec/share-sheet.md): Limen's `share` provider, running as `_share`. Spends the app's press with frescod, lists the installed share targets for the item's types, and hands the person's choice to limend; the app then embeds that target and sends it the item."
+publish     = false
+
+[lib]
+name = "share_sheet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "share-sheet"
+path = "src/bin/share_sheet.rs"
+
+# The two other ends, for the VM gate and as examples: an app that shares,
+# and an app that takes shares (`[roles] implements = ["share-target"]`).
+[[bin]]
+name = "share-demo"
+path = "src/bin/share_demo.rs"
+
+[[bin]]
+name = "share-target-demo"
+path = "src/bin/share_target_demo.rs"
+
+[dependencies]
+limen           = { path = "../limen" }
+tabula          = { path = "../tabula" }
+fresco-protocol = { path = "../fresco-protocol" }
+fresco-client   = { path = "../fresco-client" }
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
+pergola         = { path = "../pergola" }
+aqueduct        = { path = "../aqueduct" }

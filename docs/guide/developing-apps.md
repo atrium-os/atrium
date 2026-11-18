@@ -90,8 +90,9 @@ Two templates show an app split into a core and a worker
   controls; it never demuxes or decodes.
 
 **Planned:** a `service` template, an app that provides a role
-(`[roles] implements`), once `share-target` has its messages and the share
-sheet sends them.
+(`[roles] implements`). `share-target`'s messages and the share sheet exist
+since 2026-11-18 ([share-sheet.md](../spec/share-sheet.md));
+`share-sheet/src/bin/share_target_demo.rs` is the shape it will take.
 
 `cargo atrium new hello --template c-app` is the same in C: a window on
 libatrium and a Makefile on `atrium.app.mk` (`make`, `make run`).
