@@ -170,6 +170,13 @@ pub enum Request {
     /// decided as `Handoff` on this connection (threat model §2.10). Only
     /// such a link is handed on; answered by `Handed`. `press` as for `Save`.
     Hand { url: String, how: Hand, press: Press },
+    /// The rail's New window menu (navigator-ui.md §2.4): a Navigator
+    /// window in another of the person's personas (`personal` for
+    /// Personal), one navigatord passed in `NAVIGATOR_UI_OTHER_PERSONAS`.
+    /// navigatord asks portcullisd (`NewWindowIn`) with the press, which
+    /// starts that persona's Navigator or brings it forward. Nothing of
+    /// this window goes with it. Answered by `WindowIn`.
+    NewWindow { persona: String, press: Press },
 }
 
 /// frescod's activation token for a press (zero: none).
@@ -279,6 +286,8 @@ pub enum Event {
     Incoming { url: String, from: Option<String> },
     /// A hand-off was passed to its handler, or why not.
     Handed { url: String, ok: bool, why: Option<String> },
+    /// `NewWindow` done, or why not.
+    WindowIn { persona: String, ok: bool, why: Option<String> },
     /// `SignOut` done: how many session cookies ended, or why not.
     SignedOut { url: String, cookies: Option<u32>, why: Option<String> },
     /// The accounts Arca holds for `url`'s site, at most [`ACCOUNTS_MAX`];

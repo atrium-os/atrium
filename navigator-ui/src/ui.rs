@@ -55,6 +55,8 @@ pub mod ph {
     pub const KEY: char = '\u{e2d6}';
     pub const PASSWORD: char = '\u{e752}';
     pub const TRASH_SIMPLE: char = '\u{e4a8}';
+    pub const CHECK: char = '\u{e182}';
+    pub const APP_WINDOW: char = '\u{e5da}';
 }
 
 /// The app clock for the prompt row's 500 ms rule.
@@ -318,6 +320,11 @@ impl View for ShellView {
             let accounts = s.accounts.as_ref().filter(|(a, _)| *a == site).map(|(_, a)| a.clone());
             floating(ctx, r, g.presence, move || with(&st, |s| s.presence_open = false), move |ctx| presence_menu(ctx, r, &site, knows, accounts, &st2));
         }
+        if let Some(r) = g.persona_menu {
+            let (st, st2) = (self.state.clone(), self.state.clone());
+            let rows = s.persona_rows();
+            floating(ctx, r, g.persona_chip, move || with(&st, |s| s.persona_open = false), move |ctx| persona_menu(ctx, r, rows.clone(), &st2));
+        }
         if let Some(r) = g.sections_menu {
             let (st, st2) = (self.state.clone(), self.state.clone());
             let rows = s.sections_shown();
@@ -355,12 +362,7 @@ fn rail(ctx: &mut Ctx, s: &Shell, g: &Geo, st: &Mutable<Shell>) {
     {
         let st2 = st.clone();
         rect(ctx, em(12.0), em(6.0), em(122.0), em(28.0), t.border_control(), em(6.0));
-        area(ctx, Rect::new(em(13.0), em(7.0), em(120.0), em(26.0)), em(5.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| {
-            s.store.persona = match s.store.persona {
-                trail::Persona::Personal => trail::Persona::Unrecorded,
-                trail::Persona::Unrecorded => trail::Persona::Personal,
-            };
-        }));
+        area(ctx, Rect::new(em(13.0), em(7.0), em(120.0), em(26.0)), em(5.0), t.bg_elevated(), t.state_hover(), move || with(&st2, |s| s.press_persona_chip()));
         let unrec = s.store.persona == trail::Persona::Unrecorded;
         icon(ctx, em(20.0), em(12.0), if unrec { ph::EYE_SLASH } else { ph::USER_CIRCLE }, 16.0, t.text_secondary());
         // A Work window's recorded trails are Work's (personas.md §3).
@@ -1100,6 +1102,38 @@ fn find_bar(ctx: &mut Ctx, r: Rect, f: &shell::FindBar, sections_button: Option<
     if let Some(b) = sections_button {
         let st2 = st.clone();
         small_button(ctx, b, None, "Sections", sections_open, "Jump to section", move || with(&st2, |s| s.toggle_sections()));
+    }
+}
+
+/// The rail's persona chip menu (§2.4): new trails' persona, then a
+/// window in each of the person's other personas.
+fn persona_menu(ctx: &mut Ctx, r: Rect, rows: Vec<(Option<String>, String, bool)>, st: &Mutable<Shell>) {
+    let t = ctx.theme;
+    boxed(ctx, r.x(), r.y(), r.w(), r.h(), t.border_default(), t.bg_elevated(), em(8.0));
+    let st_row = sans(type_size::SM, Weight::Regular, t.text_primary());
+    let mut y = r.y() + em(8.0);
+    for (i, (to, words, now)) in rows.into_iter().enumerate() {
+        if i == 2 {
+            text(ctx, r.x() + em(16.0), y + em(14.0), "NEW WINDOW", type_size::XXS, Weight::Semibold, t.text_tertiary());
+            y += em(26.0);
+        }
+        let s2 = st.clone();
+        area(ctx, Rect::new(r.x() + em(6.0), y, r.w() - em(12.0), em(shell::PERSONA_ROW)), em(6.0), Color::TRANSPARENT, t.state_hover(), move || {
+            let press = pergola::clipboard::current_activation();
+            with(&s2, |s| s.choose_persona_row(i, press))
+        });
+        let glyph = match &to {
+            Some(_) => ph::APP_WINDOW,
+            None if i == 1 => ph::EYE_SLASH,
+            None => ph::USER_CIRCLE,
+        };
+        icon(ctx, r.x() + em(16.0), y + em(8.0), glyph, 16.0, t.text_secondary());
+        text(ctx, r.x() + em(42.0), y + em(shell::PERSONA_ROW) / 2.0, &fit(&words, &st_row, r.w() - em(80.0)), type_size::SM, Weight::Regular, t.text_primary());
+        if now {
+            icon(ctx, r.x() + r.w() - em(32.0), y + em(8.0), ph::CHECK, 16.0, t.accent_fg());
+        }
+        ctx.pop();
+        y += em(shell::PERSONA_ROW);
     }
 }
 

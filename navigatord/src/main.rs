@@ -1352,6 +1352,17 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
             Request::Discard { id } => {
                 waiting.lock().unwrap().take(id);
             }
+            Request::NewWindow { persona, press } => {
+                let w = w.clone();
+                std::thread::spawn(move || {
+                    let r = worker::new_window_in(&persona, press);
+                    match &r {
+                        Ok(()) => eprintln!("navigatord: a new window in {persona}"),
+                        Err(why) => eprintln!("navigatord: no new window in {persona}: {why}"),
+                    }
+                    send(&w, &Event::WindowIn { persona, ok: r.is_ok(), why: r.err() });
+                });
+            }
             Request::Hand { url, how: ctl::Hand::With, press } => {
                 // Open with…: a page we hold, its address as we have it.
                 if !state.lock().unwrap().cache.iter().any(|p| p.url == url) {
@@ -1619,14 +1630,23 @@ fn main() {
         // The window's persona (personas.md §3), for the rail; frescod
         // draws the strip chip itself, from our uid.
         if !cfg.unconfined {
-            pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA"));
+            pairs.retain(|(k, _)| !k.starts_with("NAVIGATOR_UI_PERSONA") && k != "NAVIGATOR_UI_OTHER_PERSONAS");
             match worker::persona() {
-                Ok(Some((name, colour))) => {
-                    eprintln!("navigatord: persona {name} ({colour})");
-                    pairs.push(("NAVIGATOR_UI_PERSONA".into(), name));
-                    pairs.push(("NAVIGATOR_UI_PERSONA_COLOUR".into(), colour));
+                Ok((here, others)) => {
+                    match here {
+                        Some((name, colour)) => {
+                            eprintln!("navigatord: persona {name} ({colour})");
+                            pairs.push(("NAVIGATOR_UI_PERSONA".into(), name));
+                            pairs.push(("NAVIGATOR_UI_PERSONA_COLOUR".into(), colour));
+                        }
+                        None => eprintln!("navigatord: persona Personal"),
+                    }
+                    // For the rail's New window menu.
+                    if !others.is_empty() {
+                        eprintln!("navigatord: other personas {}", others.join(", "));
+                        pairs.push(("NAVIGATOR_UI_OTHER_PERSONAS".into(), others.join(",")));
+                    }
                 }
-                Ok(None) => eprintln!("navigatord: persona Personal"),
                 Err(e) => eprintln!("navigatord: persona unknown, Personal shown: {e}"),
             }
         }

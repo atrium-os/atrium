@@ -91,6 +91,12 @@ pub struct Shell {
     /// This window's named persona (personas.md §3: one per window), from
     /// navigatord's settings (`NAVIGATOR_UI_PERSONA`); `None` is Personal.
     pub window_persona: Option<String>,
+    /// The person's other personas (`personal` for Personal), from
+    /// navigatord (`NAVIGATOR_UI_OTHER_PERSONAS`): the New window menu.
+    pub other_personas: Vec<String>,
+    /// The rail's persona chip menu is open: new trails' persona, and a
+    /// New window in another persona.
+    pub persona_open: bool,
     pub w: f32,
     pub h: f32,
     /// Ctrl-B, or the rail's sidebar button.
@@ -177,6 +183,8 @@ pub enum Out {
     Discard { id: u32 },
     /// Hand a link to its program (§6.4, threat model §2.10).
     Hand { url: String, how: navigator_control::Hand, press: navigator_control::Press },
+    /// A Navigator window in another persona (§2.4), with the press.
+    NewWindow { persona: String, press: navigator_control::Press },
     /// Find in the page on screen (§7; limen `ToChild::Find`).
     Find { query: String, step: i8 },
     /// The current version of the page `key`, fetched again (§5.5).
@@ -259,6 +267,9 @@ pub struct Geo {
     /// The presence control, and its menu while open (§6.2).
     pub presence: Rect,
     pub presence_menu: Option<Rect>,
+    /// The rail's persona chip and its menu.
+    pub persona_chip: Rect,
+    pub persona_menu: Option<Rect>,
     /// The "Jump to section" list under the find bar, and its button.
     pub sections_menu: Option<Rect>,
     pub sections_button: Option<Rect>,
@@ -269,7 +280,21 @@ pub struct Geo {
 /// The window's named persona from the settings, capitalised for the rail
 /// ("work" shows as "Work"), if it is a fit name.
 pub fn window_persona() -> Option<String> {
-    let p = std::env::var("NAVIGATOR_UI_PERSONA").ok()?;
+    fit_persona(&std::env::var("NAVIGATOR_UI_PERSONA").ok()?)
+}
+
+/// The person's other personas from the settings, each a fit name.
+pub fn other_personas() -> Vec<String> {
+    std::env::var("NAVIGATOR_UI_OTHER_PERSONAS").unwrap_or_default().split(',')
+        .filter(|p| fit_persona(p).is_some()).take(8).map(String::from).collect()
+}
+
+/// The persona chip menu's width and row height.
+pub const PERSONA_W: f32 = 236.0;
+pub const PERSONA_ROW: f32 = 32.0;
+
+/// A persona's name as shown: "work" as "Work", if it is a fit name.
+pub fn fit_persona(p: &str) -> Option<String> {
     if p.is_empty() || p.len() > 32 || !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return None;
     }
@@ -279,7 +304,7 @@ pub fn window_persona() -> Option<String> {
 
 impl Shell {
     pub fn new(store: TrailStore, w: f32, h: f32) -> Self {
-        Shell { store, window_persona: window_persona(), w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
+        Shell { store, window_persona: window_persona(), other_personas: other_personas(), persona_open: false, w, h, rail_collapsed: false, status_bar: false, editing: None, popover: false, mods: Modifiers::default(), hover_hint: None, last_note: None, live: None, outbox: Vec::new(), prompt_at: None, find: None, sections: Vec::new(), sections_open: false, answered: None, reading_open: false, history: None, presence_open: false, accounts: None, rail_focus: false, focus_page: false }
     }
 
     /// A page for `url`: from navigatord when live, else the stand-in.
@@ -448,7 +473,11 @@ impl Shell {
             let n = self.sections_shown().len().max(1) as f32;
             Rect::new((b.x() + b.w() - em(SECTIONS_W)).max(x0 + 8.0), b.y() + b.h() + 4.0, em(SECTIONS_W), em(16.0) + n * em(SECTION_ROW))
         });
-        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, sections_menu, sections_button }
+        let persona_chip = Rect::new(em(12.0), em(6.0), em(122.0), em(28.0));
+        let persona_menu = (self.persona_open && rail > em(100.0)).then(|| {
+            Rect::new(em(8.0), persona_chip.y() + persona_chip.h() + 4.0, em(PERSONA_W), em(PERSONA_ROW) * self.persona_rows().len() as f32 + em(16.0) + em(26.0))
+        });
+        Geo { w, h, rail, x0, where_, prompt, page, status, drop, popover, find, reading, aa, media, presence, presence_menu, persona_chip, persona_menu, sections_menu, sections_button }
     }
 
     // -- the Where field ---------------------------------------------------
@@ -594,7 +623,7 @@ impl Shell {
         let g = self.geo();
         let Some(r) = g.prompt else { return false };
         let over = |o: Option<Rect>| o.is_some_and(|o| o.x() < r.x() + r.w() && r.x() < o.x() + o.w() && o.y() < r.y() + r.h() && r.y() < o.y() + o.h());
-        over(g.drop) || over(g.popover) || over(g.reading) || over(g.presence_menu) || over(g.sections_menu)
+        over(g.drop) || over(g.popover) || over(g.reading) || over(g.presence_menu) || over(g.sections_menu) || over(g.persona_menu)
     }
 
     /// Called every frame: a prompt row that moved, or is covered, starts
@@ -735,6 +764,57 @@ impl Shell {
         true
     }
 
+    /// The rail's persona chip: with other personas, its menu; without,
+    /// it switches new trails between the window's persona and Unrecorded.
+    pub fn press_persona_chip(&mut self) {
+        if self.other_personas.is_empty() {
+            self.store.persona = match self.store.persona {
+                crate::trail::Persona::Personal => crate::trail::Persona::Unrecorded,
+                crate::trail::Persona::Unrecorded => crate::trail::Persona::Personal,
+            };
+            return;
+        }
+        self.persona_open = !self.persona_open;
+        if self.persona_open {
+            self.rail_collapsed = false;
+            self.popover = false;
+            self.reading_open = false;
+            self.presence_open = false;
+            self.sections_open = false;
+        }
+    }
+
+    /// The menu's rows: new trails in this window's persona or
+    /// Unrecorded (`None`, with whether it is the one now), then a window
+    /// in each other persona (`Some(name)`).
+    pub fn persona_rows(&self) -> Vec<(Option<String>, String, bool)> {
+        let here = self.window_persona.clone().unwrap_or_else(|| "Personal".into());
+        let unrec = self.store.persona == crate::trail::Persona::Unrecorded;
+        let mut v = vec![(None, format!("New trails: {here}"), !unrec), (None, "New trails: Unrecorded".to_string(), unrec)];
+        for p in &self.other_personas {
+            v.push((Some(p.clone()), format!("New {} window", fit_persona(p).unwrap_or_default()), false));
+        }
+        v
+    }
+
+    /// A row of the persona menu chosen; `press` for a New window.
+    pub fn choose_persona_row(&mut self, i: usize, press: Option<navigator_control::Press>) {
+        let Some((to, _, _)) = self.persona_rows().get(i).cloned() else { return };
+        match to {
+            None => {
+                self.persona_open = false;
+                self.store.persona = if i == 0 { crate::trail::Persona::Personal } else { crate::trail::Persona::Unrecorded };
+            }
+            // The menu stays up until the answer: the press was in its
+            // window, and portcullisd spends it only while that window
+            // still has the focus.
+            Some(p) => {
+                self.last_note = Some(format!("new window: asked for {p}"));
+                self.outbox.push(Out::NewWindow { persona: p, press: press.unwrap_or([0; 16]) });
+            }
+        }
+    }
+
     pub fn toggle_presence_menu(&mut self) {
         if self.presence_open {
             self.presence_open = false;
@@ -861,16 +941,22 @@ impl Shell {
     }
 
     pub fn apply(&mut self, a: Action, _now: f64) {
+        self.persona_open = a == Action::NewWindow && !self.persona_open && !self.other_personas.is_empty();
         self.popover = false;
         self.reading_open = false;
         self.presence_open = false;
-        if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail | Action::NextRegion | Action::PrevRegion) {
+        if !matches!(a, Action::History | Action::ToggleStatus | Action::ToggleRail | Action::NextRegion | Action::PrevRegion | Action::NewWindow) {
             self.history = None;
         }
         match a {
             Action::FocusWhere => self.begin_edit(),
             Action::NewTrail => self.new_trail(false),
             Action::NewUnrecorded => self.new_trail(true),
+            Action::NewWindow => {
+                if self.persona_open {
+                    self.rail_collapsed = false;
+                }
+            }
             Action::PutAway => {
                 self.end_edit();
                 self.store.put_away(crate::clock::now_s());
@@ -1013,7 +1099,8 @@ impl Shell {
     /// Escape closes what is on top: a pop-up, then the Where field, then
     /// the history view, then find. Returns whether it closed anything.
     pub fn escape(&mut self) -> bool {
-        if self.popover || self.reading_open || self.presence_open || self.sections_open {
+        if self.popover || self.reading_open || self.presence_open || self.sections_open || self.persona_open {
+            self.persona_open = false;
             self.popover = false;
             self.reading_open = false;
             self.presence_open = false;
@@ -1268,6 +1355,9 @@ impl Shell {
         if self.sections_open && !inside(g.sections_menu) && !inside(g.sections_button) {
             self.sections_open = false;
         }
+        if self.persona_open && !inside(g.persona_menu) && !inside(Some(g.persona_chip)) {
+            self.persona_open = false;
+        }
     }
 }
 
@@ -1452,6 +1542,38 @@ mod tests {
         s.consented("https://news.example/a");
         assert!(s.store.knows("news.example"));
         assert!(matches!(s.outbox.as_slice(), [Out::Reload { .. }]), "{:?}", s.outbox);
+    }
+
+    #[test]
+    fn the_persona_chip_opens_a_window_in_another_persona() {
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.store.new_trail(false);
+        // No other persona: the chip switches new trails, as before.
+        s.press_persona_chip();
+        assert!(!s.persona_open && s.store.persona == crate::trail::Persona::Unrecorded);
+        s.press_persona_chip();
+        s.apply(Action::NewWindow, 0.0);
+        assert!(!s.persona_open, "Ctrl-N has nothing to offer");
+        s.other_personas = vec!["work".into()];
+        s.press_persona_chip();
+        assert!(s.persona_open && s.geo().persona_menu.is_some());
+        let rows: Vec<String> = s.persona_rows().into_iter().map(|r| r.1).collect();
+        assert_eq!(rows, ["New trails: Personal", "New trails: Unrecorded", "New Work window"]);
+        s.choose_persona_row(1, None);
+        assert!(!s.persona_open && s.store.persona == crate::trail::Persona::Unrecorded && s.outbox.is_empty());
+        s.apply(Action::NewWindow, 0.0);
+        assert!(s.persona_open, "Ctrl-N");
+        s.choose_persona_row(2, Some([9; 16]));
+        assert_eq!(s.outbox.pop(), Some(Out::NewWindow { persona: "work".into(), press: [9; 16] }));
+        assert!(s.persona_open, "up until the answer, so the press is still its window's");
+        s.persona_open = false;
+        s.press_persona_chip();
+        assert!(s.escape() && !s.persona_open);
+        // A Work window: its own name, and Personal to open.
+        s.window_persona = Some("Work".into());
+        s.other_personas = vec!["personal".into()];
+        let rows: Vec<String> = s.persona_rows().into_iter().map(|r| r.1).collect();
+        assert_eq!(rows, ["New trails: Work", "New trails: Unrecorded", "New Personal window"]);
     }
 
     #[test]

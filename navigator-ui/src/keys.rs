@@ -8,6 +8,8 @@ pub enum Action {
     FocusWhere,
     NewTrail,
     NewUnrecorded,
+    /// Ctrl-N: the New window menu, a window in another persona (§2.4).
+    NewWindow,
     PutAway,
     BringBack,
     Back,
@@ -65,6 +67,7 @@ pub fn action(ev: &Event) -> Option<Action> {
         ("t", false) => Action::NewTrail,
         ("t", true) => Action::BringBack,
         ("n", true) => Action::NewUnrecorded,
+        ("n", false) => Action::NewWindow,
         ("w", false) => Action::PutAway,
         ("b", false) => Action::ToggleRail,
         ("d", false) => Action::Keep,
