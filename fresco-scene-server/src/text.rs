@@ -718,7 +718,7 @@ impl TextEngine {
             let (font, shaped) = match segs.last() {
                 // A space stays in the stretch it is in (shaping needs it),
                 // except after emoji: their faces' spaces are emoji-wide.
-                Some(&(f, sh, _)) if (ch.is_whitespace() && !self.is_emoji_face(f)) || (sh && is_mark(ch) && self.has_glyph(f, ch)) => (f, sh),
+                Some(&(f, sh, _)) if (ch.is_whitespace() && !self.is_emoji_face(f)) || (sh && is_mark(ch) && (self.has_glyph(f, ch) || matches!(cp, 0xFE00..=0xFE0F))) => (f, sh),
                 _ => {
                     let f = match emoji_vs.then(|| self.library_pick("Noto Emoji", bold, ch)).flatten() {
                         Some(f) => f,
@@ -1163,6 +1163,8 @@ mod tests {
         let gap = two.glyphs[1].dx - two.glyphs[0].dx;
         assert!(gap < 24.0 * 1.6, "{gap}");
         // VS16 picks the emoji form of a character a text face also has.
+        let items = t.layout(f, 24.0, 400, "1\u{FE0F}\u{20E3}");
+        assert_eq!(items.len(), 1, "a keycap is one glyph: {items:?}");
         let items = t.layout(f, 24.0, 400, "\u{2764}\u{FE0F}");
         let Item::Glyph { font, .. } = items[0] else { panic!("{items:?}") };
         assert!(t.fonts[&font].color, "{items:?}");

@@ -284,7 +284,9 @@ impl Fonts for PinnedFonts {
             // VS16 asks for the emoji form (❤️, ☺️, keycaps).
             let emoji_vs = text[i + ch.len_utf8()..].starts_with('\u{FE0F}');
             let face = match segs.last() {
-                Some(&(fc, _, _)) if joins && self.has(fc, ch) => fc,
+                // A variation selector always: a face may leave it out of
+                // its cmap (Noto Color Emoji does), and shaping drops it.
+                Some(&(fc, _, _)) if joins && (self.has(fc, ch) || matches!(ch as u32, 0xFE00..=0xFE0F)) => fc,
                 _ => match emoji_vs.then(|| self.lib_face_for("Noto Emoji", f, ch)).flatten() {
                     Some(k) => k,
                     None => self.face_for(&stack, ch, f, han),
@@ -1026,6 +1028,10 @@ mod tests {
         assert_eq!(family("", "😀"), ["Noto Color Emoji".to_string()].into());
         // VS16 takes the emoji face for a character a text face also has.
         assert_eq!(family("", "\u{2764}\u{FE0F}"), ["Noto Color Emoji".to_string()].into());
+        // A keycap (digit, VS16, U+20E3) is one colour glyph.
+        assert_eq!(family("", "1\u{FE0F}\u{20E3}"), ["Noto Color Emoji".to_string()].into());
+        let l = layout_para(&doc("1\u{FE0F}\u{20E3}"), doc("1\u{FE0F}\u{20E3}").para(0).unwrap(), 1_000_000, &f);
+        assert_eq!(l.glyphs.len(), 1, "{:?}", l.glyphs);
         for seq in ["👨\u{200D}👩\u{200D}👧", "👍\u{1F3FD}", "🇮🇳"] {
             let l = layout_para(&doc(seq), doc(seq).para(0).unwrap(), 1_000_000, &f);
             assert_eq!(l.glyphs.len(), 1, "{seq}: {:?}", l.glyphs);
