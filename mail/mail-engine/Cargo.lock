@@ -1238,6 +1238,7 @@ dependencies = [
  "postcard",
  "rand",
  "rcgen",
+ "ring",
  "rsa",
  "serde",
  "serde_json",

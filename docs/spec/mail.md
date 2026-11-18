@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces).
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1034,9 +1034,8 @@ Stalwart in the cloud VM, and later a real account):
    headless (a press on a row, j/k, an empty folder), and end to end against a real
    Dovecot over TLS through the real courier and real parse jails: 305 messages in 5
    folders, stage 1 first, 50 texts in the window, resync after a delete, an arrival
-   and a flag change, then a pass that changes nothing. Not yet: DKIM/DMARC lookups (the
-   engine answers every `Query` with nothing, so sender checks stay *Pending*; see the
-   privacy note on lookups at arrival), sync and engine as separate jailed processes over
+   and a flag change, then a pass that changes nothing. Not yet (DKIM/DMARC lookups came
+   in M8, through Nuntius): sync and engine as separate jailed processes over
    Aqueduct with the window reading through the engine, jails started by jaild, fetching a
    text on open and fetching only the text part, IDLE in a loop, the narrow layouts of
    §15.4, a VM run with frescod.
@@ -1299,7 +1298,7 @@ Stalwart in the cloud VM, and later a real account):
    hours, notifications off and VIPs in the notifier. **Not yet**: DNS SRV/MX from the
    app (Nuntius is HTTP only, so those steps find nothing), removing an account's Arca
    items with it, the OAuth sign-in sheet (Microsoft accounts are found but can't be
-   added), JMAP needing an API token as its password (bearer only; an API host other
+   added; SRV and MX came later with Nuntius lookups), JMAP needing an API token as its password (bearer only; an API host other
    than the session's is refused; uploads up to 1 MiB), IMAP IDLE.
 9. **M8** later items: OpenPGP, lanes, cards, private addresses, big-file links, local
    assistance.
@@ -1335,6 +1334,21 @@ Stalwart in the cloud VM, and later a real account):
    lane counts and notifications per lane. *Big-file links* need a share-link service
    (Loculus or Crypta) and *local assistance* a local model service, neither of which
    exists yet.
+   **DKIM and DMARC lookups built on the host (2026-11-18)** (Shankar: "DNS lookups through
+   Nuntius"): Nuntius gained a `Lookup` request for TXT, SRV and MX (nuntius.md §3.6;
+   `nuntiusd` asks the system resolver over sockets connected before its sandbox). The
+   engine answers the jail's `Query` through it (`mail_engine::dns`): the DKIM record with
+   a key, or the `v=DMARC1` record; a name with none is answered empty, so the sender is
+   *not verified* rather than pending forever; a failed lookup leaves it *pending*, and a
+   pending message is checked again when opened (the new verdict is kept). Answers are
+   kept in memory for 6 hours (1 hour when there is none), so a sender's DNS sees at most
+   one lookup per key every few hours, from the resolver, never one per message; mail
+   fetched headers-only asks nothing. Both the sync thread and the window have a fetcher
+   for this, opened when first needed. Account setup now gets SRV and MX through the same
+   request. Tests: engine 1 (verified with one lookup for two messages, no key published,
+   a resolver that doesn't answer then a recheck on opening), fetcher 3, wire 1. **Not
+   yet**: a VM run against local-unbound, keeping answers across restarts, the provider's
+   own verdict (Authentication-Results) for accounts at known providers.
 
 ## 17. Decisions, with recommendations
 

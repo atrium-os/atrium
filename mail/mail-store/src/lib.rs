@@ -598,6 +598,13 @@ impl Writer<'_> {
         Ok(id)
     }
 
+    /// A sender check done again (a key that couldn't be fetched before).
+    pub fn set_sender_check(&mut self, id: MsgId, check: mail_schema::SenderCheck) -> Result<()> {
+        let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;
+        m.summary.sender_check = check;
+        self.put_msg(id, &m)
+    }
+
     /// Keep (or forget) a message's converted HTML document.
     pub fn set_document(&mut self, id: MsgId, document: Option<Hash>) -> Result<()> {
         let mut m = self.get_msg(id)?.ok_or(Error::NotFound)?;

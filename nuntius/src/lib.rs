@@ -114,12 +114,54 @@ impl Open {
     }
 }
 
+/// A DNS lookup (nuntius.md §3.6): only the record kinds an app may need
+/// beside addresses, which a fetch resolves by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordKind { Txt, Srv, Mx }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lookup { pub id: u32, pub name: String, pub kind: RecordKind }
+
+/// One answer record of the kind asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Record {
+    /// A TXT record's strings, joined (as DKIM and DMARC read them).
+    Txt(String),
+    Srv { priority: u16, weight: u16, port: u16, target: String },
+    Mx { preference: u16, host: String },
+}
+
+/// Longest name looked up, and most records in one answer.
+pub const NAME_MAX: usize = 253;
+pub const RECORDS_MAX: usize = 32;
+/// Longest TXT record kept (an RSA-4096 DKIM key is about 800 bytes).
+pub const TXT_MAX: usize = 4096;
+
+/// A name a lookup may ask for: letters, digits, `-` and `_` in labels of
+/// 1–63, at least two of them, no trailing dot.
+pub fn name_ok(n: &str) -> bool {
+    n.len() <= NAME_MAX && n.split('.').count() >= 2
+        && n.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
+impl Record {
+    pub fn valid(&self) -> bool {
+        match self {
+            Record::Txt(t) => t.len() <= TXT_MAX,
+            Record::Srv { target: h, .. } | Record::Mx { host: h, .. } => h.len() <= NAME_MAX && !h.contains(|c: char| c.is_control()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Open(Open),
     Cancel { id: u32 },
     /// More byte credit for `Stream` delivery (added to what is left).
     Budget { bytes: u64 },
+    /// Answered by one `Records` (no such name or no records: empty), or
+    /// `Error` with `Dns`, `Policy` or `Timeout`.
+    Lookup(Lookup),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,15 +180,17 @@ pub enum Event {
     Retrying { id: u32, attempt: u32, reason: String },
     Done { id: u32, bytes: u64 },
     Error { id: u32, code: ErrorCode },
+    /// A lookup's answer. `secure`: the resolver validated it with DNSSEC.
+    Records { id: u32, records: Vec<Record>, secure: bool },
 }
 
 impl Event {
     pub fn id(&self) -> u32 {
         match self { Event::Head { id, .. } | Event::Data { id, .. } | Event::Fd { id, .. } | Event::Progress { id, .. }
-                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } => *id }
+                   | Event::Retrying { id, .. } | Event::Done { id, .. } | Event::Error { id, .. } | Event::Records { id, .. } => *id }
     }
     /// The request's last event.
-    pub fn is_last(&self) -> bool { matches!(self, Event::Done { .. } | Event::Error { .. }) }
+    pub fn is_last(&self) -> bool { matches!(self, Event::Done { .. } | Event::Error { .. } | Event::Records { .. }) }
 }
 
 /// ★ An anonymous file to fill, and a READ-ONLY descriptor of it for the

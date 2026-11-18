@@ -156,6 +156,8 @@ fn translate(mut c: nuntius::Client, url: &str, out: &UnixStream) {
             }
             Event::Error { code, .. } => { send(FromFetcher::Failed { reason: format!("{code:?}") }, None); return }
             Event::Fd { .. } | Event::Progress { .. } | Event::Retrying { .. } => true,
+            // Never asked for here.
+            Event::Records { .. } => { send(FromFetcher::Failed { reason: "an answer to no request".into() }, None); return }
         };
         if !ok { return }
     }

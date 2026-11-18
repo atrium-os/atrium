@@ -60,6 +60,18 @@ fn sites() -> Option<nuntius::Sites> {
     }
 }
 
+/// Lookups through the system's resolver (unsandboxed: opened as asked).
+#[cfg(not(target_os = "freebsd"))]
+fn with_dns(conv: Conversation<'static>) -> Conversation<'static> {
+    match navigator_fetch::dns::Udp::system() {
+        Ok(d) => conv.with_dns(std::sync::Arc::new(d)),
+        Err(e) => {
+            eprintln!("nuntiusd: no resolver for lookups: {e}");
+            conv
+        }
+    }
+}
+
 fn serve(conv: Conversation<'static>) -> ! {
     let s = channel();
     match navigator_fetch::nuntius::serve_channel(s, conv, navigator_fetch::nuntius::CHANNEL_CREDIT) {
@@ -80,7 +92,7 @@ fn main() {
     }
     let tls = std::fs::read(&trust).map_err(|e| e.to_string()).and_then(|p| tls_config(&p)).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     eprintln!("nuntiusd: ★ UNCONFINED, for testing: no sandbox");
-    serve(Conversation::new(&navigator_fetch::Direct, tls, policy).with_sites(sites()))
+    serve(with_dns(Conversation::new(&navigator_fetch::Direct, tls, policy).with_sites(sites())))
 }
 
 #[cfg(target_os = "freebsd")]
@@ -92,9 +104,15 @@ fn main() {
     let sites = sites();
     let pem = std::fs::read(&trust).unwrap_or_else(|e| fail(format!("{trust}: {e}")));
     let tls = tls_config(&pem).unwrap_or_else(|e| fail(e));
+    // The resolver's sockets, connected now: afterwards nothing can be.
+    let dns = navigator_fetch::dns::Udp::system().map_err(|e| eprintln!("nuntiusd: no resolver for lookups: {e}")).ok();
     let net = sandbox::enter().unwrap_or_else(|e| fail(format!("sandbox: {e}")));
     if !sandbox::in_capability_mode() { fail("kernel reports NOT in capability mode — refusing to serve".into()) }
     let locked: &'static navigator_fetch::Locked<sandbox::Net> = Box::leak(Box::new(navigator_fetch::Locked(std::sync::Mutex::new(net))));
     // (fstat on the channel is allowed in capability mode.)
-    serve(Conversation::new(locked, tls, policy).with_sites(sites))
+    let conv = Conversation::new(locked, tls, policy).with_sites(sites);
+    serve(match dns {
+        Some(d) => conv.with_dns(std::sync::Arc::new(d)),
+        None => conv,
+    })
 }

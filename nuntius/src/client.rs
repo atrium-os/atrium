@@ -5,7 +5,7 @@
 //! cancels.
 
 use crate::wire::{self, WireEvent};
-use crate::{Event, Open, Request};
+use crate::{Event, Lookup, Open, Request};
 use aqueduct::{flag, Connection};
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -31,6 +31,7 @@ impl Client {
     pub fn open(&mut self, o: Open) -> io::Result<()> { self.requests.send(&Request::Open(o)) }
     pub fn cancel(&mut self, id: u32) -> io::Result<()> { self.requests.send(&Request::Cancel { id }) }
     pub fn budget(&mut self, bytes: u64) -> io::Result<()> { self.requests.send(&Request::Budget { bytes }) }
+    pub fn lookup(&mut self, l: Lookup) -> io::Result<()> { self.requests.send(&Request::Lookup(l)) }
     pub fn recv(&mut self) -> io::Result<Event> { self.events.recv() }
     pub fn recv_timeout(&mut self, t: Duration) -> io::Result<Option<Event>> { self.events.recv_timeout(t) }
 }

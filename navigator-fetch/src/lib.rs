@@ -7,6 +7,7 @@
 //! a bounded number of redirects.
 
 pub mod addr;
+pub mod dns;
 pub mod http;
 pub mod nuntius;
 pub mod prefetch;
@@ -147,6 +148,8 @@ pub struct Conversation<'a> {
     /// ★ The app's site list (nuntius.md §4), checked on EVERY hop before
     /// any lookup; `None` is unrestricted.
     sites: Option<Arc<::nuntius::Sites>>,
+    /// Where `Lookup`s go (nuntius.md §3.6); none: they fail with `Dns`.
+    dns: Option<Arc<dyn dns::Exchange>>,
 }
 
 #[derive(Default)]
@@ -194,7 +197,7 @@ impl Conn {
 
 impl<'a> Conversation<'a> {
     pub fn new(net: &'a (dyn Connect + Sync), tls: Arc<rustls::ClientConfig>, policy: addr::Policy) -> Self {
-        Conversation { net, tls, policy, shared: Default::default(), reuse: false, sites: None }
+        Conversation { net, tls, policy, shared: Default::default(), reuse: false, sites: None, dns: None }
     }
 
     /// Keep connections open between requests to the same origin, and
@@ -204,6 +207,19 @@ impl<'a> Conversation<'a> {
     /// ★ Narrow this conversation to `sites` (nuntius.md §4): a URL or a
     /// redirect to any other host is refused before it is looked up.
     pub fn with_sites(mut self, sites: Option<::nuntius::Sites>) -> Self { self.sites = sites.map(Arc::new); self }
+
+    /// Answer `Lookup`s through `ex` (the resolver's sockets, opened
+    /// before the sandbox).
+    pub fn with_dns(mut self, ex: Arc<dyn dns::Exchange>) -> Self { self.dns = Some(ex); self }
+
+    /// ★ A DNS lookup, held to the app's site list like a fetch.
+    pub fn lookup(&self, name: &str, kind: ::nuntius::RecordKind) -> Result<(Vec<::nuntius::Record>, bool), ::nuntius::ErrorCode> {
+        if self.site_check(name).is_err() {
+            return Err(::nuntius::ErrorCode::Policy);
+        }
+        let ex = self.dns.as_ref().ok_or(::nuntius::ErrorCode::Dns)?;
+        dns::lookup(ex.as_ref(), name, kind)
+    }
 
     fn site_check(&self, host: &str) -> Result<(), FetchError> {
         match &self.sites {
@@ -215,7 +231,7 @@ impl<'a> Conversation<'a> {
     /// ★ Another handle on THIS conversation, for another thread: the same
     /// pins, the same idle connections, the same policy.
     pub fn sibling(&self) -> Conversation<'a> {
-        Conversation { net: self.net, tls: self.tls.clone(), policy: self.policy, shared: self.shared.clone(), reuse: self.reuse, sites: self.sites.clone() }
+        Conversation { net: self.net, tls: self.tls.clone(), policy: self.policy, shared: self.shared.clone(), reuse: self.reuse, sites: self.sites.clone(), dns: self.dns.clone() }
     }
 
     pub fn policy(&self) -> addr::Policy { self.policy }

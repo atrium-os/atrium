@@ -31,6 +31,8 @@ sha2 = { version = "0.10", features = ["oid"] }
 # OpenPGP: keys and signatures made as senders would.
 pgp = { version = "0.21", default-features = false }
 rand = "0.8"
+# DKIM: messages signed as a sender would.
+ring = "0.17"
 # The end-to-end test: a real Dovecot over TLS, through the real Arca mail
 # courier, into the engine with real parse jails.
 arca-courier = { path = "../../arca/arca-courier" }
