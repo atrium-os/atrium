@@ -269,10 +269,16 @@ impl Workbook {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
         let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none();
-        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s);
+        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
         }
+        let gone = |sheet: u16| sheet == s;
+        self.spills.retain(|a, _| !gone(a.sheet));
+        self.blocked.retain(|a, _| !gone(a.sheet));
+        self.claims.retain(|a, _| !gone(a.sheet));
+        self.changed.retain(|r| !gone(r.sheet));
+        self.lookup.lock().unwrap().clear();
         self.sheets.pop().map(|sh| sh.name)
     }
 
@@ -844,5 +850,144 @@ impl Workbook {
     pub fn formatted(&self, a: CellAddr) -> Formatted {
         let v = self.get(a);
         self.styles.format(self.style_id(a)).format(&v)
+    }
+}
+
+// ---------- moving sheets ----------
+
+/// `e` with its references to sheet `s` naming sheet `m(s)` (a formula's own
+/// sheet, unnamed, stays its own).
+pub(crate) fn remap_sheets(e: &Expr, m: &dyn Fn(u16) -> u16) -> Expr {
+    use crate::formula::{CellRef, RangeRef};
+    let b = |x: &Expr| Box::new(remap_sheets(x, m));
+    match e {
+        Expr::Ref(r) => Expr::Ref(CellRef { sheet: r.sheet.map(m), ..*r }),
+        Expr::Spill(r) => Expr::Spill(CellRef { sheet: r.sheet.map(m), ..*r }),
+        Expr::Range(r) => Expr::Range(RangeRef { sheet: r.sheet.map(m), ..*r }),
+        Expr::Neg(x) => Expr::Neg(b(x)),
+        Expr::Plus(x) => Expr::Plus(b(x)),
+        Expr::Pct(x) => Expr::Pct(b(x)),
+        Expr::Paren(x) => Expr::Paren(b(x)),
+        Expr::At(x) => Expr::At(b(x)),
+        Expr::Bin(op, x, y) => Expr::Bin(*op, b(x), b(y)),
+        Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| remap_sheets(a, m)).collect()),
+        Expr::Invoke(g, args) => Expr::Invoke(b(g), args.iter().map(|a| remap_sheets(a, m)).collect()),
+        Expr::Array(rows) => Expr::Array(rows.iter().map(|r| r.iter().map(|a| remap_sheets(a, m)).collect()).collect()),
+        other => other.clone(),
+    }
+}
+
+impl Workbook {
+    /// Moves sheet `from` to place `to`, the sheets between closing up; every
+    /// formula, name, table, chart, pivot table, conditional format and spill
+    /// follows its sheet. Cells don't move or recalculate: the cost is in the
+    /// workbook's formula groups and objects, not its cells. False (nothing
+    /// done) if either place isn't a sheet.
+    pub fn move_sheet(&mut self, from: u16, to: u16) -> bool {
+        let n = self.sheets.len();
+        if from as usize >= n || to as usize >= n {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        let x = order.remove(from as usize);
+        order.insert(to as usize, x);
+        let mut p = vec![0u16; n];
+        for (new, &old) in order.iter().enumerate() {
+            p[old] = new as u16;
+        }
+        let m = |s: u16| p.get(s as usize).copied().unwrap_or(s);
+        let rect = |r: Rect| Rect { sheet: m(r.sheet), ..r };
+        let addr = |a: CellAddr| CellAddr { sheet: m(a.sheet), ..a };
+
+        // Names and conditional formats as text (sheets by name), read back after.
+        let defs: Vec<crate::names::NameDef> = self.names.iter().cloned().collect();
+        let names_b = self.encode_names(&defs);
+        let cfs_b = self.encode_cond_formats(&self.cond_formats);
+
+        // Formula groups out, to come back on their sheets' new places.
+        let ids: Vec<GroupId> = self.groups().map(|(g, _)| g).collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for g in ids {
+            let grp = self.group(g);
+            let (s, c, r0, r1, e) = (grp.sheet, grp.col, grp.r0, grp.r1, grp.expr.clone());
+            let pend = self.remove_group(g, true);
+            out.push((s, c, r0, r1, e, pend));
+        }
+
+        let mut old: Vec<Option<Sheet>> = std::mem::take(&mut self.sheets).into_iter().map(Some).collect();
+        self.sheets = order.iter().map(|&o| old[o].take().expect("each sheet once")).collect();
+
+        let ts: Vec<_> = std::mem::take(&mut self.tables).into_iter().map(|mut t| {
+            t.rect = rect(t.rect);
+            t
+        }).collect();
+        self.replace_tables(ts);
+        let cs: Vec<_> = std::mem::take(&mut self.charts).into_iter().map(|mut c| {
+            c.anchor.sheet = m(c.anchor.sheet);
+            let text = |t: Option<crate::charts::ChartText>| match t {
+                Some(crate::charts::ChartText::Cell(a)) => Some(crate::charts::ChartText::Cell(addr(a))),
+                t => t,
+            };
+            c.title = text(c.title.take());
+            for s in &mut c.series {
+                s.vals = rect(s.vals);
+                s.cats = s.cats.map(rect);
+                s.name = text(s.name.take());
+            }
+            c
+        }).collect();
+        self.replace_charts(cs);
+        let ps: Vec<_> = self.pivot_state().into_iter().map(|(mut pv, area)| {
+            pv.source = rect(pv.source);
+            pv.dest = addr(pv.dest);
+            (pv, area.map(rect))
+        }).collect();
+        self.replace_pivots(ps);
+        if let Some(mc) = self.macros.as_mut() {
+            for (s, _) in &mut mc.sheet_codes {
+                *s = m(*s);
+            }
+        }
+        self.spills = std::mem::take(&mut self.spills).into_iter().map(|(a, mut s)| {
+            s.area = rect(s.area);
+            (addr(a), s)
+        }).collect();
+        self.blocked = std::mem::take(&mut self.blocked).into_iter().map(|(a, r)| (addr(a), rect(r))).collect();
+        self.claims = std::mem::take(&mut self.claims).into_iter().map(|(a, r)| (addr(a), rect(r))).collect();
+        for r in &mut self.changed {
+            *r = rect(*r);
+        }
+
+        if let Ok(mut defs) = self.decode_names(&names_b) {
+            for d in &mut defs {
+                d.scope = d.scope.map(m);
+            }
+            self.replace_names(defs);
+        }
+        if let Ok(mut fs) = self.decode_cond_formats(&cfs_b) {
+            for f in &mut fs {
+                f.sheet = m(f.sheet);
+                for r in &mut f.ranges {
+                    *r = rect(*r);
+                }
+            }
+            self.replace_cond_formats(fs);
+        }
+
+        for (s, c, r0, r1, e, pend) in out {
+            let id = self.add_group(m(s), c, r0, r1, Arc::new(remap_sheets(&e, &m)), None);
+            if let Some(rs) = pend {
+                let pe = self.pending.entry(id).or_default();
+                for (a, b) in rs.0 {
+                    pe.add(a, b);
+                }
+            }
+        }
+        self.lookup.lock().unwrap().clear();
+        self.cond_stats.lock().unwrap().clear();
+        true
     }
 }

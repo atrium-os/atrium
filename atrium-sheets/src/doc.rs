@@ -515,8 +515,10 @@ impl Doc {
         if self.over_budget() {
             self.journal(&Record::Undo);
             self.history.undo(&mut self.wb);
+            self.keep_sheet();
             return;
         }
+        self.keep_sheet();
         self.recalc();
         self.dirty = true;
     }

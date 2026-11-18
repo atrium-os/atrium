@@ -201,7 +201,7 @@ fn mentions(e: &Expr, own: u16, target: u16) -> bool {
 /// Adds the fills of formula cells `cells` (old row, old col, new row, new
 /// col, new expression), in order down each column, joining runs whose
 /// relative expressions are the same.
-fn fills_of(wb: &Workbook, mut cells: Vec<(u32, u32, Arc<Expr>)>, out: &mut Vec<Fill>) {
+pub(crate) fn fills_of(wb: &Workbook, mut cells: Vec<(u32, u32, Arc<Expr>)>, out: &mut Vec<Fill>) {
     cells.sort_by_key(|c| (c.1, c.0));
     let mut last: Option<(u32, u32, Arc<Expr>)> = None;
     for (r, c, e) in cells {
