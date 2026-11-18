@@ -26,7 +26,7 @@ impl Choragus {
     fn ask(&mut self, m: &ToAttribution) -> Option<FromAttribution> {
         for _ in 0..2 {
             if self.conn.is_none() {
-                let s = UnixStream::connect(&self.path).ok()?;
+                let s = atrium_listen::connect(&self.path, Some(std::time::Duration::from_secs(2))).ok()?;
                 // limend asks under its state lock: never wait long.
                 s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
                 s.set_write_timeout(Some(Duration::from_secs(1))).ok()?;

@@ -33,6 +33,7 @@ const MANIFEST_DIRS: &[&str] = &[
     "frescod/etc/services.d",
     "lyra/etc/services.d",
     "choragus/etc/services.d",
+    "limen/etc/services.d",
 ];
 
 #[test]
@@ -103,4 +104,21 @@ fn choragusd_manifest_passes_the_shipped_policy() {
     if let Err(e) = validate_create(&m.to_create_request(), &p) {
         panic!("atrium-choragusd: jaild would refuse it: {e:?}");
     }
+}
+
+/// limend's manifest (limen.md §1) passes the shipped policy: its socket is
+/// supervisor-bound under its own rw mount, it runs as _limen, and it has no
+/// network.
+#[test]
+fn limend_manifest_passes_the_shipped_policy() {
+    let p = policy();
+    let out = load_dir(&repo().join("limen/etc/services.d")).expect("read limen/etc/services.d");
+    assert!(out.errors.is_empty(), "unparseable: {:?}", out.errors);
+    let m = out.manifests.iter().find(|m| m.name == "atrium-limend").expect("atrium-limend manifest");
+    if let Err(e) = validate_create(&m.to_create_request(), &p) {
+        panic!("atrium-limend: jaild would refuse it: {e:?}");
+    }
+    assert_eq!(m.exec.as_ref().map(|e| e.uid), Some(65022));
+    assert!(m.sockets.iter().any(|s| s.path == "/atrium/sockets/limen/limend.sock"),
+        "limend.sock is not supervisor-bound");
 }

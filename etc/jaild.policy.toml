@@ -86,6 +86,8 @@ ro_paths = [
     # aura-keys connects to arcad's for Wi-Fi credentials.
     "/atrium/sockets/aura-keys",
     "/atrium/sockets/arca",
+    "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles)
+    "/etc/pwd.db",                   # limend: a worker rule's run_as -> uid (no hashes)
 ]
 rw_paths = [
     # Aqueduct service-socket directory (all jails that talk to
@@ -130,6 +132,8 @@ rw_paths = [
     "/atrium/sockets/clipboard",
     # The install sheet's: monstratord, for atrium-app: links (L5).
     "/atrium/sockets/opifex-sheet",
+    "/atrium/sockets/limen",
+    "/atrium/sockets/audio-attribution",
 
     # choragusd's users' volumes (<user>.toml; _choragus 0700).
     "/var/db/choragus",

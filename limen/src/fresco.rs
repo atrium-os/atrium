@@ -12,8 +12,14 @@ use crate::catalogue::SlotKind;
 use crate::daemon::Compositor;
 use crate::proto::WindowToken;
 
-/// frescod's default activation socket.
-pub const DEFAULT_SOCKET: &str = "/var/run/atrium/fresco-activation.sock";
+/// frescod's activation socket, in its own directory so a jail can mount it
+/// (limend's jail does; the old /var/run/atrium link isn't in any jail).
+pub const DEFAULT_SOCKET: &str = "/atrium/sockets/fresco-activation/fresco-activation.sock";
+
+/// frescod's activation socket isn't supervisor-bound yet, so it can be
+/// missing for a moment after boot or while frescod restarts: wait that long
+/// for it (on a watch of its directory) before an embed fails.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Frescod {
     path: PathBuf,
@@ -29,7 +35,7 @@ impl Frescod {
 
     fn call<Q: serde::Serialize, R: serde::de::DeserializeOwned>(&mut self, opc: u16, q: &Q) -> std::io::Result<R> {
         if self.conn.is_none() {
-            self.conn = Some(Connection::connect(&self.path)?);
+            self.conn = Some(Connection::wrap(atrium_listen::connect(&self.path, Some(CONNECT_WAIT))?)?);
         }
         let c = self.conn.as_mut().unwrap();
         let bad = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
@@ -118,7 +124,7 @@ impl Frescod {
     pub fn open_embed(&self, owner_uid: u32) -> std::io::Result<std::os::unix::net::UnixStream> {
         use aqueduct::envelope::{read_message_alloc, write_message};
         use slot::{EmbedConnect, EmbedConnectResult, op::EMBED_CONNECT as OP};
-        let mut s = std::os::unix::net::UnixStream::connect(&self.path)?;
+        let mut s = atrium_listen::connect(&self.path, Some(CONNECT_WAIT))?;
         s.set_read_timeout(Some(Duration::from_secs(2)))?;
         let payload = postcard::to_stdvec(&EmbedConnect { owner_uid }).unwrap();
         let h = aqueduct::Header::new(aqueduct::classes::CLASS_DISPLAY, OP, flag::RESPONSE_EXPECTED, payload.len() as u32);

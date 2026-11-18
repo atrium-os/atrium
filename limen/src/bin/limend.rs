@@ -27,10 +27,13 @@
 //! User-role children start through portcullisd's `ExecInstance`
 //! ([`limen::launch`]). Slots are bound with frescod's slot op on its
 //! activation socket (`LIMEN_FRESCOD_ACTIVATION`, default
-//! /var/run/atrium/fresco-activation.sock; [`limen::fresco`]).
+//! /atrium/sockets/fresco-activation/fresco-activation.sock; [`limen::fresco`]).
+//!
+//! At boot limend runs jailed as a service (etc/services.d/41-atrium-limend.toml):
+//! the supervisor binds its socket and hands it over (`atrium_listen`), so
+//! apps can connect before limend is up.
 
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixListener;
 
 use limen::daemon::Shared;
 
@@ -76,17 +79,18 @@ fn main() -> std::io::Result<()> {
     if let Some(d) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    if default {
-        let _ = std::fs::remove_file(limen::client::OLD_SOCKET);
-        if let Err(e) = std::os::unix::fs::symlink(&path, limen::client::OLD_SOCKET) {
-            eprintln!("limend: link {} -> {path}: {e}", limen::client::OLD_SOCKET);
+    // The supervisor's socket if it bound one (the services.d manifest sets
+    // its owner and mode), else bound here.
+    let (listener, origin) = atrium_listen::listener(&path)?;
+    if origin == atrium_listen::Origin::Bound {
+        if default {
+            let _ = std::fs::remove_file(limen::client::OLD_SOCKET);
+            if let Err(e) = std::os::unix::fs::symlink(&path, limen::client::OLD_SOCKET) {
+                eprintln!("limend: link {} -> {path}: {e}", limen::client::OLD_SOCKET);
+            }
         }
-    }
-    // Every app may connect: who it is comes from the connection
-    // (getpeereid), never from the socket's mode.
-    {
+        // Every app may connect: who it is comes from the connection
+        // (getpeereid), never from the socket's mode.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     }

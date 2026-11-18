@@ -1,0 +1,101 @@
+# /etc/atrium/services.d/41-atrium-limend.toml
+#
+# limend, the embed broker (docs/spec/limen.md), as a jailed system service.
+# atrium-portcullisd-bootstrap reads this, binds limend's socket, asks jaild
+# to create the jail and supervises limend inside it. App jails whose manifest
+# `embeds` a role mount /atrium/sockets/limen/ (f88e2b89); without this entry
+# nothing listens there after a plain boot and every picker, share, print and
+# credential embed fails.
+#
+# limend runs NON-ROOT as _limen (65022), the uid frescod (FRESCOD_SLOT_UIDS),
+# choragusd (--limen-uid) and the system policy's worker rules name. It holds
+# no secrets, has no network and no devices beyond the basics. It sees:
+#   - its own socket dir (rw), which the supervisor binds before anything
+#     starts, so apps connect at once whatever order services come up in;
+#   - portcullisd's socket dir: each embed child is an ExecInstance;
+#   - frescod's activation socket dir: it binds embed slots there;
+#   - choragusd's attribution socket dir: audio tickets for embedded players;
+#   - read-only: the launch registry (who each app uid is), the installed
+#     manifests (embeds, roles), /etc/atrium (the system policy's worker
+#     rules) and /etc/pwd.db (to turn a rule's run_as into a uid).
+# No `after`: everything it connects to is a supervisor-bound socket, or
+# portcullisd (started by rc before the bootstrap), and it connects per embed.
+#
+# REQUIRES (scripts/limen-service.sh does all of it):
+#   1. The _limen (65022) system user (already in jaild.policy's allowed_system_uids).
+#   2. /atrium/sockets/limen, owned _limen, 0755.
+#   3. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,etc/atrium,
+#      var/lib/atrium/apps,atrium/sockets/{limen,portcullis,fresco-activation,audio-attribution},
+#      var/run/atrium} and empty files <path>/var/run/atrium/app-registry and
+#      <path>/etc/pwd.db (nullfs file mount points).
+
+enabled       = true
+name          = "atrium-limend"
+path          = "/var/lib/atrium/jails/limend"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: basics only
+# network: none (the manifest default, `disable`).
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/limen"                  # rw: limend.sock (bound by the supervisor)
+dest   = "atrium/sockets/limen"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/portcullis"             # rw: ExecInstance for each embed child
+dest   = "atrium/sockets/portcullis"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/fresco-activation"      # rw: frescod's slot op (_limen only)
+dest   = "atrium/sockets/fresco-activation"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/audio-attribution"      # rw: choragusd's tickets for embedded players
+dest   = "atrium/sockets/audio-attribution"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/lib/atrium/apps"                   # ro: installed manifests (embeds, roles)
+dest   = "var/lib/atrium/apps"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/etc/atrium"                            # ro: the system policy's worker rules
+dest   = "etc/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/etc/pwd.db"                            # ro: run_as name -> uid (no hashes; spwd.db stays out)
+dest   = "etc/pwd.db"
+kind   = "ro_nullfs"
+
+# Bound by the supervisor before anything starts (fast-boot.md §5). 0666: who
+# a caller is comes from getpeereid and the registry, never the socket's mode;
+# only jails whose manifest embeds a role have the directory.
+[[sockets]]
+path  = "/atrium/sockets/limen/limend.sock"
+owner = 65022   # _limen
+group = 65022
+mode  = "0666"
+
+[exec]
+path = "/usr/local/bin/atrium-limend"
+argv = ["atrium-limend"]
+uid  = 65022   # _limen
+gid  = 65022
