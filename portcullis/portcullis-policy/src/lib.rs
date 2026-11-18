@@ -428,6 +428,7 @@ pub struct CapabilityDelta {
     pub workspace_exec:  bool,
     pub bluetooth_control: bool,
     pub status_item:     bool,
+    pub printers_configure: bool,
     pub audio_device:    bool,
     pub net_fetch:       bool,
     pub protected_media: bool,
@@ -493,6 +494,7 @@ impl CapabilityDelta {
             && !self.workspace_exec
             && !self.bluetooth_control
             && !self.status_item
+            && !self.printers_configure
             && !self.audio_device
             && !self.net_fetch
             && !self.protected_media
@@ -552,6 +554,7 @@ impl CapabilityDelta {
         if self.workspace_exec  { out.push("Build and run commands in the workspaces you pick in it".into()); }
         if self.bluetooth_control { out.push("Pair, connect and forget Bluetooth devices".into()); }
         if self.status_item     { out.push("Put an icon with a menu in the bar".into()); }
+        if self.printers_configure { out.push("Add, share and remove your printers, and see what you printed".into()); }
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
@@ -674,6 +677,7 @@ pub fn compute_delta(
     bool_cap!(workspace_exec);
     bool_cap!(bluetooth_control);
     bool_cap!(status_item);
+    bool_cap!(printers_configure);
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
     bool_cap!(protected_media);
@@ -1010,6 +1014,7 @@ run_as = "_navpage"
             workspace_exec: None,
             bluetooth_control: None,
             status_item: None,
+            printers_configure: None,
             audio_device: None,
             net_fetch: None,
             net_fetch_sites: None,

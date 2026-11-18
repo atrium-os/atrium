@@ -130,9 +130,9 @@ fn main() -> ExitCode {
     // read fresh each time: apps come and go.
     let person_of = Box::new(move |app: u32| {
         let reg = portcullis_peer::AppRegistry::load(&registry).ok()?;
-        let (user, _) = reg.resolve(app)?;
+        let (user, id) = reg.resolve(app)?;
         let person = uid_of(user)?;
-        Some((person, reg.persona(app).flatten().map(str::to_string)))
+        Some((person, reg.persona(app).flatten().map(str::to_string), id.to_string()))
     });
     let d = Daemon::new(Config { state, spool, network: Box::new(move || network.clone()), mdns, sheet_uid, person_of }, launcher);
     if let Some(dir) = socket.parent() {

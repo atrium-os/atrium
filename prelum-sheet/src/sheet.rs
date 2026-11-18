@@ -433,6 +433,8 @@ mod tests {
             color: true,
             new: false,
             changed: None,
+            persona: String::new(),
+            shared: false,
         }
     }
 

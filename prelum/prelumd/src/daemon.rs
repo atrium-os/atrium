@@ -21,17 +21,25 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use prelum_ipp_codec::ops::{ColorMode, Format, JobIdentity, Quality, Sides, Ticket};
-use prelum_ipp_codec::printer::{PrinterInfo, PrinterState};
+use prelum_ipp_codec::printer::{PrinterInfo, PrinterState, Reason, StateReason};
 use prelum_proto::frame::{self, DATA_CHUNK};
 use prelum_proto::ipp::{self, JobState};
-use prelum_proto::print::{self, status, Changed, Phase};
+use prelum_proto::print::{self, status, Alert, Changed, Ended, Phase};
 use prelum_proto::render;
 
 use crate::launch::{Launcher, Proc, Stopper};
 use crate::store::{self, Saved};
 
-/// How long a finished job stays in the list (history proper is R5's).
+/// How long a finished job stays in the list (history keeps it longer).
 const KEEP_ENDED: usize = 200;
+/// History per person at most (§6.5 keeps 30 days).
+const KEEP_HISTORY: usize = 2000;
+/// How long `WATCH` waits for a change.
+const WATCH_FOR: Duration = Duration::from_secs(25);
+/// Curia (its Printers page) and prelum-status (the Forum status item,
+/// Praeco notices): the apps that act for their person (§6.4).
+pub const CURIA_APP: &str = "org.atrium.curia";
+pub const STATUS_APP: &str = "org.atrium.prelum-status";
 /// Spool per person (§6.5).
 pub const SPOOL_CAP: u64 = 2 << 30;
 /// Job state polling (§6.3): every 2 s for a minute, then every 10 s.
@@ -57,9 +65,10 @@ pub struct Config {
     /// prelum-sheet's uid: the one peer that may act for an app's person
     /// (`FOR`, §5.2).
     pub sheet_uid: Option<u32>,
-    /// An app's uid to its person's uid and persona (the launch registry):
-    /// whose printers a sheet opened for that app uses.
-    pub person_of: Box<dyn Fn(u32) -> Option<(u32, Option<String>)> + Send + Sync>,
+    /// An app's uid to its person's uid, persona and app id (the launch
+    /// registry): whose printers a sheet opened for that app uses, and which
+    /// app is asking.
+    pub person_of: Box<dyn Fn(u32) -> Option<(u32, Option<String>, String)> + Send + Sync>,
 }
 
 pub type Fail = (u8, String);
@@ -78,10 +87,14 @@ struct Live {
 struct Person {
     file: store::File,
     live: HashMap<u32, Live>,
+    /// Loaded when first needed.
+    history: Option<store::History>,
 }
 
 struct JobRec {
     uid: u32,
+    /// The persona it was printed from (history, §9).
+    persona: String,
     view: print::Job,
     req: print::Print,
     pdf: OwnedFd,
@@ -98,6 +111,8 @@ struct State {
     next_job: u64,
     /// (uid, printer) with a runner.
     running: HashSet<(u32, u32)>,
+    /// Bumped on every change to a job (`WATCH`).
+    generation: u64,
 }
 
 pub struct Daemon {
@@ -106,6 +121,8 @@ pub struct Daemon {
     st: Mutex<State>,
     /// Woken when a job is released or cancelled.
     cv: Condvar,
+    /// Woken on every change to a job (`WATCH`).
+    watch_cv: Condvar,
     /// Discovery (§7.1): its own lock, never held with `st`'s.
     pub(crate) near: Mutex<crate::nearby::Near>,
 }
@@ -138,6 +155,29 @@ impl Drop for Ipp {
 pub fn fingerprint(k: &[u8; 32]) -> String {
     use base64::Engine;
     format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(k))
+}
+
+/// Why a stopped printer stopped, from what it reports (§6.6).
+fn alert_of(reasons: &[StateReason]) -> Alert {
+    let has = |r: &[Reason]| reasons.iter().any(|s| r.contains(&s.reason));
+    if has(&[Reason::MediaEmpty, Reason::MediaNeeded]) {
+        Alert::OutOfPaper
+    } else if has(&[Reason::MediaJam]) {
+        Alert::Jam
+    } else if has(&[Reason::DoorOpen, Reason::CoverOpen, Reason::InputTrayMissing, Reason::OutputAreaFull]) {
+        Alert::Open
+    } else {
+        Alert::Stopped
+    }
+}
+
+fn stopped_words(name: &str, a: Alert) -> String {
+    match a {
+        Alert::OutOfPaper => format!("{name} is out of paper"),
+        Alert::Jam => format!("paper is jammed in {name}"),
+        Alert::Open => format!("{name} needs attention"),
+        _ => format!("{name} is stopped"),
+    }
 }
 
 fn now() -> u64 {
@@ -351,6 +391,7 @@ impl Daemon {
             launcher,
             st: Mutex::new(State { next_job: 1, ..Default::default() }),
             cv: Condvar::new(),
+            watch_cv: Condvar::new(),
             near: Mutex::new(Default::default()),
         })
     }
@@ -360,7 +401,7 @@ impl Daemon {
     }
 
     fn person<'a>(&self, st: &'a mut State, uid: u32) -> &'a mut Person {
-        st.people.entry(uid).or_insert_with(|| Person { file: store::load(&self.cfg.state, uid), live: HashMap::new() })
+        st.people.entry(uid).or_insert_with(|| Person { file: store::load(&self.cfg.state, uid), live: HashMap::new(), history: None })
     }
 
     fn saved(&self, uid: u32, id: u32) -> Result<Saved, Fail> {
@@ -422,6 +463,8 @@ impl Daemon {
             color: i.color_modes.iter().any(|m| m == "color"),
             new: s.jobs_sent == 0,
             changed: live.and_then(|l| l.changed.clone()),
+            persona: s.persona.clone(),
+            shared: s.shared,
         }
     }
 
@@ -472,7 +515,7 @@ impl Daemon {
         }
     }
 
-    pub fn add(&self, uid: u32, a: &print::Add) -> Result<print::Printer, Fail> {
+    pub fn add(&self, uid: u32, persona: &str, a: &print::Add) -> Result<print::Printer, Fail> {
         if a.name.len() > 128 || a.name.chars().any(char::is_control) {
             return fail(status::MALFORMED, "bad name");
         }
@@ -496,6 +539,8 @@ impl Daemon {
                 raster_only: false,
                 titles_off: false,
                 jobs_sent: 0,
+                persona: persona.to_string(),
+                shared: false,
                 info: PrinterInfo::default(),
             };
             match self.learn(&s) {
@@ -552,6 +597,106 @@ impl Daemon {
         s.name = r.name.clone();
         self.persist(uid, &mut st);
         Ok("renamed".into())
+    }
+
+    /// Shared by every persona, or its own persona's again (§9; the sheet
+    /// keeping personas apart is R7's).
+    pub fn share(&self, uid: u32, r: &print::Share) -> Result<String, Fail> {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        let s = p.file.printer.iter_mut().find(|s| s.id == r.printer).ok_or((status::NOT_FOUND, "no such printer".to_string()))?;
+        s.shared = r.shared;
+        self.persist(uid, &mut st);
+        Ok(if r.shared { "shared".into() } else { "not shared".into() })
+    }
+
+    /// The last 30 days' ended jobs, newest first.
+    pub fn history(&self, uid: u32) -> Vec<Ended> {
+        let mut st = self.lock();
+        let h = self.history_of(&mut st, uid);
+        let mut v = h.job.clone();
+        v.reverse();
+        v
+    }
+
+    pub fn clear_history(&self, uid: u32) -> Result<String, Fail> {
+        let mut st = self.lock();
+        self.history_of(&mut st, uid).job.clear();
+        self.persist_history(uid, &mut st);
+        Ok("cleared".into())
+    }
+
+    fn history_of<'a>(&self, st: &'a mut State, uid: u32) -> &'a mut store::History {
+        let state = &self.cfg.state;
+        let p = self.person(st, uid);
+        let h = p.history.get_or_insert_with(|| store::load_history(state, uid));
+        let old = now().saturating_sub(print::HISTORY_DAYS * 24 * 3600);
+        h.job.retain(|e| e.at >= old);
+        h
+    }
+
+    fn persist_history(&self, uid: u32, st: &mut State) {
+        let h = self.history_of(st, uid).clone();
+        if let Err(e) = store::save_history(&self.cfg.state, uid, &h) {
+            eprintln!("prelumd: saving history of {uid}: {e}");
+        }
+    }
+
+    /// A job ended: into its person's history (§6.5), without its document.
+    fn record(&self, st: &mut State, job: u64) {
+        let Some(j) = st.jobs.get(&job) else { return };
+        let (uid, view, persona) = (j.uid, j.view.clone(), j.persona.clone());
+        let saved = self.person(st, uid).file.printer.iter().find(|s| s.id == view.printer).map(|s| (s.name.clone(), s.titles_off));
+        let (printer, titles_off) = saved.unwrap_or_else(|| ("a removed printer".into(), false));
+        let e = Ended {
+            job,
+            title: if titles_off { "Document".into() } else { view.title },
+            printer,
+            sheets: view.sheets,
+            at: now(),
+            result: view.phase,
+            message: view.message,
+            persona,
+        };
+        let h = self.history_of(st, uid);
+        h.job.push(e);
+        if h.job.len() > KEEP_HISTORY {
+            let n = h.job.len() - KEEP_HISTORY;
+            h.job.drain(..n);
+        }
+        self.persist_history(uid, st);
+    }
+
+    /// Something about a job changed: wake `WATCH`.
+    fn changed(&self, st: &mut State) {
+        st.generation += 1;
+        self.watch_cv.notify_all();
+    }
+
+    /// The person's jobs once they differ from `after`, or after 25 s.
+    pub fn watch(&self, uid: u32, after: u64) -> print::Watched {
+        let until = Instant::now() + WATCH_FOR;
+        let mut st = self.lock();
+        while st.generation == after {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            st = self.watch_cv.wait_timeout(st, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        print::Watched { generation: st.generation, jobs: st.jobs.values().filter(|j| j.uid == uid).map(|j| j.view.clone()).collect() }
+    }
+
+    /// What a job may need the person for; `None` clears it. The time it
+    /// began is kept while it stays the same.
+    fn alert(&self, job: u64, a: Option<Alert>) {
+        let mut st = self.lock();
+        let Some(j) = st.jobs.get_mut(&job) else { return };
+        if j.view.alert != a {
+            j.view.alert = a;
+            j.view.alert_since = if a.is_some() { now() } else { 0 };
+            self.changed(&mut st);
+        }
     }
 
     /// "Use the new identity" (§7.3): learn the printer again at its saved
@@ -662,7 +807,7 @@ impl Daemon {
         self.lock().jobs.values().filter(|j| j.uid == uid).map(|j| j.view.clone()).collect()
     }
 
-    pub fn submit(self: &Arc<Self>, uid: u32, req: print::Print, pdf: OwnedFd) -> Result<u64, Fail> {
+    pub fn submit(self: &Arc<Self>, uid: u32, persona: &str, req: print::Print, pdf: OwnedFd) -> Result<u64, Fail> {
         if req.title.len() > 512 || req.copies == 0 || req.copies > 999 || ![1, 2, 4].contains(&req.per_sheet) {
             return fail(status::MALFORMED, "bad print settings");
         }
@@ -684,6 +829,7 @@ impl Daemon {
         let title: String = req.title.chars().filter(|c| !c.is_control()).take(200).collect();
         st.jobs.insert(id, JobRec {
             uid,
+            persona: persona.to_string(),
             view: print::Job {
                 id,
                 printer: s.id,
@@ -693,6 +839,8 @@ impl Daemon {
                 of: 0,
                 message: String::new(),
                 submitted: now(),
+                alert: None,
+                alert_since: 0,
             },
             req,
             pdf: file.into(),
@@ -707,6 +855,7 @@ impl Daemon {
                 st.jobs.remove(k);
             }
         }
+        self.changed(&mut st);
         self.kick(&mut st, uid, s.id);
         Ok(id)
     }
@@ -724,10 +873,15 @@ impl Daemon {
         if !running {
             j.view.phase = Phase::Cancelled;
             j.view.message.clear();
+            j.view.alert = None;
         }
         for s in j.stops.drain(..) {
             s.stop();
         }
+        if !running {
+            self.record(&mut st, job);
+        }
+        self.changed(&mut st);
         self.cv.notify_all();
         Ok("cancelled".into())
     }
@@ -740,7 +894,9 @@ impl Daemon {
         }
         j.view.phase = Phase::Pending;
         j.view.message.clear();
+        j.view.alert = None;
         let p = j.view.printer;
+        self.changed(&mut st);
         self.kick(&mut st, uid, p);
         Ok("released".into())
     }
@@ -794,6 +950,14 @@ impl Daemon {
                     j.view.message = m;
                 }
             }
+            if !matches!(j.view.phase, Phase::Pending | Phase::Held) {
+                j.view.alert = None;
+            }
+            let ended = j.view.phase.ended();
+            if ended {
+                self.record(&mut st, next);
+            }
+            self.changed(&mut st);
             let _ = std::fs::remove_file(self.spool_path(uid, next));
             if retry {
                 // Wait, unless something changes (a cancel, a release).
@@ -812,13 +976,15 @@ impl Daemon {
 
     fn set(&self, job: u64, f: impl FnOnce(&mut JobRec)) -> bool {
         let mut st = self.lock();
-        match st.jobs.get_mut(&job) {
+        let ok = match st.jobs.get_mut(&job) {
             Some(j) => {
                 f(j);
                 !j.cancel
             }
-            None => false,
-        }
+            None => return false,
+        };
+        self.changed(&mut st);
+        ok
     }
 
     fn cancelled(&self, job: u64) -> bool {
@@ -872,14 +1038,17 @@ impl Daemon {
             }
             Ok(ipp::Ev::Printer { info, .. }) => {
                 self.mark_changed(uid, printer, None, info.uuid.clone());
+                self.alert(job, Some(Alert::IdentityChanged));
                 return Outcome::Held(format!("{}'s identity changed", s.name));
             }
             Ok(ipp::Ev::IdentityChanged { key, uuid }) => {
                 self.mark_changed(uid, printer, key, uuid);
+                self.alert(job, Some(Alert::IdentityChanged));
                 return Outcome::Held(format!("{}'s identity changed", s.name));
             }
             Ok(ipp::Ev::Unreachable(_)) => {
                 self.set_offline(uid, printer, true);
+                self.alert(job, Some(Alert::Offline));
                 return Outcome::Retry(format!("{} is offline", s.name));
             }
             Ok(ev) => return Outcome::Failed(self.ev_fail(uid, printer, ev).1),
@@ -887,8 +1056,11 @@ impl Daemon {
             Err(e) => return Outcome::Failed(format!("prelum-ipp: {e}")),
         };
         if info.state == Some(PrinterState::Stopped) {
-            return Outcome::Retry(format!("{} is stopped", s.name));
+            let a = alert_of(&info.state_reasons);
+            self.alert(job, Some(a));
+            return Outcome::Retry(stopped_words(&s.name, a));
         }
+        self.alert(job, None);
         let (_, args, ticket) = match plan(&info, s.raster_only, &req) {
             Ok(p) => p,
             Err(m) => return Outcome::Failed(m),
@@ -965,10 +1137,12 @@ impl Daemon {
             Ok(()) => {}
             Err(SendErr::Ev(ipp::Ev::IdentityChanged { key, uuid })) => {
                 self.mark_changed(uid, printer, key, uuid);
+                self.alert(job, Some(Alert::IdentityChanged));
                 return Outcome::Held(format!("{}'s identity changed", s.name));
             }
             Err(SendErr::Ev(ipp::Ev::Unreachable(_))) if remote.is_none() => {
                 self.set_offline(uid, printer, true);
+                self.alert(job, Some(Alert::Offline));
                 return Outcome::Retry(format!("{} is offline", s.name));
             }
             Err(SendErr::Ev(ev)) => return Outcome::Failed(self.ev_fail(uid, printer, ev).1),
@@ -985,7 +1159,7 @@ impl Daemon {
         }
         let Some(remote) = remote else { return Outcome::Done(String::new()) };
         self.set(job, |j| j.view.phase = Phase::Printing);
-        self.watch(&s, w, job, remote)
+        self.follow(&s, w, job, remote)
     }
 
     /// Submit, then the spool's bytes as they come, then the end.
@@ -1043,7 +1217,7 @@ impl Daemon {
     }
 
     /// Follow the job at the printer until it ends (§6.3 polling).
-    fn watch(&self, s: &Saved, mut w: Ipp, job: u64, remote: i32) -> Outcome {
+    fn follow(&self, s: &Saved, mut w: Ipp, job: u64, remote: i32) -> Outcome {
         let began = Instant::now();
         let mut failing_since: Option<Instant> = None;
         loop {
@@ -1074,9 +1248,17 @@ impl Daemon {
                         JobState::Canceled => return Outcome::Cancelled,
                         JobState::Aborted => return Outcome::Failed("the printer stopped the job".into()),
                         JobState::Stopped => {
-                            self.set(job, |j| j.view.message = "the printer has stopped".into());
+                            // Why: the printer's own reasons (out of paper,
+                            // a jam), asked of it now.
+                            let a = match w.ask(&ipp::Req::Query) {
+                                Ok(ipp::Ev::Printer { info, .. }) => alert_of(&clean(*info).state_reasons),
+                                _ => Alert::Stopped,
+                            };
+                            self.alert(job, Some(a));
+                            self.set(job, |j| j.view.message = stopped_words(&s.name, a));
                         }
                         _ => {
+                            self.alert(job, None);
                             self.set(job, |j| j.view.message.clear());
                         }
                     }

@@ -22,7 +22,7 @@ use crate::network::{headline, manual_fields, name, security_label, NetPage, MAC
 use atrium_netconf::Target;
 use pergola::text_edit::TextEdit;
 
-fn em(pt: f32) -> f32 {
+pub(crate) fn em(pt: f32) -> f32 {
     pergola::theme::size::em(pt)
 }
 
@@ -41,6 +41,7 @@ pub enum Which {
     Devices,
     Apps,
     Personas,
+    Printers,
 }
 
 pub struct CuriaView {
@@ -70,6 +71,11 @@ pub struct CuriaView {
     /// its keys; Curia only reserves its place and gets a handle.
     pub cred: CredentialField,
     pub size: Mutable<(f32, f32)>,
+    /// The Printers page (printers.rs): its model, scroll, and the rename
+    /// and add-by-address fields.
+    pub printers: Mutable<crate::printers::PrintersPage>,
+    pub printers_scroll: Mutable<ScrollState>,
+    pub printer_fields: [Mutable<TextEdit>; 2],
 }
 
 pub fn with(page: &Mutable<NetPage>, f: impl FnOnce(&mut NetPage)) {
@@ -82,26 +88,26 @@ fn sans(size: f32, weight: Weight, color: Color) -> TextStyle {
     TextStyle { family: font::SANS.into(), size, weight, color }
 }
 
-fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, color: Color) -> NodeId {
+pub(crate) fn text(ctx: &mut Ctx, x: f32, cy: f32, s: &str, size: f32, weight: Weight, color: Color) -> NodeId {
     let h = em(size) * 1.5;
     ctx.add(Node::Text { rect: Rect::new(x, cy - h / 2.0, 0.0, h), content: s.into(), style: sans(size, weight, color) })
 }
 
-fn width(s: &str, size: f32, weight: Weight) -> f32 {
+pub(crate) fn width(s: &str, size: f32, weight: Weight) -> f32 {
     Node::measure_text(s, &sans(size, weight, Color::TRANSPARENT)).w
 }
 
-fn rect(ctx: &mut Ctx, x: f32, y: f32, w: f32, h: f32, fill: Color, radius: f32) -> NodeId {
+pub(crate) fn rect(ctx: &mut Ctx, x: f32, y: f32, w: f32, h: f32, fill: Color, radius: f32) -> NodeId {
     ctx.add(Node::Rect { rect: Rect::new(x, y, w, h), fill, radius })
 }
 
-fn icon(ctx: &mut Ctx, x: f32, y: f32, g: char, size: f32, color: Color) -> NodeId {
+pub(crate) fn icon(ctx: &mut Ctx, x: f32, y: f32, g: char, size: f32, color: Color) -> NodeId {
     Glyph::new(g).size(size).color(color).at(x, y).emit(ctx)
 }
 
 /// A pressable area pushed as the parent of what is drawn in it; the
 /// caller pops it.
-fn area(ctx: &mut Ctx, r: Rect, radius: f32, fill: Color, hover: Color, on: impl Fn() + 'static) -> NodeId {
+pub(crate) fn area(ctx: &mut Ctx, r: Rect, radius: f32, fill: Color, hover: Color, on: impl Fn() + 'static) -> NodeId {
     let id = ctx.push(Node::Rect { rect: r, fill, radius });
     if ctx.is_hovered(id) || ctx.is_pressed(id) {
         let c = if ctx.is_pressed(id) { ctx.theme.state_pressed() } else { hover };
@@ -114,7 +120,7 @@ fn area(ctx: &mut Ctx, r: Rect, radius: f32, fill: Color, hover: Color, on: impl
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Look {
+pub(crate) enum Look {
     Ghost,
     Secondary,
     Primary,
@@ -122,7 +128,7 @@ enum Look {
 }
 
 /// A text button, 30 high at 100% text; returns its width.
-fn button(ctx: &mut Ctx, x: f32, y: f32, label: &str, look: Look, enabled: bool, on: impl Fn() + 'static) -> f32 {
+pub(crate) fn button(ctx: &mut Ctx, x: f32, y: f32, label: &str, look: Look, enabled: bool, on: impl Fn() + 'static) -> f32 {
     let t = ctx.theme;
     let (w, h) = (width(label, type_size::SM, Weight::Medium) + em(24.0), em(30.0));
     let (fill, hover, fg) = match look {
@@ -164,7 +170,7 @@ impl View for CuriaView {
         rect(ctx, 0.0, 0.0, side_w(), h, t.bg_surface(), 0.0);
         text(ctx, em(20.0), em(30.0), "Settings", type_size::LG, Weight::Semibold, t.text_primary());
         let now = self.which.get();
-        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Bluetooth, ph::BLUETOOTH, "Bluetooth"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps"), (Which::Personas, ph::USERS, "Personas")].into_iter().enumerate() {
+        for (i, (which, glyph, label)) in [(Which::Network, ph::WIFI_HIGH, "Network"), (Which::Bluetooth, ph::BLUETOOTH, "Bluetooth"), (Which::Display, ph::MONITOR, "Display"), (Which::Sound, ph::SPEAKER_HIGH, "Sound"), (Which::Devices, ph::USB, "Devices"), (Which::Apps, ph::SQUARES_FOUR, "Apps"), (Which::Personas, ph::USERS, "Personas"), (Which::Printers, ph::FILES, "Printers")].into_iter().enumerate() {
             let y = em(56.0) + i as f32 * em(38.0);
             let on = now == which;
             let sel = self.which.clone();
@@ -181,6 +187,7 @@ impl View for CuriaView {
             Which::Devices => self.devices(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Apps => self.apps(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
             Which::Personas => self.personas(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
+            Which::Printers => self.printers(ctx, side_w() + em(32.0), w - side_w() - em(64.0), h),
         }
     }
 }
@@ -1569,7 +1576,7 @@ mod tests {
         let mut p = NetPage::new();
         p.take_wants();
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p.clone()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Network settings are not available"));
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         p.apply(Got::Profiles(Ok(vec![Profile { ssid: b"home".to_vec(), open: false, wpa3_only: false, mac: "network".into(), auto: true, prio: 2, metered: false, manual: None }])));
@@ -1630,7 +1637,7 @@ mod tests {
         p.apply(Got::Status(Some(Status { link: Link::Wifi, online: Online::Unknown, metered: false, bars: Some(3), ssid: Some(b"home".to_vec()), portal: None })));
         let page = m!(p.clone());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), persona_field: m!(Default::default()), persona_scroll: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((960.0, 720.0)) };
+        let v = CuriaView { which: m!(Which::Network), page: page.clone(), devs: m!(DevPage::default()), dev_scroll: m!(Default::default()), disp: m!(DispPage::default()), disp_scroll: m!(Default::default()), sound: m!(SoundPage::default()), sound_scroll: m!(Default::default()), apps: m!(AppsPage::default()), apps_scroll: m!(Default::default()), bt: m!(BtPage::default()), bt_scroll: m!(Default::default()), bt_code: m!(Default::default()), persona_field: m!(Default::default()), persona_scroll: m!(Default::default()), net_fields: std::array::from_fn(|_| m!(Default::default())), net_scroll: m!(Default::default()), cred, size: m!((960.0, 720.0)), printers: m!(Default::default()), printers_scroll: m!(Default::default()), printer_fields: std::array::from_fn(|_| m!(Default::default())) };
         let mut app = pergola::App::new_with_flag(v, dirty.clone());
         let mut s = Model::default();
         let labels = |s: &Model| s.0.values().filter_map(|v| v.0.clone()).filter(|t| t.ends_with(" details")).collect::<Vec<_>>();
@@ -1662,7 +1669,7 @@ mod tests {
         p.edit_ip(atrium_netconf::Target::Wired("em0".into()));
         p.edit_error = Some("\"10.0.0.300\" is not an IPv4 address".into());
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Network), page: Mutable::new(p), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         let all = texts(&v);
         for want in ["IP settings", "home (Wi-Fi)", "Fixed: 10.0.0.5/24", "em0 (Ethernet)", "Automatic (DHCP)", "Use this address", "Automatic", "Close", "DNS servers", "9.9.9.9, encrypted (dns.quad9.net)", "\"10.0.0.300\" is not an IPv4 address"] {
             assert!(all.iter().any(|s| s == want), "{want} missing from {all:?}");
@@ -1682,7 +1689,7 @@ mod tests {
         use crate::display::{Got, Snapshot};
         use fresco_protocol::{WmDisplayMode, WmOutput, WmRect};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Display), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::new()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Asking Forum for the display settings…"));
         with_disp(&v.disp, |p| p.apply(Got::State(Err("forum-wm is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "forum-wm is not answering; trying again"));
@@ -1701,7 +1708,7 @@ mod tests {
     fn the_sound_page_shows_volume_outputs_and_apps() {
         use lyra_protocol::wire::{AppEntry, FromControl, Output, Role, VolumeMode};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Sound), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Asking choragusd for the sound settings…"));
         with_sound(&v.sound, |p| p.lost("choragusd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "choragusd is not running; trying again"));
@@ -1721,7 +1728,7 @@ mod tests {
         use crate::apps::Got;
         use portcullis_ipc::{AccessBy, AccessEntry};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Apps), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Asking which apps are installed…"));
         with_apps(&v.apps, |p| p.apply(Got::List(Err("portcullisd is not answering".into()))));
         assert!(texts(&v).iter().any(|s| s == "portcullisd is not answering; trying again"));
@@ -1746,7 +1753,7 @@ mod tests {
     fn the_bluetooth_page_shows_the_prompt_paired_and_nearby() {
         use vinculum_control::{Addr, DeviceInfo, Event};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Bluetooth), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Asking vinculumd for Bluetooth…"));
         with_bt(&v.bt, |p| p.lost("vinculumd is not running".into()));
         assert!(texts(&v).iter().any(|s| s == "vinculumd is not running; trying again"));
@@ -1770,7 +1777,7 @@ mod tests {
     fn the_devices_page_shows_nobodys_first() {
         use atrium_devices::{Device, Owner};
         let cred = CredentialField::wifi_passphrase(Mutable::new(Default::default()));
-        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)) };
+        let v = CuriaView { which: Mutable::new(Which::Devices), page: Mutable::new(NetPage::new()), devs: Mutable::new(DevPage::default()), dev_scroll: Mutable::new(Default::default()), disp: Mutable::new(DispPage::default()), disp_scroll: Mutable::new(Default::default()), sound: Mutable::new(SoundPage::default()), sound_scroll: Mutable::new(Default::default()), apps: Mutable::new(AppsPage::default()), apps_scroll: Mutable::new(Default::default()), bt: Mutable::new(BtPage::default()), bt_scroll: Mutable::new(Default::default()), bt_code: Mutable::new(Default::default()), persona_field: Mutable::new(Default::default()), persona_scroll: Mutable::new(Default::default()), net_fields: std::array::from_fn(|_| Mutable::new(Default::default())), net_scroll: Mutable::new(Default::default()), cred, size: Mutable::new((960.0, 720.0)), printers: Mutable::new(Default::default()), printers_scroll: Mutable::new(Default::default()), printer_fields: std::array::from_fn(|_| Mutable::new(Default::default())) };
         assert!(texts(&v).iter().any(|s| s == "Asking which devices this machine has…"));
         let d = |n: &str, ids: &str, owner| Device { name: n.into(), id: 1, bus: "usb".into(), parent: "uhub0".into(), ids: ids.into(), owner };
         with_devs(&v.devs, |p| p.apply(Ok(vec![

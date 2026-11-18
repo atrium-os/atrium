@@ -11,7 +11,7 @@
 //!   boot()        → request jaild to launch vestibulum (the login UI), full-screen
 //!   authenticate  → (pam; stubbed here) credential → human uid
 //!   login(human)  → bind the seat (`portcullis_peer::seat`) + launch the session
-//!                   layer (forum-wm + forum-bar + forum-dock for GUI;
+//!                   layer (forum-wm + forum-bar + forum-dock + prelum-status for GUI;
 //!                   a zsh console-shell for CLI)
 //!   logout()      → tear the session down + unbind the seat → back to vestibulum
 //!
@@ -112,6 +112,9 @@ fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
             spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify", "media-control", "audio-control"]),
             spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control", "audio-control", "media-control", "removable-media", "session-lock"]),
             spec("org.atrium.forum-dock", human, "forum-dock", &[], vec!["graphics", "forum-control"]),
+            // Printing's status item and notices (printing.md §6.6): no
+            // window, no graphics; prelumd knows it by this app id.
+            spec("org.atrium.prelum-status", human, "prelum-status", &[], vec!["status-item", "notify"]),
         ],
         // Display-down fallback: a login zsh in the human's session jail (the
         // decided shell; the jail is the boundary, not a custom shell). No Forum.

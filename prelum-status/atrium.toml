@@ -1,0 +1,25 @@
+# prelumd's face while a job prints (docs/spec/printing.md §6.6): a Forum
+# status item while any job is active (printer, page N of M, Cancel) and
+# Praeco notices when a job needs the person or ends badly. A session
+# component, one per person, with no window. prelumd knows it by this app
+# id in the launch registry and gives it the person's jobs, their printers'
+# names, Cancel and Release, nothing else.
+[app]
+id          = "org.atrium.prelum-status"
+name        = "Printing"
+version     = "0.1.0"
+entry       = "bin/prelum-status"
+description = "Shows what is printing in the bar, and tells you when a printer needs you."
+icon        = "files"
+
+[capabilities]
+status-item = true
+notify      = true
+network     = "none"
+# Limen roles it embeds. Without this key a platform bundle keeps every role.
+embeds = []
+
+[supervision]
+restart    = "on-crash"
+keep-alive = true
+instances  = "single"
