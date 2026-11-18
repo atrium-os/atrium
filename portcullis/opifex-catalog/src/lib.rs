@@ -515,6 +515,28 @@ impl Log {
     /// A third-party catalog's log: apps from publisher records only.
     pub fn third_party(dir: &Path) -> Log { Log { dir: dir.to_path_buf(), third_party: true } }
 
+    /// For the publishing tools: a catalog whose root.toml names no platform
+    /// key is a third-party one. (Machines don't guess: they know which
+    /// catalog is the system's.)
+    pub fn for_dir(dir: &Path) -> Result<Log, String> {
+        let l = Log::open(dir);
+        let third = l.root()?.with_role("platform").next().is_none();
+        Ok(Log { third_party: third, ..l })
+    }
+
+    /// Replay every entry, as a machine would: the releases, yanks and
+    /// publishers as of the end of the log.
+    pub fn replay(&self) -> Result<Local, String> {
+        let root = self.root()?;
+        let mut local = Local { name: root.name.clone(), ..Local::default() };
+        let mut seen = HashSet::new();
+        for (i, e) in self.entries()?.iter().enumerate() {
+            let e = Entry::parse(e).map_err(|m| format!("entry {i}: {m}"))?;
+            apply(&e, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {i}: {m}"))?;
+        }
+        Ok(local)
+    }
+
     pub fn root(&self) -> Result<Root, String> {
         Root::parse(&fs::read_to_string(self.dir.join(ROOT)).map_err(|e| format!("{ROOT}: {e}"))?)
     }
@@ -546,12 +568,9 @@ impl Log {
         let root = self.root()?;
         let mut all = self.entries()?;
         // Replay what is there, exactly as a machine will, then the new ones.
-        let mut local = Local::default();
-        let mut seen = HashSet::new();
-        for (i, e) in all.iter().enumerate() {
-            let e = Entry::parse(e).map_err(|m| format!("entry {i}: {m}"))?;
-            apply(&e, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {i}: {m}"))?;
-        }
+        let mut local = self.replay()?;
+        let mut seen: HashSet<(String, String, String, String)> = local.releases.iter()
+            .map(|r| (r.kind.clone(), r.id.clone(), r.version.clone(), r.arch.clone())).collect();
         for e in new {
             apply(e, &root, self.third_party, &mut local, &mut seen)?;
             all.push(e.bytes());
