@@ -467,6 +467,9 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             if rect.r0 > rect.r1 {
                 return Err("There is nothing under the header to sort.".into());
             }
+            if d.wb.merges_in(&rect).next().is_some() {
+                return Err("Unmerge the merged cells in the range before sorting it.".into());
+            }
             let key = col.clamp(rect.c0, rect.c1);
             let descending = cmd == DataCmd::SortDesc;
             match sort_op(&d.wb, rect, &[SortKey { col: key, descending }]) {
@@ -719,6 +722,9 @@ mod tests {
         assert_eq!(d.wb.merges(0), &[Rect { sheet: 0, r0: 1, c0: 0, r1: 2, c1: 1 }]);
         assert_eq!(cell(&d, 1, 0), before.0);
         assert_eq!(cell(&d, 1, 1), "");
+        // Sorting across it is refused.
+        run(&mut d, one(3, 0), (3, 0), DataCmd::SortAsc);
+        assert!(d.status.starts_with("Unmerge the merged cells"), "{}", d.status);
         // The cursor in it offers Unmerge.
         let titles = menu(&d, one(2, 1), (2, 1)).into_iter().map(|(m, _)| m.label).collect::<Vec<_>>();
         assert!(titles.iter().any(|t| t == "Unmerge Cells"), "{titles:?}");
