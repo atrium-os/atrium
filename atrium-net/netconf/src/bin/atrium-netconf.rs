@@ -74,8 +74,26 @@ impl std::io::Read for WithFds<'_> {
 }
 
 impl Peer {
+    /// Connects to atrium-net's control socket, waiting for it while
+    /// atrium-net is not up yet (at boot it may still be waiting for a port):
+    /// rc no longer waits for us (fast-boot.md §4.2), and dying here would
+    /// only have daemon(8) restart us every 2 s. Our own sockets are already
+    /// listening, so apps that connect meanwhile wait in the backlog.
     fn connect(p: &str) -> Peer {
-        let s = UnixStream::connect(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+        use std::io::ErrorKind::{ConnectionRefused, NotFound};
+        let mut pause = Duration::from_millis(5);
+        let mut said = false;
+        let s = loop {
+            match UnixStream::connect(p) {
+                Ok(s) => break s,
+                Err(e) if matches!(e.kind(), NotFound | ConnectionRefused) => {
+                    if !said { eprintln!("atrium-netconf: waiting for {p} ({e})"); said = true; }
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(500));
+                }
+                Err(e) => die(&format!("{p}: {e}")),
+            }
+        };
         Peer { s, r: Reader::default(), pending: Vec::new(), fds: Vec::new() }
     }
 

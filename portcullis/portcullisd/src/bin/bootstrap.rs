@@ -42,6 +42,36 @@ const DEFAULT_SOCKET: &str = "/var/run/atrium/jaild.sock";
 const DEFAULT_SVCDIR: &str = "/etc/atrium/services.d";
 const DEFAULT_VOLUMES_SOCKET: &str = "/var/run/atrium/atrium-volumes.sock";
 
+/// How long to wait for jaild's and atrium-volumes' sockets at boot.
+const JAILD_WAIT:   Duration = Duration::from_secs(30);
+const VOLUMES_WAIT: Duration = Duration::from_secs(10);
+
+/// Connect with `f`, retrying while the service is not up yet (its socket
+/// does not exist, or exists but nobody listens) until `budget` runs out.
+/// Retries start at 5 ms and back off to 100 ms, so a service that comes up
+/// in 30 ms costs about 30 ms, not a fixed sleep.
+fn connect_when_up<T>(what: &str, budget: Duration,
+                      mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    let start = std::time::Instant::now();
+    let mut pause = Duration::from_millis(5);
+    let mut said = false;
+    loop {
+        match f() {
+            Ok(c) => {
+                if said { info!("{what} is up after {} ms", start.elapsed().as_millis()); }
+                return Ok(c);
+            }
+            Err(e) if matches!(e.kind(), NotFound | ConnectionRefused) && start.elapsed() < budget => {
+                if !said { info!("waiting for {what} ({e})"); said = true; }
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn usage() -> ExitCode {
     eprintln!("\
 usage:
@@ -136,7 +166,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let client = match Client::connect(&socket_path) {
+    /* jaild and atrium-volumes are started by rc just before us and
+     * daemonize, so their sockets appear a moment later (fast-boot.md
+     * §4.2). Wait for them here, in our own process, instead of in the rc
+     * script, so rc is not blocked. */
+    let client = match connect_when_up("jaild", JAILD_WAIT, || Client::connect(&socket_path)) {
         Ok(c) => c,
         Err(e) => {
             error!("connect jaild socket {}: {e}", socket_path.display());
@@ -148,14 +182,18 @@ fn main() -> ExitCode {
      * `[[volumes]]` of `kind = "persistent"` will fail; tmpfs
      * still works (no allocator needed). */
     let mut volumes = match &volumes_socket {
-        Some(path) => match volumes_client::Client::connect(path) {
+        Some(path) => match connect_when_up("atrium-volumes", VOLUMES_WAIT,
+                                            || volumes_client::Client::connect(path)) {
             Ok(c) => {
                 info!("connected to atrium-volumes at {}", path.display());
                 Some(c)
             }
+            /* Storage is optional (the rc script's old rule): without it,
+             * only manifests with persistent volumes fail to launch. */
             Err(e) => {
-                error!("connect atrium-volumes socket {}: {e}", path.display());
-                return ExitCode::FAILURE;
+                warn!("atrium-volumes at {} not reachable ({e}); starting without storage",
+                    path.display());
+                None
             }
         },
         None => None,

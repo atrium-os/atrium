@@ -1,6 +1,7 @@
 #!/bin/sh
 # PROVIDE: atrium_portcullisd_bootstrap
-# REQUIRE: FILESYSTEMS atrium_jaild atrium_volumes portcullisd
+# REQUIRE: FILESYSTEMS atrium_jaild atrium_volumes
+# BEFORE: netif
 # KEYWORD: shutdown
 #
 # atrium-portcullisd-bootstrap — system-service launcher and
@@ -60,35 +61,14 @@ atrium_portcullisd_bootstrap_prepare_dirs() {
 atrium_portcullisd_bootstrap_start() {
     atrium_portcullisd_bootstrap_prepare_dirs
 
-    if [ ! -S "${atrium_portcullisd_bootstrap_jaild_socket}" ]; then
-        err 1 "jaild socket missing; is atrium_jaild running?"
-    fi
-
-    # Storage (atrium-volumes) is OPTIONAL. The memory governors and
-    # session apps don't need it; only services that declare volumes
-    # do. If the socket is configured empty/NO/none, or the configured
-    # path doesn't exist, run without storage (pass an empty
-    # --volumes-socket, which the bootstrap binary treats as "no
-    # volume backend"). Only services that actually request a volume
-    # will then fail — by design.
+    # jaild and atrium-volumes start just before us and daemonize, so their
+    # sockets appear a moment later. The bootstrap binary waits for them
+    # itself (jaild up to 30 s, volumes up to 10 s, then without storage), so
+    # rc is not held here (docs/spec/fast-boot.md §4.2). Storage stays
+    # optional: an empty/NO/none socket runs without it.
     _vol="${atrium_portcullisd_bootstrap_volumes_socket}"
     case "${_vol}" in
-        ""|NO|no|none|NONE)
-            _vol="" ;;
-        *)
-            # atrium-volumes runs earlier in rcorder but daemonizes, so its
-            # socket appears asynchronously. A single immediate check lost that
-            # race on every boot and started bootstrap WITHOUT storage — every
-            # manifest with a persistent volume was skipped ("allocator
-            # unavailable"). Wait for it, bounded.
-            _i=0
-            while [ ! -S "${_vol}" ] && [ ${_i} -lt 20 ]; do
-                sleep 0.5; _i=$((_i + 1))
-            done
-            if [ ! -S "${_vol}" ]; then
-                warn "atrium-volumes socket ${_vol} missing after 10s; starting without storage"
-                _vol=""
-            fi ;;
+        ""|NO|no|none|NONE) _vol="" ;;
     esac
 
     echo "Starting ${name}."
@@ -114,9 +94,9 @@ atrium_portcullisd_bootstrap_stop() {
     # leak until atrium_jaild restarts and runs orphan
     # reconciliation, OR the operator umounts manually.
     kill -TERM "${pid}" 2>/dev/null
-    for _ in 1 2 3 4 5; do
-        if kill -0 "${pid}" 2>/dev/null; then sleep 1; else break; fi
-    done
+    # pwait returns the moment it exits (a `sleep 1` loop cost a full second
+    # per script at every shutdown: fast-boot.md §2.0).
+    pwait -t 5 "${pid}" 2>/dev/null
     if kill -0 "${pid}" 2>/dev/null; then
         echo "Force-killing ${name}."
         kill -KILL "${pid}" 2>/dev/null

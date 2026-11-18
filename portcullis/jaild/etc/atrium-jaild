@@ -83,13 +83,9 @@ atrium_jaild_stop() {
     # daemon(8) removes the pidfile automatically when our child
     # exits, so re-`cat` will fail mid-loop. Cache `${pid}` once
     # and use kill -0 ${pid} as the liveness check.
-    for _ in 1 2 3 4 5; do
-        if kill -0 "${pid}" 2>/dev/null; then
-            sleep 1
-        else
-            break
-        fi
-    done
+    # pwait returns the moment it exits (a `sleep 1` loop cost a full second
+    # per script at every shutdown: fast-boot.md §2.0).
+    pwait -t 5 "${pid}" 2>/dev/null
     if kill -0 "${pid}" 2>/dev/null; then
         echo "Force-killing ${name}."
         kill -KILL "${pid}" 2>/dev/null
