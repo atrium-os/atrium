@@ -37,6 +37,26 @@ impl<T: Http + ?Sized> Http for Box<T> {
     }
 }
 
+/// What the engine does with a JMAP account, here or in the `sync`
+/// worker (remote.rs).
+pub trait Jmap {
+    fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report>;
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> Result<String>;
+    fn can_hold(&self, secs: i64) -> bool;
+}
+
+impl<H: Http> Jmap for Client<H> {
+    fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
+        Client::sync(self, sink)
+    }
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> Result<String> {
+        Client::send(self, message, from, rcpts, send_at)
+    }
+    fn can_hold(&self, secs: i64) -> bool {
+        Client::can_hold(self, secs)
+    }
+}
+
 /// How a push watch ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pushed {
@@ -66,7 +86,7 @@ impl From<jmap::Error> for Error {
     }
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Messages per request, and the most read of one mailbox on the first sync
 /// (newest first; older ones come with search, §6.4).

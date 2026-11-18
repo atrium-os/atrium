@@ -50,6 +50,12 @@ pub enum Call {
     /// Send one message on a submission session (instead of `Start`; the
     /// worker ends after it). Answers [`Reply::Submitted`].
     Submit { from: String, rcpts: Vec<String>, bytes: Vec<u8>, hold_for: Option<u64> },
+    /// A JMAP account (instead of `Start`): read its session at `url`, the
+    /// HTTP asked of the engine ([`SinkCall::Get`], [`SinkCall::Post`]).
+    /// Answers [`Reply::JmapReady`].
+    JmapConnect { url: String },
+    JmapSync,
+    JmapSend { message: Vec<u8>, from: String, rcpts: Vec<String>, send_at: Option<i64> },
 }
 
 /// What [`Error`] was, across the wire.
@@ -71,6 +77,9 @@ pub enum Reply {
     Idled(bool),
     LoggedOut,
     Submitted(std::result::Result<crate::submit::Sent, crate::submit::SendError>),
+    /// The session's `maxDelayedSend` (seconds).
+    JmapReady { max_delayed_send: u64 },
+    JmapSent(std::result::Result<String, String>),
     Failed(Kind, String),
 }
 
@@ -92,6 +101,9 @@ pub enum SinkCall {
     SetServerState(String, String),
     Listed(String),
     ServerIdAt(String, u32),
+    /// JMAP's HTTP, which the engine does through Arca's courier.
+    Get { url: String, max: u64 },
+    Post { url: String, content_type: String, body: Vec<u8>, max: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +115,7 @@ pub enum SinkAnswer {
     Changes(Vec<Change>),
     Text(Option<String>),
     Listed(Vec<(String, u32)>),
+    Body(std::result::Result<Vec<u8>, String>),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -335,11 +348,30 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
     }
 }
 
+/// JMAP's HTTP, inside the worker: asked of the engine.
+struct RemoteHttp<R: Read, W: Write>(Shared<R, W>);
+
+impl<R: Read, W: Write> crate::jmap::Http for RemoteHttp<R, W> {
+    fn get(&mut self, url: &str, max: usize) -> std::result::Result<Vec<u8>, String> {
+        match RemoteSink(self.0.clone()).ask(SinkCall::Get { url: url.into(), max: max as u64 })? {
+            SinkAnswer::Body(b) => b.and_then(|b| if b.len() > max { Err("the answer is too large".into()) } else { Ok(b) }),
+            _ => Err("a wrong answer".into()),
+        }
+    }
+    fn post(&mut self, url: &str, content_type: &str, body: &[u8], max: usize) -> std::result::Result<Vec<u8>, String> {
+        match RemoteSink(self.0.clone()).ask(SinkCall::Post { url: url.into(), content_type: content_type.into(), body: body.to_vec(), max: max as u64 })? {
+            SinkAnswer::Body(b) => b.and_then(|b| if b.len() > max { Err("the answer is too large".into()) } else { Ok(b) }),
+            _ => Err("a wrong answer".into()),
+        }
+    }
+}
+
 /// The `sync` worker's main: serve calls on `r`/`w` until the engine
 /// closes them or after `Logout`.
 pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
     let chan: Shared<R, W> = std::rc::Rc::new(std::cell::RefCell::new(Chan { r, w, wire: VecDeque::new(), eof: false, timeouts: 0 }));
     let mut session: Option<Session<Tunnel<R, W>>> = None;
+    let mut jmap: Option<crate::jmap::Client<RemoteHttp<R, W>>> = None;
     loop {
         let next = {
             let mut c = chan.borrow_mut();
@@ -362,6 +394,36 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Some(_) => return Err(bad("not a call")),
             }
         };
+        // JMAP calls, for a worker that connected to a JMAP account.
+        let next = match next {
+            Call::JmapConnect { url } if session.is_none() && jmap.is_none() => {
+                let reply = match crate::jmap::Client::connect(RemoteHttp(chan.clone()), &url) {
+                    Ok(c) => {
+                        let r = Reply::JmapReady { max_delayed_send: c.session.max_delayed_send };
+                        jmap = Some(c);
+                        r
+                    }
+                    Err(e) => Reply::Failed(Kind::Protocol, e.0),
+                };
+                write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
+                continue;
+            }
+            Call::JmapSync | Call::JmapSend { .. } => {
+                let reply = match (next, jmap.as_mut()) {
+                    (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
+                    (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
+                    (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
+                    _ => unreachable!(),
+                };
+                write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
+                continue;
+            }
+            Call::JmapConnect { .. } => {
+                write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&Reply::Failed(Kind::Protocol, "already started".into()))?)?;
+                continue;
+            }
+            other => other,
+        };
         let reply = match (next, session.as_mut()) {
             (Call::Start, None) => match Session::start(Tunnel(chan.clone())) {
                 Ok(s) => {
@@ -378,6 +440,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
             (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. }, _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -462,18 +525,22 @@ pub const QUIET: Duration = Duration::from_secs(120);
 /// The session in the `sync` worker: the engine relays the courier's
 /// bytes and answers the store calls.
 pub struct Remote<I: Write + AsFd, O: Read + AsFd> {
-    courier: std::os::unix::net::UnixStream,
+    /// The IMAP or submission courier; none for JMAP, whose HTTP the
+    /// worker asks of `http`.
+    courier: Option<std::os::unix::net::UnixStream>,
+    http: Option<Box<dyn crate::jmap::Http>>,
     to_worker: I,
     from_worker: O,
     caps: Vec<String>,
     gone: bool,
+    max_delayed_send: u64,
 }
 
 impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// Start the session in the worker (`to_worker` is its standard input,
     /// `from_worker` its output) over `courier`.
     pub fn start(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O) -> Result<Remote<I, O>> {
-        let mut r = Remote { courier, to_worker, from_worker, caps: Vec::new(), gone: false };
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
         match r.call(&Call::Start, None, QUIET)? {
             Reply::Started { caps } => r.caps = caps,
             other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
@@ -485,7 +552,7 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// the worker ends).
     pub fn submit(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O, o: &crate::submit::Outgoing<'_>) -> std::result::Result<crate::submit::Sent, crate::submit::SendError> {
         use crate::submit::SendError;
-        let mut r = Remote { courier, to_worker, from_worker, caps: Vec::new(), gone: false };
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
         let c = Call::Submit { from: o.from.into(), rcpts: o.rcpts.to_vec(), bytes: o.bytes.to_vec(), hold_for: o.hold_for };
         match r.call(&c, None, QUIET) {
             Ok(Reply::Submitted(x)) => x,
@@ -495,17 +562,31 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
         }
     }
 
+    /// A JMAP account in the worker: its session at `url`, the HTTP done
+    /// here with `http` (the courier's).
+    pub fn connect_jmap(http: Box<dyn crate::jmap::Http>, to_worker: I, from_worker: O, url: &str) -> Result<Remote<I, O>> {
+        let mut r = Remote { courier: None, http: Some(http), to_worker, from_worker, caps: Vec::new(), gone: true, max_delayed_send: 0 };
+        match r.call(&Call::JmapConnect { url: url.into() }, None, QUIET)? {
+            Reply::JmapReady { max_delayed_send } => r.max_delayed_send = max_delayed_send,
+            Reply::Failed(k, t) => return Err(error_of(k, t)),
+            other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
+        }
+        Ok(r)
+    }
+
     /// One call: relay until its reply.
     fn call(&mut self, call: &Call, mut sink: Option<&mut dyn Sink>, wait: Duration) -> Result<Reply> {
         let b = enc(call)?;
         write_frame(&mut self.to_worker, CALL, &b)?;
         let mut buf = vec![0u8; 16 * 1024];
         loop {
+            let courier_fd = self.courier.as_ref().map_or(-1, |c| c.as_raw_fd());
             let mut fds = [
                 libc::pollfd { fd: self.from_worker.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: self.courier.as_raw_fd(), events: if self.gone { 0 } else { libc::POLLIN }, revents: 0 },
+                libc::pollfd { fd: courier_fd, events: if self.gone { 0 } else { libc::POLLIN }, revents: 0 },
             ];
-            let ms = wait.as_millis().min(i32::MAX as u128) as i32;
+            // A JMAP worker's wait is the HTTP's, not a courier's.
+            let ms = if self.courier.is_some() { wait.as_millis().min(i32::MAX as u128) as i32 } else { -1 };
             let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
             if n < 0 {
                 let e = io::Error::last_os_error();
@@ -521,11 +602,26 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
             if fds[0].revents != 0 {
                 let (k, b) = read_frame(&mut self.from_worker)?.ok_or_else(|| Error::Protocol("the sync worker ended".into()))?;
                 match k {
-                    WIRE => self.courier.write_all(&b)?,
+                    WIRE => match self.courier.as_mut() {
+                        Some(c) => c.write_all(&b)?,
+                        None => return Err(Error::Protocol("server bytes for a JMAP worker".into())),
+                    },
                     REPLY => return Ok(dec(&b)?),
                     SINK => {
-                        let Some(s) = sink.as_deref_mut() else { return Err(Error::Protocol("a store call outside sync".into())) };
-                        let a = answer(s, dec(&b)?);
+                        let a = match dec::<SinkCall>(&b)? {
+                            SinkCall::Get { url, max } => match self.http.as_mut() {
+                                Some(h) => SinkAnswer::Body(h.get(&url, max.min(FRAME_MAX as u64) as usize)),
+                                None => return Err(Error::Protocol("HTTP asked of an IMAP worker".into())),
+                            },
+                            SinkCall::Post { url, content_type, body, max } => match self.http.as_mut() {
+                                Some(h) => SinkAnswer::Body(h.post(&url, &content_type, &body, max.min(FRAME_MAX as u64) as usize)),
+                                None => return Err(Error::Protocol("HTTP asked of an IMAP worker".into())),
+                            },
+                            c => {
+                                let Some(s) = sink.as_deref_mut() else { return Err(Error::Protocol("a store call outside sync".into())) };
+                                answer(s, c)
+                            }
+                        };
                         write_frame(&mut self.to_worker, ANSWER, &enc(&a)?)?;
                     }
                     _ => return Err(Error::Protocol("a frame the worker doesn't send".into())),
@@ -533,7 +629,8 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
                 continue;
             }
             if fds[1].revents != 0 {
-                match self.courier.read(&mut buf) {
+                let Some(c) = self.courier.as_mut() else { continue };
+                match c.read(&mut buf) {
                     Ok(0) | Err(_) => {
                         self.gone = true;
                         write_frame(&mut self.to_worker, EOF, &[])?;
@@ -570,6 +667,7 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::SetServerState(k, v) => SinkAnswer::Done(s.set_server_state(&k, &v)),
         SinkCall::Listed(id) => SinkAnswer::Listed(s.listed(&id)),
         SinkCall::ServerIdAt(f, u) => SinkAnswer::Text(s.server_id_at(&f, u)),
+        SinkCall::Get { .. } | SinkCall::Post { .. } => SinkAnswer::Body(Err("no HTTP here".into())),
     }
 }
 
@@ -598,5 +696,28 @@ impl<I: Write + AsFd, O: Read + AsFd> Imap for Remote<I, O> {
     }
     fn logout(&mut self) -> Result<()> {
         self.reply(&Call::Logout, None, QUIET, |r| (r == Reply::LoggedOut).then_some(()))
+    }
+}
+
+impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
+    fn sync(&mut self, sink: &mut dyn Sink) -> crate::jmap::Result<Report> {
+        match self.call(&Call::JmapSync, Some(sink), QUIET) {
+            Ok(Reply::Synced(r)) => Ok(r),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
+    }
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> crate::jmap::Result<String> {
+        let c = Call::JmapSend { message: message.to_vec(), from: from.into(), rcpts: rcpts.to_vec(), send_at };
+        match self.call(&c, None, QUIET) {
+            Ok(Reply::JmapSent(r)) => r.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
+    }
+    fn can_hold(&self, secs: i64) -> bool {
+        secs > 0 && (secs as u64) <= self.max_delayed_send
     }
 }

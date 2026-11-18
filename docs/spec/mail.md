@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP sync runs in a jailed worker.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1395,12 +1395,16 @@ Stalwart in the cloud VM, and later a real account):
    before. Tests: the wire 3 (the same store calls as in-process, APPEND, IDLE with news
    and with a passed wait, a dead worker is an error), Dovecot 1 (two passes with sync
    in the worker; the whole Dovecot suite passes that way too). **Not yet**: one uid per
-   account (workers have one uid per app worker, not per account); JMAP still parses
-   its answers in Mail's process; the engine is not yet a process of its own apart from
+   account (workers have one uid per app worker, not per account); the engine is not yet a process of its own apart from
    the window. *Sending* went the same way the same day: each message goes out over a
    submission courier whose replies the worker reads (`Call::Submit`, one message per
    worker, which then ends); a refusal comes back as the same error as before. Tests:
-   the wire 1 (sent, and a refused sender), and the Dovecot sends through the worker.
+   the wire 1 (sent, and a refused sender), and the Dovecot sends through the worker. *JMAP* followed: the worker runs the JMAP client and reads every JSON answer,
+   and asks Mail for each HTTP exchange (`SinkCall::Get`/`Post`), which Mail makes
+   through Arca's courier as before, so the worker still has no network and no token.
+   Sync and sending go through it; the EventSource watch still runs in Mail's process
+   (it only reads state-change events). Tests: the wire 1 (the same session, errors and
+   HTTP exchanges as in-process), and the engine's JMAP suite passes through the worker.
 
 ## 17. Decisions, with recommendations
 
