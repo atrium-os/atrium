@@ -27,6 +27,7 @@ pub mod pictures;
 pub mod send;
 pub mod senders;
 pub mod later;
+pub mod quick;
 pub mod notify;
 pub mod smime;
 pub mod accounts;

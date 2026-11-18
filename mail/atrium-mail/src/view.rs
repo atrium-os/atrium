@@ -305,6 +305,8 @@ pub struct Ui {
     pub undo: Option<Undo>,
     /// Bumped whenever the index may have changed, to drop cached rows.
     pub gen: u64,
+    /// The quick filters on (§11.7; `mail_engine::quick` bits).
+    pub quick: u16,
     pub error: Option<String>,
 }
 
@@ -324,6 +326,11 @@ pub struct Mail {
     pub engine: Rc<Engine>,
     pub ui: Mutable<Ui>,
     pages: Rc<RefCell<Pages>>,
+    /// The chosen folder's rows that pass the quick filters, for one
+    /// (gen, folder, conversations, filters).
+    filtered: Rc<RefCell<Option<((u64, FolderId, bool, u16), Rc<Vec<ListRow>>)>>>,
+    /// The chips' height as last drawn, above the list.
+    chips_h: Rc<std::cell::Cell<f32>>,
     /// The list's scroll, to keep the cursor in view on j/k.
     list: Mutable<ScrollState>,
     reader: Mutable<ScrollState>,
@@ -417,6 +424,9 @@ impl Mail {
             });
         }
         let folder = ui.folder?;
+        if ui.quick != 0 {
+            return self.filtered_rows(folder, ui.conversations, ui.quick).get(i).cloned();
+        }
         let mut p = self.pages.borrow_mut();
         if p.gen != ui.gen || p.folder != Some(folder) {
             *p = Pages { gen: ui.gen, folder: Some(folder), pages: HashMap::new() };
@@ -429,7 +439,57 @@ impl Mail {
         p.pages.get(&page).and_then(|r| r.get(i % PAGE)).cloned()
     }
 
+    /// The rows of `folder` that pass `quick`, newest first (at most
+    /// [`mail_engine::quick::SCAN_MAX`] rows looked through).
+    fn filtered_rows(&self, folder: FolderId, conversations: bool, quick: u16) -> Rc<Vec<ListRow>> {
+        let key = (self.ui.get_cloned().gen, folder, conversations, quick);
+        if let Some((k, rows)) = &*self.filtered.borrow() {
+            if *k == key {
+                return rows.clone();
+            }
+        }
+        let mut q = self.engine.quick(quick);
+        let mut out = Vec::new();
+        for page in 0..mail_engine::quick::SCAN_MAX.div_ceil(PAGE) {
+            let rows = self.read_page(folder, conversations, page);
+            let last = rows.len() < PAGE;
+            out.extend(rows.into_iter().filter(|r| q.passes(r.msg, r.thread, r.unread, r.flagged)));
+            if last {
+                break;
+            }
+        }
+        let rows = Rc::new(out);
+        *self.filtered.borrow_mut() = Some((key, rows.clone()));
+        rows
+    }
+
+    /// Where the list's first row starts, as last drawn: under the
+    /// heading and the quick-filter chips.
+    pub fn list_top(&self) -> f32 {
+        head_h() + self.chips_h.get()
+    }
+
+    /// Turn quick filter `bit` on or off (§11.7).
+    pub fn toggle_quick(&self, bit: u16) {
+        let mut ui = self.ui.get_cloned();
+        ui.quick ^= bit;
+        ui.gen += 1;
+        self.ui.set(ui.clone());
+        ui.count = ui.folder.map_or(0, |f| self.count_with(f, ui.conversations, ui.quick));
+        ui.cursor = None;
+        ui.reading = None;
+        self.ui.set(ui);
+        self.list.set(ScrollState::default());
+    }
+
     fn count_of(&self, folder: FolderId, conversations: bool) -> usize {
+        self.count_with(folder, conversations, self.ui.get_cloned().quick)
+    }
+
+    fn count_with(&self, folder: FolderId, conversations: bool, quick: u16) -> usize {
+        if quick != 0 {
+            return self.filtered_rows(folder, conversations, quick).len();
+        }
         let s = &self.engine.store;
         if conversations { s.conversation_count(folder) } else { s.count(folder) }.unwrap_or(0)
     }
@@ -1772,7 +1832,7 @@ impl Mail {
         };
         if ui.cursor != Some(next) {
             self.open(next);
-            let shown = self.size.get().1 - head_h();
+            let shown = self.size.get().1 - head_h() - self.chips_h.get();
             VirtualList::reveal(&self.list, next, ui.count, row_h(), shown);
         }
         true
@@ -1978,6 +2038,8 @@ impl MailView {
             size: ui.sibling(size),
             ui,
             pages: Rc::default(),
+            filtered: Rc::default(),
+            chips_h: Rc::default(),
             now: Rc::new(now),
             dark: Rc::default(),
             loads: Rc::default(),
@@ -2215,6 +2277,36 @@ impl MailView {
         ctx.pop();
     }
 
+    /// The quick-filter chips under the list's header, wrapped to the
+    /// list's width: their height.
+    fn chips(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32) -> f32 {
+        let t = ctx.theme;
+        let (ch, gap) = (em(24.0), em(6.0));
+        let (mut x, mut y) = (x0 + 12.0, head_h() + em(4.0));
+        for (bit, label) in mail_engine::quick::CHIPS {
+            let lw = width(label, type_size::XS, Weight::Medium) + em(20.0);
+            if x + lw > x0 + w - 12.0 && x > x0 + 12.0 {
+                x = x0 + 12.0;
+                y += ch + gap;
+            }
+            let on = ui.quick & bit != 0;
+            let r = Rect::new(x, y, lw, ch);
+            ctx.add(Node::Rect { rect: Rect::new(r.x() - 1.0, r.y() - 1.0, r.w() + 2.0, r.h() + 2.0), fill: if on { t.accent_fg() } else { t.border_default() }, radius: ch / 2.0 + 1.0 });
+            let m = self.mail.clone();
+            let id = ctx.push(Node::Rect { rect: r, fill: if on { t.selection_bg() } else { t.bg_canvas() }, radius: ch / 2.0 });
+            if !on && ctx.is_hovered(id) {
+                if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                    *fill = t.state_hover();
+                }
+            }
+            ctx.on_click(id, move || m.toggle_quick(bit));
+            text(ctx, x + em(10.0), y + ch / 2.0, label, type_size::XS, Weight::Medium, if on { t.text_primary() } else { t.text_secondary() });
+            ctx.pop();
+            x += lw + gap;
+        }
+        y + ch + em(8.0) - head_h()
+    }
+
     fn list(&self, ctx: &mut Ctx, ui: &Ui, x0: f32, w: f32, h: f32) {
         let t = ctx.theme;
         rect(ctx, Rect::new(x0 + w - 1.0, 0.0, 1.0, h), t.border_default());
@@ -2267,8 +2359,12 @@ impl MailView {
             }
         }
         text(ctx, x0 + 16.0, head_h() / 2.0, &fit(&title, type_size::LG, Weight::Semibold, sw_x - x0 - 24.0), type_size::LG, Weight::Semibold, t.text_primary());
+        // Quick filters (§11.7): chips under the header, combinable.
+        let chips = if ui.folder.is_some() && ui.search.is_none() { self.chips(ctx, ui, x0, w) } else { 0.0 };
+        self.mail.chips_h.set(chips);
+        let top = head_h() + chips;
         if let Some(e) = &ui.error {
-            text(ctx, x0 + 16.0, head_h() + em(20.0), &fit(e, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.danger_fg());
+            text(ctx, x0 + 16.0, top + em(20.0), &fit(e, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.danger_fg());
             return;
         }
         if ui.count == 0 {
@@ -2282,19 +2378,20 @@ impl MailView {
                         Lane::NewSenders => "No one new is waiting",
                         Lane::ScreenedOut => "Nothing screened out",
                     };
-                    text(ctx, x0 + 16.0, head_h() + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
+                    text(ctx, x0 + 16.0, top + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
                 }
                 Some(s) if s.query.trim().is_empty() => {
                     let tips = ["Words anywhere, or from: to: subject:", "has:attachment  is:unread  is:flagged  in:archive", "before:2026-01-31  after:  larger:5M  smaller:"];
                     for (k, tip) in tips.iter().enumerate() {
-                        text(ctx, x0 + 16.0, head_h() + em(20.0) + k as f32 * em(22.0), &fit(tip, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.text_secondary());
+                        text(ctx, x0 + 16.0, top + em(20.0) + k as f32 * em(22.0), &fit(tip, type_size::SM, Weight::Regular, w - 32.0), type_size::SM, Weight::Regular, t.text_secondary());
                     }
                 }
                 Some(_) => {
-                    text(ctx, x0 + 16.0, head_h() + em(20.0), "Nothing found", type_size::SM, Weight::Regular, t.text_secondary());
+                    text(ctx, x0 + 16.0, top + em(20.0), "Nothing found", type_size::SM, Weight::Regular, t.text_secondary());
                 }
                 None if ui.folder.is_some() => {
-                    text(ctx, x0 + 16.0, head_h() + em(20.0), "Nothing here", type_size::SM, Weight::Regular, t.text_secondary());
+                    let empty = if ui.quick != 0 { "Nothing matches these filters" } else { "Nothing here" };
+                    text(ctx, x0 + 16.0, top + em(20.0), empty, type_size::SM, Weight::Regular, t.text_secondary());
                 }
                 None => {}
             }
@@ -2303,7 +2400,7 @@ impl MailView {
         let m = self.mail.clone();
         let cursor = ui.cursor;
         let now = (self.mail.now)();
-        VirtualList::new(self.mail.list.clone(), Rect::new(x0, head_h(), w - 1.0, h - head_h()), ui.count, row_h(), move |i, ctx| {
+        VirtualList::new(self.mail.list.clone(), Rect::new(x0, top, w - 1.0, h - top), ui.count, row_h(), move |i, ctx| {
             let t = ctx.theme;
             row(ctx, w - 1.0, row_h());
             let Some(r) = m.row(i) else {

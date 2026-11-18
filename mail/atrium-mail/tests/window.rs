@@ -94,9 +94,10 @@ fn list_and_read() {
     let order: Vec<String> = (0..4).map(|i| mail.row(i).unwrap().subject).collect();
     assert_eq!(order, ["Headers only so far", "This week", "Lunch on Friday?", "Q4 numbers"]);
 
-    // A press on the fourth row (the list starts under its 48 pt heading,
-    // rows are 72 pt) opens Arun's message, wrapped to the column.
-    let at = Point::new(224.0 + 200.0, 48.0 + 72.0 * 3.0 + 36.0);
+    // A press on the fourth row (the list starts under its heading and
+    // the filter chips, rows are 72 pt) opens Arun's message, wrapped to
+    // the column.
+    let at = Point::new(224.0 + 200.0, mail.list_top() + 72.0 * 3.0 + 36.0);
     app.handle_event(Event::PointerDown { at });
     app.handle_event(Event::PointerUp { at });
     app.tick();
@@ -752,4 +753,91 @@ fn an_encrypted_message_is_read_with_the_person_s_key() {
     app.tick();
     assert!(texts(&app).iter().any(|x| x.contains("The secret plan.")), "{:?}", texts(&app));
     assert!(texts(&app).iter().any(|x| x == "plan.csv"));
+}
+
+#[test]
+fn quick_filters_narrow_the_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let mut prefs = engine.prefs();
+    prefs.vips = vec!["arun@acme.example".into()];
+    engine.set_prefs(&prefs).unwrap();
+    let mail_of = |uid: u32, head: &str, body: &str, t: i64, seen: bool| {
+        let s = t.rem_euclid(86_400);
+        let date = format!("Mon, 23 Nov 2026 {:02}:{:02}:{:02} +0000", s / 3600, s % 3600 / 60, s % 60);
+        let bytes = format!("{head}Date: {date}\r\nMessage-ID: <q{uid}@x>\r\nMIME-Version: 1.0\r\n{body}").into_bytes();
+        Fetched { uid, flags: if seen { vec!["\\Seen".into()] } else { vec![] }, size: 1000, internal_date: Some(t), server_id: None, bytes, full: true }
+    };
+    {
+        let mut sink = engine.sink(account);
+        sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
+        sink.messages("INBOX", vec![
+            // A person asks, with a file: unread, to me, needs a reply.
+            mail_of(1, "From: Lena <lena@partner.example>\r\nTo: Priya <priya@example.org>\r\nSubject: Contract\r\n",
+                "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nCan you sign it?\r\n--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=c.pdf\r\n\r\n%PDF-1.4\r\n--b--\r\n", NOW - 600, false),
+            // A newsletter: to me, but a list.
+            mail_of(2, "From: News <news@shop.example>\r\nTo: priya@example.org\r\nSubject: Sale\r\nList-Id: <deals.shop.example>\r\n",
+                "Content-Type: text/plain\r\n\r\nHalf off.\r\n", NOW - 1200, true),
+            // A VIP, Cc only.
+            mail_of(3, "From: Arun <arun@acme.example>\r\nTo: team@acme.example\r\nCc: priya@example.org\r\nSubject: Plan\r\n",
+                "Content-Type: text/plain\r\n\r\nFYI.\r\n", NOW - 1800, true),
+        ]).unwrap();
+    }
+    let dirty = Arc::new(AtomicBool::new(true));
+    let view = MailView::new(engine, dirty.clone(), (1280.0, 800.0), || NOW);
+    let mail = view.mail.clone();
+    let mut app = App::new_with_flag(view, dirty);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    let t = texts(&app);
+    for chip in ["Unread", "To me", "From people", "VIPs", "Has attachment", "Needs reply", "Snoozed back"] {
+        assert!(t.iter().any(|x| x == chip), "{chip} not drawn");
+    }
+    let subjects = |m: &atrium_mail::view::Mail| (0..m.ui.get_cloned().count).map(|i| m.row(i).unwrap().subject).collect::<Vec<_>>();
+    use mail_engine::quick::*;
+    for (bits, want) in [
+        (UNREAD, vec!["Contract"]),
+        (TO_ME, vec!["Contract"]),
+        (FROM_PEOPLE, vec!["Contract", "Plan"]),
+        (VIPS, vec!["Plan"]),
+        (ATTACHMENT, vec!["Contract"]),
+        (NEEDS_REPLY, vec!["Contract"]),
+        (FLAGGED, vec![]),
+    ] {
+        mail.toggle_quick(bits);
+        app.tick();
+        assert_eq!(subjects(&mail), want, "filter {bits}");
+        mail.toggle_quick(bits);
+    }
+    // Combined: from people and not unread-only → both; plus unread → one.
+    mail.toggle_quick(FROM_PEOPLE);
+    mail.toggle_quick(UNREAD);
+    app.tick();
+    assert_eq!(subjects(&mail), ["Contract"]);
+    // Nothing matches: said so.
+    mail.toggle_quick(VIPS);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    assert!(texts(&app).iter().any(|x| x == "Nothing matches these filters"));
+    // A press on a chip turns it off again.
+    mail.toggle_quick(VIPS);
+    mail.toggle_quick(UNREAD);
+    mail.toggle_quick(FROM_PEOPLE);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 3);
+    // Priya answers Lena (her copy in Sent): it no longer needs a reply.
+    {
+        let mut sink = mail.engine.sink(account);
+        sink.folders(&[
+            RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
+            RemoteFolder { name: "Sent".into(), role: Role::Sent, selectable: true },
+        ]).unwrap();
+        sink.messages("Sent", vec![mail_of(9, "From: Priya <priya@example.org>\r\nTo: Lena <lena@partner.example>\r\nSubject: Re: Contract\r\nIn-Reply-To: <q1@x>\r\nReferences: <q1@x>\r\n",
+            "Content-Type: text/plain\r\n\r\nSigned.\r\n", NOW - 60, true)]).unwrap();
+    }
+    mail.refresh();
+    mail.toggle_quick(NEEDS_REPLY);
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().count, 0, "{:?}", subjects(&mail));
 }

@@ -1197,7 +1197,7 @@ Stalwart in the cloud VM, and later a real account):
    **Not yet**: a settings page (screener switch, review time, quiet hours, sounds,
    VIPs), times in the person's time zone (built later, see M8), Later notes typed in the sheet,
    the weekly look and the 7/30-day overdue rules, `$Snoozed` and a server *Snoozed*
-   folder, quick filters and grouping (§11.7), server-side search outside the offline
+   folder, grouping (§11.7; quick filters built later, see M8), server-side search outside the offline
    window, Praeco's longer posts and event times (tabula.md §5.3–5.4, so freshness uses
    the message's date), notification actions, and a VM run.
 8. **M7** S/MIME with Sigillum tokens and Arca certificates; JMAP; OAuth (Microsoft first).
@@ -1462,6 +1462,18 @@ Stalwart in the cloud VM, and later a real account):
    under UTC, Asia/Kolkata and America/New_York. On Atrium, app and worker jails get
    the machine's zone file as `/etc/localtime` (portcullis-jail, 9e07795); a changed zone
    reaches Mail on its next launch.
+
+   **Quick filters (2026-11-18, §11.7)**: chips under the list's heading, combinable,
+   wrapping to the list's width: *Unread*, *Flagged*, *To me* (the person in To, not
+   list mail), *From people* (not lists or automated senders, or a VIP), *VIPs*, *Has
+   attachment* (any message of a conversation), *Needs reply* (the conversation's last
+   message is to the person, not from them, not automated and not answered), *Snoozed
+   back* (Later items come back). They run on the local index (`mail_engine::quick`), in
+   Conversations or Messages, looking through at most 5,000 rows; the count follows, and
+   "Nothing matches these filters" says why a list is empty. Tests: the window 1 (each
+   chip, two combined, none matching, and a reply in Sent ending *Needs reply*). **Not
+   yet**: grouping (§11.7), saving a filter set as a smart folder, and the chips in a
+   search's results.
 
 ## 17. Decisions, with recommendations
 
