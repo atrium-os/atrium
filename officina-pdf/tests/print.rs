@@ -55,7 +55,7 @@ fn a_sheet_prints_down_then_across_and_looks_as_it_does_on_screen() {
     let fonts = PinnedFonts::new().unwrap();
     // 40 columns of 64 px (48 pt) and 150 rows of 20 px (15 pt) on A4 with
     // 54 pt margins: 10 columns and 48 rows a page, 4 pages across, 4 down.
-    let s = Sheet { name: "Q3", cols: vec![64.0; 40], rows: vec![20.0; 150], cell: &cells, gridlines: true };
+    let s = Sheet { name: "Q3", cols: vec![64.0; 40], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new() };
     let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     assert_eq!(stats.pages, 16);
     assert_eq!(stats.fonts, 2, "the screen's face, regular and bold");
@@ -77,7 +77,7 @@ fn a_sheet_prints_down_then_across_and_looks_as_it_does_on_screen() {
 #[test]
 fn numbers_that_do_not_fit_show_hashes_and_text_is_cut() {
     let fonts = PinnedFonts::new().unwrap();
-    let s = Sheet { name: "", cols: vec![64.0; 3], rows: vec![20.0], cell: &cells, gridlines: false };
+    let s = Sheet { name: "", cols: vec![64.0; 3], rows: vec![20.0], cell: &cells, gridlines: false, merges: Vec::new() };
     let (pdf, _) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "Cut", Vec::new(), &mut |_, _| {}).unwrap();
     // The text is in the ToUnicode maps: '#' and '…' were used, the long
     // number's digits past what fits were not.
@@ -89,7 +89,7 @@ fn numbers_that_do_not_fit_show_hashes_and_text_is_cut() {
 #[test]
 fn fit_to_width_puts_every_column_on_one_page_across() {
     let fonts = PinnedFonts::new().unwrap();
-    let s = Sheet { name: "", cols: vec![64.0; 15], rows: vec![20.0; 150], cell: &cells, gridlines: true };
+    let s = Sheet { name: "", cols: vec![64.0; 15], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new() };
     let mut setup = Setup::paper(595.0, 842.0);
     let (_, plain) = sheet::export(&s, &setup, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     setup.fit_width = true;
@@ -187,3 +187,25 @@ fn inflate_all(pdf: &[u8]) -> String {
     out
 }
 
+
+#[test]
+fn a_merged_area_prints_as_one_cell_even_across_pages() {
+    let fonts = PinnedFonts::new().unwrap();
+    // A1:C2 merged (red, "Total" in A1); J5:K5 runs over the page's edge
+    // (10 columns a page).
+    let s = Sheet { name: "", cols: vec![64.0; 12], rows: vec![20.0; 6], cell: &cells, gridlines: true, merges: vec![[0, 0, 1, 2], [4, 9, 4, 10]] };
+    let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+    assert_eq!(stats.pages, 2);
+    let pages = draw(&pdf);
+    // Red across all three columns and both rows: no gridline at B's or
+    // C's left edge or between the rows, and B1's own text isn't drawn.
+    for (x, y) in [(102, 62), (150, 62), (190, 69), (130, 80)] {
+        assert!(reddish(px(&pages[0], x, y)), "({x}, {y}) {:?}", px(&pages[0], x, y));
+    }
+    // The cell after the area (D1) is an ordinary one, with its gridline.
+    assert!(!reddish(px(&pages[0], 200, 62)));
+    // J5:K5's piece on the second page: K5 has no text of its own drawn
+    // ("4:10"), so the cell is blank there.
+    let dark = (54..102).flat_map(|x| (115..129).map(move |y| (x, y))).filter(|&(x, y)| px(&pages[1], x, y)[0] < 128).count();
+    assert_eq!(dark, 0, "the area's text stays on the page with its first cell");
+}
