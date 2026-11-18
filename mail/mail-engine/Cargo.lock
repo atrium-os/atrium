@@ -1254,6 +1254,7 @@ dependencies = [
  "arca-store",
  "atrium-worker",
  "getrandom 0.2.17",
+ "libc",
  "mail-compose",
  "mail-pgp",
  "mail-proto",
