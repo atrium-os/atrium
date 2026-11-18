@@ -1970,6 +1970,25 @@ impl Sheets {
                     self.cond_cmd(c);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::CircleInvalid) => {
+                    let mut d = self.doc.borrow_mut();
+                    d.circling = !d.circling;
+                    d.status = if !d.circling {
+                        String::new()
+                    } else {
+                        let s = d.sheet;
+                        let (r, c) = d.wb.extent(s);
+                        let n = d.wb.invalid_cells(&officina_grid::Rect { sheet: s, r0: 0, c0: 0, r1: r.saturating_sub(1), c1: c.saturating_sub(1) }, 100_000, 1 << 22).len();
+                        match n {
+                            0 => "No cell on this sheet breaks its rule.".into(),
+                            1 => "1 cell breaks its rule; it is circled.".into(),
+                            n => format!("{n} cells break their rules; they are circled."),
+                        }
+                    };
+                    drop(d);
+                    self.changed();
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::Validation) => {
                     self.open_valid();
                     false
@@ -2400,6 +2419,31 @@ mod tests {
         s.take_cmds();
         assert!(s.list.get_cloned().open);
         assert_eq!(s.grid.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn invalid_data_is_circled_until_turned_off() {
+        use officina_grid::condfmt::CmpOp;
+        use officina_grid::validation::{Allow, Validation};
+        let (mut d, _) = Doc::from_csv("c.csv", b"5\n12\n7\n30\n").unwrap();
+        let f = d.wb.validation_formula("10", 0, (0, 0)).unwrap();
+        d.wb.add_validation(Validation::new(0, vec![officina_grid::Rect { sheet: 0, r0: 0, c0: 0, r1: 9, c1: 0 }], Allow::Whole, CmpOp::LessOrEqual, Some(f), None)).unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let rings = || {
+            let fl = pergola::widgets::GridSource::floats(&*s.source, [0.0, 0.0, 1000.0, 600.0], &pergola::theme::Semantic::LIGHT);
+            fl.iter().find(|f| f.key == 1 << 58).map(|f| f.nodes.len())
+        };
+        assert_eq!(rings(), None);
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::CircleInvalid));
+        s.take_cmds();
+        assert_eq!(s.doc.borrow().status, "2 cells break their rules; they are circled.");
+        assert!(rings().is_some_and(|n| n >= 2));
+        // Fixed, a cell's ring goes; turned off, they all go.
+        s.doc.borrow_mut().type_into(1, 0, "3");
+        assert_eq!(s.doc.borrow().wb.invalid_cells(&officina_grid::Rect { sheet: 0, r0: 0, c0: 0, r1: 9, c1: 0 }, 10, 100).len(), 1);
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::CircleInvalid));
+        s.take_cmds();
+        assert_eq!(rings(), None);
     }
 
     #[test]

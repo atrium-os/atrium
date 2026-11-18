@@ -431,7 +431,42 @@ pub fn wrap_lines(text: &str, style: &pergola::TextStyle, w: f32, max: usize) ->
     out
 }
 
+/// Invalid cells ringed in the view, at most.
+pub const MAX_RINGS: usize = 2000;
+
 impl SheetSource {
+    /// A red ring around each cell in `view` whose value its validation rule
+    /// doesn't allow, while [`Doc::circling`] is on.
+    fn invalid_rings(&self, view: [f64; 4]) -> Option<pergola::widgets::GridFloat> {
+        use pergola::shape::{Paint, PathData, Shape, Stroke};
+        if !self.doc.borrow().circling {
+            return None;
+        }
+        let area = {
+            let d = self.doc.borrow();
+            officina_grid::Rect { sheet: d.sheet, r0: self.row_at(view[1].max(0.0)), c0: self.col_at(view[0].max(0.0)), r1: self.row_at(view[1].max(0.0) + view[3]), c1: self.col_at(view[0].max(0.0) + view[2]) }
+        };
+        let cells = self.doc.borrow().wb.invalid_cells(&area, MAX_RINGS, 1 << 18);
+        if cells.is_empty() {
+            return None;
+        }
+        let (ox, oy) = (self.col_left(area.c0), self.row_top(area.r0));
+        let (w, h) = (self.col_left(area.c1 + 1) - ox, self.row_top(area.r1 + 1) - oy);
+        let red = Color::rgba(0.85, 0.1, 0.1, 1.0);
+        let mut nodes = Vec::new();
+        for a in cells {
+            let (x0, x1) = (self.col_left(a.col) - ox, self.col_left(a.col + 1) - ox);
+            let (y0, y1) = (self.row_top(a.row) - oy, self.row_top(a.row + 1) - oy);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let c = pergola::geom::Point::new(((x0 + x1) / 2.0) as f32, ((y0 + y1) / 2.0) as f32);
+            let ring = Shape::new(PathData::ellipse(c, ((x1 - x0) / 2.0 + 2.0) as f32, ((y1 - y0) / 2.0 + 1.0) as f32)).stroke(Stroke::new(Paint::Solid(red), 1.5));
+            nodes.extend(ring.fills().into_iter().map(|f| pergola::Node::Fill(std::sync::Arc::new(f))));
+        }
+        Some(pergola::widgets::GridFloat { key: 1 << 58, at: [ox, oy, w, h], nodes: Rc::new(nodes), movable: false, pressable: false })
+    }
+
     /// A button at the right of [`Self::note_at`]'s cell when a validation
     /// rule offers it a list; a press opens the list.
     fn list_button(&self, theme: &pergola::theme::Semantic) -> Option<pergola::widgets::GridFloat> {
@@ -555,6 +590,7 @@ impl GridSource for SheetSource {
         let mut out = self.data_marks(view, theme);
         out.extend(self.note_float());
         out.extend(self.list_button(theme));
+        out.extend(self.invalid_rings(view));
         let d = self.doc.borrow();
         let charts = d.wb.charts();
         if charts.is_empty() {

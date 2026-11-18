@@ -372,6 +372,9 @@ pub struct Doc {
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
+    /// Data ▸ Circle Invalid Data: cells their validation rule doesn't allow
+    /// are ringed in red (not saved).
+    pub circling: bool,
 }
 
 /// The most a workbook may grow to by editing: the least that any machine
@@ -423,7 +426,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.

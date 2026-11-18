@@ -291,6 +291,42 @@ impl Workbook {
         }
     }
 
+    /// The cells of `area` that hold a value their rule doesn't allow (Excel's
+    /// Circle Invalid Data), row by row, at most `limit`; at most `budget`
+    /// cells are checked. A rule's empty cells count only when it doesn't
+    /// allow blanks.
+    pub fn invalid_cells(&self, area: &Rect, limit: usize, budget: u64) -> Vec<CellAddr> {
+        let mut out = Vec::new();
+        let mut checked = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        for v in self.validations.iter().filter(|v| v.sheet == area.sheet && v.show_error && v.allow != Allow::Any) {
+            for r in &v.ranges {
+                let (r0, r1, c0, c1) = (r.r0.max(area.r0), r.r1.min(area.r1), r.c0.max(area.c0), r.c1.min(area.c1));
+                if r0 > r1 || c0 > c1 {
+                    continue;
+                }
+                for row in r0..=r1 {
+                    for col in c0..=c1 {
+                        checked += 1;
+                        if checked > budget || out.len() >= limit {
+                            return out;
+                        }
+                        let a = CellAddr::new(area.sheet, row, col);
+                        // A cell is its first rule's.
+                        if !seen.insert((row, col)) || !std::ptr::eq(self.validation_at(a).map_or(std::ptr::null(), |x| x as *const _), v) {
+                            continue;
+                        }
+                        if self.check_cell(a).is_err() {
+                            out.push(a);
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|a| (a.row, a.col));
+        out
+    }
+
     fn refusal(&self, v: &Validation, a: CellAddr) -> Refusal {
         let ftext = |e: &Option<Arc<Expr>>| e.as_ref().map(|e| self.cond_formula_text(e, v.origin())).unwrap_or_default();
         let (x, y) = (ftext(&v.f1), ftext(&v.f2));
@@ -438,6 +474,25 @@ impl Validation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_cells_are_found_in_an_area() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        let f = wb.validation_formula("10", 0, (0, 0)).unwrap();
+        let mut v = Validation::new(0, vec![Rect { sheet: 0, r0: 0, c0: 0, r1: 99, c1: 0 }], Allow::Whole, CmpOp::LessOrEqual, Some(f), None);
+        v.allow_blank = true;
+        wb.add_validation(v).unwrap();
+        for (r, x) in [(0, 5.0), (3, 12.0), (7, 2.5), (50, 99.0)] {
+            wb.set_value(CellAddr::new(0, r, 0), Value::Num(x));
+        }
+        wb.set_value(CellAddr::new(0, 4, 1), Value::Num(500.0));
+        let all = Rect { sheet: 0, r0: 0, c0: 0, r1: 200, c1: 5 };
+        let at = |v: Vec<CellAddr>| v.into_iter().map(|a| (a.row, a.col)).collect::<Vec<_>>();
+        assert_eq!(at(wb.invalid_cells(&all, 100, 1 << 20)), [(3, 0), (7, 0), (50, 0)]);
+        assert_eq!(at(wb.invalid_cells(&Rect { r1: 10, ..all }, 100, 1 << 20)), [(3, 0), (7, 0)]);
+        assert_eq!(wb.invalid_cells(&all, 1, 1 << 20).len(), 1);
+    }
+
     use super::*;
     use crate::ops::GridOp;
     use officina_core::history::History;

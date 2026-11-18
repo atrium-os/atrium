@@ -88,6 +88,8 @@ pub enum DataCmd {
     Validation,
     /// Take validation rules off the selection's cells.
     ClearValidation,
+    /// Ring the cells their rule doesn't allow, or stop; the window runs it.
+    CircleInvalid,
     /// Pick the cursor's cell value from its validation list; the window
     /// runs it, as it opens a panel (§16.83).
     ChooseFromList,
@@ -238,6 +240,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let table = wb.table_at(s, row, col);
     let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
     let plural = |n: u32, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
+    let circling = d.circling;
     let mut v = vec![
         (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
@@ -304,6 +307,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let validated = wb.validations().iter().any(|v| v.ranges.iter().any(|r| r.sheet == s && r.r0 <= sel_rect.r1 && sel_rect.r0 <= r.r1 && r.c0 <= sel_rect.c1 && sel_rect.c0 <= r.c1));
     v.push((MenuItem::new("Data Validation…"), Some(DataCmd::Validation)));
     v.push((MenuItem::new("Clear Validation").enabled(validated), Some(DataCmd::ClearValidation)));
+    v.push((MenuItem::new("Circle Invalid Data").checked(circling).enabled(!wb.validations().is_empty() || circling), Some(DataCmd::CircleInvalid)));
     v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
     v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
     v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
@@ -605,7 +609,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
