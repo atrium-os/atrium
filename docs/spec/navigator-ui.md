@@ -283,8 +283,19 @@ so rctl limits, and anything that tells instances apart by uid, follow the insta
   **Open with…** button (where the empty More button was) hands the shown page's address to
   Monstrator with the press (`Hand::With`, only for a page navigatord holds); its sheet offers
   the other apps and the other personas, and the person's switch decides (personas.md §6).
-- Not yet: downloads into the persona's folder (P2), a Work window's network routes (vpn.md V2),
-  and choosing the persona from the Navigator's own New window menu.
+- **New window in another persona (2026-11-18).** The rail's persona chip opens a menu when
+  the person has other personas (Ctrl-N opens it too): new trails in the window's persona or
+  Unrecorded, then "New Work window" (or "New Personal window") for each other persona.
+  navigatord learns them from portcullisd's `Persona` answer (`others`) and passes them as
+  `NAVIGATOR_UI_OTHER_PERSONAS`. A press there goes to navigatord (`NewWindow`), which asks
+  portcullisd `NewWindowIn { persona, activation }`: only the caller's own instanced app, only
+  a persona the person has and not the caller's, with the press spent (purpose LINK, which
+  also lets the window come forward). That persona's Navigator starts, or comes forward if it
+  runs. Nothing of this window goes with it, so no crossing switch is asked. The menu stays up
+  until the answer, because frescod spends a press only while its window still has the focus.
+  Gate: `navigator-confined-vm.sh` (116/116). With no other persona the chip switches new
+  trails between the window's persona and Unrecorded, as before.
+- Not yet: downloads into the persona's folder (P2), and a Work window's network routes (vpn.md V2).
 
 ---
 

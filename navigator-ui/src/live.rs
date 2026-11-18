@@ -485,6 +485,12 @@ impl Live {
                 Event::Saved { path, .. } => s.last_note = Some(format!("saved as {path}")),
                 Event::NotSaved { why, .. } => s.last_note = Some(format!("not saved: {why}")),
                 Event::PressRefused { why } => s.press_refused(&why, crate::ui::now_ms()),
+                Event::WindowIn { persona, ok, why } => {
+                    let note = if ok { format!("a window in {persona}") } else { format!("no window in {persona}: {}", why.unwrap_or_default()) };
+                    eprintln!("navigator-ui: {note}");
+                    s.persona_open = false;
+                    s.last_note = Some(note)
+                }
                 Event::Handed { url, ok, why } => {
                     let note = if ok { format!("handed {url} on") } else { format!("{url} not handed on: {}", why.unwrap_or_default()) };
                     eprintln!("navigator-ui: {note}");
@@ -676,6 +682,7 @@ impl Live {
                 Out::Save { id, press } => send(&mut self.w, &Request::Save { id, press }),
                 Out::Discard { id } => send(&mut self.w, &Request::Discard { id }),
                 Out::Hand { url, how, press } => send(&mut self.w, &Request::Hand { url, how, press }),
+                Out::NewWindow { persona, press } => send(&mut self.w, &Request::NewWindow { persona, press }),
                 Out::Reload { key } => {
                     // Its child closes; the page opens again, fetched.
                     if let Some(i) = self.children.iter().position(|c| c.key == key) {

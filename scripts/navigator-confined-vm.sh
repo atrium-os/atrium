@@ -687,6 +687,23 @@ i=0; while [ $i -lt 60 ] && ! g "grep -q 'a link sent from personal' $WL"; do sl
 g "grep -q 'navigator-ui: a link sent from personal: a new trail, anonymous' $WL" && ok "…and the Work window opened it in a new trail, anonymous" || bad "Work anonymous: $(g "grep -h -e 'sent from' -e 'link from' $WL | tail -2" | tr '\n' ';')"
 sleep 5
 shot confined-9-into-work
+# The New window menu (navigator-ui.md §2.4): the Work window, in front
+# after that link, opens the rail's persona chip and asks for a Personal
+# window; portcullisd brings the running Personal Navigator forward.
+# Nothing crosses, so no switch is asked.
+g "grep -q 'navigatord: other personas personal' $WL" && ok "Work's Navigator knows the person's other persona" || bad "others: $(g "grep -h 'other personas' $WL $S/navigatord.log" | tr '\n' ';')"
+g "grep -q 'navigatord: other personas work' $S/navigatord.log" && ok "…and Personal's knows Work" || bad "Personal's others: $(g "grep -h 'other personas' $S/navigatord.log" | tr '\n' ';')"
+press 73 $((TOP + 20))                       # the rail's persona chip
+shot confined-11-new-window-menu
+press 100 $((TOP + 152))                     # New Personal window
+i=0; while [ $i -lt 30 ] && ! g "grep -q 'a new window for org.atrium.navigator in personal' $PL"; do sleep 2; i=$((i+2)); done
+g "grep -q 'a new window for org.atrium.navigator in personal: running, window [0-9]* brought forward (from work, for navtest)' $PL" && ok "New Personal window, from Work: the Personal Navigator came forward" || bad "new window: $(g "grep -h -e 'new window' $PL $WL | tail -3" | tr '\n' ';')"
+g "grep -q 'navigator-ui: a window in personal' $WL" && ok "…and the Work window heard so" || bad "Work UI: $(g "grep -h 'window in' $WL | tail -2" | tr '\n' ';')"
+g "grep -q 'new window REFUSED' $PL" && bad "a refusal: $(g "grep -h 'new window REFUSED' $PL | tail -1")" || ok "nothing refused"
+R=$(g "printf '{\"op\":\"hello\",\"version\":1}\n{\"op\":\"new_window_in\",\"persona\":\"work\",\"activation\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]}\n' | nc -N -U /atrium/sockets/portcullis/portcullis.sock")
+case "$R" in *"not a launched app"*) ok "root asking for a window: refused" ;; *) bad "root new window: $R" ;; esac
+sleep 3
+shot confined-12-personal-forward
 
 echo "=== atrium-app: an app that isn't installed (L5)"
 # The catalog above, opifexd and the install sheet as _opifexsheet. App probe asks for

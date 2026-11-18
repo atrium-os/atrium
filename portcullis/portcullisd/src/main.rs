@@ -693,6 +693,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
+        /* ★ A New window in another persona (navigator-ui.md §2.4): the
+         * caller's own app, by the PEER UID, with a press. */
+        if let Request::NewWindowIn { persona, activation } = req {
+            let resp = handle_new_window_in(uid, &persona, activation, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+
         /* ★ Settings' Personas page (personas.md §2, §4.1). */
         if matches!(req, Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. }) {
             let resp = handle_persona_change(uid, req, &shared, &portcullisd::crossing::Sigillum::default());
@@ -711,11 +719,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         if matches!(req, Request::Persona) {
             let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
             let resp = match (reg.persona(uid), reg.resolve(uid)) {
-                (Some(None), _) => Response::Persona { name: None, colour: None },
-                (Some(Some(p)), Some((user, _))) => {
-                    let colour = shared.lock().unwrap().get_or_load(user).ok()
-                        .and_then(|tp| tp.policy.personas.get(p).map(|d| d.colour.clone()));
-                    Response::Persona { name: Some(p.to_string()), colour }
+                (Some(here), Some((user, _))) => {
+                    let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let pol = st.get_or_load(user).ok().map(|tp| &tp.policy).filter(|p| !p.personas.is_empty() && p.check_personas().is_ok());
+                    let colour = here.and_then(|p| pol.and_then(|pol| pol.personas.get(p).map(|d| d.colour.clone())));
+                    let others = pol.map(|pol| std::iter::once(portcullis_policy::PERSONAL).chain(pol.personas.keys().map(|k| k.as_str()))
+                        .filter(|n| *n != here.unwrap_or(portcullis_policy::PERSONAL)).map(String::from).collect()).unwrap_or_default();
+                    Response::Persona { name: here.map(String::from), colour, others }
                 }
                 _ => Response::Error { message: "persona: caller is not a launched app".into() },
             };
@@ -1608,7 +1618,7 @@ fn handle_link(user: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
                 let ok = shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(&g.person)
                     .map(|tp| tp.policy.may_cross(g.persona.as_deref(), target.as_deref(), "links")).unwrap_or(false);
                 if !ok {
-                    return refuse(format!("cap.link.crossing: links from {} to {} are off (Settings, Personas)", shown(&g.persona), shown(&target)));
+                    return refuse(format!("cap.link.crossing: links from {} to {} are off (Settings, Apps, Between personas)", shown(&g.persona), shown(&target)));
                 }
                 eprintln!("portcullisd: a {} link crosses from {} to {} for {}, by the person's switch", g.scheme, shown(&g.persona), shown(&target), g.person);
             } else if app == g.asker_app {
@@ -1687,6 +1697,50 @@ fn start_for_instance(app: &str, persona: Option<&str>, owner: &str, why: &'stat
         }
         STARTED_FOR_OPEN.lock().unwrap().retain(|x| x != &key);
     });
+}
+
+/// NewWindowIn: the caller's own app in another of its person's personas,
+/// started or brought forward. Only an instanced app, only a persona the
+/// person has, never the caller's own; nothing goes with it, so no switch
+/// is asked. The press is spent last (purpose LINK, which also lets the
+/// running instance's window come forward).
+fn handle_new_window_in(uid: u32, persona: &str, activation: [u8; 16], shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::opens;
+    let refuse = |why: String| {
+        eprintln!("portcullisd: new window REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let (Some((owner, app)), Some(here)) = (reg.resolve(uid).map(|(u, a)| (u.to_string(), a.to_string())), reg.persona(uid).map(|p| p.map(String::from))) else {
+        return refuse("not a launched app".into());
+    };
+    if launch::not_instanced(&app).is_some() {
+        return refuse(format!("{app} runs once for every persona"));
+    }
+    let target = (persona != portcullis_policy::PERSONAL).then(|| persona.to_string());
+    if target == here {
+        return refuse("that is this window's persona".into());
+    }
+    let known = shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(&owner)
+        .map(|tp| !tp.policy.personas.is_empty() && tp.policy.check_personas().is_ok() && tp.policy.has_persona(target.as_deref())).unwrap_or(false);
+    if !known {
+        return refuse(format!("{persona}: not one of {owner}'s personas"));
+    }
+    if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::LINK) {
+        return refuse(why);
+    }
+    let shown = target.as_deref().unwrap_or(portcullis_policy::PERSONAL);
+    if launch::running_jid_instance(&app, target.as_deref()).is_some() {
+        match launch::instance_uid(&owner, &app, target.as_deref()).map(|u| opens::raise(&opens::activation_socket(), u)) {
+            Some(Ok(w)) => eprintln!("portcullisd: a new window for {app} in {shown}: running, window {w} brought forward (from {}, for {owner})", here.as_deref().unwrap_or("personal")),
+            Some(Err(why)) => eprintln!("portcullisd: a new window for {app} in {shown}: running, not brought forward: {why}"),
+            None => eprintln!("portcullisd: a new window for {app} in {shown}: running, no uid for it"),
+        }
+    } else {
+        eprintln!("portcullisd: a new window for {app} in {shown}: starting it (from {}, for {owner})", here.as_deref().unwrap_or("personal"));
+        start_for_instance(&app, target.as_deref(), &owner, "a new window");
+    }
+    Response::Ok
 }
 
 /// Access, RemoveAccess and ApproveAccess (curia.md §13). `uid` is the
@@ -3053,7 +3107,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "internal: session verbs must go through handle_session".into(),
         },
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
-        | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } => Response::Error {
+
+        | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

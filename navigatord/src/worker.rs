@@ -64,8 +64,9 @@ fn portcullisd() -> io::Result<UnixStream> {
 }
 
 /// Our persona (personas.md §3), as portcullisd's launch registry has it
-/// by our uid: `None` for Personal, else its name and colour.
-pub fn persona() -> io::Result<Option<(String, String)>> {
+/// by our uid: `None` for Personal, else its name and colour; and the
+/// person's other personas (`personal` for Personal).
+pub fn persona() -> io::Result<(Option<(String, String)>, Vec<String>)> {
     use portcullis_ipc::{round_trip, Request, Response};
     let mut s = portcullisd()?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -74,9 +75,28 @@ pub fn persona() -> io::Result<Option<(String, String)>> {
         other => return Err(io::Error::other(format!("portcullisd hello: {other:?}"))),
     }
     match round_trip(&mut s, &Request::Persona)? {
-        Response::Persona { name: None, .. } => Ok(None),
-        Response::Persona { name: Some(n), colour } => Ok(Some((n, colour.unwrap_or_default()))),
+        Response::Persona { name, colour, others } => Ok((name.map(|n| (n, colour.unwrap_or_default())), others)),
         other => Err(io::Error::other(format!("portcullisd persona: {other:?}"))),
+    }
+}
+
+/// A window of ours in `persona` (`NewWindowIn`), with the person's press.
+pub fn new_window_in(persona: &str, press: [u8; 16]) -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response};
+    let ask = || -> io::Result<Response> {
+        let mut s = portcullisd()?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        match round_trip(&mut s, &Request::Hello { version: portcullis_ipc::PROTO_VERSION })? {
+            Response::Hello { .. } => {}
+            other => return Err(io::Error::other(format!("portcullisd hello: {other:?}"))),
+        }
+        round_trip(&mut s, &Request::NewWindowIn { persona: persona.into(), activation: press })
+    };
+    match ask() {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected answer: {other:?}")),
+        Err(e) => Err(format!("portcullisd: {e}")),
     }
 }
 

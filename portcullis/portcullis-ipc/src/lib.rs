@@ -431,6 +431,17 @@ pub enum Request {
         activation: [u8; 16],
     },
 
+    /// A new window of the caller's own app in another of the person's
+    /// personas (`personal` for Personal): its instance there started, or
+    /// brought forward if it runs (navigator-ui.md §2.4, the New window
+    /// menu). Nothing crosses: the instance starts as it would from the
+    /// dock. With `activation`, a press in the caller's window that
+    /// portcullisd spends with frescod (purpose LINK). Answer: `Ok`.
+    NewWindowIn {
+        persona:    String,
+        activation: [u8; 16],
+    },
+
     /// The person's workspaces (homes.md §5), Scratch made at the first
     /// ask. Asked by a launcher or by the person (not an app). Answer:
     /// `WorkspaceList`. A workspace's terminal is a `Console` whose
@@ -823,7 +834,14 @@ pub enum Response {
     /// Persona → the caller's: `None` for Personal, else the named
     /// persona and its colour (one of portcullis-policy's
     /// `PERSONA_COLOURS`).
-    Persona { name: Option<String>, colour: Option<String> },
+    /// `others`: the person's other personas by name (`personal` for
+    /// Personal), for a New window menu; empty with no named persona.
+    Persona {
+        name:   Option<String>,
+        colour: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        others: Vec<String>,
+    },
 
     /// PersonaList → Personal first, then the named personas (just
     /// Personal: nothing to ask). `last`: the one `app_id` last ran in, by
