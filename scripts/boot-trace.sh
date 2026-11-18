@@ -90,6 +90,8 @@ EOF
          [ -S "$f" ] && stat -f "%.6FB %N" "$f"; done 2>/dev/null | sort -n' > "$R/sockets.txt"
     V 'ps -axww -o lstart= -o etimes= -o pid= -o jid= -o user= -o command=' > "$R/ps.txt"
     V 'dmesg -a' > "$R/dmesg.txt"
+    # This boot's kernel (uname.txt above is the one before the first reboot).
+    V 'uname -a; sysctl -n kern.bootfile' > "$R/uname.txt"
     V 'cd /var/log/atrium 2>/dev/null && for f in *.log; do echo "== $f"; tail -n 200 "$f"; done' > "$R/atrium-logs/all.txt" 2>&1
     [ -n "$SER" ] && kill "$SER" 2>/dev/null
     python3 - "$R" <<'EOF' > "$R/summary.txt"

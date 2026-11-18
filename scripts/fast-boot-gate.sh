@@ -23,7 +23,9 @@
 #   efi      print the firmware boot entries (the 5 s "X64 image" detour)
 #
 # KERNELS=1 also boots, once each through nextboot (falls back by itself):
-#   kernel.atrium            the debug ATRIUM kernel already on the VM
+#   kernel.atrium            the kernel in /boot/kernel.atrium (on the dev VM a
+#                            NODEBUG build from Nov 10; ATRIUM_TAR replaces it
+#                            with a debug ATRIUM build, same tarball layout)
 #   kernel.nodebug           ATRIUM-NODEBUG from $NODEBUG_TAR (a tarball of
 #                            boot/kernel from the cloud cross-build)
 # with boot-trace.sh RUNS=1 each.
@@ -64,9 +66,11 @@ ok "built"
 say "deploy"
 V 'for s in atrium-portcullisd-bootstrap atrium-portcullisd-daemon atrium-dispensatord atrium-volumes atrium-jaild; do
        service $s onestop >/dev/null 2>&1; done; pkill -x atrium-lyrad; pkill -x atrium-choragusd; true'
-for b in atrium-jaild atrium-portcullisd-bootstrap atrium-portcullisd-daemon ostiarius; do
+for b in atrium-jaild atrium-portcullisd-bootstrap atrium-portcullisd-daemon; do
     put "$P/$b" "/usr/local/bin/$b" && ok "$b" || bad "$b copy"
 done
+# The services.d manifest runs ostiarius as atrium-ostiarius.
+put "$P/ostiarius" /usr/local/bin/atrium-ostiarius && ok "atrium-ostiarius" || bad "ostiarius copy"
 put "$ROOT/lyra/target/$TARGET/release/lyrad" /var/tmp/lyrad && put "$ROOT/choragus/target/$TARGET/release/choragusd" /var/tmp/choragusd \
     || bad "lyrad/choragusd copy"
 for f in portcullis/jaild/etc/atrium-jaild portcullis/atrium-volumes/etc/atrium-volumes \
@@ -111,7 +115,9 @@ ex=$(grep -c "exited after" "$OUT/bootstrap-lastboot.log")
 [ "$ex" = 0 ] && ok "no service exited during boot" || { bad "$ex service exit(s) during boot:"; grep "exited after" "$OUT/bootstrap-lastboot.log" | head; }
 V 'pgrep -x atrium-lyrad >/dev/null && pgrep -x atrium-choragusd >/dev/null' && ok "lyrad and choragusd running" || bad "lyrad/choragusd not running"
 V 'tail -n 5 /var/log/atrium/atrium-ostiarius.log 2>/dev/null' > "$OUT/ostiarius-tail.txt"
-grep -q "waiting for frescod" "$OUT/ostiarius-tail.txt" && ok "ostiarius waits for frescod" || echo "  note: ostiarius log: $(tail -n 1 "$OUT/ostiarius-tail.txt")"
+if grep -q "giving up" "$OUT/ostiarius-tail.txt"; then bad "ostiarius gave up on frescod (old binary?)"
+elif grep -q "waiting for frescod" "$OUT/ostiarius-tail.txt"; then ok "ostiarius waits for frescod"
+else echo "  note: ostiarius log: $(tail -n 1 "$OUT/ostiarius-tail.txt")"; fi
 
 say "restart"
 i1=$(V 'stat -f %i /atrium/sockets/lyrad/lyrad.sock')
@@ -127,6 +133,10 @@ V 'efibootmgr -v' > "$OUT/efibootmgr.txt" 2>&1; cat "$OUT/efibootmgr.txt"
 
 if [ "${KERNELS:-0}" = 1 ]; then
     say "kernels"
+    if [ -n "${ATRIUM_TAR:-}" ] && [ -f "$ATRIUM_TAR" ]; then
+        put "$ATRIUM_TAR" /var/tmp/kernel.atrium.tar.xz || bad "atrium kernel copy"
+        V '[ -d /boot/kernel.atrium.prev ] || cp -Rp /boot/kernel.atrium /boot/kernel.atrium.prev 2>/dev/null; rm -rf /boot/kernel.atrium && mkdir -p /boot/kernel.atrium && tar -xf /var/tmp/kernel.atrium.tar.xz -C /boot/kernel.atrium --strip-components 1 && kldxref /boot/kernel.atrium'
+    fi
     V 'nextboot -k kernel.atrium' && RUNS=1 sh "$ROOT/scripts/boot-trace.sh" "$OUT/k-atrium" > "$OUT/k-atrium.log" 2>&1
     V 'uname -i' | tee "$OUT/k-after-atrium.txt"
     if [ -n "${NODEBUG_TAR:-}" ] && [ -f "$NODEBUG_TAR" ]; then
@@ -136,8 +146,9 @@ if [ "${KERNELS:-0}" = 1 ]; then
         V 'uname -i' | tee "$OUT/k-after-nodebug.txt"
     fi
     for k in k-atrium k-nodebug; do
-        [ -f "$OUT/$k/uname.txt" ] || continue
-        echo "  $k: $(grep -o 'ATRIUM[A-Z-]*\|GENERIC' "$OUT/$k/uname.txt" | head -1) rc: $(awk '/\/etc\/rc starting/{s=$2} /bgfsck done/{e=$2} END{print e-s " ms"}' "$OUT/$k/run-1/boottrace.txt")"
+        u="$OUT/$k/run-1/uname.txt"
+        [ -f "$u" ] || continue
+        echo "  $k: $(grep -o 'ATRIUM[A-Z-]*\|GENERIC' "$u" | head -1) ($(tail -n 1 "$u")) rc: $(awk '/\/etc\/rc starting/{s=$2} /bgfsck done/{e=$2} END{print e-s " ms"}' "$OUT/$k/run-1/boottrace.txt")"
     done
 fi
 
