@@ -35,6 +35,11 @@ pub struct Target {
     pub name: String,
     /// Which of the item's types it takes, in the item's order.
     pub takes: Vec<String>,
+    /// `[app] icon`: a system icon name, or a path to an SVG in the bundle.
+    pub icon: Option<String>,
+    /// That SVG's text, read safely from the bundle
+    /// (`portcullis_toml::icon::read_bundle_svg`); the drawer still checks it.
+    pub icon_svg: Option<String>,
 }
 
 /// Installed manifests under one folder.
@@ -89,7 +94,11 @@ impl Installed {
                 let m = manifest(&self.dir, &id)?;
                 let accepts = m.roles.as_ref().and_then(|r| r.share_target.as_ref()).map(|s| s.mime.clone()).unwrap_or_default();
                 let takes: Vec<String> = mimes.iter().filter(|t| crate::share_target::accepts(&accepts, t)).cloned().collect();
-                (!takes.is_empty()).then(|| Target { app: id, name: m.app.name.clone(), takes })
+                if takes.is_empty() {
+                    return None;
+                }
+                let icon_svg = m.app.icon.as_deref().and_then(|i| portcullis_toml::icon::read_bundle_svg(&self.dir.join(&id), i));
+                Some(Target { app: id, name: m.app.name.clone(), takes, icon: m.app.icon.clone(), icon_svg })
             })
             .collect()
     }
@@ -155,13 +164,19 @@ mod tests {
         // only the installed one; a declared type list narrows.
         assert!(i.may_target("alice", "dev.alice.scratch.org.example.share") && !i.may_target("bob", "dev.alice.scratch.org.example.share"));
         assert!(!i.may_target("bob", "org.atrium.maps") && !i.may_target("bob", "../x"));
-        app(&d, "com.example.photos", "\n[roles]\nimplements = [\"share-target\"]\n\n[roles.share-target]\nmime = [\"image/*\"]\n");
+        app(&d, "com.example.photos", "icon = \"icons/app.svg\"\n\n[roles]\nimplements = [\"share-target\"]\n\n[roles.share-target]\nmime = [\"image/*\"]\n");
+        std::fs::create_dir_all(d.join("com.example.photos/icons")).unwrap();
+        std::fs::write(d.join("com.example.photos/icons/app.svg"), "<svg/>").unwrap();
         let pdf = vec!["application/pdf".to_string()];
         let png = vec!["image/png".to_string(), "text/plain".to_string()];
         let ids = |v: Vec<Target>| v.into_iter().map(|t| t.app).collect::<Vec<_>>();
         assert_eq!(ids(i.share_targets("bob", &pdf)), ["com.example.share"]);
         assert_eq!(ids(i.share_targets("bob", &png)), ["com.example.photos", "com.example.share"]);
         assert_eq!(i.share_targets("bob", &png)[0].takes, ["image/png"]);
+        // The icon: its own SVG from the bundle; none declared, none.
+        let t = i.share_targets("bob", &png);
+        assert_eq!((t[0].icon.as_deref(), t[0].icon_svg.as_deref()), (Some("icons/app.svg"), Some("<svg/>")));
+        assert_eq!((t[1].icon.as_deref(), t[1].icon_svg.as_deref()), (None, None));
         assert_eq!(ids(i.share_targets("alice", &pdf)), ["com.example.share", "dev.alice.scratch.org.example.share"]);
         std::fs::remove_dir_all(&d).unwrap();
     }

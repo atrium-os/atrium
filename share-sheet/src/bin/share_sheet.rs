@@ -27,7 +27,9 @@ use limen::proto::EmbedId;
 use pergola::event::{Event as Input, Key, KeyEventKind};
 use pergola::geom::Rect;
 use pergola::node::Node;
-use pergola::theme::{font, size::em, type_size, Weight};
+use forum_dock::icons::{self, AppIcon};
+use pergola::theme::{font, radius, size::em, type_size, Weight};
+use pergola::widgets::Glyph;
 use pergola::view::{Ctx, View};
 use pergola::window::StepResult;
 use pergola::{App, Color, Mutable, SizeSpec, TextStyle, Window, WindowDesc};
@@ -92,7 +94,51 @@ impl Shown {
 
 struct Pane {
     shown: Mutable<Shown>,
+    /// Each target's icon, worked out once.
+    marks: Vec<Mark>,
 }
+
+/// What a row shows for its app (forum.md §6.1, as the dock does).
+enum Mark {
+    /// The app's own SVG, as filled paths.
+    Vector(Arc<forum_dock::bundle_icon::VectorIcon>),
+    Icon(AppIcon),
+}
+
+impl Mark {
+    fn of(t: &Target) -> Mark {
+        match forum_dock::vector_icon(&t.app, t.icon_svg.as_deref()) {
+            Some(v) => Mark::Vector(v),
+            None => Mark::Icon(icons::for_app(&t.app, &t.name, t.icon.as_deref())),
+        }
+    }
+
+    /// On a `p`-point plate at (`x`, `y`).
+    fn draw(&self, ctx: &mut Ctx, x: f32, y: f32, p: f32) {
+        let t = ctx.theme;
+        match self {
+            Mark::Vector(v) => {
+                for f in v.placed(x, y, p) {
+                    ctx.add(Node::Fill(Arc::new(f)));
+                }
+            }
+            Mark::Icon(AppIcon::Glyph(g)) => {
+                ctx.add(Node::Rect { rect: Rect::new(x, y, p, p), fill: t.bg_surface(), radius: radius::SM });
+                let gs = em(ICON_GLYPH);
+                Glyph::new(*g).size(ICON_GLYPH).color(t.text_primary()).at(x + (p - gs) / 2.0, y + (p - gs) / 2.0).emit(ctx);
+            }
+            Mark::Icon(AppIcon::Letter(l, c)) => {
+                ctx.add(Node::Rect { rect: Rect::new(x, y, p, p), fill: *c, radius: radius::SM });
+                let size = type_size::MD;
+                ctx.add(Node::Text { rect: Rect::new(x, y + (p - em(size * 1.25)) / 2.0, p, em(size * 1.25)), content: l.to_string(), style: TextStyle { family: font::SANS.into(), size, weight: Weight::Semibold, color: Color::rgba(1.0, 1.0, 1.0, 1.0) } });
+            }
+        }
+    }
+}
+
+/// A row's icon plate and the glyph on it, in points.
+const ICON: f32 = 32.0;
+const ICON_GLYPH: f32 = 20.0;
 
 fn style(size: f32, weight: Weight, color: Color) -> TextStyle {
     TextStyle { family: font::SANS.into(), size, weight, color }
@@ -126,7 +172,7 @@ impl View for Pane {
         if s.targets.is_empty() {
             ctx.add(Node::Text { rect: Rect::new(24.0, y, 0.0, em(20.0)), content: "No app on this computer takes this.".into(), style: style(type_size::SM, Weight::Regular, t.text_primary()) });
         }
-        for (i, target) in s.targets.iter().take(ROWS).enumerate() {
+        for ((i, target), mark) in s.targets.iter().take(ROWS).enumerate().zip(&self.marks) {
             let row = ctx.push(Node::Rect { rect: Rect::new(16.0, y, W - 32.0, em(44.0)), fill: Color::TRANSPARENT, radius: 8.0 });
             let picked = s.selected == Some(i);
             if ctx.is_hovered(row) || ctx.is_pressed(row) || picked {
@@ -143,8 +189,10 @@ impl View for Pane {
                     shown.set(s);
                 }
             });
-            ctx.add(Node::Text { rect: Rect::new(28.0, y + em(6.0), 0.0, em(20.0)), content: cut(&target.name, 40), style: style(type_size::MD, Weight::Medium, t.text_primary()) });
-            ctx.add(Node::Text { rect: Rect::new(28.0, y + em(26.0), 0.0, em(16.0)), content: format!("{} · takes {}", cut(&target.app, 36), target.takes.join(", ")), style: style(type_size::XS, Weight::Regular, t.text_tertiary()) });
+            mark.draw(ctx, 28.0, y + (em(44.0) - em(ICON)) / 2.0, em(ICON));
+            let tx = 28.0 + em(ICON) + 12.0;
+            ctx.add(Node::Text { rect: Rect::new(tx, y + em(6.0), 0.0, em(20.0)), content: cut(&target.name, 36), style: style(type_size::MD, Weight::Medium, t.text_primary()) });
+            ctx.add(Node::Text { rect: Rect::new(tx, y + em(26.0), 0.0, em(16.0)), content: format!("{} · takes {}", cut(&target.app, 32), target.takes.join(", ")), style: style(type_size::XS, Weight::Regular, t.text_tertiary()) });
             ctx.pop();
             y += em(48.0);
         }
@@ -182,8 +230,9 @@ fn pane(embed: EmbedId, fresco: String, first: Shown, rx: Receiver<()>, tx: Send
     };
     let auto = std::env::var("SHARE_AUTO_PICK").ok().filter(|a| first.targets.iter().any(|t| &t.app == a));
     let dirty = Arc::new(AtomicBool::new(true));
+    let marks = first.targets.iter().take(ROWS).map(Mark::of).collect();
     let shown = Mutable::with_dirty(first, dirty.clone());
-    let mut app = App::new_with_flag(Pane { shown: shown.clone() }, dirty);
+    let mut app = App::new_with_flag(Pane { shown: shown.clone(), marks }, dirty);
     let _ = win.paint(&mut app);
     let mut ready = false;
     let mut sent = false;
@@ -295,7 +344,7 @@ mod tests {
     use super::*;
 
     fn shown(n: usize) -> Shown {
-        let targets = (0..n).map(|i| Target { app: format!("org.t.{i}"), name: format!("T{i}"), takes: vec![] }).collect();
+        let targets = (0..n).map(|i| Target { app: format!("org.t.{i}"), name: format!("T{i}"), takes: vec![], icon: None, icon_svg: None }).collect();
         Shown { targets, ..Default::default() }
     }
 

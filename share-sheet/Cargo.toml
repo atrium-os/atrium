@@ -32,3 +32,6 @@ fresco-client   = { path = "../fresco-client" }
 portcullis-peer = { path = "../portcullis/portcullis-peer" }
 pergola         = { path = "../pergola" }
 aqueduct        = { path = "../aqueduct" }
+# App icons as the dock draws them: system glyphs, letter tiles, and an
+# app's own SVG under the strict profile.
+forum-dock      = { path = "../forum-dock" }

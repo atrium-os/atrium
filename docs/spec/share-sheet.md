@@ -1,6 +1,6 @@
 # The share sheet: handing one item to an app the person picks
 
-Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 20/20 (limend-dev) and `scripts/vm-share-jail-check.sh` 13/13 (real jails). Crate `share-sheet/`
+Status: built 2026-11-18; VM gates on headless frescod (amd64 cloud VM, Haswell guest), 2026-11-18: `scripts/vm-share-check.sh` 21/21 (limend-dev) and `scripts/vm-share-jail-check.sh` 13/13 (real jails). Crate `share-sheet/`
 (the service and two demo apps), role messages `limen::share` and `limen::share_target`,
 limend's `CHOOSE`. Assigned to the Pergola thread on 2026-11-06 (pergola.md §1), built by
 the share-sheet thread.
@@ -122,7 +122,8 @@ mime = ["text/*", "image/*"]      # 1–32: a type, a family, or "*/*"
 ```
 
 portcullis-toml validates it (`is_mime_pattern`); without the section an app that implements
-the role takes anything. The sheet lists an installed app when it takes at least one of the
+the role takes anything. Each row shows the app's `[app] icon` as Forum's dock draws it (its own SVG read from the
+bundle under the strict profile, a system icon, or a letter tile). The sheet lists an installed app when it takes at least one of the
 item's types (`limen::share_target::accepts`), for the parent's person (her dev builds, nobody
 else's), never the sharing app itself.
 
@@ -173,10 +174,12 @@ Built and tested on Linux:
 In the amd64 cloud VM, on headless frescod with its real activation table (only `_share` 65045
 may spend `SHARE`) and injected clicks:
 
-- `scripts/vm-share-check.sh` (20/20, limend-dev, targets unconfined as `sharetgt`): no press
+- `scripts/vm-share-check.sh` (21/21, limend-dev, targets unconfined as `sharetgt`): no press
   gives `Failed`; Photos and Scraps are listed but not Maps nor the app itself; a press beside
   the sheet does nothing; the picture arrives by descriptor; Cancel starts nothing. With keys:
   Return before any pick chooses nothing, Escape cancels, Down Down Return chooses the second row.
+  Each row shows the app's icon as the dock does: a bundle SVG under the strict profile, a
+  system icon name, or a letter tile.
 - `scripts/vm-share-jail-check.sh` (13/13) runs it confined: the real limend as `_limen`
   (65022), portcullisd, the share sheet as `_share`, and three dev builds Run from a Scratch
   workspace (Notes with `embeds = ["share"]`, Scraps and Photos as targets). A click in jailed
@@ -193,7 +196,6 @@ may spend `SHARE`) and injected clicks:
 Not done yet:
 
 - Under Forum: the gates click straight into frescod; no launcher or Forum session is running.
-- App icons in the list (names only now).
 - Sharing across personas (refused by construction: targets run in the parent's persona).
 - Curia: the person's ordering or hiding of targets.
 - Notification actions over `CLASS_BROKER` (tabula.md §5) are a separate path, still not built.

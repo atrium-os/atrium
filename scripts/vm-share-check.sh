@@ -77,10 +77,13 @@ for u in "_share 65045" "shareapp 50911" "sharetgt 50912"; do
 done
 printf '50911 alice org.test.notes\n' > $S/registry
 mk() { mkdir -p $S/apps/\$1; printf '[app]\nid = "%s"\nname = "%s"\nversion = "1"\nentry = "bin/x"\n%b' "\$1" "\$2" "\$3" > $S/apps/\$1/atrium.toml; }
-mk org.test.scraps Scraps '\n[roles]\nimplements = ["share-target"]\n\n[roles.share-target]\nmime = ["text/*", "image/*"]\n'
-mk org.test.photos Photos '\n[roles]\nimplements = ["share-target"]\n\n[roles.share-target]\nmime = ["image/*"]\n'
+mk org.test.scraps Scraps 'icon = "icons/scraps.svg"\n\n[roles]\nimplements = ["share-target"]\n\n[roles.share-target]\nmime = ["text/*", "image/*"]\n'
+mk org.test.photos Photos 'icon = "image"\n\n[roles]\nimplements = ["share-target"]\n\n[roles.share-target]\nmime = ["image/*"]\n'
 mk org.test.maps Maps '\n[roles]\nimplements = ["map"]\n'
 mk org.test.notes Notes '\n[roles]\nimplements = ["share-target"]\n'
+# Scraps' own icon, a bundle SVG; Photos names a system icon.
+mkdir -p $S/apps/org.test.scraps/icons
+printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#C2410C"/><rect x="8" y="7" width="16" height="18" rx="2" fill="#FFF7ED"/><rect x="11" y="12" width="10" height="2" fill="#C2410C"/><rect x="11" y="17" width="7" height="2" fill="#C2410C"/></svg>' > $S/apps/org.test.scraps/icons/scraps.svg
 printf '\211PNG\r\n\032\n-a-picture-' > $S/lake.png; chmod 644 $S/lake.png
 chmod -R a+rX $S/apps $S/registry
 EOS
@@ -128,6 +131,7 @@ V "grep -q 'asked for the share sheet' $S/demo.log" && ok "a click on Share asks
 V "grep -q '2 types, 2 targets for alice' $S/sheet.log" && ok "the sheet spent the press and found Photos and Scraps (not Maps, not Notes itself)" || bad "targets: $(V "tail -4 $S/sheet.log | tr '\n' ';'")"
 sleep 10
 shot 2 share-sheet
+V "grep -q 'icon is not drawn' $S/sheet.log" && bad "an icon was refused: $(V "grep 'not drawn' $S/sheet.log")" || ok "Scraps' own SVG icon and Photos' system icon were taken (see share-sheet.png)"
 # frescod puts the 480 x 400 sheet at 140,48: rows from y 80, 48 each,
 # sorted by app id (Photos, Scraps).
 press 60 300
