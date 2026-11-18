@@ -1155,7 +1155,10 @@ impl Browser {
             Err(e) => sh.error = Some(e),
             Ok(m) => {
                 let code = m.split_once("recovery code ").map(|(_, c)| c.trim().to_string()).filter(|c| !c.is_empty());
-                let (label, ask) = (sh.label.clone(), sh.ask.clone());
+                // A stick opened with its code may answer the name it was
+                // given at format, before the places list catches up.
+                let label = m.split_once("; named ").map(|(_, n)| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| sh.label.clone());
+                let ask = sh.ask.clone();
                 match (ask, code) {
                     (StickAsk::Format { .. }, Some(code)) => {
                         sh.ask = StickAsk::Code { code };
@@ -1671,6 +1674,11 @@ mod tests {
         b.media_done(Ok("da0s1 opened for personal".into()));
         assert!(b.stick_sheet.is_none());
         assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("USB stick is open"));
+        b.ask_about(0);
+        b.ask_recovery();
+        b.confirm_stick(Some([7; 16]));
+        b.media_done(Ok("da0s1 opened for personal; named Holiday".into()));
+        assert_eq!(b.notice.as_ref().map(|n| n.text.as_str()), Some("Holiday is open"));
 
         // An older copy: open read-only, then make it current.
         b.ask_about(1);
