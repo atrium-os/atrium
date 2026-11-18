@@ -34,7 +34,14 @@
 #      the crash image below (kept for fsck) is the collected volume;
 #   9. a crash between the journal commit and the superblock write
 #      (kern.tessera.skip_next_sb, then a copy of the image): the copy
-#      mounts, replays the sealed ROOT_UPDATE and has the last file.
+#      mounts, replays the sealed ROOT_UPDATE and has the last file;
+#  10. older copies: refused below the high-water mark, read-only with an
+#      older-ro key, writable once made current;
+#  11. key groups (E4.2, encryption §5.4) on a fresh sealed image: a group
+#      can't be made without its key; made once; an empty quota domain goes
+#      into it, a non-empty one or a plain directory doesn't; after a
+#      remount the domain is in the group and open, locked with the key
+#      dropped, BAD with a wrong key, open again with the right one.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-arm64}"
@@ -52,7 +59,7 @@ deploy() {
     mkdir -p "$st/core" "$st/tools"
     cp -R "$TS/core/include" "$TS/core/src" "$st/core/"
     cp "$TS/tools/tessera-mkfs-sealed.c" "$TS/kmod/tessera-keyload.c" \
-        "$TS/kmod/tessera-gc.c" "$st/tools/"
+        "$TS/kmod/tessera-gc.c" "$TS/kmod/tessera-quota-set.c" "$st/tools/"
     tar --no-xattrs -cf - -C "$st" . | "$VSSH" "rm -rf $T && mkdir -p $T && tar xf - -C $T"
     rm -r "$st"
     "$VSSH" "cd $T/core/src && cc -O2 -I../include -I. -o $T/tessera-mkfs-sealed \
@@ -62,7 +69,8 @@ deploy() {
         b3_blake3_portable.c b3_shim.c tessera_reader.c crypt.c seal.c \
         -lmd -lcrypto && cc -O2 -I../include -o $T/tessera-keyload \
         ../../tools/tessera-keyload.c && cc -O2 -o $T/tessera-gc \
-        ../../tools/tessera-gc.c && echo tools built"
+        ../../tools/tessera-gc.c && cc -O2 -o $T/tessera-quota-set \
+        ../../tools/tessera-quota-set.c && echo tools built"
 }
 
 guest_script() {
@@ -250,9 +258,61 @@ tessera-keyload load $T/key $KID $U >/dev/null || fail "reload plain"
 echo "older copy: ok (made current at generation $G)"
 
 # kept for the host's fsck --key-file (the fsck subcommand)
+# 11. key groups (E4.2)
 mdconfig -d -u ${DEV#/dev/md}
 cp $IMG.crash $T/kept-$1.img && cp $T/key $T/kept-$1.key
-rm -f $IMG $IMG.crash $T/key $T/wrong
+rm -f $IMG $IMG.crash
+GKID=9e0000aa112233445566778899aabbcc
+head -c 32 /dev/random > $T/gkey; head -c 32 /dev/random > $T/gwrong
+U2=$(tessera-mkfs-sealed --key-file $T/key --key-id $KID --create -s 64 -j 64 \
+    $IMG | awk '/^uuid/ {print $2}') || fail "mkfs for groups"
+tessera-keyload drop $KID >/dev/null
+tessera-keyload load $T/key $KID $U2 >/dev/null || fail "load for groups"
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+mount -t tessera $DEV $M || fail "rw mount for groups"
+mkdir $M/persona $M/full $M/plain || fail "group dirs"
+tessera-quota-set $M/persona 1000000000 >/dev/null || fail "quota on persona"
+tessera-quota-set $M/full 1000000000 >/dev/null || fail "quota on full"
+echo 'already here' > $M/full/f
+tessera-keyload group-create $M $GKID 7 2>/dev/null && fail "group made with no key"
+tessera-keyload load-group $T/gkey $GKID $U2 7 >/dev/null || fail "load-group"
+tessera-keyload group-create $M $GKID 7 >/dev/null || fail "group-create"
+tessera-keyload group-create $M $GKID 7 2>/dev/null && fail "group made twice"
+tessera-keyload quota-group $M/full 7 2>/dev/null && fail "a non-empty domain went into a group"
+tessera-keyload quota-group $M/plain 7 2>/dev/null && fail "a plain directory went into a group"
+tessera-keyload quota-group $M/persona 8 2>/dev/null && fail "a domain went into a group that doesn't exist"
+tessera-keyload quota-group $M/persona 7 >/dev/null || fail "quota-group"
+tessera-keyload quota-group $M/persona 7 2>/dev/null && fail "a domain went into a group twice"
+echo 'persona note' > $M/persona/note.txt || fail "write in the group's domain"
+sync
+umount $M || fail "umount after groups"
+# dump DIR WANT: the console listing after a quota dump has WANT
+dump() {
+    n0=$(dmesg | wc -l)
+    tessera-keyload quota-dump $1 || fail "quota-dump"
+    dmesg | tail -n +$((n0 + 1)) > $T/dump
+    grep -qE "$2" $T/dump || { cat $T/dump; fail "dump lacks: $2"; }
+}
+mount -t tessera $DEV $M || fail "remount with groups"
+[ "$(cat $M/persona/note.txt)" = 'persona note' ] || fail "note after remount"
+dump $M 'root_inode=.* group=7 open'
+dump $M 'key group 7 gen=0 open'
+umount $M
+tessera-keyload drop $GKID >/dev/null || fail "drop group key"
+mount -t tessera $DEV $M || fail "mount with the group locked"
+dump $M 'group=7 locked'
+tessera-keyload load-group $T/gwrong $GKID $U2 7 >/dev/null || fail "load wrong group key"
+dump $M 'key group 7 gen=0 BAD'
+dump $M 'group=7 BAD'
+tessera-keyload drop $GKID >/dev/null
+tessera-keyload load-group $T/gkey $GKID $U2 7 >/dev/null || fail "reload group key"
+dump $M 'group=7 open'
+umount $M
+mdconfig -d -u ${DEV#/dev/md}
+tessera-keyload drop $GKID >/dev/null
+rm -f $IMG $T/gkey $T/gwrong $T/key $T/wrong
+echo "key groups: ok"
+
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload
 dmesg | tail -60 | grep -iE 'panic|tessera_fs: sealed' | tail -8

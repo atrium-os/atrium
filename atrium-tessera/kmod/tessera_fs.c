@@ -5673,7 +5673,7 @@ tessera_fs_groups_refresh(struct tessera_mount *tmp_)
 	for (uint32_t i = 0; i < tmp_->ngroups; i++) {
 		struct tessera_fs_group *g = &tmp_->groups[i];
 		uint8_t gk[32];
-		int have = tessera_keyring_get(g->rec.key_id, tmp_->sb.uuid,
+		int have = tessera_keyring_get(g->rec.key_id, tmp_->sb.volume_uuid,
 		    g->rec.group_id, gk, NULL, NULL) == 0;
 
 		if (!have) {
@@ -5688,7 +5688,7 @@ tessera_fs_groups_refresh(struct tessera_mount *tmp_)
 			tessera_group_keys_t *k = malloc(sizeof(*k), M_TESSERA,
 			    M_WAITOK | M_ZERO);
 			int r = tessera_group_keys_init(k, g->rec.suite, gk,
-			    tmp_->sb.uuid, g->rec.group_id);
+			    tmp_->sb.volume_uuid, g->rec.group_id);
 			if (r == TESSERA_OK)
 				r = tessera_key_group_verify(k, &g->rec);
 			if (r == TESSERA_OK) {
@@ -33331,10 +33331,35 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 			    d->dedup_policy == TESSERA_DEDUP_DEFERRED ? "DEFERRED" :
 			    d->dedup_policy == TESSERA_DEDUP_SALTED ? "SALTED" : "?";
 			printf("  domain %ju root_inode=%u policy=%s "
-			    "limit=%ju used=%ju\n",
+			    "limit=%ju used=%ju",
 			    (uintmax_t)d->domain_id, (unsigned)d->root_inode_no,
 			    pol, (uintmax_t)d->limit_bytes,
 			    (uintmax_t)d->used_bytes);
+			if (d->key_group != 0) {
+				/* §5.4: the group's state for this domain,
+				 * with its MAC checked. */
+				tessera_group_keys_t *gk = malloc(sizeof(*gk),
+				    M_TESSERA, M_WAITOK | M_ZERO);
+				int ge = tessera_fs_domain_keys(tmp_,
+				    d->domain_id, gk);
+				printf(" group=%ju %s", (uintmax_t)d->key_group,
+				    ge == 0 ? "open" : ge == EACCES ? "locked" :
+				    "BAD");
+				zfree(gk, M_TESSERA);
+			}
+			printf("\n");
+		}
+		if (tmp_->groups_sx_init) {
+			sx_xlock(&tmp_->groups_sx);
+			tessera_fs_groups_refresh(tmp_);
+			for (uint32_t i = 0; i < tmp_->ngroups; i++)
+				printf("  key group %ju gen=%ju %s\n",
+				    (uintmax_t)tmp_->groups[i].rec.group_id,
+				    (uintmax_t)tmp_->groups[i].rec.generation,
+				    tmp_->groups[i].bad ? "BAD" :
+				    tmp_->groups[i].keys != NULL ? "open" :
+				    "locked");
+			sx_xunlock(&tmp_->groups_sx);
 		}
 		return (0);
 	}
@@ -33406,12 +33431,12 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		if (a->group_id == 0 || a->group_id > TESSERA_KEY_GROUP_ID_MAX)
 			return (EINVAL);
 		uint8_t gk[32];
-		if (tessera_keyring_get(a->key_id, tmp_->sb.uuid, a->group_id,
+		if (tessera_keyring_get(a->key_id, tmp_->sb.volume_uuid, a->group_id,
 		    gk, NULL, NULL) != 0)
 			return (ENOENT);
 		tessera_group_keys_t *k = malloc(sizeof(*k), M_TESSERA,
 		    M_WAITOK | M_ZERO);
-		int r = tessera_group_keys_init(k, suite, gk, tmp_->sb.uuid,
+		int r = tessera_group_keys_init(k, suite, gk, tmp_->sb.volume_uuid,
 		    a->group_id);
 		explicit_bzero(gk, sizeof(gk));
 		int err = 0;
