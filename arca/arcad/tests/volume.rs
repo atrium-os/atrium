@@ -329,6 +329,47 @@ fn a_recovery_code_adopts_a_stick_from_elsewhere() {
     assert_eq!((st, p.as_slice()), (status::OK, &b"personal"[..]));
     assert_eq!(k2.lock().unwrap().loaded[0].1, key);
 
+    // Typed into Arca's recovery-code field (Scrinium never sees it): the
+    // handle, once, for the user who typed it, and only from that field.
+    k2.lock().unwrap().loaded.clear();
+    let hold = |t: &mut State, user: &str, v: &str, tag: Option<u8>| -> [u8; 16] {
+        let r = t.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| {
+            w.str(user);
+            w.raw(&[7; 32]);
+            w.str("org.atrium.scrinium");
+            w.bytes(v.as_bytes());
+            if let Some(b) = tag {
+                w.u8(b);
+            }
+        }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().try_into().unwrap()
+    };
+    let by_handle = |t: &mut State, user: &str, h: [u8; 16]| {
+        t.handle(&dispensatord(), volume_op::VK_ADOPT, &body(|w| {
+            w.str(user);
+            w.str("personal");
+            w.raw(&key_id);
+            w.raw(&UUID);
+            w.raw(slot);
+            w.u8(0);
+            w.str("");
+            w.raw(&h);
+        }))
+        .status
+    };
+    let h = hold(&mut t, "alice", &code, None);
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "a password field's value");
+    let h = hold(&mut t, "bob", &code, Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "another user's");
+    let h = hold(&mut t, "alice", &format!(" {code} "), Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(by_handle(&mut t, "alice", h), status::OK);
+    assert_eq!(k2.lock().unwrap().loaded[0].1, key);
+    assert_eq!(by_handle(&mut t, "alice", h), status::DENIED, "once");
+    // Nor is a recovery code's handle any app's to redeem.
+    let h = hold(&mut t, "alice", &code, Some(op::HOLD_FOR_RECOVERY));
+    assert_eq!(t.handle(&Label::Service(op::WIFI_SERVICE.into()), op::TAKE_WIFI, &h).status, status::DENIED);
+
     // A locked store adopts nothing.
     assert_eq!(t.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_eq!(adopt(&mut t, "alice", "personal", &key_id, UUID, slot, true, &code), status::LOCKED);

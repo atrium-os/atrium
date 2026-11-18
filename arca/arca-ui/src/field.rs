@@ -13,6 +13,16 @@ use limen::credential::{Handle, Purpose, ToParent, USERNAME_MAX};
 
 use crate::keymap::Key;
 
+/// The `U_HOLD` tag for what is typed into a field for `purpose`: who
+/// alone may redeem it (0: the app's own endpoints, as any password).
+pub fn hold_tag(purpose: Purpose) -> u8 {
+    match purpose {
+        Purpose::WifiPassphrase => arcad::proto::op::HOLD_FOR_WIFI,
+        Purpose::RecoveryCode => arcad::proto::op::HOLD_FOR_RECOVERY,
+        _ => 0,
+    }
+}
+
 /// The longest password the field takes by typing.
 pub const TYPED_MAX: usize = 1024;
 
@@ -133,6 +143,13 @@ impl Field {
         &self.typed.as_ref()[..self.len]
     }
 
+    /// A recovery code is drawn as typed, in Arca's own slot (the app
+    /// never sees the slot's pixels): 30 characters typed blind would be
+    /// mistyped. Every other field shows bullets.
+    pub fn shown_text(&self) -> Option<String> {
+        (self.purpose == Purpose::RecoveryCode && self.content == Content::Typed).then(|| String::from_utf8_lossy(self.typed()).to_uppercase())
+    }
+
     /// How many bullets to draw.
     pub fn bullets(&self) -> usize {
         match self.content {
@@ -165,7 +182,7 @@ impl Field {
         match self.purpose {
             Purpose::CurrentPassword => (0..self.accounts.len()).map(Offer::Account).collect(),
             Purpose::NewPassword => vec![Offer::Generate],
-            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase => Vec::new(),
+            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode => Vec::new(),
         }
     }
 

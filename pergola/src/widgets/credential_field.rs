@@ -61,6 +61,9 @@ impl CredentialField {
     pub fn one_time_code(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::OneTimeCode, state) }
     /// A Wi-Fi passphrase (Settings): only the Wi-Fi key service redeems it.
     pub fn wifi_passphrase(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::WifiPassphrase, state) }
+    /// A sealed stick's recovery code (Scrinium): only arcad's `VK_ADOPT`
+    /// redeems it.
+    pub fn recovery_code(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::RecoveryCode, state) }
 
     /// Let Arca fill this username field on the same press.
     pub fn username_field(mut self, u: Mutable<String>) -> Self {

@@ -1096,10 +1096,28 @@ fn stick_menu(sticks: &[atrium_media::Volume], note: Option<&str>) -> (Vec<MenuI
         parts.push(None);
     }
     for (i, v) in sticks.iter().enumerate() {
-        let ro = if v.read_only { ", read-only" } else { "" };
-        let head = MenuItem::new(format!("{} · {}, {} free{ro}", v.part, human_size(v.size_bytes), human_size(v.free_bytes))).enabled(false);
+        // A sealed stick (tessera-encryption.md §7.2): whose, or Locked.
+        // Unlocking and erasing are Scrinium's: they need Arca's field and
+        // a sheet that says what will be erased.
+        let whose = {
+            let mut c = v.persona.chars();
+            c.next().map(|f| format!("{}{}, ", f.to_uppercase(), c.as_str())).unwrap_or_default()
+        };
+        let text = if v.locked {
+            let what = if v.older { "older copy, Locked" } else { "Locked: encrypted stick from another machine or persona" };
+            format!("{} · {what}", v.part)
+        } else {
+            let ro = if v.older { ", older copy, read-only" } else if v.read_only { ", read-only" } else { "" };
+            format!("{} · {whose}{}, {} free{ro}", v.part, human_size(v.size_bytes), human_size(v.free_bytes))
+        };
+        let head = MenuItem::new(text).enabled(false);
         items.push(if i > 0 || note.is_some() { head.separated() } else { head });
         parts.push(None);
+        if v.locked {
+            let how = if v.older { "Open it read-only in Scrinium" } else if v.recovery { "Enter its recovery code in Scrinium" } else { "Erase it in Scrinium to use it" };
+            items.push(MenuItem::new(how.to_string()).enabled(false));
+            parts.push(None);
+        }
         items.push(MenuItem::new(format!("Eject {}", v.part)));
         parts.push(Some(v.part.clone()));
     }
@@ -1499,7 +1517,19 @@ mod tests {
     }
 
     fn stick(p: &str) -> atrium_media::Volume {
-        atrium_media::Volume { part: p.into(), label: String::new(), mountpoint: format!("/media/{p}"), size_bytes: 80_000_000, free_bytes: 1_900_000_000 / 100, read_only: false }
+        atrium_media::Volume { part: p.into(), label: String::new(), mountpoint: format!("/media/{p}"), size_bytes: 80_000_000, free_bytes: 1_900_000_000 / 100, read_only: false, persona: String::new(), locked: false, recovery: false, older: false }
+    }
+
+    #[test]
+    fn sealed_sticks_say_whose_and_locked_ones_say_where_to_open_them() {
+        let work = atrium_media::Volume { persona: "work".into(), ..stick("da0p1") };
+        let locked = atrium_media::Volume { mountpoint: String::new(), locked: true, recovery: true, ..stick("da1p1") };
+        let (items, parts) = stick_menu(&[work, locked], None);
+        let labels: Vec<String> = items.iter().map(|m| m.label.clone()).collect();
+        assert_eq!(labels[0], "da0p1 · Work, 80 MB, 19 MB free");
+        assert_eq!(labels[2], "da1p1 · Locked: encrypted stick from another machine or persona");
+        assert_eq!(labels[3], "Enter its recovery code in Scrinium");
+        assert_eq!(parts, [None, Some("da0p1".to_string()), None, None, Some("da1p1".to_string())]);
     }
 
     #[test]
