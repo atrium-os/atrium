@@ -109,3 +109,26 @@ fn local_children() {
     assert!(t.elapsed() < Duration::from_secs(10));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn stdio_worker() {
+    let dir = std::env::temp_dir().join(format!("atrium-worker-stdio-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::write(dir.join("bin/conv"), "#!/bin/sh\nread kind\necho \"note $kind\" >&2\ntr a-z A-Z\nexit 4\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("bin/conv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("atrium.toml"), "[[workers]]\nname = \"conv\"\nentry = \"bin/conv\"\n").unwrap();
+    let w = Workers::from_root(&dir, true).unwrap();
+    assert!(w.has("conv"));
+    let mut p = w.spawn_stdio("conv").unwrap();
+    let mut i = p.stdin.take().unwrap();
+    i.write_all(b"docx\nhello\n").unwrap();
+    drop(i);
+    let mut out = String::new();
+    p.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    let mut err = String::new();
+    p.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert_eq!((out.as_str(), err.as_str()), ("HELLO\n", "note docx\n"));
+    assert_eq!(p.wait(), Some(4));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

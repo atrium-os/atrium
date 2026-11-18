@@ -125,8 +125,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-message"
+version = "0.1.0"
+dependencies = [
+ "atrium-message-derive",
+]
+
+[[package]]
+name = "atrium-message-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "atrium-types"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-worker"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "autocfg"
@@ -1224,6 +1251,7 @@ version = "0.1.0"
 dependencies = [
  "arca-courier",
  "arca-store",
+ "atrium-worker",
  "getrandom 0.2.17",
  "mail-compose",
  "mail-pgp",

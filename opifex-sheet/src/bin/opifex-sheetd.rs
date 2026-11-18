@@ -72,8 +72,10 @@ fn decide(asker: u32, id: &str, show: impl FnOnce(Described) -> Result<Outcome, 
         Ok(other) => return Answer::Failed { why: format!("opifexd: {other:?}") },
         Err(why) => return Answer::Failed { why },
     };
-    if app.kind != "app" {
-        return Answer::Failed { why: format!("{id} is a {}, not an app", app.kind) };
+    // Apps and fonts are anyone's to install; layers, drivers and firmware
+    // are an administrator's (opifex.md decision 11), not the sheet's.
+    if app.kind != "app" && app.kind != "font" {
+        return Answer::Failed { why: format!("{id} is a {}, not an app or a font", app.kind) };
     }
     if app.installed.as_deref() == Some(app.latest.as_str()) {
         return Answer::Installed;
@@ -359,8 +361,8 @@ mod tests {
         assert_eq!(decide(1001, "org.atrium.hello", |_| panic!("no sheet")), Answer::Installed);
         h.join().unwrap();
 
-        // Not an app (a font, say): no sheet.
-        let (p, h) = fake("font", vec![Response::Described { app: Described { kind: "font".into(), ..app(None) } }]);
+        // Not an app or a font (a layer, say): no sheet.
+        let (p, h) = fake("layer", vec![Response::Described { app: Described { kind: "layer".into(), ..app(None) } }]);
         std::env::set_var("OPIFEX_SOCKET", &p);
         assert!(matches!(decide(1001, "org.atrium.hello", |_| panic!("no sheet")), Answer::Failed { why } if why.contains("not an app")));
         h.join().unwrap();

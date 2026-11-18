@@ -241,16 +241,102 @@ impl Workers {
     }
 }
 
+impl Workers {
+    /// Whether the app declares worker `name`.
+    pub fn has(&self, name: &str) -> bool { self.defs.contains_key(name) }
+
+    /// Start worker `name` on three pipes, for a worker with a protocol of
+    /// its own on standard input, output and error (a converter that
+    /// streams a file in and one out). Isolated as [`session`](Self::session)
+    /// is; not in-process.
+    pub fn spawn_stdio(&self, name: &str) -> Result<Stdio, Error> {
+        let def = self.defs.get(name).ok_or_else(|| Error::NoSuchWorker(name.into()))?.clone();
+        let (in_r, in_w) = io::pipe()?;
+        let (out_r, out_w) = io::pipe()?;
+        let (err_r, err_w) = io::pipe()?;
+        let fds: [OwnedFd; 3] = [in_r.into(), out_w.into(), err_w.into()];
+        let proc = match &self.mode {
+            Mode::InProcess { .. } => return Err(Error::Start("an in-process worker has no standard input".into())),
+            Mode::Local { root } => Proc::Child(spawn_fds(root, &def, fds, false)?),
+            Mode::Atrium { root } => {
+                if def.isolation.as_deref() == Some("capsicum") {
+                    Proc::Child(spawn_fds(root, &def, fds, true)?)
+                } else {
+                    let [a, b, c] = fds;
+                    let conn = worker_call_fds(name, [a.as_raw_fd(), b.as_raw_fd(), c.as_raw_fd()])?;
+                    drop((a, b, c));
+                    Proc::Jail(conn)
+                }
+            }
+        };
+        Ok(Stdio { stdin: Some(in_w), stdout: Some(out_r), stderr: Some(err_r), proc })
+    }
+}
+
+/// A worker started by [`Workers::spawn_stdio`]: its three pipes, and its
+/// end.
+pub struct Stdio {
+    pub stdin: Option<io::PipeWriter>,
+    pub stdout: Option<io::PipeReader>,
+    pub stderr: Option<io::PipeReader>,
+    proc: Proc,
+}
+
+impl Stdio {
+    /// Wait for it to end: `Some(code)`, or `None` when it was killed (a
+    /// limit, a signal).
+    pub fn wait(mut self) -> Option<i32> {
+        self.stdin = None;
+        match &mut self.proc {
+            Proc::Jail(c) => {
+                let _ = c.set_read_timeout(None);
+                match read_line(c) {
+                    Ok(v) if v["kind"] == "launch_exit" => v["code"].as_i64().map(|c| c as i32),
+                    _ => None,
+                }
+            }
+            Proc::Child(c) => {
+                use std::os::unix::process::ExitStatusExt;
+                c.wait().ok().and_then(|s| if s.signal().is_some() { None } else { s.code() })
+            }
+            Proc::Thread(_) => None,
+        }
+    }
+
+    /// End it now.
+    pub fn kill(&mut self) {
+        match &mut self.proc {
+            Proc::Jail(c) => { let _ = c.shutdown(std::net::Shutdown::Both); }
+            Proc::Child(c) => { let _ = c.kill(); }
+            Proc::Thread(_) => {}
+        }
+    }
+}
+
+impl Drop for Stdio {
+    fn drop(&mut self) {
+        match &mut self.proc {
+            Proc::Jail(c) => { let _ = c.shutdown(std::net::Shutdown::Both); }
+            Proc::Child(c) => { let _ = c.kill(); let _ = c.wait(); }
+            Proc::Thread(_) => {}
+        }
+    }
+}
+
 fn dup_stderr() -> io::Result<OwnedFd> {
     std::os::fd::AsFd::as_fd(&io::stderr()).try_clone_to_owned()
 }
 
 fn spawn(root: &Path, def: &WorkerDef, sock: UnixStream, err: OwnedFd, capsicum: bool) -> Result<std::process::Child, Error> {
+    let out: OwnedFd = err.try_clone()?;
+    spawn_fds(root, def, [OwnedFd::from(sock), out, err], capsicum)
+}
+
+fn spawn_fds(root: &Path, def: &WorkerDef, [i, o, e]: [OwnedFd; 3], capsicum: bool) -> Result<std::process::Child, Error> {
     use std::process::{Command, Stdio};
     let prog = root.join(def.entry.trim_start_matches('/'));
-    let out: OwnedFd = err.try_clone()?;
     let mut c = Command::new(&prog);
-    c.stdin(Stdio::from(OwnedFd::from(sock))).stdout(Stdio::from(out)).stderr(Stdio::from(err))
+    c.stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e))
         .env_clear().env("PATH", "/usr/bin:/bin");
     if capsicum { c.env(wire::CAPSICUM_ENV, "1"); }
     c.spawn().map_err(|e| Error::Start(format!("{}: {e}", prog.display())))
@@ -291,6 +377,10 @@ fn read_line(s: &mut UnixStream) -> io::Result<serde_json::Value> {
 /// `WorkerCall`: the worker's jail, on `sock` (stdin) and `err` (stdout,
 /// stderr). Returns the connection it lives by.
 fn worker_call(name: &str, sock: &UnixStream, err: &OwnedFd) -> Result<UnixStream, Error> {
+    worker_call_fds(name, [sock.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])
+}
+
+fn worker_call_fds(name: &str, fds: [std::os::fd::RawFd; 3]) -> Result<UnixStream, Error> {
     let start = |e: io::Error| Error::Start(format!("portcullisd: {e}"));
     let mut s = portcullisd().map_err(start)?;
     s.set_read_timeout(Some(Duration::from_secs(30))).map_err(start)?;
@@ -307,7 +397,7 @@ fn worker_call(name: &str, sock: &UnixStream, err: &OwnedFd) -> Result<UnixStrea
             ready["stage"].as_str().unwrap_or("?"), ready["message"].as_str().unwrap_or("?")))),
         _ => return Err(Error::Start(format!("portcullisd: {ready}"))),
     }
-    wire::send_with_fds(&s, &[sock.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()], b"F").map_err(start)?;
+    wire::send_with_fds(&s, &fds, b"F").map_err(start)?;
     s.set_read_timeout(None).map_err(start)?;
     Ok(s)
 }

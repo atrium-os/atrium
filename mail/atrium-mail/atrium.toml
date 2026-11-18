@@ -24,6 +24,13 @@ open-attachments = true
 # never a storm after a gap.
 notify = true
 
+# The parser (§4): every message is parsed here, in a jail of its own as
+# a uid of its own, with no capability (app-composition.md §4).
+[[workers]]
+name   = "parse"
+entry  = "bin/mail-parse-jail"
+memory = "512M"
+
 [[links]]
 schemes = ["mailto"]
 

@@ -151,6 +151,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-message"
+version = "0.1.0"
+dependencies = [
+ "atrium-message-derive",
+]
+
+[[package]]
+name = "atrium-message-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "atrium-open"
 version = "0.1.0"
 dependencies = [
@@ -188,6 +204,17 @@ version = "0.1.0"
 [[package]]
 name = "atrium-types"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-worker"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "libc",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "atrium-write"
@@ -1348,6 +1375,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "argon2",
+ "atrium-worker",
  "getrandom 0.2.17",
  "hmac",
  "libc",
@@ -1421,6 +1449,7 @@ dependencies = [
  "officina-shapes",
  "rustybuzz",
  "ttf-parser",
+ "unicode-bidi",
  "unicode-linebreak",
 ]
 
@@ -1534,6 +1563,7 @@ dependencies = [
  "limen",
  "log",
  "postcard",
+ "ropey",
  "serde",
  "swash",
  "tabula",
@@ -1541,6 +1571,7 @@ dependencies = [
  "tiny-skia-path 0.12.0",
  "unicode-linebreak",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1879,6 +1910,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ropey"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+dependencies = [
+ "smallvec",
+ "str_indices",
+]
+
+[[package]]
 name = "roxmltree"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2098,6 +2139,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "str_indices"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2198,6 +2245,7 @@ dependencies = [
  "aqueduct",
  "fresco-protocol",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "serde",
 ]
@@ -2464,6 +2512,12 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "universal-hash"

@@ -8,6 +8,7 @@
 //! The daemon (`atrium-dispensatord`) carries the ops out as root on
 //! FreeBSD; everything here is pure and runs in host tests.
 
+pub mod catalog;
 pub mod jail;
 pub mod media;
 pub mod plan;
