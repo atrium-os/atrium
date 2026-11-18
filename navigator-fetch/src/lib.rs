@@ -441,6 +441,15 @@ impl<'a> Conversation<'a> {
     /// the connection is never reused.
     pub fn open_stream(&mut self, url: &str, head_only: bool, range: Option<(u64, Option<u64>)>, if_range: Option<&str>,
                        accept: Option<&str>, post: Option<(&str, &[u8])>, head_wait: Duration) -> Result<Stream, FetchError> {
+        self.open_stream_as(url, head_only, range, if_range, accept, post, false, head_wait)
+    }
+
+    /// [`open_stream`](Self::open_stream); with `form`, a POST answered by
+    /// 301, 302 or 303 goes on as a GET without its body, as a browser does
+    /// after a form (nuntius `Method::Form`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_stream_as(&mut self, url: &str, head_only: bool, range: Option<(u64, Option<u64>)>, if_range: Option<&str>,
+                       accept: Option<&str>, mut post: Option<(&str, &[u8])>, form: bool, head_wait: Duration) -> Result<Stream, FetchError> {
         let mut current = url::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
         for redirects in 0..=MAX_REDIRECTS {
             let https = match current.scheme() { "https" => true, "http" => false, s => return Err(FetchError::Refused(format!("scheme {s}"))) };
@@ -473,7 +482,12 @@ impl<'a> Conversation<'a> {
             if matches!(head.status, 301 | 302 | 303 | 307 | 308) {
                 // A POST is never followed: its body would go to a place the client did
                 // not name (or, rewritten to GET, the answer would not be to the request).
-                if post.is_some() { return Err(FetchError::Refused(format!("redirect ({}) of a POST", head.status))) }
+                if post.is_some() {
+                    if !(form && matches!(head.status, 301 | 302 | 303)) {
+                        return Err(FetchError::Refused(format!("redirect ({}) of a POST", head.status)));
+                    }
+                    post = None;
+                }
                 let loc = head.header("location").ok_or(FetchError::Http(http::HttpError::Malformed("redirect without Location")))?;
                 let next = current.join(loc).map_err(|e| FetchError::BadUrl(e.to_string()))?;
                 if current.scheme() == "https" && next.scheme() != "https" { return Err(FetchError::Refused(format!("redirect downgrades to {next}"))) }

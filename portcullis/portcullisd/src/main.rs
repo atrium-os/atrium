@@ -601,6 +601,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 write_response(&mut writer, &refuse("cap.network_portal.denied: the caller's manifest does not hold network-portal".into()))?;
                 continue;
             };
+            // Only the sign-in window's own instance (PortalWindow started
+            // it): the person's everyday windows never reach private
+            // addresses or the network's resolvers.
+            if !is_portal_instance(uid) {
+                eprintln!("portcullisd: portal fetcher DENIED to {app} (uid {uid}): not its sign-in window");
+                write_response(&mut writer, &refuse("cap.network_portal.denied: only the sign-in window's instance".into()))?;
+                continue;
+            }
             let info = portcullisd::portal::info();
             let (dns, iface) = match info {
                 Ok(i) if !i.dns.is_empty() => (i.dns.join(","), i.iface),
@@ -779,6 +787,16 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ A New window in another persona (navigator-ui.md §2.4): the
          * caller's own app, by the PEER UID, with a press. */
+        /* ★ The captive portal's sign-in window (atrium-net.md §8.1 S3). */
+        if let Request::PortalWindow { activation } = req {
+            let resp = handle_portal_window(uid, &owner, activation, &shared);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
+        if matches!(req, Request::PortalStatus) {
+            write_response(&mut writer, &handle_portal_status(uid))?;
+            continue;
+        }
         if let Request::NewWindowIn { persona, activation } = req {
             let resp = handle_new_window_in(uid, &persona, activation, &shared);
             write_response(&mut writer, &resp)?;
@@ -1923,6 +1941,68 @@ fn start_for_instance(app: &str, persona: Option<&str>, owner: &str, why: &'stat
     });
 }
 
+/// Whether `uid` is an instance in the reserved sign-in persona.
+fn is_portal_instance(uid: u32) -> bool {
+    portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default()
+        .persona(uid).flatten() == Some(portcullis_peer::PORTAL_PERSONA)
+}
+
+/// PortalWindow (atrium-net.md §8.1 S3/S4): the sign-in window for the
+/// network the machine is on, as the person `owner`'s Navigator (the
+/// installed app holding `network-portal`) in the reserved portal persona.
+/// Started if it isn't running; brought forward on a press if it is.
+fn handle_portal_window(uid: u32, owner: &str, activation: Option<[u8; 16]>, shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::opens;
+    let refuse = |why: String| {
+        eprintln!("portcullisd: sign-in window REFUSED to uid {uid}: {why}");
+        Response::Error { message: why }
+    };
+    if is_portal_instance(uid) {
+        return refuse("that is the sign-in window".into());
+    }
+    if shared.lock().unwrap_or_else(|e| e.into_inner()).get_or_load(owner).is_err() {
+        return refuse(format!("{owner} is not a person with a policy"));
+    }
+    let Some(app) = launch::portal_app() else {
+        return refuse("no installed app holds network-portal".into());
+    };
+    let p = Some(portcullis_peer::PORTAL_PERSONA);
+    if launch::running_jid_instance(&app, p).is_some() {
+        let Some(press) = activation else {
+            eprintln!("portcullisd: sign-in window for {owner}: already open");
+            return Response::Ok;
+        };
+        if let Err(why) = opens::spend_press_for(&opens::activation_socket(), press, uid, fresco_protocol::activation::purpose::LINK) {
+            return refuse(why);
+        }
+        match launch::instance_uid(owner, &app, p).map(|u| opens::raise(&opens::activation_socket(), u)) {
+            Some(Ok(w)) => eprintln!("portcullisd: sign-in window for {owner}: window {w} brought forward"),
+            Some(Err(why)) => eprintln!("portcullisd: sign-in window for {owner}: not brought forward: {why}"),
+            None => eprintln!("portcullisd: sign-in window for {owner}: no uid for it"),
+        }
+    } else {
+        eprintln!("portcullisd: sign-in window for {owner}: starting {app} (asked by uid {uid})");
+        start_for_instance(&app, p, owner, "the sign-in window");
+    }
+    Response::Ok
+}
+
+/// PortalStatus: the sign-in window's network, for that window only.
+fn handle_portal_status(uid: u32) -> Response {
+    if !is_portal_instance(uid) {
+        eprintln!("portcullisd: portal status REFUSED to uid {uid}: not the sign-in window");
+        return Response::Error { message: "cap.network_portal.denied: only the sign-in window's instance".into() };
+    }
+    match portcullisd::portal::info() {
+        Ok(i) => {
+            let network = i.ssid.as_deref().map(|b| String::from_utf8_lossy(b).into_owned())
+                .filter(|n| !n.trim().is_empty()).unwrap_or_else(|| i.iface.clone());
+            Response::PortalStatus { start_url: i.start_url(), online: i.online == atrium_netconf::Online::Yes, network }
+        }
+        Err(why) => Response::Error { message: why },
+    }
+}
+
 /// NewWindowIn: the caller's own app in another of its person's personas,
 /// started or brought forward. Only an instanced app, only a persona the
 /// person has, never the caller's own; nothing goes with it, so no switch
@@ -1940,6 +2020,9 @@ fn handle_new_window_in(uid: u32, persona: &str, activation: [u8; 16], shared: &
     };
     if launch::not_instanced(&app).is_some() {
         return refuse(format!("{app} runs once for every persona"));
+    }
+    if here.as_deref() == Some(portcullis_peer::PORTAL_PERSONA) {
+        return refuse("the sign-in window opens no other windows".into());
     }
     let target = (persona != portcullis_policy::PERSONAL).then(|| persona.to_string());
     if target == here {
@@ -3368,6 +3451,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::WorkerCall { .. } => Response::Error {
             message: "WorkerCall must be routed through the peer-uid, fd-passing path".into(),
+        },
+        Request::PortalWindow { .. } | Request::PortalStatus => Response::Error {
+            message: "internal: the sign-in window's verbs go through the peer-uid path".into(),
         },
         Request::OpenPortalFetcher => Response::Error {
             message: "OpenPortalFetcher must be routed through the peer-uid, fd-passing path".into(),

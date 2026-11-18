@@ -429,8 +429,11 @@ fn post_server(status: u16) -> (SocketAddr, Arc<Mutex<Vec<(String, String, Vec<u
             }
             let body = buf[end..end + len].to_vec();
             let method = text.split(' ').next().unwrap_or("").to_string();
-            seen.lock().unwrap().push((method, hdr("content-type").unwrap_or_default(), body.clone()));
+            seen.lock().unwrap().push((method.clone(), hdr("content-type").unwrap_or_default(), body.clone()));
+            // The GET a form's redirect is followed with.
+            let status = if method == "GET" { 1 } else { status };
             let r = match status {
+                1 => "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nsigned in".to_string().into_bytes(),
                 302 => "HTTP/1.1 302 Found\r\nLocation: http://media.test/elsewhere\r\nContent-Length: 0\r\n\r\n".to_string().into_bytes(),
                 200 => {
                     let mut out = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
@@ -480,4 +483,19 @@ fn a_post_is_neither_retried_nor_redirected() {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(seen.lock().unwrap().len(), 1, "status {status}: one request only");
     }
+}
+
+#[test]
+fn a_forms_redirect_goes_on_as_a_get_without_its_body() {
+    let (addr, seen) = post_server(302);
+    let (n, rx) = post_instance(addr);
+    n.request(Request::Open(Open::form(1, "http://portal.test/login", b"accept=1".to_vec())));
+    let (k, got, err) = collect(&rx, 1);
+    assert_eq!(err, None);
+    assert_eq!(k, vec!["head 200", "done"]);
+    assert_eq!(got, b"signed in");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], ("POST".to_string(), "application/x-www-form-urlencoded".to_string(), b"accept=1".to_vec()));
+    assert_eq!((seen[1].0.as_str(), seen[1].2.len()), ("GET", 0));
 }
