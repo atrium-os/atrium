@@ -830,6 +830,13 @@ font on demand and a driver from a `nobody` device's notice.
   `jid 0` in dispensatord's line is jaild's sentinel for exec'd jails, not a failure.)
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
+- CJK packages (2026-11-18): `scripts/opifex-cjk-fonts.sh <out> --sign <platform key>` builds
+  Noto Sans JP, SC, TC, HK and KR 2.004 (regular and bold, OFL) from the
+  `@expo-google-fonts/noto-sans-*` 0.4.4 tarballs, each pinned by its npm sha512, with
+  `incoming/<id>.toml` requests for the catalog-blobs release `fonts-noto-cjk-2.004`.
+  `opifex/tests/cjk_fonts.rs` installs all five and checks atrium-fonts picks each one's forms
+  by hint; a scratch catalog took all five (`catalog add`, sync). Published once the platform key
+  and the repositories exist.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
   frescod with an installed package; the gate checks the library); the notice opening Curia's install page for a driver
   (it names the command for now); PCI devices in the lookup (dispensatord sees USB and HID

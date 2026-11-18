@@ -184,7 +184,11 @@ a Japanese label in the VM.
   officina-text's drawing (Write, Slides, the PDF export) and Pergola's
   client-side glyph atlas still draw the Noto Emoji outlines. Opifex installs font
   packages (opifex.md §14.7: `opifex font pack`, the pin list written by
-  opifexd); the CJK packages wait on being published to the catalog. Han forms follow the run's kana or Hangul and
+  opifexd). The CJK packages (`org.atrium.font.noto-sans-{jp,sc,tc,hk,kr}`
+  2.004, regular and bold, 11 to 21 MB each) are built by
+  `scripts/opifex-cjk-fonts.sh` from pinned npm tarballs and checked installed
+  (`opifex/tests/cjk_fonts.rs`: each hint picks its own forms, kana JP, Hangul KR);
+  they wait on the platform key and the catalog repositories to be published. Han forms follow the run's kana or Hangul and
   the document's language, then the locale; a per-person language setting
   (Curia) would beat the locale. Write has no command yet to set a run's
   language.
