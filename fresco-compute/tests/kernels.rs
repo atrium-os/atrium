@@ -46,6 +46,21 @@ pub fn scene() -> Scene {
                 ],
                 turn: Some([0.8660254, 0.5, -0.5, 0.8660254]),
             }],
+        }, GlyphBatch {
+            // Colour glyphs (emoji): the RGBA texture as their atlas, drawn
+            // in its own colours at the run's opacity, upright and turned.
+            atlas: 0,
+            runs: vec![GlyphRun {
+                origin: [30.0, 38.0],
+                color: [0.0, 0.0, 0.0, 0.8],
+                glyphs: vec![Glyph { d_offset: [0.0, 0.0], atlas_uv: [0.0, 0.0, 4.0, 4.0], bearing: [0.0, 4.0] }, Glyph { d_offset: [6.0, 0.0], atlas_uv: [1.0, 1.0, 3.0, 3.0], bearing: [0.5, 3.0] }],
+                turn: None,
+            }, GlyphRun {
+                origin: [12.5, 8.25],
+                color: [0.0, 0.0, 0.0, 1.0],
+                glyphs: vec![Glyph { d_offset: [0.0, 0.0], atlas_uv: [0.0, 0.0, 4.0, 4.0], bearing: [0.0, 4.0] }],
+                turn: Some([0.8660254, 0.5, -0.5, 0.8660254]),
+            }],
         }],
     }
 }

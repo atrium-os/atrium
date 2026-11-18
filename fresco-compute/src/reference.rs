@@ -6,7 +6,7 @@ use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
 /// Branch counters (feature `coverage`): what a corpus actually exercised.
 pub mod coverage {
     /// The branches counted, by index.
-    pub const NAMES: [&str; 33] = [
+    pub const NAMES: [&str; 35] = [
         "bin: empty bbox",
         "bin: bbox clipped to the target",
         "bin: bbox inside the target",
@@ -40,6 +40,8 @@ pub mod coverage {
         "layer still open after the last op",
         "turned glyph: outside its box",
         "turned glyph",
+        "colour glyph",
+        "turned colour glyph",
     ];
     #[cfg(feature = "coverage")]
     static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
@@ -254,6 +256,15 @@ fn glyph_texel(f: &Frame, t: [u32; 4], u: u32, v: u32, gw: i32, gh: i32, x: i32,
     texel(f, t, (u as i32).wrapping_add(x), (v as i32).wrapping_add(y))[0]
 }
 
+/// A colour glyph's texel, premultiplied, zero outside the glyph.
+fn glyph_rgba(f: &Frame, t: [u32; 4], u: u32, v: u32, gw: i32, gh: i32, x: i32, y: i32) -> [f32; 4] {
+    if x < 0 || y < 0 || x >= gw || y >= gh {
+        return [0.0; 4];
+    }
+    let c = texel(f, t, (u as i32).wrapping_add(x), (v as i32).wrapping_add(y));
+    [c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]]
+}
+
 /// raster.comp's `glyph_xf`: a glyph under a 2x2 turn ([`crate::KIND_GLYPH_XF`]).
 fn glyph_xf(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     let (p0, p2) = (o.p0, o.p2);
@@ -284,6 +295,16 @@ fn glyph_xf(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     let (ax, ay) = (tx - flx, ty - fly);
     let x = clamp_(flx, -1.0, fw) as i32;
     let y = clamp_(fly, -1.0, fh) as i32;
+    if t[3] == 0 {
+        hit(34);
+        let qa = mix4(glyph_rgba(f, t, u, v, gw, gh, x, y), glyph_rgba(f, t, u, v, gw, gh, x + 1, y), ax);
+        let qb = mix4(glyph_rgba(f, t, u, v, gw, gh, x, y + 1), glyph_rgba(f, t, u, v, gw, gh, x + 1, y + 1), ax);
+        let q = mix4(qa, qb, ay);
+        if q[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        return [q[0] / q[3], q[1] / q[3], q[2] / q[3], q[3] * o.p1[3]];
+    }
     let c00 = glyph_texel(f, t, u, v, gw, gh, x, y);
     let c10 = glyph_texel(f, t, u, v, gw, gh, x + 1, y);
     let c01 = glyph_texel(f, t, u, v, gw, gh, x, y + 1);
@@ -355,8 +376,12 @@ pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
     // KIND_GLYPH, and as the kernel does, any other kind.
     hit(if kind == crate::KIND_GLYPH { 9 } else { 10 });
     let uv = [mix(o.p2[0], o.p2[2], t[0]), mix(o.p2[1], o.p2[3], t[1])];
-    let cov = sample_bilinear(f, o.meta[1], uv)[0];
-    [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
+    let c = sample_bilinear(f, o.meta[1], uv);
+    if o.meta[1] < f.header.tex_count && f.tex[o.meta[1] as usize][3] == 0 {
+        hit(33);
+        return [c[0], c[1], c[2], c[3] * o.p1[3]];
+    }
+    [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * c[0]]
 }
 
 /// raster.comp's colour and layer stack (`KIND_PUSH` / `KIND_POP`).

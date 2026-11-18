@@ -123,8 +123,11 @@ fn check(name: &str, scene: &fc::Scene, w: u32, h: u32) -> Option<Stats> {
 
 #[test]
 fn matches_vulkan_renderer() {
-    // The Vulkan renderer has no filled paths and no turned glyph runs.
+    // The Vulkan renderer has no filled paths, no turned glyph runs and no
+    // colour glyphs.
     let mut scene = fc::Scene { fills: Vec::new(), ..kernels::scene() };
+    let textures = scene.textures.clone();
+    scene.glyph_batches.retain(|b| textures[b.atlas].format == fc::TexFormat::R8);
     for b in &mut scene.glyph_batches {
         b.runs.retain(|r| r.turn.is_none());
     }
