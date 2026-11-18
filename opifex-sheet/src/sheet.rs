@@ -171,6 +171,7 @@ pub(crate) fn described(installed: Option<&str>) -> Described {
         latest: "1.1".into(), publisher: "0123456789abcdef0123".into(), catalog: "Atrium".into(),
         capabilities: vec!["clipboard".into(), "network".into()], archive_size: 2_500_000,
         installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32), added: vec![],
+        ..Default::default()
     }
 }
 

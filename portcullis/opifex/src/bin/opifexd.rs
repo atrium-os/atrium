@@ -109,6 +109,8 @@ fn main() {
         require_content: opifex::app::require_content(std::path::Path::new(portcullis_trust::TRUST_CONFIG)),
         fetch_cmd: std::env::var("OPIFEX_FETCH").map(|v| v.split_whitespace().map(String::from).collect())
             .unwrap_or_else(|_| opifex::fetch::FETCH_CMD.iter().map(|s| s.to_string()).collect()),
+        fetch_any_cmd: std::env::var("OPIFEX_FETCH_ANY").map(|v| v.split_whitespace().map(String::from).collect())
+            .unwrap_or_else(|_| opifex::fetch::FETCH_ANY_CMD.iter().map(|s| s.to_string()).collect()),
         catalog_url: std::env::var("OPIFEX_CATALOG_URL").unwrap_or_else(|_| opifex::fetch::CATALOG_URL.into()),
         fonts: env("OPIFEX_FONTS", opifex::font::SYSTEM_FONTS),
         system: env("OPIFEX_SYSTEM", "/"),

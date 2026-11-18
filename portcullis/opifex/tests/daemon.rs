@@ -43,6 +43,7 @@ fn world(tag: &str) -> W {
         check_bin: PathBuf::from(env!("CARGO_BIN_EXE_opifex-check")), sandbox: false, worker_uid: 0, sheet_uid: Some(65042),
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
         fetch_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
+        fetch_any_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
         catalog_url: "https://example.org/cat/".into(),
         praeco: None, fonts: d.join("fonts"), system: d.join("sys"),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
@@ -98,7 +99,7 @@ fn catalog_install_update_rollback() {
     let w = world("cycle");
     publish(&w, "1.0", &elf(1));
     assert!(matches!(sync(&w), Response::Synced { entries: 1, .. }));
-    match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+    match ask(&w, 1001, Request::Describe { id: ID.into(), for_uid: None }) {
         Response::Described { app } => {
             assert_eq!((app.name.as_str(), app.latest.as_str(), app.installed.as_deref()), ("Hello", "1.0", None));
             assert_eq!(app.capabilities, vec!["clipboard".to_string()]);
@@ -170,7 +171,7 @@ fn the_sheet_installs_what_the_person_saw() {
     let w = world("sheet");
     publish(&w, "1.0", &elf(1));
     sync(&w);
-    let shown = match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+    let shown = match ask(&w, 1001, Request::Describe { id: ID.into(), for_uid: None }) {
         Response::Described { app } => app.manifest_sha256,
         other => panic!("{other:?}"),
     };
@@ -183,7 +184,7 @@ fn the_sheet_installs_what_the_person_saw() {
     sync(&w);
     assert!(err(ask(&w, 65042, approved(&shown))).contains("catalog changed"));
     assert!(w.daemon.store().get(ID).unwrap().is_none());
-    let now = match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+    let now = match ask(&w, 1001, Request::Describe { id: ID.into(), for_uid: None }) {
         Response::Described { app } => app.manifest_sha256,
         other => panic!("{other:?}"),
     };
@@ -265,7 +266,7 @@ fn updates_and_the_daily_round() {
     sync(&w);
     let p = pending(&w);
     assert_eq!((p[0].action, p[0].added.clone()), (Action::Ask, vec!["camera".to_string()]));
-    match ask(&w, 1001, Request::Describe { id: ID.into() }) {
+    match ask(&w, 1001, Request::Describe { id: ID.into(), for_uid: None }) {
         Response::Described { app } => assert_eq!(app.added, vec!["camera".to_string()]),
         other => panic!("{other:?}"),
     }
@@ -326,7 +327,7 @@ fn fonts_and_layers_from_the_catalog() {
     assert_eq!(ask(&w, 1001, Request::Search { text: "japanese".into() }), Response::Found { ids: vec![FONT.into()] });
 
     // A font: any person, through the sheet.
-    let sha = match ask(&w, 1001, Request::Describe { id: FONT.into() }) {
+    let sha = match ask(&w, 1001, Request::Describe { id: FONT.into(), for_uid: None }) {
         Response::Described { app } => {
             assert_eq!((app.kind.as_str(), app.name.as_str(), app.description.as_str()), ("font", "Test JP", "Japanese, sans serif"));
             assert!(app.capabilities.is_empty());
@@ -355,7 +356,7 @@ fn fonts_and_layers_from_the_catalog() {
     assert_ne!(fs::read_to_string(w.daemon.fonts.join("pins")).unwrap(), pins);
 
     // A layer: an administrator's.
-    let lsha = match ask(&w, 1001, Request::Describe { id: "rust".into() }) {
+    let lsha = match ask(&w, 1001, Request::Describe { id: "rust".into(), for_uid: None }) {
         Response::Described { app } => { assert_eq!(app.kind, "layer"); app.manifest_sha256 }
         other => panic!("{other:?}"),
     };
@@ -410,7 +411,7 @@ fn a_driver_with_its_firmware() {
     assert_eq!(opifex::driver::lookup(&idx, Some(((0x0bda, 0x8153), [0xff, 0, 0])), &[]), vec![drv.to_string()]);
 
     // An administrator's: not through the sheet.
-    let sha = match ask(&w, 1001, Request::Describe { id: drv.into() }) {
+    let sha = match ask(&w, 1001, Request::Describe { id: drv.into(), for_uid: None }) {
         Response::Described { app } => { assert_eq!((app.kind.as_str(), app.name.as_str()), ("driver", "Realtek USB Ethernet")); app.manifest_sha256 }
         other => panic!("{other:?}"),
     };
@@ -426,4 +427,162 @@ fn a_driver_with_its_firmware() {
     assert!(!sys.join(format!("usr/local/etc/atrium/devices.d/60-{drv}.toml")).exists());
     assert!(matches!(ask(&w, 0, Request::Uninstall { id: "org.atrium.firmware.rtl".into() }), Response::Done { .. }));
     assert!(!sys.join("usr/local/share/atrium/firmware/rtl8153").exists());
+}
+
+// ── C7: a catalog someone added ─────────────────────────────────────────────
+
+const TP: &str = "com.example.hello";
+const SHEET: u32 = 65042;
+
+struct Third { base: PathBuf, cat: K, roots: Vec<K> }
+
+/// A third-party catalog served at https://apps.example.com/cat/.
+fn third(w: &W) -> Third {
+    let base = w.d.join("web/apps.example.com/cat");
+    fs::create_dir_all(&base).unwrap();
+    let (r1, r2, cat) = (key(30), key(31), key(32));
+    let text = format!(
+        "schema = \"{}\"\nname = \"Example Apps\"\nversion = 1\nexpires = 4000000000\nthreshold = 2\n\n\
+         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n\
+         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"catalog\"]\n", oc::ROOT_SCHEMA, r1.pk, r2.pk, cat.pk);
+    fs::write(base.join("root.toml"), text).unwrap();
+    // The Atrium catalog "on the web" too, so a full sync reaches it.
+    let _ = std::os::unix::fs::symlink(w.d.join("cat"), w.d.join("web/example.org/cat"));
+    Third { base, cat, roots: vec![r1, r2] }
+}
+
+fn pub_entry(t: &Third, action: &str, id: &str, domains: &[&str], k: &K, signers: &[&K]) {
+    let mut p = oc::publisher::PublisherEntry {
+        id: id.into(), action: action.into(), name: "Example Ltd".into(), domains: domains.iter().map(|d| d.to_string()).collect(),
+        kinds: vec!["app".into()], devices: false, key: k.pk.clone(), sigs: vec![] };
+    for s in signers {
+        p.sign_with(&s.sk, &s.pk).unwrap();
+    }
+    let log = oc::Log::third_party(&t.base);
+    log.append(&[p.entry(now())]).unwrap();
+    log.sign_head(&t.cat.sk, now(), 14).unwrap();
+}
+
+fn pub_app(w: &W, t: &Third, id: &str, v: &str, k: &K, publisher: &str) {
+    let b = w.d.join(format!("tp-{id}-{v}"));
+    let _ = fs::remove_dir_all(&b);
+    fs::create_dir_all(b.join("bin")).unwrap();
+    fs::write(b.join("bin/hello"), elf(v.len() as u8)).unwrap();
+    fs::write(b.join("atrium.toml"), format!(
+        "[app]\nid = \"{id}\"\nname = \"Example Hello\"\nversion = \"{v}\"\nentry = \"bin/hello\"\n\n[capabilities]\nclipboard = true\n")).unwrap();
+    opifex::app::pack(&b, Some(&k.sk)).unwrap();
+    let bytes = opifex::archive::pack(&b).unwrap();
+    let sha = oc::hex(&Sha256::digest(&bytes));
+    fs::create_dir_all(w.d.join("web/dl.example.com")).unwrap();
+    fs::write(w.d.join(format!("web/dl.example.com/{id}-{v}.insula")), &bytes).unwrap();
+    let mut e = oc::release_entry(&b, opifex_arch(), &sha, bytes.len() as u64,
+                                  vec![format!("https://dl.example.com/{id}-{v}.insula")], &k.pk, now()).unwrap();
+    e.release.as_mut().unwrap().publisher = publisher.into();
+    let log = oc::Log::third_party(&t.base);
+    log.append(&[e]).unwrap();
+    log.sign_head(&t.cat.sk, now(), 14).unwrap();
+}
+
+#[test]
+fn a_catalog_someone_added() {
+    let w = world("third");
+    publish(&w, "1.0", &elf(1));
+    let t = third(&w);
+    let (k1, k2, k3, evil) = (key(40), key(41), key(42), key(43));
+    let pid = oc::publisher::publisher_id(&k1.pk).unwrap();
+    let eid = oc::publisher::publisher_id(&evil.pk).unwrap();
+    pub_entry(&t, "register", &pid, &["example.com"], &k1, &[&k1]);
+    pub_app(&w, &t, TP, "1.0", &k1, &pid);
+    // A publisher claiming a bank's domain, with no proof there.
+    pub_entry(&t, "register", &eid, &["bank.test"], &evil, &[&evil]);
+    pub_app(&w, &t, "test.bank.app", "1.0", &evil, &eid);
+    // example.com proves its publisher (the .well-known file).
+    fs::create_dir_all(w.d.join("web/example.com/.well-known")).unwrap();
+    fs::write(w.d.join("web/example.com/.well-known/atrium-publisher"), oc::publisher::proof_text(&pid)).unwrap();
+
+    let url = "https://apps.example.com/cat/";
+    let sha = match ask(&w, 1001, Request::PreviewCatalog { url: url.into() }) {
+        Response::CatalogPreview { name, root_sha256, warning, .. } => {
+            assert_eq!(name, "Example Apps");
+            assert!(warning.contains("nobody but its publisher"));
+            root_sha256
+        }
+        other => panic!("{other:?}"),
+    };
+    let add = |uid, machine, sha: &str| ask(&w, uid, Request::AddCatalog { url: url.into(), root_sha256: sha.into(), machine, for_uid: 1001 });
+    assert!(err(add(1001, false, &sha)).contains("administrator"), "a person adds one through the sheet");
+    assert!(err(add(SHEET, true, &sha)).contains("administrator"), "everyone's: an administrator's");
+    assert!(err(add(SHEET, false, &"00".repeat(32))).contains("changed since"));
+    match add(SHEET, false, &sha) {
+        Response::CatalogAdded { slug, summary, .. } => {
+            assert_eq!(slug, "apps.example.com");
+            assert!(summary.contains("1 releases offered") && summary.contains("not proven: bank.test"), "{summary}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(err(add(SHEET, false, &sha)).contains("added already"));
+
+    // Only the person who added it sees it; the unproven publisher's app is offered to nobody.
+    let described = |uid, for_uid, id: &str| ask(&w, uid, Request::Describe { id: id.into(), for_uid });
+    match described(1001, None, TP) {
+        Response::Described { app } => {
+            assert!(app.third_party);
+            assert_eq!((app.publisher.as_str(), app.publisher_name.as_str(), app.catalog.as_str()), (pid.as_str(), "Example Ltd", "Example Apps"));
+            assert_eq!(app.publisher_domains, vec!["example.com".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(err(described(1002, None, TP)).contains("not in the catalog"));
+    assert!(err(described(1002, Some(1001), TP)).contains("not in the catalog"), "for_uid only from the sheet");
+    assert!(matches!(described(SHEET, Some(1001), TP), Response::Described { .. }));
+    assert!(err(described(1001, None, "test.bank.app")).contains("not in the catalog"));
+    assert_eq!(ask(&w, 1001, Request::Search { text: "example hello".into() }), Response::Found { ids: vec![TP.into()] });
+    assert_eq!(ask(&w, 1002, Request::Search { text: "example hello".into() }), Response::Found { ids: vec![] });
+    match ask(&w, 1002, Request::Catalogs) { Response::Catalogs { items } => assert_eq!(items.len(), 1), o => panic!("{o:?}") }
+    match ask(&w, 1001, Request::Catalogs) {
+        Response::Catalogs { items } => {
+            assert_eq!(items.len(), 2);
+            assert!(items[1].third_party && !items[1].machine && items[1].added_by == 1001);
+            assert!(items[1].publishers.iter().any(|p| p.contains("proven: example.com")));
+            assert!(items[1].publishers.iter().any(|p| p.contains("proven: none")));
+        }
+        o => panic!("{o:?}"),
+    }
+
+    // Installed through the sheet, for that person.
+    let msha = match described(SHEET, Some(1001), TP) { Response::Described { app } => app.manifest_sha256, o => panic!("{o:?}") };
+    assert_eq!(ask(&w, SHEET, Request::InstallApproved { id: TP.into(), manifest_sha256: msha, for_uid: 1001 }),
+               Response::Done { id: TP.into(), version: "1.0".into() });
+    let rec = w.daemon.store().get(TP).unwrap().unwrap();
+    assert_eq!((rec.source.as_str(), rec.publisher.as_str(), rec.installed_by), ("catalog:apps.example.com", pid.as_str(), 1001));
+
+    // A rotated key is the same publisher: the update goes in the background.
+    pub_entry(&t, "rotate", &pid, &["example.com"], &k2, &[&k1, &k2]);
+    pub_app(&w, &t, TP, "1.1", &k2, &pid);
+    match ask(&w, 0, Request::Sync { from: String::new() }) {
+        Response::Synced { others, .. } => assert!(others.iter().any(|o| o.starts_with("apps.example.com: ")), "{others:?}"),
+        o => panic!("{o:?}"),
+    }
+    let ups = match ask(&w, 1001, Request::Updates) { Response::Updates { items, .. } => items, o => panic!("{o:?}") };
+    let u = ups.iter().find(|u| u.id == TP).unwrap();
+    assert_eq!((u.to.as_str(), u.action), ("1.1", Action::Background));
+    assert!(matches!(ask(&w, 0, Request::Tick), Response::Ticked { .. }));
+    assert_eq!(w.daemon.store().get(TP).unwrap().unwrap().version, "1.1");
+
+    // A recovery (two root keys): the next update asks the person again.
+    pub_entry(&t, "recover", &pid, &["example.com"], &k3, &[&t.roots[0], &t.roots[1], &k3]);
+    pub_app(&w, &t, TP, "1.2", &k3, &pid);
+    ask(&w, 0, Request::Sync { from: String::new() });
+    let ups = match ask(&w, 1001, Request::Updates) { Response::Updates { items, .. } => items, o => panic!("{o:?}") };
+    let u = ups.iter().find(|u| u.id == TP).unwrap();
+    assert_eq!(u.action, Action::Ask);
+    assert!(u.why.contains("recovery"), "{}", u.why);
+    match described(SHEET, Some(1001), TP) { Response::Described { app } => assert!(app.recovered), o => panic!("{o:?}") }
+
+    // Removing it: another person may not; the one who added it may. The app stays; its updates stop.
+    assert!(err(ask(&w, 1002, Request::RemoveCatalog { slug: "apps.example.com".into() })).contains("only an administrator"));
+    assert_eq!(ask(&w, 1001, Request::RemoveCatalog { slug: "apps.example.com".into() }), Response::Ok);
+    assert!(w.daemon.root.join("apps").join(TP).is_dir());
+    let ups = match ask(&w, 1001, Request::Updates) { Response::Updates { items, .. } => items, o => panic!("{o:?}") };
+    assert!(!ups.iter().any(|u| u.id == TP));
 }

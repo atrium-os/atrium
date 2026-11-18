@@ -81,7 +81,7 @@ fn main() -> ExitCode {
         "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
-        | "updates" | "update-care" | "tick" => ask_daemon(&args[1..]),
+        | "updates" | "update-care" | "tick" | "catalogs" | "follow" | "unfollow" => ask_daemon(&args[1..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
         other => { eprintln!("opifex: unknown command: {other}"); usage(); return ExitCode::from(2); }
     };
@@ -124,7 +124,10 @@ fn usage() {
            updates             what is waiting, and why\n  \
            update-care <id> notify|auto   wait for me / the publisher's timing\n  \
            tick                the daily round now (root)\n  \
-           update-all          apply every waiting update (root)\n\n\
+           update-all          apply every waiting update (root)\n  \
+           catalogs            the catalogs followed: the Atrium one and those people added\n  \
+           follow <https://…> [<root sha256> [--everyone]]   show, then follow, a catalog (root)\n  \
+           unfollow <slug>     stop following one; its apps stay, their updates stop\n\n\
          font|driver|firmware pack <tree> --manifest <atrium.toml> [--sign <key.pem>]   (opifex.md §8)\n  \
            driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>   look a device up in the synced catalog\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
@@ -224,7 +227,7 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
 
     let arg = |i: usize| args.get(i).cloned().ok_or_else(|| format!("{}: missing argument", args[0]));
     let req = match args[0].as_str() {
-        "describe" => Request::Describe { id: arg(1)? },
+        "describe" => Request::Describe { id: arg(1)?, for_uid: None },
         "search" => Request::Search { text: arg(1)? },
         "installed" => Request::Installed,
         "get" => Request::Install { id: arg(1)? },
@@ -239,6 +242,15 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         "updates" => Request::Updates,
         "update-care" => Request::SetUpdates { id: arg(1)?, care: arg(2)? },
         "tick" => Request::Tick,
+        "catalogs" => Request::Catalogs,
+        // `opifex follow <url>` shows what it is; `opifex follow <url> <sha256>
+        // [--everyone]` follows it (root; a person adds one on the sheet).
+        "follow" => match args.get(2) {
+            None => Request::PreviewCatalog { url: arg(1)? },
+            Some(sha) => Request::AddCatalog { url: arg(1)?, root_sha256: sha.clone(),
+                                               machine: args.iter().any(|a| a == "--everyone"), for_uid: 0 },
+        },
+        "unfollow" => Request::RemoveCatalog { slug: arg(1)? },
         _ => unreachable!(),
     };
     match opifex::proto::ask(&req)? {
@@ -257,7 +269,28 @@ fn ask_daemon(args: &[String]) -> Result<(), String> {
         }
         Response::Found { ids } => { for i in ids { println!("  {i}"); } Ok(()) }
         Response::Done { id, version } => { println!("opifex: {id} {version}: done"); Ok(()) }
-        Response::Synced { entries, releases } => { println!("opifex: catalog checked: {entries} entries, {releases} releases"); Ok(()) }
+        Response::Synced { entries, releases, others } => {
+            println!("opifex: catalog checked: {entries} entries, {releases} releases");
+            for o in others {
+                println!("  {o}");
+            }
+            Ok(())
+        }
+        Response::Catalogs { items } => {
+            for c in items {
+                let whose = if !c.third_party { "Atrium".to_string() } else if c.machine { "everyone".into() } else { format!("uid {}", c.added_by) };
+                println!("{:<24} {:<20} {:>5} releases  for {whose}  {}", if c.slug.is_empty() { "-" } else { &c.slug }, c.name, c.releases, c.url);
+                for p in c.publishers {
+                    println!("    {p}");
+                }
+            }
+            Ok(())
+        }
+        Response::CatalogPreview { url, name, root_sha256, warning } => {
+            println!("{name} at {url}\nroot.toml sha256 {root_sha256}\n{warning}");
+            Ok(())
+        }
+        Response::CatalogAdded { slug, name, summary } => { println!("opifex: following {name} as {slug}: {summary}"); Ok(()) }
         Response::Updates { items, last_sync, last_error } => {
             println!("last checked: {}{}", if last_sync == 0 { "never".into() } else { format!("{last_sync} (unix time)") },
                      if last_error.is_empty() { String::new() } else { format!(", failed: {last_error}") });

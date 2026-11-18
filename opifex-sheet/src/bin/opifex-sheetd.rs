@@ -66,7 +66,7 @@ fn decide(asker: u32, id: &str, show: impl FnOnce(Described) -> Result<Outcome, 
     if !plain_id(id) {
         return Answer::Failed { why: "not an app id".into() };
     }
-    let app = match opifexd(&Request::Describe { id: id.into() }, Duration::from_secs(10)) {
+    let app = match opifexd(&Request::Describe { id: id.into(), for_uid: Some(asker) }, Duration::from_secs(10)) {
         Ok(Response::Described { app }) => app,
         Ok(Response::Error { message }) => return Answer::Failed { why: message },
         Ok(other) => return Answer::Failed { why: format!("opifexd: {other:?}") },
@@ -332,6 +332,7 @@ mod tests {
             id: "org.atrium.hello".into(), kind: "app".into(), name: "Hello".into(), description: String::new(),
             latest: "1.1".into(), publisher: "k".into(), catalog: "Atrium".into(), capabilities: vec![],
             archive_size: 1, installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32), added: vec![],
+            ..Default::default()
         }
     }
 

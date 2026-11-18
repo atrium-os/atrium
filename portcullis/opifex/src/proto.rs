@@ -15,8 +15,10 @@ pub const MAX_LINE: usize = 64 * 1024;
 pub enum Request {
     /// What is installed.
     Installed,
-    /// What the catalog says about an id (no network).
-    Describe { id: String },
+    /// What the catalog says about an id (no network). `for_uid`: from the
+    /// sheet or root, describe it as that person sees the catalogs (their
+    /// own added catalogs too); ignored from anyone else.
+    Describe { id: String, #[serde(default)] for_uid: Option<u32> },
     /// Ids whose id, name or description contains `text`.
     Search { text: String },
     /// Install the newest release of `id` from the local catalog, downloading
@@ -43,9 +45,20 @@ pub enum Request {
     /// where the catalog says it lives; or an `https://` base) through the
     /// fetcher, or from a folder.
     Sync { from: String },
+    /// The catalogs this person sees (C7).
+    Catalogs,
+    /// What adding the catalog at `url` would add: its name and its
+    /// `root.toml`'s hash, for the sheet to show before the press. Anyone.
+    PreviewCatalog { url: String },
+    /// Follow the catalog at `url`, whose `root.toml` hashes to
+    /// `root_sha256` (what the person pressed for). From the sheet for the
+    /// person `for_uid`; `machine` (everyone's) only from an administrator.
+    AddCatalog { url: String, root_sha256: String, machine: bool, for_uid: u32 },
+    /// Stop following a catalog: an administrator, or the person who added it.
+    RemoveCatalog { slug: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Described {
     pub id: String,
     pub kind: String,
@@ -64,6 +77,18 @@ pub struct Described {
     /// installed one doesn't (what the sheet shows).
     #[serde(default)]
     pub added: Vec<String>,
+    /// The publisher's name and the domains it proved (C7; empty for the
+    /// Atrium catalog's platform key).
+    #[serde(default)]
+    pub publisher_name: String,
+    #[serde(default)]
+    pub publisher_domains: Vec<String>,
+    /// From a catalog someone added, not the Atrium catalog.
+    #[serde(default)]
+    pub third_party: bool,
+    /// Its publisher's key was replaced by a recovery since it was installed.
+    #[serde(default)]
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,7 +98,10 @@ pub enum Response {
     Described { app: Described },
     Found { ids: Vec<String> },
     Done { id: String, version: String },
-    Synced { entries: u64, releases: usize },
+    Synced { entries: u64, releases: usize, #[serde(default)] others: Vec<String> },
+    Catalogs { items: Vec<crate::catalogs::Listed> },
+    CatalogPreview { url: String, name: String, root_sha256: String, warning: String },
+    CatalogAdded { slug: String, name: String, summary: String },
     Updates { items: Vec<crate::updates::Pending>, last_sync: u64, last_error: String },
     Ticked { installed: Vec<String>, waiting: usize },
     Ok,

@@ -35,6 +35,9 @@ pub const URL_MAX: usize = 2048;
 pub enum Ask {
     /// GET `url` (https only), at most `max` bytes.
     Get { url: String, max: u64 },
+    /// The TXT records of `name`, one per line (a publisher's domain proof,
+    /// C7). No records: an empty body.
+    Txt { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +57,14 @@ pub fn plain_https(url: &str) -> bool {
             !host.is_empty() && !host.contains('@') && rest.bytes().all(|b| b.is_ascii_graphic())
         })
 }
+
+/// The fetcher that may reach any https host: third-party catalogs, their
+/// archives, publishers' domain proofs and WebAuthn RP checks (C7). The
+/// Atrium catalog keeps its narrowed fetcher.
+pub const FETCH_ANY_APP: &str = "org.atrium.opifex.fetch-any";
+pub const FETCH_ANY_CMD: &[&str] = &["/usr/local/bin/portcullis", "launch", "--no-prompt", FETCH_ANY_APP];
+/// The largest proof or `.well-known` file read.
+pub const PROOF_MAX: u64 = 16 << 10;
 
 /// `base` joined with a catalog `path` (`head`, `entries/000000`).
 pub fn join(base: &str, path: &str) -> String {
@@ -88,10 +99,24 @@ impl Fetcher {
         if !plain_https(url) {
             return Err(format!("{url}: not a plain https URL"));
         }
+        self.ask(&Ask::Get { url: url.into(), max }, url, max)
+    }
+
+    /// The TXT records of `name`.
+    pub fn txt(&mut self, name: &str) -> Result<Vec<String>, String> {
+        if !txt_name_ok(name) {
+            return Err(format!("{name}: not a DNS name"));
+        }
+        let b = self.ask(&Ask::Txt { name: name.into() }, name, PROOF_MAX)?;
+        let t = String::from_utf8(b).map_err(|_| format!("{name}: TXT not UTF-8"))?;
+        Ok(t.lines().map(str::to_string).collect())
+    }
+
+    fn ask(&mut self, ask: &Ask, url: &str, max: u64) -> Result<Vec<u8>, String> {
         self.start()?;
         let r = (|| {
             let (_, i, o) = self.run.as_mut().expect("started");
-            let mut line = serde_json::to_vec(&Ask::Get { url: url.into(), max }).map_err(|e| e.to_string())?;
+            let mut line = serde_json::to_vec(ask).map_err(|e| e.to_string())?;
             line.push(b'\n');
             i.write_all(&line).and_then(|_| i.flush()).map_err(|e| format!("fetcher: {e}"))?;
             let mut back = String::new();
@@ -131,8 +156,16 @@ impl Drop for Fetcher {
     fn drop(&mut self) { self.stop() }
 }
 
-/// The fetcher's end: answer each [`Ask`] on `input` with `get`, until EOF.
-pub fn serve(input: impl Read, mut out: impl Write, mut get: impl FnMut(&str, u64) -> Result<Vec<u8>, String>) -> io::Result<()> {
+/// A name a TXT lookup may ask for (as Nuntius checks it).
+pub fn txt_name_ok(n: &str) -> bool {
+    n.len() <= 253 && n.split('.').count() >= 2
+        && n.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
+/// The fetcher's end: answer each [`Ask`] on `input` with `get` (and TXT
+/// lookups with `txt`), until EOF.
+pub fn serve(input: impl Read, mut out: impl Write, mut get: impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+             mut txt: impl FnMut(&str) -> Result<Vec<String>, String>) -> io::Result<()> {
     let mut input = BufReader::new(input);
     loop {
         let mut line = String::new();
@@ -144,6 +177,16 @@ pub fn serve(input: impl Read, mut out: impl Write, mut get: impl FnMut(&str, u6
                 if b.len() as u64 > max { Err(format!("bigger than {max} bytes")) } else { Ok(b) }
             }),
             Ok(Ask::Get { .. }) => Err("not a plain https URL".into()),
+            Ok(Ask::Txt { name }) if txt_name_ok(&name) => txt(&name).map(|v| {
+                let mut b = Vec::new();
+                for t in v.iter().filter(|t| !t.contains('\n')) {
+                    b.extend_from_slice(t.as_bytes());
+                    b.push(b'\n');
+                }
+                b.truncate(PROOF_MAX as usize);
+                b
+            }),
+            Ok(Ask::Txt { .. }) => Err("not a DNS name".into()),
             Err(e) => Err(format!("bad ask: {e}")),
         };
         let (head, body) = match got {
@@ -178,8 +221,18 @@ mod tests {
                     Ask::Get { url: "http://a/x".into(), max: 10 }];
         let input: Vec<u8> = asks.iter().flat_map(|a| { let mut v = serde_json::to_vec(a).unwrap(); v.push(b'\n'); v }).collect();
         let mut out = Vec::new();
-        serve(&input[..], &mut out, |u, _| Ok(u.as_bytes()[8..].to_vec())).unwrap();
+        serve(&input[..], &mut out, |u, _| Ok(u.as_bytes()[8..].to_vec()), |_| Ok(Vec::new())).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert_eq!(s, "{\"ok\":{\"len\":3}}\na/x{\"err\":{\"why\":\"bigger than 2 bytes\"}}\n{\"err\":{\"why\":\"not a plain https URL\"}}\n");
+    }
+
+    #[test]
+    fn txt_lookups() {
+        let asks = [Ask::Txt { name: "_atrium-publisher.example.com".into() }, Ask::Txt { name: "bad name".into() }];
+        let input: Vec<u8> = asks.iter().flat_map(|a| { let mut v = serde_json::to_vec(a).unwrap(); v.push(b'\n'); v }).collect();
+        let mut out = Vec::new();
+        serve(&input[..], &mut out, |_, _| Err("no".into()), |n| Ok(vec![format!("for {n}"), "two".into()])).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("{\"ok\":{\"len\":38}}\nfor _atrium-publisher.example.com\ntwo\n{\"err\""), "{s}");
     }
 }
