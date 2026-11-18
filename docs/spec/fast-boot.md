@@ -158,6 +158,15 @@ descriptors ride jaild's exec path as §4.9 intended.
   atrium_volumes` — drop `portcullisd` (the old multi-tenant daemon script,
   whose REQUIRE pulls in NETWORKING DAEMON). Add `BEFORE: netif` so the jailed
   tree, frescod and the login screen start while rc does the network.
+- That also puts the tree ahead of `/etc/rc.d/devfs` (it REQUIREs
+  mountcritremote, after NETWORKING), which is what loads the devfs rulesets.
+  jaild refuses a jail whose ruleset has no rules, so the `atrium_jaild` rc
+  script loads every file in `devfs_rulesets` before jaild starts, and Atrium
+  hosts set `devfs_load_rulesets="NO"`: rc.d/devfs reloads by deleting and
+  re-adding each ruleset, and a jail mounted in that gap would see the host's
+  whole /dev. `service atrium_jaild devfsrules` reloads after the rules file
+  changes. (Found by the first B1 gate run: every service was refused with
+  `devfs_ruleset.not_loaded`.)
 - Host daemons that do not need the network move before it too:
   `atrium_dispensatord` (needs devd — fine, devd is early), `atrium_zram`,
   `atrium_memoryd`, `atrium_memfed` (today REQUIRE `sshd` for bring-up

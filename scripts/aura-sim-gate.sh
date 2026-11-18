@@ -145,7 +145,7 @@ setup() {
         "$V" "set -e
             install -m 755 /tmp/aura/aura-mlme /usr/local/bin/atrium-aura-mlme
             install -m 755 /tmp/aura/aura-keys /usr/local/bin/atrium-aura-keys
-            service devfs restart >/dev/null
+            sh -c '. /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets' >/dev/null
             for id in 28 29; do [ -n \"\$(devfs rule -s \$id show)\" ] || { echo ruleset \$id not loaded; exit 1; }; done
             for j in aura-mlme aura-keys; do
                 J=/var/lib/atrium/jails/\$j

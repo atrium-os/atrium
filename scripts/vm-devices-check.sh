@@ -59,7 +59,7 @@ cd /root/d
 install -d -m 0755 /usr/local/etc/atrium/devices.d
 install -o root -g wheel -m 0644 rules/*.toml /usr/local/etc/atrium/devices.d/
 install -m 0644 atrium.devfs.rules /usr/local/etc/atrium/devfs.rules
-service devfs restart >/dev/null 2>&1
+sh -c ". /etc/rc.subr; load_rc_config devfs; devfs_init_rulesets" >/dev/null 2>&1
 service atrium-dispensatord stop >/dev/null 2>&1
 install -m 0755 atrium-dispensatord /usr/local/bin/atrium-dispensatord
 install -m 0555 atrium-dispensatord.rc /usr/local/etc/rc.d/atrium-dispensatord
