@@ -440,7 +440,7 @@ impl Live {
                                 self.to_child(c.embed, &ToChild::ScrollTo { anchor: fragment });
                             }
                         }
-                        LinkAction::Handoff { url, scheme } => s.handoff(&url, &scheme, crate::ui::now_ms()),
+                        LinkAction::Handoff { url, scheme, app } => s.handoff(&url, &scheme, app, crate::ui::now_ms()),
                         LinkAction::Blocked { why } => s.last_note = Some(format!("link refused: {why}")),
                         LinkAction::Consented { url } => {
                             eprintln!("navigator-ui: the reader's answer on {url} is kept; it opens again with the site knowing you");

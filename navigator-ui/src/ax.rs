@@ -119,7 +119,10 @@ pub fn prompt_text(p: &Prompt) -> String {
         Prompt::FetchAgain => "This page could not be restored and will be fetched again".into(),
         Prompt::Play { origin } => format!("{origin} wants to play sound"),
         Prompt::Handoff { url, scheme } => format!("This link is for another program ({scheme}): {url}"),
-        Prompt::OpenApp { name, .. } => format!("This link opens the app {name}"),
+        Prompt::OpenApp { name, about, .. } => match crate::trail::app_words(name, about.as_ref()) {
+            (n, Some(by), asks) => format!("This link opens the app {n} by {by}; it {asks}"),
+            (n, None, why) => format!("This link opens the app {n}, {why}"),
+        },
         Prompt::Stored { at_s } => format!("The version you saw {}, from the store, offline", crate::clock::when_label(*at_s, crate::clock::now_s())),
     }
 }
