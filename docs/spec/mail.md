@@ -1459,8 +1459,9 @@ Stalwart in the cloud VM, and later a real account):
    A wall-clock time becomes a moment with the offset of that moment, so a
    daylight-saving change in between is right. Tests: the date and choice functions on
    wall-clock times, and a test that what is chosen is what is shown; both suites pass
-   under UTC, Asia/Kolkata and America/New_York. **Not yet**: app jails don't get
-   `/etc/localtime` or `TZ` yet (asked of the platform), so on Atrium this is still UTC.
+   under UTC, Asia/Kolkata and America/New_York. On Atrium, app and worker jails get
+   the machine's zone file as `/etc/localtime` (portcullis-jail, 9e07795); a changed zone
+   reaches Mail on its next launch.
 
 ## 17. Decisions, with recommendations
 
