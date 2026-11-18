@@ -171,7 +171,7 @@ impl Engine {
 
     /// [`Engine::deliver`] over JMAP (§6.1): the server files the copy in
     /// Sent itself, and holds it until later when it can.
-    pub fn deliver_jmap<H: mail_sync::jmap::Http>(&self, id: u64, client: &mut mail_sync::jmap::Client<H>) -> Result<Delivery, Error> {
+    pub fn deliver_jmap(&self, id: u64, client: &mut dyn mail_sync::jmap::Jmap) -> Result<Delivery, Error> {
         let t = now();
         if !self.store.write(|w| w.claim_send(id, t))? {
             return Ok(Delivery::NotDue);

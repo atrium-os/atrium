@@ -129,6 +129,52 @@ pub fn open_imap(courier: UnixStream) -> Result<Box<dyn Imap>, String> {
     }
 }
 
+/// A JMAP session with `session`, its JSON read in the `sync` worker when
+/// there is one, the worker asking Mail for each HTTP exchange over `h`
+/// (Arca's courier); else here.
+pub fn open_jmap(h: Box<dyn mail_sync::jmap::Http>, session: &str) -> Result<Box<dyn mail_sync::jmap::Jmap>, String> {
+    match sync_worker()? {
+        Some((i, o, proc)) => {
+            let remote = mail_sync::remote::Remote::connect_jmap(h, i, o, session).map_err(|e| e.to_string())?;
+            Ok(Box::new(JmapInWorker { remote, _proc: Killed(proc) }))
+        }
+        None => Ok(Box::new(mail_sync::jmap::Client::connect(h, session).map_err(|e| e.to_string())?)),
+    }
+}
+
+/// A worker that is killed when dropped.
+struct Killed(SyncProc);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        match &mut self.0 {
+            SyncProc::Worker(w) => w.kill(),
+            SyncProc::Child(c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
+/// A JMAP session in the `sync` worker, with the worker it runs in.
+struct JmapInWorker<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd> {
+    remote: mail_sync::remote::Remote<I, O>,
+    _proc: Killed,
+}
+
+impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd> mail_sync::jmap::Jmap for JmapInWorker<I, O> {
+    fn sync(&mut self, sink: &mut dyn mail_sync::Sink) -> mail_sync::jmap::Result<mail_sync::Report> {
+        mail_sync::jmap::Jmap::sync(&mut self.remote, sink)
+    }
+    fn send(&mut self, message: &[u8], from: &str, rcpts: &[String], send_at: Option<i64>) -> mail_sync::jmap::Result<String> {
+        mail_sync::jmap::Jmap::send(&mut self.remote, message, from, rcpts, send_at)
+    }
+    fn can_hold(&self, secs: i64) -> bool {
+        self.remote.can_hold(secs)
+    }
+}
+
 /// Send one message over a submission `courier`, its replies read in the
 /// `sync` worker when there is one, else here.
 pub fn submit(courier: UnixStream, o: &mail_sync::submit::Outgoing<'_>) -> Result<mail_sync::submit::Sent, mail_sync::submit::SendError> {
@@ -256,14 +302,13 @@ impl Engine {
 
     fn pass_jmap(&self, account: AccountId, cfg: &AccountConfig, session: &str, net: &dyn Connect) -> Result<Pass, String> {
         let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
-        let h = net.jmap(session, &item)?;
-        let mut client = mail_sync::jmap::Client::connect(h, session).map_err(|e| e.to_string())?;
+        let mut client = open_jmap(net.jmap(session, &item)?, session)?;
         let mut pass = Pass { report: client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?, ..Default::default() };
         for (id, o) in self.due_sends().map_err(|e| e.to_string())? {
             if o.account != account {
                 continue;
             }
-            match self.deliver_jmap(id, &mut client).map_err(|e| e.to_string())? {
+            match self.deliver_jmap(id, client.as_mut()).map_err(|e| e.to_string())? {
                 Delivery::Sent { .. } => pass.sent += 1,
                 Delivery::Failed { why, .. } => pass.failed.push(why),
                 _ => {}

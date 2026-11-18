@@ -218,3 +218,44 @@ fn a_message_is_submitted_through_the_worker() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A JMAP server that serves its session and answers every API call with
+/// an error, recording what it was asked.
+struct Jmap(Arc<Mutex<Vec<String>>>);
+
+impl mail_sync::jmap::Http for Jmap {
+    fn get(&mut self, url: &str, _: usize) -> Result<Vec<u8>, String> {
+        self.0.lock().unwrap().push(format!("GET {url}"));
+        if url != "https://jmap.test/session" {
+            return Err(format!("404 {url}"));
+        }
+        Ok(br#"{"capabilities":{"urn:ietf:params:jmap:core":{},"urn:ietf:params:jmap:mail":{},"urn:ietf:params:jmap:submission":{}},
+            "accounts":{"u1":{"name":"ada","accountCapabilities":{"urn:ietf:params:jmap:mail":{},"urn:ietf:params:jmap:submission":{"maxDelayedSend":3600}}}},
+            "primaryAccounts":{"urn:ietf:params:jmap:mail":"u1"},"apiUrl":"https://jmap.test/api/",
+            "downloadUrl":"https://jmap.test/d/{accountId}/{blobId}/{name}?type={type}","uploadUrl":"https://jmap.test/u/{accountId}/","state":"s"}"#
+            .to_vec())
+    }
+    fn post(&mut self, url: &str, _: &str, _: &[u8], _: usize) -> Result<Vec<u8>, String> {
+        self.0.lock().unwrap().push(format!("POST {url}"));
+        Err("503 busy".into())
+    }
+}
+
+#[test]
+fn jmap_runs_in_the_worker_with_the_http_here() {
+    use mail_sync::jmap::{Client, Jmap as _};
+    let url = "https://jmap.test/session";
+    let (here, there) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+    let mut l = Client::connect(Jmap(here.clone()), url).unwrap();
+    let (i, o) = worker();
+    let mut r = Remote::connect_jmap(Box::new(Jmap(there.clone())), i, o, url).unwrap();
+    assert!(r.can_hold(600) && !r.can_hold(7200));
+    assert_eq!(l.can_hold(600), r.can_hold(600));
+    let (le, re) = (mail_sync::jmap::Jmap::sync(&mut l, &mut Log::default()).unwrap_err(), mail_sync::jmap::Jmap::sync(&mut r, &mut Log::default()).unwrap_err());
+    assert_eq!(le.0, re.0, "the same error as here");
+    let rcpts = ["b@x.example".to_string()];
+    let (le, re) = (l.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err(), r.send(b"Subject: x\r\n\r\nx\r\n", "a@x.example", &rcpts, None).unwrap_err());
+    assert_eq!(le.0, re.0);
+    // Every exchange the worker wanted went over Mail's HTTP, the same as here.
+    assert_eq!(*here.lock().unwrap(), *there.lock().unwrap());
+}

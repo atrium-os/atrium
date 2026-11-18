@@ -252,8 +252,9 @@ fn jmap_sync_changes_and_send() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
     let account = engine.store.add_account("ada@example.org").unwrap();
-    let mut client = Client::connect(Fake(server.clone()), SESSION).unwrap();
-    assert!(client.session.can_submit);
+    assert!(Client::connect(Fake(server.clone()), SESSION).unwrap().session.can_submit);
+    // In the sync worker when MAIL_SYNC_WORKER names one, else here.
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
 
     // ── first sync ──
     let r = client.sync(&mut engine.sink(account)).unwrap();
@@ -340,7 +341,7 @@ fn jmap_sync_changes_and_send() {
     };
     let id = engine.send(account, &draft, When::default()).unwrap();
     assert!(engine.send_now(id).unwrap());
-    let d = engine.deliver_jmap(id, &mut client).unwrap();
+    let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert_eq!(d, Delivery::Sent { copy: None, rejected: vec![], held: false });
     assert!(engine.store.outbox().unwrap().is_empty());
     {
@@ -361,7 +362,7 @@ fn jmap_sync_changes_and_send() {
     let other = Draft { from: Mailbox::new("Ada", "ada@elsewhere.example"), subject: "x".into(), ..draft };
     let id = engine.send(account, &other, When::default()).unwrap();
     assert!(engine.send_now(id).unwrap());
-    let d = engine.deliver_jmap(id, &mut client).unwrap();
+    let d = engine.deliver_jmap(id, client.as_mut()).unwrap();
     assert!(matches!(d, Delivery::Failed { transient: false, .. }), "{d:?}");
 }
 
