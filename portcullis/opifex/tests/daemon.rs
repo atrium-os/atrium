@@ -33,7 +33,7 @@ fn world(tag: &str) -> W {
         "schema = \"{}\"\nname = \"Atrium\"\nversion = 1\nexpires = 4000000000\nthreshold = 1\n\n\
          [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"root\"]\n\n\
          [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"catalog\"]\n\n\
-         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\", \"font\", \"layer\"]\n",
+         [[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\", \"font\", \"layer\", \"driver\", \"firmware\"]\n",
         oc::ROOT_SCHEMA, r1.pk, r2.pk, cat.pk, plat.pk);
     fs::create_dir_all(d.join("cat")).unwrap();
     fs::write(d.join("cat/root.toml"), &text).unwrap();
@@ -44,7 +44,7 @@ fn world(tag: &str) -> W {
         trust: portcullis_trust::Trust::new(d.join("pubs"), true), require_content: true, lock: Mutex::new(()),
         fetch_cmd: vec![env!("CARGO_BIN_EXE_opifex-fetch").into(), "--dir".into(), d.join("web").display().to_string()],
         catalog_url: "https://example.org/cat/".into(),
-        praeco: None, fonts: d.join("fonts"),
+        praeco: None, fonts: d.join("fonts"), system: d.join("sys"),
         sysroot: { let s = d.join("sysroot"); fs::create_dir_all(s.join("libexec")).unwrap(); fs::write(s.join("libexec/ld-elf.so.1"), b"rtld").unwrap(); s },
     };
     W { d, plat, cat, daemon }
@@ -382,4 +382,48 @@ fn fonts_and_layers_from_the_catalog() {
     assert!(!w.daemon.fonts.join(FONT).exists());
     assert!(matches!(ask(&w, 0, Request::Uninstall { id: "rust".into() }), Response::Done { .. }));
     assert!(!w.daemon.root.join("layers/rust@1.101.0").exists());
+}
+
+#[test]
+fn a_driver_with_its_firmware() {
+    let w = world("driver");
+    let drv = "org.atrium.driver.rtl";
+    let fw = w.d.join("fwpkg");
+    fs::create_dir_all(&fw).unwrap();
+    fs::write(fw.join("rtl8153a-4.fw"), b"blob").unwrap();
+    opifex::driver::pack_firmware(&fw, "kind = \"firmware\"\n[firmware]\nid = \"org.atrium.firmware.rtl\"\nname = \"RTL firmware\"\n\
+        version = \"1\"\nlicense = \"LicenseRef-Realtek\"\nplace = \"jailed\"\ndir = \"rtl8153\"\n", Some(&w.plat.sk)).unwrap();
+    publish_dir(&w, &fw, "any", "fw1");
+    let t = w.d.join("drvpkg");
+    fs::create_dir_all(&t).unwrap();
+    fs::write(t.join("rtl"), elf(3)).unwrap();
+    fs::write(t.join("devices.toml"), format!("[[rule]]\nname = \"rtl\"\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\nnodes = [\"ugen{{bus}}.{{addr}}\"]\n\
+        owner = \"driver:rtl\"\n\n[driver.rtl]\nexec = \"/usr/local/libexec/atrium/drivers/{drv}/rtl\"\nargv = [\"rtl\"]\nuid = 65060\ngid = 65060\n\
+        jail = \"atrium-rtl-{{usb}}\"\nroot = \"/var/lib/atrium/jails/rtl-{{usb}}\"\ndevfs_ruleset = 30\nsysfil = \"device\"\n")).unwrap();
+    opifex::driver::pack_driver(&t, &format!("kind = \"driver\"\n[driver]\nid = \"{drv}\"\nname = \"Realtek USB Ethernet\"\nversion = \"1.0\"\n\
+        license = \"BSD-2-Clause\"\nfirmware = [\"org.atrium.firmware.rtl\"]\n\n[[match]]\nclass = \"usb\"\nusb_ids = [\"0bda:8153\"]\n"), Some(&w.plat.sk)).unwrap();
+    publish_dir(&w, &t, opifex_arch(), "d1");
+    assert!(matches!(sync(&w), Response::Synced { entries: 2, .. }));
+
+    // The lookup is local: devices.idx after the sync.
+    let idx = fs::read_to_string(w.daemon.state.join("devices.idx")).unwrap();
+    assert_eq!(opifex::driver::lookup(&idx, Some(((0x0bda, 0x8153), [0xff, 0, 0])), &[]), vec![drv.to_string()]);
+
+    // An administrator's: not through the sheet.
+    let sha = match ask(&w, 1001, Request::Describe { id: drv.into() }) {
+        Response::Described { app } => { assert_eq!((app.kind.as_str(), app.name.as_str()), ("driver", "Realtek USB Ethernet")); app.manifest_sha256 }
+        other => panic!("{other:?}"),
+    };
+    assert!(err(ask(&w, 65042, Request::InstallApproved { id: drv.into(), manifest_sha256: sha, for_uid: 1001 })).contains("administrator"));
+    assert_eq!(ask(&w, 0, Request::Install { id: drv.into() }), Response::Done { id: drv.into(), version: "1.0".into() });
+    let sys = &w.daemon.system;
+    assert!(sys.join(format!("usr/local/etc/atrium/devices.d/60-{drv}.toml")).is_file());
+    assert!(sys.join(format!("usr/local/libexec/atrium/drivers/{drv}/rtl")).is_file());
+    assert_eq!(fs::read(sys.join("usr/local/share/atrium/firmware/rtl8153/rtl8153a-4.fw")).unwrap(), b"blob");
+    assert_eq!(w.daemon.store().get("org.atrium.firmware.rtl").unwrap().unwrap().kind, "firmware");
+
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: drv.into() }), Response::Done { .. }));
+    assert!(!sys.join(format!("usr/local/etc/atrium/devices.d/60-{drv}.toml")).exists());
+    assert!(matches!(ask(&w, 0, Request::Uninstall { id: "org.atrium.firmware.rtl".into() }), Response::Done { .. }));
+    assert!(!sys.join("usr/local/share/atrium/firmware/rtl8153").exists());
 }

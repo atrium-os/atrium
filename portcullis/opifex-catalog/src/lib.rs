@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod driver;
 pub mod font;
 
 use base64::Engine;
@@ -363,6 +364,16 @@ pub struct Described {
 /// toolchain layer or a font package).
 pub fn describe(manifest: &str) -> Result<Described, String> {
     let v: toml::Value = manifest.parse().map_err(|e| format!("manifest: {e}"))?;
+    if v.get("kind").and_then(|k| k.as_str()) == Some("driver") {
+        let m = driver::DriverManifest::from_str(manifest)?;
+        let content = (!m.driver.content.is_empty()).then(|| m.driver.content.clone());
+        return Ok(Described { kind: "driver".into(), id: m.driver.id, version: m.driver.version, arches: Vec::new(), content });
+    }
+    if v.get("kind").and_then(|k| k.as_str()) == Some("firmware") {
+        let m = driver::FirmwareManifest::from_str(manifest)?;
+        let content = (!m.firmware.content.is_empty()).then(|| m.firmware.content.clone());
+        return Ok(Described { kind: "firmware".into(), id: m.firmware.id, version: m.firmware.version, arches: vec![font::ARCH.into()], content });
+    }
     if v.get("kind").and_then(|k| k.as_str()) == Some("font") {
         let m = font::FontManifest::from_str(manifest)?;
         let content = (!m.font.content.is_empty()).then(|| m.font.content.clone());

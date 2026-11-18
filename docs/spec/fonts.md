@@ -167,8 +167,9 @@ a Japanese label in the VM.
   paragraph's direction in Write.
 - Tessera already holds a content hash for every file; once the VFS exposes it
   the library can compare that with the pinned value instead of hashing.
-- Colour emoji waits on colour glyph support (Noto Emoji outlines meanwhile). CJK packages wait on Opifex
-  publishing them (its step C6). Han forms follow the run's kana or Hangul and
+- Colour emoji waits on colour glyph support (Noto Emoji outlines meanwhile). Opifex installs font
+  packages (opifex.md §14.7: `opifex font pack`, the pin list written by
+  opifexd); the CJK packages wait on being published to the catalog. Han forms follow the run's kana or Hangul and
   the document's language, then the locale; a per-person language setting
   (Curia) would beat the locale. Write has no command yet to set a run's
   language.

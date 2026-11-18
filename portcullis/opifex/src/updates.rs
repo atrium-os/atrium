@@ -61,7 +61,7 @@ pub fn caps(manifest: &str) -> Vec<String> {
 /// The app's display name, if the manifest gives one.
 pub fn name(manifest: &str) -> Option<String> {
     let v: toml::Value = manifest.parse().ok()?;
-    let sec = v.get("app").or_else(|| v.get("font"))?;
+    let sec = ["app", "font", "driver", "firmware"].iter().find_map(|k| v.get(*k))?;
     sec.get("name")?.as_str().map(str::to_string)
 }
 

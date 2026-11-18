@@ -76,7 +76,8 @@ fn main() -> ExitCode {
         "list"      => cmd_list(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "layer"     => cmd_layer(&args[2..]),
-        "font"      => cmd_font(&args[2..]),
+        "font" | "driver" | "firmware" => cmd_pack_kind(&args[1], &args[2..]),
+        "driver-for" => driver_for(&args[2..]),
         "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
@@ -124,7 +125,8 @@ fn usage() {
            update-care <id> notify|auto   wait for me / the publisher's timing\n  \
            tick                the daily round now (root)\n  \
            update-all          apply every waiting update (root)\n\n\
-         font pack <tree> --manifest <atrium.toml> [--sign <key.pem>]   a font package (opifex.md §8.1)\n\n\
+         font|driver|firmware pack <tree> --manifest <atrium.toml> [--sign <key.pem>]   (opifex.md §8)\n  \
+           driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>   look a device up in the synced catalog\n\n\
          --root:    Atrium state root, installed INTO (default {DEFAULT_ROOT}).\n\
          --sysroot: where runtime libs are READ FROM (default {DEFAULT_SYSROOT});\n      \
            point at a FreeBSD sysroot to install from a cross-build host."
@@ -288,8 +290,31 @@ fn cmd_rollback(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `opifex font pack <tree> --manifest <toml> [--sign <key.pem>]`.
-fn cmd_font(args: &[String]) -> Result<(), String> {
+/// `opifex driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>`: what the
+/// synced catalog has for a device (devices.idx; nothing leaves the machine).
+fn driver_for(args: &[String]) -> Result<(), String> {
+    let state = std::env::var("OPIFEX_STATE").unwrap_or_else(|_| "/var/db/atrium/opifex".into());
+    let idx = std::fs::read_to_string(Path::new(&state).join(opifex::driver::IDX)).map_err(|e| format!("{state}/devices.idx: {e} (sync first)"))?;
+    let hex = |s: &str| u16::from_str_radix(s, 16).map_err(|_| format!("{s}: not hex"));
+    let hits = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["usb", ids, ref rest @ ..] => {
+            let id = opifex_catalog::driver::usb_id(ids).ok_or("usb: vvvv:pppp")?;
+            let mut c = [0u8; 3];
+            if let Some(cl) = rest.first() {
+                for (i, p) in cl.split('/').take(3).enumerate() { c[i] = hex(p)? as u8; }
+            }
+            opifex::driver::lookup(&idx, Some((id, c)), &[])
+        }
+        ["hid", page] => opifex::driver::lookup(&idx, None, &[hex(page)?]),
+        _ => return Err("driver-for usb <vvvv:pppp> [<cc/ss/pp>] | hid <page>".into()),
+    };
+    if hits.is_empty() { println!("opifex: no driver in the catalog for it"); }
+    for h in hits { println!("  {h}"); }
+    Ok(())
+}
+
+/// `opifex font|driver|firmware pack <tree> --manifest <toml> [--sign <key.pem>]`.
+fn cmd_pack_kind(kind: &str, args: &[String]) -> Result<(), String> {
     let (mut manifest, mut sign, mut pos) = (None::<String>, None::<String>, Vec::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -301,13 +326,17 @@ fn cmd_font(args: &[String]) -> Result<(), String> {
         }
     }
     let ["pack", tree] = pos.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
-        return Err("font pack <tree> --manifest <atrium.toml> [--sign <key.pem>]".into());
+        return Err(format!("{kind} pack <tree> --manifest <atrium.toml> [--sign <key.pem>]"));
     };
-    let t = std::fs::read_to_string(manifest.ok_or("font pack: --manifest <toml>")?).map_err(|e| e.to_string())?;
+    let t = std::fs::read_to_string(manifest.ok_or(format!("{kind} pack: --manifest <toml>"))?).map_err(|e| e.to_string())?;
     let key = match sign { Some(k) => Some(std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?), None => None };
-    let m = opifex::font::pack(Path::new(tree), &t, key.as_deref())?;
-    println!("opifex: packed font {} {} ({} faces, content {}){}", m.font.id, m.font.version, m.faces.len(), m.font.content,
-             if key.is_some() { ", signed" } else { ", NOT signed" });
+    let tree = Path::new(tree);
+    let (id, version, content) = match kind {
+        "font" => { let m = opifex::font::pack(tree, &t, key.as_deref())?; (m.font.id, m.font.version, m.font.content) }
+        "driver" => { let m = opifex::driver::pack_driver(tree, &t, key.as_deref())?; (m.driver.id, m.driver.version, m.driver.content) }
+        _ => { let m = opifex::driver::pack_firmware(tree, &t, key.as_deref())?; (m.firmware.id, m.firmware.version, m.firmware.content) }
+    };
+    println!("opifex: packed {kind} {id} {version} (content {content}){}", if key.is_some() { ", signed" } else { ", NOT signed" });
     Ok(())
 }
 

@@ -187,6 +187,7 @@ dependencies = [
  "libc",
  "portcullis-identity",
  "portcullis-peer",
+ "praeco",
  "serde",
  "toml",
 ]
@@ -425,6 +426,16 @@ dependencies = [
  "embedded-io 0.4.0",
  "embedded-io 0.6.1",
  "heapless",
+ "serde",
+]
+
+[[package]]
+name = "praeco"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "portcullis-peer",
+ "postcard",
  "serde",
 ]
 

@@ -533,6 +533,9 @@ mod run {
         /// The last failure showing each (service, node), so a service that
         /// is down is logged once, not every reshow.
         show_errors: BTreeMap<(String, String), String>,
+        /// Catalog drivers already offered, by (device label, package):
+        /// one notice each while this agent runs.
+        offered: std::collections::BTreeSet<(String, String)>,
         media: Media,
         session: Session,
         seat: PathBuf,
@@ -1423,9 +1426,11 @@ mod run {
         let mut a = Agent {
             jaild,
             state,
-            planner: Planner::new(rules),
+            planner: Planner::new(rules).with_catalog(
+                std::env::var_os("OPIFEX_DEVICES_IDX").map(PathBuf::from).unwrap_or_else(|| dispensator::catalog::IDX.into())),
             drivers: BTreeMap::new(),
             show_errors: BTreeMap::new(),
+            offered: Default::default(),
             media: Media::default(),
             session: Session::None,
             seat,
@@ -1981,6 +1986,22 @@ mod run {
             }
         }
 
+        /// A driver for a device nobody drives is in the catalog: one Praeco
+        /// notice (as a system poster: praecod's PRAECO_SYSTEM_POSTERS names
+        /// uid 0). Installing it is an administrator's (opifex.md §8.2).
+        fn offer(&mut self, device: &str, label: &str, package: &str) {
+            eprintln!("atrium-dispensatord: {device} ({label}): the catalog has a driver, {package}");
+            if !self.offered.insert((label.to_string(), package.to_string())) {
+                return;
+            }
+            let sock = std::env::var_os("PRAECO_SOCKET").map(PathBuf::from).unwrap_or_else(|| "/var/run/atrium/praecod.sock".into());
+            let body = format!("A device you connected ({label}) has no driver here. The catalog has one, {package}; \
+                                an administrator can install it with: opifex get {package}");
+            if let Err(e) = praeco::client::post(&sock, praeco::proto::urgency::NORMAL, "A driver is available", &body) {
+                eprintln!("atrium-dispensatord: praecod: {e}");
+            }
+        }
+
         fn run(&mut self, ops: Vec<Op>) {
             let changed = ops.iter().any(|o| !matches!(o, Op::Show { .. }));
             for op in ops {
@@ -2002,6 +2023,7 @@ mod run {
                     Op::DetachKernel { ugen, interface } => Self::detach_kernel(&ugen, interface),
                     Op::StopDriver { driver, device, vars } => self.stop(&driver, &device, &vars),
                     Op::Log(m) => eprintln!("atrium-dispensatord: {m}"),
+                    Op::DriverAvailable { device, label, package } => self.offer(&device, &label, &package),
                     Op::Settle { disk } => self.settling.push((Instant::now() + Duration::from_millis(1500), disk)),
                 }
             }

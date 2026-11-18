@@ -50,6 +50,9 @@ pub struct Daemon {
     /// Installed font packages and their pin list
     /// (`/usr/share/fonts/atrium-extra`, font.rs).
     pub fonts: PathBuf,
+    /// The system root drivers and firmware are installed under (`/`,
+    /// driver.rs).
+    pub system: PathBuf,
     /// Where side-loaded bundles' libraries are read from (`/`).
     pub sysroot: PathBuf,
     /// One change at a time.
@@ -102,7 +105,7 @@ impl Daemon {
         let r = local.latest(id, portcullis_toml::layer::host_arch())
             .ok_or_else(|| format!("{id}: not in the catalog"))?;
         let v: toml::Value = r.manifest.parse().map_err(|e| format!("{id}: {e}"))?;
-        let app = v.get("app").or_else(|| v.get("font")).or_else(|| v.get("layer"));
+        let app = ["app", "font", "driver", "firmware", "layer"].iter().find_map(|k| v.get(*k));
         let s = |k: &str| app.and_then(|a| a.get(k)).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let plain = |c: String| c.split('=').next().unwrap_or("").to_string();
         let capabilities: Vec<String> = updates::caps(&r.manifest).into_iter().map(plain).collect();
@@ -156,6 +159,10 @@ impl Daemon {
             let get = move |p: &str| fs::read(src.join(p)).map_err(|e| format!("{p}: {e}"));
             c.update(&get, now())?
         };
+        // What the catalog's drivers are for, for dispensatord's lookup.
+        if let Err(e) = crate::driver::write_idx(&self.state, &l, portcullis_toml::layer::host_arch()) {
+            eprintln!("opifexd: {e}");
+        }
         Ok(Response::Synced { entries: l.size, releases: l.releases.len() })
     }
 
@@ -164,7 +171,11 @@ impl Daemon {
     fn unpack(&self, archive: &Path, size: u64) -> Result<PathBuf, String> {
         let base = self.state.join("unpack");
         fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-        let dir = base.join(format!("job-{}-{}", std::process::id(), now()));
+        // One folder per job, even within a second (a driver unpacks its
+        // firmware while its own folder is still in use).
+        static JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = base.join(format!("job-{}-{}-{n}", std::process::id(), now()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         if self.sandbox {
@@ -334,7 +345,7 @@ impl Daemon {
         let root = c.root()?;
         let r = local.latest(id, portcullis_toml::layer::host_arch())
             .ok_or_else(|| format!("{id}: not in the catalog for this machine"))?.clone();
-        if !["app", "font", "layer"].contains(&r.kind.as_str()) {
+        if !["app", "font", "layer", "driver", "firmware"].contains(&r.kind.as_str()) {
             return Err(format!("{id}: a {} (not installed by opifexd yet)", r.kind));
         }
         // The sheet asks for anyone, and only apps and fonts are anyone's to
@@ -389,6 +400,29 @@ impl Daemon {
                     let (m, _) = crate::font::install(&dir, &self.fonts, std::slice::from_ref(&signer))?;
                     self.store().put(record(&m.font.version, &m.font.content))?;
                     return Ok(Response::Done { id: id.into(), version: m.font.version });
+                }
+                "driver" => {
+                    let m = opifex_catalog::driver::DriverManifest::from_str(&r.manifest)?;
+                    // Its firmware first, each from the catalog.
+                    for fw in &m.driver.firmware {
+                        let have = self.store().get(fw)?.map(|x| x.version);
+                        let latest = local.latest(fw, portcullis_toml::layer::host_arch()).map(|x| x.version.clone());
+                        if latest.is_none() {
+                            return Err(format!("{id}: its firmware {fw} is not in the catalog"));
+                        }
+                        if have != latest {
+                            self.install_catalog(fw, None, uid).map_err(|e| format!("{id}: firmware {fw}: {e}"))?;
+                        }
+                    }
+                    let m = crate::driver::install_driver(&dir, &self.system, std::slice::from_ref(&signer))?;
+                    self.store().put(record(&m.driver.version, &m.driver.content))?;
+                    eprintln!("opifexd: driver {id} {}: dispensatord takes its devices from its next start", m.driver.version);
+                    return Ok(Response::Done { id: id.into(), version: m.driver.version });
+                }
+                "firmware" => {
+                    let m = crate::driver::install_firmware(&dir, &self.system, std::slice::from_ref(&signer))?;
+                    self.store().put(record(&m.firmware.version, &m.firmware.content))?;
+                    return Ok(Response::Done { id: id.into(), version: m.firmware.version });
                 }
                 "layer" => {
                     let o = crate::layer::InstallOpts { root: &self.root, keys: std::slice::from_ref(&signer),
@@ -462,6 +496,19 @@ impl Daemon {
             // Older versions a workspace still names stay; this one goes,
             // unless a running workspace has it mounted.
             Some(r) if r.kind == "layer" => { crate::layer::remove(&self.root, &format!("{id}@{}", r.version))?; }
+            Some(r) if r.kind == "driver" => crate::driver::remove_driver(&self.system, id)?,
+            Some(r) if r.kind == "firmware" => {
+                // Its folder is the one whose manifest names it.
+                for base in [crate::driver::FIRMWARE_JAILED, crate::driver::FIRMWARE_KERNEL] {
+                    for e in fs::read_dir(self.system.join(base)).into_iter().flatten().flatten() {
+                        if let Ok(t) = fs::read_to_string(e.path().join("atrium.toml")) {
+                            if opifex_catalog::driver::FirmwareManifest::from_str(&t).is_ok_and(|m| m.firmware.id == id) {
+                                crate::driver::remove_firmware(&self.system, &t)?;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         let rec = self.store().remove(id)?;
