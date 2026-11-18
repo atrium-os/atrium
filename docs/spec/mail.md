@@ -1428,6 +1428,23 @@ Stalwart in the cloud VM, and later a real account):
    caret). **Not yet**: imported vCards and CardDAV (§17 D8), and a page to see and
    forget people (`forget_person` exists).
 
+   **Platform SDK (2026-11-18)**: the manifest names the roles Mail embeds
+   (`embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential"]`), so it
+   no longer keeps every role as an unlisted first-party app. `cargo atrium check` lists
+   nine parsers linked into the core; none of them runs on received bytes. They arrive with
+   the compose editor (pergola-richtext, officina-text). html5ever and pulldown-cmark come
+   in through navigator-render and navigator-dom, which the editor uses only for the font
+   set and image limits; Mail never asks them for HTML or Markdown. Its own drafts' HTML is
+   read back by `rich::from_html`, and a received HTML body is only ever text-scanned
+   after the parse jail has normalized it. usvg and roxmltree come with navigator-image,
+   which decodes only pictures in a document, and Mail's mail profile has none. Paste is
+   plain text. allsorts, rustybuzz and ttf-parser read the system's pinned fonts, never a
+   message's. flate2 and brotli serve those fonts' WOFF tables, and flate2 also serves
+   OpenPGP encryption of outgoing mail. Signatures are checked in the parse jail, and
+   decrypting isn't built. One thing to watch: `give_pgp_key`, a key the person pastes,
+   would parse in the core once the UI calls it. It belongs in the parse worker when that
+   comes.
+
 ## 17. Decisions, with recommendations
 
 | # | question | recommendation |
