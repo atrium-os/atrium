@@ -3693,11 +3693,28 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - An Information rule keeps the value and says why in the status line.
   - The cursor cell's input prompt shows beside it, as a comment does. A list cell adds the hint "Data ▸ Choose from List…", which opens the list at the right of the grid, with a search. A press types the item in, and the rule checks it as it checks typing.
 - **Not yet:**
-  - A dialog to make or change rules (rules come from files for now).
   - A drop-down button in the cell, and Alt+↓.
   - Checking pasted values (Excel doesn't either).
   - Circling invalid data.
 - **Gates:** officina-grid `rules_allow_and_refuse_values` and `rules_are_undone_saved_and_move_with_rows`; officina-convert `tests/validation.rs`; atrium-sheets `validation_refuses_warns_and_offers_its_list`.
+
+### 16.84 Data validation panel (2026-11-19)
+
+- **Sheets** (`atrium-sheets/src/validation.rs`, drawn by `app.rs`).
+  - Data ▸ Data Validation… opens a panel at the right of the grid. It shows the rule over the cursor's cell ("Change Validation"), or a new rule for the selection ("New Validation", a list by default).
+  - The panel has:
+    - Apply To.
+    - Allow (any value, whole number, decimal, list, date, time, text length, custom formula).
+    - The comparison and one or two values, for kinds that compare.
+    - Allow empty cells, and Offer the list.
+    - The input prompt (shown or not, title, text).
+    - Check values typed in, with the error style and its title and message.
+  - **Values:** a number, `=formula`, a date as 2026-01-31 or a time as 09:30. A list is items split by commas, or `=range`. A value the rule can't use is refused with why, and nothing is saved.
+  - **Saving:** a cell has one rule, as in Excel. A saved rule's cells leave every other rule, and a rule left with no cells goes. A new rule goes first; a changed one keeps its place.
+  - **Deleting:** Delete Rule removes the rule being changed. Data ▸ Clear Validation takes rules off the selection's cells only.
+  - Each change is one undo step.
+- **Not yet:** applying a changed rule to every cell with the same settings (Excel's "apply these changes to all other cells"), and choosing a range by dragging while the panel is open.
+- **Gates:** atrium-sheets `rules_are_made_changed_and_cleared` and `the_validation_panel_makes_changes_and_deletes_rules`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
