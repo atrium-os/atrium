@@ -122,7 +122,7 @@ tessera_format_dev(struct thread *td, const struct tkey_format *f)
 		d.sectors = f->total_sectors;
 
 	/* The key, for exactly this volume. */
-	if (tessera_keyring_get(f->key_id, f->uuid, 0, vk, &hw) != 0) {
+	if (tessera_keyring_get(f->key_id, f->uuid, 0, vk, &hw, NULL) != 0) {
 		error = ENOENT;
 		goto out;
 	}

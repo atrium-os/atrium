@@ -264,6 +264,13 @@ pub mod volume_op {
     /// owner's persona (high-water 0) as if minted here. Then it loads it.
     /// `DENIED`: the code isn't this slot's; `MALFORMED`: not a code.
     pub const VK_ADOPT: u16 = 0xB6;
+    /// `owner | key_id[16] | uuid[16]` → nothing: "This stick is older
+    /// than the last time it was used here. Open read-only?" (§8). Needs
+    /// Sigillum's `VERIFY_USER` (`NEEDS_VERIFICATION` first). arcad reloads
+    /// the key `TKEY_LOAD_OLDER_RO`: it opens the copy below its high-water
+    /// mark, and the kernel refuses every writable mount with it. The
+    /// item's mark is unchanged.
+    pub const VK_OLDER: u16 = 0xB7;
     pub const SLOT_LEN: usize = crate::recovery::SLOT_LEN;
     pub const CODE_MAX: usize = 64;
     /// Longest label.

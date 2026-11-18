@@ -136,6 +136,11 @@ sleep 5
 check "the old copy isn't mounted" "" "$(mounted)"
 check "…the kernel said why" yes "$(g "dmesg | tail -40 | grep -q 'below the key.s high-water' && echo yes || echo no")"
 check "…and it shows Locked" yes "$(list_as alice | grep -q "^$PART - .* locked" && echo yes || echo no)"
+check "…as her older copy" yes "$(list_as alice | grep -q "^$PART - .* locked older persona=work" && echo yes || echo no)"
+# No Sigillum in this VM: arcad can't verify her, so it stays shut.
+r=$(g "su -m alice -c '$D --media-socket $S --open-older $PART'")
+check "open read-only needs verification" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…still not mounted" "" "$(mounted)"
 
 echo "=== 7. a recovery code opens it elsewhere (§7.4)"
 g "mdconfig -d -u $MD3"; sleep 3
