@@ -13,7 +13,7 @@ URL=${2:?url OUT is served at}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # The crates the SDK offers to apps (dev-tools.md §5.4); everything they
 # reach through path dependencies comes along.
-CRATES="pergola libatrium atrium-fonts fresco-client fresco-protocol atrium-message"
+CRATES="pergola libatrium atrium-fonts fresco-client fresco-protocol atrium-message atrium-worker atrium-open"
 SEED=$(mktemp -d)
 trap 'rm -rf "$SEED"' EXIT
 mkdir -p "$SEED/src"
@@ -26,7 +26,7 @@ mkdir -p "$SEED/src"
     echo 'publish = false'
     echo '[dependencies]'
     for c in $CRATES; do
-        case $c in atrium-message*) p="$ROOT/sdk/$c" ;; *) p="$ROOT/$c" ;; esac
+        case $c in atrium-message*|atrium-worker) p="$ROOT/sdk/$c" ;; *) p="$ROOT/$c" ;; esac
         echo "$c = { path = \"$p\" }"
     done
 } > "$SEED/Cargo.toml"

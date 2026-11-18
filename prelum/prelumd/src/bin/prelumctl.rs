@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! prelumctl [--socket PATH] printers
+//! prelumctl nearby [--wait SECONDS]       printers on the LAN (mDNS), confirmed over IPP
 //! prelumctl add URI [NAME]                 ipps://host[:port]/path, ipp://…, or a host
 //! prelumctl remove|repin|identify|refresh PRINTER
 //! prelumctl rename PRINTER NAME
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
         a.drain(..2);
     }
     let Some(cmd) = a.first().cloned() else {
-        return die("usage: prelumctl printers|add|remove|rename|repin|identify|refresh|print|jobs|cancel|release …");
+        return die("usage: prelumctl printers|nearby|add|remove|rename|repin|identify|refresh|print|jobs|cancel|release …");
     };
     let mut c = match Client::connect(&socket) {
         Ok(c) => c,
@@ -82,6 +83,32 @@ fn main() -> ExitCode {
         "printers" => {
             for p in c.printers().map_err(|e| e.to_string())? {
                 show(&p);
+            }
+            Ok(())
+        }
+        "nearby" => {
+            let secs = match arg(1).as_str() {
+                "" => 4,
+                "--wait" => arg(2).parse::<u8>().map_err(|_| "--wait SECONDS (at most 10)".to_string())?,
+                x => return Err(format!("nearby [--wait SECONDS], not {x}")),
+            };
+            let list = c.nearby(secs).map_err(|e| e.to_string())?;
+            if list.is_empty() {
+                println!("no printers found");
+            }
+            for n in list {
+                let saved = n.saved.map(|i| format!("saved as {i}")).unwrap_or_else(|| "not saved".into());
+                println!("{}  [{}]  {}", n.uri, if n.tls { "encrypted" } else { "NOT ENCRYPTED" }, saved);
+                println!("    name {}  (announced as {:?})", n.name, n.announced);
+                if !n.make_and_model.is_empty() {
+                    println!("    model {}", n.make_and_model);
+                }
+                if let Some(f) = &n.fingerprint {
+                    println!("    key {f}");
+                }
+                if let Some(u) = &n.uuid {
+                    println!("    uuid {u}");
+                }
             }
             Ok(())
         }

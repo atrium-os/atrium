@@ -10,4 +10,5 @@ pub mod data;
 pub mod doc;
 pub mod files;
 pub mod pivotpane;
+pub mod review;
 pub mod source;

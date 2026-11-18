@@ -34,6 +34,7 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
             op::REPIN => reply(arg::<u32>(p).and_then(|id| d.repin(uid, id))),
             op::IDENTIFY => reply(arg::<u32>(p).and_then(|id| d.identify(uid, id))),
             op::REFRESH => reply(arg::<u32>(p).and_then(|id| d.refresh(uid, id))),
+            op::NEARBY => reply(arg::<u8>(p).and_then(|secs| d.nearby(uid, secs))),
             op::PRINT => {
                 let fd = conn.take_fds(1).and_then(|mut v| v.pop());
                 reply(match (arg::<print::Print>(p), fd) {

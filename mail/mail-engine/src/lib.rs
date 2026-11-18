@@ -88,29 +88,52 @@ pub(crate) fn now() -> i64 {
 
 /// One running jail.
 struct Jail {
-    child: Child,
-    r: BufReader<std::process::ChildStdout>,
-    w: BufWriter<std::process::ChildStdin>,
+    proc: Proc,
+    r: BufReader<Box<dyn std::io::Read + Send>>,
+    w: BufWriter<Box<dyn std::io::Write + Send>>,
+}
+
+/// How it runs: the app's `parse` worker (dev-tools-plan.md M5), or a child.
+enum Proc {
+    Worker(atrium_worker::Stdio),
+    Child(Child),
 }
 
 impl Drop for Jail {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.proc {
+            Proc::Worker(w) => w.kill(),
+            Proc::Child(c) => { let _ = c.kill(); let _ = c.wait(); }
+        }
     }
 }
 
+/// The worker's name in Mail's `[[workers]]`.
+pub const PARSE_WORKER: &str = "parse";
+
 impl Parser {
+    /// Installed, Mail declares the parser as its `parse` worker: a jail of
+    /// its own, as a uid of its own, with no capability (app-composition.md
+    /// §4). Elsewhere (development, tests) `program` runs as a child.
     fn start(&self) -> Result<Jail, Error> {
+        let named = std::env::var_os("MAIL_PARSE_JAIL").is_some();
+        if let Some(w) = atrium_worker::Workers::get().ok().filter(|w| !named && w.has(PARSE_WORKER)) {
+            let mut p = w.spawn_stdio(PARSE_WORKER).map_err(|e| Error::Jail(format!("start the parse worker: {e}")))?;
+            let r: Box<dyn std::io::Read + Send> = Box::new(p.stdout.take().expect("piped"));
+            let w: Box<dyn std::io::Write + Send> = Box::new(p.stdin.take().expect("piped"));
+            // Its stderr is dropped, as the child's is.
+            drop(p.stderr.take());
+            return Ok(Jail { proc: Proc::Worker(p), r: BufReader::new(r), w: BufWriter::new(w) });
+        }
         let mut child = Command::new(&self.program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| Error::Jail(format!("start {}: {e}", self.program.display())))?;
-        let r = BufReader::new(child.stdout.take().unwrap());
-        let w = BufWriter::new(child.stdin.take().unwrap());
-        Ok(Jail { child, r, w })
+        let r: Box<dyn std::io::Read + Send> = Box::new(child.stdout.take().unwrap());
+        let w: Box<dyn std::io::Write + Send> = Box::new(child.stdin.take().unwrap());
+        Ok(Jail { proc: Proc::Child(child), r: BufReader::new(r), w: BufWriter::new(w) })
     }
 
     /// Frames until `Done`, answering lookups (none yet: DKIM keys come from

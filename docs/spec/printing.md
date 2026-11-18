@@ -605,7 +605,7 @@ Checks:
 - Unit tests: prelum-proto (frames: cut anywhere fails, oversize refused),
   prelum-ipp (the pin before any byte, learning, unreachable, URIs), prelumd
   (store round trip and mode, typed addresses, media names, the plan),
-  jaild's validator (a print worker and only a print worker, 10 refusals).
+  jaild's validator (a print worker and only a print worker, 11 refusals).
 - `scripts/prelum-r2-check.sh` on the host, workers unjailed, against three
   `ippeveprinter`s: 23 of 23. An IPPS printer added by URI with its key
   pinned (the same SHA-256 openssl reads from its certificate) and its UUID,

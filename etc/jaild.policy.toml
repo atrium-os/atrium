@@ -355,6 +355,7 @@ mount_prefix = "/media"
 name_prefix = "system-prelum-"
 render_exec = "/usr/local/bin/atrium-prelum-render"
 ipp_exec    = "/usr/local/bin/atrium-prelum-ipp"
+browse_exec = "/usr/local/bin/atrium-prelum-browse"
 uid_first   = 62000
 uid_last    = 62499
 

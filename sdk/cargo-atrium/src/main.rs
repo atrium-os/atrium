@@ -21,14 +21,16 @@ Commands:
       clang and ld.lld with the SDK sysroot ($ATRIUM_SYSROOT/<arch> or
       ~/.atrium/sysroot/<arch>), then cargo build --target <triple>.
   run [--release] [cargo build args]
-      In a workspace: build, put the binary where atrium.toml's entry says,
-      and ask (in the Terminal, with your press) to Run the project as an
+      In a workspace: build, put the core and each worker where
+      atrium.toml's entries say, and ask (in the Terminal, with your press) to Run the project as an
       app, with the capabilities its manifest asks for.
   fuzz --list [--json]
   fuzz <target> [--json] [--max-time <secs>]
       Fuzz a worker or an input surface of the core with libFuzzer
-      (targets: package.metadata.atrium.fuzz tables named worker:x or
-      core:x in Cargo.toml, with function = mylib::f). Stops at the first crash; the
+      (targets: each [[workers]] entry, as worker:<name>, through its
+      handler mylib::workers::<name>; and package.metadata.atrium.fuzz
+      tables named worker:x or core:x in Cargo.toml, with function =
+      mylib::f). Stops at the first crash; the
       input is saved in fuzz/crashes/<target>/. --json: one event a line.
   registry verify <folder or https URL> [--keys <dir or .pem>]
       Check the SDK registry's index against the platform keys
@@ -436,7 +438,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         Ok(t) => t,
         Err(e) => return fail(format!("{}: {e}", manifest.display())),
     };
-    let targets = match fuzz::targets(&text) {
+    let atrium_toml = std::fs::read_to_string(project.join("atrium.toml")).ok();
+    let targets = match fuzz::targets(&text, atrium_toml.as_deref()) {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
@@ -445,7 +448,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             let v: Vec<_> = targets.iter().map(|t| t.to_json()).collect();
             println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         } else if targets.is_empty() {
-            println!("No fuzz targets: declare them in Cargo.toml as [package.metadata.atrium.fuzz.\"worker:<name>\"] function = \"mylib::f\"");
+            println!("No fuzz targets: add [[workers]] to atrium.toml, or declare them in Cargo.toml as [package.metadata.atrium.fuzz.\"core:<surface>\"] function = \"mylib::f\"");
         } else {
             for t in &targets {
                 println!("  {:<24} {}", t.name, t.about);
@@ -465,7 +468,13 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     };
     let tdir = meta["target_directory"].as_str().map(PathBuf::from).unwrap_or_else(|| project.join("target"));
     let hdir = tdir.join("atrium-fuzz").join(t.slug());
-    let (hc, hm) = fuzz::harness(t, &lib, &project);
+    let package = text.parse::<toml::Value>().ok()
+        .and_then(|v| v.get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str()).map(str::to_string))
+        .unwrap_or_else(|| lib.clone());
+    let (hc, hm) = match fuzz::harness(t, &lib, &package, &project, fuzz::worker_dependency(&text, &project).as_deref()) {
+        Ok(h) => h,
+        Err(e) => return fail(e),
+    };
     if let Err(e) = std::fs::create_dir_all(hdir.join("src"))
         .and_then(|_| std::fs::write(hdir.join("Cargo.toml"), hc))
         .and_then(|_| std::fs::write(hdir.join("src/main.rs"), hm))
@@ -587,10 +596,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if entry.starts_with('/') || entry.split('/').any(|c| c == ".." || c.is_empty()) {
         return fail(format!("entry {entry:?} isn't a path in the project"));
     }
-    let bin = entry.rsplit('/').next().unwrap_or(&entry).to_string();
+    // The core, then each worker: (bin, where it goes in the project).
+    let mut entries = vec![entry];
+    for w in m.get("workers").and_then(|w| w.as_array()).into_iter().flatten() {
+        if let Some(e) = w.get("entry").and_then(|e| e.as_str()) {
+            if e.starts_with('/') || e.split('/').any(|c| c == ".." || c.is_empty()) {
+                return fail(format!("worker entry {e:?} isn't a path in the project"));
+            }
+            entries.push(e.to_string());
+        }
+    }
+    let bins: Vec<(String, String)> = entries.iter().map(|e| (e.rsplit('/').next().unwrap_or(e).to_string(), e.clone())).collect();
     let release = args.iter().any(|a| a == "--release");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    match Command::new(&cargo).arg("build").args(["--bin", &bin]).args(args).current_dir(&proj).status() {
+    let mut build = Command::new(&cargo);
+    build.arg("build");
+    for (b, _) in &bins {
+        build.args(["--bin", b]);
+    }
+    match build.args(args).current_dir(&proj).status() {
         Ok(s) if s.success() => {}
         _ => return fail("build failed".into()),
     }
@@ -598,12 +622,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
         .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
         .and_then(|v| v["target_directory"].as_str().map(PathBuf::from))
         .unwrap_or_else(|| proj.join("target"));
-    let built = tdir.join(if release { "release" } else { "debug" }).join(&bin);
-    let dest = proj.join(&entry);
-    let copied = dest.parent().map(std::fs::create_dir_all).unwrap_or(Ok(()))
-        .and_then(|_| std::fs::copy(&built, &dest).map(|_| ()));
-    if let Err(e) = copied {
-        return fail(format!("{} -> {}: {e}", built.display(), dest.display()));
+    for (bin, entry) in &bins {
+        let built = tdir.join(if release { "release" } else { "debug" }).join(bin);
+        let dest = proj.join(entry);
+        let copied = dest.parent().map(std::fs::create_dir_all).unwrap_or(Ok(()))
+            .and_then(|_| std::fs::copy(&built, &dest).map(|_| ()));
+        if let Err(e) = copied {
+            return fail(format!("{} -> {}: {e}", built.display(), dest.display()));
+        }
     }
     // Run takes the project as a folder in ~/work.
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();

@@ -96,16 +96,35 @@ pub struct Packet {
 /// One query datagram asking for each service type, with the
 /// unicast-response bit set so answers come straight back (RFC 6762 §5.4).
 pub fn query(service_types: &[&str]) -> Vec<u8> {
+    let qs: Vec<(Name, u16)> = service_types.iter().map(|t| (Name::from_dotted(t), TYPE_PTR)).collect();
+    query_for(&qs)
+}
+
+/// Record types a follow-up question asks for.
+pub mod rtype {
+    pub const A: u16 = super::TYPE_A;
+    pub const PTR: u16 = super::TYPE_PTR;
+    pub const TXT: u16 = super::TYPE_TXT;
+    pub const SRV: u16 = super::TYPE_SRV;
+}
+
+/// One query datagram with these questions (name, type), unicast-response
+/// bit set. At most [`MAX_QUESTIONS`] are asked; the rest are left out.
+pub fn query_for(qs: &[(Name, u16)]) -> Vec<u8> {
+    let qs = &qs[..qs.len().min(MAX_QUESTIONS)];
     let mut out = vec![0, 0, 0, 0];
-    out.extend_from_slice(&(service_types.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(qs.len() as u16).to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    for t in service_types {
-        Name::from_dotted(t).encode(&mut out);
-        out.extend_from_slice(&TYPE_PTR.to_be_bytes());
+    for (n, t) in qs {
+        n.encode(&mut out);
+        out.extend_from_slice(&t.to_be_bytes());
         out.extend_from_slice(&(0x8000 | CLASS_IN).to_be_bytes());
     }
     out
 }
+
+/// Questions in one follow-up datagram.
+pub const MAX_QUESTIONS: usize = 16;
 
 struct Reader<'a> {
     buf: &'a [u8],
@@ -258,6 +277,7 @@ impl Packet {
 
 /// The TXT keys Prelum reads (spec §7.1), values made safe to show.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Txt {
     pub ty: Option<String>,
     pub note: Option<String>,
@@ -334,6 +354,7 @@ impl Txt {
 /// A complete service: it has an SRV record and the instance is under a
 /// type that was asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Service {
     /// The instance label as the printer wrote it, made safe to show.
     pub instance: String,
@@ -455,6 +476,46 @@ impl Browser {
         self.expire(now);
     }
 
+    /// Instances heard of, complete or not (at most [`MAX_SERVICES`]).
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// What is missing for instances heard of: their SRV and TXT when only
+    /// a PTR came, the address of an SRV's host when none came. Responders
+    /// usually send all of it at once; these are the questions to ask when
+    /// one didn't. At most [`MAX_QUESTIONS`].
+    pub fn wanting(&mut self, now: u64) -> Vec<(Name, u16)> {
+        self.expire(now);
+        let mut out = Vec::new();
+        let mut names: Vec<&(Name, Instance)> = self.instances.values().collect();
+        names.sort_by(|a, b| a.0.key().cmp(&b.0.key()));
+        for (name, i) in names {
+            if out.len() >= MAX_QUESTIONS {
+                break;
+            }
+            match &i.srv {
+                None => out.push((name.clone(), TYPE_SRV)),
+                Some(s) if !self.hosts.contains_key(&s.value.1.key()) => {
+                    let q = (s.value.1.clone(), TYPE_A);
+                    if !out.iter().any(|(n, t)| *t == TYPE_A && n.key() == q.0.key()) {
+                        out.push(q);
+                    }
+                }
+                Some(_) => {}
+            }
+            if i.txt.is_none() && out.len() < MAX_QUESTIONS {
+                out.push((name.clone(), TYPE_TXT));
+            }
+        }
+        out.truncate(MAX_QUESTIONS);
+        out
+    }
+
     /// Services known now, sorted by instance name.
     pub fn services(&mut self, now: u64) -> Vec<Service> {
         self.expire(now);
@@ -535,6 +596,55 @@ mod tests {
         r.rr(&inst, TYPE_TXT, ttl, &txt);
         r.rr(&enc("office.local"), TYPE_A, ttl, &[192, 168, 1, 20]);
         r.done()
+    }
+
+    #[test]
+    fn asks_for_what_a_bare_ptr_left_out() {
+        let mut b = Browser::new(&[IPP, IPPS]);
+        let mut r = Resp::new();
+        let owner = enc(IPP);
+        let mut ptr = vec![14];
+        ptr.extend_from_slice(b"Office Printer");
+        ptr.extend_from_slice(&[0xC0, 12]);
+        r.rr(&owner, TYPE_PTR, 120, &ptr);
+        b.feed(&Packet::parse(&r.done()).unwrap(), 0);
+        assert!(b.services(0).is_empty(), "no SRV yet");
+        let w = b.wanting(0);
+        let inst = Name::from_dotted("Office Printer._ipp._tcp.local");
+        assert_eq!(w, [(inst.clone(), TYPE_SRV), (inst.clone(), TYPE_TXT)]);
+        // The questions parse back as a query for exactly those.
+        let q = query_for(&w);
+        assert_eq!(q[4..6], [0, 2]);
+        assert!(Packet::parse(&q).is_err(), "a query is not an answer");
+        // SRV and TXT come, the host's address doesn't: ask for it.
+        let mut r = Resp::new();
+        let mut srv = vec![0, 0, 0, 0, 0x02, 0x77];
+        srv.extend_from_slice(&enc("office.local"));
+        r.rr(&enc("Office Printer._ipp._tcp.local"), TYPE_SRV, 120, &srv);
+        r.rr(&enc("Office Printer._ipp._tcp.local"), TYPE_TXT, 120, &[6, b'r', b'p', b'=', b'i', b'p', b'p']);
+        b.feed(&Packet::parse(&r.done()).unwrap(), 1);
+        assert_eq!(b.wanting(1), [(Name::from_dotted("office.local"), TYPE_A)]);
+        b.feed(&Packet::parse(&printer_packet(120)).unwrap(), 2);
+        assert!(b.wanting(2).is_empty());
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn follow_ups_are_bounded() {
+        let mut b = Browser::new(&[IPP]);
+        let owner = enc(IPP);
+        for i in 0..40 {
+            let mut r = Resp::new();
+            let label = format!("p{i}");
+            let mut ptr = vec![label.len() as u8];
+            ptr.extend_from_slice(label.as_bytes());
+            ptr.extend_from_slice(&[0xC0, 12]);
+            r.rr(&owner, TYPE_PTR, 120, &ptr);
+            b.feed(&Packet::parse(&r.done()).unwrap(), 0);
+        }
+        assert_eq!(b.wanting(0).len(), MAX_QUESTIONS);
+        let many: Vec<(Name, u16)> = (0..100).map(|i| (Name::from_dotted(&format!("x{i}.local")), TYPE_A)).collect();
+        assert_eq!(query_for(&many)[4..6], [0, MAX_QUESTIONS as u8]);
     }
 
     #[test]

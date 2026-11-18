@@ -1,0 +1,27 @@
+# {{name}}: made by `cargo atrium new` (template: indexer).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A window and nothing else. The files the person opens in it come as
+# descriptors ([[opens]]), so it needs no access to their files.
+[capabilities]
+graphics = "fresco"
+network = "none"
+
+# Files offers "Open with {{title}}" for plain text.
+[[opens]]
+types = ["text/plain"]
+
+# The index lives here: one worker for the app's run (lifetime "session"),
+# with no capabilities, that takes messages and keeps what it learned.
+[[workers]]
+name = "index"
+entry = "bin/{{name}}-index"
+input = "message"
+lifetime = "session"
+memory = "128M"
+cpu = "5s"

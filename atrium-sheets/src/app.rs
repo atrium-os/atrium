@@ -50,6 +50,8 @@ pub enum Cmd {
     RemoveMacros,
     /// A Data menu command, on the selection.
     Data(crate::data::DataCmd),
+    /// A press in the Compare with… pane.
+    Review(crate::review::ReviewCmd),
     /// The picked chart: its kind ([`ChartKind::ALL`]).
     ChartKind(usize),
     /// Its legend: none, or at [`LEGENDS`].
@@ -217,6 +219,10 @@ pub struct Sheets {
     /// Asking whether to save before the window closes.
     pub closing: Mutable<bool>,
     pub cond: Mutable<crate::condfmt::CondPanel>,
+    /// Compare with…: the pane, and the other copy it compares with.
+    pub review: Mutable<crate::review::ReviewPane>,
+    pub theirs: Rc<RefCell<Option<officina_grid::Workbook>>>,
+    pub review_scroll: Mutable<ScrollState>,
     /// Its Apply To field and the rule's two value fields.
     pub cond_range: Mutable<TextEdit>,
     pub cond_a: Mutable<TextEdit>,
@@ -233,7 +239,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -338,6 +344,80 @@ impl Sheets {
         };
         p.error = r.err().unwrap_or_default();
         self.pivot_pane.set(p);
+        self.changed();
+    }
+
+    /// Compares this workbook with `theirs` (named `name`) and lists what
+    /// differs in the Compare pane.
+    pub fn compare_with(&self, name: &str, theirs: officina_grid::Workbook) {
+        let mut p = crate::review::ReviewPane { open: true, name: name.to_string(), ..Default::default() };
+        p.refresh(&self.doc.borrow().wb, &theirs);
+        p.picked = (!p.changes.is_empty()).then_some(0);
+        *self.theirs.borrow_mut() = Some(theirs);
+        self.cond.set(crate::condfmt::CondPanel::default());
+        self.pivot_pane.set(crate::pivotpane::PivotPane::default());
+        self.filter.set(FilterPanel::default());
+        self.doc.borrow_mut().status = p.summary() + ".";
+        self.review.set(p);
+        self.review_cmd(crate::review::ReviewCmd::Pick(0));
+    }
+
+    /// Selects change `ch`'s cell and scrolls it into view.
+    fn show_change(&self, ch: &officina_grid::compare::Change) {
+        use pergola::widgets::GridSource;
+        let Some((sheet, r, c)) = ch.at() else { return };
+        self.doc.borrow_mut().sheet = sheet;
+        let mut g = self.grid.get_cloned();
+        g.select(r, c);
+        self.grid.set(g);
+        let mut st = self.scroll.get();
+        st.physics.stop();
+        st.physics_x.stop();
+        st.physics.set_position((self.source.row_top(r) - 3.0 * (self.source.row_top(r + 1) - self.source.row_top(r))).max(0.0));
+        st.physics_x.set_position((self.source.col_left(c) - 60.0).max(0.0));
+        self.scroll.set(st);
+    }
+
+    /// Runs a press in the Compare pane.
+    pub fn review_cmd(&self, c: crate::review::ReviewCmd) {
+        use crate::review::{self as rv, ReviewCmd};
+        let mut p = self.review.get_cloned();
+        let theirs = self.theirs.clone();
+        let theirs = theirs.borrow();
+        let Some(other) = theirs.as_ref() else { return };
+        match c {
+            ReviewCmd::Pick(i) => {
+                p.picked = (i < p.changes.len()).then_some(i);
+                if let Some(ch) = p.picked.map(|i| p.changes[i].clone()) {
+                    self.show_change(&ch);
+                }
+            }
+            ReviewCmd::Take | ReviewCmd::Keep => {
+                if let Some(ch) = p.picked.and_then(|i| p.changes.get(i)).cloned() {
+                    if c == ReviewCmd::Keep {
+                        p.kept.push(ch);
+                    } else if !rv::take(&mut self.doc.borrow_mut(), other, &ch) {
+                        self.doc.borrow_mut().status = "Sheets added or removed can't be taken here; add or delete the sheet itself.".into();
+                        p.kept.push(ch);
+                    }
+                    p.refresh(&self.doc.borrow().wb, other);
+                    if let Some(ch) = p.picked.map(|i| p.changes[i].clone()) {
+                        self.show_change(&ch);
+                    }
+                }
+            }
+            ReviewCmd::TakeAll => {
+                let n = rv::take_all(&mut self.doc.borrow_mut(), other, &p.changes);
+                p.refresh(&self.doc.borrow().wb, other);
+                self.doc.borrow_mut().status = format!("Took {n} change{} from “{}”.", if n == 1 { "" } else { "s" }, p.name);
+            }
+            ReviewCmd::Close => {
+                p = rv::ReviewPane::default();
+                drop(theirs);
+                *self.theirs.borrow_mut() = None;
+            }
+        }
+        self.review.set(p);
         self.changed();
     }
 
@@ -914,6 +994,61 @@ impl View for Sheets {
             }
         }
 
+        // Compare with…: the other copy's differences, at the right over the grid.
+        let rv = self.review.get_cloned();
+        if rv.open {
+            use crate::review::{ReviewCmd, REVIEW_ROW_H, REVIEW_W};
+            let (x0, y0) = ((w - REVIEW_W).max(0.0), TOOLBAR_H + FORMULA_H);
+            let ph = (h - y0 - STATUS_H).max(200.0);
+            let back = ctx.add(Node::Rect { rect: Rect::new(x0, y0, REVIEW_W, ph), fill: t.bg_surface(), radius: 0.0 });
+            ctx.on_click(back, || {});
+            ctx.add(Node::Rect { rect: Rect::new(x0, y0, 1.0, ph), fill: t.border_default(), radius: 0.0 });
+            let push = |c: ReviewCmd| {
+                let cmds = self.cmds.clone();
+                move || cmds.lock().unwrap().push(Cmd::Review(c))
+            };
+            let fw = REVIEW_W - 24.0;
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw - 70.0, 20.0), content: "Compare".into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
+            Button::secondary("Close").at(x0 + REVIEW_W - 76.0, y0 + 6.0).width(64.0).on_click(push(ReviewCmd::Close)).render(ctx);
+            ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 36.0, fw, 16.0), content: rv.summary().chars().take(60).collect(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
+            let (lines, sheets): (Vec<String>, Vec<String>) = {
+                let d = self.doc.borrow();
+                let theirs = self.theirs.borrow();
+                match theirs.as_ref() {
+                    Some(o) => rv.changes.iter().map(|c| (c.describe(&d.wb, o), c.sheet().filter(|_| d.wb.sheet_count() > 1).map(|s| d.wb.sheet_name(s)).unwrap_or_default())).unzip(),
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
+            let ly = y0 + 60.0;
+            let lh = (ph - 60.0 - 56.0).max(REVIEW_ROW_H);
+            let n = lines.len();
+            let (lines, sheets, cmds, picked) = (Rc::new(lines), Rc::new(sheets), self.cmds.clone(), rv.picked);
+            pergola::widgets::VirtualList::new(self.review_scroll.clone(), Rect::new(x0 + 1.0, ly, REVIEW_W - 1.0, lh), n, REVIEW_ROW_H, move |k, ctx| {
+                let t = ctx.theme;
+                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, REVIEW_W - 1.0, REVIEW_ROW_H), 0.0));
+                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                let hit = ctx.add(Node::Rect { rect: Rect::new(6.0, 1.0, REVIEW_W - 13.0, REVIEW_ROW_H - 2.0), fill: if picked == Some(k) { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                let cmds = cmds.clone();
+                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Review(ReviewCmd::Pick(k))));
+                let sheet = &sheets[k];
+                let tw = if sheet.is_empty() { REVIEW_W - 28.0 } else { REVIEW_W - 110.0 };
+                ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 6.0, tw, 18.0), content: lines[k].chars().take(56).collect(), style: TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() } });
+                if !sheet.is_empty() {
+                    ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(REVIEW_W - 96.0, 7.0, 80.0, 16.0), content: sheet.chars().take(14).collect(), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() } });
+                }
+                ctx.pop();
+            })
+            .backdrop(t.bg_surface())
+            .key(0xF119)
+            .emit(ctx);
+            let by = ly + lh + 12.0;
+            ctx.add(Node::Rect { rect: Rect::new(x0, by - 6.0, REVIEW_W, 1.0), fill: t.border_default(), radius: 0.0 });
+            let whole = rv.picked.and_then(|i| rv.changes.get(i)).is_some_and(|c| c.whole_sheet());
+            Button::primary(if whole { "Take Sheet" } else { "Take" }).at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
+            Button::secondary("Keep Mine").at(x0 + 120.0, by).width(96.0).on_click(push(ReviewCmd::Keep)).render(ctx);
+            Button::secondary("Take All").at(x0 + REVIEW_W - 100.0, by).width(88.0).on_click(push(ReviewCmd::TakeAll)).render(ctx);
+        }
+
         // The pivot field list, at the right over the grid.
         let pv = self.pivot_pane.get_cloned();
         let pivot = pv.open.then(|| self.doc.borrow().wb.pivots().get(pv.pivot).cloned()).flatten();
@@ -1041,6 +1176,11 @@ impl Sheets {
                 }
                 Cmd::Redo => {
                     Self::act(&self.doc, &self.source, &self.rev, GridAction::Redo);
+                    false
+                }
+                Cmd::Data(crate::data::DataCmd::CompareWith) => true,
+                Cmd::Review(c) => {
+                    self.review_cmd(c);
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::CondFormats) => {
@@ -1177,6 +1317,57 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn compare_with_lists_and_takes_changes() {
+        use crate::review::ReviewCmd;
+        use officina_grid::compare::Change;
+        let (d, _) = Doc::from_csv("mine.csv", b"Item,Qty\npens,3\nink,4\npaper,5\n").unwrap();
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let theirs = |csv: &[u8]| Doc::from_csv("theirs.csv", csv).unwrap().0.wb;
+        let texts = || {
+            let (tree, _) = pergola::view::render(&s, pergola::theme::Semantic::LIGHT);
+            tree.iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect::<Vec<String>>()
+        };
+        let run = |c: ReviewCmd| {
+            s.cmds.lock().unwrap().push(Cmd::Review(c));
+            s.take_cmds();
+        };
+        // Data ▸ Compare with… goes to the window, which asks for the copy.
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::CompareWith));
+        assert_eq!(s.take_cmds(), vec![Cmd::Data(crate::data::DataCmd::CompareWith)]);
+        s.compare_with("theirs.csv", theirs(b"Item,Qty\npens,3\nink,9\npaper,5\nclips,2\n"));
+        let p = s.review.get_cloned();
+        assert!(p.open);
+        assert_eq!(p.changes.len(), 2, "{:?}", p.changes);
+        let t = texts();
+        for want in ["Compare", "2 differences from “theirs.csv”", "B3: 4 → 9", "1 row added before row 5 (clips, 2)", "Take", "Keep Mine", "Take All"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        // The first is shown: its cell picked.
+        assert_eq!(s.grid.get_cloned().cursor, (2, 1));
+        // Take it: one undo step; it leaves the list.
+        run(ReviewCmd::Take);
+        assert_eq!(s.doc.borrow().wb.value(0, 2, 1), officina_grid::Value::Num(9.0));
+        assert_eq!(s.review.get_cloned().changes.len(), 1);
+        // Keep mine: the row isn't added and isn't listed again.
+        run(ReviewCmd::Pick(0));
+        run(ReviewCmd::Keep);
+        assert!(s.review.get_cloned().changes.is_empty());
+        assert!(s.doc.borrow().wb.value(0, 4, 0).is_empty());
+        s.cmds.lock().unwrap().push(Cmd::Undo);
+        s.take_cmds();
+        assert_eq!(s.doc.borrow().wb.value(0, 2, 1), officina_grid::Value::Num(4.0));
+        // Take All against a copy with rows removed: the sheet becomes theirs.
+        s.compare_with("short.csv", theirs(b"Item,Qty\nink,4\n"));
+        assert!(s.review.get_cloned().changes.iter().any(|c| matches!(c, Change::RowsRemoved { .. })));
+        run(ReviewCmd::TakeAll);
+        assert!(s.review.get_cloned().changes.is_empty());
+        assert_eq!(s.doc.borrow().wb.value(0, 1, 0), officina_grid::Value::Str("ink".into()));
+        assert!(s.doc.borrow().wb.value(0, 2, 0).is_empty());
+        run(ReviewCmd::Close);
+        assert!(!s.review.get_cloned().open && s.theirs.borrow().is_none());
+    }
 
     #[test]
     fn closing_with_changes_asks_first() {
