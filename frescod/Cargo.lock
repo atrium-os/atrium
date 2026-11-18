@@ -237,6 +237,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "atrium-rdna4"
 version = "0.1.0"
 dependencies = [
@@ -1007,6 +1014,7 @@ dependencies = [
  "atrium-devevents",
  "atrium-gpu-app",
  "atrium-gpu-rs",
+ "atrium-listen",
  "atrium-spv-loader",
  "atrium-trace",
  "env_logger",
@@ -1878,6 +1886,7 @@ name = "tactus"
 version = "0.1.0"
 dependencies = [
  "atrium-devevents",
+ "atrium-listen",
  "libc",
  "postcard",
  "serde",

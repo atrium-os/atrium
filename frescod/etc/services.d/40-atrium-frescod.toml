@@ -34,8 +34,8 @@
 #      [devfs_rulesets].allowed_ids, pinned to this service. jaild writes the
 #      display lease before frescod starts (atrium-gpu-amd/ISOLATION.md).
 #   3. The per-cap socket dirs owned by _frescod so it can bind:
-#      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm &&
-#       chown _frescod:_frescod /atrium/sockets/fresco /atrium/sockets/fresco-wm`.
+#      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm /atrium/sockets/fresco-activation &&
+#       chown _frescod:_frescod /atrium/sockets/fresco /atrium/sockets/fresco-wm /atrium/sockets/fresco-activation`.
 #   4. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
 #      usr/local/bin,usr/local/share/atrium,atrium/sockets,var/db/atrium,
 #      var/run/atrium} and the file in 6.
@@ -90,6 +90,30 @@ source = "/atrium/sockets"                        # rw: frescod BINDS its socket
 dest   = "atrium/sockets"
 kind   = "rw_nullfs"
 
+
+# Bound by the supervisor before anything starts (fast-boot.md §5), so apps,
+# Forum, ostiarius and limend connect at once whatever order services come up
+# in, and the sockets survive a frescod restart. frescod takes them through
+# atrium-listen (and binds them itself if started by hand). 0666: reachability
+# is the gate (only jails holding the capability get the directory mounted),
+# as when frescod binds them itself.
+[[sockets]]
+path  = "/atrium/sockets/fresco/fresco.sock"
+owner = 65010   # _frescod
+group = 65010
+mode  = "0666"
+
+[[sockets]]
+path  = "/atrium/sockets/fresco-wm/fresco-wm.sock"
+owner = 65010
+group = 65010
+mode  = "0666"
+
+[[sockets]]
+path  = "/atrium/sockets/fresco-activation/fresco-activation.sock"
+owner = 65010
+group = 65010
+mode  = "0666"
 
 [exec]
 # Installed as atrium-frescod (the atrium- prefix the exec_paths allow-list
