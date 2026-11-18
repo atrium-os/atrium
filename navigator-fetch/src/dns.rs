@@ -113,6 +113,10 @@ fn qtype(k: RecordKind) -> u16 {
 /// A query for `name` (checked with `nuntius::name_ok`), recursion and
 /// the AD bit asked for, EDNS0 with a 4 KiB answer size.
 pub fn query(id: u16, name: &str, kind: RecordKind) -> Vec<u8> {
+    query_type(id, name, qtype(kind))
+}
+
+fn query_type(id: u16, name: &str, qt: u16) -> Vec<u8> {
     let mut q = Vec::with_capacity(name.len() + 30);
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&0x0120u16.to_be_bytes()); // RD, AD
@@ -122,7 +126,7 @@ pub fn query(id: u16, name: &str, kind: RecordKind) -> Vec<u8> {
         q.extend_from_slice(l.as_bytes());
     }
     q.push(0);
-    q.extend_from_slice(&qtype(kind).to_be_bytes());
+    q.extend_from_slice(&qt.to_be_bytes());
     q.extend_from_slice(&1u16.to_be_bytes());
     // OPT: root name, type 41, class = UDP size, no flags, no data.
     q.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
@@ -236,6 +240,110 @@ pub fn answer(m: &[u8], id: u16, name: &str, kind: RecordKind) -> Result<(Vec<Re
     Ok((out, flags & 0x0020 != 0))
 }
 
+/// At most this many addresses from one answer.
+pub const ADDRS_MAX: usize = 8;
+
+/// The addresses (A: `qt` 1, AAAA: 28) in answer `m` to query `id` for
+/// `name`: records owned by the name, or by a name it is a CNAME for
+/// (followed in answer order, at most 8 steps). No such name: none.
+pub fn addr_answer(m: &[u8], id: u16, name: &str, qt: u16) -> io::Result<Vec<IpAddr>> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed DNS answer");
+    let flags = u16_at(m, 2).ok_or_else(bad)?;
+    if u16_at(m, 0) != Some(id) || flags & 0x8000 == 0 || flags & 0x7800 != 0 || flags & 0x0200 != 0 {
+        return Err(bad());
+    }
+    match flags & 0x000F {
+        0 => {}
+        3 => return Ok(Vec::new()),
+        _ => return Err(io::Error::other("the DNS server failed")),
+    }
+    let (qd, an) = (u16_at(m, 4).ok_or_else(bad)?, u16_at(m, 6).ok_or_else(bad)?);
+    let (qname, mut i) = name_at(m, 12).ok_or_else(bad)?;
+    if qd != 1 || !qname.eq_ignore_ascii_case(name) || u16_at(m, i) != Some(qt) || u16_at(m, i + 2) != Some(1) {
+        return Err(bad());
+    }
+    i += 4;
+    let mut names = vec![qname];
+    let mut out = Vec::new();
+    for _ in 0..an.min(64) {
+        let (owner, j) = name_at(m, i).ok_or_else(bad)?;
+        let (t, class, len) = (u16_at(m, j).ok_or_else(bad)?, u16_at(m, j + 2).ok_or_else(bad)?, u16_at(m, j + 8).ok_or_else(bad)? as usize);
+        let at = j + 10;
+        let data = m.get(at..at + len).ok_or_else(bad)?;
+        i = at + len;
+        if class != 1 || !names.contains(&owner) {
+            continue;
+        }
+        match (t, len) {
+            (5, _) if names.len() < 9 => names.push(name_at(m, at).ok_or_else(bad)?.0),
+            (1, 4) if qt == 1 => out.push(IpAddr::from(<[u8; 4]>::try_from(data).unwrap())),
+            (28, 16) if qt == 28 => out.push(IpAddr::from(<[u8; 16]>::try_from(data).unwrap())),
+            _ => {}
+        }
+        if out.len() >= ADDRS_MAX {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// `name`'s addresses through `ex`: A, then AAAA. Used where unbound must
+/// be passed by (a captive portal's sign-in window, atrium-net.md §8.1).
+pub fn addresses(ex: &dyn Exchange, name: &str) -> io::Result<Vec<IpAddr>> {
+    if !nuntius::name_ok(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a host name"));
+    }
+    let mut out = Vec::new();
+    let mut last = None;
+    for qt in [1u16, 28] {
+        let id = fresh_id();
+        match ex.exchange(&query_type(id, name, qt)).and_then(|m| addr_answer(&m, id, name, qt)) {
+            Ok(v) => out.extend(v),
+            Err(e) => last = Some(e),
+        }
+    }
+    match (out.is_empty(), last) {
+        (true, Some(e)) => Err(e),
+        (true, None) => Err(io::Error::new(io::ErrorKind::NotFound, "no such name")),
+        _ => Ok(out),
+    }
+}
+
+/// Resolve with `dns` (the network's own servers), connect with `net`:
+/// the fetcher of a portal sign-in window (atrium-net.md §8.1). The
+/// address check and pins in `Conversation` apply as ever.
+pub struct ViaDns {
+    pub net: &'static (dyn crate::Connect + Sync),
+    pub dns: std::sync::Arc<dyn Exchange>,
+}
+
+impl crate::Connect for ViaDns {
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        if let Ok(a) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(a, port)]);
+        }
+        Ok(addresses(&*self.dns, host)?.into_iter().map(|a| SocketAddr::new(a, port)).collect())
+    }
+    fn connect_addr(&self, addr: SocketAddr) -> io::Result<std::net::TcpStream> {
+        self.net.connect_addr(addr)
+    }
+}
+
+/// `ATRIUM_NUNTIUS_RESOLVERS=A,B`: the DNS servers a portal window's
+/// fetcher asks instead of the system's (set only by portcullisd).
+pub const RESOLVERS_ENV: &str = "ATRIUM_NUNTIUS_RESOLVERS";
+
+/// The servers in `RESOLVERS_ENV`'s value: at most 3 addresses, each a
+/// usable unicast one; anything else is refused whole.
+pub fn resolvers(v: &str) -> io::Result<Vec<SocketAddr>> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("{RESOLVERS_ENV}: at most 3 addresses"));
+    let v: Vec<IpAddr> = v.split(',').map(|a| a.trim().parse().map_err(|_| bad())).collect::<io::Result<_>>()?;
+    if v.is_empty() || v.len() > 3 || v.iter().any(|a| a.is_unspecified() || a.is_multicast() || a.is_loopback()) {
+        return Err(bad());
+    }
+    Ok(v.into_iter().map(|a| SocketAddr::new(a, 53)).collect())
+}
+
 /// A query id no one off the path can guess.
 fn fresh_id() -> u16 {
     use std::hash::{BuildHasher, Hasher};
@@ -338,5 +446,47 @@ mod tests {
             assert_eq!(lookup(&u, "_dmarc.example.com", RecordKind::Txt), Ok((vec![Record::Txt("abc".into())], true)));
         }
         assert_eq!(lookup(&u, "nodots", RecordKind::Txt), Err(ErrorCode::Malformed));
+    }
+
+    /// A portal's DNS: every name is the portal, sometimes through a CNAME.
+    struct Portal;
+    impl Exchange for Portal {
+        fn exchange(&self, q: &[u8]) -> io::Result<Vec<u8>> {
+            let qt = u16::from_be_bytes([q[q.len() - 15], q[q.len() - 14]]);
+            // The question's name ends 4 bytes before the OPT record (11).
+            Ok(match qt {
+                1 => {
+                    // CNAME to "p.lan" (written after the question), then
+                    // its A; an A owned by something else is ignored.
+                    let mut m = reply(q, 0, &[]);
+                    let qend = m.len();
+                    m[6..8].copy_from_slice(&3u16.to_be_bytes());
+                    let target_at = qend + 12;
+                    m.extend_from_slice(&[0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 7, 1, b'p', 3, b'l', b'a', b'n', 0]);
+                    m.extend_from_slice(&[0xC0, target_at as u8, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 88, 0, 1]);
+                    m.extend_from_slice(&[1, b'x', 0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 8, 8, 8, 8]);
+                    m
+                }
+                _ => reply(q, 0, &[(28, vec![0xfd, 0x77, 0, 0, 0, 0, 0, 0x88, 0, 0, 0, 0, 0, 0, 0, 1])]),
+            })
+        }
+    }
+
+    #[test]
+    fn addresses_through_a_portals_dns() {
+        let v = addresses(&Portal, "www.example.com").unwrap();
+        assert_eq!(v, vec!["10.88.0.1".parse::<IpAddr>().unwrap(), "fd77:0:0:88::1".parse().unwrap()]);
+        assert!(addresses(&Portal, "no dots").is_err());
+        let q = query_type(9, "gone.example", 1);
+        assert!(addr_answer(&reply(&q, 3, &[]), 9, "gone.example", 1).unwrap().is_empty());
+        assert!(addr_answer(&reply(&q, 2, &[]), 9, "gone.example", 1).is_err());
+        assert!(addr_answer(&reply(&q, 0, &[(1, vec![1, 2, 3])]), 9, "gone.example", 1).unwrap().is_empty(), "a short A is no address");
+        for cut in 0..40 {
+            let _ = addr_answer(&reply(&q, 0, &[(1, vec![1, 2, 3, 4])])[..cut], 9, "gone.example", 1);
+        }
+        assert_eq!(resolvers("10.88.0.53, fd77:0:0:88::53").unwrap().len(), 2);
+        for bad in ["", "x", "127.0.0.1", "0.0.0.0", "1.1.1.1,1.0.0.1,9.9.9.9,8.8.8.8", "ff02::1"] {
+            assert!(resolvers(bad).is_err(), "{bad}");
+        }
     }
 }

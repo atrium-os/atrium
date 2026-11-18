@@ -433,6 +433,7 @@ pub struct CapabilityDelta {
     pub audio_device:    bool,
     pub net_fetch:       bool,
     pub protected_media: bool,
+    pub network_portal:  bool,
     pub tessera_cas_read: bool,
     /// `arca`: keep secrets in Arca, its own items only.
     pub arca:            bool,
@@ -499,6 +500,7 @@ impl CapabilityDelta {
             && !self.audio_device
             && !self.net_fetch
             && !self.protected_media
+            && !self.network_portal
             && !self.tessera_cas_read
             && !self.arca
             && self.embeds_added.is_empty()
@@ -559,6 +561,7 @@ impl CapabilityDelta {
         if self.audio_device    { out.push("Add a sound output and play the system's sound through it".into()); }
         if self.net_fetch       { out.push("Fetch from the internet through the system's fetcher (no direct network access)".into()); }
         if self.protected_media { out.push("Play protected (DRM) media through a separately jailed decryption module".into()); }
+        if self.network_portal  { out.push("Open sign-in pages of public Wi-Fi networks (captive portals) on the network's own DNS".into()); }
         if self.arca            { out.push("Keep its own passwords and keys in Arca".into()); }
         for r in &self.embeds_added {
             // Roles read as what the person sees.
@@ -682,6 +685,7 @@ pub fn compute_delta(
     bool_cap!(audio_device);
     bool_cap!(net_fetch);
     bool_cap!(protected_media);
+    bool_cap!(network_portal);
     bool_cap!(tessera_cas_read);
     bool_cap!(arca);
     if let Some(req) = &requested.embeds {
@@ -1020,6 +1024,7 @@ run_as = "_navpage"
             net_fetch: None,
             net_fetch_sites: None,
             protected_media: None,
+            network_portal: None,
             syscalls: None,
             input: None,
             extra:      Default::default(),
