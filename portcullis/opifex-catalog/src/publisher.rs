@@ -48,9 +48,13 @@ pub struct Publisher {
     pub devices: bool,
     pub key: String,
     pub key_id: String,
-    /// Keys it used before, oldest first.
+    /// Ids of keys it used before, oldest first.
     #[serde(default)]
     pub past: Vec<String>,
+    /// Those keys' PEMs, in the same order: a tree installed before a
+    /// rotation stays signed by the key of its day.
+    #[serde(default)]
+    pub past_keys: Vec<String>,
     /// How many recoveries (root-signed key replacements) it has had.
     #[serde(default)]
     pub recoveries: u64,
@@ -152,7 +156,7 @@ impl PublisherEntry {
                 }
                 known.push(Publisher { id: self.id.clone(), name: self.name.clone(), domains: self.domains.clone(),
                                        prefixes, kinds: self.kinds.clone(), devices: self.devices,
-                                       key: self.key.clone(), key_id: new_id, past: Vec::new(), recoveries: 0 });
+                                       key: self.key.clone(), key_id: new_id, past: Vec::new(), past_keys: Vec::new(), recoveries: 0 });
             }
             ("register", Some(_)) => return Err(format!("{what}: registered already")),
             (_, None) => return Err(format!("{what}: not registered")),
@@ -193,6 +197,7 @@ impl PublisherEntry {
                 let p = &mut known[i];
                 if rekey {
                     p.past.push(cur.key_id.clone());
+                    p.past_keys.push(cur.key.clone());
                     p.key = self.key.clone();
                     p.key_id = new_id;
                 }
