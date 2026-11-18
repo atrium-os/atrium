@@ -278,6 +278,7 @@ dependencies = [
  "fresco-protocol",
  "lyra-protocol",
  "pergola",
+ "portcullis-ipc",
 ]
 
 [[package]]
@@ -663,6 +664,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",

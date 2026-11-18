@@ -387,7 +387,12 @@ n0)
     g1=$(stat web_get)
     [ $((g1 - g0)) -ge 3 ] && "$V" "$PC portal" | grep -q 'watching=1' \
         && ok "portal watch on: probed every 5 s ($((g1 - g0)) probes in 16 s)" || fail "portal watch: $g0 -> $g1 $("$V" "$PC portal")"
-    lanctl web-ok >/dev/null
+    # The sign-in page itself, as the window would see it: a form whose
+    # POST lets the machine through.
+    r=$("$V" "printf 'GET /login?from=atrium HTTP/1.0\\r\\nHost: 10.88.0.1\\r\\n\\r\\n' | nc -w 5 10.88.0.1 80" 2>&1 || true)
+    echo "$r" | grep -q '<form method=post action=/accept>' && ok "the portal's page on the router: one form, POST /accept" || fail "portal page: $r"
+    r=$("$V" "printf 'POST /accept HTTP/1.0\\r\\nHost: 10.88.0.1\\r\\nContent-Type: application/x-www-form-urlencoded\\r\\nContent-Length: 9\\r\\n\\r\\nterms=yes' | nc -w 5 10.88.0.1 80" 2>&1 || true)
+    echo "$r" | grep -q 'You are online' && [ "$(stat portal_accept)" -ge 1 ] && ok "the form sent: the portal lets the machine through" || fail "portal accept: $r"
     i=0; until stl | grep -q 'internet=yes'; do i=$((i + 1)); [ $i -lt 20 ] || fail "not online after sign-in: $(stl)"; sleep 1; done
     "$V" "$PC portal" | grep -q 'online=Yes .*watching=0' \
         && ok "signed in: online within ${i} s of the portal letting go, and the watch ended by itself" || fail "after sign-in: $("$V" "$PC portal")"

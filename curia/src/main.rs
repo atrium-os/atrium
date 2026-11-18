@@ -243,6 +243,26 @@ fn display_work(w: curia::display::Want, tx: Sender<curia::display::Got>, refres
     });
 }
 
+/// portcullisd's `PortalWindow` (atrium-net.md §8.1): the person's sign-in
+/// window, started or brought forward by the press.
+fn portal_window(activation: Option<[u8; 16]>) -> Result<(), String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let path = portcullis_ipc::resolve_socket_path().ok_or("portcullisd is not running")?;
+    let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("portcullisd: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).map_err(|e| e.to_string())?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { version }) if version == PROTO_VERSION => {}
+        Ok(other) => return Err(format!("portcullisd: {other:?}")),
+        Err(e) => return Err(format!("portcullisd is not answering ({e})")),
+    }
+    match round_trip(&mut s, &Request::PortalWindow { activation }) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("portcullisd: {other:?}")),
+        Err(e) => Err(format!("portcullisd is not answering ({e})")),
+    }
+}
+
 /// One request; joins can take up to a minute, so each runs on its own
 /// thread, and a second scan while one runs is dropped.
 fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
@@ -275,6 +295,7 @@ fn work(w: Want, tx: Sender<Got>, scanning: Arc<AtomicBool>) {
             Want::SetStatic(s) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_static(s).map_err(e)) },
             Want::SetDns(v) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_dns(v).map_err(e)) },
             Want::SetDnsTls(t) => Got::Done { what: w.clone(), result: connect(Grant::Configure).and_then(|mut c| c.set_dns_tls(t).map_err(e)) },
+            Want::SignIn { activation } => Got::Done { what: w.clone(), result: portal_window(*activation) },
         };
         let _ = tx.send(g);
     });

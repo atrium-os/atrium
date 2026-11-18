@@ -158,9 +158,11 @@ pub fn apply_all(
     // The terminal asks for more consoles (Console, homes.md §4) the same way,
     // and Settings lists and changes apps' access (`app-grants`, curia.md §13);
     // an IDE asks for workspace picks and commands (`workspace-exec`).
+    // Whoever may join Wi-Fi (`network-wifi`: the bar, Settings) may open
+    // the network's sign-in window (PortalWindow, atrium-net.md §8.1).
     if (caps.net_fetch == Some(true) || caps.protected_media == Some(true) || caps.removable_files == Some(true)
         || caps.consoles == Some(true) || caps.app_grants == Some(true) || caps.workspaces == Some(true)
-        || caps.workspace_exec == Some(true))
+        || caps.workspace_exec == Some(true) || caps.network_wifi == Some(true))
         && caps.app_launch != Some(true) {
         apply_app_launch(jc, opts);
     }

@@ -495,7 +495,13 @@ DNS over TLS working again.
 302, the socket's permissions, refusal to another user, 5 s probes while watched and the
 watch ending once online) and S2 (Nuntius resolvers, portcullisd `OpenPortalFetcher`
 gated on the `network-portal` manifest capability, `nuntius::launch::open_portal`).
-S3 and S4 are next.
+S4 entry points built the same day: "Sign in to this network…" in the bar's network
+menu and "Sign in to network" on Settings' Network page (primary when the probe saw a
+portal), both whenever a link is up, both asking portcullisd's `PortalWindow` (Settings
+with the press, so an open window comes forward). `network-wifi` now reaches
+portcullisd's socket for this. lan.py's router serves the sign-in page (GET /login, one
+form; POST /accept lets the machine through), and gate n0 (70/70) sends that form.
+Left: the automatic offer when DNS over TLS fails on a new network (P3), and S3.
 
 *S3, the window's shape (Navigator thread, 2026-11-18):* the Navigator runs one window per
 instance and `Launch` passes no arguments, so the sign-in window is its own Navigator

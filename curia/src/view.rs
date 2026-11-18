@@ -224,11 +224,26 @@ impl CuriaView {
                 text(ctx, x0 + em(56.0), y + ch / 2.0, &head, type_size::MD, Weight::Medium, t.text_primary());
             }
         }
+        let mut bx = x0 + pw - em(16.0);
         if s.is_some_and(|s| s.link == Link::Wifi) {
             let label = "Disconnect";
             let bw = width(label, type_size::SM, Weight::Medium) + em(24.0);
+            bx -= bw;
             let pg = self.page.clone();
-            button(ctx, x0 + pw - bw - em(16.0), y + (ch - em(30.0)) / 2.0, label, Look::Secondary, true, move || with(&pg, NetPage::leave));
+            button(ctx, bx, y + (ch - em(30.0)) / 2.0, label, Look::Secondary, true, move || with(&pg, NetPage::leave));
+            bx -= em(8.0);
+        }
+        // The network's sign-in page (atrium-net.md §8.1): the thing to do
+        // when the probe saw a portal, else offered quietly.
+        if let Some(needed) = p.sign_in_offer() {
+            let label = "Sign in to network";
+            let bw = width(label, type_size::SM, Weight::Medium) + em(24.0);
+            bx -= bw;
+            let pg = self.page.clone();
+            button(ctx, bx, y + (ch - em(30.0)) / 2.0, label, if needed { Look::Primary } else { Look::Ghost }, true, move || {
+                let token = pergola::clipboard::current_activation();
+                with(&pg, |p| p.sign_in(token))
+            });
         }
         y += ch + em(24.0);
         if !p.reachable {
