@@ -125,6 +125,9 @@ ocf_run(struct cryptop *crp)
 	struct ocf_wait w;
 	int error;
 
+	/* Zeroed first: mtx_init on stack garbage panics an INVARIANTS kernel
+	 * ("already initialized") when an old lock's bits are still there. */
+	bzero(&w, sizeof(w));
 	mtx_init(&w.lock, "tessera_ocf", NULL, MTX_DEF);
 	crp->crp_callback = ocf_cb;
 	crp->crp_opaque = &w;
