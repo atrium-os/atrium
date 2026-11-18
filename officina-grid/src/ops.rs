@@ -60,6 +60,9 @@ pub enum GridOp {
     /// [`Workbook::encode_cond_formats`] writes them (their formulas are text, read
     /// against the workbook when the op is applied). Made by [`GridOp::cond_formats`].
     CondFormats(std::sync::Arc<[u8]>),
+    /// The workbook's data validation rules, swapped in whole, as
+    /// [`Workbook::encode_validations`] writes them. Made by [`GridOp::validations`].
+    Validations(std::sync::Arc<[u8]>),
     /// The workbook's defined names, swapped in whole, as
     /// [`Workbook::encode_names`] writes them (formula text, read against the
     /// workbook when applied). Made by [`GridOp::names`].
@@ -127,6 +130,9 @@ impl GridOp {
     /// Puts `fs` in place of the workbook's conditional formats.
     pub fn cond_formats(wb: &Workbook, fs: &[crate::condfmt::CondFormat]) -> Self {
         GridOp::CondFormats(wb.encode_cond_formats(fs).into())
+    }
+    pub fn validations(wb: &Workbook, vs: &[crate::validation::Validation]) -> Self {
+        GridOp::Validations(wb.encode_validations(vs).into())
     }
 
     /// Puts `defs` in place of the workbook's defined names.
@@ -196,6 +202,11 @@ impl GridOp {
                 for (p, area) in ps {
                     p.encode(&mut w, *area);
                 }
+                return w.into_bytes();
+            }
+            GridOp::Validations(b) => {
+                w.u8(20);
+                w.bytes(b);
                 return w.into_bytes();
             }
             GridOp::CondFormats(b) => {
@@ -359,6 +370,13 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(GridOp::Pivots(v));
+        }
+        if kind == 20 {
+            let v = r.bytes("validation rules", b.len() as u64)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Validations(v.into()));
         }
         if kind == 8 || kind == 9 {
             let v = r.bytes("conditional formats", b.len() as u64)?;
@@ -528,6 +546,13 @@ impl Op<Workbook> for GridOp {
             GridOp::Tables(ts) => GridOp::Tables(wb.replace_tables(ts)),
             GridOp::Charts(cs) => GridOp::Charts(wb.replace_charts(cs)),
             GridOp::Pivots(ps) => GridOp::Pivots(wb.replace_pivots(ps)),
+            GridOp::Validations(b) => {
+                let old = wb.encode_validations(wb.validations());
+                if let Ok(vs) = wb.decode_validations(&b) {
+                    wb.replace_validations(vs);
+                }
+                GridOp::Validations(old.into())
+            }
             GridOp::CondFormats(b) => {
                 // A list that no longer reads against the workbook (a sheet it
                 // names is gone) changes nothing.

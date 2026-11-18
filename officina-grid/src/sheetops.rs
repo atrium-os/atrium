@@ -84,6 +84,10 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if cfs.len() != wb.cond_formats().len() {
         ops.push(GridOp::cond_formats(wb, &cfs));
     }
+    let vs: Vec<_> = wb.validations().iter().filter(|v| v.sheet != s).cloned().collect();
+    if vs.len() != wb.validations().len() {
+        ops.push(GridOp::validations(wb, &vs));
+    }
 
     // Its filter, cells, styles and sizes.
     let st = wb.filter_state(s);

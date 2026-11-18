@@ -169,6 +169,8 @@ pub struct Workbook {
     pub(crate) spill_out: Mutex<Vec<(CellAddr, Option<Arc<crate::eval::Array>>)>>,
     /// Conditional formats, in priority order ([`crate::condfmt`]).
     pub(crate) cond_formats: Vec<crate::condfmt::CondFormat>,
+    /// Data validation rules ([`crate::validation`]).
+    pub(crate) validations: Vec<crate::validation::Validation>,
     pub(crate) pivots: Vec<crate::pivot::Pivot>,
     pub(crate) pivot_shapes: Vec<crate::pivot::Shape>,
     pub(crate) cond_stats: crate::condfmt::StatCache,
@@ -206,6 +208,7 @@ impl Workbook {
             claims: HashMap::new(),
             spill_out: Mutex::new(Vec::new()),
             cond_formats: Vec::new(),
+            validations: Vec::new(),
             pivots: Vec::new(),
             pivot_shapes: Vec::new(),
             cond_stats: Default::default(),
@@ -283,7 +286,7 @@ impl Workbook {
         let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
         let sh = &self.sheets[s as usize];
         let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none() && sh.tab_color.is_none() && sh.merges.is_empty() && sh.comments.is_empty() && sh.links.is_empty() && sh.freeze == (0, 0);
-        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
+        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s) || self.validations.iter().any(|v| v.sheet == s) || self.pivots.iter().any(|p| p.dest.sheet == s || p.source.sheet == s);
         if !bare || on_it {
             return None;
         }
@@ -920,6 +923,7 @@ impl Workbook {
         let defs: Vec<crate::names::NameDef> = self.names.iter().cloned().collect();
         let names_b = self.encode_names(&defs);
         let cfs_b = self.encode_cond_formats(&self.cond_formats);
+        let vs_b = self.encode_validations(&self.validations);
 
         // Formula groups out, to come back on their sheets' new places.
         let ids: Vec<GroupId> = self.groups().map(|(g, _)| g).collect();
@@ -989,6 +993,15 @@ impl Workbook {
                 }
             }
             self.replace_cond_formats(fs);
+        }
+        if let Ok(mut vs) = self.decode_validations(&vs_b) {
+            for v in &mut vs {
+                v.sheet = m(v.sheet);
+                for r in &mut v.ranges {
+                    *r = rect(*r);
+                }
+            }
+            self.replace_validations(vs);
         }
 
         for (s, c, r0, r1, e, pend) in out {

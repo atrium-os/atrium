@@ -19,6 +19,7 @@
 //! | 15 | TAB_COLORS | sheets' tab colours: count; per sheet, its index and 0xRRGGBB |
 //! | 16 | MERGES | one sheet's merged cells: sheet, count, each area's corners |
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
+//! | 20 | VALIDATIONS | data validation rules: ranges, kind, operator, formulas as text, flags, messages |
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
@@ -48,6 +49,7 @@ pub const MERGES: u16 = 16;
 pub const COMMENTS: u16 = 17;
 pub const LINKS: u16 = 18;
 pub const FREEZE: u16 = 19;
+pub const VALIDATIONS: u16 = 20;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -244,6 +246,9 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             f.encode(&mut w, wb);
         }
         c.add(COND_FORMATS, &w.into_bytes())?;
+    }
+    if !wb.validations.is_empty() {
+        c.add(VALIDATIONS, &wb.encode_validations(&wb.validations))?;
     }
     if !wb.pivots.is_empty() {
         let mut w = Writer::new();
@@ -512,6 +517,17 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             wb.add_cond_format(f).map_err(LoadError::Bad)?;
         }
         done(&r)?;
+    }
+
+    let mut it = of(VALIDATIONS);
+    if let Some(i) = it.next() {
+        if it.next().is_some() {
+            return Err(LoadError::Bad("two VALIDATIONS chunks"));
+        }
+        let vs = wb.decode_validations(c.chunk(i)?)?;
+        for v in vs {
+            wb.add_validation(v).map_err(LoadError::Bad)?;
+        }
     }
 
     // Macros, kept as they are.

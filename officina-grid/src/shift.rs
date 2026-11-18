@@ -429,6 +429,24 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::cond_formats(wb, &cfs));
     }
 
+    // Validation rules, as conditional formats.
+    let vs: Vec<_> = wb.validations().iter().filter_map(|v| {
+        let mut v = v.clone();
+        let (or, oc) = v.origin();
+        if v.sheet == sheet {
+            v.ranges = v.ranges.iter().filter_map(|r| s.map_rect(*r)).collect();
+            if v.ranges.is_empty() {
+                return None;
+            }
+        }
+        let (nr, nc) = v.origin();
+        let a = Adjust { own: v.sheet, target: sheet, s, or, oc, nr, nc };
+        Some(v.map_exprs(&|e| a.expr(e)))
+    }).collect();
+    if vs != wb.validations() {
+        ops.push(GridOp::validations(wb, &vs));
+    }
+
     // Comments and links: with their cells; those on deleted cells go.
     let set = crate::links::moved(wb.comments(sheet), |r, c| s.map_cell(r, c));
     if !set.is_empty() {
