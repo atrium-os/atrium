@@ -39,6 +39,7 @@ const NS: &str = concat!(
     r#"xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" "#,
     r#"xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" "#,
     r#"xmlns:xlink="http://www.w3.org/1999/xlink" "#,
+    r#"xmlns:dc="http://purl.org/dc/elements/1.1/" "#,
     r#"xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" "#,
     r#"xmlns:calcext="urn:org:documentfoundation:names:experimental:calc:xmlns:calcext:1.0" "#,
     r#"xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0" "#,
@@ -762,6 +763,23 @@ fn time_text(x: f64) -> String {
     t
 }
 
+/// The cell's comment as an `office:annotation`, if it has one.
+fn note(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32) {
+    let Some(k) = wb.comment(s, r, c) else { return };
+    out.push_str("<office:annotation>");
+    if !k.author.is_empty() {
+        out.push_str("<dc:creator>");
+        esc(out, &k.author);
+        out.push_str("</dc:creator>");
+    }
+    for line in k.text.split('\n') {
+        out.push_str("<text:p>");
+        esc(out, line);
+        out.push_str("</text:p>");
+    }
+    out.push_str("</office:annotation>");
+}
+
 /// One cell's attributes and content (without the element's name).
 fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, span: Option<officina_grid::addr::Rect>, bools: &mut BTreeSet<StyleId>) {
     out.push_str("<table:table-cell");
@@ -824,9 +842,13 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
         out.push('"');
     }
     match v {
-        Value::Empty => {
+        Value::Empty if wb.comment(s, r, c).is_none() => {
             out.push_str("/>");
             return;
+        }
+        Value::Empty => {
+            out.push('>');
+            note(out, wb, s, r, c);
         }
         Value::Num(x) => {
             let x = *x;
@@ -846,6 +868,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
                     let _ = write!(out, r#" office:value-type="float" office:value="{}" calcext:value-type="float">"#, num(x));
                 }
             }
+            note(out, wb, s, r, c);
             paragraphs(out, &wb.formatted(officina_grid::CellAddr::new(s, r, c)).text);
         }
         Value::Str(t) => {
@@ -856,10 +879,12 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
                 out.push('"');
             }
             out.push_str(r#" calcext:value-type="string">"#);
+            note(out, wb, s, r, c);
             paragraphs(out, t);
         }
         Value::Bool(b) => {
             let _ = write!(out, r#" office:value-type="boolean" office:boolean-value="{b}" calcext:value-type="boolean">"#);
+            note(out, wb, s, r, c);
             paragraphs(out, if *b { "TRUE" } else { "FALSE" });
         }
         Value::Err(e) => {
@@ -868,6 +893,7 @@ fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, 
                 e => e.text(),
             };
             out.push_str(r#" office:value-type="string" office:string-value="" calcext:value-type="error">"#);
+            note(out, wb, s, r, c);
             paragraphs(out, t);
         }
     }
@@ -913,6 +939,12 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
                 cells.push((r, c as u32));
             }
             extra += (b - a + 1) as usize;
+        }
+    }
+    // Commented cells, written even when empty, to carry the comment.
+    for &(r, c) in wb.comments(s).keys() {
+        if r < ODS_ROWS && c < ODS_COLS {
+            cells.push((r, c));
         }
     }
     // Merged areas: their first cell written even when empty, to carry the span.

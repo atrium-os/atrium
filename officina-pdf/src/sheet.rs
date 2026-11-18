@@ -3,7 +3,9 @@
 //! the grid shows: its formatted text (the app hands it over as drawn, so a
 //! number format or a conditional format prints as it looks), its fill,
 //! borders and data bar, in the screen's face, cut with "…" or shown as
-//! "###" when it doesn't fit. Pixels are the screen's (96 to the inch).
+//! "###" when it doesn't fit. A merged area prints as one cell, its
+//! top-left cell's, with no lines inside. Pixels are the screen's (96 to
+//! the inch).
 
 use std::cell::RefCell;
 use std::io::{self, Write};
@@ -61,6 +63,9 @@ pub struct Sheet<'a> {
     pub cell: &'a dyn Fn(u32, u32) -> Option<Cell>,
     /// Light lines between cells, as the screen draws them.
     pub gridlines: bool,
+    /// Merged areas, `[r0, c0, r1, c1]` inclusive: each drawn as its
+    /// top-left cell across the whole area.
+    pub merges: Vec<[u32; 4]>,
 }
 
 /// The paper, in points, and its margins.
@@ -205,64 +210,96 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
     let mut pdf = Pdf::new(out)?;
     let none = |_: u32| None;
     let mut done = 0;
+    // One cell (or merged area) at x, y (pt), cw × ch: fill and bar under
+    // the text, borders over it.
+    let draw = |items: &mut Vec<Item>, cell: &Cell, x: f64, y: f64, cw: f64, ch: f64, text: bool| {
+        if let Some(f) = cell.fill {
+            items.push(Item::Rect { x: lu(x), y: lu(y), w: lu(cw), h: lu(ch), color: f });
+        }
+        if let Some((share, col)) = cell.bar {
+            let bw = ((cw - 4.0 * k).max(0.0) * share.clamp(0.0, 1.0) as f64).max(0.0);
+            items.push(Item::Rect { x: lu(x + 2.0 * k), y: lu(y + 2.0 * k), w: lu(bw), h: lu((ch - 5.0 * k).max(0.0)), color: col });
+        }
+        let lead = cell.indent as f64 * INDENT_PX * k;
+        let room = lu(cw - 2.0 * PAD_PX * k - lead);
+        if text && !cell.text.is_empty() {
+            if let Some((p, l, tw)) = fit(&shaper, cell, room) {
+                let left = match cell.align {
+                    Align::Left => lu(x + PAD_PX * k + lead),
+                    Align::Center => lu(x) + (lu(cw) - tw) / 2,
+                    Align::Right => lu(x + cw - PAD_PX * k) - tw,
+                };
+                let (cy, chl) = (lu(y), lu(ch));
+                shaper.paint(items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
+            }
+        }
+        for (side, b) in cell.borders.iter().enumerate() {
+            let Some((bw, col)) = *b else { continue };
+            let bw = (bw as f64 * k).max(0.25);
+            let (bx, by, bwid, bh) = match side {
+                0 => (x, y, bw, ch),
+                1 => (x + cw - bw, y, bw, ch),
+                2 => (x, y, cw, bw),
+                _ => (x, y + ch - bw, cw, bw),
+            };
+            items.push(Item::Rect { x: lu(bx), y: lu(by), w: lu(bwid), h: lu(bh), color: col });
+        }
+    };
     // Down, then across.
     for &(c0, c1) in &across {
         for &(r0, r1) in &down {
             let mut page = Page::default();
             let mut items = Vec::new();
             let mut lines = Vec::new();
-            let mut y = m;
+            // Where each column and row starts on this page.
+            let mut xs = vec![m; c1 - c0 + 1];
+            for c in c0..c1 {
+                xs[c - c0 + 1] = xs[c - c0] + cols[c].max(0.0);
+            }
+            let mut ys = vec![m; r1 - r0 + 1];
             for r in r0..r1 {
-                let ch = rows[r];
+                ys[r - r0 + 1] = ys[r - r0] + rows[r].max(0.0);
+            }
+            // The merged areas on this page, cut to it.
+            let pieces: Vec<([u32; 4], [usize; 4])> = sheet
+                .merges
+                .iter()
+                .filter(|a| (a[0] as usize) < r1 && a[2] as usize >= r0 && (a[1] as usize) < c1 && a[3] as usize >= c0)
+                .map(|a| (*a, [(a[0] as usize).max(r0), (a[1] as usize).max(c0), (a[2] as usize).min(r1 - 1), (a[3] as usize).min(c1 - 1)]))
+                .collect();
+            let merged = |r: usize, c: usize| pieces.iter().any(|(_, p)| (p[0]..=p[2]).contains(&r) && (p[1]..=p[3]).contains(&c));
+            for r in r0..r1 {
+                let (y, ch) = (ys[r - r0], rows[r]);
                 if ch <= 0.0 {
                     continue;
                 }
-                let mut x = m;
                 for c in c0..c1 {
-                    let cw = cols[c];
-                    if cw <= 0.0 {
+                    let (x, cw) = (xs[c - c0], cols[c]);
+                    if cw <= 0.0 || merged(r, c) {
                         continue;
                     }
                     if sheet.gridlines {
                         lines.push((x, y, cw, ch));
                     }
                     if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
-                        // Fill and bar under the text; borders over it.
-                        if let Some(f) = cell.fill {
-                            items.push(Item::Rect { x: lu(x), y: lu(y), w: lu(cw), h: lu(ch), color: f });
-                        }
-                        if let Some((share, col)) = cell.bar {
-                            let bw = ((cw - 4.0 * k).max(0.0) * share.clamp(0.0, 1.0) as f64).max(0.0);
-                            items.push(Item::Rect { x: lu(x + 2.0 * k), y: lu(y + 2.0 * k), w: lu(bw), h: lu((ch - 5.0 * k).max(0.0)), color: col });
-                        }
-                        let lead = cell.indent as f64 * INDENT_PX * k;
-                        let room = lu(cw - 2.0 * PAD_PX * k - lead);
-                        if !cell.text.is_empty() {
-                            if let Some((p, l, tw)) = fit(&shaper, &cell, room) {
-                                let left = match cell.align {
-                                    Align::Left => lu(x + PAD_PX * k + lead),
-                                    Align::Center => lu(x) + (lu(cw) - tw) / 2,
-                                    Align::Right => lu(x + cw - PAD_PX * k) - tw,
-                                };
-                                let (cy, chl) = (lu(y), lu(ch));
-                                shaper.paint(&mut items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
-                            }
-                        }
-                        for (side, b) in cell.borders.iter().enumerate() {
-                            let Some((bw, col)) = *b else { continue };
-                            let bw = (bw as f64 * k).max(0.25);
-                            let (bx, by, bwid, bh) = match side {
-                                0 => (x, y, bw, ch),
-                                1 => (x + cw - bw, y, bw, ch),
-                                2 => (x, y, cw, bw),
-                                _ => (x, y + ch - bw, cw, bw),
-                            };
-                            items.push(Item::Rect { x: lu(bx), y: lu(by), w: lu(bwid), h: lu(bh), color: col });
-                        }
+                        draw(&mut items, &cell, x, y, cw, ch, true);
                     }
-                    x += cw;
                 }
-                y += ch;
+            }
+            for (a, p) in &pieces {
+                let (x, y) = (xs[p[1] - c0], ys[p[0] - r0]);
+                let (cw, ch) = (xs[p[3] + 1 - c0] - x, ys[p[2] + 1 - r0] - y);
+                if cw <= 0.0 || ch <= 0.0 {
+                    continue;
+                }
+                if sheet.gridlines {
+                    lines.push((x, y, cw, ch));
+                }
+                if let Some(cell) = (sheet.cell)(a[0], a[1]) {
+                    // The text goes on the page with the area's first cell.
+                    let first = p[0] == a[0] as usize && p[1] == a[1] as usize;
+                    draw(&mut items, &cell, x, y, cw, ch, first);
+                }
             }
             // Gridlines first, so fills and borders cover them.
             if !lines.is_empty() {

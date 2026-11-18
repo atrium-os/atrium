@@ -102,6 +102,7 @@ sleep 4
 r=$(g "su -m alice -c '$D --media-socket $S --format $PART personal Holiday --recovery'")
 CODE=${r##*recovery code }
 check "sealed, with a code" yes "$(echo "$CODE" | grep -Eq '^[0-9A-Z]{5}(-[0-9A-Z]{5}){5}$' && echo yes || echo no)"
+check "…listed by its name" yes "$(list_as alice | grep -q "^$PART .* name=Holiday\$" && echo yes || echo no)"
 g "chmod 755 /media/$PART; su -m alice -c 'echo holiday photos > /media/$PART/note.txt'; chmod 644 /media/$PART/note.txt; sync"
 K=$(g "dd if=/dev/$PART bs=4096 count=1 2>/dev/null | dd bs=1 skip=264 count=16 2>/dev/null | od -An -tx1 | tr -d ' \n'")
 g "su -m alice -c '$D --media-socket $S --eject $PART'" >/dev/null
@@ -181,6 +182,8 @@ waitfor "seals=\\[$PART:personal\\] stick=-" 120 && ok "the right code opens it:
 check "…mounted" tessera "$(mounted)"
 check "…alice's note reads back" "holiday photos" "$(g "cat /media/$PART/note.txt")"
 check "…listed as bob's" yes "$(list_as bob | grep -q "^$PART /media/$PART .*persona=personal" && echo yes || echo no)"
+check "…by the name alice gave it, from its recovery slot" yes "$(list_as bob | grep -q "^$PART .* name=Holiday\$" && echo yes || echo no)"
+waitfor "names=\\[$PART=Holiday\\]" 30 && ok "…and Scrinium calls it Holiday" || bad "name: $(trace)"
 shot 4 4-opened
 LC=$(echo "$CODE" | tr 'A-Z' 'a-z')
 check "the code never reached Scrinium" 0 "$(g "grep -ci -e '$CODE' -e '$LC' /tmp/su/scrinium.log" | tr -d ' ')"

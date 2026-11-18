@@ -442,6 +442,9 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
     if wb.charts().iter().any(|c| c.anchor.sheet == s) {
         let _ = write!(o, r#"<drawing r:id="rId{}"/>"#, k + 1);
     }
+    if !wb.comments(s).is_empty() {
+        o.extend_from_slice(br#"<legacyDrawing r:id="rIdVml"/>"#);
+    }
     if k > 0 {
         let _ = write!(o, r#"<tableParts count="{k}">"#);
         for j in 0..k {
@@ -552,6 +555,14 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
             ct.push_str(&format!(r#"<Override PartName="/xl/drawings/drawing{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#, s + 1));
         }
     }
+    if (0..n).any(|s| !wb.comments(s as u16).is_empty()) {
+        ct.push_str(&format!(r#"<Default Extension="vml" ContentType="{}"/>"#, super::comments::VML_TYPE));
+    }
+    for s in 0..n {
+        if !wb.comments(s as u16).is_empty() {
+            ct.push_str(&format!(r#"<Override PartName="/xl/comments{}.xml" ContentType="{}"/>"#, s + 1, super::comments::COMMENTS_TYPE));
+        }
+    }
     for i in 0..wb.charts().len() {
         ct.push_str(&format!(r#"<Override PartName="/xl/charts/chart{}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>"#, i + 1));
     }
@@ -652,7 +663,8 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
         let mine: Vec<usize> = (0..wb.tables().len()).filter(|&i| wb.tables()[i].rect.sheet as usize == s).collect();
         let charts: Vec<usize> = (1..=wb.charts().len()).filter(|&i| wb.charts()[i - 1].anchor.sheet as usize == s).collect();
         let pivots: Vec<usize> = (0..wb.pivots().len()).filter(|&i| wb.pivots()[i].dest.sheet as usize == s).collect();
-        if !mine.is_empty() || !charts.is_empty() || !pivots.is_empty() {
+        let noted = !wb.comments(s as u16).is_empty();
+        if !mine.is_empty() || !charts.is_empty() || !pivots.is_empty() || noted {
             let mut r = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#);
             for (j, i) in mine.iter().enumerate() {
                 r.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table{}.xml"/>"#, j + 1, i + 1));
@@ -667,6 +679,11 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
                 }
                 dr.push_str("</Relationships>");
                 z.add(&format!("xl/drawings/_rels/drawing{}.xml.rels", s + 1), dr.as_bytes())?;
+            }
+            if noted {
+                r.push_str(&format!(r#"<Relationship Id="rIdCm" Type="{}" Target="../comments{}.xml"/><Relationship Id="rIdVml" Type="{}" Target="../drawings/vmlDrawing{}.vml"/>"#, super::comments::COMMENTS_REL, s + 1, super::comments::VML_REL, s + 1));
+                z.add(&format!("xl/comments{}.xml", s + 1), super::comments::comments_xml(wb, s as u16).as_bytes())?;
+                z.add(&format!("xl/drawings/vmlDrawing{}.vml", s + 1), super::comments::vml(wb, s as u16).as_bytes())?;
             }
             for i in &pivots {
                 r.push_str(&format!(r#"<Relationship Id="rIdPt{0}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable{0}.xml"/>"#, i + 1));

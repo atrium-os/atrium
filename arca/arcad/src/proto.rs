@@ -268,7 +268,8 @@ pub mod volume_op {
     /// neither.
     pub const VK_RECOVERY: u16 = 0xB5;
     /// `owner | key_id[16] | uuid[16] | slot[256] | u8 keep | str code
-    /// [| handle[16] when code is empty]` → nothing: a stick from
+    /// [| handle[16] when code is empty]` → the stick's name from its slot
+    /// (empty if it has none): a stick from
     /// elsewhere, opened with its recovery code. With a handle, the code is
     /// what the person typed into Arca's field (`U_HOLD` with
     /// `HOLD_FOR_RECOVERY`, as the same user); `DENIED` if it isn't one.
