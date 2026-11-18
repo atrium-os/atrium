@@ -80,6 +80,8 @@ pub enum GridOp {
     MoveSheet { from: u16, to: u16 },
     /// A sheet's tab colour (0xRRGGBB), or none.
     TabColor { sheet: u16, color: Option<u32> },
+    /// A sheet's merged cells ([`crate::merges`]), swapped in whole.
+    Merges { sheet: u16, list: Vec<Rect> },
 }
 
 impl GridOp {
@@ -233,6 +235,12 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::Merges { sheet, list } => {
+                w.u8(16);
+                w.u16(*sheet);
+                crate::merges::encode(&mut w, list);
+                return w.into_bytes();
+            }
             GridOp::Sizes { sheet, rows, over } => {
                 w.u8(10);
                 w.u16(*sheet);
@@ -357,6 +365,14 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 16 {
+            let sheet = r.u16()?;
+            let list = crate::merges::decode(&mut r, sheet)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::Merges { sheet, list });
         }
         if kind == 10 {
             let sheet = r.u16()?;
@@ -503,6 +519,12 @@ impl Op<Workbook> for GridOp {
                 Ok(old) => GridOp::RenameSheet { sheet, name: old },
                 Err(_) => GridOp::Batch(Vec::new()),
             },
+            GridOp::Merges { sheet, list } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                GridOp::Merges { sheet, list: wb.set_merges(sheet, list) }
+            }
             GridOp::Sizes { sheet, rows, over } => {
                 if sheet as usize >= wb.sheet_count() {
                     return GridOp::Sizes { sheet, rows, over };

@@ -86,7 +86,7 @@ ro_paths = [
     # aura-keys connects to arcad's for Wi-Fi credentials.
     "/atrium/sockets/aura-keys",
     "/atrium/sockets/arca",
-    "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles)
+    "/var/lib/atrium/apps",          # limend: installed manifests (embeds, roles); the share sheet: share-targets and icons
     "/etc/pwd.db",                   # limend: a worker rule's run_as -> uid (no hashes)
 ]
 rw_paths = [
@@ -159,6 +159,12 @@ rw_patterns = [
     # Per-user home — mounted only into that user's supervisor
     # jail and into apps the user grants the `home` capability to.
     "/usr/home/*",
+
+    # A session component's state in the person's home
+    # (~/.atrium/state/<component>, homes.md §2; `.atrium` and `state` are
+    # root's). root's own home on dev machines, where root logs in.
+    "/usr/home/*/.atrium/state/*",
+    "/root/.atrium/state/*",
 
     # Per-user persistent state under Atrium control (db, prefs).
     "/var/db/atrium/users/*",
@@ -508,6 +514,8 @@ allowed_system_uids = [
     65044,   # _egress: a `registries` workspace's proxy, nuntius-egress, one
              # jail per running workspace, started by portcullisd under the
              # system worker rule (nuntius-egress-bundle.sh; dev-tools.md §5.2)
+    65045,   # _share: the share sheet, Limen's `share` provider
+             # (share-sheet.md; share-sheet-service.sh creates it)
 ]
 
 [gid]
@@ -535,6 +543,7 @@ allowed_system_gids = [
     65038,   # _monstrator
     65042,   # _opifexsheet
     65044,   # _egress
+    65045,   # _share
 ]
 
 

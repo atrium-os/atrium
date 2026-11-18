@@ -27,6 +27,12 @@ fn usage() -> ! {
 }
 
 fn main() {
+    // ATRIUM_PLAYER_TIMES=1: also print milliseconds since start at the
+    // worker's ready, the first frame, a restart and the end (gates time
+    // the decode worker's start with it).
+    let t0 = std::time::Instant::now();
+    let times = std::env::var_os("ATRIUM_PLAYER_TIMES").is_some();
+    let stamp = |what: &str| if times { println!("t-{what} {}", t0.elapsed().as_millis()) };
     let mut args = std::env::args().skip(1);
     let (mut headless, mut feed, mut seek, mut probe, mut kill_after) = (false, false, None, false, None);
     let (mut exit_at_end, mut size) = (false, (640u32, 360u32));
@@ -157,12 +163,18 @@ fn main() {
         }
         let Some(ev) = ev else { continue };
         match ev {
-            PlayerEvent::Sandboxed(s) => println!("sandboxed {s}"),
+            PlayerEvent::Sandboxed(s) => {
+                println!("sandboxed {s}");
+                stamp("ready");
+            }
             PlayerEvent::VideoTrack { width, height, bit_depth } => println!("video-track {width}x{height} {bit_depth}-bit"),
             PlayerEvent::AudioTrack { rate, channels } => println!("audio-track {rate} Hz {channels} ch"),
             PlayerEvent::Duration(d) => println!("duration {d:.3}"),
             PlayerEvent::Frame { .. } => {
                 frames += 1;
+                if frames == 1 {
+                    stamp("first-frame");
+                }
                 if Some(frames) == kill_after {
                     if let Some(pid) = p.worker_pid() {
                         println!("killing worker {pid}");
@@ -193,7 +205,10 @@ fn main() {
                 println!("buffered {track} {}", r.join(" "));
             }
             PlayerEvent::Probe { refused } => println!("probe open-refused={} connect-refused={} fork-refused={}", refused & 1 != 0, refused & 2 != 0, refused & 4 != 0),
-            PlayerEvent::Restarted => println!("worker restarted"),
+            PlayerEvent::Restarted => {
+                println!("worker restarted");
+                stamp("restarted");
+            }
             PlayerEvent::AppendRefused { track, code } => println!("append on track {track} refused ({code})"),
             PlayerEvent::Ended => {
                 loop {
@@ -205,6 +220,7 @@ fn main() {
                 }
                 println!("audio {pcm_frames} frames from {}", first_pcm_pts.unwrap_or(0));
                 println!("ended {frames} frames");
+                stamp("end");
                 return;
             }
             PlayerEvent::Error(code) => {

@@ -763,8 +763,11 @@ fn time_text(x: f64) -> String {
 }
 
 /// One cell's attributes and content (without the element's name).
-fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, bools: &mut BTreeSet<StyleId>) {
+fn cell_xml(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, v: &Value, style: Option<StyleId>, span: Option<officina_grid::addr::Rect>, bools: &mut BTreeSet<StyleId>) {
     out.push_str("<table:table-cell");
+    if let Some(m) = span {
+        let _ = write!(out, r#" table:number-columns-spanned="{}" table:number-rows-spanned="{}""#, m.c1 - m.c0 + 1, m.r1 - m.r0 + 1);
+    }
     let id = wb.sheet(s).style_id(r, c);
     // A logical value needs a boolean format to stay one (LibreOffice shows 1).
     let style = if matches!(v, Value::Bool(_)) && wb.styles.format(id).is_general() {
@@ -912,6 +915,12 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             extra += (b - a + 1) as usize;
         }
     }
+    // Merged areas: their first cell written even when empty, to carry the span.
+    for m in wb.merges(s) {
+        if m.r0 < ODS_ROWS && m.c0 < ODS_COLS {
+            cells.push((m.r0, m.c0));
+        }
+    }
     cells.sort_unstable();
     cells.dedup();
 
@@ -1041,7 +1050,8 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
             }
             let id = sh.style_id(r, cc);
             let style = (id != tail(cc)).then_some(id);
-            cell_xml(out, wb, s, r, cc, &wb.value(s, r, cc), style, bools);
+            let span = wb.merge_at(officina_grid::CellAddr::new(s, r, cc)).filter(|m| (m.r0, m.c0) == (r, cc));
+            cell_xml(out, wb, s, r, cc, &wb.value(s, r, cc), style, span, bools);
             col = cc + 1;
             any = true;
             k += 1;

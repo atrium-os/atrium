@@ -1,0 +1,71 @@
+# /etc/atrium/services.d/42-atrium-share-sheet.toml
+#
+# The jailed launch of share-sheet, Limen's `share` provider
+# (docs/spec/share-sheet.md). atrium-portcullisd-bootstrap reads this, asks
+# jaild to create the jail and supervises share-sheet inside it.
+#
+# share-sheet runs NON-ROOT (_share) with no devices, no network and none of
+# anyone's files. It connects to limend (which takes PROVIDE share and CHOOSE
+# from this uid only, LIMEN_SHARE_UID), draws each sheet through frescod, and
+# spends the app's press there (purpose SHARE, which frescod lets only this
+# uid spend). It reads the installed manifests and their icons, and the
+# launch registry to know whose app is sharing. It never sees the item.
+#
+# It waits for limend (again every 5 s), so boot order doesn't matter.
+#
+# REQUIRES (scripts/share-sheet-service.sh does all of it):
+#   1. The _share (65045) system user, in jaild.policy's allowed_system_uids.
+#   2. /var/lib/atrium/apps and /var/run/atrium/app-registry in ro_paths.
+#   3. The rootfs mountpoints: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,
+#      atrium/sockets/{limen,fresco,fresco-activation},var/lib/atrium/apps,
+#      var/run/atrium} and an empty file <path>/var/run/atrium/app-registry.
+
+enabled       = true
+name          = "atrium-share-sheet"
+class         = "idle"                          # boot class (fast-boot.md §6.3): nothing shares before someone is logged in
+path          = "/var/lib/atrium/jails/share-sheet"
+children_max  = 0
+devfs_ruleset = 4                                # devfsrules_jail: no devices
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets/limen"                  # rw: connects to limend
+dest   = "atrium/sockets/limen"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/fresco"                 # rw: each sheet's window
+dest   = "atrium/sockets/fresco"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/fresco-activation"      # rw: spends the app's press (SHARE)
+dest   = "atrium/sockets/fresco-activation"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/var/lib/atrium/apps"                   # ro: installed manifests (share-targets) and icons
+dest   = "var/lib/atrium/apps"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/var/run/atrium/app-registry"           # ro: who each app uid is (one file)
+dest   = "var/run/atrium/app-registry"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-share-sheet"
+argv = ["atrium-share-sheet"]
+uid  = 65045   # _share
+gid  = 65045

@@ -23,7 +23,8 @@
 # COMPONENT (portcullisd's LaunchSessionComponent, as ostiarius asks at
 # login): it gets the person's state folder, read-write at /atrium/state;
 # Ctrl+D unpins the selected app, the pins land in
-# /var/db/atrium/state/<person>/org.atrium.forum-dock/pinned, and they are
+# ~/.atrium/state/org.atrium.forum-dock/pinned (homes.md §2; root's home
+# here), and they are
 # read back after a teardown and a fresh launch. Alpha ships its own SVG icon,
 # which portcullisd reads from the bundle and the dock draws as filled paths.
 # The person has a Work persona (personas.md §7): launching from the grid asks
@@ -221,10 +222,10 @@ g "grep -c 'persona question' $S/dock.log" | grep -qx "$NQ" && ok "and asked not
 g "pkill -x beta; P=/var/db/atrium/root/policy.toml; sed -i '' '/^\[personas.work\]/,+1d' \$P"
 
 echo "== the dock as a session component: pins kept in the person's state folder"
-SD=/var/db/atrium/state/root/org.atrium.forum-dock
+SD=/root/.atrium/state/org.atrium.forum-dock
 JN=app-org-atrium-forum-dock
 # The app-launched dock goes (portcullisd cleans its jail up); Beta too.
-g "pkill -x forum-dock; pkill -x beta; sleep 5; rm -rf /var/db/atrium/state/root
+g "pkill -x forum-dock; pkill -x beta; sleep 5; rm -rf /var/db/atrium/state/root /root/.atrium/state
   mkdir -p /etc/atrium/session.d /usr/local/share/atrium/apps/org.atrium.forum-dock/bin
   install -m 755 $W/forum-dock /usr/local/share/atrium/apps/org.atrium.forum-dock/bin/forum-dock
   printf 'enabled = false\nname = \"gate-session-launcher\"\npath = \"/var/lib/atrium/jails/gate-session-launcher\"\n[capabilities]\nsession_launch = true\n[exec]\npath = \"/usr/bin/true\"\nargv = [\"true\"]\nuid = 0\ngid = 0\n' > /etc/atrium/services.d/99-gate-session-launcher.toml"

@@ -349,8 +349,10 @@ parse = "../mail-parse"      # its folder, or its Cargo.toml
 and each worker at their `entry` paths and the icon (an SVG path) in a
 tree, and adds the runtime closure: every library the programs need,
 read from their `DT_NEEDED` and `DT_RUNPATH` (never by running them), and
-the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others
-go to `usr/lib/`. The programs are stripped (`--no-strip` keeps them as
+the loader. Base libraries keep their paths (`lib/`, `usr/lib/`); others,
+pkg's `/usr/local/lib` among them, go to `usr/lib/`, since an app's jail
+has no `ld-elf.so.hints` and its loader looks only in `/lib` and
+`/usr/lib`. The programs are stripped (`--no-strip` keeps them as
 built); their debug info goes to `<tree>.debug/`, linked by
 `.gnu_debuglink`, for the debugger. Then `opifex pack` writes the content
 index and the signature (the key may be PKCS#8 or SEC1 PEM), and `opifex

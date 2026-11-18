@@ -9,7 +9,7 @@
 //!
 //! Styles and number formats come from `xl/styles.xml` ([`super::styles`]).
 //!
-//! Reported, not carried (O4c–O4e): merged cells, charts and
+//! Reported, not carried (O4c–O4e): charts and
 //! drawings, defined names, tables, conditional formats, data validation, comments,
 //! hyperlinks. Kept inert: macros (`vbaProject.bin`, see [`super::macros`]), external links.
 
@@ -364,6 +364,8 @@ struct Seg {
     cond: Vec<super::condfmt::Raw>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
+    /// `<mergeCell ref>`s, (r0, c0, r1, c1).
+    merges: Vec<(u32, u32, u32, u32)>,
 }
 
 /// Parses one piece of a sheet. Pieces after the first must number their rows.
@@ -578,7 +580,13 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                     }
                 }
             }
-            b"mergeCell" => seg.rep.note(Kind::Approximate, "merged cells shown unmerged"),
+            b"mergeCell" => {
+                if let Some(rect) = attr(&e, b"ref")?.as_deref().and_then(parse_ref) {
+                    if seg.merges.len() < officina_grid::merges::MAX_MERGES {
+                        seg.merges.push(rect);
+                    }
+                }
+            }
             b"conditionalFormatting" if !empty && e.name().as_ref() == b"conditionalFormatting" => {
                 let sqref = attr(&e, b"sqref")?.unwrap_or_default();
                 let end = e.name().as_ref().to_vec();
@@ -722,6 +730,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         let mut widths = Vec::new();
         let mut heights = Vec::new();
         let mut hidden: Vec<u32> = Vec::new();
+        let mut merges: Vec<(u32, u32, u32, u32)> = Vec::new();
         let mut filter = None;
         let mut sruns: Vec<Vec<(u32, u32, u32)>> = Vec::new();
         let mut col_styles: Vec<(u32, u32, u32)> = Vec::new();
@@ -760,6 +769,7 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 widths.extend(seg.widths);
                 heights.extend(seg.heights);
                 hidden.extend(seg.hidden);
+                merges.extend(seg.merges);
                 filter = seg.filter.or(filter);
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
@@ -792,6 +802,15 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
         cutter.join().map_err(|_| bad("the reader stopped"))??;
         if let Some(e) = failed {
             return Err(e);
+        }
+        if !merges.is_empty() {
+            let n = merges.len();
+            let list = merges.into_iter().map(|(r0, c0, r1, c1)| officina_grid::addr::Rect { sheet: s, r0, c0, r1, c1 }).collect();
+            wb.set_merges(s, list);
+            let kept = wb.merges(s).len();
+            if kept < n {
+                rep.note_n(Kind::Dropped, "merged cells overlapping others or of one cell", (n - kept) as u64);
+            }
         }
         let sh = wb.sheet_mut(s);
         if let Some(w) = dw {

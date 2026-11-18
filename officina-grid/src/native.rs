@@ -17,6 +17,7 @@
 //! | 14 | PIVOTS | pivot tables: source, place, fields on each axis with hidden items, value fields |
 //! | 9 | TABLES | structured tables: name, sheet, range, header/totals/stripes flags, style, column names |
 //! | 15 | TAB_COLORS | sheets' tab colours: count; per sheet, its index and 0xRRGGBB |
+//! | 16 | MERGES | one sheet's merged cells: sheet, count, each area's corners |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile
@@ -40,6 +41,7 @@ use std::sync::Arc;
 pub const WORKBOOK: u16 = 1;
 pub const STRINGS: u16 = 2;
 pub const TAB_COLORS: u16 = 15;
+pub const MERGES: u16 = 16;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -280,6 +282,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u32(c & 0xFF_FFFF);
         }
         c.add(TAB_COLORS, &w.into_bytes())?;
+    }
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        if !sh.merges.is_empty() {
+            let mut w = Writer::new();
+            w.u16(si as u16);
+            crate::merges::encode(&mut w, &sh.merges);
+            c.add(MERGES, &w.into_bytes())?;
+        }
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if sh.hidden.is_empty() && sh.filter.is_none() {
@@ -717,6 +727,18 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
             }
         }
         done(&r)?;
+    }
+
+    for i in of(MERGES) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let s = r.u16()?;
+        let list = crate::merges::decode(&mut r, s)?;
+        done(&r)?;
+        let Some(sh) = wb.sheets.get(s as usize) else { return Err(LoadError::Bad("merged cells on a sheet that does not exist")) };
+        if !sh.merges.is_empty() {
+            return Err(LoadError::Bad("a sheet's merged cells twice"));
+        }
+        wb.set_merges(s, list);
     }
 
     // Pivot tables: their output is in the cells already.

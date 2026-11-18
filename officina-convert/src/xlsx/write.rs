@@ -429,6 +429,14 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             }
         }
     }
+    let merges = wb.merges(s);
+    if !merges.is_empty() {
+        let _ = write!(o, r#"<mergeCells count="{}">"#, merges.len());
+        for m in merges {
+            let _ = write!(o, r#"<mergeCell ref="{}:{}"/>"#, a1(m.r0, m.c0), a1(m.r1, m.c1));
+        }
+        o.extend_from_slice(b"</mergeCells>");
+    }
     super::condfmt::sheet_xml(wb, s, &super::condfmt::dxfs(wb), &mut o);
     let k = wb.tables().iter().filter(|t| t.rect.sheet == s).count();
     if wb.charts().iter().any(|c| c.anchor.sheet == s) {

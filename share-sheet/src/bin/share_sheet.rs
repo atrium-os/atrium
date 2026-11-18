@@ -6,9 +6,9 @@
 //! app can neither draw over it nor read it.
 //!
 //! Environment (defaults in brackets):
-//!   FRESCO_SOCKET               [/tmp/frescod.sock]
+//!   FRESCO_SOCKET               [/atrium/sockets/fresco/fresco.sock]
 //!   LIMEN_SOCKET                [/atrium/sockets/limen/limend.sock]
-//!   SHARE_FRESCOD_ACTIVATION    [/var/run/atrium/fresco-activation.sock]
+//!   SHARE_FRESCOD_ACTIVATION    [/atrium/sockets/fresco-activation/fresco-activation.sock]
 //!   SHARE_APP_REGISTRY          [the launch registry]
 //!   SHARE_APPS                  [/var/lib/atrium/apps] installed manifests
 //!   SHARE_AUTO_PICK             [unset] tests only: choose this app id as
@@ -268,9 +268,9 @@ fn pane(embed: EmbedId, fresco: String, first: Shown, rx: Receiver<()>, tx: Send
 }
 
 fn main() {
-    let fresco = env("FRESCO_SOCKET", "/tmp/frescod.sock");
+    let fresco = env("FRESCO_SOCKET", "/atrium/sockets/fresco/fresco.sock");
     let limen_sock = env("LIMEN_SOCKET", limen::client::DEFAULT_SOCKET);
-    let act = env("SHARE_FRESCOD_ACTIVATION", "/var/run/atrium/fresco-activation.sock");
+    let act = env("SHARE_FRESCOD_ACTIVATION", "/atrium/sockets/fresco-activation/fresco-activation.sock");
     let registry = env("SHARE_APP_REGISTRY", portcullis_peer::DEFAULT_REGISTRY);
     let apps = env("SHARE_APPS", limen::manifests::APPS_DIR);
     let until = std::env::var("SHARE_SECS").ok().and_then(|s| s.parse::<u64>().ok()).map(|s| Instant::now() + Duration::from_secs(s));

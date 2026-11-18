@@ -429,6 +429,13 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::cond_formats(wb, &cfs));
     }
 
+    // Merged cells: they move, grow by what's inserted inside and shrink by
+    // what's deleted; one left a single cell is no longer merged.
+    let merges: Vec<Rect> = wb.merges(sheet).iter().filter_map(|r| s.map_rect(*r)).filter(|r| r.cells() > 1).collect();
+    if merges != wb.merges(sheet) {
+        ops.push(GridOp::Merges { sheet, list: merges });
+    }
+
     // The filter and hidden rows.
     let st = wb.filter_state(sheet);
     let mut st2 = st.clone();

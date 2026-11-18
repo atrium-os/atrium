@@ -6,7 +6,7 @@
 //! number formats from ODF data styles (turned into Excel format codes), bold, italic,
 //! underline, strike, font colour, background, borders, alignment, wrap.
 //!
-//! Reported, not carried: merged cells, comments, charts and images, conditional
+//! Reported, not carried: comments, charts and images, conditional
 //! formats, validation, named ranges, hidden rows and columns (shown), other formula
 //! namespaces (kept as values).
 
@@ -744,6 +744,8 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
     // Hidden rows of the sheet being read; an auto-filter being read (target range,
     // conditions by field) and the filters read.
     let mut hidden_rows: Vec<(u32, u32)> = Vec::new();
+    // Merged cells of the sheet being read (`table:number-*-spanned`).
+    let mut merges: Vec<officina_grid::addr::Rect> = Vec::new();
     let mut db: Option<(String, Vec<(u32, Cond)>)> = None;
     let mut filters: Vec<(String, Vec<(u32, Cond)>)> = Vec::new();
     // Named database ranges: (name, range, header row).
@@ -890,11 +892,13 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                     b"table:table-cell" | b"table:covered-table-cell" => {
                         let a = attrs(e);
                         let repeat = a.get("table:number-columns-repeated").and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).clamp(1, MAX_COLS);
-                        if name == b"table:covered-table-cell" {
-                            rep.note(Kind::Approximate, "merged cells shown unmerged");
-                        }
-                        if a.contains_key("table:number-columns-spanned") || a.contains_key("table:number-rows-spanned") {
-                            rep.note(Kind::Approximate, "merged cells shown unmerged");
+                        let spanned = |k: &str| a.get(k).and_then(|v| v.parse::<u64>().ok()).filter(|&n| n >= 1).unwrap_or(1);
+                        let (rs, cs) = (spanned("table:number-rows-spanned"), spanned("table:number-columns-spanned"));
+                        if (rs > 1 || cs > 1) && name == b"table:table-cell" && merges.len() < officina_grid::merges::MAX_MERGES {
+                            let (r1, c1) = (row + rs - 1, col + cs - 1);
+                            if r1 < MAX_ROWS as u64 && c1 < MAX_COLS as u64 {
+                                merges.push(officina_grid::addr::Rect { sheet: sheet.unwrap_or(0), r0: row as u32, c0: col as u32, r1: r1 as u32, c1: c1 as u32 });
+                            }
                         }
                         let vtype = if a.get("calcext:value-type").is_some_and(|v| v == "error") { "error".to_string() } else { a.get("office:value-type").or_else(|| a.get("calcext:value-type")).cloned().unwrap_or_default() };
                         let value = match vtype.as_str() {
@@ -1286,6 +1290,7 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         if let Some(s) = sheet.take() {
                             finish_sheet(&mut wb, s, &mut widths, &mut heights, &mut runs);
                             wb.sheet_mut(s).hidden = officina_grid::filter::merge(std::mem::take(&mut hidden_rows));
+                            wb.set_merges(s, std::mem::take(&mut merges));
                         }
                     }
                     _ => {}
