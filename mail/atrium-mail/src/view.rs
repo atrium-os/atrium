@@ -2164,6 +2164,11 @@ impl Mail {
         self.composes.borrow_mut().push((mail_engine::compose::Compose { account, draft, identity, notes: Vec::new(), original: None }, Some(id)));
     }
 
+    /// How many compose windows wait to be opened.
+    pub fn composes_waiting(&self) -> usize {
+        self.composes.borrow().len()
+    }
+
     /// Compose windows to open (the app opens a window for each).
     pub fn take_composes(&self) -> Vec<(mail_engine::compose::Compose, Option<u64>)> {
         std::mem::take(&mut *self.composes.borrow_mut())

@@ -1593,9 +1593,11 @@ Stalwart in the cloud VM, and later a real account):
    the keyboard; an archived message being read leaves the reader. Reply opens a compose
    window with the reply. A message gone since, or a verb Mail never offered, does
    nothing. Tests: engine 1 (ids within Praeco's rules and back, archive, read, reply, a
-   gone message), window 1 (archive while reading it, its Undo, read, reply). **Not
-   yet**: raising the reply window with the notification's press (Praeco doesn't hand
-   the app a press yet), and a run through praecod and Forum in the VM.
+   gone message), window 1 (archive while reading it, its Undo, read, reply). The reply
+   window is **raised** with the notification's press: once it is open and drawn, Mail
+   calls `praeco::client::raise` with the notification's id, and forum-wm brings it to
+   the front (praecod takes it once per press, within 110 s). **Not yet**: a run through
+   praecod and Forum in the VM.
 
    **The command palette built on the host (2026-11-18, §15.5, E9).** **Ctrl-K** opens a
    box over the window: "Type a command or a place", then the entries that match, each

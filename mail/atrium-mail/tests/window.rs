@@ -1150,7 +1150,9 @@ fn a_notification_s_buttons_act_in_the_window() {
 
     // Reply: a compose window to Arun.
     assert!(mail.take_composes().is_empty());
+    assert_eq!(mail.composes_waiting(), 0);
     mail.notification_action(id(1), "reply");
+    assert_eq!(mail.composes_waiting(), 1, "the app raises it once open");
     let c = mail.take_composes();
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].0.draft.subject, "Re: One");

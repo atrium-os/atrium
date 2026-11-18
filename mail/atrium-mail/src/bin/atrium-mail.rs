@@ -102,7 +102,7 @@ fn now_secs() -> i64 {
 /// A one-message post has Archive, Mark read and Reply (tabula.md §5.5);
 /// a press comes back on the receiver as (message, action), heard by a
 /// listener opened at start, so a press that started Mail isn't lost.
-fn notifications() -> (mpsc::Sender<mail_engine::notify::Post>, mpsc::Receiver<(u64, String)>) {
+fn notifications() -> (mpsc::Sender<mail_engine::notify::Post>, mpsc::Receiver<(u64, String, u64)>) {
     use mail_engine::notify::Post;
     use praeco::proto::urgency;
     let (tx, rx) = mpsc::channel::<Post>();
@@ -118,7 +118,7 @@ fn notifications() -> (mpsc::Sender<mail_engine::notify::Post>, mpsc::Receiver<(
                         match l.next(Duration::from_secs(60)) {
                             Ok(Some(a)) => {
                                 if let Some((msg, verb)) = mail_engine::notify::action_of(&a.action) {
-                                    if acted_tx.send((msg, verb.to_string())).is_err() {
+                                    if acted_tx.send((msg, verb.to_string(), a.id)).is_err() {
                                         return;
                                     }
                                 }
@@ -448,6 +448,8 @@ fn main() {
     }
     let mut notifier = mail_engine::notify::Notifier::new();
     let (notes, pressed) = notifications();
+    // Replies from a notification's press, raised once their window is up.
+    let mut raise: Vec<u64> = Vec::new();
     let mut ticked = Instant::now();
     loop {
         // Mail hears j/k and the arrows before the list does, so a move of
@@ -476,8 +478,21 @@ fn main() {
         while let Ok(url) = incoming.try_recv() {
             mail.mailto(&url);
         }
-        while let Ok((msg, action)) = pressed.try_recv() {
+        // Opened and drawn last time round: forum-wm brings it to the front
+        // with the notification's press (tabula.md §5.5).
+        for id in raise.drain(..) {
+            std::thread::spawn(move || {
+                if let Err(e) = praeco::client::raise(&praeco::client::socket(), id) {
+                    eprintln!("atrium-mail: raising a reply: {e}");
+                }
+            });
+        }
+        while let Ok((msg, action, id)) = pressed.try_recv() {
+            let before = mail.composes_waiting();
             mail.notification_action(msg, &action);
+            if mail.composes_waiting() > before {
+                raise.push(id);
+            }
         }
         let asked = mail.take_composes();
         let opened = !asked.is_empty();
