@@ -41,6 +41,9 @@ pub enum Op {
     EndText,
     Font(String, f64),
     Rise(f64),
+    /// Text rendering mode (`Tr`): 0 fill, 3 invisible (text kept for
+    /// copying and search, drawn some other way).
+    TextRender(u8),
     TextMatrix([f64; 6]),
     ShowText(Vec<u8>),
     ShowArray(Vec<TjPart>),
@@ -137,6 +140,9 @@ impl Op {
                 nums(out, &[*r]);
                 out.extend(b"Ts");
             }
+            Op::TextRender(m) => {
+                out.extend(format!("{m} Tr").bytes());
+            }
             Op::TextMatrix(m) => {
                 nums(out, m);
                 out.extend(b"Tm");
@@ -181,6 +187,7 @@ mod tests {
             Op::Fill,
             Op::BeginText,
             Op::Font("F1".into(), 12.0),
+            Op::TextRender(3),
             Op::TextMatrix([1.0, 0.0, 0.0, 1.0, 72.0, 700.0]),
             Op::ShowArray(vec![TjPart::Codes(vec![0, 3, 0, 4]), TjPart::Adjust(-12.5), TjPart::Codes(vec![0, 5])]),
             Op::EndText,
@@ -191,7 +198,7 @@ mod tests {
         ]);
         assert_eq!(
             String::from_utf8(s).unwrap(),
-            "1 0.5 0 rg\n10 20 30.5 40 re\nf\nBT\n/F1 12 Tf\n1 0 0 1 72 700 Tm\n[<00030004>-12.5<0005>]TJ\nET\nq\n100 0 0 50 10 10 cm\n/Im#201 Do\nQ\n"
+            "1 0.5 0 rg\n10 20 30.5 40 re\nf\nBT\n/F1 12 Tf\n3 Tr\n1 0 0 1 72 700 Tm\n[<00030004>-12.5<0005>]TJ\nET\nq\n100 0 0 50 10 10 cm\n/Im#201 Do\nQ\n"
         );
     }
 }

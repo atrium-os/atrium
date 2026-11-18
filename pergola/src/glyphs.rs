@@ -9,6 +9,9 @@
 //!   rastered at its device size on first sight (whole device pixels, no
 //!   sub-pixel variants yet). New glyphs reach frescod as one region update
 //!   just before the run that needs them.
+//! - Colour glyphs (a COLR face: Noto Color Emoji) go to the atlas's RGBA
+//!   twin, [`fresco_protocol::COLOR_ATLAS_W`] square, drawn by `atrium-colr`;
+//!   their entries say `color`, and the run marks them `GLYPH_COLOR`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -22,6 +25,8 @@ struct FaceData {
     id: u32,
     bytes: Bytes,
     index: u32,
+    /// Has colour glyphs (COLR), found on first use.
+    color: std::sync::OnceLock<bool>,
 }
 
 /// A face's bytes: owned, or mapped for the process's life (the system font
@@ -37,12 +42,12 @@ impl Face {
     /// Register a face. Call once per font and keep the handle: each call
     /// mints a new id (and so new atlas entries).
     pub fn new(bytes: impl Into<Arc<[u8]>>, index: u32) -> Self {
-        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Owned(bytes.into()), index }))
+        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Owned(bytes.into()), index, color: Default::default() }))
     }
     /// Register a face whose bytes live as long as the process, without
     /// copying them.
     pub fn from_static(bytes: &'static [u8], index: u32) -> Self {
-        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Static(bytes), index }))
+        Face(Arc::new(FaceData { id: NEXT_FACE.fetch_add(1, Ordering::Relaxed), bytes: Bytes::Static(bytes), index, color: Default::default() }))
     }
     pub fn id(&self) -> u32 { self.0.id }
     pub fn bytes(&self) -> &[u8] {
@@ -52,6 +57,10 @@ impl Face {
         }
     }
     pub fn index(&self) -> u32 { self.0.index }
+    /// Whether the face draws colour glyphs (a COLR table).
+    pub fn is_color(&self) -> bool {
+        *self.0.color.get_or_init(|| self.0.index == 0 && atrium_colr::is_color_font(self.bytes()))
+    }
 }
 
 impl PartialEq for Face {
@@ -85,14 +94,47 @@ pub struct Entry {
     pub left: f32,
     /// Above the baseline, device px.
     pub top: f32,
+    /// On the colour atlas (RGBA), not the coverage one.
+    pub color: bool,
+}
+
+pub const COLOR_W: u32 = fresco_protocol::COLOR_ATLAS_W;
+pub const COLOR_H: u32 = fresco_protocol::COLOR_ATLAS_H;
+
+/// Shelf packing: where the next `w`×`h` goes in a `aw`×`ah` page.
+#[derive(Default)]
+struct Shelf {
+    x: u32,
+    y: u32,
+    row: u32,
+}
+
+impl Shelf {
+    fn place(&mut self, w: u32, h: u32, aw: u32, ah: u32) -> Option<(u32, u32)> {
+        if self.x + w > aw {
+            self.x = 0;
+            self.y += self.row + 1;
+            self.row = 0;
+        }
+        if w > aw || self.y + h > ah {
+            return None;
+        }
+        let at = (self.x, self.y);
+        self.x += w + 1;
+        self.row = self.row.max(h);
+        Some(at)
+    }
 }
 
 /// The glyph atlas of one window.
 pub struct Atlas {
     data: Vec<u8>,
-    x: u32,
-    y: u32,
-    row: u32,
+    shelf: Shelf,
+    /// The colour twin (RGBA, straight alpha, sRGB), made on the first
+    /// colour glyph; its changed rows.
+    color: Option<Vec<u8>>,
+    color_shelf: Shelf,
+    color_dirty: Option<(u32, u32)>,
     /// (face, size in 1/64 device px, glyph) → entry; `None`: blank or
     /// didn't fit.
     slots: HashMap<(u32, u32, u16), Option<Entry>>,
@@ -111,7 +153,10 @@ impl Atlas {
     pub fn new() -> Self {
         Atlas {
             data: vec![0; (ATLAS_W * ATLAS_H) as usize],
-            x: 0, y: 0, row: 0,
+            shelf: Shelf::default(),
+            color: None,
+            color_shelf: Shelf::default(),
+            color_dirty: None,
             slots: HashMap::new(),
             dirty: None,
             dropped: 0,
@@ -131,8 +176,40 @@ impl Atlas {
         e
     }
 
+    fn full(&mut self) -> Option<Entry> {
+        self.dropped += 1;
+        if self.dropped == 1 {
+            log::warn!("glyph atlas full: glyphs are being dropped");
+        }
+        None
+    }
+
+    /// A colour glyph into the RGBA twin; `None` when the face has no
+    /// colour version of `gid` (it is then drawn as coverage).
+    fn raster_color(&mut self, face: &Face, size: f32, gid: u16) -> Option<Option<Entry>> {
+        // Black for palette entries that mean "the text's colour": a
+        // document's emoji carry their own colours.
+        let bm = atrium_colr::render(face.bytes(), gid as u32, size, [0.0, 0.0, 0.0, 1.0])?;
+        let (gw, gh) = (bm.width, bm.height);
+        let Some((x, y)) = self.color_shelf.place(gw, gh, COLOR_W, COLOR_H) else { return Some(self.full()) };
+        let data = self.color.get_or_insert_with(|| vec![0; (COLOR_W * COLOR_H * 4) as usize]);
+        for yy in 0..gh {
+            let dst = (((y + yy) * COLOR_W + x) * 4) as usize;
+            let src = (yy * gw * 4) as usize;
+            data[dst..dst + (gw * 4) as usize].copy_from_slice(&bm.rgba[src..src + (gw * 4) as usize]);
+        }
+        let (a, b) = self.color_dirty.unwrap_or((y, y + gh));
+        self.color_dirty = Some((a.min(y), b.max(y + gh)));
+        Some(Some(Entry { u: x, v: y, w: gw, h: gh, left: bm.left as f32, top: bm.top as f32, color: true }))
+    }
+
     fn raster(&mut self, face: &Face, size: f32, gid: u16) -> Option<Entry> {
         use swash::scale::{Render, Source};
+        if face.is_color() {
+            if let Some(e) = self.raster_color(face, size, gid) {
+                return e;
+            }
+        }
         let font = swash::FontRef::from_index(face.bytes(), face.index() as usize)?;
         let mut s = self.scaler.builder(font).size(size).hint(false).build();
         let img = Render::new(&[Source::Outline]).format(swash::zeno::Format::Alpha).render(&mut s, gid)?;
@@ -140,28 +217,15 @@ impl Atlas {
         if gw == 0 || gh == 0 {
             return None;
         }
-        if self.x + gw > ATLAS_W {
-            self.x = 0;
-            self.y += self.row + 1;
-            self.row = 0;
-        }
-        if gw > ATLAS_W || self.y + gh > ATLAS_H {
-            self.dropped += 1;
-            if self.dropped == 1 {
-                log::warn!("glyph atlas full: glyphs are being dropped");
-            }
-            return None;
-        }
+        let Some((x, y)) = self.shelf.place(gw, gh, ATLAS_W, ATLAS_H) else { return self.full() };
         for yy in 0..gh {
-            let dst = ((self.y + yy) * ATLAS_W + self.x) as usize;
+            let dst = ((y + yy) * ATLAS_W + x) as usize;
             let src = (yy * gw) as usize;
             self.data[dst..dst + gw as usize].copy_from_slice(&img.data[src..src + gw as usize]);
         }
-        let e = Entry { u: self.x, v: self.y, w: gw, h: gh, left: img.placement.left as f32, top: img.placement.top as f32 };
-        let (a, b) = self.dirty.unwrap_or((self.y, self.y + gh));
-        self.dirty = Some((a.min(self.y), b.max(self.y + gh)));
-        self.x += gw + 1;
-        self.row = self.row.max(gh);
+        let e = Entry { u: x, v: y, w: gw, h: gh, left: img.placement.left as f32, top: img.placement.top as f32, color: false };
+        let (a, b) = self.dirty.unwrap_or((y, y + gh));
+        self.dirty = Some((a.min(y), b.max(y + gh)));
         Some(e)
     }
 
@@ -173,6 +237,17 @@ impl Atlas {
 
     /// The whole atlas (its first upload).
     pub fn pixels(&self) -> &[u8] { &self.data }
+
+    /// The colour twin's rows changed since the last call, and their
+    /// pixels (full width, RGBA).
+    pub fn take_color_dirty(&mut self) -> Option<(u32, u32, &[u8])> {
+        let (a, b) = self.color_dirty.take()?;
+        let d = self.color.as_deref()?;
+        Some((a, b - a, &d[(a * COLOR_W * 4) as usize..(b * COLOR_W * 4) as usize]))
+    }
+
+    /// The whole colour twin, once a colour glyph made it.
+    pub fn color_pixels(&self) -> Option<&[u8]> { self.color.as_deref() }
 }
 
 #[cfg(test)]
@@ -202,5 +277,23 @@ mod tests {
         assert_eq!(a.glyph(&f, 16.0, space), None, "blank glyphs take no room");
         let big = a.glyph(&f, 32.0, gid).unwrap();
         assert!(big.h > e.h && big.u > e.u, "another size is another entry");
+        assert!(!e.color && a.color_pixels().is_none());
+    }
+
+    /// An emoji of Noto Color Emoji lands on the RGBA twin, in colour.
+    #[test]
+    fn colour_glyphs_go_to_the_colour_atlas() {
+        static EMOJI: &[u8] = include_bytes!("../../fonts/noto/NotoColorEmoji-Regular.ttf");
+        let f = Face::from_static(EMOJI, 0);
+        assert!(f.is_color() && !plex().is_color());
+        let mut a = Atlas::new();
+        let gid = swash::FontRef::from_index(f.bytes(), 0).unwrap().charmap().map('😀');
+        let e = a.glyph(&f, 32.0, gid).expect("drawn");
+        assert!(e.color && e.w > 30 && e.h > 30, "{e:?}");
+        assert!(a.take_dirty().is_none(), "nothing on the coverage atlas");
+        let (y, rows, px) = a.take_color_dirty().unwrap();
+        assert_eq!((y, rows, px.len()), (0, e.h, (e.h * COLOR_W * 4) as usize));
+        assert!(px.chunks(4).any(|p| p[3] > 200 && p[0] > 200 && p[2] < 120), "yellow");
+        assert_eq!(a.glyph(&f, 32.0, gid), Some(e), "cached");
     }
 }
