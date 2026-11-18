@@ -43,7 +43,7 @@ mod imp {
     use aura_ipc::{fmt_mac, Got, Line, Reader};
     use net_proto::{check_dns6, check_lease6, check_v4, in_net, ordinary_unicast, HostView, LeaseV4};
     use std::io;
-    use atrium_netconf::{check_dns, lines as nlines, Manual};
+    use atrium_netconf::{check_dns, lines as nlines, tls_name_ok, Manual};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -71,8 +71,24 @@ mod imp {
     }
 
     /// The settings file: `wired iface=NAME maddr=..` and `dns servers=..`.
-    fn parse_settings(text: &str) -> (Vec<(String, Manual)>, Vec<IpAddr>) {
-        let (mut wired, mut dns) = (Vec::new(), Vec::new());
+    /// Own DNS servers, and the name their TLS certificate must show if
+    /// they are asked over TLS.
+    type OwnDns = (Vec<IpAddr>, Option<String>);
+
+    /// The `dns` line of the ctl socket and the settings file:
+    /// `servers=A,B [tls=NAME]`; no servers: each network's own.
+    fn parse_own_dns(l: &Line) -> Option<OwnDns> {
+        let v: Vec<IpAddr> = l.get("servers").map(|s| s.split(',').map(|x| x.parse().ok()).collect()).unwrap_or(Some(Vec::new()))?;
+        check_dns(&v).ok()?;
+        let tls = l.get("tls").map(str::to_string);
+        if tls.as_ref().is_some_and(|n| v.is_empty() || !tls_name_ok(n)) {
+            return None;
+        }
+        Some((v, tls))
+    }
+
+    fn parse_settings(text: &str) -> (Vec<(String, Manual)>, OwnDns) {
+        let (mut wired, mut dns) = (Vec::new(), (Vec::new(), None));
         for l in text.lines().take(64).filter_map(Line::parse) {
             match l.verb.as_str() {
                 "wired" => {
@@ -82,9 +98,8 @@ mod imp {
                     }
                 }
                 "dns" => {
-                    let v: Option<Vec<IpAddr>> = l.get("servers").map(|s| s.split(',').map(|x| x.parse().ok()).collect()).unwrap_or(Some(Vec::new()));
-                    if let Some(v) = v.filter(|v| check_dns(v).is_ok()) {
-                        dns = v;
+                    if let Some(d) = parse_own_dns(&l) {
+                        dns = d;
                     }
                 }
                 _ => {}
@@ -110,6 +125,11 @@ mod imp {
             .unwrap_or_default()
     }
     const PROBE_CONFIRM_MS: u64 = 5_000;
+
+    /// `uptime: N seconds` of `unbound-control status`.
+    fn unbound_uptime(s: &str) -> Option<u64> {
+        s.lines().find_map(|l| l.strip_prefix("uptime: "))?.split_whitespace().next()?.parse().ok()
+    }
 
     /// A ctl reply line with descriptors attached to its first byte.
     fn send_line_fds(s: &UnixStream, l: &Line, fds: &[std::os::fd::OwnedFd]) -> io::Result<()> {
@@ -321,6 +341,12 @@ mod imp {
         /// servers (used instead of every network's when set).
         wired_manual: Vec<(String, Manual)>,
         own_dns: Vec<IpAddr>,
+        /// Ask `own_dns` only over TLS, checked against this name.
+        dns_tls: Option<String>,
+        /// unbound's uptime when last checked: less means it restarted
+        /// (and lost what it was told, which list_forwards can't show for
+        /// TLS).
+        unbound_up: u64,
         egress: Egress,
         /// The default route we installed (interface, router), and the
         /// interface last announced as the egress.
@@ -445,7 +471,17 @@ mod imp {
         /// after '%'). Kept as is when nothing is known (an empty list would
         /// leave unbound resolving from the roots).
         fn forward(&mut self) {
-            let mut list: Vec<String> = self.own_dns.iter().map(|a| a.to_string()).collect();
+            // Own servers over TLS: port 853 and the name unbound checks the
+            // certificate against.
+            let tls = self.dns_tls.clone().filter(|_| !self.own_dns.is_empty());
+            let mut list: Vec<String> = self
+                .own_dns
+                .iter()
+                .map(|a| match &tls {
+                    Some(n) => format!("{a}@853#{n}"),
+                    None => a.to_string(),
+                })
+                .collect();
             let own = !list.is_empty();
             for i in self.ifs.iter().filter(|_| !own) {
                 if let Some(l) = &i.applied.lease {
@@ -468,9 +504,12 @@ mod imp {
                 self.forwarders = list;
                 return;
             };
-            match u.cmd(&format!("forward {}", list.join(" "))) {
+            // forward_add replaces the root's forwarders as `forward` does;
+            // +t: only over TLS, never plain DNS instead.
+            let c = if tls.is_some() { format!("forward_add +t . {}", list.join(" ")) } else { format!("forward {}", list.join(" ")) };
+            match u.cmd(&c) {
                 Ok(s) if s.trim_end() == "ok" => {
-                    self.log(&format!("unbound: forward {}", list.join(" ")));
+                    self.log(&format!("unbound: {c}"));
                     self.forwarders = list;
                 }
                 Ok(s) => eprintln!("atrium-net: unbound said {:?}", s.trim_end()),
@@ -492,12 +531,15 @@ mod imp {
                 Ok(s) => root_forwards(&s),
                 Err(_) => return, // down: try again next time
             };
-            let mut want: Vec<String> = self.forwarders.iter().map(|x| x.split('%').next().unwrap_or(x).to_string()).collect();
+            let up = u.cmd("status").ok().and_then(|s| unbound_uptime(&s));
+            let restarted = up.is_some_and(|t| t < self.unbound_up);
+            self.unbound_up = up.unwrap_or(0);
+            let mut want: Vec<String> = self.forwarders.iter().map(|x| x.split(['%', '@']).next().unwrap_or(x).to_string()).collect();
             let mut have = have;
             want.sort();
             have.sort();
-            if want != have {
-                self.log(&format!("unbound forwards {:?}, not ours: setting them again", have));
+            if want != have || restarted {
+                self.log(&format!("unbound forwards {:?}{}, not ours: setting them again", have, if restarted { " (restarted)" } else { "" }));
                 self.forwarders.clear();
                 self.forward();
             }
@@ -1014,7 +1056,8 @@ mod imp {
                 out.push_str(&String::from_utf8_lossy(&nlines::with_manual(Line::new("wired").with("iface", n), m).encode().unwrap_or_default()));
             }
             if !self.own_dns.is_empty() {
-                out.push_str(&format!("dns servers={}\n", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
+                let tls = self.dns_tls.as_ref().map(|n| format!(" tls={n}")).unwrap_or_default();
+                out.push_str(&format!("dns servers={}{tls}\n", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
             }
             if let Err(e) = self.state.write(SETTINGS_FILE, out.as_bytes()) {
                 eprintln!("atrium-net: saving settings: {e}");
@@ -1307,10 +1350,21 @@ mod imp {
                     ok()
                 }
                 "dns" => {
-                    let v: Option<Vec<IpAddr>> = l.get("servers").map(|s| s.split(',').map(|x| x.parse().ok()).collect()).unwrap_or(Some(Vec::new()));
-                    let Some(v) = v.filter(|v| check_dns(v).is_ok()) else { return err("bad-dns") };
-                    self.log(&format!("own DNS servers: {v:?}"));
+                    let Some((v, tls)) = parse_own_dns(l) else { return err("bad-dns") };
+                    // Without certificates to check with, unbound would take
+                    // any: refuse rather than pretend.
+                    if tls.is_some() {
+                        if let Some(u) = &self.unbound {
+                            let b = u.cmd("get_option tls-cert-bundle").unwrap_or_default();
+                            let b = b.trim();
+                            if b.is_empty() || b.starts_with("error") {
+                                return err("no-tls-bundle");
+                            }
+                        }
+                    }
+                    self.log(&format!("own DNS servers: {v:?}{}", tls.as_ref().map(|n| format!(" over TLS as {n}")).unwrap_or_default()));
                     self.own_dns = v;
+                    self.dns_tls = tls;
                     self.save_settings();
                     // Back to the networks' own: forward() keeps the list
                     // when it is unchanged, so clear what it compares with.
@@ -1392,7 +1446,11 @@ mod imp {
                 v.push(l);
             }
             if !self.own_dns.is_empty() {
-                v.push(Line::new("dns").with("own", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")));
+                let mut l = Line::new("dns").with("own", self.own_dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+                if let Some(n) = &self.dns_tls {
+                    l = l.with("tls", n);
+                }
+                v.push(l);
             }
             if let Some(w) = &self.wifi {
                 let mut l = Line::new("wifi").with("state", w.state()).with("mlme", self.mlme.is_some() as u8).with("profiles", w.saved.profiles.len());
@@ -1665,7 +1723,7 @@ mod imp {
         let all = sys::interfaces().unwrap_or_else(|e| die(&e.to_string()));
         let _ = std::fs::create_dir_all(&o.state);
         let state = Dir::open(&o.state).unwrap_or_else(|e| die(&format!("{}: {e}", o.state)));
-        let (wired_manual, own_dns) = parse_settings(&state.read(SETTINGS_FILE, 1 << 16).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
+        let (wired_manual, (own_dns, dns_tls)) = parse_settings(&state.read(SETTINGS_FILE, 1 << 16).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
         let wifi = o.wifi.as_ref().map(|_| {
             let text = state.read(STATE_FILE, 1 << 20).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
             Wifi::new(Saved::parse(&text))
@@ -1691,6 +1749,8 @@ mod imp {
             forwarders: Vec::new(),
             wired_manual,
             own_dns,
+            dns_tls,
+            unbound_up: 0,
             egress: Egress::new(o.ifaces.len()),
             def4: None,
             announced: None,

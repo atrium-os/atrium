@@ -13,7 +13,7 @@
 //! | `network-details` | those, `INTERFACES`, `ROUTES` |
 //! | `network-wifi` | those of `network-read` with the network's name, `WIFI_PROFILES`, `WIFI_JOIN`, `WIFI_LEAVE`, `WIFI_FORGET`, `WIFI_SET_PROFILE` |
 //! | `wifi-nearby` | those of `network-read`, `WIFI_NEARBY` (SSID, security, signal bars; never BSSIDs). Nearby networks tell where you are, so it is its own capability with its own consent line |
-//! | `network-configure` | those of `network-read`, `SET_COUNTRY`, `SET_STATIC`, `SET_DNS`. Restricted to the settings app |
+//! | `network-configure` | those of `network-read`, `SET_COUNTRY`, `SET_STATIC`, `SET_DNS`, `SET_DNS_TLS`. Restricted to the settings app |
 //! | `print-discovery` | `PRINT_DISCOVERY`: printer discovery's two mDNS sockets on the active interface (printing.md §7.1). Root only (prelumd), never granted to an app |
 //!
 //! Every reply (`IS_RESPONSE`) is `u8 status`, then on `OK` the postcard
@@ -40,6 +40,11 @@ pub mod op {
     pub const SET_COUNTRY: u16 = 0x40;
     pub const SET_STATIC: u16 = 0x41;
     pub const SET_DNS: u16 = 0x42;
+    /// [`DnsTls`]: the machine's own DNS servers, asked only over TLS
+    /// (port 853) and only if their certificate is valid for `name`.
+    /// `SET_DNS` turns it off. `FAILED` "no-tls-bundle" when unbound has
+    /// no certificates to check with.
+    pub const SET_DNS_TLS: u16 = 0x43;
     /// Reply `Ok(interface name)` with two fds, in this order: receive
     /// (bound 0.0.0.0:5353, joined to 224.0.0.251 on that interface,
     /// sending side shut) and send (bound 5353, multicast out of that
@@ -99,7 +104,7 @@ impl Grant {
             INTERFACES | ROUTES => self == Grant::Details,
             WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE => self == Grant::Wifi,
             WIFI_NEARBY => self == Grant::Nearby,
-            SET_COUNTRY | SET_STATIC | SET_DNS => self == Grant::Configure,
+            SET_COUNTRY | SET_STATIC | SET_DNS | SET_DNS_TLS => self == Grant::Configure,
             PRINT_DISCOVERY => self == Grant::PrintDiscovery,
             _ => false,
         }
@@ -186,6 +191,41 @@ pub struct Routes {
     /// The DNS servers set for the whole machine (`SET_DNS`); empty: each
     /// network's own.
     pub own_dns: Vec<String>,
+    /// Set by `SET_DNS_TLS`: `own_dns` are asked only over TLS, checked
+    /// against this name.
+    pub dns_tls: Option<String>,
+}
+
+/// `SET_DNS_TLS`: DNS over TLS (RFC 7858) to these servers, which must
+/// show a certificate for `name` (strict: never plain DNS instead).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsTls {
+    pub servers: Vec<IpAddr>,
+    pub name: String,
+}
+
+impl DnsTls {
+    pub fn check(&self) -> Res<()> {
+        check_dns(&self.servers)?;
+        if self.servers.is_empty() {
+            return Err(Fail::new(status::MALFORMED, "at least one DNS server"));
+        }
+        if !tls_name_ok(&self.name) {
+            return Err(Fail::new(status::MALFORMED, "the servers' name: a host name like dns.example.net"));
+        }
+        Ok(())
+    }
+}
+
+/// A host name a DNS-over-TLS certificate can be checked against: two or
+/// more labels of letters, digits and '-', at most 253 bytes, not all digits
+/// at the end (that is an address).
+pub fn tls_name_ok(n: &str) -> bool {
+    let labels: Vec<&str> = n.split('.').collect();
+    n.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| (1..=63).contains(&l.len()) && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        && !labels.last().unwrap().bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A fixed IPv4 setting, used instead of DHCP.
@@ -376,6 +416,9 @@ pub mod server {
         fn set_country(&self, cc: String) -> Res<()>;
         fn set_static(&self, s: SetStatic) -> Res<()>;
         fn set_dns(&self, servers: Vec<IpAddr>) -> Res<()>;
+        fn set_dns_tls(&self, _t: DnsTls) -> Res<()> {
+            Err(Fail::new(status::UNSUPPORTED, "no DNS over TLS here"))
+        }
         /// The active interface's name and the two mDNS sockets (receive, send).
         fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
             Err(Fail::new(status::UNSUPPORTED, "no printer discovery here"))
@@ -490,6 +533,10 @@ pub mod server {
                     check_dns(&v)?;
                     b.set_dns(v)
                 })),
+                op::SET_DNS_TLS => enc(&arg::<DnsTls>(p).and_then(|t| {
+                    t.check()?;
+                    b.set_dns_tls(t)
+                })),
                 _ => enc::<()>(&Err(Fail::new(status::MALFORMED, "unknown op"))),
             };
             conn.send_message(CLASS, o, flag::IS_RESPONSE, &reply)?;
@@ -589,6 +636,9 @@ pub mod client {
         }
         pub fn set_dns(&mut self, servers: &[IpAddr]) -> Res<()> {
             self.call(op::SET_DNS, &servers.to_vec())
+        }
+        pub fn set_dns_tls(&mut self, t: &DnsTls) -> Res<()> {
+            self.call(op::SET_DNS_TLS, t)
         }
 
         /// Subscribe: the connection then carries only status events.

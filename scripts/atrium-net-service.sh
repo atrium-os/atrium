@@ -44,6 +44,13 @@ install -d -m 0700 /var/db/atrium-net
 if [ ! -f /var/unbound/unbound.conf ] || ! grep -q '^nameserver 127.0.0.1' /etc/resolv.conf; then
     local-unbound-setup >/dev/null
 fi
+# DNS over TLS (§6): unbound checks certificates against a copy of the
+# system's bundle inside its chroot.
+if [ -f "$D/unbound-atrium-tls.conf" ] && [ -s /etc/ssl/cert.pem ]; then
+    install -d /var/unbound/conf.d
+    install -m 0644 /etc/ssl/cert.pem /var/unbound/atrium-ca.pem
+    install -m 0644 "$D/unbound-atrium-tls.conf" /var/unbound/conf.d/atrium-tls.conf
+fi
 if [ -f "$D/unbound-atrium-local.conf" ]; then
     install -d /var/unbound/conf.d
     install -m 0644 "$D/unbound-atrium-local.conf" /var/unbound/conf.d/atrium-local.conf

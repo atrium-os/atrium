@@ -138,6 +138,10 @@ impl Backend for Fake {
         self.log.lock().unwrap().push(format!("dns {v:?}"));
         Ok(())
     }
+    fn set_dns_tls(&self, t: DnsTls) -> Res<()> {
+        self.log.lock().unwrap().push(format!("dns-tls {:?} {}", t.servers, t.name));
+        Ok(())
+    }
     fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
         // Stand-ins for the two sockets: each end of a pair says which it is.
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -225,6 +229,21 @@ fn over_sockets() {
     conf.set_dns(&["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()]).unwrap();
     conf.set_dns(&[]).unwrap();
     assert_eq!(conf.set_dns(&["127.0.0.1".parse().unwrap()]).unwrap_err().0, status::MALFORMED);
+    let q9 = || vec!["9.9.9.9".parse().unwrap()];
+    conf.set_dns_tls(&DnsTls { servers: q9(), name: "dns.quad9.net".into() }).unwrap();
+    for (servers, name) in [
+        (vec![], "dns.quad9.net"),
+        (q9(), ""),
+        (q9(), "quad9"),
+        (q9(), "dns quad9.net"),
+        (q9(), "9.9.9.9"),
+        (q9(), "-x.example.net"),
+        (q9(), "x..net"),
+        (vec!["127.0.0.1".parse().unwrap()], "dns.quad9.net"),
+    ] {
+        assert_eq!(conf.set_dns_tls(&DnsTls { servers, name: name.into() }).unwrap_err().0, status::MALFORMED, "{name}");
+    }
+    assert!(!tls_name_ok(&format!("{}.net", "a.".repeat(130))));
     assert_eq!(
         *fake.log.lock().unwrap(),
         vec![
@@ -234,13 +253,15 @@ fn over_sockets() {
             "static Wifi([104, 111, 109, 101]) Some(10.0.0.5)",
             "static Wired(\"vtnet1\") None",
             "dns [9.9.9.9, 2620:fe::fe]",
-            "dns []"
+            "dns []",
+            "dns-tls [9.9.9.9] dns.quad9.net"
         ]
     );
     // Fixed settings and own DNS servers read back from atrium-net's lines.
     let l = lines::with_manual(Line::new("net").with_hex("ssid", b"home"), &m);
     assert_eq!(lines::profile(&l).unwrap().manual, Some(m.clone()));
     assert_eq!(lines::routes(&[parse("dns own=9.9.9.9,1.1.1.1")]).own_dns, vec!["9.9.9.9".to_string(), "1.1.1.1".into()]);
+    assert_eq!(lines::routes(&[parse("dns own=9.9.9.9 tls=dns.quad9.net")]).dns_tls.as_deref(), Some("dns.quad9.net"));
 
     // Subscribe: now, then only changes, names filtered by grant.
     let mut ch = c(Grant::Read).subscribe().unwrap();

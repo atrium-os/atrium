@@ -89,7 +89,7 @@ setup() {
     # sandboxed atrium-lease); atrium-netctl is the command line.
     (cd "$ROOT/atrium-net" && RUSTFLAGS="$X" cargo build --release -p atrium-net -p atrium-lease -p atrium-netconf -p atrium-mdns --target "$T" >&2)
     N="$ROOT/atrium-net/target/$T/release"
-    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$N/atrium-netconf" "$N/atrium-mdns" "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$B/"
+    cp "$N/atrium-net" "$N/atrium-lease" "$N/atrium-probe" "$N/atrium-netctl" "$N/atrium-netconf" "$N/atrium-mdns" "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$ROOT/atrium-net/etc/unbound-atrium-tls.conf" "$B/"
     tar czf - -C "$(dirname "$B")" aura | "$V" 'rm -rf /tmp/aura && tar xzf - -C /tmp'
     rm -rf "$(dirname "$B")"
 

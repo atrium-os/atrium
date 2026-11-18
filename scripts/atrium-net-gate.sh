@@ -64,7 +64,7 @@ n0)
     CROSS_RUSTFLAGS=$(set -- env; . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
     (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease -p atrium-netconf -p atrium-mdns >&2)
     R="$ROOT/atrium-net/target/$T/release"
-    { cp "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$R/"; tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl atrium-mdns unbound-atrium-local.conf; } | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
+    { cp "$ROOT/atrium-net/etc/unbound-atrium-local.conf" "$ROOT/atrium-net/etc/unbound-atrium-tls.conf" "$R/"; tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl atrium-mdns unbound-atrium-local.conf unbound-atrium-tls.conf; } | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
 
     pkill -f atrium-net/sim/lan.py 2>/dev/null || true
     python3 "$ROOT/atrium-net/sim/lan.py" "$LEASE_S" > "$LAN_LOG" 2>&1 &
@@ -283,6 +283,59 @@ n0)
     ok "atrium-mdns killed: started again (${i} s), atrium-net running"
     u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
     capmode "$("$V" 'pgrep -x atrium-netconf')" && [ "$u" = _atrium-netconf ] && ok "atrium-netconf still $u in capability mode" || fail "netconf: $u"
+
+    # DNS over TLS (§6): a second unbound on 192.0.2.53:853 (lo1) with a
+    # test CA plays the machine's own server. It alone knows
+    # dot-only.atrium.test and says gate.atrium.test = 10.99.0.77 (the LAN
+    # says 10.88.0.77), so an answer shows which server gave it.
+    ctl() { "$V" "printf '%s\n' '$1' | nc -U -w 5 /tmp/atrium-net/ctl.sock"; }
+    look4() { "$V" "drill $1 A @127.0.0.1" 2>&1 || true; }
+    flush() { "$V" 'local-unbound-control flush_zone atrium.test >/dev/null; local-unbound-control flush_bogus >/dev/null; local-unbound-control flush_negative >/dev/null; local-unbound-control flush_requestlist >/dev/null'; }
+    "$V" 'set -e; D=/tmp/atrium-net/dot; rm -rf $D; mkdir -p $D; cd $D
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 2 -subj /CN=atrium-test-ca >/dev/null 2>&1
+        openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj /CN=dot.atrium.test >/dev/null 2>&1
+        printf "subjectAltName=DNS:dot.atrium.test\n" > ext
+        openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.pem -days 2 -extfile ext >/dev/null 2>&1
+        cat srv.pem ca.pem > chain.pem
+        ifconfig lo1 >/dev/null 2>&1 || ifconfig lo1 create
+        ifconfig lo1 inet 192.0.2.53/32 alias
+        printf "server:\n username: \"\"\n chroot: \"\"\n directory: \"%s\"\n pidfile: \"%s/pid\"\n use-syslog: no\n logfile: \"%s/log\"\n interface: 192.0.2.53@853\n tls-port: 853\n tls-service-key: \"%s/srv.key\"\n tls-service-pem: \"%s/chain.pem\"\n access-control: 0.0.0.0/0 allow\n do-ip6: no\n module-config: \"iterator\"\n local-zone: \".\" static\n local-data: \"dot-only.atrium.test. 60 IN A 10.99.0.1\"\n local-data: \"gate.atrium.test. 60 IN A 10.99.0.77\"\nremote-control:\n control-enable: no\n" $D $D $D $D $D > unbound.conf
+        rm -f /var/unbound/conf.d/atrium-tls.conf /var/unbound/atrium-ca.pem
+        service local_unbound restart >/dev/null 2>&1
+        /usr/sbin/local-unbound -c $D/unbound.conf'
+    r=$(ctl 'dns servers=192.0.2.53 tls=dot.atrium.test')
+    echo "$r" | grep -q 'error.*no-tls-bundle' && ok "DNS over TLS refused while unbound has no certificates to check with" || fail "no bundle: $r"
+    "$V" 'cat /etc/ssl/cert.pem /tmp/atrium-net/dot/ca.pem > /var/unbound/atrium-ca.pem; cp /tmp/atrium-net/unbound-atrium-tls.conf /var/unbound/conf.d/atrium-tls.conf; service local_unbound restart >/dev/null 2>&1'
+    i=0; until look4 gate.atrium.test | grep -q 10.88.0.77; do i=$((i + 1)); [ $i -lt 30 ] || fail "unbound not back"; sleep 1; done
+    r=$(ctl 'dns servers=192.0.2.53 tls=dot.atrium.test')
+    echo "$r" | grep -q '^ok' || fail "dns over TLS: $r"
+    flush
+    d0=$(stat dns)
+    r=$(look4 dot-only.atrium.test)
+    echo "$r" | grep -qE 'IN[[:space:]]+A[[:space:]]+10\.99\.0\.1' || fail "dot-only.atrium.test over TLS: $r $("$V" 'tail -n 3 /tmp/atrium-net/net.log; tail -n 5 /tmp/atrium-net/dot/log')"
+    r=$(look4 gate.atrium.test)
+    echo "$r" | grep -qE 'IN[[:space:]]+A[[:space:]]+10\.99\.0\.77' && [ "$(stat dns)" = "$d0" ] \
+        && ok "own server over TLS (192.0.2.53@853, certificate for dot.atrium.test): its answers, nothing to the LAN's DNS" || fail "gate.atrium.test over TLS: $r (lan dns $d0 -> $(stat dns))"
+    st=$(ctl status)
+    echo "$st" | grep -q '^dns own=192.0.2.53 tls=dot.atrium.test' && "$V" 'grep -q "^dns servers=192.0.2.53 tls=dot.atrium.test" /var/db/atrium-net/settings' \
+        && ok "shown on the status line and kept in the settings" || fail "status/settings: $(echo "$st" | grep '^dns')"
+    # A certificate for another name: no answers, and never plain DNS instead.
+    r=$(ctl 'dns servers=192.0.2.53 tls=wrong.atrium.test')
+    flush
+    r=$(look4 gate.atrium.test)
+    echo "$r" | grep -q 'rcode: SERVFAIL' && [ "$(stat dns)" = "$d0" ] \
+        && ok "a certificate for another name: SERVFAIL, nothing in the clear" || fail "wrong name: $r (lan dns $d0 -> $(stat dns))"
+    # unbound restarted: list_forwards can't show TLS, so atrium-net sees the
+    # restart by its uptime and sets the servers again.
+    ctl 'dns servers=192.0.2.53 tls=dot.atrium.test' >/dev/null
+    "$V" 'service local_unbound restart >/dev/null 2>&1'
+    i=0; until look4 dot-only.atrium.test | grep -q 10.99.0.1; do i=$((i + 1)); [ $i -lt 40 ] || fail "TLS after unbound restart: $("$V" 'local-unbound-control list_forwards; tail -n 3 /tmp/atrium-net/net.log')"; sleep 1; done
+    [ "$(stat dns)" = "$d0" ] && ok "local_unbound restarted: over TLS again in ${i}s" || fail "plain DNS after restart (lan dns $d0 -> $(stat dns))"
+    r=$(ctl 'dns')
+    flush
+    i=0; until look4 gate.atrium.test | grep -q 10.88.0.77; do i=$((i + 1)); [ $i -lt 20 ] || fail "back to the LAN's DNS"; sleep 1; done
+    ok "turned off: the network's DNS servers again"
+    "$V" 'kill $(cat /tmp/atrium-net/dot/pid); ifconfig lo1 destroy'
 
     # Renewal at T1 (half the lease).
     i=0; while [ "$(stat renew)" -lt 1 ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done

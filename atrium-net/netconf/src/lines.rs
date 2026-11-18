@@ -89,8 +89,10 @@ pub fn status(lines: &[Line], rssi: Option<i32>) -> Status {
 
 pub fn routes(lines: &[Line]) -> Routes {
     let e = lines.iter().filter_map(iface).find(|i| i.egress);
-    let own_dns = lines.iter().find(|l| l.verb == "dns").map(|l| list(l, "own")).unwrap_or_default();
-    Routes { default4: e.and_then(|i| Some((i.name.clone(), i.router.clone()?))), own_dns }
+    let dns = lines.iter().find(|l| l.verb == "dns");
+    let own_dns = dns.map(|l| list(l, "own")).unwrap_or_default();
+    let dns_tls = dns.and_then(|l| l.get("tls")).map(str::to_string);
+    Routes { default4: e.and_then(|i| Some((i.name.clone(), i.router.clone()?))), own_dns, dns_tls }
 }
 
 /// A `net` line of `wifi-list`.

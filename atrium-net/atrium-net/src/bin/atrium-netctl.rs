@@ -332,7 +332,7 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
                 None => println!("no default route"),
             }
             if !r.own_dns.is_empty() {
-                println!("own dns {}", r.own_dns.join(","));
+                println!("own dns {}{}", r.own_dns.join(","), r.dns_tls.as_ref().map(|n| format!(" over TLS ({n})")).unwrap_or_default());
             }
         }),
         "list" => c.profiles().map(|v| {
@@ -388,10 +388,15 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
             });
             c.set_static(&SetStatic { target, manual }).map(|_| println!("ok"))
         }
-        // dns [A,B,C]: the machine's own DNS servers; none: each network's.
+        // dns [A,B,C [tls NAME]]: the machine's own DNS servers, over TLS
+        // to a certificate for NAME if given; none: each network's.
         "dns" => {
             let v: Vec<std::net::IpAddr> = args.get(1).map(|d| d.split(',').map(|x| x.parse().unwrap_or_else(|_| die("bad DNS server"))).collect()).unwrap_or_default();
-            c.set_dns(&v).map(|_| println!("ok"))
+            match (args.get(2).map(String::as_str), args.get(3)) {
+                (Some("tls"), Some(n)) => c.set_dns_tls(&atrium_netconf::DnsTls { servers: v, name: n.clone() }).map(|_| println!("ok")),
+                (None, _) => c.set_dns(&v).map(|_| println!("ok")),
+                _ => die("dns [A,B,C [tls NAME]]"),
+            }
         }
         "printers" => {
             let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);

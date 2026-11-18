@@ -254,11 +254,26 @@ As built (N2):
   upstream allows, caches. `atrium-net` sets its forwarders from the active interface's
   DHCP/RA servers through `unbound-control` (no config rewrite, no restart).
 - `/etc/resolv.conf` is fixed: `nameserver 127.0.0.1`. Nothing else writes it.
-- A user setting can replace the network's servers (and later turn on DoT upstreams,
-  which unbound supports). As built (2026-11-15): `SetDns` (up to 3 unicast IPv4/IPv6
+- A user setting can replace the network's servers, and ask them over TLS. As built (2026-11-15): `SetDns` (up to 3 unicast IPv4/IPv6
   servers, not loopback) is kept in the state dir's `settings` file; while set, unbound
   forwards to those alone, and an empty list goes back to each network's. `GetRoutes`
   returns it as `own_dns`.
+- **DNS over TLS** (RFC 7858, built 2026-11-18, Shankar's pick): `SET_DNS_TLS` (op 0x43,
+  `network-configure`) takes the own servers and the host name their certificate must
+  show (`dns.quad9.net`). unbound then asks them only on port 853 over TLS
+  (`forward_add +t . A@853#NAME`), checking the chain against
+  `/var/unbound/atrium-ca.pem` (a copy of `/etc/ssl/cert.pem` inside unbound's chroot,
+  made by `atrium-net-service.sh` with `conf.d/atrium-tls.conf`) and the name. Strict:
+  a wrong certificate or a blocked port 853 gives SERVFAIL, never plain DNS (a captive
+  portal must be signed into with it off). Without a bundle unbound would take any
+  certificate, so atrium-net asks `get_option tls-cert-bundle` and refuses
+  ("no-tls-bundle"). Kept in `settings` (`dns servers=.. tls=NAME`), shown as
+  `dns own=.. tls=NAME` and `Routes.dns_tls`; `SET_DNS` turns it off. A restarted
+  unbound is told again (its forwarders differ, or its uptime went down: list_forwards
+  can't show TLS). `atrium-netctl dns A,B tls NAME`. Gate `atrium-net-gate.sh n0`
+  61/61: a second unbound on 192.0.2.53:853 (lo1) with a test CA answers; nothing
+  reaches the LAN's DNS; refused without a bundle; a wrong name SERVFAILs; back after an
+  unbound restart; off again. Not yet: a Curia switch for it.
 - The Insula broker and Nuntius already resolve on the host; they now get the cache and
   validation for free.
 
@@ -365,7 +380,7 @@ DHCPv6 as built (2026-11-15):
 | `ListInterfaces`, `GetRoutes` (addresses, routes) | `network_details` |
 | `ListWifiNetworks` (SSID, security, signal bucket; never BSSIDs) | `network_wifi` + user grant (location) |
 | `JoinWifi`, `ForgetWifi`, `SetProfile` | `network_wifi` |
-| `SetStatic`, `SetDns`, `SetCountry` | `network_configure` |
+| `SetStatic`, `SetDns`, `SetDnsTls`, `SetCountry` | `network_configure` |
 | `Subscribe` (status changes) | `network_read` |
 
 Passwords pass through `atrium-net` to aura-keys' `remember` and are not kept. The

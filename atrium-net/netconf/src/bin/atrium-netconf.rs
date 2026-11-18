@@ -361,6 +361,11 @@ impl Backend for Front {
         self.call(&l).map(|_| ())
     }
 
+    fn set_dns_tls(&self, t: atrium_netconf::DnsTls) -> Res<()> {
+        let l = Line::new("dns").with("servers", t.servers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")).with("tls", t.name);
+        self.call(&l).map(|_| ())
+    }
+
     fn print_discovery(&self) -> Res<(String, [OwnedFd; 2])> {
         // Holding the lock across the call: the fds that come belong to it.
         let mut p = self.calls.lock().unwrap();
