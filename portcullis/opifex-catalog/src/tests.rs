@@ -308,3 +308,56 @@ fn proofs() {
     assert!(!publisher::proof_ok("atrium-publisher pub:0123456789abcdee", id));
     assert_eq!(publisher::prefix_of("shop.example.co.uk"), "uk.co.example.shop.");
 }
+
+/// A platform key stolen after entry 2: root.toml version 2 names a new
+/// platform key and keeps the old one retired at 2. Machines already synced
+/// and fresh machines end with the same catalog: the old key's first two
+/// releases count, the thief's don't (and are listed as revoked), and the
+/// new key publishes.
+#[test]
+fn retired_platform_key() {
+    let w = world("retire");
+    let cat = w.dir.join("cat");
+    let log = Log::open(&cat);
+    log.append(&[release(&w, "org.atrium.a", "1", &w.plat), release(&w, "org.atrium.b", "1", &w.plat)]).unwrap();
+    // The thief, with the stolen platform key (and a way past CI).
+    log.append(&[release(&w, "org.atrium.a", "2", &w.plat),
+                 yank_entry("org.atrium.b", "1", "gone", &w.plat.sk, &w.plat.pk, NOW).unwrap()]).unwrap();
+    log.sign_head(&w.cat.sk, NOW, 14).unwrap();
+    let old_machine = client(&w);
+    let l = old_machine.update(&fetcher(cat.clone()), NOW).unwrap();
+    assert_eq!(l.latest("org.atrium.a", "aarch64").unwrap().version, "2");
+
+    // Root version 2: new platform key, the stolen one retired at entry 2.
+    let new_plat = key(6);
+    let mut text = root_text(&[&w.roots[0], &w.roots[1], &w.roots[2]], &w.cat, &new_plat, 2);
+    text += &format!("\n[[key]]\npem = \"\"\"{}\"\"\"\nroles = [\"platform\"]\nprefixes = [\"org.atrium.\"]\nkinds = [\"app\"]\nuntil = 2\n", w.plat.pk);
+    let sigs = sign_root(&text, &w.roots[0].sk, &w.roots[0].pk).unwrap() + &sign_root(&text, &w.roots[2].sk, &w.roots[2].pk).unwrap();
+    fs::write(cat.join(ROOT), &text).unwrap();
+    fs::write(cat.join(ROOT_SIG), sigs).unwrap();
+    // The publishing side refuses the retired key, takes the new one.
+    assert!(log.append(&[release(&w, "org.atrium.c", "1", &w.plat)]).unwrap_err().contains("retired"));
+    log.append(&[release(&w, "org.atrium.a", "3", &new_plat)]).unwrap();
+    log.sign_head(&w.cat.sk, NOW + 10, 14).unwrap();
+
+    let check = |l: &Local| {
+        assert_eq!(l.size, 5);
+        assert_eq!(l.latest("org.atrium.a", "aarch64").unwrap().version, "3");
+        assert!(l.releases.iter().all(|r| !(r.id == "org.atrium.a" && r.version == "2")));
+        assert!(l.is_revoked("org.atrium.a", "2") && !l.is_revoked("org.atrium.a", "1"));
+        // The thief's yank didn't count.
+        assert_eq!(l.latest("org.atrium.b", "aarch64").unwrap().version, "1");
+    };
+    check(&old_machine.update(&fetcher(cat.clone()), NOW + 10).unwrap());
+    let w_fresh = World { dir: w.dir.join("fresh"), roots: vec![], cat: key(4), plat: key(5) };
+    fs::create_dir_all(&w_fresh.dir).unwrap();
+    let fresh = Client::init(&w_fresh.dir.join("state"), &text).unwrap();
+    check(&fresh.update(&fetcher(cat.clone()), NOW + 10).unwrap());
+    check(&log.replay().unwrap());
+
+    // root.toml rules: only a platform key is retired, and not all of them.
+    let bad = root_text(&[&w.roots[0], &w.roots[1], &w.roots[2]], &w.cat, &new_plat, 3).replace("kinds = [\"app\", \"layer\", \"font\"]\n", "kinds = [\"app\"]\nuntil = 0\n");
+    assert!(Root::parse(&bad).unwrap_err().contains("every platform key"));
+    let bad = text.replacen("roles = [\"catalog\"]\n", "roles = [\"catalog\"]\nuntil = 1\n", 1);
+    assert!(Root::parse(&bad).unwrap_err().contains("only a platform key"));
+}

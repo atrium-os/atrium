@@ -143,12 +143,13 @@ pub fn serve(
             }
             return None;
         }
-        /* Up to 3 descriptors per request for a one-shot's stdio
-         * (ExecSpec::stdio), or up to MAX_LISTEN_FDS for a service's
-         * listening sockets (ExecSpec::listen). Every other request must
-         * carry none — dispatch refuses them. */
+        /* Up to 3 + MAX_EXTRA_FDS descriptors per request for a one-shot's
+         * stdio (ExecSpec::stdio) and what it passes on at 3, 4, ..., or up
+         * to MAX_LISTEN_FDS for a service's listening sockets
+         * (ExecSpec::listen; never combined with stdio). Every other request
+         * must carry none — dispatch refuses them. */
         Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES)
-            .with_fds(protocol::MAX_LISTEN_FDS.max(3)))
+            .with_fds(protocol::MAX_LISTEN_FDS.max(3 + protocol::MAX_EXTRA_FDS)))
     };
 
     loop {
@@ -265,15 +266,21 @@ fn dispatch(
     } else {
         None
     };
-    let stdio: Option<[OwnedFd; 3]> = if wants_stdio {
-        match <[OwnedFd; 3]>::try_from(fds) {
-            Ok(three) => Some(three),
-            Err(v) => return (Response::PolicyDenied {
+    let stdio: Option<CallerFds> = if wants_stdio {
+        /* ★ Past the three, a one-shot's caller may pass a few more (a
+         * worker's codec or CDM sockets), placed at 3, 4, ... in the jail.
+         * Not with a FUSE server, whose own descriptors sit there. */
+        let has_fuse = matches!(&req, Request::CreateJail(r) if r.fuse.is_some());
+        if fds.len() < 3 || fds.len() > 3 + protocol::MAX_EXTRA_FDS || (has_fuse && fds.len() > 3) {
+            return (Response::PolicyDenied {
                 rule:   "exec.stdio.fd_count".into(),
-                detail: format!("exec.stdio needs exactly 3 descriptors (stdin, stdout, \
-                                 stderr) on the request; got {}", v.len()),
-            }, Vec::new()),
+                detail: format!("exec.stdio needs 3 descriptors (stdin, stdout, stderr), and up to {} \
+                                 more without fuse, on the request; got {}", protocol::MAX_EXTRA_FDS, fds.len()),
+            }, Vec::new());
         }
+        let extra = fds.split_off(3);
+        let std = <[OwnedFd; 3]>::try_from(fds).unwrap_or_else(|_| unreachable!("three checked above"));
+        Some(CallerFds { std, extra })
     } else if fuse_control {
         None
     } else if !fds.is_empty() {
@@ -818,9 +825,16 @@ fn handle_remove(
     (Response::Ok, None)
 }
 
+/// What a one-shot's caller passed: its stdio, and up to
+/// [`protocol::MAX_EXTRA_FDS`] more for the program at 3, 4, ...
+struct CallerFds {
+    std:   [OwnedFd; 3],
+    extra: Vec<OwnedFd>,
+}
+
 fn handle_create(
     req:        &CreateJailRequest,
-    stdio:      Option<[OwnedFd; 3]>,
+    stdio:      Option<CallerFds>,
     control:    Option<OwnedFd>,
     listen:     Vec<OwnedFd>,
     policy:     &Policy,
@@ -1383,7 +1397,7 @@ fn check_listen(req: &CreateJailRequest, paths: &[String], fds: &[OwnedFd]) -> R
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
-    stdio:       Option<[OwnedFd; 3]>,
+    stdio:       Option<CallerFds>,
     control:     Option<OwnedFd>,
     listen:      Vec<OwnedFd>,
     lo0_alias:   Option<String>,
@@ -1464,12 +1478,19 @@ fn handle_create_with_exec(
          * log redirect above — which stays first, so a failure here still has
          * somewhere to be reported. Before jail_attach, while the child is
          * still root in the host, like every other fd setup. */
-        if let Some(fds) = &stdio {
+        if let Some(CallerFds { std: fds, extra }) = &stdio {
             use std::os::unix::io::AsRawFd;
             if let Err(e) = ffi::install_child_stdio(
                 [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()])
             {
                 eprintln!("jaild-child[{}]: install caller stdio: {e}", req.name);
+                ffi::child_exit(105);
+            }
+            // The caller's extras at 3, 4, ... (copied high first, so none
+            // is clobbered on the way).
+            let raw: Vec<i32> = extra.iter().map(|f| f.as_raw_fd()).collect();
+            if let Err(e) = ffi::install_child_fds(&raw) {
+                eprintln!("jaild-child[{}]: install caller descriptors: {e}", req.name);
                 ffi::child_exit(105);
             }
         }

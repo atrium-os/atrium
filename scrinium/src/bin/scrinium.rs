@@ -957,8 +957,9 @@ fn main() {
         let shared = shared.clone();
         std::thread::spawn(move || {
             for sticks in prx {
-                let mut all = places::distinct(sticks);
-                all.extend(configured.iter().cloned());
+                // The person's own folders first (places.rs), then the sticks.
+                let mut all = configured.clone();
+                all.extend(places::distinct(sticks));
                 let mut p = shared.lock().unwrap();
                 if p.list != all {
                     p.list = all;

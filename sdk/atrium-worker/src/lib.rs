@@ -263,7 +263,7 @@ impl Workers {
                     Proc::Child(spawn_fds(root, &def, fds, true)?)
                 } else {
                     let [a, b, c] = fds;
-                    let conn = worker_call_fds(name, [a.as_raw_fd(), b.as_raw_fd(), c.as_raw_fd()])?;
+                    let conn = worker_call_fds(name, &[a.as_raw_fd(), b.as_raw_fd(), c.as_raw_fd()])?;
                     drop((a, b, c));
                     Proc::Jail(conn)
                 }
@@ -279,8 +279,8 @@ impl Workers {
     /// `extra` from descriptor 3 on, in order (other services it was
     /// given: [`socket_worker`] takes them). Isolated as
     /// [`session`](Self::session) is; not in-process. In a jail,
-    /// portcullisd's WorkerCall carries the three standard descriptors
-    /// only, so `extra` needs `isolation = "capsicum"` until it carries more.
+    /// portcullisd's WorkerCall carries up to [`MAX_EXTRA_FDS`] past the
+    /// three, placed at 3, 4, ... in the worker's jail.
     pub fn spawn_socket(&self, name: &str, extra: &[BorrowedFd<'_>]) -> Result<SocketWorker, Error> {
         let def = self.defs.get(name).ok_or_else(|| Error::NoSuchWorker(name.into()))?.clone();
         let (ours, theirs) = UnixStream::pair()?;
@@ -292,13 +292,15 @@ impl Workers {
             Mode::Atrium { root } => {
                 if def.isolation.as_deref() == Some("capsicum") {
                     Proc::Child(spawn_with(root, &def, [theirs.into(), err.try_clone()?, err], &extra, true)?)
-                } else if !extra.is_empty() {
+                } else if extra.len() > MAX_EXTRA_FDS {
                     return Err(Error::Start(format!(
-                        "worker {name:?}: a jail's WorkerCall carries three descriptors, not {} more; use isolation = \"capsicum\" for now",
+                        "worker {name:?}: a jail's WorkerCall carries at most {MAX_EXTRA_FDS} descriptors past its three, not {}",
                         extra.len())));
                 } else {
-                    let conn = worker_call_fds(name, [theirs.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])?;
-                    drop((theirs, err));
+                    let mut fds = vec![theirs.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()];
+                    fds.extend(extra.iter().map(|f| f.as_raw_fd()));
+                    let conn = worker_call_fds(name, &fds)?;
+                    drop((theirs, err, extra));
                     Proc::Jail(conn)
                 }
             }
@@ -536,10 +538,14 @@ fn read_line(s: &mut UnixStream) -> io::Result<serde_json::Value> {
 /// `WorkerCall`: the worker's jail, on `sock` (stdin) and `err` (stdout,
 /// stderr). Returns the connection it lives by.
 fn worker_call(name: &str, sock: &UnixStream, err: &OwnedFd) -> Result<UnixStream, Error> {
-    worker_call_fds(name, [sock.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])
+    worker_call_fds(name, &[sock.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()])
 }
 
-fn worker_call_fds(name: &str, fds: [std::os::fd::RawFd; 3]) -> Result<UnixStream, Error> {
+/// How many descriptors past its three portcullisd's WorkerCall carries
+/// into a worker's jail (jaild's MAX_EXTRA_FDS).
+pub const MAX_EXTRA_FDS: usize = 8;
+
+fn worker_call_fds(name: &str, fds: &[std::os::fd::RawFd]) -> Result<UnixStream, Error> {
     let start = |e: io::Error| Error::Start(format!("portcullisd: {e}"));
     let mut s = portcullisd().map_err(start)?;
     s.set_read_timeout(Some(Duration::from_secs(30))).map_err(start)?;
@@ -556,7 +562,7 @@ fn worker_call_fds(name: &str, fds: [std::os::fd::RawFd; 3]) -> Result<UnixStrea
             ready["stage"].as_str().unwrap_or("?"), ready["message"].as_str().unwrap_or("?")))),
         _ => return Err(Error::Start(format!("portcullisd: {ready}"))),
     }
-    wire::send_with_fds(&s, &fds, b"F").map_err(start)?;
+    wire::send_with_fds(&s, fds, b"F").map_err(start)?;
     s.set_read_timeout(None).map_err(start)?;
     Ok(s)
 }

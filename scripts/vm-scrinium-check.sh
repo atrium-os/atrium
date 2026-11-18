@@ -116,7 +116,7 @@ mkdir -p $APPS/org.atrium.scrinium $APPS/org.test.notes /var/run/atrium
 sed -i '' '/ org.atrium.scrinium\$/d; / org.test.notes\$/d' $REG 2>/dev/null || true
 printf '50603 alice org.atrium.scrinium\n50601 alice org.test.notes\n' >> $REG
 printf '[app]\nid = "org.atrium.scrinium"\n[capabilities]\ngraphics = "fresco"\nremovable-files = true\nfile-picker = true\nhome-files = true\narca = true\nnetwork = "none"\nembeds = ["doc-viewer", "pdf-viewer", "media-player", "credential"]\n' > $APPS/org.atrium.scrinium/atrium.toml
-printf '[app]\nid = "org.test.notes"\n[capabilities]\ngraphics = "fresco"\n' > $APPS/org.test.notes/atrium.toml
+printf '[app]\nid = "org.test.notes"\n[capabilities]\ngraphics = "fresco"\nembeds = ["picker"]\n' > $APPS/org.test.notes/atrium.toml
 for J in "$JF $RF scrinium" "$JN $RN scrinium-pick-demo"; do
   set -- \$J
   mkdir -p \$2/bin \$2/tmp/sc \$2/sock \$2/dev
@@ -176,6 +176,9 @@ SENV="FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock SCRINIU
 # The window opens on alice's Documents (her folders come first); the
 # stick checks then open the stick.
 FMENV="$SENV SCRINIUM_OPEN=$PART"
+# The picker's checks press rows of the stick, so its window gets only the
+# stick (no home folders before it).
+PENV="$SENV SCRINIUM_HOME=/nonexistent SCRINIUM_WORKSPACES=/nonexistent"
 
 echo "== the file manager"
 V "daemon -f -o /tmp/sc/scrinium.log jexec -u grantfm $JF env $FMENV /bin/scrinium --no-picker"
@@ -202,7 +205,7 @@ shot 6 scrinium-docs
 V "pkill -f '/bin/scrinium --no-picker'"; sleep 3
 
 echo "== the picker: one file"
-V "daemon -f -o /tmp/sc/picker.log jexec -u grantfm $JF env $SENV /bin/scrinium --no-window"
+V "daemon -f -o /tmp/sc/picker.log jexec -u grantfm $JF env $PENV /bin/scrinium --no-window"
 sleep 10
 V "grep -q 'providing picker' /tmp/sc/picker.log" && ok "Scrinium provides the picker" || bad "provider: $(V 'tail -3 /tmp/sc/picker.log /tmp/sc/limend.log | tr "\n" ";"')"
 V "daemon -f -o /tmp/sc/demo.log jexec -u grantapp $JN env FRESCO_SOCKET=/tmp/sc/fresco.sock LIMEN_SOCKET=/tmp/sc/limend.sock PICK_EXT=txt /bin/scrinium-pick-demo"

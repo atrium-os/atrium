@@ -46,6 +46,29 @@ fn exec_other() -> String {
     format!("{} {}", p.rsplit('/').next().unwrap_or(""), out.lines().nth(1).unwrap_or("").chars().take(160).collect::<String>())
 }
 
+/// A socket worker in its own jail, given one more descriptor (a pipe) at 3.
+fn extra_fd(w: &Workers) -> String {
+    use std::io::BufRead;
+    let mut p = [0i32; 2];
+    // SAFETY: pipe(2) into a two-int array.
+    if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 { return "no pipe".into() }
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    let (r, wr) = unsafe { (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1])) };
+    let mut wf = std::fs::File::from(wr);
+    let _ = writeln!(wf, "a line through the pipe");
+    drop(wf);
+    match w.spawn_socket("sock", &[r.as_fd()]) {
+        Ok(sw) => {
+            let mut line = String::new();
+            let _ = sw.sock.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            let _ = std::io::BufReader::new(&sw.sock).read_line(&mut line);
+            let code = sw.wait();
+            format!("{} (exit {code:?})", line.trim())
+        }
+        Err(e) => format!("error {e}"),
+    }
+}
+
 fn main() {
     let w = match Workers::get() {
         Ok(w) => w,
@@ -77,5 +100,6 @@ fn main() {
         r => say("nope", format!("{r:?}")),
     }
     say("exec-other", exec_other());
+    say("extra-fd", extra_fd(&w));
     say("done", "1".into());
 }

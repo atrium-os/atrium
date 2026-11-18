@@ -118,6 +118,17 @@ pub struct Key {
     /// May ship `devices.d` entries (device-assignment §4.2.6).
     #[serde(default)]
     pub devices: bool,
+    /// A retired platform key (lost, replaced or stolen): its releases and
+    /// yanks at log index `until` and after are revoked, those before it
+    /// still count. Never removed from root.toml, so a machine replaying the
+    /// whole log can still check what it signed before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+}
+
+impl Key {
+    /// Does this key's signature on log entry `idx` count?
+    pub fn counts_at(&self, idx: u64) -> bool { self.until.map_or(true, |u| idx < u) }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -169,6 +180,12 @@ impl Root {
                     return Err(format!("{ROOT}: unknown kind {kind:?}"));
                 }
             }
+            if k.until.is_some() && k.roles != ["platform"] {
+                return Err(format!("{ROOT}: only a platform key is retired with `until` (drop a root or catalog key instead)"));
+            }
+        }
+        if r.with_role("platform").count() > 0 && r.with_role("platform").all(|k| k.until.is_some()) {
+            return Err(format!("{ROOT}: every platform key is retired"));
         }
         Ok(r)
     }
@@ -530,10 +547,12 @@ impl Log {
         let root = self.root()?;
         let mut local = Local { name: root.name.clone(), ..Local::default() };
         let mut seen = HashSet::new();
-        for (i, e) in self.entries()?.iter().enumerate() {
+        let entries = self.entries()?;
+        for (i, e) in entries.iter().enumerate() {
             let e = Entry::parse(e).map_err(|m| format!("entry {i}: {m}"))?;
-            apply(&e, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {i}: {m}"))?;
+            apply(&e, i as u64, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {i}: {m}"))?;
         }
+        local.size = entries.len() as u64;
         Ok(local)
     }
 
@@ -572,7 +591,13 @@ impl Log {
         let mut seen: HashSet<(String, String, String, String)> = local.releases.iter()
             .map(|r| (r.kind.clone(), r.id.clone(), r.version.clone(), r.arch.clone())).collect();
         for e in new {
-            apply(e, &root, self.third_party, &mut local, &mut seen)?;
+            let idx = all.len() as u64;
+            let signer = e.release.as_ref().filter(|r| r.publisher.is_empty()).map(|r| &r.signer)
+                .or(e.yank.as_ref().map(|y| &y.signer));
+            if signer.is_some_and(|s| retired_at(&root, s, idx)) {
+                return Err("signed by a retired key (root.toml `until`)".into());
+            }
+            apply(e, idx, &root, self.third_party, &mut local, &mut seen)?;
             all.push(e.bytes());
         }
         let d = self.dir.join(ENTRIES);
@@ -668,10 +693,18 @@ pub struct Local {
     pub releases: Vec<Release>,
     #[serde(default, rename = "publisher")]
     pub publishers: Vec<Publisher>,
+    /// Releases (id, version, arch) signed by a retired platform key at or
+    /// after its `until`: never offered, and installed copies are flagged.
+    #[serde(default)]
+    pub revoked: Vec<(String, String, String)>,
 }
 
 impl Local {
     /// The newest release of `id` for `arch` (or for any arch) that isn't yanked.
+    pub fn is_revoked(&self, id: &str, version: &str) -> bool {
+        self.revoked.iter().any(|(i, v, _)| i == id && v == version)
+    }
+
     pub fn latest(&self, id: &str, arch: &str) -> Option<&Release> {
         self.releases.iter()
             .filter(|r| r.id == id && (r.arch == arch || r.arch == font::ARCH) && !self.yanked.iter().any(|(i, v)| i == id && *v == r.version))
@@ -763,11 +796,13 @@ impl Client {
             return Err(format!("head: size {} is smaller than the {old} entries already seen (history rewritten)", head.size));
         }
         // 3. New entries, from the bundle that holds entry `old`.
-        let mut local = self.local()?;
+        // A new root.toml may retire a key, so the whole log is checked again
+        // under it (old entries still against the leaves seen before).
+        let mut local = if new_root { Local::default() } else { self.local()? };
         local.name = root.name.clone();
         let mut seen: HashSet<(String, String, String, String)> = local.releases.iter()
             .map(|r| (r.kind.clone(), r.id.clone(), r.version.clone(), r.arch.clone())).collect();
-        let mut n = old / BUNDLE;
+        let mut n = if new_root { 0 } else { old / BUNDLE };
         while n * BUNDLE < head.size {
             let count = (head.size - n * BUNDLE).min(BUNDLE);
             let bytes = fetch(&bundle_name(n, count))?;
@@ -779,11 +814,15 @@ impl Client {
                     if leaves[idx] != h {
                         return Err(format!("entry {idx} differs from the one seen before (history rewritten)"));
                     }
-                    continue;
+                    if !new_root {
+                        continue;
+                    }
                 }
                 let entry = Entry::parse(e).map_err(|m| format!("entry {idx}: {m}"))?;
-                apply(&entry, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {idx}: {m}"))?;
-                leaves.push(h);
+                if idx >= leaves.len() {
+                    leaves.push(h);
+                }
+                apply(&entry, idx as u64, &root, self.third_party, &mut local, &mut seen).map_err(|m| format!("entry {idx}: {m}"))?;
             }
             n += 1;
         }
@@ -803,8 +842,22 @@ impl Client {
     }
 }
 
-fn apply(e: &Entry, root: &Root, third_party: bool, local: &mut Local,
+/// Signed by a root.toml key that no longer counts at log entry `idx`?
+fn retired_at(root: &Root, signer: &str, idx: u64) -> bool {
+    root.key(signer).is_some_and(|k| !k.counts_at(idx))
+}
+
+fn apply(e: &Entry, idx: u64, root: &Root, third_party: bool, local: &mut Local,
          seen: &mut HashSet<(String, String, String, String)>) -> Result<(), String> {
+    // A retired key's later entries are skipped, not errors: the log is
+    // append-only, so a stolen key's releases stay in it for good.
+    if let Some(r) = e.release.as_ref().filter(|r| r.publisher.is_empty() && retired_at(root, &r.signer, idx)) {
+        local.revoked.push((r.id.clone(), r.version.clone(), r.arch.clone()));
+        return Ok(());
+    }
+    if e.yank.as_ref().is_some_and(|y| retired_at(root, &y.signer, idx)) {
+        return Ok(());
+    }
     if let Some(p) = &e.publisher {
         p.apply(root, third_party, &mut local.publishers)?;
     }

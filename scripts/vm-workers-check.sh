@@ -21,6 +21,8 @@
 #     §9.1c); 20 calls are timed either way;
 #   - the core's jail has the worker-call socket, which refuses anything
 #     but WorkerCall, and no portcullisd socket;
+#   - a socket worker gets a descriptor past its three (a pipe, at 3 in
+#     its jail) and reads from it;
 #   - and after it all no worker jail is left.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +41,7 @@ echo "=== cross-build"
     -p portcullisd -p portcullis-cli -p jaild --bin portcullisd --bin portcullis --bin atrium-jaild) \
     || { echo "build failed"; echo "workers: 1 failed"; exit 1; }
 (cd "$ROOT/sdk" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
-    -p atrium-worker --example gate_core --example gate_worker) \
+    -p atrium-worker --example gate_core --example gate_worker --example gate_sock) \
     || { echo "sdk build failed"; echo "workers: 1 failed"; exit 1; }
 
 echo "=== install"
@@ -48,6 +50,7 @@ V "pkill -x portcullisd; sleep 1; rm -rf $B; mkdir -p $B; chmod 755 $B"
 for f in "$ROOT/portcullis/target/$TARGET/release/portcullisd" "$ROOT/portcullis/target/$TARGET/release/portcullis" \
          "$ROOT/portcullis/target/$TARGET/release/atrium-jaild" \
          "$ROOT/sdk/target/$TARGET/release/examples/gate_core" "$ROOT/sdk/target/$TARGET/release/examples/gate_worker" \
+         "$ROOT/sdk/target/$TARGET/release/examples/gate_sock" \
          "$ROOT/etc/jaild.policy.toml"; do
     scp -q $K -P 2222 "$f" root@localhost:$B/ || { echo "copy $f failed"; echo "workers: 1 failed"; exit 1; }
 done
@@ -82,6 +85,7 @@ set -e
 rm -rf $P; mkdir -p $P/bin
 install -m 0755 $B/gate_core $P/bin/core
 install -m 0755 $B/gate_worker $P/bin/echo
+install -m 0755 $B/gate_sock $P/bin/sock
 cat > $P/atrium.toml <<'T'
 [app]
 id = "org.example.wk"
@@ -94,6 +98,10 @@ name = "echo"
 entry = "bin/echo"
 cpu = "3s"
 memory = "128M"
+
+[[workers]]
+name = "sock"
+entry = "bin/sock"
 T
 chown -R alice:files-alice $P
 EOS
@@ -144,8 +152,9 @@ r=$(V "grep -m1 'memoryuse' $B/rctl.txt"); case "$r" in *memoryuse:sigkill=13421
 r=$(line after-memory); [ "$r" = "$u1" ] && ok "and the next call works" || bad "after-memory: $r"
 r=$(line nope); case "$r" in no-such-worker) ok "an undeclared worker is refused" ;; *) bad "nope: $r" ;; esac
 r=$(line exec-other); case "$r" in "workers.sock"*"only WorkerCall"*) ok "the core has only the worker-call socket: $r" ;; *) bad "exec-other: $r" ;; esac
+r=$(line extra-fd); case "$r" in "from-extra a line through the pipe (exit Some(0))") ok "a socket worker reads the descriptor passed at 3 in its jail" ;; *) bad "extra-fd: $r" ;; esac
 sleep 3
-left=$(V "jls name | grep -c 'org.example.wk.*w-echo'" | tr -d ' ')
+left=$(V "jls name | grep -c 'org.example.wk.*w-'" | tr -d ' ')
 [ "$left" = 0 ] && ok "no worker jail left" || bad "$left worker jails left: $(V "jls name | grep w-echo")"
 
 A "stop scratch" >/dev/null

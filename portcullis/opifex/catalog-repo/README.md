@@ -104,7 +104,11 @@ opifex catalog publish site --key catalog.pem
 ```
 
 Machines adopt it at their next sync; from then on the old keys alone change nothing. A new
-catalog or platform key goes in the same way. `scripts/opifex-token-check.sh` rehearses all of
+catalog or platform key goes in the same way. A replaced platform key is not dropped: `root-new
+--next yes` keeps it with `until` set to the log's current size, so what it signed before still
+checks and anything after is revoked. If it was stolen, add `--retire-at <entry>` with the
+first entry you don't trust; machines then drop the thief's releases and tell anyone who
+installed one (opifex.md §5.1.1). `scripts/opifex-token-check.sh` rehearses all of
 this on software tokens.
 
 ## Signing a release built elsewhere (opifex.md §10.4)

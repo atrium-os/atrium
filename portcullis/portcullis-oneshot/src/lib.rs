@@ -247,6 +247,16 @@ pub fn as_worker(m: &mut portcullis_toml::Manifest, name: &str) -> Result<(), St
 }
 
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
+    run_with_fds(spec, stdio, Vec::new())
+}
+
+/// As [`run_with_stdio`], and `extra` at 3, 4, ... in the jail (at most
+/// `jaild::protocol::MAX_EXTRA_FDS`; only with `stdio`).
+pub fn run_with_fds(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<std::os::fd::OwnedFd>) -> OneShot {
+    if !extra.is_empty() && (stdio.is_none() || extra.len() > jaild::protocol::MAX_EXTRA_FDS) {
+        return OneShot::Refused(format!("{} extra descriptors: at most {}, and only with the caller's stdio",
+            extra.len(), jaild::protocol::MAX_EXTRA_FDS));
+    }
     // ★ This lane builds the instance root and reads the machine's identity
     // secret in THIS process, so it needs root — and says so first. Without
     // it an unprivileged caller was told "host identity: Permission denied",
@@ -467,7 +477,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         fuse: None,
     });
     tm.mark("prepare");
-    let outcome = run_via_jaild(&req, stdio);
+    let outcome = run_via_jaild(&req, stdio, extra);
     tm.mark("jaild-run");
 
     jaild_remove(&jail_name);
@@ -635,7 +645,8 @@ fn jaild_network(spec: Option<&portcullis_toml::NetworkSpec>, app_id: &str,
 /// request is sent. The worker holds its own now; if this process kept the
 /// stdout write end, the broker reading it would never see EOF when the worker
 /// exits — it would wait on us instead.
-fn run_via_jaild(req: &jaild::protocol::Request, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
+fn run_via_jaild(req: &jaild::protocol::Request, stdio: Option<[std::os::fd::OwnedFd; 3]>,
+                 extra: Vec<std::os::fd::OwnedFd>) -> OneShot {
     use jaild::protocol::Response;
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     let mut client = match jaild::client::Client::connect(JAILD_SOCK) {
@@ -644,12 +655,17 @@ fn run_via_jaild(req: &jaild::protocol::Request, stdio: Option<[std::os::fd::Own
             "connect {JAILD_SOCK}: {e} — one-shot jails are created by atrium-jaild")),
     };
     let sent = match &stdio {
-        Some([i, o, e]) => client.send_with_fds(req, &[i.as_fd(), o.as_fd(), e.as_fd()], 1),
+        Some([i, o, e]) => {
+            let mut all = vec![i.as_fd(), o.as_fd(), e.as_fd()];
+            all.extend(extra.iter().map(|f| f.as_fd()));
+            client.send_with_fds(req, &all, 1)
+        }
         None => client.send_with_fds(req, &[std::io::stdin().as_fd(),
                                             std::io::stdout().as_fd(),
                                             std::io::stderr().as_fd()], 1),
     };
     drop(stdio);
+    drop(extra);
     let (resp, got) = match sent {
         Ok(x) => x,
         Err(e) => return OneShot::Failed(format!("jaild: {e}")),
