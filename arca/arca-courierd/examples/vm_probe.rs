@@ -117,6 +117,7 @@ fn main() {
             println!("body={}", String::from_utf8_lossy(&body));
         }
         Response::Refused(r) => println!("courier_refused={r:?}"),
+        other => println!("unexpected={other:?}"),
     }
     match ask("/redirect") {
         Response::Http { status, headers, .. } => {
@@ -124,6 +125,7 @@ fn main() {
             println!("redirect={status} {loc}");
         }
         Response::Refused(r) => println!("redirect_refused={r:?}"),
+        other => println!("redirect_unexpected={other:?}"),
     }
     let during: Vec<String> = courier_jails().into_iter().filter(|j| !before.contains(j)).collect();
     println!("jail={}", during.join(","));
