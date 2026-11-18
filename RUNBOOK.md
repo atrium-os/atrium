@@ -5875,8 +5875,14 @@ with… in the Personal window, In: Work, sends the page to the Work Navigator, 
 a new trail marked anonymous (`a link sent from personal: a new trail, anonymous` in Work's log,
 `confined-9-into-work.png`). The run first deletes any
 `[[crossings]]` left in navtest's `policy.toml` by an earlier run. jaild's policy needs
-`/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it). 98/98 on
-2026-11-18. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
+`/atrium/sockets/clipboard` in `rw_paths` for monstratord's jail (the script adds it), and `/atrium/sockets/opifex-sheet` too. Last, L5: a test catalog
+(signed with throwaway keys, as `vm-opifex-c3-check.sh`, so it rewrites
+`/etc/atrium/opifex/root.toml`), opifexd on its own socket and opifex-sheetd as `_opifexsheet`;
+App probe (`link-probe` reading `atrium-app://org.atrium.l5hello` from its bundle's
+`link-probe.url`) asks with Enter, portcullisd answers "to install first", the install sheet
+shows (`confined-10-install.png`), Up and Enter on Install installs it for App probe's uid
+(`asked by uid 65038` in the sheet's log) and portcullisd opens it. 106/106 on 2026-11-18;
+98/98 earlier that day. 94/94 on 2026-11-17 (67/67 before the Work section). Earlier: 61/61 on
 2026-11-15. jaild's policy needed `/atrium/sockets/monstrator`, `/atrium/sockets/portcullis`,
 `/atrium/sockets/fresco` and `/atrium/sockets/fresco-activation` in `rw_paths`, and a services.d
 manifest may set no environment keys outside the policy's allow-list (monstratord finds
@@ -5952,6 +5958,13 @@ Print service (R2, spec §11.2), against the same oracle:
   and checks jobs from the guest plus the jails: render with `ip4=disable`,
   ipp in a vnet whose `atrium/<jail>` anchor passes only the printer's
   address and port, no jail left after a job. Ends with `PASS`.
+- Finding printers (R3, spec §11.3). Host: `sh scripts/prelum-r3-check.sh`
+  (Avahi by legacy unicast, `--mdns-legacy 127.0.0.1:5353`; at most two
+  test printers, since Avahi cuts legacy answers at 512 bytes). VM: boot it
+  with the fake LAN once (`sh scripts/atrium-net-gate.sh vm`), then
+  `sh scripts/prelum-r3-vm.sh`. That runs atrium-net on vtnet1 with
+  `--no-egress-group` so the ipp jails' NAT stays on vtnet0, and lan.py's
+  `mdns-printer 10.0.2.2 8661` / `mdns-flood`. Ends with `PASS`.
 - By hand: `atrium-prelumd --socket S --state D --spool D [--direct BIN]`,
   then `prelumctl --socket S add ipps://HOST/ipp/print`, `print FILE
   --printer 1 [--wait]`, `jobs`, `cancel N`, `repin 1`.

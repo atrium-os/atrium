@@ -1,0 +1,28 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+
+# What the core and its worker share: the messages between them, and the
+# parser the worker runs.
+[lib]
+path = "src/lib.rs"
+
+# The core: holds atrium.toml's capabilities, asks Nuntius for bytes and
+# never parses them.
+[[bin]]
+name = "{{name}}"
+path = "src/main.rs"
+
+# The parse worker: no capabilities; it reads each response.
+[[bin]]
+name = "{{name}}-parse"
+path = "src/bin/parse.rs"
+
+[dependencies]
+pergola = {{dep:pergola}}
+nuntius = {{dep:nuntius}}
+atrium-message = {{dep:atrium-message}}
+atrium-worker = {{dep:atrium-worker}}
+# Used by the worker: any crate you like can parse there, it's caged.
+serde_json = "1"

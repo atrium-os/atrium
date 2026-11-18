@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod archive;
+pub mod catalogs;
 pub mod content;
 pub mod daemon;
 pub mod driver;
@@ -11,5 +12,6 @@ pub mod font;
 pub mod installed;
 pub mod layer;
 pub mod proto;
+pub mod rp;
 pub mod runtime;
 pub mod updates;

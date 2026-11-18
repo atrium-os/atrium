@@ -1,0 +1,19 @@
+# {{name}}: made by `cargo atrium new` (template: media).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A window, and the system's media player embedded in it (Limen's
+# `media-player` role): the player demuxes and decodes in a jail of its
+# own and draws into the app's window. The app never touches the codecs.
+[capabilities]
+graphics = "fresco"
+network = "none"
+embeds = ["media-player"]
+
+# Files offers "Open with {{title}}" for these.
+[[opens]]
+types = ["video/mp4", "video/webm", "audio/mpeg", "audio/ogg", "audio/flac"]

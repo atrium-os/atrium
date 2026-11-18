@@ -116,8 +116,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-netconf"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "aura-ipc",
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "atrium-types"
 version = "0.1.0"
+
+[[package]]
+name = "aura-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zeroize",
+]
 
 [[package]]
 name = "base64"
@@ -978,6 +997,7 @@ name = "prelumd"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-netconf",
  "base64",
  "jaild",
  "libc",

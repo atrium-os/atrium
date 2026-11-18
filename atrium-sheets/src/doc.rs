@@ -360,7 +360,26 @@ pub struct Doc {
     /// The password, while a protected document is open: saves and the
     /// journal are encrypted with it.
     pub protection: Option<Protection>,
+    /// How long an edit may recalculate before it hands the window back (the
+    /// app's event loop finishes the work a slice a frame). None: all at once,
+    /// as tests and batch work want.
+    pub recalc_budget: Option<std::time::Duration>,
+    /// The most memory the workbook's cells may take ([`Workbook::memory_bytes`]):
+    /// a change that would take it past is undone and the user told.
+    pub memory_budget: u64,
 }
+
+/// The workbook memory budget: half the machine's memory, between 1 and 16 GiB.
+/// One budget for the whole workbook, however its cells are spread over sheets.
+pub fn default_memory_budget() -> u64 {
+    // SAFETY: sysconf reads system configuration and has no preconditions.
+    let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    let ram = if pages > 0 && size > 0 { pages as u64 * size as u64 } else { 4 << 30 };
+    (ram / 2).clamp(1 << 30, 16 << 30)
+}
+
+/// The app's recalculation slice: well under a frame at 30 Hz.
+pub const RECALC_SLICE: std::time::Duration = std::time::Duration::from_millis(12);
 
 impl Doc {
     pub fn new(name: &str) -> Self {
@@ -370,7 +389,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: default_memory_budget() }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -445,6 +464,46 @@ impl Doc {
         }
     }
 
+    /// Whether the workbook is past its memory budget; if so the status says so.
+    fn over_budget(&mut self) -> bool {
+        let used = self.wb.memory_bytes();
+        if used <= self.memory_budget {
+            return false;
+        }
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        self.status = format!("That change would make the workbook about {:.1} GB, past its {:.1} GB memory limit, so it wasn't made.", gib(used), gib(self.memory_budget));
+        true
+    }
+
+    /// The sheet on screen, kept to one that exists (undo can take a sheet away).
+    fn keep_sheet(&mut self) {
+        let n = self.wb.sheet_count().max(1);
+        if self.sheet as usize >= n {
+            self.sheet = (n - 1) as u16;
+        }
+    }
+
+    /// Recalculates within the budget; what's left waits for [`Doc::settle`].
+    pub fn recalc(&mut self) {
+        match self.recalc_budget {
+            Some(b) => {
+                self.wb.recalc_for(b);
+            }
+            None => {
+                self.wb.recalc();
+            }
+        }
+    }
+
+    /// Another slice of unfinished recalculation: true when work remains.
+    pub fn settle(&mut self) -> bool {
+        if !self.wb.recalc_pending() {
+            return false;
+        }
+        self.recalc();
+        self.wb.recalc_pending()
+    }
+
     /// Runs `ops` as one undo step: applied, journaled, recalculated.
     pub fn run(&mut self, label: &str, ops: Vec<GridOp>) {
         if ops.is_empty() {
@@ -453,7 +512,12 @@ impl Doc {
         let r = Record::Run { label: label.into(), ops };
         self.journal(&r);
         self.replay(r);
-        self.wb.recalc();
+        if self.over_budget() {
+            self.journal(&Record::Undo);
+            self.history.undo(&mut self.wb);
+            return;
+        }
+        self.recalc();
         self.dirty = true;
     }
 
@@ -531,7 +595,8 @@ impl Doc {
         }
         self.journal(&Record::Undo);
         self.history.undo(&mut self.wb);
-        self.wb.recalc();
+        self.keep_sheet();
+        self.recalc();
         self.dirty = true;
         true
     }
@@ -542,7 +607,13 @@ impl Doc {
         }
         self.journal(&Record::Redo);
         self.history.redo(&mut self.wb);
-        self.wb.recalc();
+        self.keep_sheet();
+        if self.over_budget() {
+            self.journal(&Record::Undo);
+            self.history.undo(&mut self.wb);
+            return false;
+        }
+        self.recalc();
         self.dirty = true;
         true
     }
@@ -612,6 +683,69 @@ mod tests {
         let d = std::env::temp_dir().join(format!("atrium-sheets-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn a_change_past_the_memory_budget_is_not_made() {
+        let mut d = Doc::new("big");
+        assert!(d.memory_budget >= 1 << 30);
+        d.memory_budget = 64 << 20;
+        assert!(d.type_into(0, 0, "1"));
+        let used = d.wb.memory_bytes();
+        // A formula down two billion rows: refused before anything computes it.
+        let fill = GridOp::fill(0, 1, 0, officina_grid::addr::MAX_ROWS - 1, "=A1*2");
+        d.run("Fill", vec![fill]);
+        assert!(d.status.contains("memory limit"), "{}", d.status);
+        assert_eq!(d.wb.formula_text(CellAddr::new(0, 5, 1)), None);
+        assert!(d.wb.memory_bytes() <= used + 4096);
+        d.status.clear();
+        // Ten million numbers (about 80 MB) are past it too; ten thousand are not.
+        let rows: Vec<Vec<Input>> = (0..10_000).map(|r| vec![Input::Value(Value::Num(r as f64))]).collect();
+        d.run("Paste", vec![GridOp::block(0, 0, 2, rows)]);
+        assert_eq!(d.wb.value(0, 9_999, 2), Value::Num(9_999.0), "{}", d.status);
+        d.status.clear();
+        let big: Vec<Vec<Input>> = (0..100).map(|_| (0..100_000).map(|c| Input::Value(Value::Num(c as f64))).collect()).collect();
+        d.run("Paste", vec![GridOp::block(0, 0, 3, big)]);
+        assert!(d.status.contains("memory limit"), "{}", d.status);
+        assert_eq!(d.wb.value(0, 5, 3), Value::Empty);
+        // Undo still takes back the last change that was made.
+        assert!(d.undo());
+        assert_eq!(d.wb.value(0, 9_999, 2), Value::Empty);
+    }
+
+    #[test]
+    fn a_slow_edit_hands_the_window_back_and_greys_what_is_not_done() {
+        use pergola::widgets::GridSource;
+        let rows = 20_000u32;
+        let mut d = Doc::new("slow");
+        let a: Vec<f64> = (0..rows).map(|r| (r % 97) as f64).collect();
+        d.wb.set_numbers(0, 0, 0, &a);
+        d.wb.set_value(CellAddr::new(0, 0, 5), Value::Num(1.0));
+        d.wb.fill_formula(0, 1, 0, rows - 1, &format!("=COUNTIF($A$1:$A${rows},\">\"&A1)*$F$1")).unwrap();
+        d.wb.recalc();
+        let before = d.wb.value(0, rows - 1, 1);
+        d.recalc_budget = Some(RECALC_SLICE);
+        let t = std::time::Instant::now();
+        assert!(d.type_into(0, 5, "2"));
+        assert!(t.elapsed() < RECALC_SLICE * 5, "the edit held the window {:?}", t.elapsed());
+        assert!(d.wb.recalc_pending());
+        let doc = std::rc::Rc::new(std::cell::RefCell::new(d));
+        let src = crate::source::SheetSource::new(doc.clone());
+        let last = src.cell(rows - 1, 1).unwrap();
+        assert_eq!(last.color, Some(pergola::theme::palette::neutral_400()), "an old value is shown greyed");
+        let mut d = doc.borrow_mut();
+        assert_eq!(d.wb.value(0, rows - 1, 1), before);
+        let mut slices = 0;
+        while d.settle() {
+            slices += 1;
+        }
+        assert!(slices > 0);
+        drop(d);
+        let d = doc.borrow();
+        let Value::Num(x) = d.wb.value(0, rows - 1, 1) else { panic!() };
+        let Value::Num(y) = before else { panic!() };
+        assert_eq!(x, 2.0 * y);
+        assert_ne!(src.cell(rows - 1, 1).unwrap().color, Some(pergola::theme::palette::neutral_400()));
     }
 
     fn v(doc: &Doc, r: u32, c: u32) -> Value {

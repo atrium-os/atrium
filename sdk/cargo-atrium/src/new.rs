@@ -56,12 +56,33 @@ const INDEXER: &[File] = &[
     ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/indexer/cargo-config.toml.tmpl")),
 ];
 
+const CLIENT: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/client/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/client/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/client/src/main.rs")),
+    ("src/lib.rs", "src/lib.rs", include_str!("../../templates/client/src/lib.rs")),
+    ("src/bin/parse.rs", "src/bin/parse.rs", include_str!("../../templates/client/src/bin/parse.rs")),
+    ("fuzz/seed.json", "fuzz/corpus/worker-parse/seed.json", include_str!("../../templates/client/fuzz/seed.json")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/client/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/client/cargo-config.toml.tmpl")),
+];
+
+const MEDIA: &[File] = &[
+    ("Cargo.toml.tmpl", "Cargo.toml", include_str!("../../templates/media/Cargo.toml.tmpl")),
+    ("atrium.toml.tmpl", "atrium.toml", include_str!("../../templates/media/atrium.toml.tmpl")),
+    ("src/main.rs", "src/main.rs", include_str!("../../templates/media/src/main.rs")),
+    ("gitignore.tmpl", ".gitignore", include_str!("../../templates/media/gitignore.tmpl")),
+    ("cargo-config.toml.tmpl", ".cargo/config.toml", include_str!("../../templates/media/cargo-config.toml.tmpl")),
+];
+
 /// (template, what it is, its files).
 pub const TEMPLATES: &[(&str, &str, &[File])] = &[
     ("app", "a window and nothing else: start here for an app that opens no files and uses no network", APP),
     ("c-app", "the same in C: a window on libatrium, a Makefile on atrium.app.mk (make, make run)", C_APP),
     ("viewer", "opens files the person picks and parses them in a worker with no capabilities (a BMP viewer)", VIEWER),
     ("indexer", "keeps one worker for the app's run and talks to it in messages (word counts of opened text)", INDEXER),
+    ("client", "fetches through Nuntius (net-fetch) and parses each response in a worker (a JSON Feed reader)", CLIENT),
+    ("media", "plays opened audio and video in the system's media player, embedded through Limen (no codecs in the app)", MEDIA),
 ];
 
 /// Where an SDK crate is in an Atrium checkout.
@@ -147,13 +168,13 @@ mod tests {
 
     #[test]
     fn worker_templates() {
-        for (t, worker) in [("viewer", "decode"), ("indexer", "index")] {
+        for (t, worker) in [("viewer", "decode"), ("indexer", "index"), ("client", "parse")] {
             let o = Opts { name: "my-app", template: t, id: None, sdk_path: None, registry: REGISTRY };
             let f = render(&o).unwrap();
             assert!(f.iter().all(|x| !x.1.contains("{{")), "{t}: unfilled placeholder");
             let bin = f.iter().find(|x| x.0 == format!("src/bin/{worker}.rs")).unwrap();
             assert!(bin.1.contains(&format!("atrium_worker::main!(my_app::workers::{worker});")), "{}", bin.1);
-            assert!(f.iter().any(|x| x.0 == format!("fuzz/corpus/worker-{worker}/seed") || x.0 == format!("fuzz/corpus/worker-{worker}/seed.bmp")));
+            assert!(f.iter().any(|x| x.0.starts_with(&format!("fuzz/corpus/worker-{worker}/seed"))));
             let m = &f.iter().find(|x| x.0 == "atrium.toml").unwrap().1;
             let (findings, _, _) = crate::check::manifest(m);
             assert!(findings.iter().all(|x| x.level != crate::check::Level::Error), "{t}: {findings:?}");

@@ -16,6 +16,10 @@ const ARCA_UID: u32 = 900;
 const VIEWER_UID: u32 = 1500;
 const PLAYER_UID: u32 = 1600;
 const SCRINIUM_UID: u32 = 1700;
+const SHARE_UID: u32 = 1800;
+const NOTES_UID: u32 = 1900;
+const W_SHEET: WindowToken = [8; 16];
+const W_NOTES: WindowToken = [9; 16];
 const W_PICKER: WindowToken = [7; 16];
 const W_APP: WindowToken = [1; 16];
 const W_OTHER: WindowToken = [2; 16];
@@ -62,9 +66,9 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert!(["org.example.viewer", "org.example.player", "org.example.map"].contains(&app), "{app}");
+        assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes"].contains(&app), "{app}");
         self.0.send((embed, ch)).unwrap();
-        Ok(if app == "org.example.player" { PLAYER_UID } else { VIEWER_UID })
+        Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
     fn end(&mut self, embed: EmbedId) { self.1.lock().unwrap().push(embed) }
 }
@@ -86,6 +90,8 @@ impl World {
             g.0.insert(W_ARCA, ARCA_UID);
             g.0.insert(W_VIEWER, VIEWER_UID);
             g.0.insert(W_PICKER, SCRINIUM_UID);
+            g.0.insert(W_SHEET, SHARE_UID);
+            g.0.insert(W_NOTES, NOTES_UID);
         }
         let (tx, rx) = mpsc::channel();
         let ended = Arc::new(Mutex::new(Vec::new()));
@@ -94,6 +100,7 @@ impl World {
             OTHER => Some(("ana".into(), "org.example.other".into())),
             ARCA_UID => Some(("ana".into(), catalogue::ARCA.into())),
             SCRINIUM_UID => Some(("ana".into(), catalogue::SCRINIUM.into())),
+            SHARE_UID => Some(("ana".into(), catalogue::SHARE.into())),
             _ => None,
         });
         let defaults = Box::new(|_: &str, role: &str| match role {
@@ -571,4 +578,80 @@ fn a_parent_embeds_only_the_roles_its_manifest_names() {
     let e = app.request("doc-viewer", W_APP).unwrap();
     let (spawned, _child) = w.spawned();
     assert_eq!(e, spawned);
+}
+
+#[test]
+fn a_share_target_is_only_ever_the_app_the_person_chose_in_the_parents_share_sheet() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use limen::share_target::{Body, Format, Item};
+    let w = World::new();
+    w.shared.set_target_check(Box::new(|person: &str, app: &str| person == "ana" && app == "org.example.notes"));
+    let mut app = w.parent(APP);
+    let mut other = w.parent(OTHER);
+    // No choice, no target: there is no default for this role.
+    assert_eq!(refused(app.request("share-target", W_APP)), refusal::NO_PROVIDER);
+    // Only the catalogue's share sheet provides `share`.
+    assert!(matches!(provider(w.connect(APP), "share"), Err(Error::Refused(r)) if r == refusal::NOT_PROVIDER));
+    let mut sheet = provider(w.connect(SHARE_UID), "share").unwrap();
+
+    let s = app.request("share", W_APP).unwrap();
+    assert_eq!(next_c(&mut sheet), ChildEvent::Attach { embed: s, role: "share".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    let open = limen::share::ToChild::Open(limen::share::Open { activation: [5; 16], title: "Lake".into(), mimes: vec!["image/png".into(), "text/plain".into()] });
+    app.send(s, open.encode()).unwrap();
+    assert_eq!(next_c(&mut sheet), ChildEvent::Message { embed: s, bytes: open.encode() });
+    sheet.ready(s, W_SHEET).unwrap();
+    app.place(s, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: s });
+    assert!(w.fresco.binds().iter().any(|b| b.1 == W_SHEET && b.2 == SlotKind::Sheet { w: 480, h: 400 }));
+
+    // Only the sheet chooses, only for its own embed, only a real target.
+    assert_eq!(refused(sheet.choose(s + 1000, "org.example.notes")), refusal::NOT_YOURS);
+    assert_eq!(refused(sheet.choose(s, "org.example.evil")), refusal::NOT_A_TARGET);
+    assert_eq!(refused(sheet.choose(s, "../org.example.notes")), refusal::NOT_A_TARGET);
+    let mut pretender = Child::wrap(w.connect(APP));
+    assert_eq!(refused(pretender.choose(s, "org.example.notes")), refusal::NOT_YOURS);
+
+    sheet.choose(s, "org.example.notes").unwrap();
+    sheet.emit(s, limen::share::ToParent::Chosen.encode()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed: s, bytes: limen::share::ToParent::Chosen.encode() });
+    app.detach(s).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Detached { embed: s });
+    // The choice is the app's: another app gets nothing from it.
+    assert_eq!(refused(other.request("share-target", W_OTHER)), refusal::NO_PROVIDER);
+
+    let t = app.request("share-target", W_APP).unwrap();
+    let (te, mut notes) = w.spawned();
+    assert_eq!(te, t);
+    assert_eq!(next_c(&mut notes), ChildEvent::Attach { embed: t, role: "share-target".into(), parent_app: "org.example.mail".into(), parent_uid: APP });
+    // Once: a second request finds no choice.
+    assert_eq!(refused(app.request("share-target", W_APP)), refusal::NO_PROVIDER);
+
+    let item = Item { title: "Lake".into(), formats: vec![
+        Format { mime: "image/png".into(), body: Body::Fd { size: 9 } },
+        Format { mime: "text/plain".into(), body: Body::Inline(b"Lake".to_vec()) },
+    ] };
+    let path = std::env::temp_dir().join(format!("limen-share-{}", std::process::id()));
+    std::fs::write(&path, b"png bytes").unwrap();
+    let f = std::fs::File::open(&path).unwrap();
+    app.send(t, limen::share_target::ToChild::Share(item.clone()).encode()).unwrap();
+    app.send_fd(t, limen::share_target::ToChild::Part { index: 0 }.encode(), f.as_fd()).unwrap();
+    let ChildEvent::Message { bytes, .. } = next_c(&mut notes) else { panic!() };
+    assert_eq!(limen::share_target::ToChild::decode(&bytes), Some(limen::share_target::ToChild::Share(item)));
+    let ChildEvent::MessageFd { bytes, .. } = next_c(&mut notes) else { panic!() };
+    assert_eq!(limen::share_target::ToChild::decode(&bytes), Some(limen::share_target::ToChild::Part { index: 0 }));
+    let mut got = String::new();
+    std::fs::File::from(notes.take_fd().unwrap()).read_to_string(&mut got).unwrap();
+    assert_eq!(got, "png bytes");
+    // A writable descriptor is refused.
+    let rw = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    assert_eq!(refused(app.send_fd(t, limen::share_target::ToChild::Part { index: 0 }.encode(), rw.as_fd())), refusal::BAD_FD);
+
+    notes.ready(t, W_NOTES).unwrap();
+    app.place(t, RECT).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Attached { embed: t });
+    assert!(w.fresco.binds().iter().any(|b| b.1 == W_NOTES && b.2 == SlotKind::Sheet { w: 560, h: 440 }));
+    notes.emit(t, limen::share_target::ToParent::Accepted.encode()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed: t, bytes: limen::share_target::ToParent::Accepted.encode() });
+    let _ = std::fs::remove_file(&path);
 }

@@ -1251,7 +1251,9 @@ fn create_routed(
 /// §6.4). The validator has checked device and mountpoint against the pin.
 /// Returns the two descriptors for the child's fd 3 and fd 4. A share
 /// server's mount has no device (the validator allows that only for
-/// `[share_servers]`): then the child gets `/dev/fuse` alone, as fd 3.
+/// `[share_servers]`): then the child gets `/dev/fuse` alone, as fd 3. A
+/// trusted stick's server gets the stick's mount, a directory, in the
+/// partition's place.
 fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(Option<OwnedFd>, OwnedFd), JaildError> {
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
@@ -1259,7 +1261,11 @@ fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(Option<OwnedFd>, Owne
     if let Err(e) = ffi::kld_ensure("fusefs") {
         warn!("jaild: kldload fusefs: {e} (the mount will say whether it matters)");
     }
-    let dev = if f.device.is_empty() {
+    let dev = if !f.root_dir.is_empty() {
+        // A trusted stick's server ([stick_servers]): the stick's own mount,
+        // as a directory descriptor, and only if it is one.
+        Some(stick_root(&f.root_dir)?)
+    } else if f.device.is_empty() {
         None
     } else {
         Some(std::fs::OpenOptions::new()
@@ -1279,11 +1285,35 @@ fn fuse_prepare(f: &crate::protocol::FuseServe) -> Result<(Option<OwnedFd>, Owne
         Err(e) => return Err(sys("mkdir mountpoint", e)),
     }
     use std::os::unix::io::AsRawFd;
-    let fsname = if f.device.is_empty() { "capsa-share".to_string() } else { format!("capsa:{}", f.device) };
+    let fsname = if !f.root_dir.is_empty() {
+        format!("capsa-stick:{}", f.root_dir.rsplit('/').next().unwrap_or(""))
+    } else if f.device.is_empty() {
+        "capsa-share".to_string()
+    } else {
+        format!("capsa:{}", f.device)
+    };
     ffi::fusefs_mount(&f.mountpoint, fusefd.as_raw_fd(), f.read_only, &fsname)
         .map_err(|e| sys("nmount fusefs", e))?;
     info!("jaild: fusefs on {} for {}{}", f.mountpoint, fsname, if f.read_only { " (ro)" } else { "" });
     Ok((dev.map(OwnedFd::from), OwnedFd::from(fusefd)))
+}
+
+/// Open `dir` for a trusted stick's server: it must be the root of a
+/// Tessera mount (the kernel's, of a sealed stick), and nothing on the way
+/// may be a link. The server reaches what this descriptor reaches.
+fn stick_root(dir: &str) -> Result<std::fs::File, JaildError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let refuse = |detail: String| JaildError::PolicyViolation { rule: "fuse.root_dir", detail };
+    let d = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(|e| refuse(format!("{dir}: {e}")))?;
+    match ffi::fs_of_fd(&d) {
+        Some((fstype, on)) if fstype == "tessera" && on == dir => Ok(d),
+        Some((fstype, on)) => Err(refuse(format!("{dir} is not a Tessera mount's root ({fstype} on {on})"))),
+        None => Err(refuse(format!("{dir}: fstatfs failed"))),
+    }
 }
 
 fn handle_create_with_exec(

@@ -14,6 +14,38 @@ enum Op {
     Ge,
 }
 
+/// What an equality criterion compares by (see [`Criterion::eq_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Key {
+    /// An empty cell or empty text.
+    Empty,
+    Bool(bool),
+    Num(u64),
+    Text(String),
+}
+
+impl Key {
+    fn num(x: f64) -> Key {
+        Key::Num(if x == 0.0 { 0 } else { x.to_bits() })
+    }
+
+    /// The key of a cell's value: numbers and text that reads as a number by
+    /// value, other text case-folded; errors have none.
+    pub fn of(v: &Value) -> Option<Key> {
+        match v {
+            Value::Empty => Some(Key::Empty),
+            Value::Str(s) if s.is_empty() => Some(Key::Empty),
+            Value::Bool(b) => Some(Key::Bool(*b)),
+            Value::Num(x) => (!x.is_nan()).then(|| Key::num(*x)),
+            Value::Str(s) => match super::parse_number(s) {
+                Some(x) if !x.is_nan() => Some(Key::num(x)),
+                _ => Some(Key::Text(s.chars().flat_map(char::to_lowercase).collect())),
+            },
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Criterion {
     op: Op,
@@ -59,6 +91,22 @@ impl Criterion {
                 Criterion { op, num, text: rest.to_string(), wild, boolean }
             }
         }
+    }
+
+    /// The one key a cell must have to match, when this criterion is plain
+    /// equality (no wildcards): matching is then
+    /// `key(cell) == Some(self.eq_key())`, which lets a range be indexed once.
+    pub fn eq_key(&self) -> Option<Key> {
+        if !matches!(self.op, Op::Eq) || self.wild {
+            return None;
+        }
+        if let Some(b) = self.boolean {
+            return Some(Key::Bool(b));
+        }
+        if let Some(n) = self.num {
+            return (!n.is_nan()).then(|| Key::num(n));
+        }
+        Some(if self.text.is_empty() { Key::Empty } else { Key::Text(self.text.chars().flat_map(char::to_lowercase).collect()) })
     }
 
     /// Whether an empty cell can match (so callers walking only stored cells know to

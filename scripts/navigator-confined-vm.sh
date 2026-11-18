@@ -145,6 +145,7 @@ if [ "${BUILD:-1}" = 1 ]; then
     xb navigatord "--bin navigatord"
     xb monstrator "--bin monstratord --example monctl --example link-probe"
     xb tabula "--bin tabulad"
+    xb opifex-sheet "--bin opifex-sheetd"
     xb atrium-open "--example open-probe"
 fi
 
@@ -162,6 +163,10 @@ g "P=/etc/atrium/jaild.policy.toml
 allow_rctl = true
 ' \$P
     else printf '\n[resource_control]\nallow_rctl = true\n' >> \$P; fi
+    # The install sheet's socket directory for atrium-app: links (etc/jaild.policy.toml).
+    grep -q '\"/atrium/sockets/opifex-sheet\"' \$P || sed -i '' '/\"\/atrium\/sockets\/fresco-activation\",/a\\
+    \"/atrium/sockets/opifex-sheet\",
+' \$P
     # Tabula's socket directory for monstratord's Copy address (etc/jaild.policy.toml).
     grep -q '\"/atrium/sockets/clipboard\"' \$P || sed -i '' '/\"\/atrium\/sockets\/fresco-activation\",/a\\
     \"/atrium/sockets/clipboard\",
@@ -183,6 +188,7 @@ for b in "$ROOT/frescod/target/$R/frescod" "$ROOT/frescod/target/$R/fresco-rende
          "$ROOT/scripts/navigator-broker-bundle.sh" "$ROOT/scripts/navigator-ui-bundle.sh" "$FIX/ca.pem" \
          "$ROOT/monstrator/target/$R/monstratord" "$ROOT/monstrator/target/$R/examples/monctl" \
          "$ROOT/monstrator/target/$R/examples/link-probe" "$ROOT/tabula/target/$R/tabulad" \
+         "$ROOT/opifex-sheet/target/$R/opifex-sheetd" "$ROOT/portcullis/target/$R/opifexd" "$ROOT/portcullis/target/$R/opifex-check" \
          "$ROOT/atrium-open/target/$R/examples/open-probe" "$ROOT/scripts/monstrator-service.sh" \
          "$ROOT/monstrator/etc/services.d/38-atrium-monstratord.toml" \
          "$ROOT/portcullis/target/$R/atrium-portcullisd-bootstrap"; do
@@ -260,6 +266,18 @@ g "set -e
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/linkprobe-bundle/atrium.toml.sig /root/linkprobe-bundle/atrium.toml
     opifex install /root/linkprobe-bundle
     portcullis policy grant --system org.test.linkprobe
+    # The same probe, asking for atrium-app://org.atrium.l5hello, an app
+    # that is only in the catalog (opening-links.md §4.3, L5).
+    rm -rf /root/appprobe-bundle && mkdir -p /root/appprobe-bundle/bin && cp $D/link-probe /root/appprobe-bundle/bin/
+    echo atrium-app://org.atrium.l5hello > /root/appprobe-bundle/link-probe.url
+    printf '[app]\nid = \"org.test.appprobe\"\nname = \"App probe\"\nversion = \"1\"\nentry = \"bin/link-probe\"\n\n[capabilities]\ngraphics = \"fresco\"\nopen-uri = true\n' > /root/appprobe-bundle/atrium.toml
+    openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/appprobe-bundle/atrium.toml.sig /root/appprobe-bundle/atrium.toml
+    opifex install /root/appprobe-bundle
+    portcullis policy grant --system org.test.appprobe
+    # The install sheet's users and socket directory (opifex-sheet-service.sh).
+    id _opifexsheet >/dev/null 2>&1 || pw useradd _opifexsheet -u 65042 -d /nonexistent -s /usr/sbin/nologin -c 'Opifex install sheet'
+    id _opifex >/dev/null 2>&1 || pw useradd _opifex -u 65041 -d /nonexistent -s /usr/sbin/nologin -c 'Opifex worker'
+    install -d -o _opifexsheet -m 0755 /atrium/sockets/opifex-sheet
     sh $D/monstrator-service.sh $D/monstratord $D/38-atrium-monstratord.toml" > "$OUT.bundles.log" 2>&1 \
     || die "bundles: $(tail -5 "$OUT.bundles.log")"
 for a in org.test.mail:open-probe org.test.mail2:open-probe org.atrium.navigator:navigatord org.atrium.navigator.ui:navigator-ui $PAGE_ID:navigator-page $CONV_ID:prerender $FETCH_ID:navigator-fetchd org.atrium.fresco.renderer:fresco-renderer; do
@@ -318,7 +336,7 @@ MON=$(g "ps -o jid= -o uid= -p \$(pgrep -f atrium-monstratord | head -1)" | tr -
 MJID=${MON%% *}; MUID=${MON#* }
 [ -n "$MJID" ] && [ "$MJID" != 0 ] && [ "$MUID" = 65038 ] && ok "monstratord runs in a jail (jid $MJID) as _monstrator (65038)" || bad "monstratord: '$MON' $(g "tail -3 $S/bootstrap.log")"
 MM=$(g "mount -p | awk '{print \$2}' | grep '/jails/monstratord/atrium/sockets' | sed 's#.*/atrium/sockets/#sockets/#' | sort | tr '\n' ' '" | tr -d '\r')
-[ "$MM" = "sockets/clipboard sockets/fresco sockets/fresco-activation sockets/monstrator sockets/portcullis " ] && ok "its jail reaches its own socket, portcullisd's, frescod's two and Tabula's, no other" || bad "monstratord's socket mounts: '$MM'"
+[ "$MM" = "sockets/clipboard sockets/fresco sockets/fresco-activation sockets/monstrator sockets/opifex-sheet sockets/portcullis " ] && ok "its jail reaches its own socket, portcullisd's, frescod's two, Tabula's and the install sheet's, no other" || bad "monstratord's socket mounts: '$MM'"
 # A services.d jail without network: no addresses at all (ip4 and ip6
 # disabled), or a stack of its own.
 MN=$(g "jls -n -j ${MJID:-0} ip4 ip6 vnet 2>&1" | tr -d '\r')
@@ -613,6 +631,69 @@ i=0; while [ $i -lt 60 ] && ! g "grep -q 'a link sent from personal' $WL"; do sl
 g "grep -q 'navigator-ui: a link sent from personal: a new trail, anonymous' $WL" && ok "…and the Work window opened it in a new trail, anonymous" || bad "Work anonymous: $(g "grep -h -e 'sent from' -e 'link from' $WL | tail -2" | tr '\n' ';')"
 sleep 5
 shot confined-9-into-work
+
+echo "=== atrium-app: an app that isn't installed (L5)"
+# A catalog signed with test keys (as vm-opifex-c3-check.sh), opifexd and
+# the install sheet as _opifexsheet. App probe asks for
+# atrium-app://org.atrium.l5hello: Monstrator asks the install sheet for it,
+# Install on the sheet installs it, and portcullisd opens it.
+L5=$S/l5; L5ID=org.atrium.l5hello; ARCHN=$(echo "$TARGET" | cut -d- -f1); [ "$ARCHN" = x86_64 ] && ARCHN=amd64
+g "pkill -x opifex-sheetd; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; rm -rf $L5 /var/lib/atrium/apps/$L5ID; mkdir -p $L5; chmod 755 $L5
+   install -m 0755 $D/opifexd /usr/local/sbin/opifexd; install -m 0755 $D/opifex-sheetd /usr/local/bin/opifex-sheetd
+   mkdir -p /usr/local/libexec; install -m 0755 $D/opifex-check /usr/local/libexec/opifex-check"
+g 'sh -s' > "$OUT.l5.log" 2>&1 <<EOS
+set -e
+cd $L5
+for k in root1 root2 catalog platform; do
+  openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out \$k.pem
+  openssl ec -in \$k.pem -pubout -out \$k.pub 2>/dev/null
+done
+{
+  echo 'schema = "atrium-catalog-root/1"'; echo 'name = "Atrium"'; echo 'version = 1'
+  echo 'expires = 4000000000'; echo 'threshold = 2'
+  for k in root1 root2; do printf '\n[[key]]\npem = """%s"""\nroles = ["root"]\n' "\$(cat \$k.pub)"; done
+  printf '\n[[key]]\npem = """%s"""\nroles = ["catalog"]\n' "\$(cat catalog.pub)"
+  printf '\n[[key]]\npem = """%s"""\nroles = ["platform"]\nprefixes = ["org.atrium."]\nkinds = ["app"]\n' "\$(cat platform.pub)"
+} > root.toml
+mkdir -p cat /etc/atrium/opifex
+cp root.toml cat/root.toml; cp root.toml /etc/atrium/opifex/root.toml
+opifex catalog root-sign cat --key root1.pem --pub root1.pub >/dev/null
+opifex catalog root-sign cat --key root2.pem --pub root2.pub >/dev/null
+mkdir -p b/bin; cp /bin/echo b/bin/hello
+printf '[app]\nid = "$L5ID"\nname = "L5 hello"\nversion = "1.0"\nentry = "bin/hello"\ndescription = "Says hello"\n' > b/atrium.toml
+opifex pack b --sign platform.pem >/dev/null
+opifex archive b 1.0.insula >/dev/null
+opifex catalog add cat b --arch $ARCHN --archive 1.0.insula --url https://example.org/1.0.insula >/dev/null
+opifex catalog head cat --key catalog.pem >/dev/null
+mkdir -p /var/db/atrium/opifex/dl; cp 1.0.insula /var/db/atrium/opifex/dl/\$(sha256 -q 1.0.insula).insula
+(OPIFEX_SOCKET=$L5/opifex.sock /usr/local/sbin/opifexd > $L5/opifexd.log 2>&1 &)
+sleep 1
+OPIFEX_SOCKET=$L5/opifex.sock opifex sync cat >/dev/null
+chmod 666 $L5/opifex.sock
+EOS
+[ $? = 0 ] && ok "a catalog with $L5ID, and opifexd" || bad "catalog: $(tail -3 "$OUT.l5.log" | tr '\n' ';')"
+g "rm -f /atrium/sockets/opifex-sheet/opifex-sheet.sock
+   cd $S && daemon -f -u _opifexsheet -o $L5/sheet.log env OPIFEX_SHEET_SOCKET=/atrium/sockets/opifex-sheet/opifex-sheet.sock OPIFEX_SOCKET=$L5/opifex.sock \
+   OPIFEX_SHEET_ACTIVATION=$AS FRESCO_SOCKET=$FS /usr/local/bin/opifex-sheetd </dev/null"
+i=0; while [ $i -lt 20 ] && ! g "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock"; do sleep 1; i=$((i+1)); done
+g "test -S /atrium/sockets/opifex-sheet/opifex-sheet.sock" && ok "the install sheet is up" || bad "opifex-sheetd: $(g "tail -3 $L5/sheet.log")"
+g "cd $S && daemon -f -o $S/appprobe.log -u navtest /usr/local/bin/portcullis launch --no-prompt org.test.appprobe </dev/null"
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'link-probe: up' $S/appprobe.log"; do sleep 3; i=$((i+3)); done
+sleep 10
+key 0x28                  # Enter in App probe's window: open the link
+i=0; while [ $i -lt 60 ] && ! g "grep -q 'asking about' $L5/sheet.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'not installed: to install first' $PL" && ok "portcullisd: $L5ID isn't installed, so it is to be installed first" || bad "grant: $(g "grep -h 'atrium-app' $PL | tail -2; tail -2 $ML" | tr '\n' ';')"
+g "grep -q 'asking about $L5ID' $L5/sheet.log" && ok "Monstrator asked the install sheet, which shows" || bad "no install sheet: $(g "tail -3 $L5/sheet.log; tail -2 $ML; tail -2 $S/appprobe.log" | tr '\n' ';')"
+sleep 5
+shot confined-10-install
+key 0x52; key 0x28        # Up to Install, Enter
+i=0; while [ $i -lt 90 ] && ! g "grep -q -e 'link-probe: opened' -e 'link-probe: not opened' $S/appprobe.log"; do sleep 3; i=$((i+3)); done
+g "grep -q 'link-probe: opened' $S/appprobe.log" && ok "Install on the sheet, then the link opened" || bad "L5: $(g "tail -2 $S/appprobe.log; tail -2 $ML; tail -2 $L5/sheet.log" | tr '\n' ';')"
+AP=$(g "awk '\$3 == \"org.test.appprobe\" {print \$1}' /var/run/atrium/app-registry | tail -1" | tr -d '\r')
+g "grep -q '$L5ID for uid $AP (asked by uid 65038): Installed' $L5/sheet.log" && ok "…installed for App probe (uid $AP), asked by Monstrator" || bad "sheet: $(g "tail -2 $L5/sheet.log" | tr '\n' ';')"
+g "test -x /var/lib/atrium/apps/$L5ID/bin/hello" && ok "$L5ID is installed" || bad "not installed: $(g "tail -3 $L5/opifexd.log" | tr '\n' ';')"
+g "grep -q '$L5ID opened from org.test.appprobe for navtest' $PL" && ok "…and portcullisd opened it" || bad "open: $(g "grep -h '$L5ID' $PL | tail -2" | tr '\n' ';')"
+g "pkill -x link-probe; pkill -x opifex-sheetd; pkill -x opifexd; OPIFEX_SOCKET=/nonexistent opifex uninstall $L5ID >/dev/null 2>&1; true"
 
 echo "=== end"
 g "pkill -x open-probe; pkill -f atrium-portcullisd-bootstrap; sleep 3; true"

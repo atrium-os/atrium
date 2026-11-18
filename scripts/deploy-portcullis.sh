@@ -117,8 +117,8 @@ scp $SSHOPT -P 2222 "$BSD/etc/atrium.devfs.rules" root@localhost:/root/atrium.de
         install -m 644 /root/atrium.devfs.rules /usr/local/etc/atrium/devfs.rules &&
         sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null &&
         service devfs restart >/dev/null &&
-        for id in 20 21 22; do [ -n "$(devfs rule -s $id show)" ] || exit 1; done' >/dev/null 2>&1 \
-  && echo "  rulesets 20 21 22 loaded" || { echo "  devfs rulesets FAILED to load"; rc=1; }
+        for id in 20 21 22 33; do [ -n "$(devfs rule -s $id show)" ] || exit 1; done' >/dev/null 2>&1 \
+  && echo "  rulesets 20 21 22 33 loaded" || { echo "  devfs rulesets FAILED to load"; rc=1; }
 echo "=== pf isolation -> /usr/local/etc/atrium/pf.conf ==="
 # ★★ Before any daemon starts: jaild refuses a networked jail unless these
 # rules are loaded (network.md §0) — without them an app reached the host.

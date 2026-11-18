@@ -11,6 +11,7 @@ pub mod arrays;
 pub mod criteria;
 pub mod dates;
 pub mod funcs;
+pub mod ifcache;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;

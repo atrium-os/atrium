@@ -233,6 +233,12 @@ impl Child {
         }
     }
 
+    /// The share sheet only: the person chose `app` as the target for the
+    /// parent of `embed` (a `share` embed this connection serves).
+    pub fn choose(&mut self, embed: EmbedId, app: &str) -> Result<(), Error> {
+        self.0.ok(op::CHOOSE, &proto::Choose { embed, app: app.into() })
+    }
+
     /// Ask for picture-in-picture (`on`) or to go back into the slot.
     pub fn pip(&mut self, embed: EmbedId, on: bool, aspect: [u32; 2]) -> Result<(), Error> {
         self.0.ok(op::PIP, &proto::Pip { embed, on, aspect })

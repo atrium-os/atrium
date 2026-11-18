@@ -27,6 +27,11 @@ clipboard contents. What they share is unified instead, so each piece exists onc
 So the share broker is Tabula's offer store plus a chooser drawn by Forum (trusted UI): a share
 is a drop whose target the user picked in the chooser, and it spends the same tokens.
 
+As built (2026-11-18, [share-sheet.md](share-sheet.md)): the chooser is the share sheet, a
+Limen system role drawn by `share-sheet` as `_share` in a frescod `Sheet` slot (the picker's
+trusted path), which spends the app's press as `SHARE`; the item goes straight from the app to
+the chosen app over Limen (`share-target`), not through a store, so nothing is kept.
+
 ## 1. The rule
 
 An app touches the clipboard only on a real user gesture in one of its own windows. Copy, cut,

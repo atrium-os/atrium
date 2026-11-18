@@ -365,6 +365,12 @@ pub struct FuseServe {
     /// (device-assignment.md §4.8).
     #[serde(default)]
     pub control:    bool,
+    /// Instead of a device: a directory on the host, a trusted stick's
+    /// Tessera mount (`/media/<part>`), which jaild opens and hands over as
+    /// fd 3, so the server reaches that tree and nothing else
+    /// (`[stick_servers]` only, tessera-encryption.md §7.2a). Empty: none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub root_dir:   String,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host

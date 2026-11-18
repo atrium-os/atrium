@@ -16,11 +16,13 @@ install -d -m 0755 /atrium/sockets
 install -d -o _monstrator -g _monstrator -m 0755 /atrium/sockets/monstrator
 # Tabula's (tabulad binds clipboard.sock there): Copy address.
 install -d -m 0755 /atrium/sockets/clipboard
+# The install sheet's (opifex-sheet-service.sh owns it): atrium-app: links.
+[ -d /atrium/sockets/opifex-sheet ] || install -d -m 0755 /atrium/sockets/opifex-sheet
 install -m 0755 "$D" /usr/local/bin/atrium-monstratord
 HERE=$(dirname "$0")/..
 install -d /etc/atrium/services.d
 M=${2:-$HERE/monstrator/etc/services.d/38-atrium-monstratord.toml}
 install -m 0644 "$M" /etc/atrium/services.d/38-atrium-monstratord.toml
 R=/var/lib/atrium/jails/monstratord
-for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/monstrator atrium/sockets/portcullis atrium/sockets/fresco atrium/sockets/fresco-activation atrium/sockets/clipboard; do [ -d "$R/$d" ] || install -d "$R/$d"; done
+for d in dev libexec lib usr/lib usr/local/bin atrium/sockets/monstrator atrium/sockets/portcullis atrium/sockets/fresco atrium/sockets/fresco-activation atrium/sockets/clipboard atrium/sockets/opifex-sheet; do [ -d "$R/$d" ] || install -d "$R/$d"; done
 echo "monstrator-service: commissioned. Restart atrium-portcullisd-bootstrap (or run it) to start atrium-monstratord."

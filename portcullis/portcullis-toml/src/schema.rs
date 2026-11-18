@@ -95,6 +95,21 @@ pub struct RolesSection {
     /// Roles it provides (limen.md §3.1): `share-target`, `doc-viewer`, ...
     #[serde(default)]
     pub implements: Vec<String>,
+    /// `[roles.share-target]`: what the app takes when it is chosen in the
+    /// share sheet (share-sheet.md §4).
+    #[serde(rename = "share-target")]
+    pub share_target: Option<ShareTargetSection>,
+}
+
+/// `[roles.share-target]`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareTargetSection {
+    /// Media types it takes: `text/plain`, a family (`image/*`) or
+    /// anything (`*/*`). Without the section an app that implements the
+    /// role takes anything; with it, only these.
+    #[serde(default)]
+    pub mime: Vec<String>,
 }
 
 /// `[ipc]`: service names with a version, `com.example.photos.library/1`.

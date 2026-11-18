@@ -346,6 +346,12 @@ can declare (limen.md §2.0). The sheet shows:
 - *Install* · *Not now*. *Try it* appears only once `[trial]` exists in portcullis-toml
   (decision 10).
 
+*Asking for another app, as built 2026-11-18 (opening-links.md L5):* `Ask::Install` has an
+optional `for_uid`, the app the install is asked for. opifex-sheetd takes it only from the uids
+in `OPIFEX_SHEET_FOR_OTHERS` (default `_monstrator`, 65038) and answers anyone else `Failed`;
+the declines, the one-at-a-time rule and opifexd's `InstallApproved.for_uid` are then that
+app's, not Monstrator's. A line without it reads as before.
+
 ### 7.2 The steps
 
 ```
@@ -745,14 +751,17 @@ font on demand and a driver from a `nobody` device's notice.
   needs `PRAECO_SYSTEM_POSTERS=0:Updates` (opifexd is root).
 - `opifex updates`, `opifex update-care <id> notify|auto`, `opifex tick`.
 - Not yet: Curia's Updates page (Curia's owner: it reads `Updates` and sends the person to the
-  sheet for an ask); a VM run of the daily round with praecod; batched admin approval for
+  sheet for an ask); batched admin approval for
   platform kinds (C6, with the kinds); **key rotation and recovery move to C7**, where
   publisher keys other than the platform's first appear: until then the only publisher is
   the platform key, which rotates through `root.toml` (2-of-3).
 - Checked: host tests (unit tests of `decide` and the notice; `updates_and_the_daily_round`:
   a background update, a `notify` release waiting and announced once, added capabilities
   asked with `added` on `Describe`, more care set and cleared, only root or the installer may
-  set it, only root may tick); the sheet's update lines.
+  set it, only root may tick); the sheet's update lines. VM gate
+  `scripts/vm-opifex-c5-check.sh` 0 failed on the Mac VM (2026-11-18, 21327c4): the daily round
+  through the fetcher's file mode, one notice taken by a real praecod as "Updates", none on a
+  second round, and praecod refusing opifexd when its uid isn't a listed poster.
 
 ### 14.7 C6 as built (2026-11-18)
 
@@ -811,7 +820,14 @@ font on demand and a driver from a `nobody` device's notice.
   node to the request's uid). opifex refuses a driver file with another ruleset, a uid
   outside the range or not equal to its gid, another jail name, or a uid another installed
   driver has. The VM gate checks the driver's jail starts and runs as its uid once this
-  tree's jaild, policy and devfs rules are deployed (not yet run).
+  tree's jaild, policy and devfs rules are deployed. Rerun 2026-11-18 with ruleset 33
+  loaded: jaild then refused dispensatord's read-only mount of the driver's package folder
+  (read-only sources were exact paths only). Fixed in jaild: `[mount_sources] ro_subtrees`
+  takes a folder directly inside a listed one, never the listed folder itself, so a driver
+  sees only its own package (`/usr/local/libexec/atrium/drivers/`). Rerun the same day with
+  that jaild: **0 failed** (31 checks); jaild started the driver's jail
+  (`atrium-driver-c6mtp-0-2-0` via `ugen0.2,usb/0.2.0`) and it runs as its uid. (The
+  `jid 0` in dispensatord's line is jaild's sentinel for exec'd jails, not a failure.)
 - opifex checks a driver's `devices.d` file together with the installed ones through
   `dispensator::rules`, so one bad package can't stop dispensatord from loading every rule.
 - Not yet: frescod drawing an installed CJK font from the catalog (the fonts thread checked
@@ -824,6 +840,121 @@ font on demand and a driver from a `nobody` device's notice.
   from the catalog, devices.idx after sync, the sheet refused for it, uninstall; rule
   coverage; firmware placement; lookups; dispensator's planner offering a catalog driver for
   a nobody device).
+
+### 14.8 C7 as built (2026-11-18)
+
+- **Publisher records** (`opifex-catalog/src/publisher.rs`): log entries of type
+  `publisher` with an action. `register` gives a stable id (`pub:` + the first 16 hex of
+  its key's id), a name, domains (lowercase host names; prefixes are the reversed domains),
+  kinds and a key; it is signed by that key. `rotate` names a new key, signed by the current
+  and the new key; a past key never comes back. `scope` changes name, domains or kinds,
+  signed by the current key. `recover` replaces a lost key, signed by the catalog's
+  root-key threshold and the new key, and counts a recovery. No two publishers share a key
+  or a domain. A release may name a `publisher`; its signer must be that publisher's
+  current key, the id in its prefixes, the kind in its kinds. A publisher's current key
+  yanks any of its releases. Publishers keep past keys' PEMs (`past_keys`), so a tree
+  signed before a rotation still checks.
+- **Third-party catalogs**: the machine decides by location (the system's catalog in
+  `catalog/`, the others in `catalogs/<slug>/`), never by what a catalog says. A
+  third-party catalog carries apps only, never `org.atrium.`, never `devices`, and
+  releases only through publisher records (`Scope`, `Client::third_party`,
+  `Log::third_party`). `Log::append` replays the log exactly as a machine does
+  (`Log::replay`).
+- **Following catalogs** (`opifex/src/catalogs.rs`): `catalogs/<slug>/` holds the client
+  state, `source.toml` (URL, the approved root.toml's sha256, for everyone or for the
+  person who added it, who, when) and `proofs.toml`. The slug is the host name (`-2`,
+  `-3` for more on one host), and the installed record's source is `catalog:<slug>`, which
+  has a dot, so it never meets the Atrium catalog's `catalog:Atrium`. `Describe`, `Search`
+  and installs look in the catalog an id came from if it is installed (never replaced from
+  another), else the Atrium catalog, then the person's other catalogs in order. A
+  catalog someone adds for themselves is seen by them only.
+- **Domain proofs, per machine**: after each sync of an added catalog, opifexd checks every
+  publisher domain it hasn't checked yet: the TXT record `_atrium-publisher.<domain>`
+  through Nuntius (opifex-fetch's new `Txt` ask, `nuntius::Lookup`), else
+  `https://<domain>/.well-known/atrium-publisher`, either holding the line
+  `atrium-publisher pub:…`. The proof names the publisher id, so a rotation needs no new
+  proof; a domain added by `scope` does. A release is offered only once the domain whose
+  prefix holds its id is proven; proofs of domains a publisher dropped are forgotten.
+- **Two fetchers**: the Atrium catalog keeps `org.atrium.opifex.fetch`, narrowed to its
+  hosts. Everything else (added catalogs, their archives, proofs, WebAuthn files) goes
+  through `org.atrium.opifex.fetch-any`, the same binary with `net-fetch` to any https host
+  (`scripts/opifex-fetch-bundle.sh --any`; `OPIFEX_FETCH_ANY`). Neither is trusted for
+  anything it brings.
+- **opifexd requests**: `Catalogs`; `PreviewCatalog { url }` (anyone: name, root.toml
+  sha256, the warning); `AddCatalog { url, root_sha256, machine, for_uid }` (from the sheet
+  for one person, `machine` only from root), refused if root.toml changed since the
+  preview, undone if the first sync fails; `RemoveCatalog { slug }` (root, or the person
+  who added it): the catalog's apps stay installed and their updates stop. A full `Sync`
+  syncs every followed catalog and reports each in `others`; an Atrium failure no longer
+  stops the others. `Describe { id, for_uid }`: the sheet describes as the person sees it.
+  Described gains `publisher_name`, `publisher_domains`, `third_party`, `recovered`.
+- **Updates**: the installed record keeps the publisher id, so a rotated key updates as the
+  same publisher; after a recovery (record's `recoveries` behind the publisher's) the next
+  update asks on the sheet even with nothing new asked for (§7.7), with "its publisher's
+  key was replaced by a recovery".
+- **The sheet** (`opifex-sheet`): `Ask::AddCatalog { url }` (`opifex_sheet::add_catalog`)
+  shows "Add the catalog <name>?", its address, the warning (marked), "Its apps will be
+  offered to you only", and its keys' hash; a counted press on Add follows exactly that
+  root.toml for the asker (`Answer::Added`). An app from an added catalog names its
+  publisher and proven domains and says "Atrium has not reviewed this catalog's apps."; an
+  update after a recovery is marked.
+- **Running a catalog** (`opifex catalog …`): `init` (root keys, a catalog key, a root.toml
+  signed by the threshold, a first head), `register` (prints the TXT and `.well-known`
+  lines), `publisher rotate|scope|recover`, `publishers`, `publish` (= `head`); `add` finds
+  a publisher by its signature; a catalog with no platform key is handled as a third
+  party's by the tools (`Log::for_dir`). The `catalog-repo` template, its workflow and
+  `publish.sh` are the recipe for anyone (README, "Running a catalog of your own").
+  CLI for machines: `opifex catalogs | follow <url> [<sha> [--everyone]] | unfollow <slug>`.
+- **WebAuthn RP ids** (`opifex/src/rp.rs`, §7.3): an app's `identity.webauthn` RP ids are
+  each checked against `https://<rp>/.well-known/atrium-apps` (lines `<publisher> <app id>`:
+  the publisher id, or the platform key's id), at most 8; the ones that name the app go
+  into the record's `verified_rps`, the rest are dropped and logged.
+- Checked: host tests (publisher lifecycle and refusals in `opifex-catalog`; opifexd end to
+  end with an added catalog served through the fetcher: preview, add from the sheet,
+  visibility per person, an unproven publisher's app never offered, install for the person,
+  a WebAuthn RP verified and one dropped, a rotation updating in the background, a recovery
+  asking, removal keeping the app; the sheet's lines and its add-a-catalog decision; TXT
+  answers in the fetcher; jaild's `ro_subtrees` refusals); the publishing tools run by hand
+  (init, register, add, publish, rotate, a past key refused, sync). VM gate
+  `scripts/vm-opifex-c7-check.sh` 0 failed on the Mac VM (2026-11-18, 56c424a): a third-party
+  catalog made with `opifex catalog init`, followed after its preview, a proven publisher's app
+  offered and installed for one person, an unproven publisher's never offered, WebAuthn RPs
+  verified, rotation and recovery, a forged entry refused with the copy unchanged.
+- Not yet: launch trust for apps from added catalogs (portcullis-trust's gate knows only
+  `/etc/atrium/publishers`; reading opifexd's record and the publisher's keys is the
+  platform thread's, told 2026-11-18); Sigillum reading `verified_rps` and keying private
+  RPs on the publisher id; Curia's add-a-catalog page and a link that opens the sheet
+  (both call `opifex_sheet::add_catalog`); per-persona catalogs (personas.md, later);
+  atrium-ax coverage in the publishing check, which needs an ax measurement tool that
+  doesn't exist yet (atrium-ax.md §5.3).
+
+### 14.9 Root keys on hardware tokens (2026-11-18)
+
+- `portcullis-token`: a key on a PKCS#11 token (YubiKey PIV through Yubico's `libykcs11`,
+  Nitrokey or any module, loaded at run time) signs with ECDSA P-256 over the SHA-256 digest;
+  the signature is checked against the token's public key before use and comes out in the
+  same DER form as a PEM key's. A small **key file** names the key (`atrium-token-key = 1`,
+  `module`, `serial`, `id`); it holds nothing secret.
+- `portcullis_sig::set_external_signer`: `sign` and `public_pem` hand a non-PEM key file to
+  the signer a tool installed. Only the `opifex` CLI installs it, so every `--key`/`--sign`
+  (`root-sign`, `yank`, `register`, `publisher`, `pack`, `head`) takes a token key file;
+  daemons never install it.
+- The PIN is typed at the terminal with echo off, once per token per run, never an argument,
+  file or environment variable. A key that wants the PIN for every signature (YubiKey slot
+  9c) gets a context-specific login; slot 9a needs only the one.
+- `opifex token list|ref|pub`; `opifex catalog root-new` writes an unsigned `root.toml` from
+  public keys or key files (three root keys, a catalog key, the platform key with every kind
+  under `org.atrium.`), `--next yes` the one after it (version + 1, signatures cleared).
+  `root-sign`'s `--pub` is now optional.
+- Handover (a new owner, or admins holding root slots): a next `root.toml` naming the new
+  keys, signed by the threshold of the old root keys and of its own; machines adopt it at
+  their next sync. After that the old keys alone can change nothing. Losing more root keys
+  than the threshold allows before a handover leaves only a reinstall with a new `root.toml`.
+- Checked: unit tests on SoftHSM (listing, public key, signing, a wrong PIN, a missing
+  token, a catalog root through `portcullis_sig`), and `scripts/opifex-token-check.sh`
+  (host, SoftHSM + pkcs11-tool, PINs through a pty): the ceremony with three token keys, a
+  handover to three new tokens adopted by a machine, a root signed by the old keys alone
+  refused, a wrong PIN signing nothing. 0 failed. Not yet tried on a real YubiKey.
 
 ## 15. Decisions, with recommendations
 

@@ -1,0 +1,8 @@
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "An example feed",
+  "items": [
+    { "id": "1", "title": "Hello", "url": "https://example.org/hello" },
+    { "id": "2", "title": "A second post", "url": "https://example.org/second" }
+  ]
+}

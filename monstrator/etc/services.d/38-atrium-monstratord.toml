@@ -5,19 +5,21 @@
 # asks jaild to create the jail and supervises monstratord inside it.
 #
 # monstratord runs NON-ROOT (_monstrator) with no devices (ruleset 4), no
-# network and none of anyone's files. It reaches five socket directories: its own
+# network and none of anyone's files. It reaches six socket directories: its own
 # (/atrium/sockets/monstrator/, which apps with `open-uri` and the Navigator
 # see) and portcullisd's, which takes LinkGrant and DeliverLink only from
 # this user, and frescod's and its activation socket for its sheet (a
 # choice among apps; its presses are its own, PROMPT), and Tabula's, for Copy
 # address (the address copied for the app that asked, in its persona;
-# tabulad takes that from _monstrator only). It can't launch
+# tabulad takes that from _monstrator only), and the install sheet's, for an
+# atrium-app: link to an app that isn't installed (the sheet takes the asking
+# app from _monstrator only; opening-links.md §4.3). It can't launch
 # anything or spend an app's press: portcullisd does both.
 #
 # REQUIRES (scripts/monstrator-service.sh does all of it):
 #   1. The _monstrator (65038) system user, in jaild.policy's allowed_system_uids.
 #   2. /atrium/sockets/monstrator, owned _monstrator, 0755.
-#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets/{monstrator,portcullis,fresco,fresco-activation,clipboard}}.
+#   3. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/bin,atrium/sockets/{monstrator,portcullis,fresco,fresco-activation,clipboard,opifex-sheet}}.
 
 enabled       = true
 name          = "atrium-monstratord"
@@ -60,6 +62,10 @@ kind   = "rw_nullfs"
 [[mounts]]
 source = "/atrium/sockets/clipboard"              # rw: Copy address, through Tabula
 dest   = "atrium/sockets/clipboard"
+kind   = "rw_nullfs"
+[[mounts]]
+source = "/atrium/sockets/opifex-sheet"           # rw: the install sheet, for atrium-app: links (L5)
+dest   = "atrium/sockets/opifex-sheet"
 kind   = "rw_nullfs"
 
 [exec]

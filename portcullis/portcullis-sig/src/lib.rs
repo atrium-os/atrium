@@ -29,7 +29,26 @@ pub enum SigError {
     BadKey,
     /// The base64 signature didn't decode.
     BadEncoding,
+    /// A key held elsewhere (a hardware token) could not sign: why.
+    External(String),
 }
+
+/// A signer for keys that are not a PEM: the text of a key file that names a
+/// key held elsewhere (a hardware token, `portcullis-token`). `sign` answers
+/// `None` when the text isn't one of its references; `Some` with a DER
+/// signature or the reason it failed. Installed once by a tool that signs
+/// (`opifex`); daemons never install one, so for them a key is a PEM only.
+pub struct ExternalSigner {
+    pub sign: fn(&[u8], &str) -> Option<Result<Vec<u8>, String>>,
+    pub public_pem: fn(&str) -> Option<Result<String, String>>,
+}
+
+static EXTERNAL: std::sync::OnceLock<ExternalSigner> = std::sync::OnceLock::new();
+
+/// Install the signer for non-PEM key files (once per process).
+pub fn set_external_signer(s: ExternalSigner) { let _ = EXTERNAL.set(s); }
+
+fn is_pem(key: &str) -> bool { key.trim_start().starts_with("-----BEGIN") }
 
 /// Verify `manifest` against one publisher key. `sig_der` is the raw DER ECDSA
 /// signature (what `openssl dgst -sha256 -sign` and cosign produce); `pubkey_pem`
@@ -167,8 +186,16 @@ mod tests {
 /// the SHA-256 prehash, what [`verify_one`] checks. Used for the machine's
 /// own dev publisher (homes.md §5.3: what a workspace builds), never for a
 /// third party's.
+///
+/// A key file that is not a PEM goes to the installed [`ExternalSigner`].
 pub fn sign(manifest: &[u8], key_pem: &str) -> Result<Vec<u8>, SigError> {
     use p256::ecdsa::{signature::Signer, SigningKey};
+    if !is_pem(key_pem) {
+        return match EXTERNAL.get().and_then(|x| (x.sign)(manifest, key_pem)) {
+            Some(r) => r.map_err(SigError::External),
+            None => Err(SigError::BadKey),
+        };
+    }
     use p256::pkcs8::DecodePrivateKey;
     let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
     let s: Signature = k.sign(manifest);
@@ -185,11 +212,26 @@ pub fn new_key(seed: [u8; 32]) -> Result<(String, String), SigError> {
     Ok((private, public))
 }
 
+/// The public SPKI PEM of a PKCS#8 PEM private key.
+pub fn public_pem(key_pem: &str) -> Result<String, SigError> {
+    use p256::ecdsa::SigningKey;
+    if !is_pem(key_pem) {
+        return match EXTERNAL.get().and_then(|x| (x.public_pem)(key_pem)) {
+            Some(r) => r.map_err(SigError::External),
+            None => Err(SigError::BadKey),
+        };
+    }
+    use p256::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+    let k = SigningKey::from_pkcs8_pem(key_pem).map_err(|_| SigError::BadKey)?;
+    k.verifying_key().to_public_key_pem(LineEnding::LF).map_err(|_| SigError::BadKey)
+}
+
 #[cfg(test)]
 mod sign_tests {
     #[test]
     fn a_signature_of_ours_verifies_and_only_for_its_text() {
         let (k, p) = super::new_key([7; 32]).unwrap();
+        assert_eq!(super::public_pem(&k).unwrap(), p);
         let s = super::sign(b"[app]\nid = \"dev.scratch.hello\"\n", &k).unwrap();
         super::verify_one(b"[app]\nid = \"dev.scratch.hello\"\n", &s, &p).unwrap();
         assert!(super::verify_one(b"[app]\nid = \"dev.scratch.other\"\n", &s, &p).is_err());

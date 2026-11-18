@@ -14,6 +14,7 @@
 //! | `network-wifi` | those of `network-read` with the network's name, `WIFI_PROFILES`, `WIFI_JOIN`, `WIFI_LEAVE`, `WIFI_FORGET`, `WIFI_SET_PROFILE` |
 //! | `wifi-nearby` | those of `network-read`, `WIFI_NEARBY` (SSID, security, signal bars; never BSSIDs). Nearby networks tell where you are, so it is its own capability with its own consent line |
 //! | `network-configure` | those of `network-read`, `SET_COUNTRY`, `SET_STATIC`, `SET_DNS`. Restricted to the settings app |
+//! | `print-discovery` | `PRINT_DISCOVERY`: printer discovery's two mDNS sockets on the active interface (printing.md §7.1). Root only (prelumd), never granted to an app |
 //!
 //! Every reply (`IS_RESPONSE`) is `u8 status`, then on `OK` the postcard
 //! value, otherwise a postcard `String` saying why. `SUBSCRIBE` answers
@@ -39,6 +40,12 @@ pub mod op {
     pub const SET_COUNTRY: u16 = 0x40;
     pub const SET_STATIC: u16 = 0x41;
     pub const SET_DNS: u16 = 0x42;
+    /// Reply `Ok(interface name)` with two fds, in this order: receive
+    /// (bound 0.0.0.0:5353, joined to 224.0.0.251 on that interface,
+    /// sending side shut) and send (bound 5353, multicast out of that
+    /// interface with TTL 255, no loopback, connected to 224.0.0.251:5353).
+    /// `FAILED` "no-network" when no interface has an IPv4 address.
+    pub const PRINT_DISCOVERY: u16 = 0x50;
     pub const EV: u16 = 0x80;
 }
 
@@ -65,10 +72,12 @@ pub enum Grant {
     Wifi,
     Nearby,
     Configure,
+    /// Root only: its socket is mode 0600 and the front checks the peer.
+    PrintDiscovery,
 }
 
 impl Grant {
-    pub const ALL: [Grant; 5] = [Grant::Read, Grant::Details, Grant::Wifi, Grant::Nearby, Grant::Configure];
+    pub const ALL: [Grant; 6] = [Grant::Read, Grant::Details, Grant::Wifi, Grant::Nearby, Grant::Configure, Grant::PrintDiscovery];
 
     /// The capability's name, which is also its socket directory and file
     /// (`/atrium/sockets/<name>/<name>.sock`).
@@ -79,6 +88,7 @@ impl Grant {
             Grant::Wifi => "network-wifi",
             Grant::Nearby => "wifi-nearby",
             Grant::Configure => "network-configure",
+            Grant::PrintDiscovery => "print-discovery",
         }
     }
 
@@ -90,6 +100,7 @@ impl Grant {
             WIFI_PROFILES | WIFI_JOIN | WIFI_LEAVE | WIFI_FORGET | WIFI_SET_PROFILE => self == Grant::Wifi,
             WIFI_NEARBY => self == Grant::Nearby,
             SET_COUNTRY | SET_STATIC | SET_DNS => self == Grant::Configure,
+            PRINT_DISCOVERY => self == Grant::PrintDiscovery,
             _ => false,
         }
     }
@@ -365,6 +376,10 @@ pub mod server {
         fn set_country(&self, cc: String) -> Res<()>;
         fn set_static(&self, s: SetStatic) -> Res<()>;
         fn set_dns(&self, servers: Vec<IpAddr>) -> Res<()>;
+        /// The active interface's name and the two mDNS sockets (receive, send).
+        fn print_discovery(&self) -> Res<(String, [std::os::fd::OwnedFd; 2])> {
+            Err(Fail::new(status::UNSUPPORTED, "no printer discovery here"))
+        }
     }
 
     fn arg<T: for<'a> Deserialize<'a>>(p: &[u8]) -> Res<T> {
@@ -443,6 +458,15 @@ pub mod server {
                     b.set_profile(x)
                 })),
                 op::WIFI_NEARBY => enc(&b.nearby()),
+                op::PRINT_DISCOVERY => match b.print_discovery() {
+                    Ok((name, fds)) => {
+                        use std::os::fd::AsRawFd;
+                        let raw = [fds[0].as_raw_fd(), fds[1].as_raw_fd()];
+                        conn.send_message_with_fds(CLASS, o, flag::IS_RESPONSE, &enc(&Ok(name)), &raw)?;
+                        continue;
+                    }
+                    Err(f) => enc::<()>(&Err(f)),
+                },
                 op::SET_COUNTRY => enc(&arg::<String>(p).and_then(|cc| {
                     if cc.len() != 2 || !cc.bytes().all(|c| c.is_ascii_alphabetic()) {
                         return Err(Fail::new(status::MALFORMED, "a country is two letters"));
@@ -524,6 +548,14 @@ pub mod client {
 
         pub fn status(&mut self) -> Res<Status> {
             self.call(op::STATUS, &())
+        }
+        /// Printer discovery (`print-discovery` only): the interface's name
+        /// and (receive, send); see [`op::PRINT_DISCOVERY`].
+        pub fn print_discovery(&mut self) -> Res<(String, std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+            let name: String = self.call(op::PRINT_DISCOVERY, &())?;
+            let mut v = self.0.take_fds(2).ok_or_else(|| Fail::new(status::FAILED, "the sockets did not come"))?;
+            let w = v.pop().unwrap();
+            Ok((name, v.pop().unwrap(), w))
         }
         pub fn interfaces(&mut self) -> Res<Vec<Iface>> {
             self.call(op::INTERFACES, &())

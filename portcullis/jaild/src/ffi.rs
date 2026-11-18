@@ -987,6 +987,31 @@ pub fn mount_table() -> Vec<MountEntry> {
     }).collect()
 }
 
+/// The type of the file system `f` is on and where it is mounted.
+#[cfg(target_os = "freebsd")]
+pub fn fs_of_fd(f: &impl std::os::fd::AsRawFd) -> Option<(String, String)> {
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    #[allow(unsafe_code)]
+    // SAFETY: fstatfs fills the struct we pass for an fd this process owns.
+    if unsafe { libc::fstatfs(f.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    #[allow(unsafe_code)]
+    // SAFETY: filled above.
+    let st = unsafe { st.assume_init() };
+    #[allow(unsafe_code)]
+    let text = |b: &[libc::c_char]| -> String {
+        // SAFETY: the kernel NUL-terminates these names.
+        unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }.to_string_lossy().into_owned()
+    };
+    Some((text(&st.f_fstypename), text(&st.f_mntonname)))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn fs_of_fd(_f: &impl std::os::fd::AsRawFd) -> Option<(String, String)> {
+    None
+}
+
 /// The id of the top file system mounted on `path` (mount_table).
 #[cfg(target_os = "freebsd")]
 pub fn fsid_of(path: &str) -> Option<[i32; 2]> {

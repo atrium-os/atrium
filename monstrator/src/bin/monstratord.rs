@@ -54,11 +54,22 @@ fn open(asker: u32, url: &str, activation: [u8; 16], choose: bool) -> Result<Str
         Response::Hello { .. } => {}
         other => return Err(format!("portcullisd: {other:?}")),
     }
-    let (grant, apps, personas) = match ask(&mut p, &Request::LinkGrant { asker_uid: asker, activation, scheme: link.scheme.clone(), app: link.app.clone() })? {
-        Response::LinkGranted { grant, apps, personas, .. } => (grant, apps, personas),
+    let (grant, apps, personas, install) = match ask(&mut p, &Request::LinkGrant { asker_uid: asker, activation, scheme: link.scheme.clone(), app: link.app.clone() })? {
+        Response::LinkGranted { grant, apps, personas, install, .. } => (grant, apps, personas, install),
         Response::Error { message } => return Err(message),
         other => return Err(format!("portcullisd: {other:?}")),
     };
+    // An atrium-app: link to an app that isn't here (§4.3, L5): Opifex's
+    // install sheet asks the person, for the app that asked; then it opens.
+    if install {
+        let id = apps.first().map(|a| a.id.clone()).ok_or("no app named")?;
+        self::install(asker, &id)?;
+        return match ask(&mut p, &Request::DeliverLink { grant, app: id, url: link.url, always: false, persona: None })? {
+            Response::LinkDelivered { .. } => Ok(link.scheme),
+            Response::Error { message } => Err(message),
+            other => Err(format!("portcullisd: {other:?}")),
+        };
+    }
     // Without "Open with…", the default or the only app; with it, or with
     // a choice, the person makes it in Monstrator's own sheet (§5), where
     // another persona may be chosen too (personas.md §6).
@@ -77,6 +88,46 @@ fn open(asker: u32, url: &str, activation: [u8; 16], choose: bool) -> Result<Str
         Response::LinkDelivered { .. } => Ok(link.scheme),
         Response::Error { message } => Err(message),
         other => Err(format!("portcullisd: {other:?}")),
+    }
+}
+
+/// Opifex's install sheet (opifex.md §7.1), for an `atrium-app:` link to
+/// an app that isn't installed.
+const INSTALL_SHEET: &str = "/atrium/sockets/opifex-sheet/opifex-sheet.sock";
+
+/// The install sheet's wire (opifex_sheet::Ask and Answer, as JSON lines).
+#[derive(serde::Serialize)]
+enum SheetAsk<'a> {
+    Install { id: &'a str, for_uid: Option<u32> },
+}
+
+#[derive(serde::Deserialize, Debug)]
+enum SheetAnswer {
+    Installed,
+    Declined,
+    Failed { why: String },
+}
+
+/// Ask the install sheet to install `id` for `asker`, the app whose link
+/// it was (the sheet takes `for_uid` from `_monstrator` only). Waits for
+/// the person, up to the sheet's two minutes.
+fn install(asker: u32, id: &str) -> Result<(), String> {
+    let path = std::env::var("MONSTRATOR_INSTALL_SHEET").unwrap_or_else(|_| INSTALL_SHEET.into());
+    let mut s = UnixStream::connect(&path).map_err(|e| format!("not installed, and the install sheet: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(150))).ok();
+    let mut line = serde_json::to_vec(&SheetAsk::Install { id, for_uid: Some(asker) }).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    s.write_all(&line).map_err(|e| format!("the install sheet: {e}"))?;
+    let mut back = String::new();
+    BufReader::new(&s).read_line(&mut back).map_err(|e| format!("the install sheet: {e}"))?;
+    match serde_json::from_str::<SheetAnswer>(back.trim_end()) {
+        Ok(SheetAnswer::Installed) => {
+            eprintln!("monstratord: {id} installed for uid {asker}, through the install sheet");
+            Ok(())
+        }
+        Ok(SheetAnswer::Declined) => Err(format!("{id} isn't installed: not now")),
+        Ok(SheetAnswer::Failed { why }) => Err(format!("{id} isn't installed: {why}")),
+        Err(e) => Err(format!("the install sheet: {e}")),
     }
 }
 
@@ -337,7 +388,7 @@ mod tests {
     #[test]
     fn a_link_goes_through_portcullisd_once() {
         let (p, h) = fake(vec![
-            Response::LinkGranted { grant: [9; 16], person: "ana".into(), apps: vec![LinkChoice { id: "org.example.mail".into(), name: "Mail".into(), default: false }], personas: vec![] },
+            Response::LinkGranted { grant: [9; 16], person: "ana".into(), apps: vec![LinkChoice { id: "org.example.mail".into(), name: "Mail".into(), default: false }], personas: vec![], install: false },
             Response::LinkDelivered { app: "Mail".into() },
         ]);
         std::env::set_var("PORTCULLIS_SOCKET", &p);
@@ -350,5 +401,33 @@ mod tests {
         assert!(open(50001, "javascript:alert(1)", [1; 16], false).unwrap_err().contains("never opened"));
         assert!(open(50001, "mailto:a@b\nbcc:c@d", [1; 16], false).unwrap_err().contains("control"));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+
+        // L5: an atrium-app: link to an app that isn't here. The install
+        // sheet is asked for the asking app's uid; installed, it opens;
+        // declined, nothing is delivered.
+        for (answer, opened) in [("\"Installed\"", true), ("\"Declined\"", false)] {
+            let not_here = || Response::LinkGranted { grant: [7; 16], person: "ana".into(), apps: vec![LinkChoice { id: "org.atrium.hello".into(), name: "org.atrium.hello".into(), default: false }], personas: vec![], install: true };
+            let (p, h) = fake(if opened { vec![not_here(), Response::LinkDelivered { app: "Hello".into() }] } else { vec![not_here()] });
+            std::env::set_var("PORTCULLIS_SOCKET", &p);
+            let sheet = p.parent().unwrap().join("sheet.sock");
+            let l = UnixListener::bind(&sheet).unwrap();
+            let a = answer.to_string();
+            let sh = std::thread::spawn(move || {
+                let (s, _) = l.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(&s).read_line(&mut line).unwrap();
+                (&s).write_all(format!("{a}\n").as_bytes()).unwrap();
+                line
+            });
+            std::env::set_var("MONSTRATOR_INSTALL_SHEET", &sheet);
+            let r = open(50001, "atrium-app://org.atrium.hello", [2; 16], false);
+            assert_eq!(r.is_ok(), opened, "{r:?}");
+            let asked: serde_json::Value = serde_json::from_str(sh.join().unwrap().trim()).unwrap();
+            assert_eq!(asked["Install"]["id"], "org.atrium.hello");
+            assert_eq!(asked["Install"]["for_uid"], 50001);
+            let got = h.join().unwrap();
+            assert_eq!(got.iter().filter(|q| matches!(q, Request::DeliverLink { .. })).count(), usize::from(opened));
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
     }
 }

@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod proto;
 pub mod server;
+pub mod local;
 #[cfg(feature = "tessera")]
 pub mod tessera;
 

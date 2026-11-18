@@ -37,9 +37,21 @@ pub enum Tone {
     Marked,
 }
 
+/// A catalog someone asks to add (opifex.md §6.5): its name, where it is
+/// served, and its root.toml's hash (what the press approves).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Adding {
+    pub name: String,
+    pub url: String,
+    pub root_sha256: String,
+    pub warning: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Sheet {
     pub app: Described,
+    /// Set when the sheet asks about adding a catalog, not an app.
+    pub adding: Option<Adding>,
     pub focus: usize,
     pub notice: Option<&'static str>,
 }
@@ -47,7 +59,16 @@ pub struct Sheet {
 impl Sheet {
     pub fn new(app: Described) -> Sheet {
         // Not now is the default: Enter alone never installs.
-        Sheet { app, focus: 1, notice: None }
+        Sheet { app, adding: None, focus: 1, notice: None }
+    }
+
+    pub fn catalog(a: Adding) -> Sheet {
+        Sheet { app: Described::default(), adding: Some(a), focus: 1, notice: None }
+    }
+
+    /// The window's title.
+    pub fn window_title(&self) -> &'static str {
+        if self.adding.is_some() { "Add a catalog" } else { "Install" }
     }
 
     pub fn update(&self) -> bool {
@@ -55,6 +76,9 @@ impl Sheet {
     }
 
     pub fn title(&self) -> String {
+        if let Some(a) = &self.adding {
+            return format!("Add the catalog {}?", a.name);
+        }
         let name = if self.app.name.is_empty() { &self.app.id } else { &self.app.name };
         if self.update() {
             format!("Update {name} to {}?", self.app.latest)
@@ -65,13 +89,34 @@ impl Sheet {
 
     /// The lines under the title.
     pub fn lines(&self) -> Vec<(String, Tone)> {
-        let a = &self.app;
         let mut v = Vec::new();
+        if let Some(c) = &self.adding {
+            v.push((format!("From {}", c.url), Tone::Quiet));
+            v.push((c.warning.clone(), Tone::Marked));
+            v.push(("Its apps will be offered to you only. Nothing is installed until you ask for an app.".into(), Tone::Body));
+            let short: String = c.root_sha256.chars().take(16).collect();
+            v.push((format!("Its keys: {short}"), Tone::Quiet));
+            if let Some(n) = self.notice {
+                v.push((n.into(), Tone::Marked));
+            }
+            return v;
+        }
+        let a = &self.app;
         if !a.description.is_empty() {
             v.push((a.description.clone(), Tone::Body));
         }
-        let key: String = a.publisher.chars().take(12).collect();
-        v.push((format!("{} {} from the {} catalog, signed by key {key}", a.id, a.latest, a.catalog), Tone::Quiet));
+        if a.third_party {
+            let who = if a.publisher_domains.is_empty() { a.publisher_name.clone() }
+                      else { format!("{} ({})", a.publisher_name, a.publisher_domains.join(", ")) };
+            v.push((format!("{} {} from {who}, in the {} catalog you added", a.id, a.latest, a.catalog), Tone::Quiet));
+            v.push(("Atrium has not reviewed this catalog's apps.".into(), Tone::Marked));
+        } else {
+            let key: String = a.publisher.chars().take(12).collect();
+            v.push((format!("{} {} from the {} catalog, signed by key {key}", a.id, a.latest, a.catalog), Tone::Quiet));
+        }
+        if a.recovered {
+            v.push(("Its publisher lost its key, and the catalog's owners replaced it. Check this update is one you expect.".into(), Tone::Marked));
+        }
         if let Some(old) = &a.installed {
             v.push((format!("You have {old}."), Tone::Quiet));
         }
@@ -99,6 +144,7 @@ impl Sheet {
 
     pub fn label(&self, r: Row) -> &'static str {
         match (r, self.update()) {
+            (Row::Install, _) if self.adding.is_some() => "Add",
             (Row::Install, false) => "Install",
             (Row::Install, true) => "Update",
             (Row::NotNow, _) => "Not now",
@@ -171,6 +217,7 @@ pub(crate) fn described(installed: Option<&str>) -> Described {
         latest: "1.1".into(), publisher: "0123456789abcdef0123".into(), catalog: "Atrium".into(),
         capabilities: vec!["clipboard".into(), "network".into()], archive_size: 2_500_000,
         installed: installed.map(Into::into), manifest_sha256: "ab".repeat(32), added: vec![],
+        ..Default::default()
     }
 }
 
@@ -216,6 +263,18 @@ mod tests {
         assert!(l.contains(&("  use the network".into(), Tone::Marked)));
         assert!(!l.iter().any(|(x, _)| x.contains("clipboard")));
         let f = Sheet::new(Described { kind: "font".into(), capabilities: vec![], ..described(None) });
+        let mut t = described(None);
+        (t.third_party, t.publisher_name, t.publisher_domains, t.catalog, t.recovered) =
+            (true, "Example Ltd".into(), vec!["example.com".into()], "Example Apps".into(), true);
+        let l = Sheet::new(t).lines();
+        assert!(l.iter().any(|(x, _)| x.contains("from Example Ltd (example.com), in the Example Apps catalog you added")));
+        assert!(l.contains(&("Atrium has not reviewed this catalog's apps.".into(), Tone::Marked)));
+        assert!(l.iter().any(|(x, t)| x.starts_with("Its publisher lost its key") && *t == Tone::Marked));
+        let c = Sheet::catalog(Adding { name: "Example Apps".into(), url: "https://apps.example.com/cat/".into(),
+                                        root_sha256: "ab".repeat(32), warning: "Apps from this catalog are checked by nobody.".into() });
+        assert_eq!((c.title().as_str(), c.label(Row::Install), c.window_title()), ("Add the catalog Example Apps?", "Add", "Add a catalog"));
+        assert!(c.lines().contains(&("Apps from this catalog are checked by nobody.".into(), Tone::Marked)));
+        assert_eq!(c.focus, 1, "Not now has the focus");
         assert_eq!(f.title(), "Install Hello?");
         assert!(f.lines().iter().any(|(x, _)| x.starts_with("Fonts run nothing")));
     }

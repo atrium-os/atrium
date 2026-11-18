@@ -24,6 +24,9 @@ pub enum Provider {
     System(&'static str),
     /// Apps whose manifest declares the role; the user's default.
     User,
+    /// The app the person chose for this parent in the share sheet, just
+    /// now (share-sheet.md §3): no default, nothing else.
+    Chosen,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,13 +51,21 @@ pub const NAVIGATOR_ENGINE: &str = "org.atrium.navigator.engine";
 /// Scrinium, the file manager, which also serves the system picker
 /// (scrinium.md §4): it holds the user's sticks and hands out one pick.
 pub const SCRINIUM: &str = "org.atrium.scrinium";
+/// The share sheet (share-sheet.md), running as `_share`: lists the
+/// targets for an item and hands the person's choice to limend.
+pub const SHARE: &str = "org.atrium.share";
+
+/// How long the person's choice in the share sheet waits for the parent's
+/// `share-target` request.
+pub const CHOICE_MS: u64 = 30_000;
 
 pub const ROLES: &[Role] = &[
     Role { name: "credential", provider: Provider::System(ARCA), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Sheet { w: 640, h: 440 }, takes_fd: false, returns_fd: true },
-    Role { name: "share-target", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
+    Role { name: "share", provider: Provider::System(SHARE), slot: SlotKind::Sheet { w: 480, h: 400 }, takes_fd: false, returns_fd: false },
+    Role { name: "share-target", provider: Provider::Chosen, slot: SlotKind::Sheet { w: 560, h: 440 }, takes_fd: true, returns_fd: false },
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "pdf-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },

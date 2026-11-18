@@ -203,21 +203,79 @@ impl Workbook {
         }
     }
 
+    // ---------- memory ----------
+
+    /// About how many bytes the workbook's cells hold: values, text, styles,
+    /// sizes, and every formula cell's result whether computed yet or not (so a
+    /// formula filled down two billion rows counts before recalculation makes
+    /// its results). An estimate to hold a budget against, not an allocator's
+    /// count; it walks chunks, not cells (about a millisecond at 100 M cells).
+    pub fn memory_bytes(&self) -> u64 {
+        let mut n = 0u64;
+        for sh in &self.sheets {
+            n += 256;
+            for c in &sh.cols {
+                n += c.bytes() as u64;
+            }
+            for r in &sh.styles {
+                n += 24 + r.bytes();
+            }
+            for f in &sh.fidx {
+                n += 24 + f.len() as u64 * 48;
+            }
+            n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
+            n += sh.hidden.len() as u64 * 8;
+        }
+        n += self.strings.bytes();
+        for (_, g) in self.groups() {
+            n += 256 + (g.r1 - g.r0) as u64 * 8;
+        }
+        n
+    }
+
     // ---------- sheets ----------
 
     pub fn add_sheet(&mut self, name: &str) -> Result<u16, &'static str> {
         if self.sheets.len() >= MAX_SHEETS {
             return Err("too many sheets");
         }
-        if name.is_empty() || name.len() > MAX_SHEET_NAME || name.contains(['[', ']', ':', '*', '?', '/', '\\']) {
-            return Err("bad sheet name");
-        }
-        if self.sheet_id(name).is_some() {
-            return Err("a sheet with that name exists");
-        }
+        self.sheet_name_ok(name, None)?;
         self.sheets.push(Sheet::new(name));
         Ok((self.sheets.len() - 1) as u16)
     }
+    /// Whether `name` can name a sheet (other than sheet `except`).
+    pub fn sheet_name_ok(&self, name: &str, except: Option<u16>) -> Result<(), &'static str> {
+        if name.is_empty() || name.len() > MAX_SHEET_NAME || name.contains(['[', ']', ':', '*', '?', '/', '\\']) {
+            return Err("bad sheet name");
+        }
+        match self.sheet_id(name) {
+            Some(s) if Some(s) != except => Err("a sheet with that name exists"),
+            _ => Ok(()),
+        }
+    }
+
+    /// Renames a sheet; the old name.
+    pub fn rename_sheet(&mut self, s: u16, name: &str) -> Result<String, &'static str> {
+        if s as usize >= self.sheets.len() {
+            return Err("no such sheet");
+        }
+        self.sheet_name_ok(name, Some(s))?;
+        Ok(std::mem::replace(&mut self.sheets[s as usize].name, name.to_string()))
+    }
+
+    /// Takes away the last sheet if it holds nothing (no cells, formulas,
+    /// styles, or anything placed on it) and isn't the only one; its name.
+    pub fn drop_last_sheet(&mut self) -> Option<String> {
+        let s = self.sheets.len().checked_sub(1).filter(|&s| s > 0)? as u16;
+        let sh = &self.sheets[s as usize];
+        let bare = sh.cols.iter().all(|c| c.count() == 0) && sh.fidx.iter().all(|f| f.is_empty()) && sh.filter.is_none();
+        let on_it = self.tables().iter().any(|t| t.rect.sheet == s) || self.charts().iter().any(|c| c.anchor.sheet == s) || self.cond_formats().iter().any(|f| f.sheet == s);
+        if !bare || on_it {
+            return None;
+        }
+        self.sheets.pop().map(|sh| sh.name)
+    }
+
     pub fn sheet_count(&self) -> usize {
         self.sheets.len()
     }

@@ -114,7 +114,8 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `sign-in` | system | Vestibulum | `credential` | one sign-in |
 | `doc-viewer` | user | default: the Navigator's document worker | `plain` | as long as the parent wants |
 | `picker` | system | Scrinium (`org.atrium.scrinium`) | `plain` | one pick |
-| `share-target` | user | the app the user chose in the share sheet | `plain` | one share |
+| `share` | system | the share sheet (`org.atrium.share`, [share-sheet.md](share-sheet.md)) | `sheet` | one choice |
+| `share-target` | chosen | the app the person chose in the share sheet, nothing else | `sheet` | one share |
 | `media-player` | user | default media app | `plain` | as long as the parent wants |
 | `pdf-viewer` | user | default: Atrium PDF (`org.atrium.pdf`) | `plain` | as long as the parent wants |
 | `payment` | user | the user's payment app | `credential` | one payment |
@@ -294,9 +295,15 @@ user choose a target app, which receives it.
 
 | direction | message | payload |
 |---|---|---|
-| parent → child | `Share` | `offer: Offer`, the same type as Tabula's clipboard entries (tabula.md §0) |
+| parent → child | `Share` | `item: Item`, the shape of Tabula's clipboard entries (tabula.md §0): a title and up to 16 `(mime, body)` formats |
+| parent → child | `Part` | `index`, with a read-only descriptor (`SEND_FD`) for a format sent by descriptor |
 | child → parent | `Accepted` | none |
 | child → parent | `Declined` | none |
+
+Built 2026-11-18 as `limen::share_target`, with the sheet's own role `share`
+(`limen::share`) and limend's `CHOOSE`: see [share-sheet.md](share-sheet.md). The provider
+is never a default: limend starts only the app the person chose in a share sheet the same
+parent opened, once, within 30 s.
 
 ### 2.5 `payment`
 

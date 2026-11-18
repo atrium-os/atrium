@@ -588,6 +588,9 @@ mod run {
         devices: Option<Arc<dserver::Shared>>,
         /// Each stick server's control socket, by partition (§4.8).
         controls: BTreeMap<String, UnixStream>,
+        /// Trusted sticks' servers (tessera-encryption.md §7.2a), by
+        /// partition: the procdesc, held, keeps the jail.
+        stick_servers: BTreeMap<String, OwnedFd>,
         /// Folders of served sticks in app jails.
         grants: Vec<GrantRec>,
         next_grant: u64,
@@ -1243,6 +1246,32 @@ mod run {
 
     /// End a share jail and take down the nullfs mounts it was created with
     /// (jaild unmounts the jail's devfs and FUSE mount, not these).
+    /// Trusted sticks' servers ([stick_servers] in jaild's policy).
+    const STICK_EXEC: &str = "/usr/local/bin/atrium-capsa-local";
+    /// What its jail mounts: the binary and the libraries it links.
+    const STICK_MOUNTS: &[&str] = &["/lib", "/libexec", "/usr/lib", "/usr/local/bin"];
+    /// Where their FUSE mounts go: root's alone; grants are mounts of
+    /// their own.
+    const STICKS_DIR: &str = "/media/.sticks";
+
+    fn stick_jail(part: &str) -> String {
+        format!("system-stick-{part}")
+    }
+
+    fn stick_mountpoint(part: &str) -> String {
+        format!("{STICKS_DIR}/{part}")
+    }
+
+    /// The persona an app's uid runs in, as the launch registry binds it
+    /// (personas.md §3): a named persona's, or Personal's (also for a uid
+    /// the registry doesn't know).
+    fn persona_of_uid(uid: u32) -> String {
+        portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .ok()
+            .and_then(|r| r.persona(uid).flatten().map(String::from))
+            .unwrap_or_else(|| "personal".into())
+    }
+
     fn remove_share_jail(jaild: &str, uid: u32) {
         let name = dispensator::share::jail_name(uid);
         let _ = Client::connect(jaild).and_then(|mut c| c.send(&Request::RemoveJail { jid: None, name: Some(name.clone()) }));
@@ -1323,7 +1352,7 @@ mod run {
                 return (mstatus::FAILED, format!("share registry: {e}"));
             }
             let mnt = sr::mountpoint(uid);
-            let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: true };
+            let fuse = FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: true, root_dir: String::new() };
             let req = match share_request(uid, sh.proto, addr, sh.port, sr::argv(&sh, addr, suid, sgid, read_only), Some(fuse)) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1545,6 +1574,7 @@ mod run {
             settling: Vec::new(),
             devices: None,
             controls: BTreeMap::new(),
+            stick_servers: BTreeMap::new(),
             grants: Vec::new(),
             next_grant: 0,
             standing: Vec::new(),
@@ -1892,7 +1922,16 @@ mod run {
             if self.grants.iter().any(|x| x.jail == g.jail && x.dest == dest) {
                 return (mstatus::BUSY, format!("{} already has {dest}", g.jail));
             }
+            // A persona's stick goes only to that persona's instances
+            // (personas.md §5.1).
+            if let Some(t) = self.trusted.get(&g.part) {
+                let theirs = persona_of_uid(g.uid);
+                if theirs != t.persona {
+                    return (mstatus::NOT_ALLOWED, format!("{} is {}'s stick; uid {} runs in {theirs}", g.part, t.persona, g.uid));
+                }
+            }
             let read_only = g.read_only
+                || self.trusted.get(&g.part).is_some_and(|t| t.read_only)
                 || self.media.driver_of(&g.part).and_then(|d| self.planner.rules().drivers.get(d)).is_some_and(|d| d.fuse_read_only)
                 || dispensator::share::uid_of_part(&g.part).and_then(|u| self.shares.get(&u)).is_some_and(|r| r.read_only);
             let top = Path::new("/media/.grants");
@@ -1987,6 +2026,9 @@ mod run {
                     if self.grants.iter().any(|g| g.jail == s.jail && g.dest == dest) {
                         continue;
                     }
+                    if self.trusted.get(part).is_some_and(|t| t.persona != persona_of_uid(s.uid)) {
+                        continue;
+                    }
                     let g = atrium_media::Grant { part: part.clone(), path: "/".into(), jail: s.jail.clone(), uid: s.uid, gid: s.gid, read_only: false };
                     if self.grant(&g).0 == mstatus::OK {
                         made += 1;
@@ -2031,8 +2073,18 @@ mod run {
             if matches!(probe(&mnt), Probe::Silent) {
                 return (mstatus::FAILED, format!("{device}'s server isn't answering: unplug the stick"));
             }
+            // A trusted stick's server holds its folder open: it goes first,
+            // and comes back if the stick turns out to be busy.
+            let trusted = self.trusted.contains_key(device);
+            if trusted {
+                self.stop_stick_server(device);
+            }
             if let Err(e) = jaild::ffi::unmount_at(&mnt, 0) {
                 if e.raw_os_error() == Some(libc::EBUSY) {
+                    if trusted {
+                        self.serve_trusted(device);
+                        self.sync_standing();
+                    }
                     return (mstatus::BUSY, format!("{mnt} is busy: close the files open on it first"));
                 }
                 if e.raw_os_error() != Some(libc::EINVAL) {
@@ -2215,6 +2267,7 @@ mod run {
                     mountpoint: mountpoint.clone(),
                     read_only: *read_only,
                     control: p.argv.windows(2).any(|w| w == ["--control-fd", "5"]),
+                    root_dir: String::new(),
                 }),
             }
         }
@@ -2327,6 +2380,7 @@ mod run {
                         Ok(()) => {
                             eprintln!("atrium-dispensatord: {device}: sealed stick of {user}/{persona}, mounted at {mnt}");
                             self.trusted.insert(device.to_string(), Trusted { mnt: mnt.to_string(), user, persona, key_id, read_only: false });
+                            self.serve_trusted(device);
                         }
                         Err(e) => {
                             // The key is this person's, but the stick doesn't
@@ -2354,12 +2408,115 @@ mod run {
             }
         }
 
+        /// Start a trusted stick's server (§7.2a), so its folders can be
+        /// granted to apps like any stick's: a jail as the stick's person,
+        /// handed only the stick's mount (by jaild, as a descriptor), whose
+        /// FUSE mount sits out of the way and whose control socket takes
+        /// grants.
+        fn serve_trusted(&mut self, device: &str) {
+            use dispensator::share::JAIL_ROOT;
+            use std::os::fd::AsFd;
+            let Some(t) = self.trusted.get(device) else { return };
+            let Session::Active { user, uid, gid } = self.session.clone() else { return };
+            if user != t.user || self.stick_servers.contains_key(device) {
+                return;
+            }
+            let read_only = t.read_only;
+            let name = stick_jail(device);
+            let root = format!("{JAIL_ROOT}/{name}");
+            let fail = |m: String| eprintln!("atrium-dispensatord: {device}: no server for grants: {m}");
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                return fail(format!("{root}: {e}"));
+            }
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::create_dir_all(STICKS_DIR);
+                let _ = std::fs::set_permissions(STICKS_DIR, std::fs::Permissions::from_mode(0o700));
+            }
+            let mnt = stick_mountpoint(device);
+            unmount_force(Path::new(&mnt));
+            let _ = std::fs::remove_dir(&mnt);
+            let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+            let mut argv: Vec<String> = ["atrium-capsa-local", "--root-fd", "3", "--fuse-fd", "4", "--control-fd", "5"].iter().map(|a| a.to_string()).collect();
+            if read_only {
+                argv.push("--ro".into());
+            }
+            let req = CreateJailRequest {
+                name: name.clone(),
+                path: root,
+                children_max: 0,
+                mounts: STICK_MOUNTS.iter().map(|m| ro(m)).collect(),
+                devfs_ruleset: 22,
+                network: NetworkConfig::Disable,
+                exec: Some(ExecSpec { path: STICK_EXEC.into(), argv, env: vec![], uid, gid, stdio: false }),
+                rctl: None,
+                hostname: None,
+                hostid: None,
+                hostuuid: None,
+                allow_mlock: false,
+                allow_tessera_keys: false,
+                syscall_profile: Some("fuse-server".into()),
+                devfs_grant: None,
+                devfs_grants: vec![],
+                fuse: Some(FuseServe { device: String::new(), mountpoint: mnt.clone(), read_only, control: true, root_dir: t.mnt.clone() }),
+            };
+            let (ours, theirs) = match UnixStream::pair() {
+                Ok(p) => p,
+                Err(e) => return fail(format!("socketpair: {e}")),
+            };
+            let sent = Client::connect(&self.jaild).and_then(|mut c| c.send_with_fds(&Request::CreateJail(req), &[theirs.as_fd()], 1));
+            drop(theirs);
+            match sent {
+                Ok((Response::JailCreated(r), fds)) => {
+                    eprintln!("atrium-dispensatord: {device}: {name} serves it for grants (jid {}, pid {}{})", r.jid, r.pid, if read_only { ", ro" } else { "" });
+                    self.controls.insert(device.to_string(), ours);
+                    if let Some(&raw) = fds.first() {
+                        // SAFETY: jaild just passed us this procdesc; held, it keeps the jail.
+                        self.stick_servers.insert(device.to_string(), unsafe { OwnedFd::from_raw_fd(raw) });
+                    }
+                }
+                other => {
+                    unmount_force(Path::new(&mnt));
+                    fail(format!("jaild: {other:?}"));
+                }
+            }
+        }
+
+        /// End a trusted stick's grants and its server, so nothing but the
+        /// person's own programs holds the stick.
+        fn stop_stick_server(&mut self, device: &str) {
+            let had = self.stick_servers.remove(device);
+            if had.is_none() && !self.controls.contains_key(device) {
+                return;
+            }
+            self.end_grants(|g| g.part == device);
+            self.controls.remove(device);
+            let name = stick_jail(device);
+            let _ = Client::connect(&self.jaild).and_then(|mut c| c.send(&Request::RemoveJail { jid: None, name: Some(name.clone()) }));
+            // Its folder descriptor goes with the process: wait for that.
+            if let Some(pd) = &had {
+                let mut p = libc::pollfd { fd: pd.as_raw_fd(), events: libc::POLLHUP, revents: 0 };
+                // SAFETY: one valid pollfd.
+                unsafe { libc::poll(&mut p, 1, 2000) };
+            }
+            drop(had);
+            let root = format!("{}/{name}", dispensator::share::JAIL_ROOT);
+            for d in STICK_MOUNTS.iter().rev().chain(["/dev"].iter()) {
+                unmount_force(Path::new(&format!("{root}{d}")));
+            }
+            let mnt = stick_mountpoint(device);
+            unmount_force(Path::new(&mnt));
+            let _ = std::fs::remove_dir(&mnt);
+            eprintln!("atrium-dispensatord: {device}: {name} removed");
+        }
+
         /// Unmount a trusted stick (gently, then by force: it was unplugged
         /// or the session went), record its generation in the key's item,
         /// and drop the key from the kernel.
         fn stop_sealed(&mut self, device: &str) {
             self.locked.remove(device);
             self.older.remove(device);
+            self.stop_stick_server(device);
             let Some(t) = self.trusted.remove(device) else { return };
             if jaild::ffi::unmount_at(&t.mnt, 0).is_err() {
                 let _ = jaild::ffi::unmount_at(&t.mnt, libc::MNT_FORCE);
@@ -2438,6 +2595,7 @@ mod run {
             let _ = std::os::unix::fs::chown(&mnt, Some(uid), Some(gid));
             let _ = std::fs::set_permissions(&mnt, std::os::unix::fs::PermissionsExt::from_mode(0o700));
             self.trusted.insert(f.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: f.persona.clone(), key_id, read_only: false });
+            self.serve_trusted(&f.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: sealed for {user}/{}{}, mounted at {mnt}", f.part, f.persona, if code.is_some() { " with a recovery code" } else { "" });
             match code {
@@ -2476,6 +2634,7 @@ mod run {
             self.locked.remove(part);
             self.older.remove(part);
             self.trusted.insert(part.to_string(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: o.persona.clone(), key_id: o.key_id, read_only: true });
+            self.serve_trusted(part);
             self.publish();
             eprintln!("atrium-dispensatord: {part}: an older copy of {user}/{}, opened read-only at {mnt}", o.persona);
             (mstatus::OK, format!("{part} opened read-only"))
@@ -2514,6 +2673,7 @@ mod run {
             }
             self.locked.remove(&a.part);
             self.trusted.insert(a.part.clone(), Trusted { mnt: mnt.clone(), user: user.clone(), persona: a.persona.clone(), key_id, read_only: false });
+            self.serve_trusted(&a.part);
             self.publish();
             eprintln!("atrium-dispensatord: {}: opened with its recovery code for {user}/{} ({keep}), mounted at {mnt}", a.part, a.persona);
             (mstatus::OK, format!("{} opened for {}", a.part, a.persona))

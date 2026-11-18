@@ -310,6 +310,21 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   proxy; per-workspace host list in its record and the Workspaces app. Gate: cargo
   fetches crates; an unlisted host, a private address and the metadata address are
   refused; `outbound` workspaces unchanged.
+  **As built (2026-11-18).** `nuntius-egress` (a `navigator-fetch` binary) accepts
+  only `CONNECT host:443` for exactly listed names and refuses a name if any address
+  it resolves to fails Nuntius's address policy (never the private-network grant).
+  A `registries` workspace's jail is `loopback`. Before anything runs in it,
+  portcullisd binds 127.0.0.1:3128 in the workspace's own stack (a helper,
+  `portcullisd --bind-in-jail <jid>`, attaches and hands the socket back) and gives
+  that listener to the proxy as stdin. The proxy runs as a one-shot jail of the system
+  bundle `org.atrium.nuntius-egress`, one per running workspace, as `_egress` (65044)
+  under the system worker rule (`scripts/nuntius-egress-bundle.sh`). The workspace gets
+  `HTTPS_PROXY` and the related variables. Its host list is `hosts` in its record
+  (`portcullis workspace set NAME --hosts a,b`, `WorkspaceSet.hosts`), defaulting to
+  §5.2's list. Gate `scripts/vm-registries-check.sh`: 27/27 in deny mode. Not done:
+  the Workspaces app's host list editor, and a `cargo fetch` (the gate fetches with
+  `fetch(1)`, which uses the same proxy variables, because the cloud VM has no Rust
+  layer).
 - **M9 (M).** Needs Arca's SSH agent (Arca A5); this thread builds the workspace side:
   agent socket mounted per workspace, per-key grants in Curia, `git-credential-arca`,
   `c-dev`'s git. Gate: `git push` over SSH to a test server with the key in Arca;

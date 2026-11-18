@@ -393,6 +393,10 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
             let v: Vec<std::net::IpAddr> = args.get(1).map(|d| d.split(',').map(|x| x.parse().unwrap_or_else(|_| die("bad DNS server"))).collect()).unwrap_or_default();
             c.set_dns(&v).map(|_| println!("ok"))
         }
+        "printers" => {
+            let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+            c.print_discovery().map(|(iface, r, w)| printers(&iface, r, w, secs))
+        }
         "watch" => {
             let secs: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             let mut ch = c.subscribe().unwrap_or_else(|f| refused(f));
@@ -409,10 +413,118 @@ fn as_app(cap: &str, dir: &str, args: &[String]) -> ! {
             }
             Ok(())
         }
-        _ => die("--app CAP status|interfaces|routes|list|join SSID [--open|--known]|leave|forget SSID|nearby|country CC|static|watch SECS"),
+        _ => die("--app CAP status|interfaces|routes|list|join SSID [--open|--known]|leave|forget SSID|nearby|country CC|static|watch SECS|printers SECS"),
     };
     match r {
         Ok(()) => exit(0),
         Err(f) => refused(f),
     }
+}
+
+/// `--app print-discovery printers SECS`: the two mDNS sockets checked, a
+/// QU query for IPP printers sent, and every answer for SECS seconds shown
+/// (a check tool; prelum-browse is the real reader).
+fn printers(iface: &str, r: std::os::fd::OwnedFd, w: std::os::fd::OwnedFd, secs: u64) {
+    use std::net::UdpSocket;
+    let (r, w) = (UdpSocket::from(r), UdpSocket::from(w));
+    println!("sockets iface={iface} recv={} send={} peer={}", show_addr(r.local_addr()), show_addr(w.local_addr()), show_addr(w.peer_addr()));
+    let refused = |x: std::io::Result<usize>| if x.is_err() { "refused" } else { "SENT" };
+    println!("recv-socket-send={}", refused(r.send_to(b"x", "224.0.0.251:5353")));
+    println!("send-socket-elsewhere={}", refused(w.send_to(b"x", "10.0.2.2:53")));
+    // One message, two questions, the unicast-response bit set.
+    let mut q = vec![0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0];
+    for svc in [&b"_ipp"[..], b"_ipps"] {
+        for l in [svc, b"_tcp", b"local"] {
+            q.push(l.len() as u8);
+            q.extend_from_slice(l);
+        }
+        q.extend_from_slice(&[0, 0, 12, 0x80, 1]);
+    }
+    match w.send(&q) {
+        Ok(_) => println!("query sent"),
+        Err(e) => die(&format!("query: {e}")),
+    }
+    let end = Instant::now() + Duration::from_secs(secs);
+    let mut buf = [0u8; 9000];
+    let mut n = 0;
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        r.set_read_timeout(Some(left.max(Duration::from_millis(1)))).ok();
+        let Ok((len, from)) = r.recv_from(&mut buf) else { break };
+        n += 1;
+        let m = &buf[..len];
+        if m.len() >= 12 && m[2] & 0x80 != 0 && n <= 20 {
+            println!("answer from={from} len={len}{}", dns_summary(m));
+        }
+    }
+    println!("datagrams={n}");
+}
+
+fn show_addr(a: std::io::Result<std::net::SocketAddr>) -> String {
+    a.map(|a| a.to_string()).unwrap_or_else(|_| "-".into())
+}
+
+/// A name at `i` (pointers followed, at most 16 jumps and 255 bytes).
+fn dns_name(m: &[u8], mut i: usize) -> Option<(String, usize)> {
+    let (mut out, mut end, mut jumps) = (String::new(), None, 0);
+    loop {
+        let l = *m.get(i)? as usize;
+        if l == 0 {
+            return Some((out, end.unwrap_or(i + 1)));
+        }
+        if l & 0xc0 == 0xc0 {
+            jumps += 1;
+            if jumps > 16 {
+                return None;
+            }
+            end.get_or_insert(i + 2);
+            i = ((l & 0x3f) << 8) | *m.get(i + 1)? as usize;
+            continue;
+        }
+        let lab = m.get(i + 1..i + 1 + l)?;
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(lab));
+        if out.len() > 255 {
+            return None;
+        }
+        i += 1 + l;
+    }
+}
+
+/// PTR targets, SRV ports and A addresses in an answer.
+fn dns_summary(m: &[u8]) -> String {
+    let u16at = |i: usize| m.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let (qd, an, ns, ar) = (u16at(4).unwrap_or(0), u16at(6).unwrap_or(0), u16at(8).unwrap_or(0), u16at(10).unwrap_or(0));
+    let mut i = 12;
+    let mut out = format!(" an={an}");
+    for _ in 0..qd {
+        let Some((_, e)) = dns_name(m, i) else { return out + " bad" };
+        i = e + 4;
+    }
+    for _ in 0..(an as usize + ns as usize + ar as usize).min(64) {
+        let Some((_, e)) = dns_name(m, i) else { return out + " bad" };
+        let (Some(t), Some(len)) = (u16at(e), u16at(e + 8)) else { return out + " bad" };
+        let rd = e + 10;
+        match t {
+            12 => {
+                if let Some((n, _)) = dns_name(m, rd) {
+                    out += &format!(" ptr=\"{n}\"");
+                }
+            }
+            33 => {
+                if let Some(p) = u16at(rd + 4) {
+                    out += &format!(" srv={p}");
+                }
+            }
+            1 if len == 4 => {
+                if let Some(a) = m.get(rd..rd + 4) {
+                    out += &format!(" a={}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+                }
+            }
+            _ => {}
+        }
+        i = rd + len as usize;
+    }
+    out
 }

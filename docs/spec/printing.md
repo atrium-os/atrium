@@ -633,12 +633,78 @@ Checks:
   91 pass in the guest.
 
 Not yet: the network pin uses a name given to prelumd (`--network`) until
-atrium-net says which network this is (R3); jobs and history are kept in
+atrium-net says which network this is; jobs and history are kept in
 memory only (history is R5); IPv6 printers can't be granted to a worker
 jail yet (jaild's grants are IPv4); CA-signed printer certificates are
 pinned by key like the rest.
 
-Next: R3, `prelum-browse` and atrium-net's multicast socket.
+### 11.3 R3 as built (2026-11-18)
+
+- **atrium-net** (built in the network thread, bdabbc7b): `CLASS_NETCONF`
+  `PRINT_DISCOVERY` (0x50) on atrium-netconf's `print-discovery` socket
+  (directory 0700, socket 0600, the peer must be root: prelumd). atrium-net's
+  spawner, which is outside capability mode, makes two IPv4 sockets on the
+  active interface and returns the interface name. The receive socket is
+  bound to 5353, joined to 224.0.0.251, and shut for writing. The send
+  socket is bound to 5353 and `connect`ed to 224.0.0.251:5353 (TTL 255,
+  loop off), so it can't reach any other address. IPv4 only for now.
+- **`prelum-browse`** (new crate and jailed binary): prelumd hands it both
+  sockets over its stdio socket (one byte, `SCM_RIGHTS`). It then enters
+  capability mode, so it can only `send` on the one, `recv` on the other,
+  and talk to prelumd. QU questions for `_ipp._tcp` and `_ipps._tcp`, one per
+  datagram, at 0, 1, 3, 7 … s, doubling to 20 s. Follow-up questions (SRV, TXT,
+  A) go out at most once a second for instances that came without them,
+  at most 16 per datagram. Answers are read by `prelum-dnssd`, whose cache
+  is bounded (256 services). Complete services go to prelumd at most four
+  times a second, and only when they change. Its jail is a print worker
+  with no network (jaild's `[print_workers]` `browse_exec`), syscall class
+  `renderer`, optional rctl 64 MB and a quarter of a CPU.
+- **prelumd** `NEARBY` (`CLASS_PRINT` 0x07, `prelumctl nearby [--wait S]`):
+  the first ask starts the browser, and later asks make it query again.
+  Nobody asking for 60 s stops it. Each new service is confirmed by a
+  `prelum-ipp` that learns its key, as adding does. At most 4 run at once,
+  64 per session, and each gets 8 s. Only printers that answered are
+  listed, under their own `printer-info` or model, with the announced name
+  beside it, the key fingerprint, and "saved as N" when the UUID and key
+  match a saved printer. A printer offering IPPS and IPP (same UUID and
+  address) is listed once, by IPPS. The URI listed is what `ADD` takes.
+  Addresses are IPv4 only. Loopback addresses, a path other than plain
+  `[A-Za-z0-9/_.-]`, and port 0 are refused.
+- `--mdns-legacy ADDR:PORT` (development, Linux): one socket connected to
+  a responder (RFC 6762 §6.7). Avahi answers this way, though it fits a
+  legacy answer into 512 bytes by leaving instances out, without setting TC.
+
+Checks:
+
+- Unit tests: `prelum-dnssd` follow-up questions and their bound;
+  `prelum-browse` on loopback, where it finds a printer and asks for what a
+  bare PTR left out. Under 3000 hostile datagrams (garbage, compression
+  loops, 9.5 KB datagrams, 750 distinct printers) it holds at 256 services,
+  keeps the first printer and still answers prelumd. `prelumd` checks where
+  it asks a service; jaild's validator test has a browse worker and refuses
+  one with a network.
+- `scripts/prelum-r3-check.sh` on the host, against two ippeveprinters
+  through Avahi: all pass. The checks: found; confirmed (the key is the
+  one openssl reads); described by the printer itself; one printer offering
+  IPPS and IPP listed once; a plain-IPP printer shown unencrypted; added by
+  the listed URI and printed to; shown as saved afterwards; a printer that
+  stops drops off the list.
+- `scripts/prelum-r3-vm.sh` in the FreeBSD VM, with atrium-net on the fake
+  LAN (`lan.py`'s `mdns-printer`, pointing at ippeveprinter on the host):
+  18 of 18. atrium-net's sockets handed over. The printer is found on
+  vtnet1 and confirmed over IPPS with the right key, listed by its own name,
+  added, printed to, then shown as saved. The browse jail has
+  `ip4=disable`, the process is in capability mode, and its only inet
+  sockets are atrium-net's two. After `mdns-flood` (tens of thousands of
+  hostile answers) the browser is alive at about 3.5 MB resident, the
+  printer is still listed, and no junk is listed (none answered over IPP).
+  Nobody looking for a minute stops the browser, and no jail is left.
+
+Not yet: the network pin still uses `--network` (atrium-net doesn't name
+networks to prelumd yet); IPv6 discovery and IPv6 printers; the VPN-only
+persona rule (§7.1) waits for personas in R7; `_uscan` for scanners.
+
+Next: R4, the `print` role, `prelum-sheet` and the apps.
 
 ## 12. Decisions, with recommendations
 

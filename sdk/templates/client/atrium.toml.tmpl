@@ -1,0 +1,26 @@
+# {{name}}: made by `cargo atrium new` (template: client).
+# The id is yours to choose: reverse DNS of a domain you control.
+[app]
+id = "{{id}}"
+name = "{{title}}"
+version = "0.1.0"
+entry = "bin/{{name}}"
+
+# A window, and bytes from the web through Nuntius, the system's jailed
+# fetcher: the app itself has no network. List the sites it fetches from
+# (src/main.rs's FEED is on the first).
+[capabilities]
+graphics = "fresco"
+network = "none"
+net-fetch = true
+net-fetch-sites = ["example.org"]
+
+# Each response is parsed here: a jail of its own for each one, with no
+# capabilities, a memory ceiling and a time limit.
+[[workers]]
+name = "parse"
+entry = "bin/{{name}}-parse"
+input = "fd"
+lifetime = "call"
+memory = "128M"
+cpu = "5s"

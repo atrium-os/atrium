@@ -472,10 +472,14 @@ impl GridSource for SheetSource {
                 }
             }
         }
-        if d.wb.cond_formats().is_empty() {
-            return cv;
+        let mut cv = if d.wb.cond_formats().is_empty() { cv } else { cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v) };
+        // Still to be recalculated: the old value, greyed (§8.4).
+        if d.wb.is_stale(d.sheet, r, c) {
+            if let Some(v) = cv.as_mut() {
+                v.color = Some(palette::neutral_400());
+            }
         }
-        cond_view(cv, &d.wb.look(CellAddr::new(d.sheet, r, c)), &v)
+        cv
     }
     fn edit_text(&self, r: u32, c: u32) -> String {
         let d = self.doc.borrow();

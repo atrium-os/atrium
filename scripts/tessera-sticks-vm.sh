@@ -24,10 +24,16 @@
 #   5. replugged (a new md over the same image): back for alice;
 #   6. an older copy of the stick (taken before her last writes) is refused
 #      by the kernel (below the key's high-water mark) and shows Locked;
+#   5b. its folders reach apps (§7.2a): a jailed server, as alice, holding
+#      only the stick's mount, takes grants; her Work instance gets a
+#      folder (reads, writes as her, sees nothing above it or through a
+#      link), her Personal one is refused; ejecting ends server and grants;
 #   7. a stick alice formats with a recovery code is Locked in bob's session
 #      (his Arca stands in for another machine's), a wrong code is refused,
 #      the right one opens it and keeps its key in his Personal persona, and
 #      replugged it opens for him by itself.
+# §5b needs the guest's jaild current (deploy-portcullis.sh) with the
+# repository's policy ([stick_servers]; arca-vm-test.sh merges it in).
 # Ends "sticks: N failed".
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -51,14 +57,19 @@ A=/atrium/sockets/arca/arcad.sock
 echo "=== build"
 (cd "$ROOT/dispensator" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bin atrium-dispensatord) || { echo "sticks: build failed"; exit 1; }
 BIN="$ROOT/dispensator/target/$TARGET/release/atrium-dispensatord"
+(cd "$ROOT/capsa" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" -p capsa-fuse --no-default-features --bin atrium-capsa-local) || { echo "sticks: build failed"; exit 1; }
+LOCAL="$ROOT/capsa/target/$TARGET/release/atrium-capsa-local"
 g "test -c /dev/tesserakeys && test -x $KL && test -S $A" || { echo "sticks: needs tessera_fs, /root/sealed and arcad (see the header)"; exit 1; }
 
 echo "=== setup"
 g "service atrium-dispensatord onestop >/dev/null 2>&1; pkill -f 'atrium-dispensatord --rules $T' ; rm -rf $T; mkdir -p $T/rules /media; chmod 755 $T"
 scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q "$BIN" root@localhost:/tmp/atrium-dispensatord
 g "install -m 755 /tmp/atrium-dispensatord $D"
+scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222 -q "$LOCAL" root@localhost:/tmp/atrium-capsa-local
+g "install -m 755 /tmp/atrium-capsa-local /usr/local/bin/atrium-capsa-local"
+g "grep -q '^\[stick_servers\]' /etc/atrium/jaild.policy.toml" || echo "  note: the guest's jaild policy has no [stick_servers]; §5b will fail"
 g "id _dispensator-vk >/dev/null 2>&1 || pw useradd _dispensator-vk -u 65043 -d /nonexistent -s /usr/sbin/nologin"
-for u in alice:1011 bob:1012; do
+for u in alice:1011 bob:1012 stickw:50701 stickp:50702; do
     g "id ${u%:*} >/dev/null 2>&1 || pw useradd ${u%:*} -u ${u#*:} -m -s /bin/sh"
 done
 sed -e 's/disk  = \["da"\]/disk  = ["md"]/' "$ROOT/capsa/etc/devices.d/50-capsa.toml" | g "cat > $T/rules/50-capsa-md.toml"
@@ -127,8 +138,38 @@ sleep 5
 check "back for alice" tessera "$(mounted)"
 check "her file is there" 2000 "$(g "su -m alice -c 'wc -l < /media/$PART/plans.txt'" | tr -d ' ')"
 
+echo "=== 5b. its folders, granted to apps (§7.2a)"
+JC=/usr/local/bin/atrium-portcullisd-jclient; JS=/var/run/atrium/jaild.sock
+JW=app-stickw$$; RW=/var/lib/atrium/jails/$JW
+JP=app-stickp$$; RP=/var/lib/atrium/jails/$JP
+REG=/var/run/atrium/app-registry
+# Two instances of one app of alice's: Work's (50701) and Personal's (50702).
+g "mkdir -p /var/run/atrium $RW $RP; touch $REG; sed -i '' '/^5070[12] /d' $REG; printf '50701 alice org.test.stick persona=work\n50702 alice org.test.stick\n' >> $REG"
+g "$JC $JS create $JW $RW >/dev/null; $JC $JS create $JP $RP >/dev/null"
+SJ=system-stick-$PART
+check "a server for its grants, jailed" yes "$(g "jls -n name | grep -q 'name=$SJ\$' && echo yes || echo no")"
+check "…running as alice" 1011 "$(g "ps -J \$(jls -j $SJ jid) -o uid= | head -1" | tr -d ' ')"
+check "…with nothing of the stick in its jail" no "$(g "test -e /var/lib/atrium/jails/$SJ/media && echo yes || echo no")"
+check "its own mount is root's alone" no "$(g "su -m alice -c 'ls /media/.sticks/$PART' >/dev/null 2>&1 && echo yes || echo no")"
+g "su -m alice -c 'mkdir -p /media/$PART/Docs && echo for-the-app > /media/$PART/Docs/note.txt && ln -sf /etc /media/$PART/Docs/etc'"
+r=$(g "$D --media-socket $S --grant $PART /Docs --jail $JW --uid 50701")
+check "a folder into her Work instance" "ok /media/$PART" "$r"
+check "the app reads it" for-the-app "$(g "su -m stickw -c 'cat $RW/media/$PART/note.txt'" 2>&1)"
+g "su -m stickw -c 'echo from-the-app > $RW/media/$PART/reply.txt'"
+check "its write lands on the stick" from-the-app "$(g "su -m alice -c 'cat /media/$PART/Docs/reply.txt'" 2>&1)"
+check "…as alice's" alice "$(g "stat -f %Su /media/$PART/Docs/reply.txt")"
+check "only that folder" no "$(g "test -e $RW/media/$PART/plans.txt && echo yes || echo no")"
+check "no way out through a link" no "$(g "test -e $RW/media/$PART/etc/passwd && echo yes || echo no")"
+r=$(g "$D --media-socket $S --grant $PART /Docs --jail $JP --uid 50702")
+check "her Personal instance is refused" no "$(echo "$r" | grep -q '^ok' && echo yes || echo no)"
+check "…and has nothing" no "$(g "test -e $RP/media/$PART/note.txt && echo yes || echo no")"
+
 echo "=== 6. an older copy is refused"
 r=$(g "su -m alice -c '$D --media-socket $S --eject $PART'")
+case "$r" in ok*) check "eject, with a grant out" ok ok ;; *) check "eject, with a grant out" ok "$r" ;; esac
+check "…its server went" no "$(g "jls -n name | grep -q 'name=$SJ\$' && echo yes || echo no")"
+check "…and its grant" 0 "$(g "mount -p | grep -c '$RW/media'" | tr -d ' ')"
+check "…and its mount" 0 "$(g "mount -p | grep -c '/media/.sticks/'" | tr -d ' ')"
 g "mdconfig -d -u $MD2"; sleep 3
 MD3=$(g "mdconfig -a -t vnode -f $T/old.img")
 PART=${MD3}p1
@@ -187,6 +228,7 @@ r=$(g "su -m bob -c '$D --media-socket $S --eject $PART'")
 check "ejected" "" "$(mounted)"
 
 echo "=== cleanup"
+g "for j in $JW $JP; do $JC $JS remove \$j >/dev/null 2>&1; done; sed -i '' '/^5070[12] /d' $REG; true"
 g "umount /media/$PART 2>/dev/null; pkill -f 'atrium-dispensatord --rules $T'; sleep 1; mdconfig -d -u $MD6; $KL drop $K >/dev/null 2>&1; $KL drop $K2 >/dev/null 2>&1; true"
 echo "--- dispensatord log"
 g "cat $T/d.log" | tail -30

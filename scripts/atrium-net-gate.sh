@@ -21,7 +21,7 @@ LANDEV="-netdev socket,id=lan,udp=127.0.0.1:7801,localaddr=127.0.0.1:7802 -devic
 pass=0
 ok() { echo "ok   $1"; pass=$((pass + 1)); }
 cleanup() {
-    "$V" 'pkill -f "atrium-net -v"; sleep 1
+    "$V" 'pkill -x atrium-netconf; pkill -f "atrium-net -v"; sleep 1
         for a in $(ifconfig vtnet1 inet | awk "/inet /{print \$2}"); do ifconfig vtnet1 inet $a -alias; done
         # RAs off before deleting SLAAC addresses (kernel race, spec §5.3).
         ifconfig vtnet1 inet6 -accept_rtadv
@@ -62,9 +62,9 @@ vm)
     ;;
 n0)
     CROSS_RUSTFLAGS=$(set -- env; . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
-    (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease >&2)
+    (cd "$ROOT/atrium-net" && cargo test -q >&2 && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --release --target "$T" -p atrium-net -p atrium-lease -p atrium-netconf >&2)
     R="$ROOT/atrium-net/target/$T/release"
-    tar czf - -C "$R" atrium-net atrium-lease | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
+    tar czf - -C "$R" atrium-net atrium-lease atrium-netconf atrium-netctl | "$V" 'rm -rf /tmp/atrium-net && mkdir -p /tmp/atrium-net && tar xzf - -C /tmp/atrium-net'
 
     pkill -f atrium-net/sim/lan.py 2>/dev/null || true
     python3 "$ROOT/atrium-net/sim/lan.py" "$LEASE_S" > "$LAN_LOG" 2>&1 &
@@ -215,6 +215,36 @@ n0)
     capmode "$new" && [ "$u" = _atrium-lease ] && ok "the new atrium-lease is sandboxed too ($u, capability mode)" || fail "new lease: user $u"
     i=0; while [ $i -lt 30 ] && [ "$(stat request)" -le "$r0" ]; do sleep 1; i=$((i + 1)); done
     [ "$(stat discover)" -gt "$d0" ] && [ "$(stat request)" -gt "$r0" ] && wait_addr 10.88.0.50 5 && ok "the new parser leased 10.88.0.50 again (DISCOVER, REQUEST)" || fail "no lease after restart: discover $d0->$(stat discover) request $r0->$(stat request)"
+
+    # Printer discovery (printing.md §7.1): atrium-netconf's root-only
+    # print-discovery socket hands out the two mDNS sockets atrium-net's
+    # spawner makes on the active interface.
+    "$V" "set -e
+        id _atrium-netconf >/dev/null 2>&1 || pw useradd _atrium-netconf -u 65036 -d /nonexistent -s /usr/sbin/nologin -c 'atrium-net settings front'
+        pkill -x atrium-netconf 2>/dev/null || true; sleep 1; rm -rf /tmp/atrium-net/sockets
+        daemon -f -o /tmp/atrium-net/netconf.log /tmp/atrium-net/atrium-netconf -v --ctl /tmp/atrium-net/ctl.sock --dir /tmp/atrium-net/sockets --uid 65036 --capsicum
+        sleep 2"
+    PD=/tmp/atrium-net/sockets/print-discovery
+    m=$("$V" "stat -f '%Sp %Su' $PD $PD/print-discovery.sock | tr '\n' ' '")
+    [ "$m" = "drwx------ root srw------- root " ] && ok "print-discovery: root-only directory and socket ($m)" || fail "print-discovery permissions: $m"
+    NC="/tmp/atrium-net/atrium-netctl --dir /tmp/atrium-net/sockets --app print-discovery"
+    out=$("$V" "su -m nobody -c '$NC printers 1'" 2>&1) && fail "another user got the sockets: $out"
+    ok "another user is refused ($(echo "$out" | tail -n 1))"
+    lanctl "mdns-printer 10.0.2.2 8661" >/dev/null
+    out=$("$V" "$NC printers 4" 2>&1) || fail "printers: $out"
+    echo "$out" | sed 's/^/    /'
+    echo "$out" | grep -q '^sockets iface=vtnet1 recv=0.0.0.0:5353 send=10.88.0.50:5353 peer=224.0.0.251:5353' && ok "two sockets on vtnet1, both on port 5353, the send one connected to 224.0.0.251:5353" || fail "sockets: $out"
+    echo "$out" | grep -q 'recv-socket-send=refused' && echo "$out" | grep -q 'send-socket-elsewhere=refused' && ok "the receive socket cannot send; the send socket cannot reach another address" || fail "socket limits: $out"
+    echo "$out" | grep -q 'answer from=10.88.0.60:5353 .*ptr="Gate Printer._ipp._tcp.local".* srv=8661 .*a=10.0.2.2' && [ "$(stat mdns_query)" -ge 1 ] \
+        && ok "QU query out of vtnet1, unicast answer on the receive socket: Gate Printer at 10.0.2.2:8661" || fail "no printer: $out $(lanctl stats)"
+    lanctl mdns-flood >/dev/null
+    out=$("$V" "$NC printers 8" 2>&1) || fail "printers (flood): $out"
+    n=$(echo "$out" | sed -n 's/^datagrams=//p')
+    "$V" 'pgrep -x atrium-netconf >/dev/null && pgrep -f "atrium-net -v" >/dev/null' && [ "${n:-0}" -ge 100 ] \
+        && ok "a flood of hostile answers ($(stat mdns_answer) sent) reaches only the socket ($n datagrams); atrium-net and atrium-netconf untouched" || fail "flood: n=$n"
+    lanctl mdns-off >/dev/null
+    u=$("$V" 'ps -o user= -p $(pgrep -x atrium-netconf)' | tr -d ' ')
+    capmode "$("$V" 'pgrep -x atrium-netconf')" && [ "$u" = _atrium-netconf ] && ok "atrium-netconf still $u in capability mode" || fail "netconf: $u"
 
     # Renewal at T1 (half the lease).
     i=0; while [ "$(stat renew)" -lt 1 ] && [ $i -lt $((LEASE_S)) ]; do sleep 5; i=$((i + 5)); done

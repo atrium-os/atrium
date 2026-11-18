@@ -172,12 +172,57 @@ pub fn is_share_server(req: &CreateJailRequest, policy: &Policy) -> bool {
         && c.exec_paths.contains(&exec.path)
         && match &req.fuse {
             // Serving: its own mount, and grants of folders on the control socket.
-            Some(f) => !exec.stdio && f.device.is_empty() && f.mountpoint == c.mountpoint(uid),
+            Some(f) => !exec.stdio && f.device.is_empty() && f.root_dir.is_empty() && f.mountpoint == c.mountpoint(uid),
             None => exec.stdio,
         }
         && req.devfs_grant.is_none()
         && req.devfs_grants.is_empty()
         && req.children_max == 0
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
+}
+
+/// What a trusted stick's server may have mounted (read-only, at the same
+/// path): its binary and the libraries it links.
+pub const STICK_SERVER_MOUNTS: &[&str] = &["/lib", "/libexec", "/usr/lib", "/usr/local/bin"];
+
+/// Whether `req` is a trusted stick's server (`[stick_servers]`,
+/// tessera-encryption.md §7.2a): named for the stick's partition, rooted
+/// like a courier's, running exactly the policy's binary as a person's uid,
+/// serving FUSE at exactly that stick's mountpoint from exactly its Tessera
+/// mount, handed over as a descriptor, with grants on a control socket.
+/// Nothing else: no writable mounts, devices, network, stdio, children or
+/// keys.
+pub fn is_stick_server(req: &CreateJailRequest, policy: &Policy) -> bool {
+    use crate::protocol::NetworkConfig;
+    let (Some(c), Some(dir), Some(exec), Some(f)) =
+        (policy.stick_servers.as_ref(), policy.exec_paths.instance_root_dir.as_deref(), req.exec.as_ref(), req.fuse.as_ref())
+    else {
+        return false;
+    };
+    let Some(part) = req.name.strip_prefix(c.name_prefix.as_str()) else { return false };
+    !part.is_empty()
+        && part.len() <= 32
+        && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && (c.uid_first..=c.uid_last).contains(&exec.uid)
+        && (c.uid_first..=c.uid_last).contains(&exec.gid)
+        && exec.path == c.exec_path
+        && !exec.stdio
+        && f.device.is_empty()
+        && f.root_dir == c.root_dir(part)
+        && f.mountpoint == c.mountpoint(part)
+        && f.control
+        // The binary and its libraries, read-only; nothing writable.
+        && req.mounts.iter().all(|m| {
+            matches!(m.kind, crate::protocol::MountKind::RoNullfs)
+                && m.source == m.dest
+                && STICK_SERVER_MOUNTS.contains(&m.source.as_str())
+        })
+        && matches!(req.network, NetworkConfig::Disable)
+        && req.devfs_grant.is_none()
+        && req.devfs_grants.is_empty()
+        && req.children_max == 0
+        && !req.allow_mlock
+        && !req.allow_tessera_keys
         && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
@@ -383,6 +428,17 @@ fn validate_devfs_pin(req: &CreateJailRequest, policy: &Policy) -> Result<(), Ja
             detail: format!("devfs_grants needs devfs_grant and holds at most {MAX_EXTRA_GRANTS} nodes; got {}", req.devfs_grants.len()),
         });
     }
+    if req.fuse.as_ref().is_some_and(|f| !f.root_dir.is_empty()) {
+        // FUSE from a directory: a trusted stick's server, and only that.
+        return if is_stick_server(req, policy) {
+            Ok(())
+        } else {
+            Err(JaildError::PolicyViolation {
+                rule:   "fuse.root_dir",
+                detail: "a FUSE mount served from a directory is a trusted stick's server's ([stick_servers])".into(),
+            })
+        };
+    }
     if req.fuse.as_ref().is_some_and(|f| f.device.is_empty()) {
         // FUSE without a device: a share server's, and only that.
         return if is_share_server(req, policy) {
@@ -579,11 +635,12 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
 
     match m.kind {
         MountKind::RoNullfs => {
-            let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source);
+            let allowed = policy.mount_sources.ro_paths.iter().any(|p| p == &m.source)
+                || policy.mount_sources.ro_subtrees.iter().any(|base| below(&m.source, base));
             if !allowed {
                 return Err(JaildError::PolicyViolation {
                     rule:   "mount.source.not_in_ro",
-                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths", m.source),
+                    detail: format!("ro source {:?} not in policy.mount_sources.ro_paths or ro_subtrees", m.source),
                 });
             }
         }
@@ -635,6 +692,14 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a folder directly in `base`: one plain segment below
+/// it (no `.`, `..` or empty segment), never `base` itself.
+fn below(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    let Some(rest) = path.strip_prefix(base).and_then(|r| r.strip_prefix('/')) else { return false };
+    !base.is_empty() && !rest.is_empty() && !rest.contains('/') && rest != "." && rest != ".."
 }
 
 fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool, courier: bool) -> Result<(), JaildError> {
@@ -1108,7 +1173,7 @@ mod tests {
             let e = r.exec.as_mut().unwrap();
             e.uid = uid;
             e.gid = uid;
-            r.fuse = Some(crate::protocol::FuseServe { device: String::new(), mountpoint: mnt.into(), read_only: false, control: false });
+            r.fuse = Some(crate::protocol::FuseServe { device: String::new(), mountpoint: mnt.into(), read_only: false, control: false, root_dir: String::new() });
             r
         };
         let root = |n: &str| format!("/var/lib/atrium/jails/{n}");
@@ -1159,6 +1224,94 @@ mod tests {
             assert!(!is_share_server(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
+    }
+
+    /// Trusted sticks' servers: exactly the policy's name, root, binary,
+    /// a person's uid, that stick's mount and mountpoint, and a control
+    /// socket; any deviation is refused, and a directory-served FUSE mount
+    /// is no one else's.
+    #[test]
+    fn a_stick_server_jail_and_only_a_stick_server_jail() {
+        use crate::protocol::{MountKind, MountSpec, NetworkConfig};
+        let p = load_sample_policy();
+        let stick = |name: &str, exe: &str, uid: u32, root_dir: &str, mnt: &str| {
+            let mut r = instance_req(name, &format!("/var/lib/atrium/jails/{name}"), exe, false);
+            let e = r.exec.as_mut().unwrap();
+            e.uid = uid;
+            e.gid = uid;
+            r.network = NetworkConfig::Disable;
+            r.mounts.clear();
+            r.fuse = Some(crate::protocol::FuseServe { device: String::new(), mountpoint: mnt.into(), read_only: false, control: true, root_dir: root_dir.into() });
+            r
+        };
+        let exe = "/usr/local/bin/atrium-capsa-local";
+        let ok = stick("system-stick-da0p1", exe, 1001, "/media/da0p1", "/media/.sticks/da0p1");
+        assert!(is_stick_server(&ok, &p));
+        validate_create(&ok, &p).expect("a trusted stick's server");
+        let mut ro = ok.clone();
+        ro.fuse.as_mut().unwrap().read_only = true;
+        validate_create(&ro, &p).expect("read-only too (an older copy)");
+        let mut no_ctl = ok.clone();
+        no_ctl.fuse.as_mut().unwrap().control = false;
+        let mut dev = ok.clone();
+        dev.fuse.as_mut().unwrap().device = "da0p1".into();
+        let mut stdio = ok.clone();
+        stdio.exec.as_mut().unwrap().stdio = true;
+        let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let mut libs = ok.clone();
+        libs.mounts = STICK_SERVER_MOUNTS.iter().map(|m| ro(m)).collect();
+        assert!(is_stick_server(&libs, &p), "its binary and libraries");
+        let mut mounted = libs.clone();
+        mounted.mounts.push(ro("/usr/local/lib"));
+        let mut rw = libs.clone();
+        rw.mounts[0].kind = MountKind::RwNullfs;
+        let mut moved = libs.clone();
+        moved.mounts[0].dest = "/usr/local/bin".into();
+        let mut mlock = ok.clone();
+        mlock.allow_mlock = true;
+        let mut keys = ok.clone();
+        keys.allow_tessera_keys = true;
+        let mut child = ok.clone();
+        child.children_max = 1;
+        let mut net = ok.clone();
+        net.network = NetworkConfig::Isolated;
+        let mut elsewhere = ok.clone();
+        elsewhere.path = "/var/lib/atrium/jails/elsewhere".into();
+        for (r, why) in [
+            (stick("system-stick-da0p1", exe, 0, "/media/da0p1", "/media/.sticks/da0p1"), "root"),
+            (stick("system-stick-da0p1", exe, 65020, "/media/da0p1", "/media/.sticks/da0p1"), "a system uid"),
+            (stick("system-stick-da0p1", exe, 63001, "/media/da0p1", "/media/.sticks/da0p1"), "a share server's uid"),
+            (stick("system-stick-da0p1", exe, 1001, "/media/da1p1", "/media/.sticks/da0p1"), "another stick's mount"),
+            (stick("system-stick-da0p1", exe, 1001, "/home/alice", "/media/.sticks/da0p1"), "a home folder"),
+            (stick("system-stick-da0p1", exe, 1001, "/media/da0p1", "/media/.sticks/da1p1"), "another stick's mountpoint"),
+            (stick("system-stick-da0p1", exe, 1001, "/media/da0p1", "/etc"), "a mountpoint outside /media"),
+            (stick("system-stick-..", exe, 1001, "/media/..", "/media/.sticks/.."), "a name that climbs"),
+            (stick("system-stick-", exe, 1001, "/media/", "/media/.sticks/"), "no partition"),
+            (stick("system-stick-da0p1", "/usr/local/bin/atrium-capsa-fuse", 1001, "/media/da0p1", "/media/.sticks/da0p1"), "another binary"),
+            (stick("app-x--1", exe, 1001, "/media/da0p1", "/media/.sticks/da0p1"), "not a stick server"),
+            (no_ctl, "no control socket"),
+            (dev, "a device as well"),
+            (stdio, "caller stdio"),
+            (mounted, "another mount"),
+            (rw, "a writable mount"),
+            (moved, "a library mounted elsewhere"),
+            (mlock, "locked memory"),
+            (keys, "Tessera keys"),
+            (child, "child jails"),
+            (net, "a network"),
+            (elsewhere, "another root"),
+        ] {
+            assert!(!is_stick_server(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+        // A share server may not serve a directory.
+        let mut share = instance_req("system-share-63001", "/var/lib/atrium/jails/system-share-63001", "/usr/local/bin/atrium-share-sftp", false);
+        let e = share.exec.as_mut().unwrap();
+        e.uid = 63001;
+        e.gid = 63001;
+        share.fuse = Some(crate::protocol::FuseServe { device: String::new(), mountpoint: "/media/share-63001".into(), read_only: false, control: true, root_dir: "/media/da0p1".into() });
+        assert!(!is_share_server(&share, &p));
+        assert!(validate_create(&share, &p).is_err());
     }
 
     /// ★ Only an instance may take the caller's descriptors: a service asking
@@ -1323,6 +1476,24 @@ mod tests {
             owner: None,
         });
         validate_create(&r, &p).unwrap();
+    }
+
+    #[test]
+    fn mount_ro_subtree_is_one_package_folder() {
+        let mut p = load_sample_policy();
+        p.mount_sources.ro_subtrees = vec!["/usr/local/libexec/atrium/drivers/".into()];
+        let ro = |src: &str| {
+            let mut r = req_default();
+            r.mounts.push(MountSpec { source: src.into(), dest: "pkg".into(), kind: MountKind::RoNullfs, size_mb: None, owner: None });
+            validate_create(&r, &p)
+        };
+        ro("/usr/local/libexec/atrium/drivers/org.atrium.driver.x").unwrap();
+        for bad in ["/usr/local/libexec/atrium/drivers", "/usr/local/libexec/atrium/drivers/",
+                    "/usr/local/libexec/atrium/drivers/../../../../etc", "/usr/local/libexec/atrium/driversX/a",
+                    "/usr/local/libexec/atrium/drivers//a", "/usr/local/libexec/atrium/drivers/./a",
+                    "/usr/local/libexec/atrium/drivers/a/b", "/usr/local/libexec/atrium/drivers/.."] {
+            assert!(matches!(ro(bad), Err(JaildError::PolicyViolation { rule: "mount.source.not_in_ro", .. })), "{bad}");
+        }
     }
 
     #[test]
@@ -1787,7 +1958,7 @@ mod tests {
         let req = |dev: &str, mnt: &str| {
             let mut r = frescod_req("atrium-capsa-da0p1", "/usr/local/bin/atrium-capsa-fuse", 65070);
             r.devfs_ruleset = 28;
-            r.fuse = Some(crate::protocol::FuseServe { device: dev.into(), mountpoint: mnt.into(), read_only: false, control: false });
+            r.fuse = Some(crate::protocol::FuseServe { device: dev.into(), mountpoint: mnt.into(), read_only: false, control: false, root_dir: String::new() });
             r
         };
         validate_devfs_pin(&req("da0p1", "/media/usb-da0p1"), &p).unwrap();

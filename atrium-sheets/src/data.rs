@@ -69,6 +69,10 @@ pub enum DataCmd {
     /// Compare this workbook with another copy ([`crate::review`]); the window
     /// asks for the copy.
     CompareWith,
+    /// A new sheet at the end; the window runs it, as it shows the sheet.
+    AddSheet,
+    /// Rename the sheet on screen; the window runs it (a bar under the grid).
+    RenameSheet,
 }
 
 /// The block of non-empty cells around (`row`, `col`), bounded by empty rows and
@@ -228,6 +232,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     v.push((MenuItem::new("Refresh All Pivot Tables").enabled(!wb.pivots().is_empty()), Some(DataCmd::RefreshAllPivots)));
     v.push((MenuItem::new("Conditional Formatting…").separated(), Some(DataCmd::CondFormats)));
     v.push((MenuItem::new("Compare with…").separated(), Some(DataCmd::CompareWith)));
+    v.push((MenuItem::new("Add Sheet").separated(), Some(DataCmd::AddSheet)));
+    v.push((MenuItem::new("Rename Sheet…"), Some(DataCmd::RenameSheet)));
     v
 }
 
@@ -262,6 +268,10 @@ pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid:
 
 /// Runs `cmd`; says what happened (or why nothing did) in the status line.
 pub fn run(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) {
+    // Sorting, filtering and pivots read values: finish recalculating first.
+    if d.wb.recalc_pending() {
+        d.wb.recalc();
+    }
     let msg = match apply(d, sel, cursor, cmd) {
         Ok(m) | Err(m) => m,
     };
@@ -432,7 +442,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;

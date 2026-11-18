@@ -65,6 +65,10 @@ pub struct Policy {
     /// Network share servers (network-shares.md §4.1). Absent = none.
     #[serde(default)]
     pub share_servers: Option<ShareServerPolicy>,
+    /// Trusted sticks' pass-through servers (tessera-encryption.md §7.2a).
+    /// Absent = none.
+    #[serde(default)]
+    pub stick_servers: Option<StickServerPolicy>,
     /// Prelum's per-job and per-printer workers (printing.md §6.1, §6.3).
     /// Absent = none.
     #[serde(default)]
@@ -221,6 +225,34 @@ impl ShareServerPolicy {
     }
 }
 
+/// `[stick_servers]`: dispensatord asks for one jail per trusted (sealed,
+/// kernel-mounted) stick, named `<name_prefix><part>` at
+/// `<instance_root_dir>/<name>`, running exactly `exec_path` as the stick
+/// owner's uid (a person's, in `uid_first..=uid_last`), with no filesystem
+/// of its own: jaild hands it the stick's mount `<media_prefix>/<part>` as
+/// a directory descriptor and serves FUSE at `<media_prefix>/.sticks/<part>`,
+/// which only dispensatord's grants reach (tessera-encryption.md §7.2a).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StickServerPolicy {
+    pub name_prefix:  String,
+    pub exec_path:    String,
+    pub uid_first:    u32,
+    pub uid_last:     u32,
+    pub media_prefix: String,
+}
+
+impl StickServerPolicy {
+    /// The stick's own mount, which the server is handed.
+    pub fn root_dir(&self, part: &str) -> String {
+        format!("{}/{part}", self.media_prefix.trim_end_matches('/'))
+    }
+    /// Where the server's FUSE mount goes: out of the way, for grants.
+    pub fn mountpoint(&self, part: &str) -> String {
+        format!("{}/.sticks/{part}", self.media_prefix.trim_end_matches('/'))
+    }
+}
+
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md
 /// §6.1, §6.3), named `<name_prefix><uid>` at `<instance_root_dir>/<name>`,
 /// running exactly `render_exec` (no network) or `ipp_exec` (a routed vnet
@@ -290,6 +322,12 @@ pub struct MountSources {
     /// allocator daemon producing the paths.
     #[serde(default)]
     pub rw_subtrees: Vec<String>,
+    /// Read-only package parents: a folder directly in one of these (never
+    /// the folder itself, so one package never sees its neighbours) is
+    /// permitted as an ro mount source. Catalog drivers' package folders
+    /// (`/usr/local/libexec/atrium/drivers/<id>`, opifex.md §8.2).
+    #[serde(default)]
+    pub ro_subtrees: Vec<String>,
     /// ★ The largest tmpfs any jail may mount, in MiB, and the size given to
     /// one that does not ask. tmpfs is RAM-backed and was mounted with no
     /// options at all, so every tmpfs jaild created could grow until the

@@ -81,6 +81,10 @@ pub type Resolve = Box<dyn Fn(u32) -> Option<(String, String)> + Send + Sync>;
 pub type Defaults = Box<dyn Fn(&str, &str) -> Option<String> + Send + Sync>;
 /// (parent app id, role) → whether its manifest lets it embed the role.
 pub type EmbedCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+/// (person, app id) → whether the share sheet may choose the app as a
+/// `share-target` for that person (its installed manifest implements the
+/// role; a dev build only for its own person).
+pub type TargetCheck = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 type ConnId = u64;
 
@@ -139,6 +143,9 @@ struct State {
     embeds: HashMap<EmbedId, Embed>,
     /// role → the system provider's connection.
     providers: HashMap<&'static str, (ConnId, u32)>,
+    /// parent → the app the person chose for its next `share-target`, and
+    /// when (share-sheet.md §3).
+    choices: HashMap<ConnId, (String, Instant)>,
 }
 
 impl State {
@@ -176,6 +183,8 @@ pub struct Shared {
     attribution: Mutex<Option<Box<dyn Attribution>>>,
     /// Without one (tests), any app may embed any role.
     embed_check: Mutex<Option<EmbedCheck>>,
+    /// Without one (tests), the share sheet may choose any app.
+    target_check: Mutex<Option<TargetCheck>>,
 }
 
 impl Shared {
@@ -193,6 +202,7 @@ impl Shared {
             system_uids: Mutex::new(HashMap::new()),
             attribution: Mutex::new(None),
             embed_check: Mutex::new(None),
+            target_check: Mutex::new(None),
         })
     }
 
@@ -212,6 +222,12 @@ impl Shared {
     /// ([`crate::manifests::Installed::may_embed`]).
     pub fn set_embed_check(&self, c: EmbedCheck) {
         *self.embed_check.lock().unwrap() = Some(c);
+    }
+
+    /// Which apps the share sheet may choose: limend's is the installed
+    /// manifests' `[roles] implements` ([`crate::manifests::Installed::may_target`]).
+    pub fn set_target_check(&self, c: TargetCheck) {
+        *self.target_check.lock().unwrap() = Some(c);
     }
 
     /// Live embeds (tests and logs).
@@ -313,6 +329,7 @@ fn handle(shared: &Arc<Shared>, conn: ConnId, uid: u32, opc: u16, payload: &[u8]
                 emit(shared, conn, m, Some(fd))
             }
             op::PIP => pip(shared, conn, de(payload)?),
+            op::CHOOSE => choose(shared, conn, de(payload)?),
             op::FOCUS_OUT => {
                 let f: proto::FocusOut = de(payload)?;
                 let st = shared.state.lock().unwrap();
@@ -334,7 +351,9 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     let refuse = |reason| Err(Reply::Refused { reason });
     let Some((user, app)) = (shared.resolve)(uid) else { return refuse(refusal::NOT_AN_APP) };
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
-    if let Some(check) = shared.embed_check.lock().unwrap().as_ref() {
+    // A chosen role needs no `embeds` of its own: the choice can only come
+    // from a share sheet the parent opened, which did need it.
+    if let (Provider::System(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
         if !check(&app, role.name) {
             eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
             return refuse(refusal::NOT_EMBEDDABLE);
@@ -351,8 +370,15 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
             Some(&(c, u)) => (c, u, false),
             None => return refuse(refusal::NO_PROVIDER),
         },
-        Provider::User => {
-            let Some(provider) = (shared.defaults)(&user, role.name) else { return refuse(refusal::NO_PROVIDER) };
+        Provider::User | Provider::Chosen => {
+            let provider = match role.provider {
+                Provider::Chosen => match st.choices.remove(&conn) {
+                    Some((app, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some(app),
+                    _ => None,
+                },
+                _ => (shared.defaults)(&user, role.name),
+            };
+            let Some(provider) = provider else { return refuse(refusal::NO_PROVIDER) };
             let (ours, theirs) = UnixStream::pair().map_err(|_| Reply::Refused { reason: refusal::LAUNCH_FAILED })?;
             let (tx, rx) = mpsc::channel();
             st.next_conn += 1;
@@ -631,6 +657,32 @@ fn rebind_quiet(shared: &Arc<Shared>, st: &mut State, embed: EmbedId) {
     }
 }
 
+/// The share sheet's `CHOOSE` (share-sheet.md §3): only the `share`
+/// provider, only for an embed it serves, only an app that is a target for
+/// the parent's person. The choice is the parent's, for one request.
+fn choose(shared: &Arc<Shared>, conn: ConnId, c: proto::Choose) -> Result<Reply, Reply> {
+    let (parent, parent_uid) = {
+        let st = shared.state.lock().unwrap();
+        match st.embeds.get(&c.embed) {
+            Some(e) if e.child == conn && e.role.name == "share" && !e.spawned => (e.parent, e.parent_uid),
+            _ => return Err(Reply::Refused { reason: refusal::NOT_YOURS }),
+        }
+    };
+    let person = (shared.resolve)(parent_uid).map(|(u, _)| u).unwrap_or_default();
+    let ok = crate::manifests::plausible_id(&c.app)
+        && shared.target_check.lock().unwrap().as_ref().is_none_or(|check| check(&person, &c.app));
+    if !ok {
+        eprintln!("limend: the share sheet chose {:?}, not a share target for {person}", c.app);
+        return Err(Reply::Refused { reason: refusal::NOT_A_TARGET });
+    }
+    let mut st = shared.state.lock().unwrap();
+    // The parent may have gone meanwhile; a choice for nobody is dropped.
+    if st.embeds.get(&c.embed).is_some_and(|e| e.parent == parent) {
+        st.choices.insert(parent, (c.app, Instant::now()));
+    }
+    Ok(Reply::Ok)
+}
+
 fn provide(shared: &Arc<Shared>, conn: ConnId, uid: u32, p: proto::Provide) -> Result<Reply, Reply> {
     let role = catalogue::role(&p.role).ok_or(Reply::Refused { reason: refusal::UNKNOWN_ROLE })?;
     let Provider::System(app) = role.provider else { return Err(Reply::Refused { reason: refusal::NOT_PROVIDER }) };
@@ -680,6 +732,7 @@ fn gone(shared: &Arc<Shared>, conn: ConnId) {
     let mut st = shared.state.lock().unwrap();
     st.conns.remove(&conn);
     st.providers.retain(|_, (c, _)| *c != conn);
+    st.choices.remove(&conn);
     let mine: Vec<EmbedId> = st.embeds.iter().filter(|(_, e)| e.parent == conn || e.child == conn).map(|(k, _)| *k).collect();
     for id in mine {
         let e = st.embeds.remove(&id).unwrap();

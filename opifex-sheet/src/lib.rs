@@ -26,7 +26,18 @@ pub const MAX_LINE: usize = 4 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ask {
     /// Install the app `id` from the catalog, if the person agrees.
-    Install { id: String },
+    /// `for_uid`: the app it is asked for, when the asker asks on its
+    /// behalf: Monstrator, for an `atrium-app:` link to an app that isn't
+    /// installed (opening-links.md §4.3, L5). Taken only from the uids in
+    /// `OPIFEX_SHEET_FOR_OTHERS` (default `_monstrator`, 65038).
+    Install {
+        id: String,
+        #[serde(default)]
+        for_uid: Option<u32>,
+    },
+    /// Follow the catalog served at `url` (https), for the asking person,
+    /// if they agree (opifex.md §6.5; C7).
+    AddCatalog { url: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +47,8 @@ pub enum Answer {
     /// The person said not now (or closed the sheet, or let it time out).
     Declined,
     Failed { why: String },
+    /// The catalog is followed now, for that person.
+    Added { name: String },
 }
 
 pub fn socket() -> PathBuf {
@@ -46,7 +59,19 @@ pub fn socket() -> PathBuf {
 pub fn install(id: &str) -> io::Result<Answer> {
     let mut s = UnixStream::connect(socket())?;
     s.set_read_timeout(Some(Duration::from_secs(150)))?;
-    let mut line = serde_json::to_vec(&Ask::Install { id: id.into() })?;
+    let mut line = serde_json::to_vec(&Ask::Install { id: id.into(), for_uid: None })?;
+    line.push(b'\n');
+    s.write_all(&line)?;
+    let mut back = String::new();
+    BufReader::new(s).read_line(&mut back)?;
+    serde_json::from_str(back.trim_end()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Ask for the catalog at `url` to be added for this person; waits for them.
+pub fn add_catalog(url: &str) -> io::Result<Answer> {
+    let mut s = UnixStream::connect(socket())?;
+    s.set_read_timeout(Some(Duration::from_secs(150)))?;
+    let mut line = serde_json::to_vec(&Ask::AddCatalog { url: url.into() })?;
     line.push(b'\n');
     s.write_all(&line)?;
     let mut back = String::new();
