@@ -15,4 +15,5 @@ pub mod layer;
 pub mod proto;
 pub mod rp;
 pub mod runtime;
+pub mod sign;
 pub mod updates;

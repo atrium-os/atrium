@@ -554,6 +554,25 @@ The catalog accepts any licence, shown on the sheet as SPDX. The base system's n
 about the base, which never depends on a catalog package. Platform-published packages follow
 the base rule except dev layers, which dev-tools already allows to carry GPL tools.
 
+### 10.4 Built elsewhere, signed here
+
+The platform key never needs to be on the machine that builds. The signature covers only
+`atrium.toml`, which names the archive's contents by the hash of `content.index`, so a remote
+or cloud builder packs unsigned and the key holder signs the manifests alone, without the
+archives:
+
+- on the builder: `opifex sign --list <dir>…` prints `id version content-hash` per package;
+- a second, independent build (another machine or CI runner) prints its own list;
+- locally: `opifex sign <dir>… --key platform.key --expect list.txt` reads every manifest
+  first, refuses all of them if any id, version or content hash differs from the list, then
+  signs each `atrium.toml` (a token key file asks for the PIN once) and writes
+  `atrium.toml.sig` next to it, checked against the key's public key;
+- the `.sig` files go back to the builder, which publishes.
+
+Only the few-KB manifests travel to the key, and the `--expect` list makes two builds agree
+before anything is signed (a reproducible-build check). The platform key sits on its own
+token, separate from the three root tokens.
+
 ## 11. Updates
 
 - `opifex-fetch` syncs the catalog once a day, at a random time, and when the person opens

@@ -107,3 +107,18 @@ Machines adopt it at their next sync; from then on the old keys alone change not
 catalog or platform key goes in the same way. `scripts/opifex-token-check.sh` rehearses all of
 this on software tokens.
 
+## Signing a release built elsewhere (opifex.md §10.4)
+
+The platform key can live on a fourth token on the key holder's own machine while builds run
+remotely. Only the manifests travel:
+
+```
+# on the builder, and again on a second independent build
+opifex sign --list out/*/ > list.txt
+# locally, with the manifest folders copied over (no archives needed)
+opifex sign out/*/ --key platform.key --expect list.txt
+# copy each out/<pkg>/atrium.toml.sig back to the builder, which publishes
+```
+
+`--expect` refuses to sign anything if either build differs from the list.
+

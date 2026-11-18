@@ -84,6 +84,7 @@ fn main() -> ExitCode {
         "update-all" => update_all(),
         "catalog"   => catalog::cmd(&args[2..]),
         "token"     => token::cmd(&args[2..]),
+        "sign"      => cmd_sign(&args[2..]),
         "describe" | "search" | "installed" | "get" | "sync" | "remove" | "side-load"
         | "updates" | "update-care" | "tick" | "catalogs" | "follow" | "unfollow" => ask_daemon(&args[1..]),
         "help" | "-h" | "--help" => { usage(); Ok(()) }
@@ -126,6 +127,8 @@ fn usage() {
            catalog publisher <cat> rotate|scope|recover --id <pub:…> [--key <pub.pem>] --sign <pem>…\n  \
            catalog publishers <cat> | catalog publish <cat> --key <catalog.pem>\n      \
              A catalog of your own (§6.5): apps only, under domains its publishers prove.\n  \
+           sign <dir>… --key <key> [--expect <list>] | sign --list <dir>…\n      \
+             Sign packed manifests built elsewhere; --expect: only if a second build matches.\n  \
            token list --module <pkcs11 lib> | token pub <key file>\n  \
            token ref --module <lib> --serial <s> --id <hex> --out <key file> [--pub <pem>]\n      \
              Keys on hardware tokens (YubiKey PIV): a key file names one; any --key/--sign takes it.\n\n\
@@ -185,6 +188,38 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
     println!("opifex: packed {} ({}){}", m.app.id,
              m.bundle.as_ref().and_then(|b| b.content.clone()).unwrap_or_default(),
              if key.is_some() { ", signed" } else { ", NOT signed" });
+    Ok(())
+}
+
+/// `opifex sign`: see `opifex::sign`.
+fn cmd_sign(args: &[String]) -> Result<(), String> {
+    let (mut key, mut expect, mut list, mut dirs) = (None::<String>, None::<String>, false, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--key" => key = Some(it.next().ok_or("--key needs a key file")?.clone()),
+            "--expect" => expect = Some(it.next().ok_or("--expect needs a file")?.clone()),
+            "--list" => list = true,
+            o if o.starts_with("--") => return Err(format!("sign: unknown flag {o}")),
+            o => dirs.push(Path::new(o).to_path_buf()),
+        }
+    }
+    if dirs.is_empty() {
+        return Err("sign --list <dir>… | sign <dir>… --key <key> [--expect <list>]".into());
+    }
+    if list {
+        for d in &dirs {
+            println!("{}", opifex::sign::read(d)?.line());
+        }
+        return Ok(());
+    }
+    let k = key.ok_or("sign: --key <key file> (a PEM or a token key file)")?;
+    let key = std::fs::read_to_string(&k).map_err(|e| format!("{k}: {e}"))?;
+    let want = match expect { Some(f) => Some(opifex::sign::expected(&std::fs::read_to_string(&f).map_err(|e| format!("{f}: {e}"))?)), None => None };
+    let refs: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+    for p in opifex::sign::sign(&refs, &key, want.as_deref())? {
+        println!("opifex: signed {} {} ({})", p.id, p.version, p.content);
+    }
     Ok(())
 }
 
