@@ -22,6 +22,7 @@ P=$D/pki
 EXTRA_BUILD=1
 CRYPTA_GATE_LIB=1 . "$ROOT/scripts/crypta-v1-gate.sh"
 GW=198.51.100.52
+K="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 NAVPUB=$(printf 'c%.0s' $(seq 64))
 # A web courier's uid: arcad's courier range (64000-64999), clear of the
 # launcher's (it counts up from 64000).
@@ -199,26 +200,9 @@ window_checks() {
     "$V" "pkill -f 'navigatord --unconfined'; pkill -x arca-courierd" || true
 }
 
-case "${1:-}" in
-run)
-    for p in 8443 8444 8445 8446; do
-        nc -z 127.0.0.1 $p 2>/dev/null || { echo "ocserv's forward :$p is not up: sh scripts/crypta-ocserv-vm.sh up" >&2; exit 1; }
-    done
-    CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
-    (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-probe)
-    (cd "$ROOT/crypta" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T -p crypta-engine)
-    (cd "$ROOT/navigatord" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin navigatord)
-    (cd "$ROOT/navigator-prerender" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin prerender)
-    (cd "$ROOT/navigator-page" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --example sign-in-probe)
-    (cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courierd)
-    (cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courier)
-    EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe
-        $ROOT/navigatord/target/$T/release/navigatord $ROOT/navigator-prerender/target/$T/release/prerender
-        $ROOT/navigator-page/target/$T/release/examples/sign-in-probe $ROOT/arca/arca-courierd/target/$T/release/arca-courierd
-        $ROOT/arca/arca-courier/target/$T/release/arca-courier $P/ca.pem"
-    setup
-
-    echo "== the AnyConnect engine, Arca's field and a person's store"
+# arcad (alice's store unlocked, the Navigator's broker and a web courier
+# known) and cryptad, as Settings and the sign-in window find them.
+stand() {
     "$V" "set -e
         install -m 755 $G/atrium-crypta-ac /usr/local/bin/atrium-crypta-ac
         for u in cg-vest cg-ui cg-nav; do id \$u >/dev/null 2>&1 || pw useradd \$u -d /nonexistent -s /usr/sbin/nologin -c 'crypta gate'; done
@@ -239,6 +223,29 @@ run)
         grep -q gw.crypta.test /etc/hosts || echo '$GW gw.crypta.test' >> /etc/hosts
         grep -q sso.crypta.test /etc/hosts || echo '$GW sso.crypta.test' >> /etc/hosts
         sleep 1"
+}
+
+case "${1:-}" in
+run)
+    for p in 8443 8444 8445 8446; do
+        nc -z 127.0.0.1 $p 2>/dev/null || { echo "ocserv's forward :$p is not up: sh scripts/crypta-ocserv-vm.sh up" >&2; exit 1; }
+    done
+    CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
+    (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-probe)
+    (cd "$ROOT/crypta" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T -p crypta-engine)
+    (cd "$ROOT/navigatord" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin navigatord)
+    (cd "$ROOT/navigator-prerender" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin prerender)
+    (cd "$ROOT/navigator-page" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --example sign-in-probe)
+    (cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courierd)
+    (cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courier)
+    EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe
+        $ROOT/navigatord/target/$T/release/navigatord $ROOT/navigator-prerender/target/$T/release/prerender
+        $ROOT/navigator-page/target/$T/release/examples/sign-in-probe $ROOT/arca/arca-courierd/target/$T/release/arca-courierd
+        $ROOT/arca/arca-courier/target/$T/release/arca-courier $P/ca.pem"
+    setup
+
+    echo "== the AnyConnect engine, Arca's field and a person's store"
+    stand
     h=$(hold probe); [ ${#h} = 32 ] && ok "Arca holds a typed value for Crypta (a handle)" || fail "hold: $h"
     CA=$(openssl x509 -in "$P/ca.pem" -outform DER | base64 -w0)
 
@@ -390,8 +397,85 @@ run)
     [ "$left" = 0 ] && ok "Arca keeps nothing for them (passwords, sessions, the client key)" || fail "Arca still holds items: $left"
     echo "crypta V4 gate: $pass checks passed"
     ;;
+ui)
+    # Frames of Settings' sign-ins (scratch/crypta-v4-*.png): the stand,
+    # Crypta's front, a password gateway and a single sign-on gateway both
+    # asking, and a headless frescod, forum-wm, limend, arca-ui (Arca's
+    # field in a slot) and Curia. The UI binaries come prebuilt from
+    # $UIBIN (frescod forum-wm curia limend arca-ui, x86_64-unknown-freebsd).
+    # Then `click X Y name` presses and frames.
+    U=/var/tmp/crypta-v4-ui; FS=$U/fresco.sock
+    CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
+    (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-probe)
+    (cd "$ROOT/crypta" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T -p crypta-engine -p crypta-ctl)
+    EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe
+        $ROOT/crypta/target/$T/release/atrium-crypta-ctl $P/ca.pem"
+    setup
+    trap - EXIT
+    pkill -f atrium-net/sim/lan.py 2>/dev/null || true
+    python3 "$ROOT/atrium-net/sim/lan.py" 3600 > "$LAN_LOG" 2>&1 &
+    sleep 15
+    "$V" "install -m 755 $G/atrium-crypta-ac /usr/local/bin/atrium-crypta-ac
+        for u in cg-vest cg-ui cg-nav cg-set; do id \$u >/dev/null 2>&1 || pw useradd \$u -d /nonexistent -s /usr/sbin/nologin -c 'crypta gate'; done"
+    stand
+    scp $K -P 2222 -q "$ROOT/crypta/etc/atrium-crypta-ctl" root@localhost:$G/rc.atrium-crypta-ctl
+    "$V" "set -e
+        echo \"\$(id -u cg-set) alice org.atrium.curia $PUBK\" >> $G/apps.registry; chmod 644 $G/apps.registry
+        id -u _crypta-ctl 2>/dev/null | grep -qx 65054 || { pw userdel _crypta-ctl 2>/dev/null || true; pw useradd _crypta-ctl -u 65054 -d /nonexistent -s /usr/sbin/nologin -c 'cryptad settings front'; }
+        install -m 755 $G/atrium-crypta-ctl /usr/local/bin/
+        install -m 555 $G/rc.atrium-crypta-ctl /usr/local/etc/rc.d/atrium-crypta-ctl
+        sysrc atrium_crypta_ctl_ctl=$G/crypta.sock atrium_crypta_ctl_flags=-v >/dev/null
+        service atrium-crypta-ctl onestop >/dev/null 2>&1 || true
+        service atrium-crypta-ctl onestart >/dev/null
+        i=0; while [ \$i -lt 20 ] && ! test -S /atrium/sockets/vpn-configure/vpn-configure.sock; do sleep 1; i=\$((i+1)); done"
+    CA=$(openssl x509 -in "$P/ca.pem" -outform DER | base64 -w0)
+    "$V" "$CTL create-ac name=corp host=gw.crypta.test ca=$CA scoped=0; $CTL up name=corp
+        $CTL create-ac name=sso host=sso.crypta.test:447 ca=$CA scoped=0; $CTL up name=sso" >/dev/null || true
+    wait_for corp signin prompt "no prompt"
+    "$V" "pkill -x 'curia|forum-wm|frescod|limend|arca-ui' || true; sleep 1; rm -rf $U; mkdir -p $U /usr/local/share/fonts/ibm-plex"
+    for b in curia forum-wm frescod limend arca-ui; do scp $K -P 2222 -q "${UIBIN:?the UI binaries}/$b" root@localhost:$U/; done
+    scp $K -P 2222 -q "$ROOT/fonts/ibm-plex/IBMPlexSans.ttf" "$ROOT/fonts/phosphor/Phosphor.ttf" root@localhost:/usr/local/share/fonts/ibm-plex/
+    E="FRESCO_SOCKET=$FS FRESCO_WM_SOCKET=$U/wm.sock FORUM_CTL_SOCKET=$U/ctl.sock"
+    "$V" "set -e; cd $U
+        mkdir -p /atrium/sockets/ostiarius; printf 'alice\n' > /atrium/sockets/ostiarius/active-session; : > /atrium/sockets/ostiarius/session-locked
+        UI=\$(id -u cg-ui); SET=\$(id -u cg-set)
+        env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$U/screen FRESCOD_SOCK=$FS FRESCOD_WM_SOCK=$U/wm.sock FRESCOD_INPUT_SOCK=$U/inject.sock \
+            FRESCOD_ACTIVATION_SOCK=$U/activation.sock FRESCOD_CHROME_UIDS=\$SET FRESCOD_SLOT_UIDS=0 FRESCOD_ACTIVATION_UIDS=\$UI FRESCOD_INJECT_ACTIVATION=1 \
+            daemon -f -o $U/frescod.log $U/frescod </dev/null
+        i=0; while [ \$i -lt 60 ] && ! test -S $FS; do sleep 2; i=\$((i+1)); done
+        env $E daemon -f -o $U/wm.log $U/forum-wm </dev/null; sleep 4; chmod 666 $U/*.sock; chmod 755 $U
+        env LIMEN_SOCKET=$U/limend.sock LIMEN_FRESCOD_ACTIVATION=$U/activation.sock LIMEN_APP_REGISTRY=$G/apps.registry LIMEN_ARCA_UID=\$UI \
+            daemon -f -o $U/limend.log $U/limend </dev/null
+        i=0; while [ \$i -lt 20 ] && ! test -S $U/limend.sock; do sleep 1; i=\$((i+1)); done; chmod 666 $U/limend.sock
+        env LIMEN_SOCKET=$U/limend.sock FRESCO_SOCKET=$FS ARCA_SOCKET=/atrium/sockets/arca/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry \
+            daemon -f -o $U/arca-ui.log -u cg-ui $U/arca-ui </dev/null
+        env $E LIMEN_SOCKET=$U/limend.sock CURIA_SIZE=1100x760 daemon -f -u cg-set -o $U/curia.log $U/curia </dev/null
+        sleep 3; pgrep -lx 'frescod|forum-wm|limend|arca-ui|curia' | tr '\n' ' '; echo"
+    GAP=40 sh "$0" frame start
+    ;;
+click)
+    U=/var/tmp/crypta-v4-ui
+    "$V" "printf 'MOVE $2 $3\n' | nc -N -U $U/inject.sock; sleep 1; printf 'BTN 1 1\n' | nc -N -U $U/inject.sock; sleep 1; printf 'BTN 1 0\n' | nc -N -U $U/inject.sock" >/dev/null
+    sh "$0" frame "${4:-click}"
+    ;;
+type) # lower-case letters and digits, then a frame
+    U=/var/tmp/crypta-v4-ui; s=$2; out=""
+    while [ -n "$s" ]; do
+        c=$(printf '%s' "$s" | cut -c1); s=$(printf '%s' "$s" | cut -c2-)
+        case "$c" in [a-z]) u=$(( $(printf '%d' "'$c") - 97 + 4 )) ;; [1-9]) u=$(( c + 29 )) ;; 0) u=39 ;; *) exit 2 ;; esac
+        out="${out}KEY $u 1\nKEY $u 0\n"
+    done
+    "$V" "printf '$out' | nc -N -U $U/inject.sock" >/dev/null
+    sh "$0" frame "${3:-typed}"
+    ;;
+frame)
+    U=/var/tmp/crypta-v4-ui; O="$ROOT/scratch"; mkdir -p "$O"
+    sleep "${GAP:-15}"
+    "$V" "cp $U/screen.png $U/s.png 2>/dev/null || cp $U/screen $U/s.png"
+    scp $K -P 2222 -q root@localhost:$U/s.png "$O/crypta-v4-$2.png" && echo "frame $O/crypta-v4-$2.png"
+    ;;
 *)
-    echo "usage: $0 run" >&2
+    echo "usage: $0 run|ui|click X Y name|frame name" >&2
     exit 2
     ;;
 esac

@@ -853,7 +853,9 @@ fn main() {
                     (true, None) if Instant::now() >= next_vask => {
                         next_vask = Instant::now() + Duration::from_secs(2);
                         if let Some(token) = win.embed_token() {
-                            match e.borrow_mut().request("credential", token, vcred.slot_key()) {
+                            // Asked first: the borrow ends before `send` takes it again.
+                            let asked = e.borrow_mut().request("credential", token, vcred.slot_key());
+                            match asked {
                                 Ok(id) => {
                                     let _ = e.borrow_mut().send(id, vcred.configure().encode());
                                     vcred_embed = Some(id);
