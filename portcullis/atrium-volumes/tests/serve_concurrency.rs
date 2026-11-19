@@ -20,6 +20,7 @@ fn start() -> (PathBuf, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("atrium-volumes.sock");
     let state = dir.path().join("atrium-volumes.state.json");
+    let groups = dir.path().join("volumes.groups.toml");
     let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()      // portcullis/
         .parent().unwrap()      // bsd/
@@ -27,7 +28,7 @@ fn start() -> (PathBuf, tempfile::TempDir) {
     let policy = Policy::load(&policy_path).expect("load shipped policy");
     let listener = atrium_volumes::server::bind(&sock).unwrap();
     std::thread::spawn(move || {
-        let _ = atrium_volumes::server::serve(&listener, &policy, &state);
+        let _ = atrium_volumes::server::serve(&listener, &policy, &state, &groups);
     });
     (sock, dir)
 }

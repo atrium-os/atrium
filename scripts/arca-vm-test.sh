@@ -122,10 +122,9 @@ put "$tmpd/jaild.policy.toml" /etc/atrium/jaild.policy.toml
 # The web broker (§6): a test app id and publisher, as the Navigator's will be.
 BROKER_PUB=$(printf 'b%.0s' $(seq 64))
 # And a test system service for the machine store (§3, uid 50804).
-# §9: a test uid (50805) stands in for atrium-volumes, a volume service;
+# §9: atrium-volumes' own uid (_volumes-vk, 65053), a volume service;
 # dispensatord keeps its own (65043, scripts/tessera-sticks-vm.sh).
 sed -e "s|^env  = \[|env  = [{ key = \"ARCA_WEB_BROKER\", value = \"org.atrium.navigator $BROKER_PUB\" }, |" -e "s|vinculumd=65024|vinculumd=50804|" \
-    -e "s|dispensatord=65043|dispensatord=65043,atrium-volumes=50805|" \
     "$ROOT/arca/arcad/etc/services.d/42-atrium-arcad.toml" > "$tmpd/42-atrium-arcad.toml"
 put "$tmpd/42-atrium-arcad.toml" /etc/atrium/services.d/42-atrium-arcad.toml
 # Only Arca's manifest: the smoke manifests would churn the bootstrap log.
@@ -414,7 +413,7 @@ echo "=== 9. Tessera volume keys (tessera-encryption.md §4.3, E2)"
 if g "test -c /dev/tesserakeys"; then
 KL=/root/sealed/tessera-keyload
 VK=/root/vk-test
-g "pw usershow arcavol >/dev/null 2>&1 || pw useradd arcavol -u 50805 -d /nonexistent -s /usr/sbin/nologin"
+g "pw usershow _volumes-vk >/dev/null 2>&1 || pw useradd _volumes-vk -u 65053 -d /nonexistent -s /usr/sbin/nologin"
 check "arcad's jail may use the keyring (allow.tessera_keys)" true "$(g "jls -j $JID allow.tessera_keys" | tr -d ' ')"
 check "arcad's jail sees the keyring, as _arca" "_arca 600" "$(g "stat -f '%Su %Lp' $J/dev/tesserakeys" 2>/dev/null)"
 # Another jail, shown the host's /dev: the kernel still refuses it.
@@ -429,30 +428,30 @@ U=$(g "head -c 16 /dev/random | od -An -tx1 | tr -d ' \n'")
 FOREIGN=$(g "head -c 16 /dev/random | od -An -tx1 | tr -d ' \n'")
 check "an app can't mint a volume key" no "$(as arcaapp1 "vk-mint alice work $U stick" | grep -q '^status=0' && echo yes || echo no)"
 check "an unnamed service can't" no "$(as arcabt "vk-mint alice work $U stick" | grep -q '^status=0' && echo yes || echo no)"
-r=$(as arcavol "vk-mint alice work $U VM-stick")
+r=$(as _volumes-vk "vk-mint alice work $U VM-stick")
 KID=$(echo "$r" | sed -n 's/^status=0 body=//p')
 check "the volume service mints a key (only its id comes back)" 32 "${#KID}"
 loaded() { g "$KL gen $1 >/dev/null 2>&1 && echo loaded || echo absent"; }
 check "the key is in the kernel" loaded "$(loaded $KID)"
-check "no op returns anything as long as a key" yes "$(as arcavol "vk-sweep alice work $KID $U" | awk -F'[= ]' '{print ($2 < 32) ? "yes" : $0}')"
+check "no op returns anything as long as a key" yes "$(as _volumes-vk "vk-sweep alice work $KID $U" | awk -F'[= ]' '{print ($2 < 32) ? "yes" : $0}')"
 g "$KL drop $KID >/dev/null"
 # Another person, unlocked: their store has no such key. (Locked, arcad can
 # only answer LOCKED: the item would be in that store, which it can't read.)
 as _ostiarius 'unlock vkbob other-horse' >/dev/null
-check "another person: refused" "status=1 body=" "$(as arcavol "vk-load vkbob work $KID $U 0")"
-check "another persona: refused" "status=1 body=" "$(as arcavol "vk-load alice personal $KID $U 0")"
-check "another volume: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $FOREIGN 0")"
-check "another key group: refused" "status=1 body=" "$(as arcavol "vk-load alice work $KID $U 7")"
+check "another person: refused" "status=1 body=" "$(as _volumes-vk "vk-load vkbob work $KID $U 0")"
+check "another persona: refused" "status=1 body=" "$(as _volumes-vk "vk-load alice personal $KID $U 0")"
+check "another volume: refused" "status=1 body=" "$(as _volumes-vk "vk-load alice work $KID $FOREIGN 0")"
+check "another key group: refused" "status=1 body=" "$(as _volumes-vk "vk-load alice work $KID $U 7")"
 check "an app can't load it" no "$(as arcaapp1 "vk-load alice work $KID $U 0" | grep -q '^status=0' && echo yes || echo no)"
 check "…and nothing was loaded" absent "$(loaded $KID)"
 as _ostiarius 'lock alice' >/dev/null
-check "locked: LOCKED" "status=2 body=" "$(as arcavol "vk-load alice work $KID $U 0")"
+check "locked: LOCKED" "status=2 body=" "$(as _volumes-vk "vk-load alice work $KID $U 0")"
 check "…nothing loaded" absent "$(loaded $KID)"
 as _ostiarius 'unlock alice correct-horse' >/dev/null
-check "unlocked: the owner's key loads" "status=0 body=" "$(as arcavol "vk-load alice work $KID $U 0")"
+check "unlocked: the owner's key loads" "status=0 body=" "$(as _volumes-vk "vk-load alice work $KID $U 0")"
 check "…into the kernel" loaded "$(loaded $KID)"
-check "record: the high-water mark (8 bytes)" 16 "$(as arcavol "vk-record alice work $KID" | sed -n 's/^status=0 body=//p' | tr -d '\n' | wc -c | tr -d ' ')"
-r=$(as arcavol "vk-forget alice work $KID")
+check "record: the high-water mark (8 bytes)" 16 "$(as _volumes-vk "vk-record alice work $KID" | sed -n 's/^status=0 body=//p' | tr -d '\n' | wc -c | tr -d ' ')"
+r=$(as _volumes-vk "vk-forget alice work $KID")
 check "forget without verification is refused" no "$(echo "$r" | grep -q '^status=0' && echo yes || echo no)"
 check "…and the key stays" loaded "$(loaded $KID)"
 # Mounts against arcad's key: a volume naming its id for another uuid, and

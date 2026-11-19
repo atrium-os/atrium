@@ -2298,8 +2298,8 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
     publish_colours(&owner, &tp.policy);
     if removing {
         let gone = portcullis_overlay::remove_persona_places(&owner, &name);
-        // Its files too (personas.md §4.1): deleted until Tessera's keys
-        // make it the key that goes.
+        // Its files too (personas.md §4.1): encrypted, the key goes and the
+        // kernel crypto-erases them (tessera-encryption.md E4.6).
         let files = match portcullisd::home::remove_persona(&owner, &name) {
             Ok(true) => "its folders deleted",
             Ok(false) => "it had no folders",

@@ -34258,6 +34258,62 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
 /* struct tessera_ioc_group and the two commands are in tessera/keyring.h,
  * for tessera-keyload and atrium-volumes. */
 
+/*
+ * TESSERA_IOC_GROUP_INFO (E4.6): what a directory is, for atrium-volumes'
+ * expected groups (§5.4). The state is tessera_fs_domain_keys' answer, so
+ * OPEN means the key is loaded and the domain record carries the group's
+ * MAC; a domain moved into another group, or stripped of its group, shows
+ * as such and atrium-volumes refuses it.
+ */
+static __noinline int
+tessera_fs_group_info(struct vnode *vp, struct tessera_ioc_group_info *o)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	struct tessera_node *tn = VTOTNODE(vp);
+	tessera_inode_record_t dino;
+	tessera_group_keys_t *gk;
+	tessera_quota_domain_t *qd;
+	struct tessera_fs_group *g;
+	int e;
+
+	if (vp->v_type != VDIR)
+		return (ENOTDIR);
+	memset(o, 0, sizeof(*o));
+	memcpy(o->volume_uuid, tmp_->sb.volume_uuid, sizeof(o->volume_uuid));
+	if (tmp_->inode_tree == NULL)
+		return (0);
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
+	    != TESSERA_OK)
+		return (EIO);
+	if (dino.quota_domain == 0)
+		return (0);
+	o->domain_id = dino.quota_domain;
+	gk = malloc(sizeof(*gk), M_TESSERA, M_WAITOK | M_ZERO);
+	e = tessera_fs_domain_keys(tmp_, dino.quota_domain, gk);
+	tessera_group_keys_clear(gk);
+	zfree(gk, M_TESSERA);
+	if (!tmp_->groups_sx_init)
+		return (0);
+	sx_xlock(&tmp_->groups_sx);
+	qd = tessera_quota_find(tmp_, dino.quota_domain);
+	if (qd != NULL) {
+		if (qd->root_inode_no == tn->inode_no)
+			o->flags |= TESSERA_GROUP_INFO_ROOT;
+		o->group_id = qd->key_group;
+	}
+	g = tessera_fs_group_find(tmp_, o->group_id);
+	if (g != NULL)
+		memcpy(o->key_id, g->rec.key_id, sizeof(o->key_id));
+	else if (o->group_id != 0)
+		o->flags |= TESSERA_GROUP_INFO_NO_RECORD;
+	sx_xunlock(&tmp_->groups_sx);
+	if (o->group_id != 0)
+		o->flags |= e == 0 ? TESSERA_GROUP_INFO_OPEN :
+		    e == EACCES ? TESSERA_GROUP_INFO_LOCKED :
+		    TESSERA_GROUP_INFO_BAD;
+	return (0);
+}
+
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
@@ -34530,7 +34586,8 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	case TESSERA_IOC_CLEAR_RECOVERY:
 	case TESSERA_IOC_GROUP_CREATE:
 	case TESSERA_IOC_QUOTA_GROUP:
-	case TESSERA_IOC_GROUP_ERASE: {
+	case TESSERA_IOC_GROUP_ERASE:
+	case TESSERA_IOC_GROUP_INFO: {
 		if (jailed(ap->a_cred))
 			return (EPERM);
 		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
@@ -34550,6 +34607,10 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 			atomic_add_rel_64(&tmp_->quota_gen, 1);
 		return (er);
 	}
+	/* GROUP_INFO only reads; it takes groups_sx itself. */
+	if (ap->a_command == TESSERA_IOC_GROUP_INFO)
+		return (tessera_fs_group_info(ap->a_vp,
+		    (struct tessera_ioc_group_info *)ap->a_data));
 	/* QUOTA_GROUP checks emptiness first, which may publish the
 	 * directory's pending dirents through the gate; it takes the gate
 	 * itself afterwards. */

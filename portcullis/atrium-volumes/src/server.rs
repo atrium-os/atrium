@@ -22,15 +22,36 @@ use crate::protocol::{
     self, BackendInfo, DestroyRequest, ProvisionRequest, Request, Response,
     VolumeKind, VolumeRecord as ProtoVolumeRecord,
 };
+use crate::arca::Arcad;
+use crate::groups::Groups;
+use crate::persona::{Folders, Tessera};
 use crate::state::{State, VolumeRecord};
+
+/// What the persona-folder requests need between requests.
+pub struct FolderCtx<'a> {
+    arcad:  &'a Arcad,
+    groups: &'a mut Groups,
+    path:   &'a Path,
+}
+
+impl FolderCtx<'_> {
+    fn with(&mut self, f: impl FnOnce(&mut Folders<'_, Tessera, Arcad>) -> Response) -> Response {
+        let mut x = Folders { kernel: &Tessera, keys: self.arcad, groups: self.groups, path: self.path };
+        f(&mut x)
+    }
+}
 use crate::VolumesError;
 
 pub fn serve(
     listener:   &UnixListener,
     policy:     &Policy,
     state_path: &Path,
+    groups_path: &Path,
 ) -> Result<(), VolumesError> {
     let mut state = State::load(state_path)?;
+    let mut groups = Groups::load(groups_path)?;
+    let arcad = Arcad::new()?;
+    let mut folders = FolderCtx { arcad: &arcad, groups: &mut groups, path: groups_path };
     info!("atrium-volumes: ready ({} volume(s) known, {} backend(s) configured)",
         state.volumes.len(), policy.backends.len());
 
@@ -56,7 +77,7 @@ pub fn serve(
             let Some(conn) = mux.session_mut(fd) else { continue };
             let served = match conn.take_frame() {
                 Ok(Some(body)) => serve_request(conn.stream(), &body, policy,
-                    &mut state, state_path),
+                    &mut state, state_path, &mut folders),
                 Ok(None) => Ok(()),
                 Err(e) => Err(VolumesError::Io(e)),
             };
@@ -75,6 +96,7 @@ fn serve_request(
     policy:     &Policy,
     state:      &mut State,
     state_path: &Path,
+    folders:    &mut FolderCtx<'_>,
 ) -> Result<(), VolumesError> {
     let req: Request = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -84,7 +106,11 @@ fn serve_request(
             });
         }
     };
-    let resp = dispatch(req, policy, state, state_path);
+    let resp = match req {
+        Request::PersonaFolders(r) => folders.with(|f| f.prepare(&r)),
+        Request::EraseFolders(r) => folders.with(|f| f.erase(&r)),
+        req => dispatch(req, policy, state, state_path),
+    };
     send(stream, &resp)
 }
 
@@ -116,6 +142,10 @@ fn dispatch(
         Request::Destroy(d) => match handle_destroy(&d, policy, state, state_path) {
             Ok(resp) => resp,
             Err(e)   => err_to_resp(e),
+        },
+
+        Request::PersonaFolders(_) | Request::EraseFolders(_) => Response::Error {
+            detail: "persona folders are served by serve_request".into(),
         },
 
         Request::Status(s) => Response::Status {

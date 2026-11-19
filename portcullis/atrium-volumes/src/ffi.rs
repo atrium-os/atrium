@@ -152,3 +152,131 @@ pub fn tessera_detach_quota_domain(_path: &Path) -> io::Result<()> {
         "tessera quota-detach ioctl is FreeBSD-only",
     ))
 }
+
+// ---------------------------------------------------------------------
+// Key groups (tessera-encryption.md §5.4, E4.6): the ioctls in
+// atrium-tessera/core/include/tessera/keyring.h, on a directory's
+// descriptor, unjailed root only.
+// ---------------------------------------------------------------------
+
+/// `struct tessera_ioc_group_info`: what a directory is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct GroupInfo {
+    pub volume_uuid: [u8; 16],
+    /// The group's key id; zero for no group.
+    pub key_id:      [u8; 16],
+    /// 0: in no quota domain.
+    pub domain_id:   u64,
+    /// 0: the domain is in no key group.
+    pub group_id:    u64,
+    pub flags:       u32,
+    pub pad:         u32,
+}
+
+impl GroupInfo {
+    pub const ROOT: u32 = 0x1;
+    pub const OPEN: u32 = 0x2;
+    pub const LOCKED: u32 = 0x4;
+    pub const BAD: u32 = 0x8;
+    pub const NO_RECORD: u32 = 0x10;
+    pub fn has(&self, f: u32) -> bool { self.flags & f != 0 }
+}
+
+/// `struct tessera_ioc_group`.
+#[repr(C)]
+struct IocGroup {
+    key_id:   [u8; 16],
+    group_id: u64,
+    suite:    u32,
+    pad:      u32,
+}
+
+/// `_IOR('T', 10, struct tessera_ioc_group_info)`: OUT | 56 << 16 | 'T' << 8 | 10.
+pub const TESSERA_IOC_GROUP_INFO: u64 = 0x4038_540A;
+/// `_IOW('T', 7, struct tessera_ioc_group)`: IN | 32 << 16 | 'T' << 8 | 7.
+pub const TESSERA_IOC_GROUP_CREATE: u64 = 0x8020_5407;
+/// `_IOW('T', 8, uint64_t)`.
+pub const TESSERA_IOC_QUOTA_GROUP: u64 = 0x8008_5408;
+/// `_IOW('T', 9, uint64_t)`.
+pub const TESSERA_IOC_GROUP_ERASE: u64 = 0x8008_5409;
+
+#[cfg(target_os = "freebsd")]
+fn dir_ioctl<T>(path: &Path, cmd: u64, arg: &mut T) -> io::Result<()> {
+    let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
+    // SAFETY: open a directory (never through a link) read-only for the
+    // ioctl; `arg` is a #[repr(C)] value of the size the command encodes;
+    // close on every path.
+    let fd = unsafe {
+        libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::ioctl(fd, cmd as libc::c_ulong, arg as *mut T) };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn dir_ioctl<T>(_path: &Path, _cmd: u64, _arg: &mut T) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTTY))
+}
+
+/// What `path` (a directory) is: its volume, domain and key group.
+pub fn tessera_group_info(path: &Path) -> io::Result<GroupInfo> {
+    let mut gi = GroupInfo::default();
+    dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?;
+    Ok(gi)
+}
+
+/// Make key group `group_id` on the volume under the loaded key `key_id`.
+pub fn tessera_group_create(path: &Path, key_id: &[u8; 16], group_id: u64) -> io::Result<()> {
+    let mut g = IocGroup { key_id: *key_id, group_id, suite: 0, pad: 0 };
+    dir_ioctl(path, TESSERA_IOC_GROUP_CREATE, &mut g)
+}
+
+/// Put the (empty) domain rooted at `path` into key group `group_id`.
+pub fn tessera_quota_group(path: &Path, group_id: u64) -> io::Result<()> {
+    let mut g = group_id;
+    dir_ioctl(path, TESSERA_IOC_QUOTA_GROUP, &mut g)
+}
+
+/// Crypto-erase locked key group `group_id` (any directory of the volume).
+pub fn tessera_group_erase(path: &Path, group_id: u64) -> io::Result<()> {
+    let mut g = group_id;
+    dir_ioctl(path, TESSERA_IOC_GROUP_ERASE, &mut g)
+}
+
+/// Copy the `user.atrium.origin` attribute (where a download came from)
+/// from one open file to another. Absent: nothing to do.
+#[cfg(target_os = "freebsd")]
+pub fn copy_origin(from: &std::fs::File, to: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = CString::new("atrium.origin").unwrap();
+    let mut buf = [0u8; 4096];
+    // SAFETY: descriptors we hold, a NUL-terminated name, a buffer and its length.
+    let n = unsafe {
+        libc::extattr_get_fd(from.as_raw_fd(), libc::EXTATTR_NAMESPACE_USER,
+            name.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+    };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ENOATTR) { Ok(()) } else { Err(e) };
+    }
+    let r = unsafe {
+        libc::extattr_set_fd(to.as_raw_fd(), libc::EXTATTR_NAMESPACE_USER,
+            name.as_ptr(), buf.as_ptr().cast(), n as usize)
+    };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn copy_origin(_from: &std::fs::File, _to: &std::fs::File) -> io::Result<()> {
+    Ok(())
+}

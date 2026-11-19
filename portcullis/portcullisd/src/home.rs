@@ -48,6 +48,70 @@ fn pw(args: &[&str]) -> Result<(), String> {
     if o.status.success() { Ok(()) } else { Err(format!("pw {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim())) }
 }
 
+/// atrium-volumes' socket (persona folders' encryption, E4.6).
+pub const VOLUMES_SOCKET: &str = "/var/run/atrium/atrium-volumes.sock";
+
+fn volumes() -> Option<crate::volumes_client::Client> {
+    let path = std::env::var_os("ATRIUM_VOLUMES_SOCKET").map(PathBuf::from).unwrap_or_else(|| VOLUMES_SOCKET.into());
+    match crate::volumes_client::Client::connect(&path) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("portcullisd: atrium-volumes at {} not reached ({e}): folders are not encrypted now", path.display());
+            None
+        }
+    }
+}
+
+/// A persona's folders, encrypted in its key group with its key loaded
+/// from the person's Arca (tessera-encryption.md §5.4, E4.6): atrium-volumes
+/// makes missing ones in the group and moves a plain one's files in. A
+/// folder that should be encrypted and isn't (an offline edit) is refused,
+/// and so is a locked Arca: the folders aren't handed out. Without Tessera
+/// or Arca keys on this machine the folders stay as they were.
+fn encrypt_folders(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32) -> Result<(), String> {
+    use atrium_volumes::protocol::{PersonaFoldersRequest, Request, Response};
+    let Some(mut c) = volumes() else { return Ok(()) };
+    let req = Request::PersonaFolders(PersonaFoldersRequest {
+        person: person.into(),
+        persona: persona.into(),
+        folders: dirs.iter().map(|d| d.display().to_string()).collect(),
+        uid,
+        gid,
+        mode: 0o2770,
+    });
+    match c.send(&req) {
+        Ok(Response::FoldersReady { encrypted, moved }) => {
+            for m in moved {
+                eprintln!("portcullisd: {person}'s {m}: old files moved into the encrypted folder");
+            }
+            if !encrypted {
+                eprintln!("portcullisd: {person}'s {persona} folders are not encrypted (no Tessera keys here)");
+            }
+            Ok(())
+        }
+        Ok(Response::FoldersRefused { folder, detail }) => Err(format!("{folder} refused: {detail}")),
+        Ok(Response::Error { detail }) => Err(detail),
+        Ok(other) => Err(format!("atrium-volumes: unexpected {other:?}")),
+        Err(e) => {
+            eprintln!("portcullisd: atrium-volumes: {e}: {person}'s {persona} folders are not encrypted now");
+            Ok(())
+        }
+    }
+}
+
+/// A removed persona's folders, crypto-erased: `Ok(false)` if they were
+/// never encrypted.
+fn erase_folders(person: &str, persona: &str) -> Result<bool, String> {
+    use atrium_volumes::protocol::{EraseFoldersRequest, Request, Response};
+    let Some(mut c) = volumes() else { return Ok(false) };
+    match c.send(&Request::EraseFolders(EraseFoldersRequest { person: person.into(), persona: persona.into() })) {
+        Ok(Response::FoldersErased { erased }) => Ok(erased),
+        Ok(Response::Error { detail }) => Err(detail),
+        Ok(other) => Err(format!("atrium-volumes: unexpected {other:?}")),
+        Err(e) => Err(format!("atrium-volumes: {e}")),
+    }
+}
+
 /// Make the person's folders, group and `~/.atrium` if missing, and put
 /// right a folder whose group or mode drifted. Returns the home and the
 /// group's id. A folder that is a link, or someone else's, is refused.
@@ -63,6 +127,7 @@ pub fn ensure_person(person: &str) -> Result<(PathBuf, u32), String> {
         }
     };
     portcullis_overlay::apps_root(&home)?;
+    encrypt_folders(person, "personal", &FOLDERS.iter().map(|f| home.join(f)).collect::<Vec<_>>(), uid, gid)?;
     for f in FOLDERS {
         let d = home.join(f);
         match std::fs::symlink_metadata(&d) {
@@ -165,6 +230,7 @@ pub fn ensure_persona(person: &str, persona: &str) -> Result<(PathBuf, u32), Str
     ensure_root_dir(&all)?;
     let dir = all.join(persona);
     ensure_root_dir(&dir)?;
+    encrypt_folders(person, persona, &FOLDERS.iter().map(|f| dir.join(f)).collect::<Vec<_>>(), uid, gid)?;
     for f in FOLDERS {
         ensure_folder(&dir.join(f), uid, gid, person)?;
     }
@@ -192,11 +258,17 @@ pub fn grant_persona_group(person: &str, persona: &str, run_as: &str) -> Result<
 }
 
 /// A removed persona's folders and group go (personas.md §4.1 "Removing a
-/// persona"). Without Tessera's keys this deletes; with them it will be
-/// the key that goes.
+/// persona"). Encrypted, it is the key that goes: arcad deletes it, the
+/// kernel drops it and crypto-erases the group (E4.6), and the empty
+/// folders are deleted after. Plain, they are deleted.
 pub fn remove_persona(person: &str, persona: &str) -> Result<bool, String> {
     if !plain(persona) {
         return Err(format!("{persona:?} is not a named persona"));
+    }
+    // An erase that can't finish now (a folder in use) finishes at the
+    // person's next login; its key is gone already, so nothing is readable.
+    if let Err(e) = erase_folders(person, persona) {
+        return Err(format!("its key is gone; the erase finishes later ({e})"));
     }
     let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
     let dir = home.join(PERSONAS_DIR).join(persona);

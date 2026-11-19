@@ -229,7 +229,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB8).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xB9).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC9).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
@@ -786,6 +786,33 @@ impl State {
                     return reply(status::NEEDS_VERIFICATION);
                 }
                 tri!(store.delete(&m.id, &Access { persona: &persona, recipient: &me }));
+                match self.keyring.as_mut().unwrap().drop_key(&key_id) {
+                    Ok(()) => ok(Vec::new()),
+                    Err(e) if e == libc::ENOENT => ok(Vec::new()),
+                    Err(_) => reply(status::INTERNAL),
+                }
+            }
+            volume_op::VK_RETIRE => {
+                let key_id = field!(r.array::<16>());
+                field!(r.end());
+                if name != "atrium-volumes" {
+                    return reply(status::DENIED);
+                }
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let Some(m) = tri!(Self::volume_item(store, &persona, &key_id)) else { return reply(status::DENIED) };
+                *item = Some(m.id);
+                // A key group's only: a stick's key goes through VK_FORGET,
+                // with the person verified.
+                if !decode_scope(&m.scope).is_some_and(|(_, _, g)| g != 0) {
+                    return reply(status::DENIED);
+                }
+                tri!(store.delete(&m.id, &Access { persona: &persona, recipient: &me }));
+                if let Some(ids) = self.group_keys.get_mut(&user) {
+                    ids.retain(|k| k != &key_id);
+                }
                 match self.keyring.as_mut().unwrap().drop_key(&key_id) {
                     Ok(()) => ok(Vec::new()),
                     Err(e) if e == libc::ENOENT => ok(Vec::new()),
