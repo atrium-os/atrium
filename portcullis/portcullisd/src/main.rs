@@ -2484,12 +2484,18 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         };
         eprintln!("portcullisd: {owner} removed persona {name} (from {caller}, verified): {} app folder(s) deleted, {files}", gone.len());
     } else {
-        if tp.policy.personas.contains_key(&name) {
-            if let Err(e) = portcullisd::home::ensure_persona(&owner, &name) {
+        let folders_ready = match portcullisd::home::ensure_persona(&owner, &name) {
+            Ok(_) => true,
+            Err(e) => {
                 eprintln!("portcullisd: {owner}'s {name} folders not made: {e}");
+                false
             }
-        }
+        };
         eprintln!("portcullisd: {owner}'s persona {name} is now {:?}, vpn {:?} (from {caller})", tp.policy.personas.get(&name).map(|d| d.colour.as_str()), tp.policy.personas.get(&name).and_then(|d| d.vpn.as_deref()));
+        drop(s);
+        if folders_ready && matches!(req, Request::AddPersona { .. }) {
+            launch::refresh_files_groups(&owner);
+        }
     }
     Response::Ok
 }
@@ -3433,6 +3439,7 @@ fn session_ended(user: &str) -> Response {
     if !portcullis_overlay::plain_segment(user) || portcullis_overlay::home_of(user).is_none() {
         return Response::Ok;
     }
+    launch::stop_files_for_logout(user);
     let uids = launch::user_uids(user);
     launch::end_processes(&uids);
     if let Ok(list) = workspace::list(user) {

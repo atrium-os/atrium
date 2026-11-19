@@ -15,6 +15,9 @@ configuration). Gate: `scripts/vm-scrinium-check.sh` on the cloud amd64 VM.
 
 ## 1. Short answer
 
+- Adding a persona in Settings restarts an open Files window so it can use the
+  new persona’s folders. The replacement starts in the usual view.
+  See [personas.md](personas.md) §4.1.
 - No app sees `/media`. The file manager sees all of it; every other app asks
   the picker and gets one file (an open descriptor) or one folder (a mount of
   that folder alone in its own jail).

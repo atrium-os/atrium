@@ -21,13 +21,16 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use portcullis_jail::{build, jail_name_from_app_id, BuildOpts, JailConfig};
 use portcullis_toml::{merge_capabilities, Manifest};
 
 const APPS_DIR:     &str = "/var/lib/atrium/apps";
 pub const JAILS_DIR:    &str = "/var/lib/atrium/jails";
+const FILES_APP: &str = "org.atrium.scrinium";
 const SENTINEL:     &str = ".atrium-firstrun-done";
 
 #[derive(Debug)]
@@ -62,6 +65,34 @@ pub fn launch_with_stdio(
     launch_instance(app_id, None, user, stdio)
 }
 
+// Files has one jail across all personas. Its launch thread owns both the
+// restart and teardown, so a second launch cannot mount over a dying jail.
+#[derive(Default)]
+struct FilesRun {
+    owner: String,
+    refresh: bool,
+    logging_out: bool,
+}
+static FILES_RUN: Mutex<Option<FilesRun>> = Mutex::new(None);
+
+pub fn refresh_files_groups(owner: &str) {
+    if let Some(run) = FILES_RUN.lock().unwrap().as_mut() {
+        if run.owner == owner && !run.logging_out {
+            run.refresh = true;
+        }
+    }
+}
+
+pub fn stop_files_for_logout(owner: &str) {
+    if let Some(run) = FILES_RUN.lock().unwrap().as_mut() {
+        if run.owner == owner {
+            run.logging_out = true;
+        }
+    }
+}
+
+type BundleIdentity = (String, Option<[u8; 32]>);
+
 /// Launch `(user, app_id)`'s instance in `persona` (personas.md §3; `None`:
 /// Personal). A named persona's instance is its own jail
 /// (`<id>@<persona>` root, `<name>__p_<persona>` jail), its own uid (registry
@@ -74,7 +105,36 @@ pub fn launch_instance(
     user:    &str,
     stdio:   Option<[OwnedFd; 3]>,
 ) -> Result<LaunchOutcome, LaunchError> {
-    launch_inner(app_id, persona, user, stdio, None)
+    if app_id != FILES_APP || persona.is_some() {
+        return launch_inner(app_id, persona, user, stdio, None, None);
+    }
+    {
+        let mut active = FILES_RUN.lock().unwrap();
+        if active.is_some() || running_jid_instance(app_id, None).is_some() {
+            return Err(LaunchError::Failed("jail-c", "Files is already running or changing jails".into()));
+        }
+        *active = Some(FilesRun { owner: user.into(), ..FilesRun::default() });
+    }
+
+    let mut bundle = None;
+    loop {
+        // Keep the original launch's stdio available for every replacement.
+        let copy_stdio = || -> std::io::Result<Option<[OwnedFd; 3]>> {
+            stdio.as_ref().map(|[input, output, error]| {
+                Ok([input.try_clone()?, output.try_clone()?, error.try_clone()?])
+            }).transpose()
+        };
+        let result = copy_stdio()
+            .map_err(|e| LaunchError::Failed("fdpass", e.to_string()))
+            .and_then(|fds| launch_inner(app_id, persona, user, fds, None, Some(&mut bundle)));
+        let mut active = FILES_RUN.lock().unwrap();
+        let run = active.as_mut().unwrap();
+        if result.is_err() || run.logging_out || !std::mem::take(&mut run.refresh) {
+            *active = None;
+            return result;
+        }
+        eprintln!("portcullisd: restarting Files for {user} with the current persona folders");
+    }
 }
 
 /// Run dev app `app_id` under the debugger (dev-tools.md §7.2,
@@ -85,7 +145,7 @@ pub fn launch_debug(app_id: &str, user: &str, conn: OwnedFd) -> Result<LaunchOut
     if !app_id.starts_with("dev.") {
         return Err(LaunchError::Failed("debug", format!("{app_id} is not a dev build: installed apps are never debugged")));
     }
-    launch_inner(app_id, None, user, None, Some(conn))
+    launch_inner(app_id, None, user, None, Some(conn), None)
 }
 
 /// What a debug run mounts at [`DEBUG_IN_JAIL`]: lldb-server and sh from
@@ -152,6 +212,7 @@ fn launch_inner(
     user:    &str,
     stdio:   Option<[OwnedFd; 3]>,
     debug:   Option<OwnedFd>,
+    files_bundle: Option<&mut Option<BundleIdentity>>,
 ) -> Result<LaunchOutcome, LaunchError> {
     let mut stdio = stdio;
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
@@ -175,6 +236,18 @@ fn launch_inner(
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("parse error: {e}")))?;
+    let refresh_groups = files_bundle.is_some();
+    if let Some(pinned) = files_bundle {
+        // A changed manifest or publisher must go through a new launch
+        // request and its normal policy review.
+        match pinned {
+            Some((original, key)) if *original != text || *key != publisher => {
+                return Err(LaunchError::Failed("manifest", "Files changed while running; open it again".into()));
+            }
+            None => *pinned = Some((text, publisher)),
+            _ => {}
+        }
+    }
     let report = portcullis_toml::validate(&manifest);
     if !report.is_ok() {
         let msg = report.errors.join("; ");
@@ -366,7 +439,7 @@ fn launch_inner(
                          inherits daemon intentionally — Phase 4.5
                          step-1 simplification. Step-2 will pipe setup
                          output through the same tty as the runtime
-                         app. */ None)
+                         app. */ None, None)
                 .map_err(|e| { full_teardown(&jail_path, None); e })?;
             if setup_exit != Some(0) {
                 full_teardown(&jail_path, None);
@@ -503,9 +576,12 @@ fn launch_inner(
         full_teardown(&jail_path, None);
         return Err(e);
     }
-    let outcome = run_one_jail(&jc, &jail_path, stdio);
+    let outcome = run_one_jail(&jc, &jail_path, stdio, refresh_groups.then_some(app_uid));
 
-    full_teardown(&jail_path, Some(&jc.name));
+    let clean = full_teardown(&jail_path, Some(&jc.name));
+    if refresh_groups && !clean {
+        return Err(LaunchError::Failed("teardown", "Files' old mounts are still in use".into()));
+    }
 
     outcome.map(|exit_code| LaunchOutcome { exit_code })
 }
@@ -563,6 +639,7 @@ fn run_one_jail(
     jc:        &JailConfig,
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
+    refresh_uid: Option<u32>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★ A `full` network comes from jaild, the one allocator (network.md §0):
      * a point-to-point epair with the app's derived MAC — never the host's
@@ -586,7 +663,7 @@ fn run_one_jail(
         let _ = fs::create_dir_all(&etc);
         let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
-    let outcome = run_one_jail_inner(&jc, jail_path, stdio);
+    let outcome = run_one_jail_inner(&jc, jail_path, stdio, refresh_uid);
     if networked.is_some() {
         jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
     }
@@ -705,6 +782,7 @@ fn run_one_jail_inner(
     jc:        &JailConfig,
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
+    refresh_uid: Option<u32>,
 ) -> Result<Option<i32>, LaunchError> {
     /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
     portcullis_mounts::ensure_devfs_isolation(jc)
@@ -730,7 +808,10 @@ fn run_one_jail_inner(
         cmd.stdout(Stdio::from(sout));
         cmd.stderr(Stdio::from(serr));
     }
-    let status = cmd.status();
+    let status = match refresh_uid {
+        Some(uid) => wait_for_files(&mut cmd, &jc.name, uid),
+        None => cmd.status(),
+    };
     let _ = fs::remove_file(&conf_path);
     /* Per-jail teardown: jail -r releases the jail's specific mounts
      * (mount.devfs, capability mounts) without touching the
@@ -760,6 +841,38 @@ fn run_one_jail_inner(
     Ok(code)
 }
 
+fn files_should_stop() -> bool {
+    FILES_RUN.lock().unwrap().as_ref().is_some_and(|run| run.refresh || run.logging_out)
+}
+
+fn wait_for_files(cmd: &mut Command, jail: &str, uid: u32) -> std::io::Result<ExitStatus> {
+    let mut child = cmd.spawn()?;
+    let uid = uid.to_string();
+    let signal = |sig: &str| {
+        Command::new("pkill").args([sig, "-j", jail, "-U", &uid])
+            .status().is_ok_and(|s| s.success())
+    };
+    let mut term_at: Option<Instant> = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if let Some(at) = term_at {
+            if at.elapsed() >= Duration::from_secs(3) {
+                if !signal("-KILL") && child.try_wait()?.is_none() {
+                    eprintln!("portcullisd: could not signal Files in {jail} after TERM");
+                }
+                return child.wait();
+            }
+        } else if files_should_stop() && signal("-TERM") {
+            // A refresh during startup stays pending until the app is
+            // actually in the jail and can receive the signal.
+            term_at = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Final teardown: optional jail -r (idempotent if already removed), then
 /// unmount everything the launch mounted — deepest first, convergently.
 ///
@@ -784,7 +897,7 @@ fn run_one_jail_inner(
 /// ★ NOT forced, unlike the one-shot lane: an application's mounts may be
 /// genuinely busy, and forcing would take a filesystem away from something
 /// still using it. This path reports survivors instead.
-pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
+pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) -> bool {
     if let Some(n) = jail_name {
         let _ = Command::new("jail").arg("-q").arg("-r").arg(n)
             .stderr(Stdio::null()).status();
@@ -806,6 +919,7 @@ pub fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
                   if left.is_empty() { "" } else { " (not all)" });
     }
     portcullis_mounts::warn_survivors("portcullisd", &left);
+    left.is_empty()
 }
 
 /// Resolve the dedicated per-app uid the app executes as (PRIVILEGE INVARIANT,

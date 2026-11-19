@@ -32,6 +32,7 @@
 #     [[crossings]] switch; refused, nothing is written; Turn off needs no
 #     confirming; root can't turn one. "Personal may share to Work's apps"
 #     turns on and off the same way.
+#   - Adding School while Files is open relaunches it with School’s group.
 # WX/WY: where frescod puts Curia's window (0 0 with no window manager).
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -66,7 +67,7 @@ done
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 POL=/var/db/atrium/alice/policy.toml
-NEW=org.test.new; SYS=org.test.sys; CURIA=org.atrium.curia
+NEW=org.test.new; SYS=org.test.sys; CURIA=org.atrium.curia; FILES=org.atrium.scrinium
 # Other installed apps (other gates') are set aside while this runs, so the
 # page lists only these three, and put back at the end.
 ASIDE=/var/lib/atrium/apps-aside
@@ -92,6 +93,12 @@ rm -f /var/db/atrium/alice/links.toml /var/db/atrium/alice/share.toml
 mkdir -p $ASIDE
 for d in /var/lib/atrium/apps/*; do case \${d##*/} in $NEW|$SYS|$CURIA) ;; *) mv \$d $ASIDE/ ;; esac; done
 mk $CURIA Settings curia curia 'graphics = "fresco"\napp-grants = true'
+# Set the signed Files probe aside until the Personas test so it does not
+# change any earlier Apps-page rows.
+mkdir -p $B/files-probe/bin
+cp $B/home_probe $B/files-probe/bin/stay_probe
+printf '[app]\nid = "%s"\nname = "Files"\nversion = "1"\nentry = "bin/stay_probe"\n\n[capabilities]\nhome-files = true\n' $FILES > $B/files-probe/atrium.toml
+openssl dgst -sha256 -sign /root/of-key.pem -out $B/files-probe/atrium.toml.sig $B/files-probe/atrium.toml
 printf '[personas.work]\ncolour = "blue"\n' > $POL
 daemon -f -o $B/sigillum.log $B/sigillum_stand_in $B/sigillum.sock
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
@@ -241,11 +248,24 @@ press ${GX:-372} ${GY:-220}                      # Work's colour: green
 i=0; while [ $i -lt 20 ] && [ "$(count "persona work is now Some(\"green\")")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "persona work is now Some(\"green\")")" = 1 ] && ok "Work is green now" || bad "colour: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
 V "grep -A1 '^\[personas.work\]' $POL | grep -q green" && ok "in her policy" || bad "policy: $(V "cat $POL")"
+V "mv $B/files-probe /var/lib/atrium/apps/$FILES
+   daemon -f -o $B/files.log -u alice /usr/local/bin/portcullis launch --no-prompt $FILES"
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'home-probe:.*persona_made=ok' $B/files.log"; do sleep 2; i=$((i+2)); done
+V "grep -q 'home-probe:.*persona_made=ok' $B/files.log" && ok "Files probe is running before the add" || bad "Files launch: $(V "tail -5 $B/files.log")"
 press ${FX:-300} ${FY:-326}                      # the name field
 key 0x16 0x06 0x0b 0x12 0x12 0x0f                # "school"
 press ${AX2:-484} ${AY2:-325}                    # Add
 i=0; while [ $i -lt 20 ] && [ "$(count "persona school is now")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "persona school is now Some(\"blue\")")" = 1 ] && ok "School added, in the first free colour" || bad "add: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'restarting Files for alice' $LOG && grep 'home-probe:' $B/files.log | tail -1 | grep -q 'personas=\[school,.*persona_made=ok'"; do sleep 2; i=$((i+2)); done
+if V "test \$(grep -c 'home-probe:' $B/files.log) -eq 2 &&
+      grep -q 'restarting Files for alice' $LOG &&
+      grep 'home-probe:' $B/files.log | tail -1 | grep -q 'personas=\[school,.*persona_made=ok' &&
+      test \"\$(stat -f %Sg /home/alice/.atrium/personas/school/Documents/probe.txt)\" = files-alice-school"; then
+    ok "Files restarted once and wrote in School's Documents with School's group"
+else
+    bad "Files restart: $(V "tail -5 $B/files.log; tail -8 $LOG")"
+fi
 shot persona-4
 V "mkdir -p /home/alice/.atrium/persona-apps/work/org.test.new/var /home/alice/.atrium/persona-apps/school && touch /home/alice/.atrium/persona-apps/work/org.test.new/var/data /home/alice/.atrium/persona-apps/school/org.test.new.img"
 press ${CX:-880} ${RY:-288}                      # Work's Remove…
@@ -259,7 +279,7 @@ V "test -e /home/alice/.atrium/persona-apps/school/org.test.new.img" && ok "Scho
 V "grep -q 'personas.work' $POL" && bad "Work still in her policy" || ok "Work out of her policy"
 shot persona-6
 
-V "pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
+V "pkill -TERM -j org_atrium_scrinium -x stay_probe; pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
 # Its own test apps go (they take mailto:, which other gates count on).
-V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
+V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; if test -d /var/lib/atrium/apps/$FILES; then mv /var/lib/atrium/apps/$FILES $B/files-probe; fi; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
 echo "apps-access: $fails failed"
