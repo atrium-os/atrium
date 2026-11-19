@@ -651,9 +651,19 @@ rectangular crop. Officina reports ODP picture crops as incomplete, so those
 decks are refused. Silent supported transitions and speaker notes are omitted.
 The reader explains the loss of notes, text search and selection.
 
+The Title Slide and Title and Content profiles use Officina's stock templates
+and can be mixed with blank slides. PowerPoint placeholders resolve through the
+matching layout and master. ODP must account for the corresponding master page
+and saved presentation styles. The worker preserves paragraph alignment,
+spacing, wrapping, supported bullets and numbering, and mixed sizes, weights,
+italic, solid colors and supported text decorations. The profiles accept the
+stock Officina text font families and the stock bullet font through Atrium's
+font mapping. Empty layout prompts stay out of the output. Rich text and
+decorations must fit inside their frames, including the final slide.
+
 The worker reconstructs the static deck and compares all package parts,
-relationships, styles and slide XML before drawing. Valid decks with other
-templates, rich text or unsupported producer markup can be refused. Hidden
+relationships, styles and slide XML before drawing. Valid decks with custom templates, unsupported text effects or incompatible
+producer markup can be refused. Hidden
 slides, builds, audio or video (including posters attached to a video),
 external objects, encryption, missing parts, unknown paint operations and
 text that cannot be drawn completely refuse the whole deck. Limits include

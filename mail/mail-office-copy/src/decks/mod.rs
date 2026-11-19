@@ -10,6 +10,7 @@ use officina_convert::{odp, pptx, zip::Archive};
 use officina_slides::{model::*, ops::new_slide};
 use std::collections::BTreeMap;
 mod raster;
+mod rich;
 
 fn check(ok: bool, message: &'static str) -> Result<(), Error> {
     if ok {
@@ -75,7 +76,12 @@ fn parts(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, Error> {
     Ok(out)
 }
 
-fn rebuild_shape(source: &Deck, clean: &mut Deck, s: &Shape) -> Result<Shape, Error> {
+fn rebuild_shape(
+    source: &Deck,
+    clean: &mut Deck,
+    s: &Shape,
+    rich_text: bool,
+) -> Result<Shape, Error> {
     let r = s.frame.ok_or("unsupported inherited frame")?;
     check(
         r.w > 0
@@ -95,17 +101,22 @@ fn rebuild_shape(source: &Deck, clean: &mut Deck, s: &Shape) -> Result<Shape, Er
                 None | Some(Fill::None) => Fill::None,
                 _ => return Err("unsupported slide fill".into()),
             };
-            let text = text.as_ref().map(|t| t.text());
-            check(
-                text.as_ref()
-                    .is_none_or(|t| t.len() <= 4096 && !t.chars().any(char::is_control)),
-                "unsupported text frame",
-            )?;
+            let text = if rich_text {
+                text.as_ref().map(rich::body).transpose()?
+            } else {
+                let text = text.as_ref().map(TextBody::text);
+                check(
+                    text.as_ref()
+                        .is_none_or(|t| t.len() <= 4096 && !t.chars().any(char::is_control)),
+                    "unsupported text frame",
+                )?;
+                text.as_deref().map(TextBody::plain)
+            };
             ShapeKind::Geom {
                 geom: Some(Geom::preset("rect")),
                 fill: Some(fill),
                 line: Some(Stroke::none()),
-                text: text.as_deref().map(TextBody::plain),
+                text,
             }
         }
         ShapeKind::Picture { media, crop, .. } => {
@@ -139,58 +150,18 @@ pub(super) fn convert(odf: bool, bytes: &[u8]) -> Result<OfficeCopy, Error> {
         loaded.report.is_empty(),
         "Officina reported incomplete slide import",
     )?;
-    let mut clean = Deck::new();
-    clean.size = source.size;
     check(
         (1..=64).contains(&source.slide_count())
-            && [clean.size.0, clean.size.1]
+            && [source.size.0, source.size.1]
                 .iter()
                 .all(|n| (635..=30_480_000).contains(n)),
         "invalid slide count or dimensions",
     )?;
-    let layout = clean
-        .layout_of_kind("blank")
-        .ok_or("missing blank layout")?
-        .id;
-    source.load_slide(0).map_err(|e| e.0)?;
-    let source_layout = source
-        .slide_if_loaded(0)
-        .and_then(|s| source.layout(s.layout))
-        .ok_or("missing slide layout")?;
-    let master = source
-        .master(source_layout.master)
-        .ok_or("missing slide master")?;
-    for shape in master.shapes.iter().filter(|s| s.ph.is_none()) {
-        let decoration = rebuild_shape(&source, &mut clean, shape)?;
-        clean.masters[0].shapes.push(decoration);
-    }
-    for shape in source_layout.shapes.iter().filter(|s| s.ph.is_none()) {
-        let decoration = rebuild_shape(&source, &mut clean, shape)?;
-        clean
-            .layouts
-            .iter_mut()
-            .find(|l| l.id == layout)
-            .ok_or("missing layout")?
-            .shapes
-            .push(decoration);
-    }
-    for i in 0..source.slide_count() {
-        source.load_slide(i).map_err(|e| e.0)?;
-        let s = source.slide_if_loaded(i).ok_or("missing slide")?;
-        check(
-            !s.hidden && s.builds.is_empty() && s.shapes.len() <= 512,
-            "hidden slide, build or too many shapes",
-        )?;
-        let mut slide = new_slide(&mut clean, layout);
-        for shape in &s.shapes {
-            slide
-                .shapes
-                .push(rebuild_shape(&source, &mut clean, shape)?);
-        }
-        slide.notes = s.notes.as_ref().map(|t| TextBody::plain(&t.text()));
-        slide.transition = s.transition.clone();
-        clean.push_slide(slide);
-    }
+    let mut clean = if rich::has_layouts(&mut source, odf)? {
+        rich::rebuild(&mut source, odf)?
+    } else {
+        rebuild_blank(&mut source)?
+    };
     let rebuilt = if odf {
         odp::write(&mut clean, Vec::new())?
     } else {
@@ -210,6 +181,55 @@ pub(super) fn convert(odf: bool, bytes: &[u8]) -> Result<OfficeCopy, Error> {
         }
     }
     raster::pages(&mut clean)
+}
+
+fn rebuild_blank(source: &mut Deck) -> Result<Deck, Error> {
+    let mut clean = Deck::new();
+    clean.size = source.size;
+    let layout = clean
+        .layout_of_kind("blank")
+        .ok_or("missing blank layout")?
+        .id;
+    source.load_slide(0).map_err(|e| e.0)?;
+    let source_layout = source
+        .slide_if_loaded(0)
+        .and_then(|s| source.layout(s.layout))
+        .ok_or("missing slide layout")?;
+    let master = source
+        .master(source_layout.master)
+        .ok_or("missing slide master")?;
+    for shape in master.shapes.iter().filter(|s| s.ph.is_none()) {
+        let decoration = rebuild_shape(source, &mut clean, shape, false)?;
+        clean.masters[0].shapes.push(decoration);
+    }
+    for shape in source_layout.shapes.iter().filter(|s| s.ph.is_none()) {
+        let decoration = rebuild_shape(source, &mut clean, shape, false)?;
+        clean
+            .layouts
+            .iter_mut()
+            .find(|l| l.id == layout)
+            .ok_or("missing layout")?
+            .shapes
+            .push(decoration);
+    }
+    for i in 0..source.slide_count() {
+        source.load_slide(i).map_err(|e| e.0)?;
+        let s = source.slide_if_loaded(i).ok_or("missing slide")?;
+        check(
+            !s.hidden && s.builds.is_empty() && s.shapes.len() <= 512,
+            "hidden slide, build or too many shapes",
+        )?;
+        let mut slide = new_slide(&mut clean, layout);
+        for shape in &s.shapes {
+            slide
+                .shapes
+                .push(rebuild_shape(source, &mut clean, shape, false)?);
+        }
+        slide.notes = s.notes.as_ref().map(|t| TextBody::plain(&t.text()));
+        slide.transition = s.transition.clone();
+        clean.push_slide(slide);
+    }
+    Ok(clean)
 }
 
 #[cfg(test)]

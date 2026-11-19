@@ -3,6 +3,7 @@ use mail_office_copy::{OfficeCopy, PagePixels};
 use officina_slides::{
     draw::{draw_slide, DrawItem, Notes, Paint},
     model::*,
+    resolve::{resolve, Owner},
 };
 use officina_text::{layout::PinnedFonts, paint::Item, LU};
 use std::collections::BTreeMap;
@@ -88,15 +89,30 @@ pub(super) fn pages(deck: &mut Deck) -> Result<OfficeCopy, Error> {
         let slide = deck.slide_if_loaded(i).ok_or("missing slide")?;
         let layout = deck.layout(slide.layout).ok_or("missing layout")?;
         let master = deck.master(layout.master).ok_or("missing master")?;
-        for shape in master
+        let inherited = master
             .shapes
             .iter()
-            .chain(&layout.shapes)
-            .filter(|s| s.ph.is_none())
-            .chain(&slide.shapes)
+            .filter(|s| !slide.hide_layout_shapes && !layout.hide_master_shapes && s.ph.is_none())
+            .map(|s| (Owner::Master, s))
+            .chain(
+                layout
+                    .shapes
+                    .iter()
+                    .filter(|s| !slide.hide_layout_shapes && s.ph.is_none())
+                    .map(|s| (Owner::Layout(master.id), s)),
+            );
+        for (owner, shape) in
+            inherited.chain(slide.shapes.iter().map(|s| (Owner::Slide(layout.id), s)))
         {
-            if let Some(text) = shape.text().map(TextBody::text).filter(|s| !s.is_empty()) {
-                let f = shape.frame.ok_or("missing text frame")?;
+            if shape.text().is_some_and(|t| !t.text().is_empty()) {
+                let f = resolve(deck, owner, shape).frame;
+                check(
+                    f.x >= 0
+                        && f.y >= 0
+                        && f.x.checked_add(f.w).is_some_and(|x| x <= deck.size.0)
+                        && f.y.checked_add(f.h).is_some_and(|y| y <= deck.size.1),
+                    "text frame outside slide",
+                )?;
                 let frame = Rect::from_xywh(
                     (f.x as f64 / PIXEL) as f32,
                     (f.y as f64 / PIXEL) as f32,
@@ -104,29 +120,60 @@ pub(super) fn pages(deck: &mut Deck) -> Result<OfficeCopy, Error> {
                     (f.h as f64 / PIXEL) as f32,
                 )
                 .ok_or("invalid text frame")?;
-                expected.insert(shape.id, (text, frame));
+                check(
+                    expected.insert(shape.id, frame).is_none(),
+                    "duplicate text frame",
+                )?;
             }
         }
-        let mut notes = Notes::default();
+        let mut notes = Notes::checking_text();
         let mut canvas = Pixmap::new(pw, ph).ok_or("invalid slide dimensions")?;
         canvas.fill(tiny_skia::Color::WHITE);
-        for item in draw_slide(deck, i, &fonts, &mut notes).map_err(|e| e.0)? {
+        let items = draw_slide(deck, i, &fonts, &mut notes).map_err(|e| e.0)?;
+        check(
+            !notes.incomplete_text,
+            "text overflows or cannot be drawn completely",
+        )?;
+        check(notes.unknown_presets.is_empty(), "unsupported slide shape")?;
+        for item in items {
             match item {
                 DrawItem::Text { xf, shape, items } => {
                     let k = officina_slides::EMU_PER_PT as f64 / LU as f64;
                     check(xf[..4] == [k, 0., 0., k], "unsupported text transform")?;
-                    let (text, frame) = expected.remove(&shape).ok_or("unexpected slide text")?;
-                    let mut painted = String::new();
+                    let frame = expected.remove(&shape).ok_or("unexpected slide text")?;
+                    let ox = (xf[4] / k).round() as i64;
+                    let oy = (xf[5] / k).round() as i64;
                     for item in items {
-                        let Item::Glyphs(mut run) = item else {
-                            return Err("unsupported slide text paint".into());
-                        };
-                        run.x += (xf[4] / k).round() as i64;
-                        run.y += (xf[5] / k).round() as i64;
-                        crate::paint::glyphs_in(&mut canvas, &fonts, &run, frame)?;
-                        painted.push_str(&run.text);
+                        match item {
+                            Item::Glyphs(mut run) => {
+                                run.x += ox;
+                                run.y += oy;
+                                crate::paint::glyphs_in(&mut canvas, &fonts, &run, frame)?;
+                            }
+                            Item::Rect { x, y, w, h, color } => {
+                                let px = 2. / LU as f32;
+                                let rect = Rect::from_xywh(
+                                    (x + ox) as f32 * px,
+                                    (y + oy) as f32 * px,
+                                    w as f32 * px,
+                                    h as f32 * px,
+                                )
+                                .ok_or("invalid text decoration")?;
+                                check(
+                                    rect.left() >= frame.left()
+                                        && rect.top() >= frame.top()
+                                        && rect.right() <= frame.right()
+                                        && rect.bottom() <= frame.bottom(),
+                                    "text decoration outside frame",
+                                )?;
+                                let mut paint = tiny_skia::Paint::default();
+                                let [_, r, g, b] = color.to_be_bytes();
+                                paint.set_color_rgba8(r, g, b, 255);
+                                canvas.fill_rect(rect, &paint, Transform::identity(), None);
+                            }
+                            _ => return Err("unsupported slide text paint".into()),
+                        }
                     }
-                    check(text == painted, "incomplete slide text")?;
                 }
                 other => {
                     // The reconstructed model contains only axis-aligned rectangles and pictures.
@@ -171,10 +218,7 @@ pub(super) fn pages(deck: &mut Deck) -> Result<OfficeCopy, Error> {
                 }
             }
         }
-        check(
-            expected.is_empty() && notes.unknown_presets.is_empty(),
-            "missing slide content",
-        )?;
+        check(expected.is_empty(), "missing slide content")?;
         let rgb: Vec<u8> = canvas
             .data()
             .chunks_exact(4)

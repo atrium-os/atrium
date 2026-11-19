@@ -70,6 +70,16 @@ pub enum DrawItem {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Notes {
     pub unknown_presets: Vec<Arc<str>>,
+    /// A text frame overflowed or its paint stream omitted or reordered text.
+    pub incomplete_text: bool,
+    verify_text: bool,
+}
+
+impl Notes {
+    /// Ask the drawing pass to check text coverage and frame height.
+    pub fn checking_text() -> Self {
+        Self { verify_text: true, ..Self::default() }
+    }
 }
 
 /// The map from a shape's own box (`0..w`, `0..h`) onto its parent's
@@ -235,7 +245,7 @@ fn shape(deck: &Deck, owner: Owner, s: &Shape, base: &Xform, slide_no: &str, fon
             if let Some(t) = text {
                 // Text turns with its shape but isn't mirrored.
                 let txf = mul(base, &shape_xform(f, s.rot, false, false));
-                frame_text(deck, &r, t, s.id, &txf, slide_no, fonts, out);
+                frame_text(deck, &r, t, s.id, &txf, slide_no, fonts, out, notes);
             }
         }
         ShapeKind::Picture { media, crop, .. } => {
@@ -460,9 +470,15 @@ fn frame_geom(deck: &Deck, r: Resolved, body: &TextBody, txf: &Xform, slide_no: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>) {
+fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xform, slide_no: &str, fonts: &dyn Fonts, out: &mut Vec<DrawItem>, notes: &mut Notes) {
     let g = frame_geom(deck, r.clone(), body, xf, Some(slide_no), fonts);
     let fl = &g.layout;
+    let [_, top_inset, _, bottom_inset] = g.resolved.inset;
+    if notes.verify_text && fl.doc.blocks.iter().any(|b| b.as_para().is_some_and(|p| !p.text.is_empty()))
+        && fl.height > crate::emu_to_lu((r.frame.h - top_inset - bottom_inset).max(0))
+    {
+        notes.incomplete_text = true;
+    }
     let mut items = Vec::new();
     let mut counters = [0u32; MAX_LEVELS];
     for (i, (pl, top)) in fl.paras.iter().enumerate() {
@@ -501,7 +517,19 @@ fn frame_text(deck: &Deck, r: &Resolved, body: &TextBody, id: ShapeId, xf: &Xfor
             }
             _ => None,
         };
+        let start = items.len();
         paint_para(&mut items, &fl.doc, fonts, pl, &p.text, 0, *top, label.as_ref().map(|(s, f)| (s.as_str(), f.clone())));
+        if notes.verify_text {
+            let painted = items[start..].iter().filter_map(|item| match item {
+                Item::Glyphs(run) => Some(run.text.as_str()),
+                _ => None,
+            }).flat_map(str::chars);
+            let expected = label.as_ref().into_iter().flat_map(|(s, _)| s.chars()).chain(p.text.chars());
+            // Line wrapping can consume an ordinary space at the break.
+            if !painted.filter(|&c| c != ' ').eq(expected.filter(|&c| c != ' ')) {
+                notes.incomplete_text = true;
+            }
+        }
     }
     if items.is_empty() {
         return;

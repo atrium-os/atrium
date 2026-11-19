@@ -156,3 +156,58 @@ fn static_master_and_local_picture() {
         assert_eq!(pixel(260, 170), [0, 0, 255]);
     }
 }
+
+#[test]
+fn rich_decks() {
+    for (odf, bytes) in [
+        (
+            false,
+            include_bytes!("../../tests/fixtures/rich.pptx").as_slice(),
+        ),
+        (
+            true,
+            include_bytes!("../../tests/fixtures/rich.odp").as_slice(),
+        ),
+    ] {
+        let pdf = convert(odf, bytes).unwrap_or_else(|e| panic!("odf={odf}: {e}"));
+        assert_eq!(pdf.pages.len(), 3);
+        for page in &pdf.pages {
+            let pixels = miniz_oxide::inflate::decompress_to_vec_zlib(&page.samples).unwrap();
+            assert!(pixels.chunks_exact(3).any(|p| p == [0xb0, 0x12, 0x28]));
+            assert!(pixels.chunks_exact(3).any(|p| p == [0, 0, 0]));
+        }
+    }
+}
+
+#[test]
+fn incomplete_rich_final_slide_refuses_the_whole_deck() {
+    let pptx = include_bytes!("../../tests/fixtures/rich.pptx");
+    let odp = include_bytes!("../../tests/fixtures/rich.odp");
+    for (odf, bytes, part, label) in [
+        (
+            false,
+            pptx.as_slice(),
+            "ppt/slides/slide3.xml",
+            "PPTX complete",
+        ),
+        (true, odp.as_slice(), "content.xml", "ODP complete"),
+    ] {
+        let overflow = "Unfinished words ".repeat(200);
+        let error = convert(odf, &edit(bytes, part, label, overflow.trim_end()))
+            .err()
+            .expect("refuse overflowing final title");
+        assert!(
+            error.to_string().contains("text overflows")
+                || error.to_string().contains("glyph outside frame"),
+            "{error}"
+        );
+    }
+
+    let invalid = edit(
+        odp,
+        "content.xml",
+        "draw:master-page-name=\"Layout2\"",
+        "draw:master-page-name=\"Absent\"",
+    );
+    assert!(convert(true, &invalid).is_err());
+}
