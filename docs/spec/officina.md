@@ -3670,8 +3670,12 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - The frozen area is at most three quarters of the view.
 - **Sheets.** Data ▸ Freeze Panes keeps the rows above the cursor and the columns left of it in view. Freeze Top Row keeps the first row. With panes frozen, the item reads Unfreeze Panes. Each is one undo step.
 - **Floats in frozen panes (2026-11-19).** Charts, filter buttons, comment boxes and validation marks meeting the frozen rows or columns are drawn in their band too, so they stay with those cells. The part of a chart past the freeze line scrolls in the body, as in Excel. Presses on them in a band reach them. Gate: pergola `a_float_in_the_frozen_rows_stays_with_them`.
-- **Not yet:** freezing from a row other than the first (Excel freezes from the row at the top of the view), and repeating frozen rows when printing.
-- **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
+- **From the top of the view (2026-11-19).** As in Excel, Freeze Panes freezes from the row and column at the top left of the view, and Freeze Top Row keeps the row at the top of the view. `Sheet::freeze_from` holds the first frozen row and column (0 on an axis with none frozen, else less than `freeze`); rows and columns above and left of it are out of reach until unfrozen. `GridOp::Freeze` carries it (8 more bytes when not (0, 0), so older records still read), and the native file keeps it in chunk `FREEZE_FROM` (22).
+  - **Grid:** `GridSource::frozen_from`. The bands start there, and `scroll::Physics` gained a `min` (`set_min`), so the body can't scroll above it.
+  - **.xlsx:** `<sheetView topLeftCell>` is the first frozen cell, and `xSplit`/`ySplit` count the frozen columns and rows from it. **.ods:** `PositionTop`/`PositionLeft`. LibreOffice keeps it both ways (`tests/freeze.rs`, sheet "Scrolled").
+  - The status bar names the frozen rows and columns, e.g. "Rows 11 to 12 and columns B to C stay in view".
+- **Not yet:** repeating frozen rows when printing.
+- **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`, `rows_frozen_from_the_top_of_the_view_hide_those_above`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
 
 ### 16.83 Data validation (2026-11-18)
 
@@ -3783,7 +3787,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Files:** .xlsx columns with no width are written `hidden="1"` and read back hidden (they used to show 2 px wide, with a note); .ods columns get `table:visibility="collapse"` and are read back hidden. Hidden rows were kept already. LibreOffice keeps both ways (`officina-convert/tests/hidden.rs`).
 - **Double-click on the double line** (2026-11-19): just right of where columns are hidden, a double-click on the label edge shows the hidden run again, as Unhide Columns would (`data::unhide_cols_at`, from `GridAction::FitCol` on a hidden column); just left of it still fits the shown column.
 - **Width kept (2026-11-19):** a hidden column's width before hiding is kept in `Sheet::hidden_widths`, set as one undo step with the hiding by `GridOp::HiddenWidths` (journal tag 21) and saved in native chunk `HIDDEN_WIDTHS` (21). .xlsx writes it as the hidden column's `width` and .ods as its column style's width, and both read it back, so Unhide Columns shows the column as it was after saving and reopening, in LibreOffice and Excel too. Inserting and deleting columns move the list; deleting the sheet takes it, and undo brings it back.
-- **Not yet:** Freeze Panes from the row at the top of the view (freezing needs a top-left offset in the model and xlsx `topLeftCell`). Hidden rows get the same double-click (§16.93).
+- Hidden rows get the same double-click (§16.93).
 - **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
 
 ### 16.90 Row heights by dragging, and sizes undone in one step (2026-11-19)

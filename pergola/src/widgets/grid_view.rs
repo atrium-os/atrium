@@ -344,6 +344,12 @@ pub trait GridSource {
     fn frozen(&self) -> (u32, u32) {
         (0, 0)
     }
+    /// The first frozen row and column ((0, 0) unless panes were frozen
+    /// with the view scrolled): rows from it to [`frozen`](Self::frozen)
+    /// stay in view, and those above it are out of reach until unfrozen.
+    fn frozen_from(&self) -> (u32, u32) {
+        (0, 0)
+    }
     /// The last used cell (Ctrl + End).
     fn last_used(&self) -> (u32, u32) {
         (self.rows().saturating_sub(1), self.cols().saturating_sub(1))
@@ -711,6 +717,9 @@ struct Geom {
     /// most the body's.
     frozen: (u32, u32),
     fz: [f64; 2],
+    /// Where the first frozen column and row start, px (x, y): what is
+    /// left of and above them is out of reach.
+    skip: [f64; 2],
 }
 
 impl Geom {
@@ -718,7 +727,7 @@ impl Geom {
     /// unscrolled place; elsewhere, the scrolled one.
     fn content(&self, st: &ScrollState, p: crate::geom::Point) -> (f64, f64) {
         let (dx, dy) = ((p.x - self.body.x()) as f64, (p.y - self.body.y()) as f64);
-        (if dx < self.fz[0] { dx } else { st.physics_x.y + dx }, if dy < self.fz[1] { dy } else { st.physics.y + dy })
+        (if dx < self.fz[0] { self.skip[0] + dx } else { st.physics_x.y + dx }, if dy < self.fz[1] { self.skip[1] + dy } else { st.physics.y + dy })
     }
 }
 
@@ -786,8 +795,17 @@ impl GridView {
         let body = Rect::new(r.x() + header_w, r.y() + HEADER_H, (r.w() - header_w).max(0.0), (r.h() - HEADER_H).max(0.0));
         let frozen = src.frozen();
         let frozen = (frozen.0.min(rows), frozen.1.min(cols));
-        let fz = [src.col_left(frozen.1).min(body.w() as f64 * 0.75), src.row_top(frozen.0).min(body.h() as f64 * 0.75)];
-        let geom = Geom { body, rows, cols, ext, frozen, fz };
+        let from = src.frozen_from();
+        let from = (if frozen.0 > 0 { from.0.min(frozen.0 - 1) } else { 0 }, if frozen.1 > 0 { from.1.min(frozen.1 - 1) } else { 0 });
+        let skip = [src.col_left(from.1), src.row_top(from.0)];
+        let fz = [(src.col_left(frozen.1) - skip[0]).min(body.w() as f64 * 0.75), (src.row_top(frozen.0) - skip[1]).min(body.h() as f64 * 0.75)];
+        let geom = Geom { body, rows, cols, ext, frozen, fz, skip };
+        // Rows and columns above and left of the frozen ones are out of reach.
+        if st.physics.min != skip[1] || st.physics_x.min != skip[0] {
+            st.physics.set_min(skip[1]);
+            st.physics_x.set_min(skip[0]);
+            self.scroll.set(st);
+        }
 
         // The scroll state knows the extent (and keeps a grid's zoom).
         if st.extent != Some(ext) || !st.fixed_zoom {
@@ -1068,19 +1086,19 @@ impl GridView {
             // (key, viewport, rows, columns, scrolls across, scrolls down)
             let mut bands: Vec<(u64, Rect, (u32, u32), (u32, u32), bool, bool)> = Vec::new();
             if frozen.0 > 0 && fh > 0.0 && tiles_c.0 <= tiles_c.1 {
-                bands.push((3, Rect::new(body.x(), body.y(), body.w(), fh), (0, frozen.0 - 1), (all_c.0.max(frozen.1), all_c.1), true, false));
+                bands.push((3, Rect::new(body.x(), body.y(), body.w(), fh), (from.0, frozen.0 - 1), (all_c.0.max(frozen.1), all_c.1), true, false));
             }
             if frozen.1 > 0 && fw > 0.0 && tiles_r.0 <= tiles_r.1 {
-                bands.push((4, Rect::new(body.x(), body.y(), fw, body.h()), (all_r.0.max(frozen.0), all_r.1), (0, frozen.1 - 1), false, true));
+                bands.push((4, Rect::new(body.x(), body.y(), fw, body.h()), (all_r.0.max(frozen.0), all_r.1), (from.1, frozen.1 - 1), false, true));
             }
             if frozen.0 > 0 && frozen.1 > 0 && fw > 0.0 && fh > 0.0 {
-                bands.push((5, Rect::new(body.x(), body.y(), fw, fh), (0, frozen.0 - 1), (0, frozen.1 - 1), false, false));
+                bands.push((5, Rect::new(body.x(), body.y(), fw, fh), (from.0, frozen.0 - 1), (from.1, frozen.1 - 1), false, false));
             }
             for (k, rect, rr, cr, across, down) in bands {
                 if rr.0 > rr.1 || cr.0 > cr.1 {
                     continue;
                 }
-                let (ox, oy) = (if across { bx } else { 0.0 }, if down { by } else { 0.0 });
+                let (ox, oy) = (if across { bx } else { skip[0] }, if down { by } else { skip[1] });
                 ctx.key(self.key + k);
                 let id = ctx.push(Node::Scroll {
                     rect,
@@ -1106,7 +1124,7 @@ impl GridView {
                     // Floats meeting the band's cells (a chart in the frozen rows
                     // stays with them; the part past the freeze line scrolls in
                     // the body, as in Excel).
-                    let (vx, vy) = (if across { x } else { 0.0 }, if down { y } else { 0.0 });
+                    let (vx, vy) = (if across { x } else { skip[0] }, if down { y } else { skip[1] });
                     let (vw, vh) = (if across { rect.w() as f64 } else { fz[0] }, if down { rect.h() as f64 } else { fz[1] });
                     let band_floats: Vec<GridFloat> = src.floats([vx, vy, vw, vh], &t).into_iter().filter(|f| f.at[0] < vx + vw && f.at[0] + f.at[2] > vx && f.at[1] < vy + vh && f.at[1] + f.at[3] > vy).collect();
                     if !band_floats.is_empty() {
@@ -1382,9 +1400,9 @@ impl GridView {
             ctx.key(self.key + 6);
             let fr = Rect::new(body.x(), r.y(), fz[0] as f32, HEADER_H);
             let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
-            for c in 0..frozen.1 {
+            for c in from.1..frozen.1 {
                 let (xl, xr) = (src.col_left(c), src.col_left(c + 1));
-                let (cx, w) = (q(body.x() as f64 + xl), (xr - xl) as f32);
+                let (cx, w) = (q(body.x() as f64 + xl - skip[0]), (xr - xl) as f32);
                 let on = c >= sel.c0 && c <= sel.c1;
                 if on {
                     ctx.add(Node::Rect { rect: Rect::new(cx, r.y(), w, HEADER_H), fill: t.accent_bg(), radius: 0.0 });
@@ -1405,12 +1423,12 @@ impl GridView {
             ctx.key(self.key + 7);
             let fr = Rect::new(r.x(), body.y(), header_w, fz[1] as f32);
             let id = ctx.push(Node::Scroll { rect: fr, offset: 0.0, zoom: 1.0, stretch: 1.0, backdrop: Some(t.bg_surface()), content_h: 0.0, offset_x: 0.0, content_w: 0.0 });
-            for row in 0..frozen.0 {
+            for row in from.0..frozen.0 {
                 let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
                 if yb <= yt {
                     continue;
                 }
-                let (cy, h) = (q(body.y() as f64 + yt), (yb - yt) as f32);
+                let (cy, h) = (q(body.y() as f64 + yt - skip[1]), (yb - yt) as f32);
                 let on = row >= sel.r0 && row <= sel.r1;
                 if on {
                     ctx.add(Node::Rect { rect: Rect::new(r.x(), cy, header_w, h), fill: t.accent_bg(), radius: 0.0 });
@@ -1982,7 +2000,7 @@ fn reveal(src: &dyn GridSource, geom: &Geom, st: &mut ScrollState, cell: (u32, u
     if r >= geom.frozen.0 {
         if top < st.physics.y + fh {
             st.physics.stop();
-            st.physics.set_position((top - fh).max(0.0));
+            st.physics.set_position(top - fh);
         } else if bottom > st.physics.y + h {
             st.physics.stop();
             st.physics.set_position((bottom - h).min(top - fh));
@@ -1992,7 +2010,7 @@ fn reveal(src: &dyn GridSource, geom: &Geom, st: &mut ScrollState, cell: (u32, u
     if c >= geom.frozen.1 {
         if left < st.physics_x.y + fw {
             st.physics_x.stop();
-            st.physics_x.set_position((left - fw).max(0.0));
+            st.physics_x.set_position(left - fw);
         } else if right > st.physics_x.y + w {
             st.physics_x.stop();
             st.physics_x.set_position((right - w).min(left - fw));
@@ -2311,6 +2329,7 @@ mod tests {
         cells: RefCell<HashMap<(u32, u32), String>>,
         merges: RefCell<Vec<CellRange>>,
         frozen: std::cell::Cell<(u32, u32)>,
+        from: std::cell::Cell<(u32, u32)>,
         /// Pressable floats: key and where.
         buttons: RefCell<Vec<(u64, [f64; 4])>>,
         fills: std::cell::Cell<bool>,
@@ -2318,7 +2337,7 @@ mod tests {
 
     impl Sheet {
         fn new(rows: u32, cols: u32) -> Self {
-            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), buttons: Default::default(), fills: Default::default() }
+            Self { rows, cols, widths: Default::default(), cells: Default::default(), merges: Default::default(), frozen: Default::default(), from: Default::default(), buttons: Default::default(), fills: Default::default() }
         }
         fn w(&self, c: u32) -> f64 {
             *self.widths.borrow().get(&c).unwrap_or(&64.0)
@@ -2371,6 +2390,9 @@ mod tests {
         }
         fn frozen(&self) -> (u32, u32) {
             self.frozen.get()
+        }
+        fn frozen_from(&self) -> (u32, u32) {
+            self.from.get()
         }
         fn fills(&self) -> bool {
             self.fills.get()
@@ -2673,6 +2695,42 @@ mod tests {
         key(&mut app, Key::Up, "", Modifiers::default());
         assert_eq!(state.get_cloned().cursor, (0, 12));
         assert_eq!(scroll.get().physics.y, 380.0);
+    }
+
+    #[test]
+    fn rows_frozen_from_the_top_of_the_view_hide_those_above() {
+        let (mut app, grid, scroll, state, _) = host(200, 40);
+        // Rows 10 to 14 frozen, as when the view started at row 10.
+        grid.frozen.set((15, 0));
+        grid.from.set((10, 0));
+        app.tick();
+        // Rows above 10 are out of reach: the view starts at row 10's top.
+        assert_eq!(scroll.get().physics.y, 200.0);
+        let mut st = scroll.get();
+        st.physics.set_position(0.0);
+        scroll.set(st);
+        app.tick();
+        assert_eq!(scroll.get().physics.y, 200.0);
+        let shown: Vec<String> = app.tree().iter().filter_map(|(_, n)| if let Node::Text { content, .. } = n { Some(content.clone()) } else { None }).collect();
+        assert!(shown.iter().any(|t| t == "11") && shown.iter().any(|t| t == "15"), "{shown:?}");
+        // A press at the band's top is row 10; just below the band, row 15.
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let click = |app: &mut App<Host>, x: f32, y: f32| {
+            app.handle_event(Event::PointerDown { at: Point::new(x, y) });
+            app.handle_event(Event::PointerUp { at: Point::new(x, y) });
+            app.tick();
+        };
+        click(&mut app, hw + 10.0, HEADER_H + 5.0);
+        assert_eq!(state.get_cloned().cursor, (10, 0));
+        click(&mut app, hw + 10.0, HEADER_H + 5.0 * 20.0 + 5.0);
+        assert_eq!(state.get_cloned().cursor, (15, 0));
+        // Scrolled down, the band still shows rows 10 to 14.
+        let mut st = scroll.get();
+        st.physics.set_position(1000.0);
+        scroll.set(st);
+        app.tick();
+        click(&mut app, hw + 10.0, HEADER_H + 4.0 * 20.0 + 5.0);
+        assert_eq!(state.get_cloned().cursor, (14, 0));
     }
 
     #[test]

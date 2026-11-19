@@ -48,6 +48,11 @@ pub struct Sheet {
     /// Rows and columns frozen at the top and left (0, 0: none), kept in view
     /// while the rest scrolls.
     pub freeze: (u32, u32),
+    /// The first frozen row and column, when panes were frozen with the
+    /// view scrolled ((0, 0) otherwise): rows `freeze_from.0..freeze.0`
+    /// are kept in view, and those above are out of reach until unfrozen.
+    /// A part is 0 when nothing is frozen on that axis.
+    pub freeze_from: (u32, u32),
     /// The width each hidden column (width 0) had, for showing it again as
     /// it was: (column, px), sorted. Files keep it with the column.
     pub hidden_widths: Vec<(u32, f64)>,
@@ -55,7 +60,7 @@ pub struct Sheet {
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), hidden_widths: Vec::new() }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -1020,4 +1025,10 @@ impl Workbook {
         self.cond_stats.lock().unwrap().clear();
         true
     }
+}
+
+/// Whether `from` can be the first frozen row and column of panes frozen
+/// at `freeze`: on each axis, 0, or less than the first unfrozen one.
+pub fn freeze_from_fits(freeze: (u32, u32), from: (u32, u32)) -> bool {
+    (from.0 == 0 || from.0 < freeze.0) && (from.1 == 0 || from.1 < freeze.1)
 }

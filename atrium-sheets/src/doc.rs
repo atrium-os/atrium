@@ -442,6 +442,9 @@ pub struct Doc {
     /// While a column or row edge is dragged: the sheet, rows or columns,
     /// and their sizes before, to make one undo step when it is let go.
     pub sizing: Option<(u16, bool, Vec<(u32, f64)>)>,
+    /// The row and column at the top left of the view, set by the window
+    /// before a command: Freeze Panes freezes from there, as Excel does.
+    pub view_top: (u32, u32),
     /// Rows grown to fit typed lines, by (sheet, row): they shrink back when
     /// their text needs less (for this session; a row sized by hand leaves).
     pub grown_rows: std::collections::HashSet<(u16, u32)>,
@@ -508,7 +511,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, grown_rows: Default::default(), edits: 0, last_fill: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.

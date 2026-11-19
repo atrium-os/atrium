@@ -185,12 +185,19 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             (true, false) => "bottomLeft",
             _ => "topRight",
         };
-        o.extend_from_slice(br#"<sheetViews><sheetView workbookViewId="0"><pane"#);
+        // The view starts at the first frozen row and column; the splits
+        // count the frozen ones from there.
+        let (tr, tc) = (sh.freeze_from.0.min(fr.saturating_sub(1)), sh.freeze_from.1.min(fc.saturating_sub(1)));
+        o.extend_from_slice(br#"<sheetViews><sheetView workbookViewId="0""#);
+        if (tr, tc) != (0, 0) {
+            let _ = write!(o, r#" topLeftCell="{}""#, a1(tr, tc));
+        }
+        o.extend_from_slice(br#"><pane"#);
         if fc > 0 {
-            let _ = write!(o, r#" xSplit="{fc}""#);
+            let _ = write!(o, r#" xSplit="{}""#, fc - tc);
         }
         if fr > 0 {
-            let _ = write!(o, r#" ySplit="{fr}""#);
+            let _ = write!(o, r#" ySplit="{}""#, fr - tr);
         }
         let _ = write!(o, r#" topLeftCell="{}" activePane="{pane}" state="frozen"/><selection pane="{pane}"/></sheetView></sheetViews>"#, a1(fr, fc));
     }
