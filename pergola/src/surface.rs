@@ -663,17 +663,16 @@ impl FrescoSurface {
             }
         }
         // Each window has its own atlas slot: one that missed rows another
-        // window added gets the whole atlas, the rest only new rows.
+        // window added gets the whole atlas, the rest only the newly written rectangle.
         if self.atlas_seen != Some(self.atlas_gen) {
             if self.atlas.take_dirty().is_some() {
                 self.atlas_gen += 1;
             }
             let hash = self.conn.upload_blob(self.atlas.pixels())?;
             self.conn.slot_set_texture(self.atlas_slot, hash, ATLAS_W, ATLAS_H, fresco_protocol::TextureFormat::R8Unorm)?;
-        } else if let Some((y, rows, px)) = self.atlas.take_dirty() {
-            let px = px.to_vec();
-            self.conn.slot_update_region(self.atlas_slot, 0, y, ATLAS_W, rows, px)?;
-            self.atlas_gen += 1;
+        } else if let Some(([x, y, w, h], px)) = self.atlas.take_dirty_region(false) {
+            self.atlas_gen += 1; // A failed send leaves every stale window behind this generation.
+            self.conn.slot_update_region(self.atlas_slot, x, y, w, h, px)?;
         }
         self.atlas_seen = Some(self.atlas_gen);
         // The colour twin, the same way, once an emoji made it.
@@ -687,10 +686,9 @@ impl FrescoSurface {
                 self.conn.slot_set_texture(cslot, hash, crate::glyphs::COLOR_W, crate::glyphs::COLOR_H, fresco_protocol::TextureFormat::Rgba8UnormSrgb)?;
                 self.color_seen = Some(self.color_gen);
             }
-        } else if let Some((y, rows, px)) = self.atlas.take_color_dirty() {
-            let px = px.to_vec();
-            self.conn.slot_update_region(cslot, 0, y, crate::glyphs::COLOR_W, rows, px)?;
-            self.color_gen += 1;
+        } else if let Some(([x, y, w, h], px)) = self.atlas.take_dirty_region(true) {
+            self.color_gen += 1; // A failed send leaves every stale window behind this generation.
+            self.conn.slot_update_region(cslot, x, y, w, h, px)?;
             self.color_seen = Some(self.color_gen);
         }
         Ok(fresco_protocol::GlyphRunParams {

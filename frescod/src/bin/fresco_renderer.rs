@@ -203,7 +203,7 @@ fn raster(
         let mismatches = reference.iter().zip(&w.px).filter(|(a,b)| a!=b).count();
         let touched = damage::tiles_after_plan(width, height, &sig, held, &out.pixels, usize::MAX);
         let count: u64 = touched.iter().map(|r| u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])).sum();
-        eprintln!("i0_raster width={width} height={height} tiles={count} full=false pixel_mismatches={mismatches}");
+        eprintln!("i0_raster width={width} height={height} tiles={count} tile_rects={touched:?} full=false pixel_mismatches={mismatches}");
         if mismatches != 0 { return Err("incremental raster differs from full frame".into()); }
     }
     w.tiles = Some(sig);

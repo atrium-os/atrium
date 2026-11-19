@@ -181,6 +181,13 @@ touched by ops after the group are rastered. To tell "only the translation chang
 re-deriving it, **pack's output carries, per `SCROLL` group, a content hash of its subtree in local
 space (its own translation excluded) and the box of everything drawn after it**.
 
+Pergola packs the changed atlas texels into a rectangular slot update. A
+window that missed an atlas generation receives a full upload. For ordinary
+glyph ops, tile signatures include the atlas footprint and bilinear edge taps.
+Repeated glyphs reuse that hash within the frame. Large or nonstandard
+footprints, turned glyphs and ordinary textures retain whole-texture damage.
+The per-texture regional hashing budget bounds work for overlapping UV boxes.
+
 **As built** (Fresco owners, 2026-11-06): pack's `WindowFrame::scrolls` gives per viewport its
 area (whole pixels inside the clip and the background), the content's offset, a hash of the
 viewport's placement, background and content in local space, the texture slots the content samples

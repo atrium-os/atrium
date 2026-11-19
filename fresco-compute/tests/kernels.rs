@@ -280,3 +280,36 @@ fn op_box_clips_in_reference_and_tier2() {
     t2.render(&f, &mut got).unwrap();
     assert_eq!(got, want);
 }
+
+#[test]
+fn atlas_damage_tracks_coverage_color_and_bilinear_edge_taps() {
+    for format in [TexFormat::R8, TexFormat::Rgba8Srgb] {
+        let stride = format.bytes_per_texel();
+        let mut s = scene();
+        s.rects.clear();
+        s.paths.clear();
+        s.texture_batches.clear();
+        s.textures = vec![Texture { width: 32, height: 8, format, data: vec![0; 32 * 8 * stride] }];
+        let mut run = s.glyph_batches[0].runs[0].clone();
+        run.origin = [2.25, 2.25];
+        run.color = [1.0; 4];
+        run.glyphs.truncate(1);
+        run.glyphs[0].bearing = [0.0; 2];
+        run.glyphs[0].atlas_uv = [4.0, 2.0, 4.0, 4.0];
+        let mut other = run.clone();
+        other.origin[0] += 32.0;
+        other.glyphs[0].atlas_uv[0] = 20.0;
+        s.glyph_batches = vec![GlyphBatch { atlas: 0, runs: vec![run, other] }];
+        let frame = |s: &Scene| Frame::pack(s, 48, 16, 48);
+        let first = frame(&s);
+        for (x, expected) in [(13, false), (4, true), (3, true)] {
+            let i = (3 * 32 + x) * stride;
+            s.textures[0].data[i..i+stride].fill(255);
+            let after = frame(&s);
+            let dirty = damage::dirty(&damage::tile_signatures(&after), Some(&damage::tile_signatures(&first)));
+            assert_eq!(dirty, [expected, false, false]);
+            assert_eq!(reference::render(&first) != reference::render(&after), expected);
+            s.textures[0].data[i..i+stride].fill(0);
+        }
+    }
+}

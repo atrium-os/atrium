@@ -23,6 +23,34 @@ fn hash_words(mut h: u64, w: &[u32]) -> u64 {
     h
 }
 
+// Include a texel of halo on both ends for sample_bilinear, including
+// fractional placement and clamped texture edges. Use the full hash for UVs
+// outside the ordinary atlas profile, or for large client-specified regions.
+fn glyph_region(uv: [f32; 4], w: u32, h: u32) -> Option<[u32; 4]> {
+    if w == 0 || h == 0 || !uv.iter().all(|v| (0.0..=1.0).contains(v))
+        || uv[0] > uv[2] || uv[1] > uv[3] { return None; }
+    let x = ((uv[0] * w as f32).floor() as u32).saturating_sub(1);
+    let y = ((uv[1] * h as f32).floor() as u32).saturating_sub(1);
+    let right = ((uv[2] * w as f32).ceil() as u32).saturating_add(1).min(w);
+    let bottom = ((uv[3] * h as f32).ceil() as u32).saturating_add(1).min(h);
+    (u64::from(right - x) * u64::from(bottom - y) <= 4096).then_some([x, y, right, bottom])
+}
+
+fn glyph_hash(f: &Frame, texture: &[u32; 4], [x, y, right, bottom]: [u32; 4]) -> u64 {
+    let [base, width, height, format] = *texture;
+    let mut hash = hash_words(0, &[width, height, format]);
+    for row in y..bottom {
+        for col in x..right {
+            let index = row as u64 * u64::from(width) + u64::from(col);
+            let offset = if format == 0 { index } else { index / 4 };
+            let word = f.texels.get((u64::from(base) + offset) as usize).copied().unwrap_or(0);
+            let pixel = if format == 0 { word } else { (word >> (8 * (index % 4))) & 255 };
+            hash = mix(hash, u64::from(pixel));
+        }
+    }
+    hash
+}
+
 /// One signature per tile, row major (`tiles_x * tiles_y`).
 /// The signature [`tile_signatures`] gives a tile no op touches: one
 /// holding only the frame's clear colour.
@@ -34,17 +62,10 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
     let h = &f.header;
     let base = empty_signature(h);
     let mut sig = vec![base; (h.tiles_x * h.tiles_y) as usize];
-    // Texel content per texture, hashed once.
-    let tex_hash: Vec<u64> = f
-        .tex
-        .iter()
-        .map(|t| {
-            let words = if t[3] == 0 { t[1] * t[2] } else { (t[1] * t[2]).div_ceil(4) };
-            let lo = (t[0] as usize).min(f.texels.len());
-            let hi = (lo + words as usize).min(f.texels.len());
-            hash_words(hash_words(0, t), &f.texels[lo..hi])
-        })
-        .collect();
+    let mut whole_textures = vec![None; f.tex.len()];
+    // Overlapping UV boxes must not multiply hashing cost without bound.
+    let mut budget: Vec<u64> = f.tex.iter().map(|t| u64::from(t[1]) * u64::from(t[2])).collect();
+    let mut glyphs = std::collections::HashMap::new();
     for o in &f.ops[..h.op_count as usize] {
         // The same clamp as bin.comp: ops outside the target touch no tile.
         let b = o.p3;
@@ -66,7 +87,32 @@ pub fn tile_signatures(f: &Frame) -> Vec<u64> {
             oh = hash_words(oh, &o.meta);
         }
         if o.meta[0] == KIND_TEXTURE || o.meta[0] == KIND_GLYPH || o.meta[0] == KIND_GLYPH_XF {
-            oh = mix(oh, tex_hash.get(o.meta[1] as usize).copied().unwrap_or(0));
+            let slot = o.meta[1] as usize;
+            if let Some(t) = f.tex.get(slot) {
+                // Normal glyphs only sample their UV box, with bilinear edge taps.
+                // Large or unusual boxes use the bounded once-per-texture path.
+                let region = if o.meta[0] == KIND_GLYPH {
+                    glyph_region(o.p2, t[1], t[2])
+                } else { None };
+                let local = region.and_then(|r| {
+                    if let Some(&hash) = glyphs.get(&(slot, r)) { return Some(hash); }
+                    let cost = u64::from(r[2] - r[0]) * u64::from(r[3] - r[1]);
+                    budget[slot] = budget[slot].checked_sub(cost)?;
+                    let hash = glyph_hash(f, t, r);
+                    glyphs.insert((slot, r), hash);
+                    Some(hash)
+                });
+                let content = local.unwrap_or_else(|| {
+                    *whole_textures[slot].get_or_insert_with(|| {
+                        let len = u64::from(t[1]) * u64::from(t[2]);
+                        let words = if t[3] == 0 { len } else { len.div_ceil(4) };
+                        let lo = (t[0] as usize).min(f.texels.len());
+                        let hi = lo.saturating_add(words as usize).min(f.texels.len());
+                        hash_words(hash_words(0, t), &f.texels[lo..hi])
+                    })
+                });
+                oh = mix(oh, content);
+            }
         }
         if o.meta[0] == KIND_FILL {
             // Its whole block (header word 7 = its length): any change

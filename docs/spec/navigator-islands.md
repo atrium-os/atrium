@@ -365,6 +365,40 @@ The next I0 comparison is the common sign-in fixture. Production per-origin
 fetch delegation, credential mediation and broader paint coverage remain open.
 This gate measures work per interaction. It does not measure latency.
 
+### Editor glyph damage follow-up, 2026-11-20
+
+Inserting the first `x` on line 4 replaced the shaped glyph run and moved the
+caret. Pergola rasterized a new 11 × 9 coverage glyph at atlas position (254, 0).
+The old slot update sent nine complete 2,048-byte rows, or 18,432 raw bytes.
+The packed update sends the 99 coverage bytes and occupies 119 bytes on the
+wire. A trace of the resulting frame counted 514 bytes for the shaped run, 50
+for the caret, 42 for their placements and 31 for frame boundaries and present.
+
+The compute packer expands the run into individual glyph operations. The old
+tile signature mixed the entire atlas into each glyph, so adding `x` changed
+all signatures covering visible text, a 17 × 12 tile rectangle starting at the
+origin. The new signature hashes the glyph's atlas rectangle including the
+bilinear sample halo, shared by repeated uses within the frame. The two
+remaining damage rectangles in half-open tile coordinates are (10,4)–(13,5)
+and (10,5)–(17,6). They cover the caret and shifted letters on line 4.
+
+| Arm64 Capsicum gate | Key nodes | Key wire bytes | Key raster tiles |
+| --- | ---: | ---: | ---: |
+| Original editor and whole-atlas damage | 2 | 19,091 | 204 |
+| Packed atlas update alone | 2 | 756 | 204 |
+| Packed update and glyph-local damage | 2 | 756 | 10 |
+
+Three trials per arm used an HVF clone of the same FreeBSD arm64 guest,
+kernel `main-n290542-cfbf11308b58`, and the same signed, JIT-off fixture.
+Every incremental frame matched a full redraw. Final blink and restore each
+changed one node, sent 102 bytes and touched two tiles. Scrolling 24 pixels
+changed three nodes, sent 560 bytes and touched 35 tiles. Initial upload
+fell from 4,469,466 to 4,265,693 bytes for 136 nodes and 920 tiles.
+Final stripped editor SHA-256 was
+`bdc19692da477979fe57d496de64854e704399bccabd76cc9f6e2bf354398a3e`,
+renderer `8c0abdf21b92802dcfb5d6dfe5421871227b499dae656190450bb68ce5317f5f`.
+These are work counts at 1×. Interaction latency remains unmeasured.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

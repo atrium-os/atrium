@@ -126,6 +126,31 @@ impl Shelf {
     }
 }
 
+/// Bounds of texels written since the last upload, in atlas coordinates.
+#[derive(Clone, Copy)]
+struct DirtyBox { left: u32, top: u32, right: u32, bottom: u32 }
+
+impl DirtyBox {
+    fn include(area: &mut Option<Self>, x: u32, y: u32, w: u32, h: u32) {
+        let r = area.get_or_insert(Self { left: x, top: y, right: x + w, bottom: y + h });
+        r.left = r.left.min(x);
+        r.top = r.top.min(y);
+        r.right = r.right.max(x + w);
+        r.bottom = r.bottom.max(y + h);
+    }
+
+    fn packed(self, data: &[u8], stride: u32, bpp: u32) -> ([u32; 4], Vec<u8>) {
+        let w = self.right - self.left;
+        let h = self.bottom - self.top;
+        let mut bytes = Vec::with_capacity((w * h * bpp) as usize);
+        for y in self.top..self.bottom {
+            let start = ((y * stride + self.left) * bpp) as usize;
+            bytes.extend_from_slice(&data[start..start + (w * bpp) as usize]);
+        }
+        ([self.left, self.top, w, h], bytes)
+    }
+}
+
 /// The glyph atlas of one window.
 pub struct Atlas {
     data: Vec<u8>,
@@ -134,12 +159,12 @@ pub struct Atlas {
     /// colour glyph; its changed rows.
     color: Option<Vec<u8>>,
     color_shelf: Shelf,
-    color_dirty: Option<(u32, u32)>,
+    color_dirty: Option<DirtyBox>,
     /// (face, size in 1/64 device px, glyph) → entry; `None`: blank or
     /// didn't fit.
     slots: HashMap<(u32, u32, u16), Option<Entry>>,
-    /// Rows `dirty.0..dirty.1` changed since the last [`Atlas::take_dirty`].
-    dirty: Option<(u32, u32)>,
+    /// Changed coverage texels.
+    dirty: Option<DirtyBox>,
     /// Glyphs dropped because the atlas was full.
     pub dropped: u64,
     scaler: swash::scale::ScaleContext,
@@ -198,8 +223,7 @@ impl Atlas {
             let src = (yy * gw * 4) as usize;
             data[dst..dst + (gw * 4) as usize].copy_from_slice(&bm.rgba[src..src + (gw * 4) as usize]);
         }
-        let (a, b) = self.color_dirty.unwrap_or((y, y + gh));
-        self.color_dirty = Some((a.min(y), b.max(y + gh)));
+        DirtyBox::include(&mut self.color_dirty, x, y, gw, gh);
         Some(Some(Entry { u: x, v: y, w: gw, h: gh, left: bm.left as f32, top: bm.top as f32, color: true }))
     }
 
@@ -224,15 +248,23 @@ impl Atlas {
             self.data[dst..dst + gw as usize].copy_from_slice(&img.data[src..src + gw as usize]);
         }
         let e = Entry { u: x, v: y, w: gw, h: gh, left: img.placement.left as f32, top: img.placement.top as f32, color: false };
-        let (a, b) = self.dirty.unwrap_or((y, y + gh));
-        self.dirty = Some((a.min(y), b.max(y + gh)));
+        DirtyBox::include(&mut self.dirty, x, y, gw, gh);
         Some(e)
     }
 
     /// The rows changed since the last call, and their pixels (full width).
     pub fn take_dirty(&mut self) -> Option<(u32, u32, &[u8])> {
-        let (a, b) = self.dirty.take()?;
+        let area = self.dirty.take()?;
+        let (a, b) = (area.top, area.bottom);
         Some((a, b - a, &self.data[(a * ATLAS_W) as usize..(b * ATLAS_W) as usize]))
+    }
+
+    pub(crate) fn take_dirty_region(&mut self, color: bool) -> Option<([u32; 4], Vec<u8>)> {
+        if color {
+            Some(self.color_dirty.take()?.packed(self.color.as_deref()?, COLOR_W, 4))
+        } else {
+            Some(self.dirty.take()?.packed(&self.data, ATLAS_W, 1))
+        }
     }
 
     /// The whole atlas (its first upload).
@@ -241,7 +273,8 @@ impl Atlas {
     /// The colour twin's rows changed since the last call, and their
     /// pixels (full width, RGBA).
     pub fn take_color_dirty(&mut self) -> Option<(u32, u32, &[u8])> {
-        let (a, b) = self.color_dirty.take()?;
+        let area = self.color_dirty.take()?;
+        let (a, b) = (area.top, area.bottom);
         let d = self.color.as_deref()?;
         Some((a, b - a, &d[(a * COLOR_W * 4) as usize..(b * COLOR_W * 4) as usize]))
     }
@@ -277,6 +310,12 @@ mod tests {
         assert_eq!(a.glyph(&f, 16.0, space), None, "blank glyphs take no room");
         let big = a.glyph(&f, 32.0, gid).unwrap();
         assert!(big.h > e.h && big.u > e.u, "another size is another entry");
+        let (bounds, bytes) = a.take_dirty_region(false).unwrap();
+        assert_eq!(bounds, [big.u, big.v, big.w, big.h]);
+        for (row, packed) in bytes.chunks_exact(big.w as usize).enumerate() {
+            let start = ((big.v + row as u32) * ATLAS_W + big.u) as usize;
+            assert_eq!(packed, &a.pixels()[start..start + big.w as usize]);
+        }
         assert!(!e.color && a.color_pixels().is_none());
     }
 
