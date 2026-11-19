@@ -521,10 +521,56 @@ fn work_points_out_recipients_outside_the_company() {
     app.tick();
     assert_eq!(k.outside(), Some(("example.com".into(), vec!["ada@other.org".into(), "sam@notexample.com".into()])));
     assert!(texts(&app).iter().any(|x| x == "Outside example.com: ada@other.org, sam@notexample.com"), "{:?}", texts(&app));
+    // Both fields naming someone outside are marked; Subject isn't.
+    assert!(texts(&app).iter().any(|x| x == "To •") && texts(&app).iter().any(|x| x == "Cc •"));
     // All inside: the line goes.
     k.to.set(TextEdit::new("priya@example.com"));
     k.cc.set(TextEdit::new(""));
     app.tick();
     assert!(k.outside().is_none());
     assert!(!texts(&app).iter().any(|x| x.starts_with("Outside")));
+    assert!(texts(&app).iter().any(|x| x == "To"));
+}
+
+#[test]
+fn the_palette_in_a_compose_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: "/nonexistent".into() }));
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    engine.store.set_identities(account, &[Identity { name: "Priya".into(), addr: "priya@example.org".into(), signature: String::new() }]).unwrap();
+    let c = engine.compose_new(account, 0).unwrap();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    let ctrl_k = Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Modifiers::default() }, chars: "k".into() };
+    let press = |key: Key| Event::Key { kind: KeyEventKind::Down, key, modifiers: Modifiers::default(), chars: String::new() };
+    // Ctrl-K: up, typing narrows it (and nothing goes to the fields).
+    assert!(k.key(&ctrl_k, None));
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Send") && texts(&app).iter().any(|x| x == "Ctrl-Enter"));
+    for ch in ["b", "c", "c"] {
+        assert!(k.key(&typed(ch), None));
+    }
+    assert_eq!(k.palette_shown()[0].label, "Show Bcc");
+    assert!(k.to.get_cloned().text().is_empty());
+    assert!(k.key(&press(Key::Enter), None));
+    assert!(k.ui.get_cloned().show_bcc && k.ui.get_cloned().palette.is_none());
+    assert!(!k.palette_entries().iter().any(|e| e.label == "Show Bcc"));
+    // Escape closes it; Send later from it shows the choices.
+    assert!(k.key(&ctrl_k, None) && k.key(&press(Key::Escape), None));
+    assert!(k.ui.get_cloned().palette.is_none());
+    assert!(k.key(&ctrl_k, None));
+    for ch in "later".chars() {
+        k.key(&typed(&ch.to_string()), None);
+    }
+    assert!(k.key(&press(Key::Enter), None));
+    assert!(k.ui.get_cloned().later);
+    // Discard from it: the window is done.
+    assert!(k.key(&press(Key::Escape), None));
+    assert!(k.key(&ctrl_k, None));
+    for ch in "discard".chars() {
+        k.key(&typed(&ch.to_string()), None);
+    }
+    assert!(k.key(&press(Key::Enter), None));
+    assert_eq!(k.done(), Some(Done::Discarded));
 }

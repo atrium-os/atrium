@@ -46,6 +46,14 @@ pub enum Cmd {
     /// Make the `n`th of the open message's "Always…" rules (§11.6) and
     /// run it over the inbox.
     Always(u16),
+    // A compose window's (§9).
+    Send,
+    SendLater,
+    Attach,
+    RichText(bool),
+    ShowBcc,
+    SaveDraft,
+    Discard,
 }
 
 /// What an export covers (§6.5).
@@ -105,6 +113,42 @@ pub fn filter(all: &[Entry], query: &str) -> Vec<Entry> {
     let mut v: Vec<(i32, usize, &Entry)> = all.iter().enumerate().filter_map(|(i, e)| score(&e.label, query).map(|s| (s, i, e))).collect();
     v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     v.into_iter().map(|(_, _, e)| e.clone()).collect()
+}
+
+/// What a key did to the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Do shown entry `n`.
+    Run(usize),
+    Closed,
+    /// Taken (typed, moved, or ignored while up).
+    Taken,
+}
+
+/// A key while the palette is up over `n` shown entries: typing narrows
+/// it, Up and Down choose, Enter does it, Escape (or Ctrl-K again)
+/// closes it.
+pub fn key(p: &mut Palette, n: usize, key: &pergola::Key, modifiers: pergola::event::Modifiers, chars: &str) -> Step {
+    use pergola::Key;
+    match key {
+        Key::Escape => return Step::Closed,
+        Key::Char if modifiers.ctrl && chars.eq_ignore_ascii_case("k") => return Step::Closed,
+        Key::Down => p.sel = if n == 0 { 0 } else { (p.sel + 1) % n },
+        Key::Up => p.sel = if n == 0 { 0 } else { (p.sel + n - 1) % n },
+        Key::Enter => return Step::Run(p.sel),
+        Key::Backspace => {
+            p.query.pop();
+            p.sel = 0;
+        }
+        Key::Char if !modifiers.ctrl && !modifiers.alt && !modifiers.meta => {
+            if p.query.chars().count() < QUERY_MAX {
+                p.query.extend(chars.chars().filter(|c| !c.is_control()));
+            }
+            p.sel = 0;
+        }
+        _ => {}
+    }
+    Step::Taken
 }
 
 #[cfg(test)]

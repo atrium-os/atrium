@@ -613,6 +613,15 @@ fn search_as_you_type_and_a_saved_search() {
     // Operators: from Arun with "plan", via the saved place too.
     mail.search_for("from:arun@acme.example plan", None);
     assert_eq!(subjects(&mail), ["Old north plan"]);
+    // The chips over a search's results are operators in its words (§11.7).
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Flagged"), "chips shown");
+    mail.toggle_quick(mail_engine::quick::FLAGGED);
+    assert_eq!(mail.ui.get_cloned().search.unwrap().query, "from:arun@acme.example plan is:flagged");
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    assert_eq!(mail.chips_on(&mail.ui.get_cloned()), mail_engine::quick::FLAGGED);
+    mail.toggle_quick(mail_engine::quick::FLAGGED);
+    assert_eq!(subjects(&mail), ["Old north plan"]);
     let id = mail.ui.get_cloned().saved[0].id;
     mail.search_for("north", Some(id));
     app.tick();
@@ -1319,6 +1328,12 @@ fn the_command_palette() {
     assert_eq!(subjects(&mail), ["Two", "One"]);
     assert!(mail.key(&press(Key::Down), None));
     assert_eq!(mail.ui.get_cloned().cursor, Some(1));
+    // Their keys aren't shown either; Ctrl-P's still is.
+    let entries = mail.palette_entries();
+    assert!(entries.iter().any(|e| e.label == "Archive" && e.key.is_empty()));
+    assert!(entries.iter().any(|e| e.label == "Print" && e.key == "Ctrl-P"));
+    app.tick();
+    assert!(!texts(&app).iter().any(|x| x == "e"), "no e on Archive");
     assert!(mail.key(&ctrl_k, None));
     typed("arch");
     assert!(mail.key(&press(Key::Enter), None));

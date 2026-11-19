@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1837,6 +1837,24 @@ Stalwart in the cloud VM, and later a real account):
    leaves mail here alone until run; moved, flagged once, quiet does nothing; the choices
    for a sender), window 1 (an Always entry kept and run, with Undo), settings 1 (Run on
    the inbox with nothing that fits). **Not yet**: Report phishing.
+
+   **Small leftovers (2026-11-19, §15.5, §11.7, §9.1, §6.5).** *The palette in compose
+   windows*: Ctrl-K over a compose window offers Send (Ctrl-Enter), Send later…, Attach a
+   file…, rich or plain text, Show Bcc, Save draft and Discard draft; it takes every key
+   while up, so nothing typed reaches the fields; the palette's keys and drawing are now
+   shared (`palette::key`, `view::draw_palette`). *Keys hidden with single keys off*: the
+   reader's buttons and the palette no longer show single-key shortcuts when they are
+   turned off (Ctrl-P still shows). *Chips on search results*: the quick-filter chips sit
+   over a search's results too, each the search operator it stands for (`is:unread`,
+   `has:attachment`…) added to or taken out of the words, so a saved search keeps them
+   (`quick::toggle_in`, `bits_of`). *Recipients outside the company, in Work*: To, Cc or
+   Bcc naming someone outside has its label in the warning colour with a dot ("To •"),
+   beside the line that names them. *Export takes held mail*: a folder's export and "all
+   mail" include what the screener holds. Tests: window 2 (chips toggled into a search's
+   words and out; keys gone with single keys off), compose 2 (the palette: narrowing, Show
+   Bcc, Escape, Send later, Discard; the marked labels), export 1 (a held message
+   exported), quick 1. **Not yet**: screen-reader names for the palette's rows, and
+   Maildir.
 
 ## 17. Decisions, with recommendations
 

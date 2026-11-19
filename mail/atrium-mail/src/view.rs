@@ -799,8 +799,23 @@ impl Mail {
     /// Turn quick filter `bit` on or off (§11.7).
     pub fn toggle_quick(&self, bit: u16) {
         let mut ui = self.ui.get_cloned();
+        // In a search, a chip is its operator in the words (§11.7).
+        if let Some(q) = ui.search.as_ref().filter(|s| s.view.is_none()).map(|s| mail_engine::quick::toggle_in(&s.query, bit)) {
+            let saved = None;
+            drop(ui);
+            self.search_for(&q, saved);
+            return;
+        }
         ui.quick ^= bit;
         self.relist(ui);
+    }
+
+    /// The chips on: the folder's, or those a search's words ask for.
+    pub fn chips_on(&self, ui: &Ui) -> u16 {
+        match &ui.search {
+            Some(s) if s.view.is_none() => mail_engine::quick::bits_of(&s.query),
+            _ => ui.quick,
+        }
     }
 
     fn count_of(&self, folder: FolderId, conversations: bool) -> usize {
@@ -2667,7 +2682,8 @@ impl Mail {
         use crate::palette::{Cmd, Entry};
         let ui = self.ui.get_cloned();
         let mut v = Vec::new();
-        let mut add = |label: String, key: &'static str, cmd: Cmd| v.push(Entry { label, key, cmd });
+        let singles = self.engine.prefs().single_keys;
+        let mut add = |label: String, key: &'static str, cmd: Cmd| v.push(Entry { label, key: if singles || key.chars().count() > 1 { key } else { "" }, cmd });
         if let Some(r) = &ui.reading {
             add("Reply".into(), "r", Cmd::Reply);
             add("Reply all".into(), "a", Cmd::ReplyAll);
@@ -2753,26 +2769,10 @@ impl Mail {
         let mut ui = self.ui.get_cloned();
         let Some(p) = &mut ui.palette else { return false };
         let n = self.palette_shown().len();
-        match key {
-            Key::Escape => ui.palette = None,
-            Key::Char if modifiers.ctrl && chars.eq_ignore_ascii_case("k") => ui.palette = None,
-            Key::Down => p.sel = if n == 0 { 0 } else { (p.sel + 1) % n },
-            Key::Up => p.sel = if n == 0 { 0 } else { (p.sel + n - 1) % n },
-            Key::Enter => {
-                let sel = p.sel;
-                return self.palette_run(sel);
-            }
-            Key::Backspace => {
-                p.query.pop();
-                p.sel = 0;
-            }
-            Key::Char if !modifiers.ctrl && !modifiers.alt && !modifiers.meta => {
-                if p.query.chars().count() < crate::palette::QUERY_MAX {
-                    p.query.extend(chars.chars().filter(|c| !c.is_control()));
-                }
-                p.sel = 0;
-            }
-            _ => return true,
+        match crate::palette::key(p, n, key, modifiers, chars) {
+            crate::palette::Step::Run(sel) => return self.palette_run(sel),
+            crate::palette::Step::Closed => ui.palette = None,
+            crate::palette::Step::Taken => {}
         }
         self.ui.set(ui);
         true
@@ -2831,6 +2831,7 @@ impl Mail {
             Cmd::Export(e) => self.export(e),
             Cmd::Import => self.import(),
             Cmd::Always(i) => self.always(i as usize),
+            Cmd::Send | Cmd::SendLater | Cmd::Attach | Cmd::RichText(_) | Cmd::ShowBcc | Cmd::SaveDraft | Cmd::Discard => {}
             Cmd::Saved(id) => {
                 let q = self.ui.get_cloned().saved.iter().find(|s| s.id == id).map(|s| s.query.clone());
                 if let Some(q) = q {
@@ -3395,13 +3396,14 @@ impl MailView {
         let t = ctx.theme;
         let (ch, gap) = (em(24.0), em(6.0));
         let (mut x, mut y) = (x0 + 12.0, head_h() + em(4.0));
+        let bits = self.mail.chips_on(ui);
         for (bit, label) in mail_engine::quick::CHIPS {
             let lw = width(label, type_size::XS, Weight::Medium) + em(20.0);
             if x + lw > x0 + w - 12.0 && x > x0 + 12.0 {
                 x = x0 + 12.0;
                 y += ch + gap;
             }
-            let on = ui.quick & bit != 0;
+            let on = bits & bit != 0;
             let r = Rect::new(x, y, lw, ch);
             ctx.add(Node::Rect { rect: Rect::new(r.x() - 1.0, r.y() - 1.0, r.w() + 2.0, r.h() + 2.0), fill: if on { t.accent_fg() } else { t.border_default() }, radius: ch / 2.0 + 1.0 });
             let m = self.mail.clone();
@@ -3415,6 +3417,10 @@ impl MailView {
             text(ctx, x + em(10.0), y + ch / 2.0, label, type_size::XS, Weight::Medium, if on { t.text_primary() } else { t.text_secondary() });
             ctx.pop();
             x += lw + gap;
+        }
+        // A search's results: its chips only (Save search keeps them).
+        if ui.search.is_some() {
+            return y + ch + em(8.0) - head_h();
         }
         // Grouping (§11.7): a press moves to the next way.
         let label = ui.group.label();
@@ -3517,7 +3523,8 @@ impl MailView {
         }
         text(ctx, x0 + 16.0 + lead, head_h() / 2.0, &fit(&title, type_size::LG, Weight::Semibold, sw_x - x0 - 24.0 - lead), type_size::LG, Weight::Semibold, t.text_primary());
         // Quick filters (§11.7): chips under the header, combinable.
-        let chips = if ui.folder.is_some() && ui.search.is_none() { self.chips(ctx, ui, x0, w) } else { 0.0 };
+        let searching = ui.search.as_ref().is_some_and(|s| s.view.is_none() && !s.query.trim().is_empty());
+        let chips = if (ui.folder.is_some() && ui.search.is_none()) || searching { self.chips(ctx, ui, x0, w) } else { 0.0 };
         self.mail.chips_h.set(chips);
         let top = head_h() + chips;
         if let Some(e) = &ui.error {
@@ -3700,7 +3707,10 @@ impl MailView {
         } else {
             buttons
         };
+        // With single-key shortcuts off, their keys aren't shown.
+        let singles = self.mail.engine.prefs().single_keys;
         for (label, k, on) in buttons {
+            let k = if singles || k.chars().count() > 1 { k } else { "" };
             let lw = width(label, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
             bx -= lw;
             area(ctx, Rect::new(bx, em(34.0) - em(12.0), lw, em(24.0)), t.bg_window(), on);
@@ -3763,45 +3773,10 @@ impl MailView {
     /// The command palette (§15.5): what is typed, then what it finds,
     /// each with its key; a press does one.
     fn palette(&self, ctx: &mut Ctx, p: &crate::palette::Palette, w: f32) {
-        let t = ctx.theme;
-        let shown = self.mail.palette_shown();
-        let row = em(30.0);
-        let pw = em(440.0).min(w - em(32.0));
-        let field = em(40.0);
-        let ph = field + 1.0 + (shown.len().max(1)) as f32 * row + em(8.0);
-        let (px, py) = ((w - pw) / 2.0, head_h() + em(8.0));
-        ctx.push(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, pw + 2.0, ph + 2.0), fill: t.border_strong(), radius: 9.0 });
-        ctx.add(Node::Rect { rect: Rect::new(px, py, pw, ph), fill: t.bg_window(), radius: 8.0 });
-        let cy = py + field / 2.0;
-        if p.query.is_empty() {
-            text(ctx, px + em(14.0), cy, "Type a command or a place", type_size::SM, Weight::Regular, t.text_tertiary());
-        } else {
-            let q = fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0));
-            text(ctx, px + em(14.0), cy, &q, type_size::SM, Weight::Regular, t.text_primary());
-        }
-        let lh = em(type_size::SM) * 1.3;
-        let cx = px + em(14.0) + if p.query.is_empty() { 0.0 } else { width(&fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0)), type_size::SM, Weight::Regular) };
-        ctx.add(Node::Rect { rect: Rect::new(cx, cy - lh / 2.0, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
-        ctx.add(Node::Rect { rect: Rect::new(px, py + field, pw, 1.0), fill: t.border_default(), radius: 0.0 });
-        let mut y = py + field + 1.0 + em(4.0);
-        if shown.is_empty() {
-            text(ctx, px + em(14.0), y + row / 2.0, "Nothing matches", type_size::SM, Weight::Regular, t.text_secondary());
-        }
-        for (i, e) in shown.iter().enumerate() {
-            let m = self.mail.clone();
-            let sel = i == p.sel.min(shown.len().saturating_sub(1));
-            area(ctx, Rect::new(px + em(6.0), y, pw - em(12.0), row), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || {
-                m.palette_run(i);
-            });
-            let kw = if e.key.is_empty() { 0.0 } else { width(e.key, type_size::XS, Weight::Regular) + em(12.0) };
-            text(ctx, px + em(14.0), y + row / 2.0, &fit(&e.label, type_size::SM, Weight::Regular, pw - em(28.0) - kw), type_size::SM, Weight::Regular, t.text_primary());
-            if !e.key.is_empty() {
-                text(ctx, px + pw - em(14.0) - width(e.key, type_size::XS, Weight::Regular), y + row / 2.0, e.key, type_size::XS, Weight::Regular, t.text_tertiary());
-            }
-            ctx.pop();
-            y += row;
-        }
-        ctx.pop();
+        let m = self.mail.clone();
+        draw_palette(ctx, p, &self.mail.palette_shown(), w, head_h() + em(8.0), Rc::new(move |i| {
+            m.palette_run(i);
+        }));
     }
 
     /// The Later sheet (§11.4): what for, then when (each with its key).
@@ -4319,4 +4294,43 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::Gap => {}
     }
+}
+
+pub(crate) fn draw_palette(ctx: &mut Ctx, p: &crate::palette::Palette, shown: &[crate::palette::Entry], w: f32, top: f32, run: Rc<dyn Fn(usize)>) {
+    let t = ctx.theme;
+    let row = em(30.0);
+    let pw = em(440.0).min(w - em(32.0));
+    let field = em(40.0);
+    let ph = field + 1.0 + (shown.len().max(1)) as f32 * row + em(8.0);
+    let (px, py) = ((w - pw) / 2.0, top);
+    ctx.push(Node::Rect { rect: Rect::new(px - 1.0, py - 1.0, pw + 2.0, ph + 2.0), fill: t.border_strong(), radius: 9.0 });
+    ctx.add(Node::Rect { rect: Rect::new(px, py, pw, ph), fill: t.bg_window(), radius: 8.0 });
+    let cy = py + field / 2.0;
+    if p.query.is_empty() {
+        text(ctx, px + em(14.0), cy, "Type a command or a place", type_size::SM, Weight::Regular, t.text_tertiary());
+    } else {
+        let q = fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0));
+        text(ctx, px + em(14.0), cy, &q, type_size::SM, Weight::Regular, t.text_primary());
+    }
+    let lh = em(type_size::SM) * 1.3;
+    let cx = px + em(14.0) + if p.query.is_empty() { 0.0 } else { width(&fit(&p.query, type_size::SM, Weight::Regular, pw - em(40.0)), type_size::SM, Weight::Regular) };
+    ctx.add(Node::Rect { rect: Rect::new(cx, cy - lh / 2.0, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+    ctx.add(Node::Rect { rect: Rect::new(px, py + field, pw, 1.0), fill: t.border_default(), radius: 0.0 });
+    let mut y = py + field + 1.0 + em(4.0);
+    if shown.is_empty() {
+        text(ctx, px + em(14.0), y + row / 2.0, "Nothing matches", type_size::SM, Weight::Regular, t.text_secondary());
+    }
+    for (i, e) in shown.iter().enumerate() {
+        let run = run.clone();
+        let sel = i == p.sel.min(shown.len().saturating_sub(1));
+        area(ctx, Rect::new(px + em(6.0), y, pw - em(12.0), row), if sel { t.selection_bg() } else { Color::TRANSPARENT }, move || run(i));
+        let kw = if e.key.is_empty() { 0.0 } else { width(e.key, type_size::XS, Weight::Regular) + em(12.0) };
+        text(ctx, px + em(14.0), y + row / 2.0, &fit(&e.label, type_size::SM, Weight::Regular, pw - em(28.0) - kw), type_size::SM, Weight::Regular, t.text_primary());
+        if !e.key.is_empty() {
+            text(ctx, px + pw - em(14.0) - width(e.key, type_size::XS, Weight::Regular), y + row / 2.0, e.key, type_size::XS, Weight::Regular, t.text_tertiary());
+        }
+        ctx.pop();
+        y += row;
+    }
+    ctx.pop();
 }

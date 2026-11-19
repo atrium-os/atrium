@@ -33,20 +33,40 @@ pub const CHIPS: [(u16, &str); 8] = [
     (BACK, "Snoozed back"),
 ];
 
-/// The search operators that ask for `bits` (§11.2, §11.7), so a set of
-/// quick filters can be kept as a saved search.
+/// Each chip's search operator (§11.2, §11.7).
+pub const OPS: [(u16, &str); 8] = [
+    (UNREAD, "is:unread"),
+    (FLAGGED, "is:flagged"),
+    (TO_ME, "is:to-me"),
+    (FROM_PEOPLE, "is:from-people"),
+    (VIPS, "is:vip"),
+    (ATTACHMENT, "has:attachment"),
+    (NEEDS_REPLY, "is:needs-reply"),
+    (BACK, "is:back"),
+];
+
+/// The search operators that ask for `bits`, so a set of quick filters
+/// can be kept as a saved search.
 pub fn query_of(bits: u16) -> String {
-    const OPS: [(u16, &str); 8] = [
-        (UNREAD, "is:unread"),
-        (FLAGGED, "is:flagged"),
-        (TO_ME, "is:to-me"),
-        (FROM_PEOPLE, "is:from-people"),
-        (VIPS, "is:vip"),
-        (ATTACHMENT, "has:attachment"),
-        (NEEDS_REPLY, "is:needs-reply"),
-        (BACK, "is:back"),
-    ];
     OPS.iter().filter(|(b, _)| bits & b != 0).map(|(_, o)| *o).collect::<Vec<_>>().join(" ")
+}
+
+/// The chips a search's words ask for.
+pub fn bits_of(query: &str) -> u16 {
+    query.split_whitespace().filter_map(|w| OPS.iter().find(|(_, o)| o.eq_ignore_ascii_case(w)).map(|(b, _)| *b)).fold(0, |a, b| a | b)
+}
+
+/// `query` with chip `bit`'s operator added, or taken out if it is there.
+pub fn toggle_in(query: &str, bit: u16) -> String {
+    let Some((_, op)) = OPS.iter().find(|(b, _)| *b == bit) else { return query.to_string() };
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.iter().any(|w| w.eq_ignore_ascii_case(op)) {
+        words.into_iter().filter(|w| !w.eq_ignore_ascii_case(op)).collect::<Vec<_>>().join(" ")
+    } else {
+        let mut w = words;
+        w.push(op);
+        w.join(" ")
+    }
 }
 
 /// Rows a filtered list looks through at most.
@@ -129,5 +149,15 @@ impl Quick<'_> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn chips_in_a_query() {
+        assert_eq!(super::toggle_in("from:lena", super::UNREAD), "from:lena is:unread");
+        assert_eq!(super::bits_of("from:lena is:unread HAS:attachment"), super::UNREAD | super::ATTACHMENT);
+        assert_eq!(super::toggle_in("from:lena is:unread", super::UNREAD), "from:lena");
     }
 }

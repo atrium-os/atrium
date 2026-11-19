@@ -127,6 +127,8 @@ pub struct ComposeUi {
     pub done: Option<Done>,
     /// Attach was pressed: the app opens the system picker.
     pub want_attach: bool,
+    /// The command palette (Ctrl-K, §15.5), while it is up.
+    pub palette: Option<crate::palette::Palette>,
     /// The picker is up, over the window.
     pub attaching: bool,
     /// The suggestion picked with the arrows, for what was typed (§14.2).
@@ -593,6 +595,52 @@ impl Composer {
         }
     }
 
+    /// What the palette offers in a compose window.
+    pub fn palette_entries(&self) -> Vec<crate::palette::Entry> {
+        use crate::palette::{Cmd, Entry};
+        let ui = self.ui.get_cloned();
+        let rich = self.is_rich();
+        let mut v = vec![
+            Entry { label: "Send".into(), key: "Ctrl-Enter", cmd: Cmd::Send },
+            Entry { label: "Send later…".into(), key: "", cmd: Cmd::SendLater },
+            Entry { label: "Attach a file…".into(), key: "", cmd: Cmd::Attach },
+            Entry { label: if rich { "Switch to plain text".into() } else { "Switch to rich text".into() }, key: "", cmd: Cmd::RichText(!rich) },
+        ];
+        if !ui.show_bcc {
+            v.push(Entry { label: "Show Bcc".into(), key: "", cmd: Cmd::ShowBcc });
+        }
+        v.push(Entry { label: "Save draft".into(), key: "", cmd: Cmd::SaveDraft });
+        v.push(Entry { label: "Discard draft".into(), key: "", cmd: Cmd::Discard });
+        v
+    }
+
+    pub fn palette_shown(&self) -> Vec<crate::palette::Entry> {
+        let q = self.ui.get_cloned().palette.map(|p| p.query).unwrap_or_default();
+        let mut v = crate::palette::filter(&self.palette_entries(), &q);
+        v.truncate(crate::palette::SHOWN_MAX);
+        v
+    }
+
+    /// Do shown entry `i` (Send needs the press's `activation`) and close
+    /// the palette.
+    pub fn palette_run(&self, i: usize, activation: Option<[u8; 16]>) {
+        use crate::palette::Cmd;
+        let Some(e) = self.palette_shown().into_iter().nth(i) else { return };
+        self.ui.update(|u| u.palette = None);
+        match e.cmd {
+            Cmd::Send => {
+                self.send(activation, None);
+            }
+            Cmd::SendLater => self.ui.update(|u| u.later = true),
+            Cmd::Attach => self.ask_attach(),
+            Cmd::RichText(on) => self.set_rich(on),
+            Cmd::ShowBcc => self.ui.update(|u| u.show_bcc = true),
+            Cmd::SaveDraft => self.save(true),
+            Cmd::Discard => self.discard(),
+            _ => {}
+        }
+    }
+
     /// Throw the draft away.
     pub fn discard(&self) {
         let ui = self.ui.get_cloned();
@@ -716,9 +764,27 @@ impl Composer {
     /// The window's own keys: Ctrl+Enter sends (with the key's
     /// activation), Escape closes the Send later choices. True when taken.
     pub fn key(&self, ev: &Event, activation: Option<[u8; 16]>) -> bool {
-        let Event::Key { kind, key, modifiers, .. } = ev else { return false };
+        let Event::Key { kind, key, modifiers, chars } = ev else { return false };
         if !kind.pressed() {
             return false;
+        }
+        // The palette takes every key while it is up.
+        let mut ui = self.ui.get_cloned();
+        if let Some(p) = &mut ui.palette {
+            let n = self.palette_shown().len();
+            match crate::palette::key(p, n, key, *modifiers, chars) {
+                crate::palette::Step::Run(i) => self.palette_run(i, activation),
+                crate::palette::Step::Closed => {
+                    ui.palette = None;
+                    self.ui.set(ui);
+                }
+                crate::palette::Step::Taken => self.ui.set(ui),
+            }
+            return true;
+        }
+        if modifiers.ctrl && !modifiers.alt && !modifiers.meta && *key == Key::Char && chars.eq_ignore_ascii_case("k") {
+            self.ui.update(|u| u.palette = Some(crate::palette::Palette::default()));
+            return true;
         }
         match key {
             Key::Enter if modifiers.ctrl || modifiers.meta => {
@@ -918,8 +984,16 @@ impl View for ComposeView {
         }
         fields.push(("Subject", &self.c.subject));
         let mut slots: Vec<(usize, pergola::node::NodeId, Rect)> = Vec::new();
+        // Work: a field naming someone outside the company has its label
+        // in the warning colour, with a dot (§9.1).
+        let outside: Vec<String> = self.c.outside().map(|(_, o)| o).unwrap_or_default();
         for (i, (label, state)) in fields.into_iter().enumerate() {
-            line(ctx, 16.0, y + row_h / 2.0, label, type_size::SM, Weight::Regular, t.text_secondary());
+            let out_here = label != "Subject" && !outside.is_empty() && parse_list(state.get_cloned().text()).iter().any(|m| outside.iter().any(|o| o.eq_ignore_ascii_case(&m.addr)));
+            if out_here {
+                line(ctx, 16.0, y + row_h / 2.0, &format!("{label} •"), type_size::SM, Weight::Medium, t.warning_fg());
+            } else {
+                line(ctx, 16.0, y + row_h / 2.0, label, type_size::SM, Weight::Regular, t.text_secondary());
+            }
             let fy = y + (row_h - pergola::theme::size::input_height()) / 2.0;
             let f = TextField::new(state.clone()).at(16.0 + label_w, fy).width(field_w).autofocus(i == 0 && state.get_cloned().text().is_empty());
             let slot = ctx.place(f);
@@ -1099,6 +1173,11 @@ impl View for ComposeView {
                 line(ctx, mx + em(12.0), r.y() + ih / 2.0, &ch.label, type_size::SM, Weight::Regular, t.text_primary());
                 ctx.pop();
             }
+        }
+        // The palette over everything (Ctrl-K).
+        if let Some(p) = &ui.palette {
+            let c = self.c.clone();
+            crate::view::draw_palette(ctx, p, &self.c.palette_shown(), w, em(56.0), Rc::new(move |i| c.palette_run(i, pergola::clipboard::current_activation())));
         }
     }
 }

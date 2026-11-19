@@ -48,7 +48,13 @@ pub enum What {
 /// The messages `what` covers, oldest first, each once.
 pub fn messages(store: &Store, what: &What) -> mail_store::Result<Vec<MsgId>> {
     let mut ids: Vec<MsgId> = match what {
-        What::Folder(f) => store.list(*f, 0, store.count(*f)?)?.into_iter().map(|r| r.msg).collect(),
+        // Mail the screener holds (out of its folder's list) goes too.
+        What::Folder(f) => {
+            let mut v: Vec<MsgId> = store.list(*f, 0, store.count(*f)?)?.into_iter().map(|r| r.msg).collect();
+            let account = store.folder(*f)?.account;
+            v.extend(store.held(account)?.into_iter().filter(|h| h.1 == *f).map(|h| h.0));
+            v
+        }
         What::Messages(v) => v.clone(),
         What::Everything => {
             let mut v = Vec::new();
@@ -56,6 +62,7 @@ pub fn messages(store: &Store, what: &What) -> mail_store::Result<Vec<MsgId>> {
                 for (f, _) in store.folders(a)? {
                     v.extend(store.list(f, 0, store.count(f)?)?.into_iter().map(|r| r.msg));
                 }
+                v.extend(store.held(a)?.into_iter().map(|h| h.0));
             }
             v
         }

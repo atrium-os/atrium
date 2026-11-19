@@ -42,6 +42,9 @@ fn folders_messages_and_everything() {
     // The same messages under Gmail's All Mail: once each in "everything".
     sink.messages("All Mail", vec![f(7, a.clone(), true, "A"), f(8, b.clone(), true, "B")]).unwrap();
     let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    // Lunch is held by the screener (out of the inbox's list): exported all the same.
+    assert!(engine.store.write(|w| w.hold(inbox, 2, mail_store::senders::why::SCREENER)).unwrap());
+    assert_eq!(engine.store.count(inbox).unwrap(), 1);
 
     // A folder: oldest first, read back as it was.
     let ids = export::messages(&engine.store, &What::Folder(inbox)).unwrap();
