@@ -29,6 +29,7 @@ const VIPS: &str = "vips";
 const REPORT_TO: &str = "phishing_report_to";
 /// The company's other mail domains (Work), newline-separated.
 const COMPANY: &str = "company_domains";
+const SCANNERS: &str = "company_scanners";
 /// Most company domains kept.
 pub const COMPANY_MAX: usize = 50;
 const ALL: u32 = 0;
@@ -68,11 +69,14 @@ pub struct Prefs {
     /// The company's other mail domains (§9.1): recipients there aren't
     /// outside the company, as the From address's domain isn't.
     pub company: Vec<String>,
+    /// The company's own link scanners (§7.6), by host: with scanning
+    /// kept, a link through one opens through it, as the known ones do.
+    pub scanners: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None, report_to: None, company: Vec::new() }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None, report_to: None, company: Vec::new(), scanners: Vec::new() }
     }
 }
 
@@ -127,6 +131,7 @@ impl Engine {
             },
             report_to: s.sync_state(ALL, REPORT_TO).ok().flatten(),
             company: s.sync_state(ALL, COMPANY).ok().flatten().map(|v| v.lines().map(str::to_string).collect()).unwrap_or_default(),
+            scanners: s.sync_state(ALL, SCANNERS).ok().flatten().map(|v| v.lines().map(str::to_string).collect()).unwrap_or_default(),
             vips: s.sync_state(ALL, VIPS).ok().flatten().map(|v| v.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
         }
     }
@@ -140,6 +145,9 @@ impl Engine {
         let mut company: Vec<String> = p.company.iter().filter_map(|d| company_domain(d)).collect();
         company.dedup();
         company.truncate(COMPANY_MAX);
+        let mut scanners: Vec<String> = p.scanners.iter().filter_map(|d| company_domain(d)).collect();
+        scanners.dedup();
+        scanners.truncate(COMPANY_MAX);
         let quiet = p.quiet.filter(|(f, t)| *f < 1440 && *t < 1440).map(|(f, t)| f as u64 * 10_000 + t as u64 + 1);
         self.store.write(|w| {
             w.set_setting(ALL, NOTIFY_OFF, (!p.notify).then_some(1))?;
@@ -156,6 +164,7 @@ impl Engine {
             w.set_sync_state(ALL, DIGEST, digest.as_deref())?;
             w.set_sync_state(ALL, REPORT_TO, report_to.as_deref())?;
             w.set_sync_state(ALL, COMPANY, (!company.is_empty()).then(|| company.join("\n")).as_deref())?;
+            w.set_sync_state(ALL, SCANNERS, (!scanners.is_empty()).then(|| scanners.join("\n")).as_deref())?;
             w.set_sync_state(ALL, VIPS, (!vips.is_empty()).then(|| vips.join("\n")).as_deref())
         })?;
         Ok(())
@@ -237,5 +246,7 @@ mod tests {
         assert_eq!(company_domains(""), Some(vec![]));
         e.set_prefs(&Prefs { company: vec!["Acme.example".into(), "bad domain".into()], ..e.prefs() }).unwrap();
         assert_eq!(e.prefs().company, ["acme.example"]);
+        e.set_prefs(&Prefs { scanners: vec!["Scan.Acme.example".into(), "no".into()], ..e.prefs() }).unwrap();
+        assert_eq!(e.prefs().scanners, ["scan.acme.example"]);
     }
 }

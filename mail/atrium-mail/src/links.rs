@@ -45,9 +45,29 @@ pub fn scanned_by(link: &str) -> Option<&'static str> {
     unwrap_once(&u).map(|(_, who)| who).filter(|w| SCANNERS.contains(w))
 }
 
+/// What a link through one of the company's own scanners is said to go
+/// through.
+pub const OWN_SCANNER: &str = "the company's scanner";
+
+/// The company's own scanner (one of `own`, by host or a host under it)
+/// that `link` goes through, if any.
+pub fn own_scanner(link: &str, own: &[String]) -> bool {
+    let Some(h) = web(link).and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase())) else { return false };
+    own.iter().any(|o| h == *o || h.ends_with(&format!(".{o}")))
+}
+
 /// [`bar`], with company scanning kept when `keep` (a named persona's
 /// default): a scanned link opens as it came, through the scanner.
-pub fn bar_kept(link: &str, text: Option<&str>, keep: bool) -> Result<Bar, String> {
+/// `own` are the company's own scanners' hosts: the bar shows the link
+/// they carry (in `url`, `u`, `target`, `dest` or `q`) when there is one.
+pub fn bar_kept(link: &str, text: Option<&str>, keep: bool, own: &[String]) -> Result<Bar, String> {
+    if keep && own_scanner(link, own) {
+        let carried = web(link).and_then(|u| param(&u, &["url", "u", "target", "dest", "destination", "q"])).and_then(|t| web(&t)).map(String::from);
+        let mut b = bar(carried.as_deref().unwrap_or(link), text)?;
+        b.open = atrium_links::check(link.trim())?.url;
+        b.scanned = Some(OWN_SCANNER);
+        return Ok(b);
+    }
     let mut b = bar(link, text)?;
     if keep {
         if let Some(s) = scanned_by(link) {
@@ -285,19 +305,29 @@ mod tests {
     fn company_scanning_kept() {
         let safe = "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fdash.acme.example%2Fq4&data=05";
         assert_eq!(scanned_by(safe), Some("Microsoft Safe Links"));
-        let b = bar_kept(safe, None, true).unwrap();
+        let b = bar_kept(safe, None, true, &[]).unwrap();
         assert_eq!((b.open.as_str(), b.domain.as_str(), b.scanned), (safe, "acme.example", Some("Microsoft Safe Links")));
-        let b = bar_kept(safe, None, false).unwrap();
+        let b = bar_kept(safe, None, false, &[]).unwrap();
         assert_eq!((b.open.as_str(), b.scanned), ("https://dash.acme.example/q4", None));
         // Not a company scanner: peeled either way.
         let g = "https://www.google.com/url?q=https%3A%2F%2Facme.example%2F";
         assert_eq!(scanned_by(g), None);
-        assert_eq!(bar_kept(g, None, true).unwrap().open, "https://acme.example/");
+        assert_eq!(bar_kept(g, None, true, &[]).unwrap().open, "https://acme.example/");
         let pp = "https://urldefense.proofpoint.com/v2/url?u=https-3A__acme.example_a&d=x";
         assert_eq!(scanned_by(pp), Some("Proofpoint URL Defense"));
-        assert_eq!(bar_kept(pp, None, true).unwrap().open, pp);
+        assert_eq!(bar_kept(pp, None, true, &[]).unwrap().open, pp);
         let mc = "https://protect-eu.mimecast.com/s/abc?domain=acme.example";
-        assert_eq!(bar_kept(mc, None, true).unwrap().scanned, Some("Mimecast"));
+        assert_eq!(bar_kept(mc, None, true, &[]).unwrap().scanned, Some("Mimecast"));
+        // The company's own scanner: kept, named, and what it carries shown.
+        let own = vec!["scan.acme.example".to_string()];
+        let l = "https://eu.scan.acme.example/r?url=https%3A%2F%2Fdash.acme.example%2Fq4&sig=1";
+        let b = bar_kept(l, None, true, &own).unwrap();
+        assert_eq!((b.open.as_str(), b.domain.as_str(), b.scanned), (l, "acme.example", Some(OWN_SCANNER)));
+        assert_eq!(b.rest, "/q4");
+        let opaque = "https://scan.acme.example/x/abc123";
+        assert_eq!(bar_kept(opaque, None, true, &own).unwrap().scanned, Some(OWN_SCANNER));
+        assert_eq!(bar_kept(l, None, false, &own).unwrap().scanned, None);
+        assert!(!own_scanner("https://notscan.acme.example/", &own));
     }
 
     #[test]

@@ -1381,6 +1381,11 @@ fn the_command_palette() {
     typed("arch");
     assert!(mail.key(&press(Key::Enter), None));
     assert_eq!(subjects(&mail), ["Two"]);
+    // Nor the undo's key, nor search's: Ctrl-K alone.
+    app.tick();
+    let t = texts(&app);
+    assert!(t.iter().any(|x| x == "Undo") && !t.iter().any(|x| x == "z"), "{t:?}");
+    assert!(t.iter().any(|x| x == "Ctrl-K") && !t.iter().any(|x| x.starts_with("/ ")), "{t:?}");
 
     // Export (§6.5): this folder, as mbox through the picker's Save.
     use mail_engine::export::What;
@@ -1548,4 +1553,7 @@ fn files_across_mail() {
     assert_eq!(s.hits.iter().map(|h| h.preview.as_str()).collect::<Vec<_>>(), ["plan.pdf · 20 bytes", "beach.pdf · 20 bytes"]);
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "beach.pdf · 20 bytes"));
+    // Counted in its header.
+    assert_eq!(mail.ui.get_cloned().files_total, (2, 40));
+    assert!(texts(&app).iter().any(|x| x == "2 files, 40 bytes"), "{:?}", texts(&app));
 }

@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host; company domains, import progress and given-up uploads, and the changed filters shown built on the host; ManageSieve passed against Pigeonhole on the host and on the FreeBSD VM.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host; company domains, import progress and given-up uploads, and the changed filters shown built on the host; ManageSieve passed against Pigeonhole on the host and on the FreeBSD VM; key hints hidden with single keys off, the company's own link scanner and the Files view's counts built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1656,8 +1656,7 @@ Stalwart in the cloud VM, and later a real account):
    and the Later sheet keeps its own keys. Kept in the instance's settings like the rest.
    Tests: engine 1 (kept), settings 1 (twelve private addresses and every section drawn
    with nothing cut off, the switch), window 1 (e ignored when off, Down and the palette
-   still archive). **Not yet**: keys shown on buttons are still drawn when single keys
-   are off.
+   still archive). Keys on buttons with single keys off: see below.
 
    **Recipients outside the company, in Work (2026-11-19, §9.1).** Mail asks portcullisd
    which persona it runs in at start (`Request::Persona`, by its uid from the launch
@@ -1684,7 +1683,7 @@ Stalwart in the cloud VM, and later a real account):
    Mail learns its persona from portcullisd as in §9.1. Tests: links 1 (scanner named,
    original kept), prefs 1 (default by persona), window 1 (Work keeps the Safe Links
    link and names it, turning it off peels it). **Not yet**: a VM run in a Work
-   instance, and a company's own scanner list from the persona.
+   instance (a company's own scanner: see below, typed in Settings).
 
    **Export as mbox (2026-11-19, §6.5).** The command palette has "Export Inbox as mbox"
    (the folder shown), "Export these results as mbox" (a search, view or saved search)
@@ -1893,7 +1892,7 @@ Stalwart in the cloud VM, and later a real account):
    for a non-address, undone), prefs (the address kept, bad ones refused), files 1,
    window 2 (rail icons; the report sent and undone; the conversation's files, Files from,
    the Files view), settings (the field, asked in Work). **Not yet**: a grid of
-   thumbnails for the Files view (rows for now), and the Files view's counts.
+   thumbnails for the Files view (rows for now). Its counts: see below.
 
    **Search operators on the server, and rules on JMAP servers (2026-11-19, §11.2,
    §11.6).** *Search server* now sends the search's operators too, not only its words:
@@ -1961,6 +1960,21 @@ Stalwart in the cloud VM, and later a real account):
    parse jail and sync worker, and runs them on the dev VM against FreeBSD's
    dovecot 2.3.21.1 and dovecot-pigeonhole 0.5.21.1. All 8 passed on the Mac VM on
    2026-11-19, none skipped.
+
+   **Key hints, the company's own link scanner, and the Files view's counts
+   (2026-11-19, §§15.5, 7.6, 8.1).** With single-key shortcuts off, no single key is
+   drawn anywhere they no longer work: the search box says only "Ctrl-K", the undo bar's
+   *Undo* has no "z", and the Later bar's *Done*, *Later*, *Drop* and *Restore* have no
+   keys (the Later sheet keeps its keys, since they still work there). Work's LINKS
+   section has "Your company's own scanner": hosts, comma separated, each covering the
+   hosts under it. With scanning kept, a link through one opens as it came. The bar
+   shows the link it carries (in `url`, `u`, `target`, `dest`, `destination` or `q`)
+   when it has one, else the scanner's own link, and says "Opens through your company's
+   link scanner". The Files view's header counts what it lists: "12 files, 24 MB"
+   (with a "+" past the newest 500 messages). Tests: links 1 (own scanner kept, named, carried link shown, opaque
+   link, a look-alike host isn't one, off peels nothing), prefs (hosts kept, bad ones
+   dropped), settings (the field), window (no "z" and Ctrl-K alone with single keys off;
+   the Files header).
 
 ## 17. Decisions, with recommendations
 

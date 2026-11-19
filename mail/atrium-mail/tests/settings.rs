@@ -269,6 +269,9 @@ fn settings_window() {
     s.company.set(TextEdit::new("acme-corp.example, @acme.example"));
     s.tick();
     assert_eq!(engine.prefs().company, ["acme-corp.example", "acme.example"]);
+    s.scanners.set(TextEdit::new("scan.acme.example"));
+    s.tick();
+    assert_eq!(engine.prefs().scanners, ["scan.acme.example"]);
     s.report_to.set(TextEdit::new(""));
     s.tick();
     assert_eq!(engine.prefs().report_to, None);

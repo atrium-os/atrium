@@ -375,6 +375,8 @@ pub struct Ui {
     pub saved: Vec<SavedPlace>,
     /// The views shown under the folders, with a count where it matters.
     pub views: Vec<(Lane, usize)>,
+    /// The Files view's files and their total size (§8.1).
+    pub files_total: (usize, u64),
     /// Later items past their time (the sidebar marks them).
     pub overdue: usize,
     /// The Later sheet (`l`): what it is for, then when.
@@ -932,6 +934,7 @@ impl Mail {
         }
         ui.overdue = self.engine.later_items().unwrap_or_default().iter().filter(|(_, l)| !l.back && l.due <= now).count();
         ui.views = self.views(&accounts.iter().map(|a| a.0).collect::<Vec<_>>());
+        let mut files_total = None;
         if let Some(s) = &mut ui.search {
             // What sync brought in may match too; the row read stays put.
             if !s.typing {
@@ -940,12 +943,18 @@ impl Mail {
                     Some(v) => self.lane_hits(v),
                     None => self.engine.search(&mail_engine::search::parse(&s.query, false)).unwrap_or_default(),
                 };
+                if s.view == Some(Lane::Files) {
+                    files_total = Some(self.files_total(&s.hits));
+                }
                 ui.cursor = shown.and_then(|m| s.hits.iter().position(|h| h.msg == m));
                 if ui.cursor.is_none() {
                     ui.reading = None;
                 }
             }
             ui.count = s.hits.len();
+        }
+        if let Some(t) = files_total {
+            ui.files_total = t;
         }
         if ui.cursor.is_some_and(|c| c >= ui.count) {
             ui.cursor = None;
@@ -1603,6 +1612,11 @@ impl Mail {
             Some(v) => Ok(self.lane_hits(v)),
             None => self.engine.search(&q),
         };
+        let total = (s.view == Some(Lane::Files)).then(|| got.as_ref().ok().map(|h| self.files_total(h))).flatten();
+        if let Some(t) = total {
+            ui.files_total = t;
+        }
+        let Some(s) = &mut ui.search else { return };
         s.hits = match got {
             Ok(h) => h,
             Err(e) => {
@@ -1654,6 +1668,14 @@ impl Mail {
             out.push((Lane::ScreenedOut, refused));
         }
         out
+    }
+
+    /// The files in `hits` and their total size.
+    fn files_total(&self, hits: &[mail_engine::search::Hit]) -> (usize, u64) {
+        hits.iter().filter_map(|h| self.engine.store.message(h.msg).ok()).fold((0, 0), |(n, z), m| {
+            let f = mail_engine::files::files_of(&m.summary);
+            (n + f.len(), z + f.iter().map(|x| x.1).sum::<u64>())
+        })
     }
 
     /// A view's rows, every account, newest first.
@@ -2525,7 +2547,7 @@ impl Mail {
     pub fn link(&self, url: &str) {
         let text = self.framed().and_then(|(_, d, _)| d.0.links.iter().find(|(h, _)| h == url).map(|(_, t)| t.clone()));
         let keep = self.engine.prefs().keeps_scanning(self.persona.borrow().is_some());
-        let bar = crate::links::bar_kept(url, text.as_deref(), keep);
+        let bar = crate::links::bar_kept(url, text.as_deref(), keep, &self.engine.prefs().scanners);
         let mut ui = self.ui.get_cloned();
         ui.link = Some(LinkBar { bar, note: None });
         self.ui.set(ui);
@@ -3528,7 +3550,7 @@ impl MailView {
             text(ctx, tx, cy, "Search", type_size::SM, Weight::Regular, t.text_tertiary());
             if !typing {
                 // Its key, and the palette's for everything else (§15.5).
-                let hint = "/   Ctrl-K";
+                let hint = if self.mail.engine.prefs().single_keys { "/   Ctrl-K" } else { "Ctrl-K" };
                 let kw = width(hint, type_size::XS, Weight::Regular);
                 text(ctx, r.x() + r.w() - em(10.0) - kw, cy, hint, type_size::XS, Weight::Regular, t.text_tertiary());
             }
@@ -3631,6 +3653,13 @@ impl MailView {
             0.0
         };
         let title = match &ui.search {
+            // The Files view counts them: "12 files, 24 MB" (of the newest
+            // RESULTS_MAX messages, said with a "+").
+            Some(Search { view: Some(Lane::Files), hits, .. }) if !hits.is_empty() => {
+                let (n, z) = ui.files_total;
+                let more = if hits.len() >= mail_engine::search::RESULTS_MAX { "+" } else { "" };
+                format!("{n}{more} file{}, {}", if n == 1 { "" } else { "s" }, mail_engine::files::size_words(z))
+            }
             Some(Search { view: Some(v), .. }) => v.label().to_string(),
             Some(s) => match s.saved.and_then(|id| ui.saved.iter().find(|p| p.id == id)) {
                 Some(p) => p.name.clone(),
@@ -3797,7 +3826,9 @@ impl MailView {
         // "Message archived · Undo z" at the list's foot while it can be undone.
         if let Some(u) = ui.undo.as_ref().filter(|u| u.until >= now) {
             let undo = "Undo";
-            let uw = width(undo, type_size::XS, Weight::Semibold) + width("z", type_size::XS, Weight::Regular) + em(24.0);
+            // Its key, unless single keys are off.
+            let z = if self.mail.engine.prefs().single_keys { "z" } else { "" };
+            let uw = width(undo, type_size::XS, Weight::Semibold) + width(z, type_size::XS, Weight::Regular) + em(24.0);
             let lw = width(&u.label, type_size::SM, Weight::Regular);
             let bw = (lw + uw + em(36.0)).min(w - 24.0);
             let (bx, by, bh) = (x0 + (w - bw) / 2.0, h - em(56.0), em(40.0));
@@ -3809,7 +3840,7 @@ impl MailView {
                 m.undo();
             });
             text(ctx, ux + em(8.0), by + bh / 2.0, undo, type_size::XS, Weight::Semibold, t.bg_canvas());
-            text(ctx, ux + uw - em(8.0) - width("z", type_size::XS, Weight::Regular), by + bh / 2.0, "z", type_size::XS, Weight::Regular, t.bg_canvas());
+            text(ctx, ux + uw - em(8.0) - width(z, type_size::XS, Weight::Regular), by + bh / 2.0, z, type_size::XS, Weight::Regular, t.bg_canvas());
             ctx.pop();
         } else if let Some((note, _)) = ui.file_note.as_ref().filter(|(_, until)| *until >= now) {
             // What became of Open or Save.
@@ -4164,6 +4195,7 @@ impl MailView {
                 let second = match (&l.note, &b.says, b.via) {
                     (Some(n), _, _) => Some((n.clone(), t.text_secondary())),
                     (None, Some(says), _) => Some((format!("The link's text says {says}, but it goes to {}", b.domain), t.warning_fg())),
+                    (None, None, _) if b.scanned == Some(crate::links::OWN_SCANNER) => Some(("Opens through your company's link scanner".into(), t.text_secondary())),
                     (None, None, _) if b.scanned.is_some() => Some((format!("Opens through {}, your company's link scanning", b.scanned.unwrap_or_default()), t.text_secondary())),
                     (None, None, Some("Mimecast")) => Some(("Through Mimecast, which keeps the destination on its servers".into(), t.text_secondary())),
                     (None, None, Some(v)) => Some((format!("Unwrapped from {v}"), t.text_secondary())),
@@ -4265,12 +4297,15 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
         }
         Item::Later => {
             let now = (mail.now)();
+            // Keys on the buttons only when single keys are on.
+            let singles = mail.engine.prefs().single_keys;
+            let key = |k: &'static str| if singles { k } else { "" };
             if let (None, Some((_, l, at))) = (&s.later, &s.dropped) {
                 let mut label = format!("Dropped {} · was {}", crate::date_text(*at, now), mail_engine::later::kind_label(l.kind));
                 if !l.note.is_empty() {
                     label += &format!(": {}", l.note);
                 }
-                let (b, k) = ("Restore", "u");
+                let (b, k) = ("Restore", key("u"));
                 let bw = width(b, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(26.0);
                 let label = fit(&label, type_size::XS, Weight::Medium, (tw - bw - em(12.0)).max(em(60.0)));
                 text(ctx, x, cy, &label, type_size::XS, Weight::Medium, t.text_secondary());
@@ -4302,14 +4337,14 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             let buttons: Vec<(&str, &str, Box<dyn Fn()>)> = if l.pushed >= mail_engine::later::PUSHED_ASK && !l.back {
                 vec![
                     ("Do it now", "", { let m = mail.clone(); Box::new(move || { m.later_now(); }) }),
-                    ("Drop", "x", { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
+                    ("Drop", key("x"), { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
                     ("Someday", "", { let m = mail.clone(); Box::new(move || { m.later_someday(); }) }),
                 ]
             } else {
                 vec![
-                    ("Done", "d", { let m = mail.clone(); Box::new(move || { m.later_done(); }) }),
-                    ("Later", "l", { let m = mail.clone(); Box::new(move || m.ask_later()) }),
-                    ("Drop", "x", { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
+                    ("Done", key("d"), { let m = mail.clone(); Box::new(move || { m.later_done(); }) }),
+                    ("Later", key("l"), { let m = mail.clone(); Box::new(move || m.ask_later()) }),
+                    ("Drop", key("x"), { let m = mail.clone(); Box::new(move || { m.later_drop(); }) }),
                 ]
             };
             let bw: f32 = buttons.iter().map(|(l, k, _)| width(l, type_size::XS, Weight::Medium) + width(k, type_size::XS, Weight::Regular) + em(32.0)).sum();
