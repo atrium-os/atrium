@@ -197,13 +197,13 @@ fn validate_tree(
     doc: &Doc,
     node: &Object,
     depth: usize,
-    inherited_media: bool,
+    mut boxes: [Option<Rect>; 2],
     seen: &mut std::collections::HashSet<folium_syntax::Ref>,
 ) -> Result<usize> {
     require(depth <= 32 && seen.len() < 256 && seen.insert(node.as_ref().ok_or(UNSUPPORTED)?))?;
     let obj = doc.syntax.resolve(node)?;
     let d = obj.as_dict().ok_or(UNSUPPORTED)?;
-    for key in ["MediaBox", "CropBox"] {
+    for (slot, key) in boxes.iter_mut().zip(["MediaBox", "CropBox"]) {
         if let Some(value) = d.get(key) {
             let value = doc.syntax.resolve(value)?;
             let coords = value.as_array().ok_or(UNSUPPORTED)?;
@@ -213,9 +213,9 @@ fn validate_tree(
                         .iter()
                         .all(|v| v.as_f64().is_some_and(|n| n.abs() < 32768.0)),
             )?;
-            require(
-                coords[0].as_f64() < coords[2].as_f64() && coords[1].as_f64() < coords[3].as_f64(),
-            )?;
+            let at = |i: usize| coords[i].as_f64().unwrap();
+            require(at(0) < at(2) && at(1) < at(3))?;
+            *slot = Some(Rect::new(at(0), at(1), at(2), at(3)));
         }
     }
     if let Some(angle) = d.get("Rotate") {
@@ -232,16 +232,21 @@ fn validate_tree(
     if let Some(unit) = d.get("UserUnit") {
         require(unit.as_f64().is_some_and(|n| n > 0.0 && n <= 75000.0))?;
     }
-    let media = inherited_media || d.get("MediaBox").is_some();
     if d.type_is("Page") {
-        require(media && d.get("Kids").is_none())?;
+        let media = boxes[0].ok_or(UNSUPPORTED)?;
+        let crop = boxes[1].unwrap_or(media);
+        require(
+            media.x0.max(crop.x0) < media.x1.min(crop.x1)
+                && media.y0.max(crop.y0) < media.y1.min(crop.y1)
+                && d.get("Kids").is_none(),
+        )?;
         return Ok(1);
     }
     require(d.type_is("Pages"))?;
     let kids = doc.syntax.get_in(d, "Kids")?;
     let mut total = 0;
     for kid in kids.as_array().ok_or(UNSUPPORTED)? {
-        total += validate_tree(doc, kid, depth + 1, media, seen)?;
+        total += validate_tree(doc, kid, depth + 1, boxes, seen)?;
     }
     require(d.int("Count") == Some(total as i64))?;
     Ok(total)
@@ -259,7 +264,7 @@ pub fn export(source: Box<dyn Source>) -> Result<Vec<u8>> {
             &doc,
             catalog.get("Pages").ok_or(UNSUPPORTED)?,
             0,
-            false,
+            [None, None],
             &mut Default::default(),
         )? == doc.page_count(),
     )?;
@@ -324,6 +329,7 @@ pub fn export(source: Box<dyn Source>) -> Result<Vec<u8>> {
         let shared = Shared::new();
         let mut interpreter =
             Interp::new(&doc.syntax, &shared, Matrix::IDENTITY, Some(crop), &expired);
+        interpreter.keep_fills_separate();
         interpreter.run(&data, &p.resources)?;
         let list = interpreter.finish();
         require(list.skipped.is_empty() && !expired())?;
@@ -454,7 +460,7 @@ mod tests {
     #[test]
     fn paints_every_page_and_drops_the_source_catalog() {
         let bytes = export(Box::new(Bytes(
-            fixture(&[b"1 0 0 rg 0 0 10 20 re f", b""]).into(),
+            fixture(&[b"1 0 0 rg 0 0 10 20 re f 10 0 -10 20 re f", b""]).into(),
         )))
         .unwrap();
         // Re-importing the image-only file exercises strict Flate RGB input.

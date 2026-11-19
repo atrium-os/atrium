@@ -207,6 +207,7 @@ pub struct Interp<'a> {
     cancel: &'a dyn Fn() -> bool,
     out: DisplayList,
     clip_ids: HashMap<(u32, [u64; 4]), u32>,
+    merge_fills: bool,
     gs: State,
     stack: Vec<State>,
     path: Path,
@@ -228,6 +229,7 @@ impl<'a> Interp<'a> {
             cancel,
             out: DisplayList::default(),
             clip_ids: HashMap::new(),
+            merge_fills: true,
             gs: State {
                 ctm,
                 clip: 0,
@@ -254,6 +256,10 @@ impl<'a> Interp<'a> {
         }
         it
     }
+
+    /// Oppositely wound paths from separate fill operations must not cancel
+    /// each other in a visual copy, even when their colours are identical.
+    pub fn keep_fills_separate(&mut self) { self.merge_fills = false; }
 
     pub fn finish(self) -> DisplayList { self.out }
 
@@ -603,7 +609,7 @@ impl<'a> Interp<'a> {
         }
         let clip = self.gs.clip;
         if let Some(Item::Fill { path, even_odd: e, color: c, clip: k, bounds: b }) = self.out.items.last_mut() {
-            if *e == even_odd && *c == color && *k == clip && color.a >= 1.0 && path.els.len() < 1 << 16 && !even_odd {
+            if self.merge_fills && *e == even_odd && *c == color && *k == clip && color.a >= 1.0 && path.els.len() < 1 << 16 && !even_odd {
                 path.extend(&p);
                 *b = b.union(&bounds);
                 return;
