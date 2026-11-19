@@ -505,6 +505,12 @@ stays frescod's, drawn outside any app.
   the ranges, used once a band source exists), `DocumentView`, and a live run of a Pergola app on frescod.
 
 
+### §10.6 Grid cell overflow
+
+In `GridView`, ordinary cell text overflows only from visible columns. The 32-column
+search counts visible neighbours and skips zero-width columns in both directions,
+including when finding text that reaches the viewport from outside it.
+
 ## §11. Vector drawing: `Canvas` (asked by the user, 2026-11-06)
 
 For apps that draw their own 2D content (vector drawing, flowcharts, diagrams). Built

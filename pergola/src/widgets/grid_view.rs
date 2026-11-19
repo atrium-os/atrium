@@ -1679,21 +1679,27 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
                 let (_, yb) = at(left, src.row_top(row + 1));
                 ctx.add(Node::Rect { rect: Rect::new(tx, yb - 1.0, tw, 1.0), fill: line, radius: 0.0 });
             }
+            let mut columns = Vec::with_capacity((c1 - c0 + 1) as usize);
+            let mut xl = left;
             for col in c0..=c1 {
-                let (xr, _) = at(src.col_left(col + 1), top);
-                ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
+                let xr = src.col_left(col + 1);
+                if xr > xl {
+                    columns.push((col, xl, xr));
+                    let (x, _) = at(xr, top);
+                    ctx.add(Node::Rect { rect: Rect::new(x - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
+                }
+                xl = xr;
             }
             for row in r0..=r1 {
                 let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
                 if yb <= yt {
                     continue;
                 }
-                for col in c0..=c1 {
+                for &(col, xl, xr) in &columns {
                     if src.merge_at(row, col).is_some() {
                         continue;
                     }
                     let Some(mut cv) = src.cell(row, col) else { continue };
-                    let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
                     let (cx, cy) = at(xl, yt);
                     // Text running over empty neighbours is drawn by the layer below.
                     if let Some(span) = spill(src, row, col, &cv) {
@@ -1731,7 +1737,7 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
     ctx.pop();
 }
 
-/// Columns text may run over beside its cell, at most.
+/// Visible neighbours ordinary text may run over, at most.
 pub const SPILL_COLS: u32 = 32;
 
 /// The width cell view `cv` needs to show whole, px: its widest line, its
@@ -1776,6 +1782,29 @@ fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
     TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) }
 }
 
+/// The visible column at `col`, or the first one beyond its hidden run.
+fn visible_col(src: &dyn GridSource, col: u32, cols: u32, right: bool) -> Option<u32> {
+    if col >= cols { return None; }
+    let x = src.col_left(col);
+    if src.col_left(col + 1) > x { return Some(col); }
+    if right {
+        let next = src.col_at(x);
+        return (next > col && src.col_left(next + 1) > x).then_some(next);
+    }
+    // Find the left edge of the zero-width run. Looking up x - epsilon
+    // can pick the wrong column when column widths are fractional.
+    let (mut low, mut high) = (0, col);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if src.col_left(mid) < x { low = mid + 1; } else { high = mid; }
+    }
+    low.checked_sub(1)
+}
+
+fn next_visible_col(src: &dyn GridSource, col: u32, cols: u32, right: bool) -> Option<u32> {
+    visible_col(src, if right { col + 1 } else { col.checked_sub(1)? }, cols, right)
+}
+
 /// Whether cell (`r`, `c`) shows nothing: text may run over it.
 fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
     src.merge_at(r, c).is_none() && src.cell(r, c).is_none_or(|v| v.text.is_empty())
@@ -1789,7 +1818,8 @@ fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u3
     if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap {
         return None;
     }
-    let last = src.cols().saturating_sub(1);
+    let cols = src.cols();
+    let last = cols.saturating_sub(1);
     if cv.align == CellAlign::Across {
         // The run: following cells that show nothing and centre across too.
         let mut b = c;
@@ -1815,22 +1845,24 @@ fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u3
         return None;
     }
     let need = (w - room) as f64;
-    let (mut a, mut b) = (c, c);
     let (want_l, want_r) = match cv.align {
         CellAlign::Left => (0.0, need),
         CellAlign::Right => (need, 0.0),
         CellAlign::Center | CellAlign::Across => (need / 2.0, need / 2.0),
     };
-    let mut got = 0.0;
-    while got < want_r && b < last && b - c < SPILL_COLS && blank(src, r, b + 1) {
-        b += 1;
-        got += src.col_left(b + 1) - src.col_left(b);
-    }
-    got = 0.0;
-    while got < want_l && a > 0 && c - a < SPILL_COLS && blank(src, r, a - 1) {
-        a -= 1;
-        got += src.col_left(a + 1) - src.col_left(a);
-    }
+    let extend = |want, right| {
+        let mut end = c;
+        let mut got = 0.0;
+        for _ in 0..SPILL_COLS {
+            if got >= want { break; }
+            let Some(next) = next_visible_col(src, end, cols, right) else { break; };
+            if !blank(src, r, next) { break; }
+            got += src.col_left(next + 1) - src.col_left(next);
+            end = next;
+        }
+        end
+    };
+    let (a, b) = (extend(want_l, false), extend(want_r, true));
     ((a, b) != (c, c)).then_some((a, b))
 }
 
@@ -1838,31 +1870,29 @@ fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u3
 /// cells up to [`SPILL_COLS`] beside them whose text reaches in): the grid
 /// lines it crosses hidden, then the text across its columns.
 fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), mut spills: Vec<(u32, u32, (u32, u32), CellView)>, at: &dyn Fn(f64, f64) -> (f32, f32)) {
-    let last = src.cols().saturating_sub(1);
-    // Cells beside the columns whose text reaches in: only through a blank
-    // edge cell, so a full row costs nothing more.
+    let cols = src.cols();
+    // Offscreen text can reach in only through a blank visible edge.
+    let (Some(left), Some(right)) = (visible_col(src, cr.0, cols, true), visible_col(src, cr.1, cols, false)) else { return; };
+    if left > right { return; }
     for row in rr.0..=rr.1 {
         if src.row_top(row + 1) <= src.row_top(row) {
             continue;
         }
-        let left = cr.0 > 0 && blank(src, row, cr.0);
-        let right = cr.1 < last && blank(src, row, cr.1);
-        let mut side = |cols: &mut dyn Iterator<Item = u32>| {
-            for col in cols {
-                if src.merge_at(row, col).is_some() {
-                    continue;
-                }
-                let Some(cv) = src.cell(row, col) else { continue };
-                if let Some(span) = spill(src, row, col, &cv).filter(|&(a, b)| b >= cr.0 && a <= cr.1) {
+        for (edge, outward) in [(left, false), (right, true)] {
+            if (outward && edge + 1 == cols) || (!outward && edge == 0) || !blank(src, row, edge) {
+                continue;
+            }
+            let mut col = edge;
+            for _ in 0..SPILL_COLS {
+                let Some(next) = next_visible_col(src, col, cols, outward) else { break; };
+                col = next;
+                if src.merge_at(row, col).is_some() { break; }
+                let Some(cv) = src.cell(row, col).filter(|cv| !cv.text.is_empty()) else { continue; };
+                if let Some(span) = spill(src, row, col, &cv).filter(|&(a, b)| b >= left && a <= right) {
                     spills.push((row, col, span, cv));
                 }
+                break;
             }
-        };
-        if left {
-            side(&mut (cr.0.saturating_sub(SPILL_COLS)..cr.0));
-        }
-        if right {
-            side(&mut (cr.1 + 1..=(cr.1 + SPILL_COLS).min(last)));
         }
     }
     if spills.is_empty() {
@@ -1883,12 +1913,14 @@ fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, 
             let (x0, y0) = at(src.col_left(a), yt);
             let (x1, y1) = at(src.col_left(b + 1), yb);
             // The grid lines inside the run, where no fill hides them.
-            for k in a..b {
-                let filled = |c: u32| c != col && src.cell(row, c).is_some_and(|v| v.fill.is_some());
-                if !filled(k) && !filled(k + 1) {
-                    let (xr, _) = at(src.col_left(k + 1), yt);
-                    ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, y0, 1.0, y1 - y0 - 1.0), fill: cv.fill.filter(|_| k == col || k + 1 == col).unwrap_or(t.bg_canvas()), radius: 0.0 });
+            let filled = |c: u32| c != col && src.cell(row, c).is_some_and(|v| v.fill.is_some());
+            let mut k = a;
+            while let Some(next) = next_visible_col(src, k, cols, true).filter(|&next| next <= b) {
+                if !filled(k) && !filled(next) {
+                    let (xr, _) = at(src.col_left(next), yt);
+                    ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, y0, 1.0, y1 - y0 - 1.0), fill: cv.fill.filter(|_| k == col || next == col).unwrap_or(t.bg_canvas()), radius: 0.0 });
                 }
+                k = next;
             }
             let style = cell_style(&cv, t);
             let lead = cv.indent as f32 * INDENT_STEP + if cv.icon.is_some() { 17.0 } else { 0.0 };
@@ -2436,6 +2468,9 @@ mod tests {
                 if let Some(t) = s.strip_prefix('»') {
                     return Some(CellView { align: CellAlign::Across, ..CellView::text(t.to_string()) });
                 }
+                if let Some(t) = s.strip_prefix('«') {
+                    return Some(CellView { align: CellAlign::Right, ..CellView::text(t.to_string()) });
+                }
                 // "¶…": wraps its text.
                 if let Some(t) = s.strip_prefix('¶') {
                     return Some(CellView { wrap: true, ..CellView::text(t.to_string()) });
@@ -2699,6 +2734,50 @@ mod tests {
         assert!(shown.iter().any(|(t, w)| t == long && *w > 64.0), "{shown:?}");
         assert!(shown.iter().any(|(t, w)| t.ends_with('…') && t.starts_with("A ") && *w <= 64.0), "{shown:?}");
         assert_eq!(shown.iter().filter(|(t, _)| t == long).count(), 1, "{shown:?}");
+    }
+
+    #[test]
+    fn text_runs_across_hidden_columns_from_visible_cells_only() {
+        let (mut app, grid, _, _, _) = host(100, 80);
+        let heading = "A heading much wider than one column";
+        let next = SPILL_COLS + 9;
+        for (r, c, text) in [
+            (1, 0, heading), (1, 1, "Hidden blocker"),
+            (2, 0, heading), (2, 1, "Hidden blocker"), (2, next, "Visible blocker"),
+            (4, next, "«Right aligned"), (4, next - 1, "Hidden left blocker"),
+            (5, next - 1, "Hidden source must not overflow into the next column"),
+        ] {
+            grid.cells.borrow_mut().insert((r, c), text.into());
+        }
+        let row = |app: &App<Host>, r: u32| {
+            let top = HEADER_H + r as f32 * 20.0;
+            app.tree().iter().filter_map(|(_, node)| match node {
+                Node::Text { content, rect, .. } if rect.y() >= top && rect.y() < top + 20.0 => Some((content.clone(), *rect)),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        app.tick();
+        let visible = row(&app, 1);
+        assert!(visible.iter().any(|(t, rect)| t.starts_with("A ") && t.ends_with('…') && rect.w() <= 64.0), "{visible:?}");
+        assert!(visible.iter().any(|(t, _)| t == "Hidden blocker"), "{visible:?}");
+
+        for c in 1..next {
+            grid.widths.borrow_mut().insert(c, 0.0);
+        }
+        app.dirty_flag().store(true, std::sync::atomic::Ordering::Release);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let spilled = row(&app, 1);
+        assert!(spilled.iter().any(|(t, rect)| t == heading && rect.x() < hw + 64.0 && rect.x() + rect.w() > hw + 64.0), "{spilled:?}");
+        let blocked = row(&app, 2);
+        assert!(blocked.iter().any(|(t, rect)| t.starts_with("A ") && t.ends_with('…') && rect.x() + rect.w() <= hw + 64.0), "{blocked:?}");
+        assert!(blocked.iter().any(|(t, _)| t == "Visible blocker"), "{blocked:?}");
+        let leftward = row(&app, 4);
+        assert!(leftward.iter().any(|(t, rect)| t == "Right aligned" && rect.x() < hw + 64.0 && rect.x() + rect.w() > hw + 64.0), "{leftward:?}");
+        for r in [1, 2, 4, 5] {
+            let shown = row(&app, r);
+            assert!(shown.iter().all(|(t, _)| !t.starts_with("Hidden")), "{shown:?}");
+        }
     }
 
     #[test]

@@ -3727,13 +3727,13 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 
 - **Grid** (pergola `grid_view.rs`, `spill`/`emit_spills`). Text wider than its cell runs over empty neighbours, as spreadsheets show it:
   - Left-aligned text runs right, right-aligned text runs left, and centred text runs both ways.
-  - It runs up to 32 columns, and stops at a cell that shows anything or is merged. What still doesn't fit is cut with an ellipsis.
+  - It runs up to 32 visible neighbours per side and stops at a visible cell that shows anything or is merged. What still doesn't fit is cut with an ellipsis.
   - Numbers never run over; they show `###`. Text with line breaks doesn't run over either.
   - The grid lines under the text are hidden, except where a neighbour has a fill.
   - The text is drawn in a layer over the cell tiles, so a run that crosses tiles or frozen bands draws once.
   - Text reaching in from cells beside the visible columns is found only through a blank edge cell, so full rows cost nothing more. `scroll_cost` p50 and p99 are unchanged.
-- **Not yet:** text that runs from a hidden column.
-- **Gate:** pergola `long_text_runs_over_empty_neighbours`.
+- **Hidden columns:** a hidden column can neither contribute text nor block overflow from a visible cell. A visible cell beyond the hidden run can block the overflow. The Excel behavior is documented in the interoperability report. [LibreOffice bug 160011, comment 6](https://bugs.documentfoundation.org/show_bug.cgi?id=160011#c6)
+- **Gates:** pergola `long_text_runs_over_empty_neighbours` and `text_runs_across_hidden_columns_from_visible_cells_only`.
 
 ### 16.86 Center Across Selection (2026-11-19)
 
