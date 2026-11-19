@@ -157,6 +157,15 @@ impl TextEdit {
         true
     }
 
+    /// A line break at the caret even in a one-line field (a spreadsheet
+    /// cell's Alt+Enter).
+    pub fn insert_break(&mut self) -> bool {
+        let was = std::mem::replace(&mut self.multiline, true);
+        let r = self.insert("\n");
+        self.multiline = was;
+        r
+    }
+
     /// Backspace: the selection, else the grapheme (or word) before the caret.
     pub fn backspace(&mut self, word: bool) -> bool {
         let run = !self.has_selection() && !word;

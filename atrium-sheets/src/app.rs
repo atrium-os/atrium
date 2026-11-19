@@ -1260,7 +1260,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1445,6 +1445,22 @@ impl View for Sheets {
                 // A double-click on a column's edge: as wide as its widest entry.
                 // With whole columns selected, every one of them.
                 // On the double line of hidden columns: show them.
+                // A row's edge: show hidden rows there, or fit the row (all
+                // the selected whole rows) to its tallest cell.
+                GridAction::FitRow(row) if crate::data::unhide_rows_at(&mut doc.borrow_mut(), row) => {
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::FitRow(row) => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
+                    let heights: Vec<(u32, f64)> = (lo..=hi).filter(|&r| !doc.borrow().wb.sheet(doc.borrow().sheet).row_hidden(r)).map(|r| (r, src.fit_height(r))).collect();
+                    let mut d = doc.borrow_mut();
+                    for (r, h) in heights {
+                        d.size_preview(true, r, r, h);
+                    }
+                    d.size_done();
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
                 GridAction::FitCol(col) if crate::data::unhide_cols_at(&mut doc.borrow_mut(), col) => {
                     rev.set(rev.get().wrapping_add(1));
                 }

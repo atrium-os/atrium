@@ -101,6 +101,10 @@ pub struct CellView {
     pub indent: u8,
     /// The cell has a comment: a small triangle in its top-right corner.
     pub note: bool,
+    /// Text broken onto lines to the cell's width (Wrap Text); it never
+    /// runs over its neighbours. Text with line breaks shows its lines
+    /// either way.
+    pub wrap: bool,
 }
 
 /// One step of a cell's indent, px.
@@ -259,7 +263,7 @@ pub fn draw_icon(ctx: &mut Ctx, icon: CellIcon, c: Color, off: Color, x: f32, y:
 
 impl CellView {
     pub fn text(s: impl Into<String>) -> Self {
-        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false }
+        Self { text: s.into(), align: CellAlign::Left, color: None, bold: false, numeric: false, fill: None, borders: [None; 4], bar: None, icon: None, indent: 0, note: false, wrap: false }
     }
     pub fn number(s: impl Into<String>) -> Self {
         Self { text: s.into(), align: CellAlign::Right, numeric: true, ..Self::text("") }
@@ -430,6 +434,8 @@ pub struct GridState {
     /// The column edge last pressed, and when: a second press soon after is
     /// a double-click (fit the column).
     edge_press: Option<(u32, std::time::Instant)>,
+    /// The row edge last pressed (the row a double-click fits), and when.
+    row_edge_press: Option<(u32, std::time::Instant)>,
     /// While a selection or the fill handle is dragged past the body's
     /// edge: where the pointer is (window px). Each frame scrolls toward it.
     edge: Option<crate::geom::Point>,
@@ -468,6 +474,10 @@ pub enum GridAction {
     /// A double-click on column `col`'s right edge: fit it to what it
     /// holds (the app measures, with [`needed_width`]).
     FitCol(u32),
+    /// A double-click on row `row`'s bottom edge: fit it to what it holds
+    /// (the app measures, with [`needed_height`]). On the double line of
+    /// hidden rows, `row` is the first hidden one.
+    FitRow(u32),
     Undo,
     Redo,
     Copy(CellRange),
@@ -1250,14 +1260,29 @@ impl GridView {
                 match (phase, g.drag) {
                     (DragPhase::Start, _) => {
                         commit(&mut g, &act);
-                        // Near a row's bottom edge: resize that row.
-                        let grip = if (src.row_top(row + 1) - cy).abs() <= RESIZE_GRIP as f64 {
-                            Some(row)
+                        // Near a row's bottom edge: resize that row. A
+                        // double-click fits it, or just below a double line
+                        // shows the hidden rows there.
+                        let (grip, fits) = if (src.row_top(row + 1) - cy).abs() <= RESIZE_GRIP as f64 {
+                            (Some(row), Some(row))
                         } else if row > 0 && (cy - src.row_top(row)).abs() <= RESIZE_GRIP as f64 {
-                            Some(src.row_at((src.row_top(row) - 0.5).max(0.0)))
+                            let k = src.row_at((src.row_top(row) - 0.5).max(0.0));
+                            let hidden = k + 1 < row && cy >= src.row_top(row);
+                            (Some(k), Some(if hidden { k + 1 } else { k }))
                         } else {
-                            None
+                            (None, None)
                         };
+                        let now = std::time::Instant::now();
+                        if let Some(k) = fits.filter(|k| g.row_edge_press.is_some_and(|(r, t)| r == *k && now.duration_since(t) < DOUBLE_CLICK)) {
+                            g.row_edge_press = None;
+                            g.drag = Drag::None;
+                            gst.set(g);
+                            if let Some(a) = &act {
+                                a(GridAction::FitRow(k));
+                            }
+                            return;
+                        }
+                        g.row_edge_press = fits.map(|k| (k, now));
                         match grip {
                             Some(k) => g.drag = Drag::ResizeRow { row: k, y0: p.y, h0: src.row_top(k + 1) - src.row_top(k) },
                             None => {
@@ -1567,6 +1592,32 @@ pub const SPILL_COLS: u32 = 32;
 
 /// The width cell view `cv` needs to show whole, px: its widest line, its
 /// indent, an icon, and the cell's padding. For fitting a column.
+/// The height cell view `cv` needs in a column `width` px wide: its lines
+/// (wrapped to the width when it wraps), px.
+pub fn needed_height(cv: &CellView, width: f64) -> f64 {
+    if cv.text.is_empty() {
+        return 0.0;
+    }
+    let st = cell_style(cv, &crate::theme::Semantic::LIGHT);
+    let n = text_lines(cv, (width as f32 - 2.0 * PAD - cv.indent as f32 * INDENT_STEP).max(1.0), &st).len().max(1);
+    (n as f32 * TEXT_SIZE * 1.3 + 2.0 * LINE_PAD).ceil() as f64
+}
+
+/// Space above and below a cell's lines, px.
+const LINE_PAD: f32 = 1.5;
+
+/// The lines cell view `cv` shows in `avail` px: its own lines, each broken
+/// where text may break (and inside a word too long for the line) when it
+/// wraps.
+fn text_lines(cv: &CellView, avail: f32, style: &TextStyle) -> Vec<String> {
+    let width = if cv.wrap { avail.max(1.0) } else { f32::INFINITY };
+    let text = cv.text.replace("\r\n", "\n");
+    crate::text::lines_with(&text, style, width, &crate::wrap::Wrap { hyphens: false, max_lines: MAX_LINES as u16 })
+}
+
+/// The most lines one cell shows.
+const MAX_LINES: usize = 200;
+
 pub fn needed_width(cv: &CellView) -> f64 {
     if cv.text.is_empty() {
         return 0.0;
@@ -1591,7 +1642,7 @@ fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
 /// alignment points (both, centred), up to [`SPILL_COLS`]. None when it fits,
 /// is a number, or has no empty neighbour.
 fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u32)> {
-    if cv.text.is_empty() || cv.text.contains('\n') {
+    if cv.text.is_empty() || cv.text.contains('\n') || cv.wrap {
         return None;
     }
     let last = src.cols().saturating_sub(1);
@@ -1754,13 +1805,32 @@ fn draw_cell(ctx: &mut Ctx, t: &crate::theme::Semantic, cv: &CellView, cx: f32, 
         return;
     }
     let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) };
+    let lh = TEXT_SIZE * 1.3;
+    if !cv.numeric && (cv.wrap || cv.text.contains('\n')) {
+        // Several lines: centred down the cell when they fit, else from
+        // the top, as many as fit whole (at least one).
+        let avail = cw - 2.0 * PAD - lead;
+        let lines = text_lines(cv, avail, &style);
+        let room = (((ch - 2.0 * LINE_PAD) / lh).floor() as usize).max(1);
+        let n = lines.len().min(room);
+        let top = if lines.len() <= room { cy + q(((ch - n as f32 * lh) / 2.0).max(0.0) as f64) } else { cy + LINE_PAD };
+        for (i, line) in lines.iter().take(n).enumerate() {
+            let (shown, w) = fit_text(&CellView { text: line.clone(), ..cv.clone() }, avail, &style);
+            let tx0 = match cv.align {
+                CellAlign::Left => cx + PAD + lead,
+                CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
+                CellAlign::Right => cx + q((cw - PAD - w) as f64),
+            };
+            ctx.add(Node::Text { rect: Rect::new(tx0, top + i as f32 * lh, w, lh), content: shown, style: style.clone() });
+        }
+        return;
+    }
     let (shown, w) = fit_text(cv, cw - 2.0 * PAD - lead, &style);
     let tx0 = match cv.align {
         CellAlign::Left => cx + PAD + lead,
         CellAlign::Center | CellAlign::Across => cx + q(((cw - w) / 2.0) as f64),
         CellAlign::Right => cx + q((cw - PAD - w) as f64),
     };
-    let lh = TEXT_SIZE * 1.3;
     ctx.add(Node::Text { rect: Rect::new(tx0, cy + q(((ch - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
 }
 
@@ -1904,6 +1974,11 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
         match key {
             Key::Escape => {
                 g.edit = None;
+                return true;
+            }
+            // Alt+Enter: a line break in the cell, as in Excel.
+            Key::Enter if m.alt => {
+                ed.insert_break();
                 return true;
             }
             Key::Enter => {
@@ -2640,6 +2715,7 @@ mod tests {
         assert_eq!(got, [GridAction::ResizeRow { row: 1, height: 35.0 }, GridAction::ResizeEnd]);
         // Just below the edge, the next row's top: still row 2. Mid-label: selects.
         log.borrow_mut().clear();
+        std::thread::sleep(std::time::Duration::from_millis(500));
         app.handle_event(Event::PointerDown { at: Point::new(edge.x, HEADER_H + 41.0) });
         app.handle_event(Event::PointerMove { at: Point::new(edge.x, HEADER_H + 31.0) });
         app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 31.0) });
@@ -2648,6 +2724,34 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 70.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 3, c0: 0, r1: 3, c1: 19 });
+    }
+
+    #[test]
+    fn a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller() {
+        let (mut app, _, _, _, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let edge = Point::new(hw / 2.0, HEADER_H + 40.0 - 1.0);
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at: edge });
+            app.handle_event(Event::PointerUp { at: edge });
+            app.tick();
+        }
+        assert_eq!(log.borrow().last(), Some(&GridAction::FitRow(1)));
+        crate::text::clear_measurer();
+        let long = "one two three four five six seven eight";
+        let one = needed_height(&CellView::text("abc"), 64.0);
+        assert_eq!(needed_height(&CellView::text(long), 64.0), one);
+        let wrapped = needed_height(&CellView { wrap: true, ..CellView::text(long) }, 64.0);
+        assert!(wrapped >= 3.0 * one - 2.0 * 2.0 * LINE_PAD as f64, "{one} {wrapped}");
+        assert!(needed_height(&CellView::text("a\nb"), 64.0) > one);
+        let style = editor_style();
+        let lines = text_lines(&CellView { wrap: true, ..CellView::text(long) }, 60.0, &style);
+        assert!(lines.len() > 2 && lines.iter().all(|l| crate::text::measure(l.trim_end(), &style).w <= 60.0), "{lines:?}");
+        assert_eq!(lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" "), long);
+        // A word too long breaks between letters.
+        let lines = text_lines(&CellView { wrap: true, ..CellView::text("abcdefghijklmnopqrstuvwxyz") }, 30.0, &style);
+        assert!(lines.len() > 1 && lines.concat().replace('-', "") == "abcdefghijklmnopqrstuvwxyz", "{lines:?}");
     }
 
     #[test]
@@ -2760,6 +2864,11 @@ mod tests {
         crate::input::set_pointer_modifiers(Modifiers::default());
         app.tick();
         assert_eq!(state.get_cloned().edit.unwrap().selected_text(), "llo");
+        // Alt+Enter breaks the line and keeps editing; Enter commits.
+        key(&mut app, Key::End, "", Modifiers::default());
+        key(&mut app, Key::Enter, "", Modifiers { alt: true, ..Default::default() });
+        key(&mut app, Key::Char, "x", Modifiers::default());
+        assert_eq!(state.get_cloned().edit.unwrap().text(), "hello world\nx");
         // A press on another cell still commits and moves there.
         let c5 = Point::new(hw + 128.0 + 10.0, HEADER_H + 85.0);
         app.handle_event(Event::PointerDown { at: c5 });
