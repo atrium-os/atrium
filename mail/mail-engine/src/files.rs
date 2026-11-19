@@ -4,13 +4,46 @@
 
 use mail_schema::{PartKind, Summary};
 
+/// An attachment in search results. Its source is the immutable mail blob
+/// and MIME part path, so a cached preview cannot follow a changed message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHit {
+    pub name: String,
+    pub size: u64,
+    pub picture: Option<PicturePart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PicturePart {
+    pub blob: mail_store::Hash,
+    pub path: String,
+}
+
+fn parts(s: &Summary) -> impl Iterator<Item = &mail_schema::Part> {
+    s.parts.iter().filter(|p| p.kind == PartKind::Attachment)
+}
+
+fn filename(p: &mail_schema::Part) -> String {
+    p.filename.as_ref().filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| "Unnamed file".into())
+}
+
 /// A message's attachments: name and decoded size.
 pub fn files_of(s: &Summary) -> Vec<(String, u64)> {
-    s.parts
-        .iter()
-        .filter(|p| p.kind == PartKind::Attachment)
-        .map(|p| (p.filename.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Unnamed file".into()), p.size))
-        .collect()
+    parts(s).map(|p| (filename(p), p.size)).collect()
+}
+
+pub(crate) fn file_hits(m: &mail_store::Message) -> Vec<FileHit> {
+    parts(&m.summary).map(|p| {
+        let name = filename(p);
+        let image = matches!(p.content_type.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+            || name.rsplit_once('.').is_some_and(|(_, ext)| {
+                ["png", "jpg", "jpeg", "gif", "webp"].iter().any(|e| ext.eq_ignore_ascii_case(e))
+            });
+        let picture = m.full.filter(|_| !m.summary.encrypted && image).map(|blob| PicturePart {
+            blob, path: p.path.clone(),
+        });
+        FileHit { name, size: p.size, picture }
+    }).collect()
 }
 
 /// "12 bytes", "3 KB", "1.4 MB".

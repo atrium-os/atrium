@@ -506,7 +506,11 @@ doesn't run a spam classifier of its own in v1.
 - **All files in a thread** at the top of the conversation; **all files from a person** and
   a Files view across the persona's mail. Files and searches with `has:attachment` show
   one tile per attachment with its file icon, name and size. A press opens the source
-  message. Up and Down move between source messages.
+  message. Up and Down move between source messages. Visible tiles for locally stored,
+  unencrypted PNG, JPEG, GIF and WebP attachments get bounded thumbnails from an unplaced
+  Limen doc-viewer. The original is passed on a sealed memory descriptor. Mail keeps the
+  resulting pixels in a small in-memory cache and uses the file icon while waiting or if
+  extraction, decoding or the viewer fails.
 
 ### 8.2 Opening and saving
 
@@ -1894,8 +1898,8 @@ Stalwart in the cloud VM, and later a real account):
    window 2 (rail icons; the report sent and undone; the conversation's files, Files from,
    the Files view), settings (the field, asked in Work). The Files view and searches
    with `has:attachment` now use a virtualized grid of file icons, names and sizes.
-   Pressing a tile opens the source message with its attachment strip. **Not yet**:
-   thumbnails generated from attachment contents. Its counts: see below.
+   Pressing a tile opens the source message with its attachment strip. The grid loads
+   image thumbnails through the jailed Limen doc-viewer (§8.1). Its counts: see below.
 
    **Search operators on the server, and rules on JMAP servers (2026-11-19, §11.2,
    §11.6).** *Search server* now sends the search's operators too, not only its words:

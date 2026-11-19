@@ -29,6 +29,11 @@ pub const SECTION_TITLE_MAX: usize = 128;
 pub const URL_MAX: usize = 16 * 1024;
 /// The largest document a child reads from a `Load` descriptor.
 pub const DOC_MAX: u64 = 128 << 20;
+/// Encoded attachment bytes the thumbnail operation will read.
+pub const THUMBNAIL_INPUT_MAX: usize = 8 << 20;
+/// RGBA8 at this size fits in one Limen role message (including headers).
+pub const THUMBNAIL_EDGE: u16 = 120;
+pub const THUMBNAIL_RGBA_MAX: usize = THUMBNAIL_EDGE as usize * THUMBNAIL_EDGE as usize * 4;
 
 /// What the descriptor sent with `Load` holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +89,8 @@ pub enum ToChild {
     /// `Error { PRINT_FAILED }`. The parent hands the bytes to the print
     /// sheet, which never parses them itself.
     Print { w_pt: u32, h_pt: u32, margin_pt: u32 },
+    /// An image on a sealed descriptor. The child may stay unplaced.
+    MakeThumbnail,
 }
 
 /// The most pictures one document is given, and the most bytes in all.
@@ -159,6 +166,8 @@ pub enum ToParent {
     /// Navigator's sign-in window shows them and sends one, and navigatord
     /// checks the document carries every name, value and action it is told.
     Forms { forms: Vec<Form> },
+    /// A bounded, tightly packed RGBA8 raster. No encoded image crosses back.
+    Thumbnail { width: u16, height: u16, rgba: Vec<u8> },
 }
 
 /// One `<form>` (at most [`FORMS_MAX`] a document): its `action` as the
@@ -275,7 +284,7 @@ impl ToChild {
             ToChild::Open { scroll, reading, .. } => scroll_ok(*scroll) && reading.ok(),
             ToChild::SetReading { reading } => reading.ok(),
             ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
-            ToChild::Park => true,
+            ToChild::Park | ToChild::MakeThumbnail => true,
             ToChild::Provide { id } => !id.is_empty() && clean_text(id, ANCHOR_MAX),
             ToChild::Print { w_pt, h_pt, margin_pt } => {
                 let r = PRINT_PT_MIN..=PRINT_PT_MAX;
@@ -309,6 +318,11 @@ impl ToParent {
             }
             ToParent::Zoomed { zoom_64 } => (Reading::ZOOM_MIN..=Reading::ZOOM_MAX).contains(zoom_64),
             ToParent::Printed { pages, .. } => (1..=PRINT_PAGES_MAX).contains(pages),
+            ToParent::Thumbnail { width, height, rgba } => {
+                let edge = 1..=THUMBNAIL_EDGE;
+                edge.contains(width) && edge.contains(height)
+                    && rgba.len() == usize::from(*width) * usize::from(*height) * 4
+            }
             ToParent::Forms { forms } => !forms.is_empty() && forms.len() <= FORMS_MAX && forms.iter().all(Form::ok),
             ToParent::Key { key, chars, ctrl, alt, .. } => {
                 clean_text(chars, KEY_CHARS_MAX) && chars.chars().count() <= 1 && (*key != ChromeKey::Char || !chars.is_empty())
@@ -340,6 +354,20 @@ pub fn cut(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_messages_have_bounded_rgba() {
+        let ask = ToChild::MakeThumbnail;
+        assert_eq!(ToChild::decode(&ask.encode()), Some(ask));
+        let raster = |width, height, len| ToParent::Thumbnail { width, height, rgba: vec![8; len] };
+        let largest = raster(THUMBNAIL_EDGE, THUMBNAIL_EDGE, THUMBNAIL_RGBA_MAX);
+        let bytes = largest.encode();
+        assert!(bytes.len() < crate::catalogue::MAX_MESSAGE);
+        assert_eq!(ToParent::decode(&bytes), Some(largest));
+        for bad in [raster(0, 1, 0), raster(1, 1, 3), raster(1, THUMBNAIL_EDGE + 1, (THUMBNAIL_EDGE as usize + 1) * 4)] {
+            assert_eq!(ToParent::decode(&bad.encode()), None);
+        }
+    }
 
     #[test]
     fn round_trips_and_refusals() {

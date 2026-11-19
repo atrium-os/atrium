@@ -24,7 +24,7 @@ open-attachments = true
 # never a storm after a gap.
 notify = true
 # The roles Mail embeds through limend: the system picker (attach, Save),
-# a doc-viewer for HTML bodies and the quote under a reply, a pdf-viewer
+# a doc-viewer for HTML bodies, reply quotes and image thumbnails, a pdf-viewer
 # and a media-player for quick look, the credential sheet (sign-in), and
 # the print sheet.
 embeds = ["picker", "doc-viewer", "pdf-viewer", "media-player", "credential", "print"]

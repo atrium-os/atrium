@@ -1515,7 +1515,11 @@ fn files_across_mail() {
     };
     let plan = with_file("p1@acme.example", "Arun <arun@acme.example>", "Plan", "", "plan.pdf", "08:00:00");
     let reply = "From: Arun <arun@acme.example>\r\nTo: priya@example.org\r\nSubject: Re: Plan\r\nDate: Mon, 23 Nov 2026 09:00:00 +0000\r\nMessage-ID: <p2@acme.example>\r\nIn-Reply-To: <p1@acme.example>\r\nReferences: <p1@acme.example>\r\n\r\nDid you read it?\r\n".as_bytes().to_vec();
-    let photo = with_file("l1@x.example", "Lena <lena@x.example>", "Photos", "", "beach.pdf", "07:00:00");
+    let photo = with_file("l1@x.example", "Lena <lena@x.example>", "Photos", "", "beach.png", "07:00:00");
+    let photo = String::from_utf8(photo).unwrap()
+        .replace("Content-Type: application/pdf", "Content-Type: image/png\r\nContent-Transfer-Encoding: base64")
+        .replace("%PDF-1.7 a small one", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRuoAAAAASUVORK5CYII=")
+        .into_bytes();
     {
         let mut sink = engine.sink(account);
         sink.folders(&[RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true }]).unwrap();
@@ -1547,7 +1551,8 @@ fn files_across_mail() {
     assert_eq!(s.query, "from:arun@acme.example has:attachment");
     assert_eq!(s.hits.len(), 1);
     assert_eq!(s.hits[0].subject, "Plan");
-    assert_eq!(s.hits[0].files, [("plan.pdf".into(), 20)]);
+    assert_eq!(s.hits[0].files[0].name, "plan.pdf");
+    assert_eq!(s.hits[0].files[0].size, 20);
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "plan.pdf"));
 
@@ -1555,20 +1560,29 @@ fn files_across_mail() {
     assert!(mail.ui.get_cloned().views.iter().any(|(l, _)| *l == Lane::Files));
     mail.show_view(Lane::Files);
     let s = mail.ui.get_cloned().search.unwrap();
-    assert_eq!(s.hits.iter().flat_map(|h| h.files.iter().map(|(name, _)| name.as_str())).collect::<Vec<_>>(), ["plan.pdf", "beach.pdf"]);
+    assert_eq!(s.hits.iter().flat_map(|h| h.files.iter().map(|file| file.name.as_str())).collect::<Vec<_>>(), ["plan.pdf", "beach.png"]);
     app.tick();
     let t = texts(&app);
-    for label in ["plan.pdf", "beach.pdf", "20 bytes"] {
+    for label in ["plan.pdf", "beach.png", "20 bytes"] {
         assert!(t.iter().any(|x| x == label), "{t:?}");
     }
 
-    // The second tile shares the first grid row and opens its source.
-    let at = Point::new(224.0 + 200.0, mail.list_top() + 50.0);
+    assert!(!app.tree().iter().any(|(_, n)| matches!(n, Node::Image { .. })));
+    let part = mail.next_thumbnail().expect("visible picture");
+    assert_eq!(Some(&part), s.hits[1].files[0].picture.as_ref());
+    mail.thumbnail_ready(part, Some(pergola::node::Image::new(2, 1, vec![128; 8])));
+    app.tick();
+    assert!(mail.next_thumbnail().is_none());
+    assert_eq!(app.tree().iter().filter(|(_, n)| matches!(n, Node::Image { .. })).count(), 1);
+
+    // Clicking the raster inside a tile still opens its source.
+    let at = Point::new(224.0 + 199.0, mail.list_top() + 32.0);
     app.handle_event(Event::PointerDown { at });
     app.handle_event(Event::PointerUp { at });
     app.tick();
     assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Photos");
     // Counted in its header.
-    assert_eq!(mail.ui.get_cloned().files_total, (2, 40));
-    assert!(texts(&app).iter().any(|x| x == "2 files, 40 bytes"), "{:?}", texts(&app));
+    let total = 20 + s.hits[1].files[0].size;
+    assert_eq!(mail.ui.get_cloned().files_total, (2, total));
+    assert!(texts(&app).contains(&format!("2 files, {total} bytes")), "{:?}", texts(&app));
 }

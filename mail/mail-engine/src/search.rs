@@ -204,7 +204,7 @@ pub struct Hit {
     pub preview: String,
     pub unread: bool,
     /// Attachment names and decoded sizes for `has:attachment` results.
-    pub files: Vec<(String, u64)>,
+    pub files: Vec<crate::files::FileHit>,
 }
 
 impl Engine {
@@ -267,7 +267,7 @@ impl Engine {
             let ok = ok && quick.as_mut().is_none_or(|qk| qk.passes(id, None, unread, flags.iter().any(|f| f & flag::FLAGGED != 0)));
             if ok {
                 let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
-                let attachments = if files { crate::files::files_of(&m.summary) } else { Vec::new() };
+                let attachments = if files { crate::files::file_hits(&m) } else { Vec::new() };
                 hits.push(Hit {
                     msg: id, date: m.date, from, subject: m.summary.subject.clone(),
                     preview: m.summary.preview.clone(), unread, files: attachments,

@@ -682,7 +682,7 @@ fn embedded() {
                     Some(ToChild::SetReading { reading }) => run.relayout(Some(reading)),
                     Some(ToChild::Find { query, step }) => run.find(&mut out, &query, step),
                     Some(ToChild::ScrollTo { anchor }) => run.scroll_to(&anchor),
-                    Some(ToChild::Load { .. }) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
+                    Some(ToChild::Load { .. } | ToChild::MakeThumbnail) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
                     Some(ToChild::Provide { .. }) => eprintln!("navigator-page: a picture came without its bytes"),
                     Some(ToChild::Print { w_pt, h_pt, margin_pt }) => run.print(&mut out, w_pt, h_pt, margin_pt),
                     Some(ToChild::Park) => {
@@ -717,6 +717,16 @@ fn embedded() {
                             let b = fd.map(std::fs::File::from).ok_or(error::NO_DOCUMENT).and_then(read_bounded);
                             run.provided.load();
                             run.load(&mut out, kind, base, Reading::plain(dark), 0.0, b, vec![]);
+                        }
+                        Some(ToChild::MakeThumbnail) => {
+                            let reply = fd.map(std::fs::File::from).ok_or(error::NO_DOCUMENT)
+                                .and_then(navigator_page::thumbnail);
+                            match reply {
+                                Ok(px) => out.send(ToParent::Thumbnail {
+                                    width: px.width as u16, height: px.height as u16, rgba: px.rgba,
+                                }),
+                                Err(code) => out.send(ToParent::Error { code }),
+                            }
                         }
                         Some(ToChild::Provide { id }) => {
                             use std::io::Read as _;

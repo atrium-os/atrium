@@ -31,6 +31,8 @@ use mail_store::Store;
 use pergola::window::StepResult;
 use pergola::{App, SizeSpec, Window, WindowDesc};
 
+mod thumbnails;
+
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -370,6 +372,7 @@ fn main() {
     // Sync and sends run on a thread of their own with their own engine
     // over the same store; every connection is an Arca courier.
     let syncer = atrium_mail::accounts::start(store.clone(), jail.clone(), mail_engine::smime::system_roots(), Arc::new(atrium_mail::accounts::Couriers { socket: atrium_mail::accounts::courierd_socket() }));
+    let mut thumbnails = thumbnails::Thumbnails::start(store.clone(), Parser { program: jail.clone() });
     let mut engine = Engine::new(store, Parser { program: jail });
     // Senders whose key couldn't be fetched at arrival are checked again on opening.
     engine.set_dns(Box::new(atrium_mail::accounts::NuntiusDns::default()));
@@ -484,7 +487,13 @@ fn main() {
             };
             pergola::input::translate(ev).is_some_and(|e| mail.key(&e, activation))
         };
-        let wait = if composes.is_empty() && settings.is_none() { 250 } else { 16 };
+        let wait = if !composes.is_empty() || settings.is_some() {
+            16
+        } else if thumbnails.pending() {
+            50
+        } else {
+            250
+        };
         match win.step_with(&mut app, Some(Duration::from_millis(wait)), first) {
             Ok(StepResult::Closed) => break,
             Ok(_) => {}
@@ -687,6 +696,7 @@ fn main() {
         if opened || save || composes.len() != before {
             remember_open(&store_dir, &composes);
         }
+        thumbnails.step(&mail, win.embed_token());
         // Pictures asked for go to the fetch thread; what came back is kept
         // and, when its message is in the viewer, handed to it.
         for msg in mail.take_loads() {

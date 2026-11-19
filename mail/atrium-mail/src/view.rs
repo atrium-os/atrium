@@ -5,10 +5,10 @@
 //! only what is in view is in the scene.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
-use mail_engine::Engine;
+use mail_engine::{files::PicturePart, Engine};
 use mail_store::{flag, AccountId, FolderId, MsgId, Role, ThreadId};
 use pergola::geom::{Axis, Rect};
 use pergola::layout::FlexStyle;
@@ -50,6 +50,8 @@ pub fn search_h() -> f32 { em(44.0) }
 pub fn list_w() -> f32 { em(400.0) }
 /// A list row: sender and time, subject, preview.
 pub fn row_h() -> f32 { em(72.0) }
+
+const THUMBNAIL_CACHE_MAX: usize = 128;
 
 fn file_tile_h() -> f32 { em(108.0) }
 
@@ -582,6 +584,8 @@ pub struct Mail {
     list: Mutable<ScrollState>,
     reader: Mutable<ScrollState>,
     look_scroll: Mutable<ScrollState>,
+    thumbnails: Mutable<VecDeque<(PicturePart, Option<pergola::node::Image>)>>,
+    visible_pictures: Rc<RefCell<Vec<PicturePart>>>,
     size: Mutable<(f32, f32)>,
     now: Rc<dyn Fn() -> i64>,
     /// Whether the window is drawn dark (the doc-viewer is told).
@@ -637,6 +641,22 @@ fn addrs(l: &[mail_schema::Address]) -> String {
 }
 
 impl Mail {
+    /// The next visible, locally stored attachment that needs a thumbnail.
+    pub fn next_thumbnail(&self) -> Option<PicturePart> {
+        let cache = self.thumbnails.get_cloned();
+        self.visible_pictures.borrow().iter().find(|part| !cache.iter().any(|(key, _)| key == *part)).cloned()
+    }
+
+    /// Keep both successes and refusals within a bounded, in-memory cache.
+    pub fn thumbnail_ready(&self, part: PicturePart, image: Option<pergola::node::Image>) {
+        let mut cache = self.thumbnails.get_cloned();
+        if cache.len() == THUMBNAIL_CACHE_MAX {
+            cache.pop_front();
+        }
+        cache.push_back((part, image));
+        self.thumbnails.set(cache);
+    }
+
     fn read_page(&self, folder: FolderId, conversations: bool, page: usize) -> Vec<ListRow> {
         let store = &self.engine.store;
         if conversations {
@@ -1696,8 +1716,8 @@ impl Mail {
 
     /// The files in `hits` and their total size.
     fn files_total(&self, hits: &[mail_engine::search::Hit]) -> (usize, u64) {
-        hits.iter().flat_map(|h| &h.files).fold((0, 0), |(n, z), (_, size)| {
-            (n + 1, z.saturating_add(*size))
+        hits.iter().flat_map(|h| &h.files).fold((0, 0), |(n, z), file| {
+            (n + 1, z.saturating_add(file.size))
         })
     }
 
@@ -3240,6 +3260,8 @@ impl MailView {
             list: ui.sibling(ScrollState::default()),
             reader: ui.sibling(ScrollState::default()),
             look_scroll: ui.sibling(ScrollState::default()),
+            thumbnails: ui.sibling(VecDeque::new()),
+            visible_pictures: Rc::default(),
             size: ui.sibling(size),
             ui,
             pages: Rc::default(),
@@ -3335,6 +3357,7 @@ impl View for MailView {
         let (w, h) = self.mail.size.get();
         let t = ctx.theme;
         self.mail.dark.set(t.mode == pergola::theme::Mode::Dark);
+        self.mail.visible_pictures.borrow_mut().clear();
         ctx.min_size(pergola::geom::Size::new(em(320.0), head_h() + 4.0 * row_h()));
         rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_canvas());
         let typing = ui.search.as_ref().is_some_and(|s| s.typing);
@@ -3857,27 +3880,50 @@ impl MailView {
     /// where the attachment strip applies the existing Open and Quick look rules.
     fn file_grid(&self, ctx: &mut Ctx, search: &Search, cursor: Option<usize>, bounds: Rect) {
         let tiles: Vec<_> = search.hits.iter().enumerate().flat_map(|(i, hit)| {
-            hit.files.iter().map(move |(name, size)| (i, name.clone(), *size))
+            hit.files.iter().cloned().map(move |file| (i, file))
         }).collect();
         let cols = file_columns(bounds.w() + 1.0);
         let gap = em(6.0);
         let tile_w = (bounds.w() - gap) / cols as f32;
         let mail = self.mail.clone();
+        let cache = mail.thumbnails.get_cloned();
+        let scroll = mail.list.get();
+        let shown = f64::from(bounds.h()) / scroll.zoom.settled.max(0.01);
+        let height = f64::from(file_tile_h());
+        let first = (scroll.physics.y / height).floor().max(0.0) as usize;
+        let end = ((scroll.physics.y + shown) / height).ceil().max(first as f64) as usize;
+        mail.visible_pictures.borrow_mut().extend(tiles.iter().skip(first.saturating_mul(cols))
+            .take((end - first).saturating_mul(cols))
+            .filter(|(_, file)| file.size <= limen::doc_viewer::THUMBNAIL_INPUT_MAX as u64)
+            .filter_map(|(_, file)| file.picture.clone())
+            .take(THUMBNAIL_CACHE_MAX));
         let background = ctx.theme.bg_canvas();
         VirtualList::new(mail.list.clone(), bounds, tiles.len().div_ceil(cols), file_tile_h(), move |r, ctx| {
             let t = ctx.theme;
             row(ctx, bounds.w(), file_tile_h());
-            for (col, (i, name, size)) in tiles.iter().skip(r * cols).take(cols).enumerate() {
+            for (col, (i, file)) in tiles.iter().skip(r * cols).take(cols).enumerate() {
                 let i = *i;
                 let x = gap + col as f32 * tile_w;
                 let mail = mail.clone();
                 let fill = if cursor == Some(i) { t.selection_bg() } else { t.bg_window() };
                 area(ctx, Rect::new(x, gap, tile_w - gap, file_tile_h() - gap), fill, move || mail.open(i));
-                pergola::widgets::Glyph::new(crate::files::ph::FILE)
-                    .size(30.0).color(t.text_secondary()).at(x + em(10.0), em(21.0)).emit(ctx);
-                let label = fit(name, type_size::SM, Weight::Medium, tile_w - gap - em(20.0));
+                let image = file.picture.as_ref().and_then(|part| {
+                    cache.iter().find(|(key, _)| key == part).and_then(|(_, image)| image.as_ref())
+                });
+                if let Some(image) = image {
+                    let pixels = image.data();
+                    let scale = ((tile_w - gap - em(20.0)) / pixels.width as f32)
+                        .min(em(44.0) / pixels.height as f32);
+                    let (w, h) = (pixels.width as f32 * scale, pixels.height as f32 * scale);
+                    let left = x + (tile_w - gap - w) / 2.0;
+                    ctx.add(Node::Image { rect: Rect::new(left, em(32.0) - h / 2.0, w, h), image: image.clone() });
+                } else {
+                    pergola::widgets::Glyph::new(crate::files::ph::FILE)
+                        .size(30.0).color(t.text_secondary()).at(x + em(10.0), em(21.0)).emit(ctx);
+                }
+                let label = fit(&file.name, type_size::SM, Weight::Medium, tile_w - gap - em(20.0));
                 text(ctx, x + em(10.0), em(64.0), &label, type_size::SM, Weight::Medium, t.text_primary());
-                let size = mail_engine::files::size_words(*size);
+                let size = mail_engine::files::size_words(file.size);
                 text(ctx, x + em(10.0), em(86.0), &size, type_size::XS, Weight::Regular, t.text_secondary());
                 ctx.pop();
             }

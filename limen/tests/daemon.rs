@@ -271,6 +271,35 @@ fn messages_are_capped_in_size_and_rate() {
 }
 
 #[test]
+fn a_doc_viewer_returns_thumbnail_pixels_without_a_placed_slot() {
+    use limen::doc_viewer::{ToChild, ToParent, THUMBNAIL_EDGE, THUMBNAIL_RGBA_MAX};
+    use std::os::fd::AsFd;
+
+    let w = World::new();
+    let mut app = w.parent(APP);
+    let embed = app.request("doc-viewer", W_APP).unwrap();
+    let (_, mut viewer) = w.spawned();
+    assert!(matches!(next_c(&mut viewer), ChildEvent::Attach { embed: id, .. } if id == embed));
+    viewer.ready(embed, W_VIEWER).unwrap();
+
+    let path = std::env::temp_dir().join(format!("limen-thumbnail-{}", std::process::id()));
+    std::fs::write(&path, b"encoded picture").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let request = ToChild::MakeThumbnail.encode();
+    app.send_fd(embed, request.clone(), file.as_fd()).unwrap();
+    assert_eq!(next_c(&mut viewer), ChildEvent::MessageFd { embed, bytes: request });
+    assert!(viewer.take_fd().is_some());
+
+    let reply = ToParent::Thumbnail {
+        width: THUMBNAIL_EDGE, height: THUMBNAIL_EDGE, rgba: vec![8; THUMBNAIL_RGBA_MAX],
+    }.encode();
+    viewer.emit(embed, reply.clone()).unwrap();
+    assert_eq!(next_p(&mut app), ParentEvent::Message { embed, bytes: reply });
+    assert!(w.fresco.binds().is_empty());
+}
+
+#[test]
 fn a_spawned_child_crash_is_child_lost_and_a_parent_exit_ends_its_children() {
     let w = World::new();
     let mut app = w.parent(APP);

@@ -86,6 +86,24 @@ pub fn picture(bytes: &[u8]) -> Result<navigator_image::image::Pixels, u16> {
     })
 }
 
+/// Decode a small image preview in the viewer's jail without loading a page.
+pub fn thumbnail(input: impl Read) -> Result<navigator_image::image::Pixels, u16> {
+    use limen::doc_viewer::{THUMBNAIL_EDGE, THUMBNAIL_INPUT_MAX, THUMBNAIL_RGBA_MAX};
+    use navigator_image::image::{decode_unaddressed, natural_size, Ceilings};
+    let mut bytes = Vec::new();
+    input.take(THUMBNAIL_INPUT_MAX as u64 + 1).read_to_end(&mut bytes).map_err(|_| error::UNREADABLE)?;
+    if bytes.len() > THUMBNAIL_INPUT_MAX {
+        return Err(error::TOO_BIG);
+    }
+    let edge = u32::from(THUMBNAIL_EDGE);
+    let (_, w, h) = natural_size(&bytes).map_err(|_| error::UNREADABLE)?;
+    // The decoder scales to cover the target. Ask only on the long axis
+    // so rounding the short axis cannot push the result over the limit.
+    let target = if w >= h { (edge, 0) } else { (0, edge) };
+    decode_unaddressed(&bytes, Ceilings { target: Some(target), budget: THUMBNAIL_RGBA_MAX, ..Ceilings::default() })
+        .map_err(|_| error::UNREADABLE)
+}
+
 /// Where a `iw` x `ih` picture goes in a `w` x `h` window: whole, centred,
 /// never drawn larger than its own pixels (an SVG was drawn large already).
 pub fn fit_picture(iw: u32, ih: u32, w: f32, h: f32) -> [f32; 4] {
@@ -468,6 +486,13 @@ mod tests {
         let px = picture(&png).unwrap();
         assert!(px.width <= PICTURE_PX_MAX && px.height <= PICTURE_PX_MAX, "{}x{}", px.width, px.height);
         assert_eq!(px.rgba.len(), (px.width * px.height * 4) as usize);
+        let thumb = thumbnail(png.as_slice()).unwrap();
+        assert_eq!((thumb.width, thumb.height), (120, 30));
+        assert_eq!(&thumb.rgba[..4], &[200; 4]);
+        assert_eq!(thumbnail(&b"not an image"[..]).unwrap_err(), error::UNREADABLE);
+        use limen::doc_viewer::THUMBNAIL_INPUT_MAX;
+        let excess = std::io::repeat(0).take(THUMBNAIL_INPUT_MAX as u64 + 1);
+        assert_eq!(thumbnail(excess).unwrap_err(), error::TOO_BIG);
         // A small SVG is drawn large.
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"><rect width="24" height="12" fill="red"/></svg>"#;
         let s = picture(svg).unwrap();
