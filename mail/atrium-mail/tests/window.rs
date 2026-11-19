@@ -19,6 +19,9 @@ use pergola::{App, Event, Key, KeyEventKind, Modifiers};
 const NOW: i64 = 1_795_425_660;
 
 fn jail() -> PathBuf {
+    if let Some(parser) = std::env::var_os("MAIL_PARSE_JAIL") {
+        return PathBuf::from(parser);
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());
@@ -388,6 +391,15 @@ fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
     app.tick();
     assert!(texts(&app).iter().any(|x| x == "Opens through Microsoft Safe Links, your company's link scanning"), "{:?}", texts(&app));
     assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, other);
+    assert!(enter(Some([7; 16])));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while mail.ui.get_cloned().link.is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mail.poll_link();
+    }
+    assert!(mail.ui.get_cloned().link.is_none(), "Monstrator opened the Work link");
+    let request = asked.lock().unwrap().pop().unwrap();
+    assert!(request.contains(other), "{request}");
     // Turned off: peeled as in Personal.
     engine.set_prefs(&mail_engine::prefs::Prefs { link_scanning: Some(false), ..engine.prefs() }).unwrap();
     mail.link(wrapped);
