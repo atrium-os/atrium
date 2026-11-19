@@ -258,7 +258,7 @@ impl Workbook {
             n += sh.links.values().map(|k| 48 + k.target.len() as u64).sum::<u64>();
         }
         n += self.strings.bytes();
-        n += self.pictures.iter().map(|p| p.bytes.len() as u64).sum::<u64>();
+        n += self.pictures.iter().map(|p| (p.bytes.len() + p.link.as_ref().map_or(0, |link| link.len())) as u64).sum::<u64>();
         for (_, g) in self.groups() {
             n += 256 + (g.r1 - g.r0) as u64 * 8;
         }

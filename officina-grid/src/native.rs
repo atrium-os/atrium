@@ -10,7 +10,7 @@
 //! | 5 | STYLES | the style table: every style after the default (id 0), in id order |
 //! | 6 | STYLE_RUNS | one sheet's style runs: per styled column, its runs (first row, style id) |
 //! | 8 | ROWS_SHOWN | one sheet's hidden rows and auto-filter (as `GridOp::Filter` carries them) |
-//! | 25 | PICTURE | one embedded raster picture: sheet, anchor, optional crop and rotation, and encoded bytes |
+//! | 25 | PICTURE | one embedded raster picture: sheet, anchor, optional crop, rotation and link, and encoded bytes |
 //! | 10 | CHARTS | charts: kind, grouping, legend, titles, anchor, series ranges |
 //! | 11 | MACROS | macros kept inert: family, VBA code names (the parts follow) |
 //! | 12 | MACRO_PART | one macro part: path, media type, bytes, never parsed |

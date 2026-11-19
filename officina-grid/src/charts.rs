@@ -86,7 +86,10 @@ pub struct Anchor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Picture {
     pub anchor: Anchor,
+    /// Embedded image or the workbook's cached copy of a linked image.
     pub bytes: Arc<[u8]>,
+    /// External relationship target, kept as inert text.
+    pub link: Option<Arc<str>>,
     /// Source insets in thousandths of a percent: left, top, right, bottom.
     pub crop: [i32; 4],
     /// Clockwise rotation about the anchor's center, in 1/60,000 degrees.
@@ -100,6 +103,8 @@ pub(crate) const MAX_PICTURE_TOTAL: usize = (64 << 20) - (MAX_PICTURES * 64);
 
 // Picture records originally started with an unflagged sheet index.
 const PICTURE_TRANSFORM: u16 = 1 << 15;
+const PICTURE_LINK: u16 = 1 << 14;
+pub const MAX_PICTURE_LINK: usize = 4096;
 
 impl Picture {
     fn has_transform(&self) -> bool {
@@ -107,8 +112,9 @@ impl Picture {
     }
 
     // There is already room for the anchor and image length in the budget.
-    fn transform_reserve(&self) -> usize {
-        if self.has_transform() { 16 } else { 0 }
+    fn extra_bytes(&self) -> usize {
+        let transform = if self.has_transform() { 16 } else { 0 };
+        transform + self.link.as_ref().map_or(0, |link| link.len() + 2)
     }
 
     /// The extension used when saving the embedded bytes to XLSX.
@@ -124,7 +130,9 @@ impl Picture {
 
     pub(crate) fn encode(&self, w: &mut Writer) {
         let transformed = self.has_transform();
-        w.u16(self.anchor.sheet | if transformed { PICTURE_TRANSFORM } else { 0 });
+        let transform_flag = if transformed { PICTURE_TRANSFORM } else { 0 };
+        let link_flag = if self.link.is_some() { PICTURE_LINK } else { 0 };
+        w.u16(self.anchor.sheet | transform_flag | link_flag);
         for (row, col, x, y) in [self.anchor.from, self.anchor.to] {
             w.u32(row);
             w.u32(col);
@@ -137,12 +145,15 @@ impl Picture {
             }
             w.ivar(i64::from(self.rotation));
         }
+        if let Some(link) = &self.link {
+            w.str(link);
+        }
         w.bytes(&self.bytes);
     }
 
     pub(crate) fn decode(r: &mut Reader, limit: usize) -> Result<Self, WireError> {
         let flags = r.u16()?;
-        let sheet = flags & !PICTURE_TRANSFORM;
+        let sheet = flags & !(PICTURE_TRANSFORM | PICTURE_LINK);
         let mut corner = || -> Result<_, WireError> {
             Ok((r.u32()?, r.u32()?, r.f64()? as f32, r.f64()? as f32))
         };
@@ -155,8 +166,13 @@ impl Picture {
             }
             rotation = coordinate()?;
         }
+        let link = if flags & PICTURE_LINK != 0 {
+            Some(Arc::from(r.str("picture link", MAX_PICTURE_LINK as u64)?))
+        } else {
+            None
+        };
         let bytes = Arc::from(r.bytes("picture", limit.min(MAX_PICTURE_BYTES) as u64)?);
-        Ok(Self { anchor, bytes, crop, rotation })
+        Ok(Self { anchor, bytes, link, crop, rotation })
     }
 }
 
@@ -167,20 +183,23 @@ impl Workbook {
 
     /// Whether there is room for another embedded picture of this size.
     pub fn can_add_picture(&self, size: usize) -> bool {
-        self.has_picture_room(size, 0)
+        size > 0 && self.has_picture_room(size, 0)
     }
 
-    fn has_picture_room(&self, size: usize, transform_reserve: usize) -> bool {
+    fn has_picture_room(&self, size: usize, extra: usize) -> bool {
         self.pictures.len() < MAX_PICTURES
-            && (1..=MAX_PICTURE_BYTES).contains(&size)
-            && self.pictures.iter().map(|p| p.bytes.len() + p.transform_reserve()).sum::<usize>()
-                <= MAX_PICTURE_TOTAL - size - transform_reserve
+            && size <= MAX_PICTURE_BYTES
+            && self.pictures.iter().map(|p| p.bytes.len() + p.extra_bytes()).sum::<usize>()
+                <= MAX_PICTURE_TOTAL.saturating_sub(size.saturating_add(extra))
     }
 
     pub fn add_picture(&mut self, picture: Picture) -> Result<(), &'static str> {
         let a = picture.anchor;
-        if !self.has_picture_room(picture.bytes.len(), picture.transform_reserve())
-            || Picture::extension(&picture.bytes).is_none()
+        if picture.link.as_ref().is_some_and(|link| {
+                link.is_empty() || link.len() > MAX_PICTURE_LINK || link.chars().any(char::is_control)
+            })
+            || !self.has_picture_room(picture.bytes.len(), picture.extra_bytes())
+            || if picture.bytes.is_empty() { picture.link.is_none() } else { Picture::extension(&picture.bytes).is_none() }
             || picture.crop.iter().any(|inset| !(-1_000_000..=1_000_000).contains(inset))
             || a.sheet as usize >= self.sheet_count()
             || [a.from, a.to].iter().any(|&(r, c, x, y)| {

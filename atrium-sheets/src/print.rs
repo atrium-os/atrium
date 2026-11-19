@@ -18,6 +18,7 @@ use crate::source::SheetSource;
 pub struct Snapshot {
     pub name: String,
     pub drawings: Vec<Drawing>,
+    links: Vec<(usize, std::sync::Arc<str>)>,
     pub cols: Vec<f64>,
     pub rows: Vec<f64>,
     /// Row by row.
@@ -84,7 +85,7 @@ fn print_area(d: &Doc) -> Result<Option<[u32; 4]>, String> {
 
 /// The current sheet's print area or its used range, captured at print time.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
-    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges, drawings, object_rows, object_cols) = {
+    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges, drawings, links, object_rows, object_cols) = {
         let d = doc.borrow();
         let area = print_area(&d)?;
         let (r, c) = d.wb.extent(d.sheet);
@@ -111,6 +112,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             [x0 - ox, y0 - oy, x1 - x0, y1 - y0]
         };
         let mut drawings = Vec::new();
+        let mut links = Vec::new();
         let (mut object_rows, mut object_cols) = (0, 0);
         let past = |sizes: &officina_grid::column::Sizes, end: f64, max: u32| {
             let i = sizes.index_at(end).min(max);
@@ -135,6 +137,9 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
                 },
             };
             if include(drawing.paint_bounds()) {
+                if let Some(link) = picture.link.as_ref().filter(|_| picture.bytes.is_empty()) {
+                    links.push((drawings.len(), link.clone()));
+                }
                 drawings.push(drawing);
             }
         }
@@ -166,7 +171,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             .collect::<Vec<_>>();
         let from = (sh.freeze_from.0.saturating_sub(top), sh.freeze_from.1.saturating_sub(left));
         let to = (sh.freeze.0.saturating_sub(top), sh.freeze.1.saturating_sub(left));
-        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges, drawings, object_rows, object_cols)
+        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges, drawings, links, object_rows, object_cols)
     };
     let src = SheetSource::new(doc.clone());
     let mut cells = Vec::with_capacity((rows * cols) as usize);
@@ -216,11 +221,49 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, drawings, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
+    Ok(Snapshot { name, drawings, links, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
+}
+
+impl Snapshot {
+    pub fn next_link(&self) -> Option<&str> {
+        self.links.first().map(|(_, link)| link.as_ref())
+    }
+
+    /// Supply a picture explicitly selected for the next unresolved link.
+    pub fn supply_link(&mut self, file: std::fs::File) -> Result<(), String> {
+        use std::io::Read;
+        use officina_grid::charts::{Picture, MAX_PICTURE_BYTES};
+        let Some((_, link)) = self.links.first() else { return Err("No linked picture is pending".into()) };
+        let mut bytes = Vec::new();
+        file.take(MAX_PICTURE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_PICTURE_BYTES || Picture::extension(&bytes).is_none() {
+            return Err("Choose a PNG or JPEG no larger than 16 MiB".into());
+        }
+        let used = self.drawings.iter().filter_map(|drawing| match &drawing.content {
+            DrawingContent::Picture { bytes, .. } => Some(bytes.len()),
+            _ => None,
+        }).sum::<usize>();
+        let placements = self.links.iter().filter(|(_, target)| target == link).count();
+        if used + bytes.len() * placements > 64 * 1024 * 1024 {
+            return Err("Linked pictures exceed the print picture budget".into());
+        }
+        let bytes = std::sync::Arc::from(bytes);
+        for (i, target) in &self.links {
+            if target == link {
+                if let DrawingContent::Picture { bytes: image, .. } = &mut self.drawings[*i].content {
+                    *image = std::sync::Arc::clone(&bytes);
+                }
+            }
+        }
+        let link = std::sync::Arc::clone(link);
+        self.links.retain(|(_, target)| *target != link);
+        Ok(())
+    }
 }
 
 /// The snapshot as PDF on paper `w` × `h` points.
 pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String> {
+    if s.next_link().is_some() { return Err("Choose the linked pictures before printing".into()); }
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
     let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone(), title_rows: s.title_rows, title_cols: s.title_cols };
@@ -274,7 +317,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
         {
             let mut d = doc.borrow_mut();
-            d.wb.add_picture(Picture { anchor, bytes: bytes.clone(), crop: [25_000, 0, 0, 0], rotation: 5_400_000 }).unwrap();
+            d.wb.add_picture(Picture { anchor, bytes: bytes.clone(), link: Some("https://example.invalid/plot.png".into()), crop: [25_000, 0, 0, 0], rotation: 5_400_000 }).unwrap();
             let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
             let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
             d.wb = native::load(&native::save_to_vec(&imported)).unwrap();
@@ -282,9 +325,11 @@ mod tests {
             assert_eq!(d.wb.pictures()[0].bytes, bytes);
             assert_eq!(d.wb.pictures()[0].crop, [25_000, 0, 0, 0]);
             assert_eq!(d.wb.pictures()[0].rotation, 5_400_000);
+            assert_eq!(d.wb.pictures()[0].link.as_deref(), Some("https://example.invalid/plot.png"));
         }
         let page = snapshot(&doc).unwrap();
         assert!(page.cells.iter().all(Option::is_none));
+        assert!(page.next_link().is_none());
         assert_eq!(page.cols.len(), 5);
         assert_eq!(page.drawings[0].bounds[2..], [64.0, 40.0]);
         assert_eq!(page.drawings[0].paint_bounds()[2..], [40.0, 64.0]);
@@ -308,6 +353,33 @@ mod tests {
         assert_eq!(d.wb.pictures()[0].bytes, bytes);
         assert_eq!(d.wb.pictures()[0].crop, [25_000, 0, 0, 0]);
         assert_eq!(d.wb.pictures()[0].rotation, 5_400_000);
+    }
+
+    #[test]
+    fn uncached_links_survive_conversion_and_require_a_picked_picture() {
+        use officina_grid::{charts::{Anchor, Picture}, native};
+        let doc = Rc::new(RefCell::new(Doc::new("Proof")));
+        let anchor = Anchor { sheet: 0, from: (0, 0, 0.0, 0.0), to: (4, 4, 0.0, 0.0) };
+        let target = "https://example.invalid/linked.png?x=1&y=2";
+        {
+            let mut d = doc.borrow_mut();
+            d.wb.add_picture(Picture { anchor, bytes: [].into(), link: Some(target.into()), crop: [0; 4], rotation: 0 }).unwrap();
+            let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
+            let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
+            d.wb = native::load(&native::save_to_vec(&imported)).unwrap();
+        }
+        let mut pending = snapshot(&doc).unwrap();
+        assert_eq!(pending.next_link(), Some(target));
+        assert!(pdf(&pending, 595.0, 842.0, "Proof").is_err());
+        let path = std::env::temp_dir().join(format!("sheets-linked-picture-{}", std::process::id()));
+        let path = path.with_extension("png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        pending.supply_link(file).unwrap();
+        assert!(pending.next_link().is_none());
+        assert!(matches!(&pending.drawings[0].content, DrawingContent::Picture { bytes, .. } if !bytes.is_empty()));
+        assert_eq!(snapshot(&doc).unwrap().next_link(), Some(target));
     }
 
     #[test]

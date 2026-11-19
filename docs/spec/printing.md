@@ -793,7 +793,10 @@ about the center of their anchor. The PDF embeds only source pixels that interse
 the crop and clips fractional pixel edges at the picture frame. The rotated bounds determine placement across pages
 and the used range when there is no saved print area. Drawings are clipped at the print area and
 page boundaries. Frozen titles repeat within the printed bounds, while drawings appear
-only at their original sheet positions. Mail prints message text;
+only at their original sheet positions. An XLSX linked picture uses its workbook
+cache when present. For an uncached picture in the print area, Sheets asks for a
+PNG or JPEG through the system picker. The selected file is used for that print
+session and its relayouts. The relationship target remains inert. Mail prints message text;
 colour, two-sided and tray options wait for R5's attributes; Scrinium's
 quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
 Pergola (`officina_pdf::plain` is the text half).

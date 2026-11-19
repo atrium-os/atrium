@@ -54,6 +54,7 @@ enum Target {
 enum Asking {
     Open,
     SaveAs,
+    LinkedPicture,
     /// The copy to compare with.
     Compare,
     MergeBase,
@@ -634,7 +635,11 @@ fn main() {
                     Ok(snap) => {
                         run.set_status("Getting the sheet ready to print…");
                         let snap = Arc::new(snap);
-                        print_pdf = Some((sheet_pdf(snap.clone(), Paper::A4), false));
+                        if snap.next_link().is_some() {
+                            want_picker = Some(Asking::LinkedPicture);
+                        } else {
+                            print_pdf = Some((sheet_pdf(snap.clone(), Paper::A4), false));
+                        }
                         print_snap = Some(snap);
                     }
                     Err(why) => run.set_status(format!("Couldn't print: {why}.")),
@@ -690,6 +695,16 @@ fn main() {
                             name: String::new(), origin: String::new(),
                         },
                         Asking::SaveAs => Filter::save(&save_name(&name), ""),
+                        Asking::LinkedPicture => {
+                            let Some(link) = print_snap.as_ref().and_then(|snap| snap.next_link()) else { continue };
+                            Filter {
+                                kind: Kind::File,
+                                extensions: ["png", "jpg", "jpeg"].map(String::from).to_vec(),
+                                multiple: false, write: false,
+                                title: format!("Choose the linked picture \u{201c}{}\u{201d}", link.rsplit(['/', '\\']).next().unwrap_or(link).chars().take(80).collect::<String>()),
+                                name: String::new(), origin: String::new(),
+                            }
+                        }
                     };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
                     match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
@@ -698,7 +713,10 @@ fn main() {
                             asking = Some(what);
                             run.sheets.ui.set(Ui { asking: true });
                         }
-                        Err(err) => run.set_status(format!("The picker didn't open: {err:?}")),
+                        Err(err) => {
+                            if what == Asking::LinkedPicture { print_snap = None; }
+                            run.set_status(format!("The picker didn't open: {err:?}"));
+                        }
                     }
                 }
                 _ => run.set_status("The system picker isn't available here."),
@@ -707,6 +725,7 @@ fn main() {
         if let Some(e) = &embeds {
             let ev = e.borrow_mut().poll(Duration::from_millis(0));
             let mut finish = false;
+            let mut supplied_picture = false;
             let step = match (&mut printing, &ev) {
                 (Some(p), Ok(Some(pev))) => p.handle(e, pev),
                 _ => None,
@@ -738,17 +757,29 @@ fn main() {
             }
             if !ours {
             match ev {
-                Ok(Some(ParentEvent::MessageFd { bytes, .. })) => {
+                Ok(Some(ParentEvent::MessageFd { embed: event, bytes })) => {
                     let fd = e.borrow_mut().take_fd();
+                    if embed == Some(event) {
                     match (ToParent::decode(&bytes), fd) {
+                        (Some(ToParent::File { .. }), Some(fd)) if asking == Some(Asking::LinkedPicture) => {
+                            let result = print_snap.as_mut().and_then(Arc::get_mut)
+                                .ok_or_else(|| "No linked picture is pending".to_string())
+                                .and_then(|snap| snap.supply_link(fd.into()));
+                            match result {
+                                Ok(()) => supplied_picture = true,
+                                Err(why) => run.set_status(format!("Couldn't print: {why}.")),
+                            }
+                            finish = true;
+                        }
                         (Some(ToParent::File { name, write: true, .. }), Some(fd)) if asking == Some(Asking::SaveAs) => run.save_as(name, fd.into()),
                         (Some(ToParent::File { name, .. }), Some(fd))
                             if matches!(asking, Some(Asking::Compare | Asking::MergeBase | Asking::MergeIncoming)) =>
                             run.read_review(name, fd, asking.unwrap()),
                         _ => eprintln!("atrium-sheets: an odd message with a descriptor from the picker"),
                     }
+                    }
                 }
-                Ok(Some(ParentEvent::Message { bytes, .. })) => match ToParent::decode(&bytes) {
+                Ok(Some(ParentEvent::Message { embed: event, bytes })) if embed == Some(event) => match ToParent::decode(&bytes) {
                     Some(ToParent::Cancelled) => {
                         if asking == Some(Asking::MergeIncoming) { run.merge_base = None; }
                         finish = true;
@@ -760,7 +791,7 @@ fn main() {
                     }
                     _ => {}
                 },
-                Ok(Some(ParentEvent::ChildLost { .. })) => finish = true,
+                Ok(Some(ParentEvent::ChildLost { embed: event })) if embed == Some(event) => finish = true,
                 Ok(_) => {}
                 Err(err) => {
                     eprintln!("atrium-sheets: limend: {err:?}");
@@ -771,6 +802,22 @@ fn main() {
             if finish {
                 if let Some(id) = embed.take() {
                     let _ = e.borrow_mut().detach_embed(id);
+                }
+                if asking == Some(Asking::LinkedPicture) {
+                    if supplied_picture {
+                        if let Some(snap) = &print_snap {
+                            if snap.next_link().is_some() {
+                                want_picker = Some(Asking::LinkedPicture);
+                            } else {
+                                print_pdf = Some((sheet_pdf(snap.clone(), Paper::A4), false));
+                            }
+                        }
+                    } else {
+                        print_snap = None;
+                        if run.sheets.doc.borrow().status == "Getting the sheet ready to print…" {
+                            run.set_status("Printing cancelled before the linked picture was selected.");
+                        }
+                    }
                 }
                 asking = None;
                 run.sheets.ui.set(Ui { asking: false });

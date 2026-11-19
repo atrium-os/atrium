@@ -748,7 +748,12 @@ fn write_with<W: Write>(wb: &Workbook, out: W, macros: Option<&officina_grid::ma
                     dr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart{i}.xml"/>"#, j + 1));
                 }
                 for (j, &i) in pictures.iter().enumerate() {
-                    let bytes = &wb.pictures()[i].bytes;
+                    let picture = &wb.pictures()[i];
+                    if let Some(link) = &picture.link {
+                        dr.push_str(&format!(r#"<Relationship Id="rIdLink{j}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{}" TargetMode="External"/>"#, crate::xml::esc(link)));
+                    }
+                    let bytes = &picture.bytes;
+                    if bytes.is_empty() { continue; }
                     let ext = officina_grid::charts::Picture::extension(bytes)
                         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unsupported picture"))?;
                     let name = format!("sheet-picture-{i}.{ext}");

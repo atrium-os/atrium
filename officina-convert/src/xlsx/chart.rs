@@ -17,7 +17,7 @@ use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Legen
 use officina_grid::Workbook;
 
 #[cfg(feature = "read")]
-use super::read::{attr, decode_escapes, internal_rels, parse_ref, xml, XlsxError};
+use super::read::{attr, decode_escapes, external_rels, internal_rels, parse_ref, xml, XlsxError};
 use crate::report::{Kind, Report};
 use crate::zip::Archive;
 
@@ -46,6 +46,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
     for d in drawings {
         let Some(data) = z.read_name(&d)? else { continue };
         let drels = internal_rels(z, &d)?;
+        let external = external_rels(z, &d)?;
         let mut r = xml(&data);
         let mut buf = Vec::new();
         // The anchor being read: from/to (col, colOff, row, rowOff), which corner.
@@ -54,6 +55,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
         let mut pos = [[0i64; 4]; 2];
         let mut anchor_kind: &[u8] = b"";
         let mut picture = None;
+        let mut link = None;
         let mut in_picture = false;
         let mut crop = [0; 4];
         let mut rotation = 0;
@@ -69,6 +71,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                             _ => b"absoluteAnchor",
                         };
                         picture = None;
+                        link = None;
                         in_picture = false;
                         crop = [0; 4];
                         rotation = 0;
@@ -117,6 +120,15 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         if let Some(id) = attr(&e, b"embed")? {
                             picture = drels.get(&id).filter(|(ty, _)| ty.ends_with("/image")).map(|(_, p)| p.clone());
                         }
+                        if let Some(id) = attr(&e, b"link")? {
+                            let target = |relationships: &std::collections::HashMap<String, (String, String)>| {
+                                relationships.get(&id).filter(|(ty, _)| ty.ends_with("/image")).map(|(_, p)| p.clone())
+                            };
+                            link = target(&external).map(Arc::from);
+                            if picture.is_none() {
+                                picture = target(&drels);
+                            }
+                        }
                     }
                     b"sp" | b"cxnSp" | b"grpSp" if !anchor_kind.is_empty() => other = true,
                     _ => {}
@@ -137,8 +149,8 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                     b"col" | b"colOff" | b"row" | b"rowOff" => field = None,
                     b"pic" => {
                         in_picture = false;
-                        if picture.is_none() {
-                            rep.note(Kind::Dropped, "pictures without embedded media");
+                        if picture.is_none() && link.is_none() {
+                            rep.note(Kind::Dropped, "pictures without a usable image relationship");
                         }
                     }
                     b"twoCellAnchor" | b"oneCellAnchor" | b"absoluteAnchor" => {
@@ -156,14 +168,15 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         let off = |v: i64| (v as f64 / EMU_PT).clamp(0.0, 1e6) as f32;
                         let corner = |p: [i64; 4]| (cl(p[2], officina_grid::addr::MAX_ROWS), cl(p[0], officina_grid::addr::MAX_COLS), off(p[1]), off(p[3]));
                         let anchor = Anchor { sheet, from: corner(pos[0]), to: corner(pos[1]) };
-                        if let Some(p) = picture.take().filter(|_| !other) {
-                            let bytes = match z.find(&p) {
+                        if !other && (picture.is_some() || link.is_some()) {
+                            let bytes = match picture.take().and_then(|p| z.find(&p)) {
                                 Some(entry) if usize::try_from(entry.size).ok().is_some_and(|size| wb.can_add_picture(size)) => Some(z.read(entry)?),
                                 _ => None,
                             };
-                            if bytes.is_none_or(|bytes| wb.add_picture(officina_grid::charts::Picture {
-                                anchor, bytes: Arc::from(bytes), crop, rotation,
-                            }).is_err()) {
+                            let bytes = bytes.filter(|b| officina_grid::charts::Picture::extension(b).is_some());
+                            if wb.add_picture(officina_grid::charts::Picture {
+                                anchor, bytes: Arc::from(bytes.unwrap_or_default()), link: link.take(), crop, rotation,
+                            }).is_err() {
                                 rep.note(Kind::Dropped, "missing, oversized or unsupported pictures (embedded PNG and JPEG supported)");
                             }
                         }
@@ -590,8 +603,10 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> S
         anchor(&mut o, picture.anchor);
         let [l, t, r, b] = picture.crop;
         let rotation = picture.rotation;
+        let embed = if picture.bytes.is_empty() { String::new() } else { format!(r#" r:embed="rIdPic{j}""#) };
+        let link = picture.link.as_ref().map(|_| format!(r#" r:link="rIdLink{j}""#)).unwrap_or_default();
         let id = ids.len() + j + 2;
-        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdPic{j}"/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
+        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"{embed}{link}/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
     }
     o.push_str("</xdr:wsDr>");
     o
