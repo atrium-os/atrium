@@ -1,0 +1,130 @@
+# AGENTS.md — rules for any coding agent working in Atrium
+
+Atrium is a FreeBSD-based desktop platform (16.0-CURRENT, arm64 first, x86_64
+port in progress). This file holds the project rules every agent needs. The
+long-form references are:
+
+- [README.md](README.md): what Atrium is, tree layout, quick start.
+- [RUNBOOK.md](RUNBOOK.md): how to build, boot, deploy and test everything
+  (§0 bootstrap, §2 VM lifecycle, §4 cross-compile, §5 quirks, §13 cloud and
+  remote workflows).
+- [docs/STATUS.md](docs/STATUS.md): where each workstream stands now.
+- [docs/spec/](docs/spec/): one spec per subsystem (about 145). Read the spec
+  before changing a subsystem, and update it in the same commit when the
+  design changes.
+- [docs/NAMING.md](docs/NAMING.md): the canonical component names.
+
+## Design in one page
+
+- **Kernel**: FreeBSD with our patches (`freebsd-src`, branch `atrium-os`),
+  the Laminar scheduler, and Atrium kmods: Tessera (`tessera_fs.ko`,
+  content-addressed filesystem, the default root), native GPU and display
+  drivers, Hospes, Aura (Wi-Fi). No linuxkpi, no DRM/KMS, no shims: use
+  BSD-native primitives.
+- **Every app is a jail.** `jaild` is the only caller of `jail_set(2)`;
+  `portcullisd` reads the bundle's signed `atrium.toml` manifest and enforces
+  its capabilities. The jail rootfs is the bundle. Each app gets its own
+  overlay volume and its own vnet network stack.
+- **System services are small, jailed, privilege-separated Rust daemons**,
+  each with one job and its own uid: Arca (the secret store: apps *use*
+  secrets, never read them), Vestibulum/Ostiarius (login, session), Stoa
+  (persistent sessions), Lyra/Choragus (audio), Curia (settings), Scrinium
+  (files), Praeco (notifications), Tabula (clipboard), Opifex (packages),
+  Monstrator (links), Prelum (printing), Crypta (VPN), Dispensator (devices),
+  Capsa (removable media), Navigator (the web, `navigatord` + jailed engines).
+  Parsing of untrusted input happens in a jail with no secrets and no network
+  it does not need.
+- **IPC**: Aqueduct (envelope + class registry + CAS payloads). **Graphics**:
+  Fresco (retained-mode, content-addressed scenegraph) served by `frescod`;
+  apps build UI with Pergola. **Shell**: Forum (`forum-wm`, `forum-bar`,
+  `forum-dock`, ...).
+- Treat every client of a service as hostile. Wire formats have one profile:
+  the hostile one.
+
+## Hard rules
+
+- **Licensing: permissive only.** No GPL, LGPL, AGPL, SSPL, BUSL, CDDL or EPL
+  code or dependency in anything that ships. MIT, BSD, Apache-2.0, ISC, Zlib,
+  CC0 are fine; MPL-2.0 is case by case. Check the license of every new crate
+  before adding it. See [docs/LICENSING-POLICY.md](docs/LICENSING-POLICY.md).
+- **Language**: userspace is Rust, new kernel code is Rust by default (C for
+  VFS/newbus glue and code imported from FreeBSD), public APIs are C ABI.
+  See [docs/LANGUAGE-POLICY.md](docs/LANGUAGE-POLICY.md).
+- **Build on the host, never in the VM.** The VM is for running and testing.
+  Never run `cargo build --release` (or any release-profile cargo) inside the
+  VM: it hangs the guest and `kill -9` of QEMU corrupts the qcow2.
+- **Never `execve` a binary off the 9p share** (`/mnt/host`): it panics p9fs.
+  Stage with `scp` and run from the guest's local disk.
+- **Proof of concept: features over stability.** Target 16.0-CURRENT and use
+  the native FreeBSD API rather than portable fallbacks.
+
+## Building and testing
+
+There is no top-level Cargo workspace: each crate builds on its own from its
+directory. The toolchain is pinned in `rust-toolchain.toml` (nightly with
+`rust-src`, since `aarch64-unknown-freebsd` is Tier 3 and std is rebuilt).
+Move the pin only on purpose, for the whole tree.
+
+```sh
+sh scripts/bootstrap-atrium.sh                    # bare checkout -> sysroot, QEMU, kernel, kmods, userspace, image
+cd <crate> && cargo test                          # host unit tests
+cd <crate> && cargo build --release --target aarch64-unknown-freebsd   # cross-build for the guest
+sh scripts/core-host-tests.sh                     # Tessera core C tests, plain + ASan/UBSan
+```
+
+- `.cargo/config.toml` holds the Mac cross-link setup (rust-lld + the FreeBSD
+  CRT from `sysroot/`). In cloud sessions use `. scripts/cloud-vm.sh env` and
+  pass `RUSTFLAGS="$CROSS_RUSTFLAGS"` per command, never globally.
+- Kernel and kmods cross-build on the host with FreeBSD's
+  `tools/build/make.py` (RUNBOOK §4, §13.2). Never run two `make.py` builds on
+  one objdir.
+- Most subsystems have a VM check script in `scripts/` (`*-vm-check.sh`,
+  `*-gate.sh`, `*-vm.sh`). Run the one for the area you changed; the RUNBOOK
+  section for that subsystem names it.
+- Scratch worktrees: make them with `scripts/scratch-worktree.sh` (shared
+  Cargo build-dir, parent outside `~/src` itself) and remove them with
+  `--remove`, never `rm -r`.
+
+## The dev VM
+
+- `scripts/run-vm.sh` boots it, `scripts/vssh` runs commands in it,
+  `scripts/vshutdown` stops it. Always stop it with `vshutdown`.
+- **The Mac VM is shared by several agents working in parallel.** Ask before
+  taking it (in a project, ask the coordinator), and don't stop or reboot a VM
+  someone else started. `vshutdown` refuses when more than one VM runs or a
+  test harness owns the VM; stop the harness instead, since killing a harness
+  can relaunch or kill its VM.
+- `vssh` has a 3 s connect timeout and fails with empty output when the guest
+  is busy; use `VSSH_CONNECT_TIMEOUT=30` for scripted work and check for a
+  marker at the destination.
+- In cloud sessions use `scripts/cloud-vm.sh` (QEMU under TCG; never quote its
+  timings as product numbers). See RUNBOOK §13.
+
+## Git
+
+- Work on `main` and push directly; there are no PRs for normal work. Several
+  agents and cloud sessions push to `main` at the same time, so
+  `git pull --rebase` before you commit and again before you push.
+- Commit subjects name the component and say what changed in plain words,
+  e.g. `Mail: filters against a real Pigeonhole, and a VM check for the
+  Dovecot tests`.
+- Never commit secrets, build outputs (`target/`, `.ko`, images, tarballs) or
+  anything under `scratch/` unless asked.
+
+## How to verify (lessons that cost real time)
+
+- A green suite can hide a hang: reconcile the test names that printed
+  against the ones that should have. A SIGKILL is a bug report.
+- One timing is not a measurement: at least 3 runs per arm, and control the
+  dominant variable before comparing.
+- Check which kernel and which binary you actually measured.
+- Positive-control every counter and probe: make it fire once on purpose.
+- Assert that the new input landed, not just that output appeared.
+- A privilege drop must verify itself (uid, gids, groups) after dropping.
+- A named kernel object (devfs ruleset, sysctl, module) must exist: ask the
+  kernel, don't trust the config file.
+- Silent-drop paths (an unknown case that returns empty or `EIO`) hide bugs;
+  make them loud.
+- Bound every wait loop.
+- A hung guest: capture it with QEMU's `dump-guest-memory` before resetting
+  it, and walk the dump offline (see `scripts/vm-reserve-exhaustion-test.sh`).
