@@ -96,9 +96,11 @@ mk $CURIA Settings curia curia 'graphics = "fresco"\napp-grants = true'
 # Set the signed Files probe aside until the Personas test so it does not
 # change any earlier Apps-page rows.
 mkdir -p $B/files-probe/bin
-cp $B/home_probe $B/files-probe/bin/stay_probe
-printf '[app]\nid = "%s"\nname = "Files"\nversion = "1"\nentry = "bin/stay_probe"\n\n[capabilities]\nhome-files = true\n' $FILES > $B/files-probe/atrium.toml
+cp $B/home_probe $B/files-probe/bin/files_stay_probe
+printf '[app]\nid = "%s"\nname = "Files"\nversion = "1"\nentry = "bin/files_stay_probe"\n\n[capabilities]\nhome-files = true\n' $FILES > $B/files-probe/atrium.toml
 openssl dgst -sha256 -sign /root/of-key.pem -out $B/files-probe/atrium.toml.sig $B/files-probe/atrium.toml
+opifex install --root $B/files-state $B/files-probe >/dev/null
+mkdir -p /atrium/sockets/clipboard /atrium/sockets/notify
 printf '[personas.work]\ncolour = "blue"\n' > $POL
 daemon -f -o $B/sigillum.log $B/sigillum_stand_in $B/sigillum.sock
 mkdir -p /atrium/sockets/portcullis; rm -f $PSOCK
@@ -125,7 +127,7 @@ V "test -S $B/activation.sock" && ok "frescod is up" || { bad "frescod: $(V "tai
 inj() { V "printf '%s\n' $(printf "'%s' " "$@") | nc -N -U $B/inject.sock" >/dev/null; }
 press() { inj "MOVE $(($1 + WX)) $(($2 + WY))" "BTN 1 1" "BTN 1 0"; sleep ${GAP:-6}; }
 shot() { sleep 4; get $B/screen.png "$OUT/$1.png" 2>/dev/null || get $B/screen "$OUT/$1.png" 2>/dev/null; [ -s "$OUT/$1.png" ] && echo "  screenshot $OUT/$1.png" || echo "  (no screenshot for $1)"; }
-count() { V "grep -c '$1' $LOG" | tr -d ' '; }
+count() { printf '%s\n' "$1" | V "grep -F -c -f - $LOG" | tr -d ' '; }
 
 echo "=== Settings, the Apps page"
 V "daemon -f -o $B/curia.log su -m alice -c 'portcullis launch --no-prompt $CURIA'"
@@ -146,9 +148,9 @@ i=0; while [ $i -lt 30 ] && [ "$(count "alice allowed $NEW")" = 0 ]; do sleep 2;
 V "grep -q 'org.test.new' $POL" && ok "written to her policy" || bad "policy: $(V "cat $POL")"
 shot apps-2
 V "daemon -f -o $B/new.log su -m alice -c 'portcullis launch --no-prompt $NEW'"
-i=0; while [ $i -lt 30 ] && ! V "grep -q 'launching $NEW as uid' $LOG"; do sleep 2; i=$((i+2)); done
-V "grep -q 'launching $NEW as uid' $LOG" && ok "New now launches without asking" || bad "launch: $(V "tail -3 $LOG")"
-V "pkill -f stay_probe" >/dev/null 2>&1
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'home-probe:' $B/new.log"; do sleep 2; i=$((i+2)); done
+V "grep -q 'home-probe:' $B/new.log" && ok "New now launches without asking" || bad "launch: $(V "tail -3 $B/new.log; tail -3 $LOG")"
+V "pkill -TERM -j org_test_new -x stay_probe" >/dev/null 2>&1
 
 echo "=== the system's app"
 # The third row (Sys): no Allow; a press there allows nothing.
@@ -248,20 +250,35 @@ press ${GX:-372} ${GY:-220}                      # Work's colour: green
 i=0; while [ $i -lt 20 ] && [ "$(count "persona work is now Some(\"green\")")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "persona work is now Some(\"green\")")" = 1 ] && ok "Work is green now" || bad "colour: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
 V "grep -A1 '^\[personas.work\]' $POL | grep -q green" && ok "in her policy" || bad "policy: $(V "cat $POL")"
-V "mv $B/files-probe /var/lib/atrium/apps/$FILES
-   daemon -f -o $B/files.log -u alice /usr/local/bin/portcullis launch --no-prompt $FILES"
-i=0; while [ $i -lt 30 ] && ! V "grep -q 'home-probe:.*persona_made=ok' $B/files.log"; do sleep 2; i=$((i+2)); done
-V "grep -q 'home-probe:.*persona_made=ok' $B/files.log" && ok "Files probe is running before the add" || bad "Files launch: $(V "tail -5 $B/files.log")"
+V "mv $B/files-state/apps/$FILES /var/lib/atrium/apps/$FILES &&
+   daemon -f -o $B/files.log su -m alice -c 'portcullis launch --no-prompt $FILES'"
+i=0; while [ $i -lt 30 ] && ! V "grep -q 'home-probe:' $B/files.log"; do sleep 2; i=$((i+2)); done
+files_pid_before=$(V "pgrep -j org_atrium_scrinium -x files_stay_probe" 2>/dev/null)
+if [ -n "$files_pid_before" ] && V "grep -q 'home-probe:' $B/files.log"; then
+    ok "Files probe is running before the add"
+else
+    bad "Files launch: $(V "tail -5 $B/files.log")"
+fi
 press ${FX:-300} ${FY:-326}                      # the name field
 key 0x16 0x06 0x0b 0x12 0x12 0x0f                # "school"
+V "touch $B/files-before-add"
 press ${AX2:-484} ${AY2:-325}                    # Add
 i=0; while [ $i -lt 20 ] && [ "$(count "persona school is now")" = 0 ]; do sleep 2; i=$((i+2)); done
 [ "$(count "persona school is now Some(\"blue\")")" = 1 ] && ok "School added, in the first free colour" || bad "add: $(V "grep -i 'persona\|REFUSED' $LOG | tail -3")"
 i=0; while [ $i -lt 30 ] && ! V "grep -q 'restarting Files for alice' $LOG && grep 'home-probe:' $B/files.log | tail -1 | grep -q 'personas=\[school,.*persona_made=ok'"; do sleep 2; i=$((i+2)); done
-if V "test \$(grep -c 'home-probe:' $B/files.log) -eq 2 &&
-      grep -q 'restarting Files for alice' $LOG &&
+files_pid_after=$(V "pgrep -j org_atrium_scrinium -x files_stay_probe" 2>/dev/null)
+school_gid=$(V "stat -f %g /home/alice/.atrium/personas/school/Documents")
+files_groups=
+if [ -n "$files_pid_after" ]; then
+    files_groups=$(V "procstat -s $files_pid_after" | awk 'NR == 2 { print $NF }')
+fi
+if [ -n "$files_pid_after" ] && [ "$files_pid_after" != "$files_pid_before" ] &&
+   [ -n "$school_gid" ] && printf '%s\n' "$files_groups" | tr ',' '\n' | grep -Fxq "$school_gid" &&
+   V "test \$(grep -c 'home-probe:' $B/files.log) -eq 2 &&
+      test \$(grep -c 'restarting Files for alice' $LOG) -eq 1 &&
       grep 'home-probe:' $B/files.log | tail -1 | grep -q 'personas=\[school,.*persona_made=ok' &&
-      test \"\$(stat -f %Sg /home/alice/.atrium/personas/school/Documents/probe.txt)\" = files-alice-school"; then
+      test /home/alice/.atrium/personas/school/Documents/files-restart-probe.txt -nt $B/files-before-add &&
+      test \"\$(stat -f %Sg /home/alice/.atrium/personas/school/Documents/files-restart-probe.txt)\" = files-alice-school"; then
     ok "Files restarted once and wrote in School's Documents with School's group"
 else
     bad "Files restart: $(V "tail -5 $B/files.log; tail -8 $LOG")"
@@ -279,7 +296,8 @@ V "test -e /home/alice/.atrium/persona-apps/school/org.test.new.img" && ok "Scho
 V "grep -q 'personas.work' $POL" && bad "Work still in her policy" || ok "Work out of her policy"
 shot persona-6
 
-V "pkill -TERM -j org_atrium_scrinium -x stay_probe; pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
+V "pkill -TERM -j org_atrium_scrinium -x files_stay_probe; pkill -x curia; pkill -f sigillum_stand_in" >/dev/null 2>&1
 # Its own test apps go (they take mailto:, which other gates count on).
-V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; if test -d /var/lib/atrium/apps/$FILES; then mv /var/lib/atrium/apps/$FILES $B/files-probe; fi; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
+V "opifex uninstall $NEW >/dev/null 2>&1; opifex uninstall $SYS >/dev/null 2>&1; if test -d /var/lib/atrium/apps/$FILES; then mv /var/lib/atrium/apps/$FILES $B/files-state/apps/$FILES; fi; mv $ASIDE/* /var/lib/atrium/apps/ 2>/dev/null; rmdir $ASIDE"
 echo "apps-access: $fails failed"
+[ "$fails" -eq 0 ]

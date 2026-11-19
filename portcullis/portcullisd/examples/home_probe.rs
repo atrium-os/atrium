@@ -14,6 +14,7 @@
 use std::io::Write;
 
 fn main() {
+    let entry = std::env::args().next().unwrap_or_default();
     let old = std::path::Path::new("/old-state").exists();
     let runs = std::fs::read_to_string("/var/probe-runs").ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0) + 1;
     let wrote = std::fs::create_dir_all("/var").and_then(|_| std::fs::write("/var/probe-runs", runs.to_string())).is_ok();
@@ -54,16 +55,20 @@ fn main() {
         }
         Err(_) => "absent".into(),
     };
+    let persona_file = if entry.ends_with("files_stay_probe") {
+        "files-restart-probe.txt"
+    } else {
+        "probe.txt"
+    };
     let pmade = match personas.split(',').next().filter(|p| !p.is_empty() && *p != "absent") {
-        Some(p) => match std::fs::File::create(format!("/atrium/personas/{p}/Documents/probe.txt")).and_then(|mut f| f.write_all(b"from the file manager")) {
+        Some(p) => match std::fs::File::create(format!("/atrium/personas/{p}/Documents/{persona_file}")).and_then(|mut f| f.write_all(b"from the file manager")) {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("err({})", e.raw_os_error().unwrap_or(0)),
         },
         None => "-".into(),
     };
     eprintln!("home-probe: {uid} old={old} runs={runs} wrote={wrote} home=[{home}] made={made} made_gid={group} personas=[{personas}] persona_made={pmade} hostuuid={hostuuid}");
-    let me = std::env::args().next().unwrap_or_default();
-    if me.ends_with("stay_probe") {
+    if entry.ends_with("stay_probe") {
         let _ = std::fs::write("/var/console-mark", "stay-mark\n");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
