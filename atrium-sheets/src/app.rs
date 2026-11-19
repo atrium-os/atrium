@@ -2279,6 +2279,13 @@ impl Sheets {
                 }
                 Cmd::Data(dc) => {
                     let g = self.grid.get_cloned();
+                    {
+                        // The row and column at the top left of the view.
+                        use pergola::widgets::GridSource as _;
+                        let st = self.scroll.get();
+                        let top = (self.source.row_at(st.physics.y), self.source.col_at(st.physics_x.y));
+                        self.doc.borrow_mut().view_top = top;
+                    }
                     crate::data::run(&mut self.doc.borrow_mut(), g.selection(), g.cursor, dc);
                     self.rev.set(self.rev.get().wrapping_add(1));
                     false

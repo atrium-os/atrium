@@ -732,15 +732,34 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if n == 1 { "Comment deleted.".into() } else { format!("{n} comments deleted.") })
         }
         DataCmd::FreezePanes | DataCmd::FreezeTopRow | DataCmd::Unfreeze => {
+            // Frozen from the row and column at the top left of the view, as
+            // in Excel: what is above and left of them is out of reach.
+            let top = d.view_top;
             let (rows, cols) = match cmd {
                 DataCmd::FreezePanes => cursor,
-                DataCmd::FreezeTopRow => (1, 0),
+                DataCmd::FreezeTopRow => (top.0.saturating_add(1).min(officina_grid::addr::MAX_ROWS - 1), 0),
                 _ => (0, 0),
             };
-            if d.wb.sheet(s).freeze == (rows, cols) {
+            let from = (if top.0 < rows { top.0 } else { 0 }, if top.1 < cols { top.1 } else { 0 });
+            if (d.wb.sheet(s).freeze, d.wb.sheet(s).freeze_from) == ((rows, cols), from) {
                 return Ok(String::new());
             }
-            d.run(if (rows, cols) == (0, 0) { "Unfreeze Panes" } else { "Freeze Panes" }, vec![GridOp::Freeze { sheet: s, rows, cols }]);
+            d.run(if (rows, cols) == (0, 0) { "Unfreeze Panes" } else { "Freeze Panes" }, vec![GridOp::Freeze { sheet: s, rows, cols, from }]);
+            if from != (0, 0) {
+                let span = |a: u32, b: u32, one: &str, many: &str, label: &dyn Fn(u32) -> String| if a + 1 == b { format!("{one} {}", label(a)) } else { format!("{many} {} to {}", label(a), label(b - 1)) };
+                let col = |c: u32| officina_grid::addr::col_name(c);
+                let row = |r: u32| (r + 1).to_string();
+                let rs = (rows > 0).then(|| span(from.0, rows, "Row", "Rows", &row));
+                let cs = (cols > 0).then(|| span(from.1, cols, "column", "columns", &col));
+                let what = match (rs, cs) {
+                    (Some(r), Some(c)) => format!("{r} and {c}"),
+                    (Some(r), None) => r,
+                    (None, Some(c)) => { let mut c = c; c[..1].make_ascii_uppercase(); c }
+                    (None, None) => String::new(),
+                };
+                let many = rows.saturating_sub(from.0) + cols.saturating_sub(from.1) > 1;
+                return Ok(format!("{what} {} in view; those above and left are out of reach until you unfreeze.", if many { "stay" } else { "stays" }));
+            }
             let rs = if rows == 1 { "top row".to_string() } else { format!("top {rows} rows") };
             let cs = if cols == 1 { "first column".to_string() } else { format!("first {cols} columns") };
             Ok(match (rows, cols) {
@@ -1066,6 +1085,21 @@ mod tests {
         assert_eq!(d.status, "The top row stays in view.");
         assert!(d.undo());
         assert_eq!(d.wb.sheet(0).freeze, (0, 0));
+        // With the view scrolled to row 11, column B: frozen from there.
+        d.view_top = (10, 1);
+        run(&mut d, one(12, 3), (12, 3), DataCmd::FreezePanes);
+        assert_eq!((d.wb.sheet(0).freeze, d.wb.sheet(0).freeze_from), ((12, 3), (10, 1)));
+        assert_eq!(d.status, "Rows 11 to 12 and columns B to C stay in view; those above and left are out of reach until you unfreeze.");
+        run(&mut d, one(12, 3), (12, 3), DataCmd::Unfreeze);
+        assert_eq!((d.wb.sheet(0).freeze, d.wb.sheet(0).freeze_from), ((0, 0), (0, 0)));
+        // Freeze Top Row keeps the row at the top of the view.
+        run(&mut d, one(2, 1), (2, 1), DataCmd::FreezeTopRow);
+        assert_eq!((d.wb.sheet(0).freeze, d.wb.sheet(0).freeze_from), ((11, 0), (10, 0)));
+        assert_eq!(d.status, "Row 11 stays in view; those above and left are out of reach until you unfreeze.");
+        // The cursor above the view's top: frozen from the first row.
+        d.undo();
+        run(&mut d, one(5, 0), (5, 0), DataCmd::FreezePanes);
+        assert_eq!((d.wb.sheet(0).freeze, d.wb.sheet(0).freeze_from), ((5, 0), (0, 0)));
     }
 
     #[test]

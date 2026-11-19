@@ -391,8 +391,11 @@ struct Seg {
     valid: Vec<u8>,
     /// `<sheetPr><tabColor>`, 0xRRGGBB.
     tab: Option<u32>,
-    /// A frozen `<pane>`: rows and columns kept in view.
-    freeze: Option<(u32, u32)>,
+    /// A frozen `<pane>`: the first unfrozen row and column, and the first
+    /// frozen ones (the `<sheetView topLeftCell>`, where the view started).
+    freeze: Option<((u32, u32), (u32, u32))>,
+    /// The `<sheetView topLeftCell>`, for a frozen pane after it.
+    view_top: (u32, u32),
     /// `<mergeCell ref>`s, (r0, c0, r1, c1).
     merges: Vec<(u32, u32, u32, u32)>,
     /// `<hyperlink>`s: cells, relationship id, location.
@@ -692,11 +695,18 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                 }
             }
             b"dynamicFilter" | b"top10" | b"colorFilter" | b"iconFilter" => seg.rep.note(Kind::Approximate, "dynamic, top-10, colour and icon filters (rows stay as the file hid them)"),
+            b"sheetView" => seg.view_top = attr(&e, b"topLeftCell")?.as_deref().and_then(parse_a1).unwrap_or((0, 0)),
             b"pane" if attr(&e, b"state")?.is_some_and(|v| v.starts_with("frozen")) => {
+                // xSplit and ySplit count the frozen columns and rows, from
+                // the view's top-left cell.
                 let split = |v: Option<String>| v.and_then(|v| v.parse::<f64>().ok()).filter(|x| x.is_finite() && *x >= 0.0).map_or(0, |x| x as u32);
-                let (rows, cols) = (split(attr(&e, b"ySplit")?).min(officina_grid::addr::MAX_ROWS - 1), split(attr(&e, b"xSplit")?).min(officina_grid::addr::MAX_COLS - 1));
+                let (n_rows, n_cols) = (split(attr(&e, b"ySplit")?), split(attr(&e, b"xSplit")?));
+                let from = (if n_rows > 0 { seg.view_top.0 } else { 0 }, if n_cols > 0 { seg.view_top.1 } else { 0 });
+                let rows = from.0.saturating_add(n_rows).min(officina_grid::addr::MAX_ROWS - 1);
+                let cols = from.1.saturating_add(n_cols).min(officina_grid::addr::MAX_COLS - 1);
                 if (rows, cols) != (0, 0) {
-                    seg.freeze = Some((rows, cols));
+                    let from = if officina_grid::book::freeze_from_fits((rows, cols), from) { from } else { (0, 0) };
+                    seg.freeze = Some(((rows, cols), from));
                 }
             }
             b"pane" if attr(&e, b"xSplit")?.is_some() || attr(&e, b"ySplit")?.is_some() => seg.rep.note(Kind::Dropped, "split (not frozen) panes"),
@@ -828,8 +838,9 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
                 if seg.tab.is_some() {
                     wb.sheet_mut(s).tab_color = seg.tab;
                 }
-                if let Some(f) = seg.freeze {
+                if let Some((f, from)) = seg.freeze {
                     wb.sheet_mut(s).freeze = f;
+                    wb.sheet_mut(s).freeze_from = from;
                 }
                 cond.extend(seg.cond);
                 if valid.is_empty() {

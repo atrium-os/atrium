@@ -5,18 +5,21 @@ use officina_grid::{CellAddr, Value, Workbook};
 
 fn book() -> Workbook {
     let mut wb = Workbook::new();
-    for n in ["Rows", "Both", "Cols", "None"] {
+    for n in ["Rows", "Both", "Cols", "None", "Scrolled"] {
         wb.add_sheet(n).unwrap();
         wb.set_value(CellAddr::new(wb.sheet_count() as u16 - 1, 0, 0), Value::str(n));
     }
     wb.sheet_mut(0).freeze = (1, 0);
     wb.sheet_mut(1).freeze = (2, 3);
     wb.sheet_mut(2).freeze = (0, 1);
+    // Frozen with the view at row 11 and column B: rows 11-12, column B.
+    wb.sheet_mut(4).freeze = (12, 2);
+    wb.sheet_mut(4).freeze_from = (10, 1);
     wb
 }
 
-fn all(wb: &Workbook) -> Vec<(u32, u32)> {
-    (0..wb.sheet_count() as u16).map(|s| wb.sheet(s).freeze).collect()
+fn all(wb: &Workbook) -> Vec<((u32, u32), (u32, u32))> {
+    (0..wb.sheet_count() as u16).map(|s| (wb.sheet(s).freeze, wb.sheet(s).freeze_from)).collect()
 }
 
 #[test]

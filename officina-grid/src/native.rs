@@ -21,6 +21,7 @@
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
 //! | 20 | VALIDATIONS | data validation rules: ranges, kind, operator, formulas as text, flags, messages |
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
+//! | 22 | FREEZE_FROM | panes frozen with the view scrolled: count; per sheet, its index, first frozen row and column |
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
@@ -52,6 +53,7 @@ pub const LINKS: u16 = 18;
 pub const FREEZE: u16 = 19;
 pub const VALIDATIONS: u16 = 20;
 pub const HIDDEN_WIDTHS: u16 = 21;
+pub const FREEZE_FROM: u16 = 22;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -306,6 +308,17 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
             w.u32(c);
         }
         c.add(FREEZE, &w.into_bytes())?;
+    }
+    let from: Vec<(usize, (u32, u32))> = wb.sheets.iter().enumerate().filter(|(_, sh)| sh.freeze_from != (0, 0)).map(|(i, sh)| (i, sh.freeze_from)).collect();
+    if !from.is_empty() {
+        let mut w = Writer::new();
+        w.var(from.len() as u64);
+        for (i, (r, c)) in from {
+            w.u16(i as u16);
+            w.u32(r);
+            w.u32(c);
+        }
+        c.add(FREEZE_FROM, &w.into_bytes())?;
     }
     for (si, sh) in wb.sheets.iter().enumerate() {
         if !sh.hidden_widths.is_empty() {
@@ -806,6 +819,22 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
                 return Err(LoadError::Bad("a sheet's frozen panes twice"));
             }
             sh.freeze = (rows, cols);
+        }
+        done(&r)?;
+    }
+    for i in of(FREEZE_FROM) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let n = r.var()?;
+        if n > wb.sheets.len() as u64 {
+            return Err(LoadError::Bad("more frozen panes than sheets"));
+        }
+        for _ in 0..n {
+            let (s, from) = (r.u16()? as usize, (r.u32()?, r.u32()?));
+            let Some(sh) = wb.sheets.get_mut(s) else { return Err(LoadError::Bad("frozen panes on a sheet that does not exist")) };
+            if from == (0, 0) || sh.freeze_from != (0, 0) || !crate::book::freeze_from_fits(sh.freeze, from) {
+                return Err(LoadError::Bad("where frozen panes start"));
+            }
+            sh.freeze_from = from;
         }
         done(&r)?;
     }

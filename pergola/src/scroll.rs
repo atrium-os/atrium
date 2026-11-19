@@ -59,8 +59,11 @@ enum Motion {
 /// Scroll position and motion along one axis.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Physics {
-    /// Current position, px, in `0..=max`.
+    /// Current position, px, in `min..=max`.
     pub y: f64,
+    /// Smallest position (0, or more when content above is out of reach,
+    /// as rows above frozen panes are).
+    pub min: f64,
     /// Largest position (content height minus viewport height).
     pub max: f64,
     motion: Motion,
@@ -77,15 +80,28 @@ impl Default for Physics {
 
 impl Physics {
     pub fn new(max: f64) -> Self {
-        Self { y: 0.0, max: max.max(0.0), motion: Motion::Idle, samples: [(0.0, 0.0); 8], n_samples: 0, velocity: 0.0 }
+        Self { y: 0.0, min: 0.0, max: max.max(0.0), motion: Motion::Idle, samples: [(0.0, 0.0); 8], n_samples: 0, velocity: 0.0 }
     }
 
     /// The content or the viewport changed size. Keeps the position in
     /// bounds; a fling past the new end stops there.
     pub fn set_max(&mut self, max: f64) {
-        self.max = max.max(0.0);
+        self.max = max.max(self.min);
         if self.y > self.max {
             self.y = self.max;
+            if matches!(self.motion, Motion::Fling { .. }) {
+                self.stop();
+            }
+        }
+    }
+
+    /// Content above `min` px is out of reach (0: none). Keeps the
+    /// position in bounds, as [`set_max`](Self::set_max) does.
+    pub fn set_min(&mut self, min: f64) {
+        self.min = if min.is_finite() { min.max(0.0) } else { 0.0 };
+        self.max = self.max.max(self.min);
+        if self.y < self.min {
+            self.y = self.min;
             if matches!(self.motion, Motion::Fling { .. }) {
                 self.stop();
             }
@@ -115,7 +131,7 @@ impl Physics {
         let i = self.n_samples % self.samples.len();
         self.samples[i] = (t, dy);
         self.n_samples += 1;
-        self.y = (self.y + dy).clamp(0.0, self.max);
+        self.y = (self.y + dy).clamp(self.min, self.max);
         self.motion = Motion::Drag { last: t, y_last: self.y, held: false };
     }
 
@@ -176,7 +192,7 @@ impl Physics {
     /// Start an eased jump to `y` (clamped) at `t` ms: page and arrow
     /// keys, Home/End, a discrete wheel notch, a find result.
     pub fn jump_to(&mut self, y: f64, t: f64) {
-        let y1 = y.clamp(0.0, self.max);
+        let y1 = y.clamp(self.min, self.max);
         // A jump during a jump retargets from where it is now.
         self.step(t);
         self.motion = Motion::Jump { t0: t, y0: self.y, y1 };
@@ -196,11 +212,11 @@ impl Physics {
     /// Put the position at `y` with no motion (anchoring, restoring a
     /// saved position). A fling in progress keeps going from there.
     pub fn set_position(&mut self, y: f64) {
-        let d = y.clamp(0.0, self.max) - self.y;
+        let d = y.clamp(self.min, self.max) - self.y;
         self.y += d;
         match &mut self.motion {
             Motion::Fling { y0, .. } => *y0 += d,
-            Motion::Jump { y0, y1, .. } => { *y0 += d; *y1 = (*y1 + d).clamp(0.0, self.max); }
+            Motion::Jump { y0, y1, .. } => { *y0 += d; *y1 = (*y1 + d).clamp(self.min, self.max); }
             _ => {}
         }
     }
@@ -224,14 +240,14 @@ impl Physics {
                         // The fling takes over the coast where it stands,
                         // at the coast's speed.
                         let at = last + RELEASE_AFTER_MS;
-                        let y0 = (y_last + v * (at - due).max(0.0) / 1000.0).clamp(0.0, self.max);
+                        let y0 = (y_last + v * (at - due).max(0.0) / 1000.0).clamp(self.min, self.max);
                         self.motion = Motion::Fling { t0: at, y0, v0: v };
                         return self.step(t);
                     }
                     self.stop();
                 } else {
                     if t > due && v.abs() >= FLING_MIN_PX_PER_S {
-                        self.y = (y_last + v * (t - due) / 1000.0).clamp(0.0, self.max);
+                        self.y = (y_last + v * (t - due) / 1000.0).clamp(self.min, self.max);
                     }
                     // Following the finger: its speed drives greeking too.
                     self.velocity = v;
@@ -244,7 +260,7 @@ impl Physics {
                 let ru = (ln_r * u).exp();
                 let y = y0 + v0 / 1000.0 * (ru - 1.0) / ln_r;
                 let v = v0 * ru;
-                self.y = y.clamp(0.0, self.max);
+                self.y = y.clamp(self.min, self.max);
                 if v.abs() < FLING_STOP_PX_PER_S || self.y != y {
                     self.stop();
                 } else {
@@ -254,7 +270,7 @@ impl Physics {
             Motion::Jump { t0, y0, y1 } => {
                 let u = ((t - t0) / JUMP_MS).clamp(0.0, 1.0);
                 let e = 1.0 - (1.0 - u).powi(3); // ease-out cubic
-                self.y = (y0 + (y1 - y0) * e).clamp(0.0, self.max);
+                self.y = (y0 + (y1 - y0) * e).clamp(self.min, self.max);
                 // d/du of the easing, in px/s.
                 self.velocity = (y1 - y0) * 3.0 * (1.0 - u).powi(2) / JUMP_MS * 1000.0;
                 if u >= 1.0 {
