@@ -836,7 +836,10 @@ another origin. An active portal-profile session stays in engine memory.
   without prompting. Reloading the domain key then requires fresh approval
   before the unlocked count goes to the gateway. IPv4 echo uses the same
   reconnected TLS connection or ESP association through both refreshes.
-  The arm64 reconnect gate passed 20/20 on TLS and 20/20 with `--esp`.
+  Finally, after unlock approval, the gate rebinds again. The gateway must
+  receive the identical unlocked report without another review, then carry
+  IPv4 echo over the new TLS connection or ESP association.
+  The extended arm64 gate passed 22/22 on TLS and 22/22 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
