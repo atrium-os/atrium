@@ -49,6 +49,8 @@ pub enum TabCmd {
     ColorCancel,
     /// The comment bar for the cursor's cell; its field submitted; closed.
     Commenting,
+    NewThread,
+    ThreadMessage(usize),
     CommentDone,
     CommentFormat(pergola::inline::Emphasis),
     CommentCancel,

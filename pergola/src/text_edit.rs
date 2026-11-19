@@ -67,6 +67,7 @@ struct Snapshot {
     anchor: usize,
     marks: Option<Vec<u8>>,
     typing_marks: Option<u8>,
+    tracked: Vec<(usize, Range<usize>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,7 +80,9 @@ pub struct TextEdit {
     /// boundaries so every byte of a character retains the same mask.
     marks: Option<Vec<u8>>,
     typing_marks: Option<u8>,
+    tracked: Vec<(usize, Range<usize>)>,
     multiline: bool,
+    line_markers: bool,
     /// A password: no copy or cut, and word motions treat it as one word
     /// (so they don't reveal where its spaces are), and no undo history.
     secret: bool,
@@ -101,7 +104,9 @@ impl TextEdit {
             preedit: None,
             marks: None,
             typing_marks: None,
+            tracked: Vec::new(),
             multiline: false,
+            line_markers: false,
             secret: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -128,6 +133,19 @@ impl TextEdit {
         }
         edit.marks = Some(marks);
         edit
+    }
+
+    pub fn marked_lines(text: &str) -> Self {
+        let mut edit = Self::new("");
+        edit.line_markers = true;
+        edit.text = text.to_owned();
+        edit.caret = edit.text.len();
+        edit.anchor = edit.caret;
+        edit
+    }
+
+    pub fn shows_line_markers(&self) -> bool {
+        !self.secret && (self.line_markers || self.is_rich())
     }
 
     pub fn is_rich(&self) -> bool { self.marks.is_some() && !self.secret }
@@ -177,10 +195,34 @@ impl TextEdit {
         true
     }
 
+    /// Track ranges by caller-supplied IDs. Replacing any part of a range
+    /// removes it. Edits before it shift it, and undo restores it.
+    pub fn with_tracked_ranges(mut self, ranges: impl IntoIterator<Item = (usize, Range<usize>)>) -> Self {
+        self.tracked = ranges.into_iter().filter(|(_, range)| {
+            range.start < range.end && self.text.get(range.clone()).is_some()
+        }).collect();
+        self
+    }
+
+    pub fn tracked_ranges(&self) -> &[(usize, Range<usize>)] {
+        &self.tracked
+    }
+
     fn replace(&mut self, range: Range<usize>, text: &str, mask: u8) {
         if let Some(marks) = &mut self.marks {
             marks.splice(range.clone(), std::iter::repeat_n(mask, text.len()));
         }
+        self.tracked.retain_mut(|(_, span)| {
+            if span.end <= range.start {
+                true
+            } else if span.start >= range.end {
+                span.start = span.start - range.len() + text.len();
+                span.end = span.end - range.len() + text.len();
+                true
+            } else {
+                false
+            }
+        });
         self.text.replace_range(range, text);
     }
 
@@ -393,7 +435,7 @@ impl TextEdit {
                 _ => KeyOutcome::Ignored,
             },
             Key::Char => changed(self.insert(chars)),
-            Key::Enter if self.is_rich() && m.shift => changed(self.insert("\n")),
+            Key::Enter if self.shows_line_markers() && m.shift => changed(self.insert("\n")),
             Key::Enter if self.multiline => changed(self.insert("\n")),
             Key::Enter => KeyOutcome::Submit,
             Key::Backspace => changed(self.backspace(cmd || m.alt)),
@@ -428,7 +470,7 @@ impl TextEdit {
     }
 
     fn clean(&self, s: &str) -> String {
-        s.chars().filter(|&c| !c.is_control() || (self.multiline && c == '\n') || (self.is_rich() && matches!(c, '\n' | '\t'))).collect()
+        s.chars().filter(|&c| !c.is_control() || (self.multiline && c == '\n') || (self.shows_line_markers() && matches!(c, '\n' | '\t'))).collect()
     }
 
     fn cut_selection(&mut self) {
@@ -458,13 +500,14 @@ impl TextEdit {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { text: self.text.clone(), caret: self.caret, anchor: self.anchor, marks: self.marks.clone(), typing_marks: self.typing_marks }
+        Snapshot { text: self.text.clone(), caret: self.caret, anchor: self.anchor, marks: self.marks.clone(), typing_marks: self.typing_marks, tracked: self.tracked.clone() }
     }
 
     fn restore(&mut self, s: Snapshot) {
         self.text = s.text;
         self.marks = s.marks;
         self.typing_marks = s.typing_marks;
+        self.tracked = s.tracked;
         self.caret = s.caret;
         self.anchor = s.anchor;
         self.preedit = None;

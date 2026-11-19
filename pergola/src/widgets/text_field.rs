@@ -111,7 +111,7 @@ fn shown(e: &TextEdit) -> (String, impl Fn(usize) -> usize + '_) {
     let pre = e.preedit().map_or("", |p| p.text.as_str());
     let caret = e.caret();
     let secret = e.is_secret();
-    let rich = e.is_rich();
+    let rich = e.shows_line_markers();
     let mut out = String::new();
     let push = |s: &str, out: &mut String| {
         if secret {
@@ -193,7 +193,7 @@ impl View for TextField {
         ctx.set_flex(clip_id, crate::layout::FlexStyle { free: true, ..Default::default() });
         let primary = style(theme.text_primary());
         let caret = edit.caret();
-        let pre_end = map(caret) + edit.preedit().map_or(0, |p| shown_len(&p.text, edit.is_secret(), edit.is_rich()));
+        let pre_end = map(caret) + edit.preedit().map_or(0, |p| shown_len(&p.text, edit.is_secret(), edit.shows_line_markers()));
         let mut fragments = Vec::new();
         if edit.is_rich() {
             for (range, marks) in edit.inline_runs() {
@@ -217,7 +217,7 @@ impl View for TextField {
             .map(|(r, marks)| Node::measure_text(&display[r.start..byte.min(r.end)], &crate::inline::style(&primary, *marks)).w)
             .sum::<f32>();
         let caret_byte = match edit.preedit() {
-            Some(p) => map(caret) + if edit.is_secret() { 0 } else { shown_len(&p.text[..p.text.floor_char_boundary(p.cursor)], false, edit.is_rich()) },
+            Some(p) => map(caret) + if edit.is_secret() { 0 } else { shown_len(&p.text[..p.text.floor_char_boundary(p.cursor)], false, edit.shows_line_markers()) },
             None => map(edit.caret()),
         };
         let room = clip.x() + clip.w() - (rect.x() + space::SM) - CARET_W;

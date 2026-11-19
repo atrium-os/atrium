@@ -34,6 +34,7 @@ fresco-protocol = { path = "../fresco-protocol" }
 # Ctrl+P, caught before the window sees it.
 fresco-client = { path = "../fresco-client" }
 libc = "0.2"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 # What ships in the bundle: no debug info, symbols stripped.

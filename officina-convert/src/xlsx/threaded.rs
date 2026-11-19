@@ -47,15 +47,18 @@ fn xstring(value: &str) -> String {
 /// keeps its ID, and later occurrences get a fresh ID and updated parent links.
 pub(super) struct Export<'a> {
     pub(super) sheets: Vec<SheetIds>,
+    mention_ids: HashMap<(u128, usize), u128>,
     people: HashMap<&'a ThreadPerson, u128>,
 }
 
 impl<'a> Export<'a> {
     pub(super) fn new(wb: &'a Workbook) -> Self {
         let threads = (0..wb.sheet_count() as u16).flat_map(|s| wb.comments(s).values()).flat_map(|k| k.thread());
-        let mut reserved: HashSet<_> = threads.flat_map(|m| [m.id, m.author.id]).collect();
+        let mut reserved: HashSet<_> = threads.flat_map(|m| [m.id, m.author.id].into_iter().chain(m.mentions.iter().flat_map(|n| [n.id, n.person.id]))).collect();
         let mut seen_people = HashSet::new();
         let mut seen_messages = HashSet::new();
+        let mut seen_mentions = HashSet::new();
+        let mut mention_ids = HashMap::new();
         let mut next = 0x4000_8000_0000_0000_0000_u128;
         let mut allocate = |seen: &mut HashSet<_>, original| {
             if seen.insert(original) { return original; }
@@ -69,12 +72,17 @@ impl<'a> Export<'a> {
             wb.comments(s).iter().filter(|(_, k)| !k.thread().is_empty()).map(|(&cell, k)| {
                 let ids = k.thread().iter().map(|m| {
                     people.entry(m.author.as_ref()).or_insert_with(|| allocate(&mut seen_people, m.author.id));
-                    allocate(&mut seen_messages, m.id)
+                    let id = allocate(&mut seen_messages, m.id);
+                    for (index, mention) in m.mentions.iter().enumerate() {
+                        people.entry(mention.person.as_ref()).or_insert_with(|| allocate(&mut seen_people, mention.person.id));
+                        mention_ids.insert((id, index), allocate(&mut seen_mentions, mention.id));
+                    }
+                    id
                 }).collect();
                 (cell, ids)
             }).collect()
         }).collect();
-        Self { sheets, people }
+        Self { sheets, people, mention_ids }
     }
 
     pub(super) fn has_people(&self) -> bool {
@@ -111,7 +119,18 @@ impl<'a> Export<'a> {
                     let _ = write!(out, r#" dT="{}""#, crate::xml::esc(&m.timestamp));
                 }
                 if m.done { out.push_str(r#" done="1""#); }
-                let _ = write!(out, "><text>{}</text></threadedComment>", xstring(&m.text));
+                let _ = write!(out, "><text>{}</text>", xstring(&m.text));
+                if !m.mentions.is_empty() {
+                    out.push_str("<mentions>");
+                    for (index, mention) in m.mentions.iter().enumerate() {
+                        let start = m.text[..mention.start].encode_utf16().count();
+                        let length = m.text[mention.start..mention.end].encode_utf16().count();
+                        let _ = write!(out, r#"<mention mentionpersonId="{}" mentionId="{}" startIndex="{start}" length="{length}"/>"#,
+                            guid(self.people[mention.person.as_ref()]), guid(self.mention_ids[&(id, index)]));
+                    }
+                    out.push_str("</mentions>");
+                }
+                out.push_str("</threadedComment>");
             }
         }
         out.push_str("</ThreadedComments>");
@@ -127,7 +146,7 @@ mod read {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use officina_grid::comments::{Comment, ThreadMessage, MAX_COMMENTS, MAX_TEXT, MAX_THREAD_FIELD, MAX_THREAD_MESSAGES};
+    use officina_grid::comments::{Comment, ThreadMention, ThreadMessage, MAX_COMMENTS, MAX_MENTIONS, MAX_TEXT, MAX_THREAD_FIELD, MAX_THREAD_MESSAGES};
     use quick_xml::events::{BytesStart, Event};
 
     use super::*;
@@ -190,6 +209,7 @@ mod read {
         cell: Option<Cell>,
         message: ThreadMessage,
         text: String,
+        mentions: Vec<(u128, u128, u32, u32)>,
     }
 
     fn start(e: &BytesStart<'_>, people: &mut People, rep: &mut Report) -> Result<Option<Pending>, XlsxError> {
@@ -212,9 +232,9 @@ mod read {
             message: ThreadMessage {
                 id, parent: parent_id, author, timestamp: field(e, b"dT", rep)?,
                 done: attr(e, b"done")?.is_some_and(|v| matches!(v.as_str(), "1" | "true")),
-                text: "".into(),
+                text: "".into(), mentions: Arc::default(),
             },
-            text: String::new(),
+            text: String::new(), mentions: Vec::new(),
         }))
     }
 
@@ -224,10 +244,33 @@ mod read {
         pending.text.push_str(bounded(text, room, rep));
     }
 
-    fn finish(mut pending: Pending, rep: &mut Report) -> (Option<Cell>, ThreadMessage) {
+    fn finish(mut pending: Pending, people: &People, rep: &mut Report) -> (Option<Cell>, ThreadMessage) {
         let normal = pending.text.replace("\r\n", "\n").replace('\r', "\n");
         let text = decode_escapes(&normal);
         pending.message.text = bounded(&text, MAX_TEXT, rep).into();
+        let text = &pending.message.text;
+        if !pending.mentions.is_empty() {
+            // XLSX indices count UTF-16 code units. A split surrogate has no UTF-8 boundary.
+            let mut offsets = Vec::with_capacity(text.len() + 1);
+            for (start, ch) in text.char_indices() {
+                offsets.push(Some(start));
+                if ch.len_utf16() == 2 { offsets.push(None); }
+            }
+            offsets.push(Some(text.len()));
+            let mut ids = HashSet::new();
+            pending.message.mentions = pending.mentions.into_iter().filter_map(|(id, person, start, length)| {
+                let bounds = start.checked_add(length).and_then(|end| {
+                    Some(((*offsets.get(start as usize)?)?, (*offsets.get(end as usize)?)?))
+                });
+                if let (Some((start, end)), Some(person)) = (bounds, people.get(&person)) {
+                    if start < end && ids.insert(id) {
+                        return Some(ThreadMention { id, person: person.clone(), start, end });
+                    }
+                }
+                rep.note(Kind::Dropped, "threaded comment mentions with invalid ranges or people");
+                None
+            }).collect();
+        }
         (pending.cell, pending.message)
     }
 
@@ -235,19 +278,33 @@ mod read {
         let mut reader = xml(data);
         let mut pending = None;
         let mut in_text = false;
+        let mut in_mentions = false;
         let mut messages = Vec::new();
         loop {
             match reader.read_event()? {
                 Event::Start(e) if e.local_name().as_ref() == b"threadedComment" => {
                     pending = start(&e, people, rep)?;
                     in_text = false;
+                    in_mentions = false;
                 }
                 Event::Empty(e) if e.local_name().as_ref() == b"threadedComment" => {
-                    messages.extend(start(&e, people, rep)?.map(|p| finish(p, rep)));
+                    messages.extend(start(&e, people, rep)?.map(|p| finish(p, people, rep)));
                 }
                 Event::Start(e) if e.local_name().as_ref() == b"text" => in_text = true,
-                Event::Start(e) if e.local_name().as_ref() == b"mentions" && pending.is_some() => {
-                    rep.note(Kind::Dropped, "threaded comment mention metadata");
+                Event::Start(e) if e.local_name().as_ref() == b"mentions" => in_mentions = true,
+                Event::End(e) if e.local_name().as_ref() == b"mentions" => in_mentions = false,
+                Event::Start(e) | Event::Empty(e) if in_mentions && e.local_name().as_ref() == b"mention" => {
+                    if let Some(p) = pending.as_mut() {
+                        let id = attr(&e, b"mentionId")?.as_deref().and_then(parse_guid);
+                        let person = attr(&e, b"mentionpersonId")?.as_deref().and_then(parse_guid);
+                        let start = attr(&e, b"startIndex")?.and_then(|s| s.parse().ok());
+                        let length = attr(&e, b"length")?.and_then(|s| s.parse().ok());
+                        match (id, person, start, length) {
+                            (Some(id), Some(person), Some(start), Some(length)) if p.mentions.len() < MAX_MENTIONS =>
+                                p.mentions.push((id, person, start, length)),
+                            _ => rep.note(Kind::Dropped, "invalid or excessive threaded comment mentions"),
+                        }
+                    }
                 }
                 Event::Text(t) if in_text => {
                     if let Some(p) = pending.as_mut() {
@@ -263,7 +320,7 @@ mod read {
                 }
                 Event::End(e) if e.local_name().as_ref() == b"text" => in_text = false,
                 Event::End(e) if e.local_name().as_ref() == b"threadedComment" => {
-                    messages.extend(pending.take().map(|p| finish(p, rep)));
+                    messages.extend(pending.take().map(|p| finish(p, people, rep)));
                 }
                 Event::Eof => break,
                 _ => {}

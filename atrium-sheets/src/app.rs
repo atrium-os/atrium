@@ -301,6 +301,7 @@ pub struct Sheets {
     /// The comment bar: the cell it writes the comment of (sheet, row,
     /// column), and its field (lines shown joined by ¶).
     pub commenting: Mutable<Option<(u16, u32, u32)>>,
+    thread_edit: Mutable<Option<crate::comment::ThreadEdit>>,
     pub comment_text: Mutable<TextEdit>,
     /// The link bar: the cell it writes the link of, and its field.
     pub linking: Mutable<Option<(u16, u32, u32)>>,
@@ -327,7 +328,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -717,6 +718,7 @@ impl Sheets {
     /// A new document on screen, at its top left.
     pub fn replace(&self, doc: Doc) -> Doc {
         let old = std::mem::replace(&mut *self.doc.borrow_mut(), doc);
+        self.close_comment_bar();
         self.home();
         old
     }
@@ -845,13 +847,19 @@ impl Sheets {
         drop(d);
         self.renaming.set(false);
         self.coloring.set(false);
-        self.commenting.set(None);
+        self.close_comment_bar();
         self.linking.set(None);
         let mut ed = TextEdit::new(&format!("{}", now.round()));
         ed.select_all();
         self.size_text.set(ed);
         self.size_bar.set(Some((s, rows, lo, hi)));
         self.changed();
+    }
+
+    fn close_comment_bar(&self) {
+        self.commenting.set(None);
+        self.thread_edit.set(None);
+        self.comment_text.set(TextEdit::new(""));
     }
 
     pub fn tab_cmd(&self, c: crate::tabs::TabCmd) {
@@ -987,23 +995,35 @@ impl Sheets {
                 self.coloring.set(false);
                 self.changed();
             }
-            TabCmd::Commenting => {
+            TabCmd::Commenting | TabCmd::NewThread => {
+                let new_thread = matches!(c, TabCmd::NewThread);
                 let (r, c) = self.grid.get_cloned().cursor;
-                let mut doc = self.doc.borrow_mut();
+                let doc = self.doc.borrow();
                 let s = doc.sheet;
                 let comment = doc.wb.comment(s, r, c);
-                if comment.is_some_and(|c| !c.thread().is_empty()) {
-                    doc.status = "Imported comment threads can be viewed in the balloon.".into();
-                    drop(doc);
-                    self.changed();
-                    return;
-                }
-                let edit = crate::comment::edit(comment);
+                if new_thread && comment.is_some() { return; }
+                let thread_edit = (new_thread
+                    || comment.is_some_and(|c| !c.thread().is_empty()))
+                    .then(|| crate::comment::ThreadEdit { original: comment.cloned(), index: 0 });
+                let edit = thread_edit.as_ref().map_or_else(|| crate::comment::edit(comment), |t| t.open());
                 drop(doc);
+                self.thread_edit.set(thread_edit);
                 self.renaming.set(false);
                 self.coloring.set(false);
                 self.comment_text.set(edit);
                 self.commenting.set(Some((s, r, c)));
+                self.changed();
+            }
+            TabCmd::ThreadMessage(index) => {
+                let Some(mut thread) = self.thread_edit.get_cloned() else { return };
+                if self.commenting.get().is_none() || index > thread.messages().len()
+                    || !thread.unchanged(&self.comment_text.get_cloned())
+                {
+                    return;
+                }
+                thread.index = index;
+                self.comment_text.set(thread.open());
+                self.thread_edit.set(Some(thread));
                 self.changed();
             }
             TabCmd::CommentDone => {
@@ -1011,22 +1031,47 @@ impl Sheets {
                 let edit = self.comment_text.get_cloned();
                 let mut d = self.doc.borrow_mut();
                 let old = d.wb.comment(s, r, c).cloned();
-                let author = old.as_ref().map_or_else(comment_author, |k| k.author.to_string());
-                let new = crate::comment::save(&author, &edit);
-                if new != old {
+                let (label, new) = if let Some(thread) = self.thread_edit.get_cloned() {
+                    if thread.original != old {
+                        d.status = "The comment changed. Reopen the thread to edit it.".into();
+                        drop(d);
+                        self.close_comment_bar();
+                        self.changed();
+                        return;
+                    }
+                    if thread.index < thread.messages().len() && thread.unchanged(&edit) {
+                        ("Edit Thread Message", old.clone())
+                    } else {
+                        let Some(new) = thread.save(&edit) else {
+                            d.status = "Enter a message within the comment limits.".into();
+                            drop(d);
+                            self.changed();
+                            return;
+                        };
+                        let label = if old.is_none() { "New Comment Thread" }
+                            else if thread.index == thread.messages().len() { "Reply to Comment" }
+                            else { "Edit Thread Message" };
+                        (label, Some(new))
+                    }
+                } else {
+                    let author = old.as_ref().map_or_else(comment_author, |k| k.author.to_string());
+                    let new = crate::comment::save(&author, &edit);
                     let label = match (&old, &new) {
                         (None, _) => "New Comment",
                         (_, None) => "Delete Comment",
                         _ => "Edit Comment",
                     };
+                    (label, new)
+                };
+                if new != old {
                     d.run(label, vec![officina_grid::ops::GridOp::Comments { sheet: s, set: vec![(r, c, new)] }]);
                 }
                 drop(d);
-                self.commenting.set(None);
+                self.close_comment_bar();
                 self.changed();
             }
             TabCmd::CommentFormat(mark) => {
-                if self.commenting.get().is_some() {
+                if self.commenting.get().is_some() && self.thread_edit.get_cloned().is_none() {
                     let mut edit = self.comment_text.get_cloned();
                     if edit.toggle_emphasis(mark) {
                         self.comment_text.set(edit);
@@ -1035,7 +1080,7 @@ impl Sheets {
                 }
             }
             TabCmd::CommentCancel => {
-                self.commenting.set(None);
+                self.close_comment_bar();
                 self.changed();
             }
             TabCmd::Linking => {
@@ -1046,7 +1091,7 @@ impl Sheets {
                 };
                 self.renaming.set(false);
                 self.coloring.set(false);
-                self.commenting.set(None);
+                self.close_comment_bar();
                 let mut ed = TextEdit::new(&text);
                 ed.set_caret(ed.text().len(), false);
                 self.link_text.set(ed);
@@ -1223,6 +1268,41 @@ impl Sheets {
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, lw, 18.0), content: label, style: st });
             Button::primary("Keep").at(w - 160.0, y + 2.0).width(72.0).on_click(push(TabCmd::WarnKeep)).render(ctx);
             Button::secondary("Undo").at(w - 80.0, y + 2.0).width(72.0).on_click(push(TabCmd::WarnUndo)).render(ctx);
+            return;
+        }
+        if let (Some((_, r, c)), Some(thread)) = (self.commenting.get(), self.thread_edit.get_cloned()) {
+            let here = officina_grid::addr::a1(r, c);
+            let messages = thread.messages();
+            let current = messages.get(thread.index);
+            let label = match current {
+                Some(m) => format!("{} · {}/{} · {}", here, thread.index + 1, messages.len(), m.author.name),
+                None if messages.is_empty() => format!("New thread on {here}"),
+                None => format!("Reply on {here}"),
+            };
+            let st = crate::tabs::style(t.text_primary(), true);
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 186.0, 18.0), content: label, style: st });
+            let fw = (w - 452.0).max(88.0);
+            let cmds = self.cmds.clone();
+            TextField::new(self.comment_text.clone()).autofocus(true).at(200.0, y + 2.0).width(fw)
+                .on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
+            let x = 208.0 + fw;
+            if thread.unchanged(&self.comment_text.get_cloned()) {
+                if thread.index > 0 {
+                    Button::secondary("‹").at(x, y + 2.0).width(28.0).tooltip("Previous message")
+                        .on_click(push(TabCmd::ThreadMessage(thread.index - 1))).render(ctx);
+                }
+                if thread.index + 1 < messages.len() {
+                    Button::secondary("›").at(x + 32.0, y + 2.0).width(28.0).tooltip("Next message")
+                        .on_click(push(TabCmd::ThreadMessage(thread.index + 1))).render(ctx);
+                }
+                if current.is_some() && messages.len() < officina_grid::comments::MAX_THREAD_MESSAGES {
+                    Button::secondary("Reply").at(x + 64.0, y + 2.0).width(56.0)
+                        .on_click(push(TabCmd::ThreadMessage(messages.len()))).render(ctx);
+                }
+            }
+            Button::primary(if current.is_some() { "Save" } else { "Post" })
+                .at(x + 124.0, y + 2.0).width(56.0).on_click(push(TabCmd::CommentDone)).render(ctx);
+            Button::secondary("Cancel").at(x + 184.0, y + 2.0).width(64.0).on_click(push(TabCmd::CommentCancel)).render(ctx);
             return;
         }
         if let Some((_, r, c)) = self.commenting.get() {
@@ -2327,6 +2407,10 @@ impl Sheets {
                     self.tab_cmd(crate::tabs::TabCmd::Commenting);
                     false
                 }
+                Cmd::Data(crate::data::DataCmd::NewThread) => {
+                    self.tab_cmd(crate::tabs::TabCmd::NewThread);
+                    false
+                }
                 Cmd::Data(crate::data::DataCmd::Link) => {
                     self.tab_cmd(crate::tabs::TabCmd::Linking);
                     false
@@ -2335,7 +2419,7 @@ impl Sheets {
                     self.size_bar.set(None);
                     self.renaming.set(false);
                     self.coloring.set(false);
-                    self.commenting.set(None);
+                    self.close_comment_bar();
                     self.linking.set(None);
                     self.paste_bar.set(Some(officina_grid::clip::Special::of(officina_grid::clip::What::All)));
                     self.changed();
@@ -2625,7 +2709,7 @@ fn short_url(u: &str) -> String {
 }
 
 /// Who new comments are by: `$USER`, else "Me" (as Write writes them).
-fn comment_author() -> String {
+pub(crate) fn comment_author() -> String {
     std::env::var("USER").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "Me".into())
 }
 
@@ -3677,6 +3761,104 @@ mod tests {
     }
 
     #[test]
+    fn threads_can_be_posted_replied_to_edited_and_undone() {
+        use crate::data::DataCmd;
+        use crate::tabs::TabCmd;
+        use officina_grid::comments::{Comment, ThreadMention, ThreadPerson};
+
+        let (doc, _) = Doc::from_csv("t.csv", b"1\n").unwrap();
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::with_dirty(0, dirty.clone()), (1200.0, 800.0));
+        let mut app = App::new_with_flag(sheets.clone(), dirty);
+        let click = |app: &mut App<Sheets>, label: &str| {
+            app.tick();
+            let at = app.tree().iter().find_map(|(_, node)| match node {
+                Node::Text { content, rect, .. } if content == label =>
+                    Some(Point::new(rect.x() + rect.w() / 2.0, rect.y() + rect.h() / 2.0)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing button {label}"));
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            sheets.take_cmds();
+        };
+        let stored = || sheets.doc.borrow().wb.comment(0, 0, 0).cloned().unwrap();
+        let set_text = |text: &str| {
+            let mut edit = sheets.comment_text.get_cloned();
+            edit.set_text(text);
+            sheets.comment_text.set(edit);
+        };
+        sheets.cmds.lock().unwrap().push(Cmd::Data(DataCmd::NewThread));
+        sheets.take_cmds();
+        assert_eq!(sheets.commenting.get(), Some((0, 0, 0)));
+        set_text("🙂 @Bo please check");
+        sheets.tab_cmd(TabCmd::CommentDone);
+        let root = stored();
+        assert_eq!(root.thread()[0].text.as_ref(), "🙂 @Bo please check");
+        assert!(root.thread()[0].timestamp.ends_with('Z'));
+        assert!(sheets.doc.borrow_mut().undo());
+        assert!(sheets.doc.borrow().wb.comment(0, 0, 0).is_none());
+        assert!(sheets.doc.borrow_mut().redo());
+
+        // The same editor opens a message imported with a real person reference.
+        let mut thread = root.thread().to_vec();
+        thread[0].mentions = vec![ThreadMention {
+            id: 17, start: 5, end: 8,
+            person: Arc::new(ThreadPerson { id: 21, name: "Bo".into(), user_id: "bo@example.invalid".into(), provider_id: "PeoplePicker".into() }),
+        }].into();
+        let original = Comment::threaded(thread).unwrap();
+        sheets.doc.borrow_mut().wb.set_comments(0, vec![(0, 0, Some(original.clone()))]);
+
+        sheets.tab_cmd(TabCmd::Commenting);
+        let mut editor = sheets.comment_text.get_cloned();
+        editor.set_caret(0, false);
+        editor.insert("é ");
+        editor.set_caret(9, false);
+        editor.delete(false);
+        assert!(editor.tracked_ranges().is_empty());
+        assert!(editor.undo());
+        assert_eq!(editor.tracked_ranges(), &[(0, 8..11)]);
+        editor.set_caret(editor.text().len(), false);
+        editor.insert(" today");
+        sheets.comment_text.set(editor);
+        sheets.tab_cmd(TabCmd::CommentDone);
+        let edited = stored();
+        let message = &edited.thread()[0];
+        assert_eq!(message.text.as_ref(), "é 🙂 @Bo please check today");
+        assert_eq!(message.id, original.thread()[0].id);
+        assert_eq!(message.author, original.thread()[0].author);
+        assert_eq!(message.mentions[0].id, 17);
+        assert_eq!(message.mentions[0].person, original.thread()[0].mentions[0].person);
+        assert_eq!(&message.text[message.mentions[0].start..message.mentions[0].end], "@Bo");
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(stored(), original);
+        assert!(sheets.doc.borrow_mut().redo());
+
+        sheets.tab_cmd(TabCmd::Commenting);
+        click(&mut app, "Reply");
+        assert!(sheets.comment_text.get_cloned().text().is_empty());
+        set_text("Checked");
+        sheets.tab_cmd(TabCmd::CommentDone);
+        let replied = stored();
+        assert_eq!(replied.thread().len(), 2);
+        assert_eq!(replied.thread()[1].parent, Some(message.id));
+        assert_eq!(replied.thread()[1].author, message.author);
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(stored(), edited);
+        assert!(sheets.doc.borrow_mut().redo());
+
+        sheets.tab_cmd(TabCmd::Commenting);
+        sheets.tab_cmd(TabCmd::ThreadMessage(1));
+        assert_eq!(sheets.comment_text.get_cloned().text(), "Checked");
+        set_text("Checked twice");
+        sheets.tab_cmd(TabCmd::CommentDone);
+        assert_eq!(stored().thread()[1].text.as_ref(), "Checked twice");
+        assert_eq!(stored().thread()[1].id, replied.thread()[1].id);
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(stored(), replied);
+    }
+
+    #[test]
     fn imported_threads_can_be_deleted_and_undone_without_flattening() {
         use crate::data::DataCmd;
         use crate::tabs::TabCmd;
@@ -3685,14 +3867,16 @@ mod tests {
         let (mut doc, _) = Doc::from_csv("t.csv", b"1\n").unwrap();
         let author = Arc::new(ThreadPerson { id: 1, name: "Ana".into(), user_id: "ana".into(), provider_id: "".into() });
         let note = Comment::threaded(vec![
-            ThreadMessage { id: 2, parent: None, author: author.clone(), timestamp: "".into(), done: false, text: "Root".into() },
-            ThreadMessage { id: 3, parent: Some(2), author, timestamp: "".into(), done: false, text: "Reply".into() },
+            ThreadMessage { id: 2, parent: None, author: author.clone(), timestamp: "".into(), done: false, text: "Root".into(), mentions: Default::default() },
+            ThreadMessage { id: 3, parent: Some(2), author, timestamp: "".into(), done: false, text: "Reply".into(), mentions: Default::default() },
         ]).unwrap();
         doc.wb.set_comments(0, vec![(0, 0, Some(note.clone()))]);
         let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.tab_cmd(TabCmd::Commenting);
-        assert!(sheets.commenting.get().is_none());
+        assert_eq!(sheets.commenting.get(), Some((0, 0, 0)));
+        assert_eq!(sheets.comment_text.get_cloned().text(), "Root");
+        sheets.tab_cmd(TabCmd::CommentCancel);
         assert_eq!(sheets.doc.borrow().wb.comment(0, 0, 0), Some(&note));
         sheets.cmds.lock().unwrap().push(Cmd::Data(DataCmd::DeleteComments));
         sheets.take_cmds();

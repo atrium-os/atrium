@@ -26,6 +26,91 @@ pub fn save(author: &str, edit: &TextEdit) -> Option<Comment> {
     Some(Comment::with_runs(author, text, runs))
 }
 
+/// Snapshot of the thread being edited, so a stale bar cannot replace edits
+/// made by undo, a row operation, or another command.
+#[derive(Clone)]
+pub(crate) struct ThreadEdit {
+    pub original: Option<Comment>,
+    pub index: usize,
+}
+
+impl ThreadEdit {
+    pub fn messages(&self) -> &[officina_grid::comments::ThreadMessage] {
+        self.original.as_ref().map_or(&[], Comment::thread)
+    }
+
+    pub fn open(&self) -> TextEdit {
+        let Some(message) = self.messages().get(self.index) else { return TextEdit::marked_lines(""); };
+        TextEdit::marked_lines(&message.text).with_tracked_ranges(
+            message.mentions.iter().enumerate().map(|(i, m)| (i, m.start..m.end)),
+        )
+    }
+
+    pub fn unchanged(&self, edit: &TextEdit) -> bool {
+        let Some(message) = self.messages().get(self.index) else { return edit.text().is_empty(); };
+        message.text.as_ref() == edit.text() && message.mentions.iter().enumerate()
+            .map(|(i, m)| (i, m.start..m.end)).eq(edit.tracked_ranges().iter().cloned())
+    }
+
+    pub fn save(&self, edit: &TextEdit) -> Option<Comment> {
+        use officina_grid::comments::{ThreadMessage, MAX_TEXT};
+
+        let text = edit.text();
+        if text.trim().is_empty() || text.len() > MAX_TEXT { return None; }
+        let mut messages = self.messages().to_vec();
+        if let Some(message) = messages.get_mut(self.index) {
+            message.text = text.into();
+            message.mentions = edit.tracked_ranges().iter().filter_map(|(i, range)| {
+                let mut mention = message.mentions.get(*i)?.clone();
+                mention.start = range.start;
+                mention.end = range.end;
+                Some(mention)
+            }).collect();
+        } else {
+            messages.push(ThreadMessage {
+                id: uuid::Uuid::new_v4().as_u128(),
+                parent: messages.first().map(|m| m.id),
+                author: local_author(),
+                timestamp: timestamp().into(),
+                done: false,
+                text: text.into(),
+                mentions: Default::default(),
+            });
+        }
+        Comment::threaded(messages)
+    }
+}
+
+fn local_author() -> std::sync::Arc<officina_grid::comments::ThreadPerson> {
+    use officina_grid::comments::{ThreadPerson, MAX_THREAD_FIELD};
+    use std::sync::{Arc, OnceLock};
+
+    static AUTHOR: OnceLock<Arc<ThreadPerson>> = OnceLock::new();
+    AUTHOR.get_or_init(|| {
+        let name = super::app::comment_author();
+        let name = &name[..name.floor_char_boundary(MAX_THREAD_FIELD.min(name.len()))];
+        Arc::new(ThreadPerson {
+            id: uuid::Uuid::new_v4().as_u128(),
+            name: name.into(),
+            user_id: name.into(),
+            provider_id: "None".into(),
+        })
+    }).clone()
+}
+
+fn timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else { return String::new(); };
+    let Ok(seconds) = libc::time_t::try_from(elapsed.as_secs()) else { return String::new(); };
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // gmtime_r initializes tm on success.
+    if unsafe { libc::gmtime_r(&seconds, tm.as_mut_ptr()) }.is_null() { return String::new(); }
+    let tm = unsafe { tm.assume_init() };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", tm.tm_year + 1900, tm.tm_mon + 1,
+        tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 pub type Line<'a> = Vec<(&'a str, u8)>;
 
 pub fn wrap<'a>(comment: &'a Comment, base: &TextStyle, width: f32, max: usize) -> Vec<Line<'a>> {

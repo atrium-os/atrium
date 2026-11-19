@@ -79,7 +79,7 @@ Second sheet</t></r></text>"#);
 /// Real XLSX relationships, including a reply ahead of its parent without a
 /// ref and a root whose legacy placeholder supplies the authoritative cell.
 #[test]
-fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
+fn threaded_comments_preserve_authors_replies_and_mentions_through_native_and_xlsx() {
     let mut wb = book();
     wb.add_sheet("Thread only").unwrap();
     let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
@@ -92,6 +92,8 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
     let other = "{AAAAAAAA-0000-4000-8000-000000000004}";
     let ana = "{BBBBBBBB-0000-4000-8000-000000000001}";
     let bo = "{BBBBBBBB-0000-4000-8000-000000000002}";
+    let mentioned = "{BBBBBBBB-0000-4000-8000-000000000003}";
+    let mention_id = "{CCCCCCCC-0000-4000-8000-000000000001}";
     let ns = "http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments";
     for e in &z.entries {
         let mut data = z.read(e).unwrap();
@@ -112,10 +114,10 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
         w.add(&e.name, &data).unwrap();
     }
     w.add("xl/worksheets/_rels/sheet3.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}</Relationships>"#, rel("rIdTc", "threadedComment", "../threadedComments/threadedComment3.xml")).as_bytes()).unwrap();
-    w.add("xl/persons/person.xml", format!(r#"<personList xmlns="{ns}"><person id="{ana}" displayName="Ana Ruiz" userId="ana@example.invalid" providerId="AD"/><person id="{bo}" displayName="Bo Chen" userId="bo&#9;team" providerId="None"/></personList>"#).as_bytes()).unwrap();
+    w.add("xl/persons/person.xml", format!(r#"<personList xmlns="{ns}"><person id="{ana}" displayName="Ana Ruiz" userId="ana@example.invalid" providerId="AD"/><person id="{bo}" displayName="Bo Chen" userId="bo&#9;team" providerId="None"/><person id="{mentioned}" displayName="Chloé" userId="chloe@example.invalid" providerId="PeoplePicker"/></personList>"#).as_bytes()).unwrap();
     w.add("xl/threadedComments/threadedComment1.xml", format!(r#"<ThreadedComments xmlns="{ns}">
     <threadedComment id="{reply}" parentId="{root}" personId="{bo}" dT="2026-11-18T10:05:00Z"><text>Yes &amp; fixed.</text></threadedComment>
-    <threadedComment ref="C2" id="{root}" personId="{ana}" dT="2026-11-18T10:00:00Z" done="1"><text>Is this right?</text></threadedComment>
+    <threadedComment ref="C2" id="{root}" personId="{ana}" dT="2026-11-18T10:00:00Z" done="1"><text>🙂 @Chloé, is this right?</text><mentions><mention mentionpersonId="{mentioned}" mentionId="{mention_id}" startIndex="3" length="6"/></mentions></threadedComment>
     <threadedComment ref="B2" id="{nested}" parentId="{reply}" personId="{ana}"><text> Thanks! _x005F_x000D_ </text></threadedComment>
     </ThreadedComments>"#).as_bytes()).unwrap();
     w.add("xl/threadedComments/threadedComment3.xml", format!(r#"<ThreadedComments xmlns="{ns}"><threadedComment ref="C3" id="{other}" personId="{bo}"><text><![CDATA[Without a legacy note.]]></text></threadedComment></ThreadedComments>"#).as_bytes()).unwrap();
@@ -123,7 +125,7 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
     let (imported, report) = officina_convert::xlsx::read(&w.finish().unwrap()).unwrap();
     assert!(report.report.is_empty(), "{report:?}");
     let k = imported.comment(0, 1, 1).unwrap();
-    assert_eq!((&*k.author, &*k.text), ("Ana Ruiz", "Is this right?\n\nBo Chen: Yes & fixed.\n\nAna Ruiz:  Thanks! _x000D_ "));
+    assert_eq!((&*k.author, &*k.text), ("Ana Ruiz", "🙂 @Chloé, is this right?\n\nBo Chen: Yes & fixed.\n\nAna Ruiz:  Thanks! _x000D_ "));
     assert!(imported.comment(0, 1, 2).is_none());
     let [head, child, grandchild] = k.thread() else { panic!("expected three messages") };
     assert_eq!((&*head.author.name, &*child.author.name, &*grandchild.author.name), ("Ana Ruiz", "Bo Chen", "Ana Ruiz"));
@@ -133,6 +135,11 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
     assert_eq!(grandchild.parent, Some(child.id));
     assert_eq!(&*child.timestamp, "2026-11-18T10:05:00Z");
     assert!(head.done);
+    let [mention] = head.mentions.as_ref() else { panic!("expected a mention") };
+    assert_eq!(&head.text[mention.start..mention.end], "@Chloé");
+    assert_eq!((&*mention.person.name, &*mention.person.user_id, &*mention.person.provider_id),
+        ("Chloé", "chloe@example.invalid", "PeoplePicker"));
+    assert_eq!(mention.id, 0xCCCCCCCC_0000_4000_8000_000000000001);
     assert_eq!(imported.comment(2, 2, 2).unwrap().thread()[0].text.as_ref(), "Without a legacy note.");
     assert_eq!(imported.comment(0, 4, 3).unwrap().text.as_ref(), "Fill in by Friday");
 
@@ -156,7 +163,10 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
     let legacy = part("xl/comments1.xml");
     assert!(legacy.contains(&format!("<author>tc={root}</author>")) && legacy.contains(&format!(r#"xr:uid="{root}""#)));
     let people = part("xl/persons/person.xml");
-    assert_eq!(people.matches("<person ").count(), 2);
+    assert_eq!(people.matches("<person ").count(), 3);
+    assert!(part("xl/threadedComments/threadedComment1.xml").contains(&format!(
+        r#"mentionpersonId="{mentioned}" mentionId="{mention_id}" startIndex="3" length="6""#
+    )));
     let (back, report) = officina_convert::xlsx::read(&x).unwrap();
     assert!(report.report.is_empty(), "{report:?}");
     for s in 0..3 {
@@ -175,6 +185,10 @@ fn threaded_comments_preserve_authors_and_replies_through_native_and_xlsx() {
     assert_eq!(copied_child.parent, Some(copied_head.id));
     assert_eq!(copied_grandchild.parent, Some(copied_child.id));
     assert_eq!(copied_child.author, child.author);
+    let copied_mention = &copied_head.mentions[0];
+    assert_ne!(copied_mention.id, mention.id);
+    assert_eq!(copied_mention.person, mention.person);
+    assert_eq!(&copied_head.text[copied_mention.start..copied_mention.end], "@Chloé");
 }
 
 /// LibreOffice opens our file and saves it as the other format; we read that.

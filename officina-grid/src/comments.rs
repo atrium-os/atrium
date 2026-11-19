@@ -57,6 +57,17 @@ pub struct ThreadPerson {
     pub provider_id: Arc<str>,
 }
 
+/// A person reference over a UTF-8 byte range of a thread message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadMention {
+    pub id: u128,
+    pub person: Arc<ThreadPerson>,
+    pub start: usize,
+    pub end: usize,
+}
+
+pub const MAX_MENTIONS: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadMessage {
     pub id: u128,
@@ -65,6 +76,7 @@ pub struct ThreadMessage {
     pub timestamp: Arc<str>,
     pub done: bool,
     pub text: Arc<str>,
+    pub mentions: Arc<[ThreadMention]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +135,13 @@ impl Comment {
             {
                 return None;
             }
+            if message.mentions.len() > MAX_MENTIONS || message.mentions.iter().any(|m| {
+                m.start >= m.end || message.text.get(m.start..m.end).is_none()
+                    || [&m.person.name, &m.person.user_id, &m.person.provider_id].into_iter()
+                        .any(|field| field.len() > MAX_THREAD_FIELD)
+            }) {
+                return None;
+            }
         }
         let mut view = root.text.to_string();
         for reply in &messages[1..] {
@@ -147,6 +166,8 @@ impl Comment {
         let thread = self.thread.iter().map(|m| {
             160 + m.text.len() + m.timestamp.len() + m.author.name.len()
                 + m.author.user_id.len() + m.author.provider_id.len()
+                + m.mentions.iter().map(|m| 96 + m.person.name.len() + m.person.user_id.len()
+                    + m.person.provider_id.len()).sum::<usize>()
         }).sum::<usize>();
         (64 + self.author.len() + self.text.len() + std::mem::size_of_val(self.runs()) + thread) as u64
     }
@@ -193,8 +214,9 @@ pub fn encode(w: &mut Writer, set: &[(u32, u32, Option<Comment>)]) {
         w.var(*c as u64);
         match k {
             Some(k) if !k.thread.is_empty() => {
-                w.u8(3);
-                encode_thread(w, k.thread());
+                let mentions = k.thread().iter().any(|m| !m.mentions.is_empty());
+                w.u8(if mentions { 4 } else { 3 });
+                encode_thread(w, k.thread(), mentions);
             }
             Some(k) => {
                 w.u8(if k.runs.is_empty() { 1 } else { 2 });
@@ -248,7 +270,7 @@ pub fn decode(r: &mut Reader) -> Result<Vec<(u32, u32, Option<Comment>)>, WireEr
                     Some(Comment::with_runs(author, text, runs))
                 }
             }
-            3 => Some(decode_thread(r)?),
+            kind @ (3 | 4) => Some(decode_thread(r, kind == 4)?),
             _ => return Err(WireError::Invalid("comment")),
         };
         v.push((row as u32, col as u32, k));
@@ -256,40 +278,55 @@ pub fn decode(r: &mut Reader) -> Result<Vec<(u32, u32, Option<Comment>)>, WireEr
     Ok(v)
 }
 
-fn encode_thread(w: &mut Writer, messages: &[ThreadMessage]) {
+fn encode_thread(w: &mut Writer, messages: &[ThreadMessage], mentions: bool) {
     fn id(w: &mut Writer, id: u128) {
         w.u64(id as u64);
         w.u64((id >> 64) as u64);
+    }
+    fn person(w: &mut Writer, p: &ThreadPerson) {
+        id(w, p.id);
+        w.str(&p.name);
+        w.str(&p.user_id);
+        w.str(&p.provider_id);
     }
     w.var(messages.len() as u64);
     for message in messages {
         id(w, message.id);
         if let Some(parent) = message.parent { id(w, parent); }
-        id(w, message.author.id);
-        w.str(&message.author.name);
-        w.str(&message.author.user_id);
-        w.str(&message.author.provider_id);
+        person(w, &message.author);
         w.str(&message.timestamp);
         w.u8(u8::from(message.done));
         w.str(&message.text);
+        if mentions {
+            w.var(message.mentions.len() as u64);
+            for mention in message.mentions.iter() {
+                id(w, mention.id);
+                person(w, &mention.person);
+                w.var(mention.start as u64);
+                w.var(mention.end as u64);
+            }
+        }
     }
 }
 
-fn decode_thread(r: &mut Reader) -> Result<Comment, WireError> {
+fn decode_thread(r: &mut Reader, has_mentions: bool) -> Result<Comment, WireError> {
     fn id(r: &mut Reader) -> Result<u128, WireError> {
         Ok(r.u64()? as u128 | ((r.u64()? as u128) << 64))
+    }
+    fn person(r: &mut Reader) -> Result<Arc<ThreadPerson>, WireError> {
+        Ok(Arc::new(ThreadPerson {
+            id: id(r)?,
+            name: r.str("thread author", MAX_THREAD_FIELD as u64)?.into(),
+            user_id: r.str("thread user ID", MAX_THREAD_FIELD as u64)?.into(),
+            provider_id: r.str("thread provider ID", MAX_THREAD_FIELD as u64)?.into(),
+        }))
     }
     let n = r.count("thread messages", MAX_THREAD_MESSAGES as u64, 38)?;
     let mut messages = Vec::with_capacity(n);
     for i in 0..n {
         let message_id = id(r)?;
         let parent = (i != 0).then(|| id(r)).transpose()?;
-        let author = Arc::new(ThreadPerson {
-            id: id(r)?,
-            name: r.str("thread author", MAX_THREAD_FIELD as u64)?.into(),
-            user_id: r.str("thread user ID", MAX_THREAD_FIELD as u64)?.into(),
-            provider_id: r.str("thread provider ID", MAX_THREAD_FIELD as u64)?.into(),
-        });
+        let author = person(r)?;
         let timestamp = r.str("thread timestamp", MAX_THREAD_FIELD as u64)?.into();
         let done = match r.u8()? {
             0 => false,
@@ -297,7 +334,20 @@ fn decode_thread(r: &mut Reader) -> Result<Comment, WireError> {
             _ => return Err(WireError::Invalid("thread resolution")),
         };
         let text = r.str("thread text", MAX_TEXT as u64)?.into();
-        messages.push(ThreadMessage { id: message_id, parent, author, timestamp, done, text });
+        let mut mentions = Vec::new();
+        if has_mentions {
+            let count = r.count("thread mentions", MAX_MENTIONS as u64, 37)?;
+            for _ in 0..count {
+                let id = id(r)?;
+                let person = person(r)?;
+                let (start, end) = (r.var()?, r.var()?);
+                if start >= end || end > MAX_TEXT as u64 {
+                    return Err(WireError::Invalid("thread mention range"));
+                }
+                mentions.push(ThreadMention { id, person, start: start as usize, end: end as usize });
+            }
+        }
+        messages.push(ThreadMessage { id: message_id, parent, author, timestamp, done, text, mentions: mentions.into() });
     }
     Comment::threaded(messages).ok_or(WireError::Invalid("comment thread"))
 }
