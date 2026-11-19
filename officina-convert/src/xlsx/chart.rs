@@ -55,6 +55,8 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
         let mut anchor_kind: &[u8] = b"";
         let mut picture = None;
         let mut in_picture = false;
+        let mut crop = [0; 4];
+        let mut rotation = 0;
         let mut chart: Option<String> = None;
         let mut other = false;
         loop {
@@ -68,6 +70,8 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         };
                         picture = None;
                         in_picture = false;
+                        crop = [0; 4];
+                        rotation = 0;
                         corner = 0;
                         field = None;
                         chart = None;
@@ -94,6 +98,21 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                         }
                     }
                     b"pic" if !anchor_kind.is_empty() => in_picture = true,
+                    b"srcRect" if in_picture => {
+                        for (inset, side) in crop.iter_mut().zip([b"l", b"t", b"r", b"b"]) {
+                            if let Some(value) = attr(&e, side)? {
+                                *inset = if let Some(percent) = value.strip_suffix('%') {
+                                    percent.parse::<f64>().ok().filter(|n| n.is_finite())
+                                        .map_or(0, |n| (n * 1000.0).round() as i32)
+                                } else {
+                                    value.parse::<i32>().unwrap_or(0)
+                                }.clamp(-1_000_000, 1_000_000);
+                            }
+                        }
+                    }
+                    b"xfrm" if in_picture => {
+                        rotation = attr(&e, b"rot")?.and_then(|n| n.parse::<i32>().ok()).unwrap_or(0);
+                    }
                     b"blip" if in_picture => {
                         if let Some(id) = attr(&e, b"embed")? {
                             picture = drels.get(&id).filter(|(ty, _)| ty.ends_with("/image")).map(|(_, p)| p.clone());
@@ -143,7 +162,7 @@ pub(crate) fn read_sheet(wb: &mut Workbook, sheet: u16, z: &Archive, part: &str,
                                 _ => None,
                             };
                             if bytes.is_none_or(|bytes| wb.add_picture(officina_grid::charts::Picture {
-                                anchor, bytes: Arc::from(bytes),
+                                anchor, bytes: Arc::from(bytes), crop, rotation,
                             }).is_err()) {
                                 rep.note(Kind::Dropped, "missing, oversized or unsupported pictures (embedded PNG and JPEG supported)");
                             }
@@ -567,9 +586,12 @@ pub(crate) fn drawing_xml(wb: &Workbook, ids: &[usize], pictures: &[usize]) -> S
         );
     }
     for (j, &i) in pictures.iter().enumerate() {
-        anchor(&mut o, wb.pictures()[i].anchor);
+        let picture = &wb.pictures()[i];
+        anchor(&mut o, picture.anchor);
+        let [l, t, r, b] = picture.crop;
+        let rotation = picture.rotation;
         let id = ids.len() + j + 2;
-        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdPic{j}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
+        let _ = write!(o, r#"<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{id}" name="Picture {id}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="rIdPic{j}"/><a:srcRect l="{l}" t="{t}" r="{r}" b="{b}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm rot="{rotation}"/><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor>"#);
     }
     o.push_str("</xdr:wsDr>");
     o

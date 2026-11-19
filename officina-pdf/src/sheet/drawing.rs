@@ -20,17 +20,36 @@ pub(super) fn paint<W: Write>(
     for (id, drawing) in drawings.iter().enumerate() {
         let [x, y, w, h] = drawing.bounds;
         let (x, y, w, h) = (tile.origin[0] + x * k, tile.origin[1] + y * k, w * k, h * k);
-        let (x0, y0) = (x.max(left), y.max(top));
-        let (x1, y1) = ((x + w).min(left + width), (y + h).min(top + height));
+        let [bx, by, bw, bh] = drawing.paint_bounds();
+        let (bx, by) = (tile.origin[0] + bx * k, tile.origin[1] + by * k);
+        let (x0, y0) = (bx.max(left), by.max(top));
+        let (x1, y1) = ((bx + bw * k).min(left + width), (by + bh * k).min(top + height));
         if x0 >= x1 || y0 >= y1 {
             continue;
         }
         page.c.extend([Op::Save, Op::Rect(x0, ph - y1, x1 - x0, y1 - y0), Op::Clip, Op::EndPath]);
         match &drawing.content {
-            DrawingContent::Picture(bytes) => {
-                let name = pdf.picture(page, id as u64, || Some(bytes.to_vec()))?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Could not decode a picture in the print area"))?;
-                page.c.extend([Op::Transform([w, 0.0, 0.0, h, x, ph - y - h]), Op::XObject(name)]);
+            DrawingContent::Picture { bytes, crop, .. } => {
+                let [l, t, r, b] = crop.map(i64::from);
+                let (visible_w, visible_h) = (100_000 - l - r, 100_000 - t - b);
+                if visible_w > 0 && visible_h > 0 {
+                    let name = pdf.picture(page, id as u64, || Some(bytes.to_vec()))?
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Could not decode a picture in the print area"))?;
+                    let (sin, cos) = drawing.rotation();
+                    let (sx, sy) = (w / visible_w as f64, h / visible_h as f64);
+                    // Local picture coordinates point down. Rotate about the center
+                    // while mapping to the PDF coordinate system, which points up.
+                    let (cx, cy) = (x + w / 2.0, ph - y - h / 2.0);
+                    page.c.extend([
+                        Op::Transform([cos, -sin, -sin, -cos,
+                            cx - cos * w / 2.0 + sin * h / 2.0,
+                            cy + sin * w / 2.0 + cos * h / 2.0]),
+                        Op::Rect(0.0, 0.0, w, h), Op::Clip, Op::EndPath,
+                        Op::Transform([100_000.0 * sx, 0.0, 0.0, -100_000.0 * sy,
+                            -(l as f64) * sx, (100_000 - t) as f64 * sy]),
+                        Op::XObject(name),
+                    ]);
+                }
             }
             DrawingContent::Chart(prims) => {
                 let point = |a: f32, b: f32| (x + f64::from(a) * k, ph - y - f64::from(b) * k);

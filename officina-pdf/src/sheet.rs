@@ -147,7 +147,33 @@ pub struct Drawing {
 
 pub enum DrawingContent {
     Chart(Vec<officina_draw::chart::Prim>),
-    Picture(std::sync::Arc<[u8]>),
+    Picture { bytes: std::sync::Arc<[u8]>, crop: [i32; 4], rotation: i32 },
+}
+
+impl Drawing {
+    /// Axis-aligned bounds of the drawing after rotation, in sheet pixels.
+    pub fn paint_bounds(&self) -> [f64; 4] {
+        let [x, y, w, h] = self.bounds;
+        if w <= 0.0 || h <= 0.0 {
+            return [x, y, 0.0, 0.0];
+        }
+        let (sin, cos) = self.rotation();
+        let width = w * cos.abs() + h * sin.abs();
+        let height = w * sin.abs() + h * cos.abs();
+        [x + (w - width) / 2.0, y + (h - height) / 2.0, width, height]
+    }
+
+    fn rotation(&self) -> (f64, f64) {
+        let DrawingContent::Picture { rotation, .. } = &self.content else { return (0.0, 1.0) };
+        let angle = rotation.rem_euclid(360 * 60_000);
+        match angle {
+            0 => (0.0, 1.0),
+            5_400_000 => (1.0, 0.0),
+            10_800_000 => (0.0, -1.0),
+            16_200_000 => (-1.0, 0.0),
+            _ => (f64::from(angle) / 60_000.0).to_radians().sin_cos(),
+        }
+    }
 }
 
 mod drawing;

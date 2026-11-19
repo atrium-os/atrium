@@ -87,6 +87,10 @@ pub struct Anchor {
 pub struct Picture {
     pub anchor: Anchor,
     pub bytes: Arc<[u8]>,
+    /// Source insets in thousandths of a percent: left, top, right, bottom.
+    pub crop: [i32; 4],
+    /// Clockwise rotation about the anchor's center, in 1/60,000 degrees.
+    pub rotation: i32,
 }
 
 pub const MAX_PICTURE_BYTES: usize = 16 * 1024 * 1024;
@@ -94,7 +98,19 @@ pub const MAX_PICTURES: usize = 256;
 // Leave room for anchors and lengths in a journal record.
 pub(crate) const MAX_PICTURE_TOTAL: usize = (64 << 20) - (MAX_PICTURES * 64);
 
+// Picture records originally started with an unflagged sheet index.
+const PICTURE_TRANSFORM: u16 = 1 << 15;
+
 impl Picture {
+    fn has_transform(&self) -> bool {
+        self.crop != [0; 4] || self.rotation != 0
+    }
+
+    // There is already room for the anchor and image length in the budget.
+    fn transform_reserve(&self) -> usize {
+        if self.has_transform() { 16 } else { 0 }
+    }
+
     /// The extension used when saving the embedded bytes to XLSX.
     pub fn extension(bytes: &[u8]) -> Option<&'static str> {
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -107,24 +123,40 @@ impl Picture {
     }
 
     pub(crate) fn encode(&self, w: &mut Writer) {
-        w.u16(self.anchor.sheet);
+        let transformed = self.has_transform();
+        w.u16(self.anchor.sheet | if transformed { PICTURE_TRANSFORM } else { 0 });
         for (row, col, x, y) in [self.anchor.from, self.anchor.to] {
             w.u32(row);
             w.u32(col);
             w.f64(f64::from(x));
             w.f64(f64::from(y));
         }
+        if transformed {
+            for inset in self.crop {
+                w.ivar(i64::from(inset));
+            }
+            w.ivar(i64::from(self.rotation));
+        }
         w.bytes(&self.bytes);
     }
 
     pub(crate) fn decode(r: &mut Reader, limit: usize) -> Result<Self, WireError> {
-        let sheet = r.u16()?;
+        let flags = r.u16()?;
+        let sheet = flags & !PICTURE_TRANSFORM;
         let mut corner = || -> Result<_, WireError> {
             Ok((r.u32()?, r.u32()?, r.f64()? as f32, r.f64()? as f32))
         };
         let anchor = Anchor { sheet, from: corner()?, to: corner()? };
+        let (mut crop, mut rotation) = ([0; 4], 0);
+        if flags & PICTURE_TRANSFORM != 0 {
+            let mut coordinate = || i32::try_from(r.ivar()?).map_err(|_| WireError::Invalid("picture transform"));
+            for inset in &mut crop {
+                *inset = coordinate()?;
+            }
+            rotation = coordinate()?;
+        }
         let bytes = Arc::from(r.bytes("picture", limit.min(MAX_PICTURE_BYTES) as u64)?);
-        Ok(Self { anchor, bytes })
+        Ok(Self { anchor, bytes, crop, rotation })
     }
 }
 
@@ -135,14 +167,21 @@ impl Workbook {
 
     /// Whether there is room for another embedded picture of this size.
     pub fn can_add_picture(&self, size: usize) -> bool {
+        self.has_picture_room(size, 0)
+    }
+
+    fn has_picture_room(&self, size: usize, transform_reserve: usize) -> bool {
         self.pictures.len() < MAX_PICTURES
             && (1..=MAX_PICTURE_BYTES).contains(&size)
-            && self.pictures.iter().map(|p| p.bytes.len()).sum::<usize>() <= MAX_PICTURE_TOTAL - size
+            && self.pictures.iter().map(|p| p.bytes.len() + p.transform_reserve()).sum::<usize>()
+                <= MAX_PICTURE_TOTAL - size - transform_reserve
     }
 
     pub fn add_picture(&mut self, picture: Picture) -> Result<(), &'static str> {
         let a = picture.anchor;
-        if !self.can_add_picture(picture.bytes.len()) || Picture::extension(&picture.bytes).is_none()
+        if !self.has_picture_room(picture.bytes.len(), picture.transform_reserve())
+            || Picture::extension(&picture.bytes).is_none()
+            || picture.crop.iter().any(|inset| !(-1_000_000..=1_000_000).contains(inset))
             || a.sheet as usize >= self.sheet_count()
             || [a.from, a.to].iter().any(|&(r, c, x, y)| {
                 r >= MAX_ROWS || c >= MAX_COLS || !(0.0..=1e6).contains(&x) || !(0.0..=1e6).contains(&y)

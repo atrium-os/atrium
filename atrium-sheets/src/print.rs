@@ -128,9 +128,14 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
             true
         };
         for picture in d.wb.pictures().iter().filter(|p| p.anchor.sheet == d.sheet) {
-            let bounds = bounds(picture.anchor);
-            if include(bounds) {
-                drawings.push(Drawing { bounds, content: DrawingContent::Picture(picture.bytes.clone()) });
+            let drawing = Drawing {
+                bounds: bounds(picture.anchor),
+                content: DrawingContent::Picture {
+                    bytes: picture.bytes.clone(), crop: picture.crop, rotation: picture.rotation,
+                },
+            };
+            if include(drawing.paint_bounds()) {
+                drawings.push(drawing);
             }
         }
         for chart in d.wb.charts().iter().filter(|c| c.anchor.sheet == d.sheet) {
@@ -269,17 +274,24 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
         {
             let mut d = doc.borrow_mut();
-            d.wb.add_picture(Picture { anchor, bytes: bytes.clone() }).unwrap();
+            d.wb.add_picture(Picture { anchor, bytes: bytes.clone(), crop: [25_000, 0, 0, 0], rotation: 5_400_000 }).unwrap();
             let package = officina_convert::xlsx::write(&d.wb, Vec::new()).unwrap();
             let (imported, _) = officina_convert::xlsx::read(&package).unwrap();
             d.wb = native::load(&native::save_to_vec(&imported)).unwrap();
             assert_eq!(d.wb.pictures()[0].anchor, anchor);
             assert_eq!(d.wb.pictures()[0].bytes, bytes);
+            assert_eq!(d.wb.pictures()[0].crop, [25_000, 0, 0, 0]);
+            assert_eq!(d.wb.pictures()[0].rotation, 5_400_000);
         }
         let page = snapshot(&doc).unwrap();
         assert!(page.cells.iter().all(Option::is_none));
         assert_eq!(page.cols.len(), 5);
         assert_eq!(page.drawings[0].bounds[2..], [64.0, 40.0]);
+        assert_eq!(page.drawings[0].paint_bounds()[2..], [40.0, 64.0]);
+
+        // Only the part swung above the original anchor enters this area.
+        doc.borrow_mut().wb.define_name("_xlnm.Print_Area", Some(0), "=$A$8:$J$8").unwrap();
+        assert_eq!(snapshot(&doc).unwrap().drawings.len(), 1);
 
         doc.borrow_mut().wb.define_name("_xlnm.Print_Area", Some(0), "=$A$1:$B$3").unwrap();
         assert!(snapshot(&doc).unwrap().drawings.is_empty());
@@ -294,6 +306,8 @@ mod tests {
         GridOp::decode(&inverse.encode()).unwrap().apply(&mut d.wb);
         assert_eq!(d.wb.pictures()[0].anchor, anchor);
         assert_eq!(d.wb.pictures()[0].bytes, bytes);
+        assert_eq!(d.wb.pictures()[0].crop, [25_000, 0, 0, 0]);
+        assert_eq!(d.wb.pictures()[0].rotation, 5_400_000);
     }
 
     #[test]
