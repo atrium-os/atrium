@@ -1,14 +1,14 @@
 #!/bin/sh
 # Prelum R5 in the FreeBSD VM (docs/spec/printing.md §6.4–§6.6, §11): Curia's
 # Printers page, the Forum status item and Praeco notices, and history. Runs
-# on the HOST after `sh scripts/cloud-vm.sh up`.
+# on the HOST against an already-running ARM64 VM with jaild provisioned.
 #
 #   sh scripts/prelum-r5-vm.sh [out-dir]       # screenshots land in out-dir
 #   ONLY="curia status" sh scripts/prelum-r5-vm.sh   (access, curia, status, history)
 #
 # Printers, both on this host (test oracles, never shipped), which the guest
-# reaches at 10.0.2.2:
-#   8661  CUPS's ippeveprinter, IPPS
+# reaches at its QEMU gateway (override with HOSTIP):
+#   8661  scripts/prelum-fake-printer.py with TLS, IPPS
 #   8662  scripts/prelum-fake-printer.py, plain IPP, out of paper on cue
 #
 # Apps, each its own uid in the launch registry, all alice's:
@@ -21,7 +21,8 @@
 #     ops; any other app is refused;
 #   - Curia's Printers page, by clicks and typing: add two printers by
 #     address, identify one, rename it, share it, remove the other (asked
-#     twice);
+#     twice). A Sigillum protocol fixture refuses the first share and verifies
+#     the retry, checking the account, printer name and requested strength;
 #   - out of paper: the job waits with the alert, prelum-status puts the
 #     status item up (Forum's forum-wm lists it) and posts a notice to
 #     praecod; paper back, the job prints, the notice is withdrawn, "Printed"
@@ -38,7 +39,7 @@ VMDIR="${VMDIR:-$HOME/atrium-vm}"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SCP="scp -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P 2222"
 TARGET=aarch64-unknown-freebsd
-HOSTIP=10.0.2.2
+HOSTIP="${HOSTIP:-}"
 XT="${XT:-$HOME/ct-x}"
 work=$(mktemp -d)
 FAILS=0
@@ -60,84 +61,120 @@ put() {
     die "$1 arrived damaged"
 }
 get() { $SCP "root@localhost:$1" "$2" >/dev/null 2>&1; }
-P=/tmp/pr5
-stop_all() { g "pkill -x curia; pkill -x prelum-status; pkill -x forum-wm; pkill -x praecod; pkill -x frescod; pkill -f 'prelumd --socket $P/prelum.sock'" >/dev/null 2>&1; }
+P=""
+stop_guest() {
+    for name in "$@"; do
+        g "if [ -s $P/$name.pid ]; then kill \$(cat $P/$name.pid) 2>/dev/null || true; rm -f $P/$name.pid; fi"
+    done
+}
 cleanup() {
-    stop_all
-    for f in frescod prelumd praecod curia curia2 status wm; do get $P/$f.log "$OUT/$f.log"; done
+    if [ -n "$P" ]; then
+        stop_guest curia curia2 status wm frescod praecod prelumd sigillum
+        for f in frescod prelumd praecod curia curia2 status wm sigillum; do get "$P/$f.log" "$OUT/$f.log"; done
+        g "for b in atrium-prelum-ipp atrium-prelum-render; do
+            if [ -e $P/installed-\$b ]; then
+                rm -f /usr/local/bin/\$b
+                if [ -e $P/prior-\$b ]; then mv $P/prior-\$b /usr/local/bin/\$b; fi
+            fi
+        done
+        for u in printdemo printcuria printstatus alice; do
+            if [ -e $P/created-\$u ]; then pw userdel \$u; fi
+        done
+        rm -rf -- $P"
+    fi
+    cp "$work/a.log" "$OUT/ipps.log" 2>/dev/null
     cp "$work/fake.log" "$OUT/fake.log" 2>/dev/null
     for p in $pids; do kill "$p" 2>/dev/null; done
     [ -n "${KEEP:-}" ] && echo "work dir: $work" || rm -rf "$work"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 1' INT TERM
 
 STAGE=build
 say "$STAGE (cross, on this host)"
-CROSS_RUSTFLAGS=$(cd "$ROOT" && sh -c '. ./scripts/cloud-vm.sh >/dev/null 2>&1; printf %s "$CROSS_RUSTFLAGS"' sh env)
-[ -n "$CROSS_RUSTFLAGS" ] || die "cloud-vm.sh env"
-export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
-export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$VMDIR/sysroot"
+if [ "$(uname -s)" = Darwin ]; then
+    SYSROOT="${SYSROOT:-$HOME/src/bsd/sysroot}"
+    LLVM="${LLVM:-/opt/homebrew/opt/llvm/bin}"
+    export CC_aarch64_unknown_freebsd="$LLVM/clang" AR_aarch64_unknown_freebsd="$LLVM/llvm-ar"
+    unset RUSTFLAGS
+else
+    SYSROOT="${SYSROOT:-$VMDIR/sysroot}"
+    CROSS_RUSTFLAGS=$(cd "$ROOT" && sh -c '. ./scripts/cloud-vm.sh >/dev/null 2>&1; printf %s "$CROSS_RUSTFLAGS"' sh env)
+    [ -n "$CROSS_RUSTFLAGS" ] || die "cloud-vm.sh env"
+    export CC_aarch64_unknown_freebsd=clang AR_aarch64_unknown_freebsd=llvm-ar
+fi
+export CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=$SYSROOT"
 export CARGO_PROFILE_RELEASE_DEBUG=0
 xb() { # DIR ARGS...
     d=$1; shift
-    (cd "$ROOT/$d" && CARGO_TARGET_DIR="$XT" RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TARGET "$@") || die "cross-build of $d"
+    (
+        cd "$ROOT/$d" || exit 1
+        if [ -n "${CROSS_RUSTFLAGS:-}" ]; then
+            RUSTFLAGS="$CROSS_RUSTFLAGS" CARGO_TARGET_DIR="$XT" cargo build -q --release --target "$TARGET" "$@"
+        else
+            CARGO_TARGET_DIR="$XT" cargo build -q --release --target "$TARGET" "$@"
+        fi
+    ) || die "cross-build of $d"
 }
 [ -n "${NO_BUILD:-}" ] || {
     xb prelum -p prelumd -p prelum-ipp -p prelum-render --bins
+    xb prelum -p prelumd --example r5-sigillum-fixture
     xb frescod --bin frescod
     xb curia --bin curia
     xb prelum-status --bin prelum-status
     xb praeco --bin praecod
     xb forum-wm --bin forum-wm
     xb forum-ctl --bin forum-ctl
-    (cd "$ROOT/portcullis" && TESSERA_CORE_LIB="$ROOT/atrium-tessera/core" RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $TARGET -p jaild) || die "jaild cross-build"
 }
 B="$XT/$TARGET/release"
 
 STAGE=deploy
 say "$STAGE"
-g true || die "no ssh to the VM (sh scripts/cloud-vm.sh up)"
-CROSS_RUSTFLAGS="$CROSS_RUSTFLAGS" RUSTFLAGS="$CROSS_RUSTFLAGS" START=1 sh "$ROOT/scripts/deploy-portcullis.sh" >"$work/deploy.log" 2>&1 \
-    || grep -q "atrium-jaild  *RUNNING" "$work/deploy.log" \
-    || { tail -20 "$work/deploy.log"; die "deploy-portcullis"; }
-stop_all; g "sleep 1; rm -rf $P; mkdir -p $P/bin; chmod 755 $P; true"
+g 'test -S /var/run/atrium/jaild.sock' || die "running guest with jaild required"
+if [ -z "$HOSTIP" ]; then
+    HOSTIP=$(g 'route -n get default' | awk '/gateway:/ { print $2 }')
+    [ -n "$HOSTIP" ] || die "guest gateway not found (set HOSTIP)"
+fi
+guest_dir=$(g 'mktemp -d /tmp/pr5.XXXXXX') || die "guest fixture directory"
+case "$guest_dir" in /tmp/pr5.*) P=$guest_dir ;; *) die "unexpected guest fixture directory" ;; esac
+g "mkdir $P/bin; chmod 755 $P" || die "guest fixture setup"
 for b in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render frescod curia prelum-status praecod forum-wm forum-ctl; do put "$B/$b" "$P/bin/$b"; done
-put "$ROOT/prelum/prelum-ipp-codec/examples/min.pdf" $P/min.pdf
-g "mkdir -p /usr/local/share/fonts/ibm-plex"
-for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
-    g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" "/usr/local/share/fonts/ibm-plex/$(basename "$f")"
-done
-. "$ROOT/scripts/vm-fonts.sh"; vm_install_fonts
-REG=/var/run/atrium/app-registry; APPS=/var/lib/atrium/apps
+put "$B/examples/r5-sigillum-fixture" "$P/bin/r5-sigillum-fixture"
+put "$ROOT/prelum/prelum-ipp-codec/examples/min.pdf" "$P/min.pdf"
+REG=$P/registry
 g 'sh -s' <<EOS || die "setup"
 set -e
-for b in atrium-prelumd prelumctl atrium-prelum-ipp atrium-prelum-render; do install -m 0555 $P/bin/\$b /usr/local/bin/\$b; done
+for b in atrium-prelum-ipp atrium-prelum-render; do
+    if [ -e /usr/local/bin/\$b ]; then cp -p /usr/local/bin/\$b $P/prior-\$b; fi
+    touch $P/installed-\$b
+    install -m 0555 $P/bin/\$b /usr/local/bin/\$b
+done
 chmod 0555 $P/bin/*; chmod 0444 $P/min.pdf
-id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
+if ! id alice >/dev/null 2>&1; then
+    pw useradd alice -d /nonexistent -s /bin/sh
+    touch $P/created-alice
+fi
 for u in "printdemo 50621" "printcuria 50626" "printstatus 50627"; do
-  set -- \$u
-  id \$1 >/dev/null 2>&1 || pw useradd \$1 -u \$2 -d /nonexistent -s /usr/sbin/nologin
+    set -- \$u
+    if ! id \$1 >/dev/null 2>&1; then
+        pw useradd \$1 -u \$2 -d /nonexistent -s /usr/sbin/nologin
+        touch $P/created-\$1
+    fi
+    [ "\$(id -u \$1)" = "\$2" ]
 done
-mkdir -p /var/run/atrium $APPS
-sed -i '' '/ org.test.printdemo\$/d; / org.atrium.curia\$/d; / org.atrium.prelum-status\$/d' $REG 2>/dev/null || true
-printf '50621 alice org.test.printdemo\n50626 alice org.atrium.curia\n50627 alice org.atrium.prelum-status\n' >> $REG
-for a in org.test.printdemo org.atrium.curia org.atrium.prelum-status; do
-  mkdir -p $APPS/\$a; printf '[app]\nid = "%s"\nname = "%s"\nversion = "1"\nentry = "bin/app"\n\n[capabilities]\ngraphics = "fresco"\n' \$a \$a > $APPS/\$a/atrium.toml
-done
+printf '50621 alice org.test.printdemo\n50626 alice org.atrium.curia\n50627 alice org.atrium.prelum-status\n' > $REG
 EOS
-check "binaries, users, the registry and manifests" 0 ""
+check "binaries, users, the fixture registry" 0 ""
 
 STAGE=printers
 say "$STAGE (on this host)"
-command -v ippeveprinter >/dev/null || die "ippeveprinter not installed (cups-ipp-utils)"
-preload=""
-if [ ! -e /proc/net/if_inet6 ]; then
-    cc -shared -fPIC -o "$work/noipv6.so" "$ROOT/scripts/prelum-oracle-noipv6.c" -ldl
-    preload="$work/noipv6.so"
-fi
-pkill -f "ippeveprinter -p 8661" 2>/dev/null; pkill -f "prelum-fake-printer.py --port 8662" 2>/dev/null
-mkdir -p "$work/a" "$work/keys-a"
-LD_PRELOAD=$preload ippeveprinter -p 8661 -n 127.0.0.1 -d "$work/a" -K "$work/keys-a" -k -f application/pdf,image/pwg-raster -M Atrium -m "VM R5" "Prelum VM R5" >"$work/a.log" 2>&1 &
+if port_up 8661 || port_up 8662; then die "fixture printer ports already in use"; fi
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=Prelum-R5 \
+    -addext basicConstraints=critical,CA:FALSE -addext extendedKeyUsage=serverAuth \
+    -keyout "$work/key.pem" -out "$work/cert.pem" >"$work/tls.log" 2>&1 || die "fixture TLS certificate"
+echo idle > "$work/astate"
+python3 -I "$ROOT/scripts/prelum-fake-printer.py" --port 8661 --state "$work/astate" --spool "$work/a" \
+    --name "Prelum VM R5" --tls-cert "$work/cert.pem" --tls-key "$work/key.pem" >"$work/a.log" 2>&1 &
 pids="$pids $!"
 echo idle > "$work/fstate"
 fake_up() {
@@ -151,10 +188,14 @@ port_up 8661 && port_up 8662 || die "the printers did not start"
 
 STAGE=services
 say "$STAGE (prelumd, praecod)"
-g "rm -rf $P/state $P/spool; daemon -f -o $P/prelumd.log atrium-prelumd --socket $P/prelum.sock --state $P/state --spool $P/spool --sheet-uid 65046 --registry $REG </dev/null >/dev/null 2>&1; for i in \$(seq 120); do [ -S $P/prelum.sock ] && break; sleep 0.5; done; chmod 666 $P/prelum.sock; test -S $P/prelum.sock" || die "prelumd did not start: $(g "cat $P/prelumd.log")"
-g "cd $P && env PRAECO_SOCKET=$P/praeco.sock PRAECO_APP_REGISTRY=$REG PRAECO_SUBSCRIBERS=0 daemon -f -o $P/praecod.log $P/bin/praecod </dev/null; for i in \$(seq 20); do [ -S $P/praeco.sock ] && break; sleep 0.5; done; chmod 666 $P/praeco.sock; test -S $P/praeco.sock" || die "praecod did not start"
-actl() { g "su -m alice -c 'prelumctl --socket $P/prelum.sock $*'"; }
-as() { u=$1; shift; g "su -m $u -c 'prelumctl --socket $P/prelum.sock $*'" 2>&1; }
+if want curia; then
+    g "daemon -f -p $P/sigillum.pid -o $P/sigillum.log $P/bin/r5-sigillum-fixture $P/sigillum.sock
+       for i in \$(seq 20); do [ -S $P/sigillum.sock ] && exit 0; sleep 0.5; done; exit 1" || die "Sigillum fixture did not start"
+fi
+g "daemon -f -p $P/prelumd.pid -o $P/prelumd.log $P/bin/atrium-prelumd --socket $P/prelum.sock --state $P/state --spool $P/spool --sheet-uid 65046 --registry $REG --sigillum $P/sigillum.sock </dev/null >/dev/null 2>&1; for i in \$(seq 120); do [ -S $P/prelum.sock ] && break; sleep 0.5; done; chmod 666 $P/prelum.sock; test -S $P/prelum.sock" || die "prelumd did not start: $(g "cat $P/prelumd.log")"
+g "cd $P && env PRAECO_SOCKET=$P/praeco.sock PRAECO_APP_REGISTRY=$REG PRAECO_SUBSCRIBERS=0 daemon -f -p $P/praecod.pid -o $P/praecod.log $P/bin/praecod </dev/null; for i in \$(seq 20); do [ -S $P/praeco.sock ] && break; sleep 0.5; done; chmod 666 $P/praeco.sock; test -S $P/praeco.sock" || die "praecod did not start"
+actl() { g "su -m alice -c '$P/bin/prelumctl --socket $P/prelum.sock $*'"; }
+as() { u=$1; shift; g "su -m $u -c '$P/bin/prelumctl --socket $P/prelum.sock $*'" 2>&1; }
 check "prelumd and praecod up" 0 ""
 
 if want access; then
@@ -165,7 +206,7 @@ out=$(as printstatus printers); [ $? = 0 ] && ! echo "$out" | grep -q prelumctl;
 out=$(as printstatus add ipp://$HOSTIP:8662/ipp/print); echo "$out" | grep -q "not for this app"; check "but may not add one" $? "$(echo "$out" | head -1)"
 out=$(as printstatus history); echo "$out" | grep -q "not for this app"; check "nor read history" $? "$(echo "$out" | head -1)"
 out=$(as printcuria history); [ $? = 0 ]; check "Curia reads alice's history" $? "$(echo "$out" | head -1)"
-out=$(g "su -m printcuria -c 'prelumctl --socket $P/prelum.sock print $P/min.pdf --printer 1'" 2>&1); echo "$out" | grep -q "not for this app"; check "Curia may not print" $? "$(echo "$out" | head -1)"
+out=$(g "su -m printcuria -c '$P/bin/prelumctl --socket $P/prelum.sock print $P/min.pdf --printer 1'" 2>&1); echo "$out" | grep -q "not for this app"; check "Curia may not print" $? "$(echo "$out" | head -1)"
 fi
 
 inj() { g "printf '%s\n' $(printf "'%s' " "$@") | nc -N -U $P/inject.sock" >/dev/null; }
@@ -186,15 +227,16 @@ waitfor() { # FILE PATTERN SECONDS
     g "grep -q '$2' $1"
 }
 start_desk() {
-    g "pkill -x curia; pkill -x prelum-status; pkill -x forum-wm; pkill -x frescod; sleep 1; rm -f $P/fresco.sock $P/inject.sock $P/activation.sock $P/wm.sock $P/ctl.sock $P/status.sock"
+    stop_guest curia curia2 status wm frescod
+    g "sleep 1; rm -f $P/fresco.sock $P/inject.sock $P/activation.sock $P/wm.sock $P/ctl.sock $P/status.sock"
     g "cd $P && env FRESCOD_SPLIT=0 FRESCOD_HEADLESS_PNG=$P/screen FRESCOD_SOCK=$P/fresco.sock FRESCOD_WM_SOCK=$P/wm.sock \
-       FRESCOD_INPUT_SOCK=$P/inject.sock FRESCOD_ACTIVATION_SOCK=$P/activation.sock FRESCOD_SLOT_UIDS=0 FRESCOD_DEV_CAPS=all FRESCOD_INJECT_ACTIVATION=1 \
-       daemon -f -o $P/frescod.log $P/bin/frescod </dev/null"
+       FRESCOD_INPUT_SOCK=$P/inject.sock FRESCOD_ACTIVATION_SOCK=$P/activation.sock FRESCOD_SLOT_UIDS=0 FRESCOD_DEV_CAPS=all FRESCOD_INJECT_ACTIVATION=1 FRESCOD_APP_REGISTRY=$REG \
+       daemon -f -p $P/frescod.pid -o $P/frescod.log $P/bin/frescod </dev/null"
     i=0; while [ $i -lt 60 ] && ! g "test -S $P/fresco.sock && test -S $P/inject.sock"; do sleep 2; i=$((i+1)); done
     g "chmod 666 $P/fresco.sock $P/inject.sock" || die "frescod: $(g "tail -5 $P/frescod.log")"
 }
 curia() { # LOG
-    g ": > $P/$1.log; daemon -f -o $P/$1.log -u printcuria env HOME=/nonexistent FRESCO_SOCKET=$P/fresco.sock CURIA_PRINT_SOCK=$P/prelum.sock CURIA_NET_DIR=$P/none $P/bin/curia"
+    g ": > $P/$1.log; daemon -f -p $P/$1.pid -o $P/$1.log -u printcuria env HOME=/nonexistent FRESCO_SOCKET=$P/fresco.sock CURIA_PRINT_SOCK=$P/prelum.sock CURIA_NET_DIR=$P/none $P/bin/curia"
     sleep ${WAIT:-40}
 }
 # Curia's Printers page at 100% text: the page's left edge is at 232 and
@@ -231,6 +273,13 @@ actl printers 2>&1 | grep -q "1  Hall"; check "prelumd has the new name" $? "$(a
 sleep 8
 press $(slot 0 2)                                   # Share opens confirmation under the card
 press $((232 + 16 + 30)) $(($CARD0 + 98 + 15))
+waitfor $P/curia.log "Sigillum verification was refused" 60; check "Share requires Sigillum approval" $? ""
+out=$(actl printers 2>&1)
+printf '%s\n' "$out" | awk '/1  Hall/ && !/shared/ { found=1 } END { exit !found }'
+check "Hall stays private after refusal" $? ""
+press $(slot 0 2)
+press $((232 + 16 + 30)) $(($CARD0 + 98 + 15))
+waitfor $P/sigillum.log "Hall for alice: verified" 60; check "Sigillum verified the retry for the correct user and printer" $? ""
 waitfor $P/curia.log "Hall is shared" 60; check "Share" $? "$(g "grep 'shared' $P/curia.log | tail -1")"
 actl printers 2>&1 | grep "1  Hall" | grep -q shared; check "prelumd has it shared" $? "$(actl printers 2>&1 | grep '^ *1  ')"
 sleep 8
@@ -241,18 +290,18 @@ press $(slot 1 3)
 waitfor $P/curia.log "removed Bench" 60; check "Remove, pressed again" $? "$(g "grep 'removed' $P/curia.log | tail -1")"
 n=$(actl printers 2>&1 | grep -c '^ *[0-9]  '); check "alice has one printer left" "$([ "$n" = 1 ]; echo $?)" "$n"
 sleep 8; shot curia-done
-g "pkill -x curia"
+stop_guest curia
 fi
 
 if want status; then
 STAGE=status
 say "$STAGE: the status item and notices"
 start_desk
-g "cd $P && env FRESCO_SOCKET=$P/fresco.sock FRESCO_WM_SOCKET=$P/wm.sock FORUM_CTL_SOCKET=$P/ctl.sock FORUM_STATUS_SOCKET=$P/status.sock daemon -f -o $P/wm.log $P/bin/forum-wm </dev/null"
+g "cd $P && env FRESCO_SOCKET=$P/fresco.sock FRESCO_WM_SOCKET=$P/wm.sock FORUM_CTL_SOCKET=$P/ctl.sock FORUM_STATUS_SOCKET=$P/status.sock FORUM_STATUS_APP_REGISTRY=$REG daemon -f -p $P/wm.pid -o $P/wm.log $P/bin/forum-wm </dev/null"
 i=0; while [ $i -lt 30 ] && ! g "test -S $P/status.sock"; do sleep 2; i=$((i+1)); done
 g "chmod 666 $P/status.sock $P/ctl.sock" || die "forum-wm: $(g "tail -5 $P/wm.log")"
 fctl() { g "FORUM_CTL_SOCKET=$P/ctl.sock $P/bin/forum-ctl $*" 2>&1; }
-g ": > $P/status.log; daemon -f -o $P/status.log -u printstatus env PRELUM_SOCKET=$P/prelum.sock PRAECO_SOCKET=$P/praeco.sock FORUM_STATUS_SOCKET=$P/status.sock PRELUM_OFFLINE_AFTER=30 $P/bin/prelum-status"
+g ": > $P/status.log; daemon -f -p $P/status.pid -o $P/status.log -u printstatus env PRELUM_SOCKET=$P/prelum.sock PRAECO_SOCKET=$P/praeco.sock FORUM_STATUS_SOCKET=$P/status.sock PRELUM_OFFLINE_AFTER=30 $P/bin/prelum-status"
 waitfor $P/status.log "prelum-status: up" 30; check "prelum-status up as alice's app" $? ""
 id=$(actl printers 2>&1 | grep Bench | awk '{print $1}')
 [ -n "$id" ] || { actl add ipp://$HOSTIP:8662/ipp/print >/dev/null 2>&1; id=$(actl printers 2>&1 | grep Bench | awk '{print $1}'); }
@@ -279,7 +328,7 @@ actl jobs 2>&1 | grep Offline | grep -q Cancelled; check "the job is cancelled" 
 waitfor $P/status.log "item removed" 60; check "the item goes again" $? ""
 g "grep -q 'praecod:' $P/status.log"; check "praecod took every notice (an app of alice's)" "$([ $? = 1 ]; echo $?)" "$(g "grep 'praecod:' $P/status.log | head -1")"
 fake_up
-g "pkill -x prelum-status; pkill -x forum-wm"
+stop_guest status wm
 fi
 
 if want history; then

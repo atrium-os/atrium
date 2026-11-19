@@ -824,13 +824,16 @@ Next: R5.
   app's jail. Only Curia has it.
 
 Checks: unit tests in prelumd (store round trip with history), prelum-status (notices,
-the panel) and Curia (the page). `scripts/prelum-r5-vm.sh` in the FreeBSD VM, with
-frescod, forum-wm, praecod, Curia and prelum-status as alice's apps, and
-`scripts/prelum-fake-printer.py` (a plain-IPP printer whose state a file sets, so it
-runs out of paper on cue) beside ippeveprinter: 40/40 pass (roles; add, identify,
-rename, share, remove in Curia; the out-of-paper notice and its withdrawal, "Printed",
-offline told only after the wait, Cancel from the status item; history kept without the
-document and cleared from Curia).
+the panel) and Curia (the page). Run `scripts/prelum-r5-vm.sh` against a running
+FreeBSD guest with jaild. It stages its own frescod, forum-wm, praecod, Curia and
+prelum-status processes. Two instances of `scripts/prelum-fake-printer.py` serve
+IPPS and plain IPP. A state file makes the plain-IPP printer run out of paper.
+The gate checks roles, printer management in Curia, notices and the status
+item, cancellation, and document-free history. A test-only Sigillum endpoint
+checks the account, printer name and minimum verification strength. It refuses
+the first share request and approves the retry, and the gate checks that the
+saved printer becomes shared only after approval. The R7 desktop check in §11.6
+covers the real Sigillum sheet and PAM passcode verification.
 
 The “Printed” notice still cannot be turned off, and the status item has no Release
 button for held jobs.

@@ -841,7 +841,9 @@ fn serve_status(mut s: std::os::unix::net::UnixStream, conn: u64, any: bool) {
         forum_ctl::encode(m).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)).and_then(|b| forum_ctl::write_frame(s, &b))
     };
     let uid = peer_uid(&s);
-    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let registry_path = std::env::var("FORUM_STATUS_APP_REGISTRY")
+        .unwrap_or_else(|_| portcullis_peer::DEFAULT_REGISTRY.into());
+    let registry = portcullis_peer::AppRegistry::load(&registry_path).unwrap_or_default();
     let app_id = match uid.and_then(|u| registry.resolve(u).map(|(_, a)| a.to_string())) {
         Some(a) => a,
         None if any => format!("uid:{}", uid.unwrap_or(0)),

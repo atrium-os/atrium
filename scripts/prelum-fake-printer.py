@@ -15,6 +15,7 @@ seconds later, but only while the state is idle; documents go to --spool.
 import argparse
 import http.server
 import os
+import ssl
 import struct
 import threading
 import time
@@ -25,7 +26,11 @@ A.add_argument("--port", type=int, required=True)
 A.add_argument("--state", required=True)
 A.add_argument("--spool", required=True)
 A.add_argument("--name", default="Fake Printer")
+A.add_argument("--tls-cert")
+A.add_argument("--tls-key")
 ARGS = A.parse_args()
+if bool(ARGS.tls_cert) != bool(ARGS.tls_key):
+    A.error("--tls-cert and --tls-key must be used together")
 UUID = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, "prelum-fake-%d" % ARGS.port))
 
 # Value tags.
@@ -102,10 +107,10 @@ def head(status, rid):
 
 def printer_attrs(host):
     st, reasons = state()
-    uri = "ipp://%s/ipp/print" % host
+    uri = "%s://%s/ipp/print" % ("ipps" if ARGS.tls_cert else "ipp", host)
     return bytes([PRG]) + b"".join([
         attr(URI, "printer-uri-supported", uri),
-        attr(KEYWORD, "uri-security-supported", "none"),
+        attr(KEYWORD, "uri-security-supported", "tls" if ARGS.tls_cert else "none"),
         attr(URI, "printer-uuid", UUID),
         attr(TEXT, "printer-info", ARGS.name),
         attr(TEXT, "printer-make-and-model", "Prelum Fake"),
@@ -218,5 +223,9 @@ class H(http.server.BaseHTTPRequestHandler):
 os.makedirs(ARGS.spool, exist_ok=True)
 http.server.ThreadingHTTPServer.allow_reuse_address = True
 srv = http.server.ThreadingHTTPServer(("0.0.0.0", ARGS.port), H)
+if ARGS.tls_cert:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(ARGS.tls_cert, ARGS.tls_key)
+    srv.socket = context.wrap_socket(srv.socket, server_side=True)
 print("fake printer: listening on %d (%s)" % (ARGS.port, UUID), flush=True)
 srv.serve_forever()
