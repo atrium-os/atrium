@@ -405,6 +405,12 @@ if [ -n "$tessera_fact" ]; then
     new_tessera_receipt() {
         tail -n "+$((receipt_offset + 1))" "$receipts" | grep -q "^$expected_count "
     }
+    lock_tessera_key() {
+        "$V" 'set -e
+            /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
+            /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
+            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
+    }
     receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
     if [ "$hip" != tessera ]; then
         "$V" 'G=/tmp/crypta-gate; set -e
@@ -422,10 +428,7 @@ if [ -n "$tessera_fact" ]; then
     probe "IPv4 echo after approved Tessera encryption change"
     if [ "$hip" != tessera ]; then
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
-        "$V" 'set -e
-            /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
-            /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
-            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
+        lock_tessera_key
         if [ "$hip" != tessera-domain ]; then
             approve_tessera_change 0 "Tessera domain key lock" rebind
             wait_field handshake 1
@@ -482,6 +485,11 @@ if [ -n "$tessera_fact" ]; then
                 fail "the post-unlock rebind reported different facts"
             ok "post-unlock rebind sent the unchanged HIP report without prompting"
             probe "IPv4 echo on the post-unlock rebound tunnel"
+
+            receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+            lock_tessera_key
+            approve_tessera_change 0 "Tessera domain key lock after rebind"
+            probe "IPv4 echo on the rebound tunnel after approved key lock"
         fi
     fi
     "$V" "$CTL down name=gp-gate" >/dev/null

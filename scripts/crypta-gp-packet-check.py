@@ -498,20 +498,21 @@ def main():
                     if not runs or runs[-1][0] != report:
                         runs.append([])
                     runs[-1].append(report)
-                assert [run[0][0] for run in runs] == ["0", "1", "0", "1"], reports
+                assert [run[0][0] for run in runs] == ["0", "1", "0", "1", "0"], reports
                 assert len(runs[2]) >= 2 and len(runs[3]) >= 2 and runs[1][0] == runs[3][0], reports
+                assert runs[2][0] == runs[4][0], reports
                 if esp:
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == 4, calls
                     original, _, reconnected, rebound = (config[0][0] for config in esp.configs)
                     assert esp.received_spis == {original, reconnected, rebound}, esp.received_spis
-                    assert esp.echo == [original, original] + [reconnected] * 3 + [rebound], esp.echo
+                    assert esp.echo == [original, original] + [reconnected] * 3 + [rebound] * 2, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == 3 and calls.count("echo") == 6, calls
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == 3 and calls.count("echo") == 7, calls
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
-                    assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == 1, calls
-                print("Unchanged unlocked HIP preceded traffic on the rebound tunnel")
+                    assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == 2, calls
+                print("The rebound tunnel carried traffic after the unchanged report and the approved key lock")
                 return
             if args.hip == "tessera-rebind-decline":
                 assert calls.count("login.esp") == 1 and calls.count("getconfig.esp") == 2, calls
