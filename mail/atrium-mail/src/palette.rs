@@ -21,6 +21,8 @@ pub enum Cmd {
     Forward,
     Archive,
     Delete,
+    /// To Junk, or (in Junk) Not junk (§7.7).
+    Junk,
     Later,
     Done,
     Drop,

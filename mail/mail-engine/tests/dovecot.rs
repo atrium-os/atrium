@@ -227,6 +227,10 @@ namespace inbox {{
     special_use = \Trash
     auto = create
   }}
+  mailbox Junk {{
+    special_use = \Junk
+    auto = create
+  }}
 }}
 service imap-login {{
   inet_listener imap {{
@@ -664,6 +668,58 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     assert!(engine.store.accounts().unwrap().is_empty());
     assert!(engine.configured().is_empty());
     assert!(engine.store.account_config(account).unwrap().is_none());
+}
+
+/// Junk and Not junk (§7.7): the message moves, and carries `$Junk` or
+/// `$NotJunk` for the server's filter; read back from Dovecot.
+#[test]
+fn junk_and_not_junk_teach_the_server() {
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let sync = || Session::start(courier(&dc)).unwrap().sync(&mut engine.sink(account)).unwrap();
+    sync();
+    let folders = engine.store.folders(account).unwrap();
+    let id_of = |role: Role| folders.iter().find(|(_, f)| f.role == role).unwrap().0;
+    let (inbox, junk) = (id_of(Role::Inbox), id_of(Role::Junk));
+    let row = engine.store.list(inbox, 0, 1).unwrap().remove(0);
+    let n = engine.store.count(inbox).unwrap();
+
+    // Junk: a flag change, then the move, both inside the undo window.
+    let ops = engine.act(inbox, &[row.uid], Action::Junk(true)).unwrap();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(engine.store.count(inbox).unwrap(), n - 1);
+    // Past the window (made due here rather than waiting 10 s).
+    let due_now = |folder, uid, add, remove, to| {
+        engine.store.write(|w| { for id in &ops { w.undo(*id)?; } Ok(()) }).unwrap();
+        engine.store.write(|w| { w.queue(folder, uid, mail_store::OpKind::Flags { add, remove }, 0)?; w.queue(folder, uid, mail_store::OpKind::Move { to }, 0)?; Ok(()) }).unwrap();
+    };
+    due_now(inbox, row.uid, flag::JUNK, flag::NOT_JUNK, junk);
+    sync();
+    assert_eq!(engine.store.ops_pending().unwrap(), 0);
+    sync();
+    let j = engine.store.list(junk, 0, 5).unwrap();
+    let moved = j.iter().find(|r| r.msg == row.msg || r.subject == row.subject).expect("in Junk on the server");
+    assert!(moved.flags & flag::JUNK != 0, "{:#x}", moved.flags);
+
+    // Not junk: back to the inbox, $NotJunk, $Junk gone.
+    let ops = engine.act(junk, &[moved.uid], Action::Junk(false)).unwrap();
+    assert_eq!(ops.len(), 2);
+    let due_now = |folder, uid, add, remove, to| {
+        engine.store.write(|w| { for id in &ops { w.undo(*id)?; } Ok(()) }).unwrap();
+        engine.store.write(|w| { w.queue(folder, uid, mail_store::OpKind::Flags { add, remove }, 0)?; w.queue(folder, uid, mail_store::OpKind::Move { to }, 0)?; Ok(()) }).unwrap();
+    };
+    due_now(junk, moved.uid, flag::NOT_JUNK, flag::JUNK, inbox);
+    sync();
+    sync();
+    assert_eq!(engine.store.count(junk).unwrap(), 0);
+    assert_eq!(engine.store.count(inbox).unwrap(), n);
+    let back = engine.store.list(inbox, 0, n).unwrap().into_iter().find(|r| r.subject == row.subject).unwrap();
+    assert_eq!(back.flags & (flag::JUNK | flag::NOT_JUNK), flag::NOT_JUNK, "{:#x}", back.flags);
 }
 
 #[test]

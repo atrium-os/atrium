@@ -666,7 +666,7 @@ impl Sink for AccountSink<'_> {
 
 /// Flag bits as IMAP's system flags (and the `$Snoozed` keyword).
 fn imap_flags(bits: u32) -> Vec<String> {
-    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft"), (flag::SNOOZED, "$Snoozed")]
+    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft"), (flag::SNOOZED, "$Snoozed"), (flag::JUNK, "$Junk"), (flag::NOT_JUNK, "$NotJunk")]
         .iter()
         .filter(|(b, _)| bits & b != 0)
         .map(|(_, n)| n.to_string())
@@ -682,6 +682,9 @@ pub enum Action {
     Delete,
     Read(bool),
     Flag(bool),
+    /// To Junk, marked `$Junk` (true); out of Junk to the inbox, marked
+    /// `$NotJunk` (false). The server's filter learns from both (§7.7).
+    Junk(bool),
 }
 
 /// How long a list action can be undone before sync makes it (§15.5).
@@ -701,6 +704,31 @@ impl Engine {
             }
             Ok(None)
         };
+        if let Action::Junk(on) = action {
+            let roles: &[Role] = if on { &[Role::Junk] } else { &[Role::Inbox] };
+            let Some(to) = role_folder(roles)? else { return Err(Error::Refused("This account has no Junk folder")) };
+            let (add, remove) = if on { (flag::JUNK, flag::NOT_JUNK) } else { (flag::NOT_JUNK, flag::JUNK) };
+            let due = now() + UNDO_SECS;
+            let mut ids = Vec::new();
+            self.store.write(|w| {
+                for &u in uids {
+                    match w.queue(folder, u, OpKind::Flags { add, remove }, due) {
+                        Ok(id) => ids.push(id),
+                        Err(mail_store::Error::NotFound) => continue,
+                        Err(e) => return Err(e),
+                    }
+                    if to != folder {
+                        match w.queue(folder, u, OpKind::Move { to }, due) {
+                            Ok(id) => ids.push(id),
+                            Err(mail_store::Error::NotFound) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(ids);
+        }
         let (kind, due) = match action {
             Action::Read(on) => (OpKind::Flags { add: if on { flag::SEEN } else { 0 }, remove: if on { 0 } else { flag::SEEN } }, now()),
             Action::Flag(on) => (OpKind::Flags { add: if on { flag::FLAGGED } else { 0 }, remove: if on { 0 } else { flag::FLAGGED } }, now() + UNDO_SECS),
@@ -712,6 +740,7 @@ impl Engine {
                 Some(to) if to != folder => (OpKind::Move { to }, now() + UNDO_SECS),
                 _ => (OpKind::Expunge, now() + UNDO_SECS),
             },
+            Action::Junk(_) => unreachable!(),
         };
         let mut ids = Vec::new();
         self.store.write(|w| {

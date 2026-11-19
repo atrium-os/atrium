@@ -407,12 +407,14 @@ fn archive_delete_and_undo_from_the_keyboard() {
             RemoteFolder { name: "INBOX".into(), role: Role::Inbox, selectable: true },
             RemoteFolder { name: "Archive".into(), role: Role::Archive, selectable: true },
             RemoteFolder { name: "Trash".into(), role: Role::Trash, selectable: true },
+            RemoteFolder { name: "Junk".into(), role: Role::Junk, selectable: true },
         ]).unwrap();
         let f = |uid: u32, subject: &str, t: i64| {
             let bytes = message(uid, "Arun <arun@example.org>", subject, "Text.", false, t);
             Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: Some(t), server_id: None, bytes, full: true }
         };
         sink.messages("INBOX", vec![f(1, "One", NOW - 300), f(2, "Two", NOW - 200), f(3, "Three", NOW - 100)]).unwrap();
+        sink.messages("Junk", vec![f(5, "Real order", NOW - 50)]).unwrap();
     }
     let dirty = Arc::new(AtomicBool::new(true));
     let view = MailView::new(engine.clone(), dirty.clone(), (1280.0, 800.0), || NOW);
@@ -454,6 +456,28 @@ fn archive_delete_and_undo_from_the_keyboard() {
     let real_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let due_now = engine.store.ops_due(account, real_now).unwrap();
     assert!(due_now.iter().all(|(_, o)| matches!(o.kind, mail_store::OpKind::Flags { .. })), "{due_now:?}");
+
+    // !: to Junk (§7.7), marked $Junk for the server's filter; z undoes it.
+    mail.open(0);
+    assert!(mail.key(&key("!"), None));
+    assert_eq!(subjects(&mail), ["Two"]);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message moved to Junk");
+    let pending = engine.store.ops_due(account, i64::MAX).unwrap();
+    assert!(pending.iter().any(|(_, o)| o.kind == mail_store::OpKind::Flags { add: mail_store::flag::JUNK, remove: mail_store::flag::NOT_JUNK }), "{pending:?}");
+    assert!(mail.key(&key("z"), None));
+    assert_eq!(subjects(&mail), ["Three", "Two"]);
+    // In Junk: the palette offers Not junk, and ! sends it to the inbox.
+    let junk = engine.store.folder_id(account, "Junk", mail_store::Role::Junk).unwrap();
+    mail.choose_folder(junk);
+    mail.open(0);
+    assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Modifiers::default() }, chars: "k".into() }, None));
+    assert!(mail.palette_entries().iter().any(|e| e.label == "Not junk" && e.key == "!"));
+    assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
+    assert!(mail.key(&key("!"), None));
+    assert_eq!(mail.ui.get_cloned().count, 0);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message moved to the inbox");
+    let pending = engine.store.ops_due(account, i64::MAX).unwrap();
+    assert!(pending.iter().any(|(_, o)| o.folder == junk && matches!(o.kind, mail_store::OpKind::Move { .. })), "{pending:?}");
 }
 
 #[test]

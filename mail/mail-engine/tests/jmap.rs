@@ -103,7 +103,7 @@ impl Server {
             let answer = match name {
                 "Mailbox/get" => {
                     let mb = |id: &str, name: &str, role: Value, parent: Value| json!({ "id": id, "name": name, "role": role, "parentId": parent });
-                    json!({ "state": "m1", "list": [mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj"))], "notFound": [] })
+                    json!({ "state": "m1", "list": [mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj")), mb("spam", "Junk", json!("junk"), Value::Null)], "notFound": [] })
                 }
                 "Email/query" => {
                     // In a mailbox, or with text (the server's search).
@@ -263,7 +263,7 @@ fn jmap_sync_changes_and_send() {
 
     // ── first sync ──
     let r = client.sync(&mut engine.sink(account)).unwrap();
-    assert_eq!(r.folders, 5, "{r:?}");
+    assert_eq!(r.folders, 6, "{r:?}");
     assert_eq!(server.borrow().downloads, 2, "the large one isn't downloaded; Plan once for two mailboxes");
     let folders = engine.store.folders(account).unwrap();
     let fid = |name: &str| folders.iter().find(|(_, f)| f.name == name).unwrap_or_else(|| panic!("{name}: {folders:?}")).0;
@@ -393,6 +393,30 @@ fn jmap_sync_changes_and_send() {
     // The next pass doesn't list it twice.
     client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(engine.store.list(archive, 0, 10).unwrap().iter().filter(|r| r.subject == "Old deal").count(), 1);
+
+    // Junk (§7.7): one patch moves it and sets $junk; Not junk undoes both
+    // and sets $notjunk.
+    let junk = fid("Junk");
+    let deal = engine.store.list(archive, 0, 10).unwrap().into_iter().find(|r| r.subject == "Old deal").unwrap();
+    let ops = engine.act(archive, &[deal.uid], Action::Junk(true)).unwrap();
+    engine.store.write(|w| { for id in &ops { w.undo(*id)?; } w.queue(archive, deal.uid, mail_store::OpKind::Flags { add: flag::JUNK, remove: flag::NOT_JUNK }, 0)?; w.queue(archive, deal.uid, mail_store::OpKind::Move { to: junk }, 0)?; Ok(()) }).unwrap();
+    let sid = engine.store.message(deal.msg).unwrap().server_id.unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    {
+        let s = server.borrow();
+        assert_eq!(s.mails[&sid].boxes.iter().collect::<Vec<_>>(), ["spam"]);
+        assert!(s.mails[&sid].keywords.contains("$junk"));
+    }
+    let row = engine.store.list(junk, 0, 5).unwrap().remove(0);
+    assert!(row.flags & flag::JUNK != 0);
+    let ops = engine.act(junk, &[row.uid], Action::Junk(false)).unwrap();
+    engine.store.write(|w| { for id in &ops { w.undo(*id)?; } w.queue(junk, row.uid, mail_store::OpKind::Flags { add: flag::NOT_JUNK, remove: flag::JUNK }, 0)?; w.queue(junk, row.uid, mail_store::OpKind::Move { to: inbox }, 0)?; Ok(()) }).unwrap();
+    client.sync(&mut engine.sink(account)).unwrap();
+    {
+        let s = server.borrow();
+        assert_eq!(s.mails[&sid].boxes.iter().collect::<Vec<_>>(), ["in"]);
+        assert!(s.mails[&sid].keywords.contains("$notjunk") && !s.mails[&sid].keywords.contains("$junk"));
+    }
 
     // Import (§6.5): an mbox into Archive; Lunch is already here and the
     // new one is twice in the file, so one goes up, seen, and syncs back.

@@ -1367,6 +1367,8 @@ impl Mail {
         let label = match action {
             mail_engine::Action::Archive => "archived",
             mail_engine::Action::Delete => "deleted",
+            mail_engine::Action::Junk(true) => "moved to Junk",
+            mail_engine::Action::Junk(false) => "moved to the inbox",
             _ => "changed",
         };
         let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
@@ -1401,6 +1403,18 @@ impl Mail {
         if let Some(n) = next {
             self.open(n);
         }
+    }
+
+    /// The message being read is in the account's Junk folder.
+    pub fn reading_junk(&self) -> bool {
+        let folder = self.ui.get_cloned().reading.and_then(|r| r.folder);
+        folder.and_then(|f| self.engine.store.folder(f).ok()).is_some_and(|f| f.role == mail_store::Role::Junk)
+    }
+
+    /// `!`: to Junk, or out of it to the inbox when read there; either way
+    /// the server's filter is told (§7.7).
+    pub fn junk(&self) {
+        self.act(mail_engine::Action::Junk(!self.reading_junk()));
     }
 
     // ── search (§11.2) ──────────────────────────────────────────────
@@ -2484,6 +2498,10 @@ impl Mail {
                 self.act(mail_engine::Action::Delete);
                 return true;
             }
+            (Key::Char, "!") if ui.reading.is_some() => {
+                self.junk();
+                return true;
+            }
             (Key::Char, "z") => return self.undo(),
             (Key::Char, ",") => {
                 self.ask_settings();
@@ -2625,6 +2643,7 @@ impl Mail {
             if r.folder.is_some() {
                 add("Archive".into(), "e", Cmd::Archive);
                 add("Delete".into(), "#", Cmd::Delete);
+                add(if self.reading_junk() { "Not junk".into() } else { "Move to Junk".into() }, "!", Cmd::Junk);
             }
             add("Later…".into(), "l", Cmd::Later);
             if r.later.is_some() {
@@ -2740,6 +2759,7 @@ impl Mail {
             Cmd::Forward => self.reply(Kind::Forward),
             Cmd::Archive => self.act(mail_engine::Action::Archive),
             Cmd::Delete => self.act(mail_engine::Action::Delete),
+            Cmd::Junk => self.junk(),
             Cmd::Later => self.ask_later(),
             Cmd::Done => {
                 self.later_done();

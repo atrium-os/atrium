@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1722,6 +1722,21 @@ Stalwart in the cloud VM, and later a real account):
    not from search, not while the picker is up). **Not yet**: Maildir (the picker's folder
    kind could carry it), local-only folders (every import goes to a server), a progress
    line for big imports and a way to see or clear uploads that gave up.
+
+   **Junk and Not junk teach the server (2026-11-19, §7.7).** `!` (or "Move to Junk" in
+   the palette) moves the message or conversation to the account's Junk folder and marks
+   it `$Junk`, removing `$NotJunk`; read in Junk, the same key ("Not junk") moves it to
+   the inbox and marks it `$NotJunk`, removing `$Junk`. Both wait out the undo window like
+   Archive ("Message moved to Junk", z undoes). On IMAP the keyword change goes before the
+   move in the same pass; on JMAP both are one `Email/set` patch. Gmail, Fastmail, Dovecot
+   with its antispam plugins and Stalwart learn from these. An account without a Junk
+   folder says so. The store now keeps `$Junk`/`$NotJunk` as flag bits (64, 128) as it
+   keeps `$Snoozed`. Mail still runs no spam classifier of its own. Tests: Dovecot 1 (to
+   Junk with `$Junk` and back with `$NotJunk`, read back from the server; the test server
+   gained a `\Junk` folder), JMAP 1 (mailbox and keywords on the server both ways),
+   window 1 (`!`, undo, "Not junk" offered in Junk, the move queued), store (flags).
+   **Not yet**: a Junk button on the reader's bar (key and palette only), and Report
+   phishing.
 
 ## 17. Decisions, with recommendations
 
