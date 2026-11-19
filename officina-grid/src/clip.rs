@@ -125,11 +125,16 @@ impl Clip {
     /// in each direction (more than one), the clip repeated to fill it, as
     /// Excel does; otherwise once at its top-left. A cut pastes once.
     pub fn paste_into(&self, wb: &Workbook, area: Rect) -> Result<(Vec<GridOp>, Rect), String> {
+        self.paste_into_as(wb, area, What::All)
+    }
+
+    /// As [`paste_into`](Self::paste_into), bringing only `what`.
+    pub fn paste_into_as(&self, wb: &Workbook, area: Rect, what: What) -> Result<(Vec<GridOp>, Rect), String> {
         let (h, w) = (area.rows(), area.cols());
         let (ch, cw) = (self.rows() as u64, self.cols() as u64);
         let (nr, nc) = (h / ch, w / cw);
         if self.cut || h % ch != 0 || w % cw != 0 || nr * nc <= 1 {
-            return self.paste(wb, area.sheet, area.r0, area.c0);
+            return self.paste_as(wb, area.sheet, area.r0, area.c0, what, false);
         }
         if nr * nc > MAX_TILES || area.cells() > MAX_TILED_CELLS {
             return Err("That's too big an area to fill with copies; select a smaller one.".into());
@@ -137,7 +142,7 @@ impl Clip {
         let mut ops = Vec::new();
         for i in 0..nr {
             for j in 0..nc {
-                let (o, _) = self.paste(wb, area.sheet, area.r0 + (i * ch) as u32, area.c0 + (j * cw) as u32)?;
+                let (o, _) = self.paste_as(wb, area.sheet, area.r0 + (i * ch) as u32, area.c0 + (j * cw) as u32, what, false)?;
                 ops.extend(o);
             }
         }

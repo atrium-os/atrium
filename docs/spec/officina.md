@@ -3815,8 +3815,19 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Rows grow as you type** (2026-11-19): when what is typed needs more lines than its row shows and nobody has sized the row, the row grows to fit, in the same undo step as the typing (journal record `Extend`, tag 7, `Doc::grow_row`). A row sized by hand keeps its height.
 - **Vertical alignment** (2026-11-19): `CellView.valign` (Top, Center, Bottom) places a cell's lines in a taller row; Sheets follows the style's `v_align`, bottom by default as in Excel. Data ▸ Align Top, Align Middle, Align Bottom set it for the selection, one undo step each.
 - **The editor grows** (2026-11-19): with line breaks it is as tall as its lines, draws each with its selection and caret, and a press picks the line under it.
-- **Not yet:** rows shrinking back when their text gets shorter (a grown row counts as sized), wrapping inside the editor as the cell would, Up and Down moving between the editor's lines, and wrapped text in printing (the printing thread's part).
+- **Rows shrink back** (2026-11-19): a row grown for typed lines is fitted again when its text changes or is cleared, back down to the default height (`Doc.grown_rows`, this session only; sizing it by hand ends that).
+- **Up and Down** in an editor holding several lines move between them at about the same place across; past the first or last line they end editing and move, as before.
+- **Not yet:** wrapping inside the editor as the cell would, and wrapped text in printing (the printing thread's part).
 - **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller` (with `line_top`), `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter, the second line); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it` (with alignment), `rows_nobody_sized_grow_for_typed_lines`, `records_round_trip`.
+
+### 16.94 Entry keys and typed dates (2026-11-19)
+
+- **Typed dates and times:** typing `2026-11-19`, `14:30`, `14:30:05` or `2026-11-19 14:30` enters a date or time serial, and a cell still in General format gets `yyyy-mm-dd`, `hh:mm` (and so on) in the same undo step (`doc::typed_date`). Before, these stayed text. Impossible days (`2026-02-31`) stay text.
+- **Ctrl+Enter** in the editor enters what is typed in every selected cell, as one undo step: formulas move as a copy moves them (`=A1+1` typed over B3:C5 reads `=B3+1` in C5), formats stay. Typing no longer collapses the selection to the active cell, so the selection is still there for it. At most 10,000 cells (`Doc::type_all`, `GridAction::CommitAll`).
+- **Ctrl+;** and **Ctrl+Shift+;** put today's date or the time now (local) into the editor, starting it when needed; they become a date or time as above (`GridSource::now_text`).
+- **Size bar:** 0 now hides, as it said: rows through Hide Rows, columns by width 0. Before, it set 1 px.
+- **Not yet:** other date orders (`19/11/2026`, `Nov 19`), which need the persona's locale, and F2 to edit a cell in place with the arrows moving the caret.
+- **Gates:** pergola `ctrl_enter_enters_the_text_in_every_selected_cell`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Up and Down); atrium-sheets `typed_dates_and_times_become_them`, `ctrl_semicolon_gives_today_and_the_time_as_typed`, `rows_nobody_sized_grow_for_typed_lines` (shrinking), `the_size_bar_sets_exact_heights_and_widths` (0 hides).
 
 ## 17. Decisions (accepted 2026-11-14)
 

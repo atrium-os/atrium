@@ -636,12 +636,27 @@ impl SheetSource {
     }
 }
 
+/// The local date and time now: year, month, day, hour, minute.
+fn local_now() -> Option<(i32, u32, u32, u32, u32)> {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as libc::time_t;
+    // SAFETY: localtime_r writes only into `tm`, which outlives the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    Some((tm.tm_year + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32))
+}
+
 /// The most cells one column fit reads.
 pub const FIT_CELLS: usize = 200_000;
 
 impl GridSource for SheetSource {
     fn fills(&self) -> bool {
         true
+    }
+    fn now_text(&self, time: bool) -> Option<String> {
+        let (y, mo, d, h, mi) = local_now()?;
+        Some(if time { format!("{h:02}:{mi:02}") } else { format!("{y:04}-{mo:02}-{d:02}") })
     }
     fn frozen(&self) -> (u32, u32) {
         let d = self.doc.borrow();
@@ -883,6 +898,15 @@ mod tests {
         // Hidden, the long one no longer counts.
         s.doc.borrow_mut().wb.sheet_mut(0).hidden = vec![(1, 1)];
         assert!(s.fit_width(0).unwrap() < wide);
+    }
+
+    #[test]
+    fn ctrl_semicolon_gives_today_and_the_time_as_typed() {
+        let s = src(&[]);
+        let day = s.now_text(false).unwrap();
+        assert!(crate::doc::typed_date(&day).is_some_and(|d| d.1 == "yyyy-mm-dd"), "{day}");
+        let time = s.now_text(true).unwrap();
+        assert!(crate::doc::typed_date(&time).is_some_and(|d| d.1 == "hh:mm"), "{time}");
     }
 
     #[test]

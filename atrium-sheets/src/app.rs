@@ -1067,6 +1067,10 @@ impl Sheets {
                 let most = if rows { MAX_ROW_PX } else { MAX_COL_PX };
                 let mut d = self.doc.borrow_mut();
                 match typed.parse::<f64>() {
+                    // A row 0 high is a hidden row, as Hide Rows makes it.
+                    Ok(px) if rows && px == 0.0 && s == d.sheet => {
+                        crate::data::run(&mut d, pergola::widgets::CellRange { r0: lo, c0: 0, r1: hi, c1: 0 }, (lo, 0), crate::data::DataCmd::HideRows);
+                    }
                     Ok(px) if px.is_finite() && (0.0..=most).contains(&px) && s == d.sheet => {
                         d.size_preview(rows, lo, hi, px.round());
                         d.size_done();
@@ -1276,7 +1280,20 @@ impl Sheets {
                     grow = Some(row);
                 }
             }
-            GridAction::Clear(r) => d.clear(r.r0, r.c0, r.r1, r.c1),
+            GridAction::CommitAll { sel, text } => {
+                let area = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+                if d.type_all(area, &text) && sel.r0 == sel.r1 {
+                    grow = Some(sel.r0);
+                }
+            }
+            GridAction::Clear(r) => {
+                d.clear(r.r0, r.c0, r.r1, r.c1);
+                // A row grown for lines now gone shrinks back.
+                let s = d.sheet;
+                if let Some(&(_, row)) = d.grown_rows.iter().find(|&&(t, row)| t == s && (r.r0..=r.r1).contains(&row)) {
+                    grow = Some(row);
+                }
+            }
             GridAction::Fill { from, to, copy, flip } => {
                 use officina_grid::autofill::Mode;
                 let rect = |r: CellRange| officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
@@ -2876,6 +2893,17 @@ mod tests {
         s.doc.borrow_mut().size_done();
         commit(6, "one\ntwo\nthree");
         assert_eq!(height(6), 30.0);
+        // A grown row shrinks back when its text needs less.
+        commit(4, "one\ntwo\nthree");
+        assert!(height(4) > 40.0);
+        commit(4, "one\ntwo");
+        assert!(height(4) > 20.0 && height(4) < 40.0, "{}", height(4));
+        commit(4, "one");
+        assert_eq!(height(4), 20.0);
+        // Cleared, too.
+        commit(4, "one\ntwo");
+        Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Clear(pergola::widgets::CellRange { r0: 4, c0: 0, r1: 4, c1: 0 }));
+        assert_eq!(height(4), 20.0);
     }
 
     #[test]
@@ -2912,6 +2940,11 @@ mod tests {
         s.size_text.set(TextEdit::new("40"));
         run(Cmd::Tab(TabCmd::SizeDone));
         assert_eq!(s.doc.borrow().wb.sheet(0).row_sizes.size(0), 40.0);
+        // 0 hides.
+        run(Cmd::Data(crate::data::DataCmd::RowHeight));
+        s.size_text.set(TextEdit::new("0"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert!(s.doc.borrow().wb.sheet(0).row_hidden(0));
     }
 
     #[test]

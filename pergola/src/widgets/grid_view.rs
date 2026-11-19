@@ -316,6 +316,11 @@ pub trait GridSource {
     fn merges_in(&self, _range: CellRange) -> Vec<CellRange> {
         Vec::new()
     }
+    /// Today's date (or, `time`, the time now) as typed into a cell, for
+    /// Ctrl+; and Ctrl+Shift+;. None: the keys do nothing.
+    fn now_text(&self, _time: bool) -> Option<String> {
+        None
+    }
     fn data_edge(&self, r: u32, c: u32, dr: i32, dc: i32) -> (u32, u32) {
         let r = match dr.signum() {
             -1 => 0,
@@ -485,6 +490,9 @@ pub enum GridAction {
     /// A double-click on column `col`'s right edge: fit it to what it
     /// holds (the app measures, with [`needed_width`]).
     FitCol(u32),
+    /// Ctrl+Enter in the editor: `text` entered in every cell of `sel`
+    /// (formulas moving as a copy would); the selection stays.
+    CommitAll { sel: CellRange, text: String },
     /// A double-click on row `row`'s bottom edge: fit it to what it holds
     /// (the app measures, with [`needed_height`]). On the double line of
     /// hidden rows, `row` is the first hidden one.
@@ -2045,6 +2053,37 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 ed.insert_break();
                 return true;
             }
+            // Ctrl+Enter: the same entry in every selected cell.
+            Key::Enter if m.ctrl || m.meta => {
+                let text = ed.text().to_string();
+                let sel = g.selection();
+                g.edit = None;
+                send(GridAction::CommitAll { sel, text });
+                return true;
+            }
+            Key::Char if (m.ctrl || m.meta) && (chars == ";" || chars == ":") => {
+                if let Some(t) = src.now_text(m.shift || chars == ":") {
+                    ed.insert(&t);
+                }
+                return true;
+            }
+            // Up and Down move between the editor's lines, at about the
+            // same place across; past the first or last they end it.
+            Key::Up | Key::Down if !m.shift && ed.text().contains('\n') => {
+                let text = ed.text().to_string();
+                let lines = editor_lines(&text);
+                let k = lines.iter().position(|l| (l.start..=l.end).contains(&ed.caret())).unwrap_or(0);
+                let to = if key == Key::Up { k.checked_sub(1) } else { Some(k + 1).filter(|&n| n < lines.len()) };
+                if let Some(n) = to {
+                    let style = editor_style();
+                    let x = crate::text::measure(&text[lines[k].start..ed.caret()], &style).w;
+                    let i = lines[n].start + index_at(&text[lines[n].clone()], x, &style);
+                    ed.set_caret(i, false);
+                    return true;
+                }
+                finish(g, st, if key == Key::Up { -1 } else { 1 }, 0);
+                return true;
+            }
             Key::Enter => {
                 finish(g, st, if m.shift { -1 } else { 1 }, 0);
                 return true;
@@ -2112,6 +2151,15 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             send(GridAction::Clear(g.selection()));
             return true;
         }
+        // Ctrl+; (Ctrl+Shift+;): start editing with today's date (the time).
+        Key::Char if cmd && (chars == ";" || chars == ":") => {
+            let Some(t) = src.now_text(m.shift || chars == ":") else { return false };
+            let mut ed = TextEdit::new("");
+            ed.insert(&t);
+            g.edit = Some(ed);
+            reveal(src, geom, st, g.cursor);
+            return true;
+        }
         Key::Char if cmd => {
             match chars.to_ascii_lowercase().as_str() {
                 "z" if m.shift => send(GridAction::Redo),
@@ -2144,10 +2192,10 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             return true;
         }
         Key::Char if !chars.is_empty() && !chars.chars().any(char::is_control) => {
-            // Typing replaces the active cell's content.
+            // Typing replaces the active cell's content; the selection stays
+            // (for Ctrl+Enter).
             let mut ed = TextEdit::new("");
             ed.insert(chars);
-            g.anchor = g.cursor;
             g.edit = Some(ed);
             reveal(src, geom, st, g.cursor);
             return true;
@@ -2948,12 +2996,47 @@ mod tests {
         app.handle_event(Event::PointerUp { at: second });
         app.tick();
         assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.caret()), Some("hello world\n".len()));
+        // Up and Down move between its lines; Down past the last ends it.
+        key(&mut app, Key::End, "", Modifiers::default());
+        key(&mut app, Key::Up, "", Modifiers::default());
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.caret()), Some(1));
+        key(&mut app, Key::Down, "", Modifiers::default());
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.caret()), Some("hello world\nx".len()));
+        key(&mut app, Key::Down, "", Modifiers::default());
+        assert!(state.get_cloned().edit.is_none());
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Commit { row: 1, col: 1, text } if text == "hello world\nx")));
+        log.borrow_mut().clear();
+        key(&mut app, Key::Char, "z", Modifiers::default());
         // A press on another cell still commits and moves there.
         let c5 = Point::new(hw + 128.0 + 10.0, HEADER_H + 85.0);
         app.handle_event(Event::PointerDown { at: c5 });
         app.handle_event(Event::PointerUp { at: c5 });
         app.tick();
-        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Commit { row: 1, col: 1, .. })));
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Commit { row: 2, col: 1, .. })));
+    }
+
+    #[test]
+    fn ctrl_enter_enters_the_text_in_every_selected_cell() {
+        let (mut app, _, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let b2 = Point::new(hw + 64.0 + 10.0, HEADER_H + 25.0);
+        app.handle_event(Event::PointerDown { at: b2 });
+        app.handle_event(Event::PointerUp { at: b2 });
+        app.tick();
+        let shift = Modifiers { shift: true, ..Default::default() };
+        key(&mut app, Key::Down, "", shift);
+        key(&mut app, Key::Right, "", shift);
+        key(&mut app, Key::Char, "7", Modifiers::default());
+        key(&mut app, Key::Enter, "", Modifiers { ctrl: true, ..Default::default() });
+        let sel = CellRange { r0: 1, c0: 1, r1: 2, c1: 2 };
+        assert_eq!(log.borrow().last(), Some(&GridAction::CommitAll { sel, text: "7".into() }));
+        let g = state.get_cloned();
+        assert!(g.edit.is_none());
+        assert_eq!(g.selection(), sel);
+        // Ctrl+; with no date to give does nothing.
+        key(&mut app, Key::Char, ";", Modifiers { ctrl: true, ..Default::default() });
+        assert!(state.get_cloned().edit.is_none());
     }
 
     #[test]
