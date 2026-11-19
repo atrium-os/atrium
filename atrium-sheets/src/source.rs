@@ -115,6 +115,7 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
         HAlign::CenterAcross => CellAlign::Across,
         HAlign::Right => CellAlign::Right,
     };
+    cv.wrap = st.wrap;
     Some(cv)
 }
 
@@ -599,6 +600,32 @@ impl SheetSource {
     }
 }
 
+impl SheetSource {
+    /// The height row `row` needs for what it shows: its tallest cell's
+    /// lines (wrapped to their column's width), at least the default
+    /// height. Hidden columns and cells merged across rows don't count.
+    pub fn fit_height(&self, row: u32) -> f64 {
+        let cols: Vec<(u32, f64)> = {
+            let d = self.doc.borrow();
+            let (_, ec) = d.wb.extent(d.sheet);
+            let sh = d.wb.sheet(d.sheet);
+            let mut cols = Vec::new();
+            if ec > 0 {
+                d.wb.each(&officina_grid::Rect { sheet: d.sheet, r0: row, c0: 0, r1: row, c1: ec - 1 }, &mut |_, c, v| {
+                    if cols.len() < FIT_CELLS && !v.is_empty() {
+                        cols.push((c, sh.col_sizes.size(c)));
+                    }
+                });
+            }
+            cols.retain(|&(c, w)| w > 0.0 && d.wb.merge_at(CellAddr::new(d.sheet, row, c)).is_none_or(|m| m.r0 == m.r1));
+            cols
+        };
+        let default = { let d = self.doc.borrow(); d.wb.sheet(d.sheet).row_sizes.default };
+        let h = cols.into_iter().filter_map(|(c, w)| self.cell(row, c).map(|cv| pergola::widgets::grid_view::needed_height(&cv, w))).fold(0.0, f64::max);
+        h.max(default)
+    }
+}
+
 /// The most cells one column fit reads.
 pub const FIT_CELLS: usize = 200_000;
 
@@ -846,6 +873,22 @@ mod tests {
         // Hidden, the long one no longer counts.
         s.doc.borrow_mut().wb.sheet_mut(0).hidden = vec![(1, 1)];
         assert!(s.fit_width(0).unwrap() < wide);
+    }
+
+    #[test]
+    fn a_row_fits_its_wrapped_text() {
+        let s = src(&[(0, 0, "short"), (0, 1, "one two three four five six seven eight nine ten")]);
+        let default = s.doc.borrow().wb.sheet(0).row_sizes.default;
+        assert_eq!(s.fit_height(0), default);
+        assert_eq!(s.fit_height(5), default);
+        // Wrapped, the long one takes several lines.
+        let mut d = s.doc.borrow_mut();
+        let r = officina_grid::Rect { sheet: 0, r0: 0, c0: 1, r1: 0, c1: 1 };
+        let op = officina_grid::ops::GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { wrap: true, ..st.clone() });
+        d.run("Wrap Text", vec![op]);
+        drop(d);
+        assert!(s.cell(0, 1).unwrap().wrap);
+        assert!(s.fit_height(0) > 2.0 * default, "{}", s.fit_height(0));
     }
 
     fn src(cells: &[(u32, u32, &str)]) -> SheetSource {

@@ -59,8 +59,15 @@ fi
 # They are restarted below in dependency order; with START=0 the operator
 # restarts them.
 echo "=== stopping daemons (ETXTBSY guard) ==="
-for s in atrium-dispensatord atrium-portcullisd-daemon atrium-volumes atrium-jaild; do
-    if g "pgrep -f $s >/dev/null 2>&1"; then
+# The bootstrap too: started at boot, its binary is busy like the others'.
+# Running is asked of rc.d (`service status`), never `pgrep -f`: the
+# bootstrap's own arguments name atrium-volumes' socket, so a pattern match
+# finds a daemon that isn't there.
+running() { g "service $1 status >/dev/null 2>&1"; }
+BOOTSTRAP_WAS=0
+running atrium-portcullisd-bootstrap && BOOTSTRAP_WAS=1
+for s in atrium-portcullisd-bootstrap atrium-dispensatord atrium-portcullisd-daemon atrium-volumes atrium-jaild; do
+    if running $s; then
         g "service $s stop >/dev/null 2>&1"
         printf '  %-34s stopped\n' "$s"
     else
@@ -202,7 +209,7 @@ for s in atrium-jaild atrium-dispensatord atrium-volumes atrium-portcullisd-daem
     # exits non-zero for it, so checking the process first is what makes this
     # script idempotent in its OUTPUT and not just in its effect — a deploy
     # script that prints FAILED on a healthy system trains you to ignore it.
-    if g "pgrep -f $s >/dev/null 2>&1"; then
+    if running $s; then
         echo "already running"
     elif g "service $s start >/tmp/svc.log 2>&1"; then
         echo OK
@@ -212,13 +219,18 @@ for s in atrium-jaild atrium-dispensatord atrium-volumes atrium-portcullisd-daem
     sleep 2
 done
 
+if [ "$BOOTSTRAP_WAS" = 1 ]; then
+    printf '  %-32s ' atrium-portcullisd-bootstrap
+    if g "service atrium-portcullisd-bootstrap start >/tmp/svc.log 2>&1"; then echo "OK (was running)"; else echo FAILED; rc=1; fi
+fi
+
 echo "=== verify ==="
 g 'for p in atrium-jaild atrium-volumes atrium-portcullisd-daemon; do
-     printf "  %-32s %s\n" "$p" "$(pgrep -f $p >/dev/null && echo RUNNING || echo DOWN)"
+     printf "  %-32s %s\n" "$p" "$(service $p status >/dev/null 2>&1 && echo RUNNING || echo DOWN)"
    done
    echo "  sockets: $(ls /var/run/atrium/*.sock 2>/dev/null | wc -l | tr -d " ")"'
-g 'pgrep -f atrium-jaild >/dev/null && pgrep -f atrium-volumes >/dev/null \
-   && pgrep -f atrium-portcullisd-daemon >/dev/null' || { echo "  ★ a daemon is DOWN"; rc=1; }
+g 'service atrium-jaild status >/dev/null && service atrium-volumes status >/dev/null \
+   && service atrium-portcullisd-daemon status >/dev/null' || { echo "  ★ a daemon is DOWN"; rc=1; }
 
 echo
 echo "To drive the smoke manifests:  service atrium-portcullisd-bootstrap start"
