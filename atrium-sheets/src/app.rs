@@ -2877,6 +2877,75 @@ mod tests {
     use pergola::geom::Point;
 
     #[test]
+    fn reopened_axis_ids_merge_multiple_blank_shifts_and_flag_conflicts() {
+        use officina_grid::{compare::{CellSnapshot, Change}, shift::{shift_op, Axis}, Value};
+
+        let shift = |doc: &mut Doc, axis, at, by| {
+            let op = shift_op(&doc.wb, 0, axis, at, by).unwrap();
+            doc.run("Shift", vec![op]);
+        };
+        let mut seed = Doc::new("base");
+        shift(&mut seed, Axis::Rows, 20, 1);
+        let saved = seed.stored_native().unwrap();
+        let open = || Doc::from_native("base.osheet", &saved).unwrap();
+        let reopen = |doc: &Doc| Doc::from_native("branch.osheet", &doc.stored_native().unwrap()).unwrap();
+        let base = CellSnapshot::capture(&open().wb);
+        let make_app = |doc| Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+
+        let mut ours = open();
+        shift(&mut ours, Axis::Rows, 2, 2);
+        shift(&mut ours, Axis::Rows, 7, -1);
+        assert!(ours.type_into(3, 3, "51"));
+        let ours = reopen(&ours);
+        let prior = CellSnapshot::capture(&ours.wb);
+        let mut incoming = open();
+        shift(&mut incoming, Axis::Cols, 1, 2);
+        shift(&mut incoming, Axis::Cols, 7, -1);
+        shift(&mut incoming, Axis::Rows, 8, 1);
+        shift(&mut incoming, Axis::Rows, 12, -1);
+        assert!(incoming.type_into(8, 1, "88"));
+        let incoming = reopen(&incoming);
+
+        let sheets = make_app(ours);
+        sheets.merge_copies("incoming.osheet", &base, &incoming.wb);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        let merged = reopen(&sheets.doc.borrow());
+        assert_eq!(merged.wb.value(0, 3, 5), Value::num(51.0));
+        assert_eq!(merged.wb.value(0, 9, 1), Value::num(88.0));
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(CellSnapshot::capture(&sheets.doc.borrow().wb), prior);
+        assert!(sheets.doc.borrow_mut().redo());
+        assert_eq!(CellSnapshot::capture(&sheets.doc.borrow().wb), CellSnapshot::capture(&merged.wb));
+
+        // The imported IDs match on a second merge, so no axis is inserted twice.
+        let sheets = make_app(merged);
+        let before = CellSnapshot::capture(&sheets.doc.borrow().wb);
+        sheets.merge_copies("incoming.osheet", &base, &incoming.wb);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        assert_eq!(CellSnapshot::capture(&sheets.doc.borrow().wb), before);
+
+        let mut ours = open();
+        assert!(ours.type_into(5, 3, "30"));
+        let mut incoming = open();
+        shift(&mut incoming, Axis::Rows, 5, -1);
+        let sheets = make_app(reopen(&ours));
+        sheets.merge_copies("incoming.osheet", &base, &reopen(&incoming).wb);
+        assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
+            [Change::StructuralConflict { axis: Axis::Rows, at: 5, .. }]));
+        assert_eq!(sheets.doc.borrow().wb.value(0, 5, 3), Value::num(30.0));
+
+        let mut ours = open();
+        let mut incoming = open();
+        shift(&mut ours, Axis::Cols, 3, 1);
+        shift(&mut incoming, Axis::Cols, 3, 1);
+        let sheets = make_app(reopen(&ours));
+        sheets.merge_copies("incoming.osheet", &base, &reopen(&incoming).wb);
+        assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
+            [Change::StructuralConflict { axis: Axis::Cols, at: 3, .. }]));
+    }
+
+    #[test]
     fn structural_merge_combines_both_axes_and_flags_overlapping_edits() {
         use officina_grid::{compare::{CellSnapshot, Change}, ops::GridOp, shift::{shift_op, Axis}, CellAddr, Value};
 

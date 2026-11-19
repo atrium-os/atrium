@@ -148,6 +148,7 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellSnapshot {
     pub(crate) sheets: BTreeMap<String, BTreeMap<(u32, u32), Input>>,
+    pub(crate) axes: BTreeMap<String, [crate::axis_ids::AxisIds; 2]>,
 }
 
 pub struct MergePlan {
@@ -170,7 +171,10 @@ impl CellSnapshot {
             }).collect();
             (wb.sheet_name(sheet), inputs)
         }).collect();
-        Self { sheets }
+        let axes = (0..wb.sheet_count() as u16).map(|sheet| {
+            (wb.sheet_name(sheet), wb.sheet(sheet).axis_ids.clone())
+        }).collect();
+        Self { sheets, axes }
     }
 
     /// Compare by address, with the base deciding which side changed.

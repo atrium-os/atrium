@@ -56,11 +56,12 @@ pub struct Sheet {
     /// The width each hidden column (width 0) had, for showing it again as
     /// it was: (column, px), sorted. Files keep it with the column.
     pub hidden_widths: Vec<(u32, f64)>,
+    pub(crate) axis_ids: [crate::axis_ids::AxisIds; 2],
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new() }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), freeze_from: (0, 0), hidden_widths: Vec::new(), axis_ids: Default::default() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)
@@ -248,6 +249,7 @@ impl Workbook {
                 n += 24 + f.len() as u64 * 48;
             }
             n += (sh.row_sizes.overrides().len() + sh.col_sizes.overrides().len()) as u64 * 24;
+            n += sh.axis_ids.iter().map(|ids| ids.bytes()).sum::<u64>();
             n += sh.hidden.len() as u64 * 8;
             n += sh.merges.len() as u64 * 20;
             n += sh.comments.values().map(crate::comments::Comment::estimated_bytes).sum::<u64>();

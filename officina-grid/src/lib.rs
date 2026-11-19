@@ -39,6 +39,7 @@ pub mod numfmt;
 pub mod ops;
 pub mod pivot;
 pub mod recalc;
+pub mod axis_ids;
 pub mod shift;
 pub mod structural_merge;
 pub mod sheetops;

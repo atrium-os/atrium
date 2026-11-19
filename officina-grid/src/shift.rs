@@ -28,6 +28,12 @@ pub enum Axis {
     Cols,
 }
 
+impl Axis {
+    pub(crate) fn index(self) -> usize {
+        match self { Self::Rows => 0, Self::Cols => 1 }
+    }
+}
+
 /// `n` (> 0) inserted before `at`, or `-n` deleted from `at`, along one axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shift {
@@ -221,10 +227,26 @@ pub(crate) fn fills_of(wb: &Workbook, mut cells: Vec<(u32, u32, Arc<Expr>)>, out
 /// `sheet` at `at`; `None` if there is nothing to do or it would push cells
 /// off the sheet.
 pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Option<GridOp> {
+    if n > i64::from(MAX_ROWS) { return None; }
+    if n > 0 {
+        let inserted = [crate::axis_ids::Run::inserted(n as u32)];
+        shift_with_ids(wb, sheet, axis, at, n, Some(&inserted))
+    } else {
+        shift_with_ids(wb, sheet, axis, at, n, Some(&[]))
+    }
+}
+
+pub(crate) fn shift_with_ids(
+    wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64,
+    inserted: Option<&[crate::axis_ids::Run]>,
+) -> Option<GridOp> {
     if n == 0 || sheet as usize >= wb.sheet_count() {
         return None;
     }
     let s = Shift { axis, at, n };
+    let max = s.max();
+    if at >= max || n.unsigned_abs() > u64::from(max - at) { return None; }
+
     let (rows, cols) = wb.extent(sheet);
     let grow = n.max(0) as u32;
     let (nrows, ncols) = match axis {
@@ -523,6 +545,11 @@ pub fn shift_op(wb: &Workbook, sheet: u16, axis: Axis, at: u32, n: i64) -> Optio
         ops.push(GridOp::Sizes { sheet, rows: axis == Axis::Rows, over });
     }
 
+    if let Some(inserted) = inserted {
+        if inserted.iter().map(|r| i64::from(r.len)).sum::<i64>() != n.max(0) { return None; }
+        let ids = wb.sheet(sheet).axis_ids[axis.index()].splice(at, (-n).max(0) as u32, inserted)?;
+        ops.push(GridOp::AxisIdentities { sheet, axis, ids });
+    }
     if ops.is_empty() {
         return None;
     }

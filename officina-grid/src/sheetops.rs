@@ -128,6 +128,11 @@ pub fn delete_sheet_op(wb: &Workbook, s: u16) -> Option<GridOp> {
     if !wb.merges(s).is_empty() {
         ops.push(GridOp::Merges { sheet: s, list: Vec::new() });
     }
+    for axis in [crate::shift::Axis::Rows, crate::shift::Axis::Cols] {
+        if !wb.sheet(s).axis_ids[axis.index()].is_implicit() {
+            ops.push(GridOp::AxisIdentities { sheet: s, axis, ids: Default::default() });
+        }
+    }
     ops.push(GridOp::MoveSheet { from: s, to: (n - 1) as u16 });
     ops.push(GridOp::DropSheet);
     Some(GridOp::Batch(ops))
@@ -220,6 +225,7 @@ mod tests {
     #[test]
     fn deleting_a_sheet_breaks_what_read_it_and_undo_brings_all_back() {
         let mut wb = book();
+        crate::shift::shift_op(&wb, 0, crate::shift::Axis::Rows, 50, 1).unwrap().apply(&mut wb);
         wb.sheet_mut(0).tab_color = Some(0xC62828);
         let before = all_inputs(&wb);
         let file = crate::native::save_to_vec(&wb);

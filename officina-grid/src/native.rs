@@ -21,6 +21,7 @@
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
 //! | 20 | VALIDATIONS | data validation rules: ranges, kind, operator, formulas as text, flags, messages |
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
+//! | 24 | AXIS_IDENTITIES | one sheet’s runs of stable row and column IDs |
 //! | 23 | TRACKED_CELLS | change set author and its sparse baseline inputs by sheet name |
 //! | 22 | FREEZE_FROM | panes frozen with the view scrolled: count; per sheet, its index, first frozen row and column |
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
@@ -56,6 +57,7 @@ pub const VALIDATIONS: u16 = 20;
 pub const HIDDEN_WIDTHS: u16 = 21;
 pub const FREEZE_FROM: u16 = 22;
 pub const TRACKED_CELLS: u16 = 23;
+pub const AXIS_IDENTITIES: u16 = 24;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -136,6 +138,14 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         let mut w = Writer::new();
         set.encode(&mut w);
         c.add(TRACKED_CELLS, &w.into_bytes())?;
+    }
+
+    for (sheet, sh) in wb.sheets.iter().enumerate() {
+        if sh.axis_ids.iter().all(crate::axis_ids::AxisIds::is_implicit) { continue; }
+        let mut w = Writer::new();
+        w.u16(sheet as u16);
+        for ids in &sh.axis_ids { ids.encode(&mut w); }
+        c.add(AXIS_IDENTITIES, &w.into_bytes())?;
     }
 
     // Cells, renumbering the strings they use (the pool also holds texts no cell
@@ -491,6 +501,19 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
         let mut r = Reader::new(c.chunk(i)?);
         wb.set_tracked_cells(crate::tracking::TrackedCells::decode(&mut r)?);
+        done(&r)?;
+    }
+
+    let mut identities = std::collections::HashSet::new();
+    for i in of(AXIS_IDENTITIES) {
+        let mut r = Reader::new(c.chunk(i)?);
+        let sheet = r.u16()?;
+        if sheet as usize >= wb.sheet_count() || !identities.insert(sheet) {
+            return Err(LoadError::Bad("invalid or repeated axis identity sheet"));
+        }
+        wb.sheet_mut(sheet).axis_ids = [
+            crate::axis_ids::AxisIds::decode(&mut r)?, crate::axis_ids::AxisIds::decode(&mut r)?,
+        ];
         done(&r)?;
     }
 

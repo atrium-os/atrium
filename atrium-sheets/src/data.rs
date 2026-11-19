@@ -865,8 +865,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                     };
                     Ok(format!("{thing} {}.", if n > 0 { "inserted" } else { "deleted" }))
                 }
-                None if n > 0 => Err("There's no room: the sheet's last rows or columns are in use.".into()),
-                None => Ok("Nothing there to delete.".into()),
+                None => Err("This shift exceeds the sheet size or axis identity limits.".into()),
             }
         }
         DataCmd::SortAsc | DataCmd::SortDesc => {

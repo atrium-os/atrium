@@ -67,7 +67,7 @@ impl TrackedCells {
     fn empty(author: &str) -> Self {
         Self {
             author: author.into(),
-            baseline: CellSnapshot { sheets: BTreeMap::new() },
+            baseline: CellSnapshot { sheets: BTreeMap::new(), axes: BTreeMap::new() },
             bytes: 128 + author.len() as u64,
         }
     }

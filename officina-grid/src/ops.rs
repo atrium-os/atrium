@@ -95,6 +95,7 @@ pub enum GridOp {
     /// A sheet's remembered widths of hidden columns
     /// ([`crate::book::Sheet::hidden_widths`]), swapped in whole.
     HiddenWidths { sheet: u16, list: Vec<(u32, f64)> },
+    AxisIdentities { sheet: u16, axis: crate::shift::Axis, ids: crate::axis_ids::AxisIds },
 }
 
 /// Remembered widths: count, then each column (rising) and its width
@@ -274,6 +275,13 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::AxisIdentities { sheet, axis, ids } => {
+                w.u8(22);
+                w.u16(*sheet);
+                w.u8(axis.index() as u8);
+                ids.encode(&mut w);
+                return w.into_bytes();
+            }
             GridOp::HiddenWidths { sheet, list } => {
                 w.u8(21);
                 w.u16(*sheet);
@@ -444,6 +452,19 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 22 {
+            let sheet = r.u16()?;
+            let axis = match r.u8()? {
+                0 => crate::shift::Axis::Rows,
+                1 => crate::shift::Axis::Cols,
+                _ => return Err(WireError::Invalid("identity axis")),
+            };
+            let ids = crate::axis_ids::AxisIds::decode(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::AxisIdentities { sheet, axis, ids });
         }
         if kind == 21 {
             let sheet = r.u16()?;
@@ -645,6 +666,13 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::Links { sheet, set: wb.set_links(sheet, set) }
+            }
+            GridOp::AxisIdentities { sheet, axis, ids } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                let ids = std::mem::replace(&mut wb.sheet_mut(sheet).axis_ids[axis.index()], ids);
+                GridOp::AxisIdentities { sheet, axis, ids }
             }
             GridOp::HiddenWidths { sheet, list } => {
                 if sheet as usize >= wb.sheet_count() {
