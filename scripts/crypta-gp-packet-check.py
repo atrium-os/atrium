@@ -84,6 +84,7 @@ def require_reconnect_approval(receipts, config_index):
 
 # The cycle declines offer 1. The later reconnects use offers 2, 4, and 6.
 CYCLE_RECONNECTS = frozenset((2, 4, 6))
+CYCLE_REBINDS = frozenset((3, 5, 7))
 
 
 class EspPeer:
@@ -416,15 +417,20 @@ def main():
                         help="use ESP initially and force TLS fallback on later Tessera connections")
     parser.add_argument("--recover-esp-on-rebind", action="store_true",
                         help="force TLS on Tessera reconnects and restore ESP on rebinds")
+    parser.add_argument("--drop-esp-on-rebind", action="store_true",
+                        help="keep ESP on reconnect and force TLS fallback on Tessera rebinds")
     parser.add_argument("--hip", choices=("approve", "decline", *REFRESH_HIP), help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
-    if args.drop_esp_after_initial and args.recover_esp_on_rebind:
+    outages = [indices for enabled, indices in (
+        (args.drop_esp_after_initial, CYCLE_RECONNECTS | CYCLE_REBINDS),
+        (args.recover_esp_on_rebind, CYCLE_RECONNECTS),
+        (args.drop_esp_on_rebind, CYCLE_REBINDS),
+    ) if enabled]
+    if len(outages) > 1:
         parser.error("choose one staged ESP outage")
-    drop_config_indices = frozenset()
-    if args.drop_esp_after_initial or args.recover_esp_on_rebind:
-        if args.hip != "tessera-cycle" or args.drop_esp:
-            parser.error("staged ESP outages require --hip tessera-cycle")
-        drop_config_indices = CYCLE_RECONNECTS if args.recover_esp_on_rebind else frozenset(range(1, 8))
+    if outages and (args.hip != "tessera-cycle" or args.drop_esp):
+        parser.error("staged ESP outages require --hip tessera-cycle")
+    drop_config_indices = outages[0] if outages else frozenset()
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
@@ -600,6 +606,8 @@ def main():
                 if final_reconnect:
                     if args.recover_esp_on_rebind:
                         print("Dropped probes forced TLS on reconnects and ESP carried echo again on rebinds")
+                    elif args.drop_esp_on_rebind:
+                        print("ESP carried echo on reconnects and dropped probes forced TLS on rebinds")
                     elif args.drop_esp_after_initial:
                         print("ESP carried the initial traffic, then dropped probes forced TLS on every reconnect and rebind")
                     print("Final reconnect verified decline, silent refresh, fresh unlock approval, and rebind")

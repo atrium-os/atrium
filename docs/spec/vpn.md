@@ -885,6 +885,11 @@ another origin. An active portal-profile session stays in engine memory.
   It verifies IPv4 echo over TLS on reconnect and over the new ESP
   association on rebind, with the same HIP approval rules.
   The arm64 recovery gate passed 42/42 in one run.
+  With `--hip tessera-cycle --drop-esp-on-rebind`, the peer answers ESP
+  probes on reconnects and drops them on the three rebinds. The gate checks
+  IPv4 echo on ESP after reconnect and on TLS after rebind, with the same
+  HIP approval rules.
+  The arm64 rebind fallback variant passed 42/42 in one run.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
