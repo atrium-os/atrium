@@ -31,7 +31,13 @@ impl Drop for Sheet {
 fn window(view: u64, cookies: Cookies) -> Result<Sheet, ()> {
     let mut window = Connection::connect_default().map_err(|_| ())?;
     window.set_read_timeout(Some(Duration::from_secs(3))).map_err(|_| ())?;
-    let id = window.window_create(640, 360, "Microsoft sign-in", WindowHints { embed_pending: true, ..Default::default() }).map_err(|_| ())?;
+    let id = window.window_create(720, 540, "Microsoft sign-in", WindowHints { embed_pending: true, ..Default::default() }).map_err(|_| ())?;
+    window.set_default_window(u16::try_from(id).map_err(|_| ())?);
+    let mut frame = window.frame().map_err(|_| ())?;
+    frame.rect(fresco_protocol::RectParams {
+        x: 0., y: 0., w: 720., h: 540., r: 1., g: 1., b: 1., a: 1., radius: 0.,
+    }).map_err(|_| ())?;
+    frame.finish().map_err(|_| ())?;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(3) {
         if let Some(Event::EmbedToken { window_id, token }) = window.wait_event(Some(Duration::from_millis(100))).map_err(|_| ())? {
@@ -55,7 +61,7 @@ fn page(sheet: &mut Sheet, view: u64, ticket: [u8; 16], cookies: &Cookies, socke
     let channel = UnixStream::connect(socket).map_err(|_| ())?;
     let mut parent = Parent::wrap(aqueduct::Connection::wrap(channel).map_err(|_| ())?);
     let worker = parent.request("mail-sign-in-page", sheet.token).map_err(|_| ())?;
-    parent.place(worker, Some([0., 0., 640., 360.])).map_err(|_| ())?;
+    parent.place(worker, Some([24., 36., 640., 360.])).map_err(|_| ())?;
     parent.send_fd(worker, result.url.into_bytes(), body.as_fd()).map_err(|_| ())?;
     sheet.page = Some((parent, worker));
     Ok(())

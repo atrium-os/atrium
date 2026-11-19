@@ -400,6 +400,11 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     if st.embeds.values().filter(|e| e.parent == conn).count() >= catalogue::MAX_EMBEDS_PER_PARENT {
         return refuse(refusal::TOO_MANY);
     }
+    if role.slot == SlotKind::SignInPage && !st.embeds.values().any(|sheet|
+        sheet.role.name == "mail-sign-in" && sheet.child_uid == uid && sheet.child_window == Some(req.window)
+    ) {
+        return refuse(refusal::NOT_PROVIDER);
+    }
     if role.name == "print" {
         // One print sheet per window, and a window that keeps opening it
         // is slowed (printing.md §5.2).

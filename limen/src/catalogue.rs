@@ -16,6 +16,8 @@ pub enum SlotKind {
     /// parent asked for, dims the parent and keeps its input from it, and
     /// frames it with a tag the parent can't draw over.
     Sheet { w: u16, h: u16 },
+    /// The document of Navigator’s registered Mail sign-in sheet.
+    SignInPage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +78,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "pdf-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "pdf-sanitizer", provider: Provider::Worker("org.atrium.folium.sanitizer"), slot: SlotKind::Plain, takes_fd: true, returns_fd: true },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
-    Role { name: "mail-sign-in-page", provider: Provider::Worker("org.atrium.navigator.mail-page"), slot: SlotKind::Island, takes_fd: true, returns_fd: false },
+    Role { name: "mail-sign-in-page", provider: Provider::Worker("org.atrium.navigator.mail-page"), slot: SlotKind::SignInPage, takes_fd: true, returns_fd: false },
     Role { name: "mail-sign-in", provider: Provider::System("org.atrium.navigator"), slot: SlotKind::Sheet { w: 720, h: 540 }, takes_fd: false, returns_fd: false },
     Role { name: "web-island", provider: Provider::Worker(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },

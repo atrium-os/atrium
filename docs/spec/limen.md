@@ -515,7 +515,11 @@ in its slot; a made-up token is refused; after a release, or after its
 parent is destroyed, the click goes past it again; and a gone window's token is dead.
 
 A sheet may contain a credential slot, clipped and stacked above the sheet.
-Other slots still require a top-level parent. Limen lets the fixed-UID system
+The Mail sign-in sheet can also host its own document. For `mail-sign-in-page`,
+Limen requires the uid and window token of the active registered provider's
+sheet before launching the worker. Fresco accepts the `SIGN_IN_PAGE` bind
+only inside a sheet and gives its child the normal island clipping and input
+protections. Ordinary island and plain binds still require a top-level parent. Limen lets the fixed-UID system
 print sheet request the Arca credential role for its own surface. Frescod checks
 the window owner on bind as it does for other requests.
 

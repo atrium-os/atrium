@@ -570,7 +570,8 @@ hands the returned HTML in a sealed descriptor to its nested
 URL and bytes; the session ticket and cookie jar stay outside the engine.
 Cross-build the worker with `I0_MAIL_PAGE=ON`, link it with the interpreter
 and native painter, and sign the mail-page manifest. Deployment needs a
-Limen worker rule and Navigator's manifest grant for `mail-sign-in-page`.
+Limen per-instance worker rule for `org.atrium.navigator.mail-page`, with
+`_limen` as caller. Navigator opens the trusted sheet with its Fresco grant.
 
 The development provider requires a Secure HttpOnly session cookie on its
 redirect before serving a page whose inline script labels an account field.
@@ -595,8 +596,40 @@ For the visible test, stage the `I0_MAIL_PAGE=ON` binary as the signed
 gate worker and run the editor gate with `I0_MAIL_DOCUMENT` pointing to
 the public response saved by the first gate.
 
-Mail and navigatord cross-checked for arm64. The real Mail button, deployed
-signed services and session-backed sheet still need one continuous UI trial.
+**Continuous local UI gate, 2026-11-20.** On the shared arm64 HVF baseline,
+the writable overlay mounted `/dev/vtbd1p1` as Tessera. In each of three cold
+app launches, the test entered `ada@outlook.com` in Mail settings, pressed
+**Find settings**, then **Sign in with Microsoft**. Arca audited Mail's
+`0x14` and Navigator's `0x77` under the same fixture user. The signed
+Navigator instance was already running for that user. The courier reached
+only the fixture over TLS. The provider checked the S256 request and
+required its Secure HttpOnly cookie at the redirect before returning HTML.
+The rendered account field and its inline-script label **Enter your account**
+were visible inside the system-labeled Navigator sheet on all three presses.
+
+Mail anchors the sheet before sending the ticket. Navigator paints an opaque
+backdrop. Limen checks the requesting uid and window token against the
+registered Mail sheet before starting its document. Fresco admits that
+document as a clipped island inside the sheet. The non-root worker
+(uid 50006) ran the interpreter build identified above. FreeBSD reported
+Capsicum flag `C` and both jail IP families disabled. Split Fresco used a
+separate renderer jail. Each initial 640 × 360 document frame submitted
+3 changed nodes and 4,198,501 encoded bytes and rasterized 920 tiles.
+The three desktop PNGs had SHA-256
+`b0ef50c85095cd8c223ba0eb9a38a6e745e09513252c783f227c1d2a7c39146a`.
+
+The local provider is the `courier-test-server` example. Its arguments for
+this gate are `login.microsoftonline.com CA_FILE PORT_FILE MARKER_LOG
+127.0.0.1:0`. Trust its ephemeral CA only in the test courier. Inside the
+overlay map the provider name to 10.0.2.100. Run QEMU with restricted user
+networking and a per-connection guest forward from 10.0.2.100:443 to that
+loopback listener. This keeps the guest's standard PF host-address block in
+force. Start arcad, courierd and limend with the fixture publisher settings
+above, launch the installed Navigator and Mail bundles for the same user,
+and require exactly `authorized`, then `first-screen-cookie-ok` per press.
+Screenshots and redacted guest evidence on the Mac are under
+`~/atrium-vm/evidence/navigator-mail-button-20261120/`.
+
 This milestone covers the first HTML response and inline script. External
 script and stylesheet loading from LibWeb, interactive continuation, redirect
 redemption and first-grant storage still need separate verification. The

@@ -494,9 +494,9 @@ impl Arca for ArcadSocket {
         let mut s = UnixStream::connect(&self.path).map_err(|e| format!("arcad: {e}"))?;
         s.set_read_timeout(Some(Duration::from_secs(10))).ok();
         arcad::proto::write_request(&mut s, arcad::proto::broker_op::W_TICKET, &ask.encode()).map_err(|e| format!("arcad: {e}"))?;
-        let (st, body) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
+        let (st, body) = arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::Ticket).map_err(|e| format!("arcad: {e}"))?;
         if st != arcad::proto::status::OK { return Err(format!("arcad refused the ticket (status {st})")) }
-        body.as_ref().try_into().map_err(|_| "arcad: a ticket is 16 bytes".to_string())
+        body.as_slice().try_into().map_err(|_| "arcad: a ticket is 16 bytes".to_string())
     }
 
     fn forget(&mut self, partition: &str, prefix: bool) -> Result<u32, String> {
@@ -506,9 +506,9 @@ impl Arca for ArcadSocket {
         w.str(partition);
         w.u8(prefix as u8);
         arcad::proto::write_request(&mut s, arcad::proto::broker_op::W_FORGET, &w.buf).map_err(|e| format!("arcad: {e}"))?;
-        let (st, body) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
+        let (st, body) = arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::Count).map_err(|e| format!("arcad: {e}"))?;
         if st != arcad::proto::status::OK { return Err(format!("arcad refused to forget (status {st})")) }
-        let b: [u8; 4] = body.as_ref().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
+        let b: [u8; 4] = body.as_slice().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
         Ok(u32::from_le_bytes(b))
     }
 
@@ -579,11 +579,15 @@ impl ArcadSocket {
         let mut s = UnixStream::connect(&self.path).map_err(|e| format!("arcad: {e}"))?;
         s.set_read_timeout(Some(Duration::from_secs(10))).ok();
         arcad::proto::write_request(&mut s, op, body).map_err(|e| format!("arcad: {e}"))?;
-        let (st, b) = arcad::proto::read_reply(&mut s).map_err(|e| format!("arcad: {e}"))?;
+        let (st, b) = if op == arcad::proto::broker_op::W_MAIL_SIGN_IN {
+            arcad::proto::read_app_reply(&mut s, arcad::proto::AppReply::AuthorizationUrl)
+        } else {
+            arcad::proto::read_reply(&mut s).map(|(st, b)| (st, b.as_ref().to_vec()))
+        }.map_err(|e| format!("arcad: {e}"))?;
         if st != arcad::proto::status::OK {
             return Err(format!("arcad refused to {what} (status {st})"));
         }
-        Ok(b.as_ref().to_vec())
+        Ok(b)
     }
 }
 

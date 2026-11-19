@@ -7,7 +7,9 @@
 //! throwaway CA written to CA_OUT. The port goes to PORT_OUT; each request
 //! head, one line per request (`<request line> token=<bool> cookie=<value|->`),
 //! goes to LOG.
-//! Answers as courier-vm-probe's server does.
+//! A fifth argument is the listen address for the Mail sign-in fixture
+//! (use 127.0.0.1:0 on the host). In this mode the log contains stage
+//! markers only. The fixture checks PKCE request fields and a redirect cookie.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -18,12 +20,16 @@ fn main() {
     let (hosts, ca_out, port_out, log) = (&a[1], &a[2], &a[3], a[4].clone());
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.distinguished_name.push(rcgen::DnType::CommonName, "Atrium courier test CA");
+    ca.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca.self_signed(&ca_key).unwrap();
     std::fs::write(ca_out, ca_cert.pem()).unwrap();
     let k = rcgen::KeyPair::generate().unwrap();
     let names: Vec<String> = hosts.split(',').map(String::from).collect();
-    let c = rcgen::CertificateParams::new(names).unwrap().signed_by(&k, &ca_cert, &ca_key).unwrap();
+    let mut leaf = rcgen::CertificateParams::new(names).unwrap();
+    leaf.use_authority_key_identifier_extension = true;
+    let c = leaf.signed_by(&k, &ca_cert, &ca_key).unwrap();
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let cfg = Arc::new(
         rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -33,7 +39,11 @@ fn main() {
             .with_single_cert(vec![CertificateDer::from(c.der().to_vec())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k.serialize_der())))
             .unwrap(),
     );
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    // Optional guest-local address for the Mail button gate. The only signing
+    // authority in that courier jail is this throwaway fixture CA.
+    let mail_address = a.get(5);
+    let mail = mail_address.is_some();
+    let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
     std::fs::write(port_out, l.local_addr().unwrap().port().to_string()).unwrap();
     for s in l.incoming().flatten() {
         let (cfg, log) = (cfg.clone(), log.clone());
@@ -53,6 +63,27 @@ fn main() {
                 let token = req.contains("Authorization: Bearer hunter2-token\r\n");
                 let first = req.lines().next().unwrap_or("").to_string();
                 let cookie = req.lines().find_map(|l| l.strip_prefix("Cookie: ")).unwrap_or("-").to_string();
+                if mail {
+                    let target = first.strip_prefix("GET ").and_then(|s| s.split_whitespace().next()).unwrap_or("");
+                    let authorization = target.strip_prefix("/common/oauth2/v2.0/authorize?").is_some_and(|q| {
+                        let has = |key: &str, value: &str| q.split('&').any(|kv| kv.split_once('=') == Some((key, value)));
+                        has("client_id", "11111111-1111-4111-8111-111111111111") && has("code_challenge_method", "S256")
+                            && q.split('&').any(|kv| kv.strip_prefix("code_challenge=").is_some_and(|v| v.len() == 43))
+                            && q.split('&').any(|kv| kv.strip_prefix("state=").is_some_and(|v| v.len() == 22))
+                    });
+                    let (marker, reply) = if authorization {
+                        ("authorized", "HTTP/1.1 302 Found\r\nSet-Cookie: flow=dev; Secure; HttpOnly; Path=/\r\nLocation: /first\r\nContent-Length: 0\r\n\r\n".to_string())
+                    } else if target == "/first" && cookie.split("; ").any(|v| v == "flow=dev") {
+                        let html = "<!doctype html><label id=prompt for=account></label><input id=account><script>document.getElementById('prompt').textContent='Enter your account'</script>";
+                        ("first-screen-cookie-ok", format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{html}", html.len()))
+                    } else {
+                        ("refused", "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_string())
+                    };
+                    let mut log = std::fs::OpenOptions::new().append(true).create(true).open(&log).unwrap();
+                    writeln!(log, "{marker}").unwrap();
+                    if t.write_all(reply.as_bytes()).and_then(|_| t.flush()).is_err() { break; }
+                    continue;
+                }
                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&log) {
                     let _ = writeln!(f, "{first} token={token} cookie={cookie}");
                 }

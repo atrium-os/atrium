@@ -810,6 +810,8 @@ fn mail_sheet_requires_its_publisher_owner_and_persona() {
     assert_eq!(refused(provider(w.connect(4101), "mail-sign-in").map(|_| ())), refusal::NOT_PROVIDER);
     w.shared.set_mail_sheet_provider(Box::new(|uid| uid == 4101));
     let _sheet = provider(w.connect(4101), "mail-sign-in").unwrap();
+    assert_eq!(refused(w.parent(4101).request("mail-sign-in-page", W_APP)), refusal::NOT_PROVIDER);
+    assert_eq!(refused(w.parent(4111).request("mail-sign-in-page", W_APP)), refusal::NOT_PROVIDER);
     assert_eq!(refused(provider(w.connect(4102), "mail-sign-in").map(|_| ())), refusal::NOT_PROVIDER);
     assert!(w.parent(4111).request("mail-sign-in", W_APP).is_ok());
     assert_eq!(refused(w.parent(4112).request("mail-sign-in", W_APP)), refusal::NO_PROVIDER);

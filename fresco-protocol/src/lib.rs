@@ -2569,6 +2569,9 @@ pub mod slot {
         /// go to the sheet, and frescod frames it with a tag naming its app
         /// that the parent can't draw over. One per parent.
         pub const SHEET: u8 = 3;
+        /// The brokered sign-in document inside its trusted sheet. After binding,
+        /// the compositor treats the document as an ordinary protected island.
+        pub const SIGN_IN_PAGE: u8 = 4;
     }
 
     pub mod refusal {

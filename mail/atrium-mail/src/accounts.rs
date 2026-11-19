@@ -360,9 +360,9 @@ pub fn microsoft_sign_in(arca: &std::path::Path) -> Result<[u8; 16], String> {
     let timeout = Some(Duration::from_secs(10));
     socket.set_read_timeout(timeout).and_then(|_| socket.set_write_timeout(timeout)).map_err(|e| e.to_string())?;
     arcad::proto::write_request(&mut socket, op::MAIL_SIGN_IN, &[]).map_err(|e| e.to_string())?;
-    let (code, body) = arcad::proto::read_reply(&mut socket).map_err(|e| e.to_string())?;
+    let (code, body) = arcad::proto::read_app_reply(&mut socket, arcad::proto::AppReply::Ticket).map_err(|e| e.to_string())?;
     match code {
-        status::OK => body.as_ref().try_into().map_err(|_| "Arca returned an invalid sign-in ticket.".into()),
+        status::OK => body.as_slice().try_into().map_err(|_| "Arca returned an invalid sign-in ticket.".into()),
         status::UNSUPPORTED => Err("Atrium Mail has no Microsoft app registration configured.".into()),
         status::LOCKED => Err("Unlock Arca and try again.".into()),
         _ => Err(format!("Arca refused Microsoft sign-in ({code}).")),

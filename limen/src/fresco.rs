@@ -57,6 +57,7 @@ impl Compositor for Frescod {
         let kind = match kind {
             SlotKind::Plain => slot::kind::PLAIN,
             SlotKind::Credential => slot::kind::CREDENTIAL,
+            SlotKind::SignInPage => slot::kind::SIGN_IN_PAGE,
             SlotKind::Island => slot::kind::ISLAND,
             SlotKind::Sheet { .. } => slot::kind::SHEET,
         };

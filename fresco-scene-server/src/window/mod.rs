@@ -1647,9 +1647,15 @@ impl Compositor {
         if child == 0 || parent == 0 || !self.windows.contains_key(&child) || !self.windows.contains_key(&parent) {
             return Err(refusal::UNKNOWN_WINDOW);
         }
+        let sign_in_page = kind == k::SIGN_IN_PAGE;
+        let parent_slot = self.windows[&parent].slot;
+        if sign_in_page && !parent_slot.is_some_and(|s| s.kind == k::SHEET) {
+            return Err(refusal::INVALID);
+        }
+        let kind = if sign_in_page { k::ISLAND } else { kind };
         let c = &self.windows[&child];
         let ok = child != parent
-            && self.windows[&parent].slot.is_none_or(|s| s.kind == k::SHEET && kind == k::CREDENTIAL)
+            && parent_slot.is_none_or(|s| s.kind == k::SHEET && (kind == k::CREDENTIAL || sign_in_page))
             && c.role != WmRole::Notification
             && c.slot.is_none_or(|s| s.parent == parent)
             && c.kept_by.is_none_or(|p| p == parent)
@@ -2413,6 +2419,24 @@ mod notification_tests {
         assert_eq!(c.sheet_of(p), None);
         assert_eq!(c.key_target(p), p);
         assert_eq!(c.keyboard_window(), p as u32);
+    }
+
+    #[test]
+    fn a_sign_in_page_is_an_island_only_inside_a_sheet() {
+        use fresco_protocol::slot::{kind, refusal};
+        let mut c = Compositor::new();
+        let mail = c.create(1, (900, 640));
+        let sheet = c.create(2, (720, 540));
+        let page = c.create(3, (640, 360));
+        let rect = Some([0., 0., 640., 360.]);
+        assert_eq!(c.bind_slot(page, mail, kind::SIGN_IN_PAGE, rect, 0), Err(refusal::INVALID));
+        c.bind_slot(sheet, mail, kind::SHEET, rect, 0).unwrap();
+        assert_eq!(c.bind_slot(page, sheet, kind::ISLAND, rect, 0), Err(refusal::INVALID));
+        c.bind_slot(page, sheet, kind::SIGN_IN_PAGE, rect, 0).unwrap();
+        assert!(c.is_island(page));
+        assert!(c.embed_in(page, sheet));
+        c.bind_slot(sheet, mail, kind::SHEET, None, 0).unwrap();
+        assert!(!c.z_order.contains(&page));
     }
 
     #[test]

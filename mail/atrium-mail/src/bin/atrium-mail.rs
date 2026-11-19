@@ -679,7 +679,7 @@ fn main() {
             if let Some(ticket) = sw.s.take_microsoft_ticket() {
                 if let (false, None, Some(e), Some(token)) = (close_settings, sw.microsoft, &embeds, sw.win.embed_token()) {
                     let mut e = e.borrow_mut();
-                    match e.request("mail-sign-in", token, 0x4d534947) {
+                    match e.request("mail-sign-in", token, atrium_mail::settings::MICROSOFT_SHEET_SLOT) {
                         Ok(id) if e.send(id, ticket.to_vec()).is_ok() => {
                             sw.microsoft = Some(id);
                             sw.s.microsoft_sheet_open.set(true);

@@ -15,6 +15,7 @@ icon        = "envelope"
 
 [capabilities]
 graphics  = "fresco"
+arca      = true  # begin the PKCE session under Mail’s signed identity
 network   = "none"
 net-fetch = true   # remote pictures, only when asked
 # Open in… (§8.2): a sealed, read-only memory file to portcullisd with a

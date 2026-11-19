@@ -1064,12 +1064,16 @@ impl SettingsView {
     }
 }
 
+pub const MICROSOFT_SHEET_SLOT: pergola::slot::SlotKey = 0x4d534947;
+
 impl View for SettingsView {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
         let ui = self.s.ui.get_cloned();
         let (w, h) = self.size.get();
-        ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
+        let background = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: t.bg_canvas(), radius: 0.0 });
+        // Register the sheet anchor before a button press can send its ticket.
+        ctx.slot(background, MICROSOFT_SHEET_SLOT);
         let head = em(48.0);
         ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, head), fill: t.bg_window(), radius: 0.0 });
         ctx.add(Node::Rect { rect: Rect::new(0.0, head - 1.0, w, 1.0), fill: t.border_default(), radius: 0.0 });

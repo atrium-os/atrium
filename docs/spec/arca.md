@@ -20,7 +20,10 @@ profiles). Arca holds data that is *kept from* the app. Loculus's master key is 
 
 Mail's Microsoft first-screen gate uses `MAIL_SIGN_IN` and
 `W_MAIL_SIGN_IN` to pass a same-user, one-use authorization URL to the
-signed Navigator broker while Arca retains the PKCE verifier.
+signed Navigator broker while Arca retains the PKCE verifier. Mail and Navigator
+use bounded app replies for 16-byte tickets, four-byte forget counts and the
+authorization URL. Ordinary app jails can read these without memory-lock
+privileges. Secret-bearing Arca replies still require locked memory.
 [Development configuration and gate](navigator-islands.md#development-registration-and-mails-first-screen).
 
 ## 1. The three promises

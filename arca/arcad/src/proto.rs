@@ -581,6 +581,40 @@ pub fn write_request(w: &mut impl Write, op: u16, body: &[u8]) -> io::Result<()>
 
 /// Read a reply frame (clients and tests): `(status, body)`.
 pub fn read_reply(r: &mut impl Read) -> io::Result<(u8, LockedBuf)> {
+    let (status, len) = reply_header(r)?;
+    let mut body = LockedBuf::zeroed(len)?;
+    r.read_exact(body.as_mut())?;
+    Ok((status, body))
+}
+
+/// Replies ordinary app jails may receive without the privilege to lock memory.
+/// The verifier, credentials and cookie values are never among these replies.
+pub enum AppReply {
+    Ticket,
+    Count,
+    AuthorizationUrl,
+}
+
+pub fn read_app_reply(r: &mut impl Read, kind: AppReply) -> io::Result<(u8, Vec<u8>)> {
+    let (status, len) = reply_header(r)?;
+    let valid = if status != status::OK {
+        len == 0
+    } else {
+        match kind {
+            AppReply::Ticket => len == 16,
+            AppReply::Count => len == 4,
+            AppReply::AuthorizationUrl => (1..=8192).contains(&len),
+        }
+    };
+    if !valid {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid app reply length"));
+    }
+    let mut body = vec![0; len];
+    r.read_exact(&mut body)?;
+    Ok((status, body))
+}
+
+fn reply_header(r: &mut impl Read) -> io::Result<(u8, usize)> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let n = u32::from_le_bytes(len) as usize;
@@ -589,7 +623,27 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<(u8, LockedBuf)> {
     }
     let mut st = [0u8; 1];
     r.read_exact(&mut st)?;
-    let mut body = LockedBuf::zeroed(n - 1)?;
-    r.read_exact(body.as_mut())?;
-    Ok((st[0], body))
+    Ok((st[0], n - 1))
+}
+
+#[cfg(test)]
+mod app_reply_tests {
+    use super::*;
+
+    #[test]
+    fn app_replies_check_the_status_and_length_before_reading_the_body() {
+        let mut frame = Vec::new();
+        write_reply(&mut frame, status::OK, &[7; 16]).unwrap();
+        assert_eq!(read_app_reply(&mut &frame[..], AppReply::Ticket).unwrap().1, [7; 16]);
+        assert!(read_app_reply(&mut &frame[..], AppReply::Count).is_err());
+        assert!(read_app_reply(&mut &frame[..8], AppReply::Ticket).is_err());
+
+        frame.clear();
+        write_reply(&mut frame, status::LOCKED, &[]).unwrap();
+        assert_eq!(read_app_reply(&mut &frame[..], AppReply::Ticket).unwrap(), (status::LOCKED, vec![]));
+        frame.clear();
+        write_reply(&mut frame, status::LOCKED, &[7]).unwrap();
+        assert!(read_app_reply(&mut &frame[..], AppReply::Ticket).is_err());
+        assert!(read_app_reply(&mut &[2, 32, 0, 0, status::OK][..], AppReply::AuthorizationUrl).is_err());
+    }
 }

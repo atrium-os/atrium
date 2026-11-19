@@ -6,8 +6,8 @@
 #   sh navigator-broker-bundle.sh <navigatord binary> <navigatord.conf> <signing key.pem> [opifex]
 #
 # A person launches it (portcullisd's Launch), so it runs as the Navigator's
-# per-app uid for that person, in the Navigator's jail. Its one capability is
-# `navigator-broker`, restricted: the directories of the sockets it serves
+# per-app uid for that person, in the Navigator's jail. Its restricted
+# `navigator-broker` capability provides the directories of the sockets it serves
 # (navigator/, navigator-page/) and uses (fresco-chrome/, fresco-activation/,
 # limen/, portcullis/, arca/, arca-courier/). No network: its pages come
 # through fetcher jails. A jail gets no environment of its caller's, so its
@@ -29,6 +29,7 @@ entry = "bin/navigatord"
 
 [capabilities]
 navigator-broker = true
+graphics = "fresco"  # the broker owns the trusted sign-in sheet window
 # The captive portal's sign-in window (atrium-net.md §8.1 S3), restricted.
 network-portal = true
 
