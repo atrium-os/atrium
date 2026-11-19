@@ -3852,7 +3852,7 @@ impl MailView {
             }
             let wt = if r.unread { Weight::Semibold } else { Weight::Regular };
             let date = crate::date_text(r.date, now);
-            let dw = width(&date, type_size::XS, Weight::Regular);
+            let dw = width(&date, type_size::SM, Weight::Regular);
             let count = if r.count > 1 { format!(" {}", r.count) } else { String::new() };
             let cw = width(&count, type_size::XS, Weight::Regular);
             let inner = w - 1.0 - 36.0;
@@ -3864,10 +3864,10 @@ impl MailView {
             if !count.is_empty() {
                 text(ctx, 20.0 + pw, top + line * 0.5, &count, type_size::XS, Weight::Regular, t.text_secondary());
             }
-            text(ctx, w - 17.0 - dw, top + line * 0.5, &date, type_size::XS, Weight::Regular, t.text_secondary());
+            text(ctx, w - 17.0 - dw, top + line * 0.5, &date, type_size::SM, Weight::Regular, t.text_primary());
             let subject = if r.subject.trim().is_empty() { "(no subject)" } else { &r.subject };
             text(ctx, 20.0, top + line * 1.5, &fit(subject, type_size::SM, wt, inner), type_size::SM, wt, t.text_primary());
-            text(ctx, 20.0, top + line * 2.5, &fit(&r.preview, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_secondary());
+            text(ctx, 20.0, top + line * 2.5, &fit(&r.preview, type_size::SM, Weight::Regular, inner), type_size::SM, Weight::Regular, t.text_primary());
             ctx.pop();
             ctx.pop();
         })
