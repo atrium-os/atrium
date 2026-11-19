@@ -413,6 +413,30 @@ if [ -n "$tessera_fact" ]; then
     new_tessera_receipt() {
         tail -n "+$((receipt_offset + 1))" "$receipts" | grep -q "^$expected_count "
     }
+    check_unchanged_locked_report() {
+        first_locked=$(awk -v offset="$receipt_offset" 'NR > offset && $1 == 0 { print NR; exit }' "$receipts")
+        [ -n "$first_locked" ] || fail "expected an approved locked-key report"
+        second_locked=$((first_locked + 1))
+        for _ in $(seq 1 20); do
+            [ "$(field signin)" = in ] || fail "unchanged reconnect HIP report prompted or disconnected"
+            [ "$(wc -l < "$receipts" | tr -d ' ')" -lt "$second_locked" ] || break
+            sleep 1
+        done
+        [ "$(wc -l < "$receipts" | tr -d ' ')" -ge "$second_locked" ] ||
+            fail "unchanged reconnect HIP report did not reach the fixture"
+        locked_report=$(sed -n "${first_locked}p" "$receipts")
+        [ "$(sed -n "${second_locked}p" "$receipts")" = "$locked_report" ] ||
+            fail "the unchanged reconnect reports differed"
+        ok "unchanged HIP report refreshed after reconnect without prompting"
+        probe "IPv4 echo after unchanged reconnect refresh"
+    }
+    unlock_tessera_key() {
+        "$V" 'G=/tmp/crypta-gate; set -e
+            /root/sealed/tessera-keyload load-group "$G/tessera-key" c0ffee00112233445566778899aabbcc \
+                "$(cat "$G/tessera-uuid")" 9
+            /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
+            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 1'
+    }
     lock_tessera_key() {
         "$V" 'set -e
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
@@ -447,30 +471,15 @@ if [ -n "$tessera_fact" ]; then
         if [ "$hip" = tessera-reconnect ]; then
             "$V" "route -n get 10.77.0.1 | grep -Eq 'interface: $reconnect_iface$'" ||
                 fail "approved reconnect did not install its tunnel route"
-            first_locked=$(awk -v offset="$receipt_offset" 'NR > offset && $1 == 0 { print NR; exit }' "$receipts")
-            [ -n "$first_locked" ] || fail "expected an approved locked-key report"
-            second_locked=$((first_locked + 1))
-            for _ in $(seq 1 20); do
-                [ "$(field signin)" = in ] || fail "unchanged reconnect HIP report prompted or disconnected"
-                [ "$(wc -l < "$receipts" | tr -d ' ')" -lt "$second_locked" ] || break
-                sleep 1
-            done
-            [ "$(wc -l < "$receipts" | tr -d ' ')" -ge "$second_locked" ] ||
-                fail "unchanged reconnect HIP report did not reach the fixture"
-            locked_report=$(sed -n "${first_locked}p" "$receipts")
-            [ "$(sed -n "${second_locked}p" "$receipts")" = "$locked_report" ] ||
-                fail "the unchanged reconnect reports differed"
-            ok "unchanged HIP report refreshed after reconnect without prompting"
-            probe "IPv4 echo after unchanged reconnect refresh"
+            check_unchanged_locked_report
         fi
 
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
-        "$V" 'G=/tmp/crypta-gate; set -e
-            /root/sealed/tessera-keyload load-group "$G/tessera-key" c0ffee00112233445566778899aabbcc \
-                "$(cat "$G/tessera-uuid")" 9
-            rm -f "$G/tessera-key"
-            /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
-            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 1'
+        unlock_tessera_key
+        # The second-decline reconnect needs the disposable key for one more unlock.
+        if [ "$decline_relock" != 2 ]; then
+            "$V" "rm -f '$G/tessera-key'"
+        fi
         approve_tessera_change 1 "Tessera domain key unlock"
         probe "IPv4 echo after approved Tessera domain key unlock"
         if [ "$hip" = tessera-reconnect ]; then
@@ -528,6 +537,12 @@ if [ -n "$tessera_fact" ]; then
             if [ "$decline_relock" = 2 ]; then
                 wait_field handshake 1
                 probe "IPv4 echo after approved second-decline reconnect"
+                check_unchanged_locked_report
+                receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                unlock_tessera_key
+                "$V" "rm -f '$G/tessera-key'"
+                approve_tessera_change 1 "Tessera domain key unlock after second-decline reconnect"
+                probe "IPv4 echo after approved unlock on the second reconnect"
             else
                 probe "IPv4 echo on the rebound tunnel after approved key lock"
             fi

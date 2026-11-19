@@ -520,7 +520,11 @@ def main():
                 expected_counts = ["0", "1", "0", "1"]
                 if not declined_relock:
                     expected_counts.append("0")
+                if second_reconnect:
+                    expected_counts.append("1")
                 assert [run[0][0] for run in runs] == expected_counts, reports
+                if second_reconnect:
+                    assert len(runs[4]) >= 2 and runs[3][0] == runs[5][0], reports
                 assert len(runs[2]) >= 2 and len(runs[3]) >= 2 and runs[1][0] == runs[3][0], reports
                 if not declined_relock:
                     assert runs[2][0] == runs[4][0], reports
@@ -529,18 +533,19 @@ def main():
                     assert not esp.errors, esp.errors
                     assert len(esp.configs) == config_count, calls
                     original, _, reconnected, rebound, *rest = (config[0][0] for config in esp.configs)
-                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest
+                    echo_spis = [original, original] + [reconnected] * 3 + [rebound] * rebound_echoes + rest * 3
                     assert esp.received_spis == set(echo_spis) and esp.echo == echo_spis, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
                     assert calls.count("ssl-tunnel-connect.sslvpn") == config_count - 1, calls
-                    assert calls.count("echo") == 5 + rebound_echoes + second_reconnect, calls
+                    assert calls.count("echo") == 5 + rebound_echoes + (3 if second_reconnect else 0), calls
                     if second_reconnect:
                         assert second_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
+                        assert second_calls.count("echo") == 3, calls
                     assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
                     assert reconnect_calls.count("echo") == 3 and final_calls.count("echo") == rebound_echoes, calls
                 if second_reconnect:
-                    print("Fresh approval preceded the locked report and traffic after the second decline")
+                    print("The second reconnect refreshed unchanged HIP without prompting and required fresh approval after unlock")
                 elif declined_relock:
                     print("Declining the second key lock sent no changed count and closed the rebound tunnel")
                 else:
