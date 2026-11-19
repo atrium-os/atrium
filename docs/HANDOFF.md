@@ -16,7 +16,7 @@ Last updated: 2026-11-19.
 
 | Workstream | Spec | Where it stands | Next step | Waiting on |
 |---|---|---|---|---|
-| VPN (Crypta) | [vpn.md](spec/vpn.md) | V0–V4 done, V4 gate 60/60 (`e2b3f075`) | V5: GlobalProtect engine (`crypta-gp`) | SSO and WebAuthn sign-in wait on Navigator I3 |
+| VPN (Crypta) | [vpn.md](spec/vpn.md) | V0–V4 done and pushed: V4 gate 60/60 (`e2b3f075`, includes the sign-in window end to end, the IdP password through Arca's field, the sign-in jar forgotten with its profile); `crypta-ac` fuzzers (`7df29276`); Settings sign-in frames + Curia crash fix (`6286a322`, `scripts/crypta-v4-gate.sh ui`, frescod needs the cloud VM booted with `TCG_CPU=Haswell-noTSX`). Nothing uncommitted | V5: GlobalProtect engine (`crypta-gp`) per vpn.md §9/§11; optional: frame the SSO sign-in window (navigator-ui on the VM) | script SSO (Okta, Entra) and security keys/passkeys at the IdP wait on Navigator live code I3 (Shankar's choice) |
 | Navigator live code (islands) | [navigator-islands.md](spec/navigator-islands.md) | accepted 2026-11-19 (D1–D6); I0 not started | I0: cross-build Servo and Ladybird on the Mac and measure them side by side | a Mac session with disk room (about 104 GB free now, tight for both engines) |
 | Mail | [mail.md](spec/mail.md) | mostly done; filters against a real Pigeonhole, VM check `scripts/mail-vm-check.sh` | VM runs for Open with…, Work compose warnings, the link scanner | the VM, and the pieces those features call into |
 | Officina Sheets | [officina.md](spec/officina.md) | feature batches pushed | Flash Fill number and date reformatting; rich-text comments; wrap in the cell editor | — |
