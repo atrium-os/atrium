@@ -229,14 +229,34 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   `fontconfig.pc`. An embeddable `servo --lib` cross-build with default
   features off, `bundled` enabled and the stock Atrium sysroot reproduced
   the Fontconfig failure. No engine binary or runtime measurement resulted.
-  Servo exposes a `SoftwareRenderingContext` for a CPU rendering experiment.
+  Its `SoftwareRenderingContext` opens a Surfman connection and creates a software
+  OpenGL adapter. CPU readback depends on establishing that context inside the jail.
 - The shared [scripted sign-in fixture](../../test-assets/navigator-i0/sign-in.html)
   tests two navigations, a rejected public fixture password, and a successful
   callback. Its script passed a local smoke check with mocked DOM and navigation.
   The engine runs, JIT verification, and jail and Capsicum checks remain pending.
-- Next, try Servo's pinned-font adapter and software rendering path in the
-  arm64 library build. Then bring up the Ladybird engine for the same fixture
-  and containment checks. No engine choice has been made.
+- Ladybird at `ead47ae6ef846b910ac509f51b12281523d7c2c3` (source inspection).
+  WebView's FontService scans installed directories. LibGfx's SharedFontProvider
+  already accepts a mapped catalog and brokered face descriptors. Supply pinned
+  face IDs, bytes, family and code-point fallback to both content and compositor.
+  Replace the provider's automatic resource-font load too. HarfBuzz shapes the
+  text and the compositor can construct a Skia typeface from those bytes.
+  The FreeBSD CMake and vcpkg profiles require changes to omit Fontconfig,
+  the desktop UI, GPU dependencies and bundled media.
+- LibWeb records a display list. The compositor plays it through Skia and its
+  CPU backing store wraps bitmap memory with an explicit pitch. A limited
+  presentation adapter can validate dimensions and format, copy premultiplied
+  pixels into the island texture and release the backing store after copying.
+  Keep display-list parsing and rasterization inside confinement.
+- Build Ladybird with `ENABLE_JS_JIT=OFF`. LibWasm has a separate JIT enabled
+  by default at this pin. Omit Wasm for the fixture or enforce interpreter-only
+  execution and verify it separately. The FreeBSD compositor needs Atrium's
+  jail launcher and capability setup.
+- First-frame experiment, one engine build at a time on the Mac. Ladybird has
+  the more direct CPU path in source. Show a known rectangle from an HTML
+  display list in the assigned Fresco island after capability entry, then
+  verify pinned text, input and the same brokered sign-in fixture in both
+  engines. Neither engine has run this gate. Engine selection remains open.
 
 ## 9. Decisions, with recommendations
 
