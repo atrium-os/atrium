@@ -25,6 +25,17 @@ pub struct PgpKey {
 }
 
 impl Store {
+    /// Every address with keys, by address, each's keys newest first.
+    pub fn all_pgp_keys(&self) -> Result<Vec<(String, Vec<PgpKey>)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for e in tx.open_table(PGP_KEYS)?.iter()? {
+            let (k, v) = e?;
+            out.push((k.value().to_string(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
     /// The keys for `addr`, newest first.
     pub fn pgp_keys(&self, addr: &str) -> Result<Vec<PgpKey>> {
         let tx = self.db.begin_read()?;

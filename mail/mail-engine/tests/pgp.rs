@@ -133,4 +133,27 @@ fn keys_learned_signatures_checked_and_mail_encrypted() {
     // And the parser sees it as PGP/MIME encrypted.
     let o = engine.parser.open(sent.as_bytes(), vec![], &[], None, vec![]).unwrap().unwrap();
     assert!(o.pgp_encrypted);
+    // Expired and revoked keys (made by GnuPG): not taken when pasted, and
+    // a learned one isn't encrypted to.
+    let expired = include_bytes!("../../mail-pgp/tests/keys/expired.asc");
+    let revoked = include_bytes!("../../mail-pgp/tests/keys/revoked.asc");
+    let later = include_bytes!("../../mail-pgp/tests/keys/expiring.asc");
+    assert!(engine.give_pgp_key(expired, i64::MAX / 2).unwrap_err().to_string().contains("expired"));
+    assert!(engine.give_pgp_key(revoked, 100).unwrap_err().to_string().contains("revoked"));
+    let bin = |a: &[u8]| mail_pgp::to_binary(&mail_pgp::read_key(a).unwrap()).unwrap();
+    engine.store.write(|w| w.saw_pgp_key("gone@example.com", mail_store::pgp::PgpKey { key: bin(revoked), first_seen: 5, last_seen: 5, given: false })).unwrap();
+    let mut gone = draft.clone();
+    gone.to = vec![Mailbox::new("", "gone@example.com")];
+    assert!(engine.usable_pgp_key("gone@example.com", 100).is_none());
+    let e = engine.send_protected(account, &gone, Default::default(), Protect { sign: None, encrypt: true }).unwrap_err();
+    assert!(e.to_string().contains("expired or was revoked"), "{e}");
+    engine.give_pgp_key(later, 100).unwrap();
+    // Settings' list: every address, its newest key, where it came from.
+    let known = engine.known_pgp_keys();
+    let line = |a: &str| known.iter().find(|k| k.addr == a).map(|k| k.line(100)).unwrap();
+    assert!(line("gone@example.com").ends_with("From their mail · revoked by its owner"));
+    assert!(line("later@example.com").contains("Pasted by you · expires 20"), "{}", line("later@example.com"));
+    assert!(known.iter().any(|k| k.addr == "priya@example.com" && !k.given));
+    engine.forget_pgp_keys("gone@example.com").unwrap();
+    assert!(!engine.known_pgp_keys().iter().any(|k| k.addr == "gone@example.com"));
 }

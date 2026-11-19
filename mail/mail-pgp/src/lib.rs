@@ -22,9 +22,19 @@ pub struct KeyInfo {
     /// The addresses of its user ids, lower case.
     pub emails: Vec<String>,
     pub can_encrypt: bool,
+    /// When the key stops being valid (seconds since 1970), if it does.
+    pub expires: Option<i64>,
+    /// Its owner revoked it (a revocation signature that checks).
+    pub revoked: bool,
 }
 
 impl KeyInfo {
+    /// Fit to encrypt to at `now`: not revoked, not expired, with a key
+    /// that encrypts.
+    pub fn usable(&self, now: i64) -> bool {
+        self.can_encrypt && !self.revoked && self.expires.is_none_or(|e| e > now)
+    }
+
     /// "1A2B 3C4D …": the last 16 hex digits in fours, for showing.
     pub fn short(&self) -> String {
         let f = &self.fingerprint[self.fingerprint.len().saturating_sub(16)..];
@@ -53,12 +63,36 @@ pub fn read_key(bytes: &[u8]) -> Result<SignedPublicKey, String> {
     Ok(k)
 }
 
+/// When a key made at `created` expires, by the newest of `sigs` (its
+/// self-signatures) that says.
+fn expiry(created: u32, sigs: &[&pgp::packet::Signature]) -> Option<i64> {
+    let newest = sigs.iter().max_by_key(|s| s.created().map(|t| t.as_secs()).unwrap_or(0))?;
+    let d: std::time::Duration = newest.key_expiration_time()?.into();
+    (d.as_secs() > 0).then(|| created as i64 + d.as_secs() as i64)
+}
+
+/// When the primary key of `k` expires.
+fn key_expiry(k: &SignedPublicKey) -> Option<i64> {
+    let sigs: Vec<&pgp::packet::Signature> = k.details.users.iter().flat_map(|u| &u.signatures).chain(&k.details.direct_signatures).collect();
+    expiry(k.primary_key.created_at().as_secs(), &sigs)
+}
+
+/// The subkeys of `k` that can be encrypted to at `now`.
+fn live_encryption_subkeys(k: &SignedPublicKey, now: i64) -> impl Iterator<Item = &pgp::composed::SignedPublicSubKey> {
+    k.public_subkeys.iter().filter(move |s| {
+        let revoked = s.signatures.iter().any(|g| g.typ() == Some(pgp::packet::SignatureType::SubkeyRevocation));
+        let sigs: Vec<&pgp::packet::Signature> = s.signatures.iter().collect();
+        s.key.algorithm().can_encrypt() && !revoked && expiry(s.key.created_at().as_secs(), &sigs).is_none_or(|e| e > now)
+    })
+}
+
 pub fn info(k: &SignedPublicKey) -> KeyInfo {
     let mut emails: Vec<String> = k.details.users.iter().filter_map(|u| email_of(u.id.id())).collect();
     emails.sort();
     emails.dedup();
     let can_encrypt = k.primary_key.algorithm().can_encrypt() || k.public_subkeys.iter().any(|s| s.key.algorithm().can_encrypt());
-    KeyInfo { fingerprint: format!("{:X}", k.primary_key.fingerprint()), emails, can_encrypt }
+    let revoked = !k.details.revocation_signatures.is_empty();
+    KeyInfo { fingerprint: format!("{:X}", k.primary_key.fingerprint()), emails, can_encrypt, expires: key_expiry(k), revoked }
 }
 
 pub fn key_info(bytes: &[u8]) -> Result<KeyInfo, String> {
@@ -188,14 +222,23 @@ pub fn encrypt(content: &[u8], keys: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     if keys.is_empty() {
         return Err("no one to encrypt to".into());
     }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     for kb in keys {
         let k = read_key(kb)?;
-        if let Some(s) = k.public_subkeys.iter().find(|s| s.key.algorithm().can_encrypt()) {
+        let i = info(&k);
+        if i.revoked {
+            return Err(format!("the key {} was revoked by its owner", i.short()));
+        }
+        if i.expires.is_some_and(|e| e <= now) {
+            return Err(format!("the key {} has expired", i.short()));
+        }
+        let sub = live_encryption_subkeys(&k, now).next();
+        if let Some(s) = sub {
             b.encrypt_to_key(&mut rng, &s.key).map_err(|e| e.to_string())?;
         } else if k.primary_key.algorithm().can_encrypt() {
             b.encrypt_to_key(&mut rng, &k.primary_key).map_err(|e| e.to_string())?;
         } else {
-            return Err(format!("the key {} can't encrypt", info(&k).short()));
+            return Err(format!("the key {} can't encrypt", i.short()));
         }
     }
     b.to_armored_string(&mut rng, ArmorOptions::default()).map(String::into_bytes).map_err(|e| e.to_string())
@@ -207,6 +250,26 @@ mod tests {
     use pgp::composed::{EncryptionCaps, KeyType, Message, SecretKeyParamsBuilder, SignedSecretKey, SubkeyParamsBuilder};
     use pgp::crypto::{ecc_curve::ECCCurve, hash::HashAlgorithm};
     use pgp::types::Password;
+
+    #[test]
+    fn expired_and_revoked_keys() {
+        // Made by GnuPG 2.4: one that expired 2 s after it was made, one
+        // that lasts two years, one revoked.
+        let expired = key_info(include_bytes!("../tests/keys/expired.asc")).unwrap();
+        assert!(expired.expires.is_some() && !expired.revoked);
+        assert!(!expired.usable(expired.expires.unwrap()) && expired.usable(expired.expires.unwrap() - 1));
+        let later = key_info(include_bytes!("../tests/keys/expiring.asc")).unwrap();
+        let e = later.expires.unwrap();
+        assert!(e > 1_795_000_000 + 600 * 86_400, "about two years after 2026-11-19: {e}");
+        let gone = key_info(include_bytes!("../tests/keys/revoked.asc")).unwrap();
+        assert!(gone.revoked && gone.expires.is_none() && !gone.usable(0));
+        assert_eq!(gone.emails, ["gone@example.com"]);
+        // Never encrypted to.
+        let bin = |a: &[u8]| to_binary(&read_key(a).unwrap()).unwrap();
+        assert!(encrypt(b"x", &[bin(include_bytes!("../tests/keys/expired.asc"))]).unwrap_err().contains("has expired"));
+        assert!(encrypt(b"x", &[bin(include_bytes!("../tests/keys/revoked.asc"))]).unwrap_err().contains("revoked"));
+        assert!(encrypt(b"x", &[bin(include_bytes!("../tests/keys/expiring.asc"))]).is_ok());
+    }
 
     fn key(uid: &str) -> SignedSecretKey {
         let mut p = SecretKeyParamsBuilder::default();

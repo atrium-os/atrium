@@ -176,6 +176,13 @@ fn settings_window() {
     }).unwrap();
     s.reload();
     drawn(&mut app, &["PRIVATE ADDRESSES", "Domain", "Save", "OPENPGP", "No key of yours yet", "Paste a key"]);
+    // The keys Mail has (§10.2): listed with where they came from; Forget.
+    engine.give_pgp_key(include_bytes!("../../mail-pgp/tests/keys/expiring.asc"), 100).unwrap();
+    s.reload();
+    drawn(&mut app, &["later@example.com", "Forget"]);
+    assert!(s.ui.get_cloned().keys[0].1.contains("Pasted by you · expires 20"), "{:?}", s.ui.get_cloned().keys);
+    s.forget_key("later@example.com");
+    assert!(s.ui.get_cloned().keys.is_empty() && engine.known_pgp_keys().is_empty());
     // Away (§11.6): the form, kept for the next sync; a bad day says so.
     drawn(&mut app, &["AWAY", "Reply automatically", "First day", "Last day", "Reply", "ada@me.example: not read yet"]);
     s.toggle_away();

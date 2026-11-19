@@ -58,6 +58,9 @@ pub enum Adding {
     Keeping(Shown),
 }
 
+/// Keys listed in Settings; the rest are counted.
+pub const KEYS_SHOWN: usize = 50;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsUi {
     pub rows: Vec<Row>,
@@ -82,6 +85,10 @@ pub struct SettingsUi {
     /// The person's own OpenPGP key for that account (§10.2): its
     /// addresses and short fingerprint.
     pub my_key: Option<(String, String)>,
+    /// The keys Mail has (§10.2), at most [`KEYS_SHOWN`]: the address and
+    /// its line; and how many there are.
+    pub keys: Vec<(String, String)>,
+    pub keys_count: usize,
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
@@ -291,6 +298,10 @@ impl Settings {
         let pd = pa.and_then(|a| e.private_domain(a));
         let privates = pa.map(|a| e.private_addresses(a)).unwrap_or_default();
         let my_key = pa.and_then(|a| e.my_pgp_key(a)).map(|k| (k.emails.join(", "), k.short()));
+        let mut known = e.known_pgp_keys();
+        known.sort_by(|a, b| b.given.cmp(&a.given).then(b.last_seen.cmp(&a.last_seen)).then(a.addr.cmp(&b.addr)));
+        let keys_count = known.len();
+        let keys: Vec<(String, String)> = known.iter().take(KEYS_SHOWN).map(|k| (k.addr.clone(), k.line(now))).collect();
         if pa != u.priv_account {
             self.domain.set(TextEdit::new(pd.as_deref().unwrap_or("")));
         }
@@ -303,7 +314,7 @@ impl Settings {
                 u.people_query = q;
             });
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.rules_lines != rules_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.rules_lines != rules_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key || u.keys != keys || u.keys_count != keys_count {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
@@ -315,6 +326,8 @@ impl Settings {
                 u.priv_domain = pd;
                 u.privates = privates;
                 u.my_key = my_key;
+                u.keys = keys;
+                u.keys_count = keys_count;
             });
         }
     }
@@ -739,6 +752,16 @@ impl Settings {
     }
 
     /// "Paste a key": from the clipboard.
+    /// Forget the keys Mail has for `addr`.
+    pub fn forget_key(&self, addr: &str) {
+        let note = match self.engine.forget_pgp_keys(addr) {
+            Ok(()) => format!("Forgot the key for {addr}; a new one comes with their next mail"),
+            Err(e) => format!("Couldn't: {e:?}"),
+        };
+        self.update(|u| u.note = Some(note));
+        self.reload();
+    }
+
     pub fn paste_key(&self, now: i64) {
         match pergola::clipboard::paste_text() {
             Ok(Some(t)) => self.give_key(&t, now),
@@ -1126,6 +1149,21 @@ impl SettingsView {
             let s = self.s.clone();
             button(ctx, right - bw, y + em(20.0), "Paste a key", false, true, move || s.paste_key(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
             y += em(44.0);
+            // The keys Mail has, each with where it came from and Forget.
+            if !ui.keys.is_empty() {
+                let fw = measure("Forget", type_size::SM, Weight::Medium) + em(24.0);
+                for (addr, line) in &ui.keys {
+                    text(ctx, x, y + em(12.0), &crate::view::fit_text(addr, type_size::SM, Weight::Regular, inner - fw - em(8.0)), type_size::SM, Weight::Regular, t.text_primary());
+                    text(ctx, x, y + em(30.0), &crate::view::fit_text(line, type_size::XS, Weight::Regular, inner - fw - em(8.0)), type_size::XS, Weight::Regular, if line.contains("revoked") || line.contains("expired") { t.warning_fg() } else { t.text_secondary() });
+                    let (s, a) = (self.s.clone(), addr.clone());
+                    button(ctx, right - fw, y + em(20.0), "Forget", false, true, move || s.forget_key(&a));
+                    y += em(42.0);
+                }
+                if ui.keys_count > ui.keys.len() {
+                    text(ctx, x, y + em(10.0), &format!("and {} more", ui.keys_count - ui.keys.len()), type_size::XS, Weight::Regular, t.text_tertiary());
+                    y += em(24.0);
+                }
+            }
         }
 
         // The address book (§14.2): find someone, forget them.

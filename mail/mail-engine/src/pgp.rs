@@ -16,6 +16,31 @@ use crate::{Engine, Error};
 
 pub use mail_pgp::KeyInfo;
 
+/// A key Mail has, for Settings (§10.2): the newest for an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub addr: String,
+    pub info: KeyInfo,
+    /// Pasted by the person, not learned from their mail.
+    pub given: bool,
+    pub last_seen: i64,
+}
+
+impl Known {
+    /// "Pasted by you · expires 2028-11-18", "From their mail · revoked".
+    pub fn line(&self, now: i64) -> String {
+        let from = if self.given { "Pasted by you" } else { "From their mail" };
+        let state = if self.info.revoked {
+            " · revoked by its owner".to_string()
+        } else if let Some(e) = self.info.expires {
+            if e <= now { format!(" · expired {}", crate::clock::day_iso(e)) } else { format!(" · expires {}", crate::clock::day_iso(e)) }
+        } else {
+            String::new()
+        };
+        format!("{} · {from}{state}", self.info.short())
+    }
+}
+
 /// How a message is encrypted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -32,6 +57,20 @@ impl Engine {
     /// The keys a signature on `s` is checked against: its From's.
     pub(crate) fn pgp_keys_of(&self, s: &Summary) -> Vec<Vec<u8>> {
         s.from.first().map(|a| self.pgp_keys_for(&a.addr)).unwrap_or_default()
+    }
+
+    /// The newest key for `addr` that can be encrypted to at `now`.
+    pub fn usable_pgp_key(&self, addr: &str, now: i64) -> Option<Vec<u8>> {
+        self.pgp_keys_for(addr).into_iter().find(|k| mail_pgp::key_info(k).is_ok_and(|i| i.usable(now)))
+    }
+
+    /// Every address Mail has a key for, with its newest key.
+    pub fn known_pgp_keys(&self) -> Vec<Known> {
+        self.store.all_pgp_keys().unwrap_or_default().into_iter().filter_map(|(addr, keys)| {
+            let k = keys.into_iter().next()?;
+            let info = mail_pgp::key_info(&k.key).ok()?;
+            Some(Known { addr, info, given: k.given, last_seen: k.last_seen })
+        }).collect()
     }
 
     /// What the newest key for `addr` is.
@@ -72,6 +111,12 @@ impl Engine {
         if !info.can_encrypt {
             return Err(Error::Refused("the key can't be encrypted to"));
         }
+        if info.revoked {
+            return Err(Error::Refused("the key was revoked by its owner"));
+        }
+        if info.expires.is_some_and(|e| e <= now) {
+            return Err(Error::Refused("the key has expired"));
+        }
         let bin = mail_pgp::to_binary(&k).map_err(|_| Error::Refused("that isn't an OpenPGP public key"))?;
         if bin.len() > mail_schema::PGP_KEY_MAX {
             return Err(Error::Refused("the key is too large"));
@@ -107,7 +152,7 @@ impl Engine {
         }
         let keys: Vec<String> = draft.to.iter().chain(&draft.cc).chain(&draft.bcc)
             .map(|m| m.addr.trim().to_ascii_lowercase())
-            .filter(|a| self.pgp_keys_for(a).is_empty())
+            .filter(|a| self.usable_pgp_key(a, crate::now()).is_none())
             .collect();
         if keys.is_empty() {
             return Ok(Scheme::OpenPgp);
@@ -118,12 +163,16 @@ impl Engine {
     /// `entity` (a MIME entity: its headers and body) as an armored
     /// OpenPGP message for `rcpts` and `from` (a copy they can read again).
     pub(crate) fn pgp_encrypt(&self, entity: &[u8], from: &str, rcpts: &[String]) -> Result<Vec<u8>, Error> {
-        let missing: Vec<&str> = rcpts.iter().filter(|a| self.pgp_keys_for(a).is_empty()).map(|a| a.as_str()).collect();
+        let now = crate::now();
+        // Expired and revoked keys are never encrypted to (§10.2).
+        let missing: Vec<&str> = rcpts.iter().filter(|a| self.usable_pgp_key(a, now).is_none()).map(|a| a.as_str()).collect();
         if !missing.is_empty() {
-            return Err(Error::Compose(format!("No certificate or OpenPGP key to encrypt to {}", missing.join(", "))));
+            let stale = missing.iter().any(|a| !self.pgp_keys_for(a).is_empty());
+            let why = if stale { " (their key has expired or was revoked)" } else { "" };
+            return Err(Error::Compose(format!("No certificate or OpenPGP key to encrypt to {}{why}", missing.join(", "))));
         }
-        let own = self.pgp_keys_for(from).into_iter().next().ok_or(Error::Compose("Mail has no OpenPGP key of yours to keep a copy you can read; add yours in Settings".into()))?;
-        let mut keys: Vec<Vec<u8>> = rcpts.iter().filter_map(|a| self.pgp_keys_for(a).into_iter().next()).collect();
+        let own = self.usable_pgp_key(from, now).ok_or(Error::Compose("Mail has no OpenPGP key of yours to keep a copy you can read (or yours has expired); add yours in Settings".into()))?;
+        let mut keys: Vec<Vec<u8>> = rcpts.iter().filter_map(|a| self.usable_pgp_key(a, now)).collect();
         keys.push(own);
         keys.sort();
         keys.dedup();
