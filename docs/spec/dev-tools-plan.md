@@ -370,7 +370,13 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   credential only for the granted workspace and host. SSH `git push` created a
   branch in a disposable bare repository served over the workspace's loopback,
   and its ref matched the source commit. Revocation blocked both Git operations.
-  Repeat with `sh scripts/vm-m9-curia-check.sh [out-dir]` after booting a
+  From the host, run `python3 scripts/vm-m9-fresh.py --cache /path/to/amd64-cache`
+  for a complete hardware-free run. The cache holds the stock
+  `FreeBSD-*-amd64-zfs-*.qcow2.xz` and its matching `sysroot/`. The command
+  boots a private copy with QEMU and UEFI, provisions SSH and rctl, checks
+  that Git is absent, runs M9, and powers off the guest. The printed run
+  directory retains the gate log, serial log, and Curia screenshots.
+  To use an existing guest, run `sh scripts/vm-m9-curia-check.sh [out-dir]` after booting a
   disposable amd64 guest with rctl and x86-64-v3 (e.g. `TCG_CPU=Haswell-noTSX`
   under recent QEMU). `VMDIR` supplies the guest sysroot, and
   `SSH_AGENT_GATE_PORT` and `SSH_AGENT_GATE_KEY` can select its SSH forwarding
