@@ -74,6 +74,14 @@ TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-de
 REFRESH_HIP = ("refresh", "posture", *TESSERA_HIP)
 
 
+def require_reconnect_approval(receipts, config_index):
+    if config_index == 0:
+        return
+    assert config_index >= 2, "data or HIP report used the declined configuration"
+    suffix = ".approved" if config_index < 4 else ".relock-approved" if config_index < 6 else ".final-approved"
+    assert receipts.with_suffix(suffix).exists(), f"configuration {config_index + 1} used before HIP approval"
+
+
 class EspPeer:
     def __init__(self, socket, drop, reconnect_approval=None):
         self.socket = socket
@@ -127,15 +135,11 @@ class EspPeer:
                 assert hmac.compare_digest(wire[-12:], hmac.digest(akey, wire[:-12], hashlib.sha1)[:12])
                 replay[spi_in, seq] = True
                 self.received_spis.add(spi_in)
-                if self.reconnect_approval and pair in self.configs[1:]:
-                    assert pair != self.configs[1], "ESP used the declined association"
-                    assert self.reconnect_approval.exists(), "ESP opened before reconnect approval"
-                    if pair in self.configs[3:4] or pair in self.configs[5:]:
-                        assert spi_in in self.hip_reported_spis, "rebound ESP opened before HIP submission"
-                    if pair in self.configs[4:]:
-                        assert self.reconnect_approval.with_suffix(".relock-approved").exists(), "ESP opened before second reconnect approval"
-                    if pair in self.configs[6:]:
-                        assert self.reconnect_approval.with_suffix(".final-approved").exists(), "ESP opened before final reconnect approval"
+                if self.reconnect_approval:
+                    config_index = self.configs.index(pair)
+                    require_reconnect_approval(self.reconnect_approval, config_index)
+                    if config_index >= 2:
+                        assert spi_in in self.hip_reported_spis, "ESP opened before HIP submission"
                 plain = self.cipher(ekey, wire[8:24], wire[24:-12], decrypt=True)
                 assert plain[-1] == 4
                 padding = plain[-2]
@@ -227,12 +231,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "hipreport.esp":
                         assert hip in ("approve", *REFRESH_HIP), "HIP submitted without approval"
                         assert fields["authcookie"] == [COOKIE]
-                        if hip in RECONNECT_HIP and calls.count("getconfig.esp") > 1:
-                            assert calls.count("getconfig.esp") >= 3 and receipts.with_suffix(".approved").exists(), calls
-                            if calls.count("getconfig.esp") >= 5:
-                                assert receipts.with_suffix(".relock-approved").exists(), calls
-                            if calls.count("getconfig.esp") >= 7:
-                                assert receipts.with_suffix(".final-approved").exists(), calls
+                        if hip in RECONNECT_HIP:
+                            require_reconnect_approval(receipts, calls.count("getconfig.esp") - 1)
                         report, = fields["report"]
                         doc = ET.fromstring(report)
                         assert doc.tag == "hip-report" and doc.attrib == {"name": "hip-report"}
@@ -293,12 +293,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                             esp.hip_reported_spis.add(esp.configs[-1][0][0])
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
-                        if hip in RECONNECT_HIP and calls.count("getconfig.esp") > 1:
-                            assert calls.count("getconfig.esp") >= 3 and receipts.with_suffix(".approved").exists(), calls
-                            if calls.count("getconfig.esp") >= 5:
-                                assert receipts.with_suffix(".relock-approved").exists(), calls
-                            if calls.count("getconfig.esp") >= 7:
-                                assert receipts.with_suffix(".final-approved").exists(), calls
+                        if hip in RECONNECT_HIP:
+                            require_reconnect_approval(receipts, calls.count("getconfig.esp") - 1)
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
                         return

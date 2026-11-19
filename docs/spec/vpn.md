@@ -870,6 +870,10 @@ another origin. An active portal-profile session stays in engine memory.
   identical locked report refreshes without prompting, unlock requires
   fresh approval, and rebind sends the unchanged unlocked report before
   echo resumes on the new data connection.
+  The fixture uses the same approval checks for report submission, TLS
+  tunnel setup, and ESP traffic. On reconnect and rebind, the fixture
+  requires a HIP submission for the newly offered ESP association before
+  accepting its first packet.
   The batched arm64 gate passed 42/42 on TLS and 42/42 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random

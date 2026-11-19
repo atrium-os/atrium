@@ -334,14 +334,22 @@ fi
 if [ -n "$tessera_fact" ]; then
     probe "IPv4 echo before the Tessera encryption change"
     grep -q '^0 ' "$receipts" || fail "initial Tessera report did not reach peer"
+    checkpoint_tessera_receipts() {
+        receipt_offset=$(awk 'END { print NR }' "$receipts")
+    }
+    reject_stale_hip_choice() {
+        [ -n "$1" ] || fail "missing previous HIP choice"
+        [ "$(hip_choice)" != "$1" ] || fail "the replacement review reused the previous HIP choice"
+        if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$1" 2>&1); then
+            fail "the replacement review accepted the stale choice"
+        fi
+        [ "$stale_reply" = 'error why=bad-choice' ] ||
+            fail "unexpected reply to stale HIP choice: $stale_reply"
+    }
     reconnect_tessera() {
         "$V" "$CTL up name=gp-gate" >/dev/null
         wait_tessera_review
-        [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined HIP choice"
-        if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
-            fail "reconnect accepted the declined HIP choice"
-        fi
-        [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected rejection: $stale_reply"
+        reject_stale_hip_choice "$declined_choice"
         sleep 1
         [ "$(field handshake)" = 0 ] || fail "reconnect opened before HIP approval"
         reconnect_iface=$(field iface)
@@ -366,12 +374,7 @@ if [ -n "$tessera_fact" ]; then
             "$V" "$CTL rebind name=gp-gate" >/dev/null
             wait_field handshake 0
             wait_tessera_review
-            [ "$(hip_choice)" != "$old_choice" ] || fail "rebind reused the original HIP choice"
-            if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$old_choice" 2>&1); then
-                fail "rebound tunnel accepted the stale approval choice"
-            fi
-            [ "$stale_reply" = 'error why=bad-choice' ] ||
-                fail "expected the rebound review to reject the stale choice: $stale_reply"
+            reject_stale_hip_choice "$old_choice"
             ok "rebind replaced the pending HIP review and rejected the stale choice"
         fi
         sleep 1
@@ -488,7 +491,7 @@ if [ -n "$tessera_fact" ]; then
             /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
     }
-    receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+    checkpoint_tessera_receipts
     if [ "$hip" != tessera ]; then
         "$V" 'G=/tmp/crypta-gate; set -e
             /root/sealed/tessera-keyload quota-group "$G/tessera/persona" 9
@@ -504,7 +507,7 @@ if [ -n "$tessera_fact" ]; then
     approve_tessera_change 1 "Tessera encryption change"
     probe "IPv4 echo after approved Tessera encryption change"
     if [ "$hip" != tessera ]; then
-        receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+        checkpoint_tessera_receipts
         lock_tessera_key
         if [ "$hip" != tessera-domain ]; then
             approve_tessera_change 0 "Tessera domain key lock" rebind
@@ -519,7 +522,7 @@ if [ -n "$tessera_fact" ]; then
             check_unchanged_locked_report
         fi
 
-        receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+        checkpoint_tessera_receipts
         unlock_tessera_key
         # The second-decline reconnect needs the disposable key for one more unlock.
         if [ "$decline_relock" != 2 ]; then
@@ -531,7 +534,7 @@ if [ -n "$tessera_fact" ]; then
             rebind_unlocked_tessera 3
             probe "IPv4 echo on the post-unlock rebound tunnel"
 
-            receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+            checkpoint_tessera_receipts
             lock_tessera_key
             if [ "$decline_relock" != 0 ]; then
                 expected_count=0
@@ -548,7 +551,7 @@ if [ -n "$tessera_fact" ]; then
                 wait_field handshake 1
                 probe "IPv4 echo after approved second-decline reconnect"
                 check_unchanged_locked_report
-                receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                checkpoint_tessera_receipts
                 unlock_tessera_key
                 if [ "$decline_final_lock" != 2 ]; then
                     "$V" "rm -f '$G/tessera-key'"
@@ -558,7 +561,7 @@ if [ -n "$tessera_fact" ]; then
                 rebind_unlocked_tessera 5
                 probe "IPv4 echo after the second reconnect rebind"
 
-                receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                checkpoint_tessera_receipts
                 lock_tessera_key
                 if [ "$decline_final_lock" != 0 ]; then
                     expected_count=0
@@ -573,7 +576,7 @@ if [ -n "$tessera_fact" ]; then
                     wait_field handshake 1
                     probe "IPv4 echo after reconnect from final decline"
                     check_unchanged_locked_report
-                    receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                    checkpoint_tessera_receipts
                     unlock_tessera_key
                     "$V" "rm -f '$G/tessera-key'"
                     approve_tessera_change 1 "Tessera domain key unlock after final decline"
