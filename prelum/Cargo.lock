@@ -1257,6 +1257,7 @@ dependencies = [
  "arca-store",
  "arcad",
  "base64",
+ "md-5",
  "navigator-fetch",
  "prelum-ipp-codec",
  "prelum-proto",

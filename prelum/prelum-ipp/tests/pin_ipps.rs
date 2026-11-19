@@ -42,6 +42,14 @@ fn ipps(
     expected: &[(u16, u16)],
     login: Option<&'static [u8]>,
 ) -> (SocketAddr, [u8; 32], thread::JoinHandle<()>) {
+    ipps_with_auth(expected, login, false)
+}
+
+fn ipps_with_auth(
+    expected: &[(u16, u16)],
+    login: Option<&'static [u8]>,
+    digest: bool,
+) -> (SocketAddr, [u8; 32], thread::JoinHandle<()>) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["printer.local".into()])
         .unwrap()
@@ -80,7 +88,7 @@ fn ipps(
                 assert!(matches!(stream.read(&mut [0u8; 1]), Ok(0) | Err(_)));
                 continue;
             }
-            serve_ipp(&mut stream, code, status, login);
+            serve_ipp(&mut stream, code, status, login, digest);
         }
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -95,6 +103,7 @@ fn serve_ipp(
     code: u16,
     status: u16,
     login: Option<&[u8]>,
+    digest: bool,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -109,7 +118,7 @@ fn serve_ipp(
         if line == "\r\n" {
             break;
         }
-        if let Some(value) = line.strip_prefix("Authorization: Basic ") {
+        if let Some(value) = line.strip_prefix("Authorization: ") {
             authorization = Some(value.trim_end().to_string());
         } else if let Some(n) = line.strip_prefix("Content-Length: ") {
             framing = Some(Framing::Length(n.trim().parse().unwrap()));
@@ -117,10 +126,32 @@ fn serve_ipp(
             framing = Some(Framing::Chunked);
         }
     }
-    let expected_auth = login
-        .filter(|_| code != op::GET_PRINTER_ATTRIBUTES)
-        .map(|value| base64::engine::general_purpose::STANDARD.encode(value));
-    assert!(authorization == expected_auth, "wrong Authorization header");
+    let expected_auth = login.filter(|_| !matches!(code, op::GET_PRINTER_ATTRIBUTES | op::VALIDATE_JOB));
+    if digest && expected_auth.is_some() {
+        use sha2::{Digest, Sha256};
+        let value = authorization.as_deref().unwrap().strip_prefix("Digest ").unwrap();
+        let params: std::collections::HashMap<_, _> = value.split(", ").map(|p| {
+            let (key, value) = p.split_once('=').unwrap();
+            (key, value.trim_matches('"'))
+        }).collect();
+        let hash = |value: &[u8]| format!("{:x}", Sha256::digest(value));
+        assert_eq!(params["username"], "tester");
+        assert_eq!(params["realm"], "fixture");
+        assert_eq!(params["nonce"], "fresh");
+        assert_eq!(params["opaque"], "echo");
+        assert_eq!(params["uri"], "/ipp/print");
+        assert_eq!(params["algorithm"], "SHA-256");
+        assert_eq!(params["qop"], "auth");
+        let count = if code == op::CREATE_JOB { "00000001" } else { "00000002" };
+        assert_eq!(params["nc"], count);
+        let a1 = hash(b"tester:fixture:fixture-pass");
+        let a2 = hash(b"POST:/ipp/print");
+        let expected = hash(format!("{a1}:fresh:{count}:{}:auth:{a2}", params["cnonce"]).as_bytes());
+        assert!(params["response"] == expected, "invalid Digest response");
+    } else {
+        let expected = expected_auth.map(|value| format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(value)));
+        assert!(authorization == expected, "wrong Authorization header");
+    }
     let head = Head {
         status: 200,
         headers: vec![],
@@ -137,6 +168,19 @@ fn serve_ipp(
     let password = req
         .attribute(tag::OPERATION, "job-password")
         .and_then(Attribute::first);
+    if code == op::VALIDATE_JOB {
+        assert!(password.is_none());
+        assert!(all[offset..].is_empty());
+        let challenge = if digest {
+            "WWW-Authenticate: Basic realm=legacy, Digest realm=fixture, nonce=fresh, opaque=echo, algorithm=SHA-256, qop=\"auth-int, auth\"\r\n"
+        } else {
+            "WWW-Authenticate: Basic realm=fixture\r\n"
+        };
+        let stream = reader.into_inner();
+        write!(stream, "HTTP/1.1 401 Unauthorized\r\n{challenge}Content-Length: 0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        return;
+    }
     let group = match code {
         op::GET_PRINTER_ATTRIBUTES => {
             assert!(password.is_none());
@@ -367,7 +411,16 @@ fn arca_releases_once_after_key_and_uuid_match_then_ipps_receives_pin_before_pdf
 }
 
 #[test]
-fn saved_login_stays_out_of_identity_queries_and_authenticates_the_job() {
+fn saved_login_stays_out_of_identity_queries_and_authenticates_with_basic() {
+    saved_login(false);
+}
+
+#[test]
+fn saved_login_stays_out_of_identity_queries_and_authenticates_with_digest() {
+    saved_login(true);
+}
+
+fn saved_login(digest: bool) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("arca.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -386,15 +439,17 @@ fn saved_login_stays_out_of_identity_queries_and_authenticates_the_job() {
             arcad::serve_conn(stream, &label, &state).unwrap();
         }
     });
-    let (addr, key, printer) = ipps(
+    let (addr, key, printer) = ipps_with_auth(
         &[
             (0, 0),
             (op::GET_PRINTER_ATTRIBUTES, 0),
             (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::VALIDATE_JOB, 0),
             (op::CREATE_JOB, 0),
             (op::SEND_DOCUMENT, 0),
         ],
         Some(b"tester:fixture-pass"),
+        digest,
     );
     let mut root = Writer::new();
     root.str("tester");

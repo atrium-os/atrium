@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use arca_store::codec::Writer;
 use arcad::proto;
-use base64::Engine;
 use zeroize::{Zeroize, Zeroizing};
 
 use prelum_ipp_codec::ops::{self, op, JobIdentity};
@@ -76,7 +75,7 @@ pub struct Session {
     pub start: Start,
     target: Target,
     next_id: u32,
-    login: Option<Zeroizing<String>>,
+    login: Option<(crate::auth::Scheme, Zeroizing<Vec<u8>>)>,
 }
 
 impl Session {
@@ -122,8 +121,16 @@ impl Session {
         Ev::Refused { status: m.code, message: msg }
     }
 
+    fn exchange(&mut self, msg: &Message, doc: Option<&mut dyn Read>) -> Result<Message, Error> {
+        let authorization = self.login.as_mut().map(|(scheme, secret)| {
+            scheme.header(secret, &self.target.path)
+                .ok_or_else(|| Error::Io("Could not construct printer authentication".into()))
+        }).transpose()?;
+        self.target.call_with_login(msg, doc, authorization.as_deref().map(String::as_str))
+    }
+
     fn call(&mut self, m: &Message, doc: Option<&mut dyn Read>) -> Result<Message, Ev> {
-        let r = self.target.call_with_login(m, doc, self.login.as_ref().map(|v| v.as_str())).map_err(Self::fail)?;
+        let r = self.exchange(m, doc).map_err(Self::fail)?;
         if !r.is_success() {
             return Err(if self.login.is_some() { Ev::Refused { status: r.code, message: String::new() } } else { Self::refused(&r) });
         }
@@ -152,21 +159,29 @@ impl Session {
     }
 
     fn authorize(&mut self, info: &PrinterInfo, path: &Path) -> Result<(), Ev> {
-        let Some(grant) = &self.start.login else { return Ok(()) };
+        let Some(grant) = self.start.login.clone() else { return Ok(()) };
         if self.login.is_some() {
             return Ok(());
         }
-        let (Some(key), Some(uuid), true) = (self.start.key, self.start.uuid.as_deref(), self.start.tls) else {
+        let (Some(key), Some(_), true) = (self.start.key, self.start.uuid.as_deref(), self.start.tls) else {
             return Err(Ev::Failed("Printer login requires a pinned IPPS key and UUID".into()));
         };
         self.check_identity(info)?;
+        // Validate-Job has no side effects, document, or PIN. Ask for the
+        // challenge before handing a live job (especially a stream) to HTTP.
+        let id = self.id();
+        let probe = ops::validate_job(id, &self.start.uri, &JobIdentity {
+            user: "atrium".into(), job_name: "Document".into(), job_password: None,
+        }, ops::Format::Pdf, &ops::Ticket::default());
+        let scheme = self.target.login_scheme(&probe).map_err(Self::fail)?;
+        let uuid = self.start.uuid.as_deref().unwrap();
         let mut w = Writer::new();
         w.raw(&grant.0);
         w.raw(&key);
         w.str(uuid);
         let secret = arca_secret(path, proto::op::TAKE_PRINT_LOGIN, &w.buf, arca_store::model::caps::ACCOUNT + 1 + 1024)
             .map_err(|_| Ev::Failed("Arca could not release the saved printer login".into()))?;
-        self.login = Some(Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*secret)));
+        self.login = Some((scheme, secret));
         Ok(())
     }
 
@@ -212,7 +227,7 @@ impl Session {
             let response = if let Some(mut value) = identity.job_password.take() {
                 value.zeroize();
                 // Do not surface printer-controlled text from a PIN request.
-                let response = self.target.call_with_login(&request, None, self.login.as_ref().map(|v| v.as_str()));
+                let response = self.exchange(&request, None);
                 for attr in request.groups.iter_mut().flat_map(|g| &mut g.attributes) {
                     if attr.name == "job-password" {
                         for value in &mut attr.values {

@@ -15,6 +15,7 @@ prelum-proto = { path = "../prelum-proto" }
 navigator-fetch = { path = "../../navigator-fetch" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 sha2 = "0.10"
+md-5 = "0.10"
 base64 = "0.22"
 
 [dev-dependencies]

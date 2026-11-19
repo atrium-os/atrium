@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+mod auth;
 pub mod conn;
 pub mod tls;
 pub mod worker;

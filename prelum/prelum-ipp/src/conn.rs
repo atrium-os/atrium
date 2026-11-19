@@ -12,11 +12,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use navigator_fetch::http::{read_head, Body};
+use navigator_fetch::http::{read_head, Body, Head};
 use prelum_ipp_codec::{Limits, Message};
 use zeroize::Zeroizing;
 
-use crate::tls;
+use crate::{auth::Scheme, tls};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A printer busy printing may stop reading the document for a while.
@@ -133,8 +133,41 @@ impl Target {
         self.call_with_login(msg, doc, None)
     }
 
-    pub(crate) fn call_with_login(&self, msg: &Message, doc: Option<&mut dyn Read>, login: Option<&str>) -> Result<Message, Error> {
-        if login.is_some() && (self.tls.is_none() || !self.verifier.as_ref().is_some_and(|v| v.pinned().is_some())) {
+    fn pinned(&self) -> bool {
+        self.tls.is_some() && self.verifier.as_ref().is_some_and(|v| v.pinned().is_some())
+    }
+
+    pub(crate) fn login_scheme(&self, probe: &Message) -> Result<Scheme, Error> {
+        if !self.pinned() {
+            return Err(Error::Io("Printer login requires pinned IPPS".into()));
+        }
+        let (_, head, _) = self.exchange(probe, None, None)?;
+        if !matches!(head.status, 200 | 400 | 401 | 405 | 501) {
+            return Err(Error::Http(head.status));
+        }
+        Scheme::choose(head.status, &head.headers)
+            .ok_or_else(|| Error::Io("The printer offered no supported HTTP authentication challenge".into()))
+    }
+
+    pub(crate) fn call_with_login(&self, msg: &Message, doc: Option<&mut dyn Read>, authorization: Option<&str>) -> Result<Message, Error> {
+        let (mut s, head, rest) = self.exchange(msg, doc, authorization)?;
+        if head.status != 200 {
+            return Err(Error::Http(head.status));
+        }
+        let limits = Limits::default();
+        let mut body = Body::new(&head, rest);
+        let mut out = Vec::new();
+        while let Some(piece) = body.next(&mut s, 64 * 1024).map_err(|e| Error::Io(format!("{e:?}")))? {
+            out.extend_from_slice(&piece);
+            if out.len() > limits.max_bytes {
+                return Err(Error::Ipp("answer too large".into()));
+            }
+        }
+        Message::decode(&out, &limits).map(|(m, _)| m).map_err(|e| Error::Ipp(e.to_string()))
+    }
+
+    fn exchange(&self, msg: &Message, doc: Option<&mut dyn Read>, authorization: Option<&str>) -> Result<(Stream, Head, Vec<u8>), Error> {
+        if authorization.is_some() && !self.pinned() {
             return Err(Error::Io("Printer login requires pinned IPPS".into()));
         }
         let mut s = self.open()?;
@@ -144,10 +177,10 @@ impl Target {
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/ipp\r\nUser-Agent: Atrium-Prelum/1\r\nConnection: close\r\n",
             self.path, self.host
         ));
-        if let Some(login) = login {
-            head.reserve("Authorization: Basic ".len() + login.len() + 64);
-            head.push_str("Authorization: Basic ");
-            head.push_str(login);
+        if let Some(value) = authorization {
+            head.reserve("Authorization: ".len() + value.len() + 64);
+            head.push_str("Authorization: ");
+            head.push_str(value);
             head.push_str("\r\n");
         }
         match doc {
@@ -176,7 +209,6 @@ impl Target {
             }
         }
         s.flush().map_err(io)?;
-        let limits = Limits::default();
         // Skip interim answers (100 Continue).
         let (head, rest) = loop {
             let (h, rest) = read_head(&mut s, false).map_err(|e| Error::Io(format!("{e:?}")))?;
@@ -188,18 +220,7 @@ impl Target {
             }
             break (h, rest);
         };
-        if head.status != 200 {
-            return Err(Error::Http(head.status));
-        }
-        let mut body = Body::new(&head, rest);
-        let mut out = Vec::new();
-        while let Some(piece) = body.next(&mut s, 64 * 1024).map_err(|e| Error::Io(format!("{e:?}")))? {
-            out.extend_from_slice(&piece);
-            if out.len() > limits.max_bytes {
-                return Err(Error::Ipp("answer too large".into()));
-            }
-        }
-        Message::decode(&out, &limits).map(|(m, _)| m).map_err(|e| Error::Ipp(e.to_string()))
+        Ok((s, head, rest))
     }
 }
 

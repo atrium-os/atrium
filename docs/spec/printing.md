@@ -888,9 +888,15 @@ under a printer recipient keyed by its TLS SPKI and IPP UUID. Saving again
 updates the existing encrypted item.
 
 Prelumd gets only an opaque one-use grant from Arca. The IPP worker makes an
-unauthenticated identity query over pinned TLS, checks the UUID, and then redeems
-the grant. It uses HTTP Basic for job requests over the same pinned IPPS
-destination. Discovery must allow the unauthenticated identity query. A changed
+unauthenticated identity query over pinned TLS and checks the UUID. It sends
+an anonymous Validate-Job without a PIN or document to learn the HTTP
+authentication challenge before it redeems the grant. The worker prefers
+supported HTTP Digest to Basic and accepts MD5, SHA-256 and SHA-512-256,
+including their session variants, with `qop=auth` or the legacy no-qop form.
+Digest uses the POST request target and a nonce count. Job requests, including
+streamed document uploads, are sent once over pinned IPPS. The worker fails
+if the printer offers no supported challenge before redemption and does not replay a job after
+HTTP 401. Discovery must allow the anonymous identity query. A changed
 identity cannot receive the password or the document.
 
 The authenticated simulator gate passed on arm64 FreeBSD. A job without a
@@ -899,10 +905,12 @@ the simulator UUID changed, Prelum held the job before the worker redeemed
 the grant. After the UUID was restored, Arca released the login to the jailed
 worker and the simulator authenticated Create-Job and Send-Document. The
 desktop job reached Done. The fixture used an alternate Arca socket in the
-usual mount directory.
+usual mount directory. A separate SHA-256 Digest run on arm64 FreeBSD used the
+same desktop flow and verified that the IPPS simulator challenged an
+anonymous Validate-Job, checked the Digest response for Create-Job,
+Send-Document and job polling, and received exactly one PDF.
 
-HTTP Digest, saved job PINs, Sigillum verification for sharing, and per-persona
-routing and crossing policy remain open.
+Saved job PINs and per-persona routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 
