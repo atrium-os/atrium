@@ -102,6 +102,7 @@ pub struct Connection {
     /// While corked, `send_message` only buffers: a frame of many small
     /// messages goes out in a few writes instead of one per message.
     corked: bool,
+    encoded_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -137,8 +138,13 @@ impl Connection {
             infds: VecDeque::new(),
             held: VecDeque::new(),
             corked: false,
+            encoded_bytes: 0,
         })
     }
+
+    /// Outgoing envelope and payload bytes, including corked messages and CAS traffic.
+    /// Compare across successful flushes to measure a frame on the wire.
+    pub fn encoded_bytes(&self) -> u64 { self.encoded_bytes }
 
     pub fn set_cache_cap(&mut self, bytes: usize) {
         self.cache_cap = bytes;
@@ -164,6 +170,7 @@ impl Connection {
         }
         let h = Header::new(opcode_class, op, flags, payload.len() as u32);
         envelope::write_message(&mut self.wr, h, payload)?;
+        self.encoded_bytes += (h.encode().len() + payload.len()) as u64;
         if self.corked {
             return Ok(());
         }
@@ -213,7 +220,9 @@ impl Connection {
         let mut bytes = h.encode().to_vec();
         bytes.extend_from_slice(payload);
         let sent = send_with_fds(self.wr.get_ref(), &bytes, fds)?;
-        self.wr.get_mut().write_all(&bytes[sent..])
+        self.wr.get_mut().write_all(&bytes[sent..])?;
+        self.encoded_bytes += bytes.len() as u64;
+        Ok(())
     }
 
     /// Take `n` received fds, oldest first; `None` (and none taken) if

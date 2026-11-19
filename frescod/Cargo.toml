@@ -47,6 +47,8 @@ name = "fresco-renderer"
 path = "src/bin/fresco_renderer.rs"
 
 [features]
+# Compare the split renderer's incremental pixels against a full raster for I0.
+i0-raster-check = []
 # Compile the compute renderer's kernels in-process (Cranelift) when
 # atrium-spv-compile is not installed.
 cranelift = ["fresco-compute/cranelift"]

@@ -353,6 +353,9 @@ impl Connection {
         self.default_window = id;
     }
 
+    /// Outgoing Aqueduct envelope and payload bytes.
+    pub fn encoded_bytes(&self) -> u64 { self.inner.encoded_bytes() }
+
     /// Set timeout on the underlying socket read. None = blocking.
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(t)

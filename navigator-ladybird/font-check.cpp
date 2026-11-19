@@ -16,6 +16,11 @@ int main()
     auto font = Gfx::FontDatabase::the().get(family, 12, 400, Gfx::FontWidth::Normal, 0);
     if (!font || font->family() != family)
         return 4;
+    size_t length = 0;
+    auto* bytes = navigator_pinned_sfnt(font.ptr(), &length);
+    auto backing = font->typeface().font_data();
+    if (!bytes || !length || length != backing.size() || memcmp(bytes, backing.data(), length))
+        return 7;
     auto* buffer = hb_buffer_create();
     hb_buffer_add_utf8(buffer, "beta", 4, 0, 4);
     hb_buffer_guess_segment_properties(buffer);

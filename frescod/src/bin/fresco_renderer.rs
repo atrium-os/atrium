@@ -175,6 +175,8 @@ fn raster(
     let h = &frame.header;
     if w.tiles.is_none() {
         t2.render(frame, &mut w.px).map_err(|e| e.to_string())?;
+        #[cfg(feature = "i0-raster-check")]
+        eprintln!("i0_raster width={width} height={height} tiles={} full=true", h.tiles_x * h.tiles_y);
         w.tiles = Some(sig);
         w.scrolls = scrolls;
         return Ok(Some(None));
@@ -193,6 +195,16 @@ fn raster(
         // What `px` holds is now neither frame: draw the next one whole.
         w.tiles = None;
         return Err(e.to_string());
+    }
+    #[cfg(feature = "i0-raster-check")]
+    {
+        let mut reference = vec![0; n];
+        t2.render(frame, &mut reference).map_err(|e| e.to_string())?;
+        let mismatches = reference.iter().zip(&w.px).filter(|(a,b)| a!=b).count();
+        let touched = damage::tiles_after_plan(width, height, &sig, held, &out.pixels, usize::MAX);
+        let count: u64 = touched.iter().map(|r| u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])).sum();
+        eprintln!("i0_raster width={width} height={height} tiles={count} full=false pixel_mismatches={mismatches}");
+        if mismatches != 0 { return Err("incremental raster differs from full frame".into()); }
     }
     w.tiles = Some(sig);
     let t = fresco_compute::TILE;

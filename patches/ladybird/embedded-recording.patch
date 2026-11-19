@@ -1,0 +1,26 @@
+--- a/Libraries/LibWeb/Rust/src/lib.rs
++++ b/Libraries/LibWeb/Rust/src/lib.rs
+@@ -37,6 +37,23 @@
+ pub(crate) mod style_layout_pool;
+ pub(crate) mod svg;
+ pub mod web_audio;
++
++// The embedded painter reads a published recording synchronously on the document thread.
++pub use render_state::DocumentHost as EmbeddedDocumentHost;
++
++pub fn with_embedded_recording<T>(
++    host: &EmbeddedDocumentHost,
++    visit: impl FnOnce(
++        &libcompositing_rust::display_list::storage::DisplayListStorage,
++        &libcompositing_rust::scrolling::ScrollStateSnapshot,
++        &std::collections::HashMap<u64, libgfx_rust::font::FontHandle>,
++    ) -> T,
++) -> Option<T> {
++    let output = host.recording().published_recording()?;
++    let tree = output.visual_context_tree.clone()?;
++    let list = libcompositing_rust::display_list::storage::DisplayListStorage::recorded(output.display_list.clone(), tree);
++    Some(visit(&list, &host.scroll_state(), &output.resources.fonts))
++}
+ 
+ // What libweb_bindings_rust, whose interfaces are implemented in Rust, uses of this crate.
+ pub use animations::animation::AnimationRecordRef;

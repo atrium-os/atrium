@@ -382,7 +382,7 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     let Some(role) = catalogue::role(&req.role) else { return refuse(refusal::UNKNOWN_ROLE) };
     // A chosen role needs no `embeds` of its own: the choice can only come
     // from a share sheet the parent opened, which did need it.
-    if let (Provider::System(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
+    if let (Provider::System(_) | Provider::Worker(_) | Provider::User, Some(check)) = (role.provider, shared.embed_check.lock().unwrap().as_ref()) {
         if !print_pin && !check(&app, role.name) {
             eprintln!("limend: {app} (uid {uid}) may not embed {}: not in its manifest's embeds", role.name);
             return refuse(refusal::NOT_EMBEDDABLE);
@@ -416,8 +416,9 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
             Some(&(c, u)) => (c, u, false),
             None => return refuse(refusal::NO_PROVIDER),
         },
-        Provider::User | Provider::Chosen => {
+        Provider::Worker(_) | Provider::User | Provider::Chosen => {
             let provider = match role.provider {
+                Provider::Worker(app) => Some((app.to_string(), None)),
                 Provider::Chosen => match st.choices.remove(&conn) {
                     Some((app, persona, at)) if at.elapsed() <= Duration::from_millis(catalogue::CHOICE_MS) => Some((app, persona)),
                     _ => None,

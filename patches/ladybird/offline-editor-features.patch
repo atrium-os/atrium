@@ -1,0 +1,189 @@
+--- a/Libraries/LibWeb/CSS/FontLoading.cpp
++++ b/Libraries/LibWeb/CSS/FontLoading.cpp
+@@ -23,7 +23,11 @@
+ 
+ bool requires_off_thread_vector_font_preparation(ByteBuffer const& data)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return false;
++#else
+     return font_signature(data) == woff2_signature;
++#endif
+ }
+ 
+ // https://drafts.csswg.org/css-fonts-4/#fetch-a-font
+@@ -31,6 +35,9 @@
+ // NB: The type is the one the data has, whatever the response's Content-Type says.
+ ErrorOr<NonnullRefPtr<Gfx::Typeface const>> try_load_vector_font(ByteBuffer const& data)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return Error::from_string_literal("Navigator editor uses pinned fonts");
++#else
+     switch (font_signature(data)) {
+     case woff_signature:
+         return WOFF::try_load_from_bytes(data);
+@@ -39,14 +46,19 @@
+     default:
+         return Gfx::Typeface::try_load_from_temporary_memory(data);
+     }
++#endif
+ }
+ 
+ void prepare_vector_font_data_off_thread(ByteBuffer data, Function<void(ErrorOr<Core::AnonymousBuffer>)>&& on_complete)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    on_complete(Error::from_string_literal("Navigator editor uses pinned fonts"));
++#else
+     auto convert = [data = move(data)] {
+         return WOFF2::convert_to_ttf(data);
+     };
+     Platform::run_on_thread_pool<ErrorOr<Core::AnonymousBuffer>>(move(convert), move(on_complete));
++#endif
+ }
+ 
+ }
+--- a/Libraries/LibWeb/HTML/Canvas/SerializeBitmap.cpp
++++ b/Libraries/LibWeb/HTML/Canvas/SerializeBitmap.cpp
+@@ -51,6 +51,9 @@
+ // https://html.spec.whatwg.org/multipage/canvas.html#a-serialisation-of-the-bitmap-as-a-file
+ ErrorOr<SerializeBitmapResult> serialize_bitmap(Gfx::DecodedImageFrame const& frame, Utf16View type, Optional<double> quality)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return Error::from_string_literal("Canvas export is unavailable in the editor fixture");
++#else
+     auto bitmap = frame.bitmap_sharing_pixels();
+     Optional<ReadonlyBytes> icc_data;
+     Optional<Media::CodingIndependentCodePoints> cicp;
+@@ -85,6 +88,7 @@
+     // User agents must support PNG ("image/png"). User agents may support other types.
+     // If the user agent does not support the requested type, then it must create the file using the PNG format. [PNG]
+     return SerializeBitmapResult { TRY(Gfx::PNGWriter::encode(*bitmap, { .icc_data = icc_data, .cicp = cicp })), SerializedBitmapMimeType::PNG };
++#endif
+ }
+ 
+ }
+--- a/Libraries/LibWeb/WebRTC/RTCPeerConnection.cpp
++++ b/Libraries/LibWeb/WebRTC/RTCPeerConnection.cpp
+@@ -54,6 +54,9 @@
+ 
+ WebIDL::ExceptionOr<GC::Ref<RTCPeerConnection>> RTCPeerConnection::create_for_constructor(JS::Object& relevant_global_object, RTCConfiguration const& configuration)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return WebIDL::NotSupportedError::create("The Navigator editor has no WebRTC capability"_utf16);
++#else
+     if (!WebRTCAgent::the().is_ready())
+         return WebIDL::OperationError::create("Unable to start the WebRTC helper"_utf16);
+     auto* global_scope = HTML::window_or_worker_global_scope_from_global_object(relevant_global_object);
+@@ -94,6 +97,7 @@
+     }
+     WebRTCAgent::the().register_peer_connection(connection->m_pc_id, connection);
+     return connection;
++#endif
+ }
+ 
+ RTCPeerConnection::RTCPeerConnection(GC::Ref<DOM::EventTarget> relevant_global_object, RTCConfiguration configuration)
+--- a/Libraries/LibWeb/WebAudio/MediaStreamAudioSourceNode.cpp
++++ b/Libraries/LibWeb/WebAudio/MediaStreamAudioSourceNode.cpp
+@@ -62,6 +62,9 @@
+ }
+ RustFFI::FfiSharedCppObject web_audio_media_source_attach(MediaCapture::MediaStreamTrack* track, Audio::SpscAudioFrameRing* ring, float sample_rate)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return { nullptr, [](void*) { }, [](void*) { } };
++#else
+     auto channel_count = ring->channel_count();
+     auto converter = Media::FFmpeg::FFmpegAudioConverter::try_create();
+     if (converter.is_error())
+@@ -102,6 +105,7 @@
+     };
+     track->add_audio_sink(*sink);
+     return { &sink.leak_ref(), [](void* sink) { static_cast<MediaCapture::AudioFrameSink*>(sink)->ref(); }, [](void* sink) { static_cast<MediaCapture::AudioFrameSink*>(sink)->unref(); } };
++#endif
+ }
+ void web_audio_media_source_detach(MediaCapture::MediaStreamTrack* track, MediaCapture::AudioFrameSink* sink) { track->remove_audio_sink(*sink); }
+ 
+--- a/Libraries/LibWeb/Loader/ContentBlocker.cpp
++++ b/Libraries/LibWeb/Loader/ContentBlocker.cpp
+@@ -23,7 +23,11 @@
+ 
+ ContentBlocker::~ContentBlocker()
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return;
++#else
+     ContentBlocking::FFI::rust_content_blocker_free(m_engine.load());
++#endif
+ }
+ 
+ static StringView resource_type_to_adblock_request_type(ContentBlocker::ResourceType type)
+@@ -151,6 +155,11 @@
+ 
+ ErrorOr<void> ContentBlocker::set_rules_from_bytes(ReadonlyBytes rules_bytes)
+ {
++#ifdef ATRIUM_I0_EDITOR
++    if (!rules_bytes.is_empty())
++        return Error::from_string_literal("Editor fixture has no filter list engine");
++    return {};
++#else
+     // OPTIMIZATION: Building an engine costs the same tokenizing and flatbuffer work whether or not there are any
+     //               rules to put in it, and every caller already treats a missing engine as "nothing is blocked".
+     //               Drop the engine instead of rebuilding an empty one.
+@@ -171,6 +180,7 @@
+     ContentBlocking::FFI::rust_content_blocker_free(m_engine.exchange(engine));
+     m_has_cosmetic_rules = has_cosmetic_rules;
+     return {};
++#endif
+ }
+ 
+ bool ContentBlocker::is_filtered(URL::URL const& url) const
+@@ -185,6 +195,9 @@
+ 
+ bool ContentBlocker::is_filtered(URL::URL const& url, URL::URL const& source_url, ResourceType resource_type) const
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return false;
++#else
+     if (!has_rules())
+         return false;
+ 
+@@ -205,6 +218,7 @@
+         url_string.bytes(),
+         source_url_string.bytes(),
+         request_type.bytes());
++#endif
+ }
+ 
+ Utf16String ContentBlocker::cosmetic_style_sheet_for_url(URL::URL const& url) const
+@@ -214,6 +228,9 @@
+ 
+ Utf16String ContentBlocker::cosmetic_style_sheet_for_url(URL::URL const& url, ReadonlySpan<Utf16FlyString> classes, ReadonlySpan<Utf16FlyString> ids) const
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return {};
++#else
+     if (!has_cosmetic_rules())
+         return {};
+ 
+@@ -238,10 +255,14 @@
+         url_string.bytes(),
+         classes_bytes.bytes(),
+         ids_bytes.bytes()));
++#endif
+ }
+ 
+ bool ContentBlocker::has_generic_cosmetic_selectors_for_url(URL::URL const& url, ReadonlySpan<Utf16FlyString> classes, ReadonlySpan<Utf16FlyString> ids) const
+ {
++#ifdef ATRIUM_I0_EDITOR
++    return false;
++#else
+     if (!has_cosmetic_rules())
+         return false;
+ 
+@@ -266,6 +287,7 @@
+         url_string.bytes(),
+         classes_bytes.bytes(),
+         ids_bytes.bytes());
++#endif
+ }
+ 
+ ContentBlocker::ResourceType ContentBlocker::resource_type_from_fetch_metadata(Optional<Fetch::Infrastructure::Request::Destination> const& destination, Optional<Fetch::Infrastructure::Request::InitiatorType> const& initiator_type, Fetch::Infrastructure::Request::Mode mode)

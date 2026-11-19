@@ -26,6 +26,15 @@ public:
         return {};
     }
 
+    ReadonlyBytes bytes_for(Gfx::Typeface const& typeface) const
+    {
+        for (size_t i = 0; i < m_faces.size(); ++i) {
+            if (m_faces[i].ptr() == &typeface)
+                return sources[i].bytes;
+        }
+        return {};
+    }
+
     void for_each_typeface_with_family_name(FlyString const& family, Function<void(Gfx::Typeface const&)> visit) override
     {
         for (size_t i = 0; i < m_faces.size(); ++i) {
@@ -83,6 +92,8 @@ private:
     Vector<NonnullRefPtr<Gfx::Typeface>> m_faces;
 };
 
+static PinnedFonts const* s_installed_fonts;
+
 ErrorOr<void> install_pinned_fonts()
 {
     auto& database = Gfx::FontDatabase::the();
@@ -90,10 +101,22 @@ ErrorOr<void> install_pinned_fonts()
         return Error::from_string_literal("Navigator requires exclusive ownership of the LibWeb font provider");
     auto provider = TRY(try_make<PinnedFonts>());
     TRY(provider->load());
+    auto* pinned = provider.ptr();
     auto& installed = database.install_system_font_provider(move(provider));
+    s_installed_fonts = pinned;
     static NeverDestroyed<Web::Platform::FontPlugin> plugin(false, &installed);
     Web::Platform::FontPlugin::install(*plugin);
     return {};
 }
 
+}
+
+extern "C" u8 const* navigator_pinned_sfnt(void const* font, size_t* length)
+{
+    *length = 0;
+    if (!font || !Navigator::s_installed_fonts)
+        return nullptr;
+    auto bytes = Navigator::s_installed_fonts->bytes_for(static_cast<Gfx::Font const*>(font)->typeface());
+    *length = bytes.size();
+    return bytes.data();
 }

@@ -30,6 +30,7 @@ serde    = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
+nuntius = { path = "../nuntius", default-features = false }
 fresco-client = { path = "../fresco-client" }
 
 [[example]]

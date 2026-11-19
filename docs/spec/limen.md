@@ -119,7 +119,7 @@ doesn't know drops the message. An incompatible change is a new role name (`doc-
 | `media-player` | user | default media app | `plain` | as long as the parent wants |
 | `pdf-viewer` | user | default: Atrium PDF (`org.atrium.pdf`) | `plain` | as long as the parent wants |
 | `payment` | user | the user's payment app | `credential` | one payment |
-| `web-island` | system | the Navigator's engine host | `island` | as long as the page |
+| `web-island` | fixed worker | a fresh instance of `org.atrium.navigator.engine`, with the embed-only Fresco connection | `island` | as long as the page |
 | `map` | user | default map app | `plain` | as long as the parent wants |
 | `editor-extension` | user | the extension the user installed | `plain` | as long as the parent wants |
 

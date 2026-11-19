@@ -279,7 +279,7 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   generates the C++ and Rust Web IDL bindings from the upstream IDL inventory
   and cross-builds the Rust LibJS, LibWeb layout/paint, compositing and bindings
   libraries. The bindings' normal target dependency tree excludes both JIT crates.
-  The editor executable still needs its engine-only support libraries and display connection.
+  The linked editor measurements below use this interpreter configuration.
   On the base arm64 sysroot the upstream GUI-off CMake configure reached its
   required JPEG decoder after staging mimalloc, FastFloat, LLVM libc headers,
   simdutf, zmij and HarfBuzz. Its global checks also require media, Fontconfig
@@ -300,56 +300,70 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   on line 4 changed 814 pixels within 106 × 19 and moved the selection from
   offset 17 to 18. A wheel event moved the viewport by 24 CSS pixels and changed
   2,435 pixels within 410 × 183. These counts include the host's scrollbar
-  rendering. Ladybird engine work, Fresco op counts, wire bytes, damage and tiles
-  for these interactions remain unmeasured.
-- **LibWeb editor host and fonts (arm64).** The Mac cross-built 966 LibWeb and 63
-  LibJS C++ units from the upstream source lists, all 759 generated C++ binding
-  units, and the [fixture page client](../../navigator-ladybird/EditorPage.cpp).
-  It supplies a 640 × 360 viewport at 1×, rejects file requests, and feeds the
-  checked-in HTML to the scripting-enabled parser. The executable checks for 128
-  editor paragraphs, focus and caret offset 17 after parsing. Those assertions
-  await the first linked run.
-- The [provider](../../navigator-ladybird/PinnedFonts.cpp) installs directly in
-  LibGfx and LibWeb. The host-side font exporter verifies the ten canonical
-  SFNT addresses before embedding them. The signed font check entered Capsicum
-  before provider initialization, observed uid 1011 and a denied global open,
-  resolved CSS monospace to IBM Plex Mono and shaped `beta` into four matching
-  glyph IDs with positive advances. The verified executable's SHA-256 was
-  `4312bba2f418134842a4e73bc3b8bb6162f9d5c218949e4956d6778f283b421c`.
-- The [painter](../../navigator-ladybird/painter.rs) reads LibCompositing's
-  recording in chunk and occurrence order. It translates ordinary fills,
-  visible carets and horizontal filled glyph runs to Pergola nodes. The glyph
-  positions use LibGfx's ascent and the command scale. It preserves each run's
-  context for clip, effect and scroll resolution. A second signed arm64
-  Capsicum test fed an upstream-built tape with two identical chunks and a
-  caret through the adapter. Both occurrences survived the phase change with
-  identical rectangle nodes. The test stopped at the node conversion.
-- **Link and measurement gate.** As of Nov 19 the editor link has unresolved
-  Unicode, request, compositor and media symbols, including
-  `Unicode::Segmenter::create`, `Requests::RequestClient::websocket_connect`
-  and `MediaClient::Client::acquire`. Finish Unicode and other ordinary support
-  libraries, and bind the platform interfaces to the offline fixture, the
-  assigned Fresco connection and Atrium's brokers. Upstream's optional
-  content-blocking implementation pulls in MPL-2.0 `adblock`; the scratch
-  compile used its ABI declarations only. On the rendering side, connect
-  LibWeb's published `RecordingOutput`, resolve its font IDs and translate its
-  spatial and clip tree to retained groups. Check unsupported commands before
-  submitting a frame. Node updates, bytes and tiles for all three editor
-  interactions and their full-redraw controls remain unmeasured.
-- To resume on the Mac, use `/private/tmp/atrium-i0`. The source is
-  `ladybird-full`; `cpp-engine` contains the C++ objects and Ninja inputs.
-  `editor-link.rsp` and `editor-link.log` identify the exact last link and
-  its unresolved symbols. The [component CMake project](../../navigator-ladybird/CMakeLists.txt)
-  uses the generated headers in `page-headers`, the arm64 toolchain in
-  `freebsd-arm64.cmake`, the dependency prefix `engine-deps` and the JIT-off
-  Rust component archive. Rebuild the existing checkpoint with
-  `cmake --build /private/tmp/atrium-i0/font-rebuild --target font-check editor-host`.
-  For a new tree apply the patches in `patches/ladybird` to the pin above, run
-  the Rust component build, and export the fonts with
-  `cargo run --locked --manifest-path navigator-fontset/Cargo.toml --example export_ladybird -- FONT_DIR`.
-  CMake stages the painter manifest in its build directory. The guest-local
-  signed bundles are `/tmp/navigator-i0-font.6SEQST` and
-  `/tmp/navigator-i0-painter.MbpKML`.
+  rendering. The Fresco measurements below count scene operations and raster tiles.
+### Ladybird editor on FreeBSD arm64, 2026-11-19
+
+The Mac linked the [LibWeb host](../../navigator-ladybird/EditorPage.cpp) with
+the generated bindings, ICU, and one Rust archive containing the interpreter,
+layout, recording and [Fresco painter](../../navigator-ladybird/painter.rs).
+The target dependency graph excludes the JS and Wasm JITs. Portcullis verified
+the bundle manifest. The editor checked jail membership, uid 1011, Capsicum
+mode 1 and an ambient pathname open returning `ECAPMODE` on FreeBSD
+16.0-CURRENT arm64 `main-n290542-cfbf11308b58`.
+
+Limen grants a separate embed connection per web island. The measurement
+launcher also transfers a preconnected Nuntius fixture channel. LibWeb's
+ResourceLoader fetched the 1,003-byte document through that channel and
+verified it against the checked-in fixture before parsing. The broker serves
+one fixed GET. The page ran its script, produced 128 editable paragraphs and
+placed the caret at offset 17. The [pinned font provider](../../navigator-ladybird/PinnedFonts.cpp)
+exports the canonical SFNT bytes for the typeface used by LibGfx. The painter
+reads the published glyph positions, clips, caret and scroll state and sends
+native nodes to the assigned Fresco window. Each renderer runs in its own
+Portcullis jail. Unsupported paint operations fail the fixture.
+
+Three fresh private displays at 640 × 360 and 1× gave identical results.
+Bytes count outbound Aqueduct envelopes and payloads on the editor's display
+connection, including content-addressed resources. Tiles count unique 16 × 16
+raster tiles in the damage plan, including exposed scroll strips. The verification
+redraw is excluded from that count.
+
+| Frame | Changed nodes | Wire bytes | Raster tiles |
+| --- | ---: | ---: | ---: |
+| Initial scene | 136 | 4,469,466 | 920 |
+| Caret hidden | 1 | 102 | 2 |
+| Caret restored | 1 | 102 | 2 |
+| Focused `x` press and release | 2 | 19,091 | 204 |
+| Wheel scroll, 24 CSS pixels | 3 | 560 | 35 |
+
+Blink samples two phases of LibWeb's recorded caret clock. Keeping its scene
+slot while hidden preserves sibling paint order. Fresco dispatched the key and
+wheel through the placed island. The editor verified the changed text and caret
+offset 18, resolved the wheel hit against the recorded scroll tree, and verified
+`scrollTop == 24`. Every incremental image matched a full redraw byte for byte.
+The key touched 204 of 920 tiles even though it changed only two nodes.
+
+**Reproduction.** The Mac staging directory is `/private/tmp/atrium-i0`.
+Use the pinned source in `ladybird-full` with the patches in `patches/ladybird`.
+The stage contains generated headers and Ninja inputs in `page-headers` and
+`cpp-engine`. The editor-specific C++ units use `ATRIUM_I0_EDITOR`.
+Build the CMake targets `font-check` and `editor-host` in `font-rebuild`
+and build its staged painter manifest with `--features editor` for
+`aarch64-unknown-freebsd`. Link the staged objects with
+`python3 scripts/navigator-i0-editor-link.py /private/tmp/atrium-i0`.
+Build Limen's `editor_fixture` example, headless frescod and the split renderer
+with the `i0-raster-check` renderer feature. Copy host-built executables to
+guest-local storage. The [guest gate](../../scripts/navigator-i0-editor-gate.sh)
+takes the display staging directory and signed editor bundle. On the test guest
+these are `/tmp/i0display.UYjBD3` and `/tmp/navigator-i0-editor.UreA3F`.
+The stripped editor SHA-256 was
+`33aab8426708d239b582e42ab4e0800f8c155625205c28a06935a3c7fea38f10`,
+and the renderer was
+`378e34febe2dba007b6bb5b5b907dc1c3b2aa36d83d536500c15b7873453914c`.
+
+The next I0 comparison is the common sign-in fixture. Production per-origin
+fetch delegation, credential mediation and broader paint coverage remain open.
+This gate measures work per interaction. It does not measure latency.
 
 ## 9. Decisions, with recommendations
 

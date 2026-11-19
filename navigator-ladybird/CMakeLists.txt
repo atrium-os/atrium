@@ -71,9 +71,9 @@ if(DEFINED WEB_GENERATED_HEADERS)
     target_compile_options(editor-host PRIVATE -Wno-unqualified-std-cast-call
         "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/../test-assets/navigator-i0")
     target_include_directories(editor-host PRIVATE "${WEB_GENERATED_HEADERS}" "${gen}"
-        "${LADYBIRD_SOURCE}" "${lib}" "${ENGINE_DEPS}/include")
+        "${LADYBIRD_SOURCE}" "${LADYBIRD_SOURCE}/Services" "${lib}" "${ENGINE_DEPS}/include")
     if(DEFINED ENGINE_LIBRARIES)
-        add_executable(editor-check $<TARGET_OBJECTS:editor-host> PinnedFonts.cpp)
+        add_executable(editor-check $<TARGET_OBJECTS:editor-host> PinnedFonts.cpp EditorAudio.cpp)
         target_compile_features(editor-check PRIVATE cxx_std_23)
         target_include_directories(editor-check PRIVATE "${WEB_GENERATED_HEADERS}" "${gen}"
             "${FONT_DIR}" "${LADYBIRD_SOURCE}" "${lib}")

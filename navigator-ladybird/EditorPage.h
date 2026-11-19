@@ -13,7 +13,7 @@ class EditorPage final : public Web::PageClient {
 
 public:
     static GC::Ref<EditorPage> create(Gfx::Palette);
-    ErrorOr<void> load_fixture(StringView html);
+    ErrorOr<void> load_fixture(StringView html, bool embedded);
     Web::PageId id() const override { return Web::PageId { 1 }; }
     Web::Page& page() override { return *m_page; }
     Web::Page const& page() const override { return *m_page; }

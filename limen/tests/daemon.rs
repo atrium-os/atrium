@@ -68,7 +68,7 @@ impl Fresco {
 struct Launch(mpsc::Sender<(EmbedId, UnixStream)>, Arc<Mutex<Vec<EmbedId>>>);
 impl Launcher for Launch {
     fn launch(&mut self, app: &str, embed: EmbedId, ch: UnixStream) -> Result<u32, String> {
-        assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes"].contains(&app), "{app}");
+        assert!(["org.example.viewer", "org.example.player", "org.example.map", "org.example.notes", catalogue::NAVIGATOR_ENGINE].contains(&app), "{app}");
         self.0.send((embed, ch)).unwrap();
         Ok(match app { "org.example.player" => PLAYER_UID, "org.example.notes" => NOTES_UID, _ => VIEWER_UID })
     }
@@ -324,6 +324,21 @@ fn a_spawned_child_crash_is_child_lost_and_a_parent_exit_ends_its_children() {
     std::thread::sleep(Duration::from_millis(catalogue::DETACH_GRACE_MS + 200));
     assert!(w.ended.lock().unwrap().contains(&e2));
     assert_eq!(w.shared.embeds(), 0);
+}
+
+#[test]
+fn each_web_island_launches_its_fixed_worker_with_an_embed_connection() {
+    let w = World::new();
+    let mut app = w.parent(APP);
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let embed = app.request("web-island", W_APP).unwrap();
+        let (instance, mut child) = w.spawned();
+        assert_eq!(instance, embed);
+        assert!(matches!(next_c(&mut child), ChildEvent::Attach { role, .. } if role == "web-island"));
+        children.push(child);
+    }
+    assert_eq!(w.fresco.0.lock().unwrap().2.len(), 2);
 }
 
 #[test]

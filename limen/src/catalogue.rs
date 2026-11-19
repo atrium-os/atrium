@@ -22,6 +22,8 @@ pub enum SlotKind {
 pub enum Provider {
     /// A system service, by registry app id. Never chosen, never registered for.
     System(&'static str),
+    /// A fixed system bundle launched afresh for each embed.
+    Worker(&'static str),
     /// Apps whose manifest declares the role; the user's default.
     User,
     /// The app the person chose for this parent in the share sheet, just
@@ -73,7 +75,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "pdf-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
-    Role { name: "web-island", provider: Provider::System(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
+    Role { name: "web-island", provider: Provider::Worker(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },
     Role { name: "map", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     Role { name: "editor-extension", provider: Provider::User, slot: SlotKind::Plain, takes_fd: false, returns_fd: false },
     // The PDF comes with Print; Save as PDF goes back read-only.

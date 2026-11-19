@@ -1,0 +1,43 @@
+--- a/Libraries/LibWeb/Loader/ResourceLoader.cpp
++++ b/Libraries/LibWeb/Loader/ResourceLoader.cpp
+@@ -30,6 +30,10 @@
+ #include <LibWeb/Platform/EventLoopPlugin.h>
+ #include <LibWeb/Platform/Timer.h>
+ #include <LibWebCommon/Loader/UserAgent.h>
++
++#ifdef ATRIUM_I0_EDITOR
++extern "C" size_t navigator_fixture_get(u8 const*, size_t, u8*, size_t);
++#endif
+ 
+ namespace Web {
+ 
+@@ -507,6 +511,29 @@
+         return nullptr;
+     }
+ 
++#ifdef ATRIUM_I0_EDITOR
++    // The offline editor's only external data is a single fixture GET.
++    // All other schemes, request methods, and resources fail closed.
++    if (url.scheme() == "https"sv && request.method() == "GET"sv && request.body().is_empty()) {
++        auto buffer = ByteBuffer::create_uninitialized(65536);
++        auto const& name = url.serialize();
++        if (!buffer.is_error()) {
++            auto body = buffer.release_value();
++            auto length = navigator_fixture_get(name.bytes().data(), name.bytes().size(), body.data(), body.size());
++            if (length && length <= body.size()) {
++                auto headers = HTTP::HeaderList::create();
++                headers->append({ "Content-Type"sv, "text/html"sv });
++                on_headers_received->function()(nullptr, *headers, 200, {}, Requests::CacheState::NotCached);
++                on_data_received->function()(nullptr, Requests::ResponseData::from_bytes(body.bytes().slice(0, length)));
++                on_complete->function()(true, {}, {}, {});
++                return nullptr;
++            }
++        }
++    }
++    on_complete->function()(false, {}, "Resource unavailable from the Navigator fixture broker"sv, {});
++    return nullptr;
++#endif
++
+     if (url.scheme() == "resource"sv) {
+         handle_resource_load_request(
+             request,
