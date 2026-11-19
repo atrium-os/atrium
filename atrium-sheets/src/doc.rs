@@ -770,9 +770,9 @@ impl Doc {
         self.dirty = true;
     }
 
-    /// Column (`rows` false) or row `i` shown at `px` while its edge is
-    /// dragged; [`size_done`](Self::size_done) makes it one undo step.
-    pub fn size_preview(&mut self, rows: bool, i: u32, px: f64) {
+    /// Columns (`rows` false) or rows `lo..=hi` shown at `px` while an edge
+    /// is dragged; [`size_done`](Self::size_done) makes it one undo step.
+    pub fn size_preview(&mut self, rows: bool, lo: u32, hi: u32, px: f64) {
         let s = self.sheet;
         fn sizes(d: &Doc, s: u16, rows: bool) -> &officina_grid::column::Sizes {
             if rows { &d.wb.sheet(s).row_sizes } else { &d.wb.sheet(s).col_sizes }
@@ -782,11 +782,9 @@ impl Doc {
             self.sizing = Some((s, rows, sizes(self, s, rows).overrides().to_vec()));
         }
         let px = px.clamp(1.0, 8192.0);
-        let mut over = sizes(self, s, rows).overrides().to_vec();
-        match over.binary_search_by_key(&i, |o| o.0) {
-            Ok(k) => over[k].1 = px,
-            Err(k) => over.insert(k, (i, px)),
-        }
+        let mut over: Vec<(u32, f64)> = sizes(self, s, rows).overrides().iter().copied().filter(|o| o.0 < lo || o.0 > hi).collect();
+        over.extend((lo..=hi).map(|i| (i, px)));
+        over.sort_by_key(|o| o.0);
         // A new list each time, so views keyed on it see the change.
         let sh = self.wb.sheet_mut(s);
         let sz = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
@@ -1001,12 +999,12 @@ mod tests {
     fn a_dragged_edge_is_one_undo_step() {
         let mut d = Doc::new("sizes");
         for h in [25.0, 30.0, 42.0] {
-            d.size_preview(true, 3, h);
+            d.size_preview(true, 3, 3, h);
         }
         assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
         d.size_done();
         assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
-        d.size_preview(false, 1, 150.0);
+        d.size_preview(false, 1, 1, 150.0);
         d.size_done();
         assert_eq!(d.wb.sheet(0).col_sizes.size(1), 150.0);
         assert!(d.undo());

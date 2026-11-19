@@ -1192,7 +1192,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1210,8 +1210,6 @@ impl Sheets {
                 let (from, to) = (rect(from), rect(to));
                 d.fill(from, to, copy);
             }
-            GridAction::ResizeCol { col, width } => d.size_preview(false, col, width),
-            GridAction::ResizeRow { row, height } => d.size_preview(true, row, height),
             GridAction::ResizeEnd => d.size_done(),
             GridAction::Undo => {
                 d.undo();
@@ -1239,6 +1237,20 @@ impl Sheets {
         }
         drop(d);
         rev.set(rev.get().wrapping_add(1));
+    }
+}
+
+/// The most rows or columns one drag sizes together.
+pub const MAX_SIZED: u32 = 16_384;
+
+/// The columns (`rows` false) or rows an edge of `i` sizes: the selected
+/// whole columns (rows) when `i` is one of them, else `i` alone.
+pub fn sized_span(sel: &CellRange, rows: bool, i: u32, src: &dyn pergola::widgets::GridSource) -> (u32, u32) {
+    let (whole, lo, hi) = if rows { (sel.c0 == 0 && sel.c1 + 1 >= src.cols(), sel.r0, sel.r1) } else { (sel.r0 == 0 && sel.r1 + 1 >= src.rows(), sel.c0, sel.c1) };
+    if whole && (lo..=hi).contains(&i) && hi - lo < MAX_SIZED {
+        (lo, hi)
+    } else {
+        (i, i)
     }
 }
 
@@ -1357,17 +1369,31 @@ impl View for Sheets {
                 // A filter column's button: its value list.
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
                 // A double-click on a column's edge: as wide as its widest entry.
+                // With whole columns selected, every one of them.
                 GridAction::FitCol(col) => {
-                    let w = src.fit_width(col);
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
+                    let widths: Vec<(u32, f64)> = (lo..=hi).filter_map(|c| src.fit_width(c).map(|w| (c, w))).collect();
                     let mut d = doc.borrow_mut();
-                    match w {
-                        Some(w) => {
-                            d.size_preview(false, col, w);
-                            d.size_done();
-                        }
-                        None => d.status = "That column is empty.".into(),
+                    if widths.is_empty() {
+                        d.status = if lo == hi { "That column is empty.".into() } else { "Those columns are empty.".into() };
                     }
+                    for (c, w) in widths {
+                        d.size_preview(false, c, c, w);
+                    }
+                    d.size_done();
                     drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                // An edge dragged: with whole columns (rows) selected and the
+                // edge one of theirs, all of them take the size.
+                GridAction::ResizeCol { col, width } => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
+                    doc.borrow_mut().size_preview(false, lo, hi, width);
+                    rev.set(rev.get().wrapping_add(1));
+                }
+                GridAction::ResizeRow { row, height } => {
+                    let (lo, hi) = sized_span(&grid.get_cloned().selection(), true, row, &*src);
+                    doc.borrow_mut().size_preview(true, lo, hi, height);
                     rev.set(rev.get().wrapping_add(1));
                 }
                 // A double-click on the fill handle: down along the data beside it.
@@ -2451,6 +2477,27 @@ mod tests {
         run(Cmd::Valid(ValidCmd::Remove));
         assert!(s.doc.borrow().wb.validations().is_empty());
         assert!(s.doc.borrow_mut().type_into(4, 1, "9"));
+    }
+
+    #[test]
+    fn an_edge_of_selected_whole_columns_sizes_them_all() {
+        use pergola::widgets::GridSource;
+        let mut d = Doc::new("w");
+        d.type_into(0, 2, "a rather long entry here");
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let rows = s.source.rows();
+        let cols = CellRange { r0: 0, c0: 1, r1: rows - 1, c1: 3 };
+        assert_eq!(sized_span(&cols, false, 2, &*s.source), (1, 3));
+        // An edge outside them, or a selection not of whole columns: one.
+        assert_eq!(sized_span(&cols, false, 5, &*s.source), (5, 5));
+        assert_eq!(sized_span(&CellRange { r1: 9, ..cols }, false, 2, &*s.source), (2, 2));
+        assert_eq!(sized_span(&CellRange { r0: 4, c0: 0, r1: 6, c1: s.source.cols() - 1 }, true, 5, &*s.source), (4, 6));
+        let mut d = s.doc.borrow_mut();
+        d.size_preview(false, 1, 3, 100.0);
+        d.size_done();
+        assert!((1..=3).all(|c| d.wb.sheet(0).col_sizes.size(c) == 100.0));
+        assert!(d.undo());
+        assert!((1..=3).all(|c| d.wb.sheet(0).col_sizes.size(c) == 64.0));
     }
 
     #[test]
