@@ -58,6 +58,18 @@ pub trait Jmap {
         let _ = plan;
         Ok(None)
     }
+    /// What the server keeps of Mail's filters.
+    fn filters(&self) -> Filters {
+        Filters::default()
+    }
+}
+
+/// What a JMAP server keeps (§11.6): an automatic reply of its own
+/// (`VacationResponse`), Sieve scripts (RFC 9661).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Filters {
+    pub vacation: bool,
+    pub sieve: bool,
 }
 
 /// An automatic reply (mail.md §11.6), as the worker carries it.
@@ -100,6 +112,9 @@ impl<H: Http> Jmap for Client<H> {
     }
     fn sieve(&mut self, plan: &crate::sieve::Plan) -> Result<Option<crate::sieve::Sieved>> {
         Client::sieve(self, plan)
+    }
+    fn filters(&self) -> Filters {
+        Filters { vacation: self.session.can_vacation, sieve: self.session.sieve.is_some() }
     }
     fn search(&mut self, query: &crate::ServerQuery, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
         Client::search_server(self, query, sink, limit)
@@ -537,14 +552,28 @@ impl<H: Http> Client<H> {
             done.others = Some(other.clone());
             return Ok(Some(done));
         }
+        let ours = list.iter().find(|(_, n, _)| n == crate::sieve::SCRIPT).map(|(id, ..)| id.clone());
+        // Read back first: changes made there since are kept.
+        if let (Some(id), Some(prev), false) = (&ours, plan.previous, plan.replace) {
+            let a = self.call(jmap::get_sieve_blob(&self.session.account, id))?;
+            if let Some(blob) = jmap::sieve_blob(&a)? {
+                let url = self.session.download_as(&blob, "atrium-mail.sieve", "application/sieve");
+                let text = self.h.get(&url, 1 << 20).map_err(Error)?;
+                if crate::sieve::fingerprint(&String::from_utf8_lossy(&text)) != prev {
+                    done.changed_there = true;
+                    return Ok(Some(done));
+                }
+            }
+        }
         let caps = mail_proto::sieve::Caps { implementation: String::new(), sieve: exts };
         let (text, no_vacation, skipped) = crate::sieve::script(plan, &caps);
         (done.no_vacation, done.skipped) = (no_vacation, skipped);
         let r = self.h.post(&self.session.upload(), "application/sieve", text.as_bytes(), 64 << 10).map_err(Error)?;
         let blob = jmap::uploaded(&r)?;
-        let ours = list.iter().find(|(_, n, _)| n == crate::sieve::SCRIPT).map(|(id, ..)| id.as_str());
+        let ours = ours.as_deref();
         let a = self.call(jmap::put_sieve_script(&self.session.account, ours, crate::sieve::SCRIPT, &blob))?;
         jmap::sieve_put(&a)?;
+        done.put = Some(crate::sieve::fingerprint(&text));
         Ok(Some(done))
     }
 

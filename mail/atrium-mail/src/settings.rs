@@ -68,7 +68,9 @@ pub struct SettingsUi {
     pub away_on: bool,
     pub away_lines: Vec<(String, String)>,
     /// Accounts whose rules aren't (all) on their server, and why (§11.6).
-    pub rules_lines: Vec<(String, String)>,
+    /// The account's id when the line offers Replace (Mail's filters were
+    /// changed on the server).
+    pub rules_lines: Vec<(String, String, Option<mail_store::AccountId>)>,
     /// Private addresses (§13.3): the account shown, its domain, its addresses.
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
@@ -260,7 +262,15 @@ impl Settings {
         let mail_rules: Vec<(String, String)> = e.rules().iter().map(|r| (r.text(), r.words())).collect();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let away_lines: Vec<(String, String)> = e.configured().into_iter().map(|(id, c)| (c.address, e.away_line(id, now))).collect();
-        let rules_lines: Vec<(String, String)> = if mail_rules.is_empty() { Vec::new() } else { e.configured().into_iter().filter_map(|(id, c)| Some((c.address, e.rules_line(id)?))).collect() };
+        let rules_lines: Vec<(String, String, Option<mail_store::AccountId>)> = e
+            .configured()
+            .into_iter()
+            .filter_map(|(id, c)| {
+                let line = e.rules_line(id)?;
+                let changed = line == mail_engine::sieve::CHANGED_THERE;
+                (changed || !mail_rules.is_empty()).then(|| (c.address, line, changed.then_some(id)))
+            })
+            .collect();
         let u = self.ui.get_cloned();
         let rows: Vec<Row> = rows;
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
@@ -596,6 +606,16 @@ impl Settings {
             Err(e) => format!("Couldn't run it: {e:?}"),
         };
         self.update(|u| u.note = Some(note));
+    }
+
+    /// Put Mail's filters over the changes made to them on the server.
+    pub fn replace_filters(&self, account: mail_store::AccountId) {
+        let note = match self.engine.replace_filters(account) {
+            Ok(()) => "Mail's filters go back on the server at the next sync".to_string(),
+            Err(e) => format!("Couldn't: {e:?}"),
+        };
+        self.update(|u| u.note = Some(note));
+        self.reload();
     }
 
     pub fn remove_mail_rule(&self, i: usize) {
@@ -1244,8 +1264,16 @@ impl SettingsView {
             y += em(30.0);
         }
         // Where they stand on each server (ManageSieve or JMAP Sieve).
-        for (addr, line) in &ui.rules_lines {
-            y += para(ctx, x, y, inner, &format!("{addr}: {line}"), type_size::XS, t.text_tertiary()) + em(4.0);
+        for (addr, line, replace) in &ui.rules_lines {
+            let bw = measure("Replace", type_size::SM, Weight::Medium) + em(24.0);
+            let room = if replace.is_some() { inner - bw - em(8.0) } else { inner };
+            let top = y;
+            y += para(ctx, x, y, room, &format!("{addr}: {line}"), type_size::XS, t.text_tertiary()) + em(4.0);
+            if let Some(id) = *replace {
+                let s = self.s.clone();
+                button(ctx, right - bw, top + em(10.0), "Replace", false, true, move || s.replace_filters(id));
+                y = y.max(top + em(28.0));
+            }
         }
         let fw = (inner - em(80.0)).max(em(160.0));
         let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;

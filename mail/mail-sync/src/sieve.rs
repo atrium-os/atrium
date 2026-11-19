@@ -23,6 +23,21 @@ pub struct Plan {
     pub today: String,
     /// The person's zone (`+0530`), for a server whose Sieve has dates.
     pub zone: Option<String>,
+    /// [`fingerprint`] of the script Mail last put there: one that reads
+    /// otherwise was changed on the server (by webmail, say) and is left
+    /// as it is, unless `replace`.
+    pub previous: Option<u64>,
+    /// Put Mail's script even over changes made on the server (the person
+    /// chose to).
+    pub replace: bool,
+}
+
+/// A script's fingerprint, its line ends and trailing blank lines aside
+/// (servers may store either): FNV-1a, stable across builds.
+pub fn fingerprint(text: &str) -> u64 {
+    let t = text.replace("\r\n", "\n");
+    let t = t.trim_end_matches(['\n', ' ']);
+    t.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +84,11 @@ pub struct Rule {
 pub struct Sieved {
     /// Another script is active (its name): nothing was changed.
     pub others: Option<String>,
+    /// Mail's own script was changed on the server since Mail put it:
+    /// left as it is.
+    pub changed_there: bool,
+    /// The fingerprint of what was put (kept for the next time).
+    pub put: Option<u64>,
     /// The server's Sieve can't send automatic replies.
     pub no_vacation: bool,
     /// Rules the server's Sieve can't do (Mail still does them here).
@@ -209,11 +229,20 @@ pub fn apply<S: Read + Write>(mut s: S, plan: &Plan) -> Result<Sieved, String> {
     if let Some((other, _)) = list.iter().find(|(n, active)| *active && n != SCRIPT) {
         done.others = Some(other.chars().filter(|c| !c.is_control()).take(100).collect());
     } else {
-        let (text, no_vacation, skipped) = script(plan, &caps);
-        (done.no_vacation, done.skipped) = (no_vacation, skipped);
-        ask(&mut s, &mut d, &ms::putscript(SCRIPT, text.as_bytes()).expect("a fixed name"), "Mail's filters")?;
-        if !list.iter().any(|(n, active)| *active && n == SCRIPT) {
-            ask(&mut s, &mut d, &ms::setactive(SCRIPT).expect("a fixed name"), "to turn Mail's filters on")?;
+        // Read back first: changes made there since are kept.
+        let ours = list.iter().any(|(n, _)| n == SCRIPT);
+        if let (true, Some(prev), false) = (ours, plan.previous, plan.replace) {
+            let r = ask(&mut s, &mut d, &ms::getscript(SCRIPT).expect("a fixed name"), "Mail's filters")?;
+            done.changed_there = ms::script_text(&r).is_some_and(|t| fingerprint(t) != prev);
+        }
+        if !done.changed_there {
+            let (text, no_vacation, skipped) = script(plan, &caps);
+            (done.no_vacation, done.skipped) = (no_vacation, skipped);
+            ask(&mut s, &mut d, &ms::putscript(SCRIPT, text.as_bytes()).expect("a fixed name"), "Mail's filters")?;
+            done.put = Some(fingerprint(&text));
+            if !list.iter().any(|(n, active)| *active && n == SCRIPT) {
+                ask(&mut s, &mut d, &ms::setactive(SCRIPT).expect("a fixed name"), "to turn Mail's filters on")?;
+            }
         }
     }
     let _ = s.write_all(&ms::logout());
@@ -236,7 +265,14 @@ mod tests {
             rules: vec![],
             today: "2026-11-20".into(),
             zone: Some("+0530".into()),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn fingerprints_ignore_line_ends() {
+        assert_eq!(fingerprint("keep;\r\nstop;\r\n"), fingerprint("keep;\nstop;"));
+        assert_ne!(fingerprint("keep;"), fingerprint("discard;"));
     }
 
     #[test]

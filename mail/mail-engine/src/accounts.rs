@@ -188,6 +188,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn sieve(&mut self, plan: &mail_sync::sieve::Plan) -> mail_sync::jmap::Result<Option<mail_sync::sieve::Sieved>> {
         mail_sync::jmap::Jmap::sieve(&mut self.remote, plan)
     }
+    fn filters(&self) -> mail_sync::jmap::Filters {
+        mail_sync::jmap::Jmap::filters(&self.remote)
+    }
     fn vacation(&mut self, set: Option<&mail_sync::jmap::Vacation>) -> mail_sync::jmap::Result<Option<mail_sync::jmap::Vacation>> {
         mail_sync::jmap::Jmap::vacation(&mut self.remote, set)
     }

@@ -53,6 +53,8 @@ struct Server {
     sieve: Option<Vec<(String, String, bool, String)>>,
     /// Refuse SieveScript/set with this.
     sieve_refuse: Option<&'static str>,
+    /// The session has no VacationResponse.
+    no_vacation: bool,
 }
 
 impl Server {
@@ -189,7 +191,7 @@ impl Server {
                     json!({ "newState": "v2", "updated": { "singleton": null } })
                 }
                 "SieveScript/get" => {
-                    let list: Vec<Value> = self.sieve.as_ref().unwrap().iter().map(|(id, n, a, _)| json!({ "id": id, "name": n, "isActive": a })).collect();
+                    let list: Vec<Value> = self.sieve.as_ref().unwrap().iter().map(|(id, n, a, _)| json!({ "id": id, "name": n, "isActive": a, "blobId": format!("SB{id}") })).collect();
                     json!({ "state": "z", "list": list, "notFound": [] })
                 }
                 "SieveScript/set" => {
@@ -247,8 +249,11 @@ impl Http for Fake {
         let mut s = self.0.borrow_mut();
         let body = if url == SESSION {
             let mut caps = json!({ "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold }, "urn:ietf:params:jmap:vacationresponse": {} });
+            if s.no_vacation {
+                caps.as_object_mut().unwrap().remove("urn:ietf:params:jmap:vacationresponse");
+            }
             if s.sieve.is_some() {
-                caps["urn:ietf:params:jmap:sieve"] = json!({ "sieveExtensions": ["fileinto", "imap4flags"], "maxSizeScript": 65536 });
+                caps["urn:ietf:params:jmap:sieve"] = json!({ "sieveExtensions": ["fileinto", "imap4flags", "vacation"], "maxSizeScript": 65536 });
             }
             serde_json::to_vec(&json!({
                 "capabilities": { "urn:ietf:params:jmap:core": { "maxSizeUpload": 50_000_000 }, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} },
@@ -261,6 +266,9 @@ impl Http for Fake {
                 "state": "s"
             }))
             .unwrap()
+        } else if let Some(rest) = url.strip_prefix("https://jmap.test/download/u1/SB") {
+            let id = rest.split('/').next().unwrap();
+            s.sieve.as_ref().unwrap().iter().find(|x| x.0 == id).ok_or("404")?.3.clone().into_bytes()
         } else if let Some(rest) = url.strip_prefix("https://jmap.test/download/u1/") {
             let blob = rest.split('/').next().unwrap();
             s.downloads += 1;
@@ -669,6 +677,48 @@ fn jmap_rules_through_sieve() {
     engine.sync_jmap_sieve(account, client.as_mut(), t0 + 5000).unwrap();
     assert!(engine.rules_line(account).unwrap().contains("“webmail”"), "{:?}", engine.rules_line(account));
     assert!(server.borrow().sieve.as_ref().unwrap()[1].2, "still theirs");
+
+    // Mail's script edited on the server: read back, kept, said; Replace.
+    {
+        let mut s = server.borrow_mut();
+        let scripts = s.sieve.as_mut().unwrap();
+        scripts.truncate(1);
+        scripts[0].2 = true;
+        scripts[0].3 = "# edited in webmail\r\nkeep;\r\n".into();
+    }
+    engine.add_rule(parse_rule("subject:newsletter read").unwrap()).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 9000).unwrap();
+    assert!(server.borrow().sieve.as_ref().unwrap()[0].3.contains("edited in webmail"));
+    assert_eq!(engine.rules_line(account).as_deref(), Some(mail_engine::sieve::CHANGED_THERE));
+    engine.replace_filters(account).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 9100).unwrap();
+    assert!(server.borrow().sieve.as_ref().unwrap()[0].3.contains("newsletter"));
+    assert_eq!(engine.rules_line(account), None);
+}
+
+#[test]
+fn jmap_away_through_sieve() {
+    use mail_store::away::Away;
+    let server = Rc::new(RefCell::new(Server { sieve: Some(Vec::new()), no_vacation: true, ..Server::default() }));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut client = mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION).unwrap();
+    assert_eq!(client.filters(), mail_sync::jmap::Filters { vacation: false, sieve: true });
+    let t0 = 1_795_000_000;
+    engine.set_away(&Away { on: true, subject: "Away".into(), text: "Back Monday.".into(), ..Default::default() }).unwrap();
+    // The server has no reply of its own: not "can't", but the script.
+    engine.sync_away(account, client.as_mut()).unwrap();
+    assert_eq!(engine.away_line(account, t0), "set at the next sync");
+    engine.sync_jmap_sieve(account, client.as_mut(), t0).unwrap();
+    let text = server.borrow().sieve.as_ref().unwrap()[0].3.clone();
+    assert!(text.contains("vacation :days 1 :subject \"Away\"") && text.contains("Back Monday."), "{text}");
+    assert_eq!(engine.away_line(account, t0), "replying");
+    // Off: the script again, without it.
+    engine.set_away(&Away { on: false, ..engine.away_shown() }).unwrap();
+    engine.sync_jmap_sieve(account, client.as_mut(), t0 + 60).unwrap();
+    assert!(!server.borrow().sieve.as_ref().unwrap()[0].3.contains("vacation"));
+    assert_eq!(engine.away_line(account, t0), "off");
 }
 
 #[test]

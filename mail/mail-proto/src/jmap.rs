@@ -159,6 +159,11 @@ impl Session {
         fill(&self.download_url, &[("accountId", &self.account), ("blobId", blob), ("name", "message.eml"), ("type", "message/rfc822")])
     }
 
+    /// Where to download blob `blob` as file `name` of type `ty`.
+    pub fn download_as(&self, blob: &str, name: &str, ty: &str) -> String {
+        fill(&self.download_url, &[("accountId", &self.account), ("blobId", blob), ("name", name), ("type", ty)])
+    }
+
     pub fn upload(&self) -> String {
         fill(&self.upload_url, &[("accountId", &self.account)])
     }
@@ -348,6 +353,18 @@ pub fn sieve_scripts(a: &Answers) -> Result<Vec<(String, String, bool)>> {
         .filter_map(Value::as_object)
         .filter_map(|s| Some((need_id(s, "id").ok()?, get_str(s, "name").unwrap_or("").chars().filter(|c| !c.is_control()).take(100).collect(), s.get("isActive").and_then(Value::as_bool).unwrap_or(false))))
         .collect())
+}
+
+/// Script `id`'s blob, to read it back.
+pub fn get_sieve_blob(account: &str, id: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "using": [CORE, SIEVE], "methodCalls": [["SieveScript/get", { "accountId": account, "ids": [id], "properties": ["id", "blobId"] }, "g"]] })).unwrap_or_default()
+}
+
+/// The answer to [`get_sieve_blob`]: its blob id, `None` when it is gone.
+pub fn sieve_blob(a: &Answers) -> Result<Option<String>> {
+    let o = a.of("g", "SieveScript/get")?;
+    let list = o.get("list").and_then(Value::as_array).ok_or(Error("no list".into()))?;
+    Ok(list.iter().filter_map(Value::as_object).find_map(|s| need_id(s, "blobId").ok()))
 }
 
 /// Put uploaded script `blob` as script `name` (a new one, or the one

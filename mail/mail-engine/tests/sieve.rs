@@ -22,6 +22,8 @@ struct Server_ {
     scripts: Vec<(&'static str, bool)>,
     /// Refuse PUTSCRIPT with this.
     refuse: Option<&'static str>,
+    /// GETSCRIPT gives this (an edit made on the server), else what was put.
+    edited: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -63,6 +65,9 @@ fn serve(mut s: UnixStream, cfg: Server_, seen: Arc<Mutex<Seen>>) {
                     s.write_all(b"OK \"Putscript completed.\"\r\n").unwrap();
                 }
             }
+        } else if line == "GETSCRIPT \"atrium-mail\"" {
+            let text = cfg.edited.map(String::from).or_else(|| seen.lock().unwrap().script.clone()).unwrap_or_default();
+            write!(s, "{{{}}}\r\n{text}\r\nOK \"Getscript completed.\"\r\n", text.len()).unwrap();
         } else if line == "SETACTIVE \"atrium-mail\"" {
             s.write_all(b"OK \"Setactive completed.\"\r\n").unwrap();
         } else if line == "LOGOUT" {
@@ -109,7 +114,7 @@ fn the_reply_and_rules_go_to_the_server() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: PathBuf::from("/nonexistent") });
     let a = account(&engine);
-    let net = Net { server: Mutex::new(Server_ { exts: "fileinto vacation imap4flags date relational", scripts: vec![], refuse: None }), seen: Arc::default() };
+    let net = Net { server: Mutex::new(Server_ { exts: "fileinto vacation imap4flags date relational", scripts: vec![], refuse: None, edited: None }), seen: Arc::default() };
     let t0 = 1_795_000_000;
     let sessions = || net.seen.lock().unwrap().sessions;
 
@@ -149,7 +154,7 @@ fn the_reply_and_rules_go_to_the_server() {
     assert_eq!(sessions(), 1);
 
     // Someone else's script is active (webmail, say): left alone, and said.
-    *net.server.lock().unwrap() = Server_ { exts: "fileinto vacation", scripts: vec![("atrium-mail", false), ("roundcube", true)], refuse: None };
+    *net.server.lock().unwrap() = Server_ { exts: "fileinto vacation", scripts: vec![("atrium-mail", false), ("roundcube", true)], refuse: None, edited: None };
     engine.set_away(&Away { on: true, subject: "Out".into(), text: "Out today.".into(), ..Default::default() }).unwrap();
     engine.sync_sieve(a, &net, t0 + 600).unwrap();
     assert_eq!(net.seen.lock().unwrap().commands[4..], ["LISTSCRIPTS", "LOGOUT"]);
@@ -158,7 +163,7 @@ fn the_reply_and_rules_go_to_the_server() {
     assert_eq!(sessions(), 2, "not asked again until something changes");
 
     // A refusal is kept and tried again in an hour, or when the reply changes.
-    *net.server.lock().unwrap() = Server_ { exts: "fileinto vacation", scripts: vec![], refuse: Some("line 4: error") };
+    *net.server.lock().unwrap() = Server_ { exts: "fileinto vacation", scripts: vec![], refuse: Some("line 4: error"), edited: None };
     engine.set_away(&Away { on: true, subject: "Out".into(), text: "Out all week.".into(), ..Default::default() }).unwrap();
     engine.sync_sieve(a, &net, t0 + 1000).unwrap();
     assert!(engine.away_line(a, t0).contains("line 4: error"), "{}", engine.away_line(a, t0));
@@ -171,12 +176,33 @@ fn the_reply_and_rules_go_to_the_server() {
     assert_eq!(sessions(), 5);
 
     // A server whose Sieve has no automatic reply: said, and not asked again.
-    *net.server.lock().unwrap() = Server_ { exts: "fileinto", scripts: vec![("atrium-mail", true)], refuse: None };
+    *net.server.lock().unwrap() = Server_ { exts: "fileinto", scripts: vec![("atrium-mail", true)], refuse: None, edited: None };
     engine.set_away(&Away { on: true, subject: "Out".into(), text: "Gone.".into(), ..Default::default() }).unwrap();
     engine.sync_sieve(a, &net, t0 + 5000).unwrap();
     assert_eq!(engine.away_line(a, t0), "its server can't send automatic replies");
     let script = net.seen.lock().unwrap().script.clone().unwrap();
     assert!(!script.contains("vacation") && script.contains("fileinto \"Lists/GitHub\""), "the rules still go: {script}");
+
+    // Mail's script edited on the server (webmail): read back, kept, said;
+    // Replace puts Mail's over it at the next pass.
+    *net.server.lock().unwrap() = Server_ { exts: "fileinto", scripts: vec![("atrium-mail", true)], refuse: None, edited: Some("# mine now\r\nkeep;\r\n") };
+    engine.add_rule(parse_rule("subject:invoice read").unwrap()).unwrap();
+    let before = net.seen.lock().unwrap().script.clone();
+    engine.sync_sieve(a, &net, t0 + 9000).unwrap();
+    assert_eq!(net.seen.lock().unwrap().script, before, "not put");
+    assert_eq!(engine.rules_line(a).as_deref(), Some(mail_engine::sieve::CHANGED_THERE));
+    let n = sessions();
+    engine.sync_sieve(a, &net, t0 + 9100).unwrap();
+    assert_eq!(sessions(), n, "not asked again within the hour");
+    engine.replace_filters(a).unwrap();
+    engine.sync_sieve(a, &net, t0 + 9200).unwrap();
+    assert!(net.seen.lock().unwrap().script.as_deref().unwrap().contains("invoice"));
+    assert_eq!(engine.rules_line(a), None);
+    // Its own edits from then on are what was put: nothing to say.
+    net.server.lock().unwrap().edited = None;
+    engine.add_rule(parse_rule("subject:receipt read").unwrap()).unwrap();
+    engine.sync_sieve(a, &net, t0 + 9300).unwrap();
+    assert!(net.seen.lock().unwrap().script.as_deref().unwrap().contains("receipt"));
 
     // Removing the account takes its filters' sign-in with it.
     engine.store.write(|w| w.remove_account(a)).unwrap();

@@ -285,6 +285,16 @@ pub fn putscript(name: &str, script: &[u8]) -> Option<Vec<u8>> {
     Some(b)
 }
 
+/// Read script `name` back: its text comes as the response's one line.
+pub fn getscript(name: &str) -> Option<Vec<u8>> {
+    name_ok(name).then(|| format!("GETSCRIPT {}\r\n", quoted(name)).into_bytes())
+}
+
+/// The text from a `GETSCRIPT` answer.
+pub fn script_text(r: &Response) -> Option<&str> {
+    r.lines.first()?.first().map(Item::text)
+}
+
 pub fn setactive(name: &str) -> Option<Vec<u8>> {
     name_ok(name).then(|| format!("SETACTIVE {}\r\n", quoted(name)).into_bytes())
 }

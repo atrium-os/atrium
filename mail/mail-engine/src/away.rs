@@ -74,6 +74,9 @@ impl Engine {
                 s.supported = Some(true);
                 s.why = None;
             }
+            // No reply of its own, but scripts: the reply goes in Mail's
+            // script (`sync_jmap_sieve`).
+            Ok(None) if client.filters().sieve => {}
             Ok(None) => {
                 s.supported = Some(false);
                 s.wanted = None;

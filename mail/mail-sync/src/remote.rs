@@ -98,7 +98,8 @@ pub enum Reply {
     LoggedOut,
     Submitted(std::result::Result<crate::submit::Sent, crate::submit::SendError>),
     /// The session's `maxDelayedSend` (seconds).
-    JmapReady { max_delayed_send: u64 },
+    /// `filters`: what [`crate::jmap::Jmap::filters`] says.
+    JmapReady { max_delayed_send: u64, filters: crate::jmap::Filters },
     JmapSent(std::result::Result<String, String>),
     Vacation(std::result::Result<Option<crate::jmap::Vacation>, String>),
     Watched(std::result::Result<crate::jmap::Pushed, String>),
@@ -463,7 +464,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
             Call::JmapConnect { url } if session.is_none() && jmap.is_none() => {
                 let reply = match crate::jmap::Client::connect(RemoteHttp(chan.clone()), &url) {
                     Ok(c) => {
-                        let r = Reply::JmapReady { max_delayed_send: c.session.max_delayed_send };
+                        let r = Reply::JmapReady { max_delayed_send: c.session.max_delayed_send, filters: crate::jmap::Jmap::filters(&c) };
                         jmap = Some(c);
                         r
                     }
@@ -614,13 +615,15 @@ pub struct Remote<I: Write + AsFd, O: Read + AsFd> {
     caps: Vec<String>,
     gone: bool,
     max_delayed_send: u64,
+    /// A JMAP account's: what its server keeps.
+    filters: crate::jmap::Filters,
 }
 
 impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// Start the session in the worker (`to_worker` is its standard input,
     /// `from_worker` its output) over `courier`.
     pub fn start(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O) -> Result<Remote<I, O>> {
-        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0, filters: Default::default() };
         match r.call(&Call::Start, None, QUIET)? {
             Reply::Started { caps } => r.caps = caps,
             other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
@@ -632,7 +635,7 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// the worker ends).
     pub fn submit(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O, o: &crate::submit::Outgoing<'_>) -> std::result::Result<crate::submit::Sent, crate::submit::SendError> {
         use crate::submit::SendError;
-        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0, filters: Default::default() };
         let c = Call::Submit { from: o.from.into(), rcpts: o.rcpts.to_vec(), bytes: o.bytes.to_vec(), hold_for: o.hold_for };
         match r.call(&c, None, QUIET) {
             Ok(Reply::Submitted(x)) => x,
@@ -645,7 +648,7 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// Put Mail's filters on a ManageSieve `courier` in the worker (then
     /// the worker ends).
     pub fn sieve(courier: std::os::unix::net::UnixStream, to_worker: I, from_worker: O, plan: &crate::sieve::Plan) -> std::result::Result<crate::sieve::Sieved, String> {
-        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0 };
+        let mut r = Remote { courier: Some(courier), http: None, to_worker, from_worker, caps: Vec::new(), gone: false, max_delayed_send: 0, filters: Default::default() };
         match r.call(&Call::Sieve(plan.clone()), None, QUIET) {
             Ok(Reply::Sieved(x)) => x,
             Ok(Reply::Failed(_, t)) => Err(t),
@@ -657,9 +660,12 @@ impl<I: Write + AsFd, O: Read + AsFd> Remote<I, O> {
     /// A JMAP account in the worker: its session at `url`, the HTTP done
     /// here with `http` (the courier's).
     pub fn connect_jmap(http: Box<dyn crate::jmap::Http>, to_worker: I, from_worker: O, url: &str) -> Result<Remote<I, O>> {
-        let mut r = Remote { courier: None, http: Some(http), to_worker, from_worker, caps: Vec::new(), gone: true, max_delayed_send: 0 };
+        let mut r = Remote { courier: None, http: Some(http), to_worker, from_worker, caps: Vec::new(), gone: true, max_delayed_send: 0, filters: Default::default() };
         match r.call(&Call::JmapConnect { url: url.into() }, None, QUIET)? {
-            Reply::JmapReady { max_delayed_send } => r.max_delayed_send = max_delayed_send,
+            Reply::JmapReady { max_delayed_send, filters } => {
+                r.max_delayed_send = max_delayed_send;
+                r.filters = filters;
+            }
             Reply::Failed(k, t) => return Err(error_of(k, t)),
             other => return Err(Error::Protocol(format!("the worker answered {other:?}"))),
         }
@@ -890,6 +896,9 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
     }
     fn can_hold(&self, secs: i64) -> bool {
         secs > 0 && (secs as u64) <= self.max_delayed_send
+    }
+    fn filters(&self) -> crate::jmap::Filters {
+        self.filters
     }
     fn sieve(&mut self, plan: &crate::sieve::Plan) -> crate::jmap::Result<Option<crate::sieve::Sieved>> {
         match self.call(&Call::JmapSieve(plan.clone()), None, QUIET) {
