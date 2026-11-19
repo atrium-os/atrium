@@ -399,6 +399,55 @@ Final stripped editor SHA-256 was
 renderer `8c0abdf21b92802dcfb5d6dfe5421871227b499dae656190450bb68ce5317f5f`.
 These are work counts at 1×. Interaction latency remains unmeasured.
 
+### Tessera-root arm64 HVF baseline, 2026-11-20
+
+The host ran `qemu-system-aarch64 -accel hvf -cpu host` with four vCPUs and
+4 GiB RAM. UEFI loaded the Atrium kernel and matching Tessera module from a
+separate boot disk. In the running guest, `mount -p` reported
+`/dev/vtbd1p1 / tessera rw`. The editor bundle also resolved to this mount.
+The kernel was `16.0-CURRENT atrium-os-9f2eed03a36c` (ATRIUM, arm64).
+The powered-off Tessera disk was the read-only backing file for a fresh
+qcow2 overlay. A second boot used a new overlay over the retained base
+(SHA-256 `f9a327dfaff407d7ce0e85f7ccad9273a43ef1611c9d2b093b2179d89d46f6a1`).
+Each boot ran three independent editor launches with private displays. The editor and renderer SHA-256 values matched the glyph damage
+follow-up above.
+
+| Frame at 640 × 360, 1× | Changed nodes | Outbound wire bytes | 16 × 16 raster tiles |
+| --- | ---: | ---: | ---: |
+| Initial scene | 136 | 4,265,693 | 920 |
+| Caret blink, each phase | 1 | 102 | 2 |
+| Focused `x` press and release | 2 | 756 | 10 |
+| Wheel scroll, 24 CSS pixels | 3 | 560 | 35 |
+
+All six trials gave these counts, matching the UFS fixture baseline. Each
+incremental raster matched its full redraw. Each signed editor verified uid
+1011, jail membership, Capsicum mode 1 and `ECAPMODE` on ambient open. It
+verified the broker's 1,003-byte response, caret offset 18 after inserting
+`x`, and final scroll offset 24. The console emitted a WITNESS lock-order
+warning involving nullfs over Tessera and unionfs over tmpfs during jail
+setup. All trials finished and `jls` showed no remaining jails. Shutdown
+synced all buffers. These trials measured rendering work, not elapsed time.
+
+The Mac keeps the private base and evidence under `~/atrium-vm/navigator-i0-tessera`
+(`root.sha256`, `gate.log`, `snapshot.txt`, `hvf.txt` and
+`boot-measurement.log`, plus `replay-gate.log` and `replay-boot.log`). To repeat from a fresh disk snapshot after reserving
+local SSH port 24223, use a new directory on the same APFS volume:
+
+```sh
+base="$HOME/atrium-vm/navigator-i0-tessera"
+run=$(mktemp -d /private/tmp/i0-tessera-run.XXXXXX)
+cp -c "$base/firmware-boot.qcow2" "$run/firmware-boot.qcow2"
+cp -c "$base/vars.fd" "$run/vars.fd"
+chmod 600 "$run/firmware-boot.qcow2" "$run/vars.fd"
+cp "$base/boot" "$run/boot"
+qemu-img create -f qcow2 -F raw -b "$base/root.raw" "$run/measurement.qcow2"
+sh "$run/boot" measurement.qcow2 qcow2 measurement
+```
+
+Check the live mount before running the guest-local
+`/tmp/i0display.UYjBD3/navigator-i0-editor-gate.sh /tmp/i0display.UYjBD3 /tmp/navigator-i0-editor.UreA3F`.
+Power off the private guest cleanly after collecting the gate output.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's
