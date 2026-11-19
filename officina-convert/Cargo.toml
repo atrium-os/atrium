@@ -20,7 +20,7 @@ required-features = ["read"]
 # links the crate without them (default-features = false): the writers,
 # protection and the launcher only, so no XML parser.
 default = ["read"]
-read = ["dep:quick-xml", "dep:navigator-image"]
+read = ["dep:quick-xml", "dep:navigator-image", "dep:navigator-dom", "dep:serde_json"]
 
 [dependencies]
 officina-core = { path = "../officina-core" }
@@ -36,6 +36,10 @@ quick-xml = { version = "0.37", optional = true }
 # The pictures mode of the worker (pictures.rs): the Navigator's memory-safe
 # decoders, with Office's WMF/EMF/BMP.
 navigator-image = { path = "../navigator-image", features = ["office"], optional = true }
+# HTML clipboard import runs in the worker. The parser's registry dependencies
+# and serde_json are already used in-tree and dual MIT/Apache-2.0.
+navigator-dom = { path = "../navigator-dom", optional = true }
+serde_json = { version = "1", optional = true }
 libc = "0.2"
 # Run as the app's `convert` worker when installed (dev-tools-plan.md M5).
 atrium-worker = { path = "../sdk/atrium-worker" }

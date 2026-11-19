@@ -523,6 +523,7 @@ pub struct Doc {
     pub memory_budget: u64,
     /// The most recent local copy, including formulas and one-shot cut state.
     pub clip: Option<ClipboardCopy>,
+    pub(crate) html_paste: Option<crate::clipboard::PendingHtml>,
     /// While a column or row edge is dragged: the sheet, rows or columns,
     /// and their sizes before, to make one undo step when it is let go.
     pub sizing: Option<(u16, bool, Vec<(u32, f64)>)>,
@@ -595,7 +596,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, html_paste: None, sizing: None, view_top: (0, 0), grown_rows: Default::default(), edits: 0, last_fill: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -977,6 +978,10 @@ impl Doc {
             self.paste_local_clip(area);
             return;
         }
+        self.paste_external(area, bytes, limit);
+    }
+
+    pub(crate) fn paste_external(&mut self, area: Rect, bytes: &[u8], limit: usize) {
         let clip = match officina_grid::clip::Clip::decode_system(bytes, limit) {
             Ok(clip) => clip,
             Err(_) => {

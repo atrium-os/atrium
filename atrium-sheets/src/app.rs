@@ -1448,9 +1448,9 @@ impl Sheets {
                 let rect = officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
                 crate::clipboard::copy(&mut d, rect, cut);
             }
-            GridAction::Paste { row, col, sel } => {
+            GridAction::Paste { row, col, sel, plain } => {
                 let area = officina_grid::addr::Rect { sheet: d.sheet, r0: row, c0: col, r1: sel.r1.max(row), c1: sel.c1.max(col) };
-                crate::clipboard::paste(&mut d, area);
+                crate::clipboard::paste(&mut d, area, plain);
             }
         }
         drop(d);
@@ -2292,6 +2292,9 @@ impl Sheets {
     /// The toolbar's file commands since the last call; undo and redo are run here.
     pub fn take_cmds(&self) -> Vec<Cmd> {
         self.poll_link();
+        if crate::clipboard::poll_html(&mut self.doc.borrow_mut()) {
+            self.changed();
+        }
         let cmds = std::mem::take(&mut *self.cmds.lock().unwrap());
         cmds.into_iter()
             .filter(|&c| match c {
@@ -3572,7 +3575,8 @@ mod tests {
         assert!(offers.borrow().is_empty());
         chord(&mut first, "c", Some([1; 16]));
         let original_offer = offers.borrow().clone();
-        assert_eq!(original_offer.len(), 2);
+        assert_eq!(original_offer.len(), 3);
+        assert_eq!(original_offer[2].0, "text/html");
         assert_eq!(original_offer[0], ("text/plain".into(), b"1.25\t=literal text\t\n".to_vec()));
 
         let mut target = Doc::new("target");
@@ -3597,6 +3601,35 @@ mod tests {
         assert_eq!(target.doc.borrow().wb.value(0, 2, 1), Value::Bool(true));
         assert_eq!(target.doc.borrow().wb.style(cell(2, 1)), &before);
         assert_eq!(target.doc.borrow().wb.style(cell(2, 3)), &Style::default());
+
+        // A configured converter also exercises HTML-only system paste and
+        // the user's explicit plain-text fallback through the grid.
+        if std::env::var_os("OFFICINA_CONVERT").is_some() {
+            *offers.borrow_mut() = vec![original_offer[0].clone(), original_offer[2].clone()];
+            chord(&mut second, "v", Some([9; 16]));
+            assert!(target.doc.borrow().html_paste.is_some());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while target.doc.borrow().html_paste.is_some() && std::time::Instant::now() < until {
+                target.take_cmds();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(target.doc.borrow().html_paste.is_none());
+            assert_eq!(target.doc.borrow().wb.value(0, 2, 1), Value::Num(1.25));
+            assert_eq!(target.doc.borrow().wb.style(cell(2, 1)), &number);
+            assert_eq!(target.doc.borrow().wb.style(cell(2, 3)), &blank);
+            assert!(target.doc.borrow_mut().undo());
+
+            second.handle_event_activated(Event::Key {
+                kind: KeyEventKind::Down,
+                key: Key::Char,
+                chars: "v".into(),
+                modifiers: Modifiers { ctrl: true, shift: true, ..Default::default() },
+            }, Some([10; 16]));
+            assert!(target.doc.borrow().html_paste.is_none());
+            assert_eq!(target.doc.borrow().wb.value(0, 2, 1), Value::Num(1.25));
+            assert_eq!(target.doc.borrow().wb.style(cell(2, 1)), &before);
+            assert!(target.doc.borrow_mut().undo());
+        }
 
         // A malformed rich offer leaves the destination alone.
         let mut bad = original_offer.clone();

@@ -1304,6 +1304,7 @@ dependencies = [
  "libc",
  "md-5",
  "miniz_oxide 0.8.9",
+ "navigator-dom",
  "navigator-image",
  "officina-core",
  "officina-grid",
@@ -1312,6 +1313,7 @@ dependencies = [
  "officina-text",
  "pbkdf2",
  "quick-xml",
+ "serde_json",
  "sha1",
  "sha2",
 ]

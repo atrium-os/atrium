@@ -16,6 +16,7 @@ pub mod doc;
 #[cfg(feature = "read")]
 pub mod ppt;
 pub mod docx;
+pub mod html_clipboard;
 pub mod launch;
 pub mod odt;
 pub mod pictures;

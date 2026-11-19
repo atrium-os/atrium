@@ -528,7 +528,7 @@ pub enum GridAction {
     Cut(CellRange),
     /// Paste at the active cell; `sel` the selection (a bigger one may be
     /// filled with copies).
-    Paste { row: u32, col: u32, sel: CellRange },
+    Paste { row: u32, col: u32, sel: CellRange, plain: bool },
     /// Float `key` dragged to `at` (content px: x, y, width, height).
     PlaceFloat { key: u64, at: [f64; 4] },
     /// Delete with float `key` picked.
@@ -2337,7 +2337,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 }
                 "e" if src.fills() => send(GridAction::FlashFill { row: g.cursor.0, col: g.cursor.1 }),
                 "x" => send(GridAction::Cut(g.selection())),
-                "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection() }),
+                "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection(), plain: m.shift }),
                 "a" => {
                     g.anchor = (0, 0);
                     g.cursor = (last_r, last_c);

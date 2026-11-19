@@ -31,11 +31,14 @@ fn copy_and_paste_through_tabula() {
     let mut a = Tabula::at(&path).unwrap();
     let mut b = Tabula::at(&path).unwrap();
     let rich = "application/vnd.atrium.sheets.cells";
-    a.set(fake.mint(me, kind::KEY), &[("text/plain", b"from a"), (rich, b"rich bytes")], false).unwrap();
+    let html = b"<table><tr><td>from a</td></tr></table>";
+    a.set(fake.mint(me, kind::KEY), &[("text/plain", b"from a"), ("text/html", html), (rich, b"rich bytes")], false).unwrap();
     let paste = fake.mint(me, kind::KEY);
-    let got = b.get(paste, &[rich, "text/plain"]).unwrap();
+    let got = b.get(paste, &[rich, "text/html", "text/plain"]).unwrap();
     assert_eq!(got, Some((rich.into(), b"rich bytes".to_vec())));
     assert!(matches!(b.get(paste, &["text/plain"]), Err(Error::Refused { .. })));
+    let got = b.get(fake.mint(me, kind::KEY), &["text/html", "text/plain"]).unwrap();
+    assert_eq!(got, Some(("text/html".into(), html.to_vec())));
     let got = b.get(fake.mint(me, kind::KEY), &["text/plain"]).unwrap();
     assert_eq!(got, Some(("text/plain".into(), b"from a".to_vec())));
     // A token that frescod never minted.

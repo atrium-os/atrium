@@ -8,12 +8,38 @@ use super::{Clip, Content};
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
 use crate::ops::{read_value, write_value};
 use crate::style::Style;
+use crate::value::Value;
 
 /// The largest selection Sheets exports as one clipboard item.
 pub const MAX_SYSTEM_COPY_CELLS: u64 = 2_000_000;
 const VERSION: u8 = 1;
 
 impl Clip {
+    /// A rectangular clipboard range from an external table. Missing cells
+    /// on shorter rows are blank. Text values are never parsed as formulas.
+    pub fn from_table(table: Vec<Vec<(Value, Style)>>) -> Option<Self> {
+        let rows = table.len();
+        let cols = table.iter().map(Vec::len).max().unwrap_or(0);
+        if rows == 0 || cols == 0 || rows > MAX_ROWS as usize || cols > MAX_COLS as usize
+            || rows as u64 * cols as u64 > MAX_SYSTEM_COPY_CELLS
+        {
+            return None;
+        }
+        let mut cells = Vec::new();
+        let mut styles = Vec::new();
+        let default = Style::default();
+        for (row, values) in table.into_iter().enumerate() {
+            for (col, (value, style)) in values.into_iter().enumerate() {
+                let (row, col) = (row as u32, col as u32);
+                if !value.is_empty() { cells.push((row, col, Content::Value(value))); }
+                if style != default { styles.push((col, row, row, style)); }
+            }
+        }
+        styles.sort_unstable_by_key(|&(col, row, _, _)| (col, row));
+        let from = Rect { sheet: 0, r0: 0, c0: 0, r1: rows as u32 - 1, c1: cols as u32 - 1 };
+        Some(Clip { from, cut: false, cells, styles, notes: Vec::new(), links: Vec::new() })
+    }
+
     /// Encode a copy as values and styles, with a per-copy ID that can match
     /// the source document's local copy. Return none above the byte limit.
     pub fn encode_system(&self, id: &[u8; 16], max_bytes: usize) -> Option<Vec<u8>> {

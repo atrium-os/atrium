@@ -117,12 +117,33 @@ fn pictures(mut stdin: impl Read) -> ! {
     }
 }
 
+fn clipboard_html(stdin: impl Read) -> Result<(), String> {
+    use officina_convert::html_clipboard::{self, MAX_HTML_BYTES, MAX_NATIVE_BYTES};
+    let mut input = Vec::new();
+    stdin.take((MAX_HTML_BYTES + 1) as u64).read_to_end(&mut input).map_err(|e| e.to_string())?;
+    sandbox_cpu(3);
+    let clip = html_clipboard::read(&input)?;
+    let encoded = clip.encode_system(&[0; 16], MAX_NATIVE_BYTES)
+        .ok_or("The converted clipboard range is too large.")?;
+    std::io::stdout().lock().write_all(&encoded).map_err(|e| e.to_string())
+}
+
 fn main() {
     let mut stdin = std::io::stdin().lock();
     let (what, with_password) = match std::env::args().nth(1) {
         Some(w) => (w, std::env::args().nth(2).is_some_and(|a| a == "--password")),
         None => header(&mut stdin),
     };
+    if what == officina_convert::html_clipboard::WORKER_KIND {
+        match clipboard_html(stdin) {
+            Ok(()) => eprintln!("done"),
+            Err(e) => {
+                eprintln!("error\t{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if what == "pictures" {
         pictures(stdin);
     }
