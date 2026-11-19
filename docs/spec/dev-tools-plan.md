@@ -362,7 +362,9 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   HTTPS token grants through portcullisd and requires a compositor-confirmed
   press to grant or revoke. The SSH gate starts the agent with the shipped
   services.d entry, checks its jail ID and UID, and exercises the privileged
-  agent protocol alongside key and token isolation.
+  agent protocol alongside key and token isolation. The dedicated FreeBSD
+  amd64 run passed 42/42. Its workspaces had no Git, so it verified SSH login
+  and the credential helper directly.
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;

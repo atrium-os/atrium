@@ -21,6 +21,7 @@ name          = "atrium-ssh-agent"
 path          = "/var/lib/atrium/jails/ssh-agent"
 children_max  = 0
 devfs_ruleset = 4
+allow_mlock   = true                             # Arca replies use locked memory
 
 [[mounts]]
 source = "/libexec"

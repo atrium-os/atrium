@@ -586,7 +586,7 @@ allowed_system_gids = [
 # compressor (docs/spec/arca.md §6.3), and refuses to serve without it.
 # ---------------------------------------------------------------
 [mlock]
-allow_jails = ["atrium-arcad"]
+allow_jails = ["atrium-arcad", "atrium-ssh-agent"]
 
 
 # ---------------------------------------------------------------

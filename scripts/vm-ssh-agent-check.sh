@@ -71,7 +71,7 @@ G=/tmp/sshgate
 S=/atrium/sockets/arca/arcad.sock
 AR=/atrium/sockets/ssh-agent
 AGENT_LOG=/var/log/atrium/atrium-ssh-agent.log
-V "test ! -S $S || test -f $G/arcad.pid" || {
+V "test -f $G/arcad.pid || sockstat -lu | awk -v path='$S' '\$6 == path { found=1 } END { exit found }'" || {
     echo "ssh-agent: arcad already owns the production socket"
     exit 1
 }
@@ -92,7 +92,7 @@ for b in portcullis/target/$TARGET/release/atrium-jaild \
          arca/arca-ssh-agent/target/$TARGET/release/atrium-ssh-agent arca/arca-ssh-agent/target/$TARGET/release/arca-ssh \
          arca/arca-ssh-agent/target/$TARGET/release/git-credential-arca \
          arca/arca-ssh-agent/etc/services.d/44-atrium-ssh-agent.toml \
-         scripts/ssh-agent-service.sh etc/jaild.policy.toml; do
+         scripts/ssh-agent-service.sh etc/jaild.policy.toml etc/atrium.pf etc/atrium.devfs.rules; do
     put "$ROOT/$b" "$B/" || { echo "copy $b failed"; echo "ssh-agent: 1 failed"; exit 1; }
 done
 put "$ROOT/portcullis/jaild/etc/atrium-jaild" "$B/jaild.rc" || exit 1
@@ -100,6 +100,7 @@ PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 V 'sh -s' <<EOS
 set -e
+mkdir -p /usr/local/bin /usr/local/etc/rc.d
 for b in portcullisd portcullis arca-ssh git-credential-arca; do install -m 0755 $B/\$b /usr/local/bin/\$b; done
 mkdir -p /etc/atrium; cp $B/jaild.policy.toml /etc/atrium/jaild.policy.toml
 grep -q '^allow_rctl' /etc/atrium/jaild.policy.toml || printf '\n[resource_control]\nallow_rctl = true\n' >> /etc/atrium/jaild.policy.toml
@@ -107,12 +108,29 @@ id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
 id sshtest >/dev/null 2>&1 || pw useradd sshtest -m -s /bin/sh
 for u in sg-unlock:50093 _arca-ssh:65047; do n=\${u%%:*}; i=\${u##*:}; id \$n >/dev/null 2>&1 || pw useradd \$n -u \$i -d /nonexistent -s /usr/sbin/nologin; done
 service sshd onestatus >/dev/null 2>&1 || service sshd onestart >/dev/null 2>&1
-mkdir -p /usr/local/etc/rc.d
 if service atrium-jaild onestatus >/dev/null 2>&1; then service atrium-jaild onestop; fi
 install -m 0555 $B/jaild.rc /usr/local/etc/rc.d/atrium-jaild
 install -m 0555 $B/atrium-jaild /usr/local/bin/atrium-jaild
-service atrium-jaild onestart
+# Load the shipped isolation rules before allocating routed workspace jails.
+if ! pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+    kldstat -q -m pf || kldload pf
+    E=\$(route -n get default | awk '/interface:/ { print \$2 }')
+    test -n "\$E"
+    ifconfig "\$E" group atrium_egress
+    pfctl -f $B/atrium.pf
+    pfctl -e
+fi
+pfctl -s rules | grep -q 'anchor "atrium/\*"'
+sysctl -q net.inet.ip.forwarding=1
+if ! devfs rule -s 22 show 2>/dev/null | grep -q .; then
+    mkdir -p /usr/local/etc/atrium
+    install -m 0644 $B/atrium.devfs.rules /usr/local/etc/atrium/devfs.rules
+    sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" devfs_load_rulesets=NO
+    service atrium-jaild onedevfsrules
+fi
 devfs rule -s 4 show | grep -q .
+devfs rule -s 22 show | grep -q .
+service atrium-jaild onestart
 mkdir -p /var/run/atrium /var/log/atrium /atrium/sockets/arca $G/services.d
 touch /var/run/atrium/app-registry
 # Recreate the package-relative path expected by the commissioning script.
@@ -129,7 +147,7 @@ cd $G && env ARCA_DIR=$G/db ARCA_SOCKET=$S ARCA_APP_REGISTRY=/var/run/atrium/app
    daemon -p $G/arcad.pid -o $G/arcad.log $B/arcad </dev/null >/dev/null 2>&1
 i=0; while [ \$i -lt 30 ] && ! test -S $S; do sleep 1; i=\$((i+1)); done
 chmod 755 $G; chmod 666 $S
-daemon -P $G/bootstrap.pid -o $G/bootstrap.log $B/atrium-portcullisd-bootstrap \
+daemon -f -P $G/bootstrap.pid -o $G/bootstrap.log $B/atrium-portcullisd-bootstrap \
     --socket /var/run/atrium/jaild.sock --volumes-socket "" --services-dir $G/services.d
 i=0; while [ \$i -lt 20 ] && ! test -S $AR/control.sock; do sleep 1; i=\$((i+1)); done
 test -S $AR/control.sock

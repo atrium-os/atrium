@@ -691,7 +691,8 @@ For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
   (`_arca-ssh`, 65047). `SA_SIGN` is `DENIED` unless the key is granted to the named
   workspace in that persona. arcad never releases the seed.
 - **The agent** (`arca/arca-ssh-agent`, `atrium-ssh-agent`, jailed, no network) owns
-  `/atrium/sockets/ssh-agent`. At each workspace start portcullisd asks it (control socket,
+  `/atrium/sockets/ssh-agent`. Its jail has `allow.mlock` so it can read Arca's
+  locked-memory protocol replies. At each workspace start portcullisd asks it (control socket,
   as root) to `open OWNER WORKSPACE PERSONA UID`; it makes `<owner>.<workspace>/agent.sock`,
   and portcullisd mounts that folder **read-only** at `/atrium/ssh-agent` in the workspace
   and sets `SSH_AUTH_SOCK`. The socket a connection arrives on names the workspace: a jail
