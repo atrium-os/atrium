@@ -110,7 +110,7 @@ login() { # person password: ostiarius's unlock, then portcullisd's ask
 logout() { g "su -m _ostiarius -c '$P $A lock $1' >/dev/null"; }
 info() { g "$KL group-info $1" 2>/dev/null; }
 state() { info "$1" | awk '{print $NF}'; }
-grp() { info "$1" | awk '{print $5}'; }
+grp() { info "$1" | awk '{for (i = 1; i < NF; i++) if ($i == "group") { print $(i+1); exit }}'; }
 ticks() { g "for i in 1 2; do sync; echo \$i > $M/plain/tick; sync; sleep 1; done; sync"; }
 free() { g "df -k $M | awk 'NR==2 {print \$4}'"; }
 HA=$M/home/e46a; HB=$M/home/e46b; WA=$HA/.atrium/personas/work
@@ -267,12 +267,17 @@ check "…the state reads" "b dock state secret" "$(g "cat $AB/state/org.x.dock/
 check "…workspaces keeps root:files 750" "root files-e46b 750" "$(g "stat -f '%Su %Sg %Lp' $AB/workspaces")"
 # portcullisd unmounts it at logout (SessionEnded); here by hand.
 g "umount $AB/apps/org.x.mail && mdconfig -d -u ${OM#md}"
+# Tessera's st_blocks follows the length, so sparseness shows in free
+# space: the copy writes only the image's data, not its 64 MiB.
+ticks; f0=$(free)
 r=$(appdata)
 check "free: apps moves in" yes "$(echo "$r" | grep -qF "\"moved\":[\"$AB/apps\"]" && echo yes || echo no)"
 check "…into b's Personal group" "$GPB" "$(grp $AB/apps)"
 check "…apps keeps root 755" "root 755" "$(g "stat -f '%Su %Lp' $AB/apps")"
 check "…the image keeps its length" "$IMGLEN" "$(g "stat -f %z $AB/apps/org.x.mail.img")"
-check "…and stays sparse" yes "$([ "$(g "du -k $AB/apps/org.x.mail.img | cut -f1")" -lt $((IMGLEN / 1024 / 2)) ] && echo yes || echo no)"
+ticks; f1=$(free)
+echo "  free KiB: $f0 -> $f1 across the move-in"
+check "…and stays sparse (the copy cost under half its length)" yes "$([ $((f0 - f1)) -lt $((IMGLEN / 1024 / 2)) ] && echo yes || echo no)"
 OM=$(g "mdconfig -a -t vnode -f $AB/apps/org.x.mail.img")
 check "the overlay mounts from the group" yes "$(g "mount -t tessera /dev/$OM $AB/apps/org.x.mail" && echo yes || echo no)"
 check "…and its file reads" "$MSUM" "$(g "md5 -q $AB/apps/org.x.mail/mail-cache-secret.db")"
