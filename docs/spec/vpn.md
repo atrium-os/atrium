@@ -808,12 +808,13 @@ another origin. An active portal-profile session stays in engine memory.
   fresh approval. IPv4 echo passes on the original data connection. The
   arm64 Tessera gate passed 10/10 on TLS and 10/10 with `--esp`.
   The `--hip tessera-domain` case uses the same module and the guest's
-  Tessera quota tool. It assigns an empty quota domain to an authenticated
-  key group while the tunnel is up, checks that the updated count waits
-  for approval, and verifies echo on the original connection. After the
-  tunnel closes, the gate confirms locking the key excludes the domain
-  from the verified count. The arm64 domain gate passed 11/11 on TLS and
-  11/11 with `--esp`.
+  Tessera quota tool. With the tunnel up, it assigns an empty quota domain
+  to an authenticated key group, locks the key, and reloads it. The peer
+  checks the verified count sequence of 0, 1, 0, 1. Each change waits for
+  fresh review, including when a previously approved report recurs. IPv4
+  echo resumes on the same TLS connection or ESP association after each
+  approval. The arm64 domain gate passed 14/14 on TLS and 14/14 with
+  `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

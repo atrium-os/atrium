@@ -466,12 +466,21 @@ def main():
                 return
             if args.hip in ("refresh", "posture", "tessera", "tessera-domain"):
                 assert calls.count("getconfig.esp") == 1, calls
+                echoes = 2
+                if args.hip == "tessera-domain":
+                    transitions = []
+                    for count, digest in map(str.split, receipts.read_text().splitlines()):
+                        if not transitions or transitions[-1] != (count, digest):
+                            transitions.append((count, digest))
+                    assert [count for count, _ in transitions] == ["0", "1", "0", "1"], transitions
+                    assert transitions[0] == transitions[2] and transitions[1] == transitions[3], transitions
+                    echoes = len(transitions)
                 if esp:
                     assert not esp.errors, esp.errors
-                    assert len(esp.echo) == 2 and len(set(esp.echo)) == 1, esp.echo
+                    assert len(esp.echo) == echoes and len(set(esp.echo)) == 1, esp.echo
                     assert "ssl-tunnel-connect.sslvpn" not in calls, calls
                 else:
-                    assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == echoes, calls
                 assert calls[-1] == "logout.esp", calls
                 print("HIP refresh preserved the original data connection")
                 return

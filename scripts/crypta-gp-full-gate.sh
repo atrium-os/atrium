@@ -93,7 +93,8 @@ if [ "$1" = tessera-domain ]; then
     "$tools/tessera-quota-set" "$G/tessera/persona" 1000000000 >/dev/null
     "$tools/tessera-keyload" load-group "$G/tessera-key" "$kid" "$uuid" 9 >/dev/null
     "$tools/tessera-keyload" group-create "$G/tessera" "$kid" 9 >/dev/null
-    rm -f "$G/tessera-key"
+    # Keep this disposable, mode-0600 key until the live unlock check.
+    printf '%s\n' "$uuid" > "$G/tessera-uuid"
     test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0
     exit 0
 fi
@@ -317,6 +318,27 @@ fi
 if [ -n "$tessera_fact" ]; then
     probe "IPv4 echo before the Tessera encryption change"
     grep -q '^0 ' "$receipts" || fail "initial Tessera report did not reach peer"
+    approve_tessera_change() {
+        expected_count=$1
+        change=$2
+        wait_prompt gp_hip_approval
+        printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+            grep -q "$(hex "$tessera_fact  $expected_count")" ||
+            fail "HIP review omitted the count after $change"
+        sleep 1
+        if new_tessera_receipt; then fail "$change was uploaded without approval"; fi
+        "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+        for _ in $(seq 1 20); do
+            new_tessera_receipt && break
+            sleep 1
+        done
+        new_tessera_receipt || fail "approved report did not reach peer after $change"
+        ok "$change required fresh approval before upload"
+    }
+    new_tessera_receipt() {
+        tail -n "+$((receipt_offset + 1))" "$receipts" | grep -q "^$expected_count "
+    }
+    receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
     if [ "$hip" = tessera-domain ]; then
         "$V" 'G=/tmp/crypta-gate; set -e
             /root/sealed/tessera-keyload quota-group "$G/tessera/persona" 9
@@ -329,27 +351,28 @@ if [ -n "$tessera_fact" ]; then
             cmp "$G/tessera/probe" "$G/tessera-content"
             test "$(sysctl -n kern.tessera.sealed_mounts)" = 1'
     fi
-    wait_prompt gp_hip_approval
-    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
-        grep -q "$(hex "$tessera_fact  1")" ||
-        fail "HIP review omitted the updated Tessera count"
-    if grep -q '^1 ' "$receipts"; then fail "Tessera count was uploaded without approval"; fi
-    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
-    for _ in $(seq 1 20); do
-        grep -q '^1 ' "$receipts" && break
-        sleep 1
-    done
-    grep -q '^1 ' "$receipts" || fail "approved Tessera report did not reach peer"
-    ok "Tessera encryption change required fresh approval before upload"
-    probe "IPv4 echo after approved Tessera posture refresh"
-    "$V" "$CTL down name=gp-gate" >/dev/null
+    approve_tessera_change 1 "Tessera encryption change"
+    probe "IPv4 echo after approved Tessera encryption change"
     if [ "$hip" = tessera-domain ]; then
+        receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
         "$V" 'set -e
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
             /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
-        ok "Tessera excludes a still-encrypted domain when its key is locked"
+        approve_tessera_change 0 "Tessera domain key lock"
+        probe "IPv4 echo after approved Tessera domain key lock"
+
+        receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+        "$V" 'G=/tmp/crypta-gate; set -e
+            /root/sealed/tessera-keyload load-group "$G/tessera-key" c0ffee00112233445566778899aabbcc \
+                "$(cat "$G/tessera-uuid")" 9
+            rm -f "$G/tessera-key"
+            /root/sealed/tessera-keyload group-info "$G/tessera/persona" | grep -q " open$"
+            test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 1'
+        approve_tessera_change 1 "Tessera domain key unlock"
+        probe "IPv4 echo after approved Tessera domain key unlock"
     fi
+    "$V" "$CTL down name=gp-gate" >/dev/null
     echo "$pass checks passed"
     exit 0
 fi
