@@ -205,7 +205,10 @@ g "sysctl kern.tessera.test_cross_domain_link=1 >/dev/null && ln $HB/Documents/b
 check "a file linked out of its group doesn't open" no "$(g "cat $M/plain/leaked >/dev/null 2>&1 && echo yes || echo no")"
 
 echo "=== 5. a removes her Work persona"
-g "su -m e46a -c 'echo work plans secret > $WA/Documents/work-plans.txt'"
+# Section 4's logout locked Work; she opens it again, as at a login.
+r=$(ask e46a work $GA $WA)
+check "Work open again" open "$(state $WA/Documents)"
+check "…a Work file written" yes "$(g "su -m e46a -c 'echo work plans secret > $WA/Documents/work-plans.txt'" && echo yes || echo no)"
 # E5: a Work stick's key in her Work Arca (minted as atrium-volumes would
 # when the stick is formatted), and Work app data in the clear, which
 # portcullisd deletes before it asks for the erase.
