@@ -134,6 +134,18 @@ fn class_for_app(v: u8) -> Result<Class, Reply> {
     }
 }
 
+fn print_pin_binding<'a>(r: &mut Reader<'a>) -> Result<(&'a str, &'a str, [u8; 32], &'a str), Error> {
+    let user = r.str(caps::USER)?;
+    let persona = r.str(caps::PERSONA)?;
+    let key = r.array::<32>()?;
+    let uuid = r.str(36)?;
+    if !valid_user(user) || !arca_store::model::valid_persona(persona) || uuid.len() != 36
+        || !uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return Err(Error::BadRecipient);
+    }
+    Ok((user, persona, key, uuid))
+}
+
 impl State {
     /// `dir` holds one store directory per user, plus `audit.log`.
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
@@ -233,6 +245,8 @@ impl State {
             Label::Service(name) if (0xB0..=0xBA).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC9).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
+            Label::PrintWorker if op == op::TAKE_PRINT_PIN => self.take_print_pin(body),
+            Label::PrintWorker => reply(status::DENIED),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
         self.audit(who, op, item.as_ref(), r.status);
@@ -263,6 +277,7 @@ impl State {
                 Recipient::Endpoint { host, port, .. } => format!("courier:{host}:{port}/{}@{}", c.persona, c.user),
                 _ => "courier:?".into(),
             },
+            Label::PrintWorker => "prelum-ipp".into(),
             Label::Unknown => "unknown".into(),
         };
         let item = item.map(|i| i.hex()).unwrap_or_else(|| "-".into());
@@ -1449,12 +1464,64 @@ impl State {
                 ok(Vec::new())
             }
             op::U_ACCOUNTS | op::U_HOLD | op::U_HANDLE | op::U_GENERATE => self.field_op(op, body, item),
+            op::U_HOLD_PRINT_PIN => self.hold_print_pin(body),
             op::U_DROP => {
                 let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
                 self.handles.drop_handle(&h);
                 ok(Vec::new())
             }
             _ => reply(status::DENIED),
+        }
+    }
+
+    fn hold_print_pin(&mut self, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let (user, persona, key, uuid) = print_pin_binding(&mut r)?;
+            let pin = r.bytes(255)?;
+            r.end()?;
+            Ok::<_, Error>((user, persona, key, uuid, pin))
+        })();
+        let Ok((user, persona, key, uuid, pin)) = parsed else { return malformed() };
+        if pin.is_empty() || !pin.iter().all(u8::is_ascii_digit) {
+            return malformed();
+        }
+        if !self.print_user_unlocked(user) {
+            return reply(status::LOCKED);
+        }
+        let value = tri!(LockedBuf::from_slice(pin).map_err(Error::Io));
+        let entry = crate::handles::Entry {
+            user: user.into(),
+            persona: persona.into(),
+            recipient: Recipient::Service("prelum-ipp".into()),
+            source: crate::handles::Source::Pending(value),
+            expires: std::time::Instant::now() + crate::handles::TTL,
+            generated: false,
+            hold: crate::handles::HOLD_PRINT_PIN,
+            printer: Some((key, uuid.into())),
+        };
+        self.handles.issue(entry).map_or_else(|| reply(status::FULL), |h| ok(h.to_vec()))
+    }
+
+    fn print_user_unlocked(&self, user: &str) -> bool {
+        self.stores.get(user).is_some_and(|store| store.state() == LockState::Unlocked)
+    }
+
+    fn take_print_pin(&mut self, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let handle = r.array::<16>()?;
+            let binding = print_pin_binding(&mut r)?;
+            r.end()?;
+            Ok::<_, Error>((handle, binding))
+        })();
+        let Ok((handle, (user, persona, key, uuid))) = parsed else { return malformed() };
+        if !self.print_user_unlocked(user) {
+            return reply(status::LOCKED);
+        }
+        match self.handles.take_print_pin(&handle, user, persona, &key, uuid) {
+            Some(pin) => Reply { status: status::OK, body: Body::Secret(pin) },
+            None => reply(status::DENIED),
         }
     }
 
@@ -1481,6 +1548,7 @@ impl State {
             expires: std::time::Instant::now() + crate::handles::TTL,
             generated,
             hold,
+            printer: None,
         };
         let issued = |h: Option<[u8; 16]>| match h {
             Some(h) => ok(h.to_vec()),

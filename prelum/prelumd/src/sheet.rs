@@ -172,7 +172,7 @@ impl Caller {
     pub fn may(&self, o: u16) -> bool {
         match self {
             Caller::Person => true,
-            Caller::Curia { .. } => !matches!(o, op::PRINT | op::PREVIEW | op::SAVE_PDF),
+            Caller::Curia { .. } => !matches!(o, op::PRINT | op::PRINT_PIN | op::PREVIEW | op::SAVE_PDF),
             Caller::Status { .. } => matches!(o, op::PRINTERS | op::JOBS | op::WATCH | op::CANCEL | op::RELEASE),
             Caller::App => false,
         }

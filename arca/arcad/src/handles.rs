@@ -15,6 +15,7 @@ pub type Handle = [u8; 16];
 pub const TTL: Duration = Duration::from_secs(600);
 /// A field holds one handle at a time; this bounds a misbehaving UI.
 pub const MAX: usize = 1024;
+pub const HOLD_PRINT_PIN: u8 = 4;
 
 pub enum Source {
     /// A stored item, read at redeem time (so a lock in between voids it).
@@ -35,6 +36,8 @@ pub struct Entry {
     /// redeem it: 0 any, `HOLD_FOR_WIFI` only `take_wifi`, `HOLD_FOR_VPN` only `take_vpn`,
     /// `HOLD_FOR_RECOVERY` only `take_recovery`.
     pub hold: u8,
+    /// SPKI digest and printer UUID for a per-job Arca PIN.
+    pub printer: Option<([u8; 32], String)>,
 }
 
 #[derive(Default)]
@@ -73,6 +76,15 @@ impl Handles {
             return None;
         }
         Some(e)
+    }
+
+    pub fn take_print_pin(&mut self, h: &Handle, user: &str, persona: &str, key: &[u8; 32], uuid: &str) -> Option<LockedBuf> {
+        let e = self.map.remove(h)?;
+        match e.source {
+            Source::Pending(v) if e.hold == HOLD_PRINT_PIN && e.expires > Instant::now() && e.user == user && e.persona == persona
+                && e.printer.as_ref().is_some_and(|(k, id)| k == key && id == uuid) => Some(v),
+            _ => None,
+        }
     }
 
     /// Redeem a Wi-Fi passphrase field's typed value, once, for the Wi-Fi

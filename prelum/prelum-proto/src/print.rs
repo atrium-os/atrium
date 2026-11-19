@@ -20,6 +20,7 @@
 //! | `PREVIEW` 0x14 | postcard [`PreviewReq`], the PDF as the one descriptor | postcard [`Previews`]: small sheet images drawn in a render jail (§5.2) |
 //! | `WATCH` 0x16 | postcard `u64`: the last generation seen (0 at first) | postcard [`Watched`]: the jobs once they differ from that generation, or after 25 s unchanged |
 //! | `SAVE_PDF` 0x15 | postcard [`Layout`], the PDF as the one descriptor | postcard `u64` (its size), the rewritten PDF as the reply's one descriptor (§5.2's Save as PDF) |
+//! | `PRINT_PIN` 0x17 | postcard `(Print, [u8; 16])`, the Arca handle and a PDF descriptor | postcard `u64`: queued job id |
 //! | `FOR` 0x20 | postcard `u32`: the app's uid, as limend named the sheet's parent | postcard `String`: the app's persona ("" for Personal). Only from prelum-sheet's uid, once per connection: from then on the connection acts for that app's person (§5.2) |
 //!
 //! On anything but `OK` the payload after the status is a postcard
@@ -59,6 +60,7 @@ pub mod op {
     pub const PREVIEW: u16 = 0x14;
     pub const SAVE_PDF: u16 = 0x15;
     pub const WATCH: u16 = 0x16;
+    pub const PRINT_PIN: u16 = 0x17;
     pub const FOR: u16 = 0x20;
 }
 
@@ -457,6 +459,10 @@ pub mod client {
         }
         pub fn print(&mut self, p: &Print, pdf: &dyn AsRawFd) -> Res<u64> {
             self.call(op::PRINT, &Self::enc(p), Some(pdf))
+        }
+        /// Submit a PDF with the opaque, one-use handle from Arca's credential UI.
+        pub fn print_pin(&mut self, p: &Print, handle: [u8; 16], pdf: &dyn AsRawFd) -> Res<u64> {
+            self.call(op::PRINT_PIN, &Self::enc(&(p, handle)), Some(pdf))
         }
         pub fn jobs(&mut self) -> Res<Vec<Job>> {
             self.call(op::JOBS, &[], None)

@@ -10,8 +10,8 @@
 //!   class `networked`.
 //!
 //! The root holds the base libraries and the installed binaries, read-only,
-//! and nothing else: no sockets, no user files, no trust store (printers are
-//! pinned by key).
+//! with no user files or trust store. Only a PIN job mounts Arca’s socket
+//! directory read-only so its IPP worker can redeem the one-use handle.
 //!
 //! A worker's jail is removed when it exits; a janitor retries what can't be
 //! removed at once (a vnet jail lingers while its TCP connections are in
@@ -40,6 +40,7 @@ pub const IPP_EXEC: &str = "/usr/local/bin/atrium-prelum-ipp";
 pub const BROWSE_EXEC: &str = "/usr/local/bin/atrium-prelum-browse";
 pub const UID_FIRST: u32 = 62000;
 pub const UID_LAST: u32 = 62499;
+const ARCA_DIR: &str = "/atrium/sockets/arca";
 /// The app devfs ruleset (portcullis_jail::APP_DEVFS_RULESET).
 const DEVFS_RULESET: u32 = 22;
 /// prelum-render's memory cap (§6.1: 1 GB by default).
@@ -139,7 +140,7 @@ impl Jailed {
 }
 
 impl Launcher for Jailed {
-    fn ipp(&self, printer: SocketAddr) -> io::Result<Proc> {
+    fn ipp(&self, printer: SocketAddr, pin: bool) -> io::Result<Proc> {
         let SocketAddr::V4(v4) = printer else {
             return Err(io::Error::other("an IPv6 printer can't be granted yet"));
         };
@@ -156,7 +157,7 @@ impl Launcher for Jailed {
         };
         let mac = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(e.to_string()))?.mac;
         let err = io::stderr();
-        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants), fib: None }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None);
+        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants), fib: None }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None, pin);
         drop(theirs);
         match r {
             Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),
@@ -172,7 +173,7 @@ impl Launcher for Jailed {
         let (ours, theirs) = UnixStream::pair()?;
         let err = io::stderr();
         let rctl = self.rctl.then(|| RctlLimits { memoryuse_mb: Some(BROWSE_MEMORY_MB), pcpu: Some(25) });
-        let r = self.start(uid, BROWSE_EXEC, args, NetworkConfig::Disable, "renderer", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], rctl);
+        let r = self.start(uid, BROWSE_EXEC, args, NetworkConfig::Disable, "renderer", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], rctl, false);
         drop(theirs);
         match r {
             Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),
@@ -188,7 +189,7 @@ impl Launcher for Jailed {
         let (ours, theirs) = UnixStream::pair()?;
         let err = io::stderr();
         let rctl = self.rctl.then(|| RctlLimits { memoryuse_mb: Some(RENDER_MEMORY_MB), pcpu: Some(100) });
-        let r = self.start(uid, RENDER_EXEC, args, NetworkConfig::Disable, "renderer", [pdf.as_fd(), theirs.as_fd(), err.as_fd()], rctl);
+        let r = self.start(uid, RENDER_EXEC, args, NetworkConfig::Disable, "renderer", [pdf.as_fd(), theirs.as_fd(), err.as_fd()], rctl, false);
         drop(theirs);
         drop(pdf);
         match r {
@@ -203,18 +204,23 @@ impl Launcher for Jailed {
 
 impl Jailed {
     #[allow(clippy::too_many_arguments)]
-    fn start(&self, uid: u32, exec: &str, args: &[String], network: NetworkConfig, profile: &str, stdio: [std::os::fd::BorrowedFd<'_>; 3], rctl: Option<RctlLimits>) -> io::Result<OwnedFd> {
+    fn start(&self, uid: u32, exec: &str, args: &[String], network: NetworkConfig, profile: &str, stdio: [std::os::fd::BorrowedFd<'_>; 3], rctl: Option<RctlLimits>, pin: bool) -> io::Result<OwnedFd> {
         let root = root(uid);
         for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "dev", "tmp"] {
             std::fs::create_dir_all(root.join(d))?;
         }
         let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
+        let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
+        if pin {
+            std::fs::create_dir_all(root.join(ARCA_DIR.trim_start_matches('/')))?;
+            mounts.push(ro(ARCA_DIR));
+        }
         let id = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(format!("host identity: {e}")))?;
         let req = Request::CreateJail(CreateJailRequest {
             name: name(uid),
             path: root.to_string_lossy().into_owned(),
             children_max: 0,
-            mounts: vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")],
+            mounts,
             devfs_ruleset: DEVFS_RULESET,
             network,
             exec: Some(ExecSpec { path: exec.into(), argv: Self::argv(exec, args), env: Vec::new(), uid, gid: uid, stdio: true, listen: Vec::new(), ready: false }),
@@ -265,7 +271,7 @@ fn try_teardown(uid: u32) -> bool {
     }
     // ★ Never remove_dir_all: a surviving mount would take the removal
     // into /lib. Only the empty directories made here.
-    for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "usr/local", "usr", "dev", "tmp", ""] {
+    for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "usr/local", "usr", "dev", "tmp", "atrium/sockets/arca", "atrium/sockets", "atrium", ""] {
         let _ = std::fs::remove_dir(root.join(d));
     }
     !root.exists()

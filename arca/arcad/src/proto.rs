@@ -86,6 +86,8 @@ pub mod op {
     /// name): its sign-in window's jar (partitions `vpn-<profile>.`) goes
     /// from every unlocked person's store and from memory.
     pub const VPN_FORGET_JAR: u16 = 0x10;
+    /// Print courier only. `handle[16] | user | persona | key[32] | uuid` → PIN bytes.
+    pub const TAKE_PRINT_PIN: u16 = 0x11;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -143,6 +145,8 @@ pub mod op {
     pub const U_GENERATE: u16 = 0x65;
     /// `handle[16]` → nothing: the field was cleared or detached.
     pub const U_DROP: u16 = 0x66;
+    /// Trusted UI only. `user | persona | key[32] | uuid | bytes PIN` → `handle[16]`.
+    pub const U_HOLD_PRINT_PIN: u16 = 0x68;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).

@@ -3,7 +3,7 @@
 //! frame is a [`Start`]; then requests one at a time, each answered by one
 //! or more [`Ev`]s ending with a final one ([`Ev::is_final`]).
 //!
-//! A `Submit` is followed by `Data` frames and an `End` (or the socket
+//! A `Submit` or `SubmitPin` is followed by `Data` frames and an `End` (or the socket
 //! closing, which abandons the job) and is answered by `JobCreated`, then
 //! `Sent` once the printer has the whole document.
 
@@ -30,6 +30,19 @@ pub struct Start {
     pub uuid: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinGrant {
+    pub handle: [u8; 16],
+    pub user: String,
+    pub persona: String,
+}
+
+impl std::fmt::Debug for PinGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinGrant { .. }")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Req {
     /// `Get-Printer-Attributes`.
@@ -44,6 +57,7 @@ pub enum Req {
     Job { id: i32, user: String },
     /// `Cancel-Job`.
     Cancel { id: i32, user: String },
+    SubmitPin { identity: JobIdentity, format: Format, ticket: Ticket, grant: PinGrant },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

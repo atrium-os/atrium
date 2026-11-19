@@ -102,6 +102,7 @@ struct JobRec {
     uid: u32,
     /// The persona it was printed from (history, §9).
     persona: String,
+    pin: Option<ipp::PinGrant>,
     view: print::Job,
     req: print::Print,
     pdf: OwnedFd,
@@ -484,9 +485,9 @@ impl Daemon {
             .collect()
     }
 
-    fn worker(&self, s: &Saved, learn: bool) -> Result<Ipp, Fail> {
+    fn worker(&self, s: &Saved, learn: bool, pin: bool) -> Result<Ipp, Fail> {
         let addr: SocketAddr = s.addr.parse().map_err(|_| (status::FAILED, "bad saved address".to_string()))?;
-        let p = self.launcher.ipp(addr).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
+        let p = self.launcher.ipp(addr, pin).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
         let mut w = Ipp { p };
         let start = ipp::Start {
             uri: s.uri.clone(),
@@ -507,7 +508,7 @@ impl Daemon {
     /// [`Self::learn`], giving up after `limit` (a printer found on the LAN,
     /// which may never answer).
     pub(crate) fn learn_within(&self, s: &Saved, limit: Option<Duration>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
-        let mut w = self.worker(s, true)?;
+        let mut w = self.worker(s, true, false)?;
         if limit.is_some() {
             w.p.sock.set_read_timeout(limit).map_err(|e| (status::FAILED, e.to_string()))?;
         }
@@ -741,7 +742,7 @@ impl Daemon {
 
     pub fn identify(&self, uid: u32, id: u32) -> Result<String, Fail> {
         let s = self.saved(uid, id)?;
-        let mut w = self.worker(&s, false)?;
+        let mut w = self.worker(&s, false, false)?;
         let mut actions: Vec<String> = ["sound", "flash", "display"].iter().filter(|a| s.info.identify_actions.iter().any(|x| x == *a)).map(|a| a.to_string()).collect();
         if actions.is_empty() {
             actions.push("sound".into());
@@ -788,7 +789,7 @@ impl Daemon {
         if s.network != (self.cfg.network)() {
             return Ok(self.view(&s, None));
         }
-        let mut w = self.worker(&s, false)?;
+        let mut w = self.worker(&s, false, false)?;
         let ev = w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
         match ev {
             ipp::Ev::Printer { info, .. } => {
@@ -820,6 +821,17 @@ impl Daemon {
     }
 
     pub fn submit(self: &Arc<Self>, uid: u32, persona: &str, req: print::Print, pdf: OwnedFd) -> Result<u64, Fail> {
+        self.enqueue(uid, persona, req, pdf, None)
+    }
+
+    pub fn submit_pin(self: &Arc<Self>, uid: u32, persona: &str, req: print::Print, pdf: OwnedFd, handle: [u8; 16]) -> Result<u64, Fail> {
+        let user = portcullis_peer::username(uid).ok_or((status::NOT_ALLOWED, "unknown account for PIN printing".into()))?;
+        let persona_name = if persona.is_empty() { "personal" } else { persona };
+        let grant = ipp::PinGrant { handle, user, persona: persona_name.into() };
+        self.enqueue(uid, persona, req, pdf, Some(grant))
+    }
+
+    fn enqueue(self: &Arc<Self>, uid: u32, persona: &str, req: print::Print, pdf: OwnedFd, pin: Option<ipp::PinGrant>) -> Result<u64, Fail> {
         if req.title.len() > 512 || req.copies == 0 || req.copies > 999 || ![1, 2, 4].contains(&req.per_sheet) {
             return fail(status::MALFORMED, "bad print settings");
         }
@@ -840,6 +852,9 @@ impl Daemon {
         if !visible_to(s, persona) {
             return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
         }
+        if pin.is_some() && (!s.tls || s.key.is_none() || s.uuid.is_none()) {
+            return fail(status::NOT_ALLOWED, "PIN jobs require a pinned IPPS printer");
+        }
         let printer = s.id;
         let id = st.next_job;
         st.next_job += 1;
@@ -847,6 +862,7 @@ impl Daemon {
         st.jobs.insert(id, JobRec {
             uid,
             persona: persona.to_string(),
+            pin,
             view: print::Job {
                 id,
                 printer,
@@ -888,6 +904,7 @@ impl Daemon {
         // the flag once its workers are stopped, and cancels at the printer.
         let running = matches!(j.view.phase, Phase::Preparing | Phase::Sending | Phase::Printing);
         if !running {
+            j.pin = None;
             j.view.phase = Phase::Cancelled;
             j.view.message.clear();
             j.view.alert = None;
@@ -972,6 +989,7 @@ impl Daemon {
             }
             let ended = j.view.phase.ended();
             if ended {
+                j.pin = None;
                 self.record(&mut st, next);
             }
             self.changed(&mut st);
@@ -1020,7 +1038,7 @@ impl Daemon {
 
     /// One attempt at one job.
     fn run(self: &Arc<Self>, uid: u32, printer: u32, job: u64) -> Outcome {
-        let (s, req, pdf) = {
+        let (s, req, pdf, pin) = {
             let mut st = self.lock();
             let Some(s) = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == printer).cloned() else {
                 return Outcome::Failed("the printer was removed".into());
@@ -1034,7 +1052,7 @@ impl Daemon {
             let Ok(pdf) = j.pdf.try_clone() else {
                 return Outcome::Failed("the document is gone".into());
             };
-            (s, j.req.clone(), pdf)
+            (s, j.req.clone(), pdf, j.pin.clone())
         };
         if s.network != (self.cfg.network)() {
             return Outcome::Retry(format!("{} is not on this network", s.name));
@@ -1047,7 +1065,7 @@ impl Daemon {
         }
 
         // Who is it, and what does it take? (§7.3: before any job byte.)
-        let mut w = match self.worker(&s, false) {
+        let mut w = match self.worker(&s, false, pin.is_some()) {
             Ok(w) => w,
             Err((_, m)) => return Outcome::Failed(m),
         };
@@ -1139,7 +1157,12 @@ impl Daemon {
             job_name: if s.titles_off { "Document".into() } else { req.title.clone() },
             job_password: None,
         };
-        let sent = self.send(&mut w, job, &spool, &prog, identity, format, ticket);
+        let pin_job = pin.is_some();
+        let request = match pin {
+            Some(grant) => ipp::Req::SubmitPin { identity, format, ticket, grant },
+            None => ipp::Req::Submit { identity, format, ticket },
+        };
+        let sent = self.send(&mut w, job, &spool, &prog, request);
         let rendered = reader.join().unwrap_or_else(|_| Err("prelum-render's reader failed".into()));
         let remote = self.lock().jobs.get(&job).and_then(|j| j.remote);
         if self.cancelled(job) {
@@ -1163,7 +1186,7 @@ impl Daemon {
                 self.alert(job, Some(Alert::IdentityChanged));
                 return Outcome::Held(format!("{}'s identity changed", s.name));
             }
-            Err(SendErr::Ev(ipp::Ev::Unreachable(_))) if remote.is_none() => {
+            Err(SendErr::Ev(ipp::Ev::Unreachable(_))) if remote.is_none() && !pin_job => {
                 self.set_offline(uid, printer, true);
                 self.alert(job, Some(Alert::Offline));
                 return Outcome::Retry(format!("{} is offline", s.name));
@@ -1186,10 +1209,9 @@ impl Daemon {
     }
 
     /// Submit, then the spool's bytes as they come, then the end.
-    #[allow(clippy::too_many_arguments)]
-    fn send(&self, w: &mut Ipp, job: u64, spool: &PathBuf, prog: &Arc<(Mutex<Progress>, Condvar)>, identity: JobIdentity, format: Format, ticket: Ticket) -> Result<(), SendErr> {
+    fn send(&self, w: &mut Ipp, job: u64, spool: &PathBuf, prog: &Arc<(Mutex<Progress>, Condvar)>, request: ipp::Req) -> Result<(), SendErr> {
         let io = |e: io::Error| SendErr::Msg(format!("prelum-ipp: {e}"));
-        w.send(&ipp::Req::Submit { identity, format, ticket }).map_err(io)?;
+        w.send(&request).map_err(io)?;
         let mut f = File::open(spool).map_err(|e| SendErr::Msg(format!("spool: {e}")))?;
         let mut at = 0u64;
         let mut buf = vec![0u8; DATA_CHUNK];
@@ -1293,7 +1315,7 @@ impl Daemon {
                     }
                     if other.is_err() {
                         // The worker died: a new one.
-                        match self.worker(s, false) {
+                        match self.worker(s, false, false) {
                             Ok(nw) => {
                                 let ok = self.hold(job, &nw.p.stop);
                                 w = nw;
@@ -1310,7 +1332,7 @@ impl Daemon {
     }
 
     fn cancel_remote(&self, s: &Saved, remote: i32) {
-        if let Ok(mut w) = self.worker(s, false) {
+        if let Ok(mut w) = self.worker(s, false, false) {
             let _ = w.ask(&ipp::Req::Cancel { id: remote, user: USER.into() });
         }
     }

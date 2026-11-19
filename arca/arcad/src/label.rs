@@ -33,6 +33,8 @@ pub enum Label {
     /// its own credential field and mint shares' SSH keys. Otherwise it is
     /// that app.
     FileManager { user: String, publisher: [u8; 32], app_id: String },
+    /// A reserved Prelum worker UID. May only redeem a one-use print PIN.
+    PrintWorker,
     /// Anything else: refused every op.
     Unknown,
 }
@@ -100,6 +102,11 @@ pub const UNSIGNED_PUBLISHER: [u8; 32] = [0; 32];
 
 impl Resolver {
     pub fn resolve(&self, uid: u32) -> Label {
+        // jaild's reserved Prelum worker UID range. Only a worker with
+        // a matching one-use handle can receive a PIN.
+        if (62_000..=62_499).contains(&uid) {
+            return Label::PrintWorker;
+        }
         if (crate::courier::UID_FIRST..=crate::courier::UID_LAST).contains(&uid) {
             // Courier uids are never apps or system services.
             return self

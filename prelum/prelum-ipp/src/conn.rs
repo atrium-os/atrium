@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use navigator_fetch::http::{read_head, Body};
 use prelum_ipp_codec::{Limits, Message};
+use zeroize::Zeroizing;
 
 use crate::tls;
 
@@ -130,7 +131,7 @@ impl Target {
     /// printer's answer.
     pub fn call(&self, msg: &Message, doc: Option<&mut dyn Read>) -> Result<Message, Error> {
         let mut s = self.open()?;
-        let ipp = msg.encode();
+        let ipp = Zeroizing::new(msg.encode());
         let io = |e: io::Error| Error::Io(e.to_string());
         let mut head = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/ipp\r\nUser-Agent: Atrium-Prelum/1\r\nConnection: close\r\n",
@@ -139,7 +140,8 @@ impl Target {
         match doc {
             None => {
                 head.push_str(&format!("Content-Length: {}\r\n\r\n", ipp.len()));
-                let mut all = head.into_bytes();
+                let mut all = Zeroizing::new(Vec::with_capacity(head.len() + ipp.len()));
+                all.extend_from_slice(head.as_bytes());
                 all.extend_from_slice(&ipp);
                 s.write_all(&all).map_err(io)?;
             }

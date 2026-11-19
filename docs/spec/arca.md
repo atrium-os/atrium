@@ -311,6 +311,17 @@ one ordinary `Response::Http` frame. A stream's connection is never kept for ano
 request. Old clients never send that `Accept` and never see the new frames. Gate:
 `tests/courier.rs` `an_event_stream_comes_one_event_at_a_time_masked`.
 
+### Per-job printer PINs
+
+The trusted UI can stage a digit PIN with `U_HOLD_PRINT_PIN` for an unlocked
+person, persona, printer TLS SPKI digest and printer UUID. Arca holds it in locked
+memory for one use, up to the credential handle lifetime or until the person
+locks the store. A Prelum worker in jaild's reserved UID range may redeem the
+opaque handle with `TAKE_PRINT_PIN` and the same binding. The IPP worker makes
+this call only after verifying the printer's pinned identity and checking that the
+printer can accept a PIN before document upload. See [printing.md](printing.md)
+§11.6 for the wire path and simulator gate.
+
 ## 6. At rest and in memory
 
 ### 6.1 The key hierarchy

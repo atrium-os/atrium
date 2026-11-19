@@ -844,10 +844,24 @@ Curia still lists every printer for the person and asks for confirmation before
 sharing one with every persona. The print sheet cannot change sharing or other
 printer administration settings.
 
-The IPP worker rejects PIN submissions unless the printer has a pinned IPPS key and
-UUID. It checks the printer's identity and advertised PIN length before submission.
-Arca credential entry, courier delivery, Sigillum verification for sharing, and
-per-persona routing and crossing policy remain open.
+A PIN job enters via `CLASS_PRINT/PRINT_PIN` with the PDF and an opaque handle
+from Arca. prelumd derives the person and persona from the connection and passes
+the handle to the IPP worker. The PIN worker has a read-only mount of the Arca
+socket directory. It redeems the handle only after an IPPS query verifies the
+pinned TLS key and printer UUID and confirms support for PINs and split job
+submission. It sends the PIN in `Create-Job` with attribute fidelity and sends
+the document only after the printer accepts the request. The worker discards its
+PIN copies after the request. Offline failures after submission begins require a
+fresh handle if retried.
+
+The host gate `prelum/prelum-ipp/tests/pin_ipps.rs` feeds the worker framed
+requests, serves real arcad handlers over a Unix socket, and checks the printer's
+TLS and IPP traffic. It covers changed TLS key and UUID, acceptance before
+document upload, replay refusal, and cancellation without upload if the printer
+reports it ignored or substituted attributes. It supplies the Arca peer roles in the
+harness. The desktop credential prompt, the FreeBSD jail runtime gate, stored
+printer passwords and PINs, Sigillum verification for sharing, and per-persona
+routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

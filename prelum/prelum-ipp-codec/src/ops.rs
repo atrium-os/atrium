@@ -155,6 +155,7 @@ fn job_op_attrs(attrs: &mut Vec<Attribute>, id: &JobIdentity) {
     user(attrs, &id.user);
     attrs.push(Attribute::new("job-name", Value::Name(id.job_name.clone())));
     if let Some(p) = &id.job_password {
+        attrs.push(Attribute::new("ipp-attribute-fidelity", Value::Boolean(true)));
         attrs.push(Attribute::new("job-password", Value::OctetString(p.clone())));
         attrs.push(Attribute::new("job-password-encryption", Value::Keyword("none".into())));
     }
