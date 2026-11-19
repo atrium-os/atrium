@@ -54,6 +54,8 @@ struct Dovecot {
     sub_port: u16,
     relayed: Arc<Mutex<Vec<Relayed>>>,
     ca_pem: String,
+    /// ManageSieve (Pigeonhole), when it is installed.
+    sieve_port: Option<u16>,
 }
 
 /// What reached the relay behind Dovecot's submission service.
@@ -181,6 +183,16 @@ fn start_dovecot() -> Option<Dovecot> {
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let sub_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let (relay, relayed) = smtp_sink();
+    // Pigeonhole's ManageSieve, when installed (Debian's
+    // dovecot-managesieved, FreeBSD's dovecot-pigeonhole).
+    let pigeonhole = ["/usr/lib/dovecot/managesieve", "/usr/local/libexec/dovecot/managesieve"].into_iter().any(|p| Path::new(p).exists());
+    let sieve_port = pigeonhole.then(|| TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port());
+    let sieve_conf = match sieve_port {
+        Some(p) => format!(
+            "protocols = $protocols sieve\nplugin {{\n  sieve = file:~/sieve;active=~/.dovecot.sieve\n}}\nprotocol lda {{\n  mail_plugins = $mail_plugins sieve\n}}\nservice managesieve-login {{\n  inet_listener sieve {{\n    port = {p}\n  }}\n}}\n"
+        ),
+        None => String::new(),
+    };
     let conf = format!(
         r#"base_dir = {d}/run
 state_dir = {d}/state
@@ -261,7 +273,7 @@ service stats {{
     mode = 0666
   }}
 }}
-"#,
+{sieve_conf}"#,
         d = d.display()
     );
     std::fs::write(d.join("dovecot.conf"), conf).unwrap();
@@ -280,7 +292,11 @@ service stats {{
     let child = Command::new(bin).arg("-F").arg("-c").arg(d.join("dovecot.conf")).spawn().ok()?;
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() && TcpStream::connect(("127.0.0.1", sub_port)).is_ok() {
-            return Some(Dovecot { child, dir, port, sub_port, relayed, ca_pem: ca_cert.pem() });
+            if sieve_port.is_some_and(|p| TcpStream::connect(("127.0.0.1", p)).is_err()) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            return Some(Dovecot { child, dir, port, sub_port, relayed, ca_pem: ca_cert.pem(), sieve_port });
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -334,6 +350,10 @@ fn courier_to(dc: &Dovecot, scheme: Scheme, port: u16) -> UnixStream {
 }
 
 fn jail() -> PathBuf {
+    // Built elsewhere (a VM run copies it in with the test).
+    if let Some(p) = std::env::var_os("MAIL_PARSE_JAIL") {
+        return p.into();
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-parse/Cargo.toml");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-parse-jail", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());
@@ -801,6 +821,9 @@ fn a_watch_ends_when_its_connection_is_shut() {
 }
 
 fn sync_worker() -> PathBuf {
+    if let Some(p) = std::env::var_os("MAIL_SYNC_WORKER") {
+        return p.into();
+    }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mail-sync/Cargo.toml");
     let st = Command::new(env!("CARGO")).args(["build", "-q", "--bin", "mail-sync-worker", "--manifest-path"]).arg(&manifest).status().unwrap();
     assert!(st.success());
@@ -858,4 +881,79 @@ fn a_pass_with_sync_in_its_worker() {
     assert_eq!(found("subject:250 is:read"), 0);
     assert_eq!(found("subject:250 larger:1MB"), 0);
     assert_eq!(found("subject:249 is:read before:2000-01-01"), 0);
+}
+
+/// Mail's rules and automatic reply through the real courier to a real
+/// Pigeonhole ManageSieve (§11.6): the script is accepted (Pigeonhole
+/// compiles it on PUTSCRIPT), made active, and files new mail as the rule
+/// says when Dovecot delivers; an edit made on the server is kept and
+/// shown, then replaced on the person's word.
+#[test]
+fn filters_go_to_pigeonhole() {
+    use std::io::Write as _;
+    use mail_store::away::Away;
+    use mail_store::{AccountConfig, Protocol, Reached, Server};
+    let Some(dc) = start_dovecot() else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    let Some(sieve_port) = dc.sieve_port else {
+        eprintln!("SKIPPED: Pigeonhole (ManageSieve) is not installed");
+        return;
+    };
+    let store_dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(store_dir.path()).unwrap(), Parser { program: jail() });
+    let cfg = AccountConfig {
+        address: "priya@example.org".into(),
+        name: "Priya Raman".into(),
+        protocol: Protocol::Imap {
+            imap: Server { scheme: "imaps".into(), host: HOST.into(), port: dc.port },
+            smtp: Server { scheme: "submissions".into(), host: HOST.into(), port: dc.sub_port },
+        },
+        incoming_item: Some([9; 16]),
+        outgoing_item: Some([9; 16]),
+        oauth: None,
+        reached: Reached::Never,
+    };
+    let account = engine.store.add_configured(&cfg).unwrap();
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    engine.set_sieve(account, Server { scheme: "sieve".into(), host: HOST.into(), port: sieve_port }, [9; 16]).unwrap();
+    engine.add_rule(mail_engine::rules::parse_rule("subject:invoice move Archive").unwrap()).unwrap();
+    engine.set_away(&Away { on: true, from: None, until: Some(now() + 7 * DAY), subject: "Away".into(), text: "Back next week.".into() }).unwrap();
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert_eq!(engine.rules_line(account), None, "put and active");
+    let home = dc.dir.path().join("home");
+    let script = std::fs::read_to_string(home.join("sieve/atrium-mail.sieve")).expect("Mail's script on the server");
+    assert!(script.contains("fileinto \"Archive\";") && script.contains("vacation"), "{script}");
+    assert!(std::fs::read_link(home.join(".dovecot.sieve")).unwrap().to_string_lossy().contains("atrium-mail"), "active");
+    let st = engine.away(account);
+    assert!(st.supported == Some(true) && st.server.as_ref().is_some_and(|s| s.on), "{st:?}");
+
+    // Dovecot delivers with Mail's script: the invoice is filed.
+    let lda = ["/usr/lib/dovecot/dovecot-lda", "/usr/local/libexec/dovecot/dovecot-lda"].into_iter().find(|p| Path::new(p).exists());
+    if let Some(lda) = lda {
+        let msg = format!("From: billing@shop.example\r\nTo: priya@example.org\r\nSubject: Your invoice\r\nMessage-ID: <inv1@shop.example>\r\nDate: {}\r\n\r\nPay up.\r\n", rfc2822(now()));
+        let mut c = Command::new(lda).arg("-c").arg(dc.dir.path().join("dovecot.conf")).args(["-d", "priya@example.org", "-f", "billing@shop.example"]).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        c.stdin.take().unwrap().write_all(msg.as_bytes()).unwrap();
+        assert!(c.wait().unwrap().success(), "{}", std::fs::read_to_string(dc.dir.path().join("dovecot.log")).unwrap_or_default());
+        let filed = std::fs::read_dir(maildir(&home).join(".Archive/new")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(filed, 1, "filed in Archive by the server's Sieve");
+    } else {
+        eprintln!("no dovecot-lda: delivery not checked");
+    }
+
+    // Edited on the server (webmail, say): kept, and what is there shown.
+    std::fs::write(home.join("sieve/atrium-mail.sieve"), "# mine now\r\nkeep;\r\n").unwrap();
+    engine.add_rule(mail_engine::rules::parse_rule("subject:receipt read").unwrap()).unwrap();
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    assert_eq!(engine.rules_line(account).as_deref(), Some(mail_engine::sieve::CHANGED_THERE));
+    assert_eq!(engine.filters_there(account).as_deref(), Some("# mine now\nkeep;\n"));
+    assert_eq!(std::fs::read_to_string(home.join("sieve/atrium-mail.sieve")).unwrap(), "# mine now\r\nkeep;\r\n");
+    // Replace: Mail's script goes back at the next pass.
+    engine.replace_filters(account).unwrap();
+    engine.pass(account, &Couriers(&dc), now()).unwrap();
+    let script = std::fs::read_to_string(home.join("sieve/atrium-mail.sieve")).unwrap();
+    assert!(script.contains("receipt") && script.contains("Archive"), "{script}");
+    assert_eq!(engine.rules_line(account), None);
+    assert_eq!(engine.filters_there(account), None);
 }
