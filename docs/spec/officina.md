@@ -3769,6 +3769,16 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** names, conditional formats, charts and validation rules following moved cells; formulas that read the cells a move overwrites becoming `#REF!` (Excel's do); pasting a clip into a larger selection as tiles, transposing formulas' references, Paste Special's arithmetic (add, multiply) and skip-blanks, and rich formats on the system clipboard for other apps.
 - **Gates:** officina-grid `clip::tests` (5); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`, `paste_special_is_offered_after_a_copy_and_pastes_values`.
 
+### 16.89 Hiding rows and columns by hand (2026-11-19)
+
+- **Sheets** (Data menu): Hide Rows and Hide Columns hide the selection's; Unhide Rows and Unhide Columns show the hidden ones inside the selection (select the rows or columns around them, as in Excel). Each is one undo step, and the status line counts what changed.
+  - Rows join the sheet's hidden ranges (`Sheet.hidden`, which the filter shares: rows hidden by hand outside a filter's range stay hidden when it filters again; inside it, filtering decides).
+  - Columns get no width; shown again, they take the default width. At most 16,384 at once.
+- **Grid** (pergola `past_hidden`): arrow keys step over hidden rows and columns (filtered ones too) to the next shown one, or stay put if none.
+- **Files:** .xlsx columns with no width are written `hidden="1"` and read back hidden (they used to show 2 px wide, with a note); .ods columns get `table:visibility="collapse"` and are read back hidden. Hidden rows were kept already. LibreOffice keeps both ways (`officina-convert/tests/hidden.rs`).
+- **Not yet:** remembering a hidden column's width for when it is shown, the double line Excel draws where rows or columns are hidden, and Home/Page keys skipping hidden ones.
+- **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

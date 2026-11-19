@@ -1020,6 +1020,9 @@ fn sheet_xml(out: &mut String, wb: &Workbook, s: u16, row_style: &mut BTreeMap<u
         if n > 1 {
             let _ = write!(out, r#" table:number-columns-repeated="{n}""#);
         }
+        if w <= 0.0 {
+            out.push_str(r#" table:visibility="collapse""#);
+        }
         let _ = write!(out, r#" table:default-cell-style-name="{}"/>"#, if t == 0 { "Default".to_string() } else { format!("ce{t}") });
         c += n;
     }

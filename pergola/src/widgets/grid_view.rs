@@ -491,6 +491,26 @@ impl GridState {
     }
 }
 
+/// `at`, or past the hidden (zero-sized) rows or columns it is in, the way
+/// the cursor was going (`dr`, `dc`), to the next shown one; `from` (where
+/// it was) if there is none.
+fn past_hidden(src: &dyn GridSource, from: (u32, u32), at: (u32, u32), dr: i32, dc: i32) -> (u32, u32) {
+    let (r, c) = at;
+    if dr != 0 && src.row_top(r + 1) - src.row_top(r) <= 0.0 {
+        let y = src.row_top(r);
+        let to = if dr > 0 { src.row_at(y) } else if y > 0.0 { src.row_at(y - 0.5) } else { r };
+        let shown = src.row_top(to + 1) - src.row_top(to) > 0.0;
+        return if shown { (to, c) } else { from };
+    }
+    if dc != 0 && src.col_left(c + 1) - src.col_left(c) <= 0.0 {
+        let x = src.col_left(c);
+        let to = if dc > 0 { src.col_at(x) } else if x > 0.0 { src.col_at(x - 0.5) } else { c };
+        let shown = src.col_left(to + 1) - src.col_left(to) > 0.0;
+        return if shown { (r, to) } else { from };
+    }
+    at
+}
+
 /// How near the selection's corner a press takes the fill handle, px.
 const FILL_GRIP: f64 = 5.0;
 
@@ -1722,7 +1742,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 Key::Left => (0, -1),
                 _ => (0, 1),
             };
-            Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { step(g.cursor, dr as i64, dc as i64) })
+            Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
         Key::PageUp => Some(step(g.cursor, -page(st), 0)),
         Key::PageDown => Some(step(g.cursor, page(st), 0)),
@@ -2027,6 +2047,35 @@ mod tests {
         key(&mut app, Key::Down, "", Modifiers { alt: true, ..Modifiers::default() });
         assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Choose { row: 2, col: 1 })));
         assert_eq!(state.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn arrows_step_over_hidden_columns() {
+        let (mut app, grid, _, state, _) = host(100, 10);
+        // C and D hidden (no width).
+        grid.widths.borrow_mut().insert(2, 0.0);
+        grid.widths.borrow_mut().insert(3, 0.0);
+        app.tick();
+        // A click on B1 gives the grid the keys.
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        app.handle_event(Event::PointerDown { at: Point::new(hw + 74.0, HEADER_H + 5.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(hw + 74.0, HEADER_H + 5.0) });
+        app.tick();
+        assert_eq!(state.get_cloned().cursor, (0, 1));
+        let none = Modifiers::default();
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 4));
+        key(&mut app, Key::Left, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 1));
+        // Hidden up to the last column: the cursor stays.
+        for c in 5..10 {
+            grid.widths.borrow_mut().insert(c, 0.0);
+        }
+        let mut g = state.get_cloned();
+        g.select(0, 4);
+        state.set(g);
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 4));
     }
 
     #[test]

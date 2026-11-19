@@ -431,18 +431,18 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
                 let (Some(min), Some(max)) = (attr(&e, b"min")?.and_then(|v| v.parse::<u32>().ok()), attr(&e, b"max")?.and_then(|v| v.parse::<u32>().ok())) else { continue };
                 let hidden = attr(&e, b"hidden")?.is_some_and(|v| v == "1" || v == "true");
                 let w = if hidden { Some(0.0) } else { attr(&e, b"width")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v <= 255.0) };
-                if hidden {
-                    seg.rep.note(Kind::Approximate, "hidden columns shown narrow");
-                }
                 if let Some(xf) = attr(&e, b"style")?.and_then(|v| v.parse::<u32>().ok()).filter(|&x| x != 0) {
                     seg.col_styles.push((min.clamp(1, MAX_COLS) - 1, max.clamp(1, MAX_COLS) - 1, xf));
                 }
                 if let Some(w) = w {
-                    let px = (w * MDW).round().max(2.0);
+                    // Hidden: no width (Sheets hides columns so).
+                    let px = if hidden { 0.0 } else { (w * MDW).round().max(2.0) };
                     let (min, max) = (min.clamp(1, MAX_COLS), max.clamp(1, MAX_COLS));
                     // A range over every column is a default, not 16,384 overrides.
                     if max - min > 4096 {
-                        seg.default_w = Some(w);
+                        if !hidden {
+                            seg.default_w = Some(w);
+                        }
                     } else {
                         for c in min..=max {
                             seg.widths.push((c - 1, px));
