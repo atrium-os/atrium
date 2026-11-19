@@ -167,16 +167,17 @@ the same Portcullis launcher.
 
 ### 4.2 Save and Save As
 
-Sheets Save writes through its existing read-write descriptor. Save As uses
-Scrinium’s `Save` picker to create a new `.osheet` file in the chosen folder.
-Scrinium chooses a unique name when the suggested name already exists.
-The current workbook jail receives a writable descriptor and keeps it for
-subsequent Save operations. The workbook process never receives a folder
-path or mount.
+For a workbook opened through Scrinium, Sheets encodes the current revision and
+sends a sealed snapshot and its session save grant through Limen. Scrinium
+stages the bytes in the selected directory, syncs the file, checks the original
+entry and revision, atomically replaces it and syncs the directory. Sheets
+marks the revision saved after confirmation. Edits made in the meantime stay
+pending. A stale or expired grant requires reopening the workbook or Save As.
 
-Saving through a descriptor updates the file in place. A crash during the
-write can leave a partial file. An atomic replacement protocol with a
-Scrinium commit handle remains future work.
+Save As sends a sealed native workbook to Scrinium’s Save picker. Scrinium
+publishes the completed file under an unused name and returns a new save grant.
+An interruption before publication leaves the previous workbook intact and can
+leave a hidden staging file. Neither operation exposes the directory to Sheets.
 
 ### 4.3 Recent files and reopening
 

@@ -138,7 +138,14 @@ spends the picker's confirmation press through Portcullis and sends the file
 directly to a new Sheets jail in the parent's persona. The parent receives
 `Done { files: 0 }` after the broker accepts the launch. Sheets review inputs
 use ordinary `File` mode. `Save` creates a unique named file in the chosen
-folder and sends its writable descriptor to the parent.
+folder and sends its writable descriptor to the parent. For Sheets, the request
+includes a sealed snapshot of up to 2 GiB. Scrinium syncs it before publishing
+the new name with a no-replace rename and returns a session save grant.
+Scrinium keeps the last 128 grants. Each pins a directory and workbook inode.
+Commit checks the selected entry and file revision immediately before rename.
+Hard links, special permissions, filesystem flags and user extended attributes
+require Save As. Replacement preserves ownership, mode and supported access ACLs.
+A directory sync error after rename means publication could have succeeded.
 
 Known limit: the descriptor is on Scrinium's grant mount, so it stops working
 if Scrinium's jail goes, or the session locks, the stick is ejected or

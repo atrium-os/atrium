@@ -391,6 +391,8 @@ pub enum Request {
         /// to the file manager, and its persona determines the new jail.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workbook_picker: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workbook_commit: Option<[u8; 16]>,
     },
 
     /// Start an empty workbook in a fresh Sheets jail on a Sheets press.

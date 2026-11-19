@@ -53,6 +53,8 @@ pub struct Opened {
     /// and the place is writable); otherwise Save asks where to put a copy.
     pub write: bool,
     pub file: File,
+    /// Opaque Scrinium authority for replacing this workbook.
+    pub commit: Option<[u8; 16]>,
 }
 
 /// `OPEN\0type\0r|w\0name`, the name made safe (no NUL, no `/`, at most
@@ -163,7 +165,18 @@ pub enum Message {
 
 /// Send one open: `fd` with its name and type.
 pub fn send(s: &UnixStream, name: &str, mime: &str, write: bool, fd: RawFd) -> io::Result<()> {
-    let body = encode(name, mime, write);
+    send_with_commit(s, name, mime, write, fd, None)
+}
+
+pub fn send_with_commit(s: &UnixStream, name: &str, mime: &str, write: bool, fd: RawFd, commit: Option<[u8; 16]>) -> io::Result<()> {
+    let mut body = encode(name, mime, write);
+    if let Some(token) = commit {
+        if !write { return Err(io::Error::other("read-only save grant")); }
+        let mut tagged = b"WORKBOOK\0".to_vec();
+        tagged.extend_from_slice(&token);
+        tagged.append(&mut body);
+        body = tagged;
+    }
     if body.len() > MAX {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "a message over 10 KiB"));
     }
@@ -316,13 +329,23 @@ impl Channel {
             return decode_link(&body).map(|u| Some(Message::Link(u)))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a link message"));
         }
-        let Some((name, mime, write)) = decode(&body) else {
+        let (commit, document) = match body.strip_prefix(b"WORKBOOK\0") {
+            Some(rest) => {
+                let (token, document) = rest.split_at_checked(16).ok_or_else(|| io::Error::other("short save grant"))?;
+                (Some(token.try_into().unwrap()), document)
+            }
+            None => (None, body.as_slice()),
+        };
+        let Some((name, mime, write)) = decode(document) else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an open message"));
         };
+        if commit.is_some() && !write {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "read-only save grant"));
+        }
         if fds.len() != 1 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("an open with {} descriptors", fds.len())));
         }
-        Ok(Some(Message::File(Opened { name, mime, write, file: File::from(fds.pop().unwrap()) })))
+        Ok(Some(Message::File(Opened { name, mime, write, commit, file: File::from(fds.pop().unwrap()) })))
     }
 }
 

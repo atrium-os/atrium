@@ -216,6 +216,13 @@ pub fn move_to(src: &Path, name: &str, dst: &Path) -> io::Result<String> {
 /// link, never executable. The file is opened read-write so Limen can return it.
 pub fn create_new(dir: &Path, name: &str) -> io::Result<(std::fs::File, String)> {
     use std::os::unix::fs::OpenOptionsExt;
+    publish_name(name, |candidate| {
+        std::fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .mode(0o644).custom_flags(libc::O_NOFOLLOW).open(dir.join(candidate))
+    })
+}
+
+fn publish_name<T>(name: &str, mut create: impl FnMut(&str) -> io::Result<T>) -> io::Result<(T, String)> {
     if !valid_name(name) || hidden(name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a name to save as")));
     }
@@ -228,13 +235,105 @@ pub fn create_new(dir: &Path, name: &str) -> io::Result<(std::fs::File, String)>
         if !valid_name(&try_name) {
             break;
         }
-        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o644).custom_flags(libc::O_NOFOLLOW).open(dir.join(&try_name)) {
+        match create(&try_name) {
             Ok(f) => return Ok((f, try_name)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
     Err(taken(name))
+}
+
+/// Finish a staged Save As before publishing a name in the chosen folder.
+pub fn publish_workbook(dir: &Path, name: &str, source: &std::fs::File) -> io::Result<(std::fs::File, String)> {
+    stage_workbook(dir, name, |file| copy_snapshot(source, file))
+}
+
+pub(crate) fn copy_snapshot(source: &std::fs::File, file: &mut std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let len = source.metadata()?.len();
+    if len > 2 << 30 { return Err(io::Error::other("invalid workbook size")); }
+    use std::io::Write;
+    let mut buf = [0u8; 65536];
+    let mut offset = 0;
+    while offset < len {
+        let n = buf.len().min((len - offset) as usize);
+        source.read_exact_at(&mut buf[..n], offset)?;
+        file.write_all(&buf[..n])?;
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+fn stage_workbook(dir: &Path, name: &str, write: impl FnOnce(&mut std::fs::File) -> io::Result<()>) -> io::Result<(std::fs::File, String)> {
+    use std::os::fd::AsRawFd;
+    let folder = std::fs::File::open(dir)?;
+    let result = stage_in(&folder, write, |stage, tmp| publish_name(name, |candidate| {
+        publish_new(stage, tmp, folder.as_raw_fd(), &std::ffi::CString::new(candidate)?)
+    }).map(|(_, name)| name))?;
+    result.0.sync_all()?;
+    folder.sync_all()?;
+    Ok(result)
+}
+
+pub(crate) fn random_token() -> io::Result<[u8; 16]> {
+    let mut bytes = [0u8; 16];
+    if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn stage_in<T>(folder: &std::fs::File, write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+    publish: impl FnOnce(std::os::fd::RawFd, &std::ffi::CStr) -> io::Result<T>) -> io::Result<(std::fs::File, T)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = folder.as_raw_fd();
+    let nonce = random_token()?;
+    let tmp = CString::new(format!(".scrinium-save-{:032x}", u128::from_ne_bytes(nonce))).unwrap();
+    // Pin a private directory so a writer in a shared folder cannot replace
+    // the staged source entry between copying and publication.
+    if unsafe { libc::mkdirat(fd, tmp.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let raw = unsafe { libc::openat(fd, tmp.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        let stage = unsafe { std::fs::File::from_raw_fd(raw) };
+        use std::os::unix::fs::MetadataExt;
+        let st = stage.metadata()?;
+        if st.uid() != unsafe { libc::geteuid() } || st.mode() & 0o077 != 0 {
+            return Err(io::Error::other("Workbook staging directory changed"));
+        }
+        let leaf = c"snapshot";
+        let raw = unsafe { libc::openat(stage.as_raw_fd(), leaf.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600 as libc::c_int) };
+        if raw < 0 { return Err(io::Error::last_os_error()); }
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        let saved = (|| {
+            write(&mut file)?;
+            file.sync_all()?;
+            publish(stage.as_raw_fd(), leaf)
+        })();
+        unsafe { libc::unlinkat(stage.as_raw_fd(), leaf.as_ptr(), 0); }
+        Ok((file, saved?))
+    })();
+    unsafe { libc::unlinkat(fd, tmp.as_ptr(), libc::AT_REMOVEDIR); }
+    result
+}
+
+fn publish_new(stage: std::os::fd::RawFd, from: &std::ffi::CStr, dir: std::os::fd::RawFd, to: &std::ffi::CStr) -> io::Result<()> {
+    #[cfg(target_os = "freebsd")]
+    let rc = {
+        unsafe extern "C" {
+            fn renameat2(fd1: libc::c_int, from: *const libc::c_char, fd2: libc::c_int, to: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+        }
+        // AT_RENAME_NOREPLACE from FreeBSD 16 sys/fcntl.h.
+        unsafe { renameat2(stage, from.as_ptr(), dir, to.as_ptr(), 1) }
+    };
+    #[cfg(not(target_os = "freebsd"))]
+    let rc = unsafe { libc::linkat(stage, from.as_ptr(), dir, to.as_ptr(), 0) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 /// The user extended attribute that says where a saved file came from
@@ -416,6 +515,57 @@ mod tests {
         let (body, file) = look(&path, "proof.txt").unwrap();
         assert!(matches!(body, crate::browser::LookBody::Text { cut: true, .. }));
         assert_eq!(read_print_text(file.unwrap()).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopped_writer_leaves_the_previous_workbook_and_retry_publishes_once() {
+        use std::io::Write;
+        const CHILD_DIR: &str = "SCRINIUM_TEST_INTERRUPTED_SAVE_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let _ = stage_workbook(Path::new(&dir), "Book.osheet", |file| {
+                file.write_all(b"incomplete")?;
+                file.sync_all()?;
+                std::process::exit(26);
+            });
+            panic!("staging did not reach the interruption");
+        }
+        let dir = tmp("stopped-writer");
+        std::fs::write(dir.join("Book.osheet"), b"original").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "fs::tests::stopped_writer_leaves_the_previous_workbook_and_retry_publishes_once"])
+            .env(CHILD_DIR, &dir).status().unwrap();
+        assert_eq!(status.code(), Some(26));
+        assert_eq!(list(&dir, false).unwrap().len(), 1);
+        let (_, saved) = stage_workbook(&dir, "Book.osheet", |file| file.write_all(b"complete")).unwrap();
+        assert_eq!(saved, "Book (2).osheet");
+        assert_eq!(std::fs::read(dir.join(saved)).unwrap(), b"complete");
+        assert_eq!(std::fs::read(dir.join("Book.osheet")).unwrap(), b"original");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workbook_publication_survives_interrupted_copy_and_name_collision() {
+        use std::io::Write;
+        let dir = tmp("publish-workbook");
+        let existing = dir.join("Budget.osheet");
+        std::fs::write(&existing, b"previous workbook").unwrap();
+        let result = stage_workbook(&dir, "Budget.osheet", |file| {
+            file.write_all(b"partial workbook")?;
+            assert_eq!(std::fs::read(&existing)?, b"previous workbook");
+            assert!(!dir.join("Budget (2).osheet").exists());
+            Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted before commit"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let source = dir.join("source");
+        let bytes = vec![17u8; 155_000];
+        std::fs::write(&source, &bytes).unwrap();
+        let (file, name) = publish_workbook(&dir, "Budget.osheet", &std::fs::File::open(source).unwrap()).unwrap();
+        assert_eq!(name, "Budget (2).osheet");
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
+        assert_eq!(std::fs::read(existing).unwrap(), b"previous workbook");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

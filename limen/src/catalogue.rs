@@ -71,7 +71,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "sign-in", provider: Provider::System(VESTIBULUM), slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
     // Returns a descriptor: a printed page's PDF (`Printed`).
     Role { name: "doc-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: true },
-    Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Sheet { w: 640, h: 440 }, takes_fd: false, returns_fd: true },
+    Role { name: "picker", provider: Provider::System(SCRINIUM), slot: SlotKind::Sheet { w: 640, h: 440 }, takes_fd: true, returns_fd: true },
     Role { name: "share", provider: Provider::System(SHARE), slot: SlotKind::Sheet { w: 480, h: 400 }, takes_fd: false, returns_fd: false },
     Role { name: "share-target", provider: Provider::Chosen, slot: SlotKind::Sheet { w: 560, h: 440 }, takes_fd: true, returns_fd: false },
     Role { name: "media-player", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },

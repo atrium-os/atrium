@@ -599,6 +599,18 @@ fn send(shared: &Arc<Shared>, conn: ConnId, s: proto::Send, fd: Option<OwnedFd>)
         return Err(Reply::Refused { reason: refusal::MALFORMED });
     }
     if let Some(f) = fd.as_ref() {
+        if e.role.name == "picker" {
+            use crate::picker::{Kind, ToChild};
+            let save = match ToChild::decode(&s.bytes) {
+                Some(ToChild::Open(filter)) => filter.kind == Kind::Save,
+                Some(ToChild::Commit(_)) => true,
+                None => false,
+            };
+            if !save { return Err(Reply::Refused { reason: refusal::MALFORMED }); }
+            if !crate::fdpass::sealed(f) {
+                return Err(Reply::Refused { reason: refusal::BAD_FD });
+            }
+        }
         if crate::fdpass::check(f).is_err() || crate::fdpass::narrow(f).is_err() {
             return Err(Reply::Refused { reason: refusal::BAD_FD });
         }

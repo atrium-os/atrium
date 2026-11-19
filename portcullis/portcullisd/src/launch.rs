@@ -215,11 +215,11 @@ pub fn new_workbook(user: &str, persona: Option<&str>) -> std::io::Result<()> {
     launch_workbook(user, persona, None)
 }
 pub fn open_workbook(
-    user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd,
+    user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd, commit: Option<[u8; 16]>,
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let (sender, receiver) = std::os::unix::net::UnixStream::pair()?;
-    atrium_open::send(&sender, name, mime, write, fd.as_raw_fd())?;
+    atrium_open::send_with_commit(&sender, name, mime, write, fd.as_raw_fd(), commit)?;
     drop(sender);
     launch_workbook(user, persona, Some(receiver.into()))
 }

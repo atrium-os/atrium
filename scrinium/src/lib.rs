@@ -20,3 +20,5 @@ pub mod install;
 pub mod open;
 pub mod places;
 pub mod view;
+
+pub mod workbook;

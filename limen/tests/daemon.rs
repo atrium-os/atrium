@@ -578,6 +578,23 @@ fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
     app.send(e, ask.encode()).unwrap();
     assert!(matches!(next_c(&mut picker), ChildEvent::Message { .. }));
 
+    #[cfg(any(target_os = "freebsd", target_os = "linux"))]
+    {
+        let staged = limen::fdpass::sealed_file("workbook", b"complete snapshot").unwrap();
+        let save = limen::picker::ToChild::Open(limen::picker::Filter::save("Budget.osheet", "")).encode();
+        assert_eq!(refused(app.send_fd(e, ask.encode(), staged.as_fd())), refusal::MALFORMED);
+        app.send_fd(e, save, staged.as_fd()).unwrap();
+        assert!(matches!(next_c(&mut picker), ChildEvent::MessageFd { .. }));
+        let mut got = std::fs::File::from(picker.take_fd().unwrap());
+        let mut bytes = Vec::new();
+        got.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"complete snapshot");
+        let commit = limen::picker::ToChild::Commit([42; 16]);
+        app.send_fd(e, commit.encode(), staged.as_fd()).unwrap();
+        assert!(matches!(next_c(&mut picker), ChildEvent::MessageFd { bytes, .. } if bytes == commit.encode()));
+        assert!(picker.take_fd().is_some());
+    }
+
     let path = std::env::temp_dir().join(format!("limen-pick-{}", std::process::id()));
     std::fs::write(&path, b"picked bytes").unwrap();
     let ro = std::fs::File::open(&path).unwrap();
@@ -618,8 +635,7 @@ fn the_picker_is_scriniums_and_hands_back_one_regular_file() {
     assert!(matches!(next_p(&mut app), ParentEvent::Message { .. }));
     assert!(app.take_fd().is_none());
 
-    // Another role's child can't hand one back, and a parent can't send one
-    // to the picker.
+    // A viewer cannot return a file, and arbitrary picker messages cannot carry one.
     let v = app.request("media-player", W_APP).unwrap();
     let (_, mut viewer) = w.spawned();
     assert_eq!(refused(viewer.emit_fd(v, b"x".to_vec(), ro.as_fd())), refusal::MALFORMED);

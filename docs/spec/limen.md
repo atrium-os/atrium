@@ -286,6 +286,10 @@ an app gets, so no app may register to be it. Built: [scrinium.md](scrinium.md) 
 |---|---|---|
 | parent → child | `Open` | `filter: { kind: File \| Folder, extensions, multiple, write, title }` |
 | child → parent | `File` | `name, size, write`; sent with `EMIT_FD`, the open file in the same frame |
+| parent → child | `Open(Save)` with descriptor | sealed workbook snapshot for Save As |
+| parent → child | `Commit` with descriptor | session save grant and sealed workbook snapshot |
+| child → parent | `Published` with descriptor | chosen name, size and new save grant |
+| child → parent | `Committed` | Scrinium has finished replacing and syncing the workbook |
 | child → parent | `Folder` | `at` (`/media/<part>` in the parent's jail), `name, read_only`; the folder was mounted there by dispensatord's `PICKED` |
 | child → parent | `Done` | `files: u32` |
 | child → parent | `Cancelled` | none |

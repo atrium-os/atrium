@@ -265,6 +265,8 @@ enum FromPane {
     Ready(EmbedId, [u8; 16]),
     Picked(EmbedId, Outcome),
     Gone(EmbedId),
+    Published(EmbedId, std::io::Result<(std::fs::File, String, [u8; 16])>),
+    Committed(EmbedId, std::io::Result<()>),
 }
 
 /// A picker's window, on its own thread: frescod keeps it hidden until
@@ -284,13 +286,14 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
         }
     };
     let mut pane = Pane::new(win, Mode::Picker { filter: Filter::file(), app: app_id });
+    let mut opened = false;
     let mut ready = false;
     let mut sent = false;
     loop {
         if !pane.step(Duration::from_millis(30), &places, &who) {
             break;
         }
-        if !ready {
+        if opened && !ready {
             if let Some(token) = pane.win.embed_token() {
                 ready = true;
                 let _ = tx.send(FromPane::Ready(embed, token));
@@ -298,6 +301,7 @@ fn picker_pane(embed: EmbedId, app_id: String, fresco: String, places: SharedPla
         }
         match rx.try_recv() {
             Ok(ToPane::Open(f)) => {
+                opened = true;
                 let list = places.lock().unwrap().list.clone();
                 with(&pane.state, |b| {
                     b.mode = match &b.mode {
@@ -336,6 +340,8 @@ struct Embed {
     parent_uid: u32,
     sheets: bool,
     write: bool,
+    staged: Option<std::fs::File>,
+    requested: bool,
 }
 
 /// Hand the pick over: files as descriptors, a folder as a grant into the
@@ -394,7 +400,7 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
             let ty = detected.known().ok_or_else(|| detected.question().unwrap_or_else(|| "Unknown workbook format".into()))?;
             let mime = if ty.mime == "text/plain" { "text/csv" } else { ty.mime };
             let write = write && mime != "application/vnd.ms-excel";
-            scrinium::open::open_workbook(e.parent_uid, mime, &name, write, activation, &file)?;
+            scrinium::open::open_workbook(e.parent_uid, mime, &name, write, activation, &file, &path)?;
             child.emit(embed, ToParent::Done { files: 0 }.encode()).map_err(|err| format!("{err:?}"))?;
             Ok(())
         }
@@ -427,6 +433,15 @@ fn hand_over(child: &mut Child, embed: EmbedId, e: &Embed, o: Outcome, media_soc
 }
 
 /// The picker service: limend's `picker` provider, one pane per embed.
+fn workbook_failure(message: String) -> ToParent {
+    let mut why = String::new();
+    for c in message.chars().filter(|c| !c.is_control()) {
+        if why.len() + c.len_utf8() > limen::picker::MAX_WHY { break; }
+        why.push(c);
+    }
+    ToParent::Failed { why }
+}
+
 fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_sock: std::path::PathBuf) {
     std::thread::spawn(move || loop {
         let mut child = match Child::provider(&limen_sock, "picker") {
@@ -452,7 +467,7 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                 Some(ChildEvent::Attach { embed, role, parent_app, parent_uid }) if role == "picker" => {
                     eprintln!("scrinium: picker {embed} for {parent_app} (uid {parent_uid})");
                     let (ptx, prx) = mpsc::channel();
-                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", write: false });
+                    embeds.insert(embed, Embed { to_pane: ptx, parent_uid, sheets: parent_app == "org.atrium.sheets", write: false, staged: None, requested: false });
                     let (f, pl, t) = (fresco.clone(), places.clone(), tx.clone());
                     std::thread::spawn(move || picker_pane(embed, parent_app, f, pl, prx, t));
                 }
@@ -462,8 +477,37 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                         let _ = e.to_pane.send(ToPane::Persona(persona));
                     }
                 }
+                Some(ChildEvent::MessageFd { embed, bytes }) => {
+                    let fd = child.take_fd();
+                    if let Some(ToChild::Commit(token)) = ToChild::decode(&bytes) {
+                        let Some(e) = embeds.get_mut(&embed) else { continue };
+                        if !e.sheets || e.requested || fd.is_none() {
+                            let _ = child.emit(embed, ToParent::Failed { why: "Invalid workbook commit".into() }.encode());
+                            continue;
+                        }
+                        e.requested = true;
+                        let source = std::fs::File::from(fd.unwrap());
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            let result = scrinium::workbook::commit(token, &source);
+                            let _ = tx.send(FromPane::Committed(embed, result));
+                        });
+                        continue;
+                    }
+                    if let (Some(e), Some(ToChild::Open(f)), Some(fd)) = (embeds.get_mut(&embed), ToChild::decode(&bytes), fd) {
+                        if e.requested || !e.sheets || f.kind != limen::picker::Kind::Save || !f.origin.is_empty() {
+                            let _ = child.emit(embed, ToParent::Failed { why: "Invalid workbook save request".into() }.encode());
+                            continue;
+                        }
+                        e.requested = true;
+                        e.staged = Some(fd.into());
+                        let _ = e.to_pane.send(ToPane::Open(f));
+                    }
+                }
                 Some(ChildEvent::Message { embed, bytes }) => {
                     if let (Some(e), Some(ToChild::Open(f))) = (embeds.get_mut(&embed), ToChild::decode(&bytes)) {
+                        if e.requested { continue; }
+                        e.requested = true;
                         if f.kind == limen::picker::Kind::Workbook && !e.sheets {
                             let _ = child.emit(embed, ToParent::Failed { why: "Only Sheets can open a workbook this way".into() }.encode());
                             continue;
@@ -487,11 +531,44 @@ fn serve_picker(limen_sock: String, fresco: String, places: SharedPlaces, media_
                         }
                     }
                     FromPane::Picked(embed, o) => {
-                        let Some(e) = embeds.get(&embed) else { continue };
+                        let Some(e) = embeds.get_mut(&embed) else { continue };
+                        if let (Outcome::Save { dir, name, .. }, Some(file)) = (&o, e.staged.take()) {
+                            let (dir, name, tx) = (dir.clone(), name.clone(), tx.clone());
+                            std::thread::spawn(move || {
+                                let result = scrinium::fs::publish_workbook(&dir, &name, &file).and_then(|(file, name)| {
+                                    let token = scrinium::workbook::grant(&dir.join(&name), &file)?;
+                                    Ok((file, name, token))
+                                });
+                                let _ = tx.send(FromPane::Published(embed, result));
+                            });
+                            continue;
+                        }
                         if let Err(why) = hand_over(&mut child, embed, e, o, &media_sock) {
                             eprintln!("scrinium: picker {embed}: {why}");
                             let _ = e.to_pane.send(ToPane::Failed(why));
                         }
+                    }
+                    FromPane::Committed(embed, result) => {
+                        if embeds.contains_key(&embed) {
+                            let reply = match result {
+                                Ok(()) => ToParent::Committed,
+                                Err(err) => workbook_failure(err.to_string()),
+                            };
+                            let _ = child.emit(embed, reply.encode());
+                        }
+                    }
+                    FromPane::Published(embed, result) => {
+                        use std::os::fd::AsFd;
+                        if !embeds.contains_key(&embed) { continue; }
+                        let result = result.and_then(|(file, name, commit)| {
+                            let msg = ToParent::Published { name, size: file.metadata()?.len(), commit };
+                            child.emit_fd(embed, msg.encode(), file.as_fd()).map_err(|err| std::io::Error::other(format!("{err:?}")))
+                        });
+                        let reply = match result {
+                            Ok(()) => ToParent::Done { files: 1 },
+                            Err(e) => workbook_failure(format!("Couldn't save workbook: {e}")),
+                        };
+                        let _ = child.emit(embed, reply.encode());
                     }
                     FromPane::Gone(embed) => {
                         // The window went first (frescod closed it): the app
@@ -976,7 +1053,7 @@ impl Network {
                     let r = scrinium::fs::open_for_app(&req.path, req.write).map_err(|e| scrinium::browser::err_text(&e)).and_then(|(f, w)| {
                         req.write = w;
                         let (app, mime) = (req.app.clone().unwrap_or_default(), req.mime.clone().unwrap_or_default());
-                        scrinium::open::open(&app, &mime, &req.name, w, req.always, req.token, &f)
+                        scrinium::open::open(&app, &mime, &req.name, w, req.always, req.token, &f, &req.path)
                     });
                     let _ = tx.send(Job::Handed(req, r));
                 }

@@ -121,6 +121,8 @@ impl Filter {
 pub enum ToChild {
     /// Show the picker. Sent once, first; a second is ignored.
     Open(Filter),
+    /// Replace one previously granted workbook with the attached sealed snapshot.
+    Commit([u8; 16]),
 }
 
 impl ToChild {
@@ -131,8 +133,7 @@ impl ToChild {
     /// Decode the parent's message, refusing anything out of shape.
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
-        let ToChild::Open(f) = &m;
-        f.sane().then_some(m)
+        match &m { Self::Open(f) if !f.sane() => None, _ => Some(m) }
     }
 }
 
@@ -149,6 +150,8 @@ pub enum ToParent {
     Cancelled,
     /// The pick could not be handed over (the stick went, a grant failed).
     Failed { why: String },
+    Published { name: String, size: u64, commit: [u8; 16] },
+    Committed,
 }
 
 pub const MAX_WHY: usize = 200;
@@ -166,7 +169,8 @@ impl ToParent {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
         let ok = match &m {
-            ToParent::File { name, .. } => !name.is_empty() && clean(name, MAX_NAME) && !name.contains('/'),
+            ToParent::Committed => true,
+            ToParent::File { name, .. } | ToParent::Published { name, .. } => !name.is_empty() && clean(name, MAX_NAME) && !name.contains('/'),
             ToParent::Folder { at, name, .. } => at.starts_with("/media/") && clean(at, 64) && !at.split('/').any(|c| c == "..") && clean(name, MAX_NAME),
             ToParent::Done { files } => (*files as usize) <= MAX_FILES,
             ToParent::Cancelled => true,

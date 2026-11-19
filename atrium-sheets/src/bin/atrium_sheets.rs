@@ -43,8 +43,8 @@ const SYNC_EVERY: Duration = Duration::from_secs(2);
 
 /// Where the user's file is, for Save.
 enum Target {
-    /// A picked file, open read-write.
-    Picked { file: File, format: Format },
+    /// A Scrinium grant for replacing a picked workbook.
+    Picked { commit: [u8; 16], format: Format },
     /// A path supplied for development.
     Path { path: PathBuf, format: Format },
 }
@@ -54,6 +54,7 @@ enum Target {
 enum Asking {
     Open,
     SaveAs,
+    Commit,
     LinkedPicture,
     /// The copy to compare with.
     Compare,
@@ -101,6 +102,24 @@ fn encode(d: &Doc, format: Format) -> io::Result<Vec<u8>> {
     }
 }
 
+fn saved_status(d: &Doc, format: Format) -> String {
+    let lost = format == Format::Csv && d.wb.groups().next().is_some();
+    // Macros go back only into their own kind of file (§5.3).
+    let fam = d.wb.macros().map(|m| m.family);
+    let macros_lost = match (fam, format) {
+        (None, _) => false,
+        (Some(officina_grid::macros::MacroFamily::Ooxml), Format::Xlsm) | (Some(officina_grid::macros::MacroFamily::Odf), Format::Ods) | (Some(_), Format::Native) => false,
+        _ => true,
+    };
+    if lost {
+        format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name)
+    } else if macros_lost {
+        format!("Saved “{}”. Its macros aren't in this file: this format can't hold them.", d.name)
+    } else {
+        format!("Saved “{}”.", d.name)
+    }
+}
+
 /// Where Save writes a document opened from `target`: nowhere for an `.xls`,
 /// which Sheets reads but doesn't write (Save asks where to keep a copy).
 fn keep_target(d: &mut Doc, target: Option<Target>) -> Option<Target> {
@@ -113,8 +132,7 @@ fn keep_target(d: &mut Doc, target: Option<Target>) -> Option<Target> {
     }
 }
 
-/// Writes the document over a picked file. The autosave folder still holds the
-/// document until this returns, so a crash halfway loses nothing.
+/// In-place write for the development command-line path.
 fn write_over(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
@@ -213,10 +231,8 @@ impl Run {
     }
 
     fn save(&mut self) -> bool {
-        let Some(t) = self.target.as_mut() else { return false };
-        let format = match t {
-            Target::Picked { format, .. } | Target::Path { format, .. } => *format,
-        };
+        let Some(Target::Path { path, format }) = self.target.as_ref() else { return false };
+        let format = *format;
         if format != Format::Native && self.sheets.doc.borrow().wb.tracked_cells().is_some() {
             self.set_status("Choose where to save an .osheet copy with its tracked cell changes.");
             return false;
@@ -225,32 +241,15 @@ impl Run {
         { let mut d = self.sheets.doc.borrow_mut(); if d.wb.recalc_pending() { d.wb.recalc(); } }
         let r = {
             let d = self.sheets.doc.borrow();
-            encode(&d, format).and_then(|bytes| match t {
-                Target::Picked { file, .. } => write_over(file, &bytes),
-                Target::Path { path, .. } => {
-                    let mut f = OpenOptions::new().write(true).open(&*path)?;
-                    write_over(&mut f, &bytes)
-                }
+            encode(&d, format).and_then(|bytes| {
+                let mut file = OpenOptions::new().write(true).open(path)?;
+                write_over(&mut file, &bytes)
             })
         };
         let mut d = self.sheets.doc.borrow_mut();
         match r.and_then(|_| d.saved()) {
             Ok(()) => {
-                let lost = format == Format::Csv && d.wb.groups().next().is_some();
-                // Macros go back only into their own kind of file (§5.3).
-                let fam = d.wb.macros().map(|m| m.family);
-                let macros_lost = match (fam, format) {
-                    (None, _) => false,
-                    (Some(officina_grid::macros::MacroFamily::Ooxml), Format::Xlsm) | (Some(officina_grid::macros::MacroFamily::Odf), Format::Ods) | (Some(_), Format::Native) => false,
-                    _ => true,
-                };
-                d.status = if lost {
-                    format!("Saved “{}” as CSV: values only, formulas are not kept in CSV.", d.name)
-                } else if macros_lost {
-                    format!("Saved “{}”. Its macros aren't in this file: this format can't hold them.", d.name)
-                } else {
-                    format!("Saved “{}”.", d.name)
-                };
+                d.status = saved_status(&d, format);
             }
             Err(e) => d.status = format!("Couldn't save “{}”: {e}. Your changes are still here and in the autosave.", d.name),
         }
@@ -259,34 +258,28 @@ impl Run {
         true
     }
 
-    fn save_as(&mut self, name: String, mut file: File) {
-        let result = {
-            let mut doc = self.sheets.doc.borrow_mut();
-            if doc.wb.recalc_pending() { doc.wb.recalc(); }
-            encode(&doc, Format::Native).and_then(|bytes| write_over(&mut file, &bytes))
-        };
-        match result {
-            Ok(()) => {
-                self.target = Some(Target::Picked { file, format: Format::Native });
-                let mut doc = self.sheets.doc.borrow_mut();
-                doc.name = name.clone();
-                doc.status = match doc.saved() {
-                    Ok(()) => format!("Saved as “{name}”."),
-                    Err(e) => format!("Saved as “{name}”, but couldn't clear the autosave: {e}."),
-                };
-                drop(doc);
-                self.sheets.changed();
+    fn published(&mut self, name: String, commit: [u8; 16], edits: u64) {
+        self.target = Some(Target::Picked { commit, format: Format::Native });
+        let mut doc = self.sheets.doc.borrow_mut();
+        doc.name = name.clone();
+        doc.status = if doc.edits == edits {
+            match doc.saved() {
+                Ok(()) => format!("Saved as “{name}”."),
+                Err(e) => format!("Saved as “{name}”, but couldn't update autosave: {e}."),
             }
-            Err(e) => self.set_status(format!("Couldn't save “{name}”: {e}.")),
-        }
+        } else {
+            format!("Saved as “{name}”. More recent edits are still pending.")
+        };
+        drop(doc);
+        self.sheets.changed();
     }
 
     /// A picked file arrived.
-    fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd) {
+    fn opened(&mut self, name: String, write: bool, fd: std::os::fd::OwnedFd, commit: Option<[u8; 16]>) {
         let mut f = File::from(fd);
         let format = format_of(&name);
         match read_all(&mut f) {
-            Ok(data) => self.open_bytes(name, data, write.then_some(Target::Picked { file: f, format }), !write, None),
+            Ok(data) => self.open_bytes(name, data, commit.filter(|_| write).map(|commit| Target::Picked { commit, format }), !write, None),
             Err(e) => self.set_status(format!("Couldn't read “{name}”: {e}")),
         }
     }
@@ -396,6 +389,7 @@ impl Run {
             let pw = (!text.is_empty()).then_some(text.as_str());
             let r = self.sheets.doc.borrow_mut().set_password(pw);
             let mut d = self.sheets.doc.borrow_mut();
+            d.edits += 1;
             d.dirty = true;
             d.status = match (r, pw) {
                 (Err(e), _) => format!("The password is set, but autosave stopped: {e}."),
@@ -516,7 +510,7 @@ fn main() {
     if let Some(file) = workbook {
         eprintln!("atrium-sheets: “{}” opened in its document jail{}", file.name,
                   if file.write { " (write)" } else { "" });
-        run.opened(file.name, file.write, file.file.into());
+        run.opened(file.name, file.write, file.file.into(), file.commit);
     } else if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
     } else if let Some((dir, name)) = restore {
@@ -540,6 +534,7 @@ fn main() {
     let mut last_sync = Instant::now();
     // Closing waits on Save As (true), and Don't Save drops the changes.
     let mut close_after_save = false;
+    let mut staged_save = None;
     let mut discard = false;
     let mut recalculating = false;
     // Printing: the sheet as it was asked for, the PDF being made (true once
@@ -603,6 +598,12 @@ fn main() {
                 Cmd::PasswordClose => run.password_cancelled(),
                 Cmd::SaveAs => want_picker = Some(Asking::SaveAs),
                 Cmd::Print => want_print = true,
+                Cmd::Save | Cmd::CloseSave if matches!(run.target, Some(Target::Picked { .. })) => {
+                    close_after_save = matches!(c, Cmd::CloseSave);
+                    let native_copy = matches!(run.target, Some(Target::Picked { format, .. }) if format != Format::Native)
+                        && run.sheets.doc.borrow().wb.tracked_cells().is_some();
+                    want_picker = Some(if native_copy { Asking::SaveAs } else { Asking::Commit });
+                }
                 Cmd::Save => {
                     if !run.save() {
                         want_picker = Some(Asking::SaveAs);
@@ -694,7 +695,7 @@ fn main() {
                             },
                             name: String::new(), origin: String::new(),
                         },
-                        Asking::SaveAs => Filter::save(&save_name(&name), ""),
+                        Asking::SaveAs | Asking::Commit => Filter::save(&save_name(&name), ""),
                         Asking::LinkedPicture => {
                             let Some(link) = print_snap.as_ref().and_then(|snap| snap.next_link()) else { continue };
                             Filter {
@@ -706,20 +707,46 @@ fn main() {
                             }
                         }
                     };
+                    let commit_target = match (&run.target, what) {
+                        (Some(Target::Picked { commit, format }), Asking::Commit) => Some((*commit, *format)),
+                        _ => None,
+                    };
+                    let source = if matches!(what, Asking::SaveAs | Asking::Commit) {
+                        let mut d = run.sheets.doc.borrow_mut();
+                        if d.wb.recalc_pending() { d.wb.recalc(); }
+                        match encode(&d, commit_target.map_or(Format::Native, |(_, format)| format)).and_then(|bytes| {
+                            let file = limen::fdpass::sealed_file("workbook.osheet", &bytes)?;
+                            Ok((file, bytes.len() as u64))
+                        }) {
+                            Ok((file, size)) => { staged_save = Some((d.edits, size)); Some(file) }
+                            Err(err) => { drop(d); close_after_save = false; run.set_status(format!("Couldn't stage the workbook: {err}")); continue; }
+                        }
+                    } else { None };
                     let asked = e.borrow_mut().request("picker", token, PICKER_SLOT);
-                    match asked.and_then(|id| e.borrow_mut().send(id, ToChild::Open(filter).encode()).map(|_| id)) {
+                    match asked.and_then(|id| {
+                        use std::os::fd::AsFd;
+                        let message = match commit_target { Some((token, _)) => ToChild::Commit(token), None => ToChild::Open(filter) }.encode();
+                        let result = match source {
+                            Some(file) => e.borrow_mut().send_fd(id, message, file.as_fd()),
+                            None => e.borrow_mut().send(id, message),
+                        };
+                        if result.is_err() { let _ = e.borrow_mut().detach_embed(id); }
+                        result.map(|_| id)
+                    }) {
                         Ok(id) => {
                             embed = Some(id);
                             asking = Some(what);
                             run.sheets.ui.set(Ui { asking: true });
                         }
                         Err(err) => {
+                            close_after_save = false;
+                            staged_save = None;
                             if what == Asking::LinkedPicture { print_snap = None; }
                             run.set_status(format!("The picker didn't open: {err:?}"));
                         }
                     }
                 }
-                _ => run.set_status("The system picker isn't available here."),
+                _ => { close_after_save = false; run.set_status("The system picker isn't available here."); }
             }
         }
         if let Some(e) = &embeds {
@@ -771,7 +798,12 @@ fn main() {
                             }
                             finish = true;
                         }
-                        (Some(ToParent::File { name, write: true, .. }), Some(fd)) if asking == Some(Asking::SaveAs) => run.save_as(name, fd.into()),
+                        (Some(ToParent::Published { name, size, commit }), Some(_fd)) if asking == Some(Asking::SaveAs) => {
+                            if let Some((edits, _)) = staged_save.filter(|(_, expected)| size == *expected) {
+                                staged_save = None;
+                                run.published(name, commit, edits);
+                            } else { run.set_status("The picker returned an incomplete workbook."); }
+                        }
                         (Some(ToParent::File { name, .. }), Some(fd))
                             if matches!(asking, Some(Asking::Compare | Asking::MergeBase | Asking::MergeIncoming)) =>
                             run.read_review(name, fd, asking.unwrap()),
@@ -780,6 +812,23 @@ fn main() {
                     }
                 }
                 Ok(Some(ParentEvent::Message { embed: event, bytes })) if embed == Some(event) => match ToParent::decode(&bytes) {
+                    Some(ToParent::Committed) if asking == Some(Asking::Commit) => {
+                        if let Some((edits, _)) = staged_save.take() {
+                            let mut d = run.sheets.doc.borrow_mut();
+                            d.status = if d.edits != edits {
+                                "Saved. More recent edits are still pending.".into()
+                            } else {
+                                match d.saved() {
+                                    Ok(()) => match run.target {
+                                        Some(Target::Picked { format, .. }) => saved_status(&d, format),
+                                        _ => "Saved.".into(),
+                                    },
+                                    Err(e) => format!("Saved, but autosave could not be updated: {e}"),
+                                }
+                            };
+                        }
+                        finish = true;
+                    }
                     Some(ToParent::Cancelled) => {
                         if asking == Some(Asking::MergeIncoming) { run.merge_base = None; }
                         finish = true;
@@ -791,10 +840,14 @@ fn main() {
                     }
                     _ => {}
                 },
-                Ok(Some(ParentEvent::ChildLost { embed: event })) if embed == Some(event) => finish = true,
+                Ok(Some(ParentEvent::ChildLost { embed: event })) if embed == Some(event) => {
+                    if staged_save.is_some() { run.set_status("Scrinium disconnected before confirming the save."); }
+                    finish = true;
+                }
                 Ok(_) => {}
                 Err(err) => {
                     eprintln!("atrium-sheets: limend: {err:?}");
+                    if staged_save.is_some() { run.set_status("Lost contact with the picker before save confirmation."); }
                     finish = asking.is_some();
                 }
             }
@@ -820,6 +873,7 @@ fn main() {
                     }
                 }
                 asking = None;
+                if staged_save.take().is_some() { close_after_save = false; }
                 run.sheets.ui.set(Ui { asking: false });
                 // Saved on the way out: close; cancelled: stay open.
                 if std::mem::take(&mut close_after_save) && !run.sheets.doc.borrow().dirty {
@@ -1027,6 +1081,22 @@ mod document_tests {
                 eprintln!("reopened {}", received.name);
             }
         }
+    }
+
+    #[test]
+    fn workbook_open_carries_the_scrinium_commit_handle() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        let path = std::env::temp_dir().join(format!("sheets-grant-{}.osheet", std::process::id()));
+        fs::write(&path, Doc::new("Budget").stored_native().unwrap()).unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        atrium_open::send_with_commit(&tx, "Budget.osheet", "application/vnd.atrium.osheet", true,
+            file.as_raw_fd(), Some([42;16])).unwrap();
+        let opened = atrium_open::Channel::from_stream(rx).recv(Some(Duration::from_secs(2))).unwrap().unwrap();
+        assert_eq!(opened.commit, Some([42;16]));
+        assert_eq!(opened.name, "Budget.osheet");
+        let mut file = opened.file;
+        Doc::from_native(&opened.name, &read_all(&mut file).unwrap()).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

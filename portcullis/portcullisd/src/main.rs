@@ -1527,8 +1527,11 @@ fn handle_open(
             list.sort_by_key(|c| !c.default);
             write_response(writer, &Response::OpenApps { apps: list })
         }
-        Request::OpenFile { app, mime, name, write, activation, always, workbook_picker } => {
+        Request::OpenFile { app, mime, name, write, activation, always, workbook_picker, workbook_commit } => {
             let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+            if workbook_commit.is_some() && (!write || app != portcullis_policy::opens::SHEETS) {
+                return refuse(writer, "save grant requires a writable Sheets workbook".into());
+            }
             let persona = match workbook_picker {
                 Some(parent) if app == portcullis_policy::opens::SHEETS && !always
                     && registry.resolve(parent) == Some((owner, app.as_str())) => registry.persona(parent).flatten(),
@@ -1579,7 +1582,7 @@ fn handle_open(
                     eprintln!("portcullisd: {owner}'s default for {mime} is now {app}");
                 }
             }
-            if let Err(e) = deliver_open(owner, &app, persona, &name, &mime, write, fd) {
+            if let Err(e) = deliver_open(owner, &app, persona, &name, &mime, write, fd, workbook_commit) {
                 return refuse(writer, e.to_string());
             }
             eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
@@ -1591,11 +1594,11 @@ fn handle_open(
 
 fn deliver_open(
     owner: &str, app: &str, persona: Option<&str>, name: &str,
-    mime: &str, write: bool, fd: OwnedFd,
+    mime: &str, write: bool, fd: OwnedFd, commit: Option<[u8; 16]>,
 ) -> std::io::Result<()> {
     use portcullisd::opens::{self, Delivery, Hub};
     if app == portcullis_policy::opens::SHEETS {
-        return launch::open_workbook(owner, persona, name, mime, write, fd);
+        return launch::open_workbook(owner, persona, name, mime, write, fd, commit);
     }
     let key = opens::channel_key(app, persona);
     let hub = Hub::global();
@@ -1733,7 +1736,7 @@ fn handle_open_download(
     if let Err(e) = opens::narrow(&fd, false) {
         return refuse(writer, format!("cap_rights_limit: {e}"));
     }
-    if let Err(e) = deliver_open(owner, &app, persona.as_deref(), name, t.mime, false, fd) {
+    if let Err(e) = deliver_open(owner, &app, persona.as_deref(), name, t.mime, false, fd, None) {
         return refuse(writer, e.to_string());
     }
     eprintln!("portcullisd: a download “{name}” ({}) from {} opened in {key} for {owner}", t.mime, caller.as_deref().unwrap_or("?"));
@@ -1810,7 +1813,7 @@ fn handle_open_attachment(
     if let Err(why) = opens::spend_press(&opens::activation_socket(), activation, uid) {
         return refuse(writer, why);
     }
-    if let Err(e) = deliver_open(owner, &app, persona, name, t.mime, false, fd) {
+    if let Err(e) = deliver_open(owner, &app, persona, name, t.mime, false, fd, None) {
         return refuse(writer, e.to_string());
     }
     eprintln!("portcullisd: attachment “{name}” ({}) opened in {app} for {owner}", t.mime);

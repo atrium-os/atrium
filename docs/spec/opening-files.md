@@ -181,7 +181,9 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
   jail alone at `/atrium/sockets/opens/opens.sock` (the `atrium-open`
   crate). The app connects once at start; portcullisd takes the
   connection only from the app's own uid and sends each file there as an
-  `OPEN` message (type, `r` or `w`, name) with the descriptor. A file
+  `OPEN` message (type, `r` or `w`, name) with the descriptor.
+  For a writable Sheets document selected in Scrinium, Portcullis prefixes
+  that message with `WORKBOOK\0` and Scrinium’s 16-byte save grant. A file
   opened before the app has connected waits (60 s at most); portcullisd
   starts the app if it isn't running. An app that declares no types has
   no channel. *(As built: not fd 3 and `ATRIUM_OPEN=1` as first written,
