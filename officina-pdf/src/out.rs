@@ -67,6 +67,13 @@ impl Page {
 }
 
 /// The file being written.
+#[derive(Clone, Copy)]
+struct PictureObject {
+    object: Ref,
+    /// Retained source rectangle as fractions of the original image.
+    source: [f64; 4],
+}
+
 pub(crate) struct Pdf<W: Write> {
     o: Writer<W>,
     catalog: Ref,
@@ -74,7 +81,7 @@ pub(crate) struct Pdf<W: Write> {
     info: Ref,
     kids: Vec<Ref>,
     fonts_used: BTreeMap<u16, FontUse>,
-    pictures: HashMap<u64, Option<Ref>>,
+    pictures: HashMap<u64, Option<PictureObject>>,
     color_faces: HashMap<u16, bool>,
     emoji: HashMap<(u16, u16), Option<Emoji>>,
     pub stats: Stats,
@@ -90,21 +97,37 @@ impl<W: Write> Pdf<W> {
     /// Picture `key` (written once, from `bytes` the first time) named in
     /// `page`'s resources; None when it can't be read.
     pub fn picture(&mut self, page: &mut Page, key: u64, bytes: impl FnOnce() -> Option<Vec<u8>>) -> io::Result<Option<String>> {
-        let obj = match self.pictures.get(&key) {
-            Some(o) => *o,
+        self.register_picture(page, key, |out| match bytes() {
+            Some(bytes) => write_picture(out, &bytes),
+            None => Ok(None),
+        }).map(|picture| picture.map(|(name, _)| name))
+    }
+
+    /// Embed just the pixels intersecting the source crop. Keep fractional
+    /// edges for the caller's clip so subpixel crops preserve placement.
+    pub fn cropped_picture(&mut self, page: &mut Page, key: u64, bytes: &[u8], crop: [i32; 4]) -> io::Result<Option<(String, [f64; 4])>> {
+        self.register_picture(page, key, |out| {
+            let Some((w, h, rgba)) = decode(bytes) else { return Ok(None) };
+            let [l, t, r, b] = crop;
+            let (x, right) = crop_span(w, l, r);
+            let (y, bottom) = crop_span(h, t, b);
+            write_pixels(out, w, h, &rgba, [x, y, right - x, bottom - y])
+        })
+    }
+
+    fn register_picture(&mut self, page: &mut Page, key: u64, write: impl FnOnce(&mut Writer<W>) -> io::Result<Option<PictureObject>>) -> io::Result<Option<(String, [f64; 4])>> {
+        let picture = match self.pictures.get(&key) {
+            Some(picture) => *picture,
             None => {
-                let n = match bytes() {
-                    Some(b) => write_picture(&mut self.o, &b)?,
-                    None => None,
-                };
-                self.pictures.insert(key, n);
-                n
+                let picture = write(&mut self.o)?;
+                self.pictures.insert(key, picture);
+                picture
             }
         };
-        Ok(obj.map(|obj| {
-            let n = format!("Im{key}");
-            page.xobjects.insert(n.clone(), obj);
-            n
+        Ok(picture.map(|picture| {
+            let name = format!("Im{key}");
+            page.xobjects.insert(name.clone(), picture.object);
+            (name, picture.source)
         }))
     }
 
@@ -415,33 +438,74 @@ fn decode(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 
 /// A picture's bytes as an image XObject (JPEG as it is, anything else
 /// decoded and deflated); None when they can't be read.
-fn write_picture<W: Write>(o: &mut Writer<W>, bytes: &[u8]) -> io::Result<Option<Ref>> {
-    let head = |w: u32, h: u32, cs: &str| dict([("Type", name("XObject")), ("Subtype", name("Image")), ("Width", int(w as i64)), ("Height", int(h as i64)), ("ColorSpace", name(cs)), ("BitsPerComponent", int(8))]);
+fn write_picture<W: Write>(o: &mut Writer<W>, bytes: &[u8]) -> io::Result<Option<PictureObject>> {
     if let Some((w, h, comps)) = jpeg_info(bytes) {
         let n = o.reserve();
-        let mut d = head(w, h, if comps == 1 { "DeviceGray" } else { "DeviceRGB" });
+        let mut d = image_head(w, h, if comps == 1 { "DeviceGray" } else { "DeviceRGB" });
         d.insert("Filter", name("DCTDecode"));
         o.stream(n, d, bytes, false)?;
-        return Ok(Some(n));
+        return Ok(Some(PictureObject { object: n, source: [0.0, 0.0, 1.0, 1.0] }));
     }
     let Some((w, h, rgba)) = decode(bytes) else { return Ok(None) };
-    let count = (w as usize) * (h as usize);
-    if rgba.len() < count * 4 || count == 0 {
+    write_pixels(o, w, h, &rgba, [0, 0, w, h])
+}
+
+/// Pixel edges enclosing the requested interval, clamped to the source.
+fn crop_span(size: u32, start: i32, end: i32) -> (u32, u32) {
+    let size = i64::from(size);
+    let scale = 100_000i64;
+    let first = i64::from(start).clamp(0, scale) * size / scale;
+    let last = ((scale - i64::from(end).clamp(0, scale)) * size + scale - 1) / scale;
+    (first as u32, last.max(first) as u32)
+}
+
+fn image_head(w: u32, h: u32, cs: &str) -> Dict {
+    dict([("Type", name("XObject")), ("Subtype", name("Image")), ("Width", int(w as i64)),
+        ("Height", int(h as i64)), ("ColorSpace", name(cs)), ("BitsPerComponent", int(8))])
+}
+
+fn write_pixels<W: Write>(o: &mut Writer<W>, source_w: u32, source_h: u32, rgba: &[u8], region: [u32; 4]) -> io::Result<Option<PictureObject>> {
+    let [x, y, w, h] = region;
+    let stride = source_w as usize * 4;
+    if w == 0 || h == 0 || rgba.len() / stride < source_h as usize {
         return Ok(None);
     }
+    let count = w as usize * h as usize;
     let mut rgb = Vec::with_capacity(count * 3);
     let mut alpha = Vec::with_capacity(count);
-    for p in rgba.chunks_exact(4).take(count) {
-        rgb.extend_from_slice(&p[..3]);
-        alpha.push(p[3]);
+    let start = x as usize * 4;
+    let end = start + w as usize * 4;
+    for row in rgba.chunks_exact(stride).skip(y as usize).take(h as usize) {
+        for p in row[start..end].chunks_exact(4) {
+            rgb.extend_from_slice(&p[..3]);
+            alpha.push(p[3]);
+        }
     }
-    let mut d = head(w, h, "DeviceRGB");
+    let mut d = image_head(w, h, "DeviceRGB");
     if alpha.iter().any(|&a| a != 255) {
         let m = o.reserve();
-        o.stream(m, head(w, h, "DeviceGray"), &alpha, true)?;
+        o.stream(m, image_head(w, h, "DeviceGray"), &alpha, true)?;
         d.insert("SMask", reference(m));
     }
     let n = o.reserve();
     o.stream(n, d, &rgb, true)?;
-    Ok(Some(n))
+    let source = [
+        f64::from(x) / f64::from(source_w), f64::from(y) / f64::from(source_h),
+        f64::from(w) / f64::from(source_w), f64::from(h) / f64::from(source_h),
+    ];
+    Ok(Some(PictureObject { object: n, source }))
+}
+
+
+#[cfg(test)]
+mod picture_tests {
+    use super::crop_span;
+
+    #[test]
+    fn crop_retains_only_pixels_intersecting_the_requested_span() {
+        assert_eq!(crop_span(64, 25_000, 25_000), (16, 48));
+        assert_eq!(crop_span(7, 25_000, 25_000), (1, 6));
+        assert_eq!(crop_span(64, -25_000, 50_000), (0, 32));
+        assert_eq!(crop_span(64, 110_000, -25_000), (64, 64));
+    }
 }

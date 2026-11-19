@@ -32,9 +32,20 @@ pub(super) fn paint<W: Write>(
             DrawingContent::Picture { bytes, crop, .. } => {
                 let [l, t, r, b] = crop.map(i64::from);
                 let (visible_w, visible_h) = (100_000 - l - r, 100_000 - t - b);
-                if visible_w > 0 && visible_h > 0 {
-                    let name = pdf.picture(page, id as u64, || Some(bytes.to_vec()))?
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Could not decode a picture in the print area"))?;
+                if visible_w > 0 && visible_h > 0 && [l, t, r, b].into_iter().all(|side| side < 100_000) {
+                    // Crop embedded pixels before rotating. A PDF clip alone
+                    // can admit an adjacent source pixel at a rasterized edge.
+                    let (name, source) = if crop.iter().any(|&side| side > 0) {
+                        let Some(picture) = pdf.cropped_picture(page, id as u64, bytes, *crop)? else {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "Could not decode a picture crop in the print area"));
+                        };
+                        picture
+                    } else {
+                        let name = pdf.picture(page, id as u64, || Some(bytes.to_vec()))?
+                            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Could not decode a picture in the print area"))?;
+                        (name, [0.0, 0.0, 1.0, 1.0])
+                    };
+                    let [source_x, source_y, source_w, source_h] = source.map(|v| v * 100_000.0);
                     let (sin, cos) = drawing.rotation();
                     let (sx, sy) = (w / visible_w as f64, h / visible_h as f64);
                     // Local picture coordinates point down. Rotate about the center
@@ -45,8 +56,8 @@ pub(super) fn paint<W: Write>(
                             cx - cos * w / 2.0 + sin * h / 2.0,
                             cy + sin * w / 2.0 + cos * h / 2.0]),
                         Op::Rect(0.0, 0.0, w, h), Op::Clip, Op::EndPath,
-                        Op::Transform([100_000.0 * sx, 0.0, 0.0, -100_000.0 * sy,
-                            -(l as f64) * sx, (100_000 - t) as f64 * sy]),
+                        Op::Transform([source_w * sx, 0.0, 0.0, -source_h * sy,
+                            (source_x - l as f64) * sx, (source_y + source_h - t as f64) * sy]),
                         Op::XObject(name),
                     ]);
                 }

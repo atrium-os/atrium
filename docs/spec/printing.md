@@ -789,7 +789,8 @@ Sheets honors a saved XLSX print area consisting of one absolute cell or rectang
 Without a saved area it prints the used range, including anchored charts and embedded
 PNG and JPEG pictures imported from XLSX. Charts use the on-screen layout with paper
 colors and PDF text and vectors. Pictures use the XLSX source crop and rotate clockwise
-about the center of their anchor. The rotated bounds determine placement across pages
+about the center of their anchor. The PDF embeds only source pixels that intersect
+the crop and clips fractional pixel edges at the picture frame. The rotated bounds determine placement across pages
 and the used range when there is no saved print area. Drawings are clipped at the print area and
 page boundaries. Frozen titles repeat within the printed bounds, while drawings appear
 only at their original sheet positions. Mail prints message text;
