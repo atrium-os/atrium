@@ -2,7 +2,10 @@
 
 Status: **proposed 2026-11-19**, for Shankar's decisions in §9. Shankar asked for site
 scripts to run live in the jailed environment (2026-11-19) and chose to plan first, then
-build. This spec turns the settled design into build steps. It decides nothing that
+build. Sign-in is the second case that needs it (Shankar, same day): single sign-on pages
+(Okta, Entra ID) and WebAuthn with fingerprints and security keys run scripts, so the VPN's
+SSO sign-in (vpn.md §9.3 and §14 V4, "sign-ins that need scripts wait") and Mail's Microsoft account
+wait on this engine. This spec turns the settled design into build steps. It decides nothing that
 [atrium-navigator-legacy-web.md](atrium-navigator-legacy-web.md) §8.1 and §11 already
 settled, and only names what those sections left open.
 
@@ -111,6 +114,37 @@ island's fetcher and their bytes are appended to the native player. The player d
 presents and draws its controls in its own jail. Any media backend Servo brings with it is
 left out of the build (its usual one is GStreamer, which is LGPL).
 
+## 6a. Sign-in: SSO and WebAuthn
+
+An identity provider's page is a whole page of script: a redirect chain, a password step,
+push approval, then a passkey or a security key. Islands don't fit it, so sign-in runs the
+**whole page live** in the engine jail, in a **sign-in window**. The Navigator already has
+windows of this kind (the Wi-Fi sign-in window; the VPN's `vpn` persona window), each its
+own Navigator instance in a reserved persona. What changes is that its pages run in the
+engine rather than in the document lane:
+
+- **Fetching goes through Arca's couriers** in the window's own jar (vpn.md §9.3 and §14 V4: one
+  partition per sign-in, `vpn-<profile>.<site>`), never a throwaway Nuntius jar. The jar
+  is what keeps the person signed in next time. Cookies stay in the courier, and the
+  engine never sees `Set-Cookie`. Declared token fields (the VPN gateway's
+  `acSamlv2Token`) go to Arca and never reach the page.
+- **WebAuthn**: the engine's `navigator.credentials.create` and `get` cross the typed
+  channel to navigatord as requests, never as results. navigatord is the WebAuthn client
+  (sigillum.md §9.1). It knows the origin from the courier's TLS endpoint, not from the
+  engine. It checks the RP ID, builds `clientDataJSON` with `sigillum-webauthn` (built,
+  S3a) and asks `sigillumd`. Sigillum's sheet takes the press, the fingerprint or the
+  key's touch (`sigillum-ui`, passcodes never reach the Navigator). The engine gets back
+  the `PublicKeyCredential` that navigatord packaged. A compromised engine can ask for an
+  assertion for its own origin only, and only with the person's press on Sigillum's sheet.
+- **Passwords** are typed into Arca's secure field (arca.md), not the page's own field,
+  where Arca has an item for the site.
+- **The window ends** at the flow's final address (the VPN's assertion consumer service,
+  an OAuth redirect URI a native app registered) or after ten minutes, as the Wi-Fi
+  sign-in window does.
+- **Everyday browsing** keeps signing in through the document lane's forms where a site
+  allows it. A site whose sign-in needs script opens a sign-in window for it on the
+  person's press, rather than turning the persona's whole trail live.
+
 ## 7. Build steps
 
 Each step runs in the VM with a gate before the next, as the Navigator's other steps did.
@@ -135,13 +169,21 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
    private addresses nor the document. It ends with its page.
 3. **I2. Channel, label and lifecycle.** The typed channel, the tier chip's live part, Stop,
    and session recycling (a memory limit and an idle restart). Fuzz the channel.
-4. **I3. Video: the YouTube prototype** (legacy-web §8.1). `MediaSource` goes to the native
+4. **I3. Sign-in windows run live** (§6a), ahead of video because the VPN and Mail wait on
+   it. The engine serves a whole page in a sign-in window, fetching through Arca's couriers
+   in the window's jar. WebAuthn bridges to navigatord and Sigillum. Gates:
+   - A fixture identity provider whose sign-in needs script (a redirect chain, a scripted
+     password step, then WebAuthn `get` with the soft key through Sigillum's sheet)
+     completes. The gateway token lands in Arca, not the page.
+   - With the VPN thread: `VpnSignInWindow` against its SSO gateway in the VM.
+   - On the Mac VM: a real YubiKey, then a fingerprint where the hardware has one.
+5. **I4. Video: the YouTube prototype** (legacy-web §8.1). `MediaSource` goes to the native
    player. The document's chapter links seek through the channel. The gate is a real
    YouTube embed, which needs the open internet (see §8).
-5. **I4. Hardening and the zygote.** JIT-off verified in the binary, rctl limits, crash
+6. **I5. Hardening and the zygote.** JIT-off verified in the binary, rctl limits, crash
    handling (an island that dies leaves its box and a note), and fork-before-taint start-up.
    Then measure the time to first frame.
-6. **I5. Whole-page live code** for fat clients, if §9 D5 says so.
+7. **I6. Whole-page live code** for fat clients in everyday browsing, if §9 D5 says so.
 
 ## 8. Costs and risks, stated
 
@@ -166,5 +208,6 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 | **D1** | Engine | **Servo + SpiderMonkey** (spec's pick, Rust embedding, MPL-2.0) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Servo**, as legacy-web §11.3 chose, with Ladybird as the measured fallback if I0 fails. Boa and our DOM have no layout or rendering, so they can't run a widget |
 | **D2** | MPL-2.0 for Servo and SpiderMonkey (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft, and toolkit-backends.md already accepted it for Servo. Nothing else links it |
 | **D3** | Where I0 builds | the shared Mac VM · a larger cloud build environment | **The shared Mac VM**, booked through the coordinator. It's arm64 at native speed with room for the build |
-| **D4** | First island | a non-video widget (counter fixture, then a corpus chart or map) · the YouTube embed straight away | **A widget first**, so the jail, fetcher, drawing and input are proven before `MediaSource`, the biggest unknown |
-| **D5** | Whole pages live (fat clients) | later, as I5, offered per page on the person's press · never | **Later, on a press.** Islands come first because they keep everything else on the page in the document lane |
+| **D4** | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
+| **D5** | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
+| **D6** | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
