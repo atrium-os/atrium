@@ -63,17 +63,30 @@ fn with_backend<R>(f: impl FnOnce(&mut dyn Backend) -> R) -> R {
     })
 }
 
+/// Maximum bytes Tabula takes in one clipboard format.
+pub const MAX_FORMAT_BYTES: usize = tabula::store::MAX_FORMAT_BYTES;
+
+/// Publish a single clipboard item with alternative MIME representations.
+pub fn copy_formats(formats: &[(&str, &[u8])], sensitive: bool) -> Result<(), Error> {
+    let token = current_activation().ok_or(Error::NoGesture)?;
+    with_backend(|b| b.set(token, formats, sensitive))
+}
+
+/// Read the first offered MIME type in `accept`, spending one paste gesture.
+pub fn paste_format(accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+    let token = current_activation().ok_or(Error::NoGesture)?;
+    with_backend(|b| b.get(token, accept))
+}
+
 /// Copy `text` (as `text/plain`). `sensitive`: a secret, kept 60 s.
 pub fn copy_text(text: &str, sensitive: bool) -> Result<(), Error> {
-    let token = current_activation().ok_or(Error::NoGesture)?;
-    with_backend(|b| b.set(token, &[("text/plain", text.as_bytes())], sensitive))
+    copy_formats(&[("text/plain", text.as_bytes())], sensitive)
 }
 
 /// Paste as text, if the clipboard has `text/plain`. Invalid UTF-8 is
 /// replaced, never trusted.
 pub fn paste_text() -> Result<Option<String>, Error> {
-    let token = current_activation().ok_or(Error::NoGesture)?;
-    Ok(with_backend(|b| b.get(token, &["text/plain"]))?.map(|(_, b)| String::from_utf8_lossy(&b).into_owned()))
+    Ok(paste_format(&["text/plain"])?.map(|(_, bytes)| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// Inside a drop handler: the dropped content as text, if it offers

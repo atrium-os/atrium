@@ -481,6 +481,17 @@ pub fn recover_with(dir: &Path, password: Option<&str>) -> io::Result<(Doc, Reco
     Ok((doc, Recovered { actions, torn_bytes: torn }))
 }
 
+pub struct ClipboardCopy {
+    pub clip: officina_grid::clip::Clip,
+    identity: ClipboardIdentity,
+}
+
+enum ClipboardIdentity {
+    Text(String),
+    System { offer: Vec<u8>, edits: u64 },
+    PlainOnly,
+}
+
 /// One open spreadsheet.
 pub struct Doc {
     pub wb: Workbook,
@@ -510,10 +521,8 @@ pub struct Doc {
     /// ([`Workbook::memory_bytes`]): a change that would take it past is undone
     /// and the user told. [`MAKE_LIMIT`], so a workbook made here opens anywhere.
     pub memory_budget: u64,
-    /// The cells last copied or cut here, with the text that went on the
-    /// clipboard: while the clipboard still holds that text, a paste brings
-    /// formulas and styles too (a cut moves them).
-    pub clip: Option<(officina_grid::clip::Clip, String)>,
+    /// The most recent local copy, including formulas and one-shot cut state.
+    pub clip: Option<ClipboardCopy>,
     /// While a column or row edge is dragged: the sheet, rows or columns,
     /// and their sizes before, to make one undo step when it is let go.
     pub sizing: Option<(u16, bool, Vec<(u32, f64)>)>,
@@ -942,8 +951,41 @@ impl Doc {
     /// Keeps `rect` of this sheet as the clip, with `text` (what went on
     /// the clipboard).
     pub fn take_clip(&mut self, rect: Rect, cut: bool, text: String) {
-        self.clip = Some((officina_grid::clip::Clip::take(&self.wb, Rect { sheet: self.sheet, ..rect }, cut), text));
+        self.clip = Some(ClipboardCopy {
+            clip: officina_grid::clip::Clip::take(&self.wb, Rect { sheet: self.sheet, ..rect }, cut),
+            identity: ClipboardIdentity::Text(text),
+        });
         self.status = if cut { "Cut: paste to move it.".into() } else { String::new() };
+    }
+
+    pub(crate) fn keep_system_clip(&mut self, clip: officina_grid::clip::Clip, offer: Option<Vec<u8>>) {
+        self.status = match (clip.cut, offer.is_some()) {
+            (true, _) => "Cut: paste to move it.".into(),
+            (false, true) => String::new(),
+            (false, false) => "Copied as text. Formatting exceeds the clipboard size limit.".into(),
+        };
+        let identity = offer.map_or(ClipboardIdentity::PlainOnly, |offer| ClipboardIdentity::System { offer, edits: self.edits });
+        self.clip = Some(ClipboardCopy { clip, identity });
+    }
+
+    pub(crate) fn paste_system(&mut self, area: Rect, bytes: &[u8], limit: usize) {
+        let area = Rect { sheet: self.sheet, ..area };
+        if self.clip.as_ref().is_some_and(|copy| {
+            matches!(&copy.identity, ClipboardIdentity::System { offer, edits }
+                if offer == bytes && (!copy.clip.cut || *edits == self.edits))
+        }) {
+            self.paste_local_clip(area);
+            return;
+        }
+        let clip = match officina_grid::clip::Clip::decode_system(bytes, limit) {
+            Ok(clip) => clip,
+            Err(_) => {
+                self.status = "The clipboard cell data is invalid.".into();
+                return;
+            }
+        };
+        let result = clip.paste_into(&self.wb, area);
+        self.finish_clip_paste(result, false);
     }
 
     /// Pastes clipboard text `text` at (`row`, `col`): the clip if the text
@@ -959,14 +1001,22 @@ impl Doc {
         let area = Rect { sheet: self.sheet, ..area };
         let (row, col) = (area.r0, area.c0);
         let norm = |t: &str| t.replace("\r\n", "\n").trim_end_matches('\n').to_string();
-        let ours = self.clip.as_ref().is_some_and(|(_, t)| norm(t) == norm(text));
+        let ours = self.clip.as_ref().is_some_and(|copy| matches!(&copy.identity, ClipboardIdentity::Text(t) if norm(t) == norm(text)));
         if !ours {
             return self.paste_tsv(row, col, text).then_some(Rect { sheet: self.sheet, r0: row, c0: col, r1: row, c1: col });
         }
-        let (clip, _) = self.clip.as_ref()?;
-        match clip.paste_into(&self.wb, area) {
+        self.paste_local_clip(area)
+    }
+
+    fn paste_local_clip(&mut self, area: Rect) -> Option<Rect> {
+        let clip = &self.clip.as_ref()?.clip;
+        let (result, cut) = (clip.paste_into(&self.wb, area), clip.cut);
+        self.finish_clip_paste(result, cut)
+    }
+
+    fn finish_clip_paste(&mut self, result: Result<(Vec<GridOp>, Rect), String>, cut: bool) -> Option<Rect> {
+        match result {
             Ok((ops, to)) => {
-                let cut = clip.cut;
                 self.status.clear();
                 self.run(if cut { "Move" } else { "Paste" }, ops);
                 if cut {
@@ -1015,17 +1065,25 @@ impl Doc {
     pub fn copy_tsv(&self, r0: u32, c0: u32, r1: u32, c1: u32) -> String {
         let (er, ec) = self.wb.extent(self.sheet);
         let (r1, c1) = (r1.min(er.saturating_sub(1)).max(r0), c1.min(ec.saturating_sub(1)).max(c0));
-        let mut s = String::new();
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                if c > c0 {
-                    s.push('\t');
+        self.copy_tsv_bounded(Rect { sheet: self.sheet, r0, c0, r1, c1 }, usize::MAX).unwrap()
+    }
+
+    pub(crate) fn copy_tsv_bounded(&self, rect: Rect, limit: usize) -> Option<String> {
+        let mut text = String::new();
+        for r in rect.r0..=rect.r1 {
+            for c in rect.c0..=rect.c1 {
+                if c > rect.c0 {
+                    text.push('\t');
                 }
-                s.push_str(&self.wb.value(self.sheet, r, c).display().replace(['\t', '\n', '\r'], " "));
+                let value = self.wb.value(rect.sheet, r, c).display();
+                if text.len().saturating_add(value.len()) >= limit {
+                    return None;
+                }
+                text.push_str(&value.replace(['\t', '\n', '\r'], " "));
             }
-            s.push('\n');
+            text.push('\n');
         }
-        s
+        Some(text)
     }
 
     pub fn undo(&mut self) -> bool {

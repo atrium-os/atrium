@@ -311,7 +311,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
     let plural = |n: u32, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
     let circling = d.circling;
-    let special = d.clip.as_ref().is_some_and(|(c, _)| !c.cut);
+    let special = d.clip.as_ref().is_some_and(|c| !c.clip.cut);
     let mut v = vec![
         (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()), Some(DataCmd::FillCopy)),
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
@@ -452,10 +452,10 @@ pub fn pivot_for(wb: &Workbook, t: &Target, name: &str) -> Option<officina_grid:
 /// Paste the cells last copied here at the selection's top left, as `sp`
 /// says, as one undo step named `label`.
 pub fn paste_with(d: &mut Doc, sel: CellRange, sp: officina_grid::clip::Special, label: &str) -> Result<String, String> {
-    let Some((clip, _)) = d.clip.as_ref() else {
+    let Some(copy) = d.clip.as_ref() else {
         return Err("Copy some cells first.".into());
     };
-    let (ops, _) = clip.paste_special(&d.wb, d.sheet, sel.r0, sel.c0, sp)?;
+    let (ops, _) = copy.clip.paste_special(&d.wb, d.sheet, sel.r0, sel.c0, sp)?;
     d.run(label, ops);
     Ok(format!("{label}: done."))
 }

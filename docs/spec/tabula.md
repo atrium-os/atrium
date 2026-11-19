@@ -513,6 +513,9 @@ is sent), over a `Backend` that is Tabula's socket in production (`TABULA_SOCKET
 `/atrium/sockets/clipboard.sock`). `TextField`: Ctrl/Cmd chords are commands and are never typed
 (they used to append the letter); Ctrl-C/X copy or cut the whole field (no selection yet); Ctrl-V
 appends `text/plain` with control characters dropped; a `secret` field never copies or cuts.
+`copy_formats` publishes alternative MIME representations in one SET. `paste_format` submits an
+ordered list of accepted types in one GET and Tabula returns the first available type. Fresco
+supplies and checks the gesture token. Tabula negotiates the MIME type and serves its bytes.
 Tested in `text_field.rs` and against the real server code in `pergola/tests/clipboard_tabula.rs`.
 `Window` passes the `activation` of fresco-client's key and button presses (04c295d) and of
 `Event::Drop`. Drops: fresco-client's `Drop` becomes `pergola::Event::Drop { at }`; the App

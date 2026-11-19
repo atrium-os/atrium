@@ -6,6 +6,9 @@
 //! same step, and references to the moved cells (from anywhere, the moved
 //! formulas too) follow them, while references to cells left behind stay.
 
+mod system;
+pub use system::MAX_SYSTEM_COPY_CELLS;
+
 use std::sync::Arc;
 
 use crate::addr::{CellAddr, Rect, MAX_COLS, MAX_ROWS};
@@ -23,7 +26,7 @@ enum Content {
     Expr(Arc<Expr>, Value),
     /// Cut: its references follow what moves with it (and stay on what
     /// doesn't), written for the cell's place in the cut area.
-    Moved(Arc<Expr>),
+    Moved(Arc<Expr>, Value),
 }
 
 /// The most copies one paste into a bigger area makes.
@@ -92,7 +95,12 @@ impl Clip {
     /// whole column costs what it holds.
     pub fn take(wb: &Workbook, rect: Rect, cut: bool) -> Clip {
         let (er, ec) = wb.extent(rect.sheet);
-        let used = Rect { r1: rect.r1.min(er.saturating_sub(1)).max(rect.r0), c1: rect.c1.min(ec.saturating_sub(1)).max(rect.c0), ..rect };
+        let mut used = Rect { r1: rect.r1.min(er.saturating_sub(1)).max(rect.r0), c1: rect.c1.min(ec.saturating_sub(1)).max(rect.c0), ..rect };
+        let formats = wb.style_snapshot(&rect);
+        for (col, _, last, _) in &formats.spans {
+            used.c1 = used.c1.max(*col);
+            used.r1 = used.r1.max(*last);
+        }
         let snap = wb.snapshot(&used);
         let mut cells = Vec::new();
         for (r, c, v) in snap.values {
@@ -102,13 +110,13 @@ impl Clip {
             for r in f.r0..=f.r1 {
                 let content = match (cut, wb.group_at(rect.sheet, r, f.col)) {
                     (false, Some(g)) => Content::Expr(wb.group(g).expr.clone(), wb.value(rect.sheet, r, f.col)),
-                    (true, Some(g)) => Content::Moved(wb.group(g).expr.clone()),
+                    (true, Some(g)) => Content::Moved(wb.group(g).expr.clone(), wb.value(rect.sheet, r, f.col)),
                     _ => continue,
                 };
                 cells.push((r - rect.r0, f.col - rect.c0, content));
             }
         }
-        let styles = wb.style_snapshot(&used).spans.into_iter().map(|(c, a, b, st)| (c - rect.c0, a - rect.r0, b - rect.r0, st)).collect();
+        let styles = formats.spans.into_iter().map(|(c, a, b, st)| (c - rect.c0, a - rect.r0, b - rect.r0, st)).collect();
         let inside = |&(r, c): &(u32, u32)| used.contains(CellAddr::new(rect.sheet, r, c));
         let notes = wb.comments(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), k)| (r - rect.r0, c - rect.c0, k.clone())).collect();
         let links = wb.links(rect.sheet).iter().filter(|(k, _)| inside(k)).map(|(&(r, c), l)| (r - rect.r0, c - rect.c0, l.clone())).collect();
@@ -205,7 +213,7 @@ impl Clip {
                     exprs.push((r, c, Arc::new(e)));
                 }
                 Content::Expr(e, _) => exprs.push((r, c, e.clone())),
-                Content::Moved(e) => {
+                Content::Moved(e, _) => {
                     let m = self.mover(sheet, row, col);
                     let e = m.expr(e, self.from.r0 + dr, self.from.c0 + dc, self.from.sheet, r, c, sheet);
                     fills.push(Fill { col: c, r0: r, r1: r, src: crate::formula::to_a1(&e, r, c, &|id| wb.sheet_name(id)) });

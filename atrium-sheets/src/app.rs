@@ -15,7 +15,7 @@ use pergola::view::{Ctx, View};
 use pergola::widgets::grid_view::col_name;
 use pergola::text_edit::TextEdit;
 use pergola::widgets::{Button, CellRange, GridAction, GridState, GridView, MenuButton, MenuState, ScrollState, TextField};
-use pergola::{clipboard, Color, Mutable, TextStyle};
+use pergola::{Color, Mutable, TextStyle};
 
 use crate::doc::Doc;
 use officina_grid::charts::{ChartKind, ChartText, Grouping, LegendPos};
@@ -1445,19 +1445,13 @@ impl Sheets {
             }
             GridAction::Copy(r) | GridAction::Cut(r) => {
                 let cut = matches!(a, GridAction::Cut(_));
-                if let Some(text) = copy(&mut d, r) {
-                    let rect = officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
-                    d.take_clip(rect, cut, text);
-                }
+                let rect = officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
+                crate::clipboard::copy(&mut d, rect, cut);
             }
-            GridAction::Paste { row, col, sel } => match clipboard::paste_text() {
-                Ok(Some(t)) => {
-                    let area = officina_grid::addr::Rect { sheet: d.sheet, r0: row, c0: col, r1: sel.r1.max(row), c1: sel.c1.max(col) };
-                    d.paste_in(area, &t);
-                }
-                Ok(None) => d.status = "The clipboard holds no text.".into(),
-                Err(e) => d.status = format!("Couldn't paste: {e:?}"),
-            },
+            GridAction::Paste { row, col, sel } => {
+                let area = officina_grid::addr::Rect { sheet: d.sheet, r0: row, c0: col, r1: sel.r1.max(row), c1: sel.c1.max(col) };
+                crate::clipboard::paste(&mut d, area);
+            }
         }
         drop(d);
         // Rows nobody sized grow to fit wrapped or broken lines typed into
@@ -1515,22 +1509,10 @@ pub fn sized_span(sel: &CellRange, rows: bool, i: u32, src: &dyn pergola::widget
     }
 }
 
-/// The most cells one copy puts on the clipboard (as text, about 30 MB).
-pub const MAX_COPY_CELLS: u64 = 2_000_000;
+pub use officina_grid::clip::MAX_SYSTEM_COPY_CELLS as MAX_COPY_CELLS;
 
 fn cells(r: CellRange) -> u64 {
     (r.r1 - r.r0) as u64 * (r.c1 - r.c0 + 1) as u64 + (r.c1 - r.c0 + 1) as u64
-}
-
-fn copy(d: &mut Doc, r: CellRange) -> Option<String> {
-    let text = d.copy_tsv(r.r0, r.c0, r.r1, r.c1);
-    match clipboard::copy_text(&text, false) {
-        Ok(()) => Some(text),
-        Err(e) => {
-            d.status = format!("Couldn't copy: {e:?}");
-            None
-        }
-    }
 }
 
 /// "B12", or "B2:D9" for a range.
@@ -3523,6 +3505,142 @@ mod tests {
         assert_ne!(styled.runs(), changed.runs());
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(saved(), changed);
+    }
+
+    #[test]
+    fn system_clipboard_round_trips_formats_between_workbooks() {
+        use officina_grid::style::{HAlign, Style};
+        use officina_grid::{CellAddr, Rect as Cells, Value};
+        use pergola::clipboard::{self, Backend, Error, Token};
+        use pergola::event::{Event, Key, KeyEventKind, Modifiers};
+
+        type Offers = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
+        struct Clipboard(Offers);
+        impl Backend for Clipboard {
+            fn set(&mut self, _: Token, formats: &[(&str, &[u8])], sensitive: bool) -> Result<(), Error> {
+                assert!(!sensitive);
+                *self.0.borrow_mut() = formats.iter().map(|(mime, data)| (mime.to_string(), data.to_vec())).collect();
+                Ok(())
+            }
+
+            fn get(&mut self, _: Token, accept: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+                Ok(accept.iter().find_map(|mime| self.0.borrow().iter().find(|(offered, _)| offered == mime).cloned()))
+            }
+
+            fn drop_get(&mut self, _: Token, _: &[&str]) -> Result<Option<(String, Vec<u8>)>, Error> {
+                unreachable!()
+            }
+        }
+
+        let offers: Offers = Rc::new(RefCell::new(Vec::new()));
+        clipboard::set_backend(Box::new(Clipboard(offers.clone())));
+        let new = |doc| {
+            let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+                Mutable::new(Ui::default()), Mutable::with_dirty(0, dirty.clone()), (1200.0, 800.0));
+            let mut app = pergola::app::App::new_with_flag(sheets.clone(), dirty);
+            app.tick();
+            let at = pergola::geom::Point::new(100.0, TOOLBAR_H + FORMULA_H + 34.0);
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            assert!(app.focused().is_some());
+            (sheets, app)
+        };
+        let chord = |app: &mut pergola::app::App<Sheets>, key: &str, token| {
+            app.handle_event_activated(Event::Key { kind: KeyEventKind::Down, key: Key::Char, chars: key.into(),
+                modifiers: Modifiers { ctrl: true, ..Default::default() } }, token);
+        };
+        let rect = |r, c| Cells { sheet: 0, r0: r, c0: c, r1: r, c1: c };
+        let cell = |r, c| CellAddr::new(0, r, c);
+
+        let mut source = Doc::new("source");
+        assert!(source.type_into(0, 0, "=5/4"));
+        source.wb.set_value(cell(0, 1), Value::str("=literal\ntext"));
+        let mut number = Style::default().with_num_fmt("0.00%");
+        number.font.bold = true;
+        number.fill = Some(0xAAF2CC);
+        number.h_align = HAlign::Right;
+        let blank = Style { wrap: true, fill: Some(0xDD77EE), ..Default::default() };
+        source.wb.set_style(&rect(0, 0), number.clone());
+        source.wb.set_style(&rect(0, 2), blank.clone());
+        let (source, mut first) = new(source);
+        let mut grid = source.grid.get_cloned();
+        grid.anchor = (0, 0);
+        grid.cursor = (0, 2);
+        source.grid.set(grid);
+        chord(&mut first, "c", None);
+        assert!(offers.borrow().is_empty());
+        chord(&mut first, "c", Some([1; 16]));
+        let original_offer = offers.borrow().clone();
+        assert_eq!(original_offer.len(), 2);
+        assert_eq!(original_offer[0], ("text/plain".into(), b"1.25\t=literal text\t\n".to_vec()));
+
+        let mut target = Doc::new("target");
+        let before = Style { fill: Some(0x101010), ..Default::default() };
+        target.wb.set_value(cell(2, 1), Value::Bool(true));
+        target.wb.set_style(&rect(2, 1), before.clone());
+        let (target, mut second) = new(target);
+        let mut grid = target.grid.get_cloned();
+        grid.select(2, 1);
+        target.grid.set(grid);
+        chord(&mut second, "v", Some([2; 16]));
+        {
+            let doc = target.doc.borrow();
+            assert_eq!(doc.wb.value(0, 2, 1), Value::Num(1.25));
+            assert!(doc.wb.formula_text(cell(2, 1)).is_none());
+            assert_eq!(doc.wb.value(0, 2, 2), Value::str("=literal\ntext"));
+            assert_eq!(doc.wb.style(cell(2, 1)), &number);
+            assert_eq!(doc.wb.value(0, 2, 3), Value::Empty);
+            assert_eq!(doc.wb.style(cell(2, 3)), &blank);
+        }
+        assert!(target.doc.borrow_mut().undo());
+        assert_eq!(target.doc.borrow().wb.value(0, 2, 1), Value::Bool(true));
+        assert_eq!(target.doc.borrow().wb.style(cell(2, 1)), &before);
+        assert_eq!(target.doc.borrow().wb.style(cell(2, 3)), &Style::default());
+
+        // A malformed rich offer leaves the destination alone.
+        let mut bad = original_offer.clone();
+        bad[1].1.pop();
+        *offers.borrow_mut() = bad;
+        chord(&mut second, "v", Some([3; 16]));
+        assert_eq!(target.doc.borrow().status, "The clipboard cell data is invalid.");
+        assert_eq!(target.doc.borrow().wb.value(0, 2, 1), Value::Bool(true));
+
+        // The exact local copy still pastes the original formula.
+        *offers.borrow_mut() = original_offer;
+        let mut grid = source.grid.get_cloned();
+        grid.select(1, 0);
+        source.grid.set(grid);
+        chord(&mut first, "v", Some([4; 16]));
+        assert_eq!(source.doc.borrow().wb.formula_text(cell(1, 0)).as_deref(), Some("=5/4"));
+
+        // Identical plain text copied by another app does not replay a cut.
+        let mut grid = source.grid.get_cloned();
+        grid.select(0, 0);
+        source.grid.set(grid);
+        chord(&mut first, "x", Some([5; 16]));
+        let cut = offers.borrow().clone();
+        offers.borrow_mut().truncate(1);
+        let mut grid = source.grid.get_cloned();
+        grid.select(3, 0);
+        source.grid.set(grid);
+        chord(&mut first, "v", Some([6; 16]));
+        assert_eq!(source.doc.borrow().wb.value(0, 0, 0), Value::Num(1.25));
+        assert_eq!(source.doc.borrow().wb.value(0, 3, 0), Value::Num(1.25));
+
+        // A fresh local cut can still move the original cells, once.
+        let mut grid = source.grid.get_cloned();
+        grid.select(0, 0);
+        source.grid.set(grid);
+        chord(&mut first, "x", Some([7; 16]));
+        assert_ne!(*offers.borrow(), cut);
+        let mut grid = source.grid.get_cloned();
+        grid.select(4, 0);
+        source.grid.set(grid);
+        chord(&mut first, "v", Some([8; 16]));
+        assert_eq!(source.doc.borrow().wb.value(0, 0, 0), Value::Empty);
+        assert_eq!(source.doc.borrow().wb.formula_text(cell(4, 0)).as_deref(), Some("=5/4"));
+        assert!(source.doc.borrow().clip.is_none());
     }
 
     #[test]
