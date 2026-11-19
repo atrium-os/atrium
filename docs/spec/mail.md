@@ -1728,8 +1728,8 @@ Stalwart in the cloud VM, and later a real account):
    it `$Junk`, removing `$NotJunk`; read in Junk, the same key ("Not junk") moves it to
    the inbox and marks it `$NotJunk`, removing `$Junk`. Both wait out the undo window like
    Archive ("Message moved to Junk", z undoes). On IMAP the keyword change goes before the
-   move in the same pass; on JMAP both are one `Email/set` patch. Gmail, Fastmail, Dovecot
-   with its antispam plugins and Stalwart learn from these. An account without a Junk
+   move in the same pass; on JMAP both are one `Email/set` patch. Servers whose filters
+   read these keywords, or learn from moves into Junk, are taught either way. An account without a Junk
    folder says so. The store now keeps `$Junk`/`$NotJunk` as flag bits (64, 128) as it
    keeps `$Snoozed`. Mail still runs no spam classifier of its own. Tests: Dovecot 1 (to
    Junk with `$Junk` and back with `$NotJunk`, read back from the server; the test server
