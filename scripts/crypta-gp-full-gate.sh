@@ -38,7 +38,7 @@ if [ "$hip" = posture ]; then
 fi
 case "$hip" in
     tessera) tessera_fact='Mounted sealed Tessera volumes' ;;
-    tessera-domain|tessera-rebind|tessera-rebind-decline) tessera_fact='Tessera encrypted domains verified with active keys' ;;
+    tessera-domain|tessera-rebind|tessera-rebind-decline|tessera-reconnect) tessera_fact='Tessera encrypted domains verified with active keys' ;;
     *) tessera_fact= ;;
 esac
 if [ -n "$tessera_fact" ]; then
@@ -346,7 +346,8 @@ if [ -n "$tessera_fact" ]; then
         fi
         sleep 1
         if new_tessera_receipt; then fail "$change was uploaded without approval"; fi
-        if [ "${3:-}" = rebind ] && [ "$hip" = tessera-rebind-decline ]; then
+        if [ "${3:-}" = rebind ] && [ "$hip" != tessera-rebind ]; then
+            declined_choice=$(hip_choice)
             "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
             wait_field up 0
             [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
@@ -362,8 +363,30 @@ if [ -n "$tessera_fact" ]; then
                 fail "the declined profile retained its tunnel route"
             if new_tessera_receipt; then fail "$change was uploaded after decline"; fi
             ok "rebound tunnel stayed down and no changed HIP report arrived"
-            echo "$pass checks passed"
-            exit 0
+            if [ "$hip" = tessera-rebind-decline ]; then
+                echo "$pass checks passed"
+                exit 0
+            fi
+            "$V" "$CTL up name=gp-gate" >/dev/null
+            wait_tessera_review
+            [ "$(hip_choice)" != "$declined_choice" ] || fail "reconnect reused the declined HIP choice"
+            if stale_reply=$("$V" "$CTL answer name=gp-gate t0=$declined_choice" 2>&1); then
+                fail "reconnect accepted the declined HIP choice"
+            fi
+            [ "$stale_reply" = 'error why=bad-choice' ] || fail "unexpected rejection: $stale_reply"
+            sleep 1
+            [ "$(field handshake)" = 0 ] || fail "reconnect opened before HIP approval"
+            reconnect_iface=$(field iface)
+            [ -n "$reconnect_iface" ] || fail "reconnect has no tunnel interface"
+            "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $reconnect_iface$'; then exit 1; fi" ||
+                fail "reconnect installed its tunnel route before approval"
+            "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+                fail "IPv4 echo passed before reconnect approval"
+            [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = 1 ] ||
+                fail "reconnect came up before fresh approval"
+            if new_tessera_receipt; then fail "$change was uploaded before reconnect approval"; fi
+            ok "explicit reconnect waited for a new HIP approval"
+            touch "$receipts.approved"
         fi
         approve_hip
         for _ in $(seq 1 20); do
@@ -403,13 +426,20 @@ if [ -n "$tessera_fact" ]; then
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
             /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
-        if [ "$hip" = tessera-rebind ] || [ "$hip" = tessera-rebind-decline ]; then
+        if [ "$hip" != tessera-domain ]; then
             approve_tessera_change 0 "Tessera domain key lock" rebind
             wait_field handshake 1
         else
             approve_tessera_change 0 "Tessera domain key lock"
         fi
         probe "IPv4 echo after approved Tessera domain key lock"
+        if [ "$hip" = tessera-reconnect ]; then
+            "$V" "route -n get 10.77.0.1 | grep -Eq 'interface: $reconnect_iface$'" ||
+                fail "approved reconnect did not install its tunnel route"
+            "$V" "$CTL down name=gp-gate" >/dev/null
+            echo "$pass checks passed"
+            exit 0
+        fi
 
         receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
         "$V" 'G=/tmp/crypta-gate; set -e

@@ -69,10 +69,15 @@ def frames(stream, reader, calls):
         calls.append("echo")
 
 
+TESSERA_HIP = ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline", "tessera-reconnect")
+REFRESH_HIP = ("refresh", "posture", *TESSERA_HIP)
+
+
 class EspPeer:
-    def __init__(self, socket, drop):
+    def __init__(self, socket, drop, reconnect_approval=None):
         self.socket = socket
         self.drop = drop
+        self.reconnect_approval = reconnect_approval
         self.configs = []
         self.errors = []
         self.echo = []
@@ -120,6 +125,9 @@ class EspPeer:
                 assert hmac.compare_digest(wire[-12:], hmac.digest(akey, wire[:-12], hashlib.sha1)[:12])
                 replay[spi_in, seq] = True
                 self.received_spis.add(spi_in)
+                if self.reconnect_approval and pair in self.configs[1:]:
+                    assert len(self.configs) == 3 and pair == self.configs[2], "ESP used the declined association"
+                    assert self.reconnect_approval.exists(), "ESP opened before reconnect approval"
                 plain = self.cipher(ekey, wire[8:24], wire[24:-12], decrypt=True)
                 assert plain[-1] == 4
                 padding = plain[-2]
@@ -206,11 +214,13 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
                         needed = "yes" if hip else "no"
-                        interval = "<hip-report-interval>5</hip-report-interval>" if hip in ("refresh", "posture", "tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline") else ""
+                        interval = "<hip-report-interval>5</hip-report-interval>" if hip in REFRESH_HIP else ""
                         body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
                     elif path == "hipreport.esp":
-                        assert hip in ("approve", "refresh", "posture", "tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline"), "HIP submitted without approval"
+                        assert hip in ("approve", *REFRESH_HIP), "HIP submitted without approval"
                         assert fields["authcookie"] == [COOKIE]
+                        if hip == "tessera-reconnect" and calls.count("getconfig.esp") > 1:
+                            assert calls.count("getconfig.esp") == 3 and receipts.with_suffix(".approved").exists(), calls
                         report, = fields["report"]
                         doc = ET.fromstring(report)
                         assert doc.tag == "hip-report" and doc.attrib == {"name": "hip-report"}
@@ -220,7 +230,7 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("hip-report-version") == "4"
                         categories = doc.findall("./categories/entry")
                         assert [node.attrib for node in categories[:2]] == [{"name": "host-info"}, {"name": "firewall"}]
-                        if hip in ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline"):
+                        if hip in TESSERA_HIP:
                             disk = doc.find("./categories/entry[@name='disk-encryption']")
                             tessera = [entry for entry in disk.findall("entry")
                                        if entry.findtext("product") == "Atrium Tessera"]
@@ -264,11 +274,13 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 fact = forwarding
                                 if hip == "posture":
                                     fact = locked
-                                elif hip in ("tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline"):
+                                elif hip in TESSERA_HIP:
                                     fact = tessera_count
                                 print(f"{fact} {digest}", file=receipt)
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
+                        if hip == "tessera-reconnect" and calls.count("getconfig.esp") > 1:
+                            assert calls.count("getconfig.esp") == 3 and receipts.with_suffix(".approved").exists(), calls
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
                         return
@@ -376,7 +388,7 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
-    parser.add_argument("--hip", choices=["approve", "decline", "refresh", "posture", "tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline"], help="require a reviewed HIP report in the full gate")
+    parser.add_argument("--hip", choices=("approve", "decline", *REFRESH_HIP), help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
@@ -399,19 +411,20 @@ def main():
         pin = fingerprint.strip().split("=", 1)[1].replace(":", "")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
+        receipts = tmp / "hip-receipts" if args.hip in REFRESH_HIP else None
+        reconnect_approval = receipts.with_suffix(".approved") if args.hip == "tessera-reconnect" else None
         with ExitStack() as stack:
             esp = None
             if args.esp or args.drop_esp:
                 udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
                 udp.bind(("127.0.0.1", 4501))
                 udp.settimeout(300)
-                esp = EspPeer(udp, args.drop_esp)
+                esp = EspPeer(udp, args.drop_esp, reconnect_approval)
                 threading.Thread(target=esp.serve, daemon=True).start()
             listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            receipts = tmp / "hip-receipts" if args.hip in ("refresh", "posture", "tessera", "tessera-domain", "tessera-rebind", "tessera-rebind-decline") else None
             if receipts:
                 receipts.touch()
             thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts}, daemon=True)
@@ -465,6 +478,27 @@ def main():
             if args.hip == "decline":
                 assert calls == ["prelogin.esp", "login.esp", *exchange], calls
                 print("Declining HIP sent no report and opened no data tunnel")
+                return
+            if args.hip == "tessera-reconnect":
+                configs = [i for i, call in enumerate(calls) if call == "getconfig.esp"]
+                assert len(configs) == 3 and calls.count("login.esp") == 1, calls
+                assert calls[configs[1]:configs[2]] == exchange, calls
+                final_calls = calls[configs[2]:]
+                assert final_calls[:3] == [*exchange, "hipreport.esp"] and final_calls[-1] == "logout.esp", calls
+                counts = [line.split()[0] for line in receipts.read_text().splitlines()]
+                transitions = [count for i, count in enumerate(counts) if i == 0 or count != counts[i - 1]]
+                assert transitions == ["0", "1", "0"], counts
+                if esp:
+                    assert not esp.errors, esp.errors
+                    assert len(esp.configs) == 3, calls
+                    original, _, reconnected = (config[0][0] for config in esp.configs)
+                    assert esp.received_spis == {original, reconnected}, esp.received_spis
+                    assert esp.echo == [original, original, reconnected], esp.echo
+                    assert "ssl-tunnel-connect.sslvpn" not in calls, calls
+                else:
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == 2 and calls.count("echo") == 3, calls
+                    assert final_calls[3:5] == ["ssl-tunnel-connect.sslvpn", "echo"], calls
+                print("Fresh approval preceded the changed HIP report and traffic on the explicit reconnect")
                 return
             if args.hip == "tessera-rebind-decline":
                 assert calls.count("login.esp") == 1 and calls.count("getconfig.esp") == 2, calls

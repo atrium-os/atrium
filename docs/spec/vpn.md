@@ -829,6 +829,10 @@ another origin. An active portal-profile session stays in engine memory.
   that the peer sees neither a second TLS data connection nor any ESP
   packet on the newly offered association. The arm64 decline gate passed
   13/13 on TLS and 13/13 with `--esp`.
+  The `--hip tessera-reconnect` variant starts the profile again after
+  declining the rebound review. It rejects the declined approval choice,
+  verifies the route and changed report wait for the new approval, and
+  checks IPv4 echo on the newly opened TLS connection or ESP association.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
