@@ -72,6 +72,8 @@ pub enum GridOp {
     /// A sheet's row heights (`rows`) or column widths that differ from the
     /// default, swapped in whole: (index, size), sorted.
     Sizes { sheet: u16, rows: bool, over: Vec<(u32, f64)> },
+    /// A complete size axis, including its default and explicit overrides.
+    LayoutSizes { sheet: u16, rows: bool, default: f64, over: Vec<(u32, f64)> },
     /// A new empty sheet at the end, by this name (refused, changing nothing, if
     /// the name is taken or bad). Its inverse is [`GridOp::DropSheet`].
     AddSheet(String),
@@ -331,10 +333,15 @@ impl GridOp {
                 crate::merges::encode(&mut w, list);
                 return w.into_bytes();
             }
-            GridOp::Sizes { sheet, rows, over } => {
-                w.u8(10);
+            GridOp::Sizes { sheet, rows, over } | GridOp::LayoutSizes { sheet, rows, over, .. } => {
+                let default = match self {
+                    GridOp::LayoutSizes { default, .. } => Some(*default),
+                    _ => None,
+                };
+                w.u8(if default.is_some() { 24 } else { 10 });
                 w.u16(*sheet);
                 w.u8(u8::from(*rows));
+                if let Some(default) = default { w.f64(default); }
                 w.var(over.len() as u64);
                 for (i, v) in over {
                     w.var(*i as u64);
@@ -534,16 +541,25 @@ impl GridOp {
             }
             return Ok(GridOp::Merges { sheet, list });
         }
-        if kind == 10 {
+        if kind == 10 || kind == 24 {
             let sheet = r.u16()?;
-            let rows = r.u8()? != 0;
-            let n = r.count("sizes", MAX_ROWS as u64, 9)?;
+            let axis = r.u8()?;
+            let rows = axis != 0;
+            let default = if kind == 24 {
+                let value = r.f64()?;
+                if axis > 1 || !value.is_finite() || value <= 0.0 {
+                    return Err(WireError::Invalid("default size"));
+                }
+                Some(value)
+            } else { None };
+            let max = if default.is_some() && !rows { MAX_COLS } else { MAX_ROWS };
+            let n = r.count("sizes", max as u64, 9)?;
             let mut over = Vec::with_capacity(n);
             let mut last = None;
             for _ in 0..n {
                 let i = r.var()?;
                 let v = r.f64()?;
-                if i >= MAX_ROWS as u64 || last.is_some_and(|l| i <= l) || !v.is_finite() || v < 0.0 {
+                if i >= max as u64 || last.is_some_and(|l| i <= l) || !v.is_finite() || v < 0.0 {
                     return Err(WireError::Invalid("size"));
                 }
                 last = Some(i);
@@ -552,7 +568,10 @@ impl GridOp {
             if !r.is_empty() {
                 return Err(WireError::Invalid("trailing bytes"));
             }
-            return Ok(GridOp::Sizes { sheet, rows, over });
+            return Ok(match default {
+                Some(default) => GridOp::LayoutSizes { sheet, rows, default, over },
+                None => GridOp::Sizes { sheet, rows, over },
+            });
         }
         if kind == 4 {
             let f = crate::filter::FilterState::decode(&mut r)?;
@@ -729,6 +748,18 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::Merges { sheet, list: wb.set_merges(sheet, list) }
+            }
+            GridOp::LayoutSizes { sheet, rows, default, over } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                let sh = wb.sheet_mut(sheet);
+                let sizes = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
+                let old = GridOp::LayoutSizes {
+                    sheet, rows, default: sizes.default, over: sizes.overrides().to_vec(),
+                };
+                *sizes = crate::column::Sizes::from_parts(default, over);
+                old
             }
             GridOp::Sizes { sheet, rows, over } => {
                 if sheet as usize >= wb.sheet_count() {

@@ -3331,6 +3331,78 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_flags_takes_and_keeps_merges_and_sizes() {
+        use crate::review::ReviewCmd;
+        use officina_grid::{Rect as Cells, compare::Change, native};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Layout").unwrap();
+            wb.add_sheet("Data").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        let merge = |sheet, row, last_col| Cells { sheet, r0: row, r1: row, c0: 1, c1: last_col };
+        local.wb.set_merges(0, vec![merge(0, 2, 2), merge(0, 4, 2), merge(0, 6, 3)]);
+        incoming.wb.set_merges(1, vec![merge(1, 2, 3), merge(1, 8, 4)]);
+        incoming.wb.sheet_mut(1).row_sizes = officina_grid::column::Sizes::new(24.0);
+        incoming.wb.sheet_mut(1).col_sizes = officina_grid::column::Sizes::new(72.0);
+        for (r, h) in [(2, 32.0), (50, 34.0)] { local.wb.sheet_mut(0).row_sizes.set(r, h); }
+        for (r, h) in [(2, 36.0), (52, 38.0)] { incoming.wb.sheet_mut(1).row_sizes.set(r, h); }
+        for (c, w) in [(1, 96.0), (4, 0.0), (8, 112.0)] { local.wb.sheet_mut(0).col_sizes.set(c, w); }
+        for (c, w) in [(1, 99.0), (4, 0.0), (10, 134.0)] { incoming.wb.sheet_mut(1).col_sizes.set(c, w); }
+        local.wb.sheet_mut(0).hidden_widths = vec![(4, 96.0)];
+        incoming.wb.sheet_mut(1).hidden_widths = vec![(4, 180.0)];
+        let incoming = native::load(&native::save_to_vec(&incoming.wb)).unwrap();
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming);
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.changes.len(), 13);
+        assert!(pane.changes.iter().all(|c| matches!(c, Change::Merge(_) | Change::RowHeight(_) | Change::ColumnWidth(_))));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for label in ["Merge B3:D3 changed", "Merge B5:C5 removed", "Merge B9:E9 added",
+                      "Row 3 height: 32 → 36", "Column B width: 96 → 99"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
+        }
+        let choose = |label, cmd| {
+            let pane = sheets.review.get_cloned();
+            let at = {
+                let doc = sheets.doc.borrow();
+                pane.changes.iter().position(|c| c.describe(&doc.wb, &doc.wb) == label).unwrap()
+            };
+            sheets.review_cmd(ReviewCmd::Pick(at));
+            sheets.review_cmd(cmd);
+        };
+        choose("Merge B5:C5 removed", ReviewCmd::Keep);
+        choose("Default row height: 20 → 24", ReviewCmd::Keep);
+        choose("Row 3 height: 32 → 36", ReviewCmd::Keep);
+        choose("Column B width: 96 → 99", ReviewCmd::Keep);
+        choose("Merge B3:D3 changed", ReviewCmd::Take);
+        assert_eq!(sheets.doc.borrow().wb.merges(0)[0], merge(0, 2, 3));
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let doc = sheets.doc.borrow();
+            assert_eq!(doc.wb.merges(0), &[merge(0, 2, 3), merge(0, 4, 2), merge(0, 8, 4)]);
+            let sh = doc.wb.sheet(0);
+            assert_eq!(sh.row_sizes.default, 20.0);
+            assert_eq!(sh.col_sizes.default, 72.0);
+            assert_eq!(sh.row_sizes.overrides(), &[(2, 32.0), (52, 38.0)]);
+            assert_eq!(sh.col_sizes.overrides(), &[(1, 96.0), (4, 0.0), (10, 134.0)]);
+            assert_eq!(sh.hidden_widths, vec![(4, 180.0)]);
+        }
+        assert!(sheets.doc.borrow_mut().undo());
+        let doc = sheets.doc.borrow();
+        assert_eq!(doc.wb.merges(0), &[merge(0, 2, 3), merge(0, 4, 2), merge(0, 6, 3)]);
+        assert_eq!(doc.wb.sheet(0).col_sizes.default, 64.0);
+        assert_eq!(doc.wb.sheet(0).row_sizes.overrides(), &[(2, 32.0), (50, 34.0)]);
+        assert_eq!(doc.wb.sheet(0).col_sizes.overrides(), &[(1, 96.0), (4, 0.0), (8, 112.0)]);
+        assert_eq!(doc.wb.sheet(0).hidden_widths, vec![(4, 96.0)]);
+    }
+
+    #[test]
     fn workbook_review_flags_takes_and_keeps_threads_and_hyperlinks() {
         use crate::review::ReviewCmd;
         use officina_grid::comments::{Comment, CommentRun, CommentStyle, ThreadMention, ThreadMessage, ThreadPerson};

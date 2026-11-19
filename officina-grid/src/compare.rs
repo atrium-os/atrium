@@ -22,10 +22,12 @@ use crate::ops::{Fill, GridOp, Region};
 use crate::value::Value;
 
 mod annotations;
+mod layout;
 mod parts;
 mod rules;
 mod tables;
 pub use annotations::AnnotationChange;
+pub use layout::{MergeChange, SizeChange};
 pub use parts::{ChartChange, NameChange, PictureChange};
 pub use rules::RuleChange;
 pub use tables::{PivotChange, TableChange};
@@ -51,6 +53,9 @@ pub enum Change {
     Link(AnnotationChange<crate::links::Link>),
     Chart(ChartChange),
     Picture(PictureChange),
+    Merge(MergeChange),
+    RowHeight(SizeChange),
+    ColumnWidth(SizeChange),
     Name(NameChange),
     Table(TableChange),
     Pivot(PivotChange),
@@ -89,6 +94,8 @@ impl Change {
             Change::Link(ref link) => Some(link.at.sheet),
             Change::Chart(ref chart) => chart.sheet,
             Change::Picture(ref picture) => picture.sheet,
+            Change::Merge(ref merge) => Some(merge.at.sheet),
+            Change::RowHeight(ref size) | Change::ColumnWidth(ref size) => Some(size.at.sheet),
             Change::Name(ref name) => name.sheet,
             Change::Table(ref table) => table.at().map(|a| a.sheet),
             Change::Pivot(ref pivot) => pivot.at().map(|a| a.sheet),
@@ -114,6 +121,8 @@ impl Change {
             Change::Link(ref link) => Some((link.at.sheet, link.at.row, link.at.col)),
             Change::Chart(ref chart) => chart.anchor(),
             Change::Picture(ref picture) => picture.anchor(),
+            Change::Merge(ref merge) => Some((merge.at.sheet, merge.at.row, merge.at.col)),
+            Change::RowHeight(ref size) | Change::ColumnWidth(ref size) => Some((size.at.sheet, size.at.row, size.at.col)),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
             Change::Table(ref table) => table.at().map(|a| (a.sheet, a.row, a.col)),
             Change::Pivot(ref pivot) => pivot.at().map(|a| (a.sheet, a.row, a.col)),
@@ -160,6 +169,9 @@ impl Change {
             Change::Link(link) => link.describe("Hyperlink"),
             Change::Chart(chart) => chart.describe(),
             Change::Picture(picture) => picture.describe(),
+            Change::Merge(merge) => merge.describe(),
+            Change::RowHeight(size) => size.describe(true),
+            Change::ColumnWidth(size) => size.describe(false),
             Change::Name(name) => name.describe(),
             Change::Table(table) => table.describe(),
             Change::Pivot(pivot) => pivot.describe(),
@@ -424,7 +436,14 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
     let compare_styles = !ours.sheet(s).styles.is_empty() || !theirs.sheet(t).styles.is_empty();
     let compare_annotations = !ours.comments(s).is_empty() || !theirs.comments(t).is_empty()
         || !ours.links(s).is_empty() || !theirs.links(t).is_empty();
-    let paired_metadata = compare_styles || compare_annotations;
+    let compare_layout = ours.sheet(s).row_sizes.default != theirs.sheet(t).row_sizes.default
+        || ours.sheet(s).col_sizes.default != theirs.sheet(t).col_sizes.default
+        || [(ours, s), (theirs, t)].into_iter().any(|(wb, sheet)| {
+            let sh = wb.sheet(sheet);
+            !wb.merges(sheet).is_empty() || !sh.row_sizes.overrides().is_empty()
+                || !sh.col_sizes.overrides().is_empty() || !sh.hidden_widths.is_empty()
+        });
+    let paired_metadata = compare_styles || compare_annotations || compare_layout;
     let mut row_pairs = Vec::new();
     let (mut i, mut j) = (0u32, 0u32);
     for (mi, mj) in pairs {
@@ -453,6 +472,7 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
     parts::pair(&mut row_pairs, ra.n, rb.n, MAX_ROWS - ra.n.max(rb.n));
     (compare_styles && parts::styles(ours, s, theirs, t, &row_pairs, out))
         || (compare_annotations && annotations::compare(ours, s, theirs, t, &row_pairs, out))
+        || (compare_layout && layout::compare(ours, s, theirs, t, &row_pairs, out))
 }
 
 /// How a gap between matched rows lines up.
@@ -619,6 +639,10 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             let set = change.take(ours.link(sheet, row, col), ours.links(sheet).len(), crate::links::MAX_LINKS)?;
             Some(vec![GridOp::Links { sheet, set: vec![set] }])
         }
+        Change::Merge(_) | Change::RowHeight(_) | Change::ColumnWidth(_) => {
+            let (ops, taken) = take_layout(ours, &[ch]);
+            (taken != 0).then_some(ops)
+        }
         Change::Chart(_) | Change::Picture(_) | Change::Name(_) | Change::Table(_) | Change::Pivot(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
             let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
             (n != 0).then_some(ops)
@@ -652,6 +676,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             let target = Rect { sheet: *sheet, r0: *at, r1: *at + *n - 1, ..source };
             if let Some(op) = parts::row_styles(theirs, source, target) { ops.push(op); }
             ops.extend(annotations::insert_rows(ours, theirs, source, target)?);
+            ops.extend(layout::insert_rows(ours, theirs, source, target));
             Some(ops)
         }
         Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
@@ -670,6 +695,11 @@ pub fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (
 /// Plans selected comments and links, preserving other annotations.
 pub fn take_annotations(ours: &Workbook, changes: &[&Change]) -> (Vec<GridOp>, usize) {
     annotations::take_selected(ours, changes)
+}
+
+/// Plans selected merged ranges and size overrides without changing other layout.
+pub fn take_layout(ours: &Workbook, changes: &[&Change]) -> (Vec<GridOp>, usize) {
+    layout::take(ours, changes)
 }
 
 /// Our sheet `s` made the same as theirs of its name: cells, formulas and
@@ -713,6 +743,7 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
     styles.rect.sheet = s;
     let mut ops = vec![GridOp::Replace(Region { rect, values, fills }), GridOp::Restyle(styles)];
     ops.extend(annotations::take_sheet(ours, s, theirs, t)?);
+    ops.extend(layout::take_sheet(ours, s, theirs, t));
     Some(GridOp::Batch(ops))
 }
 
@@ -720,6 +751,53 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn review_defaults_round_trip_and_keep_explicit_sizes() {
+        let mut ours = book(&[&["Header"]]);
+        let mut theirs = book(&[&["Header"]]);
+        ours.sheet_mut(0).col_sizes.set(7, 88.0);
+        theirs.sheet_mut(0).col_sizes = crate::column::Sizes::new(88.0);
+        let (changes, _) = compare(&ours, &theirs);
+        let first = changes.iter().find(|c| c.describe(&ours, &theirs) == "Default column width: 64 → 88").unwrap();
+        let op = take(&ours, &theirs, first).unwrap().remove(0);
+        let undo = GridOp::decode(&op.encode()).unwrap().apply(&mut ours);
+        assert_eq!(ours.sheet(0).col_sizes.default, 88.0);
+        assert_eq!(ours.sheet(0).col_sizes.overrides(), &[(7, 88.0)]);
+        GridOp::decode(&undo.encode()).unwrap().apply(&mut ours);
+        assert_eq!(ours.sheet(0).col_sizes.default, 64.0);
+        assert_eq!(ours.sheet(0).col_sizes.overrides(), &[(7, 88.0)]);
+    }
+
+    #[test]
+    fn review_layout_follows_rows_and_refuses_overlapping_merges() {
+        let mut ours = book(&[&["Header"], &["first"], &["last"]]);
+        let mut theirs = book(&[&["Header"], &["first"], &["inserted"], &["last"]]);
+        let area = |r0, r1, c0, c1| Rect { sheet: 0, r0, r1, c0, c1 };
+        ours.set_merges(0, vec![area(2, 2, 1, 2)]);
+        theirs.set_merges(0, vec![area(2, 2, 1, 2), area(3, 3, 1, 2)]);
+        ours.sheet_mut(0).row_sizes.set(2, 35.0);
+        theirs.sheet_mut(0).row_sizes.set(2, 42.0);
+        theirs.sheet_mut(0).row_sizes.set(3, 35.0);
+        let (changes, _) = compare(&ours, &theirs);
+        assert!(matches!(&changes[..], [Change::RowsAdded { .. }]));
+        let undo = GridOp::Batch(take(&ours, &theirs, &changes[0]).unwrap()).apply(&mut ours);
+        assert!(compare(&ours, &theirs).0.is_empty());
+        undo.apply(&mut ours);
+        assert_eq!(ours.merges(0), &[area(2, 2, 1, 2)]);
+        assert_eq!(ours.sheet(0).row_sizes.size(2), 35.0);
+        take_sheet(&ours, &theirs, 0).unwrap().apply(&mut ours);
+        assert!(compare(&ours, &theirs).0.is_empty());
+
+        theirs.set_merges(0, vec![area(2, 2, 0, 2), area(3, 3, 1, 2)]);
+        let (changes, _) = compare(&ours, &theirs);
+        let add = changes.iter().find(|c| c.at() == Some((0, 2, 0))).unwrap();
+        assert!(take(&ours, &theirs, add).is_none());
+        let (ops, taken) = take_layout(&ours, &changes.iter().collect::<Vec<_>>());
+        assert_eq!(taken, 2);
+        GridOp::Batch(ops).apply(&mut ours);
+        assert!(compare(&ours, &theirs).0.is_empty());
+    }
 
     #[test]
     fn review_annotations_follow_aligned_and_inserted_rows() {

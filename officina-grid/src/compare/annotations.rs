@@ -71,7 +71,7 @@ fn mapped<'a, T>(entries: &'a BTreeMap<Coordinate, T>, pairs: &'a [RowRun], remo
     })
 }
 
-fn differences<'a, T: PartialEq + 'a>(
+pub(super) fn differences<'a, T: PartialEq + 'a>(
     local: impl Iterator<Item = (Coordinate, &'a T)>,
     remote: impl Iterator<Item = (Coordinate, &'a T)>,
     mut emit: impl FnMut(Coordinate, Option<&'a T>, Option<&'a T>) -> bool,

@@ -481,7 +481,7 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         let name = r.str("sheet name", MAX_SHEET_NAME as u64)?;
         let s = wb.add_sheet(name).map_err(LoadError::Bad)?;
         for (axis, max) in [(0, MAX_ROWS), (1, MAX_COLS)] {
-            let def = size(&mut r)?;
+            let def = size(&mut r, false)?;
             let k = r.count("size overrides", max as u64, 9)?;
             let mut over = Vec::with_capacity(k);
             for _ in 0..k {
@@ -489,7 +489,7 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
                 if over.last().is_some_and(|&(p, _)| p >= at) {
                     return Err(LoadError::Bad("size overrides out of order"));
                 }
-                over.push((at, size(&mut r)?));
+                over.push((at, size(&mut r, axis == 1)?));
             }
             let sz = crate::column::Sizes::from_parts(def, over);
             if axis == 0 {
@@ -974,9 +974,9 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
     Ok(wb)
 }
 
-fn size(r: &mut Reader) -> Result<f64, LoadError> {
+fn size(r: &mut Reader, hidden_column_allowed: bool) -> Result<f64, LoadError> {
     let x = r.f64()?;
-    if x.is_finite() && x > 0.0 && x <= MAX_SIZE {
+    if x.is_finite() && (x > 0.0 || (hidden_column_allowed && x == 0.0)) && x <= MAX_SIZE {
         Ok(x)
     } else {
         Err(LoadError::Bad("row height or column width"))
