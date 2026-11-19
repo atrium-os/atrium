@@ -77,6 +77,8 @@ pub enum Cmd {
     FilterCancel,
     /// The data validation panel.
     Valid(ValidCmd),
+    /// The open rule panel's Apply To field takes the grid's selection.
+    UseSelection,
     /// The validation list: item `i` (of those the search shows) typed into
     /// the cell; closed.
     ListPick(usize),
@@ -1581,7 +1583,9 @@ impl View for Sheets {
                     ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: title.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
                     let mut y = y0 + 40.0;
                     label(ctx, y, "Apply to");
-                    TextField::new(self.cond_range.clone()).placeholder("e.g. B2:D20").at(x0 + 12.0, y + 18.0).width(fw).render(ctx);
+                    TextField::new(self.cond_range.clone()).placeholder("e.g. B2:D20").at(x0 + 12.0, y + 18.0).width(fw - 104.0).render(ctx);
+                    let cmds = self.cmds.clone();
+                    Button::secondary("Selection").at(x0 + 12.0 + fw - 96.0, y + 18.0).width(96.0).on_click(move || cmds.lock().unwrap().push(Cmd::UseSelection)).render(ctx);
                     y += 60.0;
                     label(ctx, y, "Format cells by");
                     let kinds: Vec<pergola::widgets::MenuItem> = cf::KINDS.iter().enumerate().map(|(i, k)| pergola::widgets::MenuItem::new(*k).radio(i == e.kind)).collect();
@@ -1685,7 +1689,11 @@ impl View for Sheets {
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw, 20.0), content: title.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
             let mut y = y0 + 40.0;
             label(ctx, y, "Apply to");
-            field(ctx, va::RANGE, x0 + 12.0, y + 18.0, fw, "e.g. B2:B100");
+            field(ctx, va::RANGE, x0 + 12.0, y + 18.0, fw - 104.0, "e.g. B2:B100");
+            {
+                let cmds = self.cmds.clone();
+                Button::secondary("Selection").at(x0 + 12.0 + fw - 96.0, y + 18.0).width(96.0).on_click(move || cmds.lock().unwrap().push(Cmd::UseSelection)).render(ctx);
+            }
             y += 60.0;
             label(ctx, y, "Allow");
             menu(ctx, 0, &va::ALLOWS, vp.allow, y + 18.0, ValidCmd::Allow);
@@ -1995,6 +2003,19 @@ impl Sheets {
                 }
                 Cmd::Valid(c) => {
                     self.valid_cmd(c);
+                    false
+                }
+                Cmd::UseSelection => {
+                    let text = crate::condfmt::rect_text(&{
+                        let g = self.grid.get_cloned().selection();
+                        officina_grid::Rect { sheet: self.doc.borrow().sheet, r0: g.r0, c0: g.c0, r1: g.r1, c1: g.c1 }
+                    });
+                    if self.valid.get_cloned().open {
+                        self.valid_text[crate::validation::RANGE].set(TextEdit::new(&text));
+                    } else if self.cond.get_cloned().editor.is_some() {
+                        self.cond_range.set(TextEdit::new(&text));
+                    }
+                    self.changed();
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::PivotFields) => {
@@ -2364,6 +2385,13 @@ mod tests {
         run(Cmd::Data(DataCmd::Validation));
         assert!(texts().iter().any(|x| x == "New Validation"));
         assert_eq!(s.valid_text[va::RANGE].get_cloned().text(), "B2");
+        // The grid's selection, chosen while the panel is open, fills Apply To.
+        let mut g = s.grid.get_cloned();
+        g.select(1, 1);
+        g.cursor = (8, 1);
+        s.grid.set(g);
+        run(Cmd::UseSelection);
+        assert_eq!(s.valid_text[va::RANGE].get_cloned().text(), "B2:B9");
         // Whole numbers 1 to 5 over B2:B9, told with the rule's own words.
         run(Cmd::Valid(ValidCmd::Allow(1)));
         s.valid_text[va::RANGE].set(TextEdit::new("B2:B9"));

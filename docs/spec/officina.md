@@ -3713,7 +3713,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - Each change is one undo step.
 - **The list in the cell.** The cursor's cell shows a ▾ button at its right when its rule offers a list; a press on it, or Alt+↓, opens the list. A filter column's ▾ button opens its value list the same way. pergola: `GridFloat::pressable` floats report `GridAction::PressFloat` instead of choosing cells, and Alt+↓ reports `GridAction::Choose`.
 - **Circle Invalid Data** (a Data menu toggle) rings in red each cell on screen whose value its rule doesn't allow, and the status line counts them on the sheet's used cells. Rings follow edits and go when the toggle is turned off; it isn't saved. Engine: `Workbook::invalid_cells(area, limit, budget)`, which checks each covered cell against its first rule, with empty cells counting only when blanks aren't allowed.
-- **Not yet:** applying a changed rule to every cell with the same settings (Excel's "apply these changes to all other cells"), and choosing a range by dragging while the panel is open.
+- **Selection.** While a rule panel (validation or conditional formats) is open, the grid's left part stays usable. Its Selection button puts the grid's selection into Apply To.
+- **Not Excel's way:** Excel keeps one rule per range and offers to "apply these changes to all other cells with the same settings"; here a rule holds all its ranges, so a change always reaches all of them.
 - **Gates:** atrium-sheets `rules_are_made_changed_and_cleared`, `the_validation_panel_makes_changes_and_deletes_rules` and `a_list_cell_s_button_and_alt_down_open_its_list`, `invalid_data_is_circled_until_turned_off`; officina-grid `invalid_cells_are_found_in_an_area`; pergola `a_button_in_a_cell_and_alt_down_reach_the_app`.
 
 ## 17. Decisions (accepted 2026-11-14)
