@@ -436,7 +436,10 @@ fn person_uid(person: &str) -> Option<u32> {
 
 /// The person's home and files group (made if missing).
 fn person(owner: &str) -> Result<(PathBuf, u32), String> {
-    crate_home::ensure_person(owner)
+    let r = crate_home::ensure_person(owner)?;
+    // Workspaces and their object cache are app data (E6).
+    crate_home::ensure_app_data(owner, None)?;
+    Ok(r)
 }
 
 use portcullisd::home as crate_home;

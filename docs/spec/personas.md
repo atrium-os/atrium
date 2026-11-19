@@ -74,7 +74,7 @@ persona):
 - **uid:** portcullisd allocates one per (person, app, persona), extending homes.md
   decision H4 (per (person, app)). The kernel, not only mounts, keeps Mail · Work out of
   Mail · Personal's files.
-- **data:** `~/.atrium/apps/<id>/` for Personal (unchanged), `~/.atrium/apps/<id>@<persona>/`
+- **data:** `~/.atrium/apps/<id>/` for Personal (unchanged), `~/.atrium/persona-apps/<persona>/<id>/` (before tessera-encryption.md E6: `~/.atrium/apps/<id>@<persona>/`)
   for a named persona.
 - **Arca:** the instance's items live under its persona (arca.md personas): passwords,
   cookies, tokens of one never reach the other.

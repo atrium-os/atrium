@@ -69,6 +69,12 @@ fn volumes() -> Option<crate::volumes_client::Client> {
 /// and so is a locked Arca: the folders aren't handed out. Without Tessera
 /// or Arca keys on this machine the folders stay as they were.
 fn encrypt_folders(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32) -> Result<(), String> {
+    encrypt_dirs(person, persona, dirs, uid, gid, 0o2770).map_err(|(_, e)| e)
+}
+
+/// The error says whether a folder was refused (`true`: it should be
+/// encrypted and isn't, or is in the wrong group).
+fn encrypt_dirs(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid: u32, mode: u32) -> Result<(), (bool, String)> {
     use atrium_volumes::protocol::{PersonaFoldersRequest, Request, Response};
     let Some(mut c) = volumes() else { return Ok(()) };
     let req = Request::PersonaFolders(PersonaFoldersRequest {
@@ -77,21 +83,24 @@ fn encrypt_folders(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid:
         folders: dirs.iter().map(|d| d.display().to_string()).collect(),
         uid,
         gid,
-        mode: 0o2770,
+        mode,
     });
     match c.send(&req) {
-        Ok(Response::FoldersReady { encrypted, moved }) => {
+        Ok(Response::FoldersReady { encrypted, moved, waiting }) => {
             for m in moved {
                 eprintln!("portcullisd: {person}'s {m}: old files moved into the encrypted folder");
+            }
+            for w in waiting {
+                eprintln!("portcullisd: {person}'s {w} is in use: it is encrypted once it is free (next login)");
             }
             if !encrypted {
                 eprintln!("portcullisd: {person}'s {persona} folders are not encrypted (no Tessera keys here)");
             }
             Ok(())
         }
-        Ok(Response::FoldersRefused { folder, detail }) => Err(format!("{folder} refused: {detail}")),
-        Ok(Response::Error { detail }) => Err(detail),
-        Ok(other) => Err(format!("atrium-volumes: unexpected {other:?}")),
+        Ok(Response::FoldersRefused { folder, detail }) => Err((true, format!("{folder} refused: {detail}"))),
+        Ok(Response::Error { detail }) => Err((false, detail)),
+        Ok(other) => Err((false, format!("atrium-volumes: unexpected {other:?}"))),
         Err(e) => {
             eprintln!("portcullisd: atrium-volumes: {e}: {person}'s {persona} folders are not encrypted now");
             Ok(())
@@ -143,6 +152,54 @@ pub fn ensure_person(person: &str) -> Result<(PathBuf, u32), String> {
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2770)).map_err(|e| format!("chmod {}: {e}", d.display()))?;
     }
     Ok((home, gid))
+}
+
+/// The parts of `~/.atrium` that hold the person's app data (E6,
+/// tessera-encryption.md §13.2), in their Personal key group: app overlays
+/// (`apps`) and session state (`state`), root's 0755; workspaces and the
+/// workspaces' object cache, root's with the files group, 0750.
+pub const APP_DATA_ROOT: &[&str] = &["apps", "state"];
+pub const APP_DATA_FILES: &[&str] = &["workspaces", "cache"];
+
+/// The person's app data in their key groups before anything mounts or
+/// uses it (E6): Personal's parts of `~/.atrium`, or a named persona's
+/// overlays folder `~/.atrium/persona-apps/<persona>` (root's, 0700). A
+/// persona overlay from before E6 (`apps/<id>@<persona>`) is moved to its
+/// persona's folder first, so it never enters Personal's group.
+///
+/// A part that should be encrypted and isn't (an offline edit) fails the
+/// launch. Any other trouble (no atrium-volumes, the person's Arca locked
+/// before their group was ever made) leaves the data as it was, plain, and
+/// is logged: a launch that worked before E6 still works. Data already in
+/// a locked group can't be read anyway: its overlay doesn't mount.
+pub fn ensure_app_data(person: &str, persona: Option<&str>) -> Result<(), String> {
+    let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
+    portcullis_overlay::apps_root(&home)?;
+    let at = home.join(".atrium");
+    let r = match persona.filter(|p| *p != "personal") {
+        None => {
+            portcullis_overlay::relocate_persona_overlays(person, None);
+            let gid = ensure_group(&files_group(person))?;
+            encrypt_dirs(person, "personal", &APP_DATA_ROOT.iter().map(|d| at.join(d)).collect::<Vec<_>>(), 0, 0, 0o755)
+                .and_then(|_| encrypt_dirs(person, "personal", &APP_DATA_FILES.iter().map(|d| at.join(d)).collect::<Vec<_>>(), 0, gid, 0o750))
+        }
+        Some(p) => {
+            if !plain(p) {
+                return Err(format!("{p:?} is not a named persona"));
+            }
+            ensure_root_dir(&at.join(portcullis_overlay::PERSONA_APPS))?;
+            portcullis_overlay::relocate_persona_overlays(person, Some(p));
+            encrypt_dirs(person, p, &[portcullis_overlay::persona_apps_dir(&home, p)], 0, 0, 0o700)
+        }
+    };
+    match r {
+        Err((true, e)) => Err(e),
+        Err((false, e)) => {
+            eprintln!("portcullisd: {person}'s app data ({}) stays as it is for now: {e}", persona.unwrap_or("personal"));
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Give `run_as` (an app's own account) the person's files group, so the
@@ -274,6 +331,14 @@ pub fn remove_persona(person: &str, persona: &str) -> Result<bool, String> {
         return Err(format!("its key is gone; the erase finishes later ({e})"));
     }
     let home = portcullis_overlay::home_of(person).ok_or_else(|| format!("{person} has no home"))?;
+    // Its app overlays' folder, emptied by remove_persona_places (E6); the
+    // erase above took it if it was encrypted.
+    let apps = portcullis_overlay::persona_apps_dir(&home, persona);
+    if let Ok(m) = std::fs::symlink_metadata(&apps) {
+        if m.is_dir() && m.uid() == 0 {
+            std::fs::remove_dir_all(&apps).map_err(|e| format!("remove {}: {e}", apps.display()))?;
+        }
+    }
     let dir = home.join(PERSONAS_DIR).join(persona);
     let had = match std::fs::symlink_metadata(&dir) {
         Ok(m) if m.is_dir() && m.uid() == 0 => {

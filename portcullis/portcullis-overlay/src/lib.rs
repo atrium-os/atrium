@@ -161,18 +161,154 @@ pub fn place(person: Option<&str>, app_id: &str) -> Place {
     place_instance(person, app_id, None)
 }
 
+/// Where a named persona's app overlays live, under the home: one folder
+/// per persona, `~/.atrium/persona-apps/<persona>/`, so each can be a
+/// domain of that persona's key group (tessera-encryption.md E6). Before
+/// E6 they were `apps/<id>@<persona>`, in among Personal's.
+pub const PERSONA_APPS: &str = "persona-apps";
+
+/// `~/.atrium/persona-apps/<persona>` (not made here).
+pub fn persona_apps_dir(home: &Path, persona: &str) -> PathBuf {
+    home.join(".atrium").join(PERSONA_APPS).join(persona)
+}
+
+fn persona_ok(persona: &str) -> bool {
+    plain_segment(persona) && !persona.contains('@') && !persona.starts_with('.')
+}
+
 /// The overlay of the instance of `app_id` in `persona` (personas.md §3):
-/// `apps/<id>` for Personal, `apps/<id>@<persona>` for a named persona. A
-/// named persona needs the person's home (there is no machine-wide place for
-/// it) and a name that is one plain segment without `@`; otherwise `None`.
+/// `apps/<id>` for Personal, `persona-apps/<persona>/<id>` for a named
+/// persona. A named persona needs the person's home (there is no
+/// machine-wide place for it) and a name that is one plain segment without
+/// `@`; otherwise `None`.
 pub fn persona_place(person: &str, app_id: &str, persona: &str) -> Option<Place> {
-    if !plain_segment(persona) || persona.contains('@') || app_id.contains('@') || !plain_segment(app_id) {
+    if !persona_ok(persona) || app_id.contains('@') || !plain_segment(app_id) {
         return None;
     }
     let home = home_of(person)?;
+    let dir = persona_apps_dir(&home, persona);
+    Some(Place { dir: dir.join(app_id), img: dir.join(format!("{app_id}.img")), person: Some(person.to_string()) })
+}
+
+/// The pre-E6 place of a persona instance, `apps/<id>@<persona>`.
+fn old_persona_place(home: &Path, person: &str, app_id: &str, persona: &str) -> Place {
     let apps = home.join(".atrium").join("apps");
     let key = format!("{app_id}@{persona}");
-    Some(Place { dir: apps.join(&key), img: apps.join(format!("{key}.img")), person: Some(person.to_string()) })
+    Place { dir: apps.join(&key), img: apps.join(format!("{key}.img")), person: Some(person.to_string()) }
+}
+
+/// `(app id, persona)` of each pre-E6 persona overlay left in `apps/`.
+fn old_persona_overlays(home: &Path) -> Vec<(String, String)> {
+    let mut v = std::collections::BTreeSet::new();
+    if let Ok(rd) = fs::read_dir(home.join(".atrium").join("apps")) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let key = name.strip_suffix(".img").unwrap_or(&name);
+            if let Some((id, persona)) = key.split_once('@') {
+                if plain_segment(id) && persona_ok(persona) {
+                    v.insert((id.to_string(), persona.to_string()));
+                }
+            }
+        }
+    }
+    v.into_iter().collect()
+}
+
+/// Move `person`'s pre-E6 persona overlays (`apps/<id>@<persona>`, all
+/// personas or only `only`) to their persona's folder, unmounting each
+/// first. Done before the folders are encrypted, so it is a rename on
+/// the plain volume; a persona folder that is already encrypted gets a
+/// copy (EXDEV). One that is in use, or whose new place is taken, stays
+/// and is logged. Returns how many moved.
+pub fn relocate_persona_overlays(person: &str, only: Option<&str>) -> usize {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let Some(home) = home_of(person) else { return 0 };
+    let mut moved = 0;
+    for (id, persona) in old_persona_overlays(&home) {
+        if only.is_some_and(|o| o != persona) {
+            continue;
+        }
+        let old = old_persona_place(&home, person, &id, &persona);
+        let Some(new) = persona_place(person, &id, &persona) else { continue };
+        let r = (|| -> Result<(), String> {
+            if new.img.exists() || fs::read_dir(&new.dir).map(|mut r| r.next().is_some()).unwrap_or(false) {
+                return Err(format!("{} is taken", new.dir.display()));
+            }
+            let parent = new.dir.parent().ok_or("no parent")?;
+            for d in [parent.parent().ok_or("no parent")?, parent] {
+                match fs::symlink_metadata(d) {
+                    Ok(m) if m.is_dir() && m.uid() == 0 => {}
+                    Ok(_) => return Err(format!("{} is not root's own folder", d.display())),
+                    Err(_) => {
+                        fs::DirBuilder::new().mode(0o700).create(d).map_err(|e| format!("create {}: {e}", d.display()))?;
+                        std::os::unix::fs::chown(d, Some(0), Some(0)).map_err(|e| format!("chown {}: {e}", d.display()))?;
+                    }
+                }
+            }
+            teardown(&old)?;
+            if old.img.exists() {
+                move_path(&old.img, &new.img)?;
+                let _ = fs::remove_dir(&old.dir);
+            } else if old.dir.exists() {
+                let _ = fs::remove_dir(&new.dir);
+                move_path(&old.dir, &new.dir)?;
+            }
+            Ok(())
+        })();
+        match r {
+            Ok(()) => {
+                moved += 1;
+                eprintln!("portcullis: moved {person}'s {id}@{persona} overlay into {}", new.dir.display());
+            }
+            Err(e) => eprintln!("portcullis: {person}'s {id}@{persona} overlay stays in apps/ for now: {e}"),
+        }
+    }
+    moved
+}
+
+/// Every overlay place in `person`'s home: Personal's in `apps/` and each
+/// persona's in `persona-apps/<persona>/` (and any pre-E6 one).
+pub fn person_places(person: &str) -> Vec<Place> {
+    let Some(home) = home_of(person) else { return Vec::new() };
+    let mut v = Vec::new();
+    let mut scan = |dir: PathBuf| {
+        let mut keys = std::collections::BTreeSet::new();
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let key = name.strip_suffix(".img").unwrap_or(&name).to_string();
+                if plain_segment(&key) && !key.starts_with('.') {
+                    keys.insert(key);
+                }
+            }
+        }
+        for k in keys {
+            v.push(Place { dir: dir.join(&k), img: dir.join(format!("{k}.img")), person: Some(person.to_string()) });
+        }
+    };
+    scan(home.join(".atrium").join("apps"));
+    if let Ok(rd) = fs::read_dir(home.join(".atrium").join(PERSONA_APPS)) {
+        for e in rd.flatten() {
+            let p = e.file_name().to_string_lossy().into_owned();
+            if persona_ok(&p) {
+                scan(persona_apps_dir(&home, &p));
+            }
+        }
+    }
+    v
+}
+
+/// Unmount every overlay of `person` (at logout, before their keys go:
+/// the images are in their key groups, E6). The ones that stay mounted
+/// (busy), by place.
+pub fn teardown_person(person: &str) -> Vec<String> {
+    let mut busy = Vec::new();
+    for pl in person_places(person) {
+        if let Err(e) = teardown(&pl) {
+            busy.push(format!("{}: {e}", pl.dir.display()));
+        }
+    }
+    busy
 }
 
 /// [`place`] for an instance: Personal falls back as `place` does; a named
@@ -203,19 +339,20 @@ pub fn all_places(app_id: &str) -> Vec<Place> {
             if p.person.is_some() && (p.img.exists() || p.dir.exists()) {
                 v.push(p);
             }
-            // And each persona's instance (personas.md §3): `apps/<id>@<persona>`.
-            let apps = Path::new("/home").join(&person).join(".atrium").join("apps");
-            if let Ok(rd) = fs::read_dir(&apps) {
-                let prefix = format!("{app_id}@");
-                let mut seen = std::collections::BTreeSet::new();
+            // And each persona's instance (personas.md §3), where it is
+            // now and where it was before E6 (`apps/<id>@<persona>`).
+            let home = Path::new("/home").join(&person);
+            for (id, persona) in old_persona_overlays(&home) {
+                if id == app_id {
+                    v.push(old_persona_place(&home, &person, &id, &persona));
+                }
+            }
+            if let Ok(rd) = fs::read_dir(home.join(".atrium").join(PERSONA_APPS)) {
                 for e in rd.flatten() {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let key = name.strip_suffix(".img").unwrap_or(&name);
-                    if let Some(persona) = key.strip_prefix(&prefix) {
-                        if seen.insert(persona.to_string()) {
-                            if let Some(p) = persona_place(&person, app_id, persona) {
-                                v.push(p);
-                            }
+                    let persona = e.file_name().to_string_lossy().into_owned();
+                    if let Some(p) = persona_place(&person, app_id, &persona) {
+                        if p.img.exists() || p.dir.exists() {
+                            v.push(p);
                         }
                     }
                 }
@@ -568,30 +705,32 @@ pub fn destroy(pl: &Place) -> Result<(), String> {
 }
 
 /// Destroy every app instance place of `person`'s persona `persona`
-/// (`apps/<id>@<persona>` and its image; personas.md §4.1, Remove). The
-/// app ids whose places went; one that couldn't go is logged and left.
+/// (`persona-apps/<persona>/<id>` and its image, or a pre-E6
+/// `apps/<id>@<persona>`; personas.md §4.1, Remove). The app ids whose
+/// places went; one that couldn't go is logged and left.
 pub fn remove_persona_places(person: &str, persona: &str) -> Vec<String> {
     let mut gone = Vec::new();
-    if !plain_segment(persona) || persona.contains('@') {
+    if !persona_ok(persona) {
         return gone;
     }
     let Some(home) = home_of(person) else { return gone };
-    let apps = home.join(".atrium").join("apps");
-    let suffix = format!("@{persona}");
+    let mut places: Vec<(String, Place)> = old_persona_overlays(&home).into_iter()
+        .filter(|(_, p)| p == persona)
+        .map(|(id, p)| (id.clone(), old_persona_place(&home, person, &id, &p)))
+        .collect();
+    let dir = persona_apps_dir(&home, persona);
     let mut ids = std::collections::BTreeSet::new();
-    if let Ok(rd) = fs::read_dir(&apps) {
+    if let Ok(rd) = fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let key = name.strip_suffix(".img").unwrap_or(&name);
-            if let Some(id) = key.strip_suffix(&suffix) {
-                if plain_segment(id) && !id.contains('@') {
-                    ids.insert(id.to_string());
-                }
+            if plain_segment(key) && !key.contains('@') && !key.starts_with('.') {
+                ids.insert(key.to_string());
             }
         }
     }
-    for id in ids {
-        let Some(pl) = persona_place(person, &id, persona) else { continue };
+    places.extend(ids.into_iter().filter_map(|id| persona_place(person, &id, persona).map(|p| (id, p))));
+    for (id, pl) in places {
         match destroy(&pl) {
             Ok(()) => gone.push(id),
             Err(e) => eprintln!("portcullis: {person}'s {id}@{persona} not removed: {e}"),

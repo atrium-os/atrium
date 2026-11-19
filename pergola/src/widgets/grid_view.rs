@@ -30,8 +30,7 @@
 //! rows and columns and their labels; presses there map to the unscrolled
 //! cells ([`Geom::content`]), and moving the cursor keeps it clear of them.
 //!
-//! Not yet: Ctrl+arrow data edges beyond what the source says, and placing
-//! the caret by pointer in the editor.
+//! Not yet: Ctrl+arrow data edges beyond what the source says.
 
 use std::rc::Rc;
 
@@ -409,6 +408,8 @@ enum Drag {
     /// A picked float pressed: moved (or sized from its corner) by the
     /// distance from where the press began, content px.
     Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
+    /// A press in the editor: dragging selects its text.
+    Caret,
     /// The fill handle dragged: the area it reaches so far.
     Fill { to: CellRange, from: (f64, f64) },
 }
@@ -432,6 +433,9 @@ pub struct GridState {
     /// While a selection or the fill handle is dragged past the body's
     /// edge: where the pointer is (window px). Each frame scrolls toward it.
     edge: Option<crate::geom::Point>,
+    /// When the editor was last pressed: a second press soon after is a
+    /// double-click (selects the word).
+    text_press: Option<std::time::Instant>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -532,6 +536,49 @@ const FILL_GRIP: f64 = 5.0;
 
 /// Two presses closer than this are a double-click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// The editor's area, content px: the active cell (or its merged area),
+/// widened to its text as it is drawn.
+fn editor_rect(src: &dyn GridSource, g: &GridState) -> Option<[f64; 4]> {
+    let ed = g.edit.as_ref()?;
+    let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
+    let (x, y) = (src.col_left(one.c0), src.row_top(one.r0));
+    let (w, h) = (src.col_left(one.c1 + 1) - x, src.row_top(one.r1 + 1) - y);
+    let tw = crate::text::measure(ed.text(), &editor_style()).w as f64;
+    Some([x, y, w.max(tw + 2.0 * PAD as f64 + 2.0), h])
+}
+
+fn in_editor(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> bool {
+    editor_rect(src, g).is_some_and(|r| cx >= r[0] && cx < r[0] + r[2] && cy >= r[1] && cy < r[1] + r[3])
+}
+
+/// The editor's text index nearest content x `cx` (a character boundary).
+fn editor_index(src: &dyn GridSource, g: &GridState, cx: f64) -> Option<usize> {
+    let r = editor_rect(src, g)?;
+    let text = g.edit.as_ref()?.text();
+    Some(index_at(text, (cx - r[0]) as f32 - PAD, &editor_style()))
+}
+
+/// The character boundary of `text` nearest `x` px from its start.
+fn index_at(text: &str, x: f32, style: &TextStyle) -> usize {
+    let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let w = |k: usize| crate::text::measure(&text[..bounds[k]], style).w;
+    // Widths grow with the prefix: the last boundary at or left of x...
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if w(mid) <= x { lo = mid } else { hi = mid - 1 }
+    }
+    // ...or the next, when x is nearer it.
+    if lo + 1 < bounds.len() && (w(lo + 1) - x) < (x - w(lo)) {
+        lo += 1;
+    }
+    bounds[lo]
+}
+
+fn editor_style() -> TextStyle {
+    TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: Color::rgba(0.0, 0.0, 0.0, 1.0) }
+}
 
 /// How far `p` is past the body's edges, px: (right +, left -), (below +,
 /// above -); 0 inside.
@@ -818,6 +865,36 @@ impl GridView {
                     } else {
                         g.drag = Drag::Fill { to, from };
                     }
+                    gst.set(g);
+                    return;
+                }
+                // In the editor: the press places the caret, a drag selects,
+                // a double-click takes the word.
+                if let (Drag::Caret, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
+                    if let Some(i) = editor_index(&*src, &g, cx) {
+                        if let Some(ed) = g.edit.as_mut() {
+                            ed.set_caret(i, true);
+                        }
+                    }
+                    if phase == DragPhase::End {
+                        g.drag = Drag::None;
+                    }
+                    gst.set(g);
+                    return;
+                }
+                if phase == DragPhase::Start && g.edit.is_some() && in_editor(&*src, &g, cx, cy) {
+                    let i = editor_index(&*src, &g, cx).unwrap_or(0);
+                    let now = std::time::Instant::now();
+                    let double = g.text_press.is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK);
+                    g.text_press = Some(now);
+                    if let Some(ed) = g.edit.as_mut() {
+                        if double {
+                            ed.select_word(i);
+                        } else {
+                            ed.set_caret(i, crate::input::pointer_modifiers().shift);
+                        }
+                    }
+                    g.drag = if double { Drag::None } else { Drag::Caret };
                     gst.set(g);
                     return;
                 }
@@ -2610,6 +2687,41 @@ mod tests {
         }
         assert_eq!(scroll.get().physics.y, y2);
         assert_eq!(state.get_cloned().selection().c0, 0);
+    }
+
+    #[test]
+    fn a_press_in_the_editor_places_the_caret_and_a_drag_selects() {
+        let (mut app, _, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let b2 = Point::new(hw + 64.0 + 10.0, HEADER_H + 25.0);
+        app.handle_event(Event::PointerDown { at: b2 });
+        app.handle_event(Event::PointerUp { at: b2 });
+        app.tick();
+        key(&mut app, Key::Char, "hello world", Modifiers::default());
+        let style = editor_style();
+        let x_of = |s: &str| hw + 64.0 + PAD + crate::text::measure(s, &style).w;
+        // A press just past "hello": the caret goes there, still editing.
+        let at = Point::new(x_of("hello") + 1.0, HEADER_H + 30.0);
+        app.handle_event(Event::PointerDown { at });
+        app.handle_event(Event::PointerUp { at });
+        app.tick();
+        let g = state.get_cloned();
+        assert_eq!(g.edit.as_ref().map(|e| e.caret()), Some(5));
+        assert!(!log.borrow().iter().any(|a| matches!(a, GridAction::Commit { .. })));
+        // Dragged from the start to past "hello w": that is selected.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        app.handle_event(Event::PointerDown { at: Point::new(x_of("") + 1.0, HEADER_H + 30.0) });
+        app.handle_event(Event::PointerMove { at: Point::new(x_of("hello w") + 1.0, HEADER_H + 30.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(x_of("hello w") + 1.0, HEADER_H + 30.0) });
+        app.tick();
+        assert_eq!(state.get_cloned().edit.unwrap().selected_text(), "hello w");
+        // A press on another cell still commits and moves there.
+        let c5 = Point::new(hw + 128.0 + 10.0, HEADER_H + 85.0);
+        app.handle_event(Event::PointerDown { at: c5 });
+        app.handle_event(Event::PointerUp { at: c5 });
+        app.tick();
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Commit { row: 1, col: 1, .. })));
     }
 
     #[test]

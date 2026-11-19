@@ -143,7 +143,9 @@ pub enum Response {
     /// `encrypted` false: the folders stay plain (not on Tessera, or no
     /// keys on this machine), and never were encrypted. `moved`: folders
     /// whose old files were moved in this time.
-    FoldersReady { encrypted: bool, moved: Vec<String> },
+    /// `waiting`: plain folders left as they are for now because they are
+    /// in use (something mounted in or from them); a later ask moves them.
+    FoldersReady { encrypted: bool, moved: Vec<String>, #[serde(default)] waiting: Vec<String> },
     /// A folder isn't in the group it must be in (§5.4 expected groups):
     /// don't hand it out.
     FoldersRefused { folder: String, detail: String },

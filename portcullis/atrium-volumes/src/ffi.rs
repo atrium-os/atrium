@@ -301,6 +301,34 @@ pub fn tessera_scrub(path: &Path) -> io::Result<ScrubReport> {
 
 /// Copy the `user.atrium.origin` attribute (where a download came from)
 /// from one open file to another. Absent: nothing to do.
+/// Whether anything is mounted at or below `dir`, or mounted from it (a
+/// nullfs of it into a jail): moving such a folder would leave the mount
+/// on the old copy (E6).
+#[cfg(target_os = "freebsd")]
+pub fn mounts_under(dir: &Path) -> bool {
+    // SAFETY: a null buffer asks for the count only.
+    let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return false;
+    }
+    let mut v: Vec<libc::statfs> = vec![unsafe { std::mem::zeroed() }; n as usize + 8];
+    let size = (v.len() * std::mem::size_of::<libc::statfs>()) as libc::c_long;
+    // SAFETY: v holds `size` bytes of statfs records.
+    let n = unsafe { libc::getfsstat(v.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return false;
+    }
+    let s = |b: &[libc::c_char]| -> std::path::PathBuf {
+        std::path::PathBuf::from(b.iter().take_while(|&&c| c != 0).map(|&c| c as u8 as char).collect::<String>())
+    };
+    v[..n as usize].iter().any(|f| s(&f.f_mntonname).starts_with(dir) || s(&f.f_mntfromname).starts_with(dir))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn mounts_under(_dir: &Path) -> bool {
+    false
+}
+
 #[cfg(target_os = "freebsd")]
 pub fn copy_origin(from: &std::fs::File, to: &std::fs::File) -> io::Result<()> {
     use std::os::fd::AsRawFd;

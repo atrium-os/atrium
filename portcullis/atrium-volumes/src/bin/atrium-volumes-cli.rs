@@ -11,7 +11,7 @@
 //!     atrium-volumes-cli <socket> status [<jail>]
 //!     atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
 //!     atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
-//!     atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
+//!     atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid>[/<mode>] <dir>...
 //!     atrium-volumes-cli <socket> erase <person> <persona> [home]
 //!
 //! kind = persistent | tmpfs
@@ -33,7 +33,7 @@ usage:
   atrium-volumes-cli <socket> status [<jail>]
   atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
   atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
-  atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
+  atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid>[/<mode>] <dir>...
   atrium-volumes-cli <socket> erase <person> <persona> [home]
 
 kind = persistent | tmpfs
@@ -86,17 +86,19 @@ fn main() -> ExitCode {
             })
         }
         // A persona's folders, encrypted (tessera-encryption.md E4.6), as
-        // portcullisd asks at login; mode 2770.
+        // portcullisd asks at login; mode 2770 unless given in octal after
+        // the gid (E6: app data, e.g. `0/755`).
         "folders" => {
             if rest.len() < 5 { return usage(); }
-            let (Ok(uid), Ok(gid)) = (rest[2].parse(), rest[3].parse()) else { return usage() };
+            let (g, m) = rest[3].split_once('/').unwrap_or((&rest[3], "2770"));
+            let (Ok(uid), Ok(gid), Ok(mode)) = (rest[2].parse(), g.parse(), u32::from_str_radix(m, 8)) else { return usage() };
             Request::PersonaFolders(PersonaFoldersRequest {
                 person: rest[0].clone(),
                 persona: rest[1].clone(),
                 folders: rest[4..].to_vec(),
                 uid,
                 gid,
-                mode: 0o2770,
+                mode,
             })
         }
         "erase" => {

@@ -38,7 +38,12 @@
 #      (E5) the rest of her Work Arca goes too, so a Work stick's key
 #      leaves the kernel and can't be found (the stick shows Locked), and
 #      the volume is scrubbed so the Work app data deleted in the clear is
-#      not on the disk; added again, it gets a new group.
+#      not on the disk; added again, it gets a new group;
+#   6. (E6) b's app data from before (session state, a workspace, an app's
+#      overlay image) moves into his Personal group; a part with an overlay
+#      still mounted waits until it is unmounted; the image stays sparse and
+#      mounts from the group; nothing of it is left in the clear; while he
+#      is out root can read none of it.
 # Ends "personas: N failed".
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -239,6 +244,57 @@ check "…and its expectation" 2 "$(g "grep -c '^\[\[group\]\]' $T/groups.toml")
 check "a's Personal is untouched" "$OLDSUM" "$(g "md5 -q $HA/Documents/letters/old-letter-secret.txt")"
 r=$(ask e46a work $GA $WA)
 check "Work added again: a new group" yes "$(g2=$(grp $WA/Documents); [ -n "$g2" ] && [ "$g2" != 0 ] && [ "$g2" != "$GWA" ] && echo yes || echo no)"
+
+echo "=== 6. app data moves into Personal's group (E6)"
+# b's app data from before E6, plain, as portcullis left it: session state,
+# a workspace, and an app's overlay (its own Tessera volume in an image
+# file), still mounted the first time.
+AB=$HB/.atrium
+g "mkdir -p $AB/apps $AB/state/org.x.dock $AB/workspaces/scratch/work && chmod 755 $AB $AB/apps $AB/state && chown root:$GB $AB/workspaces && chmod 750 $AB/workspaces && echo 'b dock state secret' > $AB/state/org.x.dock/state.toml && echo 'b workspace notes secret' > $AB/workspaces/scratch/work/notes.txt"
+g "$MKFS --plain --create -s 64 $AB/apps/org.x.mail.img >/dev/null && mkdir $AB/apps/org.x.mail"
+OM=$(g "mdconfig -a -t vnode -f $AB/apps/org.x.mail.img")
+g "mount -t tessera /dev/$OM $AB/apps/org.x.mail && jot -w 'b mail cache line %06d' 20000 > $AB/apps/org.x.mail/mail-cache-secret.db && sync"
+MSUM=$(g "md5 -q $AB/apps/org.x.mail/mail-cache-secret.db")
+IMGLEN=$(g "stat -f %z $AB/apps/org.x.mail.img")
+appdata() { # what portcullisd asks before a launch
+    g "$CLI $VS folders e46b personal 0 0/755 $AB/apps $AB/state; $CLI $VS folders e46b personal 0 $GB/750 $AB/workspaces $AB/cache" 2>/dev/null | tr -d ' \n'
+}
+r=$(appdata)
+check "an overlay still mounted: apps waits, plain" yes "$(echo "$r" | grep -qF "\"waiting\":[\"$AB/apps\"]" && echo yes || echo no)"
+check "…state and workspaces move in" "$GPB $GPB $GPB" "$(for d in state workspaces cache; do grp $AB/$d; done | tr '\n' ' ' | sed 's/ $//')"
+check "…apps is still plain" 0 "$(grp $AB/apps)"
+check "…the state reads" "b dock state secret" "$(g "cat $AB/state/org.x.dock/state.toml")"
+check "…workspaces keeps root:files 750" "root files-e46b 750" "$(g "stat -f '%Su %Sg %Lp' $AB/workspaces")"
+# portcullisd unmounts it at logout (SessionEnded); here by hand.
+g "umount $AB/apps/org.x.mail && mdconfig -d -u ${OM#md}"
+r=$(appdata)
+check "free: apps moves in" yes "$(echo "$r" | grep -qF "\"moved\":[\"$AB/apps\"]" && echo yes || echo no)"
+check "…into b's Personal group" "$GPB" "$(grp $AB/apps)"
+check "…apps keeps root 755" "root 755" "$(g "stat -f '%Su %Lp' $AB/apps")"
+check "…the image keeps its length" "$IMGLEN" "$(g "stat -f %z $AB/apps/org.x.mail.img")"
+check "…and stays sparse" yes "$([ "$(g "du -k $AB/apps/org.x.mail.img | cut -f1")" -lt $((IMGLEN / 1024 / 2)) ] && echo yes || echo no)"
+OM=$(g "mdconfig -a -t vnode -f $AB/apps/org.x.mail.img")
+check "the overlay mounts from the group" yes "$(g "mount -t tessera /dev/$OM $AB/apps/org.x.mail" && echo yes || echo no)"
+check "…and its file reads" "$MSUM" "$(g "md5 -q $AB/apps/org.x.mail/mail-cache-secret.db")"
+for i in $(seq 1 120); do
+    [ "$(g "test -s $T/volumes.scrub && echo q || echo e")" = e ] && break
+    sleep 1
+done
+check "the move-in's scrub ran" e "$(g "test -s $T/volumes.scrub && echo q || echo e")"
+for w in 'b mail cache line' mail-cache-secret 'b dock state secret' 'b workspace notes secret'; do
+    check "b's '$w' not on the disk in the clear" 0 "$(g "grep -ac '$w' /dev/$MD")"
+done
+g "umount $AB/apps/org.x.mail && mdconfig -d -u ${OM#md}"
+logout e46b
+check "b out: root can't read his overlay image" no "$(g "dd if=$AB/apps/org.x.mail.img of=/dev/null bs=64k count=1 2>/dev/null && echo yes || echo no")"
+check "…nor his session state" no "$(g "cat $AB/state/org.x.dock/state.toml >/dev/null 2>&1 && echo yes || echo no")"
+login e46b b-horse
+r=$(appdata)
+check "b back: his app data is ready" yes "$(echo "$r" | grep -qF '"moved":[],"waiting":[]' && echo yes || echo no)"
+OM=$(g "mdconfig -a -t vnode -f $AB/apps/org.x.mail.img")
+g "mount -t tessera /dev/$OM $AB/apps/org.x.mail"
+check "…his overlay reads again" "$MSUM" "$(g "md5 -q $AB/apps/org.x.mail/mail-cache-secret.db")"
+g "umount $AB/apps/org.x.mail; mdconfig -d -u ${OM#md}"
 
 echo "=== cleanup"
 pkill_vol

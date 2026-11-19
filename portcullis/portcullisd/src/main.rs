@@ -905,7 +905,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         if matches!(req,
             Request::LaunchSessionComponent { .. }
             | Request::VerifyCredential { .. }
-            | Request::TeardownSessionComponent { .. })
+            | Request::TeardownSessionComponent { .. }
+            | Request::SessionEnded { .. })
         {
             let resp = handle_session(uid, req, &shared);
             write_response(&mut writer, &resp)?;
@@ -3197,6 +3198,8 @@ fn prepare_state_dir(owner: &str, app_id: &str, uid: u32) -> std::io::Result<Str
         Some(home) => {
             use std::os::unix::fs::MetadataExt;
             portcullis_overlay::apps_root(&home).map_err(std::io::Error::other)?;
+            // In the person's Personal key group (E6), before it is mounted.
+            portcullisd::home::ensure_app_data(owner, None).map_err(std::io::Error::other)?;
             let st = home.join(".atrium").join("state");
             match std::fs::symlink_metadata(&st) {
                 // root's real folder, so the person can't point it at
@@ -3279,7 +3282,47 @@ fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
             launch_session_component(&component_id, &owner_name, shared),
         Request::TeardownSessionComponent { jail_name } =>
             teardown_session_component(&jail_name, shared),
+        Request::SessionEnded { user } => session_ended(&user),
         _ => Response::Error { message: "not a session request".into() },
+    }
+}
+
+/// `user` is logging out (E6): their app overlays are in key groups that
+/// lock with their Arca, so everything of theirs that holds one stops
+/// first. Their apps' processes (every persona) are asked to end, then
+/// killed; their workspaces stop; then each overlay is unmounted (a jail's
+/// teardown may take a moment to release it). What stays in use is
+/// reported: the kernel flushes it as the keys go, and its reads fail.
+fn session_ended(user: &str) -> Response {
+    if !portcullis_overlay::plain_segment(user) || portcullis_overlay::home_of(user).is_none() {
+        return Response::Ok;
+    }
+    let uids = launch::user_uids(user);
+    launch::end_processes(&uids);
+    if let Ok(list) = workspace::list(user) {
+        for (r, running) in list {
+            if running {
+                workspace::stop(user, &r.name);
+            }
+        }
+    }
+    let mut busy = Vec::new();
+    for i in 0..20 {
+        busy = portcullis_overlay::teardown_person(user);
+        if busy.is_empty() {
+            break;
+        }
+        if i == 10 {
+            launch::end_processes(&uids);
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if busy.is_empty() {
+        eprintln!("portcullisd: {user} logging out: {} app uid(s) stopped, overlays unmounted", uids.len());
+        Response::Ok
+    } else {
+        eprintln!("portcullisd: {user} logging out: still in use: {}", busy.join("; "));
+        Response::Error { message: format!("still in use: {}", busy.join("; ")) }
     }
 }
 
@@ -3517,7 +3560,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         },
         Request::LaunchSessionComponent { .. }
         | Request::VerifyCredential { .. }
-        | Request::TeardownSessionComponent { .. } => Response::Error {
+        | Request::TeardownSessionComponent { .. }
+        | Request::SessionEnded { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
