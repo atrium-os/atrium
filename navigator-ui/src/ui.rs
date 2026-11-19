@@ -1155,6 +1155,13 @@ fn form_bar(ctx: &mut Ctx, r: Rect, network: &str, f: Option<&shell::FormPanel>,
         let row_cy = y + row.h() / 2.0;
         let st2 = st.clone();
         match fld.kind {
+            FieldKind::Password if p.arca_field() == Some(i) => {
+                // Arca's own field, in its surface: the keys go there.
+                text(ctx, x, row_cy, &fit(&fld.label, &ls, label_w), type_size::SM, Weight::Regular, t.text_secondary());
+                let fr = Rect::new(cx, y + em(4.0), cw.max(pergola::widgets::credential_field::MIN_W), em(28.0).max(pergola::widgets::credential_field::MIN_H));
+                let id = ctx.add(Node::Rect { rect: fr, fill: t.bg_canvas(), radius: em(6.0) });
+                ctx.slot(id, shell::ARCA_SLOT);
+            }
             FieldKind::Text | FieldKind::Password => {
                 // The whole row, its label too, gives the field the keys.
                 let rr = Rect::new(x - em(4.0), y + em(2.0), label_w + cw + em(24.0), em(32.0));

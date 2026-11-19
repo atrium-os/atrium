@@ -206,6 +206,7 @@ impl State {
             },
             Label::WebBroker { user, .. } if op == broker_op::W_TICKET => self.broker_ticket(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_FORGET => self.broker_forget(user, body),
+            Label::WebBroker { user, publisher, app_id } if op == broker_op::W_HANDLE_FOR => self.broker_handle_for(user, publisher, app_id, body),
             Label::WebBroker { user, .. } if op == broker_op::W_SIGN_OUT => self.broker_sign_out(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_ACCOUNTS => self.broker_accounts(user, body),
             Label::WebBroker { user, .. } if op == broker_op::W_SCRIPT_COOKIES => self.broker_script_cookies(user, body),
@@ -1048,6 +1049,17 @@ impl State {
             out.as_mut()[4..].copy_from_slice(v.as_ref());
             return Reply { status: status::OK, body: Body::Secret(out) };
         }
+        if op == op::VPN_FORGET_JAR {
+            if name != op::CRYPTA_SERVICE {
+                return reply(status::DENIED);
+            }
+            let mut r = Reader::new(body);
+            let Ok(profile) = r.str(caps::ACCOUNT) else { return malformed() };
+            if r.end().is_err() || profile.is_empty() || profile.contains('.') {
+                return malformed();
+            }
+            return self.vpn_forget_jar(&format!("{}{profile}.", crate::jar::VPN_JAR));
+        }
         if op == op::TAKE_WIFI {
             // What the user typed into a Wi-Fi passphrase field: only the
             // Wi-Fi key service redeems it, once (curia.md §4).
@@ -1635,6 +1647,27 @@ impl State {
         ok(n.to_le_bytes().to_vec())
     }
 
+    /// A typed password goes with the form the person pressed to send
+    /// (`broker_op::W_HANDLE_FOR`).
+    fn broker_handle_for(&mut self, user: &str, publisher: &[u8; 32], app_id: &str, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let h = r.array::<16>()?;
+            let ep = crate::proto::read_endpoint(&mut r)?;
+            let partition = r.str(caps::HOST)?.to_string();
+            r.end()?;
+            Ok::<_, Error>((h, ep, partition))
+        })();
+        let Ok((h, ep, partition)) = parsed else { return malformed() };
+        let Recipient::Endpoint { scheme, host, port, .. } = ep else { return malformed() };
+        let Ok(to) = Recipient::endpoint(scheme, &host, port, Some(&partition)) else { return malformed() };
+        let Ok(from) = Recipient::app(*publisher, app_id) else { return malformed() };
+        match self.handles.rebind(&h, user, &from, broker_op::WEB_PERSONA, to) {
+            Some(n) => ok(n.to_vec()),
+            None => reply(status::DENIED),
+        }
+    }
+
     /// "Sign out here" (`broker_op::W_SIGN_OUT`): one partition's session
     /// cookies go, in memory or in the store.
     fn broker_sign_out(&mut self, user: &str, body: &[u8]) -> Reply {
@@ -1777,6 +1810,31 @@ impl State {
         }
         *item = Some(m.id);
         ok(Vec::new())
+    }
+
+    /// A VPN profile's sign-in jar, everywhere it can be reached: memory,
+    /// and every unlocked person's store. A locked store keeps its copy
+    /// until the profile's name is used again (cryptad asks at `create`
+    /// too).
+    fn vpn_forget_jar(&mut self, prefix: &str) -> Reply {
+        let mut n = 0u32;
+        let users: Vec<String> = self.stores.keys().cloned().collect();
+        for user in &users {
+            n += (self.jars.forget(user, prefix, true) > 0) as u32;
+            let Some(store) = self.stores.get_mut(user) else { continue };
+            let jars: Vec<Recipient> = tri!(store.recipients())
+                .into_iter()
+                .filter(|(persona, rec)| {
+                    persona == broker_op::WEB_PERSONA && matches!(rec, Recipient::Endpoint { partition: Some(p), .. } if p.starts_with(prefix))
+                })
+                .map(|(_, rec)| rec)
+                .collect();
+            for rec in &jars {
+                tri!(store.forget(&Access { persona: broker_op::WEB_PERSONA, recipient: rec }));
+                n += 1;
+            }
+        }
+        ok(n.to_le_bytes().to_vec())
     }
 
     /// Keep one cookie a web courier (or, `script`, a page's

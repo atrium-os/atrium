@@ -56,6 +56,8 @@ pub fn history_clear_all(x: f32, col: f32) -> (f32, f32) {
 pub const PAGE_SLOT: u64 = 0x5041_4745; // "PAGE"
 /// The print sheet's slot, over the whole window while it is open.
 pub const PRINT_SLOT: u64 = 0x5052_4e54; // "PRNT"
+/// Arca's password field in a VPN sign-in window's form panel.
+pub const ARCA_SLOT: u64 = 0x4152_4341; // "ARCA"
 
 /// The Where field while it is focused (§5.3).
 #[derive(Clone, Debug)]
@@ -168,6 +170,18 @@ pub struct FormPanel {
     pub checked: Vec<bool>,
     /// The text field with the keys.
     pub focus: Option<usize>,
+    /// Arca's handle for what was typed into its field (a VPN sign-in
+    /// window's password field, [`FormPanel::arca_field`]).
+    pub arca: Option<[u8; 16]>,
+    /// A press on a button before Arca's handle came (the field holds what
+    /// was typed when it loses the keys, which the press itself does): the
+    /// form goes when the handle comes, or without it at the deadline.
+    pub waiting: Option<(usize, Option<navigator_control::Press>, std::time::Instant)>,
+    /// A VPN sign-in window's panel: its password is Arca's field.
+    pub vpn: bool,
+    /// Counts the forms sent: Arca's field is asked for anew after each
+    /// (its handle went with the form).
+    pub sent: u32,
 }
 
 impl FormPanel {
@@ -183,11 +197,25 @@ impl FormPanel {
         self.form.fields.iter().enumerate().filter(|(_, f)| f.kind == limen::doc_viewer::FieldKind::Submit).map(|(i, _)| i).take(4).collect()
     }
 
-    fn texts(&self) -> Vec<usize> {
+    pub fn texts(&self) -> Vec<usize> {
         use limen::doc_viewer::FieldKind::*;
-        self.rows().into_iter().filter(|&i| matches!(self.form.fields[i].kind, Text | Password)).collect()
+        let arca = self.arca_field();
+        self.rows().into_iter().filter(|&i| matches!(self.form.fields[i].kind, Text | Password) && Some(i) != arca).collect()
+    }
+
+    /// The password field Arca draws (in its own surface, in
+    /// [`ARCA_SLOT`]): a VPN sign-in window's first, so the password never
+    /// reaches this process or navigatord (arca-autofill.md §3).
+    pub fn arca_field(&self) -> Option<usize> {
+        if !self.vpn {
+            return None;
+        }
+        self.rows().into_iter().find(|&i| self.form.fields[i].kind == limen::doc_viewer::FieldKind::Password)
     }
 }
+
+/// How long a press waits for Arca's handle.
+pub const ARCA_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// The form panel's rows and its heading.
 pub const FORM_ROW: f32 = 36.0;
@@ -1302,7 +1330,7 @@ impl Shell {
         let n = form.fields.len();
         let edits = form.fields.iter().map(|f| TextEdit::new(&f.value)).collect();
         let checked = form.fields.iter().map(|f| f.checked).collect();
-        let mut p = FormPanel { key, form, edits, checked, focus: None };
+        let mut p = FormPanel { key, form, edits, checked, focus: None, arca: None, waiting: None, vpn: window_vpn(), sent: 0 };
         p.focus = p.texts().first().copied();
         debug_assert_eq!(p.edits.len(), n);
         self.form = Some(p);
@@ -1334,6 +1362,7 @@ impl Shell {
         let Some(p) = &mut self.form else { return };
         let Some(f) = p.form.fields.get(i) else { return };
         match f.kind {
+            Password if p.arca_field() == Some(i) => {}
             Text | Password => p.focus = Some(i),
             Checkbox => p.checked[i] = !p.checked[i],
             Radio => {
@@ -1382,13 +1411,33 @@ impl Shell {
     /// the person filled it, with that button's own name and value.
     pub fn submit_form(&mut self, i: usize, press: Option<navigator_control::Press>) {
         use limen::doc_viewer::FieldKind::*;
-        let (Some(p), Some(page)) = (&self.form, self.shown_url()) else { return };
+        let (Some(p), Some(_)) = (&self.form, self.shown_url()) else { return };
         if p.form.fields.get(i).is_none_or(|f| f.kind != Submit) || p.key != self.shown_key() {
             return;
         }
+        if p.arca_field().is_some() && p.arca.is_none() {
+            // Arca holds what was typed as its field loses the keys, which
+            // this press just did: the form waits for its handle.
+            if let Some(f) = &mut self.form {
+                f.waiting = Some((i, press, std::time::Instant::now() + ARCA_WAIT));
+            }
+            return;
+        }
+        self.send_form(i, press);
+    }
+
+    /// The form as filled, with button `i`, to navigatord.
+    fn send_form(&mut self, i: usize, press: Option<navigator_control::Press>) {
+        use limen::doc_viewer::FieldKind::*;
+        let (Some(p), Some(page)) = (&self.form, self.shown_url()) else { return };
+        let arca = p.arca_field();
         let mut fields = Vec::new();
         for (j, f) in p.form.fields.iter().enumerate() {
             if f.name.is_empty() {
+                continue;
+            }
+            if Some(j) == arca {
+                fields.push(navigator_control::FormField { name: f.name.clone(), value: String::new(), typed: true, arca: p.arca });
                 continue;
             }
             let (value, typed) = match f.kind {
@@ -1398,10 +1447,40 @@ impl Shell {
                 Submit if j == i => (f.value.clone(), false),
                 _ => continue,
             };
-            fields.push(navigator_control::FormField { name: f.name.clone(), value, typed });
+            fields.push(navigator_control::FormField { name: f.name.clone(), value, typed, arca: None });
         }
-        self.last_note = Some(format!("sent \"{}\"", p.form.fields[i].label));
-        self.outbox.push(Out::SubmitForm { page, jar: self.store.trail().jar(), action: p.form.action.clone(), post: p.form.post, fields, press: press.unwrap_or_default() });
+        let (label, action, post) = (p.form.fields[i].label.clone(), p.form.action.clone(), p.form.post);
+        // Spent: a handle goes with one form.
+        if let Some(f) = &mut self.form {
+            f.arca = None;
+            f.waiting = None;
+            f.sent += 1;
+        }
+        self.last_note = Some(format!("sent \"{label}\""));
+        self.outbox.push(Out::SubmitForm { page, jar: self.store.trail().jar(), action, post, fields, press: press.unwrap_or_default() });
+    }
+
+    /// Arca's field said what it holds: a handle, or nothing (cleared). A
+    /// press that waited for it sends its form now.
+    pub fn arca_handle(&mut self, h: Option<[u8; 16]>) {
+        let Some(p) = &mut self.form else { return };
+        p.arca = h;
+        if let (Some(_), Some((i, press, _))) = (h, p.waiting.take()) {
+            self.send_form(i, press);
+        }
+    }
+
+    /// A press that waited past [`ARCA_WAIT`]: the field was empty, and
+    /// the form goes without it.
+    pub fn arca_tick(&mut self, now: std::time::Instant) {
+        let Some(p) = &mut self.form else { return };
+        if let Some((i, press, at)) = p.waiting {
+            if now >= at {
+                p.waiting = None;
+                p.arca = None;
+                self.send_form(i, press);
+            }
+        }
     }
 
     /// The page child's answer.
@@ -1709,6 +1788,44 @@ mod tests {
         let (t, _) = s.shown_key().unwrap();
         let (jar, knows) = s.store.presence_of(t, "https://atlas.example/").unwrap();
         assert!(matches!(jar, navigator_control::Jar::Unrecorded(j) if j != 0) && !knows);
+    }
+
+    #[test]
+    fn a_vpn_sign_in_sends_arcas_handle_for_the_password_never_a_value() {
+        use limen::doc_viewer::{Field, FieldKind::*, Form};
+        let f = |kind, name: &str, label: &str, value: &str| Field { kind, name: name.into(), label: label.into(), value: value.into(), checked: false };
+        let form = Form { action: "/login".into(), post: true, fields: vec![
+            f(Text, "username", "Username", ""), f(Password, "password", "Password", ""), f(Submit, "login", "Sign In", "")] };
+        let mut s = Shell::new(TrailStore::empty(), 1280.0, 696.0);
+        s.live = Some(LivePage::Loading(String::new()));
+        s.store.new_trail(true);
+        s.enter("https://idp.example/auth");
+        s.portal = Some("the corp VPN".into());
+        s.set_forms(vec![form.clone()]);
+        s.form.as_mut().unwrap().vpn = true;
+        let p = s.form.as_ref().unwrap();
+        assert_eq!((p.arca_field(), p.texts()), (Some(1), vec![0]), "the password is Arca's field, not the panel's");
+        s.form_field(1);
+        assert_eq!(s.form.as_ref().unwrap().focus, Some(0), "the panel never takes its keys");
+        for c in "alice".chars() {
+            s.form_key(Key::Char, Modifiers::default(), &c.to_string());
+        }
+        // The press comes before Arca's handle (its field held what was
+        // typed as it lost the keys): the form waits for it.
+        s.submit_form(2, None);
+        assert!(s.outbox.is_empty() && s.form.as_ref().unwrap().waiting.is_some());
+        s.arca_handle(Some([7; 16]));
+        let Some(Out::SubmitForm { fields, .. }) = s.outbox.pop() else { panic!("{:?}", s.outbox) };
+        let got: Vec<_> = fields.iter().map(|f| (f.name.as_str(), f.value.as_str(), f.typed, f.arca)).collect();
+        assert_eq!(got, vec![("username", "alice", true, None), ("password", "", true, Some([7; 16])), ("login", "", false, None)]);
+        let p = s.form.as_ref().unwrap();
+        assert_eq!((p.arca, p.sent), (None, 1), "the handle went with the form; Arca's field is asked anew");
+        // No handle in time: the field was empty, the form goes without it.
+        s.submit_form(2, None);
+        s.arca_tick(std::time::Instant::now() + ARCA_WAIT);
+        let Some(Out::SubmitForm { fields, .. }) = s.outbox.pop() else { panic!("{:?}", s.outbox) };
+        assert_eq!(fields[1].arca, None);
+        assert_eq!(fields[1].value, "");
     }
 
     #[test]

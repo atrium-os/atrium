@@ -34,7 +34,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use arca_courier::schema::{Header, Method, Request, Response, Segment};
+use arca_courier::schema::{Encoding, Header, Method, Place, Request, Response, Segment, Slot};
 use arca_store::codec::Writer;
 
 /// As navigator-fetch's.
@@ -78,19 +78,23 @@ pub struct Fetch {
     pub gesture: bool,
     /// A form's fields, `application/x-www-form-urlencoded` (a POST).
     pub body: Vec<u8>,
+    /// A password the person typed into Arca's field, which goes into
+    /// `body` at this byte offset (form-encoded by the courier), never
+    /// through this process: Arca's handle for it (arca-autofill.md §3).
+    pub secret: Option<(usize, [u8; 16])>,
 }
 
 impl Fetch {
     pub fn navigation(url: &str, initiator: Option<&str>, gesture: bool) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![] }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Navigation, initiator: initiator.map(Into::into), gesture, body: vec![], secret: None }
     }
     pub fn subresource(url: &str, page_host: &str) -> Fetch {
-        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![] }
+        Fetch { url: url.into(), method: Method::Get, reason: Reason::Subresource, initiator: Some(page_host.into()), gesture: false, body: vec![], secret: None }
     }
     /// A form the reader pressed to send, as a POST of `body` from a page
     /// on `page_host`. Only a sign-in window's view sends one.
     pub fn form(url: &str, page_host: &str, body: Vec<u8>) -> Fetch {
-        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body }
+        Fetch { url: url.into(), method: Method::Post, reason: Reason::Form, initiator: Some(page_host.into()), gesture: true, body, secret: None }
     }
 }
 
@@ -192,6 +196,11 @@ pub trait Arca {
     }
     fn accounts(&mut self, _site: &str) -> Result<Vec<(u8, String)>, String> {
         Err("this Arca cannot list accounts".into())
+    }
+    /// A typed password's handle, handed on to the form's endpoint and
+    /// jar (arcad `W_HANDLE_FOR`): the handle the courier fills from.
+    fn handle_for(&mut self, _handle: &[u8; 16], _host: &str, _port: u16, _partition: &str) -> Result<[u8; 16], String> {
+        Err("this Arca cannot hand on a password".into())
     }
 }
 
@@ -333,6 +342,8 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
         if f.reason == Reason::Form && !form { return Err(Refused::Method) }
         if f.body.len() > arca_courier::schema::BODY_MAX { return Err(Refused::Malformed("the form is too big".into())) }
         let (mut method, mut reason, mut form_body) = (f.method, f.reason, f.body.clone());
+        if f.secret.is_some_and(|(at, _)| at > f.body.len() || !form) { return Err(Refused::Malformed("a password goes only in a sign-in window's form".into())) }
+        let mut secret = f.secret;
         let mut url = url::Url::parse(&f.url).map_err(|e| Refused::Malformed(e.to_string()))?;
         if url.scheme() != "https" { return Err(Refused::NotHttps) }
         let origin = f.initiator.clone().unwrap_or_default().to_ascii_lowercase();
@@ -358,16 +369,29 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             if method == Method::Post {
                 headers.push((Header::ContentType, b"application/x-www-form-urlencoded".to_vec()));
             }
-            let segs = if form_body.is_empty() { vec![] } else { vec![Segment::Literal(form_body.clone())] };
-            let req = |ticket| Request { method, path: path.clone().into_bytes(), query: query.clone().into_bytes(),
-                                headers: headers.clone(), slots: vec![], body: segs.clone(), ticket: Some(ticket) };
+            let segs = |at: Option<usize>| match at {
+                // The password's place: Arca's courier puts it there.
+                Some(at) => [Segment::Literal(form_body[..at].to_vec()), Segment::Slot { slot: 0, encoding: Encoding::Form },
+                             Segment::Literal(form_body[at..].to_vec())].into_iter().filter(|s| *s != Segment::Literal(vec![])).collect(),
+                None if form_body.is_empty() => vec![],
+                None => vec![Segment::Literal(form_body.clone())],
+            };
+            let req = |ticket, slot: Option<(usize, [u8; 16])>| Request { method, path: path.clone().into_bytes(), query: query.clone().into_bytes(),
+                                headers: headers.clone(),
+                                slots: slot.map(|(_, h)| vec![Slot { source: arcad::proto::courier_op::SOURCE_HANDLE, reference: h, place: Place::Body }]).unwrap_or_default(),
+                                body: segs(slot.map(|(at, _)| at)), ticket: Some(ticket) };
             // A ticket is spent once: a courier that failed mid-exchange
-            // may have spent it, so the one retry asks for a new one.
+            // may have spent it, so the one retry asks for a new one. A
+            // password's handle is spent too: no retry with one.
             let mut sent = Err(String::new());
-            for _ in 0..2 {
+            let slot = match secret.take() {
+                Some((at, h)) => Some((at, self.arca.handle_for(&h, &host, port, &partition).map_err(Refused::Ticket)?)),
+                None => None,
+            };
+            for _ in 0..if slot.is_some() { 1 } else { 2 } {
                 self.tickets += 1;
                 let ticket = self.arca.ticket(&ask).map_err(Refused::Ticket)?;
-                sent = self.couriers.send(&host, port, &partition, &req(ticket));
+                sent = self.couriers.send(&host, port, &partition, &req(ticket, slot));
                 if sent.is_ok() { break }
             }
             let resp = sent.map_err(Refused::Courier)?;
@@ -457,6 +481,15 @@ impl Arca for ArcadSocket {
         if st != arcad::proto::status::OK { return Err(format!("arcad refused to forget (status {st})")) }
         let b: [u8; 4] = body.as_ref().try_into().map_err(|_| "arcad: a count is 4 bytes".to_string())?;
         Ok(u32::from_le_bytes(b))
+    }
+
+    fn handle_for(&mut self, handle: &[u8; 16], host: &str, port: u16, partition: &str) -> Result<[u8; 16], String> {
+        let mut w = Writer::new();
+        w.raw(handle);
+        arcad::proto::write_endpoint(&mut w, host, port);
+        w.str(partition);
+        let body = self.ask(arcad::proto::broker_op::W_HANDLE_FOR, &w.buf, "hand on the password")?;
+        body.as_slice().try_into().map_err(|_| "arcad: a handle is 16 bytes".to_string())
     }
 
     fn sign_out(&mut self, partition: &str) -> Result<u32, String> {

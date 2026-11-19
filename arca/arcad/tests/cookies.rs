@@ -611,4 +611,53 @@ fn a_vpn_sign_in_jars_token_is_cryptas() {
     assert_eq!(get_t(&mut s, &plain, "/", Some(t)).0, status::OK);
     assert_eq!(set_t(&mut s, &plain, "acSamlv2Token", "Secure", "/", Some(t)), status::OK);
     assert_eq!(items(&mut s).0, 1);
+    // The profile removed: its sign-in jar goes, nothing else does.
+    let forget = |s: &mut State, who: &Label, p: &str| s.handle(who, op::VPN_FORGET_JAR, &body(|w| w.str(p)));
+    assert_eq!(forget(&mut s, &Label::Service("aura-keys".into()), "corp").status, status::DENIED);
+    assert_eq!(forget(&mut s, &crypta, "corp.x").status, status::MALFORMED);
+    let r = forget(&mut s, &crypta, "corp");
+    assert_eq!(r.status, status::OK);
+    assert!(u32::from_le_bytes(r.body.bytes()[..4].try_into().unwrap()) >= 1);
+    let t = ticket(&mut s, "idp.example", "vpn-corp.idp.example", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &idp, "/", Some(t)), (status::OK, "".into()), "the IdP's session went with the profile");
+    let t = ticket(&mut s, "gw.crypta.test", "crypta.test", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &plain, "/", Some(t)), (status::OK, "acSamlv2Token=v".into()), "browsing's jar stays");
+}
+
+#[test]
+fn a_password_typed_in_the_brokers_window_goes_with_its_form_only() {
+    let (_d, mut s) = setup();
+    let hold = |s: &mut State| -> [u8; 16] {
+        let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { w.str("alice"); w.raw(&[9; 32]); w.str(BROKER); w.bytes(b"idp-pw"); }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().try_into().unwrap()
+    };
+    let for_ = |s: &mut State, who: &Label, h: [u8; 16], host: &str, partition: &str| {
+        s.handle(who, arcad::proto::broker_op::W_HANDLE_FOR, &body(|w| { w.raw(&h); arcad::proto::write_endpoint(w, host, 443); w.str(partition); }))
+    };
+    let fill = |s: &mut State, c: &Label, h: [u8; 16]| s.handle(c, cop::FILL, &body(|w| { w.u8(1); w.u8(cop::SOURCE_HANDLE); w.raw(&h); }));
+    let idp = web("idp.example", "vpn-corp.idp.example");
+    // The typed value itself is never a courier's.
+    let h = hold(&mut s);
+    assert_eq!(fill(&mut s, &idp, h).status, status::DENIED);
+    // Through the broker, for the form's endpoint and jar: once.
+    let h = hold(&mut s);
+    let r = for_(&mut s, &broker(), h, "idp.example", "vpn-corp.idp.example");
+    assert_eq!(r.status, status::OK);
+    let n: [u8; 16] = r.body.bytes().try_into().unwrap();
+    assert_eq!(for_(&mut s, &broker(), h, "idp.example", "vpn-corp.idp.example").status, status::DENIED, "the old handle is spent");
+    assert_eq!(fill(&mut s, &web("idp.example", "idp.example"), n).status, status::DENIED, "another jar burns it");
+    let h = hold(&mut s);
+    let n: [u8; 16] = for_(&mut s, &broker(), h, "idp.example", "vpn-corp.idp.example").body.bytes().try_into().unwrap();
+    let r = fill(&mut s, &idp, n);
+    assert_eq!(r.status, status::OK);
+    assert_eq!(&r.body.bytes()[4..], b"idp-pw");
+    assert_eq!(fill(&mut s, &idp, n).status, status::DENIED, "once");
+    // Another app's broker label, or a handle of another app, gets nothing.
+    let h = hold(&mut s);
+    let other = Label::WebBroker { user: "alice".into(), publisher: [8; 32], app_id: BROKER.into() };
+    assert_eq!(for_(&mut s, &other, h, "idp.example", "vpn-corp.idp.example").status, status::DENIED);
+    let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { w.str("alice"); w.raw(&[9; 32]); w.str("org.example.mail"); w.bytes(b"x"); }));
+    let h: [u8; 16] = r.body.bytes().try_into().unwrap();
+    assert_eq!(for_(&mut s, &broker(), h, "idp.example", "vpn-corp.idp.example").status, status::DENIED);
 }

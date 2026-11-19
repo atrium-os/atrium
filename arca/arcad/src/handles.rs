@@ -107,6 +107,17 @@ impl Handles {
         }
     }
 
+    /// A typed value held for `from` (the broker's app), handed on to
+    /// `to` (a web endpoint, persona `persona`): a new handle; the old one
+    /// is spent either way.
+    pub fn rebind(&mut self, h: &Handle, user: &str, from: &Recipient, persona: &str, to: Recipient) -> Option<Handle> {
+        let e = self.map.remove(h)?;
+        if e.hold != 0 || e.expires <= Instant::now() || e.user != user || &e.recipient != from || !matches!(e.source, Source::Pending(_)) {
+            return None;
+        }
+        self.issue(Entry { persona: persona.into(), recipient: to, ..e })
+    }
+
     /// The stored item a handle names, for exactly the party it was
     /// issued to, without redeeming it (FILL looks before it takes, so a
     /// fill that must wait for verification leaves its handles).

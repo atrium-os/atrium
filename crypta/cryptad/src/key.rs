@@ -248,6 +248,20 @@ fn answer(socket: &str, l: &Line) -> Line {
                 Err(st) => err(st),
             };
         }
+        "forget-jar" => {
+            // A removed (or new) profile's sign-in window jar (vpn.md §9.3).
+            let p = l.get("profile").unwrap_or("");
+            if p.is_empty() {
+                return err(status::MALFORMED);
+            }
+            let mut w = Writer::new();
+            w.str(p);
+            return match call(socket, op::VPN_FORGET_JAR, &w.buf) {
+                Ok((st, _)) if st == status::OK => Line::new("ok"),
+                Ok((st, _)) => err(st),
+                Err(_) => err(253),
+            };
+        }
         "sign" => {
             let (Some(i), Some(d)) = (l.hex("id").filter(|i| i.len() == 16), l.hex("digest").filter(|d| d.len() == 32)) else { return err(status::MALFORMED) };
             let mut b = i;

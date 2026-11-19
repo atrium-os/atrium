@@ -142,13 +142,33 @@ impl Arca for InProcArca {
         if r.status != status::OK { return Err(format!("status {}", r.status)) }
         Ok(u32::from_le_bytes(r.body.bytes().try_into().unwrap()))
     }
+    fn handle_for(&mut self, h: &[u8; 16], host: &str, port: u16, partition: &str) -> Result<[u8; 16], String> {
+        let mut w = Writer::new();
+        w.raw(h); arcad::proto::write_endpoint(&mut w, host, port); w.str(partition);
+        let r = self.s.borrow_mut().handle(&broker_label(), arcad::proto::broker_op::W_HANDLE_FOR, &w.buf);
+        if r.status != status::OK { return Err(format!("status {}", r.status)) }
+        Ok(r.body.bytes().try_into().unwrap())
+    }
 }
 
 /// A courier's vault: arcad under that courier's own label.
 struct StateVault { s: Shared, label: Label }
 
 impl Vault for StateVault {
-    fn fill(&mut self, _: &[(u8, [u8; 16])]) -> Result<Vec<LockedBuf>, Refusal> { Err(Refusal::Denied) }
+    fn fill(&mut self, refs: &[(u8, [u8; 16])]) -> Result<Vec<LockedBuf>, Refusal> {
+        let mut w = Writer::new();
+        w.u8(refs.len() as u8);
+        for (src, x) in refs { w.u8(*src); w.raw(x) }
+        let r = self.s.borrow_mut().handle(&self.label, cop::FILL, &w.buf);
+        if r.status != status::OK { return Err(Refusal::Denied) }
+        let (mut b, mut out) = (r.body.bytes(), vec![]);
+        while b.len() >= 4 {
+            let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+            out.push(LockedBuf::from_slice(&b[4..4 + n]).unwrap());
+            b = &b[4 + n..];
+        }
+        Ok(out)
+    }
     fn set_cookie(&mut self, name: &str, value: &[u8], attrs: &[u8], path: &str, ticket: Option<&[u8; 16]>) {
         let mut w = Writer::new();
         w.str(name); w.bytes(value); w.bytes(attrs); w.str(path);
@@ -445,7 +465,6 @@ fn a_sign_in_windows_forms_go_through_couriers_and_the_token_to_crypta() {
     let mut b = Broker::new(InProcArca { s: s.clone(), issued: vec![] }, InProcCouriers { s: s.clone(), net, tls, open: HashMap::new() });
     let gw = format!("https://gw.corp.example:{}", ga.port());
     let idp = format!("https://sso.idp.example:{}", ia.port());
-    let _ = idp_log;
     const V: ViewId = 7;
 
     // An ordinary cookied view sends no form.
@@ -463,8 +482,27 @@ fn a_sign_in_windows_forms_go_through_couriers_and_the_token_to_crypta() {
     assert!(r.url.starts_with(&idp));
     b.show_sign_in(V, &r.url, "corp").unwrap();
     assert_eq!(b.partition(V), Some("vpn-corp.corp.example"));
-    let r = b.fetch(V, &Fetch::form(&format!("{idp}/login"), "sso.idp.example", b"username=alice&password=pw".to_vec())).unwrap();
-    assert_eq!(r.status, 200, "the idp's own session cookie went with its form");
+    // The password typed into Arca's field: the broker holds only its
+    // handle, and the courier puts it in the form (form-encoded).
+    let hold = |s: &Shared, v: &[u8]| -> [u8; 16] {
+        let mut w = Writer::new();
+        let Label::WebBroker { publisher, app_id, .. } = broker_label() else { unreachable!() };
+        w.str("alice"); w.raw(&publisher); w.str(&app_id); w.bytes(v);
+        s.borrow_mut().handle(&Label::TrustedUi, op::U_HOLD, &w.buf).body.bytes().try_into().unwrap()
+    };
+    let mut f = Fetch::form(&format!("{idp}/login"), "sso.idp.example", b"username=alice&password=".to_vec());
+    f.secret = Some((f.body.len() + 1, hold(&s, b"pw")));
+    assert!(matches!(b.fetch(V, &f), Err(Refused::Malformed(_))), "a place past the form");
+    f.secret = Some((f.body.len(), hold(&s, b"pw")));
+    assert!(matches!(b.fetch(1, &f), Err(Refused::Method)), "not from an ordinary view");
+    let r = b.fetch(V, &f).unwrap();
+    assert_eq!(r.status, 200, "the idp's own session cookie and the password went with its form");
+    assert!(matches!(b.fetch(V, &f), Err(Refused::Ticket(_))), "the handle is spent");
+    // Form-encoded: a password with '&' and '=' stays one value.
+    let mut f = Fetch::form(&format!("{idp}/login"), "sso.idp.example", b"username=alice&password=".to_vec());
+    f.secret = Some((f.body.len(), hold(&s, b"p&w=1")));
+    assert_eq!(b.fetch(V, &f).unwrap().status, 403);
+    assert!(idp_log.lock().unwrap().iter().any(|(t, _)| t.ends_with("password=p%26w%3D1")), "{:?}", idp_log.lock().unwrap());
     let r = b.fetch(V, &Fetch::form(&format!("{gw}/acs"), "sso.idp.example", b"SAMLResponse=signed&RelayState=x".to_vec())).unwrap();
     assert_eq!((r.status, r.body.as_slice()), (200, &b"signed on"[..]), "after the form, the answer's page by GET");
     assert!(r.url.ends_with("/final"));

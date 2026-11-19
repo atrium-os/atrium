@@ -199,6 +199,10 @@ pub struct FormField {
     pub name: String,
     pub value: String,
     pub typed: bool,
+    /// A password typed into Arca's field (a VPN sign-in window's): Arca's
+    /// handle, and `value` is empty. The value never reaches the UI or
+    /// navigatord; Arca's courier puts it in the form (arca-autofill.md §3).
+    pub arca: Option<[u8; 16]>,
 }
 
 /// The most fields a form sent has, and the longest name or value.
@@ -211,7 +215,9 @@ pub const FORM_FIXED_MAX: usize = 32 * 1024;
 /// A `SubmitForm` in shape.
 pub fn form_ok(action: &str, fields: &[FormField]) -> bool {
     clean(action, URL_MAX) && fields.len() <= FORM_FIELDS_MAX
-        && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, if f.typed { FORM_TEXT_MAX } else { FORM_FIXED_MAX }))
+        && fields.iter().all(|f| !f.name.is_empty() && clean(&f.name, FORM_TEXT_MAX) && clean(&f.value, if f.typed { FORM_TEXT_MAX } else { FORM_FIXED_MAX })
+            && (f.arca.is_none() || (f.typed && f.value.is_empty())))
+        && fields.iter().filter(|f| f.arca.is_some()).count() <= 1
 }
 
 /// frescod's activation token for a press (zero: none).
@@ -501,6 +507,15 @@ pub fn raw(s: &impl AsRawFd) -> RawFd { s.as_raw_fd() }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_arca_field_sends_a_handle_never_a_value() {
+        let f = |v: &str, typed, arca| FormField { name: "password".into(), value: v.into(), typed, arca };
+        assert!(form_ok("/login", &[f("", true, Some([1; 16]))]));
+        assert!(!form_ok("/login", &[f("pw", true, Some([1; 16]))]), "a handle and a value");
+        assert!(!form_ok("/login", &[f("", false, Some([1; 16]))]), "the page's value can't be Arca's");
+        assert!(!form_ok("/login", &[f("", true, Some([1; 16])), f("", true, Some([2; 16]))]), "one per form");
+    }
+
 
     #[test]
     fn a_ticket_names_the_instance_whose_socket_redeems_it() {

@@ -476,7 +476,7 @@ enum Upstream {
     /// couriers with the broker's tickets; the rest the plain way.
     /// In a sign-in window, the first ask may be a form's POST of these
     /// bytes, from a page on this host.
-    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, form: Option<(Vec<u8>, String)>, plain: Box<Upstream> },
+    Cookied { cookies: Cookies, view: u64, host: String, navigated: bool, form: Option<FormSend>, plain: Box<Upstream> },
     /// The sign-in window's fetcher; the first navigation is a form's POST
     /// of these bytes when there are any.
     Portal(Arc<portal::Portal>, Option<Vec<u8>>),
@@ -489,7 +489,7 @@ impl Upstream {
             // The first ask is the page itself (the reader's navigation, or
             // the form they sent); the converter's are its subresources.
             let f = match form.take() {
-                Some((body, from)) if !*navigated => Fetch::form(&url, &from, body),
+                Some((body, from, secret)) if !*navigated => Fetch { secret, ..Fetch::form(&url, &from, body) },
                 _ if *navigated => Fetch::subresource(&url, host),
                 _ => Fetch::navigation(&url, None, true),
             };
@@ -649,12 +649,20 @@ fn convert(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>) -
 /// [`convert`]; with `form`, the page is the answer to a form's POST of
 /// those bytes to `url`, from a page on that host (the sign-in windows
 /// only: the portal's through its fetcher, a VPN's through Arca's couriers).
-fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<(Vec<u8>, String)>) -> Result<Got, String> {
+/// A form to POST: its encoded fields, the host of the page it came from,
+/// and where in the body a password typed into Arca's field goes (Arca's
+/// handle; the courier puts the value there).
+type FormSend = (Vec<u8>, String, Option<(usize, [u8; 16])>);
+
+fn convert_with(cfg: &Config, url: &str, ctx: Ctx, cookies: Option<(Cookies, u64)>, form: Option<FormSend>) -> Result<Got, String> {
     let inst = instance();
     let mut up = upstream(cfg, &inst)?;
     let mut form = form;
     if let Upstream::Portal(_, f) = &mut up {
-        *f = form.take().map(|(b, _)| b);
+        if form.as_ref().is_some_and(|f| f.2.is_some()) {
+            return Err("a password from Arca's field goes only through Arca's couriers".into());
+        }
+        *f = form.take().map(|(b, _, _)| b);
     }
     let jar = cookies.as_ref().map(|(c, v)| (c.clone(), *v));
     if let Some((cookies, view)) = cookies {
@@ -1430,6 +1438,14 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     send(&w, &Event::PressRefused { why });
                     continue;
                 }
+                // A password typed into Arca's field: only a VPN sign-in
+                // window has one, and only in a POST through its couriers.
+                let arca = fields.iter().position(|f| f.arca.is_some());
+                if arca.is_some() && (cfg.vpn.is_none() || !post) {
+                    refuse("a password from Arca's field goes only with a sign-in window's POST".into());
+                    continue;
+                }
+                let secret_of = arca.and_then(|i| fields[i].arca);
                 let pairs: Vec<(String, String)> = fields.into_iter().map(|f| (f.name, f.value)).collect();
                 if !post {
                     match portal::get_target(&target, &pairs) {
@@ -1446,7 +1462,20 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                 let (cfg, state, w, cookies) = (cfg.clone(), state.clone(), w.clone(), cookies.clone());
                 let from = url::Url::parse(&p.url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
                 std::thread::spawn(move || {
-                    let body = portal::encode(&pairs).into_bytes();
+                    // The fields in order; Arca's password, when there is one,
+                    // goes in at its field's place, by the courier.
+                    let (body, secret) = match (arca, secret_of) {
+                        (Some(i), Some(h)) => {
+                            let mut b = portal::encode(&pairs[..=i]);
+                            let at = b.len();
+                            if i + 1 < pairs.len() {
+                                b.push('&');
+                                b.push_str(&portal::encode(&pairs[i + 1..]));
+                            }
+                            (b.into_bytes(), Some((at, h)))
+                        }
+                        _ => (portal::encode(&pairs).into_bytes(), None),
+                    };
                     // A VPN sign-in's form goes through Arca's couriers, in
                     // the profile's jar; the portal's through its fetcher.
                     let jarred = match (&cfg.vpn, &cookies) {
@@ -1461,7 +1490,7 @@ fn serve_ui(cfg: Arc<Config>, state: Arc<Mutex<State>>, cookies: Option<Cookies>
                     };
                     let ctx = Ctx { jar, knows: jarred.is_some() };
                     eprintln!("navigatord: a form sent as a POST to {} ({} bytes)", origin(&target).unwrap_or_default(), body.len());
-                    let action = match convert_with(&cfg, &target, ctx, jarred, Some((body, from))) {
+                    let action = match convert_with(&cfg, &target, ctx, jarred, Some((body, from, secret))) {
                         Ok(Got::Page(p)) => {
                             let mut st = state.lock().unwrap();
                             let p = Arc::new(st.stored(Page { ctx, ..p }));
@@ -2038,7 +2067,7 @@ mod tests {
     #[test]
     fn a_form_goes_only_where_the_page_says_with_what_it_holds() {
         let p = page("http://10.88.0.1/welcome", r#"<form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"t\" value=\"9f\"><input name=\"room\"><button name=\"go\" value=\"1\">Connect</button></form>"#);
-        let f = |name: &str, value: &str, typed| ctl::FormField { name: name.into(), value: value.into(), typed };
+        let f = |name: &str, value: &str, typed| ctl::FormField { name: name.into(), value: value.into(), typed, arca: None };
         let ok = [f("t", "9f", false), f("room", "4 12", true), f("go", "1", false)];
         let s = SchemeAllowlist::default();
         assert_eq!(form_target(&p, "/login", &ok, &s).as_deref(), Ok("http://10.88.0.1/login"));

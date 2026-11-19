@@ -81,6 +81,11 @@ pub mod op {
     /// items (a TLS handshake's, whose transcript can be longer than a
     /// `SIGN` message, or a certificate request's).
     pub const SIGN_DIGEST: u16 = 0x0F;
+    /// The crypta service only (vpn.md §9.3): `str profile` → `u32` how
+    /// many jars went. A VPN profile removed (or made anew under an old
+    /// name): its sign-in window's jar (partitions `vpn-<profile>.`) goes
+    /// from every unlocked person's store and from memory.
+    pub const VPN_FORGET_JAR: u16 = 0x10;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -184,6 +189,15 @@ pub mod broker_op {
     /// continue press of a consent wall, legacy-web §5.4.1e), never
     /// exploration's. Needs the store unlocked.
     pub const W_SCRIPT_SET_COOKIE: u16 = 0x75;
+    /// `handle[16] | endpoint | str partition` → `handle[16]`: what the
+    /// person typed into Arca's field in the broker's own window (its
+    /// handle, bound to the broker's app) goes with a form the person
+    /// pressed to send, to exactly that endpoint and partition
+    /// (arca-autofill.md §3 step 5, the broker's form POST). The old
+    /// handle is spent; the new one only a web courier for that endpoint
+    /// and partition redeems (`FILL`), once. Typed values only, not
+    /// stored items.
+    pub const W_HANDLE_FOR: u16 = 0x76;
     pub const ACCOUNT_PASSKEY: u8 = 1;
     pub const ACCOUNT_PASSWORD: u8 = 2;
     pub const ACCOUNTS_MAX: usize = 16;

@@ -583,6 +583,8 @@ impl D {
             }
         }
         p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        // A sign-in jar left by an old profile of this name is not this one's.
+        let _ = self.keys.call(&Line::new("forget-jar").with("profile", &p.name));
         self.log(&format!("created {} (AnyConnect, {})", p.name, p.ac.as_ref().map(|a| a.host.as_str()).unwrap_or("")));
         Ok(vec![Line::new("created").with("name", &p.name)])
     }
@@ -678,6 +680,8 @@ impl D {
         if p.ac.is_some() {
             // Its password, session, token and client key.
             let _ = self.keys.call(&Line::new("forget-all").with("prefix", format!("{name}/")));
+            // The identity provider's session, kept in its sign-in jar.
+            let _ = self.keys.call(&Line::new("forget-jar").with("profile", name));
         } else {
             let mut ids = vec![p.key];
             ids.extend(p.psk);

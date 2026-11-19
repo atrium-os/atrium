@@ -112,7 +112,13 @@ pub struct Live {
     /// The page child asked to lay its page out on paper: its embed, the
     /// title, and whether the sheet is already open (a new paper size).
     print_ask: Option<(EmbedId, String, bool)>,
+    /// Arca's password field in a VPN sign-in form: its embed, for which
+    /// form (page, forms sent), and when to ask again after a refusal.
+    arca: Option<(EmbedId, ArcaFor)>,
+    arca_next: Instant,
 }
+
+type ArcaFor = (Option<(u64, PageId)>, u32);
 
 /// The paper a page is first laid out on for the sheet; it asks again for
 /// another (`Step::Relayout`).
@@ -252,6 +258,8 @@ impl Live {
                 idle,
                 printing: None,
                 print_ask: None,
+                arca: None,
+                arca_next: Instant::now(),
             },
             Hello { frescod: fd, limen, measure, trails: kept },
         ))
@@ -364,6 +372,39 @@ impl Live {
         } else {
             c.pending = Some(ticket);
         }
+    }
+
+    /// Arca's field for the form panel's password (a VPN sign-in window):
+    /// asked for while the form shows one, anew for each form sent, gone
+    /// with the form. A press waiting for its handle goes at the deadline.
+    fn arca_field(&mut self, s: &mut Shell) -> bool {
+        s.arca_tick(Instant::now());
+        let want: Option<ArcaFor> = s.form.as_ref().and_then(|f| f.arca_field().map(|_| (f.key, f.sent)));
+        let Some(e) = self.embeds.clone() else { return false };
+        let mut changed = false;
+        if let Some((id, of)) = self.arca {
+            if Some(of) != want {
+                let _ = e.borrow_mut().detach_embed(id);
+                self.arca = None;
+                changed = true;
+            }
+        }
+        if let (Some(of), None, Some(w)) = (want, self.arca, self.window) {
+            if Instant::now() >= self.arca_next {
+                self.arca_next = Instant::now() + Duration::from_secs(2);
+                let asked = e.borrow_mut().request("credential", w, crate::shell::ARCA_SLOT);
+                match asked {
+                    Ok(id) => {
+                        let c = limen::credential::ToChild::Configure { purpose: limen::credential::Purpose::CurrentPassword, username_field: false };
+                        let _ = e.borrow_mut().send(id, c.encode());
+                        self.arca = Some((id, of));
+                        changed = true;
+                    }
+                    Err(err) => eprintln!("navigator-ui: Arca's password field: {err:?}"),
+                }
+            }
+        }
+        changed
     }
 
     /// A new child for the page `key`, in the slot, and navigatord asked
@@ -608,6 +649,7 @@ impl Live {
                 Event::TrailsNotSaved { why } => eprintln!("navigator-ui: trail store not kept: {why}"),
             }
         }
+        changed |= self.arca_field(s);
         // The page children.
         loop {
             let ev = match &self.embeds {
@@ -649,6 +691,25 @@ impl Live {
                 ParentEvent::MessageFd { .. } => self.embeds.as_ref().and_then(|e| e.borrow_mut().take_fd()),
                 _ => None,
             };
+            if self.arca.as_ref().is_some_and(|a| a.0 == embed) {
+                match ev {
+                    ParentEvent::Message { bytes, .. } => match limen::credential::ToParent::decode(&bytes) {
+                        Some(limen::credential::ToParent::Handle { handle }) => s.arca_handle(Some(handle)),
+                        Some(limen::credential::ToParent::Cleared) => s.arca_handle(None),
+                        Some(limen::credential::ToParent::Filled { .. }) => {}
+                        None => eprintln!("navigator-ui: dropped a malformed message from Arca's field"),
+                    },
+                    ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. } => {
+                        // What was typed went with Arca's side: a new field.
+                        eprintln!("navigator-ui: Arca's field went away");
+                        self.arca = None;
+                        s.arca_handle(None);
+                    }
+                    _ => {}
+                }
+                changed = true;
+                continue;
+            }
             let Some(i) = self.children.iter().position(|c| c.embed == embed) else { continue };
             let on_screen = self.shown == Some(self.children[i].key);
             match ev {
