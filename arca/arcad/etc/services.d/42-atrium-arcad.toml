@@ -91,5 +91,7 @@ gid  = 65020
 # aura-keys (_aura-keys, 65032) for Wi-Fi credentials (wifi.md §3.4);
 # dispensatord (its arcad calls run as _dispensator-vk, 65043) for sealed
 # sticks' volume keys (tessera-encryption.md §7); the SSH agent (_arca-ssh,
-# 65047) for workspaces' SSH keys (arca.md §9.1).
-env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }, { key = "ARCA_SERVICES", value = "vinculumd=65024,sigillumd=65028,aura-keys=65032,dispensatord=65043,ssh-agent=65047" }]
+# 65047) for workspaces' SSH keys (arca.md §9.1); atrium-volumes (its arcad
+# calls run as _volumes-vk, 65053) for persona folders' group keys
+# (tessera-encryption.md §5.4, E4.6).
+env  = [{ key = "ARCA_VESTIBULUM_UID", value = "50093" }, { key = "ARCA_UI_UID", value = "65021" }, { key = "ARCA_SERVICES", value = "vinculumd=65024,sigillumd=65028,aura-keys=65032,dispensatord=65043,ssh-agent=65047,atrium-volumes=65053" }]

@@ -889,6 +889,40 @@ group id should not be reused before that pass has run: a later
 group with the same id would keep the old packs. VM gate:
 `tessera-sealed-vm.sh` check 14.
 
+**E4.6 as built (2026-11-19).** Each persona of a person (Personal is
+`personal`) has one key group; each of its five folders is a quota domain
+in it. portcullisd asks atrium-volumes (`PersonaFolders`) before it makes or
+hands out a persona's folders (`home::ensure_person`, `ensure_persona`, so
+at the first launch after login). atrium-volumes asks the kernel what each
+folder is (`TESSERA_IOC_GROUP_INFO _IOR('T',10)`: volume uuid, domain, root
+or not, group, the group's key id, and open/locked/bad, where open means the
+domain record carries the group's MAC; `tessera-keyload group-info DIR`).
+The first time, it picks a random group id (never reused, even if its own
+file is lost), has arcad mint the key (`VK_MINT` with that group) and makes
+the group (`GROUP_CREATE`); a missing folder is made empty, made a domain
+and put in the group (`QUOTA_GROUP`). A plain folder from before is moved
+in (decision of 2026-11-19): renamed to `.<name>.unencrypted`, made again in
+the group, its tree copied in (contents, mode, owner, times, the download
+origin attribute, links as links) and the old copy deleted; an interrupted
+move finishes at the next ask. Expected groups are kept in
+`/var/db/atrium/volumes.groups.toml` (person, persona, volume, group, key
+id, the folders in it). At the next login a locked group's key is loaded
+with `VK_LOAD`; a folder that is expected and is plain, in another group,
+not the domain's root, names another key, or doesn't verify is refused
+(`FoldersRefused`), and portcullisd doesn't hand it out. A locked Arca is an
+error too. Without Tessera or Arca keys (arcad unreachable, no keyring, or
+atrium-volumes not in `ARCA_SERVICES`) folders that were never encrypted
+stay plain. arcad's calls run in a child as `_volumes-vk` (65053), named
+`atrium-volumes` in `ARCA_SERVICES`. Logout: ostiarius stops the person's
+apps, then locks Arca, which drops their group keys (the kernel flushes as
+each goes). Removing a persona: `EraseFolders`; arcad's `VK_RETIRE` (0xB9,
+atrium-volumes only, key-group keys only, no second verification since
+portcullisd had Sigillum verify the removal) deletes the item and drops
+the key, then `GROUP_ERASE`; if a folder is still in use the erase waits
+for the person's next ask. Limit: a mount holds at most 32 groups
+(`TESSERA_FS_MAX_GROUPS`), so 32 person-personas per volume for now. VM
+gate: `scripts/tessera-personas-vm.sh`.
+
 ## 14. Decisions
 
 Accepted 2026-11-17, all as recommended.

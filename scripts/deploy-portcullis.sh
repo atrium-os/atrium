@@ -147,6 +147,10 @@ pfctl -s info | grep -q "Status: Enabled" || exit 1' >/tmp/pfdeploy.log 2>&1 \
   || { echo "  pf isolation FAILED: $(tail -1 /tmp/pfdeploy.log)"; rc=1; }
 echo "=== config -> /etc/atrium ==="
 g 'mkdir -p /etc/atrium/services.d /var/db/atrium /var/log/atrium' >/dev/null 2>&1
+# atrium-volumes' arcad calls (persona folders' keys, tessera-encryption.md
+# E4.6) run in a child as this uid; arcad's ARCA_SERVICES names it.
+g 'id _volumes-vk >/dev/null 2>&1 || pw useradd _volumes-vk -u 65053 -d /nonexistent -s /usr/sbin/nologin -c "atrium-volumes folder keys"' >/dev/null 2>&1 \
+    && echo "  _volumes-vk (65053) ok" || { echo "  _volumes-vk FAILED"; rc=1; }
 # ★ The TARGET's [resource_control] survives the deploy. Copying the repo
 # policy over it dropped `allow_rctl = true`, and jaild then refused every
 # limited one-shot (`rctl.disabled`) until it was re-added by hand

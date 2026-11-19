@@ -506,3 +506,32 @@ fn a_persona_group_key_drops_when_its_person_logs_out() {
     s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice")));
     assert!(!k.lock().unwrap().loaded.iter().any(|(i, _)| i.key_id.to_vec() == a));
 }
+
+#[test]
+fn a_removed_personas_group_key_is_retired_only_by_atrium_volumes() {
+    // E4.6: a removed persona's folder key goes (item deleted, kernel drops
+    // it) so its group can be crypto-erased; only for a key group's key,
+    // and only atrium-volumes may ask.
+    let (_d, mut s, k) = setup();
+    let vols = Label::Service("atrium-volumes".into());
+    let r = s.handle(&vols, volume_op::VK_MINT, &body(|w| {
+        w.str("alice");
+        w.str("work");
+        w.raw(&UUID);
+        w.u64(7);
+        w.str("Work folders");
+    }));
+    assert_eq!(r.status, status::OK);
+    let g = r.body.bytes().to_vec();
+    let (st, stick) = mint(&mut s, &dispensatord(), "alice", "work", [0x66; 16]);
+    assert_eq!(st, status::OK);
+    let retire = |s: &mut State, who: &Label, id: &[u8]| s.handle(who, volume_op::VK_RETIRE, &body(|w| { w.str("alice"); w.str("work"); w.raw(id); })).status;
+
+    assert_eq!(retire(&mut s, &dispensatord(), &g), status::DENIED, "only atrium-volumes retires");
+    assert_eq!(retire(&mut s, &vols, &stick), status::DENIED, "a stick's key needs VK_FORGET");
+    assert_eq!(retire(&mut s, &vols, &g), status::OK);
+    assert!(!k.lock().unwrap().loaded.iter().any(|(i, _)| i.key_id.to_vec() == g), "the kernel still has it");
+    assert!(k.lock().unwrap().loaded.iter().any(|(i, _)| i.key_id.to_vec() == stick));
+    assert_eq!(load(&mut s, &vols, "alice", "work", &g, UUID, 7), status::DENIED, "the item is gone");
+    assert_eq!(retire(&mut s, &vols, &g), status::DENIED);
+}

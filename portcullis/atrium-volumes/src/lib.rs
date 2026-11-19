@@ -23,8 +23,11 @@
 
 #![deny(unsafe_code)]
 
+pub mod arca;
 pub mod error;
 pub mod ffi;
+pub mod groups;
+pub mod persona;
 pub mod plugin;
 pub mod policy;
 pub mod protocol;

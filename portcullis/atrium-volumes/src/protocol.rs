@@ -17,6 +17,30 @@ pub enum Request {
     Destroy(DestroyRequest),
     Status(StatusRequest),
     ListBackends,
+    /// A persona's folders, encrypted in its key group (E4.6).
+    PersonaFolders(PersonaFoldersRequest),
+    /// A removed persona's folders: crypto-erased.
+    EraseFolders(EraseFoldersRequest),
+}
+
+/// tessera-encryption.md §5.4, E4.6: make `folders` (absolute paths, the
+/// persona's) encrypted in the persona's key group, loading its key from
+/// the person's Arca; new folders are `uid:gid` with `mode`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PersonaFoldersRequest {
+    pub person:  String,
+    /// `personal` for Personal.
+    pub persona: String,
+    pub folders: Vec<String>,
+    pub uid:     u32,
+    pub gid:     u32,
+    pub mode:    u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct EraseFoldersRequest {
+    pub person:  String,
+    pub persona: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +135,16 @@ pub enum Response {
 
     BackendUnavailable    { name: String, configured: Vec<String> },
     BackendDoesNotSupport { feature: String },
+
+    /// `encrypted` false: the folders stay plain (not on Tessera, or no
+    /// keys on this machine), and never were encrypted. `moved`: folders
+    /// whose old files were moved in this time.
+    FoldersReady { encrypted: bool, moved: Vec<String> },
+    /// A folder isn't in the group it must be in (§5.4 expected groups):
+    /// don't hand it out.
+    FoldersRefused { folder: String, detail: String },
+    /// `erased` false: the persona had no encrypted folders.
+    FoldersErased { erased: bool },
 
     PolicyDenied { rule: String, detail: String },
     Error        { detail: String },

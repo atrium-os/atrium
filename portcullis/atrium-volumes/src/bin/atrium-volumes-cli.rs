@@ -11,6 +11,8 @@
 //!     atrium-volumes-cli <socket> status [<jail>]
 //!     atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
 //!     atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
+//!     atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
+//!     atrium-volumes-cli <socket> erase <person> <persona>
 //!
 //! kind = persistent | tmpfs
 
@@ -19,7 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use atrium_volumes::protocol::{
-    DestroyRequest, MAX_FRAME_BYTES, ProvisionRequest, Request, Response,
+    DestroyRequest, EraseFoldersRequest, MAX_FRAME_BYTES, PersonaFoldersRequest, ProvisionRequest, Request, Response,
     StatusRequest, VolumeKind, VolumeSpec,
 };
 
@@ -31,6 +33,8 @@ usage:
   atrium-volumes-cli <socket> status [<jail>]
   atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
   atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
+  atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
+  atrium-volumes-cli <socket> erase <person> <persona>
 
 kind = persistent | tmpfs
 ");
@@ -81,6 +85,24 @@ fn main() -> ExitCode {
                 really_yes,
             })
         }
+        // A persona's folders, encrypted (tessera-encryption.md E4.6), as
+        // portcullisd asks at login; mode 2770.
+        "folders" => {
+            if rest.len() < 5 { return usage(); }
+            let (Ok(uid), Ok(gid)) = (rest[2].parse(), rest[3].parse()) else { return usage() };
+            Request::PersonaFolders(PersonaFoldersRequest {
+                person: rest[0].clone(),
+                persona: rest[1].clone(),
+                folders: rest[4..].to_vec(),
+                uid,
+                gid,
+                mode: 0o2770,
+            })
+        }
+        "erase" => {
+            if rest.len() != 2 { return usage(); }
+            Request::EraseFolders(EraseFoldersRequest { person: rest[0].clone(), persona: rest[1].clone() })
+        }
         _ => return usage(),
     };
 
@@ -120,7 +142,8 @@ fn main() -> ExitCode {
     println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
     match resp {
         Response::Ok | Response::Provisioned { .. } | Response::AlreadyProvisioned { .. }
-        | Response::Destroyed | Response::Status { .. } | Response::Backends { .. } => ExitCode::SUCCESS,
+        | Response::Destroyed | Response::Status { .. } | Response::Backends { .. }
+        | Response::FoldersReady { .. } | Response::FoldersErased { .. } => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
     }
 }

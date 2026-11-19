@@ -303,6 +303,14 @@ pub mod volume_op {
     /// never a number from the caller) and reloads the key as usual, so
     /// the copy mounts writable. `DENIED` if no older copy was opened.
     pub const VK_CURRENT: u16 = 0xB8;
+    /// `owner | key_id[16]` → nothing: a removed persona's folder key
+    /// (tessera-encryption.md §10, E4.6). Only atrium-volumes, only a key
+    /// group's key (scope group ≠ 0): the item is deleted and the kernel
+    /// drops the key, so atrium-volumes can crypto-erase the group.
+    /// portcullisd had Sigillum verify the person for the removal, so no
+    /// second `VERIFY_USER` here; and root could delete those folders
+    /// anyway. `DENIED` for a stick's key or an unknown id.
+    pub const VK_RETIRE: u16 = 0xB9;
     pub const SLOT_LEN: usize = crate::recovery::SLOT_LEN;
     pub const CODE_MAX: usize = 64;
     /// Longest label.

@@ -12,6 +12,7 @@
  *   tessera-keyload group-create DIR KEY_ID_HEX GROUP
  *   tessera-keyload quota-group DIR GROUP
  *   tessera-keyload group-erase DIR GROUP
+ *   tessera-keyload group-info DIR
  *       (on a mounted volume: make the group; put DIR's quota domain in it)
  *   tessera-keyload quota-dump DIR
  *       (the mount's domains and key groups, to the console)
@@ -63,6 +64,7 @@ usage(void)
 	    "       tessera-keyload group-create DIR KEY_ID GROUP\n"
 	    "       tessera-keyload quota-group DIR GROUP\n"
 	    "       tessera-keyload group-erase DIR GROUP\n"
+	    "       tessera-keyload group-info DIR\n"
 	    "       tessera-keyload quota-dump DIR\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
@@ -125,6 +127,32 @@ main(int argc, char **argv)
 			return (1);
 		}
 		printf("group %ju erased\n", (uintmax_t)gid);
+		return (0);
+	}
+	if (strcmp(argv[1], "group-info") == 0 && argc == 3) {
+		struct tessera_ioc_group_info gi;
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		if (ioctl(dfd, TESSERA_IOC_GROUP_INFO, &gi) != 0) {
+			perror("TESSERA_IOC_GROUP_INFO");
+			return (1);
+		}
+		/* One line: domain, root?, group, key id, state. */
+		printf("domain %ju%s group %ju key ", (uintmax_t)gi.domain_id,
+		    (gi.flags & TESSERA_GROUP_INFO_ROOT) ? " root" : "",
+		    (uintmax_t)gi.group_id);
+		for (int i = 0; i < 16; i++)
+			printf("%02x", gi.key_id[i]);
+		printf(" %s\n",
+		    (gi.flags & TESSERA_GROUP_INFO_OPEN) ? "open" :
+		    (gi.flags & TESSERA_GROUP_INFO_LOCKED) ? "locked" :
+		    (gi.flags & TESSERA_GROUP_INFO_BAD) ? "BAD" :
+		    (gi.flags & TESSERA_GROUP_INFO_NO_RECORD) ? "no-record" :
+		    "plain");
 		return (0);
 	}
 	if (strcmp(argv[1], "quota-dump") == 0 && argc == 3) {

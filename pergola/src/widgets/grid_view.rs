@@ -682,34 +682,7 @@ impl GridView {
             ctx.pop();
             // Floats (charts) over the cells, those meeting the view.
             let gs = self.state.get_cloned();
-            for f in src.floats([x, y, body.w() as f64, body.h() as f64], &t) {
-                let (fx, fy) = at(f.at[0], f.at[1]);
-                ctx.key((1u64 << 63) | f.key);
-                let id = ctx.push(Node::vstack(Rect::new(fx, fy, f.at[2] as f32, f.at[3] as f32), 0.0));
-                ctx.set_flex(id, FlexStyle { free: true, ..FlexStyle::default() });
-                for n in f.nodes.iter() {
-                    ctx.add(shift(n, fx, fy));
-                }
-                if f.movable && gs.picked == Some(f.key) {
-                    // Picked: a frame, its corner handle, and where a drag puts it.
-                    let (fw, fh) = (f.at[2] as f32, f.at[3] as f32);
-                    ring(ctx, Rect::new(fx - 2.0, fy - 2.0, fw + 4.0, fh + 4.0), t.accent_fg());
-                    ctx.add(Node::Rect { rect: Rect::new(fx + fw - 6.0, fy + fh - 6.0, 9.0, 9.0), fill: t.accent_fg(), radius: 2.0 });
-                    if let Some((k, size, dx, dy)) = gs.float_drag().filter(|d| d.0 == f.key) {
-                        let _ = k;
-                        let g = float_moved(f.at, size, dx, dy);
-                        let (gx, gy) = at(g[0], g[1]);
-                        ring(ctx, Rect::new(gx, gy, g[2] as f32, g[3] as f32), Color::rgba(0.2, 0.45, 0.95, 0.7));
-                    }
-                }
-                if f.movable {
-                    placed.borrow_mut().push((f.key, f.at));
-                }
-                if f.pressable {
-                    buttons.borrow_mut().push((f.key, f.at));
-                }
-                ctx.pop();
-            }
+            emit_floats(ctx, src.floats([x, y, body.w() as f64, body.h() as f64], &t), &t, &gs, &at, &placed, &buttons);
             ctx.pop();
         }
         ctx.pop();
@@ -873,6 +846,19 @@ impl GridView {
                     ctx.set_flex(over, FlexStyle { free: true, ..FlexStyle::default() });
                     emit_overlay(ctx, &*src, &t, &gs, CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 }, &at);
                     ctx.pop();
+                    // Floats meeting the band's cells (a chart in the frozen rows
+                    // stays with them; the part past the freeze line scrolls in
+                    // the body, as in Excel).
+                    let (vx, vy) = (if across { x } else { 0.0 }, if down { y } else { 0.0 });
+                    let (vw, vh) = (if across { rect.w() as f64 } else { fz[0] }, if down { rect.h() as f64 } else { fz[1] });
+                    let band_floats: Vec<GridFloat> = src.floats([vx, vy, vw, vh], &t).into_iter().filter(|f| f.at[0] < vx + vw && f.at[0] + f.at[2] > vx && f.at[1] < vy + vh && f.at[1] + f.at[3] > vy).collect();
+                    if !band_floats.is_empty() {
+                        ctx.key(u64::MAX - 2);
+                        let fl = ctx.push(Node::vstack(rect, 0.0));
+                        ctx.set_flex(fl, FlexStyle { free: true, ..FlexStyle::default() });
+                        emit_floats(ctx, band_floats, &t, &gs, &at, &placed, &buttons);
+                        ctx.pop();
+                    }
                     ctx.pop();
                 }
                 ctx.pop();
@@ -1161,6 +1147,40 @@ pub fn grow_to_merges(src: &dyn GridSource, mut r: CellRange) -> CellRange {
 
 /// The selection (cut to `vis`) and, when it is in `vis`, the active cell or
 /// its editor, placed by `at` (content px to window px).
+/// Floats placed by `at` (content px to window px); movable and pressable
+/// ones noted in `placed` and `buttons` for presses.
+type Spots = Rc<std::cell::RefCell<Vec<(u64, [f64; 4])>>>;
+fn emit_floats(ctx: &mut Ctx, floats: Vec<GridFloat>, t: &crate::theme::Semantic, gs: &GridState, at: &dyn Fn(f64, f64) -> (f32, f32), placed: &Spots, buttons: &Spots) {
+    for f in floats {
+        let (fx, fy) = at(f.at[0], f.at[1]);
+        ctx.key((1u64 << 63) | f.key);
+        let id = ctx.push(Node::vstack(Rect::new(fx, fy, f.at[2] as f32, f.at[3] as f32), 0.0));
+        ctx.set_flex(id, FlexStyle { free: true, ..FlexStyle::default() });
+        for n in f.nodes.iter() {
+            ctx.add(shift(n, fx, fy));
+        }
+        if f.movable && gs.picked == Some(f.key) {
+            // Picked: a frame, its corner handle, and where a drag puts it.
+            let (fw, fh) = (f.at[2] as f32, f.at[3] as f32);
+            ring(ctx, Rect::new(fx - 2.0, fy - 2.0, fw + 4.0, fh + 4.0), t.accent_fg());
+            ctx.add(Node::Rect { rect: Rect::new(fx + fw - 6.0, fy + fh - 6.0, 9.0, 9.0), fill: t.accent_fg(), radius: 2.0 });
+            if let Some((_, size, dx, dy)) = gs.float_drag().filter(|d| d.0 == f.key) {
+                let g = float_moved(f.at, size, dx, dy);
+                let (gx, gy) = at(g[0], g[1]);
+                ring(ctx, Rect::new(gx, gy, g[2] as f32, g[3] as f32), Color::rgba(0.2, 0.45, 0.95, 0.7));
+            }
+        }
+        let spot = (f.key, f.at);
+        if f.movable && !placed.borrow().contains(&spot) {
+            placed.borrow_mut().push(spot);
+        }
+        if f.pressable && !buttons.borrow().contains(&spot) {
+            buttons.borrow_mut().push(spot);
+        }
+        ctx.pop();
+    }
+}
+
 fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, gs: &GridState, vis: CellRange, at: &dyn Fn(f64, f64) -> (f32, f32)) {
     // A selection meeting part of a merged area shows all of it.
     let sel = grow_to_merges(src, gs.selection());
@@ -1669,7 +1689,7 @@ mod tests {
             self.frozen.get()
         }
         fn floats(&self, _view: [f64; 4], _theme: &crate::theme::Semantic) -> Vec<GridFloat> {
-            self.buttons.borrow().iter().map(|&(key, at)| GridFloat { key, at, nodes: Rc::new(Vec::new()), movable: false, pressable: true }).collect()
+            self.buttons.borrow().iter().map(|&(key, at)| GridFloat { key, at, nodes: Rc::new(vec![Node::Rect { rect: Rect::new(0.0, 0.0, at[2] as f32, at[3] as f32), fill: Color::rgba(1.0, 0.0, 0.0, 1.0), radius: 0.0 }]), movable: false, pressable: true }).collect()
         }
     }
 
@@ -1780,6 +1800,31 @@ mod tests {
         key(&mut app, Key::Down, "", Modifiers { alt: true, ..Modifiers::default() });
         assert!(log.borrow().iter().any(|a| matches!(a, GridAction::Choose { row: 2, col: 1 })));
         assert_eq!(state.get_cloned().cursor, (2, 1));
+    }
+
+    #[test]
+    fn a_float_in_the_frozen_rows_stays_with_them() {
+        let (mut app, grid, scroll, _, log) = host(200, 10);
+        grid.frozen.set((1, 0));
+        // A button in A1's row, at D1's right; another down in row 30.
+        grid.buttons.borrow_mut().push((9, [3.0 * 64.0 + 48.0, 2.0, 16.0, 16.0]));
+        grid.buttons.borrow_mut().push((10, [3.0 * 64.0 + 48.0, 600.0, 16.0, 16.0]));
+        app.tick();
+        let mut st = scroll.get();
+        st.physics.set_position(400.0);
+        scroll.set(st);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 4);
+        let reds = |app: &App<Host>| app.tree().iter().filter_map(|(_, n)| match n { Node::Rect { rect, fill, .. } if *fill == Color::rgba(1.0, 0.0, 0.0, 1.0) => Some((rect.x(), rect.y())), _ => None }).collect::<Vec<_>>();
+        let r = reds(&app);
+        // Drawn twice: in the body (scrolled away by its viewport) and in the
+        // frozen row's band, which doesn't scroll down. The other, once.
+        assert_eq!(r.iter().filter(|p| **p == (hw + 240.0, HEADER_H + 2.0)).count(), 2, "{r:?}");
+        assert_eq!(r.iter().filter(|p| p.1 > HEADER_H + 100.0).count(), 1, "{r:?}");
+        app.handle_event(Event::PointerDown { at: Point::new(hw + 248.0, HEADER_H + 10.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(hw + 248.0, HEADER_H + 10.0) });
+        app.tick();
+        assert!(log.borrow().iter().any(|a| matches!(a, GridAction::PressFloat(9))), "{:?}", log.borrow());
     }
 
     #[test]
