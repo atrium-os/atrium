@@ -61,6 +61,9 @@ impl CredentialField {
     pub fn one_time_code(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::OneTimeCode, state) }
     /// A Wi-Fi passphrase (Settings): only the Wi-Fi key service redeems it.
     pub fn wifi_passphrase(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::WifiPassphrase, state) }
+    /// A VPN sign-in password or code (vpn.md §9.3): only the tunnel's
+    /// engine, through the crypta service, can redeem what is typed.
+    pub fn vpn_secret(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::VpnSecret, state) }
     /// A sealed stick's recovery code (Scrinium): only arcad's `VK_ADOPT`
     /// redeems it.
     pub fn recovery_code(state: Mutable<CredentialState>) -> Self { Self::new(Purpose::RecoveryCode, state) }

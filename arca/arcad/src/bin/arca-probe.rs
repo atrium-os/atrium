@@ -15,7 +15,7 @@
 //! arca-probe - persona PUBHEX APP            # the app's courier persona
 //! arca-probe SOCK accounts USER PUBHEX APP # as arca-ui's uid: the chip's list
 //! arca-probe SOCK generate USER PUBHEX APP # as arca-ui's uid: a handle
-//! arca-probe SOCK hold USER PUBHEX APP VALUE  # as arca-ui's uid: a typed value's handle
+//! arca-probe SOCK hold USER PUBHEX APP VALUE [vpn]  # as arca-ui's uid: a typed value's handle
 //! arca-probe SOCK share-save HANDLE HOST PORT PATH KEYHEX ACCOUNT  # as the file manager
 //! arca-probe SOCK share-mint HOST PORT PATH KEYHEX ACCOUNT         # as the file manager
 //! arca-probe SOCK share-list                                       # as the file manager
@@ -145,6 +145,10 @@ fn main() -> ExitCode {
             w.raw(&unhex(arg(4)));
             w.str(arg(5));
             w.bytes(arg(6).as_bytes());
+            // `vpn`: for Crypta's engines only (TAKE_VPN).
+            if arg(7) == "vpn" {
+                w.u8(op::HOLD_FOR_VPN);
+            }
             call(sock, op::U_HOLD, &w.buf)
         }
         "share-save" | "share-mint" => {

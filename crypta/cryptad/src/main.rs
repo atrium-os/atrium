@@ -24,9 +24,22 @@
 //! - `up name=N`, `down name=N`, `delete name=N`, `set name=N block=0|1`
 //! - `list`: one `tunnel` line per profile
 //!
+//! AnyConnect (V4, vpn.md §9):
+//!
+//! - `create-ac name=N host=H[:P] [path=] [user=HEX] [group=HEX] [pin=HEX] [ca=B64] [scoped=0]`
+//! - `prompt name=N`: what the gateway asks (`text k= v=HEX` lines, then
+//!   `field i= kind= name=HEX label=HEX` and `choice i= value=HEX
+//!   label=HEX`), or `sso login=HEX final=HEX cookie=HEX`
+//! - `answer name=N tI=HEX | hI=HANDLE [keep=1] ... | cancel=1`: field I's
+//!   text, or the handle of what was typed into Arca's field
+//! - `sso-done name=N ok=0|1`, `rebind name=N`
+//! - `csr name=N [cn=HEX]`: a P-256 key in Arca and a request for it
+//! - `certificate name=N` with the PEM chain as a descriptor
+//!
 //! `atrium-cryptad ctl VERB [k=v ...]` sends one (with stdin as the file for
 //! `import`) and prints the answer.
 
+mod csr;
 mod fd;
 mod key;
 mod net;
@@ -38,7 +51,9 @@ use aura_ipc::Line;
 use crypta_proto::engine::{self, DhShared, FromEngine, Start, ToEngine};
 use profile::Profile;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -99,6 +114,33 @@ struct Live {
     rd: engine::Reader,
     pd: OwnedFd,
     started: Instant,
+    /// An AnyConnect engine's secrets helper (vpn.md §9.3).
+    helper: Option<Helper>,
+}
+
+/// A child that ends with its engine.
+struct Helper(std::process::Child);
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// AnyConnect: where a sign-in stands.
+#[derive(Default)]
+struct AcRun {
+    /// Where the gateway's name resolved at `up`.
+    gw: Option<SocketAddrV4>,
+    prompt: Option<engine::Prompt>,
+    /// `(login, final_url, token_cookie)`.
+    sso: Option<(String, String, String)>,
+    pushed: Option<engine::Pushed>,
+    /// What the person answered the username and group fields with, kept
+    /// in the profile once the sign-in succeeds.
+    user: Option<String>,
+    group: Option<String>,
 }
 
 struct Run {
@@ -112,6 +154,7 @@ struct Run {
     stats: (u64, u64, u64),
     starts: u32,
     last_error: String,
+    ac: AcRun,
 }
 
 struct CtlConn {
@@ -129,6 +172,32 @@ struct D {
     janitor: Vec<u32>,
     /// The `vpn-state` text last written.
     shown: Option<String>,
+    /// Why a tunnel stopped for good (a gateway's refusal, a push
+    /// atrium-net refused), until it is turned on again.
+    failed: HashMap<String, String>,
+}
+
+/// A gateway's name to an IPv4 address (the machine's resolver).
+fn resolve(host: &str, port: u16) -> Result<SocketAddrV4, String> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return Ok(SocketAddrV4::new(ip, port));
+    }
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .find_map(|a| match a {
+            SocketAddr::V4(v) => Some(v),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| "no-v4-address".to_string())
+}
+
+/// Free text for a line: hex, at most `max` bytes of it.
+fn texts(out: &mut Vec<Line>, k: &str, v: &str) {
+    for c in v.as_bytes().chunks(1500).take(8) {
+        out.push(Line::new("text").with("k", k).with_hex("v", c));
+    }
 }
 
 fn hex32(l: &Line, k: &str) -> Option<[u8; 32]> {
@@ -254,17 +323,25 @@ impl D {
             return Err("too-many".into());
         }
         let p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        self.failed.remove(name);
+        // AnyConnect: the gateway's address now; its settings come with the
+        // sign-in, and are applied then (`Pushed`).
+        let gw = match &p.ac {
+            Some(a) => Some(resolve(&a.host, a.port)?),
+            None => None,
+        };
         let mut a = self.net_call(&Line::new("tunnel-open").with("id", name))?;
         let iface = a.lines.iter().find(|l| l.verb == "tunnel").and_then(|l| l.get("iface")).ok_or("no-iface")?.to_string();
         let tun = a.fds.pop().ok_or("no-tun")?;
-        for l in p.proposal().to_lines(name) {
+        let wg = if gw.is_none() { p.proposal().to_lines(name) } else { Vec::new() };
+        for l in wg {
             if let Err(e) = self.net_call(&l) {
                 let _ = self.net_call(&Line::new("tunnel-close").with("id", name));
                 return Err(e);
             }
         }
-        self.log(&format!("{name}: applied on {iface}"));
-        let mut r = Run { p, iface, tun, engine: None, restart_at: None, backoff_s: 1, handshake: false, stats: (0, 0, 0), starts: 0, last_error: String::new() };
+        self.log(&format!("{name}: open on {iface}"));
+        let mut r = Run { p, iface, tun, engine: None, restart_at: None, backoff_s: 1, handshake: false, stats: (0, 0, 0), starts: 0, last_error: String::new(), ac: AcRun { gw, ..AcRun::default() } };
         if let Err(e) = self.start_engine(&mut r) {
             eprintln!("atrium-cryptad: {name}: engine: {e}");
             r.last_error = e;
@@ -286,6 +363,9 @@ impl D {
     }
 
     fn start_engine(&mut self, r: &mut Run) -> Result<(), String> {
+        if r.p.ac.is_some() {
+            return self.start_ac(r);
+        }
         let psk = match r.p.psk {
             Some(i) => {
                 let a = self.keys.call(&Line::new("release").with_hex("id", &i)).map_err(|e| e.to_string())?;
@@ -295,7 +375,7 @@ impl D {
         };
         let uid = self.pick_uid().ok_or("no-uid")?;
         r.starts += 1;
-        let mut e = launch(&self.o.jaild, uid, r)?;
+        let mut e = launch(&self.o.jaild, uid, r, r.p.endpoint, None)?;
         let start = ToEngine::Start(Start {
             our_public: r.p.public,
             peer_public: r.p.peer,
@@ -313,6 +393,223 @@ impl D {
         r.engine = Some(e);
         r.handshake = false;
         Ok(())
+    }
+
+    /// An AnyConnect engine (vpn.md §9.3): its own secrets helper on a
+    /// socket only it holds, and what Arca already keeps for the profile.
+    fn start_ac(&mut self, r: &mut Run) -> Result<(), String> {
+        let a = r.p.ac.clone().ok_or("not-ac")?;
+        let gw = r.ac.gw.ok_or("no-gateway")?;
+        let mut has = |acc: String| self.keys.call(&Line::new("find").with("account", acc)).is_ok_and(|l| l.verb == "ok");
+        let saved = has(format!("{}/password", r.p.name));
+        let resume = has(format!("{}/session", r.p.name));
+        let uid = self.pick_uid().ok_or("no-uid")?;
+        let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+        let helper = key::Keys::start_vpn(self.o.key_uid, &self.o.arca, &r.p.name, theirs).map_err(|e| format!("secrets helper: {e}"))?;
+        let helper = Helper(helper);
+        r.starts += 1;
+        let mut e = launch(&self.o.jaild, uid, r, gw, Some(ours.as_fd()))?;
+        drop(ours);
+        e.helper = Some(helper);
+        let start = ToEngine::StartAc(engine::StartAc {
+            host: a.host.clone(),
+            gateway: gw,
+            path: a.path.clone(),
+            cas: a.cas.clone(),
+            pin: a.pin,
+            hostname: a.hostname.clone(),
+            mtu: r.p.mtu.unwrap_or(1406),
+            username: a.username.clone(),
+            group: a.group.clone(),
+            saved,
+            cert_chain: a.cert_chain.clone(),
+            resume,
+        });
+        let _ = e.sock.set_write_timeout(Some(Duration::from_secs(2)));
+        if let Err(err) = engine::write(&mut e.sock, &start) {
+            self.retire(e.uid);
+            return Err(format!("start: {err}"));
+        }
+        self.log(&format!("{}: AnyConnect engine {} started for {} ({gw}){}{}", r.p.name, e.uid, a.host, if saved { ", saved password" } else { "" }, if resume { ", resuming" } else { "" }));
+        r.engine = Some(e);
+        r.handshake = false;
+        r.ac.prompt = None;
+        r.ac.sso = None;
+        Ok(())
+    }
+
+    /// A tunnel that cannot go on: stopped and closed, and why kept for
+    /// `list` until it is turned on again.
+    fn fail(&mut self, k: usize, why: &str) {
+        let name = self.runs[k].p.name.clone();
+        eprintln!("atrium-cryptad: {name}: stopped: {why}");
+        self.stop_engine(k);
+        self.runs.remove(k);
+        let _ = self.net_call(&Line::new("tunnel-close").with("id", &name));
+        self.failed.insert(name, why.chars().take(400).collect());
+    }
+
+    /// What a gateway pushed, to atrium-net; it checks it again (§9.4).
+    fn apply_push(&mut self, k: usize, p: engine::Pushed) -> Result<(), String> {
+        let r = &self.runs[k];
+        let gw = r.ac.gw.ok_or("no-gateway")?;
+        if r.ac.pushed.as_ref() == Some(&p) {
+            return Ok(());
+        }
+        let name = r.p.name.clone();
+        for l in r.p.ac_proposal(&p, gw).to_lines(&name) {
+            self.net_call(&l)?;
+        }
+        if !p.ignored.is_empty() {
+            self.log(&format!("{name}: ignored {}", p.ignored.join(",")));
+        }
+        self.log(&format!("{name}: applied {}/{} on {}", p.addr, p.prefix, self.runs[k].iface));
+        let r = &mut self.runs[k];
+        r.ac.pushed = Some(p);
+        r.ac.prompt = None;
+        r.ac.sso = None;
+        // Signed in: keep what was typed for the username and group.
+        let (user, group) = (r.ac.user.take(), r.ac.group.take());
+        if let Some(a) = r.p.ac.as_mut() {
+            let changed = (user.is_some() && a.username != user) || (group.is_some() && a.group != group);
+            if changed {
+                a.username = user.or(a.username.take());
+                a.group = group.or(a.group.take());
+                if let Some(mut saved) = Profile::load(&self.o.state, &r.p.name) {
+                    if let (Some(s), Some(n)) = (saved.ac.as_mut(), r.p.ac.as_ref()) {
+                        s.username = n.username.clone();
+                        s.group = n.group.clone();
+                        let _ = saved.save(&self.o.state);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ac_run(&mut self, name: &str) -> Result<usize, String> {
+        let k = self.runs.iter().position(|r| r.p.name == name).ok_or("not-up")?;
+        if self.runs[k].p.ac.is_none() {
+            return Err("not-ac".into());
+        }
+        Ok(k)
+    }
+
+    fn to_engine(&mut self, k: usize, m: &ToEngine) -> Result<(), String> {
+        let e = self.runs[k].engine.as_mut().ok_or("no-engine")?;
+        engine::write(&mut e.sock, m).map_err(|e| e.to_string())
+    }
+
+    /// `prompt`: what the gateway is asking, for Settings.
+    fn prompt(&mut self, name: &str) -> Result<Vec<Line>, String> {
+        let k = self.ac_run(name)?;
+        let r = &self.runs[k];
+        let mut v = Vec::new();
+        if let Some((login, fin, cookie)) = &r.ac.sso {
+            v.push(Line::new("sso").with_hex("login", login.as_bytes()).with_hex("final", fin.as_bytes()).with_hex("cookie", cookie.as_bytes()));
+            return Ok(v);
+        }
+        let p = r.ac.prompt.as_ref().ok_or("no-prompt")?;
+        for (k, t) in [("title", &p.title), ("message", &p.message), ("error", &p.error), ("banner", &p.banner)] {
+            texts(&mut v, k, t);
+        }
+        for (i, f) in p.fields.iter().enumerate() {
+            v.push(Line::new("field").with("i", i).with("kind", f.kind).with_hex("name", f.name.as_bytes()).with_hex("label", f.label.as_bytes()));
+            for (val, label) in f.choices.iter().take(64) {
+                v.push(Line::new("choice").with("i", i).with_hex("value", val.as_bytes()).with_hex("label", label.as_bytes()));
+            }
+        }
+        Ok(v)
+    }
+
+    /// `answer`: the person's answers to the prompt, to the engine.
+    fn answer(&mut self, name: &str, l: &Line) -> Result<(), String> {
+        let k = self.ac_run(name)?;
+        let p = self.runs[k].ac.prompt.clone().ok_or("no-prompt")?;
+        let a = if l.get("cancel") == Some("1") {
+            None
+        } else {
+            let keep = l.get("keep") == Some("1");
+            let mut out = Vec::new();
+            for (i, f) in p.fields.iter().enumerate() {
+                let v = if let Some(t) = l.hex(&format!("t{i}")) {
+                    // A password reaches the engine only through Arca's
+                    // field (vpn.md §9.3), never through cryptad.
+                    if f.kind == 1 {
+                        return Err("password-through-arca".into());
+                    }
+                    let t = String::from_utf8(t).map_err(|_| "bad-text")?;
+                    if f.kind == 0 && f.name == "username" {
+                        self.runs[k].ac.user = Some(t.clone());
+                    }
+                    if f.kind == 3 {
+                        if !f.choices.iter().any(|(v, _)| *v == t) {
+                            return Err("bad-choice".into());
+                        }
+                        if f.name == "group_list" {
+                            self.runs[k].ac.group = Some(t.clone());
+                        }
+                    }
+                    engine::Value::Text(t)
+                } else if let Some(h) = l.hex(&format!("h{i}")).and_then(|h| <[u8; 16]>::try_from(h).ok()) {
+                    engine::Value::Held { handle: h, keep: keep && f.kind == 1 }
+                } else {
+                    return Err("missing-field".into());
+                };
+                out.push((f.name.clone(), v));
+            }
+            Some(out)
+        };
+        self.to_engine(k, &ToEngine::Answer(a))?;
+        self.runs[k].ac.prompt = None;
+        Ok(())
+    }
+
+    /// `csr`: a client key made in Arca, and a request for the IT team.
+    fn csr(&mut self, name: &str, l: &Line) -> Result<Vec<Line>, String> {
+        let mut p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let a = p.ac.as_mut().ok_or("not-ac")?;
+        let account = format!("{name}/tls");
+        let (id, public) = match self.keys.call(&Line::new("find").with("account", &account)).ok().filter(|l| l.verb == "ok").and_then(|l| l.hex("id")).and_then(|i| <[u8; 16]>::try_from(i).ok()) {
+            Some(id) if a.cert_key.is_some() => (id, a.cert_key.clone().unwrap()),
+            old => {
+                if let Some(id) = old {
+                    self.forget(&[id]);
+                }
+                let m = self.keys.call(&Line::new("mint-tls").with("account", &account)).map_err(|e| e.to_string())?;
+                let (Some(id), Some(public)) = (m.hex("id").and_then(|i| <[u8; 16]>::try_from(i).ok()), m.hex("pub").filter(|p| p.len() == 65)) else {
+                    return Err(format!("arca-{}", m.get("status").unwrap_or("?")));
+                };
+                a.cert_key = Some(public.clone());
+                a.cert_chain.clear();
+                (id, public)
+            }
+        };
+        let cn = match l.hex("cn") {
+            Some(c) => String::from_utf8(c).ok().filter(|c| !c.is_empty() && c.len() <= 64 && !c.chars().any(char::is_control)).ok_or("bad-cn")?,
+            None => a.username.clone().unwrap_or_else(|| name.to_string()),
+        };
+        let info = csr::info(&cn, &public);
+        let s = self.keys.call(&Line::new("sign").with_hex("id", &id).with_hex("digest", &csr::digest(&info))).map_err(|e| e.to_string())?;
+        let sig = s.hex("sig").ok_or_else(|| format!("arca-{}", s.get("status").unwrap_or("?")))?;
+        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        Ok(vec![Line::new("csr").with_hex("pem", csr::pem(&info, &sig).as_bytes())])
+    }
+
+    /// `certificate`: the chain the IT team signed, for the key `csr` made.
+    fn certificate(&mut self, name: &str, file: Option<OwnedFd>) -> Result<Vec<Line>, String> {
+        let mut p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
+        let a = p.ac.as_mut().ok_or("not-ac")?;
+        let key = a.cert_key.clone().ok_or("no-key")?;
+        let mut text = String::new();
+        std::fs::File::from(file.ok_or("no-file")?).take(64 * 1024).read_to_string(&mut text).map_err(|_| "unreadable")?;
+        let chain = profile::certs_of(&text).ok_or("bad-certificate")?;
+        if chain.len() > 8 || !csr::certifies(&chain[0], &key) {
+            return Err("not-for-this-key".into());
+        }
+        a.cert_chain = chain;
+        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        Ok(vec![])
     }
 
     fn retire(&mut self, uid: u32) {
@@ -342,9 +639,15 @@ impl D {
     fn delete(&mut self, name: &str) -> Result<(), String> {
         let p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
         self.down(name)?;
-        let mut ids = vec![p.key];
-        ids.extend(p.psk);
-        self.forget(&ids);
+        self.failed.remove(name);
+        if p.ac.is_some() {
+            // Its password, session, token and client key.
+            let _ = self.keys.call(&Line::new("forget-all").with("prefix", format!("{name}/")));
+        } else {
+            let mut ids = vec![p.key];
+            ids.extend(p.psk);
+            self.forget(&ids);
+        }
         std::fs::remove_file(Profile::path(&self.o.state, name)).map_err(|e| e.to_string())
     }
 
@@ -366,8 +669,33 @@ impl D {
                 } else {
                     l = l.with("up", 0);
                 }
-                if let Some(p) = Profile::load(&self.o.state, &n) {
-                    l = l.with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8).with("scoped", p.scoped as u8);
+                if let Some(r) = self.runs.iter().find(|r| r.p.name == n) {
+                    if r.p.ac.is_some() {
+                        let st = if r.ac.sso.is_some() { "sso" } else if r.ac.prompt.is_some() { "prompt" } else if r.ac.pushed.is_some() { "in" } else { "starting" };
+                        l = l.with("signin", st);
+                        if let Some(p) = &r.ac.pushed {
+                            l = l.with("addr", format!("{}/{}", p.addr, p.prefix)).with("full", p.full as u8).with("routes", p.includes.len());
+                            if !p.banner.is_empty() {
+                                l = l.with("banner", 1);
+                            }
+                        }
+                    }
+                }
+                if let Some(why) = self.failed.get(&n) {
+                    l = l.with_hex("error", why.as_bytes());
+                }
+                let ac = Profile::load(&self.o.state, &n).filter(|p| p.ac.is_some());
+                if let Some(p) = ac {
+                    let a = p.ac.as_ref().unwrap();
+                    l = l.with("kind", "ac").with("host", &a.host).with("port", a.port).with("block", p.block as u8).with("scoped", p.scoped as u8).with("cert", (!a.cert_chain.is_empty()) as u8).with("pinned", a.pin.is_some() as u8);
+                    if let Some(u) = &a.username {
+                        l = l.with_hex("user", u.as_bytes());
+                    }
+                    if let Some(g) = &a.group {
+                        l = l.with_hex("group", g.as_bytes());
+                    }
+                } else if let Some(p) = Profile::load(&self.o.state, &n) {
+                    l = l.with("kind", "wg").with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8).with("scoped", p.scoped as u8);
                     l = l.with("addrs", p.addrs.iter().map(|a| format!("{}/{}", a.addr, a.len)).collect::<Vec<_>>().join(",")).with("routes", p.allowed.len());
                     if !p.dns.is_empty() {
                         l = l.with("dns", p.dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
@@ -383,6 +711,25 @@ impl D {
         let res: Result<Vec<Line>, String> = match (l.verb.as_str(), name) {
             ("import", _) => self.import(l, file),
             ("create", _) => self.create(l),
+            ("create-ac", _) => match Profile::from_create_ac(l) {
+                Err(e) => Err(e.into()),
+                Ok(p) if Profile::load(&self.o.state, &p.name).is_some() => Err("exists".into()),
+                Ok(p) => p.save(&self.o.state).map(|_| vec![Line::new("created").with("name", &p.name)]).map_err(|e| format!("save: {e}")),
+            },
+            ("prompt", Some(n)) => self.prompt(&n),
+            ("answer", Some(n)) => self.answer(&n, l).map(|_| vec![]),
+            ("sso-done", Some(n)) => {
+                let ok = l.get("ok") == Some("1");
+                self.ac_run(&n).and_then(|k| {
+                    if self.runs[k].ac.sso.take().is_none() {
+                        return Err("no-sso".into());
+                    }
+                    self.to_engine(k, &ToEngine::SsoDone(ok))
+                }).map(|_| vec![])
+            }
+            ("rebind", Some(n)) => self.ac_run(&n).and_then(|k| self.to_engine(k, &ToEngine::Rebind)).map(|_| vec![]),
+            ("csr", Some(n)) => self.csr(&n, l),
+            ("certificate", Some(n)) => self.certificate(&n, file),
             ("up", Some(n)) => self.up(&n).map(|_| vec![]),
             ("down", Some(n)) => self.down(&n).map(|_| vec![]),
             ("delete", Some(n)) => self.delete(&n).map(|_| vec![]),
@@ -465,6 +812,26 @@ impl D {
                     self.log(&format!("{}: not connected ({})", self.runs[k].p.name, why.chars().take(80).collect::<String>()));
                 }
                 FromEngine::Stats { rx, tx, dropped } => self.runs[k].stats = (rx, tx, dropped),
+                FromEngine::Prompt(p) => {
+                    self.log(&format!("{}: the gateway asks ({} fields)", self.runs[k].p.name, p.fields.len()));
+                    self.runs[k].ac.sso = None;
+                    self.runs[k].ac.prompt = Some(p);
+                }
+                FromEngine::Sso { login, final_url, token_cookie } => {
+                    self.log(&format!("{}: single sign-on at {}", self.runs[k].p.name, login.chars().take(120).collect::<String>()));
+                    self.runs[k].ac.prompt = None;
+                    self.runs[k].ac.sso = Some((login, final_url, token_cookie));
+                }
+                FromEngine::Pushed(p) => {
+                    if let Err(e) = self.apply_push(k, p) {
+                        self.fail(k, &format!("atrium-net refused what the gateway pushed ({e})"));
+                        return;
+                    }
+                }
+                FromEngine::Refused { why } => {
+                    self.fail(k, &why);
+                    return;
+                }
             }
         }
     }
@@ -537,14 +904,14 @@ impl D {
 }
 
 #[cfg(target_os = "freebsd")]
-fn launch(jaild: &str, uid: u32, r: &Run) -> Result<Live, String> {
-    let e = jail::launch(jaild, uid, r.p.endpoint, r.tun.as_fd())?;
-    Ok(Live { uid: e.uid, sock: e.sock, rd: engine::Reader::default(), pd: e.procdesc, started: Instant::now() })
+fn launch(jaild: &str, uid: u32, r: &Run, gw: SocketAddrV4, secrets: Option<BorrowedFd<'_>>) -> Result<Live, String> {
+    let e = jail::launch(jaild, uid, gw, r.tun.as_fd(), secrets)?;
+    Ok(Live { uid: e.uid, sock: e.sock, rd: engine::Reader::default(), pd: e.procdesc, started: Instant::now(), helper: None })
 }
 
 #[cfg(not(target_os = "freebsd"))]
-fn launch(_jaild: &str, uid: u32, r: &Run) -> Result<Live, String> {
-    Err(format!("engines run on FreeBSD only (uid {uid}, tun fd {})", r.tun.as_raw_fd()))
+fn launch(_jaild: &str, uid: u32, r: &Run, gw: SocketAddrV4, _secrets: Option<BorrowedFd<'_>>) -> Result<Live, String> {
+    Err(format!("engines run on FreeBSD only (uid {uid}, tun fd {}, {gw})", r.tun.as_raw_fd()))
 }
 
 fn dummy_run() -> Run {
@@ -565,6 +932,7 @@ fn dummy_run() -> Run {
             block: false,
             insecure: false,
             scoped: false,
+            ac: None,
         },
         iface: String::new(),
         tun: std::fs::File::open("/dev/null").expect("/dev/null").into(),
@@ -575,6 +943,7 @@ fn dummy_run() -> Run {
         stats: (0, 0, 0),
         starts: 0,
         last_error: String::new(),
+        ac: AcRun::default(),
     }
 }
 
@@ -613,7 +982,7 @@ fn daemon(o: Opts) {
     }
     let keys = key::Keys::start(o.key_uid, &o.arca).unwrap_or_else(|e| die(&format!("key helper: {e}")));
     let listener = listen(&o.sock);
-    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new(), shown: None };
+    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new(), shown: None, failed: HashMap::new() };
     #[cfg(target_os = "freebsd")]
     {
         d.janitor = jail::sweep(&d.o.jaild);
@@ -730,7 +1099,7 @@ fn ctl_client(o: &Opts, args: &[String]) -> i32 {
         }
     };
     let b = l.encode().unwrap_or_default();
-    let sent = if verb == "import" {
+    let sent = if verb == "import" || verb == "certificate" {
         let stdin = io::stdin();
         fd::send(s.as_raw_fd(), &b, &[stdin.as_fd().as_raw_fd()]).and_then(|n| s.write_all(&b[n..]))
     } else {
@@ -769,6 +1138,12 @@ fn main() {
     if a.first().map(String::as_str) == Some("--arca-key") {
         let sock = std::env::var("ARCA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
         return key::serve(&sock);
+    }
+    if a.first().map(String::as_str) == Some("--arca-vpn") {
+        // An AnyConnect engine's own helper: its socket is stdin and stdout.
+        let sock = std::env::var("ARCA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
+        let Some(name) = a.get(1).filter(|n| profile::valid_name(n)) else { die("--arca-vpn NAME") };
+        return key::serve_vpn(&sock, name);
     }
     if a.first().map(String::as_str) == Some("ctl") {
         // Options before `ctl` are not taken; the socket from the environment.

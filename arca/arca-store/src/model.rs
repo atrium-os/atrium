@@ -90,6 +90,10 @@ pub enum Kind {
     /// A WireGuard static key (X25519, vpn.md §4.3): used only through
     /// `DH_X25519`, never released. Value: the 32-byte private scalar.
     WireGuardKey = 0x104,
+    /// A TLS client key for a VPN gateway (P-256, vpn.md §9.3): used only
+    /// through `SIGN` by the crypta service, never released. Value: the
+    /// 32-byte scalar.
+    TlsClientKey = 0x105,
 }
 
 impl Kind {
@@ -110,6 +114,7 @@ impl Kind {
             0x102 => Symmetric,
             0x103 => VolumeKey,
             0x104 => WireGuardKey,
+            0x105 => TlsClientKey,
             _ => return Err(Error::Corrupt("unknown kind")),
         })
     }

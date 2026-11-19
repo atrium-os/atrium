@@ -18,6 +18,9 @@ pub const JAILS_DIR: &str = "/var/lib/atrium/jails";
 /// jaild's `[crypta_engines]`: these must match its policy.
 pub const NAME_PREFIX: &str = "system-crypta-";
 pub const EXEC_PATH: &str = "/usr/local/bin/atrium-crypta-wg";
+/// The AnyConnect engine (V4): TCP to its gateway, the system's CA file
+/// read before its sandbox, its secrets helper at fd 4.
+pub const EXEC_AC: &str = "/usr/local/bin/atrium-crypta-ac";
 pub const UID_FIRST: u32 = 61000;
 pub const UID_LAST: u32 = 61499;
 /// The app devfs ruleset: null, zero, random and little else. The engine
@@ -40,21 +43,28 @@ pub struct Engine {
     pub procdesc: OwnedFd,
 }
 
-/// Start an engine for a tunnel to `gw` on `tun`. On failure the jail is
-/// released before the error returns; its root is the janitor's.
-pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>) -> Result<Engine, String> {
+/// Start an engine for a tunnel to `gw` on `tun`: WireGuard (UDP), or with
+/// `secrets` AnyConnect (TCP, the secrets helper's socket at fd 4). On
+/// failure the jail is released before the error returns; its root is the
+/// janitor's.
+pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secrets: Option<BorrowedFd<'_>>) -> Result<Engine, String> {
+    let ac = secrets.is_some();
     if !try_teardown(uid) {
         return Err(format!("{} is still being torn down", name(uid)));
     }
     let root = root(uid);
     std::fs::create_dir_all(&root).map_err(|e| format!("root: {e}"))?;
     let ro = |p: &str| MountSpec { source: p.into(), dest: p.into(), kind: MountKind::RoNullfs, size_mb: None, owner: None };
-    let mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
+    let mut mounts = vec![ro("/lib"), ro("/libexec"), ro("/usr/lib"), ro("/usr/local/bin")];
+    if ac {
+        // The system's CA file (certctl's /etc/ssl/cert.pem), read once.
+        mounts.push(ro("/etc/ssl"));
+    }
     let id = portcullis_identity::for_app(&format!("org.atrium.crypta.engine.{uid}")).map_err(|e| format!("host identity: {e}"))?;
     let grants = NetGrants {
         app_key: portcullis_identity::consent_key(&name(uid)),
         outbound_any: false,
-        outbound: vec![NetDest { cidr: format!("{}/32", gw.ip()), port: Some(gw.port()), udp: true }],
+        outbound: vec![NetDest { cidr: format!("{}/32", gw.ip()), port: Some(gw.port()), udp: !ac }],
         peers: vec![],
         inbound: vec![],
         no_resolver: true,
@@ -68,8 +78,8 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>) -> R
         devfs_ruleset: DEVFS_RULESET,
         network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
         exec: Some(ExecSpec {
-            path: EXEC_PATH.into(),
-            argv: vec![EXEC_PATH.into()],
+            path: if ac { EXEC_AC } else { EXEC_PATH }.into(),
+            argv: vec![if ac { EXEC_AC } else { EXEC_PATH }.into()],
             env: vec![],
             uid,
             gid: uid,
@@ -91,8 +101,11 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>) -> R
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
     let mut c = jaild::client::Client::connect(jaild).map_err(|e| format!("connect {jaild}: {e}"))?;
     let err = std::io::stderr();
-    // stdin and stdout are the socket, stderr our log; the tun lands at fd 3.
-    let sent = c.send_with_fds(&req, &[theirs.as_fd(), theirs.as_fd(), err.as_fd(), tun], 1);
+    // stdin and stdout are the socket, stderr our log; the tun lands at fd
+    // 3, an AnyConnect engine's secrets helper at 4.
+    let mut fds = vec![theirs.as_fd(), theirs.as_fd(), err.as_fd(), tun];
+    fds.extend(secrets);
+    let sent = c.send_with_fds(&req, &fds, 1);
     drop(theirs);
     let (resp, got) = sent.map_err(|e| format!("jaild: {e}"))?;
     // SAFETY: jaild handed these over; each is owned once.
@@ -143,7 +156,7 @@ pub fn try_teardown(uid: u32) -> bool {
         return false;
     }
     // ★ Never remove_dir_all: only empty directories go.
-    for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "usr/local", "usr", "dev", ""] {
+    for d in ["lib", "libexec", "usr/lib", "usr/local/bin", "usr/local", "usr", "etc/ssl", "etc", "dev", ""] {
         let _ = std::fs::remove_dir(root.join(d));
     }
     !root.exists()

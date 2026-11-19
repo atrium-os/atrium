@@ -283,7 +283,8 @@ pub const CRYPTA_TAG: &str = "CRYPTA_OUTER";
 /// vpn.md §3), named and rooted like a courier's, taking its caller's
 /// stdio (cryptad's socket, and the tun as one more descriptor): a routed
 /// vnet whose grants pass only UDP to single addresses on stated ports
-/// (the gateway), tagged `CRYPTA_OUTER`, nothing inbound, no peers, no
+/// (the WireGuard engine's gateways) or only TCP (the AnyConnect engine's,
+/// `ac_exec_path`), tagged `CRYPTA_OUTER`, nothing inbound, no peers, no
 /// resolver. No devices, no FUSE, no child jails, no locked memory.
 pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
     use crate::protocol::NetworkConfig;
@@ -295,11 +296,19 @@ pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
     let Some(uid) = req.name.strip_prefix(c.name_prefix.as_str()).and_then(|u| u.parse::<u32>().ok()) else {
         return false;
     };
+    // Which engine, and so which transport its grants may name.
+    let udp = if exec.path == c.exec_path {
+        true
+    } else if c.ac_exec_path.as_deref() == Some(exec.path.as_str()) {
+        false
+    } else {
+        return false;
+    };
     let network_ok = match &req.network {
         NetworkConfig::Routed { grants: Some(g), fib: None, .. } => {
             !g.outbound_any && g.no_resolver && g.peers.is_empty() && g.inbound.is_empty() && !g.outbound.is_empty()
                 && g.outbound.len() <= 8
-                && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && d.udp)
+                && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && d.udp == udp)
                 && g.tag.as_deref() == Some(CRYPTA_TAG)
         }
         _ => false,
@@ -309,7 +318,6 @@ pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
         && (c.uid_first..=c.uid_last).contains(&uid)
         && exec.uid == uid
         && exec.gid == uid
-        && exec.path == c.exec_path
         && exec.stdio
         && req.fuse.is_none()
         && req.devfs_grant.is_none()
@@ -1338,6 +1346,20 @@ mod tests {
             (engine("system-crypta-61001", "/usr/local/bin/atrium-svc", 61001, routed(grants(gw(), Some("CRYPTA_OUTER")))), "another binary"),
             (engine("system-crypta-61001", wg, 61001, NetworkConfig::Routed { mac: "02:00:00:00:00:01".into(), grants: Some(grants(gw(), Some("CRYPTA_OUTER"))), fib: Some(1) }), "in a route domain"),
             (mlock, "locked memory"),
+        ] {
+            assert!(!is_crypta_engine(&r, &p), "{why}");
+            assert!(validate_create(&r, &p).is_err(), "{why}");
+        }
+        // The AnyConnect engine: TCP to its gateway, never UDP.
+        let ac = "/usr/local/bin/atrium-crypta-ac";
+        let tcp = || vec![NetDest { cidr: "198.51.100.52/32".into(), port: Some(443), udp: false }];
+        let ok = engine("system-crypta-61002", ac, 61002, routed(grants(tcp(), Some("CRYPTA_OUTER"))));
+        assert!(is_crypta_engine(&ok, &p));
+        validate_create(&ok, &p).expect("an AnyConnect engine");
+        for (r, why) in [
+            (engine("system-crypta-61002", ac, 61002, routed(grants(gw(), Some("CRYPTA_OUTER")))), "ac over udp"),
+            (engine("system-crypta-61002", ac, 61002, routed(grants(tcp(), None))), "ac untagged"),
+            (engine("system-crypta-61002", ac, 61002, routed(grants(vec![NetDest { cidr: "198.51.100.52/32".into(), port: None, udp: false }], Some("CRYPTA_OUTER")))), "ac any port"),
         ] {
             assert!(!is_crypta_engine(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
