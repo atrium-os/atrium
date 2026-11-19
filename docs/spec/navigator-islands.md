@@ -279,7 +279,7 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   generates the C++ and Rust Web IDL bindings from the upstream IDL inventory
   and cross-builds the Rust LibJS, LibWeb layout/paint, compositing and bindings
   libraries. The bindings' normal target dependency tree excludes both JIT crates.
-  The complete C++ LibWeb host and retained-scene adapter still need linking.
+  The editor executable still needs its engine-only support libraries and display connection.
   On the base arm64 sysroot the upstream GUI-off CMake configure reached its
   required JPEG decoder after staging mimalloc, FastFloat, LLVM libc headers,
   simdutf, zmij and HarfBuzz. Its global checks also require media, Fontconfig
@@ -302,10 +302,54 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   2,435 pixels within 410 × 183. These counts include the host's scrollbar
   rendering. Ladybird engine work, Fresco op counts, wire bytes, damage and tiles
   for these interactions remain unmeasured.
-- For native scenes, connect Ladybird replay to a retained painter in the engine
-  jail. Inspect the display-list chunks and spatial tree before replay flattens
-  scroll state. Preserve occurrence and order for repeated chunks. Report
-  unsupported operations with the fixture state. Both engine gates are open.
+- **LibWeb editor host and fonts (arm64).** The Mac cross-built 966 LibWeb and 63
+  LibJS C++ units from the upstream source lists, all 759 generated C++ binding
+  units, and the [fixture page client](../../navigator-ladybird/EditorPage.cpp).
+  It supplies a 640 × 360 viewport at 1×, rejects file requests, and feeds the
+  checked-in HTML to the scripting-enabled parser. The executable checks for 128
+  editor paragraphs, focus and caret offset 17 after parsing. Those assertions
+  await the first linked run.
+- The [provider](../../navigator-ladybird/PinnedFonts.cpp) installs directly in
+  LibGfx and LibWeb. The host-side font exporter verifies the ten canonical
+  SFNT addresses before embedding them. The signed font check entered Capsicum
+  before provider initialization, observed uid 1011 and a denied global open,
+  resolved CSS monospace to IBM Plex Mono and shaped `beta` into four matching
+  glyph IDs with positive advances. The verified executable's SHA-256 was
+  `4312bba2f418134842a4e73bc3b8bb6162f9d5c218949e4956d6778f283b421c`.
+- The [painter](../../navigator-ladybird/painter.rs) reads LibCompositing's
+  recording in chunk and occurrence order. It translates ordinary fills,
+  visible carets and horizontal filled glyph runs to Pergola nodes. The glyph
+  positions use LibGfx's ascent and the command scale. It preserves each run's
+  context for clip, effect and scroll resolution. A second signed arm64
+  Capsicum test fed an upstream-built tape with two identical chunks and a
+  caret through the adapter. Both occurrences survived the phase change with
+  identical rectangle nodes. The test stopped at the node conversion.
+- **Link and measurement gate.** As of Nov 19 the editor link has unresolved
+  Unicode, request, compositor and media symbols, including
+  `Unicode::Segmenter::create`, `Requests::RequestClient::websocket_connect`
+  and `MediaClient::Client::acquire`. Finish Unicode and other ordinary support
+  libraries, and bind the platform interfaces to the offline fixture, the
+  assigned Fresco connection and Atrium's brokers. Upstream's optional
+  content-blocking implementation pulls in MPL-2.0 `adblock`; the scratch
+  compile used its ABI declarations only. On the rendering side, connect
+  LibWeb's published `RecordingOutput`, resolve its font IDs and translate its
+  spatial and clip tree to retained groups. Check unsupported commands before
+  submitting a frame. Node updates, bytes and tiles for all three editor
+  interactions and their full-redraw controls remain unmeasured.
+- To resume on the Mac, use `/private/tmp/atrium-i0`. The source is
+  `ladybird-full`; `cpp-engine` contains the C++ objects and Ninja inputs.
+  `editor-link.rsp` and `editor-link.log` identify the exact last link and
+  its unresolved symbols. The [component CMake project](../../navigator-ladybird/CMakeLists.txt)
+  uses the generated headers in `page-headers`, the arm64 toolchain in
+  `freebsd-arm64.cmake`, the dependency prefix `engine-deps` and the JIT-off
+  Rust component archive. Rebuild the existing checkpoint with
+  `cmake --build /private/tmp/atrium-i0/font-rebuild --target font-check editor-host`.
+  For a new tree apply the patches in `patches/ladybird` to the pin above, run
+  the Rust component build, and export the fonts with
+  `cargo run --locked --manifest-path navigator-fontset/Cargo.toml --example export_ladybird -- FONT_DIR`.
+  CMake stages the painter manifest in its build directory. The guest-local
+  signed bundles are `/tmp/navigator-i0-font.6SEQST` and
+  `/tmp/navigator-i0-painter.MbpKML`.
 
 ## 9. Decisions, with recommendations
 

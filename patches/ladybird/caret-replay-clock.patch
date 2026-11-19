@@ -1,0 +1,11 @@
+--- a/Libraries/LibCompositing/Rust/src/display_list/replay.rs
++++ b/Libraries/LibCompositing/Rust/src/display_list/replay.rs
+@@ -242,7 +242,7 @@
+
+ const CARET_BLINK_INTERVAL_NS: i64 = 500_000_000;
+
+-fn caret_is_visible_at_time(caret: &PaintCaret, time_ns: i64) -> bool {
++pub fn caret_is_visible_at_time(caret: &PaintCaret, time_ns: i64) -> bool {
+     if !caret.should_blink {
+         return true;
+     }

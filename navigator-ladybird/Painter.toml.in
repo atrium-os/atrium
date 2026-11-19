@@ -1,0 +1,13 @@
+[package]
+name = "navigator-ladybird-painter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "@CMAKE_CURRENT_SOURCE_DIR@/painter.rs"
+
+[dependencies]
+pergola = { path = "@CMAKE_CURRENT_SOURCE_DIR@/../pergola" }
+libcompositing_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibCompositing/Rust", default-features = false }
+libgfx_rust = { path = "@LADYBIRD_SOURCE@/Libraries/LibGfx/Rust", default-features = false }

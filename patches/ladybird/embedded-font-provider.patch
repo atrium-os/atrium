@@ -1,0 +1,20 @@
+--- a/Libraries/LibWeb/Platform/FontPlugin.cpp
++++ b/Libraries/LibWeb/Platform/FontPlugin.cpp
+@@ -35,6 +35,9 @@
+ FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_provider)
+     : m_is_layout_test_mode(is_layout_test_mode)
+ {
++#ifdef LADYBIRD_EMBEDDED_FONT_PROVIDER
++    VERIFY(font_provider && Gfx::FontDatabase::the().has_system_font_provider());
++#else
+     if (!font_provider)
+         font_provider = &static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
+     if (is<Gfx::PathFontProvider>(*font_provider)) {
+@@ -43,5 +46,7 @@
+         for (auto const& path : Gfx::FontDatabase::font_directories().release_value_but_fixme_should_propagate_errors())
+             path_font_provider.load_all_fonts_from_uri(MUST(String::formatted("file://{}", path)));
+     }
++
++#endif
+
+     update_generic_fonts();
