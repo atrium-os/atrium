@@ -1251,6 +1251,8 @@ impl Sheets {
             _ => None,
         };
         let mut d = doc.borrow_mut();
+        // A row typed into that may need to grow (several lines).
+        let mut grow = None;
         match a {
             GridAction::PlaceFloat { key, .. } => {
                 let mut all = d.wb.charts().to_vec();
@@ -1270,7 +1272,9 @@ impl Sheets {
                 }
             }
             GridAction::Commit { row, col, text } => {
-                d.type_into(row, col, &text);
+                if d.type_into(row, col, &text) {
+                    grow = Some(row);
+                }
             }
             GridAction::Clear(r) => d.clear(r.r0, r.c0, r.r1, r.c1),
             GridAction::Fill { from, to, copy, flip } => {
@@ -1306,6 +1310,12 @@ impl Sheets {
             },
         }
         drop(d);
+        // Rows nobody sized grow to fit wrapped or broken lines typed into
+        // them, as part of the typing (Excel fits such rows).
+        if let Some(row) = grow {
+            let h = src.fit_height(row);
+            doc.borrow_mut().grow_row(row, h);
+        }
         rev.set(rev.get().wrapping_add(1));
     }
 }
@@ -2845,6 +2855,27 @@ mod tests {
             assert!(s.doc.borrow_mut().undo());
         }
         assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn rows_nobody_sized_grow_for_typed_lines() {
+        let (d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid, Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let height = |r| s.doc.borrow().wb.sheet(0).row_sizes.size(r);
+        let commit = |row, text: &str| Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Commit { row, col: 0, text: text.into() });
+        commit(4, "one\ntwo\nthree");
+        assert!(height(4) > 40.0, "{}", height(4));
+        // One undo takes the text and the height back.
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!((height(4), s.doc.borrow().wb.value(0, 4, 0)), (20.0, officina_grid::Value::Empty));
+        // One line: no change. A row sized by hand stays as it was.
+        commit(5, "short");
+        assert_eq!(height(5), 20.0);
+        s.doc.borrow_mut().size_preview(true, 6, 6, 30.0);
+        s.doc.borrow_mut().size_done();
+        commit(6, "one\ntwo\nthree");
+        assert_eq!(height(6), 30.0);
     }
 
     #[test]

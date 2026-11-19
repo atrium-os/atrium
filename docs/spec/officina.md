@@ -3812,8 +3812,11 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Hidden rows:** just below the double line of hidden rows, the double-click shows them again, as Unhide Rows would (`data::unhide_rows_at`), as for columns (§16.89).
 - **Sheets:** Data ▸ Wrap Text turns wrapping on or off for the selection (ticked when its first cell wraps), one undo step.
 - **Line breaks:** Alt+Enter in the cell editor puts a line break at the caret and keeps editing, as in Excel (`TextEdit::insert_break`).
-- **Not yet:** rows growing on their own when wrapped text is typed (Excel fits rows nobody sized), vertical alignment (Excel puts text at the bottom by default; ours is centred), wrapped text in printing (the printing thread's part), and the editor growing to show several lines while one is typed.
-- **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it`.
+- **Rows grow as you type** (2026-11-19): when what is typed needs more lines than its row shows and nobody has sized the row, the row grows to fit, in the same undo step as the typing (journal record `Extend`, tag 7, `Doc::grow_row`). A row sized by hand keeps its height.
+- **Vertical alignment** (2026-11-19): `CellView.valign` (Top, Center, Bottom) places a cell's lines in a taller row; Sheets follows the style's `v_align`, bottom by default as in Excel. Data ▸ Align Top, Align Middle, Align Bottom set it for the selection, one undo step each.
+- **The editor grows** (2026-11-19): with line breaks it is as tall as its lines, draws each with its selection and caret, and a press picks the line under it.
+- **Not yet:** rows shrinking back when their text gets shorter (a grown row counts as sized), wrapping inside the editor as the cell would, Up and Down moving between the editor's lines, and wrapped text in printing (the printing thread's part).
+- **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller` (with `line_top`), `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter, the second line); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it` (with alignment), `rows_nobody_sized_grow_for_typed_lines`, `records_round_trip`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

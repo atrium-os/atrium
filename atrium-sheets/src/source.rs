@@ -4,11 +4,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use officina_grid::addr::{CellAddr, MAX_COLS, MAX_ROWS};
-use officina_grid::style::{HAlign, Line, StyleId, StyleTable};
+use officina_grid::style::{HAlign, Line, StyleId, StyleTable, VAlign};
 use officina_grid::Value;
 use pergola::Color;
 use pergola::theme::palette;
-use pergola::widgets::{CellAlign, CellIcon, CellRange, CellView, GridSource};
+use pergola::widgets::{CellAlign, CellIcon, CellRange, CellVAlign, CellView, GridSource};
 
 use crate::doc::Doc;
 
@@ -65,6 +65,11 @@ impl SheetSource {
 
 /// How a value shows in a cell (General format).
 pub fn view_of(v: &Value) -> Option<CellView> {
+    // At the bottom of a taller row, as spreadsheets show cells.
+    view_of_centred(v).map(|cv| CellView { valign: CellVAlign::Bottom, ..cv })
+}
+
+fn view_of_centred(v: &Value) -> Option<CellView> {
     Some(match v {
         Value::Empty => return None,
         Value::Num(_) => CellView::number(v.display()),
@@ -116,6 +121,11 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
         HAlign::Right => CellAlign::Right,
     };
     cv.wrap = st.wrap;
+    cv.valign = match st.v_align {
+        VAlign::Top => CellVAlign::Top,
+        VAlign::Center => CellVAlign::Center,
+        VAlign::Bottom | VAlign::Justify | VAlign::Distributed => CellVAlign::Bottom,
+    };
     Some(cv)
 }
 
