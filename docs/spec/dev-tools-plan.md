@@ -449,7 +449,14 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   `cargo atrium worker add <fn> --from crate::<path> --dry-run --json` in Output
   (files it changes, call sites to update) and moves on **Move**; the composition
   and fuzz panels reload with the new worker as a target (end-to-end on Linux
-  against the real fuzzer and CLI). M12's Artifex half is built too: the debugger panel on `lldb-dap` over
+  against the real fuzzer and CLI). The focused
+  `engine::tests::moves_a_reported_core_crash_with_cargo_atrium` regression
+  passed on FreeBSD amd64 with installed Cargo and the host-built SDK command.
+  Run the host-built Artifex library test binary locally in the guest with
+  `--ignored --exact engine::tests::moves_a_reported_core_crash_with_cargo_atrium`
+  and both commands on PATH. The test feeds a fixture crash report to the
+  engine. The desktop gate still needs to exercise the buttons from a live
+  workspace fuzz run. M12's Artifex half is built too: the debugger panel on `lldb-dap` over
   `WorkspaceExec` (breakpoints in the gutter, stack, locals, stepping; end-to-end on
   Linux), and the fuzz panel running `cargo atrium fuzz` in the background, core
   crashes first with "Move into a worker", a crash opening at its line and replaying

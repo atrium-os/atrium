@@ -1706,17 +1706,6 @@ mod tests {
         e.act(Act::Use("proj".into()), &mut s);
         e.wait_jobs(&mut s);
         e.act(Act::Open("photos/src/lib.rs".into()), &mut s);
-        let wait = |e: &mut Engine, s: &mut State, secs: u64, f: &dyn Fn(&State) -> bool| {
-            let end = std::time::Instant::now() + Duration::from_secs(secs);
-            while std::time::Instant::now() < end {
-                e.tick(s);
-                if f(s) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            false
-        };
         assert!(wait(&mut e, &mut s, 60, &|s| s.fuzz.as_ref().is_some_and(|f| f.listed)), "{:?}", s.fuzz);
         let f = s.fuzz.clone().unwrap();
         assert_eq!(f.error, None);
@@ -1757,22 +1746,64 @@ mod tests {
             }
             e.act(Act::StopDebug, &mut s);
         }
+        check_worker_move(&d, &mut e, &mut s);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The Artifex move action against the real SDK command. A crash report
+    /// fixture lets FreeBSD check this without building the libFuzzer harness.
+    #[test]
+    #[ignore = "requires cargo and cargo-atrium on PATH"]
+    fn moves_a_reported_core_crash_with_cargo_atrium() {
+        let (d, mut e, mut s) = setup("move-core-crash");
+        let project = d.join("proj/photos");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("Cargo.toml"),
+            "[package]\nname = \"photos\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        std::fs::write(project.join("atrium.toml"),
+            "[app]\nid = \"org.example.photos\"\nentry = \"bin/photos\"\n").unwrap();
+        std::fs::write(project.join("src/lib.rs"),
+            "pub fn read_album(b: &[u8]) {\n    let _ = b[0];\n}\n").unwrap();
+        e.act(Act::Use("proj".into()), &mut s);
+        e.wait_jobs(&mut s);
+        e.act(Act::Open("photos/src/lib.rs".into()), &mut s);
+        s.fuzz.as_mut().unwrap().line("core:album",
+            r#"{"event":"crash","frame":"src/lib.rs:2","in_core":true}"#);
+        check_worker_move(&d, &mut e, &mut s);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn wait(e: &mut Engine, s: &mut State, secs: u64, f: &dyn Fn(&State) -> bool) -> bool {
+        let end = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < end {
+            e.tick(s);
+            if f(s) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn check_worker_move(d: &Path, e: &mut Engine, s: &mut State) {
         // Move into a worker: a preview, then the move; the worker becomes a
         // fuzz target of its own.
-        e.act(Act::MoveToWorker(0), &mut s);
-        assert!(wait(&mut e, &mut s, 120, &|s| s.moving.is_some() || s.note.as_ref().is_some_and(|n| n.1)), "{:?} {}", s.note, s.output);
+        e.act(Act::MoveToWorker(0), s);
+        assert!(wait(e, s, 120, &|s| s.moving.is_some() || s.note.as_ref().is_some_and(|n| n.1)), "{:?} {}", s.note, s.output);
         let m = s.moving.clone().unwrap_or_else(|| panic!("{:?} {}", s.note, s.output));
         assert_eq!((m.worker.as_str(), m.from.as_str(), m.dry_run), ("read-album", "crate::read_album", true));
         assert!(m.changed.iter().any(|c| c.ends_with("atrium.toml")), "{m:?}");
         assert!(!std::fs::read_to_string(d.join("proj/photos/atrium.toml")).unwrap().contains("[[workers]]"), "a preview writes nothing");
-        e.act(Act::ConfirmMove(true), &mut s);
-        assert!(wait(&mut e, &mut s, 120, &|s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Moved") || n.1)), "{:?} {}", s.note, s.output);
+        let worker_bin = d.join("proj/photos/src/bin/read_album.rs");
+        assert!(!worker_bin.exists(), "a preview creates no worker binary source");
+        e.act(Act::ConfirmMove(true), s);
+        assert!(wait(e, s, 120, &|s| s.note.as_ref().is_some_and(|n| n.0.starts_with("Moved") || n.1)), "{:?} {}", s.note, s.output);
         assert_eq!(s.note.as_ref().map(|n| n.1), Some(false), "{:?} {}", s.note, s.output);
         assert!(std::fs::read_to_string(d.join("proj/photos/atrium.toml")).unwrap().contains("[[workers]]"));
-        assert!(wait(&mut e, &mut s, 60, &|s| s.fuzz.as_ref().is_some_and(|f| f.listed)), "{:?}", s.fuzz);
+        assert!(wait(e, s, 60, &|s| s.fuzz.as_ref().is_some_and(|f| f.listed)), "{:?}", s.fuzz);
         assert!(s.fuzz.as_ref().unwrap().targets.iter().any(|t| t.name == "worker:read-album" && !t.core), "{:?}", s.fuzz);
         assert_eq!(s.composition.as_ref().map(|c| c.workers.len()), Some(1));
-        let _ = std::fs::remove_dir_all(&d);
+        assert!(std::fs::read_to_string(worker_bin).unwrap().contains("atrium_worker::main!(photos::workers::read_album)"));
     }
 
     #[test]
