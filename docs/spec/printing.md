@@ -287,10 +287,11 @@ without looking at it.
 
 - A **Forum status item** (forum-status-items.md) while any job is active: printer,
   progress (page N of M once rendering knows), Cancel.
-- **Praeco notifications** only when the person must act or a job ends badly: out of
-  paper, jam, offline for 2 minutes, "printer changed identity" (§7.3), PIN needed,
-  failed. "Printed" is a quiet notification, shown in history but not as a toast,
-  unless the person turns it on.
+- **Praeco notifications** cover out of paper, jams, sustained offline state,
+  changed printer identity (§7.3), PIN requests, and failed jobs. “Printed”
+  is a quiet success notice, on by default. The **Printed notices** control
+  in Curia → Printers sets the preference for the person across personas.
+  Turning it off leaves job history, progress and problem notices available.
 
 ## 7. Printers
 
@@ -842,8 +843,7 @@ the first share request and approves the retry, and the gate checks that the
 saved printer becomes shared only after approval. The R7 desktop check in §11.6
 covers the real Sigillum sheet and PAM passcode verification.
 
-The “Printed” notice still cannot be turned off, and the status item has no Release
-button for held jobs.
+The status item has no Release button for held jobs.
 
 ### 11.6 R7 in progress
 

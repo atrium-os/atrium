@@ -719,6 +719,24 @@ impl Daemon {
     }
 
     /// The last 30 days' ended jobs, newest first.
+    pub fn printed_notice(&self, uid: u32) -> bool {
+        !self.person(&mut self.lock(), uid).file.mute_printed_notice
+    }
+
+    pub fn set_printed_notice(&self, uid: u32, enabled: bool) -> Result<String, Fail> {
+        let mut st = self.lock();
+        let p = self.person(&mut st, uid);
+        if p.file.mute_printed_notice == enabled {
+            let mut next = p.file.clone();
+            next.mute_printed_notice = !enabled;
+            store::save(&self.cfg.state, uid, &next)
+                .map_err(|e| (status::FAILED, format!("Could not save the Printed notice preference: {e}")))?;
+            p.file = next;
+            self.changed(&mut st);
+        }
+        Ok("saved".into())
+    }
+
     pub fn history(&self, uid: u32) -> Vec<Ended> {
         let mut st = self.lock();
         let h = self.history_of(&mut st, uid);

@@ -46,6 +46,8 @@ pub struct Saved {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct File {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mute_printed_notice: bool,
     #[serde(default)]
     pub printer: Vec<Saved>,
 }
@@ -141,6 +143,7 @@ mod tests {
             ..Default::default()
         };
         let f = File {
+            mute_printed_notice: true,
             printer: vec![Saved {
                 id: 1,
                 name: "Office".into(),

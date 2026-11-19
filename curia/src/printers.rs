@@ -29,12 +29,14 @@ pub enum Want {
     Share(u32, bool),
     Remove(u32),
     ClearHistory,
+    SetPrintedNotice(bool),
 }
 
 #[derive(Clone, Debug)]
 pub enum Got {
     Printers(Result<Vec<Printer>, String>),
     History(Result<Vec<Ended>, String>),
+    PrintedNotice(Result<bool, String>),
     Nearby(Result<Vec<Nearby>, String>),
     /// A change: what to say, or why it failed.
     Done(Result<String, String>),
@@ -45,6 +47,7 @@ pub struct PrintersPage {
     /// None until prelumd answers.
     pub printers: Option<Result<Vec<Printer>, String>>,
     pub history: Option<Result<Vec<Ended>, String>>,
+    pub printed_notice: Option<Result<bool, String>>,
     pub nearby: Option<Result<Vec<Nearby>, String>>,
     pub looking: bool,
     /// A change on its way (nothing else is offered meanwhile).
@@ -139,6 +142,7 @@ impl PrintersPage {
         match g {
             Got::Printers(r) => self.printers = Some(r),
             Got::History(r) => self.history = Some(r),
+            Got::PrintedNotice(r) => self.printed_notice = Some(r),
             Got::Nearby(r) => {
                 self.looking = false;
                 self.nearby = Some(r);
@@ -174,12 +178,13 @@ pub fn work(w: Want, names: Vec<(u32, String)>, tx: Sender<Got>) {
         };
         match w {
             Want::Refresh => {
-                let (p, h) = match connect() {
-                    Ok(mut c) => (c.printers().map_err(|e| e.to_string()), c.history().map_err(|e| e.to_string())),
-                    Err(e) => (Err(e.clone()), Err(e)),
+                let (p, h, n) = match connect() {
+                    Ok(mut c) => (c.printers().map_err(|e| e.to_string()), c.history().map_err(|e| e.to_string()), c.printed_notice().map_err(|e| e.to_string())),
+                    Err(e) => (Err(e.clone()), Err(e.clone()), Err(e)),
                 };
                 let _ = tx.send(Got::Printers(p));
                 let _ = tx.send(Got::History(h));
+                let _ = tx.send(Got::PrintedNotice(n));
             }
             Want::Nearby => {
                 let r = connect().and_then(|mut c| c.nearby(4).map_err(|e| e.to_string()));
@@ -205,6 +210,10 @@ pub fn work(w: Want, names: Vec<(u32, String)>, tx: Sender<Got>) {
                 done(format!("{} {}", name(id), if shared { "is shared by every persona" } else { "is its persona's only" }), r)
             }
             Want::Remove(id) => done(format!("removed {}", name(id)), connect().and_then(|mut c| c.remove(id).map_err(|e| e.to_string()))),
+            Want::SetPrintedNotice(enabled) => done(
+                if enabled { "Printed notices on".into() } else { "Printed notices off".into() },
+                connect().and_then(|mut c| c.set_printed_notice(enabled).map_err(|e| e.to_string())),
+            ),
             Want::ClearHistory => done("history cleared".into(), connect().and_then(|mut c| c.clear_history().map_err(|e| e.to_string()))),
         }
     });
@@ -431,6 +440,12 @@ impl CuriaView {
             let pg = page.clone();
             let lab = if p.confirm_clear { "Clear all history" } else { "Clear history…" };
             button(ctx, em(SLOT), y, lab, if p.confirm_clear { Look::Danger } else { Look::Ghost }, has && !p.busy, move || with_printers(&pg, |a| a.clear_history()));
+            if let Some(Ok(enabled)) = &p.printed_notice {
+                let enabled = *enabled;
+                let pg = page.clone();
+                button(ctx, em(300.0), y, if enabled { "Printed notices: On" } else { "Printed notices: Off" },
+                    Look::Secondary, !p.busy, move || with_printers(&pg, |a| a.change(Want::SetPrintedNotice(!enabled))));
+            }
             y += em(40.0);
             text(ctx, 0.0, y + em(8.0), "Titles, printers and times for 30 days; never what was printed.", type_size::SM, Weight::Regular, t.text_tertiary());
             y += em(24.0);

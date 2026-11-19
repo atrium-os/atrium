@@ -173,7 +173,7 @@ impl Caller {
         match self {
             Caller::Person => true,
             Caller::Curia { .. } => !matches!(o, op::PRINT | op::PRINT_PIN | op::PREVIEW | op::SAVE_PDF),
-            Caller::Status { .. } => matches!(o, op::PRINTERS | op::JOBS | op::WATCH | op::CANCEL | op::RELEASE),
+            Caller::Status { .. } => matches!(o, op::PRINTERS | op::JOBS | op::WATCH | op::CANCEL | op::RELEASE | op::PRINTED_NOTICE),
             Caller::App => false,
         }
     }

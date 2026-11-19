@@ -37,6 +37,7 @@ pub enum Action {
 
 pub struct Notices {
     pub offline_after: u64,
+    pub printed_notice: bool,
     /// Ended jobs already told (or ended before we started).
     told_ended: HashSet<u64>,
     /// The alert notices up now.
@@ -46,7 +47,7 @@ pub struct Notices {
 
 impl Notices {
     pub fn new(offline_after: u64) -> Notices {
-        Notices { offline_after, told_ended: HashSet::new(), up: HashSet::new(), started: false }
+        Notices { offline_after, printed_notice: true, told_ended: HashSet::new(), up: HashSet::new(), started: false }
     }
 
     /// The jobs now, the printers' names, the time (seconds since the
@@ -62,7 +63,7 @@ impl Notices {
                 if self.told_ended.insert(j.id) && !first {
                     let printer = name(j.printer);
                     match j.phase {
-                        Phase::Done => out.push(Action::Post {
+                        Phase::Done if self.printed_notice => out.push(Action::Post {
                             key: Key::Ended(j.id),
                             urgency: LOW,
                             title: format!("Printed \u{201c}{}\u{201d}", j.title),
@@ -211,6 +212,19 @@ mod tests {
         let a = n.update(&[f.clone()], &names(), 2);
         assert!(matches!(&a[..], [Action::Post { key: Key::Ended(3), urgency: NORMAL, body, .. }] if body == "On Office: the printer stopped the job."));
         assert!(n.update(&[f, job(4, Phase::Cancelled, None, 0)], &names(), 3).is_empty(), "a cancel is the person's own doing");
+    }
+
+    #[test]
+    fn muted_completions_are_not_replayed_and_failures_still_post() {
+        let mut n = Notices::new(120);
+        n.update(&[], &names(), 0);
+        n.printed_notice = false;
+        let done = job(1, Phase::Done, None, 0);
+        let failed = job(2, Phase::Failed, None, 0);
+        let a = n.update(&[done.clone(), failed], &names(), 1);
+        assert!(matches!(&a[..], [Action::Post { key: Key::Ended(2), urgency: NORMAL, .. }]));
+        n.printed_notice = true;
+        assert!(n.update(&[done], &names(), 2).is_empty());
     }
 
     #[test]

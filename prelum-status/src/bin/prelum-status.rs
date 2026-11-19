@@ -19,7 +19,7 @@ use prelum_proto::print::{client::Client, Job};
 use prelum_status::{panel, Action, Key, Notices, ICON};
 
 enum Ev {
-    Jobs(Vec<Job>),
+    Jobs(Vec<Job>, bool),
     /// prelumd is away (why).
     Lost(String),
     /// A Cancel pressed in the panel.
@@ -46,7 +46,7 @@ fn follow(tx: Sender<Ev>) {
                     match c.watch(generation) {
                         Ok(w) => {
                             generation = w.generation;
-                            if tx.send(Ev::Jobs(w.jobs)).is_err() {
+                            if tx.send(Ev::Jobs(w.jobs, c.printed_notice().unwrap_or(false))).is_err() {
                                 return;
                             }
                         }
@@ -129,7 +129,8 @@ fn main() {
     loop {
         let wait = notices.next_due(&jobs, now()).map(|s| Duration::from_secs(s.max(1))).unwrap_or(Duration::from_secs(60));
         match rx.recv_timeout(wait) {
-            Ok(Ev::Jobs(j)) => {
+            Ok(Ev::Jobs(j, printed_notice)) => {
+                notices.printed_notice = printed_notice;
                 // A printer not named yet: ask for the names again.
                 if j.iter().any(|j| !names.contains_key(&j.printer)) {
                     if let Ok(ps) = Client::connect(&print_sock()).map_err(|e| e.to_string()).and_then(|mut c| c.printers().map_err(|e| e.to_string())) {

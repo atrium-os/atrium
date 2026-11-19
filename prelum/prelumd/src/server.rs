@@ -106,6 +106,8 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
             op::SHARE => reply(arg::<print::Share>(p).and_then(|s| d.share(uid, &s))),
             op::HISTORY => reply::<Vec<print::Ended>>(Ok(d.history(uid))),
             op::CLEAR_HISTORY => reply(d.clear_history(uid)),
+            op::PRINTED_NOTICE => reply(Ok(d.printed_notice(uid))),
+            op::SET_PRINTED_NOTICE => reply(arg::<bool>(p).and_then(|enabled| d.set_printed_notice(uid, enabled))),
             op::WATCH => reply(arg::<u64>(p).map(|after| d.watch(uid, after))),
             op::PRINT => {
                 let fd = conn.take_fds(1).and_then(|mut v| v.pop());

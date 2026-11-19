@@ -54,6 +54,8 @@ pub mod op {
     pub const SHARE: u16 = 0x08;
     pub const HISTORY: u16 = 0x09;
     pub const CLEAR_HISTORY: u16 = 0x0A;
+    pub const PRINTED_NOTICE: u16 = 0x0B;
+    pub const SET_PRINTED_NOTICE: u16 = 0x0C;
     pub const PRINT: u16 = 0x10;
     pub const JOBS: u16 = 0x11;
     pub const CANCEL: u16 = 0x12;
@@ -464,6 +466,12 @@ pub mod client {
         }
         pub fn clear_history(&mut self) -> Res<String> {
             self.call(op::CLEAR_HISTORY, &[], None)
+        }
+        pub fn printed_notice(&mut self) -> Res<bool> {
+            self.call(op::PRINTED_NOTICE, &[], None)
+        }
+        pub fn set_printed_notice(&mut self, enabled: bool) -> Res<String> {
+            self.call(op::SET_PRINTED_NOTICE, &Self::enc(&enabled), None)
         }
         /// The jobs once they differ from generation `after`, or after 25 s.
         pub fn watch(&mut self, after: u64) -> Res<Watched> {
