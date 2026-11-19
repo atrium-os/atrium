@@ -727,7 +727,7 @@ fn unsubscribe_block_and_the_screener() {
     use atrium_mail::view::Lane;
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 1, "the stranger waits");
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0), (Lane::NewSenders, 1)]);
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 1), (Lane::Files, 0), (Lane::NewSenders, 1)]);
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "Newsletters") && t.iter().any(|x| x == "New senders"), "{t:?}");
 
@@ -772,7 +772,8 @@ fn unsubscribe_block_and_the_screener() {
     mail.screen(0, true);
     let ui = mail.ui.get_cloned();
     assert_eq!(ui.count, 0);
-    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0), (Lane::NewSenders, 0)]);
+    // The stranger accepted is unread in the inbox: counted under People.
+    assert_eq!(ui.views, [(Lane::Later, 0), (Lane::People, 1), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0), (Lane::NewSenders, 0)]);
     mail.end_search();
     assert_eq!(mail.ui.get_cloned().count, 2);
 }

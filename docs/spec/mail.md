@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host; company domains, import progress and given-up uploads, and the changed filters shown built on the host; ManageSieve passed against Pigeonhole on the host and on the FreeBSD VM; key hints hidden with single keys off, the company's own link scanner and the Files view's counts built on the host; OpenPGP keys listed with Forget, and expired and revoked keys never encrypted to, built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host; company domains, import progress and given-up uploads, and the changed filters shown built on the host; ManageSieve passed against Pigeonhole on the host and on the FreeBSD VM; key hints hidden with single keys off, the company's own link scanner and the Files view's counts built on the host; OpenPGP keys listed with Forget, and expired and revoked keys never encrypted to, built on the host; unread counts per lane, S/MIME CAs you add and the certificates list built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1232,9 +1232,9 @@ Stalwart in the cloud VM, and later a real account):
    mail-smime 5, jail 4 more (signed, claims, encrypted), engine 3, window 2, compose 2,
    sigillumd 1. **Not yet**: unwrapping with the token (Sigillum needs a decrypt op and the
    PKCS#11 host's allow-list a decrypt mechanism) or with an Arca-held key (`arca_decrypt`,
-   `arca_sign`), so the reader says it can't decrypt yet; the person's added CAs; opaque
+   `arca_sign`), so the reader says it can't decrypt yet; the person's added CAs (built 2026-11-19, below); opaque
    signed-data (`smime-type=signed-data`) and AuthEnvelopedData (AES-GCM); revocation
-   (OCSP/CRL); a certificates page (seen certificates, forgetting one); Bcc recipients
+   (OCSP/CRL); a certificates page (seen certificates, forgetting one; built 2026-11-19, below); Bcc recipients
    show in the envelope's recipient list (as in other clients).
    **JMAP built on the host (2026-11-18)**: `mail-proto::jmap` (session resource,
    request builders, bounded readers of every answer, RFC 3339 dates) and
@@ -1334,7 +1334,7 @@ Stalwart in the cloud VM, and later a real account):
    mail and signing with OpenPGP (the private key belongs in Arca, which has no OpenPGP
    ops; the reader says so), inline PGP, Autocrypt's prefer-encrypt and gossip, key
    expiry and revocation and a keys page (built 2026-11-19, below); cards need DKIM lookups to show;
-   lane counts and notifications per lane. *Big-file links* need a share-link service
+   lane counts (built 2026-11-19, below) and notifications per lane. *Big-file links* need a share-link service
    (Loculus or Crypta) and *local assistance* a local model service, neither of which
    exists yet.
    **DKIM and DMARC lookups built on the host (2026-11-18)** (Shankar: "DNS lookups through
@@ -1990,6 +1990,24 @@ Stalwart in the cloud VM, and later a real account):
    revoked; expiry, revocation, never encrypted to), engine pgp (pasting refused, a
    learned revoked key not encrypted to, the list's lines, Forget), settings (the list,
    Forget).
+
+   **Lane counts, CAs you add, and the certificates Mail has (2026-11-19, §§15.2,
+   10.1).** People, Updates and Newsletters show how many unread messages each has in
+   the inbox, across every account. They are counted when the views are drawn, and only
+   unread rows are classified, so a big inbox that has been read costs one listing.
+   Settings has an S/MIME section. *Paste a CA* takes a PEM certificate authority (your
+   company's, say). A certificate that isn't a CA, has expired or is already there is
+   refused, and at most 20 are kept, in Mail's settings. Signatures are then checked
+   against the system's roots and these, and a message whose issuer wasn't trusted is
+   checked again when it is next opened. The same section lists every address with a
+   certificate seen on its signed mail (name, issuer, until when, expired in the warning
+   colour). Each CA and each certificate has *Forget*. Autocrypt's prefer-encrypt was
+   left out: Mail can't read encrypted replies yet (Arca has no OpenPGP ops), so asking
+   for them would only hurt. Tests: engine smime 1 (with no system roots a signature
+   isn't trusted; a leaf refused as a CA; the fixture CA added, then the same signature
+   valid; the seen certificate's line, Forget; the CA forgotten, untrusted again),
+   settings (the CA pasted, listed, forgotten), window (counts under Newsletters and
+   People).
 
 ## 17. Decisions, with recommendations
 

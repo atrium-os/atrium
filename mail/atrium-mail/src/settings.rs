@@ -89,6 +89,12 @@ pub struct SettingsUi {
     /// its line; and how many there are.
     pub keys: Vec<(String, String)>,
     pub keys_count: usize,
+    /// S/MIME (§10.1): the CAs the person added (name, line, SHA-256), and
+    /// the certificates seen (address, line), at most [`KEYS_SHOWN`], and
+    /// how many.
+    pub cas: Vec<(String, String, [u8; 32])>,
+    pub certs: Vec<(String, String)>,
+    pub certs_count: usize,
     pub adding: Adding,
     /// The account whose Remove was pressed once.
     pub removing: Option<AccountId>,
@@ -302,6 +308,11 @@ impl Settings {
         known.sort_by(|a, b| b.given.cmp(&a.given).then(b.last_seen.cmp(&a.last_seen)).then(a.addr.cmp(&b.addr)));
         let keys_count = known.len();
         let keys: Vec<(String, String)> = known.iter().take(KEYS_SHOWN).map(|k| (k.addr.clone(), k.line(now))).collect();
+        let cas: Vec<(String, String, [u8; 32])> = e.added_cas().into_iter().map(|c| (c.name, format!("Added by you · until {}", mail_engine::clock::day_iso(c.not_after)), c.sha256)).collect();
+        let mut seen = e.known_certs();
+        seen.sort_by(|a, b| a.addr.cmp(&b.addr));
+        let certs_count = seen.len();
+        let certs: Vec<(String, String)> = seen.iter().take(KEYS_SHOWN).map(|c| (c.addr.clone(), c.line(now))).collect();
         if pa != u.priv_account {
             self.domain.set(TextEdit::new(pd.as_deref().unwrap_or("")));
         }
@@ -314,7 +325,7 @@ impl Settings {
                 u.people_query = q;
             });
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.rules_lines != rules_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key || u.keys != keys || u.keys_count != keys_count {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.rules_lines != rules_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key || u.keys != keys || u.keys_count != keys_count || u.cas != cas || u.certs != certs || u.certs_count != certs_count {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
@@ -328,6 +339,9 @@ impl Settings {
                 u.my_key = my_key;
                 u.keys = keys;
                 u.keys_count = keys_count;
+                u.cas = cas;
+                u.certs = certs;
+                u.certs_count = certs_count;
             });
         }
     }
@@ -751,7 +765,6 @@ impl Settings {
         self.reload();
     }
 
-    /// "Paste a key": from the clipboard.
     /// Forget the keys Mail has for `addr`.
     pub fn forget_key(&self, addr: &str) {
         let note = match self.engine.forget_pgp_keys(addr) {
@@ -762,6 +775,45 @@ impl Settings {
         self.reload();
     }
 
+    /// A CA certificate, pasted (PEM): trusted for signatures too.
+    pub fn give_ca(&self, text: &str, now: i64) {
+        let r = self.engine.add_ca(text, now);
+        self.update(|u| {
+            u.note = Some(match r {
+                Ok(n) if n.is_empty() => "Mail trusts that one already.".to_string(),
+                Ok(n) => format!("Signatures from certificates {} issued now check as trusted.", n.join(", ")),
+                Err(e) => format!("Couldn't use it: {e}"),
+            })
+        });
+        self.reload();
+    }
+
+    /// "Paste a CA": from the clipboard.
+    pub fn paste_ca(&self, now: i64) {
+        match pergola::clipboard::paste_text() {
+            Ok(Some(t)) => self.give_ca(&t, now),
+            Ok(None) => self.update(|u| u.note = Some("The clipboard has no text: copy the certificate (it starts with -----BEGIN CERTIFICATE-----) first.".into())),
+            Err(_) => self.update(|u| u.note = Some("Couldn't read the clipboard.".into())),
+        }
+    }
+
+    pub fn forget_ca(&self, sha256: [u8; 32]) {
+        if let Err(e) = self.engine.forget_ca(&sha256) {
+            self.update(|u| u.note = Some(format!("Couldn't: {e:?}")));
+        }
+        self.reload();
+    }
+
+    pub fn forget_cert(&self, addr: &str) {
+        let note = match self.engine.forget_certs(addr) {
+            Ok(()) => format!("Forgot the certificate for {addr}; a new one comes with their next signed mail"),
+            Err(e) => format!("Couldn't: {e:?}"),
+        };
+        self.update(|u| u.note = Some(note));
+        self.reload();
+    }
+
+    /// "Paste a key": from the clipboard.
     pub fn paste_key(&self, now: i64) {
         match pergola::clipboard::paste_text() {
             Ok(Some(t)) => self.give_key(&t, now),
@@ -1163,6 +1215,35 @@ impl SettingsView {
                     text(ctx, x, y + em(10.0), &format!("and {} more", ui.keys_count - ui.keys.len()), type_size::XS, Weight::Regular, t.text_tertiary());
                     y += em(24.0);
                 }
+            }
+        }
+
+        // S/MIME (§10.1): CAs the person trusts besides the system's, and
+        // the certificates seen on signed mail.
+        if ui.priv_account.is_some() {
+            y += em(16.0);
+            section(ctx, x, &mut y, "S/MIME");
+            let bw = measure("Paste a CA", type_size::SM, Weight::Medium) + em(24.0);
+            y += para(ctx, x, y, inner - bw - em(8.0), "Signatures are checked against this system's certificate authorities. Add your company's here.", type_size::XS, t.text_tertiary());
+            let s = self.s.clone();
+            button(ctx, right - bw, y - em(6.0), "Paste a CA", false, true, move || s.paste_ca(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)));
+            y += em(14.0);
+            let fw = measure("Forget", type_size::SM, Weight::Medium) + em(24.0);
+            let rows = ui.cas.iter().map(|(n, l, h)| (n.clone(), l.clone(), Some(*h), None)).chain(ui.certs.iter().map(|(a, l)| (a.clone(), l.clone(), None, Some(a.clone()))));
+            for (head, line, ca, addr) in rows {
+                text(ctx, x, y + em(12.0), &crate::view::fit_text(&head, type_size::SM, Weight::Regular, inner - fw - em(8.0)), type_size::SM, Weight::Regular, t.text_primary());
+                text(ctx, x, y + em(30.0), &crate::view::fit_text(&line, type_size::XS, Weight::Regular, inner - fw - em(8.0)), type_size::XS, Weight::Regular, if line.contains("expired") { t.warning_fg() } else { t.text_secondary() });
+                let s = self.s.clone();
+                button(ctx, right - fw, y + em(20.0), "Forget", false, true, move || match (&ca, &addr) {
+                    (Some(h), _) => s.forget_ca(*h),
+                    (_, Some(a)) => s.forget_cert(a),
+                    _ => {}
+                });
+                y += em(42.0);
+            }
+            if ui.certs_count > ui.certs.len() {
+                text(ctx, x, y + em(10.0), &format!("and {} more", ui.certs_count - ui.certs.len()), type_size::XS, Weight::Regular, t.text_tertiary());
+                y += em(24.0);
             }
         }
 

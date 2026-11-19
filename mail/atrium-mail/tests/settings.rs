@@ -183,6 +183,24 @@ fn settings_window() {
     assert!(s.ui.get_cloned().keys[0].1.contains("Pasted by you · expires 20"), "{:?}", s.ui.get_cloned().keys);
     s.forget_key("later@example.com");
     assert!(s.ui.get_cloned().keys.is_empty() && engine.known_pgp_keys().is_empty());
+    // S/MIME (§10.1): a CA pasted is listed and can be forgotten.
+    drawn(&mut app, &["S/MIME", "Paste a CA"]);
+    let ca = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../mail-smime/tests/data/ca.der")).unwrap();
+    let b64 = {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut o = String::new();
+        for c in ca.chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for k in 0..4 { o.push(if k <= c.len() { T[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' }); }
+        }
+        o
+    };
+    s.give_ca(&format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n"), 0);
+    let cas = s.ui.get_cloned().cas;
+    assert_eq!(cas.len(), 1, "{:?}", s.ui.get_cloned().note);
+    drawn(&mut app, &[cas[0].0.as_str()]);
+    s.forget_ca(cas[0].2);
+    assert!(s.ui.get_cloned().cas.is_empty() && engine.added_cas().is_empty());
     // Away (§11.6): the form, kept for the next sync; a bad day says so.
     drawn(&mut app, &["AWAY", "Reply automatically", "First day", "Last day", "Reply", "ada@me.example: not read yet"]);
     s.toggle_away();

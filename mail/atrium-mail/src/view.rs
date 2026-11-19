@@ -1651,7 +1651,17 @@ impl Mail {
             out.push((Lane::Dropped, dropped));
         }
         if !accounts.is_empty() {
-            out.extend([(Lane::People, 0), (Lane::Updates, 0), (Lane::Newsletters, 0), (Lane::Files, 0)]);
+            // Unread inbox mail by lane, every account.
+            let mut c = [0; 3];
+            for a in accounts {
+                if let Ok(n) = e.lane_unread(*a) {
+                    for i in 0..3 {
+                        c[i] += n[i];
+                    }
+                }
+            }
+            let [p, u, n] = c;
+            out.extend([(Lane::People, p), (Lane::Updates, u), (Lane::Newsletters, n), (Lane::Files, 0)]);
         }
         let (mut new, mut refused, mut on) = (0, 0, false);
         for a in accounts {

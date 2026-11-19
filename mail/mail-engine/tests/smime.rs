@@ -26,6 +26,45 @@ fn fetched(uid: u32, bytes: Vec<u8>, full: bool) -> Fetched {
     Fetched { uid, flags: vec![], size: bytes.len() as u64, internal_date: None, server_id: None, bytes, full }
 }
 
+/// A CA the person adds (§10.1): signatures under it check, with no system
+/// roots; refused when not a CA; forgotten again. Certificates seen are
+/// listed and forgotten.
+#[test]
+fn added_cas_and_seen_certificates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    engine.set_roots(vec![]);
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true }]).unwrap();
+    sink.messages("INBOX", vec![fetched(1, data("signed.eml"), true)]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let id = engine.store.at(inbox, 1).unwrap().unwrap().0;
+    assert_ne!(engine.open(id).unwrap().summary.smime.unwrap().state, SmimeState::Valid, "no root yet");
+    let pem = |d: &[u8]| format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", base64(d));
+    assert!(engine.add_ca(&pem(&data("leaf.der")), 0).unwrap_err().to_string().contains("isn't a certificate authority"));
+    assert!(engine.add_ca("hello", 0).is_err());
+    let names = engine.add_ca(&format!("pasted:\n{}", pem(&data("ca.der"))), 0).unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(engine.add_ca(&pem(&data("ca.der")), 0).unwrap(), Vec::<String>::new(), "already there");
+    let added = engine.added_cas();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].name, names[0]);
+    assert_eq!(engine.open(id).unwrap().summary.smime.unwrap().state, SmimeState::Valid, "checked against the added CA");
+    // The certificate it carried is kept, listed, and can be forgotten.
+    let mut sink = engine.sink(account);
+    sink.messages("INBOX", vec![fetched(2, data("signed.eml"), true)]).unwrap();
+    let known = engine.known_certs();
+    let g = known.iter().find(|k| k.addr == "grace@example.net").expect("listed");
+    assert!(g.line(0).starts_with("Grace Hopper · from ") && g.line(0).contains(" · until "), "{}", g.line(0));
+    assert!(g.line(i64::MAX / 2).contains(" · expired "));
+    engine.forget_certs("grace@example.net").unwrap();
+    assert!(engine.cert_for("grace@example.net").is_none() && engine.known_certs().is_empty());
+    engine.forget_ca(&added[0].sha256).unwrap();
+    assert!(engine.added_cas().is_empty());
+    assert_ne!(engine.open(id).unwrap().summary.smime.unwrap().state, SmimeState::Valid, "untrusted again");
+}
+
 #[test]
 fn signed_mail_is_checked_and_its_certificate_kept() {
     let dir = tempfile::tempdir().unwrap();

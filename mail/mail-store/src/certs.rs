@@ -25,6 +25,17 @@ pub struct SeenCert {
 }
 
 impl Store {
+    /// Every address with certificates, each's newest first.
+    pub fn all_certs(&self) -> Result<Vec<(String, Vec<SeenCert>)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for e in tx.open_table(CERTS)?.iter()? {
+            let (k, v) = e?;
+            out.push((k.value().to_string(), dec(v.value())?));
+        }
+        Ok(out)
+    }
+
     /// The certificates seen for `addr`, newest first.
     pub fn certs(&self, addr: &str) -> Result<Vec<SeenCert>> {
         let tx = self.db.begin_read()?;

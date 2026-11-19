@@ -355,7 +355,7 @@ impl Engine {
                 return Ok(Reading::bare(m.summary, Some(String::new())));
             };
             let raw = self.store.blob(&full)?;
-            return match self.parser.open_with(&raw, Vec::new(), &self.roots, Some(key), self.pgp_keys_of(&m.summary), &|n| self.answer(n))? {
+            return match self.parser.open_with(&raw, Vec::new(), &self.all_roots(), Some(key), self.pgp_keys_of(&m.summary), &|n| self.answer(n))? {
                 Some(o) => {
                     let text = o.summary.text.clone().or_else(|| o.document.as_ref().map(|_| String::new()));
                     let card = verified_card(&o.summary, o.card);
@@ -369,7 +369,10 @@ impl Engine {
         // one now: parse again.
         // A sender check that waited for a key: check again now lookups can run.
         let recheck = m.summary.sender_check == wire::SenderCheck::Pending && self.dns.is_some();
-        let stale = |sh: &Shown| recheck || matches!(&sh.pgp, Some(p) if p.state == wire::PgpState::NoKey) && !pgp_keys.is_empty();
+        // A signature from an issuer not trusted, once the person has added
+        // CAs: checked again (against them too).
+        let untrusted = matches!(&m.summary.smime, Some(sm) if matches!(sm.state, wire::SmimeState::NotTrusted(_))) && !self.added_ca_ders().is_empty();
+        let stale = |sh: &Shown| recheck || untrusted || matches!(&sh.pgp, Some(p) if p.state == wire::PgpState::NoKey) && !pgp_keys.is_empty();
         if let Some(sh) = m.document.and_then(|h| self.store.blob(&h).ok()).and_then(|b| postcard::from_bytes::<Shown>(&b).ok()).filter(|sh| !stale(sh)) {
             let has_html = sh.document.is_some();
             let text = m.summary.text.clone().or(Some(String::new()));
@@ -384,7 +387,7 @@ impl Engine {
             .take(wire::LOADED_MAX)
             .filter_map(|(id, h)| self.store.blob(h).ok().map(|b| (id.clone(), b[..b.len().min(wire::LOADED_HEAD)].to_vec())))
             .collect();
-        match self.parser.open_with(&raw, loaded, &self.roots, None, pgp_keys, &|n| self.answer(n))? {
+        match self.parser.open_with(&raw, loaded, &self.all_roots(), None, pgp_keys, &|n| self.answer(n))? {
             Some(o) => {
                 let sh = Shown { document: o.document, attachments: o.attachments, card: o.card, pgp: o.pgp, pgp_encrypted: o.pgp_encrypted };
                 let h = self.store.put_blob(&postcard::to_stdvec(&sh).map_err(|e| Error::Jail(e.to_string()))?)?;
@@ -500,7 +503,7 @@ impl Sink for AccountSink<'_> {
             let chunk = &page[i..end];
             let full = chunk[0].full;
             let input: Vec<(u64, &[u8])> = chunk.iter().enumerate().map(|(k, f)| (k as u64, f.bytes.as_slice())).collect();
-            let (sums, found) = self.e.parser.summarize_with(&input, !full, &self.e.roots, &|n| self.e.answer(n)).map_err(|e| e.to_string())?;
+            let (sums, found) = self.e.parser.summarize_with(&input, !full, &self.e.all_roots(), &|n| self.e.answer(n)).map_err(|e| e.to_string())?;
             for (k, addr, key) in found {
                 let when = sums[k].as_ref().and_then(|s| s.date).or(chunk[k].internal_date).unwrap_or_else(now).min(now());
                 keys.push((addr, key, when, chunk[k].uid));

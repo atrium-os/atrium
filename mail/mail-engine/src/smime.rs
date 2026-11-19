@@ -68,7 +68,135 @@ pub fn system_roots() -> Vec<Vec<u8>> {
     std::fs::read_to_string(SYSTEM_ROOTS).map(|p| pem_certs(&p)).unwrap_or_default()
 }
 
+/// Where the CAs the person added are kept (PEM, settings of account 0).
+const ADDED_CAS: &str = "added_cas";
+/// At most this many added CAs.
+pub const ADDED_CAS_MAX: usize = 20;
+
+/// A CA the person added (§10.1), as Settings shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedCa {
+    pub name: String,
+    pub not_after: i64,
+    pub sha256: [u8; 32],
+}
+
+/// A certificate Mail has seen on a valid signature, as Settings shows it:
+/// the newest for its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownCert {
+    pub addr: String,
+    pub name: String,
+    pub issuer: String,
+    pub not_after: i64,
+}
+
+impl KnownCert {
+    /// "Grace Hopper · from Example CA · until 2027-01-31" (or "expired").
+    pub fn line(&self, now: i64) -> String {
+        let until = if self.not_after <= now { format!("expired {}", crate::clock::day_iso(self.not_after)) } else { format!("until {}", crate::clock::day_iso(self.not_after)) };
+        format!("{} · from {} · {until}", self.name, self.issuer)
+    }
+}
+
+fn pem_of(der: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::from("-----BEGIN CERTIFICATE-----\n");
+    for (i, c) in der.chunks(3).enumerate() {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for k in 0..4 {
+            s.push(if k <= c.len() { T[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+        }
+        if i % 16 == 15 {
+            s.push('\n');
+        }
+    }
+    s.push_str("\n-----END CERTIFICATE-----\n");
+    s
+}
+
 impl Engine {
+    /// The CAs the person added (DER).
+    pub(crate) fn added_ca_ders(&self) -> Vec<Vec<u8>> {
+        self.store.sync_state(0, ADDED_CAS).ok().flatten().map(|p| pem_certs(&p)).unwrap_or_default()
+    }
+
+    /// The roots signatures are checked against: the system's (or those
+    /// set) and the CAs the person added.
+    pub(crate) fn all_roots(&self) -> Vec<Vec<u8>> {
+        let mut r = self.roots.clone();
+        for d in self.added_ca_ders() {
+            if !r.contains(&d) && r.len() < wire::ROOTS_MAX {
+                r.push(d);
+            }
+        }
+        r
+    }
+
+    /// The CAs the person added, for Settings.
+    pub fn added_cas(&self) -> Vec<AddedCa> {
+        self.added_ca_ders().iter().filter_map(|d| {
+            let c = mail_smime::cert::parse(d).ok()?;
+            let i = mail_smime::cert::info(&c);
+            Some(AddedCa { name: if i.name.is_empty() { i.issuer } else { i.name }, not_after: i.not_after, sha256: i.sha256 })
+        }).collect()
+    }
+
+    /// Trust the CA certificates in `pem` (pasted by the person) for
+    /// signatures too; their names. A certificate that isn't a CA, has
+    /// expired, or is already here is refused.
+    pub fn add_ca(&self, pem: &str, now: i64) -> Result<Vec<String>, Error> {
+        let ders = pem_certs(pem);
+        if ders.is_empty() {
+            return Err(Error::Refused("no certificate in it (it starts with -----BEGIN CERTIFICATE-----)"));
+        }
+        let mut have = self.added_ca_ders();
+        let mut names = Vec::new();
+        for d in ders {
+            let c = mail_smime::cert::parse(&d).map_err(|_| Error::Refused("that isn't a certificate"))?;
+            if !mail_smime::cert::is_ca(&c) {
+                return Err(Error::Refused("that certificate isn't a certificate authority's"));
+            }
+            let i = mail_smime::cert::info(&c);
+            if i.not_after <= now {
+                return Err(Error::Refused("that certificate authority's certificate has expired"));
+            }
+            if !have.contains(&d) {
+                if have.len() >= ADDED_CAS_MAX {
+                    return Err(Error::Refused("Mail keeps at most 20 added certificate authorities"));
+                }
+                have.push(d);
+                names.push(if i.name.is_empty() { i.issuer } else { i.name });
+            }
+        }
+        let pem: String = have.iter().map(|d| pem_of(d)).collect();
+        self.store.write(|w| w.set_sync_state(0, ADDED_CAS, Some(&pem)))?;
+        Ok(names)
+    }
+
+    /// Stop trusting the added CA with this SHA-256.
+    pub fn forget_ca(&self, sha256: &[u8; 32]) -> Result<(), Error> {
+        let have: Vec<Vec<u8>> = self.added_ca_ders().into_iter().filter(|d| &mail_smime::cert::sha256(d) != sha256).collect();
+        let pem: String = have.iter().map(|d| pem_of(d)).collect();
+        self.store.write(|w| w.set_sync_state(0, ADDED_CAS, (!pem.is_empty()).then_some(pem.as_str())))?;
+        Ok(())
+    }
+
+    /// Every address with a certificate seen on its signed mail.
+    pub fn known_certs(&self) -> Vec<KnownCert> {
+        self.store.all_certs().unwrap_or_default().into_iter().filter_map(|(addr, certs)| {
+            let c = certs.into_iter().next()?;
+            Some(KnownCert { addr, name: c.name, issuer: c.issuer, not_after: c.not_after })
+        }).collect()
+    }
+
+    /// Forget the certificates seen for `addr` (encryption to them waits
+    /// for their next signed mail).
+    pub fn forget_certs(&self, addr: &str) -> Result<(), Error> {
+        self.store.write(|w| w.forget_certs(addr))?;
+        Ok(())
+    }
+
     /// The roots signatures are checked against: the system's, and any the
     /// person added (DER).
     pub fn set_roots(&mut self, roots: Vec<Vec<u8>>) {

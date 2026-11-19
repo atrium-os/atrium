@@ -193,6 +193,35 @@ impl Engine {
         Ok(classify(&m.summary, &self.lane_rules(), wrote, prefs.is_vip(&from)))
     }
 
+    /// Unread mail in `account`'s inbox by lane (People, Updates,
+    /// Newsletters), for the counts beside the views (§15.2). Only unread
+    /// rows are classified, so a big read inbox costs one listing.
+    pub fn lane_unread(&self, account: AccountId) -> Result<[usize; 3], Error> {
+        let mut n = [0; 3];
+        let Some(inbox) = self.store.folders(account)?.into_iter().find(|(_, f)| f.role == Role::Inbox && !f.hidden).map(|(id, _)| id) else { return Ok(n) };
+        let rules = self.lane_rules();
+        let prefs = self.prefs();
+        let mut at = 0;
+        while at < SCAN_MAX {
+            let page = self.store.list(inbox, at, 500)?;
+            if page.is_empty() {
+                break;
+            }
+            at += page.len();
+            for r in page.into_iter().filter(|r| r.flags & mail_store::flag::SEEN == 0) {
+                let Ok(m) = self.store.message(r.msg) else { continue };
+                let from = m.summary.from.first().map(|a| a.addr.clone()).unwrap_or_default();
+                let wrote = self.store.contact(account, &from)? & contact::WROTE != 0;
+                n[match classify(&m.summary, &rules, wrote, prefs.is_vip(&from)).0 {
+                    LaneKind::People => 0,
+                    LaneKind::Updates => 1,
+                    LaneKind::Newsletters => 2,
+                }] += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// A lane of `account`'s inbox, newest first, at most `limit`.
     /// Newsletters also has list mail filed in other folders.
     pub fn lane(&self, account: AccountId, kind: LaneKind, limit: usize) -> Result<Vec<MsgId>, Error> {
