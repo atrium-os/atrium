@@ -3780,7 +3780,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Grid** (pergola `past_hidden`): arrow keys step over hidden rows and columns (filtered ones too) to the next shown one, or stay put if none. Since 2026-11-19 Home, Ctrl+Home, Page Up and Page Down do too, landing on the nearest shown row or column. The row and column labels draw a double line where hidden ones sit, as Excel does.
 - **Files:** .xlsx columns with no width are written `hidden="1"` and read back hidden (they used to show 2 px wide, with a note); .ods columns get `table:visibility="collapse"` and are read back hidden. Hidden rows were kept already. LibreOffice keeps both ways (`officina-convert/tests/hidden.rs`).
 - **Double-click on the double line** (2026-11-19): just right of where columns are hidden, a double-click on the label edge shows the hidden run again, as Unhide Columns would (`data::unhide_cols_at`, from `GridAction::FitCol` on a hidden column); just left of it still fits the shown column.
-- **Not yet:** remembering a hidden column's width across saving and reopening (the file holds no width for it), and the same double-click for hidden rows.
+- **Not yet:** remembering a hidden column's width across saving and reopening (the file holds no width for it). Hidden rows get the same double-click (§16.93).
 - **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
 
 ### 16.90 Row heights by dragging, and sizes undone in one step (2026-11-19)
@@ -3790,7 +3790,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Fit a column** (2026-11-19): a double-click on a column label's right edge sends `GridAction::FitCol`; Sheets sets the column to its widest shown entry (`SheetSource::fit_width`: shown rows, cells not merged across columns, at most 200,000 cells read; pergola `needed_width` measures a cell view's widest line with its indent, icon and padding), as one undo step. An empty column is left alone.
 - **Several at once** (2026-11-19): with whole columns (or rows) selected, dragging or double-clicking the edge of one of them sizes all of them (each fitted to its own entries on a double-click), as one undo step; up to 16,384 at once (`app::sized_span`).
 - **Exact sizes** (2026-11-19; Data menu): Row Height… and Column Width… open a bar holding the cursor's row height or column width in pixels; a number from 0 (hides) to 545 for rows or 1790 for columns sets every selected row or column (up to 16,384) as one undo step, and anything else leaves the bar open with a note. Sizes are in pixels, not Excel's points and characters.
-- **Not yet:** fitting rows to wrapped text, and the exact-size bar in Excel's units.
+- **Not yet:** the exact-size bar in Excel's units. Fitting rows: §16.93.
 - **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`, `an_edge_of_selected_whole_columns_sizes_them_all`, `the_size_bar_sets_exact_heights_and_widths`.
 
 ### 16.91 The grid scrolls on while a selection is dragged past its edge (2026-11-19)
@@ -3803,6 +3803,17 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 
 - **Grid** (pergola): while a cell is being edited, a press inside the editor (the cell, or as wide as its text runs) places the caret at the nearest character instead of committing; dragging selects text, Shift+press extends, and a double-click selects the word. A press anywhere else still commits and moves, as before. `editor_rect`, `index_at` (a binary search over measured prefixes).
 - **Gate:** pergola `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (press, drag, double-click word, Shift+press).
+
+### 16.93 Wrapped text and rows fitted to it (2026-11-19)
+
+- **Before:** a style's wrap flag was read and written with files but the grid ignored it, and text with line breaks showed on one line.
+- **Grid** (pergola): `CellView.wrap` breaks text onto lines to the cell's width, at spaces, or between letters for a word wider than the cell (`text_lines` over `text::lines_with`, at most 200 lines). Text with line breaks shows its lines whether it wraps or not. The lines are centred down the cell when they fit; otherwise as many as fit whole are shown from the top, at least one. Wrapped text never runs over its neighbours.
+- **Fit a row:** a double-click on a row label's bottom edge sends `GridAction::FitRow`. Sheets sets the row to its tallest cell's lines, at least the default height (`SheetSource::fit_height`; `needed_height` measures a cell view's lines in a column's width; hidden columns and cells merged across rows don't count, at most 200,000 cells). With whole rows selected, each is fitted, as one undo step.
+- **Hidden rows:** just below the double line of hidden rows, the double-click shows them again, as Unhide Rows would (`data::unhide_rows_at`), as for columns (§16.89).
+- **Sheets:** Data ▸ Wrap Text turns wrapping on or off for the selection (ticked when its first cell wraps), one undo step.
+- **Line breaks:** Alt+Enter in the cell editor puts a line break at the caret and keeps editing, as in Excel (`TextEdit::insert_break`).
+- **Not yet:** rows growing on their own when wrapped text is typed (Excel fits rows nobody sized), vertical alignment (Excel puts text at the bottom by default; ours is centred), wrapped text in printing (the printing thread's part), and the editor growing to show several lines while one is typed.
+- **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

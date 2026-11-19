@@ -98,6 +98,9 @@ pub enum DataCmd {
     /// The selection's text centred across its columns without merging
     /// them (again: back to General).
     CenterAcross,
+    /// Text in the selection broken onto lines to its column's width, or
+    /// not.
+    WrapText,
     /// The merged areas the selection meets, back to separate cells.
     Unmerge,
     /// Write or change the cursor's cell comment; the window runs it (a bar
@@ -318,6 +321,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
             (MenuItem::new("Merge Cells").enabled(nr > 1 || nc > 1).separated(), Some(DataCmd::Merge))
         },
         (MenuItem::new("Center Across Selection").checked(across_at(wb, s, sel)).enabled(nc > 1 || across_at(wb, s, sel)), Some(DataCmd::CenterAcross)),
+        (MenuItem::new("Wrap Text").checked(wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).wrap), Some(DataCmd::WrapText)),
         (MenuItem::new("Sort A to Z").enabled(some).separated(), Some(DataCmd::SortAsc)),
         (MenuItem::new("Sort Z to A").enabled(some), Some(DataCmd::SortDesc)),
         (MenuItem::new("Filter").checked(filter.is_some()).enabled(some || filter.is_some()).separated(), Some(DataCmd::Filter)),
@@ -422,9 +426,29 @@ pub const MAX_VALUES: usize = 10_000;
 /// A filter column's values to choose from: the column (of the sheet), then each
 /// distinct shown text with how many rows show it and whether the filter keeps it
 /// now. `Err` says why there is no list (no filter there, too many values).
-/// A double-click on the double line where `col` is hidden: the hidden
-/// columns around it shown again, as Unhide Columns would. False when
-/// `col` isn't hidden.
+/// A double-click on the double line where `row` is hidden (by hand or
+/// filtered): the hidden rows around it shown again, as Unhide Rows would.
+/// False when `row` isn't hidden.
+pub fn unhide_rows_at(d: &mut Doc, row: u32) -> bool {
+    let sh = d.wb.sheet(d.sheet);
+    if !sh.row_hidden(row) {
+        return false;
+    }
+    let (mut lo, mut hi) = (row, row);
+    while lo > 0 && sh.row_hidden(lo - 1) && row - lo < MAX_HIDE_ROWS_SCAN {
+        lo -= 1;
+    }
+    while hi + 1 < officina_grid::addr::MAX_ROWS && sh.row_hidden(hi + 1) && hi - row < MAX_HIDE_ROWS_SCAN {
+        hi += 1;
+    }
+    run(d, CellRange { r0: lo, c0: 0, r1: hi, c1: 0 }, (lo, 0), DataCmd::UnhideRows);
+    true
+}
+
+/// How far a double-click on hidden rows' line looks for the run's ends.
+const MAX_HIDE_ROWS_SCAN: u32 = 1 << 20;
+
+/// The same for hidden columns around `col`.
 pub fn unhide_cols_at(d: &mut Doc, col: u32) -> bool {
     let sizes = &d.wb.sheet(d.sheet).col_sizes;
     if sizes.size(col) > 0.0 {
@@ -602,6 +626,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let to = if off { HAlign::General } else { HAlign::CenterAcross };
             d.run("Center Across Selection", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { h_align: to, ..st.clone() })]);
             Ok(if off { "Text no longer centred across the selection.".into() } else { "Text centred across the selection.".into() })
+        }
+        DataCmd::WrapText => {
+            let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+            let on = !d.wb.style(CellAddr { sheet: s, row: sel.r0, col: sel.c0 }).wrap;
+            d.run("Wrap Text", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { wrap: on, ..st.clone() })]);
+            Ok(if on { "Text wraps in its cells.".into() } else { "Text no longer wraps.".into() })
         }
         DataCmd::Merge => {
             let r = d.wb.grow_to_merges(Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 });
@@ -1071,6 +1101,23 @@ mod tests {
         assert!((0..=2).all(|c| at(&d, c) == HAlign::General));
         assert!(d.undo());
         assert!((0..=2).all(|c| at(&d, c) == HAlign::CenterAcross));
+    }
+
+    #[test]
+    fn wrap_text_toggles_and_a_hidden_row_s_line_shows_it() {
+        let mut d = doc();
+        let sel = CellRange { r0: 0, c0: 0, r1: 1, c1: 1 };
+        run(&mut d, sel, (0, 0), DataCmd::WrapText);
+        assert_eq!(d.status, "Text wraps in its cells.");
+        assert!(d.wb.style(CellAddr { sheet: 0, row: 1, col: 1 }).wrap);
+        assert!(menu(&d, sel, (0, 0)).iter().any(|(m, _)| m.label == "Wrap Text" && m.mark == pergola::widgets::Mark::Check(true)));
+        run(&mut d, sel, (0, 0), DataCmd::WrapText);
+        assert!(!d.wb.style(CellAddr { sheet: 0, row: 0, col: 0 }).wrap);
+        // Hidden rows 3-4: a double-click on their line (row 3) shows both.
+        run(&mut d, CellRange { r0: 2, c0: 0, r1: 3, c1: 0 }, (2, 0), DataCmd::HideRows);
+        assert!(!unhide_rows_at(&mut d, 1));
+        assert!(unhide_rows_at(&mut d, 2));
+        assert!(!d.wb.sheet(0).row_hidden(2) && !d.wb.sheet(0).row_hidden(3));
     }
 
     #[test]
