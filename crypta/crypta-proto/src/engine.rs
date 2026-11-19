@@ -165,6 +165,7 @@ pub struct HipFacts {
     pub pf: Option<bool>,
     pub ipv6_forwarding: Option<bool>,
     pub mounted_geli: Option<u32>,
+    pub mounted_tessera_sealed: Option<u32>,
     pub patch_status: Option<HipPatchStatus>,
     pub screen_locked: Option<bool>,
 }

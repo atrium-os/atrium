@@ -36171,6 +36171,48 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, mounts,
     tessera_sysctl_mounts, "A",
     "Per-mount metadata-reserve admission inputs and pinscan state");
 
+/*
+ * A mount has a seal only after the kernel has authenticated the volume.
+ * Count live mounts without exporting mount paths, volume IDs or keys.
+ */
+static int
+tessera_sysctl_sealed_mounts(SYSCTL_HANDLER_ARGS)
+{
+	struct mount *mp, *next;
+	unsigned int count = 0;
+	int error;
+
+	if (jailed(req->td->td_ucred))
+		return (EPERM);
+	error = priv_check(req->td, PRIV_VFS_ADMIN);
+	if (error != 0)
+		return (error);
+
+	mtx_lock(&mountlist_mtx);
+	for (mp = TAILQ_FIRST(&mountlist); mp != NULL; mp = next) {
+		if (mp->mnt_op != &tessera_vfsops) {
+			next = TAILQ_NEXT(mp, mnt_list);
+			continue;
+		}
+		error = vfs_busy(mp, MBF_NOWAIT | MBF_MNTLSTLOCK);
+		if (error != 0)
+			break;
+		struct tessera_mount *t = VFSTOTESSERA(mp);
+		if (t != NULL && t->seal != NULL)
+			count++;
+		mtx_lock(&mountlist_mtx);
+		next = TAILQ_NEXT(mp, mnt_list);
+		vfs_unbusy(mp);
+	}
+	mtx_unlock(&mountlist_mtx);
+	if (error != 0)
+		return (error);
+	return (sysctl_handle_int(oidp, &count, 0, req));
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, sealed_mounts,
+    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_sealed_mounts, "IU", "Number of mounted sealed Tessera volumes");
+
 /* ── E4.4: dropping a group's key (encryption §10, page cache) ───── */
 
 static void

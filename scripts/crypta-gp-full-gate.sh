@@ -36,7 +36,58 @@ if [ "$hip" = posture ]; then
     (cd "$ROOT/portcullis" && cargo build -q --release --target "$T" -p opifex --bin opifexd)
     EXTRA="$EXTRA $ROOT/portcullis/target/$T/release/opifexd"
 fi
+if [ "$hip" = tessera ]; then
+    module=${CRYPTA_GATE_TESSERA_KMOD:?path to a host-built tessera_fs.ko}
+    [ -f "$module" ] && [ "${module##*/}" = tessera_fs.ko ] ||
+        fail "expected a host-built tessera_fs.ko"
+    EXTRA="$EXTRA $module"
+fi
 setup
+
+if [ "$hip" = tessera ]; then
+    tessera_cleanup() {
+        "$V" 'G=/tmp/crypta-gate
+            umount "$G/tessera" 2>/dev/null || true
+            if [ -f "$G/tessera-md" ]; then
+                md=$(cat "$G/tessera-md")
+                mdconfig -d -u "${md#md}" 2>/dev/null || true
+            fi
+            if [ -f "$G/tessera-kld" ]; then
+                /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc >/dev/null 2>&1 || true
+                kldunload -i "$(cat "$G/tessera-kld")" || true
+            fi
+            rm -f "$G/tessera-key" "$G/tessera.img"' || true
+        cleanup
+        kill "$LANPID" 2>/dev/null || true
+    }
+    trap tessera_cleanup EXIT
+    "$V" 'sh -s' <<'GUEST'
+set -eu
+G=/tmp/crypta-gate
+tools=/root/sealed
+kid=c0ffee00112233445566778899aabbcc
+test -x "$tools/tessera-mkfs-sealed"
+test -x "$tools/tessera-keyload"
+if kldstat -q -m tessera; then
+    echo "The Tessera posture gate needs a guest without Tessera already mounted or loaded" >&2
+    exit 1
+fi
+kldload "$G/tessera_fs.ko"
+kldstat -n tessera_fs.ko | awk 'NR == 2 {print $1}' > "$G/tessera-kld"
+test "$(sysctl -n kern.tessera.sealed_mounts)" = 0
+mkdir "$G/tessera"
+umask 077
+head -c 32 /dev/random > "$G/tessera-key"
+printf '%s\n' 'sealed HIP fixture' > "$G/tessera-content"
+"$tools/tessera-mkfs-sealed" --key-file "$G/tessera-key" --key-id "$kid" --create -s 64 -j 64 \
+    --seed-file probe --seed-content "$G/tessera-content" "$G/tessera.img" > "$G/tessera-format"
+uuid=$(awk '/^uuid/ {print $2}' "$G/tessera-format")
+test -n "$uuid"
+"$tools/tessera-keyload" load "$G/tessera-key" "$kid" "$uuid" >/dev/null
+rm -f "$G/tessera-key"
+mdconfig -a -t vnode -f "$G/tessera.img" > "$G/tessera-md"
+GUEST
+fi
 
 posture_cleanup() {
     "$V" 'G=/tmp/crypta-gate
@@ -184,6 +235,12 @@ if [ -n "$hip" ]; then
         done
         ok "review shows live GELI, Opifex and active-session lock facts"
     fi
+    if [ "$hip" = tessera ]; then
+        case "$preview" in *"$(hex 'Mounted sealed Tessera volumes  0')"*) ;;
+            *) fail "initial HIP review omitted the verified zero Tessera count" ;;
+        esac
+        ok "review shows zero mounted sealed Tessera volumes"
+    fi
     ok "Settings prompt exposes the HIP facts before the data tunnel is up"
     if [ "$hip" = decline ]; then
         "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
@@ -234,6 +291,30 @@ if [ "$hip" = posture ]; then
     grep -q '^yes ' "$receipts" || fail "approved screen-lock change did not reach peer"
     ok "changed screen lock required fresh approval before upload"
     probe "IPv4 echo after approved posture refresh"
+    "$V" "$CTL down name=gp-gate" >/dev/null
+    echo "$pass checks passed"
+    exit 0
+fi
+if [ "$hip" = tessera ]; then
+    probe "IPv4 echo before the sealed Tessera mount"
+    grep -q '^0 ' "$receipts" || fail "initial Tessera report did not reach peer"
+    "$V" 'G=/tmp/crypta-gate; set -e
+        mount -t tessera -r "/dev/$(cat "$G/tessera-md")" "$G/tessera"
+        cmp "$G/tessera/probe" "$G/tessera-content"
+        test "$(sysctl -n kern.tessera.sealed_mounts)" = 1'
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' |
+        grep -q "$(hex 'Mounted sealed Tessera volumes  1')" ||
+        fail "HIP review omitted the verified sealed mount"
+    if grep -q '^1 ' "$receipts"; then fail "sealed mount was uploaded without approval"; fi
+    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
+    for _ in $(seq 1 20); do
+        grep -q '^1 ' "$receipts" && break
+        sleep 1
+    done
+    grep -q '^1 ' "$receipts" || fail "approved Tessera report did not reach peer"
+    ok "sealed Tessera mount required fresh approval before upload"
+    probe "IPv4 echo after approved Tessera posture refresh"
     "$V" "$CTL down name=gp-gate" >/dev/null
     echo "$pass checks passed"
     exit 0

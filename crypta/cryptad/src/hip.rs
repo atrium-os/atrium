@@ -130,6 +130,28 @@ pub fn mounted_geli() -> Option<u32> {
     None
 }
 
+#[cfg(target_os = "freebsd")]
+pub fn mounted_tessera_sealed() -> Option<u32> {
+    let mut count = 0u32;
+    let mut size = std::mem::size_of_val(&count);
+    // SAFETY: count and size are writable and the new-value pointer is null.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.tessera.sealed_mounts".as_ptr(),
+            (&mut count as *mut u32).cast(),
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    (rc == 0 && size == std::mem::size_of_val(&count)).then_some(count)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn mounted_tessera_sealed() -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

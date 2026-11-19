@@ -61,6 +61,11 @@ dedup existence oracle), [tessera-quotas.md](tessera-quotas.md) (domains),
   person) are mounted by the kernel's `tessera_fs`. Everything else keeps the jailed FUSE
   path. A sealed stick without a key is shown as locked and never decoded.
 
+The read-only `kern.tessera.sealed_mounts` sysctl gives the host administrator
+the count of mounts with an authenticated volume seal. Crypta uses it for
+reviewed GlobalProtect HIP posture. The count includes sealed filesystems
+only and exports no volume paths, identifiers or keys.
+
 ## 2. Words
 
 | word | meaning here |

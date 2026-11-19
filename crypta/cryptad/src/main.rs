@@ -958,6 +958,7 @@ impl D {
                             pf,
                             ipv6_forwarding: hip_ipv6_forwarding(),
                             mounted_geli: hip::mounted_geli(),
+                            mounted_tessera_sealed: hip::mounted_tessera_sealed(),
                             patch_status: hip::patch_status(),
                             screen_locked: hip::screen_locked(),
                         };

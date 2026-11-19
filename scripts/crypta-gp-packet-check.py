@@ -204,10 +204,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
                         needed = "yes" if hip else "no"
-                        interval = "<hip-report-interval>5</hip-report-interval>" if hip in ("refresh", "posture") else ""
+                        interval = "<hip-report-interval>5</hip-report-interval>" if hip in ("refresh", "posture", "tessera") else ""
                         body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
                     elif path == "hipreport.esp":
-                        assert hip in ("approve", "refresh", "posture"), "HIP submitted without approval"
+                        assert hip in ("approve", "refresh", "posture", "tessera"), "HIP submitted without approval"
                         assert fields["authcookie"] == [COOKIE]
                         report, = fields["report"]
                         doc = ET.fromstring(report)
@@ -218,6 +218,14 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("hip-report-version") == "4"
                         categories = doc.findall("./categories/entry")
                         assert [node.attrib for node in categories[:2]] == [{"name": "host-info"}, {"name": "firewall"}]
+                        if hip == "tessera":
+                            disk = doc.find("./categories/entry[@name='disk-encryption']")
+                            tessera = [entry for entry in disk.findall("entry")
+                                       if entry.findtext("product") == "Atrium Tessera"]
+                            assert len(tessera) == 1
+                            tessera_count = tessera[0].findtext("mounted-sealed-volumes")
+                            assert tessera_count in ("0", "1")
+                            assert {node.tag for node in tessera[0]} == {"product", "mounted-sealed-volumes"}
                         if hip == "posture":
                             assert [node.attrib for node in categories[2:]] == [
                                 {"name": "disk-encryption"}, {"name": "patch-management"}, {"name": "screen-lock"},
@@ -241,7 +249,12 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert hashlib.md5(original.encode()).hexdigest() == digest
                         if receipts:
                             with receipts.open("a") as receipt:
-                                print(f"{locked if hip == 'posture' else forwarding} {digest}", file=receipt)
+                                fact = forwarding
+                                if hip == "posture":
+                                    fact = locked
+                                elif hip == "tessera":
+                                    fact = tessera_count
+                                print(f"{fact} {digest}", file=receipt)
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
@@ -351,7 +364,7 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
-    parser.add_argument("--hip", choices=["approve", "decline", "refresh", "posture"], help="require a reviewed HIP report in the full gate")
+    parser.add_argument("--hip", choices=["approve", "decline", "refresh", "posture", "tessera"], help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
     if args.hip and (not args.full_vm or args.drop_esp):
         parser.error("HIP cases require the full VM gate")
@@ -386,7 +399,7 @@ def main():
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            receipts = tmp / "hip-receipts" if args.hip in ("refresh", "posture") else None
+            receipts = tmp / "hip-receipts" if args.hip in ("refresh", "posture", "tessera") else None
             if receipts:
                 receipts.touch()
             thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts}, daemon=True)
@@ -441,7 +454,7 @@ def main():
                 assert calls == ["prelogin.esp", "login.esp", *exchange], calls
                 print("Declining HIP sent no report and opened no data tunnel")
                 return
-            if args.hip in ("refresh", "posture"):
+            if args.hip in ("refresh", "posture", "tessera"):
                 assert calls.count("getconfig.esp") == 1, calls
                 if esp:
                     assert not esp.errors, esp.errors

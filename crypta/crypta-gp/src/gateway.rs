@@ -670,20 +670,25 @@ impl HipReport {
             );
             let _ = writeln!(review, "Firewall  Atrium pf enabled: {value}");
         }
+        let mut disk = Element::new("entry").with_attr("name", "disk-encryption");
         if let Some(count) = facts.mounted_geli {
-            let count = count.to_string();
-            categories = categories.with_child(
-                Element::new("entry")
-                    .with_attr("name", "disk-encryption")
-                    .with_child(
-                        Element::new("entry")
-                            .with_child(Element::new("product").with_text("FreeBSD GELI"))
-                            .with_child(
-                                Element::new("mounted-encrypted-providers").with_text(&count),
-                            ),
-                    ),
-            );
+            disk = disk.with_child(encryption_entry(
+                "FreeBSD GELI",
+                "mounted-encrypted-providers",
+                count,
+            ));
             let _ = writeln!(review, "Mounted GELI encrypted providers  {count}");
+        }
+        if let Some(count) = facts.mounted_tessera_sealed {
+            disk = disk.with_child(encryption_entry(
+                "Atrium Tessera",
+                "mounted-sealed-volumes",
+                count,
+            ));
+            let _ = writeln!(review, "Mounted sealed Tessera volumes  {count}");
+        }
+        if facts.mounted_geli.is_some() || facts.mounted_tessera_sealed.is_some() {
+            categories = categories.with_child(disk);
         }
         if let Some(status) = facts.patch_status {
             let last_check = status.last_check.to_string();
@@ -725,6 +730,12 @@ impl HipReport {
             review,
         })
     }
+}
+
+fn encryption_entry(product: &str, tag: &str, count: u32) -> Element {
+    Element::new("entry")
+        .with_child(Element::new("product").with_text(product))
+        .with_child(Element::new(tag).with_text(&count.to_string()))
 }
 
 pub fn hip_check(bytes: &[u8]) -> Result<bool> {
@@ -830,6 +841,7 @@ mod tests {
 
         let facts = HipFacts {
             mounted_geli: Some(1),
+            mounted_tessera_sealed: Some(0),
             patch_status: Some(HipPatchStatus {
                 last_check: 100,
                 pending: Some(2),
@@ -844,6 +856,10 @@ mod tests {
         for changed in [
             HipFacts {
                 mounted_geli: Some(0),
+                ..facts
+            },
+            HipFacts {
+                mounted_tessera_sealed: Some(1),
                 ..facts
             },
             HipFacts {
