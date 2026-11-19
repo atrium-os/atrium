@@ -833,6 +833,7 @@ another origin. An active portal-profile session stays in engine memory.
   declining the rebound review. It rejects the declined approval choice,
   verifies the route and changed report wait for the new approval, and
   checks IPv4 echo on the newly opened TLS connection or ESP association.
+  The arm64 reconnect gate passed 16/16 on TLS and 16/16 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
