@@ -1354,6 +1354,38 @@ impl Mail {
         });
     }
 
+    /// "Always…" (§11.6): keep the open message's `i`th suggested rule and
+    /// run it over the mail already in the inbox, with Undo for that.
+    pub fn always(&self, i: usize) {
+        let mut ui = self.ui.get_cloned();
+        let Some(msg) = ui.reading.as_ref().and_then(|r| r.current().or(r.msgs.last())).map(|m| m.msg) else { return };
+        let Some(rule) = self.engine.always_for(msg).into_iter().nth(i) else { return };
+        let r = self.engine.add_rule(rule.clone()).map_err(|e| e.to_string()).and_then(|()| self.engine.run_rule(&rule).map_err(|e| e.to_string()));
+        match r {
+            Ok(ops) if !ops.is_empty() => {
+                let n = ops.len();
+                ui.undo = Some(Undo { ops, send: None, later: Vec::new(), label: format!("Rule kept; {n} message{} {}", if n == 1 { "" } else { "s" }, match rule.then {
+                    mail_engine::rules::Then::Move(_) => "moved",
+                    mail_engine::rules::Then::Flag => "flagged",
+                    _ => "marked read",
+                }), until: (self.now)() + mail_engine::UNDO_SECS });
+                // Moved out of the inbox: the reader closes with it.
+                if matches!(rule.then, mail_engine::rules::Then::Move(_)) && ui.reading.as_ref().and_then(|r| r.folder).and_then(|f| self.engine.store.folder(f).ok()).is_some_and(|f| f.role == mail_store::Role::Inbox) {
+                    ui.reading = None;
+                    ui.cursor = None;
+                }
+            }
+            Ok(_) => ui.file_note = Some((format!("Rule kept: {}", rule.words()), (self.now)() + 4)),
+            Err(e) => ui.error = Some(e),
+        }
+        // The list as it now is.
+        if let (Some(f), None) = (ui.folder, &ui.search) {
+            ui.count = self.count_of(f, ui.conversations);
+        }
+        ui.gen += 1;
+        self.ui.set(ui);
+    }
+
     /// Archive or delete what the reader shows (the conversation's
     /// messages in this folder): gone from the list at once, on the server
     /// after the undo window. The next row opens in its place.
@@ -2654,6 +2686,11 @@ impl Mail {
                 add("Restore (Later)".into(), "u", Cmd::Restore);
             }
             add("Print".into(), "Ctrl-P", Cmd::Print);
+            if let Some(m) = r.current().or(r.msgs.last()) {
+                for (i, rule) in self.engine.always_for(m.msg).iter().enumerate() {
+                    add(format!("Always: {}", rule.words()), "", Cmd::Always(i as u16));
+                }
+            }
         }
         if ui.undo.is_some() {
             add(format!("Undo: {}", ui.undo.as_ref().map(|u| u.label.as_str()).unwrap_or_default()), "z", Cmd::Undo);
@@ -2793,6 +2830,7 @@ impl Mail {
             Cmd::View(lane) => self.show_view(lane),
             Cmd::Export(e) => self.export(e),
             Cmd::Import => self.import(),
+            Cmd::Always(i) => self.always(i as usize),
             Cmd::Saved(id) => {
                 let q = self.ui.get_cloned().saved.iter().find(|s| s.id == id).map(|s| s.query.clone());
                 if let Some(q) = q {
@@ -3638,6 +3676,7 @@ impl MailView {
         let buttons: Vec<(&str, &str, Box<dyn Fn()>)> = vec![
             ("Print", "⌃P", { let m = m.clone(); Box::new(move || { m.print_current(); }) }),
             ("Delete", "#", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Delete)) }),
+            (if m.reading_junk() { "Not junk" } else { "Junk" }, "!", { let m = m.clone(); Box::new(move || m.junk()) }),
             ("Later", "l", { let m = m.clone(); Box::new(move || m.ask_later()) }),
             ("Archive", "e", { let m = m.clone(); Box::new(move || m.act(mail_engine::Action::Archive)) }),
             ("Forward", "f", { let m = m.clone(); Box::new(move || m.reply(Kind::Forward)) }),

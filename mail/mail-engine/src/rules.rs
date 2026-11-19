@@ -202,15 +202,7 @@ impl Engine {
                 continue;
             }
             let Some(r) = first(&rules, &m.summary) else { continue };
-            let kind = match &r.then {
-                Then::Move(name) => match self.folder_named(account, name) {
-                    Some(to) if to != folder => OpKind::Move { to },
-                    _ => continue,
-                },
-                Then::Flag => OpKind::Flags { add: mail_store::flag::FLAGGED, remove: 0 },
-                Then::Read => OpKind::Flags { add: mail_store::flag::SEEN, remove: 0 },
-                Then::Quiet => continue,
-            };
+            let Some(kind) = self.op_for(account, folder, r) else { continue };
             ops.push((uid, kind));
         }
         if ops.is_empty() {
@@ -227,6 +219,89 @@ impl Engine {
             Ok(())
         })?;
         Ok(())
+    }
+
+    /// What `r` does to a message in `folder`; `None`: nothing to send
+    /// (quiet, or a folder the account doesn't have).
+    fn op_for(&self, account: AccountId, folder: FolderId, r: &Rule) -> Option<OpKind> {
+        Some(match &r.then {
+            Then::Move(name) => match self.folder_named(account, name) {
+                Some(to) if to != folder => OpKind::Move { to },
+                _ => return None,
+            },
+            Then::Flag => OpKind::Flags { add: mail_store::flag::FLAGGED, remove: 0 },
+            Then::Read => OpKind::Flags { add: mail_store::flag::SEEN, remove: 0 },
+            Then::Quiet => return None,
+        })
+    }
+
+    /// Run `r` over the mail already in every inbox (§11.6), as it would
+    /// have been on arrival; mail the screener holds is left alone. The
+    /// ops it queued (one per message), due after the undo window.
+    pub fn run_rule(&self, r: &Rule) -> Result<Vec<u64>, Error> {
+        let mut n = Vec::new();
+        for (account, _) in self.store.accounts()? {
+            let Some((inbox, _)) = self.store.folders(account)?.into_iter().find(|(_, f)| f.role == Role::Inbox) else { continue };
+            let held: Vec<MsgId> = self.store.held(account)?.into_iter().map(|h| h.0).collect();
+            let mut ops = Vec::new();
+            for row in self.store.list(inbox, 0, self.store.count(inbox)?)? {
+                if held.contains(&row.msg) {
+                    continue;
+                }
+                let Ok(m) = self.store.message(row.msg) else { continue };
+                if !r.matches(&m.summary) {
+                    continue;
+                }
+                let Some(kind) = self.op_for(account, inbox, r) else { continue };
+                if let OpKind::Flags { add, .. } = kind {
+                    if row.flags & add == add {
+                        continue;
+                    }
+                }
+                ops.push((row.uid, kind));
+            }
+            if ops.is_empty() {
+                continue;
+            }
+            let t = now() + crate::UNDO_SECS;
+            self.store.write(|w| {
+                for (uid, kind) in &ops {
+                    match w.queue(inbox, *uid, kind.clone(), t) {
+                        Ok(id) => n.push(id),
+                        Err(mail_store::Error::NotFound) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(n)
+    }
+
+    /// The rules "Always…" offers for message `msg` (§11.6): for its list,
+    /// else its sender; moved to each of its account's own folders (and
+    /// Archive), flagged, marked read, or quiet.
+    pub fn always_for(&self, msg: MsgId) -> Vec<Rule> {
+        let Ok(m) = self.store.message(msg) else { return Vec::new() };
+        let when = match (list_key(&m.summary), m.summary.from.first()) {
+            (Some(k), _) => When::List(k),
+            (None, Some(f)) if f.addr.contains('@') => When::From(f.addr.to_ascii_lowercase()),
+            _ => return Vec::new(),
+        };
+        let account = m.locations.first().and_then(|(f, _)| self.store.folder(*f).ok()).map(|f| f.account);
+        let mut folders: Vec<String> = account
+            .and_then(|a| self.store.folders(a).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, f)| !f.hidden && matches!(f.role, Role::Other | Role::Archive))
+            .map(|(_, f)| f.name)
+            .collect();
+        folders.sort_by_key(|f| f.to_lowercase());
+        let mut v: Vec<Rule> = folders.into_iter().map(|f| Rule { when: when.clone(), then: Then::Move(f) }).collect();
+        for then in [Then::Flag, Then::Read, Then::Quiet] {
+            v.push(Rule { when: when.clone(), then });
+        }
+        v
     }
 
     /// No notification for `s` (a `quiet` rule).

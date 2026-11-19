@@ -74,3 +74,38 @@ fn rules_move_flag_read_and_quiet() {
     engine.sink(account).messages("Archive", vec![f(8, "GitHub <noreply@github.com>", "arun@example.org", "[repo] old")]).unwrap();
     assert_eq!(engine.store.ops_due(account, i64::MAX).unwrap().len(), 4);
 }
+
+#[test]
+fn a_rule_runs_over_mail_already_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("arun@example.org").unwrap();
+    let mut sink = engine.sink(account);
+    sink.folders(&[
+        RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true },
+        RemoteFolder { name: "GitHub".into(), role: mail_sync::Role::Other, selectable: true },
+    ]).unwrap();
+    sink.messages("INBOX", vec![
+        f(1, "GitHub <noreply@github.com>", "arun@example.org", "[repo] PR merged"),
+        f(2, "GitHub <noreply@github.com>", "arun@example.org", "[repo] Issue opened"),
+        f(3, "Lena <lena@partner.example>", "arun@example.org", "Lunch"),
+    ]).unwrap();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 3);
+    // Added now: the mail already here stays until it is run.
+    let r = parse_rule("from:@github.com move GitHub").unwrap();
+    engine.add_rule(r.clone()).unwrap();
+    assert_eq!(engine.store.count(inbox).unwrap(), 3);
+    assert_eq!(engine.run_rule(&r).unwrap().len(), 2);
+    let rows = engine.store.list(inbox, 0, 10).unwrap();
+    assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["Lunch"]);
+    // Flagging twice flags once; a quiet rule does nothing to mail here.
+    let flag_it = parse_rule("from:lena@partner.example flag").unwrap();
+    assert_eq!(engine.run_rule(&flag_it).unwrap().len(), 1);
+    assert_eq!(engine.run_rule(&flag_it).unwrap().len(), 0);
+    assert!(engine.run_rule(&parse_rule("from:lena@partner.example quiet").unwrap()).unwrap().is_empty());
+    // "Always…" for Lena's message: her address, each own folder, then flag, read, quiet.
+    let lunch = engine.store.list(inbox, 0, 10).unwrap()[0].msg;
+    let words: Vec<String> = engine.always_for(lunch).iter().map(|r| r.words()).collect();
+    assert_eq!(words, ["Mail from lena@partner.example goes to GitHub", "Mail from lena@partner.example is flagged", "Mail from lena@partner.example is marked read", "Mail from lena@partner.example doesn't notify"]);
+}

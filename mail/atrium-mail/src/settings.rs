@@ -580,6 +580,17 @@ impl Settings {
         self.reload();
     }
 
+    /// Run rule `i` over the mail already in the inboxes (§11.6).
+    pub fn run_mail_rule(&self, i: usize) {
+        let Some(r) = self.engine.rules().into_iter().nth(i) else { return };
+        let note = match self.engine.run_rule(&r) {
+            Ok(ops) if ops.is_empty() => "Nothing in the inbox fits that rule".to_string(),
+            Ok(ops) => format!("Done to {} message{} in the inbox", ops.len(), if ops.len() == 1 { "" } else { "s" }),
+            Err(e) => format!("Couldn't run it: {e:?}"),
+        };
+        self.update(|u| u.note = Some(note));
+    }
+
     pub fn remove_mail_rule(&self, i: usize) {
         let mut rules = self.engine.rules();
         if i < rules.len() {
@@ -1202,6 +1213,9 @@ impl SettingsView {
             let s = self.s.clone();
             let rw = measure("Remove", type_size::SM, Weight::Medium) + em(24.0);
             button(ctx, right - rw, y + em(14.0), "Remove", false, true, move || s.remove_mail_rule(i));
+            let s = self.s.clone();
+            let uw = measure("Run on the inbox", type_size::SM, Weight::Medium) + em(24.0);
+            button(ctx, right - rw - em(6.0) - uw, y + em(14.0), "Run on the inbox", false, true, move || s.run_mail_rule(i));
             y += em(30.0);
         }
         let fw = (inner - em(80.0)).max(em(160.0));

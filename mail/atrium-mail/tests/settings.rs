@@ -148,6 +148,9 @@ fn settings_window() {
     s.add_mail_rule();
     assert!(s.ui.get_cloned().note.unwrap().starts_with("That rule doesn't read: say what to do"));
     assert_eq!(engine.rules().len(), 1);
+    drawn(&mut app, &["Run on the inbox"]);
+    s.run_mail_rule(0);
+    assert_eq!(s.ui.get_cloned().note.as_deref(), Some("Nothing in the inbox fits that rule"));
     s.remove_mail_rule(0);
     assert!(engine.rules().is_empty());
     // Lane rules: one that reads is kept first; one that doesn't says why.

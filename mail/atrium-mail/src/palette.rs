@@ -43,6 +43,9 @@ pub enum Cmd {
     Export(Export),
     /// Import an mbox file into the folder shown (§6.5).
     Import,
+    /// Make the `n`th of the open message's "Always…" rules (§11.6) and
+    /// run it over the inbox.
+    Always(u16),
 }
 
 /// What an export covers (§6.5).

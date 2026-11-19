@@ -478,6 +478,20 @@ fn archive_delete_and_undo_from_the_keyboard() {
     assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message moved to the inbox");
     let pending = engine.store.ops_due(account, i64::MAX).unwrap();
     assert!(pending.iter().any(|(_, o)| o.folder == junk && matches!(o.kind, mail_store::OpKind::Move { .. })), "{pending:?}");
+
+    // "Always…" (§11.6): a rule for the open message's sender, kept and
+    // run over the inbox at once, with Undo for what it did.
+    let inbox = engine.store.folder_id(account, "INBOX", mail_store::Role::Inbox).unwrap();
+    mail.choose_folder(inbox);
+    mail.open(0);
+    let flag_it = mail.palette_entries().into_iter().find(|e| e.label.starts_with("Always: Mail from ") && e.label.ends_with(" is flagged")).expect("an Always entry");
+    let mail_engine_rules = engine.rules().len();
+    match flag_it.cmd {
+        atrium_mail::palette::Cmd::Always(i) => mail.always(i as usize),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(engine.rules().len(), mail_engine_rules + 1);
+    assert!(mail.ui.get_cloned().undo.unwrap().label.ends_with(" flagged"), "{:?}", mail.ui.get_cloned().undo);
 }
 
 #[test]
