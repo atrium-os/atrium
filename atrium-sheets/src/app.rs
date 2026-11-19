@@ -281,7 +281,6 @@ pub struct Sheets {
     /// Compare with…: the pane, and the other copy it compares with.
     pub review: Mutable<crate::review::ReviewPane>,
     pub theirs: Rc<RefCell<Option<officina_grid::Workbook>>>,
-    tracked_base: Rc<RefCell<Option<officina_grid::compare::CellSnapshot>>>,
     pub review_scroll: Mutable<ScrollState>,
     /// Its Apply To field and the rule's two value fields.
     pub cond_range: Mutable<TextEdit>,
@@ -329,7 +328,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), tracked_base: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -453,26 +452,30 @@ impl Sheets {
     }
 
     fn start_tracking(&self) {
-        if self.tracked_base.borrow().is_some() {
+        if self.doc.borrow().wb.tracked_cells().is_some() {
             self.review_tracked();
             return;
         }
-        *self.tracked_base.borrow_mut() = Some(officina_grid::compare::CellSnapshot::capture(&self.doc.borrow().wb));
-        self.set_status("Tracking cell changes from this version.");
+        let result = self.doc.borrow_mut().start_tracking(&comment_author());
+        self.set_status(match result {
+            Ok(()) => "Tracking cell changes from this version.",
+            Err(error) => error,
+        });
     }
 
     fn review_tracked(&self) {
         use crate::review::{merge_error, ReviewMode, ReviewPane};
-        let Some(result) = self.tracked_base.borrow().as_ref().map(|base| base.changes_since(&self.doc.borrow().wb)) else {
-            self.set_status("Start tracking cell changes first.");
-            return;
+        let result = {
+            let d = self.doc.borrow();
+            d.wb.tracked_cells().map(|set| (set.author().to_string(), set.changes(&d.wb)))
         };
         match result {
-            Ok(changes) => self.open_cell_review(ReviewPane {
-                open: true, mode: ReviewMode::Tracked { author: comment_author() }, changes,
+            Some((author, Ok(changes))) => self.open_cell_review(ReviewPane {
+                open: true, mode: ReviewMode::Tracked { author }, changes,
                 ..Default::default()
             }),
-            Err(error) => self.set_status(merge_error(error)),
+            Some((_, Err(error))) => self.set_status(merge_error(error)),
+            None => self.set_status("Start tracking cell changes first."),
         }
     }
 
@@ -843,7 +846,6 @@ impl Sheets {
         self.close_comment_bar();
         self.review.set(crate::review::ReviewPane::default());
         *self.theirs.borrow_mut() = None;
-        *self.tracked_base.borrow_mut() = None;
         self.home();
         old
     }
@@ -2857,6 +2859,44 @@ mod tests {
     use pergola::app::App;
     use pergola::event::{Event, Key, KeyEventKind, Modifiers};
     use pergola::geom::Point;
+
+    #[test]
+    fn reopened_workbook_reviews_tracked_changes_under_the_saved_author() {
+        use crate::{data::DataCmd, review::ReviewMode};
+        use officina_grid::{book::Input, compare::Change, Value};
+
+        let mut doc = Doc::from_csv("tracked.csv", b"1,2,3\n").unwrap().0;
+        doc.start_tracking("Zoë Nguyen").unwrap();
+        assert!(doc.dirty, "starting tracking alone needs a save");
+        assert!(doc.type_into(0, 0, "11"));
+        assert!(doc.type_into(0, 1, "=A1*2"));
+        assert!(doc.type_into(0, 2, ""));
+        let saved = doc.stored_native().unwrap();
+        doc.saved().unwrap();
+        drop(doc);
+
+        let doc = Doc::from_native("tracked.osheet", &saved).unwrap();
+        let reopened = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let review = || {
+            reopened.cmds.lock().unwrap().push(Cmd::Data(DataCmd::ReviewTracked));
+            reopened.take_cmds();
+            reopened.review.get_cloned()
+        };
+        let number = |n| Input::Value(Value::num(n));
+        let pane = review();
+        assert_eq!(pane.mode, ReviewMode::Tracked { author: "Zoë Nguyen".into() });
+        assert_eq!(pane.changes, vec![
+            Change::Cell { sheet: 0, row: 0, col: 0, ours: number(1.0), theirs: number(11.0) },
+            Change::Cell { sheet: 0, row: 0, col: 1, ours: number(2.0), theirs: Input::Formula("=A1*2".into()) },
+            Change::Cell { sheet: 0, row: 0, col: 2, ours: number(3.0), theirs: Input::Empty },
+        ]);
+        // Keep using the original change set after reopening.
+        assert!(reopened.doc.borrow_mut().type_into(0, 0, "1"));
+        assert_eq!(review().changes.len(), 2);
+        assert!(reopened.doc.borrow_mut().undo());
+        assert_eq!(review(), pane);
+    }
 
     #[test]
     fn tracked_cell_changes_and_three_way_merge_use_undo_and_flag_conflicts() {

@@ -205,6 +205,7 @@ enum Record {
     /// More of the last action (a row grown to fit what was just typed):
     /// undone with it.
     Extend { ops: Vec<GridOp> },
+    TrackCells(officina_grid::tracking::TrackedCells),
 }
 
 impl Record {
@@ -229,6 +230,10 @@ impl Record {
             }
             Record::Saved => w.u8(5),
             Record::RemoveMacros => w.u8(6),
+            Record::TrackCells(set) => {
+                w.u8(8);
+                set.encode(&mut w);
+            }
             Record::Extend { ops } => {
                 w.u8(7);
                 w.var(ops.len() as u64);
@@ -273,6 +278,7 @@ impl Record {
                 }
                 Record::Extend { ops }
             }
+            8 => Record::TrackCells(officina_grid::tracking::TrackedCells::decode(&mut r)?),
             _ => return Err(WireError::Invalid("record")),
         };
         if !r.is_empty() {
@@ -662,6 +668,7 @@ impl Doc {
                 self.history.redo(&mut self.wb);
             }
             Record::Saved => {}
+            Record::TrackCells(set) => self.wb.set_tracked_cells(set),
             Record::RemoveMacros => {
                 self.wb.remove_macros();
             }
@@ -717,6 +724,21 @@ impl Doc {
         }
         self.recalc();
         self.wb.recalc_pending()
+    }
+
+    pub fn start_tracking(&mut self, author: &str) -> Result<(), &'static str> {
+        if self.wb.tracked_cells().is_some() { return Ok(()); }
+        if self.wb.recalc_pending() { self.wb.recalc(); }
+        let set = officina_grid::tracking::TrackedCells::capture(&self.wb, author)
+            .ok_or("The workbook is too large to start tracking cell changes.")?;
+        if self.wb.memory_bytes().saturating_add(set.memory_bytes()) > self.memory_budget {
+            return Err("Tracking cell changes would exceed the workbook memory budget.");
+        }
+        let record = Record::TrackCells(set);
+        self.journal(&record);
+        self.replay(record);
+        self.dirty = true;
+        Ok(())
     }
 
     /// Runs `ops` as one undo step: applied, journaled, recalculated.
@@ -1504,6 +1526,29 @@ mod tests {
         assert_eq!(v(&d, 1, 2), Value::Empty);
         assert!(d.redo());
         assert_eq!(v(&d, 1, 2), Value::Num(3.0));
+    }
+
+    #[test]
+    fn autosave_recovers_tracking_started_between_cell_edits() {
+        use officina_grid::compare::Change;
+
+        let dir = tmp("tracked");
+        let mut doc = Doc::new("Tracked");
+        doc.autosave_to(&dir).unwrap();
+        assert!(doc.type_into(0, 0, "12"));
+        doc.start_tracking("María Ionescu").unwrap();
+        assert!(doc.type_into(0, 0, "24"));
+        doc.autosave().unwrap().sync().unwrap();
+        drop(doc);
+
+        let (doc, recovered) = recover(&dir).unwrap();
+        assert_eq!(recovered.actions, 3);
+        let set = doc.wb.tracked_cells().unwrap();
+        assert_eq!(set.author(), "María Ionescu");
+        assert_eq!(set.changes(&doc.wb).unwrap(), vec![
+            Change::Cell { sheet: 0, row: 0, col: 0, ours: Input::Value(Value::Num(12.0)), theirs: Input::Value(Value::Num(24.0)) },
+        ]);
+        doc.close().unwrap();
     }
 
     /// The O2 gate: a crash at any point loses at most the action being written.

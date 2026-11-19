@@ -223,6 +223,10 @@ impl Run {
         let format = match t {
             Target::Picked { format, .. } | Target::Path { format, .. } => *format,
         };
+        if format != Format::Native && self.sheets.doc.borrow().wb.tracked_cells().is_some() {
+            self.set_status("Choose where to save an .osheet copy with its tracked cell changes.");
+            return false;
+        }
         // A file keeps every value as it should be: finish recalculating first.
         { let mut d = self.sheets.doc.borrow_mut(); if d.wb.recalc_pending() { d.wb.recalc(); } }
         let r = {

@@ -136,8 +136,9 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
 
 /// Sparse, positional cell inputs for tracking edits and merging copies
 /// of the same sheet layout. Formula results and spill followers are excluded.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CellSnapshot {
-    sheets: BTreeMap<String, BTreeMap<(u32, u32), Input>>,
+    pub(crate) sheets: BTreeMap<String, BTreeMap<(u32, u32), Input>>,
 }
 
 pub struct MergePlan {

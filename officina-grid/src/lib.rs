@@ -20,6 +20,7 @@ pub mod clip;
 pub mod column;
 pub mod comments;
 pub mod compare;
+pub mod tracking;
 pub mod condfmt;
 pub mod csv;
 pub mod deps;

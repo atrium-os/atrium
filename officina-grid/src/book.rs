@@ -149,6 +149,7 @@ type LookupKey = (u16, u32, u32, u32);
 
 pub struct Workbook {
     pub(crate) sheets: Vec<Sheet>,
+    pub(crate) tracked_cells: Option<crate::tracking::TrackedCells>,
     pub strings: StringPool,
     pub styles: StyleTable,
     /// Defined names; change them with [`Workbook::define_name`] so formulas re-bind.
@@ -198,6 +199,7 @@ impl Workbook {
     pub fn new() -> Self {
         Workbook {
             sheets: Vec::new(),
+            tracked_cells: None,
             strings: StringPool::new(),
             styles: StyleTable::new(),
             names: Names::default(),
@@ -233,7 +235,7 @@ impl Workbook {
     /// its results). An estimate to hold a budget against, not an allocator's
     /// count; it walks chunks, not cells (about a millisecond at 100 M cells).
     pub fn memory_bytes(&self) -> u64 {
-        let mut n = 0u64;
+        let mut n = self.tracked_cells.as_ref().map_or(0, |set| set.memory_bytes());
         for sh in &self.sheets {
             n += 256;
             for c in &sh.cols {

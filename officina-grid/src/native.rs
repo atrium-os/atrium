@@ -21,6 +21,7 @@
 //! | 18 | LINKS | one sheet's cell hyperlinks: sheet, count, each cell and its target |
 //! | 20 | VALIDATIONS | data validation rules: ranges, kind, operator, formulas as text, flags, messages |
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
+//! | 23 | TRACKED_CELLS | change set author and its sparse baseline inputs by sheet name |
 //! | 22 | FREEZE_FROM | panes frozen with the view scrolled: count; per sheet, its index, first frozen row and column |
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
 //! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, a plain note, styled note or thread |
@@ -54,6 +55,7 @@ pub const FREEZE: u16 = 19;
 pub const VALIDATIONS: u16 = 20;
 pub const HIDDEN_WIDTHS: u16 = 21;
 pub const FREEZE_FROM: u16 = 22;
+pub const TRACKED_CELLS: u16 = 23;
 pub const COLUMN: u16 = 3;
 pub const FORMULAS: u16 = 4;
 pub const STYLES: u16 = 5;
@@ -130,6 +132,11 @@ pub fn save<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     c.add(WORKBOOK, &w.into_bytes())?;
+    if let Some(set) = wb.tracked_cells() {
+        let mut w = Writer::new();
+        set.encode(&mut w);
+        c.add(TRACKED_CELLS, &w.into_bytes())?;
+    }
 
     // Cells, renumbering the strings they use (the pool also holds texts no cell
     // uses any more).
@@ -476,6 +483,16 @@ pub fn load_within(data: &[u8], budget: u64) -> Result<Workbook, LoadError> {
         }
     }
     done(&r)?;
+
+    let mut tracked = of(TRACKED_CELLS);
+    if let Some(i) = tracked.next() {
+        if tracked.next().is_some() {
+            return Err(LoadError::Bad("two TRACKED_CELLS chunks"));
+        }
+        let mut r = Reader::new(c.chunk(i)?);
+        wb.set_tracked_cells(crate::tracking::TrackedCells::decode(&mut r)?);
+        done(&r)?;
+    }
 
     // Names, before formulas (whose dependencies follow them).
     let mut it = of(NAMES);
