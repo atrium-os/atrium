@@ -28,7 +28,7 @@ runs while they read: no script runs at view time anywhere in the Navigator.
   seek, current time). The island never sees the document's DOM.
 - A whole page goes live only when it is a fat client throughout (§11.8.3: Figma, WhatsApp
   Web, editors, banking).
-- Engine: **Ladybird first in I0**, then Servo with SpiderMonkey (§11.3, §9 D1), **JIT off** (§11.5), **session recycling**
+- Engine: **Ladybird in I0**, Servo with SpiderMonkey deferred (§11.3, §9 D1), **JIT off** (§11.5), **session recycling**
   (§11.9.1), **in a jail on this machine** (§11.9.3: never an operator's rendering proxy).
 - Video plays in **Limen's native player**. The engine's `<video>` and `MediaSource` are
   backed by a `media-player` embed (§8.1, mapping built in `navigator-media`, §8.1.1). The
@@ -154,19 +154,19 @@ engine rather than in the document lane:
 
 Each step runs in the VM with a gate before the next, as the Navigator's other steps did.
 
-1. **I0. Two engines, measured side by side** (D1). Try **Ladybird first**, then **Servo**, for
-   FreeBSD (amd64 and arm64), using their embeddable engines, JIT off, with their network
+1. **I0. Qualify Ladybird on required pages** (D1). Test Ladybird on
+   FreeBSD (amd64 and arm64), using its embeddable engine, JIT off, with its network
    and media layers stubbed. Use native Fresco scenes and Atrium's pinned fonts
    (`navigator-fontset`). Desktop shells and their graphics or system font-discovery
    stacks are outside the comparison. The qualifying run uses a real Atrium jail
    with Capsicum entered and only the fixture broker and display capabilities.
-   Load the same set in each:
+   Use these workloads:
    - the fixture site and the [whole-page editor](../../test-assets/navigator-i0/editor.html)
      with a native insertion caret, an editable paragraph and an opaque scroll viewport;
    - three corpus widgets (an Infogram chart, a map, the YouTube embed);
    - two scripted sign-in pages (a fixture identity provider, and a real one's page as far
      as its password step).
-   For each engine, measure:
+   For Ladybird, measure:
    - correctness against a reference rendering;
    - start time and memory;
    - binary and build size;
@@ -174,8 +174,8 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
    - FreeBSD patches needed;
    - how far its `MediaSource` is from what the YouTube player needs;
    - how its network and media layers can be replaced (§3, §6).
-   Write the results and the choice in this spec. The choice is made on those measurements,
-   not on licence.
+   Record the results here. Reopen the Servo port if a required page fails in upstream
+   Ladybird and a reduced case works in upstream Servo.
 
    **Editor measurement.** Use the same pinned fonts, 1× device scale, window size,
    initial selection and quiescent baseline in each arm. Focus line 4 before
@@ -254,7 +254,7 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 - The shared [scripted sign-in fixture](../../test-assets/navigator-i0/sign-in.html)
   tests two navigations, a rejected public fixture password, and a successful
   callback. Its script passed a local smoke check with mocked DOM and navigation.
-  Ladybird passed the jailed, JIT-off gate below. Servo still needs the equivalent run.
+  Ladybird passed the jailed, JIT-off gate below. The equivalent Servo run is deferred.
 - Ladybird at `ead47ae6ef846b910ac509f51b12281523d7c2c3` (source inspection).
   WebView's FontService scans installed directories. LibGfx's SharedFontProvider
   already accepts a mapped catalog and brokered face descriptors. Supply pinned
@@ -504,6 +504,43 @@ at `editor-parent` and the `i0-raster-check` build of `fresco-renderer` at
 with `I0_SIGN_IN=1`. For the editor configure `I0_SIGN_IN=OFF` and unset
 the guest variable. Power off cleanly and release the slot to the Coordinator.
 
+### Mail Microsoft sign-in attempt, 2026-11-20
+
+The first blocker is in Mail account setup. Discovery sets the OAuth provider
+to `microsoft`. In `mail/atrium-mail/src/settings.rs`, `shown` displays the
+missing-sheet message and `can_add` disables the button for any OAuth account.
+There is no Microsoft launch from this screen. This finding comes from tracing
+the Mail code. The guest test below starts at the engine entry point.
+
+On a fresh arm64 HVF overlay, the guest reported kernel `9f2eed03a36c` and
+`/dev/vtbd1p1` mounted read-write as Tessera. The unmodified JIT-off control
+completed all four fixture GETs, password refusal and callback in each of three
+trials. For the diagnostic build we substituted the initial URL in
+`SignInFixture.h` with `MICROSOFT.authorize` from
+`arca/arca-courier/src/oauth.rs` and logged the URL immediately before
+`fetch`. This tests the origin boundary without inventing a client registration
+or sending account data. The URL had no OAuth query parameters. The engine
+otherwise used the same interpreter, loader and broker as the control.
+
+Portcullis verified the manifest. The probe reported uid 1011, jail membership,
+Capsicum mode 1 and ECAPMODE on the ambient open. LibWeb attempted to load
+`https://login.microsoftonline.com/common/oauth2/v2.0/authorize`.
+In `navigator-ladybird/fixture_fetch.rs`, the exact-URL check precedes
+`client.open`. The broker logged zero GETs, the worker reported
+`broker did not return the common fixture`, and Limen observed `ChildLost`
+before the first page frame. Microsoft supplied no bytes, so page parsing,
+script execution, password UI, callback and page timings remain untested.
+Probe SHA-256: `9d9efb0aa4374d1b82d1d3c61b435ba36b419327f2ec3286d72a185293311d9a`.
+
+Next, connect Mail's provider action to an Arca-owned PKCE session and
+Navigator sign-in sheet. Supply Atrium's registered Microsoft client ID and
+route navigation, subresources and the session cookie jar through the scoped
+broker. The fixture transport checks the response against embedded HTML and
+cannot serve as the real IdP loader. Retry to the first visible sign-in step;
+record the last successful fetch and first failing stage. Full account setup
+also needs Arca to intercept the registered redirect, verify state, exchange
+the code and store the initial grant as described in mail.md §5.3.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's
@@ -513,7 +550,7 @@ alongside I0.
 
 | | question | options | recommendation |
 |---|---|---|---|
-| **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, Rust LibJS with a C++ API and mixed Rust/C++ LibWeb) · our Boa and minimal DOM, run live | **Decided (Shankar, 2026-11-19): measure Servo and Ladybird side by side in I0, and choose on the measurements.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
+| **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, Rust LibJS with a C++ API and mixed Rust/C++ LibWeb) · our Boa and minimal DOM, run live | **Updated by Shankar, 2026-11-20. Use Ladybird. Defer Servo unless it can handle a required page blocked by Ladybird.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
 | **D2** ✓ | MPL-2.0, if I0 picks Servo (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft: we publish the source of any MPL file we change, and nothing of ours changes licence. toolkit-backends.md already accepted it for Servo. Nothing else links it |
 | **D3** ✓ | Where I0 builds | cross-build on the Mac · natively in the Mac VM · a larger cloud build environment | **Decided (Shankar, 2026-11-19): cross-build on the Mac** with a FreeBSD sysroot, from a Mac session. Build one engine at a time on the Mac. The shared VM runs I0's measurements |
 | **D4** ✓ | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
