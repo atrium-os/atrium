@@ -877,6 +877,9 @@ not Pergola; screenshot in project files `mail/mail-layout-main.png`).
 
 ### 15.2 The main window
 
+The sidebar and its folded rail use Pergola’s chrome surface. Unread counts use
+semibold primary text, with the danger color for overdue Later items.
+
 ```
 ┌ strip: Mail · [Work] ─────────────────────────────────────────── (frescod) ┐
 │ [Write]   [ Search mail and attachments…   from: has:attachment ]   Ctrl-K │

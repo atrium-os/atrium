@@ -3441,7 +3441,7 @@ impl MailView {
     /// folders), unread ones marked.
     fn rail(&self, ctx: &mut Ctx, ui: &Ui, w: f32, h: f32) {
         let t = ctx.theme;
-        rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
+        rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_surface());
         rect(ctx, Rect::new(w - 1.0, 0.0, 1.0, h), t.border_default());
         let b = em(36.0);
         let bx = (w - b) / 2.0;
@@ -3485,7 +3485,7 @@ impl MailView {
 
     fn places(&self, ctx: &mut Ctx, ui: &Ui, w: f32, h: f32) {
         let t = ctx.theme;
-        rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_window());
+        rect(ctx, Rect::new(0.0, 0.0, w, h), t.bg_surface());
         rect(ctx, Rect::new(w - 1.0, 0.0, 1.0, h), t.border_default());
         text(ctx, 16.0, head_h() / 2.0, "Mail", type_size::LG, Weight::Semibold, t.text_primary());
         // Write (c): a new message.
@@ -3503,7 +3503,7 @@ impl MailView {
         for p in &ui.places {
             if let Some(a) = &p.account {
                 y += em(8.0);
-                text(ctx, 16.0, y + em(10.0), &fit(&a.to_uppercase(), type_size::XS, Weight::Semibold, w - 32.0), type_size::XS, Weight::Semibold, t.text_tertiary());
+                text(ctx, 16.0, y + em(10.0), &fit(&a.to_uppercase(), type_size::XS, Weight::Semibold, w - 32.0), type_size::XS, Weight::Semibold, t.text_secondary());
                 y += em(20.0);
             }
             let sel = ui.folder == Some(p.folder) && ui.search.is_none();
@@ -3513,10 +3513,10 @@ impl MailView {
                 m.choose_folder(f);
             });
             let n = if p.count > 0 { p.count.to_string() } else { String::new() };
-            let nw = width(&n, type_size::SM, Weight::Regular);
+            let nw = width(&n, type_size::SM, Weight::Semibold);
             let wt = if sel { Weight::Semibold } else { Weight::Regular };
             text(ctx, 20.0, y + place_h() / 2.0, &fit(&p.label, type_size::SM, wt, w - 48.0 - nw), type_size::SM, wt, t.text_primary());
-            text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Regular, t.text_secondary());
+            text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Semibold, t.text_primary());
             ctx.pop();
             y += place_h();
             if y > h {
@@ -3534,7 +3534,7 @@ impl MailView {
         // Views (§15.2): the newsletter lane, the screener's.
         if !ui.views.is_empty() && y < h {
             y += em(8.0);
-            text(ctx, 16.0, y + em(10.0), "VIEWS", type_size::XS, Weight::Semibold, t.text_tertiary());
+            text(ctx, 16.0, y + em(10.0), "VIEWS", type_size::XS, Weight::Semibold, t.text_secondary());
             y += em(20.0);
             for &(lane, n) in &ui.views {
                 let sel = ui.search.as_ref().is_some_and(|s| s.view == Some(lane));
@@ -3545,11 +3545,11 @@ impl MailView {
                 });
                 let wt = if sel { Weight::Semibold } else { Weight::Regular };
                 let n = if n > 0 { n.to_string() } else { String::new() };
-                let nw = width(&n, type_size::SM, Weight::Regular);
+                let nw = width(&n, type_size::SM, Weight::Semibold);
                 text(ctx, 20.0, y + place_h() / 2.0, &fit(lane.label(), type_size::SM, wt, w - 48.0 - nw), type_size::SM, wt, t.text_primary());
                 // Overdue Later items are marked (§15.2).
-                let nc = if lane == Lane::Later && ui.overdue > 0 { t.danger_fg() } else { t.text_secondary() };
-                text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Regular, nc);
+                let nc = if lane == Lane::Later && ui.overdue > 0 { t.danger_fg() } else { t.text_primary() };
+                text(ctx, w - 20.0 - nw, y + place_h() / 2.0, &n, type_size::SM, Weight::Semibold, nc);
                 ctx.pop();
                 y += place_h();
             }
@@ -3557,7 +3557,7 @@ impl MailView {
         // Saved searches (smart folders, §11.2) under the folders.
         if !ui.saved.is_empty() && y < h {
             y += em(8.0);
-            text(ctx, 16.0, y + em(10.0), "SAVED SEARCHES", type_size::XS, Weight::Semibold, t.text_tertiary());
+            text(ctx, 16.0, y + em(10.0), "SAVED SEARCHES", type_size::XS, Weight::Semibold, t.text_secondary());
             y += em(20.0);
             for p in &ui.saved {
                 let sel = ui.search.as_ref().is_some_and(|s| s.saved == Some(p.id));
@@ -3578,7 +3578,7 @@ impl MailView {
         // Settings (,), kept at the foot of the sidebar.
         {
             let fy = h - place_h() - 8.0;
-            rect(ctx, Rect::new(0.0, fy - 8.0, w - 1.0, place_h() + 16.0), t.bg_window());
+            rect(ctx, Rect::new(0.0, fy - 8.0, w - 1.0, place_h() + 16.0), t.bg_surface());
             let m = self.mail.clone();
             area(ctx, Rect::new(8.0, fy, w - 16.0, place_h()), Color::TRANSPARENT, move || m.ask_settings());
             text(ctx, 20.0, fy + place_h() / 2.0, "Settings", type_size::SM, Weight::Regular, t.text_secondary());
@@ -3601,12 +3601,12 @@ impl MailView {
         let tx = r.x() + em(10.0);
         let max = r.w() - em(20.0);
         if q.is_empty() {
-            text(ctx, tx, cy, "Search", type_size::SM, Weight::Regular, t.text_tertiary());
+            text(ctx, tx, cy, "Search", type_size::SM, Weight::Regular, t.text_secondary());
             if !typing {
                 // Its key, and the palette's for everything else (§15.5).
                 let hint = if self.mail.engine.prefs().single_keys { "/   Ctrl-K" } else { "Ctrl-K" };
                 let kw = width(hint, type_size::XS, Weight::Regular);
-                text(ctx, r.x() + r.w() - em(10.0) - kw, cy, hint, type_size::XS, Weight::Regular, t.text_tertiary());
+                text(ctx, r.x() + r.w() - em(10.0) - kw, cy, hint, type_size::XS, Weight::Regular, t.text_secondary());
             }
         } else {
             // The end of a long query stays in view, with the caret.
