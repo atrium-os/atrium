@@ -762,7 +762,7 @@ Checks:
 
 Sheets and Slides print (2026-11-18): `officina_pdf::sheet` pages a sheet down, then
 across, each cell as the grid draws it (formatted text, fill, borders, data bars, "###"
-for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; a merged area prints as one cell, as the grid draws it, cut where it crosses a page, with its text on the page that has its first cell; Center Across Selection text is centred across its run with no lines inside, as on screen; and
+for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; a merged area prints as one cell, as the grid draws it, cut where it crosses a page, with its text on the page that has its first cell; Center Across Selection text is centred across its run with no lines inside, as on screen; frozen rows and columns repeat on every page as print titles; and
 `officina_pdf::slides` draws a page per slide from the display list the editor draws
 (hidden slides left out), fitted on the paper. Gradients are bands of solid colour,
 since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout

@@ -55,7 +55,7 @@ fn a_sheet_prints_down_then_across_and_looks_as_it_does_on_screen() {
     let fonts = PinnedFonts::new().unwrap();
     // 40 columns of 64 px (48 pt) and 150 rows of 20 px (15 pt) on A4 with
     // 54 pt margins: 10 columns and 48 rows a page, 4 pages across, 4 down.
-    let s = Sheet { name: "Q3", cols: vec![64.0; 40], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new(), across: Vec::new() };
+    let s = Sheet { name: "Q3", cols: vec![64.0; 40], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new(), across: Vec::new(), title_rows: (0, 0), title_cols: (0, 0) };
     let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     assert_eq!(stats.pages, 16);
     assert_eq!(stats.fonts, 2, "the screen's face, regular and bold");
@@ -77,7 +77,7 @@ fn a_sheet_prints_down_then_across_and_looks_as_it_does_on_screen() {
 #[test]
 fn numbers_that_do_not_fit_show_hashes_and_text_is_cut() {
     let fonts = PinnedFonts::new().unwrap();
-    let s = Sheet { name: "", cols: vec![64.0; 3], rows: vec![20.0], cell: &cells, gridlines: false, merges: Vec::new(), across: Vec::new() };
+    let s = Sheet { name: "", cols: vec![64.0; 3], rows: vec![20.0], cell: &cells, gridlines: false, merges: Vec::new(), across: Vec::new(), title_rows: (0, 0), title_cols: (0, 0) };
     let (pdf, _) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "Cut", Vec::new(), &mut |_, _| {}).unwrap();
     // The text is in the ToUnicode maps: '#' and '…' were used, the long
     // number's digits past what fits were not.
@@ -89,7 +89,7 @@ fn numbers_that_do_not_fit_show_hashes_and_text_is_cut() {
 #[test]
 fn fit_to_width_puts_every_column_on_one_page_across() {
     let fonts = PinnedFonts::new().unwrap();
-    let s = Sheet { name: "", cols: vec![64.0; 15], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new(), across: Vec::new() };
+    let s = Sheet { name: "", cols: vec![64.0; 15], rows: vec![20.0; 150], cell: &cells, gridlines: true, merges: Vec::new(), across: Vec::new(), title_rows: (0, 0), title_cols: (0, 0) };
     let mut setup = Setup::paper(595.0, 842.0);
     let (_, plain) = sheet::export(&s, &setup, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     setup.fit_width = true;
@@ -193,7 +193,7 @@ fn a_merged_area_prints_as_one_cell_even_across_pages() {
     let fonts = PinnedFonts::new().unwrap();
     // A1:C2 merged (red, "Total" in A1); J5:K5 runs over the page's edge
     // (10 columns a page).
-    let s = Sheet { name: "", cols: vec![64.0; 12], rows: vec![20.0; 6], cell: &cells, gridlines: true, merges: vec![[0, 0, 1, 2], [4, 9, 4, 10]], across: Vec::new() };
+    let s = Sheet { name: "", cols: vec![64.0; 12], rows: vec![20.0; 6], cell: &cells, gridlines: true, merges: vec![[0, 0, 1, 2], [4, 9, 4, 10]], across: Vec::new(), title_rows: (0, 0), title_cols: (0, 0) };
     let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     assert_eq!(stats.pages, 2);
     let pages = draw(&pdf);
@@ -215,11 +215,29 @@ fn center_across_puts_the_text_in_the_middle_of_its_run() {
     let fonts = PinnedFonts::new().unwrap();
     let title = |r: u32, c: u32| ((r, c) == (0, 0)).then(|| Cell { text: "Title".into(), ..Default::default() });
     // A1:C1 a run: A1's text centred across 3 columns of 48 pt from x 54.
-    let s = Sheet { name: "", cols: vec![64.0; 4], rows: vec![20.0; 2], cell: &title, gridlines: true, merges: Vec::new(), across: vec![[0, 0, 2]] };
+    let s = Sheet { name: "", cols: vec![64.0; 4], rows: vec![20.0; 2], cell: &title, gridlines: true, merges: Vec::new(), across: vec![[0, 0, 2]], title_rows: (0, 0), title_cols: (0, 0) };
     let (pdf, _) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     let pages = draw(&pdf);
     let dark = |x0: u32, x1: u32| (x0..x1).flat_map(|x| (56..68).map(move |y| (x, y))).filter(|&(x, y)| px(&pages[0], x, y)[0] < 128).count();
     assert!(dark(110, 142) > 5, "the text is in the middle of the run");
     assert_eq!(dark(54, 100), 0, "not in A1's own place");
     assert!(px(&pages[0], 150, 58)[0] > 240, "no gridline inside the run: {:?}", px(&pages[0], 150, 58));
+}
+
+#[test]
+fn frozen_rows_and_columns_repeat_on_every_page() {
+    let fonts = PinnedFonts::new().unwrap();
+    // Row 1 and column A as print titles; A1 is red.
+    let s = Sheet { name: "", cols: vec![64.0; 15], rows: vec![20.0; 60], cell: &cells, gridlines: true, merges: Vec::new(), across: Vec::new(), title_rows: (0, 1), title_cols: (0, 1) };
+    let (pdf, stats) = sheet::export(&s, &Setup::paper(595.0, 842.0), &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+    // 2 down (48 rows, then 12 under the title row), 2 across (10, then 5
+    // right of column A).
+    assert_eq!(stats.pages, 4);
+    let pages = draw(&pdf);
+    for (i, p) in pages.iter().enumerate() {
+        assert!(reddish(px(p, 98, 58)), "page {i} starts with A1: {:?}", px(p, 98, 58));
+    }
+    // Page 2 (down first): row 1, then row 49 ("48:1" in B, right-aligned).
+    let dark = (102..150).flat_map(|x| (71..83).map(move |y| (x, y))).filter(|&(x, y)| px(&pages[1], x, y)[0] < 128).count();
+    assert!(dark > 5, "a body row under the title row");
 }

@@ -654,6 +654,14 @@ pub enum Request {
     /// (`~/.atrium/persona-apps/<name>/<id>`) is deleted, its crossing switches go
     /// and it leaves the policy file. `app-grants` only. Answer: `Ok`.
     RemovePersona { name: String, activation: [u8; 16] },
+    /// ★ Settings' VPN page (vpn.md §9.7): which of the person's personas
+    /// route through which tunnel, by cryptad's profile name. `app-grants`
+    /// only. Answer: `PersonaVpns`.
+    PersonaVpns,
+    /// ★ Persona `name`'s apps go through tunnel `vpn` (None: direct). As
+    /// `SetPersonaColour`, and refused while any of its apps runs: an
+    /// instance's routing table is fixed when it starts.
+    SetPersonaVpn { name: String, vpn: Option<String>, activation: [u8; 16] },
 }
 
 /// A persona in the launch question.
@@ -991,6 +999,8 @@ pub enum Response {
         #[serde(default)]
         spans:    bool,
     },
+    /// PersonaVpns → (persona, tunnel) for each persona that uses one.
+    PersonaVpns { routes: Vec<(String, String)> },
 }
 
 /// Send one request and read one response over a connected stream.

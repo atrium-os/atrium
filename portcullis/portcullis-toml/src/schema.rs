@@ -400,6 +400,19 @@ pub struct Capabilities {
     /// (atrium-net.md §7.1). Restricted to the settings app.
     #[serde(rename = "network-configure")]
     pub network_configure: Option<bool>,
+    /// Which VPN tunnels there are and whether each is up (vpn.md §7.2),
+    /// over atrium-crypta-ctl's `vpn-read/` socket: names, kind, state and
+    /// scope; never addresses, gateways or keys.
+    #[serde(rename = "vpn-read")]
+    pub vpn_read: Option<bool>,
+    /// Connect and disconnect the saved tunnels (vpn.md §7.4, the bar's
+    /// item), over `vpn-use/`.
+    #[serde(rename = "vpn-use")]
+    pub vpn_use: Option<bool>,
+    /// Add, import, change and remove tunnels (vpn.md §7.3), over
+    /// `vpn-configure/`. Restricted to the settings app.
+    #[serde(rename = "vpn-configure")]
+    pub vpn_configure: Option<bool>,
     /// Open a captive portal's sign-in window (atrium-net.md §8.1): a
     /// fetcher on the network's own DNS that may reach private addresses
     /// (`OpenPortalFetcher`). Restricted to the Navigator.
@@ -545,7 +558,7 @@ impl Capabilities {
             ("session-lock", self.session_lock), ("device-list", self.device_list),
             ("display-settings", self.display_settings), ("network-details", self.network_details),
             ("network-wifi", self.network_wifi), ("wifi-nearby", self.wifi_nearby),
-            ("network-configure", self.network_configure), ("navigator-page", self.navigator_page),
+            ("network-configure", self.network_configure), ("vpn-use", self.vpn_use), ("vpn-configure", self.vpn_configure), ("navigator-page", self.navigator_page),
             ("navigator-broker", self.navigator_broker), ("notification-shelf", self.notification_shelf),
             ("removable-files", self.removable_files), ("file-picker", self.file_picker),
             ("home-files", self.home_files), ("consoles", self.consoles), ("app-grants", self.app_grants), ("open-attachments", self.open_attachments), ("workspaces", self.workspaces), ("bluetooth-control", self.bluetooth_control), ("status-item", self.status_item), ("printers-configure", self.printers_configure),
@@ -756,6 +769,9 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         network_wifi: ovr.network_wifi.or(base.network_wifi),
         wifi_nearby: ovr.wifi_nearby.or(base.wifi_nearby),
         network_configure: ovr.network_configure.or(base.network_configure),
+        vpn_read: ovr.vpn_read.or(base.vpn_read),
+        vpn_use: ovr.vpn_use.or(base.vpn_use),
+        vpn_configure: ovr.vpn_configure.or(base.vpn_configure),
         navigator_page:   ovr.navigator_page.or(base.navigator_page),
         navigator_broker: ovr.navigator_broker.or(base.navigator_broker),
         notification_shelf: ovr.notification_shelf.or(base.notification_shelf),

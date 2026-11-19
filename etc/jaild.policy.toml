@@ -545,6 +545,8 @@ allowed_system_uids = [
     # 65049 = _atrium-mdns     (atrium-net's .local answerer, same, §6.1)
     # 65052 = _crypta-key      (cryptad's Arca key helper: setuid by cryptad
     #                           itself, no jail; vpn.md "V1 as built")
+    # 65054 = _crypta-ctl      (cryptad's settings front, atrium-crypta-ctl:
+    #                           setuid + Capsicum by itself, no jail; vpn.md §7.2)
 ]
 
 [gid]

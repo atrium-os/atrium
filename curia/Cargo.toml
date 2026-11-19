@@ -26,6 +26,7 @@ lyra-protocol = { path = "../lyra-protocol" }
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 vinculum-control = { path = "../vinculum/vinculum-control" }
 prelum-proto = { path = "../prelum/prelum-proto" }
+crypta-ctl = { path = "../crypta/crypta-ctl" }
 
 [dev-dependencies]
 fresco-scene-server = { path = "../fresco-scene-server" }

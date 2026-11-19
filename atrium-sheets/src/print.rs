@@ -25,6 +25,9 @@ pub struct Snapshot {
     pub merges: Vec<[u32; 4]>,
     /// Center Across Selection runs, `[row, c0, c1]` inclusive.
     pub across: Vec<[u32; 3]>,
+    /// The frozen rows and columns (`a..b`), repeated on every page.
+    pub title_rows: (u32, u32),
+    pub title_cols: (u32, u32),
 }
 
 fn srgb(c: Color) -> u32 {
@@ -58,7 +61,7 @@ pub fn cell_of(v: CellView) -> Cell {
 /// The current sheet from A1 to its last shown cell; Err when it is more
 /// than a print can take.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
-    let (rows, cols, name, col_px, row_px) = {
+    let (rows, cols, name, col_px, row_px, from, to) = {
         let d = doc.borrow();
         let (mut r, mut c) = d.wb.extent(d.sheet);
         // A merged area that starts in the used range counts in full.
@@ -71,7 +74,7 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
         let col_px: Vec<f64> = (0..c).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect();
         let row_px: Vec<f64> = (0..r).map(|i| rs.offset(i + 1) - rs.offset(i)).collect();
-        (r, c, sh.name.clone(), col_px, row_px)
+        (r, c, sh.name.clone(), col_px, row_px, sh.freeze_from, sh.freeze)
     };
     if rows as u64 * cols as u64 > MAX_CELLS {
         return Err(format!("the sheet has more than {MAX_CELLS} cells to print"));
@@ -123,14 +126,14 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across })
+    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across, title_rows: (from.0, to.0.min(last_r)), title_cols: (from.1, to.1.min(last_c)) })
 }
 
 /// The snapshot as PDF on paper `w` × `h` points.
 pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String> {
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
-    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone() };
+    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone(), title_rows: s.title_rows, title_cols: s.title_cols };
     officina_pdf::sheet::print(&sheet, &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
@@ -191,6 +194,21 @@ mod tests {
         let s = snapshot(&doc).unwrap();
         assert_eq!(s.across, vec![[0, 0, 3]]);
         assert!(pdf(&s, 595.0, 842.0, "Q3").unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn frozen_rows_are_the_print_titles() {
+        let doc = Rc::new(RefCell::new(Doc::new("Q3")));
+        {
+            let mut d = doc.borrow_mut();
+            for r in 0..5 {
+                d.type_into(r, 0, "x");
+            }
+            d.type_into(0, 1, "y");
+            d.run("Freeze Panes", vec![officina_grid::ops::GridOp::Freeze { sheet: 0, rows: 2, cols: 1, from: (0, 0) }]);
+        }
+        let s = snapshot(&doc).unwrap();
+        assert_eq!((s.title_rows, s.title_cols), ((0, 2), (0, 1)));
     }
 
     #[test]

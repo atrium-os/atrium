@@ -69,6 +69,11 @@ pub struct Sheet<'a> {
     /// Center Across Selection runs, `[row, c0, c1]` inclusive: the text
     /// of the cell at `c0` centred across them all, no lines inside.
     pub across: Vec<[u32; 3]>,
+    /// Print titles: rows `a..b` repeated at the top of every page that
+    /// starts below them, columns `a..b` at the left of every page that
+    /// starts right of them (a sheet's frozen panes). Empty: none.
+    pub title_rows: (u32, u32),
+    pub title_cols: (u32, u32),
 }
 
 /// The paper, in points, and its margins.
@@ -105,6 +110,32 @@ fn bands(sizes: &[f64], room: f64) -> Vec<(usize, usize)> {
     if start < sizes.len() {
         out.push((start, sizes.len()));
     }
+    out
+}
+
+/// [`bands`], with `title` taken off the room of each run that starts at
+/// or after `from` (where print titles are repeated).
+fn bands_after(sizes: &[f64], room: f64, from: usize, title: f64) -> Vec<(usize, usize)> {
+    if title <= 0.0 || from == 0 || from >= sizes.len() {
+        return bands(sizes, room);
+    }
+    let mut out = bands(&sizes[..from], room);
+    // The run holding the titles may have room left for rows after them.
+    let (mut start, mut used) = match out.pop() {
+        Some((a, b)) => (a, sizes[a..b].iter().sum::<f64>()),
+        None => (0, 0.0),
+    };
+    let mut room_now = room;
+    for (i, &s) in sizes.iter().enumerate().skip(from) {
+        if used + s > room_now + 0.01 && i > start {
+            out.push((start, i));
+            start = i;
+            used = 0.0;
+            room_now = room - title;
+        }
+        used += s;
+    }
+    out.push((start, sizes.len()));
     out
 }
 
@@ -205,8 +236,16 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
     let k = if setup.fit_width && total_w > room_w { (room_w / total_w).max(1.0 / 3.0) } else { 1.0 } * PT_PER_PX;
     let cols: Vec<f64> = sheet.cols.iter().map(|w| w.max(0.0) * k).collect();
     let rows: Vec<f64> = sheet.rows.iter().map(|h| h.max(0.0) * k).collect();
-    let across = bands(&cols, room_w);
-    let down = bands(&rows, room_h);
+    // Print titles, unless they would take more than half the page.
+    let titles = |(a, b): (u32, u32), sizes: &[f64], room: f64| {
+        let (a, b) = ((a as usize).min(sizes.len()), (b as usize).min(sizes.len()));
+        let size: f64 = sizes[a..b.max(a)].iter().sum();
+        if b > a && size > 0.0 && size <= room / 2.0 { ((a, b), size) } else { ((0, 0), 0.0) }
+    };
+    let (tr_, tr_h) = titles(sheet.title_rows, &rows, room_h);
+    let (tc_, tc_w) = titles(sheet.title_cols, &cols, room_w);
+    let across = bands_after(&cols, room_w, tc_.1, tc_w);
+    let down = bands_after(&rows, room_h, tr_.1, tr_h);
     let shaper = Shaper::new(fonts, TEXT_PX * k);
     let lu = |v: f64| (v * LU as f64).round() as i64;
     let total = (across.len() * down.len()).max(1);
@@ -255,89 +294,107 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
             items.push(Item::Rect { x: lu(bx), y: lu(by), w: lu(bwid), h: lu(bh), color: col });
         }
     };
-    // Down, then across.
+    // Rows r0..r1 by columns c0..c1 drawn from (ox, oy): cells, merged
+    // areas cut to the block, Center Across runs.
+    let block = |items: &mut Vec<Item>, lines: &mut Vec<(f64, f64, f64, f64)>, (r0, r1): (usize, usize), (c0, c1): (usize, usize), ox: f64, oy: f64| {
+        // Where each column and row starts in this block.
+        let mut xs = vec![ox; c1 - c0 + 1];
+        for c in c0..c1 {
+            xs[c - c0 + 1] = xs[c - c0] + cols[c].max(0.0);
+        }
+        let mut ys = vec![oy; r1 - r0 + 1];
+        for r in r0..r1 {
+            ys[r - r0 + 1] = ys[r - r0] + rows[r].max(0.0);
+        }
+        // The merged areas on this page, cut to it.
+        let pieces: Vec<([u32; 4], [usize; 4])> = sheet
+            .merges
+            .iter()
+            .filter(|a| (a[0] as usize) < r1 && a[2] as usize >= r0 && (a[1] as usize) < c1 && a[3] as usize >= c0)
+            .map(|a| (*a, [(a[0] as usize).max(r0), (a[1] as usize).max(c0), (a[2] as usize).min(r1 - 1), (a[3] as usize).min(c1 - 1)]))
+            .collect();
+        let merged = |r: usize, c: usize| pieces.iter().any(|(_, p)| (p[0]..=p[2]).contains(&r) && (p[1]..=p[3]).contains(&c));
+        // Center Across runs on this page, cut to it.
+        let runs: Vec<([u32; 3], usize, usize)> = sheet
+            .across
+            .iter()
+            .filter(|a| (r0..r1).contains(&(a[0] as usize)) && (a[1] as usize) < c1 && a[2] as usize >= c0 && a[2] > a[1])
+            .map(|a| (*a, (a[1] as usize).max(c0), (a[2] as usize).min(c1 - 1)))
+            .collect();
+        let in_run = |r: usize, c: usize| runs.iter().any(|(a, p0, p1)| a[0] as usize == r && (*p0..=*p1).contains(&c));
+        for r in r0..r1 {
+            let (y, ch) = (ys[r - r0], rows[r]);
+            if ch <= 0.0 {
+                continue;
+            }
+            for c in c0..c1 {
+                let (x, cw) = (xs[c - c0], cols[c]);
+                if cw <= 0.0 || merged(r, c) {
+                    continue;
+                }
+                let run = in_run(r, c);
+                if sheet.gridlines && !run {
+                    lines.push((x, y, cw, ch));
+                }
+                if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
+                    draw(items, &cell, x, y, cw, ch, !run);
+                }
+            }
+        }
+        for (a, p) in &pieces {
+            let (x, y) = (xs[p[1] - c0], ys[p[0] - r0]);
+            let (cw, ch) = (xs[p[3] + 1 - c0] - x, ys[p[2] + 1 - r0] - y);
+            if cw <= 0.0 || ch <= 0.0 {
+                continue;
+            }
+            if sheet.gridlines {
+                lines.push((x, y, cw, ch));
+            }
+            if let Some(cell) = (sheet.cell)(a[0], a[1]) {
+                // The text goes on the page with the area's first cell.
+                let first = p[0] == a[0] as usize && p[1] == a[1] as usize;
+                draw(items, &cell, x, y, cw, ch, first);
+            }
+        }
+        for (a, p0, p1) in &runs {
+            let r = a[0] as usize;
+            let (x, y) = (xs[p0 - c0], ys[r - r0]);
+            let (cw, ch) = (xs[p1 + 1 - c0] - x, rows[r]);
+            if cw <= 0.0 || ch <= 0.0 {
+                continue;
+            }
+            if sheet.gridlines {
+                lines.push((x, y, cw, ch));
+            }
+            // The text on the page with the run's first cell, centred
+            // across the part of the run on it.
+            if *p0 == a[1] as usize {
+                if let Some(cell) = (sheet.cell)(a[0], a[1]) {
+                    words(items, &Cell { align: Align::Center, indent: 0, ..cell }, x, y, cw, ch);
+                }
+            }
+        }
+    };
+    // Down, then across; the print titles (frozen rows and columns) on
+    // every page that doesn't already start with them.
     for &(c0, c1) in &across {
         for &(r0, r1) in &down {
             let mut page = Page::default();
             let mut items = Vec::new();
             let mut lines = Vec::new();
-            // Where each column and row starts on this page.
-            let mut xs = vec![m; c1 - c0 + 1];
-            for c in c0..c1 {
-                xs[c - c0 + 1] = xs[c - c0] + cols[c].max(0.0);
+            let tr = if r0 >= tr_.1 && tr_.1 > tr_.0 { Some(tr_) } else { None };
+            let tc = if c0 >= tc_.1 && tc_.1 > tc_.0 { Some(tc_) } else { None };
+            let (dx, dy) = (tc.map_or(0.0, |_| tc_w), tr.map_or(0.0, |_| tr_h));
+            if let (Some(tr), Some(tc)) = (tr, tc) {
+                block(&mut items, &mut lines, tr, tc, m, m);
             }
-            let mut ys = vec![m; r1 - r0 + 1];
-            for r in r0..r1 {
-                ys[r - r0 + 1] = ys[r - r0] + rows[r].max(0.0);
+            if let Some(tr) = tr {
+                block(&mut items, &mut lines, tr, (c0, c1), m + dx, m);
             }
-            // The merged areas on this page, cut to it.
-            let pieces: Vec<([u32; 4], [usize; 4])> = sheet
-                .merges
-                .iter()
-                .filter(|a| (a[0] as usize) < r1 && a[2] as usize >= r0 && (a[1] as usize) < c1 && a[3] as usize >= c0)
-                .map(|a| (*a, [(a[0] as usize).max(r0), (a[1] as usize).max(c0), (a[2] as usize).min(r1 - 1), (a[3] as usize).min(c1 - 1)]))
-                .collect();
-            let merged = |r: usize, c: usize| pieces.iter().any(|(_, p)| (p[0]..=p[2]).contains(&r) && (p[1]..=p[3]).contains(&c));
-            // Center Across runs on this page, cut to it.
-            let runs: Vec<([u32; 3], usize, usize)> = sheet
-                .across
-                .iter()
-                .filter(|a| (r0..r1).contains(&(a[0] as usize)) && (a[1] as usize) < c1 && a[2] as usize >= c0 && a[2] > a[1])
-                .map(|a| (*a, (a[1] as usize).max(c0), (a[2] as usize).min(c1 - 1)))
-                .collect();
-            let in_run = |r: usize, c: usize| runs.iter().any(|(a, p0, p1)| a[0] as usize == r && (*p0..=*p1).contains(&c));
-            for r in r0..r1 {
-                let (y, ch) = (ys[r - r0], rows[r]);
-                if ch <= 0.0 {
-                    continue;
-                }
-                for c in c0..c1 {
-                    let (x, cw) = (xs[c - c0], cols[c]);
-                    if cw <= 0.0 || merged(r, c) {
-                        continue;
-                    }
-                    let run = in_run(r, c);
-                    if sheet.gridlines && !run {
-                        lines.push((x, y, cw, ch));
-                    }
-                    if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
-                        draw(&mut items, &cell, x, y, cw, ch, !run);
-                    }
-                }
+            if let Some(tc) = tc {
+                block(&mut items, &mut lines, (r0, r1), tc, m, m + dy);
             }
-            for (a, p) in &pieces {
-                let (x, y) = (xs[p[1] - c0], ys[p[0] - r0]);
-                let (cw, ch) = (xs[p[3] + 1 - c0] - x, ys[p[2] + 1 - r0] - y);
-                if cw <= 0.0 || ch <= 0.0 {
-                    continue;
-                }
-                if sheet.gridlines {
-                    lines.push((x, y, cw, ch));
-                }
-                if let Some(cell) = (sheet.cell)(a[0], a[1]) {
-                    // The text goes on the page with the area's first cell.
-                    let first = p[0] == a[0] as usize && p[1] == a[1] as usize;
-                    draw(&mut items, &cell, x, y, cw, ch, first);
-                }
-            }
-            for (a, p0, p1) in &runs {
-                let r = a[0] as usize;
-                let (x, y) = (xs[p0 - c0], ys[r - r0]);
-                let (cw, ch) = (xs[p1 + 1 - c0] - x, rows[r]);
-                if cw <= 0.0 || ch <= 0.0 {
-                    continue;
-                }
-                if sheet.gridlines {
-                    lines.push((x, y, cw, ch));
-                }
-                // The text on the page with the run's first cell, centred
-                // across the part of the run on it.
-                if *p0 == a[1] as usize {
-                    if let Some(cell) = (sheet.cell)(a[0], a[1]) {
-                        words(&mut items, &Cell { align: Align::Center, indent: 0, ..cell }, x, y, cw, ch);
-                    }
-                }
-            }
+            block(&mut items, &mut lines, (r0, r1), (c0, c1), m + dx, m + dy);
             // Gridlines first, so fills and borders cover them.
             if !lines.is_empty() {
                 use folium_content::ops::Op;

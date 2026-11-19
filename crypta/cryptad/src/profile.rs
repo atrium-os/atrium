@@ -112,6 +112,48 @@ impl Profile {
         })
     }
 
+    /// From a `create` request (vpn.md §7.3, "generate a key"): what the
+    /// server's admin gave, with a key Arca makes; `key` and `public` are
+    /// filled in once it has. Checked as an imported file is.
+    pub fn from_create(l: &Line) -> Result<Profile, &'static str> {
+        let name = l.get("name").filter(|n| valid_name(n)).ok_or("bad-name")?.to_string();
+        let peer = l.get("peer").and_then(crypta_proto::b64::key).ok_or("bad-peer")?;
+        let endpoint: SocketAddrV4 = l.get("endpoint").and_then(|e| e.parse().ok()).ok_or("bad-endpoint")?;
+        let addrs: Option<Vec<Prefix4>> = list(l, "addrs")
+            .map(|a| {
+                let (ip, len) = a.split_once('/').unwrap_or((a, "32"));
+                Some(Prefix4 { addr: ip.parse().ok()?, len: len.parse().ok().filter(|l| *l <= 32)? })
+            })
+            .collect();
+        let addrs = addrs.filter(|a| !a.is_empty() && a.len() <= 8).ok_or(Unusable::NoV4Address.word())?;
+        let allowed: Option<Vec<Prefix4>> = list(l, "allowed").map(Prefix4::parse).collect();
+        let allowed = allowed.filter(|a| !a.is_empty()).ok_or(Unusable::NoV4Routes.word())?;
+        let dns: Option<Vec<Ipv4Addr>> = list(l, "dns").map(|a| a.parse().ok()).collect();
+        let dns = dns.filter(|d| d.len() <= 3).ok_or("bad-dns")?;
+        let keepalive = match l.get("keepalive") {
+            None => None,
+            Some(k) => Some(k.parse::<u16>().ok().filter(|k| (1..=3600).contains(k)).ok_or("bad-keepalive")?),
+        };
+        let full = allowed.iter().any(|p| p.len == 0);
+        Ok(Profile {
+            name,
+            key: [0; 16],
+            public: [0; 32],
+            psk: None,
+            peer,
+            endpoint,
+            keepalive,
+            addrs,
+            allowed,
+            dns,
+            domains: Vec::new(),
+            mtu: None,
+            block: full,
+            insecure: false,
+            scoped: false,
+        })
+    }
+
     pub fn full(&self) -> bool {
         self.allowed.iter().any(|p| p.len == 0)
     }
@@ -266,6 +308,24 @@ mod tests {
         assert_eq!((t.gateway, t.port), ("198.51.100.51".parse().unwrap(), 51820));
         let host = net_proto::HostView { others: vec![("10.88.0.50".parse().unwrap(), 24)] };
         assert_eq!(net_proto::tunnel::check_tunnel(&mut t, &host), Ok(()));
+    }
+
+    #[test]
+    fn a_created_profile() {
+        let l = Line::parse("create name=acme peer=xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg= endpoint=198.51.100.51:51820 addrs=10.99.0.2/24 allowed=0.0.0.0/0 dns=10.99.0.1 keepalive=25").unwrap();
+        let p = Profile::from_create(&l).unwrap();
+        assert!(p.full() && p.block && !p.scoped);
+        assert_eq!(p.addrs, vec![Prefix4 { addr: "10.99.0.2".parse().unwrap(), len: 24 }]);
+        assert_eq!((p.keepalive, p.dns.len()), (Some(25), 1));
+        let split = Line::parse("create name=w peer=xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg= endpoint=198.51.100.51:51820 addrs=10.99.0.2 allowed=10.99.0.0/24,10.100.0.0/16").unwrap();
+        let p = Profile::from_create(&split).unwrap();
+        assert!(!p.block && p.allowed.len() == 2 && p.addrs[0].len == 32);
+        for (bad, why) in [("peer=short", "bad-peer"), ("addrs=", "no-v4-address"), ("allowed=10.0.0.0/33", "no-v4-routes"), ("keepalive=0", "bad-keepalive"), ("endpoint=x", "bad-endpoint")] {
+            let (k, _) = bad.split_once('=').unwrap();
+            let text = l.fields.iter().filter(|(kk, _)| kk != k).map(|(k, v)| format!(" {k}={v}")).collect::<String>();
+            let b = Line::parse(&format!("create{text} {bad}")).unwrap();
+            assert_eq!(Profile::from_create(&b), Err(why), "{bad}");
+        }
     }
 
     #[test]

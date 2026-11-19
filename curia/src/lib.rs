@@ -9,3 +9,4 @@ pub mod network;
 pub mod printers;
 pub mod sound;
 pub mod view;
+pub mod vpn;

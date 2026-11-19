@@ -5,7 +5,7 @@ id          = "org.atrium.curia"
 name        = "Settings"
 version     = "0.1.0"
 entry       = "bin/curia"
-description = "Settings: network and Wi-Fi, Bluetooth, display, sound, devices, apps."
+description = "Settings: network and Wi-Fi, Bluetooth, display, sound, devices, apps, printers, VPN."
 icon        = "settings"
 
 [capabilities]
@@ -21,9 +21,12 @@ audio-control     = true   # the volume, apps' levels, outputs (restricted: Foru
 app-grants        = true   # what each app may do; allow, remove (restricted: Curia only)
 bluetooth-control = true   # pair, connect, forget Bluetooth devices (restricted: Curia, Forum bar)
 printers-configure = true  # add, share, remove printers; print history (restricted: Curia only)
+vpn-read          = true   # which tunnels there are and whether each is up
+vpn-use           = true   # connect and disconnect them
+vpn-configure     = true   # add, import, change, remove tunnels (restricted: Curia only)
 network           = "none"
 # Limen roles it embeds. Without this key a platform bundle keeps every role.
-embeds = ["credential"]
+embeds = ["credential", "picker"]
 
 [supervision]
 restart   = "on-crash"
