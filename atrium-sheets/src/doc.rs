@@ -68,6 +68,15 @@ fn lock(dir: &Path) -> io::Result<File> {
     Ok(f)
 }
 
+/// How a fill is done again (Excel's Auto Fill Options).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillHow {
+    Copy,
+    Series,
+    FormatsOnly,
+    NoFormats,
+}
+
 /// The most cells one Ctrl+Enter fills.
 pub const MAX_TYPE_ALL: u64 = officina_grid::clip::MAX_TILES;
 
@@ -439,6 +448,12 @@ pub struct Doc {
     /// Rows grown to fit typed lines, by (sheet, row): they shrink back when
     /// their text needs less (for this session; a row sized by hand leaves).
     pub grown_rows: std::collections::HashSet<(u16, u32)>,
+    /// Records journaled so far: a change since a moment shows as a
+    /// different count.
+    pub edits: u64,
+    /// The last fill (from, to, how) and the count just after it: while
+    /// nothing else has changed, it can be done again another way.
+    pub last_fill: Option<(Rect, Rect, officina_grid::autofill::Mode, u64)>,
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
@@ -496,7 +511,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, hidden_widths: Default::default(), grown_rows: Default::default() }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None, hidden_widths: Default::default(), grown_rows: Default::default(), edits: 0, last_fill: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -543,6 +558,7 @@ impl Doc {
     }
 
     fn journal(&mut self, r: &Record) {
+        self.edits += 1;
         if let Some(a) = &mut self.autosave {
             if let Err(e) = a.append(r) {
                 self.status = format!("Autosave failed: {e}");
@@ -785,10 +801,12 @@ impl Doc {
             Ok(GridOp::Batch(ops)) => {
                 self.status.clear();
                 self.run(if mode == Mode::Series { "Fill Series" } else { "Fill" }, ops);
+                self.last_fill = Some((from, to, mode, self.edits));
                 true
             }
             Ok(op) => {
                 self.run("Fill", vec![op]);
+                self.last_fill = Some((from, to, mode, self.edits));
                 true
             }
             Err(e) => {
@@ -796,6 +814,54 @@ impl Doc {
                 false
             }
         }
+    }
+
+    /// Whether the last change is a fill that [`refill`](Self::refill) can
+    /// do again another way.
+    pub fn can_refill(&self) -> bool {
+        self.last_fill.is_some_and(|f| f.3 == self.edits && f.0.sheet == self.sheet)
+    }
+
+    /// The last fill done again as `how` (Excel's Auto Fill Options): one
+    /// undo step in its place.
+    pub fn refill(&mut self, how: FillHow) -> bool {
+        use officina_grid::autofill::{fill, Mode};
+        let Some((from, to, mode, _)) = self.last_fill.filter(|_| self.can_refill()) else {
+            self.status = "Fill first; then choose how it fills.".into();
+            return false;
+        };
+        let mode = match how {
+            FillHow::Copy => Mode::Copy,
+            FillHow::Series => Mode::Count,
+            FillHow::FormatsOnly | FillHow::NoFormats => mode,
+        };
+        self.undo();
+        let ops = match fill(&self.wb, from, to, mode) {
+            Ok(GridOp::Batch(ops)) => ops,
+            Ok(op) => vec![op],
+            Err(e) => {
+                self.status = e;
+                return false;
+            }
+        };
+        // The fill is a Replace (contents) then a Restyle (formats).
+        let ops: Vec<GridOp> = ops
+            .into_iter()
+            .filter(|o| match how {
+                FillHow::FormatsOnly => matches!(o, GridOp::Restyle(_)),
+                FillHow::NoFormats => !matches!(o, GridOp::Restyle(_)),
+                _ => true,
+            })
+            .collect();
+        let label = match how {
+            FillHow::Copy => "Fill",
+            FillHow::Series => "Fill Series",
+            FillHow::FormatsOnly => "Fill Formats",
+            FillHow::NoFormats => "Fill Without Formats",
+        };
+        self.run(label, ops);
+        self.last_fill = Some((from, to, mode, self.edits));
+        true
     }
 
     /// Keeps `rect` of this sheet as the clip, with `text` (what went on
@@ -1123,6 +1189,37 @@ mod tests {
         assert_eq!(shown(&d, 1, 0), "Week 1");
         assert!(!d.fill(r(0, 0, 0, 0), r(0, 1, 2, 1), true));
         assert!(!d.status.is_empty());
+    }
+
+    #[test]
+    fn a_fill_can_be_done_again_another_way() {
+        let mut d = Doc::new("fill");
+        d.type_into(0, 0, "1");
+        let bold = officina_grid::ops::GridOp::restyle(&d.wb, Rect { sheet: 0, r0: 0, c0: 0, r1: 0, c1: 0 }, |st| officina_grid::style::Style { h_align: officina_grid::style::HAlign::Right, ..st.clone() });
+        d.run("Format", vec![bold]);
+        d.type_into(3, 0, "x");
+        let r = |r0, c0, r1, c1| Rect { sheet: 0, r0, c0, r1, c1 };
+        let shown = |d: &Doc, row| d.wb.formatted(CellAddr::new(0, row, 0)).text;
+        let right = |d: &Doc, row| d.wb.style(CellAddr::new(0, row, 0)).h_align == officina_grid::style::HAlign::Right;
+        assert!(!d.can_refill());
+        // The handle copies one number; as a series it counts.
+        assert!(d.fill_as(r(0, 0, 0, 0), r(0, 0, 2, 0), officina_grid::autofill::Mode::Series));
+        assert_eq!(shown(&d, 2), "1");
+        assert!(d.can_refill());
+        assert!(d.refill(FillHow::Series));
+        assert_eq!(shown(&d, 2), "3");
+        // Without formats: the values, cells keep theirs.
+        assert!(d.refill(FillHow::NoFormats));
+        assert_eq!((shown(&d, 2), right(&d, 2)), ("3".to_string(), false));
+        // Formats only: the cells keep what they hold.
+        assert!(d.refill(FillHow::FormatsOnly));
+        assert_eq!((shown(&d, 2), right(&d, 2)), (String::new(), true));
+        // One undo takes the whole fill back.
+        assert!(d.undo());
+        assert_eq!((shown(&d, 2), right(&d, 2)), (String::new(), false));
+        // After another change, nothing to refill.
+        d.type_into(5, 5, "y");
+        assert!(!d.can_refill() && !d.refill(FillHow::Copy));
     }
 
     #[test]

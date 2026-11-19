@@ -458,6 +458,10 @@ pub struct GridState {
     /// When the editor was last pressed: a second press soon after is a
     /// double-click (selects the word).
     text_press: Option<std::time::Instant>,
+    /// The editor was started by typing (Excel's Enter mode): arrow keys
+    /// finish the entry and move. Otherwise (F2, Enter, a press in the
+    /// editor) they move the caret.
+    entering: bool,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -951,6 +955,8 @@ impl GridView {
                     let i = editor_index(&*src, &g, cx, cy).unwrap_or(0);
                     let now = std::time::Instant::now();
                     let double = g.text_press.is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK);
+                    // A press in the editor: editing in place from now on.
+                    g.entering = false;
                     g.text_press = Some(now);
                     if let Some(ed) = g.edit.as_mut() {
                         if double {
@@ -2067,6 +2073,32 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                 }
                 return true;
             }
+            // Ctrl+' : the formula of the cell above, as it is written;
+            // Ctrl+Shift+' : its value as shown.
+            Key::Char if (m.ctrl || m.meta) && (chars == "'" || chars == "\"") => {
+                if g.cursor.0 > 0 {
+                    let (r, c) = (g.cursor.0 - 1, g.cursor.1);
+                    let t = if m.shift || chars == "\"" { src.cell(r, c).map(|v| v.text).unwrap_or_default() } else { src.edit_text(r, c) };
+                    ed.insert(&t);
+                }
+                return true;
+            }
+            // F2 switches between entering (arrows move on) and editing.
+            Key::F(2) => {
+                g.entering = !g.entering;
+                return true;
+            }
+            // Entering: an arrow finishes and moves that way.
+            Key::Up | Key::Down | Key::Left | Key::Right if g.entering && !m.shift => {
+                let (dr, dc) = match key {
+                    Key::Up => (-1, 0),
+                    Key::Down => (1, 0),
+                    Key::Left => (0, -1),
+                    _ => (0, 1),
+                };
+                finish(g, st, dr, dc);
+                return true;
+            }
             // Up and Down move between the editor's lines, at about the
             // same place across; past the first or last they end it.
             Key::Up | Key::Down if !m.shift && ed.text().contains('\n') => {
@@ -2140,15 +2172,27 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             reveal(src, geom, st, to);
             return true;
         }
-        Key::Enter => {
+        Key::Enter | Key::F(2) => {
             let mut ed = TextEdit::new(&src.edit_text(g.cursor.0, g.cursor.1));
             ed.set_caret(ed.text().len(), false);
             g.anchor = g.cursor;
             g.edit = Some(ed);
+            g.entering = false;
             return true;
         }
         Key::Delete | Key::Backspace => {
             send(GridAction::Clear(g.selection()));
+            return true;
+        }
+        // Ctrl+' (Ctrl+Shift+'): start editing with the formula (value) above.
+        Key::Char if cmd && (chars == "'" || chars == "\"") && g.cursor.0 > 0 => {
+            let (r, c) = (g.cursor.0 - 1, g.cursor.1);
+            let t = if m.shift || chars == "\"" { src.cell(r, c).map(|v| v.text).unwrap_or_default() } else { src.edit_text(r, c) };
+            let mut ed = TextEdit::new("");
+            ed.insert(&t);
+            g.edit = Some(ed);
+            g.entering = false;
+            reveal(src, geom, st, g.cursor);
             return true;
         }
         // Ctrl+; (Ctrl+Shift+;): start editing with today's date (the time).
@@ -2157,6 +2201,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             let mut ed = TextEdit::new("");
             ed.insert(&t);
             g.edit = Some(ed);
+            g.entering = true;
             reveal(src, geom, st, g.cursor);
             return true;
         }
@@ -2197,6 +2242,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             let mut ed = TextEdit::new("");
             ed.insert(chars);
             g.edit = Some(ed);
+            g.entering = true;
             reveal(src, geom, st, g.cursor);
             return true;
         }
@@ -3037,6 +3083,44 @@ mod tests {
         // Ctrl+; with no date to give does nothing.
         key(&mut app, Key::Char, ";", Modifiers { ctrl: true, ..Default::default() });
         assert!(state.get_cloned().edit.is_none());
+    }
+
+    #[test]
+    fn arrows_finish_a_typed_entry_and_f2_edits_in_place() {
+        let (mut app, grid, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let b2 = Point::new(hw + 64.0 + 10.0, HEADER_H + 25.0);
+        app.handle_event(Event::PointerDown { at: b2 });
+        app.handle_event(Event::PointerUp { at: b2 });
+        app.tick();
+        let none = Modifiers::default();
+        // Typed, then Right: committed, one cell right.
+        key(&mut app, Key::Char, "ab", none);
+        key(&mut app, Key::Right, "", none);
+        assert_eq!(log.borrow().last(), Some(&GridAction::Commit { row: 1, col: 1, text: "ab".into() }));
+        assert_eq!(state.get_cloned().cursor, (1, 2));
+        // Typed, F2, Left: the caret moves instead.
+        key(&mut app, Key::Char, "cd", none);
+        key(&mut app, Key::F(2), "", none);
+        key(&mut app, Key::Left, "", none);
+        let g = state.get_cloned();
+        assert_eq!((g.cursor, g.edit.as_ref().map(|e| e.caret())), ((1, 2), Some(1)));
+        key(&mut app, Key::Escape, "", none);
+        // F2 on a cell: its text, editing in place.
+        grid.cells.borrow_mut().insert((1, 2), "=A1".into());
+        key(&mut app, Key::F(2), "", none);
+        key(&mut app, Key::Left, "", none);
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| (e.text().to_string(), e.caret())), Some(("=A1".into(), 2)));
+        key(&mut app, Key::Escape, "", none);
+        // Ctrl+' below it: the formula above as written; Ctrl+Shift+': its text.
+        key(&mut app, Key::Down, "", none);
+        key(&mut app, Key::Char, "'", Modifiers { ctrl: true, ..Default::default() });
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.text().to_string()), Some("=A1".into()));
+        key(&mut app, Key::Escape, "", none);
+        grid.cells.borrow_mut().insert((1, 2), "seen".into());
+        key(&mut app, Key::Char, "\"", Modifiers { ctrl: true, shift: true, ..Default::default() });
+        assert_eq!(state.get_cloned().edit.as_ref().map(|e| e.text().to_string()), Some("seen".into()));
     }
 
     #[test]

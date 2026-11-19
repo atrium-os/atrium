@@ -3753,8 +3753,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Grid** (pergola): a source that says `fills()` gets a small square at the selection's bottom-right corner. Dragging it rings the area it reaches, down, up, right or left, whichever way the pointer is farther out. Letting go sends `GridAction::Fill { from, to, copy: false, flip }`, `flip` when Ctrl is held as it is let go, and selects the filled area. Ctrl+D and Ctrl+R send `copy: true`: the selection's first row (or column) into the rest, or with one row chosen, the row above.
 - **Sheets:** `Doc::fill`, undone as one step ("Fill Series" or "Fill").
 - **Double-click on the handle** (2026-11-19) fills the selection down as far as the data beside it goes: the column left of it, or else the one right of it, to the end of its unbroken run, stopping above anything already in the selection's first column (`autofill::to_data_end`, reading the column a growing window at a time). The filled area is selected. pergola reports `GridAction::FillToData`; two presses on the handle within 450 ms are a double-click, and a press that hardly moves fills nothing.
-- **Not yet:** the Auto Fill Options button after a drag, custom lists, and Flash Fill.
-- **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
+- **Fill choices** (2026-11-19, Data menu, while the last change is a fill): Fill: Copy Cells, Fill: Series (one number counts by one, `Mode::Count`), Fill: Formats Only, Fill: Without Formatting do the fill again that way, in its place as one undo step (`Doc::refill`, `Doc.last_fill` checked against `Doc.edits`).
+- **Not yet:** a button by the filled area offering those choices (they are in the Data menu), custom lists, and Flash Fill.
+- **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`, which checks `Mode::Count` too); atrium-sheets `a_fill_can_be_done_again_another_way`; pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ### 16.88 Copy, cut and paste within Sheets (2026-11-19)
 
@@ -3826,8 +3827,10 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Ctrl+Enter** in the editor enters what is typed in every selected cell, as one undo step: formulas move as a copy moves them (`=A1+1` typed over B3:C5 reads `=B3+1` in C5), formats stay. Typing no longer collapses the selection to the active cell, so the selection is still there for it. At most 10,000 cells (`Doc::type_all`, `GridAction::CommitAll`).
 - **Ctrl+;** and **Ctrl+Shift+;** put today's date or the time now (local) into the editor, starting it when needed; they become a date or time as above (`GridSource::now_text`).
 - **Size bar:** 0 now hides, as it said: rows through Hide Rows, columns by width 0. Before, it set 1 px.
-- **Not yet:** other date orders (`19/11/2026`, `Nov 19`), which need the persona's locale, and F2 to edit a cell in place with the arrows moving the caret.
-- **Gates:** pergola `ctrl_enter_enters_the_text_in_every_selected_cell`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Up and Down); atrium-sheets `typed_dates_and_times_become_them`, `ctrl_semicolon_gives_today_and_the_time_as_typed`, `rows_nobody_sized_grow_for_typed_lines` (shrinking), `the_size_bar_sets_exact_heights_and_widths` (0 hides).
+- **Entering and editing** (2026-11-19): an editor started by typing (or Ctrl+;) is entering, as Excel's Enter mode: an arrow key finishes the entry and moves that way. One started by F2 or Enter, or pressed into, is editing: arrows move the caret. F2 in the editor switches between the two.
+- **Ctrl+'** puts the formula of the cell above into the editor as written; **Ctrl+Shift+'** its value as shown.
+- **Not yet:** other date orders (`19/11/2026`, `Nov 19`), which need the persona's locale, and showing whether the editor is entering or editing.
+- **Gates:** pergola `ctrl_enter_enters_the_text_in_every_selected_cell`, `arrows_finish_a_typed_entry_and_f2_edits_in_place`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Up and Down); atrium-sheets `typed_dates_and_times_become_them`, `ctrl_semicolon_gives_today_and_the_time_as_typed`, `rows_nobody_sized_grow_for_typed_lines` (shrinking), `the_size_bar_sets_exact_heights_and_widths` (0 hides).
 
 ## 17. Decisions (accepted 2026-11-14)
 

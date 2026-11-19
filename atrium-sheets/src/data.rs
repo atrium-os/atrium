@@ -107,6 +107,12 @@ pub enum DataCmd {
     /// not.
     WrapText,
     /// The selection's text at the top, middle or bottom of its cells.
+    /// The fill just made, done again: copying, as a series, only its
+    /// formats, or without them.
+    FillCopy,
+    FillSeries,
+    FillFormats,
+    FillNoFormats,
     AlignTop,
     AlignMiddle,
     AlignBottom,
@@ -294,7 +300,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let circling = d.circling;
     let special = d.clip.as_ref().is_some_and(|(c, _)| !c.cut);
     let mut v = vec![
-        (MenuItem::new("Paste Values").enabled(special), Some(DataCmd::PasteValues)),
+        (MenuItem::new("Fill: Copy Cells").enabled(d.can_refill()), Some(DataCmd::FillCopy)),
+        (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
+        (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
+        (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
+        (MenuItem::new("Paste Values").enabled(special).separated(), Some(DataCmd::PasteValues)),
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
         (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
@@ -638,6 +648,16 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let to = if off { HAlign::General } else { HAlign::CenterAcross };
             d.run("Center Across Selection", vec![GridOp::restyle(&d.wb, r, |st| officina_grid::style::Style { h_align: to, ..st.clone() })]);
             Ok(if off { "Text no longer centred across the selection.".into() } else { "Text centred across the selection.".into() })
+        }
+        DataCmd::FillCopy | DataCmd::FillSeries | DataCmd::FillFormats | DataCmd::FillNoFormats => {
+            use crate::doc::FillHow;
+            let how = match cmd {
+                DataCmd::FillCopy => FillHow::Copy,
+                DataCmd::FillSeries => FillHow::Series,
+                DataCmd::FillFormats => FillHow::FormatsOnly,
+                _ => FillHow::NoFormats,
+            };
+            if d.refill(how) { Ok("Filled again.".into()) } else { Err(std::mem::take(&mut d.status)) }
         }
         DataCmd::AlignTop | DataCmd::AlignMiddle | DataCmd::AlignBottom => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
