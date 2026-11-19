@@ -860,6 +860,10 @@ another origin. An active portal-profile session stays in engine memory.
   repeated locked count waits for fresh approval and IPv4 echo resumes on
   the same TLS connection or ESP association.
   The extended arm64 case passed 34/34 on TLS and 34/34 with `--esp`.
+  The `--hip tessera-final-lock-decline` variant declines that last
+  review on the active tunnel. It checks that the locked count remains
+  unsent, the tunnel and route go down, and IPv4 echo fails. It passed
+  33/33 on arm64 TLS and 33/33 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

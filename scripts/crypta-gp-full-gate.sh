@@ -17,9 +17,11 @@ transport=${5:-}
 hip=${6:-}
 receipts=${7:-}
 decline_relock=0
+decline_final_lock=0
 case "$hip" in
     tessera-relock-decline) hip=tessera-reconnect; decline_relock=1 ;;
     tessera-relock-reconnect) hip=tessera-reconnect; decline_relock=2 ;;
+    tessera-final-lock-decline) hip=tessera-reconnect; decline_relock=2; decline_final_lock=1 ;;
 esac
 if [ -n "$transport" ]; then
     export CRYPTA_GP_TEST_ESP=4501
@@ -458,6 +460,27 @@ if [ -n "$tessera_fact" ]; then
             fail "the post-unlock rebind reported different facts"
         ok "post-unlock rebind sent the unchanged HIP report without prompting"
     }
+    decline_active_tessera_review() {
+        wait_tessera_review
+        declined_choice=$(hip_choice)
+        [ "$(field handshake)" = 1 ] || fail "the rebound tunnel was down before decline"
+        "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+        wait_field up 0
+        [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+            fail "declining $change did not stop the profile"
+        # Allow another refresh interval to catch retries or delayed uploads.
+        sleep 6
+        [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+            fail "the profile restarted after declining $change"
+        [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = "$1" ] ||
+            fail "another tunnel connected after declining $change"
+        "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $2$'; then exit 1; fi" ||
+            fail "the declined rebound tunnel retained its route"
+        "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
+            fail "IPv4 echo passed after declining $change"
+        if new_tessera_receipt; then fail "the declined count reached the gateway"; fi
+        ok "declining $change shut down the rebound tunnel without uploading the changed count"
+    }
     lock_tessera_key() {
         "$V" 'set -e
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
@@ -512,25 +535,7 @@ if [ -n "$tessera_fact" ]; then
             if [ "$decline_relock" != 0 ]; then
                 expected_count=0
                 change="Tessera domain key lock after rebind"
-                wait_tessera_review
-                declined_choice=$(hip_choice)
-                [ "$(field handshake)" = 1 ] || fail "the rebound tunnel was down before decline"
-                "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
-                wait_field up 0
-                [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
-                    fail "declining the second key lock did not stop the profile"
-                # Allow another refresh interval to catch retries or delayed uploads.
-                sleep 6
-                [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
-                    fail "the profile restarted after declining the second key lock"
-                [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = 3 ] ||
-                    fail "another tunnel connected after declining the second key lock"
-                "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $reconnect_iface$'; then exit 1; fi" ||
-                    fail "the declined rebound tunnel retained its route"
-                "$V" 'if ping -n -c 1 -t 2 -S 10.77.0.2 10.77.0.1 >/dev/null 2>&1; then exit 1; fi' ||
-                    fail "IPv4 echo passed after declining the second key lock"
-                if new_tessera_receipt; then fail "the declined locked-key count reached the gateway"; fi
-                ok "declining the second key lock shut down the rebound tunnel without uploading the changed count"
+                decline_active_tessera_review 3 "$reconnect_iface"
                 if [ "$decline_relock" = 1 ]; then
                     echo "$pass checks passed"
                     exit 0
@@ -552,6 +557,13 @@ if [ -n "$tessera_fact" ]; then
 
                 receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
                 lock_tessera_key
+                if [ "$decline_final_lock" = 1 ]; then
+                    expected_count=0
+                    change="Tessera domain key lock after the second reconnect rebind"
+                    decline_active_tessera_review 5 "$reconnect_iface"
+                    echo "$pass checks passed"
+                    exit 0
+                fi
                 approve_tessera_change 0 "Tessera domain key lock after the second reconnect rebind"
                 probe "IPv4 echo on the second rebound tunnel after approved key lock"
             else
