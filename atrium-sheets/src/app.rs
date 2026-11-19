@@ -3331,6 +3331,75 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_flags_takes_and_keeps_embedded_pictures() {
+        use crate::review::ReviewCmd;
+        use officina_grid::{charts::{Anchor, Picture}, compare::Change, native};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Drawings").unwrap();
+            wb.add_sheet("Data").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        let picture = |sheet, row, payload| {
+            // The review handles the encoded bytes without decoding the image.
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.push(payload);
+            Picture {
+                anchor: Anchor { sheet, from: (row, 1, 0.0, 0.0), to: (row + 2, 3, 0.0, 0.0) },
+                bytes: bytes.into(), link: None, crop: [0; 4], rotation: 0,
+            }
+        };
+        let removed = picture(0, 2, 1);
+        let keep_removed = picture(0, 4, 2);
+        let keep_changed = picture(0, 6, 3);
+        let changed = picture(0, 8, 4);
+        let companion = picture(0, 8, 5);
+        for p in [&removed, &keep_removed, &keep_changed, &changed, &companion] {
+            local.wb.add_picture(p.clone()).unwrap();
+        }
+        let mut replacement = picture(0, 8, 6);
+        replacement.anchor.to.2 = 12.0;
+        replacement.crop = [10_000, 0, 20_000, 0];
+        replacement.rotation = 5_400_000;
+        let addition = picture(0, 10, 7);
+        for mut p in [companion.clone(), picture(0, 6, 8), replacement.clone(), addition.clone(), picture(0, 12, 9)] {
+            p.anchor.sheet = 1;
+            incoming.wb.add_picture(p).unwrap();
+        }
+        let incoming = native::load(&native::save_to_vec(&incoming.wb)).unwrap();
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming);
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.changes.len(), 6);
+        assert!(pane.changes.iter().all(|change| matches!(change, Change::Picture(_))));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for label in ["Picture B3 removed", "Picture B9 changed", "Picture B11 added"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
+        }
+        let choose = |row, cmd| {
+            let at = sheets.review.get_cloned().changes.iter().position(|ch| ch.at() == Some((0, row, 1))).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(at));
+            sheets.review_cmd(cmd);
+        };
+        choose(4, ReviewCmd::Keep);
+        choose(6, ReviewCmd::Keep);
+        choose(12, ReviewCmd::Keep);
+        choose(2, ReviewCmd::Take);
+        assert_eq!(sheets.review.get_cloned().changes.len(), 2, "kept pictures survive an index shift");
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        assert_eq!(sheets.doc.borrow().wb.pictures(), &[keep_removed.clone(), keep_changed.clone(), replacement, companion.clone(), addition]);
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.pictures(), &[keep_removed, keep_changed, changed, companion]);
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.pictures().first(), Some(&removed));
+    }
+
+    #[test]
     fn workbook_review_flags_takes_and_keeps_tables_and_pivots() {
         use crate::review::ReviewCmd;
         use officina_grid::pivot::{Agg, DataField, Pivot, PivotField};

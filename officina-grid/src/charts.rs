@@ -117,6 +117,11 @@ impl Picture {
         transform + self.link.as_ref().map_or(0, |link| link.len() + 2)
     }
 
+    pub(crate) fn collection_fits(pictures: &[Self]) -> bool {
+        pictures.len() <= MAX_PICTURES
+            && pictures.iter().map(|picture| picture.bytes.len() + picture.extra_bytes()).sum::<usize>() <= MAX_PICTURE_TOTAL
+    }
+
     /// The extension used when saving the embedded bytes to XLSX.
     pub fn extension(bytes: &[u8]) -> Option<&'static str> {
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {

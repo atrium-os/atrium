@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::addr::{Rect, MAX_COLS, MAX_ROWS};
-use crate::charts::{Chart, ChartText, MAX_CHARTS};
+use crate::charts::{Anchor, Chart, ChartText, Picture, MAX_CHARTS};
 use crate::names::{NameDef, MAX_NAMES};
 use crate::ops::GridOp;
 use crate::style::Style;
@@ -37,6 +37,32 @@ impl ChartChange {
             Some(ChartText::Lit(title)) if !title.is_empty() => format!("Chart {address} {action}: {title}"),
             _ => format!("Chart {address} {action}"),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PictureChange {
+    pub(crate) sheet: Option<u16>,
+    before: Option<(usize, Box<Picture>)>,
+    after: Option<Box<Picture>>,
+}
+
+impl PictureChange {
+    pub(crate) fn anchor(&self) -> Option<(u16, u32, u32)> {
+        let picture = self.before.as_ref().map(|(_, picture)| picture).or(self.after.as_ref())?;
+        Some((self.sheet?, picture.anchor.from.0, picture.anchor.from.1))
+    }
+
+    pub(crate) fn same_review_item(&self, other: &Self) -> bool {
+        self.sheet == other.sheet && self.after == other.after
+            && self.before.as_ref().map(|(_, picture)| picture) == other.before.as_ref().map(|(_, picture)| picture)
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let picture = self.before.as_ref().map(|(_, picture)| picture).or(self.after.as_ref()).unwrap();
+        let address = crate::addr::a1(picture.anchor.from.0, picture.anchor.from.1);
+        let action = action(self.before.is_some(), self.after.is_some());
+        format!("Picture {address} {action}")
     }
 }
 
@@ -142,38 +168,62 @@ fn emit_style(out: &mut Vec<Change>, span: Option<(Rect, &Style, &Style)>) -> bo
 }
 
 pub(super) fn chart_matches(ours: &Workbook, theirs: &Workbook) -> impl Iterator<Item = Change> {
+    drawing_pairs(ours, theirs, ours.charts(), theirs.charts(), |chart| chart.anchor, remap_chart)
+        .map(|(sheet, before, after)| Change::Chart(ChartChange {
+            sheet,
+            before: before.map(|i| (i, Box::new(ours.charts()[i].clone()))),
+            after: after.map(|i| Box::new(theirs.charts()[i].clone())),
+        })).collect::<Vec<_>>().into_iter()
+}
+
+pub(super) fn picture_matches(ours: &Workbook, theirs: &Workbook) -> impl Iterator<Item = Change> {
+    drawing_pairs(ours, theirs, ours.pictures(), theirs.pictures(), |picture| picture.anchor, remap_picture)
+        .map(|(sheet, before, after)| Change::Picture(PictureChange {
+            sheet,
+            before: before.map(|i| (i, Box::new(ours.pictures()[i].clone()))),
+            after: after.map(|i| Box::new(theirs.pictures()[i].clone())),
+        })).collect::<Vec<_>>().into_iter()
+}
+
+/// Pair drawings by host sheet and top-left cell, matching identical
+/// drawings first so another drawing at the same anchor can be reviewed.
+fn drawing_pairs<T: PartialEq>(
+    ours: &Workbook, theirs: &Workbook, left: &[T], right: &[T],
+    anchor: impl Fn(&T) -> Anchor, remap: impl Fn(&T, &Workbook, &Workbook) -> Option<T>,
+) -> impl Iterator<Item = (Option<u16>, Option<usize>, Option<usize>)> {
     type Key = (String, u32, u32);
     type Groups = BTreeMap<Key, (Vec<usize>, Vec<usize>)>;
     let mut groups = Groups::new();
-    for (wb, remote) in [(ours, false), (theirs, true)] {
-        for (index, chart) in wb.charts().iter().enumerate() {
-            let k = (wb.sheet_name(chart.anchor.sheet).to_ascii_lowercase(), chart.anchor.from.0, chart.anchor.from.1);
-            let (left, right) = groups.entry(k).or_default();
-            if remote { right.push(index); } else { left.push(index); }
+    for (wb, drawings, remote) in [(ours, left, false), (theirs, right, true)] {
+        for (index, drawing) in drawings.iter().enumerate() {
+            let anchor = anchor(drawing);
+            let key = (wb.sheet_name(anchor.sheet).to_ascii_lowercase(), anchor.from.0, anchor.from.1);
+            let (a, b) = groups.entry(key).or_default();
+            if remote { b.push(index); } else { a.push(index); }
         }
     }
-    let mut changes = Vec::new();
-    for ((sheet, _, _), (left, right)) in groups {
-        let mapped: Vec<_> = right.iter().map(|&i| remap_chart(&theirs.charts()[i], theirs, ours)).collect();
+    let mut pairs = Vec::new();
+    for ((sheet, _, _), (a, b)) in groups {
+        let mapped: Vec<_> = b.iter().map(|&i| remap(&right[i], theirs, ours)).collect();
         let mut used = BTreeSet::new();
-        let left: Vec<_> = left.into_iter().filter(|&i| {
-            if let Some(j) = mapped.iter().enumerate().position(|(j, c)| !used.contains(&j) && c.as_ref() == Some(&ours.charts()[i])) {
+        let a: Vec<_> = a.into_iter().filter(|&i| {
+            if let Some(j) = mapped.iter().enumerate().position(|(j, drawing)| !used.contains(&j) && drawing.as_ref() == Some(&left[i])) {
                 used.insert(j);
                 false
             } else {
                 true
             }
         }).collect();
-        let right: Vec<_> = right.into_iter().enumerate().filter_map(|(j, i)| (!used.contains(&j)).then_some(i)).collect();
-        for i in 0..left.len().max(right.len()) {
-            changes.push(Change::Chart(ChartChange {
-                sheet: ours.sheet_id(&sheet),
-                before: left.get(i).map(|&j| (j, Box::new(ours.charts()[j].clone()))),
-                after: right.get(i).map(|&j| Box::new(theirs.charts()[j].clone())),
-            }));
-        }
+        let b: Vec<_> = b.into_iter().enumerate().filter_map(|(j, i)| (!used.contains(&j)).then_some(i)).collect();
+        pairs.extend((0..a.len().max(b.len())).map(|i| (ours.sheet_id(&sheet), a.get(i).copied(), b.get(i).copied())));
     }
-    changes.into_iter()
+    pairs.into_iter()
+}
+
+fn remap_picture(picture: &Picture, src: &Workbook, dst: &Workbook) -> Option<Picture> {
+    let mut picture = picture.clone();
+    picture.anchor.sheet = dst.sheet_id(&src.sheet_name(picture.anchor.sheet))?;
+    Some(picture)
 }
 
 fn remap_chart(chart: &Chart, src: &Workbook, dst: &Workbook) -> Option<Chart> {
@@ -218,11 +268,13 @@ pub(super) fn name_matches<'a>(ours: &'a Workbook, theirs: &Workbook) -> impl It
     })
 }
 
-/// Take chart and name changes together so multiple changes compose into a
-/// single update of each collection without overwriting kept objects.
+/// Combine chart, picture and name changes into one update per collection.
+/// Entries outside the selection keep their local values.
 pub(super) fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (Vec<GridOp>, usize) {
     let mut charts = None;
     let mut names = None;
+    let mut pictures = None;
+    let mut picture_count = 0;
     let mut chart_count = 0;
     let mut name_count = 0;
     let mut next_name = ours.names().len();
@@ -245,6 +297,24 @@ pub(super) fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change
                     slots.push(Some(chart));
                 }
                 chart_count += 1;
+            }
+            Change::Picture(c) => {
+                let after = match &c.after {
+                    Some(picture) => match remap_picture(picture, theirs, ours) {
+                        Some(picture) => Some(picture),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                let slots = pictures.get_or_insert_with(|| ours.pictures().iter().cloned().map(Some).collect::<Vec<_>>());
+                if let Some((i, original)) = &c.before {
+                    let Some(slot) = slots.get_mut(*i) else { continue };
+                    if slot.as_ref() != Some(original.as_ref()) { continue; }
+                    *slot = after;
+                } else if let Some(picture) = after {
+                    slots.push(Some(picture));
+                }
+                picture_count += 1;
             }
             Change::Name(c) => {
                 let scope = match &c.scope {
@@ -291,7 +361,13 @@ pub(super) fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change
     } else {
         name_count = 0;
     }
-    (ops, chart_count + name_count)
+    let pictures = pictures.map(|slots| slots.into_iter().flatten().collect::<Vec<_>>());
+    if let Some(pictures) = pictures.filter(|p| picture_count != 0 && Picture::collection_fits(p)) {
+        ops.push(GridOp::Pictures(pictures));
+    } else {
+        picture_count = 0;
+    }
+    (ops, chart_count + name_count + picture_count)
 }
 
 pub(super) fn style_spans(rect: Rect, style: &Style) -> Vec<(u32, u32, u32, Style)> {

@@ -24,7 +24,7 @@ use crate::value::Value;
 mod parts;
 mod rules;
 mod tables;
-pub use parts::{ChartChange, NameChange};
+pub use parts::{ChartChange, NameChange, PictureChange};
 pub use rules::RuleChange;
 pub use tables::{PivotChange, TableChange};
 
@@ -46,6 +46,7 @@ pub enum Change {
     /// A static style change over a contiguous run in one column.
     Style { rect: Rect, ours: Box<crate::style::Style>, theirs: Box<crate::style::Style> },
     Chart(ChartChange),
+    Picture(PictureChange),
     Name(NameChange),
     Table(TableChange),
     Pivot(PivotChange),
@@ -69,6 +70,7 @@ impl Change {
     pub fn same_review_item(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Chart(a), Self::Chart(b)) => a.same_review_item(b),
+            (Self::Picture(a), Self::Picture(b)) => a.same_review_item(b),
             _ => self == other,
         }
     }
@@ -80,6 +82,7 @@ impl Change {
             Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::StructuralConflict { sheet, .. } => Some(sheet),
             Change::Style { rect, .. } => Some(rect.sheet),
             Change::Chart(ref chart) => chart.sheet,
+            Change::Picture(ref picture) => picture.sheet,
             Change::Name(ref name) => name.sheet,
             Change::Table(ref table) => table.at().map(|a| a.sheet),
             Change::Pivot(ref pivot) => pivot.at().map(|a| a.sheet),
@@ -102,6 +105,7 @@ impl Change {
             }),
             Change::Style { rect, .. } => Some((rect.sheet, rect.r0, rect.c0)),
             Change::Chart(ref chart) => chart.anchor(),
+            Change::Picture(ref picture) => picture.anchor(),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
             Change::Table(ref table) => table.at().map(|a| (a.sheet, a.row, a.col)),
             Change::Pivot(ref pivot) => pivot.at().map(|a| (a.sheet, a.row, a.col)),
@@ -113,7 +117,7 @@ impl Change {
 
     /// Whether this entry is applied through a workbook object collection.
     pub fn is_object(&self) -> bool {
-        matches!(self, Self::Chart(_) | Self::Name(_) | Self::Table(_) | Self::Pivot(_) | Self::ConditionalFormats(_) | Self::Validations(_))
+        matches!(self, Self::Chart(_) | Self::Picture(_) | Self::Name(_) | Self::Table(_) | Self::Pivot(_) | Self::ConditionalFormats(_) | Self::Validations(_))
     }
 
     /// Whether it is rows added or removed (taken as rows inserted or
@@ -145,6 +149,7 @@ impl Change {
                 else { format!("Style {first}:{} changed", crate::addr::a1(rect.r1, rect.c1)) }
             }
             Change::Chart(chart) => chart.describe(),
+            Change::Picture(picture) => picture.describe(),
             Change::Name(name) => name.describe(),
             Change::Table(table) => table.describe(),
             Change::Pivot(pivot) => pivot.describe(),
@@ -196,7 +201,7 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
             out.push(Change::SheetAdded { name });
         }
     }
-    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)).chain(tables::compare(ours, theirs)) {
+    for change in parts::chart_matches(ours, theirs).chain(parts::picture_matches(ours, theirs)).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)).chain(tables::compare(ours, theirs)) {
         if out.len() == MAX_CHANGES { return (out, true); }
         out.push(change);
     }
@@ -588,7 +593,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             if ours.style_snapshot(rect).spans != parts::style_spans(*rect, before) { return None; }
             Some(vec![GridOp::style(*rect, (**after).clone())])
         }
-        Change::Chart(_) | Change::Name(_) | Change::Table(_) | Change::Pivot(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
+        Change::Chart(_) | Change::Picture(_) | Change::Name(_) | Change::Table(_) | Change::Pivot(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
             let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
             (n != 0).then_some(ops)
         }
@@ -681,6 +686,32 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn picture_review_leaves_an_over_limit_collection_pending() {
+        use crate::charts::{Anchor, Picture, MAX_PICTURES};
+
+        let mut ours = book(&[&["Input"]]);
+        let mut theirs = book(&[&["Input"]]);
+        let bytes: Arc<[u8]> = Arc::from(&b"\x89PNG\r\n\x1a\n"[..]);
+        let picture = |row| Picture {
+            anchor: Anchor { sheet: 0, from: (row, 4, 0.0, 0.0), to: (row, 5, 0.0, 0.0) },
+            bytes: bytes.clone(), link: None, crop: [0; 4], rotation: 0,
+        };
+        for row in 0..MAX_PICTURES as u32 {
+            ours.add_picture(picture(row)).unwrap();
+        }
+        theirs.add_picture(picture(MAX_PICTURES as u32)).unwrap();
+        let (changes, _) = compare(&ours, &theirs);
+        let addition = changes.iter().find(|change| change.at() == Some((0, MAX_PICTURES as u32, 4))).unwrap();
+        assert!(matches!(addition, Change::Picture(_)));
+        assert!(take(&ours, &theirs, addition).is_none());
+        let (ops, count) = take_objects(&ours, &theirs, &changes);
+        assert_eq!(count, MAX_PICTURES + 1);
+        assert_eq!(ops.len(), 1);
+        ops.into_iter().next().unwrap().apply(&mut ours);
+        assert_eq!(ours.pictures(), theirs.pictures());
+    }
 
     #[test]
     fn table_and_pivot_review_leaves_occupied_destinations_pending() {
