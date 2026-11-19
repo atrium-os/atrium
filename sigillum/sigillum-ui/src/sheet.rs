@@ -122,6 +122,16 @@ impl State {
                         let p = |s: &str| if s == "personal" { "Personal".to_string() } else { s.to_string() };
                         format!("to let {} send {kind} to {}", p(from), p(to))
                     }
+                    Purpose::SharePrinter { printer } => {
+                        return (
+                            "Confirm it’s you".into(),
+                            vec![
+                                format!("{requester} asks to share with every persona"),
+                                format!("Printer: “{printer}”"),
+                                format!("User: {user}"),
+                            ],
+                        );
+                    }
                     Purpose::RemovePersona { name } => {
                         let mut c = name.chars();
                         let n: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();

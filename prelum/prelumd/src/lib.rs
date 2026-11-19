@@ -11,3 +11,5 @@ pub mod nearby;
 pub mod server;
 pub mod sheet;
 pub mod store;
+
+mod sharing;

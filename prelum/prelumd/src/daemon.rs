@@ -57,6 +57,7 @@ const USER: &str = "atrium";
 pub struct Config {
     pub state: PathBuf,
     pub spool: PathBuf,
+    pub sigillum: PathBuf,
     /// The network we are on now, as atrium-net names it (§7.3).
     pub network: Box<dyn Fn() -> String + Send + Sync>,
     /// Where prelum-browse's sockets come from (§7.1): atrium-net, asked
@@ -116,6 +117,8 @@ struct JobRec {
 struct State {
     people: HashMap<u32, Person>,
     jobs: BTreeMap<u64, JobRec>,
+    pending_shares: HashMap<(u32, u32), u64>,
+    share_ceremony: u64,
     next_job: u64,
     /// (uid, printer) with a runner.
     running: HashSet<(u32, u32)>,
@@ -593,6 +596,7 @@ impl Daemon {
             return fail(status::NOT_FOUND, "no such printer");
         }
         p.live.remove(&id);
+        st.pending_shares.remove(&(uid, id));
         self.persist(uid, &mut st);
         // Its waiting jobs go with it.
         let ids: Vec<u64> = st.jobs.iter().filter(|(_, j)| j.uid == uid && j.view.printer == id && !j.view.phase.ended()).map(|(k, _)| *k).collect();
@@ -615,14 +619,61 @@ impl Daemon {
         Ok("renamed".into())
     }
 
-    /// Shared by every persona, or its own persona's again (§9).
+    /// Publishing to all personas requires a fresh, successful Sigillum ceremony.
     pub fn share(&self, uid: u32, r: &print::Share) -> Result<String, Fail> {
+        let key = (uid, r.printer);
         let mut st = self.lock();
-        let p = self.person(&mut st, uid);
-        let s = p.file.printer.iter_mut().find(|s| s.id == r.printer).ok_or((status::NOT_FOUND, "no such printer".to_string()))?;
-        s.shared = r.shared;
-        self.persist(uid, &mut st);
-        Ok(if r.shared { "shared".into() } else { "not shared".into() })
+        if !r.shared {
+            st.pending_shares.remove(&key);
+            return self.set_sharing(&mut st, uid, r.printer, false);
+        }
+
+        let snapshot = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == r.printer)
+            .cloned().ok_or((status::NOT_FOUND, "no such printer".into()))?;
+        if snapshot.shared {
+            return Ok("shared".into());
+        }
+        if st.pending_shares.contains_key(&key) {
+            return fail(status::NOT_ALLOWED, "Printer sharing is already waiting for verification");
+        }
+        let user = portcullis_peer::username(uid)
+            .ok_or((status::NOT_ALLOWED, "Unknown account for printer sharing".into()))?;
+        st.share_ceremony = st.share_ceremony.wrapping_add(1);
+        let ceremony = st.share_ceremony;
+        st.pending_shares.insert(key, ceremony);
+        drop(st);
+
+        // The person may take time to answer. Other printer operations can proceed.
+        let verified = crate::sharing::verify(&self.cfg.sigillum, ceremony, &user, &snapshot.name);
+        let mut st = self.lock();
+        if st.pending_shares.get(&key) != Some(&ceremony) {
+            return fail(status::NOT_ALLOWED, "Printer sharing was cancelled");
+        }
+        st.pending_shares.remove(&key);
+        verified.map_err(|message| (status::NOT_ALLOWED, message))?;
+        let current = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == r.printer);
+        if !current.is_some_and(|s| {
+            s.name == snapshot.name && s.persona == snapshot.persona && s.uri == snapshot.uri
+                && s.addr == snapshot.addr && s.tls == snapshot.tls && s.key == snapshot.key
+                && s.uuid == snapshot.uuid && s.network == snapshot.network
+        }) {
+            return fail(status::NOT_ALLOWED, "The printer changed while you were verifying. Try again.");
+        }
+        self.set_sharing(&mut st, uid, r.printer, true)
+    }
+
+    fn set_sharing(&self, st: &mut State, uid: u32, printer: u32, shared: bool) -> Result<String, Fail> {
+        let p = self.person(st, uid);
+        let mut file = p.file.clone();
+        let saved = file.printer.iter_mut().find(|s| s.id == printer)
+            .ok_or((status::NOT_FOUND, "no such printer".into()))?;
+        if saved.shared != shared {
+            saved.shared = shared;
+            store::save(&self.cfg.state, uid, &file)
+                .map_err(|e| (status::FAILED, format!("Could not save printer sharing: {e}")))?;
+            p.file = file;
+        }
+        Ok(if shared { "shared".into() } else { "not shared".into() })
     }
 
     /// The last 30 days' ended jobs, newest first.
@@ -1464,6 +1515,7 @@ mod tests {
         let d = Daemon::new(Config {
             state: PathBuf::new(),
             spool: PathBuf::new(),
+            sigillum: PathBuf::new(),
             network: Box::new(|| "test".into()),
             mdns: None,
             sheet_uid: None,
@@ -1489,6 +1541,80 @@ mod tests {
 
         d.person(&mut d.lock(), uid).file.printer[0].shared = true;
         assert_eq!(d.printers(uid, Some("work"))[0].id, 1);
+    }
+
+    #[test]
+    fn sharing_stays_private_until_sigillum_verifies_and_unshare_needs_no_prompt() {
+        use std::os::unix::net::UnixListener;
+        use sigillum_proto::client::{Method, Purpose, Refusal, Reply, Request, Strength, MAX_MESSAGE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sigillum.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let d = Daemon::new(Config {
+            state: dir.path().into(), spool: dir.path().into(), sigillum: socket,
+            network: Box::new(|| "test".into()), mdns: None, sheet_uid: None,
+            person_of: Box::new(|_| None),
+        }, Box::new(crate::launch::Direct { bin_dir: PathBuf::new() }));
+        let uid = unsafe { libc::getuid() };
+        let user = portcullis_peer::username(uid).unwrap();
+        let printer = toml::from_str(r#"
+            id = 1
+            name = "Home"
+            uri = "ipp://localhost:631/ipp/print"
+            addr = "127.0.0.1:631"
+            tls = false
+            network = "test"
+        "#).unwrap();
+        d.person(&mut d.lock(), uid).file.printer = vec![printer];
+
+        let serve = |answer: fn(u64) -> Reply, cancel| {
+            let d = Arc::clone(&d);
+            std::thread::scope(|scope| {
+                let enable = scope.spawn(|| d.share(uid, &print::Share { printer: 1, shared: true }));
+                let until = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("Sigillum test accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let Some(Request::VerifyUser(request)) = sigillum_proto::read_msg(&mut stream, MAX_MESSAGE).unwrap() else {
+                    panic!("expected printer sharing verification");
+                };
+                assert_eq!(request.user, user);
+                assert_eq!(request.purpose, Purpose::SharePrinter { printer: "Home".into() });
+                assert_eq!(request.min_strength, Strength::BiometricSecure);
+                assert!(d.printers(uid, Some("work")).is_empty());
+                if cancel {
+                    d.share(uid, &print::Share { printer: 1, shared: false }).unwrap();
+                }
+                sigillum_proto::write_msg(&mut stream, &answer(request.ceremony), MAX_MESSAGE).unwrap();
+                enable.join().unwrap()
+            })
+        };
+        assert!(serve(|ceremony| Reply::Refused { ceremony, reason: Refusal::NotAllowed }, false).is_err());
+        assert!(serve(|ceremony| Reply::Verified {
+            ceremony, method: Method::Fingerprint, strength: Strength::BiometricPlain,
+        }, false).is_err());
+        assert!(serve(|ceremony| Reply::Verified {
+            ceremony: ceremony + 1, method: Method::Passcode, strength: Strength::Passcode,
+        }, false).is_err());
+        let verified = |ceremony| Reply::Verified { ceremony, method: Method::Passcode, strength: Strength::Passcode };
+        assert!(serve(verified, true).is_err());
+        assert!(serve(verified, false).is_ok());
+        assert!(store::load(dir.path(), uid).printer[0].shared);
+        assert_eq!(d.printers(uid, Some("work"))[0].id, 1);
+        drop(listener);
+        d.share(uid, &print::Share { printer: 1, shared: false }).unwrap();
+        assert!(!store::load(dir.path(), uid).printer[0].shared);
+        assert!(d.printers(uid, Some("work")).is_empty());
     }
 
     #[test]

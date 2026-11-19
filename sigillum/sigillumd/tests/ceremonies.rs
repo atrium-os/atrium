@@ -604,6 +604,27 @@ fn verify_user_is_for_arca_and_ostiarius_only() {
 }
 
 #[test]
+fn printer_sharing_is_a_settings_only_purpose() {
+    let mut r = Rig::new(SoftKey::new(None));
+    let verify = |printer: &str| Request::VerifyUser(VerifyUser {
+        ceremony: 4,
+        user: "shankar".into(),
+        purpose: Purpose::SharePrinter { printer: printer.into() },
+        min_strength: Strength::BiometricSecure,
+    });
+    r.request(&web_broker(), verify("Office"));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 4, reason: Refusal::Denied });
+    r.request(&Label::Arca, verify("Office"));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 4, reason: Refusal::Denied });
+    r.request(&Label::Portcullis, verify("Office\nPrinter"));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 4, reason: Refusal::Malformed });
+    r.request(&Label::Portcullis, verify("Office"));
+    assert!(matches!(&r.sheets.last().unwrap().1,
+        Sheet::Verify { requester, purpose: Purpose::SharePrinter { printer }, .. }
+        if requester == "Settings" && printer == "Office"));
+}
+
+#[test]
 fn unplugging_ends_the_ceremony() {
     let mut r = Rig::new(SoftKey::new(Some(PIN)));
     r.pin = None;

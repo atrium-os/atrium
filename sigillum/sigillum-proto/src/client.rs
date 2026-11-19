@@ -76,6 +76,8 @@ pub enum Purpose {
     /// portcullisd only (personas.md §4.1): Settings' Remove on persona
     /// `name`, which deletes that persona's app data for good.
     RemovePersona { name: String },
+    /// Prelum asks before a saved printer becomes available to every persona.
+    SharePrinter { printer: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

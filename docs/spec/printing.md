@@ -840,9 +840,15 @@ button for held jobs.
 The picker lists saved printers owned by its calling persona and shared printers.
 Discovery reports saved IDs only for printers the picker can use. prelumd checks
 ownership again on submit and at the start of each attempt, including retries.
-Curia still lists every printer for the person and asks for confirmation before
-sharing one with every persona. The print sheet cannot change sharing or other
-printer administration settings.
+Curia lists every printer for the person. It asks for confirmation before
+requesting that a printer be shared with every persona. Prelumd uses the
+authenticated person's identity to ask Sigillum to verify the change, with
+`SharePrinter` naming the saved printer and a minimum strength of
+`BiometricSecure`. A refusal, unavailable verifier, or cancelled request
+leaves the printer private. Prelumd persists approval only while the original
+request and printer configuration are still current. Stop sharing removes
+cross-persona access and cancels any pending approval without a ceremony.
+The print sheet cannot change sharing or other printer administration settings.
 
 For a saved IPPS printer, **Use PIN** opens Arca's credential field inside the
 print sheet. Prelumd supplies the authenticated person, persona, TLS key and

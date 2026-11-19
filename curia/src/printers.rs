@@ -345,7 +345,7 @@ impl CuriaView {
                     button(ctx, em(16.0), fy, "Share", Look::Primary, enabled, move || with_printers(&pg, |a| a.share(id, true)));
                     let pg = page.clone();
                     button(ctx, em(16.0 + SLOT), fy, "Cancel", Look::Ghost, enabled, move || with_printers(&pg, |a| a.confirm_share = None));
-                    text(ctx, em(16.0 + 2.0 * SLOT), fy + em(15.0), "Every persona will be able to print here.", type_size::SM, Weight::Regular, t.text_secondary());
+                    text(ctx, em(16.0 + 2.0 * SLOT), fy + em(15.0), "Confirm in Sigillum to share with every persona.", type_size::SM, Weight::Regular, t.text_secondary());
                 }
                 if renaming {
                     let fy = y + em(96.0);

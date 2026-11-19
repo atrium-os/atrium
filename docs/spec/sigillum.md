@@ -339,7 +339,12 @@ The check Arca's verify-each-use class needs, and the step-up any system UI can 
   kind }` when Settings turns a switch between personas on (personas.md §6); the sheet says
   "to let work send links to personal". Only portcullisd (label `Portcullis`, its uid from
   `SIGILLUM_PORTCULLIS_UID`, default 0, `none` to turn it off) may ask it, and it may ask
-  nothing else.
+  only the system Settings purposes.
+- **Printer sharing.** Prelumd uses the same Settings broker peer label for
+  `Purpose::SharePrinter { printer }`. The name must be nonempty, at most 128
+  bytes, and free of control characters. The trusted sheet names the printer and
+  says it will be shared with every persona. Prelumd requires at least
+  `biometric-secure` before granting cross-persona access.
 - **Rate:** five failed biometric matches in a row disable biometrics until the passcode is
   entered; a burst of verify requests is an anomaly reported to the monitor (arca.md §10).
 

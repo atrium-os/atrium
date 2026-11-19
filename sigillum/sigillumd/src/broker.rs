@@ -493,9 +493,8 @@ impl Broker {
                 if matches!(v.purpose, Purpose::ArcaItem { .. }) && *label != Label::Arca {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
-                // portcullisd asks only for a crossing switch or removing a
-                // persona, and only it does.
-                if matches!(v.purpose, Purpose::Crossing { .. } | Purpose::RemovePersona { .. }) != (*label == Label::Portcullis) {
+                // The root Settings brokers may request only these changes.
+                if matches!(v.purpose, Purpose::Crossing { .. } | Purpose::RemovePersona { .. } | Purpose::SharePrinter { .. }) != (*label == Label::Portcullis) {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
                 let name = |s: &str| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
@@ -506,6 +505,11 @@ impl Broker {
                 }
                 if let Purpose::RemovePersona { name: p } = &v.purpose {
                     if !name(p) || p == "personal" {
+                        return vec![refused(conn, id, Refusal::Malformed)];
+                    }
+                }
+                if let Purpose::SharePrinter { printer } = &v.purpose {
+                    if printer.is_empty() || printer.len() > 128 || printer.chars().any(char::is_control) {
                         return vec![refused(conn, id, Refusal::Malformed)];
                     }
                 }

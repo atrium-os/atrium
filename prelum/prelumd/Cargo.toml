@@ -7,6 +7,7 @@ publish = false
 description = "Prelum's daemon (docs/spec/printing.md §6.4): saved printers per person, one queue per printer, the job state machine and spool. Parses no document, no IPP and no mDNS: it starts jailed workers (prelum-render, prelum-ipp) and moves their bytes. Also prelumctl, its console client."
 
 [dependencies]
+sigillum-proto = { path = "../../sigillum/sigillum-proto" }
 arcad = { path = "../../arca/arcad" }
 arca-store = { path = "../../arca/arca-store" }
 prelum-proto = { path = "../prelum-proto" }
