@@ -332,7 +332,7 @@ impl Run {
             }
             // Finding text comes with the text layer (P3).
             ToChild::Find { .. } => out.send(ToParent::Found { count: 0, current: 0, page: None }),
-            ToChild::Load { .. } => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
+            ToChild::ExportImages | ToChild::Load { .. } => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
         }
     }
 
@@ -490,9 +490,9 @@ fn standalone(path: &str, dark: bool) {
 
 fn embedded() {
     let (mut child, fresco) = limen::client::Child::embedded().unwrap_or_else(|e| die(format_args!("no limend channel: {e:?}")));
-    let embed = loop {
+    let (embed, sanitizer) = loop {
         match child.poll(Duration::from_secs(30)) {
-            Ok(Some(ChildEvent::Attach { embed, role, .. })) if role == "pdf-viewer" => break embed,
+            Ok(Some(ChildEvent::Attach { embed, role, .. })) if role == "pdf-viewer" || role == "pdf-sanitizer" => break (embed, role == "pdf-sanitizer"),
             Ok(Some(ChildEvent::Attach { role, .. })) => die(format_args!("asked to be {role}")),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => die("limend never attached us"),
@@ -535,7 +535,18 @@ fn embedded() {
                 Ok(Some(ChildEvent::MessageFd { bytes, .. })) => {
                     let fd = out.0.take_fd();
                     match ToChild::decode(&bytes) {
-                        Some(ToChild::Load { dark }) => {
+                        Some(ToChild::ExportImages) if sanitizer => {
+                            use std::os::fd::AsFd;
+                            let pdf = fd.ok_or(folium_syntax::Error::Unreadable("missing PDF"))
+                                .and_then(|fd| atrium_pdf::sanitized::export(Box::new(std::fs::File::from(fd))))
+                                .and_then(|bytes| Ok(limen::fdpass::sealed_file("visual-copy.pdf", &bytes)?));
+                            match pdf {
+                                Ok(file) => { let _ = out.0.emit_fd(embed, ToParent::ImageCopy.encode(), file.as_fd()); }
+                                Err(folium_syntax::Error::NeedsPassword) => out.send(ToParent::PasswordNeeded),
+                                Err(_) => out.send(ToParent::Error { code: error::UNREADABLE }),
+                            }
+                        }
+                        Some(ToChild::Load { dark }) if !sanitizer => {
                             run.view.dark.set(dark);
                             run.load(&mut out, fd.map(std::fs::File::from));
                         }

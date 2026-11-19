@@ -766,8 +766,9 @@ fn main() {
                     let Some(token) = win.embed_token() else { mail.file_note("Document viewer unavailable".into()); continue; };
                     let key = (ask.msg, ask.file.which.clone());
                     let ready = retry_copy.take().filter(|(k, _)| k == &key).map(|(_, fd)| fd);
+                    let visual = ask.file.mime == Some("application/pdf");
                     let doc = if ready.is_none() {
-                        match engine.prepare_attachment_document(ask.msg, ask.file.which.clone()) {
+                        match engine.prepare_attachment_document(ask.msg, ask.file.which.clone(), visual) {
                             Ok(doc) => Some(doc),
                             Err(e) => { mail.file_note(format!("Could not convert attachment: {e}")); continue; }
                         }
@@ -775,7 +776,7 @@ fn main() {
                     let stem = std::path::Path::new(&ask.file.name).file_stem().and_then(|s| s.to_str()).unwrap_or("attachment");
                     let name = format!("{stem}-sanitized.pdf");
                     converting = true;
-                    mail.file_note(format!("Preparing {name}…"));
+                    mail.file_note(if visual { format!("Preparing {name} as page images. Search and text selection are lost.") } else { format!("Preparing {name}…") });
                     let tx = copy_tx.clone();
                     std::thread::spawn(move || {
                         let pdf = match (ready, doc) {
@@ -785,6 +786,7 @@ fn main() {
                         };
                         let result = match pdf {
                             Ok(fd) => match atrium_mail::files::open_in_app(&name, activation, &fd, None) {
+                                Ok(app) if visual => (None, format!("Opened {name} in {app}. Page images have no search or text selection.")),
                                 Ok(app) => (None, format!("Opened {name} in {app}")),
                                 Err(e) => (Some((key, fd)), format!("{name}: {e}. Press Open sanitized copy to retry.")),
                             },

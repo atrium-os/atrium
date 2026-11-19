@@ -49,6 +49,7 @@ pub struct Document {
     crypt: Option<Handler>,
     encrypt_ref: Option<Ref>,
     repaired: bool,
+    strict: bool,
     /// From the header, `(1, 7)` for `%PDF-1.7`; the catalog's
     /// `/Version` is the doc layer's business.
     pub version: (u8, u8),
@@ -64,6 +65,15 @@ impl Document {
     /// Open with a password (UTF-8 for AES-256 files, Latin-1/PDFDoc for
     /// older ones). [`Error::NeedsPassword`] when it doesn't open.
     pub fn open_with_password(src: Box<dyn Source>, password: &[u8]) -> Result<Document> {
+        Self::read(src, password, false)
+    }
+
+    /// Export must not substitute scanned objects or guess a stream boundary.
+    pub fn open_for_export(src: Box<dyn Source>) -> Result<Document> {
+        Self::read(src, b"", true)
+    }
+
+    fn read(src: Box<dyn Source>, password: &[u8], strict: bool) -> Result<Document> {
         let len = src.len();
         if len > FILE_MAX {
             return Err(Error::Limit("the file's size"));
@@ -81,6 +91,7 @@ impl Document {
             crypt: None,
             encrypt_ref: None,
             repaired: false,
+            strict,
             version,
             cache: Mutex::new(Cache::default()),
             fallback: OnceLock::new(),
@@ -97,6 +108,7 @@ impl Document {
             Err(_) => doc.repair()?,
         }
         if let Some(e) = doc.xref.trailer.get("Encrypt").cloned() {
+            if strict { return Err(Error::NeedsPassword); }
             doc.encrypt_ref = e.as_ref();
             let enc = doc.resolve(&e)?;
             if let Some(enc) = enc.as_dict() {
@@ -117,7 +129,7 @@ impl Document {
         Ok(doc)
     }
 
-    fn ctx(&self) -> Ctx<'_> { Ctx { xref: &self.xref, cached: true, fallback: true } }
+    fn ctx(&self) -> Ctx<'_> { Ctx { xref: &self.xref, cached: true, fallback: !self.strict } }
 
     fn root_ok(&self) -> bool {
         let Some(r) = self.xref.trailer.get("Root").and_then(Object::as_ref) else { return false };
@@ -126,6 +138,7 @@ impl Document {
     }
 
     fn repair(&mut self) -> Result<()> {
+        if self.strict { return Err(Error::Unreadable("cross-reference needs repair")); }
         let x = self.scan()?;
         if x.trailer.get("Root").is_none() {
             return Err(Error::Unreadable("no catalog found"));
@@ -231,6 +244,8 @@ impl Document {
         let res = match ctx.xref.get(r.num) {
             Entry::Free => return Ok(Object::Null),
             Entry::Missing => Ok(None),
+            Entry::Offset { gen, .. } if self.strict && gen != r.gen => Err(Error::Unreadable("wrong reference generation")),
+            Entry::InStream { .. } if self.strict && r.gen != 0 => Err(Error::Unreadable("wrong compressed reference generation")),
             Entry::Offset { offset, .. } => self.at_offset(r, offset, ctx, depth).map(Some),
             Entry::InStream { stream, index } => {
                 if stream == r.num {
@@ -255,8 +270,8 @@ impl Document {
     }
 
     fn at_offset(&self, r: Ref, offset: u64, ctx: Ctx, depth: usize) -> Result<Object> {
-        let (n, _g, o, data) = xref::object_header(&*self.src, offset)?;
-        if n != r.num {
+        let (n, g, o, data) = xref::object_header(&*self.src, offset)?;
+        if n != r.num || (self.strict && g != r.gen) {
             return Err(Error::Syntax { offset, what: "the cross-reference points at another object" });
         }
         let mut o = match (o, data) {
@@ -289,6 +304,10 @@ impl Document {
             let mut lx = Lexer::new(&tail, 0);
             lx.skip_white();
             let rest = &tail[lx.pos..];
+            if self.strict {
+                if lx.keyword(b"endstream").is_ok() && lx.keyword(b"endobj").is_ok() { return Ok(l); }
+                return Err(Error::Unreadable("incorrect stream boundary"));
+            }
             if rest.starts_with(b"endstream") || rest.starts_with(b"endobj") {
                 return Ok(l);
             }
@@ -297,6 +316,7 @@ impl Document {
                 return Ok(l);
             }
         }
+        if self.strict { return Err(Error::Unreadable("missing stream length")); }
         // Search forward for `endstream`.
         let mut off = start;
         let end = (start + ENDSTREAM_SEARCH_MAX).min(self.src.len());

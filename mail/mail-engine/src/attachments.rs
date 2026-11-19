@@ -10,6 +10,11 @@ use crate::{Engine, Error};
 /// The most attachment text kept for one message's search.
 pub const FILES_TEXT_MAX: usize = 4 << 20;
 
+pub enum ExportSource {
+    Html(mail_schema::Document),
+    Pdf(Vec<u8>),
+}
+
 impl Engine {
     /// One attachment of `msg`, decoded in its own jail. `NotFound` when the
     /// whole message isn't here yet or has no such attachment.
@@ -23,8 +28,8 @@ impl Engine {
 
     /// Capture the selected part and its session key on the engine thread.
     /// Reading and normalizing a large attachment run on the export thread.
-    pub fn prepare_attachment_document(&self, msg: MsgId, which: Which)
-        -> Result<impl FnOnce() -> Result<mail_schema::Document, Error> + Send + 'static, Error> {
+    pub fn prepare_attachment_document(&self, msg: MsgId, which: Which, pdf: bool)
+        -> Result<impl FnOnce() -> Result<ExportSource, Error> + Send + 'static, Error> {
         let m = self.store.message(msg)?;
         let full = m.full.ok_or(Error::NotFound)?;
         let key = if m.summary.encrypted { Some(self.content_key(msg).ok_or(Error::Refused("Unlock this message first"))?) } else { None };
@@ -32,6 +37,10 @@ impl Engine {
         let parser = self.parser.clone();
         Ok(move || {
             let raw = store.blob(&full)?;
+            if pdf {
+                let attachment = parser.attachment(&raw, &which, key)?.ok_or(Error::NotFound)?;
+                return Ok(ExportSource::Pdf(attachment.bytes));
+            }
             let len = raw.len() as u64;
             let mut jail = parser.start()?;
             mail_schema::write_frame(&mut jail.w, &mail_schema::ToJail::HtmlAttachment {
@@ -39,7 +48,7 @@ impl Engine {
             }).map_err(|e| Error::Jail(e.to_string()))?;
             let frames = super::Parser::exchange(&mut jail, &|id| (id == 1).then_some(len), &|_| None)?;
             match frames.into_iter().next() {
-                Some(mail_schema::FromJail::Opened { result: Ok(opened), .. }) => opened.document.ok_or(Error::NotFound),
+                Some(mail_schema::FromJail::Opened { result: Ok(opened), .. }) => opened.document.map(ExportSource::Html).ok_or(Error::NotFound),
                 _ => Err(Error::Refused("Could not convert the HTML attachment")),
             }
         })

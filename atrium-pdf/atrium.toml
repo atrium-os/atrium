@@ -1,0 +1,16 @@
+[app]
+id = "org.atrium.folium.sanitizer"
+name = "Folium PDF sanitizer"
+version = "1"
+entry = "bin/atrium-pdf"
+
+[roles]
+implements = ["pdf-sanitizer"]
+
+[capabilities]
+network = "none"
+embeds = []
+
+[resources]
+memory = "512M"
+cpu = 100

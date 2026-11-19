@@ -548,14 +548,11 @@ doesn't run a spam classifier of its own in v1.
 #### 8.2.1 Open sanitized copy
 
 **What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
-type checks as `text/html`. The action produces a new PDF and opens it in the
-persona's PDF handler. Keep the original attachment in the message. For example,
-`invoice.html` produces `invoice-sanitized.pdf`. Mail shows the PDF filename while preparing it and opens the persona’s default PDF handler. V1 excludes standalone images (including SVG), plain text, PDFs,
-Office documents, archives, attached messages and all other types. HTML is the
-existing input shared by Mail's document pipeline and Navigator's page-print path.
-Preview support alone does not qualify another format.
+type checks as `text/html` or `application/pdf`. Mail keeps the original attachment
+in the message and opens the completed copy in the persona’s default PDF handler.
+Both `invoice.html` and `invoice.pdf` produce `invoice-sanitized.pdf`.
 
-**How it is made.** Process the attachment itself through the parse jail's HTML
+**HTML input.** Process the attachment itself through the parse jail's HTML
 profile (§7.3). Load the normalized document into the jailed Navigator
 `doc-viewer` through Limen. Use Navigator's native document scene, lay it out at
 paper width, and invoke its Officina PDF writer in a dedicated sanitized-export
@@ -572,6 +569,23 @@ printing emits. Build the PDF from allowed paint operations only, without PDF
 actions, forms, attachments, source HTML, source fonts or original image streams.
 A displayed address or misleading sentence can still appear as text. This action
 makes a passive copy and makes no malware-scan claim.
+
+**PDF input.** The reader explains “Sanitized PDFs are images. Search and text
+selection are lost.” Mail sends the sealed attachment to Limen’s fixed
+`pdf-sanitizer` worker, `org.atrium.folium.sanitizer`. The jailed Folium binary
+renders the crop and rotation of each page on white at 144 dpi. Its writer
+emits a fresh catalog and page tree with one RGB image per page. Visible words
+and addresses become pixels. The copy drops text layers, accessibility tags,
+fonts, active actions, metadata, embedded files and prior revisions.
+
+The initial profile accepts simple fills and strokes, printable ASCII text in
+the built-in Helvetica, Times-Roman and Courier faces, and axis-aligned 8-bit
+DeviceGray or DeviceRGB images with raw or Flate samples. Export requires each
+content stream and drawing operation to pass the stricter Folium checks. Forms,
+annotations, optional content, encryption (including an empty user password),
+repaired page trees, unsupported drawing or image codecs, and exceeded budgets
+refuse the entire conversion. Limits include 16 MiB of source, 64 pages,
+8 million output pixels per page and 24 million across the document.
 
 **Delivery and failure.** Return a completed, sealed, read-only PDF descriptor.
 Apply §8.2's broker checks and same-persona routing to that descriptor. If conversion

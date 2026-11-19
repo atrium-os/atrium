@@ -501,6 +501,13 @@ width, fit page, percent), find, copy, page number and labels, and a
 password sheet when the file is encrypted. Links inside the document jump;
 outside links go to the Navigator, with the address shown first.
 
+**Mail visual copies.** A separate fixed Limen role, `pdf-sanitizer`, runs the
+same binary with the capability-free sanitizer bundle. An `ExportImages`
+request carries the source descriptor. A complete conversion returns
+`ImageCopy` with a sealed PDF descriptor. An encrypted document returns
+`PasswordNeeded`; other refusals return `Error` without a descriptor. The
+strict rendering profile and user-visible losses are specified in Mail §8.2.1.
+
 **`pdf-viewer` Limen role**: `takes_fd`, `plain` slot, user role whose
 default is `org.atrium.pdf`. Parent to child: `Load { dark }` with the
 descriptor, `GoTo { page }`, `Find { query, step }`, `SetZoom`. Child to

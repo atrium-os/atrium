@@ -533,3 +533,4 @@ mod tests {
         assert_eq!(px(300, 300), [0, 0, 255, 255]);
     }
 }
+pub mod sanitized;

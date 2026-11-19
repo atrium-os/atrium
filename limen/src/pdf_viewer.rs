@@ -45,6 +45,8 @@ pub enum ToChild {
     /// at or after the top of the view, 1 the next, -1 the previous.
     Find { query: String, step: i8 },
     SetZoom { fit: Fit },
+    /// Export the supplied descriptor under the strict visual-copy profile.
+    ExportImages,
 }
 
 /// Child to parent.
@@ -66,6 +68,7 @@ pub enum ToParent {
     /// that sends it unasked only opens the print sheet, whose Print still
     /// needs the person's own press, at Limen's rate.
     PrintAsked,
+    ImageCopy,
 }
 
 /// `Error` codes.
@@ -90,7 +93,7 @@ impl ToChild {
     pub fn decode(b: &[u8]) -> Option<Self> {
         let m: Self = postcard::from_bytes(b).ok()?;
         let ok = match &m {
-            ToChild::Load { .. } | ToChild::SetTheme { .. } => true,
+            ToChild::ExportImages | ToChild::Load { .. } | ToChild::SetTheme { .. } => true,
             ToChild::GoTo { page } => *page < PAGES_MAX,
             ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
             ToChild::SetZoom { fit } => match fit {
@@ -114,7 +117,7 @@ impl ToParent {
             ToParent::LinkActivated { url } => link_ok(url),
             ToParent::Found { count, current, page } => *count <= FOUND_MAX && *current <= *count && (*current == 0) == page.is_none() && page.is_none_or(|p| p < PAGES_MAX),
             ToParent::AtPage { page } => *page < PAGES_MAX,
-            ToParent::Error { .. } | ToParent::PasswordNeeded | ToParent::PrintAsked => true,
+            ToParent::ImageCopy | ToParent::Error { .. } | ToParent::PasswordNeeded | ToParent::PrintAsked => true,
         };
         ok.then_some(m)
     }
