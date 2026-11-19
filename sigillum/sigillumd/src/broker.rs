@@ -490,7 +490,7 @@ impl Broker {
                 if !matches!(label, Label::Arca | Label::Ostiarius | Label::Portcullis) {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
-                if matches!(v.purpose, Purpose::ArcaItem { .. }) && *label != Label::Arca {
+                if matches!(v.purpose, Purpose::ArcaItem { .. } | Purpose::ArcaSshSign { .. }) && *label != Label::Arca {
                     return vec![refused(conn, id, Refusal::Denied)];
                 }
                 // The root Settings brokers may request only these changes.
@@ -796,7 +796,7 @@ impl Broker {
                 c.state = State::AwaitingPasscode;
                 vec![Action::CheckPasscode { key, user, retry: false }]
             }
-            (Choice::Passcode, Kind::Verify(v)) => {
+            (Choice::Passcode, Kind::Verify(v)) if !matches!(v.purpose, Purpose::ArcaSshSign { .. }) => {
                 let user = v.user.clone();
                 self.ceremonies.get_mut(&key).unwrap().state = State::AwaitingPasscode;
                 vec![Action::CheckPasscode { key, user, retry: false }]

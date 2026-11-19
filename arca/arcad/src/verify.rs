@@ -26,6 +26,8 @@ pub const MIN_STRENGTH: Strength = Strength::BiometricSecure;
 pub trait Verify: Send + Sync {
     /// Did the user confirm, on Sigillum's sheet, the use of `description`?
     fn verify(&self, user: &str, description: &str) -> bool;
+    /// Confirm this SSH signing request with an enrolled security key.
+    fn verify_ssh(&self, _user: &str, _description: &str) -> bool { false }
 }
 
 /// sigillumd's client socket.
@@ -39,7 +41,7 @@ impl Sigillum {
         Sigillum { socket: socket.into(), next: AtomicU64::new(1) }
     }
 
-    fn ask(&self, user: &str, description: &str) -> io::Result<bool> {
+    fn ask(&self, user: &str, description: &str, ssh: bool) -> io::Result<bool> {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let mut s = UnixStream::connect(&self.socket)?;
         // The longest ceremony sigillumd runs, and a margin.
@@ -53,10 +55,19 @@ impl Sigillum {
             }
             d.truncate(end);
         }
-        let req = Request::VerifyUser(VerifyUser { ceremony: id, user: user.into(), purpose: Purpose::ArcaItem { description: d }, min_strength: MIN_STRENGTH });
+        let (purpose, min_strength) = if ssh {
+            (Purpose::ArcaSshSign { description: d }, Strength::KeyUv)
+        } else {
+            (Purpose::ArcaItem { description: d }, MIN_STRENGTH)
+        };
+        let req = Request::VerifyUser(VerifyUser { ceremony: id, user: user.into(), purpose, min_strength });
         write_msg(&mut s, &req, client::MAX_MESSAGE)?;
         Ok(match read_msg::<Reply>(&mut s, client::MAX_MESSAGE)? {
-            Some(Reply::Verified { ceremony, strength, .. }) => ceremony == id && strength >= MIN_STRENGTH,
+            Some(Reply::Verified { ceremony, method, strength }) => ceremony == id && if ssh {
+                method == client::Method::SecurityKey && strength == Strength::KeyUv
+            } else {
+                strength >= min_strength
+            },
             _ => false,
         })
     }
@@ -64,8 +75,15 @@ impl Sigillum {
 
 impl Verify for Sigillum {
     fn verify(&self, user: &str, description: &str) -> bool {
-        self.ask(user, description).unwrap_or_else(|e| {
+        self.ask(user, description, false).unwrap_or_else(|e| {
             eprintln!("arcad: sigillumd: {:?}", e.kind());
+            false
+        })
+    }
+
+    fn verify_ssh(&self, user: &str, description: &str) -> bool {
+        self.ask(user, description, true).unwrap_or_else(|e| {
+            eprintln!("arcad: sigillumd SSH verification: {:?}", e.kind());
             false
         })
     }

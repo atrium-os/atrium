@@ -295,8 +295,8 @@ fn person(a: &Agent, user: &str, line: &str, token: &str) -> Result<Vec<String>,
 fn person_request(a: &Agent, user: &str, req: Person, token: &str) -> Result<Vec<String>, String> {
     let e = |e: arca_ssh_agent::arca::Error| e.to_string();
     match req {
-        Person::New { persona, comment } => {
-            let k = a.arca.mint(user, &persona, &comment).map_err(e)?;
+        Person::New { persona, comment, touch } => {
+            let k = a.arca.mint(user, &persona, &comment, touch).map_err(e)?;
             eprintln!("ssh-agent: {user} made key {} in {persona}", &hex(&k.id)[..8]);
             Ok(vec![format!("{} {}", hex(&k.id), public_line(&k.pk, &k.comment))])
         }

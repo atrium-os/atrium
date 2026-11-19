@@ -76,8 +76,10 @@ impl State {
                 rows.extend(passkeys.iter().map(|p| Row { choice: Choice::Passkey(p.id), label: format!("Passkey \u{201c}{}\u{201d}", if p.name.is_empty() { &p.display_name } else { &p.name }) }));
                 rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
             }
-            Sheet::Verify { key, .. } => {
-                rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() });
+            Sheet::Verify { key, purpose, .. } => {
+                if !matches!(purpose, Purpose::ArcaSshSign { .. }) {
+                    rows.push(Row { choice: Choice::Passcode, label: "Use your passcode".into() });
+                }
                 if *key {
                     rows.extend(devices.iter().map(|d| Row { choice: Choice::Device(d.id), label: format!("Use {}", d.name) }));
                 }
@@ -96,6 +98,8 @@ impl State {
             })),
         }
         let notice = (rows.is_empty() || matches!(sheet, Sheet::Verify { key: true, .. }) && devices.is_empty()).then_some(match &sheet {
+            Sheet::Verify { purpose: Purpose::ArcaSshSign { .. }, key: false, .. } => "Enroll a security key to use this SSH key",
+            Sheet::Verify { purpose: Purpose::ArcaSshSign { .. }, .. } => "Plug in your security key",
             Sheet::Verify { .. } => "Plug in your security key, or use your passcode",
             Sheet::Certificates { .. } => "Plug in your token",
             _ => "Plug in your security key",
@@ -116,6 +120,7 @@ impl State {
             Sheet::Verify { requester, user, purpose, .. } => {
                 let why = match purpose {
                     Purpose::ArcaItem { description } => format!("to use \u{201c}{description}\u{201d}"),
+                    Purpose::ArcaSshSign { description } => format!("to sign with SSH key “{description}”"),
                     Purpose::Unlock => "to unlock".into(),
                     Purpose::Admin => "to change a system setting".into(),
                     Purpose::Crossing { from, to, kind } => {

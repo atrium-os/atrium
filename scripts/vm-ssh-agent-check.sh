@@ -61,7 +61,7 @@ hasnt() { case "$3" in *"$2"*) bad "$1: [$2] in [$3]" ;; *) ok "$1" ;; esac; }
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
-    -p jaild -p portcullisd -p portcullis-cli --bin atrium-jaild --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap) || { echo "ssh-agent: 1 failed"; exit 1; }
+    -p jaild -p portcullisd -p portcullis-cli --example sigillum_stand_in --bin atrium-jaild --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arca-ssh-agent" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 
@@ -88,6 +88,7 @@ V "pkill -x portcullisd; pkill -f $B/; sleep 1; rm -rf $B $G; mkdir -p $B $G; ch
 for b in portcullis/target/$TARGET/release/atrium-jaild \
          portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/atrium-portcullisd-bootstrap \
+         portcullis/target/$TARGET/release/examples/sigillum_stand_in \
          arca/arcad/target/$TARGET/release/arcad arca/arcad/target/$TARGET/release/arca-probe \
          arca/arca-ssh-agent/target/$TARGET/release/atrium-ssh-agent arca/arca-ssh-agent/target/$TARGET/release/arca-ssh \
          arca/arca-ssh-agent/target/$TARGET/release/git-credential-arca \
@@ -141,9 +142,12 @@ rm -rf $AR
 sh $B/scripts/ssh-agent-service.sh $B
 cp /etc/atrium/services.d/44-atrium-ssh-agent.toml $G/services.d/
 rm -f $S
+daemon -f -o $G/sigillum.log $B/sigillum_stand_in $G/sigillum.sock
+i=0; while [ \$i -lt 15 ] && ! test -S $G/sigillum.sock; do sleep 1; i=\$((i+1)); done
+test -S $G/sigillum.sock
 : > $AGENT_LOG
 cd $G && env ARCA_DIR=$G/db ARCA_SOCKET=$S ARCA_APP_REGISTRY=/var/run/atrium/app-registry ARCA_VESTIBULUM_UID=50093 \
-   ARCA_SERVICES=ssh-agent=65047 ARCA_COURIER_REGISTRY=$G/none ARCA_SHARE_REGISTRY=$G/none ARCA_SIGILLUM_SOCKET=none \
+   ARCA_SERVICES=ssh-agent=65047 ARCA_COURIER_REGISTRY=$G/none ARCA_SHARE_REGISTRY=$G/none ARCA_SIGILLUM_SOCKET=$G/sigillum.sock \
    daemon -p $G/arcad.pid -o $G/arcad.log $B/arcad </dev/null >/dev/null 2>&1
 i=0; while [ \$i -lt 30 ] && ! test -S $S; do sleep 1; i=\$((i+1)); done
 chmod 755 $G; chmod 666 $S
@@ -261,6 +265,31 @@ has "a replaced token keeps its grant" "password=ghp_gate_token2" "$(run keys "s
 TID2=$(SSHA list | awk '/ token github.com /{print $1}')
 check "broker revokes the token" "ok" "$(agent_admin revoke alice personal "$TID2" keys)"
 hasnt "revoked: none" "ghp_gate_token" "$(run keys "set -- github.com; $CRED")"
+
+echo "=== SSH keys requiring Sigillum"
+protected=$(SSHA new --verify-each-use touch-test)
+protected_id=$(printf '%s\n' "$protected" | cut -d' ' -f1)
+protected_pub=$(printf '%s\n' "$protected" | cut -d' ' -f2-)
+check "protected key minted" 32 "${#protected_id}"
+SSHA grant "$protected_id" keys >/dev/null
+has "protected public key lists before verification" "$protected_pub" "$(run keys 'ssh-add -L 2>&1')"
+prompts() { V "grep -c 'ArcaSshSign.*workspace keys: touch-test' $G/sigillum.log || true"; }
+out=$(run other "set -- '$protected_pub'; $SIGN")
+hasnt "ungranted workspace cannot use protected key" "BEGIN SSH SIGNATURE" "$out"
+check "listing, ordinary signing and ungranted use prompt zero times" 0 "$(prompts)"
+out=$(run keys "set -- '$protected_pub'; $SIGN")
+hasnt "even a successful passcode cannot sign" "BEGIN SSH SIGNATURE" "$out"
+check "passcode reply followed a real request to Sigillum" 1 "$(prompts)"
+V "touch $G/sigillum.sock.refuse"
+out=$(run keys "set -- '$protected_pub'; $SIGN")
+hasnt "Sigillum refusal cannot sign" "BEGIN SSH SIGNATURE" "$out"
+V "rm -f $G/sigillum.sock.refuse; touch $G/sigillum.sock.security-key"
+for use in 1 2; do
+    out=$(run keys "set -- '$protected_pub'; $SIGN")
+    has "security-key verification permits signature $use" "BEGIN SSH SIGNATURE" "$out"
+done
+check "every protected signing attempt asked Sigillum" 4 "$(prompts)"
+SSHA revoke "$protected_id" keys >/dev/null
 
 echo "=== revoke, lock, delete"
 check "broker revokes the key" "ok" "$(agent_admin revoke alice personal "$ID" keys)"

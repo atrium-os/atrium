@@ -1,6 +1,6 @@
 //! arca-ssh: the person's SSH keys in Arca (arca.md §9.1).
 //!
-//!     arca-ssh new [--persona P] COMMENT    make a key; prints its id and public line
+//!     arca-ssh new [--persona P] [--verify-each-use] COMMENT    make a key; prints its id and public line
 //!     arca-ssh list [--persona P]           keys, public lines, the workspaces granted
 //!     arca-ssh grant [--persona P] ID WORKSPACE
 //!     arca-ssh revoke [--persona P] ID WORKSPACE
@@ -29,6 +29,10 @@ fn main() -> ExitCode {
     let Some(verb) = args.first().cloned() else { return usage() };
     let rest = &args[1..];
     let line = match (verb.as_str(), rest.len()) {
+        ("new", 1) if rest[0] == "--verify-each-use" => return usage(),
+        ("new", _) if rest.first().is_some_and(|s| s == "--verify-each-use") => {
+            format!("new-touch {persona} {}", rest[1..].join(" "))
+        }
         ("new", n) if n >= 1 => format!("new {persona} {}", rest.join(" ")),
         ("list", 0) => format!("list {persona}"),
         ("grant" | "revoke", 2) => format!("{verb} {persona} {} {}", rest[0], rest[1]),
@@ -92,6 +96,6 @@ fn no_echo<T>(tty: bool, f: impl FnOnce() -> T) -> T {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: arca-ssh [--persona P] new COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID | token HOST USERNAME");
+    eprintln!("usage: arca-ssh [--persona P] new [--verify-each-use] COMMENT | list | grant ID WORKSPACE | revoke ID WORKSPACE | delete ID | token HOST USERNAME");
     ExitCode::from(2)
 }

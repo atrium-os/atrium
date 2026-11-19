@@ -29,6 +29,26 @@ pub fn token_account(host: &str, user: &str) -> String {
     format!("{host} {user}")
 }
 
+const PUBLIC_KEY: &str = "@ed25519:";
+
+/// Public metadata for keys whose seed needs a touch to read.
+pub fn public_scope(pk: &[u8; 32]) -> Vec<u8> {
+    let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{PUBLIC_KEY}{hex}").into_bytes()
+}
+
+pub fn scope_public_key(scope: &[u8]) -> Option<[u8; 32]> {
+    let hex = std::str::from_utf8(scope).ok()?.lines().next()?.strip_prefix(PUBLIC_KEY)?;
+    let mut pk = [0; 32];
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    for (i, byte) in pk.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(pk)
+}
+
 /// The workspaces in a scope.
 pub fn grants(scope: &[u8]) -> Vec<&str> {
     std::str::from_utf8(scope).unwrap_or("").lines().filter(|l| valid_workspace(l)).collect()
@@ -46,6 +66,11 @@ pub fn with_grant(scope: &[u8], ws: &str, on: bool) -> Vec<u8> {
     }
     v.sort();
     v.dedup();
+    if let Some(line) = std::str::from_utf8(scope).ok().and_then(|s| s.lines().next())
+        .filter(|line| line.starts_with(PUBLIC_KEY))
+    {
+        v.insert(0, line);
+    }
     v.join("\n").into_bytes()
 }
 

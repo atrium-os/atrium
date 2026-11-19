@@ -78,6 +78,8 @@ pub enum Purpose {
     RemovePersona { name: String },
     /// Prelum asks before a saved printer becomes available to every persona.
     SharePrinter { printer: String },
+    /// Arca signing with a verify-each-use SSH key requires an enrolled security key.
+    ArcaSshSign { description: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

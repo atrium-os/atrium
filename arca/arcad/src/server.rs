@@ -182,6 +182,21 @@ impl State {
             return (!names.is_empty()).then(|| (c.user.clone(), format!("{} for {host}", names.join(", "))));
         }
         if let Label::Service(name) = who {
+            if name == crate::ssh::SERVICE && op == ssh_op::SA_SIGN {
+                let mut r = Reader::new(body);
+                let user = r.str(caps::USER).ok()?;
+                let persona = r.str(caps::PERSONA).ok()?;
+                let workspace = r.str(64).ok()?;
+                let id = ItemId(r.array::<16>().ok()?);
+                r.bytes(MAX_SIGN_MSG).ok()?;
+                r.end().ok()?;
+                let store = self.stores.get(user).filter(|s| s.state() == LockState::Unlocked)?;
+                let recipient = Recipient::Service(name.clone());
+                let meta = store.meta(&id, &Access { persona, recipient: &recipient }).ok()?;
+                return (meta.kind == Kind::Ed25519 && meta.class == Class::VerifyEachUse
+                    && crate::ssh::granted(&meta.scope, workspace))
+                    .then(|| (user.into(), format!("workspace {workspace}: {}", meta.account)));
+            }
             if !matches!(op, volume_op::VK_FORGET | volume_op::VK_OLDER | volume_op::VK_CURRENT) || !crate::volume::SERVICES.contains(&name.as_str()) {
                 return None;
             }
@@ -2576,6 +2591,7 @@ impl State {
     /// granted to it by name.
     fn ssh_op(&mut self, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         use crate::ssh::{granted, token_account, valid_host, valid_workspace, with_grant, SERVICE};
+        let verified = std::mem::take(&mut self.verified);
         let mut r = Reader::new(body);
         macro_rules! field {
             ($e:expr) => {
@@ -2595,27 +2611,38 @@ impl State {
         let Some(store) = self.stores.get_mut(&user).filter(|s| s.state() == LockState::Unlocked) else {
             return reply(status::LOCKED);
         };
-        let pubkey = |store: &Store, id: &ItemId| -> Result<[u8; 32], Error> {
-            let (_, seed) = store.release(id, &who, None)?;
+        let pubkey = |store: &Store, m: &arca_store::model::ItemMeta| -> Result<[u8; 32], Error> {
+            if m.class == Class::VerifyEachUse {
+                return crate::ssh::scope_public_key(&m.scope).ok_or(Error::BadInput("SSH public key metadata"));
+            }
+            let (_, seed) = store.release(&m.id, &who, None)?;
             Ok(signing_key(&seed).verifying_key().to_bytes())
         };
         match op {
             ssh_op::SA_MINT => {
                 let comment = field!(r.str(ssh_op::COMMENT_MAX));
+                let class = if r.remaining() == 0 {
+                    Class::WhileUnlocked
+                } else if field!(r.u8()) == Class::VerifyEachUse as u8 {
+                    Class::VerifyEachUse
+                } else {
+                    return malformed();
+                };
                 field!(r.end());
                 if comment.chars().any(|c| c.is_control()) {
                     return malformed();
                 }
                 let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
                 let pk = signing_key(&seed).verifying_key().to_bytes();
+                let scope = if class == Class::VerifyEachUse { crate::ssh::public_scope(&pk) } else { Vec::new() };
                 let m = tri!(store.add(NewItem {
                     persona: &persona,
                     recipient: me.clone(),
-                    class: Class::WhileUnlocked,
+                    class,
                     kind: Kind::Ed25519,
                     provenance: Provenance::ArcaGenerated,
                     account: comment,
-                    scope: b"",
+                    scope: &scope,
                     value: seed.as_ref(),
                 }));
                 *item = Some(m.id);
@@ -2650,13 +2677,13 @@ impl State {
                         w.u16(m.kind as u16);
                     }
                     if m.kind == Kind::Ed25519 {
-                        w.raw(&tri!(pubkey(store, &m.id)));
+                        w.raw(&tri!(pubkey(store, &m)));
                     } else {
                         w.raw(&[0; 32]);
                     }
                     w.str(&m.account);
                     if ws.is_none() {
-                        w.str(std::str::from_utf8(&m.scope).unwrap_or(""));
+                        w.str(&crate::ssh::grants(&m.scope).join("\n"));
                     }
                     n += 1;
                 }
@@ -2764,7 +2791,8 @@ impl State {
                 if m.kind != Kind::Ed25519 || !granted(&m.scope, ws) {
                     return reply(status::DENIED);
                 }
-                let (_, seed) = tri!(store.release(&id, &who, None));
+                let verified = verified.then(arca_store::UserVerified::vouched_by_vestibulum);
+                let (_, seed) = tri!(store.release(&id, &who, verified));
                 let sk = signing_key(&seed);
                 drop(seed);
                 ok(sk.sign(msg).to_bytes().to_vec())

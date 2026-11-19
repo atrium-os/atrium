@@ -158,3 +158,76 @@ fn a_workspace_gets_only_its_granted_https_token() {
     s.handle(&agent(), ssh_op::SA_FORGET, &body(|w| { w.str("alice"); w.str("main"); w.str("web"); }));
     assert_eq!(token_get(&mut s, &agent(), "main", "web", "github.com").0, status::DENIED);
 }
+
+#[test]
+fn touch_keys_list_publicly_and_require_a_new_security_key_reply_for_each_signature() {
+    use arcad::{proto, verify::Sigillum};
+    use sigillum_proto::client::{Method, Purpose, Reply, Request, Strength};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let (d, mut state) = setup();
+    let r = state.handle(&agent(), ssh_op::SA_MINT, &body(|w| {
+        w.str("alice");
+        w.str("main");
+        w.str("touch-test");
+        w.u8(arca_store::Class::VerifyEachUse as u8);
+    }));
+    assert_eq!(r.status, status::OK);
+    let id: [u8; 16] = r.body.bytes()[..16].try_into().unwrap();
+    let pk: [u8; 32] = r.body.bytes()[16..].try_into().unwrap();
+    assert_eq!(grant(&mut state, "main", id, "web", true), status::OK);
+    assert_eq!(keys(&mut state, "main", "web"), vec![(id, pk, "touch-test".into())]);
+    assert_eq!(sign(&mut state, &agent(), "main", "web", id, b"m").0, status::NEEDS_VERIFICATION);
+    assert_eq!(sign(&mut state, &agent(), "main", "other", id, b"m").0, status::DENIED);
+    let state = Arc::new(Mutex::new(state));
+    let path = d.path().join("uv.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let daemon_state = state.clone();
+    let arcad = std::thread::spawn(move || {
+        arcad::serve_conn_with(server, &agent(), &daemon_state, Some(&Sigillum::new(path))).unwrap();
+    });
+    let verifier = std::thread::spawn(move || {
+        for (index, (method, strength)) in [
+            (Method::Passcode, Strength::Passcode),
+            (Method::SecurityKey, Strength::KeyUv),
+            (Method::SecurityKey, Strength::KeyUv),
+            (Method::SecurityKey, Strength::KeyUv),
+        ].into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let Some(Request::VerifyUser(v)) = sigillum_proto::read_msg(&mut socket, 4096).unwrap() else {
+                panic!("expected an SSH verification ceremony");
+            };
+            assert_eq!(v.ceremony, index as u64 + 1);
+            assert_eq!(v.user, "alice");
+            assert_eq!(v.purpose, Purpose::ArcaSshSign { description: "workspace web: touch-test".into() });
+            assert_eq!(v.min_strength, Strength::KeyUv);
+            let mut state = state.try_lock().expect("Arca released its lock before asking");
+            if index == 3 {
+                assert_eq!(grant(&mut state, "main", id, "web", false), status::OK);
+            }
+            drop(state);
+            sigillum_proto::write_msg(&mut socket, &Reply::Verified { ceremony: v.ceremony, method, strength }, 4096).unwrap();
+        }
+    });
+    let request = |client: &mut UnixStream| {
+        proto::write_request(client, ssh_op::SA_SIGN, &body(|w| {
+            w.str("alice"); w.str("main"); w.str("web"); w.raw(&id); w.bytes(b"m");
+        })).unwrap();
+        proto::read_reply(client).unwrap()
+    };
+    assert_eq!(request(&mut client).0, status::NEEDS_VERIFICATION);
+    for _ in 0..2 {
+        let (status_code, sig) = request(&mut client);
+        assert_eq!(status_code, status::OK);
+        VerifyingKey::from_bytes(&pk).unwrap().verify(b"m", &Signature::from_slice(sig.as_ref()).unwrap()).unwrap();
+    }
+    assert_eq!(request(&mut client).0, status::DENIED, "revoked while the sheet was open");
+    verifier.join().unwrap();
+    drop(client);
+    arcad.join().unwrap();
+}

@@ -1047,6 +1047,15 @@ administrative calls (`C_InnaIT*`: zeroize, initialise, applet install and delet
   through vestibulum or a gate of its own); removing a key (a user deletes its file entry
   through ostiarius, to be added with the settings page).
 
+### 16.7 SSH signing approval
+
+Arca can request `VerifyUser` with purpose `ArcaSshSign` for an
+already-granted verify-each-use key. Sigillum offers the enrolled security
+key and verifies its presence and user verification against the registered
+credential. The sheet identifies the SSH key and workspace. The broker
+restricts this purpose to Arca and rejects the passcode choice. Arca accepts
+a `SecurityKey` / `KeyUv` reply for that ceremony only.
+
 ## 17. Decisions, with recommendations
 
 **Accepted by Shankar, 2026-11-13: all eleven, as recommended.**

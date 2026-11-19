@@ -696,7 +696,9 @@ items or reads a value by name.
 For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
 
 - **Keys** are Ed25519 items in the person's store, in the workspace's persona (Personal is
-  Arca's `main`), recipient `Service("ssh-agent")`, class while-unlocked, made inside arcad.
+  Arca's `main`), recipient `Service("ssh-agent")`, made inside arcad.
+  The default class is while-unlocked. `arca-ssh new --verify-each-use COMMENT`
+  opts into per-signature confirmation with an enrolled Sigillum security key.
   The item's scope holds the workspaces the key is granted to, one name a line. Ops
   `ssh_op` 0xC0–0xC7 (`SA_MINT`, `SA_LIST`, `SA_GRANT`, `SA_REVOKE`, `SA_DELETE`, `SA_KEYS`,
   `SA_SIGN`, `SA_FORGET`; 0xC8–0xC9 for tokens, below), answered only for the `ARCA_SERVICES` entry `ssh-agent`
@@ -734,8 +736,13 @@ For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
   brokers list, grant and revoke after authenticating Settings by its peer
   UID and installed capability, and spends a Fresco APPROVE press before a
   write. The agent's root control protocol serves those three operations on
-  explicit owner and persona. List returns metadata only. A Sigillum touch
-  per use (verify-each-use keys) is pending.
+  explicit owner and persona. List returns metadata only.
+- **Verify-each-use SSH keys** expose their public key from item metadata.
+  Arca checks the workspace grant before prompting, releases its state lock
+  while waiting, and rechecks the grant and unlock state before signing.
+  Each invocation accepts only a fresh Sigillum reply for an enrolled
+  security key with user verification and presence. Refusal, an unavailable
+  verifier, or a passcode reply returns no signature.
 - Gate: `scripts/vm-ssh-agent-check.sh`.
 
 ## 10. Audit

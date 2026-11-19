@@ -913,3 +913,30 @@ fn a_forged_or_replayed_key_answer_is_refused() {
     assert!(matches!(r.reply(), Reply::Refused { .. }));
     assert!(r.audit.iter().any(|a| a.contains("sign count")));
 }
+
+#[test]
+fn arca_ssh_sign_requires_the_enrolled_security_key() {
+    let request = || Request::VerifyUser(VerifyUser {
+        ceremony: 9, user: "shankar".into(),
+        purpose: Purpose::ArcaSshSign { description: "Git key in workspace web".into() },
+        min_strength: Strength::KeyUv,
+    });
+    let mut r = Rig::new(SoftKey::new(Some(PIN)));
+    r.request(&Label::Ostiarius, request());
+    assert!(matches!(r.reply(), Reply::Refused { reason: Refusal::Denied, .. }));
+    r.request(&Label::Ostiarius, enrol());
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::KeyEnrolled { .. }));
+    r.passcode_asks = 0;
+    r.request(&Label::Arca, request());
+    assert!(matches!(&r.sheets.last().unwrap().1, Sheet::Verify { key: true, .. }));
+    r.press_last(Choice::Passcode);
+    assert!(r.replies.is_empty());
+    assert_eq!(r.passcode_asks, 0);
+    r.press_last(Choice::Device(DEV));
+    assert!(matches!(r.reply(), Reply::Verified { ceremony: 9, method: sigillum_proto::client::Method::SecurityKey, strength: Strength::KeyUv }));
+    r.key.borrow_mut().touch = false;
+    r.request(&Label::Arca, request());
+    r.press_last(Choice::Device(DEV));
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 9, reason: Refusal::NotAllowed });
+}

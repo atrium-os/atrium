@@ -55,7 +55,12 @@ pub fn serve_conn_with(stream: UnixStream, label: &label::Label, state: &Mutex<s
         if r.status == proto::status::NEEDS_VERIFICATION {
             let prompt = verifier.and_then(|v| Some((v, lock().verify_prompt(label, op, &b[2..])?)));
             if let Some((v, (user, description))) = prompt {
-                if v.verify(&user, &description) {
+                let verified = if op == proto::ssh_op::SA_SIGN {
+                    v.verify_ssh(&user, &description)
+                } else {
+                    v.verify(&user, &description)
+                };
+                if verified {
                     r = lock().handle_verified(label, op, &b[2..]);
                 }
             }

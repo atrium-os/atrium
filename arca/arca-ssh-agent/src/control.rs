@@ -5,7 +5,7 @@
 //!   WORKSPACE`, `forget OWNER WORKSPACE PERSONA` (deleted: its grants go),
 //!   `list OWNER PERSONA` and `grant|revoke OWNER PERSONA ID WORKSPACE`;
 //! - a person (a uid with a passwd entry that is not a launched app's):
-//!   `new PERSONA COMMENT...`, `list PERSONA`, `grant|revoke PERSONA ID
+//!   `new|new-touch PERSONA COMMENT...`, `list PERSONA`, `grant|revoke PERSONA ID
 //!   WORKSPACE`, `delete PERSONA ID`, `token PERSONA HOST USERNAME` (the
 //!   token on the next line), acting on their own keys only.
 
@@ -24,7 +24,7 @@ pub enum Admin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Person {
-    New { persona: String, comment: String },
+    New { persona: String, comment: String, touch: bool },
     List { persona: String },
     Grant { persona: String, id: [u8; 16], ws: String, on: bool },
     Delete { persona: String, id: [u8; 16] },
@@ -68,11 +68,11 @@ pub fn parse_person(line: &str) -> Option<Person> {
     let f: Vec<&str> = rest.split_ascii_whitespace().collect();
     let p = |s: &&str| valid_persona(s).then(|| s.to_string());
     match (verb, f.as_slice()) {
-        ("new", [persona, ..]) => {
+        ("new" | "new-touch", [persona, ..]) => {
             let comment = rest.trim_start().strip_prefix(*persona)?.trim().to_string();
             (!comment.is_empty() && comment.len() <= arcad::proto::ssh_op::COMMENT_MAX && !comment.chars().any(char::is_control))
                 .then_some(())?;
-            Some(Person::New { persona: p(persona)?, comment })
+            Some(Person::New { persona: p(persona)?, comment, touch: verb == "new-touch" })
         }
         ("list", [persona]) => Some(Person::List { persona: p(persona)? }),
         ("grant" | "revoke", [persona, id, ws]) if ws_ok(ws) => {
@@ -100,7 +100,7 @@ mod tests {
         assert_eq!(parse_admin("close alice web"), Some(Admin::Close { owner: "alice".into(), ws: "web".into() }));
         assert!(matches!(parse_admin("forget alice web work"), Some(Admin::Forget { .. })));
         assert_eq!(parse_person("new personal alice@laptop key"),
-                   Some(Person::New { persona: "personal".into(), comment: "alice@laptop key".into() }));
+                   Some(Person::New { persona: "personal".into(), comment: "alice@laptop key".into(), touch: false }));
         assert_eq!(parse_person("new personal"), None);
         assert_eq!(parse_person("new Bad x"), None);
         let id = "00112233445566778899aabbccddeeff";

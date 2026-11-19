@@ -38,6 +38,7 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "Arca: {e}"),
             Error::Refused(status::LOCKED) => write!(f, "Arca is locked"),
             Error::Refused(status::DENIED) => write!(f, "no such key"),
+            Error::Refused(status::NEEDS_VERIFICATION) => write!(f, "security key verification required"),
             Error::Refused(s) => write!(f, "Arca refused ({s})"),
             Error::Malformed => write!(f, "Arca's answer was malformed"),
         }
@@ -64,7 +65,9 @@ fn owner(w: &mut Writer, user: &str, persona: &str) {
 impl Arca {
     fn call(&self, op: u16, body: &[u8]) -> Result<Vec<u8>, Error> {
         let mut s = UnixStream::connect(&self.socket)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // Signing may be waiting on an enrolled key on Sigillum's sheet.
+        let read_seconds = if op == ssh_op::SA_SIGN { 11 * 60 + 5 } else { 10 };
+        s.set_read_timeout(Some(Duration::from_secs(read_seconds)))?;
         s.set_write_timeout(Some(Duration::from_secs(10)))?;
         proto::write_request(&mut s, op, body)?;
         let (st, b) = proto::read_reply(&mut s)?;
@@ -74,10 +77,13 @@ impl Arca {
         Ok(b.as_ref().to_vec())
     }
 
-    pub fn mint(&self, user: &str, persona: &str, comment: &str) -> Result<Key, Error> {
+    pub fn mint(&self, user: &str, persona: &str, comment: &str, touch: bool) -> Result<Key, Error> {
         let mut w = Writer::new();
         owner(&mut w, user, persona);
         w.str(comment);
+        if touch {
+            w.u8(arca_store::Class::VerifyEachUse as u8);
+        }
         let b = self.call(ssh_op::SA_MINT, &w.buf)?;
         let mut r = Reader::new(&b);
         let k = Key { id: r.array()?, pk: r.array()?, comment: comment.into() };

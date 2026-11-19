@@ -368,14 +368,14 @@ pub mod volume_op {
 
 /// The SSH agent's ops (0xC0..), arca.md §9.1: only the `ARCA_SERVICES`
 /// entry named [`crate::ssh::SERVICE`]. Keys are Ed25519 items in the
-/// owner's persona with that service as recipient, class while-unlocked;
+/// owner's persona with that service as recipient, while-unlocked or verify-each-use;
 /// an item's scope holds the workspaces it is granted to, one name a line.
 /// `owner` is `str user | str persona`. The agent names the owner and the
 /// workspace from the kernel's peer uid and the launch registry (it is the
 /// one service trusted to); the private key never leaves arcad.
 pub mod ssh_op {
     /// The person (through the agent's control socket): `owner | str
-    /// comment` → `id[16] | pubkey[32]`.
+    /// comment [| u8 verify-each-use class]` → `id[16] | pubkey[32]`.
     pub const SA_MINT: u16 = 0xC0;
     /// The person: `owner` → `u32 n | n × (id[16] | u16 kind | pubkey[32]
     /// | str comment | str grants)`, grants newline-separated: keys
@@ -392,7 +392,8 @@ pub mod ssh_op {
     /// n × (id[16] | pubkey[32] | str comment)`, the keys granted to it.
     pub const SA_KEYS: u16 = 0xC5;
     /// A workspace's agent connection: `owner | str workspace | id[16] |
-    /// bytes msg` → `sig[64]`. `DENIED` unless the key is granted to it.
+    /// bytes msg` → `sig[64]`. `DENIED` unless the key is granted to it. A
+    /// verify-each-use key requires a successful Sigillum security-key ceremony.
     pub const SA_SIGN: u16 = 0xC6;
     /// portcullisd, through the agent, when a workspace is deleted: `owner |
     /// str workspace` → `u32 n`, the keys whose grant to it went.
