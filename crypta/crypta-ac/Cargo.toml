@@ -1,0 +1,12 @@
+[package]
+name        = "crypta-ac"
+version     = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish     = false
+description = "Crypta's AnyConnect engine core (docs/spec/vpn.md §9): the config-auth XML exchange, sign-in forms, CSTP framing and the gateway's pushed settings, sans-IO, every parser bounded and fuzzed. TLS only (no DTLS, decision 13)."
+
+[dependencies]
+crypta-proto = { path = "../crypta-proto" }
+serde        = { version = "1", features = ["derive"] }
+zeroize      = "1"

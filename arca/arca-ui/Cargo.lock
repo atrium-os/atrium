@@ -53,6 +53,7 @@ name = "arcad"
 version = "0.1.0"
 dependencies = [
  "arca-store",
+ "chacha20poly1305",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "libc",
@@ -61,6 +62,8 @@ dependencies = [
  "psl",
  "sha2",
  "sigillum-proto",
+ "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -97,11 +100,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-colr"
+version = "0.1.0"
+dependencies = [
+ "skrifa",
+ "tiny-skia",
+]
+
+[[package]]
 name = "atrium-links"
 version = "0.1.0"
 dependencies = [
  "idna",
  "url",
+]
+
+[[package]]
+name = "atrium-listen"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -862,6 +880,7 @@ name = "limen"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-listen",
  "fresco-protocol",
  "libc",
  "lyra-protocol",
@@ -970,6 +989,7 @@ name = "pergola"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "atrium-colr",
  "fresco-client",
  "fresco-protocol",
  "futures-signals",
@@ -983,7 +1003,7 @@ dependencies = [
  "swash",
  "tabula",
  "taffy",
- "tiny-skia-path",
+ "tiny-skia-path 0.12.0",
  "unicode-linebreak",
  "unicode-segmentation",
  "unicode-width",
@@ -1473,6 +1493,7 @@ dependencies = [
  "aqueduct",
  "fresco-protocol",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "serde",
 ]
@@ -1540,6 +1561,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tiny-skia"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83d13394d44dae3207b52a326c0c85a8bf87f1541f23b0d143811088497b09ab"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "bytemuck",
+ "cfg-if",
+ "log",
+ "tiny-skia-path 0.11.4",
+]
+
+[[package]]
+name = "tiny-skia-path"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "strict-num",
 ]
 
 [[package]]
@@ -1800,6 +1846,18 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "yazi"

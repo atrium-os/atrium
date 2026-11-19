@@ -108,6 +108,7 @@ fn the_engine_carries_packets_with_its_key_held_elsewhere() {
                 FromEngine::Up => { up = true; eprintln!("up at {:?}", t0.elapsed()); }
                 FromEngine::Down { why } => panic!("down: {why}"),
                 FromEngine::Stats { .. } => {}
+                other => panic!("not WireGuard's: {other:?}"),
             }
         }
         // The server.

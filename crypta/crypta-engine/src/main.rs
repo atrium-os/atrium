@@ -257,7 +257,7 @@ fn main() {
                         return;
                     }
                     ToEngine::Rebind => log("network changed: the next packet goes the new way"),
-                    ToEngine::Start(_) | ToEngine::Dh(_) => log("unexpected frame ignored"),
+                    _ => log("unexpected frame ignored"),
                 }
             }
             if c.gone {

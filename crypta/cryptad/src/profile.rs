@@ -34,6 +34,62 @@ pub struct Profile {
     /// whose `vpn` names this profile use it, through its route domain;
     /// the rest of the machine never sees it. Off: machine scope.
     pub scoped: bool,
+    /// An AnyConnect profile (vpn.md §9, V4); the WireGuard fields above
+    /// are then unused.
+    pub ac: Option<Ac>,
+}
+
+/// An AnyConnect gateway and how to sign in to it. No secret: a saved
+/// password, the session cookie and the client key are Arca items of the
+/// crypta service, named by account (`<profile>/password`, `/session`,
+/// `/tls`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ac {
+    /// The gateway's name (TLS and `Host`), resolved at each connect.
+    pub host: String,
+    pub port: u16,
+    /// `/` or a group's path.
+    pub path: String,
+    /// CA certificates the profile trusts besides the system's (DER).
+    pub cas: Vec<Vec<u8>>,
+    /// Or the gateway's own certificate, pinned by its SHA-256.
+    pub pin: Option<[u8; 32]>,
+    /// Remembered after a successful sign-in, offered next time.
+    pub username: Option<String>,
+    pub group: Option<String>,
+    /// What the gateway is told this machine is called (§9.5).
+    pub hostname: String,
+    /// The client certificate chain (DER, its own first); its key is the
+    /// Arca item `<profile>/tls`.
+    pub cert_chain: Vec<Vec<u8>>,
+    /// The client key's public point (SEC1), once made.
+    pub cert_key: Option<Vec<u8>>,
+}
+
+/// A gateway name: a DNS name (letters, digits, `-`, dots), at most 253.
+pub fn valid_host(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 253 && h.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') && !l.starts_with('-'))
+}
+
+/// A gateway path: `/` and URL-safe characters only.
+pub fn valid_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && p.len() <= 128 && p.bytes().all(|c| c.is_ascii_alphanumeric() || b"/-_.~".contains(&c))
+}
+
+/// The hostname the gateway is told by default (§9.5): generic.
+pub const HOSTNAME: &str = "atrium";
+
+/// A PEM file's certificates (DER), or one base64 body.
+pub fn certs_of(text: &str) -> Option<Vec<Vec<u8>>> {
+    if !text.contains("-----BEGIN") {
+        return crypta_proto::b64::decode(text.trim()).filter(|d| !d.is_empty()).map(|d| vec![d]);
+    }
+    let mut out = Vec::new();
+    for blk in text.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let body: String = blk.split("-----END").next()?.lines().map(str::trim).collect();
+        out.push(crypta_proto::b64::decode(&body)?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// A profile name: what the user calls the tunnel, as a file name and an
@@ -109,6 +165,7 @@ impl Profile {
             block: full,
             insecure: false,
             scoped: false,
+            ac: None,
         })
     }
 
@@ -151,7 +208,94 @@ impl Profile {
             block: full,
             insecure: false,
             scoped: false,
+            ac: None,
         })
+    }
+
+    /// From a `create-ac` request (vpn.md §7.3, V4): an AnyConnect
+    /// gateway, `host=` (`name[:port]`), with optional `path=`, `group=`,
+    /// `user=`, `pin=` (hex SHA-256 of the gateway's certificate) and `ca=`
+    /// (base64 DER of a CA to trust).
+    pub fn from_create_ac(l: &Line) -> Result<Profile, &'static str> {
+        let name = l.get("name").filter(|n| valid_name(n)).ok_or("bad-name")?.to_string();
+        let hp = l.get("host").ok_or("bad-host")?;
+        let (host, port) = match hp.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok().filter(|p| *p > 0).ok_or("bad-host")?),
+            None => (hp, 443),
+        };
+        let host = host.to_ascii_lowercase();
+        if !valid_host(&host) {
+            return Err("bad-host");
+        }
+        let path = l.get("path").unwrap_or("/").to_string();
+        if !valid_path(&path) {
+            return Err("bad-path");
+        }
+        let text = |k: &str| -> Result<Option<String>, &'static str> {
+            match l.hex(k) {
+                None if l.get(k).is_none() => Ok(None),
+                Some(b) => String::from_utf8(b).ok().filter(|s| !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control)).map(Some).ok_or("bad-text"),
+                None => Err("bad-text"),
+            }
+        };
+        let pin = match l.get("pin") {
+            None => None,
+            Some(_) => Some(hexa::<32>(l, "pin").ok_or("bad-pin")?),
+        };
+        let cas = match l.get("ca") {
+            None => Vec::new(),
+            Some(c) => certs_of(c).ok_or("bad-ca")?,
+        };
+        Ok(Profile {
+            name,
+            key: [0; 16],
+            public: [0; 32],
+            psk: None,
+            peer: [0; 32],
+            endpoint: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
+            keepalive: None,
+            addrs: Vec::new(),
+            allowed: Vec::new(),
+            dns: Vec::new(),
+            domains: Vec::new(),
+            mtu: None,
+            block: false,
+            // Pushed names under a signed parent often fail DNSSEC (§5.5).
+            insecure: true,
+            // A person's corporate VPN carries their work apps (§9.6).
+            scoped: l.get("scoped") != Some("0"),
+            ac: Some(Ac {
+                host,
+                port,
+                path,
+                cas,
+                pin,
+                username: text("user")?,
+                group: text("group")?,
+                hostname: HOSTNAME.into(),
+                cert_chain: Vec::new(),
+                cert_key: None,
+            }),
+        })
+    }
+
+    /// The tunnel for atrium-net from what an AnyConnect gateway pushed,
+    /// to the address cryptad resolved.
+    pub fn ac_proposal(&self, p: &crypta_proto::engine::Pushed, gw: SocketAddrV4) -> Tunnel {
+        Tunnel {
+            addrs: vec![Net4 { addr: p.addr, prefix: p.prefix }],
+            mtu: p.mtu,
+            includes: if p.full { Vec::new() } else { p.includes.iter().map(|x| Net4 { addr: x.addr, prefix: x.len }).collect() },
+            full: p.full,
+            dns: p.dns.clone(),
+            domains: p.domains.clone(),
+            insecure: self.insecure,
+            gateway: *gw.ip(),
+            port: gw.port(),
+            tcp: true,
+            block: self.block && p.full,
+            scoped: self.scoped,
+        }
     }
 
     pub fn full(&self) -> bool {
@@ -171,6 +315,7 @@ impl Profile {
             insecure: self.insecure,
             gateway: *self.endpoint.ip(),
             port: self.endpoint.port(),
+            tcp: false,
             block: self.block && full,
             scoped: self.scoped,
         }
@@ -202,7 +347,30 @@ impl Profile {
         if !self.domains.is_empty() {
             p = p.with("domains", self.domains.join(","));
         }
+        if let Some(a) = &self.ac {
+            p = p.with("kind", "ac").with("host", &a.host).with("port", a.port).with("path", &a.path).with_hex("hostname", a.hostname.as_bytes());
+            if let Some(u) = &a.username {
+                p = p.with_hex("user", u.as_bytes());
+            }
+            if let Some(g) = &a.group {
+                p = p.with_hex("group", g.as_bytes());
+            }
+            if let Some(x) = &a.pin {
+                p = p.with_hex("pin", x);
+            }
+            if let Some(k) = &a.cert_key {
+                p = p.with_hex("certkey", k);
+            }
+        }
         let mut out = String::from_utf8(p.encode().unwrap_or_default()).unwrap_or_default();
+        if let Some(a) = &self.ac {
+            for (verb, ders) in [("ca", &a.cas), ("certificate", &a.cert_chain)] {
+                for d in ders.iter() {
+                    let l = Line::new(verb).with("der", crypta_proto::b64::encode(d));
+                    out.push_str(&String::from_utf8(l.encode().unwrap_or_default()).unwrap_or_default());
+                }
+            }
+        }
         for c in self.allowed.chunks(128) {
             let l = Line::new("allowed").with("add", join(c));
             out.push_str(&String::from_utf8(l.encode().unwrap_or_default()).unwrap_or_default());
@@ -218,15 +386,40 @@ impl Profile {
         }
         let flag = |k: &str| l.get(k) == Some("1");
         let mut allowed = Vec::new();
+        let (mut cas, mut chain) = (Vec::new(), Vec::new());
         for a in lines {
             let a = a?;
-            if a.verb != "allowed" {
-                return None;
-            }
-            for p in list(&a, "add") {
-                allowed.push(Prefix4::parse(p)?);
+            match a.verb.as_str() {
+                "allowed" => {
+                    for p in list(&a, "add") {
+                        allowed.push(Prefix4::parse(p)?);
+                    }
+                }
+                "ca" => cas.push(crypta_proto::b64::decode(a.get("der")?)?),
+                "certificate" => chain.push(crypta_proto::b64::decode(a.get("der")?)?),
+                _ => return None,
             }
         }
+        let utf8 = |k: &str| l.hex(k).and_then(|b| String::from_utf8(b).ok());
+        let ac = match l.get("kind") {
+            Some("ac") => Some(Ac {
+                host: l.get("host").filter(|h| valid_host(h))?.to_string(),
+                port: l.num("port")?,
+                path: l.get("path").filter(|p| valid_path(p))?.to_string(),
+                cas,
+                pin: match l.get("pin") {
+                    Some(_) => Some(hexa(&l, "pin")?),
+                    None => None,
+                },
+                username: utf8("user"),
+                group: utf8("group"),
+                hostname: utf8("hostname").unwrap_or_else(|| HOSTNAME.into()),
+                cert_chain: chain,
+                cert_key: l.hex("certkey"),
+            }),
+            None => None,
+            Some(_) => return None,
+        };
         let addrs: Option<Vec<Prefix4>> = list(&l, "addr")
             .map(|a| {
                 let (ip, len) = a.split_once('/')?;
@@ -255,6 +448,7 @@ impl Profile {
             block: flag("block"),
             insecure: flag("insecure"),
             scoped: flag("scoped"),
+            ac,
         })
     }
 
@@ -360,6 +554,42 @@ mod tests {
         assert_eq!(Profile::load(d.path(), "big").unwrap(), p);
         assert_eq!(Profile::names(d.path()), vec!["big".to_string()]);
         assert!(Profile::load(d.path(), "../big").is_none());
+    }
+
+    #[test]
+    fn an_anyconnect_profile() {
+        let ca = crypta_proto::b64::encode(&[0x30, 0x03, 0x02, 0x01, 0x01]);
+        let l = Line::parse(&format!("create-ac name=work host=GW.corp.example:8443 path=/staff user={} group={} ca={ca}", aura_ipc::hex(b"ann smith"), aura_ipc::hex(b"Staff"))).unwrap();
+        let mut p = Profile::from_create_ac(&l).unwrap();
+        let a = p.ac.clone().unwrap();
+        assert_eq!((a.host.as_str(), a.port, a.path.as_str(), a.username.as_deref(), a.group.as_deref()), ("gw.corp.example", 8443, "/staff", Some("ann smith"), Some("Staff")));
+        assert!(p.scoped && p.insecure && !p.block, "a corporate VPN carries a persona's apps by default");
+        p.ac.as_mut().unwrap().cert_chain = vec![vec![1, 2, 3]];
+        p.ac.as_mut().unwrap().cert_key = Some(vec![4; 65]);
+        let back = Profile::from_text(&p.to_text()).unwrap();
+        assert_eq!(back, p);
+        let pushed = crypta_proto::engine::Pushed {
+            addr: "10.98.0.50".parse().unwrap(),
+            prefix: 24,
+            mtu: 1378,
+            dns: vec!["10.98.0.1".parse().unwrap()],
+            domains: vec!["corp.crypta.test".into()],
+            includes: vec![Prefix4::parse("10.98.0.0/24").unwrap()],
+            excludes: vec![],
+            full: false,
+            banner: String::new(),
+            ignored: vec![],
+        };
+        let mut t = p.ac_proposal(&pushed, "198.51.100.52:443".parse().unwrap());
+        assert!(t.tcp && !t.full && t.scoped && t.includes.len() == 1);
+        assert_eq!(t.addrs, vec![Net4 { addr: "10.98.0.50".parse().unwrap(), prefix: 24 }]);
+        let host = net_proto::HostView { others: vec![("10.88.0.50".parse().unwrap(), 24)] };
+        assert_eq!(net_proto::tunnel::check_tunnel(&mut t, &host), Ok(()));
+        for bad in ["host=-x", "host=a:0", "host=a/b", "path=//x", "pin=12", "ca=!!", "user=zz"] {
+            let (k, _) = bad.split_once('=').unwrap();
+            let text = l.fields.iter().filter(|(kk, _)| kk != k).map(|(k, v)| format!(" {k}={v}")).collect::<String>();
+            assert!(Profile::from_create_ac(&Line::parse(&format!("create-ac{text} {bad}")).unwrap()).is_err(), "{bad}");
+        }
     }
 
     #[test]

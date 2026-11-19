@@ -149,3 +149,29 @@ fn a_wifi_passphrase_goes_only_to_the_wifi_key_service_once() {
     assert_eq!(s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice"))).status, status::OK);
     assert_eq!(s.handle(&keys, op::TAKE_WIFI, &h).status, status::DENIED);
 }
+
+#[test]
+fn a_vpn_field_goes_only_to_the_crypta_service_once() {
+    let (_d, mut s) = setup();
+    let crypta = Label::Service(op::CRYPTA_SERVICE.into());
+    let hold = |s: &mut State| -> [u8; 16] {
+        let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { parent(w, 7, "org.atrium.curia"); w.bytes(b"vpn-pw"); w.u8(op::HOLD_FOR_VPN); }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().try_into().unwrap()
+    };
+    let h = hold(&mut s);
+    assert!(s.redeem(&h, "alice", &rcp(7, "org.atrium.curia")).is_none());
+    let h = hold(&mut s);
+    assert_eq!(s.handle(&Label::Service(op::WIFI_SERVICE.into()), op::TAKE_WIFI, &h).status, status::DENIED);
+    let h = hold(&mut s);
+    assert_eq!(s.handle(&Label::Service(op::WIFI_SERVICE.into()), op::TAKE_VPN, &h).status, status::DENIED);
+    let h = hold(&mut s);
+    let r = s.handle(&crypta, op::TAKE_VPN, &h);
+    assert_eq!(r.status, status::OK);
+    assert_eq!(Reader::new(r.body.bytes()).bytes(64).unwrap(), b"vpn-pw");
+    assert_eq!(s.handle(&crypta, op::TAKE_VPN, &h).status, status::DENIED, "once");
+    // A Wi-Fi passphrase is not crypta's.
+    let r = s.handle(&Label::TrustedUi, op::U_HOLD, &body(|w| { parent(w, 7, "org.atrium.curia"); w.bytes(b"wifi"); w.u8(op::HOLD_FOR_WIFI); }));
+    let h: [u8; 16] = r.body.bytes().try_into().unwrap();
+    assert_eq!(s.handle(&crypta, op::TAKE_VPN, &h).status, status::DENIED);
+}

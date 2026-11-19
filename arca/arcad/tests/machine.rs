@@ -240,3 +240,49 @@ fn cryptad_keeps_wireguard_keys_it_can_use_and_never_read() {
     assert_ne!(s.handle(&vinculum(), op::DH_X25519, &b).status, status::OK);
     assert_ne!(s.handle(&vinculum(), op::PUBKEY, &id).status, status::OK);
 }
+
+/// Crypta V4 (vpn.md §9.3): a TLS client key cryptad's helper can sign
+/// with and never read, a saved password and a session cookie it keeps.
+#[test]
+fn cryptad_signs_with_a_tls_client_key_and_keeps_a_session() {
+    const TLS_KEY: u16 = 0x105;
+    const PASSWORD: u16 = 1;
+    const COOKIE: u16 = 2;
+    use p256::ecdsa::signature::Verifier;
+    let crypta = Label::Service(op::CRYPTA_SERVICE.into());
+    let d = tempfile::tempdir().unwrap();
+    let mut s = machine(&d);
+    let r = s.handle(&crypta, op::MINT, &body(|w| { w.u16(TLS_KEY); w.u8(AFTER_BOOT); w.str("acme/tls"); }));
+    assert_eq!(r.status, status::OK);
+    let (id, point) = (r.body.bytes()[..16].to_vec(), r.body.bytes()[16..].to_vec());
+    assert_eq!(point.len(), 65);
+    let r = s.handle(&crypta, op::PUBKEY, &id);
+    assert_eq!((r.status, r.body.bytes()), (status::OK, &point[..]));
+    use sha2::Digest;
+    let mut b = id.clone();
+    b.extend_from_slice(&sha2::Sha256::digest(b"handshake!!"));
+    let r = s.handle(&crypta, op::SIGN_DIGEST, &b);
+    assert_eq!(r.status, status::OK);
+    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).unwrap();
+    let sig = p256::ecdsa::Signature::from_der(r.body.bytes()).unwrap();
+    assert!(vk.verify(b"handshake!!", &sig).is_ok());
+    assert_eq!(release(&mut s, &crypta, &id).0, status::NOT_RELEASABLE);
+    // Another service may not mint one, nor sign with cryptad's.
+    assert_ne!(s.handle(&vinculum(), op::MINT, &body(|w| { w.u16(TLS_KEY); w.u8(AFTER_BOOT); w.str("x"); })).status, status::OK);
+    assert_ne!(s.handle(&vinculum(), op::SIGN_DIGEST, &b).status, status::OK);
+    // A WireGuard key is not one to sign with.
+    let r = s.handle(&crypta, op::MINT, &body(|w| { w.u16(0x104); w.u8(AFTER_BOOT); w.str("wg"); }));
+    let mut w = r.body.bytes()[..16].to_vec();
+    w.extend_from_slice(&[0u8; 32]);
+    assert_eq!(s.handle(&crypta, op::SIGN_DIGEST, &w).status, status::UNSUPPORTED);
+
+    // A saved password and the gateway's session cookie: bearer items.
+    for (kind, v) in [(PASSWORD, &b"pw"[..]), (COOKIE, &b"webvpn"[..])] {
+        let (st, i) = store(&mut s, &crypta, kind, AFTER_BOOT, "acme/x", v);
+        assert_eq!(st, status::OK);
+        let (st, got) = release(&mut s, &crypta, &i);
+        assert_eq!((st, &got[4..]), (status::OK, v));
+    }
+    // A cookie is no other service's to keep.
+    assert_ne!(store(&mut s, &vinculum(), COOKIE, AFTER_BOOT, "x", b"c").0, status::OK);
+}

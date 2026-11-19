@@ -19,6 +19,10 @@ pub enum Purpose {
     /// A sealed stick's recovery code (tessera-encryption.md §7.4): typed,
     /// never offered, held so that only arcad's `VK_ADOPT` redeems it.
     RecoveryCode,
+    /// A VPN sign-in password or one-time code (vpn.md §9.3): typed, never
+    /// offered, held so that only the crypta service redeems it, for the
+    /// tunnel's engine.
+    VpnSecret,
 }
 
 /// One submit's worth of reference to the value, meaningful only on this

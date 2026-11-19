@@ -67,6 +67,22 @@ pub mod op {
     /// Arca; a low-order point is refused (`MALFORMED`). Also the
     /// `CRYPTA_SERVICE`'s, on its machine-store items.
     pub const DH_X25519: u16 = 0x0D;
+    // The crypta service also (V4): `MINT` a `TlsClientKey` (P-256; the
+    // answer's public part is the 65-byte SEC1 point), `PUBKEY` of it, and
+    // `SIGN_DIGEST` with it; `STORE` a
+    // `Password` (a saved VPN password) or a `Cookie` (the gateway's
+    // session, for a reconnect), `RELEASE` and `DELETE` them.
+    /// The crypta service only (vpn.md §9.3): `handle[16]` → `bytes value`,
+    /// once. Redeems what the person typed into a VPN sign-in field (held
+    /// with `HOLD_FOR_VPN`) for the tunnel's engine, and nothing else.
+    pub const TAKE_VPN: u16 = 0x0E;
+    /// The crypta service only: `id[16] | digest[32]` → a DER ECDSA
+    /// signature over that SHA-256 digest with one of its `TlsClientKey`
+    /// items (a TLS handshake's, whose transcript can be longer than a
+    /// `SIGN` message, or a certificate request's).
+    pub const SIGN_DIGEST: u16 = 0x0F;
+    /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
+    pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
     /// machine store (vpn.md §4.3, as built in V1): `MINT` a `WireGuardKey`,
     /// `STORE` one imported from a `.conf` (32 bytes; the only key kind

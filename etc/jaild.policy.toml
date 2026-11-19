@@ -431,6 +431,7 @@ uid_last    = 62499
 [crypta_engines]
 name_prefix = "system-crypta-"
 exec_path   = "/usr/local/bin/atrium-crypta-wg"
+ac_exec_path = "/usr/local/bin/atrium-crypta-ac"
 uid_first   = 61000
 uid_last    = 61499
 

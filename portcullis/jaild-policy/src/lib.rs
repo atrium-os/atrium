@@ -266,9 +266,13 @@ impl StickServerPolicy {
 #[serde(deny_unknown_fields)]
 pub struct CryptaEnginePolicy {
     pub name_prefix: String,
+    /// The WireGuard engine: UDP to its gateways only.
     pub exec_path:   String,
     pub uid_first:   u32,
     pub uid_last:    u32,
+    /// The AnyConnect engine (vpn.md §9): TCP to its one gateway only.
+    #[serde(default)]
+    pub ac_exec_path: Option<String>,
 }
 
 /// `[print_workers]`: prelumd asks for one jail per worker (printing.md

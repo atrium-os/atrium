@@ -1035,6 +1035,19 @@ impl State {
 
     fn service_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         let Ok(me) = Recipient::service(name) else { return reply(status::UNKNOWN_PEER) };
+        if op == op::TAKE_VPN {
+            // What the person typed into a VPN sign-in field: only the
+            // crypta service redeems it, once, for a tunnel's engine.
+            if name != op::CRYPTA_SERVICE {
+                return reply(status::DENIED);
+            }
+            let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
+            let Some(v) = self.handles.take_vpn(&h) else { return reply(status::DENIED) };
+            let mut out = tri!(LockedBuf::zeroed(4 + v.len()).map_err(Error::Io));
+            out.as_mut()[..4].copy_from_slice(&(v.len() as u32).to_le_bytes());
+            out.as_mut()[4..].copy_from_slice(v.as_ref());
+            return Reply { status: status::OK, body: Body::Secret(out) };
+        }
         if op == op::TAKE_WIFI {
             // What the user typed into a Wi-Fi passphrase field: only the
             // Wi-Fi key service redeems it, once (curia.md §4).
@@ -1068,10 +1081,34 @@ impl State {
                 let class = field!(r.u8());
                 let account = field!(r.str(caps::ACCOUNT));
                 field!(r.end());
-                if kind != Kind::WireGuardKey as u16 {
+                if class != Class::AfterFirstUnlock as u8 {
                     return reply(status::UNSUPPORTED);
                 }
-                if class != Class::AfterFirstUnlock as u8 {
+                if kind == Kind::TlsClientKey as u16 {
+                    // A VPN gateway's client key (vpn.md §9.3): P-256.
+                    let (seed, pk) = loop {
+                        let s = tri!(LockedBuf::random(32).map_err(Error::Io));
+                        if let Ok(k) = p256::ecdsa::SigningKey::from_slice(s.as_ref()) {
+                            break (s, k.verifying_key().to_encoded_point(false).as_bytes().to_vec());
+                        }
+                    };
+                    let m = tri!(store.add(NewItem {
+                        persona: MACHINE_PERSONA,
+                        recipient: me.clone(),
+                        class: Class::AfterFirstUnlock,
+                        kind: Kind::TlsClientKey,
+                        provenance: Provenance::ArcaGenerated,
+                        account,
+                        scope: b"",
+                        value: seed.as_ref(),
+                    }));
+                    *item = Some(m.id);
+                    let mut w = Writer::new();
+                    w.raw(&m.id.0);
+                    w.raw(&pk);
+                    return ok(w.buf);
+                }
+                if kind != Kind::WireGuardKey as u16 {
                     return reply(status::UNSUPPORTED);
                 }
                 let seed = tri!(LockedBuf::random(32).map_err(Error::Io));
@@ -1092,12 +1129,31 @@ impl State {
                 w.raw(&pk);
                 ok(w.buf)
             }
+            op::SIGN_DIGEST if crypta => {
+                let id = ItemId(field!(r.array::<16>()));
+                let digest = field!(r.array::<32>());
+                field!(r.end());
+                *item = Some(id);
+                let (m, secret) = tri!(store.release(&id, &who, None));
+                if m.kind != Kind::TlsClientKey {
+                    return reply(status::UNSUPPORTED);
+                }
+                let Ok(k) = p256::ecdsa::SigningKey::from_slice(secret.as_ref()) else { return reply(status::INTERNAL) };
+                drop(secret);
+                use p256::ecdsa::signature::hazmat::PrehashSigner;
+                let Ok(sig) = PrehashSigner::<p256::ecdsa::Signature>::sign_prehash(&k, &digest) else { return reply(status::INTERNAL) };
+                ok(sig.to_der().as_bytes().to_vec())
+            }
             op::PUBKEY | op::DH_X25519 if crypta => {
                 let id = ItemId(field!(r.array::<16>()));
                 let point = if op == op::DH_X25519 { Some(field!(r.array::<32>())) } else { None };
                 field!(r.end());
                 *item = Some(id);
                 let (m, secret) = tri!(store.release(&id, &who, None));
+                if m.kind == Kind::TlsClientKey && point.is_none() {
+                    let Ok(k) = p256::ecdsa::SigningKey::from_slice(secret.as_ref()) else { return reply(status::INTERNAL) };
+                    return ok(k.verifying_key().to_encoded_point(false).as_bytes().to_vec());
+                }
                 if m.kind != Kind::WireGuardKey {
                     return reply(status::UNSUPPORTED);
                 }
@@ -1144,7 +1200,9 @@ impl State {
                     w.raw(&public_of(kind, &secret));
                     return ok(w.buf);
                 }
-                if kind.shape() != Shape::Bearer || kind == Kind::Cookie {
+                // A gateway session cookie is the crypta service's only
+                // cookie (vpn.md §9.3, re-authentication).
+                if kind.shape() != Shape::Bearer || (kind == Kind::Cookie && !crypta) {
                     return reply(status::UNSUPPORTED);
                 }
                 let m = tri!(store.add(NewItem {
@@ -1436,7 +1494,7 @@ impl State {
                 let hold = match r.remaining() {
                     0 => 0,
                     _ => match r.u8() {
-                        Ok(h @ (op::HOLD_FOR_WIFI | op::HOLD_FOR_RECOVERY)) => h,
+                        Ok(h @ (op::HOLD_FOR_WIFI | op::HOLD_FOR_RECOVERY | op::HOLD_FOR_VPN)) => h,
                         _ => return malformed(),
                     },
                 };

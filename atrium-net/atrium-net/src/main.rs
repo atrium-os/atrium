@@ -2155,7 +2155,7 @@ mod imp {
             let at: Vec<AnchorTunnel> = ts.iter().map(|(i, a, fib)| {
                 let dns = a.dns.first().copied().or(if a.full { None } else { lan_dns });
                 AnchorTunnel {
-                    iface: i, gateway: a.gateway, port: a.port, full: a.full && !a.scoped, block: a.block && !a.scoped,
+                    iface: i, gateway: a.gateway, port: a.port, tcp: a.tcp, full: a.full && !a.scoped, block: a.block && !a.scoped,
                     rdr: if a.scoped && *fib != 0 { dns.map(|d| (*fib, d)) } else { None },
                 }
             }).collect();

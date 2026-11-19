@@ -19,6 +19,7 @@ pub fn hold_tag(purpose: Purpose) -> u8 {
     match purpose {
         Purpose::WifiPassphrase => arcad::proto::op::HOLD_FOR_WIFI,
         Purpose::RecoveryCode => arcad::proto::op::HOLD_FOR_RECOVERY,
+        Purpose::VpnSecret => arcad::proto::op::HOLD_FOR_VPN,
         _ => 0,
     }
 }
@@ -182,7 +183,7 @@ impl Field {
         match self.purpose {
             Purpose::CurrentPassword => (0..self.accounts.len()).map(Offer::Account).collect(),
             Purpose::NewPassword => vec![Offer::Generate],
-            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode => Vec::new(),
+            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode | Purpose::VpnSecret => Vec::new(),
         }
     }
 

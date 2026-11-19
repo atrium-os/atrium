@@ -66,3 +66,33 @@ mod tests {
         assert_eq!(key(&format!("{}=", &s[..43].replace('A', "*"))), if s[..43].contains('A') { None } else { Some(k) });
     }
 }
+
+/// Any standard base64 (padding optional, no whitespace inside): a PEM
+/// body's lines joined, for one.
+pub fn decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut n, mut bits) = (0u32, 0);
+    for ch in s.bytes() {
+        n = (n << 6) | A.iter().position(|&a| a == ch)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((n >> bits) as u8);
+            n &= (1 << bits) - 1;
+        }
+    }
+    (bits < 6).then_some(out)
+}
+
+#[cfg(test)]
+mod decode_tests {
+    #[test]
+    fn round_trips() {
+        for n in 0..40 {
+            let b: Vec<u8> = (0..n).map(|i| (i * 37 + 11) as u8).collect();
+            assert_eq!(super::decode(&super::encode(&b)), Some(b));
+        }
+        assert_eq!(super::decode("a b"), None);
+    }
+}

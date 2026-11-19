@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use std::net::SocketAddrV4;
 
-/// No frame is longer: [`Start`] with [`MAX_ALLOWED`] prefixes fits.
-pub const MAX_FRAME: usize = 16 * 1024;
+/// No frame is longer: [`Start`] with [`MAX_ALLOWED`] prefixes fits, and
+/// an AnyConnect push or prompt with its gateway's text.
+pub const MAX_FRAME: usize = 64 * 1024;
 pub const MAX_ALLOWED: usize = 1024;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,9 +42,70 @@ impl Drop for Start {
     }
 }
 
+/// An AnyConnect tunnel (vpn.md §9, V4): what `atrium-crypta-ac` needs.
+/// No secret: passwords and tokens reach the engine from Arca through its
+/// own secrets helper (fd 4), never through cryptad.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartAc {
+    /// The gateway's name: TLS server name and `Host`.
+    pub host: String,
+    /// Where cryptad resolved it; the engine's jail reaches only this.
+    pub gateway: SocketAddrV4,
+    /// `/` or the group's path (`/staff`).
+    pub path: String,
+    /// CA certificates (DER) the profile trusts besides the system's.
+    pub cas: Vec<Vec<u8>>,
+    /// SHA-256 of the gateway's certificate, when the profile pins it
+    /// instead (a self-signed gateway): then no CA is consulted.
+    pub pin: Option<[u8; 32]>,
+    /// What the gateway is told the machine is called (vpn.md §9.5).
+    pub hostname: String,
+    pub mtu: u16,
+    /// The username to answer the first text field with, when the profile
+    /// keeps one.
+    pub username: Option<String>,
+    /// The group to choose when the gateway offers one (`group_list`).
+    pub group: Option<String>,
+    /// Arca holds a saved password for this profile: the first password
+    /// field is answered with it once, without asking.
+    pub saved: bool,
+    /// The profile's client certificate chain (DER, its own first), whose
+    /// key Arca holds: the engine signs through its secrets helper.
+    pub cert_chain: Vec<Vec<u8>>,
+    /// The session cookie of a sign-in still valid, kept by Arca: try it
+    /// before asking again (a roam, an engine restart).
+    pub resume: bool,
+}
+
+/// One answer to a prompt field.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Value {
+    Text(String),
+    /// What was typed into Arca's field (`HOLD_FOR_VPN`): only the
+    /// engine's secrets helper redeems it. `keep`: save it as the
+    /// profile's password once the gateway accepts it.
+    Held { handle: [u8; 16], keep: bool },
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Text(t) => write!(f, "Text({} bytes)", t.len()),
+            Value::Held { keep, .. } => write!(f, "Held(.., keep {keep})"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ToEngine {
     Start(Start),
+    StartAc(StartAc),
+    /// The person's answers to the last `Prompt`, field by field; `None`:
+    /// they cancelled.
+    Answer(Option<Vec<(String, Value)>>),
+    /// An SSO sign-in finished (vpn.md §9.3): Arca holds the token for this
+    /// profile's gateway; `false`: it failed or was cancelled.
+    SsoDone(bool),
     /// The answer to [`FromEngine::Dh`]; `None`: refused or unavailable.
     Dh(Option<DhShared>),
     /// The network changed: send from the new path (vpn.md §5.6).
@@ -76,6 +138,55 @@ pub enum FromEngine {
     Down { why: String },
     /// Every 10 s while running.
     Stats { rx: u64, tx: u64, dropped: u64 },
+    /// AnyConnect: the gateway asks the person (vpn.md §9.3). The JSON-free
+    /// form is `crypta_ac::auth::Form`'s, encoded by the engine.
+    Prompt(Prompt),
+    /// AnyConnect: sign in at an identity provider in a Navigator sign-in
+    /// window; the final page at `final_url` sets `token_cookie`.
+    Sso { login: String, final_url: String, token_cookie: String },
+    /// AnyConnect: signed in and the tunnel is open; these are the
+    /// gateway's settings, for atrium-net (vpn.md §5.1).
+    Pushed(Pushed),
+    /// The gateway refused, or asked what Atrium does not do: shown to the
+    /// person as is. The engine stops after it.
+    Refused { why: String },
+}
+
+/// A prompt as cryptad passes it on (`crypta_ac::auth::Form` flattened).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Prompt {
+    pub title: String,
+    pub message: String,
+    pub error: String,
+    pub banner: String,
+    pub fields: Vec<PromptField>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptField {
+    pub name: String,
+    pub label: String,
+    /// 0 text, 1 password, 2 one-time code, 3 choice.
+    pub kind: u8,
+    /// `(value, label)` for a choice.
+    pub choices: Vec<(String, String)>,
+}
+
+/// A gateway's push (vpn.md §9.4), checked again by atrium-net.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Pushed {
+    /// Our address in the tunnel and its network's prefix length.
+    pub addr: std::net::Ipv4Addr,
+    pub prefix: u8,
+    pub mtu: u16,
+    pub dns: Vec<std::net::Ipv4Addr>,
+    pub domains: Vec<String>,
+    pub includes: Vec<Prefix4>,
+    pub excludes: Vec<Prefix4>,
+    pub full: bool,
+    pub banner: String,
+    /// What was dropped (header names), for the log and Settings.
+    pub ignored: Vec<String>,
 }
 
 pub fn write<T: Serialize>(w: &mut impl Write, m: &T) -> io::Result<()> {

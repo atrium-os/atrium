@@ -290,6 +290,10 @@ fn chart_nodes(prims: Vec<officina_draw::chart::Prim>, theme: &pergola::theme::S
 pub const KEY_FILTER: u64 = 1 << 61;
 const KEY_TABLE: u64 = 1 << 60;
 pub const KEY_LIST: u64 = 1 << 59;
+/// The fill options button by the area a fill just filled.
+pub const KEY_FILL: u64 = 1 << 57;
+/// Its size, px.
+const FILL_BUTTON: f64 = 16.0;
 
 /// A small square button with a down-pointing triangle, `size` px.
 fn drop_button(theme: &pergola::theme::Semantic, size: f32, lit: bool) -> Vec<pergola::Node> {
@@ -503,6 +507,27 @@ impl SheetSource {
         Some(pergola::widgets::GridFloat { key: KEY_LIST, at: [x, y, size as f64, size as f64], nodes: Rc::new(drop_button(theme, size, false)), movable: false, pressable: true })
     }
 
+    /// Below the right of the area the last fill filled, while it can still
+    /// be done again another way: a press offers the ways (Excel's Auto
+    /// Fill Options).
+    fn fill_button(&self, theme: &pergola::theme::Semantic) -> Option<pergola::widgets::GridFloat> {
+        let to = {
+            let d = self.doc.borrow();
+            if !d.can_refill() {
+                return None;
+            }
+            d.last_fill?.1
+        };
+        let at = self.fill_button_at(to)?;
+        Some(pergola::widgets::GridFloat { key: KEY_FILL, at, nodes: Rc::new(drop_button(theme, FILL_BUTTON as f32, false)), movable: false, pressable: true })
+    }
+
+    /// Where the fill options button for a fill of `to` sits (content px).
+    pub fn fill_button_at(&self, to: officina_grid::addr::Rect) -> Option<[f64; 4]> {
+        let (x, y) = (self.col_left(to.c1 + 1), self.row_top(to.r1 + 1));
+        (x > self.col_left(to.c0) && y > self.row_top(to.r0)).then_some([x + 1.0, y + 1.0, FILL_BUTTON, FILL_BUTTON])
+    }
+
     /// The comment of [`Self::note_at`]'s cell as a box beside the cell.
     fn note_float(&self) -> Option<pergola::widgets::GridFloat> {
         let (r, c) = self.note_at.get()?;
@@ -679,6 +704,7 @@ impl GridSource for SheetSource {
         let mut out = self.data_marks(view, theme);
         out.extend(self.note_float());
         out.extend(self.list_button(theme));
+        out.extend(self.fill_button(theme));
         out.extend(self.invalid_rings(view));
         let d = self.doc.borrow();
         let charts = d.wb.charts();

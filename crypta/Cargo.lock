@@ -316,6 +316,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "crypta-ac"
+version = "0.1.0"
+dependencies = [
+ "crypta-proto",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "crypta-ctl"
 version = "0.1.0"
 dependencies = [
@@ -330,9 +339,14 @@ dependencies = [
 name = "crypta-engine"
 version = "0.1.0"
 dependencies = [
+ "aura-ipc",
+ "crypta-ac",
  "crypta-proto",
  "crypta-wg",
  "libc",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
  "zeroize",
 ]
 
@@ -369,8 +383,10 @@ dependencies = [
  "jaild",
  "libc",
  "net-proto",
+ "p256",
  "portcullis-identity",
  "portcullis-mounts",
+ "sha2",
  "tempfile",
  "zeroize",
 ]
@@ -563,7 +579,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1290,7 +1306,41 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rustls"
+version = "0.23.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+dependencies = [
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-pki-types"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "102f35f7de7b06d8c61f1cff6592f5253e0dea431c74867aad5dfd70f44663fb"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a0760a887c14823fca5a1c970b01d47c328c696c0c64829d1df50e8f853fd5"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
 ]
 
 [[package]]
@@ -1495,7 +1545,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

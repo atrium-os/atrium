@@ -39,6 +39,7 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
                                the router's 10.88.0.1:80 serves the sign-in page
                                (GET /login: one form; POST /accept: web-ok)
   stats                     -- counters
+  ac-drop                   -- reset every AnyConnect connection (a roam)
   seen                      -- (and seen-reset) every IPv4/IPv6 packet the guest
                                sent since the last reset, as {"proto dst[:port]": n}
                                (ARP, DHCP, ND and router solicitations left out):
@@ -47,6 +48,11 @@ Control on UDP 127.0.0.1:7803, one word per datagram, answered with JSON:
 A WireGuard gateway "beyond the router" at 198.51.100.51:51820: the guest's
 UDP to it is relayed to 127.0.0.1:51820 (where crypta-wg-linux-vm.sh's Ubuntu
 VM listens) and the answers come back from 198.51.100.51.
+
+AnyConnect gateways at 198.51.100.52:443-446 (vpn.md §11): the guest's TCP
+to them ends here, in a small TCP of this script's own, and each connection
+is carried on to 127.0.0.1:8443-8446 (crypta-ocserv-vm.sh's forwards to
+ocserv in the Ubuntu VM).
 """
 import json, random, socket, struct, sys
 
@@ -70,6 +76,8 @@ WEB = bytes([198, 51, 100, 80])  # beyond the router
 WG_GW = bytes([198, 51, 100, 51])  # a WireGuard gateway, also beyond it
 WG_PORT = 51820
 WG_RELAY = ("127.0.0.1", 51820)
+AC_GW = bytes([198, 51, 100, 52])  # AnyConnect gateways, beyond the router
+AC_PORTS = {443: 8443, 444: 8444, 445: 8445, 446: 8446}
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
 seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
@@ -460,6 +468,149 @@ def handle_tcp(src_mac, s, body, srv=WEB):
     return [eth(src_mac, RMAC, 0x0800, o) for o in out]
 
 
+# ---- AnyConnect: TCP carried to the host --------------------------------------
+
+M32 = 1 << 32
+ac = {}  # (guest ip, guest port, our port) -> Ac
+
+
+def after(a, b):
+    """a is later than b, in sequence space."""
+    return 0 < (a - b) % M32 < M32 // 2
+
+
+class Ac:
+    """One guest connection, ended here and carried to the host's port."""
+
+    def __init__(self, gmac, gip, gport, dport, isn):
+        import time
+        self.gmac, self.gip, self.gport, self.dport = gmac, gip, gport, dport
+        self.rcv = (isn + 1) % M32
+        self.una = self.nxt = random.getrandbits(32)
+        self.buf = b""  # from una: sent and not acknowledged, then not sent
+        self.wnd = 65535
+        self.host_done = self.fin_sent = self.guest_done = False
+        self.sent_at = time.monotonic()
+        self.host = socket.create_connection(("127.0.0.1", AC_PORTS[dport]), timeout=5)
+        self.host.setblocking(False)
+
+    def seg(self, seq, flags, data=b""):
+        return eth(self.gmac, RMAC, 0x0800, tcp_seg(AC_GW, self.gip, self.dport, self.gport, seq % M32, self.rcv, flags, data))
+
+    def flush(self):
+        import time
+        out = []
+        while True:
+            off = (self.nxt - self.una) % M32
+            room = self.wnd - off
+            chunk = self.buf[off:off + min(1360, max(room, 0))]
+            if not chunk:
+                break
+            out.append(self.seg(self.nxt, 0x18, chunk))
+            self.nxt = (self.nxt + len(chunk)) % M32
+        if self.host_done and not self.fin_sent and (self.nxt - self.una) % M32 == len(self.buf):
+            out.append(self.seg(self.nxt, 0x11))
+            self.nxt = (self.nxt + 1) % M32
+            self.fin_sent = True
+        if out:
+            self.sent_at = time.monotonic()
+        return out
+
+    def guest(self, body):
+        sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", body[:14])
+        self.wnd = struct.unpack("!H", body[14:16])[0]
+        data = body[(off >> 4) * 4:]
+        out = []
+        if flags & 0x04:  # RST
+            self.close()
+            return out
+        if flags & 0x10 and after(ack, self.una) and not after(ack, self.nxt):
+            n = (ack - self.una) % M32
+            self.buf = self.buf[n:]
+            self.una = ack
+        if data or flags & 0x01:
+            if seq == self.rcv:
+                if data:
+                    stats["ac_out"] = stats.get("ac_out", 0) + len(data)
+                    try:
+                        self.host.sendall(data)
+                    except OSError:
+                        self.host_done = True
+                    self.rcv = (self.rcv + len(data)) % M32
+                if flags & 0x01 and not self.guest_done:
+                    self.guest_done = True
+                    self.rcv = (self.rcv + 1) % M32
+                    try:
+                        self.host.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+            out.append(self.seg(self.nxt, 0x10))
+        out += self.flush()
+        if self.guest_done and self.fin_sent and self.una == self.nxt:
+            self.close()
+        return out
+
+    def from_host(self):
+        try:
+            d = self.host.recv(65536)
+        except BlockingIOError:
+            return []
+        except OSError:
+            d = b""
+        if d:
+            stats["ac_in"] = stats.get("ac_in", 0) + len(d)
+            self.buf += d
+        else:
+            self.host_done = True
+        return self.flush()
+
+    def again(self, now):
+        """Go back to the first byte not acknowledged, after a second."""
+        if self.una != self.nxt and now - self.sent_at > 1.0:
+            if self.fin_sent and (self.nxt - self.una) % M32 == len(self.buf) + 1:
+                self.fin_sent = False
+            self.nxt = self.una
+            return self.flush()
+        return []
+
+    def close(self):
+        try:
+            self.host.close()
+        except OSError:
+            pass
+        for k, v in list(ac.items()):
+            if v is self:
+                del ac[k]
+
+
+def handle_ac(src_mac, s, body):
+    if len(body) < 20:
+        return []
+    sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", body[:14])
+    key = (s, sport, dport)
+    c = ac.get(key)
+    if flags & 0x02 and not flags & 0x10:  # SYN
+        if c is not None:
+            c.close()
+        if dport not in AC_PORTS:
+            return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
+        try:
+            c = Ac(src_mac, s, sport, dport, seq)
+        except OSError:
+            return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
+        stats["ac_syn"] = stats.get("ac_syn", 0) + 1
+        ac[key] = c
+        f = c.seg(c.nxt, 0x12)
+        c.nxt = (c.nxt + 1) % M32
+        c.una = c.nxt
+        return [f]
+    if c is None:
+        if flags & 0x04:
+            return []
+        return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, ack, (seq + len(body) - (off >> 4) * 4) % M32, 0x14))]
+    return c.guest(body)
+
+
 # ---- IPv6 -------------------------------------------------------------------
 
 def a6(s):
@@ -751,6 +902,8 @@ def frame(f, relay=None):
                 return [eth(src, RMAC, 0x0800, ip(DNS, s, 17, udp(DNS, s, 53, sport, a)))]
     if proto == 6 and d == WEB:
         return handle_tcp(src, s, body)
+    if proto == 6 and d == AC_GW:
+        return handle_ac(src, s, body)
     if proto == 6 and d == ROUTER:
         return handle_tcp(src, s, body, ROUTER)
     if proto == 1 and len(body) >= 8 and body[0] == 8 and d in (ROUTER, DNS, WEB):
@@ -790,7 +943,13 @@ def main():
             for out in d6_hostile_push():
                 lan.sendto(out, GUEST)
             next_d6 = now + 1
-        r, _, _ = select.select([lan, ctl, relay], [], [], 0.1 if mode6 == "flap6" else 1.0)
+        hosts = [c.host for c in ac.values() if not c.host_done]
+        r, _, _ = select.select([lan, ctl, relay] + hosts, [], [], 0.1 if mode6 == "flap6" else 0.5)
+        for c in list(ac.values()):
+            outs = c.from_host() if c.host in r else []
+            outs += c.again(time.monotonic())
+            for out in outs:
+                lan.sendto(out, GUEST)
         if lan in r:
             f, _ = lan.recvfrom(65536)
             for out in frame(f, relay):
@@ -818,6 +977,12 @@ def main():
                 d6 = w
                 print(f"lan: {w}", flush=True)
                 lan.sendto(good_ra(), GUEST)
+            if w == "ac-drop":
+                # Every AnyConnect connection reset, as a roam leaves them.
+                for c in list(ac.values()):
+                    lan.sendto(c.seg(c.nxt, 0x14), GUEST)
+                    c.close()
+                print("lan: ac-drop", flush=True)
             if w in ("seen", "seen-reset"):
                 ctl.sendto(json.dumps(seen).encode(), a)
                 if w == "seen-reset":
