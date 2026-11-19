@@ -781,8 +781,8 @@ pages with the thumbnail repeated. Two-slide handouts stack the thumbnails.
 Three-slide handouts leave ruled writing space beside each thumbnail. Four- and
 six-slide handouts use two columns, and nine-slide handouts use a three-by-three
 grid. Handouts fill in slide order across each row before moving down. The Print
-menu’s Include Hidden Slides checkbox is off by default and applies to slides,
-speaker notes, and handouts. The layout and checkbox setting are captured for
+menu’s Include Hidden Slides checkbox is off by default, resets when a different
+deck opens in the window, and applies to slides, speaker notes, and handouts. The layout and checkbox setting are captured for
 the print session and preserved when paper or orientation changes.
 Gradients are bands of solid colour,
 since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout

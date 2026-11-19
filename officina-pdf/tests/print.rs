@@ -198,17 +198,29 @@ fn print_layouts_paginate_notes_and_pack_visible_slides() {
 fn including_hidden_slides_adds_them_to_every_print_layout() {
     use slides::{PrintLayout, PrintOptions};
     let fonts = PinnedFonts::new().unwrap();
-    let mut deck = deck();
-    for (layout, pages) in [
-        (PrintLayout::Slides, 3),
-        (PrintLayout::SpeakerNotes, 3),
+    for (layout, capacity) in [
+        (PrintLayout::Slides, 1usize),
+        (PrintLayout::SpeakerNotes, 1),
         (PrintLayout::HandoutTwo, 2),
+        (PrintLayout::HandoutThree, 3),
+        (PrintLayout::HandoutFour, 4),
+        (PrintLayout::HandoutSix, 6),
+        (PrintLayout::HandoutNine, 9),
     ] {
-        let options = PrintOptions { layout, include_hidden: true };
-        let (_, printed) = slides::export_with_options(&mut deck, Some((595.0, 842.0)), options, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
-        assert_eq!(printed.hidden, 0);
-        assert_eq!(printed.stats.pages, pages);
-        assert!(deck.slide_if_loaded(1).unwrap().hidden);
+        let mut deck = deck();
+        let title = deck.layout_of_kind("title").unwrap().id;
+        let visible = capacity.max(2);
+        for _ in 2..visible {
+            let slide = new_slide(&mut deck, title);
+            deck.push_slide(slide);
+        }
+        for include_hidden in [false, true] {
+            let options = PrintOptions { layout, include_hidden };
+            let (_, printed) = slides::export_with_options(&mut deck, Some((595.0, 842.0)), options, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+            assert_eq!(printed.hidden, usize::from(!include_hidden), "{layout:?}");
+            assert_eq!(printed.stats.pages, (visible + usize::from(include_hidden)).div_ceil(capacity), "{layout:?}");
+            assert!(deck.slide_if_loaded(1).unwrap().hidden);
+        }
     }
 }
 

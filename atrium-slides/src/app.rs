@@ -253,6 +253,7 @@ impl Slides {
         *self.sel.borrow_mut() = Sel::default();
         self.lists.borrow_mut().map.clear();
         self.strip_first.set(0);
+        self.print_hidden.set(false);
         self.deck_key.set(self.deck_key.get() + 1);
         self.changed();
         old
@@ -1506,6 +1507,15 @@ impl Slides {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_the_deck_resets_the_hidden_slide_print_choice() {
+        let slides = Slides::new(Doc::new("First"), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        assert!(!slides.include_hidden_in_print());
+        slides.print_hidden.set(true);
+        slides.replace(Doc::new("Second"));
+        assert!(!slides.include_hidden_in_print());
+    }
 
     #[test]
     fn snapping_meets_the_middle_and_other_edges() {
