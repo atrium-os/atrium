@@ -30,9 +30,8 @@
 //! rows and columns and their labels; presses there map to the unscrolled
 //! cells ([`Geom::content`]), and moving the cursor keeps it clear of them.
 //!
-//! Not yet: auto-scroll while dragging a
-//! selection past the edge, Ctrl+arrow data edges beyond what the source
-//! says, and placing the caret by pointer in the editor.
+//! Not yet: Ctrl+arrow data edges beyond what the source says, and placing
+//! the caret by pointer in the editor.
 
 use std::rc::Rc;
 
@@ -430,6 +429,9 @@ pub struct GridState {
     /// The column edge last pressed, and when: a second press soon after is
     /// a double-click (fit the column).
     edge_press: Option<(u32, std::time::Instant)>,
+    /// While a selection or the fill handle is dragged past the body's
+    /// edge: where the pointer is (window px). Each frame scrolls toward it.
+    edge: Option<crate::geom::Point>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -530,6 +532,22 @@ const FILL_GRIP: f64 = 5.0;
 
 /// Two presses closer than this are a double-click.
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
+
+/// How far `p` is past the body's edges, px: (right +, left -), (below +,
+/// above -); 0 inside.
+fn past_edge(geom: &Geom, p: crate::geom::Point) -> (f32, f32) {
+    let b = geom.body;
+    let o = |v: f32, lo: f32, hi: f32| if v < lo { v - lo } else if v > hi { v - hi } else { 0.0 };
+    (o(p.x, b.x(), b.x() + b.w()), o(p.y, b.y(), b.y() + b.h()))
+}
+
+/// The cell under `p`, or past the body's edge, the cell at that edge.
+fn cell_at_edge(src: &dyn GridSource, geom: &Geom, st: &ScrollState, p: crate::geom::Point) -> (u32, u32) {
+    let b = geom.body;
+    let q = crate::geom::Point::new(p.x.clamp(b.x(), (b.x() + b.w() - 1.0).max(b.x())), p.y.clamp(b.y(), (b.y() + b.h() - 1.0).max(b.y())));
+    let (cx, cy) = geom.content(st, q);
+    (src.row_at(cy.max(0.0)), src.col_at(cx.max(0.0)))
+}
 
 /// The fill handle dragged to `cell` from selection `sel`: `sel` grown down,
 /// up, right or left, whichever way `cell` is farther outside it.
@@ -720,9 +738,31 @@ impl GridView {
             s.set(st);
         });
         let s = self.scroll.clone();
+        let (fsrc, fgst) = (src.clone(), self.state.clone());
         ctx.on_frame(body_id, move |t, node| {
             let mut st = s.get();
-            let more = st.frame(t, node);
+            let mut more = st.frame(t, node);
+            // A drag held past the edge: scroll toward the pointer, and the
+            // selection (or fill) follows to the cell now at the edge.
+            let mut g = fgst.get_cloned();
+            if let Some(p) = g.edge.filter(|_| matches!(g.drag, Drag::Cells | Drag::Fill { .. })) {
+                let (ox, oy) = past_edge(&geom, p);
+                let speed = |o: f32| if o == 0.0 { 0.0 } else { o.signum() as f64 * (o.abs() as f64 * 0.5).clamp(4.0, 60.0) };
+                st.physics.set_max(geom.ext[1] - geom.body.h() as f64);
+                st.physics_x.set_max(geom.ext[0] - geom.body.w() as f64);
+                let (y0, x0) = (st.physics.y, st.physics_x.y);
+                st.physics.stop();
+                st.physics_x.stop();
+                st.physics.set_position((y0 + speed(oy)).clamp(0.0, (geom.ext[1] - geom.body.h() as f64).max(0.0)));
+                st.physics_x.set_position((x0 + speed(ox)).clamp(0.0, (geom.ext[0] - geom.body.w() as f64).max(0.0)));
+                let cell = cell_at_edge(&*fsrc, &geom, &st, p);
+                match g.drag {
+                    Drag::Fill { from, .. } => g.drag = Drag::Fill { to: fill_reach(grow_to_merges(&*fsrc, g.selection()), cell), from },
+                    _ => g.cursor = cell,
+                }
+                fgst.set(g);
+                more = true;
+            }
             if st != s.get() {
                 s.set(st);
             }
@@ -738,8 +778,10 @@ impl GridView {
                 if geom.rows == 0 || geom.cols == 0 {
                     return;
                 }
-                let cell = (src.row_at(cy.max(0.0)), src.col_at(cx.max(0.0)));
+                // Past the body's edge, the cell at the edge (the view scrolls on to it).
+                let cell = cell_at_edge(&*src, &geom, &st, p);
                 let mut g = gst.get_cloned();
+                g.edge = (phase == DragPhase::Move && matches!(g.drag, Drag::Cells | Drag::Fill { .. }) && past_edge(&geom, p) != (0.0, 0.0)).then_some(p);
                 // A movable float under the press (the topmost) is picked and dragged.
                 if let (Drag::Float { key, size, from, .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
                     let (dx, dy) = (cx - from.0, cy - from.1);
@@ -2526,6 +2568,48 @@ mod tests {
         let b = needed_width(&CellView::text("abcdefghij"));
         assert!(b > a && a > 2.0 * PAD as f64, "{a} {b}");
         assert_eq!(needed_width(&CellView { indent: 1, ..CellView::text("abc") }), a + INDENT_STEP as f64);
+    }
+
+    #[test]
+    fn a_selection_held_past_the_edge_scrolls_on() {
+        let (mut app, _, scroll, state, _) = host(1000, 50);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let start = Point::new(hw + 10.0, HEADER_H + 5.0);
+        app.handle_event(Event::PointerDown { at: start });
+        // Below the grid (it is 600 px high), held there.
+        let below = Point::new(hw + 10.0, 640.0);
+        app.handle_event(Event::PointerMove { at: below });
+        app.tick();
+        let first = state.get_cloned().cursor.0;
+        assert!(app.wants_frame());
+        for i in 0..20 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        let y = scroll.get().physics.y;
+        let row = state.get_cloned().cursor.0;
+        assert!(y > 300.0, "{y}");
+        assert!(row > first + 10, "{first} -> {row}");
+        // Above the grid: back up. Let go: it stops.
+        app.handle_event(Event::PointerMove { at: Point::new(hw + 10.0, 2.0) });
+        for i in 20..25 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        assert!(scroll.get().physics.y < y);
+        app.handle_event(Event::PointerUp { at: Point::new(hw + 10.0, 2.0) });
+        app.tick();
+        let y2 = scroll.get().physics.y;
+        for i in 25..30 {
+            app.set_time(16.0 * i as f64);
+            app.frame();
+            app.tick();
+        }
+        assert_eq!(scroll.get().physics.y, y2);
+        assert_eq!(state.get_cloned().selection().c0, 0);
     }
 
     #[test]
