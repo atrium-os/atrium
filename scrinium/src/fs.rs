@@ -391,6 +391,26 @@ mod tests {
     }
 
     #[test]
+    fn quick_look_pdf_descriptor_survives_path_replacement() {
+        use std::io::Read;
+        let dir = tmp("look-pdf");
+        let path = dir.join("proof.pdf");
+        let original = b"%PDF-1.7\noriginal";
+        std::fs::write(&path, original).unwrap();
+        let (body, file) = look(&path, "proof.pdf").unwrap();
+        let look = crate::browser::Look { path: path.clone(), name: "proof.pdf".into(), size: original.len() as u64, body: Some(body) };
+        assert!(look.is_pdf());
+        std::fs::rename(&path, dir.join("old.pdf")).unwrap();
+        std::fs::write(&path, b"<!DOCTYPE html><p>replacement</p>").unwrap();
+        let mut actual = Vec::new();
+        file.unwrap().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, original);
+        let (body, _) = super::look(&path, "proof.pdf").unwrap();
+        assert!(!crate::browser::Look { body: Some(body), ..look }.is_pdf());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_file_for_an_app_is_a_file_and_no_link() {
         use std::io::Write;
         let d = tmp("forapp");

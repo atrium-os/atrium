@@ -806,8 +806,10 @@ only at their original sheet positions. An XLSX linked picture uses its workbook
 cache when present. For an uncached picture in the print area, Sheets asks for a
 PNG or JPEG through the system picker. The selected file is used for that print
 session and its relayouts. The relationship target remains inert. Mail prints message text;
-colour, two-sided and tray options wait for R5's attributes; Scrinium's
-quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
+colour, two-sided and tray options wait for R5's attributes. Scrinium Quick Look
+can print PDFs from its Print button or a `PrintAsked` from the active PDF viewer.
+It passes the read-only descriptor for that preview to the print sheet as a
+fixed-layout document. `print_image` and `print_text` helpers in
 Pergola (`officina_pdf::plain` is the text half).
 
 Next: R5.

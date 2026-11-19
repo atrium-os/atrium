@@ -19,8 +19,8 @@ home-files      = true   # the person's folders at /atrium/home, and their works
 arca            = true   # its saved network shares (the server, its key, the password item)
 network         = "none"
 # Limen roles the window embeds (app-composition.md §3): quick look's
-# viewers, and Arca's fields (a share's password, a stick's recovery code).
-embeds          = ["doc-viewer", "pdf-viewer", "media-player", "credential"]
+# viewers and print sheet (with a picker for Save as PDF), and Arca's fields.
+embeds          = ["doc-viewer", "pdf-viewer", "media-player", "credential", "print", "picker"]
 
 [supervision]
 restart   = "on-crash"

@@ -571,7 +571,13 @@ fn arca_slot(embeds: &std::rc::Rc<std::cell::RefCell<pergola::embed::Embeds>>, p
     }
 }
 
-/// "Connect to server" and the saved shares, for the manager's window.
+struct LookViewer {
+    path: std::path::PathBuf,
+    embed: EmbedId,
+    pdf: Option<std::fs::File>,
+}
+
+/// Embeds and background requests for the manager's window.
 struct Network {
     media: std::path::PathBuf,
     arca: std::path::PathBuf,
@@ -581,7 +587,8 @@ struct Network {
     /// Arca's recovery-code field, while a stick's sheet asks for it.
     rcode_embed: Option<EmbedId>,
     /// Quick look's viewer (opening-files.md §7), for this file.
-    look_embed: Option<(std::path::PathBuf, EmbedId)>,
+    look_embed: Option<LookViewer>,
+    printing: Option<pergola::print::Printing>,
     /// The file read for the viewer, until it is handed over.
     look_file: Option<(std::path::PathBuf, std::fs::File)>,
     tx: Sender<Job>,
@@ -613,9 +620,29 @@ impl Network {
             }
         };
         let (tx, rx) = mpsc::channel();
-        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
+        let n = Network { media, arca: scrinium::shares::arca_socket(), embeds, cred_embed: None, rcode_embed: None, look_embed: None, printing: None, look_file: None, tx, rx, forget: HashMap::new(), space: HashMap::new(), asked: HashMap::new(), offline: Default::default(), asked_login: Default::default() };
         n.refresh_saved();
         n
+    }
+
+    fn print_look(&mut self, pane: &Pane, b: &mut Browser, path: &std::path::Path) {
+        use std::os::fd::AsFd;
+        use pergola::print::Printing;
+
+        let Some(look) = b.look.as_ref().filter(|look| look.path == path && look.is_pdf()) else { return };
+        if self.printing.is_some() {
+            return;
+        }
+        let pdf = self.look_embed.as_ref().filter(|viewer| viewer.path == path).and_then(|viewer| viewer.pdf.as_ref());
+        let (Some(embeds), Some(token), Some(pdf)) = (&self.embeds, pane.win.embed_token(), pdf) else {
+            b.notice = Some(scrinium::browser::Notice { text: "The PDF preview isn't ready to print.".into(), error: true });
+            return;
+        };
+        // Send the same read-only file that was handed to the current viewer.
+        match Printing::start(embeds, token, scrinium::view::PRINT_SLOT, pdf.as_fd(), &look.name, false, None) {
+            Ok(printing) => self.printing = Some(printing),
+            Err(error) => b.notice = Some(scrinium::browser::Notice { text: format!("Couldn't open the print sheet: {error:?}"), error: true }),
+        }
     }
 
     /// Quick look's viewer: the pane's embed for the file it shows, asked
@@ -631,9 +658,9 @@ impl Network {
             return false;
         };
         let want = b.look.as_ref().filter(|l| matches!(l.body, Some(LookBody::Embed { .. }))).map(|l| l.path.clone());
-        if let Some((p, e)) = &self.look_embed {
-            if want.as_ref() != Some(p) {
-                let _ = embeds.borrow_mut().detach_embed(*e);
+        if let Some(viewer) = &self.look_embed {
+            if want.as_ref() != Some(&viewer.path) {
+                let _ = embeds.borrow_mut().detach_embed(viewer.embed);
                 self.look_embed = None;
             }
         }
@@ -673,7 +700,7 @@ impl Network {
         match r {
             Ok(e) => {
                 eprintln!("scrinium: quick look: {} in {role}", path.display());
-                self.look_embed = Some((path, e));
+                self.look_embed = Some(LookViewer { path, embed: e, pdf: (role == "pdf-viewer").then_some(f) });
             }
             Err(e) => {
                 let why = match e {
@@ -797,13 +824,29 @@ impl Network {
         let wants_field = matches!(b.connect.as_ref().map(|f| &f.step), Some(Step::Password { .. }));
         // Arca's recovery-code field: while a stick's sheet asks for the code.
         let wants_code = matches!(b.stick_sheet.as_ref().map(|s| &s.ask), Some(scrinium::browser::StickAsk::Recovery { .. }));
-        if let Some(embeds) = &self.embeds {
-            arca_slot(embeds, pane, wants_field, &mut self.cred_embed, false);
-            arca_slot(embeds, pane, wants_code, &mut self.rcode_embed, true);
+        if let Some(embeds) = self.embeds.clone() {
+            arca_slot(&embeds, pane, wants_field, &mut self.cred_embed, false);
+            arca_slot(&embeds, pane, wants_code, &mut self.rcode_embed, true);
             loop {
                 // Not zero: a zero read timeout is refused (EINVAL), and
                 // that lost limend, so the password field never came.
                 let ev = embeds.borrow_mut().poll(Duration::from_millis(1));
+                if let (Some(printing), Ok(Some(event))) = (&mut self.printing, &ev) {
+                    if let Some(step) = printing.handle(&embeds, event) {
+                        use pergola::print::{Outcome, Step};
+                        if let Step::Done(outcome) = step {
+                            self.printing = None;
+                            b.notice = match outcome {
+                                Outcome::Queued => Some(scrinium::browser::Notice { text: "Sent to the printer.".into(), error: false }),
+                                Outcome::Saved(name) => Some(scrinium::browser::Notice { text: format!("Saved “{name}”."), error: false }),
+                                Outcome::Failed(why) => Some(scrinium::browser::Notice { text: why, error: true }),
+                                Outcome::Cancelled => None,
+                            };
+                            changed = true;
+                        }
+                        continue;
+                    }
+                }
                 match ev {
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == self.cred_embed => {
                         if let Some(m) = limen::credential::ToParent::decode(&bytes) {
@@ -828,10 +871,19 @@ impl Network {
                     }
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.cred_embed => self.cred_embed = None,
                     Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == self.rcode_embed => self.rcode_embed = None,
-                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if self.look_embed.as_ref().is_some_and(|(_, e)| *e == embed) => {
-                        let (p, _) = self.look_embed.take().unwrap();
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) => {
+                        if let Some(viewer) = self.look_embed.as_ref().filter(|viewer| viewer.embed == embed && viewer.pdf.is_some()) {
+                            if limen::pdf_viewer::ToParent::decode(&bytes) == Some(limen::pdf_viewer::ToParent::PrintAsked) {
+                                let path = viewer.path.clone();
+                                self.print_look(pane, &mut b, &path);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if self.look_embed.as_ref().is_some_and(|viewer| viewer.embed == embed) => {
+                        let viewer = self.look_embed.take().unwrap();
                         let words = look_words(&b);
-                        b.looked(&p, Ok(scrinium::browser::LookBody::Info { words, why: Some("The viewer stopped".into()) }));
+                        b.looked(&viewer.path, Ok(scrinium::browser::LookBody::Info { words, why: Some("The viewer stopped".into()) }));
                         changed = true;
                     }
                     Ok(Some(_)) => {}
@@ -839,6 +891,7 @@ impl Network {
                     Err(e) => {
                         eprintln!("scrinium: limend: {e:?}");
                         self.embeds = None;
+                        self.printing = None;
                         break;
                     }
                 }
@@ -925,6 +978,10 @@ impl Network {
             });
         }
         changed |= self.look_viewer(pane, &mut b);
+        if let Some(path) = b.want_look_print.take() {
+            self.print_look(pane, &mut b, &path);
+            changed = true;
+        }
         // Shares' sizes: asked now and then, each on its own thread.
         for p in b.places.iter().filter(|p| p.network) {
             let every = if self.offline.contains(&p.id) { SHARE_OFFLINE_EVERY } else { SHARE_SPACE_EVERY };

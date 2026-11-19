@@ -209,12 +209,15 @@ renaming or moving the file needs the picker.
 ## 7. Quick look
 
 Space in Scrinium shows the file in a pane of Scrinium's window: an
-embedded Limen `doc-viewer` for documents and pictures, `media-player` for
-audio and video, plain text drawn by Scrinium itself. The embed is its
+embedded Limen `doc-viewer` for documents and pictures, `pdf-viewer` for PDFs,
+`media-player` for audio and video, or plain text drawn by Scrinium itself. The embed is its
 own jail and gets the file as a read-only descriptor through limend (new
 `ToChild::OpenFd`, the reverse of `EMIT_FD`), so a crafted file attacks the
 viewer's jail, not Scrinium. Types with no viewer show their icon, size
-and type. D6 asks whether quick look comes in the first build.
+and type. A PDF preview can print from **Print…** or Ctrl+P inside its
+viewer. Scrinium keeps the read-only descriptor used for that preview and
+passes it to the system print sheet. The sheet handles paper selection and
+submission without reopening the file by pathname.
 
 ## 8. What never runs
 

@@ -245,6 +245,8 @@ pub struct Browser {
     /// answers [`Browser::looked`].
     pub look: Option<Look>,
     pub want_look: Option<PathBuf>,
+    /// The PDF named by the Quick Look Print button.
+    pub want_look_print: Option<PathBuf>,
     /// Whose window this is (`SCRINIUM_PERSONA`, "personal" by default):
     /// the sticks it makes are this persona's, and another persona's
     /// sticks are shown, not opened.
@@ -265,15 +267,21 @@ pub struct Look {
     pub body: Option<LookBody>,
 }
 
+impl Look {
+    /// True only when file detection assigned this preview to the PDF viewer.
+    pub fn is_pdf(&self) -> bool {
+        matches!(&self.body, Some(LookBody::Embed { role, .. }) if *role == "pdf-viewer")
+    }
+}
+
 /// What the pane shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookBody {
     /// Text, drawn by Scrinium itself: the first [`LOOK_TEXT`] bytes,
     /// `cut` if there is more.
     Text { text: String, words: String, cut: bool },
-    /// A viewer embedded through Limen (`doc-viewer`, `media-player`),
-    /// in its own jail, given the file read-only; the app holds the file
-    /// until the embed takes it.
+    /// A viewer embedded through Limen in its own jail, given the file
+    /// read-only. For a PDF, Scrinium also holds the descriptor for printing.
     Embed { role: &'static str, mime: String, words: String },
     /// No viewer: what it is, and why not when it says.
     Info { words: String, why: Option<String> },
@@ -429,6 +437,7 @@ impl Browser {
             open_sheet: None,
             look: None,
             want_look: None,
+            want_look_print: None,
             persona: "personal".into(),
             stick_sheet: None,
             want_media: None,

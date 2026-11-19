@@ -82,6 +82,8 @@ pub fn place_h() -> f32 { em(44.0) }
 
 /// Quick look's viewer slot (an embed's place in the window).
 pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4c4f_4f4b;
+/// Separate from the viewer, so the print sheet can cover the file window.
+pub const PRINT_SLOT: pergola::slot::SlotKey = 0x5052_4e54;
 /// Where a row's text starts: after its 16 px inset and its icon.
 fn text_x() -> f32 { 16.0 + em(28.0) }
 pub fn pick_title_h() -> f32 { em(52.0) }
@@ -1155,7 +1157,15 @@ impl ScriniumView {
         rect(ctx, x0, y0, w, y1 - y0, t.bg_surface(), 0.0);
         rect(ctx, x0, y0, 1.0, y1 - y0, t.border_default(), 0.0);
         let inner = (w - 2.0 * pad).max(0.0);
-        text(ctx, x0 + pad, y0 + em(22.0), &fit(&l.name, type_size::MD, Weight::Medium, inner), type_size::MD, Weight::Medium, t.text_primary());
+        let title_width = if l.is_pdf() { (inner - button_w("Print…") - pad).max(0.0) } else { inner };
+        text(ctx, x0 + pad, y0 + em(22.0), &fit(&l.name, type_size::MD, Weight::Medium, title_width), type_size::MD, Weight::Medium, t.text_primary());
+        if l.is_pdf() {
+            let state = self.state.clone();
+            let path = l.path.clone();
+            button(ctx, x1 - pad - button_w("Print…"), y0 + em(8.0), "Print…", Look::Ghost, true, move || {
+                with(&state, |b| b.want_look_print = Some(path.clone()));
+            });
+        }
         let words = match &l.body {
             Some(LookBody::Text { words, .. } | LookBody::Embed { words, .. } | LookBody::Info { words, .. }) => words.clone(),
             None => "Reading…".into(),
@@ -1198,6 +1208,8 @@ impl ScriniumView {
     fn manager(&self, ctx: &mut Ctx, b: &Browser, w: f32, h: f32) {
         let t = ctx.theme;
         let x0 = side_for(w);
+        let slot = ctx.add(Node::Rect { rect: Rect::new(0.0, 0.0, w, h), fill: Color::TRANSPARENT, radius: 0.0 });
+        ctx.slot(slot, PRINT_SLOT);
         self.sidebar(ctx, b, 0.0, x0, h);
         let compact = compact(h);
         // Toolbar: back, up, the path.
