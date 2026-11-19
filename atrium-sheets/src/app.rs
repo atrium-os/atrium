@@ -3331,6 +3331,82 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_flags_takes_and_keeps_threads_and_hyperlinks() {
+        use crate::review::ReviewCmd;
+        use officina_grid::comments::{Comment, CommentRun, CommentStyle, ThreadMention, ThreadMessage, ThreadPerson};
+        use officina_grid::links::Link;
+        use officina_grid::{compare::Change, native};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Review").unwrap();
+            wb.add_sheet("Data").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        let ana = Arc::new(ThreadPerson { id: 1, name: "Ana".into(), user_id: "ana".into(), provider_id: "test".into() });
+        let lee = Arc::new(ThreadPerson { id: 2, name: "Lee".into(), user_id: "lee".into(), provider_id: "test".into() });
+        let thread = |done: bool, mentions| Comment::threaded(vec![
+            ThreadMessage {
+                id: 3, parent: None, author: ana.clone(), timestamp: "2026-11-20T08:00:00Z".into(),
+                done, text: "Please review".into(), mentions: [].into(),
+            },
+            ThreadMessage {
+                id: 4, parent: Some(3), author: lee.clone(), timestamp: "2026-11-20T08:01:00Z".into(),
+                done: false, text: "@Ana done".into(), mentions,
+            },
+        ]).unwrap();
+        let open = thread(false, [].into());
+        let resolved = thread(true, [ThreadMention { id: 5, person: ana.clone(), start: 0, end: 4 }].into());
+        let mut rich = CommentStyle::default();
+        rich.bold = true;
+        let formatted = Comment::with_runs("Lee", "New note", [CommentRun { start: 0, end: 3, style: rich }]);
+        local.wb.set_comments(0, vec![(2, 1, Some(open.clone())), (4, 1, Some(open.clone()))]);
+        incoming.wb.set_comments(1, vec![(2, 1, Some(resolved.clone())), (6, 1, Some(formatted.clone()))]);
+        let local_link = Link::new("https://example.invalid/local");
+        let incoming_link = Link::new("#Data!$B$2");
+        local.wb.set_links(0, vec![(3, 1, local_link.clone()), (5, 1, local_link.clone())]);
+        incoming.wb.set_links(1, vec![(3, 1, incoming_link.clone()), (7, 1, incoming_link.clone())]);
+        let incoming = native::load(&native::save_to_vec(&incoming.wb)).unwrap();
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming);
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.changes.len(), 6);
+        assert!(pane.changes.iter().all(|ch| matches!(ch, Change::Comment(_) | Change::Link(_))));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for label in ["Comment thread B3 changed", "Comment thread B5 removed", "Comment B7 added",
+                      "Hyperlink B4 changed", "Hyperlink B6 removed", "Hyperlink B8 added"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
+        }
+        let choose = |row, cmd| {
+            let at = sheets.review.get_cloned().changes.iter().position(|ch| ch.at() == Some((0, row, 1))).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(at));
+            sheets.review_cmd(cmd);
+        };
+        choose(4, ReviewCmd::Keep);
+        choose(3, ReviewCmd::Keep);
+        choose(2, ReviewCmd::Take);
+        assert_eq!(sheets.doc.borrow().wb.comment(0, 2, 1), Some(&resolved));
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let d = sheets.doc.borrow();
+            assert_eq!(d.wb.comment(0, 4, 1), Some(&open));
+            assert_eq!(d.wb.comment(0, 6, 1), Some(&formatted));
+            assert_eq!(d.wb.link(0, 3, 1), local_link.as_ref());
+            assert!(d.wb.link(0, 5, 1).is_none());
+            assert_eq!(d.wb.link(0, 7, 1), incoming_link.as_ref());
+        }
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.link(0, 5, 1), local_link.as_ref());
+        assert!(sheets.doc.borrow().wb.comment(0, 6, 1).is_none());
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.comment(0, 2, 1), Some(&open));
+    }
+
+    #[test]
     fn workbook_review_flags_takes_and_keeps_embedded_pictures() {
         use crate::review::ReviewCmd;
         use officina_grid::{charts::{Anchor, Picture}, compare::Change, native};

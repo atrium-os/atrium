@@ -21,9 +21,11 @@ use crate::formula;
 use crate::ops::{Fill, GridOp, Region};
 use crate::value::Value;
 
+mod annotations;
 mod parts;
 mod rules;
 mod tables;
+pub use annotations::AnnotationChange;
 pub use parts::{ChartChange, NameChange, PictureChange};
 pub use rules::RuleChange;
 pub use tables::{PivotChange, TableChange};
@@ -45,6 +47,8 @@ pub enum Change {
     Cell { sheet: u16, row: u32, col: u32, ours: Input, theirs: Input },
     /// A static style change over a contiguous run in one column.
     Style { rect: Rect, ours: Box<crate::style::Style>, theirs: Box<crate::style::Style> },
+    Comment(AnnotationChange<crate::comments::Comment>),
+    Link(AnnotationChange<crate::links::Link>),
     Chart(ChartChange),
     Picture(PictureChange),
     Name(NameChange),
@@ -81,6 +85,8 @@ impl Change {
         match *self {
             Change::Cell { sheet, .. } | Change::RowsAdded { sheet, .. } | Change::RowsRemoved { sheet, .. } | Change::SheetRemoved { sheet } | Change::StructuralConflict { sheet, .. } => Some(sheet),
             Change::Style { rect, .. } => Some(rect.sheet),
+            Change::Comment(ref comment) => Some(comment.at.sheet),
+            Change::Link(ref link) => Some(link.at.sheet),
             Change::Chart(ref chart) => chart.sheet,
             Change::Picture(ref picture) => picture.sheet,
             Change::Name(ref name) => name.sheet,
@@ -104,6 +110,8 @@ impl Change {
                 crate::shift::Axis::Cols => (sheet, 0, at),
             }),
             Change::Style { rect, .. } => Some((rect.sheet, rect.r0, rect.c0)),
+            Change::Comment(ref comment) => Some((comment.at.sheet, comment.at.row, comment.at.col)),
+            Change::Link(ref link) => Some((link.at.sheet, link.at.row, link.at.col)),
             Change::Chart(ref chart) => chart.anchor(),
             Change::Picture(ref picture) => picture.anchor(),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
@@ -148,6 +156,8 @@ impl Change {
                 if rect.r0 == rect.r1 { format!("Style {first} changed") }
                 else { format!("Style {first}:{} changed", crate::addr::a1(rect.r1, rect.c1)) }
             }
+            Change::Comment(comment) => comment.describe(comment.label()),
+            Change::Link(link) => link.describe("Hyperlink"),
             Change::Chart(chart) => chart.describe(),
             Change::Picture(picture) => picture.describe(),
             Change::Name(name) => name.describe(),
@@ -412,7 +422,10 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
     let mut pairs = match_rows(&ha, &hb);
     pairs.push((ra.n, rb.n));
     let compare_styles = !ours.sheet(s).styles.is_empty() || !theirs.sheet(t).styles.is_empty();
-    let mut style_pairs = Vec::new();
+    let compare_annotations = !ours.comments(s).is_empty() || !theirs.comments(t).is_empty()
+        || !ours.links(s).is_empty() || !theirs.links(t).is_empty();
+    let paired_metadata = compare_styles || compare_annotations;
+    let mut row_pairs = Vec::new();
     let (mut i, mut j) = (0u32, 0u32);
     for (mi, mj) in pairs {
         // The gap before this match: rows paired by likeness, the rest added
@@ -421,7 +434,7 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
             match step {
                 Step::Pair(x, y) => {
                     cells(ours, &ra, s, x, theirs, &rb, y, out);
-                    if compare_styles { parts::pair(&mut style_pairs, x, y, 1); }
+                    if paired_metadata { parts::pair(&mut row_pairs, x, y, 1); }
                 }
                 Step::Add(at, y, n) => out.push(Change::RowsAdded { sheet: s, at, n, theirs_row: y }),
                 Step::Remove(x, n) => out.push(Change::RowsRemoved { sheet: s, row: x, n }),
@@ -430,15 +443,16 @@ fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut V
                 return true;
             }
         }
-        if compare_styles && mi < ra.n && mj < rb.n {
-            parts::pair(&mut style_pairs, mi, mj, 1);
+        if paired_metadata && mi < ra.n && mj < rb.n {
+            parts::pair(&mut row_pairs, mi, mj, 1);
         }
         i = mi + 1;
         j = mj + 1;
     }
-    if !compare_styles { return false; }
-    parts::pair(&mut style_pairs, ra.n, rb.n, MAX_ROWS - ra.n.max(rb.n));
-    parts::styles(ours, s, theirs, t, &style_pairs, out)
+    if !paired_metadata { return false; }
+    parts::pair(&mut row_pairs, ra.n, rb.n, MAX_ROWS - ra.n.max(rb.n));
+    (compare_styles && parts::styles(ours, s, theirs, t, &row_pairs, out))
+        || (compare_annotations && annotations::compare(ours, s, theirs, t, &row_pairs, out))
 }
 
 /// How a gap between matched rows lines up.
@@ -593,6 +607,18 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             if ours.style_snapshot(rect).spans != parts::style_spans(*rect, before) { return None; }
             Some(vec![GridOp::style(*rect, (**after).clone())])
         }
+        Change::Comment(change) => {
+            let CellAddr { sheet, row, col } = change.at;
+            if !change.on_current_sheet(ours) { return None; }
+            let set = change.take(ours.comment(sheet, row, col), ours.comments(sheet).len(), crate::comments::MAX_COMMENTS)?;
+            Some(vec![GridOp::Comments { sheet, set: vec![set] }])
+        }
+        Change::Link(change) => {
+            let CellAddr { sheet, row, col } = change.at;
+            if !change.on_current_sheet(ours) { return None; }
+            let set = change.take(ours.link(sheet, row, col), ours.links(sheet).len(), crate::links::MAX_LINKS)?;
+            Some(vec![GridOp::Links { sheet, set: vec![set] }])
+        }
         Change::Chart(_) | Change::Picture(_) | Change::Name(_) | Change::Table(_) | Change::Pivot(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
             let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
             (n != 0).then_some(ops)
@@ -625,6 +651,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             let source = Rect { sheet: t, r0: *theirs_row, r1: *theirs_row + *n - 1, c0: 0, c1: 0 };
             let target = Rect { sheet: *sheet, r0: *at, r1: *at + *n - 1, ..source };
             if let Some(op) = parts::row_styles(theirs, source, target) { ops.push(op); }
+            ops.extend(annotations::insert_rows(ours, theirs, source, target)?);
             Some(ops)
         }
         Change::RowsRemoved { sheet, row, n } => shift_op(ours, *sheet, Axis::Rows, *row, -(*n as i64)).map(|op| vec![op]),
@@ -638,6 +665,11 @@ pub fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (
     let rule_count = rules::take(ours, theirs, changes, &mut ops);
     let table_count = tables::take(ours, theirs, changes, &mut ops);
     (ops, count + rule_count + table_count)
+}
+
+/// Plans selected comments and links, preserving other annotations.
+pub fn take_annotations(ours: &Workbook, changes: &[&Change]) -> (Vec<GridOp>, usize) {
+    annotations::take_selected(ours, changes)
 }
 
 /// Our sheet `s` made the same as theirs of its name: cells, formulas and
@@ -679,13 +711,51 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
     });
     let mut styles = theirs.style_snapshot(&Rect { r1: MAX_ROWS - 1, c1: MAX_COLS - 1, ..theirs_rect });
     styles.rect.sheet = s;
-    Some(GridOp::Batch(vec![GridOp::Replace(Region { rect, values, fills }), GridOp::Restyle(styles)]))
+    let mut ops = vec![GridOp::Replace(Region { rect, values, fills }), GridOp::Restyle(styles)];
+    ops.extend(annotations::take_sheet(ours, s, theirs, t)?);
+    Some(GridOp::Batch(ops))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn review_annotations_follow_aligned_and_inserted_rows() {
+        use crate::comments::Comment;
+        use crate::links::Link;
+
+        let mut ours = book(&[&["Header"], &["first"], &["last"]]);
+        let mut theirs = book(&[&["Header"], &["first"], &["inserted"], &["last"]]);
+        let stay = Comment::new("Ana", "Same comment");
+        let added = Comment::new("Lee", "On the new row");
+        let link = Link::new("#A1");
+        ours.set_comments(0, vec![(2, 1, Some(stay.clone()))]);
+        theirs.set_comments(0, vec![(2, 1, Some(added.clone())), (3, 1, Some(stay.clone()))]);
+        ours.set_links(0, vec![(200, 4, link.clone())]);
+        theirs.set_links(0, vec![(2, 2, link.clone()), (201, 4, link.clone())]);
+        let (changes, _) = compare(&ours, &theirs);
+        assert!(matches!(&changes[..], [Change::RowsAdded { .. }]));
+        let inv = GridOp::Batch(take(&ours, &theirs, &changes[0]).unwrap()).apply(&mut ours);
+        assert_eq!(ours.comment(0, 2, 1), Some(&added));
+        assert_eq!(ours.comment(0, 3, 1), Some(&stay));
+        assert_eq!(ours.link(0, 2, 2), link.as_ref());
+        assert!(compare(&ours, &theirs).0.is_empty());
+        inv.apply(&mut ours);
+        assert_eq!(ours.comment(0, 2, 1), Some(&stay));
+        assert_eq!(ours.link(0, 200, 4), link.as_ref());
+        take_sheet(&ours, &theirs, 0).unwrap().apply(&mut ours);
+        assert!(compare(&ours, &theirs).0.is_empty());
+
+        theirs.set_links(0, vec![(300, 4, link)]);
+        let (changes, _) = compare(&ours, &theirs);
+        assert!(matches!(&changes[..], [Change::Link(_)]));
+        ours.add_sheet("Unrelated").unwrap();
+        assert!(ours.move_sheet(0, 1));
+        assert!(take(&ours, &theirs, &changes[0]).is_none());
+        assert_eq!(take_annotations(&ours, &[&changes[0]]).1, 0);
+    }
 
     #[test]
     fn picture_review_leaves_an_over_limit_collection_pending() {

@@ -109,7 +109,7 @@ pub fn take(d: &mut Doc, theirs: &Workbook, ch: &Change) -> bool {
 /// added or removed whole, other sheets cell by cell. The number taken.
 pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Change]) -> usize {
     let protected: std::collections::BTreeSet<_> = kept.iter().filter(|change| {
-        matches!(change, Change::Cell { .. } | Change::Style { .. }) || change.is_rows()
+        matches!(change, Change::Cell { .. } | Change::Style { .. } | Change::Comment(_) | Change::Link(_)) || change.is_rows()
     }).filter_map(Change::sheet).collect();
     let whole: std::collections::BTreeSet<_> = changes.iter().filter(|c| c.is_rows()).filter_map(Change::sheet)
         .filter(|s| !protected.contains(s)).collect();
@@ -119,6 +119,7 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
         _ => None,
     });
     let mut ops = Vec::new();
+    let mut annotations = Vec::new();
     let mut done = std::collections::BTreeMap::new();
     for ch in changes {
         if ch.is_object() { continue; }
@@ -140,13 +141,18 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
                 continue;
             }
         }
-        if !ch.is_rows() {
+        if matches!(ch, Change::Comment(_) | Change::Link(_)) {
+            annotations.push(ch);
+        } else if !ch.is_rows() {
             if let Some(more) = compare::take(&d.wb, theirs, ch) {
                 ops.extend(more);
                 n += 1;
             }
         }
     }
+    let (annotation_ops, taken) = compare::take_annotations(&d.wb, &annotations);
+    n += taken;
+    ops.extend(annotation_ops);
     if pivot_areas.is_some() {
         ops.splice(..0, objects);
     } else {

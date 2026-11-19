@@ -91,7 +91,7 @@ pub(super) fn action(before: bool, after: bool) -> &'static str {
     }
 }
 
-type RowRun = (u32, u32, u32);
+pub(super) type RowRun = (u32, u32, u32);
 type StyleRun = (u32, u32, u32);
 
 pub(super) fn pair(runs: &mut Vec<RowRun>, ours: u32, theirs: u32, len: u32) {
