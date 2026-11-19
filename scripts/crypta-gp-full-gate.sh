@@ -38,7 +38,7 @@ if [ "$hip" = posture ]; then
 fi
 case "$hip" in
     tessera) tessera_fact='Mounted sealed Tessera volumes' ;;
-    tessera-domain|tessera-rebind) tessera_fact='Tessera encrypted domains verified with active keys' ;;
+    tessera-domain|tessera-rebind|tessera-rebind-decline) tessera_fact='Tessera encrypted domains verified with active keys' ;;
     *) tessera_fact= ;;
 esac
 if [ -n "$tessera_fact" ]; then
@@ -346,6 +346,25 @@ if [ -n "$tessera_fact" ]; then
         fi
         sleep 1
         if new_tessera_receipt; then fail "$change was uploaded without approval"; fi
+        if [ "${3:-}" = rebind ] && [ "$hip" = tessera-rebind-decline ]; then
+            "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+            wait_field up 0
+            [ "$(field error)" = "$(hex 'GlobalProtect device report was not approved')" ] ||
+                fail "declining the rebound HIP review did not stop the profile"
+            ok "declining the fresh HIP review stopped the rebound profile"
+            # Cover another HIP timer interval and check for a transient Up.
+            sleep 6
+            [ "$(field up)" = 0 ] && [ -z "$(field engine)" ] ||
+                fail "the rebound profile restarted after decline"
+            [ "$("$V" "grep -c 'gp-gate: connected$' $G/cryptad.log")" = 1 ] ||
+                fail "the rebound tunnel connected after decline"
+            "$V" "if route -n get 10.77.0.1 2>/dev/null | grep -Eq 'interface: $iface$'; then exit 1; fi" ||
+                fail "the declined profile retained its tunnel route"
+            if new_tessera_receipt; then fail "$change was uploaded after decline"; fi
+            ok "rebound tunnel stayed down and no changed HIP report arrived"
+            echo "$pass checks passed"
+            exit 0
+        fi
         approve_hip
         for _ in $(seq 1 20); do
             new_tessera_receipt && break
@@ -384,7 +403,7 @@ if [ -n "$tessera_fact" ]; then
             /root/sealed/tessera-keyload drop c0ffee00112233445566778899aabbcc
             /root/sealed/tessera-keyload group-info /tmp/crypta-gate/tessera/persona | grep -q " locked$"
             test "$(sysctl -n kern.tessera.verified_encrypted_domains)" = 0'
-        if [ "$hip" = tessera-rebind ]; then
+        if [ "$hip" = tessera-rebind ] || [ "$hip" = tessera-rebind-decline ]; then
             approve_tessera_change 0 "Tessera domain key lock" rebind
             wait_field handshake 1
         else

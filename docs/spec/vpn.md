@@ -823,6 +823,12 @@ another origin. An active portal-profile session stays in engine memory.
   count reaches the gateway only after fresh approval, and IPv4 echo
   resumes on the rebound TLS connection or ESP association. The arm64
   rebind gate passed 15/15 on each transport.
+  The `--hip tessera-rebind-decline` variant declines the replacement
+  review. It checks that the profile and its route stay down for a full
+  refresh interval, that the changed count never reaches the peer, and
+  that the peer sees neither a second TLS data connection nor any ESP
+  packet on the newly offered association. The arm64 decline gate passed
+  13/13 on TLS and 13/13 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
