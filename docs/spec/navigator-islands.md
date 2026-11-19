@@ -198,9 +198,16 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 - **Servo is the largest dependency Atrium would take,** and SpiderMonkey is C++ with a
   tracing collector (§11.9). The jail, JIT off and recycling bound the harm. They don't
   remove it.
-- **Build host.** A Servo build won't fit this cloud workspace (about 2 GB free). I0 needs a
-  machine with tens of GB of disk and plenty of memory: the shared Mac VM (arm64, native
-  speed), or a larger build environment. This is the first practical blocker.
+- **Build host.** A Servo build won't fit this cloud workspace (about 2 GB free). I0
+  cross-builds on the Mac (D3), as `.cargo/config.toml` already does for the rest of Atrium
+  with clang and a FreeBSD sysroot:
+  - The Rust crates cross-compile like ours.
+  - The risk is the C and C++ underneath. SpiderMonkey has its own build system, and Servo
+    links fontconfig, FreeType and HarfBuzz, which the sysroot must carry from FreeBSD's
+    packages. Ladybird uses CMake with vcpkg, which builds its dependencies (Skia among
+    them) and would need a FreeBSD toolchain file.
+  - Where a cross-build fails, that engine builds natively in the Mac VM instead, which is
+    slower but sure.
 - **FreeBSD support.** Servo targets Linux, macOS, Windows and Android. FreeBSD may need
   patches, upstreamed where we can.
 - **Compatibility.** Servo renders fewer sites correctly than Blink. Islands are small
@@ -220,7 +227,7 @@ alongside I0.
 |---|---|---|---|
 | **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Decided (Shankar, 2026-11-19): measure Servo and Ladybird side by side in I0, and choose on the measurements.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
 | **D2** | MPL-2.0, if I0 picks Servo (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft: we publish the source of any MPL file we change, and nothing of ours changes licence. toolkit-backends.md already accepted it for Servo. Nothing else links it |
-| **D3** | Where I0 builds | the shared Mac VM · a larger cloud build environment | **The shared Mac VM**, booked through the coordinator. It's arm64 at native speed with room for the build |
+| **D3** ✓ | Where I0 builds | cross-build on the Mac · natively in the Mac VM · a larger cloud build environment | **Decided (Shankar, 2026-11-19): cross-build on the Mac** with a FreeBSD sysroot, from a Mac session. An engine whose C++ side won't cross-build builds natively in the shared Mac VM, booked through the coordinator. The VM runs I0's measurements either way |
 | **D4** | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
 | **D5** | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |
 | **D6** | Whose jar a live sign-in uses | Arca couriers in the window's own partition · a throwaway Nuntius jar | **Arca's couriers**, as vpn.md §9.3 already specifies, so the person stays signed in next time and no engine holds a cookie |
