@@ -91,6 +91,27 @@ pub enum GridOp {
     Links { sheet: u16, set: Vec<(u32, u32, Option<crate::links::Link>)> },
     /// A sheet's frozen rows and columns ([`crate::book::Sheet::freeze`]).
     Freeze { sheet: u16, rows: u32, cols: u32 },
+    /// A sheet's remembered widths of hidden columns
+    /// ([`crate::book::Sheet::hidden_widths`]), swapped in whole.
+    HiddenWidths { sheet: u16, list: Vec<(u32, f64)> },
+}
+
+/// Remembered widths: count, then each column (rising) and its width
+/// (finite, 0 to 8192 px).
+pub(crate) fn decode_widths(r: &mut Reader) -> Result<Vec<(u32, f64)>, WireError> {
+    let n = r.count("widths", MAX_COLS as u64, 9)?;
+    let mut list = Vec::with_capacity(n);
+    let mut last = None;
+    for _ in 0..n {
+        let i = r.var()?;
+        let v = r.f64()?;
+        if i >= MAX_COLS as u64 || last.is_some_and(|l| i <= l) || !v.is_finite() || !(0.0..=8192.0).contains(&v) {
+            return Err(WireError::Invalid("hidden width"));
+        }
+        last = Some(i);
+        list.push((i as u32, v));
+    }
+    Ok(list)
 }
 
 impl GridOp {
@@ -252,6 +273,16 @@ impl GridOp {
                 w.str(name);
                 return w.into_bytes();
             }
+            GridOp::HiddenWidths { sheet, list } => {
+                w.u8(21);
+                w.u16(*sheet);
+                w.var(list.len() as u64);
+                for (i, v) in list {
+                    w.var(*i as u64);
+                    w.f64(*v);
+                }
+                return w.into_bytes();
+            }
             GridOp::Freeze { sheet, rows, cols } => {
                 w.u8(19);
                 w.u16(*sheet);
@@ -408,6 +439,14 @@ impl GridOp {
                 return Err(WireError::Invalid("trailing bytes"));
             }
             return Ok(op);
+        }
+        if kind == 21 {
+            let sheet = r.u16()?;
+            let list = decode_widths(&mut r)?;
+            if !r.is_empty() {
+                return Err(WireError::Invalid("trailing bytes"));
+            }
+            return Ok(GridOp::HiddenWidths { sheet, list });
         }
         if kind == 19 {
             let (sheet, rows, cols) = (r.u16()?, r.u32()?, r.u32()?);
@@ -600,6 +639,13 @@ impl Op<Workbook> for GridOp {
                     return GridOp::Batch(Vec::new());
                 }
                 GridOp::Links { sheet, set: wb.set_links(sheet, set) }
+            }
+            GridOp::HiddenWidths { sheet, list } => {
+                if sheet as usize >= wb.sheet_count() {
+                    return GridOp::Batch(Vec::new());
+                }
+                let old = std::mem::replace(&mut wb.sheet_mut(sheet).hidden_widths, list);
+                GridOp::HiddenWidths { sheet, list: old }
             }
             GridOp::Freeze { sheet, rows, cols } => {
                 if sheet as usize >= wb.sheet_count() {
@@ -837,6 +883,26 @@ mod tests {
         assert_eq!(wb.sheet_count(), 1);
         h.undo(&mut wb);
         assert_eq!(wb.sheet(1).freeze, (3, 0));
+    }
+
+    #[test]
+    fn hidden_widths_are_kept_undone_saved_and_shifted() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("One").unwrap();
+        let op = GridOp::HiddenWidths { sheet: 0, list: vec![(2, 120.0), (5, 30.5)] };
+        assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
+        assert!(GridOp::decode(&GridOp::HiddenWidths { sheet: 0, list: vec![(3, 1.0), (2, 1.0)] }.encode()).is_err());
+        let mut h: History<GridOp> = History::new();
+        h.run(&mut wb, "Hide Columns", vec![op]);
+        let back = crate::native::load(&crate::native::save_to_vec(&wb)).unwrap();
+        assert_eq!(back.sheet(0).hidden_widths, vec![(2, 120.0), (5, 30.5)]);
+        // A column inserted before them moves them on.
+        let ins = crate::shift::shift_op(&wb, 0, crate::shift::Axis::Cols, 0, 1).unwrap();
+        h.run(&mut wb, "Insert Column", vec![ins]);
+        assert_eq!(wb.sheet(0).hidden_widths, vec![(3, 120.0), (6, 30.5)]);
+        h.undo(&mut wb);
+        h.undo(&mut wb);
+        assert!(wb.sheet(0).hidden_widths.is_empty());
     }
 
     #[test]

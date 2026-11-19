@@ -430,13 +430,15 @@ fn segment(data: &[u8], sst: &[Arc<str>], theme: &[u32], first: bool) -> Result<
             b"col" => {
                 let (Some(min), Some(max)) = (attr(&e, b"min")?.and_then(|v| v.parse::<u32>().ok()), attr(&e, b"max")?.and_then(|v| v.parse::<u32>().ok())) else { continue };
                 let hidden = attr(&e, b"hidden")?.is_some_and(|v| v == "1" || v == "true");
-                let w = if hidden { Some(0.0) } else { attr(&e, b"width")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v <= 255.0) };
+                let given = attr(&e, b"width")?.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0 && *v <= 255.0);
+                let w = if hidden { Some(0.0) } else { given };
                 if let Some(xf) = attr(&e, b"style")?.and_then(|v| v.parse::<u32>().ok()).filter(|&x| x != 0) {
                     seg.col_styles.push((min.clamp(1, MAX_COLS) - 1, max.clamp(1, MAX_COLS) - 1, xf));
                 }
                 if let Some(w) = w {
                     // Hidden: no width (Sheets hides columns so).
-                    let px = if hidden { 0.0 } else { (w * MDW).round().max(2.0) };
+                    // Hidden: its width kept as a negative, to remember.
+                    let px = if hidden { given.filter(|g| *g > 0.0).map_or(0.0, |g| -(g * MDW).round().max(2.0)) } else { (w * MDW).round().max(2.0) };
                     let (min, max) = (min.clamp(1, MAX_COLS), max.clamp(1, MAX_COLS));
                     // A range over every column is a default, not 16,384 overrides.
                     if max - min > 4096 {
@@ -900,6 +902,8 @@ fn sheet(wb: &mut Workbook, s: u16, z: &Archive, part: &crate::zip::Entry, sst: 
             sh.row_sizes = Sizes::new((h * 96.0 / 72.0).round().max(2.0));
         }
         if !widths.is_empty() {
+            let (hw, widths) = remembered(widths);
+            sh.hidden_widths = hw;
             sh.col_sizes = Sizes::from_overrides(sh.col_sizes.default, widths);
         }
         if !heights.is_empty() {
@@ -1377,4 +1381,13 @@ pub(crate) fn parse_ref(s: &str) -> Option<(u32, u32, u32, u32)> {
     let (a, b) = s.split_once(':').unwrap_or((&s, &s));
     let ((r0, c0), (r1, c1)) = (parse_a1(a)?, parse_a1(b)?);
     Some((r0.min(r1), c0.min(c1), r0.max(r1), c0.max(c1)))
+}
+
+/// Column widths read, hidden ones as negatives: the widths to remember for
+/// hidden columns, and the sizes (hidden ones 0).
+pub(crate) fn remembered(widths: Vec<(u32, f64)>) -> (Vec<(u32, f64)>, Vec<(u32, f64)>) {
+    let mut hw: Vec<(u32, f64)> = widths.iter().filter(|w| w.1 < 0.0).map(|&(c, w)| (c, (-w).min(8192.0))).collect();
+    hw.sort_by_key(|w| w.0);
+    hw.dedup_by_key(|w| w.0);
+    (hw, widths.into_iter().map(|(c, w)| (c, w.max(0.0))).collect())
 }

@@ -239,7 +239,12 @@ fn sheet_xml(wb: &Workbook, s: u16, strings: &mut Strings, code: Option<&str>) -
             if c >= XLSX_COLS {
                 continue;
             }
-            let _ = write!(o, r#"<col min="{0}" max="{0}" width="{1}""#, c + 1, px.unwrap_or(sh.col_sizes.default) / MDW);
+            // A hidden column keeps the width it will show again at.
+            let shown = match px {
+                Some(w) if w <= 0.0 => sh.hidden_widths.binary_search_by_key(&c, |h| h.0).map_or(sh.col_sizes.default, |i| sh.hidden_widths[i].1),
+                p => p.unwrap_or(sh.col_sizes.default),
+            };
+            let _ = write!(o, r#"<col min="{0}" max="{0}" width="{1}""#, c + 1, shown / MDW);
             if px.is_some() {
                 o.extend_from_slice(br#" customWidth="1""#);
             }

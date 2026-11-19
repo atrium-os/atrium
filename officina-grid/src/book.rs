@@ -48,11 +48,14 @@ pub struct Sheet {
     /// Rows and columns frozen at the top and left (0, 0: none), kept in view
     /// while the rest scrolls.
     pub freeze: (u32, u32),
+    /// The width each hidden column (width 0) had, for showing it again as
+    /// it was: (column, px), sorted. Files keep it with the column.
+    pub hidden_widths: Vec<(u32, f64)>,
 }
 
 impl Sheet {
     fn new(name: &str) -> Self {
-        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0) }
+        Sheet { name: name.to_string(), cols: Vec::new(), row_sizes: Sizes::new(20.0), col_sizes: Sizes::new(64.0), fidx: Vec::new(), rows_used: 0, styles: Vec::new(), hidden: Vec::new(), filter: None, tab_color: None, merges: Vec::new(), comments: Default::default(), links: Default::default(), freeze: (0, 0), hidden_widths: Vec::new() }
     }
     pub fn column(&self, c: u32) -> Option<&Column> {
         self.cols.get(c as usize)

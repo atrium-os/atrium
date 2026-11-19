@@ -820,7 +820,9 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
         if !widths.is_empty() {
             widths.sort_by_key(|w| w.0);
             widths.dedup_by_key(|w| w.0);
-            sh.col_sizes = Sizes::from_overrides(sh.col_sizes.default, std::mem::take(widths));
+            let (hw, sizes) = crate::xlsx::read::remembered(std::mem::take(widths));
+            sh.hidden_widths = hw;
+            sh.col_sizes = Sizes::from_overrides(sh.col_sizes.default, sizes);
         }
         if !heights.is_empty() {
             sh.row_sizes = Sizes::from_overrides(sh.row_sizes.default, std::mem::take(heights));
@@ -913,10 +915,12 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                                 widths.push((c as u32, w.round().max(2.0)));
                             }
                         }
-                        // Hidden columns: no width, as Sheets hides them.
+                        // Hidden columns: no width, as Sheets hides them; the
+                        // width their style gives kept (as a negative) to remember.
                         if !shown {
+                            let keep = a.get("table:style-name").and_then(|s| styles.col_width.get(s)).map_or(0.0, |w| -w.round().max(2.0));
                             for c in col_x..(col_x + n).min(MAX_COLS as u64).min(col_x + 4096) {
-                                widths.push((c as u32, 0.0));
+                                widths.push((c as u32, keep));
                             }
                         }
                         col_defaults.push((col_x, col_x + n - 1, a.get("table:default-cell-style-name").cloned()));

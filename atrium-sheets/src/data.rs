@@ -585,21 +585,25 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let old = d.wb.sheet(s).col_sizes.overrides().to_vec();
             let inside = |c: u32| (sel.c0..=sel.c1).contains(&c);
             let mut over: Vec<(u32, f64)> = old.iter().copied().filter(|&(c, w)| !inside(c) || (cmd == DataCmd::UnhideCols && w > 0.0)).collect();
+            let kept_old = d.wb.sheet(s).hidden_widths.clone();
+            let mut kept = kept_old.clone();
             if cmd == DataCmd::HideCols {
                 // Remember the widths, to show them again as they were.
                 for c in sel.c0..=sel.c1 {
                     let w = d.wb.sheet(s).col_sizes.size(c);
                     if w > 0.0 {
-                        d.hidden_widths.insert((s, c), w);
+                        kept.retain(|k| k.0 != c);
+                        kept.push((c, w));
                     }
                 }
                 over.extend((sel.c0..=sel.c1).map(|c| (c, 0.0)));
             } else {
                 for &(c, w) in &old {
                     if inside(c) && w <= 0.0 {
-                        if let Some(&was) = d.hidden_widths.get(&(s, c)) {
+                        if let Some(&(_, was)) = kept_old.iter().find(|k| k.0 == c) {
                             over.push((c, was));
                         }
+                        kept.retain(|k| k.0 != c);
                     }
                 }
             }
@@ -609,7 +613,12 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             }
             let hidden = |v: &[(u32, f64)]| v.iter().filter(|o| o.1 <= 0.0).count();
             let n = hidden(&over).abs_diff(hidden(&old));
-            d.run(if cmd == DataCmd::HideCols { "Hide Columns" } else { "Unhide Columns" }, vec![GridOp::Sizes { sheet: s, rows: false, over }]);
+            kept.sort_by_key(|k| k.0);
+            let mut ops = vec![GridOp::Sizes { sheet: s, rows: false, over }];
+            if kept != kept_old {
+                ops.push(GridOp::HiddenWidths { sheet: s, list: kept });
+            }
+            d.run(if cmd == DataCmd::HideCols { "Hide Columns" } else { "Unhide Columns" }, ops);
             Ok(if cmd == DataCmd::HideCols { format!("{n} columns hidden.") } else { format!("{n} columns shown.") })
         }
         DataCmd::PasteValues
