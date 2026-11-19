@@ -653,21 +653,9 @@ VM from the Aura gates cover them.
   (`check_dns6`) before unbound gets DHCP's and the RA's servers together.
 - Gate: `scripts/atrium-net-gate.sh n0` now 28 checks, IPv4 and IPv6, including 25 RAs
   from a rogue router (12 kinds) with no bad server reaching unbound.
-- Found while testing: a FreeBSD kernel race. Deleting a SLAAC address while RAs for its
-  prefix arrive can free the prefix that a newly made address still points to
-  (`in6_purgeifaddr` checks `ndpr_addrcnt` without the ND6 lock while `prelist_update`
-  increments it); the next RA or NA walks the freed prefix and the kernel panics in
-  `pfxlist_onlink_check`. `lan.py flap6` plus address deletions in a loop reproduce it
-  in about 15 s. atrium-net turns RA processing off on the interface while it deletes
-  addresses, which closes its own window. With that fixed, the same stress found a second
-  bug: `nd6_na_input` removes a router whose NA dropped the Router flag while holding the
-  neighbor entry's lock, and `defrouter_del` then takes the ND6 lock, the reverse of
-  `pfxlist_onlink_check`'s order: the IPv6 stack deadlocks (seen in DDB). Both are fixed
-  in a fork patch (address-prefix linkage under the ND6 write lock with a prefix
-  reference held across the purge; router removal after the neighbor unlock): 509 SLAAC
-  addresses made and deleted under the flood with no panic or hang, 10 minutes clean, the
-  gate 28/28 on that kernel. Pushed to atrium-os/freebsd-src branch `atrium-os` as
-  92ffd19c3; a private report to the FreeBSD Security Officer is drafted, not sent.
+- Testing turned up two FreeBSD kernel issues in IPv6 address handling. They are fixed
+  in the atrium-os/freebsd-src fork and are being reported to FreeBSD privately;
+  details follow here once that report is handled.
 - IPv6 over Wi-Fi checked 2026-11-17 (`aura-sim-gate.sh wifi6`, 11/11): the AP VM's
   `ra6.py` advertises fd77:0:0:77::/64 and RDNSS on br0; RAs arrive as group frames
   under the GTK; SLAAC stable and temporary addresses, the AP as default router, ping6
