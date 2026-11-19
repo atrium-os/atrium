@@ -191,11 +191,12 @@ fn touch_keys_list_publicly_and_require_a_new_security_key_reply_for_each_signat
         arcad::serve_conn_with(server, &agent(), &daemon_state, Some(&Sigillum::new(path))).unwrap();
     });
     let verifier = std::thread::spawn(move || {
-        for (index, (method, strength)) in [
-            (Method::Passcode, Strength::Passcode),
-            (Method::SecurityKey, Strength::KeyUv),
-            (Method::SecurityKey, Strength::KeyUv),
-            (Method::SecurityKey, Strength::KeyUv),
+        for (index, verified) in [
+            None,
+            Some((Method::Passcode, Strength::Passcode)),
+            Some((Method::SecurityKey, Strength::KeyUv)),
+            Some((Method::SecurityKey, Strength::KeyUv)),
+            Some((Method::SecurityKey, Strength::KeyUv)),
         ].into_iter().enumerate() {
             let (mut socket, _) = listener.accept().unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -207,11 +208,15 @@ fn touch_keys_list_publicly_and_require_a_new_security_key_reply_for_each_signat
             assert_eq!(v.purpose, Purpose::ArcaSshSign { description: "workspace web: touch-test".into() });
             assert_eq!(v.min_strength, Strength::KeyUv);
             let mut state = state.try_lock().expect("Arca released its lock before asking");
-            if index == 3 {
+            if index == 4 {
                 assert_eq!(grant(&mut state, "main", id, "web", false), status::OK);
             }
             drop(state);
-            sigillum_proto::write_msg(&mut socket, &Reply::Verified { ceremony: v.ceremony, method, strength }, 4096).unwrap();
+            let reply = match verified {
+                Some((method, strength)) => Reply::Verified { ceremony: v.ceremony, method, strength },
+                None => Reply::Refused { ceremony: v.ceremony, reason: sigillum_proto::client::Refusal::NotAllowed },
+            };
+            sigillum_proto::write_msg(&mut socket, &reply, 4096).unwrap();
         }
     });
     let request = |client: &mut UnixStream| {
@@ -220,6 +225,9 @@ fn touch_keys_list_publicly_and_require_a_new_security_key_reply_for_each_signat
         })).unwrap();
         proto::read_reply(client).unwrap()
     };
+    let (status_code, cancelled) = request(&mut client);
+    assert_eq!(status_code, status::NEEDS_VERIFICATION);
+    assert!(cancelled.as_ref().is_empty(), "cancelling returned no signature");
     assert_eq!(request(&mut client).0, status::NEEDS_VERIFICATION);
     for _ in 0..2 {
         let (status_code, sig) = request(&mut client);

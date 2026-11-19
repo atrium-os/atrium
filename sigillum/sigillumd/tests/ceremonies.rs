@@ -935,6 +935,10 @@ fn arca_ssh_sign_requires_the_enrolled_security_key() {
     assert_eq!(r.passcode_asks, 0);
     r.press_last(Choice::Device(DEV));
     assert!(matches!(r.reply(), Reply::Verified { ceremony: 9, method: sigillum_proto::client::Method::SecurityKey, strength: Strength::KeyUv }));
+    r.request(&Label::Arca, request());
+    r.press_last(Choice::Cancel);
+    assert_eq!(r.reply(), Reply::Refused { ceremony: 9, reason: Refusal::NotAllowed });
+
     r.key.borrow_mut().touch = false;
     r.request(&Label::Arca, request());
     r.press_last(Choice::Device(DEV));
