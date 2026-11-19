@@ -3669,7 +3669,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - Moving the cursor scrolls so that it clears the frozen rows and columns, and moving into them doesn't scroll.
   - The frozen area is at most three quarters of the view.
 - **Sheets.** Data ▸ Freeze Panes keeps the rows above the cursor and the columns left of it in view. Freeze Top Row keeps the first row. With panes frozen, the item reads Unfreeze Panes. Each is one undo step.
-- **Not yet:** charts over the frozen area (drawn under the bands), freezing from a row other than the first (Excel freezes from the row at the top of the view), and repeating frozen rows when printing.
+- **Floats in frozen panes (2026-11-19).** Charts, filter buttons, comment boxes and validation marks meeting the frozen rows or columns are drawn in their band too, so they stay with those cells. The part of a chart past the freeze line scrolls in the body, as in Excel. Presses on them in a band reach them. Gate: pergola `a_float_in_the_frozen_rows_stays_with_them`.
+- **Not yet:** freezing from a row other than the first (Excel freezes from the row at the top of the view), and repeating frozen rows when printing.
 - **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
 
 ### 16.83 Data validation (2026-11-18)
