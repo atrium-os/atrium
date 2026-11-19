@@ -96,6 +96,17 @@ tessera_key_group_store_get(tessera_btree_t *t, uint64_t group_id,
 }
 
 int
+tessera_key_group_store_delete(tessera_btree_t *t, uint64_t group_id,
+                               uint64_t *new_root)
+{
+	if (t == NULL || group_id == 0 || group_id > TESSERA_KEY_GROUP_ID_MAX)
+		return TESSERA_EINVAL;
+	uint8_t key[8];
+	tessera_key_group_key(group_id, key);
+	return tessera_btree_delete(t, key, new_root);
+}
+
+int
 tessera_quota_store_delete(tessera_btree_t *t,
                            uint64_t domain_id,
                            uint64_t *new_root)

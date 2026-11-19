@@ -865,6 +865,27 @@ flush fails. Test hook: `kern.tessera.test_cross_domain_link` lets
 `link(2)` skip the domain check, standing in for an offline edit. VM gate:
 `tessera-sealed-vm.sh` check 13.
 
+**E4.5 as built (2026-11-19, kernel).** GC pass 1 walks an inode of a key
+group only while the group is open; a group it can't walk (locked, bad, or
+a read its key no longer opens, say a key dropped mid-pass) goes into a
+skip set, and pass 2 keeps every pack whose prelude names a skipped group.
+Other groups' packs are judged like a sealed volume's: their ids come from
+the front opened under the group's keys, and a pack that doesn't open is
+kept. So a locked group loses nothing, and GC still frees everything else.
+A group with no inodes left is not in the skip set, but its packs only go
+once its key is loaded. Crypto-erase is `TESSERA_IOC_GROUP_ERASE` (group id;
+`tessera-keyload group-erase DIR GROUP`), for atrium-volumes after arcad
+deleted the key: the group must be locked (EBUSY otherwise), none of its
+vnodes in use, and no snapshot retained (EBUSY: a snapshot's inodes would
+name packs it frees; to be lifted when snapshots learn groups). It deletes
+every inode of the group's domains, turns each domain's root into an empty
+directory in no domain (the caller removes it by name), retires the domain
+records and the group record, then runs a GC pass, which frees every pack
+whose prelude names a group with no record without opening it (no grace
+period). A group id should not be reused before that pass has run: a later
+group with the same id would keep the old packs. VM gate:
+`tessera-sealed-vm.sh` check 14.
+
 ## 14. Decisions
 
 Accepted 2026-11-17, all as recommended.

@@ -11,6 +11,7 @@
  *       (a key group's GK, scope (uuid, group); encryption §5.4)
  *   tessera-keyload group-create DIR KEY_ID_HEX GROUP
  *   tessera-keyload quota-group DIR GROUP
+ *   tessera-keyload group-erase DIR GROUP
  *       (on a mounted volume: make the group; put DIR's quota domain in it)
  *   tessera-keyload quota-dump DIR
  *       (the mount's domains and key groups, to the console)
@@ -61,6 +62,7 @@ usage(void)
 	    "       tessera-keyload load-group KEY_FILE KEY_ID UUID GROUP\n"
 	    "       tessera-keyload group-create DIR KEY_ID GROUP\n"
 	    "       tessera-keyload quota-group DIR GROUP\n"
+	    "       tessera-keyload group-erase DIR GROUP\n"
 	    "       tessera-keyload quota-dump DIR\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
@@ -106,6 +108,23 @@ main(int argc, char **argv)
 			return (1);
 		}
 		printf("in group %ju\n", (uintmax_t)gid);
+		return (0);
+	}
+	if (strcmp(argv[1], "group-erase") == 0 && argc == 4) {
+		uint64_t gid = strtoull(argv[3], NULL, 0);
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		/* Crypto-erase (encryption §9): the group's key must be
+		 * dropped first. */
+		if (ioctl(dfd, TESSERA_IOC_GROUP_ERASE, &gid) != 0) {
+			perror("TESSERA_IOC_GROUP_ERASE");
+			return (1);
+		}
+		printf("group %ju erased\n", (uintmax_t)gid);
 		return (0);
 	}
 	if (strcmp(argv[1], "quota-dump") == 0 && argc == 3) {

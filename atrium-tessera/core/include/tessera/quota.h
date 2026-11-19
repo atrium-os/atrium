@@ -79,6 +79,9 @@ int  tessera_key_group_store_put(struct tessera_btree *t,
                                  uint64_t *new_root);
 int  tessera_key_group_store_get(struct tessera_btree *t, uint64_t group_id,
                                  tessera_key_group_t *out);
+/* Remove a key-group record (crypto-erase, encryption §9). */
+int  tessera_key_group_store_delete(struct tessera_btree *t,
+                                    uint64_t group_id, uint64_t *new_root);
 
 /* Remove a domain record; returns the new tree root in *new_root. */
 int tessera_quota_store_delete(struct tessera_btree *t,

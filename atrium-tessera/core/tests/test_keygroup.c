@@ -248,6 +248,11 @@ test_shared_tree(uint32_t suite)
 	CHECK(key[0] == 0xFF && key[7] == 7);
 	tessera_quota_key(7, key);
 	CHECK(!tessera_quota_key_is_group(key));
+	/* Crypto-erase removes the group's record and leaves the domain's. */
+	CHECK(tessera_key_group_store_delete(t, 7, &root) == TESSERA_OK);
+	CHECK(tessera_key_group_store_get(t, 7, &got) == TESSERA_ENOENT);
+	CHECK(tessera_quota_store_get(t, 7, &gd) == TESSERA_OK);
+	CHECK(tessera_key_group_store_delete(t, 0, &root) == TESSERA_EINVAL);
 	tessera_btree_close(t);
 	free(disk);
 	tessera_group_keys_clear(&g);

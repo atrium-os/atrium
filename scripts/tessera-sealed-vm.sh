@@ -55,6 +55,13 @@
 #      what was written just before the drop is there after the reload; a
 #      name for a group's file in a plain directory (the test sysctl stands
 #      in for an offline edit) is refused after a remount.
+#  14. GC and crypto-erase of a key group (E4.5) on a plain image: with the
+#      key loaded GC frees a deleted file of the group; with it dropped GC
+#      still frees plain files but nothing of the group; reloaded, the
+#      group's deleted file is freed; erase is refused while the key is
+#      loaded, then with it dropped frees the group's packs without it,
+#      leaves its root an empty directory, and the group is gone after a
+#      remount.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-arm64}"
@@ -493,6 +500,68 @@ umount $M; mdconfig -d -u ${DEV#/dev/md}
 tessera-keyload drop $GKID >/dev/null; tessera-keyload drop $GKID2 >/dev/null
 rm -f $IMG $T/gkey $T/gkey2
 echo "locked groups and rules: ok"
+
+# 14. GC and crypto-erase of a key group (E4.5)
+U5=c3d4e5f60718293a4b5c6d7e8f90a1b2
+rm -f $IMG
+tessera-mkfs-sealed --plain --create -s 64 -j 64 --uuid $U5 $IMG >/dev/null ||
+    fail "mkfs plain for group gc"
+head -c 32 /dev/random > $T/gkey
+DEV=/dev/$(mdconfig -a -t vnode -f $IMG) || fail mdconfig
+mount -t tessera $DEV $M || fail "plain mount for group gc"
+mkdir $M/persona $M/other || fail "gc dirs"
+tessera-quota-set $M/persona 1000000000 >/dev/null || fail "quota persona"
+tessera-quota-set $M/other 1000000000 >/dev/null || fail "quota other"
+tessera-keyload load-group $T/gkey $GKID $U5 9 >/dev/null || fail "load-group 9"
+tessera-keyload group-create $M $GKID 9 >/dev/null || fail "group-create 9"
+tessera-keyload quota-group $M/persona 9 >/dev/null || fail "quota-group 9"
+for f in a b c; do
+    jot -w "persona doomed $f line %06d" 80000 > $M/persona/$f.txt || fail "write $f"
+done
+mkdir $M/persona/sub && echo 'sub note' > $M/persona/sub/d.txt || fail "sub in group"
+jot -w 'plain doomed line %06d' 80000 > $M/other/plain.txt || fail "plain write"
+free() { sync; sleep 2; sync; df -k $M | awk 'NR==2 {print $4}'; }
+gc() { tessera-gc $M >/dev/null || fail "tessera-gc"; }
+f0=$(free)
+rm $M/persona/a.txt || fail "rm a"
+gc; f1=$(free)
+echo "group gc, key loaded: $f0 -> $f1 KiB free"
+[ $((f1 - f0)) -gt 1500 ] || fail "GC freed nothing of the group with its key loaded"
+rm $M/persona/b.txt $M/other/plain.txt || fail "rm b, plain"
+sync
+tessera-keyload drop $GKID >/dev/null || fail "drop group 9"
+dmesg -c >/dev/null
+gc; f2=$(free)
+echo "group gc, key dropped: $f1 -> $f2 KiB free"
+dmesg | grep -q 'key group 9 locked, not walked' || fail "no 'not walked' line"
+[ $((f2 - f1)) -gt 1500 ] || fail "GC freed no plain file with a group locked"
+[ $((f2 - f1)) -lt 3200 ] || fail "GC freed a locked group's file"
+tessera-keyload load-group $T/gkey $GKID $U5 9 >/dev/null || fail "reload group 9"
+gc; f3=$(free)
+echo "group gc, key reloaded: $f2 -> $f3 KiB free"
+[ $((f3 - f2)) -gt 1500 ] || fail "GC didn't free the group's file once reloaded"
+[ "$(cat $M/persona/sub/d.txt)" = 'sub note' ] || fail "group file after gc"
+cmp -s $M/persona/c.txt /dev/null && fail "c.txt empty"
+tessera-keyload group-erase $M 9 2>/dev/null && fail "erased a group with its key loaded"
+tessera-keyload drop $GKID >/dev/null || fail "drop group 9 for erase"
+f4=$(free)
+dmesg -c >/dev/null
+tessera-keyload group-erase $M 9 >/dev/null || fail "group-erase"
+f5=$(free)
+echo "crypto-erase: $f4 -> $f5 KiB free"
+dmesg | grep -q 'key group 9 erased' || fail "no 'erased' line"
+[ $((f5 - f4)) -gt 1500 ] || fail "erase freed nothing"
+[ -z "$(ls -A $M/persona)" ] || fail "the erased group's root isn't empty"
+tessera-keyload group-erase $M 9 2>/dev/null && fail "erased a group twice"
+umount $M || fail "umount after erase"
+mount -t tessera $DEV $M || fail "remount after erase"
+dump $M 'quota/dedup domains on this mount'
+grep -qE 'key group 9|group=9' $T/dump && fail "group 9 still there after erase"
+rmdir $M/persona || fail "rmdir the erased group's root"
+jot -w 'shared plain line %06d' 1000 > $M/other/after.txt || fail "write after erase"
+umount $M; mdconfig -d -u ${DEV#/dev/md}
+rm -f $IMG $T/gkey
+echo "group gc and erase: ok"
 
 tessera-keyload drop $KID >/dev/null
 kldunload $1 || fail kldunload

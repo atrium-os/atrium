@@ -585,6 +585,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, publish_dedup_chunked,
 static unsigned long tessera_stat_gc_scans       = 0;
 static unsigned long tessera_stat_gc_scan_ms     = 0;
 static unsigned long tessera_stat_gc_aborts      = 0;
+/* E4.5: key-group packs pass 2 judged from their fronts, and erased
+ * groups' packs found dead from their preludes. */
+static unsigned long tessera_stat_gc_group_packs  = 0;
+static unsigned long tessera_stat_gc_group_erased = 0;
+static unsigned long tessera_stat_gc_group_skips  = 0;
 /* ★ #99: duty-cycle bound for the data-zone GC. A pass costing T that
  * reclaims nothing earns T*(100/pct - 1) of quiet, so GC's share of the
  * machine stays near pct whatever the volume size. 0 = the old
@@ -1068,6 +1073,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_unproductive_ms, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_backoff_ms, CTLFLAG_RD,
     &tessera_stat_gc_backoff_ms, 0,
     "Quiet period the duty bound imposed after it, ms (#99)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_packs, CTLFLAG_RD,
+    &tessera_stat_gc_group_packs, 0,
+    "Key-group packs GC judged under their group's keys (E4.5)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_erased, CTLFLAG_RD,
+    &tessera_stat_gc_group_erased, 0,
+    "Packs of erased key groups GC found dead (E4.5)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_group_skips, CTLFLAG_RD,
+    &tessera_stat_gc_group_skips, 0,
+    "Key groups a GC pass couldn't walk, all their packs kept (E4.5)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_aborts, CTLFLAG_RD,
     &tessera_stat_gc_aborts, 0,
     "GC passes that reclaimed nothing because the live-set walk aborted");
@@ -4606,6 +4620,9 @@ struct tessera_mount {
 	}                         groups[TESSERA_FS_MAX_GROUPS];
 	uint32_t                  ngroups;
 	int                       groups_dirty;
+	/* E4.5: erased groups whose records the next commit deletes. */
+	uint64_t                  groups_dead[TESSERA_FS_MAX_GROUPS];
+	uint32_t                  groups_ndead;
 	int                       groups_sx_init;
 	uint64_t                  groups_epoch;
 	struct sx                 groups_sx;
@@ -13599,6 +13616,10 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			if (tessera_quota_store_put(tmp_->quota_tree,
 			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
 				qok = 0;
+		for (uint32_t i = 0; qok && tmp_->groups_dirty &&
+		    i < tmp_->groups_ndead; i++)
+			(void)tessera_key_group_store_delete(tmp_->quota_tree,
+			    tmp_->groups_dead[i], &qroot);
 		/* Key-group records (encryption §5.4): written whole, each
 		 * already carrying its MAC. */
 		for (uint32_t i = 0; qok && tmp_->groups_dirty &&
@@ -13617,6 +13638,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			tmp_->quota_dirty = 0;
 			tmp_->quota_ndead = 0;
 			tmp_->groups_dirty = 0;
+			tmp_->groups_ndead = 0;
 		}
 	}
 
@@ -21752,6 +21774,102 @@ out:
 	return (rc);
 }
 
+/*
+ * ── E4.5: GC and key groups (§5.5, §9) ──────────────────────────────
+ * Pass 1 walks a group's inodes only while its key is loaded; a group
+ * it can't walk (locked, bad, or a read that its key doesn't open) goes
+ * in the skip set, and pass 2 keeps every pack of a skipped group. A
+ * walked group's packs are judged like any other, from their fronts
+ * opened under the group's keys. A pack of a group with no record (one
+ * TESSERA_IOC_GROUP_ERASE retired) is dead without opening anything:
+ * its prelude names the group in the clear.
+ */
+struct tessera_gc_groups {
+	uint32_t n;
+	uint64_t skip[TESSERA_FS_MAX_GROUPS];
+};
+
+static int
+tessera_gc_groups_skipped(const struct tessera_gc_groups *s, uint64_t g)
+{
+	for (uint32_t i = 0; i < s->n; i++)
+		if (s->skip[i] == g)
+			return (1);
+	return (0);
+}
+
+static void
+tessera_gc_groups_skip(struct tessera_gc_groups *s, uint64_t g)
+{
+	if (g == 0 || tessera_gc_groups_skipped(s, g))
+		return;
+	if (s->n < TESSERA_FS_MAX_GROUPS)
+		s->skip[s->n++] = g;
+}
+
+/* The group of an inode record's domain (0: none). *walk is 0 when pass 1
+ * must not walk it: its group is locked or doesn't verify. */
+static uint64_t
+tessera_fs_gc_record_group(struct tessera_mount *tmp_,
+    const tessera_inode_record_t *ino, struct tessera_gc_groups *s,
+    int *walk)
+{
+	uint64_t d, g;
+
+	*walk = 1;
+	if (tmp_->ngroups == 0)
+		return (0);
+	d = ino->quota_domain != 0 ? ino->quota_domain :
+	    tmp_->quota_default_domain;
+	g = tessera_fs_domain_group(tmp_, d);
+	if (g == 0)
+		return (0);
+	if (tessera_gc_groups_skipped(s, g) ||
+	    tessera_fs_group_state(tmp_, g) != 0) {
+		tessera_gc_groups_skip(s, g);
+		*walk = 0;
+	}
+	return (g);
+}
+
+/* The key group a KEY_GROUP pack's prelude names, read in the clear. */
+static int
+tessera_fs_pack_prelude_group(struct tessera_mount *tmp_,
+    const tessera_registry_entry_t *re, uint64_t *out)
+{
+	tessera_pack_extent_t ext = { re->start_sector, re->length_sectors };
+	uint8_t *sec;
+	uint32_t flen;
+	int rc = 0;
+
+	if ((re->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0 ||
+	    re->length_sectors < 2)
+		return (EIO);
+	sec = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
+	if (tessera_fs_pack_read_range(tmp_, &ext, 1, re->length_sectors, 0,
+	    TESSERA_SECTOR_SIZE, sec) != 0)
+		rc = EIO;
+	else if (tessera_pack_sealed_prelude(sec, TESSERA_SECTOR_SIZE, out,
+	    &flen) != TESSERA_OK || *out == 0)
+		rc = EINTEGRITY;
+	free(sec, M_TESSERA);
+	return (rc);
+}
+
+/* Does the mount hold a record for group g? */
+static int
+tessera_fs_group_known(struct tessera_mount *tmp_, uint64_t g)
+{
+	int known;
+
+	if (!tmp_->groups_sx_init)
+		return (0);
+	sx_slock(&tmp_->groups_sx);
+	known = tessera_fs_group_find(tmp_, g) != NULL;
+	sx_sunlock(&tmp_->groups_sx);
+	return (known);
+}
+
 static int
 tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
     struct tessera_gc_scan *scan)
@@ -21923,6 +22041,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 #define _GC_WALK_RECORD(_ino) do {                                       \
 		tessera_hash_t *_stack = gc_walk_stack;                   \
 		int _sp = 0;                                              \
+		int _gw = 1;                                              \
+		uint64_t _wg = tessera_fs_gc_record_group(tmp_, &(_ino),  \
+		    &gc_groups, &_gw);                                    \
+		if (!_gw) break;                                          \
 		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
 			if (tessera_gc_walk_trust_leaf &&                 \
 			    (_ino.flags & TESSERA_INODE_FLAG_MFT_LEAF)) { \
@@ -21981,6 +22103,15 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			 * a concurrent pack publish truncated the scan. */\
 			int _frc = tessera_fs_fetch_blob_ex(tmp_,         \
 			    scan_reg_tree, _h, NULL, 0, &_blob, &_blen);  \
+			/* E4.5: a group's read its key didn't open   \
+			 * (dropped mid-walk): skip the group, keep    \
+			 * all its packs. */                           \
+			if (_frc != 0 && _wg != 0 && (_frc == EACCES ||   \
+			    _frc == EINTEGRITY)) {                        \
+				tessera_gc_groups_skip(&gc_groups, _wg);  \
+				_sp = 0;                                  \
+				continue;                                 \
+			}                                                 \
 			if (_frc != 0) {                                  \
 				if (gc_abort_fetchfail++ == 0)            \
 					memcpy(gc_abort_hash, _h,         \
@@ -22086,6 +22217,9 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * hard GC abort (no reclaim this cycle), exactly like gc_seed_abort.
 	 */
 	int gc_walk_abort = 0;
+	/* E4.5: groups pass 1 couldn't walk; pass 2 keeps their packs. */
+	struct tessera_gc_groups gc_groups;
+	memset(&gc_groups, 0, sizeof(gc_groups));
 	/* Teardown aborts the walk exactly like a corrupt-read does — same
 	 * "reclaim nothing this pass" outcome, which is always correct. */
 #define _GC_TEARDOWN()	(tmp_->gc_abort != 0)
@@ -22739,6 +22873,10 @@ snap_next:
 		uint64_t              *pels;
 		uint32_t               npels;
 	};
+	for (uint32_t gi = 0; gi < gc_groups.n; gi++)
+		printf("tessera_fs: gc: key group %ju locked, not walked; "
+		    "its packs are kept\n", (uintmax_t)gc_groups.skip[gi]);
+	tessera_stat_gc_group_skips += gc_groups.n;
 	uint32_t dead_cap = 16, dead_count = 0;
 	struct dead *deads = malloc(dead_cap * sizeof(*deads), M_TESSERA,
 	    M_WAITOK);
@@ -22785,16 +22923,12 @@ snap_next:
 			 */
 			if (re.length_sectors == 0 ||
 			    re.length_sectors > 4096u) goto next_p; /* sanity */
-			/* A key group's pack is kept whole until GC handles
-			 * groups (tessera-encryption §13.1 E4.5): its blobs
-			 * are reached through keys this pass may not have. */
-			if ((re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) != 0)
-				goto next_p;
 
 			/* Shared by both enumeration arms below. */
 			tessera_hash_t bh;              /* blob 0 */
 			uint32_t nbh = 0;
 			int dead = 0;
+			int erased = 0;    /* E4.5: an erased group's pack */
 
 			/* ★ #133: enumerate this pack's blob hashes from its
 			 * header + index (1 + index_blocks sectors) instead of
@@ -22806,6 +22940,45 @@ snap_next:
 			uint32_t nexts = 0;
 			int ok = (tessera_fs_pack_extents_resolve(tmp_, &re,
 			    &exts, &nexts) == 0);
+			/* E4.5: a key group's pack. Kept when pass 1 couldn't
+			 * walk its group; dead outright when its group was
+			 * erased; else its ids come from its front, opened
+			 * under the group's keys (kept if that fails). */
+			if ((re.flags & TESSERA_REGISTRY_FLAG_KEY_GROUP) != 0) {
+				uint64_t pg = 0;
+				tessera_hash_t *pbh = NULL;
+				uint32_t pn = 0;
+
+				free(exts, M_TESSERA);
+				if (tessera_fs_pack_prelude_group(tmp_, &re,
+				    &pg) != 0 ||
+				    tessera_gc_groups_skipped(&gc_groups, pg))
+					goto next_p;
+				if (!tessera_fs_group_known(tmp_, pg)) {
+					memset(bh, 0, sizeof(bh));
+					nbh = 0;
+					dead = 1;
+					erased = 1;
+					tessera_stat_gc_group_erased++;
+					goto have_hashes;
+				}
+				if (tessera_fs_gc_sealed_index_hashes(tmp_, &re,
+				    tmp_->seal != NULL ?
+				    pval + TESSERA_REGISTRY_ENTRY_SIZE : NULL,
+				    &pbh, &pn) != 0)
+					goto next_p;
+				nbh = pn;
+				bh_all = pbh;
+				dead = 1;
+				for (uint32_t bi = 0; bi < pn; bi++) {
+					if (_GC_HASH_IS_LIVE(bh_all[bi])) {
+						dead = 0; break;
+					}
+				}
+				memcpy(bh, bh_all[0], sizeof(tessera_hash_t));
+				tessera_stat_gc_group_packs++;
+				goto have_hashes;
+			}
 			/* Sealed: the index is inside the sealed front, opened
 			 * against the registry's tag. No whole-pack fallback:
 			 * a front that does not open keeps its pack. */
@@ -22939,7 +23112,9 @@ have_hashes:
 			 * minutes on a nearly-full volume converts a rare
 			 * transient read failure into ENOSPC.
 			 */
-			if (dead && tessera_gc_grace_seconds > 0 &&
+			/* An erased group's pack has no grace: nothing can
+			 * reference it again (its group has no record). */
+			if (dead && !erased && tessera_gc_grace_seconds > 0 &&
 			    re.create_time != 0) {
 				const uint64_t _now = (uint64_t)time_second;
 				if (_now >= re.create_time &&
@@ -34066,6 +34241,242 @@ static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
  * async checkpoint publish of the same record — gate directory ops.
  * File records are never touched by checkpoints; files stay ungated. */
+/*
+ * Crypto-erase a key group (tessera-encryption §9, E4.5): what atrium-volumes
+ * does when a persona is removed, after arcad deleted its key and the
+ * kernel dropped it. Needs no key. The group must be locked, no vnode of it
+ * in use, and no snapshot retained (a snapshot's inodes would name packs
+ * this frees). Every inode of the group's domains goes; each domain's root
+ * stays, as an empty directory in no domain, for the caller to remove by
+ * name; the domain and group records go; then a GC pass frees every pack
+ * whose prelude names the group, without opening it.
+ */
+static int
+tessera_fs_group_erase(struct vnode *ivp, uint64_t gid)
+{
+	struct mount *mp = ivp->v_mount;
+	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+	struct tessera_fs_group *g;
+	struct tessera_fs_wctx wv;
+	struct vnode *vp, *mvp;
+	uint64_t doms[TESSERA_FS_MAX_GROUPS * 4];
+	uint32_t roots[TESSERA_FS_MAX_GROUPS * 4];
+	uint32_t ndoms = 0, nvict = 0, vcap = 64, *vict = NULL;
+	uint8_t *mft = NULL;
+	size_t mlen = 0;
+	tessera_hash_t ehash;
+	uint64_t reclaimed = 0;
+	int err = 0, busy = 0, gated = 0;
+
+	if ((mp->mnt_flag & MNT_RDONLY) != 0 || tmp_->inode_tree == NULL)
+		return (EROFS);
+	if (gid == 0 || !tmp_->groups_sx_init)
+		return (EINVAL);
+	sx_xlock(&tmp_->groups_sx);
+	tessera_fs_groups_refresh(tmp_);
+	g = tessera_fs_group_find(tmp_, gid);
+	if (g == NULL)
+		err = ENOENT;
+	else if (g->keys != NULL)
+		err = EBUSY;              /* drop the key first */
+	sx_xunlock(&tmp_->groups_sx);
+	if (err != 0)
+		return (err);
+	if (tmp_->snapshots_tree != NULL) {
+		tessera_btree_cursor_t *c =
+		    tessera_btree_seek_first(tmp_->snapshots_tree);
+		if (c != NULL) {
+			uint8_t sk[8];
+			uint8_t sv[TESSERA_SNAPSHOT_RECORD_SIZE];
+			if (tessera_btree_cursor_get(c, sk, sv) == TESSERA_OK)
+				err = EBUSY;
+			tessera_btree_cursor_free(c);
+		}
+		if (err != 0)
+			return (err);
+	}
+
+	/* No vnode of the group may be in use; the others are thrown away
+	 * so none outlives its inode (inode numbers are reused). */
+	for (int pass = 0; pass < 2 && !busy; pass++) {
+		MNT_VNODE_FOREACH_ALL(vp, mp, mvp) {
+			uint64_t vg;
+
+			if (vp->v_type == VNON || vp->v_data == NULL) {
+				VI_UNLOCK(vp);
+				continue;
+			}
+			if (vget(vp, LK_EXCLUSIVE | LK_INTERLOCK) != 0)
+				continue;
+			if (!VN_IS_DOOMED(vp) && tessera_fs_vp_group(vp,
+			    &vg) == 0 && vg == gid) {
+				cache_purge(vp);
+				if (pass == 0 && vrefcnt(vp) > 1)
+					busy++;
+				else if (pass == 1)
+					vgone(vp);
+			}
+			vput(vp);
+		}
+	}
+	if (busy) {
+		printf("tessera_fs: key group %ju: %d vnode(s) in use; not "
+		    "erased\n", (uintmax_t)gid, busy);
+		return (EBUSY);
+	}
+	(void)tessera_fs_flush(tmp_);
+
+	/* The empty directory each domain root becomes, outside any group. */
+	tessera_fs_wctx_vol(tmp_, &wv);
+	tessera_manifest_builder_t *mb =
+	    tessera_fs_mft_begin(tmp_, &wv, TESSERA_MFT_DIRECTORY);
+	if (mb == NULL)
+		return (ENOMEM);
+	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, ehash);
+	mft = malloc(mlen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(mb, mft, mlen, &mlen, ehash) !=
+	    TESSERA_OK) {
+		tessera_manifest_free(mb);
+		err = EIO;
+		goto out;
+	}
+	tessera_manifest_free(mb);
+
+	if (tmp_->flush_mtx_init) {
+		tessera_fs_flush_gate_enter(tmp_);
+		gated = 1;
+	}
+	for (uint32_t i = 0; i < tmp_->quota_ndomains && ndoms < nitems(doms);
+	    i++) {
+		if (tmp_->quota_domains[i].key_group != gid)
+			continue;
+		doms[ndoms] = tmp_->quota_domains[i].domain_id;
+		roots[ndoms++] = (uint32_t)tmp_->quota_domains[i].root_inode_no;
+	}
+	/* The domains' inodes, found by quota_domain. */
+	vict = malloc(vcap * sizeof(*vict), M_TESSERA, M_WAITOK);
+	{
+		tessera_btree_cursor_t *c =
+		    tessera_btree_seek_first(tmp_->inode_tree);
+		while (c != NULL) {
+			uint8_t k[4];
+			tessera_inode_record_t ino;
+
+			if (tessera_btree_cursor_get(c, k, &ino) != TESSERA_OK)
+				break;
+			uint32_t no = ((uint32_t)k[0] << 24) |
+			    ((uint32_t)k[1] << 16) | ((uint32_t)k[2] << 8) | k[3];
+			for (uint32_t d = 0; d < ndoms; d++) {
+				if (ino.quota_domain != doms[d] || no == roots[d])
+					continue;
+				if (nvict == vcap) {
+					uint32_t *n2 = malloc(vcap * 2 *
+					    sizeof(*vict), M_TESSERA, M_WAITOK);
+					memcpy(n2, vict, vcap * sizeof(*vict));
+					free(vict, M_TESSERA);
+					vict = n2;
+					vcap *= 2;
+				}
+				vict[nvict++] = no;
+				break;
+			}
+			if (tessera_btree_cursor_next(c) != TESSERA_OK)
+				break;
+		}
+		if (c != NULL)
+			tessera_btree_cursor_free(c);
+	}
+	for (uint32_t i = 0; i < nvict; i++) {
+		tessera_inode_record_t ino;
+
+		/* Look again: the dirty cache is what counts. */
+		if (tessera_fs_inode_get(tmp_, vict[i], &ino) != TESSERA_OK)
+			continue;
+		for (uint32_t d = 0; d < ndoms; d++)
+			if (ino.quota_domain == doms[d]) {
+				(void)tessera_fs_inode_delete(tmp_, vict[i]);
+				break;
+			}
+	}
+	if (gated) {
+		tessera_fs_flush_gate_exit(tmp_);
+		gated = 0;
+	}
+	/* Each root becomes an empty plain directory. */
+	for (uint32_t d = 0; d < ndoms && err == 0; d++) {
+		tessera_hash_t pub;
+		tessera_inode_record_t r;
+		struct timeval tv;
+
+		if (tessera_fs_publish_manifest_owned(tmp_, &wv, mft, mlen, pub,
+		    roots[d]) != 0) {
+			err = EIO;
+			break;
+		}
+		if (tmp_->flush_mtx_init) {
+			tessera_fs_flush_gate_enter(tmp_);
+			gated = 1;
+		}
+		if (tessera_fs_inode_get(tmp_, roots[d], &r) == TESSERA_OK) {
+			getmicrotime(&tv);
+			r.quota_domain = 0;
+			memset(r.xattr_hash, 0, sizeof(r.xattr_hash));
+			tessera_fs_ino_set_mft(&r, pub, TESSERA_MFT_DIRECTORY);
+			r.size = 0;
+			r.nlink = 2;
+			r.mtime_ns = r.ctime_ns = (uint64_t)tv.tv_sec *
+			    1000000000ULL + (uint64_t)tv.tv_usec * 1000ULL;
+			if (tessera_fs_inode_put(tmp_, roots[d], &r) !=
+			    TESSERA_OK)
+				err = EIO;
+		}
+		for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+			if (tmp_->quota_domains[i].domain_id == doms[d]) {
+				tessera_fs_quota_retire_at(tmp_, i);
+				break;
+			}
+		if (gated) {
+			tessera_fs_flush_gate_exit(tmp_);
+			gated = 0;
+		}
+	}
+	if (err != 0)
+		goto out;
+	/* The group's record goes: its packs are now dead by their
+	 * preludes, and nothing can be written in it again. */
+	sx_xlock(&tmp_->groups_sx);
+	for (uint32_t i = 0; i < tmp_->ngroups; i++) {
+		if (tmp_->groups[i].rec.group_id != gid)
+			continue;
+		tessera_fs_group_lock_keys(&tmp_->groups[i]);
+		tmp_->ngroups--;
+		if (i != tmp_->ngroups)
+			tmp_->groups[i] = tmp_->groups[tmp_->ngroups];
+		memset(&tmp_->groups[tmp_->ngroups], 0,
+		    sizeof(tmp_->groups[0]));
+		if (tmp_->groups_ndead < TESSERA_FS_MAX_GROUPS)
+			tmp_->groups_dead[tmp_->groups_ndead++] = gid;
+		tmp_->groups_dirty = 1;
+		break;
+	}
+	sx_xunlock(&tmp_->groups_sx);
+	tmp_->quota_dirty = 1;
+	tessera_fs_mark_dirty(tmp_);
+	atomic_add_rel_64(&tmp_->quota_gen, 1);
+	if (tessera_fs_flush(tmp_) != 0)
+		err = EIO;
+	(void)tessera_fs_gc_now(tmp_, &reclaimed);
+	printf("tessera_fs: key group %ju erased: %u domain(s), %u inode(s); "
+	    "gc reclaimed %ju\n", (uintmax_t)gid, ndoms, nvict,
+	    (uintmax_t)reclaimed);
+out:
+	if (gated)
+		tessera_fs_flush_gate_exit(tmp_);
+	free(vict, M_TESSERA);
+	free(mft, M_TESSERA);
+	return (err);
+}
+
 static int
 tessera_vop_ioctl(struct vop_ioctl_args *ap)
 {
@@ -34103,7 +34514,8 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	case TESSERA_IOC_QUOTA_DETACH:
 	case TESSERA_IOC_CLEAR_RECOVERY:
 	case TESSERA_IOC_GROUP_CREATE:
-	case TESSERA_IOC_QUOTA_GROUP: {
+	case TESSERA_IOC_QUOTA_GROUP:
+	case TESSERA_IOC_GROUP_ERASE: {
 		if (jailed(ap->a_cred))
 			return (EPERM);
 		int perr = priv_check_cred(ap->a_cred, PRIV_VFS_ADMIN);
@@ -34113,6 +34525,15 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	}
 	default:
 		break;
+	}
+	/* GROUP_ERASE flushes, walks vnodes and runs a GC pass: it takes
+	 * the gate itself, for its middle part only. */
+	if (ap->a_command == TESSERA_IOC_GROUP_ERASE) {
+		int er = tessera_fs_group_erase(ap->a_vp,
+		    *(uint64_t *)ap->a_data);
+		if (er == 0)
+			atomic_add_rel_64(&tmp_->quota_gen, 1);
+		return (er);
 	}
 	/* QUOTA_GROUP checks emptiness first, which may publish the
 	 * directory's pending dirents through the gate; it takes the gate

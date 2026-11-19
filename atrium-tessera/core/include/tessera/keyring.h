@@ -78,6 +78,10 @@ struct tessera_ioc_group {
 };
 #define TESSERA_IOC_GROUP_CREATE _IOW('T', 7, struct tessera_ioc_group)
 #define TESSERA_IOC_QUOTA_GROUP  _IOW('T', 8, uint64_t)
+/* Crypto-erase a locked group (§9, E4.5): its domains' inodes go, each
+ * domain's root becomes an empty plain directory, the domain and group
+ * records go, and a GC pass frees the group's packs from their preludes. */
+#define TESSERA_IOC_GROUP_ERASE  _IOW('T', 9, uint64_t)
 
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
