@@ -3759,7 +3759,12 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Double-click on the handle** (2026-11-19) fills the selection down as far as the data beside it goes: the column left of it, or else the one right of it, to the end of its unbroken run, stopping above anything already in the selection's first column (`autofill::to_data_end`, reading the column a growing window at a time). The filled area is selected. pergola reports `GridAction::FillToData`; two presses on the handle within 450 ms are a double-click, and a press that hardly moves fills nothing.
 - **Fill choices** (2026-11-19, Data menu, while the last change is a fill): Fill: Copy Cells, Fill: Series (one number counts by one, `Mode::Count`), Fill: Formats Only, Fill: Without Formatting do the fill again that way, in its place as one undo step (`Doc::refill`, `Doc.last_fill` checked against `Doc.edits`).
 - **Fill options button** (2026-11-19): after a fill, a small button sits under the right of the filled area until the next change (`source::KEY_FILL`, `fill_button_at`). A press opens a menu with Copy Cells, Fill Series, Fill Formats Only and Fill Without Formatting, as Excel's Auto Fill Options does. Gates: atrium-sheets `a_fill_offers_its_options_by_the_filled_area`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
-- **Not yet:** custom lists, and Flash Fill.
+- **Flash Fill** (2026-11-19; Ctrl+E, Data ▸ Flash Fill). Type how a cell or two beside some data should read, and Flash Fill fills the rest of that column the same way, as one undo step (`officina_grid::flashfill`, `GridAction::FlashFill`).
+  - It learns a short program from the examples and checks it against every one as it grows. A program is made of words of the cells beside (counted from either end), their first letters, whole cells, each in the same case or upper, lower or proper case, with fixed text between.
+  - It reads up to 8 columns on each side and fills up to 100,000 rows. A first row the examples don't explain is taken as a header and left alone.
+  - When no program explains the examples it says so rather than guessing. It never writes over a cell that holds something.
+  - Gates: officina-grid `programs_are_learnt_from_examples`, `a_column_is_filled_by_example`; atrium-sheets `flash_fill_fills_a_column_by_its_examples`.
+- **Not yet:** custom lists, and Flash Fill from character positions (the first three letters, say) or with numbers reformatted.
 - **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`, which checks `Mode::Count` too); atrium-sheets `a_fill_can_be_done_again_another_way`; pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ### 16.88 Copy, cut and paste within Sheets (2026-11-19)
@@ -3827,7 +3832,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **The editor grows** (2026-11-19): with line breaks it is as tall as its lines, draws each with its selection and caret, and a press picks the line under it.
 - **Rows shrink back** (2026-11-19): a row grown for typed lines is fitted again when its text changes or is cleared, back down to the default height (`Doc.grown_rows`, this session only; sizing it by hand ends that).
 - **Up and Down** in an editor holding several lines move between them at about the same place across; past the first or last line they end editing and move, as before.
-- **Not yet:** wrapping inside the editor as the cell would, and wrapped text in printing (the printing thread's part).
+- **The editor wraps** (2026-11-19): in a cell that wraps its text, the editor breaks its lines as the cell does (after spaces, or inside a word too long for the line), and Up and Down move between them (`editor_wrap`, `editor_lines`). Gate: pergola `the_editor_wraps_as_its_cell_does`.
+- **Not yet:** wrapped text in printing (the printing thread's part).
 - **Gates:** pergola `a_double_click_on_a_row_edge_asks_to_fit_it_and_wrapped_text_is_taller` (with `line_top`), `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Alt+Enter, the second line); atrium-sheets `a_row_fits_its_wrapped_text`, `wrap_text_toggles_and_a_hidden_row_s_line_shows_it` (with alignment), `rows_nobody_sized_grow_for_typed_lines`, `records_round_trip`.
 
 ### 16.94 Entry keys and typed dates (2026-11-19)

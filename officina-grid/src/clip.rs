@@ -507,7 +507,7 @@ impl Clip {
 
 /// Replace edits for just these cells (a value or a fill starting at each),
 /// one a run of touching cells down a column, leaving the cells between.
-fn by_runs(sheet: u16, mut cells: Vec<(u32, u32, Option<Value>, Option<Fill>)>) -> Vec<GridOp> {
+pub(crate) fn by_runs(sheet: u16, mut cells: Vec<(u32, u32, Option<Value>, Option<Fill>)>) -> Vec<GridOp> {
     cells.sort_by_key(|x| (x.1, x.0));
     let mut ops: Vec<GridOp> = Vec::new();
     for (r, c, v, f) in cells {

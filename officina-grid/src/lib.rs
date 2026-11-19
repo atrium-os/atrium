@@ -26,6 +26,7 @@ pub mod deps;
 pub mod eval;
 pub mod fast;
 pub mod filter;
+pub mod flashfill;
 pub mod links;
 pub mod validation;
 pub mod macros;

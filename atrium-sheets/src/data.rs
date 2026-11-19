@@ -51,6 +51,8 @@ pub enum DataCmd {
     PasteDivide,
     /// The copied cells, blank ones leaving what is under them.
     PasteSkipBlanks,
+    /// Fill the cursor's column by the examples typed in it.
+    FlashFill,
     /// The Paste Special bar: what to paste, an operation, skipping blanks
     /// and turning, together.
     PasteSpecial,
@@ -309,6 +311,7 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
+        (MenuItem::new("Flash Fill").shortcut("Ctrl+E"), Some(DataCmd::FlashFill)),
         (MenuItem::new("Paste Values").enabled(special).separated(), Some(DataCmd::PasteValues)),
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
@@ -662,6 +665,11 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 _ => (Special { transpose: true, ..of(What::All) }, "Paste Transposed"),
             };
             paste_with(d, sel, sp, label)
+        }
+        DataCmd::FlashFill => {
+            let (ops, n) = officina_grid::flashfill::flash_fill(&d.wb, s, cursor.0, cursor.1)?;
+            d.run("Flash Fill", ops);
+            Ok(if n == 1 { "Flash Fill filled 1 cell.".into() } else { format!("Flash Fill filled {n} cells.") })
         }
         DataCmd::CenterAcross => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };

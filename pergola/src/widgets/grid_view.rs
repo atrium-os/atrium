@@ -547,6 +547,9 @@ pub enum GridAction {
     /// A double-click on the fill handle: fill the selection down as far as
     /// the data beside it goes (the app finds how far).
     FillToData(CellRange),
+    /// Ctrl+E: fill the cursor's column by the examples typed in it (Flash
+    /// Fill; the app learns how).
+    FlashFill { row: u32, col: u32 },
 }
 
 impl GridState {
@@ -600,27 +603,66 @@ fn editor_rect(src: &dyn GridSource, g: &GridState) -> Option<[f64; 4]> {
     let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
     let (x, y) = (src.col_left(one.c0), src.row_top(one.r0));
     let (w, h) = (src.col_left(one.c1 + 1) - x, src.row_top(one.r1 + 1) - y);
-    let (tw, th) = editor_size(ed.text(), &editor_style());
+    let (tw, th) = editor_size(ed.text(), editor_wrap(src, g), &editor_style());
     Some([x, y, w.max(tw as f64 + 2.0 * PAD as f64 + 2.0), h.max(th as f64)])
 }
 
-/// The editor's lines: byte ranges of `text` between line breaks.
-fn editor_lines(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut out = Vec::new();
+/// How wide the editor's lines may run before they wrap, px: the cell's
+/// width inside its padding when the cell wraps its text, as the cell
+/// shows it; None (no wrapping) otherwise.
+fn editor_wrap(src: &dyn GridSource, g: &GridState) -> Option<f32> {
+    let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
+    let cv = src.cell(one.r0, one.c0)?;
+    let w = (src.col_left(one.c1 + 1) - src.col_left(one.c0)) as f32;
+    cv.wrap.then(|| (w - 2.0 * PAD - cv.indent as f32 * INDENT_STEP - 2.0).max(8.0))
+}
+
+/// The editor's lines: byte ranges of `text` between line breaks, and,
+/// within `wrap` px, broken after spaces (or inside a word too long for
+/// the line) as the cell breaks them.
+fn editor_lines(text: &str, wrap: Option<f32>, style: &TextStyle) -> Vec<std::ops::Range<usize>> {
+    let mut hard = Vec::new();
     let mut start = 0;
     for (i, ch) in text.char_indices() {
         if ch == '\n' {
-            out.push(start..i);
+            hard.push(start..i);
             start = i + 1;
         }
     }
-    out.push(start..text.len());
+    hard.push(start..text.len());
+    let Some(width) = wrap else { return hard };
+    let mut out = Vec::new();
+    for r in hard {
+        let mut start = r.start;
+        loop {
+            // The furthest place the line fits to, and the last after a space.
+            let (mut w, mut fit, mut space) = (0.0f32, start, None);
+            for (off, ch) in text[start..r.end].char_indices() {
+                w += crate::text::measure(ch.encode_utf8(&mut [0u8; 4]), style).w;
+                if w > width {
+                    break;
+                }
+                fit = start + off + ch.len_utf8();
+                if ch == ' ' {
+                    space = Some(fit);
+                }
+            }
+            if fit >= r.end {
+                out.push(start..r.end);
+                break;
+            }
+            let first = start + text[start..].chars().next().map_or(1, char::len_utf8);
+            let cut = space.filter(|&s| s > start).unwrap_or(fit.max(first));
+            out.push(start..cut);
+            start = cut;
+        }
+    }
     out
 }
 
 /// The widest line and the height the editor's lines need, px.
-fn editor_size(text: &str, style: &TextStyle) -> (f32, f32) {
-    let lines = editor_lines(text);
+fn editor_size(text: &str, wrap: Option<f32>, style: &TextStyle) -> (f32, f32) {
+    let lines = editor_lines(text, wrap, style);
     let w = lines.iter().map(|r| crate::text::measure(&text[r.clone()], style).w).fold(0.0, f32::max);
     let h = if lines.len() > 1 { lines.len() as f32 * TEXT_SIZE * 1.3 + 2.0 * LINE_PAD } else { 0.0 };
     (w, h)
@@ -641,7 +683,7 @@ fn in_editor(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> bool {
 fn editor_index(src: &dyn GridSource, g: &GridState, cx: f64, cy: f64) -> Option<usize> {
     let r = editor_rect(src, g)?;
     let text = g.edit.as_ref()?.text();
-    let lines = editor_lines(text);
+    let lines = editor_lines(text, editor_wrap(src, g), &editor_style());
     let one = src.merge_at(g.cursor.0, g.cursor.1).unwrap_or(CellRange::of(g.cursor, g.cursor));
     let h = (src.row_top(one.r1 + 1) - src.row_top(one.r0)) as f32;
     let k = (((cy - r[1]) as f32 - editor_top(lines.len(), h)) / (TEXT_SIZE * 1.3)).floor().clamp(0.0, (lines.len() - 1) as f32) as usize;
@@ -1591,11 +1633,12 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
     // The editor: as wide and tall as its lines need, from the cell.
     let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: Weight::Regular, color: t.text_primary() };
     let text = ed.text();
-    let (tw, th) = editor_size(text, &style);
+    let wrap = editor_wrap(src, gs);
+    let (tw, th) = editor_size(text, wrap, &style);
     let (ew, eh) = (w.max(tw + 2.0 * PAD + 2.0), h.max(th));
     ctx.add(Node::Rect { rect: Rect::new(sx, sy, ew, eh), fill: t.bg_canvas(), radius: 0.0 });
     let lh = TEXT_SIZE * 1.3;
-    let lines = editor_lines(text);
+    let lines = editor_lines(text, wrap, &style);
     let top = sy + editor_top(lines.len(), h);
     let sel = ed.has_selection().then(|| ed.selection());
     for (k, line) in lines.iter().enumerate() {
@@ -2075,6 +2118,8 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
     }
 
     // The editor has the keys, except the ones that end it.
+    // How wide the editor's lines may run (a wrapping cell's width).
+    let wrap = editor_wrap(src, g);
     if let Some(ed) = &mut g.edit {
         let finish = |g: &mut GridState, st: &mut ScrollState, dr: i64, dc: i64| {
             commit(g, act);
@@ -2134,9 +2179,9 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             }
             // Up and Down move between the editor's lines, at about the
             // same place across; past the first or last they end it.
-            Key::Up | Key::Down if !m.shift && ed.text().contains('\n') => {
+            Key::Up | Key::Down if !m.shift && editor_lines(ed.text(), wrap, &editor_style()).len() > 1 => {
                 let text = ed.text().to_string();
-                let lines = editor_lines(&text);
+                let lines = editor_lines(&text, wrap, &editor_style());
                 let k = lines.iter().position(|l| (l.start..=l.end).contains(&ed.caret())).unwrap_or(0);
                 let to = if key == Key::Up { k.checked_sub(1) } else { Some(k + 1).filter(|&n| n < lines.len()) };
                 if let Some(n) = to {
@@ -2258,6 +2303,7 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                     };
                     send(GridAction::Fill { from, to, copy: true, flip: false });
                 }
+                "e" if src.fills() => send(GridAction::FlashFill { row: g.cursor.0, col: g.cursor.1 }),
                 "x" => send(GridAction::Cut(g.selection())),
                 "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection() }),
                 "a" => {
@@ -2389,6 +2435,10 @@ mod tests {
                 // "»…": centred across the cells after it.
                 if let Some(t) = s.strip_prefix('»') {
                     return Some(CellView { align: CellAlign::Across, ..CellView::text(t.to_string()) });
+                }
+                // "¶…": wraps its text.
+                if let Some(t) = s.strip_prefix('¶') {
+                    return Some(CellView { wrap: true, ..CellView::text(t.to_string()) });
                 }
                 return Some(CellView::text(s.clone()));
             }
@@ -2604,6 +2654,8 @@ mod tests {
         let mut g = state.get_cloned();
         g.select(4, 3);
         state.set(g);
+        key(&mut app, Key::Char, "e", Modifiers { ctrl: true, ..Modifiers::default() });
+        assert!(matches!(log.borrow().last(), Some(&GridAction::FlashFill { .. })));
         key(&mut app, Key::Char, "d", Modifiers { ctrl: true, ..Modifiers::default() });
         let one = CellRange { r0: 3, c0: 3, r1: 3, c1: 3 };
         assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from: one, to: CellRange { r1: 4, ..one }, copy: true, flip: false }));
@@ -3156,6 +3208,40 @@ mod tests {
         // Ctrl+; with no date to give does nothing.
         key(&mut app, Key::Char, ";", Modifiers { ctrl: true, ..Default::default() });
         assert!(state.get_cloned().edit.is_none());
+    }
+
+    #[test]
+    fn the_editor_wraps_as_its_cell_does() {
+        let style = editor_style();
+        // Broken after spaces within the width; a word too long, inside it.
+        let text = "aaa bbb ccc\ndddddddddddddddddddd";
+        let w = crate::text::measure("aaa bbb ", &style).w + 1.0;
+        let lines: Vec<&str> = editor_lines(text, Some(w), &style).into_iter().map(|r| &text[r]).collect();
+        assert_eq!(lines[..2], ["aaa bbb ", "ccc"]);
+        assert!(lines.len() > 3 && lines[2..].concat() == "dddddddddddddddddddd", "{lines:?}");
+        assert_eq!(editor_lines(text, None, &style).len(), 2);
+        // In the grid: F2 on a wrapping cell, Down moves to the next line it shows.
+        let (mut app, grid, _, state, _) = host(100, 20);
+        grid.cells.borrow_mut().insert((1, 1), "¶one two three four five six".into());
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let b2 = Point::new(hw + 64.0 + 10.0, HEADER_H + 25.0);
+        app.handle_event(Event::PointerDown { at: b2 });
+        app.handle_event(Event::PointerUp { at: b2 });
+        app.tick();
+        key(&mut app, Key::F(2), "", Modifiers::default());
+        let g = state.get_cloned();
+        let ed = g.edit.as_ref().expect("editing");
+        assert!(ed.text().ends_with("five six"));
+        let lines = editor_lines(ed.text(), editor_wrap(&*grid, &g), &style);
+        assert!(lines.len() >= 3, "{lines:?}");
+        // The caret at the end: Up goes to the line before, still editing.
+        key(&mut app, Key::Up, "", Modifiers::default());
+        let g = state.get_cloned();
+        let caret = g.edit.as_ref().expect("Up stays in the editor").caret();
+        let k = lines.len() - 2;
+        assert!((lines[k].start..=lines[k].end).contains(&caret), "{caret} {lines:?}");
+        app.tick();
     }
 
     #[test]
