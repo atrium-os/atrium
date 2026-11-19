@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1657,6 +1657,20 @@ Stalwart in the cloud VM, and later a real account):
    with nothing cut off, the switch), window 1 (e ignored when off, Down and the palette
    still archive). **Not yet**: keys shown on buttons are still drawn when single keys
    are off.
+
+   **Recipients outside the company, in Work (2026-11-19, §9.1).** Mail asks portcullisd
+   which persona it runs in at start (`Request::Persona`, by its uid from the launch
+   registry, as the Navigator does). In a named persona (Work), a compose window says
+   who is outside the From address's domain, under the fields in the warning colour:
+   "Outside example.com: ada@other.org, sam@notexample.com", from To, Cc and Bcc as typed,
+   each once; an address at a subdomain (`eu.example.com`) is inside, and a look-alike
+   domain (`notexample.com`) is not. It follows the From address chosen and goes when
+   everyone is inside. Personal says nothing. A compose window open before portcullisd
+   answered is told when it does. The spec's wording was "coloured"; a line naming them
+   is used because a text field can't colour single addresses in what is typed. Tests:
+   engine 1 (inside, subdomain, look-alike, duplicates), compose window 1 (Personal
+   silent, Work's line, all inside). **Not yet**: a VM run in a Work instance, and the
+   persona's own list of company domains (one From domain is the company for now).
 
 ## 17. Decisions, with recommendations
 

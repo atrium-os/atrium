@@ -161,3 +161,33 @@ impl Engine {
         Ok(())
     }
 }
+
+/// The recipients of `to` outside the domain of `from` (§9.1, for a Work
+/// persona): an address at that domain or under it (`eu.example.com` for
+/// `example.com`) is inside; case aside. Each once, in order.
+pub fn outside_domain<'a>(from: &str, to: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let dom = |a: &str| a.trim().rsplit_once('@').map(|(_, d)| d.trim_end_matches('.').to_ascii_lowercase());
+    let Some(home) = dom(from).filter(|d| !d.is_empty()) else { return Vec::new() };
+    let mut out: Vec<String> = Vec::new();
+    for a in to {
+        let Some(d) = dom(a) else { continue };
+        let inside = d == home || d.ends_with(&format!(".{home}"));
+        let a = a.trim().to_string();
+        if !inside && !out.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod outside_tests {
+    use super::outside_domain;
+
+    #[test]
+    fn outside_the_company() {
+        let to = ["priya@example.com", "Lena@EU.Example.com", "ada@other.org", "ADA@other.org", "sam@notexample.com", "nobody"];
+        assert_eq!(outside_domain("arun@example.com", to), ["ada@other.org", "sam@notexample.com"]);
+        assert!(outside_domain("not an address", to).is_empty());
+    }
+}

@@ -448,6 +448,20 @@ fn main() {
     }
     let mut notifier = mail_engine::notify::Notifier::new();
     let (notes, pressed) = notifications();
+    // Which persona this instance is (personas.md §3), from portcullisd:
+    // a named one (Work) points out recipients outside the company (§9.1).
+    let persona: Arc<std::sync::Mutex<Option<Option<String>>>> = Default::default();
+    {
+        let persona = persona.clone();
+        std::thread::spawn(move || {
+            let p = atrium_mail::files::persona().unwrap_or_else(|e| {
+                eprintln!("atrium-mail: which persona: {e}");
+                None
+            });
+            *persona.lock().unwrap() = Some(p);
+        });
+    }
+    let mut persona_known: Option<Option<String>> = None;
     // Replies from a notification's press, raised once their window is up.
     let mut raise: Vec<u64> = Vec::new();
     let mut ticked = Instant::now();
@@ -494,11 +508,24 @@ fn main() {
                 raise.push(id);
             }
         }
+        if persona_known.is_none() {
+            if let Some(p) = persona.lock().unwrap().take() {
+                for cw in &composes {
+                    cw.c.ui.set(atrium_mail::compose::ComposeUi { persona: p.clone(), ..cw.c.ui.get_cloned() });
+                }
+                persona_known = Some(p);
+            }
+        }
         let asked = mail.take_composes();
         let opened = !asked.is_empty();
         for (c, draft) in asked {
             match compose_window(&engine, embeds.as_ref(), c, draft) {
-                Ok(w) => composes.push(w),
+                Ok(w) => {
+                    if let Some(Some(p)) = &persona_known {
+                        w.c.ui.set(atrium_mail::compose::ComposeUi { persona: Some(p.clone()), ..w.c.ui.get_cloned() });
+                    }
+                    composes.push(w)
+                }
                 Err(e) => eprintln!("atrium-mail: a compose window: {e}"),
             }
         }

@@ -105,6 +105,9 @@ pub struct ComposeUi {
     pub draft_id: Option<u64>,
     /// About a `mailto:` link: what was left out, hidden copies, length.
     pub notes: Vec<String>,
+    /// The named persona Mail runs in (Work), if any: recipients outside
+    /// the From address's domain are pointed out (§9.1).
+    pub persona: Option<String>,
     /// "Saved", for a moment.
     pub status: Option<String>,
     pub error: Option<String>,
@@ -736,6 +739,19 @@ impl Composer {
     }
 
     /// The window's title: the subject, or "New message".
+    /// In a named persona, the From domain and who is outside it among
+    /// To, Cc and Bcc (§9.1); `None` when nothing is to be said.
+    pub fn outside(&self) -> Option<(String, Vec<String>)> {
+        let ui = self.ui.get_cloned();
+        ui.persona.as_ref()?;
+        let from = ui.froms.get(ui.identity)?;
+        let from = from.rsplit_once('<').map(|(_, a)| a.trim_end_matches('>')).unwrap_or(from);
+        let all: Vec<String> = [&self.to, &self.cc, &self.bcc].iter().flat_map(|f| parse_list(f.get_cloned().text())).map(|m| m.addr).collect();
+        let out = mail_engine::compose::outside_domain(from, all.iter().map(String::as_str));
+        let dom = from.rsplit_once('@')?.1.to_ascii_lowercase();
+        (!out.is_empty()).then_some((dom, out))
+    }
+
     pub fn title(&self) -> String {
         let s = self.subject.get_cloned().text().trim().to_string();
         if s.is_empty() { "New message".into() } else { s }
@@ -920,6 +936,15 @@ impl View for ComposeView {
                 ctx.pop();
             }
             y += row_h;
+        }
+        // Work persona: who is outside the company (§9.1).
+        if let Some((dom, out)) = self.c.outside() {
+            let r = Rect::new(0.0, y, w, em(28.0));
+            ctx.add(Node::Rect { rect: r, fill: t.bg_window(), radius: 0.0 });
+            let who = format!("Outside {dom}: {}", out.join(", "));
+            let fit = crate::view::fit_text(&who, type_size::SM, Weight::Medium, w - 32.0);
+            line(ctx, 16.0, y + em(14.0), &fit, type_size::SM, Weight::Medium, t.warning_fg());
+            y += em(28.0);
         }
         ctx.add(Node::Rect { rect: Rect::new(0.0, y, w, 1.0), fill: t.border_default(), radius: 0.0 });
         // The text's bar: formatting (rich), and the switch.

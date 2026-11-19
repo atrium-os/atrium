@@ -258,6 +258,24 @@ pub fn portcullis_socket() -> std::path::PathBuf {
     std::env::var_os("MAIL_PORTCULLIS_SOCKET").map(Into::into).unwrap_or_else(|| "/atrium/sockets/portcullis/portcullis.sock".into())
 }
 
+/// The persona this instance runs in (personas.md §3), as portcullisd's
+/// launch registry has it by Mail's uid: `None` for Personal, else its
+/// name ("work").
+pub fn persona() -> Result<Option<String>, String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let mut s = std::os::unix::net::UnixStream::connect(portcullis_socket()).map_err(|e| format!("Atrium's app launcher isn't reachable ({e})"))?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { .. }) => {}
+        Ok(r) => return Err(format!("the app launcher answered {r:?}")),
+        Err(e) => return Err(format!("the app launcher: {e}")),
+    }
+    match round_trip(&mut s, &Request::Persona).map_err(|e| e.to_string())? {
+        Response::Persona { name, .. } => Ok(name),
+        r => Err(format!("an odd answer: {r:?}")),
+    }
+}
+
 /// Open in… (§8.2): hand `fd` (from [`sealed`]) to portcullisd with the
 /// press that asked; it decides the type from the bytes and opens it in
 /// the person's default app. That app's name, or why not. Called off the

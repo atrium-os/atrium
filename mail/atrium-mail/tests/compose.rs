@@ -498,3 +498,33 @@ fn recipients_complete_from_the_address_book() {
     k.subject.set(TextEdit::new("x"));
     assert!(k.suggest(None).people.is_empty());
 }
+
+#[test]
+fn work_points_out_recipients_outside_the_company() {
+    use atrium_mail::compose::ComposeUi;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Rc::new(Engine::new(Store::open(dir.path()).unwrap(), Parser { program: "/nonexistent".into() }));
+    let account = engine.store.add_account("arun@example.com").unwrap();
+    engine.store.set_identities(account, &[Identity { name: "Arun".into(), addr: "arun@example.com".into(), signature: String::new() }]).unwrap();
+    let c = engine.compose_new(account, 0).unwrap();
+    let dirty = Arc::new(AtomicBool::new(true));
+    let k = Composer::new(engine.clone(), c, None, dirty.clone(), move || NOW);
+    let mut app = App::new_with_flag(ComposeView::new(k.clone(), (760.0, 640.0)), dirty);
+    k.to.set(TextEdit::new("Priya <priya@example.com>, lena@eu.example.com, ada@other.org"));
+    k.cc.set(TextEdit::new("sam@notexample.com"));
+    // Personal: nothing said.
+    app.tick();
+    assert!(k.outside().is_none());
+    assert!(!texts(&app).iter().any(|x| x.starts_with("Outside")));
+    // Work: who is outside example.com (a subdomain is inside).
+    k.ui.set(ComposeUi { persona: Some("work".into()), ..k.ui.get_cloned() });
+    app.tick();
+    assert_eq!(k.outside(), Some(("example.com".into(), vec!["ada@other.org".into(), "sam@notexample.com".into()])));
+    assert!(texts(&app).iter().any(|x| x == "Outside example.com: ada@other.org, sam@notexample.com"), "{:?}", texts(&app));
+    // All inside: the line goes.
+    k.to.set(TextEdit::new("priya@example.com"));
+    k.cc.set(TextEdit::new(""));
+    app.tick();
+    assert!(k.outside().is_none());
+    assert!(!texts(&app).iter().any(|x| x.starts_with("Outside")));
+}
