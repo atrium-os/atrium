@@ -164,7 +164,10 @@ pub struct Settings {
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
     pub mail_rule: Mutable<TextEdit>,
+    pub away_from: Mutable<TextEdit>,
     pub away_until: Mutable<TextEdit>,
+    /// The reply's first line shown, and the caret it was placed for.
+    away_top: Rc<std::cell::Cell<(usize, usize)>>,
     pub away_subject: Mutable<TextEdit>,
     pub away_text: Mutable<TextEdit>,
     pub domain: Mutable<TextEdit>,
@@ -204,9 +207,16 @@ impl Settings {
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
             mail_rule: ui.sibling(TextEdit::new("")),
+            away_from: ui.sibling(TextEdit::new(&away.from.map(mail_engine::clock::day_iso).unwrap_or_default())),
             away_until: ui.sibling(TextEdit::new(&away.until.map(mail_engine::clock::day_iso).unwrap_or_default())),
+            away_top: Rc::new(std::cell::Cell::new((0, usize::MAX))),
             away_subject: ui.sibling(TextEdit::new(&away.subject)),
-            away_text: ui.sibling(TextEdit::new(&away.text.replace('\n', " "))),
+            away_text: ui.sibling({
+                // Multi-line before the text goes in, or its line breaks go.
+                let mut e = TextEdit::new("").multiline(true);
+                e.set_text(&away.text);
+                e
+            }),
             domain: ui.sibling(TextEdit::new("")),
             made_for: ui.sibling(TextEdit::new("")),
             person: ui.sibling(TextEdit::new("")),
@@ -479,25 +489,35 @@ impl Settings {
     /// Keep the automatic reply as the form says; the next sync puts it on
     /// each account's server.
     pub fn save_away(&self) {
-        let until_text = self.away_until.get_cloned().text().trim().to_string();
-        let until = if until_text.is_empty() {
-            None
-        } else {
-            match mail_engine::clock::end_of_day(&until_text) {
-                Some(t) => Some(t),
-                None => {
-                    self.update(|u| u.note = Some("The last day reads like 2026-11-30, or leave it empty".into()));
-                    return;
-                }
+        let day = |f: &Mutable<TextEdit>, read: fn(&str) -> Option<i64>| -> Result<Option<i64>, ()> {
+            let t = f.get_cloned().text().trim().to_string();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                read(&t).map(Some).ok_or(())
             }
         };
+        let Ok(from) = day(&self.away_from, mail_engine::clock::start_of_day) else {
+            self.update(|u| u.note = Some("The first day reads like 2026-11-23, or leave it empty".into()));
+            return;
+        };
+        let Ok(until) = day(&self.away_until, mail_engine::clock::end_of_day) else {
+            self.update(|u| u.note = Some("The last day reads like 2026-11-30, or leave it empty".into()));
+            return;
+        };
+        if let (Some(f), Some(u)) = (from, until) {
+            if f > u {
+                self.update(|u| u.note = Some("The first day comes after the last".into()));
+                return;
+            }
+        }
         let on = self.ui.get_cloned().away_on;
         let text = self.away_text.get_cloned().text().trim().to_string();
         if on && text.is_empty() {
             self.update(|u| u.note = Some("Write the reply first".into()));
             return;
         }
-        let a = mail_engine::away::Away { on, from: None, until, subject: self.away_subject.get_cloned().text().trim().to_string(), text };
+        let a = mail_engine::away::Away { on, from, until, subject: self.away_subject.get_cloned().text().trim().to_string(), text };
         match self.engine.set_away(&a) {
             Ok(()) => self.update(|u| u.note = Some(if on { "Your reply goes on at the next sync".into() } else { "Your reply goes off at the next sync".into() })),
             Err(e) => self.update(|u| u.note = Some(format!("Couldn't keep it: {e:?}"))),
@@ -1084,12 +1104,21 @@ impl SettingsView {
             y += em(32.0);
             let lw = em(64.0);
             let fw = (inner - lw).max(em(160.0));
-            for (label, field, hint) in [("Last day", &self.s.away_until, "2026-11-30, or empty"), ("Subject", &self.s.away_subject, "Away until Monday"), ("Reply", &self.s.away_text, "I'm away until Monday; Sam can help.")] {
+            for (label, field, hint) in [("First day", &self.s.away_from, "2026-11-23, or empty"), ("Last day", &self.s.away_until, "2026-11-30, or empty"), ("Subject", &self.s.away_subject, "Away until Monday")] {
                 text(ctx, x, y + em(18.0), label, type_size::SM, Weight::Regular, t.text_secondary());
                 let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
                 ctx.place(TextField::new(field.clone()).at(x + lw, fy).width(fw).placeholder(hint));
                 y += em(40.0);
             }
+            // The reply: lines of its own, in a box like a field's.
+            text(ctx, x, y + em(18.0), "Reply", type_size::SM, Weight::Regular, t.text_secondary());
+            let bh = em(type_size::MD) * 1.5 * 5.0 + em(12.0);
+            let b = Rect::new(x + lw, y + em(4.0), fw, bh);
+            ctx.add(Node::Rect { rect: b, fill: t.border_control(), radius: 6.0 });
+            ctx.add(Node::Rect { rect: Rect::new(b.x() + 1.0, b.y() + 1.0, b.w() - 2.0, b.h() - 2.0), fill: t.bg_canvas(), radius: 5.0 });
+            let (s1, s2) = (self.s.clone(), self.s.clone());
+            crate::compose::text_area(ctx, Rect::new(b.x() + em(8.0), b.y() + em(6.0), b.w() - em(16.0), b.h() - em(12.0)), &self.s.away_text, &self.s.away_top, "I'm away until Monday; Sam can help.", false, Rc::new(move || s1.update(|_| {})), Rc::new(move |_| s2.update(|_| {})));
+            y += bh + em(8.0);
             let s = self.s.clone();
             let bw = measure("Save", type_size::SM, Weight::Medium) + em(24.0);
             button(ctx, right - bw, y + em(14.0), "Save", true, true, move || s.save_away());

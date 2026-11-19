@@ -1128,129 +1128,141 @@ impl ComposeView {
     /// Pergola's editing core, Up and Down move by visual line, a press
     /// places the caret, the wheel scrolls.
     fn body(&self, ctx: &mut Ctx, r: Rect) {
-        let t = ctx.theme;
-        let st = sans(type_size::MD, Weight::Regular, t.text_primary());
-        let lh = em(type_size::MD) * 1.5;
-        let edit = self.c.body.get_cloned();
-        let text = edit.text().to_string();
-        let lines = wrap(&text, r.w(), &st);
-        let rows = ((r.h() / lh).floor() as usize).max(1);
-        let caret_line = line_of(&lines, edit.caret());
-        let (mut top, placed_for) = self.top.get();
-        top = top.min(lines.len().saturating_sub(1));
-        if edit.caret() != placed_for {
-            if caret_line < top {
-                top = caret_line;
-            } else if caret_line >= top + rows {
-                top = caret_line + 1 - rows;
+        let (ui, ui2) = (self.c.ui.clone(), self.c.ui.clone());
+        text_area(ctx, r, &self.c.body, &self.top, "Write your message", true, Rc::new(move || ui.update(|u| u.status = None)), Rc::new(move |to| ui2.update(|u| u.top = to)));
+    }
+}
+
+/// A multi-line text field in `r`: wrapped lines, a caret, a selection;
+/// keys edit through Pergola's editing core, Up and Down move by visual
+/// line, a press places the caret, the wheel scrolls. `top` keeps the
+/// first line shown and the caret it was placed for; `on_edit` after each
+/// key, `on_scroll` with the new first line. Lines starting `>` are dimmed
+/// when `dim_quotes`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn text_area(ctx: &mut Ctx, r: Rect, field: &Mutable<TextEdit>, top_cell: &Rc<std::cell::Cell<(usize, usize)>>, placeholder: &str, dim_quotes: bool, on_edit: Rc<dyn Fn()>, on_scroll: Rc<dyn Fn(usize)>) {
+    let t = ctx.theme;
+    let st = sans(type_size::MD, Weight::Regular, t.text_primary());
+    let lh = em(type_size::MD) * 1.5;
+    let edit = field.get_cloned();
+    let text = edit.text().to_string();
+    let lines = wrap(&text, r.w(), &st);
+    let rows = ((r.h() / lh).floor() as usize).max(1);
+    let caret_line = line_of(&lines, edit.caret());
+    let (mut top, placed_for) = top_cell.get();
+    top = top.min(lines.len().saturating_sub(1));
+    if edit.caret() != placed_for {
+        if caret_line < top {
+            top = caret_line;
+        } else if caret_line >= top + rows {
+            top = caret_line + 1 - rows;
+        }
+    }
+    top_cell.set((top, edit.caret()));
+    let id = ctx.push(Node::Rect { rect: r, fill: t.bg_canvas(), radius: 0.0 });
+    let focused = ctx.is_focused(id);
+    let sel = edit.selection();
+    for (i, &(s, e)) in lines.iter().enumerate().skip(top).take(rows) {
+        let y = r.y() + (i - top) as f32 * lh;
+        if focused && sel.start < e.max(s + 1) && sel.end > s {
+            let a = measure(&text[s..sel.start.clamp(s, e)], &st);
+            let b = measure(&text[s..sel.end.clamp(s, e)], &st) + if sel.end > e { em(4.0) } else { 0.0 };
+            ctx.add(Node::Rect { rect: Rect::new(r.x() + a, y, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
+        }
+        let content = text[s..e].trim_end_matches(' ').to_string();
+        let quoted = dim_quotes && content.starts_with('>');
+        let style = sans(type_size::MD, Weight::Regular, if quoted { t.text_secondary() } else { t.text_primary() });
+        ctx.add(Node::Text { rect: Rect::new(r.x(), y, measure(&content, &style), lh), content, style });
+    }
+    if text.is_empty() {
+        ctx.add(Node::Text { rect: Rect::new(r.x(), r.y(), r.w(), lh), content: placeholder.into(), style: sans(type_size::MD, Weight::Regular, t.text_tertiary()) });
+    }
+    if focused && sel.is_empty() && caret_line >= top && caret_line < top + rows {
+        let (s, _) = lines.get(caret_line).copied().unwrap_or((0, 0));
+        let x = r.x() + measure(&text[s..edit.caret()], &st);
+        ctx.add(Node::Rect { rect: Rect::new(x, r.y() + (caret_line - top) as f32 * lh, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
+    }
+    ctx.focusable(id);
+    let body = field.clone();
+    let on_edit = on_edit.clone();
+    let lines_k = lines.clone();
+    let text_k = text.clone();
+    let st_k = st.clone();
+    let width = r.w();
+    ctx.on_key(id, move |ev| {
+        let Event::Key { kind, key, modifiers, chars } = ev else { return };
+        if !kind.pressed() || ((modifiers.ctrl || modifiers.meta) && *key == Key::Enter) {
+            return;
+        }
+        let mut e = body.get_cloned();
+        match key {
+            Key::Up | Key::Down => {
+                // Keys typed since the last frame: the lines of the text now.
+                let fresh;
+                let (lines_k, text_k) = if e.text() == text_k {
+                    (&lines_k, text_k.as_str())
+                } else {
+                    fresh = (wrap(e.text(), width, &st_k), e.text().to_string());
+                    (&fresh.0, fresh.1.as_str())
+                };
+                let l = line_of(lines_k, e.caret());
+                let to = if *key == Key::Up { l.checked_sub(1) } else { (l + 1 < lines_k.len()).then_some(l + 1) };
+                let at = match to {
+                    Some(to) => {
+                        let x = measure(&text_k[lines_k[l].0..e.caret()], &st_k);
+                        offset_at(text_k, lines_k[to], x, &st_k)
+                    }
+                    None if *key == Key::Up => 0,
+                    None => text_k.len(),
+                };
+                e.set_caret(at, modifiers.shift);
+                body.set(e);
             }
-        }
-        self.top.set((top, edit.caret()));
-        let id = ctx.push(Node::Rect { rect: r, fill: t.bg_canvas(), radius: 0.0 });
-        let focused = ctx.is_focused(id);
-        let sel = edit.selection();
-        for (i, &(s, e)) in lines.iter().enumerate().skip(top).take(rows) {
-            let y = r.y() + (i - top) as f32 * lh;
-            if focused && sel.start < e.max(s + 1) && sel.end > s {
-                let a = measure(&text[s..sel.start.clamp(s, e)], &st);
-                let b = measure(&text[s..sel.end.clamp(s, e)], &st) + if sel.end > e { em(4.0) } else { 0.0 };
-                ctx.add(Node::Rect { rect: Rect::new(r.x() + a, y, b - a, lh), fill: t.selection_bg(), radius: 0.0 });
-            }
-            let content = text[s..e].trim_end_matches(' ').to_string();
-            let quoted = content.starts_with('>');
-            let style = sans(type_size::MD, Weight::Regular, if quoted { t.text_secondary() } else { t.text_primary() });
-            ctx.add(Node::Text { rect: Rect::new(r.x(), y, measure(&content, &style), lh), content, style });
-        }
-        if text.is_empty() {
-            ctx.add(Node::Text { rect: Rect::new(r.x(), r.y(), r.w(), lh), content: "Write your message".into(), style: sans(type_size::MD, Weight::Regular, t.text_tertiary()) });
-        }
-        if focused && sel.is_empty() && caret_line >= top && caret_line < top + rows {
-            let (s, _) = lines.get(caret_line).copied().unwrap_or((0, 0));
-            let x = r.x() + measure(&text[s..edit.caret()], &st);
-            ctx.add(Node::Rect { rect: Rect::new(x, r.y() + (caret_line - top) as f32 * lh, 1.5, lh), fill: t.accent_fg(), radius: 0.0 });
-        }
-        ctx.focusable(id);
-        let body = self.c.body.clone();
-        let ui = self.c.ui.clone();
-        let lines_k = lines.clone();
-        let text_k = text.clone();
-        let st_k = st.clone();
-        let width = r.w();
-        ctx.on_key(id, move |ev| {
-            let Event::Key { kind, key, modifiers, chars } = ev else { return };
-            if !kind.pressed() || ((modifiers.ctrl || modifiers.meta) && *key == Key::Enter) {
-                return;
-            }
-            let mut e = body.get_cloned();
-            match key {
-                Key::Up | Key::Down => {
-                    // Keys typed since the last frame: the lines of the text now.
-                    let fresh;
-                    let (lines_k, text_k) = if e.text() == text_k {
-                        (&lines_k, text_k.as_str())
-                    } else {
-                        fresh = (wrap(e.text(), width, &st_k), e.text().to_string());
-                        (&fresh.0, fresh.1.as_str())
-                    };
-                    let l = line_of(lines_k, e.caret());
-                    let to = if *key == Key::Up { l.checked_sub(1) } else { (l + 1 < lines_k.len()).then_some(l + 1) };
-                    let at = match to {
-                        Some(to) => {
-                            let x = measure(&text_k[lines_k[l].0..e.caret()], &st_k);
-                            offset_at(text_k, lines_k[to], x, &st_k)
-                        }
-                        None if *key == Key::Up => 0,
-                        None => text_k.len(),
-                    };
-                    e.set_caret(at, modifiers.shift);
-                    body.set(e);
+            _ => match e.key(*key, *modifiers, chars) {
+                KeyOutcome::Changed => body.set(e),
+                KeyOutcome::Copy(s) => {
+                    if pergola::clipboard::copy_text(&s, false).is_ok() {
+                        body.set(e);
+                    }
                 }
-                _ => match e.key(*key, *modifiers, chars) {
-                    KeyOutcome::Changed => body.set(e),
-                    KeyOutcome::Copy(s) => {
-                        if pergola::clipboard::copy_text(&s, false).is_ok() {
+                KeyOutcome::Paste => {
+                    if let Ok(Some(s)) = pergola::clipboard::paste_text() {
+                        if e.insert(&s) {
                             body.set(e);
                         }
                     }
-                    KeyOutcome::Paste => {
-                        if let Ok(Some(s)) = pergola::clipboard::paste_text() {
-                            if e.insert(&s) {
-                                body.set(e);
-                            }
-                        }
-                    }
-                    KeyOutcome::Submit | KeyOutcome::Ignored => {}
-                },
-            }
-            ui.update(|u| u.status = None);
-        });
-        let body = self.c.body.clone();
-        let lines_d = lines.clone();
-        ctx.on_drag_local(id, move |phase, p: Point| {
-            let mut e = body.get_cloned();
-            if e.text() != text {
-                return;
-            }
-            let l = (top + (p.y / lh).max(0.0) as usize).min(lines_d.len().saturating_sub(1));
-            let Some(&ln) = lines_d.get(l) else { return };
-            let at = offset_at(&text, ln, p.x, &st);
-            e.set_caret(at, phase != DragPhase::Start);
-            body.set(e);
-        });
-        let ui = self.c.ui.clone();
-        let n = lines.len();
-        let cell = self.top.clone();
-        ctx.on_scroll(id, move |s| {
-            if let pergola::interaction::ScrollKind::Wheel { dy, .. } = s.kind {
-                let step = (dy / lh).round() as i64;
-                let (cur, caret) = cell.get();
-                let to = (cur as i64 + step).clamp(0, n.saturating_sub(rows) as i64) as usize;
-                cell.set((to, caret));
-                ui.update(|u| u.top = to);
-            }
-        });
-        ctx.pop();
-    }
+                }
+                KeyOutcome::Submit | KeyOutcome::Ignored => {}
+            },
+        }
+        on_edit();
+    });
+    let body = field.clone();
+    let lines_d = lines.clone();
+    ctx.on_drag_local(id, move |phase, p: Point| {
+        let mut e = body.get_cloned();
+        if e.text() != text {
+            return;
+        }
+        let l = (top + (p.y / lh).max(0.0) as usize).min(lines_d.len().saturating_sub(1));
+        let Some(&ln) = lines_d.get(l) else { return };
+        let at = offset_at(&text, ln, p.x, &st);
+        e.set_caret(at, phase != DragPhase::Start);
+        body.set(e);
+    });
+    let on_scroll = on_scroll.clone();
+    let n = lines.len();
+    let cell = top_cell.clone();
+    ctx.on_scroll(id, move |s| {
+        if let pergola::interaction::ScrollKind::Wheel { dy, .. } = s.kind {
+            let step = (dy / lh).round() as i64;
+            let (cur, caret) = cell.get();
+            let to = (cur as i64 + step).clamp(0, n.saturating_sub(rows) as i64) as usize;
+            cell.set((to, caret));
+            on_scroll(to);
+        }
+    });
+    ctx.pop();
 }
 
 /// A small text button at `x` in a bar at `y`, `h` high.

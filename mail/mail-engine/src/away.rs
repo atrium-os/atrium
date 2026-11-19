@@ -51,9 +51,11 @@ impl Engine {
             (_, Some(_), _, Some(why)) => format!("not set yet: {why}"),
             (_, Some(_), ..) => "set at the next sync".into(),
             (_, None, Some(a), _) if a.on && a.until.is_some_and(|u| u < now) => "off (its end date passed)".into(),
-            (_, None, Some(a), _) if a.on => match a.until {
-                Some(u) => format!("replying until {}", crate::clock::day_label(u)),
-                None => "replying".into(),
+            (_, None, Some(a), _) if a.on => match (a.from.filter(|f| *f > now), a.until) {
+                (Some(f), Some(u)) => format!("replying from {} until {}", crate::clock::day_label(f), crate::clock::day_label(u)),
+                (Some(f), None) => format!("replying from {}", crate::clock::day_label(f)),
+                (None, Some(u)) => format!("replying until {}", crate::clock::day_label(u)),
+                (None, None) => "replying".into(),
             },
             (_, None, Some(_), _) => "off".into(),
             _ => "not read yet".into(),

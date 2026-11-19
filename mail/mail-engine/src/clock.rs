@@ -67,6 +67,16 @@ pub fn day_iso(t: i64) -> String {
 
 /// "2026-11-30" (or "30 Nov 2026"): the last second of that local day.
 pub fn end_of_day(s: &str) -> Option<i64> {
+    day_typed(s).map(|days| from_local(days * 86_400 + 86_399))
+}
+
+/// The same day's first second.
+pub fn start_of_day(s: &str) -> Option<i64> {
+    day_typed(s).map(|days| from_local(days * 86_400))
+}
+
+/// A typed day, as days since 1970.
+fn day_typed(s: &str) -> Option<i64> {
     let s = s.trim();
     let (y, m, d) = if let Some((y, rest)) = s.split_once('-') {
         let (m, d) = rest.split_once('-')?;
@@ -85,7 +95,7 @@ pub fn end_of_day(s: &str) -> Option<i64> {
     if civil(days) != (y, m, d) {
         return None;
     }
-    Some(from_local(days * 86_400 + 86_399))
+    Some(days)
 }
 
 #[cfg(test)]
@@ -100,6 +110,9 @@ mod tests {
         assert_eq!(super::end_of_day("2026-02-30"), None);
         assert_eq!(super::end_of_day("2028-02-29").map(super::day_iso).as_deref(), Some("2028-02-29"));
         assert_eq!(super::end_of_day("tomorrow"), None);
+        let s = super::start_of_day("2026-11-30").unwrap();
+        assert_eq!((super::day_iso(s), super::day_iso(s - 1)), ("2026-11-30".to_string(), "2026-11-29".to_string()));
+        assert_eq!(t - s, 86_399);
     }
 
     #[test]

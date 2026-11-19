@@ -174,7 +174,7 @@ fn settings_window() {
     s.reload();
     drawn(&mut app, &["PRIVATE ADDRESSES", "Domain", "Save", "OPENPGP", "No key of yours yet", "Paste a key"]);
     // Away (§11.6): the form, kept for the next sync; a bad day says so.
-    drawn(&mut app, &["AWAY", "Reply automatically", "ada@me.example: not read yet"]);
+    drawn(&mut app, &["AWAY", "Reply automatically", "First day", "Last day", "Reply", "ada@me.example: not read yet"]);
     s.toggle_away();
     s.save_away();
     assert_eq!(s.ui.get_cloned().note.as_deref(), Some("Write the reply first"));
@@ -183,10 +183,21 @@ fn settings_window() {
     s.save_away();
     assert!(s.ui.get_cloned().note.unwrap().starts_with("The last day reads like"));
     s.away_until.set(TextEdit::new("2026-11-30"));
+    s.away_from.set(TextEdit::new("someday"));
+    s.save_away();
+    assert!(s.ui.get_cloned().note.unwrap().starts_with("The first day reads like"));
+    s.away_from.set(TextEdit::new("2026-12-01"));
+    s.save_away();
+    assert_eq!(s.ui.get_cloned().note.as_deref(), Some("The first day comes after the last"));
+    s.away_from.set(TextEdit::new("2026-11-23"));
+    let mut text = TextEdit::new("").multiline(true);
+    text.set_text("Back Monday.\nSam can help.");
+    s.away_text.set(text);
     s.save_away();
     let w = engine.away(id).wanted.unwrap();
-    assert_eq!((w.on, w.text.as_str(), w.until.map(mail_engine::clock::day_iso).as_deref()), (true, "Back Monday.", Some("2026-11-30")));
-    drawn(&mut app, &["ada@me.example: set at the next sync"]);
+    assert_eq!((w.on, w.text.as_str(), w.until.map(mail_engine::clock::day_iso).as_deref()), (true, "Back Monday.\nSam can help.", Some("2026-11-30")));
+    assert_eq!(w.from.map(mail_engine::clock::day_iso).as_deref(), Some("2026-11-23"));
+    drawn(&mut app, &["ada@me.example: set at the next sync", "First day", "Sam can help."]);
     s.give_key("hello", 5);
     assert!(s.ui.get_cloned().note.unwrap().starts_with("Couldn't use it"));
     s.domain.set(TextEdit::new("me.example"));

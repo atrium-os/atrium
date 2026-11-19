@@ -456,6 +456,13 @@ fn jmap_sync_changes_and_send() {
     assert_eq!(st.server.as_ref().unwrap().until, Some(until));
     assert!(engine.away_line(account, t0).starts_with("replying until "), "{}", engine.away_line(account, t0));
     assert_eq!(engine.away_line(account, until + 1), "off (its end date passed)");
+    // A first day still to come is said, and goes as fromDate.
+    let from = t0 + 2 * 86_400;
+    engine.set_away(&mail_store::away::Away { from: Some(from), ..away.clone() }).unwrap();
+    engine.sync_away(account, client.as_mut()).unwrap();
+    assert_eq!(server.borrow().vacation.as_ref().unwrap()["fromDate"].as_str().and_then(mail_proto::jmap::utc_date), Some(from));
+    assert!(engine.away_line(account, t0).starts_with("replying from "), "{}", engine.away_line(account, t0));
+    assert!(engine.away_line(account, from + 1).starts_with("replying until "));
     engine.set_away(&mail_store::away::Away::default()).unwrap();
     engine.sync_away(account, client.as_mut()).unwrap();
     assert_eq!(server.borrow().vacation.as_ref().unwrap()["isEnabled"], json!(false));
