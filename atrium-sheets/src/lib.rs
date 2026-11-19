@@ -9,6 +9,7 @@ pub mod condfmt;
 pub mod data;
 pub mod doc;
 pub mod files;
+pub mod lists;
 pub mod pivotpane;
 pub mod print;
 pub mod review;

@@ -21,6 +21,23 @@ use crate::tickets::Ticket;
 /// Most cookies one Unrecorded jar holds (its groups hold 50 each).
 pub const PER_JAR: usize = 1000;
 
+/// A VPN sign-in window's jar (vpn.md §9.3): every partition of it begins
+/// `vpn-<profile>.`, so the identity provider's cookies stay apart from
+/// the person's browsing and are kept for the next sign-in.
+pub const VPN_JAR: &str = "vpn-";
+
+/// The cookie an AnyConnect gateway hands its sign-on token in, at the end
+/// of a SAML sign-in.
+pub const VPN_SSO_COOKIE: &str = "acSamlv2Token";
+
+/// The VPN profile whose sign-in jar `partition` is in, if it is one.
+pub fn vpn_profile(partition: &str) -> Option<String> {
+    let (p, site) = partition.strip_prefix(VPN_JAR)?.split_once('.')?;
+    let ok = !p.is_empty() && p.len() <= 32 && !p.starts_with('-') && !site.is_empty()
+        && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    ok.then(|| p.to_string())
+}
+
 /// Whether `partition` is an Unrecorded trail's, kept here.
 pub fn in_memory(partition: &str) -> bool {
     partition.starts_with(crate::proto::broker_op::UNRECORDED)

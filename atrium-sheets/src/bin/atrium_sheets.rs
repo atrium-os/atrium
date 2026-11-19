@@ -409,6 +409,10 @@ fn main() {
     }
 
     let root = state_root();
+    // The custom lists fills follow, kept beside the autosaves.
+    if let Some(dir) = root.parent() {
+        atrium_sheets::lists::init(dir);
+    }
     let _ = fs::create_dir_all(&root);
     // A document a crash left comes back first; it, or a file named on the
     // command line, is read on its own thread once the window shows.

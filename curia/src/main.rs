@@ -533,6 +533,9 @@ fn main() {
     let page = Mutable::with_dirty(NetPage::new(), dirty.clone());
     let cred_state = Mutable::with_dirty(CredentialState::default(), dirty.clone());
     let cred = CredentialField::wifi_passphrase(cred_state.clone());
+    // A VPN sign-in's password or code (vpn.md §9.3).
+    let vcred_state = Mutable::with_dirty(CredentialState::default(), dirty.clone());
+    let vcred = CredentialField::vpn_secret(vcred_state.clone());
     let size = Mutable::with_dirty((win.width, win.height), dirty.clone());
     let devs = Mutable::with_dirty(curia::devices::DevPage::default(), dirty.clone());
     let which = Mutable::with_dirty(curia::view::Which::default(), dirty.clone());
@@ -560,7 +563,7 @@ fn main() {
     // The system picker, while a WireGuard file is chosen (vpn.md §7.3).
     let mut vpn_pick: Option<limen::proto::EmbedId> = None;
     let mut vpn_pick_ask = false;
-    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn: vpn.clone(), vpn_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), vpn_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())) };
+    let view = CuriaView { which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn: vpn.clone(), vpn_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), vpn_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn_cred: vcred.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
     let mut next_disp = Instant::now();
@@ -591,7 +594,9 @@ fn main() {
     let mut embeds = link_limend(&mut win);
     let mut next_limend = Instant::now() + Duration::from_secs(5);
     let mut cred_embed = None;
+    let mut vcred_embed = None;
     let mut next_ask = Instant::now();
+    let mut next_vask = Instant::now();
     let mut failed = false;
     let mut app = App::new_with_flag(view, dirty);
     let (tx, rx): (Sender<Got>, Receiver<Got>) = channel();
@@ -831,9 +836,59 @@ fn main() {
                 }
                 _ => {}
             }
+            // Arca's field for a VPN sign-in: while a gateway asks for a
+            // password or code on the VPN page.
+            {
+                let mut vp = vpn.get_cloned();
+                let mut vch = false;
+                if std::mem::take(&mut vp.reset_field) {
+                    if let Some(id) = vcred_embed.take() {
+                        let _ = e.borrow_mut().detach_embed(id);
+                    }
+                    vcred_state.set(CredentialState::default());
+                    vch = true;
+                }
+                let want = vp.wants_field() && which.get() == curia::view::Which::Vpn;
+                match (want, vcred_embed) {
+                    (true, None) if Instant::now() >= next_vask => {
+                        next_vask = Instant::now() + Duration::from_secs(2);
+                        if let Some(token) = win.embed_token() {
+                            match e.borrow_mut().request("credential", token, vcred.slot_key()) {
+                                Ok(id) => {
+                                    let _ = e.borrow_mut().send(id, vcred.configure().encode());
+                                    vcred_embed = Some(id);
+                                }
+                                Err(err) => eprintln!("curia: Arca's VPN field: {err:?}"),
+                            }
+                        }
+                    }
+                    (false, Some(id)) => {
+                        let _ = e.borrow_mut().detach_embed(id);
+                        vcred_embed = None;
+                        vcred_state.set(CredentialState::default());
+                    }
+                    _ => {}
+                }
+                let up = vcred_embed.is_some();
+                if vp.field_up != up {
+                    vp.field_up = up;
+                    vch = true;
+                }
+                if vp.tick(Instant::now()) {
+                    vch = true;
+                }
+                if vch {
+                    vpn.set(vp);
+                }
+            }
             if std::mem::take(&mut vpn_pick_ask) && vpn_pick.is_none() {
+                let for_cert = vpn.get_cloned().pick_cert.is_some();
                 let asked = win.embed_token().ok_or(()).and_then(|token| {
-                    let filter = limen::picker::Filter { title: "Import a WireGuard file".into(), extensions: vec!["conf".into()], ..limen::picker::Filter::file() };
+                    let filter = if for_cert {
+                        limen::picker::Filter { title: "Import the signed certificate".into(), extensions: vec!["pem".into(), "crt".into(), "cer".into()], ..limen::picker::Filter::file() }
+                    } else {
+                        limen::picker::Filter { title: "Import a WireGuard file".into(), extensions: vec!["conf".into()], ..limen::picker::Filter::file() }
+                    };
                     let id = e.borrow_mut().request("picker", token, curia::vpn::PICK_SLOT).map_err(|_| ())?;
                     e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map_err(|_| ())?;
                     Ok(id)
@@ -890,6 +945,18 @@ fn main() {
                         vpn_pick = None;
                         let _ = vtx.send(curia::vpn::Got::Picked(Err("the picker went away".into())));
                     }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == vcred_embed => {
+                        if let Some(m) = limen::credential::ToParent::decode(&bytes) {
+                            vcred.apply(m);
+                            let h = vcred_state.get_cloned().handle;
+                            curia::vpn::with_vpn(&vpn, |a| a.field(h, Instant::now()));
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed, .. })) if Some(embed) == vcred_embed => {
+                        vcred_embed = None;
+                        vcred_state.set(CredentialState::default());
+                        curia::vpn::with_vpn(&vpn, |a| a.field(None, Instant::now()));
+                    }
                     Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if Some(embed) == cred_embed => {
                         if let Some(m) = limen::credential::ToParent::decode(&bytes) {
                             cred.apply(m);
@@ -920,6 +987,8 @@ fn main() {
                 }
                 embeds = None;
                 cred_embed = None;
+                vcred_embed = None;
+                vcred_state.set(CredentialState::default());
                 cred_state.set(CredentialState::default());
                 p.field(None, Instant::now());
                 changed = true;

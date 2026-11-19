@@ -1365,7 +1365,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FlashFill { .. } | GridAction::FitCol(_) | GridAction::FitRow(_) | GridAction::ResizeCol { .. } | GridAction::ResizeRow { .. } => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1645,6 +1645,8 @@ impl View for Sheets {
                     rev.set(rev.get().wrapping_add(1));
                 }
                 // A double-click on the fill handle: down along the data beside it.
+                // Ctrl+E: the cursor's column by its examples.
+                GridAction::FlashFill { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::FlashFill)),
                 GridAction::FillToData(sel) => {
                     let mut d = doc.borrow_mut();
                     let from = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -3077,6 +3079,23 @@ mod tests {
         commit(4, "one\ntwo");
         Sheets::act(&s.doc, &s.source, &s.rev, GridAction::Clear(pergola::widgets::CellRange { r0: 4, c0: 0, r1: 4, c1: 0 }));
         assert_eq!(height(4), 20.0);
+    }
+
+    #[test]
+    fn flash_fill_fills_a_column_by_its_examples() {
+        let (d, _) = Doc::from_csv("t.csv", b"Name,Last\nAda Lovelace,Lovelace\nAlan Turing,\nGrace Hopper,\n").unwrap();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let mut g = grid.get_cloned();
+        g.select(2, 1);
+        grid.set(g);
+        s.cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::FlashFill));
+        s.take_cmds();
+        let v = |r| s.doc.borrow().wb.value(0, r, 1).display();
+        assert_eq!((v(0), v(2), v(3)), ("Last".to_string(), "Turing".to_string(), "Hopper".to_string()));
+        assert_eq!(s.doc.borrow().status, "Flash Fill filled 2 cells.");
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(v(2), "");
     }
 
     #[test]

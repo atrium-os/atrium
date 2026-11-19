@@ -65,6 +65,8 @@ signin() {
     done
     fail "$1: still asked after 4 rounds"
 }
+# How many items Arca keeps for Crypta's engines.
+arca_items() { echo $((0x$("$V" "su -m _crypta-key -c '$G/arca-probe $G/arcad.sock list'" | sed -n 's/^status=0 body=//p' | cut -c1-2))); }
 prompt_text() { # $1 profile, $2 k: the text, decoded
     "$V" "$CTL prompt name=$1" | awk -v k="$2" '/^text /{split($2,a,"=");split($3,b,"=");if(a[2]==k)printf "%s", b[2]}' | { read -r h || true; [ -n "${h:-}" ] && unhex "$h"; true; }
 }
@@ -120,6 +122,9 @@ run)
     l=$(acleaks); [ -z "$l" ] && ok "nothing for the tunnel's networks on the LAN, only the gateway's TCP ($(stat ac_out) bytes out)" || fail "leaked: $l"
     "$V" "grep -rq alice-pw $G/state $G/cryptad.log" && fail "the password is in cryptad's state or log" || ok "the password is not in cryptad's state or log"
     [ "$(tl corp user)" = "$(hexof alice)" ] && ok "the profile remembers the username" || fail "user: $(tl corp user)"
+    [ "$(tl corp banner)" = 1 ] || fail "no banner flag"
+    bn=$("$V" "$CTL banner name=corp" | awk '/^text /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="v")printf "%s", a[2]}}')
+    bn=$(unhex "$bn"); case "$bn" in *"Crypta gate gateway"*) ok "the gateway's banner, as text: $bn" ;; *) fail "banner: $bn" ;; esac
 
     echo "== roam: every connection to the gateway reset"
     a0=$(asks); s0=$(tl corp starts); addr=$(tl corp addr); syn=$(stat ac_syn)
@@ -130,8 +135,10 @@ run)
     [ "$(stat ac_syn)" -gt "$syn" ] && ok "on a new connection ($(( $(stat ac_syn) - syn )) since the reset)" || fail "no new connection after the reset"
 
     echo "== down and up: the saved password, nothing asked"
+    k0=$(arca_items)
     "$V" "$CTL down name=corp" >/dev/null || fail "down corp"
     "$V" 'pfctl -a atrium/vpn -sr' | grep -q . && fail "atrium/vpn left loaded" || ok "down: pf anchor emptied"
+    [ "$(arca_items)" = $((k0 - 1)) ] && ok "down: the session cookie is gone from Arca, the password kept ($k0 -> $(arca_items) items)" || fail "Arca items after down: $k0 -> $(arca_items)"
     "$V" "$CTL up name=corp" >/dev/null || fail "up corp again"
     wait_for corp handshake 1 "not back"
     [ "$(asks)" = "$a0" ] && ok "signed in again without asking" || fail "asked again"
@@ -222,8 +229,8 @@ run)
 
     echo "== delete: everything Arca kept for the profiles"
     for n in corp ann otp cert pin badpin hostile; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
-    left=$("$V" "su -m _crypta-key -c '$G/arca-probe $G/arcad.sock list'" | sed -n 's/^status=0 body=//p' | cut -c1-8)
-    [ "$left" = 00000000 ] && ok "Arca keeps nothing for them (passwords, sessions, the client key)" || fail "Arca still holds items: $left"
+    left=$(arca_items)
+    [ "$left" = 0 ] && ok "Arca keeps nothing for them (passwords, sessions, the client key)" || fail "Arca still holds items: $left"
     echo "crypta V4 gate: $pass checks passed"
     ;;
 *)

@@ -51,6 +51,12 @@ pub enum DataCmd {
     PasteDivide,
     /// The copied cells, blank ones leaving what is under them.
     PasteSkipBlanks,
+    /// Fill the cursor's column by the examples typed in it.
+    FlashFill,
+    /// Keep the selected cells' entries as a custom list fills follow.
+    AddCustomList,
+    /// Forget the custom lists.
+    ClearCustomLists,
     /// The Paste Special bar: what to paste, an operation, skipping blanks
     /// and turning, together.
     PasteSpecial,
@@ -309,6 +315,9 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Fill: Series").enabled(d.can_refill()), Some(DataCmd::FillSeries)),
         (MenuItem::new("Fill: Formats Only").enabled(d.can_refill()), Some(DataCmd::FillFormats)),
         (MenuItem::new("Fill: Without Formatting").enabled(d.can_refill()), Some(DataCmd::FillNoFormats)),
+        (MenuItem::new("Flash Fill").shortcut("Ctrl+E"), Some(DataCmd::FlashFill)),
+        (MenuItem::new("Fill: Keep Selection as a List").enabled(sel.r0 == sel.r1 || sel.c0 == sel.c1), Some(DataCmd::AddCustomList)),
+        (MenuItem::new("Fill: Forget Custom Lists").enabled(!officina_grid::autofill::custom_lists().is_empty()), Some(DataCmd::ClearCustomLists)),
         (MenuItem::new("Paste Values").enabled(special).separated(), Some(DataCmd::PasteValues)),
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
@@ -662,6 +671,27 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
                 _ => (Special { transpose: true, ..of(What::All) }, "Paste Transposed"),
             };
             paste_with(d, sel, sp, label)
+        }
+        DataCmd::AddCustomList => {
+            if sel.r0 != sel.r1 && sel.c0 != sel.c1 {
+                return Err("Select one row or one column of entries.".into());
+            }
+            let n = ((sel.r1 - sel.r0 + 1) as u64 * (sel.c1 - sel.c0 + 1) as u64).min(officina_grid::autofill::MAX_ENTRIES as u64 + 1) as u32;
+            if n as usize > officina_grid::autofill::MAX_ENTRIES {
+                return Err(format!("A list holds at most {} entries.", officina_grid::autofill::MAX_ENTRIES));
+            }
+            let entries: Vec<String> = (0..n).map(|k| if sel.r0 == sel.r1 { (sel.r0, sel.c0 + k) } else { (sel.r0 + k, sel.c0) }).map(|(r, c)| d.wb.formatted(CellAddr::new(s, r, c)).text).collect();
+            let kept = crate::lists::add(entries)?;
+            Ok(format!("Kept a list of {kept}: a fill from any of them goes on through the rest."))
+        }
+        DataCmd::ClearCustomLists => {
+            crate::lists::clear()?;
+            Ok("Custom lists forgotten.".into())
+        }
+        DataCmd::FlashFill => {
+            let (ops, n) = officina_grid::flashfill::flash_fill(&d.wb, s, cursor.0, cursor.1)?;
+            d.run("Flash Fill", ops);
+            Ok(if n == 1 { "Flash Fill filled 1 cell.".into() } else { format!("Flash Fill filled {n} cells.") })
         }
         DataCmd::CenterAcross => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
@@ -1078,6 +1108,28 @@ mod tests {
     }
     fn cell(d: &Doc, r: u32, c: u32) -> String {
         d.wb.formatted(CellAddr::new(0, r, c)).text
+    }
+
+    #[test]
+    fn a_selection_kept_as_a_list_fills_on() {
+        let mut d = doc();
+        for (r, w) in ["North", "South", "East", "West"].iter().enumerate() {
+            d.type_into(r as u32 + 20, 0, w);
+        }
+        let col = CellRange { r0: 20, c0: 0, r1: 23, c1: 0 };
+        run(&mut d, col, (20, 0), DataCmd::AddCustomList);
+        assert_eq!(d.status, "Kept a list of 4: a fill from any of them goes on through the rest.");
+        d.type_into(30, 5, "east");
+        let r = |r0, r1| Rect { sheet: 0, r0, c0: 5, r1, c1: 5 };
+        assert!(d.fill(r(30, 30), r(30, 32), false));
+        assert_eq!((cell(&d, 31, 5), cell(&d, 32, 5)), ("west".to_string(), "north".to_string()));
+        // A block, or one entry: refused.
+        run(&mut d, CellRange { r0: 20, c0: 0, r1: 21, c1: 1 }, (20, 0), DataCmd::AddCustomList);
+        assert_eq!(d.status, "Select one row or one column of entries.");
+        run(&mut d, one(20, 0), (20, 0), DataCmd::AddCustomList);
+        assert_eq!(d.status, "A list needs two different entries or more.");
+        run(&mut d, one(20, 0), (20, 0), DataCmd::ClearCustomLists);
+        assert!(officina_grid::autofill::custom_lists().is_empty());
     }
 
     #[test]

@@ -32,7 +32,7 @@
 //!   label=HEX`), or `sso login=HEX final=HEX cookie=HEX`
 //! - `answer name=N tI=HEX | hI=HANDLE [keep=1] ... | cancel=1`: field I's
 //!   text, or the handle of what was typed into Arca's field
-//! - `sso-done name=N ok=0|1`, `rebind name=N`
+//! - `sso-done name=N ok=0|1`, `rebind name=N`, `banner name=N` (`text` lines)
 //! - `csr name=N [cn=HEX]`: a P-256 key in Arca and a request for it
 //! - `certificate name=N` with the PEM chain as a descriptor
 //!
@@ -405,7 +405,7 @@ impl D {
         let resume = has(format!("{}/session", r.p.name));
         let uid = self.pick_uid().ok_or("no-uid")?;
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
-        let helper = key::Keys::start_vpn(self.o.key_uid, &self.o.arca, &r.p.name, theirs).map_err(|e| format!("secrets helper: {e}"))?;
+        let helper = key::Keys::start_vpn(self.o.key_uid, &self.o.arca, &r.p.name, &a.host, theirs).map_err(|e| format!("secrets helper: {e}"))?;
         let helper = Helper(helper);
         r.starts += 1;
         let mut e = launch(&self.o.jaild, uid, r, gw, Some(ours.as_fd()))?;
@@ -565,6 +565,28 @@ impl D {
         Ok(())
     }
 
+    /// `create-ac`: a corporate gateway; CA certificates (PEM) may come as a
+    /// descriptor besides `ca=`.
+    fn create_ac(&mut self, l: &Line, file: Option<OwnedFd>) -> Result<Vec<Line>, String> {
+        let mut p = Profile::from_create_ac(l)?;
+        if Profile::load(&self.o.state, &p.name).is_some() {
+            return Err("exists".into());
+        }
+        if let Some(f) = file {
+            let mut text = String::new();
+            std::fs::File::from(f).take(64 * 1024).read_to_string(&mut text).map_err(|_| "unreadable")?;
+            if !text.trim().is_empty() {
+                let cas = profile::certs_of(&text).ok_or("bad-ca")?;
+                if let Some(a) = p.ac.as_mut() {
+                    a.cas.extend(cas.into_iter().take(8));
+                }
+            }
+        }
+        p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
+        self.log(&format!("created {} (AnyConnect, {})", p.name, p.ac.as_ref().map(|a| a.host.as_str()).unwrap_or("")));
+        Ok(vec![Line::new("created").with("name", &p.name)])
+    }
+
     /// `csr`: a client key made in Arca, and a request for the IT team.
     fn csr(&mut self, name: &str, l: &Line) -> Result<Vec<Line>, String> {
         let mut p = Profile::load(&self.o.state, name).ok_or("no-profile")?;
@@ -623,6 +645,13 @@ impl D {
     fn stop_engine(&mut self, k: usize) {
         if let Some(mut e) = self.runs[k].engine.take() {
             let _ = engine::write(&mut e.sock, &ToEngine::Stop);
+            if e.helper.is_some() {
+                // An AnyConnect engine says goodbye to its gateway first:
+                // a moment for it to go by itself.
+                let _ = e.sock.set_read_timeout(Some(Duration::from_millis(1500)));
+                let mut b = [0u8; 4096];
+                while matches!(e.sock.read(&mut b), Ok(n) if n > 0) {}
+            }
             // Closing the process descriptor ends the engine if Stop did not.
             drop(e.pd);
             self.retire(e.uid);
@@ -632,7 +661,13 @@ impl D {
     fn down(&mut self, name: &str) -> Result<(), String> {
         let Some(k) = self.runs.iter().position(|r| r.p.name == name) else { return Ok(()) };
         self.stop_engine(k);
-        self.runs.remove(k);
+        let r = self.runs.remove(k);
+        if r.p.ac.is_some() {
+            // Disconnected by the person: the session is over (vpn.md §9.3).
+            if let Some(id) = self.keys.call(&Line::new("find").with("account", format!("{name}/session"))).ok().and_then(|l| l.hex("id")).and_then(|i| <[u8; 16]>::try_from(i).ok()) {
+                self.forget(&[id]);
+            }
+        }
         self.net_call(&Line::new("tunnel-close").with("id", name)).map(|_| ())
     }
 
@@ -711,12 +746,16 @@ impl D {
         let res: Result<Vec<Line>, String> = match (l.verb.as_str(), name) {
             ("import", _) => self.import(l, file),
             ("create", _) => self.create(l),
-            ("create-ac", _) => match Profile::from_create_ac(l) {
-                Err(e) => Err(e.into()),
-                Ok(p) if Profile::load(&self.o.state, &p.name).is_some() => Err("exists".into()),
-                Ok(p) => p.save(&self.o.state).map(|_| vec![Line::new("created").with("name", &p.name)]).map_err(|e| format!("save: {e}")),
-            },
+            ("create-ac", _) => self.create_ac(l, file),
             ("prompt", Some(n)) => self.prompt(&n),
+            // What the gateway said once signed in (vpn.md §9.4: plain text).
+            ("banner", Some(n)) => self.ac_run(&n).map(|k| {
+                let mut v = Vec::new();
+                if let Some(p) = &self.runs[k].ac.pushed {
+                    texts(&mut v, "banner", &p.banner);
+                }
+                v
+            }),
             ("answer", Some(n)) => self.answer(&n, l).map(|_| vec![]),
             ("sso-done", Some(n)) => {
                 let ok = l.get("ok") == Some("1");
@@ -865,6 +904,20 @@ impl D {
                     r.backoff_s = (r.backoff_s * 2).min(BACKOFF_MAX_S);
                 }
                 self.runs[k] = r;
+            }
+        }
+        // A single sign-on ends when Arca's courier has caught the
+        // gateway's token in the profile's sign-in jar (vpn.md §9.3, SAML):
+        // then the engine takes it from Arca and signs in with it.
+        for k in 0..self.runs.len() {
+            let (Some(_), Some(a)) = (&self.runs[k].ac.sso, &self.runs[k].p.ac) else { continue };
+            let acc = format!("{}/sso@{}", self.runs[k].p.name, a.host);
+            if self.keys.call(&Line::new("find").with("account", acc)).is_ok_and(|l| l.verb == "ok") {
+                self.runs[k].ac.sso = None;
+                self.log(&format!("{}: signed on; the gateway's token is in Arca", self.runs[k].p.name));
+                if let Err(e) = self.to_engine(k, &ToEngine::SsoDone(true)) {
+                    eprintln!("atrium-cryptad: {}: {e}", self.runs[k].p.name);
+                }
             }
         }
         #[cfg(target_os = "freebsd")]
@@ -1142,8 +1195,8 @@ fn main() {
     if a.first().map(String::as_str) == Some("--arca-vpn") {
         // An AnyConnect engine's own helper: its socket is stdin and stdout.
         let sock = std::env::var("ARCA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
-        let Some(name) = a.get(1).filter(|n| profile::valid_name(n)) else { die("--arca-vpn NAME") };
-        return key::serve_vpn(&sock, name);
+        let (Some(name), Some(host)) = (a.get(1).filter(|n| profile::valid_name(n)), a.get(2)) else { die("--arca-vpn NAME HOST") };
+        return key::serve_vpn(&sock, name, host);
     }
     if a.first().map(String::as_str) == Some("ctl") {
         // Options before `ctl` are not taken; the socket from the environment.

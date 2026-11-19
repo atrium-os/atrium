@@ -57,7 +57,7 @@ enum Series {
     Months { first: (i64, i64, i64), step: f64, time: f64 },
     Days { first: f64, step: f64 },
     Numbered { head: String, tail: String, width: usize, first: f64, step: f64 },
-    Named { list: &'static [&'static str], case: Case, first: i64, step: i64 },
+    Named { list: std::sync::Arc<[String]>, case: Case, first: i64, step: i64 },
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +72,38 @@ const DAYS3: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const MONTHS3: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const LISTS: [&[&str]; 4] = [&DAYS, &DAYS3, &MONTHS, &MONTHS3];
+
+/// The person's own lists (Excel's custom lists: regions, sizes, terms),
+/// tried before the day and month names. Set by the app from its settings.
+static CUSTOM: std::sync::RwLock<Vec<std::sync::Arc<[String]>>> = std::sync::RwLock::new(Vec::new());
+/// Lists, and entries in a list, at most.
+pub const MAX_LISTS: usize = 64;
+pub const MAX_ENTRIES: usize = 256;
+
+/// Set the custom lists fills follow: each of 2 to [`MAX_ENTRIES`] entries,
+/// blank ones and repeats dropped; at most [`MAX_LISTS`].
+pub fn set_custom_lists(lists: Vec<Vec<String>>) {
+    let clean: Vec<std::sync::Arc<[String]>> = lists
+        .into_iter()
+        .filter_map(|l| {
+            let mut seen: Vec<String> = Vec::new();
+            for e in l {
+                let e = e.trim().to_string();
+                if !e.is_empty() && e.chars().count() <= 255 && !seen.iter().any(|s| s.eq_ignore_ascii_case(&e)) && seen.len() < MAX_ENTRIES {
+                    seen.push(e);
+                }
+            }
+            (seen.len() >= 2).then(|| seen.into())
+        })
+        .take(MAX_LISTS)
+        .collect();
+    *CUSTOM.write().unwrap_or_else(|e| e.into_inner()) = clean;
+}
+
+/// The custom lists now set.
+pub fn custom_lists() -> Vec<Vec<String>> {
+    CUSTOM.read().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.to_vec()).collect()
+}
 
 /// The edit that fills `to` from `src`, which `to` holds and extends one way
 /// (down, up, right or left). Only the cells of `to` outside `src` change.
@@ -261,7 +293,7 @@ fn at_step(s: &Series, x: f64) -> Value {
         }
         Series::Named { list, case, first, step } => {
             let i = (first + step * x as i64).rem_euclid(list.len() as i64) as usize;
-            let w = list[i];
+            let w = &list[i];
             Value::str(&match case {
                 Case::Title => w.to_string(),
                 Case::Upper => w.to_uppercase(),
@@ -345,7 +377,10 @@ fn months_of(ys: &[f64]) -> Option<Series> {
 
 /// Day or month names, all from one list, a fixed number apart.
 fn named_of(texts: &[&str], one: i64) -> Option<Series> {
-    for list in LISTS {
+    let custom = CUSTOM.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let builtin = LISTS.iter().map(|l| l.iter().map(|s| s.to_string()).collect::<Vec<_>>().into());
+    for list in custom.into_iter().chain(builtin) {
+        let list: std::sync::Arc<[String]> = list;
         let idx: Option<Vec<i64>> = texts.iter().map(|t| list.iter().position(|w| w.eq_ignore_ascii_case(t)).map(|i| i as i64)).collect();
         let Some(idx) = idx else { continue };
         let len = list.len() as i64;
@@ -469,6 +504,18 @@ mod tests {
         // Across: =A1+1 in C1 to the right reads B1, C1...
         fill(&wb, rect(0, 2, 0, 2), rect(0, 2, 0, 4), Mode::Series).unwrap().apply(&mut wb);
         assert_eq!(shown(&wb, 0, 4), "=C1+1");
+    }
+
+    #[test]
+    fn custom_lists_fill_in_turn() {
+        let mut wb = wb();
+        set_custom_lists(vec![vec!["Small".into(), " Medium ".into(), "".into(), "Large".into(), "small".into()], vec!["lonely".into()]]);
+        assert_eq!(custom_lists(), vec![vec!["Small".to_string(), "Medium".into(), "Large".into()]]);
+        set(&mut wb, 0, 0, "Medium");
+        fill(&wb, rect(0, 0, 0, 0), rect(0, 0, 3, 0), Mode::Series).unwrap().apply(&mut wb);
+        assert_eq!((1..=3).map(|r| shown(&wb, r, 0)).collect::<Vec<_>>(), ["Large", "Small", "Medium"]);
+        set_custom_lists(Vec::new());
+        assert!(custom_lists().is_empty());
     }
 
     #[test]

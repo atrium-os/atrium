@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use aura_ipc::{Got, Line, Reader};
 use crypta_ctl::server::{serve, Backend};
-use crypta_ctl::{lines, status, words, CreateWireGuard, Created, Details, Fail, Grant, ImportWireGuard, Profile, Res, SetProfile, Tunnel};
+use crypta_ctl::{lines, status, words, Answer, Ask, CertRequest, Certificate, CreateAnyConnect, CreateWireGuard, Created, Details, Fail, Grant, ImportWireGuard, Profile, Res, SetProfile, SsoDone, Tunnel};
 
 fn die(s: &str) -> ! {
     eprintln!("atrium-crypta-ctl: {s}");
@@ -150,6 +150,20 @@ impl Front {
         Err(Fail::new(status::UNAVAILABLE, "cryptad did not answer"))
     }
 
+    /// A request with `bytes` as a file on a pipe (written while cryptad reads).
+    fn call_file(&self, l: &Line, bytes: Vec<u8>) -> Res<Vec<Line>> {
+        let (r, w) = pipe().map_err(|e| Fail(status::FAILED, e.to_string()))?;
+        let writer = std::thread::spawn(move || {
+            let mut f = std::fs::File::from(w);
+            let _ = f.write_all(&bytes);
+        });
+        let res = self.call(l, Some(r.as_raw_fd()));
+        drop(r);
+        let _ = writer.join();
+        let _ = self.kick.lock().unwrap_or_else(|e| e.into_inner()).send(());
+        res
+    }
+
     fn change(&self, l: &Line) -> Res<()> {
         let r = self.call(l, None).map(|_| ());
         let _ = self.kick.lock().unwrap_or_else(|e| e.into_inner()).send(());
@@ -209,11 +223,12 @@ impl Backend for Front {
     }
 
     fn details(&self, name: String) -> Res<Details> {
-        self.call(&Line::new("list"), None)?
-            .iter()
-            .filter(|l| l.get("name") == Some(name.as_str()))
-            .find_map(lines::details)
-            .ok_or_else(|| Fail::new(status::FAILED, "no such tunnel"))
+        let l = self.call(&Line::new("list"), None)?.into_iter().find(|l| l.get("name") == Some(name.as_str()));
+        let mut d = l.as_ref().and_then(lines::details).ok_or_else(|| Fail::new(status::FAILED, "no such tunnel"))?;
+        if l.is_some_and(|l| l.get("banner") == Some("1")) {
+            d.banner = self.call(&Line::new("banner").with("name", &name), None).ok().and_then(|v| lines::banner(&v));
+        }
+        Ok(d)
     }
 
     fn import(&self, i: ImportWireGuard) -> Res<Created> {
@@ -255,6 +270,42 @@ impl Backend for Front {
     fn remove(&self, name: String) -> Res<()> {
         self.log(&format!("remove {name}"));
         self.change(&Line::new("delete").with("name", name))
+    }
+
+    fn create_ac(&self, c: CreateAnyConnect) -> Res<String> {
+        self.log(&format!("create-ac {} {}", c.name, c.host));
+        self.call_file(&lines::create_ac(&c), c.ca)?;
+        Ok(c.name)
+    }
+
+    fn prompt(&self, name: String) -> Res<Option<Ask>> {
+        match self.call(&Line::new("prompt").with("name", name), None) {
+            Ok(v) => Ok(lines::ask(&v)),
+            Err(Fail(_, w)) if w == words("no-prompt") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn answer(&self, a: Answer) -> Res<()> {
+        self.log(&format!("answer {} ({} values)", a.name, a.values.as_ref().map_or(0, Vec::len)));
+        self.change(&lines::answer(&a))
+    }
+
+    fn sso_done(&self, s: SsoDone) -> Res<()> {
+        self.change(&Line::new("sso-done").with("name", s.name).with("ok", s.ok as u8))
+    }
+
+    fn cert_request(&self, c: CertRequest) -> Res<String> {
+        let mut l = Line::new("csr").with("name", &c.name);
+        if let Some(cn) = &c.cn {
+            l = l.with_hex("cn", cn.as_bytes());
+        }
+        let v = self.call(&l, None)?;
+        v.iter().find(|l| l.verb == "csr").and_then(|l| l.hex("pem")).and_then(|p| String::from_utf8(p).ok()).ok_or_else(|| Fail::new(status::FAILED, "cryptad's answer did not parse"))
+    }
+
+    fn certificate(&self, c: Certificate) -> Res<()> {
+        self.call_file(&Line::new("certificate").with("name", &c.name), c.pem).map(|_| ())
     }
 }
 

@@ -57,7 +57,7 @@ impl VpnShown {
 
     pub fn look(&self) -> Look {
         let v = self.tunnels.as_deref().unwrap_or(&[]);
-        if v.iter().any(|t| t.state == State::Connecting) {
+        if v.iter().any(|t| matches!(t.state, State::Connecting | State::SignIn)) {
             Look::Connecting
         } else if v.iter().any(|t| t.state == State::Up) {
             Look::Up
@@ -80,6 +80,8 @@ pub fn menu(n: &VpnShown) -> (Vec<MenuItem>, Vec<Option<VpnAction>>) {
         let (label, act) = match t.state {
             State::Up => (format!("Disconnect {} (connected{whom})", t.name), VpnAction::Disconnect(t.name.clone())),
             State::Connecting => (format!("Disconnect {} (connecting{whom})", t.name), VpnAction::Disconnect(t.name.clone())),
+            // vpn.md §7.4: the sign-in is on Settings' VPN page.
+            State::SignIn => (format!("Disconnect {} (sign in on Settings' VPN page{whom})", t.name), VpnAction::Disconnect(t.name.clone())),
             State::Down => (format!("Connect {}", t.name), VpnAction::Connect(t.name.clone())),
         };
         let it = MenuItem::new(label);
