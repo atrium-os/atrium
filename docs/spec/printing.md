@@ -775,13 +775,15 @@ Sheets and Slides print (2026-11-18): `officina_pdf::sheet` pages a sheet down, 
 across, each cell as the grid draws it (formatted text, fill, borders, data bars, "###"
 for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; a merged area prints as one cell, as the grid draws it, cut where it crosses a page, with its text on the page that has its first cell; Center Across Selection text is centred across its run with no lines inside, as on screen; frozen rows and columns repeat on every page as print titles; and
 `officina_pdf::slides` draws a page per slide from the display list the editor draws
-(hidden slides left out), fitted on the paper. Slides’ Print menu also offers
+fitted on the paper. Slides’ Print menu also offers
 Speaker Notes with a thumbnail above the notes. Long notes continue onto further
 pages with the thumbnail repeated. Two-slide handouts stack the thumbnails.
 Three-slide handouts leave ruled writing space beside each thumbnail. Four- and
 six-slide handouts use two columns, and nine-slide handouts use a three-by-three
-grid. Handouts fill in slide order across each row before moving down. All layouts
-skip hidden slides and survive a paper or orientation change in the print sheet.
+grid. Handouts fill in slide order across each row before moving down. The Print
+menu’s Include Hidden Slides checkbox is off by default and applies to slides,
+speaker notes, and handouts. The layout and checkbox setting are captured for
+the print session and preserved when paper or orientation changes.
 Gradients are bands of solid colour,
 since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout
 with a new layout for the paper and orientation chosen. Gates in

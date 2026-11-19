@@ -1,7 +1,7 @@
 //! A deck as PDF (printing from Slides): a page per slide, drawn from the
 //! slide's display list (officina_slides::draw), the same one the editor,
 //! thumbnails and presenting draw, so a printed slide looks like it does on
-//! screen. Hidden slides are left out. Gradients are PDF shadings, pictures
+//! screen. Hidden slides are left out by default. Gradients are PDF shadings, pictures
 //! are written once however many slides show them, text is real text.
 
 use std::io::{self, Write};
@@ -188,6 +188,13 @@ pub enum PrintLayout {
     HandoutNine,
 }
 
+/// App choices captured for the whole print session, including relayouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrintOptions {
+    pub layout: PrintLayout,
+    pub include_hidden: bool,
+}
+
 /// Writes the visible slides, one per page.
 pub fn export<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Printed)> {
     export_layout(deck, paper, PrintLayout::Slides, fonts, files, title, out, progress)
@@ -195,6 +202,12 @@ pub fn export<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, fonts: &dyn 
 
 #[allow(clippy::too_many_arguments)]
 pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layout: PrintLayout, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Printed)> {
+    export_with_options(deck, paper, PrintOptions { layout, include_hidden: false }, fonts, files, title, out, progress)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn export_with_options<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, options: PrintOptions, fonts: &dyn Fonts, files: &dyn FontFiles, title: &str, out: W, progress: &mut dyn FnMut(usize, usize)) -> io::Result<(W, Printed)> {
+    let PrintOptions { layout, include_hidden } = options;
     let slide_size = [deck.size.0.max(1) as f64 / U, deck.size.1.max(1) as f64 / U];
     let (pw, ph) = paper.map_or((slide_size[0], slide_size[1]), |(w, h)| (w.clamp(72.0, 14400.0), h.clamp(72.0, 14400.0)));
     let margin = 36.0f64.min(pw.min(ph) / 8.0);
@@ -220,7 +233,7 @@ pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layou
     for i in 0..total {
         let items = draw::draw_slide(deck, i, fonts, &mut draw_notes);
         let slide = deck.slide_if_loaded(i);
-        if slide.is_some_and(|sl| sl.hidden) {
+        if !include_hidden && slide.is_some_and(|sl| sl.hidden) {
             printed.hidden += 1;
         } else {
             let items = items.unwrap_or_else(|_| {
@@ -332,8 +345,12 @@ pub fn print(deck: &mut Deck, paper: Option<(f64, f64)>, title: &str) -> io::Res
 }
 
 pub fn print_layout(deck: &mut Deck, paper: Option<(f64, f64)>, title: &str, layout: PrintLayout) -> io::Result<(Vec<u8>, Printed)> {
+    print_with_options(deck, paper, title, PrintOptions { layout, include_hidden: false })
+}
+
+pub fn print_with_options(deck: &mut Deck, paper: Option<(f64, f64)>, title: &str, options: PrintOptions) -> io::Result<(Vec<u8>, Printed)> {
     let fonts = officina_text::layout::PinnedFonts::new().map_err(io::Error::other)?;
-    export_layout(deck, paper, layout, &fonts, &fonts, title, Vec::new(), &mut |_, _| {})
+    export_with_options(deck, paper, options, &fonts, &fonts, title, Vec::new(), &mut |_, _| {})
 }
 
 /// EMU to a point.

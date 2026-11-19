@@ -195,6 +195,24 @@ fn print_layouts_paginate_notes_and_pack_visible_slides() {
 }
 
 #[test]
+fn including_hidden_slides_adds_them_to_every_print_layout() {
+    use slides::{PrintLayout, PrintOptions};
+    let fonts = PinnedFonts::new().unwrap();
+    let mut deck = deck();
+    for (layout, pages) in [
+        (PrintLayout::Slides, 3),
+        (PrintLayout::SpeakerNotes, 3),
+        (PrintLayout::HandoutTwo, 2),
+    ] {
+        let options = PrintOptions { layout, include_hidden: true };
+        let (_, printed) = slides::export_with_options(&mut deck, Some((595.0, 842.0)), options, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
+        assert_eq!(printed.hidden, 0);
+        assert_eq!(printed.stats.pages, pages);
+        assert!(deck.slide_if_loaded(1).unwrap().hidden);
+    }
+}
+
+#[test]
 fn on_paper_slides_are_fitted_and_centred() {
     let fonts = PinnedFonts::new().unwrap();
     let mut d = deck();

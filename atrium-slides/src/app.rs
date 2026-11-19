@@ -178,6 +178,7 @@ pub struct Slides {
     deck_key: Rc<Cell<u64>>,
     new_menu: Mutable<MenuState>,
     print_menu: Mutable<MenuState>,
+    print_hidden: Mutable<bool>,
     shape_menu: Mutable<MenuState>,
     arrange_menu: Mutable<MenuState>,
     /// Device px per point.
@@ -231,10 +232,15 @@ impl Slides {
             deck_key: Rc::new(Cell::new(1)),
             new_menu: Mutable::new(MenuState::default()),
             print_menu: Mutable::new(MenuState::default()),
+            print_hidden: Mutable::new(false),
             shape_menu: Mutable::new(MenuState::default()),
             arrange_menu: Mutable::new(MenuState::default()),
             scale: Rc::new(Cell::new(1.0)),
         }
+    }
+
+    pub fn include_hidden_in_print(&self) -> bool {
+        self.print_hidden.get()
     }
 
     pub fn changed(&self) {
@@ -1206,11 +1212,15 @@ impl View for Slides {
                 ("Handout (6 Slides)", PrintLayout::HandoutSix),
                 ("Handout (9 Slides)", PrintLayout::HandoutNine),
             ];
-            let items = layouts.iter().map(|(label, _)| MenuItem::new(*label)).collect();
+            let mut items: Vec<_> = layouts.iter().map(|(label, _)| MenuItem::new(*label)).collect();
+            items.push(MenuItem::new("Include Hidden Slides").checked(self.include_hidden_in_print()).separated());
             let cmds = self.cmds.clone();
+            let print_hidden = self.print_hidden.clone();
             MenuButton::new("Print", self.print_menu.clone(), items, move |i| {
                 if let Some(&(_, layout)) = layouts.get(i) {
                     cmds.lock().unwrap().push(Cmd::Print(layout));
+                } else if i == layouts.len() {
+                    print_hidden.set(!print_hidden.get());
                 }
             }).at(x, 8.0).width(64.0).render(ctx);
             x += 72.0;
