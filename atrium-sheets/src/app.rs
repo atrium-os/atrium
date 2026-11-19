@@ -1192,7 +1192,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) | GridAction::FitCol(_) => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1356,6 +1356,20 @@ impl View for Sheets {
                 GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
                 // A filter column's button: its value list.
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
+                // A double-click on a column's edge: as wide as its widest entry.
+                GridAction::FitCol(col) => {
+                    let w = src.fit_width(col);
+                    let mut d = doc.borrow_mut();
+                    match w {
+                        Some(w) => {
+                            d.size_preview(false, col, w);
+                            d.size_done();
+                        }
+                        None => d.status = "That column is empty.".into(),
+                    }
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
                 // A double-click on the fill handle: down along the data beside it.
                 GridAction::FillToData(sel) => {
                     let mut d = doc.borrow_mut();

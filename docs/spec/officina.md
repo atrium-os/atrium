@@ -3783,8 +3783,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 
 - **Grid** (pergola): a press within 4 px of a row label's bottom edge drags that row's height (at least 6 px), as a column label's right edge drags its width; elsewhere on the label it still selects the row. It sends `GridAction::ResizeRow` while dragging and `GridAction::ResizeEnd` when let go (for columns too).
 - **Sheets:** the drag shows live (`Doc::size_preview`, not journaled), and letting go makes it one undoable `GridOp::Sizes` ("Row Height" or "Column Width", `Doc::size_done`). Column widths used to change without undo.
-- **Not yet:** double-clicking an edge to fit the contents, sizing several selected rows or columns at once, and a Row Height… / Column Width… box for exact numbers.
-- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`; atrium-sheets `a_dragged_edge_is_one_undo_step`.
+- **Fit a column** (2026-11-19): a double-click on a column label's right edge sends `GridAction::FitCol`; Sheets sets the column to its widest shown entry (`SheetSource::fit_width`: shown rows, cells not merged across columns, at most 200,000 cells read; pergola `needed_width` measures a cell view's widest line with its indent, icon and padding), as one undo step. An empty column is left alone.
+- **Not yet:** fitting rows to wrapped text, fitting several selected columns at once, sizing several rows or columns by one drag, and a Row Height… / Column Width… box for exact numbers.
+- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

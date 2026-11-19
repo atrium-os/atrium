@@ -427,6 +427,9 @@ pub struct GridState {
     /// When the fill handle was last pressed: a second press soon after is
     /// a double-click.
     fill_press: Option<std::time::Instant>,
+    /// The column edge last pressed, and when: a second press soon after is
+    /// a double-click (fit the column).
+    edge_press: Option<(u32, std::time::Instant)>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -456,6 +459,9 @@ pub enum GridAction {
     ResizeRow { row: u32, height: f64 },
     /// A column or row resize let go: the sizes it left are final.
     ResizeEnd,
+    /// A double-click on column `col`'s right edge: fit it to what it
+    /// holds (the app measures, with [`needed_width`]).
+    FitCol(u32),
     Undo,
     Redo,
     Copy(CellRange),
@@ -1011,6 +1017,17 @@ impl GridView {
                         } else {
                             None
                         };
+                        let now = std::time::Instant::now();
+                        if let Some(k) = grip.filter(|k| g.edge_press.is_some_and(|(c, t)| c == *k && now.duration_since(t) < DOUBLE_CLICK)) {
+                            g.edge_press = None;
+                            g.drag = Drag::None;
+                            gst.set(g);
+                            if let Some(a) = &act {
+                                a(GridAction::FitCol(k));
+                            }
+                            return;
+                        }
+                        g.edge_press = grip.map(|k| (k, now));
                         match grip {
                             Some(k) => g.drag = Drag::Resize { col: k, x0: p.x, w0: src.col_left(k + 1) - src.col_left(k) },
                             None => {
@@ -1416,6 +1433,18 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
 
 /// Columns text may run over beside its cell, at most.
 pub const SPILL_COLS: u32 = 32;
+
+/// The width cell view `cv` needs to show whole, px: its widest line, its
+/// indent, an icon, and the cell's padding. For fitting a column.
+pub fn needed_width(cv: &CellView) -> f64 {
+    if cv.text.is_empty() {
+        return 0.0;
+    }
+    let st = cell_style(cv, &crate::theme::Semantic::LIGHT);
+    let w = cv.text.lines().map(|l| crate::text::measure(l, &st).w).fold(0.0f32, f32::max);
+    let icon = if cv.icon.is_some() { TEXT_SIZE + 4.0 } else { 0.0 };
+    (w + 2.0 * PAD + cv.indent as f32 * INDENT_STEP + icon + 2.0).ceil() as f64
+}
 
 fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
     TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) }
@@ -2478,6 +2507,25 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 70.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 3, c0: 0, r1: 3, c1: 19 });
+    }
+
+    #[test]
+    fn a_double_click_on_a_column_edge_asks_to_fit_it() {
+        let (mut app, _, _, _, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        let edge = Point::new(hw + 128.0 - 1.0, HEADER_H / 2.0);
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at: edge });
+            app.handle_event(Event::PointerUp { at: edge });
+            app.tick();
+        }
+        assert_eq!(log.borrow().last(), Some(&GridAction::FitCol(1)));
+        // Longer text needs more; an indent adds a step.
+        let a = needed_width(&CellView::text("abc"));
+        let b = needed_width(&CellView::text("abcdefghij"));
+        assert!(b > a && a > 2.0 * PAD as f64, "{a} {b}");
+        assert_eq!(needed_width(&CellView { indent: 1, ..CellView::text("abc") }), a + INDENT_STEP as f64);
     }
 
     #[test]
