@@ -341,7 +341,8 @@ pub enum Request {
     /// ★ The apps that open `mime`, for the file manager's Open and Open
     /// with (docs/spec/opening-files.md §6.1). Only from the session's file
     /// manager (its INSTALLED manifest holds `removable-files`), as for
-    /// dispensatord's CONNECT. Answer: `OpenApps`.
+    /// dispensatord's CONNECT, or from an app holding `open-attachments`
+    /// (Mail's Open with…, mail.md §8.2). Answer: `OpenApps`.
     OpenApps { mime: String },
 
     /// ★ Open a file in an app (opening-files.md §6.2). Only from the
@@ -371,11 +372,15 @@ pub enum Request {
     /// grow or shrink), read-only memory file, never a path. portcullisd
     /// decides the type from its bytes and `name` itself, refuses programs,
     /// shortcuts and names that lie, and hands it read-only to the person's
-    /// default app for the type, as `OpenFile` does. Answer: `Opened`.
+    /// default app for the type, as `OpenFile` does; or to `app` (Open
+    /// with…), which must open the type portcullisd decided. Answer:
+    /// `Opened`.
     OpenAttachment {
         /// The attachment's own name: never a path.
         name:       String,
         activation: [u8; 16],
+        #[serde(default)]
+        app:        Option<String>,
     },
 
     /// ★ Save a download (personas.md §4.1, navigator-ui.md §6.4). Only

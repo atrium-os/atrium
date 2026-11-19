@@ -84,6 +84,8 @@ pub mod flag {
     /// spam, or isn't; servers' filters learn from them.
     pub const JUNK: u32 = 64;
     pub const NOT_JUNK: u32 = 128;
+    /// `$Phishing` (mail.md §7.7): reported as phishing, with `$Junk`.
+    pub const PHISHING: u32 = 256;
 
     /// IMAP system flags → bits (others ignored).
     pub fn from_imap<S: AsRef<str>>(flags: &[S]) -> u32 {
@@ -97,6 +99,7 @@ pub mod flag {
                 "$snoozed" => SNOOZED,
                 "$junk" => JUNK,
                 "$notjunk" => NOT_JUNK,
+                "$phishing" => PHISHING,
                 _ => 0,
             }
         })

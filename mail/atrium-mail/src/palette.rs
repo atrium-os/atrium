@@ -23,6 +23,8 @@ pub enum Cmd {
     Delete,
     /// To Junk, or (in Junk) Not junk (§7.7).
     Junk,
+    /// Report phishing: to Junk, marked `$Phishing` too (§7.7).
+    Phishing,
     Later,
     Done,
     Drop,

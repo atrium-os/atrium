@@ -267,14 +267,29 @@ pub struct FileAsk {
     pub act: FileAct,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAct {
     /// Show it in a viewer in [`LOOK_SLOT`].
     Look,
-    /// Open in its app, with the press that asked.
-    Open { activation: [u8; 16] },
+    /// Open in its app (the person's default, or `app`: Open with…), with
+    /// the press that asked.
+    Open { activation: [u8; 16], app: Option<String> },
+    /// Find the apps that open it (Open with…); the app answers with
+    /// [`Mail::open_with_apps`].
+    Apps,
     /// Save through the picker.
     Save,
+}
+
+/// Open with… for one attachment (§8.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenWith {
+    /// The message's place in the reader, and the file's in it.
+    pub k: usize,
+    pub i: usize,
+    pub name: String,
+    /// (id, name, default); `None` while asked; `Err` why not.
+    pub apps: Option<Result<Vec<(String, String, bool)>, String>>,
 }
 
 /// A search (§11.2): what is typed, and what it finds. While it is up the
@@ -355,6 +370,8 @@ pub struct Ui {
     pub overdue: usize,
     /// The Later sheet (`l`): what it is for, then when.
     pub later_sheet: Option<u8>,
+    /// Open with… (§8.2): the attachment and its apps, once known.
+    pub open_with: Option<OpenWith>,
     /// The sheet's one-line note, and whether it is being typed (`n`).
     pub later_note: String,
     pub later_noting: bool,
@@ -1243,7 +1260,55 @@ impl Mail {
             self.file_note("Open needs a press of the button.".into());
             return;
         };
-        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Open { activation } });
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Open { activation, app: None } });
+    }
+
+    /// Open with… (§8.2): ask which apps open it; the choices show when
+    /// they come.
+    pub fn ask_open_with(&self, k: usize, i: usize) {
+        let Some((msg, file)) = self.file_at(k, i) else { return };
+        if !file.can_open || file.mime.is_none() {
+            self.file_note(file.warn.clone().unwrap_or_else(|| "No app opens this kind of file.".into()));
+            return;
+        }
+        let name = file.name.clone();
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Apps });
+        let mut ui = self.ui.get_cloned();
+        ui.open_with = Some(OpenWith { k, i, name, apps: None });
+        self.ui.set(ui);
+    }
+
+    /// The apps for the attachment Open with… asked about.
+    pub fn open_with_apps(&self, name: &str, apps: Result<Vec<(String, String, bool)>, String>) {
+        let mut ui = self.ui.get_cloned();
+        if let Some(o) = ui.open_with.as_mut().filter(|o| o.name == name) {
+            o.apps = Some(apps);
+            self.ui.set(ui);
+        }
+    }
+
+    /// Open the attachment in app `app`, chosen with a press.
+    pub fn open_with(&self, app: &str, activation: Option<[u8; 16]>) {
+        let Some(o) = self.ui.get_cloned().open_with else { return };
+        let Some((msg, file)) = self.file_at(o.k, o.i) else { return };
+        let Some(activation) = activation else {
+            self.file_note("Open needs a press of the button.".into());
+            return;
+        };
+        let mut ui = self.ui.get_cloned();
+        ui.open_with = None;
+        self.ui.set(ui);
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Open { activation, app: Some(app.to_string()) } });
+    }
+
+    pub fn close_open_with(&self) -> bool {
+        let open = self.ui.get_cloned().open_with.is_some();
+        if open {
+            let mut ui = self.ui.get_cloned();
+            ui.open_with = None;
+            self.ui.set(ui);
+        }
+        open
     }
 
     /// Save through the picker (§8.2).
@@ -1416,6 +1481,7 @@ impl Mail {
             mail_engine::Action::Delete => "deleted",
             mail_engine::Action::Junk(true) => "moved to Junk",
             mail_engine::Action::Junk(false) => "moved to the inbox",
+            mail_engine::Action::Phishing => "reported as phishing",
             _ => "changed",
         };
         let what = if r.msgs.len() > 1 && ui.conversations { "Conversation" } else { "Message" };
@@ -2523,6 +2589,9 @@ impl Mail {
             self.close_side();
             return true;
         }
+        if *key == Key::Escape && self.close_open_with() {
+            return true;
+        }
         if ui.link.is_some() {
             match key {
                 Key::Enter => {
@@ -2692,6 +2761,9 @@ impl Mail {
                 add("Archive".into(), "e", Cmd::Archive);
                 add("Delete".into(), "#", Cmd::Delete);
                 add(if self.reading_junk() { "Not junk".into() } else { "Move to Junk".into() }, "!", Cmd::Junk);
+                if !self.reading_junk() {
+                    add("Report phishing".into(), "", Cmd::Phishing);
+                }
             }
             add("Later…".into(), "l", Cmd::Later);
             if r.later.is_some() {
@@ -2797,6 +2869,7 @@ impl Mail {
             Cmd::Archive => self.act(mail_engine::Action::Archive),
             Cmd::Delete => self.act(mail_engine::Action::Delete),
             Cmd::Junk => self.junk(),
+            Cmd::Phishing => self.act(mail_engine::Action::Phishing),
             Cmd::Later => self.ask_later(),
             Cmd::Done => {
                 self.later_done();
@@ -3768,6 +3841,62 @@ impl MailView {
         if let Some(k) = ui.later_sheet {
             self.later_sheet(ctx, k, x0 + w - 16.0, read_head_h() + 8.0);
         }
+        if let Some(o) = &ui.open_with {
+            self.open_with_sheet(ctx, o, x0 + w - 16.0, read_head_h() + 8.0);
+        }
+    }
+
+    /// Open with… (§8.2): the apps that open the attachment, the default
+    /// marked; a press on one opens it there.
+    fn open_with_sheet(&self, ctx: &mut Ctx, o: &OpenWith, right: f32, y0: f32) {
+        let t = ctx.theme;
+        let row_h = em(30.0);
+        let sw = em(300.0);
+        let rows = match &o.apps {
+            Some(Ok(a)) => a.len().max(1),
+            _ => 1,
+        };
+        let sh = em(44.0) + rows as f32 * row_h + row_h + em(8.0);
+        let (sx, sy) = (right - sw, y0);
+        ctx.push(Node::Rect { rect: Rect::new(sx - 1.0, sy - 1.0, sw + 2.0, sh + 2.0), fill: t.border_strong(), radius: 9.0 });
+        ctx.add(Node::Rect { rect: Rect::new(sx, sy, sw, sh), fill: t.bg_window(), radius: 8.0 });
+        let title = fit(&format!("Open {} with", o.name), type_size::SM, Weight::Semibold, sw - em(24.0));
+        text(ctx, sx + em(12.0), sy + em(22.0), &title, type_size::SM, Weight::Semibold, t.text_primary());
+        let mut y = sy + em(40.0);
+        match &o.apps {
+            None => {
+                text(ctx, sx + em(12.0), y + row_h / 2.0, "Finding apps…", type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            Some(Err(why)) => {
+                text(ctx, sx + em(12.0), y + row_h / 2.0, &fit(why, type_size::SM, Weight::Regular, sw - em(24.0)), type_size::SM, Weight::Regular, t.warning_fg());
+            }
+            Some(Ok(apps)) if apps.is_empty() => {
+                text(ctx, sx + em(12.0), y + row_h / 2.0, "No app opens this kind of file.", type_size::SM, Weight::Regular, t.text_secondary());
+            }
+            Some(Ok(apps)) => {
+                for (id, name, default) in apps {
+                    let (m, id) = (self.mail.clone(), id.clone());
+                    area(ctx, Rect::new(sx + em(6.0), y, sw - em(12.0), row_h), Color::TRANSPARENT, move || m.open_with(&id, pergola::clipboard::current_activation()));
+                    text(ctx, sx + em(12.0), y + row_h / 2.0, &fit(name, type_size::SM, Weight::Regular, sw - em(100.0)), type_size::SM, Weight::Regular, t.text_primary());
+                    if *default {
+                        let d = "default";
+                        text(ctx, sx + sw - em(12.0) - width(d, type_size::XS, Weight::Regular), y + row_h / 2.0, d, type_size::XS, Weight::Regular, t.text_tertiary());
+                    }
+                    ctx.pop();
+                    y += row_h;
+                }
+                y -= row_h;
+            }
+        }
+        y += row_h + em(4.0);
+        let m = self.mail.clone();
+        let cw = width("Cancel", type_size::XS, Weight::Medium) + em(16.0);
+        area(ctx, Rect::new(sx + sw - em(12.0) - cw, y, cw, em(24.0)), Color::TRANSPARENT, move || {
+            m.close_open_with();
+        });
+        text(ctx, sx + sw - em(12.0) - cw + em(8.0), y + em(12.0), "Cancel", type_size::XS, Weight::Medium, t.accent_fg());
+        ctx.pop();
+        ctx.pop();
     }
 
     /// The command palette (§15.5): what is typed, then what it finds,
@@ -4272,6 +4401,8 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             let mm = mail.clone();
             button(ctx, "Save", Box::new(move || mm.save_file(k, i)));
             if f.can_open {
+                let mm = mail.clone();
+                button(ctx, "Open with…", Box::new(move || mm.ask_open_with(k, i)));
                 let mm = mail.clone();
                 button(ctx, "Open", Box::new(move || mm.open_file(k, i, pergola::clipboard::current_activation())));
             }

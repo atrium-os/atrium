@@ -49,7 +49,7 @@ fn list_is_newest_first_and_dedups_by_server_id() {
     s.write(|w| w.clear_folder(inbox)).unwrap();
     assert_eq!(s.count(inbox).unwrap(), 0);
     assert_eq!(s.uids(inbox).unwrap(), Vec::<u32>::new());
-    assert_eq!(flag::from_imap(&["\\Seen", "\\Answered", "$Junk", "$Forwarded"]), flag::SEEN | flag::ANSWERED | flag::JUNK);
+    assert_eq!(flag::from_imap(&["\\Seen", "\\Answered", "$Junk", "$Phishing", "$Forwarded"]), flag::SEEN | flag::ANSWERED | flag::JUNK | flag::PHISHING);
 }
 
 #[test]

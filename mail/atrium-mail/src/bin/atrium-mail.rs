@@ -412,6 +412,8 @@ fn main() {
     let mut looked: Option<(u64, mail_schema::Which, limen::proto::EmbedId)> = None;
     // What became of Open and Save, from their threads.
     let (file_done_tx, file_done) = mpsc::channel::<String>();
+    // Open with…: the apps for an attachment, by its name.
+    let (apps_tx, apps_done) = mpsc::channel::<(String, Result<Vec<(String, String, bool)>, String>)>();
     // One-press unsubscribes (§11.3): each a POST through a fetcher of its
     // own, on a thread; (message, what came of it) back.
     let (unsub_tx, unsub_done) = mpsc::channel::<(u64, Result<(), String>)>();
@@ -706,6 +708,9 @@ fn main() {
                 }
             }
         }
+        while let Ok((name, apps)) = apps_done.try_recv() {
+            mail.open_with_apps(&name, apps);
+        }
         while let Ok(note) = file_done.try_recv() {
             mail.file_note(note);
         }
@@ -732,13 +737,19 @@ fn main() {
             match ask.act {
                 // The viewer follows `looking()` below.
                 FileAct::Look => {}
-                FileAct::Open { activation } => match engine.attachment(ask.msg, &ask.file.which).map_err(|e| e.to_string()).and_then(|a| atrium_mail::files::sealed(&a.bytes).map_err(|e| e.to_string())) {
+                FileAct::Apps => {
+                    let (tx, name, mime) = (apps_tx.clone(), ask.file.name.clone(), ask.file.mime.unwrap_or_default());
+                    std::thread::spawn(move || {
+                        let _ = tx.send((name, atrium_mail::files::apps_for(mime)));
+                    });
+                }
+                FileAct::Open { activation, app } => match engine.attachment(ask.msg, &ask.file.which).map_err(|e| e.to_string()).and_then(|a| atrium_mail::files::sealed(&a.bytes).map_err(|e| e.to_string())) {
                     // The hand-over may start an app: off the window's thread.
                     Ok(fd) => {
                         mail.file_note(format!("Opening {}…", ask.file.name));
                         let (tx, name) = (file_done_tx.clone(), ask.file.name.clone());
                         std::thread::spawn(move || {
-                            let r = atrium_mail::files::open_in_app(&name, activation, &fd);
+                            let r = atrium_mail::files::open_in_app(&name, activation, &fd, app.as_deref());
                             let _ = tx.send(match r {
                                 Ok(app) => format!("Opened {name} in {app}"),
                                 Err(why) => format!("Couldn't open {name}: {why}"),

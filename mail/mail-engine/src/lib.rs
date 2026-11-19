@@ -669,7 +669,7 @@ impl Sink for AccountSink<'_> {
 
 /// Flag bits as IMAP's system flags (and the `$Snoozed` keyword).
 fn imap_flags(bits: u32) -> Vec<String> {
-    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft"), (flag::SNOOZED, "$Snoozed"), (flag::JUNK, "$Junk"), (flag::NOT_JUNK, "$NotJunk")]
+    [(flag::SEEN, "\\Seen"), (flag::ANSWERED, "\\Answered"), (flag::FLAGGED, "\\Flagged"), (flag::DRAFT, "\\Draft"), (flag::SNOOZED, "$Snoozed"), (flag::JUNK, "$Junk"), (flag::NOT_JUNK, "$NotJunk"), (flag::PHISHING, "$Phishing")]
         .iter()
         .filter(|(b, _)| bits & b != 0)
         .map(|(_, n)| n.to_string())
@@ -688,6 +688,8 @@ pub enum Action {
     /// To Junk, marked `$Junk` (true); out of Junk to the inbox, marked
     /// `$NotJunk` (false). The server's filter learns from both (§7.7).
     Junk(bool),
+    /// Reported as phishing: to Junk, marked `$Junk` and `$Phishing`.
+    Phishing,
 }
 
 /// How long a list action can be undone before sync makes it (§15.5).
@@ -707,10 +709,15 @@ impl Engine {
             }
             Ok(None)
         };
-        if let Action::Junk(on) = action {
+        if let Action::Junk(_) | Action::Phishing = action {
+            let on = action != Action::Junk(false);
             let roles: &[Role] = if on { &[Role::Junk] } else { &[Role::Inbox] };
             let Some(to) = role_folder(roles)? else { return Err(Error::Refused("This account has no Junk folder")) };
-            let (add, remove) = if on { (flag::JUNK, flag::NOT_JUNK) } else { (flag::NOT_JUNK, flag::JUNK) };
+            let (add, remove) = match action {
+                Action::Phishing => (flag::JUNK | flag::PHISHING, flag::NOT_JUNK),
+                _ if on => (flag::JUNK, flag::NOT_JUNK),
+                _ => (flag::NOT_JUNK, flag::JUNK | flag::PHISHING),
+            };
             let due = now() + UNDO_SECS;
             let mut ids = Vec::new();
             self.store.write(|w| {
@@ -743,7 +750,7 @@ impl Engine {
                 Some(to) if to != folder => (OpKind::Move { to }, now() + UNDO_SECS),
                 _ => (OpKind::Expunge, now() + UNDO_SECS),
             },
-            Action::Junk(_) => unreachable!(),
+            Action::Junk(_) | Action::Phishing => unreachable!(),
         };
         let mut ids = Vec::new();
         self.store.write(|w| {

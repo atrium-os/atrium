@@ -707,8 +707,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
         /* ★ Attachments (mail.md §8.2): from a mail app, by its installed
          * manifest's `open-attachments`; a sealed memory file follows. */
-        if let Request::OpenAttachment { name, activation } = req {
-            handle_open_attachment(uid, &owner, &name, activation, &shared, &mut writer, &reader)?;
+        if let Request::OpenAttachment { name, activation, app } = req {
+            handle_open_attachment(uid, &owner, &name, activation, app.as_deref(), &shared, &mut writer, &reader)?;
             continue;
         }
         /* ★ Downloads (personas.md §4.1): from the Navigator, into its
@@ -1470,7 +1470,9 @@ fn handle_open(
     };
     let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
         .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
-    if !caller.as_deref().is_some_and(launch::app_is_file_manager) {
+    // A mail app may ask which apps open a type (Open with…), not open files.
+    let mail_asks = matches!(req, Request::OpenApps { .. }) && caller.as_deref().is_some_and(launch::app_opens_attachments);
+    if !mail_asks && !caller.as_deref().is_some_and(launch::app_is_file_manager) {
         return refuse(writer, format!("cap.open.denied: only the file manager opens files in apps (caller {})",
                                       caller.as_deref().unwrap_or("is not a launched app")));
     }
@@ -1700,6 +1702,7 @@ fn handle_open_attachment(
     owner:      &str,
     name:       &str,
     activation: [u8; 16],
+    chosen:     Option<&str>,
     shared:     &Mutex<Tenants>,
     writer:     &mut UnixStream,
     reader:     &BufReader<UnixStream>,
@@ -1739,7 +1742,12 @@ fn handle_open_attachment(
     };
     let apps = launch::apps_opening(t.mime);
     let defaults = Defaults::load(&Defaults::user_path(owner)).unwrap_or_default();
-    let app = defaults.app_for(t.mime, |id| apps.iter().any(|(a, _, _)| a == id)).or_else(|| apps.first().map(|a| a.0.clone()));
+    // Open with…: only an app that opens the type decided here.
+    let app = match chosen {
+        Some(c) if apps.iter().any(|(a, _, _)| a == c) => Some(c.to_string()),
+        Some(c) => return refuse(writer, format!("{c} doesn't open {}", t.words)),
+        None => defaults.app_for(t.mime, |id| apps.iter().any(|(a, _, _)| a == id)).or_else(|| apps.first().map(|a| a.0.clone())),
+    };
     let Some(app) = app else {
         return refuse(writer, format!("No app opens {} yet", t.words));
     };

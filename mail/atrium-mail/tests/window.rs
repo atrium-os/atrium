@@ -466,12 +466,22 @@ fn archive_delete_and_undo_from_the_keyboard() {
     assert!(pending.iter().any(|(_, o)| o.kind == mail_store::OpKind::Flags { add: mail_store::flag::JUNK, remove: mail_store::flag::NOT_JUNK }), "{pending:?}");
     assert!(mail.key(&key("z"), None));
     assert_eq!(subjects(&mail), ["Three", "Two"]);
+    // Report phishing (§7.7): to Junk, marked $Junk and $Phishing; undone.
+    mail.open(0);
+    let report = mail.palette_entries().into_iter().find(|e| e.label == "Report phishing").expect("offered");
+    mail.run_cmd(report.cmd);
+    assert_eq!(mail.ui.get_cloned().undo.unwrap().label, "Message reported as phishing");
+    let pending = engine.store.ops_due(account, i64::MAX).unwrap();
+    assert!(pending.iter().any(|(_, o)| o.kind == mail_store::OpKind::Flags { add: mail_store::flag::JUNK | mail_store::flag::PHISHING, remove: mail_store::flag::NOT_JUNK }), "{pending:?}");
+    assert!(mail.key(&key("z"), None));
+    assert_eq!(subjects(&mail), ["Three", "Two"]);
     // In Junk: the palette offers Not junk, and ! sends it to the inbox.
     let junk = engine.store.folder_id(account, "Junk", mail_store::Role::Junk).unwrap();
     mail.choose_folder(junk);
     mail.open(0);
     assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Char, modifiers: Modifiers { ctrl: true, ..Modifiers::default() }, chars: "k".into() }, None));
     assert!(mail.palette_entries().iter().any(|e| e.label == "Not junk" && e.key == "!"));
+    assert!(!mail.palette_entries().iter().any(|e| e.label == "Report phishing"));
     assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
     assert!(mail.key(&key("!"), None));
     assert_eq!(mail.ui.get_cloned().count, 0);
@@ -526,7 +536,26 @@ fn attachments_show_what_they_are_and_quick_look_text() {
     mail.open_file(0, 2, Some([7; 16]));
     let asks = mail.take_file_asks();
     assert_eq!(asks.len(), 1);
-    assert_eq!(asks[0].act, atrium_mail::view::FileAct::Open { activation: [7; 16] });
+    assert_eq!(asks[0].act, atrium_mail::view::FileAct::Open { activation: [7; 16], app: None });
+    // Open with… (§8.2): the apps asked for, shown with the default marked;
+    // a press on one opens it there; Escape closes the choices.
+    assert!(t.iter().any(|x| x == "Open with…"));
+    mail.ask_open_with(0, 2);
+    assert_eq!(mail.take_file_asks()[0].act, atrium_mail::view::FileAct::Apps);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Finding apps…"));
+    mail.open_with_apps("report.pdf", Ok(vec![("org.atrium.pdf".into(), "Atrium PDF".into(), true), ("org.example.reader".into(), "Reader".into(), false)]));
+    app.tick();
+    let t2 = texts(&app);
+    assert!(t2.iter().any(|x| x == "Open report.pdf with") && t2.iter().any(|x| x == "Reader") && t2.iter().any(|x| x == "default"), "{t2:?}");
+    mail.open_with("org.example.reader", Some([8; 16]));
+    assert_eq!(mail.take_file_asks()[0].act, atrium_mail::view::FileAct::Open { activation: [8; 16], app: Some("org.example.reader".into()) });
+    assert!(mail.ui.get_cloned().open_with.is_none());
+    mail.ask_open_with(0, 1);
+    assert!(mail.ui.get_cloned().open_with.is_none(), "not for the file whose name lies");
+    mail.ask_open_with(0, 2);
+    assert!(mail.close_open_with() && mail.ui.get_cloned().open_with.is_none());
+    mail.take_file_asks();
     // Quick look of the CSV: Mail draws the text itself.
     mail.look_file(0, 0);
     app.tick();

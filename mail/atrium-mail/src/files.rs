@@ -276,11 +276,28 @@ pub fn persona() -> Result<Option<String>, String> {
     }
 }
 
+/// The apps that open `mime`, the person's default first (Open with…,
+/// §8.2): (id, name, default). Called off the window's thread.
+pub fn apps_for(mime: &str) -> Result<Vec<(String, String, bool)>, String> {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    let mut s = std::os::unix::net::UnixStream::connect(portcullis_socket()).map_err(|e| format!("Atrium's app launcher isn't reachable ({e})"))?;
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { .. }) => {}
+        Ok(r) => return Err(format!("the app launcher answered {r:?}")),
+        Err(e) => return Err(format!("the app launcher: {e}")),
+    }
+    match round_trip(&mut s, &Request::OpenApps { mime: mime.into() }).map_err(|e| e.to_string())? {
+        Response::OpenApps { apps } => Ok(apps.into_iter().map(|a| (a.id, a.name, a.default)).collect()),
+        Response::Error { message } => Err(message),
+        r => Err(format!("an odd answer: {r:?}")),
+    }
+}
+
 /// Open in… (§8.2): hand `fd` (from [`sealed`]) to portcullisd with the
 /// press that asked; it decides the type from the bytes and opens it in
-/// the person's default app. That app's name, or why not. Called off the
-/// window's thread.
-pub fn open_in_app(name: &str, activation: [u8; 16], fd: &std::os::fd::OwnedFd) -> Result<String, String> {
+/// the person's default app, or in `app` (Open with…). That app's name,
+/// or why not. Called off the window's thread.
+pub fn open_in_app(name: &str, activation: [u8; 16], fd: &std::os::fd::OwnedFd, app: Option<&str>) -> Result<String, String> {
     use portcullis_ipc::{round_trip, send_fds, Request, Response, PROTO_VERSION};
     use std::os::fd::AsRawFd;
     let mut s = std::os::unix::net::UnixStream::connect(portcullis_socket()).map_err(|e| format!("Atrium's app launcher isn't reachable ({e})"))?;
@@ -289,7 +306,7 @@ pub fn open_in_app(name: &str, activation: [u8; 16], fd: &std::os::fd::OwnedFd) 
         Ok(r) => return Err(format!("the app launcher answered {r:?}")),
         Err(e) => return Err(format!("the app launcher: {e}")),
     }
-    match round_trip(&mut s, &Request::OpenAttachment { name: name.into(), activation }).map_err(|e| e.to_string())? {
+    match round_trip(&mut s, &Request::OpenAttachment { name: name.into(), activation, app: app.map(String::from) }).map_err(|e| e.to_string())? {
         Response::ReadyForFds => {}
         Response::Error { message } => return Err(message),
         r => return Err(format!("an odd answer: {r:?}")),
