@@ -80,21 +80,93 @@ pub enum FillHow {
 /// The most cells one Ctrl+Enter fills.
 pub const MAX_TYPE_ALL: u64 = officina_grid::clip::MAX_TILES;
 
-/// A date or time typed in ISO form (`2026-11-19`, `14:30`, `14:30:05`,
-/// `2026-11-19 14:30`): its serial and the format to show it in.
-pub fn typed_date(s: &str) -> Option<(f64, &'static str)> {
+/// A date or time typed (`2026-11-19`, `19/11/2026`, `19 Nov 2026`,
+/// `Nov 19, 2026`, `14:30`, `14:30:05`, a date and a time): its serial and
+/// the format to show it in. Numbers alone (`19/11/2026`, `11/19/26`) are
+/// read in the persona's order ([`day_first`]); a day without a year is in
+/// this year.
+pub fn typed_date(s: &str) -> Option<(f64, String)> {
+    typed_date_with(s, day_first(), crate::source::local_now().map(|n| n.0))
+}
+
+/// Whether numeric dates put the day first (`19/11/2026`), from the
+/// persona's locale (`LC_ALL`, `LC_TIME`, `LANG`): month first only in the
+/// United States and the few places that follow it; day first elsewhere,
+/// and when no locale is set.
+pub fn day_first() -> bool {
+    static FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIRST.get_or_init(|| {
+        let loc = ["LC_ALL", "LC_TIME", "LANG"].iter().filter_map(|k| std::env::var(k).ok()).find(|v| !v.is_empty()).unwrap_or_default();
+        day_first_in(&loc)
+    })
+}
+
+fn day_first_in(locale: &str) -> bool {
+    let territory = locale.split(['.', '@']).next().unwrap_or("").split('_').nth(1).unwrap_or("");
+    !matches!(territory, "US" | "PH" | "FM" | "MH" | "PW" | "AS" | "GU" | "MP" | "PR" | "UM" | "VI")
+}
+
+const MONTH_NAMES: [&str; 12] = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+/// As [`typed_date`], with the order and this year given.
+pub fn typed_date_with(s: &str, day_first: bool, this_year: Option<i32>) -> Option<(f64, String)> {
     let s = s.trim();
     let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().ok().filter(|n| (lo..=hi).contains(n) && !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit()));
-    let date = |t: &str| -> Option<f64> {
-        let mut p = t.split('-');
-        let (y, m, d) = (p.next()?, p.next()?, p.next()?);
-        if p.next().is_some() || y.len() != 4 {
-            return None;
-        }
-        let (y, m, d) = (num(y, 1900, 9999)?, num(m, 1, 12)?, num(d, 1, 31)?);
+    let serial = |y: u32, m: u32, d: u32| -> Option<f64> {
         let serial = officina_grid::eval::dates::date_serial(y as f64, m as f64, d as f64)?;
         // 2026-02-31 is not a day.
         (officina_grid::eval::dates::ymd(serial) == Some((y as i64, m as i64, d as i64))).then_some(serial)
+    };
+    // A year as typed: four digits, or two (30-99 the 1900s, else the 2000s).
+    let year = |t: &str| -> Option<u32> {
+        match t.len() {
+            4 => num(t, 1900, 9999),
+            2 => num(t, 0, 99).map(|y| if y >= 30 { 1900 + y } else { 2000 + y }),
+            _ => None,
+        }
+    };
+    let month = |t: &str| -> Option<u32> {
+        let t = t.trim_end_matches('.').to_ascii_lowercase();
+        if t.len() < 3 {
+            return None;
+        }
+        MONTH_NAMES.iter().position(|m| *m == t || (t.len() <= 4 && m.starts_with(&t) && (t.len() == 3 || t == "sept"))).map(|i| i as u32 + 1)
+    };
+    let date = |t: &str| -> Option<(f64, String)> {
+        // ISO.
+        let p: Vec<&str> = t.split('-').collect();
+        if p.len() == 3 && p[0].len() == 4 {
+            return Some((serial(num(p[0], 1900, 9999)?, num(p[1], 1, 12)?, num(p[2], 1, 31)?)?, "yyyy-mm-dd".into()));
+        }
+        // Numbers in the persona's order: d/m/y or m/d/y, or without the year.
+        for sep in ['/', '.', '-'] {
+            let p: Vec<&str> = t.split(sep).collect();
+            // (A dash needs a four-digit year: 26-11-19 stays text; a dot or
+            // dash needs the year: 1.5 is a number.)
+            if !(2..=3).contains(&p.len()) || p.iter().any(|x| x.is_empty() || x.len() > 4) || (sep != '/' && p.len() == 2) || (sep == '-' && p[2].len() != 4) {
+                continue;
+            }
+            let (a, b) = (num(p[0], 1, 31)?, num(p[1], 1, 31)?);
+            let (d, m) = if day_first { (a, b) } else { (b, a) };
+            let y = if p.len() == 3 { year(p[2])? } else { this_year? as u32 };
+            let fmt = match (day_first, p.len() == 3) {
+                (true, true) => "dd/mm/yyyy",
+                (false, true) => "mm/dd/yyyy",
+                (true, false) => "d mmm",
+                (false, false) => "mmm d",
+            };
+            return Some((serial(y, num(&m.to_string(), 1, 12)?, d)?, fmt.into()));
+        }
+        // A month by name: 19 Nov 2026, Nov 19, 2026, 19 Nov, Nov 19, Nov 2026.
+        let w: Vec<&str> = t.split([' ', ',']).filter(|x| !x.is_empty()).collect();
+        match w.as_slice() {
+            [d, m, y] if month(m).is_some() => Some((serial(year(y)?, month(m)?, num(d, 1, 31)?)?, "d mmm yyyy".into())),
+            [m, d, y] if month(m).is_some() => Some((serial(year(y)?, month(m)?, num(d, 1, 31)?)?, "mmm d, yyyy".into())),
+            [m, y] if month(m).is_some() && y.len() == 4 => Some((serial(year(y)?, month(m)?, 1)?, "mmm yyyy".into())),
+            [d, m] if month(m).is_some() => Some((serial(this_year? as u32, month(m)?, num(d, 1, 31)?)?, "d mmm".into())),
+            [m, d] if month(m).is_some() => Some((serial(this_year? as u32, month(m)?, num(d, 1, 31)?)?, "mmm d".into())),
+            _ => None,
+        }
     };
     let time = |t: &str| -> Option<(f64, bool)> {
         let p: Vec<&str> = t.split(':').collect();
@@ -105,15 +177,18 @@ pub fn typed_date(s: &str) -> Option<(f64, &'static str)> {
         let sec = if p.len() == 3 { num(p[2], 0, 59).filter(|_| p[2].len() == 2)? } else { 0 };
         Some(((h * 3600 + m * 60 + sec) as f64 / 86400.0, p.len() == 3))
     };
-    if let Some((d, t)) = s.split_once(' ') {
-        let (t, secs) = time(t.trim())?;
-        return Some((date(d)? + t, if secs { "yyyy-mm-dd hh:mm:ss" } else { "yyyy-mm-dd hh:mm" }));
+    // A time after the date.
+    if let Some((d, t)) = s.rsplit_once(' ') {
+        if let Some((t, secs)) = time(t.trim()) {
+            let (d, fmt) = date(d.trim())?;
+            return Some((d + t, format!("{fmt} {}", if secs { "hh:mm:ss" } else { "hh:mm" })));
+        }
     }
     if let Some(d) = date(s) {
-        return Some((d, "yyyy-mm-dd"));
+        return Some(d);
     }
     let (t, secs) = time(s)?;
-    Some((t, if secs { "hh:mm:ss" } else { "hh:mm" }))
+    Some((t, if secs { "hh:mm:ss" } else { "hh:mm" }.into()))
 }
 
 /// One record of the journal: one user action.
@@ -744,7 +819,7 @@ impl Doc {
         // A date or time typed: shown as one, unless the cell has a format.
         if let Some(fmt) = date_fmt.filter(|_| &*self.wb.style(a).num_fmt == "General") {
             let r = officina_grid::Rect { sheet: a.sheet, r0: row, c0: col, r1: row, c1: col };
-            ops.push(GridOp::restyle(&self.wb, r, |st| officina_grid::style::Style { num_fmt: fmt.into(), ..st.clone() }));
+            ops.push(GridOp::restyle(&self.wb, r, |st| officina_grid::style::Style { num_fmt: fmt.as_str().into(), ..st.clone() }));
         }
         self.run("Typing", ops);
         // A validation rule over the cell: refuse, warn, or tell (§16.83).
@@ -1286,16 +1361,43 @@ mod tests {
 
     #[test]
     fn typed_dates_and_times_become_them() {
-        assert_eq!(typed_date("2026-11-19"), Some((46345.0, "yyyy-mm-dd")));
-        assert_eq!(typed_date("14:30"), Some((14.5 / 24.0, "hh:mm")));
-        assert_eq!(typed_date("2026-11-19 06:00"), Some((46345.25, "yyyy-mm-dd hh:mm")));
+        assert_eq!(typed_date("2026-11-19"), Some((46345.0, "yyyy-mm-dd".into())));
+        assert_eq!(typed_date("14:30"), Some((14.5 / 24.0, "hh:mm".into())));
+        assert_eq!(typed_date("2026-11-19 06:00"), Some((46345.25, "yyyy-mm-dd hh:mm".into())));
         for no in ["2026-02-31", "26-11-19", "24:00", "1:5", "12", "2026-11", "x"] {
             assert_eq!(typed_date(no), None, "{no}");
         }
+        // Other orders: the persona's for numbers, any with a month's name.
+        let w = |s: &str, first: bool| typed_date_with(s, first, Some(2026));
+        let nov19 = Some((46345.0, "dd/mm/yyyy".to_string()));
+        assert_eq!(w("19/11/2026", true), nov19);
+        assert_eq!(w("19.11.26", true).map(|d| d.0), Some(46345.0));
+        assert_eq!(w("11/19/2026", false), Some((46345.0, "mm/dd/yyyy".into())));
+        assert_eq!(w("11/19/2026", true), None);
+        assert_eq!(w("19/11", true), Some((46345.0, "d mmm".into())));
+        assert_eq!(w("19 Nov 2026", true), Some((46345.0, "d mmm yyyy".into())));
+        assert_eq!(w("November 19, 2026", true), Some((46345.0, "mmm d, yyyy".into())));
+        assert_eq!(w("Sept 1 2026", true).map(|d| d.0), Some(46266.0));
+        assert_eq!(w("Nov 19", false), Some((46345.0, "mmm d".into())));
+        assert_eq!(w("Nov 2026", true).map(|d| d.1), Some("mmm yyyy".into()));
+        assert_eq!(w("19 Nov 2026 06:00", true), Some((46345.25, "d mmm yyyy hh:mm".into())));
+        assert_eq!(w("19 Nov", true).map(|d| d.0), Some(46345.0));
+        // Without this year, year-less ones stay text; words aren't months.
+        assert_eq!(typed_date_with("19/11", true, None), None);
+        for no in ["19 Novel 2026", "Mayday 1", "1/2/3/4", "32/1/2026", "1/13/2026x"] {
+            assert_eq!(w(no, true), None, "{no}");
+        }
+        assert!(day_first_in("en_IN.UTF-8") && day_first_in("") && day_first_in("de_DE") && !day_first_in("en_US.UTF-8"));
         let mut d = Doc::new("t");
         d.type_into(0, 0, "2026-11-19");
         assert_eq!(d.wb.value(0, 0, 0), officina_grid::Value::Num(46345.0));
         assert_eq!(d.wb.formatted(CellAddr::new(0, 0, 0)).text, "2026-11-19");
+        for (k, typed) in ["19 Nov 2026", "Nov 19, 2026", "Nov 2026"].iter().enumerate() {
+            d.type_into(10 + k as u32, 0, typed);
+            assert_eq!(d.wb.formatted(CellAddr::new(0, 10 + k as u32, 0)).text, *typed);
+        }
+        d.type_into(13, 0, "1.5");
+        assert_eq!(d.wb.value(0, 13, 0), officina_grid::Value::Num(1.5));
         // Ctrl+Enter: every cell, formulas moving; one undo step.
         let area = officina_grid::Rect { sheet: 0, r0: 2, c0: 1, r1: 4, c1: 2 };
         assert!(d.type_all(area, "=A1+1"));

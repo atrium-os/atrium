@@ -662,7 +662,7 @@ impl SheetSource {
 }
 
 /// The local date and time now: year, month, day, hour, minute.
-fn local_now() -> Option<(i32, u32, u32, u32, u32)> {
+pub(crate) fn local_now() -> Option<(i32, u32, u32, u32, u32)> {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as libc::time_t;
     // SAFETY: localtime_r writes only into `tm`, which outlives the call.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

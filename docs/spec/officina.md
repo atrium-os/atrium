@@ -3766,7 +3766,8 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - Gates: officina-grid `programs_are_learnt_from_examples`, `a_column_is_filled_by_example`; atrium-sheets `flash_fill_fills_a_column_by_its_examples`.
 - **Flash Fill by position** (2026-11-19): programs also take the first characters of a word (up to 7) and the first or last characters of a whole cell (up to 8): `Lovelace` → `LOV`, `AB12345` → `2345`.
 - **Custom lists** (2026-11-19; Data ▸ Fill: Keep Selection as a List, Fill: Forget Custom Lists): a row or column of 2 to 256 different entries becomes a list. A fill from any of its entries goes on through the rest in turn, before the day and month names are tried, and in the typed entry's case. Up to 64 lists, kept for the person beside Sheets' autosaves (`atrium-sheets/lists`, one list a line, entries split by tabs; `atrium_sheets::lists`, `autofill::set_custom_lists`). A new list replaces one sharing an entry with it. Gates: officina-grid `custom_lists_fill_in_turn`; atrium-sheets `a_selection_kept_as_a_list_fills_on`.
-- **Not yet:** Flash Fill with numbers or dates reformatted, and a settings page listing custom lists one by one.
+- **Custom lists panel** (2026-11-19; Data ▸ Fill: Custom Lists…): lists each custom list with Forget, plus Forget all (`lists::forget`). Gate: atrium-sheets `the_custom_lists_panel_opens_and_closes`.
+- **Not yet:** Flash Fill with numbers reformatted (dates already split into words, so `2026-11-19` → `19/11/2026` is learnt).
 - **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`, which checks `Mode::Count` too); atrium-sheets `a_fill_can_be_done_again_another_way`; pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ### 16.88 Copy, cut and paste within Sheets (2026-11-19)
@@ -3847,7 +3848,13 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Entering and editing** (2026-11-19): an editor started by typing (or Ctrl+;) is entering, as Excel's Enter mode: an arrow key finishes the entry and moves that way. One started by F2 or Enter, or pressed into, is editing: arrows move the caret. F2 in the editor switches between the two.
 - **Ctrl+'** puts the formula of the cell above into the editor as written; **Ctrl+Shift+'** its value as shown.
 - **Enter or Edit in the status bar** (2026-11-19): while the editor is open, the status bar's right end says Enter or Edit, as Excel's does (`GridState::edit_mode`, `EditMode`).
-- **Not yet:** other date orders (`19/11/2026`, `Nov 19`), which need the persona's locale.
+- **Other date orders** (2026-11-19; `doc::typed_date_with`):
+  - Numbers in the persona's order: `19/11/2026`, `19.11.26` and `19-11-2026` day first, or `11/19/2026` month first. The order comes from the persona's locale (`LC_ALL`, `LC_TIME`, `LANG`; `doc::day_first`). It is month first only in the United States and the places that follow it, and day first elsewhere and when no locale is set.
+  - A month by name in any order: `19 Nov 2026`, `November 19, 2026`, `Sept 1 2026`, `Nov 2026`.
+  - Without a year (`19/11`, `Nov 19`): this year.
+  - A time may follow any of them.
+  - Each is shown in the order it was typed (`dd/mm/yyyy`, `d mmm yyyy`, `mmm d, yyyy` and so on).
+  - Two-digit years are 1930–2029. A dash needs a four-digit year, and a dot needs the year, so `1.5` stays a number and `26-11-19` stays text.
 - **Gates:** pergola `ctrl_enter_enters_the_text_in_every_selected_cell`, `arrows_finish_a_typed_entry_and_f2_edits_in_place`, `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (Up and Down); atrium-sheets `typed_dates_and_times_become_them`, `ctrl_semicolon_gives_today_and_the_time_as_typed`, `rows_nobody_sized_grow_for_typed_lines` (shrinking), `the_size_bar_sets_exact_heights_and_widths` (0 hides).
 
 ## 17. Decisions (accepted 2026-11-14)
