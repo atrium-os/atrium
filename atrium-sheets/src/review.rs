@@ -117,7 +117,7 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
     let mut ops = Vec::new();
     let mut done = std::collections::BTreeSet::new();
     for ch in changes {
-        if matches!(ch, Change::Chart(_) | Change::Name(_)) { continue; }
+        if ch.is_object() { continue; }
         let Some(s) = ch.sheet() else { continue };
         if whole.contains(&s) {
             if !done.contains(&s) {

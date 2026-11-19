@@ -3331,6 +3331,105 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_flags_and_resolves_conditional_formats_and_validations() {
+        use crate::review::ReviewCmd;
+        use officina_grid::condfmt::{CmpOp, CondFormat, Dxf, Rule, RuleKind};
+        use officina_grid::validation::{Allow, Message, Validation};
+        use officina_grid::{CellAddr, Rect as Cells, Workbook, compare::Change};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Summary").unwrap();
+            wb.add_sheet("Data").unwrap();
+            wb.add_sheet("Other").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        let area = |sheet, col| Cells { sheet, r0: 4, r1: 7, c0: col, c1: col };
+        let conditional = |wb: &Workbook, sheet, col, expr: &str, fill| CondFormat {
+            sheet,
+            ranges: vec![area(sheet, col)],
+            rules: vec![Rule {
+                kind: RuleKind::Expression(wb.cond_formula(expr, sheet, (4, col)).unwrap()),
+                dxf: Dxf { fill: Some(fill), ..Dxf::default() },
+                stop: true,
+            }],
+        };
+        let validation = |wb: &Workbook, sheet, col, formula: &str, prompt| {
+            let mut rule = Validation::new(sheet, vec![area(sheet, col)], Allow::Whole, CmpOp::Greater,
+                Some(wb.validation_formula(formula, sheet, (4, col)).unwrap()), None);
+            rule.prompt = Message::new("Enter a number", prompt);
+            rule
+        };
+
+        let local_format = conditional(&local.wb, 0, 0, "=Data!$A$1>1", 1);
+        let first = conditional(&local.wb, 1, 1, "=Summary!$A$1>2", 2);
+        let second = conditional(&local.wb, 1, 1, "=Summary!$A$1>3", 3);
+        for format in [local_format.clone(), first.clone(), second.clone()] {
+            local.wb.add_cond_format(format).unwrap();
+        }
+        for format in [
+            conditional(&incoming.wb, 1, 0, "=Data!$A$1>8", 8),
+            conditional(&incoming.wb, 0, 1, "=Summary!$A$1>3", 3),
+            conditional(&incoming.wb, 0, 1, "=Summary!$A$1>2", 2),
+            conditional(&incoming.wb, 2, 0, "=Data!$A$1>2", 4),
+        ] {
+            incoming.wb.add_cond_format(format).unwrap();
+        }
+
+        let old = validation(&local.wb, 0, 2, "=Data!$A$1", "Old prompt");
+        let keep = validation(&local.wb, 1, 3, "=Summary!$A$1", "Keep prompt");
+        let remove = validation(&local.wb, 2, 0, "=1", "Remove this");
+        let taken = validation(&local.wb, 0, 2, "=Data!$B$1", "New prompt");
+        for rule in [old.clone(), keep.clone(), remove.clone()] {
+            local.wb.add_validation(rule).unwrap();
+        }
+        for rule in [
+            validation(&incoming.wb, 1, 2, "=Data!$B$1", "New prompt"),
+            validation(&incoming.wb, 0, 3, "=Summary!$A$1", "Different prompt"),
+        ] {
+            incoming.wb.add_validation(rule).unwrap();
+        }
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming.wb);
+        let choose = |pred: &dyn Fn(&Change) -> bool, sheet, cmd| {
+            let pane = sheets.review.get_cloned();
+            let row = pane.changes.iter().position(|ch| ch.sheet() == Some(sheet) && pred(ch)).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(row));
+            sheets.review_cmd(cmd);
+        };
+        let formats = |change: &Change| matches!(change, Change::ConditionalFormats(_));
+        let validations = |change: &Change| matches!(change, Change::Validations(_));
+
+        assert_eq!(sheets.review.get_cloned().changes.len(), 6);
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for label in ["Conditional formatting changed", "Conditional formatting added", "Data validation changed", "Data validation removed"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
+        }
+
+        choose(&formats, 0, ReviewCmd::Keep);
+        choose(&validations, 1, ReviewCmd::Keep);
+        choose(&validations, 0, ReviewCmd::Take);
+        assert_eq!(sheets.doc.borrow().wb.validation_at(CellAddr::new(0, 4, 2)), Some(&taken));
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let doc = sheets.doc.borrow();
+            let formats = doc.wb.cond_formats();
+            assert_eq!(&formats[..3], &[local_format.clone(), second.clone(), first.clone()]);
+            assert_eq!(formats[3].sheet, 2);
+            assert_eq!(doc.wb.validations(), &[taken.clone(), keep.clone()]);
+        }
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.cond_formats(), &[local_format, first, second]);
+        assert_eq!(sheets.doc.borrow().wb.validations(), &[taken, keep.clone(), remove.clone()]);
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(sheets.doc.borrow().wb.validations(), &[old, keep, remove]);
+    }
+
+    #[test]
     fn compare_with_lists_and_takes_changes() {
         use crate::review::ReviewCmd;
         use officina_grid::compare::Change;

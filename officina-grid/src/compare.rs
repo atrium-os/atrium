@@ -22,7 +22,9 @@ use crate::ops::{Fill, GridOp, Region};
 use crate::value::Value;
 
 mod parts;
+mod rules;
 pub use parts::{ChartChange, NameChange};
+pub use rules::RuleChange;
 
 /// The row formulas are printed for when compared, so that relative
 /// references read the same wherever the row is.
@@ -43,6 +45,8 @@ pub enum Change {
     Style { rect: Rect, ours: Box<crate::style::Style>, theirs: Box<crate::style::Style> },
     Chart(ChartChange),
     Name(NameChange),
+    ConditionalFormats(RuleChange<crate::condfmt::CondFormat>),
+    Validations(RuleChange<crate::validation::Validation>),
     /// `n` rows of theirs, from their row `theirs_row`, that ours doesn't
     /// have; they would go before our row `at`.
     RowsAdded { sheet: u16, at: u32, n: u32, theirs_row: u32 },
@@ -73,6 +77,8 @@ impl Change {
             Change::Style { rect, .. } => Some(rect.sheet),
             Change::Chart(ref chart) => chart.sheet,
             Change::Name(ref name) => name.sheet,
+            Change::ConditionalFormats(ref rules) => Some(rules.sheet),
+            Change::Validations(ref rules) => Some(rules.sheet),
             Change::SheetAdded { .. } => None,
         }
     }
@@ -91,8 +97,15 @@ impl Change {
             Change::Style { rect, .. } => Some((rect.sheet, rect.r0, rect.c0)),
             Change::Chart(ref chart) => chart.anchor(),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
+            Change::ConditionalFormats(ref rules) => rules.anchor(),
+            Change::Validations(ref rules) => rules.anchor(),
             Change::SheetAdded { .. } => None,
         }
+    }
+
+    /// Whether this entry is applied through a workbook object collection.
+    pub fn is_object(&self) -> bool {
+        matches!(self, Self::Chart(_) | Self::Name(_) | Self::ConditionalFormats(_) | Self::Validations(_))
     }
 
     /// Whether it is rows added or removed (taken as rows inserted or
@@ -125,6 +138,8 @@ impl Change {
             }
             Change::Chart(chart) => chart.describe(),
             Change::Name(name) => name.describe(),
+            Change::ConditionalFormats(rules) => rules.describe("Conditional formatting"),
+            Change::Validations(rules) => rules.describe("Data validation"),
             Change::RowsAdded { at, n, theirs_row, .. } => {
                 let first = theirs_row_text(theirs, ours, self, *theirs_row);
                 format!("{} added before row {}{}", rows(*n), at + 1, first.map(|t| format!(" ({t})")).unwrap_or_default())
@@ -171,7 +186,7 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
             out.push(Change::SheetAdded { name });
         }
     }
-    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)) {
+    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)) {
         if out.len() == MAX_CHANGES { return (out, true); }
         out.push(change);
     }
@@ -554,7 +569,7 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             if ours.style_snapshot(rect).spans != parts::style_spans(*rect, before) { return None; }
             Some(vec![GridOp::style(*rect, (**after).clone())])
         }
-        Change::Chart(_) | Change::Name(_) => {
+        Change::Chart(_) | Change::Name(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
             let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
             (n != 0).then_some(ops)
         }
@@ -591,9 +606,11 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
     }
 }
 
-/// Builds a combined update for chart and name changes in a review selection.
+/// Builds a combined update for workbook object changes in a review selection.
 pub fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (Vec<GridOp>, usize) {
-    parts::take_objects(ours, theirs, changes)
+    let (mut ops, count) = parts::take_objects(ours, theirs, changes);
+    let rule_count = rules::take(ours, theirs, changes, &mut ops);
+    (ops, count + rule_count)
 }
 
 /// Our sheet `s` made the same as theirs of its name: cells, formulas and
@@ -638,6 +655,34 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn workbook_rule_review_remaps_sheet_ids_and_refuses_missing_references() {
+        use crate::condfmt::CmpOp;
+        use crate::validation::{Allow, Validation};
+
+        let mut ours = Workbook::new();
+        let mut theirs = Workbook::new();
+        for wb in [&mut ours, &mut theirs] {
+            wb.add_sheet("Entry").unwrap();
+            wb.add_sheet("Options").unwrap();
+        }
+        assert!(theirs.move_sheet(1, 0));
+        let rule = |wb: &Workbook, sheet, text| Validation::new(
+            sheet, vec![Rect::cell(CellAddr::new(sheet, 3, 1))], Allow::List, CmpOp::Equal,
+            Some(wb.validation_formula(text, sheet, (3, 1)).unwrap()), None,
+        );
+        ours.add_validation(rule(&ours, 0, "=Options!$A$1:$A$3")).unwrap();
+        theirs.add_validation(rule(&theirs, 1, "=Options!$A$1:$A$3")).unwrap();
+        assert!(compare(&ours, &theirs).0.is_empty());
+
+        theirs.add_sheet("IncomingOnly").unwrap();
+        theirs.replace_validations(vec![rule(&theirs, 1, "=IncomingOnly!$A$1:$A$3")]);
+        let (changes, _) = compare(&ours, &theirs);
+        let change = changes.iter().find(|ch| matches!(ch, Change::Validations(_))).unwrap();
+        assert!(take(&ours, &theirs, change).is_none());
+        assert_eq!(ours.validations(), &[rule(&ours, 0, "=Options!$A$1:$A$3")]);
+    }
 
     #[test]
     fn styles_follow_matched_rows_and_take_new_row_styles() {
