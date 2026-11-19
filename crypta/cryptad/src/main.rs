@@ -1022,7 +1022,7 @@ impl D {
 
 #[cfg(target_os = "freebsd")]
 fn launch(jaild: &str, uid: u32, r: &Run, gw: SocketAddrV4, secrets: Option<BorrowedFd<'_>>) -> Result<Live, String> {
-    let e = jail::launch(jaild, uid, gw, r.tun.as_fd(), secrets)?;
+    let e = jail::launch(jaild, uid, gw, r.tun.as_fd(), secrets, r.p.ac.as_ref().is_some_and(|a| a.globalprotect))?;
     Ok(Live { uid: e.uid, sock: e.sock, rd: engine::Reader::default(), pd: e.procdesc, started: Instant::now(), helper: None })
 }
 

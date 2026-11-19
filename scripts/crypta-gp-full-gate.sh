@@ -13,6 +13,10 @@ export CRYPTA_GATE_CONFIGURED_TOOLCHAIN=1 CRYPTA_GATE_OWN_LAN=1
 export CRYPTA_GP_TEST_PORT=$2
 trust=$3
 portal_port=${4:-}
+transport=${5:-}
+if [ -n "$transport" ]; then
+    export CRYPTA_GP_TEST_ESP=4501
+fi
 if [ -n "$portal_port" ]; then
     export CRYPTA_GP_PORTAL_PORT=$portal_port
 fi
@@ -151,6 +155,11 @@ done
 [ "$connected" = 2 ] || fail "the second handshake never completed"
 wait_field handshake 1
 probe "IPv4 echo after rebind"
+if [ -n "$transport" ]; then
+    count=$("$V" "grep -c 'GlobalProtect data transport: $transport$' $G/cryptad.log" || true)
+    [ "$count" = 2 ] || fail "expected $transport for both data connections"
+    ok "engine selected $transport on both connections"
+fi
 "$V" "$CTL down name=gp-gate" >/dev/null
 ok "GlobalProtect profile disconnected"
 echo "$pass checks passed"

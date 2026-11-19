@@ -143,6 +143,8 @@ impl Session {
             ("preferred-ip", &ip),
             ("client-type", "1"),
             ("protocol-version", "p1"),
+            ("enc-algo", "aes-128-cbc"),
+            ("hmac-algo", "sha1"),
             ("clientos", "Linux"),
             ("os-version", "Atrium"),
             ("app-version", "Atrium"),
@@ -429,7 +431,16 @@ fn entries<'a>(root: &'a Element, name: &str, limit: usize) -> Result<Vec<&'a st
     Ok(list.children.iter().map(|e| e.text.trim()).collect())
 }
 
+pub const ESP_PORT: u16 = 4501;
+
+pub struct EspConfig {
+    pub transmit: super::esp::Key,
+    pub receive: super::esp::Key,
+    pub probe: Ipv4Addr,
+}
+
 pub struct Config {
+    pub esp: Option<EspConfig>,
     pub push: Pushed,
     pub renew_after: Duration,
 }
@@ -439,6 +450,53 @@ pub fn config(bytes: &[u8], fallback_mtu: u16) -> Result<Config> {
     let answer = proposal(&root, fallback_mtu);
     clear_xml(&mut root);
     answer
+}
+
+fn esp_config(root: &Element) -> Option<EspConfig> {
+    let esp = unique(root, "ipsec").ok()??;
+    let field = |name| scalar(esp, name).ok().flatten();
+    if field("udp-port")?.parse::<u16>().ok()? != ESP_PORT
+        || field("ipsec-mode")? != "esp-tunnel"
+        || !matches!(field("enc-algo")?, "aes-128-cbc" | "aes128")
+        || field("hmac-algo")? != "sha1"
+    {
+        return None;
+    }
+    let spi = |name| u32::from_str_radix(field(name)?.strip_prefix("0x")?, 16).ok();
+    let probe: Ipv4Addr = scalar(root, "gw-address").ok()??.parse().ok()?;
+    if probe.is_unspecified() || probe.is_multicast() || probe.is_broadcast() {
+        return None;
+    }
+    Some(EspConfig {
+        transmit: super::esp::Key::new(
+            spi("c2s-spi")?,
+            hex_key(esp, "ekey-c2s")?,
+            hex_key(esp, "akey-c2s")?,
+        )?,
+        receive: super::esp::Key::new(
+            spi("s2c-spi")?,
+            hex_key(esp, "ekey-s2c")?,
+            hex_key(esp, "akey-s2c")?,
+        )?,
+        probe,
+    })
+}
+
+fn hex_key<const N: usize>(esp: &Element, field: &str) -> Option<Zeroizing<[u8; N]>> {
+    let key = unique(esp, field).ok()??;
+    if scalar(key, "bits").ok()??.parse::<usize>().ok()? != N * 8 {
+        return None;
+    }
+    let encoded = scalar(key, "val").ok()??.as_bytes();
+    if encoded.len() != N * 2 {
+        return None;
+    }
+    let mut out = Zeroizing::new([0; N]);
+    for (output, pair) in out.iter_mut().zip(encoded.chunks_exact(2)) {
+        *output =
+            (char::from(pair[0]).to_digit(16)? * 16 + char::from(pair[1]).to_digit(16)?) as u8;
+    }
+    Some(out)
 }
 
 fn proposal(root: &Element, fallback_mtu: u16) -> Result<Config> {
@@ -509,6 +567,7 @@ fn proposal(root: &Element, fallback_mtu: u16) -> Result<Config> {
     // Refresh before the gateway expires the TLS tunnel.
     let renew_after = Duration::from_secs(timeout.clamp(15, 86400) * 9 / 10);
     Ok(Config {
+        esp: esp_config(root),
         renew_after,
         push: Pushed {
             addr,

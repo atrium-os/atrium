@@ -20,6 +20,7 @@
 //! cookie and asks nobody; an ended session signs in again.
 
 mod gp;
+mod gp_esp;
 mod link;
 mod tls;
 
@@ -136,6 +137,7 @@ struct Engine {
     conn: link::Connector,
     cfg: Arc<rustls::ClientConfig>,
     tun: std::fs::File,
+    esp: Option<std::net::UdpSocket>,
     /// The saved password was tried this run (and is not tried again).
     saved_used: bool,
     rx: u64,
@@ -710,6 +712,12 @@ fn main() {
         Ok(c) => c,
         Err(e) => return log(&format!("connector: {e}")),
     };
+    let esp = globalprotect.and_then(|_| {
+        let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+        socket.connect((*st.gateway.ip(), crypta_gp::gateway::ESP_PORT)).ok()?;
+        socket.set_nonblocking(true).ok()?;
+        Some(socket)
+    });
     limits();
     let secrets = match link::Secrets::new(secrets_sock) {
         Ok(s) => Secrets(Arc::new(std::sync::Mutex::new(s))),
@@ -733,7 +741,7 @@ fn main() {
     };
     drop(system);
     log(&format!("gateway {} at {}", st.host, st.gateway));
-    let mut e = Engine { st, ctl, secrets, conn, cfg, tun, saved_used: false, rx: 0, tx: 0, dropped: 0 };
+    let mut e = Engine { st, ctl, secrets, conn, cfg, tun, esp, saved_used: false, rx: 0, tx: 0, dropped: 0 };
     let result = match globalprotect { Some(mode) => e.run_gp(mode), None => e.run() };
     match result {
         Ok(()) => log("stopping"),

@@ -3,6 +3,9 @@
 
 import argparse
 import base64
+from contextlib import ExitStack
+import hashlib
+import hmac
 import os
 from pathlib import Path
 import shlex
@@ -64,7 +67,82 @@ def frames(stream, reader, calls):
         calls.append("echo")
 
 
-def serve(ctx, listener, calls, errors, *, isolated=False, portal=False):
+class EspPeer:
+    def __init__(self, socket, drop):
+        self.socket = socket
+        self.drop = drop
+        self.configs = []
+        self.errors = []
+        self.echo = []
+        self.probes = 0
+
+    def offer(self):
+        spi = 0x11223300 + len(self.configs) * 2
+        incoming, outgoing = self.association(spi), self.association(spi + 1)
+        self.configs.append((incoming, outgoing))
+        fields = ("<gw-address>10.77.0.1</gw-address><ipsec><udp-port>4501</udp-port>"
+                  "<ipsec-mode>esp-tunnel</ipsec-mode><enc-algo>aes-128-cbc</enc-algo><hmac-algo>sha1</hmac-algo>")
+        for direction, assoc in [("c2s", incoming), ("s2c", outgoing)]:
+            spi, ekey, akey = assoc
+            fields += (f"<{direction}-spi>0x{spi:08x}</{direction}-spi>"
+                       f"<ekey-{direction}><bits>128</bits><val>{ekey.hex()}</val></ekey-{direction}>"
+                       f"<akey-{direction}><bits>160</bits><val>{akey.hex()}</val></akey-{direction}>")
+        return fields + "</ipsec>"
+
+    @staticmethod
+    def association(spi):
+        return spi, os.urandom(16), os.urandom(20)
+
+    @staticmethod
+    def cipher(key, iv, packet, decrypt=False):
+        args = ["openssl", "enc", "-aes-128-cbc", "-nopad", "-nosalt",
+                "-K", key.hex(), "-iv", iv.hex()]
+        if decrypt:
+            args.append("-d")
+        return subprocess.run(args, input=packet, capture_output=True, check=True, timeout=3).stdout
+
+    def serve(self):
+        replay = {}
+        sequence = {}
+        try:
+            while True:
+                wire, address = self.socket.recvfrom(2048)
+                spi = int.from_bytes(wire[:4], "big")
+                seq = int.from_bytes(wire[4:8], "big")
+                pair = next((entry for entry in self.configs if entry[0][0] == spi), None)
+                assert pair is not None, f"unoffered ESP SPI {spi:08x}"
+                (spi_in, ekey, akey), (spi_out, reply_ekey, reply_akey) = pair
+                # OpenConnect sends its bootstrap probe with sequence zero.
+                assert (spi_in, seq) not in replay, "client replayed an ESP sequence"
+                assert hmac.compare_digest(wire[-12:], hmac.digest(akey, wire[:-12], hashlib.sha1)[:12])
+                replay[spi_in, seq] = True
+                plain = self.cipher(ekey, wire[8:24], wire[24:-12], decrypt=True)
+                assert plain[-1] == 4
+                padding = plain[-2]
+                assert plain[len(plain) - padding - 2:-2] == bytes(range(1, padding + 1))
+                packet = plain[:len(plain) - padding - 2]
+                offset = (packet[0] & 15) * 4
+                probe = packet[offset + 8:].startswith(b"monitor\0\0pan ha ")
+                if probe:
+                    self.probes += 1
+                if self.drop:
+                    continue
+                reply = echo_reply(packet)
+                padding = (-len(reply) - 2) % 16
+                reply += bytes(range(1, padding + 1)) + bytes([padding, 4])
+                sequence[spi_out] = sequence.get(spi_out, 0) + 1
+                iv = os.urandom(16)
+                frame = struct.pack("!II", spi_out, sequence[spi_out]) + iv + self.cipher(reply_ekey, iv, reply)
+                self.socket.sendto(frame + hmac.digest(reply_akey, frame, hashlib.sha1)[:12], address)
+                if not probe:
+                    self.echo.append(spi_in)
+        except (TimeoutError, OSError):
+            return
+        except Exception as error:
+            self.errors.append(error)
+
+
+def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None):
     try:
         while True:
             raw, _ = listener.accept()
@@ -117,7 +195,8 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False):
                         assert fields["authcookie"] == [COOKIE] and fields["portal"] == ["office"]
                         body = ('<response status="success"><ssl-tunnel-url>/ssl-tunnel-connect.sslvpn</ssl-tunnel-url>'
                                 '<ip-address>10.77.0.2</ip-address><netmask>255.255.255.0</netmask>'
-                                '<access-routes><member>10.77.0.0/24</member></access-routes></response>')
+                                '<access-routes><member>10.77.0.0/24</member></access-routes>'
+                                + (esp.offer() if esp else '') + '</response>')
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
                         body = "<response><hip-report-needed>no</hip-report-needed></response>"
@@ -142,13 +221,20 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False):
 def openconnect_probe():
     """OpenConnect's script-tun socket carries one raw IP packet per datagram."""
     sock = socket.socket(fileno=int(os.environ["VPNFD"]))
-    sock.settimeout(10)
+    sock.settimeout(0.3)
     icmp = bytearray(bytes.fromhex("0800000012340001") + b"openconnect")
     icmp[2:4] = struct.pack("!H", checksum(icmp))
     ip = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(icmp), 1, 0, 64, 1, 0, LOCAL, REMOTE))
     ip[10:12] = struct.pack("!H", checksum(ip))
-    sock.sendall(ip + icmp)
-    reply = sock.recv(1500)
+    for _ in range(16):
+        sock.sendall(ip + icmp)
+        try:
+            reply = sock.recv(1500)
+            break
+        except TimeoutError:
+            continue
+    else:
+        raise TimeoutError("OpenConnect received no echo reply")
     assert reply[12:20] == REMOTE + LOCAL and reply[20] == 0
     assert checksum(reply[:20]) == checksum(reply[20:]) == 0
     assert reply[24:] == icmp[4:]
@@ -204,7 +290,11 @@ def main():
     group.add_argument("--vm", choices=["arm64", "amd64"])
     group.add_argument("--full-vm", choices=["arm64", "amd64"])
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
+    parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
+    parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
     args = parser.parse_args()
+    if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
+        parser.error("use --full-vm or the host client for ESP packet checks")
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
         if args.portal_vm:
@@ -222,18 +312,26 @@ def main():
         pin = fingerprint.strip().split("=", 1)[1].replace(":", "")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
-        with socket.create_server(("127.0.0.1", 0)) as listener:
+        with ExitStack() as stack:
+            esp = None
+            if args.esp or args.drop_esp:
+                udp = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+                udp.bind(("127.0.0.1", 4501))
+                udp.settimeout(300)
+                esp = EspPeer(udp, args.drop_esp)
+                threading.Thread(target=esp.serve, daemon=True).start()
+            listener = stack.enter_context(socket.create_server(("127.0.0.1", 0)))
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), daemon=True)
+            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp}, daemon=True)
             thread.start()
             if args.openconnect:
                 marker = tmp / "reply"
                 script = shlex.join([sys.executable, __file__, "--probe", str(marker)])
                 with subprocess.Popen(
                     [args.openconnect, "--protocol=gp", "--non-inter", "--passwd-on-stdin",
-                     "--user=alice", "--os=linux", "--no-dtls", "--cafile", cert,
+                     "--user=alice", "--os=linux", *([] if esp else ["--no-dtls"]), "--cafile", cert,
                      "--script-tun", "--script", script, f"https://localhost:{port}/gateway"],
                     stdin=subprocess.PIPE, text=True,
                 ) as client:
@@ -253,7 +351,8 @@ def main():
                 assert marker.exists(), "OpenConnect did not carry an echo reply"
                 print("OpenConnect received an ICMP echo reply with valid checksums and matching payload")
             elif args.full_vm:
-                subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin],
+                subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin, "",
+                                ("TLS" if args.drop_esp else "ESP") if esp else ""],
                                check=True, timeout=300)
             elif args.vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
@@ -272,7 +371,15 @@ def main():
                 assert result.stdout.count("echo reply from 10.77.0.1") == 2
             thread.join(2)
             assert not errors, errors
-            exchange = ["getconfig.esp", "hipreportcheck.esp", "ssl-tunnel-connect.sslvpn", "echo"]
+            exchange = ["getconfig.esp", "hipreportcheck.esp"]
+            if esp:
+                assert not esp.errors, esp.errors
+                assert esp.probes > 0, "client sent no authenticated ESP probes"
+                if not args.drop_esp:
+                    assert len(set(esp.echo)) == (1 if args.openconnect else 2), esp.echo
+                    print("ESP carried packet echo on each negotiated association")
+            if not esp or args.drop_esp:
+                exchange += ["ssl-tunnel-connect.sslvpn", "echo"]
             expected = ["prelogin.esp", "login.esp"] + exchange * (1 if args.openconnect else 2)
             assert calls == expected + ["logout.esp"], calls
     print("GlobalProtect TLS packet check passed")

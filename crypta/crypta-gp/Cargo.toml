@@ -8,3 +8,8 @@ license.workspace = true
 crypta-ac = { path = "../crypta-ac" }
 crypta-proto = { path = "../crypta-proto" }
 zeroize = "1"
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = { version = "0.1", features = ["zeroize"] }
+getrandom = "0.2"
+hmac = "0.12"
+sha1 = "0.10"

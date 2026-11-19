@@ -762,8 +762,22 @@ another origin. An active portal-profile session stays in engine memory.
   checks Arca for persisted credentials. The peer verifies that portal
   credentials, cookies and tokens stay at the portal. A single gateway login
   carries IPv4 echo before and after rebind, followed by logout.
-  ESP and reviewed HIP reporting remain in V5. Scripted SSO and passkeys
-  remain parked pending Navigator I3.
+  Reviewed HIP reporting remains in V5. Scripted SSO and passkeys remain
+  parked pending Navigator I3.
+- GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
+  suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
+  IVs and a 64-packet replay window. The engine probes the authenticated path
+  before sending tun traffic. Rebind and tunnel renewal get new associations
+  from the existing TLS control session. An absent or unsupported offer, a
+  failed probe, or a lost ESP path falls back to TLS. The jail grant and
+  tagged egress exception cover only TCP to the configured HTTPS port and
+  UDP/4501 to that same gateway.
+- `crypta-gp-packet-check.py --full-vm arm64 --esp` checks ESP echo before and
+  after rebind, with a fresh association for each connection.
+  `--full-vm arm64 --drop-esp` drops authenticated probes and checks echo
+  through the TLS fallback on both connections. `--esp --openconnect PATH`
+  independently checks OpenConnect against the same UDP packet peer. Both
+  FreeBSD arm64 gates passed 9/9 and OpenConnect 9.21 carried ESP echo.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
 

@@ -21,6 +21,7 @@ pub const TUN_MTU_MAX: u16 = 1500;
 /// pf tag jaild puts on a Crypta engine's flows (on its epair), which only
 /// those may carry to a gateway's address and port out the physical
 /// interface (§5.4).
+pub const GLOBALPROTECT_ESP_PORT: u16 = 4501;
 pub const OUTER_TAG: &str = "CRYPTA_OUTER";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub struct Tunnel {
     /// The engine reaches the gateway over TCP (AnyConnect's TLS, §9),
     /// not UDP (WireGuard).
     pub tcp: bool,
+    /// GlobalProtect also needs UDP/4501 to the same gateway.
+    pub gp_esp: bool,
     /// Block when not connected (§5.4): only with `full`.
     pub block: bool,
     /// Persona scope (§5.3, §9.7): the routes go in the tunnel's own route
@@ -153,7 +156,8 @@ impl Tunnel {
             insecure: flag("insecure")?,
             gateway: l.get("gw")?.parse().ok()?,
             port: l.num::<u16>("port")?,
-            tcp: l.get("proto") == Some("tcp"),
+            tcp: matches!(l.get("proto"), Some("tcp" | "gp")),
+            gp_esp: l.get("proto") == Some("gp"),
             block: flag("block")?,
             scoped: flag("scoped")?,
         })
@@ -173,7 +177,7 @@ impl Tunnel {
             .with("full", self.full as u8)
             .with("gw", self.gateway)
             .with("port", self.port)
-            .with("proto", if self.tcp { "tcp" } else { "udp" })
+            .with("proto", if self.gp_esp { "gp" } else if self.tcp { "tcp" } else { "udp" })
             .with("block", self.block as u8)
             .with("insecure", self.insecure as u8)
             .with("scoped", self.scoped as u8);
@@ -269,6 +273,8 @@ pub struct AnchorTunnel<'a> {
     pub gateway: Ipv4Addr,
     pub port: u16,
     pub tcp: bool,
+    /// GlobalProtect also needs UDP/4501 to the same gateway.
+    pub gp_esp: bool,
     pub full: bool,
     pub block: bool,
     /// A persona-scoped tunnel's DNS (§5.5, V2): every lookup from an app in
@@ -317,6 +323,9 @@ pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
             t.gateway,
             t.port
         ));
+        if t.gp_esp {
+            r.push_str(&format!("pass out quick on {out} inet proto udp from any to {} port {GLOBALPROTECT_ESP_PORT} tagged {OUTER_TAG} keep state\n", t.gateway));
+        }
         r.push_str(&format!("block out quick on {out} inet from any to {}\n", t.gateway));
         // Nothing from the tunnel opens a connection here (§5.4): only
         // replies to flows we opened, which pf's states pass before rules.
@@ -410,8 +419,21 @@ mod tests {
     }
 
     #[test]
+    fn globalprotect_allows_only_tagged_esp_to_its_gateway() {
+        let gateway = Ipv4Addr::new(198, 51, 100, 52);
+        let tunnel = AnchorTunnel {
+            iface: "tun0", gateway, port: 443, tcp: true, gp_esp: true,
+            full: true, block: true, rdr: None,
+        };
+        let rules = render_anchor(&[tunnel], Some("vtnet1"));
+        let esp = "pass out quick on vtnet1 inet proto udp from any to 198.51.100.52 port 4501 tagged CRYPTA_OUTER keep state";
+        let block = "block out quick on vtnet1 inet from any to 198.51.100.52";
+        assert!(rules.find(esp).unwrap() < rules.find(block).unwrap());
+    }
+
+    #[test]
     fn the_anchor() {
-        let t = AnchorTunnel { iface: "tun0", gateway: Ipv4Addr::new(198, 51, 100, 51), port: 51820, tcp: false, full: true, block: true, rdr: None };
+        let t = AnchorTunnel { iface: "tun0", gateway: Ipv4Addr::new(198, 51, 100, 51), port: 51820, tcp: false, gp_esp: false, full: true, block: true, rdr: None };
         let a = render_anchor(&[t], Some("vtnet1"));
         let lines: Vec<&str> = a.lines().collect();
         assert_eq!(lines[0], "nat on tun0 inet from 100.64.0.0/16 to any -> (tun0)");
@@ -419,26 +441,26 @@ mod tests {
         assert_eq!(lines[2], "block out quick on vtnet1 inet from any to 198.51.100.51");
         assert_eq!(lines[3], "block in quick on tun0 all");
         assert_eq!(*lines.last().unwrap(), "block out quick on vtnet1 all");
-        let split = AnchorTunnel { iface: "tun1", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 51820, tcp: false, full: false, block: false, rdr: None };
+        let split = AnchorTunnel { iface: "tun1", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 51820, tcp: false, gp_esp: false, full: false, block: false, rdr: None };
         let a = render_anchor(&[split], Some("vtnet1"));
         assert!(!a.contains("block out quick on vtnet1 all"));
         // AnyConnect's engine: TCP to the gateway.
-        let ac = AnchorTunnel { iface: "tun4", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 443, tcp: true, full: false, block: false, rdr: None };
+        let ac = AnchorTunnel { iface: "tun4", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 443, tcp: true, gp_esp: false, full: false, block: false, rdr: None };
         assert!(render_anchor(&[ac], Some("vtnet1")).contains("pass out quick on vtnet1 inet proto tcp from any to 198.51.100.52 port 443 tagged CRYPTA_OUTER keep state"));
         assert!(!a.contains("inet6"));
         // A full tunnel without the block still keeps IPv6 from going around it.
-        let open = AnchorTunnel { iface: "tun2", gateway: Ipv4Addr::new(198, 51, 100, 53), port: 51820, tcp: false, full: true, block: false, rdr: None };
+        let open = AnchorTunnel { iface: "tun2", gateway: Ipv4Addr::new(198, 51, 100, 53), port: 51820, tcp: false, gp_esp: false, full: true, block: false, rdr: None };
         let a = render_anchor(&[open], None);
         assert!(a.contains("block out quick on atrium_egress inet6 all"));
         assert!(!a.contains("block out quick on atrium_egress all"));
         // A persona's tunnel: its apps' lookups go to its DNS, and it is
         // neither full nor blocking for the machine.
-        let work = AnchorTunnel { iface: "tun3", gateway: Ipv4Addr::new(198, 51, 100, 54), port: 51820, tcp: false, full: false, block: false, rdr: Some((2, Ipv4Addr::new(10, 99, 0, 1))) };
+        let work = AnchorTunnel { iface: "tun3", gateway: Ipv4Addr::new(198, 51, 100, 54), port: 51820, tcp: false, gp_esp: false, full: false, block: false, rdr: Some((2, Ipv4Addr::new(10, 99, 0, 1))) };
         let a = render_anchor(&[work], Some("vtnet1"));
         assert_eq!(a.lines().next().unwrap(), "rdr pass on atrium inet proto { udp tcp } from <atrium_fib_2> to any port 53 -> 10.99.0.1 port 53");
         assert!(!a.contains("block out quick on vtnet1 all"));
         // AnyConnect's engine: TCP to the gateway.
-        let ac = AnchorTunnel { iface: "tun4", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 443, tcp: true, full: false, block: false, rdr: None };
+        let ac = AnchorTunnel { iface: "tun4", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 443, tcp: true, gp_esp: false, full: false, block: false, rdr: None };
         assert!(render_anchor(&[ac], Some("vtnet1")).contains("pass out quick on vtnet1 inet proto tcp from any to 198.51.100.52 port 443 tagged CRYPTA_OUTER keep state"));
     }
 }

@@ -308,7 +308,12 @@ pub fn is_crypta_engine(req: &CreateJailRequest, policy: &Policy) -> bool {
         NetworkConfig::Routed { grants: Some(g), fib: None, .. } => {
             !g.outbound_any && g.no_resolver && g.peers.is_empty() && g.inbound.is_empty() && !g.outbound.is_empty()
                 && g.outbound.len() <= 8
-                && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some() && d.udp == udp)
+                && g.outbound.iter().all(|d| d.cidr.ends_with("/32") && d.port.is_some())
+                && (g.outbound.iter().all(|d| d.udp == udp)
+                    || (!udp && g.outbound.len() == 2 && g.outbound.iter().any(|d| {
+                        d.udp && d.port == Some(4501)
+                            && g.outbound.iter().any(|tls| !tls.udp && tls.cidr == d.cidr)
+                    })))
                 && g.tag.as_deref() == Some(CRYPTA_TAG)
         }
         _ => false,
@@ -1350,12 +1355,20 @@ mod tests {
             assert!(!is_crypta_engine(&r, &p), "{why}");
             assert!(validate_create(&r, &p).is_err(), "{why}");
         }
-        // The AnyConnect engine: TCP to its gateway, never UDP.
+        // The corporate executable accepts TCP and the fixed GP ESP pair.
         let ac = "/usr/local/bin/atrium-crypta-ac";
         let tcp = || vec![NetDest { cidr: "198.51.100.52/32".into(), port: Some(443), udp: false }];
         let ok = engine("system-crypta-61002", ac, 61002, routed(grants(tcp(), Some("CRYPTA_OUTER"))));
         assert!(is_crypta_engine(&ok, &p));
         validate_create(&ok, &p).expect("an AnyConnect engine");
+        let esp = |cidr: &str, port| {
+            let mut destinations = tcp();
+            destinations.push(NetDest { cidr: cidr.into(), port: Some(port), udp: true });
+            engine("system-crypta-61002", ac, 61002, routed(grants(destinations, Some("CRYPTA_OUTER"))))
+        };
+        assert!(is_crypta_engine(&esp("198.51.100.52/32", 4501), &p));
+        assert!(!is_crypta_engine(&esp("198.51.100.51/32", 4501), &p));
+        assert!(!is_crypta_engine(&esp("198.51.100.52/32", 4500), &p));
         for (r, why) in [
             (engine("system-crypta-61002", ac, 61002, routed(grants(gw(), Some("CRYPTA_OUTER")))), "ac over udp"),
             (engine("system-crypta-61002", ac, 61002, routed(grants(tcp(), None))), "ac untagged"),

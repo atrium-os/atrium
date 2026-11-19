@@ -90,6 +90,9 @@ SSO_GW = bytes([172, 16, 47, 1])  # the SAML stand-in and Keycloak, privately
 GW_PORTS = {AC_GW: AC_PORTS, SSO_GW: {447: 8447, 448: 8448}}
 if "CRYPTA_GP_PORTAL_PORT" in os.environ:
     GW_PORTS[bytes([198, 51, 100, 54])] = {450: int(os.environ["CRYPTA_GP_PORTAL_PORT"])}
+GP_ESP_PORT = 4501
+GP_ESP_RELAY = ("127.0.0.1", int(os.environ["CRYPTA_GP_TEST_ESP"])) if "CRYPTA_GP_TEST_ESP" in os.environ else None
+gp_peer = None
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
 seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
@@ -871,7 +874,7 @@ def see(typ, p):
 
 
 def frame(f, relay=None):
-    global wg_peer
+    global wg_peer, gp_peer
     stats["frames"] += 1
     if len(f) < 14:
         return []
@@ -904,6 +907,10 @@ def frame(f, relay=None):
             stats["wg_out"] = stats.get("wg_out", 0) + 1
             wg_peer = (src, s, sport)
             relay.sendto(body[8:], WG_RELAY)
+            return []
+        if d == AC_GW and dport == GP_ESP_PORT and relay is not None and GP_ESP_RELAY:
+            gp_peer = (src, s, sport)
+            relay.sendto(body[8:], GP_ESP_RELAY)
             return []
         if dport == 5353 and d == MDNS_GROUP:
             return handle_mdns(src, s, sport, body[8:])
@@ -972,6 +979,9 @@ def main():
                 stats["wg_in"] = stats.get("wg_in", 0) + 1
                 gmac, gip, gport = wg_peer
                 lan.sendto(eth(gmac, RMAC, 0x0800, ip(WG_GW, gip, 17, udp(WG_GW, gip, WG_PORT, gport, m))), GUEST)
+            if a == GP_ESP_RELAY and gp_peer:
+                gmac, gip, gport = gp_peer
+                lan.sendto(eth(gmac, RMAC, 0x0800, ip(AC_GW, gip, 17, udp(AC_GW, gip, GP_ESP_PORT, gport, m))), GUEST)
         if ctl in r:
             c, a = ctl.recvfrom(256)
             w = c.decode().strip()

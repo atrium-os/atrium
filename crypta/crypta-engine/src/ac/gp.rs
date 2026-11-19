@@ -18,6 +18,7 @@ pub(super) enum Mode {
 enum LinkEnd {
     Stop(Stop),
     Expired,
+    EspLost,
 }
 
 impl From<Stop> for LinkEnd {
@@ -229,11 +230,11 @@ impl Engine {
         Ok(session)
     }
 
-    fn gp_open(
+    fn gp_configure(
         &mut self,
         jar: &mut Jar,
         session: &gp::Session,
-    ) -> Result<(tls::Tls, gp::Config, Vec<u8>), LinkEnd> {
+    ) -> Result<gp::Config, LinkEnd> {
         let (status, body) = self.gp_post(jar, gp::CONFIG, &session.config(&self.st.hostname))?;
         match status {
             200 => {}
@@ -251,6 +252,10 @@ impl Engine {
         }
         gp::hip_check(&body).map_err(refused)?;
 
+        Ok(config)
+    }
+
+    fn gp_open_tls(&mut self, session: &gp::Session) -> Result<(tls::Tls, Vec<u8>), LinkEnd> {
         let mut stream = self.connect()?;
         stream
             .send(session.tunnel_request().as_bytes())
@@ -272,7 +277,7 @@ impl Engine {
             .s
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(gateway_io)?;
-        Ok((stream, config, buf.split_off(gp::START_TUNNEL.len())))
+        Ok((stream, buf.split_off(gp::START_TUNNEL.len())))
     }
 
     pub(super) fn run_gp(&mut self, mode: Mode) -> Result<(), String> {
@@ -294,6 +299,8 @@ impl Engine {
         };
         let mut jar = Jar::default();
         let mut delay = 1;
+        let mut tls_only = false;
+        let mut esp_spis = Vec::new();
         loop {
             let result = (|| {
                 if session.is_none() {
@@ -304,7 +311,37 @@ impl Engine {
                     session = Some(self.gp_login(&mut jar, durable)?);
                 }
                 let active = session.as_ref().unwrap();
-                let (t, config, first) = self.gp_open(&mut jar, active)?;
+                let mut config = self.gp_configure(&mut jar, active)?;
+                let mut esp = None;
+                if let (Some(keys), Some(socket)) = (config.esp.take(), self.esp.as_ref()) {
+                    let spis = (keys.transmit.spi(), keys.receive.spi());
+                    let fresh = esp_spis.len() < 256
+                        && !esp_spis
+                            .iter()
+                            .any(|&(tx, rx)| spis.0 == tx || spis.1 == rx);
+                    if !tls_only && fresh {
+                        esp_spis.push(spis);
+                        match super::gp_esp::Transport::start(
+                            socket,
+                            keys,
+                            config.push.addr,
+                            &mut self.ctl,
+                        ) {
+                            Ok(t) => {
+                                // IPv4/UDP, the ESP header and IV, padding and authentication tag.
+                                config.push.mtu = config.push.mtu.min(1420);
+                                esp = Some(t);
+                            }
+                            Err(Stop::Told) => return Err(Stop::Told.into()),
+                            Err(_) => log("GlobalProtect ESP probe failed; using TLS"),
+                        }
+                    }
+                }
+                let tls = if esp.is_none() {
+                    Some(self.gp_open_tls(active)?)
+                } else {
+                    None
+                };
                 self.ctl.send(&FromEngine::Pushed(config.push.clone()));
                 if self
                     .ctl
@@ -317,11 +354,27 @@ impl Engine {
                 }
                 self.ctl.send(&FromEngine::Up);
                 delay = 1;
-                let ended = self.gp_pump(t, &config, first);
-                Err::<(), _>(LinkEnd::Stop(ended))
+                if let Some(esp) = esp {
+                    log("GlobalProtect data transport: ESP");
+                    let ended = self.gp_pump_esp(esp, &config);
+                    return Err(match ended {
+                        Ok(stop) => LinkEnd::Stop(stop),
+                        Err(()) => LinkEnd::EspLost,
+                    });
+                }
+                let (t, first) = tls.expect("one data transport");
+                log("GlobalProtect data transport: TLS");
+                tls_only = false;
+                Err::<(), _>(LinkEnd::Stop(self.gp_pump(t, &config, first)))
             })();
             match result {
                 Ok(()) => return Ok(()),
+                Err(LinkEnd::EspLost) => {
+                    tls_only = true;
+                    self.ctl.send(&FromEngine::Down {
+                        why: "GlobalProtect ESP lost; reconnecting over TLS".into(),
+                    });
+                }
                 Err(LinkEnd::Expired) => {
                     session = None;
                     jar = Jar::default();

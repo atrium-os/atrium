@@ -47,7 +47,7 @@ pub struct Engine {
 /// `secrets` AnyConnect (TCP, the secrets helper's socket at fd 4). On
 /// failure the jail is released before the error returns; its root is the
 /// janitor's.
-pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secrets: Option<BorrowedFd<'_>>) -> Result<Engine, String> {
+pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secrets: Option<BorrowedFd<'_>>, gp: bool) -> Result<Engine, String> {
     let ac = secrets.is_some();
     if !try_teardown(uid) {
         return Err(format!("{} is still being torn down", name(uid)));
@@ -61,10 +61,15 @@ pub fn launch(jaild: &str, uid: u32, gw: SocketAddrV4, tun: BorrowedFd<'_>, secr
         mounts.push(ro("/etc/ssl"));
     }
     let id = portcullis_identity::for_app(&format!("org.atrium.crypta.engine.{uid}")).map_err(|e| format!("host identity: {e}"))?;
+    let cidr = format!("{}/32", gw.ip());
+    let mut outbound = vec![NetDest { cidr: cidr.clone(), port: Some(gw.port()), udp: !ac }];
+    if gp {
+        outbound.push(NetDest { cidr, port: Some(net_proto::tunnel::GLOBALPROTECT_ESP_PORT), udp: true });
+    }
     let grants = NetGrants {
         app_key: portcullis_identity::consent_key(&name(uid)),
         outbound_any: false,
-        outbound: vec![NetDest { cidr: format!("{}/32", gw.ip()), port: Some(gw.port()), udp: !ac }],
+        outbound,
         peers: vec![],
         inbound: vec![],
         no_resolver: true,

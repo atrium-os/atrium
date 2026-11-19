@@ -313,6 +313,7 @@ impl Profile {
             gateway: *gw.ip(),
             port: gw.port(),
             tcp: true,
+            gp_esp: self.ac.as_ref().is_some_and(|a| a.globalprotect),
             block: self.block && p.full,
             scoped: self.scoped,
         }
@@ -336,6 +337,7 @@ impl Profile {
             gateway: *self.endpoint.ip(),
             port: self.endpoint.port(),
             tcp: false,
+            gp_esp: false,
             block: self.block && full,
             scoped: self.scoped,
         }
