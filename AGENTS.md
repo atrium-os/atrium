@@ -1,8 +1,14 @@
 # AGENTS.md — rules for any coding agent working in Atrium
 
 Atrium is a FreeBSD-based desktop platform (16.0-CURRENT, arm64 first, x86_64
-port in progress). This file holds the project rules every agent needs. The
-long-form references are:
+port in progress). This file holds the project rules every agent needs.
+
+The repo is `github.com/atrium-os/atrium`, cloned on the Mac at `~/src/bsd`
+(scripts and `.cargo/config.toml` assume that path). The companion
+`atrium-os/fresco` repo sits beside it at `~/src/fresco`; FreeBSD sources
+are `atrium-os/freebsd-src`, branch `atrium-os`, in `freebsd-src/`.
+
+The long-form references are:
 
 - [README.md](README.md): what Atrium is, tree layout, quick start.
 - [RUNBOOK.md](RUNBOOK.md): how to build, boot, deploy and test everything
