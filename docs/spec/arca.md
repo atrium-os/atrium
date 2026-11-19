@@ -322,6 +322,18 @@ this call only after verifying the printer's pinned identity and checking that t
 printer can accept a PIN before document upload. See [printing.md](printing.md)
 §11.6 for the wire path and simulator gate.
 
+### Saved IPPS logins
+
+Printer recipients carry a TLS SPKI digest and IPP UUID. The trusted UI saves
+one username and password per user, persona and printer via
+`U_STORE_PRINT_LOGIN`. Arca keeps it in that user’s encrypted store in the
+while-unlocked class and updates it atomically when the UI saves a replacement.
+The root Prelum broker can ask for a one-use `PRINT_LOGIN_GRANT`. It receives no
+credential bytes. A reserved worker UID can redeem the grant with
+`TAKE_PRINT_LOGIN` and the matching identity. The worker sends the login only
+over authenticated IPPS after its identity query. See [printing.md](printing.md)
+§11.6.
+
 ## 6. At rest and in memory
 
 ### 6.1 The key hierarchy

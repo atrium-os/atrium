@@ -246,7 +246,9 @@ impl State {
             Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC9).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::PrintWorker if op == op::TAKE_PRINT_PIN => self.take_print_pin(body),
-            Label::PrintWorker => reply(status::DENIED),
+            Label::PrintWorker if op == op::TAKE_PRINT_LOGIN => self.take_print_login(body),
+            Label::PrintBroker if op == op::PRINT_LOGIN_GRANT => self.print_login_grant(body),
+            Label::PrintWorker | Label::PrintBroker => reply(status::DENIED),
             Label::Unknown => reply(status::UNKNOWN_PEER),
         };
         self.audit(who, op, item.as_ref(), r.status);
@@ -278,6 +280,7 @@ impl State {
                 _ => "courier:?".into(),
             },
             Label::PrintWorker => "prelum-ipp".into(),
+            Label::PrintBroker => "prelumd".into(),
             Label::Unknown => "unknown".into(),
         };
         let item = item.map(|i| i.hex()).unwrap_or_else(|| "-".into());
@@ -1465,6 +1468,7 @@ impl State {
             }
             op::U_ACCOUNTS | op::U_HOLD | op::U_HANDLE | op::U_GENERATE => self.field_op(op, body, item),
             op::U_HOLD_PRINT_PIN => self.hold_print_pin(body),
+            op::U_STORE_PRINT_LOGIN => self.store_print_login(body, item),
             op::U_DROP => {
                 let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
                 self.handles.drop_handle(&h);
@@ -1472,6 +1476,87 @@ impl State {
             }
             _ => reply(status::DENIED),
         }
+    }
+
+    fn store_print_login(&mut self, body: &[u8], item: &mut Option<ItemId>) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let (user, persona, key, uuid) = print_pin_binding(&mut r)?;
+            let recipient = Recipient::printer(key, uuid)?;
+            let account = r.str(caps::ACCOUNT)?;
+            let password = r.bytes(1024)?;
+            r.end()?;
+            Ok::<_, Error>((user, persona, recipient, account, password))
+        })();
+        let Ok((user, persona, recipient, account, password)) = parsed else { return malformed() };
+        if account.is_empty() || account.contains(':') || account.chars().any(char::is_control)
+            || password.is_empty() || password.iter().any(u8::is_ascii_control)
+        {
+            return malformed();
+        }
+        let Some(store) = self.stores.get_mut(user).filter(|s| s.state() == LockState::Unlocked) else {
+            return reply(status::LOCKED);
+        };
+        let access = Access { persona, recipient: &recipient };
+        let existing = tri!(store.list(&access)).into_iter().find(|m| m.kind == Kind::Password);
+        let meta = match existing {
+            Some(m) => tri!(store.update(&m.id, &access, password, Some(account))),
+            None => tri!(store.add(NewItem {
+                persona, recipient, class: Class::WhileUnlocked, kind: Kind::Password,
+                provenance: Provenance::UserTyped, account, scope: b"", value: password,
+            })),
+        };
+        *item = Some(meta.id);
+        ok(Vec::new())
+    }
+
+    fn print_login_grant(&mut self, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let (user, persona, key, uuid) = print_pin_binding(&mut r)?;
+            r.end()?;
+            Ok::<_, Error>((user, persona, Recipient::printer(key, uuid)?))
+        })();
+        let Ok((user, persona, recipient)) = parsed else { return malformed() };
+        let Some(store) = self.stores.get(user).filter(|s| s.state() == LockState::Unlocked) else {
+            // An ordinary job can proceed without credentials.
+            return ok(Vec::new());
+        };
+        let access = Access { persona, recipient: &recipient };
+        let Some(meta) = tri!(store.list(&access)).into_iter().find(|m| m.kind == Kind::Password) else {
+            return ok(Vec::new());
+        };
+        let entry = crate::handles::Entry {
+            user: user.into(), persona: persona.into(), recipient,
+            source: crate::handles::Source::Item(meta.id),
+            expires: std::time::Instant::now() + crate::handles::TTL,
+            generated: false, hold: crate::handles::HOLD_PRINT_LOGIN, printer: None,
+        };
+        self.handles.issue(entry).map_or_else(|| reply(status::FULL), |h| ok(h.to_vec()))
+    }
+
+    fn take_print_login(&mut self, body: &[u8]) -> Reply {
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let h = r.array::<16>()?;
+            let recipient = Recipient::printer(r.array::<32>()?, r.str(36)?)?;
+            r.end()?;
+            Ok::<_, Error>((h, recipient))
+        })();
+        let Ok((h, recipient)) = parsed else { return malformed() };
+        let Some(entry) = self.handles.take_print_login(&h, &recipient) else { return reply(status::DENIED) };
+        let crate::handles::Source::Item(id) = entry.source else { return reply(status::DENIED) };
+        let Some(store) = self.stores.get(&entry.user).filter(|s| s.state() == LockState::Unlocked) else {
+            return reply(status::LOCKED);
+        };
+        let (meta, password) = tri!(store.release(&id, &Access { persona: &entry.persona, recipient: &recipient }, None));
+        if meta.kind != Kind::Password { return reply(status::DENIED); }
+        let n = meta.account.len();
+        let mut login = tri!(LockedBuf::zeroed(n + 1 + password.len()).map_err(Error::Io));
+        login.as_mut()[..n].copy_from_slice(meta.account.as_bytes());
+        login.as_mut()[n] = b':';
+        login.as_mut()[n + 1..].copy_from_slice(password.as_ref());
+        Reply { status: status::OK, body: Body::Secret(login) }
     }
 
     fn hold_print_pin(&mut self, body: &[u8]) -> Reply {

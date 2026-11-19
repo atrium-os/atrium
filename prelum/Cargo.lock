@@ -1309,6 +1309,8 @@ name = "prelumd"
 version = "0.1.0"
 dependencies = [
  "aqueduct",
+ "arca-store",
+ "arcad",
  "atrium-netconf",
  "base64",
  "jaild",

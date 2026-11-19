@@ -306,24 +306,27 @@ fn why(msg: &str) -> Option<Why> {
     }
 }
 
-struct PinPrompt {
+struct PrinterCredentialPrompt {
     parent: Parent,
     embed: EmbedId,
     printer: u32,
     scale: f32,
     config: Option<credential::ToChild>,
     pending: Option<(Print, OwnedFd, Instant)>,
+    saving_login_since: Option<Instant>,
 }
 
-impl PinPrompt {
-    fn open(path: &PathBuf, app_uid: u32, printer: u32, window: WindowToken, scale: f32) -> Result<Self, String> {
-        let binding = prelumd(path, app_uid)?.pin_binding(printer).map_err(|e| e.message)?;
-        let config = credential::ToChild::ConfigurePrintPin {
-            user: binding.user, persona: binding.persona, key: binding.key, uuid: binding.uuid,
-        };
-        let mut parent = Parent::connect().map_err(|e| format!("Cannot open the Arca PIN field ({e:?})"))?;
-        let embed = parent.request("credential", window).map_err(|e| format!("Cannot open the Arca PIN field ({e:?})"))?;
-        let mut pin = Self { parent, embed, printer, scale, config: Some(config), pending: None };
+impl PrinterCredentialPrompt {
+    fn open(path: &PathBuf, app_uid: u32, printer: u32, window: WindowToken, scale: f32, login: bool) -> Result<Self, String> {
+        let mut client = prelumd(path, app_uid)?;
+        let binding = if login { client.login_binding(printer) } else { client.pin_binding(printer) }
+            .map_err(|e| e.message)?;
+        let prelum_proto::print::PinBinding { user, persona, key, uuid } = binding;
+        let config = if login { credential::ToChild::ConfigurePrintLogin { user, persona, key, uuid } }
+            else { credential::ToChild::ConfigurePrintPin { user, persona, key, uuid } };
+        let mut parent = Parent::connect().map_err(|e| format!("Cannot open the Arca field ({e:?})"))?;
+        let embed = parent.request("credential", window).map_err(|e| format!("Cannot open the Arca field ({e:?})"))?;
+        let mut pin = Self { parent, embed, printer, scale, config: Some(config), pending: None, saving_login_since: None };
         pin.place(scale)?;
         Ok(pin)
     }
@@ -331,7 +334,7 @@ impl PinPrompt {
     fn place(&mut self, scale: f32) -> Result<(), String> {
         let r = view::pin_slot();
         self.parent.place(self.embed, Some([r.x() * scale, r.y() * scale, r.w() * scale, r.h() * scale]))
-            .map_err(|e| format!("Cannot place the Arca PIN field ({e:?})"))?;
+            .map_err(|e| format!("Cannot place the Arca field ({e:?})"))?;
         self.scale = scale;
         Ok(())
     }
@@ -340,16 +343,16 @@ impl PinPrompt {
         if self.scale != scale {
             self.place(scale)?;
         }
-        match self.parent.poll(Duration::from_millis(1)).map_err(|_| "The Arca PIN field disconnected")? {
+        match self.parent.poll(Duration::from_millis(1)).map_err(|_| "The Arca field disconnected")? {
             Some(ParentEvent::Attached { embed }) if embed == self.embed => {
                 if let Some(config) = self.config.take() {
-                    self.parent.send(embed, config.encode()).map_err(|_| "Cannot configure the Arca PIN field")?;
+                    self.parent.send(embed, config.encode()).map_err(|_| "Cannot configure the Arca field")?;
                 }
                 Ok(None)
             }
             Some(ParentEvent::Message { embed, bytes }) if embed == self.embed => Ok(credential::ToParent::decode(&bytes)),
             Some(ParentEvent::ChildLost { embed } | ParentEvent::Detached { embed }) if embed == self.embed => {
-                Err("The Arca PIN field closed. Remove the PIN field and open it again.".into())
+                Err("The Arca field closed. Open it again.".into())
             }
             _ => Ok(None),
         }
@@ -403,7 +406,7 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
         state.set(s);
     };
     let mut ready = false;
-    let mut pin: Option<PinPrompt> = None;
+    let mut pin: Option<PrinterCredentialPrompt> = None;
     let mut guarded = (0.0f32, 0.0f32);
     // Previews: what was last asked for, and when settings last changed.
     let mut gen = 0u64;
@@ -565,6 +568,21 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
         if let Some(prompt) = &mut pin {
             let result = prompt.poll(k);
             match result {
+                Ok(Some(credential::ToParent::PrintLoginSaved)) if prompt.saving_login_since.is_some() => {
+                    pin = None;
+                    v.login_account.set(pergola::text_edit::TextEdit::new(""));
+                    set(&|s| {
+                        s.login_printer = None;
+                        s.working = None;
+                        s.notice = Some(("Printer login saved.".into(), Tone::Quiet));
+                    });
+                }
+                Ok(Some(credential::ToParent::Cleared)) if prompt.saving_login_since.take().is_some() => {
+                    set(&|s| {
+                        s.working = None;
+                        s.notice = Some(("Arca could not save this login. Check the username, password and lock state.".into(), Tone::Error));
+                    });
+                }
                 Ok(Some(credential::ToParent::Handle { handle })) => {
                     if let Some((print, fd, _)) = prompt.pending.take() {
                         let _ = job_tx.send(Job::PrintPin { print, fd, handle });
@@ -583,11 +601,12 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
                         s.notice = Some((message.clone(), Tone::Error));
                     });
                 }
-                _ if prompt.pending.as_ref().is_some_and(|(_, _, at)| at.elapsed() > Duration::from_secs(8)) => {
+                _ if prompt.pending.as_ref().is_some_and(|(_, _, at)| at.elapsed() > Duration::from_secs(8))
+                    || prompt.saving_login_since.is_some_and(|at| at.elapsed() > Duration::from_secs(8)) => {
                     pin = None;
                     set(&|s| {
                         s.working = None;
-                        s.notice = Some(("Arca did not answer. Remove the PIN field and open it again.".into(), Tone::Error));
+                        s.notice = Some(("Arca did not answer. Close the credential field and try again.".into(), Tone::Error));
                     });
                 }
                 _ => {}
@@ -599,14 +618,31 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
         if asked != Asked::default() {
             v.asked.set(Asked::default());
             if asked.cancel {
+                if state.get_cloned().login_printer.is_some() {
+                    pin = None;
+                    v.login_account.set(pergola::text_edit::TextEdit::new(""));
+                    set(&|s| { s.login_printer = None; s.working = None; s.notice = None; });
+                    continue;
+                }
                 return end(&tx, &stop, ToParent::Cancelled);
+            }
+            if asked.open_login && state.get_cloned().working.is_none() {
+                if let (Dest::Saved(printer), Some(window)) = (state.get_cloned().dest(), win.embed_token()) {
+                    match PrinterCredentialPrompt::open(&prelum, app_uid, printer.id, window, k, true) {
+                        Ok(prompt) => {
+                            pin = Some(prompt);
+                            set(&|s| { s.login_printer = Some(printer.id); s.notice = None; });
+                        }
+                        Err(message) => set(&|s| s.notice = Some((message.clone(), Tone::Error))),
+                    }
+                }
             }
             if asked.toggle_pin && state.get_cloned().working.is_none() {
                 if state.get_cloned().pin_requested() {
                     pin = None;
                     set(&|s| { s.pin_printer = None; s.notice = None; });
                 } else if let (Dest::Saved(printer), Some(window)) = (state.get_cloned().dest(), win.embed_token()) {
-                    match PinPrompt::open(&prelum, app_uid, printer.id, window, k) {
+                    match PrinterCredentialPrompt::open(&prelum, app_uid, printer.id, window, k, false) {
                         Ok(prompt) => {
                             pin = Some(prompt);
                             set(&|s| { s.pin_printer = Some(printer.id); s.notice = None; });
@@ -618,6 +654,26 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
             if let Some(token) = asked.print {
                 let s = state.get_cloned();
                 if s.working.is_some() {
+                    continue;
+                }
+                if s.login_printer.is_some() {
+                    let account = v.login_account.get_cloned().text().to_owned();
+                    if account.is_empty() || account.len() > 512 || account.contains(':') || account.chars().any(char::is_control) {
+                        set(&|s| s.notice = Some(("Enter a valid printer username.".into(), Tone::Warning)));
+                        continue;
+                    }
+                    if counted(token).is_err() {
+                        set(&|s| s.notice = Some(("That press didn’t count. Press Save login again.".into(), Tone::Warning)));
+                        continue;
+                    }
+                    if let Some(prompt) = pin.as_mut().filter(|p| p.config.is_none()) {
+                        if prompt.parent.send(prompt.embed, credential::ToChild::SavePrintLogin { account }.encode()).is_ok() {
+                            prompt.saving_login_since = Some(Instant::now());
+                            set(&|s| { s.notice = None; s.working = Some("Saving in Arca…"); });
+                            continue;
+                        }
+                    }
+                    set(&|s| s.notice = Some(("The Arca field is unavailable. Go back and open Printer login again.".into(), Tone::Error)));
                     continue;
                 }
                 match s.action() {

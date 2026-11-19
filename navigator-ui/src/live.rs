@@ -696,7 +696,7 @@ impl Live {
                     ParentEvent::Message { bytes, .. } => match limen::credential::ToParent::decode(&bytes) {
                         Some(limen::credential::ToParent::Handle { handle }) => s.arca_handle(Some(handle)),
                         Some(limen::credential::ToParent::Cleared) => s.arca_handle(None),
-                        Some(limen::credential::ToParent::Filled { .. }) => {}
+                        Some(limen::credential::ToParent::Filled { .. } | limen::credential::ToParent::PrintLoginSaved) => {}
                         None => eprintln!("navigator-ui: dropped a malformed message from Arca's field"),
                     },
                     ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. } => {

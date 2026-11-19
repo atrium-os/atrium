@@ -25,6 +25,8 @@ pub enum Purpose {
     VpnSecret,
     /// A printer-specific, digit-only field owned by Arca.
     PrintPin,
+    /// A printer login password saved to Arca by the system print sheet.
+    PrintPassword,
 }
 
 /// One submit's worth of reference to the value, meaningful only on this
@@ -43,6 +45,8 @@ pub enum ToChild {
     ConfigurePrintPin { user: String, persona: String, key: [u8; 32], uuid: String },
     /// Transfer a one-use handle after the print sheet has counted the Print press.
     SubmitPrintPin,
+    ConfigurePrintLogin { user: String, persona: String, key: [u8; 32], uuid: String },
+    SavePrintLogin { account: String },
 }
 
 impl ToChild {
@@ -62,6 +66,7 @@ pub enum ToParent {
     Handle { handle: Handle },
     /// The field was emptied; any handle is void.
     Cleared,
+    PrintLoginSaved,
 }
 
 /// The longest username Arca hands a parent.

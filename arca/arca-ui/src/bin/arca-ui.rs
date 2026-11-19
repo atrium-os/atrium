@@ -37,7 +37,7 @@ fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 
-struct PrintPin {
+struct PrinterBinding {
     user: String,
     persona: String,
     key: [u8; 32],
@@ -50,7 +50,7 @@ struct Embed {
     font: view::Font,
     parent: Option<Parent>,
     print_sheet: bool,
-    print_pin: Option<PrintPin>,
+    printer: Option<PrinterBinding>,
     field: Field,
     /// The slot's size in points.
     size: (f32, f32),
@@ -118,7 +118,7 @@ impl Ctx {
     }
 
     fn submit_print_pin(&mut self, id: EmbedId, e: &mut Embed) {
-        let Some(binding) = &e.print_pin else { return };
+        let Some(binding) = &e.printer else { return };
         let result = if e.field.typed().is_empty() {
             Err(Notice::Failed)
         } else {
@@ -127,7 +127,7 @@ impl Ctx {
         };
         match result {
             Ok(handle) => {
-                e.field.clear_print_pin();
+                e.field.clear_print_secret();
                 // The print sheet now owns the grant. Detach must allow the queued worker to redeem it.
                 if self.child.emit(id, ToParent::Handle { handle }.encode()).is_err() {
                     let _ = self.arcad.drop_handle(&handle);
@@ -138,6 +138,23 @@ impl Ctx {
                 let _ = self.child.emit(id, ToParent::Cleared.encode());
             }
         }
+        e.dirty = true;
+    }
+
+    fn save_print_login(&mut self, id: EmbedId, e: &mut Embed, account: &str) {
+        let Some(binding) = &e.printer else { return };
+        let result = self.arcad.store_print_login(&binding.user, &binding.persona, &binding.key, &binding.uuid, account, e.field.typed());
+        let event = match result {
+            Ok(()) => {
+                e.field.clear_print_secret();
+                ToParent::PrintLoginSaved
+            }
+            Err(error) => {
+                e.field.notice = Some(if error.locked() { Notice::Locked } else { Notice::Failed });
+                ToParent::Cleared
+            }
+        };
+        let _ = self.child.emit(id, event.encode());
         e.dirty = true;
     }
 
@@ -250,7 +267,7 @@ fn main() -> ExitCode {
                     if parent.is_none() && !print_sheet {
                         field.notice = Some(Notice::UnknownApp);
                     }
-                    let mut e = Embed { win, window_id, font, parent, print_sheet, print_pin: None, field, size: (240.0, 36.0), scale, look: view::Look::default(), shown_chip: None, pressed_at: None, dirty: true };
+                    let mut e = Embed { win, window_id, font, parent, print_sheet, printer: None, field, size: (240.0, 36.0), scale, look: view::Look::default(), shown_chip: None, pressed_at: None, dirty: true };
                     if let Err(err) = cx.child.ready(embed, token) {
                         eprintln!("arca-ui: ready {embed}: {err:?}");
                         let _ = e.win.window_destroy(window_id);
@@ -262,17 +279,23 @@ fn main() -> ExitCode {
                 ChildEvent::Message { embed, bytes } => {
                     let Some(e) = embeds.get_mut(&embed) else { continue };
                     match postcard::from_bytes(&bytes) {
-                        Ok(ToChild::Configure { purpose, username_field }) if !e.print_sheet && purpose != Purpose::PrintPin => {
+                        Ok(ToChild::Configure { purpose, username_field }) if !e.print_sheet && !matches!(purpose, Purpose::PrintPin | Purpose::PrintPassword) => {
                             let dos = e.field.configure(purpose, username_field);
                             cx.run(embed, e, dos);
                             cx.refresh_accounts(e);
                         }
-                        Ok(ToChild::ConfigurePrintPin { user, persona, key, uuid }) if e.print_sheet && e.print_pin.is_none() => {
-                            e.print_pin = Some(PrintPin { user, persona, key, uuid });
+                        Ok(ToChild::ConfigurePrintPin { user, persona, key, uuid }) if e.print_sheet && e.printer.is_none() => {
+                            e.printer = Some(PrinterBinding { user, persona, key, uuid });
                             let dos = e.field.configure(Purpose::PrintPin, false);
                             cx.run(embed, e, dos);
                         }
-                        Ok(ToChild::SubmitPrintPin) if e.print_sheet => cx.submit_print_pin(embed, e),
+                        Ok(ToChild::SubmitPrintPin) if e.print_sheet && e.field.purpose == Purpose::PrintPin => cx.submit_print_pin(embed, e),
+                        Ok(ToChild::ConfigurePrintLogin { user, persona, key, uuid }) if e.print_sheet && e.printer.is_none() => {
+                            e.printer = Some(PrinterBinding { user, persona, key, uuid });
+                            let dos = e.field.configure(Purpose::PrintPassword, false);
+                            cx.run(embed, e, dos);
+                        }
+                        Ok(ToChild::SavePrintLogin { account }) if e.print_sheet && e.field.purpose == Purpose::PrintPassword => cx.save_print_login(embed, e, &account),
                         _ => {}
                     }
                 }

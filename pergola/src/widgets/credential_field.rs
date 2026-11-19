@@ -107,6 +107,7 @@ impl CredentialField {
             }
             ToParent::Handle { handle } => s.handle = Some(handle),
             ToParent::Cleared => s = CredentialState::default(),
+            ToParent::PrintLoginSaved => return,
         }
         self.state.set(s);
     }

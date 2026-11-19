@@ -76,6 +76,7 @@ pub struct Sheet {
     /// Something is under way ("Printing…"): the buttons wait.
     pub working: Option<&'static str>,
     pub pin_printer: Option<u32>,
+    pub login_printer: Option<u32>,
 }
 
 impl Sheet {
@@ -112,6 +113,7 @@ impl Sheet {
             notice: None,
             working: None,
             pin_printer: None,
+            login_printer: None,
         }
     }
 
@@ -311,6 +313,7 @@ impl Sheet {
 
     /// The words on the main button.
     pub fn button(&self) -> &'static str {
+        if self.login_printer.is_some() { return "Save login"; }
         match self.dest() {
             Dest::SavePdf => "Save…",
             _ => "Print",

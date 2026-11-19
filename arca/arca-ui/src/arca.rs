@@ -149,7 +149,21 @@ impl Arcad {
         self.hold_value(op::U_HOLD_PRINT_PIN, &w.buf, value, 0)
     }
 
+    pub fn store_print_login(&self, user: &str, persona: &str, key: &[u8; 32], uuid: &str, account: &str, value: &[u8]) -> Result<(), Error> {
+        let mut w = Writer::new();
+        w.str(user);
+        w.str(persona);
+        w.raw(key);
+        w.str(uuid);
+        w.str(account);
+        self.send_secret(op::U_STORE_PRINT_LOGIN, &w.buf, value, 0).map(|_| ())
+    }
+
     fn hold_value(&self, opcode: u16, head: &[u8], value: &[u8], hold: u8) -> Result<[u8; 16], Error> {
+        Self::handle(&self.send_secret(opcode, head, value, hold)?)
+    }
+
+    fn send_secret(&self, opcode: u16, head: &[u8], value: &[u8], hold: u8) -> Result<LockedBuf, Error> {
         let n = 2 + head.len() + 4 + value.len() + (hold != 0) as usize;
         let mut frame = LockedBuf::zeroed(4 + n)?;
         {
@@ -174,7 +188,7 @@ impl Arcad {
         if st != status::OK {
             return Err(Error::Status(st));
         }
-        Self::handle(&b)
+        Ok(b)
     }
 
     pub fn drop_handle(&self, h: &[u8; 16]) -> Result<(), Error> {

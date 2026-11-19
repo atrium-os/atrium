@@ -485,9 +485,10 @@ impl Daemon {
             .collect()
     }
 
-    fn worker(&self, s: &Saved, learn: bool, pin: bool) -> Result<Ipp, Fail> {
+    fn worker(&self, s: &Saved, learn: bool, pin: bool, login_user: Option<u32>) -> Result<Ipp, Fail> {
         let addr: SocketAddr = s.addr.parse().map_err(|_| (status::FAILED, "bad saved address".to_string()))?;
-        let p = self.launcher.ipp(addr, pin).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
+        let login = login_user.and_then(|uid| printer_login_grant(s, uid));
+        let p = self.launcher.ipp(addr, pin || login.is_some()).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
         let mut w = Ipp { p };
         let start = ipp::Start {
             uri: s.uri.clone(),
@@ -495,6 +496,7 @@ impl Daemon {
             tls: s.tls,
             key: if learn { None } else { s.key.as_deref().and_then(store::unhex) },
             uuid: if learn { None } else { s.uuid.clone() },
+            login,
         };
         frame::write(&mut w.p.sock, &start).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
         Ok(w)
@@ -508,7 +510,7 @@ impl Daemon {
     /// [`Self::learn`], giving up after `limit` (a printer found on the LAN,
     /// which may never answer).
     pub(crate) fn learn_within(&self, s: &Saved, limit: Option<Duration>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
-        let mut w = self.worker(s, true, false)?;
+        let mut w = self.worker(s, true, false, None)?;
         if limit.is_some() {
             w.p.sock.set_read_timeout(limit).map_err(|e| (status::FAILED, e.to_string()))?;
         }
@@ -742,7 +744,7 @@ impl Daemon {
 
     pub fn identify(&self, uid: u32, id: u32) -> Result<String, Fail> {
         let s = self.saved(uid, id)?;
-        let mut w = self.worker(&s, false, false)?;
+        let mut w = self.worker(&s, false, false, None)?;
         let mut actions: Vec<String> = ["sound", "flash", "display"].iter().filter(|a| s.info.identify_actions.iter().any(|x| x == *a)).map(|a| a.to_string()).collect();
         if actions.is_empty() {
             actions.push("sound".into());
@@ -789,7 +791,7 @@ impl Daemon {
         if s.network != (self.cfg.network)() {
             return Ok(self.view(&s, None));
         }
-        let mut w = self.worker(&s, false, false)?;
+        let mut w = self.worker(&s, false, false, None)?;
         let ev = w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
         match ev {
             ipp::Ev::Printer { info, .. } => {
@@ -824,10 +826,13 @@ impl Daemon {
         self.enqueue(uid, persona, req, pdf, None)
     }
 
-    pub fn pin_binding(&self, uid: u32, persona: &str, printer: u32) -> Result<print::PinBinding, Fail> {
+    pub fn printer_binding(&self, uid: u32, persona: &str, printer: u32, login: bool) -> Result<print::PinBinding, Fail> {
         let s = self.saved(uid, printer)?;
         if !visible_to(&s, persona) {
             return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
+        }
+        if login && s.persona != persona {
+            return fail(status::NOT_ALLOWED, "Set the printer login from its owning persona");
         }
         let Some(key) = s.key.as_deref().and_then(store::unhex).filter(|_| s.tls) else {
             return fail(status::NOT_ALLOWED, "This printer needs pinned IPPS for PIN jobs");
@@ -835,9 +840,9 @@ impl Daemon {
         let Some(uuid) = s.uuid else {
             return fail(status::NOT_ALLOWED, "This printer has no pinned UUID");
         };
-        if s.info.job_password_max.is_none()
+        if !login && (s.info.job_password_max.is_none()
             || !s.info.supports(prelum_ipp_codec::ops::op::CREATE_JOB)
-            || !s.info.supports(prelum_ipp_codec::ops::op::SEND_DOCUMENT)
+            || !s.info.supports(prelum_ipp_codec::ops::op::SEND_DOCUMENT))
         {
             return fail(status::NOT_ALLOWED, "This printer does not support PIN jobs");
         }
@@ -1087,7 +1092,7 @@ impl Daemon {
         }
 
         // Who is it, and what does it take? (§7.3: before any job byte.)
-        let mut w = match self.worker(&s, false, pin.is_some()) {
+        let mut w = match self.worker(&s, false, pin.is_some(), Some(uid)) {
             Ok(w) => w,
             Err((_, m)) => return Outcome::Failed(m),
         };
@@ -1190,14 +1195,14 @@ impl Daemon {
         if self.cancelled(job) {
             drop(w);
             if let Some(id) = remote {
-                self.cancel_remote(&s, id);
+                self.cancel_remote(&s, uid, id);
             }
             return Outcome::Cancelled;
         }
         if let Err(e) = rendered {
             drop(w);
             if let Some(id) = remote {
-                self.cancel_remote(&s, id);
+                self.cancel_remote(&s, uid, id);
             }
             return Outcome::Failed(e);
         }
@@ -1227,7 +1232,7 @@ impl Daemon {
         }
         let Some(remote) = remote else { return Outcome::Done(String::new()) };
         self.set(job, |j| j.view.phase = Phase::Printing);
-        self.follow(&s, w, job, remote)
+        self.follow(&s, w, uid, job, remote)
     }
 
     /// Submit, then the spool's bytes as they come, then the end.
@@ -1284,7 +1289,7 @@ impl Daemon {
     }
 
     /// Follow the job at the printer until it ends (§6.3 polling).
-    fn follow(&self, s: &Saved, mut w: Ipp, job: u64, remote: i32) -> Outcome {
+    fn follow(&self, s: &Saved, mut w: Ipp, uid: u32, job: u64, remote: i32) -> Outcome {
         let began = Instant::now();
         let mut failing_since: Option<Instant> = None;
         loop {
@@ -1295,7 +1300,7 @@ impl Daemon {
                 if st.jobs.get(&job).is_none_or(|j| j.cancel) {
                     drop(st);
                     drop(w);
-                    self.cancel_remote(s, remote);
+                    self.cancel_remote(s, uid, remote);
                     return Outcome::Cancelled;
                 }
             }
@@ -1337,7 +1342,7 @@ impl Daemon {
                     }
                     if other.is_err() {
                         // The worker died: a new one.
-                        match self.worker(s, false, false) {
+                        match self.worker(s, false, false, Some(uid)) {
                             Ok(nw) => {
                                 let ok = self.hold(job, &nw.p.stop);
                                 w = nw;
@@ -1353,11 +1358,34 @@ impl Daemon {
         }
     }
 
-    fn cancel_remote(&self, s: &Saved, remote: i32) {
-        if let Ok(mut w) = self.worker(s, false, false) {
+    fn cancel_remote(&self, s: &Saved, uid: u32, remote: i32) {
+        if let Ok(mut w) = self.worker(s, false, false, Some(uid)) {
             let _ = w.ask(&ipp::Req::Cancel { id: remote, user: USER.into() });
         }
     }
+}
+
+/// Ask Arca for a one-use reference only. The IPP worker redeems it.
+fn printer_login_grant(s: &Saved, uid: u32) -> Option<ipp::LoginGrant> {
+    use arca_store::codec::Writer;
+    use arcad::proto;
+    if !s.tls { return None; }
+    let (key, uuid) = (store::unhex(s.key.as_deref()?)?, s.uuid.as_deref()?);
+    let user = portcullis_peer::username(uid)?;
+    let mut request = Writer::new();
+    request.str(&user);
+    request.str(if s.persona.is_empty() { "personal" } else { &s.persona });
+    request.raw(&key);
+    request.str(uuid);
+    let path = std::env::var_os("PRELUMD_ARCA_SOCKET")
+        .unwrap_or_else(|| "/atrium/sockets/arca/arcad.sock".into());
+    let mut conn = UnixStream::connect(path).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    conn.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+    proto::write_request(&mut conn, proto::op::PRINT_LOGIN_GRANT, &request.buf).ok()?;
+    let (status, value) = proto::read_reply(&mut conn).ok()?;
+    if status != proto::status::OK { return None; }
+    Some(ipp::LoginGrant(value.as_ref().try_into().ok()?))
 }
 
 enum SendErr {

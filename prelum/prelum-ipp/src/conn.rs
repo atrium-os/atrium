@@ -130,13 +130,26 @@ impl Target {
     /// Send `msg` (and a document, read to its end, chunked) and return the
     /// printer's answer.
     pub fn call(&self, msg: &Message, doc: Option<&mut dyn Read>) -> Result<Message, Error> {
+        self.call_with_login(msg, doc, None)
+    }
+
+    pub(crate) fn call_with_login(&self, msg: &Message, doc: Option<&mut dyn Read>, login: Option<&str>) -> Result<Message, Error> {
+        if login.is_some() && (self.tls.is_none() || !self.verifier.as_ref().is_some_and(|v| v.pinned().is_some())) {
+            return Err(Error::Io("Printer login requires pinned IPPS".into()));
+        }
         let mut s = self.open()?;
         let ipp = Zeroizing::new(msg.encode());
         let io = |e: io::Error| Error::Io(e.to_string());
-        let mut head = format!(
+        let mut head = Zeroizing::new(format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/ipp\r\nUser-Agent: Atrium-Prelum/1\r\nConnection: close\r\n",
             self.path, self.host
-        );
+        ));
+        if let Some(login) = login {
+            head.reserve("Authorization: Basic ".len() + login.len() + 64);
+            head.push_str("Authorization: Basic ");
+            head.push_str(login);
+            head.push_str("\r\n");
+        }
         match doc {
             None => {
                 head.push_str(&format!("Content-Length: {}\r\n\r\n", ipp.len()));

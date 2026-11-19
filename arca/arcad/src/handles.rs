@@ -16,6 +16,7 @@ pub const TTL: Duration = Duration::from_secs(600);
 /// A field holds one handle at a time; this bounds a misbehaving UI.
 pub const MAX: usize = 1024;
 pub const HOLD_PRINT_PIN: u8 = 4;
+pub const HOLD_PRINT_LOGIN: u8 = 5;
 
 pub enum Source {
     /// A stored item, read at redeem time (so a lock in between voids it).
@@ -85,6 +86,11 @@ impl Handles {
                 && e.printer.as_ref().is_some_and(|(k, id)| k == key && id == uuid) => Some(v),
             _ => None,
         }
+    }
+
+    pub fn take_print_login(&mut self, h: &Handle, recipient: &Recipient) -> Option<Entry> {
+        let e = self.map.remove(h)?;
+        (e.hold == HOLD_PRINT_LOGIN && e.expires > Instant::now() && &e.recipient == recipient).then_some(e)
     }
 
     /// Redeem a Wi-Fi passphrase field's typed value, once, for the Wi-Fi

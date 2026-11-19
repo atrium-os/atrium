@@ -63,6 +63,7 @@ pub mod op {
     pub const WATCH: u16 = 0x16;
     pub const PRINT_PIN: u16 = 0x17;
     pub const PIN_BINDING: u16 = 0x18;
+    pub const LOGIN_BINDING: u16 = 0x19;
     pub const FOR: u16 = 0x20;
 }
 
@@ -473,6 +474,9 @@ pub mod client {
         }
         pub fn pin_binding(&mut self, printer: u32) -> Res<PinBinding> {
             self.call(op::PIN_BINDING, &Self::enc(&printer), None)
+        }
+        pub fn login_binding(&mut self, printer: u32) -> Res<PinBinding> {
+            self.call(op::LOGIN_BINDING, &Self::enc(&printer), None)
         }
         /// Submit a PDF with the opaque, one-use handle from Arca's credential UI.
         pub fn print_pin(&mut self, p: &Print, handle: [u8; 16], pdf: &dyn AsRawFd) -> Res<u64> {

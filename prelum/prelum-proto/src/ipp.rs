@@ -28,6 +28,16 @@ pub struct Start {
     pub key: Option<[u8; 32]>,
     /// `printer-uuid`, lower case, without `urn:uuid:`. `None`: learn it.
     pub uuid: Option<String>,
+    pub login: Option<LoginGrant>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginGrant(pub [u8; 16]);
+
+impl std::fmt::Debug for LoginGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LoginGrant { .. }")
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

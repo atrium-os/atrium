@@ -160,7 +160,7 @@ impl Field {
         }
     }
 
-    pub fn clear_print_pin(&mut self) {
+    pub fn clear_print_secret(&mut self) {
         self.typed.as_mut()[..self.len].fill(0);
         self.len = 0;
         self.content = Content::Empty;
@@ -189,7 +189,7 @@ impl Field {
         match self.purpose {
             Purpose::CurrentPassword => (0..self.accounts.len()).map(Offer::Account).collect(),
             Purpose::NewPassword => vec![Offer::Generate],
-            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode | Purpose::VpnSecret | Purpose::PrintPin => Vec::new(),
+            Purpose::OneTimeCode | Purpose::PrivateUsername | Purpose::WifiPassphrase | Purpose::RecoveryCode | Purpose::VpnSecret | Purpose::PrintPin | Purpose::PrintPassword => Vec::new(),
         }
     }
 
@@ -221,7 +221,7 @@ impl Field {
 
     /// Typed and not yet held: hold it, so the parent has a handle.
     fn commit(&mut self) -> Option<Do> {
-        (self.purpose != Purpose::PrintPin && self.content == Content::Typed && self.handle.is_none() && self.len > 0).then_some(Do::Hold)
+        (!matches!(self.purpose, Purpose::PrintPin | Purpose::PrintPassword) && self.content == Content::Typed && self.handle.is_none() && self.len > 0).then_some(Do::Hold)
     }
 
     /// The value changed: whatever handle there was is void.

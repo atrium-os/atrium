@@ -88,6 +88,10 @@ pub mod op {
     pub const VPN_FORGET_JAR: u16 = 0x10;
     /// Print courier only. `handle[16] | user | persona | key[32] | uuid` → PIN bytes.
     pub const TAKE_PRINT_PIN: u16 = 0x11;
+    /// Prelum broker: `user | persona | key[32] | uuid` → empty or one-use handle.
+    pub const PRINT_LOGIN_GRANT: u16 = 0x12;
+    /// Print worker: `handle[16] | key[32] | uuid` → bytes `account:password`.
+    pub const TAKE_PRINT_LOGIN: u16 = 0x13;
     /// A trailing byte on `U_HOLD`: the field is a VPN sign-in field.
     pub const HOLD_FOR_VPN: u8 = 3;
     /// The service name in `ARCA_SERVICES` that holds WireGuard keys in the
@@ -147,6 +151,8 @@ pub mod op {
     pub const U_DROP: u16 = 0x66;
     /// Trusted UI only. `user | persona | key[32] | uuid | bytes PIN` → `handle[16]`.
     pub const U_HOLD_PRINT_PIN: u16 = 0x68;
+    /// Trusted UI: `user | persona | key[32] | uuid | str account | bytes password`.
+    pub const U_STORE_PRINT_LOGIN: u16 = 0x69;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).

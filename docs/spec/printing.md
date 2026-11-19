@@ -872,8 +872,28 @@ the PIN in Create-Job before it accepted the PDF in Send-Document. The app
 reported queued and Prelum reported Done. The fixture worker used an alternate
 socket filename in the usual Arca mount so the resident Arca service stayed up.
 
-Stored printer passwords and PINs, Sigillum verification for sharing, and
-per-persona routing and crossing policy remain open.
+**Printer login…** lets the owning persona set a username and password for a
+saved IPPS printer. The username goes to Arca with a counted Save login press.
+The password is typed inside Arca’s credential surface and stored while unlocked
+under a printer recipient keyed by its TLS SPKI and IPP UUID. Saving again
+updates the existing encrypted item.
+
+Prelumd gets only an opaque one-use grant from Arca. The IPP worker makes an
+unauthenticated identity query over pinned TLS, checks the UUID, and then redeems
+the grant. It uses HTTP Basic for job requests over the same pinned IPPS
+destination. Discovery must allow the unauthenticated identity query. A changed
+identity cannot receive the password or the document.
+
+The authenticated simulator gate passed on arm64 FreeBSD. A job without a
+saved login got HTTP 401. The desktop stored a synthetic login in Arca. With
+the simulator UUID changed, Prelum held the job before the worker redeemed
+the grant. After the UUID was restored, Arca released the login to the jailed
+worker and the simulator authenticated Create-Job and Send-Document. The
+desktop job reached Done. The fixture used an alternate Arca socket in the
+usual mount directory.
+
+HTTP Digest, saved job PINs, Sigillum verification for sharing, and per-persona
+routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

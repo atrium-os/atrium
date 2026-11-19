@@ -35,6 +35,8 @@ pub enum Label {
     FileManager { user: String, publisher: [u8; 32], app_id: String },
     /// A reserved Prelum worker UID. May only redeem a one-use print PIN.
     PrintWorker,
+    /// The root Prelum broker, which can request opaque printer login grants.
+    PrintBroker,
     /// Anything else: refused every op.
     Unknown,
 }
@@ -134,6 +136,7 @@ impl Resolver {
                 _ if Some(uid) == self.vestibulum_uid => Label::Vestibulum,
                 _ if Some(uid) == self.ui_uid => Label::TrustedUi,
                 _ if service.is_some() => Label::Service(service.unwrap()),
+                _ if uid == 0 => Label::PrintBroker,
                 _ => Label::Unknown,
             };
         };

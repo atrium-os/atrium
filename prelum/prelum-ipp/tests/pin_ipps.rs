@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use arca_store::codec::Writer;
 use arcad::{label::Label, proto, server::State};
+use base64::Engine;
 use navigator_fetch::http::{Body, Framing, Head};
 use prelum_ipp::worker;
 use prelum_ipp_codec::ops::{op, Format, JobIdentity, Ticket};
 use prelum_ipp_codec::{tag, Attribute, Group, Limits, Message, Value};
 use prelum_proto::{
     frame,
-    ipp::{Ev, PinGrant, Req, Start},
+    ipp::{Ev, LoginGrant, PinGrant, Req, Start},
 };
 
 const UUID: &str = "0bc4ab0f-6451-4bd5-a146-ca6ce118ba21";
@@ -37,7 +38,10 @@ fn accept<T>(mut get: impl FnMut() -> std::io::Result<T>) -> T {
     }
 }
 
-fn ipps(expected: &[(u16, u16)]) -> (SocketAddr, [u8; 32], thread::JoinHandle<()>) {
+fn ipps(
+    expected: &[(u16, u16)],
+    login: Option<&'static [u8]>,
+) -> (SocketAddr, [u8; 32], thread::JoinHandle<()>) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["printer.local".into()])
         .unwrap()
@@ -76,7 +80,7 @@ fn ipps(expected: &[(u16, u16)]) -> (SocketAddr, [u8; 32], thread::JoinHandle<()
                 assert!(matches!(stream.read(&mut [0u8; 1]), Ok(0) | Err(_)));
                 continue;
             }
-            serve_ipp(&mut stream, code, status);
+            serve_ipp(&mut stream, code, status, login);
         }
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -90,12 +94,14 @@ fn serve_ipp(
     stream: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
     code: u16,
     status: u16,
+    login: Option<&[u8]>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     assert_eq!(line, "POST /ipp/print HTTP/1.1\r\n");
     let mut framing = None;
+    let mut authorization = None;
     loop {
         line.clear();
         let n = reader.read_line(&mut line).unwrap();
@@ -103,12 +109,18 @@ fn serve_ipp(
         if line == "\r\n" {
             break;
         }
-        if let Some(n) = line.strip_prefix("Content-Length: ") {
+        if let Some(value) = line.strip_prefix("Authorization: Basic ") {
+            authorization = Some(value.trim_end().to_string());
+        } else if let Some(n) = line.strip_prefix("Content-Length: ") {
             framing = Some(Framing::Length(n.trim().parse().unwrap()));
         } else if line == "Transfer-Encoding: chunked\r\n" {
             framing = Some(Framing::Chunked);
         }
     }
+    let expected_auth = login
+        .filter(|_| code != op::GET_PRINTER_ATTRIBUTES)
+        .map(|value| base64::engine::general_purpose::STANDARD.encode(value));
+    assert!(authorization == expected_auth, "wrong Authorization header");
     let head = Head {
         status: 200,
         headers: vec![],
@@ -149,11 +161,15 @@ fn serve_ipp(
             }
         }
         op::CREATE_JOB => {
-            assert!(matches!(password, Some(Value::OctetString(bytes)) if bytes == PIN));
+            if login.is_some() {
+                assert!(password.is_none());
+            } else {
+                assert!(matches!(password, Some(Value::OctetString(bytes)) if bytes == PIN));
+            }
             assert_eq!(
                 req.attribute(tag::OPERATION, "ipp-attribute-fidelity")
                     .and_then(Attribute::first),
-                Some(&Value::Boolean(true))
+                login.is_none().then_some(&Value::Boolean(true))
             );
             assert!(all[offset..].is_empty());
             Group {
@@ -208,6 +224,17 @@ fn serve_ipp(
 }
 
 fn job(addr: SocketAddr, key: [u8; 32], uuid: &str, handle: [u8; 16], arca: &Path) -> Vec<Ev> {
+    submit(addr, key, uuid, handle, arca, false)
+}
+
+fn submit(
+    addr: SocketAddr,
+    key: [u8; 32],
+    uuid: &str,
+    handle: [u8; 16],
+    arca: &Path,
+    login: bool,
+) -> Vec<Ev> {
     let mut frames = Vec::new();
     frame::write(
         &mut frames,
@@ -217,27 +244,35 @@ fn job(addr: SocketAddr, key: [u8; 32], uuid: &str, handle: [u8; 16], arca: &Pat
             tls: true,
             key: Some(key),
             uuid: Some(uuid.into()),
+            login: login.then_some(LoginGrant(handle)),
         },
     )
     .unwrap();
-    frame::write(
-        &mut frames,
-        &Req::SubmitPin {
-            identity: JobIdentity {
-                user: "atrium".into(),
-                job_name: "Test".into(),
-                job_password: None,
-            },
+    let identity = JobIdentity {
+        user: "atrium".into(),
+        job_name: "Test".into(),
+        job_password: None,
+    };
+    let ticket = Ticket::default();
+    let request = if login {
+        Req::Submit {
+            identity,
             format: Format::Pdf,
-            ticket: Ticket::default(),
+            ticket,
+        }
+    } else {
+        Req::SubmitPin {
+            identity,
+            format: Format::Pdf,
+            ticket,
             grant: PinGrant {
                 handle,
                 user: "tester".into(),
                 persona: "work".into(),
             },
-        },
-    )
-    .unwrap();
+        }
+    };
+    frame::write(&mut frames, &request).unwrap();
     frame::write(&mut frames, &Req::Data(PDF.to_vec())).unwrap();
     frame::write(&mut frames, &Req::End).unwrap();
     let mut out = Vec::new();
@@ -276,17 +311,20 @@ fn arca_releases_once_after_key_and_uuid_match_then_ipps_receives_pin_before_pdf
             arcad::serve_conn(stream, &label, &state).unwrap();
         }
     });
-    let (addr, key, printer) = ipps(&[
-        (0, 0),
-        (op::GET_PRINTER_ATTRIBUTES, 0),
-        (op::GET_PRINTER_ATTRIBUTES, 0),
-        (op::CREATE_JOB, 0),
-        (op::SEND_DOCUMENT, 0),
-        (op::GET_PRINTER_ATTRIBUTES, 0),
-        (op::GET_PRINTER_ATTRIBUTES, 0),
-        (op::CREATE_JOB, 1), // successful-ok-ignored-or-substituted-attributes
-        (op::CANCEL_JOB, 0),
-    ]);
+    let (addr, key, printer) = ipps(
+        &[
+            (0, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::CREATE_JOB, 0),
+            (op::SEND_DOCUMENT, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::CREATE_JOB, 1), // successful-ok-ignored-or-substituted-attributes
+            (op::CANCEL_JOB, 0),
+        ],
+        None,
+    );
     let mut root = Writer::new();
     root.str("tester");
     root.raw(&[5; 32]);
@@ -323,6 +361,77 @@ fn arca_releases_once_after_key_and_uuid_match_then_ipps_receives_pin_before_pdf
     assert_eq!(
         job(addr, key, UUID, reply.as_ref().try_into().unwrap(), &socket),
         [Ev::Failed("the printer did not accept the PIN job".into())]
+    );
+    printer.join().unwrap();
+    arca.join().unwrap();
+}
+
+#[test]
+fn saved_login_stays_out_of_identity_queries_and_authenticates_the_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("arca.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let state = Mutex::new(State::new(dir.path().join("stores")).unwrap());
+    let arca = thread::spawn(move || {
+        for label in [
+            Label::Vestibulum,
+            Label::Vestibulum,
+            Label::TrustedUi,
+            Label::PrintBroker,
+            Label::PrintWorker,
+        ] {
+            let (stream, _) = accept(|| listener.accept());
+            stream.set_nonblocking(false).unwrap();
+            arcad::serve_conn(stream, &label, &state).unwrap();
+        }
+    });
+    let (addr, key, printer) = ipps(
+        &[
+            (0, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::GET_PRINTER_ATTRIBUTES, 0),
+            (op::CREATE_JOB, 0),
+            (op::SEND_DOCUMENT, 0),
+        ],
+        Some(b"tester:fixture-pass"),
+    );
+    let mut root = Writer::new();
+    root.str("tester");
+    root.raw(&[5; 32]);
+    for op in [proto::op::V_CREATE, proto::op::V_UNLOCK] {
+        assert_eq!(arca_call(&socket, op, &root.buf).0, proto::status::OK);
+    }
+    let mut entry = Writer::new();
+    entry.str("tester");
+    entry.str("work");
+    entry.raw(&key);
+    entry.str(UUID);
+    let binding_end = entry.buf.len();
+    entry.str("tester");
+    entry.bytes(b"fixture-pass");
+    assert_eq!(
+        arca_call(&socket, proto::op::U_STORE_PRINT_LOGIN, &entry.buf).0,
+        proto::status::OK
+    );
+    let (st, reply) = arca_call(
+        &socket,
+        proto::op::PRINT_LOGIN_GRANT,
+        &entry.buf[..binding_end],
+    );
+    assert_eq!(st, proto::status::OK);
+    let grant = reply.as_ref().try_into().unwrap();
+    assert!(matches!(
+        &submit(addr, [0; 32], UUID, grant, &socket, true)[..],
+        [Ev::IdentityChanged { .. }]
+    ));
+    assert!(matches!(
+        &submit(addr, key, OTHER_UUID, grant, &socket, true)[..],
+        [Ev::IdentityChanged { .. }]
+    ));
+    assert_eq!(
+        submit(addr, key, UUID, grant, &socket, true),
+        [Ev::JobCreated { id: 17 }, Ev::Sent]
     );
     printer.join().unwrap();
     arca.join().unwrap();

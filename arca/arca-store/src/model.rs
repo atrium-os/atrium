@@ -249,6 +249,8 @@ pub enum Recipient {
     /// SSH host key blob. Only the share server registered for exactly this
     /// share, after its handshake proved that key, gets the item.
     Share { proto: ShareProto, host: String, port: u16, path: String, key: [u8; 32] },
+    /// A saved IPPS printer, identified by its TLS key and IPP UUID.
+    Printer { key: [u8; 32], uuid: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -421,7 +423,21 @@ impl Recipient {
                 w.str(path);
                 w.raw(key);
             }
+            Recipient::Printer { key, uuid } => {
+                w.u8(7);
+                w.raw(key);
+                w.str(uuid);
+            }
         }
+    }
+
+    pub fn printer(key: [u8; 32], uuid: &str) -> Result<Self, Error> {
+        if uuid.len() != 36 || !uuid.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) }
+        }) {
+            return Err(Error::BadRecipient);
+        }
+        Ok(Self::Printer { key, uuid: uuid.into() })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -462,6 +478,7 @@ impl Recipient {
                 let key = r.array::<32>()?;
                 Recipient::share(proto, &host, port, &path, key).map_err(|_| Error::Corrupt("recipient"))
             }
+            7 => Recipient::printer(r.array::<32>()?, r.str(36)?).map_err(|_| Error::Corrupt("recipient")),
             _ => Err(Error::Corrupt("recipient tag")),
         }
     }

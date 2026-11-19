@@ -47,12 +47,14 @@ pub struct Asked {
     pub print: Option<Option<fresco_protocol::activation::Token>>,
     pub cancel: bool,
     pub toggle_pin: bool,
+    pub open_login: bool,
 }
 
 #[derive(Clone)]
 pub struct SheetView {
     pub sheet: Mutable<Sheet>,
     pub range: Mutable<TextEdit>,
+    pub login_account: Mutable<TextEdit>,
     pub asked: Mutable<Asked>,
     /// The previews, ready to draw, by sheet number.
     pub pictures: Mutable<Vec<(u32, Image)>>,
@@ -72,6 +74,7 @@ impl SheetView {
     pub fn new(sheet: Mutable<Sheet>) -> SheetView {
         SheetView {
             range: sheet.sibling(TextEdit::new("")),
+            login_account: sheet.sibling(TextEdit::new("")),
             asked: sheet.sibling(Asked::default()),
             pictures: sheet.sibling(Vec::new()),
             sheet,
@@ -178,67 +181,80 @@ impl View for SheetView {
 
         let head = if s.title.is_empty() { "Print".to_string() } else { format!("Print “{}”", s.title) };
         self.text(ctx, RIGHT_X, PAD, RIGHT_W, &head, style(type_size::LG, Weight::Semibold, t.text_primary()));
-        let mut y = self.printers(ctx, &s, PAD + 34.0);
+        if s.login_printer.is_some() {
+            if let Dest::Saved(printer) = s.dest() {
+                self.text(ctx, RIGHT_X, 72.0, RIGHT_W, &format!("Printer login for {}", printer.name), style(type_size::SM, Weight::Semibold, t.text_primary()));
+            }
+            self.text(ctx, RIGHT_X, PIN_Y - 49.0, LABEL_W, "Username", style(type_size::SM, Weight::Regular, t.text_secondary()));
+            self.text(ctx, RIGHT_X, PIN_Y + 8.0, LABEL_W, "Password", style(type_size::SM, Weight::Regular, t.text_secondary()));
+            TextField::new(self.login_account.clone()).placeholder("Printer username").at(RIGHT_X + 126.0, PIN_Y - 56.0).width(194.0).render(ctx);
+        } else {
+            let mut y = self.printers(ctx, &s, PAD + 34.0);
 
-        if s.offers_copies() {
-            self.text(ctx, RIGHT_X, y + 8.0, LABEL_W, "Copies", style(type_size::SM, Weight::Regular, t.text_secondary()));
-            let st = self.sheet.clone();
-            Button::secondary("−").at(RIGHT_X + LABEL_W, y).width(32.0).on_click(move || edit(&st, |v| v.copies = v.copies.saturating_sub(1).max(1))).render(ctx);
-            self.text(ctx, RIGHT_X + LABEL_W + 44.0, y + 7.0, 40.0, &s.copies.to_string(), style(type_size::SM, Weight::Semibold, t.text_primary()));
-            let st = self.sheet.clone();
-            Button::secondary("+").at(RIGHT_X + LABEL_W + 76.0, y).width(32.0).on_click(move || edit(&st, |v| v.copies = (v.copies + 1).min(MAX_COPIES))).render(ctx);
-            y += OPT;
-        }
+            if s.offers_copies() {
+                self.text(ctx, RIGHT_X, y + 8.0, LABEL_W, "Copies", style(type_size::SM, Weight::Regular, t.text_secondary()));
+                let st = self.sheet.clone();
+                Button::secondary("−").at(RIGHT_X + LABEL_W, y).width(32.0).on_click(move || edit(&st, |v| v.copies = v.copies.saturating_sub(1).max(1))).render(ctx);
+                self.text(ctx, RIGHT_X + LABEL_W + 44.0, y + 7.0, 40.0, &s.copies.to_string(), style(type_size::SM, Weight::Semibold, t.text_primary()));
+                let st = self.sheet.clone();
+                Button::secondary("+").at(RIGHT_X + LABEL_W + 76.0, y).width(32.0).on_click(move || edit(&st, |v| v.copies = (v.copies + 1).min(MAX_COPIES))).render(ctx);
+                y += OPT;
+            }
 
-        self.choice(ctx, y, "Pages", &["All", "Some"], if s.all_pages { 0 } else { 1 }, |v, i| v.all_pages = i == 0);
-        if !s.all_pages {
-            // The range field sits over the right half of the row's own space
-            // below it.
+            self.choice(ctx, y, "Pages", &["All", "Some"], if s.all_pages { 0 } else { 1 }, |v, i| v.all_pages = i == 0);
+            if !s.all_pages {
+                // The range field sits over the right half of the row's own space
+                // below it.
+                y += OPT;
+                TextField::new(self.range.clone()).placeholder("1-3, 5").at(RIGHT_X + LABEL_W, y).width(RIGHT_W - LABEL_W).render(ctx);
+            }
             y += OPT;
-            TextField::new(self.range.clone()).placeholder("1-3, 5").at(RIGHT_X + LABEL_W, y).width(RIGHT_W - LABEL_W).render(ctx);
-        }
-        y += OPT;
-        if s.offers_color() {
-            self.choice(ctx, y, "Colour", &["Colour", "Black and white"], s.gray as usize, |v, i| v.gray = i == 1);
-            y += OPT;
-        }
-        if s.offers_duplex() {
-            let at = match s.sides {
-                Sides::OneSided => 0,
-                Sides::TwoSidedLongEdge => 1,
-                Sides::TwoSidedShortEdge => 2,
-            };
-            self.choice(ctx, y, "Two-sided", &["Off", "Long edge", "Short edge"], at, |v, i| {
-                v.sides = [Sides::OneSided, Sides::TwoSidedLongEdge, Sides::TwoSidedShortEdge][i.min(2)];
+            if s.offers_color() {
+                self.choice(ctx, y, "Colour", &["Colour", "Black and white"], s.gray as usize, |v, i| v.gray = i == 1);
+                y += OPT;
+            }
+            if s.offers_duplex() {
+                let at = match s.sides {
+                    Sides::OneSided => 0,
+                    Sides::TwoSidedLongEdge => 1,
+                    Sides::TwoSidedShortEdge => 2,
+                };
+                self.choice(ctx, y, "Two-sided", &["Off", "Long edge", "Short edge"], at, |v, i| {
+                    v.sides = [Sides::OneSided, Sides::TwoSidedLongEdge, Sides::TwoSidedShortEdge][i.min(2)];
+                });
+                y += OPT;
+            }
+            let papers = s.papers();
+            let labels: Vec<&str> = papers.iter().map(|p| p.1).collect();
+            let at = papers.iter().position(|p| p.0 == s.media).unwrap_or(0);
+            self.choice(ctx, y, "Paper", &labels, at, move |v, i| {
+                if let Some(p) = papers.get(i) {
+                    v.media = p.0.into();
+                }
             });
             y += OPT;
-        }
-        let papers = s.papers();
-        let labels: Vec<&str> = papers.iter().map(|p| p.1).collect();
-        let at = papers.iter().position(|p| p.0 == s.media).unwrap_or(0);
-        self.choice(ctx, y, "Paper", &labels, at, move |v, i| {
-            if let Some(p) = papers.get(i) {
-                v.media = p.0.into();
+            if s.can_relayout {
+                self.choice(ctx, y, "Orientation", &["Portrait", "Landscape"], s.landscape as usize, |v, i| v.landscape = i == 1);
+                y += OPT;
             }
-        });
-        y += OPT;
-        if s.can_relayout {
-            self.choice(ctx, y, "Orientation", &["Portrait", "Landscape"], s.landscape as usize, |v, i| v.landscape = i == 1);
+            let per = [1u8, 2, 4];
+            self.choice(ctx, y, "Per sheet", &["1 page", "2 pages", "4 pages"], per.iter().position(|p| *p == s.per_sheet).unwrap_or(0), move |v, i| v.per_sheet = per[i.min(2)]);
             y += OPT;
+            self.choice(ctx, y, "Scale", &["Actual size", "Fit to paper"], s.fit as usize, |v, i| v.fit = i == 1);
         }
-        let per = [1u8, 2, 4];
-        self.choice(ctx, y, "Per sheet", &["1 page", "2 pages", "4 pages"], per.iter().position(|p| *p == s.per_sheet).unwrap_or(0), move |v, i| v.per_sheet = per[i.min(2)]);
-        y += OPT;
-        self.choice(ctx, y, "Scale", &["Actual size", "Fit to paper"], s.fit as usize, |v, i| v.fit = i == 1);
 
         if let Some((n, tone)) = &s.notice {
-            let c = if *tone == Tone::Error { t.danger_fg() } else { t.warning_fg() };
+            let c = match tone {
+                Tone::Quiet => t.text_secondary(),
+                Tone::Warning => t.warning_fg(),
+                Tone::Error => t.danger_fg(),
+            };
             self.text(ctx, RIGHT_X, H - PAD - 32.0 - 24.0, RIGHT_W, n, style(type_size::XS, Weight::Regular, c));
         }
         if let Some(w) = s.working {
             self.text(ctx, RIGHT_X, H - PAD - 24.0, 140.0, w, style(type_size::SM, Weight::Regular, t.text_secondary()));
         }
-        if matches!(s.dest(), Dest::Saved(p) if p.tls && p.uuid.is_some()) {
+        if s.login_printer.is_none() && matches!(s.dest(), Dest::Saved(p) if p.tls && p.uuid.is_some()) {
             let asked = self.asked.clone();
             let busy = s.working.is_some();
             Button::secondary(if s.pin_requested() { "Remove PIN" } else { "Use PIN" })
@@ -253,9 +269,24 @@ impl View for SheetView {
                 })
                 .render(ctx);
         }
+        if s.login_printer.is_none() && !s.pin_requested() && matches!(s.dest(), Dest::Saved(p) if p.tls && p.uuid.is_some()) {
+            let asked = self.asked.clone();
+            let busy = s.working.is_some();
+            Button::secondary("Printer login…")
+                .at(RIGHT_X + 112.0, PIN_Y + 2.0)
+                .width(138.0)
+                .on_click(move || {
+                    if !busy {
+                        let mut a = asked.get_cloned();
+                        a.open_login = true;
+                        asked.set(a);
+                    }
+                })
+                .render(ctx);
+        }
         let c = cancel_button();
         let asked = self.asked.clone();
-        Button::secondary("Cancel")
+        Button::secondary(if s.login_printer.is_some() { "Back" } else { "Cancel" })
             .at(c.x(), c.y())
             .width(c.w())
             .on_click(move || {

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use arca_store::codec::Writer;
 use arcad::proto;
+use base64::Engine;
 use zeroize::{Zeroize, Zeroizing};
 
 use prelum_ipp_codec::ops::{self, op, JobIdentity};
@@ -29,22 +30,27 @@ fn take_pin(path: &Path, grant: &PinGrant, key: &[u8; 32], uuid: &str, max: usiz
     w.str(&grant.persona);
     w.raw(key);
     w.str(uuid);
+    let value = arca_secret(path, proto::op::TAKE_PRINT_PIN, &w.buf, max)?;
+    if !value.iter().all(u8::is_ascii_digit) {
+        return Err(io::Error::other("Arca returned an invalid PIN"));
+    }
+    Ok(value)
+}
+
+fn arca_secret(path: &Path, op: u16, body: &[u8], max: usize) -> io::Result<Zeroizing<Vec<u8>>> {
     let mut s = UnixStream::connect(path)?;
     let timeout = Some(Duration::from_secs(5));
     s.set_read_timeout(timeout)?;
     s.set_write_timeout(timeout)?;
-    proto::write_request(&mut s, proto::op::TAKE_PRINT_PIN, &w.buf)?;
+    proto::write_request(&mut s, op, body)?;
     let mut header = [0u8; 5];
     s.read_exact(&mut header)?;
     let n = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
     if header[4] != proto::status::OK || !(2..=max + 1).contains(&n) {
-        return Err(io::Error::other("Arca did not supply a usable PIN"));
+        return Err(io::Error::other("Arca did not supply a usable printer credential"));
     }
     let mut value = Zeroizing::new(vec![0; n - 1]);
     s.read_exact(&mut value)?;
-    if !value.iter().all(u8::is_ascii_digit) {
-        return Err(io::Error::other("Arca returned an invalid PIN"));
-    }
     Ok(value)
 }
 
@@ -70,6 +76,7 @@ pub struct Session {
     pub start: Start,
     target: Target,
     next_id: u32,
+    login: Option<Zeroizing<String>>,
 }
 
 impl Session {
@@ -85,7 +92,7 @@ impl Session {
             (None, None)
         };
         let target = Target { addr: start.addr, host: host.to_string(), path: path.to_string(), tls: cfg, verifier };
-        Ok(Session { start, target, next_id: 1 })
+        Ok(Session { start, target, next_id: 1, login: None })
     }
 
     fn id(&mut self) -> u32 {
@@ -116,16 +123,19 @@ impl Session {
     }
 
     fn call(&mut self, m: &Message, doc: Option<&mut dyn Read>) -> Result<Message, Ev> {
-        let r = self.target.call(m, doc).map_err(Self::fail)?;
+        let r = self.target.call_with_login(m, doc, self.login.as_ref().map(|v| v.as_str())).map_err(Self::fail)?;
         if !r.is_success() {
-            return Err(Self::refused(&r));
+            return Err(if self.login.is_some() { Ev::Refused { status: r.code, message: String::new() } } else { Self::refused(&r) });
         }
         Ok(r)
     }
 
     pub fn query(&mut self) -> Result<PrinterInfo, Ev> {
         let id = self.id();
-        let r = self.call(&ops::get_printer_attributes(id, &self.start.uri, ATTRS), None)?;
+        let r = self.target.call(&ops::get_printer_attributes(id, &self.start.uri, ATTRS), None).map_err(Self::fail)?;
+        if !r.is_success() {
+            return Err(Self::refused(&r));
+        }
         Ok(PrinterInfo::from_response(&r))
     }
 
@@ -141,9 +151,36 @@ impl Session {
         Ok(())
     }
 
+    fn authorize(&mut self, info: &PrinterInfo, path: &Path) -> Result<(), Ev> {
+        let Some(grant) = &self.start.login else { return Ok(()) };
+        if self.login.is_some() {
+            return Ok(());
+        }
+        let (Some(key), Some(uuid), true) = (self.start.key, self.start.uuid.as_deref(), self.start.tls) else {
+            return Err(Ev::Failed("Printer login requires a pinned IPPS key and UUID".into()));
+        };
+        self.check_identity(info)?;
+        let mut w = Writer::new();
+        w.raw(&grant.0);
+        w.raw(&key);
+        w.str(uuid);
+        let secret = arca_secret(path, proto::op::TAKE_PRINT_LOGIN, &w.buf, arca_store::model::caps::ACCOUNT + 1 + 1024)
+            .map_err(|_| Ev::Failed("Arca could not release the saved printer login".into()))?;
+        self.login = Some(Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*secret)));
+        Ok(())
+    }
+
+    fn authorize_control(&mut self, path: &Path) -> Result<(), Ev> {
+        if self.start.login.is_some() && self.login.is_none() {
+            let info = self.query()?;
+            self.authorize(&info, path)?;
+        }
+        Ok(())
+    }
+
     /// Start a job and send `doc` (prelumd's data frames) as its document.
     /// `on_created` hears the job's id as soon as the printer gives one.
-    fn submit(&mut self, mut identity: JobIdentity, format: ops::Format, ticket: &ops::Ticket, pin: Option<(&PinGrant, &Path)>, doc: &mut dyn Read, on_created: &mut dyn FnMut(i32)) -> Result<(), Ev> {
+    fn submit(&mut self, mut identity: JobIdentity, format: ops::Format, ticket: &ops::Ticket, pin: Option<&PinGrant>, arca: &Path, doc: &mut dyn Read, on_created: &mut dyn FnMut(i32)) -> Result<(), Ev> {
         if let Some(mut raw) = identity.job_password.take() {
             raw.zeroize();
             return Err(Ev::Failed("PIN jobs require a one-use Arca handle".into()));
@@ -153,18 +190,19 @@ impl Session {
         }
         let info = self.query()?;
         self.check_identity(&info)?;
+        self.authorize(&info, arca)?;
         if !info.formats.iter().any(|f| f == format.mime()) {
             return Err(Ev::Failed(format!("the printer doesn't take {}", format.mime())));
         }
         let uri = self.start.uri.clone();
         let split_job = info.supports(op::CREATE_JOB) && info.supports(op::SEND_DOCUMENT);
-        if let Some((grant, path)) = pin {
+        if let Some(grant) = pin {
             let Some(max) = info.job_password_max.filter(|_| split_job) else {
                 return Err(Ev::Failed("this printer cannot accept a PIN before the document is sent".into()));
             };
             let key = self.start.key.as_ref().unwrap();
             let uuid = self.start.uuid.as_deref().unwrap();
-            let value = take_pin(path, grant, key, uuid, max as usize)
+            let value = take_pin(arca, grant, key, uuid, max as usize)
                 .map_err(|_| Ev::Failed("Arca did not supply a usable PIN for this job".into()))?;
             identity.job_password = Some(value.to_vec());
         }
@@ -174,7 +212,7 @@ impl Session {
             let response = if let Some(mut value) = identity.job_password.take() {
                 value.zeroize();
                 // Do not surface printer-controlled text from a PIN request.
-                let response = self.target.call(&request, None);
+                let response = self.target.call_with_login(&request, None, self.login.as_ref().map(|v| v.as_str()));
                 for attr in request.groups.iter_mut().flat_map(|g| &mut g.attributes) {
                     if attr.name == "job-password" {
                         for value in &mut attr.values {
@@ -307,8 +345,8 @@ pub fn run(r: &mut impl Read, w: &mut impl Write, arca: &Path) -> io::Result<()>
                 frame::write(w, &ev)?;
             }
             Req::Identify { actions } => frame::write(w, &s.identify(&actions))?,
-            Req::Job { id, user } => frame::write(w, &s.job(id, &user))?,
-            Req::Cancel { id, user } => frame::write(w, &s.cancel(id, &user))?,
+            Req::Job { id, user } => frame::write(w, &s.authorize_control(arca).map_or_else(|e| e, |_| s.job(id, &user)))?,
+            Req::Cancel { id, user } => frame::write(w, &s.authorize_control(arca).map_or_else(|e| e, |_| s.cancel(id, &user)))?,
             request @ (Req::Submit { .. } | Req::SubmitPin { .. }) => {
                 let (identity, format, ticket, pin) = match request {
                     Req::Submit { identity, format, ticket } => (identity, format, ticket, None),
@@ -319,7 +357,7 @@ pub fn run(r: &mut impl Read, w: &mut impl Write, arca: &Path) -> io::Result<()>
                 let res = {
                     let mut doc = Frames { r: &mut *r, buf: Vec::new(), at: 0, ended: false };
                     let mut on = |id: i32| created = Some(id);
-                    s.submit(identity, format, &ticket, pin.as_ref().map(|g| (g, arca)), &mut doc, &mut on)
+                    s.submit(identity, format, &ticket, pin.as_ref(), arca, &mut doc, &mut on)
                 };
                 if let Some(id) = created {
                     frame::write(w, &Ev::JobCreated { id })?;
@@ -356,7 +394,7 @@ mod tests {
             let mut session = Session::new(Start {
                 uri: format!("{scheme}://127.0.0.1:0/ipp/print"),
                 addr: "127.0.0.1:0".parse().unwrap(),
-                tls, key, uuid,
+                tls, key, uuid, login: None,
             }).unwrap();
             let identity = JobIdentity {
                 user: "atrium".into(),
@@ -364,7 +402,7 @@ mod tests {
                 job_password: None,
             };
             let grant = PinGrant { handle: [0; 16], user: "test".into(), persona: "personal".into() };
-            let err = session.submit(identity, ops::Format::Pdf, &ops::Ticket::default(), Some((&grant, Path::new(ARCA_SOCKET))), &mut io::empty(), &mut |_| unreachable!()).unwrap_err();
+            let err = session.submit(identity, ops::Format::Pdf, &ops::Ticket::default(), Some(&grant), Path::new(ARCA_SOCKET), &mut io::empty(), &mut |_| unreachable!()).unwrap_err();
             assert_eq!(err, Ev::Failed("PIN jobs require an IPPS printer with a pinned key and UUID".into()));
             assert_eq!(session.next_id, 1);
         }
