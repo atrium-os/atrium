@@ -1357,6 +1357,7 @@ version = "0.1.0"
 dependencies = [
  "aqueduct",
  "atrium-links",
+ "atrium-media",
  "atrium-netconf",
  "atrium-open",
  "atrium-types",

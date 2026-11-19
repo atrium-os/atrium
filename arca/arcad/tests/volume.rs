@@ -535,3 +535,45 @@ fn a_removed_personas_group_key_is_retired_only_by_atrium_volumes() {
     assert_eq!(load(&mut s, &vols, "alice", "work", &g, UUID, 7), status::DENIED, "the item is gone");
     assert_eq!(retire(&mut s, &vols, &g), status::DENIED);
 }
+
+#[test]
+fn a_removed_persona_is_destroyed_whole_and_its_sticks_lock() {
+    // E5: everything of the persona goes, its loaded keys first, so its
+    // sticks show Locked; another persona's stick is untouched; only
+    // atrium-volumes may ask, and never for Personal.
+    let (_d, mut s, k) = setup();
+    let vols = Label::Service("atrium-volumes".into());
+    let r = s.handle(&vols, volume_op::VK_MINT, &body(|w| {
+        w.str("alice");
+        w.str("work");
+        w.raw(&UUID);
+        w.u64(7);
+        w.str("Work folders");
+    }));
+    assert_eq!(r.status, status::OK);
+    let g = r.body.bytes().to_vec();
+    let (st, work_stick) = mint(&mut s, &dispensatord(), "alice", "work", [0x66; 16]);
+    assert_eq!(st, status::OK);
+    let (st, home_stick) = mint(&mut s, &dispensatord(), "alice", "home", [0x67; 16]);
+    assert_eq!(st, status::OK);
+    let destroy = |s: &mut State, who: &Label, persona: &str| {
+        s.handle(who, volume_op::PERSONA_DESTROY, &body(|w| { w.str("alice"); w.str(persona); }))
+    };
+
+    assert_eq!(destroy(&mut s, &dispensatord(), "work").status, status::DENIED, "only atrium-volumes");
+    assert_eq!(destroy(&mut s, &vols, "personal").status, status::DENIED, "never Personal");
+    assert_eq!(destroy(&mut s, &vols, "main").status, status::DENIED, "never Personal");
+    let r = destroy(&mut s, &vols, "work");
+    assert_eq!(r.status, status::OK);
+    assert_eq!(r.body.bytes(), &2u32.to_le_bytes(), "the folder key and the stick key");
+    let loaded: Vec<Vec<u8>> = k.lock().unwrap().loaded.iter().map(|(i, _)| i.key_id.to_vec()).collect();
+    assert!(!loaded.contains(&g) && !loaded.contains(&work_stick), "the kernel still has a Work key");
+    assert!(loaded.contains(&home_stick), "another persona's stick key went");
+    // Plugged in again, the Work stick finds no key: Locked.
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &work_stick, [0x66; 16], 0).0, status::DENIED);
+    assert_eq!(find(&mut s, &dispensatord(), "alice", &home_stick, [0x67; 16], 0).0, status::OK);
+    assert_eq!(load(&mut s, &vols, "alice", "work", &g, UUID, 7), status::DENIED);
+    // Nothing left: a second destroy finds nothing.
+    let r = destroy(&mut s, &vols, "work");
+    assert_eq!((r.status, r.body.bytes()), (status::OK, &0u32.to_le_bytes()[..]));
+}

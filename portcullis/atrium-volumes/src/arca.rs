@@ -24,6 +24,7 @@ pub const SOCKET: &str = "/atrium/sockets/arca/arcad.sock";
 pub const VK_MINT: u16 = 0xB0;
 pub const VK_LOAD: u16 = 0xB1;
 pub const VK_RETIRE: u16 = 0xB9;
+pub const PERSONA_DESTROY: u16 = 0xBA;
 
 pub const OK: u8 = 0;
 pub const DENIED: u8 = 1;
@@ -64,6 +65,9 @@ pub trait Keys {
     fn load(&self, user: &str, persona: &str, key_id: &[u8; 16], uuid: &[u8; 16], group: u64) -> Result<(), KeyError>;
     /// A removed persona's key: deleted, and dropped from the kernel.
     fn retire(&self, user: &str, persona: &str, key_id: &[u8; 16]) -> Result<(), KeyError>;
+    /// A removed persona's whole Arca partition (E5): its sticks' keys
+    /// dropped and every item deleted. The number of items.
+    fn destroy(&self, user: &str, persona: &str) -> Result<u32, KeyError>;
 }
 
 #[derive(Default)]
@@ -117,7 +121,8 @@ pub fn unhex16(s: &str) -> Option<[u8; 16]> {
 }
 
 /// The child's request from its arguments: `mint USER PERSONA UUID GROUP
-/// LABEL`, `load USER PERSONA KEYID UUID GROUP`, `retire USER PERSONA KEYID`.
+/// LABEL`, `load USER PERSONA KEYID UUID GROUP`, `retire USER PERSONA KEYID`,
+/// `destroy USER PERSONA`.
 pub fn request(args: &[String]) -> Option<(u16, Vec<u8>)> {
     let a = |i: usize| args.get(i).map(String::as_str);
     let g = |i: usize| a(i)?.parse::<u64>().ok();
@@ -125,6 +130,7 @@ pub fn request(args: &[String]) -> Option<(u16, Vec<u8>)> {
         ("mint", 6) => Some((VK_MINT, Body::default().str(a(1)?).str(a(2)?).raw(&unhex16(a(3)?)?).u64(g(4)?).str(a(5)?).0)),
         ("load", 6) => Some((VK_LOAD, Body::default().str(a(1)?).str(a(2)?).raw(&unhex16(a(3)?)?).raw(&unhex16(a(4)?)?).u64(g(5)?).0)),
         ("retire", 4) => Some((VK_RETIRE, Body::default().str(a(1)?).str(a(2)?).raw(&unhex16(a(3)?)?).0)),
+        ("destroy", 3) => Some((PERSONA_DESTROY, Body::default().str(a(1)?).str(a(2)?).0)),
         _ => None,
     }
 }
@@ -134,6 +140,7 @@ pub fn answer(op: u16, st: u8, body: &[u8]) -> String {
     match (st, op) {
         (OK, VK_MINT) if body.len() == 16 => format!("ok {}", hex(body)),
         (OK, VK_LOAD | VK_RETIRE) if body.is_empty() => "ok".into(),
+        (OK, PERSONA_DESTROY) if body.len() == 4 => format!("ok {}", u32::from_le_bytes(body.try_into().unwrap())),
         (OK, _) => "status 255".into(),
         (st, _) => format!("status {st}"),
     }
@@ -220,6 +227,10 @@ impl Keys for Arcad {
     fn retire(&self, user: &str, persona: &str, key_id: &[u8; 16]) -> Result<(), KeyError> {
         self.run(&["retire", user, persona, &hex(key_id)]).map(|_| ())
     }
+    fn destroy(&self, user: &str, persona: &str) -> Result<u32, KeyError> {
+        let a = self.run(&["destroy", user, persona])?;
+        a.parse().map_err(|_| KeyError::Other(format!("destroy answered {a:?}")))
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +250,8 @@ mod tests {
         assert_eq!(op, VK_MINT);
         assert!(b.ends_with(b"Personal folders"));
         assert_eq!(request(&s(&["retire", "alice", "work", k])).unwrap().0, VK_RETIRE);
+        let (op, b) = request(&s(&["destroy", "alice", "work"])).unwrap();
+        assert_eq!((op, b.len()), (PERSONA_DESTROY, 4 + 5 + 4 + 4));
         assert!(request(&s(&["load", "alice", "work", "zz", k, "7"])).is_none());
         assert!(request(&s(&["mint", "alice", "work", k, "x", "l"])).is_none());
     }
@@ -247,6 +260,7 @@ mod tests {
     fn answers_and_errors() {
         assert_eq!(answer(VK_MINT, OK, &[0xab; 16]), format!("ok {}", "ab".repeat(16)));
         assert_eq!(answer(VK_LOAD, OK, &[]), "ok");
+        assert_eq!(answer(PERSONA_DESTROY, OK, &3u32.to_le_bytes()), "ok 3");
         assert_eq!(answer(VK_LOAD, LOCKED, &[]), "status 2");
         assert_eq!(status_error("status 2"), KeyError::Locked);
         assert_eq!(status_error("status 1"), KeyError::Denied);

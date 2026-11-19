@@ -35,7 +35,10 @@
 #      for the edit) doesn't open;
 #   5. a removes her Work persona: arcad retires the key, the kernel
 #      crypto-erases the group, the folders and the expectation are gone;
-#      added again, it gets a new group.
+#      (E5) the rest of her Work Arca goes too, so a Work stick's key
+#      leaves the kernel and can't be found (the stick shows Locked), and
+#      the volume is scrubbed so the Work app data deleted in the clear is
+#      not on the disk; added again, it gets a new group.
 # Ends "personas: N failed".
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -203,8 +206,30 @@ check "a file linked out of its group doesn't open" no "$(g "cat $M/plain/leaked
 
 echo "=== 5. a removes her Work persona"
 g "su -m e46a -c 'echo work plans secret > $WA/Documents/work-plans.txt'"
-r=$(g "$CLI $VS erase e46a work" 2>/dev/null | tr -d ' \n')
+# E5: a Work stick's key in her Work Arca (minted as atrium-volumes would
+# when the stick is formatted), and Work app data in the clear, which
+# portcullisd deletes before it asks for the erase.
+SU=$(g "head -c 16 /dev/random | od -An -tx1 | tr -d ' \n'")
+SK=$(g "su -m _volumes-vk -c '$P $A vk-mint e46a work $SU work-stick'" | sed -n 's/^status=0 body=//p')
+check "a Work stick key is minted" 32 "${#SK}"
+check "…and found" yes "$(g "su -m _volumes-vk -c '$P $A vk-find e46a $SK $SU'" | grep -q '^status=0' && echo yes || echo no)"
+g "mkdir -p $WA/.local/share/app && jot -w 'work app cache line %06d' 20000 > $WA/.local/share/app/work-app-cache-secret.db && sync && sleep 2 && sync"
+check "…the app data is on the disk in the clear" yes "$([ "$(g "grep -ac 'work app cache line' /dev/$MD")" -gt 0 ] && echo yes || echo no)"
+g "rm -rf $WA/.local"
+r=$(g "$CLI $VS erase e46a work $WA" 2>/dev/null | tr -d ' \n')
 check "erased" yes "$(echo "$r" | grep -q '"erased":true' && echo yes || echo no)"
+check "…its Arca destroyed" yes "$(g "grep -q \"e46a's work Arca destroyed\" $T/v.log" && echo yes || echo no)"
+check "…the stick's key left the kernel" absent "$(g "$KL gen $SK >/dev/null 2>&1 && echo loaded || echo absent")"
+check "…and the stick shows Locked (no key to find)" no "$(g "su -m _volumes-vk -c '$P $A vk-find e46a $SK $SU'" | grep -q '^status=0' && echo yes || echo no)"
+for i in $(seq 1 120); do
+    [ "$(g "test -s $T/volumes.scrub && echo q || echo e")" = e ] && break
+    sleep 1
+done
+check "…the removal's scrub ran" e "$(g "test -s $T/volumes.scrub && echo q || echo e")"
+echo "  $(g "grep 'scrub:' $T/v.log | tail -1")"
+for w in 'work app cache line' work-app-cache-secret 'work plans secret'; do
+    check "removed Work '$w' not on the disk" 0 "$(g "grep -ac '$w' /dev/$MD")"
+done
 check "…its folders are gone" no "$(g "test -e $WA/Documents && echo yes || echo no")"
 check "…its group is gone" 0 "$(g "dmesg -c >/dev/null; $KL quota-dump $M >/dev/null 2>&1; dmesg | grep -c 'key group $GWA '")"
 check "…and its expectation" 2 "$(g "grep -c '^\[\[group\]\]' $T/groups.toml")"

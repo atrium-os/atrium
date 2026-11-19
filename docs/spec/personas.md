@@ -137,7 +137,10 @@ under §6's rules.
   overlays and workspaces are deleted, its Arca persona and volume key are destroyed, its
   devices are unbound (their data becomes unreadable here; Curia says so and lists them
   first). With encryption, this is the "leaving the job" button: nothing of Work is
-  recoverable afterwards.
+  recoverable afterwards. Built in tessera-encryption.md E5 (2026-11-19): the folders'
+  group is crypto-erased, the persona's Arca (stick keys included) is destroyed, its
+  sticks show Locked, and the app data, deleted in the clear, is scrubbed from the
+  volume. Removal waits while one of its sticks is mounted.
 
 ### 4.2 Backups
 

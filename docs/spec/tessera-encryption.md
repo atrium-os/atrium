@@ -971,6 +971,30 @@ answer there, §11). Plain packs elsewhere on the volume are rebuilt too,
 which is the point: everything deleted becomes unreadable, not only the
 moved-in folder.
 
+**E5 as built (2026-11-19).** Persona domains already come from E4.6 (one
+key group per persona, its key a `VolumeKey` in that persona's Arca), and a
+trusted stick formatted for Work keeps its key in Work's Arca (E3). Removing
+a persona (Curia, with Sigillum verification) now destroys all of it:
+
+- portcullisd refuses the removal while a sealed stick of that persona is
+  mounted ("eject it first"), checked before and after verification, so no
+  mount keeps a copy of a key that is about to go;
+- it deletes the persona's app places (overlays, workspaces), then asks
+  atrium-volumes `erase_folders` with the person's home;
+- atrium-volumes queues a scrub of that volume first (durable, as in E4.7),
+  retires the folders' key and crypto-erases the group (E4.6), then asks
+  arcad `PERSONA_DESTROY` (0xBA, atrium-volumes only, never Personal or the
+  machine store): every `VolumeKey` of the persona leaves the kernel keyring,
+  and every item group of the persona (stick keys, passwords, passkeys) is
+  deleted from the person's store. Then it starts the scrub;
+- with nothing of the persona left in Arca, its sticks show Locked
+  (`VK_FIND` finds no key), and the recovery code is the only way back in.
+
+App data (overlays, caches) is not encrypted yet; it is deleted in the
+clear and the scrub makes it unreadable on the device (decision of
+2026-11-19, "delete, then scrub (now)"). Encrypting it live, in the
+persona's group, comes with E6.
+
 ## 14. Decisions
 
 Accepted 2026-11-17, all as recommended.

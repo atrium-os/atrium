@@ -2267,6 +2267,10 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         if !running.is_empty() {
             return refuse(format!("{} is still open in {name}: close it first", running.join(", ")));
         }
+        let sticks = portcullisd::home::mounted_sticks(&name);
+        if !sticks.is_empty() {
+            return refuse(format!("{} of {name} is in use: eject it first", sticks.join(", ")));
+        }
     }
     if let Err(why) = opens::spend_press_for(&opens::activation_socket(), activation, uid, fresco_protocol::activation::purpose::APPROVE) {
         return refuse(why);
@@ -2280,6 +2284,10 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         let running = launch::running_in_persona(&owner, &name);
         if !running.is_empty() {
             return refuse(format!("{} opened in {name} meanwhile: close it first; nothing was removed", running.join(", ")));
+        }
+        let sticks = portcullisd::home::mounted_sticks(&name);
+        if !sticks.is_empty() {
+            return refuse(format!("{} of {name} was plugged in meanwhile: eject it first; nothing was removed", sticks.join(", ")));
         }
     }
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());

@@ -60,6 +60,7 @@ jaild               = { path = "../jaild" }
 jaild-policy        = { path = "../jaild-policy" }
 atrium-volumes      = { path = "../atrium-volumes" }
 aqueduct            = { path = "../../aqueduct" }
+atrium-media        = { path = "../../dispensator/media" }
 # The fetcher's site-list syntax (nuntius.md §4), checked before spawn.
 nuntius             = { path = "../../nuntius", default-features = false }
 sockmux             = { path = "../sockmux" }

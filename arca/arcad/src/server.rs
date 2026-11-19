@@ -229,7 +229,7 @@ impl State {
                     Err(e) => map_err(e),
                 }
             }
-            Label::Service(name) if (0xB0..=0xB9).contains(&op) => self.volume_op(name, op, body, &mut item),
+            Label::Service(name) if (0xB0..=0xBA).contains(&op) => self.volume_op(name, op, body, &mut item),
             Label::Service(name) if name == crate::ssh::SERVICE && (0xC0..=0xC9).contains(&op) => self.ssh_op(op, body, &mut item),
             Label::Service(name) => self.service_op(name, op, body, &mut item),
             Label::Unknown => reply(status::UNKNOWN_PEER),
@@ -609,7 +609,8 @@ impl State {
         if !SERVICES.contains(&name) {
             return reply(status::DENIED);
         }
-        if self.keyring.is_none() {
+        // A removed persona's items go whether or not there is a keyring.
+        if self.keyring.is_none() && op != volume_op::PERSONA_DESTROY {
             return reply(status::UNSUPPORTED);
         }
         let mut r = Reader::new(body);
@@ -818,6 +819,43 @@ impl State {
                     Err(e) if e == libc::ENOENT => ok(Vec::new()),
                     Err(_) => reply(status::INTERNAL),
                 }
+            }
+            volume_op::PERSONA_DESTROY => {
+                field!(r.end());
+                if name != "atrium-volumes" {
+                    return reply(status::DENIED);
+                }
+                if persona == PERSONA || persona == "personal" || user == MACHINE_USER {
+                    return reply(status::DENIED);
+                }
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let who = Access { persona: &persona, recipient: &me };
+                let keys: Vec<[u8; 16]> = tri!(store.list(&who))
+                    .into_iter()
+                    .filter(|m| m.kind == Kind::VolumeKey)
+                    .filter_map(|m| decode_scope(&m.scope).map(|(k, _, _)| k))
+                    .collect();
+                if let Some(ring) = self.keyring.as_mut() {
+                    for k in &keys {
+                        match ring.drop_key(k) {
+                            Ok(()) => {}
+                            Err(e) if e == libc::ENOENT => {}
+                            Err(_) => return reply(status::INTERNAL),
+                        }
+                    }
+                }
+                if let Some(ids) = self.group_keys.get_mut(&user) {
+                    ids.retain(|k| !keys.contains(k));
+                }
+                let store = match self.volume_store(&user, &persona, false) {
+                    Ok(s) => s,
+                    Err(r) => return r,
+                };
+                let n = tri!(store.forget_persona(&persona));
+                ok((n as u32).to_le_bytes().to_vec())
             }
             volume_op::VK_OLDER => {
                 let key_id = field!(r.array::<16>());

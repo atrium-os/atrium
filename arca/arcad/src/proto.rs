@@ -311,6 +311,15 @@ pub mod volume_op {
     /// second `VERIFY_USER` here; and root could delete those folders
     /// anyway. `DENIED` for a stick's key or an unknown id.
     pub const VK_RETIRE: u16 = 0xB9;
+    /// `owner` (user | persona) → `u32` items destroyed: a removed
+    /// persona's whole Arca partition (personas.md §4.1, tessera-encryption
+    /// §9, E5). Only atrium-volumes, never Personal (`personal`, `main`),
+    /// the store unlocked. Every volume key of the persona the kernel holds
+    /// is dropped first (its folders' group key, already retired by then,
+    /// and its sticks' keys: they show Locked from then on), then every
+    /// item of the persona, of every recipient and class, goes with its
+    /// group's data key. portcullisd had Sigillum verify the removal.
+    pub const PERSONA_DESTROY: u16 = 0xBA;
     pub const SLOT_LEN: usize = crate::recovery::SLOT_LEN;
     pub const CODE_MAX: usize = 64;
     /// Longest label.
