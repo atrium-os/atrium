@@ -57,7 +57,7 @@ impl NameChange {
     }
 }
 
-fn action(before: bool, after: bool) -> &'static str {
+pub(super) fn action(before: bool, after: bool) -> &'static str {
     match (before, after) {
         (false, true) => "added",
         (true, false) => "removed",
@@ -258,6 +258,7 @@ pub(super) fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change
                 let key = (scope, c.key.clone());
                 if defs.get(&key).map(|(_, d)| (d.name.to_string(), ours.name_text(d))) != c.before { continue; }
                 if let Some((name, formula)) = &c.after {
+                    if ours.table(name).is_some() { continue; }
                     let Ok(expr) = ours.parse_stored(formula, 0, 0) else { continue; };
                     let def = NameDef { name: name.as_str().into(), scope, expr: Arc::new(expr) };
                     // Parsing against a different set of sheets may turn a reference into #REF!.

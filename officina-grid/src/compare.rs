@@ -23,8 +23,10 @@ use crate::value::Value;
 
 mod parts;
 mod rules;
+mod tables;
 pub use parts::{ChartChange, NameChange};
 pub use rules::RuleChange;
+pub use tables::{PivotChange, TableChange};
 
 /// The row formulas are printed for when compared, so that relative
 /// references read the same wherever the row is.
@@ -45,6 +47,8 @@ pub enum Change {
     Style { rect: Rect, ours: Box<crate::style::Style>, theirs: Box<crate::style::Style> },
     Chart(ChartChange),
     Name(NameChange),
+    Table(TableChange),
+    Pivot(PivotChange),
     ConditionalFormats(RuleChange<crate::condfmt::CondFormat>),
     Validations(RuleChange<crate::validation::Validation>),
     /// `n` rows of theirs, from their row `theirs_row`, that ours doesn't
@@ -77,6 +81,8 @@ impl Change {
             Change::Style { rect, .. } => Some(rect.sheet),
             Change::Chart(ref chart) => chart.sheet,
             Change::Name(ref name) => name.sheet,
+            Change::Table(ref table) => table.at().map(|a| a.sheet),
+            Change::Pivot(ref pivot) => pivot.at().map(|a| a.sheet),
             Change::ConditionalFormats(ref rules) => Some(rules.sheet),
             Change::Validations(ref rules) => Some(rules.sheet),
             Change::SheetAdded { .. } => None,
@@ -97,6 +103,8 @@ impl Change {
             Change::Style { rect, .. } => Some((rect.sheet, rect.r0, rect.c0)),
             Change::Chart(ref chart) => chart.anchor(),
             Change::Name(ref name) => name.sheet.map(|sheet| (sheet, 0, 0)),
+            Change::Table(ref table) => table.at().map(|a| (a.sheet, a.row, a.col)),
+            Change::Pivot(ref pivot) => pivot.at().map(|a| (a.sheet, a.row, a.col)),
             Change::ConditionalFormats(ref rules) => rules.anchor(),
             Change::Validations(ref rules) => rules.anchor(),
             Change::SheetAdded { .. } => None,
@@ -105,7 +113,7 @@ impl Change {
 
     /// Whether this entry is applied through a workbook object collection.
     pub fn is_object(&self) -> bool {
-        matches!(self, Self::Chart(_) | Self::Name(_) | Self::ConditionalFormats(_) | Self::Validations(_))
+        matches!(self, Self::Chart(_) | Self::Name(_) | Self::Table(_) | Self::Pivot(_) | Self::ConditionalFormats(_) | Self::Validations(_))
     }
 
     /// Whether it is rows added or removed (taken as rows inserted or
@@ -138,6 +146,8 @@ impl Change {
             }
             Change::Chart(chart) => chart.describe(),
             Change::Name(name) => name.describe(),
+            Change::Table(table) => table.describe(),
+            Change::Pivot(pivot) => pivot.describe(),
             Change::ConditionalFormats(rules) => rules.describe("Conditional formatting"),
             Change::Validations(rules) => rules.describe("Data validation"),
             Change::RowsAdded { at, n, theirs_row, .. } => {
@@ -186,7 +196,7 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
             out.push(Change::SheetAdded { name });
         }
     }
-    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)) {
+    for change in parts::chart_matches(ours, theirs).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)).chain(tables::compare(ours, theirs)) {
         if out.len() == MAX_CHANGES { return (out, true); }
         out.push(change);
     }
@@ -286,6 +296,10 @@ struct Rows {
 
 impl Rows {
     fn of(wb: &Workbook, sheet: u16) -> Rows {
+        Self::outside(wb, sheet, &[])
+    }
+
+    fn outside(wb: &Workbook, sheet: u16, excluded: &[Rect]) -> Rows {
         let (n, cols) = wb.extent(sheet);
         let mut rows: HashMap<u32, Vec<(u32, Key)>> = HashMap::new();
         if n == 0 || cols == 0 {
@@ -295,6 +309,7 @@ impl Rows {
         let spills: Vec<Rect> = wb.spills().filter(|(a, _)| a.sheet == sheet).filter_map(|(a, _)| wb.spill_area(*a)).collect();
         let spilled = |r: u32, c: u32| spills.iter().any(|a| a.contains(CellAddr::new(sheet, r, c)) && !(a.r0 == r && a.c0 == c));
         let rect = Rect { sheet, r0: 0, c0: 0, r1: n - 1, c1: cols - 1 };
+        let excluded = |r, c| excluded.iter().any(|area| area.contains(CellAddr::new(sheet, r, c)));
         let mut formulas: HashMap<(u32, u32), Key> = HashMap::new();
         for (g, grp) in wb.groups() {
             if grp.sheet != sheet {
@@ -302,11 +317,12 @@ impl Rows {
             }
             let text: Arc<str> = formula::to_a1(&grp.expr, KEY_ROW, grp.col, &|id| wb.sheet_name(id)).into();
             for r in grp.r0..=grp.r1 {
+                if excluded(r, grp.col) { continue; }
                 formulas.insert((r, grp.col), Key { text: text.clone(), group: Some(g) });
             }
         }
         wb.each(&rect, &mut |r, c, v| {
-            if formulas.contains_key(&(r, c)) || spilled(r, c) {
+            if formulas.contains_key(&(r, c)) || spilled(r, c) || excluded(r, c) {
                 return;
             }
             rows.entry(r).or_default().push((c, Key { text: value_key(&v).into(), group: None }));
@@ -384,7 +400,8 @@ fn match_rows(a: &[u64], b: &[u64]) -> Vec<(u32, u32)> {
 
 /// Adds sheet `s`'s changes (theirs `t`); true if some were left out.
 fn compare_sheet(ours: &Workbook, s: u16, theirs: &Workbook, t: u16, out: &mut Vec<Change>) -> bool {
-    let (ra, rb) = (Rows::of(ours, s), Rows::of(theirs, t));
+    let ra = Rows::outside(ours, s, &tables::pivot_areas(ours, s));
+    let rb = Rows::outside(theirs, t, &tables::pivot_areas(theirs, t));
     let ha: Vec<u64> = (0..ra.n).map(|r| ra.hash(r)).collect();
     let hb: Vec<u64> = (0..rb.n).map(|r| rb.hash(r)).collect();
     let mut pairs = match_rows(&ha, &hb);
@@ -562,14 +579,16 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             if (*sheet as usize) >= ours.sheet_count() {
                 return None;
             }
-            Some(vec![GridOp::set(CellAddr::new(*sheet, *row, *col), input.clone())])
+            let addr = CellAddr::new(*sheet, *row, *col);
+            if ours.pivot_at(addr).is_some() { return None; }
+            Some(vec![GridOp::set(addr, input.clone())])
         }
         Change::Style { rect, ours: before, theirs: after } => {
             if rect.sheet as usize >= ours.sheet_count() { return None; }
             if ours.style_snapshot(rect).spans != parts::style_spans(*rect, before) { return None; }
             Some(vec![GridOp::style(*rect, (**after).clone())])
         }
-        Change::Chart(_) | Change::Name(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
+        Change::Chart(_) | Change::Name(_) | Change::Table(_) | Change::Pivot(_) | Change::ConditionalFormats(_) | Change::Validations(_) => {
             let (ops, n) = take_objects(ours, theirs, std::slice::from_ref(ch));
             (n != 0).then_some(ops)
         }
@@ -578,11 +597,13 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
             let mut ops = vec![shift_op(ours, *sheet, Axis::Rows, *at, *n as i64)?];
             let cols = theirs.extent(t).1;
             let spills: Vec<Rect> = theirs.spills().filter(|(a, _)| a.sheet == t).filter_map(|(a, _)| theirs.spill_area(*a)).collect();
+            let pivot_areas = tables::pivot_areas(theirs, t);
             let rows: Vec<Vec<Input>> = (0..*n)
                 .map(|k| {
                     let (j, r) = (theirs_row + k, at + k);
                     (0..cols)
                         .map(|c| match theirs.group_at(t, j, c) {
+                            _ if pivot_areas.iter().any(|area| area.contains(CellAddr::new(t, j, c))) => Input::Empty,
                             Some(g) => Input::Formula(formula::to_a1(&theirs.group(g).expr, r, c, &|id| theirs.sheet_name(id))),
                             None if spills.iter().any(|a| a.contains(CellAddr::new(t, j, c)) && !(a.r0 == j && a.c0 == c)) => Input::Empty,
                             None => match theirs.value(t, j, c) {
@@ -610,7 +631,8 @@ pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridO
 pub fn take_objects(ours: &Workbook, theirs: &Workbook, changes: &[Change]) -> (Vec<GridOp>, usize) {
     let (mut ops, count) = parts::take_objects(ours, theirs, changes);
     let rule_count = rules::take(ours, theirs, changes, &mut ops);
-    (ops, count + rule_count)
+    let table_count = tables::take(ours, theirs, changes, &mut ops);
+    (ops, count + rule_count + table_count)
 }
 
 /// Our sheet `s` made the same as theirs of its name: cells, formulas and
@@ -620,6 +642,10 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
         return None;
     }
     let t = theirs.sheet_id(&ours.sheet_name(s))?;
+    if ours.pivots().iter().any(|p| p.dest.sheet == s)
+        || theirs.pivots().iter().any(|p| p.dest.sheet == t) {
+        return None;
+    }
     let ((na, ca), (nb, cb)) = (ours.extent(s), theirs.extent(t));
     let (n, c) = (na.max(nb), ca.max(cb));
     if n == 0 || c == 0 {
@@ -655,6 +681,35 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn table_and_pivot_review_leaves_occupied_destinations_pending() {
+        use crate::pivot::{Agg, DataField, Pivot, PivotField};
+        use crate::tables::Table;
+
+        let mut ours = book(&[&["Region", "Amount"], &["East", "3"]]);
+        let mut theirs = book(&[&["Region", "Amount"], &["East", "3"]]);
+        let table = |name: &str| Table {
+            name: name.into(), rect: Rect { sheet: 0, r0: 0, r1: 1, c0: 1, c1: 1 },
+            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes: false,
+        };
+        ours.add_table(table("KeepTable")).unwrap();
+        theirs.add_table(table("NewTable")).unwrap();
+        let occupied = CellAddr::new(0, 0, 4);
+        ours.set_value(occupied, Value::str("Local note"));
+        let mut pivot = Pivot::new("Summary", Rect { sheet: 0, r0: 0, r1: 1, c0: 0, c1: 1 }, occupied);
+        pivot.rows.push(PivotField::new(0));
+        pivot.data.push(DataField { field: 1, agg: Agg::Sum, name: None });
+        theirs.add_pivot(pivot).unwrap();
+
+        let (changes, _) = compare(&ours, &theirs);
+        let table = changes.iter().find(|ch| matches!(ch, Change::Table(t) if t.describe() == "Table NewTable added")).unwrap();
+        let pivot = changes.iter().find(|ch| matches!(ch, Change::Pivot(_))).unwrap();
+        assert!(take(&ours, &theirs, table).is_none());
+        assert!(take(&ours, &theirs, pivot).is_none());
+        assert_eq!(ours.get(occupied), Value::str("Local note"));
+        assert!(ours.table("KeepTable").is_some());
+    }
 
     #[test]
     fn workbook_rule_review_remaps_sheet_ids_and_refuses_missing_references() {

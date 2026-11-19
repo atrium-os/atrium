@@ -114,27 +114,44 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
     let whole: std::collections::BTreeSet<_> = changes.iter().filter(|c| c.is_rows()).filter_map(Change::sheet)
         .filter(|s| !protected.contains(s)).collect();
     let (objects, mut n) = compare::take_objects(&d.wb, theirs, changes);
+    let pivot_areas = objects.iter().find_map(|op| match op {
+        officina_grid::ops::GridOp::Pivots(state) => Some(state.iter().filter_map(|(_, area)| *area).collect::<Vec<_>>()),
+        _ => None,
+    });
     let mut ops = Vec::new();
-    let mut done = std::collections::BTreeSet::new();
+    let mut done = std::collections::BTreeMap::new();
     for ch in changes {
         if ch.is_object() { continue; }
         let Some(s) = ch.sheet() else { continue };
         if whole.contains(&s) {
-            if !done.contains(&s) {
-                if let Some(op) = compare::take_sheet(&d.wb, theirs, s) {
-                    ops.push(op);
-                    done.insert(s);
-                }
+            if let std::collections::btree_map::Entry::Vacant(entry) = done.entry(s) {
+                let op = compare::take_sheet(&d.wb, theirs, s);
+                entry.insert(op.is_some());
+                ops.extend(op);
             }
-            n += usize::from(done.contains(&s));
-        } else if !ch.is_rows() {
+            if done[&s] {
+                n += 1;
+                continue;
+            }
+        }
+        if let Change::Cell { sheet, row, col, .. } = ch {
+            let cell = officina_grid::CellAddr::new(*sheet, *row, *col);
+            if pivot_areas.as_ref().is_some_and(|areas| areas.iter().any(|area| area.contains(cell))) {
+                continue;
+            }
+        }
+        if !ch.is_rows() {
             if let Some(more) = compare::take(&d.wb, theirs, ch) {
                 ops.extend(more);
                 n += 1;
             }
         }
     }
-    ops.extend(objects);
+    if pivot_areas.is_some() {
+        ops.splice(..0, objects);
+    } else {
+        ops.extend(objects);
+    }
     d.run("Take All Changes", ops);
     n
 }

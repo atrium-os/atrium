@@ -3331,6 +3331,94 @@ mod tests {
     }
 
     #[test]
+    fn workbook_review_flags_takes_and_keeps_tables_and_pivots() {
+        use crate::review::ReviewCmd;
+        use officina_grid::pivot::{Agg, DataField, Pivot, PivotField};
+        use officina_grid::tables::Table;
+        use officina_grid::{CellAddr, Rect as Cells, Value, compare::Change};
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Sales").unwrap();
+            wb.add_sheet("Summary").unwrap();
+        }
+        assert!(incoming.wb.move_sheet(1, 0));
+        for (wb, sales) in [(&mut local.wb, 0), (&mut incoming.wb, 1)] {
+            for (row, (label, amount)) in [("Region", Value::str("Amount")), ("East", Value::Num(2.0)), ("East", Value::Num(4.0))].into_iter().enumerate() {
+                wb.set_value(CellAddr::new(sales, row as u32, 0), Value::str(label));
+                wb.set_value(CellAddr::new(sales, row as u32, 1), amount);
+            }
+        }
+        let table = |name: &str, sheet, col, stripes| Table {
+            name: name.into(), rect: Cells { sheet, r0: 0, r1: 2, c0: col, c1: col },
+            header: true, totals: false, columns: vec!["Amount".into()], style: None, stripes,
+        };
+        let pivot = |name: &str, sales, summary, col, agg| {
+            let mut p = Pivot::new(name, Cells { sheet: sales, r0: 0, r1: 2, c0: 0, c1: 1 }, CellAddr::new(summary, 0, col));
+            p.rows.push(PivotField::new(0));
+            p.data.push(DataField { field: 1, agg, name: None });
+            p
+        };
+        for t in [table("KeepTable", 0, 1, false), table("OldTable", 0, 3, false)] {
+            local.wb.add_table(t).unwrap();
+        }
+        for t in [table("KeepTable", 1, 1, true), table("NewTable", 1, 3, true)] {
+            incoming.wb.add_table(t).unwrap();
+        }
+        for p in [pivot("Keep", 0, 1, 0, Agg::Sum), pivot("Take", 0, 1, 4, Agg::Sum), pivot("Old", 0, 1, 8, Agg::Sum)] {
+            local.wb.add_pivot(p).unwrap();
+        }
+        for p in [pivot("Keep", 1, 0, 0, Agg::Count), pivot("Take", 1, 0, 4, Agg::Count), pivot("New", 1, 0, 12, Agg::Sum)] {
+            incoming.wb.add_pivot(p).unwrap();
+        }
+
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming.wb);
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.changes.len(), 7, "generated pivot values have no separate rows");
+        assert!(pane.changes.iter().all(|change| matches!(change, Change::Table(_) | Change::Pivot(_))));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for label in ["Table KeepTable changed", "Table NewTable added", "Pivot table Take changed", "Pivot table Old removed"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
+        }
+
+        let choose = |label, cmd| {
+            let pane = sheets.review.get_cloned();
+            let at = {
+                let d = sheets.doc.borrow();
+                pane.changes.iter().position(|ch| ch.describe(&d.wb, &d.wb) == label).unwrap()
+            };
+            sheets.review_cmd(ReviewCmd::Pick(at));
+            sheets.review_cmd(cmd);
+        };
+        choose("Table KeepTable changed", ReviewCmd::Keep);
+        choose("Pivot table Keep changed", ReviewCmd::Keep);
+        choose("Pivot table Take changed", ReviewCmd::Take);
+        assert_eq!(sheets.doc.borrow().wb.value(1, 1, 5), Value::Num(2.0));
+        sheets.review_cmd(ReviewCmd::TakeAll);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        {
+            let d = sheets.doc.borrow();
+            assert!(!d.wb.table("KeepTable").unwrap().stripes);
+            assert_eq!(d.wb.table("NewTable"), Some(&table("NewTable", 0, 3, true)));
+            assert!(d.wb.table("OldTable").is_none());
+            assert_eq!(d.wb.pivots(), &[pivot("Keep", 0, 1, 0, Agg::Sum), pivot("Take", 0, 1, 4, Agg::Count), pivot("New", 0, 1, 12, Agg::Sum)]);
+            assert_eq!(d.wb.value(1, 1, 1), Value::Num(6.0));
+            assert_eq!(d.wb.value(1, 1, 9), Value::Empty);
+            assert_eq!(d.wb.value(1, 1, 13), Value::Num(6.0));
+        }
+        assert!(sheets.doc.borrow_mut().undo());
+        let d = sheets.doc.borrow();
+        assert!(d.wb.table("OldTable").is_some());
+        assert!(d.wb.table("NewTable").is_none());
+        assert_eq!(d.wb.value(1, 1, 9), Value::Num(6.0));
+        assert_eq!(d.wb.value(1, 1, 13), Value::Empty);
+        assert_eq!(d.wb.value(1, 1, 5), Value::Num(2.0));
+    }
+
+    #[test]
     fn workbook_review_flags_and_resolves_conditional_formats_and_validations() {
         use crate::review::ReviewCmd;
         use officina_grid::condfmt::{CmpOp, CondFormat, Dxf, Rule, RuleKind};

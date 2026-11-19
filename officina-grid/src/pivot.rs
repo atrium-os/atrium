@@ -497,9 +497,21 @@ impl Workbook {
     ///
     /// [`refresh_pivot`]: Workbook::refresh_pivot
     pub fn pivot_op(&self, i: Option<usize>, p: Option<Pivot>) -> Result<crate::ops::GridOp, &'static str> {
-        use crate::ops::{GridOp, Region};
         let mut state = self.pivot_state();
-        let old = i.and_then(|i| self.pivot_shapes.get(i)).and_then(|s| s.area);
+        let mut ops = self.plan_pivot(&mut state, i, p)?;
+        ops.push(crate::ops::GridOp::Pivots(state));
+        Ok(crate::ops::GridOp::Batch(ops))
+    }
+
+    /// Plans output edits against current cells and updates a candidate collection.
+    pub(crate) fn plan_pivot(
+        &self, state: &mut Vec<(Pivot, Option<Rect>)>, i: Option<usize>, p: Option<Pivot>,
+    ) -> Result<Vec<crate::ops::GridOp>, &'static str> {
+        use crate::ops::{GridOp, Region};
+        if i.is_some_and(|i| i >= state.len()) {
+            return Err("no such pivot table");
+        }
+        let old = i.and_then(|i| state[i].1);
         let mut ops = Vec::new();
         if let Some(o) = old {
             ops.push(GridOp::Replace(Region { rect: o, values: Vec::new(), fills: Vec::new() }));
@@ -507,13 +519,13 @@ impl Workbook {
         match p {
             Some(p) => {
                 self.check_pivot(&p)?;
-                if self.pivots.iter().enumerate().any(|(j, q)| Some(j) != i && q.name.eq_ignore_ascii_case(&p.name)) {
+                if state.iter().enumerate().any(|(j, (q, _))| Some(j) != i && q.name.eq_ignore_ascii_case(&p.name)) {
                     return Err("a pivot table of that name exists");
                 }
                 let out = self.pivot_output(&p)?;
                 let new = out.shape.area.ok_or("the pivot table would be empty")?;
-                for (j, s) in self.pivot_shapes.iter().enumerate() {
-                    if Some(j) != i && s.area.is_some_and(|a| a.sheet == new.sheet && a.r0 <= new.r1 && new.r0 <= a.r1 && a.c0 <= new.c1 && new.c0 <= a.c1) {
+                for (j, (_, area)) in state.iter().enumerate() {
+                    if Some(j) != i && area.is_some_and(|a| a.intersects(&new)) {
                         return Err("it would overlap another pivot table");
                     }
                 }
@@ -532,7 +544,8 @@ impl Workbook {
                 ops.push(GridOp::Replace(Region { rect: new, values: out.cells.into_iter().map(|(r, c, v)| (new.r0 + r, new.c0 + c, v)).collect(), fills: Vec::new() }));
                 match i {
                     Some(i) => state[i] = (p, Some(new)),
-                    None => state.push((p, Some(new))),
+                    None if state.len() < MAX_PIVOTS => state.push((p, Some(new))),
+                    None => return Err("too many pivot tables"),
                 }
             }
             None => {
@@ -541,11 +554,7 @@ impl Workbook {
                 }
             }
         }
-        if state.len() > MAX_PIVOTS {
-            return Err("too many pivot tables");
-        }
-        ops.push(GridOp::Pivots(state));
-        Ok(GridOp::Batch(ops))
+        Ok(ops)
     }
 
     /// A name for a new pivot: PivotTable1, PivotTable2…
