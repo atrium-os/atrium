@@ -429,12 +429,33 @@ impl Run {
     }
 }
 
+fn receive_workbook() -> io::Result<Option<atrium_open::Opened>> {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+
+    let fd = std::io::stdin().as_fd().try_clone_to_owned()?;
+    atrium_open::Channel::from_stream(UnixStream::from(fd)).recv(Some(Duration::from_secs(5)))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--bench") {
         std::process::exit(bench_main(&args[2..]));
     }
 
+    let workbook = if args.get(1).is_some_and(|arg| arg == "--document") {
+        let opened = receive_workbook();
+        match opened {
+            Ok(Some(file)) => Some(file),
+            other => {
+                eprintln!("atrium-sheets: missing workbook launch descriptor: {:?}", other.err());
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let dedicated = workbook.is_some();
     let root = state_root();
     // The custom lists fills follow, kept beside the autosaves.
     if let Some(dir) = root.parent() {
@@ -453,7 +474,7 @@ fn main() {
             restore = Some((dir, name));
         }
     }
-    if restore.is_none() && locked.is_none() {
+    if !dedicated && restore.is_none() && locked.is_none() {
         if let Some(path) = args.get(1) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
@@ -493,7 +514,11 @@ fn main() {
     );
     let mut run = Run { sheets, target: None, locked: None, root: root.clone(), opening: None, merge_base: None };
     run.show(doc, target);
-    if let Some((dir, name)) = locked {
+    if let Some(file) = workbook {
+        eprintln!("atrium-sheets: “{}” opened in its document jail{}", file.name,
+                  if file.write { " (write)" } else { "" });
+        run.opened(file.name, file.write, file.file.into());
+    } else if let Some((dir, name)) = locked {
         run.recover_locked(dir, name, None);
     } else if let Some((dir, name)) = restore {
         match atrium_sheets::files::Loading::restore(dir, &name) {
@@ -524,14 +549,6 @@ fn main() {
     let mut print_pdf: Option<(std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, bool)> = None;
     let mut printing: Option<Printing> = None;
     let mut want_print = false;
-    // Files the user opens in Sheets from Scrinium (opening-files.md §6.2).
-    let mut channel = match atrium_open::Channel::connect() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("atrium-sheets: the document channel: {e}");
-            None
-        }
-    };
     'main: loop {
         // While a recalculation is unfinished, a slice of it each turn (the
         // window answers in between) and no waiting for input.
@@ -572,6 +589,7 @@ fn main() {
         }
         for c in run.sheets.take_cmds() {
             match c {
+                Cmd::Open if dedicated => run.set_status("Open another workbook from Files."),
                 Cmd::Open => want_picker = Some(Asking::Open),
                 Cmd::Data(atrium_sheets::data::DataCmd::CompareWith) => want_picker = Some(Asking::Compare),
                 Cmd::Data(atrium_sheets::data::DataCmd::MergeCopies) => {
@@ -767,19 +785,6 @@ fn main() {
                 }
             }
         }
-        if let Some(ch) = channel.as_mut() {
-            match ch.recv(Some(Duration::ZERO)) {
-                Ok(Some(o)) => {
-                    eprintln!("atrium-sheets: “{}” opened from Scrinium{}", o.name, if o.write { " (write)" } else { "" });
-                    run.opened(o.name, o.write, o.file.into());
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("atrium-sheets: the document channel: {e}");
-                    channel = None;
-                }
-            }
-        }
         if last_sync.elapsed() >= SYNC_EVERY {
             last_sync = Instant::now();
             let mut d = run.sheets.doc.borrow_mut();
@@ -947,4 +952,82 @@ fn sheet_pdf(snap: Arc<atrium_sheets::print::Snapshot>, paper: Paper) -> std::sy
         let _ = tx.send(Err(e.to_string()));
     }
     rx
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    // Run under jail(8) with a workbook descriptor queued on stdin.
+    #[test]
+    #[ignore = "requires a workbook launch descriptor on stdin"]
+    fn workbook_jail_descriptor() {
+        let received = receive_workbook().unwrap().unwrap();
+        assert!(received.write);
+        let mut file = received.file;
+        let bytes = read_all(&mut file).unwrap();
+        let (before, after) = match received.name.as_str() {
+            "first.csv" => (1.0, 11.0),
+            "second.csv" => (2.0, 22.0),
+            name => panic!("unexpected workbook {name}"),
+        };
+        let mut doc = Doc::from_csv(&received.name, &bytes).unwrap().0;
+        match doc.wb.value(0, 0, 0) {
+            officina_grid::Value::Num(n) if n == before => {
+                assert!(doc.type_into(0, 0, &after.to_string()));
+                write_over(&mut file, &encode(&doc, Format::Csv).unwrap()).unwrap();
+                eprintln!("saved {}", received.name);
+            }
+            value => {
+                assert_eq!(value, officina_grid::Value::Num(after));
+                eprintln!("reopened {}", received.name);
+            }
+        }
+    }
+
+    #[test]
+    fn workbook_launch_descriptors_save_and_reopen_independently() {
+        let root = new_autosave_dir(&std::env::temp_dir());
+        fs::create_dir(&root).unwrap();
+        let paths = [root.join("one.osheet"), root.join("two.osheet")];
+        fn connect(path: &Path) -> atrium_open::Channel {
+            let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+            let (send, recv) = UnixStream::pair().unwrap();
+            atrium_open::send(
+                &send, path.file_name().unwrap().to_str().unwrap(),
+                "application/vnd.atrium.osheet", true, file.as_raw_fd(),
+            ).unwrap();
+            atrium_open::Channel::from_stream(recv)
+        }
+
+        for (path, start) in paths.iter().zip(["11", "22"]) {
+            let mut doc = Doc::new("Workbook");
+            assert!(doc.type_into(0, 0, start));
+            fs::write(path, encode(&doc, Format::Native).unwrap()).unwrap();
+        }
+
+        let channels = paths.each_ref().map(|path| connect(path));
+        for ((mut channel, before), after) in channels.into_iter()
+            .zip(["11", "22"])
+            .zip(["111", "222"])
+        {
+            let received = channel.recv(Some(Duration::ZERO)).unwrap().unwrap();
+            assert!(received.write);
+            let mut file = received.file;
+            let mut doc = Doc::from_native(&received.name, &read_all(&mut file).unwrap()).unwrap();
+            assert_eq!(doc.wb.value(0, 0, 0), officina_grid::Value::Num(before.parse().unwrap()));
+            assert!(doc.type_into(0, 0, after));
+            write_over(&mut file, &encode(&doc, Format::Native).unwrap()).unwrap();
+            assert_eq!(channel.recv(Some(Duration::ZERO)).err().unwrap().kind(), io::ErrorKind::UnexpectedEof);
+        }
+
+        for (path, expected) in paths.iter().zip(["111", "222"]) {
+            let received = connect(path).recv(Some(Duration::ZERO)).unwrap().unwrap();
+            let doc = Doc::from_native(&received.name, &read_all(&mut { received.file }).unwrap()).unwrap();
+            assert_eq!(doc.wb.value(0, 0, 0), officina_grid::Value::Num(expected.parse().unwrap()));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

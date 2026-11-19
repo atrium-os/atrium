@@ -28,6 +28,7 @@ cpu    = "2m"
 
 [[opens]]
 types = [
+    "application/vnd.atrium.osheet",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.oasis.opendocument.spreadsheet",
     "text/csv",

@@ -129,6 +129,7 @@ struct Entry {
     /// Personal. Written as a `persona=<name>` field; a line whose persona
     /// name is invalid is void.
     persona: Option<String>,
+    document: Option<u8>,
 }
 
 /// A named persona's name (personas.md §2): 1-32 of `[a-z0-9-]`, starting
@@ -198,13 +199,20 @@ impl AppRegistry {
             if let (Some(uid), Some(user), Some(app)) = (it.next(), it.next(), it.next()) {
                 let (mut publisher, mut session, mut persona) = (None, false, None);
                 let mut kind_seen = false;
+                let mut document = None;
                 for f in it {
-                    if let Some(name) = f.strip_prefix("persona=") {
+                    if let Some(slot) = f.strip_prefix("document=") {
+                        if document.is_some() {
+                            continue 'lines;
+                        }
+                        let Ok(slot) = slot.parse::<u8>() else { continue 'lines };
+                        document = Some(slot);
+                    } else if let Some(name) = f.strip_prefix("persona=") {
                         if persona.is_some() || !valid_persona(name) {
                             continue 'lines;
                         }
                         persona = Some(name.to_string());
-                    } else if kind_seen || persona.is_some() {
+                    } else if kind_seen || persona.is_some() || document.is_some() {
                         continue 'lines; // order: kind first, persona last; one of each
                     } else if f == "session" {
                         session = true;
@@ -217,11 +225,11 @@ impl AppRegistry {
                         kind_seen = true;
                     }
                 }
-                if session && persona.is_some() {
+                if session && (persona.is_some() || document.is_some()) {
                     continue;
                 }
                 if let Ok(uid) = uid.parse::<u32>() {
-                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher, session, persona });
+                    map.insert(uid, Entry { user: user.to_string(), app_id: app.to_string(), publisher, session, persona, document });
                 }
             }
         }
@@ -253,11 +261,19 @@ impl AppRegistry {
         self.map.get(&uid).map(|e| e.persona.as_deref())
     }
 
+    pub fn document_slot(&self, uid: u32) -> Option<u8> {
+        self.map.get(&uid)?.document
+    }
+
     /// The uid of the instance `(user, app_id, persona)` with this publisher,
     /// if any. Each persona's instance has its own uid (personas.md §3).
     pub fn uid_for_instance(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>) -> Option<u32> {
+        self.uid_for_document(user, app_id, publisher, persona, None)
+    }
+
+    pub fn uid_for_document(&self, user: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>, document: Option<u8>) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id
+            .find(|(_, e)| !e.session && e.document == document && e.user == user && e.app_id == app_id
                   && e.publisher.as_ref() == publisher && e.persona.as_deref() == persona)
             .map(|(uid, _)| *uid)
     }
@@ -267,7 +283,7 @@ impl AppRegistry {
     /// [`Self::uid_for_instance`]).
     pub fn uid_for_persona(&self, user: &str, app_id: &str, persona: Option<&str>) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| !e.session && e.user == user && e.app_id == app_id && e.persona.as_deref() == persona)
+            .find(|(_, e)| !e.session && e.document.is_none() && e.user == user && e.app_id == app_id && e.persona.as_deref() == persona)
             .map(|(uid, _)| *uid)
     }
 
@@ -275,7 +291,7 @@ impl AppRegistry {
     /// in persona order (Personal's is [`Self::uid_for`]).
     pub fn named_instances(&self, user: &str, app_id: &str) -> Vec<(u32, &str)> {
         let mut v: Vec<(u32, &str)> = self.map.iter()
-            .filter(|(_, e)| !e.session && e.user == user && e.app_id == app_id)
+            .filter(|(_, e)| !e.session && e.document.is_none() && e.user == user && e.app_id == app_id)
             .filter_map(|(uid, e)| e.persona.as_deref().map(|p| (*uid, p)))
             .collect();
         v.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
@@ -318,7 +334,7 @@ impl AppRegistry {
     /// peer-cred it) instead of leaking a fresh uid + passwd entry every time.
     pub fn uid_for(&self, user: &str, app_id: &str) -> Option<u32> {
         self.map.iter()
-            .find(|(_, e)| !e.session && e.persona.is_none() && e.user == user && e.app_id == app_id)
+            .find(|(_, e)| !e.session && e.document.is_none() && e.persona.is_none() && e.user == user && e.app_id == app_id)
             .map(|(uid, _)| *uid)
     }
 
@@ -371,6 +387,18 @@ pub fn register_instance(
     publisher: Option<&[u8; 32]>,
     persona: Option<&str>,
 ) -> io::Result<()> {
+    register_document(path, uid, user, app_id, publisher, persona, None)
+}
+
+pub fn register_document(
+    path: &str,
+    uid: u32,
+    user: &str,
+    app_id: &str,
+    publisher: Option<&[u8; 32]>,
+    persona: Option<&str>,
+    document: Option<u8>,
+) -> io::Result<()> {
     use std::io::Write;
     if persona.is_some_and(|p| !valid_persona(p)) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid persona name"));
@@ -383,6 +411,9 @@ pub fn register_instance(
     if let Some(p) = persona {
         line.push_str(" persona=");
         line.push_str(p);
+    }
+    if let Some(slot) = document {
+        line.push_str(&format!(" document={slot}"));
     }
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")
@@ -613,6 +644,21 @@ mod tests {
         assert_eq!(r.named_instances("alice", "org.x.mail"), vec![(50001, "work")]);
         assert!(r.named_instances("bob", "org.x.mail").is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workbook_slots_have_dedicated_app_uids() {
+        let reg = AppRegistry::parse(
+            "50000 alice sheets persona=work\n50001 alice sheets persona=work document=0\n\
+             50002 alice sheets persona=work document=1\n",
+        );
+        assert_eq!(reg.resolve(50002), Some(("alice", "sheets")));
+        assert_eq!(reg.persona(50002), Some(Some("work")));
+        assert_eq!(reg.document_slot(50002), Some(1));
+        assert_eq!(reg.uid_for_persona("alice", "sheets", Some("work")), Some(50000));
+        assert_eq!(reg.uid_for_document("alice", "sheets", None, Some("work"), Some(0)), Some(50001));
+        assert_eq!(reg.uid_for_document("alice", "sheets", None, Some("work"), Some(1)), Some(50002));
+        assert_eq!(reg.named_instances("alice", "sheets"), vec![(50000, "work")]);
     }
 
     #[test]

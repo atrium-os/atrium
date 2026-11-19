@@ -1483,7 +1483,7 @@ fn handle_open(
     use portcullis_ipc::OpenChoice;
     use portcullis_policy::opens::Defaults;
     use portcullis_toml::OpenMode;
-    use portcullisd::opens::{self, Delivery, Hub};
+    use portcullisd::opens;
     let refuse = |w: &mut UnixStream, why: String| {
         eprintln!("portcullisd: open REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
@@ -1556,20 +1556,31 @@ fn handle_open(
                     eprintln!("portcullisd: {owner}'s default for {mime} is now {app}");
                 }
             }
-            let hub = Hub::global();
-            if let Err(e) = hub.listen(&app) {
-                return refuse(writer, format!("{app}'s document channel: {e}"));
-            }
-            match hub.deliver(owner, &app, &name, &mime, write, fd) {
-                Ok(Delivery::Sent) => {}
-                Ok(Delivery::Queued) => start_for(&app, owner, "to open a file"),
-                Err(e) => return refuse(writer, e.to_string()),
+            if let Err(e) = deliver_open(owner, &app, None, &name, &mime, write, fd) {
+                return refuse(writer, e.to_string());
             }
             eprintln!("portcullisd: “{name}” ({mime}) opened in {app} for {owner}{}", if write { " (write)" } else { "" });
             write_response(writer, &Response::Opened { app: app_name, name })
         }
         _ => unreachable!("routed by serve()"),
     }
+}
+
+fn deliver_open(
+    owner: &str, app: &str, persona: Option<&str>, name: &str,
+    mime: &str, write: bool, fd: OwnedFd,
+) -> std::io::Result<()> {
+    use portcullisd::opens::{self, Delivery, Hub};
+    if app == portcullis_policy::opens::SHEETS {
+        return launch::open_workbook(owner, persona, name, mime, write, fd);
+    }
+    let key = opens::channel_key(app, persona);
+    let hub = Hub::global();
+    hub.listen(&key)?;
+    if hub.deliver(owner, &key, name, mime, write, fd)? == Delivery::Queued {
+        start_for_instance(app, persona, owner, "to open a file");
+    }
+    Ok(())
 }
 
 /// The most a download may be (navigator-control's `FILE_MAX` is lower).
@@ -1649,7 +1660,7 @@ fn handle_open_download(
     reader: &BufReader<UnixStream>,
 ) -> std::io::Result<()> {
     use portcullis_policy::opens::Defaults;
-    use portcullisd::opens::{self, Delivery, Hub};
+    use portcullisd::opens;
     let refuse = |w: &mut UnixStream, why: String| {
         eprintln!("portcullisd: download open REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
@@ -1699,14 +1710,8 @@ fn handle_open_download(
     if let Err(e) = opens::narrow(&fd, false) {
         return refuse(writer, format!("cap_rights_limit: {e}"));
     }
-    let hub = Hub::global();
-    if let Err(e) = hub.listen(&key) {
-        return refuse(writer, format!("{key}'s document channel: {e}"));
-    }
-    match hub.deliver(owner, &key, name, t.mime, false, fd) {
-        Ok(Delivery::Sent) => {}
-        Ok(Delivery::Queued) => start_for_instance(&app, persona.as_deref(), owner, "to open a download"),
-        Err(e) => return refuse(writer, e.to_string()),
+    if let Err(e) = deliver_open(owner, &app, persona.as_deref(), name, t.mime, false, fd) {
+        return refuse(writer, e.to_string());
     }
     eprintln!("portcullisd: a download “{name}” ({}) from {} opened in {key} for {owner}", t.mime, caller.as_deref().unwrap_or("?"));
     write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })
@@ -1728,7 +1733,7 @@ fn handle_open_attachment(
     reader:     &BufReader<UnixStream>,
 ) -> std::io::Result<()> {
     use portcullis_policy::opens::Defaults;
-    use portcullisd::opens::{self, Delivery, Hub};
+    use portcullisd::opens;
     let refuse = |w: &mut UnixStream, why: String| {
         eprintln!("portcullisd: attachment REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
@@ -1782,15 +1787,8 @@ fn handle_open_attachment(
     if let Err(why) = opens::spend_press(&opens::activation_socket(), activation, uid) {
         return refuse(writer, why);
     }
-    let hub = Hub::global();
-    let channel = opens::channel_key(&app, persona);
-    if let Err(e) = hub.listen(&channel) {
-        return refuse(writer, format!("{app}'s document channel: {e}"));
-    }
-    match hub.deliver(owner, &channel, name, t.mime, false, fd) {
-        Ok(Delivery::Sent) => {}
-        Ok(Delivery::Queued) => start_for_instance(&app, persona, owner, "to open an attachment"),
-        Err(e) => return refuse(writer, e.to_string()),
+    if let Err(e) = deliver_open(owner, &app, persona, name, t.mime, false, fd) {
+        return refuse(writer, e.to_string());
     }
     eprintln!("portcullisd: attachment “{name}” ({}) opened in {app} for {owner}", t.mime);
     write_response(writer, &Response::Opened { app: app_name, name: name.to_string() })

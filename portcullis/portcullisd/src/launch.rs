@@ -106,7 +106,7 @@ pub fn launch_instance(
     stdio:   Option<[OwnedFd; 3]>,
 ) -> Result<LaunchOutcome, LaunchError> {
     if app_id != FILES_APP || persona.is_some() {
-        return launch_inner(app_id, persona, user, stdio, None, None);
+        return launch_inner(app_id, persona, user, stdio, None, None, None);
     }
     {
         let mut active = FILES_RUN.lock().unwrap();
@@ -126,7 +126,7 @@ pub fn launch_instance(
         };
         let result = copy_stdio()
             .map_err(|e| LaunchError::Failed("fdpass", e.to_string()))
-            .and_then(|fds| launch_inner(app_id, persona, user, fds, None, Some(&mut bundle)));
+            .and_then(|fds| launch_inner(app_id, persona, user, fds, None, Some(&mut bundle), None));
         let mut active = FILES_RUN.lock().unwrap();
         let run = active.as_mut().unwrap();
         if result.is_err() || run.logging_out || !std::mem::take(&mut run.refresh) {
@@ -145,7 +145,7 @@ pub fn launch_debug(app_id: &str, user: &str, conn: OwnedFd) -> Result<LaunchOut
     if !app_id.starts_with("dev.") {
         return Err(LaunchError::Failed("debug", format!("{app_id} is not a dev build: installed apps are never debugged")));
     }
-    launch_inner(app_id, None, user, None, Some(conn), None)
+    launch_inner(app_id, None, user, None, Some(conn), None, None)
 }
 
 /// What a debug run mounts at [`DEBUG_IN_JAIL`]: lldb-server and sh from
@@ -206,6 +206,51 @@ fn with_develop(app: Option<jaild_policy::SysfilParams>) -> Result<Option<jaild_
     }))
 }
 
+/// Reserve a document slot until its launch thread has torn down the jail.
+pub fn open_workbook(
+    user: &str, persona: Option<&str>, name: &str, mime: &str, write: bool, fd: OwnedFd,
+) -> std::io::Result<()> {
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::unix::net::UnixStream;
+
+    const DOCUMENT_LIMIT: usize = 8;
+    static ACTIVE: Mutex<[bool; DOCUMENT_LIMIT]> = Mutex::new([false; DOCUMENT_LIMIT]);
+
+    struct Slot(usize);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.lock().unwrap()[self.0] = false;
+        }
+    }
+
+    let (sender, receiver) = UnixStream::pair()?;
+    atrium_open::send(&sender, name, mime, write, fd.as_raw_fd())?;
+    drop(sender);
+    let stdio = Some([
+        receiver.into(),
+        std::io::stdout().as_fd().try_clone_to_owned()?,
+        std::io::stderr().as_fd().try_clone_to_owned()?,
+    ]);
+    let slot = {
+        let mut active = ACTIVE.lock().unwrap();
+        let slot = active.iter().position(|used| !used)
+            .ok_or_else(|| std::io::Error::other("Too many Sheets workbooks are open"))?;
+        active[slot] = true;
+        Slot(slot)
+    };
+    let (user, persona) = (user.to_owned(), persona.map(str::to_owned));
+    std::thread::Builder::new().name("sheets-document".into()).spawn(move || {
+        let index = slot.0;
+        let result = launch_inner(portcullis_policy::opens::SHEETS, persona.as_deref(),
+                                  &user, stdio, None, None, Some(index as u8));
+        if let Err(e) = result {
+            eprintln!("portcullisd: Sheets workbook launch: {e:?}");
+        }
+        drop(slot);
+    })?;
+    Ok(())
+}
+
 fn launch_inner(
     app_id:  &str,
     persona: Option<&str>,
@@ -213,6 +258,7 @@ fn launch_inner(
     stdio:   Option<[OwnedFd; 3]>,
     debug:   Option<OwnedFd>,
     files_bundle: Option<&mut Option<BundleIdentity>>,
+    document: Option<u8>,
 ) -> Result<LaunchOutcome, LaunchError> {
     let mut stdio = stdio;
     if persona.is_some_and(|p| !portcullis_peer::valid_persona(p)) {
@@ -254,12 +300,22 @@ fn launch_inner(
         return Err(LaunchError::Failed("manifest", msg));
     }
 
-    let jail_path   = PathBuf::from(JAILS_DIR).join(instance_key(app_id, persona));
+    if document.is_some() && (manifest.setup.is_some()
+        || manifest.capabilities.network.as_ref().is_some_and(|net| net.mode() != portcullis_toml::NetworkCap::None)
+        || manifest.capabilities.filesystem.is_some()
+        || not_instanced_manifest(&manifest).is_some()) {
+        return Err(LaunchError::Failed("document", "workbook jail must have no setup, network or broad filesystem grants".into()));
+    }
     if persona.is_some() {
         if let Some(why) = not_instanced_manifest(&manifest) {
             return Err(LaunchError::Failed("persona", format!("{app_id} runs once for every persona: {why}")));
         }
     }
+
+    let key = instance_key(app_id, persona);
+    let (app_uid, run_as_user) = resolve_launch_uid(user, app_id, publisher.as_ref(), persona, document)?;
+    let instance = document.map(|_| format!("document-{app_uid}"));
+    let jail_path = PathBuf::from(JAILS_DIR).join(instance.as_ref().unwrap_or(&key));
 
     /* PRIVILEGE INVARIANT (portcullis.md §9.0): the app runs under a dedicated,
      * non-root, non-human per-app uid (50000+) — NEVER root, NEVER the connecting
@@ -267,7 +323,6 @@ fn launch_inner(
      * launch registry; the process executes as the per-app uid that services
      * peer-cred back to (owner, app_id). $HOME is the app uid's own (nologin)
      * home, not the human's. */
-    let (app_uid, run_as_user) = resolve_instance_uid(user, app_id, publisher.as_ref(), persona)?;
     eprintln!("portcullisd: launching {app_id} as uid {app_uid} ({run_as_user}); owner={user} persona={}",
               persona.unwrap_or("personal"));
     let user_home = match std::ffi::CString::new(run_as_user.as_str()).ok().and_then(|cuser| {
@@ -307,7 +362,7 @@ fn launch_inner(
          * /var/lib/atrium/jails/<id> and one persistent overlay, so a second
          * concurrent jail here would share both. Concurrency belongs to the
          * one-shot piped path, which gets its own root per instance. */
-        instance: persona.map(|p| format!("p-{p}")),
+        instance: instance.clone().or_else(|| persona.map(|p| format!("p-{p}"))),
         persist: true,
         host_identity,
         sysfil,
@@ -326,34 +381,53 @@ fn launch_inner(
      * Stays mounted across launches — it holds the app's persistent state —
      * until `portcullis remove`, or the person's logout (E6: its image is in
      * their key group, which locks then). */
-    let overlay_quota = manifest.resources.as_ref()
-        .and_then(|r| r.storage.as_deref())
-        .and_then(portcullis_overlay::parse_size)
-        .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
-    // The person's app data in their key group (E6), before it mounts.
-    if portcullis_overlay::home_of(user).is_some() {
-        portcullisd::home::ensure_app_data(user, persona)
-            .map_err(|m| LaunchError::Failed("app data", m))?;
-    }
-    // The person's own overlay, in their home (homes.md §3).
-    let place = match persona {
-        None => portcullis_overlay::place(Some(user), app_id),
-        Some(p) => portcullis_overlay::persona_place(user, app_id, p).ok_or_else(||
-            LaunchError::Failed("overlay", format!("no home place for {user}'s {p} instance of {app_id}")))?,
+    // A workbook gets a fresh upper layer on every launch, even when its
+    // bounded UID slot is reused later. The person's file stays outside it.
+    let upper = instance.as_ref().map(|id| PathBuf::from(JAILS_DIR).join(format!("{id}-upper")));
+    let _document_mounts = upper.as_ref().map(|upper| DocumentMounts { root: &jail_path, upper });
+    let overlay_dir = if let Some(upper) = upper.as_ref() {
+        let name = portcullis_jail::jail_name_for_instance(app_id, instance.as_deref());
+        if !full_teardown(&jail_path, Some(&name)) {
+            return Err(LaunchError::Failed("document", "previous workbook jail is still mounted".into()));
+        }
+        if !portcullis_mounts::converge(&[&upper], portcullis_mounts::Force::No).is_empty() {
+            return Err(LaunchError::Failed("document", "previous workbook upper layer is still mounted".into()));
+        }
+        fs::create_dir_all(&upper).map_err(|e| LaunchError::Failed("document", e.to_string()))?;
+        run("mount", &["-t", "tmpfs", "-o", "size=128m", "tmpfs", upper.to_str().unwrap()])
+            .map_err(|e| LaunchError::Failed("document", e.to_string()))?;
+        upper.clone()
+    } else {
+        let overlay_quota = manifest.resources.as_ref()
+            .and_then(|r| r.storage.as_deref())
+            .and_then(portcullis_overlay::parse_size)
+            .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
+        // The person's app data in their key group (E6), before it mounts.
+        if portcullis_overlay::home_of(user).is_some() {
+            portcullisd::home::ensure_app_data(user, persona)
+                .map_err(|m| LaunchError::Failed("app data", m))?;
+        }
+        // The person's own overlay, in their home (homes.md §3).
+        let place = match persona {
+            None => portcullis_overlay::place(Some(user), app_id),
+            Some(p) => portcullis_overlay::persona_place(user, app_id, p).ok_or_else(||
+                LaunchError::Failed("overlay", format!("no home place for {user}'s {p} instance of {app_id}")))?,
+        };
+        let overlay_dir = place.dir.clone();
+        let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
+            .map_err(|m| LaunchError::Failed("mount", m))?;
+        if backing == portcullis_overlay::Backing::Directory {
+            /* No volume, so the structural mitigation is not in place. Fall back
+             * to the behavioural one: a per-directory dedup domain on `deferred`,
+             * which costs a full write per duplicate but keeps the observable
+             * free-space number content-independent. */
+            fs::create_dir_all(&overlay_dir)
+                .map_err(|e| LaunchError::Failed("mount",
+                         format!("create {}: {e}", overlay_dir.display())))?;
+            arm_overlay_dedup(&overlay_dir)?;
+        }
+        overlay_dir
     };
-    let overlay_dir = place.dir.clone();
-    let backing = portcullis_overlay::ensure_mounted(&place, app_id, overlay_quota)
-        .map_err(|m| LaunchError::Failed("mount", m))?;
-    if backing == portcullis_overlay::Backing::Directory {
-        /* No volume, so the structural mitigation is not in place. Fall back
-         * to the behavioural one: a per-directory dedup domain on `deferred`,
-         * which costs a full write per duplicate but keeps the observable
-         * free-space number content-independent. */
-        fs::create_dir_all(&overlay_dir)
-            .map_err(|e| LaunchError::Failed("mount",
-                     format!("create {}: {e}", overlay_dir.display())))?;
-        arm_overlay_dedup(&overlay_dir)?;
-    }
     /* homes.md §2: the overlay is the app uid's, 0700. Inside the jail it is
      * the union's root, so the app can make its own /var, /tmp and $HOME
      * there (the signed tree's folders stay root's); outside, nobody but
@@ -490,7 +564,10 @@ fn launch_inner(
     /* A named persona's instance has a channel of its own, keyed
      * `<id>@<persona>`: what reaches it comes from its own persona
      * (personas.md §3; crossing is P3, off by default). */
-    if !manifest.opens.is_empty() || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
+    if document.is_some() {
+        jc.set("exec.start", portcullis_jail::Value::String(format!("/{} --document", manifest.entry())));
+    } else if (app_id != portcullis_policy::opens::SHEETS && !manifest.opens.is_empty())
+        || !manifest.links.is_empty() || manifest.capabilities.consoles == Some(true) {
         let dir = portcullisd::opens::Hub::global().listen(&portcullisd::opens::channel_key(app_id, persona))
             .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("opens", format!("document channel: {e}")) })?;
         jc.add_mount(&dir, &jail_path.join("atrium/sockets/opens"), "nullfs", &["rw"]);
@@ -584,6 +661,22 @@ fn launch_inner(
     }
 
     outcome.map(|exit_code| LaunchOutcome { exit_code })
+}
+
+struct DocumentMounts<'a> {
+    root: &'a Path,
+    upper: &'a Path,
+}
+
+impl Drop for DocumentMounts<'_> {
+    fn drop(&mut self) {
+        if full_teardown(self.root, None) {
+            let left = portcullis_mounts::converge(&[self.upper], portcullis_mounts::Force::No);
+            portcullis_mounts::warn_survivors("portcullisd", &left);
+            let _ = fs::remove_dir(self.root);
+            let _ = fs::remove_dir(self.upper);
+        }
+    }
 }
 
 /// Clone a manifest with substituted capabilities + entry. Used to
@@ -941,6 +1034,10 @@ pub fn resolve_app_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>) 
 /// [`resolve_app_uid`] for the instance in `persona`: each persona's instance
 /// has its own uid (personas.md §3), reused across its own launches only.
 pub fn resolve_instance_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>) -> Result<(u32, String), LaunchError> {
+    resolve_launch_uid(owner, app_id, publisher, persona, None)
+}
+
+fn resolve_launch_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 32]>, persona: Option<&str>, document: Option<u8>) -> Result<(u32, String), LaunchError> {
     let reg = portcullis_peer::DEFAULT_REGISTRY;
     let fail = |s: String| LaunchError::Failed("uid", s);
     if let Some(dir) = Path::new(reg).parent() {
@@ -949,11 +1046,11 @@ pub fn resolve_instance_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 3
     let _guard = portcullis_peer::lock_registry(reg).map_err(|e| fail(e.to_string()))?;
     /* Reuse only a binding with the SAME publisher: an app id re-installed under
      * another publisher's key is another app (arca.md §4.1) and gets a new uid. */
-    let uid = match portcullis_peer::uid_for_app_instance(reg, owner, app_id, publisher, persona) {
+    let uid = match portcullis_peer::AppRegistry::load(reg).unwrap_or_default().uid_for_document(owner, app_id, publisher, persona, document) {
         Some(uid) => uid,
         None => {
             let uid = portcullis_peer::allocate(reg);
-            portcullis_peer::register_instance(reg, uid, owner, app_id, publisher, persona)
+            portcullis_peer::register_document(reg, uid, owner, app_id, publisher, persona, document)
                 .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
             uid
         }

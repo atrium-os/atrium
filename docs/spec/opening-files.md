@@ -187,6 +187,11 @@ portcullisd ── narrows fd, starts or finds the app ─▶ app: Open { name, 
   no channel. *(As built: not fd 3 and `ATRIUM_OPEN=1` as first written,
   since jail(8) closes every descriptor above 2 and cleans the
   environment; one channel serves new and running instances alike.)*
+- Sheets uses a separate jail per brokered workbook open. Portcullis queues
+  exactly one `OPEN` message on an inherited stdin socket instead of mounting
+  the app-wide channel. Eight concurrent workbook launches are allowed. Each
+  slot has a separate UID and fresh temporary upper filesystem. Download and
+  attachment opens use the same launch path and keep their read-only access.
 - The app never learns the path, the folder, or the place. Save As goes
   through the picker (officina.md §4.2).
 

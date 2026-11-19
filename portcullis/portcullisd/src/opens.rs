@@ -134,7 +134,7 @@ impl Hub {
         let uid = portcullis_peer::uid_gid(s.as_raw_fd()).map(|(u, _)| u);
         let reg = portcullis_peer::AppRegistry::load(&self.registry).unwrap_or_default();
         // `app` is the channel's key: the uid must be that very instance.
-        let owner = match uid.as_ref().ok().and_then(|u| reg.resolve(*u).map(|r| (r, reg.persona(*u).flatten()))) {
+        let owner = match uid.as_ref().ok().and_then(|u| reg.resolve(*u).filter(|_| reg.document_slot(*u).is_none()).map(|r| (r, reg.persona(*u).flatten()))) {
             Some(((o, a), p)) if channel_key(a, p) == app => o.to_string(),
             _ => {
                 eprintln!("portcullisd: {app}'s document channel: refused uid {uid:?}, not {app}");

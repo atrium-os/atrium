@@ -129,6 +129,16 @@ cost is the engine's memory plus Pergola's, to be measured in O1 (target under 4
 empty document, §15). A light "launcher" window (new, recent files, templates) is a
 separate instance with no document.
 
+**Sheets brokered opens.** Files, downloads and attachments enter separate
+Sheets jails through Portcullis, with one startup descriptor per process. Each
+live slot has its own jail root, UID and temporary writable layer. The layer
+keeps autosave data private while the jail runs and is discarded at teardown.
+Save still writes through the granted descriptor, and Files can reopen native
+`.osheet` files. A workbook opened this way directs further opens to Files.
+An ordinary Sheets launch still supports picker Open, and embedded review
+pickers still supply comparison inputs to the current workbook. Launcher and
+picker routing for new document jails remain to be wired up.
+
 **The converter jail.** Built the way the Navigator's converter is (threat model §2,
 portcullis §6.5.2e′): a fresh jail per conversion, rctl `memoryuse` and `pcpu` limits plus
 the converter's own hard `RLIMIT_AS` and `RLIMIT_CPU`, a wall-clock deadline, no network,

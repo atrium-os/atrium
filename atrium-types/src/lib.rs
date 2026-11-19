@@ -112,6 +112,7 @@ pub static TYPES: &[Type] = &[
     // Atrium app bundles (atrium-bundle-format.md §8).
     t!("application/vnd.atrium.insula", "Atrium app", Bundle, ["insula"], [Bytes(&[(0, b"INSB")])], []),
     // Documents.
+    t!("application/vnd.atrium.osheet", "Sheets workbook", Spreadsheet, ["osheet"], [Bytes(&[(0, b"OFFICINA"), (10, b"\x01\x00")])], []),
     t!("application/pdf", "PDF document", Document, ["pdf"], [Bytes(&[(0, b"%PDF-")])], []),
     t!("application/vnd.oasis.opendocument.text", "OpenDocument text", Document, ["odt"], [Bytes(&[(0, b"PK\x03\x04"), (30, b"mimetypeapplication/vnd.oasis.opendocument.text")])], [Bytes(ZIP)]),
     t!("application/vnd.oasis.opendocument.spreadsheet", "OpenDocument spreadsheet", Spreadsheet, ["ods"], [Bytes(&[(0, b"PK\x03\x04"), (30, b"mimetypeapplication/vnd.oasis.opendocument.spreadsheet")])], [Bytes(ZIP)]),
@@ -360,6 +361,12 @@ mod tests {
         assert_eq!(mime(detect("song.m4a", b"\0\0\0\x18ftypM4A ")), "audio/mp4");
         assert_eq!(mime(detect("p.svg", b"<?xml version=\"1.0\"?>\n<svg xmlns=")), "image/svg+xml");
         assert_eq!(mime(detect("empty.txt", b"")), "text/plain");
+    }
+
+    #[test]
+    fn sheets_native_kind_is_distinct() {
+        assert_eq!(mime(detect("book.osheet", b"OFFICINA\0\0\x01\0\0\0\0\0")), "application/vnd.atrium.osheet");
+        assert!(!matches!(detect("book.osheet", b"OFFICINA\0\0\x02\0\0\0\0\0"), Detected::Known(_)));
     }
 
     #[test]
