@@ -15,6 +15,7 @@ pub const PORTAL_PRELOGIN: &str =
 pub const PORTAL_CONFIG: &str = "/global-protect/getconfig.esp";
 pub const LOGIN: &str = "/ssl-vpn/login.esp";
 pub const CONFIG: &str = "/ssl-vpn/getconfig.esp";
+pub const HIP_REPORT: &str = "/ssl-vpn/hipreport.esp";
 pub const HIP_CHECK: &str = "/ssl-vpn/hipreportcheck.esp";
 pub const LOGOUT: &str = "/ssl-vpn/logout.esp";
 pub const START_TUNNEL: &[u8] = b"START_TUNNEL";
@@ -152,17 +153,31 @@ impl Session {
         ])
     }
 
-    pub fn hip(&self, computer: &str, ip: Ipv4Addr) -> Zeroizing<String> {
-        form(&[
-            ("user", &self.user),
-            ("authcookie", &self.cookie),
+    pub fn hip(
+        &self,
+        computer: &str,
+        ip: Ipv4Addr,
+        report: Option<&HipReport>,
+    ) -> Zeroizing<String> {
+        let ip = ip.to_string();
+        let mut fields = vec![
+            ("user", self.user.as_str()),
+            ("authcookie", self.cookie.as_str()),
             ("computer", computer),
-            ("portal", &self.portal),
-            ("domain", &self.domain),
+            ("portal", self.portal.as_str()),
+            ("domain", self.domain.as_str()),
             ("client-role", "global-protect-full"),
-            ("client-ip", &ip.to_string()),
-            ("md5", ""),
-        ])
+            ("client-ip", ip.as_str()),
+            ("md5", report.map_or("", |r| r.digest.as_str())),
+        ];
+        if let Some(report) = report {
+            fields.push(("report", &report.xml));
+        }
+        form(&fields)
+    }
+
+    pub fn hip_report(&self, computer: &str, ip: Ipv4Addr, os: &str) -> Result<HipReport> {
+        HipReport::new(&self.user, computer, ip, os)
     }
 
     pub fn logout(&self, computer: &str) -> Zeroizing<String> {
@@ -584,21 +599,115 @@ fn proposal(root: &Element, fallback_mtu: u16) -> Result<Config> {
     })
 }
 
-pub fn hip_check(bytes: &[u8]) -> Result<()> {
+/// Facts included in a report and displayed for approval. The same
+/// values feed both views. Unknown posture categories have no XML entry.
+pub struct HipReport {
+    pub xml: String,
+    digest: String,
+    pub review: String,
+}
+
+impl HipReport {
+    fn new(user: &str, computer: &str, ip: Ipv4Addr, os: &str) -> Result<Self> {
+        use md5::{Digest, Md5};
+        let ip = ip.to_string();
+        let info = [
+            ("user-name", "VPN user", user),
+            ("host-name", "VPN hostname", computer),
+            ("ip-address", "Assigned IPv4", &ip),
+        ];
+        if info.iter().map(|(_, _, v)| *v).chain([os]).any(|v| {
+            v.is_empty()
+                || v.len() > 100
+                || v.chars().any(|c| {
+                    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                })
+        }) {
+            return Err("GlobalProtect HIP facts cannot be displayed safely");
+        }
+        let mut root = Element::new("hip-report")
+            .with_attr("name", "hip-report")
+            .with_child(Element::new("hip-report-version").with_text("4"));
+        let mut review = String::new();
+        for (key, label, value) in info {
+            root = root.with_child(Element::new(key).with_text(value));
+            let _ = writeln!(review, "{label}  {value}");
+        }
+        root = root.with_child(
+            Element::new("categories").with_child(
+                Element::new("entry")
+                    .with_attr("name", "host-info")
+                    .with_child(Element::new("os").with_text(os))
+                    .with_child(Element::new("client-version").with_text("Atrium")),
+            ),
+        );
+        let _ = writeln!(review, "Operating system  {os}");
+        review.push_str("Client  Atrium\nOther posture categories are omitted.");
+        // MD5 is the protocol's report identifier, separate from the
+        // TLS transport and from the exact-content approval check.
+        let digest = format!("{:x}", Md5::digest(root.to_doc().as_bytes()));
+        root.children
+            .insert(0, Element::new("md5-sum").with_text(&digest));
+        Ok(Self {
+            xml: root.to_doc(),
+            digest,
+            review,
+        })
+    }
+}
+
+pub fn hip_check(bytes: &[u8]) -> Result<bool> {
     let root = document(bytes)?;
     if root.name == "response" && root.attr("status").is_none_or(|s| s == "success") {
         match scalar(&root, "hip-report-needed")? {
-            Some("no") => return Ok(()),
-            Some("yes") => return Err("GlobalProtect gateway requires a HIP report"),
+            Some("no") => return Ok(false),
+            Some("yes") => return Ok(true),
             _ => {}
         }
     }
     Err("unrecognized GlobalProtect HIP check")
 }
 
+pub fn hip_accepted(bytes: &[u8]) -> Result<()> {
+    let root = document(bytes)?;
+    if root.name == "response" && root.attr("status") == Some("success") {
+        Ok(())
+    } else {
+        Err("GlobalProtect gateway refused the HIP report")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hip_review_reports_only_the_supplied_facts() {
+        let report = HipReport::new(
+            "alice & bob",
+            "atrium",
+            Ipv4Addr::new(10, 77, 0, 2),
+            "FreeBSD 16.0",
+        )
+        .unwrap();
+        assert!(report.review.contains("VPN user  alice & bob"));
+        let xml = document(report.xml.as_bytes()).unwrap();
+        assert_eq!(xml.child_text("user-name"), Some("alice & bob"));
+        assert_eq!(xml.child("categories").unwrap().children.len(), 1);
+        let changed = HipReport::new(
+            "alice & bob",
+            "atrium",
+            Ipv4Addr::new(10, 77, 0, 3),
+            "FreeBSD 16.0",
+        )
+        .unwrap();
+        assert_ne!(report.xml, changed.xml);
+        assert_ne!(report.digest, changed.digest);
+        assert!(
+            HipReport::new("alice\nOS: fake", "atrium", Ipv4Addr::LOCALHOST, "FreeBSD").is_err()
+        );
+        assert!(hip_accepted(b"<response status='error'/>").is_err());
+    }
 
     #[test]
     fn portal_offers_only_host_and_port_choices() {
@@ -706,7 +815,8 @@ thisForm.inputStr.value = getValue();"#;
             hip_check(b"<response><hip-report-needed>no</hip-report-needed></response>").is_ok()
         );
         assert!(
-            hip_check(b"<response><hip-report-needed>yes</hip-report-needed></response>").is_err()
+            hip_check(b"<response><hip-report-needed>yes</hip-report-needed></response>")
+                == Ok(true)
         );
     }
 }

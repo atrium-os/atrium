@@ -133,6 +133,7 @@ pub fn ask(v: &[Line]) -> Option<Ask> {
                     1 => FieldKind::Password,
                     2 => FieldKind::Code,
                     3 if l.hex("name").as_deref() == Some(b"gp_gateway") => FieldKind::GatewayChoice,
+                    3 if l.hex("name").as_deref() == Some(b"gp_hip_approval") => FieldKind::HipApproval,
                     _ => FieldKind::Choice,
                 };
                 f.fields.push(Field { label: text(l, "label").unwrap_or_default(), kind, choices: Vec::new() });

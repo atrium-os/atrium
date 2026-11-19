@@ -245,12 +245,48 @@ impl Engine {
         let (status, body) = self.gp_post(
             jar,
             gp::HIP_CHECK,
-            &session.hip(&self.st.hostname, config.push.addr),
+            &session.hip(&self.st.hostname, config.push.addr, None),
         )?;
         if status != 200 {
             return Err(refused("GlobalProtect HIP check failed").into());
         }
-        gp::hip_check(&body).map_err(refused)?;
+        if gp::hip_check(&body).map_err(refused)? {
+            let os = self
+                .hip_os
+                .as_deref()
+                .ok_or_else(|| refused("Could not determine the local OS for HIP"))?;
+            let report = session
+                .hip_report(&self.st.hostname, config.push.addr, os)
+                .map_err(refused)?;
+            if self.approved_hip.as_deref() != Some(&report.xml) {
+                let review = Form {
+                    id: "globalprotect-hip".into(),
+                    title: "Review GlobalProtect device report".into(),
+                    message: format!("Send to {}:{}", self.st.host, self.st.gateway.port()),
+                    error: String::new(),
+                    banner: report.review.clone(),
+                    fields: vec![Field {
+                        name: "gp_hip_approval".into(),
+                        label: "Device report".into(),
+                        kind: Kind::Choice(vec![("submit".into(), "Approve report".into())]),
+                    }],
+                };
+                let answers = self.answers(&review, &mut false)?;
+                if gp_field(&answers, "gp_hip_approval")? != "submit" {
+                    return Err(refused("GlobalProtect device report was not approved").into());
+                }
+                self.approved_hip = Some(report.xml.clone());
+            }
+            let (status, body) = self.gp_post(
+                jar,
+                gp::HIP_REPORT,
+                &session.hip(&self.st.hostname, config.push.addr, Some(&report)),
+            )?;
+            if status != 200 {
+                return Err(refused("GlobalProtect gateway refused the HIP report").into());
+            }
+            gp::hip_accepted(&body).map_err(refused)?;
+        }
 
         Ok(config)
     }
@@ -561,4 +597,22 @@ fn gp_field<'a>(values: &'a [(String, Zeroizing<String>)], name: &str) -> Result
         .map(|(_, value)| value.as_str())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| refused("GlobalProtect answer missing"))
+}
+
+pub(super) fn hip_os() -> Option<String> {
+    // Obtain the kernel's actual name and release before Capsicum. No
+    // nodename, host ID or hardware identifiers are copied into the report.
+    let mut raw = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: uname writes a utsname on success.
+    if unsafe { libc::uname(raw.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: successful uname initialized the structure and NUL-terminated its fields.
+    let raw = unsafe { raw.assume_init() };
+    let text = |p| unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok();
+    Some(format!(
+        "{} {}",
+        text(raw.sysname.as_ptr())?,
+        text(raw.release.as_ptr())?
+    ))
 }

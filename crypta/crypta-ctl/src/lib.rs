@@ -291,6 +291,7 @@ pub enum FieldKind {
     Choice,
     PasswordOnce,
     GatewayChoice,
+    HipApproval,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

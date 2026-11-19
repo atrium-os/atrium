@@ -14,6 +14,7 @@ export CRYPTA_GP_TEST_PORT=$2
 trust=$3
 portal_port=${4:-}
 transport=${5:-}
+hip=${6:-}
 if [ -n "$transport" ]; then
     export CRYPTA_GP_TEST_ESP=4501
 fi
@@ -123,6 +124,24 @@ else
     "$V" "$CTL up name=gp-gate" >/dev/null
     wait_prompt password
     answer_password alice 'a&+ b'
+fi
+if [ -n "$hip" ]; then
+    wait_prompt gp_hip_approval
+    [ "$(field handshake)" = 0 ] || fail "the data tunnel opened before HIP approval"
+    preview=$(printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n')
+    for line in 'VPN user  alice' 'VPN hostname  atrium' 'Assigned IPv4  10.77.0.2' "Operating system  $("$V" 'uname -sr')"; do
+        case "$preview" in *"$(hex "$line")"*) ;; *) fail "HIP prompt omitted a report field" ;; esac
+    done
+    ok "Settings prompt exposes the HIP facts before the data tunnel is up"
+    if [ "$hip" = decline ]; then
+        "$V" "$CTL answer name=gp-gate cancel=1" >/dev/null
+        wait_field up 0
+        [ -n "$(field error)" ] || fail "declining HIP did not end sign-in"
+        ok "declining HIP ended sign-in"
+        echo "$pass checks passed"
+        exit 0
+    fi
+    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null
 fi
 wait_field handshake 1
 ok "GlobalProtect signed in using Arca's held password"

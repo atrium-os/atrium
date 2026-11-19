@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,7 +143,7 @@ class EspPeer:
             self.errors.append(error)
 
 
-def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None):
+def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None, hip=None):
     try:
         while True:
             raw, _ = listener.accept()
@@ -199,7 +200,28 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 + (esp.offer() if esp else '') + '</response>')
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
-                        body = "<response><hip-report-needed>no</hip-report-needed></response>"
+                        needed = "yes" if hip else "no"
+                        body = f"<response><hip-report-needed>{needed}</hip-report-needed></response>"
+                    elif path == "hipreport.esp":
+                        assert hip == "approve", "HIP submitted without approval"
+                        assert fields["authcookie"] == [COOKIE]
+                        report, = fields["report"]
+                        doc = ET.fromstring(report)
+                        assert doc.tag == "hip-report" and doc.attrib == {"name": "hip-report"}
+                        assert doc.findtext("user-name") == "alice"
+                        assert doc.findtext("host-name") == "atrium"
+                        assert doc.findtext("ip-address") == "10.77.0.2"
+                        assert doc.findtext("hip-report-version") == "4"
+                        categories = doc.findall("./categories/entry")
+                        assert [node.attrib for node in categories] == [{"name": "host-info"}]
+                        assert {node.tag for node in categories[0]} == {"os", "client-version"}
+                        assert categories[0].findtext("os").startswith("FreeBSD ")
+                        assert categories[0].findtext("client-version") == "Atrium"
+                        digest, = fields["md5"]
+                        assert doc.findtext("md5-sum") == digest
+                        original = report.replace(f"<md5-sum>{digest}</md5-sum>", "", 1)
+                        assert hashlib.md5(original.encode()).hexdigest() == digest
+                        body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
@@ -292,7 +314,10 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
+    parser.add_argument("--hip", choices=["approve", "decline"], help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
+    if args.hip and (not args.full_vm or args.esp or args.drop_esp):
+        parser.error("HIP cases run with the full TLS VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
         parser.error("use --full-vm or the host client for ESP packet checks")
     with tempfile.TemporaryDirectory() as directory:
@@ -324,7 +349,7 @@ def main():
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp}, daemon=True)
+            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip}, daemon=True)
             thread.start()
             if args.openconnect:
                 marker = tmp / "reply"
@@ -352,7 +377,7 @@ def main():
                 print("OpenConnect received an ICMP echo reply with valid checksums and matching payload")
             elif args.full_vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin, "",
-                                ("TLS" if args.drop_esp else "ESP") if esp else ""],
+                                ("TLS" if args.drop_esp else "ESP") if esp else "", args.hip or ""],
                                check=True, timeout=300)
             elif args.vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
@@ -372,6 +397,12 @@ def main():
             thread.join(2)
             assert not errors, errors
             exchange = ["getconfig.esp", "hipreportcheck.esp"]
+            if args.hip == "decline":
+                assert calls == ["prelogin.esp", "login.esp", *exchange], calls
+                print("Declining HIP sent no report and opened no data tunnel")
+                return
+            if args.hip == "approve":
+                exchange.append("hipreport.esp")
             if esp:
                 assert not esp.errors, esp.errors
                 assert esp.probes > 0, "client sent no authenticated ESP probes"

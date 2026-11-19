@@ -383,7 +383,7 @@ impl VpnPage {
                     }
                     Value::Text(x.trim().to_string())
                 }
-                FieldKind::Choice | FieldKind::GatewayChoice => match fl.choices.get(s.chosen.get(i).copied().unwrap_or(0)) {
+                FieldKind::Choice | FieldKind::GatewayChoice | FieldKind::HipApproval => match fl.choices.get(s.chosen.get(i).copied().unwrap_or(0)) {
                     Some((v, _)) => Value::Text(v.clone()),
                     None => {
                         self.note = Some((true, "nothing to choose".into()));
@@ -764,11 +764,27 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
         }
         Ask::Form(f) => f,
     };
-    let msg: Vec<&str> = f.message.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
-    let banner: Vec<&str> = f.banner.lines().filter(|l| !l.trim().is_empty()).take(8).collect();
+    let reviewing_hip = f.fields.iter().any(|x| x.kind == FieldKind::HipApproval);
+    let lines = |value: &str, limit| {
+        let width = ((pw - em(32.0)) / em(12.0)).max(1.0) as usize;
+        let mut lines = Vec::new();
+        for line in value.lines().filter(|l| !l.trim().is_empty()).take(limit) {
+            if reviewing_hip {
+                let chars: Vec<_> = line.chars().collect();
+                lines.extend(chars.chunks(width).map(|chunk| chunk.iter().collect::<String>()));
+            } else {
+                lines.push(line.chars().take(120).collect());
+            }
+        }
+        lines
+    };
+    let msg = lines(&f.message, 4);
+    let banner = lines(&f.banner, 8);
     let choosing_gateway = f.fields.iter().any(|x| x.kind == FieldKind::GatewayChoice);
     let fh: f32 = f.fields.iter().map(|x| {
-        if x.kind == FieldKind::GatewayChoice {
+        if x.kind == FieldKind::HipApproval {
+            0.0
+        } else if x.kind == FieldKind::GatewayChoice {
             em(34.0) * x.choices.len().max(1) as f32
         } else if x.kind == FieldKind::Choice {
             em(48.0)
@@ -782,7 +798,7 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     text(ctx, em(16.0), y + em(22.0), &title, type_size::MD, Weight::Medium, t.text_primary());
     y += em(36.0);
     for l in banner.iter().chain(msg.iter()) {
-        text(ctx, em(16.0), y + em(8.0), &l.chars().take(120).collect::<String>(), type_size::SM, Weight::Regular, t.text_secondary());
+        text(ctx, em(16.0), y + em(8.0), l, type_size::SM, Weight::Regular, t.text_secondary());
         y += em(18.0);
     }
     if !f.error.is_empty() {
@@ -794,6 +810,9 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     let fw = (pw - fx - em(16.0)).clamp(em(160.0), em(320.0));
     let mut ti = 0;
     for (i, fl) in f.fields.iter().enumerate() {
+        if fl.kind == FieldKind::HipApproval {
+            continue;
+        }
         let label = fl.label.trim().trim_end_matches(':');
         text(ctx, lx, y + em(18.0), &label.chars().take(24).collect::<String>(), type_size::SM, Weight::Regular, t.text_secondary());
         match fl.kind {
@@ -811,6 +830,7 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
                 }
                 y += em(44.0);
             }
+            FieldKind::HipApproval => unreachable!("approval uses the form action"),
             FieldKind::GatewayChoice => {
                 for (choice, (_, label)) in fl.choices.iter().enumerate() {
                     let on = si.chosen.get(i).copied() == Some(choice);
@@ -841,7 +861,7 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     }
     let ready = !p.busy && p.armed.is_none();
     let (pg, fs, n) = (page.clone(), fields.clone(), f.fields.iter().filter(|x| x.kind == FieldKind::Text).count().min(MAX_TEXTS));
-    let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else if choosing_gateway { "Connect" } else { "Sign in" }, Look::Primary, ready, move || {
+    let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else if reviewing_hip { "Send device report" } else if choosing_gateway { "Connect" } else { "Sign in" }, Look::Primary, ready, move || {
         let texts: Vec<String> = (0..n).map(|k| fs[ANSWER_AT + k].get_cloned().text().to_string()).collect();
         with_vpn(&pg, |a| a.sign_in(texts, std::time::Instant::now()));
     });
