@@ -73,7 +73,7 @@ pub enum Change {
     SheetAdded { name: String },
     /// A sheet only ours has.
     SheetRemoved { sheet: u16 },
-    StructuralConflict { sheet: u16, axis: crate::shift::Axis, at: u32, reason: &'static str },
+    StructuralConflict { sheet: u16, axis: crate::shift::Axis, at: u32, reason: &'static str, versions: Box<[String; 2]> },
 }
 
 impl Change {
@@ -146,6 +146,64 @@ impl Change {
     /// deleted; Take All takes such a sheet whole).
     pub fn is_rows(&self) -> bool {
         matches!(self, Change::RowsAdded { .. } | Change::RowsRemoved { .. })
+    }
+
+    /// The selected review item, with version values separate from its list summary.
+    pub fn details(&self, ours: &Workbook, theirs: &Workbook, tracked: bool) -> String {
+        let (left, right) = if tracked { ("Before", "Current") } else { ("Current", "Incoming") };
+        let versions = |title, before, after| format!("{title}\n\n{left}\n{before}\n\n{right}\n{after}");
+        let input = |value: &Input| match value {
+            Input::Empty | Input::Value(Value::Empty) => "(empty)".into(),
+            Input::Value(Value::Num(n)) => n.to_string(),
+            Input::Value(v) => v.display(),
+            Input::Formula(formula) => formula.clone(),
+        };
+        match self {
+            Change::Cell { row, col, ours: before, theirs: after, .. } =>
+                versions(crate::addr::a1(*row, *col), input(before), input(after)),
+            Change::Link(change) => {
+                let target = |link: Option<&crate::links::Link>| link.map_or_else(
+                    || "(none)".into(), |link| link.target.to_string());
+                let (before, after) = change.versions();
+                versions(self.describe(ours, theirs), target(before), target(after))
+            }
+            Change::Comment(change) => {
+                let comment_text = |comment: Option<&crate::comments::Comment>| {
+                    let Some(c) = comment else { return "(none)".into() };
+                    if c.thread().is_empty() { return format!("{}\n{}", c.author, c.text); }
+                    c.thread().iter().map(|m| {
+                        format!("{} {}{}\n{}", m.author.name, m.timestamp,
+                            if m.done { " (resolved)" } else { "" }, m.text)
+                    }).collect::<Vec<_>>().join("\n\n")
+                };
+                let (before, after) = change.versions();
+                versions(self.describe(ours, theirs), comment_text(before), comment_text(after))
+            }
+            Change::Name(change) => {
+                let (before, after) = change.formulas();
+                versions(self.describe(ours, theirs), before.into(), after.into())
+            }
+            Change::Merge(change) => {
+                let (before, after) = change.ranges();
+                versions(self.describe(ours, theirs), before, after)
+            }
+            Change::Style { ours: before, theirs: after, .. } => {
+                let props = |style: &crate::style::Style| {
+                    let font = &style.font;
+                    let color = |c: Option<u32>| c.map_or_else(|| "default".into(), |rgb| format!("#{rgb:06X}"));
+                    let flags = [(font.bold, "bold"), (font.italic, "italic"), (font.underline, "underline"), (font.strike, "strikethrough")]
+                        .into_iter().filter_map(|(on, label)| on.then_some(label)).collect::<Vec<_>>();
+                    let size = font.size.map_or_else(|| "default".into(), |s| format!("{} pt", f64::from(s) / 20.0));
+                    format!("Number format: {}\nFont: {}, {size} {}\nText color: {}\nFill: {}\nAlignment: {:?}, {:?}\nWrap: {} · Indent: {} · Rotation: {}°",
+                        style.num_fmt, font.name.as_deref().unwrap_or("default"), flags.join(", "),
+                        color(font.color), color(style.fill), style.h_align, style.v_align, style.wrap, style.indent, style.rotation)
+                };
+                versions(self.describe(ours, theirs), props(before), props(after))
+            }
+            Change::StructuralConflict { versions: sides, .. } =>
+                versions(self.describe(ours, theirs), sides[0].clone(), sides[1].clone()),
+            _ => self.describe(ours, theirs),
+        }
     }
 
     /// The change in words: "B4: 12 → 15", "2 rows added before row 7".

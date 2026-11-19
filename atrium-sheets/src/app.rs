@@ -284,6 +284,7 @@ pub struct Sheets {
     pub review: Mutable<crate::review::ReviewPane>,
     pub theirs: Rc<RefCell<Option<officina_grid::Workbook>>>,
     pub review_scroll: Mutable<ScrollState>,
+    review_detail_scroll: Mutable<ScrollState>,
     /// Its Apply To field and the rule's two value fields.
     pub cond_range: Mutable<TextEdit>,
     pub cond_a: Mutable<TextEdit>,
@@ -332,7 +333,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { launcher: false, doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { launcher: false, doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), review_detail_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -445,14 +446,14 @@ impl Sheets {
     pub fn compare_with(&self, name: &str, theirs: officina_grid::Workbook) {
         let mut p = crate::review::ReviewPane { open: true, name: name.to_string(), ..Default::default() };
         p.refresh(&self.doc.borrow().wb, &theirs);
-        p.picked = (!p.changes.is_empty()).then_some(0);
         *self.theirs.borrow_mut() = Some(theirs);
         self.cond.set(crate::condfmt::CondPanel::default());
         self.pivot_pane.set(crate::pivotpane::PivotPane::default());
         self.filter.set(FilterPanel::default());
         self.doc.borrow_mut().status = p.summary() + ".";
         self.review.set(p);
-        self.review_cmd(crate::review::ReviewCmd::Pick(0));
+        self.review_scroll.set(ScrollState::default());
+        self.changed();
     }
 
     fn start_tracking(&self) {
@@ -468,23 +469,20 @@ impl Sheets {
     }
 
     fn review_tracked(&self) {
-        use crate::review::{merge_error, ReviewMode, ReviewPane};
+        use crate::review::{merge_error, ReviewMode};
         let result = {
             let d = self.doc.borrow();
             d.wb.tracked_cells().map(|set| (set.author().to_string(), set.changes(&d.wb)))
         };
         match result {
-            Some((author, Ok(changes))) => self.open_cell_review(ReviewPane {
-                open: true, mode: ReviewMode::Tracked { author }, changes,
-                ..Default::default()
-            }),
+            Some((author, Ok(changes))) => self.open_cell_review(ReviewMode::Tracked { author }, String::new(), changes),
             Some((_, Err(error))) => self.set_status(merge_error(error)),
             None => self.set_status("Start tracking cell changes first."),
         }
     }
 
     pub fn merge_copies(&self, name: &str, base: &officina_grid::compare::CellSnapshot, incoming: &officina_grid::Workbook) {
-        use crate::review::{merge_error, writable, ReviewMode, ReviewPane};
+        use crate::review::{merge_error, writable, ReviewMode};
         use officina_grid::{compare::Change, ops::GridOp, CellAddr};
 
         let mut d = self.doc.borrow_mut();
@@ -531,10 +529,7 @@ impl Sheets {
             }
         }
         drop(d);
-        self.open_cell_review(ReviewPane {
-            open: true, mode: ReviewMode::Merge { sheets }, name: name.into(), changes: conflicts,
-            ..Default::default()
-        });
+        self.open_cell_review(ReviewMode::Merge { sheets }, name.into(), conflicts);
         let summary = self.review.get_cloned().summary();
         if structural == 0 {
             self.set_status(format!("{count} independent cell changes applied. {summary}."));
@@ -543,13 +538,16 @@ impl Sheets {
         }
     }
 
-    fn open_cell_review(&self, pane: crate::review::ReviewPane) {
+    fn open_cell_review(&self, mode: crate::review::ReviewMode, name: String, changes: Vec<officina_grid::compare::Change>) {
+        let mut pane = crate::review::ReviewPane { open: true, mode, name, ..Default::default() };
+        pane.replace_changes(changes);
         *self.theirs.borrow_mut() = None;
         self.cond.set(crate::condfmt::CondPanel::default());
         self.pivot_pane.set(crate::pivotpane::PivotPane::default());
         self.filter.set(FilterPanel::default());
         self.review.set(pane);
-        self.review_cmd(crate::review::ReviewCmd::Pick(0));
+        self.review_scroll.set(ScrollState::default());
+        self.changed();
     }
 
     /// Selects change `ch`'s cell and scrolls it into view.
@@ -569,19 +567,50 @@ impl Sheets {
         self.scroll.set(st);
     }
 
+    fn clamp_review_scroll(&self, pane: &crate::review::ReviewPane) {
+        use crate::review::{list_height, REVIEW_ROW_H};
+        let (groups, count) = pane.group_rows();
+        let mut scroll = self.review_scroll.get();
+        let shown = list_height(self.size.get().1, pane.picked.is_some()) as f64 / scroll.zoom.settled.max(0.01);
+        scroll.physics.set_max((count as f64 * REVIEW_ROW_H as f64 - shown).max(0.0));
+        self.review_scroll.set(scroll);
+        if let Some(index) = pane.picked {
+            for group in groups.iter().filter(|g| g.expanded) {
+                let indices = pane.group_items(group.group);
+                if let Ok(offset) = indices.binary_search(&index) {
+                    pergola::widgets::VirtualList::reveal(&self.review_scroll, group.start + 1 + offset,
+                        count, REVIEW_ROW_H, list_height(self.size.get().1, true));
+                    break;
+                }
+            }
+        }
+    }
+
     /// Runs a press in the Compare pane.
     pub fn review_cmd(&self, c: crate::review::ReviewCmd) {
         use crate::review::{self as rv, ReviewCmd};
         let mut p = self.review.get_cloned();
+        if !p.open { return; }
+        match c {
+            ReviewCmd::Pick(i) => {
+                if let Some(change) = p.pick(i) { self.show_change(change); }
+                self.review_detail_scroll.set(ScrollState::default());
+            }
+            ReviewCmd::Toggle(group) => {
+                p.toggle_group(group);
+            }
+            _ => {}
+        }
+        if matches!(c, ReviewCmd::Pick(_) | ReviewCmd::Toggle(_)) {
+            self.clamp_review_scroll(&p);
+            self.review.set(p);
+            self.changed();
+            return;
+        }
         if !matches!(p.mode, rv::ReviewMode::Compare) {
             match c {
                 ReviewCmd::Close => p = rv::ReviewPane::default(),
-                ReviewCmd::Pick(i) => {
-                    p.picked = p.changes.get(i).map(|ch| {
-                        self.show_change(ch);
-                        i
-                    });
-                }
+                ReviewCmd::Pick(_) | ReviewCmd::Toggle(_) => unreachable!(),
                 ReviewCmd::Take | ReviewCmd::Keep => {
                     if let (rv::ReviewMode::Merge { sheets }, Some(i)) = (&p.mode, p.picked) {
                         if let Some(officina_grid::compare::Change::Cell { sheet, row, col, ours, theirs }) = p.changes.get(i) {
@@ -603,13 +632,13 @@ impl Sheets {
                                     return;
                                 }
                             }
-                            p.changes.remove(i);
-                            p.picked = if p.changes.is_empty() { None } else { Some(i.min(p.changes.len() - 1)) };
+                            p.resolve(i);
                         }
                     }
                 }
                 ReviewCmd::TakeAll => {}
             }
+            self.clamp_review_scroll(&p);
             self.review.set(p);
             self.changed();
             return;
@@ -618,28 +647,20 @@ impl Sheets {
         let theirs = theirs.borrow();
         let Some(other) = theirs.as_ref() else { return };
         match c {
-            ReviewCmd::Pick(i) => {
-                p.picked = (i < p.changes.len()).then_some(i);
-                if let Some(ch) = p.picked.map(|i| p.changes[i].clone()) {
-                    self.show_change(&ch);
-                }
-            }
+            ReviewCmd::Pick(_) | ReviewCmd::Toggle(_) => unreachable!(),
             ReviewCmd::Take | ReviewCmd::Keep => {
                 if let Some(ch) = p.picked.and_then(|i| p.changes.get(i)).cloned() {
                     if c == ReviewCmd::Keep {
-                        p.kept.push(ch);
+                        Arc::make_mut(&mut p.kept).push(ch);
                     } else if !rv::take(&mut self.doc.borrow_mut(), other, &ch) {
                         if matches!(ch, officina_grid::compare::Change::SheetAdded { .. } | officina_grid::compare::Change::SheetRemoved { .. }) {
                             self.doc.borrow_mut().status = "Sheets added or removed can't be taken here; add or delete the sheet itself.".into();
-                            p.kept.push(ch);
+                            Arc::make_mut(&mut p.kept).push(ch);
                         } else {
                             self.doc.borrow_mut().status = "This change could not be applied to the current workbook.".into();
                         }
                     }
                     p.refresh(&self.doc.borrow().wb, other);
-                    if let Some(ch) = p.picked.map(|i| p.changes[i].clone()) {
-                        self.show_change(&ch);
-                    }
                 }
             }
             ReviewCmd::TakeAll => {
@@ -653,6 +674,7 @@ impl Sheets {
                 *self.theirs.borrow_mut() = None;
             }
         }
+        self.clamp_review_scroll(&p);
         self.review.set(p);
         self.changed();
     }
@@ -2466,46 +2488,68 @@ impl View for Sheets {
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 10.0, fw - 70.0, 20.0), content: match rv.mode { ReviewMode::Compare => "Compare", ReviewMode::Tracked { .. } => "Tracked Cell Changes", ReviewMode::Merge { .. } => "Merge Conflicts" }.into(), style: st(type_size::MD, Weight::Semibold, t.text_primary()) });
             Button::secondary("Close").at(x0 + REVIEW_W - 76.0, y0 + 6.0).width(64.0).on_click(push(ReviewCmd::Close)).render(ctx);
             ctx.add(Node::Text { rect: Rect::new(x0 + 12.0, y0 + 36.0, fw, 16.0), content: rv.summary().chars().take(60).collect(), style: st(type_size::XS, Weight::Regular, t.text_secondary()) });
-            let (lines, sheets): (Vec<String>, Vec<String>) = {
-                let d = self.doc.borrow();
-                let theirs = self.theirs.borrow();
-                let other = theirs.as_ref().unwrap_or(&d.wb);
-                rv.changes.iter().map(|c| (c.describe(&d.wb, other), c.sheet()
-                    .filter(|&s| (s as usize) < d.wb.sheet_count() && d.wb.sheet_count() > 1)
-                    .map(|s| d.wb.sheet_name(s)).unwrap_or_default())).unzip()
-            };
+            let picked = rv.picked.and_then(|index| rv.changes.get(index));
+            let (groups, count) = rv.group_rows();
             let ly = y0 + 60.0;
-            let lh = (ph - 60.0 - 56.0).max(REVIEW_ROW_H);
-            let n = lines.len();
-            let (lines, sheets, cmds, picked) = (Rc::new(lines), Rc::new(sheets), self.cmds.clone(), rv.picked);
-            pergola::widgets::VirtualList::new(self.review_scroll.clone(), Rect::new(x0 + 1.0, ly, REVIEW_W - 1.0, lh), n, REVIEW_ROW_H, move |k, ctx| {
-                let t = ctx.theme;
-                let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, REVIEW_W - 1.0, REVIEW_ROW_H), 0.0));
-                ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
-                let hit = ctx.add(Node::Rect { rect: Rect::new(6.0, 1.0, REVIEW_W - 13.0, REVIEW_ROW_H - 2.0), fill: if picked == Some(k) { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
-                let cmds = cmds.clone();
-                ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Review(ReviewCmd::Pick(k))));
-                let sheet = &sheets[k];
-                let tw = if sheet.is_empty() { REVIEW_W - 28.0 } else { REVIEW_W - 110.0 };
-                ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(8.0, 6.0, tw, 18.0), content: lines[k].chars().take(56).collect(), style: TextStyle { family: font::SANS.into(), size: type_size::SM, weight: Weight::Regular, color: t.text_primary() } });
-                if !sheet.is_empty() {
-                    ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(REVIEW_W - 96.0, 7.0, 80.0, 16.0), content: sheet.chars().take(14).collect(), style: TextStyle { family: font::SANS.into(), size: type_size::XS, weight: Weight::Regular, color: t.text_tertiary() } });
-                }
-                ctx.pop();
-            })
-            .backdrop(t.bg_surface())
-            .key(0xF119)
-            .emit(ctx);
-            let by = ly + lh + 12.0;
+            let lh = crate::review::list_height(h, picked.is_some());
+            if let Some(change) = picked {
+                let style = TextStyle { family: font::MONO.into(), size: type_size::SM,
+                    weight: Weight::Regular, color: t.text_primary() };
+                let lines = {
+                    let d = self.doc.borrow();
+                    let other = self.theirs.borrow();
+                    crate::review::detail_lines(change, &rv.mode, &d.wb, other.as_ref().unwrap_or(&d.wb), &style)
+                };
+                let detail_y = ly + lh + 8.0;
+                let detail_h = (y0 + ph - 56.0 - detail_y).max(20.0);
+                ctx.add(Node::Rect { rect: Rect::new(x0 + 8.0, detail_y - 4.0, REVIEW_W - 16.0, 1.0),
+                    fill: t.border_default(), radius: 0.0 });
+                pergola::widgets::VirtualList::new(self.review_detail_scroll.clone(),
+                    Rect::new(x0 + 8.0, detail_y, REVIEW_W - 16.0, detail_h), lines.len(), 18.0, move |k, ctx| {
+                        ctx.add(Node::Text { rect: Rect::new(4.0, 0.0, REVIEW_W - 26.0, 18.0),
+                            content: lines[k].clone(), style: style.clone() });
+                    }).backdrop(t.bg_surface()).key(0xF11A).emit(ctx);
+            }
+            let (doc, other, cmds) = (self.doc.clone(), self.theirs.clone(), self.cmds.clone());
+            let actions = picked.is_some_and(|ch| !matches!(ch, officina_grid::compare::Change::StructuralConflict { .. }));
+            let compare = matches!(rv.mode, ReviewMode::Compare);
+            let tracked = matches!(rv.mode, ReviewMode::Tracked { .. });
+            pergola::widgets::VirtualList::new(self.review_scroll.clone(), Rect::new(x0 + 1.0, ly, REVIEW_W - 1.0, lh),
+                count, REVIEW_ROW_H, move |k, ctx| {
+                    let group = &groups[groups.partition_point(|g| g.start <= k) - 1];
+                    let offset = k - group.start;
+                    let d = doc.borrow();
+                    let (label, action, selected) = if offset == 0 {
+                        let sheet = group.group.0.map(|id| d.wb.sheet_name(id)).unwrap_or_else(|| "Workbook".into());
+                        let arrow = if group.expanded { "▾" } else { "▸" };
+                        (format!("{arrow} {sheet} · {} ({})", group.group.1, group.count), ReviewCmd::Toggle(group.group), false)
+                    } else {
+                        let i = rv.group_items(group.group)[offset - 1];
+                        let other = other.borrow();
+                        let label = rv.changes[i].describe(&d.wb, other.as_ref().unwrap_or(&d.wb));
+                        (label.chars().take(56).collect(), ReviewCmd::Pick(i), rv.picked == Some(i))
+                    };
+                    let t = ctx.theme;
+                    let row = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, REVIEW_W - 1.0, REVIEW_ROW_H), 0.0));
+                    ctx.set_flex(row, pergola::layout::FlexStyle { free: true, ..pergola::layout::FlexStyle::default() });
+                    let hit = ctx.add(Node::Rect { rect: Rect::new(6.0, 1.0, REVIEW_W - 13.0, REVIEW_ROW_H - 2.0),
+                        fill: if selected { t.accent_bg() } else { Color::TRANSPARENT }, radius: 6.0 });
+                    let cmds = cmds.clone();
+                    ctx.on_click(hit, move || cmds.lock().unwrap().push(Cmd::Review(action)));
+                    let indent = if offset == 0 { 8.0 } else { 22.0 };
+                    let weight = if offset == 0 { Weight::Semibold } else { Weight::Regular };
+                    ctx.tree.insert(Some(hit), Node::Text { rect: Rect::new(indent, 6.0, REVIEW_W - indent - 25.0, 18.0),
+                        content: label, style: st(type_size::SM, weight, t.text_primary()) });
+                    ctx.pop();
+                }).backdrop(t.bg_surface()).key(0xF119).emit(ctx);
+            let by = y0 + ph - 44.0;
             ctx.add(Node::Rect { rect: Rect::new(x0, by - 6.0, REVIEW_W, 1.0), fill: t.border_default(), radius: 0.0 });
-            if !matches!(rv.mode, ReviewMode::Tracked { .. })
-                && !rv.picked.and_then(|i| rv.changes.get(i)).is_some_and(|ch| matches!(ch, officina_grid::compare::Change::StructuralConflict { .. }))
-            {
-                let label = if matches!(rv.mode, ReviewMode::Compare) { "Take" } else { "Take Incoming" };
+            if actions && !tracked {
+                let label = if compare { "Take" } else { "Take Incoming" };
                 Button::primary(label).at(x0 + 12.0, by).width(100.0).on_click(push(ReviewCmd::Take)).render(ctx);
                 Button::secondary("Keep Mine").at(x0 + 120.0, by).width(96.0).on_click(push(ReviewCmd::Keep)).render(ctx);
             }
-            if matches!(rv.mode, ReviewMode::Compare) {
+            if compare {
                 Button::secondary("Take All").at(x0 + REVIEW_W - 100.0, by).width(88.0).on_click(push(ReviewCmd::TakeAll)).render(ctx);
             }
         }
@@ -3045,6 +3089,11 @@ mod tests {
         sheets.merge_copies("incoming.osheet", &base, &reopen(&incoming).wb);
         assert!(matches!(sheets.review.get_cloned().changes.as_slice(),
             [Change::StructuralConflict { axis: Axis::Rows, at: 5, .. }]));
+        sheets.review_cmd(crate::review::ReviewCmd::Pick(0));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for want in ["Current", "Edited cells in the deleted range", "Incoming", "At base row 6: 1 removed, 0 inserted"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == want)), "{want}");
+        }
         assert_eq!(sheets.doc.borrow().wb.value(0, 5, 3), Value::num(30.0));
 
         let mut ours = open();
@@ -3164,7 +3213,7 @@ mod tests {
         let number = |n| Input::Value(Value::num(n));
         let pane = review();
         assert_eq!(pane.mode, ReviewMode::Tracked { author: "Zoë Nguyen".into() });
-        assert_eq!(pane.changes, vec![
+        assert_eq!(pane.changes.as_slice(), &[
             Change::Cell { sheet: 0, row: 0, col: 0, ours: number(1.0), theirs: number(11.0) },
             Change::Cell { sheet: 0, row: 0, col: 1, ours: number(2.0), theirs: Input::Formula("=A1*2".into()) },
             Change::Cell { sheet: 0, row: 0, col: 2, ours: number(3.0), theirs: Input::Empty },
@@ -3225,7 +3274,7 @@ mod tests {
         assert_eq!(input(0, 3), Input::Empty);
         assert_eq!(input(1, 3), number(88.0));
         let review = sheets.review.get_cloned();
-        assert_eq!(review.changes, vec![Change::Cell {
+        assert_eq!(review.changes.as_slice(), &[Change::Cell {
             sheet: 0, row: 0, col: 1, ours: number(22.0), theirs: number(33.0),
         }]);
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
@@ -3236,6 +3285,12 @@ mod tests {
         assert_eq!(input(0, 0), number(11.0));
         assert!(sheets.doc.borrow_mut().redo());
 
+        assert!(review.picked.is_none());
+        sheets.review_cmd(ReviewCmd::Pick(0));
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        for want in ["Current", "Incoming", "22", "33", "Take Incoming", "Keep Mine"] {
+            assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == want)), "{want}");
+        }
         sheets.review_cmd(ReviewCmd::TakeAll);
         assert_eq!(input(0, 1), number(22.0));
         sheets.review_cmd(ReviewCmd::Take);
@@ -3243,10 +3298,14 @@ mod tests {
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(input(0, 1), number(22.0));
         sheets.merge_copies("incoming.csv", &base, &other.wb);
+        sheets.review_cmd(ReviewCmd::Pick(0));
         sheets.doc.borrow_mut().run("Further edit", vec![GridOp::set(addr(0, 1), number(44.0))]);
         sheets.review_cmd(ReviewCmd::Take);
         assert_eq!(input(0, 1), number(44.0));
         assert_eq!(sheets.review.get_cloned().changes.len(), 1);
+        sheets.review_cmd(ReviewCmd::Keep);
+        assert!(sheets.review.get_cloned().changes.is_empty());
+        assert_eq!(input(0, 1), number(44.0));
     }
 
     #[test]
@@ -3302,6 +3361,9 @@ mod tests {
             sheets.review_cmd(action);
         };
         assert_eq!(sheets.review.get_cloned().changes.len(), 11);
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == "Style B11:B13 changed")));
         choose(&|c| matches!(c, Change::Style { rect, .. } if rect.c0 == 1), ReviewCmd::Keep);
@@ -3425,6 +3487,9 @@ mod tests {
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 13);
         assert!(pane.changes.iter().all(|c| matches!(c, Change::Merge(_) | Change::RowHeight(_) | Change::ColumnWidth(_))));
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         for label in ["Merge B3:D3 changed", "Merge B5:C5 removed", "Merge B9:E9 added",
                       "Row 3 height: 32 → 36", "Column B width: 96 → 99"] {
@@ -3511,6 +3576,9 @@ mod tests {
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 6);
         assert!(pane.changes.iter().all(|ch| matches!(ch, Change::Comment(_) | Change::Link(_))));
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         for label in ["Comment thread B3 changed", "Comment thread B5 removed", "Comment B7 added",
                       "Hyperlink B4 changed", "Hyperlink B6 removed", "Hyperlink B8 added"] {
@@ -3588,6 +3656,9 @@ mod tests {
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 6);
         assert!(pane.changes.iter().all(|change| matches!(change, Change::Picture(_))));
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         for label in ["Picture B3 removed", "Picture B9 changed", "Picture B11 added"] {
             assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
@@ -3660,6 +3731,9 @@ mod tests {
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 7, "generated pivot values have no separate rows");
         assert!(pane.changes.iter().all(|change| matches!(change, Change::Table(_) | Change::Pivot(_))));
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         for label in ["Table KeepTable changed", "Table NewTable added", "Pivot table Take changed", "Pivot table Old removed"] {
             assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
@@ -3773,6 +3847,9 @@ mod tests {
         let validations = |change: &Change| matches!(change, Change::Validations(_));
 
         assert_eq!(sheets.review.get_cloned().changes.len(), 6);
+        for group in sheets.review.get_cloned().group_rows().0 {
+            sheets.review_cmd(ReviewCmd::Toggle(group.group));
+        }
         let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
         for label in ["Conditional formatting changed", "Conditional formatting added", "Data validation changed", "Data validation removed"] {
             assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == label)), "{label}");
@@ -3799,6 +3876,69 @@ mod tests {
     }
 
     #[test]
+    fn large_workbook_review_starts_collapsed_and_virtualizes_expanded_groups() {
+        use crate::review::{Group, ReviewCmd};
+        use officina_grid::CellAddr;
+
+        let mut local = Doc::new("local");
+        let mut incoming = Doc::new("incoming");
+        for wb in [&mut local.wb, &mut incoming.wb] {
+            wb.rename_sheet(0, "Budget").unwrap();
+            wb.add_sheet("Forecast").unwrap();
+            for sheet in 0..2 {
+                wb.set_numbers(sheet, 0, 0, &vec![1.0; 5000]);
+            }
+        }
+        for sheet in 0..2 {
+            incoming.wb.set_numbers(sheet, 1, 0, &vec![2.0; 5000]);
+        }
+        incoming.wb.sheet_mut(0).tab_color = Some(0x112233);
+        let long = format!("{}\nLAST LINE", "A long value ".repeat(80));
+        incoming.wb.set_input(CellAddr::new(0, 4999, 1), &long).unwrap();
+        let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        sheets.compare_with("incoming.osheet", incoming.wb);
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.changes.len(), 10001);
+        assert_eq!(pane.group_rows().1, 3);
+        assert!(pane.picked.is_none());
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        let contains = |text| tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == text));
+        assert!(contains("▸ Budget · Cell edits (5000)"));
+        assert!(contains("▸ Forecast · Cell edits (5000)"));
+        assert!(contains("▸ Budget · Sheet settings (1)"));
+        assert!(!contains("Take"));
+        let budget = Group(Some(0), "Cell edits");
+        sheets.review_cmd(ReviewCmd::Toggle(budget));
+        let pane = sheets.review.get_cloned();
+        assert_eq!(pane.group_rows().1, 5003);
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().count() < 1500, "only nearby rows are rendered");
+        assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == "B1: added 2")));
+        let last = pane.group_items(budget)[4999];
+        sheets.review_cmd(ReviewCmd::Pick(last));
+        let d = sheets.doc.borrow();
+        let other = sheets.theirs.borrow();
+        let style = TextStyle { family: font::MONO.into(), size: type_size::SM,
+            weight: Weight::Regular, color: Color::TRANSPARENT };
+        let lines = crate::review::detail_lines(&pane.changes[last], &pane.mode, &d.wb, other.as_ref().unwrap(), &style);
+        assert_eq!(lines[0], "B5000");
+        assert!(lines.contains(&"Incoming".into()));
+        assert_eq!(lines.last().unwrap(), "LAST LINE");
+        assert_eq!(lines.iter().map(|line| line.matches('A').count()).sum::<usize>(), 81);
+        let last_line = lines.len() - 1;
+        pergola::widgets::VirtualList::reveal(&sheets.review_detail_scroll, last_line, lines.len(), 18.0, 180.0);
+        drop(other);
+        drop(d);
+        let (tree, _) = pergola::view::render(&sheets, pergola::theme::Semantic::LIGHT);
+        assert!(tree.iter().any(|(_, node)| matches!(node, Node::Text { content, .. } if content == "LAST LINE")));
+        sheets.review_cmd(ReviewCmd::Keep);
+        assert_eq!(sheets.review.get_cloned().group_rows().1, 5002);
+        sheets.review_cmd(ReviewCmd::Toggle(budget));
+        assert_eq!(sheets.review.get_cloned().group_rows().1, 3);
+    }
+
+    #[test]
     fn compare_with_lists_and_takes_changes() {
         use crate::review::ReviewCmd;
         use officina_grid::compare::Change;
@@ -3820,6 +3960,8 @@ mod tests {
         let p = s.review.get_cloned();
         assert!(p.open);
         assert_eq!(p.changes.len(), 2, "{:?}", p.changes);
+        for group in p.group_rows().0 { run(ReviewCmd::Toggle(group.group)); }
+        run(ReviewCmd::Pick(0));
         let t = texts();
         for want in ["Compare", "2 differences from “theirs.csv”", "B3: 4 → 9", "1 row added before row 5 (clips, 2)", "Take", "Keep Mine", "Take All"] {
             assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");

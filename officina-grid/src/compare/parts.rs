@@ -76,6 +76,11 @@ pub struct NameChange {
 }
 
 impl NameChange {
+    pub(super) fn formulas(&self) -> (&str, &str) {
+        (self.before.as_ref().map_or("(none)", |(_, formula)| formula),
+         self.after.as_ref().map_or("(none)", |(_, formula)| formula))
+    }
+
     pub(crate) fn describe(&self) -> String {
         let action = action(self.before.is_some(), self.after.is_some());
         let (name, formula) = self.after.as_ref().or(self.before.as_ref()).unwrap();

@@ -21,6 +21,10 @@ pub struct AnnotationChange<T> {
 }
 
 impl<T> AnnotationChange<T> {
+    pub(super) fn versions(&self) -> (Option<&T>, Option<&T>) {
+        (self.before.as_ref(), self.after.as_ref())
+    }
+
     pub(super) fn on_current_sheet(&self, wb: &Workbook) -> bool {
         (self.at.sheet as usize) < wb.sheet_count()
             && wb.sheet(self.at.sheet).name.eq_ignore_ascii_case(&self.sheet_name)

@@ -2,6 +2,9 @@
 //! copy, listed in a pane beside the grid (officina.md §16.68). A change is
 //! looked at in place, taken from the other copy, or kept as it is here.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
 use officina_grid::compare::{self, Change, MergeError};
 use officina_grid::Workbook;
 
@@ -12,11 +15,24 @@ pub const REVIEW_W: f32 = 360.0;
 /// A change's row in the list.
 pub const REVIEW_ROW_H: f32 = 30.0;
 
+pub fn list_height(window_height: f32, selected: bool) -> f32 {
+    let pane_height = (window_height - crate::app::TOOLBAR_H - crate::app::FORMULA_H - crate::app::STATUS_H).max(200.0);
+    let available = pane_height - 116.0;
+    if selected { (available * 0.55).max(REVIEW_ROW_H) } else { available }
+}
+
+/// Wrap selected details to the width of the scrollable detail pane.
+pub fn detail_lines(change: &Change, mode: &ReviewMode, ours: &Workbook, theirs: &Workbook, style: &pergola::TextStyle) -> Vec<String> {
+    let text = change.details(ours, theirs, matches!(mode, ReviewMode::Tracked { .. }));
+    pergola::text::lines(&text, style, REVIEW_W - 34.0)
+}
+
 /// A press in the pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewCmd {
     /// Pick the change at this place in the list (and show it).
     Pick(usize),
+    Toggle(Group),
     /// Take the picked change from the other copy.
     Take,
     /// Leave the picked change out of the list (this copy's stays).
@@ -53,12 +69,52 @@ pub struct ReviewPane {
     pub open: bool,
     pub mode: ReviewMode,
     pub name: String,
-    pub changes: Vec<Change>,
+    pub changes: Arc<Vec<Change>>,
+    pub(crate) groups: Arc<BTreeMap<Group, Vec<usize>>>,
+    pub(crate) expanded: BTreeSet<Group>,
     /// More changes than are listed.
     pub more: bool,
     pub picked: Option<usize>,
     /// Kept as this copy has them: not listed again.
-    pub kept: Vec<Change>,
+    pub kept: Arc<Vec<Change>>,
+}
+
+/// A collapsible group of changes on one sheet, or at workbook scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Group(pub Option<u16>, pub &'static str);
+
+impl Group {
+    fn of(change: &Change, mode: &ReviewMode) -> Self {
+        let label = match change {
+            Change::Cell { .. } if matches!(mode, ReviewMode::Merge { .. }) => "Cell conflicts",
+            Change::Cell { .. } => "Cell edits",
+            Change::Style { .. } => "Styles",
+            Change::Comment(_) => "Comments",
+            Change::Link(_) => "Hyperlinks",
+            Change::Chart(_) => "Charts",
+            Change::Picture(_) => "Pictures",
+            Change::Merge(_) => "Merged cells",
+            Change::Setting(_) => "Sheet settings",
+            Change::RowHeight(_) => "Row heights",
+            Change::ColumnWidth(_) => "Column widths",
+            Change::Name(_) => "Defined names",
+            Change::Table(_) => "Tables",
+            Change::Pivot(_) => "Pivot tables",
+            Change::ConditionalFormats(_) => "Conditional formatting",
+            Change::Validations(_) => "Data validation",
+            Change::RowsAdded { .. } | Change::RowsRemoved { .. } => "Rows",
+            Change::SheetAdded { .. } | Change::SheetRemoved { .. } => "Sheets",
+            Change::StructuralConflict { .. } => "Structural conflicts",
+        };
+        Self(change.sheet(), label)
+    }
+}
+
+pub struct GroupRow {
+    pub start: usize,
+    pub group: Group,
+    pub count: usize,
+    pub expanded: bool,
 }
 
 impl ReviewPane {
@@ -66,14 +122,61 @@ impl ReviewPane {
     pub fn refresh(&mut self, ours: &Workbook, theirs: &Workbook) {
         let (all, more) = compare::compare(ours, theirs);
         let mut matched = vec![false; self.kept.len()];
-        self.changes = all.into_iter().filter(|c| {
+        let changes = all.into_iter().filter(|c| {
             if let Some(i) = self.kept.iter().enumerate().position(|(i, k)| !matched[i] && c.same_review_item(k)) {
                 matched[i] = true;
                 false
             } else { true }
         }).collect();
         self.more = more;
-        self.picked = self.picked.filter(|_| !self.changes.is_empty()).map(|i| i.min(self.changes.len() - 1));
+        self.replace_changes(changes);
+    }
+
+    pub fn replace_changes(&mut self, changes: Vec<Change>) {
+        let mut groups = BTreeMap::<_, Vec<_>>::new();
+        for (index, change) in changes.iter().enumerate() {
+            groups.entry(Group::of(change, &self.mode)).or_default().push(index);
+        }
+        self.expanded.retain(|group| groups.contains_key(group));
+        self.groups = Arc::new(groups);
+        self.changes = Arc::new(changes);
+        self.picked = None;
+    }
+
+    pub fn resolve(&mut self, index: usize) {
+        let mut changes = Arc::unwrap_or_clone(std::mem::take(&mut self.changes));
+        changes.remove(index);
+        self.replace_changes(changes);
+    }
+
+    pub fn toggle_group(&mut self, group: Group) {
+        if !self.expanded.remove(&group) {
+            if self.groups.contains_key(&group) { self.expanded.insert(group); }
+        } else if self.picked.is_some_and(|i| Group::of(&self.changes[i], &self.mode) == group) {
+            self.picked = None;
+        }
+    }
+
+    pub fn pick(&mut self, index: usize) -> Option<&Change> {
+        self.picked = self.changes.get(index).map(|_| index);
+        let change = self.changes.get(index)?;
+        self.expanded.insert(Group::of(change, &self.mode));
+        Some(change)
+    }
+
+    pub fn group_rows(&self) -> (Vec<GroupRow>, usize) {
+        let mut start = 0;
+        let rows = self.groups.iter().map(|(&group, indices)| {
+            let expanded = self.expanded.contains(&group);
+            let row = GroupRow { start, group, count: indices.len(), expanded };
+            start += 1 + if expanded { indices.len() } else { 0 };
+            row
+        }).collect();
+        (rows, start)
+    }
+
+    pub fn group_items(&self, group: Group) -> &[usize] {
+        &self.groups[&group]
     }
 
     /// What the list's head line says.

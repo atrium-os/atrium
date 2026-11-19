@@ -21,6 +21,13 @@ pub struct MergeChange {
 }
 
 impl MergeChange {
+    pub(super) fn ranges(&self) -> (String, String) {
+        let show = |rect: Option<Rect>| rect.map_or_else(|| "(none)".into(), |r| {
+            format!("{}:{}", a1(r.r0, r.c0), a1(r.r1, r.c1))
+        });
+        (show(self.before), show(self.after))
+    }
+
     pub(super) fn describe(&self) -> String {
         let rect = self.after.or(self.before).unwrap();
         let range = format!("{}:{}", a1(rect.r0, rect.c0), a1(rect.r1, rect.c1));

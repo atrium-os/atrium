@@ -27,6 +27,15 @@ struct Patch {
 impl Patch {
     fn delta(&self) -> i64 { i64::from(self.insert) - i64::from(self.remove) }
 
+    fn describe(&self) -> String {
+        let axis = match self.axis { Axis::Rows => "row", Axis::Cols => "column" };
+        let at = match self.axis {
+            Axis::Rows => (self.at + 1).to_string(),
+            Axis::Cols => crate::addr::col_name(self.at),
+        };
+        format!("At base {axis} {at}: {} removed, {} inserted", self.remove, self.insert)
+    }
+
     fn on_same_axis(&self, other: &Self) -> bool {
         self.name == other.name && self.axis == other.axis
     }
@@ -57,14 +66,14 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
             let origin = &base.axes[name][index];
             let recorded = [&local.axes[name][index], &remote.axes[name][index]]
                 .into_iter().any(|ids| !ids.is_implicit()) || !origin.is_implicit();
-            for (branch, patches) in [(&local, &mut left), (&remote, &mut right)] {
+            for (side, (branch, patches)) in [(&local, &mut left), (&remote, &mut right)].into_iter().enumerate() {
                 if recorded {
                     match origin.differences(&branch.axes[name][index]) {
                         Some(gaps) => patches.extend(gaps.into_iter().map(|gap| Patch {
                             name: name.clone(), axis, at: gap.at, remove: gap.remove,
                             insert: gap.added.iter().map(|r| r.len).sum(), added: Some(gap.added),
                         })),
-                        None => conflicts.push(flag(sheet, axis, 0, "Cannot align recorded axis identities")),
+                        None => conflicts.push(alignment_flag(sheet, axis, side, "Cannot align recorded axis identities")),
                     }
                 } else {
                     match infer(cells, &branch.sheets[name], axis) {
@@ -73,7 +82,7 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
                             remove: (-delta).max(0) as u32, insert: delta.max(0) as u32, added: None,
                         }),
                         Ok(None) => {}
-                        Err(()) => conflicts.push(flag(sheet, axis, 0, "Cannot align the row or column changes")),
+                        Err(()) => conflicts.push(alignment_flag(sheet, axis, side, "Cannot align the row or column changes")),
                     }
                 }
             }
@@ -91,9 +100,9 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
     normalize(&mut base_local, &left, &[], false)?;
     normalize(&mut base_remote, &right, &[], false)?;
 
-    for (patches, others, branch, reference) in [
-        (&left, &right, incoming, &base_remote),
-        (&right, &left, ours, &base_local),
+    for (local_patch, patches, others, branch, reference) in [
+        (true, &left, &right, incoming, &base_remote),
+        (false, &right, &left, ours, &base_local),
     ] {
         let branch = CellSnapshot::capture(branch);
         let reference = CellSnapshot::capture(reference);
@@ -103,13 +112,18 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
             let shared = others.contains(patch) && (patch.insert == 0 || patch.added.is_some());
             if shared { continue; }
             let sheet = ours.sheet_id(&patch.name).expect("matching sheet");
-            if others.iter().any(|p| patch.on_same_axis(p) && overlaps(p, patch)) {
-                let conflict = flag(sheet, patch.axis, patch.at, "Overlapping structural edits");
-                if !conflicts.contains(&conflict) { conflicts.push(conflict); }
+            let mut overlapping = others.iter().filter(|p| patch.on_same_axis(p) && overlaps(p, patch)).peekable();
+            if overlapping.peek().is_some() {
+                if local_patch {
+                    let incoming = overlapping.map(Patch::describe).collect::<Vec<_>>().join("\n");
+                    conflicts.push(flag(sheet, patch.axis, patch.at, "Overlapping structural edits", [patch.describe(), incoming]));
+                }
                 continue;
             }
             if patch.remove != 0 && changed_in_band(&branch, &reference, &translated(patch, others.iter())?) {
-                conflicts.push(flag(sheet, patch.axis, patch.at, "Deletion overlaps a cell edit"));
+                let mut versions = [patch.describe(), "Edited cells in the deleted range".into()];
+                if !local_patch { versions.swap(0, 1); }
+                conflicts.push(flag(sheet, patch.axis, patch.at, "Deletion overlaps a cell edit", versions));
             }
         }
     }
@@ -127,8 +141,14 @@ pub fn align(base: &CellSnapshot, ours: &Workbook, incoming: &Workbook) -> Resul
     Ok(Alignment::Aligned { ops, local: Box::new(normalized_local), cells })
 }
 
-fn flag(sheet: u16, axis: Axis, at: u32, reason: &'static str) -> Change {
-    Change::StructuralConflict { sheet, axis, at, reason }
+fn flag(sheet: u16, axis: Axis, at: u32, reason: &'static str, versions: [String; 2]) -> Change {
+    Change::StructuralConflict { sheet, axis, at, reason, versions: Box::new(versions) }
+}
+
+fn alignment_flag(sheet: u16, axis: Axis, side: usize, reason: &'static str) -> Change {
+    let mut versions = [String::from("Alignment unverified"), String::from("Alignment unverified")];
+    versions[side] = "Could not match this copy to the base".into();
+    flag(sheet, axis, 0, reason, versions)
 }
 
 fn overlaps(a: &Patch, b: &Patch) -> bool {
