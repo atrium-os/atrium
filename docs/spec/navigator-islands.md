@@ -28,7 +28,7 @@ runs while they read: no script runs at view time anywhere in the Navigator.
   seek, current time). The island never sees the document's DOM.
 - A whole page goes live only when it is a fat client throughout (§11.8.3: Figma, WhatsApp
   Web, editors, banking).
-- Engine: **Servo with SpiderMonkey** (§11.3), **JIT off** (§11.5), **session recycling**
+- Engine: **Servo with SpiderMonkey** (§11.3; now measured against Ladybird first, §9 D1), **JIT off** (§11.5), **session recycling**
   (§11.9.1), **in a jail on this machine** (§11.9.3: never an operator's rendering proxy).
 - Video plays in **Limen's native player**. The engine's `<video>` and `MediaSource` are
   backed by a `media-player` embed (§8.1, mapping built in `navigator-media`, §8.1.1). The
@@ -149,15 +149,23 @@ engine rather than in the document lane:
 
 Each step runs in the VM with a gate before the next, as the Navigator's other steps did.
 
-1. **I0. Feasibility, measured.** Build Servo for FreeBSD (amd64 and arm64), headless, JIT
-   off, its network and media layers stubbed. Load the fixture site and three corpus
-   widgets (an Infogram chart, a map, the YouTube embed). Measure start time, memory and
-   correctness against a reference, and write the go/no-go in this spec. The things only
-   this step can answer:
-   - Does Servo build and run on FreeBSD at all?
-   - What does a build cost in disk, memory and hours?
-   - How far is Servo's `MediaSource` from what the YouTube player needs?
-   If Servo fails here, the fallback in §9 D1 is measured the same way.
+1. **I0. Two engines, measured side by side** (D1). Build **Servo** and **Ladybird** for
+   FreeBSD (amd64 and arm64), headless, JIT off, with their network and media layers stubbed.
+   Load the same set in each:
+   - the fixture site;
+   - three corpus widgets (an Infogram chart, a map, the YouTube embed);
+   - two scripted sign-in pages (a fixture identity provider, and a real one's page as far
+     as its password step).
+   For each engine, measure:
+   - correctness against a reference rendering;
+   - start time and memory;
+   - binary and build size;
+   - the build's cost in disk, memory and hours;
+   - FreeBSD patches needed;
+   - how far its `MediaSource` is from what the YouTube player needs;
+   - how its network and media layers can be replaced (§3, §6).
+   Write the results and the choice in this spec. The choice is made on those measurements,
+   not on licence.
 2. **I1. One live island.** The `org.atrium.navigator.engine` bundle as Limen's `web-island`
    provider:
    - in its jail, under Capsicum after start-up;
@@ -205,8 +213,8 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 
 | | question | options | recommendation |
 |---|---|---|---|
-| **D1** | Engine | **Servo + SpiderMonkey** (spec's pick, Rust embedding, MPL-2.0) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Servo**, as legacy-web §11.3 chose, with Ladybird as the measured fallback if I0 fails. Boa and our DOM have no layout or rendering, so they can't run a widget |
-| **D2** | MPL-2.0 for Servo and SpiderMonkey (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft, and toolkit-backends.md already accepted it for Servo. Nothing else links it |
+| **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Decided (Shankar, 2026-11-19): measure Servo and Ladybird side by side in I0, and choose on the measurements.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
+| **D2** | MPL-2.0, if I0 picks Servo (LICENSING-POLICY: "evaluate per-component") | accept for the engine bundle only · refuse | **Accept for the engine bundle only.** MPL is file-level copyleft: we publish the source of any MPL file we change, and nothing of ours changes licence. toolkit-backends.md already accepted it for Servo. Nothing else links it |
 | **D3** | Where I0 builds | the shared Mac VM · a larger cloud build environment | **The shared Mac VM**, booked through the coordinator. It's arm64 at native speed with room for the build |
 | **D4** | Order after the first island | sign-in windows (I3), then video · video first | **Sign-in first.** The VPN's SSO and Mail's Microsoft account wait on it, and it needs no `MediaSource`. A widget island (I1) still comes first, to prove the jail, fetching, drawing and input |
 | **D5** | Whole pages live in everyday browsing (fat clients) | later, as I6, offered per page on the person's press · never | **Later, on a press.** Sign-in windows run whole pages live from I3, because a sign-in is a whole page. Everyday trails stay document-lane with islands until then |

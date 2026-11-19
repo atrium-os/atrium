@@ -2856,7 +2856,7 @@ path.
 | candidate | licence | verdict |
 |---|---|---|
 | **WebKit / JavaScriptCore** | LGPL | **Hard reject.** LICENSING-POLICY.md admits no LGPL anywhere in the runtime stack |
-| **Chromium / Blink / V8** | BSD-3 | Licence fine; rejected on architecture — colossal, own build system, and it assumes its own process and sandbox model, which is precisely what we are replacing |
+| **Chromium / Blink / V8** | BSD-3, but Blink still carries LGPL files from WebKit and KHTML (corrected 2026-11-19) | Rejected by licence as well as on architecture — colossal, own build system, and it assumes its own process and sandbox model, which is precisely what we are replacing |
 | **Gecko** | MPL-2.0 | Enormous, never designed for embedding |
 | **Servo** (+ SpiderMonkey) | MPL-2.0 | **Selected.** Rust, embeddable by design, actively maintained. MPL-2.0 sits in the policy's "evaluate per-component" bucket, and toolkit-backends.md already set that precedent |
 
