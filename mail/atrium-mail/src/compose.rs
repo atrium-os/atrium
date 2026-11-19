@@ -813,8 +813,11 @@ impl Composer {
         let from = ui.froms.get(ui.identity)?;
         let from = from.rsplit_once('<').map(|(_, a)| a.trim_end_matches('>')).unwrap_or(from);
         let all: Vec<String> = [&self.to, &self.cc, &self.bcc].iter().flat_map(|f| parse_list(f.get_cloned().text())).map(|m| m.addr).collect();
-        let out = mail_engine::compose::outside_domain(from, all.iter().map(String::as_str));
+        let company = self.engine.prefs().company;
+        let out = mail_engine::compose::outside_company(from, &company, all.iter().map(String::as_str));
         let dom = from.rsplit_once('@')?.1.to_ascii_lowercase();
+        // With other company domains: "the company", not just this one.
+        let dom = if company.iter().any(|c| *c != dom) { "the company".to_string() } else { dom };
         (!out.is_empty()).then_some((dom, out))
     }
 

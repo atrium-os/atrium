@@ -31,6 +31,8 @@ const JMAP_TRIED: &str = "jmap_sieve_tried";
 /// to replace changes made on the server (store keys, per account).
 const PRINT: &str = "sieve_print";
 const REPLACE: &str = "sieve_replace";
+/// What the server has in Mail's script when it was changed there.
+const THERE: &str = "sieve_there";
 /// Said when Mail's script was changed on the server since Mail put it.
 pub const CHANGED_THERE: &str = "Mail's filters were changed on the server since Mail put them there, so Mail leaves them as they are";
 /// Said of a JMAP server that keeps no scripts.
@@ -125,6 +127,7 @@ impl Engine {
         sv.tried = now;
         (plan.previous, plan.replace) = self.last_put(account)?;
         let mut print = None;
+        let mut there = None;
         match put(net, &sv.server, &sv.item, &plan) {
             Ok(done) => {
                 sv.put = Some(words);
@@ -134,6 +137,7 @@ impl Engine {
                 if let Some(other) = done.others {
                     st.why = Some(format!("the server already has its own filters (“{other}”), which Mail leaves alone"));
                 } else if done.changed_there {
+                    there = done.there.clone();
                     sv.why = Some(CHANGED_THERE.into());
                     if st.wanted.is_some() {
                         st.why = Some(CHANGED_THERE.into());
@@ -163,6 +167,7 @@ impl Engine {
                 w.set_sync_state(account, PRINT, Some(&p.to_string()))?;
                 w.set_sync_state(account, REPLACE, None)?;
             }
+            w.set_sync_state(account, THERE, there.as_deref())?;
             w.set_sieve(account, Some(&sv))?;
             w.set_away(account, &st)
         })?;
@@ -182,6 +187,7 @@ impl Engine {
         let sv = self.store.sieve(account)?.map(|sv| SieveAccount { put: None, why: None, tried: 0, ..sv });
         self.store.write(|w| {
             w.set_sync_state(account, REPLACE, Some("1"))?;
+            w.set_sync_state(account, THERE, None)?;
             if let Some(sv) = &sv {
                 w.set_sieve(account, Some(sv))?;
             }
@@ -217,6 +223,7 @@ impl Engine {
             return Ok(());
         }
         (plan.previous, plan.replace) = self.last_put(account)?;
+        let mut there = None;
         let others = |o: &str| format!("the server already has its own filters (“{o}”), which Mail leaves alone");
         let mut print = None;
         let (put, why, failed) = match client.sieve(&plan) {
@@ -226,6 +233,7 @@ impl Engine {
                 if let Some(o) = &done.others {
                     (Some(words), Some(others(o)), false)
                 } else if done.changed_there {
+                    there = done.there.clone();
                     (Some(words), Some(CHANGED_THERE.to_string()), true)
                 } else {
                     print = done.put;
@@ -257,11 +265,18 @@ impl Engine {
             if with_away {
                 w.set_away(account, &st)?;
             }
+            w.set_sync_state(account, THERE, there.as_deref())?;
             w.set_sync_state(account, JMAP_PUT, put.as_deref())?;
             w.set_sync_state(account, JMAP_WHY, why.as_deref())?;
             w.set_setting(account, JMAP_TRIED, failed.then_some(now as u64))
         })?;
         Ok(())
+    }
+
+    /// What the server has in Mail's script, when it was changed there
+    /// (shown in Settings beside *Replace*).
+    pub fn filters_there(&self, account: AccountId) -> Option<String> {
+        self.store.sync_state(account, THERE).ok().flatten()
     }
 
     /// Where `account`'s rules stand on its server (§11.6), for Settings:

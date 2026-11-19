@@ -31,6 +31,12 @@ pub struct Imported {
 }
 
 impl Imported {
+    /// Said while a big file is still being read.
+    pub fn progress_line(&self, file: &str) -> String {
+        let read = self.queued + self.already + self.refused;
+        format!("Reading {file}: {read} messages so far, {} new", self.queued)
+    }
+
     /// What the person is told.
     pub fn line(&self, folder: &str) -> String {
         let n = |k: usize| if k == 1 { "1 message".to_string() } else { format!("{k} messages") };
@@ -102,12 +108,25 @@ pub fn split_stream(r: impl BufRead, mut each: impl FnMut(Vec<u8>) -> Result<(),
 /// in a parse jail, skipped when the account has it, else kept and queued
 /// for upload. Runs off the window's thread with its own store handle.
 pub fn import(store: &Store, parser: &Parser, account: AccountId, folder: FolderId, r: impl BufRead) -> Result<Imported, Error> {
+    import_with(store, parser, account, folder, r, &mut |_| {})
+}
+
+/// Messages read between progress calls.
+pub const PROGRESS_EVERY: usize = 500;
+
+/// [`import`], calling `progress` with the counts so far after every
+/// [`PROGRESS_EVERY`] messages read (a big file takes minutes).
+pub fn import_with(store: &Store, parser: &Parser, account: AccountId, folder: FolderId, r: impl BufRead, progress: &mut dyn FnMut(&Imported)) -> Result<Imported, Error> {
     let mut out = Imported::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut big = 0;
     split_stream(
         r,
         |m| {
+            let read = out.queued + out.already + out.refused;
+            if read > 0 && read % PROGRESS_EVERY == 0 {
+                progress(&out);
+            }
             let head_len = m.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(m.len());
             let s = parser.summarize(&[(0, &m[..head_len])], true, &[])?;
             let Some(Some(s)) = s.into_iter().next() else {
@@ -147,6 +166,44 @@ impl Engine {
             }
         }
         Ok(n)
+    }
+
+    /// Uploads of `account` that gave up after [`TRIES_MAX`] tries: how
+    /// many, and why the last one failed.
+    ///
+    /// [`TRIES_MAX`]: mail_store::imports::TRIES_MAX
+    pub fn imports_stuck(&self, account: AccountId) -> Result<(usize, Option<String>), Error> {
+        let mut n = 0;
+        let mut why = None;
+        for (_, i) in self.stuck(account)? {
+            n += 1;
+            why = i.why.or(why);
+        }
+        Ok((n, why))
+    }
+
+    fn stuck(&self, account: AccountId) -> Result<Vec<(u64, mail_store::imports::Import)>, Error> {
+        Ok(self
+            .store
+            .imports()?
+            .into_iter()
+            .filter(|(_, i)| i.tries >= mail_store::imports::TRIES_MAX && self.store.folder(i.folder).is_ok_and(|f| f.account == account))
+            .collect())
+    }
+
+    /// Try the given-up uploads of `account` again at the next sync; how many.
+    pub fn retry_imports(&self, account: AccountId) -> Result<usize, Error> {
+        let ids: Vec<u64> = self.stuck(account)?.into_iter().map(|(id, _)| id).collect();
+        self.store.write(|w| ids.iter().try_for_each(|&id| w.import_retry(id)))?;
+        Ok(ids.len())
+    }
+
+    /// Drop the given-up uploads of `account` (their messages stay only in
+    /// the file they came from); how many.
+    pub fn clear_stuck_imports(&self, account: AccountId) -> Result<usize, Error> {
+        let ids: Vec<u64> = self.stuck(account)?.into_iter().map(|(id, _)| id).collect();
+        self.store.write(|w| ids.iter().try_for_each(|&id| w.import_done(id)))?;
+        Ok(ids.len())
     }
 
     /// Upload waiting imports of `account`, at most

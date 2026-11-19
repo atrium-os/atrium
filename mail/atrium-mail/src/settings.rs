@@ -30,6 +30,8 @@ pub struct Row {
     /// Shown as a problem (sign in again, a failure).
     pub trouble: bool,
     pub screener: bool,
+    /// Imported messages whose upload gave up (§6.5), and why.
+    pub stuck: Option<(usize, String)>,
 }
 
 /// What was found for the address being added.
@@ -71,6 +73,8 @@ pub struct SettingsUi {
     /// The account's id when the line offers Replace (Mail's filters were
     /// changed on the server).
     pub rules_lines: Vec<(String, String, Option<mail_store::AccountId>)>,
+    /// The account whose changed filters are shown, and what the server has.
+    pub filters_shown: Option<(mail_store::AccountId, String)>,
     /// Private addresses (§13.3): the account shown, its domain, its addresses.
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
@@ -167,6 +171,8 @@ pub struct Settings {
     pub review_at: Mutable<TextEdit>,
     /// The company's address for phishing reports (Work, §7.7).
     pub report_to: Mutable<TextEdit>,
+    /// The company's other mail domains (Work, §9.1).
+    pub company: Mutable<TextEdit>,
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
     pub mail_rule: Mutable<TextEdit>,
@@ -211,6 +217,7 @@ impl Settings {
             digest_at: ui.sibling(TextEdit::new(&format_times(&prefs.digest))),
             review_at: ui.sibling(TextEdit::new(&format_hm(prefs.review))),
             report_to: ui.sibling(TextEdit::new(prefs.report_to.as_deref().unwrap_or(""))),
+            company: ui.sibling(TextEdit::new(&prefs.company.join(", "))),
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
             mail_rule: ui.sibling(TextEdit::new("")),
@@ -254,7 +261,11 @@ impl Settings {
             .into_iter()
             .map(|(id, c)| {
                 let (status, trouble) = status(&c.reached);
-                Row { id, address: c.address, status, trouble, screener: e.screener(id).unwrap_or(false) }
+                let stuck = match e.imports_stuck(id) {
+                    Ok((n, why)) if n > 0 => Some((n, why.unwrap_or_default())),
+                    _ => None,
+                };
+                Row { id, address: c.address, status, trouble, screener: e.screener(id).unwrap_or(false), stuck }
             })
             .collect();
         let prefs = e.prefs();
@@ -608,13 +619,35 @@ impl Settings {
         self.update(|u| u.note = Some(note));
     }
 
+    /// Imported messages that gave up: try them again, or drop them.
+    pub fn stuck_imports(&self, account: AccountId, retry: bool) {
+        let r = if retry { self.engine.retry_imports(account) } else { self.engine.clear_stuck_imports(account) };
+        let note = match r {
+            Ok(n) if retry => format!("Trying {} again at the next sync", if n == 1 { "1 message".to_string() } else { format!("{n} messages") }),
+            Ok(_) => "Dropped; they're still in the file they came from".to_string(),
+            Err(e) => format!("Couldn't: {e:?}"),
+        };
+        self.update(|u| u.note = Some(note));
+        self.reload();
+    }
+
+    /// Show (or hide) what the server has in Mail's changed filters.
+    pub fn show_filters(&self, account: mail_store::AccountId) {
+        let shown = self.ui.get_cloned().filters_shown.is_some_and(|(a, _)| a == account);
+        let text = (!shown).then(|| self.engine.filters_there(account)).flatten();
+        self.update(|u| u.filters_shown = text.map(|t| (account, t)));
+    }
+
     /// Put Mail's filters over the changes made to them on the server.
     pub fn replace_filters(&self, account: mail_store::AccountId) {
         let note = match self.engine.replace_filters(account) {
             Ok(()) => "Mail's filters go back on the server at the next sync".to_string(),
             Err(e) => format!("Couldn't: {e:?}"),
         };
-        self.update(|u| u.note = Some(note));
+        self.update(|u| {
+            u.note = Some(note);
+            u.filters_shown = None;
+        });
         self.reload();
     }
 
@@ -823,6 +856,12 @@ impl Settings {
                 self.set_prefs(|p| p.review = r);
             }
         }
+        // The company's domains once every one reads as a domain.
+        if let Some(d) = mail_engine::prefs::company_domains(self.company.get_cloned().text()) {
+            if d != p.company {
+                self.set_prefs(|p| p.company = d.clone());
+            }
+        }
         // The report address once it reads as one; empty turns reports off.
         let typed = self.report_to.get_cloned().text().trim().to_string();
         let to = if typed.is_empty() { Some(None) } else { mail_engine::prefs::report_address(&typed).map(Some) };
@@ -987,6 +1026,18 @@ impl SettingsView {
             let s = self.s.clone();
             button(ctx, bx, y + rh / 2.0, scr, false, true, move || s.toggle_screener(id));
             y += rh;
+            if let Some((n, why)) = &r.stuck {
+                let line = format!("{} imported {} couldn't upload: {why}", n, if *n == 1 { "message" } else { "messages" });
+                let cw = measure("Clear", type_size::SM, Weight::Medium) + em(24.0);
+                let tw = measure("Try again", type_size::SM, Weight::Medium) + em(24.0);
+                let top = y - em(6.0);
+                y += para(ctx, x, top, (inner - cw - tw - em(16.0)).max(em(120.0)), &line, type_size::XS, t.danger_fg()) + em(2.0);
+                let s = self.s.clone();
+                button(ctx, right - cw, top + em(10.0), "Clear", false, true, move || s.stuck_imports(id, false));
+                let s = self.s.clone();
+                button(ctx, right - cw - em(6.0) - tw, top + em(10.0), "Try again", false, true, move || s.stuck_imports(id, true));
+                y = y.max(top + em(30.0));
+            }
             ctx.add(Node::Rect { rect: Rect::new(x, y - 1.0, inner, 1.0), fill: t.border_default(), radius: 0.0 });
         }
         y += em(8.0);
@@ -1239,10 +1290,15 @@ impl SettingsView {
         y += em(32.0);
         y += para(ctx, x, y, inner, "A link through Safe Links, URL Defense or Mimecast opens through it, so your company's scanner still checks it. Mail shows where it goes either way.", type_size::XS, t.text_tertiary()) + em(8.0);
 
-        // Phishing reports (§7.7): a company's address, in a named persona.
-        if named || ui.prefs.report_to.is_some() {
+        // The company (§9.1, §7.7): its domains and its phishing report
+        // address, in a named persona.
+        if named || ui.prefs.report_to.is_some() || !ui.prefs.company.is_empty() {
             y += em(8.0);
-            section(ctx, x, &mut y, "PHISHING");
+            section(ctx, x, &mut y, "COMPANY");
+            text(ctx, x, y + em(14.0), "Its other mail domains", type_size::SM, Weight::Regular, t.text_primary());
+            ctx.place(TextField::new(self.s.company.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("acme.example, acme-corp.example"));
+            y += em(32.0);
+            y += para(ctx, x, y, inner, "Besides your address's own domain. Recipients anywhere else are pointed out as you write.", type_size::XS, t.text_tertiary()) + em(8.0);
             text(ctx, x, y + em(14.0), "Also send reports to", type_size::SM, Weight::Regular, t.text_primary());
             ctx.place(TextField::new(self.s.report_to.clone()).at(x + em(190.0), fy(y)).width((right - x - em(190.0)).max(em(120.0))).placeholder("phishing@company.example"));
             y += em(32.0);
@@ -1266,13 +1322,27 @@ impl SettingsView {
         // Where they stand on each server (ManageSieve or JMAP Sieve).
         for (addr, line, replace) in &ui.rules_lines {
             let bw = measure("Replace", type_size::SM, Weight::Medium) + em(24.0);
-            let room = if replace.is_some() { inner - bw - em(8.0) } else { inner };
+            let open = ui.filters_shown.as_ref().filter(|(a, _)| Some(*a) == *replace);
+            let show = if open.is_some() { "Hide" } else { "Show" };
+            let sw = measure(show, type_size::SM, Weight::Medium) + em(24.0);
+            let room = if replace.is_some() { inner - bw - sw - em(14.0) } else { inner };
             let top = y;
             y += para(ctx, x, y, room, &format!("{addr}: {line}"), type_size::XS, t.text_tertiary()) + em(4.0);
             if let Some(id) = *replace {
                 let s = self.s.clone();
                 button(ctx, right - bw, top + em(10.0), "Replace", false, true, move || s.replace_filters(id));
+                let s = self.s.clone();
+                button(ctx, right - bw - em(6.0) - sw, top + em(10.0), show, false, true, move || s.show_filters(id));
                 y = y.max(top + em(28.0));
+            }
+            // What the server has now, to read before replacing it.
+            if let Some((_, there)) = open {
+                text(ctx, x, y + em(10.0), "On the server now:", type_size::XS, Weight::Medium, t.text_secondary());
+                y += em(22.0);
+                for l in there.lines().take(200) {
+                    y += para(ctx, x + em(12.0), y, inner - em(12.0), if l.is_empty() { " " } else { l }, type_size::XS, t.text_secondary());
+                }
+                y += em(6.0);
             }
         }
         let fw = (inner - em(80.0)).max(em(160.0));

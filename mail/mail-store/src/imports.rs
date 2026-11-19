@@ -48,6 +48,15 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Try a given-up upload again from the start.
+    pub fn import_retry(&mut self, id: u64) -> Result<()> {
+        let mut t = self.tx.open_table(IMPORTS)?;
+        let Some(mut i) = t.get(id)?.map(|v| dec::<Import>(v.value())).transpose()? else { return Ok(()) };
+        i.tries = 0;
+        t.insert(id, enc(&i).as_slice())?;
+        Ok(())
+    }
+
     /// Forget every waiting upload to `folder` (the person cancelled).
     pub fn cancel_imports(&mut self, folder: FolderId) -> Result<usize> {
         let mut t = self.tx.open_table(IMPORTS)?;

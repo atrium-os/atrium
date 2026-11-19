@@ -424,7 +424,7 @@ fn main() {
     // The picker up for an import (§6.5): its embed, the folder and its
     // name; what came of it, from its thread (then mail syncs).
     let mut importing: Option<(limen::proto::EmbedId, mail_store::FolderId, String)> = None;
-    let (imported_tx, imported) = mpsc::channel::<String>();
+    let (imported_tx, imported) = mpsc::channel::<(String, bool)>();
     // A message the viewer couldn't be asked for, not asked again.
     let mut failed: Option<u64> = None;
     // Printing a message: what prints, its PDF being made (and whether
@@ -793,9 +793,11 @@ fn main() {
                 _ => mail.file_note("Importing needs the system picker, which isn't running".into()),
             }
         }
-        while let Ok(note) = imported.try_recv() {
+        while let Ok((note, done)) = imported.try_recv() {
             mail.file_note(note);
-            let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
+            if done {
+                let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
+            }
         }
         if let Some(ask) = mail.take_export() {
             match (&embeds, win.embed_token()) {
@@ -982,12 +984,17 @@ fn main() {
                                 let tx = imported_tx.clone();
                                 mail.file_note(format!("Reading {name}…"));
                                 std::thread::spawn(move || {
+                                    // A big file says how far it has got.
                                     let r = store.folder(folder).map_err(|e| e.to_string()).and_then(|f| {
-                                        mail_engine::import::import(&store, &parser, f.account, folder, std::io::BufReader::new(File::from(fd))).map_err(|e| e.to_string())
+                                        let ptx = tx.clone();
+                                        let mut progress = |p: &mail_engine::import::Imported| {
+                                            let _ = ptx.send((p.progress_line(&name), false));
+                                        };
+                                        mail_engine::import::import_with(&store, &parser, f.account, folder, std::io::BufReader::new(File::from(fd)), &mut progress).map_err(|e| e.to_string())
                                     });
                                     let _ = tx.send(match r {
-                                        Ok(x) => x.line(&fname),
-                                        Err(why) => format!("Couldn't import {name}: {why}"),
+                                        Ok(x) => (x.line(&fname), true),
+                                        Err(why) => (format!("Couldn't import {name}: {why}"), true),
                                     });
                                 });
                             }

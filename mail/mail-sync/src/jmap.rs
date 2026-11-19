@@ -559,8 +559,10 @@ impl<H: Http> Client<H> {
             if let Some(blob) = jmap::sieve_blob(&a)? {
                 let url = self.session.download_as(&blob, "atrium-mail.sieve", "application/sieve");
                 let text = self.h.get(&url, 1 << 20).map_err(Error)?;
-                if crate::sieve::fingerprint(&String::from_utf8_lossy(&text)) != prev {
+                let text = String::from_utf8_lossy(&text);
+                if crate::sieve::fingerprint(&text) != prev {
                     done.changed_there = true;
+                    done.there = Some(crate::sieve::shown(&text));
                     return Ok(Some(done));
                 }
             }

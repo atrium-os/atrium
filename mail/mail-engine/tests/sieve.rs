@@ -191,6 +191,7 @@ fn the_reply_and_rules_go_to_the_server() {
     engine.sync_sieve(a, &net, t0 + 9000).unwrap();
     assert_eq!(net.seen.lock().unwrap().script, before, "not put");
     assert_eq!(engine.rules_line(a).as_deref(), Some(mail_engine::sieve::CHANGED_THERE));
+    assert_eq!(engine.filters_there(a).as_deref(), Some("# mine now\nkeep;\n"), "shown, without the CRs");
     let n = sessions();
     engine.sync_sieve(a, &net, t0 + 9100).unwrap();
     assert_eq!(sessions(), n, "not asked again within the hour");
@@ -198,6 +199,7 @@ fn the_reply_and_rules_go_to_the_server() {
     engine.sync_sieve(a, &net, t0 + 9200).unwrap();
     assert!(net.seen.lock().unwrap().script.as_deref().unwrap().contains("invoice"));
     assert_eq!(engine.rules_line(a), None);
+    assert_eq!(engine.filters_there(a), None);
     // Its own edits from then on are what was put: nothing to say.
     net.server.lock().unwrap().edited = None;
     engine.add_rule(parse_rule("subject:receipt read").unwrap()).unwrap();

@@ -166,12 +166,19 @@ impl Engine {
 /// persona): an address at that domain or under it (`eu.example.com` for
 /// `example.com`) is inside; case aside. Each once, in order.
 pub fn outside_domain<'a>(from: &str, to: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    outside_company(from, &[], to)
+}
+
+/// [`outside_domain`] with the company's other domains (`company`, as the
+/// Work persona's settings list them) inside too.
+pub fn outside_company<'a>(from: &str, company: &[String], to: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let dom = |a: &str| a.trim().rsplit_once('@').map(|(_, d)| d.trim_end_matches('.').to_ascii_lowercase());
     let Some(home) = dom(from).filter(|d| !d.is_empty()) else { return Vec::new() };
+    let homes: Vec<String> = std::iter::once(home).chain(company.iter().map(|c| c.trim().trim_end_matches('.').to_ascii_lowercase()).filter(|c| !c.is_empty())).collect();
     let mut out: Vec<String> = Vec::new();
     for a in to {
         let Some(d) = dom(a) else { continue };
-        let inside = d == home || d.ends_with(&format!(".{home}"));
+        let inside = homes.iter().any(|h| d == *h || d.ends_with(&format!(".{h}")));
         let a = a.trim().to_string();
         if !inside && !out.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
             out.push(a);
@@ -189,5 +196,7 @@ mod outside_tests {
         let to = ["priya@example.com", "Lena@EU.Example.com", "ada@other.org", "ADA@other.org", "sam@notexample.com", "nobody"];
         assert_eq!(outside_domain("arun@example.com", to), ["ada@other.org", "sam@notexample.com"]);
         assert!(outside_domain("not an address", to).is_empty());
+        // The company's other domains are inside too.
+        assert_eq!(super::outside_company("arun@example.com", &["Other.org".into()], to), ["sam@notexample.com"]);
     }
 }

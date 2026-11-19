@@ -254,7 +254,7 @@ fn settings_window() {
     // Phishing reports: asked in a named persona (Work); kept once it reads
     // as an address, off again when emptied.
     app.tick();
-    assert!(!texts(&app).iter().any(|x| x == "PHISHING"));
+    assert!(!texts(&app).iter().any(|x| x == "COMPANY"));
     *s.persona.borrow_mut() = Some("Work".into());
     s.report_to.set(TextEdit::new("Phish@"));
     s.tick();
@@ -262,10 +262,48 @@ fn settings_window() {
     s.report_to.set(TextEdit::new("Phish@Acme.example"));
     s.tick();
     assert_eq!(engine.prefs().report_to.as_deref(), Some("phish@acme.example"));
-    drawn(&mut app, &["PHISHING", "Also send reports to"]);
+    drawn(&mut app, &["COMPANY", "Also send reports to", "Its other mail domains"]);
+    s.company.set(TextEdit::new("acme-corp.example, acme"));
+    s.tick();
+    assert!(engine.prefs().company.is_empty(), "half-typed");
+    s.company.set(TextEdit::new("acme-corp.example, @acme.example"));
+    s.tick();
+    assert_eq!(engine.prefs().company, ["acme-corp.example", "acme.example"]);
     s.report_to.set(TextEdit::new(""));
     s.tick();
     assert_eq!(engine.prefs().report_to, None);
+    // An import whose uploads gave up: said under the account, tried
+    // again or dropped.
+    let nowhere = engine.store.folder_id(id, "Nowhere", mail_store::Role::Other).unwrap();
+    let blob = engine.store.put_blob(b"Subject: lost\r\n\r\nx\r\n").unwrap();
+    let give_up = || {
+        let qid = engine.store.imports().unwrap().first().map(|(q, _)| *q);
+        engine.store.write(|w| {
+            let q = match qid { Some(q) => q, None => w.queue_import(nowhere, blob)? };
+            (0..mail_store::imports::TRIES_MAX).try_for_each(|_| w.import_failed(q, "the server has no folder Nowhere"))
+        }).unwrap();
+    };
+    give_up();
+    s.reload();
+    drawn(&mut app, &["1 imported message couldn't upload: the server has no", "folder Nowhere", "Try again", "Clear"]);
+    s.stuck_imports(id, true);
+    assert_eq!(s.ui.get_cloned().note.as_deref(), Some("Trying 1 message again at the next sync"));
+    assert_eq!(engine.imports_waiting(id).unwrap(), 1);
+    give_up();
+    s.stuck_imports(id, false);
+    assert!(engine.store.imports().unwrap().is_empty());
+    assert!(s.ui.get_cloned().rows[0].stuck.is_none());
+    // Mail's filters changed on the server: Show reads what is there.
+    engine.store.write(|w| {
+        w.set_sync_state(id, "jmap_sieve_why", Some(mail_engine::sieve::CHANGED_THERE))?;
+        w.set_sync_state(id, "sieve_there", Some("# mine now\nkeep;"))
+    }).unwrap();
+    s.reload();
+    drawn(&mut app, &["Show", "Replace"]);
+    s.show_filters(id);
+    drawn(&mut app, &["Hide", "On the server now:", "# mine now", "keep;"]);
+    s.show_filters(id);
+    assert!(s.ui.get_cloned().filters_shown.is_none());
 
     s.close();
     assert!(s.closed());

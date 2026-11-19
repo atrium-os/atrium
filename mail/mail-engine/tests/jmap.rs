@@ -548,6 +548,25 @@ fn jmap_sync_changes_and_send() {
     }
     assert_eq!(engine.imports_waiting(account).unwrap(), 0);
     assert_eq!(engine.store.imports().unwrap()[0].1.why.as_deref(), Some("the server has no folder Nowhere"));
+    // Seen in Settings: tried again, gives up again, then cleared.
+    assert_eq!(engine.imports_stuck(account).unwrap(), (1, Some("the server has no folder Nowhere".to_string())));
+    assert_eq!(engine.retry_imports(account).unwrap(), 1);
+    assert_eq!(engine.imports_waiting(account).unwrap(), 1);
+    assert_eq!(engine.imports_stuck(account).unwrap().0, 0);
+    for _ in 0..mail_store::imports::TRIES_MAX {
+        engine.upload_imports(account, &mut |f, m| client.import(f, m).map(|_| ()).map_err(|e| e.0)).unwrap();
+    }
+    assert_eq!(engine.clear_stuck_imports(account).unwrap(), 1);
+    assert!(engine.store.imports().unwrap().is_empty());
+    // A big file says how far it has got.
+    let mut big = Vec::new();
+    for i in 0..1200u32 {
+        mail_engine::export::write_one(&mut big, format!("Message-ID: <big{i}@example.com>\r\nSubject: {i}\r\n\r\nx\r\n").as_bytes(), t0).unwrap();
+    }
+    let mut seen = Vec::new();
+    let r = mail_engine::import::import_with(&engine.store, &engine.parser, account, gone, &big[..], &mut |p| seen.push(p.progress_line("old.mbox"))).unwrap();
+    assert_eq!(r.queued, 1200);
+    assert_eq!(seen, ["Reading old.mbox: 500 messages so far, 500 new", "Reading old.mbox: 1000 messages so far, 1000 new"]);
 }
 
 /// A session with an event source, and a scripted stream.
@@ -690,10 +709,12 @@ fn jmap_rules_through_sieve() {
     engine.sync_jmap_sieve(account, client.as_mut(), t0 + 9000).unwrap();
     assert!(server.borrow().sieve.as_ref().unwrap()[0].3.contains("edited in webmail"));
     assert_eq!(engine.rules_line(account).as_deref(), Some(mail_engine::sieve::CHANGED_THERE));
+    assert!(engine.filters_there(account).unwrap().contains("edited in webmail"));
     engine.replace_filters(account).unwrap();
     engine.sync_jmap_sieve(account, client.as_mut(), t0 + 9100).unwrap();
     assert!(server.borrow().sieve.as_ref().unwrap()[0].3.contains("newsletter"));
     assert_eq!(engine.rules_line(account), None);
+    assert_eq!(engine.filters_there(account), None);
 }
 
 #[test]

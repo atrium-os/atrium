@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host; rules and automatic replies on IMAP servers through ManageSieve built on the host; the automatic reply's first day and multi-line text built on the host; a Junk button on the reader, "Always…" rules from the reader and rules run over mail already here built on the host; the palette in compose windows, chips on search results, and other small leftovers built on the host; Open with… for attachments and Report phishing built on the host; icons on the medium window's rail, phishing reports to the company in Work, and files across mail built on the host; search operators sent to the server and rules on JMAP servers through JMAP Sieve built on the host; filters changed on the server kept (with Replace) and the automatic reply through JMAP Sieve built on the host; company domains, import progress and given-up uploads, and the changed filters shown built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1670,8 +1670,8 @@ Stalwart in the cloud VM, and later a real account):
    answered is told when it does. The spec's wording was "coloured"; a line naming them
    is used because a text field can't colour single addresses in what is typed. Tests:
    engine 1 (inside, subdomain, look-alike, duplicates), compose window 1 (Personal
-   silent, Work's line, all inside). **Not yet**: a VM run in a Work instance, and the
-   persona's own list of company domains (one From domain is the company for now).
+   silent, Work's line, all inside). **Not yet**: a VM run in a Work instance (company
+   domains: see below).
 
    **Company link scanning kept in Work (2026-11-19, §7.6).** Settings has a LINKS
    section with a "Keep company link scanning" switch (stored as a setting; absent means
@@ -1721,8 +1721,8 @@ Stalwart in the cloud VM, and later a real account):
    folder the server lacks gives up after 5 with its reason), Dovecot 1 (an import into
    Sent goes up by `APPEND` in a real pass and is listed seen), window 1 (palette entry,
    not from search, not while the picker is up). **Not yet**: Maildir (the picker's folder
-   kind could carry it), local-only folders (every import goes to a server), a progress
-   line for big imports and a way to see or clear uploads that gave up.
+   kind could carry it), local-only folders (every import goes to a server); progress
+   and given-up uploads: see below.
 
    **Junk and Not junk teach the server (2026-11-19, §7.7).** `!` (or "Move to Junk" in
    the palette) moves the message or conversation to the account's Junk folder and marks
@@ -1933,7 +1933,24 @@ Stalwart in the cloud VM, and later a real account):
    fingerprint), engine sieve (edited on the server: kept, said, not asked again within
    the hour, replaced, then Mail's own changes go through), JMAP 2 (edited, kept,
    replaced; the reply put in the script and taken out when turned off on a server
-   without `VacationResponse`). **Not yet**: showing what was changed on the server.
+   without `VacationResponse`). What was changed is shown since: see below.
+
+   **Company domains, import progress and the server's filters shown (2026-11-19,
+   §§7.6, 6.5, 11.6).** Work's Settings has a COMPANY section (with the phishing
+   address) where the company's other mail domains are typed, comma separated; a list
+   that doesn't parse yet isn't saved. The outside-recipient line treats them, and their
+   subdomains, as inside and then says "outside the company". An import says how far it
+   has got every 500 messages ("Reading old.mbox: 1000 messages so far, 1000 new"), and
+   only the last note wakes sync. Uploads that gave up after 5 tries are said under their
+   account in Settings, with the last reason, *Try again* (back to 0 tries) and *Clear*
+   (dropped; they stay in the file they came from). When Mail's filters were changed on
+   the server, the worker brings back what is there (control characters out, at most
+   16 KiB), the engine keeps it until the next put or *Replace*, and Settings shows it
+   under RULES with a *Show*/*Hide* button beside *Replace*. Tests: engine compose 1
+   (company domains), JMAP (stuck uploads tried again and cleared; progress at 500 and
+   1000; the changed script kept and dropped on replace), sieve (the same over
+   ManageSieve), Settings window (half-typed list not saved; stuck line with both
+   buttons; Show and Hide), compose window (the company label).
 
 ## 17. Decisions, with recommendations
 

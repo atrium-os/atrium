@@ -27,6 +27,10 @@ pub const DIGEST_MAX: usize = 6;
 const VIPS: &str = "vips";
 /// Where Report phishing also sends the message (the company's address).
 const REPORT_TO: &str = "phishing_report_to";
+/// The company's other mail domains (Work), newline-separated.
+const COMPANY: &str = "company_domains";
+/// Most company domains kept.
+pub const COMPANY_MAX: usize = 50;
 const ALL: u32 = 0;
 /// Most VIPs kept.
 pub const VIPS_MAX: usize = 200;
@@ -61,11 +65,14 @@ pub struct Prefs {
     /// The company's address for phishing reports (§7.7): Report phishing
     /// also sends the message there, attached as it arrived.
     pub report_to: Option<String>,
+    /// The company's other mail domains (§9.1): recipients there aren't
+    /// outside the company, as the From address's domain isn't.
+    pub company: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None, report_to: None }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None, report_to: None, company: Vec::new() }
     }
 }
 
@@ -119,6 +126,7 @@ impl Engine {
                 Some(v) => clean_times(v.split(',').filter_map(|t| t.trim().parse().ok())),
             },
             report_to: s.sync_state(ALL, REPORT_TO).ok().flatten(),
+            company: s.sync_state(ALL, COMPANY).ok().flatten().map(|v| v.lines().map(str::to_string).collect()).unwrap_or_default(),
             vips: s.sync_state(ALL, VIPS).ok().flatten().map(|v| v.lines().map(str::to_string).filter(|l| !l.is_empty()).collect()).unwrap_or_default(),
         }
     }
@@ -129,6 +137,9 @@ impl Engine {
         vips.dedup();
         vips.truncate(VIPS_MAX);
         let report_to = p.report_to.as_deref().and_then(report_address);
+        let mut company: Vec<String> = p.company.iter().filter_map(|d| company_domain(d)).collect();
+        company.dedup();
+        company.truncate(COMPANY_MAX);
         let quiet = p.quiet.filter(|(f, t)| *f < 1440 && *t < 1440).map(|(f, t)| f as u64 * 10_000 + t as u64 + 1);
         self.store.write(|w| {
             w.set_setting(ALL, NOTIFY_OFF, (!p.notify).then_some(1))?;
@@ -144,10 +155,27 @@ impl Engine {
             let digest = if times == DIGEST_DEFAULT { None } else if times.is_empty() { Some("-".to_string()) } else { Some(times.iter().map(u16::to_string).collect::<Vec<_>>().join(",")) };
             w.set_sync_state(ALL, DIGEST, digest.as_deref())?;
             w.set_sync_state(ALL, REPORT_TO, report_to.as_deref())?;
+            w.set_sync_state(ALL, COMPANY, (!company.is_empty()).then(|| company.join("\n")).as_deref())?;
             w.set_sync_state(ALL, VIPS, (!vips.is_empty()).then(|| vips.join("\n")).as_deref())
         })?;
         Ok(())
     }
+}
+
+/// A company domain as kept: trimmed, lower case, `@` and a leading dot
+/// taken off (`@acme.example`, `.acme.example`); `None` when it isn't a
+/// domain name.
+pub fn company_domain(d: &str) -> Option<String> {
+    let d = d.trim().trim_start_matches('@').trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
+    let ok = d.contains('.') && d.len() <= 253 && d.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !l.starts_with('-') && !l.ends_with('-'));
+    ok.then_some(d)
+}
+
+/// Domains typed as a list (commas, spaces or new lines between): each
+/// kept, or `None` when one isn't a domain (so a half-typed list isn't
+/// saved).
+pub fn company_domains(s: &str) -> Option<Vec<String>> {
+    s.split([',', ' ', '\n', ';']).filter(|w| !w.trim().is_empty()).map(company_domain).collect()
 }
 
 /// A report address as kept: trimmed, lower case, one address; `None` for
@@ -203,5 +231,11 @@ mod tests {
         }
         e.set_prefs(&Prefs { report_to: Some("".into()), ..e.prefs() }).unwrap();
         assert_eq!(e.prefs().report_to, None);
+        // Company domains: cleaned, kept, a bad list not read.
+        assert_eq!(company_domains("@Acme.example, eu.acme.example\n.acme-corp.example"), Some(vec!["acme.example".to_string(), "eu.acme.example".into(), "acme-corp.example".into()]));
+        assert_eq!(company_domains("acme.example, acme"), None);
+        assert_eq!(company_domains(""), Some(vec![]));
+        e.set_prefs(&Prefs { company: vec!["Acme.example".into(), "bad domain".into()], ..e.prefs() }).unwrap();
+        assert_eq!(e.prefs().company, ["acme.example"]);
     }
 }

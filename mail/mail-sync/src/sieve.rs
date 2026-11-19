@@ -87,12 +87,32 @@ pub struct Sieved {
     /// Mail's own script was changed on the server since Mail put it:
     /// left as it is.
     pub changed_there: bool,
+    /// What the server has in Mail's script then, for the person to read
+    /// ([`shown`], at most [`THERE_MAX`] bytes).
+    pub there: Option<String>,
     /// The fingerprint of what was put (kept for the next time).
     pub put: Option<u64>,
     /// The server's Sieve can't send automatic replies.
     pub no_vacation: bool,
     /// Rules the server's Sieve can't do (Mail still does them here).
     pub skipped: u32,
+}
+
+/// The most of a changed script kept to show.
+pub const THERE_MAX: usize = 16 << 10;
+
+/// A script the server has, as it can be shown: no control characters
+/// but line ends and tabs, cut at [`THERE_MAX`] bytes.
+pub fn shown(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars().filter(|&c| !c.is_control() || c == '\n' || c == '\t') {
+        if out.len() + c.len_utf8() > THERE_MAX {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The script for `plan` on a server with `caps`: its text, whether the
@@ -233,7 +253,10 @@ pub fn apply<S: Read + Write>(mut s: S, plan: &Plan) -> Result<Sieved, String> {
         let ours = list.iter().any(|(n, _)| n == SCRIPT);
         if let (true, Some(prev), false) = (ours, plan.previous, plan.replace) {
             let r = ask(&mut s, &mut d, &ms::getscript(SCRIPT).expect("a fixed name"), "Mail's filters")?;
-            done.changed_there = ms::script_text(&r).is_some_and(|t| fingerprint(t) != prev);
+            if let Some(t) = ms::script_text(&r).filter(|t| fingerprint(t) != prev) {
+                done.changed_there = true;
+                done.there = Some(shown(t));
+            }
         }
         if !done.changed_there {
             let (text, no_vacation, skipped) = script(plan, &caps);

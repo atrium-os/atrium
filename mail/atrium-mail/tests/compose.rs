@@ -523,6 +523,10 @@ fn work_points_out_recipients_outside_the_company() {
     assert!(texts(&app).iter().any(|x| x == "Outside example.com: ada@other.org, sam@notexample.com"), "{:?}", texts(&app));
     // Both fields naming someone outside are marked; Subject isn't.
     assert!(texts(&app).iter().any(|x| x == "To •") && texts(&app).iter().any(|x| x == "Cc •"));
+    // The company's other domains (Settings) are inside too.
+    engine.set_prefs(&mail_engine::prefs::Prefs { company: vec!["other.org".into()], ..engine.prefs() }).unwrap();
+    assert_eq!(k.outside(), Some(("the company".into(), vec!["sam@notexample.com".into()])));
+    engine.set_prefs(&mail_engine::prefs::Prefs { company: vec![], ..engine.prefs() }).unwrap();
     // All inside: the line goes.
     k.to.set(TextEdit::new("priya@example.com"));
     k.cc.set(TextEdit::new(""));
