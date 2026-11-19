@@ -34276,15 +34276,18 @@ tessera_fs_group_info(struct vnode *vp, struct tessera_ioc_group_info *o)
 	struct tessera_fs_group *g;
 	int e;
 
+	uint32_t ino;
+
 	if (vp->v_type != VDIR)
 		return (ENOTDIR);
+	ino = o->inode != 0 ? o->inode : (uint32_t)tn->inode_no;
 	memset(o, 0, sizeof(*o));
+	o->inode = ino;
 	memcpy(o->volume_uuid, tmp_->sb.volume_uuid, sizeof(o->volume_uuid));
 	if (tmp_->inode_tree == NULL)
 		return (0);
-	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
-	    != TESSERA_OK)
-		return (EIO);
+	if (tessera_fs_inode_get(tmp_, ino, &dino) != TESSERA_OK)
+		return (ENOENT);
 	if (dino.quota_domain == 0)
 		return (0);
 	o->domain_id = dino.quota_domain;
@@ -34297,7 +34300,7 @@ tessera_fs_group_info(struct vnode *vp, struct tessera_ioc_group_info *o)
 	sx_xlock(&tmp_->groups_sx);
 	qd = tessera_quota_find(tmp_, dino.quota_domain);
 	if (qd != NULL) {
-		if (qd->root_inode_no == tn->inode_no)
+		if (qd->root_inode_no == ino)
 			o->flags |= TESSERA_GROUP_INFO_ROOT;
 		o->group_id = qd->key_group;
 	}

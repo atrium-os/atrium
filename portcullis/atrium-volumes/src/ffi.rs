@@ -171,7 +171,9 @@ pub struct GroupInfo {
     /// 0: the domain is in no key group.
     pub group_id:    u64,
     pub flags:       u32,
-    pub pad:         u32,
+    /// In: the folder's inode number (st_ino), asked of another directory
+    /// of the volume; 0 asks about the directory the ioctl is on.
+    pub inode:       u32,
 }
 
 impl GroupInfo {
@@ -192,8 +194,8 @@ struct IocGroup {
     pad:      u32,
 }
 
-/// `_IOR('T', 10, struct tessera_ioc_group_info)`: OUT | 56 << 16 | 'T' << 8 | 10.
-pub const TESSERA_IOC_GROUP_INFO: u64 = 0x4038_540A;
+/// `_IOWR('T', 10, struct tessera_ioc_group_info)`: INOUT | 56 << 16 | 'T' << 8 | 10.
+pub const TESSERA_IOC_GROUP_INFO: u64 = 0xC038_540A;
 /// `_IOW('T', 7, struct tessera_ioc_group)`: IN | 32 << 16 | 'T' << 8 | 7.
 pub const TESSERA_IOC_GROUP_CREATE: u64 = 0x8020_5407;
 /// `_IOW('T', 8, uint64_t)`.
@@ -228,10 +230,25 @@ fn dir_ioctl<T>(_path: &Path, _cmd: u64, _arg: &mut T) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOTTY))
 }
 
-/// What `path` (a directory) is: its volume, domain and key group.
+/// What `path` (a directory) is: its volume, domain and key group. A
+/// locked group's folder can't be opened (tessera-encryption E4.4), so the
+/// question goes to its parent, naming the folder by inode number; a mount
+/// point is asked directly.
 pub fn tessera_group_info(path: &Path) -> io::Result<GroupInfo> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
     let mut gi = GroupInfo::default();
-    dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?;
+    match path.parent() {
+        Some(parent) if std::fs::metadata(parent)?.dev() == m.dev() => {
+            gi.inode = u32::try_from(m.ino())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            dir_ioctl(parent, TESSERA_IOC_GROUP_INFO, &mut gi)?;
+        }
+        _ => dir_ioctl(path, TESSERA_IOC_GROUP_INFO, &mut gi)?,
+    }
     Ok(gi)
 }
 

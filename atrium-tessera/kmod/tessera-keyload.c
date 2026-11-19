@@ -31,6 +31,8 @@
 #include <strings.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #include "tessera/keyring.h"
 
@@ -131,11 +133,44 @@ main(int argc, char **argv)
 	}
 	if (strcmp(argv[1], "group-info") == 0 && argc == 3) {
 		struct tessera_ioc_group_info gi;
-		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+		struct stat st, pst;
+		char parent[PATH_MAX];
+		char *slash;
+		int dfd;
 
-		if (dfd < 0) {
+		/* A locked group's folder doesn't open (E4.4): ask its
+		 * parent, by the folder's inode number. */
+		if (lstat(argv[2], &st) != 0 || !S_ISDIR(st.st_mode)) {
 			perror(argv[2]);
 			return (1);
+		}
+		snprintf(parent, sizeof(parent), "%s", argv[2]);
+		while ((slash = strrchr(parent, '/')) != NULL && slash[1] == '\0' &&
+		    slash != parent)
+			*slash = '\0';
+		slash = strrchr(parent, '/');
+		if (slash == NULL)
+			snprintf(parent, sizeof(parent), ".");
+		else if (slash == parent)
+			parent[1] = '\0';
+		else
+			*slash = '\0';
+		dfd = open(parent, O_RDONLY | O_DIRECTORY);
+		if (dfd < 0 || fstat(dfd, &pst) != 0) {
+			perror(parent);
+			return (1);
+		}
+		memset(&gi, 0, sizeof(gi));
+		/* A mount point: its root is the directory itself. */
+		if (pst.st_dev == st.st_dev)
+			gi.inode = (uint32_t)st.st_ino;
+		else {
+			close(dfd);
+			dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+			if (dfd < 0) {
+				perror(argv[2]);
+				return (1);
+			}
 		}
 		if (ioctl(dfd, TESSERA_IOC_GROUP_INFO, &gi) != 0) {
 			perror("TESSERA_IOC_GROUP_INFO");

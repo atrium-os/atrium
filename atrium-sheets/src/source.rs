@@ -82,7 +82,8 @@ pub fn rgb(c: u32) -> Color {
 /// font's colour and weight, its fill and borders, aligned as it says.
 pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
     let st = t.get(id);
-    let has_look = st.fill.is_some() || st.borders.iter().any(|b| b.line != Line::None);
+    // An empty cell centring across shows, so the run can reach over it.
+    let has_look = st.fill.is_some() || st.borders.iter().any(|b| b.line != Line::None) || st.h_align == HAlign::CenterAcross;
     let mut cv = match v {
         Value::Empty if !has_look => return None,
         Value::Empty => CellView::text(""),
@@ -110,7 +111,8 @@ pub fn styled_view(t: &StyleTable, id: StyleId, v: &Value) -> Option<CellView> {
     cv.align = match st.h_align {
         HAlign::General => cv.align,
         HAlign::Left | HAlign::Fill | HAlign::Justify | HAlign::Distributed => CellAlign::Left,
-        HAlign::Center | HAlign::CenterAcross => CellAlign::Center,
+        HAlign::Center => CellAlign::Center,
+        HAlign::CenterAcross => CellAlign::Across,
         HAlign::Right => CellAlign::Right,
     };
     Some(cv)

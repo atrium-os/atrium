@@ -3622,7 +3622,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Hooks:** `GridSource` has `merge_at` and `merges_in`, defaulting to none.
 - **Sorting** a range with merged cells works when every row is merged across the same columns, one row high and inside the range (`sort::merges_allow_sort`); the merges stay put as the rows move. Anything else is refused with "To sort, every row needs the same merged cells; unmerge them first." Excel also sorts blocks of rows merged to the same height; we don't yet.
 - **Printing** merged areas as one cell: done by the printing thread (c7af758b).
-- **Not yet:** Excel's "Center Across Selection" without merging. (The editor already spans the merged area while typing.)
+- **Center Across Selection** without merging: §16.86. (The editor already spans the merged area while typing.)
 - **Gates:** officina-grid `merges::tests`, `merges::op_tests`; officina-convert `tests/merges.rs`; pergola `a_merged_area_is_one_cell_to_the_pointer_and_the_keys`; atrium-sheets `merge_keeps_the_top_left_value_and_unmerge_and_undo_bring_cells_back`.
 
 ### 16.80 Cell comments (2026-11-18)
@@ -3717,6 +3717,26 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Selection.** While a rule panel (validation or conditional formats) is open, the grid's left part stays usable. Its Selection button puts the grid's selection into Apply To.
 - **Not Excel's way:** Excel keeps one rule per range and offers to "apply these changes to all other cells with the same settings"; here a rule holds all its ranges, so a change always reaches all of them.
 - **Gates:** atrium-sheets `rules_are_made_changed_and_cleared`, `the_validation_panel_makes_changes_and_deletes_rules` and `a_list_cell_s_button_and_alt_down_open_its_list`, `invalid_data_is_circled_until_turned_off`; officina-grid `invalid_cells_are_found_in_an_area`; pergola `a_button_in_a_cell_and_alt_down_reach_the_app`.
+
+### 16.85 Long text runs over empty cells (2026-11-19)
+
+- **Grid** (pergola `grid_view.rs`, `spill`/`emit_spills`). Text wider than its cell runs over empty neighbours, as spreadsheets show it:
+  - Left-aligned text runs right, right-aligned text runs left, and centred text runs both ways.
+  - It runs up to 32 columns, and stops at a cell that shows anything or is merged. What still doesn't fit is cut with an ellipsis.
+  - Numbers never run over; they show `###`. Text with line breaks doesn't run over either.
+  - The grid lines under the text are hidden, except where a neighbour has a fill.
+  - The text is drawn in a layer over the cell tiles, so a run that crosses tiles or frozen bands draws once.
+  - Text reaching in from cells beside the visible columns is found only through a blank edge cell, so full rows cost nothing more. `scroll_cost` p50 and p99 are unchanged.
+- **Not yet:** text that runs from a hidden column.
+- **Gate:** pergola `long_text_runs_over_empty_neighbours`.
+
+### 16.86 Center Across Selection (2026-11-19)
+
+- **Command.** Data ▸ Center Across Selection (needs two or more columns) gives the selection Excel's "centre across" alignment without merging. It is one undo step. With the selection's first cell already centred across, the item is checked, and choosing it again puts the cells back to General.
+- **Grid.** A cell centred across is drawn centred over itself and the cells after it in its row, while those cells are empty, also centred across, and not merged (up to 32 columns). Text wider than the run is cut. pergola: `CellAlign::Across`.
+- **Files.** .xlsx keeps it as `centerContinuous` (and .xls reads it). .ods has no such alignment, so it is written as `center`, which is what LibreOffice shows for it.
+- **Printing** draws it centred in its own cell for now.
+- **Gates:** atrium-sheets `center_across_selection_turns_on_and_off_without_merging`; pergola `text_centred_across_the_selection_spans_its_cells`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
