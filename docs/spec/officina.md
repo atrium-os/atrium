@@ -3718,6 +3718,18 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not Excel's way:** Excel keeps one rule per range and offers to "apply these changes to all other cells with the same settings"; here a rule holds all its ranges, so a change always reaches all of them.
 - **Gates:** atrium-sheets `rules_are_made_changed_and_cleared`, `the_validation_panel_makes_changes_and_deletes_rules` and `a_list_cell_s_button_and_alt_down_open_its_list`, `invalid_data_is_circled_until_turned_off`; officina-grid `invalid_cells_are_found_in_an_area`; pergola `a_button_in_a_cell_and_alt_down_reach_the_app`.
 
+### 16.85 Long text runs over empty cells (2026-11-19)
+
+- **Grid** (pergola `grid_view.rs`, `spill`/`emit_spills`). Text wider than its cell runs over empty neighbours, as spreadsheets show it:
+  - Left-aligned text runs right, right-aligned text runs left, and centred text runs both ways.
+  - It runs up to 32 columns, and stops at a cell that shows anything or is merged. What still doesn't fit is cut with an ellipsis.
+  - Numbers never run over; they show `###`. Text with line breaks doesn't run over either.
+  - The grid lines under the text are hidden, except where a neighbour has a fill.
+  - The text is drawn in a layer over the cell tiles, so a run that crosses tiles or frozen bands draws once.
+  - Text reaching in from cells beside the visible columns is found only through a blank edge cell, so full rows cost nothing more. `scroll_cost` p50 and p99 are unchanged.
+- **Not yet:** Center Across Selection (still drawn as centred in its own cell), and text that runs from a hidden column.
+- **Gate:** pergola `long_text_runs_over_empty_neighbours`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

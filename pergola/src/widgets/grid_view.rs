@@ -602,72 +602,10 @@ impl GridView {
             ctx.set_flex(page, FlexStyle { free: true, ..FlexStyle::default() });
             // Window position of content point (px, py).
             let at = |px: f64, py: f64| (q(body.x() as f64 + (px - bx)), q(body.y() as f64 + (py - by)));
-            if tiles_r.0 <= tiles_r.1 && tiles_c.0 <= tiles_c.1 {
-                for tr in tiles_r.0..=tiles_r.1 {
-                    for tc in tiles_c.0..=tiles_c.1 {
-                        let (r0, r1) = (tr * TILE_ROWS, ((tr + 1) * TILE_ROWS).min(rows) - 1);
-                        let (c0, c1) = (tc * TILE_COLS, ((tc + 1) * TILE_COLS).min(cols) - 1);
-                        let (top, bottom) = (src.row_top(r0), src.row_top(r1 + 1));
-                        let (left, right) = (src.col_left(c0), src.col_left(c1 + 1));
-                        let (tx, ty) = at(left, top);
-                        let (tw, th) = ((right - left) as f32, (bottom - top) as f32);
-                        ctx.key(2 + ((tr as u64) << 20 | tc as u64));
-                        let tile = ctx.push(Node::vstack(Rect::new(tx, ty, tw, th), 0.0));
-                        ctx.set_flex(tile, FlexStyle { free: true, ..FlexStyle::default() });
-                        // Grid lines: each row's bottom and each column's right edge.
-                        for row in r0..=r1 {
-                            let (_, yb) = at(left, src.row_top(row + 1));
-                            ctx.add(Node::Rect { rect: Rect::new(tx, yb - 1.0, tw, 1.0), fill: line, radius: 0.0 });
-                        }
-                        for col in c0..=c1 {
-                            let (xr, _) = at(src.col_left(col + 1), top);
-                            ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, ty, 1.0, th), fill: line, radius: 0.0 });
-                        }
-                        for row in r0..=r1 {
-                            let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
-                            if yb <= yt {
-                                // A hidden row (filtered out): nothing to draw.
-                                continue;
-                            }
-                            for col in c0..=c1 {
-                                if src.merge_at(row, col).is_some() {
-                                    // Drawn whole with the merged areas below.
-                                    continue;
-                                }
-                                let Some(cv) = src.cell(row, col) else { continue };
-                                let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
-                                let (cx, cy) = at(xl, yt);
-                                let (cw, ch) = ((xr - xl) as f32, (yb - yt) as f32);
-                                draw_cell(ctx, &t, &cv, cx, cy, cw, ch);
-                            }
-                        }
-                        ctx.pop();
-                    }
-                }
-            }
-            // Merged areas meeting the resident tiles: a plain ground over the
-            // grid lines inside, then the top-left cell drawn across the area.
             if tiles_r.0 <= tiles_r.1 && tiles_c.0 <= tiles_c.1 && rows > 0 && cols > 0 {
-                let vis = CellRange { r0: tiles_r.0 * TILE_ROWS, c0: tiles_c.0 * TILE_COLS, r1: ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1, c1: ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1 };
-                let merged = src.merges_in(vis);
-                if !merged.is_empty() {
-                    ctx.key(u64::MAX - 1);
-                    let layer = ctx.push(Node::vstack(local, 0.0));
-                    ctx.set_flex(layer, FlexStyle { free: true, ..FlexStyle::default() });
-                    for m in merged {
-                        let (cx, cy) = at(src.col_left(m.c0), src.row_top(m.r0));
-                        let (ex, ey) = at(src.col_left(m.c1 + 1), src.row_top(m.r1 + 1));
-                        let (cw, ch) = (ex - cx, ey - cy);
-                        if cw <= 1.0 || ch <= 1.0 {
-                            continue;
-                        }
-                        ctx.add(Node::Rect { rect: Rect::new(cx, cy, cw - 1.0, ch - 1.0), fill: t.bg_canvas(), radius: 0.0 });
-                        if let Some(cv) = src.cell(m.r0, m.c0) {
-                            draw_cell(ctx, &t, &cv, cx, cy, cw, ch);
-                        }
-                    }
-                    ctx.pop();
-                }
+                let rr = (tiles_r.0 * TILE_ROWS, ((tiles_r.1 + 1) * TILE_ROWS).min(rows) - 1);
+                let cr = (tiles_c.0 * TILE_COLS, ((tiles_c.1 + 1) * TILE_COLS).min(cols) - 1);
+                emit_cells(ctx, &*src, &t, rr, cr, &at);
             }
             // The overlay: selection, active cell, editor.
             ctx.key(u64::MAX);
@@ -1228,6 +1166,7 @@ fn emit_overlay(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic,
 /// meeting them, placed by `at`, in groups keyed by tile as the body's.
 fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), at: &dyn Fn(f64, f64) -> (f32, f32)) {
     let line = t.border_default();
+    let mut spills: Vec<(u32, u32, (u32, u32), CellView)> = Vec::new();
     for tr in rr.0 / TILE_ROWS..=rr.1 / TILE_ROWS {
         for tc in cr.0 / TILE_COLS..=cr.1 / TILE_COLS {
             let (r0, r1) = ((tr * TILE_ROWS).max(rr.0), ((tr + 1) * TILE_ROWS - 1).min(rr.1));
@@ -1256,15 +1195,21 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
                     if src.merge_at(row, col).is_some() {
                         continue;
                     }
-                    let Some(cv) = src.cell(row, col) else { continue };
+                    let Some(mut cv) = src.cell(row, col) else { continue };
                     let (xl, xr) = (src.col_left(col), src.col_left(col + 1));
                     let (cx, cy) = at(xl, yt);
+                    // Text running over empty neighbours is drawn by the layer below.
+                    if let Some(span) = spill(src, row, col, &cv) {
+                        spills.push((row, col, span, cv.clone()));
+                        cv.text.clear();
+                    }
                     draw_cell(ctx, t, &cv, cx, cy, (xr - xl) as f32, (yb - yt) as f32);
                 }
             }
             ctx.pop();
         }
     }
+    emit_spills(ctx, src, t, rr, cr, spills, at);
     let merged = src.merges_in(CellRange { r0: rr.0, c0: cr.0, r1: rr.1, c1: cr.1 });
     if merged.is_empty() {
         return;
@@ -1287,6 +1232,134 @@ fn emit_cells(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, r
         }
     }
     ctx.pop();
+}
+
+/// Columns text may run over beside its cell, at most.
+pub const SPILL_COLS: u32 = 32;
+
+fn cell_style(cv: &CellView, t: &crate::theme::Semantic) -> TextStyle {
+    TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: cv.color.unwrap_or(t.text_primary()) }
+}
+
+/// Whether cell (`r`, `c`) shows nothing: text may run over it.
+fn blank(src: &dyn GridSource, r: u32, c: u32) -> bool {
+    src.merge_at(r, c).is_none() && src.cell(r, c).is_none_or(|v| v.text.is_empty())
+}
+
+/// The columns cell (`r`, `c`)'s text runs over when it is wider than the
+/// cell, as spreadsheets show text: into empty neighbours on the side its
+/// alignment points (both, centred), up to [`SPILL_COLS`]. None when it fits,
+/// is a number, or has no empty neighbour.
+fn spill(src: &dyn GridSource, r: u32, c: u32, cv: &CellView) -> Option<(u32, u32)> {
+    if cv.numeric || cv.text.is_empty() || cv.text.contains('\n') {
+        return None;
+    }
+    let cw = (src.col_left(c + 1) - src.col_left(c)) as f32;
+    let room = cw - 2.0 * PAD - cv.indent as f32 * INDENT_STEP - if cv.icon.is_some() { 17.0 } else { 0.0 };
+    let est = cv.text.chars().count() as f32 * TEXT_SIZE * 0.6;
+    if est < room * 0.7 {
+        return None;
+    }
+    let style = TextStyle { family: font::SANS.into(), size: TEXT_SIZE, weight: if cv.bold { Weight::Semibold } else { Weight::Regular }, color: Color::TRANSPARENT };
+    let w = crate::text::measure_chars(&cv.text, &style);
+    if w <= room {
+        return None;
+    }
+    let need = (w - room) as f64;
+    let last = src.cols().saturating_sub(1);
+    let (mut a, mut b) = (c, c);
+    let (want_l, want_r) = match cv.align {
+        CellAlign::Left => (0.0, need),
+        CellAlign::Right => (need, 0.0),
+        CellAlign::Center => (need / 2.0, need / 2.0),
+    };
+    let mut got = 0.0;
+    while got < want_r && b < last && b - c < SPILL_COLS && blank(src, r, b + 1) {
+        b += 1;
+        got += src.col_left(b + 1) - src.col_left(b);
+    }
+    got = 0.0;
+    while got < want_l && a > 0 && c - a < SPILL_COLS && blank(src, r, a - 1) {
+        a -= 1;
+        got += src.col_left(a + 1) - src.col_left(a);
+    }
+    ((a, b) != (c, c)).then_some((a, b))
+}
+
+/// Text that runs over empty neighbours, for rows `rr` and columns `cr` (and
+/// cells up to [`SPILL_COLS`] beside them whose text reaches in): the grid
+/// lines it crosses hidden, then the text across its columns.
+fn emit_spills(ctx: &mut Ctx, src: &dyn GridSource, t: &crate::theme::Semantic, rr: (u32, u32), cr: (u32, u32), mut spills: Vec<(u32, u32, (u32, u32), CellView)>, at: &dyn Fn(f64, f64) -> (f32, f32)) {
+    let last = src.cols().saturating_sub(1);
+    // Cells beside the columns whose text reaches in: only through a blank
+    // edge cell, so a full row costs nothing more.
+    for row in rr.0..=rr.1 {
+        if src.row_top(row + 1) <= src.row_top(row) {
+            continue;
+        }
+        let left = cr.0 > 0 && blank(src, row, cr.0);
+        let right = cr.1 < last && blank(src, row, cr.1);
+        let mut side = |cols: &mut dyn Iterator<Item = u32>| {
+            for col in cols {
+                if src.merge_at(row, col).is_some() {
+                    continue;
+                }
+                let Some(cv) = src.cell(row, col) else { continue };
+                if let Some(span) = spill(src, row, col, &cv).filter(|&(a, b)| b >= cr.0 && a <= cr.1) {
+                    spills.push((row, col, span, cv));
+                }
+            }
+        };
+        if left {
+            side(&mut (cr.0.saturating_sub(SPILL_COLS)..cr.0));
+        }
+        if right {
+            side(&mut (cr.1 + 1..=(cr.1 + SPILL_COLS).min(last)));
+        }
+    }
+    if spills.is_empty() {
+        return;
+    }
+    let (lx, ly) = at(src.col_left(cr.0), src.row_top(rr.0));
+    let (lx1, ly1) = at(src.col_left(cr.1 + 1), src.row_top(rr.1 + 1));
+    let mut layer = None;
+    for (row, col, (a, b), cv) in spills {
+        let (yt, yb) = (src.row_top(row), src.row_top(row + 1));
+        {
+            if layer.is_none() {
+                ctx.key(u64::MAX - 3);
+                let id = ctx.push(Node::vstack(Rect::new(lx, ly, lx1 - lx, ly1 - ly), 0.0));
+                ctx.set_flex(id, FlexStyle { free: true, ..FlexStyle::default() });
+                layer = Some(id);
+            }
+            let (x0, y0) = at(src.col_left(a), yt);
+            let (x1, y1) = at(src.col_left(b + 1), yb);
+            // The grid lines inside the run, where no fill hides them.
+            for k in a..b {
+                let filled = |c: u32| c != col && src.cell(row, c).is_some_and(|v| v.fill.is_some());
+                if !filled(k) && !filled(k + 1) {
+                    let (xr, _) = at(src.col_left(k + 1), yt);
+                    ctx.add(Node::Rect { rect: Rect::new(xr - 1.0, y0, 1.0, y1 - y0 - 1.0), fill: cv.fill.filter(|_| k == col || k + 1 == col).unwrap_or(t.bg_canvas()), radius: 0.0 });
+                }
+            }
+            let style = cell_style(&cv, t);
+            let lead = cv.indent as f32 * INDENT_STEP + if cv.icon.is_some() { 17.0 } else { 0.0 };
+            let (shown, w) = fit_text(&CellView { align: CellAlign::Left, ..cv.clone() }, x1 - x0 - 2.0 * PAD - lead, &style);
+            let (ox, _) = at(src.col_left(col), yt);
+            let (ox1, _) = at(src.col_left(col + 1), yt);
+            let tx0 = match cv.align {
+                CellAlign::Left => ox + PAD + lead,
+                CellAlign::Right => ox1 - PAD - w,
+                // Centred on its own cell, kept inside the run.
+                CellAlign::Center => q((((ox + ox1) / 2.0 - w / 2.0).max(x0 + PAD).min(x1 - PAD - w)) as f64),
+            };
+            let lh = TEXT_SIZE * 1.3;
+            ctx.add(Node::Text { rect: Rect::new(tx0, y0 + q(((y1 - y0 - lh) / 2.0).max(0.0) as f64), w, lh), content: shown, style });
+        }
+    }
+    if layer.is_some() {
+        ctx.pop();
+    }
 }
 
 /// One cell's ground, bar, borders, icon and text in the box (`cx`, `cy`,
@@ -1825,6 +1898,21 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(hw + 248.0, HEADER_H + 10.0) });
         app.tick();
         assert!(log.borrow().iter().any(|a| matches!(a, GridAction::PressFloat(9))), "{:?}", log.borrow());
+    }
+
+    #[test]
+    fn long_text_runs_over_empty_neighbours() {
+        let (mut app, grid, _, _, _) = host(100, 10);
+        let long = "A heading much wider than one column";
+        grid.cells.borrow_mut().insert((1, 0), long.into());
+        grid.cells.borrow_mut().insert((2, 0), long.into());
+        grid.cells.borrow_mut().insert((2, 1), "x".into());
+        app.tick();
+        let shown: Vec<(String, f32)> = app.tree().iter().filter_map(|(_, n)| if let Node::Text { content, rect, .. } = n { Some((content.clone(), rect.w())) } else { None }).collect();
+        // Row 2: whole, wider than its 64 px column. Row 3: cut by "x" beside it.
+        assert!(shown.iter().any(|(t, w)| t == long && *w > 64.0), "{shown:?}");
+        assert!(shown.iter().any(|(t, w)| t.ends_with('…') && t.starts_with("A ") && *w <= 64.0), "{shown:?}");
+        assert_eq!(shown.iter().filter(|(t, _)| t == long).count(), 1, "{shown:?}");
     }
 
     #[test]
