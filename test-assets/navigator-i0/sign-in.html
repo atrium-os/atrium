@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Navigator I0 sign-in fixture</title>
+<main>
+  <h1>Fixture identity provider</h1>
+  <p id="result" role="status">Waiting for script</p>
+  <form hidden>
+    <label for="password">Fixture password</label>
+    <input id="password" type="password" required autocomplete="off">
+    <button>Sign in</button>
+  </form>
+</main>
+<script>
+"use strict";
+
+const result = document.querySelector("#result");
+const form = document.querySelector("form");
+const password = document.querySelector("#password");
+const step = new URLSearchParams(location.search).get("step");
+
+function goTo(next) {
+  const url = new URL(location.href);
+  url.searchParams.set("step", next);
+  location.replace(url.href);
+}
+
+if (step === null) {
+  goTo("authorize");
+} else if (step === "authorize") {
+  goTo("password");
+} else if (step === "password") {
+  result.textContent = "Enter the public fixture password";
+  form.hidden = false;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (password.value !== "atrium-i0-fixture") {
+      result.textContent = "Fixture password refused";
+      return;
+    }
+    password.value = "";
+    goTo("callback");
+  });
+} else if (step === "callback") {
+  result.textContent = "I0 fixture sign-in complete";
+} else {
+  result.textContent = "Unknown fixture step";
+}
+</script>
+</html>

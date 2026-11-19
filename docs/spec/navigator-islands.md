@@ -150,7 +150,11 @@ engine rather than in the document lane:
 Each step runs in the VM with a gate before the next, as the Navigator's other steps did.
 
 1. **I0. Two engines, measured side by side** (D1). Build **Servo** and **Ladybird** for
-   FreeBSD (amd64 and arm64), headless, JIT off, with their network and media layers stubbed.
+   FreeBSD (amd64 and arm64), using their embeddable engines, JIT off, with their network
+   and media layers stubbed. Use CPU frames for Fresco and Atrium's pinned fonts
+   (`navigator-fontset`). Desktop shells and their graphics or system font-discovery
+   stacks are outside the comparison. The qualifying run uses a real Atrium jail
+   with Capsicum entered and only the fixture broker and display capabilities.
    Load the same set in each:
    - the fixture site;
    - three corpus widgets (an Infogram chart, a map, the YouTube embed);
@@ -202,10 +206,12 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   cross-builds on the Mac (D3), as `.cargo/config.toml` already does for the rest of Atrium
   with clang and a FreeBSD sysroot:
   - The Rust crates cross-compile like ours.
-  - The risk is the C and C++ underneath. SpiderMonkey has its own build system, and Servo
-    links fontconfig, FreeType and HarfBuzz, which the sysroot must carry from FreeBSD's
-    packages. Ladybird uses CMake with vcpkg, which builds its dependencies (Skia among
-    them) and would need a FreeBSD toolchain file.
+  - The risk is the C and C++ underneath. SpiderMonkey has its own build system.
+    Servo's stock FreeBSD font backend depends on Fontconfig even when building the
+    embeddable library alone. Adapt its font enumeration and fallback to the pinned
+    font set before testing it. FreeType and HarfBuzz are separate font-processing
+    dependencies to assess at that boundary. Ladybird uses CMake with vcpkg and needs
+    a FreeBSD toolchain file and the equivalent font and CPU-frame integration.
   - Where a cross-build fails, that engine builds natively in the Mac VM instead, which is
     slower but sure.
 - **FreeBSD support.** Servo targets Linux, macOS, Windows and Android. FreeBSD may need
@@ -215,6 +221,22 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
   before we promise it.
 - **Real sites in gates.** I0 and I3 need the open internet in the VM. The hermetic fixture
   network covers I1 and I2.
+
+### I0 progress
+
+- Servo `c6a16079c28c` on the Mac with its pinned Rust 1.99.1 toolchain.
+  The stock `servoshell` FreeBSD arm64 cross-build stopped at the missing
+  `fontconfig.pc`. An embeddable `servo --lib` cross-build with default
+  features off, `bundled` enabled and the stock Atrium sysroot reproduced
+  the Fontconfig failure. No engine binary or runtime measurement resulted.
+  Servo exposes a `SoftwareRenderingContext` for a CPU rendering experiment.
+- The shared [scripted sign-in fixture](../../test-assets/navigator-i0/sign-in.html)
+  tests two navigations, a rejected public fixture password, and a successful
+  callback. Its script passed a local smoke check with mocked DOM and navigation.
+  The engine runs, JIT verification, and jail and Capsicum checks remain pending.
+- Next, try Servo's pinned-font adapter and software rendering path in the
+  arm64 library build. Then bring up the Ladybird engine for the same fixture
+  and containment checks. No engine choice has been made.
 
 ## 9. Decisions, with recommendations
 
