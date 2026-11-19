@@ -44,8 +44,14 @@ if [ "${BUILD:-1}" = 1 ]; then
     # C: a FreeBSD-targeting clang with the sysroot's headers.
     T=$(echo "$TARGET" | tr - _)
     if ! env | grep -q "^CC_$T="; then
-        export "CC_$T=$(command -v clang)" "CFLAGS_$T=--target=$TARGET --sysroot=${SYSROOT:-$HOME/atrium-vm/sysroot}" \
-               "AR_$T=$(command -v llvm-ar || command -v ar)"
+        # The macOS system ar can leave ring's FreeBSD object archive empty.
+        llvm=/opt/homebrew/opt/llvm/bin
+        if [ -x "$llvm/clang" ] && [ -x "$llvm/llvm-ar" ]; then
+            cc="$llvm/clang"; archiver="$llvm/llvm-ar"
+        else
+            cc=$(command -v clang); archiver=$(command -v llvm-ar || command -v ar)
+        fi
+        export "CC_$T=$cc" "CFLAGS_$T=--target=$TARGET --sysroot=${SYSROOT:-$HOME/atrium-vm/sysroot}" "AR_$T=$archiver"
     fi
     xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2); }
     xb frescod "--bin frescod --bin fresco-renderer"
@@ -76,7 +82,7 @@ g "mkdir -p /usr/local/share/fonts/ibm-plex"
 for f in "$ROOT"/fonts/ibm-plex/*.ttf "$ROOT"/fonts/phosphor/*.ttf; do
     g "test -f /usr/local/share/fonts/ibm-plex/$(basename "$f")" || put "$f" /usr/local/share/fonts/ibm-plex/
 done
-(cd "$ROOT/navigator-ui" && tar czf - fixtures) | g "rm -rf $D/fixtures; tar xzf - -C $D"
+(cd "$ROOT/navigator-ui" && COPYFILE_DISABLE=1 tar --no-xattrs -czf - fixtures) | g "rm -rf $D/fixtures; tar xzf - -C $D"
 
 echo "=== start"
 g "cd $S && env FRESCOD_SPLIT=1 FRESCOD_RENDERER=compute FRESCOD_RENDERER_LAUNCHER=unconfined FRESCOD_RENDERER_BIN=$D/fresco-renderer \
@@ -97,9 +103,9 @@ nd() { g "cd $S && env NAVIGATORD_SOCKET=$S/nav.sock NAVIGATORD_PAGE_SOCKET=$S/p
     NAVIGATORD_ACTIVATION=/var/run/atrium/fresco-activation.sock \
     NAVIGATORD_DOWNLOADS=$S/downloads NAVIGATORD_SCHEMES=mailto NAVIGATORD_MONSTRATOR=$S/mon.sock ${NDENV:-} \
     daemon -f -o $S/${1:-navigatord}.log $D/navigatord --unconfined-for-testing </dev/null"; }
-# A stand-in for Monstrator, the link opener (opening-links.md): keeps what
-# it was asked and never answers (the confined script runs the real one).
-g "rm -rf $S/downloads $S/mon.log $S/mon.sock; daemon -f -o $S/mon.log nc -lkU $S/mon.sock </dev/null"
+# Log each request to the Monstrator stand-in. Close the response side
+# on stdin EOF so one request cannot hold the listener through the next.
+g "rm -rf $S/downloads $S/mon.log $S/mon.sock; daemon -f -o $S/mon.log nc -lkNU $S/mon.sock </dev/null"
 nd
 sleep 10
 g "test -S $S/limend.sock && test -S $S/nav.sock" || { echo "ABORT: limend or navigatord did not start"; g "tail -5 $S/limend.log $S/navigatord.log"; exit 1; }

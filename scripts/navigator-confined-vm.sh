@@ -169,8 +169,14 @@ if [ "${BUILD:-1}" = 1 ]; then
     echo "=== cross-build"
     T=$(echo "$TARGET" | tr - _)
     if ! env | grep -q "^CC_$T="; then
-        export "CC_$T=$(command -v clang)" "CFLAGS_$T=--target=$TARGET --sysroot=${SYSROOT:-$HOME/atrium-vm/sysroot}" \
-               "AR_$T=$(command -v llvm-ar || command -v ar)"
+        # The macOS system ar can leave ring's FreeBSD object archive empty.
+        llvm=/opt/homebrew/opt/llvm/bin
+        if [ -x "$llvm/clang" ] && [ -x "$llvm/llvm-ar" ]; then
+            cc="$llvm/clang"; archiver="$llvm/llvm-ar"
+        else
+            cc=$(command -v clang); archiver=$(command -v llvm-ar || command -v ar)
+        fi
+        export "CC_$T=$cc" "CFLAGS_$T=--target=$TARGET --sysroot=${SYSROOT:-$HOME/atrium-vm/sysroot}" "AR_$T=$archiver"
     fi
     xb() { (cd "$ROOT/$1" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" $2) || die "build $1"; }
     # The whole portcullis workspace: deploy-portcullis.sh deploys only
@@ -649,7 +655,8 @@ inj "MOVE $((W - 40)) $((TOP + 41 + 22))"; sleep 3   # over Open
 shot confined-3-app-hover
 inj "MOVE 700 400"
 press $((W - 106)) $((TOP + 41 + 22))                  # Not now
-until_trace 'prompt=- ' || bad "the app row stayed: $(last)"
+until_trace 'prompt=- ' && g "grep -Fq 'prompt answered: Not now (OpenApp' $UL" \
+    && ok "Not now dismissed the app prompt" || bad "app dismissal: $(last); $(g "grep -F 'prompt answered:' $UL | tail -1")"
 press 270 $((TOP + 20)) >/dev/null 2>&1; press 270 $((TOP + 20)) >/dev/null 2>&1; true
 until_trace 'url=https://atlas.example/wiki/Atrium live=shown' || bad "back on Atrium: $(last)"
 press $((PX + 50)) $((TOP + PY + 64 + 20 + 120))

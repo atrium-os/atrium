@@ -816,6 +816,7 @@ impl Live {
                             changed = true;
                         }
                     }
+                    Some(ToParent::Thumbnail { .. }) => eprintln!("navigator-ui: dropped an unsolicited thumbnail from a page child"),
                     None => eprintln!("navigator-ui: dropped a malformed message from a page child"),
                 },
                 ParentEvent::ChildLost { .. } | ParentEvent::Detached { .. } => {
