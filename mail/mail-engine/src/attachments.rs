@@ -21,6 +21,30 @@ impl Engine {
         self.parser.attachment(&raw, which, key)?.ok_or(Error::NotFound)
     }
 
+    /// Capture the selected part and its session key on the engine thread.
+    /// Reading and normalizing a large attachment run on the export thread.
+    pub fn prepare_attachment_document(&self, msg: MsgId, which: Which)
+        -> Result<impl FnOnce() -> Result<mail_schema::Document, Error> + Send + 'static, Error> {
+        let m = self.store.message(msg)?;
+        let full = m.full.ok_or(Error::NotFound)?;
+        let key = if m.summary.encrypted { Some(self.content_key(msg).ok_or(Error::Refused("Unlock this message first"))?) } else { None };
+        let store = self.store.clone();
+        let parser = self.parser.clone();
+        Ok(move || {
+            let raw = store.blob(&full)?;
+            let len = raw.len() as u64;
+            let mut jail = parser.start()?;
+            mail_schema::write_frame(&mut jail.w, &mail_schema::ToJail::HtmlAttachment {
+                message: mail_schema::Raw { id: 1, bytes: raw }, which, key,
+            }).map_err(|e| Error::Jail(e.to_string()))?;
+            let frames = super::Parser::exchange(&mut jail, &|id| (id == 1).then_some(len), &|_| None)?;
+            match frames.into_iter().next() {
+                Some(mail_schema::FromJail::Opened { result: Ok(opened), .. }) => opened.document.ok_or(Error::NotFound),
+                _ => Err(Error::Refused("Could not convert the HTML attachment")),
+            }
+        })
+    }
+
     /// Take out `msg`'s attachment names and text for search (§11.2) and
     /// keep them; what was kept. Nothing when it has no attachments.
     pub fn index_files(&self, msg: MsgId) -> Result<Option<String>, Error> {

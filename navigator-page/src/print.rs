@@ -78,6 +78,32 @@ fn lu(v: U) -> i64 {
 /// `html` (normalized, with its `subs`) printed on `paper`. `picture`
 /// gives an image's bytes by content address.
 pub fn pdf(html: String, subs: Subresources, title: &str, paper: Paper, picture: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Printed, String> {
+    write_pdf(html, subs, title, paper, picture, false)
+}
+
+/// Write only passive paint items. The caller supplies freshly encoded pixels.
+pub fn sanitized_pdf(html: String, subs: Subresources, picture: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Printed, String> {
+    write_pdf(html, subs, "", Paper::new(595, 842), picture, true)
+}
+
+struct PdfBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for PdfBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit - self.bytes.len() {
+            return Err(std::io::Error::other("PDF exceeds size limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn write_pdf(html: String, subs: Subresources, title: &str, paper: Paper, picture: &dyn Fn(&str) -> Option<Vec<u8>>, passive: bool) -> Result<Printed, String> {
     let fonts = FontSet::shared()?;
     let (pw, ph, m) = (paper.w_pt, paper.h_pt, paper.margin_pt);
     if !(pw > 2.0 * m + 72.0 && ph > 2.0 * m + 72.0 && pw < 14400.0 && ph < 14400.0) {
@@ -148,12 +174,17 @@ pub fn pdf(html: String, subs: Subresources, title: &str, paper: Paper, picture:
         }
         breaks.push(y);
     }
-    let cut = breaks.len() > PAGES_MAX + 1;
+    let cut = !settled || *breaks.last().unwrap() < height;
+    if passive && cut { return Err("document exceeds layout limits".into()); }
+    if passive {
+        items.retain(|(_, _, item)| matches!(item, Item::Glyphs(_) | Item::Rect { .. } | Item::Path { .. } | Item::Image { .. }));
+    }
     breaks.truncate(PAGES_MAX + 1);
 
     let files = Faces(fonts);
     let pic = |i: u32| addresses.get(i as usize).and_then(|a| picture(a));
-    let mut out = Painted::new(Vec::new()).map_err(|e| e.to_string())?;
+    let limit = if passive { limen::doc_viewer::DOC_MAX as usize } else { usize::MAX };
+    let mut out = Painted::new(PdfBytes { bytes: Vec::new(), limit }).map_err(|e| e.to_string())?;
     let (mx, my) = ((m * 64.0) as i64, (m * 64.0) as i64);
     for w in breaks.windows(2) {
         let (y0, y1) = (w[0], w[1]);
@@ -165,7 +196,7 @@ pub fn pdf(html: String, subs: Subresources, title: &str, paper: Paper, picture:
         out.page(page, pw, ph, Some(clip), &files, &pic).map_err(|e| e.to_string())?;
     }
     let (pdf, stats) = out.finish(&files, title, "Atrium Navigator").map_err(|e| e.to_string())?;
-    Ok(Printed { pdf, pages: stats.pages, cut })
+    Ok(Printed { pdf: pdf.bytes, pages: stats.pages, cut })
 }
 
 /// An item moved by (`dx`, `dy`) layout units.
@@ -259,14 +290,11 @@ fn paint(scene: &Scene, own: &dyn Fn(U) -> bool, items: &mut Vec<(U, U, Item)>, 
                     continue;
                 }
                 lines.push((top, bottom));
-                let n = r.text.len() as u32;
                 let glyphs = r.glyphs.iter().enumerate().map(|(k, &(id, dx, dy))| PaintGlyph {
                     id,
                     x: lu(dx),
                     dy: lu(dy),
-                    // The run's text on its first glyph, so the PDF's text
-                    // can be found and copied.
-                    text: if k == 0 { 0..n } else { n..n },
+                    text: r.clusters[k].clone(),
                 }).collect();
                 let run = GlyphRun { face: r.face as u16, size: lu(r.size), color: rgb(r.rgba), x: lu(x), y: lu(y), glyphs, text: r.text.clone(), turn: None };
                 items.push((top, bottom, Item::Glyphs(run)));

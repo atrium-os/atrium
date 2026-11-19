@@ -531,16 +531,12 @@ doesn't run a spam classifier of its own in v1.
   separate copy through the picker. The recipient's own capabilities govern what it
   can do with the bytes after reading them.
 - **Content safety.** Type detection identifies a handler. A correctly identified PDF
-  can still contain hostile content. The current open path performs no malware scan
-  or content sanitization. The UI must not describe a recognized file as scanned or safe.
-- **Persona routing (required, pending).** Ordinary Open and Open with… must resolve
-  the receiving instance in Mail's persona, including when the handler must be started.
-  If that instance cannot receive the file, refuse delivery. Any explicit transfer to
-  another persona must follow the directional file-crossing policy in personas.md §6.
-  Today the attachment broker routes by owner and app ID. The FreeBSD VM check must
-  open a synthetic attachment from Work with a Personal instance of the same handler
-  already running, verify that the Work handler reads the expected bytes, and verify
-  that Personal receives no descriptor. Repeat with the Work handler already running.
+  can still contain hostile content. Ordinary Open and Open with… deliver the original bytes.
+  Mail performs no malware scan. The UI must not describe a recognized file as scanned or safe.
+- **Persona routing.** Portcullis resolves the caller's owner and persona from the
+  authenticated peer UID. It selects the document channel for that handler instance,
+  launching it in the same persona if needed. If delivery fails, Mail reports the
+  refusal. An explicit transfer across personas follows personas.md §6.
 - **Save** goes through Scrinium's picker (Save target, persona places only), with the
   origin written to `atrium.origin` ("mail: from priya@example.com, 2026-11-15") like a
   Navigator download.
@@ -549,13 +545,12 @@ doesn't run a spam classifier of its own in v1.
   Open and Open with…. Installation of a saved bundle follows the installer’s signature checks.
 - **Encrypted ZIPs and PDFs** ask for their password in Arca's field (Officina O7a's path).
 
-#### 8.2.1 Open sanitized copy (specified, pending implementation)
+#### 8.2.1 Open sanitized copy
 
 **What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
 type checks as `text/html`. The action produces a new PDF and opens it in the
 persona's PDF handler. Keep the original attachment in the message. For example,
-`invoice.html` produces `invoice-sanitized.pdf`. The chooser identifies the result
-as a PDF copy. V1 excludes standalone images (including SVG), plain text, PDFs,
+`invoice.html` produces `invoice-sanitized.pdf`. Mail shows the PDF filename while preparing it and opens the persona’s default PDF handler. V1 excludes standalone images (including SVG), plain text, PDFs,
 Office documents, archives, attached messages and all other types. HTML is the
 existing input shared by Mail's document pipeline and Navigator's page-print path.
 Preview support alone does not qualify another format.

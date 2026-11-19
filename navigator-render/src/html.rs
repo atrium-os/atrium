@@ -4478,7 +4478,7 @@ impl<'a> Cx<'a> {
                 let mw: U = pieces.iter().map(|p| p.width).sum();
                 let mut mx = if base_rtl { x + w + st.size / 2 } else { x - mw - st.size / 2 };
                 for piece in pieces {
-                    self.scene.run(Run { face: piece.face, size: st.size, rgba: st.rgba, x: mx, y: yy + base, em: st.em, glyphs: piece.glyphs, text: piece.text });
+                    self.scene.run(Run { face: piece.face, size: st.size, rgba: st.rgba, x: mx, y: yy + base, em: st.em, glyphs: piece.glyphs, clusters: piece.clusters, text: piece.text });
                     mx += piece.width;
                 }
             }
@@ -4531,7 +4531,7 @@ impl<'a> Cx<'a> {
                 let order: Vec<&crate::Piece> = if p.level % 2 == 1 { p.pieces.iter().rev().collect() } else { p.pieces.iter().collect() };
                 for piece in order {
                     self.scene.run(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: yy + base, em: p.st.em,
-                                         glyphs: piece.glyphs.clone(), text: piece.text.clone() });
+                                         glyphs: piece.glyphs.clone(), clusters: piece.clusters.clone(), text: piece.text.clone() });
                     px += piece.width;
                 }
                 let thick = (p.st.size / 16).max(PX);

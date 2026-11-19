@@ -656,6 +656,13 @@ mod print_tests {
         }
         let text = String::from_utf8_lossy(&out.pdf);
         assert!(text.contains("/FontFile2") && text.contains("/URI"), "a face embedded and the link kept");
+        let passive = print::sanitized_pdf(p.html.clone(), p.subs.clone(), &|_| None).unwrap();
+        let bytes = String::from_utf8_lossy(&passive.pdf);
+        assert_eq!(passive.pages, out.pages);
+        assert!(bytes.contains("/FontFile2"));
+        for forbidden in ["/URI", "/Annots", "/AcroForm", "/EmbeddedFiles", "/JavaScript", "atlas.example"] {
+            assert!(!bytes.contains(forbidden), "passive PDF contains {forbidden}");
+        }
         // Letter is wider: fewer pages.
         let letter = print::pdf(p.html.clone(), p.subs.clone(), &p.title, print::Paper::new(612, 792), &|_| None).unwrap();
         assert!(letter.pages <= out.pages + 1);

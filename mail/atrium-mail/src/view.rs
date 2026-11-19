@@ -291,6 +291,7 @@ pub struct FileAsk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAct {
+    Sanitize { activation: [u8; 16] },
     /// Show it in a viewer in [`LOOK_SLOT`].
     Look,
     /// Open in its app (the person's default, or `app`: Open with…), with
@@ -1330,6 +1331,16 @@ impl Mail {
             return;
         };
         self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Open { activation, app: None } });
+    }
+
+    pub fn sanitize_file(&self, k: usize, i: usize, activation: Option<[u8; 16]>) {
+        let Some((msg, file)) = self.file_at(k, i) else { return };
+        if !file.can_open || file.mime != Some("text/html") { return; }
+        let Some(activation) = activation else {
+            self.file_note("Open sanitized copy needs a press.".into());
+            return;
+        };
+        self.asks.borrow_mut().push(FileAsk { msg, file, act: FileAct::Sanitize { activation } });
     }
 
     /// Open with… (§8.2): ask which apps open it; the choices show when
@@ -4684,6 +4695,10 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             button(ctx, "Save", Box::new(move || mm.save_file(k, i)));
             if f.can_open {
                 let mm = mail.clone();
+                if f.mime == Some("text/html") {
+                    let m = mail.clone();
+                    button(ctx, "Open sanitized copy", Box::new(move || m.sanitize_file(k, i, pergola::clipboard::current_activation())));
+                }
                 button(ctx, "Open with…", Box::new(move || mm.ask_open_with(k, i)));
                 let mm = mail.clone();
                 button(ctx, "Open", Box::new(move || mm.open_file(k, i, pergola::clipboard::current_activation())));

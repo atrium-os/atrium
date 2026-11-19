@@ -562,6 +562,8 @@ fn attachments_show_what_they_are_and_quick_look_text() {
     let mut app = App::new_with_flag(view, dirty);
     app.tick();
     mail.open(0);
+    mail.sanitize_file(0, 0, Some([1; 16]));
+    assert!(mail.take_file_asks().is_empty(), "CSV is ineligible for a sanitized PDF");
     app.tick();
     let t = texts(&app);
     for s in ["q4.csv", "invoice.pdf", "report.pdf", "Quick look", "Save"] {

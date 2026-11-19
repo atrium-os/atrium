@@ -32,6 +32,7 @@ use pergola::window::StepResult;
 use pergola::{App, SizeSpec, Window, WindowDesc};
 
 mod thumbnails;
+mod sanitized;
 
 fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -414,6 +415,9 @@ fn main() {
     // The quick look viewer: which attachment it shows.
     let mut looked: Option<(u64, mail_schema::Which, limen::proto::EmbedId)> = None;
     // What became of Open and Save, from their threads.
+    let (copy_tx, copy_results) = mpsc::channel();
+    let mut converting = false;
+    let mut retry_copy = None;
     let (file_done_tx, file_done) = mpsc::channel::<String>();
     // Open with…: the apps for an attachment, by its name.
     let (apps_tx, apps_done) = mpsc::channel::<(String, Result<Vec<(String, String, bool)>, String>)>();
@@ -721,6 +725,11 @@ fn main() {
         while let Ok((name, apps)) = apps_done.try_recv() {
             mail.open_with_apps(&name, apps);
         }
+        if let Ok((retry, note)) = copy_results.try_recv() {
+            converting = false;
+            retry_copy = retry;
+            mail.file_note(note);
+        }
         while let Ok(note) = file_done.try_recv() {
             mail.file_note(note);
         }
@@ -747,6 +756,38 @@ fn main() {
             match ask.act {
                 // The viewer follows `looking()` below.
                 FileAct::Look => {}
+                FileAct::Sanitize { activation } => {
+                    if converting { mail.file_note("Preparing a PDF copy…".into()); continue; }
+                    let Some(token) = win.embed_token() else { mail.file_note("Document viewer unavailable".into()); continue; };
+                    let key = (ask.msg, ask.file.which.clone());
+                    let ready = retry_copy.take().filter(|(k, _)| k == &key).map(|(_, fd)| fd);
+                    let doc = if ready.is_none() {
+                        match engine.prepare_attachment_document(ask.msg, ask.file.which.clone()) {
+                            Ok(doc) => Some(doc),
+                            Err(e) => { mail.file_note(format!("Could not convert attachment: {e}")); continue; }
+                        }
+                    } else { None };
+                    let stem = std::path::Path::new(&ask.file.name).file_stem().and_then(|s| s.to_str()).unwrap_or("attachment");
+                    let name = format!("{stem}-sanitized.pdf");
+                    converting = true;
+                    mail.file_note(format!("Preparing {name}…"));
+                    let tx = copy_tx.clone();
+                    std::thread::spawn(move || {
+                        let pdf = match (ready, doc) {
+                            (Some(fd), _) => Ok(fd),
+                            (_, Some(prepare)) => prepare().map_err(|e| e.to_string()).and_then(|doc| sanitized::render(doc, token)),
+                            _ => Err("Missing document".into()),
+                        };
+                        let result = match pdf {
+                            Ok(fd) => match atrium_mail::files::open_in_app(&name, activation, &fd, None) {
+                                Ok(app) => (None, format!("Opened {name} in {app}")),
+                                Err(e) => (Some((key, fd)), format!("{name}: {e}. Press Open sanitized copy to retry.")),
+                            },
+                            Err(e) => (None, format!("Could not create {name}: {e}")),
+                        };
+                        let _ = tx.send(result);
+                    });
+                }
                 FileAct::Apps => {
                     let (tx, name, mime) = (apps_tx.clone(), ask.file.name.clone(), ask.file.mime.unwrap_or_default());
                     std::thread::spawn(move || {

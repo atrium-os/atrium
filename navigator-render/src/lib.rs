@@ -78,6 +78,8 @@ pub struct Run {
     pub em: bool,
     /// (glyph id, dx, dy) relative to (x, y).
     pub glyphs: Vec<(u16, U, U)>,
+    /// Source UTF-8 cluster of each glyph, for searchable document export.
+    pub clusters: Vec<std::ops::Range<u32>>,
     pub text: String,
 }
 
@@ -391,7 +393,7 @@ pub(crate) type ShapeCache = std::rc::Rc<std::cell::RefCell<std::collections::Ha
 type Shaped = (u16, i32, i32, i32, u32);
 
 /// A shaped piece of one face: glyphs positioned from its own origin.
-pub(crate) struct Piece { pub(crate) face: usize, pub(crate) glyphs: Vec<(u16, U, U)>, pub(crate) width: U, pub(crate) text: String }
+pub(crate) struct Piece { pub(crate) face: usize, pub(crate) glyphs: Vec<(u16, U, U)>, pub(crate) width: U, pub(crate) text: String, pub(crate) clusters: Vec<std::ops::Range<u32>> }
 
 impl<'a> Shaper<'a> {
     pub(crate) fn new(fonts: &'a FontSet) -> Self {
@@ -454,7 +456,21 @@ impl<'a> Shaper<'a> {
                 extra += st.ls;
                 if s.as_bytes().get(cluster as usize) == Some(&b' ') { extra += st.ws }
             }
-            Piece { face, glyphs, width: scale(pen, st.size, upem) + extra, text: s }
+            // HarfBuzz clusters may run in descending order in RTL text.
+            let mut ends: Vec<_> = shaped.iter().map(|g| g.4).collect();
+            ends.push(s.len() as u32);
+            ends.sort_unstable();
+            ends.dedup();
+            let mut previous = None;
+            let clusters = shaped.iter().map(|g| {
+                let start = g.4;
+                let end = if previous == Some(start) { start } else {
+                    ends[ends.partition_point(|&n| n <= start)]
+                };
+                previous = Some(start);
+                start..end
+            }).collect();
+            Piece { face, glyphs, clusters, width: scale(pen, st.size, upem) + extra, text: s }
         }).collect()
     }
 
@@ -646,7 +662,7 @@ impl<'a> Layout<'a> {
             let mut x = self.left() + pad;
             for p in self.sh.shape(line, &st, &mut self.report) {
                 let w = p.width;
-                self.scene.run(Run { face: p.face, size: st.size, rgba: st.rgba, x, y: y + asc, em: false, glyphs: p.glyphs, text: p.text });
+                self.scene.run(Run { face: p.face, size: st.size, rgba: st.rgba, x, y: y + asc, em: false, glyphs: p.glyphs, clusters: p.clusters, text: p.text });
                 x += w;
             }
             if x > self.left() + self.avail() { self.report.overflow_lines += 1 }
@@ -733,7 +749,7 @@ fn flow(sh: &Shaper, atoms: &[Atom], left: U, avail: U, mut y: U, marker: Option
                 let ps = sh.shape(m, &Style { link: None, rgba: TEXT, ..st.clone() }, report);
                 let mw: U = ps.iter().map(|p| p.width).sum();
                 let mut mx = left - mw - 8 * PX;
-                for p in ps { let w = p.width; scene.run(Run { face: p.face, size: st.size, rgba: TEXT, x: mx, y: base, em: false, glyphs: p.glyphs, text: p.text }); mx += w }
+                for p in ps { let w = p.width; scene.run(Run { face: p.face, size: st.size, rgba: TEXT, x: mx, y: base, em: false, glyphs: p.glyphs, clusters: p.clusters, text: p.text }); mx += w }
             }
             first = false;
         }
@@ -747,13 +763,15 @@ fn flow(sh: &Shaper, atoms: &[Atom], left: U, avail: U, mut y: U, marker: Option
                 let same = cur.as_ref().is_some_and(|r| r.face == piece.face && r.size == p.st.size && r.rgba == p.st.rgba && r.em == p.st.em);
                 if !same {
                     if let Some(r) = cur.take() { scene.run(r) }
-                    cur = Some(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: base, em: p.st.em, glyphs: vec![], text: String::new() });
+                    cur = Some(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: base, em: p.st.em, glyphs: vec![], clusters: vec![], text: String::new() });
                 } else if let Some(r) = cur.as_mut() {
                     // A gap between words inside one run is a space in its text.
                     if !r.text.is_empty() && !r.text.ends_with(' ') && px > run_end(r) { r.text.push(' ') }
                 }
                 let r = cur.as_mut().expect("run");
                 for &(g, dx, dy) in &piece.glyphs { r.glyphs.push((g, px - r.x + dx, dy)) }
+                let offset = r.text.len() as u32;
+                r.clusters.extend(piece.clusters.iter().map(|c| c.start + offset..c.end + offset));
                 r.text.push_str(&piece.text);
                 px += piece.width;
             }

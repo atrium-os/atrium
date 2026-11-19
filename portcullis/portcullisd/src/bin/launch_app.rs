@@ -62,10 +62,13 @@ fn main() {
     eprintln!("launch: manifest verified (trusted publisher) for {app_id}");
 
     // 2. ALLOCATE a dedicated uid; 3. REGISTER the binding.
+    let guard = portcullis_peer::lock_registry(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_else(|e| { eprintln!("launch: lock registry: {e}"); exit(1) });
     let uid = portcullis_peer::allocate(portcullis_peer::DEFAULT_REGISTRY);
     if let Err(e) = portcullis_peer::register_with_publisher(portcullis_peer::DEFAULT_REGISTRY, uid, owner, app_id, publisher.as_ref()) {
         eprintln!("launch: register uid {uid}: {e}"); exit(1);
     }
+    drop(guard);
     eprintln!("launch: allocated uid {uid} for {app_id} (owner {owner}); registered");
 
     // 4. EXEC the app jailed at that uid (jaild jails + drops to it).

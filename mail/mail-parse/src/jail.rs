@@ -79,6 +79,20 @@ pub fn serve(r: impl Read, w: impl Write, fonts: &html::FontSet) -> io::Result<(
                 };
                 port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
             }
+            wire::ToJail::HtmlAttachment { message, which, key } => {
+                let inner = key.as_deref().map(|k| decrypted(&message.bytes, k));
+                let raw = match &inner { None => Some(message.bytes.as_slice()), Some(bytes) => bytes.as_deref() };
+                let result = raw.ok_or(wire::Refusal::NotMail).and_then(|raw| {
+                    let s = crate::parse(raw, &Limits::default()).map_err(refusal)?;
+                    let (bytes, charset) = attachment_bytes(raw, &s, &which)?;
+                    if bytes.len() > 4 << 20 { return Err(wire::Refusal::TooLarge); }
+                    let (html, _) = crate::decode::to_utf8(&bytes, charset.as_deref());
+                    let document = document(raw, &s, &html, &BTreeMap::new(), fonts);
+                    Ok(wire::Opened { document: Some(document), summary: Default::default(),
+                        attachments: Vec::new(), card: None, pgp: None, pgp_encrypted: false })
+                });
+                port.borrow_mut().send(&wire::FromJail::Opened { id: message.id, result })?;
+            }
             wire::ToJail::Attachment { message, which, key } => {
                 let result = match key.as_deref().map(|k| decrypted(&message.bytes, k)) {
                     None => attachment(&message.bytes, &which),
@@ -336,43 +350,45 @@ fn own_pictures(raw: &[u8], s: &crate::Summary, resources: &[html::Resource]) ->
     out
 }
 
+fn document(raw: &[u8], s: &crate::Summary, h: &str, loaded: &BTreeMap<String, (u32, u32)>, fonts: &html::FontSet) -> wire::Document {
+    let env = html::Env::default();
+    let mut c = html::convert(h, loaded, fonts, &env);
+    let pictures = own_pictures(raw, s, &c.resources);
+    // Their real sizes, from their headers, so the space is right the
+    // first time: converted again only when one wasn't declared.
+    let mut sized = loaded.clone();
+    for (id, b) in &pictures {
+        if !sized.contains_key(id) {
+            if let Ok((_, w, h)) = navigator_image::image::natural_size(b) {
+                sized.insert(id.clone(), (w, h));
+            }
+        }
+    }
+    if sized.len() > loaded.len() {
+        c = html::convert(h, &sized, fonts, &env);
+    }
+    wire::Document {
+        pictures,
+        html: c.document,
+        resources: c.resources.into_iter().map(|r| wire::Resource {
+            id: r.id,
+            source: match r.source {
+                html::Source::Cid(s) => wire::Source::Cid(s),
+                html::Source::Remote(s) => wire::Source::Remote(s),
+                html::Source::Data(s) => wire::Source::Data(s),
+            },
+            used_as: match r.used_as { html::Use::Image => wire::Use::Image, html::Use::Background => wire::Use::Background, html::Use::Other => wire::Use::Other },
+            hidden: r.hidden,
+        }).collect(),
+        links: c.links,
+        dropped: c.dropped.into_iter().take(256).map(|(k, v)| (k.chars().take(1024).collect(), v.min(u32::MAX as usize) as u32)).collect(),
+    }
+}
+
 fn open<R: Read, W: Write>(raw: &[u8], ctx: &Ctx, port: &RefCell<Port<R, W>>, loaded: &BTreeMap<String, (u32, u32)>,
                            fonts: &html::FontSet) -> Result<wire::Opened, wire::Refusal> {
     let (summary, s) = summarize(raw, ctx, port)?;
-    let document = s.html.as_deref().map(|h| {
-        let env = html::Env::default();
-        let mut c = html::convert(h, loaded, fonts, &env);
-        let pictures = own_pictures(raw, &s, &c.resources);
-        // Their real sizes, from their headers, so the space is right the
-        // first time: converted again only when one wasn't declared.
-        let mut sized = loaded.clone();
-        for (id, b) in &pictures {
-            if !sized.contains_key(id) {
-                if let Ok((_, w, h)) = navigator_image::image::natural_size(b) {
-                    sized.insert(id.clone(), (w, h));
-                }
-            }
-        }
-        if sized.len() > loaded.len() {
-            c = html::convert(h, &sized, fonts, &env);
-        }
-        wire::Document {
-            pictures,
-            html: c.document,
-            resources: c.resources.into_iter().map(|r| wire::Resource {
-                id: r.id,
-                source: match r.source {
-                    html::Source::Cid(s) => wire::Source::Cid(s),
-                    html::Source::Remote(s) => wire::Source::Remote(s),
-                    html::Source::Data(s) => wire::Source::Data(s),
-                },
-                used_as: match r.used_as { html::Use::Image => wire::Use::Image, html::Use::Background => wire::Use::Background, html::Use::Other => wire::Use::Other },
-                hidden: r.hidden,
-            }).collect(),
-            links: c.links,
-            dropped: c.dropped.into_iter().take(256).map(|(k, v)| (k.chars().take(1024).collect(), v.min(u32::MAX as usize) as u32)).collect(),
-        }
-    });
+    let document = s.html.as_deref().map(|h| document(raw, &s, h, loaded, fonts));
     let shown: Vec<&str> = document.as_ref().map_or(Vec::new(), |d| d.resources.iter().filter_map(|r| match &r.source {
         wire::Source::Cid(c) if !r.hidden => Some(c.as_str()),
         _ => None,
@@ -448,15 +464,19 @@ fn attachments(raw: &[u8], s: &crate::Summary, shown: &[&str]) -> Vec<wire::Atta
 /// One attachment's bytes, and its text for search.
 fn attachment(raw: &[u8], which: &wire::Which) -> Result<wire::Attached, wire::Refusal> {
     let s = crate::parse(raw, &Limits::default()).map_err(refusal)?;
-    let (bytes, charset) = match which {
+    let (bytes, charset) = attachment_bytes(raw, &s, which)?;
+    let text = text_of(&bytes, charset.as_deref());
+    Ok(wire::Attached { bytes, text })
+}
+
+fn attachment_bytes(raw: &[u8], s: &crate::Summary, which: &wire::Which) -> Result<(Vec<u8>, Option<String>), wire::Refusal> {
+    Ok(match which {
         wire::Which::Part(path) => {
             let p = s.parts.iter().find(|p| p.path == *path && p.kind != mime::PartKind::Multipart).ok_or(wire::Refusal::NotMail)?;
             (mime::part_bytes(raw, p), p.charset.clone())
         }
-        wire::Which::Unpacked(n) => (unpacked(raw, &s).into_iter().nth(*n as usize).ok_or(wire::Refusal::NotMail)?.1.data, None),
-    };
-    let text = text_of(&bytes, charset.as_deref());
-    Ok(wire::Attached { bytes, text })
+        wire::Which::Unpacked(n) => (unpacked(raw, s).into_iter().nth(*n as usize).ok_or(wire::Refusal::NotMail)?.1.data, None),
+    })
 }
 
 /// An attachment's text, when it is text (UTF-8 or its declared charset,

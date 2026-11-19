@@ -350,3 +350,29 @@ MIME-Version: 1.0\r\nContent-Type: multipart/signed; micalg=pgp-sha256; protocol
     assert_eq!(open(&mut e, vec![key], lf).state, wire::PgpState::Valid);
     e.finish();
 }
+
+#[test]
+fn sanitized_copy_rejects_oversize_html_and_supplies_only_local_resources() {
+    let mut engine = Engine::start();
+    let raw = |html: &str| format!("From: a@example.com\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/html\r\nContent-Disposition: attachment; filename=invoice.html\r\n\r\n{html}\r\n--B--\r\n").into_bytes();
+    let html = "<html><body>Invoice <img src='https://remote.example/pixel'><script>doSomething()</script></body></html>";
+    let bytes = raw(html);
+    engine.send(&ToJail::Open { authserv_id: None, me: vec![], now: 0, roots: vec![], key: None, message: wire::Raw { id: 1, bytes: bytes.clone() }, loaded: vec![], pgp_keys: vec![] });
+    let out = engine.run(bytes.len() as u64, &|_| None);
+    let FromJail::Opened { result: Ok(o), .. } = &out[0] else { panic!("missing attachment") };
+    let which = o.attachments[0].which.clone();
+    let mut export = |bytes: Vec<u8>| {
+        let len = bytes.len();
+        engine.send(&ToJail::HtmlAttachment { message: wire::Raw { id: 2, bytes }, which: which.clone(), key: None });
+        engine.run(len as u64, &|_| panic!("unexpected query"))
+    };
+    let result = export(bytes);
+    let FromJail::Opened { result: Ok(o), .. } = &result[0] else { panic!("conversion failed") };
+    let doc = o.document.as_ref().unwrap();
+    assert!(doc.html.contains("Invoice"));
+    assert!(doc.pictures.is_empty());
+    assert!(!doc.html.contains("remote.example") && !doc.html.contains("doSomething"));
+    let result = export(raw(&"a".repeat((4 << 20) + 1)));
+    assert!(matches!(&result[..], [FromJail::Opened { result: Err(wire::Refusal::TooLarge), .. }]));
+    engine.finish();
+}

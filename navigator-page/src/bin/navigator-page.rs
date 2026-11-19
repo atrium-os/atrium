@@ -313,7 +313,7 @@ impl Run {
     /// size or measure changes; otherwise the same document px.
     /// The page shown printed on paper `w` × `h` points (navigator-ui.md
     /// "Printing"), handed to the parent as a sealed PDF.
-    fn print(&mut self, out: &mut LimenOut, w: u32, h: u32, margin: u32) {
+    fn print(&mut self, out: &mut LimenOut, w: u32, h: u32, margin: u32, passive: bool) {
         let Some(p) = self.view.page.get_cloned() else {
             eprintln!("navigator-page: nothing to print");
             out.send(ToParent::Error { code: error::PRINT_FAILED });
@@ -322,7 +322,37 @@ impl Run {
         let t = Instant::now();
         let paper = navigator_page::print::Paper { w_pt: w as f64, h_pt: h as f64, margin_pt: margin as f64 };
         let images = p.images.clone();
-        let r = navigator_page::print::pdf(p.prepared.html.clone(), p.prepared.subs.clone(), &p.prepared.title, paper, &|a| images.encoded.get(a).cloned())
+        let r = if passive {
+            // Build a fresh image stream for each local resource. Original
+            // compressed data and metadata never reach the PDF writer.
+            let mut pictures = std::collections::HashMap::new();
+            let mut total = 0;
+            for address in images.encoded.keys() {
+                let Some(image) = images.get(address) else {
+                    out.send(ToParent::Error { code: error::PRINT_FAILED });
+                    return;
+                };
+                let mut bytes = Vec::new();
+                let image = image.data();
+                let mut encoder = png::Encoder::new(&mut bytes, image.width, image.height);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                if encoder.write_header().and_then(|mut w| w.write_image_data(&image.rgba)).is_err() {
+                    out.send(ToParent::Error { code: error::PRINT_FAILED });
+                    return;
+                }
+                total += bytes.len();
+                if total as u64 > limen::doc_viewer::DOC_MAX {
+                    out.send(ToParent::Error { code: error::PRINT_FAILED });
+                    return;
+                }
+                pictures.insert(address.as_str(), bytes);
+            }
+            navigator_page::print::sanitized_pdf(p.prepared.html.clone(), p.prepared.subs.clone(), &|a| pictures.get(a).cloned())
+
+        } else {
+            navigator_page::print::pdf(p.prepared.html.clone(), p.prepared.subs.clone(), &p.prepared.title, paper, &|a| images.encoded.get(a).cloned())
+        }
             .and_then(|pr| limen::fdpass::sealed_file("page.pdf", &pr.pdf).map(|fd| (pr, fd)).map_err(|e| e.to_string()));
         match r {
             Ok((pr, fd)) => {
@@ -684,7 +714,8 @@ fn embedded() {
                     Some(ToChild::ScrollTo { anchor }) => run.scroll_to(&anchor),
                     Some(ToChild::Load { .. } | ToChild::MakeThumbnail) => out.send(ToParent::Error { code: error::NO_DOCUMENT }),
                     Some(ToChild::Provide { .. }) => eprintln!("navigator-page: a picture came without its bytes"),
-                    Some(ToChild::Print { w_pt, h_pt, margin_pt }) => run.print(&mut out, w_pt, h_pt, margin_pt),
+                    Some(ToChild::Print { w_pt, h_pt, margin_pt }) => run.print(&mut out, w_pt, h_pt, margin_pt, false),
+                    Some(ToChild::SanitizedPdf) => run.print(&mut out, 595, 842, 42, true),
                     Some(ToChild::Park) => {
                         let y = run.view.scroll.get_cloned().physics.y as f32;
                         let y = if y.is_finite() { y.clamp(0.0, limen::doc_viewer::SCROLL_MAX) } else { 0.0 };

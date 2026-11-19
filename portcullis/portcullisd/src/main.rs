@@ -1733,8 +1733,9 @@ fn handle_open_attachment(
         eprintln!("portcullisd: attachment REFUSED to uid {uid}: {why}");
         write_response(w, &Response::Error { message: why })
     };
-    let caller = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-        .unwrap_or_default().resolve(uid).map(|(_, a)| a.to_string());
+    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let persona = registry.persona(uid).flatten();
+    let caller = registry.resolve(uid).map(|(_, a)| a.to_string());
     if !caller.as_deref().is_some_and(launch::app_opens_attachments) {
         return refuse(writer, format!("cap.open_attachments.denied: {} may not open attachments",
                                       caller.as_deref().unwrap_or("a process that is not a launched app")));
@@ -1782,12 +1783,13 @@ fn handle_open_attachment(
         return refuse(writer, why);
     }
     let hub = Hub::global();
-    if let Err(e) = hub.listen(&app) {
+    let channel = opens::channel_key(&app, persona);
+    if let Err(e) = hub.listen(&channel) {
         return refuse(writer, format!("{app}'s document channel: {e}"));
     }
-    match hub.deliver(owner, &app, name, t.mime, false, fd) {
+    match hub.deliver(owner, &channel, name, t.mime, false, fd) {
         Ok(Delivery::Sent) => {}
-        Ok(Delivery::Queued) => start_for(&app, owner, "to open an attachment"),
+        Ok(Delivery::Queued) => start_for_instance(&app, persona, owner, "to open an attachment"),
         Err(e) => return refuse(writer, e.to_string()),
     }
     eprintln!("portcullisd: attachment “{name}” ({}) opened in {app} for {owner}", t.mime);
@@ -3537,12 +3539,22 @@ fn launch_session_component(component_id: &str, owner_name: &str,
     // app installed under the bar's id never gets it). A binding from before
     // the mark is not reused: the component gets a fresh, marked uid.
     let app_id = manifest.app_id.clone().unwrap_or_else(|| component_id.to_string());
-    let owner_uid = portcullis_peer::uid_for_session(reg, owner_name, &app_id)
-        .unwrap_or_else(|| {
-            let u = portcullis_peer::allocate(reg);
-            let _ = portcullis_peer::register_session(reg, u, owner_name, &app_id);
-            u
-        });
+    let owner_uid = {
+        let _guard = match portcullis_peer::lock_registry(reg) {
+            Ok(lock) => lock,
+            Err(e) => return Response::Error { message: format!("session registry: {e}") },
+        };
+        match portcullis_peer::uid_for_session(reg, owner_name, &app_id) {
+            Some(uid) => uid,
+            None => {
+                let uid = portcullis_peer::allocate(reg);
+                if let Err(e) = portcullis_peer::register_session(reg, uid, owner_name, &app_id) {
+                    return Response::Error { message: format!("register session uid: {e}") };
+                }
+                uid
+            }
+        }
+    };
     if let Some(exec) = create.exec.as_mut() {
         exec.uid = owner_uid;
         exec.gid = owner_uid;

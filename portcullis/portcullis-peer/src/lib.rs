@@ -25,6 +25,14 @@ pub const DEFAULT_REGISTRY: &str = "/var/run/atrium/app-registry";
 /// reserved app sub-range, well above typical human uids.
 pub const APP_UID_BASE: u32 = 50_000;
 
+/// Hold across lookup, allocation and registration. Independent launchers
+/// share this file, so a process-local mutex cannot protect the UID binding.
+pub fn lock_registry(path: &str) -> io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().append(true).create(true).open(format!("{path}.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
 /// Allocate a dedicated uid for a new app launch: the lowest uid ≥
 /// [`APP_UID_BASE`] that is neither bound in the registry nor already a host
 /// account other than an app account. Portcullis calls this, then

@@ -91,6 +91,8 @@ pub enum ToChild {
     Print { w_pt: u32, h_pt: u32, margin_pt: u32 },
     /// An image on a sealed descriptor. The child may stay unplaced.
     MakeThumbnail,
+    /// Produce a passive PDF from a normalized HTML document.
+    SanitizedPdf,
 }
 
 /// The most pictures one document is given, and the most bytes in all.
@@ -284,7 +286,7 @@ impl ToChild {
             ToChild::Open { scroll, reading, .. } => scroll_ok(*scroll) && reading.ok(),
             ToChild::SetReading { reading } => reading.ok(),
             ToChild::Find { query, step } => clean_text(query, QUERY_MAX) && (-1..=1).contains(step),
-            ToChild::Park | ToChild::MakeThumbnail => true,
+            ToChild::Park | ToChild::MakeThumbnail | ToChild::SanitizedPdf => true,
             ToChild::Provide { id } => !id.is_empty() && clean_text(id, ANCHOR_MAX),
             ToChild::Print { w_pt, h_pt, margin_pt } => {
                 let r = PRINT_PT_MIN..=PRINT_PT_MAX;

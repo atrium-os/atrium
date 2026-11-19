@@ -946,6 +946,7 @@ pub fn resolve_instance_uid(owner: &str, app_id: &str, publisher: Option<&[u8; 3
     if let Some(dir) = Path::new(reg).parent() {
         let _ = fs::create_dir_all(dir);
     }
+    let _guard = portcullis_peer::lock_registry(reg).map_err(|e| fail(e.to_string()))?;
     /* Reuse only a binding with the SAME publisher: an app id re-installed under
      * another publisher's key is another app (arca.md §4.1) and gets a new uid. */
     let uid = match portcullis_peer::uid_for_app_instance(reg, owner, app_id, publisher, persona) {

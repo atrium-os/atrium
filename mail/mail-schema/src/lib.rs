@@ -92,6 +92,7 @@ pub enum ToJail {
     /// message is for, and the content key wrapped for it, to be unwrapped
     /// by whoever holds that key. The answer is [`FromJail::KeyFor`].
     KeyFor { message: Raw, certs: Vec<Vec<u8>> },
+    HtmlAttachment { message: Raw, which: Which, key: Option<Vec<u8>> },
 }
 
 /// Most of the person's certificates sent with a [`ToJail::KeyFor`].

@@ -34,8 +34,9 @@ blake3 = { version = "1", features = ["pure"] }
 officina-pdf = { path = "../officina-pdf" }
 officina-text = { path = "../officina-text" }
 
-[dev-dependencies]
 png = "0.17"
+
+[dev-dependencies]
 # examples/sign-in-probe.rs
 url = "2"
 
