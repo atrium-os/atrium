@@ -3995,7 +3995,7 @@ impl MailView {
         let Some(s) = &ui.reading else {
             if ui.count > 0 {
                 let msg = "Choose a message to read";
-                text(ctx, x0 + (w - width(msg, type_size::SM, Weight::Regular)) / 2.0, h / 2.0, msg, type_size::SM, Weight::Regular, t.text_tertiary());
+                text(ctx, x0 + (w - width(msg, type_size::SM, Weight::Regular)) / 2.0, h / 2.0, msg, type_size::SM, Weight::Regular, t.text_secondary());
             }
             return;
         };
