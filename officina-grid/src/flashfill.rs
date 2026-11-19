@@ -1,6 +1,7 @@
 //! Flash Fill: a column filled by example. From the cells typed in a column
 //! beside some data, learn how each was made from the cells beside it (words
-//! of them, their first letters, whole cells, in another case, with fixed
+//! of them, their first letters, whole cells, in another case, reformatted
+//! numbers, with fixed
 //! text between) and fill the column's empty cells the same way.
 //!
 //! The learning is a search over short programs of pieces, checked against
@@ -9,6 +10,7 @@
 
 use crate::addr::{CellAddr, MAX_COLS, MAX_ROWS};
 use crate::book::Workbook;
+use crate::numfmt::NumFmt;
 use crate::ops::GridOp;
 use crate::value::Value;
 
@@ -32,7 +34,7 @@ enum Case {
 }
 
 /// One piece of an output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Piece {
     /// Fixed text.
     Text(String),
@@ -45,6 +47,8 @@ enum Piece {
     /// The first or last `.1` characters of source cell `.0`.
     Left(usize, usize, Case),
     Right(usize, usize, Case),
+    /// Render a numeric source using an inferred spreadsheet format.
+    Number(usize, NumFmt),
 }
 
 /// Characters taken from the start or end of a word or cell, at most.
@@ -108,9 +112,60 @@ fn word(src: &str, i: i32) -> Option<&str> {
     ws.get(k).map(|&(a, b)| &src[a..b])
 }
 
+/// Infer the format of a decimal token at the start of an example fragment.
+fn number_format(rest: &str) -> Option<String> {
+    let digits = rest.strip_prefix('-').unwrap_or(rest);
+    let end = digits.bytes().take_while(|b| b.is_ascii_digit() || matches!(b, b',' | b'.')).count();
+    let token = digits[..end].trim_end_matches([',', '.']);
+    let (integer, fraction) = token.split_once('.').unwrap_or((token, ""));
+    if integer.is_empty() || fraction.len() > 12 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut groups = integer.split(',');
+    let first = groups.next()?;
+    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let grouped = integer.contains(',');
+    if grouped && (first.len() > 3 || !groups.all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()))) {
+        return None;
+    }
+    let mut code = if grouped {
+        "#,##0".to_string()
+    } else if first.starts_with('0') && first.len() > 1 && first.len() <= 16 {
+        "0".repeat(first.len())
+    } else {
+        "0".to_string()
+    };
+    if !fraction.is_empty() {
+        code.push('.');
+        code.push_str(&"0".repeat(fraction.len()));
+    }
+    if digits[token.len()..].starts_with('%') {
+        code.push('%');
+    }
+    Some(code)
+}
+
+fn numeric_source(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (number, scale) = s.strip_suffix('%').map_or((s, 1.0), |n| (n, 100.0));
+    let value = if number.contains(',') {
+        number_format(number)?.starts_with("#,").then_some(())?;
+        number.replace(',', "").parse::<f64>().ok()?
+    } else {
+        number.parse::<f64>().ok()?
+    };
+    value.is_finite().then_some(value / scale)
+}
+
 fn eval(p: &Piece, srcs: &[String]) -> Option<String> {
     match p {
         Piece::Text(t) => Some(t.clone()),
+        Piece::Number(c, format) => {
+            let number = numeric_source(srcs.get(*c)?)?;
+            Some(format.format(&Value::Num(number)).text)
+        }
         Piece::Whole(c, k) => srcs.get(*c).filter(|s| !s.is_empty()).map(|s| cased(s, *k)),
         Piece::Word(c, i, k) => word(srcs.get(*c)?, *i).map(|w| cased(w, *k)),
         Piece::Prefix(c, i, n, k) => word(srcs.get(*c)?, *i).and_then(|w| left(w, *n)).map(|p| cased(p, *k)),
@@ -129,7 +184,7 @@ fn run(prog: &[Piece], srcs: &[String]) -> Option<String> {
 
 /// The pieces that could come next at byte `at` of `out`, from `srcs`:
 /// longest first, fixed text (one character) last.
-fn candidates(srcs: &[String], out: &str, at: usize) -> Vec<Piece> {
+fn candidates(srcs: &[String], out: &str, at: usize, number_formats: &[NumFmt]) -> Vec<Piece> {
     let rest = &out[at..];
     let mut found: Vec<(usize, u8, Piece)> = Vec::new();
     let cases = [Case::Same, Case::Proper, Case::Upper, Case::Lower];
@@ -139,6 +194,9 @@ fn candidates(srcs: &[String], out: &str, at: usize) -> Vec<Piece> {
         }
         let n = words(s).len() as i32;
         let mut pieces = vec![];
+        if numeric_source(s).is_some() {
+            pieces.extend(number_formats.iter().map(|format| (1, Piece::Number(c, format.clone()))));
+        }
         for k in cases {
             pieces.push((0u8, Piece::Whole(c, k)));
             for i in 0..n {
@@ -192,7 +250,18 @@ fn learn(examples: &[(Vec<String>, String)]) -> Option<Vec<Piece>> {
         if at[0] == ex[0].1.len() || prog.iter().filter(|p| !matches!(p, Piece::Text(_))).count() >= MAX_PIECES {
             return false;
         }
-        'next: for p in candidates(&ex[0].0, &ex[0].1, at[0]) {
+        // The first example can be too small to show a grouping separator,
+        // or already wide enough to hide the effect of zero padding.
+        let mut codes = Vec::new();
+        for (example, &offset) in ex.iter().zip(at.iter()) {
+            if let Some(code) = number_format(&example.1[offset..]) {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        let formats: Vec<_> = codes.iter().map(|code| NumFmt::parse(code)).collect();
+        'next: for p in candidates(&ex[0].0, &ex[0].1, at[0], &formats) {
             let mut moved = Vec::with_capacity(ex.len());
             for (k, e) in ex.iter().enumerate() {
                 match eval(&p, &e.0) {
@@ -327,6 +396,38 @@ mod tests {
         assert_eq!(run(&p, &["QQ55501".into()]).as_deref(), Some("5501"));
         // Examples that disagree: nothing learnt.
         assert!(learn(&[ex(&["a b"], "a"), ex(&["c d"], "x")]).is_none());
+    }
+
+    #[test]
+    fn reformats_numbers_from_examples() {
+        for (a, b, c, expected) in [
+            (("1234.567", "$1,234.57"), ("15000.1", "$15,000.10"), "-70.125", "$-70.13"),
+            (("2", "0002"), ("25", "0025"), "123", "0123"),
+            (("87", "87.00"), ("1234", "1,234.00"), "5000.5", "5,000.50"),
+            (("1234", "1234"), ("25", "0025"), "2", "0002"),
+            (("0.125", "12.5%"), ("0.02", "2.0%"), "0.3", "30.0%"),
+        ] {
+            let program = learn(&[ex(&[a.0], a.1), ex(&[b.0], b.1)]).unwrap();
+            assert_eq!(run(&program, &[c.into()]).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn flash_fill_writes_reformatted_numbers_as_text() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("S").unwrap();
+        for (row, value) in [1234.567, 15000.1, -70.125].into_iter().enumerate() {
+            wb.set_value(CellAddr::new(0, row as u32, 0), Value::Num(value));
+        }
+        wb.set_value(CellAddr::new(0, 0, 1), Value::str("$1,234.57"));
+        wb.set_value(CellAddr::new(0, 1, 1), Value::str("$15,000.10"));
+        let (ops, count) = flash_fill(&wb, 0, 2, 1).unwrap();
+        assert_eq!(count, 1);
+        for op in ops {
+            op.apply(&mut wb);
+        }
+        assert_eq!(wb.value(0, 0, 1), Value::str("$1,234.57"));
+        assert_eq!(wb.value(0, 2, 1), Value::str("$-70.13"));
     }
 
     #[test]

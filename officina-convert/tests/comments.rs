@@ -24,6 +24,25 @@ fn all(wb: &Workbook) -> Vec<Vec<(u32, u32, String, String)>> {
 }
 
 #[test]
+fn rich_comments_round_trip_through_xlsx_and_ods() {
+    use officina_grid::comments::{CommentRun, CommentStyle};
+
+    let mut wb = book();
+    let text = "Plain élan\nwith a tab\tand <symbols>.";
+    let comment = Comment::with_runs("Ana", text, [
+        CommentRun { start: 6, end: "Plain élan\nwith a tab\t".len(), style: CommentStyle { bold: true, italic: true, ..CommentStyle::default() } },
+        CommentRun { start: text.find('<').unwrap(), end: text.len(), style: CommentStyle { underline: true, strike: true, ..CommentStyle::default() } },
+    ]);
+    wb.set_comments(0, vec![(1, 1, Some(comment.clone()))]);
+    let x = officina_convert::xlsx::write(&wb, Vec::new()).unwrap();
+    let (back, _) = officina_convert::xlsx::read(&x).unwrap();
+    assert_eq!(back.comment(0, 1, 1), Some(&comment));
+    let o = officina_convert::ods::write(&back, Vec::new()).unwrap();
+    let (back, _) = officina_convert::ods::read(&o).unwrap();
+    assert_eq!(back.comment(0, 1, 1), Some(&comment));
+}
+
+#[test]
 fn comments_round_trip_through_xlsx_and_ods() {
     let wb = book();
     let want = all(&wb);

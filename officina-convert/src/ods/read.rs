@@ -16,6 +16,7 @@ use std::sync::Arc;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 
+use officina_grid::comments::{Comment, CommentRun, CommentStyle};
 use officina_grid::addr::{CellAddr, MAX_COLS, MAX_ROWS};
 use officina_grid::column::Sizes;
 use officina_grid::eval::dates;
@@ -243,6 +244,7 @@ struct Styles {
     tab_color: HashMap<String, u32>,
     /// Font face name → family.
     faces: HashMap<String, String>,
+    comment_text: HashMap<String, CommentStyle>,
     /// Cell styles with `style:map` conditions.
     cond_maps: bool,
 }
@@ -313,6 +315,15 @@ impl Styles {
                             }
                         }
                         "style:text-properties" => {
+                            if cur_family == "text" {
+                                let enabled = |key: &str| a.get(key).is_some_and(|value| value != "none");
+                                self.comment_text.insert(cur_name.clone(), CommentStyle {
+                                    bold: a.get("fo:font-weight").is_some_and(|v| v == "bold" || v.parse::<u32>().is_ok_and(|n| n >= 600)),
+                                    italic: a.get("fo:font-style").is_some_and(|v| matches!(v.as_str(), "italic" | "oblique")),
+                                    underline: enabled("style:text-underline-style"),
+                                    strike: enabled("style:text-line-through-style"),
+                                });
+                            }
                             if let Some((_, c)) = cur_cell.as_mut() {
                                 if let Some(w) = a.get("fo:font-weight") {
                                     c.bold = Some(w == "bold" || w.parse::<u32>().is_ok_and(|n| n >= 600));
@@ -740,6 +751,24 @@ struct Annotation {
     text: String,
     in_creator: bool,
     paras: usize,
+    paragraph_depth: Option<u32>,
+    spans: Vec<(u32, CommentStyle)>,
+    runs: Vec<CommentRun>,
+}
+
+impl Annotation {
+    fn push(&mut self, text: &str) {
+        let start = self.text.len();
+        let remaining = officina_grid::comments::MAX_TEXT.saturating_sub(start);
+        let end = text.floor_char_boundary(remaining.min(text.len()));
+        if end == 0 {
+            return;
+        }
+        self.text.push_str(&text[..end]);
+        if let Some((_, style)) = self.spans.last().filter(|(_, style)| style.mask() != 0) {
+            self.runs.push(CommentRun { start, end: self.text.len(), style: *style });
+        }
+    }
 }
 
 /// Reads an `.ods` package into a workbook.
@@ -874,13 +903,24 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                             b"dc:creator" => a.in_creator = !empty,
                             b"text:p" | b"text:h" => {
                                 if a.paras > 0 {
-                                    a.text.push('\n');
+                                    a.push("\n");
                                 }
                                 a.paras += 1;
+                                a.paragraph_depth = (!empty).then_some(annotation_depth);
                             }
-                            b"text:line-break" => a.text.push('\n'),
-                            b"text:s" => a.text.push(' '),
-                            b"text:tab" => a.text.push('\t'),
+                            b"text:span" if !empty => {
+                                let attrs = attrs(e);
+                                let inherited = a.spans.last().map_or(0, |(_, style)| style.mask());
+                                let own = attrs.get("text:style-name").and_then(|name| styles.comment_text.get(name)).map_or(0, |style| style.mask());
+                                a.spans.push((annotation_depth, CommentStyle::from_mask(inherited | own)));
+                            }
+                            b"text:line-break" => a.push("\n"),
+                            b"text:s" => {
+                                let count = attrs(e).get("text:c").and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
+                                let remaining = officina_grid::comments::MAX_TEXT.saturating_sub(a.text.len());
+                                a.push(&" ".repeat(count.min(remaining)));
+                            }
+                            b"text:tab" => a.push("\t"),
                             _ => {}
                         }
                     }
@@ -1242,9 +1282,11 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
             Event::Text(t) if annotation_depth > 0 => {
                 if let Some(a) = ann.as_mut() {
                     let s = t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?;
-                    let into = if a.in_creator { &mut a.author } else if a.paras > 0 { &mut a.text } else { continue };
-                    if into.len() + s.len() <= officina_grid::comments::MAX_TEXT {
-                        into.push_str(&s);
+                    if a.in_creator {
+                        let remaining = officina_grid::comments::MAX_AUTHOR.saturating_sub(a.author.len());
+                        a.author.push_str(&s[..s.floor_char_boundary(s.len().min(remaining))]);
+                    } else if a.paragraph_depth.is_some() {
+                        a.push(&s);
                     }
                 }
             }
@@ -1272,11 +1314,17 @@ pub fn read(data: &[u8]) -> Result<(Workbook, Loaded), OdsError> {
                         if name == b"dc:creator" {
                             a.in_creator = false;
                         }
+                        if a.paragraph_depth == Some(annotation_depth) {
+                            a.paragraph_depth = None;
+                        }
+                        if a.spans.last().is_some_and(|(depth, _)| *depth == annotation_depth) {
+                            a.spans.pop();
+                        }
                     }
                     if annotation_depth == 0 {
                         if let (Some(a), Some(s)) = (ann.take(), sheet) {
                             if row < MAX_ROWS as u64 && col < MAX_COLS as u64 && comments.len() < officina_grid::comments::MAX_COMMENTS {
-                                comments.push((row as u32, col as u32, Some(officina_grid::comments::Comment::new(a.author.trim(), &a.text))));
+                                comments.push((row as u32, col as u32, Some(Comment::with_runs(a.author.trim(), &a.text, a.runs))));
                             }
                             let _ = s;
                         }

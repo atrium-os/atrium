@@ -31,7 +31,24 @@ pub fn comments_xml(wb: &Workbook, s: u16) -> String {
     o.push_str("</authors><commentList>");
     for (&(r, c), k) in cm {
         let id = authors.iter().position(|a| *a == &*k.author).unwrap_or(0);
-        let _ = write!(o, r#"<comment ref="{}" authorId="{id}"><text><r><t xml:space="preserve">{}</t></r></text></comment>"#, a1(r, c), esc(&k.text));
+        let _ = write!(o, r#"<comment ref="{}" authorId="{id}"><text>"#, a1(r, c));
+        for (text, style) in k.segments() {
+            o.push_str("<r>");
+            if style.mask() != 0 {
+                o.push_str("<rPr>");
+                for (on, tag) in [(style.bold, "<b/>"), (style.italic, "<i/>"), (style.strike, "<strike/>"), (style.underline, "<u/>")] {
+                    if on {
+                        o.push_str(tag);
+                    }
+                }
+                o.push_str("</rPr>");
+            }
+            let _ = write!(o, r#"<t xml:space="preserve">{}</t></r>"#, esc(text));
+        }
+        if k.text.is_empty() {
+            o.push_str("<t/>");
+        }
+        o.push_str("</text></comment>");
     }
     o.push_str("</commentList></comments>");
     o
@@ -68,7 +85,7 @@ mod read {
     use crate::report::{Kind, Report};
     use crate::zip::Archive;
     use crate::xlsx::XlsxError;
-    use officina_grid::comments::{Comment, MAX_COMMENTS, MAX_TEXT};
+    use officina_grid::comments::{Comment, CommentRun, CommentStyle, MAX_COMMENTS, MAX_TEXT};
     use officina_grid::Workbook;
 
     /// The comments of the sheet at `part`, onto sheet `s`.
@@ -81,7 +98,12 @@ mod read {
         // The comment being read: cell, author, text, the first run's text and
         // whether that run is bold.
         let mut cur: Option<((u32, u32), usize, String)> = None;
-        let (mut in_t, mut runs, mut bold_first, mut first_run) = (false, 0usize, false, String::new());
+        let mut in_t = false;
+        let mut in_run = false;
+        let mut run_count = 0;
+        let mut first_run_end = 0;
+        let mut style = CommentStyle::default();
+        let mut runs = Vec::new();
         let mut set = Vec::new();
         loop {
             buf.clear();
@@ -92,40 +114,64 @@ mod read {
                         let at = attr(&e, b"ref")?.as_deref().and_then(parse_ref).map(|(r0, c0, _, _)| (r0, c0));
                         let id = attr(&e, b"authorId")?.and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
                         cur = at.map(|a| (a, id, String::new()));
-                        (runs, bold_first) = (0, false);
-                        first_run.clear();
+                        run_count = 0;
+                        first_run_end = 0;
+                        in_run = false;
+                        in_t = false;
+                        runs.clear();
                     }
-                    b"r" => runs += 1,
+                    b"r" => {
+                        run_count += 1;
+                        in_run = true;
+                        style = CommentStyle::default();
+                    }
+                    b"b" | b"i" | b"u" | b"strike" if in_run => read_style(&e, &mut style)?,
                     b"t" => in_t = true,
                     _ => {}
                 },
-                Event::Empty(e) if e.local_name().as_ref() == b"b" && runs == 1 => bold_first = true,
+                Event::Empty(e) if in_run => read_style(&e, &mut style)?,
                 Event::Text(t) => {
                     let s = t.unescape().map_err(|e| XlsxError::Xml(e.to_string()))?;
                     if let Some(a) = author.as_mut() {
                         a.push_str(&s);
                     } else if let (true, Some(c)) = (in_t, cur.as_mut()) {
-                        if c.2.len() < MAX_TEXT {
-                            c.2.push_str(&s);
-                        }
-                        if runs == 1 {
-                            first_run.push_str(&s);
+                        let start = c.2.len();
+                        if start < MAX_TEXT {
+                            c.2.push_str(&s.replace("\r\n", "\n"));
+                            if in_run && style.mask() != 0 {
+                                runs.push(CommentRun { start, end: c.2.len(), style });
+                            }
                         }
                     }
                 }
                 Event::End(e) => match e.local_name().as_ref() {
                     b"author" => authors.extend(author.take()),
                     b"t" => in_t = false,
+                    b"r" => {
+                        in_run = false;
+                        if run_count == 1 {
+                            first_run_end = cur.as_ref().map_or(0, |c| c.2.len());
+                        }
+                    }
                     b"comment" => {
-                        if let Some(((row, col), id, mut text)) = cur.take() {
-                            let who = authors.get(id).cloned().unwrap_or_default();
-                            // Excel's "Author:" in bold before the note.
-                            if bold_first && runs > 1 && first_run.trim_end().ends_with(':') {
-                                text = text[first_run.len()..].trim_start_matches(['\n', '\r']).to_string();
+                        if let Some(((row, col), id, text)) = cur.take() {
+                            let who = authors.get(id).map_or("", |a| a.trim());
+                            // Excel may prepend a synthetic bold author run.
+                            let mut body = text.as_str();
+                            if run_count > 1 && !who.is_empty()
+                                && runs.first().is_some_and(|run| run.start == 0 && run.style.bold)
+                                && text[..first_run_end].trim_end().strip_suffix(':').is_some_and(|name| name.trim() == who)
+                            {
+                                body = text[first_run_end..].trim_start_matches(['\n', '\r']);
                             }
-                            let text = text.replace("\r\n", "\n");
+                            let offset = text.len() - body.len();
                             if set.len() < MAX_COMMENTS {
-                                set.push((row, col, Some(Comment::new(who.trim(), &text))));
+                                let styles = runs.drain(..).filter(|run| run.end > offset).map(|mut run| {
+                                    run.start = run.start.saturating_sub(offset);
+                                    run.end -= offset;
+                                    run
+                                });
+                                set.push((row, col, Some(Comment::with_runs(who, body, styles))));
                             }
                         }
                     }
@@ -158,6 +204,18 @@ mod read {
         if !set.is_empty() {
             wb.set_comments(s, set);
         }
+        Ok(())
+    }
+
+    fn read_style(e: &quick_xml::events::BytesStart<'_>, style: &mut CommentStyle) -> Result<(), XlsxError> {
+        let slot = match e.local_name().as_ref() {
+            b"b" => &mut style.bold,
+            b"i" => &mut style.italic,
+            b"u" => &mut style.underline,
+            b"strike" => &mut style.strike,
+            _ => return Ok(()),
+        };
+        *slot = !matches!(attr(e, b"val")?.as_deref(), Some("0" | "false" | "none"));
         Ok(())
     }
 

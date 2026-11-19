@@ -1,5 +1,5 @@
 //! Cell comments (Excel's notes, ODF's `office:annotation`): a few lines of
-//! plain text and who wrote them, on a cell. They stay when the cell is
+//! text and who wrote them, on a cell. They stay when the cell is
 //! cleared or edited, as in Excel, and move with inserted and deleted rows
 //! and columns ([`crate::shift`]). [`crate::ops::GridOp::Comments`] changes
 //! them, one undo step.
@@ -18,18 +18,89 @@ pub const MAX_AUTHOR: usize = 255;
 /// The most comments a sheet keeps.
 pub const MAX_COMMENTS: usize = 1 << 20;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CommentStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+impl CommentStyle {
+    pub fn mask(self) -> u8 {
+        u8::from(self.bold) | (u8::from(self.italic) << 1)
+            | (u8::from(self.underline) << 2) | (u8::from(self.strike) << 3)
+    }
+
+    pub fn from_mask(mask: u8) -> Self {
+        Self { bold: mask & 1 != 0, italic: mask & 2 != 0, underline: mask & 4 != 0, strike: mask & 8 != 0 }
+    }
+}
+
+/// A styled range in the UTF-8 text, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommentRun {
+    pub start: usize,
+    pub end: usize,
+    pub style: CommentStyle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
     /// Who wrote it; may be empty.
     pub author: Arc<str>,
     /// Its text; lines split by `\n`.
     pub text: Arc<str>,
+    runs: Arc<[CommentRun]>,
 }
 
 impl Comment {
     pub fn new(author: &str, text: &str) -> Comment {
-        Comment { author: cut(author, MAX_AUTHOR).into(), text: cut(text, MAX_TEXT).into() }
+        Comment { author: cut(author, MAX_AUTHOR).into(), text: cut(text, MAX_TEXT).into(), runs: Arc::default() }
     }
+
+    pub fn with_runs(author: &str, text: &str, runs: impl IntoIterator<Item = CommentRun>) -> Self {
+        let mut comment = Self::new(author, text);
+        let mut kept: Vec<CommentRun> = Vec::new();
+        for mut run in runs {
+            run.end = run.end.min(comment.text.len());
+            if run.start >= run.end || !comment.text.is_char_boundary(run.start)
+                || !comment.text.is_char_boundary(run.end) || run.style.mask() == 0
+            {
+                continue;
+            }
+            if let Some(last) = kept.last_mut() {
+                if run.start < last.end {
+                    continue;
+                }
+                if run.start == last.end && run.style == last.style {
+                    last.end = run.end;
+                    continue;
+                }
+            }
+            kept.push(run);
+        }
+        comment.runs = kept.into();
+        comment
+    }
+
+    pub fn runs(&self) -> &[CommentRun] {
+        &self.runs
+    }
+
+    /// The plain and styled segments in text order.
+    pub fn segments(&self) -> impl Iterator<Item = (&str, CommentStyle)> {
+        let mut start = 0;
+        self.runs.iter().flat_map(move |run| {
+            let plain = &self.text[start..run.start];
+            start = run.end;
+            [(plain, CommentStyle::default()), (&self.text[run.start..run.end], run.style)]
+        }).chain(std::iter::once_with(|| {
+            let end = self.runs.last().map_or(0, |run| run.end);
+            (&self.text[end..], CommentStyle::default())
+        })).filter(|(text, _)| !text.is_empty())
+    }
+
 }
 
 /// `s` cut to at most `max` bytes, on a character boundary.
@@ -55,9 +126,17 @@ pub fn encode(w: &mut Writer, set: &[(u32, u32, Option<Comment>)]) {
         w.var(*c as u64);
         match k {
             Some(k) => {
-                w.u8(1);
+                w.u8(if k.runs.is_empty() { 1 } else { 2 });
                 w.str(&k.author);
                 w.str(&k.text);
+                if !k.runs.is_empty() {
+                    w.var(k.runs.len() as u64);
+                    for run in k.runs() {
+                        w.var(run.start as u64);
+                        w.var(run.end as u64);
+                        w.u8(run.style.mask());
+                    }
+                }
             }
             None => w.u8(0),
         }
@@ -75,10 +154,28 @@ pub fn decode(r: &mut Reader) -> Result<Vec<(u32, u32, Option<Comment>)>, WireEr
         }
         let k = match r.u8()? {
             0 => None,
-            1 => {
+            kind @ (1 | 2) => {
                 let author = r.str("comment author", MAX_AUTHOR as u64)?;
                 let text = r.str("comment", MAX_TEXT as u64)?;
-                Some(Comment { author: author.into(), text: text.into() })
+                if kind == 1 {
+                    Some(Comment::new(author, text))
+                } else {
+                    let count = r.count("comment runs", text.len() as u64, 3)?;
+                    let mut runs = Vec::with_capacity(count);
+                    let mut previous_end = 0;
+                    for _ in 0..count {
+                        let (start, end, mask) = (r.var()?, r.var()?, r.u8()?);
+                        if start < previous_end || start >= end || end > text.len() as u64
+                            || !text.is_char_boundary(start as usize) || !text.is_char_boundary(end as usize)
+                            || !(1..=15).contains(&mask)
+                        {
+                            return Err(WireError::Invalid("comment run"));
+                        }
+                        runs.push(CommentRun { start: start as usize, end: end as usize, style: CommentStyle::from_mask(mask) });
+                        previous_end = end;
+                    }
+                    Some(Comment::with_runs(author, text, runs))
+                }
             }
             _ => return Err(WireError::Invalid("comment")),
         };
@@ -133,7 +230,7 @@ mod tests {
         let mut wb = Workbook::new();
         wb.add_sheet("S").unwrap();
         wb.set_value(CellAddr::new(0, 2, 1), Value::Num(5.0));
-        let op = GridOp::Comments { sheet: 0, set: vec![(2, 1, Some(Comment::new("Ana", "Check this\nagainst March"))), (0, 0, Some(Comment::new("", "Title")))] };
+        let op = GridOp::Comments { sheet: 0, set: vec![(2, 1, Some(Comment::with_runs("Ana", "Check this\nagainst March", [CommentRun { start: 0, end: 5, style: CommentStyle { bold: true, ..CommentStyle::default() } }]))), (0, 0, Some(Comment::new("", "Title")))] };
         assert_eq!(GridOp::decode(&op.encode()).unwrap(), op);
         let inv = op.apply(&mut wb);
         assert_eq!(wb.comment(0, 2, 1).map(|k| &*k.author), Some("Ana"));

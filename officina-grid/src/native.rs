@@ -23,7 +23,7 @@
 //! | 19 | FREEZE | frozen panes: count; per sheet, its index, frozen rows and columns |
 //! | 22 | FREEZE_FROM | panes frozen with the view scrolled: count; per sheet, its index, first frozen row and column |
 //! | 21 | HIDDEN_WIDTHS | one sheet's hidden columns' remembered widths: sheet, count, each column and px |
-//! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author and text |
+//! | 17 | COMMENTS | one sheet's cell comments: sheet, count, each cell, author, text and optional styled ranges |
 //! | 7 | NAMES | defined names: scope (a sheet, or 0xFFFF for the workbook), name, A1 text as if in A1 |
 //!
 //! Formula results are stored, so a load does no recalculation except for volatile

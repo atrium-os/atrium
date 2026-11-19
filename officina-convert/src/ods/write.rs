@@ -97,45 +97,50 @@ fn cell_paras(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32, text: &st
 fn paragraphs(out: &mut String, s: &str) {
     for line in s.split('\n') {
         out.push_str("<text:p>");
-        let mut spaces = 0usize;
-        let mut start = true;
-        let flush = |out: &mut String, n: &mut usize, start: bool| {
-            if *n == 0 {
-                return;
-            }
-            let (lit, rest) = if start { (0, *n) } else { (1, *n - 1) };
-            if lit == 1 {
-                out.push(' ');
-            }
-            if rest == 1 {
-                out.push_str("<text:s/>");
-            } else if rest > 1 {
-                let _ = write!(out, r#"<text:s text:c="{rest}"/>"#);
-            }
-            *n = 0;
-        };
-        for c in line.chars() {
-            match c {
-                ' ' => spaces += 1,
-                '\t' => {
-                    flush(out, &mut spaces, start);
-                    out.push_str("<text:tab/>");
-                    start = false;
-                }
-                '\r' => {}
-                c => {
-                    flush(out, &mut spaces, start);
-                    start = false;
-                    let mut b = [0u8; 4];
-                    esc(out, c.encode_utf8(&mut b));
-                }
-            }
-        }
-        // Trailing spaces: all as text:s.
-        if spaces > 0 {
-            flush(out, &mut spaces, true);
-        }
+        text_line(out, line);
         out.push_str("</text:p>");
+    }
+}
+
+// At a span boundary, preserve leading and trailing spaces explicitly.
+fn text_line(out: &mut String, line: &str) {
+    let mut spaces = 0usize;
+    let mut start = true;
+    let flush = |out: &mut String, n: &mut usize, start: bool| {
+        if *n == 0 {
+            return;
+        }
+        let (lit, rest) = if start { (0, *n) } else { (1, *n - 1) };
+        if lit == 1 {
+            out.push(' ');
+        }
+        if rest == 1 {
+            out.push_str("<text:s/>");
+        } else if rest > 1 {
+            let _ = write!(out, r#"<text:s text:c="{rest}"/>"#);
+        }
+        *n = 0;
+    };
+    for c in line.chars() {
+        match c {
+            ' ' => spaces += 1,
+            '\t' => {
+                flush(out, &mut spaces, start);
+                out.push_str("<text:tab/>");
+                start = false;
+            }
+            '\r' => {}
+            c => {
+                flush(out, &mut spaces, start);
+                start = false;
+                let mut b = [0u8; 4];
+                esc(out, c.encode_utf8(&mut b));
+            }
+        }
+    }
+    // Trailing spaces: all as text:s.
+    if spaces > 0 {
+        flush(out, &mut spaces, true);
     }
 }
 
@@ -796,11 +801,23 @@ fn note(out: &mut String, wb: &Workbook, s: u16, r: u32, c: u32) {
         esc(out, &k.author);
         out.push_str("</dc:creator>");
     }
-    for line in k.text.split('\n') {
-        out.push_str("<text:p>");
-        esc(out, line);
-        out.push_str("</text:p>");
+    out.push_str("<text:p>");
+    for (text, style) in k.segments() {
+        let mask = style.mask();
+        if mask != 0 {
+            let _ = write!(out, r#"<text:span text:style-name="Comment{mask}">"#);
+        }
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                out.push_str(if mask == 0 { "</text:p><text:p>" } else { "<text:line-break/>" });
+            }
+            text_line(out, line);
+        }
+        if mask != 0 {
+            out.push_str("</text:span>");
+        }
     }
+    out.push_str("</text:p>");
     out.push_str("</office:annotation>");
 }
 
@@ -1322,6 +1339,25 @@ pub fn write<W: Write>(wb: &Workbook, out: W) -> io::Result<W> {
         }
     }
     auto.push_str(&cells);
+    let comment_styles: BTreeSet<u8> = (0..wb.sheet_count() as u16)
+        .flat_map(|sheet| wb.comments(sheet).values())
+        .flat_map(|comment| comment.runs().iter().map(|run| run.style.mask()))
+        .collect();
+    for mask in comment_styles {
+        let style = officina_grid::comments::CommentStyle::from_mask(mask);
+        let _ = write!(auto, r#"<style:style style:name="Comment{mask}" style:family="text"><style:text-properties"#);
+        for (on, property) in [
+            (style.bold, r#" fo:font-weight="bold""#),
+            (style.italic, r#" fo:font-style="italic""#),
+            (style.underline, r#" style:text-underline-style="solid" style:text-underline-color="font-color""#),
+            (style.strike, r#" style:text-line-through-style="solid""#),
+        ] {
+            if on {
+                auto.push_str(property);
+            }
+        }
+        auto.push_str("/></style:style>");
+    }
     let mut faces = String::new();
     let mut names: Vec<&String> = fonts.keys().collect();
     names.sort();
