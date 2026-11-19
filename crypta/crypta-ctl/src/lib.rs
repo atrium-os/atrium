@@ -289,6 +289,8 @@ pub enum FieldKind {
     /// A one-time code.
     Code,
     Choice,
+    PasswordOnce,
+    GatewayChoice,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

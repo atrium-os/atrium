@@ -26,7 +26,7 @@
 //!
 //! AnyConnect (V4, vpn.md §9):
 //!
-//! - `create-gp name=N host=H[:P] [user=HEX] [pin=HEX] [ca=B64] [scoped=0]`
+//! - `create-gp name=N host=H[:P] [portal=1] [user=HEX] [pin=HEX] [ca=B64] [scoped=0]`
 //! - `create-ac name=N host=H[:P] [path=] [user=HEX] [group=HEX] [pin=HEX] [ca=B64] [scoped=0]`
 //! - `prompt name=N`: what the gateway asks (`text k= v=HEX` lines, then
 //!   `field i= kind= name=HEX label=HEX` and `choice i= value=HEX
@@ -134,6 +134,7 @@ impl Drop for Helper {
 struct AcRun {
     /// Where the gateway's name resolved at `up`.
     gw: Option<SocketAddrV4>,
+    gp_selected: Option<(String, u16)>,
     prompt: Option<engine::Prompt>,
     /// `(login, final_url, token_cookie)`.
     sso: Option<(String, String, String)>,
@@ -399,14 +400,24 @@ impl D {
     /// An AnyConnect engine (vpn.md §9.3): its own secrets helper on a
     /// socket only it holds, and what Arca already keeps for the profile.
     fn start_ac(&mut self, r: &mut Run) -> Result<(), String> {
-        let a = r.p.ac.clone().ok_or("not-ac")?;
+        let mut a = r.p.ac.clone().ok_or("not-ac")?;
+        let discovering = a.gp_portal && r.ac.gp_selected.is_none();
+        if let Some((host, port)) = &r.ac.gp_selected {
+            a.host = host.clone();
+            a.port = *port;
+        }
         let gw = r.ac.gw.ok_or("no-gateway")?;
         let mut has = |acc: String| self.keys.call(&Line::new("find").with("account", acc)).is_ok_and(|l| l.verb == "ok");
-        let saved = has(format!("{}/password", r.p.name));
-        let resume = has(format!("{}/session", r.p.name));
+        let saved = !a.gp_portal && has(format!("{}/password", r.p.name));
+        let resume = !a.gp_portal && has(format!("{}/session", r.p.name));
         let uid = self.pick_uid().ok_or("no-uid")?;
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
-        let helper = key::Keys::start_vpn(self.o.key_uid, &self.o.arca, &r.p.name, &a.host, theirs).map_err(|e| format!("secrets helper: {e}"))?;
+        let access = match (&r.ac.gp_selected, &r.p.ac) {
+            (Some((host, port)), Some(profile)) if host != &profile.host || *port != profile.port => "selected",
+            _ if a.gp_portal => "portal",
+            _ => "profile",
+        };
+        let helper = key::Keys::start_vpn(self.o.key_uid, &self.o.arca, &r.p.name, &a.host, access, theirs).map_err(|e| format!("secrets helper: {e}"))?;
         let helper = Helper(helper);
         r.starts += 1;
         let mut e = launch(&self.o.jaild, uid, r, gw, Some(ours.as_fd()))?;
@@ -426,7 +437,7 @@ impl D {
             cert_chain: a.cert_chain.clone(),
             resume,
         };
-        let start = if a.globalprotect { ToEngine::StartGp(settings) } else { ToEngine::StartAc(settings) };
+        let start = if discovering { ToEngine::StartGpPortal(settings) } else if a.gp_portal { ToEngine::StartGpSelected(settings) } else if a.globalprotect { ToEngine::StartGp(settings) } else { ToEngine::StartAc(settings) };
         let _ = e.sock.set_write_timeout(Some(Duration::from_secs(2)));
         if let Err(err) = engine::write(&mut e.sock, &start) {
             self.retire(e.uid);
@@ -537,7 +548,7 @@ impl D {
                 let v = if let Some(t) = l.hex(&format!("t{i}")) {
                     // A password reaches the engine only through Arca's
                     // field (vpn.md §9.3), never through cryptad.
-                    if f.kind == 1 {
+                    if f.kind == 1 || f.name == "gp_response" {
                         return Err("password-through-arca".into());
                     }
                     let t = String::from_utf8(t).map_err(|_| "bad-text")?;
@@ -562,6 +573,44 @@ impl D {
             }
             Some(out)
         };
+        if let Some([(field, engine::Value::Text(authority))]) = a.as_deref() {
+            if field == "gp_gateway" {
+                let profile = self.runs[k].p.ac.as_ref().filter(|a| a.gp_portal).ok_or("not-gp-portal")?;
+                let (host, port) = authority.rsplit_once(':').ok_or("bad-gateway")?;
+                let port: u16 = port.parse().ok().filter(|p| *p != 0).ok_or("bad-gateway")?;
+                if !profile::valid_host(host) {
+                    return Err("bad-gateway".into());
+                }
+                if self.runs[k].ac.gp_selected.is_some() || self.runs[k].ac.pushed.is_some() {
+                    return Err("gateway-already-selected".into());
+                }
+                if host != profile.host || port != profile.port {
+                    // The old jail cannot connect to a new origin. Its pin
+                    // and client certificate identify the portal only.
+                    if profile.pin.is_some() || !profile.cert_chain.is_empty() {
+                        return Err("gateway-needs-own-trust-profile".into());
+                    }
+                    let gateway = resolve(host, port)?;
+                    self.stop_engine(k);
+                    let mut run = std::mem::replace(&mut self.runs[k], dummy_run());
+                    run.ac.gw = Some(gateway);
+                    run.ac.gp_selected = Some((host.into(), port));
+                    run.ac.prompt = None;
+                    let started = self.start_engine(&mut run);
+                    self.runs[k] = run;
+                    if let Err(err) = started {
+                        self.fail(k, &err);
+                        return Err(err);
+                    }
+                    return Ok(());
+                }
+                let selected = (host.to_string(), port);
+                self.to_engine(k, &ToEngine::Answer(a))?;
+                self.runs[k].ac.gp_selected = Some(selected);
+                self.runs[k].ac.prompt = None;
+                return Ok(());
+            }
+        }
         self.to_engine(k, &ToEngine::Answer(a))?;
         self.runs[k].ac.prompt = None;
         Ok(())
@@ -868,6 +917,12 @@ impl D {
                     self.runs[k].ac.sso = Some((login, final_url, token_cookie));
                 }
                 FromEngine::Pushed(p) => {
+                    if self.runs[k].p.ac.as_ref().is_some_and(|a| a.gp_portal)
+                        && self.runs[k].ac.gp_selected.is_none()
+                    {
+                        self.fail(k, "GlobalProtect portal has no selected gateway");
+                        return;
+                    }
                     if let Err(e) = self.apply_push(k, p) {
                         self.fail(k, &format!("atrium-net refused what the gateway pushed ({e})"));
                         return;
@@ -1205,7 +1260,8 @@ fn main() {
         // An AnyConnect engine's own helper: its socket is stdin and stdout.
         let sock = std::env::var("ARCA_SOCKET").unwrap_or_else(|_| "/atrium/sockets/arca/arcad.sock".into());
         let (Some(name), Some(host)) = (a.get(1).filter(|n| profile::valid_name(n)), a.get(2)) else { die("--arca-vpn NAME HOST") };
-        return key::serve_vpn(&sock, name, host);
+        let access = a.get(3).map(String::as_str).unwrap_or("profile");
+        return key::serve_vpn(&sock, name, host, access);
     }
     if a.first().map(String::as_str) == Some("ctl") {
         // Options before `ctl` are not taken; the socket from the environment.

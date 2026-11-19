@@ -115,6 +115,8 @@ pub enum ToEngine {
     StartGp(StartAc),
     /// atrium-net accepted a GlobalProtect tunnel proposal.
     Applied,
+    StartGpPortal(StartAc),
+    StartGpSelected(StartAc),
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]

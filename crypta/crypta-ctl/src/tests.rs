@@ -171,6 +171,17 @@ fn ask_lines() -> Vec<Line> {
     .collect()
 }
 
+#[test]
+fn globalprotect_portal_prompt_kinds() {
+    let fields = [
+        Line::new("field").with("i", 0).with("kind", 1).with_hex("name", b"gp_password_once"),
+        Line::new("field").with("i", 1).with("kind", 3).with_hex("name", b"gp_gateway"),
+    ];
+    let Some(Ask::Form(f)) = lines::ask(&fields) else { panic!() };
+    assert_eq!(f.fields[0].kind, FieldKind::PasswordOnce);
+    assert_eq!(f.fields[1].kind, FieldKind::GatewayChoice);
+}
+
 /// A corporate tunnel's lines: its kind, its sign-in state, its settings,
 /// what its gateway asks and the answer cryptad gets.
 #[test]

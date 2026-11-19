@@ -47,6 +47,7 @@ pub struct Profile {
 pub struct Ac {
     /// Direct GlobalProtect gateway, sharing the corporate profile fields.
     pub globalprotect: bool,
+    pub gp_portal: bool,
     /// The gateway's name (TLS and `Host`), resolved at each connect.
     pub host: String,
     pub port: u16,
@@ -236,6 +237,11 @@ impl Profile {
             return Err("bad-host");
         }
         let globalprotect = l.verb == "create-gp";
+        let gp_portal = match l.get("portal") {
+            None | Some("0") => false,
+            Some("1") if globalprotect => true,
+            _ => return Err("bad-portal"),
+        };
         if globalprotect && (l.get("path").is_some() || l.get("group").is_some()) {
             return Err("globalprotect-uses-direct-gateway");
         }
@@ -278,6 +284,7 @@ impl Profile {
             scoped: l.get("scoped") != Some("0"),
             ac: Some(Ac {
                 globalprotect,
+                gp_portal,
                 host,
                 port,
                 path,
@@ -362,6 +369,9 @@ impl Profile {
         }
         if let Some(a) = &self.ac {
             p = p.with("kind", a.kind()).with("host", &a.host).with("port", a.port).with("path", &a.path).with_hex("hostname", a.hostname.as_bytes());
+            if a.gp_portal {
+                p = p.with("portal", 1);
+            }
             if let Some(u) = &a.username {
                 p = p.with_hex("user", u.as_bytes());
             }
@@ -417,6 +427,7 @@ impl Profile {
         let ac = match l.get("kind") {
             Some("ac" | "gp") => Some(Ac {
                 globalprotect: l.get("kind") == Some("gp"),
+                gp_portal: l.get("kind") == Some("gp") && flag("portal"),
                 host: l.get("host").filter(|h| valid_host(h))?.to_string(),
                 port: l.num("port")?,
                 path: l.get("path").filter(|p| valid_path(p))?.to_string(),
@@ -575,6 +586,10 @@ mod tests {
         let line = Line::parse("create-gp name=work host=gw.example:8443").unwrap();
         let p = Profile::from_create_ac(&line).unwrap();
         assert_eq!(p.ac.as_ref().unwrap().kind(), "gp");
+        assert_eq!(Profile::from_text(&p.to_text()), Some(p));
+        let portal = Line::parse("create-gp name=work host=gw.example portal=1").unwrap();
+        let p = Profile::from_create_ac(&portal).unwrap();
+        assert!(p.ac.as_ref().unwrap().gp_portal);
         assert_eq!(Profile::from_text(&p.to_text()), Some(p));
         let portal = Line::parse("create-gp name=work host=gw.example path=/portal").unwrap();
         assert!(Profile::from_create_ac(&portal).is_err());

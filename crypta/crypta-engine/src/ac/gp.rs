@@ -8,6 +8,13 @@ const KEEPALIVE: Duration = Duration::from_secs(10);
 const MAX_HTTP_WIRE: usize = http::MAX_HEAD + 4 * http::MAX_BODY;
 const DEAD: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    Direct,
+    Portal,
+    Selected,
+}
+
 enum LinkEnd {
     Stop(Stop),
     Expired,
@@ -83,11 +90,27 @@ impl Engine {
         }
     }
 
-    fn gp_login(&mut self, jar: &mut Jar) -> Result<gp::Session, Stop> {
+    fn gp_auth(
+        &mut self,
+        jar: &mut Jar,
+        portal: bool,
+        durable: bool,
+    ) -> Result<(Zeroizing<Vec<u8>>, bool), Stop> {
+        let title = if portal {
+            "GlobalProtect portal"
+        } else {
+            "GlobalProtect gateway"
+        };
+        let password = if durable {
+            "password"
+        } else {
+            "gp_password_once"
+        };
+        let authority = format!("{}:{}", self.st.host, self.st.gateway.port());
         let mut form = Form {
             id: "globalprotect".into(),
-            title: "GlobalProtect gateway".into(),
-            message: String::new(),
+            title: title.into(),
+            message: authority.clone(),
             error: String::new(),
             banner: String::new(),
             fields: vec![
@@ -97,59 +120,113 @@ impl Engine {
                     kind: Kind::Text,
                 },
                 Field {
-                    name: "password".into(),
+                    name: password.into(),
                     label: "Password".into(),
                     kind: Kind::Secret,
                 },
             ],
         };
+        let challenge_form = Form {
+            title: title.into(),
+            message: format!("{authority}\nEnter the requested verification code."),
+            fields: vec![Field {
+                name: "gp_response".into(),
+                label: "Verification code".into(),
+                kind: Kind::Otp,
+            }],
+            ..form.clone()
+        };
+        let (prelogin, login) = if portal {
+            (gp::PORTAL_PRELOGIN, gp::PORTAL_CONFIG)
+        } else {
+            (gp::PRELOGIN, gp::LOGIN)
+        };
         for _ in 0..3 {
-            // Verify TLS immediately before asking the secrets helper for a
-            // password, even when a previous login attempt failed.
             *jar = Jar::default();
-            let (status, body) = self.gp_post(jar, gp::PRELOGIN, "")?;
+            let (status, body) = self.gp_post(jar, prelogin, "")?;
             if status != 200 {
                 return Err(refused("GlobalProtect prelogin failed"));
             }
             gp::prelogin(&body).map_err(refused)?;
             let mut kept = false;
             let values = self.answers(&form, &mut kept)?;
-            let field = |name| {
-                values
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, v)| v.as_str())
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| refused("GlobalProtect answer missing"))
-            };
+            let user = gp_field(&values, "username")?;
             let body = gp::password_login(
                 &self.st.host,
                 &self.st.hostname,
-                field("username")?,
-                field("password")?,
+                user,
+                gp_field(&values, password)?,
             );
-            let (status, result) = self.gp_post(jar, gp::LOGIN, &body)?;
+            let (mut status, mut result) = self.gp_post(jar, login, &body)?;
+            let mut rounds = 0;
+            while status == 200 {
+                let Some(input) = gp::challenge(&result).map_err(refused)? else {
+                    return Ok((result, kept));
+                };
+                if rounds == 3 {
+                    return Err(refused(
+                        "GlobalProtect gateway kept asking for verification codes",
+                    ));
+                }
+                rounds += 1;
+                let answer = self.answers(&challenge_form, &mut kept)?;
+                let body = gp::sign_in(
+                    &self.st.host,
+                    &self.st.hostname,
+                    user,
+                    gp_field(&answer, "gp_response")?,
+                    input,
+                );
+                (status, result) = self.gp_post(jar, login, &body)?;
+            }
             match status {
-                200 => {
-                    let session = gp::login(&result).map_err(refused)?;
-                    if kept && !self.secrets.ok(&Line::new("commit")) {
-                        log("the GlobalProtect password could not be saved");
-                    }
-                    if !self
-                        .secrets
-                        .ok(&Line::new("cookie-set").with_hex("value", session.stored().as_bytes()))
-                    {
-                        log("the GlobalProtect session could not be saved");
-                    }
-                    return Ok(session);
-                }
-                401 | 403 | 512 => {
-                    form.error = "The gateway refused those credentials.".into();
-                }
+                401 | 403 | 512 => form.error = "The gateway refused those credentials.".into(),
                 _ => return Err(refused("GlobalProtect login failed")),
             }
         }
         Err(refused("GlobalProtect sign-in refused"))
+    }
+
+    fn gp_discover(&mut self, jar: &mut Jar) -> Result<(), Stop> {
+        let (body, _) = self.gp_auth(jar, true, false)?;
+        let choices = gp::gateways(&body).map_err(refused)?;
+        let form = Form {
+            id: "globalprotect-gateway".into(),
+            title: "Choose a GlobalProtect gateway".into(),
+            message: String::new(),
+            error: String::new(),
+            banner: String::new(),
+            fields: vec![Field {
+                name: "gp_gateway".into(),
+                label: "Gateway".into(),
+                kind: Kind::Choice(choices),
+            }],
+        };
+        let mut kept = false;
+        let selection = self.answers(&form, &mut kept)?;
+        let selected = gp_field(&selection, "gp_gateway")?;
+        if selected != format!("{}:{}", self.st.host, self.st.gateway.port()) {
+            return Err(refused(
+                "GlobalProtect gateway selection requires a new engine jail",
+            ));
+        }
+        Ok(())
+    }
+
+    fn gp_login(&mut self, jar: &mut Jar, durable: bool) -> Result<gp::Session, Stop> {
+        let (body, kept) = self.gp_auth(jar, false, durable)?;
+        let session = gp::login(&body).map_err(refused)?;
+        if durable && kept && !self.secrets.ok(&Line::new("commit")) {
+            log("the GlobalProtect password could not be saved");
+        }
+        if durable
+            && !self
+                .secrets
+                .ok(&Line::new("cookie-set").with_hex("value", session.stored().as_bytes()))
+        {
+            log("the GlobalProtect session could not be saved");
+        }
+        Ok(session)
     }
 
     fn gp_open(
@@ -198,8 +275,10 @@ impl Engine {
         Ok((stream, config, buf.split_off(gp::START_TUNNEL.len())))
     }
 
-    pub(super) fn run_gp(&mut self) -> Result<(), String> {
-        let mut session = if self.st.resume {
+    pub(super) fn run_gp(&mut self, mode: Mode) -> Result<(), String> {
+        let mut portal = mode == Mode::Portal;
+        let durable = mode == Mode::Direct;
+        let mut session = if durable && self.st.resume {
             // Check the gateway before releasing its session from Arca.
             match self.connect() {
                 Ok(_) => self
@@ -218,7 +297,11 @@ impl Engine {
         loop {
             let result = (|| {
                 if session.is_none() {
-                    session = Some(self.gp_login(&mut jar)?);
+                    if portal {
+                        self.gp_discover(&mut jar)?;
+                        portal = false;
+                    }
+                    session = Some(self.gp_login(&mut jar, durable)?);
                 }
                 let active = session.as_ref().unwrap();
                 let (t, config, first) = self.gp_open(&mut jar, active)?;
@@ -242,7 +325,9 @@ impl Engine {
                 Err(LinkEnd::Expired) => {
                     session = None;
                     jar = Jar::default();
-                    let _ = self.secrets.ok(&Line::new("cookie-drop"));
+                    if durable {
+                        let _ = self.secrets.ok(&Line::new("cookie-drop"));
+                    }
                     self.ctl.send(&FromEngine::Down {
                         why: "GlobalProtect session expired".into(),
                     });
@@ -414,4 +499,13 @@ fn gp_receive(stream: &mut tls::Tls, buf: &mut Vec<u8>, deadline: Instant) -> Re
     }
     stream.s.set_read_timeout(Some(left)).map_err(gateway_io)?;
     stream.recv(buf).map_err(gateway_io)
+}
+
+fn gp_field<'a>(values: &'a [(String, Zeroizing<String>)], name: &str) -> Result<&'a str, Stop> {
+    values
+        .iter()
+        .find(|(field, _)| field == name)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| refused("GlobalProtect answer missing"))
 }

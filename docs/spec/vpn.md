@@ -731,8 +731,14 @@ Gate: `scripts/crypta-v2-gate.sh run` (the V1 stand; its setup is shared). Two v
 GlobalProtect gateway with `atrium-cryptad ctl create-gp name=work host=vpn.example[:port]`.
 Optional `user=HEX`, `pin=HEX`, `ca=B64`, and `scoped=0` have the same meanings as for
 `create-ac`. Settings can connect and answer prompts for a provisioned profile. Use the
-gateway address itself. Portal discovery, gateway selection, and GlobalProtect-specific
-challenge forms are future work.
+gateway address itself for direct mode. With `portal=1`, Crypta signs in to the
+configured portal, lists external gateways in Settings with their host and port,
+and asks the user to choose. A different origin gets a fresh jail restricted to
+that gateway. Profiles with a portal pin or client certificate can choose the
+same origin, or provision the other gateway as a separate direct profile with its
+own trust settings. The portal and selected gateway each ask for credentials.
+The portal profile does not save passwords or pass cookies or TLS identity to
+another origin. An active portal-profile session stays in engine memory.
 
 - `StartGp` uses the existing corporate TLS executable and jaild policy. Gateway
   prelogin, password login, JNLP session parsing, and getconfig use bounded HTTP/XML
@@ -743,9 +749,16 @@ challenge forms are future work.
   before handing packets to tun. It refreshes the tunnel using the pushed timeout and
   tries to log out on disconnect. Required HIP, local-network lockdown and split
   exclusions are refused until Atrium can enforce those policies.
-- The direct gateway TLS integration gate passes on arm64 FreeBSD. ESP, truthful
-  HIP reporting with review in Curia, portal discovery, and challenge forms remain
-  part of V5. Scripted SSO and passkeys remain parked pending Navigator I3.
+- Portal and gateway password sign-in can each ask for a bounded sequence of
+  challenge codes through Arca. Crypta accepts the XML and legacy JavaScript-shaped
+  and HTML-wrapped challenge envelopes as data, extracting the literal continuation
+  token without evaluating page code. The control check against OpenConnect 9.21
+  exercises all three envelopes with `--challenge xml|js|html`, selecting the second
+  advertised gateway label. The fixture serves both labels at one origin.
+- The direct gateway TLS integration gate passes on arm64 FreeBSD. A portal
+  advertising a different origin still needs a FreeBSD integration check. ESP and
+  reviewed HIP reporting remain in V5. Scripted SSO and passkeys remain parked
+  pending Navigator I3.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
 

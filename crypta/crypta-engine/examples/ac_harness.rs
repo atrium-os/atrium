@@ -2,7 +2,7 @@
 //! the Ubuntu VM, scripts/crypta-ocserv-vm.sh), standing in for cryptad,
 //! the tun and the secrets helper:
 //!
-//!   ac_harness ENGINE HOST ADDR:PORT CA.pem [field=value ...] [--gp] [--saved PW] [--user U] [--ping A.B.C.D] [--hold]
+//!   ac_harness ENGINE HOST ADDR:PORT CA.pem [field=value ...] [--gp | --gp-portal] [--saved PW] [--user U] [--ping A.B.C.D] [--hold]
 //!
 //! Prompts are answered from the `field=value` list (a value `@held:X` goes
 //! as an Arca handle the fake helper redeems to X; `@totp` is the code of
@@ -74,12 +74,14 @@ fn main() {
     let mut cert_chain: Vec<Vec<u8>> = Vec::new();
     let mut key_pem: Option<String> = None;
     let mut gp = false;
+    let mut portal = false;
     let mut native_tun = None;
     let mut jid = None;
     let mut i = 5;
     while i < a.len() {
         match a[i].as_str() {
             "--gp" => gp = true,
+            "--gp-portal" => { gp = true; portal = true; },
             "--native-tun" => {
                 native_tun = Some(a[i + 1].clone());
                 i += 1;
@@ -241,7 +243,7 @@ fn main() {
         cert_chain: cert_chain.clone(),
         resume: false,
     };
-    engine::write(&mut c, &if gp { ToEngine::StartGp(start) } else { ToEngine::StartAc(start) }).unwrap();
+    engine::write(&mut c, &if portal { ToEngine::StartGpPortal(start) } else if gp { ToEngine::StartGp(start) } else { ToEngine::StartAc(start) }).unwrap();
     let mut rd = engine::Reader::default();
     let t0 = Instant::now();
     let mut addr = None;
@@ -265,7 +267,18 @@ fn main() {
                     for f in &p.fields {
                         let Some(k) = answers.iter().position(|(k, _)| *k == f.name) else { fail(&format!("no answer for {}", f.name)) };
                         let v = answers.remove(k).1;
-                        let v = if v == "@totp" { totp() } else { v };
+                        let v = if let Some(label) = v.strip_prefix("@label:") {
+                            let alternatives = f.choices.iter().filter(|(_, text)| text.ends_with(&format!(" ({label})"))).collect::<Vec<_>>();
+                            if alternatives.len() != 1 || f.choices.len() < 2 {
+                                fail("the expected gateway choices were not offered");
+                            }
+                            println!("selected offered gateway: {label}");
+                            alternatives[0].0.clone()
+                        } else if v == "@totp" {
+                            totp()
+                        } else {
+                            v
+                        };
                         if let Some(x) = v.strip_prefix("@held:") {
                             let mut h = [0u8; 16];
                             getrandom(&mut h);

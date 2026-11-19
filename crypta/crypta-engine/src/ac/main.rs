@@ -292,8 +292,10 @@ impl Engine {
                 return Err(Stop::Refused("answers do not fit the form".into()));
             }
             let v = match v {
+                Value::Text(_) if name == "gp_response" => return Err(Stop::Refused("challenge response must come from Arca".into())),
                 Value::Text(t) => Zeroizing::new(t),
                 Value::Held { handle, keep } => {
+                    let keep = keep && name != "gp_response";
                     *kept |= keep;
                     self.secrets.value(&Line::new("take").with_hex("handle", &handle).with("keep", keep as u8)).map_err(|e| Stop::Refused(format!("the password could not be had from Arca: {e}")))?
                 }
@@ -695,8 +697,10 @@ fn main() {
     let tun = unsafe { std::fs::File::from_raw_fd(3) };
     let secrets_sock = unsafe { UnixStream::from_raw_fd(4) };
     let (st, globalprotect) = match engine::read::<ToEngine>(&mut &ctl_sock) {
-        Ok(Some(ToEngine::StartAc(s))) => (s, false),
-        Ok(Some(ToEngine::StartGp(s))) => (s, true),
+        Ok(Some(ToEngine::StartAc(s))) => (s, None),
+        Ok(Some(ToEngine::StartGp(s))) => (s, Some(gp::Mode::Direct)),
+        Ok(Some(ToEngine::StartGpPortal(s))) => (s, Some(gp::Mode::Portal)),
+        Ok(Some(ToEngine::StartGpSelected(s))) => (s, Some(gp::Mode::Selected)),
         Ok(Some(_)) => return log("the first frame was not StartAc"),
         Ok(None) => return log("cryptad closed before StartAc"),
         Err(e) => return log(&format!("reading StartAc: {e}")),
@@ -730,7 +734,7 @@ fn main() {
     drop(system);
     log(&format!("gateway {} at {}", st.host, st.gateway));
     let mut e = Engine { st, ctl, secrets, conn, cfg, tun, saved_used: false, rx: 0, tx: 0, dropped: 0 };
-    let result = if globalprotect { e.run_gp() } else { e.run() };
+    let result = match globalprotect { Some(mode) => e.run_gp(mode), None => e.run() };
     match result {
         Ok(()) => log("stopping"),
         Err(why) if why.is_empty() => log("stopping"),

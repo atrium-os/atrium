@@ -92,7 +92,7 @@ pub struct SignIn {
 impl SignIn {
     pub fn secrets(&self) -> usize {
         match &self.ask {
-            Ask::Form(f) => f.fields.iter().filter(|f| matches!(f.kind, FieldKind::Password | FieldKind::Code)).count(),
+            Ask::Form(f) => f.fields.iter().filter(|f| matches!(f.kind, FieldKind::Password | FieldKind::PasswordOnce | FieldKind::Code)).count(),
             Ask::Sso { .. } => 0,
         }
     }
@@ -383,14 +383,14 @@ impl VpnPage {
                     }
                     Value::Text(x.trim().to_string())
                 }
-                FieldKind::Choice => match fl.choices.get(s.chosen.get(i).copied().unwrap_or(0)) {
+                FieldKind::Choice | FieldKind::GatewayChoice => match fl.choices.get(s.chosen.get(i).copied().unwrap_or(0)) {
                     Some((v, _)) => Value::Text(v.clone()),
                     None => {
                         self.note = Some((true, "nothing to choose".into()));
                         return;
                     }
                 },
-                FieldKind::Password | FieldKind::Code => match self.handle {
+                FieldKind::Password | FieldKind::PasswordOnce | FieldKind::Code => match self.handle {
                     Some(h) => Value::Held(h),
                     None => {
                         self.armed = Some((now, texts));
@@ -766,7 +766,16 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     };
     let msg: Vec<&str> = f.message.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
     let banner: Vec<&str> = f.banner.lines().filter(|l| !l.trim().is_empty()).take(8).collect();
-    let fh: f32 = f.fields.iter().map(|x| if x.kind == FieldKind::Choice { em(48.0) } else { em(44.0) }).sum();
+    let choosing_gateway = f.fields.iter().any(|x| x.kind == FieldKind::GatewayChoice);
+    let fh: f32 = f.fields.iter().map(|x| {
+        if x.kind == FieldKind::GatewayChoice {
+            em(34.0) * x.choices.len().max(1) as f32
+        } else if x.kind == FieldKind::Choice {
+            em(48.0)
+        } else {
+            em(44.0)
+        }
+    }).sum();
     let h = em(36.0) + em(18.0) * (msg.len() + banner.len()) as f32 + if f.error.is_empty() { 0.0 } else { em(22.0) } + fh + em(52.0) + if si.has_password() { em(32.0) } else { 0.0 };
     rect(ctx, 0.0, y, pw, h, t.bg_surface(), 8.0);
     let title = if f.title.trim().is_empty() { format!("Sign in to {}", si.name) } else { format!("{}: {}", si.name, f.title.trim()) };
@@ -795,12 +804,24 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
                 ti += 1;
                 y += em(44.0);
             }
-            FieldKind::Password | FieldKind::Code => {
+            FieldKind::Password | FieldKind::PasswordOnce | FieldKind::Code => {
                 vcred.clone().at(fx, y + em(2.0)).size(fw, em(32.0)).render(ctx);
                 if !p.field_up {
                     text(ctx, fx + fw + em(12.0), y + em(18.0), "Arca's field is not here yet", type_size::XS, Weight::Regular, t.text_tertiary());
                 }
                 y += em(44.0);
+            }
+            FieldKind::GatewayChoice => {
+                for (choice, (_, label)) in fl.choices.iter().enumerate() {
+                    let on = si.chosen.get(i).copied() == Some(choice);
+                    let pg = page.clone();
+                    button(ctx, fx, y + em(2.0), label, if on { Look::Primary } else { Look::Secondary },
+                        !p.busy, move || with_vpn(&pg, |a| a.choose(i, choice)));
+                    y += em(34.0);
+                }
+                if fl.choices.is_empty() {
+                    y += em(34.0);
+                }
             }
             FieldKind::Choice => {
                 let mut bx = fx;
@@ -820,7 +841,7 @@ fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEd
     }
     let ready = !p.busy && p.armed.is_none();
     let (pg, fs, n) = (page.clone(), fields.clone(), f.fields.iter().filter(|x| x.kind == FieldKind::Text).count().min(MAX_TEXTS));
-    let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else { "Sign in" }, Look::Primary, ready, move || {
+    let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else if choosing_gateway { "Connect" } else { "Sign in" }, Look::Primary, ready, move || {
         let texts: Vec<String> = (0..n).map(|k| fs[ANSWER_AT + k].get_cloned().text().to_string()).collect();
         with_vpn(&pg, |a| a.sign_in(texts, std::time::Instant::now()));
     });

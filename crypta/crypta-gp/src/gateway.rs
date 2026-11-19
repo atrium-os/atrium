@@ -10,6 +10,9 @@ use crypta_proto::{engine::Pushed, net::Prefix4};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const PRELOGIN: &str = "/ssl-vpn/prelogin.esp?tmp=tmp&clientVer=4100&clientos=Linux";
+pub const PORTAL_PRELOGIN: &str =
+    "/global-protect/prelogin.esp?tmp=tmp&clientVer=4100&clientos=Linux";
+pub const PORTAL_CONFIG: &str = "/global-protect/getconfig.esp";
 pub const LOGIN: &str = "/ssl-vpn/login.esp";
 pub const CONFIG: &str = "/ssl-vpn/getconfig.esp";
 pub const HIP_CHECK: &str = "/ssl-vpn/hipreportcheck.esp";
@@ -43,12 +46,23 @@ pub fn form(fields: &[(&str, &str)]) -> Zeroizing<String> {
 }
 
 pub fn password_login(host: &str, computer: &str, user: &str, password: &str) -> Zeroizing<String> {
+    sign_in(host, computer, user, password, "")
+}
+
+pub fn sign_in(
+    host: &str,
+    computer: &str,
+    user: &str,
+    password: &str,
+    input: &str,
+) -> Zeroizing<String> {
     form(&[
         ("prot", "https:"),
         ("server", host),
         ("computer", computer),
         ("user", user),
         ("passwd", password),
+        ("inputStr", input),
         ("ok", "Login"),
         ("direct", "yes"),
         ("jnlpReady", "jnlpReady"),
@@ -199,6 +213,152 @@ pub fn prelogin(bytes: &[u8]) -> Result<()> {
         return Err("GlobalProtect SAML sign-in is unavailable");
     }
     Ok(())
+}
+
+/// Read the challenge token from the fixed wire envelopes. The gateway
+/// message is opaque and is never interpreted as markup or program code.
+pub fn challenge(bytes: &[u8]) -> Result<Option<&str>> {
+    if bytes.len() > xml::MAX_DOC {
+        return Err("GlobalProtect challenge is too large");
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "invalid GlobalProtect challenge text")?
+        .trim();
+    let xml = text
+        .split_once("?>")
+        .filter(|_| text.starts_with("<?xml"))
+        .map_or(text, |(_, tail)| tail.trim_start());
+    let token = if let Some(body) = xml
+        .strip_prefix("<challenge>")
+        .and_then(|s| s.strip_suffix("</challenge>"))
+    {
+        // PAN challenge messages can contain bare ampersands. Skip the
+        // message as opaque text and accept just the literal token field.
+        let body = body.trim();
+        let body = if let Some(message) = body.strip_prefix("<respmsg>") {
+            message
+                .split_once("</respmsg>")
+                .ok_or("invalid GlobalProtect challenge message")?
+                .1
+                .trim()
+        } else {
+            body
+        };
+        body.strip_prefix("<inputstr>")
+            .and_then(|s| s.strip_suffix("</inputstr>"))
+    } else {
+        let legacy = text
+            .strip_prefix("<html><head></head><body>")
+            .and_then(|s| s.strip_suffix("</body></html>"))
+            .unwrap_or(text);
+        let (status, assignment, end) =
+            if legacy.starts_with("var respStatus = &quot;Challenge&quot;;") {
+                (
+                    "var respStatus = &quot;Challenge&quot;;",
+                    "thisForm.inputStr.value = &quot;",
+                    "&quot;;",
+                )
+            } else {
+                (
+                    "var respStatus = \"Challenge\";",
+                    "thisForm.inputStr.value = \"",
+                    "\";",
+                )
+            };
+        let Some(body) = legacy.strip_prefix(status) else {
+            return Ok(None);
+        };
+        let mut values = body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(assignment));
+        let first = values.next().and_then(|s| s.strip_suffix(end));
+        if values.next().is_some() {
+            return Err("duplicate GlobalProtect challenge token");
+        }
+        first
+    };
+    token
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 512
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.~+/=".contains(&b))
+        })
+        .map(Some)
+        .ok_or("invalid GlobalProtect challenge token")
+}
+
+pub fn gateways(bytes: &[u8]) -> Result<Vec<(String, String)>> {
+    let mut root = document(bytes)?;
+    let result = gateway_choices(&root);
+    clear_xml(&mut root);
+    result
+}
+
+fn gateway_choices(root: &Element) -> Result<Vec<(String, String)>> {
+    if root.name != "policy" {
+        return Err("GlobalProtect portal refused configuration");
+    }
+    let list = unique(root, "gateways")?
+        .and_then(|g| g.child("external"))
+        .and_then(|g| g.child("list"))
+        .ok_or("GlobalProtect portal offered no external gateways")?;
+    let mut choices = Vec::new();
+    for entry in &list.children {
+        if entry.name != "entry" {
+            return Err("invalid GlobalProtect gateway list");
+        }
+        let name = entry
+            .attr("name")
+            .ok_or("missing GlobalProtect gateway address")?;
+        let (host, port) = match name.rsplit_once(':') {
+            Some((h, p)) => (
+                h,
+                p.parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or("invalid GlobalProtect gateway port")?,
+            ),
+            None => (name, 443),
+        };
+        if host.is_empty()
+            || host.len() > 253
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err("invalid GlobalProtect gateway host");
+        }
+        if choices.len() == 64 {
+            return Err("too many GlobalProtect gateways");
+        }
+        let address = format!("{}:{port}", host.to_ascii_lowercase());
+        let description: String = entry
+            .child_text("description")
+            .unwrap_or("")
+            .chars()
+            .filter(|c| {
+                !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+            .take(80)
+            .collect();
+        let label = if description.is_empty() {
+            address.clone()
+        } else {
+            format!("{address} ({description})")
+        };
+        choices.push((address, label));
+    }
+    if choices.is_empty() {
+        return Err("GlobalProtect portal offered no external gateways");
+    }
+    Ok(choices)
 }
 
 /// Clear JNLP argument text after extracting the session, including any
@@ -380,6 +540,43 @@ pub fn hip_check(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_offers_only_host_and_port_choices() {
+        let policy = |name| {
+            format!(
+                r#"<policy><gateways><external><list>
+            <entry name="{name}"><description>Office</description></entry>
+            </list></external></gateways></policy>"#
+            )
+        };
+        let choices = gateways(policy("VPN.Example").as_bytes()).unwrap();
+        assert_eq!(
+            choices,
+            vec![("vpn.example:443".into(), "vpn.example:443 (Office)".into())]
+        );
+        for bad in [
+            "https://example.test",
+            "example.test:0",
+            "user@example.test",
+            "example.test/path",
+        ] {
+            assert!(gateways(policy(bad).as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn challenge_accepts_a_literal_and_rejects_a_computed_value() {
+        let xml =
+            b"<challenge><respmsg>code & token</respmsg><inputstr>nonce</inputstr></challenge>";
+        assert_eq!(challenge(xml), Ok(Some("nonce")));
+        let script = br#"var respStatus = "Challenge";
+thisForm.inputStr.value = "literal";"#;
+        assert_eq!(challenge(script), Ok(Some("literal")));
+        let computed = br#"var respStatus = "Challenge";
+thisForm.inputStr.value = getValue();"#;
+        assert!(challenge(computed).is_err());
+    }
 
     #[test]
     fn prelogin_distinguishes_password_and_saml() {

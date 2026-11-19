@@ -129,8 +129,10 @@ pub fn ask(v: &[Line]) -> Option<Ask> {
             "field" => {
                 let kind = match l.num::<u8>("kind")? {
                     0 => FieldKind::Text,
+                    1 if l.hex("name").as_deref() == Some(b"gp_password_once") => FieldKind::PasswordOnce,
                     1 => FieldKind::Password,
                     2 => FieldKind::Code,
+                    3 if l.hex("name").as_deref() == Some(b"gp_gateway") => FieldKind::GatewayChoice,
                     _ => FieldKind::Choice,
                 };
                 f.fields.push(Field { label: text(l, "label").unwrap_or_default(), kind, choices: Vec::new() });
