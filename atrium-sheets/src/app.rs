@@ -296,6 +296,9 @@ pub struct Sheets {
     /// The link bar: the cell it writes the link of, and its field.
     pub linking: Mutable<Option<(u16, u32, u32)>>,
     pub link_text: Mutable<TextEdit>,
+    /// The exact-size bar: sheet, rows (else columns), first and last.
+    pub size_bar: Mutable<Option<(u16, bool, u32, u32)>>,
+    pub size_text: Mutable<TextEdit>,
     pub list: Mutable<ListPanel>,
     pub valid: Mutable<crate::validation::Panel>,
     pub valid_text: Rc<Vec<Mutable<TextEdit>>>,
@@ -312,7 +315,7 @@ impl Sheets {
     pub fn new(doc: Doc, scroll: Mutable<ScrollState>, grid: Mutable<GridState>, ui: Mutable<Ui>, rev: Mutable<u64>, size: (f32, f32)) -> Self {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), comment_text: Mutable::new(TextEdit::new("")), linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -810,6 +813,34 @@ impl Sheets {
         self.tab_first.set(crate::tabs::reveal(&d.wb, first, d.sheet, room));
     }
 
+    /// The exact-size bar for the selection's rows (or columns), holding
+    /// the cursor's row height (column width).
+    pub fn open_size_bar(&self, rows: bool) {
+        let g = self.grid.get_cloned();
+        let sel = g.selection();
+        let (lo, hi) = if rows { (sel.r0, sel.r1) } else { (sel.c0, sel.c1) };
+        let mut d = self.doc.borrow_mut();
+        if hi - lo >= MAX_SIZED {
+            d.status = format!("Size at most {MAX_SIZED} at once.");
+            drop(d);
+            self.changed();
+            return;
+        }
+        let sh = d.wb.sheet(d.sheet);
+        let now = if rows { sh.row_sizes.size(g.cursor.0) } else { sh.col_sizes.size(g.cursor.1) };
+        let s = d.sheet;
+        drop(d);
+        self.renaming.set(false);
+        self.coloring.set(false);
+        self.commenting.set(None);
+        self.linking.set(None);
+        let mut ed = TextEdit::new(&format!("{}", now.round()));
+        ed.select_all();
+        self.size_text.set(ed);
+        self.size_bar.set(Some((s, rows, lo, hi)));
+        self.changed();
+    }
+
     pub fn tab_cmd(&self, c: crate::tabs::TabCmd) {
         use crate::tabs::TabCmd;
         match c {
@@ -1030,6 +1061,31 @@ impl Sheets {
                 self.linking.set(None);
                 self.changed();
             }
+            TabCmd::SizeDone => {
+                let Some((s, rows, lo, hi)) = self.size_bar.get() else { return };
+                let typed = self.size_text.get_cloned().text().trim().to_string();
+                let most = if rows { MAX_ROW_PX } else { MAX_COL_PX };
+                let mut d = self.doc.borrow_mut();
+                match typed.parse::<f64>() {
+                    Ok(px) if px.is_finite() && (0.0..=most).contains(&px) && s == d.sheet => {
+                        d.size_preview(rows, lo, hi, px.round());
+                        d.size_done();
+                    }
+                    _ => {
+                        d.status = format!("Type a size from 0 to {most} pixels (0 hides).");
+                        drop(d);
+                        self.changed();
+                        return;
+                    }
+                }
+                drop(d);
+                self.size_bar.set(None);
+                self.changed();
+            }
+            TabCmd::SizeCancel => {
+                self.size_bar.set(None);
+                self.changed();
+            }
             TabCmd::WarnKeep => {
                 self.doc.borrow_mut().keep_warned();
                 self.changed();
@@ -1125,6 +1181,18 @@ impl Sheets {
             TextField::new(self.link_text.clone()).autofocus(true).placeholder("https://… or Sheet2!B4").at(146.0, y + 2.0).width(fw).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::LinkDone))).render(ctx);
             Button::primary("Save").at(154.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::LinkDone)).render(ctx);
             Button::secondary("Cancel").at(234.0 + fw, y + 2.0).width(72.0).on_click(push(TabCmd::LinkCancel)).render(ctx);
+            return;
+        }
+        if let Some((_, rows, lo, hi)) = self.size_bar.get() {
+            let st = crate::tabs::style(t.text_primary(), true);
+            let name = |i: u32| if rows { (i + 1).to_string() } else { officina_grid::addr::col_name(i) };
+            let span = if lo == hi { name(lo) } else { format!("{}–{}", name(lo), name(hi)) };
+            let label = if rows { format!("Height of row {span} (px)") } else { format!("Width of column {span} (px)") };
+            ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 200.0, 18.0), content: label, style: st });
+            let cmds = self.cmds.clone();
+            TextField::new(self.size_text.clone()).autofocus(true).at(216.0, y + 2.0).width(90.0).on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::SizeDone))).render(ctx);
+            Button::primary("Set").at(314.0, y + 2.0).width(72.0).on_click(push(TabCmd::SizeDone)).render(ctx);
+            Button::secondary("Cancel").at(394.0, y + 2.0).width(72.0).on_click(push(TabCmd::SizeCancel)).render(ctx);
             return;
         }
         if self.coloring.get() {
@@ -1244,6 +1312,10 @@ impl Sheets {
 
 /// The most rows or columns one drag sizes together.
 pub const MAX_SIZED: u32 = 16_384;
+/// The tallest row and widest column the size bar sets, in px (Excel's
+/// 409 pt and 255 characters, roughly).
+pub const MAX_ROW_PX: f64 = 545.0;
+pub const MAX_COL_PX: f64 = 1790.0;
 
 /// The columns (`rows` false) or rows an edge of `i` sizes: the selected
 /// whole columns (rows) when `i` is one of them, else `i` alone.
@@ -1372,6 +1444,10 @@ impl View for Sheets {
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
                 // A double-click on a column's edge: as wide as its widest entry.
                 // With whole columns selected, every one of them.
+                // On the double line of hidden columns: show them.
+                GridAction::FitCol(col) if crate::data::unhide_cols_at(&mut doc.borrow_mut(), col) => {
+                    rev.set(rev.get().wrapping_add(1));
+                }
                 GridAction::FitCol(col) => {
                     let (lo, hi) = sized_span(&grid.get_cloned().selection(), false, col, &*src);
                     let widths: Vec<(u32, f64)> = (lo..=hi).filter_map(|c| src.fit_width(c).map(|w| (c, w))).collect();
@@ -2014,6 +2090,10 @@ impl Sheets {
                 }
                 Cmd::Data(crate::data::DataCmd::Link) => {
                     self.tab_cmd(crate::tabs::TabCmd::Linking);
+                    false
+                }
+                Cmd::Data(c @ (crate::data::DataCmd::RowHeight | crate::data::DataCmd::ColWidth)) => {
+                    self.open_size_bar(c == crate::data::DataCmd::RowHeight);
                     false
                 }
                 Cmd::Data(crate::data::DataCmd::OpenLink) => {
@@ -2749,6 +2829,42 @@ mod tests {
             assert!(s.doc.borrow_mut().undo());
         }
         assert!(s.doc.borrow().wb.cond_formats().is_empty());
+    }
+
+    #[test]
+    fn the_size_bar_sets_exact_heights_and_widths() {
+        use crate::tabs::TabCmd;
+        let (d, _) = Doc::from_csv("t.csv", b"a,1\nb,2\n").unwrap();
+        let grid = Mutable::new(GridState::default());
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), grid.clone(), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let run = |c: Cmd| {
+            s.cmds.lock().unwrap().push(c);
+            s.take_cmds();
+        };
+        // Columns B:C selected: the bar holds B's width.
+        let mut g = grid.get_cloned();
+        g.select(0, 1);
+        g.cursor = (0, 2);
+        grid.set(g);
+        run(Cmd::Data(crate::data::DataCmd::ColWidth));
+        assert_eq!(s.size_bar.get(), Some((0, false, 1, 2)));
+        assert_eq!(s.size_text.get_cloned().text(), "64");
+        s.size_text.set(TextEdit::new("100"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert!(s.size_bar.get().is_none());
+        let width = |c| s.doc.borrow().wb.sheet(0).col_sizes.size(c);
+        assert_eq!((width(1), width(2), width(3)), (100.0, 100.0, 64.0));
+        // One undo step.
+        assert!(s.doc.borrow_mut().undo());
+        assert_eq!(width(2), 64.0);
+        // Rows; nonsense keeps the bar open with a note.
+        run(Cmd::Data(crate::data::DataCmd::RowHeight));
+        s.size_text.set(TextEdit::new("tall"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert!(s.size_bar.get().is_some() && s.doc.borrow().status.starts_with("Type a size"));
+        s.size_text.set(TextEdit::new("40"));
+        run(Cmd::Tab(TabCmd::SizeDone));
+        assert_eq!(s.doc.borrow().wb.sheet(0).row_sizes.size(0), 40.0);
     }
 
     #[test]
