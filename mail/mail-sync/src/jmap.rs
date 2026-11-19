@@ -49,6 +49,31 @@ pub trait Jmap {
     fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
     /// Store `message` in `folder`, seen (an import, §6.5); its id.
     fn import(&mut self, folder: &str, message: &[u8]) -> Result<String>;
+    /// The account's vacation reply, after setting it to `set` if given;
+    /// `None` when the server has none (§11.6).
+    fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>>;
+}
+
+/// An automatic reply (mail.md §11.6), as the worker carries it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Vacation {
+    pub on: bool,
+    pub from: Option<i64>,
+    pub until: Option<i64>,
+    pub subject: String,
+    pub text: String,
+}
+
+impl From<jmap::Vacation> for Vacation {
+    fn from(v: jmap::Vacation) -> Self {
+        Vacation { on: v.on, from: v.from, until: v.until, subject: v.subject, text: v.text }
+    }
+}
+
+impl From<&Vacation> for jmap::Vacation {
+    fn from(v: &Vacation) -> Self {
+        jmap::Vacation { on: v.on, from: v.from, until: v.until, subject: v.subject.clone(), text: v.text.clone() }
+    }
 }
 
 impl<H: Http> Jmap for Client<H> {
@@ -63,6 +88,9 @@ impl<H: Http> Jmap for Client<H> {
     }
     fn import(&mut self, folder: &str, message: &[u8]) -> Result<String> {
         Client::import(self, folder, message)
+    }
+    fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>> {
+        Client::vacation(self, set)
     }
     fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
         Client::search_server(self, text, sink, limit)
@@ -472,6 +500,20 @@ impl<H: Http> Client<H> {
         let hold = send_at.filter(|_| self.session.max_delayed_send > 0).map(jmap::utc_string);
         let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))?;
         Ok(jmap::submitted(&a)?)
+    }
+
+    /// The vacation reply, set to `set` first if given; `None` when the
+    /// account has none.
+    pub fn vacation(&mut self, set: Option<&Vacation>) -> Result<Option<Vacation>> {
+        if !self.session.can_vacation {
+            return Ok(None);
+        }
+        if let Some(v) = set {
+            let a = self.call(jmap::set_vacation(&self.session.account, &v.into()))?;
+            jmap::vacation_set(&a)?;
+        }
+        let a = self.call(jmap::get_vacation(&self.session.account))?;
+        Ok(Some(jmap::vacation(&a)?.into()))
     }
 
     /// Store `message` in `folder` (a path as [`Client::folders`] names it),

@@ -185,6 +185,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn import(&mut self, folder: &str, message: &[u8]) -> mail_sync::jmap::Result<String> {
         mail_sync::jmap::Jmap::import(&mut self.remote, folder, message)
     }
+    fn vacation(&mut self, set: Option<&mail_sync::jmap::Vacation>) -> mail_sync::jmap::Result<Option<mail_sync::jmap::Vacation>> {
+        mail_sync::jmap::Jmap::vacation(&mut self.remote, set)
+    }
 }
 
 /// Send one message over a submission `courier`, its replies read in the
@@ -286,6 +289,7 @@ impl Engine {
         let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
         let mut s = open_imap(s)?;
         let mut pass = Pass::default();
+        self.away_unsupported(account).map_err(|e| e.to_string())?;
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         self.copy_drafts(account, s.as_mut(), DRAFT_REST).map_err(|e| e.to_string())?;
         // Imported mail (§6.5) goes up; the next sync brings it in.
@@ -322,6 +326,8 @@ impl Engine {
         if self.upload_imports(account, &mut |folder, m| client.import(folder, m).map(|_| ()).map_err(|e| e.0)).map_err(|e| e.to_string())? > 0 {
             client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         }
+        // The automatic reply (§11.6): set what waits, read the server's.
+        self.sync_away(account, client.as_mut()).map_err(|e| e.to_string())?;
         for (id, o) in self.due_sends().map_err(|e| e.to_string())? {
             if o.account != account {
                 continue;

@@ -64,6 +64,9 @@ pub struct SettingsUi {
     pub rules: Vec<String>,
     /// The person's mail rules (§11.6): as written, and in words.
     pub mail_rules: Vec<(String, String)>,
+    /// The automatic reply (§11.6): on in the form, and each account's line.
+    pub away_on: bool,
+    pub away_lines: Vec<(String, String)>,
     /// Private addresses (§13.3): the account shown, its domain, its addresses.
     pub priv_account: Option<AccountId>,
     pub priv_domain: Option<String>,
@@ -161,6 +164,9 @@ pub struct Settings {
     pub vip: Mutable<TextEdit>,
     pub rule: Mutable<TextEdit>,
     pub mail_rule: Mutable<TextEdit>,
+    pub away_until: Mutable<TextEdit>,
+    pub away_subject: Mutable<TextEdit>,
+    pub away_text: Mutable<TextEdit>,
     pub domain: Mutable<TextEdit>,
     pub made_for: Mutable<TextEdit>,
     /// Find someone in the address book.
@@ -181,7 +187,8 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(engine: Rc<Engine>, dirty: std::sync::Arc<std::sync::atomic::AtomicBool>, arca: std::path::PathBuf) -> Settings {
-        let ui = Mutable::with_dirty(SettingsUi::default(), dirty);
+        let away = engine.away_shown();
+        let ui = Mutable::with_dirty(SettingsUi { away_on: away.on, ..SettingsUi::default() }, dirty);
         let prefs = engine.prefs();
         let (f, t) = prefs.quiet.map(|(f, t)| (format_hm(f), format_hm(t))).unwrap_or(("22:00".into(), "07:00".into()));
         let cred_state = ui.sibling(CredentialState::default());
@@ -197,6 +204,9 @@ impl Settings {
             vip: ui.sibling(TextEdit::new("")),
             rule: ui.sibling(TextEdit::new("")),
             mail_rule: ui.sibling(TextEdit::new("")),
+            away_until: ui.sibling(TextEdit::new(&away.until.map(mail_engine::clock::day_iso).unwrap_or_default())),
+            away_subject: ui.sibling(TextEdit::new(&away.subject)),
+            away_text: ui.sibling(TextEdit::new(&away.text.replace('\n', " "))),
             domain: ui.sibling(TextEdit::new("")),
             made_for: ui.sibling(TextEdit::new("")),
             person: ui.sibling(TextEdit::new("")),
@@ -233,6 +243,8 @@ impl Settings {
         let prefs = e.prefs();
         let rules: Vec<String> = e.lane_rules().iter().map(|r| r.text()).collect();
         let mail_rules: Vec<(String, String)> = e.rules().iter().map(|r| (r.text(), r.words())).collect();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let away_lines: Vec<(String, String)> = e.configured().into_iter().map(|(id, c)| (c.address, e.away_line(id, now))).collect();
         let u = self.ui.get_cloned();
         let rows: Vec<Row> = rows;
         let pa = u.priv_account.filter(|a| rows.iter().any(|r| r.id == *a)).or(rows.first().map(|r| r.id));
@@ -251,12 +263,13 @@ impl Settings {
                 u.people_query = q;
             });
         }
-        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
+        if u.rows != rows || u.prefs != prefs || u.rules != rules || u.mail_rules != mail_rules || u.away_lines != away_lines || u.priv_account != pa || u.priv_domain != pd || u.privates != privates || u.my_key != my_key {
             self.update(|u| {
                 u.rows = rows;
                 u.prefs = prefs;
                 u.rules = rules;
                 u.mail_rules = mail_rules;
+                u.away_lines = away_lines;
                 u.priv_account = pa;
                 u.priv_domain = pd;
                 u.privates = privates;
@@ -450,6 +463,41 @@ impl Settings {
 
     /// Company link scanning (§7.6): kept or not, against this persona's
     /// default.
+    // ── away (§11.6) ──
+
+    pub fn toggle_away(&self) {
+        self.update(|u| u.away_on = !u.away_on);
+    }
+
+    /// Keep the automatic reply as the form says; the next sync puts it on
+    /// each account's server.
+    pub fn save_away(&self) {
+        let until_text = self.away_until.get_cloned().text().trim().to_string();
+        let until = if until_text.is_empty() {
+            None
+        } else {
+            match mail_engine::clock::end_of_day(&until_text) {
+                Some(t) => Some(t),
+                None => {
+                    self.update(|u| u.note = Some("The last day reads like 2026-11-30, or leave it empty".into()));
+                    return;
+                }
+            }
+        };
+        let on = self.ui.get_cloned().away_on;
+        let text = self.away_text.get_cloned().text().trim().to_string();
+        if on && text.is_empty() {
+            self.update(|u| u.note = Some("Write the reply first".into()));
+            return;
+        }
+        let a = mail_engine::away::Away { on, from: None, until, subject: self.away_subject.get_cloned().text().trim().to_string(), text };
+        match self.engine.set_away(&a) {
+            Ok(()) => self.update(|u| u.note = Some(if on { "Your reply goes on at the next sync".into() } else { "Your reply goes off at the next sync".into() })),
+            Err(e) => self.update(|u| u.note = Some(format!("Couldn't keep it: {e:?}"))),
+        }
+        self.reload();
+    }
+
     pub fn toggle_link_scanning(&self) {
         let named = self.persona.borrow().is_some();
         self.set_prefs(|p| p.link_scanning = Some(!p.keeps_scanning(named)));
@@ -1018,6 +1066,29 @@ impl SettingsView {
                     button(ctx, right - bw, y + em(20.0), b, false, true, move || s.toggle_private(&a));
                     y += em(44.0);
                 }
+            }
+        }
+        // Away (§11.6): the automatic reply, sent by each account's server.
+        if !ui.away_lines.is_empty() {
+            y += em(8.0);
+            section(ctx, x, &mut y, "AWAY");
+            let s = self.s.clone();
+            switch(ctx, x, y + em(14.0), "Reply automatically", ui.away_on, move || s.toggle_away());
+            y += em(32.0);
+            let lw = em(64.0);
+            let fw = (inner - lw).max(em(160.0));
+            for (label, field, hint) in [("Last day", &self.s.away_until, "2026-11-30, or empty"), ("Subject", &self.s.away_subject, "Away until Monday"), ("Reply", &self.s.away_text, "I'm away until Monday; Sam can help.")] {
+                text(ctx, x, y + em(18.0), label, type_size::SM, Weight::Regular, t.text_secondary());
+                let fy = y + (em(36.0) - pergola::theme::size::input_height()) / 2.0;
+                ctx.place(TextField::new(field.clone()).at(x + lw, fy).width(fw).placeholder(hint));
+                y += em(40.0);
+            }
+            let s = self.s.clone();
+            let bw = measure("Save", type_size::SM, Weight::Medium) + em(24.0);
+            button(ctx, right - bw, y + em(14.0), "Save", true, true, move || s.save_away());
+            y += em(32.0);
+            for (addr, line) in &ui.away_lines {
+                y += para(ctx, x, y, inner, &format!("{addr}: {line}"), type_size::XS, t.text_tertiary()) + em(4.0);
             }
         }
         let left_end = y;

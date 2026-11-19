@@ -1,7 +1,7 @@
 # Mail: Atrium's email app
 
 **Status: accepted 2026-11-16** (Shankar: "Accept as recommended", all of §17 D1–D8 as
-recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host.
+recommended, after review additions §6.4, §11.4, §11.7, §12, §12.1, §15). M0 built (codecs, sender checks, HTML, jail format); M1 mail courier built on the host; M2 engine, sync and a minimal window built on the host; M3 full UI built on the host; M4 compose and send built on the host; M5 attachments built on the host; M6 search, lists, screener, Later and notifications built on the host; M7 S/MIME, JMAP and OAuth (Microsoft) built on the host; account setup, background sync and send, and a settings window built on the host; M8 lanes, cards, private addresses and OpenPGP built on the host (big-file links and local assistance wait on platform pieces); DKIM/DMARC lookups through Nuntius built on the host; push by IMAP IDLE and JMAP EventSource built on the host; IMAP and JMAP sync and sending run in a jailed worker; recipient completion from an address book built on the host; quick filters, grouping, and Later's overdue rules, Dropped list, weekly look, flags from other clients and `$Snoozed` built on the host; grouping kept per folder, by lane, and filters saved as smart folders built on the host; server-side search built on the host; the rest of the notification settings (weekend quiet, replies through, the digest, the review's time) built on the host; first-contact and look-alike notes built on the host; notification buttons built on the host; the Ctrl-K command palette built on the host; the medium and narrow window sizes built on the host; the address book's People section built on the host; a scrolling Settings window and the single-key switch built on the host; recipients outside the company pointed out in Work built on the host; company link scanning kept in Work built on the host; export as mbox built on the host; import from mbox built on the host; Junk and Not junk teaching the server built on the host; the person's own rules built on the host; automatic replies for JMAP accounts built on the host.
 **Asked by Shankar (2026-11-15):** "Let's build specs for an email app for atrium. What can
 we do to make the email experience better in addition to all the secure features we do for
 atrium?"
@@ -1757,6 +1757,24 @@ Stalwart in the cloud VM, and later a real account):
    read, remove). **Not yet**: rules on the server (ManageSieve, JMAP Sieve) so they run
    when the machine is off, vacation replies, "Always…" from the reader, and a rule run
    over mail already here.
+
+   **Automatic reply while away (2026-11-19, §11.6).** Settings has an AWAY section (when
+   there is an account): "Reply automatically", the last day (`2026-11-30` or empty), a
+   subject and the reply, and Save; under it each account's line ("replying until 30 Nov
+   2026", "set at the next sync", "off (its end date passed)", or why not). The server
+   sends the reply, so it works with the machine off. JMAP accounts: `VacationResponse`
+   (RFC 8621 §8, when the account has the capability), set and read back in each pass
+   through the sync worker (`Jmap::vacation`, worker call `JmapVacation`); what is saved
+   waits in the store (`away` table) until a pass sets it, and a failure is kept with its
+   reason and tried again. The last day ends at local midnight (`clock::end_of_day`).
+   IMAP accounts say their server takes automatic replies through ManageSieve, which Mail
+   doesn't do yet, and nothing is asked of them. The reply is one line here (the form has
+   no multi-line field); the server keeps what it is given. Tests: clock 1 (days in any
+   zone, refusals), JMAP 1 (read off, set with a last day and a control character taken
+   out, read back, the lines, turned off), Dovecot 1 (an IMAP account says ManageSieve and
+   isn't asked), settings 1 (no text, a bad day, saved, the line). **Not yet**: ManageSieve
+   (RFC 5804) through a courier for IMAP accounts, which also carries the rules to the
+   server, a start date, and a multi-line reply.
 
 ## 17. Decisions, with recommendations
 

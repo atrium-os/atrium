@@ -639,6 +639,10 @@ fn a_configured_account_syncs_and_sends_in_one_pass() {
     assert!(matches!(engine.store.account_config(account).unwrap().unwrap().reached, Reached::Ok { .. }));
     let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
     assert_eq!(engine.store.count(inbox).unwrap(), 300);
+    // No automatic reply over IMAP yet (§11.6): said, and not asked for.
+    assert!(engine.away_line(account, now()).contains("ManageSieve"));
+    engine.set_away(&mail_store::away::Away { on: true, ..Default::default() }).unwrap();
+    assert!(engine.away(account).wanted.is_none());
 
     // A send made due goes out in the next pass, and its copy lands in Sent.
     let draft = Draft { from: Mailbox::new("Priya Raman", "priya@example.org"), to: vec![Mailbox::new("", "arun@acme.example")], subject: "From the pass".into(), text: "Hi.\n".into(), ..Default::default() };

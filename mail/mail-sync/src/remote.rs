@@ -68,6 +68,8 @@ pub enum Call {
     /// Store a message in a folder, seen (an import, §6.5); answers
     /// [`Reply::JmapSent`] with its id.
     JmapImport { folder: String, message: Vec<u8> },
+    /// The vacation reply, set first if given; answers [`Reply::Vacation`].
+    JmapVacation(Option<crate::jmap::Vacation>),
 }
 
 /// What [`Error`] was, across the wire.
@@ -92,6 +94,7 @@ pub enum Reply {
     /// The session's `maxDelayedSend` (seconds).
     JmapReady { max_delayed_send: u64 },
     JmapSent(std::result::Result<String, String>),
+    Vacation(std::result::Result<Option<crate::jmap::Vacation>, String>),
     Watched(std::result::Result<crate::jmap::Pushed, String>),
     /// How many messages a server search found.
     Found(u32),
@@ -461,7 +464,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapVacation(_) => {
                 let reply = match (next, jmap.as_mut()) {
                     (Call::JmapWatch, Some(c)) => {
                         let mut a = RemoteSink(chan.clone());
@@ -472,6 +475,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
                     (Call::JmapImport { folder, message }, Some(c)) => Reply::JmapSent(c.import(&folder, &message).map_err(|e| e.0)),
+                    (Call::JmapVacation(set), Some(c)) => Reply::Vacation(c.vacation(set.as_ref()).map_err(|e| e.0)),
                     (Call::JmapSearch { text, limit }, Some(c)) => c.search_server(&text, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     _ => unreachable!(),
                 };
@@ -500,7 +504,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
             (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. }, _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } | Call::JmapVacation(_), _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -857,6 +861,14 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
     }
     fn can_hold(&self, secs: i64) -> bool {
         secs > 0 && (secs as u64) <= self.max_delayed_send
+    }
+    fn vacation(&mut self, set: Option<&crate::jmap::Vacation>) -> crate::jmap::Result<Option<crate::jmap::Vacation>> {
+        match self.call(&Call::JmapVacation(set.cloned()), None, QUIET) {
+            Ok(Reply::Vacation(r)) => r.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
     }
     fn import(&mut self, folder: &str, message: &[u8]) -> crate::jmap::Result<String> {
         let c = Call::JmapImport { folder: folder.into(), message: message.to_vec() };

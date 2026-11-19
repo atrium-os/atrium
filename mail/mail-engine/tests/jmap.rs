@@ -48,6 +48,7 @@ struct Server {
     submitted: Vec<Value>,
     downloads: usize,
     hold: u64,
+    vacation: Option<Value>,
 }
 
 impl Server {
@@ -164,6 +165,21 @@ impl Server {
                     }
                     json!({ "newState": self.state.to_string(), "updated": updated, "notUpdated": not_updated, "destroyed": destroyed })
                 }
+                "VacationResponse/get" => {
+                    let v = self.vacation.clone().unwrap_or(json!({ "isEnabled": false, "fromDate": null, "toDate": null, "subject": null, "textBody": null, "htmlBody": null }));
+                    let mut v = v.as_object().unwrap().clone();
+                    v.insert("id".into(), json!("singleton"));
+                    json!({ "state": "v1", "list": [v], "notFound": [] })
+                }
+                "VacationResponse/set" => {
+                    let patch = args["update"]["singleton"].as_object().unwrap().clone();
+                    let mut cur = self.vacation.clone().unwrap_or(json!({})).as_object().unwrap().clone();
+                    for (k, v) in patch {
+                        cur.insert(k, v);
+                    }
+                    self.vacation = Some(Value::Object(cur));
+                    json!({ "newState": "v2", "updated": { "singleton": null } })
+                }
                 "Identity/get" => json!({ "state": "i", "list": [{ "id": "id1", "email": "ada@example.org", "name": "Ada" }] }),
                 "Email/import" => {
                     let e = &args["emails"]["m"];
@@ -196,7 +212,7 @@ impl Http for Fake {
         let body = if url == SESSION {
             serde_json::to_vec(&json!({
                 "capabilities": { "urn:ietf:params:jmap:core": { "maxSizeUpload": 50_000_000 }, "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": {} },
-                "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": { "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold } } } },
+                "accounts": { ACCOUNT: { "name": "ada@example.org", "accountCapabilities": { "urn:ietf:params:jmap:mail": {}, "urn:ietf:params:jmap:submission": { "maxDelayedSend": s.hold }, "urn:ietf:params:jmap:vacationresponse": {} } } },
                 "primaryAccounts": { "urn:ietf:params:jmap:mail": ACCOUNT },
                 "apiUrl": "https://jmap.test/api/",
                 "downloadUrl": "https://jmap.test/download/{accountId}/{blobId}/{name}?type={type}",
@@ -417,6 +433,32 @@ fn jmap_sync_changes_and_send() {
         assert_eq!(s.mails[&sid].boxes.iter().collect::<Vec<_>>(), ["in"]);
         assert!(s.mails[&sid].keywords.contains("$notjunk") && !s.mails[&sid].keywords.contains("$junk"));
     }
+
+    // Away (§11.6): read from the server, then set from here; it waits for
+    // the pass and is read back.
+    engine.sync_away(account, client.as_mut()).unwrap();
+    assert_eq!(engine.away(account).server, Some(Default::default()));
+    assert_eq!(engine.away_line(account, t0), "off");
+    let until = t0 + 7 * 86_400;
+    let away = mail_store::away::Away { on: true, from: None, until: Some(until), subject: "Away\u{7}".into(), text: "Back on the 30th.\nAsk Sam.".into() };
+    engine.set_away(&away).unwrap();
+    assert_eq!(engine.away_line(account, t0), "set at the next sync");
+    assert_eq!(engine.away_shown().text, "Back on the 30th.\nAsk Sam.");
+    engine.sync_away(account, client.as_mut()).unwrap();
+    {
+        let s = server.borrow();
+        let v = s.vacation.as_ref().unwrap();
+        assert_eq!((v["isEnabled"].as_bool(), v["subject"].as_str(), v["textBody"].as_str()), (Some(true), Some("Away"), Some("Back on the 30th.\nAsk Sam.")));
+        assert_eq!(v["toDate"].as_str().and_then(mail_proto::jmap::utc_date), Some(until));
+    }
+    let st = engine.away(account);
+    assert!(st.wanted.is_none());
+    assert_eq!(st.server.as_ref().unwrap().until, Some(until));
+    assert!(engine.away_line(account, t0).starts_with("replying until "), "{}", engine.away_line(account, t0));
+    assert_eq!(engine.away_line(account, until + 1), "off (its end date passed)");
+    engine.set_away(&mail_store::away::Away::default()).unwrap();
+    engine.sync_away(account, client.as_mut()).unwrap();
+    assert_eq!(server.borrow().vacation.as_ref().unwrap()["isEnabled"], json!(false));
 
     // Import (§6.5): an mbox into Archive; Lunch is already here and the
     // new one is twice in the file, so one goes up, seen, and syncs back.

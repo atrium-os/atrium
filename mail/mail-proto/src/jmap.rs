@@ -12,6 +12,8 @@ use serde_json::{json, Map, Value};
 pub const CORE: &str = "urn:ietf:params:jmap:core";
 pub const MAIL: &str = "urn:ietf:params:jmap:mail";
 pub const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+/// RFC 8621 §8: the account's automatic reply.
+pub const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
 
 /// Largest answer read (the caller's HTTP stops at this many bytes).
 pub const MAX_RESPONSE: usize = 16 << 20;
@@ -99,6 +101,8 @@ pub struct Session {
     pub max_size_upload: u64,
     /// The submission capability's `maxDelayedSend` (seconds; 0: none).
     pub max_delayed_send: u64,
+    /// The account has a vacation reply (urn:ietf:params:jmap:vacationresponse).
+    pub can_vacation: bool,
     pub state: String,
 }
 
@@ -128,6 +132,7 @@ pub fn session(body: &[u8]) -> Result<Session> {
         can_submit,
         max_size_upload,
         max_delayed_send,
+        can_vacation: acct.is_some_and(|c| c.contains_key(VACATION)),
         state: get_str(o, "state").filter(|s| state_ok(s)).unwrap_or("0").to_string(),
     })
 }
@@ -297,6 +302,37 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
 /// seen: it is old mail.
 pub fn import(account: &str, blob: &str, mailbox: &str) -> Vec<u8> {
     request(vec![json!(["Email/import", { "accountId": account, "emails": { "m": { "blobId": blob, "mailboxIds": { mailbox: true }, "keywords": { "$seen": true } } } }, "i"])], true)
+}
+
+/// The automatic reply (RFC 8621 §8): on or off, between two times if
+/// given, with a subject (empty: the server's own) and plain text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Vacation {
+    pub on: bool,
+    pub from: Option<i64>,
+    pub until: Option<i64>,
+    pub subject: String,
+    pub text: String,
+}
+
+/// Longest vacation text kept.
+pub const VACATION_TEXT_MAX: usize = 64 << 10;
+
+pub fn get_vacation(account: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "using": [CORE, MAIL, VACATION], "methodCalls": [["VacationResponse/get", { "accountId": account, "ids": ["singleton"] }, "v"]] })).unwrap_or_default()
+}
+
+pub fn set_vacation(account: &str, v: &Vacation) -> Vec<u8> {
+    let t = |x: Option<i64>| x.map(|t| json!(utc_string(t))).unwrap_or(Value::Null);
+    let patch = json!({
+        "isEnabled": v.on,
+        "fromDate": t(v.from),
+        "toDate": t(v.until),
+        "subject": if v.subject.is_empty() { Value::Null } else { json!(v.subject) },
+        "textBody": if v.text.is_empty() { Value::Null } else { json!(v.text) },
+        "htmlBody": Value::Null,
+    });
+    serde_json::to_vec(&json!({ "using": [CORE, MAIL, VACATION], "methodCalls": [["VacationResponse/set", { "accountId": account, "update": { "singleton": patch } }, "v"]] })).unwrap_or_default()
 }
 
 // ---- answers ----
@@ -525,6 +561,30 @@ pub fn imported(a: &Answers) -> Result<String> {
     }
     let id = i.get("created").and_then(|c| c.get("m")).and_then(Value::as_object).ok_or(Error("not stored".into()))?;
     need_id(id, "id")
+}
+
+/// The answer to [`get_vacation`].
+pub fn vacation(a: &Answers) -> Result<Vacation> {
+    let o = a.of("v", "VacationResponse/get")?;
+    let list = o.get("list").and_then(Value::as_array).ok_or(Error("no list".into()))?;
+    let v = list.iter().filter_map(Value::as_object).find(|x| get_str(x, "id") == Some("singleton")).ok_or(Error("no vacation reply".into()))?;
+    let text = |k: &str| get_str(v, k).map(|s| s.chars().filter(|c| *c == '\n' || !c.is_control()).take(VACATION_TEXT_MAX).collect::<String>()).unwrap_or_default();
+    Ok(Vacation {
+        on: v.get("isEnabled").and_then(Value::as_bool).unwrap_or(false),
+        from: get_str(v, "fromDate").and_then(utc_date),
+        until: get_str(v, "toDate").and_then(utc_date),
+        subject: text("subject").replace('\n', " ").chars().take(500).collect(),
+        text: text("textBody"),
+    })
+}
+
+/// The answer to [`set_vacation`].
+pub fn vacation_set(a: &Answers) -> Result<()> {
+    let o = a.of("v", "VacationResponse/set")?;
+    if let Some(e) = o.get("notUpdated").and_then(|n| n.get("singleton")) {
+        return err(format!("not changed: {}", e.get("type").and_then(Value::as_str).unwrap_or("?").chars().take(64).collect::<String>()));
+    }
+    Ok(())
 }
 
 /// The blob id from an upload's answer.
