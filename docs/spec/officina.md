@@ -3761,11 +3761,13 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Before:** copying put only the shown values on the clipboard, so a formula pasted as its result, and a cut emptied the cells at once.
 - **Engine** (`officina-grid::clip::Clip`): `take(wb, rect, cut)` keeps the used part of the area (a whole column costs what it holds): values, formulas and styles. `paste(wb, sheet, row, col)` gives the edit and the area pasted.
   - A copy keeps formulas as expressions, so relative references move with them (`=A1*2` copied four rows down reads `=A5*2`; `$` ones stay). A column of them pastes as one formula fill.
-  - A cut keeps the formula text as it is and empties its source in the same step, so pasting moves the cells, as Excel does. Overlapping moves keep what lands.
+  - A cut empties its source in the same step, so pasting moves the cells, as Excel does. Overlapping moves keep what lands.
+  - References follow moved cells (2026-11-19): every formula in the workbook, the moved ones too, that reads a moved cell, or a range wholly inside the moved area, is rewritten to read it where it went, on whichever sheet. A range only partly inside stays. References from moved formulas to cells left behind keep reading them (named by sheet when the formula lands on another one).
   - Refused: an area that would run off the sheet, and pasting over merged cells.
 - **Sheets:** Copy and Cut still put tab-separated values on the clipboard for other apps, and `Doc.clip` keeps the cells with that text. A paste whose clipboard text is still that text (Windows line ends allowed) pastes the clip; anything else pastes as text, as before. A cut now waits for the paste ("Cut: paste to move it.") and pastes once. One undo step ("Paste" or "Move").
-- **Not yet:** formulas elsewhere that read moved cells following them (Excel's cut does), pasting a clip into a larger selection as tiles, Paste Special (values only, formats only, transpose), and rich formats on the system clipboard for other apps.
-- **Gates:** officina-grid `clip::tests` (3); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`.
+- **Paste Special** (2026-11-19; Data menu, offered after a copy, not a cut): Paste Values (formula results as they were when copied, no formats), Paste Formulas (no formats), Paste Formats (the cells keep what they hold), Paste Transposed (rows become columns, with formats). `Clip::paste_as(…, What, transpose)`. A transposed formula comes as its value for now; Excel turns its references.
+- **Not yet:** names, conditional formats, charts and validation rules following moved cells; formulas that read the cells a move overwrites becoming `#REF!` (Excel's do); pasting a clip into a larger selection as tiles, transposing formulas' references, Paste Special's arithmetic (add, multiply) and skip-blanks, and rich formats on the system clipboard for other apps.
+- **Gates:** officina-grid `clip::tests` (5); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`, `paste_special_is_offered_after_a_copy_and_pastes_values`.
 
 ## 17. Decisions (accepted 2026-11-14)
 
