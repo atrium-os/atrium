@@ -437,8 +437,9 @@ to eleven minutes for that answer. Model `AppsPage::directions`, `set_crossing`;
 Workspace access lists the signed-in person's workspaces and their personas.
 Select Credentials on a workspace to see its persona's stored SSH keys and
 HTTPS tokens, the credential kind and identifier, and the current Grant or
-Revoke action. Curia shows loading, empty and error states and reloads grants
-after a change.
+Revoke action. Curia sorts SSH keys before HTTPS tokens, then by label and
+ID within each type. It shows loading, empty and error states and reloads
+grants after a change.
 
 Portcullisd checks the peer UID against the launch registry and checks the
 installed Settings manifest's `app-grants` capability. It derives the owner

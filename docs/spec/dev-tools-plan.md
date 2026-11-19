@@ -370,6 +370,12 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   credential only for the granted workspace and host. SSH `git push` created a
   branch in a disposable bare repository served over the workspace's loopback,
   and its ref matched the source commit. Revocation blocked both Git operations.
+  Repeat with `sh scripts/vm-m9-curia-check.sh [out-dir]` after booting a
+  disposable amd64 guest with rctl and x86-64-v3 (e.g. `TCG_CPU=Haswell-noTSX`
+  under recent QEMU). `VMDIR` supplies the guest sysroot, and
+  `SSH_AGENT_GATE_PORT` and `SSH_AGENT_GATE_KEY` can select its SSH forwarding
+  port and key. The gate runs the jailed-agent prerequisite, installs Git
+  from the guest package cache or repository, and optionally saves screenshots.
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;

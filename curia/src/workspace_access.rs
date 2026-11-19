@@ -67,7 +67,14 @@ impl Page {
         self.busy = false;
         match reply {
             Ok(Response::WorkspaceList { workspaces, .. }) => self.workspaces = workspaces,
-            Ok(Response::WorkspaceCredentials { credentials }) => self.credentials = credentials,
+            Ok(Response::WorkspaceCredentials { mut credentials }) => {
+                // Keep button positions stable across grant refreshes.
+                credentials.sort_unstable_by(|a, b| {
+                    let token = |item: &WorkspaceCredential| item.kind == WorkspaceCredentialKind::HttpsToken;
+                    (token(a), &a.label, a.id).cmp(&(token(b), &b.label, b.id))
+                });
+                self.credentials = credentials;
+            }
             Ok(Response::Ok) => {
                 if let Some((workspace, persona)) = self.selected.clone() {
                     // Keep the rows visible and their buttons disabled while

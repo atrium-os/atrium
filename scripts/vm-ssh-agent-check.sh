@@ -232,7 +232,8 @@ out=$(run other "set -- '$PUB'; $LOGIN")
 hasnt "not from another workspace" "logged-in-through-the-agent" "$out"
 
 echo "=== no key material"
-out=$(run keys 'grep -rl "PRIVATE KEY" $HOME /tmp /root /var /usr/local 2>/dev/null | grep -v /work/t.sh | head -3; ls -A $HOME/.ssh 2>/dev/null | grep -v -e known_hosts -e authorized_keys')
+# Match the armored key header to avoid false positives from package documentation.
+out=$(run keys 'grep -rEl "^-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----$" "$HOME" /tmp /root /var /usr/local 2>/dev/null | head -3; ls -A "$HOME/.ssh" 2>/dev/null | grep -v -e known_hosts -e authorized_keys')
 check "no private key file in the workspace" "" "$out"
 r=$(V "su -m alice -c 'SSH_AUTH_SOCK=$AR/alice.keys/agent.sock ssh-add -L 2>&1'")
 hasnt "the socket refuses alice's own uid" "ssh-ed25519" "$r"
