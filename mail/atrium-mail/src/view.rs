@@ -3905,8 +3905,21 @@ impl MailView {
                 let i = *i;
                 let x = gap + col as f32 * tile_w;
                 let mail = mail.clone();
-                let fill = if cursor == Some(i) { t.selection_bg() } else { t.bg_window() };
-                area(ctx, Rect::new(x, gap, tile_w - gap, file_tile_h() - gap), fill, move || mail.open(i));
+                let fill = if cursor == Some(i) { t.selection_bg() } else { t.bg_elevated() };
+                let radius = pergola::theme::radius::MD;
+                let edge = pergola::theme::stroke::DEFAULT;
+                let card = Rect::new(x, gap, tile_w - gap, file_tile_h() - gap);
+                ctx.add(Node::Rect { rect: card, fill: t.border_default(), radius });
+                let face = Rect::new(card.x() + edge, card.y() + edge, card.w() - 2.0 * edge, card.h() - 2.0 * edge);
+                let id = ctx.push(Node::Rect { rect: face, fill, radius: radius - edge });
+                if let Some(overlay) = ctx.is_pressed(id).then(|| t.state_pressed())
+                    .or_else(|| ctx.is_hovered(id).then(|| t.state_hover()))
+                {
+                    if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(id) {
+                        *fill = overlay.over(*fill);
+                    }
+                }
+                ctx.on_click(id, move || mail.open(i));
                 let image = file.picture.as_ref().and_then(|part| {
                     cache.iter().find(|(key, _)| key == part).and_then(|(_, image)| image.as_ref())
                 });
@@ -3919,12 +3932,12 @@ impl MailView {
                     ctx.add(Node::Image { rect: Rect::new(left, em(32.0) - h / 2.0, w, h), image: image.clone() });
                 } else {
                     pergola::widgets::Glyph::new(crate::files::ph::FILE)
-                        .size(30.0).color(t.text_secondary()).at(x + em(10.0), em(21.0)).emit(ctx);
+                        .size(30.0).color(t.text_primary()).at(x + em(10.0), em(21.0)).emit(ctx);
                 }
-                let label = fit(&file.name, type_size::SM, Weight::Medium, tile_w - gap - em(20.0));
-                text(ctx, x + em(10.0), em(64.0), &label, type_size::SM, Weight::Medium, t.text_primary());
+                let label = fit(&file.name, type_size::SM, Weight::Semibold, tile_w - gap - em(20.0));
+                text(ctx, x + em(10.0), em(64.0), &label, type_size::SM, Weight::Semibold, t.text_primary());
                 let size = mail_engine::files::size_words(file.size);
-                text(ctx, x + em(10.0), em(86.0), &size, type_size::XS, Weight::Regular, t.text_secondary());
+                text(ctx, x + em(10.0), em(86.0), &size, type_size::SM, Weight::Regular, t.text_primary());
                 ctx.pop();
             }
             ctx.pop();

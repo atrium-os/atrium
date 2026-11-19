@@ -505,7 +505,8 @@ doesn't run a spam classifier of its own in v1.
   not a path.
 - **All files in a thread** at the top of the conversation; **all files from a person** and
   a Files view across the persona's mail. Files and searches with `has:attachment` show
-  one tile per attachment with its file icon, name and size. A press opens the source
+  one tile per attachment with its file icon, name and size. Tiles use Pergola's raised
+  card surface and primary text color for both labels. A press opens the source
   message. Up and Down move between source messages. Visible tiles for locally stored,
   unencrypted PNG, JPEG, GIF and WebP attachments get bounded thumbnails from an unplaced
   Limen doc-viewer. The original is passed on a sealed memory descriptor. Mail keeps the
