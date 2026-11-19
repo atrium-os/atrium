@@ -1,0 +1,172 @@
+--- a/Libraries/LibWasm/Engine/Cargo.toml
++++ b/Libraries/LibWasm/Engine/Cargo.toml
+@@ -12,9 +12,11 @@
+ ak = { path = "../../../AK/Rust" }
+ ladybird_allocator = { path = "../../RustAllocator", optional = true }
+ libc = "0.2"
+-libwasm_jit = { path = "../JIT" }
+ libwasm_module = { path = "../Module" }
+ rustc-demangle = "0.1"
++
++[target.'cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))'.dependencies]
++libwasm_jit = { path = "../JIT" }
+
+ [features]
+ default = []
+--- a/Libraries/LibWasm/Engine/src/runtime/mod.rs
++++ b/Libraries/LibWasm/Engine/src/runtime/mod.rs
+@@ -39,6 +39,7 @@
+ pub mod heap;
+ pub mod helpers;
+ pub mod interpreter;
++#[cfg_attr(all(target_os = "freebsd", target_arch = "aarch64"), path = "interpreter_only.rs")]
+ pub mod jit;
+ pub mod memory;
+ pub mod ranges;
+@@ -255,6 +256,7 @@
+     pub vector_storage: Box<[u32]>,
+     pub kind: FunctionKind,
+     /// Where compiled code passes its values, once a call between the tiers needed it.
++    #[cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))]
+     pub native_shapes: std::cell::OnceCell<Box<jit::NativeShapes>>,
+ }
+
+@@ -396,6 +398,7 @@
+     /// whatever makes it stop the store.
+     pub agent_waiter: Option<Arc<AgentWaiter>>,
+     /// The store's compiled code, once it has some.
++    #[cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))]
+     jit: Option<jit::StoreJit>,
+ }
+
+@@ -450,6 +453,7 @@
+             memory_grow_callback: None,
+             can_block: true,
+             agent_waiter: None,
++            #[cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))]
+             jit: None,
+         }
+     }
+@@ -639,6 +643,7 @@
+                 ty,
+                 vector_storage: Box::new([]),
+                 kind: FunctionKind::Host(callback),
++                #[cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))]
+                 native_shapes: std::cell::OnceCell::new(),
+             },
+         );
+@@ -937,6 +942,7 @@
+                         index: module.imported_function_count + offset as u32,
+                         instance: instance_address,
+                     },
++                    #[cfg(not(all(target_os = "freebsd", target_arch = "aarch64")))]
+                     native_shapes: std::cell::OnceCell::new(),
+                 },
+             );
+--- a/Libraries/LibWasm/Engine/src/runtime/memory.rs
++++ b/Libraries/LibWasm/Engine/src/runtime/memory.rs
+@@ -57,13 +57,18 @@
+
+ #[cfg(unix)]
+ mod platform {
++    #[cfg(target_os = "freebsd")]
++    const RESERVATION_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
++    #[cfg(not(target_os = "freebsd"))]
++    const RESERVATION_FLAGS: libc::c_int = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
++
+     pub unsafe fn reserve(size: usize) -> *mut u8 {
+         let pointer = unsafe {
+             libc::mmap(
+                 std::ptr::null_mut(),
+                 size,
+                 libc::PROT_NONE,
+-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
++                RESERVATION_FLAGS,
+                 -1,
+                 0,
+             )
+--- a/Libraries/LibWasm/Engine/src/runtime/interpreter.rs
++++ b/Libraries/LibWasm/Engine/src/runtime/interpreter.rs
+@@ -219,6 +219,12 @@
+     static INSTALL: Once = Once::new();
+     static mut PREVIOUS_SIGSEGV: libc::sigaction = unsafe { std::mem::zeroed() };
+     static mut PREVIOUS_SIGBUS: libc::sigaction = unsafe { std::mem::zeroed() };
++
++    #[cfg(all(target_os = "freebsd", target_arch = "aarch64"))]
++    unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
++        let context = context.cast::<libc::ucontext_t>();
++        unsafe { (&raw mut (*context).uc_mcontext.mc_gpregs.gp_elr).cast() }
++    }
+
+     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+     unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
+--- /dev/null
++++ b/Libraries/LibWasm/Engine/src/runtime/interpreter_only.rs
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: BSD-2-Clause
++
++//! FreeBSD arm64 uses the statically assembled interpreter for every function.
++
++use super::{FunctionAddress, FunctionInstance, InstanceAddress, Store};
++use crate::abi::ExecutionContext;
++
++pub fn initial_tier_up_budget() -> u32 {
++    u32::MAX
++}
++pub fn initial_native_entry() -> u64 {
++    0
++}
++pub fn instantiated(_: &mut Store, _: InstanceAddress) {}
++pub fn large_images_in_use() -> usize {
++    0
++}
++pub fn release_large_images(_: usize) {}
++
++impl Store {
++    pub fn disable_jit(&mut self) {}
++}
++
++pub unsafe fn redirect_fault(_: *mut libc::c_void) -> bool {
++    false
++}
++
++export_runtime_functions! {
++    wasm_runtime_tier_up => reset_budget,
++    wasm_runtime_call_compiled => invalid_native_entry,
++}
++
++unsafe fn reset_budget(context: *mut ExecutionContext) -> u64 {
++    unsafe {
++        let header = (*context).arguments[0] as *const FunctionInstance;
++        FunctionAddress::from_ptr(header).get_mut().header.tier_up_budget = u32::MAX;
++    }
++    0
++}
++
++unsafe fn invalid_native_entry(_: *mut ExecutionContext) -> u64 {
++    std::process::abort()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::runtime::{ExternValue, Trap, Value};
++
++    #[test]
++    fn interprets_after_a_guarded_memory_trap() {
++        let module = crate::compile(include_bytes!("../../tests/fixtures/basics.wasm")).unwrap();
++        let mut store = Store::new();
++        let instance = store.instantiate(std::sync::Arc::new(module), &[]).unwrap();
++        let Some(ExternValue::Function(load)) = store.instance(instance).export("out_of_bounds") else {
++            panic!("missing load fixture");
++        };
++        assert_eq!(store.invoke(load, &[]), Err(Trap::MemoryOutOfBounds));
++        let Some(ExternValue::Function(add)) = store.instance(instance).export("add") else {
++            panic!("missing add fixture");
++        };
++        assert_eq!(
++            store.invoke(add, &[Value::I32(40), Value::I32(2)]),
++            Ok(vec![Value::I32(42)])
++        );
++    }
++}

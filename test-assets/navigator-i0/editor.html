@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Navigator I0 editor</title>
+<style>
+  body { margin: 0; background: white; color: black; font: 16px/24px "IBM Plex Mono", monospace; }
+  #viewport { width: 480px; height: 192px; overflow: auto; background: white; }
+  #editor { outline: none; caret-color: #c00000; }
+  p { margin: 0; white-space: pre; }
+</style>
+<main id="viewport" aria-label="Document viewport">
+  <div id="editor" role="textbox" aria-label="Document" aria-multiline="true"
+       contenteditable="true" spellcheck="false"></div>
+</main>
+<script>
+"use strict";
+const editor = document.querySelector("#editor");
+for (let line = 1; line <= 128; ++line) {
+  const paragraph = document.createElement("p");
+  paragraph.textContent = "Line " + String(line).padStart(3, "0") + " | alpha beta gamma";
+  editor.append(paragraph);
+}
+editor.focus();
+const anchor = editor.children[3].firstChild;
+getSelection().collapse(anchor, anchor.textContent.indexOf("beta"));
+</script>
+</html>
