@@ -53,7 +53,10 @@ AnyConnect gateways at 198.51.100.52:443-446 (vpn.md §11): the guest's TCP
 to them ends here, in a small TCP of this script's own, and each connection
 is carried on to 127.0.0.1:8443-8446 (crypta-ocserv-vm.sh's forwards to
 ocserv in the Ubuntu VM). Ports 447 and 448 go to 127.0.0.1:8447-8448: the
-SAML stand-in gateway and Keycloak (crypta-sso-stand.sh).
+SAML stand-in gateway and Keycloak (crypta-sso-stand.sh). The same two are
+also at 172.16.47.1:447-448, a private address beyond the router, which Arca's
+couriers may reach under their test grant (a documentation address they may
+not), for the sign-in window's pages.
 """
 import json, random, socket, struct, sys
 
@@ -79,6 +82,8 @@ WG_PORT = 51820
 WG_RELAY = ("127.0.0.1", 51820)
 AC_GW = bytes([198, 51, 100, 52])  # AnyConnect gateways, beyond the router
 AC_PORTS = {443: 8443, 444: 8444, 445: 8445, 446: 8446, 447: 8447, 448: 8448}
+SSO_GW = bytes([172, 16, 47, 1])  # the SAML stand-in and Keycloak, privately
+GW_PORTS = {AC_GW: AC_PORTS, SSO_GW: {447: 8447, 448: 8448}}
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
 seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120
@@ -483,20 +488,20 @@ def after(a, b):
 class Ac:
     """One guest connection, ended here and carried to the host's port."""
 
-    def __init__(self, gmac, gip, gport, dport, isn):
+    def __init__(self, gmac, gip, gport, dport, isn, gw=AC_GW):
         import time
-        self.gmac, self.gip, self.gport, self.dport = gmac, gip, gport, dport
+        self.gmac, self.gip, self.gport, self.dport, self.gw = gmac, gip, gport, dport, gw
         self.rcv = (isn + 1) % M32
         self.una = self.nxt = random.getrandbits(32)
         self.buf = b""  # from una: sent and not acknowledged, then not sent
         self.wnd = 65535
         self.host_done = self.fin_sent = self.guest_done = False
         self.sent_at = time.monotonic()
-        self.host = socket.create_connection(("127.0.0.1", AC_PORTS[dport]), timeout=5)
+        self.host = socket.create_connection(("127.0.0.1", GW_PORTS[gw][dport]), timeout=5)
         self.host.setblocking(False)
 
     def seg(self, seq, flags, data=b""):
-        return eth(self.gmac, RMAC, 0x0800, tcp_seg(AC_GW, self.gip, self.dport, self.gport, seq % M32, self.rcv, flags, data))
+        return eth(self.gmac, RMAC, 0x0800, tcp_seg(self.gw, self.gip, self.dport, self.gport, seq % M32, self.rcv, flags, data))
 
     def flush(self):
         import time
@@ -584,21 +589,21 @@ class Ac:
                 del ac[k]
 
 
-def handle_ac(src_mac, s, body):
+def handle_ac(src_mac, s, body, gw=AC_GW):
     if len(body) < 20:
         return []
     sport, dport, seq, ack, off, flags = struct.unpack("!HHIIBB", body[:14])
-    key = (s, sport, dport)
+    key = (s, sport, dport, gw)
     c = ac.get(key)
     if flags & 0x02 and not flags & 0x10:  # SYN
         if c is not None:
             c.close()
-        if dport not in AC_PORTS:
-            return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
+        if dport not in GW_PORTS[gw]:
+            return [eth(src_mac, RMAC, 0x0800, tcp_seg(gw, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
         try:
-            c = Ac(src_mac, s, sport, dport, seq)
+            c = Ac(src_mac, s, sport, dport, seq, gw)
         except OSError:
-            return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
+            return [eth(src_mac, RMAC, 0x0800, tcp_seg(gw, s, dport, sport, 0, (seq + 1) % M32, 0x14))]
         stats["ac_syn"] = stats.get("ac_syn", 0) + 1
         ac[key] = c
         f = c.seg(c.nxt, 0x12)
@@ -608,7 +613,7 @@ def handle_ac(src_mac, s, body):
     if c is None:
         if flags & 0x04:
             return []
-        return [eth(src_mac, RMAC, 0x0800, tcp_seg(AC_GW, s, dport, sport, ack, (seq + len(body) - (off >> 4) * 4) % M32, 0x14))]
+        return [eth(src_mac, RMAC, 0x0800, tcp_seg(gw, s, dport, sport, ack, (seq + len(body) - (off >> 4) * 4) % M32, 0x14))]
     return c.guest(body)
 
 
@@ -903,8 +908,8 @@ def frame(f, relay=None):
                 return [eth(src, RMAC, 0x0800, ip(DNS, s, 17, udp(DNS, s, 53, sport, a)))]
     if proto == 6 and d == WEB:
         return handle_tcp(src, s, body)
-    if proto == 6 and d == AC_GW:
-        return handle_ac(src, s, body)
+    if proto == 6 and d in GW_PORTS:
+        return handle_ac(src, s, body, d)
     if proto == 6 and d == ROUTER:
         return handle_tcp(src, s, body, ROUTER)
     if proto == 1 and len(body) >= 8 and body[0] == 8 and d in (ROUTER, DNS, WEB):

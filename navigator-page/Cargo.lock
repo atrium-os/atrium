@@ -1239,6 +1239,7 @@ dependencies = [
  "pergola",
  "pergola-document",
  "png 0.17.16",
+ "url",
 ]
 
 [[package]]

@@ -126,6 +126,79 @@ sso_checks() {
     "$V" "$CTL down name=sso" >/dev/null
 }
 
+# The sign-in window as it runs (vpn.md §9.3): navigatord as the Navigator's
+# broker in the profile's jar, every page through a courier that
+# arca-courierd starts in a jail of its own, the forms sent as the window's
+# form panel would (the probe stands in for the UI and the page child),
+# the password typed into Arca's field (held by arca-ui: here arca-probe as
+# its uid), Keycloak's session kept for the next sign-in, and gone with the
+# profile. The stand's names point at lan.py's private relay (172.16.47.1),
+# which couriers may reach under their test grant.
+SSO_LAN=172.16.47.1
+NV=/tmp/crypta-nav
+nav_window() { # $1 profile, $2 login, $3 final; prints the probe's lines
+    # No fetcher: an empty fixtures folder, so nothing comes the plain way.
+    "$V" "pkill -f 'navigatord --unconfined' ; sleep 1; rm -rf $NV; mkdir -p $NV/none; chown -R cg-nav $NV
+        su -m cg-nav -c 'cd $NV && env NAVIGATORD_FIXTURES=$NV/none NAVIGATORD_SOCKET=$NV/nav.sock NAVIGATORD_PAGE_SOCKET=$NV/page.sock NAVIGATORD_PRERENDER=$G/prerender \
+            NAVIGATORD_ARCA=$G/arcad.sock NAVIGATORD_COURIERD=/atrium/sockets/arca-courier/courierd.sock NAVIGATORD_VPN_SIGN_IN=\"$1 $2 $3\" \
+            daemon -f -o $NV/navigatord.log $G/navigatord --unconfined-for-testing' </dev/null
+        i=0; while [ \$i -lt 30 ] && ! test -S $NV/nav.sock; do sleep 1; i=\$((i+1)); done
+        test -S $NV/nav.sock || { echo \"stuck navigatord: \$(cat $NV/navigatord.log)\"; exit 1; }" || return 0
+    h=$("$V" "su -m cg-ui -c '$G/arca-probe $G/arcad.sock hold alice $NAVPUB org.atrium.navigator alice-sso-pw'" | sed -n 's/^status=0 body=//p')
+    "$V" "su -m cg-nav -c '$G/sign-in-probe $NV/nav.sock $NV/page.sock \"$2\" \"$3\" alice $h'" 2>&1 || true
+}
+
+window_checks() {
+    "$V" "set -e
+        install -m 755 $G/arca-courier /usr/local/bin/atrium-arca-courier
+        install -m 755 $G/arca-courierd /usr/local/bin/arca-courierd
+        sed -i '' -e '/sso.crypta.test/d' -e '/idp.crypta.test/d' /etc/hosts
+        echo '$SSO_LAN sso.crypta.test idp.crypta.test' >> /etc/hosts
+        pkill -x arca-courierd || true; sleep 1
+        chmod 755 $G
+        env ARCA_COURIERD_CA=$G/ca.pem ARCA_COURIERD_GRANT_PRIVATE_NETWORK=1 ARCA_WEB_BROKER='org.atrium.navigator $NAVPUB' \
+            ARCA_APP_REGISTRY=$G/apps.registry ARCA_COURIER_REGISTRY=/var/run/atrium/courier-registry \
+            daemon -f -o $G/courierd.log /usr/local/bin/arca-courierd
+        i=0; while [ \$i -lt 30 ] && ! test -S /atrium/sockets/arca-courier/courierd.sock; do sleep 1; i=\$((i+1)); done
+        test -S /atrium/sockets/arca-courier/courierd.sock"
+    "$V" "$CTL create-ac name=win host=sso.crypta.test:447 ca=$CA scoped=0" >/dev/null || fail "create win"
+    "$V" "$CTL up name=win" >/dev/null
+    wait_for win signin sso "no single sign-on asked"
+    pr=$("$V" "$CTL prompt name=win")
+    login=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="login")print a[2]}}')")
+    fin=$(unhex "$(echo "$pr" | awk '/^sso /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="final")print a[2]}}')")
+    r=$(nav_window win "$login" "$fin")
+    echo "$r" | sed 's/^/     /'
+    echo "$r" | grep -q 'form POST .*/login-actions/authenticate .*password=<arca>' && ok "Keycloak's login form went with the password from Arca's field (the probe never had it)" || fail "login form: $r"
+    echo "$r" | grep -q 'form POST https://sso.crypta.test:447/+CSCOE+/saml/sp/acs .*SAMLResponse=' && ok "its signed answer went on to the gateway (the noscript Continue)" || fail "SAML post: $r"
+    echo "$r" | grep -q "^final " && ok "the window reached the final address" || fail "no final page: $r"
+    cl=$("$V" "grep -o 'courier [0-9]* for org.atrium.navigator (alice) to [a-z.]*:[0-9]*' $G/courierd.log | awk '{print \$NF}' | sort -u | tr '\\n' ' '")
+    case "$cl" in *idp.crypta.test:448*sso.crypta.test:447*) ok "every page through couriers in jails of their own ($cl)" ;; *) fail "couriers: $cl $("$V" "tail -5 $G/courierd.log")" ;; esac
+    wait_for win handshake 1 "not signed on with the window's token"
+    ok "signed on: the token the gateway set in the window's jar reached the engine through Arca (tunnel $(tl win addr))"
+    "$V" "grep -rqs alice-sso-pw $NV $G/state $G/cryptad.log $G/courierd.log" && fail "the IdP password is in a log" || ok "the IdP password is in no log or state"
+    # Keycloak's own session stayed in the profile's jar: the next sign-in
+    # asks for no password.
+    "$V" "$CTL down name=win" >/dev/null
+    "$V" "$CTL up name=win" >/dev/null
+    wait_for win signin sso "no sign-on asked again"
+    r=$(nav_window win "$login" "$fin")
+    echo "$r" | sed 's/^/     /'
+    echo "$r" | grep -q 'password=' && fail "asked for the password again: $r" || ok "the next sign-in: Keycloak's session from the profile's jar, no password asked"
+    wait_for win handshake 1 "not signed on the second time"
+    "$V" "$CTL down name=win" >/dev/null
+    # Removed and made again under the same name: the jar is gone.
+    "$V" "$CTL delete name=win" >/dev/null || fail "delete win"
+    "$V" "$CTL create-ac name=win host=sso.crypta.test:447 ca=$CA scoped=0" >/dev/null || fail "create win again"
+    "$V" "$CTL up name=win" >/dev/null
+    wait_for win signin sso "no sign-on asked after removal"
+    r=$(nav_window win "$login" "$fin")
+    echo "$r" | grep -q 'password=<arca>' && ok "after removing the profile, Keycloak asks for the password again: its session went with the jar" || fail "after removal: $r"
+    wait_for win handshake 1 "not signed on after removal"
+    "$V" "$CTL down name=win" >/dev/null
+    "$V" "pkill -f 'navigatord --unconfined'; pkill -x arca-courierd" || true
+}
+
 case "${1:-}" in
 run)
     for p in 8443 8444 8445 8446; do
@@ -134,7 +207,15 @@ run)
     CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
     (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-probe)
     (cd "$ROOT/crypta" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T -p crypta-engine)
-    EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe"
+    (cd "$ROOT/navigatord" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin navigatord)
+    (cd "$ROOT/navigator-prerender" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin prerender)
+    (cd "$ROOT/navigator-page" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --example sign-in-probe)
+    (cd "$ROOT/arca/arca-courierd" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courierd)
+    (cd "$ROOT/arca/arca-courier" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target $T --bin arca-courier)
+    EXTRA="$ROOT/crypta/target/$T/release/atrium-crypta-ac $ROOT/arca/arcad/target/$T/release/arca-probe
+        $ROOT/navigatord/target/$T/release/navigatord $ROOT/navigator-prerender/target/$T/release/prerender
+        $ROOT/navigator-page/target/$T/release/examples/sign-in-probe $ROOT/arca/arca-courierd/target/$T/release/arca-courierd
+        $ROOT/arca/arca-courier/target/$T/release/arca-courier $P/ca.pem"
     setup
 
     echo "== the AnyConnect engine, Arca's field and a person's store"
@@ -146,9 +227,11 @@ run)
         # The Navigator's broker and one web courier, as arcad knows them
         # (the launch and courier registries): a VPN sign-in window's jar.
         echo \"\$(id -u cg-nav) alice org.atrium.navigator $NAVPUB persona=vpn\" > $G/apps.registry
-        echo '$COURIER_UID alice web https sso.crypta.test 447 vpn-sso.crypta.test' > $G/courier-registry
-        env ARCA_DIR=$G/arca ARCA_SOCKET=$G/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry ARCA_SERVICES=cryptad=65052 ARCA_SIGILLUM_SOCKET=none \
-            ARCA_WEB_BROKER='org.atrium.navigator $NAVPUB' ARCA_COURIER_REGISTRY=$G/courier-registry \
+        mkdir -p /var/run/atrium; echo '$COURIER_UID alice web https sso.crypta.test 447 vpn-sso.crypta.test' > /var/run/atrium/courier-registry
+        # Where couriers' jails find arcad.
+        mkdir -p /atrium/sockets/arca /var/run/atrium; rm -f $G/arcad.sock; ln -s /atrium/sockets/arca/arcad.sock $G/arcad.sock
+        env ARCA_DIR=$G/arca ARCA_SOCKET=/atrium/sockets/arca/arcad.sock ARCA_APP_REGISTRY=$G/apps.registry ARCA_SERVICES=cryptad=65052 ARCA_SIGILLUM_SOCKET=none \
+            ARCA_WEB_BROKER='org.atrium.navigator $NAVPUB' ARCA_COURIER_REGISTRY=/var/run/atrium/courier-registry \
             ARCA_VESTIBULUM_UID=\$(id -u cg-vest) ARCA_UI_UID=\$(id -u cg-ui) daemon -f -o $G/arcad.log /usr/local/bin/atrium-arcad-gate
         sleep 1
         su -m cg-vest -c '$G/arca-probe $G/arcad.sock unlock alice correct-horse' >/dev/null
@@ -294,8 +377,15 @@ run)
         echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"
     fi
 
+    echo "== the sign-in window: navigatord, Arca's couriers, Keycloak"
+    if nc -z 127.0.0.1 8447 2>/dev/null && nc -z 127.0.0.1 8448 2>/dev/null; then
+        window_checks
+    else
+        echo "skip the SAML stand is not up (sh scripts/crypta-sso-stand.sh up)"
+    fi
+
     echo "== delete: everything Arca kept for the profiles"
-    for n in corp ann otp cert pin badpin hostile sso; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
+    for n in corp ann otp cert pin badpin hostile sso win; do "$V" "$CTL delete name=$n" >/dev/null || fail "delete $n"; done
     left=$(arca_items)
     [ "$left" = 0 ] && ok "Arca keeps nothing for them (passwords, sessions, the client key)" || fail "Arca still holds items: $left"
     echo "crypta V4 gate: $pass checks passed"
