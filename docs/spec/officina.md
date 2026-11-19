@@ -3674,7 +3674,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - **Grid:** `GridSource::frozen_from`. The bands start there, and `scroll::Physics` gained a `min` (`set_min`), so the body can't scroll above it.
   - **.xlsx:** `<sheetView topLeftCell>` is the first frozen cell, and `xSplit`/`ySplit` count the frozen columns and rows from it. **.ods:** `PositionTop`/`PositionLeft`. LibreOffice keeps it both ways (`tests/freeze.rs`, sheet "Scrolled").
   - The status bar names the frozen rows and columns, e.g. "Rows 11 to 12 and columns B to C stay in view".
-- **Not yet:** repeating frozen rows when printing.
+- **Printing:** the frozen rows and columns repeat on every printed page that starts below or right of them, as print titles (not when they would take more than half the page; printing.md §11.4).
 - **Gates:** officina-grid `frozen_panes_are_set_undone_and_saved`; officina-convert `tests/freeze.rs`; pergola `frozen_rows_and_columns_stay_in_view`, `rows_frozen_from_the_top_of_the_view_hide_those_above`; atrium-sheets `panes_freeze_at_the_cursor_and_unfreeze`.
 
 ### 16.83 Data validation (2026-11-18)
