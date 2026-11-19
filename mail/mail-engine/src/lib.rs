@@ -27,6 +27,7 @@ pub mod pictures;
 pub mod send;
 pub mod senders;
 pub mod later;
+mod snooze;
 pub mod quick;
 pub mod notify;
 pub mod smime;
@@ -337,7 +338,7 @@ impl Engine {
     }
 
     pub fn sink(&self, account: AccountId) -> AccountSink<'_> {
-        AccountSink { e: self, account, refused: 0 }
+        AccountSink { e: self, account, refused: 0, snoozed: None }
     }
 
     /// A message for reading. Its whole bytes when here, parsed alone; else
@@ -415,6 +416,7 @@ pub struct AccountSink<'a> {
     account: AccountId,
     /// Messages the parse jail refused (kept out of the list).
     pub refused: usize,
+    snoozed: Option<(FolderId, String)>,
 }
 
 fn role(r: mail_sync::Role) -> Role {
@@ -442,10 +444,16 @@ impl AccountSink<'_> {
 impl Sink for AccountSink<'_> {
     fn folders(&mut self, list: &[mail_sync::RemoteFolder]) -> Result<(), String> {
         let known: Vec<(FolderId, Folder)> = self.e.store.folders(self.account).map_err(|e| e.to_string())?;
+        let managed = self.server_state(mail_sync::SNOOZED_STATE);
+        self.snoozed = None;
         for f in list {
             let id = self.e.store.folder_id(self.account, &f.name, role(f.role)).map_err(|e| e.to_string())?;
             let mut cur = self.e.store.folder(id).map_err(|e| e.to_string())?;
-            let (r, hidden) = (role(f.role), !f.selectable);
+            let parked = managed.as_ref() == Some(&f.name);
+            if parked && f.selectable {
+                self.snoozed = Some((id, f.name.clone()));
+            }
+            let (r, hidden) = (role(f.role), !f.selectable || parked);
             if cur.role != r || cur.hidden != hidden {
                 cur.role = r;
                 cur.hidden = hidden;
@@ -485,6 +493,7 @@ impl Sink for AccountSink<'_> {
 
     fn messages(&mut self, folder: &str, page: Vec<mail_sync::Fetched>) -> Result<(), String> {
         let id = self.fid(folder)?;
+        let (tracked, mut links) = self.parked_links(id).map_err(|e| e.to_string())?;
         let mut stored = Vec::with_capacity(page.len());
         let mut keys = Vec::new();
         // Blobs first (named by content), then summaries from jails in
@@ -514,7 +523,17 @@ impl Sink for AccountSink<'_> {
                     continue;
                 };
                 let blob = self.e.store.put_blob(&f.bytes).map_err(|e| e.to_string())?;
-                stored.push((f.uid, Incoming {
+                let link = if !tracked.is_empty() && self.e.store.at(id, f.uid).map_err(|e| e.to_string())?.is_none() {
+                    if let Some(server) = &f.server_id {
+                        self.e.store.by_server_id(self.account, server).map_err(|e| e.to_string())?
+                            .filter(|msg| tracked.contains(msg))
+                    } else {
+                        links.remove(&(mail_store::later::header_hash(&f.bytes), f.size)).flatten()
+                    }
+                } else {
+                    None
+                };
+                stored.push((f.uid, link, Incoming {
                     server_id: f.server_id.clone(),
                     size: f.size.max(f.bytes.len() as u64),
                     internal_date: f.internal_date,
@@ -528,12 +547,12 @@ impl Sink for AccountSink<'_> {
         }
         let account = self.account;
         // New to the index (not a resync of what is here): the rules apply.
-        let fresh: Vec<bool> = stored.iter().map(|(uid, _)| self.e.store.at(id, *uid).ok().flatten().is_none()).collect();
+        let fresh: Vec<bool> = stored.iter().map(|(uid, link, _)| link.is_none() && self.e.store.at(id, *uid).ok().flatten().is_none()).collect();
         let mut new = Vec::new();
         let mut all = Vec::new();
         self.e.store.write(|w| {
-            for ((uid, m), fresh) in stored.into_iter().zip(fresh) {
-                let msg = w.put(id, account, uid, m)?;
+            for ((uid, link, m), fresh) in stored.into_iter().zip(fresh) {
+                let msg = w.put_linked(id, account, uid, m, link)?;
                 all.push(msg);
                 if fresh {
                     new.push((uid, msg));
@@ -543,6 +562,9 @@ impl Sink for AccountSink<'_> {
         }).map_err(|e| e.to_string())?;
         self.e.certs_seen(&all).map_err(|e| e.to_string())?;
         self.e.pgp_keys_seen(account, id, &keys).map_err(|e| e.to_string())?;
+        if self.snoozed.as_ref().is_some_and(|(folder, _)| *folder == id) {
+            return Ok(());
+        }
         self.e.arrived(account, id, &new).map_err(|e| e.to_string())
     }
 
@@ -567,6 +589,9 @@ impl Sink for AccountSink<'_> {
             let role = self.e.store.folder(id).map_err(|e| e.to_string())?.role;
             for (uid, m, on) in turned {
                 if on {
+                    if self.snoozed.as_ref().is_some_and(|(f, _)| *f == id) {
+                        continue;
+                    }
                     self.e.later_flagged(id, role, uid, m).map_err(|e| e.to_string())?;
                 } else {
                     self.e.later_unflagged(id, uid, m).map_err(|e| e.to_string())?;
@@ -641,6 +666,14 @@ impl Sink for AccountSink<'_> {
 
     fn change_done(&mut self, id: u64, ok: bool) -> Result<(), String> {
         self.e.store.write(|w| w.op_done(id, ok)).map_err(|e| e.to_string())
+    }
+
+    fn wants_snoozed(&mut self) -> Result<bool, String> {
+        self.wants_parked_mailbox().map_err(|e| e.to_string())
+    }
+
+    fn snooze_moves(&mut self) -> Result<Vec<mail_sync::SnoozeMove>, String> {
+        self.plan_snoozes().map_err(|e| e.to_string())
     }
 
     fn server_state(&mut self, key: &str) -> Option<String> {

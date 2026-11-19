@@ -187,6 +187,17 @@ pub fn get_mailboxes(account: &str) -> Vec<u8> {
     request(vec![json!(["Mailbox/get", { "accountId": account, "ids": null }, "m"])], false)
 }
 
+/// Create a top-level mailbox. Read the result with `created_mailbox`.
+pub fn create_mailbox(account: &str, name: &str) -> Vec<u8> {
+    request(vec![json!(["Mailbox/set", { "accountId": account, "create": { "snooze": { "name": name } } }, "mb"])], false)
+}
+
+pub fn created_mailbox(a: &Answers) -> Result<Option<String>> {
+    let o = a.of("mb", "Mailbox/set")?;
+    o.get("created").and_then(|c| c.get("snooze")).and_then(Value::as_object)
+        .map(|m| need_id(m, "id")).transpose()
+}
+
 /// The newest `limit` messages of a mailbox from `position`, with what sync
 /// needs of each.
 pub fn query_mailbox(account: &str, mailbox: &str, position: u64, limit: u64) -> Vec<u8> {

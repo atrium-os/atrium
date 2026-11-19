@@ -1843,6 +1843,7 @@ impl Mail {
         let note = std::mem::take(&mut ui.later_note);
         match self.engine.set_later(msg, k, when.at((self.now)()), &note) {
             Ok(_) => {
+                self.get_asked.set(true);
                 ui.undo = None;
                 ui.file_note = Some((format!("Set aside: {}", when.label().to_lowercase()), (self.now)() + 4));
             }
@@ -1879,6 +1880,7 @@ impl Mail {
             self.set_error(format!("Couldn't set it aside: {e}"));
             return true;
         }
+        self.get_asked.set(true);
         let mut ui = self.ui.get_cloned();
         ui.file_note = Some(("Set aside: someday".into(), (self.now)() + 4));
         let cursor = ui.cursor;
@@ -1932,6 +1934,7 @@ impl Mail {
             self.set_error(format!("Couldn't close it: {e}"));
             return true;
         }
+        self.get_asked.set(true);
         let mut ui = self.ui.get_cloned();
         ui.file_note = Some((label.into(), (self.now)() + 3));
         if a == Answer::Now {

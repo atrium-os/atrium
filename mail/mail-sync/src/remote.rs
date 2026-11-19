@@ -139,6 +139,8 @@ pub enum SinkCall {
     Pushed(bool),
     /// [`Sink::has_text`]; answered [`SinkAnswer::Go`].
     HasText(String, u32),
+    WantsSnoozed,
+    SnoozeMoves,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +156,8 @@ pub enum SinkAnswer {
     Event(Vec<u8>),
     EventsEnd(std::result::Result<(), String>),
     Go(bool),
+    WantsSnoozed(std::result::Result<bool, String>),
+    SnoozeMoves(std::result::Result<Vec<crate::SnoozeMove>, String>),
 }
 
 fn bad(what: &str) -> io::Error {
@@ -371,6 +375,20 @@ impl<R: Read, W: Write> Sink for RemoteSink<R, W> {
     fn change_done(&mut self, id: u64, ok: bool) -> std::result::Result<(), String> {
         self.done(SinkCall::ChangeDone(id, ok))
     }
+    fn wants_snoozed(&mut self) -> std::result::Result<bool, String> {
+        match self.ask(SinkCall::WantsSnoozed).map_err(|e| e.to_string())? {
+            SinkAnswer::WantsSnoozed(value) => value,
+            _ => Err("bad snooze mailbox reply".into()),
+        }
+    }
+
+    fn snooze_moves(&mut self) -> std::result::Result<Vec<crate::SnoozeMove>, String> {
+        match self.ask(SinkCall::SnoozeMoves).map_err(|e| e.to_string())? {
+            SinkAnswer::SnoozeMoves(value) => value,
+            _ => Err("bad snooze moves reply".into()),
+        }
+    }
+
     fn server_state(&mut self, key: &str) -> Option<String> {
         match self.ask(SinkCall::ServerState(key.into())) {
             Ok(SinkAnswer::Text(t)) => t,
@@ -825,6 +843,8 @@ fn answer(s: &mut dyn Sink, c: SinkCall) -> SinkAnswer {
         SinkCall::Get { .. } | SinkCall::Post { .. } => SinkAnswer::Body(Err("no HTTP here".into())),
         SinkCall::Events { .. } => SinkAnswer::EventsEnd(Err("not watching".into())),
         SinkCall::Pushed(_) => SinkAnswer::Go(false),
+        SinkCall::WantsSnoozed => SinkAnswer::WantsSnoozed(s.wants_snoozed()),
+        SinkCall::SnoozeMoves => SinkAnswer::SnoozeMoves(s.snooze_moves()),
         SinkCall::HasText(f, u) => SinkAnswer::Go(s.has_text(&f, u)),
     }
 }

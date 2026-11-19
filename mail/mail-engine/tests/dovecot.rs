@@ -165,6 +165,10 @@ fn chown_r(p: &Path, uid: u32, gid: u32) {
 }
 
 fn start_dovecot() -> Option<Dovecot> {
+    start_dovecot_with_inbox(300)
+}
+
+fn start_dovecot_with_inbox(messages: usize) -> Option<Dovecot> {
     let bin = ["/usr/sbin/dovecot", "/usr/local/sbin/dovecot"].into_iter().find(|p| Path::new(p).exists())?;
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
@@ -278,10 +282,10 @@ service stats {{
     );
     std::fs::write(d.join("dovecot.conf"), conf).unwrap();
     std::fs::create_dir_all(d.join("home")).unwrap();
-    // Mail: 300 in the inbox over two years, newest first by date; 5 sent.
+    // Mail in the inbox, newest first by date; 5 sent.
     let home = d.join("home");
     let t0 = now();
-    for n in 0..300 {
+    for n in 0..messages {
         let t = t0 - (n as i64) * 2 * DAY - 3600;
         deliver(&home, "", n, t, n % 3 == 0, &format!("Body of message {n}."), &format!("Message {n}"));
     }
@@ -881,6 +885,52 @@ fn a_pass_with_sync_in_its_worker() {
     assert_eq!(found("subject:250 is:read"), 0);
     assert_eq!(found("subject:250 larger:1MB"), 0);
     assert_eq!(found("subject:249 is:read before:2000-01-01"), 0);
+}
+
+#[test]
+fn snoozed_mail_moves_on_dovecot_and_returns_when_due() {
+    let Some(dc) = start_dovecot_with_inbox(2) else {
+        eprintln!("SKIPPED: Dovecot is not installed");
+        return;
+    };
+    std::env::set_var("MAIL_SYNC_WORKER", sync_worker());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("priya@example.org").unwrap();
+    let sync = || {
+        let mut session = mail_engine::accounts::open_imap(courier(&dc)).unwrap();
+        assert!(session.capabilities().iter().any(|c| c.eq_ignore_ascii_case("MOVE")));
+        session.sync(&mut engine.sink(account)).unwrap();
+        session.logout().unwrap();
+    };
+    sync();
+    let inbox = engine.store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let row = engine.store.list(inbox, 0, 1).unwrap().remove(0);
+    let count = engine.store.count(inbox).unwrap();
+    let due = now() + 3600;
+    let later = engine.set_later(row.msg, mail_store::later::kind::READ, due, "").unwrap();
+    sync();
+    let parked = engine.store.folders(account).unwrap().into_iter().find(|(_, f)| f.name == "Snoozed").expect("server created Snoozed");
+    assert!(parked.1.hidden);
+    let moved = engine.store.list(parked.0, 0, 10).unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].msg, row.msg, "IMAP move keeps the original local message");
+    assert!(moved[0].flags & flag::SNOOZED != 0);
+    assert_eq!(engine.store.uids(inbox).unwrap().len(), count - 1, "server removed the original Inbox UID");
+
+    // Advance the stored deadline without using the UI's release path.
+    let mut due_item = engine.later_of(row.msg).unwrap().unwrap().1;
+    due_item.due = now() - 1;
+    engine.store.write(|w| w.put_later(Some(later), &due_item)).unwrap();
+    sync();
+    sync();
+    assert!(engine.store.uids(parked.0).unwrap().is_empty());
+    assert_eq!(engine.store.uids(inbox).unwrap().len(), count);
+    let returned = engine.store.list(inbox, 0, count).unwrap().into_iter().find(|r| r.msg == row.msg).unwrap();
+    assert_eq!(returned.flags & flag::SNOOZED, 0);
+    assert_eq!(engine.later_due(now()).unwrap(), 1);
+    assert!(engine.later_of(row.msg).unwrap().unwrap().1.back);
+    assert!(engine.store.parked(account).unwrap().is_empty());
 }
 
 /// Mail's rules and automatic reply through the real courier to a real

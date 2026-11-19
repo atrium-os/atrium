@@ -296,6 +296,7 @@ impl Store {
             tx.open_table(later::LATER_BY_THREAD)?;
             tx.open_table(later::FOLLOW_UPS)?;
             tx.open_table(later::LATER_DROPPED)?;
+            tx.open_table(later::PARKED)?;
             tx.open_table(people::PEOPLE)?;
             tx.open_table(people::PEOPLE_COUNTED)?;
             tx.open_table(imports::IMPORTS)?;
@@ -546,13 +547,18 @@ impl Writer<'_> {
     /// server id (the same message in another folder or label), else new.
     /// A fuller blob or summary replaces a header-only one, never the reverse.
     pub fn put(&mut self, folder: FolderId, account: AccountId, uid: u32, m: Incoming) -> Result<MsgId> {
+        self.put_linked(folder, account, uid, m, None)
+    }
+
+    /// As `put`, with the identity of a tracked server-side transfer.
+    pub fn put_linked(&mut self, folder: FolderId, account: AccountId, uid: u32, m: Incoming, link: Option<MsgId>) -> Result<MsgId> {
         let at = self.tx.open_table(LOCATIONS)?.get((folder, uid))?.map(|v| v.value().0);
         let by_sid = match &m.server_id {
             Some(s) => self.tx.open_table(SERVER_IDS)?.get((account, s.as_str()))?.map(|v| v.value()),
             None => None,
         };
         let date = m.summary.date.or(m.internal_date).unwrap_or(0);
-        let id = match at.or(by_sid) {
+        let id = match at.or(by_sid).or(link) {
             Some(id) => {
                 let mut old = self.get_msg(id)?.ok_or(Error::Corrupt("location without message"))?;
                 if m.full && old.full.is_none() {
@@ -697,16 +703,22 @@ impl Writer<'_> {
             m.held.retain(|l| *l != (folder, uid));
             self.tx.open_table(senders::HELD)?.remove((m.account, date_key(m.date), id))?;
         }
-        if m.locations.is_empty() && m.leaving.is_empty() && m.held.is_empty() {
-            self.tx.open_table(MESSAGES)?.remove(id)?;
-            self.unindex(id)?;
-            if let Some(s) = &m.server_id {
-                self.tx.open_table(SERVER_IDS)?.remove((m.account, s.as_str()))?;
-            }
+        let parked = self.tx.open_table(later::PARKED)?.get((m.account, id))?.is_some();
+        if !parked && m.locations.is_empty() && m.leaving.is_empty() && m.held.is_empty() {
+            self.remove_unplaced(id, &m)?;
         } else {
             self.put_msg(id, &m)?;
         }
         self.thread_refresh(m.thread)
+    }
+
+    fn remove_unplaced(&mut self, id: MsgId, m: &Message) -> Result<()> {
+        self.tx.open_table(MESSAGES)?.remove(id)?;
+        self.unindex(id)?;
+        if let Some(s) = &m.server_id {
+            self.tx.open_table(SERVER_IDS)?.remove((m.account, s.as_str()))?;
+        }
+        Ok(())
     }
 
     /// UIDVALIDITY changed: everything the folder listed is void.

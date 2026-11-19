@@ -707,7 +707,13 @@ in one small sheet, both with defaults so it is one press when you're in a hurry
 **Where it is stored**: in the engine, per persona, with the thread's message ids, kind,
 date, note and history. The server sees `\Flagged` on the newest message (so phones and
 webmail still see it as flagged) and, for snoozed threads, the `$Snoozed` keyword and a
-hidden `Snoozed` folder so other clients show it gone. A thread flagged elsewhere arrives
+hidden, Mail-managed `Snoozed` folder so other clients show it gone. Mail creates the
+folder only when needed and uses `Atrium Snoozed` if the name is already taken. Only
+the Inbox copies Mail set aside are moved. On a successful sync once due or brought
+back early, Mail returns those copies to their original Inbox and clears
+`$Snoozed`. Other JMAP mailbox memberships stay in place. IMAP accounts need native
+`MOVE`; local Later and the keyword still work when server moves are unavailable.
+The folder is hidden in Mail’s sidebar. A thread flagged elsewhere arrives
 as a *Reply* item due tomorrow morning, so even flags from another client get a date.
 
 **Later** is per persona: the Work list shows only Work mail, and the review respects each
@@ -1551,10 +1557,12 @@ Stalwart in the cloud VM, and later a real account):
    phone's unflag closing it and `$Snoozed` coming off), the JMAP suite (the keyword
    reaches the server, an unflag on the server brings Plan back), the Dovecot suite
    (Dovecot takes the keyword). **Not yet**: an HTML message read to its end (the
-   doc-viewer doesn't report how far it was scrolled), the review's time as a setting,
-   and the hidden server `Snoozed` folder (moving messages out of the server's inbox
-   needs folder creation and a move back at the due time; `$Snoozed` alone covers
-   clients that know the keyword).
+   doc-viewer doesn't report how far it was scrolled), and the review's time as a setting.
+   Server snoozing is reconciled after fetching both mailboxes. The engine records
+   the original Inbox before sending the move, reuses the JMAP email ID or a unique
+   IMAP header and size match, and keeps the local message while its old UID is gone.
+   This lets a reconnect process a move whose response was lost, and avoids
+   replaying arrival rules when the copy comes home.
 
    **The rest of the notification settings built on the host (2026-11-18, §12, E5).**
    **Quiet all weekend**: Saturday and Sunday are quiet all day, alone or with quiet

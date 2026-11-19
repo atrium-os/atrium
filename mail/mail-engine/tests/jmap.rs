@@ -47,6 +47,7 @@ struct Server {
     uploads: BTreeMap<String, Vec<u8>>,
     submitted: Vec<Value>,
     downloads: usize,
+    snoozed: Option<String>,
     hold: u64,
     vacation: Option<Value>,
     /// JMAP Sieve (RFC 9661) when `Some`: id, name, active, text.
@@ -110,7 +111,16 @@ impl Server {
             let answer = match name {
                 "Mailbox/get" => {
                     let mb = |id: &str, name: &str, role: Value, parent: Value| json!({ "id": id, "name": name, "role": role, "parentId": parent });
-                    json!({ "state": "m1", "list": [mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj")), mb("spam", "Junk", json!("junk"), Value::Null)], "notFound": [] })
+                    let mut list = vec![mb("in", "Inbox", json!("inbox"), Value::Null), mb("sent", "Sent", json!("sent"), Value::Null), mb("arch", "Archive", json!("archive"), Value::Null), mb("proj", "Projects", Value::Null, Value::Null), mb("q4", "Q4", Value::Null, json!("proj")), mb("spam", "Junk", json!("junk"), Value::Null)];
+                    if let Some(name) = &self.snoozed {
+                        list.push(mb("snooze", name, Value::Null, Value::Null));
+                    }
+                    json!({ "state": "m1", "list": list, "notFound": [] })
+                }
+                "Mailbox/set" => {
+                    assert!(self.snoozed.is_none());
+                    self.snoozed = Some(args["create"]["snooze"]["name"].as_str().unwrap().to_string());
+                    json!({ "created": { "snooze": { "id": "snooze" } } })
                 }
                 "Email/query" => {
                     // In a mailbox, or with text (the server's search).
@@ -304,6 +314,41 @@ fn message(n: u32, subject: &str, body: &str) -> Vec<u8> {
 }
 
 #[test]
+fn jmap_snoozes_until_due_and_preserves_existing_labels() {
+    let server = Rc::new(RefCell::new(Server::default()));
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let id = server.borrow_mut().add(message(21, "Later", "Keep me."), &["in", "q4"], &[], at);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(Store::open(dir.path()).unwrap(), Parser { program: jail() });
+    let account = engine.store.add_account("ada@example.org").unwrap();
+    let sync = || {
+        // Reconnect for every pass, as the app does.
+        mail_engine::accounts::open_jmap(Box::new(Fake(server.clone())), SESSION)
+            .unwrap().sync(&mut engine.sink(account)).unwrap();
+    };
+    sync();
+    let inbox = engine.store.folder_id(account, "Inbox", Role::Inbox).unwrap();
+    let msg = engine.store.by_server_id(account, &id).unwrap().unwrap();
+    let due = at + 3600;
+    engine.set_later(msg, mail_store::later::kind::READ, due, "").unwrap();
+    assert_eq!(engine.next_pass(at, 7200), due);
+    sync();
+    assert_eq!(server.borrow().snoozed.as_deref(), Some("Snoozed"));
+    assert_eq!(server.borrow().mails[&id].boxes.iter().map(String::as_str).collect::<Vec<_>>(), ["q4", "snooze"]);
+    assert!(server.borrow().mails[&id].keywords.contains("$snoozed"));
+    assert_eq!(engine.store.count(inbox).unwrap(), 0);
+    assert!(engine.store.folders(account).unwrap().iter().any(|(_, folder)| folder.name == "Snoozed" && folder.hidden));
+
+    assert_eq!(engine.later_due(due).unwrap(), 1);
+    sync();
+    sync(); // Retrying a pass cannot duplicate the mail or recreate the folder.
+    assert_eq!(server.borrow().mails[&id].boxes.iter().map(String::as_str).collect::<Vec<_>>(), ["in", "q4"]);
+    assert!(!server.borrow().mails[&id].keywords.contains("$snoozed"));
+    assert_eq!(engine.store.list(inbox, 0, 10).unwrap()[0].msg, msg);
+    assert!(engine.store.parked(account).unwrap().is_empty());
+}
+
+#[test]
 fn jmap_sync_changes_and_send() {
     let server = Rc::new(RefCell::new(Server::default()));
     let t0 = 1_795_000_000;
@@ -348,7 +393,9 @@ fn jmap_sync_changes_and_send() {
     assert_eq!(in_q4.len(), 1);
     assert_eq!(in_q4[0].msg, plan.msg);
 
-    // A pass with nothing new does nothing.
+    // A pass parks the flagged message discovered on the first pass.
+    let r = client.sync(&mut engine.sink(account)).unwrap();
+    assert_eq!((r.headers, r.vanished), (1, 1), "{r:?}");
     let r = client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!((r.headers, r.vanished), (0, 0), "{r:?}");
 
@@ -385,6 +432,9 @@ fn jmap_sync_changes_and_send() {
     };
     let r = client.sync(&mut engine.sink(account)).unwrap();
     assert_eq!(r.headers, 1, "{r:?}");
+    // The unflag closed Later and queued the keyword removal during the
+    // previous download. Send that before moving the message home.
+    client.sync(&mut engine.sink(account)).unwrap();
     let rows = engine.store.list(inbox, 0, 10).unwrap();
     // Unflagged elsewhere: Plan's item is done and it is back.
     assert_eq!(rows.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>(), ["New one", "Plan"]);

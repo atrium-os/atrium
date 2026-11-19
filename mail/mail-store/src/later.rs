@@ -1,6 +1,6 @@
 //! *Later* (mail.md §11.4): a conversation set aside with a time it comes
-//! back, what it is for, and a note. Local; the server only sees
-//! `\Flagged` on its newest message.
+//! back, what it is for, and a note. The store also tracks the Inbox
+//! location of messages moved to the server's snooze mailbox.
 
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,55 @@ pub(crate) const LATER_DROPPED: TableDefinition<u64, &[u8]> = TableDefinition::n
 /// Message-ID (without `<>`) → (account, when): a follow-up asked for on
 /// send, waiting for the sent copy to arrive in Sent (§9, §11.4).
 pub(crate) const FOLLOW_UPS: TableDefinition<&str, (u32, i64)> = TableDefinition::new("follow_ups");
+
+/// Physical inbox messages entrusted to the server's snooze mailbox.
+pub(crate) const PARKED: TableDefinition<(AccountId, MsgId), &[u8]> = TableDefinition::new("snoozed_server");
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parked {
+    pub inbox: crate::FolderId,
+    /// Identifies copies on IMAP servers without a stable message ID.
+    pub header: crate::Hash,
+    pub size: u64,
+    /// Inbox arrivals can be matched only after a return has been planned.
+    pub returning: bool,
+}
+
+/// The fingerprint of a header-only fetch or the header of a whole message.
+pub fn header_hash(bytes: &[u8]) -> crate::Hash {
+    use sha2::{Digest, Sha256};
+    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n")
+        .or_else(|| bytes.windows(2).position(|w| w == b"\n\n")).unwrap_or(bytes.len());
+    let header = bytes[..end].trim_ascii_end();
+    Sha256::digest(header).into()
+}
+
+impl Store {
+    pub fn parked(&self, account: AccountId) -> Result<Vec<(MsgId, Parked)>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(PARKED)?;
+        t.range((account, 0)..=(account, MsgId::MAX))?.map(|entry| {
+            let (k, v) = entry?;
+            Ok((k.value().1, dec(v.value())?))
+        }).collect()
+    }
+}
+
+impl Writer<'_> {
+    pub fn park(&mut self, account: AccountId, msg: MsgId, park: &Parked) -> Result<()> {
+        self.tx.open_table(PARKED)?.insert((account, msg), enc(park).as_slice())?;
+        Ok(())
+    }
+
+    pub fn forget_parked(&mut self, account: AccountId, msg: MsgId) -> Result<()> {
+        self.tx.open_table(PARKED)?.remove((account, msg))?;
+        if let Some(m) = self.get_msg(msg)?.filter(|m| m.locations.is_empty() && m.leaving.is_empty() && m.held.is_empty()) {
+            self.remove_unplaced(msg, &m)?;
+            self.thread_refresh(m.thread)?;
+        }
+        Ok(())
+    }
+}
 
 /// What an item is for.
 pub mod kind {

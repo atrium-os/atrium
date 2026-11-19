@@ -268,3 +268,60 @@ fn a_flag_from_elsewhere_gets_a_date() {
     sink.messages("Trash", vec![t]).unwrap();
     assert!(engine.later_items().unwrap().is_empty());
 }
+
+#[test]
+fn server_snooze_recovers_when_source_disappears_before_destination_is_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let parser = jail();
+    let engine = Engine::new(store.clone(), Parser { program: parser.clone() });
+    let account = store.add_account("arun@example.org").unwrap();
+    let folders = [
+        RemoteFolder { name: "INBOX".into(), role: mail_sync::Role::Inbox, selectable: true },
+        RemoteFolder { name: "Snoozed".into(), role: mail_sync::Role::Other, selectable: true },
+    ];
+    let mut sink = engine.sink(account);
+    sink.folders(&folders).unwrap();
+    let inbox = store.folder_id(account, "INBOX", Role::Inbox).unwrap();
+    let parked = store.folder_id(account, "Snoozed", Role::Other).unwrap();
+    assert!(!store.folder(parked).unwrap().hidden, "unmanaged mailbox stays visible");
+    let bytes = msg("Priya <priya@example.com>", "arun@example.org", "Numbers", 10, "parked@x", "");
+    sink.messages("INBOX", vec![f(7, bytes.clone())]).unwrap();
+    let id = store.at(inbox, 7).unwrap().unwrap().0;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let due = now + 3600;
+    engine.set_later(id, kind::READ, due, "").unwrap();
+    assert!(sink.wants_snoozed().unwrap());
+    for change in sink.changes() {
+        sink.change_done(change.id, true).unwrap();
+    }
+    sink.set_server_state(mail_sync::SNOOZED_STATE, "Snoozed").unwrap();
+    sink.folders(&folders).unwrap();
+    let away = sink.snooze_moves().unwrap();
+    assert_eq!(away, [mail_sync::SnoozeMove { folder: "INBOX".into(), uid: 7, to: "Snoozed".into(), returning: false }]);
+
+    // The server applied MOVE, but Mail lost the reply. The next session
+    // sees the old UID disappear before the new one is fetched.
+    let engine = Engine::new(store.clone(), Parser { program: parser });
+    let mut sink = engine.sink(account);
+    sink.folders(&folders).unwrap();
+    sink.vanished("INBOX", &[7]).unwrap();
+    assert!(store.message(id).is_ok());
+    let mut head = f(1, bytes.clone());
+    head.bytes.truncate(bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4);
+    head.full = false;
+    assert_eq!(head.size, bytes.len() as u64);
+    sink.messages("Snoozed", vec![head]).unwrap();
+    assert_eq!(store.at(parked, 1).unwrap().unwrap().0, id);
+    assert!(sink.snooze_moves().unwrap().is_empty());
+
+    engine.later_due(due).unwrap();
+    assert_eq!(sink.snooze_moves().unwrap(), [mail_sync::SnoozeMove {
+        folder: "Snoozed".into(), uid: 1, to: "INBOX".into(), returning: true,
+    }]);
+    sink.vanished("Snoozed", &[1]).unwrap();
+    sink.messages("INBOX", vec![f(8, bytes)]).unwrap();
+    assert!(sink.snooze_moves().unwrap().is_empty());
+    assert_eq!(store.at(inbox, 8).unwrap().unwrap().0, id);
+    assert!(store.parked(account).unwrap().is_empty());
+}

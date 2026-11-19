@@ -118,6 +118,31 @@ pub struct Fetched {
     pub full: bool,
 }
 
+/// The server mailbox name is kept in the account's sync state once Mail
+/// creates it. A pre-existing mailbox with the same name stays ordinary.
+pub const SNOOZED_STATE: &str = "atrium.snoozed-mailbox";
+
+pub(crate) fn snoozed_to_create(sink: &mut dyn Sink, list: &[RemoteFolder]) -> Result<Option<String>> {
+    if !sink.wants_snoozed().map_err(Error::Sink)? {
+        return Ok(None);
+    }
+    let managed = sink.server_state(SNOOZED_STATE);
+    let occupied = |name: &str| list.iter().any(|f| f.name.eq_ignore_ascii_case(name));
+    Ok(match managed {
+        Some(name) if !occupied(&name) => Some(name),
+        Some(_) => None,
+        None => ["Snoozed", "Atrium Snoozed"].into_iter().find(|name| !occupied(name)).map(str::to_string),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnoozeMove {
+    pub folder: String,
+    pub uid: u32,
+    pub to: String,
+    pub returning: bool,
+}
+
 /// The engine, as sync sees it.
 pub trait Sink {
     fn folders(&mut self, list: &[RemoteFolder]) -> std::result::Result<(), String>;
@@ -143,6 +168,12 @@ pub trait Sink {
     fn change_done(&mut self, id: u64, ok: bool) -> std::result::Result<(), String> {
         let _ = (id, ok);
         Ok(())
+    }
+    fn wants_snoozed(&mut self) -> std::result::Result<bool, String> {
+        Ok(false)
+    }
+    fn snooze_moves(&mut self) -> std::result::Result<Vec<SnoozeMove>, String> {
+        Ok(Vec::new())
     }
     /// A sync state the account keeps (JMAP's Email state).
     fn server_state(&mut self, key: &str) -> Option<String> {
@@ -497,11 +528,30 @@ impl<S: Read + Write> Session<S> {
     /// One pass over the account.
     pub fn sync(&mut self, sink: &mut dyn Sink) -> Result<Report> {
         let mut report = Report::default();
-        let all = self.folders()?;
+        let mut all = self.folders()?;
+        let native_moves = has(&self.caps, "MOVE");
+        if native_moves {
+            if let Some(name) = snoozed_to_create(sink, &all)? {
+                let cmd = self.enc.create(&name);
+                match self.run(cmd) {
+                    Ok(_) => {
+                        sink.set_server_state(SNOOZED_STATE, &name).map_err(Error::Sink)?;
+                        all = self.folders()?;
+                    }
+                    Err(Error::No(why)) => eprintln!("mail-sync: couldn't create snooze mailbox: {why}"),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
         sink.folders(&all).map_err(Error::Sink)?;
         // The person's changes first, so the walk below sees their result.
         self.changes(sink)?;
-        let walk = self.walk(&all);
+        let mut walk = self.walk(&all);
+        if let Some(managed) = sink.server_state(SNOOZED_STATE) {
+            if !walk.iter().any(|f| f.name == managed) {
+                walk.extend(all.iter().filter(|f| f.selectable && f.name == managed).cloned());
+            }
+        }
         report.folders = walk.len();
         // Stage 1: the inbox, newest first, one small page.
         if let Some(inbox) = walk.iter().find(|f| f.role == Role::Inbox) {
@@ -510,6 +560,14 @@ impl<S: Read + Write> Session<S> {
         // Stage 2: headers for everything.
         for f in &walk {
             self.folder(&f.name, sink, None, &mut report)?;
+        }
+        if native_moves {
+            // Both sides have been reconciled with the server before a move
+            // is retried. Re-list affected mailboxes to learn their new UIDs.
+            let names = self.snooze(sink)?;
+            for name in names {
+                self.folder(&name, sink, None, &mut report)?;
+            }
         }
         // Stage 3: recent text.
         for f in &walk {
@@ -641,6 +699,55 @@ impl<S: Read + Write> Session<S> {
             }
         }
         Ok(())
+    }
+
+    fn snooze(&mut self, sink: &mut dyn Sink) -> Result<std::collections::BTreeSet<String>> {
+        let mut changed = std::collections::BTreeSet::new();
+        let mut opened = None;
+        for change in sink.snooze_moves().map_err(Error::Sink)? {
+            if opened.as_ref() != Some(&change.folder) {
+                let cmd = self.enc.select(&change.folder, false, None, false);
+                opened = None;
+                match self.run(cmd) {
+                    Ok((responses, code)) => {
+                        let expected = sink.state(&change.folder).uidvalidity;
+                        let actual = responses.iter().find_map(|response| match response {
+                            Response::State { code: Some(Code::UidValidity(v)), .. } => Some(*v),
+                            _ => None,
+                        }).or(match code { Some(Code::UidValidity(v)) => Some(v), _ => None });
+                        if expected == 0 || actual != Some(expected) {
+                            eprintln!("mail-sync: snooze source UID validity changed; waiting for a fresh sync");
+                            continue;
+                        }
+                        opened = Some(change.folder.clone());
+                    }
+                    Err(Error::No(why)) => {
+                        eprintln!("mail-sync: couldn't select snooze source: {why}");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            let set = Set::one(change.uid);
+            if change.returning {
+                let cmd = self.enc.uid_store(&set, StoreOp::Remove, &["$Snoozed"], None);
+                match self.run(cmd) {
+                    Ok(_) => {}
+                    Err(Error::No(why)) => eprintln!("mail-sync: couldn't clear snoozed keyword: {why}"),
+                    Err(e) => return Err(e),
+                }
+            }
+            let cmd = self.enc.uid_move(&set, &change.to);
+            match self.run(cmd) {
+                Ok(_) => {
+                    changed.insert(change.folder);
+                    changed.insert(change.to);
+                }
+                Err(Error::No(why)) => eprintln!("mail-sync: couldn't move snoozed message: {why}"),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(changed)
     }
 
     fn expunge_one(&mut self, set: &Set) -> Result<()> {

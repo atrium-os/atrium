@@ -396,10 +396,12 @@ impl Engine {
         c.search(query, &mut self.sink(account), mail_sync::SERVER_HITS).map_err(|e| e.to_string())
     }
 
-    /// When the next pass should run at the latest: the next due send,
-    /// else `idle` seconds from now.
+    /// Wake for the next scheduled send or snooze deadline, bounded by
+    /// the account polling interval.
     pub fn next_pass(&self, now: i64, idle: i64) -> i64 {
-        let soonest = self.store.outbox().ok().into_iter().flatten().map(|(_, o)| o.due).filter(|d| *d > now).min();
+        let sends = self.store.outbox().ok().into_iter().flatten().map(|(_, o)| o.due);
+        let snoozes = self.later_items().ok().into_iter().flatten().filter(|(_, l)| !l.back).map(|(_, l)| l.due);
+        let soonest = sends.chain(snoozes).filter(|d| *d > now).min();
         soonest.map_or(now + idle, |d| d.min(now + idle))
     }
 }

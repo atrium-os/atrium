@@ -293,7 +293,19 @@ impl<H: Http> Client<H> {
             self.folders(sink)?;
         }
         self.push(sink)?;
-        report.folders = self.folders(sink)?.len();
+        let folders = self.folders(sink)?;
+        report.folders = folders.len();
+        if let Some(name) = crate::snoozed_to_create(sink, &folders).map_err(|e| Error(e.to_string()))? {
+            let a = self.call(jmap::create_mailbox(&self.session.account, &name))?;
+            match jmap::created_mailbox(&a) {
+                Ok(Some(_)) => {
+                    sink.set_server_state(crate::SNOOZED_STATE, &name).map_err(Error)?;
+                    report.folders = self.folders(sink)?.len();
+                }
+                Ok(None) => eprintln!("mail-sync: JMAP refused to create its snooze mailbox"),
+                Err(e) => eprintln!("mail-sync: couldn't create JMAP snooze mailbox: {e}"),
+            }
+        }
         match sink.server_state(EMAIL_STATE) {
             None => self.first(sink, &mut report)?,
             Some(state) => {
@@ -304,7 +316,8 @@ impl<H: Http> Client<H> {
                         Ok(c) => c,
                         Err(e) if e.0.ends_with("cannotCalculateChanges") => {
                             // Too old: read everything again.
-                            return self.first(sink, &mut report).map(|_| report);
+                            self.first(sink, &mut report)?;
+                            break;
                         }
                         Err(e) => return Err(e.into()),
                     };
@@ -325,6 +338,7 @@ impl<H: Http> Client<H> {
                 }
             }
         }
+        self.snooze(sink, &mut report)?;
         self.texts(sink, &mut report)?;
         Ok(report)
     }
@@ -457,6 +471,44 @@ impl<H: Http> Client<H> {
             sink.checkpoint(folder, &st).map_err(Error)?;
             report.headers += 1;
             report.texts += full as usize;
+        }
+        Ok(())
+    }
+
+    fn snooze(&mut self, sink: &mut dyn Sink, report: &mut Report) -> Result<()> {
+        let moves = sink.snooze_moves().map_err(Error)?;
+        for changes in moves.chunks(PAGE as usize) {
+            let mut updates = Vec::new();
+            let mut ids = Vec::new();
+            for change in changes {
+                let (Some(id), Some(from), Some(to)) = (
+                    sink.server_id_at(&change.folder, change.uid),
+                    self.id_of(&change.folder),
+                    self.id_of(&change.to),
+                ) else {
+                    continue;
+                };
+                updates.push((id.clone(), Update::Move { from, to }));
+                if change.returning {
+                    updates.push((id.clone(), Update::Keywords { set: Vec::new(), unset: vec!["$Snoozed".into()] }));
+                }
+                ids.push(id);
+            }
+            if updates.is_empty() {
+                continue;
+            }
+            let a = self.call(jmap::set_emails(&self.session.account, &updates))?;
+            let failed = jmap::set_failures(&a)?;
+            if !failed.is_empty() {
+                eprintln!("mail-sync: JMAP refused {} snooze move(s)", failed.len());
+                ids.retain(|id| !failed.contains(id));
+            }
+            if !ids.is_empty() {
+                let a = self.call(jmap::get_emails(&self.session.account, &ids))?;
+                for e in jmap::emails(&a)? {
+                    self.place(sink, &e, true, report)?;
+                }
+            }
         }
         Ok(())
     }
