@@ -6,6 +6,8 @@ pub enum OfficeFormat {
     Odt,
     Xlsx,
     Ods,
+    Pptx,
+    Odp,
 }
 #[derive(atrium_message::Message)]
 #[message(version = 2)]

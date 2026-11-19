@@ -1,8 +1,10 @@
 use mail_office_copy::{OfficeCopy, RenderOffice};
 use std::{fs::File, io::Read};
 mod paint;
+mod package;
 mod profile;
 mod sheets;
+mod decks;
 
 type Error = Box<dyn std::error::Error>;
 fn convert(odt: bool, bytes: &[u8]) -> Result<OfficeCopy, Error> {
@@ -33,6 +35,8 @@ fn handle(req: RenderOffice, file: Option<File>) -> Result<OfficeCopy, String> {
         Docx => convert(false, &bytes),
         Odt => convert(true, &bytes),
         Xlsx => sheets::convert(false, &bytes),
+        Pptx => decks::convert(false, &bytes),
+        Odp => decks::convert(true, &bytes),
         Ods => sheets::convert(true, &bytes),
     }
     .map_err(|e| e.to_string())

@@ -689,6 +689,7 @@ dependencies = [
  "officina-draw",
  "officina-grid",
  "officina-pdf",
+ "officina-slides",
  "officina-text",
  "roxmltree 0.20.0",
  "tiny-skia 0.11.4",

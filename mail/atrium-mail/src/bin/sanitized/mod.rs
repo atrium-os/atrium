@@ -17,6 +17,8 @@ pub fn render(source: ExportSource, token: Option<[u8; 16]>) -> Result<OwnedFd, 
             CopyKind::Docx => OfficeFormat::Docx,
             CopyKind::Xlsx => OfficeFormat::Xlsx,
             CopyKind::Ods => OfficeFormat::Ods,
+            CopyKind::Pptx => OfficeFormat::Pptx,
+            CopyKind::Odp => OfficeFormat::Odp,
             _ => return Err("Unsupported Office format".into()),
         };
         let input =

@@ -11,7 +11,7 @@ use crate::{Engine, Error};
 pub const FILES_TEXT_MAX: usize = 4 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CopyKind { Html, Pdf, Docx, Odt, Xlsx, Ods }
+pub enum CopyKind { Html, Pdf, Docx, Odt, Xlsx, Ods, Pptx, Odp }
 
 impl CopyKind {
     pub fn from_mime(mime: Option<&str>) -> Option<Self> {
@@ -22,6 +22,8 @@ impl CopyKind {
             "application/vnd.oasis.opendocument.text" => Self::Odt,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Self::Xlsx,
             "application/vnd.oasis.opendocument.spreadsheet" => Self::Ods,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Self::Pptx,
+            "application/vnd.oasis.opendocument.presentation" => Self::Odp,
             _ => return None,
         })
     }

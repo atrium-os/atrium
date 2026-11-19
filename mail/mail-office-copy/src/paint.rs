@@ -35,6 +35,17 @@ pub(super) fn glyphs(
     fonts: &PinnedFonts,
     run: &GlyphRun,
 ) -> Result<(), Error> {
+    let frame = tiny_skia::Rect::from_xywh(0., 0., canvas.width() as f32, canvas.height() as f32)
+        .ok_or("invalid page dimensions")?;
+    glyphs_in(canvas, fonts, run, frame)
+}
+
+pub(super) fn glyphs_in(
+    canvas: &mut Pixmap,
+    fonts: &PinnedFonts,
+    run: &GlyphRun,
+    frame: tiny_skia::Rect,
+) -> Result<(), Error> {
     if run.turn.is_some() || run.glyphs.is_empty() {
         return Err("unsupported glyph placement".into());
     }
@@ -81,12 +92,12 @@ pub(super) fn glyphs(
             .and_then(|p| p.transform(transform))
             .ok_or("invalid outline")?;
         let bounds = path.bounds();
-        if bounds.left() < 0.
-            || bounds.top() < 0.
-            || bounds.right() > canvas.width() as f32
-            || bounds.bottom() > canvas.height() as f32
+        if bounds.left() < frame.left()
+            || bounds.top() < frame.top()
+            || bounds.right() > frame.right()
+            || bounds.bottom() > frame.bottom()
         {
-            return Err("glyph outside page".into());
+            return Err("glyph outside frame".into());
         }
         canvas.fill_path(
             &path,

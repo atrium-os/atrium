@@ -801,6 +801,7 @@ fn main() {
                     let name = format!("{stem}-sanitized.pdf");
                     converting = true;
                     mail.file_note(match kind {
+                        CopyKind::Pptx | CopyKind::Odp => "Preparing slide images without speaker notes…".into(),
                         CopyKind::Xlsx | CopyKind::Ods => "Preparing sheet images using saved formula values…".into(),
                         CopyKind::Html => format!("Preparing {name}…"),
                         _ => format!("Preparing {name} as page images. Search and text selection are lost."),

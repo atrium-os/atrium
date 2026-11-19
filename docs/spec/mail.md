@@ -554,7 +554,7 @@ doesn't run a spam classifier of its own in v1.
 #### 8.2.1 Open sanitized copy
 
 **What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
-type checks as HTML, PDF, DOCX, ODT, XLSX or ODS. Mail keeps the original attachment
+type checks as HTML, PDF, DOCX, ODT, XLSX, ODS, PPTX or ODP. Mail keeps the original attachment
 in the message and opens the completed copy in the persona’s default PDF handler.
 Both `invoice.html` and `invoice.pdf` produce `invoice-sanitized.pdf`.
 
@@ -641,6 +641,24 @@ are fetched. Limits include 24 worksheets, 4,096 rows and 256 columns per
 sheet, 100,000 cells during import, eight series per chart, 64 points per
 series, and the Office worker's workbook-wide pixel and byte limits.
 Mail receives compressed RGB samples only after the final page is complete.
+
+**PPTX and ODP input.** The jailed Officina worker returns one 144 dpi image
+per slide in presentation order and at the original slide proportions, including
+blank slides. The initial profile covers Officina's stock blank layout, plain
+text in rectangular frames, solid rectangles, supported static master and
+layout decorations, and local static PNG pictures. PPTX pictures can use a
+rectangular crop. Officina reports ODP picture crops as incomplete, so those
+decks are refused. Silent supported transitions and speaker notes are omitted.
+The reader explains the loss of notes, text search and selection.
+
+The worker reconstructs the static deck and compares all package parts,
+relationships, styles and slide XML before drawing. Valid decks with other
+templates, rich text or unsupported producer markup can be refused. Hidden
+slides, builds, audio or video (including posters attached to a video),
+external objects, encryption, missing parts, unknown paint operations and
+text that cannot be drawn completely refuse the whole deck. Limits include
+64 slides, 8 million pixels per slide, 48 million pixels overall and a
+32 MiB output. Mail receives pixels only after the final slide succeeds.
 
 **Delivery and failure.** Return a completed, sealed, read-only PDF descriptor.
 Apply §8.2's broker checks and same-persona routing to that descriptor. If conversion

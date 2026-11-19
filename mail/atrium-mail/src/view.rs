@@ -3119,7 +3119,7 @@ pub enum Item {
     /// Attachment `i` of message `msg`: icon, name, kind and size, and
     /// Quick look, Open, Save (§8.1).
     File { msg: usize, i: usize },
-    VisualCopyNote,
+    VisualCopyNote { slides: bool },
     Gap,
 }
 
@@ -3188,7 +3188,9 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
             out.push(Item::File { msg: k, i });
         }
         if b.files.iter().any(|file| file.can_open && mail_engine::attachments::CopyKind::from_mime(file.mime).is_some_and(|k| k != mail_engine::attachments::CopyKind::Html)) {
-            out.push(Item::VisualCopyNote);
+            use mail_engine::attachments::CopyKind;
+            let slides = b.files.iter().any(|f| f.can_open && matches!(CopyKind::from_mime(f.mime), Some(CopyKind::Pptx | CopyKind::Odp)));
+            out.push(Item::VisualCopyNote { slides });
         }
         if !b.files.is_empty() {
             out.push(Item::Gap);
@@ -4731,8 +4733,9 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             };
             text(ctx, nx + nw + em(8.0), cy, &fit(&said, type_size::XS, Weight::Regular, room - nw - em(8.0)), type_size::XS, Weight::Regular, c);
         }
-        Item::VisualCopyNote => {
-            text(ctx, x, cy, "PDF and Office copies are page images. Search and text selection are lost.", type_size::XS, Weight::Regular, t.text_primary());
+        Item::VisualCopyNote { slides } => {
+            let note = if *slides { "Slide images omit speaker notes. Search and text selection are lost." } else { "PDF and Office copies are page images. Search and text selection are lost." };
+            text(ctx, x, cy, note, type_size::XS, Weight::Regular, t.text_primary());
         }
         Item::Gap => {}
     }
