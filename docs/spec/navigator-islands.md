@@ -211,6 +211,11 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 
 ## 9. Decisions, with recommendations
 
+*Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's
+only C++ part is SpiderMonkey. The study of binding Boa or Nova into Servo (legacy-web
+§11.9.2: the collectors' unsafe-surface audit, then the DOM-hosting spike) comes later, not
+alongside I0.
+
 | | question | options | recommendation |
 |---|---|---|---|
 | **D1** ✓ | Engine | Servo + SpiderMonkey (MPL-2.0, Rust embedding) · Ladybird (BSD-2, C++, young) · our Boa and minimal DOM, run live | **Decided (Shankar, 2026-11-19): measure Servo and Ladybird side by side in I0, and choose on the measurements.** Chromium is out: Blink still carries LGPL files from WebKit and KHTML. Gecko is MPL and WebKit is LGPL. Boa and our DOM have no layout or rendering, so they can't run a widget or a sign-in page |
