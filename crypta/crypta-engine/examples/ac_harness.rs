@@ -2,7 +2,7 @@
 //! the Ubuntu VM, scripts/crypta-ocserv-vm.sh), standing in for cryptad,
 //! the tun and the secrets helper:
 //!
-//!   ac_harness ENGINE HOST ADDR:PORT CA.pem [field=value ...] [--saved PW] [--user U] [--ping A.B.C.D] [--hold]
+//!   ac_harness ENGINE HOST ADDR:PORT CA.pem [field=value ...] [--gp] [--saved PW] [--user U] [--ping A.B.C.D] [--hold]
 //!
 //! Prompts are answered from the `field=value` list (a value `@held:X` goes
 //! as an Arca handle the fake helper redeems to X; `@totp` is the code of
@@ -71,9 +71,11 @@ fn main() {
     // (in the real one, Arca does).
     let mut cert_chain: Vec<Vec<u8>> = Vec::new();
     let mut key_pem: Option<String> = None;
+    let mut gp = false;
     let mut i = 5;
     while i < a.len() {
         match a[i].as_str() {
+            "--gp" => gp = true,
             "--saved" => {
                 saved = Some(a[i + 1].clone());
                 i += 1;
@@ -204,24 +206,21 @@ fn main() {
     }
 
     let mut c = ctl;
-    engine::write(
-        &mut c,
-        &ToEngine::StartAc(StartAc {
-            host: host.clone(),
-            gateway: gw,
-            path: "/".into(),
-            cas,
-            pin,
-            hostname: "atrium".into(),
-            mtu: 1406,
-            username: user,
-            group: group.clone(),
-            saved: saved.is_some(),
-            cert_chain: cert_chain.clone(),
-            resume: false,
-        }),
-    )
-    .unwrap();
+    let start = StartAc {
+        host: host.clone(),
+        gateway: gw,
+        path: "/".into(),
+        cas,
+        pin,
+        hostname: "atrium".into(),
+        mtu: 1406,
+        username: user,
+        group: group.clone(),
+        saved: saved.is_some(),
+        cert_chain: cert_chain.clone(),
+        resume: false,
+    };
+    engine::write(&mut c, &if gp { ToEngine::StartGp(start) } else { ToEngine::StartAc(start) }).unwrap();
     let mut rd = engine::Reader::default();
     let t0 = Instant::now();
     let mut addr = None;
@@ -264,6 +263,9 @@ fn main() {
                 FromEngine::Pushed(p) => {
                     println!("pushed: addr={}/{} mtu={} dns={:?} domains={:?} includes={} full={} ignored={:?} banner={:?}", p.addr, p.prefix, p.mtu, p.dns, p.domains, p.includes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","), p.full, p.ignored, p.banner);
                     addr = Some(p.addr.octets());
+                    if gp {
+                        engine::write(&mut c, &ToEngine::Applied).unwrap();
+                    }
                 }
                 FromEngine::Up => {
                     ups += 1;

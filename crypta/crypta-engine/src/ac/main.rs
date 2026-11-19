@@ -19,6 +19,7 @@
 //! A lost connection or a changed network reconnects with the session
 //! cookie and asks nobody; an ended session signs in again.
 
+mod gp;
 mod link;
 mod tls;
 
@@ -693,8 +694,9 @@ fn main() {
     let ctl_sock = unsafe { UnixStream::from_raw_fd(0) };
     let tun = unsafe { std::fs::File::from_raw_fd(3) };
     let secrets_sock = unsafe { UnixStream::from_raw_fd(4) };
-    let st = match engine::read::<ToEngine>(&mut &ctl_sock) {
-        Ok(Some(ToEngine::StartAc(s))) => s,
+    let (st, globalprotect) = match engine::read::<ToEngine>(&mut &ctl_sock) {
+        Ok(Some(ToEngine::StartAc(s))) => (s, false),
+        Ok(Some(ToEngine::StartGp(s))) => (s, true),
         Ok(Some(_)) => return log("the first frame was not StartAc"),
         Ok(None) => return log("cryptad closed before StartAc"),
         Err(e) => return log(&format!("reading StartAc: {e}")),
@@ -728,7 +730,8 @@ fn main() {
     drop(system);
     log(&format!("gateway {} at {}", st.host, st.gateway));
     let mut e = Engine { st, ctl, secrets, conn, cfg, tun, saved_used: false, rx: 0, tx: 0, dropped: 0 };
-    match e.run() {
+    let result = if globalprotect { e.run_gp() } else { e.run() };
+    match result {
         Ok(()) => log("stopping"),
         Err(why) if why.is_empty() => log("stopping"),
         Err(why) => {

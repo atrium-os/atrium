@@ -717,6 +717,26 @@ Gate: `scripts/crypta-v2-gate.sh run` (the V1 stand; its setup is shared). Two v
 - Frames: `scripts/crypta-v4-gate.sh ui` (then `click`, `type`, `frame`) shows Settings' sign-ins under a headless frescod with limend and arca-ui: the gateway's username and group, the password in Arca's field, and the single sign-on card. It found Settings crashing when Arca's field was asked for (a RefCell borrow held across the request), fixed.
 - Fuzzing: `crypta/crypta-ac/fuzz` (auth/XML, HTTP head and body read whole and split, CSTP deframing read whole and split); 5 minutes each found one split-stream difference in chunk-size lines, fixed (a 256-byte line limit either way).
 
+**V5 direct gateway slice (2026-11-19).** Administrators can provision a direct
+GlobalProtect gateway with `atrium-cryptad ctl create-gp name=work host=vpn.example[:port]`.
+Optional `user=HEX`, `pin=HEX`, `ca=B64`, and `scoped=0` have the same meanings as for
+`create-ac`. Settings can connect and answer prompts for a provisioned profile. Use the
+gateway address itself. Portal discovery, gateway selection, and GlobalProtect-specific
+challenge forms are future work.
+
+- `StartGp` uses the existing corporate TLS executable and jaild policy. Gateway
+  prelogin, password login, JNLP session parsing, and getconfig use bounded HTTP/XML
+  readers after certificate verification. Client key signing and password handles use
+  the existing Arca helper. Arca stores the session for reconnect and engine restart.
+- The first transport is TLS with IPv4 on tun. The engine checks HIP requirements,
+  opens the same gateway's TLS tunnel, and waits for cryptad's atrium-net acceptance
+  before handing packets to tun. It refreshes the tunnel using the pushed timeout and
+  tries to log out on disconnect. Required HIP, local-network lockdown and split
+  exclusions are refused until Atrium can enforce those policies.
+- ESP, truthful HIP reporting with review in Curia, portal and challenge support, and
+  the FreeBSD/OpenConnect interop gate remain part of V5. Scripted SSO and passkeys
+  remain parked pending Navigator I3.
+
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
 
 ### Questions for Shankar

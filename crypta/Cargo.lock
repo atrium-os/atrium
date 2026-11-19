@@ -341,6 +341,7 @@ version = "0.1.0"
 dependencies = [
  "aura-ipc",
  "crypta-ac",
+ "crypta-gp",
  "crypta-proto",
  "crypta-wg",
  "libc",
@@ -353,6 +354,11 @@ dependencies = [
 [[package]]
 name = "crypta-gp"
 version = "0.1.0"
+dependencies = [
+ "crypta-ac",
+ "crypta-proto",
+ "zeroize",
+]
 
 [[package]]
 name = "crypta-proto"

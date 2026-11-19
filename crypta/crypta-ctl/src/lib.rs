@@ -108,6 +108,7 @@ pub enum Kind {
     WireGuard,
     /// A Cisco AnyConnect (or compatible) gateway (vpn.md §9).
     AnyConnect,
+    GlobalProtect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

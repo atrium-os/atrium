@@ -30,7 +30,11 @@ pub fn profile(l: &Line) -> Option<Profile> {
         (true, true) => State::Up,
     };
     let scope = if flag(l, "scoped") { Scope::Personas } else { Scope::Machine };
-    let kind = if l.get("kind") == Some("ac") { Kind::AnyConnect } else { Kind::WireGuard };
+    let kind = match l.get("kind") {
+        Some("ac") => Kind::AnyConnect,
+        Some("gp") => Kind::GlobalProtect,
+        _ => Kind::WireGuard,
+    };
     Some(Profile { tunnel: Tunnel { name, kind, state, scope }, block: flag(l, "block"), full: flag(l, "full") })
 }
 
@@ -42,7 +46,7 @@ fn text(l: &Line, k: &str) -> Option<String> {
 pub fn details(l: &Line) -> Option<Details> {
     let profile = profile(l)?;
     let error = text(l, "error");
-    if profile.tunnel.kind == Kind::AnyConnect {
+    if profile.tunnel.kind != Kind::WireGuard {
         let port = l.num("port").unwrap_or(443);
         return Some(Details {
             profile,

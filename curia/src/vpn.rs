@@ -243,7 +243,8 @@ pub fn describe(d: &Details) -> String {
 /// Its third line: the server, our address, our key's start.
 pub fn detail_line(d: &Details) -> String {
     if let Some(c) = &d.corporate {
-        let mut v = vec![if c.port == 443 { format!("Gateway {}", c.host) } else { format!("Gateway {}:{}", c.host, c.port) }];
+        let gateway = if d.profile.tunnel.kind == Kind::GlobalProtect { "GlobalProtect gateway" } else { "Gateway" };
+        let mut v = vec![if c.port == 443 { format!("{gateway} {}", c.host) } else { format!("{gateway} {}:{}", c.host, c.port) }];
         if !d.addrs.is_empty() {
             v.push(format!("address {}", d.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")));
         }
@@ -927,7 +928,7 @@ impl CuriaView {
             for d in &list {
                 let name = d.profile.tunnel.name.clone();
                 let chosen = d.profile.tunnel.scope == Scope::Personas;
-                let corporate = d.profile.tunnel.kind == Kind::AnyConnect;
+                let corporate = d.profile.tunnel.kind != Kind::WireGuard;
                 let err_h = if d.error.is_some() && d.profile.tunnel.state == State::Down { em(20.0) } else { 0.0 };
                 let rh = em(if chosen { 156.0 } else { 116.0 }) + if corporate { em(40.0) } else { 0.0 } + err_h;
                 rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);

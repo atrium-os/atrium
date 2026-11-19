@@ -15,6 +15,7 @@ name = "atrium-crypta-ac"
 path = "src/ac/main.rs"
 
 [dependencies]
+crypta-gp    = { path = "../crypta-gp" }
 crypta-ac    = { path = "../crypta-ac" }
 aura-ipc     = { path = "../../aura/aura-ipc" }
 rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

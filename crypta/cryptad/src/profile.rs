@@ -45,6 +45,8 @@ pub struct Profile {
 /// `/tls`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ac {
+    /// Direct GlobalProtect gateway, sharing the corporate profile fields.
+    pub globalprotect: bool,
     /// The gateway's name (TLS and `Host`), resolved at each connect.
     pub host: String,
     pub port: u16,
@@ -64,6 +66,12 @@ pub struct Ac {
     pub cert_chain: Vec<Vec<u8>>,
     /// The client key's public point (SEC1), once made.
     pub cert_key: Option<Vec<u8>>,
+}
+
+impl Ac {
+    pub fn kind(&self) -> &'static str {
+        if self.globalprotect { "gp" } else { "ac" }
+    }
 }
 
 /// A gateway name: a DNS name (letters, digits, `-`, dots), at most 253.
@@ -227,6 +235,10 @@ impl Profile {
         if !valid_host(&host) {
             return Err("bad-host");
         }
+        let globalprotect = l.verb == "create-gp";
+        if globalprotect && (l.get("path").is_some() || l.get("group").is_some()) {
+            return Err("globalprotect-uses-direct-gateway");
+        }
         let path = l.get("path").unwrap_or("/").to_string();
         if !valid_path(&path) {
             return Err("bad-path");
@@ -265,6 +277,7 @@ impl Profile {
             // A person's corporate VPN carries their work apps (§9.6).
             scoped: l.get("scoped") != Some("0"),
             ac: Some(Ac {
+                globalprotect,
                 host,
                 port,
                 path,
@@ -348,7 +361,7 @@ impl Profile {
             p = p.with("domains", self.domains.join(","));
         }
         if let Some(a) = &self.ac {
-            p = p.with("kind", "ac").with("host", &a.host).with("port", a.port).with("path", &a.path).with_hex("hostname", a.hostname.as_bytes());
+            p = p.with("kind", a.kind()).with("host", &a.host).with("port", a.port).with("path", &a.path).with_hex("hostname", a.hostname.as_bytes());
             if let Some(u) = &a.username {
                 p = p.with_hex("user", u.as_bytes());
             }
@@ -402,7 +415,8 @@ impl Profile {
         }
         let utf8 = |k: &str| l.hex(k).and_then(|b| String::from_utf8(b).ok());
         let ac = match l.get("kind") {
-            Some("ac") => Some(Ac {
+            Some("ac" | "gp") => Some(Ac {
+                globalprotect: l.get("kind") == Some("gp"),
                 host: l.get("host").filter(|h| valid_host(h))?.to_string(),
                 port: l.num("port")?,
                 path: l.get("path").filter(|p| valid_path(p))?.to_string(),
@@ -554,6 +568,16 @@ mod tests {
         assert_eq!(Profile::load(d.path(), "big").unwrap(), p);
         assert_eq!(Profile::names(d.path()), vec!["big".to_string()]);
         assert!(Profile::load(d.path(), "../big").is_none());
+    }
+
+    #[test]
+    fn a_globalprotect_profile_round_trips() {
+        let line = Line::parse("create-gp name=work host=gw.example:8443").unwrap();
+        let p = Profile::from_create_ac(&line).unwrap();
+        assert_eq!(p.ac.as_ref().unwrap().kind(), "gp");
+        assert_eq!(Profile::from_text(&p.to_text()), Some(p));
+        let portal = Line::parse("create-gp name=work host=gw.example path=/portal").unwrap();
+        assert!(Profile::from_create_ac(&portal).is_err());
     }
 
     #[test]

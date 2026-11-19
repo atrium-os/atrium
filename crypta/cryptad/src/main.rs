@@ -26,6 +26,7 @@
 //!
 //! AnyConnect (V4, vpn.md §9):
 //!
+//! - `create-gp name=N host=H[:P] [user=HEX] [pin=HEX] [ca=B64] [scoped=0]`
 //! - `create-ac name=N host=H[:P] [path=] [user=HEX] [group=HEX] [pin=HEX] [ca=B64] [scoped=0]`
 //! - `prompt name=N`: what the gateway asks (`text k= v=HEX` lines, then
 //!   `field i= kind= name=HEX label=HEX` and `choice i= value=HEX
@@ -411,7 +412,7 @@ impl D {
         let mut e = launch(&self.o.jaild, uid, r, gw, Some(ours.as_fd()))?;
         drop(ours);
         e.helper = Some(helper);
-        let start = ToEngine::StartAc(engine::StartAc {
+        let settings = engine::StartAc {
             host: a.host.clone(),
             gateway: gw,
             path: a.path.clone(),
@@ -424,13 +425,14 @@ impl D {
             saved,
             cert_chain: a.cert_chain.clone(),
             resume,
-        });
+        };
+        let start = if a.globalprotect { ToEngine::StartGp(settings) } else { ToEngine::StartAc(settings) };
         let _ = e.sock.set_write_timeout(Some(Duration::from_secs(2)));
         if let Err(err) = engine::write(&mut e.sock, &start) {
             self.retire(e.uid);
             return Err(format!("start: {err}"));
         }
-        self.log(&format!("{}: AnyConnect engine {} started for {} ({gw}){}{}", r.p.name, e.uid, a.host, if saved { ", saved password" } else { "" }, if resume { ", resuming" } else { "" }));
+        self.log(&format!("{}: corporate engine {} started for {} ({gw}){}{}", r.p.name, e.uid, a.host, if saved { ", saved password" } else { "" }, if resume { ", resuming" } else { "" }));
         r.engine = Some(e);
         r.handshake = false;
         r.ac.prompt = None;
@@ -585,7 +587,7 @@ impl D {
         p.save(&self.o.state).map_err(|e| format!("save: {e}"))?;
         // A sign-in jar left by an old profile of this name is not this one's.
         let _ = self.keys.call(&Line::new("forget-jar").with("profile", &p.name));
-        self.log(&format!("created {} (AnyConnect, {})", p.name, p.ac.as_ref().map(|a| a.host.as_str()).unwrap_or("")));
+        self.log(&format!("created {} (corporate VPN, {})", p.name, p.ac.as_ref().map(|a| a.host.as_str()).unwrap_or("")));
         Ok(vec![Line::new("created").with("name", &p.name)])
     }
 
@@ -726,7 +728,7 @@ impl D {
                 let ac = Profile::load(&self.o.state, &n).filter(|p| p.ac.is_some());
                 if let Some(p) = ac {
                     let a = p.ac.as_ref().unwrap();
-                    l = l.with("kind", "ac").with("host", &a.host).with("port", a.port).with("block", p.block as u8).with("scoped", p.scoped as u8).with("cert", (!a.cert_chain.is_empty()) as u8).with("pinned", a.pin.is_some() as u8);
+                    l = l.with("kind", a.kind()).with("host", &a.host).with("port", a.port).with("block", p.block as u8).with("scoped", p.scoped as u8).with("cert", (!a.cert_chain.is_empty()) as u8).with("pinned", a.pin.is_some() as u8);
                     if let Some(u) = &a.username {
                         l = l.with_hex("user", u.as_bytes());
                     }
@@ -750,7 +752,7 @@ impl D {
         let res: Result<Vec<Line>, String> = match (l.verb.as_str(), name) {
             ("import", _) => self.import(l, file),
             ("create", _) => self.create(l),
-            ("create-ac", _) => self.create_ac(l, file),
+            ("create-ac" | "create-gp", _) => self.create_ac(l, file),
             ("prompt", Some(n)) => self.prompt(&n),
             // What the gateway said once signed in (vpn.md §9.4: plain text).
             ("banner", Some(n)) => self.ac_run(&n).map(|k| {
@@ -869,6 +871,9 @@ impl D {
                     if let Err(e) = self.apply_push(k, p) {
                         self.fail(k, &format!("atrium-net refused what the gateway pushed ({e})"));
                         return;
+                    }
+                    if self.runs[k].p.ac.as_ref().is_some_and(|a| a.globalprotect) {
+                        let _ = self.to_engine(k, &ToEngine::Applied);
                     }
                 }
                 FromEngine::Refused { why } => {

@@ -111,6 +111,10 @@ pub enum ToEngine {
     /// The network changed: send from the new path (vpn.md §5.6).
     Rebind,
     Stop,
+    /// Direct GlobalProtect gateway, using the corporate engine sandbox.
+    StartGp(StartAc),
+    /// atrium-net accepted a GlobalProtect tunnel proposal.
+    Applied,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
