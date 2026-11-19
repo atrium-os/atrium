@@ -135,6 +135,7 @@ pub fn persona_name(p: &str) -> String {
 /// Personal's apps" (the share sheet lists them).
 pub fn crossing_words(s: &CrossingSwitch) -> String {
     match s.kind.as_str() {
+        "printers" => format!("{} may print to {} printers", persona_name(&s.from), persona_name(&s.to)),
         "share" => format!("{} may share to {}'s apps", persona_name(&s.from), persona_name(&s.to)),
         k => format!("{} may send {k} to {}", persona_name(&s.from), persona_name(&s.to)),
     }

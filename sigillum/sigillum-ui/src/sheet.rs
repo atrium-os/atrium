@@ -125,7 +125,11 @@ impl State {
                     Purpose::Admin => "to change a system setting".into(),
                     Purpose::Crossing { from, to, kind } => {
                         let p = |s: &str| if s == "personal" { "Personal".to_string() } else { s.to_string() };
-                        format!("to let {} send {kind} to {}", p(from), p(to))
+                        if kind == "printers" {
+                            format!("to let {} use {} printers", p(from), p(to))
+                        } else {
+                            format!("to let {} send {kind} to {}", p(from), p(to))
+                        }
                     }
                     Purpose::SharePrinter { printer } => {
                         return (

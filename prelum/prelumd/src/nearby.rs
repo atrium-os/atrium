@@ -112,6 +112,11 @@ fn lock(d: &Daemon) -> std::sync::MutexGuard<'_, Near> {
 impl Daemon {
     /// `NEARBY`: listen up to `secs` seconds, then list what answered.
     pub fn nearby(self: &Arc<Self>, uid: u32, persona: Option<&str>, secs: u8) -> Result<Vec<print::Nearby>, Fail> {
+        if let Some(p) = persona {
+            if self.route(uid, p)?.is_some() {
+                return Err((status::NOT_ALLOWED, "Nearby discovery is unavailable on a VPN persona".into()));
+            }
+        }
         let wait = Duration::from_secs(secs.min(MAX_WAIT) as u64);
         self.browse()?;
         std::thread::sleep(wait);
@@ -276,7 +281,7 @@ impl Daemon {
             shared: false,
             info: PrinterInfo::default(),
         };
-        let (info, key) = self.learn_within(&s, Some(CONFIRM_LIMIT)).ok()?;
+        let (info, key) = self.learn_within(&s, Some(CONFIRM_LIMIT), None).ok()?;
         Some(Confirmed { uri: uri.to_string(), tls, announced: svc.instance.clone(), info, key })
     }
 

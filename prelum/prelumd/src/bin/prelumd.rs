@@ -4,7 +4,7 @@
 //! atrium-prelumd [--socket PATH] [--state DIR] [--spool DIR] [--network NAME]
 //!         [--direct BIN_DIR] [--jaild PATH] [--rctl]
 //!         [--netconf DIR | --mdns-legacy ADDR:PORT]
-//!         [--sheet-uid UID] [--registry PATH] [--sigillum PATH]
+//!         [--sheet-uid UID] [--registry PATH] [--sigillum PATH] [--policy-root DIR]
 //! ```
 //!
 //! Serves `CLASS_PRINT` on `--socket`. Workers run through jaild
@@ -42,6 +42,7 @@ fn main() -> ExitCode {
     let mut socket = PathBuf::from(SOCKET);
     let mut state = PathBuf::from(STATE);
     let mut spool = PathBuf::from(SPOOL);
+    let mut policy_root = PathBuf::from("/var/db/atrium");
     let mut sigillum = PathBuf::from(sigillum_proto::client::SOCKET);
     let mut network = "local".to_string();
     let mut direct: Option<PathBuf> = None;
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
             "--socket" => socket = v.into(),
             "--state" => state = v.into(),
             "--spool" => spool = v.into(),
+            "--policy-root" => policy_root = v.into(),
             "--sigillum" => sigillum = v.into(),
             "--network" => network = v,
             "--direct" => direct = Some(v.into()),
@@ -136,7 +138,7 @@ fn main() -> ExitCode {
         let person = uid_of(user)?;
         Some((person, reg.persona(app).flatten().map(str::to_string), id.to_string()))
     });
-    let d = Daemon::new(Config { state, spool, sigillum, network: Box::new(move || network.clone()), mdns, sheet_uid, person_of }, launcher);
+    let d = Daemon::new(Config { state, spool, sigillum, policy_root, network: Box::new(move || network.clone()), mdns, sheet_uid, person_of }, launcher);
     if let Some(dir) = socket.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

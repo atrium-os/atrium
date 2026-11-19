@@ -22,6 +22,8 @@
 //! `OK`, then sends `EV` (`ASYNC_EVENT`) with a [`Status`] now and on every
 //! change.
 
+pub mod route_domain;
+
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 

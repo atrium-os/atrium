@@ -499,7 +499,7 @@ impl Broker {
                 }
                 let name = |s: &str| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
                 if let Purpose::Crossing { from, to, kind } = &v.purpose {
-                    if !name(from) || !name(to) || !matches!(kind.as_str(), "links" | "files" | "clipboard") {
+                    if !name(from) || !name(to) || !matches!(kind.as_str(), "links" | "files" | "clipboard" | "printers") {
                         return vec![refused(conn, id, Refusal::Malformed)];
                     }
                 }

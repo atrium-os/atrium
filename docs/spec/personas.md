@@ -204,6 +204,7 @@ One rule for every way data moves:
 | a clipboard entry | Tabula: each entry carries the persona of the instance that copied it (from its peer uid) |
 | a share-sheet offer | the share sheet lists another persona's apps only with the `share` switch on; portcullisd checks it again when limend starts the target there (share-sheet.md §7) |
 | a workspace link (homes.md §5.2) | portcullisd |
+| a print job to another persona’s private printer | Prelum checks the directional `printers` switch at submit and for each attempt |
 | a notification action that opens something | Forum, as a link |
 
 - **Off by default, both directions.** The attempt is refused in a sheet drawn by Forum

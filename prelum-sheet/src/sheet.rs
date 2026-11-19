@@ -83,6 +83,7 @@ pub struct Sheet {
     pub notice: Option<(String, Tone)>,
     /// Something is under way ("Printing…"): the buttons wait.
     pub working: Option<&'static str>,
+    pub persona: String,
     pub pin_printer: Option<u32>,
     pub pin_choice: PinChoice,
     pub login_printer: Option<u32>,
@@ -121,6 +122,7 @@ impl Sheet {
             preview_note: None,
             notice: None,
             working: None,
+            persona: String::new(),
             pin_printer: None,
             pin_choice: PinChoice::Once,
             login_printer: None,
@@ -149,10 +151,10 @@ impl Sheet {
         d.extend(nearby.into_iter().filter(|n| n.saved.is_none()).map(Dest::Nearby));
         d.push(Dest::SavePdf);
         self.dests = d;
-        self.chosen = self.dests.iter().position(|x| Self::same(x, &was)).unwrap_or(0);
+        self.chosen = self.dests.iter().position(|x| Self::same(x, &was)).unwrap_or(self.dests.len() - 1);
         // The first list: the first saved printer that can print now.
         if first {
-            self.chosen = self.dests.iter().position(|x| matches!(x, Dest::Saved(p) if usable(p).is_ok())).unwrap_or(0);
+            self.chosen = self.dests.iter().position(|x| matches!(x, Dest::Saved(p) if (p.shared || p.persona == self.persona) && usable(p).is_ok())).unwrap_or(self.dests.len() - 1);
             // No paper from the app: the printer's own.
             if let (false, Dest::Saved(p)) = (self.media_hinted, self.dest()) {
                 if let Some(m) = p.media_default.clone().filter(|m| PAPERS.iter().any(|(k, _)| k == m)) {

@@ -829,7 +829,7 @@ pub struct CrossingSwitch {
 }
 
 /// The kinds a crossing switch names in Settings (personas.md §6).
-pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files", "share"];
+pub const CROSSING_KINDS: &[&str] = &["links", "clipboard", "files", "share", "printers"];
 
 /// A link scheme in Settings' Links section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

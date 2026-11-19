@@ -58,6 +58,7 @@ pub struct Config {
     pub state: PathBuf,
     pub spool: PathBuf,
     pub sigillum: PathBuf,
+    pub policy_root: PathBuf,
     /// The network we are on now, as atrium-net names it (§7.3).
     pub network: Box<dyn Fn() -> String + Send + Sync>,
     /// Where prelum-browse's sockets come from (§7.1): atrium-net, asked
@@ -79,7 +80,7 @@ fn visible_to(printer: &Saved, persona: &str) -> bool {
 }
 
 const CROSSING_REFUSED: &str =
-    "This printer belongs to another persona. Share it in Settings → Printers to print from here.";
+    "This printer belongs to another persona. Allow printing in Settings → Personas → Between personas, or share it in Settings → Printers.";
 
 fn fail<T>(st: u8, msg: impl Into<String>) -> Result<T, Fail> {
     Err((st, msg.into()))
@@ -421,12 +422,45 @@ impl Daemon {
         p.file.printer.iter().find(|s| s.id == id).cloned().ok_or((status::NOT_FOUND, "no such printer".into()))
     }
 
+    fn policy(&self, uid: u32) -> Result<portcullis_policy::Policy, Fail> {
+        let user = portcullis_peer::username(uid)
+            .ok_or((status::NOT_ALLOWED, "Unknown account for printer policy".into()))?;
+        portcullis_policy::Policy::load(&self.cfg.policy_root.join(user).join("policy.toml"))
+            .map_err(|e| (status::FAILED, format!("Cannot read printer policy: {e}")))
+    }
+
+    fn can_print(&self, uid: u32, persona: &str, printer: &Saved) -> bool {
+        let named = |p: &str| !p.is_empty();
+        visible_to(printer, persona) || self.policy(uid).is_ok_and(|policy| {
+            policy.may_cross(named(persona).then_some(persona),
+                named(&printer.persona).then_some(printer.persona.as_str()), "printers")
+        })
+    }
+
+    fn needs_ipps(&self, uid: u32, persona: &str) -> bool {
+        !persona.is_empty() && self.policy(uid).ok()
+            .and_then(|p| p.personas.get(persona).and_then(|p| p.print_require_ipps)).unwrap_or(true)
+    }
+
+    pub(crate) fn route(&self, uid: u32, persona: &str) -> Result<Option<u32>, Fail> {
+        if persona.is_empty() {
+            return Ok(None);
+        }
+        let policy = self.policy(uid)?;
+        let def = policy.personas.get(persona)
+            .ok_or((status::NOT_ALLOWED, "The printing persona no longer exists".into()))?;
+        def.vpn.as_deref().map(|vpn| {
+            atrium_netconf::route_domain::fib_for(vpn)
+                .map_err(|e| (status::OFFLINE, format!("Cannot use {persona}'s printer route: {e}")))
+        }).transpose()
+    }
+
     /// The saved printer of `uid` with this identity, if any.
     pub(crate) fn saved_as(&self, uid: u32, persona: Option<&str>, uuid: Option<&str>, key: Option<&str>) -> Option<u32> {
         uuid?;
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
-        p.file.printer.iter().find(|o| persona.is_none_or(|p| visible_to(o, p)) && o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
+        p.file.printer.iter().find(|o| persona.is_none_or(|p| self.can_print(uid, p, o)) && o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
     }
 
     pub(crate) fn cfg(&self) -> &Config {
@@ -483,15 +517,15 @@ impl Daemon {
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
         p.file.printer.iter()
-            .filter(|s| persona.is_none_or(|p| visible_to(s, p)))
+            .filter(|s| persona.is_none_or(|p| self.can_print(uid, p, s)))
             .map(|s| self.view(s, p.live.get(&s.id)))
             .collect()
     }
 
-    fn worker(&self, s: &Saved, learn: bool, pin: bool, login_user: Option<u32>) -> Result<Ipp, Fail> {
+    fn worker(&self, s: &Saved, learn: bool, pin: bool, login_user: Option<u32>, fib: Option<u32>) -> Result<Ipp, Fail> {
         let addr: SocketAddr = s.addr.parse().map_err(|_| (status::FAILED, "bad saved address".to_string()))?;
         let login = login_user.and_then(|uid| printer_login_grant(s, uid));
-        let p = self.launcher.ipp(addr, pin || login.is_some()).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
+        let p = self.launcher.ipp(addr, pin || login.is_some(), fib).map_err(|e| (status::FAILED, format!("can't start prelum-ipp: {e}")))?;
         let mut w = Ipp { p };
         let start = ipp::Start {
             uri: s.uri.clone(),
@@ -506,14 +540,14 @@ impl Daemon {
     }
 
     /// Ask a printer who it is, learning its key (§7.2).
-    pub(crate) fn learn(&self, s: &Saved) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
-        self.learn_within(s, None)
+    pub(crate) fn learn(&self, s: &Saved, fib: Option<u32>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
+        self.learn_within(s, None, fib)
     }
 
     /// [`Self::learn`], giving up after `limit` (a printer found on the LAN,
     /// which may never answer).
-    pub(crate) fn learn_within(&self, s: &Saved, limit: Option<Duration>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
-        let mut w = self.worker(s, true, false, None)?;
+    pub(crate) fn learn_within(&self, s: &Saved, limit: Option<Duration>, fib: Option<u32>) -> Result<(PrinterInfo, Option<[u8; 32]>), Fail> {
+        let mut w = self.worker(s, true, false, None, fib)?;
         if limit.is_some() {
             w.p.sock.set_read_timeout(limit).map_err(|e| (status::FAILED, e.to_string()))?;
         }
@@ -535,10 +569,18 @@ impl Daemon {
         if a.name.len() > 128 || a.name.chars().any(char::is_control) {
             return fail(status::MALFORMED, "bad name");
         }
+        let fib = self.route(uid, persona)?;
         let cands = candidates(&a.uri).map_err(|e| (status::MALFORMED, e))?;
+        let require_ipps = self.needs_ipps(uid, persona);
         let network = (self.cfg.network)();
         let mut last = (status::FAILED, "no printer there".to_string());
         for (uri, tls, hostport) in cands {
+            if require_ipps && !tls {
+                return fail(status::NOT_ALLOWED, "This persona requires encrypted IPPS printing");
+            }
+            if fib.is_some() && hostport.parse::<SocketAddr>().is_err() {
+                return fail(status::NOT_ALLOWED, "Enter a numeric printer address for a VPN persona");
+            }
             let addr = match resolve(&hostport) {
                 Ok(a) => a,
                 Err(e) => return fail(status::OFFLINE, e),
@@ -559,7 +601,7 @@ impl Daemon {
                 shared: false,
                 info: PrinterInfo::default(),
             };
-            match self.learn(&s) {
+            match self.learn(&s, fib) {
                 Ok((info, key)) => {
                     s.key = key.map(|k| store::hex(&k));
                     s.uuid = info.uuid.clone();
@@ -571,7 +613,7 @@ impl Daemon {
                     let p = self.person(&mut st, uid);
                     // The same printer again (same identity): what was saved.
                     if let Some(old) = p.file.printer.iter().find(|o| o.uuid.is_some() && o.uuid == s.uuid && o.key == s.key && o.uri == s.uri) {
-                        if !visible_to(old, persona) {
+                        if !self.can_print(uid, persona, old) {
                             return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
                         }
                         return Ok(self.view(old, p.live.get(&old.id)));
@@ -769,7 +811,7 @@ impl Daemon {
     /// address and release the jobs held for it.
     pub fn repin(self: &Arc<Self>, uid: u32, id: u32) -> Result<print::Printer, Fail> {
         let s = self.saved(uid, id)?;
-        let (info, key) = self.learn(&s)?;
+        let (info, key) = self.learn(&s, self.route(uid, &s.persona)?)?;
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
         let Some(s) = p.file.printer.iter_mut().find(|s| s.id == id) else { return fail(status::NOT_FOUND, "no such printer") };
@@ -795,7 +837,7 @@ impl Daemon {
 
     pub fn identify(&self, uid: u32, id: u32) -> Result<String, Fail> {
         let s = self.saved(uid, id)?;
-        let mut w = self.worker(&s, false, false, None)?;
+        let mut w = self.worker(&s, false, false, None, self.route(uid, &s.persona)?)?;
         let mut actions: Vec<String> = ["sound", "flash", "display"].iter().filter(|a| s.info.identify_actions.iter().any(|x| x == *a)).map(|a| a.to_string()).collect();
         if actions.is_empty() {
             actions.push("sound".into());
@@ -842,7 +884,7 @@ impl Daemon {
         if s.network != (self.cfg.network)() {
             return Ok(self.view(&s, None));
         }
-        let mut w = self.worker(&s, false, false, None)?;
+        let mut w = self.worker(&s, false, false, None, self.route(uid, &s.persona)?)?;
         let ev = w.ask(&ipp::Req::Query).map_err(|e| (status::FAILED, format!("prelum-ipp: {e}")))?;
         match ev {
             ipp::Ev::Printer { info, .. } => {
@@ -879,7 +921,7 @@ impl Daemon {
 
     pub fn printer_binding(&self, uid: u32, persona: &str, printer: u32, login: bool) -> Result<print::PinBinding, Fail> {
         let s = self.saved(uid, printer)?;
-        if !visible_to(&s, persona) {
+        if !self.can_print(uid, persona, &s) {
             return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
         }
         if login && s.persona != persona {
@@ -927,8 +969,11 @@ impl Daemon {
         let mut st = self.lock();
         let s = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == req.printer)
             .ok_or((status::NOT_FOUND, "no such printer".into()))?;
-        if !visible_to(s, persona) {
+        if !self.can_print(uid, persona, s) {
             return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
+        }
+        if !s.tls && self.needs_ipps(uid, persona) {
+            return fail(status::NOT_ALLOWED, "This persona requires encrypted IPPS printing");
         }
         if pin.is_some() && (!s.tls || s.key.is_none() || s.uuid.is_none()) {
             return fail(status::NOT_ALLOWED, "PIN jobs require a pinned IPPS printer");
@@ -1116,7 +1161,7 @@ impl Daemon {
 
     /// One attempt at one job.
     fn run(self: &Arc<Self>, uid: u32, printer: u32, job: u64) -> Outcome {
-        let (s, req, pdf, pin) = {
+        let (s, req, pdf, pin, persona) = {
             let mut st = self.lock();
             let Some(s) = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == printer).cloned() else {
                 return Outcome::Failed("the printer was removed".into());
@@ -1124,13 +1169,16 @@ impl Daemon {
             let Some(j) = st.jobs.get(&job) else {
                 return Outcome::Failed("the document is gone".into());
             };
-            if !visible_to(&s, &j.persona) {
+            if !self.can_print(uid, &j.persona, &s) {
                 return Outcome::Failed(CROSSING_REFUSED.into());
+            }
+            if !s.tls && self.needs_ipps(uid, &j.persona) {
+                return Outcome::Failed("This persona requires encrypted IPPS printing".into());
             }
             let Ok(pdf) = j.pdf.try_clone() else {
                 return Outcome::Failed("the document is gone".into());
             };
-            (s, j.req.clone(), pdf, j.pin.clone())
+            (s, j.req.clone(), pdf, j.pin.clone(), j.persona.clone())
         };
         if s.network != (self.cfg.network)() {
             return Outcome::Retry(format!("{} is not on this network", s.name));
@@ -1142,8 +1190,12 @@ impl Daemon {
             return Outcome::Cancelled;
         }
 
+        let fib = match self.route(uid, &persona) {
+            Ok(fib) => fib,
+            Err((_, message)) => return Outcome::Failed(message),
+        };
         // Who is it, and what does it take? (§7.3: before any job byte.)
-        let mut w = match self.worker(&s, false, pin.is_some(), Some(uid)) {
+        let mut w = match self.worker(&s, false, pin.is_some(), Some(uid), fib) {
             Ok(w) => w,
             Err((_, m)) => return Outcome::Failed(m),
         };
@@ -1246,14 +1298,14 @@ impl Daemon {
         if self.cancelled(job) {
             drop(w);
             if let Some(id) = remote {
-                self.cancel_remote(&s, uid, id);
+                self.cancel_remote(&s, uid, id, fib);
             }
             return Outcome::Cancelled;
         }
         if let Err(e) = rendered {
             drop(w);
             if let Some(id) = remote {
-                self.cancel_remote(&s, uid, id);
+                self.cancel_remote(&s, uid, id, fib);
             }
             return Outcome::Failed(e);
         }
@@ -1283,7 +1335,7 @@ impl Daemon {
         }
         let Some(remote) = remote else { return Outcome::Done(String::new()) };
         self.set(job, |j| j.view.phase = Phase::Printing);
-        self.follow(&s, w, uid, job, remote)
+        self.follow(&s, w, uid, job, remote, fib)
     }
 
     /// Submit, then the spool's bytes as they come, then the end.
@@ -1340,7 +1392,7 @@ impl Daemon {
     }
 
     /// Follow the job at the printer until it ends (§6.3 polling).
-    fn follow(&self, s: &Saved, mut w: Ipp, uid: u32, job: u64, remote: i32) -> Outcome {
+    fn follow(&self, s: &Saved, mut w: Ipp, uid: u32, job: u64, remote: i32, fib: Option<u32>) -> Outcome {
         let began = Instant::now();
         let mut failing_since: Option<Instant> = None;
         loop {
@@ -1351,7 +1403,7 @@ impl Daemon {
                 if st.jobs.get(&job).is_none_or(|j| j.cancel) {
                     drop(st);
                     drop(w);
-                    self.cancel_remote(s, uid, remote);
+                    self.cancel_remote(s, uid, remote, fib);
                     return Outcome::Cancelled;
                 }
             }
@@ -1393,7 +1445,7 @@ impl Daemon {
                     }
                     if other.is_err() {
                         // The worker died: a new one.
-                        match self.worker(s, false, false, Some(uid)) {
+                        match self.worker(s, false, false, Some(uid), fib) {
                             Ok(nw) => {
                                 let ok = self.hold(job, &nw.p.stop);
                                 w = nw;
@@ -1409,8 +1461,8 @@ impl Daemon {
         }
     }
 
-    fn cancel_remote(&self, s: &Saved, uid: u32, remote: i32) {
-        if let Ok(mut w) = self.worker(s, false, false, Some(uid)) {
+    fn cancel_remote(&self, s: &Saved, uid: u32, remote: i32, fib: Option<u32>) {
+        if let Ok(mut w) = self.worker(s, false, false, Some(uid), fib) {
             let _ = w.ask(&ipp::Req::Cancel { id: remote, user: USER.into() });
         }
     }
@@ -1512,16 +1564,18 @@ mod tests {
 
     #[test]
     fn work_cannot_list_or_submit_to_a_private_personal_printer() {
+        let dir = tempfile::tempdir().unwrap();
         let d = Daemon::new(Config {
             state: PathBuf::new(),
             spool: PathBuf::new(),
             sigillum: PathBuf::new(),
+            policy_root: dir.path().into(),
             network: Box::new(|| "test".into()),
             mdns: None,
             sheet_uid: None,
             person_of: Box::new(|_| None),
         }, Box::new(crate::launch::Direct { bin_dir: PathBuf::new() }));
-        let uid = 42;
+        let uid = unsafe { libc::getuid() };
         let printer = toml::from_str(r#"
             id = 1
             name = "Home"
@@ -1539,6 +1593,26 @@ mod tests {
         assert_eq!(err, (status::NOT_ALLOWED, CROSSING_REFUSED.to_owned()));
         assert!(d.jobs(uid).is_empty());
 
+        let user = portcullis_peer::username(uid).unwrap();
+        let policy = dir.path().join(user).join("policy.toml");
+        std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+        std::fs::write(&policy, r#"
+            [personas.work]
+            colour = "blue"
+            [[crossings]]
+            from = "work"
+            to = "personal"
+            kinds = ["printers"]
+        "#).unwrap();
+        assert_eq!(d.route(uid, "work"), Ok(None));
+        assert!(d.route(uid, "missing").is_err());
+        assert_eq!(d.printers(uid, Some("work"))[0].id, 1);
+        let pdf = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        assert_eq!(d.submit(uid, "work", print::Print::new(1, "Report"), pdf.into()).unwrap_err().1,
+            "This persona requires encrypted IPPS printing");
+        std::fs::remove_file(policy).unwrap();
+        assert!(d.printers(uid, Some("work")).is_empty());
+
         d.person(&mut d.lock(), uid).file.printer[0].shared = true;
         assert_eq!(d.printers(uid, Some("work"))[0].id, 1);
     }
@@ -1553,7 +1627,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let d = Daemon::new(Config {
-            state: dir.path().into(), spool: dir.path().into(), sigillum: socket,
+            state: dir.path().into(), spool: dir.path().into(), sigillum: socket, policy_root: dir.path().into(),
             network: Box::new(|| "test".into()), mdns: None, sheet_uid: None,
             person_of: Box::new(|_| None),
         }, Box::new(crate::launch::Direct { bin_dir: PathBuf::new() }));

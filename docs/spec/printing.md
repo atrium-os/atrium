@@ -394,16 +394,23 @@ a company network and the home printer at home, that is not quite enough:
   window is Work's; the home printer added from a Personal window is Personal's. Curia's
   Printers page can make a printer **shared** (one switch, with user verification, as for
   persona switches), which is what most people with a single home printer want.
-- **The sheet shows** the caller's persona's printers, shared printers, and nearby ones
-  (marked). Adding a nearby printer from a Work window makes it Work's.
-- **Printing out of a persona** onto a printer that belongs to another persona is a
-  crossing (personas.md §6): off by default, refused with the sheet saying which switch
-  would allow it. Printing on a shared printer is not a crossing.
-- **Route:** `prelum-ipp` for a Work job sits in Work's routing table, so an office
-  printer reached through Work's VPN is reached only that way, and a Personal job never
-  uses Work's VPN.
-- **Work can require IPPS** (a per-persona switch, on by default for named personas once
-  this is built): unencrypted printers are then shown greyed with the reason.
+- **The sheet shows** the caller's own printers, shared printers, and any other
+  persona's printers enabled by a directional switch. It labels the latter
+  with the owning persona and leaves them unselected by default.
+- **Crossing is off by default.** Settings → Personas → Between personas has
+  a directional printer switch, verified by Sigillum when enabled. Selecting
+  another persona's printer and pressing Print counts the crossing for that
+  job. Prelumd checks access at enqueue and again at each attempt, so a queued
+  job cannot use a switch that has since been turned off. Shared printers work
+  from either persona independently of these switches.
+- **Route:** every job worker uses the requesting persona's route, including
+  work sent to a shared printer and replacement workers for polling or
+  cancellation. Printer administration probes use the owner's route. A VPN
+  persona uses its FIB from atrium-net or fails closed. For those personas,
+  LAN discovery is disabled and adding by address requires a numeric IP.
+- **Encrypted connections:** named personas require IPPS by default.
+  Administrators can set `print_require_ipps = false` in a persona definition.
+  Prelumd checks this on add, enqueue and each attempt.
 - **History** is per persona; removing a persona removes its printers, history and
   credentials with it.
 
@@ -840,17 +847,24 @@ button for held jobs.
 
 ### 11.6 R7 in progress
 
-The picker lists saved printers owned by its calling persona and shared printers.
-Discovery reports saved IDs only for printers the picker can use. prelumd checks
-ownership again on submit and at the start of each attempt, including retries.
+The arm64 desktop gate used registered Personal and Work app instances,
+jailed workers, and three IPPS simulators. It verified private and shared
+printing from both personas, default denial in both directions, a fixture
+Work-to-Personal switch and its revocation, and no document upload when the
+Work VPN route was unavailable. The guest had one FIB. A live VPN print
+requires a guest with an additional routing table.
+
+The picker applies the persona policy in §9 to saved printers and discovery IDs.
+Prelumd checks access again at submission and the start of each attempt,
+including retries.
 Curia lists every printer for the person. It asks for confirmation before
 requesting that a printer be shared with every persona. Prelumd uses the
 authenticated person's identity to ask Sigillum to verify the change, with
 `SharePrinter` naming the saved printer and a minimum strength of
 `BiometricSecure`. A refusal, unavailable verifier, or cancelled request
 leaves the printer private. Prelumd persists approval only while the original
-request and printer configuration are still current. Stop sharing removes
-cross-persona access and cancels any pending approval without a ceremony.
+request and printer configuration are still current. Stop sharing restores
+private-printer policy and cancels any pending approval without a ceremony.
 The print sheet cannot change sharing or other printer administration settings.
 
 For a saved IPPS printer, **Use PIN** opens Arca's credential field inside the
@@ -919,8 +933,6 @@ usual mount directory. A separate SHA-256 Digest run on arm64 FreeBSD used the
 same desktop flow and verified that the IPPS simulator challenged an
 anonymous Validate-Job, checked the Digest response for Create-Job,
 Send-Document and job polling, and received exactly one PDF.
-
-Per-persona routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

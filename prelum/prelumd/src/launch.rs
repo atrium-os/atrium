@@ -34,7 +34,7 @@ impl Stopper {
 
 pub trait Launcher: Send + Sync {
     /// A `prelum-ipp` whose network reaches only `printer`.
-    fn ipp(&self, printer: SocketAddr, pin: bool) -> io::Result<Proc>;
+    fn ipp(&self, printer: SocketAddr, pin: bool, fib: Option<u32>) -> io::Result<Proc>;
     /// A `prelum-render` reading `pdf`, with these arguments.
     fn render(&self, pdf: OwnedFd, args: &[String]) -> io::Result<Proc>;
     /// A `prelum-browse` with no network; prelumd then hands it the mDNS
@@ -98,7 +98,10 @@ fn spawn(cmd: &mut Command) -> io::Result<Stopper> {
 }
 
 impl Launcher for Direct {
-    fn ipp(&self, _printer: SocketAddr, _pin: bool) -> io::Result<Proc> {
+    fn ipp(&self, _printer: SocketAddr, _pin: bool, fib: Option<u32>) -> io::Result<Proc> {
+        if fib.is_some() {
+            return Err(io::Error::other("persona routing requires jaild"));
+        }
         let (ours, theirs) = UnixStream::pair()?;
         let theirs: OwnedFd = theirs.into();
         let stop = spawn(

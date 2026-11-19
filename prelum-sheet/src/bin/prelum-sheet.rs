@@ -168,7 +168,7 @@ enum Job {
 }
 
 enum Done {
-    Printers(Vec<Printer>),
+    Printers { list: Vec<Printer>, persona: String },
     Nearby(Vec<Nearby>),
     Preview { gen: u64, r: Result<Previews, String> },
     Printed(Result<(), String>),
@@ -178,8 +178,11 @@ enum Done {
 }
 
 fn lister(path: PathBuf, app_uid: u32, nearby_secs: u8, out: Sender<Done>, stop: Arc<AtomicBool>) {
-    let mut c = match prelumd(&path, app_uid) {
-        Ok(c) => c,
+    let (mut c, persona) = match Client::connect(&path).map_err(|e| format!("The print service isn’t running ({e})")).and_then(|mut client| {
+        let persona = client.act_for(app_uid).map_err(|e| e.message)?;
+        Ok((client, persona))
+    }) {
+        Ok(binding) => binding,
         Err(e) => {
             let _ = out.send(Done::Broken(e));
             return;
@@ -189,7 +192,7 @@ fn lister(path: PathBuf, app_uid: u32, nearby_secs: u8, out: Sender<Done>, stop:
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match c.printers() {
             Ok(v) => {
-                if out.send(Done::Printers(v)).is_err() {
+                if out.send(Done::Printers { list: v, persona: persona.clone() }).is_err() {
                     return;
                 }
             }
@@ -511,7 +514,10 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
         // What prelumd said.
         while let Ok(d) = done_rx.try_recv() {
             match d {
-                Done::Printers(p) => set(&|s| s.set_printers(p.clone())),
+                Done::Printers { list, persona } => set(&|s| {
+                    s.persona = persona.clone();
+                    s.set_printers(list.clone());
+                }),
                 Done::Nearby(n) => set(&|s| s.set_nearby(n.clone())),
                 Done::Preview { gen: g, r } if g == gen => match r {
                     Ok(p) => {

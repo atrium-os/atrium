@@ -146,7 +146,12 @@ impl SheetView {
                 ctx.add(Node::Rect { rect: r, fill: t.state_hover(), radius: radius::SM });
             }
             let (name, mark) = match d {
-                Dest::Saved(p) => (p.name.clone(), if p.tls { "" } else { "Unencrypted" }),
+                Dest::Saved(p) => {
+                    let owner = if p.persona.is_empty() { "Personal" } else { p.persona.as_str() };
+                    let mark = if p.shared { "Shared" } else if p.persona != s.persona { owner }
+                        else if !p.tls { "Unencrypted" } else { "" };
+                    (p.name.clone(), mark)
+                }
                 Dest::Nearby(n) => (n.name.clone(), "Nearby"),
                 Dest::SavePdf => ("Save as PDF".into(), ""),
             };

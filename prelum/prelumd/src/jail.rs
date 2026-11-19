@@ -140,7 +140,7 @@ impl Jailed {
 }
 
 impl Launcher for Jailed {
-    fn ipp(&self, printer: SocketAddr, pin: bool) -> io::Result<Proc> {
+    fn ipp(&self, printer: SocketAddr, pin: bool, fib: Option<u32>) -> io::Result<Proc> {
         let SocketAddr::V4(v4) = printer else {
             return Err(io::Error::other("an IPv6 printer can't be granted yet"));
         };
@@ -157,7 +157,7 @@ impl Launcher for Jailed {
         };
         let mac = portcullis_identity::for_app(&format!("org.atrium.prelum.worker.{uid}")).map_err(|e| io::Error::other(e.to_string()))?.mac;
         let err = io::stderr();
-        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants), fib: None }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None, pin);
+        let r = self.start(uid, IPP_EXEC, &[], NetworkConfig::Routed { mac, grants: Some(grants), fib }, "networked", [theirs.as_fd(), theirs.as_fd(), err.as_fd()], None, pin);
         drop(theirs);
         match r {
             Ok(pd) => Ok(Proc { sock: ours, stop: self.watch(uid, pd) }),

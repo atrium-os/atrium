@@ -92,6 +92,9 @@ pub struct PersonaDef {
     /// cryptad's profile name; `None` = direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn: Option<String>,
+    /// Require encrypted connections for jobs sent from this persona.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub print_require_ipps: Option<bool>,
 }
 
 /// Why a persona list is refused.
@@ -236,7 +239,7 @@ impl Policy {
             return Err(format!("you have a persona {name:?} already"));
         }
         let mut next = self.personas.clone();
-        next.insert(name.into(), PersonaDef { colour: colour.into(), vpn: None });
+        next.insert(name.into(), PersonaDef { colour: colour.into(), vpn: None, print_require_ipps: None });
         check_persona_map(&next).map_err(|e| e.to_string())?;
         self.personas = next;
         Ok(())
@@ -935,17 +938,17 @@ mod tests {
         assert!(p.has_persona(None) && p.has_persona(Some("work")) && p.has_persona(Some("side-gig")));
         assert!(!p.has_persona(Some("home")));
         assert_eq!(p.personas["work"].vpn.as_deref(), Some("acme"));
-        p.personas.insert("home".into(), PersonaDef { colour: "blue".into(), vpn: None });
+        p.personas.insert("home".into(), PersonaDef { colour: "blue".into(), vpn: None, print_require_ipps: None });
         assert!(matches!(p.check_personas(), Err(PersonaError::SameColour(..))));
         assert!(!p.has_persona(Some("work")), "an invalid list allows no named persona");
         p.personas.get_mut("home").unwrap().colour = "beige".into();
         assert_eq!(p.check_personas(), Err(PersonaError::BadColour("beige".into())));
         p.personas.remove("home");
-        p.personas.insert("Personal".into(), PersonaDef { colour: "red".into(), vpn: None });
+        p.personas.insert("Personal".into(), PersonaDef { colour: "red".into(), vpn: None, print_require_ipps: None });
         assert_eq!(p.check_personas(), Err(PersonaError::BadName("Personal".into())));
         p.personas.remove("Personal");
         // The sign-in window's reserved persona is never a person's.
-        p.personas.insert("portal".into(), PersonaDef { colour: "red".into(), vpn: None });
+        p.personas.insert("portal".into(), PersonaDef { colour: "red".into(), vpn: None, print_require_ipps: None });
         assert_eq!(p.check_personas(), Err(PersonaError::BadName("portal".into())));
         p.personas.remove("portal");
         // A policy without personas writes none.

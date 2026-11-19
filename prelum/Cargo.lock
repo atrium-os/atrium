@@ -1319,6 +1319,7 @@ dependencies = [
  "portcullis-identity",
  "portcullis-mounts",
  "portcullis-peer",
+ "portcullis-policy",
  "postcard",
  "prelum-dnssd",
  "prelum-ipp-codec",
