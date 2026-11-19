@@ -1197,11 +1197,19 @@ impl View for Slides {
         }
         {
             use officina_pdf::slides::PrintLayout;
-            let layouts = [PrintLayout::Slides, PrintLayout::SpeakerNotes, PrintLayout::HandoutThree, PrintLayout::HandoutSix];
-            let items = ["Slides", "Speaker Notes", "Handout (3 Slides)", "Handout (6 Slides)"].into_iter().map(MenuItem::new).collect();
+            let layouts = [
+                ("Slides", PrintLayout::Slides),
+                ("Speaker Notes", PrintLayout::SpeakerNotes),
+                ("Handout (2 Slides)", PrintLayout::HandoutTwo),
+                ("Handout (3 Slides)", PrintLayout::HandoutThree),
+                ("Handout (4 Slides)", PrintLayout::HandoutFour),
+                ("Handout (6 Slides)", PrintLayout::HandoutSix),
+                ("Handout (9 Slides)", PrintLayout::HandoutNine),
+            ];
+            let items = layouts.iter().map(|(label, _)| MenuItem::new(*label)).collect();
             let cmds = self.cmds.clone();
             MenuButton::new("Print", self.print_menu.clone(), items, move |i| {
-                if let Some(&layout) = layouts.get(i) {
+                if let Some(&(_, layout)) = layouts.get(i) {
                     cmds.lock().unwrap().push(Cmd::Print(layout));
                 }
             }).at(x, 8.0).width(64.0).render(ctx);

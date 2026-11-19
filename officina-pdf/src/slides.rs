@@ -181,8 +181,11 @@ pub struct Printed {
 pub enum PrintLayout {
     Slides,
     SpeakerNotes,
+    HandoutTwo,
     HandoutThree,
+    HandoutFour,
     HandoutSix,
+    HandoutNine,
 }
 
 /// Writes the visible slides, one per page.
@@ -196,9 +199,18 @@ pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layou
     let (pw, ph) = paper.map_or((slide_size[0], slide_size[1]), |(w, h)| (w.clamp(72.0, 14400.0), h.clamp(72.0, 14400.0)));
     let margin = 36.0f64.min(pw.min(ph) / 8.0);
     let (body_w, body_h) = (pw - 2.0 * margin, ph - 2.0 * margin);
-    let slots = if layout == PrintLayout::HandoutSix { 6 } else { 3 };
-    let slot_h = body_h / 3.0;
-    let slot_w = (body_w - 12.0) / 2.0;
+    let (columns, rows) = match layout {
+        PrintLayout::HandoutTwo => (1, 2),
+        PrintLayout::HandoutThree => (1, 3),
+        PrintLayout::HandoutFour => (2, 2),
+        PrintLayout::HandoutSix => (2, 3),
+        PrintLayout::HandoutNine => (3, 3),
+        PrintLayout::Slides | PrintLayout::SpeakerNotes => (1, 1),
+    };
+    let gap = 12.0;
+    let width_columns = if layout == PrintLayout::HandoutThree { 2 } else { columns };
+    let slot_h = body_h / rows as f64;
+    let slot_w = (body_w - gap * (width_columns - 1) as f64) / width_columns as f64;
     let mut pdf = Pdf::new(out)?;
     let mut printed = Printed::default();
     let mut draw_notes = Notes::default();
@@ -226,14 +238,15 @@ pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layou
                     let note = slide.and_then(|slide| slide.notes.as_ref()).map(|body| &body.doc);
                     write_notes(&mut pdf, deck, &items, slide_size, thumbnail, [pw, ph, margin, note_top], note, fonts, files)?;
                 }
-                PrintLayout::HandoutThree | PrintLayout::HandoutSix => {
-                    let (col, row) = if slots == 6 { (slot % 2, slot / 2) } else { (0, slot) };
-                    let x = margin + col as f64 * (slot_w + 12.0);
+                PrintLayout::HandoutTwo | PrintLayout::HandoutThree | PrintLayout::HandoutFour
+                | PrintLayout::HandoutSix | PrintLayout::HandoutNine => {
+                    let (col, row) = (slot % columns, slot / columns);
+                    let x = margin + col as f64 * (slot_w + gap);
                     let y = margin + row as f64 * slot_h;
-                    let frame = [x, y, slot_w, slot_h - 12.0];
+                    let frame = [x, y, slot_w, slot_h - gap];
                     draw_thumbnail(&mut pdf, &mut page, deck, &items, slide_size, frame, ph, true, true, files)?;
-                    if slots == 3 {
-                        let left = margin + slot_w + 12.0;
+                    if layout == PrintLayout::HandoutThree {
+                        let left = margin + slot_w + gap;
                         page.c.extend([Op::Save, Op::StrokeRgb([0.75, 0.76, 0.78]), Op::LineWidth(0.5)]);
                         for line in 1..=5 {
                             let line_y = ph - y - frame[3] * f64::from(line) / 6.0;
@@ -242,7 +255,7 @@ pub fn export_layout<W: Write>(deck: &mut Deck, paper: Option<(f64, f64)>, layou
                         page.c.extend([Op::Stroke, Op::Restore]);
                     }
                     slot += 1;
-                    if slot == slots {
+                    if slot == columns * rows {
                         pdf.end_page(std::mem::take(&mut page), pw, ph)?;
                         slot = 0;
                     }

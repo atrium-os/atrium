@@ -171,10 +171,18 @@ fn print_layouts_paginate_notes_and_pack_visible_slides() {
     let notes = (0..100).map(|i| format!("Speaker note {i}")).collect::<Vec<_>>().join("\n");
     slide.notes = Some(TextBody::plain(&notes));
     deck.push_slide(slide);
-    let fourth = new_slide(&mut deck, title);
-    deck.push_slide(fourth);
+    for _ in 0..7 {
+        let slide = new_slide(&mut deck, title);
+        deck.push_slide(slide);
+    }
 
-    for (layout, expected_pages) in [(PrintLayout::HandoutThree, 2), (PrintLayout::HandoutSix, 1)] {
+    for (layout, expected_pages) in [
+        (PrintLayout::HandoutTwo, 5),
+        (PrintLayout::HandoutThree, 4),
+        (PrintLayout::HandoutFour, 3),
+        (PrintLayout::HandoutSix, 2),
+        (PrintLayout::HandoutNine, 2),
+    ] {
         let (pdf, printed) = slides::export_layout(&mut deck, Some((595.0, 842.0)), layout, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
         assert_eq!(printed.hidden, 1);
         assert_eq!(printed.stats.pages, expected_pages);
@@ -182,7 +190,7 @@ fn print_layouts_paginate_notes_and_pack_visible_slides() {
     }
     let (pdf, printed) = slides::export_layout(&mut deck, Some((595.0, 842.0)), PrintLayout::SpeakerNotes, &fonts, &fonts, "", Vec::new(), &mut |_, _| {}).unwrap();
     assert_eq!(printed.hidden, 1);
-    assert!(printed.stats.pages > 4, "long notes must continue on subsequent pages");
+    assert!(printed.stats.pages > 10, "long notes must continue on subsequent pages");
     assert_eq!(draw(&pdf).len(), printed.stats.pages);
 }
 

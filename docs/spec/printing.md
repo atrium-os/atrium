@@ -777,8 +777,10 @@ for numbers that don't fit, "…" for text), at the screen's 96 px to the inch; 
 `officina_pdf::slides` draws a page per slide from the display list the editor draws
 (hidden slides left out), fitted on the paper. Slides’ Print menu also offers
 Speaker Notes with a thumbnail above the notes. Long notes continue onto further
-pages with the thumbnail repeated. Three-slide handouts leave ruled writing space
-beside each thumbnail, and six-slide handouts use a two-column grid. All layouts
+pages with the thumbnail repeated. Two-slide handouts stack the thumbnails.
+Three-slide handouts leave ruled writing space beside each thumbnail. Four- and
+six-slide handouts use two columns, and nine-slide handouts use a three-by-three
+grid. Handouts fill in slide order across each row before moving down. All layouts
 skip hidden slides and survive a paper or orientation change in the print sheet.
 Gradients are bands of solid colour,
 since Folium (and so the render jail) skips shadings. Both answer the sheet's Relayout
