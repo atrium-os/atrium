@@ -258,6 +258,53 @@ fn smtp_server(p: &Pki) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
     (at, seen)
 }
 
+/// A ManageSieve server (RFC 5804): STARTTLS on its plain port.
+fn sieve_server(p: &Pki) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let cfg = server_tls(p);
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = l.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    std::thread::spawn(move || {
+        for mut tcp in l.incoming().flatten() {
+            let (cfg, seen) = (cfg.clone(), seen2.clone());
+            std::thread::spawn(move || {
+                put(&mut tcp, "\"IMPLEMENTATION\" \"Test\"\r\n\"SASL\" \"\"\r\n\"STARTTLS\"\r\nOK \"ready\"\r\n");
+                if line(&mut tcp).as_deref() != Some("STARTTLS") { return }
+                put(&mut tcp, "OK \"begin TLS\"\r\n");
+                let mut t = rustls::StreamOwned::new(rustls::ServerConnection::new(cfg).unwrap(), tcp);
+                let s: &mut dyn Stream = &mut t;
+                put(s, "\"IMPLEMENTATION\" \"Test\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto vacation\"\r\nOK\r\n");
+                let mut authed = false;
+                while let Some(l) = line(s) {
+                    if authed {
+                        seen.lock().unwrap().push(l.clone());
+                    }
+                    let verb = l.split(' ').next().unwrap_or("").to_ascii_uppercase();
+                    match verb.as_str() {
+                        "AUTHENTICATE" => {
+                            let b = l.rsplit('"').nth(1).unwrap_or("");
+                            if unb64(b) == CREDS { authed = true; put(s, "OK \"Logged in\"\r\n") } else { put(s, "NO \"no\"\r\n") }
+                        }
+                        "CAPABILITY" => put(s, "\"IMPLEMENTATION\" \"Test\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto vacation\"\r\n\"VERSION\" \"1.0\"\r\nOK\r\n"),
+                        "PUTSCRIPT" => {
+                            let n: usize = l.rsplit_once('{').and_then(|(_, x)| x.trim_end_matches("+}").parse().ok()).unwrap_or(0);
+                            let mut lit = vec![0u8; n];
+                            if s.read_exact(&mut lit).is_err() { return }
+                            seen.lock().unwrap().push(format!("<script {}>", String::from_utf8_lossy(&lit)));
+                            let _ = line(s);
+                            put(s, "OK\r\n");
+                        }
+                        "LOGOUT" => { put(s, "OK \"bye\"\r\n"); return }
+                        _ => put(s, "OK\r\n"),
+                    }
+                }
+            });
+        }
+    });
+    (at, seen)
+}
+
 // ── the client side ──────────────────────────────────────────────────
 
 struct Run {
@@ -457,4 +504,51 @@ fn smtp_chunking_is_refused() {
     r.until("250 ");
     r.send("BDAT 10 LAST\r\n");
     assert_eq!(r.end().0, Ended::Refused("BDAT".into()));
+}
+
+// ── ManageSieve ──────────────────────────────────────────────────────
+
+#[test]
+fn sieve_session_is_logged_in_after_starttls_and_scripts_pass() {
+    let p = pki("mail.example.org");
+    let (at, seen) = sieve_server(&p);
+    let mut r = start(&p, Scheme::Sieve, "mail.example.org", at, vault());
+    let hello = r.until("OK");
+    assert_eq!(hello, vec!["\"IMPLEMENTATION\" \"Test\"", "\"SIEVE\" \"fileinto vacation\"", "\"VERSION\" \"1.0\"", "OK \"Logged in by Arca\""]);
+    let script = "require [\"vacation\"];\r\nvacation \"Away.\";\r\n";
+    r.send(&format!("PUTSCRIPT \"atrium-mail\" {{{}+}}\r\n{script}\r\n", script.len()));
+    assert_eq!(r.line(), "OK");
+    r.send("SETACTIVE \"atrium-mail\"\r\n");
+    assert_eq!(r.line(), "OK");
+    // Signing in again ends it, logged, and the server never sees it.
+    r.send("AUTHENTICATE \"PLAIN\" \"AHguAHk=\"\r\n");
+    let anomalies = r.anomalies.clone();
+    let (e, logins) = r.end();
+    assert_eq!(e, Ended::Refused("AUTHENTICATE".into()));
+    assert_eq!(logins, 1);
+    assert_eq!(anomalies.lock().unwrap().len(), 1);
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.contains(&format!("<script {script}>")), "{seen:?}");
+    assert!(!seen.iter().any(|l| l.starts_with("AUTHENTICATE")), "{seen:?}");
+}
+
+#[test]
+fn sieve_wrong_password_and_no_starttls() {
+    let p = pki("mail.example.org");
+    let (at, _) = sieve_server(&p);
+    let mut r = start(&p, Scheme::Sieve, "mail.example.org", at, Vault { password: "wrong", ..Default::default() });
+    assert_eq!(r.line(), "BYE \"The server refused the sign-in\"");
+    assert_eq!(r.end().0, Ended::LoginFailed);
+    // A server that doesn't offer STARTTLS: never signed in, Arca not asked.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Some(Ok(mut tcp)) = l.incoming().next() {
+            put(&mut tcp, "\"IMPLEMENTATION\" \"Plain\"\r\n\"SASL\" \"PLAIN\"\r\nOK\r\n");
+            let _ = line(&mut tcp);
+        }
+    });
+    let mut r = start(&p, Scheme::Sieve, "mail.example.org", at, vault());
+    assert_eq!(r.line(), "BYE \"Cannot reach the mail server securely\"");
+    assert_eq!(r.end(), (Ended::NotLoggedIn(Refusal::Tls), 0));
 }

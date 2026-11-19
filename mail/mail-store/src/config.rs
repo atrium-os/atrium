@@ -107,6 +107,8 @@ impl Writer<'_> {
         self.tx.open_table(crate::ACCOUNTS)?.remove(account)?;
         self.tx.open_table(crate::IDENTITIES)?.remove(account)?;
         self.tx.open_table(CONFIG)?.remove(account)?;
+        self.tx.open_table(crate::away::AWAY)?.remove(account)?;
+        self.tx.open_table(crate::sieve::SIEVE)?.remove(account)?;
         for name in ["settings", "sync"] {
             let keys: Vec<String> = if name == "settings" {
                 let t = self.tx.open_table(crate::senders::SETTINGS)?;

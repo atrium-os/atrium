@@ -341,12 +341,29 @@ pub fn endpoints(c: &AccountConfig) -> Result<Vec<(arca_store::Scheme, String, u
     }
 }
 
+/// IMAP servers known to have no ManageSieve.
+const NO_SIEVE: &[&str] = &["imap.gmail.com", "outlook.office365.com", "imap.mail.yahoo.com", "imap.mail.me.com", "imap.aol.com", "imap.gmx.com", "imap.gmx.net"];
+
+/// Where an IMAP account's filters are set (ManageSieve on the IMAP host,
+/// mail.md §11.6), unless its provider is known to have none. A sign-in
+/// by OAuth has none: no provider that signs in that way offers it.
+pub fn sieve_server(c: &AccountConfig) -> Option<Server> {
+    match &c.protocol {
+        Protocol::Imap { imap, .. } if c.oauth.is_none() && !NO_SIEVE.contains(&imap.host.to_ascii_lowercase().as_str()) => Some(Server { scheme: "sieve".into(), host: imap.host.clone(), port: mail_engine::sieve::PORT }),
+        _ => None,
+    }
+}
+
 /// Have Arca keep what the person typed into its field (`handle`) for the
-/// account's servers (arcad `KEEP_FOR`); fills in the item ids. Mail never
-/// sees the password.
-pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) -> Result<(), String> {
+/// account's servers (arcad `KEEP_FOR`); fills in the item ids, and gives
+/// the filters server's with its item. Mail never sees the password.
+pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) -> Result<Option<(Server, [u8; 16])>, String> {
     use arca_store::codec::Writer;
-    let eps = endpoints(c)?;
+    let mut eps = endpoints(c)?;
+    let sieve = sieve_server(c);
+    if let Some(s) = &sieve {
+        eps.push((arca_store::Scheme::Sieve, s.host.clone(), s.port));
+    }
     let mut w = Writer::new();
     w.raw(handle);
     w.u8(arca_store::model::Class::AfterFirstUnlock as u8); // sync runs in the background
@@ -364,7 +381,7 @@ pub fn keep(arca: &std::path::Path, handle: &[u8; 16], c: &mut AccountConfig) ->
             let ids: Vec<[u8; 16]> = body.as_ref().chunks(16).map(|c| c.try_into().unwrap()).collect();
             c.incoming_item = Some(ids[0]);
             c.outgoing_item = Some(*ids.get(1).unwrap_or(&ids[0]));
-            Ok(())
+            Ok(sieve.zip(ids.get(2).copied()))
         }
         status::LOCKED => Err("Arca is locked: unlock it and try again.".into()),
         _ => Err("Arca didn't keep the password: type it again.".into()),
@@ -385,11 +402,18 @@ pub fn items_of(c: &AccountConfig) -> Vec<((arca_store::Scheme, String, u16), [u
 }
 
 /// Have Arca delete an account's items (arcad `DELETE_FOR`), as the
-/// account is removed. Each is tried; the first failure is said.
-pub fn forget(arca: &std::path::Path, c: &AccountConfig) -> Result<(), String> {
+/// account is removed: its servers' and its filters' (`sieve`). Each is
+/// tried; the first failure is said.
+pub fn forget(arca: &std::path::Path, c: &AccountConfig, sieve: Option<&(Server, [u8; 16])>) -> Result<(), String> {
     use arca_store::codec::Writer;
     let mut first = None;
-    for ((scheme, host, port), item) in items_of(c) {
+    let mut items = items_of(c);
+    if let Some((s, item)) = sieve {
+        if let Ok(sc) = scheme(&s.scheme) {
+            items.push(((sc, s.host.clone(), s.port), *item));
+        }
+    }
+    for ((scheme, host, port), item) in items {
         let mut w = Writer::new();
         arcad::proto::write_endpoint_scheme(&mut w, scheme, &host, port);
         w.raw(&item);
@@ -803,7 +827,7 @@ mod tests {
         let (sock, seen) = fake_arcad(d.path(), vec![status::OK, status::LOCKED]);
         let c = imap_account();
         assert_eq!(items_of(&c).len(), 2);
-        assert_eq!(forget(&sock, &c), Err("Arca is locked".into()));
+        assert_eq!(forget(&sock, &c, None), Err("Arca is locked".into()));
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2);
         let want = |sc, h: &str, p, item: [u8; 16]| {
@@ -819,6 +843,40 @@ mod tests {
         assert_eq!(items_of(&one).len(), 1);
         let none = AccountConfig { incoming_item: None, outgoing_item: None, ..imap_account() };
         assert!(items_of(&none).is_empty());
-        assert_eq!(forget(&d.path().join("none.sock"), &none), Ok(()));
+        assert_eq!(forget(&d.path().join("none.sock"), &none, None), Ok(()));
+    }
+
+    #[test]
+    fn an_imap_account_keeps_a_sign_in_for_its_filters() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("arcad.sock");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let asked = std::thread::spawn(move || {
+            let mut c = l.incoming().next().unwrap().unwrap();
+            let f = arcad::proto::read_frame(&mut c).unwrap().unwrap();
+            let ids: Vec<u8> = [[1u8; 16], [2; 16], [3; 16]].concat();
+            arcad::proto::write_reply(&mut c, status::OK, &ids).unwrap();
+            f.as_ref().to_vec()
+        });
+        let mut c = AccountConfig { incoming_item: None, outgoing_item: None, ..imap_account() };
+        let sieve = keep(&path, &[7; 16], &mut c).unwrap();
+        assert_eq!((c.incoming_item, c.outgoing_item), (Some([1; 16]), Some([2; 16])));
+        let (server, item) = sieve.unwrap();
+        assert_eq!((server.scheme.as_str(), server.host.as_str(), server.port, item), ("sieve", "imap.example.org", 4190, [3; 16]));
+        let req = asked.join().unwrap();
+        let mut w = arca_store::codec::Writer::new();
+        arcad::proto::write_endpoint_scheme(&mut w, arca_store::Scheme::Sieve, "imap.example.org", 4190);
+        assert!(req.ends_with(&w.buf), "the third endpoint is the filters'");
+        // Known to have none, or signing in by OAuth: no filters' sign-in.
+        let gmail = |h: &str| AccountConfig { protocol: Protocol::Imap { imap: Server { scheme: "imaps".into(), host: h.into(), port: 993 }, smtp: Server { scheme: "submissions".into(), host: "smtp.gmail.com".into(), port: 465 } }, ..imap_account() };
+        assert!(sieve_server(&gmail("imap.gmail.com")).is_none());
+        assert!(sieve_server(&AccountConfig { oauth: Some("microsoft".into()), ..imap_account() }).is_none());
+        // Removed with the account.
+        let d2 = tempfile::tempdir().unwrap();
+        let (sock, seen) = fake_arcad(d2.path(), vec![status::OK; 3]);
+        assert_eq!(forget(&sock, &c, Some(&(server, item))), Ok(()));
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[2].1.starts_with(&w.buf) && seen[2].1.ends_with(&[3; 16]));
     }
 }

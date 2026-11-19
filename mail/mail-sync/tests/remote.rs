@@ -219,6 +219,45 @@ fn a_message_is_submitted_through_the_worker() {
     }
 }
 
+#[test]
+fn filters_are_put_through_the_worker() {
+    use mail_sync::sieve::{Action, Plan, Rule, Test};
+    let (mine, theirs) = UnixStream::pair().unwrap();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let g = got.clone();
+    std::thread::spawn(move || {
+        let mut w = theirs.try_clone().unwrap();
+        w.write_all(b"\"SIEVE\" \"fileinto\"\r\nOK \"Logged in by Arca\"\r\n").unwrap();
+        let mut r = BufReader::new(theirs);
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let l = line.trim_end().to_string();
+            if let Some(n) = l.strip_prefix("PUTSCRIPT \"atrium-mail\" {").and_then(|n| n.strip_suffix("+}")) {
+                let mut b = vec![0; n.parse::<usize>().unwrap() + 2];
+                r.read_exact(&mut b).unwrap();
+                g.lock().unwrap().push(String::from_utf8(b).unwrap());
+            } else {
+                g.lock().unwrap().push(l.clone());
+            }
+            let _ = w.write_all(b"OK\r\n");
+            if l == "LOGOUT" {
+                return;
+            }
+        }
+    });
+    let plan = Plan { rules: vec![Rule { test: Test::Subject("invoice".into()), action: Action::Move("Bills".into()) }], ..Default::default() };
+    let (i, w) = worker();
+    let done = Remote::sieve(mine, i, w, &plan).unwrap();
+    assert_eq!((done.others, done.skipped, done.no_vacation), (None, 0, false));
+    let g = got.lock().unwrap().clone();
+    assert_eq!(g[0], "LISTSCRIPTS");
+    assert!(g[1].contains("fileinto \"Bills\";"), "{g:?}");
+    assert_eq!(&g[2..], ["SETACTIVE \"atrium-mail\"", "LOGOUT"]);
+}
+
 /// A JMAP server that serves its session and answers every API call with
 /// an error, recording what it was asked.
 struct Jmap(Arc<Mutex<Vec<String>>>);

@@ -13,8 +13,9 @@
 //! `List-Id`, `subject:` words in the subject. Then `move <folder>` (a
 //! folder of the same account, by name), `flag`, `read`, or `quiet` (no
 //! notification). The first rule that matches a message is the one used.
-//! They run here, on mail new to the index, in this persona's instance
-//! only; the server does nothing with them (ManageSieve is later).
+//! They run here, on mail new to the index, in this persona's instance;
+//! an IMAP server with ManageSieve gets them too ([`crate::sieve`]), so
+//! they work with the machine off.
 
 use mail_schema::Summary;
 use mail_store::{AccountId, FolderId, MsgId, OpKind, Role};
@@ -159,7 +160,7 @@ impl Engine {
     pub fn set_rules(&self, rules: &[Rule]) -> Result<(), Error> {
         let text: Vec<String> = rules.iter().take(RULES_MAX).map(Rule::text).collect();
         self.store.write(|w| w.set_sync_state(ALL, KEY, (!text.is_empty()).then(|| text.join("\n")).as_deref()))?;
-        Ok(())
+        self.sieve_soon()
     }
 
     /// Add a rule first; one for the same thing is replaced.
@@ -177,7 +178,7 @@ impl Engine {
         self.folder_named(account, name).is_none().then(|| name.clone())
     }
 
-    fn folder_named(&self, account: AccountId, name: &str) -> Option<FolderId> {
+    pub(crate) fn folder_named(&self, account: AccountId, name: &str) -> Option<FolderId> {
         let folders = self.store.folders(account).ok()?;
         let n = name.trim_matches('/');
         folders.iter().find(|(_, f)| !f.hidden && f.name == n).or_else(|| folders.iter().find(|(_, f)| !f.hidden && f.name.eq_ignore_ascii_case(n))).map(|(id, _)| *id)

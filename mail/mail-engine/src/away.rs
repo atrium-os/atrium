@@ -1,8 +1,8 @@
 //! The automatic reply while away (mail.md §11.6). The server sends it, so
-//! it works with the machine off: JMAP `VacationResponse` now; IMAP
-//! servers take it through ManageSieve, which Mail doesn't speak yet, so
-//! those accounts say so. What the person sets waits here until the next
-//! pass puts it on the server; each pass reads the server's back.
+//! it works with the machine off: JMAP `VacationResponse`, or on an IMAP
+//! server a Sieve script put there through ManageSieve ([`crate::sieve`]).
+//! What the person sets waits here until the next pass puts it on the
+//! server; a JMAP pass reads the server's back.
 
 pub use mail_store::away::{Away, AwayState};
 use mail_store::AccountId;
@@ -28,7 +28,7 @@ impl Engine {
             s.why = None;
             self.store.write(|w| w.set_away(id, &s))?;
         }
-        Ok(())
+        self.sieve_soon()
     }
 
     pub fn away(&self, account: AccountId) -> AwayState {
@@ -46,7 +46,8 @@ impl Engine {
     pub fn away_line(&self, account: AccountId, now: i64) -> String {
         let s = self.away(account);
         match (s.supported, &s.wanted, &s.server, &s.why) {
-            (Some(false), ..) => "its server takes automatic replies through ManageSieve, which Mail doesn't do yet".into(),
+            (Some(false), ..) if self.imap_without_sieve(account) => "Mail needs Arca to keep its password for the server's filters too: remove the account and add it again".into(),
+            (Some(false), ..) => "its server can't send automatic replies".into(),
             (_, Some(_), _, Some(why)) => format!("not set yet: {why}"),
             (_, Some(_), ..) => "set at the next sync".into(),
             (_, None, Some(a), _) if a.on && a.until.is_some_and(|u| u < now) => "off (its end date passed)".into(),
@@ -81,7 +82,12 @@ impl Engine {
         Ok(())
     }
 
-    /// An IMAP account: no automatic reply Mail can set yet.
+    fn imap_without_sieve(&self, account: AccountId) -> bool {
+        matches!(self.store.account_config(account), Ok(Some(c)) if matches!(c.protocol, mail_store::Protocol::Imap { .. })) && matches!(self.store.sieve(account), Ok(None))
+    }
+
+    /// An IMAP account with no sign-in for its server's filters: no
+    /// automatic reply Mail can set.
     pub(crate) fn away_unsupported(&self, account: AccountId) -> Result<(), Error> {
         let mut s = self.store.away(account)?;
         if s.supported != Some(false) {

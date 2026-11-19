@@ -1,5 +1,6 @@
-//! The mail courier (mail.md §5.2): log in to one IMAP or SMTP submission
-//! endpoint with an Arca item, then relay the session for mail-sync through
+//! The mail courier (mail.md §5.2): log in to one IMAP, SMTP submission or
+//! ManageSieve (§11.6) endpoint with an Arca item, then relay the session
+//! for mail-sync through
 //! [`crate::mail_filter`], which refuses anything that would change who the
 //! session is.
 //!
@@ -500,6 +501,107 @@ fn smtp_login(l: &mut Lines, ep: &MailEndpoint, cx: &Ctx<'_>, item: &[u8; 16], v
     Ok(Ok(out))
 }
 
+/// One ManageSieve response line's kind: `OK`, `NO` or `BYE`, else `None`
+/// (a capability or data line).
+fn sieve_status(line: &[u8]) -> Option<&'static str> {
+    for s in ["OK", "NO", "BYE"] {
+        if starts(line, s.as_bytes()) && line.get(s.len()).is_none_or(|c| matches!(c, b' ' | b'\r' | b'\n' | b'(')) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// ManageSieve lines up to the status line: (status, the lines before it).
+fn sieve_until(l: &mut Lines) -> Result<(&'static str, Vec<Vec<u8>>), Refusal> {
+    let mut before = Vec::new();
+    for _ in 0..256 {
+        let line = l.line()?;
+        if let Some(s) = sieve_status(&line) {
+            return Ok((s, before));
+        }
+        before.push(line);
+    }
+    Err(Refusal::Http)
+}
+
+/// A capability line's name and value, unquoted: `"SASL" "PLAIN LOGIN"`.
+fn sieve_cap(line: &[u8]) -> Option<(String, String)> {
+    let s = String::from_utf8_lossy(line);
+    let mut parts = s.trim_end().split('"').filter(|p| !p.trim().is_empty());
+    let name = parts.next()?.to_ascii_uppercase();
+    Some((name, parts.next().unwrap_or("").to_string()))
+}
+
+/// ManageSieve (RFC 5804): STARTTLS always (port 4190 has no implicit TLS),
+/// capabilities again past TLS, `AUTHENTICATE "PLAIN"` (or `"XOAUTH2"` for
+/// an OAuth item) with the initial response, then `CAPABILITY` for what
+/// the client is told. Answers the lines the client sees first.
+fn sieve_login(l: &mut Lines, ep: &MailEndpoint, cx: &Ctx<'_>, item: &[u8; 16], vault: &mut dyn MailVault) -> Result<Result<Vec<u8>, ()>, Refusal> {
+    let (st, caps) = sieve_until(l)?;
+    if st != "OK" {
+        return Err(Refusal::Http);
+    }
+    if !caps.iter().filter_map(|c| sieve_cap(c)).any(|(n, _)| n == "STARTTLS") {
+        return Err(Refusal::Tls);
+    }
+    l.send(b"STARTTLS\r\n")?;
+    if sieve_until(l)?.0 != "OK" {
+        return Err(Refusal::Tls);
+    }
+    l.starttls(cx.tls, &ep.host)?;
+    // Past TLS the server says its capabilities again (RFC 5804 §2.2).
+    let (st, caps) = sieve_until(l)?;
+    if st != "OK" {
+        return Err(Refusal::Http);
+    }
+    let sasl: Vec<String> = caps.iter().filter_map(|c| sieve_cap(c)).filter(|(n, _)| n == "SASL").flat_map(|(_, v)| v.split_ascii_whitespace().map(|m| m.to_ascii_uppercase()).collect::<Vec<_>>()).collect();
+    let (account, cred) = credential(cx, item, vault)?;
+    let line = match &cred {
+        Cred::Plain(p) => {
+            if !sasl.iter().any(|m| m == "PLAIN") {
+                return Err(Refusal::Denied);
+            }
+            plain_line(b"AUTHENTICATE \"PLAIN\" \"", &account, p, b"\"\r\n")?
+        }
+        Cred::Bearer(t) => {
+            if !sasl.iter().any(|m| m == "XOAUTH2") {
+                return Err(Refusal::Denied);
+            }
+            oauth::xoauth2_line(b"AUTHENTICATE \"XOAUTH2\" \"", &account, t, b"\"\r\n")?
+        }
+    };
+    drop(cred);
+    l.send(line.as_ref())?;
+    drop(line);
+    let ok = loop {
+        let resp = l.line()?;
+        match sieve_status(&resp) {
+            Some(s) => break s == "OK",
+            // A challenge after the initial response is a failure's
+            // details: cancel (RFC 5804 §2.1).
+            None => l.send(b"\"*\"\r\n")?,
+        }
+    };
+    if !ok {
+        return Ok(Err(()));
+    }
+    l.send(b"CAPABILITY\r\n")?;
+    let (st, caps) = sieve_until(l)?;
+    if st != "OK" {
+        return Err(Refusal::Http);
+    }
+    let mut out = Vec::new();
+    for c in caps {
+        let keep = sieve_cap(&c).is_some_and(|(n, _)| !matches!(n.as_str(), "SASL" | "STARTTLS"));
+        if keep {
+            out.extend_from_slice(&c);
+        }
+    }
+    out.extend_from_slice(b"OK \"Logged in by Arca\"\r\n");
+    Ok(Ok(out))
+}
+
 fn connect(ep: &MailEndpoint, net: &(dyn Connect + Sync), tls: &Arc<rustls::ClientConfig>, policy: addr::Policy) -> Result<Wire, Refusal> {
     let mut conv = Conversation::new(net, tls.clone(), policy);
     let addrs = conv.resolve_checked(&ep.host, ep.port).map_err(|_| Refusal::Connect)?;
@@ -510,6 +612,16 @@ fn connect(ep: &MailEndpoint, net: &(dyn Connect + Sync), tls: &Arc<rustls::Clie
         Ok(Wire::Tls(Box::new(handshake(tls, &ep.host, tcp)?)))
     } else {
         Ok(Wire::Plain(tcp))
+    }
+}
+
+/// What a ManageSieve client is told when there is no session.
+fn sieve_refusal(why: Refusal) -> &'static [u8] {
+    match why {
+        Refusal::Locked => b"BYE \"Arca is locked\"\r\n",
+        Refusal::SignInAgain => b"BYE \"Sign in again\"\r\n",
+        Refusal::Denied | Refusal::Unsendable | Refusal::NotVerified => b"BYE \"No sign-in for this server\"\r\n",
+        _ => b"BYE \"Cannot reach the mail server securely\"\r\n",
     }
 }
 
@@ -567,7 +679,13 @@ pub fn session_with(
         Ok(w) => Lines { w, buf: Vec::new() },
         Err(e) => { tell(&mut cout, refusal_text(imap, e)); return Ended::NotLoggedIn(e) }
     };
-    let greeting = if imap {
+    let greeting = if ep.scheme.is_sieve() {
+        match sieve_login(&mut lines, ep, &cx, &item, vault) {
+            Ok(Ok(r)) => r,
+            Ok(Err(())) => { tell(&mut cout, b"BYE \"The server refused the sign-in\"\r\n"); return Ended::LoginFailed }
+            Err(e) => { tell(&mut cout, sieve_refusal(e)); return Ended::NotLoggedIn(e) }
+        }
+    } else if imap {
         match imap_login(&mut lines, ep, &cx, &item, vault) {
             Ok(Ok(caps)) => format!("* PREAUTH [CAPABILITY {}] Logged in by Arca\r\n", caps.join(" ")).into_bytes(),
             Ok(Err(())) => { tell(&mut cout, b"* BYE [AUTHENTICATIONFAILED] The server refused the sign-in\r\n"); return Ended::LoginFailed }
@@ -585,7 +703,13 @@ pub fn session_with(
     if cout.write_all(&greeting).and_then(|_| cout.flush()).is_err() {
         return Ended::Closed;
     }
-    let mut filter: Box<dyn Filter> = if imap { Box::new(mail_filter::Imap::new()) } else { Box::new(mail_filter::Smtp::new()) };
+    let mut filter: Box<dyn Filter> = if ep.scheme.is_sieve() {
+        Box::new(mail_filter::Sieve::new())
+    } else if imap {
+        Box::new(mail_filter::Imap::new())
+    } else {
+        Box::new(mail_filter::Smtp::new())
+    };
     match relay(*tls_stream, &buf, &mut cin, &mut cout, filter.as_mut()) {
         Ok(()) => Ended::Closed,
         Err(Stop::Refused(cmd)) => {
@@ -608,6 +732,11 @@ pub trait Filter {
 impl Filter for mail_filter::Imap {
     fn client(&mut self, b: &[u8], out: &mut Vec<u8>) -> Result<(), Stop> { mail_filter::Imap::client(self, b, out) }
     fn server(&mut self, b: &[u8], o: &mut Vec<u8>) -> Result<(), Stop> { mail_filter::Imap::server(self, b, o) }
+}
+
+impl Filter for mail_filter::Sieve {
+    fn client(&mut self, b: &[u8], out: &mut Vec<u8>) -> Result<(), Stop> { mail_filter::Sieve::client(self, b, out) }
+    fn server(&mut self, b: &[u8], o: &mut Vec<u8>) -> Result<(), Stop> { mail_filter::Sieve::server(self, b, o) }
 }
 
 impl Filter for mail_filter::Smtp {

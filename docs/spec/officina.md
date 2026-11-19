@@ -3788,6 +3788,17 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** fitting rows to wrapped text, and a Row Height… / Column Width… box for exact numbers.
 - **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`, `an_edge_of_selected_whole_columns_sizes_them_all`.
 
+### 16.91 The grid scrolls on while a selection is dragged past its edge (2026-11-19)
+
+- **Grid** (pergola): a selection or the fill handle dragged past the cells' edge takes the cell at that edge, and while the pointer stays out there each frame scrolls toward it (faster the farther out, 4 to 60 px a frame), the selection following. Before, a drag above the view jumped to row 1. `GridState.edge`, `past_edge`, `cell_at_edge`.
+- **pergola App:** a drag's move now asks for frames, so `on_frame` handlers can animate while a press is held still; handlers that don't need them stop the frames as before.
+- **Gate:** pergola `a_selection_held_past_the_edge_scrolls_on`.
+
+### 16.92 The pointer in the cell editor (2026-11-19)
+
+- **Grid** (pergola): while a cell is being edited, a press inside the editor (the cell, or as wide as its text runs) places the caret at the nearest character instead of committing; dragging selects text, Shift+press extends, and a double-click selects the word. A press anywhere else still commits and moves, as before. `editor_rect`, `index_at` (a binary search over measured prefixes).
+- **Gate:** pergola `a_press_in_the_editor_places_the_caret_and_a_drag_selects`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

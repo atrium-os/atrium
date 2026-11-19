@@ -206,6 +206,21 @@ pub fn submit(courier: UnixStream, o: &mail_sync::submit::Outgoing<'_>) -> Resul
     }
 }
 
+/// Put Mail's filters on a ManageSieve `courier` (§11.6), in the `sync`
+/// worker when there is one, else here.
+pub fn put_sieve(courier: UnixStream, plan: &mail_sync::sieve::Plan) -> Result<mail_sync::sieve::Sieved, String> {
+    match sync_worker()? {
+        Some((i, w, mut proc)) => {
+            let r = mail_sync::remote::Remote::sieve(courier, i, w, plan);
+            if let SyncProc::Child(c) = &mut proc {
+                let _ = c.wait();
+            }
+            r
+        }
+        None => mail_sync::sieve::apply(courier, plan),
+    }
+}
+
 /// Seconds one `IDLE` waits before it is renewed: under the 29 minutes
 /// RFC 2177 allows, and the mail courier's 31-minute limit.
 pub const IDLE_RENEW: u64 = 25 * 60;
@@ -289,7 +304,6 @@ impl Engine {
         let s = net.mail(imap, &item).map_err(|e| format!("couldn't reach {}: {e}", imap.host))?;
         let mut s = open_imap(s)?;
         let mut pass = Pass::default();
-        self.away_unsupported(account).map_err(|e| e.to_string())?;
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         self.copy_drafts(account, s.as_mut(), DRAFT_REST).map_err(|e| e.to_string())?;
         // Imported mail (§6.5) goes up; the next sync brings it in.
@@ -316,6 +330,8 @@ impl Engine {
             self.file_sent(account, s.as_mut(), &c).map_err(|e| e.to_string())?;
         }
         let _ = s.logout();
+        // The server's filters (§11.6): how that went is kept apart.
+        self.sync_sieve(account, net, crate::now()).map_err(|e| e.to_string())?;
         Ok(pass)
     }
 

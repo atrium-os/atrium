@@ -238,6 +238,135 @@ impl Imap {
     }
 }
 
+// ───────────────────────── ManageSieve ─────────────────────────
+
+/// What a ManageSieve client may say after the courier logged in (RFC
+/// 5804 §2): the script commands and nothing that signs in again, starts
+/// TLS or drops the sign-in.
+pub const SIEVE_ALLOWED: &[&str] = &["CAPABILITY", "HAVESPACE", "PUTSCRIPT", "LISTSCRIPTS", "SETACTIVE", "GETSCRIPT", "DELETESCRIPT", "RENAMESCRIPT", "CHECKSCRIPT", "NOOP", "LOGOUT"];
+/// Largest script (a literal) the relay passes.
+pub const MAX_SCRIPT: u64 = 1 << 20;
+
+#[derive(Debug)]
+enum SieveState {
+    Line { cont: bool },
+    Literal(u64),
+}
+
+/// The ManageSieve relay filter: an allowlist of commands, and literals
+/// as data. Only non-synchronising literals (`{n+}`), which every server
+/// takes (RFC 5804 §1.6), so the server's side needn't be read.
+#[derive(Debug)]
+pub struct Sieve {
+    state: SieveState,
+    line: Vec<u8>,
+}
+
+impl Default for Sieve {
+    fn default() -> Self { Sieve { state: SieveState::Line { cont: false }, line: Vec::new() } }
+}
+
+impl Sieve {
+    pub fn new() -> Sieve { Sieve::default() }
+
+    pub fn client(&mut self, b: &[u8], out: &mut Vec<u8>) -> Result<(), Stop> {
+        let mut i = 0;
+        while i < b.len() {
+            match &mut self.state {
+                SieveState::Literal(n) => {
+                    let k = (*n).min((b.len() - i) as u64) as usize;
+                    out.extend_from_slice(&b[i..i + k]);
+                    *n -= k as u64;
+                    i += k;
+                    if *n == 0 { self.state = SieveState::Line { cont: true } }
+                }
+                SieveState::Line { cont } => {
+                    let cont = *cont;
+                    let rest = &b[i..];
+                    match rest.iter().position(|&c| c == b'\n') {
+                        None => {
+                            if self.line.len() + rest.len() > MAX_LINE { return Err(Stop::Malformed("command line too long")) }
+                            self.line.extend_from_slice(rest);
+                            return Ok(());
+                        }
+                        Some(nl) => {
+                            if self.line.len() + nl + 1 > MAX_LINE { return Err(Stop::Malformed("command line too long")) }
+                            self.line.extend_from_slice(&rest[..=nl]);
+                            i += nl + 1;
+                            let line = std::mem::take(&mut self.line);
+                            self.line_done(&line, cont, out)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn line_done(&mut self, line: &[u8], cont: bool, out: &mut Vec<u8>) -> Result<(), Stop> {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        if !cont {
+            let word = body.split(|&c| c == b' ').next().unwrap_or(&[]);
+            if !word.is_empty() || !body.is_empty() {
+                let cmd = upper_token(word);
+                if !SIEVE_ALLOWED.contains(&cmd.as_str()) {
+                    return Err(Stop::Refused(if cmd.is_empty() { "?".into() } else { cmd }));
+                }
+            }
+        }
+        out.extend_from_slice(line);
+        match literal_at_end(body) {
+            Some((n, _)) if n > MAX_SCRIPT => Err(Stop::Malformed("literal too large")),
+            Some((_, false)) => Err(Stop::Malformed("synchronising literal")),
+            Some((0, true)) => { self.state = SieveState::Line { cont: true }; Ok(()) }
+            Some((n, true)) => { self.state = SieveState::Literal(n); Ok(()) }
+            None => { self.state = SieveState::Line { cont: false }; Ok(()) }
+        }
+    }
+
+    /// The server's bytes: nothing to learn from them.
+    pub fn server(&mut self, _: &[u8], _: &mut Vec<u8>) -> Result<(), Stop> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sieve_tests {
+    use super::*;
+
+    fn run(f: &mut Sieve, chunks: &[&[u8]]) -> Result<Vec<u8>, Stop> {
+        let mut out = Vec::new();
+        for c in chunks {
+            f.client(c, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn scripts_pass_and_sign_ins_dont() {
+        let script = b"require \"vacation\";\r\nAUTHENTICATE \"PLAIN\" \"x\"\r\n";
+        let mut cmd = format!("PUTSCRIPT \"mail\" {{{}+}}\r\n", script.len()).into_bytes();
+        cmd.extend_from_slice(script);
+        cmd.extend_from_slice(b"\r\nSETACTIVE \"mail\"\r\nlistscripts\r\n");
+        let mut f = Sieve::new();
+        // Split anywhere, the same bytes go through.
+        for at in [1, 7, 20, cmd.len() - 3] {
+            let mut f = Sieve::new();
+            assert_eq!(run(&mut f, &[&cmd[..at], &cmd[at..]]).unwrap(), cmd);
+        }
+        assert_eq!(run(&mut f, &[&cmd]).unwrap(), cmd);
+        for bad in [&b"AUTHENTICATE \"PLAIN\" \"eA==\"\r\n"[..], b"STARTTLS\r\n", b"UNAUTHENTICATE\r\n", b"\"PUTSCRIPT\"\r\n"] {
+            let mut f = Sieve::new();
+            assert!(matches!(run(&mut f, &[bad]), Err(Stop::Refused(_))), "{}", String::from_utf8_lossy(bad));
+        }
+        let mut f = Sieve::new();
+        assert_eq!(run(&mut f, &[b"PUTSCRIPT \"x\" {5}\r\n"]), Err(Stop::Malformed("synchronising literal")));
+        let mut f = Sieve::new();
+        assert_eq!(run(&mut f, &[b"PUTSCRIPT \"x\" {99999999+}\r\n"]), Err(Stop::Malformed("literal too large")));
+    }
+}
+
 // ───────────────────────── SMTP ─────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

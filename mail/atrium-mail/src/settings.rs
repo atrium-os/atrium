@@ -174,7 +174,7 @@ pub struct Settings {
     pub cred_state: Mutable<CredentialState>,
     pub cred: CredentialField,
     found: Rc<RefCell<Option<mpsc::Receiver<Result<mail_sync::setup::Found, String>>>>>,
-    kept: Rc<RefCell<Option<mpsc::Receiver<Result<AccountConfig, String>>>>>,
+    kept: Rc<RefCell<Option<mpsc::Receiver<Result<(AccountConfig, Option<(mail_store::Server, [u8; 16])>), String>>>>>,
     added: Rc<std::cell::Cell<bool>>,
     /// Arca's answer to removing a removed account's items.
     forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
@@ -383,7 +383,7 @@ impl Settings {
         let (tx, rx) = mpsc::channel();
         let (arca, mut cfg) = ((*self.arca).clone(), s.cfg.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(crate::accounts::keep(&arca, &handle, &mut cfg).map(|()| cfg));
+            let _ = tx.send(crate::accounts::keep(&arca, &handle, &mut cfg).map(|sieve| (cfg, sieve)));
         });
         *self.kept.borrow_mut() = Some(rx);
         self.update(|u| {
@@ -392,8 +392,14 @@ impl Settings {
         });
     }
 
-    fn added(&self, cfg: AccountConfig) {
-        let r = self.engine.store.add_configured(&cfg).and_then(|id| self.engine.store.set_identities(id, &[Identity { name: cfg.name.clone(), addr: cfg.address.clone(), signature: String::new() }]));
+    fn added(&self, cfg: AccountConfig, sieve: Option<(mail_store::Server, [u8; 16])>) {
+        let r = self.engine.store.add_configured(&cfg).map_err(mail_engine::Error::from).and_then(|id| {
+            self.engine.store.set_identities(id, &[Identity { name: cfg.name.clone(), addr: cfg.address.clone(), signature: String::new() }])?;
+            match sieve {
+                Some((server, item)) => self.engine.set_sieve(id, server, item),
+                None => Ok(()),
+            }
+        });
         match r {
             Ok(()) => {
                 self.added.set(true);
@@ -414,6 +420,7 @@ impl Settings {
             return;
         }
         let cfg = self.engine.store.account_config(id).ok().flatten();
+        let sieve = self.engine.store.sieve(id).ok().flatten().map(|s| (s.server, s.item));
         let r = self.engine.store.write(|w| w.remove_account(id));
         self.update(|u| {
             u.removing = None;
@@ -429,7 +436,7 @@ impl Settings {
                 let (tx, rx) = mpsc::channel();
                 let arca = (*self.arca).clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(crate::accounts::forget(&arca, &cfg));
+                    let _ = tx.send(crate::accounts::forget(&arca, &cfg, sieve.as_ref()));
                 });
                 *self.forgot.borrow_mut() = Some(rx);
             }
@@ -722,7 +729,7 @@ impl Settings {
         if let Some(r) = kept {
             *self.kept.borrow_mut() = None;
             match r {
-                Ok(cfg) => self.added(cfg),
+                Ok((cfg, sieve)) => self.added(cfg, sieve),
                 Err(e) => {
                     // What was typed went with the handle: type it again.
                     self.cred_state.set(CredentialState::default());

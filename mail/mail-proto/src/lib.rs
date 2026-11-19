@@ -10,5 +10,6 @@
 
 pub mod imap;
 pub mod jmap;
+pub mod sieve;
 pub mod smtp;
 pub mod utf7;
