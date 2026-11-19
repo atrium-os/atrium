@@ -89,7 +89,7 @@ pub fn bind_in(jid: i32, port: u16) -> Result<OwnedFd, String> {
 
 /// Start the proxy for the workspace in jail `jid` (`ws_jail` its name),
 /// for `hosts`. It runs until [`stop`].
-pub fn start(ws_jail: &str, jid: i32, hosts: &[String]) -> Result<(), String> {
+pub fn start(ws_jail: &str, jid: i32, hosts: &[String], fib: Option<u32>) -> Result<(), String> {
     let rule = portcullis_policy::Policy::load_system(std::path::Path::new(portcullis_policy::SYSTEM_PATH)).ok()
         .and_then(|p| p.workers.get(EGRESS_APP).cloned())
         .ok_or_else(|| format!("no system worker rule for {EGRESS_APP}: the proxy never runs as the workspace or as root"))?;
@@ -107,6 +107,7 @@ pub fn start(ws_jail: &str, jid: i32, hosts: &[String]) -> Result<(), String> {
         user_name: rule.run_as.clone(),
         extra_env: vec![("ATRIUM_EGRESS_HOSTS".into(), hosts.join(","))],
         worker: None,
+        fib,
     };
     let name = ws_jail.to_string();
     std::thread::Builder::new().name("portcullisd-egress".into()).spawn(move || {

@@ -104,6 +104,10 @@ pub enum Request {
         mac: String,
         #[serde(default)]
         grants: Option<NetGrants>,
+        /// The routing table (FIB) the host end goes in; see
+        /// [`NetworkConfig::Routed`]'s `fib`.
+        #[serde(default)]
+        fib: Option<u32>,
     },
 
     /// Release what [`Request::AllocateNet`] made for `jail_name`: destroy
@@ -466,6 +470,18 @@ pub struct ExecSpec {
     pub ready: bool,
 }
 
+/// The highest routing table a jail's epair may be put in: atrium-net's
+/// route domains are FIBs 1..=8.
+pub const MAX_FIB: u32 = 8;
+
+/// The resolver a jail in a route domain is given (its `resolv.conf`): any
+/// address off the jail would do, as atrium-net redirects every DNS packet
+/// of the domain's apps to the domain's tunnel (vpn.md §5.5). This one is a
+/// host-end address, so with no redirect (the tunnel down, or no DNS for it)
+/// the base ruleset's block of the host's own addresses drops it: no name
+/// resolves, and none leaks.
+pub const DOMAIN_RESOLVER: &str = "100.64.0.1";
+
 /// The most listening sockets one service may be handed (choragusd has 8).
 pub const MAX_LISTEN_FDS: usize = 12;
 
@@ -509,6 +525,13 @@ pub enum NetworkConfig {
         /// `network = "full"` means — still never the host or another app.
         #[serde(default)]
         grants: Option<NetGrants>,
+        /// ★ The routing table the host end of the epair is put in (vpn.md
+        /// §5.3, persona scope): packets the app sends are routed by that
+        /// table, which atrium-net fills with a tunnel's routes (or nothing:
+        /// the kill switch). `None`: the host's own table, 0. The number is
+        /// atrium-net's (its `route-domain` answer), 1..=[`MAX_FIB`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fib: Option<u32>,
     },
     /// An own stack with ONLY a working loopback (the `loopback` capability):
     /// vnet=new, its own `lo0` up on 127.0.0.1/::1, nothing else — no

@@ -434,6 +434,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 continue;
             }
             let mut as_uid = None;
+            // The caller's own persona; a per-instance worker's, below.
+            let mut domain = caller_domain(uid);
             if let Some(r) = rule.as_mut().filter(|r| r.per_instance) {
                 let served = match serves {
                     Some(s) if r.callers.iter().any(|c| c == &owner) => s,
@@ -461,6 +463,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                     eprintln!("portcullisd: {app_id} for {person}'s {served_app}: a share from {} to {}", shown(persona.as_deref()), shown(to));
                     persona = to.map(str::to_string);
                 }
+                domain = Some((person.clone(), persona.clone()));
                 // One allocation at a time: two pages at once must not both
                 // allocate a uid for the same instance.
                 static WORKER_UIDS: Mutex<()> = Mutex::new(());
@@ -486,7 +489,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 as_uid.or_else(|| rule.as_ref().and_then(|r| uid_of_user(&r.run_as))).or(Some(uid))
             } else { None };
             handle_exec_instance(app_id, instance, tmpfs_mb, limits, rule, Vec::new(), &owner, &shared,
-                                 &LIMITER, &mut writer, &reader, None, as_uid, None)?;
+                                 &LIMITER, &mut writer, &reader, None, as_uid, None, domain)?;
             continue;
         }
         /* ★ WorkerCall (app-composition.md §4, dev-tools-plan.md M5): one
@@ -539,7 +542,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
                 concurrent: Some(WORKER_CALLS_PER_APP),
             };
             handle_exec_instance(app, Some(instance), 32, (None, None, false), Some(rule), Vec::new(),
-                                 &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()))?;
+                                 &person, &shared, &LIMITER, &mut writer, &reader, None, None, Some(worker.clone()),
+                                 Some((person.clone(), persona.clone())))?;
             continue;
         }
         /* ★ OpenFetcher (docs/spec/nuntius.md §2): a Nuntius of the caller's
@@ -583,7 +587,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             eprintln!("portcullisd: fetcher {instance} for {app} (uid {uid})");
             // A fetcher needs no scratch space beyond its own small tmpfs.
             handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, caller_domain(uid))?;
             continue;
         }
         /* ★ OpenPortalFetcher (atrium-net.md §8.1): a captive portal's
@@ -638,8 +642,9 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: portal fetcher {instance} for {app} (uid {uid}) on {iface}, DNS {dns}");
             portcullisd::portal::watch(true);
+            // The sign-in page is the network's own: never in a tunnel.
             let r = handle_exec_instance(portcullis_ipc::NUNTIUS_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), extra_env,
-                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None);
+                                         &owner, &shared, &LIMITER, &mut writer, &reader, None, None, None, None);
             portcullisd::portal::watch(false);
             r?;
             continue;
@@ -689,7 +694,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             let instance = fetcher_instance(uid);
             eprintln!("portcullisd: CDM {instance} ({key_system}) for {app} (uid {uid})");
             handle_exec_instance(portcullis_ipc::HOSPES_CDM_APP.to_string(), Some(instance), 16, (None, None, true), Some(rule), Vec::new(),
-                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None)?;
+                                 &owner, &shared, &LIMITER, &mut writer, &reader, Some(&prepare), None, None, caller_domain(uid))?;
             continue;
         }
         /* ★ Opening files (opening-files.md §6.2): gated on the PEER UID, as
@@ -973,6 +978,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
 /// development (`--no-prompt`); on a path a program drives in a loop, a
 /// bypass flag is not a developer convenience but a permanent hole with a
 /// friendly name.
+/// A launched app's (person, persona), by its uid, for its helpers' route
+/// domain; None for anything else (a person's own CLI).
+fn caller_domain(uid: u32) -> Option<(String, Option<String>)> {
+    let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
+    let (person, _) = reg.resolve(uid)?;
+    Some((person.to_string(), reg.persona(uid).flatten().map(String::from)))
+}
+
 fn handle_exec_instance(
     app_id:   String,
     instance: Option<String>,
@@ -994,6 +1007,10 @@ fn handle_exec_instance(
     /* Some: the app's `[[workers]]` entry of this name, which runs with no
      * capability at all, so the capability gate has nothing to ask. */
     worker:   Option<String>,
+    /* The (person, persona) whose route domain a networked worker joins
+     * (vpn.md §5.4): its caller's, so a Work app's helpers leave by Work's
+     * tunnel. None: the host's own table (the portal's sign-in fetcher). */
+    domain:   Option<(String, Option<String>)>,
 ) -> std::io::Result<()> {
     /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
      * first would have the client send three descriptors the daemon is about
@@ -1076,6 +1093,19 @@ fn handle_exec_instance(
         });
     }
 
+    /* The caller's route domain, before the fd handshake like every other
+     * refusal: a persona with a VPN and no routing table is refused, never
+     * run on the host's table. */
+    let fib = match &domain {
+        None => None,
+        Some((person, persona)) => match portcullisd::route_domain::for_persona(person, persona.as_deref()) {
+            Ok(f) => f,
+            Err(why) => {
+                eprintln!("portcullisd: {app_id} REFUSED: {why}");
+                return write_response(writer, &Response::LaunchFailed { stage: "network".into(), message: why });
+            }
+        },
+    };
     write_response(writer, &match as_uid {
         Some(uid) => Response::ReadyForFdsAs { uid },
         None => Response::ReadyForFds,
@@ -1135,6 +1165,7 @@ fn handle_exec_instance(
         user_name: rule.as_ref().map(|r| r.run_as.clone()).unwrap_or_else(|| user.to_string()),
         extra_env,
         worker,
+        fib,
     };
     /* ★ A worker does not outlive its caller. The caller holds this
      * connection for the jail's whole life; if it hangs up (it exited, or it

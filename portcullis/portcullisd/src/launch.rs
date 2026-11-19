@@ -394,6 +394,19 @@ fn launch_inner(
      * types gets its own directory of the channel hub, and only its own,
      * at /atrium/sockets/opens. Made before the mount, so the source exists. */
     let mut jc = jc;
+    /* A persona whose `vpn` names a profile (vpn.md §9.7): the instance's
+     * network goes in that profile's route domain, whether or not the
+     * tunnel is up. Down, the table is empty and the instance reaches
+     * nothing (the kill switch, §5.3). No routing table, no launch: never
+     * the host's table instead. */
+    if jc.needs_routed_net.is_some() {
+        let fib = portcullisd::route_domain::for_persona(user, persona)
+            .map_err(|e| { full_teardown(&jail_path, None); LaunchError::Failed("network", e) })?;
+        if let Some(f) = fib {
+            eprintln!("portcullisd: {app_id} in {}: route domain fib {f}", persona.unwrap_or_default());
+        }
+        jc.route_fib = fib;
+    }
     // The terminal gets its consoles the same way (homes.md §4).
     /* A named persona's instance has a channel of its own, keyed
      * `<id>@<persona>`: what reaches it comes from its own persona
@@ -558,14 +571,14 @@ fn run_one_jail(
                 .map_err(|e| LaunchError::Failed("network", e))?,
             None => None,
         };
-        let (b, app, host) = jaild::client::allocate_net(Path::new(JAILD_SOCK), &jc.name, mac, grants)
+        let (b, app, host) = jaild::client::allocate_net_in(Path::new(JAILD_SOCK), &jc.name, mac, grants, jc.route_fib)
             .map_err(|e| LaunchError::Failed("network", e))?;
         jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
         /* Names resolve through the host's resolvers, over NAT. Written into the
          * overlay, never the signed tree. */
         let etc = jail_path.join("etc");
         let _ = fs::create_dir_all(&etc);
-        let _ = fs::copy("/etc/resolv.conf", etc.join("resolv.conf"));
+        let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
     let outcome = run_one_jail_inner(&jc, jail_path, stdio);
     if networked.is_some() {
@@ -585,12 +598,12 @@ pub fn create_persistent(jc: &JailConfig, jail_path: &Path) -> Result<(), Launch
          * is left from one that ended without a stop (a crash, a reboot of
          * portcullisd): released, or the allocation is refused. */
         jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
-        let (b, app, host) = jaild::client::allocate_net(Path::new(JAILD_SOCK), &jc.name, &mac, None)
+        let (b, app, host) = jaild::client::allocate_net_in(Path::new(JAILD_SOCK), &jc.name, &mac, None, jc.route_fib)
             .map_err(|e| LaunchError::Failed("network", e))?;
         jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
         let etc = jail_path.join("etc");
         let _ = fs::create_dir_all(&etc);
-        let _ = fs::copy("/etc/resolv.conf", etc.join("resolv.conf"));
+        let _ = portcullis_oneshot::write_resolv_conf(&etc, jc.route_fib);
     }
     let release = |jc: &JailConfig| if jc.needs_routed_net.is_some() {
         jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);

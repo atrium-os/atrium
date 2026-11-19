@@ -342,6 +342,12 @@ mod imp {
     /// A VPN tunnel held for cryptad (vpn.md §5): its tun stays open here
     /// while the tunnel is on, so its routes outlive an engine that dies
     /// and nothing goes around it meanwhile.
+    /// A tunnel's id, which is also its route domain's name: cryptad's
+    /// profile name.
+    fn valid_tunnel_id(i: &str) -> bool {
+        !i.is_empty() && i.len() <= 32 && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }
+
     struct Tun {
         id: String,
         iface: String,
@@ -355,9 +361,18 @@ mod imp {
         pin: Option<(Ipv4Addr, Ipv4Addr, Ipv4Addr)>,
         /// unbound forward zones set for it.
         zones: Vec<String>,
+        /// The routing table its routes are in: 0 (the host's) or its route
+        /// domain's.
+        fib: u32,
+        /// A split persona-scoped tunnel's copy of the egress in its table:
+        /// (destination, prefix, gateway, our address).
+        egress: Vec<(Ipv4Addr, u8, Ipv4Addr, u16)>,
     }
 
     const MAX_TUNNELS: usize = 8;
+    /// Route domains (vpn.md §5.3): FIBs 1..=MAX_DOMAINS, one per
+    /// persona-scoped VPN profile.
+    const MAX_DOMAINS: u32 = 8;
 
     struct Net {
         v: bool,
@@ -425,6 +440,13 @@ mod imp {
         ports_seen: Vec<String>,
         group_synced: bool,
         tunnels: Vec<Tun>,
+        /// A routing socket per route domain's FIB (index fib - 1), opened
+        /// before capability mode.
+        rtf: Vec<Rtsock>,
+        /// Route domains handed out: (name, fib). A domain outlives its
+        /// tunnel: with no tunnel applied its table is empty, so the
+        /// persona's apps reach nothing (the kill switch, §5.3).
+        domains: Vec<(String, u32)>,
         /// The `atrium/vpn` anchor as last loaded, and the egress it named.
         anchor: Option<(String, Option<String>)>,
         /// unbound restarted: the tunnels' zones are to be set again.
@@ -699,6 +721,11 @@ mod imp {
             if !self.tunnels.is_empty() {
                 self.tunnel_pins();
                 self.tunnel_anchor();
+                for k in 0..self.tunnels.len() {
+                    if self.tunnels[k].fib != 0 {
+                        self.domain_egress(k);
+                    }
+                }
             }
             if cur != self.announced {
                 self.announced = cur;
@@ -1446,6 +1473,7 @@ mod imp {
             match l.verb.as_str() {
                 "status" => self.status(),
                 "tunnel-open" | "tunnel-routes" | "tunnel-apply" | "tunnel-close" => self.tunnel_ctl(l),
+                "route-domain" => self.route_domain_ctl(l),
                 // Printer discovery's sockets (printing.md §7.1) on the
                 // active interface; only atrium-netconf's root-only
                 // `print-discovery` socket asks for them.
@@ -1719,17 +1747,56 @@ mod imp {
                         .with("gw", format!("{}:{}", a.gateway, a.port))
                         .with("routes", t.routes.len())
                         .with("pinned", t.pin.is_some() as u8)
-                        .with("zones", t.zones.len());
+                        .with("zones", t.zones.len())
+                        .with("fib", t.fib);
                 }
                 v.push(l);
+            }
+            for (n, f) in &self.domains {
+                v.push(Line::new("domain").with("name", n).with("fib", *f));
             }
             v.push(Line::new("ok"));
             v
         }
 
+        /// `route-domain name=X` (vpn.md §5.3): the routing table for VPN
+        /// profile X's persona scope, made on first ask. portcullisd asks
+        /// it when it starts an instance in a persona whose `vpn` is X, and
+        /// puts the instance's network there through jaild.
+        fn route_domain_ctl(&mut self, l: &Line) -> Vec<Line> {
+            let err = |why: &str| vec![Line::new("error").with("why", why)];
+            let Some(name) = l.get("name").filter(|i| valid_tunnel_id(i)).map(str::to_string) else {
+                return err("bad-name");
+            };
+            match self.domain_fib(&name) {
+                Some(f) => vec![Line::new("domain").with("name", &name).with("fib", f), Line::new("ok")],
+                None => err("no-fib"),
+            }
+        }
+
+        /// Domain `name`'s FIB, given out if it has none yet.
+        fn domain_fib(&mut self, name: &str) -> Option<u32> {
+            if let Some(&(_, f)) = self.domains.iter().find(|(n, _)| n == name) {
+                return Some(f);
+            }
+            let f = (1..=self.rtf.len() as u32).find(|f| !self.domains.iter().any(|(_, g)| g == f))?;
+            self.domains.push((name.to_string(), f));
+            self.log(&format!("route domain {name}: fib {f}"));
+            Some(f)
+        }
+
+        /// The routing socket for table `fib`.
+        fn rts(&mut self, fib: u32) -> &mut Rtsock {
+            if fib == 0 {
+                &mut self.rt
+            } else {
+                &mut self.rtf[fib as usize - 1]
+            }
+        }
+
         /// The applied full tunnel, if there is one (there is at most one).
         fn full_tunnel(&self) -> Option<&Tunnel> {
-            self.tunnels.iter().filter_map(|t| t.applied.as_ref()).find(|a| a.full)
+            self.tunnels.iter().filter_map(|t| t.applied.as_ref()).find(|a| a.full && !a.scoped)
         }
 
         /// `tunnel-open`, `tunnel-routes`, `tunnel-apply`, `tunnel-close`
@@ -1737,7 +1804,7 @@ mod imp {
         /// changes.
         fn tunnel_ctl(&mut self, l: &Line) -> Vec<Line> {
             let err = |why: &str| vec![Line::new("error").with("why", why)];
-            let Some(id) = l.get("id").filter(|i| !i.is_empty() && i.len() <= 32 && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')).map(str::to_string) else {
+            let Some(id) = l.get("id").filter(|i| valid_tunnel_id(i)).map(str::to_string) else {
                 return err("bad-id");
             };
             let k = self.tunnels.iter().position(|t| t.id == id);
@@ -1768,7 +1835,7 @@ mod imp {
                         Err(_) => return err("dup"),
                     };
                     self.log(&format!("tunnel {id}: {iface} opened"));
-                    self.tunnels.push(Tun { id: id.clone(), iface: iface.clone(), fd, staged: Vec::new(), applied: None, routes: Vec::new(), pin: None, zones: Vec::new() });
+                    self.tunnels.push(Tun { id: id.clone(), iface: iface.clone(), fd, staged: Vec::new(), applied: None, routes: Vec::new(), pin: None, zones: Vec::new(), fib: 0, egress: Vec::new() });
                     self.reply_fds = vec![dup];
                     vec![Line::new("tunnel").with("id", &id).with("iface", &iface), Line::new("ok")]
                 }
@@ -1796,7 +1863,7 @@ mod imp {
                     // same network.
                     let others = self.tunnels.iter().enumerate().filter(|(j, _)| *j != k).filter_map(|(_, o)| o.applied.as_ref());
                     for o in others {
-                        if (t.full && o.full) || t.includes.iter().chain(&t.addrs).any(|n| o.includes.iter().chain(&o.addrs).any(|m| m.contains(n.net()) || n.contains(m.net()))) {
+                        if (t.full && o.full && !t.scoped && !o.scoped) || t.includes.iter().chain(&t.addrs).any(|n| o.includes.iter().chain(&o.addrs).any(|m| m.contains(n.net()) || n.contains(m.net()))) {
                             return err("overlap");
                         }
                     }
@@ -1832,6 +1899,20 @@ mod imp {
             if let Err(e) = self.ifc.set_mtu(&iface, t.mtu) {
                 eprintln!("atrium-net: {iface}: mtu {}: {e}", t.mtu);
             }
+            /* A persona's tunnel lives in its route domain (§5.3): the tun
+             * goes in that table before its addresses, so their routes and
+             * what arrives through it are the domain's, never the host's. */
+            if t.scoped {
+                let Some(fib) = self.domain_fib(&self.tunnels[k].id.clone()) else {
+                    eprintln!("atrium-net: tunnel {}: no routing table left", self.tunnels[k].id);
+                    return;
+                };
+                if let Err(e) = self.ifc.set_fib(&iface, fib) {
+                    eprintln!("atrium-net: {iface}: fib {fib}: {e}");
+                    return;
+                }
+                self.tunnels[k].fib = fib;
+            }
             for a in &t.addrs {
                 match self.ifc.add_addr_p2p(&iface, a.addr, a.prefix, a.addr) {
                     Err(e) if e.raw_os_error() != Some(libc::EEXIST) => eprintln!("atrium-net: {iface}: {a}: {e}"),
@@ -1841,6 +1922,9 @@ mod imp {
             // The gateway's host route first, so the engine's packets never
             // follow the tunnel's own routes into it.
             self.tunnel_pins();
+            if t.scoped {
+                return self.domain_apply(k, &t);
+            }
             let via = t.addrs[0].addr;
             let mut want: Vec<(Ipv4Addr, u8)> = t.addrs.iter().filter(|a| a.prefix < 32).map(|a| (a.net(), a.prefix)).collect();
             want.extend(t.includes.iter().map(|n| (n.net(), n.prefix)));
@@ -1877,13 +1961,89 @@ mod imp {
             ));
         }
 
+        /// A persona-scoped tunnel (§5.3): its routes in its route
+        /// domain's table, on-link through the tunnel (the tunnel's address
+        /// is the host table's, not the domain's, so no gateway there), and
+        /// nothing of the host's own: no DNS, no lease routes withheld.
+        /// A split tunnel's table also gets the egress (§5.3: "FIB 0's
+        /// routes copied for everything else"), kept by `domain_egress`.
+        fn domain_apply(&mut self, k: usize, t: &Tunnel) {
+            let iface = self.tunnels[k].iface.clone();
+            let fib = self.tunnels[k].fib;
+            let ia = t.addrs[0].addr;
+            let mut want: Vec<(Ipv4Addr, u8)> = t.addrs.iter().map(|a| (a.net(), a.prefix)).collect();
+            want.extend(t.includes.iter().map(|n| (n.net(), n.prefix)));
+            if t.full {
+                want.push((Ipv4Addr::new(0, 0, 0, 0), 1));
+                want.push((Ipv4Addr::new(128, 0, 0, 0), 1));
+            }
+            for (dst, prefix) in want {
+                let r = match self.rts(fib).route(sys::RTM_ADD, dst, prefix, Ipv4Addr::UNSPECIFIED, ia) {
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.rts(fib).route(sys::RTM_CHANGE, dst, prefix, Ipv4Addr::UNSPECIFIED, ia),
+                    r => r,
+                };
+                match r {
+                    Ok(()) => self.tunnels[k].routes.push((dst, prefix, Ipv4Addr::UNSPECIFIED)),
+                    Err(e) => eprintln!("atrium-net: {iface}: fib {fib}: route {dst}/{prefix}: {e}"),
+                }
+            }
+            if !t.full {
+                self.domain_egress(k);
+            }
+            self.log(&format!(
+                "tunnel {}: applied on {iface} in route domain fib {fib}: {} route(s){}, gateway {}:{}",
+                self.tunnels[k].id,
+                self.tunnels[k].routes.len(),
+                if t.full { ", all traffic" } else { "" },
+                t.gateway,
+                t.port
+            ));
+        }
+
+        /// A split persona-scoped tunnel's way to everything else: the
+        /// egress's subnet and its default router, copied into the
+        /// domain's table, moved when the egress moves.
+        fn domain_egress(&mut self, k: usize) {
+            let fib = self.tunnels[k].fib;
+            self.domain_egress_clear(k);
+            if fib == 0 || !self.tunnels[k].applied.as_ref().is_some_and(|a| a.scoped && !a.full) {
+                return;
+            }
+            let Some((e, r)) = self.def4 else { return };
+            let Some(l) = self.ifs[e].applied.lease.clone() else { return };
+            let net = Ipv4Addr::from(u32::from(l.addr) & net_proto::mask(l.prefix));
+            // The subnet straight out the egress (by its index: its
+            // addresses are the host's table's), then the router.
+            let index = self.ifs[e].index;
+            for (dst, prefix, gw, idx) in [(net, l.prefix, Ipv4Addr::UNSPECIFIED, index), (Ipv4Addr::UNSPECIFIED, 0, r, 0)] {
+                let rt = self.rts(fib);
+                let res = if idx != 0 { rt.route_link(sys::RTM_ADD, dst, prefix, idx) } else { rt.route(sys::RTM_ADD, dst, prefix, gw, l.addr) };
+                match res {
+                    Ok(()) => self.tunnels[k].egress.push((dst, prefix, gw, idx)),
+                    Err(e) => eprintln!("atrium-net: fib {fib}: egress route {dst}/{prefix}: {e}"),
+                }
+            }
+        }
+
+        /// Remove what `domain_egress` put in tunnel k's table.
+        fn domain_egress_clear(&mut self, k: usize) {
+            let fib = self.tunnels[k].fib;
+            for (dst, prefix, gw, idx) in std::mem::take(&mut self.tunnels[k].egress).into_iter().rev() {
+                let rt = self.rts(fib);
+                let _ = if idx != 0 { rt.route_link(sys::RTM_DELETE, dst, prefix, idx) } else { rt.route(sys::RTM_DELETE, dst, prefix, gw, gw) };
+            }
+        }
+
         /// Undo tunnel k's routes, pin and zones (its tun stays open, its
         /// pf rules stay until the anchor is written again).
         fn tunnel_withdraw(&mut self, k: usize) {
-            let was_full = self.tunnels[k].applied.as_ref().is_some_and(|a| a.full);
+            let was_full = self.tunnels[k].applied.as_ref().is_some_and(|a| a.full && !a.scoped);
+            let fib = self.tunnels[k].fib;
             for (dst, prefix, via) in std::mem::take(&mut self.tunnels[k].routes) {
-                let _ = self.rt.route(sys::RTM_DELETE, dst, prefix, via, via);
+                let ia = if fib == 0 { via } else { self.tunnels[k].applied.as_ref().map_or(via, |a| a.addrs[0].addr) };
+                let _ = self.rts(fib).route(sys::RTM_DELETE, dst, prefix, via, ia);
             }
+            self.domain_egress_clear(k);
             if let Some((gw, r, ia)) = self.tunnels[k].pin.take() {
                 let _ = self.rt.route(sys::RTM_DELETE, gw, 32, r, ia);
             }
@@ -1892,6 +2052,10 @@ mod imp {
                 for n in &a.addrs {
                     let _ = self.ifc.del_addr(&iface, n.addr);
                 }
+            }
+            if fib != 0 {
+                let _ = self.ifc.set_fib(&iface, 0);
+                self.tunnels[k].fib = 0;
             }
             for z in std::mem::take(&mut self.tunnels[k].zones) {
                 if let Some(u) = &self.unbound {
@@ -1983,8 +2147,18 @@ mod imp {
         /// changed (vpn.md §5.4). False if pf refused it.
         fn tunnel_anchor(&mut self) -> bool {
             let phys = self.def4.map(|(k, _)| self.ifs[k].name.clone());
-            let ts: Vec<(String, Tunnel)> = self.tunnels.iter().filter_map(|t| Some((t.iface.clone(), t.applied.clone()?))).collect();
-            let at: Vec<AnchorTunnel> = ts.iter().map(|(i, a)| AnchorTunnel { iface: i, gateway: a.gateway, port: a.port, full: a.full, block: a.block }).collect();
+            /* A scoped tunnel's apps ask its own DNS servers (§5.5); a split
+             * one with none asks the network's, which its table reaches. A
+             * full one with none: no redirect, so no name resolves. */
+            let lan_dns = self.def4.and_then(|(e, _)| self.ifs[e].applied.lease.as_ref().and_then(|l| l.dns.first().copied()));
+            let ts: Vec<(String, Tunnel, u32)> = self.tunnels.iter().filter_map(|t| Some((t.iface.clone(), t.applied.clone()?, t.fib))).collect();
+            let at: Vec<AnchorTunnel> = ts.iter().map(|(i, a, fib)| {
+                let dns = a.dns.first().copied().or(if a.full { None } else { lan_dns });
+                AnchorTunnel {
+                    iface: i, gateway: a.gateway, port: a.port, full: a.full && !a.scoped, block: a.block && !a.scoped,
+                    rdr: if a.scoped && *fib != 0 { dns.map(|d| (*fib, d)) } else { None },
+                }
+            }).collect();
             let text = render_anchor(&at, phys.as_deref());
             if self.anchor.as_ref().is_some_and(|(t, p)| *t == text && *p == phys) {
                 return true;
@@ -2310,6 +2484,8 @@ mod imp {
             ports_seen: all.iter().map(|i| i.name.clone()).collect(),
             group_synced: false,
             tunnels: Vec::new(),
+            rtf: Vec::new(),
+            domains: Vec::new(),
             anchor: None,
             zones_lost: false,
         };
@@ -2404,6 +2580,23 @@ mod imp {
                 Ok(sock) => net.dot = Some(DotCheck { sock, id: (std::process::id() as u16) ^ 0x5a5a, asked: None, since_new: 0, failing_since: None, failing: false, answered: false, next: 0 }),
                 Err(e) => eprintln!("atrium-net: no DNS over TLS check: {e}"),
             }
+        }
+        // Route domains (vpn.md §5.3): the tables, and a socket for each,
+        // before capability mode. Without them persona-scoped VPNs are
+        // refused (`no-fib`); nothing else changes.
+        match sys::raise_fibs(MAX_DOMAINS + 1) {
+            Ok(()) => {
+                for f in 1..=MAX_DOMAINS {
+                    match Rtsock::new_in(f) {
+                        Ok(r) => net.rtf.push(r),
+                        Err(e) => {
+                            eprintln!("atrium-net: fib {f}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("atrium-net: no route domains: {e}"),
         }
         if o.capsicum {
             sys::cap_enter().unwrap_or_else(|e| die(&e.to_string()));

@@ -94,6 +94,11 @@ pub struct Spec {
     /// own `memory`. Set only by portcullisd, from the caller's installed
     /// manifest; the app's capabilities are never consulted for it.
     pub worker: Option<String>,
+    /// The caller's persona's route domain (vpn.md §5.4, V2): a networked
+    /// worker's epair goes in this routing table, as its caller's does, so a
+    /// Work app's helper leaves by Work's tunnel too. Set only by
+    /// portcullisd, from the caller's persona.
+    pub fib: Option<u32>,
 }
 
 /// Whether the kernel can enforce an rctl rule at all.
@@ -420,7 +425,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     if matches!(net_mode, Some(portcullis_toml::NetworkCap::Full)) {
         let etc = jail_path.join("etc");
         if let Err(e) = std::fs::create_dir_all(&etc)
-            .and_then(|_| std::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).map(|_| ()))
+            .and_then(|_| write_resolv_conf(&etc, spec.fib))
         {
             teardown(&jail_path, &jail_name);
             return OneShot::Failed(format!("resolv.conf for a networked worker: {e}"));
@@ -454,7 +459,7 @@ fn run_inner(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>, extra: Vec<s
     // worker ever writes to the caller's pipe. The devfs ruleset is checked
     // loaded by jaild (§9.1b), and the exit status is the worker's own rather
     // than jail(8)'s collapse of every failure to 1.
-    let network = match jaild_network(manifest.capabilities.network.as_ref(), &manifest.app.id, &host_identity) {
+    let network = match jaild_network(manifest.capabilities.network.as_ref(), &manifest.app.id, &host_identity, spec.fib) {
         Ok(n) => n,
         Err(e) => { teardown(&jail_path, &jail_name); return OneShot::Refused(format!("network: {e}")); }
     };
@@ -605,6 +610,18 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
     }).collect()
 }
 
+/// A networked jail's `resolv.conf` in `etc` (its overlay): the host's, or
+/// in a route domain the domain's resolver address, which atrium-net
+/// redirects to the domain's tunnel (vpn.md §5.5). Never the host's there:
+/// `127.0.0.1` would be the jail's own loopback, and the LAN's servers
+/// would see a Work app's lookups.
+pub fn write_resolv_conf(etc: &std::path::Path, fib: Option<u32>) -> std::io::Result<()> {
+    match fib {
+        Some(_) => std::fs::write(etc.join("resolv.conf"), format!("nameserver {}\n", jaild::protocol::DOMAIN_RESOLVER)),
+        None => std::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).map(|_| ()),
+    }
+}
+
 /// Turn a manifest's `network` into the structured grants jaild renders
 /// (network.md §0.1). `Ok(None)` for `network = "full"` (outbound anywhere).
 ///
@@ -650,13 +667,14 @@ pub fn net_grants(spec: &portcullis_toml::NetworkSpec, app_id: &str)
 /// `Isolated` (only a down lo0) without the capability, `Routed` with it — a
 /// point-to-point epair carrying the app's derived MAC, never the real NIC's.
 fn jaild_network(spec: Option<&portcullis_toml::NetworkSpec>, app_id: &str,
-                 id: &portcullis_identity::HostIdentity)
+                 id: &portcullis_identity::HostIdentity, fib: Option<u32>)
     -> Result<jaild::protocol::NetworkConfig, String>
 {
     Ok(match spec.map(|s| s.mode()) {
         Some(portcullis_toml::NetworkCap::Full) => jaild::protocol::NetworkConfig::Routed {
             mac: id.mac.clone(),
             grants: net_grants(spec.expect("mode came from it"), app_id)?,
+            fib,
         },
         Some(portcullis_toml::NetworkCap::Loopback) =>
             jaild::protocol::NetworkConfig::Loopback,

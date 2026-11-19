@@ -79,6 +79,10 @@ pub struct Tunnel {
     pub port: u16,
     /// Block when not connected (§5.4): only with `full`.
     pub block: bool,
+    /// Persona scope (§5.3, §9.7): the routes go in the tunnel's own route
+    /// domain (a FIB named by the tunnel's id), never the host's table, and
+    /// the host's DNS is left alone.
+    pub scoped: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,6 +151,7 @@ impl Tunnel {
             gateway: l.get("gw")?.parse().ok()?,
             port: l.num::<u16>("port")?,
             block: flag("block")?,
+            scoped: flag("scoped")?,
         })
     }
 
@@ -165,7 +170,8 @@ impl Tunnel {
             .with("gw", self.gateway)
             .with("port", self.port)
             .with("block", self.block as u8)
-            .with("insecure", self.insecure as u8);
+            .with("insecure", self.insecure as u8)
+            .with("scoped", self.scoped as u8);
         if !self.dns.is_empty() {
             a = a.with("dns", join(self.dns.iter().map(Ipv4Addr::to_string).collect()));
         }
@@ -259,6 +265,16 @@ pub struct AnchorTunnel<'a> {
     pub port: u16,
     pub full: bool,
     pub block: bool,
+    /// A persona-scoped tunnel's DNS (§5.5, V2): every lookup from an app in
+    /// route domain `.0` (its addresses are in pf table `atrium_fib_<.0>`,
+    /// kept by jaild) is redirected to `.1` on the app's gateway, so it
+    /// never reaches the network's own servers or the machine's resolver.
+    pub rdr: Option<(u32, Ipv4Addr)>,
+}
+
+/// The pf table jaild keeps of the app addresses in route domain `fib`.
+pub fn domain_table(fib: u32) -> String {
+    format!("atrium_fib_{fib}")
 }
 
 /// The `atrium/vpn` anchor (§5.4) for every applied tunnel, with `phys` the
@@ -271,6 +287,16 @@ pub struct AnchorTunnel<'a> {
 pub fn render_anchor(tunnels: &[AnchorTunnel], phys: Option<&str>) -> String {
     let out = phys.unwrap_or("atrium_egress");
     let mut r = String::new();
+    for t in tunnels {
+        // From the base ruleset's `rdr-anchor "atrium/vpn"`. `pass`: the
+        // filter's block of the host's own addresses never sees it.
+        if let Some((fib, dns)) = t.rdr {
+            r.push_str(&format!(
+                "rdr pass on atrium inet proto {{ udp tcp }} from <{}> to any port 53 -> {dns} port 53\n",
+                domain_table(fib)
+            ));
+        }
+    }
     for t in tunnels {
         // Apps' traffic that the tunnel carries leaves as the tunnel's address.
         r.push_str(&format!("nat on {} inet from {}/{} to any -> ({})\n", t.iface, APP_NET.0, APP_NET.1, t.iface));
@@ -377,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_anchor() {
-        let t = AnchorTunnel { iface: "tun0", gateway: Ipv4Addr::new(198, 51, 100, 51), port: 51820, full: true, block: true };
+        let t = AnchorTunnel { iface: "tun0", gateway: Ipv4Addr::new(198, 51, 100, 51), port: 51820, full: true, block: true, rdr: None };
         let a = render_anchor(&[t], Some("vtnet1"));
         let lines: Vec<&str> = a.lines().collect();
         assert_eq!(lines[0], "nat on tun0 inet from 100.64.0.0/16 to any -> (tun0)");
@@ -385,14 +411,20 @@ mod tests {
         assert_eq!(lines[2], "block out quick on vtnet1 inet from any to 198.51.100.51");
         assert_eq!(lines[3], "block in quick on tun0 all");
         assert_eq!(*lines.last().unwrap(), "block out quick on vtnet1 all");
-        let split = AnchorTunnel { iface: "tun1", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 51820, full: false, block: false };
+        let split = AnchorTunnel { iface: "tun1", gateway: Ipv4Addr::new(198, 51, 100, 52), port: 51820, full: false, block: false, rdr: None };
         let a = render_anchor(&[split], Some("vtnet1"));
         assert!(!a.contains("block out quick on vtnet1 all"));
         assert!(!a.contains("inet6"));
         // A full tunnel without the block still keeps IPv6 from going around it.
-        let open = AnchorTunnel { iface: "tun2", gateway: Ipv4Addr::new(198, 51, 100, 53), port: 51820, full: true, block: false };
+        let open = AnchorTunnel { iface: "tun2", gateway: Ipv4Addr::new(198, 51, 100, 53), port: 51820, full: true, block: false, rdr: None };
         let a = render_anchor(&[open], None);
         assert!(a.contains("block out quick on atrium_egress inet6 all"));
         assert!(!a.contains("block out quick on atrium_egress all"));
+        // A persona's tunnel: its apps' lookups go to its DNS, and it is
+        // neither full nor blocking for the machine.
+        let work = AnchorTunnel { iface: "tun3", gateway: Ipv4Addr::new(198, 51, 100, 54), port: 51820, full: false, block: false, rdr: Some((2, Ipv4Addr::new(10, 99, 0, 1))) };
+        let a = render_anchor(&[work], Some("vtnet1"));
+        assert_eq!(a.lines().next().unwrap(), "rdr pass on atrium inet proto { udp tcp } from <atrium_fib_2> to any port 53 -> 10.99.0.1 port 53");
+        assert!(!a.contains("block out quick on vtnet1 all"));
     }
 }

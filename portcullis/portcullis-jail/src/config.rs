@@ -62,6 +62,9 @@ pub struct JailConfig {
     pub routed_net_spec: Option<(String, portcullis_toml::NetworkSpec)>,
     /// Set by [`JailConfig::attach_routed_net`].
     pub routed_net_attached: bool,
+    /// The routing table jaild puts the network's host end in: a persona's
+    /// VPN route domain (vpn.md §5.3), from atrium-net. `None`: the host's.
+    pub route_fib: Option<u32>,
 }
 
 impl JailConfig {
@@ -76,6 +79,7 @@ impl JailConfig {
             needs_routed_net: None,
             routed_net_spec: None,
             routed_net_attached: false,
+            route_fib: None,
         }
     }
 

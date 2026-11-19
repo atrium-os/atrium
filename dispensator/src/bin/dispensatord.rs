@@ -1223,7 +1223,7 @@ mod run {
             children_max: 0,
             mounts,
             devfs_ruleset: 22,
-            network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants) },
+            network: NetworkConfig::Routed { mac: id.mac.clone(), grants: Some(grants), fib: None },
             exec: Some(ExecSpec { path: proto.exec().into(), argv, env: vec![], uid, gid: uid, stdio, listen: Vec::new(), ready: false }),
             rctl: None,
             hostname: Some(name),

@@ -340,7 +340,7 @@ impl D {
                     l = l.with("up", 0);
                 }
                 if let Some(p) = Profile::load(&self.o.state, &n) {
-                    l = l.with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8);
+                    l = l.with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8).with("scoped", p.scoped as u8);
                 }
                 l
             })
@@ -362,10 +362,11 @@ impl D {
                     Some("1") => Ok(Some(true)),
                     _ => Err(()),
                 };
-                match (Profile::load(&self.o.state, &n), flag("block"), flag("insecure")) {
-                    (Some(mut p), Ok(b), Ok(i)) if b.is_some() || i.is_some() => {
+                match (Profile::load(&self.o.state, &n), flag("block"), flag("insecure"), flag("scoped")) {
+                    (Some(mut p), Ok(b), Ok(i), Ok(s)) if b.is_some() || i.is_some() || s.is_some() => {
                         p.block = b.unwrap_or(p.block);
                         p.insecure = i.unwrap_or(p.insecure);
+                        p.scoped = s.unwrap_or(p.scoped);
                         p.save(&self.o.state).map(|_| vec![]).map_err(|e| e.to_string())
                     }
                     _ => Err("bad-request".into()),
@@ -500,6 +501,7 @@ fn dummy_run() -> Run {
             mtu: None,
             block: false,
             insecure: false,
+            scoped: false,
         },
         iface: String::new(),
         tun: std::fs::File::open("/dev/null").expect("/dev/null").into(),

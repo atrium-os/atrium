@@ -972,6 +972,12 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
         sysfil,
     };
     let mut jc = portcullis_jail::build(&manifest, &opts).map_err(|e| fail(format!("build: {e}")))?;
+    // A workspace with a persona whose `vpn` names a tunnel lives in that
+    // tunnel's route domain (vpn.md §5.4), its registries proxy with it.
+    let fib = if jc.needs_routed_net.is_some() || r.network == "registries" {
+        portcullisd::route_domain::for_persona(owner, Some(&r.persona)).map_err(|e| fail(e))?
+    } else { None };
+    jc.route_fib = fib;
     // Nothing runs at creation (the entry is `true`), and the workspace's
     // account has no home on the host for jail(8) to change to: it runs as
     // the jail's root, in /root.
@@ -1021,7 +1027,7 @@ pub fn start(owner: &str, name: &str) -> Result<Running, String> {
     if r.network == "registries" {
         // ★ Before anything runs in it: the port is the proxy's, not
         // something the workspace could bind first.
-        if let Err(e) = egress::start(&jail_name(owner, name), jid, &r.egress_hosts()) {
+        if let Err(e) = egress::start(&jail_name(owner, name), jid, &r.egress_hosts(), fib) {
             launch::remove_persistent(&jail_name(owner, name), &jp, false);
             return Err(format!("its registries proxy: {e}"));
         }

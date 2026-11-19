@@ -99,8 +99,10 @@ wg pubkey < /root/wg.key
 EOF
 }
 
-case "${1:-}" in
-run)
+# Build, install and start everything in the VM, and the LAN. Shared with
+# the V2 gate (scripts/crypta-v2-gate.sh), which sources this file with
+# CRYPTA_GATE_LIB=1 and adds its files through EXTRA (paths to copy).
+setup() {
     CROSS_RUSTFLAGS=$(set -- env; ARCH=amd64 . "$ROOT/scripts/cloud-vm.sh" >/dev/null; printf %s "$CROSS_RUSTFLAGS")
     export RUSTFLAGS="$CROSS_RUSTFLAGS"
     (cd "$ROOT/atrium-net" && cargo build -q --release --target $T -p atrium-net -p atrium-lease -p atrium-mdns)
@@ -113,7 +115,7 @@ run)
         "$ROOT/atrium-net/target/$T/release/atrium-mdns" "$ROOT/atrium-net/etc/unbound-atrium-local.conf" \
         "$ROOT/crypta/target/$T/release/atrium-cryptad" "$ROOT/crypta/target/$T/release/atrium-crypta-wg" \
         "$ROOT/arca/arcad/target/$T/release/arcad" "$ROOT/portcullis/target/$T/release/atrium-jaild" \
-        "$ROOT/etc/jaild.policy.toml" "$ROOT/etc/atrium.pf" "$S/"
+        "$ROOT/etc/jaild.policy.toml" "$ROOT/etc/atrium.pf" ${EXTRA:-} "$S/"
     tar czf - -C "$S" . | "$V" "rm -rf $G && mkdir -p $G && tar xzf - -C $G"
     rm -rf "$S"
 
@@ -163,6 +165,13 @@ run)
     "$V" 'pgrep -f "atrium-cryptad -v" >/dev/null' && ok "cryptad up" || fail "cryptad not running"
     kh=$("$V" 'procstat -s $(pgrep -f -- "cryptad --arca-key") | tail -1' | awk '{print $3, $4, $6, $NF}')
     [ "$kh" = "65052 65052 65052 65052" ] && ok "key helper runs as _crypta-key with no other groups" || fail "key helper: $kh"
+}
+
+[ -n "${CRYPTA_GATE_LIB:-}" ] && return 0
+
+case "${1:-}" in
+run)
+    setup
 
     echo "== import a .conf: split tunnel to 10.99.0.0/24, DNS for corp.test"
     IMP=$(mktemp)
