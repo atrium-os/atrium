@@ -85,32 +85,45 @@ fn ui_loop(sock: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Reads a PIN from fd 0, which must be a terminal, with echo off. One byte
+/// Reads a PIN from the controlling terminal with echo off. One byte
 /// per read(2) into a zeroized buffer: no stdio buffer keeps a copy. None on
-/// an empty line, EOF, or a fd 0 that is not a terminal.
+/// an empty line, EOF, or a terminal error.
 fn read_pin_tty(prompt: &str) -> Option<Pin> {
     use std::io::Write;
-    if unsafe { libc::isatty(0) } != 1 {
-        eprintln!("ui-tty: stdin is not a terminal; no PIN read");
-        return None;
-    }
+    use std::os::fd::AsRawFd;
+    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(tty) => tty,
+        Err(e) => { eprintln!("ui-tty: open controlling terminal: {e}"); return None; }
+    };
+    let fd = tty.as_raw_fd();
     let mut old: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(0, &mut old) } != 0 {
+    if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+        eprintln!("ui-tty: read terminal mode: {}", std::io::Error::last_os_error());
         return None;
     }
     let mut quiet = old;
     quiet.c_lflag &= !(libc::ECHO | libc::ECHONL);
-    eprint!("{prompt}");
-    let _ = std::io::stderr().flush();
-    if unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &quiet) } != 0 {
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+        eprintln!("ui-tty: disable terminal echo: {}", std::io::Error::last_os_error());
         return None;
     }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
     let mut buf = zeroize::Zeroizing::new(Vec::<u8>::with_capacity(64));
     let mut b = zeroize::Zeroizing::new([0u8; 1]);
     let mut ok = false;
     loop {
-        let n = unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) };
-        if n != 1 {
+        let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("ui-tty: read controlling terminal: {error}");
+            break;
+        }
+        if n == 0 {
+            eprintln!("ui-tty: controlling terminal closed");
             break;
         }
         if b[0] == b'\n' || b[0] == b'\r' {
@@ -121,12 +134,12 @@ fn read_pin_tty(prompt: &str) -> Option<Pin> {
         if buf.len() == 63 {
             buf.clear();
             ok = false;
-            while unsafe { libc::read(0, b.as_mut_ptr().cast(), 1) } == 1 && b[0] != b'\n' {}
+            while unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) } == 1 && b[0] != b'\n' {}
             break;
         }
         buf.push(b[0]);
     }
-    unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &old) };
+    unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &old) };
     eprintln!();
     if !ok || buf.len() < 4 {
         return None;
