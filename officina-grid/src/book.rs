@@ -953,6 +953,10 @@ impl Workbook {
         let mut old: Vec<Option<Sheet>> = std::mem::take(&mut self.sheets).into_iter().map(Some).collect();
         self.sheets = order.iter().map(|&o| old[o].take().expect("each sheet once")).collect();
 
+        for (index, sheet) in self.sheets.iter_mut().enumerate() {
+            for merge in &mut sheet.merges { merge.sheet = index as u16; }
+            if let Some(filter) = &mut sheet.filter { filter.rect.sheet = index as u16; }
+        }
         let ts: Vec<_> = std::mem::take(&mut self.tables).into_iter().map(|mut t| {
             t.rect = rect(t.rect);
             t

@@ -70,6 +70,16 @@ pub(super) fn compare(
 }
 
 impl SettingChange {
+    pub(super) fn reorder(&mut self, sheet: u16) {
+        self.sheet = sheet;
+        for setting in [&mut self.before, &mut self.after] {
+            if let Setting::Visibility(state) = setting {
+                state.sheet = sheet;
+                if let Some(f) = &mut state.filter { f.rect.sheet = sheet; }
+            }
+        }
+    }
+
     pub(super) fn describe(&self) -> String {
         let detail = match &self.after {
             Setting::Tab(Some(rgb)) => format!("Tab color → #{rgb:06X}"),

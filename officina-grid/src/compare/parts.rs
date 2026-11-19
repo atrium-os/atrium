@@ -19,6 +19,12 @@ pub struct ChartChange {
 }
 
 impl ChartChange {
+    pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        self.sheet = self.sheet.and_then(|s| new.sheet_id(&old.sheet_name(s)));
+        if let Some((_, obj)) = &mut self.before { **obj = remap_chart(obj, old, new)?; }
+        Some(())
+    }
+
     pub(crate) fn anchor(&self) -> Option<(u16, u32, u32)> {
         let chart = self.before.as_ref().map(|(_, c)| c).or(self.after.as_ref())?;
         Some((self.sheet?, chart.anchor.from.0, chart.anchor.from.1))
@@ -48,6 +54,12 @@ pub struct PictureChange {
 }
 
 impl PictureChange {
+    pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        self.sheet = self.sheet.and_then(|s| new.sheet_id(&old.sheet_name(s)));
+        if let Some((_, obj)) = &mut self.before { **obj = remap_picture(obj, old, new)?; }
+        Some(())
+    }
+
     pub(crate) fn anchor(&self) -> Option<(u16, u32, u32)> {
         let picture = self.before.as_ref().map(|(_, picture)| picture).or(self.after.as_ref())?;
         Some((self.sheet?, picture.anchor.from.0, picture.anchor.from.1))

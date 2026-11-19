@@ -21,6 +21,11 @@ pub struct MergeChange {
 }
 
 impl MergeChange {
+    pub(super) fn reorder(&mut self, sheet: u16) {
+        self.at.sheet = sheet;
+        for r in self.before.iter_mut().chain(self.after.iter_mut()) { r.sheet = sheet; }
+    }
+
     pub(super) fn ranges(&self) -> (String, String) {
         let show = |rect: Option<Rect>| rect.map_or_else(|| "(none)".into(), |r| {
             format!("{}:{}", a1(r.r0, r.c0), a1(r.r1, r.c1))

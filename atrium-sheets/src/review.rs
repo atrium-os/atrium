@@ -94,6 +94,7 @@ impl Group {
             Change::Chart(_) => "Charts",
             Change::Picture(_) => "Pictures",
             Change::Merge(_) => "Merged cells",
+            Change::TabOrder { .. } => "Tab order",
             Change::Setting(_) => "Sheet settings",
             Change::RowHeight(_) => "Row heights",
             Change::ColumnWidth(_) => "Column widths",
@@ -120,7 +121,20 @@ pub struct GroupRow {
 impl ReviewPane {
     /// The changes from `ours` to `theirs` now, less those kept.
     pub fn refresh(&mut self, ours: &Workbook, theirs: &Workbook) {
+        self.refresh_after(ours, theirs, None);
+    }
+
+    /// Sheet indices in a kept difference belong to the old tab order.
+    pub fn refresh_after(&mut self, ours: &Workbook, theirs: &Workbook, old_order: Option<&[String]>) {
         let (all, more) = compare::compare(ours, theirs);
+        if let Some(names) = old_order {
+            if !self.kept.is_empty() {
+                let mut old = Workbook::new();
+                for name in names { old.add_sheet(name).expect("existing sheet name"); }
+                Arc::make_mut(&mut self.kept).retain_mut(|ch| ch.reorder_local(&old, ours).is_some());
+            }
+            self.expanded.clear();
+        }
         let mut matched = vec![false; self.kept.len()];
         let changes = all.into_iter().filter(|c| {
             if let Some(i) = self.kept.iter().enumerate().position(|(i, k)| !matched[i] && c.same_review_item(k)) {
@@ -267,6 +281,13 @@ pub fn take_all(d: &mut Doc, theirs: &Workbook, changes: &[Change], kept: &[Chan
         ops.splice(..0, objects);
     } else {
         ops.extend(objects);
+    }
+    // All preceding operations address the original sheet indices.
+    if let Some(order) = changes.iter().find(|ch| matches!(ch, Change::TabOrder { .. })) {
+        if let Some(moves) = compare::take(&d.wb, theirs, order) {
+            ops.extend(moves);
+            n += 1;
+        }
     }
     d.run("Take All Changes", ops);
     n

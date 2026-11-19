@@ -25,6 +25,12 @@ pub struct PivotChange {
 }
 
 impl TableChange {
+    pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        if let Some(a) = &mut self.at { a.sheet = new.sheet_id(&old.sheet_name(a.sheet))?; }
+        if let Some(obj) = &mut self.before { **obj = map_table(obj, old, new)?; }
+        Some(())
+    }
+
     pub(super) fn at(&self) -> Option<CellAddr> { self.at }
 
     pub(super) fn describe(&self) -> String {
@@ -34,6 +40,12 @@ impl TableChange {
 }
 
 impl PivotChange {
+    pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        if let Some(a) = &mut self.at { a.sheet = new.sheet_id(&old.sheet_name(a.sheet))?; }
+        if let Some(obj) = &mut self.before { **obj = map_pivot(obj, old, new)?; }
+        Some(())
+    }
+
     pub(super) fn at(&self) -> Option<CellAddr> { self.at }
 
     pub(super) fn describe(&self) -> String {

@@ -646,6 +646,18 @@ impl Sheets {
         let theirs = self.theirs.clone();
         let theirs = theirs.borrow();
         let Some(other) = theirs.as_ref() else { return };
+        let order = match c {
+            ReviewCmd::Take => p.picked.and_then(|i| p.changes.get(i)),
+            ReviewCmd::TakeAll => p.changes.iter().find(|ch| matches!(ch, officina_grid::compare::Change::TabOrder { .. })),
+            _ => None,
+        }.and_then(|ch| match ch {
+            officina_grid::compare::Change::TabOrder { before, .. } => Some(before.clone()),
+            _ => None,
+        });
+        let active = order.as_ref().map(|_| {
+            let d = self.doc.borrow();
+            d.wb.sheet_name(d.sheet)
+        });
         match c {
             ReviewCmd::Pick(_) | ReviewCmd::Toggle(_) => unreachable!(),
             ReviewCmd::Take | ReviewCmd::Keep => {
@@ -660,12 +672,12 @@ impl Sheets {
                             self.doc.borrow_mut().status = "This change could not be applied to the current workbook.".into();
                         }
                     }
-                    p.refresh(&self.doc.borrow().wb, other);
+                    p.refresh_after(&self.doc.borrow().wb, other, order.as_deref());
                 }
             }
             ReviewCmd::TakeAll => {
                 let n = rv::take_all(&mut self.doc.borrow_mut(), other, &p.changes, &p.kept);
-                p.refresh(&self.doc.borrow().wb, other);
+                p.refresh_after(&self.doc.borrow().wb, other, order.as_deref());
                 self.doc.borrow_mut().status = format!("Took {n} change{} from “{}”.", if n == 1 { "" } else { "s" }, p.name);
             }
             ReviewCmd::Close => {
@@ -673,6 +685,10 @@ impl Sheets {
                 drop(theirs);
                 *self.theirs.borrow_mut() = None;
             }
+        }
+        if let Some(name) = active {
+            let mut d = self.doc.borrow_mut();
+            if let Some(sheet) = d.wb.sheet_id(&name) { d.sheet = sheet; }
         }
         self.clamp_review_scroll(&p);
         self.review.set(p);
@@ -3309,6 +3325,60 @@ mod tests {
     }
 
     #[test]
+    fn review_tab_order_follows_sheet_names_and_kept_edits() {
+        use crate::review::ReviewCmd;
+        use officina_grid::{compare::Change, CellAddr, Value};
+        for cmd in [ReviewCmd::Take, ReviewCmd::Keep, ReviewCmd::TakeAll] {
+            let mut local = Doc::new("local");
+            let mut incoming = Doc::new("incoming");
+            for wb in [&mut local.wb, &mut incoming.wb] {
+                wb.rename_sheet(0, "Summary").unwrap();
+                wb.add_sheet("Inputs").unwrap();
+                wb.add_sheet("Notes").unwrap();
+                wb.set_input(CellAddr::new(0, 0, 0), "=Inputs!A1").unwrap();
+                wb.set_input(CellAddr::new(1, 0, 0), "12").unwrap();
+                wb.set_input(CellAddr::new(2, 0, 0), "original").unwrap();
+            }
+            incoming.wb.set_input(CellAddr::new(1, 0, 0), "25").unwrap();
+            incoming.wb.set_input(CellAddr::new(2, 0, 0), "replacement").unwrap();
+            assert!(incoming.wb.move_sheet(2, 0));
+            let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+                Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+            sheets.compare_with("incoming.osheet", incoming.wb);
+            let pane = sheets.review.get_cloned();
+            assert_eq!(pane.changes.len(), 3);
+            let keep = pane.changes.iter().position(|c| matches!(c, Change::Cell { sheet: 2, .. })).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(keep));
+            sheets.review_cmd(ReviewCmd::Keep);
+            let pane = sheets.review.get_cloned();
+            let index = pane.changes.iter().position(|c| matches!(c, Change::TabOrder { .. })).unwrap();
+            sheets.review_cmd(ReviewCmd::Pick(index));
+            sheets.review_cmd(cmd);
+            if cmd != ReviewCmd::TakeAll { sheets.review_cmd(ReviewCmd::TakeAll); }
+            assert!(sheets.review.get_cloned().changes.is_empty());
+            let mut d = sheets.doc.borrow_mut();
+            let reopened = officina_grid::native::load(&officina_grid::native::save_to_vec(&d.wb)).unwrap();
+            let notes = reopened.sheet_id("Notes").unwrap();
+            assert_eq!(notes, if cmd == ReviewCmd::Keep { 2 } else { 0 });
+            assert_eq!(reopened.value(notes, 0, 0), Value::str("original"));
+            assert_eq!(reopened.value(reopened.sheet_id("Summary").unwrap(), 0, 0), Value::num(25.0));
+            assert!(d.undo());
+            if cmd == ReviewCmd::Take { assert!(d.undo()); }
+            assert_eq!(d.wb.sheet_name(0), "Summary");
+            assert_eq!(d.wb.value(0, 0, 0), Value::num(12.0));
+        }
+    }
+
+    fn keep_test_tab_order(sheets: &Sheets) {
+        use crate::review::ReviewCmd;
+        if let Some(i) = sheets.review.get_cloned().changes.iter().position(|ch|
+            matches!(ch, officina_grid::compare::Change::TabOrder { .. })) {
+            sheets.review_cmd(ReviewCmd::Pick(i));
+            sheets.review_cmd(ReviewCmd::Keep);
+        }
+    }
+
+    #[test]
     fn workbook_review_flags_and_takes_or_keeps_styles_charts_and_names() {
         use crate::review::ReviewCmd;
         use officina_grid::charts::{Anchor, Chart, ChartKind, ChartText, Grouping, Series};
@@ -3354,6 +3424,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming.wb);
+        keep_test_tab_order(&sheets);
         let choose = |pred: &dyn Fn(&Change) -> bool, action| {
             let pane = sheets.review.get_cloned();
             let row = pane.changes.iter().position(pred).unwrap();
@@ -3418,6 +3489,7 @@ mod tests {
         let mut incoming = incoming;
         incoming.set_input(officina_grid::CellAddr::new(1, 0, 0), "added").unwrap();
         sheets.compare_with("settings.osheet", incoming);
+        keep_test_tab_order(&sheets);
         let labels = || {
             let pane = sheets.review.get_cloned();
             let d = sheets.doc.borrow();
@@ -3484,6 +3556,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming);
+        keep_test_tab_order(&sheets);
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 13);
         assert!(pane.changes.iter().all(|c| matches!(c, Change::Merge(_) | Change::RowHeight(_) | Change::ColumnWidth(_))));
@@ -3573,6 +3646,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming);
+        keep_test_tab_order(&sheets);
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 6);
         assert!(pane.changes.iter().all(|ch| matches!(ch, Change::Comment(_) | Change::Link(_))));
@@ -3653,6 +3727,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming);
+        keep_test_tab_order(&sheets);
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 6);
         assert!(pane.changes.iter().all(|change| matches!(change, Change::Picture(_))));
@@ -3728,6 +3803,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming.wb);
+        keep_test_tab_order(&sheets);
         let pane = sheets.review.get_cloned();
         assert_eq!(pane.changes.len(), 7, "generated pivot values have no separate rows");
         assert!(pane.changes.iter().all(|change| matches!(change, Change::Table(_) | Change::Pivot(_))));
@@ -3837,6 +3913,7 @@ mod tests {
         let sheets = Sheets::new(local, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
             Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
         sheets.compare_with("incoming.osheet", incoming.wb);
+        keep_test_tab_order(&sheets);
         let choose = |pred: &dyn Fn(&Change) -> bool, sheet, cmd| {
             let pane = sheets.review.get_cloned();
             let row = pane.changes.iter().position(|ch| ch.sheet() == Some(sheet) && pred(ch)).unwrap();

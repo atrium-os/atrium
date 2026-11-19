@@ -71,6 +71,7 @@ pub enum Change {
     RowsRemoved { sheet: u16, row: u32, n: u32 },
     /// A sheet only theirs has.
     SheetAdded { name: String },
+    TabOrder { before: Vec<String>, after: Vec<String> },
     /// A sheet only ours has.
     SheetRemoved { sheet: u16 },
     StructuralConflict { sheet: u16, axis: crate::shift::Axis, at: u32, reason: &'static str, versions: Box<[String; 2]> },
@@ -87,6 +88,32 @@ impl Change {
         }
     }
 
+
+    /// Rebind a kept decision to new local indices. Incoming snapshots still
+    /// use the comparison workbook's original indices.
+    pub fn reorder_local(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        let sheet = |s| new.sheet_id(&old.sheet_name(s));
+        match self {
+            Self::Cell { sheet: s, .. } | Self::SheetRemoved { sheet: s } |
+            Self::RowsAdded { sheet: s, .. } | Self::RowsRemoved { sheet: s, .. } |
+            Self::StructuralConflict { sheet: s, .. } => *s = sheet(*s)?,
+            Self::Style { rect, .. } => rect.sheet = sheet(rect.sheet)?,
+            Self::Comment(c) => c.at.sheet = sheet(c.at.sheet)?,
+            Self::Link(c) => c.at.sheet = sheet(c.at.sheet)?,
+            Self::RowHeight(c) | Self::ColumnWidth(c) => c.at.sheet = sheet(c.at.sheet)?,
+            Self::Merge(c) => c.reorder(sheet(c.at.sheet)?),
+            Self::Setting(c) => c.reorder(sheet(c.sheet)?),
+            Self::Name(c) => c.sheet = c.sheet.and_then(sheet),
+            Self::Chart(c) => c.reorder(old, new)?,
+            Self::Picture(c) => c.reorder(old, new)?,
+            Self::Pivot(c) => c.reorder(old, new)?,
+            Self::Table(c) => c.reorder(old, new)?,
+            Self::Validations(c) => c.reorder(old, new)?,
+            Self::ConditionalFormats(c) => c.reorder(old, new)?,
+            Self::TabOrder { .. } | Self::SheetAdded { .. } => {}
+        }
+        Some(())
+    }
 
     /// Our sheet it is on, if any.
     pub fn sheet(&self) -> Option<u16> {
@@ -105,7 +132,7 @@ impl Change {
             Change::Pivot(ref pivot) => pivot.at().map(|a| a.sheet),
             Change::ConditionalFormats(ref rules) => Some(rules.sheet),
             Change::Validations(ref rules) => Some(rules.sheet),
-            Change::SheetAdded { .. } => None,
+            Change::SheetAdded { .. } | Change::TabOrder { .. } => None,
         }
     }
 
@@ -133,7 +160,7 @@ impl Change {
             Change::Pivot(ref pivot) => pivot.at().map(|a| (a.sheet, a.row, a.col)),
             Change::ConditionalFormats(ref rules) => rules.anchor(),
             Change::Validations(ref rules) => rules.anchor(),
-            Change::SheetAdded { .. } => None,
+            Change::SheetAdded { .. } | Change::TabOrder { .. } => None,
         }
     }
 
@@ -179,6 +206,7 @@ impl Change {
                 let (before, after) = change.versions();
                 versions(self.describe(ours, theirs), comment_text(before), comment_text(after))
             }
+            Change::TabOrder { before, after } => versions("Worksheet tab order".into(), before.join("\n"), after.join("\n")),
             Change::Name(change) => {
                 let (before, after) = change.formulas();
                 versions(self.describe(ours, theirs), before.into(), after.into())
@@ -250,6 +278,7 @@ impl Change {
                 crate::shift::Axis::Rows => format!("Row {}: {reason}", at + 1),
                 crate::shift::Axis::Cols => format!("Column {}: {reason}", crate::addr::col_name(*at)),
             },
+            Change::TabOrder { .. } => "Worksheet tab order changed".into(),
             Change::SheetAdded { name } => format!("Sheet “{name}” added"),
             Change::SheetRemoved { sheet } => format!("Sheet “{}” removed", ours.sheet_name(*sheet)),
         }
@@ -290,6 +319,16 @@ pub fn compare(ours: &Workbook, theirs: &Workbook) -> (Vec<Change>, bool) {
     for change in parts::chart_matches(ours, theirs).chain(parts::picture_matches(ours, theirs)).chain(parts::name_matches(ours, theirs)).chain(rules::compare(ours, theirs)).chain(tables::compare(ours, theirs)) {
         if out.len() == MAX_CHANGES { return (out, true); }
         out.push(change);
+    }
+    let before: Vec<_> = (0..ours.sheet_count() as u16).map(|s| ours.sheet_name(s)).collect();
+    let mut shared = (0..theirs.sheet_count() as u16).filter_map(|t| ours.sheet_id(&theirs.sheet_name(t)));
+    let after: Vec<_> = before.iter().map(|name| {
+        if theirs.sheet_id(name).is_some() { ours.sheet_name(shared.next().expect("matched sheet")) }
+        else { name.clone() }
+    }).collect();
+    if before != after {
+        if out.len() == MAX_CHANGES { return (out, true); }
+        out.push(Change::TabOrder { before, after });
     }
     (out, more)
 }
@@ -679,6 +718,20 @@ fn theirs_sheet(theirs: &Workbook, ours: &Workbook, s: u16) -> u16 {
 pub fn take(ours: &Workbook, theirs: &Workbook, ch: &Change) -> Option<Vec<GridOp>> {
     use crate::shift::{shift_op, Axis};
     match ch {
+        Change::TabOrder { before, after } => {
+            let mut order: Vec<_> = (0..ours.sheet_count() as u16).map(|s| ours.sheet_name(s)).collect();
+            if order != *before || after.len() != order.len() { return None; }
+            let mut ops = Vec::new();
+            for (to, name) in after.iter().enumerate() {
+                let from = to + order[to..].iter().position(|n| n == name)?;
+                if from != to {
+                    let moved = order.remove(from);
+                    order.insert(to, moved);
+                    ops.push(GridOp::MoveSheet { from: from as u16, to: to as u16 });
+                }
+            }
+            Some(ops)
+        }
         Change::Cell { sheet, row, col, theirs: input, .. } => {
             if (*sheet as usize) >= ours.sheet_count() {
                 return None;
@@ -817,6 +870,30 @@ pub fn take_sheet(ours: &Workbook, theirs: &Workbook, s: u16) -> Option<GridOp> 
 mod tests {
     use super::*;
     use officina_core::history::Op;
+
+    #[test]
+    fn tab_order_preserves_local_only_tabs_and_refuses_stale_order() {
+        let mut ours = Workbook::new();
+        let mut theirs = Workbook::new();
+        for name in ["One", "Local", "Two", "Three"] { ours.add_sheet(name).unwrap(); }
+        for name in ["three", "Remote", "One", "Two"] { theirs.add_sheet(name).unwrap(); }
+        let merged = Rect { sheet: 3, r0: 1, r1: 1, c0: 0, c1: 2 };
+        ours.set_merges(3, vec![merged]);
+        theirs.set_merges(0, vec![Rect { sheet: 0, ..merged }]);
+        let filter = crate::filter::AutoFilter { rect: merged, conds: Vec::new() };
+        ours.sheet_mut(3).filter = Some(filter.clone());
+        theirs.sheet_mut(0).filter = Some(crate::filter::AutoFilter { rect: Rect { sheet: 0, ..merged }, ..filter });
+        let changes = compare(&ours, &theirs).0;
+        let order = changes.iter().find(|ch| matches!(ch, Change::TabOrder { .. })).unwrap();
+        assert_eq!(changes.len(), 3);
+        for op in take(&ours, &theirs, order).unwrap() { op.apply(&mut ours); }
+        let names: Vec<_> = (0..4).map(|i| ours.sheet_name(i)).collect();
+        assert_eq!(names, ["Three", "Local", "One", "Two"]);
+        assert_eq!(ours.merges(0)[0].sheet, 0);
+        assert_eq!(ours.sheet(0).filter.as_ref().unwrap().rect.sheet, 0);
+        assert!(take(&ours, &theirs, order).is_none());
+        assert_eq!(compare(&ours, &theirs).0.len(), 2);
+    }
 
     #[test]
     fn sheet_settings_review_clears_hidden_rows_and_refuses_stale_changes() {
@@ -995,7 +1072,7 @@ mod tests {
         );
         ours.add_validation(rule(&ours, 0, "=Options!$A$1:$A$3")).unwrap();
         theirs.add_validation(rule(&theirs, 1, "=Options!$A$1:$A$3")).unwrap();
-        assert!(compare(&ours, &theirs).0.is_empty());
+        assert!(matches!(compare(&ours, &theirs).0.as_slice(), [Change::TabOrder { .. }]));
 
         theirs.add_sheet("IncomingOnly").unwrap();
         theirs.replace_validations(vec![rule(&theirs, 1, "=IncomingOnly!$A$1:$A$3")]);

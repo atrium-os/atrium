@@ -57,6 +57,13 @@ impl SheetRule for Validation {
 
 #[allow(private_bounds)]
 impl<T: SheetRule> RuleChange<T> {
+    pub(super) fn reorder(&mut self, old: &Workbook, new: &Workbook) -> Option<()> {
+        self.sheet = new.sheet_id(&old.sheet_name(self.sheet))?;
+        let map = sheet_map(old, new);
+        for rule in &mut self.before { *rule = remap(rule, self.sheet, &map)?; }
+        Some(())
+    }
+
     pub(super) fn anchor(&self) -> Option<(u16, u32, u32)> {
         let range = self.before.first().or(self.after.first())?.ranges().first()?;
         Some((self.sheet, range.r0, range.c0))
