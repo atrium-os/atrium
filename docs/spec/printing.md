@@ -858,6 +858,11 @@ The Work desktop job reached Done through a jailed IPP worker. A capture on
 `wg0` showed the worker's TCP traffic to the IPPS endpoint, and the simulator
 received one PDF. FIB 0 could not connect. With the tunnel down, a second
 Work job went offline without sending another PDF.
+A rerun imported a persona-scoped WireGuard profile through Crypta with
+its client key in Arca. Crypta completed the handshake, and Atrium-net
+installed Work’s route on `tun0` in FIB 1. The jailed worker delivered one
+PDF and the desktop job reached Done. Crypta’s Down operation withdrew the
+route, and the next Work job went offline without uploading.
 
 The picker applies the persona policy in §9 to saved printers and discovery IDs.
 Prelumd checks access again at submission and the start of each attempt,
