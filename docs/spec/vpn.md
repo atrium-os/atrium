@@ -587,12 +587,13 @@ the Aura gates (scripts/aura-ap-vm.sh), extended:
 - **AnyConnect** against ocserv in the Ubuntu VM (GPL, a test tool only, never shipped;
   LICENSING-POLICY.md allows that): password, OTP, certificate (QEMU's emulated CCID card
   for the Sigillum path), session resume after roam, a gateway pushing hostile config.
-- **GlobalProtect:** no open-source server exists, and PAN-OS VM-Series is paid. A small
-  Rust stand-in gateway (portal, gateway, HIP and ESP endpoints) built from the protocol
-  notes. So the stand-in is not just our own reading checked against itself, OpenConnect's
-  GlobalProtect client (`openconnect --protocol=gp`, a test tool only, never shipped) must
-  connect to it too: that client is proven against real gateways. The same cross-check
-  applies to ocserv with our AnyConnect engine.
+- **GlobalProtect:** use OpenConnect 9.21's external `tests/fake-gp-server.py`
+  for the control plane (`scripts/crypta-gp-control-check.py`, Python with Flask).
+  The fixture is run from its own checkout or release archive. Configure it for TLS
+  with ESP disabled. Its TLS tunnel opening deliberately returns HTTP 502.
+  Run the Atrium loopback TLS peer (`scripts/crypta-gp-packet-check.py`) for IPv4
+  packet transfer, rebind and logout. The FreeBSD gate and OpenConnect packet
+  interoperability check still need a packet-capable peer.
 - **No real company gateway** (Shankar 2026-11-15): every gate runs on local servers.
   Free public services only add value for WireGuard (for example Proton VPN's free
   plan, which hands out WireGuard configs), as an optional real-internet check.
@@ -734,7 +735,7 @@ challenge forms are future work.
   tries to log out on disconnect. Required HIP, local-network lockdown and split
   exclusions are refused until Atrium can enforce those policies.
 - ESP, truthful HIP reporting with review in Curia, portal and challenge support, and
-  the FreeBSD/OpenConnect interop gate remain part of V5. Scripted SSO and passkeys
+  the FreeBSD/OpenConnect packet interop gate remain part of V5. Scripted SSO and passkeys
   remain parked pending Navigator I3.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.

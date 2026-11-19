@@ -28,18 +28,32 @@ fn refused(why: &str) -> Stop {
 }
 
 impl Engine {
-    fn gp_post(&mut self, path: &str, body: &str) -> Result<(u16, Zeroizing<Vec<u8>>), Stop> {
+    fn gp_post(
+        &mut self,
+        jar: &mut Jar,
+        path: &str,
+        body: &str,
+    ) -> Result<(u16, Zeroizing<Vec<u8>>), Stop> {
         let host = if self.st.gateway.port() == 443 {
             self.st.host.clone()
         } else {
             format!("{}:{}", self.st.host, self.st.gateway.port())
         };
-        let request = Zeroizing::new(format!(
+        let mut request = Zeroizing::new(format!(
             "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: PAN GlobalProtect\r\n\
              Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             Accept-Encoding: identity\r\nConnection: close\r\n\r\n{body}",
+             Accept-Encoding: identity\r\nConnection: close\r\n",
             body.len(),
         ));
+        // This jar goes only to the configured gateway's TLS control endpoints.
+        let cookies = jar.header();
+        if !cookies.is_empty() {
+            request.push_str("Cookie: ");
+            request.push_str(&cookies);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
         let mut stream = self.connect()?;
         stream.send(request.as_bytes()).map_err(gateway_io)?;
         let mut buf = Zeroizing::new(Vec::new());
@@ -57,6 +71,7 @@ impl Engine {
                 if let Some((body, _)) = http::body(&h, &buf[start..])
                     .map_err(|_| refused("invalid GlobalProtect HTTP body"))?
                 {
+                    jar.take(&h);
                     return Ok((h.status, Zeroizing::new(body)));
                 }
             }
@@ -68,7 +83,7 @@ impl Engine {
         }
     }
 
-    fn gp_login(&mut self) -> Result<gp::Session, Stop> {
+    fn gp_login(&mut self, jar: &mut Jar) -> Result<gp::Session, Stop> {
         let mut form = Form {
             id: "globalprotect".into(),
             title: "GlobalProtect gateway".into(),
@@ -91,7 +106,8 @@ impl Engine {
         for _ in 0..3 {
             // Verify TLS immediately before asking the secrets helper for a
             // password, even when a previous login attempt failed.
-            let (status, body) = self.gp_post(gp::PRELOGIN, "")?;
+            *jar = Jar::default();
+            let (status, body) = self.gp_post(jar, gp::PRELOGIN, "")?;
             if status != 200 {
                 return Err(refused("GlobalProtect prelogin failed"));
             }
@@ -112,7 +128,7 @@ impl Engine {
                 field("username")?,
                 field("password")?,
             );
-            let (status, result) = self.gp_post(gp::LOGIN, &body)?;
+            let (status, result) = self.gp_post(jar, gp::LOGIN, &body)?;
             match status {
                 200 => {
                     let session = gp::login(&result).map_err(refused)?;
@@ -127,7 +143,7 @@ impl Engine {
                     }
                     return Ok(session);
                 }
-                401 | 403 => {
+                401 | 403 | 512 => {
                     form.error = "The gateway refused those credentials.".into();
                 }
                 _ => return Err(refused("GlobalProtect login failed")),
@@ -138,9 +154,10 @@ impl Engine {
 
     fn gp_open(
         &mut self,
+        jar: &mut Jar,
         session: &gp::Session,
     ) -> Result<(tls::Tls, gp::Config, Vec<u8>), LinkEnd> {
-        let (status, body) = self.gp_post(gp::CONFIG, &session.config(&self.st.hostname))?;
+        let (status, body) = self.gp_post(jar, gp::CONFIG, &session.config(&self.st.hostname))?;
         match status {
             200 => {}
             401 | 403 => return Err(LinkEnd::Expired),
@@ -148,6 +165,7 @@ impl Engine {
         }
         let config = gp::config(&body, self.st.mtu).map_err(refused)?;
         let (status, body) = self.gp_post(
+            jar,
             gp::HIP_CHECK,
             &session.hip(&self.st.hostname, config.push.addr),
         )?;
@@ -195,14 +213,15 @@ impl Engine {
         } else {
             None
         };
+        let mut jar = Jar::default();
         let mut delay = 1;
         loop {
             let result = (|| {
                 if session.is_none() {
-                    session = Some(self.gp_login()?);
+                    session = Some(self.gp_login(&mut jar)?);
                 }
                 let active = session.as_ref().unwrap();
-                let (t, config, first) = self.gp_open(active)?;
+                let (t, config, first) = self.gp_open(&mut jar, active)?;
                 self.ctl.send(&FromEngine::Pushed(config.push.clone()));
                 if self
                     .ctl
@@ -222,6 +241,7 @@ impl Engine {
                 Ok(()) => return Ok(()),
                 Err(LinkEnd::Expired) => {
                     session = None;
+                    jar = Jar::default();
                     let _ = self.secrets.ok(&Line::new("cookie-drop"));
                     self.ctl.send(&FromEngine::Down {
                         why: "GlobalProtect session expired".into(),
@@ -244,7 +264,7 @@ impl Engine {
             }
         }
         if let Some(active) = session.filter(|_| self.ctl.stopped) {
-            let _ = self.gp_post(gp::LOGOUT, &active.logout(&self.st.hostname));
+            let _ = self.gp_post(&mut jar, gp::LOGOUT, &active.logout(&self.st.hostname));
         }
         Ok(())
     }

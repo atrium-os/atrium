@@ -234,15 +234,22 @@ fn session(root: &Element) -> Result<Session> {
         "(null)" => "",
         s => s,
     };
-    if value(10) != "tunnel" {
-        return Err("invalid GlobalProtect tunnel session");
-    }
+    // Some gateways insert two empty reserved arguments before the mode.
+    let mode = match (value(10), args.get(12).map(|a| a.text.trim())) {
+        ("tunnel", Some("4100")) => 10,
+        ("", Some("tunnel"))
+            if value(11).is_empty() && args.get(14).is_some_and(|a| a.text.trim() == "4100") =>
+        {
+            12
+        }
+        _ => return Err("invalid GlobalProtect tunnel session"),
+    };
     Session::new(
         value(1),
         value(4),
         value(3),
         value(7),
-        args.get(13).map_or("", |a| a.text.trim()),
+        args.get(mode + 3).map_or("", |a| a.text.trim()),
     )
 }
 
@@ -294,7 +301,14 @@ fn proposal(root: &Element, fallback_mtu: u16) -> Result<Config> {
             .map_err(|_| "invalid GlobalProtect address")
     };
     let addr = ip("ip-address")?;
-    let mask = u32::from(ip("netmask")?);
+    let mask = match scalar(root, "netmask")? {
+        // A gateway may assign just the client's point-to-point address.
+        None => u32::MAX,
+        Some(mask) => u32::from(
+            mask.parse::<Ipv4Addr>()
+                .map_err(|_| "invalid GlobalProtect netmask")?,
+        ),
+    };
     let prefix = mask.leading_ones() as u8;
     if mask != crypta_proto::net::mask(prefix) {
         return Err("non-contiguous GlobalProtect netmask");
