@@ -352,6 +352,11 @@ fn validate_capabilities(c: &Capabilities, ctx: &str, r: &mut Report) {
             "{ctx}.network-configure = true: restricted to the settings app (changes how \
              the machine is set up on the network); requires explicit policy approval"));
     }
+    if c.vpn_configure == Some(true) {
+        r.warnings.push(format!(
+            "{ctx}.vpn-configure = true: restricted to the settings app (adds, changes \
+             and removes VPN tunnels); requires explicit policy approval"));
+    }
     if c.network_portal == Some(true) {
         r.warnings.push(format!(
             "{ctx}.network-portal = true: restricted to the Navigator (a sign-in window \

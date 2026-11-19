@@ -156,9 +156,13 @@ pub const CLASS_DEVICES:   u8 = 17;
 /// `atrium-netconf` crate). `CLASS_NET` (12) is the Insula connect broker.
 pub const CLASS_NETCONF:   u8 = 18;
 
+/// VPN tunnels (docs/spec/vpn.md §7.2): status, connect and disconnect,
+/// and settings, served by atrium-crypta-ctl for cryptad on one socket per
+/// capability. Postcard payloads (the `crypta-ctl` crate).
+pub const CLASS_VPN:       u8 = 19;
+
 /// Printing (docs/spec/printing.md §6.4): saved printers, jobs and cancel,
-/// served by prelumd. Postcard payloads (the `prelum-proto` crate). 19 is
-/// `CLASS_VPN`'s (docs/spec/vpn.md §7.2).
+/// served by prelumd. Postcard payloads (the `prelum-proto` crate).
 pub const CLASS_PRINT:     u8 = 20;
 
 /// Smoke-test / fuzzing service. Not part of the production
@@ -187,6 +191,7 @@ pub fn class_name(c: u8) -> &'static str {
         CLASS_MEDIA      => "media",
         CLASS_DEVICES    => "devices",
         CLASS_NETCONF    => "netconf",
+        CLASS_VPN        => "vpn",
         CLASS_PRINT      => "print",
         CLASS_FETCH      => "fetch",
         CLASS_NET        => "net",

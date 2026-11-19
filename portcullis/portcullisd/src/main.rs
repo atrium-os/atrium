@@ -794,7 +794,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
-        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings) {
+        if matches!(req, Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::ShareTargets | Request::SetShareTargets { .. } | Request::Crossings | Request::PersonaVpns) {
             let resp = handle_access(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
@@ -818,7 +818,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
         }
 
         /* ★ Settings' Personas page (personas.md §2, §4.1). */
-        if matches!(req, Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. }) {
+        if matches!(req, Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::SetPersonaVpn { .. }) {
             let resp = handle_persona_change(uid, req, &shared, &portcullisd::crossing::Sigillum::default());
             write_response(&mut writer, &resp)?;
             continue;
@@ -2253,6 +2253,10 @@ fn handle_access(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Err(e) => refuse(format!("save: {e}")),
             }
         }
+        Request::PersonaVpns => {
+            let routes: Vec<(String, String)> = tp.policy.personas.iter().filter_map(|(n, d)| Some((n.clone(), d.vpn.clone()?))).collect();
+            Response::PersonaVpns { routes }
+        }
         Request::Crossings => {
             let (personas, on) = portcullisd::crossing::listing(&tp.policy);
             eprintln!("portcullisd: crossings -> {caller} (uid {uid}) for {owner}: {} persona(s), {} switch(es) on", personas.len(), on.len());
@@ -2281,7 +2285,7 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         return refuse(format!("cap.app_grants.denied: {caller} may not change personas"));
     }
     let (name, activation) = match &req {
-        Request::AddPersona { name, activation, .. } | Request::SetPersonaColour { name, activation, .. } | Request::RemovePersona { name, activation } => (name.clone(), *activation),
+        Request::AddPersona { name, activation, .. } | Request::SetPersonaColour { name, activation, .. } | Request::RemovePersona { name, activation } | Request::SetPersonaVpn { name, activation, .. } => (name.clone(), *activation),
         _ => return refuse("not a persona change".into()),
     };
     // Checked on a copy before the press is spent: a refusal spends nothing.
@@ -2290,6 +2294,7 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
             Request::AddPersona { name, colour, .. } => p.add_persona(name, colour).map(|_| true),
             Request::SetPersonaColour { name, colour, .. } => p.set_persona_colour(name, colour),
             Request::RemovePersona { name, .. } => p.remove_persona(name).map(|_| true),
+            Request::SetPersonaVpn { name, vpn, .. } => p.set_persona_vpn(name, vpn.as_deref()),
             _ => unreachable!(),
         }
     };
@@ -2307,6 +2312,13 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
         }
     }
     let removing = matches!(req, Request::RemovePersona { .. });
+    if matches!(req, Request::SetPersonaVpn { .. }) {
+        // Its instances took their routing table when they started.
+        let running = launch::running_in_persona(&owner, &name);
+        if !running.is_empty() {
+            return refuse(format!("{} is open in {name}: close it first", running.join(", ")));
+        }
+    }
     if removing {
         let running = launch::running_in_persona(&owner, &name);
         if !running.is_empty() {
@@ -2368,7 +2380,7 @@ fn handle_persona_change(uid: u32, req: Request, shared: &Mutex<Tenants>, verify
                 eprintln!("portcullisd: {owner}'s {name} folders not made: {e}");
             }
         }
-        eprintln!("portcullisd: {owner}'s persona {name} is now {:?} (from {caller})", tp.policy.personas.get(&name).map(|d| d.colour.as_str()));
+        eprintln!("portcullisd: {owner}'s persona {name} is now {:?}, vpn {:?} (from {caller})", tp.policy.personas.get(&name).map(|d| d.colour.as_str()), tp.policy.personas.get(&name).and_then(|d| d.vpn.as_deref()));
     }
     Response::Ok
 }
@@ -3581,7 +3593,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Access | Request::RemoveAccess { .. } | Request::ApproveAccess { .. } | Request::Links | Request::SetLinkDefault { .. } | Request::Persona
         | Request::ShareTargets | Request::SetShareTargets { .. }
 
-        | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. } => Response::Error {
+        | Request::PersonaList { .. } | Request::AddPersona { .. } | Request::SetPersonaColour { .. } | Request::RemovePersona { .. } | Request::Crossings | Request::SetCrossing { .. } | Request::NewWindowIn { .. }
+        | Request::PersonaVpns | Request::SetPersonaVpn { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
         Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }

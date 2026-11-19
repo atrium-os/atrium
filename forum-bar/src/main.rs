@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod network;
+mod vpn;
 mod status_panel;
 
 use forum_ctl::{Intent, PadInfo, Reply, StatusContent, StatusEntry, StatusItem};
@@ -124,6 +125,10 @@ struct BarView {
     net: Mutable<network::NetShown>,
     net_open: Mutable<MenuState>,
     want_net: Mutable<Option<network::NetAction>>,
+    /// The VPN item (vpn.md §7.4): shown while there is a tunnel.
+    vpn: Mutable<vpn::VpnShown>,
+    vpn_open: Mutable<MenuState>,
+    want_vpn: Mutable<Option<vpn::VpnAction>>,
     /// The overflow menu: what the row had no room for (§ "Fitting").
     more_open: Mutable<MenuState>,
 }
@@ -694,6 +699,29 @@ impl View for BarView {
             .attached();
             ctx.place(button);
         }
+        // The VPN (vpn.md §7.4): a lock, green connected, amber connecting
+        // (its traffic may be waiting), grey down; the menu connects and
+        // disconnects. Not there while there is no tunnel.
+        {
+            let n = self.vpn.get_cloned();
+            if n.shown() {
+                let (items, acts) = vpn::menu(&n);
+                let want = self.want_vpn.clone();
+                let colour = match n.look() {
+                    vpn::Look::Up => t.success_fg(),
+                    vpn::Look::Connecting => t.warning_fg(),
+                    vpn::Look::Down => t.text_secondary(),
+                };
+                let button = MenuButton::new("VPN", self.vpn_open.clone(), items, move |i| {
+                    if let Some(Some(a)) = acts.get(i) {
+                        want.set(Some(a.clone()));
+                    }
+                })
+                .icon(phosphor::LOCK_SIMPLE, 15.0, Some(colour))
+                .attached();
+                ctx.place(button);
+            }
+        }
         // The system volume (lyra-v1.md §7): an attached drop-down from the
         // speaker, drawn by the bar (fresco-popups.md §2): mute, the master
         // level, and the output in use. Dimmed while choragusd is away.
@@ -1208,6 +1236,11 @@ fn main() -> std::io::Result<()> {
     let want_net = Mutable::with_dirty(None, dirty.clone());
     let (net_events, net_tx) = network::follow();
     let mut net_was_open = false;
+    let vpn_shown = Mutable::with_dirty(vpn::VpnShown::default(), dirty.clone());
+    let vpn_open = Mutable::with_dirty(MenuState::default(), dirty.clone());
+    let want_vpn = Mutable::with_dirty(None, dirty.clone());
+    let (vpn_events, vpn_tx) = vpn::follow();
+    let mut vpn_was_open = false;
     // The grants handed to apps for their own panels: token, app.
     let mut drawn: Vec<([u8; 16], String)> = Vec::new();
     let dirty_flag = dirty.clone();
@@ -1243,6 +1276,9 @@ fn main() -> std::io::Result<()> {
         net: net.clone(),
         net_open: net_open.clone(),
         want_net: want_net.clone(),
+        vpn: vpn_shown.clone(),
+        vpn_open: vpn_open.clone(),
+        want_vpn: want_vpn.clone(),
         more_open: Mutable::new(MenuState::default()),
     };
     let mut app = App::new_with_flag(view, dirty).with_theme(mode);
@@ -1436,6 +1472,28 @@ fn main() -> std::io::Result<()> {
                 net.set(n);
             }
         }
+        // The VPN item: tunnel lists, and picks from its menu.
+        {
+            let mut n = vpn_shown.get_cloned();
+            while let Ok(m) = vpn_events.try_recv() {
+                match m {
+                    vpn::VpnMsg::Tunnels(v) => n.tunnels = v,
+                    vpn::VpnMsg::Done(r) => n.note = r.err(),
+                }
+            }
+            let open = vpn_open.get().open;
+            if open && !vpn_was_open {
+                n.note = None;
+            }
+            vpn_was_open = open;
+            if let Some(a) = want_vpn.get_cloned() {
+                want_vpn.set(None);
+                vpn::act(vpn_tx.clone(), a);
+            }
+            if n != vpn_shown.get_cloned() {
+                vpn_shown.set(n);
+            }
+        }
         // The Lock button: ostiarius's lock-only socket, on a thread.
         if want_lock.get() {
             want_lock.set(false);
@@ -1521,6 +1579,9 @@ mod tests {
             net: Mutable::new(network::NetShown::default()),
             net_open: Mutable::new(MenuState::default()),
             want_net: Mutable::new(None),
+            vpn: Mutable::new(vpn::VpnShown::default()),
+            vpn_open: Mutable::new(MenuState::default()),
+            want_vpn: Mutable::new(None),
             more_open: Mutable::new(MenuState::default()),
         }
     }

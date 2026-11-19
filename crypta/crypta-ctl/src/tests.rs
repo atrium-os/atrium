@@ -1,0 +1,203 @@
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+
+use aura_ipc::Line;
+
+use crate::client::Client;
+use crate::server::{serve, Backend};
+use crate::*;
+
+const KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+
+fn list_lines() -> Vec<Line> {
+    [
+        format!("tunnel name=acme up=1 iface=tun0 engine=1 handshake=1 starts=2 rx=10 tx=20 dropped=0 public={KEY} endpoint=10.88.0.9:51820 full=1 block=1 scoped=1 addrs=10.7.0.2/32 routes=1 dns=10.7.0.1"),
+        format!("tunnel name=home up=0 public={KEY} endpoint=10.88.0.10:51820 full=0 block=0 scoped=0 addrs=10.8.0.2/24 routes=3"),
+        "tunnel name=../x up=1".to_string(),
+    ]
+    .iter()
+    .map(|s| Line::parse(s).unwrap())
+    .collect()
+}
+
+#[test]
+fn list_lines_to_profiles() {
+    let v: Vec<Profile> = list_lines().iter().filter_map(lines::profile).collect();
+    assert_eq!(v.len(), 2, "a bad name is dropped");
+    assert_eq!(v[0].tunnel, Tunnel { name: "acme".into(), kind: Kind::WireGuard, state: State::Up, scope: Scope::Personas });
+    assert!(v[0].block && v[0].full);
+    assert_eq!((v[1].tunnel.state, v[1].tunnel.scope), (State::Down, Scope::Machine));
+    let c = Line::parse("tunnel name=x up=1 handshake=0").unwrap();
+    assert_eq!(lines::profile(&c).unwrap().tunnel.state, State::Connecting);
+    let d = lines::details(&list_lines()[0]).unwrap();
+    assert_eq!(d.addrs, vec![Net::parse("10.7.0.2/32").unwrap()]);
+    assert_eq!((d.rx, d.tx, d.starts, d.routes), (10, 20, 2, 1));
+    assert_eq!(d.dns, vec!["10.7.0.1".parse::<std::net::Ipv4Addr>().unwrap()]);
+    assert_eq!(d.public, KEY);
+}
+
+fn create() -> CreateWireGuard {
+    CreateWireGuard {
+        name: "acme".into(),
+        peer: KEY.into(),
+        endpoint: "10.88.0.9:51820".parse().unwrap(),
+        addrs: vec![Net::parse("10.7.0.2/32").unwrap()],
+        allowed: vec![Net::parse("0.0.0.0/0").unwrap()],
+        dns: vec!["10.7.0.1".parse().unwrap()],
+        keepalive: Some(25),
+    }
+}
+
+#[test]
+fn create_checks_and_line() {
+    create().check().unwrap();
+    let bad = |c: CreateWireGuard| c.check().unwrap_err().0;
+    assert_eq!(bad(CreateWireGuard { name: "Acme".into(), ..create() }), status::MALFORMED);
+    assert_eq!(bad(CreateWireGuard { peer: "short=".into(), ..create() }), status::MALFORMED);
+    assert_eq!(bad(CreateWireGuard { addrs: vec![], ..create() }), status::MALFORMED);
+    assert_eq!(bad(CreateWireGuard { allowed: vec![Net::parse("10.0.0.0/8").unwrap(); MAX_ROUTES + 1], ..create() }), status::MALFORMED);
+    assert_eq!(bad(CreateWireGuard { endpoint: "127.0.0.1:51820".parse().unwrap(), ..create() }), status::MALFORMED);
+    assert_eq!(bad(CreateWireGuard { keepalive: Some(0), ..create() }), status::MALFORMED);
+    let l = lines::create(&create());
+    assert_eq!(String::from_utf8(l.encode().unwrap()).unwrap(), format!("create name=acme peer={KEY} endpoint=10.88.0.9:51820 addrs=10.7.0.2/32 allowed=0.0.0.0/0 dns=10.7.0.1 keepalive=25\n"));
+    // The most routes still fit one line.
+    let many = CreateWireGuard { allowed: vec![Net::parse("100.100.100.100/32").unwrap(); MAX_ROUTES], ..create() };
+    many.check().unwrap();
+    assert!(lines::create(&many).encode().is_some());
+    let made = lines::created(&[Line::parse(&format!("created name=acme public={KEY}")).unwrap()]).unwrap();
+    assert_eq!((made.name.as_str(), made.public.as_str(), made.ignored.len()), ("acme", KEY, 0));
+    let imp = lines::created(&[Line::parse(&format!("imported name=acme public={KEY} ignored=PostUp,Table")).unwrap()]).unwrap();
+    assert_eq!(imp.ignored, vec!["PostUp".to_string(), "Table".to_string()]);
+}
+
+#[derive(Default)]
+struct Fake {
+    did: Mutex<Vec<String>>,
+}
+
+impl Fake {
+    fn did(&self, s: String) {
+        self.did.lock().unwrap().push(s);
+    }
+}
+
+impl Backend for Fake {
+    fn status(&self) -> Res<Vec<Tunnel>> {
+        Ok(self.list()?.into_iter().map(|p| p.tunnel).collect())
+    }
+    fn subscribe(&self) -> Res<mpsc::Receiver<Vec<Tunnel>>> {
+        let (tx, rx) = mpsc::channel();
+        tx.send(self.status()?).unwrap();
+        let mut t = self.status()?;
+        t[0].state = State::Connecting;
+        tx.send(t).unwrap();
+        std::mem::forget(tx);
+        Ok(rx)
+    }
+    fn list(&self) -> Res<Vec<Profile>> {
+        Ok(list_lines().iter().filter_map(lines::profile).collect())
+    }
+    fn connect(&self, name: String) -> Res<()> {
+        if name == "nope" {
+            return Err(Fail(status::FAILED, words("no-profile")));
+        }
+        self.did(format!("up {name}"));
+        Ok(())
+    }
+    fn disconnect(&self, name: String) -> Res<()> {
+        self.did(format!("down {name}"));
+        Ok(())
+    }
+    fn details(&self, name: String) -> Res<Details> {
+        list_lines().iter().filter(|l| l.get("name") == Some(&name)).find_map(lines::details).ok_or(Fail::new(status::FAILED, "no such tunnel"))
+    }
+    fn import(&self, i: ImportWireGuard) -> Res<Created> {
+        self.did(format!("import {} {}", i.name, i.conf.len()));
+        Ok(Created { name: i.name, public: KEY.into(), ignored: vec![] })
+    }
+    fn create(&self, c: CreateWireGuard) -> Res<Created> {
+        self.did(format!("create {}", c.name));
+        Ok(Created { name: c.name, public: KEY.into(), ignored: vec![] })
+    }
+    fn set(&self, s: SetProfile) -> Res<()> {
+        self.did(format!("set {} {:?} {:?}", s.name, s.block, s.personas));
+        Ok(())
+    }
+    fn remove(&self, name: String) -> Res<()> {
+        self.did(format!("remove {name}"));
+        Ok(())
+    }
+}
+
+fn serve_all(dir: &Path, b: Arc<Fake>) {
+    for g in Grant::ALL {
+        let p = Client::path(dir, g);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+        let b = b.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let b = b.clone();
+                std::thread::spawn(move || {
+                    let _ = serve(aqueduct::Connection::wrap(s).unwrap(), g, &*b);
+                });
+            }
+        });
+    }
+}
+
+fn tmp() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("crypta-ctl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Over real sockets: what each capability's socket allows.
+#[test]
+fn over_sockets() {
+    let dir = tmp();
+    let fake = Arc::new(Fake::default());
+    serve_all(&dir, fake.clone());
+    let c = |g| Client::connect(&Client::path(&dir, g)).unwrap();
+
+    let mut read = c(Grant::Read);
+    let s = read.status().unwrap();
+    assert_eq!(s.len(), 2);
+    assert_eq!(read.list().unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(read.connect_tunnel("acme").unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(read.details("acme").unwrap_err().0, status::NOT_ALLOWED);
+
+    let mut using = c(Grant::Use);
+    assert_eq!(using.list().unwrap().len(), 2);
+    using.connect_tunnel("home").unwrap();
+    using.disconnect_tunnel("acme").unwrap();
+    assert_eq!(using.connect_tunnel("nope").unwrap_err(), Fail(status::FAILED, "no such tunnel".into()));
+    assert_eq!(using.connect_tunnel("../x").unwrap_err().0, status::MALFORMED);
+    // An app without vpn-configure is refused every change of settings.
+    assert_eq!(using.details("acme").unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.create(&create()).unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.import(&ImportWireGuard { name: "x".into(), conf: b"[Interface]".to_vec() }).unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.set(&SetProfile { name: "acme".into(), block: Some(false), personas: None }).unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.remove("acme").unwrap_err().0, status::NOT_ALLOWED);
+
+    let mut conf = c(Grant::Configure);
+    assert_eq!(conf.details("acme").unwrap().endpoint, "10.88.0.9:51820".parse().unwrap());
+    assert_eq!(conf.details("zzz").unwrap_err().0, status::FAILED);
+    assert_eq!(conf.create(&create()).unwrap().public, KEY);
+    assert_eq!(conf.create(&CreateWireGuard { addrs: vec![], ..create() }).unwrap_err().0, status::MALFORMED);
+    conf.import(&ImportWireGuard { name: "work".into(), conf: vec![b'#'; 100] }).unwrap();
+    assert_eq!(conf.import(&ImportWireGuard { name: "work".into(), conf: vec![b'#'; MAX_CONF + 1] }).unwrap_err().0, status::MALFORMED);
+    assert_eq!(conf.set(&SetProfile { name: "acme".into(), block: None, personas: None }).unwrap_err().0, status::MALFORMED);
+    conf.set(&SetProfile { name: "acme".into(), block: Some(false), personas: Some(true) }).unwrap();
+    conf.remove("home").unwrap();
+    conf.connect_tunnel("acme").unwrap();
+
+    let did = fake.did.lock().unwrap().clone();
+    assert_eq!(did, ["up home", "down acme", "create acme", "import work 100", "set acme Some(false) Some(true)", "remove home", "up acme"]);
+
+    let mut ch = c(Grant::Read).subscribe().unwrap();
+    assert_eq!(ch.next().unwrap()[0].state, State::Up);
+    assert_eq!(ch.next().unwrap()[0].state, State::Connecting);
+    let _ = std::fs::remove_dir_all(&dir);
+}

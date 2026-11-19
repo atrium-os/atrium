@@ -107,6 +107,16 @@ pub fn apply_all(
     if caps.network_configure == Some(true) {
         apply_socket("network-configure.sock", jc, opts);
     }
+    // atrium-crypta-ctl's sockets (vpn.md §7.2), likewise one per capability.
+    if caps.vpn_read == Some(true) {
+        apply_socket("vpn-read.sock", jc, opts);
+    }
+    if caps.vpn_use == Some(true) {
+        apply_socket("vpn-use.sock", jc, opts);
+    }
+    if caps.vpn_configure == Some(true) {
+        apply_socket("vpn-configure.sock", jc, opts);
+    }
     if caps.navigator_page == Some(true) {
         // navigatord's ticket socket (navigator-ui.md §2.1), nothing else of it.
         apply_socket("navigator-page.sock", jc, opts);

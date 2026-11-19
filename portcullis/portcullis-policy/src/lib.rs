@@ -257,6 +257,24 @@ impl Policy {
         Ok(true)
     }
 
+    /// Route persona `name` through VPN profile `vpn` (vpn.md §9.7), or
+    /// direct; whether it changed.
+    pub fn set_persona_vpn(&mut self, name: &str, vpn: Option<&str>) -> Result<bool, String> {
+        let Some(d) = self.personas.get_mut(name) else {
+            return Err(format!("{name}: not one of your personas"));
+        };
+        if let Some(v) = vpn {
+            if v.is_empty() || v.len() > 32 || v.starts_with('-') || !v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+                return Err(format!("{v:?}: not a VPN tunnel's name"));
+            }
+        }
+        if d.vpn.as_deref() == vpn {
+            return Ok(false);
+        }
+        d.vpn = vpn.map(String::from);
+        Ok(true)
+    }
+
     /// Take persona `name` out, and every crossing switch naming it.
     /// Personal can't be removed.
     pub fn remove_persona(&mut self, name: &str) -> Result<(), String> {
@@ -417,6 +435,9 @@ pub struct CapabilityDelta {
     pub network_wifi: bool,
     pub wifi_nearby: bool,
     pub network_configure: bool,
+    pub vpn_read: bool,
+    pub vpn_use: bool,
+    pub vpn_configure: bool,
     pub navigator_page:  bool,
     pub navigator_broker: bool,
     pub notification_shelf: bool,
@@ -485,6 +506,9 @@ impl CapabilityDelta {
             && !self.network_wifi
             && !self.wifi_nearby
             && !self.network_configure
+            && !self.vpn_read
+            && !self.vpn_use
+            && !self.vpn_configure
             && !self.navigator_page
             && !self.navigator_broker
             && !self.notification_shelf
@@ -547,6 +571,9 @@ impl CapabilityDelta {
         if self.network_wifi { out.push("Join and forget Wi-Fi networks, and see the name of the one in use".into()); }
         if self.wifi_nearby { out.push("See the Wi-Fi networks around you (this can tell where you are)".into()); }
         if self.network_configure { out.push("Change the machine's network settings".into()); }
+        if self.vpn_read { out.push("See which VPN tunnels are connected".into()); }
+        if self.vpn_use { out.push("Connect and disconnect your VPN tunnels".into()); }
+        if self.vpn_configure { out.push("Add, change and remove VPN tunnels".into()); }
         if self.navigator_page  { out.push("Fetch the Navigator's pages by ticket (the Navigator's page view)".into()); }
         if self.notification_shelf { out.push("Hand a press on a notification's button to the app that posted it".into()); }
         if self.navigator_broker { out.push("Run the Navigator's broker: its windows' origin, page jails and the presses it answers".into()); }
@@ -672,6 +699,9 @@ pub fn compute_delta(
     bool_cap!(network_wifi);
     bool_cap!(wifi_nearby);
     bool_cap!(network_configure);
+    bool_cap!(vpn_read);
+    bool_cap!(vpn_use);
+    bool_cap!(vpn_configure);
     bool_cap!(navigator_page);
     bool_cap!(navigator_broker);
     bool_cap!(notification_shelf);
@@ -1015,6 +1045,9 @@ run_as = "_navpage"
             network_wifi: None,
             wifi_nearby: None,
             network_configure: None,
+            vpn_read: None,
+            vpn_use: None,
+            vpn_configure: None,
             navigator_page: None,
             navigator_broker: None,
             notification_shelf: None,

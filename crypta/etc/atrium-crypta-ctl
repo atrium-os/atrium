@@ -1,0 +1,74 @@
+#!/bin/sh
+# PROVIDE: atrium_crypta_ctl
+# REQUIRE: FILESYSTEMS
+# BEFORE: atrium_portcullisd_daemon
+# KEYWORD: shutdown
+#
+# atrium-crypta-ctl: the apps' door to cryptad (CLASS_VPN,
+# docs/spec/vpn.md §7.2). It opens one socket per capability under
+# /atrium/sockets (vpn-read, vpn-use, vpn-configure; Portcullis mounts each
+# only into jails that hold it), connects to cryptad's root-only control
+# socket, then becomes _crypta-ctl (65054) and enters capability mode, so app
+# input is decoded by an unprivileged process. It exits when cryptad goes
+# away; daemon(8) starts it again 2 s later and it waits for cryptad.
+#
+# Add to /etc/rc.conf:
+#   atrium_crypta_ctl_enable="YES"
+#
+# Optional:
+#   atrium_crypta_ctl_flags=""      # "-v" logs each change asked for
+#   atrium_crypta_ctl_ctl="/var/run/atrium/crypta.sock"   # cryptad's socket
+#   atrium_crypta_ctl_logfile="/var/log/atrium/atrium-crypta-ctl.log"
+
+. /etc/rc.subr
+
+name="atrium_crypta_ctl"
+desc="Atrium VPN settings front (CLASS_VPN)"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_crypta_ctl_enable:="NO"}
+: ${atrium_crypta_ctl_flags:=""}
+: ${atrium_crypta_ctl_ctl:="/var/run/atrium/crypta.sock"}
+: ${atrium_crypta_ctl_logfile:="/var/log/atrium/atrium-crypta-ctl.log"}
+
+command="/usr/local/bin/atrium-crypta-ctl"
+pidfile="/var/run/atrium/atrium-crypta-ctl.pid"
+
+start_cmd="atrium_crypta_ctl_start"
+stop_cmd="atrium_crypta_ctl_stop"
+status_cmd="atrium_crypta_ctl_status"
+
+atrium_crypta_ctl_start() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} already running."
+        return 0
+    fi
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium /atrium/sockets
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -r -R 2 -P "${pidfile}" -o "${atrium_crypta_ctl_logfile}" -t "${name}" \
+        "${command}" --ctl "${atrium_crypta_ctl_ctl}" --dir /atrium/sockets --uid 65054 --capsicum ${atrium_crypta_ctl_flags}
+}
+
+atrium_crypta_ctl_stop() {
+    [ -s "${pidfile}" ] || { echo "${name} not running (no pidfile)."; return 0; }
+    pid=$(cat "${pidfile}")
+    echo "Stopping ${name}."
+    kill -TERM "${pid}" 2>/dev/null
+    pwait -t 5 "${pid}" 2>/dev/null
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    pkill -KILL -x atrium-crypta-ctl 2>/dev/null
+    rm -f "${pidfile}"
+}
+
+atrium_crypta_ctl_status() {
+    if [ -s "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running (supervisor pid $(cat "${pidfile}"), atrium-crypta-ctl pid $(pgrep -x atrium-crypta-ctl | tr '\n' ' '))."
+        return 0
+    fi
+    echo "${name} is not running."
+    return 1
+}
+
+run_rc_command "$1"

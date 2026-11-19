@@ -405,6 +405,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "crypta-ctl"
+version = "0.1.0"
+dependencies = [
+ "aqueduct",
+ "aura-ipc",
+ "libc",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -421,6 +432,7 @@ dependencies = [
  "aqueduct",
  "atrium-devices",
  "atrium-netconf",
+ "crypta-ctl",
  "forum-ctl",
  "fresco-client",
  "fresco-protocol",

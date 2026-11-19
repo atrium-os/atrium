@@ -19,6 +19,8 @@ session-lock  = true   # the Lock button: ostiarius locks; only the lock screen 
 network-read  = true   # the network icon: online, how, Wi-Fi bars
 network-wifi  = true   # its menu: the network's name, join a remembered one, disconnect
 wifi-nearby   = true   # its menu: the networks around
+vpn-read      = true   # the VPN item: which tunnels, and whether each is up
+vpn-use       = true   # its menu: connect and disconnect them
 network       = "none"
 # Limen roles it embeds. Without this key a platform bundle keeps every role.
 embeds = []

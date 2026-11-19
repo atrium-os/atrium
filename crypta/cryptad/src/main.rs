@@ -219,6 +219,27 @@ impl D {
         Ok(vec![im])
     }
 
+    /// `create`: a new tunnel with a key Arca makes (vpn.md §7.3); the
+    /// answer's `public` is what the server's admin needs.
+    fn create(&mut self, l: &Line) -> Result<Vec<Line>, String> {
+        let mut p = Profile::from_create(l)?;
+        if Profile::load(&self.o.state, &p.name).is_some() {
+            return Err("exists".into());
+        }
+        let k = self.keys.call(&Line::new("mint").with("account", &p.name)).map_err(|e| e.to_string())?;
+        let (Some(id), Some(public)) = (k.hex("id").and_then(|i| <[u8; 16]>::try_from(i).ok()), hex32(&k, "pub")) else {
+            return Err(format!("arca-{}", k.get("status").unwrap_or("?")));
+        };
+        p.key = id;
+        p.public = public;
+        if let Err(e) = p.save(&self.o.state) {
+            self.forget(&[id]);
+            return Err(format!("save: {e}"));
+        }
+        self.log(&format!("created {} ({} allowed, block {})", p.name, p.allowed.len(), p.block));
+        Ok(vec![Line::new("created").with("name", &p.name).with("public", crypta_proto::b64::encode(&public))])
+    }
+
     fn forget(&mut self, ids: &[[u8; 16]]) {
         for i in ids {
             let _ = self.keys.call(&Line::new("delete").with_hex("id", i));
@@ -347,6 +368,10 @@ impl D {
                 }
                 if let Some(p) = Profile::load(&self.o.state, &n) {
                     l = l.with("public", crypta_proto::b64::encode(&p.public)).with("endpoint", p.endpoint).with("full", p.full() as u8).with("block", p.block as u8).with("scoped", p.scoped as u8);
+                    l = l.with("addrs", p.addrs.iter().map(|a| format!("{}/{}", a.addr, a.len)).collect::<Vec<_>>().join(",")).with("routes", p.allowed.len());
+                    if !p.dns.is_empty() {
+                        l = l.with("dns", p.dns.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","));
+                    }
                 }
                 l
             })
@@ -357,6 +382,7 @@ impl D {
         let name = l.get("name").filter(|n| profile::valid_name(n)).map(str::to_string);
         let res: Result<Vec<Line>, String> = match (l.verb.as_str(), name) {
             ("import", _) => self.import(l, file),
+            ("create", _) => self.create(l),
             ("up", Some(n)) => self.up(&n).map(|_| vec![]),
             ("down", Some(n)) => self.down(&n).map(|_| vec![]),
             ("delete", Some(n)) => self.delete(&n).map(|_| vec![]),

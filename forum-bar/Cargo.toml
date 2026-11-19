@@ -23,6 +23,7 @@ forum-ctl = { path = "../forum-ctl" }
 atrium-media = { path = "../dispensator/media" }
 # Network status, Wi-Fi join and leave (atrium-netconf, atrium-net.md §7.1).
 atrium-netconf = { path = "../atrium-net/netconf" }
+crypta-ctl = { path = "../crypta/crypta-ctl" }
 # "Sign in to this network": portcullisd's PortalWindow (atrium-net.md §8.1).
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 # forum-bar draws its bar via Pergola (the UI toolkit) → frescod, the same way any
