@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run the hardware-free M9 gate from first boot through poweroff."""
 import argparse
+import fcntl
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -12,6 +14,108 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+SNAPSHOTS = "https://download.freebsd.org/snapshots/VM-IMAGES/16.0-CURRENT/amd64"
+STOCK_IMAGE = re.compile(r"FreeBSD-16\.0-CURRENT-amd64-zfs-(?P<build>(?P<date>\d{8})-[0-9a-f]+-\d+)\.qcow2\.xz")
+
+
+def fetch(url, destination=None):
+    cmd = ["curl", "--fail", "--silent", "--show-error", "--location", "--proto", "=https",
+           "--proto-redir", "=https", "--connect-timeout", "20", "--max-time", "1200",
+           "--retry", "3", url]
+    if destination is None:
+        return subprocess.check_output(cmd, text=True)
+    subprocess.run(cmd, stdout=destination, check=True)
+
+
+def image_digest(path):
+    with path.open("rb") as source:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def latest_image_name():
+    dates = re.findall(r'href="(\d{8})/"', fetch(f"{SNAPSHOTS}/"))
+    if not dates:
+        raise ValueError("no dated FreeBSD amd64 snapshots in the official index")
+    date = max(dates)
+    names = re.findall(r'href="([^"]+)"', fetch(f"{SNAPSHOTS}/{date}/"))
+    images = [match[0] for match in map(STOCK_IMAGE.fullmatch, names) if match and match["date"] == date]
+    if len(images) != 1:
+        raise ValueError(f"expected one stock amd64 ZFS qcow2 snapshot for {date}")
+    return images[0]
+
+
+def prepare_image(cache, image):
+    # Serialize discovery and publication so parallel first runs share a download.
+    with (cache / ".m9-image.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if image is None:
+            images = list(cache.glob("FreeBSD-*-amd64-zfs-*.qcow2.xz"))
+            if len(images) > 1:
+                raise ValueError("select one of the cached snapshots with --image")
+            if images:
+                image = images[0]
+            else:
+                image = cache / latest_image_name()
+        elif not image.is_file():
+            raise FileNotFoundError(image)
+
+        stock = STOCK_IMAGE.fullmatch(image.name)
+        if not stock:  # Explicit, locally supplied image from a different build.
+            return image, image_digest(image)
+        url = f"{SNAPSHOTS}/{stock['date']}"
+        manifest = cache / f"CHECKSUM.SHA256-{stock['build']}"
+        checksums = manifest.read_text() if manifest.is_file() else fetch(f"{url}/{manifest.name}")
+        entry = re.search(rf"^SHA256 \({re.escape(image.name)}\) = ([0-9a-f]{{64}})$", checksums, re.M)
+        if not entry:
+            raise ValueError(f"missing exact SHA256 entry for {image.name}")
+        expected = entry[1]
+        if image.is_file():
+            if image_digest(image) != expected:
+                raise ValueError(f"SHA256 mismatch for {image}")
+        else:
+            print(f"Downloading {url}/{image.name}", flush=True)
+            with tempfile.TemporaryDirectory(dir=cache) as stage:
+                partial = Path(stage) / image.name
+                with partial.open("wb") as output:
+                    fetch(f"{url}/{image.name}", output)
+                if image_digest(partial) != expected:
+                    raise ValueError(f"downloaded {image.name} failed SHA256 verification")
+                partial.replace(image)
+        if not manifest.exists():
+            with tempfile.TemporaryDirectory(dir=cache) as stage:
+                partial = Path(stage) / manifest.name
+                partial.write_text(checksums)
+                partial.replace(manifest)
+        print(f"Verified {image.name} SHA256 {expected}", flush=True)
+        return image, expected
+
+
+def prepare_sysroot(cache, digest, ssh):
+    # VMDIR is specific to the image bytes, even when --image changes.
+    vmdir = cache / "m9-sysroots" / digest
+    vmdir.mkdir(parents=True, exist_ok=True)
+    root = vmdir / "sysroot"
+    with (vmdir / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not root.exists():
+            print("Preparing the cross sysroot from the clean guest", flush=True)
+            with tempfile.TemporaryDirectory(dir=vmdir) as stage:
+                stage = Path(stage)
+                archive = stage / "sysroot.tar"
+                with archive.open("wb") as output:
+                    subprocess.run(ssh + ["tar -C / --exclude usr/lib/debug -cf - lib usr/lib usr/include"],
+                                   stdout=output, check=True, timeout=900)
+                extracted = stage / "sysroot"
+                extracted.mkdir()
+                subprocess.run(["tar", "-xf", archive, "-C", extracted], check=True)
+                for member in ("usr/lib/Scrt1.o", "usr/lib/crti.o", "usr/lib/libc.so", "usr/include/sys/types.h"):
+                    if not (extracted / member).is_file():
+                        raise ValueError(f"guest sysroot missing {member}")
+                extracted.rename(root)
+    return vmdir
 
 
 def provision(console, public_key):
@@ -72,10 +176,10 @@ def firmware(qemu):
     raise RuntimeError("amd64 QEMU UEFI firmware and variable template missing")
 
 
-def boot_and_run(cache, image, out):
+def boot_and_run(cache, image, digest, out):
     qemu = shutil.which("qemu-system-x86_64")
-    if not qemu or not (cache / "sysroot/usr/lib/Scrt1.o").is_file():
-        raise RuntimeError("install QEMU and supply the matching amd64 sysroot under VMDIR")
+    if not qemu:
+        raise RuntimeError("install qemu-system-x86_64")
     code, variables = firmware(Path(qemu).resolve())
     # Allocate fresh writable state. Leave the input image and sysroot untouched.
     with (out / "vm.qcow2").open("xb") as disk:
@@ -135,7 +239,8 @@ def boot_and_run(cache, image, out):
             echo 'FreeBSD amd64: Git absent, no YubiKey or U2F device'
             """], check=True, timeout=30, stdout=subprocess.PIPE, text=True)
         print(preflight.stdout, end="", flush=True)
-        env = dict(os.environ, VMDIR=str(cache), SSH_AGENT_GATE_PORT=port, SSH_AGENT_GATE_KEY=str(key))
+        vmdir = prepare_sysroot(cache, digest, ssh)
+        env = dict(os.environ, VMDIR=str(vmdir), SSH_AGENT_GATE_PORT=port, SSH_AGENT_GATE_KEY=str(key))
         print("Running M9. Follow", out / "gate.log", flush=True)
         with (out / "gate.log").open("w") as log:
             log.write(preflight.stdout)
@@ -179,21 +284,15 @@ def boot_and_run(cache, image, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, default=Path(os.getenv("VMDIR", "~/atrium-vm-amd64")),
-                        help="directory containing the matching sysroot and stock FreeBSD amd64 ZFS .qcow2.xz")
+                        help="snapshot and sysroot cache (created on first run)")
     parser.add_argument("--image", type=Path, help="select the stock .qcow2.xz when the cache has multiple snapshots")
     args = parser.parse_args()
     cache = args.cache.expanduser().resolve()
-    image = args.image
-    if image is None:
-        images = list(cache.glob("FreeBSD-*-amd64-zfs-*.qcow2.xz"))
-        if len(images) != 1:
-            parser.error("set --image to the stock FreeBSD amd64 ZFS .qcow2.xz matching the sysroot")
-        image = images[0]
-    if not image.is_file():
-        parser.error(f"missing snapshot: {image}")
+    cache.mkdir(parents=True, exist_ok=True)
+    image, digest = prepare_image(cache, args.image)
     out = Path(tempfile.mkdtemp(prefix="m9-fresh-", dir="/tmp"))
     print(f"Snapshot: {image.name}\nRun directory: {out}", flush=True)
-    boot_and_run(cache, image, out)
+    boot_and_run(cache, image, digest, out)
 
 
 if __name__ == "__main__":

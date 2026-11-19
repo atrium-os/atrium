@@ -371,10 +371,14 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   branch in a disposable bare repository served over the workspace's loopback,
   and its ref matched the source commit. Revocation blocked both Git operations.
   From the host, run `python3 scripts/vm-m9-fresh.py --cache /path/to/amd64-cache`
-  for a complete hardware-free run. The cache holds the stock
-  `FreeBSD-*-amd64-zfs-*.qcow2.xz` and its matching `sysroot/`. The command
-  boots a private copy with QEMU and UEFI, provisions SSH and rctl, checks
-  that Git is absent, runs M9, and powers off the guest. The printed run
+  for a complete hardware-free run. An empty cache downloads the stock amd64 ZFS
+  image from the newest dated FreeBSD 16.0-CURRENT snapshot and verifies the
+  compressed image against its published SHA256 checksum. The command boots a
+  private copy with QEMU and UEFI, provisions SSH and rctl, and checks that Git
+  is absent. Before installing guest packages it exports the guest headers,
+  libraries and startup objects for the host cross-build. Later runs reuse the
+  verified image and its sysroot under `m9-sysroots/<image-sha256>/sysroot`.
+  Each run boots a clean guest, runs M9, and powers it off. The printed run
   directory retains the gate log, serial log, and Curia screenshots.
   To use an existing guest, run `sh scripts/vm-m9-curia-check.sh [out-dir]` after booting a
   disposable amd64 guest with rctl and x86-64-v3 (e.g. `TCG_CPU=Haswell-noTSX`
