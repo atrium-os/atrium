@@ -2,6 +2,7 @@
 """GlobalProtect TLS packet peer for the Crypta host and FreeBSD checks."""
 
 import argparse
+import base64
 import os
 from pathlib import Path
 import shlex
@@ -63,7 +64,7 @@ def frames(stream, reader, calls):
         calls.append("echo")
 
 
-def serve(ctx, listener, calls, errors):
+def serve(ctx, listener, calls, errors, *, isolated=False, portal=False):
     try:
         while True:
             raw, _ = listener.accept()
@@ -83,11 +84,28 @@ def serve(ctx, listener, calls, errors):
                         headers[name.lower()] = value.strip()
                     fields = parse_qs(reader.read(int(headers.get("content-length", "0"))).decode())
                     query = parse_qs(parsed.query)
+                    extra = ""
+                    if isolated and not portal:
+                        assert "cookie" not in headers, "portal cookie reached the gateway"
+                        for values in (*fields.values(), *query.values()):
+                            assert not {"portal-alice", "portal-secret", "portal-token"} & set(values), (
+                                "portal credentials reached the gateway"
+                            )
                     if path == "prelogin.esp":
+                        if portal:
+                            assert parsed.path == "/global-protect/prelogin.esp"
+                            extra = "Set-Cookie: portal_only=portal-marker; Path=/; Secure; HttpOnly\r\n"
                         assert (query or fields)["clientos"] == ["Linux"]
                         body = ("<prelogin-response><status>Success</status>"
                                 "<username-label>Username</username-label>"
                                 "<password-label>Password</password-label></prelogin-response>")
+                    elif portal:
+                        assert parsed.path == "/global-protect/getconfig.esp"
+                        assert fields.get("user") == ["portal-alice"] and fields.get("passwd") == ["portal-secret"]
+                        assert headers.get("cookie") == "portal_only=portal-marker"
+                        body = ('<policy><gateways><external><list>'
+                                '<entry name="198.51.100.52:449"><description>Fixture gateway</description></entry>'
+                                '</list></external></gateways><portal-userauthcookie>portal-token</portal-userauthcookie></policy>')
                     elif path == "login.esp":
                         assert fields["user"] == ["alice"] and fields["passwd"] == [PASSWORD]
                         args = ["", COOKIE, "fixture", "office", "alice", "ldap", "vsys", "corp",
@@ -113,9 +131,9 @@ def serve(ctx, listener, calls, errors):
                     else:
                         raise AssertionError(path)
                     response = (f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n"
-                                f"Connection: close\r\n\r\n{body}")
+                                f"Connection: close\r\n{extra}\r\n{body}")
                     stream.sendall(response.encode())
-                    if path == "logout.esp":
+                    if path == "logout.esp" or (portal and path == "getconfig.esp"):
                         return
     except Exception as error:
         errors.append(error)
@@ -137,15 +155,61 @@ def openconnect_probe():
     Path(sys.argv[2]).touch()
 
 
+
+def two_origin_gate(tmp, arch):
+    # One trust root and distinct TLS identities for the portal and gateway.
+    ca = tmp / "ca.pem"
+    ca_key = tmp / "ca.key"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=Crypta integration test CA", "-addext", "basicConstraints=critical,CA:TRUE",
+                    "-addext", "keyUsage=critical,keyCertSign", "-keyout", ca_key, "-out", ca],
+                   check=True, capture_output=True)
+    trust = base64.b64encode(ssl.PEM_cert_to_DER_cert(ca.read_text())).decode()
+    errors, portal_calls, gateway_calls = [], [], []
+    with socket.create_server(("127.0.0.1", 0)) as portal, socket.create_server(("127.0.0.1", 0)) as gateway:
+        threads = []
+        for listener, ip, index, calls, is_portal in [
+            (portal, "198.51.100.54", "1", portal_calls, True),
+            (gateway, "198.51.100.52", "2", gateway_calls, False),
+        ]:
+            key, csr, leaf, config = [tmp / f"{index}.{ext}" for ext in ("key", "csr", "pem", "cnf")]
+            config.write_text(f"subjectAltName=IP:{ip}\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n")
+            subprocess.run(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={ip}",
+                            "-keyout", key, "-out", csr], check=True, capture_output=True)
+            subprocess.run(["openssl", "x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key,
+                            "-set_serial", index, "-days", "1", "-extfile", config, "-out", leaf],
+                           check=True, capture_output=True)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(leaf, key)
+            listener.settimeout(300)
+            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors),
+                                      kwargs={"isolated": True, "portal": is_portal}, daemon=True)
+            thread.start()
+            threads.append(thread)
+        subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", arch,
+                        str(gateway.getsockname()[1]), trust, str(portal.getsockname()[1])],
+                       check=True, timeout=300)
+        for thread in threads:
+            thread.join(2)
+        assert not errors, errors
+        assert portal_calls == ["prelogin.esp", "getconfig.esp"], portal_calls
+        exchange = ["getconfig.esp", "hipreportcheck.esp", "ssl-tunnel-connect.sslvpn", "echo"]
+        assert gateway_calls == ["prelogin.esp", "login.esp"] + exchange * 2 + ["logout.esp"], gateway_calls
+        print("Portal and gateway saw separate credentials. One gateway login carried traffic before and after rebind.")
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--openconnect", metavar="PATH")
     group.add_argument("--vm", choices=["arm64", "amd64"])
     group.add_argument("--full-vm", choices=["arm64", "amd64"])
+    group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
+        if args.portal_vm:
+            two_origin_gate(tmp, args.portal_vm)
+            return
         conf = tmp / "openssl.cnf"
         cert, key = tmp / "cert.pem", tmp / "key.pem"
         conf.write_text("[req]\ndistinguished_name=dn\nx509_extensions=v3\n"

@@ -57,6 +57,8 @@ SAML stand-in gateway and Keycloak (crypta-sso-stand.sh). The same two are
 also at 172.16.47.1:447-448, a private address beyond the router, which Arca's
 couriers may reach under their test grant (a documentation address they may
 not), for the sign-in window's pages.
+The Crypta gate can also attach a GlobalProtect TLS gateway (198.51.100.52:449)
+and a separate portal (198.51.100.54:450) to loopback fixture listeners.
 """
 import json, os, random, socket, struct, sys
 
@@ -86,6 +88,8 @@ if "CRYPTA_GP_TEST_PORT" in os.environ:
     AC_PORTS[449] = int(os.environ["CRYPTA_GP_TEST_PORT"])
 SSO_GW = bytes([172, 16, 47, 1])  # the SAML stand-in and Keycloak, privately
 GW_PORTS = {AC_GW: AC_PORTS, SSO_GW: {447: 8447, 448: 8448}}
+if "CRYPTA_GP_PORTAL_PORT" in os.environ:
+    GW_PORTS[bytes([198, 51, 100, 54])] = {450: int(os.environ["CRYPTA_GP_PORTAL_PORT"])}
 wg_peer = None  # (guest mac, guest ip, guest port) of the last datagram relayed
 seen = {}
 LEASE = int(sys.argv[1]) if len(sys.argv) > 1 else 120

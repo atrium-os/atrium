@@ -755,10 +755,15 @@ another origin. An active portal-profile session stays in engine memory.
   token without evaluating page code. The control check against OpenConnect 9.21
   exercises all three envelopes with `--challenge xml|js|html`, selecting the second
   advertised gateway label. The fixture serves both labels at one origin.
-- The direct gateway TLS integration gate passes on arm64 FreeBSD. A portal
-  advertising a different origin still needs a FreeBSD integration check. ESP and
-  reviewed HIP reporting remain in V5. Scripted SSO and passkeys remain parked
-  pending Navigator I3.
+- The direct gateway and two-origin portal integration gates pass on arm64
+  FreeBSD. The two-origin run (`crypta-gp-packet-check.py --portal-vm arm64`)
+  uses distinct TLS identities and passwords, rejects an unadvertised choice,
+  verifies the old jail is gone and the new engine is in capability mode, and
+  checks Arca for persisted credentials. The peer verifies that portal
+  credentials, cookies and tokens stay at the portal. A single gateway login
+  carries IPv4 echo before and after rebind, followed by logout.
+  ESP and reviewed HIP reporting remain in V5. Scripted SSO and passkeys
+  remain parked pending Navigator I3.
 
 V0–V3 give Atrium a complete, leak-tested WireGuard VPN with per-app scope; V4 brings AnyConnect (with its SAML sign-in) in under the same walls; V5–V6 bring GlobalProtect and script-driven sign-ins.
 

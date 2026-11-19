@@ -1,5 +1,5 @@
 #!/bin/sh
-# Called by crypta-gp-packet-check.py --full-vm. Requires a dedicated,
+# Called by crypta-gp-packet-check.py --full-vm or --portal-vm. Requires a dedicated,
 # already-booted FreeBSD guest with the atrium-net simulated LAN on vtnet1.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -11,7 +11,11 @@ esac
 export CRYPTA_GATE_TARGET
 export CRYPTA_GATE_CONFIGURED_TOOLCHAIN=1 CRYPTA_GATE_OWN_LAN=1
 export CRYPTA_GP_TEST_PORT=$2
-pin=$3
+trust=$3
+portal_port=${4:-}
+if [ -n "$portal_port" ]; then
+    export CRYPTA_GP_PORTAL_PORT=$portal_port
+fi
 headers="$ROOT/$sysroot"
 [ -d "$headers/usr/include" ] || headers="$HOME/src/bsd/$sysroot"
 llvm=${CRYPTA_LLVM_BIN:-/opt/homebrew/opt/llvm/bin}
@@ -58,27 +62,78 @@ wait_field() {
     done
     fail "profile did not reach $1=$2: $("$V" "$CTL list")"
 }
-"$V" "$CTL create-gp name=gp-gate host=198.51.100.52:449 pin=$pin scoped=0" >/dev/null
-"$V" "$CTL up name=gp-gate" >/dev/null
-wait_field signin prompt
-prompt=$("$V" "$CTL prompt name=gp-gate")
-printf '%s\n' "$prompt" | grep -q '^field i=0 kind=0 name=757365726e616d65' || fail "missing username prompt"
-printf '%s\n' "$prompt" | grep -q '^field i=1 kind=1 name=70617373776f7264' || fail "missing Arca password prompt"
-handle=$("$V" 'sh -s' <<'GUEST' | sed -n 's/^status=0 body=//p'
+hex() { printf %s "$1" | od -An -tx1 | tr -d ' \n'; }
+wait_prompt() {
+    expected=$(hex "$1")
+    for _ in $(seq 1 30); do
+        prompt=$("$V" "$CTL prompt name=gp-gate" || true)
+        if printf '%s\n' "$prompt" | grep -q " name=$expected "; then return 0; fi
+        [ -z "$(field error)" ] || break
+        sleep 1
+    done
+    fail "missing prompt field $1"
+}
+engine_jid() {
+    "$V" 'p=$(pgrep -of "^/usr/local/bin/atrium-crypta-ac$") || exit 1
+        procstat -s "$p" | awk "NR == 2 {print \$10}" | grep -q C || exit 1
+        ps -o jid= -p "$p" | tr -d " "'
+}
+answer_password() {
+    username=$1
+    password=$2
+    handle=$("$V" "sh -s -- '$password'" <<'GUEST' | sed -n 's/^status=0 body=//p'
 G=/tmp/crypta-gate
 pub=$(printf 'a%.0s' $(seq 64))
-su -m cg-ui -c "$G/arca-probe $G/arcad.sock hold alice $pub org.atrium.curia 'a&+ b' vpn"
+su -m cg-ui -c "$G/arca-probe $G/arcad.sock hold alice $pub org.atrium.curia '$1' vpn"
 GUEST
 )
-[ "${#handle}" -eq 32 ] || fail "Arca returned no credential handle"
-"$V" "$CTL answer name=gp-gate t0=616c696365 h1=$handle" >/dev/null
+    [ "${#handle}" -eq 32 ] || fail "Arca returned no credential handle"
+    "$V" "$CTL answer name=gp-gate t0=$(hex "$username") h1=$handle ${3:-}" >/dev/null || fail "answer password"
+}
+
+if [ -n "$portal_port" ]; then
+    "$V" "$CTL create-gp name=gp-gate host=198.51.100.54:450 portal=1 ca=$trust scoped=0" >/dev/null
+    "$V" "$CTL up name=gp-gate" >/dev/null
+    wait_prompt gp_password_once
+    portal_jid=$(engine_jid) || fail "portal engine jail or capability mode"
+    [ "$portal_jid" -gt 0 ] || fail "portal engine is outside a jail"
+    answer_password portal-alice portal-secret keep=1
+    wait_prompt gp_gateway
+    selected=198.51.100.52:449
+    printf '%s\n' "$prompt" | grep -q " value=$(hex "$selected") " || fail "portal gateway choice is missing"
+    if "$V" "$CTL answer name=gp-gate t0=$(hex "198.51.100.55:449")" >/dev/null; then
+        fail "an unadvertised gateway was accepted"
+    fi
+    "$V" "$CTL answer name=gp-gate t0=$(hex "$selected")" >/dev/null
+    wait_prompt gp_password_once
+    gateway_jid=$(engine_jid) || fail "selected gateway jail or capability mode"
+    [ "$gateway_jid" -gt 0 ] && [ "$gateway_jid" != "$portal_jid" ] || fail "the gateway reused the portal jail"
+    if "$V" "jls -j '$portal_jid' jid" >/dev/null 2>&1; then
+        fail "the portal jail still exists"
+    fi
+    [ "$(field starts)" = 2 ] || fail "expected one portal engine and one gateway engine"
+    ok "cryptad retired the portal jail and jaild launched a fresh gateway jail"
+    answer_password alice 'a&+ b' keep=1
+else
+    "$V" "$CTL create-gp name=gp-gate host=198.51.100.52:449 pin=$trust scoped=0" >/dev/null
+    "$V" "$CTL up name=gp-gate" >/dev/null
+    wait_prompt password
+    answer_password alice 'a&+ b'
+fi
 wait_field handshake 1
 ok "GlobalProtect signed in using Arca's held password"
 iface=$(field iface)
 "$V" "route -n get 10.77.0.1 | grep -Eq 'interface: $iface$'" || fail "atrium-net did not install the tunnel route"
-"$V" 'p=$(pgrep -of "^/usr/local/bin/atrium-crypta-ac$"); [ -n "$p" ] &&
-    [ "$(ps -o jid= -p "$p" | tr -d " ")" -gt 0 ] &&
-    procstat -s "$p" | awk "NR == 2 {print \$10}" | grep -q C' || fail "engine is not jailed and in capability mode"
+jid=$(engine_jid) || fail "engine jail or capability mode"
+[ "$jid" -gt 0 ] || fail "engine is outside a jail"
+if [ -n "$portal_port" ]; then
+    items=$("$V" "su -m _crypta-key -c '$G/arca-probe $G/arcad.sock list'")
+    printf '%s\n' "$items" | grep -q '^status=0 ' || fail "could not inspect Crypta's Arca items"
+    for account in gp-gate/password gp-gate/session; do
+        case "$items" in *"$(hex "$account")"*) fail "portal profile persisted credentials" ;; esac
+    done
+    ok "portal and gateway passwords and session stayed out of Arca storage"
+fi
 ok "jaild launched the corporate engine and atrium-net installed the route"
 probe() {
     "$V" 'ping -n -c 1 -t 5 -S 10.77.0.2 10.77.0.1' || fail "$1"
