@@ -1750,6 +1750,35 @@ impl State {
         }
     }
 
+    /// The sign-on token a VPN gateway set in its sign-in window's jar:
+    /// the crypta service's, as `<profile>/sso@<host>`, bound to the host
+    /// that set it; the engine asks for its own gateway's only, once.
+    fn vpn_token(&mut self, profile: &str, host: &str, value: &[u8], item: &mut Option<ItemId>) -> Reply {
+        if value.is_empty() || value.len() > 8192 {
+            return reply(status::DENIED);
+        }
+        let Ok(me) = Recipient::service(op::CRYPTA_SERVICE) else { return reply(status::UNKNOWN_PEER) };
+        let Some(store) = self.machine.as_mut() else { return reply(status::LOCKED) };
+        let who = Access { persona: MACHINE_PERSONA, recipient: &me };
+        let account = format!("{profile}/sso@{host}");
+        let old: Vec<ItemId> = tri!(store.list(&who)).into_iter().filter(|m| m.account == account).map(|m| m.id).collect();
+        let m = tri!(store.add(NewItem {
+            persona: MACHINE_PERSONA,
+            recipient: me.clone(),
+            class: Class::AfterFirstUnlock,
+            kind: Kind::OAuthToken,
+            provenance: Provenance::ServerSet,
+            account: &account,
+            scope: b"",
+            value,
+        }));
+        for o in old {
+            let _ = store.delete(&o, &who);
+        }
+        *item = Some(m.id);
+        ok(Vec::new())
+    }
+
     /// Keep one cookie a web courier (or, `script`, a page's
     /// `document.cookie`) set, by Arca's rules: one per (name, domain,
     /// path, host-only), expired ones gone, the group's oldest out when
@@ -2115,6 +2144,14 @@ impl State {
                     (None, None) => {}
                     (Some(_), Some(t)) if self.courier_ticket(c, path, None, &t, false).is_some() => {}
                     _ => return reply(status::DENIED),
+                }
+                // A VPN sign-in window's jar (vpn.md §9.3, SAML): the
+                // gateway's sign-on token is Crypta's, never the page's.
+                if let Some(profile) = partition.as_deref().and_then(crate::jar::vpn_profile) {
+                    if name == crate::jar::VPN_SSO_COOKIE {
+                        let (host, value) = (host.clone(), value.to_vec());
+                        return self.vpn_token(&profile, &host, &value, item);
+                    }
                 }
                 let now = (self.clock)();
                 let sc = match crate::cookie::parse(name, value, attrs, host, path, now) {

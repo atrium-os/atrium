@@ -573,3 +573,42 @@ fn a_taken_transitions_script_cookie_is_kept() {
         w.str("a=1");
     })).status, status::OK);
 }
+
+/// A VPN sign-in window's jar (vpn.md §9.3): the gateway's sign-on token
+/// goes to Crypta's items, bound to the host that set it, never the jar.
+#[test]
+fn a_vpn_sign_in_jars_token_is_cryptas() {
+    let (_d, mut s) = setup();
+    s.open_machine().unwrap();
+    let crypta = Label::Service(op::CRYPTA_SERVICE.into());
+    let items = |s: &mut State| {
+        let r = s.handle(&crypta, op::LIST, &[]);
+        assert_eq!(r.status, status::OK);
+        let b = r.body.bytes().to_vec();
+        (u32::from_le_bytes(b[..4].try_into().unwrap()), String::from_utf8_lossy(&b).into_owned())
+    };
+    let gw = web("gw.crypta.test", "vpn-corp.crypta.test");
+    for _ in 0..2 {
+        let t = ticket(&mut s, "gw.crypta.test", "vpn-corp.crypta.test", 3, "/+CSCOE+/saml/sp/acs", 3, "idp.example");
+        assert_eq!(get_exact(&mut s, &gw, 3, "/+CSCOE+/saml/sp/acs", "", Some(t)).0, status::OK);
+        assert_eq!(set_t(&mut s, &gw, "acSamlv2Token", "Secure; HttpOnly", "/+CSCOE+/saml/sp/acs", Some(t)), status::OK);
+    }
+    let (n, text) = items(&mut s);
+    assert_eq!(n, 1, "a second token replaces the first");
+    assert!(text.contains("corp/sso@gw.crypta.test"), "{text}");
+    let t = ticket(&mut s, "gw.crypta.test", "vpn-corp.crypta.test", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &gw, "/", Some(t)), (status::OK, "".into()), "the page's jar never has it");
+    // Any other cookie of the sign-in stays in its jar, kept for next time.
+    let idp = web("idp.example", "vpn-corp.idp.example");
+    let t = ticket(&mut s, "idp.example", "vpn-corp.idp.example", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &idp, "/", Some(t)).0, status::OK);
+    assert_eq!(set_t(&mut s, &idp, "KEYCLOAK_SESSION", "Secure", "/", Some(t)), status::OK);
+    let t = ticket(&mut s, "idp.example", "vpn-corp.idp.example", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &idp, "/", Some(t)), (status::OK, "KEYCLOAK_SESSION=v".into()));
+    // Outside a sign-in jar it is just a cookie.
+    let plain = web("gw.crypta.test", "crypta.test");
+    let t = ticket(&mut s, "gw.crypta.test", "crypta.test", 1, "/", 1, "");
+    assert_eq!(get_t(&mut s, &plain, "/", Some(t)).0, status::OK);
+    assert_eq!(set_t(&mut s, &plain, "acSamlv2Token", "Secure", "/", Some(t)), status::OK);
+    assert_eq!(items(&mut s).0, 1);
+}

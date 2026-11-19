@@ -130,13 +130,14 @@ fn release(socket: &str, id: &[u8; 16]) -> Result<zeroize::Zeroizing<Vec<u8>>, u
 ///   until `commit` stores it as the saved password)
 /// - `saved` → `ok value=`; `commit` → `ok`
 /// - `cookie` → `ok value=`; `cookie-set value=`; `cookie-drop`
-/// - `sso` → `ok value=` (the token Arca's courier caught, used once)
+/// - `sso` → `ok value=` (the token Arca's courier caught from this
+///   profile's sign-in jar, set by the gateway's own host; used once)
 /// - `sign digest=` → `ok sig=` (the profile's client key)
-pub fn serve_vpn(socket: &str, name: &str) {
+pub fn serve_vpn(socket: &str, name: &str, host: &str) {
     let stdin = io::stdin();
     let mut out = io::stdout();
     let mut pending: Option<zeroize::Zeroizing<Vec<u8>>> = None;
-    let (pw, session, sso, tls) = (format!("{name}/password"), format!("{name}/session"), format!("{name}/sso"), format!("{name}/tls"));
+    let (pw, session, sso, tls) = (format!("{name}/password"), format!("{name}/session"), format!("{name}/sso@{host}"), format!("{name}/tls"));
     for line in stdin.lock().lines() {
         let Ok(mut s) = line else { return };
         let req = Line::parse(&s);
@@ -350,13 +351,13 @@ impl Keys {
 
     /// An AnyConnect engine's own helper (vpn.md §9.3), serving `name`'s
     /// secrets on `sock` (the engine's fd 4), as `uid`.
-    pub fn start_vpn(uid: u32, socket: &str, name: &str, sock: std::os::unix::net::UnixStream) -> io::Result<Child> {
+    pub fn start_vpn(uid: u32, socket: &str, name: &str, host: &str, sock: std::os::unix::net::UnixStream) -> io::Result<Child> {
         use std::os::unix::process::CommandExt;
         let exe = std::env::current_exe()?;
         let fd: std::os::fd::OwnedFd = sock.into();
         let fd2 = fd.try_clone()?;
         let mut cmd = Command::new(exe);
-        cmd.arg("--arca-vpn").arg(name).env_clear().env("ARCA_SOCKET", socket).stdin(Stdio::from(fd)).stdout(Stdio::from(fd2)).stderr(Stdio::inherit());
+        cmd.arg("--arca-vpn").arg(name).arg(host).env_clear().env("ARCA_SOCKET", socket).stdin(Stdio::from(fd)).stdout(Stdio::from(fd2)).stderr(Stdio::inherit());
         // SAFETY: getuid has no preconditions.
         if unsafe { libc::getuid() } == 0 {
             cmd.uid(uid).gid(uid);

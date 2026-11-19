@@ -7,12 +7,19 @@
 //! runs [`work`] for each [`Want`] and hands back what it [`Got`]; the
 //! drawing is [`CuriaView::vpn`]. What it does is logged as `curia: vpn: …`
 //! (the VM check reads it).
+//!
+//! Corporate VPNs (V4, vpn.md §9.3): a gateway's name makes a tunnel; when
+//! it asks (a form, step by step), the form shows under its card: text and
+//! choices here, passwords and codes in Arca's credential field, whose
+//! handle is all Curia sends. A client certificate's request is made in
+//! Arca and copied for the IT team; the signed certificate comes back
+//! through the picker.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
 use crypta_ctl::client::Client;
-use crypta_ctl::{CreateWireGuard, Created, Details, Grant, ImportWireGuard, Net, Scope, SetProfile, State};
+use crypta_ctl::{Answer, Ask, CertRequest, Certificate, CreateAnyConnect, CreateWireGuard, Created, Details, FieldKind, Grant, ImportWireGuard, Kind, Net, Scope, SetProfile, SsoDone, State, Value};
 use pergola::geom::Rect;
 use pergola::layout::FlexStyle;
 use pergola::node::Node;
@@ -39,8 +46,16 @@ pub enum Want {
     Import(ImportWireGuard),
     /// Persona `persona` goes through `vpn` (None: direct), with the press.
     PersonaVpn { persona: String, vpn: Option<String>, activation: Option<[u8; 16]> },
-    /// The system picker for a `.conf` (main.rs opens it: it holds limend).
+    /// The system picker for a `.conf` (main.rs opens it: it holds limend),
+    /// or for a certificate when `pick_cert` names a tunnel.
     Pick,
+    CreateAc(CreateAnyConnect),
+    /// What the tunnel's gateway asks.
+    Prompt(String),
+    Answer(Answer),
+    SsoDone(SsoDone),
+    CertRequest(String),
+    Certificate(Certificate),
 }
 
 #[derive(Clone, Debug)]
@@ -54,7 +69,44 @@ pub enum Got {
     Created(Result<Created, String>),
     /// The picker gave a file (its name and bytes), or why not.
     Picked(Result<(String, Vec<u8>), String>),
+    /// What a tunnel's gateway asks (None: nothing now).
+    Prompt(String, Result<Option<Ask>, String>),
+    /// A certificate request: (tunnel, PEM).
+    CertRequest(Result<(String, String), String>),
 }
+
+/// A sign-in on the page: the tunnel, what its gateway asks, and the
+/// person's choices so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignIn {
+    pub name: String,
+    pub ask: Ask,
+    /// For each choice field (by field index), the chosen one.
+    pub chosen: Vec<usize>,
+    /// Save the password in Arca for this gateway.
+    pub keep: bool,
+}
+
+impl SignIn {
+    pub fn secrets(&self) -> usize {
+        match &self.ask {
+            Ask::Form(f) => f.fields.iter().filter(|f| matches!(f.kind, FieldKind::Password | FieldKind::Code)).count(),
+            Ask::Sso { .. } => 0,
+        }
+    }
+
+    pub fn has_password(&self) -> bool {
+        matches!(&self.ask, Ask::Form(f) if f.fields.iter().any(|f| f.kind == FieldKind::Password))
+    }
+}
+
+/// The corporate form's fields, in order (after the WireGuard form's six).
+pub const AC_FIELDS: [&str; 4] = ["Name, like work", "Gateway, like vpn.example.com", "Your username (optional)", "Gateway certificate SHA-256 (only for a self-signed gateway)"];
+/// Where the corporate form's fields start in `vpn_fields`, and the
+/// sign-in's text fields after them.
+pub const AC_AT: usize = 6;
+pub const ANSWER_AT: usize = 10;
+pub const MAX_TEXTS: usize = 4;
 
 /// The new-tunnel form's fields, in order.
 pub const FIELDS: [&str; 6] = ["Name, like work", "Server, like 203.0.113.5:51820", "The server's public key", "Your address in the tunnel, like 10.7.0.2/32", "Networks it carries (0.0.0.0/0: everything)", "DNS servers in the tunnel (optional)"];
@@ -76,6 +128,23 @@ pub struct VpnPage {
     pub made: Option<Created>,
     /// The picker is up.
     pub picking: bool,
+    /// The corporate form is open.
+    pub creating_ac: bool,
+    /// The picker is for this tunnel's certificate.
+    pub pick_cert: Option<String>,
+    /// A certificate request to give the IT team: (tunnel, PEM).
+    pub csr: Option<(String, String)>,
+    pub signin: Option<SignIn>,
+    /// The tunnel whose prompt was asked for.
+    asking: Option<String>,
+    /// Arca's handle for what was typed in its field.
+    pub handle: Option<[u8; 16]>,
+    /// Sign in was pressed before the handle came: the text answers.
+    pub armed: Option<(std::time::Instant, Vec<String>)>,
+    /// Arca's field is on the page.
+    pub field_up: bool,
+    /// A new form: Arca's field starts empty.
+    pub reset_field: bool,
     wants: Vec<Want>,
 }
 
@@ -102,6 +171,39 @@ pub fn parse_create(f: &[String; 6]) -> Result<CreateWireGuard, String> {
     Ok(c)
 }
 
+/// A SHA-256 typed as hex, with or without colons.
+pub fn parse_pin(s: &str) -> Option<[u8; 32]> {
+    let h: String = s.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The corporate form as a request.
+pub fn parse_create_ac(f: &[String]) -> Result<CreateAnyConnect, String> {
+    let host = f[1].trim().trim_start_matches("https://").trim_end_matches('/').to_ascii_lowercase();
+    let pin = match f[3].trim() {
+        "" => None,
+        p => Some(parse_pin(p).ok_or("the certificate's SHA-256 is 64 hex digits")?),
+    };
+    let c = CreateAnyConnect {
+        name: f[0].trim().to_ascii_lowercase(),
+        host,
+        path: None,
+        user: Some(f[2].trim().to_string()).filter(|u| !u.is_empty()),
+        ca: Vec::new(),
+        pin,
+        personas: true,
+    };
+    c.check().map_err(|e| e.1)?;
+    Ok(c)
+}
+
 /// A tunnel name from a picked file's name: `Acme VPN.conf` is `acme-vpn`.
 pub fn name_from_file(file: &str) -> String {
     let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
@@ -123,6 +225,7 @@ pub fn describe(d: &Details) -> String {
     let p = &d.profile;
     let state = match p.tunnel.state {
         State::Up => "Connected",
+        State::SignIn => "Waiting for you to sign in",
         State::Connecting if p.block => "Connecting: its traffic waits",
         State::Connecting => "Connecting",
         State::Down => "Not connected",
@@ -137,6 +240,22 @@ pub fn describe(d: &Details) -> String {
 
 /// Its third line: the server, our address, our key's start.
 pub fn detail_line(d: &Details) -> String {
+    if let Some(c) = &d.corporate {
+        let mut v = vec![if c.port == 443 { format!("Gateway {}", c.host) } else { format!("Gateway {}:{}", c.host, c.port) }];
+        if !d.addrs.is_empty() {
+            v.push(format!("address {}", d.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")));
+        }
+        if let Some(u) = &c.user {
+            v.push(format!("as {u}"));
+        }
+        if c.certificate {
+            v.push("client certificate".into());
+        }
+        if c.pinned {
+            v.push("pinned certificate".into());
+        }
+        return v.join(" \u{b7} ");
+    }
     let addrs = d.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
     format!("Server {} \u{b7} address {addrs} \u{b7} key {}…", d.endpoint, &d.public[..8.min(d.public.len())])
 }
@@ -204,6 +323,128 @@ impl VpnPage {
         }
     }
 
+    pub fn create_ac(&mut self, fields: &[String]) {
+        match parse_create_ac(fields) {
+            Ok(c) => self.change(Want::CreateAc(c)),
+            Err(e) => self.note = Some((true, e)),
+        }
+    }
+
+    pub fn cert_request(&mut self, name: &str) {
+        self.change(Want::CertRequest(name.into()));
+    }
+
+    /// The picker, for `name`'s signed certificate.
+    pub fn pick_certificate(&mut self, name: &str) {
+        if !self.busy && !self.picking {
+            self.pick_cert = Some(name.into());
+            self.pick();
+        }
+    }
+
+    pub fn choose(&mut self, field: usize, choice: usize) {
+        if let Some(s) = self.signin.as_mut() {
+            if let Some(c) = s.chosen.get_mut(field) {
+                *c = choice;
+            }
+        }
+    }
+
+    pub fn toggle_keep(&mut self) {
+        if let Some(s) = self.signin.as_mut() {
+            s.keep = !s.keep;
+        }
+    }
+
+    /// Sign in pressed: the text fields' answers, in the form's order of
+    /// text fields; a password or code is Arca's handle.
+    pub fn sign_in(&mut self, texts: Vec<String>, now: std::time::Instant) {
+        let Some(s) = self.signin.clone() else { return };
+        let Ask::Form(f) = &s.ask else { return };
+        if self.busy {
+            return;
+        }
+        if s.secrets() > 1 {
+            self.note = Some((true, "This gateway asks two secrets at once, which Settings can't take yet".into()));
+            return;
+        }
+        let mut values = Vec::new();
+        let mut t = texts.iter();
+        for (i, fl) in f.fields.iter().enumerate() {
+            let v = match fl.kind {
+                FieldKind::Text => {
+                    let x = t.next().cloned().unwrap_or_default();
+                    if x.trim().is_empty() {
+                        self.note = Some((true, format!("{} needs an answer", fl.label.trim_end_matches(':'))));
+                        return;
+                    }
+                    Value::Text(x.trim().to_string())
+                }
+                FieldKind::Choice => match fl.choices.get(s.chosen.get(i).copied().unwrap_or(0)) {
+                    Some((v, _)) => Value::Text(v.clone()),
+                    None => {
+                        self.note = Some((true, "nothing to choose".into()));
+                        return;
+                    }
+                },
+                FieldKind::Password | FieldKind::Code => match self.handle {
+                    Some(h) => Value::Held(h),
+                    None => {
+                        self.armed = Some((now, texts));
+                        return;
+                    }
+                },
+            };
+            values.push(v);
+        }
+        self.handle = None;
+        self.armed = None;
+        self.signin = None;
+        self.asking = None;
+        self.reset_field = true;
+        self.change(Want::Answer(Answer { name: s.name.clone(), values: Some(values), keep: s.keep }));
+    }
+
+    pub fn cancel_signin(&mut self) {
+        if let Some(s) = self.signin.take() {
+            self.handle = None;
+            self.armed = None;
+            self.asking = None;
+            self.reset_field = true;
+            match s.ask {
+                Ask::Form(_) => self.change(Want::Answer(Answer { name: s.name, values: None, keep: false })),
+                Ask::Sso { .. } => self.change(Want::SsoDone(SsoDone { name: s.name, ok: false })),
+            }
+        }
+    }
+
+    /// Arca's field said something: a handle, or none (emptied).
+    pub fn field(&mut self, handle: Option<[u8; 16]>, now: std::time::Instant) {
+        self.handle = handle;
+        if handle.is_some() {
+            if let Some((_, texts)) = self.armed.take() {
+                self.sign_in(texts, now);
+            }
+        }
+    }
+
+    /// No handle came after a press on Sign in: the field was empty.
+    pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        match &self.armed {
+            Some((t, _)) if now.duration_since(*t) >= crate::network::ARMED_WAIT => {
+                self.armed = None;
+                self.note = Some((true, "Type the password or code in the field first".into()));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether Arca's field belongs on the page now.
+    pub fn wants_field(&self) -> bool {
+        self.signin.as_ref().is_some_and(|s| s.secrets() == 1)
+    }
+
     pub fn pick(&mut self) {
         if !self.busy && !self.picking {
             self.picking = true;
@@ -214,7 +455,59 @@ impl VpnPage {
 
     pub fn apply(&mut self, g: Got) {
         match g {
-            Got::Tunnels(r) => self.tunnels = Some(r),
+            Got::Tunnels(r) => {
+                // A gateway asking: show what it asks (once per step).
+                let asking = match &r {
+                    Ok(v) => v.iter().find(|d| d.profile.tunnel.state == State::SignIn).map(|d| d.profile.tunnel.name.clone()),
+                    Err(_) => None,
+                };
+                match asking {
+                    Some(n) if self.asking.as_deref() != Some(n.as_str()) && !self.busy => {
+                        self.asking = Some(n.clone());
+                        self.wants.push(Want::Prompt(n));
+                    }
+                    None if self.signin.is_some() && !self.busy => {
+                        self.signin = None;
+                        self.asking = None;
+                        self.armed = None;
+                        self.reset_field = true;
+                    }
+                    None => self.asking = None,
+                    _ => {}
+                }
+                self.tunnels = Some(r);
+            }
+            Got::Prompt(name, r) => match r {
+                Ok(Some(ask)) => {
+                    let chosen = match &ask {
+                        Ask::Form(f) => vec![0; f.fields.len()],
+                        Ask::Sso { .. } => Vec::new(),
+                    };
+                    if let Ask::Sso { login, .. } = &ask {
+                        eprintln!("curia: vpn: {name} signs in at {login}");
+                    }
+                    self.signin = Some(SignIn { name, ask, chosen, keep: false });
+                    self.handle = None;
+                    self.armed = None;
+                    self.reset_field = true;
+                }
+                Ok(None) => self.asking = None,
+                Err(e) => {
+                    self.asking = None;
+                    self.note = Some((true, e));
+                }
+            },
+            Got::CertRequest(r) => {
+                self.busy = false;
+                match r {
+                    Ok(c) => {
+                        self.note = Some((false, format!("A certificate request for {}: give it to your IT team", c.0)));
+                        self.csr = Some(c);
+                    }
+                    Err(e) => self.note = Some((true, e)),
+                }
+                self.refresh();
+            }
             Got::Personas(r) => self.personas = Some(r),
             Got::Done(r) => {
                 self.busy = false;
@@ -240,12 +533,20 @@ impl VpnPage {
             Got::Picked(r) => {
                 self.picking = false;
                 match r {
+                    Ok((_, pem)) if self.pick_cert.is_some() => {
+                        let name = self.pick_cert.take().unwrap_or_default();
+                        self.csr = None;
+                        self.change(Want::Certificate(Certificate { name, pem }));
+                    }
                     Ok((file, conf)) => {
                         let name = name_from_file(&file);
                         self.change(Want::Import(ImportWireGuard { name, conf }));
                     }
-                    Err(e) if e.is_empty() => {}
-                    Err(e) => self.note = Some((true, e)),
+                    Err(e) if e.is_empty() => self.pick_cert = None,
+                    Err(e) => {
+                        self.pick_cert = None;
+                        self.note = Some((true, e));
+                    }
                 }
             }
         }
@@ -361,9 +662,130 @@ pub fn work(w: Want, tx: Sender<Got>) {
                     None => format!("{who} goes direct"),
                 }));
             }
+            Want::CreateAc(ac) => {
+                let n = ac.name.clone();
+                let r = connect().and_then(|mut c| c.create_ac(&ac).map_err(|e| e.1));
+                match &r {
+                    Ok(_) => eprintln!("curia: vpn: created {n} (AnyConnect, {})", ac.host),
+                    Err(e) => eprintln!("curia: vpn: create {n} failed: {e}"),
+                }
+                let _ = tx.send(Got::Created(r.map(|name| Created { name, public: String::new(), ignored: vec![] })));
+            }
+            Want::Prompt(n) => {
+                let r = connect().and_then(|mut c| c.prompt(&n).map_err(|e| e.1));
+                if let Ok(Some(Ask::Form(f))) = &r {
+                    eprintln!("curia: vpn: {n} asks {} field(s): {}", f.fields.len(), f.fields.iter().map(|f| format!("{:?}", f.kind)).collect::<Vec<_>>().join(","));
+                }
+                let _ = tx.send(Got::Prompt(n, r));
+            }
+            Want::Answer(a) => {
+                let n = a.name.clone();
+                let what = if a.values.is_some() { format!("{n}: signing in") } else { format!("{n}: sign-in cancelled") };
+                say(connect().and_then(|mut c| c.answer(&a).map_err(fail(n))).map(|_| what))
+            }
+            Want::SsoDone(s) => {
+                let n = s.name.clone();
+                say(connect().and_then(|mut c| c.sso_done(&s).map_err(fail(n.clone()))).map(|_| format!("{n}: single sign-on ended")))
+            }
+            Want::CertRequest(n) => {
+                let r = connect().and_then(|mut c| c.cert_request(&CertRequest { name: n.clone(), cn: None }).map_err(|e| e.1));
+                match &r {
+                    Ok(_) => eprintln!("curia: vpn: certificate request for {n}"),
+                    Err(e) => eprintln!("curia: vpn: certificate request for {n} failed: {e}"),
+                }
+                let _ = tx.send(Got::CertRequest(r.map(|p| (n, p))));
+            }
+            Want::Certificate(c) => {
+                let n = c.name.clone();
+                say(connect().and_then(|mut cl| cl.certificate(&c).map_err(fail(format!("{n}'s certificate")))).map(|_| format!("{n}: certificate added")))
+            }
             Want::Pick => {}
         }
     });
+}
+
+/// A gateway's form (or its single sign-on), under the tunnel's card;
+/// returns the y below it.
+#[allow(clippy::too_many_arguments)]
+fn signin_panel(ctx: &mut Ctx, page: &Mutable<VpnPage>, fields: &[Mutable<TextEdit>; 14], vcred: &pergola::widgets::CredentialField, p: &VpnPage, si: &SignIn, pw: f32, y0: f32) -> f32 {
+    let t = ctx.theme;
+    let mut y = y0;
+    let f = match &si.ask {
+        Ask::Sso { login, .. } => {
+            let h = em(96.0);
+            rect(ctx, 0.0, y, pw, h, t.bg_surface(), 8.0);
+            text(ctx, em(16.0), y + em(22.0), &format!("{} signs in with your organization's account", si.name), type_size::MD, Weight::Medium, t.text_primary());
+            let host = login.split('/').nth(2).unwrap_or(login);
+            text(ctx, em(16.0), y + em(44.0), &format!("at {host}, in a sign-in window of its own"), type_size::SM, Weight::Regular, t.text_secondary());
+            let pg = page.clone();
+            button(ctx, em(16.0), y + em(56.0), "Cancel", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.cancel_signin()));
+            return y + h + em(8.0);
+        }
+        Ask::Form(f) => f,
+    };
+    let msg: Vec<&str> = f.message.lines().filter(|l| !l.trim().is_empty()).take(4).collect();
+    let banner: Vec<&str> = f.banner.lines().filter(|l| !l.trim().is_empty()).take(8).collect();
+    let fh: f32 = f.fields.iter().map(|x| if x.kind == FieldKind::Choice { em(48.0) } else { em(44.0) }).sum();
+    let h = em(36.0) + em(18.0) * (msg.len() + banner.len()) as f32 + if f.error.is_empty() { 0.0 } else { em(22.0) } + fh + em(52.0) + if si.has_password() { em(32.0) } else { 0.0 };
+    rect(ctx, 0.0, y, pw, h, t.bg_surface(), 8.0);
+    let title = if f.title.trim().is_empty() { format!("Sign in to {}", si.name) } else { format!("{}: {}", si.name, f.title.trim()) };
+    text(ctx, em(16.0), y + em(22.0), &title, type_size::MD, Weight::Medium, t.text_primary());
+    y += em(36.0);
+    for l in banner.iter().chain(msg.iter()) {
+        text(ctx, em(16.0), y + em(8.0), &l.chars().take(120).collect::<String>(), type_size::SM, Weight::Regular, t.text_secondary());
+        y += em(18.0);
+    }
+    if !f.error.is_empty() {
+        text(ctx, em(16.0), y + em(10.0), &f.error.chars().take(120).collect::<String>(), type_size::SM, Weight::Regular, t.danger_fg());
+        y += em(22.0);
+    }
+    let lx = em(16.0);
+    let fx = em(160.0);
+    let fw = (pw - fx - em(16.0)).clamp(em(160.0), em(320.0));
+    let mut ti = 0;
+    for (i, fl) in f.fields.iter().enumerate() {
+        let label = fl.label.trim().trim_end_matches(':');
+        text(ctx, lx, y + em(18.0), &label.chars().take(24).collect::<String>(), type_size::SM, Weight::Regular, t.text_secondary());
+        match fl.kind {
+            FieldKind::Text => {
+                if ti < MAX_TEXTS {
+                    pergola::widgets::TextField::new(fields[ANSWER_AT + ti].clone()).at(fx, y + em(2.0)).width(fw).render(ctx);
+                }
+                ti += 1;
+                y += em(44.0);
+            }
+            FieldKind::Password | FieldKind::Code => {
+                vcred.clone().at(fx, y + em(2.0)).size(fw, em(32.0)).render(ctx);
+                if !p.field_up {
+                    text(ctx, fx + fw + em(12.0), y + em(18.0), "Arca's field is not here yet", type_size::XS, Weight::Regular, t.text_tertiary());
+                }
+                y += em(44.0);
+            }
+            FieldKind::Choice => {
+                let mut bx = fx;
+                for (c, (_, cl)) in fl.choices.iter().enumerate().take(6) {
+                    let on = si.chosen.get(i).copied() == Some(c);
+                    let pg = page.clone();
+                    bx += button(ctx, bx, y + em(2.0), &format!("{}{}", cl, if on { " \u{2713}" } else { "" }), if on { Look::Primary } else { Look::Secondary }, !p.busy, move || with_vpn(&pg, |a| a.choose(i, c))) + em(8.0);
+                }
+                y += em(48.0);
+            }
+        }
+    }
+    if si.has_password() {
+        let pg = page.clone();
+        button(ctx, fx, y, if si.keep { "Save the password in Arca: yes" } else { "Save the password in Arca: no" }, Look::Ghost, !p.busy, move || with_vpn(&pg, |a| a.toggle_keep()));
+        y += em(32.0);
+    }
+    let ready = !p.busy && p.armed.is_none();
+    let (pg, fs, n) = (page.clone(), fields.clone(), f.fields.iter().filter(|x| x.kind == FieldKind::Text).count().min(MAX_TEXTS));
+    let w = button(ctx, fx, y + em(8.0), if p.armed.is_some() { "Signing in…" } else { "Sign in" }, Look::Primary, ready, move || {
+        let texts: Vec<String> = (0..n).map(|k| fs[ANSWER_AT + k].get_cloned().text().to_string()).collect();
+        with_vpn(&pg, |a| a.sign_in(texts, std::time::Instant::now()));
+    });
+    let pg = page.clone();
+    button(ctx, fx + w + em(8.0), y + em(8.0), "Cancel", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.cancel_signin()));
+    y0 + h + em(8.0)
 }
 
 pub fn with_vpn(page: &Mutable<VpnPage>, f: impl FnOnce(&mut VpnPage)) {
@@ -386,7 +808,8 @@ impl CuriaView {
         let top = y + em(48.0);
         let page = self.vpn.clone();
         let picking = p.picking;
-        let fields: [Mutable<TextEdit>; 6] = self.vpn_fields.clone();
+        let fields: [Mutable<TextEdit>; 14] = self.vpn_fields.clone();
+        let vcred = self.vpn_cred.clone();
         let content = pergola::view::Draw(move |ctx: &mut Ctx| {
             let t = ctx.theme;
             let g = ctx.push(Node::stack(pergola::geom::Axis::Vertical, Rect::new(0.0, 0.0, pw, 0.0), 0.0));
@@ -439,15 +862,39 @@ impl CuriaView {
                 Some(Ok((n, _))) => n.clone(),
                 _ => Vec::new(),
             };
+            if let Some((n, pem)) = &p.csr {
+                let lines: Vec<&str> = pem.lines().collect();
+                let mh = em(64.0) + em(13.0) * lines.len() as f32 + em(44.0);
+                rect(ctx, 0.0, y, pw, mh, t.bg_surface(), 8.0);
+                text(ctx, em(16.0), y + em(22.0), &format!("{n}: give your IT team this certificate request, then import what they sign."), type_size::SM, Weight::Regular, t.text_secondary());
+                text(ctx, em(16.0), y + em(42.0), "The key is in Arca and never leaves it.", type_size::XS, Weight::Regular, t.text_tertiary());
+                for (i, l) in lines.iter().enumerate() {
+                    text(ctx, em(16.0), y + em(64.0) + em(13.0) * i as f32, l, type_size::XS, Weight::Regular, t.text_primary());
+                }
+                let by = y + mh - em(40.0);
+                let pem2 = pem.clone();
+                let mut bx = em(16.0);
+                bx += button(ctx, bx, by, "Copy the request", Look::Secondary, true, move || {
+                    let _ = pergola::clipboard::copy_text(&pem2, false);
+                });
+                let (pg, n2) = (page.clone(), n.clone());
+                bx += em(8.0);
+                bx += button(ctx, bx, by, "Import the signed certificate…", Look::Primary, !p.busy && !p.picking, move || with_vpn(&pg, |a| a.pick_certificate(&n2)));
+                let pg = page.clone();
+                button(ctx, bx + em(8.0), by, "Later", Look::Ghost, true, move || with_vpn(&pg, |a| a.csr = None));
+                y += mh + em(12.0);
+            }
             for d in &list {
                 let name = d.profile.tunnel.name.clone();
                 let chosen = d.profile.tunnel.scope == Scope::Personas;
-                let rh = em(if chosen { 156.0 } else { 116.0 });
+                let corporate = d.profile.tunnel.kind == Kind::AnyConnect;
+                let err_h = if d.error.is_some() && d.profile.tunnel.state == State::Down { em(20.0) } else { 0.0 };
+                let rh = em(if chosen { 156.0 } else { 116.0 }) + if corporate { em(40.0) } else { 0.0 } + err_h;
                 rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);
                 let up = d.profile.tunnel.state != State::Down;
                 let colour = match d.profile.tunnel.state {
                     State::Up => t.success_fg(),
-                    State::Connecting => t.warning_fg(),
+                    State::Connecting | State::SignIn => t.warning_fg(),
                     State::Down => t.text_tertiary(),
                 };
                 icon(ctx, em(16.0), y + em(14.0), ph::LOCK_SIMPLE, em(20.0), colour);
@@ -469,8 +916,16 @@ impl CuriaView {
                 let confirm = p.confirm_remove.as_deref() == Some(name.as_str());
                 let (n2, rx) = (name.clone(), bx + em(8.0));
                 button(ctx, rx, by, if confirm { "Remove" } else { "Remove…" }, if confirm { Look::Danger } else { Look::Secondary }, enabled, move || with_vpn(&pg, |a| a.remove(&n2)));
+                let mut ey = y + em(116.0);
+                if corporate {
+                    let cert = d.corporate.as_ref().is_some_and(|c| c.certificate);
+                    let (pg, n) = (page.clone(), name.clone());
+                    let w = button(ctx, em(16.0), ey, if cert { "New client certificate…" } else { "Client certificate…" }, Look::Secondary, enabled, move || with_vpn(&pg, |a| a.cert_request(&n)));
+                    text(ctx, em(28.0) + w, ey + em(15.0), if cert { "Signs in with its certificate (key in Arca)" } else { "For gateways that ask for one" }, type_size::XS, Weight::Regular, t.text_tertiary());
+                    ey += em(40.0);
+                }
                 if chosen {
-                    let py = y + em(116.0);
+                    let py = ey;
                     text(ctx, em(16.0), py + em(14.0), "Personas:", type_size::SM, Weight::Regular, t.text_secondary());
                     let mut px = em(96.0);
                     if named.is_empty() {
@@ -486,8 +941,29 @@ impl CuriaView {
                         });
                         px += w + em(8.0);
                     }
+                    ey += em(40.0);
+                }
+                if err_h > 0.0 {
+                    if let Some(e) = &d.error {
+                        text(ctx, em(16.0), ey + em(8.0), &format!("Stopped: {}", e.chars().take(140).collect::<String>()), type_size::SM, Weight::Regular, t.danger_fg());
+                    }
                 }
                 y += rh + em(8.0);
+                // What the gateway said once signed in (vpn.md §9.4).
+                if let (Some(b), State::Up) = (&d.banner, d.profile.tunnel.state) {
+                    let lines: Vec<String> = b.lines().filter(|l| !l.trim().is_empty()).take(8).map(|l| l.chars().take(120).collect()).collect();
+                    let bh = em(28.0) + em(16.0) * lines.len() as f32;
+                    rect(ctx, 0.0, y, pw, bh, t.bg_surface(), 8.0);
+                    text(ctx, em(16.0), y + em(16.0), &format!("{name}'s gateway says:"), type_size::XS, Weight::Regular, t.text_tertiary());
+                    for (i, l) in lines.iter().enumerate() {
+                        text(ctx, em(16.0), y + em(34.0) + em(16.0) * i as f32, l, type_size::SM, Weight::Regular, t.text_secondary());
+                    }
+                    y += bh + em(8.0);
+                }
+                // What its gateway asks, here under its card.
+                if let Some(si) = p.signin.as_ref().filter(|s| s.name == name) {
+                    y = signin_panel(ctx, &page, &fields, &vcred, &p, si, pw, y);
+                }
             }
 
             // A new tunnel: a file, or a key made here.
@@ -497,8 +973,25 @@ impl CuriaView {
             let pg = page.clone();
             let w = button(ctx, 0.0, y, if p.picking { "Choosing a file…" } else { "Import a WireGuard file…" }, Look::Secondary, !p.busy && !p.picking, move || with_vpn(&pg, |a| a.pick()));
             let pg = page.clone();
-            button(ctx, w + em(12.0), y, "Make a new key…", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.creating = !a.creating));
+            let w2 = button(ctx, w + em(12.0), y, "Make a new key…", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.creating = !a.creating));
+            let pg = page.clone();
+            button(ctx, w + w2 + em(24.0), y, "Add a corporate VPN…", Look::Secondary, !p.busy, move || with_vpn(&pg, |a| a.creating_ac = !a.creating_ac));
             y += em(44.0);
+            if p.creating_ac {
+                text(ctx, 0.0, y + em(10.0), "A Cisco AnyConnect (or compatible) gateway. It signs you in when you connect.", type_size::SM, Weight::Regular, t.text_secondary());
+                y += em(28.0);
+                for (i, f) in fields[AC_AT..AC_AT + 4].iter().enumerate() {
+                    pergola::widgets::TextField::new(f.clone()).placeholder(AC_FIELDS[i]).at(0.0, y).width(em(420.0)).render(ctx);
+                    y += em(40.0);
+                }
+                let (pg, fs) = (page.clone(), fields.clone());
+                button(ctx, 0.0, y, "Add corporate VPN", Look::Primary, !p.busy, move || {
+                    let v: Vec<String> = (AC_AT..AC_AT + 4).map(|i| fs[i].get_cloned().text().to_string()).collect();
+                    with_vpn(&pg, |a| a.create_ac(&v));
+                });
+                text(ctx, em(150.0), y + em(15.0), "For your work personas; change it on its card.", type_size::XS, Weight::Regular, t.text_tertiary());
+                y += em(44.0);
+            }
             if p.creating {
                 for (i, f) in fields.iter().enumerate() {
                     pergola::widgets::TextField::new(f.clone()).placeholder(FIELDS[i]).at(0.0, y).width(em(420.0)).render(ctx);
@@ -548,6 +1041,9 @@ mod tests {
             rx: 0,
             tx: 0,
             starts: 0,
+            corporate: None,
+            error: None,
+            banner: None,
         }
     }
 
@@ -609,6 +1105,91 @@ mod tests {
         p.take_wants();
         p.apply(Got::Picked(Err(String::new())));
         assert!(!p.picking && p.note.is_none(), "a cancel says nothing");
+    }
+
+    fn corp(state: State) -> Details {
+        let mut d = details("corp", state, Scope::Personas);
+        d.profile.tunnel.kind = Kind::AnyConnect;
+        d.corporate = Some(crypta_ctl::Corporate { host: "vpn.example.com".into(), port: 443, user: Some("alice".into()), group: None, certificate: true, pinned: false });
+        d
+    }
+
+    fn form() -> Ask {
+        use crypta_ctl::{Field, Form};
+        let f = |label: &str, kind, choices: Vec<(String, String)>| Field { label: label.into(), kind, choices };
+        Ask::Form(Form {
+            title: "Login".into(),
+            message: String::new(),
+            error: String::new(),
+            banner: String::new(),
+            fields: vec![
+                f("Username:", FieldKind::Text, vec![]),
+                f("GROUP:", FieldKind::Choice, vec![("Staff".into(), "Staff".into()), ("Eng".into(), "Engineering".into())]),
+                f("Password:", FieldKind::Password, vec![]),
+            ],
+        })
+    }
+
+    #[test]
+    fn a_corporate_vpn_is_added_and_signs_in_through_arca() {
+        let f: Vec<String> = vec!["Work".into(), "https://VPN.example.com/".into(), "alice".into(), String::new()];
+        let c = parse_create_ac(&f).unwrap();
+        assert_eq!((c.name.as_str(), c.host.as_str(), c.user.as_deref(), c.personas), ("work", "vpn.example.com", Some("alice"), true));
+        let mut bad = f.clone();
+        bad[3] = "12:34".into();
+        assert!(parse_create_ac(&bad).unwrap_err().contains("SHA-256"));
+        assert!(parse_pin(&"ab:".repeat(32)[..95]).is_some());
+
+        let mut p = VpnPage::default();
+        p.apply(Got::Tunnels(Ok(vec![corp(State::SignIn)])));
+        assert_eq!(p.take_wants(), vec![Want::Prompt("corp".into())]);
+        p.apply(Got::Tunnels(Ok(vec![corp(State::SignIn)])));
+        assert!(p.take_wants().is_empty(), "asked once per step");
+        p.apply(Got::Prompt("corp".into(), Ok(Some(form()))));
+        assert!(p.wants_field() && p.reset_field);
+        p.choose(1, 1);
+        p.toggle_keep();
+        // Pressed before Arca's handle came: it waits for it.
+        let now = std::time::Instant::now();
+        p.sign_in(vec!["alice".into()], now);
+        assert!(p.armed.is_some() && p.take_wants().is_empty());
+        p.field(Some([7; 16]), now);
+        assert_eq!(p.take_wants(), vec![Want::Answer(Answer { name: "corp".into(), values: Some(vec![Value::Text("alice".into()), Value::Text("Eng".into()), Value::Held([7; 16])]), keep: true })]);
+        assert!(p.signin.is_none() && p.handle.is_none());
+        p.apply(Got::Done(Ok("corp: signing in".into())));
+        p.take_wants();
+        // The next step (a code), then nothing typed: it says so.
+        p.apply(Got::Tunnels(Ok(vec![corp(State::SignIn)])));
+        assert_eq!(p.take_wants(), vec![Want::Prompt("corp".into())]);
+        p.apply(Got::Prompt("corp".into(), Ok(Some(form()))));
+        p.sign_in(vec!["".into()], now);
+        assert!(p.note.as_ref().unwrap().1.contains("Username"));
+        p.sign_in(vec!["alice".into()], now);
+        assert!(p.tick(now + crate::network::ARMED_WAIT));
+        assert!(p.note.as_ref().unwrap().1.contains("field first"));
+        p.cancel_signin();
+        assert_eq!(p.take_wants(), vec![Want::Answer(Answer { name: "corp".into(), values: None, keep: false })]);
+        // Signed in: the form goes.
+        p.apply(Got::Done(Ok(String::new())));
+        p.apply(Got::Tunnels(Ok(vec![corp(State::Up)])));
+        assert!(p.signin.is_none());
+        assert_eq!(describe(&corp(State::SignIn)).split(" \u{b7} ").next(), Some("Waiting for you to sign in"));
+        assert_eq!(detail_line(&corp(State::Up)), "Gateway vpn.example.com \u{b7} address 10.7.0.2/32 \u{b7} as alice \u{b7} client certificate");
+    }
+
+    #[test]
+    fn a_certificate_request_then_its_certificate() {
+        let mut p = VpnPage::default();
+        p.cert_request("corp");
+        assert_eq!(p.take_wants(), vec![Want::CertRequest("corp".into())]);
+        p.apply(Got::CertRequest(Ok(("corp".into(), "-----BEGIN CERTIFICATE REQUEST-----".into()))));
+        assert!(p.csr.is_some());
+        p.take_wants();
+        p.pick_certificate("corp");
+        assert_eq!(p.take_wants(), vec![Want::Pick]);
+        p.apply(Got::Picked(Ok(("corp.pem".into(), b"-----BEGIN CERTIFICATE-----".to_vec()))));
+        assert_eq!(p.take_wants(), vec![Want::Certificate(Certificate { name: "corp".into(), pem: b"-----BEGIN CERTIFICATE-----".to_vec() })]);
+        assert!(p.pick_cert.is_none() && p.csr.is_none());
     }
 
     #[test]

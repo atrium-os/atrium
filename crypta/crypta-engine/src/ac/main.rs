@@ -75,6 +75,8 @@ struct Ctl {
     s: UnixStream,
     rd: engine::Reader,
     pending: Vec<ToEngine>,
+    /// cryptad said Stop (the person disconnected), not just went away.
+    stopped: bool,
 }
 
 impl Ctl {
@@ -96,7 +98,10 @@ impl Ctl {
                 self.rd.push(&b[..n]);
                 loop {
                     match self.rd.next::<ToEngine>() {
-                        Ok(Some(ToEngine::Stop)) => return Err(Stop::Told),
+                        Ok(Some(ToEngine::Stop)) => {
+                            self.stopped = true;
+                            return Err(Stop::Told);
+                        }
                         Ok(Some(m)) => self.pending.push(m),
                         Ok(None) => return Ok(()),
                         Err(_) => return Err(Stop::Told),
@@ -481,6 +486,11 @@ impl Engine {
             unsafe { libc::poll(fds.as_mut_ptr(), 3, 500) };
             if fds[0].revents != 0 {
                 if let Err(s) = self.ctl.fill(0) {
+                    if self.ctl.stopped {
+                        // Disconnected by the person: the gateway ends the
+                        // session too (reason 0xb0, the user asked).
+                        let _ = t.send(&cstp::frame(cstp::DISCONNECT, &[0xb0]));
+                    }
                     return s;
                 }
                 if let Some(i) = self.ctl.pending.iter().position(|m| matches!(m, ToEngine::Rebind)) {
@@ -694,7 +704,7 @@ fn main() {
     if let Err(e) = sandbox() {
         return log(&format!("capability mode: {e}"));
     }
-    let mut ctl = Ctl { s: ctl_sock, rd: engine::Reader::default(), pending: Vec::new() };
+    let mut ctl = Ctl { s: ctl_sock, rd: engine::Reader::default(), pending: Vec::new(), stopped: false };
     let client: Option<Arc<dyn rustls::client::ResolvesClientCert>> = if st.cert_chain.is_empty() {
         None
     } else {

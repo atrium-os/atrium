@@ -127,6 +127,83 @@ impl Backend for Fake {
         self.did(format!("remove {name}"));
         Ok(())
     }
+    fn create_ac(&self, c: CreateAnyConnect) -> Res<String> {
+        self.did(format!("create-ac {} {} {}", c.name, c.host, c.ca.len()));
+        Ok(c.name)
+    }
+    fn prompt(&self, name: String) -> Res<Option<Ask>> {
+        Ok(lines::ask(&ask_lines()).filter(|_| name == "corp"))
+    }
+    fn answer(&self, a: Answer) -> Res<()> {
+        self.did(lines::answer(&a).encode().map(|b| String::from_utf8(b).unwrap().trim_end().to_string()).unwrap());
+        Ok(())
+    }
+    fn sso_done(&self, s: SsoDone) -> Res<()> {
+        self.did(format!("sso-done {} {}", s.name, s.ok));
+        Ok(())
+    }
+    fn cert_request(&self, c: CertRequest) -> Res<String> {
+        self.did(format!("csr {} {:?}", c.name, c.cn));
+        Ok("-----BEGIN CERTIFICATE REQUEST-----".into())
+    }
+    fn certificate(&self, c: Certificate) -> Res<()> {
+        self.did(format!("certificate {} {}", c.name, c.pem.len()));
+        Ok(())
+    }
+}
+
+fn hx(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn ask_lines() -> Vec<Line> {
+    [
+        format!("text k=title v={}", hx("Sign in")),
+        format!("text k=error v={}", hx("Login failed.")),
+        format!("field i=0 kind=0 name={} label={}", hx("username"), hx("Username:")),
+        format!("field i=1 kind=3 name={} label={}", hx("group_list"), hx("GROUP:")),
+        format!("choice i=1 value={} label={}", hx("Staff"), hx("Staff")),
+        format!("choice i=1 value={} label={}", hx("Eng"), hx("Engineering")),
+        format!("field i=2 kind=1 name={} label={}", hx("password"), hx("Password:")),
+    ]
+    .iter()
+    .map(|s| Line::parse(s).unwrap())
+    .collect()
+}
+
+/// A corporate tunnel's lines: its kind, its sign-in state, its settings,
+/// what its gateway asks and the answer cryptad gets.
+#[test]
+fn anyconnect_lines() {
+    let l = Line::parse(&format!("tunnel name=corp up=1 iface=tun0 engine=1 handshake=0 starts=1 signin=prompt kind=ac host=gw.example.com port=8443 block=0 scoped=1 cert=1 pinned=0 user={}", hx("alice"))).unwrap();
+    let p = lines::profile(&l).unwrap();
+    assert_eq!((p.tunnel.kind, p.tunnel.state), (Kind::AnyConnect, State::SignIn));
+    let d = lines::details(&l).unwrap();
+    let c = d.corporate.unwrap();
+    assert_eq!((c.host.as_str(), c.port, c.user.as_deref(), c.certificate), ("gw.example.com", 8443, Some("alice"), true));
+    let up = Line::parse("tunnel name=corp up=1 handshake=1 signin=in kind=ac host=gw.example.com port=443 addr=10.98.0.50/24 routes=2").unwrap();
+    assert_eq!(lines::profile(&up).unwrap().tunnel.state, State::Up);
+    assert_eq!(lines::details(&up).unwrap().addrs, vec![Net::parse("10.98.0.50/24").unwrap()]);
+    let failed = Line::parse(&format!("tunnel name=corp up=0 kind=ac host=h port=443 error={}", hx("the gateway refused"))).unwrap();
+    assert_eq!(lines::details(&failed).unwrap().error.as_deref(), Some("the gateway refused"));
+
+    let Some(Ask::Form(f)) = lines::ask(&ask_lines()) else { panic!() };
+    assert_eq!((f.title.as_str(), f.error.as_str(), f.fields.len()), ("Sign in", "Login failed.", 3));
+    assert_eq!(f.fields[1].choices, vec![("Staff".into(), "Staff".into()), ("Eng".into(), "Engineering".into())]);
+    assert_eq!(f.fields[2].kind, FieldKind::Password);
+    let sso = Line::parse(&format!("sso login={} final={} cookie={}", hx("https://idp/x"), hx("https://gw/done"), hx("acSamlv2Token"))).unwrap();
+    assert_eq!(lines::ask(&[sso]), Some(Ask::Sso { login: "https://idp/x".into(), final_url: "https://gw/done".into() }));
+
+    let a = Answer { name: "corp".into(), values: Some(vec![Value::Text("alice".into()), Value::Text("Staff".into()), Value::Held([0xab; 16])]), keep: true };
+    assert_eq!(String::from_utf8(lines::answer(&a).encode().unwrap()).unwrap(), format!("answer name=corp t0={} t1={} h2={} keep=1\n", hx("alice"), hx("Staff"), "ab".repeat(16)));
+    assert_eq!(lines::answer(&Answer { name: "corp".into(), values: None, keep: false }).get("cancel"), Some("1"));
+    let c = CreateAnyConnect { name: "corp".into(), host: "gw.example.com:8443".into(), path: None, user: Some("alice".into()), ca: vec![], pin: None, personas: true };
+    c.check().unwrap();
+    assert_eq!(String::from_utf8(lines::create_ac(&c).encode().unwrap()).unwrap(), format!("create-ac name=corp host=gw.example.com:8443 scoped=1 user={}\n", hx("alice")));
+    for bad in ["", "gw example.com", "gw.example.com:0", "-gw.example.com", "gw.example.com:x"] {
+        assert!(CreateAnyConnect { host: bad.into(), ..c.clone() }.check().is_err(), "{bad}");
+    }
+    assert!(CreateAnyConnect { path: Some("staff".into()), ..c.clone() }.check().is_err());
 }
 
 fn serve_all(dir: &Path, b: Arc<Fake>) {
@@ -193,8 +270,31 @@ fn over_sockets() {
     conf.remove("home").unwrap();
     conf.connect_tunnel("acme").unwrap();
 
+    // Corporate VPNs: only with vpn-configure.
+    let ac = CreateAnyConnect { name: "corp".into(), host: "gw.example.com".into(), path: None, user: None, ca: b"-----BEGIN CERTIFICATE-----".to_vec(), pin: None, personas: true };
+    assert_eq!(using.create_ac(&ac).unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.prompt("corp").unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(using.answer(&Answer { name: "corp".into(), values: None, keep: false }).unwrap_err().0, status::NOT_ALLOWED);
+    assert_eq!(conf.create_ac(&ac).unwrap(), "corp");
+    assert_eq!(conf.create_ac(&CreateAnyConnect { host: "not a host".into(), ..ac.clone() }).unwrap_err().0, status::MALFORMED);
+    let Some(Ask::Form(f)) = conf.prompt("corp").unwrap() else { panic!("no form") };
+    assert_eq!(f.fields.len(), 3);
+    assert_eq!(conf.prompt("home").unwrap(), None);
+    conf.answer(&Answer { name: "corp".into(), values: Some(vec![Value::Text("alice".into()), Value::Text("Staff".into()), Value::Held([1; 16])]), keep: false }).unwrap();
+    conf.sso_done(&SsoDone { name: "corp".into(), ok: true }).unwrap();
+    assert!(conf.cert_request(&CertRequest { name: "corp".into(), cn: Some("alice".into()) }).unwrap().starts_with("-----BEGIN"));
+    conf.certificate(&Certificate { name: "corp".into(), pem: vec![b'x'; 10] }).unwrap();
+    assert_eq!(conf.certificate(&Certificate { name: "corp".into(), pem: vec![] }).unwrap_err().0, status::MALFORMED);
+
     let did = fake.did.lock().unwrap().clone();
-    assert_eq!(did, ["up home", "down acme", "create acme", "import work 100", "set acme Some(false) Some(true)", "remove home", "up acme"]);
+    assert_eq!(did[..7], ["up home", "down acme", "create acme", "import work 100", "set acme Some(false) Some(true)", "remove home", "up acme"]);
+    assert_eq!(did[7..], [
+        "create-ac corp gw.example.com 27".to_string(),
+        format!("answer name=corp t0={} t1={} h2={}", hx("alice"), hx("Staff"), "01".repeat(16)),
+        "sso-done corp true".into(),
+        "csr corp Some(\"alice\")".into(),
+        "certificate corp 10".into(),
+    ]);
 
     let mut ch = c(Grant::Read).subscribe().unwrap();
     assert_eq!(ch.next().unwrap()[0].state, State::Up);
