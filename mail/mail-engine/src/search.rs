@@ -203,6 +203,8 @@ pub struct Hit {
     pub subject: String,
     pub preview: String,
     pub unread: bool,
+    /// Attachment names and decoded sizes for `has:attachment` results.
+    pub files: Vec<(String, u64)>,
 }
 
 impl Engine {
@@ -213,7 +215,7 @@ impl Engine {
         let flags: Vec<u32> = at.filter_map(|(f, u)| self.store.at(*f, *u).ok().flatten().map(|(_, fl)| fl)).collect();
         let unread = !flags.is_empty() && flags.iter().all(|f| f & flag::SEEN == 0);
         let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
-        Some(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), unread })
+        Some(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview: m.summary.preview.clone(), unread, files: Vec::new() })
     }
 
     /// Run `q` (as [`parse`]d) over every account's mail; newest first, at
@@ -265,9 +267,11 @@ impl Engine {
             let ok = ok && quick.as_mut().is_none_or(|qk| qk.passes(id, None, unread, flags.iter().any(|f| f & flag::FLAGGED != 0)));
             if ok {
                 let from = m.summary.from.first().map(|a| if a.name.is_empty() { a.addr.clone() } else { a.name.clone() }).unwrap_or_default();
-                // Looking for files: each row says which (the Files view, §8.1).
-                let preview = if files { crate::files::files_line(&m.summary) } else { m.summary.preview.clone() };
-                hits.push(Hit { msg: id, date: m.date, from, subject: m.summary.subject.clone(), preview, unread });
+                let attachments = if files { crate::files::files_of(&m.summary) } else { Vec::new() };
+                hits.push(Hit {
+                    msg: id, date: m.date, from, subject: m.summary.subject.clone(),
+                    preview: m.summary.preview.clone(), unread, files: attachments,
+                });
             }
         }
         hits.sort_by(|a, b| b.date.cmp(&a.date).then(b.msg.cmp(&a.msg)));

@@ -50,6 +50,20 @@ pub fn search_h() -> f32 { em(44.0) }
 pub fn list_w() -> f32 { em(400.0) }
 /// A list row: sender and time, subject, preview.
 pub fn row_h() -> f32 { em(72.0) }
+
+fn file_tile_h() -> f32 { em(108.0) }
+
+fn list_width(w: f32) -> f32 {
+    match layout_for(w) {
+        Layout::Wide => list_w().min(w * 0.36),
+        Layout::Medium => list_w().min((w - rail_w()) * 0.45),
+        Layout::Narrow => w,
+    }
+}
+
+fn file_columns(w: f32) -> usize {
+    ((w - em(12.0)) / em(124.0)).floor().max(1.0) as usize
+}
 pub fn place_h() -> f32 { em(30.0) }
 pub fn head_h() -> f32 { em(48.0) }
 /// About 80 characters (§15.4): the reader's text is no wider.
@@ -341,7 +355,7 @@ pub enum Lane {
     Newsletters,
     NewSenders,
     ScreenedOut,
-    /// Every message with files, each row its files (§8.1).
+    /// Every attachment across mail (§8.1).
     Files,
 }
 
@@ -1682,9 +1696,8 @@ impl Mail {
 
     /// The files in `hits` and their total size.
     fn files_total(&self, hits: &[mail_engine::search::Hit]) -> (usize, u64) {
-        hits.iter().filter_map(|h| self.engine.store.message(h.msg).ok()).fold((0, 0), |(n, z), m| {
-            let f = mail_engine::files::files_of(&m.summary);
-            (n + f.len(), z + f.iter().map(|x| x.1).sum::<u64>())
+        hits.iter().flat_map(|h| &h.files).fold((0, 0), |(n, z), (_, size)| {
+            (n + 1, z.saturating_add(*size))
         })
     }
 
@@ -2765,8 +2778,16 @@ impl Mail {
         }
         if ui.cursor != Some(next) {
             self.open(next);
-            let shown = self.size.get().1 - head_h() - self.chips_h.get();
-            VirtualList::reveal(&self.list, next, ui.count, row_h(), shown);
+            let (w, h) = self.size.get();
+            let shown = h - head_h() - self.chips_h.get();
+            if let Some(search) = ui.search.as_ref().filter(|s| s.hits.get(next).is_some_and(|hit| !hit.files.is_empty())) {
+                let cols = file_columns(list_width(w));
+                let first: usize = search.hits[..next].iter().map(|hit| hit.files.len()).sum();
+                let count: usize = search.hits.iter().map(|hit| hit.files.len()).sum();
+                VirtualList::reveal(&self.list, first / cols, count.div_ceil(cols), file_tile_h(), shown);
+            } else {
+                VirtualList::reveal(&self.list, next, ui.count, row_h(), shown);
+            }
         }
         true
     }
@@ -3322,7 +3343,7 @@ impl View for MailView {
                 // The places and the list keep their widths; the reader
                 // takes the rest.
                 let side = side_w().min(w * 0.22);
-                let list = list_w().min(w * 0.36);
+                let list = list_width(w);
                 self.places(ctx, &ui, side, h);
                 self.list(ctx, &ui, side, list, h, false);
                 self.toast(ctx, &ui, side, list, h);
@@ -3330,7 +3351,7 @@ impl View for MailView {
             }
             Layout::Medium => {
                 let rail = rail_w();
-                let list = list_w().min((w - rail) * 0.45);
+                let list = list_width(w);
                 self.rail(ctx, &ui, rail, h);
                 self.list(ctx, &ui, rail, list, h, false);
                 self.toast(ctx, &ui, rail, list, h);
@@ -3768,6 +3789,10 @@ impl MailView {
             }
             return;
         }
+        if let Some(search) = ui.search.as_ref().filter(|s| s.hits.iter().any(|hit| !hit.files.is_empty())) {
+            self.file_grid(ctx, search, ui.cursor, Rect::new(x0, top, w - 1.0, h - top));
+            return;
+        }
         let m = self.mail.clone();
         let cursor = ui.cursor;
         let now = (self.mail.now)();
@@ -3825,6 +3850,41 @@ impl MailView {
         })
         .key(100)
         .backdrop(t.bg_canvas())
+        .emit(ctx);
+    }
+
+    /// One tile per attachment. Opening a tile selects its source message,
+    /// where the attachment strip applies the existing Open and Quick look rules.
+    fn file_grid(&self, ctx: &mut Ctx, search: &Search, cursor: Option<usize>, bounds: Rect) {
+        let tiles: Vec<_> = search.hits.iter().enumerate().flat_map(|(i, hit)| {
+            hit.files.iter().map(move |(name, size)| (i, name.clone(), *size))
+        }).collect();
+        let cols = file_columns(bounds.w() + 1.0);
+        let gap = em(6.0);
+        let tile_w = (bounds.w() - gap) / cols as f32;
+        let mail = self.mail.clone();
+        let background = ctx.theme.bg_canvas();
+        VirtualList::new(mail.list.clone(), bounds, tiles.len().div_ceil(cols), file_tile_h(), move |r, ctx| {
+            let t = ctx.theme;
+            row(ctx, bounds.w(), file_tile_h());
+            for (col, (i, name, size)) in tiles.iter().skip(r * cols).take(cols).enumerate() {
+                let i = *i;
+                let x = gap + col as f32 * tile_w;
+                let mail = mail.clone();
+                let fill = if cursor == Some(i) { t.selection_bg() } else { t.bg_window() };
+                area(ctx, Rect::new(x, gap, tile_w - gap, file_tile_h() - gap), fill, move || mail.open(i));
+                pergola::widgets::Glyph::new(crate::files::ph::FILE)
+                    .size(30.0).color(t.text_secondary()).at(x + em(10.0), em(21.0)).emit(ctx);
+                let label = fit(name, type_size::SM, Weight::Medium, tile_w - gap - em(20.0));
+                text(ctx, x + em(10.0), em(64.0), &label, type_size::SM, Weight::Medium, t.text_primary());
+                let size = mail_engine::files::size_words(*size);
+                text(ctx, x + em(10.0), em(86.0), &size, type_size::XS, Weight::Regular, t.text_secondary());
+                ctx.pop();
+            }
+            ctx.pop();
+        })
+        .key(100)
+        .backdrop(background)
         .emit(ctx);
     }
 

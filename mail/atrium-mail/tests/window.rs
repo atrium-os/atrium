@@ -1540,20 +1540,34 @@ fn files_across_mail() {
     let t = texts(&app);
     assert!(t.iter().any(|x| x == "plan.pdf") && !t.iter().any(|x| x == "Show them"), "{t:?}");
 
-    // Files from the sender: a search for them, each row its files.
+    // Files from the sender: a search for their attachments.
     let from = mail.palette_entries().into_iter().find(|e| e.label == "Files from Arun").expect("offered");
     mail.run_cmd(from.cmd);
     let s = mail.ui.get_cloned().search.unwrap();
     assert_eq!(s.query, "from:arun@acme.example has:attachment");
-    assert_eq!(s.hits.iter().map(|h| (h.subject.as_str(), h.preview.as_str())).collect::<Vec<_>>(), [("Plan", "plan.pdf · 20 bytes")]);
+    assert_eq!(s.hits.len(), 1);
+    assert_eq!(s.hits[0].subject, "Plan");
+    assert_eq!(s.hits[0].files, [("plan.pdf".into(), 20)]);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "plan.pdf"));
 
     // The Files view: every message with files, newest first.
     assert!(mail.ui.get_cloned().views.iter().any(|(l, _)| *l == Lane::Files));
     mail.show_view(Lane::Files);
     let s = mail.ui.get_cloned().search.unwrap();
-    assert_eq!(s.hits.iter().map(|h| h.preview.as_str()).collect::<Vec<_>>(), ["plan.pdf · 20 bytes", "beach.pdf · 20 bytes"]);
+    assert_eq!(s.hits.iter().flat_map(|h| h.files.iter().map(|(name, _)| name.as_str())).collect::<Vec<_>>(), ["plan.pdf", "beach.pdf"]);
     app.tick();
-    assert!(texts(&app).iter().any(|x| x == "beach.pdf · 20 bytes"));
+    let t = texts(&app);
+    for label in ["plan.pdf", "beach.pdf", "20 bytes"] {
+        assert!(t.iter().any(|x| x == label), "{t:?}");
+    }
+
+    // The second tile shares the first grid row and opens its source.
+    let at = Point::new(224.0 + 200.0, mail.list_top() + 50.0);
+    app.handle_event(Event::PointerDown { at });
+    app.handle_event(Event::PointerUp { at });
+    app.tick();
+    assert_eq!(mail.ui.get_cloned().reading.unwrap().subject, "Photos");
     // Counted in its header.
     assert_eq!(mail.ui.get_cloned().files_total, (2, 40));
     assert!(texts(&app).iter().any(|x| x == "2 files, 40 bytes"), "{:?}", texts(&app));

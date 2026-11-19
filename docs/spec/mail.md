@@ -504,7 +504,9 @@ doesn't run a spam classifier of its own in v1.
   audio/video with no network), in Mail's window. The slot gets a read-only sealed memfd,
   not a path.
 - **All files in a thread** at the top of the conversation; **all files from a person** and
-  a Files view across the persona's mail (a search with `has:attachment` shown as a grid).
+  a Files view across the persona's mail. Files and searches with `has:attachment` show
+  one tile per attachment with its file icon, name and size. A press opens the source
+  message. Up and Down move between source messages.
 
 ### 8.2 Opening and saving
 
@@ -1881,18 +1883,19 @@ Stalwart in the cloud VM, and later a real account):
    each attached as it arrived (`message/rfc822`, 7bit as RFC 2046 asks; a message that
    isn't 7bit goes as an `.eml` file), with a line saying so, through the outbox; Undo
    takes the report back unsent along with the move. A message whose body isn't here
-   yet is said, not sent. Files: a *Files* view (every message with files, each row
-   listing them with sizes in place of the preview; any search with `has:attachment`
-   shows rows the same way), *Files from <sender>* in the palette while reading (that
-   search for the sender), and at the top of a conversation whose folded messages hold
-   files, "N files in this conversation: …" with *Show them*, which opens those messages
+   yet is said, not sent. Files: a *Files* view across mail, *Files from <sender>*
+   in the palette while reading (a search for that sender's attachments), and at the
+   top of a conversation whose folded messages hold files, "N files in this
+   conversation: …" with *Show them*, which opens those messages
    so their strips show (also *Show this conversation's files* in the palette). Tests:
    compose 1 (a message attached as it is, and as a file when not 7bit), engine report 1
    (sent from the account, headers kept, nothing for a headers-only message, refused
    for a non-address, undone), prefs (the address kept, bad ones refused), files 1,
    window 2 (rail icons; the report sent and undone; the conversation's files, Files from,
-   the Files view), settings (the field, asked in Work). **Not yet**: a grid of
-   thumbnails for the Files view (rows for now). Its counts: see below.
+   the Files view), settings (the field, asked in Work). The Files view and searches
+   with `has:attachment` now use a virtualized grid of file icons, names and sizes.
+   Pressing a tile opens the source message with its attachment strip. **Not yet**:
+   thumbnails generated from attachment contents. Its counts: see below.
 
    **Search operators on the server, and rules on JMAP servers (2026-11-19, §11.2,
    §11.6).** *Search server* now sends the search's operators too, not only its words:

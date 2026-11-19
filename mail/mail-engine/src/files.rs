@@ -1,5 +1,5 @@
 //! Files across mail (mail.md §8.1): a message's attachments by name, for
-//! the Files view (a search with `has:attachment`, each row its files),
+//! the Files view (a search with `has:attachment`),
 //! files from a person, and all files in a conversation.
 
 use mail_schema::{PartKind, Summary};
@@ -23,21 +23,16 @@ pub fn size_words(n: u64) -> String {
     }
 }
 
-/// A result row's line for its files: "deck.pdf · 2.4 MB, notes.txt · 3 KB".
-pub fn files_line(s: &Summary) -> String {
-    files_of(s).iter().map(|(n, z)| format!("{n} · {}", size_words(*z))).collect::<Vec<_>>().join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use mail_schema::Part;
 
     #[test]
-    fn a_line_of_files() {
+    fn attachment_names_and_sizes() {
         let part = |kind, name: Option<&str>, size| Part { path: "2".into(), kind, content_type: "application/pdf".into(), filename: name.map(Into::into), content_id: None, size, body: (0, 0) };
         let s = Summary { parts: vec![part(PartKind::Text, None, 10), part(PartKind::Attachment, Some("deck.pdf"), 2_400_000), part(PartKind::Inline, Some("logo.png"), 900), part(PartKind::Attachment, None, 3_000)], ..Summary::default() };
-        assert_eq!(files_line(&s), "deck.pdf · 2.4 MB, Unnamed file · 3 KB");
+        assert_eq!(files_of(&s), [("deck.pdf".into(), 2_400_000), ("Unnamed file".into(), 3_000)]);
         assert_eq!(size_words(999), "999 bytes");
     }
 }
