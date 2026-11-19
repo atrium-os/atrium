@@ -800,7 +800,11 @@ fn main() {
                     let stem = std::path::Path::new(&ask.file.name).file_stem().and_then(|s| s.to_str()).unwrap_or("attachment");
                     let name = format!("{stem}-sanitized.pdf");
                     converting = true;
-                    mail.file_note(if visual { format!("Preparing {name} as page images. Search and text selection are lost.") } else { format!("Preparing {name}…") });
+                    mail.file_note(match kind {
+                        CopyKind::Xlsx | CopyKind::Ods => "Preparing sheet images using saved formula values…".into(),
+                        CopyKind::Html => format!("Preparing {name}…"),
+                        _ => format!("Preparing {name} as page images. Search and text selection are lost."),
+                    });
                     let tx = copy_tx.clone();
                     std::thread::spawn(move || {
                         let pdf = match (ready, doc) {

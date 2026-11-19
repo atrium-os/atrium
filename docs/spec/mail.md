@@ -554,7 +554,7 @@ doesn't run a spam classifier of its own in v1.
 #### 8.2.1 Open sanitized copy
 
 **What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
-type checks as HTML, PDF, DOCX or ODT. Mail keeps the original attachment
+type checks as HTML, PDF, DOCX, ODT, XLSX or ODS. Mail keeps the original attachment
 in the message and opens the completed copy in the persona’s default PDF handler.
 Both `invoice.html` and `invoice.pdf` produce `invoice-sanitized.pdf`.
 
@@ -615,6 +615,32 @@ total, and 32 MiB of output. The jail returns a bounded list of page dimensions
 and compressed RGB samples. Mail checks the exact pixel length for every page
 and writes a fresh image-only PDF with the same page writer as Folium.
 Search, selection and accessibility text are lost.
+
+**XLSX and ODS input.** The same jailed Officina worker produces a snapshot
+of the workbook as saved. Each worksheet starts on a new page in tab order.
+Its name appears on every page, including an otherwise empty sheet. A sheet
+extends to its last cell, merge or chart. Wide or long sheets paginate down
+and then across. Text, numbers, booleans, supported number and date formats,
+cell sizes, simple styling and merges become 144 dpi page images.
+Mail identifies formula results as saved values. The worker requires an
+explicit, typed cache on each formula cell and removes the formula before
+import. A cached zero remains zero. The copy loses formulas, search,
+selection and editing.
+
+Minimal unstyled XLSX and ODS packages have a strict cell reader. Richer
+packages must match the supported workbook reconstructed by Officina,
+including relationships, chart parts, cached series and styles.
+This is a conservative subset of both formats. Desktop applications can
+produce valid files outside it. Two-dimensional column, bar, line, area,
+scatter, pie and doughnut charts are eligible when their anchors, labels,
+legend, local series and every plotted point fit. A shortened series,
+clipped label, chart or merge crossing a page boundary, hidden or very-hidden
+sheet, hidden range, print area, unsupported format or drawing, macro,
+encryption or missing cache refuses the whole workbook. No external resources
+are fetched. Limits include 24 worksheets, 4,096 rows and 256 columns per
+sheet, 100,000 cells during import, eight series per chart, 64 points per
+series, and the Office worker's workbook-wide pixel and byte limits.
+Mail receives compressed RGB samples only after the final page is complete.
 
 **Delivery and failure.** Return a completed, sealed, read-only PDF descriptor.
 Apply §8.2's broker checks and same-persona routing to that descriptor. If conversion

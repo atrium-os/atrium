@@ -179,7 +179,7 @@ impl Drawing {
 mod drawing;
 
 /// Cells' text shaped in the screen's face at one size.
-struct Shaper<'f> {
+pub struct Shaper<'f> {
     doc: RefCell<TextDoc>,
     plain: AttrId,
     bold: AttrId,
@@ -187,7 +187,7 @@ struct Shaper<'f> {
 }
 
 impl<'f> Shaper<'f> {
-    fn new(fonts: &'f dyn Fonts, size_pt: f64) -> Self {
+    pub fn new(fonts: &'f dyn Fonts, size_pt: f64) -> Self {
         let mut doc = TextDoc::new();
         let half = (size_pt * 2.0).round().clamp(2.0, 3200.0) as u16;
         let a = |bold| CharAttrs { family: Some(FACE.into()), size: Some(half), bold: Some(bold), ..Default::default() };
@@ -220,8 +220,17 @@ impl<'f> Shaper<'f> {
         (p, l, w)
     }
 
-    fn width(&self, text: &str, bold: bool) -> i64 {
+    pub fn width(&self, text: &str, bold: bool) -> i64 {
         self.lay(text, bold, None).2
+    }
+
+    /// Shape a complete spreadsheet label at the given top-left in layout
+    /// units. Sanitized raster export checks the returned bounds before use.
+    pub fn label(&self, text: &str, bold: bool, color: u32, left: i64, top: i64) -> (Vec<Item>, i64, i64) {
+        let (p, layout, width) = self.lay(text, bold, Some(color));
+        let mut items = Vec::new();
+        self.paint(&mut items, &p, &layout, left, |_| top);
+        (items, width, layout.height)
     }
 
     /// A laid-out line painted from `left` (LU), its top where `top` puts

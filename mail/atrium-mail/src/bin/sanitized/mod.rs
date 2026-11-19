@@ -7,10 +7,18 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use limen::pdf_viewer as folium;
-use mail_engine::attachments::ExportSource;
+use mail_engine::attachments::{CopyKind, ExportSource};
+use mail_office_copy::OfficeFormat;
 
 pub fn render(source: ExportSource, token: Option<[u8; 16]>) -> Result<OwnedFd, String> {
-    if let ExportSource::Office { odt, bytes } = source {
+    if let ExportSource::Office { kind, bytes } = source {
+        let format = match kind {
+            CopyKind::Odt => OfficeFormat::Odt,
+            CopyKind::Docx => OfficeFormat::Docx,
+            CopyKind::Xlsx => OfficeFormat::Xlsx,
+            CopyKind::Ods => OfficeFormat::Ods,
+            _ => return Err("Unsupported Office format".into()),
+        };
         let input =
             limen::fdpass::sealed_file("office-input", &bytes).map_err(|e| e.to_string())?;
         let workers = atrium_worker::Workers::from_root(std::path::Path::new("/"), false)
@@ -19,7 +27,7 @@ pub fn render(source: ExportSource, token: Option<[u8; 16]>) -> Result<OwnedFd, 
             .max_answer((32 << 20) + 4096)
             .call(
                 "office-copy",
-                &mail_office_copy::RenderOffice { odt },
+                &mail_office_copy::RenderOffice { format },
                 Some(input.into()),
             )
             .map_err(|e| format!("Officina could not render the whole document: {e}"))?;

@@ -1,9 +1,16 @@
 //! Only this wire format and the pixel-to-PDF writer are linked into Mail.
 //! The worker cannot supply PDF objects, annotations, metadata or programs.
 #[derive(atrium_message::Message)]
-#[message(version = 1)]
+pub enum OfficeFormat {
+    Docx,
+    Odt,
+    Xlsx,
+    Ods,
+}
+#[derive(atrium_message::Message)]
+#[message(version = 2)]
 pub struct RenderOffice {
-    pub odt: bool,
+    pub format: OfficeFormat,
 }
 
 #[derive(atrium_message::Message)]

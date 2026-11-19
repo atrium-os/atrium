@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["renderer"]
-renderer = ["dep:atrium-worker","dep:officina-convert","dep:officina-text","dep:tiny-skia","dep:ttf-parser","dep:roxmltree"]
+renderer = ["dep:officina-grid","dep:officina-draw","dep:officina-pdf","dep:atrium-worker","dep:officina-convert","dep:officina-text","dep:tiny-skia","dep:ttf-parser","dep:roxmltree"]
 
 [[bin]]
 name = "mail-office-copy"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 required-features = ["renderer"]
 
 [dependencies]
+officina-grid = { path = "../../officina-grid", optional = true }
+officina-draw = { path = "../../officina-draw", optional = true }
+officina-pdf = { path = "../../officina-pdf", optional = true }
 atrium-message = { path = "../../sdk/atrium-message" }
 miniz_oxide = "0.8"
 atrium-worker = { path = "../../sdk/atrium-worker", optional = true }

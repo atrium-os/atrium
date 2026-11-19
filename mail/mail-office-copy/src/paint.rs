@@ -30,7 +30,11 @@ impl ttf_parser::OutlineBuilder for Outline {
     }
 }
 
-fn glyphs(canvas: &mut Pixmap, fonts: &PinnedFonts, run: &GlyphRun) -> Result<(), Error> {
+pub(super) fn glyphs(
+    canvas: &mut Pixmap,
+    fonts: &PinnedFonts,
+    run: &GlyphRun,
+) -> Result<(), Error> {
     if run.turn.is_some() || run.glyphs.is_empty() {
         return Err("unsupported glyph placement".into());
     }

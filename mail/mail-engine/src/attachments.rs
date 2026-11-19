@@ -11,7 +11,7 @@ use crate::{Engine, Error};
 pub const FILES_TEXT_MAX: usize = 4 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CopyKind { Html, Pdf, Docx, Odt }
+pub enum CopyKind { Html, Pdf, Docx, Odt, Xlsx, Ods }
 
 impl CopyKind {
     pub fn from_mime(mime: Option<&str>) -> Option<Self> {
@@ -20,6 +20,8 @@ impl CopyKind {
             "application/pdf" => Self::Pdf,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Self::Docx,
             "application/vnd.oasis.opendocument.text" => Self::Odt,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Self::Xlsx,
+            "application/vnd.oasis.opendocument.spreadsheet" => Self::Ods,
             _ => return None,
         })
     }
@@ -28,7 +30,7 @@ impl CopyKind {
 pub enum ExportSource {
     Html(mail_schema::Document),
     Pdf(Vec<u8>),
-    Office { odt: bool, bytes: Vec<u8> },
+    Office { kind: CopyKind, bytes: Vec<u8> },
 }
 
 impl Engine {
@@ -58,7 +60,7 @@ impl Engine {
                 return Ok(if kind == CopyKind::Pdf {
                     ExportSource::Pdf(attachment.bytes)
                 } else {
-                    ExportSource::Office { odt: kind == CopyKind::Odt, bytes: attachment.bytes }
+                    ExportSource::Office { kind, bytes: attachment.bytes }
                 });
             }
             let len = raw.len() as u64;
