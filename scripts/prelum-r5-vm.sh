@@ -229,7 +229,8 @@ press $((232 + 100)) $(($CARD0 + 96 + 16)); typ "Hall"; press $((232 + 16 + 248 
 waitfor $P/curia.log "renamed .* to Hall" 60; check "Rename" $? "$(g "grep 'renamed' $P/curia.log | tail -1")"
 actl printers 2>&1 | grep -q "1  Hall"; check "prelumd has the new name" $? "$(actl printers 2>&1 | grep '^ *1  ')"
 sleep 8
-press $(slot 0 2)
+press $(slot 0 2)                                   # Share opens confirmation under the card
+press $((232 + 16 + 30)) $(($CARD0 + 98 + 15))
 waitfor $P/curia.log "Hall is shared" 60; check "Share" $? "$(g "grep 'shared' $P/curia.log | tail -1")"
 actl printers 2>&1 | grep "1  Hall" | grep -q shared; check "prelumd has it shared" $? "$(actl printers 2>&1 | grep '^ *1  ')"
 sleep 8

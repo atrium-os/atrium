@@ -832,9 +832,22 @@ rename, share, remove in Curia; the out-of-paper notice and its withdrawal, "Pri
 offline told only after the wait, Cancel from the status item; history kept without the
 document and cleared from Curia).
 
-Not yet: sharing a printer asks nothing of the person (the persona crossing rule is R7,
-with per-persona printers enforced), as are a PIN or password for a printer; "Printed"
-can't be turned off yet; the status item has no Release button for held jobs.
+The “Printed” notice still cannot be turned off, and the status item has no Release
+button for held jobs.
+
+### 11.6 R7 in progress
+
+The picker lists saved printers owned by its calling persona and shared printers.
+Discovery reports saved IDs only for printers the picker can use. prelumd checks
+ownership again on submit and at the start of each attempt, including retries.
+Curia still lists every printer for the person and asks for confirmation before
+sharing one with every persona. The print sheet cannot change sharing or other
+printer administration settings.
+
+The IPP worker rejects PIN submissions unless the printer has a pinned IPPS key and
+UUID. It checks the printer's identity and advertised PIN length before submission.
+Arca credential entry, courier delivery, Sigillum verification for sharing, and
+per-persona routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

@@ -56,6 +56,7 @@ pub struct PrintersPage {
     /// Remove pressed once: press again to remove.
     pub confirm_remove: Option<u32>,
     pub confirm_clear: bool,
+    pub confirm_share: Option<u32>,
     wants: Vec<Want>,
 }
 
@@ -106,6 +107,12 @@ impl PrintersPage {
     }
 
     pub fn share(&mut self, id: u32, shared: bool) {
+        if shared && self.confirm_share != Some(id) {
+            self.confirm_share = Some(id);
+            self.renaming = None;
+            return;
+        }
+        self.confirm_share = None;
         self.change(Want::Share(id, shared));
     }
 
@@ -303,7 +310,8 @@ impl CuriaView {
             }
             for pr in &list {
                 let renaming = p.renaming == Some(pr.id);
-                let rh = em(if renaming { 136.0 } else { 96.0 });
+                let sharing = !pr.shared && p.confirm_share == Some(pr.id);
+                let rh = em(if renaming || sharing { 136.0 } else { 96.0 });
                 rect(ctx, 0.0, y, pw, rh, t.bg_surface(), 8.0);
                 icon(ctx, em(16.0), y + em(14.0), ph::FILES, em(20.0), t.text_secondary());
                 text(ctx, em(48.0), y + em(24.0), &pr.name, type_size::MD, Weight::Medium, t.text_primary());
@@ -317,16 +325,27 @@ impl CuriaView {
                 let (pg, f) = (page.clone(), rename_field.clone());
                 button(ctx, em(16.0 + SLOT), by, "Rename", Look::Secondary, enabled, move || {
                     f.set(Default::default());
-                    with_printers(&pg, |a| a.renaming = Some(id))
+                    with_printers(&pg, |a| {
+                        a.confirm_share = None;
+                        a.renaming = Some(id);
+                    })
                 });
                 let (pg, shared) = (page.clone(), pr.shared);
-                button(ctx, em(16.0 + 2.0 * SLOT), by, if shared { "Stop sharing" } else { "Share" }, Look::Secondary, enabled, move || with_printers(&pg, |a| a.share(id, !shared)));
+                button(ctx, em(16.0 + 2.0 * SLOT), by, if shared { "Stop sharing" } else { "Share…" }, Look::Secondary, enabled && !sharing, move || with_printers(&pg, |a| a.share(id, !shared)));
                 let pg = page.clone();
                 let confirm = p.confirm_remove == Some(id);
                 button(ctx, em(16.0 + 3.0 * SLOT), by, if confirm { "Remove" } else { "Remove…" }, if confirm { Look::Danger } else { Look::Secondary }, enabled, move || with_printers(&pg, |a| a.remove(id)));
                 if confirm {
                     let w = "Its settings go; its waiting jobs are cancelled.";
                     text(ctx, em(16.0 + 4.0 * SLOT), by + em(15.0), w, type_size::XS, Weight::Regular, t.danger_fg());
+                }
+                if sharing {
+                    let fy = y + em(98.0);
+                    let pg = page.clone();
+                    button(ctx, em(16.0), fy, "Share", Look::Primary, enabled, move || with_printers(&pg, |a| a.share(id, true)));
+                    let pg = page.clone();
+                    button(ctx, em(16.0 + SLOT), fy, "Cancel", Look::Ghost, enabled, move || with_printers(&pg, |a| a.confirm_share = None));
+                    text(ctx, em(16.0 + 2.0 * SLOT), fy + em(15.0), "Every persona will be able to print here.", type_size::SM, Weight::Regular, t.text_secondary());
                 }
                 if renaming {
                     let fy = y + em(96.0);
@@ -454,6 +473,21 @@ impl CuriaView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_asks_before_granting_access() {
+        let mut p = PrintersPage::default();
+        p.share(3, true);
+        assert_eq!(p.confirm_share, Some(3));
+        assert!(p.take_wants().is_empty());
+        p.share(3, true);
+        assert_eq!(p.confirm_share, None);
+        assert_eq!(p.take_wants(), vec![Want::Share(3, true)]);
+        p.apply(Got::Done(Ok("shared".into())));
+        p.take_wants();
+        p.share(3, false);
+        assert_eq!(p.take_wants(), vec![Want::Share(3, false)]);
+    }
 
     #[test]
     fn remove_and_clear_ask_twice_and_one_change_at_a_time() {

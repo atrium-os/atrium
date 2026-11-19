@@ -59,6 +59,14 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
             conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?;
             continue;
         }
+        // A sheet represents the app's persona and only needs picker operations.
+        if sheet && acting && !matches!(m.op, op::FOR | op::PRINTERS | op::ADD | op::NEARBY | op::PREVIEW | op::SAVE_PDF | op::PRINT) {
+            let _ = conn.take_fds(1);
+            let out = reply::<String>(Err((status::NOT_ALLOWED, "not for the print sheet".into())));
+            conn.send_message(CLASS, m.op, flag::IS_RESPONSE, &out)?;
+            continue;
+        }
+        let scope = sheet.then_some(persona.as_str());
         let mut back: Option<std::fs::File> = None;
         let out = match m.op {
             op::FOR if acting => reply::<String>(Err((status::NOT_ALLOWED, "already acting for an app".into()))),
@@ -87,14 +95,14 @@ pub fn serve(stream: UnixStream, d: Arc<Daemon>) -> io::Result<()> {
                     (_, None) => Err((status::MALFORMED, "no document".into())),
                 })
             }
-            op::PRINTERS => reply::<Vec<print::Printer>>(Ok(d.printers(uid))),
+            op::PRINTERS => reply::<Vec<print::Printer>>(Ok(d.printers(uid, scope))),
             op::ADD => reply(arg::<print::Add>(p).and_then(|a| d.add(uid, &persona, &a))),
             op::REMOVE => reply(arg::<u32>(p).and_then(|id| d.remove(uid, id))),
             op::RENAME => reply(arg::<print::Rename>(p).and_then(|r| d.rename(uid, &r))),
             op::REPIN => reply(arg::<u32>(p).and_then(|id| d.repin(uid, id))),
             op::IDENTIFY => reply(arg::<u32>(p).and_then(|id| d.identify(uid, id))),
             op::REFRESH => reply(arg::<u32>(p).and_then(|id| d.refresh(uid, id))),
-            op::NEARBY => reply(arg::<u8>(p).and_then(|secs| d.nearby(uid, secs))),
+            op::NEARBY => reply(arg::<u8>(p).and_then(|secs| d.nearby(uid, scope, secs))),
             op::SHARE => reply(arg::<print::Share>(p).and_then(|s| d.share(uid, &s))),
             op::HISTORY => reply::<Vec<print::Ended>>(Ok(d.history(uid))),
             op::CLEAR_HISTORY => reply(d.clear_history(uid)),

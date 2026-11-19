@@ -73,6 +73,13 @@ pub struct Config {
 
 pub type Fail = (u8, String);
 
+fn visible_to(printer: &Saved, persona: &str) -> bool {
+    printer.shared || printer.persona == persona
+}
+
+const CROSSING_REFUSED: &str =
+    "This printer belongs to another persona. Share it in Settings → Printers to print from here.";
+
 fn fail<T>(st: u8, msg: impl Into<String>) -> Result<T, Fail> {
     Err((st, msg.into()))
 }
@@ -411,11 +418,11 @@ impl Daemon {
     }
 
     /// The saved printer of `uid` with this identity, if any.
-    pub(crate) fn saved_as(&self, uid: u32, uuid: Option<&str>, key: Option<&str>) -> Option<u32> {
+    pub(crate) fn saved_as(&self, uid: u32, persona: Option<&str>, uuid: Option<&str>, key: Option<&str>) -> Option<u32> {
         uuid?;
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
-        p.file.printer.iter().find(|o| o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
+        p.file.printer.iter().find(|o| persona.is_none_or(|p| visible_to(o, p)) && o.uuid.as_deref() == uuid && o.key.as_deref() == key).map(|o| o.id)
     }
 
     pub(crate) fn cfg(&self) -> &Config {
@@ -468,10 +475,13 @@ impl Daemon {
         }
     }
 
-    pub fn printers(&self, uid: u32) -> Vec<print::Printer> {
+    pub fn printers(&self, uid: u32, persona: Option<&str>) -> Vec<print::Printer> {
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
-        p.file.printer.iter().map(|s| self.view(s, p.live.get(&s.id))).collect()
+        p.file.printer.iter()
+            .filter(|s| persona.is_none_or(|p| visible_to(s, p)))
+            .map(|s| self.view(s, p.live.get(&s.id)))
+            .collect()
     }
 
     fn worker(&self, s: &Saved, learn: bool) -> Result<Ipp, Fail> {
@@ -555,6 +565,9 @@ impl Daemon {
                     let p = self.person(&mut st, uid);
                     // The same printer again (same identity): what was saved.
                     if let Some(old) = p.file.printer.iter().find(|o| o.uuid.is_some() && o.uuid == s.uuid && o.key == s.key && o.uri == s.uri) {
+                        if !visible_to(old, persona) {
+                            return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
+                        }
                         return Ok(self.view(old, p.live.get(&old.id)));
                     }
                     s.id = p.file.printer.iter().map(|o| o.id).max().unwrap_or(0) + 1;
@@ -599,8 +612,7 @@ impl Daemon {
         Ok("renamed".into())
     }
 
-    /// Shared by every persona, or its own persona's again (§9; the sheet
-    /// keeping personas apart is R7's).
+    /// Shared by every persona, or its own persona's again (§9).
     pub fn share(&self, uid: u32, r: &print::Share) -> Result<String, Fail> {
         let mut st = self.lock();
         let p = self.person(&mut st, uid);
@@ -822,8 +834,13 @@ impl Daemon {
             Ok(m) if m.is_file() => {}
             _ => return fail(status::MALFORMED, "the document must be a file"),
         }
-        let s = self.saved(uid, req.printer)?;
         let mut st = self.lock();
+        let s = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == req.printer)
+            .ok_or((status::NOT_FOUND, "no such printer".into()))?;
+        if !visible_to(s, persona) {
+            return fail(status::NOT_ALLOWED, CROSSING_REFUSED);
+        }
+        let printer = s.id;
         let id = st.next_job;
         st.next_job += 1;
         let title: String = req.title.chars().filter(|c| !c.is_control()).take(200).collect();
@@ -832,7 +849,7 @@ impl Daemon {
             persona: persona.to_string(),
             view: print::Job {
                 id,
-                printer: s.id,
+                printer,
                 title,
                 phase: Phase::Pending,
                 sheets: 0,
@@ -856,7 +873,7 @@ impl Daemon {
             }
         }
         self.changed(&mut st);
-        self.kick(&mut st, uid, s.id);
+        self.kick(&mut st, uid, printer);
         Ok(id)
     }
 
@@ -1003,19 +1020,25 @@ impl Daemon {
 
     /// One attempt at one job.
     fn run(self: &Arc<Self>, uid: u32, printer: u32, job: u64) -> Outcome {
-        let s = match self.saved(uid, printer) {
-            Ok(s) => s,
-            Err(_) => return Outcome::Failed("the printer was removed".into()),
+        let (s, req, pdf) = {
+            let mut st = self.lock();
+            let Some(s) = self.person(&mut st, uid).file.printer.iter().find(|s| s.id == printer).cloned() else {
+                return Outcome::Failed("the printer was removed".into());
+            };
+            let Some(j) = st.jobs.get(&job) else {
+                return Outcome::Failed("the document is gone".into());
+            };
+            if !visible_to(&s, &j.persona) {
+                return Outcome::Failed(CROSSING_REFUSED.into());
+            }
+            let Ok(pdf) = j.pdf.try_clone() else {
+                return Outcome::Failed("the document is gone".into());
+            };
+            (s, j.req.clone(), pdf)
         };
         if s.network != (self.cfg.network)() {
             return Outcome::Retry(format!("{} is not on this network", s.name));
         }
-        let Some((req, pdf)) = ({
-            let st = self.lock();
-            st.jobs.get(&job).and_then(|j| Some((j.req.clone(), j.pdf.try_clone().ok()?)))
-        }) else {
-            return Outcome::Failed("the document is gone".into());
-        };
         if !self.set(job, |j| {
             j.view.phase = Phase::Preparing;
             j.view.message.clear();
@@ -1363,6 +1386,38 @@ fn read_render(mut sock: UnixStream, mut spool: File, prog: Arc<(Mutex<Progress>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_cannot_list_or_submit_to_a_private_personal_printer() {
+        let d = Daemon::new(Config {
+            state: PathBuf::new(),
+            spool: PathBuf::new(),
+            network: Box::new(|| "test".into()),
+            mdns: None,
+            sheet_uid: None,
+            person_of: Box::new(|_| None),
+        }, Box::new(crate::launch::Direct { bin_dir: PathBuf::new() }));
+        let uid = 42;
+        let printer = toml::from_str(r#"
+            id = 1
+            name = "Home"
+            uri = "ipp://localhost:631/ipp/print"
+            addr = "127.0.0.1:631"
+            tls = false
+            network = "test"
+        "#).unwrap();
+        d.person(&mut d.lock(), uid).file.printer = vec![printer];
+
+        assert_eq!(d.printers(uid, Some(""))[0].id, 1);
+        assert!(d.printers(uid, Some("work")).is_empty());
+        let pdf = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        let err = d.submit(uid, "work", print::Print::new(1, "Report"), pdf.into()).unwrap_err();
+        assert_eq!(err, (status::NOT_ALLOWED, CROSSING_REFUSED.to_owned()));
+        assert!(d.jobs(uid).is_empty());
+
+        d.person(&mut d.lock(), uid).file.printer[0].shared = true;
+        assert_eq!(d.printers(uid, Some("work"))[0].id, 1);
+    }
 
     #[test]
     fn typed_addresses() {

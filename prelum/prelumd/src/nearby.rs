@@ -111,7 +111,7 @@ fn lock(d: &Daemon) -> std::sync::MutexGuard<'_, Near> {
 
 impl Daemon {
     /// `NEARBY`: listen up to `secs` seconds, then list what answered.
-    pub fn nearby(self: &Arc<Self>, uid: u32, secs: u8) -> Result<Vec<print::Nearby>, Fail> {
+    pub fn nearby(self: &Arc<Self>, uid: u32, persona: Option<&str>, secs: u8) -> Result<Vec<print::Nearby>, Fail> {
         let wait = Duration::from_secs(secs.min(MAX_WAIT) as u64);
         self.browse()?;
         std::thread::sleep(wait);
@@ -155,7 +155,7 @@ impl Daemon {
                     uuid: i.uuid.clone(),
                     color: i.color_modes.iter().any(|m| m == "color"),
                     duplex: i.sides_supported.iter().any(|s| s != "one-sided"),
-                    saved: self.saved_as(uid, i.uuid.as_deref(), key.as_deref()),
+                    saved: self.saved_as(uid, persona, i.uuid.as_deref(), key.as_deref()),
                     uri: c.uri,
                 }
             })

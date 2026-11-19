@@ -14,7 +14,7 @@ use crate::conn::{Error, Target};
 use crate::tls;
 
 /// What a `Get-Printer-Attributes` asks for.
-pub const ATTRS: &[&str] = &["all", "media-col-database"];
+pub const ATTRS: &[&str] = &["all", "media-col-database", "job-password-supported"];
 
 /// `ipp://host[:port]/path` or `ipps://…` → (tls, host[:port], path).
 pub fn split_uri(uri: &str) -> Option<(bool, &str, &str)> {
@@ -109,8 +109,16 @@ impl Session {
     /// Start a job and send `doc` (prelumd's data frames) as its document.
     /// `on_created` hears the job's id as soon as the printer gives one.
     pub fn submit(&mut self, identity: &JobIdentity, format: ops::Format, ticket: &ops::Ticket, doc: &mut dyn Read, on_created: &mut dyn FnMut(i32)) -> Result<(), Ev> {
+        if identity.job_password.is_some() && (!self.start.tls || self.start.key.is_none() || self.start.uuid.is_none()) {
+            return Err(Ev::Failed("PIN jobs require an IPPS printer with a pinned key and UUID".into()));
+        }
         let info = self.query()?;
         self.check_identity(&info)?;
+        if let Some(pin) = &identity.job_password {
+            if pin.is_empty() || !info.job_password_max.is_some_and(|max| pin.len() <= max as usize) {
+                return Err(Ev::Failed("this printer does not support a PIN of that length".into()));
+            }
+        }
         if !info.formats.iter().any(|f| f == format.mime()) {
             return Err(Ev::Failed(format!("the printer doesn't take {}", format.mime())));
         }
@@ -262,6 +270,30 @@ pub fn run(r: &mut impl Read, w: &mut impl Write) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_jobs_are_refused_before_contacting_an_unpinned_printer() {
+        for (tls, key, uuid) in [
+            (false, None, Some("test".into())),
+            (true, None, Some("test".into())),
+            (true, Some([1; 32]), None),
+        ] {
+            let scheme = if tls { "ipps" } else { "ipp" };
+            let mut session = Session::new(Start {
+                uri: format!("{scheme}://127.0.0.1:0/ipp/print"),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls, key, uuid,
+            }).unwrap();
+            let identity = JobIdentity {
+                user: "atrium".into(),
+                job_name: "Report".into(),
+                job_password: Some(b"1234".to_vec()),
+            };
+            let err = session.submit(&identity, ops::Format::Pdf, &ops::Ticket::default(), &mut io::empty(), &mut |_| unreachable!()).unwrap_err();
+            assert_eq!(err, Ev::Failed("PIN jobs require an IPPS printer with a pinned key and UUID".into()));
+            assert_eq!(session.next_id, 1);
+        }
+    }
 
     #[test]
     fn uris() {
