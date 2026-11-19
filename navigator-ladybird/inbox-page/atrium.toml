@@ -1,0 +1,12 @@
+[app]
+id = "org.atrium.navigator.inbox-page"
+name = "Navigator inbox fixture"
+version = "0.1.0"
+entry = "bin/inbox-page"
+
+[capabilities]
+network = "none"
+
+[resources]
+memory = "256M"
+cpu = 100

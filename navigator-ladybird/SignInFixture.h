@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EditorPage.h"
+#include <LibWebCommon/UIEvents/MouseButton.h>
 #include <AK/ScopeGuard.h>
 #include <LibURL/Parser.h>
 #include <LibWeb/DOM/Document.h>
@@ -51,6 +52,40 @@ inline ErrorOr<void> paint_mail_document(EditorPage& client, NavigatorScene* sce
     if (check_fixture) puts("development_account_input=1 inline_script=1 native_scene=1");
     return {};
 }
+
+#ifdef ATRIUM_INBOX_PAGE
+extern "C" int navigator_inbox_pointer(NavigatorScene*, float*, float*);
+
+inline int drive_inbox(EditorPage& client, NavigatorScene* scene, Core::EventLoop& loop)
+{
+    auto doc = client.page().local_traversable()->active_document();
+    auto draft = doc->get_element_by_id(u"draft"sv);
+    auto messages = doc->get_element_by_id(u"messages"sv);
+    if (!draft || !messages)
+        return 5;
+    auto previous = messages->text_content();
+    auto previous_draft = draft->text_content();
+    for (unsigned tick = 0; tick < 15000; ++tick) {
+        loop.pump(Core::EventLoop::WaitMode::PollForEvents);
+        float x = 0, y = 0;
+        auto action = navigator_inbox_pointer(scene, &x, &y);
+        if (action < 0) break;
+        Web::DevicePixelPoint point { static_cast<int>(x), static_cast<int>(y) };
+        if (action == 1) client.page().handle_mousedown(point, point, Web::UIEvents::MouseButton::Primary, Web::UIEvents::MouseButton::Primary, 0, 1);
+        if (action == 2) client.page().handle_mouseup(point, point, Web::UIEvents::MouseButton::Primary, 0, 0);
+        if (messages->text_content() == previous && draft->text_content() == previous_draft && !client.take_frame_request())
+            continue;
+        previous = messages->text_content();
+        previous_draft = draft->text_content();
+        Web::Layout::ForcedReadScope read { *doc };
+        doc->update_layout(Web::DOM::UpdateLayoutReason::DumpDisplayList);
+        if (!doc->record_display_list(read, Web::HTML::PaintConfig {}, Web::Painting::PaintCommandCacheMode::ReadWrite)
+            || !navigator_scene_sample(scene, doc->layout_node_arena().host(), true, false))
+            return 6;
+    }
+    return 0;
+}
+#endif
 
 inline ErrorOr<void> run_sign_in(Gfx::Palette palette, Function<ErrorOr<StringView>(Web::Page&, URL::URL const&)> fetch)
 {

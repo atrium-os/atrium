@@ -52,6 +52,7 @@ mod files;
 mod portal;
 mod vpn;
 mod mail_sheet;
+mod inbox_fixture;
 mod press;
 mod settings;
 mod worker;
@@ -1857,6 +1858,12 @@ fn main() {
         }
         Arc::new(Mutex::new(b))
     });
+    if settings::get("NAVIGATORD_INBOX_FIXTURE").as_deref() == Some(inbox_fixture::URL) {
+        if let (Some(socket), Some((arca, launcher))) = (&cfg.limen, &cfg.arca) {
+            let broker = Broker::new(ArcadSocket { path: arca.clone() }, Launcher::new(launcher.clone()));
+            inbox_fixture::start(socket.clone(), broker);
+        }
+    }
     if cfg.vpn.is_none() {
         if let (Some(socket), Some(_)) = (&cfg.limen, &cookies) {
             if let Some((arca, launcher)) = &cfg.arca {

@@ -12,6 +12,10 @@
 #include <LibWeb/Loader/ResourceLoader.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#ifdef ATRIUM_INBOX_PAGE
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
+#endif
 #include <LibWeb/Platform/EventLoopPlugin.h>
 
 static constexpr char fixture[] = {
@@ -24,7 +28,7 @@ static constexpr char fixture[] = {
 
 extern "C" bool navigator_fixture_channel(int);
 #ifdef ATRIUM_MAIL_PAGE
-extern "C" NavigatorScene* navigator_mail_scene_open(u8 const**, size_t*, u8 const**, size_t*);
+extern "C" NavigatorScene* navigator_mail_scene_open(bool, u8 const**, size_t*, u8 const**, size_t*);
 extern "C" void navigator_mail_scene_wait(NavigatorScene*);
 #endif
 
@@ -78,6 +82,10 @@ int main(int argc, char** argv)
     Core::EventLoop loop;
     Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
     Web::Bindings::initialize_agent(Web::HTML::AgentType::SimilarOriginWindow);
+#ifdef ATRIUM_INBOX_PAGE
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
+#endif
     auto theme = Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme));
     if (theme.is_error())
         return 3;
@@ -89,12 +97,23 @@ int main(int argc, char** argv)
     u8 const* url = nullptr;
     u8 const* body = nullptr;
     size_t url_len = 0, body_len = 0;
-    auto* scene = navigator_mail_scene_open(&url, &url_len, &body, &body_len);
+#ifdef ATRIUM_INBOX_PAGE
+    constexpr bool inbox = true;
+#else
+    constexpr bool inbox = false;
+#endif
+    auto* scene = navigator_mail_scene_open(inbox, &url, &url_len, &body, &body_len);
     if (!scene) return 4;
     ScopeGuard cleanup = [&] { navigator_scene_destroy(scene); };
+    if (inbox && !Web::ResourceLoader::is_initialized())
+        Web::ResourceLoader::initialize(GC::Heap::the());
     auto painted = Navigator::paint_mail_document(*client, scene, { url, url_len }, { body, body_len }, false);
     if (painted.is_error()) return 4;
+#ifdef ATRIUM_INBOX_PAGE
+    return Navigator::drive_inbox(*client, scene, loop);
+#else
     navigator_mail_scene_wait(scene);
+#endif
     return 0;
 #endif
     if (mail_probe) {

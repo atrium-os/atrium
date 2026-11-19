@@ -355,6 +355,15 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
     /// [`Refused::NotCookied`] before anything is asked of Arca: the caller
     /// sends it the plain way, and it carries no cookie.
     pub fn fetch(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
+        self.fetch_with_redirects(view, f, MAX_REDIRECTS)
+    }
+
+    /// Fetch exactly the URL granted for an embedded resource.
+    pub fn fetch_once(&mut self, view: ViewId, f: &Fetch) -> Result<Fetched, Refused> {
+        self.fetch_with_redirects(view, f, 0)
+    }
+
+    fn fetch_with_redirects(&mut self, view: ViewId, f: &Fetch, limit: usize) -> Result<Fetched, Refused> {
         let Some(View { partition, cookied: Some(_), sign_in, microsoft }) = self.views.get(&view).cloned() else { return Err(Refused::NotCookied) };
         // A form only from a sign-in window, and only as a form.
         let form = sign_in.is_some() && f.method == Method::Post && f.reason == Reason::Form;
@@ -434,7 +443,7 @@ impl<A: Arca, C: Couriers> Broker<A, C> {
             match (status, location) {
                 (301 | 302 | 303 | 307 | 308, Some(loc)) => {
                     redirects += 1;
-                    if redirects > MAX_REDIRECTS { return Err(Refused::Redirect(format!("more than {MAX_REDIRECTS} redirects"))) }
+                    if redirects > limit { return Err(Refused::Redirect(format!("more than {limit} redirects"))) }
                     let next = url.join(&loc).map_err(|e| Refused::Redirect(e.to_string()))?;
                     if next.scheme() != "https" { return Err(Refused::Redirect(format!("down to {}", next.scheme()))) }
                     chain.push(host);

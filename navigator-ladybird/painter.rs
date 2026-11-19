@@ -766,7 +766,7 @@ pub mod host {
         previous: NodeTree,
         pointer: Option<(f32, f32)>,
         mail_document: Option<(String, Vec<u8>)>,
-        embed: Option<(limen::client::Child, u64, FrescoSurface)>,
+        embed: Option<(std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64, FrescoSurface)>,
     }
 
     fn attach(expected_role: &str) -> Result<(limen::client::Child, u64, FrescoSurface), String> {
@@ -815,7 +815,7 @@ pub mod host {
         let mut state = SceneState::default();
         if embedded {
             match attach("web-island") {
-                Ok(embed) => state.embed = Some(embed),
+                Ok((child, id, surface)) => state.embed = Some((std::rc::Rc::new(std::cell::RefCell::new(child)), id, surface)),
                 Err(reason) => {
                     eprintln!("editor attach: {reason}");
                     return std::ptr::null_mut();
@@ -829,10 +829,10 @@ pub mod host {
     /// The trusted Navigator sheet supplies the final document URL and the
     /// sealed response body. Only this embed can send the document.
     #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn navigator_mail_scene_open(out_url: *mut *const u8, url_len: *mut usize,
+    pub unsafe extern "C" fn navigator_mail_scene_open(inbox: bool, out_url: *mut *const u8, url_len: *mut usize,
         html: *mut *const u8, html_len: *mut usize) -> *mut SceneState {
         use std::io::Read;
-        let Ok((mut child, embed, surface)) = attach("mail-sign-in-page") else { return std::ptr::null_mut() };
+        let Ok((mut child, embed, surface)) = attach(if inbox { "navigator-inbox-page" } else { "mail-sign-in-page" }) else { return std::ptr::null_mut() };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let url = loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -849,6 +849,10 @@ pub mod host {
         let mut bytes = Vec::new();
         if !file.metadata().is_ok_and(|m| m.is_file()) || file.take(2 * 1024 * 1024 + 1).read_to_end(&mut bytes).is_err()
             || bytes.is_empty() || bytes.len() > 2 * 1024 * 1024 { return std::ptr::null_mut(); }
+        let child = std::rc::Rc::new(std::cell::RefCell::new(child));
+        if inbox {
+            INBOX.with(|slot| slot.replace(Some((child.clone(), embed))));
+        }
         let state = Box::new(SceneState { embed: Some((child, embed, surface)), mail_document: Some((location, bytes)), ..Default::default() });
         let (location, bytes) = state.mail_document.as_ref().unwrap();
         unsafe { *out_url = location.as_ptr(); *url_len = location.len(); *html = bytes.as_ptr(); *html_len = bytes.len(); }
@@ -860,10 +864,54 @@ pub mod host {
         let Some((child, _, _)) = &mut state.embed else { return };
         let until = std::time::Instant::now() + std::time::Duration::from_secs(600);
         while std::time::Instant::now() < until {
-            match child.poll(until.saturating_duration_since(std::time::Instant::now())) {
+            match child.borrow_mut().poll(until.saturating_duration_since(std::time::Instant::now())) {
                 Ok(Some(limen::proto::ChildEvent::Resumed { .. } | limen::proto::ChildEvent::Suspended { .. })) => {}
                 _ => break,
             }
+        }
+    }
+
+    type ResourceChannel = (std::rc::Rc<std::cell::RefCell<limen::client::Child>>, u64);
+    thread_local! { static INBOX: std::cell::RefCell<Option<ResourceChannel>> = const { std::cell::RefCell::new(None) }; }
+
+    /// Returns the body length only after receiving the reply for this exact URL.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn navigator_inbox_get(url: *const u8, len: usize, out: *mut u8, cap: usize) -> usize {
+        use std::io::Read;
+        let bytes = unsafe { std::slice::from_raw_parts(url, len) };
+        if len > 512 || cap > 65536 { return 0; }
+        INBOX.with(|slot| {
+            let binding = slot.borrow();
+            let (child, id) = binding.as_ref()?;
+            let mut channel = child.borrow_mut();
+            channel.emit(*id, bytes.to_vec()).ok()?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let wait = until.saturating_duration_since(std::time::Instant::now());
+                if wait.is_zero() { return None; }
+                match channel.poll(wait).ok()?? {
+                    limen::proto::ChildEvent::MessageFd {embed, bytes: reply} if embed == *id && reply == bytes => break,
+                    limen::proto::ChildEvent::Resumed {..} => continue,
+                    _ => return None,
+                }
+            }
+            let mut file = std::fs::File::from(channel.take_fd()?);
+            let n = usize::try_from(file.metadata().ok()?.len()).ok()?;
+            if n > cap { return None; }
+            file.read_exact(unsafe {std::slice::from_raw_parts_mut(out,n)}).ok()?;
+            Some(n)
+        }).unwrap_or(0)
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn navigator_inbox_pointer(state: &mut SceneState, x: &mut f32, y: &mut f32) -> i32 {
+        let Some((_, _, surface)) = &mut state.embed else { return -1 };
+        match surface.connection().wait_event(Some(std::time::Duration::from_millis(20))) {
+            Ok(Some(fresco_client::Event::PointerButton {x: px, y: py, button: 1, pressed, ..})) => {
+                *x = px; *y = py; if pressed { 1 } else { 2 }
+            }
+            Err(_) | Ok(Some(fresco_client::Event::CloseRequested {..})) => -1,
+            _ => 0,
         }
     }
 
@@ -967,7 +1015,7 @@ pub mod host {
                         "editor outbound wire bytes={}",
                         surface.connection().encoded_bytes() - before
                     );
-                    if child.emit(*embed, b"frame".to_vec()).is_err() {
+                    if child.borrow_mut().emit(*embed, b"frame".to_vec()).is_err() {
                         return false;
                     }
                     if state.mail_document.is_some() { state.previous = next; return true; }
@@ -976,7 +1024,7 @@ pub mod host {
                         if std::time::Instant::now() >= until {
                             return false;
                         }
-                        match child.poll(until.saturating_duration_since(std::time::Instant::now()))
+                        match child.borrow_mut().poll(until.saturating_duration_since(std::time::Instant::now()))
                         {
                             Ok(Some(limen::proto::ChildEvent::Message { embed: id, bytes }))
                                 if id == *embed && bytes == b"advance" =>

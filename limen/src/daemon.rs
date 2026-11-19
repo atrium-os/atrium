@@ -400,6 +400,10 @@ fn request(shared: &Arc<Shared>, conn: ConnId, uid: u32, req: proto::Request) ->
     if st.embeds.values().filter(|e| e.parent == conn).count() >= catalogue::MAX_EMBEDS_PER_PARENT {
         return refuse(refusal::TOO_MANY);
     }
+    if role.name == "navigator-inbox-page" && (app != "org.atrium.navigator" ||
+        !shared.mail_sheet_provider.lock().unwrap().as_ref().is_some_and(|check| check(uid))) {
+        return refuse(refusal::NOT_PROVIDER);
+    }
     if role.slot == SlotKind::SignInPage && !st.embeds.values().any(|sheet|
         sheet.role.name == "mail-sign-in" && sheet.child_uid == uid && sheet.child_window == Some(req.window)
     ) {

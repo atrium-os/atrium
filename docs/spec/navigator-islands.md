@@ -635,6 +635,43 @@ script and stylesheet loading from LibWeb, interactive continuation, redirect
 redemption and first-grant storage still need separate verification. The
 development gate does not establish Microsoft's behavior in an embedded engine.
 
+### Direct Navigator inbox fixture
+
+On 2026-11-20 the installed Navigator app opened a 640 × 360 whole-page
+fixture in its own window, from the opt-in setting
+`NAVIGATORD_INBOX_FIXTURE=https://inbox.example/inbox`. Two cold Navigator
+launches passed on a fresh arm64 HVF overlay with `/dev/vtbd1p1` mounted as
+Tessera root. General address-bar navigation and live Gmail compatibility
+remain open.
+
+Build the worker with `I0_INBOX_PAGE=ON`, the interpreter patch and generated
+`LIBWEB_RUST_BINDINGS`. The host installs Ladybird's inline fetch executor
+on the window agent before parsing the document. Navigator opens a cookied
+view, retrieves the document through Arca and passes its body to Limen.
+The resource loader requests two external assets and a same-origin JSON
+endpoint. Navigator enforces the three exact resource URLs, single-hop
+GET, expected MIME and a 64 KiB body limit. Each reply is a sealed descriptor.
+The worker receives no cookie headers. JavaScript dispatch, layout, hit testing
+and native scene updates all run in the worker.
+
+Use the Mail gate's restricted forwarding setup with `inbox.example`. Start
+`courier-test-server inbox.example CA_FILE PORT_FILE MARKER_LOG 127.0.0.1:0 inbox`.
+First require a cookie-free GET of `/api/inbox` to return 403. Install the
+inbox worker with its shipped manifest and allow only Limen to start it.
+After Navigator launches, run `python3 scripts/navigator-i0-inbox-check.py
+SSH_WRAPPER MARKER_LOG OUTPUT_DIRECTORY` on the Mac. It reads the headless
+display and input socket under `/tmp/inbox` in the guest.
+
+Both visits requested the document, CSS, JS and authenticated JSON. Each
+before-frame showed “School field trip” and 22,631 heading pixels in the
+stylesheet color. A Fresco pointer press and release on Compose at (53, 133)
+made “New draft” appear. FreeBSD reported uid 50005, Capsicum flag `C`, and
+both IP families disabled. The worker matched its host SHA-256
+`9d0c19d09ff38310c290f4fd5117604cf25de30faee270205374cceebeee9581`.
+The arm64 engine dependency tree included the Rust JS and Wasm engines and
+neither JIT crate. The evidence is in
+`~/atrium-vm/evidence/navigator-inbox-20261120/`.
+
 ## 9. Decisions, with recommendations
 
 *Pure Rust, later (Shankar, 2026-11-19):* no complete engine is pure Rust today; Servo's

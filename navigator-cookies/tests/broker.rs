@@ -401,6 +401,17 @@ fn a_cookie_check_redirect_works_and_a_cross_site_chain_drops_strict() {
 }
 
 #[test]
+fn single_resource_grant_stops_at_the_first_redirect() {
+    let mut w = world();
+    w.b.show(NEWS_VIEW, &w.news).unwrap();
+    w.b.set_cookied(NEWS_VIEW, Why::Reader).unwrap();
+    let ask = Fetch::navigation(&format!("{}/to?{}/echo", w.news, w.cdn), None, true);
+    let before = w.b.tickets;
+    assert!(matches!(w.b.fetch_once(NEWS_VIEW, &ask), Err(Refused::Redirect(_))));
+    assert_eq!(w.b.tickets, before + 1);
+}
+
+#[test]
 fn only_https_get_and_head_and_never_down_to_http() {
     let mut w = world();
     w.b.show(NEWS_VIEW, &format!("{}/", w.news)).unwrap();

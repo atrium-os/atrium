@@ -43,6 +43,7 @@ fn main() {
     // authority in that courier jail is this throwaway fixture CA.
     let mail_address = a.get(5);
     let mail = mail_address.is_some();
+    let inbox = a.get(6).is_some_and(|mode| mode == "inbox");
     let l = TcpListener::bind(mail_address.map(String::as_str).unwrap_or("127.0.0.1:0")).unwrap();
     std::fs::write(port_out, l.local_addr().unwrap().port().to_string()).unwrap();
     for s in l.incoming().flatten() {
@@ -63,6 +64,22 @@ fn main() {
                 let token = req.contains("Authorization: Bearer hunter2-token\r\n");
                 let first = req.lines().next().unwrap_or("").to_string();
                 let cookie = req.lines().find_map(|l| l.strip_prefix("Cookie: ")).unwrap_or("-").to_string();
+                if inbox {
+                    let headers = "Set-Cookie: inbox_session=local; Secure; HttpOnly; SameSite=Strict; Path=/\r\n";
+                    let (status, mime, extra, body, marker) = match first.split_whitespace().collect::<Vec<_>>().as_slice() {
+                        ["GET", "/inbox", _] => (200, "text/html", headers, include_str!("../../../test-assets/navigator-i0/inbox/index.html"), "document"),
+                        ["GET", "/inbox.js", _] => (200, "text/javascript", "", include_str!("../../../test-assets/navigator-i0/inbox/inbox.js"), "script"),
+                        ["GET", "/inbox.css", _] => (200, "text/css", "", include_str!("../../../test-assets/navigator-i0/inbox/inbox.css"), "stylesheet"),
+                        ["GET", "/api/inbox", _] if cookie.split("; ").any(|s| s == "inbox_session=local") =>
+                            (200, "application/json", "", r#"{"subject":"School field trip"}"#, "authenticated inbox"),
+                        _ => (403, "text/plain", "", "Forbidden", "refused"),
+                    };
+                    let mut file = std::fs::OpenOptions::new().append(true).create(true).open(&log).unwrap();
+                    writeln!(file, "{marker}").unwrap();
+                    let reply = format!("HTTP/1.1 {status} {}\r\nContent-Type: {mime}\r\n{extra}Content-Length: {}\r\n\r\n{body}", if status == 200 { "OK" } else { "Forbidden" }, body.len());
+                    if t.write_all(reply.as_bytes()).and_then(|_| t.flush()).is_err() { break; }
+                    continue;
+                }
                 if mail {
                     let target = first.strip_prefix("GET ").and_then(|s| s.split_whitespace().next()).unwrap_or("");
                     let authorization = target.strip_prefix("/common/oauth2/v2.0/authorize?").is_some_and(|q| {

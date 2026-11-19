@@ -78,6 +78,7 @@ pub const ROLES: &[Role] = &[
     Role { name: "pdf-viewer", provider: Provider::User, slot: SlotKind::Plain, takes_fd: true, returns_fd: false },
     Role { name: "pdf-sanitizer", provider: Provider::Worker("org.atrium.folium.sanitizer"), slot: SlotKind::Plain, takes_fd: true, returns_fd: true },
     Role { name: "payment", provider: Provider::User, slot: SlotKind::Credential, takes_fd: false, returns_fd: false },
+    Role { name: "navigator-inbox-page", provider: Provider::Worker("org.atrium.navigator.inbox-page"), slot: SlotKind::Island, takes_fd: true, returns_fd: false },
     Role { name: "mail-sign-in-page", provider: Provider::Worker("org.atrium.navigator.mail-page"), slot: SlotKind::SignInPage, takes_fd: true, returns_fd: false },
     Role { name: "mail-sign-in", provider: Provider::System("org.atrium.navigator"), slot: SlotKind::Sheet { w: 720, h: 540 }, takes_fd: false, returns_fd: false },
     Role { name: "web-island", provider: Provider::Worker(NAVIGATOR_ENGINE), slot: SlotKind::Island, takes_fd: false, returns_fd: false },

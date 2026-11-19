@@ -515,6 +515,11 @@ in its slot; a made-up token is refused; after a release, or after its
 parent is destroyed, the click goes past it again; and a gone window's token is dead.
 
 A sheet may contain a credential slot, clipped and stacked above the sheet.
+The I0 `navigator-inbox-page` island accepts only the registered Navigator
+provider as parent. Its fixed worker receives a sealed document and can ask
+that parent for the fixture's scoped resources. It uses the ordinary island's
+clipping and input routing.
+
 The Mail sign-in sheet can also host its own document. For `mail-sign-in-page`,
 Limen requires the uid and window token of the active registered provider's
 sheet before launching the worker. Fresco accepts the `SIGN_IN_PAGE` bind
