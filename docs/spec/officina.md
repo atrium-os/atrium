@@ -3752,8 +3752,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - Refused: areas meeting merged cells, and more than 4 M new cells.
 - **Grid** (pergola): a source that says `fills()` gets a small square at the selection's bottom-right corner. Dragging it rings the area it reaches, down, up, right or left, whichever way the pointer is farther out. Letting go sends `GridAction::Fill { from, to, copy: false }` and selects the filled area. Ctrl+D and Ctrl+R send `copy: true`: the selection's first row (or column) into the rest, or with one row chosen, the row above.
 - **Sheets:** `Doc::fill`, undone as one step ("Fill Series" or "Fill").
-- **Not yet:** Excel's Ctrl-drag to flip between series and copy, the Auto Fill Options button after a drag, custom lists, Flash Fill, and double-clicking the handle to fill down to the data's end.
-- **Gates:** officina-grid `autofill::tests` (4); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`.
+- **Double-click on the handle** (2026-11-19) fills the selection down as far as the data beside it goes: the column left of it, or else the one right of it, to the end of its unbroken run, stopping above anything already in the selection's first column (`autofill::to_data_end`, reading the column a growing window at a time). The filled area is selected. pergola reports `GridAction::FillToData`; two presses on the handle within 450 ms are a double-click, and a press that hardly moves fills nothing.
+- **Not yet:** Excel's Ctrl-drag to flip between series and copy, the Auto Fill Options button after a drag, custom lists, and Flash Fill.
+- **Gates:** officina-grid `autofill::tests` (5); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ## 17. Decisions (accepted 2026-11-14)
 

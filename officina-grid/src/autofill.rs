@@ -166,6 +166,60 @@ pub fn fill(wb: &Workbook, src: Rect, to: Rect, mode: Mode) -> Result<GridOp, St
     Ok(GridOp::Batch(vec![GridOp::Replace(Region { rect: new, values, fills }), GridOp::Restyle(StyleRegion { rect: new, spans })]))
 }
 
+/// Where a double-click on the fill handle fills to: the selection grown
+/// down beside the data next to it (the column left of it, or else right),
+/// to that data's last row, stopping above anything already in the
+/// selection's first column. `None`: nothing beside it to follow.
+pub fn to_data_end(wb: &Workbook, sel: Rect) -> Option<Rect> {
+    let below = sel.r1.checked_add(1)?;
+    let filled = |c: u32| !wb.value(sel.sheet, below, c).is_empty();
+    let side = [sel.c0.checked_sub(1), sel.c1.checked_add(1)].into_iter().flatten().find(|&c| filled(c))?;
+    let end = run_end(wb, sel.sheet, side, below, true);
+    // Stop above what the first column already holds.
+    let mine = run_end(wb, sel.sheet, sel.c0, below, false);
+    let end = end.min(mine);
+    (end >= below).then_some(Rect { r1: end, ..sel })
+}
+
+/// The last row of the run from `from` down column `c` whose cells are all
+/// filled (`filled`) or all empty. Read a window at a time, so a short run
+/// in a long column stops early.
+fn run_end(wb: &Workbook, sheet: u16, c: u32, from: u32, filled: bool) -> u32 {
+    let last = crate::addr::MAX_ROWS - 1;
+    let mut next = from;
+    let mut win = 1024u32;
+    while next <= last {
+        let r1 = next.saturating_add(win - 1).min(last);
+        let mut stop = None;
+        let mut want = next;
+        wb.each(&Rect { sheet, r0: next, c0: c, r1, c1: c }, &mut |row, _, v| {
+            if stop.is_some() || v.is_empty() {
+                return;
+            }
+            if filled {
+                if row != want {
+                    stop = Some(want);
+                }
+                want = row + 1;
+            } else {
+                stop = Some(row);
+            }
+        });
+        if let Some(s) = stop {
+            return s.wrapping_sub(1);
+        }
+        if filled && want <= r1 {
+            return want.wrapping_sub(1);
+        }
+        if !filled && r1 >= wb.extent(sheet).0 {
+            return last;
+        }
+        next = r1 + 1;
+        win = win.saturating_mul(4);
+    }
+    last
+}
+
 /// A value of a series at step `x`.
 fn at_step(s: &Series, x: f64) -> Value {
     match s {
@@ -414,6 +468,31 @@ mod tests {
         assert_eq!((shown(&wb, 7, 0), shown(&wb, 8, 0)), ("10".into(), "20".into()));
         assert!(fill(&wb, rect(5, 0, 6, 0), rect(5, 0, 6, 1), Mode::Copy).is_ok());
         assert!(fill(&wb, rect(5, 0, 6, 0), rect(4, 0, 7, 0), Mode::Copy).is_err());
+    }
+
+    #[test]
+    fn a_double_click_fills_beside_the_data() {
+        let mut wb = wb();
+        // A1:A6 data; B1 the formula to fill down; B5 already holds something.
+        for r in 0..6 {
+            set(&mut wb, r, 0, &format!("{r}"));
+        }
+        set(&mut wb, 0, 1, "=A1*2");
+        set(&mut wb, 4, 1, "stop");
+        assert_eq!(to_data_end(&wb, rect(0, 1, 0, 1)), Some(rect(0, 1, 3, 1)));
+        set(&mut wb, 4, 1, "");
+        assert_eq!(to_data_end(&wb, rect(0, 1, 0, 1)), Some(rect(0, 1, 5, 1)));
+        // Data on the right when the left is empty; none: nothing.
+        assert_eq!(to_data_end(&wb, rect(0, 4, 0, 4)), None);
+        set(&mut wb, 0, 3, "x");
+        set(&mut wb, 1, 6, "y");
+        set(&mut wb, 2, 6, "y");
+        assert_eq!(to_data_end(&wb, rect(0, 3, 0, 5)), Some(rect(0, 3, 2, 5)));
+        // A long column is read a window at a time.
+        GridOp::fill(0, 8, 0, 99_999, "=1").apply(&mut wb);
+        wb.recalc();
+        set(&mut wb, 0, 9, "1");
+        assert_eq!(to_data_end(&wb, rect(0, 9, 0, 9)), Some(rect(0, 9, 99_999, 9)));
     }
 
     #[test]

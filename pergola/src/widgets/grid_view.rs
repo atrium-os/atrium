@@ -407,7 +407,7 @@ enum Drag {
     /// distance from where the press began, content px.
     Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
     /// The fill handle dragged: the area it reaches so far.
-    Fill { to: CellRange },
+    Fill { to: CellRange, from: (f64, f64) },
 }
 
 /// The grid's own state, kept by the app in a `Mutable`.
@@ -420,6 +420,9 @@ pub struct GridState {
     /// The in-cell editor, while editing the active cell.
     pub edit: Option<TextEdit>,
     drag: Drag,
+    /// When the fill handle was last pressed: a second press soon after is
+    /// a double-click.
+    fill_press: Option<std::time::Instant>,
     /// The movable float a click picked (its key), framed with a corner
     /// handle; Delete asks to remove it, Escape lets it go.
     pub picked: Option<u64>,
@@ -465,6 +468,9 @@ pub enum GridAction {
     /// Fill `to` from `from` (inside it, `to` reaching past it one way):
     /// the fill handle (`copy` false: series), Ctrl+D and Ctrl+R (`copy`).
     Fill { from: CellRange, to: CellRange, copy: bool },
+    /// A double-click on the fill handle: fill the selection down as far as
+    /// the data beside it goes (the app finds how far).
+    FillToData(CellRange),
 }
 
 impl GridState {
@@ -479,7 +485,7 @@ impl GridState {
     /// The area the fill handle reaches, while it is dragged.
     pub fn fill_drag(&self) -> Option<CellRange> {
         match self.drag {
-            Drag::Fill { to } => Some(to),
+            Drag::Fill { to, .. } => Some(to),
             _ => None,
         }
     }
@@ -487,6 +493,9 @@ impl GridState {
 
 /// How near the selection's corner a press takes the fill handle, px.
 const FILL_GRIP: f64 = 5.0;
+
+/// Two presses closer than this are a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// The fill handle dragged to `cell` from selection `sel`: `sel` grown down,
 /// up, right or left, whichever way `cell` is farther outside it.
@@ -715,9 +724,10 @@ impl GridView {
                     gst.set(g);
                     return;
                 }
-                if let (Drag::Fill { .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
+                if let (Drag::Fill { from, .. }, DragPhase::Move | DragPhase::End) = (g.drag, phase) {
                     let sel = grow_to_merges(&*src, g.selection());
-                    let to = fill_reach(sel, cell);
+                    // A press that hardly moved (a click on the handle) fills nothing.
+                    let to = if (cx - from.0).abs() + (cy - from.1).abs() < 3.0 { sel } else { fill_reach(sel, cell) };
                     if phase == DragPhase::End {
                         g.drag = Drag::None;
                         if to != sel {
@@ -730,7 +740,7 @@ impl GridView {
                             return;
                         }
                     } else {
-                        g.drag = Drag::Fill { to };
+                        g.drag = Drag::Fill { to, from };
                     }
                     gst.set(g);
                     return;
@@ -740,7 +750,17 @@ impl GridView {
                     let (hx, hy) = (src.col_left(sel.c1 + 1), src.row_top(sel.r1 + 1));
                     if (cx - hx).abs() <= FILL_GRIP && (cy - hy).abs() <= FILL_GRIP {
                         g.picked = None;
-                        g.drag = Drag::Fill { to: sel };
+                        let now = std::time::Instant::now();
+                        if g.fill_press.is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK) {
+                            g.fill_press = None;
+                            gst.set(g);
+                            if let Some(f) = &act {
+                                f(GridAction::FillToData(sel));
+                            }
+                            return;
+                        }
+                        g.fill_press = Some(now);
+                        g.drag = Drag::Fill { to: sel, from: (cx, cy) };
                         gst.set(g);
                         return;
                     }
@@ -2041,6 +2061,13 @@ mod tests {
         let from = CellRange { r0: 1, c0: 1, r1: 2, c1: 1 };
         assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from, to: CellRange { r1: 6, ..from }, copy: false }));
         assert_eq!(state.get_cloned().selection(), CellRange { r1: 6, ..from });
+        // A double-click on the handle (now at B7's corner) asks to fill to the data's end.
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at: at(2.0, 7.0) });
+            app.handle_event(Event::PointerUp { at: at(2.0, 7.0) });
+            app.tick();
+        }
+        assert_eq!(log.borrow().last(), Some(&GridAction::FillToData(CellRange { r1: 6, ..from })));
         // Ctrl+D with one row chosen copies the row above into it.
         let mut g = state.get_cloned();
         g.select(4, 3);
