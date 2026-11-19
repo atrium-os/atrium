@@ -1210,7 +1210,9 @@ impl Sheets {
                 let (from, to) = (rect(from), rect(to));
                 d.fill(from, to, copy);
             }
-            GridAction::ResizeCol { col, width } => d.set_col_width(col, width),
+            GridAction::ResizeCol { col, width } => d.size_preview(false, col, width),
+            GridAction::ResizeRow { row, height } => d.size_preview(true, row, height),
+            GridAction::ResizeEnd => d.size_done(),
             GridAction::Undo => {
                 d.undo();
             }

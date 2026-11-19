@@ -3779,6 +3779,13 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Not yet:** remembering a hidden column's width for when it is shown, the double line Excel draws where rows or columns are hidden, and Home/Page keys skipping hidden ones.
 - **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
 
+### 16.90 Row heights by dragging, and sizes undone in one step (2026-11-19)
+
+- **Grid** (pergola): a press within 4 px of a row label's bottom edge drags that row's height (at least 6 px), as a column label's right edge drags its width; elsewhere on the label it still selects the row. It sends `GridAction::ResizeRow` while dragging and `GridAction::ResizeEnd` when let go (for columns too).
+- **Sheets:** the drag shows live (`Doc::size_preview`, not journaled), and letting go makes it one undoable `GridOp::Sizes` ("Row Height" or "Column Width", `Doc::size_done`). Column widths used to change without undo.
+- **Not yet:** double-clicking an edge to fit the contents, sizing several selected rows or columns at once, and a Row Height… / Column Width… box for exact numbers.
+- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`; atrium-sheets `a_dragged_edge_is_one_undo_step`.
+
 ## 17. Decisions (accepted 2026-11-14)
 
 Shankar agreed to all of them as recommended, 2026-11-14.

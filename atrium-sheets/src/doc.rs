@@ -373,6 +373,9 @@ pub struct Doc {
     /// clipboard: while the clipboard still holds that text, a paste brings
     /// formulas and styles too (a cut moves them).
     pub clip: Option<(officina_grid::clip::Clip, String)>,
+    /// While a column or row edge is dragged: the sheet, rows or columns,
+    /// and their sizes before, to make one undo step when it is let go.
+    pub sizing: Option<(u16, bool, Vec<(u32, f64)>)>,
     /// A value a validation rule warns about, just typed: the window asks
     /// whether to keep it (§16.83).
     pub warned: Option<(CellAddr, String)>,
@@ -430,7 +433,7 @@ impl Doc {
     }
 
     pub fn from_workbook(wb: Workbook, name: &str) -> Self {
-        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None }
+        Self { wb, history: { let mut h = History::new(); h.limit = UNDO_LIMIT; h }, name: name.into(), dirty: false, sheet: 0, autosave: None, status: String::new(), csv_sep: b',', notes: Vec::new(), protection: None, recalc_budget: None, memory_budget: MAKE_LIMIT, warned: None, circling: false, clip: None, sizing: None }
     }
 
     /// A CSV file's contents as a new one-sheet document. Formulas stay text.
@@ -767,6 +770,45 @@ impl Doc {
         self.dirty = true;
     }
 
+    /// Column (`rows` false) or row `i` shown at `px` while its edge is
+    /// dragged; [`size_done`](Self::size_done) makes it one undo step.
+    pub fn size_preview(&mut self, rows: bool, i: u32, px: f64) {
+        let s = self.sheet;
+        fn sizes(d: &Doc, s: u16, rows: bool) -> &officina_grid::column::Sizes {
+            if rows { &d.wb.sheet(s).row_sizes } else { &d.wb.sheet(s).col_sizes }
+        }
+        if self.sizing.as_ref().is_none_or(|z| (z.0, z.1) != (s, rows)) {
+            self.size_done();
+            self.sizing = Some((s, rows, sizes(self, s, rows).overrides().to_vec()));
+        }
+        let px = px.clamp(1.0, 8192.0);
+        let mut over = sizes(self, s, rows).overrides().to_vec();
+        match over.binary_search_by_key(&i, |o| o.0) {
+            Ok(k) => over[k].1 = px,
+            Err(k) => over.insert(k, (i, px)),
+        }
+        // A new list each time, so views keyed on it see the change.
+        let sh = self.wb.sheet_mut(s);
+        let sz = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
+        *sz = officina_grid::column::Sizes::from_overrides(sz.default, over);
+    }
+
+    /// The edge let go: the sizes it left, as one undo step.
+    pub fn size_done(&mut self) {
+        let Some((s, rows, old)) = self.sizing.take() else { return };
+        if s as usize >= self.wb.sheet_count() {
+            return;
+        }
+        let sh = self.wb.sheet_mut(s);
+        let sz = if rows { &mut sh.row_sizes } else { &mut sh.col_sizes };
+        let now = sz.overrides().to_vec();
+        if now == old {
+            return;
+        }
+        *sz = officina_grid::column::Sizes::from_overrides(sz.default, old);
+        self.run(if rows { "Row Height" } else { "Column Width" }, vec![GridOp::Sizes { sheet: s, rows, over: now }]);
+    }
+
     /// Drops the file's macros (not undoable: the file on disk still has them until
     /// the next save).
     pub fn remove_macros(&mut self) {
@@ -953,6 +995,26 @@ mod tests {
         assert!(d.clip.is_none());
         assert!(d.undo());
         assert_eq!(d.wb.formula_text(CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
+    }
+
+    #[test]
+    fn a_dragged_edge_is_one_undo_step() {
+        let mut d = Doc::new("sizes");
+        for h in [25.0, 30.0, 42.0] {
+            d.size_preview(true, 3, h);
+        }
+        assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
+        d.size_done();
+        assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
+        d.size_preview(false, 1, 150.0);
+        d.size_done();
+        assert_eq!(d.wb.sheet(0).col_sizes.size(1), 150.0);
+        assert!(d.undo());
+        assert_eq!(d.wb.sheet(0).col_sizes.size(1), d.wb.sheet(0).col_sizes.default);
+        assert!(d.undo());
+        assert_eq!(d.wb.sheet(0).row_sizes.size(3), d.wb.sheet(0).row_sizes.default);
+        assert!(d.redo());
+        assert_eq!(d.wb.sheet(0).row_sizes.size(3), 42.0);
     }
 
     #[test]

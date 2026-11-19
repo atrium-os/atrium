@@ -30,7 +30,7 @@
 //! rows and columns and their labels; presses there map to the unscrolled
 //! cells ([`Geom::content`]), and moving the cursor keeps it clear of them.
 //!
-//! Not yet: row resizing, auto-scroll while dragging a
+//! Not yet: auto-scroll while dragging a
 //! selection past the edge, Ctrl+arrow data edges beyond what the source
 //! says, and placing the caret by pointer in the editor.
 
@@ -64,6 +64,8 @@ pub const HEADER_H: f32 = 24.0;
 pub const RESIZE_GRIP: f32 = 4.0;
 /// The narrowest a column can be dragged.
 pub const MIN_COL_W: f64 = 12.0;
+/// The lowest a dragged row goes, px.
+pub const MIN_ROW_H: f64 = 6.0;
 /// Text inset from a cell's edges.
 const PAD: f32 = 4.0;
 const TEXT_SIZE: f32 = type_size::SM;
@@ -403,6 +405,8 @@ enum Drag {
     Cols,
     Rows,
     Resize { col: u32, x0: f32, w0: f64 },
+    /// A row's bottom edge dragged (in the row labels).
+    ResizeRow { row: u32, y0: f32, h0: f64 },
     /// A picked float pressed: moved (or sized from its corner) by the
     /// distance from where the press began, content px.
     Float { key: u64, size: bool, from: (f64, f64), dx: f64, dy: f64 },
@@ -448,6 +452,10 @@ pub enum GridAction {
     Clear(CellRange),
     /// Column `col` dragged to `width` px.
     ResizeCol { col: u32, width: f64 },
+    /// Row `row` dragged to `height` px.
+    ResizeRow { row: u32, height: f64 },
+    /// A column or row resize let go: the sizes it left are final.
+    ResizeEnd,
     Undo,
     Redo,
     Copy(CellRange),
@@ -1019,6 +1027,14 @@ impl GridView {
                         return;
                     }
                     (DragPhase::Move, Drag::Cols) => g.cursor = (geom.rows - 1, c),
+                    (DragPhase::End, Drag::Resize { .. }) => {
+                        g.drag = Drag::None;
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeEnd);
+                        }
+                        return;
+                    }
                     (DragPhase::End, _) => g.drag = Drag::None,
                     _ => return,
                 }
@@ -1083,15 +1099,42 @@ impl GridView {
                 let (_, cy) = geom.content(&st, crate::geom::Point::new(geom.body.x() + geom.fz[0] as f32, p.y));
                 let row = src.row_at(cy.max(0.0));
                 let mut g = gst.get_cloned();
-                match phase {
-                    DragPhase::Start => {
+                match (phase, g.drag) {
+                    (DragPhase::Start, _) => {
                         commit(&mut g, &act);
-                        g.anchor = (row, 0);
-                        g.cursor = (row, geom.cols - 1);
-                        g.drag = Drag::Rows;
+                        // Near a row's bottom edge: resize that row.
+                        let grip = if (src.row_top(row + 1) - cy).abs() <= RESIZE_GRIP as f64 {
+                            Some(row)
+                        } else if row > 0 && (cy - src.row_top(row)).abs() <= RESIZE_GRIP as f64 {
+                            Some(src.row_at((src.row_top(row) - 0.5).max(0.0)))
+                        } else {
+                            None
+                        };
+                        match grip {
+                            Some(k) => g.drag = Drag::ResizeRow { row: k, y0: p.y, h0: src.row_top(k + 1) - src.row_top(k) },
+                            None => {
+                                g.anchor = (row, 0);
+                                g.cursor = (row, geom.cols - 1);
+                                g.drag = Drag::Rows;
+                            }
+                        }
                     }
-                    DragPhase::Move if g.drag == Drag::Rows => g.cursor = (row, geom.cols - 1),
-                    DragPhase::End => g.drag = Drag::None,
+                    (DragPhase::Move, Drag::ResizeRow { row, y0, h0 }) => {
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeRow { row, height: (h0 + (p.y - y0) as f64).max(MIN_ROW_H) });
+                        }
+                        return;
+                    }
+                    (DragPhase::Move, Drag::Rows) => g.cursor = (row, geom.cols - 1),
+                    (DragPhase::End, Drag::ResizeRow { .. }) => {
+                        g.drag = Drag::None;
+                        gst.set(g);
+                        if let Some(a) = &act {
+                            a(GridAction::ResizeEnd);
+                        }
+                        return;
+                    }
+                    (DragPhase::End, _) => g.drag = Drag::None,
                     _ => return,
                 }
                 gst.set(g);
@@ -2410,6 +2453,31 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(hw + 158.0 + 30.0, HEADER_H / 2.0) });
         app.tick();
         assert_eq!(state.get_cloned().selection(), CellRange { r0: 0, c0: 2, r1: 99, c1: 2 });
+    }
+
+    #[test]
+    fn a_row_label_s_edge_resizes_the_row() {
+        let (mut app, _, _, state, log) = host(100, 20);
+        app.tick();
+        let hw = GridView::header_width(TILE_ROWS * 2);
+        // Row 2's bottom edge (40 px into the rows), dragged 15 px down.
+        let edge = Point::new(hw / 2.0, HEADER_H + 40.0 - 1.0);
+        app.handle_event(Event::PointerDown { at: edge });
+        app.handle_event(Event::PointerMove { at: Point::new(edge.x, edge.y + 15.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, edge.y + 15.0) });
+        app.tick();
+        let got: Vec<_> = log.borrow().iter().filter(|a| matches!(a, GridAction::ResizeRow { .. } | GridAction::ResizeEnd)).cloned().collect();
+        assert_eq!(got, [GridAction::ResizeRow { row: 1, height: 35.0 }, GridAction::ResizeEnd]);
+        // Just below the edge, the next row's top: still row 2. Mid-label: selects.
+        log.borrow_mut().clear();
+        app.handle_event(Event::PointerDown { at: Point::new(edge.x, HEADER_H + 41.0) });
+        app.handle_event(Event::PointerMove { at: Point::new(edge.x, HEADER_H + 31.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 31.0) });
+        assert_eq!(log.borrow().first(), Some(&GridAction::ResizeRow { row: 1, height: MIN_ROW_H.max(10.0) }));
+        app.handle_event(Event::PointerDown { at: Point::new(edge.x, HEADER_H + 70.0) });
+        app.handle_event(Event::PointerUp { at: Point::new(edge.x, HEADER_H + 70.0) });
+        app.tick();
+        assert_eq!(state.get_cloned().selection(), CellRange { r0: 3, c0: 0, r1: 3, c1: 19 });
     }
 
     #[test]
