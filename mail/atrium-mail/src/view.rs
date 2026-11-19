@@ -1336,7 +1336,7 @@ impl Mail {
 
     pub fn sanitize_file(&self, k: usize, i: usize, activation: Option<[u8; 16]>) {
         let Some((msg, file)) = self.file_at(k, i) else { return };
-        if !file.can_open || !matches!(file.mime, Some("text/html" | "application/pdf")) { return; }
+        if !file.can_open || mail_engine::attachments::CopyKind::from_mime(file.mime).is_none() { return; }
         let Some(activation) = activation else {
             self.file_note("Open sanitized copy needs a press.".into());
             return;
@@ -3187,7 +3187,7 @@ pub fn lay_out(r: &Shown, w: f32) -> Vec<Item> {
         for i in 0..b.files.len() {
             out.push(Item::File { msg: k, i });
         }
-        if b.files.iter().any(|file| file.can_open && file.mime == Some("application/pdf")) {
+        if b.files.iter().any(|file| file.can_open && mail_engine::attachments::CopyKind::from_mime(file.mime).is_some_and(|k| k != mail_engine::attachments::CopyKind::Html)) {
             out.push(Item::VisualCopyNote);
         }
         if !b.files.is_empty() {
@@ -4706,7 +4706,7 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             button(ctx, "Save", Box::new(move || mm.save_file(k, i)));
             if f.can_open {
                 let mm = mail.clone();
-                if matches!(f.mime, Some("text/html" | "application/pdf")) {
+                if mail_engine::attachments::CopyKind::from_mime(f.mime).is_some() {
                     let m = mail.clone();
                     button(ctx, "Open sanitized copy", Box::new(move || m.sanitize_file(k, i, pergola::clipboard::current_activation())));
                 }
@@ -4732,7 +4732,7 @@ fn draw_item(ctx: &mut Ctx, item: &Item, s: &Shown, mail: &Mail, x: f32, tw: f32
             text(ctx, nx + nw + em(8.0), cy, &fit(&said, type_size::XS, Weight::Regular, room - nw - em(8.0)), type_size::XS, Weight::Regular, c);
         }
         Item::VisualCopyNote => {
-            text(ctx, x, cy, "Sanitized PDFs are images. Search and text selection are lost.", type_size::XS, Weight::Regular, t.text_primary());
+            text(ctx, x, cy, "PDF and Office copies are page images. Search and text selection are lost.", type_size::XS, Weight::Regular, t.text_primary());
         }
         Item::Gap => {}
     }

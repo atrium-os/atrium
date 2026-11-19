@@ -9,11 +9,32 @@ use std::time::{Duration, Instant};
 use limen::pdf_viewer as folium;
 use mail_engine::attachments::ExportSource;
 
-pub fn render(source: ExportSource, token: [u8; 16]) -> Result<OwnedFd, String> {
+pub fn render(source: ExportSource, token: Option<[u8; 16]>) -> Result<OwnedFd, String> {
+    if let ExportSource::Office { odt, bytes } = source {
+        let input =
+            limen::fdpass::sealed_file("office-input", &bytes).map_err(|e| e.to_string())?;
+        let workers = atrium_worker::Workers::from_root(std::path::Path::new("/"), false)
+            .map_err(|e| e.to_string())?;
+        let copy: mail_office_copy::OfficeCopy = workers
+            .max_answer((32 << 20) + 4096)
+            .call(
+                "office-copy",
+                &mail_office_copy::RenderOffice { odt },
+                Some(input.into()),
+            )
+            .map_err(|e| format!("Officina could not render the whole document: {e}"))?;
+        let pdf = copy.into_pdf()?;
+        return limen::fdpass::sealed_file("sanitized.pdf", &pdf).map_err(|e| e.to_string());
+    }
+    let token = token.ok_or("Document viewer unavailable")?;
     let explain = |e| format!("document viewer: {e:?}");
     let mut parent = Parent::connect().map_err(explain)?;
     let visual = matches!(source, ExportSource::Pdf(_));
-    let role = if visual { "pdf-sanitizer" } else { "doc-viewer" };
+    let role = if visual {
+        "pdf-sanitizer"
+    } else {
+        "doc-viewer"
+    };
     let id = parent.request(role, token).map_err(explain)?;
     // Limen authorizes returned files only after verifying both window
     // owners at bind time. Bind the worker before asking for its PDF.
@@ -35,6 +56,7 @@ pub fn render(source: ExportSource, token: [u8; 16]) -> Result<OwnedFd, String> 
         }
     }
     match source {
+        ExportSource::Office { .. } => unreachable!(),
         ExportSource::Pdf(bytes) => {
             let fd =
                 limen::fdpass::sealed_file("original.pdf", &bytes).map_err(|e| e.to_string())?;

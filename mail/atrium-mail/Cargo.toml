@@ -10,6 +10,7 @@ description = "Mail's windows (docs/spec/mail.md §9, §15): places, the message
 # and check): the parse jail talks to the engine over its socket.
 [package.metadata.atrium.workers]
 parse = "../mail-parse"
+office-copy = "../mail-office-copy"
 
 [lib]
 name = "atrium_mail"
@@ -20,6 +21,7 @@ name = "atrium-mail"
 path = "src/bin/atrium-mail.rs"
 
 [dependencies]
+mail-office-copy = { path = "../mail-office-copy", default-features = false }
 pergola = { path = "../../pergola" }
 fresco-client = { path = "../../fresco-client" }
 mail-engine = { path = "../mail-engine" }

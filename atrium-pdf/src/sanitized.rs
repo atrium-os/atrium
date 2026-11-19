@@ -5,7 +5,8 @@ use folium_content::{Interp, Matrix, Rect, Shared};
 use folium_doc::Doc;
 use folium_render::{Renderer, View};
 use folium_syntax::lexer::{Lexer, Token};
-use folium_syntax::write::{self as w, Writer};
+use folium_syntax::write as w;
+#[cfg(test)] use w::Writer;
 use folium_syntax::{Dict, Error, Object, Result, Source};
 use std::time::{Duration, Instant};
 
@@ -279,10 +280,7 @@ pub fn export(source: Box<dyn Source>) -> Result<Vec<u8>> {
         .iter()
         .all(|k| catalog.get(k).is_none()),
     )?;
-    let mut pdf = Writer::new(Vec::new(), "1.4")?;
-    let root = pdf.reserve();
-    let tree = pdf.reserve();
-    let mut kids = Vec::new();
+    let mut pdf = w::ImagePages::new()?;
     let deadline = Instant::now() + Duration::from_secs(20);
     let expired = || Instant::now() >= deadline;
     let mut pixels = 0;
@@ -346,61 +344,11 @@ pub fn export(source: Box<dyn Source>) -> Result<Vec<u8>> {
             .chunks_exact(4)
             .flat_map(|px| px[..3].iter().copied())
             .collect();
-        let img = pdf.reserve();
-        pdf.stream(
-            img,
-            w::dict([
-                ("Type", w::name("XObject")),
-                ("Subtype", w::name("Image")),
-                ("Width", w::int(pw.into())),
-                ("Height", w::int(ph.into())),
-                ("BitsPerComponent", w::int(8)),
-                ("ColorSpace", w::name("DeviceRGB")),
-            ]),
-            &rgb,
-            true,
-        )?;
-        let content = pdf.reserve();
-        pdf.stream(
-            content,
-            Dict::new(),
-            format!("q {} 0 0 {} 0 0 cm /PageImage Do Q\n", w::num(w), w::num(h)).as_bytes(),
-            false,
-        )?;
-        let page = pdf.reserve();
-        let resources = w::dict([(
-            "XObject",
-            Object::Dict(w::dict([("PageImage", w::reference(img))])),
-        )]);
-        pdf.obj(
-            page,
-            &Object::Dict(w::dict([
-                ("Type", w::name("Page")),
-                ("Parent", w::reference(tree)),
-                ("MediaBox", w::nums(&[0., 0., w, h])),
-                ("Resources", Object::Dict(resources)),
-                ("Contents", w::reference(content)),
-            ])),
-        )?;
-        kids.push(w::reference(page));
+        pdf.page(w, h, pw, ph, &rgb)?;
     }
-    pdf.obj(
-        tree,
-        &Object::Dict(w::dict([
-            ("Type", w::name("Pages")),
-            ("Count", w::int(kids.len() as i64)),
-            ("Kids", Object::Array(kids)),
-        ])),
-    )?;
-    pdf.obj(
-        root,
-        &Object::Dict(w::dict([
-            ("Type", w::name("Catalog")),
-            ("Pages", w::reference(tree)),
-        ])),
-    )?;
     require(!expired())?;
-    Ok(pdf.finish(root, None)?.0)
+    Ok(pdf.finish()?)
+
 }
 
 #[cfg(test)]

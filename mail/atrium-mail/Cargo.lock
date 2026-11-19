@@ -307,6 +307,7 @@ dependencies = [
  "limen",
  "mail-compose",
  "mail-engine",
+ "mail-office-copy",
  "mail-schema",
  "mail-smime",
  "mail-store",
@@ -2022,6 +2023,15 @@ dependencies = [
  "postcard",
  "serde",
  "unicode-security",
+]
+
+[[package]]
+name = "mail-office-copy"
+version = "0.1.0"
+dependencies = [
+ "atrium-message",
+ "folium-syntax",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]

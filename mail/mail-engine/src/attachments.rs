@@ -10,9 +10,25 @@ use crate::{Engine, Error};
 /// The most attachment text kept for one message's search.
 pub const FILES_TEXT_MAX: usize = 4 << 20;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyKind { Html, Pdf, Docx, Odt }
+
+impl CopyKind {
+    pub fn from_mime(mime: Option<&str>) -> Option<Self> {
+        Some(match mime? {
+            "text/html" => Self::Html,
+            "application/pdf" => Self::Pdf,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Self::Docx,
+            "application/vnd.oasis.opendocument.text" => Self::Odt,
+            _ => return None,
+        })
+    }
+}
+
 pub enum ExportSource {
     Html(mail_schema::Document),
     Pdf(Vec<u8>),
+    Office { odt: bool, bytes: Vec<u8> },
 }
 
 impl Engine {
@@ -28,7 +44,7 @@ impl Engine {
 
     /// Capture the selected part and its session key on the engine thread.
     /// Reading and normalizing a large attachment run on the export thread.
-    pub fn prepare_attachment_document(&self, msg: MsgId, which: Which, pdf: bool)
+    pub fn prepare_attachment_document(&self, msg: MsgId, which: Which, kind: CopyKind)
         -> Result<impl FnOnce() -> Result<ExportSource, Error> + Send + 'static, Error> {
         let m = self.store.message(msg)?;
         let full = m.full.ok_or(Error::NotFound)?;
@@ -37,9 +53,13 @@ impl Engine {
         let parser = self.parser.clone();
         Ok(move || {
             let raw = store.blob(&full)?;
-            if pdf {
+            if kind != CopyKind::Html {
                 let attachment = parser.attachment(&raw, &which, key)?.ok_or(Error::NotFound)?;
-                return Ok(ExportSource::Pdf(attachment.bytes));
+                return Ok(if kind == CopyKind::Pdf {
+                    ExportSource::Pdf(attachment.bytes)
+                } else {
+                    ExportSource::Office { odt: kind == CopyKind::Odt, bytes: attachment.bytes }
+                });
             }
             let len = raw.len() as u64;
             let mut jail = parser.start()?;

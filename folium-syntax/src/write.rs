@@ -269,3 +269,84 @@ mod tests {
         assert_eq!(&data.data[..], b"0 0 1 rg 10 10 50 50 re f");
     }
 }
+
+/// A fresh PDF containing only RGB page images.
+pub struct ImagePages {
+    pdf: Writer<Vec<u8>>,
+    root: Ref,
+    tree: Ref,
+    kids: Vec<Object>,
+}
+
+impl ImagePages {
+    pub fn new() -> io::Result<Self> {
+        let mut pdf = Writer::new(Vec::new(), "1.4")?;
+        let root = pdf.reserve();
+        let tree = pdf.reserve();
+        Ok(Self { pdf, root, tree, kids: Vec::new() })
+    }
+
+    pub fn page(&mut self, w: f64, h: f64, pw: u32, ph: u32, rgb: &[u8]) -> io::Result<()> {
+        if !(w > 0. && h > 0. && w.is_finite() && h.is_finite() && pw > 0 && ph > 0)
+            || (pw as usize).checked_mul(ph as usize).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid page bitmap"));
+        }
+        let img = self.pdf.reserve();
+        self.pdf.stream(
+            img,
+            dict([
+                ("Type", name("XObject")),
+                ("Subtype", name("Image")),
+                ("Width", int(pw.into())),
+                ("Height", int(ph.into())),
+                ("BitsPerComponent", int(8)),
+                ("ColorSpace", name("DeviceRGB")),
+            ]),
+            rgb,
+            true,
+        )?;
+        let content = self.pdf.reserve();
+        self.pdf.stream(
+            content,
+            Dict::new(),
+            format!("q {} 0 0 {} 0 0 cm /PageImage Do Q\n", num(w), num(h)).as_bytes(),
+            false,
+        )?;
+        let page = self.pdf.reserve();
+        let resources = dict([(
+            "XObject",
+            Object::Dict(dict([("PageImage", reference(img))])),
+        )]);
+        self.pdf.obj(
+            page,
+            &Object::Dict(dict([
+                ("Type", name("Page")),
+                ("Parent", reference(self.tree)),
+                ("MediaBox", nums(&[0., 0., w, h])),
+                ("Resources", Object::Dict(resources)),
+                ("Contents", reference(content)),
+            ])),
+        )?;
+        self.kids.push(reference(page));
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<Vec<u8>> {
+        self.pdf.obj(
+            self.tree,
+            &Object::Dict(dict([
+                ("Type", name("Pages")),
+                ("Count", int(self.kids.len() as i64)),
+                ("Kids", Object::Array(self.kids)),
+            ])),
+        )?;
+        self.pdf.obj(
+            self.root,
+            &Object::Dict(dict([
+                ("Type", name("Catalog")),
+                ("Pages", reference(self.tree)),
+            ])),
+        )?;
+        Ok(self.pdf.finish(self.root, None)?.0)
+    }
+}

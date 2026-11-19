@@ -47,6 +47,14 @@ entry    = "bin/mail-sync-worker"
 lifetime = "session"
 memory   = "256M"
 
+# Foreign document parsers see only the selected sealed attachment.
+[[workers]]
+name = "office-copy"
+entry = "bin/mail-office-copy"
+input = "fd"
+memory = "512M"
+cpu = "30s"
+
 [[links]]
 schemes = ["mailto"]
 

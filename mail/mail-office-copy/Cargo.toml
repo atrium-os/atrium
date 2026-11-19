@@ -1,0 +1,29 @@
+[package]
+name = "mail-office-copy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = ["renderer"]
+renderer = ["dep:atrium-worker","dep:officina-convert","dep:officina-text","dep:tiny-skia","dep:ttf-parser","dep:roxmltree"]
+
+[[bin]]
+name = "mail-office-copy"
+path = "src/main.rs"
+required-features = ["renderer"]
+
+[dependencies]
+atrium-message = { path = "../../sdk/atrium-message" }
+miniz_oxide = "0.8"
+atrium-worker = { path = "../../sdk/atrium-worker", optional = true }
+officina-convert = { path = "../../officina-convert", optional = true }
+officina-text = { path = "../../officina-text", optional = true }
+folium-syntax = { path = "../../folium-syntax" }
+tiny-skia = { version = "0.11", optional = true }
+ttf-parser = { version = "0.25", optional = true }
+roxmltree = { version = "0.20", optional = true }
+
+[patch.crates-io]
+pathfinder_simd = { path = "../../navigator-fonts/vendor/pathfinder_simd" }

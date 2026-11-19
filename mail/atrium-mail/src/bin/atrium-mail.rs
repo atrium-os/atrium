@@ -763,12 +763,14 @@ fn main() {
                 FileAct::Look => {}
                 FileAct::Sanitize { activation } => {
                     if converting { mail.file_note("Preparing a PDF copy…".into()); continue; }
-                    let Some(token) = win.embed_token() else { mail.file_note("Document viewer unavailable".into()); continue; };
+                    let token = win.embed_token();
                     let key = (ask.msg, ask.file.which.clone());
                     let ready = retry_copy.take().filter(|(k, _)| k == &key).map(|(_, fd)| fd);
-                    let visual = ask.file.mime == Some("application/pdf");
+                    use mail_engine::attachments::CopyKind;
+                    let Some(kind) = CopyKind::from_mime(ask.file.mime) else { continue };
+                    let visual = kind != CopyKind::Html;
                     let doc = if ready.is_none() {
-                        match engine.prepare_attachment_document(ask.msg, ask.file.which.clone(), visual) {
+                        match engine.prepare_attachment_document(ask.msg, ask.file.which.clone(), kind) {
                             Ok(doc) => Some(doc),
                             Err(e) => { mail.file_note(format!("Could not convert attachment: {e}")); continue; }
                         }

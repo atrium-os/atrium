@@ -548,7 +548,7 @@ doesn't run a spam classifier of its own in v1.
 #### 8.2.1 Open sanitized copy
 
 **What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
-type checks as `text/html` or `application/pdf`. Mail keeps the original attachment
+type checks as HTML, PDF, DOCX or ODT. Mail keeps the original attachment
 in the message and opens the completed copy in the persona’s default PDF handler.
 Both `invoice.html` and `invoice.pdf` produce `invoice-sanitized.pdf`.
 
@@ -570,7 +570,7 @@ actions, forms, attachments, source HTML, source fonts or original image streams
 A displayed address or misleading sentence can still appear as text. This action
 makes a passive copy and makes no malware-scan claim.
 
-**PDF input.** The reader explains “Sanitized PDFs are images. Search and text
+**PDF input.** The reader explains “PDF and Office copies are page images. Search and text
 selection are lost.” Mail sends the sealed attachment to Limen’s fixed
 `pdf-sanitizer` worker, `org.atrium.folium.sanitizer`. The jailed Folium binary
 renders the crop and rotation of each page on white at 144 dpi. Its writer
@@ -586,6 +586,29 @@ annotations, optional content, encryption (including an empty user password),
 repaired page trees, unsupported drawing or image codecs, and exceeded budgets
 refuse the entire conversion. Limits include 16 MiB of source, 64 pages,
 8 million output pixels per page and 24 million across the document.
+
+**DOCX and ODT input.** Mail hands a sealed copy of the selected part to its
+one-shot `office-copy` worker. Portcullis starts the worker in its own jail.
+It enters Capsicum before reading the input and needs no mailbox, network,
+file picker or external font directory. The first profile supports minimal
+text documents with paragraphs and automatic pagination. DOCX also supports
+bold, italic and a break before a paragraph. The worker checks package identity
+and the XML structure before calling Officina’s importer. It compares the
+source paragraphs to the model, paginates with the pinned fonts, and draws
+each glyph outline on white at 144 dpi. An incomplete import, missing glyph,
+clipped outline or unaccounted page item refuses the entire document.
+
+Plain documents saved by Officina can also carry its default stylesheet and
+page setup. The worker reconstructs the package from its paragraphs and requires
+every uncompressed part to match. Tables, pictures, hyperlinks,
+custom styles, headers and footers, fields, tracked changes, macros and
+encrypted packages currently cause refusal, including when only the last page
+uses the feature. Limits include 8 MiB of input and inflated package data,
+4,096 paragraphs, 64 pages, 8 million pixels per page, 48 million pixels in
+total, and 32 MiB of output. The jail returns a bounded list of page dimensions
+and compressed RGB samples. Mail checks the exact pixel length for every page
+and writes a fresh image-only PDF with the same page writer as Folium.
+Search, selection and accessibility text are lost.
 
 **Delivery and failure.** Return a completed, sealed, read-only PDF descriptor.
 Apply §8.2's broker checks and same-persona routing to that descriptor. If conversion
