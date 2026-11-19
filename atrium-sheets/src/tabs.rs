@@ -50,6 +50,7 @@ pub enum TabCmd {
     /// The comment bar for the cursor's cell; its field submitted; closed.
     Commenting,
     CommentDone,
+    CommentFormat(pergola::inline::Emphasis),
     CommentCancel,
     /// The link bar for the cursor's cell; its field submitted; closed.
     Linking,

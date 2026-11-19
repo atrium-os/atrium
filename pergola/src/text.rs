@@ -66,7 +66,7 @@ pub fn set_text_scale(milli: u32) -> bool {
 /// pixel row as a rule drawn at its baseline, at any fractional scale.
 pub fn wire_top_device(rect: crate::geom::Rect, style: &TextStyle, k: f32) -> f32 {
     let asc = match style.family.as_str() {
-        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 1.025,
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexSans-Italic" | "IBMPlexMono" => 1.025,
         _ => return (rect.y() * k).round(),
     };
     let baseline = (wire_top(rect, style) + asc * style.em()) * k;
@@ -76,7 +76,7 @@ pub fn wire_top_device(rect: crate::geom::Rect, style: &TextStyle, k: f32) -> f3
 pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
     // (ascender, cap height) in em, read from the shipped faces.
     let (asc, cap) = match style.family.as_str() {
-        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => (1.025, 0.698),
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexSans-Italic" | "IBMPlexMono" => (1.025, 0.698),
         _ => return rect.y(),
     };
     let baseline = rect.y() + rect.h() / 2.0 + cap * style.em() / 2.0;
@@ -88,7 +88,7 @@ pub fn wire_top(rect: crate::geom::Rect, style: &TextStyle) -> f32 {
 /// widgets of different heights.
 pub fn baseline(h: f32, style: &TextStyle) -> f32 {
     let cap = match style.family.as_str() {
-        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexMono" => 0.698,
+        crate::theme::font::SANS | crate::theme::font::MONO | "IBMPlexSans" | "IBMPlexSans-Italic" | "IBMPlexMono" => 0.698,
         _ => 0.7,
     };
     h / 2.0 + cap * style.em() / 2.0

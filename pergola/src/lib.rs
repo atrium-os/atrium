@@ -33,6 +33,7 @@ pub mod flow;
 pub mod geom;
 pub mod icon;
 pub mod input;
+pub mod inline;
 pub mod interaction;
 pub mod layout;
 pub mod node;

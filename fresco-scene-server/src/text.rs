@@ -1008,6 +1008,8 @@ impl TextEngine {
                 &["IBMPlexMono-Regular.ttf", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"],
             "IBMPlexSans" | "DejaVuSans" | "system-sans" =>
                 &["IBMPlexSans.ttf", "DejaVuSans.ttf"],
+            "IBMPlexSans-Italic" =>
+                &["IBMPlexSans-Italic.ttf", "DejaVuSans-Oblique.ttf", "IBMPlexSans.ttf"],
             // System icon set (visual-language §9) as a glyph font —
             // icons ride the text pipeline: measured, atlased, tinted.
             "Phosphor" | "system-icons" =>
@@ -1082,6 +1084,16 @@ mod tests {
     fn plex(t: &mut TextEngine) -> u32 {
         static PLEX: &[u8] = include_bytes!("../../fonts/ibm-plex/IBMPlexSans.ttf");
         t.insert_font("system-sans".into(), Arc::from(PLEX), 1).unwrap()
+    }
+
+    #[test]
+    fn plex_sans_italic_alias_opens_the_italic_face() {
+        let mut engine = TextEngine::new();
+        engine.search_paths = vec![PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../fonts/ibm-plex"))];
+        let (id, _) = engine.open("IBMPlexSans-Italic").unwrap();
+        let face = ttf_parser::Face::parse(&engine.fonts[&id].bytes, 0).unwrap();
+        assert!(face.is_italic());
+        assert!(face.is_variable());
     }
 
     /// Latin in the run's font stays per character; another script goes to

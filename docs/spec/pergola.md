@@ -474,6 +474,10 @@ stays frescod's, drawn outside any app.
   scale is the spread against the start, so the zoom follows the fingers exactly, and it settles
   (content laid out again) only after the fingers lift. Arrows, Page Up/Down, Space, Home/End go to the
   focused scroll view, else the one under the pointer. A press catches a fling.
+- **Inline emphasis.** A `TextField` with `TextEdit::rich` draws bold, italic, underline and
+  strikethrough runs. Caret and selection geometry follow the measured runs. The value keeps its
+  line breaks and tabs, shown as marks in the field. Edits and undo carry both text and marks.
+  Toolbar buttons can keep the editor focused on pointer press and still accept keyboard focus.
 - **Key repeat.** A held key arrives as `KeyEventKind::Repeat` (Tactus generates the repeats).
   Text entry, arrows, sliders, menus' arrows and scroll keys act on it again
   (`KeyEventKind::pressed`); Space and Enter on a button, a toggle or a menu item, and Enter in a

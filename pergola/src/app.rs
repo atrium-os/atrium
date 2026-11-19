@@ -531,7 +531,12 @@ impl<V: View> App<V> {
                         cb(crate::interaction::DragPhase::Start, self.drag_point(d, *at));
                     }
                 }
-                let new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
+                let mut new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
+                if self.focused.is_some() && new_focus.and_then(|id| self.interactions.get(id))
+                    .is_some_and(|h| h.retain_focus_on_press)
+                {
+                    new_focus = self.focused;
+                }
                 if self.focused != new_focus || self.focus_visible {
                     self.focused = new_focus;
                     self.focus_visible = false;

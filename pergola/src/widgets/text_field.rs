@@ -11,11 +11,12 @@
 //! selected text; the §14.1 focus ring while it has keyboard focus.
 //!
 //! Not yet: placing the caret by pointer (the field takes the click as
-//! focus and keeps its caret), scrolling text longer than the field, and
-//! an IME (the core models composition; the input method service that
+//! focus and keeps its caret) and an IME (the core models composition; the input method service that
 //! drives it doesn't exist yet).
 
 use std::rc::Rc;
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::event::{Event, KeyEventKind};
 use crate::geom::Rect;
@@ -84,20 +85,41 @@ fn inflate(r: Rect, by: f32) -> Rect {
     Rect::new(r.x() - by, r.y() - by, r.w() + 2.0 * by, r.h() + 2.0 * by)
 }
 
+fn inline_char(ch: char) -> char {
+    match ch {
+        '\n' => '¶',
+        '\t' => '⇥',
+        c if c.is_control() => '�',
+        c => c,
+    }
+}
+
+fn shown_len(s: &str, secret: bool, rich: bool) -> usize {
+    if secret {
+        s.graphemes(true).count() * '•'.len_utf8()
+    } else if rich {
+        s.chars().map(|ch| inline_char(ch).len_utf8()).sum()
+    } else {
+        s.len()
+    }
+}
+
 /// What the field shows: the text (bullets for a password, one per
 /// grapheme) with any composition spliced in at the caret, and the map
 /// from text offsets to shown offsets.
 fn shown(e: &TextEdit) -> (String, impl Fn(usize) -> usize + '_) {
-    use unicode_segmentation::UnicodeSegmentation;
     let pre = e.preedit().map_or("", |p| p.text.as_str());
     let caret = e.caret();
     let secret = e.is_secret();
+    let rich = e.is_rich();
     let mut out = String::new();
     let push = |s: &str, out: &mut String| {
         if secret {
             for _ in s.graphemes(true) {
                 out.push('\u{2022}');
             }
+        } else if rich {
+            out.extend(s.chars().map(inline_char));
         } else {
             out.push_str(s);
         }
@@ -105,9 +127,29 @@ fn shown(e: &TextEdit) -> (String, impl Fn(usize) -> usize + '_) {
     push(&e.text()[..caret], &mut out);
     push(pre, &mut out);
     push(&e.text()[caret..], &mut out);
+    let rich_offsets = if rich {
+        let mut offsets = vec![0; e.text().len() + 1];
+        let mut end = 0;
+        for (at, ch) in e.text().char_indices() {
+            end += inline_char(ch).len_utf8();
+            offsets[at + ch.len_utf8()] = end;
+        }
+        Some(offsets)
+    } else {
+        None
+    };
+    let pre_len = shown_len(pre, secret, rich);
     let map = move |at: usize| -> usize {
-        let conv = |s: &str| if secret { s.graphemes(true).count() * '\u{2022}'.len_utf8() } else { s.len() };
-        if at <= caret { conv(&e.text()[..at]) } else { conv(&e.text()[..caret]) + conv(pre) + conv(&e.text()[caret..at]) }
+        let offset = if let Some(offsets) = &rich_offsets {
+            offsets[at]
+        } else if secret {
+            let head = &e.text()[..at.min(caret)];
+            let tail = &e.text()[at.min(caret)..at];
+            shown_len(head, true, false) + shown_len(tail, true, false)
+        } else {
+            at
+        };
+        offset + if at > caret { pre_len } else { 0 }
     };
     (out, map)
 }
@@ -120,8 +162,7 @@ impl View for TextField {
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::input_height() };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.rect.size.w, h);
 
-        // Node structure is the same in every state (ids stay stable):
-        // focus halo, focus ring, edge, fill, selection, text, caret.
+        // Keep the field's focus target stable across text and style changes.
         let halo_id = ctx.add(Node::Rect { rect: inflate(rect, 3.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 3.0 });
         let ring_id = ctx.add(Node::Rect { rect: inflate(rect, 1.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 1.0 });
         let bg_id = ctx.add(Node::Rect { rect, fill: theme.border_strong(), radius: radius::XS });
@@ -150,17 +191,41 @@ impl View for TextField {
         let clip = Rect::new(inner.x() + space::XS, inner.y(), (inner.w() - 2.0 * space::XS).max(0.0), inner.h());
         let clip_id = ctx.tree.insert(Some(bg_id), Node::layer(clip, 1.0, true));
         ctx.set_flex(clip_id, crate::layout::FlexStyle { free: true, ..Default::default() });
-        let width_of = |t: &str| Node::measure_text(t, &style(theme.text_primary())).w;
+        let primary = style(theme.text_primary());
+        let caret = edit.caret();
+        let pre_end = map(caret) + edit.preedit().map_or(0, |p| shown_len(&p.text, edit.is_secret(), edit.is_rich()));
+        let mut fragments = Vec::new();
+        if edit.is_rich() {
+            for (range, marks) in edit.inline_runs() {
+                if pre_end == map(caret) || range.end <= caret || range.start > caret {
+                    fragments.push((map(range.start)..map(range.end), marks));
+                } else {
+                    if range.start < caret {
+                        fragments.push((map(range.start)..map(caret), marks));
+                    }
+                    fragments.push((pre_end..map(range.end), marks));
+                }
+            }
+            if pre_end > map(caret) {
+                let at = fragments.partition_point(|(range, _)| range.end <= map(caret));
+                fragments.insert(at, (map(caret)..pre_end, 0));
+            }
+        } else {
+            fragments.push((0..display.len(), 0));
+        }
+        let width_to = |byte: usize| fragments.iter().take_while(|(r, _)| r.start < byte)
+            .map(|(r, marks)| Node::measure_text(&display[r.start..byte.min(r.end)], &crate::inline::style(&primary, *marks)).w)
+            .sum::<f32>();
         let caret_byte = match edit.preedit() {
-            Some(p) => map(edit.caret()) + if edit.is_secret() { 0 } else { p.cursor },
+            Some(p) => map(caret) + if edit.is_secret() { 0 } else { shown_len(&p.text[..p.text.floor_char_boundary(p.cursor)], false, edit.is_rich()) },
             None => map(edit.caret()),
         };
         let room = clip.x() + clip.w() - (rect.x() + space::SM) - CARET_W;
-        let shift = if focused { (width_of(&display[..caret_byte.min(display.len())]) - room).max(0.0) } else { 0.0 };
+        let shift = if focused { (width_to(caret_byte) - room).max(0.0) } else { 0.0 };
         let text_x = rect.x() + space::SM - shift;
         let line_h = Node::measure_text("Mg", &style(theme.text_primary())).h;
         let text_y = rect.y() + (rect.h() - line_h) / 2.0;
-        let x_at = |byte: usize| text_x + width_of(&display[..byte]);
+        let x_at = |byte: usize| text_x + width_to(byte);
 
         // Selection, behind the text (shown only while focused).
         let sel = edit.selection();
@@ -172,13 +237,26 @@ impl View for TextField {
         };
         ctx.tree.insert(Some(clip_id), Node::Rect { rect: sel_rect, fill: theme.selection_bg(), radius: 0.0 });
 
-        let (content, color) = if display.is_empty() {
-            (self.placeholder.clone(), theme.text_tertiary())
+        if display.is_empty() {
+            let placeholder = style(theme.text_tertiary());
+            let size = Node::measure_text(&self.placeholder, &placeholder);
+            ctx.tree.insert(Some(clip_id), Node::Text { rect: Rect::new(text_x, text_y, size.w, size.h), content: self.placeholder.clone(), style: placeholder });
         } else {
-            (display.clone(), theme.text_primary())
-        };
-        let size = Node::measure_text(&content, &style(color));
-        ctx.tree.insert(Some(clip_id), Node::Text { rect: Rect::new(text_x, text_y, size.w, size.h), content, style: style(color) });
+            let mut x = text_x;
+            for (r, marks) in &fragments {
+                if edit.is_rich() && x > clip.x() + clip.w() { break; }
+                let st = crate::inline::style(&primary, *marks);
+                let content = &display[r.clone()];
+                let size = Node::measure_text(content, &st);
+                let bounds = Rect::new(x, text_y, size.w, size.h);
+                x += size.w;
+                if edit.is_rich() && x < clip.x() { continue; }
+                for rule in crate::inline::rules(bounds, &st, *marks) {
+                    ctx.tree.insert(Some(clip_id), rule);
+                }
+                ctx.tree.insert(Some(clip_id), Node::Text { rect: bounds, content: content.into(), style: st });
+            }
+        }
 
         // The caret (and the composition's underline, while composing).
         let caret_rect = if focused && sel.is_empty() {
@@ -188,9 +266,9 @@ impl View for TextField {
         };
         ctx.tree.insert(Some(clip_id), Node::Rect { rect: caret_rect, fill: theme.accent_fg(), radius: 0.0 });
         let under = match edit.preedit() {
-            Some(p) if focused => {
+            Some(_) if focused => {
                 let a = x_at(map(edit.caret()));
-                let b = a + Node::measure_text(&p.text, &style(theme.text_primary())).w;
+                let b = x_at(pre_end);
                 Rect::new(a, text_y + line_h, b - a, stroke::DEFAULT)
             }
             _ => Rect::new(text_x, text_y, 0.0, 0.0),
@@ -210,6 +288,11 @@ impl View for TextField {
                 return;
             }
             let mut e = state.get_cloned();
+            if *kind == KeyEventKind::Repeat && e.is_rich() && (modifiers.ctrl || modifiers.meta)
+                && matches!(chars.to_ascii_lowercase().as_str(), "b" | "i" | "u")
+            {
+                return;
+            }
             match e.key(*key, *modifiers, chars) {
                 KeyOutcome::Changed => state.set(e),
                 KeyOutcome::Copy(t) => {

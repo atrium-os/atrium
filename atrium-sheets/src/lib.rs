@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod bench;
+mod comment;
 pub mod condfmt;
 pub mod data;
 pub mod doc;

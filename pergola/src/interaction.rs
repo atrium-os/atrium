@@ -63,6 +63,8 @@ pub struct Handlers {
     /// When `true`, this node can take keyboard focus. Pointer-down
     /// on a focusable node sets focus; Tab navigates among focusables.
     pub focusable: bool,
+    /// A toolbar action can keep an existing editor focused on pointer press.
+    pub retain_focus_on_press: bool,
     /// Tab (without Ctrl) goes to this node's key handler when it has
     /// focus, not to focus traversal: a code editor indents with it.
     /// Ctrl+Tab still moves focus.

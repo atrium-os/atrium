@@ -533,7 +533,7 @@ impl SheetSource {
         let (r, c) = self.note_at.get()?;
         let (comment, link, prompt) = {
             let d = self.doc.borrow();
-            let k = d.wb.comment(d.sheet, r, c).map(|k| (k.author.to_string(), k.text.to_string()));
+            let k = d.wb.comment(d.sheet, r, c).cloned();
             let l = d.wb.link_at(CellAddr::new(d.sheet, r, c)).map(|l| l.target.to_string());
             // A validation rule's input prompt, and whether it offers a list.
             let p = d.wb.validation_at(CellAddr::new(d.sheet, r, c)).and_then(|v| {
@@ -561,12 +561,9 @@ impl SheetSource {
         let pad = 8.0;
         let lh = 16.0;
         let mut lines: Vec<(String, u8)> = Vec::new();
-        if let Some((author, text)) = comment {
-            if !author.is_empty() {
-                lines.push((author, 1));
-            }
-            lines.extend(wrap_lines(&text, &st(0), NOTE_W - 2.0 * pad, NOTE_LINES).into_iter().map(|l| (l, 0)));
-        }
+        let rich_lines = comment.as_ref().map(|k| crate::comment::wrap(k, &st(0), NOTE_W - 2.0 * pad, NOTE_LINES)).unwrap_or_default();
+        let author = comment.as_ref().map(|k| k.author.as_ref()).filter(|name| !name.is_empty());
+        let comment_rows = usize::from(author.is_some()) + rich_lines.len();
         if let Some((msg, list)) = &prompt {
             if let Some((title, text)) = msg {
                 if !title.trim().is_empty() {
@@ -584,9 +581,9 @@ impl SheetSource {
             lines.extend(wrap_lines(&shown, &st(2), NOTE_W - 2.0 * pad, 3).into_iter().map(|l| (l, 2)));
             lines.push(("Ctrl+click to open".into(), 3));
         }
-        let h = 2.0 * pad + lh * lines.len() as f32;
+        let h = 2.0 * pad + lh * (comment_rows + lines.len()) as f32;
         // A comment's pale yellow; a link alone, a plain white box.
-        let (edge, fill) = if lines.iter().any(|l| l.1 < 2) || !linked {
+        let (edge, fill) = if comment.is_some() || lines.iter().any(|l| l.1 < 2) || !linked {
             (Color::rgba(0.55, 0.5, 0.3, 1.0), Color::rgba(1.0, 0.97, 0.78, 1.0))
         } else {
             (Color::rgba(0.62, 0.64, 0.68, 1.0), Color::rgba(1.0, 1.0, 1.0, 1.0))
@@ -595,9 +592,27 @@ impl SheetSource {
             pergola::Node::Rect { rect: pergola::Rect::new(0.0, 0.0, NOTE_W, h), fill: edge, radius: 3.0 },
             pergola::Node::Rect { rect: pergola::Rect::new(1.0, 1.0, NOTE_W - 2.0, h - 2.0), fill, radius: 2.0 },
         ];
+        if let Some(author) = author {
+            let style = st(1);
+            let w = pergola::text::measure(author, &style).w.min(NOTE_W - 2.0 * pad);
+            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad, w, lh), content: author.into(), style });
+        }
+        for (i, line) in rich_lines.into_iter().enumerate() {
+            let mut x = pad;
+            let y = pad + (i + usize::from(author.is_some())) as f32 * lh;
+            for (content, marks) in line {
+                let content = crate::comment::shown(content);
+                let style = pergola::inline::style(&st(0), marks);
+                let w = pergola::text::measure(&content, &style).w.min((NOTE_W - pad - x).max(0.0));
+                let rect = pergola::Rect::new(x, y, w, lh);
+                nodes.extend(pergola::inline::rules(rect, &style, marks));
+                nodes.push(pergola::Node::Text { rect, content: content.into_owned(), style });
+                x += w;
+            }
+        }
         for (i, (l, kind)) in lines.into_iter().enumerate() {
             let w = pergola::text::measure(&l, &st(kind)).w.min(NOTE_W - 2.0 * pad);
-            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad + i as f32 * lh, w, lh), content: l, style: st(kind) });
+            nodes.push(pergola::Node::Text { rect: pergola::Rect::new(pad, pad + (comment_rows + i) as f32 * lh, w, lh), content: l, style: st(kind) });
         }
         // Beside the cell (or its merged area), level with its top.
         let (c1, r0) = {

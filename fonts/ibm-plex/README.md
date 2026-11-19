@@ -35,3 +35,5 @@ Installed in the VM at `/usr/local/share/fonts/ibm-plex/`; the fresco scene-serv
 font registry (`fresco-scene-server/src/text.rs`) resolves `system-sans` →
 `IBMPlexSans.ttf` and `system-mono` → `IBMPlexMono-Regular.ttf` (DejaVu kept as
 fallback). The Pergola `system-sans`/`system-mono` aliases therefore render Plex.
+
+The `IBMPlexSans-Italic` alias opens the variable italic face for styled UI text.

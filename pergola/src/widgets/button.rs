@@ -42,6 +42,7 @@ pub struct Button {
     pub rect: Rect,
     /// Shown after a hover (an icon-only button names itself here).
     pub tooltip: Option<String>,
+    retain_focus_on_press: bool,
     /// Drawn instead of the label, from `font::ICONS`, 1 em of the label's
     /// size so it grows with the text (an icon-only button). The label
     /// still names it: its tooltip, and its entry in an overflow menu.
@@ -56,6 +57,7 @@ impl Button {
             on_click: None,
             rect: Rect::new(0.0, 0.0, 0.0, size::button_height()),
             tooltip: None,
+            retain_focus_on_press: false,
             icon: None,
         }
     }
@@ -79,6 +81,13 @@ impl Button {
         if self.tooltip.is_none() {
             self.tooltip = Some(self.label.clone());
         }
+        self
+    }
+
+    /// Keep the current editor focused when pressed with the pointer.
+    /// The button still participates in keyboard focus traversal.
+    pub fn retain_focus_on_press(mut self) -> Self {
+        self.retain_focus_on_press = true;
         self
     }
 
@@ -228,6 +237,7 @@ impl View for Button {
             let cb = Arc::clone(cb);
             ctx.on_click(bg_id, move || cb());
             ctx.focusable(bg_id);
+            ctx.interactions.entry(bg_id).retain_focus_on_press = self.retain_focus_on_press;
         }
         if let Some(tip) = &self.tooltip {
             ctx.tooltip(bg_id, tip.clone());

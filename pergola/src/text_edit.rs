@@ -10,6 +10,8 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::inline::Emphasis;
+
 /// The longest undo history kept.
 const UNDO_MAX: usize = 100;
 
@@ -63,6 +65,8 @@ struct Snapshot {
     text: String,
     caret: usize,
     anchor: usize,
+    marks: Option<Vec<u8>>,
+    typing_marks: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +75,10 @@ pub struct TextEdit {
     caret: usize,
     anchor: usize,
     preedit: Option<Preedit>,
+    /// Rich fields keep one mask per UTF-8 byte. Range updates use text
+    /// boundaries so every byte of a character retains the same mask.
+    marks: Option<Vec<u8>>,
+    typing_marks: Option<u8>,
     multiline: bool,
     /// A password: no copy or cut, and word motions treat it as one word
     /// (so they don't reveal where its spaces are), and no undo history.
@@ -91,6 +99,8 @@ impl TextEdit {
             caret: 0,
             anchor: 0,
             preedit: None,
+            marks: None,
+            typing_marks: None,
             multiline: false,
             secret: false,
             undo: Vec::new(),
@@ -101,6 +111,77 @@ impl TextEdit {
         e.caret = e.text.len();
         e.anchor = e.caret;
         e
+    }
+
+    /// A rich, single-line field. Embedded line breaks and tabs belong to
+    /// the value and are shown as markers by the widget.
+    pub fn rich(text: &str, runs: impl IntoIterator<Item = (Range<usize>, u8)>) -> Self {
+        let mut edit = Self::new("");
+        edit.text = text.to_owned();
+        edit.caret = text.len();
+        edit.anchor = edit.caret;
+        let mut marks = vec![0; text.len()];
+        for (range, mask) in runs {
+            if text.get(range.clone()).is_some() {
+                marks[range].fill(mask & 15);
+            }
+        }
+        edit.marks = Some(marks);
+        edit
+    }
+
+    pub fn is_rich(&self) -> bool { self.marks.is_some() && !self.secret }
+
+    /// Styled and unstyled ranges in text order.
+    pub fn inline_runs(&self) -> impl Iterator<Item = (Range<usize>, u8)> + '_ {
+        self.marks.as_deref().into_iter().flat_map(|marks| {
+            let mut start = 0;
+            marks.chunk_by(|a, b| a == b).map(move |run| {
+                let end = start + run.len();
+                let range = start..end;
+                start = end;
+                (range, run[0])
+            })
+        })
+    }
+
+    fn inherited_marks(&self, selection: &Range<usize>) -> u8 {
+        let Some(marks) = &self.marks else { return 0 };
+        let at = if selection.is_empty() { selection.start.saturating_sub(1) } else { selection.start };
+        marks.get(at).copied().unwrap_or(0)
+    }
+
+    pub fn emphasis_active(&self, emphasis: Emphasis) -> bool {
+        let range = self.selection();
+        let flag = emphasis as u8;
+        if range.is_empty() {
+            return self.typing_marks.unwrap_or_else(|| self.inherited_marks(&range)) & flag != 0;
+        }
+        self.marks.as_ref().is_some_and(|marks| marks[range].iter().all(|mask| mask & flag != 0))
+    }
+
+    pub fn toggle_emphasis(&mut self, emphasis: Emphasis) -> bool {
+        if !self.is_rich() { return false }
+        let range = self.selection();
+        let active = self.emphasis_active(emphasis);
+        let flag = emphasis as u8;
+        let apply = |mask| if active { mask & !flag } else { mask | flag };
+        self.checkpoint(Kind::Other);
+        if range.is_empty() {
+            self.typing_marks = Some(apply(self.typing_marks.unwrap_or_else(|| self.inherited_marks(&range))));
+        } else if let Some(marks) = &mut self.marks {
+            for mask in &mut marks[range] {
+                *mask = apply(*mask);
+            }
+        }
+        true
+    }
+
+    fn replace(&mut self, range: Range<usize>, text: &str, mask: u8) {
+        if let Some(marks) = &mut self.marks {
+            marks.splice(range.clone(), std::iter::repeat_n(mask, text.len()));
+        }
+        self.text.replace_range(range, text);
     }
 
     pub fn multiline(mut self, on: bool) -> Self {
@@ -134,7 +215,8 @@ impl TextEdit {
             return;
         }
         self.checkpoint(Kind::Other);
-        self.text = t;
+        self.replace(0..self.text.len(), &t, 0);
+        self.typing_marks = None;
         self.caret = self.text.len();
         self.anchor = self.caret;
         self.preedit = None;
@@ -151,7 +233,8 @@ impl TextEdit {
         let typing = s.graphemes(true).count() == 1 && !self.has_selection();
         self.checkpoint(if typing { Kind::Typing } else { Kind::Other });
         let r = self.selection();
-        self.text.replace_range(r.clone(), &s);
+        let marks = self.typing_marks.unwrap_or_else(|| self.inherited_marks(&r));
+        self.replace(r.clone(), &s, marks);
         self.caret = r.start + s.len();
         self.anchor = self.caret;
         true
@@ -197,6 +280,7 @@ impl TextEdit {
     /// Move the caret; `extend` keeps the anchor (Shift held). Moving left
     /// or right without Shift over a selection collapses it to that side.
     pub fn move_caret(&mut self, m: Motion, extend: bool) {
+        self.typing_marks = None;
         self.last = Kind::Other;
         let to = match m {
             Motion::Left if !extend && self.has_selection() => self.selection().start,
@@ -218,6 +302,7 @@ impl TextEdit {
 
     /// Put the caret at `at` (a click), snapped to a grapheme boundary.
     pub fn set_caret(&mut self, at: usize, extend: bool) {
+        self.typing_marks = None;
         self.last = Kind::Other;
         self.caret = self.snap(at);
         if !extend {
@@ -226,6 +311,7 @@ impl TextEdit {
     }
 
     pub fn select_all(&mut self) {
+        self.typing_marks = None;
         self.last = Kind::Other;
         self.anchor = 0;
         self.caret = self.text.len();
@@ -233,6 +319,7 @@ impl TextEdit {
 
     /// Select the word under `at` (a double click).
     pub fn select_word(&mut self, at: usize) {
+        self.typing_marks = None;
         self.last = Kind::Other;
         if self.secret {
             return self.select_all();
@@ -299,9 +386,14 @@ impl TextEdit {
                 "z" if m.shift => changed(self.redo()),
                 "z" => changed(self.undo()),
                 "y" => changed(self.redo()),
+                "b" => changed(self.toggle_emphasis(Emphasis::Bold)),
+                "i" => changed(self.toggle_emphasis(Emphasis::Italic)),
+                "u" if m.shift => changed(self.toggle_emphasis(Emphasis::Strike)),
+                "u" => changed(self.toggle_emphasis(Emphasis::Underline)),
                 _ => KeyOutcome::Ignored,
             },
             Key::Char => changed(self.insert(chars)),
+            Key::Enter if self.is_rich() && m.shift => changed(self.insert("\n")),
             Key::Enter if self.multiline => changed(self.insert("\n")),
             Key::Enter => KeyOutcome::Submit,
             Key::Backspace => changed(self.backspace(cmd || m.alt)),
@@ -336,12 +428,13 @@ impl TextEdit {
     }
 
     fn clean(&self, s: &str) -> String {
-        s.chars().filter(|&c| !c.is_control() || (self.multiline && c == '\n')).collect()
+        s.chars().filter(|&c| !c.is_control() || (self.multiline && c == '\n') || (self.is_rich() && matches!(c, '\n' | '\t'))).collect()
     }
 
     fn cut_selection(&mut self) {
         let r = self.selection();
-        self.text.replace_range(r.clone(), "");
+        self.replace(r.clone(), "", 0);
+        self.typing_marks = None;
         self.caret = r.start;
         self.anchor = r.start;
     }
@@ -365,11 +458,13 @@ impl TextEdit {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { text: self.text.clone(), caret: self.caret, anchor: self.anchor }
+        Snapshot { text: self.text.clone(), caret: self.caret, anchor: self.anchor, marks: self.marks.clone(), typing_marks: self.typing_marks }
     }
 
     fn restore(&mut self, s: Snapshot) {
         self.text = s.text;
+        self.marks = s.marks;
+        self.typing_marks = s.typing_marks;
         self.caret = s.caret;
         self.anchor = s.anchor;
         self.preedit = None;
@@ -463,6 +558,25 @@ mod tests {
             e.key(Key::Char, NONE, g);
         }
         e
+    }
+
+    #[test]
+    fn rich_typing_and_deletion_restore_marks_with_undo() {
+        let mut edit = TextEdit::rich("aéz", [(1..3, Emphasis::Bold as u8)]);
+        edit.set_caret(3, false);
+        assert!(edit.toggle_emphasis(Emphasis::Italic));
+        assert!(edit.insert("!"));
+        assert_eq!(edit.inline_runs().collect::<Vec<_>>(), vec![(0..1, 0), (1..3, 1), (3..4, 3), (4..5, 0)]);
+        assert!(edit.undo());
+        assert_eq!(edit.text(), "aéz");
+        assert!(edit.redo());
+        assert!(edit.backspace(false));
+        assert!(edit.backspace(false));
+        assert_eq!(edit.text(), "az");
+        assert_eq!(edit.inline_runs().collect::<Vec<_>>(), vec![(0..2, 0)]);
+        assert!(edit.undo());
+        assert_eq!(edit.text(), "aé!z");
+        assert_eq!(edit.inline_runs().collect::<Vec<_>>(), vec![(0..1, 0), (1..3, 1), (3..4, 3), (4..5, 0)]);
     }
 
     #[test]
