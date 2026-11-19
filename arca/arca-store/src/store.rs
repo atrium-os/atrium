@@ -823,6 +823,29 @@ impl Store {
         Ok(n)
     }
 
+    /// A removed persona (personas.md §4.1, tessera-encryption.md §9):
+    /// destroy every group of `persona`, for every recipient and class, and
+    /// with them their data keys. Needs the store unlocked, so that groups
+    /// of every class are known. The number of items destroyed.
+    pub fn forget_persona(&mut self, persona: &str) -> Result<usize, Error> {
+        if self.master.is_none() {
+            return Err(Error::Locked);
+        }
+        let gids: Vec<[u8; 16]> =
+            self.groups.iter().filter(|(_, g)| g.persona == persona).map(|(k, _)| *k).collect();
+        let mut n = 0;
+        for gid in &gids {
+            let g = self.groups.remove(gid).unwrap();
+            n += g.items.len();
+            for it in &g.items {
+                self.by_item.remove(&it.id);
+            }
+            fs::remove_file(self.dir.join("groups").join(hex16(gid)))?;
+        }
+        File::open(self.dir.join("groups"))?.sync_all()?;
+        Ok(n)
+    }
+
     /// Every (persona, recipient) with items, for the trusted UI. Needs the
     /// store unlocked.
     pub fn recipients(&self) -> Result<Vec<(String, Recipient)>, Error> {

@@ -12,7 +12,7 @@
 //!     atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
 //!     atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
 //!     atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
-//!     atrium-volumes-cli <socket> erase <person> <persona>
+//!     atrium-volumes-cli <socket> erase <person> <persona> [home]
 //!
 //! kind = persistent | tmpfs
 
@@ -34,7 +34,7 @@ usage:
   atrium-volumes-cli <socket> provision <jail> <name> <kind> <mount_at> [backend]
   atrium-volumes-cli <socket> destroy <jail> <name> [really_yes]
   atrium-volumes-cli <socket> folders <person> <persona> <uid> <gid> <dir>...
-  atrium-volumes-cli <socket> erase <person> <persona>
+  atrium-volumes-cli <socket> erase <person> <persona> [home]
 
 kind = persistent | tmpfs
 ");
@@ -100,8 +100,8 @@ fn main() -> ExitCode {
             })
         }
         "erase" => {
-            if rest.len() != 2 { return usage(); }
-            Request::EraseFolders(EraseFoldersRequest { person: rest[0].clone(), persona: rest[1].clone() })
+            if rest.len() != 2 && rest.len() != 3 { return usage(); }
+            Request::EraseFolders(EraseFoldersRequest { person: rest[0].clone(), persona: rest[1].clone(), home: rest.get(2).cloned() })
         }
         _ => return usage(),
     };

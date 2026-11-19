@@ -41,6 +41,10 @@ pub struct PersonaFoldersRequest {
 pub struct EraseFoldersRequest {
     pub person:  String,
     pub persona: String,
+    /// The person's home: its volume is scrubbed after (E5), since the
+    /// persona's app data was deleted in the clear.
+    #[serde(default)]
+    pub home:    Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -104,7 +104,10 @@ fn encrypt_folders(person: &str, persona: &str, dirs: &[PathBuf], uid: u32, gid:
 fn erase_folders(person: &str, persona: &str) -> Result<bool, String> {
     use atrium_volumes::protocol::{EraseFoldersRequest, Request, Response};
     let Some(mut c) = volumes() else { return Ok(false) };
-    match c.send(&Request::EraseFolders(EraseFoldersRequest { person: person.into(), persona: persona.into() })) {
+    // The home, so atrium-volumes scrubs its volume: the persona's app
+    // data went in the clear just before (E5).
+    let home = portcullis_overlay::home_of(person).map(|h| h.display().to_string());
+    match c.send(&Request::EraseFolders(EraseFoldersRequest { person: person.into(), persona: persona.into(), home })) {
         Ok(Response::FoldersErased { erased }) => Ok(erased),
         Ok(Response::Error { detail }) => Err(detail),
         Ok(other) => Err(format!("atrium-volumes: unexpected {other:?}")),
@@ -285,6 +288,24 @@ pub fn remove_persona(person: &str, persona: &str) -> Result<bool, String> {
         pw(&["groupdel", &group])?;
     }
     Ok(had)
+}
+
+/// Where dispensatord serves removable media (atrium-media).
+const MEDIA_SOCKET: &str = "/atrium/sockets/removable-media/removable-media.sock";
+
+/// The persona's sealed sticks that are mounted now, by name (E5). Removing
+/// the persona takes their keys, so they show Locked when next plugged in,
+/// but a mounted stick stays open until it is ejected: Remove waits for
+/// that. No dispensatord: no sticks.
+pub fn mounted_sticks(persona: &str) -> Vec<String> {
+    match atrium_media::client::list(Path::new(MEDIA_SOCKET)) {
+        Ok(v) => v
+            .into_iter()
+            .filter(|v| v.persona == persona && !v.locked && !v.mountpoint.is_empty())
+            .map(|v| if v.label.is_empty() { format!("the stick {}", v.part) } else { format!("the stick “{}”", v.label) })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The person's uid.

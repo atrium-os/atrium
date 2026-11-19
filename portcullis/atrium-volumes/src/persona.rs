@@ -335,6 +335,37 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
         if !name_ok(&req.person) || !name_ok(&req.persona) {
             return error("bad person or persona name");
         }
+        // E5: the persona's app data was deleted in the clear (portcullisd
+        // does that first): scrub the volume. Queued now, so it happens
+        // even if the erase below has to wait.
+        if let Some(home) = req.home.as_deref().filter(|h| folder_ok(h)) {
+            if let Err(err) = self.scrub.want(Path::new(home)) {
+                warn!("persona folders: queueing a scrub of {home}: {err}");
+            }
+        }
+        let r = self.erase_group(req);
+        // E5: the rest of the persona's Arca (its sticks' keys, its
+        // passwords and passkeys), whether or not the folders' erase has
+        // to wait (their key is retired by then either way).
+        let d = match self.keys.destroy(&req.person, &req.persona) {
+            Ok(n) => {
+                info!("persona folders: {}'s {} Arca destroyed ({n} item(s))", req.person, req.persona);
+                None
+            }
+            Err(KeyError::Unavailable(why)) => {
+                warn!("persona folders: {}'s {} Arca not destroyed: {why}", req.person, req.persona);
+                None
+            }
+            Err(err) => Some(error(format!("{}'s {} Arca: {err}", req.person, req.persona))),
+        };
+        self.scrub.kick();
+        match d {
+            Some(e) if matches!(r, Response::FoldersErased { .. }) => e,
+            _ => r,
+        }
+    }
+
+    fn erase_group(&mut self, req: &EraseFoldersRequest) -> Response {
         let Some(mut e) = self.groups.find(&req.person, &req.persona).cloned() else {
             return Response::FoldersErased { erased: false };
         };
@@ -479,8 +510,10 @@ mod tests {
         loads:   u32,
         tessera: bool,
         keys_up: bool,
-        scrubs:  Vec<PathBuf>,
+        /// Queued scrubs, and whether a parked plain copy was still there.
+        scrubs:  Vec<(PathBuf, bool)>,
         kicks:   u32,
+        destroyed: Vec<String>,
     }
 
     #[derive(Clone)]
@@ -557,12 +590,11 @@ mod tests {
     impl ScrubQueue for Fake {
         fn want(&self, dir: &Path) -> io::Result<()> {
             let mut w = self.0.borrow_mut();
-            // Queued while the old copy is still there.
-            assert!(fs::read_dir(dir).unwrap().any(|e| {
+            let parked = fs::read_dir(dir).unwrap().any(|e| {
                 e.unwrap().file_name().to_string_lossy().ends_with(".unencrypted")
-            }));
-            if !w.scrubs.iter().any(|d| d == dir) {
-                w.scrubs.push(dir.to_path_buf());
+            });
+            if !w.scrubs.iter().any(|(d, _)| d == dir) {
+                w.scrubs.push((dir.to_path_buf(), parked));
             }
             Ok(())
         }
@@ -592,6 +624,14 @@ mod tests {
             }
             w.loaded.insert(*key_id);
             Ok(())
+        }
+        fn destroy(&self, _u: &str, p: &str) -> Result<u32, KeyError> {
+            let mut w = self.0.borrow_mut();
+            if !w.keys_up {
+                return Err(KeyError::Unavailable("no arcad".into()));
+            }
+            w.destroyed.push(p.to_string());
+            Ok(0)
         }
         fn retire(&self, _u: &str, _p: &str, key_id: &[u8; 16]) -> Result<(), KeyError> {
             let mut w = self.0.borrow_mut();
@@ -638,7 +678,7 @@ mod tests {
     fn erase(t: &mut T, persona: &str) -> Response {
         let fake = t.fake.clone();
         Folders { kernel: &fake, keys: &fake, scrub: &fake, groups: &mut t.groups, path: &t.db }
-            .erase(&EraseFoldersRequest { person: "alice".into(), persona: persona.into() })
+            .erase(&EraseFoldersRequest { person: "alice".into(), persona: persona.into(), home: Some(t.home.display().to_string()) })
     }
 
     fn logout(t: &T) {
@@ -719,9 +759,9 @@ mod tests {
         assert_eq!(fs::metadata(docs.join("a.txt")).unwrap().modified().unwrap(), old);
         assert_eq!(fs::read_link(docs.join("link")).unwrap(), PathBuf::from("a.txt"));
         assert!(!parked(&docs).exists(), "the old copy stays");
-        // Its volume is queued for a scrub (before the delete: see the
-        // fake) and the scrub started.
-        assert_eq!(t.fake.0.borrow().scrubs, vec![t.home.clone()]);
+        // Its volume is queued for a scrub, while the plain copy was still
+        // there, and the scrub started.
+        assert_eq!(t.fake.0.borrow().scrubs, vec![(t.home.clone(), true)]);
         assert_eq!(t.fake.0.borrow().kicks, 1);
         // Nothing moves twice, and nothing more is scrubbed.
         assert_eq!(ready(&run(&mut t, &r)), (true, vec![]));
@@ -799,7 +839,15 @@ mod tests {
         assert!(t.groups.find("alice", "work").is_none());
         assert!(!t.fake.0.borrow().groups.contains_key(&g));
         assert!(t.fake.0.borrow().arca.is_empty());
+        // E5: its whole Arca goes too, and the volume is scrubbed (the
+        // app data went in the clear).
+        assert_eq!(t.fake.0.borrow().destroyed, vec!["work".to_string()]);
+        assert_eq!(t.fake.0.borrow().scrubs, vec![(t.home.clone(), false)]);
+        assert_eq!(t.fake.0.borrow().kicks, 1);
+        // Asked again: nothing of the folders, but the Arca destroy runs
+        // again (it is idempotent).
         assert!(matches!(erase(&mut t, "work"), Response::FoldersErased { erased: false }));
+        assert_eq!(t.fake.0.borrow().destroyed.len(), 2);
         // Added again under the same name: a new group and key.
         ready(&run(&mut t, &r));
         assert_ne!(t.groups.find("alice", "work").unwrap().group_id, g);
@@ -822,6 +870,7 @@ mod tests {
         }
         assert!(matches!(erase(&mut t, "work"), Response::Error { .. }));
         assert!(t.groups.find("alice", "work").unwrap().retired);
+        assert_eq!(t.fake.0.borrow().destroyed, vec!["work".to_string()], "the Arca goes now all the same");
         // The next login (any persona) finishes it.
         t.fake.0.borrow_mut().loaded.remove(&k);
         let mut p = req(&t, "personal");
