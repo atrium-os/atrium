@@ -358,12 +358,11 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   each workspace's `/atrium/bin` from the host's install and set as git's credential
   helper whenever the workspace has the agent; it gets only that workspace's token for
   that host. The gate checks it with the helper itself and `git credential fill` where
-  git is present. The Workspace access page in Curia lists the person's workspaces
-  and their personas. Next: broker credential metadata through portcullisd and
-  require a compositor-confirmed press for grant changes. The SSH gate now
-  starts the agent with the shipped services.d entry and checks its jail ID
-  and UID before exercising key and token access. That gate still needs a
-  dedicated amd64 guest run.
+  git is present. Curia's Workspace access page lists a workspace's SSH key and
+  HTTPS token grants through portcullisd and requires a compositor-confirmed
+  press to grant or revoke. The SSH gate starts the agent with the shipped
+  services.d entry, checks its jail ID and UID, and exercises the privileged
+  agent protocol alongside key and token isolation.
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;

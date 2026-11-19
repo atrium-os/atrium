@@ -568,6 +568,16 @@ pub enum Request {
     /// `WorkspaceList`. A workspace's terminal is a `Console` whose
     /// `app_id` is `workspace/<name>`.
     Workspaces,
+    /// Settings only. Credential metadata for a workspace of the caller's owner.
+    WorkspaceCredentials { workspace: String, persona: String },
+    /// Settings only. Spend a press, then grant or revoke a stored credential.
+    SetWorkspaceCredential {
+        workspace: String,
+        persona: String,
+        credential: [u8; 16],
+        granted: bool,
+        activation: [u8; 16],
+    },
     /// Make a workspace. `network`: "outbound" (the default), "registries"
     /// or "none".
     WorkspaceNew {
@@ -726,6 +736,22 @@ pub struct AccessEntry {
     pub restricted: Vec<String>,
 }
 
+
+/// A credential the person can grant to the selected workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCredential {
+    pub id: [u8; 16],
+    pub kind: WorkspaceCredentialKind,
+    pub label: String,
+    pub granted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCredentialKind {
+    SshKey,
+    HttpsToken,
+}
 
 /// A workspace, for Forum and Scrinium.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -980,6 +1006,7 @@ pub enum Response {
 
     /// Answer to `Workspaces` (and to `WorkspaceNew`/`WorkspaceSet`: the
     /// list after the change).
+    WorkspaceCredentials { credentials: Vec<WorkspaceCredential> },
     WorkspaceList { workspaces: Vec<WorkspaceInfo>, toolchains: Vec<Toolchain> },
 
     /// Launch → policy gate refused. `delta` is the human-readable

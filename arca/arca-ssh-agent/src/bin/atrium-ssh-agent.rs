@@ -251,6 +251,10 @@ fn control(a: &Arc<Agent>, c: UnixStream) {
     let out = match who {
         None => Err("not a person or portcullisd".to_string()),
         Some(Caller::Root) => match parse_admin(&line) {
+            Some(Admin::List { owner, persona }) => person_request(a, &owner, Person::List { persona }, ""),
+            Some(Admin::Grant { owner, persona, id, ws, on }) => {
+                person_request(a, &owner, Person::Grant { persona, id, ws, on }, "")
+            }
             Some(Admin::Open { owner, ws, persona, uid }) => open(a, &owner, &ws, &persona, uid).map(|p| vec![p.display().to_string()]),
             Some(Admin::Close { owner, ws }) => {
                 close(a, &owner, &ws);
@@ -285,8 +289,12 @@ fn control(a: &Arc<Agent>, c: UnixStream) {
 }
 
 fn person(a: &Agent, user: &str, line: &str, token: &str) -> Result<Vec<String>, String> {
+    person_request(a, user, parse_person(line).ok_or("bad request")?, token)
+}
+
+fn person_request(a: &Agent, user: &str, req: Person, token: &str) -> Result<Vec<String>, String> {
     let e = |e: arca_ssh_agent::arca::Error| e.to_string();
-    match parse_person(line).ok_or("bad request")? {
+    match req {
         Person::New { persona, comment } => {
             let k = a.arca.mint(user, &persona, &comment).map_err(e)?;
             eprintln!("ssh-agent: {user} made key {} in {persona}", &hex(&k.id)[..8]);

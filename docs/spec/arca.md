@@ -716,10 +716,13 @@ For workspaces (dev-tools.md §8, dev-tools-plan.md M9).
   (`string host`), and the agent asks arcad `SA_TOKEN_GET` (0xC9), which answers only a
   token for that host granted to that workspace in its persona. https only; `store` and
   `erase` do nothing. A token can't be listed as a key or used to sign.
-- **Curia**: Workspace access lists the signed-in person's workspace names and
-  personas over portcullisd. Credential metadata and mutations from this page
-  still need an owner-scoped broker. Until then the CLI manages grants. A
-  Sigillum touch per use (verify-each-use keys) is also pending.
+- **Curia**: Workspace access lists the signed-in person's workspaces and the
+  SSH key and HTTPS token grants for each workspace's persona. Portcullisd
+  brokers list, grant and revoke after authenticating Settings by its peer
+  UID and installed capability, and spends a Fresco APPROVE press before a
+  write. The agent's root control protocol serves those three operations on
+  explicit owner and persona. List returns metadata only. A Sigillum touch
+  per use (verify-each-use keys) is pending.
 - Gate: `scripts/vm-ssh-agent-check.sh`.
 
 ## 10. Audit

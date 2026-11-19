@@ -3,6 +3,8 @@
 # Arca, used from workspaces through the agent. Runs on the HOST after
 #   ARCH=amd64 sh scripts/cloud-vm.sh up
 #   sh scripts/vm-ssh-agent-check.sh
+# VMDIR provides the amd64 sysroot. SSH_AGENT_GATE_PORT and
+# SSH_AGENT_GATE_KEY can select a separately forwarded disposable guest.
 # Ends "ssh-agent: N failed".
 #
 # Run only in a dedicated test guest: the gate replaces portcullisd and uses
@@ -34,8 +36,18 @@ SMP=${SMP:-1}
 set -- env
 . "$ROOT/scripts/cloud-vm.sh" >/dev/null
 set --
-K="-i $HOME/.ssh/fresco_bsd_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-V() { "$ROOT/scripts/vssh" "$@"; }
+GATE_PORT=${SSH_AGENT_GATE_PORT:-2222}
+GATE_KEY=${SSH_AGENT_GATE_KEY:-$HOME/.ssh/fresco_bsd_ed25519}
+V() {
+    ssh -i "$GATE_KEY" -p "$GATE_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 \
+        -o ServerAliveInterval=5 -o ServerAliveCountMax=3 root@localhost "$@"
+}
+put() {
+    scp -q -i "$GATE_KEY" -P "$GATE_PORT" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 \
+        -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$1" "root@localhost:$2"
+}
 [ "$(V 'uname -m')" = amd64 ] || {
     echo "ssh-agent: dedicated FreeBSD amd64 guest is required"
     exit 1
@@ -49,7 +61,7 @@ hasnt() { case "$3" in *"$2"*) bad "$1: [$2] in [$3]" ;; *) ok "$1" ;; esac; }
 
 echo "=== cross-build"
 (cd "$ROOT/portcullis" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" \
-    -p portcullisd -p portcullis-cli --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap) || { echo "ssh-agent: 1 failed"; exit 1; }
+    -p jaild -p portcullisd -p portcullis-cli --bin atrium-jaild --bin portcullisd --bin portcullis --bin atrium-portcullisd-bootstrap) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arcad" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 (cd "$ROOT/arca/arca-ssh-agent" && RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build -q --release --target "$TARGET" --bins) || { echo "ssh-agent: 1 failed"; exit 1; }
 
@@ -73,15 +85,17 @@ V "if test -s $G/bootstrap.pid; then kill \$(cat $G/bootstrap.pid) 2>/dev/null |
 }
 V "test ! -s $G/arcad.pid || kill \$(cat $G/arcad.pid) 2>/dev/null || true"
 V "pkill -x portcullisd; pkill -f $B/; sleep 1; rm -rf $B $G; mkdir -p $B $G; chmod 755 $B"
-for b in portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
+for b in portcullis/target/$TARGET/release/atrium-jaild \
+         portcullis/target/$TARGET/release/portcullisd portcullis/target/$TARGET/release/portcullis \
          portcullis/target/$TARGET/release/atrium-portcullisd-bootstrap \
          arca/arcad/target/$TARGET/release/arcad arca/arcad/target/$TARGET/release/arca-probe \
          arca/arca-ssh-agent/target/$TARGET/release/atrium-ssh-agent arca/arca-ssh-agent/target/$TARGET/release/arca-ssh \
          arca/arca-ssh-agent/target/$TARGET/release/git-credential-arca \
          arca/arca-ssh-agent/etc/services.d/44-atrium-ssh-agent.toml \
          scripts/ssh-agent-service.sh etc/jaild.policy.toml; do
-    scp -q $K -P 2222 "$ROOT/$b" root@localhost:$B/ || { echo "copy $b failed"; echo "ssh-agent: 1 failed"; exit 1; }
+    put "$ROOT/$b" "$B/" || { echo "copy $b failed"; echo "ssh-agent: 1 failed"; exit 1; }
 done
+put "$ROOT/portcullis/jaild/etc/atrium-jaild" "$B/jaild.rc" || exit 1
 PSOCK=/atrium/sockets/portcullis/portcullis.sock
 LOG=$B/portcullisd.log
 V 'sh -s' <<EOS
@@ -93,7 +107,12 @@ id alice >/dev/null 2>&1 || pw useradd alice -m -s /bin/sh
 id sshtest >/dev/null 2>&1 || pw useradd sshtest -m -s /bin/sh
 for u in sg-unlock:50093 _arca-ssh:65047; do n=\${u%%:*}; i=\${u##*:}; id \$n >/dev/null 2>&1 || pw useradd \$n -u \$i -d /nonexistent -s /usr/sbin/nologin; done
 service sshd onestatus >/dev/null 2>&1 || service sshd onestart >/dev/null 2>&1
-service atrium-jaild restart >/dev/null 2>&1 || service atrium-jaild start >/dev/null 2>&1
+mkdir -p /usr/local/etc/rc.d
+if service atrium-jaild onestatus >/dev/null 2>&1; then service atrium-jaild onestop; fi
+install -m 0555 $B/jaild.rc /usr/local/etc/rc.d/atrium-jaild
+install -m 0555 $B/atrium-jaild /usr/local/bin/atrium-jaild
+service atrium-jaild onestart
+devfs rule -s 4 show | grep -q .
 mkdir -p /var/run/atrium /var/log/atrium /atrium/sockets/arca $G/services.d
 touch /var/run/atrium/app-registry
 # Recreate the package-relative path expected by the commissioning script.
@@ -140,10 +159,12 @@ echo "=== workspaces"
 A() { V "su -m alice -c 'cd /tmp; portcullis workspace $*'" 2>&1; }
 for w in keys other; do A stop $w >/dev/null; A new $w --network outbound >/dev/null; done
 W=/home/alice/.atrium/workspaces
+SCRIPT=$(mktemp "${TMPDIR:-/tmp}/sshgate-script.XXXXXX") || exit 1
+trap 'rm -f "$SCRIPT"' EXIT
 # Run a script in workspace $1 (written to its work folder, run from there).
 run() {
-    printf '%s\n' "$2" > /tmp/sshgate-t.sh
-    scp -q $K -P 2222 /tmp/sshgate-t.sh root@localhost:$W/$1/work/t.sh
+    printf '%s\n' "$2" > "$SCRIPT"
+    put "$SCRIPT" "$W/$1/work/t.sh" || return
     V "chmod 644 $W/$1/work/t.sh"
     A exec $1 -- /bin/sh t.sh
 }
@@ -155,8 +176,12 @@ has "and is read-only" "ro" "$out"
 has "no identities before a grant" "no identities" "$out"
 check "the workspace's socket folders" "alice.keys" "$(V "ls $AR | grep -v -e control -e state | tr '\n' ' ' | sed 's/ \$//'")"
 
-echo "=== grant"
-SSHA grant $ID keys >/dev/null
+echo "=== grant via the broker's privileged agent protocol"
+agent_admin() { V "printf '%s\\n' '$*' | nc -w 5 -U '$AR/control.sock'"; }
+has "broker lists key metadata" "$ID ssh-ed25519" "$(agent_admin list alice personal)"
+r=$(V "printf '%s\\n' 'grant alice personal $ID keys' | su -m alice -c 'nc -w 5 -U $AR/control.sock'")
+has "a person cannot use the broker command" "error bad request" "$r"
+check "broker grants the key" "ok" "$(agent_admin grant alice personal "$ID" keys)"
 out=$(run keys 'ssh-add -L 2>&1')
 has "the granted workspace lists the key" "ssh-ed25519 $(echo "$PUB" | cut -d' ' -f2)" "$out"
 out=$(run other 'ssh-add -L 2>&1')
@@ -203,7 +228,8 @@ CRED='printf "protocol=https\nhost=$1\n\n" | git-credential-arca get; echo "help
 out=$(run keys "set -- github.com; $CRED")
 has "git's helper is arca in the workspace" "helper=credential.helper=arca" "$out"
 hasnt "nothing before a grant" "ghp_gate_token" "$out"
-SSHA grant $TID keys >/dev/null
+has "broker lists token metadata" "$TID token github.com alice granted=" "$(agent_admin list alice personal)"
+check "broker grants the token" "ok" "$(agent_admin grant alice personal "$TID" keys)"
 out=$(run keys "set -- github.com; $CRED")
 has "the granted workspace gets the token" "username=alice
 password=ghp_gate_token" "$out"
@@ -213,13 +239,12 @@ hasnt "not in another workspace" "ghp_gate_token" "$(run other "set -- github.co
 has "the hand-over is logged" "gave its github.com token" "$(V "cat $AGENT_LOG")"
 V "echo ghp_gate_token2 | su -m alice -c 'cd /tmp; arca-ssh token github.com alice'" >/dev/null 2>&1
 has "a replaced token keeps its grant" "password=ghp_gate_token2" "$(run keys "set -- github.com; $CRED")"
-SSHA revoke $TID keys >/dev/null
 TID2=$(SSHA list | awk '/ token github.com /{print $1}')
-SSHA revoke $TID2 keys >/dev/null
+check "broker revokes the token" "ok" "$(agent_admin revoke alice personal "$TID2" keys)"
 hasnt "revoked: none" "ghp_gate_token" "$(run keys "set -- github.com; $CRED")"
 
 echo "=== revoke, lock, delete"
-SSHA revoke $ID keys >/dev/null
+check "broker revokes the key" "ok" "$(agent_admin revoke alice personal "$ID" keys)"
 has "after revoke: none" "no identities" "$(run keys 'ssh-add -L 2>&1')"
 SSHA grant $ID keys >/dev/null
 A stop other >/dev/null

@@ -1364,6 +1364,7 @@ dependencies = [
  "atrium-volumes",
  "env_logger",
  "fresco-protocol",
+ "hex",
  "jaild",
  "jaild-policy",
  "libc",

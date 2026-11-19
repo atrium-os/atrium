@@ -43,6 +43,7 @@ default = ["pam"]
 pam = []
 
 [dependencies]
+hex = "0.4"
 portcullis-identity = { path = "../portcullis-identity" }
 portcullis-toml     = { path = "../portcullis-toml" }
 portcullis-jail     = { path = "../portcullis-jail" }

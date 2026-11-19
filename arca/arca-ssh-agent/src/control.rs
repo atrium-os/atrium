@@ -2,7 +2,8 @@
 //! first, then data lines), then the connection closes.
 //!
 //! - root (portcullisd): `open OWNER WORKSPACE PERSONA UID`, `close OWNER
-//!   WORKSPACE`, `forget OWNER WORKSPACE PERSONA` (deleted: its grants go);
+//!   WORKSPACE`, `forget OWNER WORKSPACE PERSONA` (deleted: its grants go),
+//!   `list OWNER PERSONA` and `grant|revoke OWNER PERSONA ID WORKSPACE`;
 //! - a person (a uid with a passwd entry that is not a launched app's):
 //!   `new PERSONA COMMENT...`, `list PERSONA`, `grant|revoke PERSONA ID
 //!   WORKSPACE`, `delete PERSONA ID`, `token PERSONA HOST USERNAME` (the
@@ -12,6 +13,9 @@ use crate::{unhex16, valid_owner, valid_persona};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admin {
+    /// Portcullisd brokers these two operations for Settings.
+    List { owner: String, persona: String },
+    Grant { owner: String, persona: String, id: [u8; 16], ws: String, on: bool },
     Open { owner: String, ws: String, persona: String, uid: u32 },
     Close { owner: String, ws: String },
     /// The workspace was deleted: close it and end its grants.
@@ -35,6 +39,17 @@ fn ws_ok(w: &str) -> bool {
 pub fn parse_admin(line: &str) -> Option<Admin> {
     let f: Vec<&str> = line.split_ascii_whitespace().collect();
     match f.as_slice() {
+        ["list", owner, persona] if valid_owner(owner) && valid_persona(persona) => {
+            Some(Admin::List { owner: owner.to_string(), persona: persona.to_string() })
+        }
+        [verb @ ("grant" | "revoke"), owner, persona, id, ws]
+            if valid_owner(owner) && valid_persona(persona) && ws_ok(ws) =>
+        {
+            Some(Admin::Grant {
+                owner: owner.to_string(), persona: persona.to_string(), id: unhex16(id)?,
+                ws: ws.to_string(), on: *verb == "grant",
+            })
+        }
         ["open", o, w, p, u] if valid_owner(o) && ws_ok(w) && valid_persona(p) => {
             let uid: u32 = u.parse().ok().filter(|u| *u != 0)?;
             Some(Admin::Open { owner: o.to_string(), ws: w.to_string(), persona: p.to_string(), uid })
@@ -94,6 +109,10 @@ mod tests {
         assert_eq!(parse_person(&format!("grant work {id} We")), None);
         assert!(matches!(parse_person(&format!("delete personal {id}")), Some(Person::Delete { .. })));
         assert_eq!(parse_person("open alice web personal 5"), None);
+        assert!(matches!(parse_admin("list alice personal"), Some(Admin::List { .. })));
+        assert!(matches!(parse_admin(&format!("revoke alice work {id} web")), Some(Admin::Grant { on: false, .. })));
+        assert_eq!(parse_admin(&format!("grant alice work {id} ../x")), None);
+        assert_eq!(parse_admin(&format!("delete alice work {id}")), None);
         assert_eq!(parse_person("token personal github.com alice"),
                    Some(Person::Token { persona: "personal".into(), host: "github.com".into(), username: "alice".into() }));
         assert_eq!(parse_person("token personal GitHub.com alice"), None);

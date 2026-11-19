@@ -10,3 +10,4 @@ pub mod printers;
 pub mod sound;
 pub mod view;
 pub mod vpn;
+pub mod workspace_access;

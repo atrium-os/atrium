@@ -779,6 +779,11 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>, workers_only: bool) ->
             write_response(&mut writer, &resp)?;
             continue;
         }
+        if matches!(req, Request::WorkspaceCredentials { .. } | Request::SetWorkspaceCredential { .. }) {
+            let resp = handle_workspace_credentials(uid, req);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         /* ★ App consoles (homes.md §4): gated on the PEER UID, a launcher. */
         if let Request::Console { app_id, activation, tab_of, new_window } = req {
             let resp = handle_console(uid, &owner, &app_id, activation, tab_of, new_window, &shared);
@@ -2862,6 +2867,41 @@ fn handle_ws_admin(uid: u32, owner: &str, name: &str, argv: &[String], activatio
     portcullis_ipc::send_fds(writer, &[procdesc.as_raw_fd(), stdin.as_raw_fd(), output.as_raw_fd()])
 }
 
+fn handle_workspace_credentials(uid: u32, req: Request) -> Response {
+    use portcullisd::opens;
+    let handle = || -> Result<Response, String> {
+        let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .map_err(|_| "Could not verify Settings' launch identity")?;
+        let (owner, _) = registry.resolve(uid)
+            .filter(|(_, caller)| launch::app_manages_grants(caller))
+            .ok_or("Only Settings can manage workspace credentials")?;
+        let (workspace, persona) = match &req {
+            Request::WorkspaceCredentials { workspace, persona }
+            | Request::SetWorkspaceCredential { workspace, persona, .. } => (workspace, persona),
+            _ => return Err("Unexpected workspace credential request".into()),
+        };
+        let check_persona = || {
+            if workspace::credential_persona(owner, workspace)? == *persona {
+                Ok(())
+            } else {
+                Err("Workspace persona changed. Reopen Workspace access".to_string())
+            }
+        };
+        check_persona()?;
+        if let Request::SetWorkspaceCredential { credential, granted, activation, .. } = &req {
+            opens::spend_press_for(&opens::activation_socket(), *activation, uid,
+                                   fresco_protocol::activation::purpose::APPROVE)?;
+            let _scope = workspace::CREDENTIAL_SCOPE.lock().unwrap_or_else(|e| e.into_inner());
+            check_persona()?;
+            ssh_agent::set_grant(owner, persona, workspace, credential, *granted)?;
+            return Ok(Response::Ok);
+        }
+        let credentials = ssh_agent::credentials(owner, persona, workspace)?;
+        Ok(Response::WorkspaceCredentials { credentials })
+    };
+    handle().unwrap_or_else(|message| Response::Error { message })
+}
+
 fn handle_workspace(uid: u32, owner: &str, req: Request, shared: &Mutex<Tenants>) -> Response {
     let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).unwrap_or_default();
     let caller = reg.resolve(uid).map(|(_, a)| a.to_string());
@@ -3715,7 +3755,8 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         | Request::PersonaVpns | Request::SetPersonaVpn { .. } => Response::Error {
             message: "access verbs must be handled on the peer-uid path".into(),
         },
-        Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
+        Request::WorkspaceCredentials { .. } | Request::SetWorkspaceCredential { .. }
+        | Request::Workspaces | Request::WorkspaceNew { .. } | Request::WorkspaceSet { .. } | Request::WorkspaceStop { .. } | Request::WorkspaceDelete { .. } | Request::WorkspaceRun { .. } | Request::WorkspaceDuplicate { .. }
         | Request::WorkspaceDebug { .. } | Request::WorkspaceCores { .. }
         | Request::WorkspacePick { .. } | Request::WorkspaceExec { .. } | Request::WorkspaceAdmin { .. } => Response::Error {
             message: "internal: workspaces must go through handle_workspace".into(),

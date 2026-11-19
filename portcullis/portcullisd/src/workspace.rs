@@ -469,6 +469,21 @@ fn make_dirs(owner: &str, home: &Path, gid: u32, name: &str) -> Result<PathBuf, 
     Ok(dir)
 }
 
+/// Serialize grant writes with workspace deletion and grant cleanup.
+pub static CREDENTIAL_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Resolve a single installed workspace without creating Scratch.
+pub fn credential_persona(owner: &str, name: &str) -> Result<String, String> {
+    if !valid_name(name) {
+        return Err("Invalid workspace name".into());
+    }
+    let (home, gid) = person(owner)?;
+    load(&root_dir(&home, gid)?.join(name))
+        .filter(|r| r.name == name)
+        .map(|r| r.persona)
+        .ok_or_else(|| "Workspace no longer exists".into())
+}
+
 /// The person's workspaces; Scratch is made the first time.
 pub fn list(owner: &str) -> Result<Vec<(Record, bool)>, String> {
     let (home, gid) = person(owner)?;
@@ -730,6 +745,7 @@ pub fn work_dir(owner: &str, name: &str) -> Result<PathBuf, String> {
 }
 
 pub fn delete(owner: &str, name: &str) -> Result<(), String> {
+    let _scope = CREDENTIAL_SCOPE.lock().unwrap_or_else(|e| e.into_inner());
     check_delete(owner, name)?;
     let persona = person(owner).ok()
         .and_then(|(home, gid)| root_dir(&home, gid).ok())

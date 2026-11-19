@@ -434,13 +434,16 @@ to eleven minutes for that answer. Model `AppsPage::directions`, `set_crossing`;
 
 ## Workspace access (Dev tools M9)
 
-Workspace access reads the signed-in person's workspace names and personas
-through portcullisd. A caller with the installed Settings manifest's
-`app-grants` capability may list its owner's workspaces. That capability
-does not authorize workspace administration. Curia shows the results on
-entry, with loading, empty and service-error states.
+Workspace access lists the signed-in person's workspaces and their personas.
+Select Credentials on a workspace to see its persona's stored SSH keys and
+HTTPS tokens, the credential kind and identifier, and the current Grant or
+Revoke action. Curia shows loading, empty and error states and reloads grants
+after a change.
 
-To finish the page, broker SSH key and HTTPS token metadata through
-portcullisd for that owner and workspace persona. Bind changes to a confirmed
-press, and resolve the workspace again on the server before applying them.
+Portcullisd checks the peer UID against the launch registry and checks the
+installed Settings manifest's `app-grants` capability. It derives the owner
+from the launch and resolves the workspace persona from the installed record.
+A mutation spends a Fresco APPROVE activation and rechecks the record.
+Portcullisd sends the owner, persona, item ID and workspace to the SSH agent's
+root control protocol. Curia receives credential labels and grant state.
 See [arca.md](arca.md) §9.1.

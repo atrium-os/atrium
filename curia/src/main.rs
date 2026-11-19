@@ -566,10 +566,9 @@ fn main() {
     // The system picker, while a WireGuard file is chosen (vpn.md §7.3).
     let mut vpn_pick: Option<limen::proto::EmbedId> = None;
     let mut vpn_pick_ask = false;
-    let workspaces = Mutable::with_dirty(None, dirty.clone());
+    let workspaces = Mutable::with_dirty(curia::workspace_access::Page::default(), dirty.clone());
     let (workspaces_tx, workspaces_rx) = channel();
     let mut workspace_page_open = false;
-    let mut workspace_visit = 0u64;
     let view = CuriaView { workspaces: workspaces.clone(), workspace_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), which: which.clone(), page: page.clone(), devs: devs.clone(), dev_scroll, disp: disp.clone(), disp_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), sound: sound.clone(), sound_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), apps: apps.clone(), apps_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt: bt.clone(), bt_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), bt_code: Mutable::with_dirty(Default::default(), dirty.clone()), persona_field: Mutable::with_dirty(Default::default(), dirty.clone()), persona_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), net_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), net_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), cred: cred.clone(), size: size.clone(), printers: printers.clone(), printers_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), printer_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn: vpn.clone(), vpn_scroll: Mutable::with_dirty(Default::default(), dirty.clone()), vpn_fields: std::array::from_fn(|_| Mutable::with_dirty(Default::default(), dirty.clone())), vpn_cred: vcred.clone() };
     let (ptx, prx) = channel();
     let refreshing = Arc::new(AtomicBool::new(false));
@@ -770,27 +769,26 @@ fn main() {
             }
         }
         let workspace_page_now = which.get() == curia::view::Which::WorkspaceCredentials;
+        if let Ok(result) = workspaces_rx.try_recv() {
+            curia::workspace_access::update(&workspaces, |page| page.apply(result));
+        }
         if workspace_page_now && !workspace_page_open {
-            workspace_visit += 1;
-            let visit = workspace_visit;
-            workspaces.set(None);
-            let tx = workspaces_tx.clone();
-            std::thread::spawn(move || {
-                use portcullis_ipc::{Request, Response};
-                let result = ask_portcullis(&Request::Workspaces, Duration::from_secs(5))
-                    .and_then(|reply| match reply {
-                        Response::WorkspaceList { workspaces, .. } => Ok(workspaces),
-                        Response::Error { message } => Err(message),
-                        _ => Err("Unexpected workspace response".into()),
-                    });
-                let _ = tx.send((visit, result));
-            });
+            curia::workspace_access::update(&workspaces, |page| page.open());
         }
         workspace_page_open = workspace_page_now;
-        while let Ok((visit, result)) = workspaces_rx.try_recv() {
-            if visit == workspace_visit {
-                workspaces.set(Some(result));
-            }
+        if workspaces.get_cloned().has_request() {
+            let mut page = workspaces.get_cloned();
+            let request = page.take_request().expect("pending workspace request");
+            workspaces.set(page);
+            let tx = workspaces_tx.clone();
+            std::thread::spawn(move || {
+                use portcullis_ipc::Response;
+                let result = ask_portcullis(&request, Duration::from_secs(15)).and_then(|reply| match reply {
+                    Response::Error { message } => Err(message),
+                    reply => Ok(reply),
+                });
+                let _ = tx.send(result);
+            });
         }
         // The VPN page: asked again every 3 s while it shows (a handshake,
         // a lost peer), and after each change.
