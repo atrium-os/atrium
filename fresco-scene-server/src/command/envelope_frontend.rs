@@ -86,6 +86,8 @@ pub struct WindowSceneState {
     pub placements:      HashMap<u32, fresco_protocol::PlaceParams>,
     pub slot_table:      HashMap<u32, [u8; 32]>,
     pub in_frame:        bool,
+    /// Number of explicit frame ends received for this window.
+    pub committed_frames: u64,
 
     /// `node_id → client_id` for every live node in this window,
     /// regardless of which op-kind map holds it. Used by
@@ -1306,6 +1308,7 @@ impl EnvelopeFrontend {
         let win_id = self.check_routable(msg)?;
         if let Some(s) = self.per_window.get_mut(&win_id) {
             s.in_frame = false;
+            s.committed_frames += 1;
         }
         Ok(Vec::new())
     }

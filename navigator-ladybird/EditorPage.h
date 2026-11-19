@@ -2,6 +2,9 @@
 
 #include <LibWeb/Page/Page.h>
 #include <LibWebCommon/Page/QueuedInputEvent.h>
+#ifdef ATRIUM_I0_SIGN_IN
+#include <LibWebCommon/HTML/NavigationPopulationRequest.h>
+#endif
 
 namespace Navigator {
 
@@ -14,6 +17,20 @@ class EditorPage final : public Web::PageClient {
 public:
     static GC::Ref<EditorPage> create(Gfx::Palette);
     ErrorOr<void> load_fixture(StringView html, bool embedded);
+#ifdef ATRIUM_I0_SIGN_IN
+    Optional<URL::URL> pending_navigation;
+    bool navigation_refused { false };
+    void request_navigation_start(Web::HTML::LocalNavigable&, Web::NavigationTarget target, URL::URL const& url, Utf16String, Optional<Web::HTML::NavigationStartRequest> request) override
+    {
+        if (target != Web::NavigationTarget::TopLevel || pending_navigation.has_value()
+            || !request.has_value() || request->url != url || !request->document_resource.has<Empty>()
+            || request->history_handling != Web::Bindings::NavigationHistoryBehavior::Replace) {
+            navigation_refused = true;
+            return;
+        }
+        pending_navigation = url;
+    }
+#endif
     Web::PageId id() const override { return Web::PageId { 1 }; }
     Web::Page& page() override { return *m_page; }
     Web::Page const& page() const override { return *m_page; }

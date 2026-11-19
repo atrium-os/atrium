@@ -13,15 +13,31 @@ use std::time::{Duration, Instant};
 
 fn serve_fixture(stream: UnixStream) -> std::io::Result<()> {
     use nuntius::{Event, Request};
-    let url = "https://editor.example/editor.html";
-    let bytes = include_bytes!("../../test-assets/navigator-i0/editor.html");
+    let signin = std::env::var_os("I0_SIGN_IN").is_some();
+    let urls: &[&str] = if signin {
+        &[
+            "https://idp.example/sign-in.html",
+            "https://idp.example/sign-in.html?step=authorize",
+            "https://idp.example/sign-in.html?step=password",
+            "https://idp.example/sign-in.html?step=callback",
+        ]
+    } else {
+        &["https://editor.example/editor.html"]
+    };
+    let bytes: &[u8] = if signin {
+        include_bytes!("../../test-assets/navigator-i0/sign-in.html")
+    } else {
+        include_bytes!("../../test-assets/navigator-i0/editor.html")
+    };
+    let mut step = 0;
     let (mut input, mut output) = nuntius::server::channel(stream)?;
     while let Some(req) = input.recv()? {
         let Request::Open(open) = req else {
             return Err(std::io::Error::other("unexpected fixture request"));
         };
         let id = open.id;
-        if open.url != url
+        if urls.get(step).copied() != Some(open.url.as_str())
+            || id != step as u32 + 1
             || open.method != nuntius::Method::Get
             || open.body.is_some()
             || open.deliver != nuntius::Deliver::Stream
@@ -33,6 +49,9 @@ fn serve_fixture(stream: UnixStream) -> std::io::Result<()> {
             })?;
             continue;
         }
+        let url = urls[step];
+        step += 1;
+        eprintln!("broker GET {id} {url} bytes={}", bytes.len());
         output.send(Event::Head {
             id,
             status: 200,
@@ -143,6 +162,7 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             }
         }
     };
+    let start = Instant::now();
     let embed = parent
         .request("web-island", token)
         .map_err(|e| format!("{e:?}"))?;
@@ -152,7 +172,13 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
     let raster_log = dir.join("frescod.log");
     let mut cursor = std::fs::metadata(&raster_log)?.len() as usize;
     let mut attached = false;
-    for stage in ["baseline", "blink", "restore", "key", "scroll"] {
+    let stages: &[&str] = if std::env::var_os("I0_SIGN_IN").is_some() {
+        &["baseline", "refused", "callback"]
+    } else {
+        &["baseline", "blink", "restore", "key", "scroll"]
+    };
+    let signin = std::env::var_os("I0_SIGN_IN").is_some();
+    for (index, &stage) in stages.iter().enumerate() {
         let until = Instant::now() + Duration::from_secs(45);
         loop {
             if Instant::now() >= until {
@@ -178,6 +204,25 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
                 line.contains("i0_raster width=640 height=360") && line.ends_with('\n')
             }) {
                 let row = row.trim_end();
+                cursor += tail.find(row).unwrap() + row.len() + 1;
+                if signin {
+                    let commit = row
+                        .split_whitespace()
+                        .next()
+                        .and_then(|token| token.strip_prefix("commit="))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .ok_or("renderer missing commit number")?;
+                    if commit == index
+                        && index > 0
+                        && row.ends_with("full=false pixel_mismatches=0")
+                    {
+                        println!("additional raster for {} {row}", stages[index - 1]);
+                        continue;
+                    }
+                    if commit != index + 1 {
+                        return Err(format!("unexpected scene commit for {stage}: {row}").into());
+                    }
+                }
                 let valid = if stage == "baseline" {
                     row.ends_with("full=true")
                 } else {
@@ -187,7 +232,10 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
                     return Err(format!("invalid raster at {stage}: {row}").into());
                 }
                 println!("{stage} {row}");
-                cursor += tail.find(row).unwrap() + row.len() + 1;
+                if std::env::var_os("I0_SIGN_IN").is_some() {
+                    println!("{stage} elapsed_us={}", start.elapsed().as_micros());
+                }
+
                 break;
             }
             if Instant::now() >= until {
@@ -231,7 +279,12 @@ fn run(dir: &Path, bundle: PathBuf) -> Result<(), Box<dyn Error>> {
             .map_err(|e| format!("{e:?}"))?;
     }
     if !exit.recv_timeout(Duration::from_secs(15))? {
-        return Err("editor worker failed".into());
+        return Err("fixture worker failed".into());
+    }
+    // A late renderer row would shift the attribution of all following frames.
+    let log = std::fs::read(&raster_log)?;
+    if std::str::from_utf8(&log[cursor..])?.contains("i0_raster width=640 height=360") {
+        return Err("extra raster after the final acknowledged frame".into());
     }
     Ok(())
 }

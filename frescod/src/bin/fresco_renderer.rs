@@ -164,6 +164,7 @@ fn raster(
     width: u32,
     height: u32,
     scrolls: Vec<(pack::Scroll, u64)>,
+    _commit: u64,
 ) -> Result<Option<Option<slot::Rect>>, String> {
     use fresco_compute::damage;
     let n = width as usize * height as usize;
@@ -176,7 +177,7 @@ fn raster(
     if w.tiles.is_none() {
         t2.render(frame, &mut w.px).map_err(|e| e.to_string())?;
         #[cfg(feature = "i0-raster-check")]
-        eprintln!("i0_raster width={width} height={height} tiles={} full=true", h.tiles_x * h.tiles_y);
+        eprintln!("commit={_commit} i0_raster width={width} height={height} tiles={} full=true", h.tiles_x * h.tiles_y);
         w.tiles = Some(sig);
         w.scrolls = scrolls;
         return Ok(Some(None));
@@ -203,7 +204,7 @@ fn raster(
         let mismatches = reference.iter().zip(&w.px).filter(|(a,b)| a!=b).count();
         let touched = damage::tiles_after_plan(width, height, &sig, held, &out.pixels, usize::MAX);
         let count: u64 = touched.iter().map(|r| u64::from(r[2] - r[0]) * u64::from(r[3] - r[1])).sum();
-        eprintln!("i0_raster width={width} height={height} tiles={count} tile_rects={touched:?} full=false pixel_mismatches={mismatches}");
+        eprintln!("commit={_commit} i0_raster width={width} height={height} tiles={count} tile_rects={touched:?} full=false pixel_mismatches={mismatches}");
         if mismatches != 0 { return Err("incremental raster differs from full frame".into()); }
     }
     w.tiles = Some(sig);
@@ -662,6 +663,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
     for (&id, w) in s.wins.iter_mut() {
         let (true, Some((width, height))) = (w.slots.is_some(), w.size) else { continue };
         // Pixel mode draws animated groups as sprites (sprites.rs).
+        let commit;
         let wf = {
             let fe = fe.lock().unwrap();
             // A client between FRAME_BEGIN and FRAME_END has sent only part
@@ -671,6 +673,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             if fe.window_state(id).is_some_and(|s| s.in_frame) {
                 continue;
             }
+            commit = fe.window_state(id).map_or(0, |s| s.committed_frames);
             let size = (width as f32, height as f32);
             if t2.is_some() {
                 let keep = w.sprites.as_ref().map(|s| s.keep()).unwrap_or_default();
@@ -744,7 +747,7 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             // Pixel mode: raster here (only what changed), send the pixels.
             Some(t2) => {
                 let scrolls = pack::keyed_scrolls(&scene, &wf.scrolls);
-                let damage = match raster(t2, w, &frame, width, height, scrolls) {
+                let damage = match raster(t2, w, &frame, width, height, scrolls, commit) {
                     Ok(Some(d)) => d,
                     Ok(None) => {
                         // Not a pixel changed.

@@ -3,6 +3,9 @@
 #include "EditorPage.h"
 #include "PinnedFonts.h"
 #include <LibCore/EventLoop.h>
+#ifdef ATRIUM_I0_SIGN_IN
+#include "SignInFixture.h"
+#endif
 #include <LibURL/Parser.h>
 #include <LibWeb/Loader/LoadRequest.h>
 #include <LibWeb/Loader/ResourceLoader.h>
@@ -11,7 +14,11 @@
 #include <LibWeb/Platform/EventLoopPlugin.h>
 
 static constexpr char fixture[] = {
+#ifdef ATRIUM_I0_SIGN_IN
+#embed "sign-in.html"
+#else
 #embed "editor.html"
+#endif
 };
 
 extern "C" bool navigator_fixture_channel(int);
@@ -20,12 +27,14 @@ extern "C" bool navigator_fixture_channel(int);
 static ByteBuffer document_body;
 static bool document_ok;
 
-static bool fetch_fixture(Web::Page& page)
+static bool fetch_fixture(Web::Page& page, URL::URL const& url)
 {
     auto& heap = GC::Heap::the();
-    Web::ResourceLoader::initialize(heap);
+    document_ok = false;
+    document_body.clear();
+    if (!Web::ResourceLoader::is_initialized()) Web::ResourceLoader::initialize(heap);
     Web::LoadRequest request(HTTP::HeaderList::create());
-    request.set_url(URL::Parser::basic_parse("https://editor.example/editor.html"sv));
+    request.set_url(url);
     request.set_page(page);
     Web::ResourceLoader::the().load(request,
         GC::create_function(heap, [](Web::Fetch::Engine::NetworkTransportHandle*, HTTP::HeaderList const&, Optional<u32>, Optional<String> const&, Requests::CacheState) {}),
@@ -61,9 +70,16 @@ int main(int argc, char** argv)
         return 3;
     auto palette = Gfx::Palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.release_value()));
     auto client = Navigator::EditorPage::create(move(palette));
+#ifdef ATRIUM_I0_SIGN_IN
+    auto result = Navigator::run_sign_in(client->palette(), [](Web::Page& page, URL::URL const& url) -> ErrorOr<StringView> {
+        if (!fetch_fixture(page, url))
+            return Error::from_string_literal("broker did not return the common fixture");
+        return StringView(document_body.bytes());
+    });
+#else
     StringView html { fixture, sizeof(fixture) };
     if (embedded) {
-        if (!fetch_fixture(client->page())) {
+        if (!fetch_fixture(client->page(), URL::Parser::basic_parse("https://editor.example/editor.html"sv).value())) {
             warnln("Fixture broker GET failed");
             return 4;
         }
@@ -71,6 +87,7 @@ int main(int argc, char** argv)
         outln("nuntius=GET fixture_matches=1 bytes={}", html.length());
     }
     auto result = client->load_fixture(html, embedded);
+#endif
     if (result.is_error()) {
         warnln("LibWeb fixture failed: {}", result.error());
         return 4;

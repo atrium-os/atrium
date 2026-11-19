@@ -18,7 +18,7 @@ struct NavigatorScene;
 extern "C" NavigatorScene* navigator_scene_create(bool embedded);
 extern "C" bool navigator_editor_input(NavigatorScene*, u8 kind, float* x, float* y, float* dy);
 extern "C" void navigator_scene_destroy(NavigatorScene*);
-extern "C" bool navigator_scene_sample(NavigatorScene*, Web::Layout::RustFFI::DocumentHost*, bool visible);
+extern "C" bool navigator_scene_sample(NavigatorScene*, Web::Layout::RustFFI::DocumentHost*, bool visible, bool require_blink);
 
 namespace Navigator {
 
@@ -64,7 +64,7 @@ ErrorOr<void> EditorPage::load_fixture(StringView html, bool embedded)
     if (!scene)
         return Error::from_string_literal("Limen did not assign an editor window");
     ScopeGuard release_scene = [&] { navigator_scene_destroy(scene); };
-    auto sample = [&](bool visible) { return navigator_scene_sample(scene, document->layout_node_arena().host(), visible); };
+    auto sample = [&](bool visible) { return navigator_scene_sample(scene, document->layout_node_arena().host(), visible, true); };
     if (!sample(true) || !sample(false) || !sample(true))
         return Error::from_string_literal("baseline or blink scene conversion failed");
     auto line = selection->anchor_node();

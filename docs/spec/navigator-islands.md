@@ -254,7 +254,7 @@ Each step runs in the VM with a gate before the next, as the Navigator's other s
 - The shared [scripted sign-in fixture](../../test-assets/navigator-i0/sign-in.html)
   tests two navigations, a rejected public fixture password, and a successful
   callback. Its script passed a local smoke check with mocked DOM and navigation.
-  The engine runs, JIT verification, and jail and Capsicum checks remain pending.
+  Ladybird passed the jailed, JIT-off gate below. Servo still needs the equivalent run.
 - Ladybird at `ead47ae6ef846b910ac509f51b12281523d7c2c3` (source inspection).
   WebView's FontService scans installed directories. LibGfx's SharedFontProvider
   already accepts a mapped catalog and brokered face descriptors. Supply pinned
@@ -361,7 +361,7 @@ The stripped editor SHA-256 was
 and the renderer was
 `378e34febe2dba007b6bb5b5b907dc1c3b2aa36d83d536500c15b7873453914c`.
 
-The next I0 comparison is the common sign-in fixture. Production per-origin
+The common sign-in results follow the Tessera editor baseline. Production per-origin
 fetch delegation, credential mediation and broader paint coverage remain open.
 This gate measures work per interaction. It does not measure latency.
 
@@ -447,6 +447,62 @@ sh "$run/boot" measurement.qcow2 qcow2 measurement
 Check the live mount before running the guest-local
 `/tmp/i0display.UYjBD3/navigator-i0-editor-gate.sh /tmp/i0display.UYjBD3 /tmp/navigator-i0-editor.UreA3F`.
 Power off the private guest cleanly after collecting the gate output.
+
+### Ladybird brokered sign-in on Tessera, 2026-11-20
+
+Three trials used a fresh copy-on-write snapshot on the shared arm64 HVF VM.
+The guest reported FreeBSD 16.0-CURRENT kernel `9f2eed03a36c` and a
+read-write Tessera root on `/dev/vtbd1p1`. Portcullis verified the bundle
+manifest. Each engine reported uid 1011, jail membership and Capsicum mode,
+and an ambient path open returned ECAPMODE. The cross-build's runtime Cargo
+dependency tree excluded both the JS and Wasm JITs.
+
+The preconnected Nuntius fixture broker served four ordered GETs to
+`https://idp.example/sign-in.html` with successive query strings of
+(empty), `?step=authorize`, `?step=password` and `?step=callback`.
+Each response supplied the same 1,381 bytes, SHA-256
+`8784c98941dba0864feb51e90878d36a7e856607697676d3ab1095659b15d733`.
+The fixture host followed the top-level navigation requested by the running
+page into a fresh LibWeb document on the same Limen embed. The driver set
+the real password control and clicked the submit button. The wrong value
+showed the refusal and issued no request. The correct public fixture value
+cleared the field and reached the scripted completion message. JITless
+Chrome reproduced the same DOM outcomes. Production origin grants, Arca
+credential delivery, cookies and an external IdP are outside this fixture.
+
+| Scene at 640 × 360 | Changed nodes | Fresco wire bytes | Rasterized tiles |
+|---|---:|---:|---:|
+| Password form, initial scene including resources | 10 | 4,203,510 | 920 |
+| Password refused | 8 | 1,927 | 32 |
+| Callback complete | 10 | 1,468 | 86 |
+
+These counts repeated in all three trials. The first trial also rasterized
+8 tiles again for the initial commit. Frame serials identify this additional
+work independently of the refusal. Every incremental raster matched a full
+redraw pixel for pixel.
+
+| Trial | Form (ms) | Refusal (ms) | Callback (ms) | Engine peak RSS (KiB) |
+|---|---:|---:|---:|---:|
+| First on this boot | 418.852 | 494.273 | 536.986 | 82,816 |
+| Second | 107.407 | 175.581 | 262.770 | 83,664 |
+| Third | 127.450 | 169.703 | 210.238 | 83,340 |
+
+Times are cumulative from the parent requesting the embed through observing
+the corresponding renderer report. They include IPC, polling and the gate's
+raster checks. The stripped engine was 164,979,848 bytes, SHA-256
+`8129d28604d927ae47bc5f0e01c02c1ef18098b75526f40e2501018f3219f894`.
+The renderer SHA-256 was
+`55dd86e14daa8822dd69a7cdc31dcd423b778a3f458dde82212c3393044f91b9`.
+
+Reserve port 24223 with the Coordinator and boot a fresh overlay using the
+preceding recipe. On the Mac configure the editor host with
+`-DI0_SIGN_IN=ON`, build the painter with the editor feature and link the
+host with `scripts/navigator-i0-editor-link.py`. Stage the stripped host
+at the fixture bundle's `bin/editor-check`, Limen's `editor_fixture` example
+at `editor-parent` and the `i0-raster-check` build of `fresco-renderer` at
+`renderer/bin/fresco-renderer` in the gate directory. Run the guest gate above
+with `I0_SIGN_IN=1`. For the editor configure `I0_SIGN_IN=OFF` and unset
+the guest variable. Power off cleanly and release the slot to the Coordinator.
 
 ## 9. Decisions, with recommendations
 

@@ -67,6 +67,10 @@ configure_file(Painter.toml.in "${CMAKE_CURRENT_BINARY_DIR}/painter/Cargo.toml" 
 # and source headers are separate in Ladybird's build tree.
 if(DEFINED WEB_GENERATED_HEADERS)
     add_library(editor-host OBJECT EditorPage.cpp editor-check.cpp)
+    option(I0_SIGN_IN "Build the common scripted sign-in fixture host" OFF)
+    if(I0_SIGN_IN)
+        target_compile_definitions(editor-host PRIVATE ATRIUM_I0_SIGN_IN)
+    endif()
     target_compile_features(editor-host PRIVATE cxx_std_23)
     target_compile_options(editor-host PRIVATE -Wno-unqualified-std-cast-call
         "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/../test-assets/navigator-i0")

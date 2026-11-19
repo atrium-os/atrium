@@ -23,6 +23,48 @@ fn rect(bounds: IntRect) -> Rect {
     )
 }
 
+fn uniform_radius(r: libgfx_rust::CornerRadii) -> Result<f32, &'static str> {
+    let radius = r.top_left.horizontal_radius;
+    if r != libgfx_rust::CornerRadii::uniform(radius) || radius < 0 {
+        return Err("nonuniform form corner radii");
+    }
+    Ok(radius as f32)
+}
+
+fn form_border(
+    c: libcompositing_rust::display_list::commands::FillRoundedRectRing,
+) -> Result<Node, &'static str> {
+    use pergola::shape::{Paint, PathData, Shape};
+    let width = c.top_width;
+    if width < 0 || [c.right_width, c.bottom_width, c.left_width] != [width; 3] {
+        return Err("nonuniform form border width");
+    }
+    let width = width as f32;
+    let radius = uniform_radius(c.corner_radii)?;
+    let outer = rect(c.rect);
+    let mut path = PathData::rounded_rect(outer, radius);
+    if outer.w() > 2. * width && outer.h() > 2. * width {
+        let inner = Rect::new(
+            outer.x() + width,
+            outer.y() + width,
+            outer.w() - 2. * width,
+            outer.h() - 2. * width,
+        );
+        let hole = PathData::rounded_rect(inner, (radius - width).max(0.));
+        path.verbs.extend(hole.verbs);
+        path.points.extend(hole.points);
+    }
+    let shape = Shape::new(path)
+        .even_odd()
+        .fill(Paint::Solid(color(c.color)));
+    let fill = shape
+        .fills()
+        .into_iter()
+        .next()
+        .ok_or("empty form border")?;
+    Ok(Node::Fill(fill.into()))
+}
+
 pub fn fill(command: &ResolvedFillRect) -> Result<Node, &'static str> {
     if command.compositing_and_blending_operator != CompositingAndBlendingOperator::Normal {
         return Err("editor fill requires normal blending");
@@ -264,6 +306,20 @@ pub fn editor_leaves(
                         return Ok(());
                     }
                     let node = match header.command_type {
+                        DisplayListCommandType::FillRectWithRoundedCorners => {
+                            let c = read_command::<libcompositing_rust::display_list::commands::FillRectWithRoundedCorners>(payload);
+                            if c.background_color_animation_effect != EffectNodeIndex::NONE {
+                                return Err("animated form background");
+                            }
+                            Node::Rect {
+                                rect: rect(c.rect),
+                                fill: color(c.color),
+                                radius: uniform_radius(c.corner_radii)?,
+                            }
+                        }
+                        DisplayListCommandType::FillRoundedRectRing => {
+                            form_border(read_command(payload))?
+                        }
                         DisplayListCommandType::FillRect => {
                             let c = read_command::<FillRect>(payload);
                             if c.background_color_animation_effect != EffectNodeIndex::NONE {
@@ -360,7 +416,7 @@ fn assemble_scene(
     let mut seen = HashSet::new();
     let mut keys = HashSet::new();
     let mut leaf_slots = HashMap::new();
-    for leaf in leaves {
+    for (leaf_index, mut leaf) in leaves.into_iter().enumerate() {
         if !leaf.context.effect.is_none() && !tree.effect_nodes.get(leaf.context.effect.0 as usize).is_some_and(|e|
             Some(leaf.context.effect)==tree.root_isolation_effect && e.parent.is_none() && e.local_clip.is_none()
             && matches!(&e.data,libcompositing_rust::visual_context::EffectNodeData::Effects(f)
@@ -431,8 +487,47 @@ fn assemble_scene(
             index = spatial.parent;
             clip = c.parent;
         }
-        if !clip.is_none() {
-            return Err("unsupported independent editor clip".into());
+        // A form control clips text in the stationary document coordinate space.
+        // Intersect its ancestor clips there before translating the run to group-local coordinates.
+        let mut bounds: Option<[f32; 4]> = None;
+        let mut depth = 0;
+        while !clip.is_none() {
+            let c = tree
+                .clip_nodes
+                .get(clip.0 as usize)
+                .ok_or("invalid form clip")?;
+            let ClipNodeData::Rect(r) = &c.data else {
+                return Err("nonrectangular form clip".into());
+            };
+            depth += 1;
+            if depth > tree.clip_nodes.len()
+                || !path.is_empty()
+                || (c.spatial != ROOT && c.spatial != leaf.context.spatial)
+                || r.mode != ClipMode::Intersect
+                || r.corner_radii != Default::default()
+            {
+                return Err("unsupported form clip geometry".into());
+            }
+            let rect = [
+                r.rect.x,
+                r.rect.y,
+                r.rect.x + r.rect.width,
+                r.rect.y + r.rect.height,
+            ];
+            if !rect.into_iter().all(f32::is_finite) {
+                return Err("invalid form clip coordinates".into());
+            }
+            bounds = Some(if let Some(b) = bounds {
+                [
+                    b[0].max(rect[0]),
+                    b[1].max(rect[1]),
+                    b[2].min(rect[2]),
+                    b[3].min(rect[3]),
+                ]
+            } else {
+                rect
+            });
+            clip = c.parent;
         }
         path.reverse();
         let common = active.iter().zip(&path).take_while(|(a, b)| a == b).count();
@@ -491,7 +586,38 @@ fn assemble_scene(
         if !keys.insert(key) {
             return Err("duplicate scene key".into());
         }
-        rows.push((active.last().copied(), None, key, leaf.node));
+        let mut parent = active.last().copied();
+        if let Some([x, y, right, bottom]) = bounds {
+            if right <= x || bottom <= y {
+                continue;
+            }
+            match &mut leaf.node {
+                Node::Glyphs { origin, .. } => {
+                    origin.x -= x;
+                    origin.y -= y;
+                }
+                Node::Rect { rect, .. } => {
+                    rect.origin.x -= x;
+                    rect.origin.y -= y;
+                }
+                _ => return Err("unsupported clipped form primitive".into()),
+            }
+            let mut hash = DefaultHasher::new();
+            (2u8, key).hash(&mut hash);
+            let clip_key = hash.finish();
+            if !keys.insert(clip_key) {
+                return Err("duplicate clip key".into());
+            }
+            let id = table.len() + leaf_index;
+            rows.push((
+                parent,
+                Some(id),
+                clip_key,
+                Node::layer(Rect::new(x, y, right - x, bottom - y), 1., true),
+            ));
+            parent = Some(id);
+        }
+        rows.push((parent, None, key, leaf.node));
     }
     let mut next = NodeTree::continuing(previous);
     let mut groups = HashMap::new();
@@ -760,6 +886,7 @@ pub mod host {
         state: &mut SceneState,
         host: &EmbeddedDocumentHost,
         visible: bool,
+        require_blink: bool,
     ) -> bool {
         let next = with_embedded_recording(host, |list, snapshot, fonts| {
             let mut caret = None;
@@ -768,15 +895,12 @@ pub mod host {
                     caret = Some(read_command::<PaintCaret>(payload));
                 }
             });
-            let caret = caret.ok_or("no caret in the published editor tape")?;
-            if !caret.should_blink {
+            if require_blink && !caret.is_some_and(|c| c.should_blink) {
                 return Err("recorded caret has no blink clock".into());
             }
-            let time_ns = caret.blink_cycle_start_time_ns.saturating_add(if visible {
-                0
-            } else {
-                500_000_000
-            });
+            let time_ns = caret
+                .map_or(0, |c| c.blink_cycle_start_time_ns)
+                .saturating_add(if visible { 0 } else { 500_000_000 });
             editor_scene(
                 list,
                 snapshot,
