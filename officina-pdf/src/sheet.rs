@@ -66,6 +66,9 @@ pub struct Sheet<'a> {
     /// Merged areas, `[r0, c0, r1, c1]` inclusive: each drawn as its
     /// top-left cell across the whole area.
     pub merges: Vec<[u32; 4]>,
+    /// Center Across Selection runs, `[row, c0, c1]` inclusive: the text
+    /// of the cell at `c0` centred across them all, no lines inside.
+    pub across: Vec<[u32; 3]>,
 }
 
 /// The paper, in points, and its margins.
@@ -210,6 +213,23 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
     let mut pdf = Pdf::new(out)?;
     let none = |_: u32| None;
     let mut done = 0;
+    // A cell's text laid in x..x + cw (pt), centred on the row y, ch.
+    let words = |items: &mut Vec<Item>, cell: &Cell, x: f64, y: f64, cw: f64, ch: f64| {
+        let lead = cell.indent as f64 * INDENT_PX * k;
+        let room = lu(cw - 2.0 * PAD_PX * k - lead);
+        if cell.text.is_empty() {
+            return;
+        }
+        if let Some((p, l, tw)) = fit(&shaper, cell, room) {
+            let left = match cell.align {
+                Align::Left => lu(x + PAD_PX * k + lead),
+                Align::Center => lu(x) + (lu(cw) - tw) / 2,
+                Align::Right => lu(x + cw - PAD_PX * k) - tw,
+            };
+            let (cy, chl) = (lu(y), lu(ch));
+            shaper.paint(items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
+        }
+    };
     // One cell (or merged area) at x, y (pt), cw × ch: fill and bar under
     // the text, borders over it.
     let draw = |items: &mut Vec<Item>, cell: &Cell, x: f64, y: f64, cw: f64, ch: f64, text: bool| {
@@ -220,18 +240,8 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
             let bw = ((cw - 4.0 * k).max(0.0) * share.clamp(0.0, 1.0) as f64).max(0.0);
             items.push(Item::Rect { x: lu(x + 2.0 * k), y: lu(y + 2.0 * k), w: lu(bw), h: lu((ch - 5.0 * k).max(0.0)), color: col });
         }
-        let lead = cell.indent as f64 * INDENT_PX * k;
-        let room = lu(cw - 2.0 * PAD_PX * k - lead);
-        if text && !cell.text.is_empty() {
-            if let Some((p, l, tw)) = fit(&shaper, cell, room) {
-                let left = match cell.align {
-                    Align::Left => lu(x + PAD_PX * k + lead),
-                    Align::Center => lu(x) + (lu(cw) - tw) / 2,
-                    Align::Right => lu(x + cw - PAD_PX * k) - tw,
-                };
-                let (cy, chl) = (lu(y), lu(ch));
-                shaper.paint(items, &p, &l, left, |lh| cy + ((chl - lh) / 2).max(0));
-            }
+        if text {
+            words(items, cell, x, y, cw, ch);
         }
         for (side, b) in cell.borders.iter().enumerate() {
             let Some((bw, col)) = *b else { continue };
@@ -268,6 +278,14 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
                 .map(|a| (*a, [(a[0] as usize).max(r0), (a[1] as usize).max(c0), (a[2] as usize).min(r1 - 1), (a[3] as usize).min(c1 - 1)]))
                 .collect();
             let merged = |r: usize, c: usize| pieces.iter().any(|(_, p)| (p[0]..=p[2]).contains(&r) && (p[1]..=p[3]).contains(&c));
+            // Center Across runs on this page, cut to it.
+            let runs: Vec<([u32; 3], usize, usize)> = sheet
+                .across
+                .iter()
+                .filter(|a| (r0..r1).contains(&(a[0] as usize)) && (a[1] as usize) < c1 && a[2] as usize >= c0 && a[2] > a[1])
+                .map(|a| (*a, (a[1] as usize).max(c0), (a[2] as usize).min(c1 - 1)))
+                .collect();
+            let in_run = |r: usize, c: usize| runs.iter().any(|(a, p0, p1)| a[0] as usize == r && (*p0..=*p1).contains(&c));
             for r in r0..r1 {
                 let (y, ch) = (ys[r - r0], rows[r]);
                 if ch <= 0.0 {
@@ -278,11 +296,12 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
                     if cw <= 0.0 || merged(r, c) {
                         continue;
                     }
-                    if sheet.gridlines {
+                    let run = in_run(r, c);
+                    if sheet.gridlines && !run {
                         lines.push((x, y, cw, ch));
                     }
                     if let Some(cell) = (sheet.cell)(r as u32, c as u32) {
-                        draw(&mut items, &cell, x, y, cw, ch, true);
+                        draw(&mut items, &cell, x, y, cw, ch, !run);
                     }
                 }
             }
@@ -299,6 +318,24 @@ pub fn export<W: Write>(sheet: &Sheet, setup: &Setup, fonts: &dyn Fonts, files: 
                     // The text goes on the page with the area's first cell.
                     let first = p[0] == a[0] as usize && p[1] == a[1] as usize;
                     draw(&mut items, &cell, x, y, cw, ch, first);
+                }
+            }
+            for (a, p0, p1) in &runs {
+                let r = a[0] as usize;
+                let (x, y) = (xs[p0 - c0], ys[r - r0]);
+                let (cw, ch) = (xs[p1 + 1 - c0] - x, rows[r]);
+                if cw <= 0.0 || ch <= 0.0 {
+                    continue;
+                }
+                if sheet.gridlines {
+                    lines.push((x, y, cw, ch));
+                }
+                // The text on the page with the run's first cell, centred
+                // across the part of the run on it.
+                if *p0 == a[1] as usize {
+                    if let Some(cell) = (sheet.cell)(a[0], a[1]) {
+                        words(&mut items, &Cell { align: Align::Center, indent: 0, ..cell }, x, y, cw, ch);
+                    }
                 }
             }
             // Gridlines first, so fills and borders cover them.
