@@ -86,21 +86,24 @@ struct tessera_ioc_group {
  * the volume's uuid, the directory's quota domain and whether it is that
  * domain's root, the domain's key group and that group's key id, and the
  * state (TESSERA_GROUP_INFO_*): OPEN only when the group's key is loaded
- * and the domain record carries the group's MAC. Unjailed root only. */
+ * and the domain record carries the group's MAC. Unjailed root only.
+ * A locked group's folder can't be opened (E4.4), so the ioctl goes to any
+ * directory of the volume (its parent, say) with the folder's inode number
+ * from stat(2) in `inode`; 0 asks about the directory itself. */
 struct tessera_ioc_group_info {
 	uint8_t  volume_uuid[16];
 	uint8_t  key_id[16];          /* the group's; zero for no group */
 	uint64_t domain_id;           /* 0: in no domain */
 	uint64_t group_id;            /* 0: the domain is in no group */
 	uint32_t flags;
-	uint32_t pad;
+	uint32_t inode;               /* in: st_ino, or 0 */
 };
 #define TESSERA_GROUP_INFO_ROOT      0x1u  /* the domain's root */
 #define TESSERA_GROUP_INFO_OPEN      0x2u
 #define TESSERA_GROUP_INFO_LOCKED    0x4u
 #define TESSERA_GROUP_INFO_BAD       0x8u  /* EINTEGRITY: record or MAC */
 #define TESSERA_GROUP_INFO_NO_RECORD 0x10u /* names a group with no record */
-#define TESSERA_IOC_GROUP_INFO   _IOR('T', 10, struct tessera_ioc_group_info)
+#define TESSERA_IOC_GROUP_INFO   _IOWR('T', 10, struct tessera_ioc_group_info)
 
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)

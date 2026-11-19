@@ -920,8 +920,13 @@ atrium-volumes only, key-group keys only, no second verification since
 portcullisd had Sigillum verify the removal) deletes the item and drops
 the key, then `GROUP_ERASE`; if a folder is still in use the erase waits
 for the person's next ask. Limit: a mount holds at most 32 groups
-(`TESSERA_FS_MAX_GROUPS`), so 32 person-personas per volume for now. VM
-gate: `scripts/tessera-personas-vm.sh`.
+(`TESSERA_FS_MAX_GROUPS`), so 32 person-personas per volume for now. A
+locked group's folder can't be opened (E4.4), so `GROUP_INFO` is asked of
+the folder's parent with the folder's inode number (`inode`, from stat,
+which root may do on a locked inode); the ioctl is `_IOWR('T',10)`. Limit:
+files moved in from a plain folder were on disk in the clear before; their
+old blocks stay in free space until reused (the VM gate saw them after GC).
+VM gate: `scripts/tessera-personas-vm.sh`.
 
 ## 14. Decisions
 
