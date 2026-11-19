@@ -549,6 +549,49 @@ doesn't run a spam classifier of its own in v1.
   Open and Open with…. Installation of a saved bundle follows the installer’s signature checks.
 - **Encrypted ZIPs and PDFs** ask for their password in Arca's field (Officina O7a's path).
 
+#### 8.2.1 Open sanitized copy (specified, pending implementation)
+
+**What opens.** Offer *Open sanitized copy* for an attachment that passes §8.2's
+type checks as `text/html`. The action produces a new PDF and opens it in the
+persona's PDF handler. Keep the original attachment in the message. For example,
+`invoice.html` produces `invoice-sanitized.pdf`. The chooser identifies the result
+as a PDF copy. V1 excludes standalone images (including SVG), plain text, PDFs,
+Office documents, archives, attached messages and all other types. HTML is the
+existing input shared by Mail's document pipeline and Navigator's page-print path.
+Preview support alone does not qualify another format.
+
+**How it is made.** Process the attachment itself through the parse jail's HTML
+profile (§7.3). Load the normalized document into the jailed Navigator
+`doc-viewer` through Limen. Use Navigator's native document scene, lay it out at
+paper width, and invoke its Officina PDF writer in a dedicated sanitized-export
+mode. Emit laid-out text with bundled fonts, supported vector paint and locally
+supplied images decoded under a budget and re-encoded from pixels. Preserve text
+selection where the writer has a glyph-to-text mapping. Omit remote resources,
+including previously cached ones. The worker receives only the document and its
+approved resources, with no network, mailbox or secret-store access.
+
+**What gets stripped.** Drop scripts, event handlers, frames, embedded objects,
+forms and controls, media, external references and source metadata. Retain a link's
+displayed label as ordinary text. Suppress the URI annotations that ordinary
+printing emits. Build the PDF from allowed paint operations only, without PDF
+actions, forms, attachments, source HTML, source fonts or original image streams.
+A displayed address or misleading sentence can still appear as text. This action
+makes a passive copy and makes no malware-scan claim.
+
+**Delivery and failure.** Return a completed, sealed, read-only PDF descriptor.
+Apply §8.2's broker checks and same-persona routing to that descriptor. If conversion
+outlasts the activation token, ask for a fresh press to open the completed copy.
+Bound input, decoded pixels, layout time, pages and output bytes. On refusal,
+timeout, worker failure or truncated output, explain that the copy could not be
+created and deliver neither a partial PDF nor the original.
+
+**Acceptance check.** Use an HTML fixture with selectable text, a local picture,
+a labelled link, a form, script and a remote picture. Verify the generated PDF
+renders the text and local picture, the remote request count stays zero, and PDF
+object inspection finds no URI annotations, actions, forms or embedded files.
+Verify a same-persona PDF handler receives the sealed PDF, an unsupported input
+has no action, and an over-budget conversion delivers no descriptor.
+
 ### 8.3 Sending big files
 
 Over a size the account allows (from `SIZE` / JMAP `maxSizeUpload`, default 20 MB), compose
