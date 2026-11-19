@@ -58,39 +58,72 @@ pub fn cell_of(v: CellView) -> Cell {
     }
 }
 
-/// The current sheet from A1 to its last shown cell; Err when it is more
-/// than a print can take.
+/// The imported Excel print area, when the current sheet has one.
+fn print_area(d: &Doc) -> Result<Option<[u32; 4]>, String> {
+    use officina_grid::formula::ast::{Coord::Abs, Expr, RangeKind};
+    let Some(name) = d.wb.names().get(d.sheet, "_xlnm.Print_Area") else { return Ok(None) };
+    let (sheet, bounds) = match name.expr.as_ref() {
+        Expr::Ref(r) => (r.sheet, match (r.row, r.col) {
+            (Abs(row), Abs(col)) => Some([row, col, row + 1, col + 1]),
+            _ => None,
+        }),
+        Expr::Range(r) => (r.sheet, match (r.kind, r.r0, r.c0, r.r1, r.c1) {
+            (RangeKind::Cells, Abs(r0), Abs(c0), Abs(r1), Abs(c1)) =>
+                Some([r0.min(r1), c0.min(c1), r0.max(r1) + 1, c0.max(c1) + 1]),
+            _ => None,
+        }),
+        _ => (None, None),
+    };
+    if name.scope.is_none() && sheet.is_some_and(|sheet| sheet != d.sheet) {
+        return Ok(None);
+    }
+    bounds.filter(|_| sheet.is_none_or(|sheet| sheet == d.sheet)).map(Some)
+        .ok_or_else(|| "The print area must be one absolute cell or rectangular range on this sheet".into())
+}
+
+/// The current sheet's print area or its used range, captured at print time.
 pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
-    let (rows, cols, name, col_px, row_px, from, to) = {
+    let (top, left, rows, cols, name, col_px, row_px, from, to, fixed, merges) = {
         let d = doc.borrow();
-        let (mut r, mut c) = d.wb.extent(d.sheet);
-        // A merged area that starts in the used range counts in full.
-        let (r0, c0) = (r, c);
-        for m in d.wb.merges(d.sheet).iter().filter(|m| m.r0 < r0 && m.c0 < c0) {
-            r = r.max(m.r1 + 1);
-            c = c.max(m.c1 + 1);
+        let area = print_area(&d)?;
+        let (r, c) = d.wb.extent(d.sheet);
+        let (mut bottom, mut right) = (r, c);
+        let all_merges = d.wb.merges(d.sheet);
+        if area.is_none() {
+            for m in all_merges.iter().filter(|m| m.r0 < r && m.c0 < c) {
+                bottom = bottom.max(m.r1 + 1);
+                right = right.max(m.c1 + 1);
+            }
+        }
+        let [top, left, bottom, right] = area.unwrap_or([0, 0, bottom, right]);
+        let (rows, cols) = (bottom - top, right - left);
+        if u64::from(rows) * u64::from(cols) > MAX_CELLS {
+            return Err(format!("the print area has more than {MAX_CELLS} cells"));
         }
         let sh = d.wb.sheet(d.sheet);
         let rs = if sh.hidden.is_empty() { sh.row_sizes.clone() } else { sh.view_row_sizes() };
-        let col_px: Vec<f64> = (0..c).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect();
-        let row_px: Vec<f64> = (0..r).map(|i| rs.offset(i + 1) - rs.offset(i)).collect();
-        (r, c, sh.name.clone(), col_px, row_px, sh.freeze_from, sh.freeze)
+        let col_px = (left..right).map(|i| sh.col_sizes.offset(i + 1) - sh.col_sizes.offset(i)).collect::<Vec<_>>();
+        let row_px = (top..bottom).map(|i| rs.offset(i + 1) - rs.offset(i)).collect::<Vec<_>>();
+        let merges = all_merges.iter()
+            .filter(|m| (top..bottom).contains(&m.r0) && (left..right).contains(&m.c0))
+            .map(|m| [m.r0 - top, m.c0 - left, m.r1.min(bottom - 1) - top, m.c1.min(right - 1) - left])
+            .collect::<Vec<_>>();
+        let from = (sh.freeze_from.0.saturating_sub(top), sh.freeze_from.1.saturating_sub(left));
+        let to = (sh.freeze.0.saturating_sub(top), sh.freeze.1.saturating_sub(left));
+        (top, left, rows, cols, sh.name.clone(), col_px, row_px, from, to, area.is_some(), merges)
     };
-    if rows as u64 * cols as u64 > MAX_CELLS {
-        return Err(format!("the sheet has more than {MAX_CELLS} cells to print"));
-    }
     let src = SheetSource::new(doc.clone());
     let mut cells = Vec::with_capacity((rows * cols) as usize);
     let (mut last_r, mut last_c) = (0, 0);
     let mut across = Vec::new();
     for r in 0..rows {
         for c in 0..cols {
-            let v = src.cell(r, c);
+            let v = src.cell(top + r, left + c);
             // A run, as the grid draws it: the empty cells after this one
             // that centre across too.
             if v.as_ref().is_some_and(|v| v.align == CellAlign::Across && !v.text.is_empty() && !v.text.contains('\n')) {
                 let mut b = c;
-                while b + 1 < cols && b - c < pergola::widgets::grid_view::SPILL_COLS && src.merge_at(r, b + 1).is_none() && src.cell(r, b + 1).is_some_and(|w| w.text.is_empty() && w.align == CellAlign::Across) {
+                while b + 1 < cols && b - c < pergola::widgets::grid_view::SPILL_COLS && src.merge_at(top + r, left + b + 1).is_none() && src.cell(top + r, left + b + 1).is_some_and(|w| w.text.is_empty() && w.align == CellAlign::Across) {
                     b += 1;
                 }
                 if b > c {
@@ -107,17 +140,18 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         }
     }
     // A merged area whose first cell shows something is printed whole.
-    let merges = doc.borrow().wb.merges(doc.borrow().sheet).to_vec();
-    for m in &merges {
-        if cells[(m.r0 * cols + m.c0) as usize].is_some() {
-            last_r = last_r.max((m.r1 + 1).min(rows));
-            last_c = last_c.max((m.c1 + 1).min(cols));
+    for &[r0, c0, r1, c1] in &merges {
+        if cells[(r0 * cols + c0) as usize].is_some() {
+            last_r = last_r.max(r1 + 1);
+            last_c = last_c.max(c1 + 1);
         }
     }
-    let merges: Vec<[u32; 4]> = merges
-        .iter()
-        .filter(|m| m.r0 < last_r && m.c0 < last_c)
-        .map(|m| [m.r0, m.c0, m.r1.min(last_r.saturating_sub(1)), m.c1.min(last_c.saturating_sub(1))])
+    if fixed {
+        (last_r, last_c) = (rows, cols);
+    }
+    let merges = merges.into_iter()
+        .filter(|m| m[0] < last_r && m[1] < last_c)
+        .map(|m| [m[0], m[1], m[2].min(last_r - 1), m[3].min(last_c - 1)])
         .collect();
     let across: Vec<[u32; 3]> = across.into_iter().filter(|a| a[0] < last_r).collect();
     // Only up to the last cell that shows anything.
@@ -157,6 +191,21 @@ mod tests {
         assert_eq!(s.cols[0], 64.0);
         let pdf = pdf(&s, 595.0, 842.0, "Q3").unwrap();
         assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn imported_print_area_limits_the_snapshot() {
+        let doc = Rc::new(RefCell::new(Doc::new("Report")));
+        {
+            let mut d = doc.borrow_mut();
+            d.type_into(0, 0, "Outside");
+            d.type_into(2, 3, "Inside");
+            d.wb.define_name("_xlnm.Print_Area", Some(0), "=$D$3:$E$5").unwrap();
+        }
+        let s = snapshot(&doc).unwrap();
+        assert_eq!((s.rows.len(), s.cols.len()), (3, 2));
+        assert_eq!(s.cells[0].as_ref().unwrap().text, "Inside");
+        assert_eq!(s.cells.iter().flatten().count(), 1);
     }
 
     #[test]

@@ -785,8 +785,9 @@ The Navigator prints too (2026-11-18, navigator-ui.md §7 "Printing"): the page'
 jailed child lays it out on the paper and writes the PDF, handed back to the window as a
 sealed memory file, and it answers Relayout the same way.
 
-Not yet: Sheets prints the current
-sheet's used range only (no print areas, titles, charts or pictures yet); Mail prints text only;
+Sheets honors a saved XLSX print area consisting of one absolute cell or rectangle.
+Without a saved area it prints the used range. Frozen titles repeat within the printed bounds.
+Charts and pictures remain open for Sheets. Mail prints message text;
 colour, two-sided and tray options wait for R5's attributes; Scrinium's
 quick look doesn't pass `PrintAsked` on yet; `print_image` and `print_text` helpers in
 Pergola (`officina_pdf::plain` is the text half).
