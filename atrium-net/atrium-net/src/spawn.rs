@@ -90,7 +90,7 @@ impl Spawner {
 
     /// Start program `kind`; our end of its socket.
     pub fn spawn(&self, kind: u8) -> io::Result<UnixStream> {
-        assert!(!matches!(kind, b'M' | b'S' | b'U' | b'T' | b'F'));
+        assert!(!matches!(kind, b'M' | b'S' | b'U' | b'T' | b'F' | b'H'));
         let mut v = self.ask(&[kind], 1, "spawner could not start it")?;
         Ok(UnixStream::from(v.remove(0)))
     }
@@ -176,6 +176,20 @@ impl Spawner {
             Ok(())
         } else {
             Err(io::Error::other("pfctl refused the anchor"))
+        }
+    }
+
+    /// The kernel's pf running flag. Unknown when the query fails.
+    pub fn pf_running(&self) -> Option<bool> {
+        let fd = self.s.as_raw_fd();
+        // SAFETY: fd is the live spawner socket and the buffer is one byte.
+        if unsafe { libc::write(fd, b"H".as_ptr().cast(), 1) } != 1 {
+            return None;
+        }
+        match recv_fds(fd).ok()?.0 {
+            b'1' => Some(true),
+            b'0' => Some(false),
+            _ => None,
         }
     }
 
@@ -346,6 +360,11 @@ fn serve(s: RawFd, progs: &[Prog]) -> ! {
             }
             continue;
         }
+        if k == b'H' {
+            let running = pf_running();
+            let _ = send_fd(s, match running { Some(true) => b'1', Some(false) => b'0', None => b'E' }, None);
+            continue;
+        }
         if k == b'F' {
             let mut n = [0u8; 1];
             if !read_exact(s, &mut n) {
@@ -431,6 +450,25 @@ fn load_anchor(rules: &[u8], iface: &str) -> bool {
         while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
     }
     ok
+}
+
+fn pf_running() -> Option<bool> {
+    use std::process::Command;
+    // The spawner normally auto-reaps helpers. Temporarily wait for pfctl.
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let result = Command::new(PFCTL).args(["-s", "info"]).env("LC_ALL", "C").output();
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+    }
+    let result = result.ok().filter(|o| o.status.success())?;
+    let status = std::str::from_utf8(&result.stdout).ok()?.lines()
+        .find_map(|line| line.strip_prefix("Status:"))?.split_whitespace().next()?;
+    match status {
+        "Enabled" => Some(true),
+        "Disabled" => Some(false),
+        _ => None,
+    }
 }
 
 fn run_pfctl(rules: &[u8], iface: &str) -> bool {

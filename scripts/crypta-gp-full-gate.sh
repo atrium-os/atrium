@@ -15,6 +15,7 @@ trust=$3
 portal_port=${4:-}
 transport=${5:-}
 hip=${6:-}
+receipts=${7:-}
 if [ -n "$transport" ]; then
     export CRYPTA_GP_TEST_ESP=4501
 fi
@@ -129,7 +130,10 @@ if [ -n "$hip" ]; then
     wait_prompt gp_hip_approval
     [ "$(field handshake)" = 0 ] || fail "the data tunnel opened before HIP approval"
     preview=$(printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n')
-    for line in 'VPN user  alice' 'VPN hostname  atrium' 'Assigned IPv4  10.77.0.2' "Operating system  $("$V" 'uname -sr')"; do
+    forwarding=$("$V" 'sysctl -n net.inet6.ip6.forwarding')
+    if [ "$forwarding" = 1 ]; then forwarded=yes; else forwarded=no; fi
+    for line in 'VPN user  alice' 'VPN hostname  atrium' 'Assigned IPv4  10.77.0.2' \
+        "Operating system  $("$V" 'uname -sr')" "IPv6 forwarding  $forwarded" 'Firewall  Atrium pf enabled: yes'; do
         case "$preview" in *"$(hex "$line")"*) ;; *) fail "HIP prompt omitted a report field" ;; esac
     done
     ok "Settings prompt exposes the HIP facts before the data tunnel is up"
@@ -162,6 +166,47 @@ probe() {
     "$V" 'ping -n -c 1 -t 5 -S 10.77.0.2 10.77.0.1' || fail "$1"
     ok "$1"
 }
+if [ "$hip" = refresh ]; then
+    original=$("$V" 'sysctl -n net.inet6.ip6.forwarding')
+    case "$original" in
+        0) changed=1; changed_word=yes ;;
+        1) changed=0; changed_word=no ;;
+        *) fail "IPv6 forwarding sysctl did not report a boolean" ;;
+    esac
+    trap '"$V" "sysctl net.inet6.ip6.forwarding=$original" >/dev/null || true; cleanup; kill "$LANPID" 2>/dev/null || true' EXIT
+    probe "IPv4 echo before HIP refresh"
+    wait_receipts() {
+        for _ in $(seq 1 25); do
+            [ "$(wc -l < "$receipts" | tr -d ' ')" -lt "$1" ] || return 0
+            sleep 1
+        done
+        fail "HIP report did not reach the fixture"
+    }
+    wait_receipts 2
+    [ "$(sed -n '1p' "$receipts")" = "$(sed -n '2p' "$receipts")" ] || fail "the unchanged reports differed"
+    [ "$(field signin)" != prompt ] || fail "the unchanged report prompted again"
+    ok "independent timer refreshed the unchanged report without asking"
+    "$V" "sysctl net.inet6.ip6.forwarding=$changed" >/dev/null
+    wait_prompt gp_hip_approval
+    printf '%s\n' "$prompt" | sed -n 's/^text k=banner v=//p' | tr -d '\n' | grep -q "$(hex "IPv6 forwarding  $changed_word")" ||
+        fail "review did not show the verified change"
+    if grep -q "^$changed_word " "$receipts"; then
+        fail "changed posture reached the gateway before approval"
+    fi
+    ok "verified posture change required fresh approval before upload"
+    "$V" "$CTL answer name=gp-gate t0=$(hex submit)" >/dev/null || fail "approve changed HIP"
+    for _ in $(seq 1 25); do
+        if grep -q "^$changed_word " "$receipts"; then break; fi
+        sleep 1
+    done
+    grep -q "^$changed_word " "$receipts" || fail "changed HIP did not reach the gateway"
+    probe "IPv4 echo after approved HIP refresh"
+    [ "$(field starts)" = 1 ] || fail "HIP refresh restarted the engine"
+    "$V" "$CTL down name=gp-gate" >/dev/null
+    ok "HIP refreshed on the original tunnel"
+    echo "$pass checks passed"
+    exit 0
+fi
 probe "IPv4 echo before rebind"
 "$V" "$CTL rebind name=gp-gate" >/dev/null
 # Wait for the second Up event, since the previous handshake can still read

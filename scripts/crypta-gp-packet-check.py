@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import select
 import shlex
 import socket
 import ssl
@@ -143,16 +144,18 @@ class EspPeer:
             self.errors.append(error)
 
 
-def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None, hip=None):
-    try:
-        while True:
-            raw, _ = listener.accept()
+def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=None, hip=None, receipts=None):
+    done = threading.Event()
+    workers = []
+
+    def handle(raw):
+        try:
             with ctx.wrap_socket(raw, server_side=True) as stream:
                 stream.settimeout(15)
                 with stream.makefile("rb") as reader:
                     first = reader.readline().decode().split()
                     if not first:
-                        continue
+                        return
                     _, url, _ = first
                     parsed = urlsplit(url)
                     path = parsed.path.rsplit("/", 1)[-1]
@@ -201,9 +204,10 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                     elif path == "hipreportcheck.esp":
                         assert fields["client-ip"] == ["10.77.0.2"]
                         needed = "yes" if hip else "no"
-                        body = f"<response><hip-report-needed>{needed}</hip-report-needed></response>"
+                        interval = "<hip-report-interval>5</hip-report-interval>" if hip == "refresh" else ""
+                        body = f"<response><hip-report-needed>{needed}</hip-report-needed>{interval}</response>"
                     elif path == "hipreport.esp":
-                        assert hip == "approve", "HIP submitted without approval"
+                        assert hip in ("approve", "refresh"), "HIP submitted without approval"
                         assert fields["authcookie"] == [COOKIE]
                         report, = fields["report"]
                         doc = ET.fromstring(report)
@@ -213,19 +217,26 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                         assert doc.findtext("ip-address") == "10.77.0.2"
                         assert doc.findtext("hip-report-version") == "4"
                         categories = doc.findall("./categories/entry")
-                        assert [node.attrib for node in categories] == [{"name": "host-info"}]
-                        assert {node.tag for node in categories[0]} == {"os", "client-version"}
+                        assert [node.attrib for node in categories] == [{"name": "host-info"}, {"name": "firewall"}]
+                        assert {node.tag for node in categories[0]} == {"os", "client-version", "ipv6-forwarding"}
+                        forwarding = categories[0].findtext("ipv6-forwarding")
+                        assert forwarding in ("yes", "no")
+                        assert categories[1].findtext("entry/product") == "Atrium pf"
+                        assert categories[1].findtext("entry/is-enabled") == "yes"
                         assert categories[0].findtext("os").startswith("FreeBSD ")
                         assert categories[0].findtext("client-version") == "Atrium"
                         digest, = fields["md5"]
                         assert doc.findtext("md5-sum") == digest
                         original = report.replace(f"<md5-sum>{digest}</md5-sum>", "", 1)
                         assert hashlib.md5(original.encode()).hexdigest() == digest
+                        if receipts:
+                            with receipts.open("a") as receipt:
+                                print(f"{forwarding} {digest}", file=receipt)
                         body = '<response status="success"/>'
                     elif path == "ssl-tunnel-connect.sslvpn":
                         assert query == {"user": ["alice"], "authcookie": [COOKIE]}
                         frames(stream, reader, calls)
-                        continue
+                        return
                     elif path == "logout.esp":
                         assert (query or fields)["authcookie"] == [COOKIE]
                         body = '<response status="success"/>'
@@ -235,9 +246,25 @@ def serve(ctx, listener, calls, errors, *, isolated=False, portal=False, esp=Non
                                 f"Connection: close\r\n{extra}\r\n{body}")
                     stream.sendall(response.encode())
                     if path == "logout.esp" or (portal and path == "getconfig.esp"):
-                        return
-    except Exception as error:
-        errors.append(error)
+                        done.set()
+        except Exception as error:
+            errors.append(error)
+            done.set()
+
+    deadline = time.monotonic() + listener.gettimeout()
+    try:
+        while not done.is_set() and time.monotonic() < deadline:
+            if not select.select([listener], [], [], 0.2)[0]:
+                continue
+            raw, _ = listener.accept()
+            worker = threading.Thread(target=handle, args=(raw,), daemon=True)
+            worker.start()
+            workers.append(worker)
+        for worker in workers:
+            worker.join(1)
+    except OSError as error:
+        if not done.is_set():
+            errors.append(error)
 
 
 def openconnect_probe():
@@ -314,10 +341,10 @@ def main():
     group.add_argument("--portal-vm", choices=["arm64", "amd64"])
     parser.add_argument("--esp", action="store_true", help="advertise ESP and carry packets over UDP")
     parser.add_argument("--drop-esp", action="store_true", help="drop ESP probes to test TLS fallback")
-    parser.add_argument("--hip", choices=["approve", "decline"], help="require a reviewed HIP report in the full gate")
+    parser.add_argument("--hip", choices=["approve", "decline", "refresh"], help="require a reviewed HIP report in the full gate")
     args = parser.parse_args()
-    if args.hip and (not args.full_vm or args.esp or args.drop_esp):
-        parser.error("HIP cases run with the full TLS VM gate")
+    if args.hip and (not args.full_vm or args.drop_esp):
+        parser.error("HIP cases require the full VM gate")
     if (args.esp or args.drop_esp) and (args.portal_vm or args.vm):
         parser.error("use --full-vm or the host client for ESP packet checks")
     with tempfile.TemporaryDirectory() as directory:
@@ -349,7 +376,10 @@ def main():
             listener.settimeout(300 if args.full_vm else 110 if args.vm else 25)
             port = listener.getsockname()[1]
             calls, errors = [], []
-            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip}, daemon=True)
+            receipts = tmp / "hip-receipts" if args.hip == "refresh" else None
+            if receipts:
+                receipts.touch()
+            thread = threading.Thread(target=serve, args=(ctx, listener, calls, errors), kwargs={"esp": esp, "hip": args.hip, "receipts": receipts}, daemon=True)
             thread.start()
             if args.openconnect:
                 marker = tmp / "reply"
@@ -377,7 +407,7 @@ def main():
                 print("OpenConnect received an ICMP echo reply with valid checksums and matching payload")
             elif args.full_vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-full-gate.sh", args.full_vm, str(port), pin, "",
-                                ("TLS" if args.drop_esp else "ESP") if esp else "", args.hip or ""],
+                                ("TLS" if args.drop_esp else "ESP") if esp else "", args.hip or "", str(receipts or "")],
                                check=True, timeout=300)
             elif args.vm:
                 subprocess.run(["sh", ROOT / "scripts/crypta-gp-vm-gate.sh", args.vm, str(port), pin],
@@ -400,6 +430,17 @@ def main():
             if args.hip == "decline":
                 assert calls == ["prelogin.esp", "login.esp", *exchange], calls
                 print("Declining HIP sent no report and opened no data tunnel")
+                return
+            if args.hip == "refresh":
+                assert calls.count("getconfig.esp") == 1, calls
+                if esp:
+                    assert not esp.errors, esp.errors
+                    assert len(esp.echo) == 2 and len(set(esp.echo)) == 1, esp.echo
+                    assert "ssl-tunnel-connect.sslvpn" not in calls, calls
+                else:
+                    assert calls.count("ssl-tunnel-connect.sslvpn") == 1 and calls.count("echo") == 2, calls
+                assert calls[-1] == "logout.esp", calls
+                print("HIP refreshed twice on the original data connection")
                 return
             if args.hip == "approve":
                 exchange.append("hipreport.esp")

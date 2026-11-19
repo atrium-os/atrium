@@ -176,8 +176,14 @@ impl Session {
         form(&fields)
     }
 
-    pub fn hip_report(&self, computer: &str, ip: Ipv4Addr, os: &str) -> Result<HipReport> {
-        HipReport::new(&self.user, computer, ip, os)
+    pub fn hip_report(
+        &self,
+        computer: &str,
+        ip: Ipv4Addr,
+        os: &str,
+        facts: crypta_proto::engine::HipFacts,
+    ) -> Result<HipReport> {
+        HipReport::new(&self.user, computer, ip, os, facts)
     }
 
     pub fn logout(&self, computer: &str) -> Zeroizing<String> {
@@ -608,7 +614,13 @@ pub struct HipReport {
 }
 
 impl HipReport {
-    fn new(user: &str, computer: &str, ip: Ipv4Addr, os: &str) -> Result<Self> {
+    fn new(
+        user: &str,
+        computer: &str,
+        ip: Ipv4Addr,
+        os: &str,
+        facts: crypta_proto::engine::HipFacts,
+    ) -> Result<Self> {
         use md5::{Digest, Md5};
         let ip = ip.to_string();
         let info = [
@@ -633,16 +645,33 @@ impl HipReport {
             root = root.with_child(Element::new(key).with_text(value));
             let _ = writeln!(review, "{label}  {value}");
         }
-        root = root.with_child(
-            Element::new("categories").with_child(
-                Element::new("entry")
-                    .with_attr("name", "host-info")
-                    .with_child(Element::new("os").with_text(os))
-                    .with_child(Element::new("client-version").with_text("Atrium")),
-            ),
-        );
+        let mut host = Element::new("entry")
+            .with_attr("name", "host-info")
+            .with_child(Element::new("os").with_text(os))
+            .with_child(Element::new("client-version").with_text("Atrium"));
         let _ = writeln!(review, "Operating system  {os}");
-        review.push_str("Client  Atrium\nOther posture categories are omitted.");
+        review.push_str("Client  Atrium\n");
+        if let Some(enabled) = facts.ipv6_forwarding {
+            let value = if enabled { "yes" } else { "no" };
+            host = host.with_child(Element::new("ipv6-forwarding").with_text(value));
+            let _ = writeln!(review, "IPv6 forwarding  {value}");
+        }
+        let mut categories = Element::new("categories").with_child(host);
+        if let Some(enabled) = facts.pf {
+            let value = if enabled { "yes" } else { "no" };
+            categories = categories.with_child(
+                Element::new("entry")
+                    .with_attr("name", "firewall")
+                    .with_child(
+                        Element::new("entry")
+                            .with_child(Element::new("product").with_text("Atrium pf"))
+                            .with_child(Element::new("is-enabled").with_text(value)),
+                    ),
+            );
+            let _ = writeln!(review, "Firewall  Atrium pf enabled: {value}");
+        }
+        root = root.with_child(categories);
+        review.push_str("Other posture categories are omitted.");
         // MD5 is the protocol's report identifier, separate from the
         // TLS transport and from the exact-content approval check.
         let digest = format!("{:x}", Md5::digest(root.to_doc().as_bytes()));
@@ -668,6 +697,17 @@ pub fn hip_check(bytes: &[u8]) -> Result<bool> {
     Err("unrecognized GlobalProtect HIP check")
 }
 
+pub fn hip_interval(bytes: &[u8]) -> Result<Duration> {
+    let root = document(bytes)?;
+    let seconds = match scalar(&root, "hip-report-interval")? {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "invalid GlobalProtect HIP interval")?,
+        None => 600,
+    };
+    Ok(Duration::from_secs(seconds.clamp(5, 3600)))
+}
+
 pub fn hip_accepted(bytes: &[u8]) -> Result<()> {
     let root = document(bytes)?;
     if root.name == "response" && root.attr("status") == Some("success") {
@@ -688,6 +728,7 @@ mod tests {
             "atrium",
             Ipv4Addr::new(10, 77, 0, 2),
             "FreeBSD 16.0",
+            Default::default(),
         )
         .unwrap();
         assert!(report.review.contains("VPN user  alice & bob"));
@@ -699,14 +740,45 @@ mod tests {
             "atrium",
             Ipv4Addr::new(10, 77, 0, 3),
             "FreeBSD 16.0",
+            Default::default(),
         )
         .unwrap();
         assert_ne!(report.xml, changed.xml);
         assert_ne!(report.digest, changed.digest);
-        assert!(
-            HipReport::new("alice\nOS: fake", "atrium", Ipv4Addr::LOCALHOST, "FreeBSD").is_err()
-        );
+        assert!(HipReport::new(
+            "alice\nOS: fake",
+            "atrium",
+            Ipv4Addr::LOCALHOST,
+            "FreeBSD",
+            Default::default()
+        )
+        .is_err());
         assert!(hip_accepted(b"<response status='error'/>").is_err());
+    }
+
+    #[test]
+    fn hip_records_verified_booleans_and_bounds_gateway_intervals() {
+        let facts = crypta_proto::engine::HipFacts {
+            pf: Some(true),
+            ipv6_forwarding: Some(false),
+        };
+        let report =
+            HipReport::new("alice", "atrium", Ipv4Addr::LOCALHOST, "FreeBSD", facts).unwrap();
+        assert!(report.xml.contains("<ipv6-forwarding>no</ipv6-forwarding>"));
+        assert!(report
+            .xml
+            .contains("<product>Atrium pf</product><is-enabled>yes</is-enabled>"));
+        assert!(report.review.contains("IPv6 forwarding  no"));
+        assert!(report.review.contains("Firewall  Atrium pf enabled: yes"));
+        assert_eq!(hip_interval(b"<response/>"), Ok(Duration::from_secs(600)));
+        assert_eq!(
+            hip_interval(b"<response><hip-report-interval>0</hip-report-interval></response>"),
+            Ok(Duration::from_secs(5))
+        );
+        assert_eq!(
+            hip_interval(b"<response><hip-report-interval>999999</hip-report-interval></response>"),
+            Ok(Duration::from_secs(3600))
+        );
     }
 
     #[test]

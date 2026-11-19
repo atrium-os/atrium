@@ -766,18 +766,26 @@ another origin. An active portal-profile session stays in engine memory.
 - HIP submits a host-info XML report when the gateway requests it. Settings
   shows the destination, VPN user, profile hostname, the assigned IPv4
   address, the kernel's actual OS and release, and the Atrium client name.
-  The report carries those facts and protocol metadata. Categories without a
-  verified source are omitted, including firewall, encryption, patch and
-  screen-lock state, antivirus, hardware IDs and MAC addresses. MD5 is the
-  gateway's report identifier. The engine compares exact report content for
-  approval, which lasts only for that engine and gateway. Changed facts require
-  review again. The check runs at tunnel setup, rebind and renewal. There is
-  no separate HIP timer yet.
+  The report also includes the host IPv6 forwarding state from the FreeBSD
+  kernel and the pf running flag from atrium-net. Settings displays both
+  verified values. Failed queries leave the fact out. Encryption, patch and
+  screen-lock state, antivirus, hardware IDs and MAC addresses remain omitted.
+  MD5 is the gateway's report identifier. Approval applies to the exact report
+  content for that engine and gateway. The HIP timer runs on the active TLS or
+  ESP tunnel independently of renewal. The interval defaults to 600 seconds
+  and a gateway-supplied interval is clamped to 5–3600 seconds. Unchanged
+  reports refresh without prompting. A changed report pauses packet processing
+  while Settings waits for approval and keeps the data connection open.
 - The arm64 FreeBSD full gate passed approval (9/9) and decline (5/5) with
   `crypta-gp-packet-check.py --full-vm arm64 --hip approve|decline`. It
   inspects the Settings prompt data before the tunnel is up, checks the XML
   against the reviewed facts and verifies traffic after approval and rebind.
-  Decline produces neither a report nor a tunnel.
+  Decline produces neither a report nor a tunnel. The refresh case
+  (`--hip refresh`) compares the first two reports, changes the test guest's
+  IPv6 forwarding sysctl, and checks that the changed report reaches the peer
+  only after approval. IPv4 echo passes on the original connection both
+  before and after refresh. The test restores the sysctl on exit. The arm64
+  gate passed 11/11 on TLS and 11/11 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path

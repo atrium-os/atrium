@@ -1472,6 +1472,13 @@ mod imp {
             }
             match l.verb.as_str() {
                 "status" => self.status(),
+                "hip-firewall" => {
+                    let mut facts = Line::new("hip-firewall");
+                    if let Some(enabled) = self.spawner.pf_running() {
+                        facts = facts.with("pf", u8::from(enabled));
+                    }
+                    vec![facts, Line::new("ok")]
+                }
                 "tunnel-open" | "tunnel-routes" | "tunnel-apply" | "tunnel-close" => self.tunnel_ctl(l),
                 "route-domain" => self.route_domain_ctl(l),
                 // Printer discovery's sockets (printing.md §7.1) on the

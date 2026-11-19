@@ -180,6 +180,19 @@ struct D {
 }
 
 /// A gateway's name to an IPv4 address (the machine's resolver).
+#[cfg(target_os = "freebsd")]
+fn hip_ipv6_forwarding() -> Option<bool> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&value);
+    // SAFETY: the named read-only sysctl writes at most len bytes.
+    let result = unsafe { libc::sysctlbyname(c"net.inet6.ip6.forwarding".as_ptr(),
+        (&mut value as *mut libc::c_int).cast(), &mut len, std::ptr::null(), 0) };
+    (result == 0 && len == std::mem::size_of_val(&value)).then_some(value != 0)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn hip_ipv6_forwarding() -> Option<bool> { None }
+
 fn resolve(host: &str, port: u16) -> Result<SocketAddrV4, String> {
     use std::net::ToSocketAddrs;
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
@@ -929,6 +942,19 @@ impl D {
                     }
                     if self.runs[k].p.ac.as_ref().is_some_and(|a| a.globalprotect) {
                         let _ = self.to_engine(k, &ToEngine::Applied);
+                    }
+                }
+                FromEngine::HipFacts => {
+                    if self.runs[k].p.ac.as_ref().is_some_and(|a| a.globalprotect) {
+                        let pf = self.net_call(&Line::new("hip-firewall")).ok().and_then(|a| {
+                            a.lines.iter().find(|l| l.verb == "hip-firewall").and_then(|l| match l.get("pf") {
+                                Some("1") => Some(true),
+                                Some("0") => Some(false),
+                                _ => None,
+                            })
+                        });
+                        let facts = engine::HipFacts { pf, ipv6_forwarding: hip_ipv6_forwarding() };
+                        let _ = self.to_engine(k, &ToEngine::HipFacts(facts));
                     }
                 }
                 FromEngine::Refused { why } => {

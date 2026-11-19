@@ -124,8 +124,9 @@ impl Engine {
         &mut self,
         mut transport: Transport,
         config: &gateway::Config,
+        mut refresh: super::gp::HipRefresh<'_>,
     ) -> Result<Stop, ()> {
-        let socket = self.esp.as_ref().ok_or(())?;
+        let socket = self.esp.as_ref().ok_or(())?.try_clone().map_err(|_| ())?;
         let mut in_buf = [0; esp::MAX_WIRE + 1];
         let mut out_buf = [0; 4 + crypta_gp::ssl::MAX_PACKET + 1];
         let started = Instant::now();
@@ -202,7 +203,7 @@ impl Engine {
                             && out_buf[..4] == AF_INET_HDR
                             && out_buf[16..20] == transport.src.octets() =>
                     {
-                        transport.send_packet(socket, &out_buf[4..n])?;
+                        transport.send_packet(&socket, &out_buf[4..n])?;
                         self.tx += (n - 4) as u64;
                     }
                     Ok(_) => self.dropped += 1,
@@ -212,6 +213,10 @@ impl Engine {
                     Err(e) => return Ok(Stop::Refused(format!("reading the tunnel: {e}"))),
                 }
             }
+            match refresh.tick(self, config.push.addr) {
+                Ok(elapsed) => last_rx += elapsed,
+                Err(stop) => return Ok(stop),
+            }
             let now = Instant::now();
             if now.duration_since(started) >= config.renew_after {
                 return Ok(Stop::Again("renewing the GlobalProtect tunnel".into()));
@@ -220,7 +225,7 @@ impl Engine {
                 return Err(());
             }
             if now.duration_since(last_probe) >= INTERVAL {
-                transport.send_probe(socket)?;
+                transport.send_probe(&socket)?;
                 last_probe = now;
             }
             if now.duration_since(last_stats) >= STATS_EVERY {

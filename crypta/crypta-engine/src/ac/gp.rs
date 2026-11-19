@@ -15,6 +15,24 @@ pub(super) enum Mode {
     Selected,
 }
 
+pub(super) struct HipRefresh<'a> {
+    jar: &'a mut Jar,
+    session: &'a gp::Session,
+    due: Instant,
+}
+
+impl HipRefresh<'_> {
+    pub(super) fn tick(&mut self, engine: &mut Engine, addr: Ipv4Addr) -> Result<Duration, Stop> {
+        let started = Instant::now();
+        if started < self.due {
+            return Ok(Duration::ZERO);
+        }
+        let interval = engine.gp_hip(self.jar, self.session, addr)?;
+        self.due = Instant::now() + interval;
+        Ok(started.elapsed())
+    }
+}
+
 enum LinkEnd {
     Stop(Stop),
     Expired,
@@ -241,22 +259,39 @@ impl Engine {
             401 | 403 => return Err(LinkEnd::Expired),
             _ => return Err(refused("GlobalProtect getconfig failed").into()),
         }
-        let config = gp::config(&body, self.st.mtu).map_err(refused)?;
+        gp::config(&body, self.st.mtu).map_err(|why| refused(why).into())
+    }
+
+    fn gp_hip(
+        &mut self,
+        jar: &mut Jar,
+        session: &gp::Session,
+        addr: Ipv4Addr,
+    ) -> Result<Duration, Stop> {
         let (status, body) = self.gp_post(
             jar,
             gp::HIP_CHECK,
-            &session.hip(&self.st.hostname, config.push.addr, None),
+            &session.hip(&self.st.hostname, addr, None),
         )?;
         if status != 200 {
-            return Err(refused("GlobalProtect HIP check failed").into());
+            return Err(refused("GlobalProtect HIP check failed"));
         }
+        let interval = gp::hip_interval(&body).map_err(refused)?;
         if gp::hip_check(&body).map_err(refused)? {
+            self.ctl.send(&FromEngine::HipFacts);
+            let facts = self
+                .ctl
+                .wait(IO_TIMEOUT, |message| match message {
+                    ToEngine::HipFacts(facts) => Some(*facts),
+                    _ => None,
+                })?
+                .ok_or_else(|| refused("Crypta could not verify local HIP facts"))?;
             let os = self
                 .hip_os
                 .as_deref()
                 .ok_or_else(|| refused("Could not determine the local OS for HIP"))?;
             let report = session
-                .hip_report(&self.st.hostname, config.push.addr, os)
+                .hip_report(&self.st.hostname, addr, os, facts)
                 .map_err(refused)?;
             if self.approved_hip.as_deref() != Some(&report.xml) {
                 let review = Form {
@@ -273,22 +308,22 @@ impl Engine {
                 };
                 let answers = self.answers(&review, &mut false)?;
                 if gp_field(&answers, "gp_hip_approval")? != "submit" {
-                    return Err(refused("GlobalProtect device report was not approved").into());
+                    return Err(refused("GlobalProtect device report was not approved"));
                 }
                 self.approved_hip = Some(report.xml.clone());
             }
             let (status, body) = self.gp_post(
                 jar,
                 gp::HIP_REPORT,
-                &session.hip(&self.st.hostname, config.push.addr, Some(&report)),
+                &session.hip(&self.st.hostname, addr, Some(&report)),
             )?;
             if status != 200 {
-                return Err(refused("GlobalProtect gateway refused the HIP report").into());
+                return Err(refused("GlobalProtect gateway refused the HIP report"));
             }
             gp::hip_accepted(&body).map_err(refused)?;
         }
 
-        Ok(config)
+        Ok(interval)
     }
 
     fn gp_open_tls(&mut self, session: &gp::Session) -> Result<(tls::Tls, Vec<u8>), LinkEnd> {
@@ -348,6 +383,12 @@ impl Engine {
                 }
                 let active = session.as_ref().unwrap();
                 let mut config = self.gp_configure(&mut jar, active)?;
+                let interval = self.gp_hip(&mut jar, active, config.push.addr)?;
+                let refresh = HipRefresh {
+                    jar: &mut jar,
+                    session: active,
+                    due: Instant::now() + interval,
+                };
                 let mut esp = None;
                 if let (Some(keys), Some(socket)) = (config.esp.take(), self.esp.as_ref()) {
                     let spis = (keys.transmit.spi(), keys.receive.spi());
@@ -392,7 +433,7 @@ impl Engine {
                 delay = 1;
                 if let Some(esp) = esp {
                     log("GlobalProtect data transport: ESP");
-                    let ended = self.gp_pump_esp(esp, &config);
+                    let ended = self.gp_pump_esp(esp, &config, refresh);
                     return Err(match ended {
                         Ok(stop) => LinkEnd::Stop(stop),
                         Err(()) => LinkEnd::EspLost,
@@ -401,7 +442,7 @@ impl Engine {
                 let (t, first) = tls.expect("one data transport");
                 log("GlobalProtect data transport: TLS");
                 tls_only = false;
-                Err::<(), _>(LinkEnd::Stop(self.gp_pump(t, &config, first)))
+                Err::<(), _>(LinkEnd::Stop(self.gp_pump(t, &config, first, refresh)))
             })();
             match result {
                 Ok(()) => return Ok(()),
@@ -443,7 +484,13 @@ impl Engine {
         Ok(())
     }
 
-    fn gp_pump(&mut self, mut t: tls::Tls, config: &gp::Config, mut buf: Vec<u8>) -> Stop {
+    fn gp_pump(
+        &mut self,
+        mut t: tls::Tls,
+        config: &gp::Config,
+        mut buf: Vec<u8>,
+        mut refresh: HipRefresh<'_>,
+    ) -> Stop {
         let p = &config.push;
         let tun = self.tun.as_raw_fd();
         let mut last_rx = Instant::now();
@@ -555,6 +602,10 @@ impl Engine {
                         ) => {}
                     Err(e) => return Stop::Refused(format!("reading the tunnel: {e}")),
                 }
+            }
+            match refresh.tick(self, p.addr) {
+                Ok(elapsed) => last_rx += elapsed,
+                Err(stop) => return stop,
             }
             let now = Instant::now();
             if now >= renew {

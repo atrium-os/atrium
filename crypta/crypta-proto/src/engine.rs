@@ -117,6 +117,7 @@ pub enum ToEngine {
     Applied,
     StartGpPortal(StartAc),
     StartGpSelected(StartAc),
+    HipFacts(HipFacts),
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +157,13 @@ pub enum FromEngine {
     /// The gateway refused, or asked what Atrium does not do: shown to the
     /// person as is. The engine stops after it.
     Refused { why: String },
+    HipFacts,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HipFacts {
+    pub pf: Option<bool>,
+    pub ipv6_forwarding: Option<bool>,
 }
 
 /// A prompt as cryptad passes it on (`crypta_ac::auth::Form` flattened).

@@ -16,6 +16,9 @@ for it and `dhclient` doing DHCP. This spec turns the sketch into something buil
   a Rust DHCPv4 client and a router-advertisement reader, one process per interface
   (`atrium-lease`). It receives raw packets from `atrium-net` over a socketpair and
   returns *proposals*; `atrium-net` checks each proposal before applying it.
+- VPN posture: the root control socket's `hip-firewall` query returns the
+  kernel's pf running flag through the spawner's fixed, read-only `pfctl -s info`
+  call. An unavailable or unrecognized status leaves the fact absent.
 - Wi-Fi: `atrium-net` is the client of `aura-mlme`'s control socket that `aura-ctl` is
   today. It keeps the known-network profiles, auto-joins, and persists what W2 left in
   memory (WPA3-only networks after Transition Disable).
