@@ -302,6 +302,8 @@ pub struct Sheets {
     /// column), and its field (lines shown joined by ¶).
     pub commenting: Mutable<Option<(u16, u32, u32)>>,
     thread_edit: Mutable<Option<crate::comment::ThreadEdit>>,
+    mention_people: Mutable<Option<Arc<crate::comment::People>>>,
+    mention_query: Mutable<TextEdit>,
     pub comment_text: Mutable<TextEdit>,
     /// The link bar: the cell it writes the link of, and its field.
     pub linking: Mutable<Option<(u16, u32, u32)>>,
@@ -328,7 +330,7 @@ impl Sheets {
         let doc = Rc::new(RefCell::new(doc));
         let source = Rc::new(SheetSource::new(doc.clone()));
         let comment_text = rev.sibling(TextEdit::new(""));
-        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
+        Self { doc, source, scroll, grid, ui, rev, cmds: Arc::new(Mutex::new(Vec::new())), size: Rc::new(Cell::new(size)), data_menu: Mutable::new(MenuState::default()), fill_menu: Mutable::new(MenuState::default()), lists_open: Mutable::new(false), password: Mutable::new(PasswordBar::default()), password_text: Mutable::new(TextEdit::new("").secret(true)), chart_title: Mutable::new(TextEdit::new("")), chart_loaded: Rc::new(Cell::new(None)), chart_kind_menu: Mutable::new(MenuState::default()), chart_legend_menu: Mutable::new(MenuState::default()), chart_group_menu: Mutable::new(MenuState::default()), filter: Mutable::new(FilterPanel::default()), filter_search: Mutable::new(TextEdit::new("")), filter_scroll: Mutable::new(ScrollState::default()), closing: Mutable::new(false), cond: Mutable::new(crate::condfmt::CondPanel::default()), review: Mutable::new(crate::review::ReviewPane::default()), theirs: Rc::new(RefCell::new(None)), review_scroll: Mutable::new(ScrollState::default()), cond_range: Mutable::new(TextEdit::new("")), cond_a: Mutable::new(TextEdit::new("")), cond_b: Mutable::new(TextEdit::new("")), cond_kind_menu: Mutable::new(MenuState::default()), cond_choice_menu: Mutable::new(MenuState::default()), cond_look_menu: Mutable::new(MenuState::default()), pivot_pane: Mutable::new(crate::pivotpane::PivotPane::default()), pivot_scroll: Mutable::new(ScrollState::default()), pivot_agg_menus: Rc::new((0..PIVOT_AGG_ROWS).map(|_| Mutable::new(MenuState::default())).collect()), tab_first: Mutable::new(0), renaming: Mutable::new(false), coloring: Mutable::new(false), rename_text: Mutable::new(TextEdit::new("")), commenting: Mutable::new(None), thread_edit: Mutable::new(None), mention_people: Mutable::new(None), mention_query: Mutable::new(TextEdit::new("")), comment_text, linking: Mutable::new(None), link_text: Mutable::new(TextEdit::new("")), size_bar: Mutable::new(None), paste_bar: Mutable::new(None), size_text: Mutable::new(TextEdit::new("")), link_press: Rc::new(Cell::new(None)), opened: Arc::new(Mutex::new(None)), list: Mutable::new(ListPanel::default()), valid: Mutable::new(crate::validation::Panel::default()), valid_text: Rc::new((0..crate::validation::FIELDS).map(|_| Mutable::new(TextEdit::new(""))).collect()), valid_menus: Rc::new((0..3).map(|_| Mutable::new(MenuState::default())).collect()), list_search: Mutable::new(TextEdit::new("")), list_scroll: Mutable::new(ScrollState::default()) }
     }
 
     /// The picked chart's index, if a chart is picked and still there.
@@ -1000,6 +1002,8 @@ impl Sheets {
     fn close_comment_bar(&self) {
         self.commenting.set(None);
         self.thread_edit.set(None);
+        self.mention_people.set(None);
+        self.mention_query.set(TextEdit::new(""));
         self.comment_text.set(TextEdit::new(""));
     }
 
@@ -1145,9 +1149,10 @@ impl Sheets {
                 if new_thread && comment.is_some() { return; }
                 let thread_edit = (new_thread
                     || comment.is_some_and(|c| !c.thread().is_empty()))
-                    .then(|| crate::comment::ThreadEdit { original: comment.cloned(), index: 0 });
+                    .then(|| crate::comment::ThreadEdit { original: comment.cloned(), index: 0, added_mentions: Vec::new() });
                 let edit = thread_edit.as_ref().map_or_else(|| crate::comment::edit(comment), |t| t.open());
                 drop(doc);
+                self.mention_people.set(None);
                 self.thread_edit.set(thread_edit);
                 self.renaming.set(false);
                 self.coloring.set(false);
@@ -1163,11 +1168,57 @@ impl Sheets {
                     return;
                 }
                 thread.index = index;
+                thread.added_mentions.clear();
+                self.mention_people.set(None);
                 self.comment_text.set(thread.open());
                 self.thread_edit.set(Some(thread));
                 self.changed();
             }
+            TabCmd::MentionOpen => {
+                let Some(thread) = self.thread_edit.get_cloned() else { return; };
+                if self.commenting.get().is_none() { return; }
+                let draft = self.comment_text.get_cloned();
+                let mut query = TextEdit::new(crate::comment::mention_prefix(&draft).map_or("", |(_, query)| query));
+                query.select_all();
+                self.mention_query.set(query);
+                self.mention_people.set(Some(Arc::new(crate::comment::People::from_workbook(&self.doc.borrow().wb, &thread.added_mentions))));
+                self.changed();
+            }
+            TabCmd::MentionPick(_) | TabCmd::MentionSubmit => {
+                let (Some(people), Some(mut thread)) = (self.mention_people.get_cloned(), self.thread_edit.get_cloned()) else { return };
+                let query = self.mention_query.get_cloned();
+                let person = match c {
+                    TabCmd::MentionPick(id) => people.get(id),
+                    _ if !query.text().trim().is_empty() => people.email(query.text())
+                        .or_else(|| people.matches(query.text()).next().cloned()),
+                    _ => None,
+                };
+                let Some(person) = person else {
+                    self.set_status("Choose a workbook participant or enter an email address.");
+                    return;
+                };
+                let mut draft = self.comment_text.get_cloned();
+                if let Some((prefix, _)) = crate::comment::mention_prefix(&draft) {
+                    draft.set_caret(prefix.start, false);
+                    draft.set_caret(prefix.end, true);
+                }
+                if !thread.mention(&mut draft, person) {
+                    self.set_status("The mention would exceed the message limits.");
+                    return;
+                }
+                self.comment_text.set(draft);
+                self.thread_edit.set(Some(thread));
+                self.mention_people.set(None);
+                self.mention_query.set(TextEdit::new(""));
+                self.changed();
+            }
+            TabCmd::MentionClose => {
+                self.mention_people.set(None);
+                self.mention_query.set(TextEdit::new(""));
+                self.changed();
+            }
             TabCmd::CommentDone => {
+                if self.mention_people.get_cloned().is_some() { return; }
                 let Some((s, r, c)) = self.commenting.get() else { return };
                 let edit = self.comment_text.get_cloned();
                 let mut d = self.doc.borrow_mut();
@@ -1411,6 +1462,41 @@ impl Sheets {
             Button::secondary("Undo").at(w - 80.0, y + 2.0).width(72.0).on_click(push(TabCmd::WarnUndo)).render(ctx);
             return;
         }
+        if let Some(people) = self.mention_people.get_cloned() {
+            let query = self.mention_query.get_cloned();
+            let suggestions: Vec<_> = people.matches(query.text()).collect();
+            let can_add = crate::comment::email_address(query.text()).is_some();
+            let width = (w - 24.0).clamp(240.0, 440.0);
+            let top = y - 32.0 * ((suggestions.len() + usize::from(can_add)).max(1)) as f32;
+            let back = ctx.add(Node::Rect { rect: Rect::new(12.0, top, width, y - top), fill: t.bg_surface(), radius: 4.0 });
+            ctx.on_click(back, || {});
+            let cmds = self.cmds.clone();
+            TextField::new(self.mention_query.clone()).key(0x5348_4d51)
+                .placeholder("Find a person or enter an email")
+                .autofocus(true).at(12.0, y + 2.0).width((width - 74.0).max(80.0))
+                .on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::MentionSubmit))).render(ctx);
+            Button::secondary("Cancel").at(width - 54.0, y + 2.0).width(66.0)
+                .on_click(push(TabCmd::MentionClose)).render(ctx);
+            if suggestions.is_empty() && !can_add {
+                ctx.add(Node::Text { rect: Rect::new(20.0, top + 8.0, width - 16.0, 18.0),
+                    content: "No matching workbook participants".into(), style: crate::tabs::style(t.text_secondary(), false) });
+            }
+            for (i, person) in suggestions.iter().enumerate() {
+                let label = if person.name.is_empty() || person.name == person.user_id || person.user_id.is_empty() {
+                    if person.name.is_empty() { person.user_id.to_string() } else { person.name.to_string() }
+                } else {
+                    format!("{} · {}", person.name, person.user_id)
+                };
+                Button::secondary(label.chars().take(64).collect::<String>())
+                    .at(16.0, top + 32.0 * i as f32 + 2.0).width(width - 8.0)
+                    .on_click(push(TabCmd::MentionPick(person.id))).render(ctx);
+            }
+            if can_add {
+                Button::primary("Mention this email").at(16.0, y - 30.0).width(width - 8.0)
+                    .on_click(push(TabCmd::MentionSubmit)).render(ctx);
+            }
+            return;
+        }
         if let (Some((_, r, c)), Some(thread)) = (self.commenting.get(), self.thread_edit.get_cloned()) {
             let here = officina_grid::addr::a1(r, c);
             let messages = thread.messages();
@@ -1422,11 +1508,13 @@ impl Sheets {
             };
             let st = crate::tabs::style(t.text_primary(), true);
             ctx.add(Node::Text { rect: Rect::new(12.0, y + 6.0, 186.0, 18.0), content: label, style: st });
-            let fw = (w - 452.0).max(88.0);
+            let fw = (w - 536.0).max(88.0);
             let cmds = self.cmds.clone();
-            TextField::new(self.comment_text.clone()).autofocus(true).at(200.0, y + 2.0).width(fw)
+            TextField::new(self.comment_text.clone()).key(0x5348_5443).autofocus(true).at(200.0, y + 2.0).width(fw)
                 .on_submit(move |_| cmds.lock().unwrap().push(Cmd::Tab(TabCmd::CommentDone))).render(ctx);
-            let x = 208.0 + fw;
+            Button::secondary("@ Mention").at(208.0 + fw, y + 2.0).width(80.0)
+                .on_click(push(TabCmd::MentionOpen)).render(ctx);
+            let x = 292.0 + fw;
             if thread.unchanged(&self.comment_text.get_cloned()) {
                 if thread.index > 0 {
                     Button::secondary("‹").at(x, y + 2.0).width(28.0).tooltip("Previous message")
@@ -4273,6 +4361,98 @@ mod tests {
         assert_eq!(stored().thread()[1].id, replied.thread()[1].id);
         assert!(sheets.doc.borrow_mut().undo());
         assert_eq!(stored(), replied);
+    }
+
+    #[test]
+    fn mention_picker_inserts_in_threads_and_replies_and_round_trips() {
+        use crate::tabs::TabCmd;
+        use officina_grid::comments::{Comment, ThreadMessage, ThreadPerson};
+
+        let mut doc = Doc::new("Mentions");
+        let person = Arc::new(ThreadPerson {
+            id: 25, name: "Zoë Example".into(), user_id: "zoe@example.invalid".into(), provider_id: "PeoplePicker".into(),
+        });
+        let participant = Comment::threaded(vec![ThreadMessage {
+            id: 30, parent: None, author: person.clone(), timestamp: "".into(),
+            done: false, text: "Existing discussion".into(), mentions: Default::default(),
+        }]).unwrap();
+        doc.wb.set_comments(0, vec![(1, 0, Some(participant))]);
+
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sheets = Sheets::new(doc, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()),
+            Mutable::new(Ui::default()), Mutable::with_dirty(0, dirty.clone()), (1200.0, 800.0));
+        let mut app = App::new_with_flag(sheets.clone(), dirty);
+        let stored = || sheets.doc.borrow().wb.comment(0, 0, 0).cloned().unwrap();
+        let click = |app: &mut App<Sheets>, label: &str| {
+            app.tick();
+            let at = app.tree().iter().find_map(|(_, node)| match node {
+                Node::Text { content, rect, .. } if content == label =>
+                    Some(Point::new(rect.x() + rect.w() / 2.0, rect.y() + rect.h() / 2.0)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("missing button {label}"));
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            sheets.take_cmds();
+            app.tick();
+        };
+        let key = |app: &mut App<Sheets>, key, chars: &str, ctrl: bool| {
+            app.handle_event(Event::Key { kind: KeyEventKind::Down, key, chars: chars.into(),
+                modifiers: Modifiers { ctrl, ..Default::default() } });
+            sheets.take_cmds();
+            app.tick();
+        };
+
+        sheets.tab_cmd(TabCmd::NewThread);
+        app.tick();
+        key(&mut app, Key::Char, "🙂 @zo", false);
+        click(&mut app, "@ Mention");
+        assert_eq!(sheets.mention_query.get_cloned().text(), "zo");
+        click(&mut app, "Cancel");
+        assert_eq!(sheets.comment_text.get_cloned().text(), "🙂 @zo");
+        click(&mut app, "@ Mention");
+        click(&mut app, "Zoë Example · zoe@example.invalid");
+        assert_eq!(sheets.comment_text.get_cloned().text(), "🙂 @Zoë Example ");
+        key(&mut app, Key::Char, "z", true);
+        assert_eq!(sheets.comment_text.get_cloned().text(), "🙂 @zo");
+        assert!(sheets.comment_text.get_cloned().tracked_ranges().is_empty());
+        key(&mut app, Key::Char, "y", true);
+        assert_eq!(sheets.comment_text.get_cloned().tracked_ranges().len(), 1);
+        key(&mut app, Key::Char, "please check", false);
+        click(&mut app, "Post");
+        let root = stored();
+        let message = &root.thread()[0];
+        let [mention] = message.mentions.as_ref() else { panic!("missing root mention") };
+        assert_eq!(mention.person, person);
+        assert_eq!(&message.text[mention.start..mention.end], "@Zoë Example");
+
+        sheets.tab_cmd(TabCmd::Commenting);
+        click(&mut app, "Reply");
+        click(&mut app, "@ Mention");
+        key(&mut app, Key::Char, "reviewer@example.invalid", false);
+        assert_eq!(sheets.mention_query.get_cloned().text(), "reviewer@example.invalid");
+        click(&mut app, "Mention this email");
+        key(&mut app, Key::Char, "looks good", false);
+        click(&mut app, "Post");
+        let posted = stored();
+        let reply = &posted.thread()[1];
+        assert_eq!(reply.parent, Some(message.id));
+        assert_eq!(reply.mentions.len(), 1);
+        let mention = &reply.mentions[0];
+        assert_eq!(&*mention.person.user_id, "reviewer@example.invalid");
+        assert_eq!(&*mention.person.provider_id, "PeoplePicker");
+        assert_eq!(&reply.text[mention.start..mention.end], "@reviewer@example.invalid");
+
+        assert!(sheets.doc.borrow_mut().undo());
+        assert_eq!(stored(), root);
+        assert!(sheets.doc.borrow_mut().redo());
+        assert_eq!(stored(), posted);
+        let doc = sheets.doc.borrow();
+        let native = Doc::from_native("mentions.osheet", &doc.stored_native().unwrap()).unwrap();
+        assert_eq!(native.wb.comment(0, 0, 0), Some(&posted));
+        let xlsx = officina_convert::xlsx::write(&doc.wb, Vec::new()).unwrap();
+        let (reopened, report) = officina_convert::xlsx::read(&xlsx).unwrap();
+        assert!(report.report.is_empty(), "{report:?}");
+        assert_eq!(reopened.comment(0, 0, 0), Some(&posted));
     }
 
     #[test]

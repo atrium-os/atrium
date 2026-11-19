@@ -282,6 +282,24 @@ impl TextEdit {
         true
     }
 
+    /// Insert a tracked token and an untracked suffix as one undo step.
+    pub fn insert_tracked(&mut self, id: usize, token: &str, suffix: &str) -> bool {
+        if self.secret { return false; }
+        let token = self.clean(token);
+        if token.is_empty() { return false; }
+        let range = self.selection();
+        let span = range.start..range.start + token.len();
+        let text = token + &self.clean(suffix);
+        self.checkpoint(Kind::Other);
+        let marks = self.typing_marks.unwrap_or_else(|| self.inherited_marks(&range));
+        self.replace(range, &text, marks);
+        self.tracked.push((id, span.clone()));
+        self.tracked.sort_by_key(|(_, range)| range.start);
+        self.caret = span.start + text.len();
+        self.anchor = self.caret;
+        true
+    }
+
     /// A line break at the caret even in a one-line field (a spreadsheet
     /// cell's Alt+Enter).
     pub fn insert_break(&mut self) -> bool {

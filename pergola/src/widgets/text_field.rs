@@ -39,6 +39,7 @@ pub struct TextField {
     pub rect: Rect,
     on_submit: Option<SubmitCallback>,
     autofocus: bool,
+    key: Option<u64>,
 }
 
 impl TextField {
@@ -49,6 +50,7 @@ impl TextField {
             rect: Rect::new(0.0, 0.0, 0.0, size::input_height()),
             on_submit: None,
             autofocus: false,
+            key: None,
         }
     }
 
@@ -66,6 +68,12 @@ impl TextField {
     /// dialog's first field).
     pub fn autofocus(mut self, on: bool) -> Self {
         self.autofocus = on;
+        self
+    }
+
+    /// Keep the field's focus target distinct from other fields in its place.
+    pub fn key(mut self, key: u64) -> Self {
+        self.key = Some(key);
         self
     }
 
@@ -165,6 +173,7 @@ impl View for TextField {
         // Keep the field's focus target stable across text and style changes.
         let halo_id = ctx.add(Node::Rect { rect: inflate(rect, 3.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 3.0 });
         let ring_id = ctx.add(Node::Rect { rect: inflate(rect, 1.0), fill: crate::Color::TRANSPARENT, radius: radius::XS + 1.0 });
+        if let Some(key) = self.key { ctx.key(key); }
         let bg_id = ctx.add(Node::Rect { rect, fill: theme.border_strong(), radius: radius::XS });
         let hovered = ctx.is_hovered(bg_id);
         let focused = ctx.is_focused(bg_id);

@@ -2,8 +2,9 @@
 //! wraps the same marked runs, measuring them in the style they are drawn in.
 
 use std::ops::Range;
+use std::sync::Arc;
 
-use officina_grid::comments::{Comment, CommentRun, CommentStyle};
+use officina_grid::comments::{Comment, CommentRun, CommentStyle, ThreadMention, ThreadPerson, MAX_MENTIONS, MAX_TEXT, MAX_THREAD_FIELD};
 use pergola::text_edit::TextEdit;
 use pergola::TextStyle;
 
@@ -26,12 +27,19 @@ pub fn save(author: &str, edit: &TextEdit) -> Option<Comment> {
     Some(Comment::with_runs(author, text, runs))
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingMention {
+    id: u128,
+    person: Arc<ThreadPerson>,
+}
+
 /// Snapshot of the thread being edited, so a stale bar cannot replace edits
 /// made by undo, a row operation, or another command.
 #[derive(Clone)]
 pub(crate) struct ThreadEdit {
     pub original: Option<Comment>,
     pub index: usize,
+    pub added_mentions: Vec<PendingMention>,
 }
 
 impl ThreadEdit {
@@ -52,20 +60,44 @@ impl ThreadEdit {
             .map(|(i, m)| (i, m.start..m.end)).eq(edit.tracked_ranges().iter().cloned())
     }
 
+    fn original_mentions(&self) -> &[ThreadMention] {
+        self.messages().get(self.index).map_or(&[], |message| &message.mentions)
+    }
+
+    pub fn mention(&mut self, edit: &mut TextEdit, person: Arc<ThreadPerson>) -> bool {
+        let name = if person.name.trim().is_empty() { &person.user_id } else { &person.name };
+        let label = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let index = self.original_mentions().len() + self.added_mentions.len();
+        if label.is_empty() || self.added_mentions.len() >= MAX_MENTIONS * 4
+            || !edit.insert_tracked(index, &format!("@{label}"), " ")
+            || edit.text().len() > MAX_TEXT || edit.tracked_ranges().len() > MAX_MENTIONS
+        {
+            return false;
+        }
+        self.added_mentions.push(PendingMention { id: uuid::Uuid::new_v4().as_u128(), person });
+        true
+    }
+
     pub fn save(&self, edit: &TextEdit) -> Option<Comment> {
-        use officina_grid::comments::{ThreadMessage, MAX_TEXT};
+        use officina_grid::comments::ThreadMessage;
 
         let text = edit.text();
         if text.trim().is_empty() || text.len() > MAX_TEXT { return None; }
+        let original = self.original_mentions();
+        let mentions: Arc<[ThreadMention]> = edit.tracked_ranges().iter().filter_map(|(i, range)| {
+            let (id, person) = if *i < original.len() {
+                let mention = &original[*i];
+                (mention.id, &mention.person)
+            } else {
+                let mention = self.added_mentions.get(*i - original.len())?;
+                (mention.id, &mention.person)
+            };
+            Some(ThreadMention { id, person: person.clone(), start: range.start, end: range.end })
+        }).collect();
         let mut messages = self.messages().to_vec();
         if let Some(message) = messages.get_mut(self.index) {
             message.text = text.into();
-            message.mentions = edit.tracked_ranges().iter().filter_map(|(i, range)| {
-                let mut mention = message.mentions.get(*i)?.clone();
-                mention.start = range.start;
-                mention.end = range.end;
-                Some(mention)
-            }).collect();
+            message.mentions = mentions;
         } else {
             messages.push(ThreadMessage {
                 id: uuid::Uuid::new_v4().as_u128(),
@@ -74,16 +106,85 @@ impl ThreadEdit {
                 timestamp: timestamp().into(),
                 done: false,
                 text: text.into(),
-                mentions: Default::default(),
+                mentions,
             });
         }
         Comment::threaded(messages)
     }
 }
 
+/// An unlinked @prefix next to the caret. Email addresses already in prose
+/// and portions of existing mention tokens are left alone.
+pub(crate) fn mention_prefix(edit: &TextEdit) -> Option<(Range<usize>, &str)> {
+    if edit.has_selection() { return None; }
+    let end = edit.caret();
+    let before = &edit.text()[..end];
+    let start = before.rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '@' | '.' | '-' | '_' | '+')))
+        .map_or(0, |i| i + before[i..].chars().next().unwrap().len_utf8());
+    let query = before[start..].strip_prefix('@')?;
+    if edit.tracked_ranges().iter().any(|(_, r)| r.start < end && start < r.end) { return None; }
+    Some((start..end, query))
+}
+
+pub(crate) struct People(Vec<Arc<ThreadPerson>>);
+
+impl People {
+    pub fn from_workbook(wb: &officina_grid::Workbook, draft: &[PendingMention]) -> Self {
+        const MAX_PEOPLE: usize = 4096;
+        let mut ids = std::collections::HashSet::new();
+        let mut people = Vec::new();
+        let candidates = (0..wb.sheet_count() as u16).flat_map(|sheet| wb.comments(sheet).values())
+            .flat_map(Comment::thread)
+            .flat_map(|m| std::iter::once(&m.author).chain(m.mentions.iter().map(|mention| &mention.person)));
+        for person in draft.iter().map(|mention| &mention.person).chain(candidates) {
+            if (person.name.is_empty() && person.user_id.is_empty()) || !ids.insert(person.id) { continue; }
+            people.push(person.clone());
+            if people.len() == MAX_PEOPLE { break; }
+        }
+        people.sort_by_cached_key(|p| (p.name.to_lowercase(), p.user_id.to_lowercase(), p.id));
+        Self(people)
+    }
+
+    pub fn matches(&self, query: &str) -> impl Iterator<Item = &Arc<ThreadPerson>> {
+        let query = query.trim().to_lowercase();
+        self.0.iter().filter(move |p| {
+            p.name.to_lowercase().contains(&query) || p.user_id.to_lowercase().contains(&query)
+        }).take(5)
+    }
+
+    pub fn get(&self, id: u128) -> Option<Arc<ThreadPerson>> {
+        self.0.iter().find(|person| person.id == id).cloned()
+    }
+
+    pub fn email(&self, query: &str) -> Option<Arc<ThreadPerson>> {
+        let email = email_address(query)?;
+        if let Some(existing) = self.0.iter().find(|p| p.user_id.eq_ignore_ascii_case(email)) {
+            return Some(existing.clone());
+        }
+        Some(Arc::new(ThreadPerson {
+            id: uuid::Uuid::new_v4().as_u128(), name: email.into(), user_id: email.into(),
+            provider_id: "PeoplePicker".into(),
+        }))
+    }
+}
+
+pub(crate) fn email_address(query: &str) -> Option<&str> {
+    let query = query.trim();
+    let (local, domain) = query.split_once('@')?;
+    if query.len() > 254 || local.is_empty() || domain.is_empty() || !domain.contains('.')
+        || local.len() > 64 || local.starts_with('.') || local.ends_with('.') || local.contains("..")
+        || !local.chars().all(|c| c.is_alphanumeric() || ".!#$%&'*+-/=?^_`{|}~".contains(c))
+        || !domain.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        || query.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || domain.split('.').any(|part| part.is_empty() || part.starts_with('-') || part.ends_with('-'))
+    {
+        return None;
+    }
+    Some(query)
+}
+
 fn local_author() -> std::sync::Arc<officina_grid::comments::ThreadPerson> {
-    use officina_grid::comments::{ThreadPerson, MAX_THREAD_FIELD};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::OnceLock;
 
     static AUTHOR: OnceLock<Arc<ThreadPerson>> = OnceLock::new();
     AUTHOR.get_or_init(|| {
