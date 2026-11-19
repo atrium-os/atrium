@@ -35,7 +35,22 @@ pub fn write(wb: &Workbook, rect: Rect) -> Option<String> {
                 Value::Str(_) => html.push_str(" x:str"),
                 _ => {}
             }
-            let style = css(wb.style(addr));
+            let cell_style = wb.style(addr);
+            if !cell_style.num_fmt.eq_ignore_ascii_case("General") {
+                // Calc uses a pair of locale IDs followed by the format code.
+                write!(html, r#" sdnum="1033;1033;{}""#, crate::xml::esc(&cell_style.num_fmt)).ok()?;
+            }
+            // Calc's clipboard HTML importer reads the legacy cell attributes.
+            if let Some(color) = cell_style.fill {
+                write!(html, r##" bgcolor="#{:06x}""##, color & 0xffffff).ok()?;
+            }
+            if let Some(align) = horizontal(cell_style.h_align) {
+                write!(html, r#" align="{align}""#).ok()?;
+            }
+            if let Some(align) = vertical(cell_style.v_align) {
+                write!(html, r#" valign="{align}""#).ok()?;
+            }
+            let style = css(cell_style);
             if !style.is_empty() {
                 write!(html, r#" style="{}""#, crate::xml::esc(&style)).ok()?;
             }
@@ -44,10 +59,7 @@ pub fn write(wb: &Workbook, rect: Rect) -> Option<String> {
                 Value::Str(text) => text.to_string(),
                 _ => wb.formatted(addr).text,
             };
-            for (i, line) in shown.split('\n').enumerate() {
-                if i > 0 { html.push_str("<br>"); }
-                html.push_str(&crate::xml::esc(line));
-            }
+            write_text(&mut html, &shown, cell_style)?;
             html.push_str("</td>");
             if html.len() > MAX_HTML_BYTES { return None; }
         }
@@ -55,6 +67,52 @@ pub fn write(wb: &Workbook, rect: Rect) -> Option<String> {
     }
     html.push_str("</table><!--EndFragment--></body></html>");
     (html.len() <= MAX_HTML_BYTES).then_some(html)
+}
+
+fn write_text(out: &mut String, shown: &str, style: &Style) -> Option<()> {
+    let font = &style.font;
+    let tags = [("b", font.bold), ("i", font.italic), ("u", font.underline), ("strike", font.strike)];
+    let font_tag = font.name.is_some() || font.color.is_some();
+    if font_tag {
+        out.push_str("<font");
+        if let Some(name) = &font.name {
+            write!(out, r#" face="{}""#, crate::xml::esc(name)).ok()?;
+        }
+        if let Some(color) = font.color {
+            write!(out, r##" color="#{:06x}""##, color & 0xffffff).ok()?;
+        }
+        out.push('>');
+    }
+    for (tag, enabled) in tags {
+        if enabled { write!(out, "<{tag}>").ok()?; }
+    }
+    for (i, line) in shown.split('\n').enumerate() {
+        if i > 0 { out.push_str("<br>"); }
+        out.push_str(&crate::xml::esc(line));
+    }
+    for (tag, enabled) in tags.into_iter().rev() {
+        if enabled { write!(out, "</{tag}>").ok()?; }
+    }
+    if font_tag { out.push_str("</font>"); }
+    Some(())
+}
+
+fn horizontal(align: HAlign) -> Option<&'static str> {
+    match align {
+        HAlign::Left => Some("left"),
+        HAlign::Center | HAlign::CenterAcross => Some("center"),
+        HAlign::Right => Some("right"),
+        HAlign::Justify => Some("justify"),
+        _ => None,
+    }
+}
+
+fn vertical(align: VAlign) -> Option<&'static str> {
+    match align {
+        VAlign::Top => Some("top"),
+        VAlign::Center => Some("middle"),
+        _ => None,
+    }
 }
 
 fn css_string(value: &str) -> String {
@@ -87,20 +145,11 @@ fn css(style: &Style) -> String {
     if let Some(color) = style.fill {
         let _ = write!(out, "background-color:#{:06x};", color & 0xffffff);
     }
-    let align = match style.h_align {
-        HAlign::Left => "left",
-        HAlign::Center | HAlign::CenterAcross => "center",
-        HAlign::Right => "right",
-        HAlign::Justify => "justify",
-        _ => "",
-    };
-    if !align.is_empty() {
+    if let Some(align) = horizontal(style.h_align) {
         let _ = write!(out, "text-align:{align};");
     }
-    match style.v_align {
-        VAlign::Top => out.push_str("vertical-align:top;"),
-        VAlign::Center => out.push_str("vertical-align:middle;"),
-        _ => {}
+    if let Some(align) = vertical(style.v_align) {
+        let _ = write!(out, "vertical-align:{align};");
     }
     if style.wrap { out.push_str("white-space:pre-wrap;"); }
     if !style.num_fmt.eq_ignore_ascii_case("General") {

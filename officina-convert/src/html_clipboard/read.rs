@@ -12,7 +12,12 @@ use officina_grid::Value;
 
 use super::{MAX_CELLS, MAX_HTML_BYTES};
 
-type Classes = HashMap<String, String>;
+#[derive(Default)]
+struct Rules {
+    classes: HashMap<String, String>,
+    td: String,
+    th: String,
+}
 
 pub fn read(input: &[u8]) -> Result<Clip, &'static str> {
     if input.len() > MAX_HTML_BYTES {
@@ -25,14 +30,14 @@ pub fn read(input: &[u8]) -> Result<Clip, &'static str> {
         return Err("HTML clipboard data has too many elements.");
     }
     let fragment = Fragment::new(&dom);
-    let classes = classes(&dom);
+    let rules = rules(&dom);
     let Some(table) = fragment.table(&dom) else {
         // Google Sheets can offer only an annotated span for one cell.
         let cell = (0..dom.nodes.len() as Handle).find(|&h| {
             dom.tag(h) == Some("span") && fragment.includes(h) && dom.connected(h)
                 && (dom.attr(h, "data-sheets-value").is_some() || dom.attr(h, "data-sheets-userformat").is_some())
         }).ok_or("The clipboard HTML does not contain a spreadsheet table.")?;
-        return Clip::from_table(vec![vec![read_cell(&dom, cell, &classes, &fragment)?]])
+        return Clip::from_table(vec![vec![read_cell(&dom, cell, &rules, &fragment)?]])
             .ok_or("The clipboard cell is empty.");
     };
     let rows = dom.nodes[table as usize].children.iter().flat_map(|h| match dom.tag(*h) {
@@ -54,7 +59,7 @@ pub fn read(input: &[u8]) -> Result<Clip, &'static str> {
             if width > MAX_COLS as usize || (result.len() + 1) as u64 * width as u64 > MAX_CELLS {
                 return Err("The clipboard table exceeds 16,384 cells.");
             }
-            values.push(read_cell(&dom, cell, &classes, &fragment)?);
+            values.push(read_cell(&dom, cell, &rules, &fragment)?);
         }
         if (result.len() + 1) as u64 * width.max(1) as u64 > MAX_CELLS {
             return Err("The clipboard table exceeds 16,384 cells.");
@@ -145,10 +150,9 @@ impl Fragment {
     }
 }
 
-// Only literal class selectors from small style blocks are recognized.
-// This handles Excel's .xlNN rules without a general CSS cascade.
-fn classes(dom: &Dom) -> Classes {
-    let mut out = Classes::new();
+// Recognize simple class rules (Excel) and literal cell defaults (Calc).
+fn rules(dom: &Dom) -> Rules {
+    let mut out = Rules::default();
     for h in dom.by_tag_anywhere("style") {
         for child in children(dom, h) {
             let Kind::Text(text) = &dom.nodes[child as usize].kind else { continue; };
@@ -157,12 +161,18 @@ fn classes(dom: &Dom) -> Classes {
             for rule in css.split('}') {
                 let Some((selectors, declarations)) = rule.split_once('{') else { continue; };
                 for selector in selectors.split(',').map(str::trim) {
-                    let Some(class) = selector.strip_prefix('.') else { continue; };
-                    if class.len() > 64 || class.is_empty() || !class.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) {
-                        continue;
-                    }
-                    if out.len() >= 512 && !out.contains_key(class) { continue; }
-                    let stored = out.entry(class.to_owned()).or_default();
+                    let stored = match selector {
+                        "td" => &mut out.td,
+                        "th" => &mut out.th,
+                        _ => {
+                            let Some(class) = selector.strip_prefix('.') else { continue; };
+                            if class.len() > 64 || class.is_empty() || !class.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) {
+                                continue;
+                            }
+                            if out.classes.len() >= 512 && !out.classes.contains_key(class) { continue; }
+                            out.classes.entry(class.to_owned()).or_default()
+                        }
+                    };
                     if stored.len() + declarations.len() < 4096 {
                         stored.push_str(declarations);
                         stored.push(';');
@@ -174,10 +184,20 @@ fn classes(dom: &Dom) -> Classes {
     out
 }
 
-fn read_cell(dom: &Dom, cell: Handle, classes: &Classes, fragment: &Fragment) -> Result<(Value, Style), &'static str> {
+fn read_cell(dom: &Dom, cell: Handle, rules: &Rules, fragment: &Fragment) -> Result<(Value, Style), &'static str> {
     let mut style = Style::default();
-    if dom.tag(cell) == Some("th") { style.font.bold = true; }
-    attributes(dom, cell, classes, &mut style);
+    match dom.tag(cell) {
+        Some("td") => declarations(&rules.td, &mut style),
+        Some("th") => {
+            style.font.bold = true;
+            declarations(&rules.th, &mut style);
+        }
+        _ => {}
+    }
+    attributes(dom, cell, rules, &mut style);
+    if let Some(code) = dom.attr(cell, "sdnum").and_then(calc_number_format) {
+        style.num_fmt = code.into();
+    }
     let mut text = String::new();
     let mut typed = sheets_value(dom.attr(cell, "data-sheets-value"));
     let mut font = None;
@@ -210,7 +230,7 @@ fn read_cell(dom: &Dom, cell: Handle, classes: &Classes, fragment: &Fragment) ->
                     typed = sheets_value(dom.attr(h, "data-sheets-value"));
                 }
                 let mut inline = Style { font: current, ..Default::default() };
-                attributes(dom, h, classes, &mut inline);
+                attributes(dom, h, rules, &mut inline);
                 stack.extend(dom.nodes[h as usize].children.iter().rev().map(|&c| (c, inline.font.clone())));
             }
             _ => {}
@@ -221,17 +241,26 @@ fn read_cell(dom: &Dom, cell: Handle, classes: &Classes, fragment: &Fragment) ->
     if text.len() > officina_grid::strings::MAX_TEXT {
         return Err("A clipboard cell has too much text.");
     }
-    let value = typed
+    // Calc also emits a Google-compatible numeric hint that can lose precision.
+    let value = typed.clone().filter(|value| matches!(value, Value::Bool(_) | Value::Str(_)))
         .or_else(|| ["x:num", "sdval"].into_iter().find_map(|key| {
             let raw = dom.attr(cell, key)?;
             let raw = if raw.is_empty() { text.trim() } else { raw.trim() };
             raw.parse::<f64>().ok().filter(|n| n.is_finite()).map(Value::num)
         }))
+        .or(typed)
         .unwrap_or_else(|| {
             let s = if dom.attr(cell, "x:str").is_some() { &text } else { text.trim() };
             if s.is_empty() { Value::Empty } else { Value::str(s) }
         });
     Ok((value, style))
+}
+
+fn calc_number_format(raw: &str) -> Option<&str> {
+    let mut fields = raw.splitn(3, ';');
+    fields.next()?.parse::<u16>().ok()?;
+    fields.next()?.parse::<u16>().ok()?;
+    fields.next().filter(|code| !code.is_empty() && code.len() <= MAX_CODE)
 }
 
 fn sheets_value(raw: Option<&str>) -> Option<Value> {
@@ -250,7 +279,7 @@ fn sheets_value(raw: Option<&str>) -> Option<Value> {
     }
 }
 
-fn attributes(dom: &Dom, h: Handle, classes: &Classes, style: &mut Style) {
+fn attributes(dom: &Dom, h: Handle, rules: &Rules, style: &mut Style) {
     if let Some(a) = dom.attr(h, "align") { horizontal(a, style); }
     if let Some(a) = dom.attr(h, "valign") { vertical(a, style); }
     if let Some(rgb) = dom.attr(h, "bgcolor").and_then(color) { style.fill = Some(rgb); }
@@ -260,7 +289,7 @@ fn attributes(dom: &Dom, h: Handle, classes: &Classes, style: &mut Style) {
     }
     if let Some(names) = dom.attr(h, "class") {
         for name in names.split_ascii_whitespace().take(16) {
-            if let Some(css) = classes.get(name) { declarations(css, style); }
+            if let Some(css) = rules.classes.get(name) { declarations(css, style); }
         }
     }
     if let Some(css) = dom.attr(h, "style").filter(|s| s.len() <= 4096) {

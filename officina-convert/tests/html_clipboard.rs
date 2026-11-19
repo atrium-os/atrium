@@ -44,7 +44,9 @@ fn html_offer_round_trips_value_and_styles_through_the_worker() {
     source.set_style(&rect(1, 1), style.clone());
     let range = Rect { r1: 1, c1: 1, ..rect(0, 0) };
     let html = html_clipboard::write(&source, range).unwrap();
-    assert!(html.contains("12.50%"));
+    assert!(html.contains(r##"bgcolor="#fefdcb" align="right" valign="middle""##));
+    assert!(html.contains(r##"<font face="Plex" color="#1297be"><b><i><u><strike>12.50%</strike></u></i></b></font>"##));
+    assert!(html.contains(r#"sdnum="1033;1033;0.00%;[Red]-0.00%""#));
     assert!(html.contains("&lt;text&gt; &amp; data"));
     let out = worker(html.as_bytes());
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -122,4 +124,25 @@ fn rejects_oversized_badly_framed_and_merged_tables() {
     let out = worker(b"<table><tr><td rowspan=0>Unsupported</td></tr></table>");
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn calc_number_format_and_fraction_survive_the_worker() {
+    let out = worker(br#"<style>body,table,th,td {font-family:"Liberation Sans";font-size:x-small}</style><table><tr>
+        <td sdval="0.125" sdnum="1033;1033;0.00%;[Red]-0.00%" data-sheets-value='{"1":3,"3":0}'>12.50%</td>
+        <td sdval="1" sdnum="1033;" data-sheets-value='{"1":4,"4":1}'>TRUE</td>
+        <td sdval="0.5" sdnum="1033;" style='mso-number-format:"0.0%"'>50.0%</td>
+        </tr></table>"#);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let clip = Clip::decode_system(&out.stdout, MAX_NATIVE_BYTES).unwrap();
+    let mut target = workbook();
+    for op in clip.paste(&target, 0, 0, 0).unwrap().0 {
+        op.apply(&mut target);
+    }
+    assert_eq!(target.value(0, 0, 0), Value::Num(0.125));
+    assert_eq!(target.formatted(CellAddr::new(0, 0, 0)).text, "12.50%");
+    assert_eq!(target.style(CellAddr::new(0, 0, 0)).num_fmt.as_ref(), "0.00%;[Red]-0.00%");
+    assert_eq!(target.value(0, 0, 1), Value::Bool(true));
+    assert_eq!(target.style(CellAddr::new(0, 0, 0)).font.name.as_deref(), Some("Liberation Sans"));
+    assert_eq!(target.style(CellAddr::new(0, 0, 2)).num_fmt.as_ref(), "0.0%");
 }
