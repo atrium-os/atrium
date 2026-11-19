@@ -70,7 +70,9 @@ impl Page {
             Ok(Response::WorkspaceCredentials { credentials }) => self.credentials = credentials,
             Ok(Response::Ok) => {
                 if let Some((workspace, persona)) = self.selected.clone() {
-                    self.select(workspace, persona);
+                    // Keep the rows visible and their buttons disabled while
+                    // fetching the authoritative grant state after the write.
+                    self.queue(Request::WorkspaceCredentials { workspace, persona });
                 }
             }
             Ok(_) => self.error = Some("Unexpected workspace access response".into()),
@@ -120,8 +122,13 @@ impl CuriaView {
             text(ctx, x + back + em(16.0), top + em(15.0), &scope, type_size::MD, Weight::Medium, t.text_primary());
             top += em(42.0);
         }
+        let has_rows = if state.selected.is_some() {
+            !state.credentials.is_empty()
+        } else {
+            !state.workspaces.is_empty()
+        };
         let status = if state.busy {
-            Some("Loading…".to_string())
+            (!has_rows).then(|| "Loading…".to_string())
         } else if let Some(error) = &state.error {
             Some(fit(error, w))
         } else if state.selected.is_some() && state.credentials.is_empty() {

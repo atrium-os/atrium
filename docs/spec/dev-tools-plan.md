@@ -351,9 +351,9 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   new|list|grant|revoke|delete`. Gate `scripts/vm-ssh-agent-check.sh`: 25/25, 35/35 with tokens (an ssh
   login and `ssh-keygen -Y sign` through the agent, the signature checked on the host;
   another workspace lists nothing and can't sign or log in; no private key in the
-  workspace; the socket refuses any uid but the workspace's; revoke and lock end it). The
-  login is to an sshd of the workspace's own on its loopback, which is what `git push`
-  over SSH does too; git itself isn't on the cloud VM. HTTPS tokens (later the same day):
+  workspace; the socket refuses any uid but the workspace's; revoke and lock end it).
+  The initial login check uses an sshd on the workspace's loopback.
+  HTTPS tokens (later the same day):
   `arca-ssh token HOST USERNAME`, granted like keys; `git-credential-arca` is copied into
   each workspace's `/atrium/bin` from the host's install and set as git's credential
   helper whenever the workspace has the agent; it gets only that workspace's token for
@@ -363,8 +363,13 @@ manifests yet), and the ~25 hand-written `cap_enter` blocks.
   press to grant or revoke. The SSH gate starts the agent with the shipped
   services.d entry, checks its jail ID and UID, and exercises the privileged
   agent protocol alongside key and token isolation. The dedicated FreeBSD
-  amd64 run passed 42/42. Its workspaces had no Git, so it verified SSH login
-  and the credential helper directly.
+  amd64 run passed 42/42. A follow-up in the dedicated guest used the signed Curia
+  bundle and Fresco's headless input path to click Grant and Revoke for both
+  credential types. The rows stay visible during the refresh. With Git 2.56.1
+  installed in two workspaces, `git credential fill` returned the fixture
+  credential only for the granted workspace and host. SSH `git push` created a
+  branch in a disposable bare repository served over the workspace's loopback,
+  and its ref matched the source commit. Revocation blocked both Git operations.
 - **M10 (M).** `WorkspaceRun { debug: true }`: lldb-server as the dev app's parent in
   its jail, a socketpair back into the workspace, the frame tag; cores copied on
   request. Gate: a breakpoint in a Pergola dev app from `lldb` in the workspace;
