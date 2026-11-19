@@ -132,6 +132,19 @@ int tessera_pack_index_find(const uint8_t *idx, size_t idx_len,
                             const tessera_hash_t hash,
                             uint64_t *out_desc_off, uint32_t *out_size);
 
+/* The scrub's compaction (tessera-encryption.md E4.7): rebuild `pack`
+ * (len bytes, as read from disk) without the blobs in `drop`. Same kind and
+ * creator, kept blobs unchanged; the pack id is new_pack_id, or the old one
+ * when NULL. (The kernel always gives a new one: pack ids are derived from
+ * what a pack first held, and a publish that finds its id registered writes
+ * nothing.) `out` holds `len` bytes; the result's size goes to *out_size.
+ * TESSERA_ENOENT: nothing to drop. */
+int tessera_pack_compact(const uint8_t *pack, size_t len,
+                         const tessera_hash_t *drop, uint32_t ndrop,
+                         const uint8_t new_pack_id[16],
+                         uint8_t *out, size_t *out_size,
+                         uint32_t *out_kept, uint32_t *out_dropped);
+
 #ifdef __cplusplus
 }
 #endif

@@ -563,6 +563,26 @@ tessera_journal_checkpoint_anchor(tessera_journal_t *j,
 	return write_journal_header(j);
 }
 
+int
+tessera_journal_scrub(tessera_journal_t *j)
+{
+	if (j == NULL) return TESSERA_EINVAL;
+	/* A sealed journal's blocks are sealed under K_meta already. */
+	if (j->seal != NULL) return TESSERA_OK;
+	if (j->head_block != j->tail_block) return TESSERA_EBUSY;
+	uint8_t *z = tessera_zalloc(BLK);
+	if (z == NULL) return TESSERA_ENOMEM;
+	int r = TESSERA_OK;
+	for (uint64_t b = 1; b < j->length; b++) {
+		if (j->io.write_block(j->io.ctx, j->start + b, z) != 0) {
+			r = TESSERA_EIO;
+			break;
+		}
+	}
+	tessera_free(z);
+	return r;
+}
+
 #ifdef _KERNEL
 void
 tessera_journal_peek_pos(const tessera_journal_t *j,

@@ -705,3 +705,88 @@ tessera_pack_index_find(const uint8_t *idx, size_t idx_len,
 	return TESSERA_ENOENT;
 }
 #endif
+
+/*
+ * Compaction for the scrub (tessera-encryption.md E4.7): the same pack with
+ * the blobs in `drop` left out, so the bytes of dead blobs that share a pack
+ * with live ones can be wiped. Same pack id, kind and creator; every kept
+ * blob byte for byte with its flags. `out` must hold `len` bytes (the result
+ * is never larger); *out_size is a multiple of the sector size.
+ * TESSERA_ENOENT when nothing in `drop` is in the pack (nothing to do).
+ */
+int
+tessera_pack_compact(const uint8_t *pack, size_t len,
+                     const tessera_hash_t *drop, uint32_t ndrop,
+                     const uint8_t new_pack_id[16],
+                     uint8_t *out, size_t *out_size,
+                     uint32_t *out_kept, uint32_t *out_dropped)
+{
+	tessera_pack_geom_t g;
+	tessera_pack_header_t *hdr;
+	tessera_pack_builder_t *b = NULL;
+	uint32_t kept = 0, dropped = 0;
+	int r;
+
+	if (pack == NULL || out == NULL || out_size == NULL ||
+	    len < 2 * TESSERA_SECTOR_SIZE || (drop == NULL && ndrop > 0))
+		return TESSERA_EINVAL;
+	r = tessera_pack_geom_from_header(pack, len, &g);
+	if (r != TESSERA_OK)
+		return r;
+	hdr = tessera_malloc(sizeof(*hdr));
+	if (hdr == NULL)
+		return TESSERA_ENOMEM;
+	r = tessera_decode_pack_header(pack, hdr);
+	if (r != TESSERA_OK)
+		goto out;
+	b = tessera_pack_begin(hdr->pack_kind,
+	    new_pack_id != NULL ? new_pack_id : hdr->pack_id,
+	    hdr->creator_tx_id);
+	if (b == NULL) {
+		r = TESSERA_ENOMEM;
+		goto out;
+	}
+	for (uint32_t i = 0; i < g.blob_count; i++) {
+		tessera_pack_index_entry_t ie;
+		const uint8_t *e = pack + g.index_off +
+		    (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE;
+		int gone = 0;
+
+		r = tessera_decode_pack_index_entry(e, &ie);
+		if (r != TESSERA_OK)
+			goto out;
+		for (uint32_t d = 0; d < ndrop && !gone; d++)
+			gone = memcmp(drop[d], ie.blob_hash, 32) == 0;
+		if (gone) {
+			dropped++;
+			continue;
+		}
+		const uint64_t desc = sizeof(tessera_blob_descriptor_t);
+		if (ie.data_offset > g.data_len ||
+		    g.data_len - ie.data_offset < desc ||
+		    ie.data_size > g.data_len - ie.data_offset - desc) {
+			r = TESSERA_ECORRUPT;
+			goto out;
+		}
+		r = tessera_pack_add_blob(b, ie.blob_hash,
+		    pack + g.data_off + ie.data_offset + desc, ie.data_size,
+		    ie.flags);
+		if (r != TESSERA_OK)
+			goto out;
+		kept++;
+	}
+	if (dropped == 0) {
+		r = TESSERA_ENOENT;
+		goto out;
+	}
+	r = tessera_pack_finalize(b, out, len, out_size);
+out:
+	if (b != NULL)
+		tessera_pack_free(b);
+	tessera_free(hdr);
+	if (out_kept != NULL)
+		*out_kept = kept;
+	if (out_dropped != NULL)
+		*out_dropped = dropped;
+	return r;
+}

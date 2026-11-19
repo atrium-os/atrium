@@ -278,6 +278,86 @@ test_partial_read_api(void)
 	tessera_pack_free(pb);
 }
 
+/* The scrub's compaction: dropping some blobs keeps the pack id, kind and
+ * creator and every other blob byte for byte; the dropped blobs are gone
+ * from both index and data; nothing to drop is ENOENT. */
+static void
+test_compact(void)
+{
+	const uint8_t pack_id[16] = { 'P','A','C','K','C','O','M','P','A','C','T','T','E','S','T','1' };
+	tessera_pack_builder_t *pb = tessera_pack_begin(2, pack_id, 77);
+	enum { N = 30 };
+	uint8_t *bytes[N]; uint32_t lens[N]; tessera_hash_t hs[N];
+	for (uint32_t i = 0; i < N; i++) {
+		gen_blob(i + 1000, &bytes[i], &lens[i], hs[i]);
+		CHECK(tessera_pack_add_blob(pb, hs[i], bytes[i], lens[i], i & 1) == TESSERA_OK);
+	}
+	size_t need = 0;
+	(void)tessera_pack_finalize(pb, NULL, 0, &need);
+	uint8_t *pack = malloc(need); size_t sz = 0;
+	CHECK(tessera_pack_finalize(pb, pack, need, &sz) == TESSERA_OK);
+
+	tessera_hash_t drop[N / 3 + 1];
+	uint32_t nd = 0;
+	for (uint32_t i = 0; i < N; i += 3)
+		memcpy(drop[nd++], hs[i], sizeof(tessera_hash_t));
+	uint8_t *out = malloc(sz); size_t osz = 0;
+	uint32_t kept = 0, dropped = 0;
+	CHECK(tessera_pack_compact(pack, sz, drop, nd, NULL, out, &osz, &kept, &dropped) == TESSERA_OK);
+	CHECK(dropped == nd && kept == N - nd);
+	CHECK(osz > 0 && osz < sz);
+	tessera_pack_reader_t *pr = tessera_pack_open(out, osz);
+	CHECK(pr != NULL);
+	if (pr != NULL) {
+		CHECK(memcmp(tessera_pack_pack_id(pr), pack_id, 16) == 0);
+		CHECK(tessera_pack_blob_count(pr) == kept);
+		for (uint32_t i = 0; i < N; i++) {
+			const uint8_t *b = NULL; uint32_t bn = 0;
+			int r = tessera_pack_lookup(pr, hs[i], &b, &bn);
+			if (i % 3 == 0) {
+				CHECK(r == TESSERA_ENOENT);
+			} else {
+				CHECK(r == TESSERA_OK && bn == lens[i] &&
+				    memcmp(b, bytes[i], bn) == 0);
+			}
+		}
+		tessera_pack_close(pr);
+	}
+	tessera_pack_header_t hh;
+	CHECK(tessera_decode_pack_header(out, &hh) == TESSERA_OK);
+	CHECK(hh.pack_kind == 2 && hh.creator_tx_id == 77);
+	/* No dropped blob's bytes survive anywhere in the output. */
+	for (uint32_t i = 0; i < N; i += 3) {
+		int found = 0;
+		for (size_t o = 0; o + 64 <= osz && !found; o++)
+			found = memcmp(out + o, bytes[i], 64) == 0;
+		CHECK(!found);
+	}
+
+	tessera_hash_t absent;
+	memset(absent, 0x5a, sizeof absent);
+	CHECK(tessera_pack_compact(pack, sz, &absent, 1, NULL, out, &osz, &kept, &dropped) == TESSERA_ENOENT);
+	CHECK(tessera_pack_compact(pack, sz, NULL, 0, NULL, out, &osz, NULL, NULL) == TESSERA_ENOENT);
+	/* A new id goes into the header. */
+	const uint8_t nid[16] = { 'N','E','W','I','D',0,1,2,3,4,5,6,7,8,9,10 };
+	CHECK(tessera_pack_compact(pack, sz, drop, nd, nid, out, &osz, &kept, &dropped) == TESSERA_OK);
+	pr = tessera_pack_open(out, osz);
+	CHECK(pr != NULL && memcmp(tessera_pack_pack_id(pr), nid, 16) == 0);
+	if (pr != NULL)
+		tessera_pack_close(pr);
+	/* Dropping everything still gives a valid, empty pack. */
+	CHECK(tessera_pack_compact(pack, sz, hs, N, NULL, out, &osz, &kept, &dropped) == TESSERA_OK);
+	CHECK(kept == 0 && dropped == N);
+	pr = tessera_pack_open(out, osz);
+	CHECK(pr != NULL && tessera_pack_blob_count(pr) == 0);
+	if (pr != NULL)
+		tessera_pack_close(pr);
+
+	for (uint32_t i = 0; i < N; i++) free(bytes[i]);
+	free(pack); free(out);
+	tessera_pack_free(pb);
+}
+
 int
 main(void)
 {
@@ -287,6 +367,7 @@ main(void)
 	test_corruption_detected();
 	test_bloom_probe_cap();
 	test_partial_read_api();
+	test_compact();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

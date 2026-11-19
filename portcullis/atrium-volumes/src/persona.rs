@@ -12,6 +12,9 @@
 //!   folder is made again in the group, everything is copied in (the kernel
 //!   encrypts it as it goes; a rename across groups would be `EXDEV`), and
 //!   the old copy is deleted. An interrupted move finishes next time.
+//!   Before the old copy goes, a scrub of its volume is queued, and it
+//!   runs once the folders are handed out (scrub.rs, E4.7): deleting
+//!   leaves the old bytes on disk until something overwrites them.
 //! - A folder that was in the group and isn't any more, or is in another
 //!   group, or whose record doesn't verify, is refused (§5.4 expected
 //!   groups): portcullisd doesn't hand it out.
@@ -29,6 +32,7 @@ use crate::arca::{hex, unhex16, KeyError, Keys};
 use crate::ffi::{self, GroupInfo};
 use crate::groups::{GroupEntry, Groups};
 use crate::protocol::{EraseFoldersRequest, PersonaFoldersRequest, Response};
+use crate::scrub::ScrubQueue;
 
 /// The kernel side, or a stand-in for tests.
 pub trait Kernel {
@@ -100,6 +104,7 @@ fn is_enotty(e: &io::Error) -> bool {
 pub struct Folders<'a, K: Kernel, A: Keys> {
     pub kernel: &'a K,
     pub keys:   &'a A,
+    pub scrub:  &'a dyn ScrubQueue,
     pub groups: &'a mut Groups,
     pub path:   &'a Path,
 }
@@ -307,12 +312,20 @@ impl<'a, K: Kernel, A: Keys> Folders<'a, K, A> {
                 if let Err(err) = copy_tree(&p, f) {
                     return error(format!("moving {} into {}: {err}", p.display(), f.display()));
                 }
+                // Queued before the delete, so a crash in between still
+                // gets its scrub.
+                if let Err(err) = self.scrub.want(&probe) {
+                    return error(format!("queueing a scrub of {}: {err}", probe.display()));
+                }
                 if let Err(err) = fs::remove_dir_all(&p) {
                     return error(format!("{}: {err}", p.display()));
                 }
                 info!("persona folders: {} moved into {}'s encrypted {}", p.display(), req.person, f.display());
                 moved.push(fs_);
             }
+        }
+        if !moved.is_empty() {
+            self.scrub.kick();
         }
         Response::FoldersReady { encrypted: true, moved }
     }
@@ -466,6 +479,8 @@ mod tests {
         loads:   u32,
         tessera: bool,
         keys_up: bool,
+        scrubs:  Vec<PathBuf>,
+        kicks:   u32,
     }
 
     #[derive(Clone)]
@@ -539,6 +554,23 @@ mod tests {
         }
     }
 
+    impl ScrubQueue for Fake {
+        fn want(&self, dir: &Path) -> io::Result<()> {
+            let mut w = self.0.borrow_mut();
+            // Queued while the old copy is still there.
+            assert!(fs::read_dir(dir).unwrap().any(|e| {
+                e.unwrap().file_name().to_string_lossy().ends_with(".unencrypted")
+            }));
+            if !w.scrubs.iter().any(|d| d == dir) {
+                w.scrubs.push(dir.to_path_buf());
+            }
+            Ok(())
+        }
+        fn kick(&self) {
+            self.0.borrow_mut().kicks += 1;
+        }
+    }
+
     impl Keys for Fake {
         fn mint(&self, _u: &str, _p: &str, uuid: &[u8; 16], group: u64, _l: &str) -> Result<[u8; 16], KeyError> {
             let mut w = self.0.borrow_mut();
@@ -600,12 +632,12 @@ mod tests {
 
     fn run(t: &mut T, r: &PersonaFoldersRequest) -> Response {
         let fake = t.fake.clone();
-        Folders { kernel: &fake, keys: &fake, groups: &mut t.groups, path: &t.db }.prepare(r)
+        Folders { kernel: &fake, keys: &fake, scrub: &fake, groups: &mut t.groups, path: &t.db }.prepare(r)
     }
 
     fn erase(t: &mut T, persona: &str) -> Response {
         let fake = t.fake.clone();
-        Folders { kernel: &fake, keys: &fake, groups: &mut t.groups, path: &t.db }
+        Folders { kernel: &fake, keys: &fake, scrub: &fake, groups: &mut t.groups, path: &t.db }
             .erase(&EraseFoldersRequest { person: "alice".into(), persona: persona.into() })
     }
 
@@ -687,8 +719,13 @@ mod tests {
         assert_eq!(fs::metadata(docs.join("a.txt")).unwrap().modified().unwrap(), old);
         assert_eq!(fs::read_link(docs.join("link")).unwrap(), PathBuf::from("a.txt"));
         assert!(!parked(&docs).exists(), "the old copy stays");
-        // Nothing moves twice.
+        // Its volume is queued for a scrub (before the delete: see the
+        // fake) and the scrub started.
+        assert_eq!(t.fake.0.borrow().scrubs, vec![t.home.clone()]);
+        assert_eq!(t.fake.0.borrow().kicks, 1);
+        // Nothing moves twice, and nothing more is scrubbed.
         assert_eq!(ready(&run(&mut t, &r)), (true, vec![]));
+        assert_eq!(t.fake.0.borrow().kicks, 1);
     }
 
     #[test]
@@ -705,6 +742,7 @@ mod tests {
         assert_eq!(moved, vec![t.home.join("Downloads").display().to_string()]);
         assert_eq!(fs::read(t.home.join("Downloads/late.pdf")).unwrap(), b"pdf");
         assert!(!p.exists());
+        assert_eq!(t.fake.0.borrow().kicks, 1);
     }
 
     #[test]

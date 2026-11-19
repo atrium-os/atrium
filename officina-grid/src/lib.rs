@@ -16,6 +16,7 @@ pub mod addr;
 pub mod autofill;
 pub mod book;
 pub mod charts;
+pub mod clip;
 pub mod column;
 pub mod comments;
 pub mod compare;

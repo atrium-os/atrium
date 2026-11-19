@@ -476,6 +476,61 @@ test_flush_cost_many_extents(void)
 	free(d);
 }
 
+/* The scrub's walk: take every free run in disk order, in pieces of at most
+ * `max`, give each back, and continue from its end. Every free sector is
+ * visited exactly once and the free set ends as it began. */
+static void
+test_take_next(void)
+{
+	tessera_extent_alloc_t *a = tessera_extent_open(NULL, 0);
+	CHECK(tessera_extent_free(a, 10, 5) == TESSERA_OK);     /* 10..14 */
+	CHECK(tessera_extent_free(a, 20, 30) == TESSERA_OK);    /* 20..49 */
+	CHECK(tessera_extent_free(a, 100, 1) == TESSERA_OK);
+	uint64_t s = 0, n = 0;
+
+	/* From inside a run: a middle piece splits it in two. */
+	CHECK(tessera_extent_take_next(a, 25, 4, &s, &n) == TESSERA_OK);
+	CHECK(s == 25 && n == 4);
+	CHECK(tessera_extent_free_blocks(a) == 32);
+	CHECK(tessera_extent_alloc(a, 5, &s) == TESSERA_OK && s == 10);
+	CHECK(tessera_extent_free(a, 10, 5) == TESSERA_OK);
+	CHECK(tessera_extent_free(a, 25, 4) == TESSERA_OK);
+	CHECK(tessera_extent_free_blocks(a) == 36);
+
+	uint8_t seen[128];
+	memset(seen, 0, sizeof seen);
+	uint64_t from = 0, pieces = 0;
+	while (tessera_extent_take_next(a, from, 7, &s, &n) == TESSERA_OK) {
+		CHECK(n >= 1 && n <= 7 && s >= from && s + n <= 128);
+		for (uint64_t k = s; k < s + n && k < 128; k++)
+			seen[k]++;
+		CHECK(tessera_extent_free(a, s, n) == TESSERA_OK);
+		from = s + n;
+		pieces++;
+		if (pieces > 100) break;
+	}
+	CHECK(pieces == 1 + 5 + 1);       /* 5 | 7,7,7,7,2 | 1 */
+	for (uint64_t k = 0; k < 128; k++) {
+		int want = (k >= 10 && k < 15) || (k >= 20 && k < 50) || k == 100;
+		CHECK(seen[k] == (want ? 1 : 0));
+	}
+	CHECK(tessera_extent_free_blocks(a) == 36);
+	CHECK(tessera_extent_largest_free_run(a) == 30);
+	CHECK(tessera_extent_take_next(a, 101, 7, &s, &n) == TESSERA_ENOENT);
+	CHECK(tessera_extent_take_next(a, 0, 0, &s, &n) == TESSERA_EINVAL);
+
+	/* Whole run, head and tail pieces. */
+	CHECK(tessera_extent_take_next(a, 0, 100, &s, &n) == TESSERA_OK);
+	CHECK(s == 10 && n == 5);
+	CHECK(tessera_extent_take_next(a, 0, 3, &s, &n) == TESSERA_OK);
+	CHECK(s == 20 && n == 3);
+	CHECK(tessera_extent_take_next(a, 45, 100, &s, &n) == TESSERA_OK);
+	CHECK(s == 45 && n == 5);
+	CHECK(tessera_extent_free_blocks(a) == 36 - 13);
+	CHECK(tessera_extent_alloc(a, 22, &s) == TESSERA_OK && s == 23);
+	tessera_extent_close(a);
+}
+
 int
 main(void)
 {
@@ -491,6 +546,7 @@ main(void)
 	test_btree_round_trip();
 	test_flush_cost_many_extents();
 	test_bounds();
+	test_take_next();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

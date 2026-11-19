@@ -15,6 +15,9 @@
  *   tessera-keyload group-info DIR
  *       (on a mounted volume: make the group; put DIR's quota domain in it)
  *   tessera-keyload quota-dump DIR
+ *   tessera-keyload scrub DIR
+ *       (E4.7: retire snapshots, rebuild partly-dead plain packs, zero the
+ *       free space and the journal's old records; prints the counts)
  *       (the mount's domains and key groups, to the console)
  *   tessera-keyload format KEY_ID_HEX UUID_HEX DEVICE [JOURNAL_SECTORS]
  *       (the kernel formats DEVICE sealed with the loaded key; the key
@@ -68,6 +71,7 @@ usage(void)
 	    "       tessera-keyload group-erase DIR GROUP\n"
 	    "       tessera-keyload group-info DIR\n"
 	    "       tessera-keyload quota-dump DIR\n"
+	    "       tessera-keyload scrub DIR\n"
 	    "       tessera-keyload format KEY_ID UUID DEVICE [JOURNAL_SECTORS]\n");
 	exit(2);
 }
@@ -188,6 +192,28 @@ main(int argc, char **argv)
 		    (gi.flags & TESSERA_GROUP_INFO_BAD) ? "BAD" :
 		    (gi.flags & TESSERA_GROUP_INFO_NO_RECORD) ? "no-record" :
 		    "plain");
+		return (0);
+	}
+	if (strcmp(argv[1], "scrub") == 0 && argc == 3) {
+		struct tessera_ioc_scrub sc;
+		int dfd = open(argv[2], O_RDONLY | O_DIRECTORY);
+
+		memset(&sc, 0, sizeof sc);
+		if (dfd < 0) {
+			perror(argv[2]);
+			return (1);
+		}
+		if (ioctl(dfd, TESSERA_IOC_SCRUB, &sc) != 0) {
+			perror("TESSERA_IOC_SCRUB");
+			return (1);
+		}
+		printf("snapshots_retired=%ju packs_freed=%ju "
+		    "packs_compacted=%ju blobs_dropped=%ju packs_young=%ju "
+		    "zeroed_sectors=%ju journal_blocks=%ju\n",
+		    (uintmax_t)sc.snapshots_retired,
+		    (uintmax_t)sc.packs_freed, (uintmax_t)sc.packs_compacted,
+		    (uintmax_t)sc.blobs_dropped, (uintmax_t)sc.packs_young,
+		    (uintmax_t)sc.zeroed_sectors, (uintmax_t)sc.journal_blocks);
 		return (0);
 	}
 	if (strcmp(argv[1], "quota-dump") == 0 && argc == 3) {

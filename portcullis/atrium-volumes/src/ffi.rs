@@ -270,6 +270,35 @@ pub fn tessera_group_erase(path: &Path, group_id: u64) -> io::Result<()> {
     dir_ioctl(path, TESSERA_IOC_GROUP_ERASE, &mut g)
 }
 
+/// `struct tessera_ioc_scrub` (tessera-encryption.md E4.7).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScrubReport {
+    pub flags:             u32,
+    pub pad:               u32,
+    pub snapshots_retired: u64,
+    pub packs_freed:       u64,
+    pub packs_compacted:   u64,
+    pub blobs_dropped:     u64,
+    /// Partly dead but inside the GC grace period: scrub again later.
+    pub packs_young:       u64,
+    pub zeroed_sectors:    u64,
+    pub journal_blocks:    u64,
+}
+
+/// `_IOWR('T', 11, struct tessera_ioc_scrub)`: INOUT | 64 << 16 | 'T' << 8 | 11.
+pub const TESSERA_IOC_SCRUB: u64 = 0xC040_540B;
+const _: () = assert!(std::mem::size_of::<ScrubReport>() == 64);
+
+/// Scrub the volume `path` (a directory) is on: retire its snapshots,
+/// rebuild partly-dead plain packs, zero its free space and its journal's
+/// old records. Slow: it writes the whole free space.
+pub fn tessera_scrub(path: &Path) -> io::Result<ScrubReport> {
+    let mut r = ScrubReport::default();
+    dir_ioctl(path, TESSERA_IOC_SCRUB, &mut r)?;
+    Ok(r)
+}
+
 /// Copy the `user.atrium.origin` attribute (where a download came from)
 /// from one open file to another. Absent: nothing to do.
 #[cfg(target_os = "freebsd")]

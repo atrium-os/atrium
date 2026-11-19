@@ -105,6 +105,26 @@ struct tessera_ioc_group_info {
 #define TESSERA_GROUP_INFO_NO_RECORD 0x10u /* names a group with no record */
 #define TESSERA_IOC_GROUP_INFO   _IOWR('T', 10, struct tessera_ioc_group_info)
 
+/* Scrub (E4.7, tessera-encryption.md §13.1): make deleted file contents
+ * unreadable from the disk. Retires every retained snapshot, runs a GC pass
+ * that also rebuilds partly-dead plain packs without their dead blobs, then
+ * zeroes every free sector of the data zone and the journal's old records
+ * (a plain journal's dirent records name files). atrium-volumes runs it after
+ * moving a plain folder into a key group. Unjailed root only; any
+ * directory of the volume. Takes as long as writing the free space. */
+struct tessera_ioc_scrub {
+	uint32_t flags;               /* in: 0 */
+	uint32_t pad;
+	uint64_t snapshots_retired;   /* out, from here on */
+	uint64_t packs_freed;
+	uint64_t packs_compacted;
+	uint64_t blobs_dropped;
+	uint64_t packs_young;         /* partly dead, kept for the grace period */
+	uint64_t zeroed_sectors;
+	uint64_t journal_blocks;      /* zeroed past the last checkpoint */
+};
+#define TESSERA_IOC_SCRUB        _IOWR('T', 11, struct tessera_ioc_scrub)
+
 /* EEXIST if the id is loaded (drop it first); ENOSPC past the limit. */
 #define TKEY_LOAD  _IOW('K', 1, struct tkey_load)
 /* ENOENT if not loaded. Mounts keep a volume's derived keys until unmount;
