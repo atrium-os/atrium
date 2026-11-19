@@ -543,6 +543,9 @@ pub struct Mail {
     opened: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
     /// Where Monstrator listens.
     monstrator: Rc<std::path::PathBuf>,
+    /// The named persona this instance runs in (Work), once portcullisd
+    /// said; `None` for Personal or not yet known.
+    pub persona: Rc<RefCell<Option<String>>>,
     /// Compose windows asked for, for the app to open.
     composes: Rc<RefCell<Vec<(mail_engine::compose::Compose, Option<u64>)>>>,
     /// Attachment asks for the app.
@@ -2277,7 +2280,8 @@ impl Mail {
     /// jail converted, so the bar can say when it names another site.
     pub fn link(&self, url: &str) {
         let text = self.framed().and_then(|(_, d, _)| d.0.links.iter().find(|(h, _)| h == url).map(|(_, t)| t.clone()));
-        let bar = crate::links::bar(url, text.as_deref());
+        let keep = self.engine.prefs().keeps_scanning(self.persona.borrow().is_some());
+        let bar = crate::links::bar_kept(url, text.as_deref(), keep);
         let mut ui = self.ui.get_cloned();
         ui.link = Some(LinkBar { bar, note: None });
         self.ui.set(ui);
@@ -2918,6 +2922,7 @@ impl MailView {
             loads: Rc::default(),
             opened: Default::default(),
             monstrator: Rc::new(monstrator::socket()),
+            persona: Rc::default(),
             composes: Rc::default(),
             asks: Rc::default(),
             print: Rc::default(),
@@ -3821,6 +3826,7 @@ impl MailView {
                 let second = match (&l.note, &b.says, b.via) {
                     (Some(n), _, _) => Some((n.clone(), t.text_secondary())),
                     (None, Some(says), _) => Some((format!("The link's text says {says}, but it goes to {}", b.domain), t.warning_fg())),
+                    (None, None, _) if b.scanned.is_some() => Some((format!("Opens through {}, your company's link scanning", b.scanned.unwrap_or_default()), t.text_secondary())),
                     (None, None, Some("Mimecast")) => Some(("Through Mimecast, which keeps the destination on its servers".into(), t.text_secondary())),
                     (None, None, Some(v)) => Some((format!("Unwrapped from {v}"), t.text_secondary())),
                     _ => None,

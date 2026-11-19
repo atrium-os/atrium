@@ -171,6 +171,9 @@ pub struct Settings {
     forgot: Rc<RefCell<Option<mpsc::Receiver<Result<(), String>>>>>,
     /// Where arcad listens.
     arca: Rc<std::path::PathBuf>,
+    /// The named persona Mail runs in (Work), shared with the main
+    /// window; `None` for Personal.
+    pub persona: Rc<RefCell<Option<String>>>,
 }
 
 impl Settings {
@@ -200,6 +203,7 @@ impl Settings {
             added: Rc::default(),
             forgot: Rc::default(),
             arca: Rc::new(arca),
+            persona: Rc::default(),
         };
         s.reload();
         s
@@ -436,6 +440,13 @@ impl Settings {
     /// Later's weekly look (§11.4): what is due next week, who is waited on.
     pub fn toggle_weekly(&self) {
         self.set_prefs(|p| p.weekly = !p.weekly);
+    }
+
+    /// Company link scanning (§7.6): kept or not, against this persona's
+    /// default.
+    pub fn toggle_link_scanning(&self) {
+        let named = self.persona.borrow().is_some();
+        self.set_prefs(|p| p.link_scanning = Some(!p.keeps_scanning(named)));
     }
 
     /// Saturday and Sunday quiet all day (§12).
@@ -1027,6 +1038,15 @@ impl SettingsView {
         y += em(32.0);
         text(ctx, x, y + em(8.0), "Ctrl-K finds every command, on or off.", type_size::XS, Weight::Regular, t.text_tertiary());
         y += em(22.0);
+
+        // Links (§7.6): company link scanning, on by default in a named persona.
+        y += em(8.0);
+        section(ctx, x, &mut y, "LINKS");
+        let named = self.s.persona.borrow().is_some();
+        let s = self.s.clone();
+        switch(ctx, x, y + em(14.0), "Keep company link scanning", ui.prefs.keeps_scanning(named), move || s.toggle_link_scanning());
+        y += em(32.0);
+        y += para(ctx, x, y, inner, "A link through Safe Links, URL Defense or Mimecast opens through it, so your company's scanner still checks it. Mail shows where it goes either way.", type_size::XS, t.text_tertiary()) + em(8.0);
 
         // Lanes (E10): the person's rules, then what Mail does by itself.
         y += em(8.0);

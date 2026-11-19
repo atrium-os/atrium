@@ -12,6 +12,8 @@ const WEEKLY_OFF: &str = "weekly_look_off";
 const QUIET_WEEKENDS: &str = "quiet_weekends";
 const REPLIES_THROUGH: &str = "replies_through_quiet";
 const SINGLE_KEYS_OFF: &str = "single_keys_off";
+/// 1: off, 2: on; absent: the persona's default (on for a named one).
+const LINK_SCANNING: &str = "link_scanning";
 /// The review's minute after local midnight, plus one; absent: 9:00.
 const REVIEW: &str = "review_minute";
 /// The digest's times, comma-separated minutes after local midnight; "-"
@@ -50,11 +52,15 @@ pub struct Prefs {
     pub review: u16,
     /// The single-key shortcuts (j, k, e, r, …; §15.5), on unless turned off.
     pub single_keys: bool,
+    /// Keep company link scanning (§7.6): a link through Safe Links,
+    /// URL Defense or Mimecast opens through it. `None`: the persona's
+    /// default, on for a named persona (Work), off for Personal.
+    pub link_scanning: Option<bool>,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true }
+        Prefs { notify: true, quiet: None, vips_through: false, vips: Vec::new(), weekly: true, quiet_weekends: false, replies_through: false, digest: DIGEST_DEFAULT.to_vec(), review: 9 * 60, single_keys: true, link_scanning: None }
     }
 }
 
@@ -72,6 +78,11 @@ impl Prefs {
     /// Whether it is quiet on `weekday` (0 = Monday) at minute `m`.
     pub fn is_quiet_on(&self, weekday: u8, m: u16) -> bool {
         (self.quiet_weekends && weekday >= 5) || self.is_quiet(m)
+    }
+
+    /// Whether company link scanning is kept, in a named persona or not.
+    pub fn keeps_scanning(&self, named_persona: bool) -> bool {
+        self.link_scanning.unwrap_or(named_persona)
     }
 
     pub fn is_vip(&self, addr: &str) -> bool {
@@ -92,6 +103,11 @@ impl Engine {
             quiet_weekends: s.setting(ALL, QUIET_WEEKENDS).ok().flatten().unwrap_or(0) != 0,
             replies_through: s.setting(ALL, REPLIES_THROUGH).ok().flatten().unwrap_or(0) != 0,
             single_keys: s.setting(ALL, SINGLE_KEYS_OFF).ok().flatten().unwrap_or(0) == 0,
+            link_scanning: match s.setting(ALL, LINK_SCANNING).ok().flatten() {
+                Some(1) => Some(false),
+                Some(2) => Some(true),
+                _ => None,
+            },
             review: s.setting(ALL, REVIEW).ok().flatten().filter(|v| (1..=1440).contains(v)).map_or(9 * 60, |v| (v - 1) as u16),
             digest: match s.sync_state(ALL, DIGEST).ok().flatten() {
                 None => DIGEST_DEFAULT.to_vec(),
@@ -115,6 +131,7 @@ impl Engine {
             w.set_setting(ALL, QUIET_WEEKENDS, p.quiet_weekends.then_some(1))?;
             w.set_setting(ALL, REPLIES_THROUGH, p.replies_through.then_some(1))?;
             w.set_setting(ALL, SINGLE_KEYS_OFF, (!p.single_keys).then_some(1))?;
+            w.set_setting(ALL, LINK_SCANNING, p.link_scanning.map(|on| if on { 2 } else { 1 }))?;
             w.set_setting(ALL, REVIEW, (p.review < 1440 && p.review != 9 * 60).then_some(p.review as u64 + 1))?;
             let times = clean_times(p.digest.iter().copied());
             let digest = if times == DIGEST_DEFAULT { None } else if times.is_empty() { Some("-".to_string()) } else { Some(times.iter().map(u16::to_string).collect::<Vec<_>>().join(",")) };
@@ -156,5 +173,11 @@ mod tests {
         assert!(!e.prefs().single_keys);
         e.set_prefs(&Prefs { single_keys: true, ..e.prefs() }).unwrap();
         assert!(e.prefs().single_keys);
+        // Link scanning: the persona's default until chosen.
+        assert!(e.prefs().keeps_scanning(true) && !e.prefs().keeps_scanning(false));
+        e.set_prefs(&Prefs { link_scanning: Some(false), ..e.prefs() }).unwrap();
+        assert!(!e.prefs().keeps_scanning(true));
+        e.set_prefs(&Prefs { link_scanning: Some(true), ..e.prefs() }).unwrap();
+        assert!(e.prefs().keeps_scanning(false));
     }
 }

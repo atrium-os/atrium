@@ -372,6 +372,28 @@ fn the_link_bar_shows_where_a_link_goes_and_opens_it_through_monstrator() {
     assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://acme.example/report");
     assert!(mail.key(&Event::Key { kind: KeyEventKind::Down, key: Key::Escape, modifiers: Modifiers::default(), chars: String::new() }, None));
     assert!(mail.ui.get_cloned().link.is_none());
+
+    // In Work, company link scanning is kept (§7.6): the bar shows where it
+    // goes, and what opens is the Safe Links link as it came.
+    *mail.persona.borrow_mut() = Some("work".into());
+    mail.link(&href);
+    app.tick();
+    let b = mail.ui.get_cloned().link.unwrap().bar.unwrap();
+    assert_eq!((b.domain.as_str(), b.scanned), ("evil.example", Some("Microsoft Safe Links")));
+    assert_eq!(b.open, wrapped);
+    // The mismatch warning still comes first; without it, the scanner is named.
+    assert!(texts(&app).iter().any(|x| x.starts_with("The link's text says")));
+    let other = "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fdash.acme.example%2Fq4&data=05";
+    mail.link(other);
+    app.tick();
+    assert!(texts(&app).iter().any(|x| x == "Opens through Microsoft Safe Links, your company's link scanning"), "{:?}", texts(&app));
+    assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, other);
+    // Turned off: peeled as in Personal.
+    engine.set_prefs(&mail_engine::prefs::Prefs { link_scanning: Some(false), ..engine.prefs() }).unwrap();
+    mail.link(wrapped);
+    assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://login.evil.example/x");
+    mail.link(other);
+    assert_eq!(mail.ui.get_cloned().link.unwrap().bar.unwrap().open, "https://dash.acme.example/q4");
 }
 
 #[test]

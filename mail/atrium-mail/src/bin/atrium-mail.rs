@@ -510,6 +510,10 @@ fn main() {
         }
         if persona_known.is_none() {
             if let Some(p) = persona.lock().unwrap().take() {
+                *mail.persona.borrow_mut() = p.clone();
+                if let Some(sw) = &settings {
+                    *sw.s.persona.borrow_mut() = p.clone();
+                }
                 for cw in &composes {
                     cw.c.ui.set(atrium_mail::compose::ComposeUi { persona: p.clone(), ..cw.c.ui.get_cloned() });
                 }
@@ -617,7 +621,10 @@ fn main() {
             match &settings {
                 Some(_) => {}
                 None => match settings_window(&engine, embeds.as_ref()) {
-                    Ok(w) => settings = Some(w),
+                    Ok(w) => {
+                        *w.s.persona.borrow_mut() = mail.persona.borrow().clone();
+                        settings = Some(w)
+                    }
                     Err(e) => eprintln!("atrium-mail: the settings window: {e}"),
                 },
             }

@@ -27,6 +27,35 @@ pub struct Bar {
     /// The link's visible text, when it names a different site (§7.6
     /// "Mismatch"): the bar shows both, the destination first.
     pub says: Option<String>,
+    /// Company link scanning kept (§7.6): the scanner the link opens
+    /// through, as it came; the bar still shows where it goes.
+    pub scanned: Option<&'static str>,
+}
+
+/// The company link scanners (§7.6): with scanning kept, a link through
+/// one of them opens through it.
+pub const SCANNERS: [&str; 3] = ["Microsoft Safe Links", "Proofpoint URL Defense", "Mimecast"];
+
+/// The company scanner `link` goes through first, if any.
+pub fn scanned_by(link: &str) -> Option<&'static str> {
+    let u = web(link)?;
+    if mimecast(&u) {
+        return Some("Mimecast");
+    }
+    unwrap_once(&u).map(|(_, who)| who).filter(|w| SCANNERS.contains(w))
+}
+
+/// [`bar`], with company scanning kept when `keep` (a named persona's
+/// default): a scanned link opens as it came, through the scanner.
+pub fn bar_kept(link: &str, text: Option<&str>, keep: bool) -> Result<Bar, String> {
+    let mut b = bar(link, text)?;
+    if keep {
+        if let Some(s) = scanned_by(link) {
+            b.open = atrium_links::check(link.trim())?.url;
+            b.scanned = Some(s);
+        }
+    }
+    Ok(b)
 }
 
 /// Wrappers inside wrappers: peeled at most this many times.
@@ -245,12 +274,31 @@ pub fn bar(link: &str, text: Option<&str>) -> Result<Bar, String> {
         let dest = u.host_str().map(registrable);
         (dest.as_deref() != Some(named.as_str())).then(|| t.trim().to_string())
     });
-    Ok(Bar { open, lead, sub, domain, rest, via, says })
+    Ok(Bar { open, lead, sub, domain, rest, via, says, scanned: None })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn company_scanning_kept() {
+        let safe = "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fdash.acme.example%2Fq4&data=05";
+        assert_eq!(scanned_by(safe), Some("Microsoft Safe Links"));
+        let b = bar_kept(safe, None, true).unwrap();
+        assert_eq!((b.open.as_str(), b.domain.as_str(), b.scanned), (safe, "acme.example", Some("Microsoft Safe Links")));
+        let b = bar_kept(safe, None, false).unwrap();
+        assert_eq!((b.open.as_str(), b.scanned), ("https://dash.acme.example/q4", None));
+        // Not a company scanner: peeled either way.
+        let g = "https://www.google.com/url?q=https%3A%2F%2Facme.example%2F";
+        assert_eq!(scanned_by(g), None);
+        assert_eq!(bar_kept(g, None, true).unwrap().open, "https://acme.example/");
+        let pp = "https://urldefense.proofpoint.com/v2/url?u=https-3A__acme.example_a&d=x";
+        assert_eq!(scanned_by(pp), Some("Proofpoint URL Defense"));
+        assert_eq!(bar_kept(pp, None, true).unwrap().open, pp);
+        let mc = "https://protect-eu.mimecast.com/s/abc?domain=acme.example";
+        assert_eq!(bar_kept(mc, None, true).unwrap().scanned, Some("Mimecast"));
+    }
 
     #[test]
     fn wrappers_are_peeled() {
