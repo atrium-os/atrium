@@ -293,6 +293,12 @@ pub fn submit(account: &str, blob: &str, sent: &str, identity: &str, from: &str,
     )
 }
 
+/// Store uploaded message `blob` in `mailbox` (an import, mail.md §6.5),
+/// seen: it is old mail.
+pub fn import(account: &str, blob: &str, mailbox: &str) -> Vec<u8> {
+    request(vec![json!(["Email/import", { "accountId": account, "emails": { "m": { "blobId": blob, "mailboxIds": { mailbox: true }, "keywords": { "$seen": true } } } }, "i"])], true)
+}
+
 // ---- answers ----
 
 /// The method answers of one request, by call id: (name, arguments).
@@ -509,6 +515,16 @@ pub fn submitted(a: &Answers) -> Result<String> {
         return err("not sent");
     }
     Ok(id)
+}
+
+/// The answer to [`import`]: the stored message's id, or why not.
+pub fn imported(a: &Answers) -> Result<String> {
+    let i = a.of("i", "Email/import")?;
+    if let Some(e) = i.get("notCreated").and_then(|n| n.get("m")) {
+        return err(format!("not stored: {}", e.get("type").and_then(Value::as_str).unwrap_or("?").chars().take(64).collect::<String>()));
+    }
+    let id = i.get("created").and_then(|c| c.get("m")).and_then(Value::as_object).ok_or(Error("not stored".into()))?;
+    need_id(id, "id")
 }
 
 /// The blob id from an upload's answer.

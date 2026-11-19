@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub cells: Vec<Option<Cell>>,
     /// Merged areas, `[r0, c0, r1, c1]` inclusive, cut to the snapshot.
     pub merges: Vec<[u32; 4]>,
+    /// Center Across Selection runs, `[row, c0, c1]` inclusive.
+    pub across: Vec<[u32; 3]>,
 }
 
 fn srgb(c: Color) -> u32 {
@@ -77,9 +79,23 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
     let src = SheetSource::new(doc.clone());
     let mut cells = Vec::with_capacity((rows * cols) as usize);
     let (mut last_r, mut last_c) = (0, 0);
+    let mut across = Vec::new();
     for r in 0..rows {
         for c in 0..cols {
-            let v = src.cell(r, c).filter(|v| !v.text.is_empty() || v.fill.is_some() || v.borders.iter().any(Option::is_some) || v.bar.is_some());
+            let v = src.cell(r, c);
+            // A run, as the grid draws it: the empty cells after this one
+            // that centre across too.
+            if v.as_ref().is_some_and(|v| v.align == CellAlign::Across && !v.text.is_empty() && !v.text.contains('\n')) {
+                let mut b = c;
+                while b + 1 < cols && b - c < pergola::widgets::grid_view::SPILL_COLS && src.merge_at(r, b + 1).is_none() && src.cell(r, b + 1).is_some_and(|w| w.text.is_empty() && w.align == CellAlign::Across) {
+                    b += 1;
+                }
+                if b > c {
+                    across.push([r, c, b]);
+                    last_c = last_c.max(b + 1);
+                }
+            }
+            let v = v.filter(|v| !v.text.is_empty() || v.fill.is_some() || v.borders.iter().any(Option::is_some) || v.bar.is_some());
             if v.is_some() {
                 last_r = last_r.max(r + 1);
                 last_c = last_c.max(c + 1);
@@ -100,20 +116,21 @@ pub fn snapshot(doc: &Rc<RefCell<Doc>>) -> Result<Snapshot, String> {
         .filter(|m| m.r0 < last_r && m.c0 < last_c)
         .map(|m| [m.r0, m.c0, m.r1.min(last_r.saturating_sub(1)), m.c1.min(last_c.saturating_sub(1))])
         .collect();
+    let across: Vec<[u32; 3]> = across.into_iter().filter(|a| a[0] < last_r).collect();
     // Only up to the last cell that shows anything.
     let mut kept = Vec::with_capacity((last_r * last_c) as usize);
     for r in 0..last_r {
         let at = (r * cols) as usize;
         kept.extend(cells[at..at + last_c as usize].iter().cloned());
     }
-    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges })
+    Ok(Snapshot { name, cols: col_px[..last_c as usize].to_vec(), rows: row_px[..last_r as usize].to_vec(), cells: kept, merges, across })
 }
 
 /// The snapshot as PDF on paper `w` × `h` points.
 pub fn pdf(s: &Snapshot, w: f64, h: f64, title: &str) -> Result<Vec<u8>, String> {
     let n = s.cols.len();
     let get = |r: u32, c: u32| s.cells.get(r as usize * n + c as usize).cloned().flatten();
-    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone() };
+    let sheet = Sheet { name: &s.name, cols: s.cols.clone(), rows: s.rows.clone(), cell: &get, gridlines: true, merges: s.merges.clone(), across: s.across.clone() };
     officina_pdf::sheet::print(&sheet, &Setup::paper(w, h), title).map_err(|e| e.to_string())
 }
 
@@ -154,6 +171,25 @@ mod tests {
         // The title reaches D, past the last value (B3).
         assert_eq!((s.rows.len(), s.cols.len()), (3, 4));
         assert_eq!(s.merges, vec![[0, 0, 0, 3]]);
+        assert!(pdf(&s, 595.0, 842.0, "Q3").unwrap().starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn a_title_centred_across_prints_across_its_run() {
+        use officina_grid::addr::Rect;
+        use officina_grid::ops::GridOp;
+        use officina_grid::style::{HAlign, Style};
+        let doc = Rc::new(RefCell::new(Doc::new("Q3")));
+        {
+            let mut d = doc.borrow_mut();
+            d.type_into(0, 0, "Quarter");
+            d.type_into(1, 3, "5");
+            let r = Rect { sheet: 0, r0: 0, c0: 0, r1: 0, c1: 3 };
+            let op = GridOp::restyle(&d.wb, r, |st| Style { h_align: HAlign::CenterAcross, ..st.clone() });
+            d.run("Center Across Selection", vec![op]);
+        }
+        let s = snapshot(&doc).unwrap();
+        assert_eq!(s.across, vec![[0, 0, 3]]);
         assert!(pdf(&s, 595.0, 842.0, "Q3").unwrap().starts_with(b"%PDF"));
     }
 

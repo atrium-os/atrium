@@ -1192,7 +1192,7 @@ impl Sheets {
                     d.run(if moved { "Move Chart" } else { "Size Chart" }, vec![officina_grid::ops::GridOp::Charts(all)]);
                 }
             }
-            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } => {}
+            GridAction::Follow { .. } | GridAction::PressFloat(_) | GridAction::Choose { .. } | GridAction::FillToData(_) => {}
             GridAction::DeleteFloat(key) => {
                 let mut all = d.wb.charts().to_vec();
                 if (key as usize) < all.len() {
@@ -1205,6 +1205,11 @@ impl Sheets {
                 d.type_into(row, col, &text);
             }
             GridAction::Clear(r) => d.clear(r.r0, r.c0, r.r1, r.c1),
+            GridAction::Fill { from, to, copy } => {
+                let rect = |r: CellRange| officina_grid::addr::Rect { sheet: d.sheet, r0: r.r0, c0: r.c0, r1: r.r1, c1: r.c1 };
+                let (from, to) = (rect(from), rect(to));
+                d.fill(from, to, copy);
+            }
             GridAction::ResizeCol { col, width } => d.set_col_width(col, width),
             GridAction::Undo => {
                 d.undo();
@@ -1338,6 +1343,7 @@ impl View for Sheets {
         let rev = self.rev.clone();
         let src = self.source.clone();
         let (cmds, press) = (self.cmds.clone(), self.link_press.clone());
+        let grid = self.grid.clone();
         GridView::new(self.source.clone(), self.scroll.clone(), self.grid.clone(), Self::grid_rect(w, h))
             .on_action(move |a| match a {
                 // Ctrl+click: the cell is selected; follow its link with this click.
@@ -1349,6 +1355,24 @@ impl View for Sheets {
                 GridAction::PressFloat(crate::source::KEY_LIST) | GridAction::Choose { .. } => cmds.lock().unwrap().push(Cmd::Data(crate::data::DataCmd::ChooseFromList)),
                 // A filter column's button: its value list.
                 GridAction::PressFloat(k) if k & crate::source::KEY_FILTER != 0 => cmds.lock().unwrap().push(Cmd::FilterOpen((k & 0xFFFF_FFFF) as u32)),
+                // A double-click on the fill handle: down along the data beside it.
+                GridAction::FillToData(sel) => {
+                    let mut d = doc.borrow_mut();
+                    let from = officina_grid::addr::Rect { sheet: d.sheet, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
+                    match officina_grid::autofill::to_data_end(&d.wb, from) {
+                        Some(to) => {
+                            if d.fill(from, to, false) {
+                                let mut g = grid.get_cloned();
+                                g.anchor = (to.r0, to.c0);
+                                g.cursor = (to.r1, to.c1);
+                                grid.set(g);
+                            }
+                        }
+                        None => d.status = "There's no data beside the selection to fill down along.".into(),
+                    }
+                    drop(d);
+                    rev.set(rev.get().wrapping_add(1));
+                }
                 a => Self::act(&doc, &src, &rev, a),
             })
             .emit(ctx);
@@ -2412,6 +2436,32 @@ mod tests {
         run(Cmd::Valid(ValidCmd::Remove));
         assert!(s.doc.borrow().wb.validations().is_empty());
         assert!(s.doc.borrow_mut().type_into(4, 1, "9"));
+    }
+
+    #[test]
+    fn a_double_click_on_the_fill_handle_fills_down_beside_the_data() {
+        let mut d = Doc::new("f");
+        for r in 0..5 {
+            d.type_into(r, 0, &format!("{}", r + 1));
+        }
+        d.type_into(0, 1, "=A1*2");
+        let s = Sheets::new(d, Mutable::new(ScrollState::default()), Mutable::new(GridState::default()), Mutable::new(Ui::default()), Mutable::new(0), (1200.0, 800.0));
+        let mut g = s.grid.get_cloned();
+        g.select(0, 1);
+        s.grid.set(g);
+        let mut app = App::new(s.clone());
+        app.tick();
+        let handle = app.tree().iter().find_map(|(_, n)| match n { Node::Rect { rect, radius, .. } if *radius == 1.0 && rect.w() == 7.0 && rect.h() == 7.0 => Some(*rect), _ => None }).expect("the fill handle");
+        let at = pergola::geom::Point::new(handle.x() + 4.0, handle.y() + 4.0);
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at });
+            app.handle_event(Event::PointerUp { at });
+            app.tick();
+        }
+        let d = s.doc.borrow();
+        assert_eq!(d.wb.formula_text(officina_grid::CellAddr::new(0, 4, 1)).as_deref(), Some("=A5*2"));
+        assert_eq!(d.wb.formula_text(officina_grid::CellAddr::new(0, 5, 1)), None);
+        assert_eq!(s.grid.get_cloned().selection(), CellRange { r0: 0, c0: 1, r1: 4, c1: 1 });
     }
 
     #[test]

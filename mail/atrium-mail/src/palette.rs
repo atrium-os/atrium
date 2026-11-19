@@ -38,6 +38,19 @@ pub enum Cmd {
     Folder(FolderId),
     View(Lane),
     Saved(u32),
+    Export(Export),
+    /// Import an mbox file into the folder shown (§6.5).
+    Import,
+}
+
+/// What an export covers (§6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Export {
+    /// The folder shown.
+    Folder,
+    /// The search or view's results.
+    Results,
+    Everything,
 }
 
 #[derive(Debug, Clone, PartialEq)]

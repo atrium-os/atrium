@@ -417,6 +417,12 @@ fn main() {
     let (unsub_tx, unsub_done) = mpsc::channel::<(u64, Result<(), String>)>();
     // The picker up for a Save: its embed, and what it saves.
     let mut saving: Option<(limen::proto::EmbedId, u64, atrium_mail::files::File)> = None;
+    // The picker up for an export (§6.5): its embed, and what goes in the file.
+    let mut exporting: Option<(limen::proto::EmbedId, atrium_mail::view::ExportAsk)> = None;
+    // The picker up for an import (§6.5): its embed, the folder and its
+    // name; what came of it, from its thread (then mail syncs).
+    let mut importing: Option<(limen::proto::EmbedId, mail_store::FolderId, String)> = None;
+    let (imported_tx, imported) = mpsc::channel::<String>();
     // A message the viewer couldn't be asked for, not asked again.
     let mut failed: Option<u64> = None;
     // Printing a message: what prints, its PDF being made (and whether
@@ -741,7 +747,7 @@ fn main() {
                     }
                     Err(e) => mail.file_note(format!("Couldn't open {}: {e}", ask.file.name)),
                 },
-                FileAct::Save if saving.is_some() => mail.file_note("Already saving a file".into()),
+                FileAct::Save if saving.is_some() || exporting.is_some() => mail.file_note("Already saving a file".into()),
                 FileAct::Save => match (&embeds, win.embed_token()) {
                     (Some(e), Some(token)) => {
                         let origin = engine.origin(ask.msg).unwrap_or_else(|_| "mail".into());
@@ -759,8 +765,46 @@ fn main() {
                 },
             }
         }
+        if let Some((folder, name)) = mail.take_import() {
+            match (&embeds, win.embed_token()) {
+                _ if print_ask.is_some() || printing.is_some() || saving.is_some() || exporting.is_some() || importing.is_some() => mail.file_note("Already printing or saving".into()),
+                (Some(e), Some(token)) => {
+                    let filter = limen::picker::Filter { title: format!("Import mail into {name}"), ..limen::picker::Filter::file() };
+                    let asked = e.borrow_mut().request("picker", token, atrium_mail::view::PICK_SLOT);
+                    match asked.and_then(|id| e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map(|_| id)) {
+                        Ok(id) => {
+                            importing = Some((id, folder, name));
+                            mail.set_saving(true);
+                        }
+                        Err(err) => mail.file_note(format!("The picker didn't open: {err:?}")),
+                    }
+                }
+                _ => mail.file_note("Importing needs the system picker, which isn't running".into()),
+            }
+        }
+        while let Ok(note) = imported.try_recv() {
+            mail.file_note(note);
+            let _ = syncer.wake.send(atrium_mail::accounts::Wake::Now);
+        }
+        if let Some(ask) = mail.take_export() {
+            match (&embeds, win.embed_token()) {
+                _ if print_ask.is_some() || printing.is_some() || saving.is_some() || exporting.is_some() || importing.is_some() => mail.file_note("Already printing or saving".into()),
+                (Some(e), Some(token)) => {
+                    let filter = limen::picker::Filter::save(&ask.name, "mail");
+                    let asked = e.borrow_mut().request("picker", token, atrium_mail::view::PICK_SLOT);
+                    match asked.and_then(|id| e.borrow_mut().send(id, limen::picker::ToChild::Open(filter).encode()).map(|_| id)) {
+                        Ok(id) => {
+                            exporting = Some((id, ask));
+                            mail.set_saving(true);
+                        }
+                        Err(err) => mail.file_note(format!("The picker didn't open: {err:?}")),
+                    }
+                }
+                _ => mail.file_note("Exporting needs the system picker, which isn't running".into()),
+            }
+        }
         if let Some(ask) = mail.take_print() {
-            if print_ask.is_some() || saving.is_some() {
+            if print_ask.is_some() || saving.is_some() || exporting.is_some() {
                 mail.file_note("Already printing or saving".into());
             } else if embeds.is_none() || win.embed_token().is_none() {
                 mail.file_note("Printing needs Limen, which isn't running".into());
@@ -915,6 +959,93 @@ fn main() {
                             cw.attach = None;
                             cw.c.set_attaching(false);
                         }
+                    }
+                    // The file picked for an import: read it on a thread,
+                    // each message checked in a parse jail and queued to go up.
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if importing.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let fd = embeds.borrow_mut().take_fd();
+                        let (_, folder, fname) = importing.clone().unwrap();
+                        match (limen::picker::ToParent::decode(&bytes), fd) {
+                            (Some(limen::picker::ToParent::File { name, .. }), Some(fd)) => {
+                                let (store, parser) = (engine.store.clone(), engine.parser.clone());
+                                let tx = imported_tx.clone();
+                                mail.file_note(format!("Reading {name}…"));
+                                std::thread::spawn(move || {
+                                    let r = store.folder(folder).map_err(|e| e.to_string()).and_then(|f| {
+                                        mail_engine::import::import(&store, &parser, f.account, folder, std::io::BufReader::new(File::from(fd))).map_err(|e| e.to_string())
+                                    });
+                                    let _ = tx.send(match r {
+                                        Ok(x) => x.line(&fname),
+                                        Err(why) => format!("Couldn't import {name}: {why}"),
+                                    });
+                                });
+                            }
+                            _ => eprintln!("atrium-mail: an odd message with a descriptor from the picker"),
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if importing.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let end = match limen::picker::ToParent::decode(&bytes) {
+                            Some(limen::picker::ToParent::Done { .. } | limen::picker::ToParent::Cancelled) => true,
+                            Some(limen::picker::ToParent::Failed { why }) => {
+                                mail.file_note(format!("The picker couldn't open it: {why}"));
+                                true
+                            }
+                            _ => false,
+                        };
+                        if end {
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                            importing = None;
+                            mail.set_saving(false);
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if importing.as_ref().is_some_and(|s| s.0 == embed) => {
+                        importing = None;
+                        mail.set_saving(false);
+                    }
+                    // The picker made the export's file: write the mbox on a
+                    // thread (all mail can be large), and say when it's done.
+                    Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if exporting.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let fd = embeds.borrow_mut().take_fd();
+                        let what = exporting.as_ref().unwrap().1.what.clone();
+                        match (limen::picker::ToParent::decode(&bytes), fd) {
+                            (Some(limen::picker::ToParent::File { name, write: true, .. }), Some(fd)) => {
+                                let store = engine.store.clone();
+                                let tx = file_done_tx.clone();
+                                mail.file_note(format!("Exporting to {name}…"));
+                                std::thread::spawn(move || {
+                                    let file = File::from(fd);
+                                    let r = mail_engine::export::messages(&store, &what).map_err(|e| e.to_string()).and_then(|ids| {
+                                        let mut out = std::io::BufWriter::new(&file);
+                                        mail_engine::export::mbox(&store, &ids, &mut out).map_err(|e| e.to_string())
+                                    });
+                                    let r = r.and_then(|x| file.sync_all().map(|_| x).map_err(|e| e.to_string()));
+                                    let _ = tx.send(match r {
+                                        Ok(x) => x.line(&name),
+                                        Err(why) => format!("Couldn't export to {name}: {why}"),
+                                    });
+                                });
+                            }
+                            _ => eprintln!("atrium-mail: an odd message with a descriptor from the picker"),
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::Message { embed, bytes })) if exporting.as_ref().is_some_and(|s| s.0 == embed) => {
+                        let end = match limen::picker::ToParent::decode(&bytes) {
+                            Some(limen::picker::ToParent::Done { .. } | limen::picker::ToParent::Cancelled) => true,
+                            Some(limen::picker::ToParent::Failed { why }) => {
+                                mail.file_note(format!("The picker couldn't save it: {why}"));
+                                true
+                            }
+                            _ => false,
+                        };
+                        if end {
+                            let _ = embeds.borrow_mut().detach_embed(embed);
+                            exporting = None;
+                            mail.set_saving(false);
+                        }
+                    }
+                    Ok(Some(limen::proto::ParentEvent::ChildLost { embed })) if exporting.as_ref().is_some_and(|s| s.0 == embed) => {
+                        exporting = None;
+                        mail.set_saving(false);
                     }
                     // The picker made the new file: write the attachment into it.
                     Ok(Some(limen::proto::ParentEvent::MessageFd { embed, bytes })) if saving.as_ref().is_some_and(|s| s.0 == embed) => {

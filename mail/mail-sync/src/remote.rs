@@ -65,6 +65,9 @@ pub enum Call {
     Search { words: Vec<String>, limit: u32 },
     /// The same on a JMAP account.
     JmapSearch { text: String, limit: u32 },
+    /// Store a message in a folder, seen (an import, §6.5); answers
+    /// [`Reply::JmapSent`] with its id.
+    JmapImport { folder: String, message: Vec<u8> },
 }
 
 /// What [`Error`] was, across the wire.
@@ -458,7 +461,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 write_frame(&mut chan.borrow_mut().w, REPLY, &enc(&reply)?)?;
                 continue;
             }
-            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } => {
+            Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. } => {
                 let reply = match (next, jmap.as_mut()) {
                     (Call::JmapWatch, Some(c)) => {
                         let mut a = RemoteSink(chan.clone());
@@ -468,6 +471,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                     (_, None) => Reply::Failed(Kind::Protocol, "not connected".into()),
                     (Call::JmapSync, Some(c)) => c.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     (Call::JmapSend { message, from, rcpts, send_at }, Some(c)) => Reply::JmapSent(c.send(&message, &from, &rcpts, send_at).map_err(|e| e.0)),
+                    (Call::JmapImport { folder, message }, Some(c)) => Reply::JmapSent(c.import(&folder, &message).map_err(|e| e.0)),
                     (Call::JmapSearch { text, limit }, Some(c)) => c.search_server(&text, &mut RemoteSink(chan.clone()), (limit as usize).min(crate::SERVER_HITS)).map(|n| Reply::Found(n as u32)).unwrap_or_else(|e| Reply::Failed(Kind::Protocol, e.0)),
                     _ => unreachable!(),
                 };
@@ -496,7 +500,7 @@ pub fn serve<R: Read, W: Write>(r: R, w: W) -> io::Result<()> {
                 Reply::Submitted(crate::submit::submit(Tunnel(chan.clone()), &crate::submit::Outgoing { from: &from, rcpts: &rcpts, bytes: &bytes, hold_for }))
             }
             (Call::Start, Some(_)) | (Call::Submit { .. }, Some(_)) => Reply::Failed(Kind::Protocol, "already started".into()),
-            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. }, _) => unreachable!(),
+            (Call::JmapConnect { .. } | Call::JmapSync | Call::JmapSend { .. } | Call::JmapWatch | Call::JmapSearch { .. } | Call::JmapImport { .. }, _) => unreachable!(),
             (_, None) => Reply::Failed(Kind::Protocol, "not started".into()),
             (Call::Sync, Some(s)) => s.sync(&mut RemoteSink(chan.clone())).map(Reply::Synced).unwrap_or_else(|e| fail(&e)),
             (Call::Append { folder, flags, message }, Some(s)) => {
@@ -853,5 +857,14 @@ impl<I: Write + AsFd, O: Read + AsFd> crate::jmap::Jmap for Remote<I, O> {
     }
     fn can_hold(&self, secs: i64) -> bool {
         secs > 0 && (secs as u64) <= self.max_delayed_send
+    }
+    fn import(&mut self, folder: &str, message: &[u8]) -> crate::jmap::Result<String> {
+        let c = Call::JmapImport { folder: folder.into(), message: message.to_vec() };
+        match self.call(&c, None, QUIET) {
+            Ok(Reply::JmapSent(r)) => r.map_err(crate::jmap::Error),
+            Ok(Reply::Failed(_, t)) => Err(crate::jmap::Error(t)),
+            Ok(other) => Err(crate::jmap::Error(format!("the worker answered {other:?}"))),
+            Err(e) => Err(crate::jmap::Error(format!("the sync worker: {e}"))),
+        }
     }
 }

@@ -182,6 +182,9 @@ impl<I: std::io::Write + std::os::fd::AsFd, O: std::io::Read + std::os::fd::AsFd
     fn search(&mut self, text: &str, sink: &mut dyn mail_sync::Sink, limit: usize) -> mail_sync::jmap::Result<usize> {
         mail_sync::jmap::Jmap::search(&mut self.remote, text, sink, limit)
     }
+    fn import(&mut self, folder: &str, message: &[u8]) -> mail_sync::jmap::Result<String> {
+        mail_sync::jmap::Jmap::import(&mut self.remote, folder, message)
+    }
 }
 
 /// Send one message over a submission `courier`, its replies read in the
@@ -285,6 +288,10 @@ impl Engine {
         let mut pass = Pass::default();
         pass.report = s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
         self.copy_drafts(account, s.as_mut(), DRAFT_REST).map_err(|e| e.to_string())?;
+        // Imported mail (§6.5) goes up; the next sync brings it in.
+        if self.upload_imports(account, &mut |folder, m| s.append(folder, &["\\Seen"], m).map(|_| ()).map_err(|e| e.to_string())).map_err(|e| e.to_string())? > 0 {
+            s.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
+        }
         let mut copies = Vec::new();
         if let Some(out) = cfg.outgoing_item {
             for (id, o) in self.due_sends().map_err(|e| e.to_string())? {
@@ -312,6 +319,9 @@ impl Engine {
         let item = cfg.incoming_item.ok_or("no sign-in for this account")?;
         let mut client = open_jmap(net.jmap(session, &item)?, session)?;
         let mut pass = Pass { report: client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?, ..Default::default() };
+        if self.upload_imports(account, &mut |folder, m| client.import(folder, m).map(|_| ()).map_err(|e| e.0)).map_err(|e| e.to_string())? > 0 {
+            client.sync(&mut self.sink(account)).map_err(|e| e.to_string())?;
+        }
         for (id, o) in self.due_sends().map_err(|e| e.to_string())? {
             if o.account != account {
                 continue;

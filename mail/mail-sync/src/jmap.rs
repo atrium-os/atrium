@@ -47,6 +47,8 @@ pub trait Jmap {
     fn watch(&mut self, on: &mut dyn FnMut(bool) -> bool) -> Result<Pushed>;
     /// Search the server for `text` (§11.2); see [`Client::search_server`].
     fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize>;
+    /// Store `message` in `folder`, seen (an import, §6.5); its id.
+    fn import(&mut self, folder: &str, message: &[u8]) -> Result<String>;
 }
 
 impl<H: Http> Jmap for Client<H> {
@@ -58,6 +60,9 @@ impl<H: Http> Jmap for Client<H> {
     }
     fn can_hold(&self, secs: i64) -> bool {
         Client::can_hold(self, secs)
+    }
+    fn import(&mut self, folder: &str, message: &[u8]) -> Result<String> {
+        Client::import(self, folder, message)
     }
     fn search(&mut self, text: &str, sink: &mut dyn Sink, limit: usize) -> Result<usize> {
         Client::search_server(self, text, sink, limit)
@@ -467,6 +472,24 @@ impl<H: Http> Client<H> {
         let hold = send_at.filter(|_| self.session.max_delayed_send > 0).map(jmap::utc_string);
         let a = self.call(jmap::submit(&self.session.account, &blob, &sent, &identity.id, from, rcpts, hold.as_deref()))?;
         Ok(jmap::submitted(&a)?)
+    }
+
+    /// Store `message` in `folder` (a path as [`Client::folders`] names it),
+    /// seen: an import (§6.5). The new message's id.
+    pub fn import(&mut self, folder: &str, message: &[u8]) -> Result<String> {
+        if self.session.max_size_upload > 0 && message.len() as u64 > self.session.max_size_upload {
+            return Err(Error("the message is larger than the server takes".into()));
+        }
+        if self.mailboxes.is_empty() {
+            let a = self.call(jmap::get_mailboxes(&self.session.account))?;
+            self.mailboxes = jmap::mailboxes(&a)?.0;
+        }
+        let mailbox = self.id_of(folder).ok_or_else(|| Error(format!("the server has no folder {folder}")))?;
+        let url = self.session.upload();
+        let r = self.h.post(&url, "message/rfc822", message, 64 << 10).map_err(Error)?;
+        let blob = jmap::uploaded(&r)?;
+        let a = self.call(jmap::import(&self.session.account, &blob, &mailbox))?;
+        Ok(jmap::imported(&a)?)
     }
 
     /// Whether the server can hold a send until `t` (seconds from now).
