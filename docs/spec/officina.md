@@ -3764,7 +3764,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - It reads up to 8 columns on each side and fills up to 100,000 rows. A first row the examples don't explain is taken as a header and left alone.
   - When no program explains the examples it says so rather than guessing. It never writes over a cell that holds something.
   - Gates: officina-grid `programs_are_learnt_from_examples`, `a_column_is_filled_by_example`; atrium-sheets `flash_fill_fills_a_column_by_its_examples`.
-- **Not yet:** custom lists, and Flash Fill from character positions (the first three letters, say) or with numbers reformatted.
+- **Flash Fill by position** (2026-11-19): programs also take the first characters of a word (up to 7) and the first or last characters of a whole cell (up to 8): `Lovelace` → `LOV`, `AB12345` → `2345`.
+- **Custom lists** (2026-11-19; Data ▸ Fill: Keep Selection as a List, Fill: Forget Custom Lists): a row or column of 2 to 256 different entries becomes a list. A fill from any of its entries goes on through the rest in turn, before the day and month names are tried, and in the typed entry's case. Up to 64 lists, kept for the person beside Sheets' autosaves (`atrium-sheets/lists`, one list a line, entries split by tabs; `atrium_sheets::lists`, `autofill::set_custom_lists`). A new list replaces one sharing an entry with it. Gates: officina-grid `custom_lists_fill_in_turn`; atrium-sheets `a_selection_kept_as_a_list_fills_on`.
+- **Not yet:** Flash Fill with numbers or dates reformatted, and a settings page listing custom lists one by one.
 - **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`, which checks `Mode::Count` too); atrium-sheets `a_fill_can_be_done_again_another_way`; pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ### 16.88 Copy, cut and paste within Sheets (2026-11-19)

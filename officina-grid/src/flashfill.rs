@@ -40,8 +40,24 @@ enum Piece {
     Whole(usize, Case),
     /// Word `.1` of source cell `.0` (from the end when negative: -1 last).
     Word(usize, i32, Case),
-    /// The first letter of that word.
-    Initial(usize, i32, Case),
+    /// The first `.2` characters of that word (1: its initial).
+    Prefix(usize, i32, usize, Case),
+    /// The first or last `.1` characters of source cell `.0`.
+    Left(usize, usize, Case),
+    Right(usize, usize, Case),
+}
+
+/// Characters taken from the start or end of a word or cell, at most.
+const MAX_CHARS: usize = 8;
+
+fn left(s: &str, n: usize) -> Option<&str> {
+    let end = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
+    (s.chars().count() >= n).then(|| &s[..end])
+}
+
+fn right(s: &str, n: usize) -> Option<&str> {
+    let count = s.chars().count();
+    (count >= n).then(|| &s[s.char_indices().nth(count - n).map_or(s.len(), |(i, _)| i)..])
 }
 
 /// The words of `s`: byte spans of its runs of letters and digits.
@@ -97,7 +113,9 @@ fn eval(p: &Piece, srcs: &[String]) -> Option<String> {
         Piece::Text(t) => Some(t.clone()),
         Piece::Whole(c, k) => srcs.get(*c).filter(|s| !s.is_empty()).map(|s| cased(s, *k)),
         Piece::Word(c, i, k) => word(srcs.get(*c)?, *i).map(|w| cased(w, *k)),
-        Piece::Initial(c, i, k) => word(srcs.get(*c)?, *i).and_then(|w| w.chars().next()).map(|ch| cased(&ch.to_string(), *k)),
+        Piece::Prefix(c, i, n, k) => word(srcs.get(*c)?, *i).and_then(|w| left(w, *n)).map(|p| cased(p, *k)),
+        Piece::Left(c, n, k) => left(srcs.get(*c)?, *n).filter(|s| !s.is_empty()).map(|p| cased(p, *k)),
+        Piece::Right(c, n, k) => right(srcs.get(*c)?, *n).filter(|s| !s.is_empty()).map(|p| cased(p, *k)),
     }
 }
 
@@ -130,8 +148,16 @@ fn candidates(srcs: &[String], out: &str, at: usize) -> Vec<Piece> {
                 let (s, e) = if near_start { (1, 2) } else { (2, 1) };
                 pieces.push((s, Piece::Word(c, i, k)));
                 pieces.push((e, Piece::Word(c, i - n, k)));
-                pieces.push((s + 2, Piece::Initial(c, i, k)));
-                pieces.push((e + 2, Piece::Initial(c, i - n, k)));
+                for m in 1..MAX_CHARS {
+                    pieces.push((s + 2, Piece::Prefix(c, i, m, k)));
+                    pieces.push((e + 2, Piece::Prefix(c, i - n, m, k)));
+                }
+            }
+            // Fixed character positions of the whole cell: last, as words
+            // explain most outputs better.
+            for m in 1..=MAX_CHARS {
+                pieces.push((5, Piece::Left(c, m, k)));
+                pieces.push((6, Piece::Right(c, m, k)));
             }
         }
         for (rank, p) in pieces {
@@ -293,6 +319,12 @@ mod tests {
         // A part of an e-mail address.
         let p = learn(&[ex(&["ada@example.org"], "ada"), ex(&["alan.t@example.com"], "alan")]).unwrap();
         assert_eq!(run(&p, &["grace@navy.mil".into()]).as_deref(), Some("grace"));
+        // The first three letters of the last name, upper case.
+        let p = learn(&[ex(&["Ada Lovelace"], "LOV"), ex(&["Alan Turing"], "TUR")]).unwrap();
+        assert_eq!(run(&p, &["Grace Hopper".into()]).as_deref(), Some("HOP"));
+        // The last four characters of a code.
+        let p = learn(&[ex(&["AB12345"], "2345"), ex(&["XY98761"], "8761")]).unwrap();
+        assert_eq!(run(&p, &["QQ55501".into()]).as_deref(), Some("5501"));
         // Examples that disagree: nothing learnt.
         assert!(learn(&[ex(&["a b"], "a"), ex(&["c d"], "x")]).is_none());
     }
