@@ -26,6 +26,7 @@ Last updated: 2026-11-19.
 | Package catalog | [atrium-pkg-registry.md](spec/atrium-pkg-registry.md) | key ceremony deferred | signing-key ceremony | YubiKeys (Shankar is buying them) |
 | Security-key unlock | [sigillum.md](spec/sigillum.md) | blocked | real-key runs (`scripts/sigillum-real-key-*.sh`) | hardware |
 | GPU driver on silicon | [atrium-gpu-amd-design.md](spec/atrium-gpu-amd-design.md) | stage 3 done on the R9700 | GPU power P2, then stage 4 (GMC, IH, MES, first dispatch) | hardware time on the R9700 box |
+| TPM and secure boot | [tpm-boot.md](spec/tpm-boot.md) | proposed 2026-11-18, nothing built | P0: swtpm in `run-vm.sh` and the cloud VM, `atrium-tpm probe`, probe the R9700 box | Shankar's answers to the spec's §10 decisions |
 
 ## Recently finished
 
