@@ -495,6 +495,11 @@ pub fn persona_of(uid: u32) -> Option<(String, [u8; 3])> {
     Some((name, colour))
 }
 
+/// The person `uid` belongs to, from the launch registry.
+pub fn person_of(uid: u32) -> Option<String> {
+    with_registry(uid, |r| Some(r.resolve(uid)?.0.to_string()))
+}
+
 /// The colour of `user`'s persona `name`, from the file portcullisd keeps
 /// (`/var/run/atrium/persona-colours`, `<user> <persona> <colour>` lines;
 /// `FRESCOD_PERSONA_COLOURS` overrides), read again every 2 s.

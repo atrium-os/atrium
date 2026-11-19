@@ -47,6 +47,7 @@ mod socket_server;
 mod split;
 mod gpu_app;
 mod chrome;
+mod route;
 mod screen;
 mod hdr;
 mod heads;
@@ -237,6 +238,7 @@ fn main() -> std::io::Result<()> {
     let redraw = redraw::RedrawSignal::new();
     activation::set_redraw(redraw.clone());
     lock::watch(comp.clone(), redraw.clone());
+    route::watch(redraw.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
     if renderer.takes_pixels() {
@@ -1336,6 +1338,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
     lock::watch(comp.clone(), redraw2.clone());
+    route::watch(redraw2.clone());
     /* Video layers (fresco-video.md): composed as pixels, so only by
      * the compute renderer; with another, creating one is refused. */
     if renderer.takes_pixels() {
@@ -1621,8 +1624,13 @@ fn render_one_frame(
                 out.push(chrome::Sheet { rect: r, app, dev: true, persona: None });
             } else if let Some((name, colour)) = chrome::persona_of(uid) {
                 /* A named persona's window (personas.md §7): framed in its
-                 * colour and tagged with its name, from the registry. */
-                out.push(chrome::Sheet { rect: r, app: name, dev: false, persona: Some(colour) });
+                 * colour and tagged with its name, from the registry; with
+                 * its VPN's route (vpn.md §7.4), amber when that is down. */
+                let (tag, colour) = match route::route(chrome::person_of(uid).as_deref(), Some(&name)) {
+                    Some(r) => (r.label(&name), if r.warns() { route::DOWN_COLOUR } else { colour }),
+                    None => (name, colour),
+                };
+                out.push(chrome::Sheet { rect: r, app: tag, dev: false, persona: Some(colour) });
             }
         }
         out
@@ -1680,12 +1688,26 @@ fn render_one_frame(
         let chip: Option<(String, [u8; 3])> = {
             let c = comp.lock().unwrap();
             let owner = |id: u16| c.windows.get(&id).map(|w| w.owner_uid);
-            let mine = focus.and_then(|f| owner(f as u16)).and_then(chrome::persona_of)
-                .or_else(|| focus_parent.and_then(owner).and_then(chrome::persona_of));
-            mine.or_else(|| {
-                let any = rects.iter().any(|&(id, _)| u16::try_from(id).ok().and_then(owner).is_some_and(|u| chrome::persona_of(u).is_some()));
-                (any && focus.is_some()).then(|| ("personal".to_string(), [0x9c, 0xa3, 0xaf]))
-            })
+            let named = |u: u32| chrome::persona_of(u).map(|p| (u, p));
+            let mine = focus.and_then(|f| owner(f as u16)).and_then(named)
+                .or_else(|| focus_parent.and_then(owner).and_then(named));
+            /* With the route (vpn.md §7.4): `work - via acme`, amber when
+             * the persona's VPN is down. */
+            let with_route = |name: String, colour: [u8; 3], r: Option<route::Route>| match r {
+                Some(r) => (r.label(&name), if r.warns() { route::DOWN_COLOUR } else { colour }),
+                None => (name, colour),
+            };
+            match mine {
+                Some((u, (name, colour))) => {
+                    let r = route::route(chrome::person_of(u).as_deref(), Some(&name));
+                    Some(with_route(name, colour, r))
+                }
+                None => {
+                    let any = rects.iter().any(|&(id, _)| u16::try_from(id).ok().and_then(owner).is_some_and(|u| chrome::persona_of(u).is_some()));
+                    ((any || route::any_vpn()) && focus.is_some())
+                        .then(|| with_route("personal".to_string(), [0x9c, 0xa3, 0xaf], route::route(None, None)))
+                }
+            }
         };
         let mut c = chrome::build_with(px, screen_w, focus, origin, note.as_deref(), &rects, &slots, &covers, &hosted, &islands, chip.as_ref().map(|(n, c)| (n.as_str(), *c)));
         chrome::sheet_frames(&mut c, px, &sheets, px.strip());

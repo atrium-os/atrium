@@ -55,6 +55,8 @@ struct Opts {
     arca: String,
     key_uid: u32,
     verbose: bool,
+    /// What the chip shows (vpn.md §7.4): each running tunnel's state.
+    vpn_state: PathBuf,
 }
 
 fn die(s: &str) -> ! {
@@ -71,6 +73,7 @@ fn opts(mut a: impl Iterator<Item = String>) -> Opts {
         arca: "/atrium/sockets/arca/arcad.sock".into(),
         key_uid: KEY_UID,
         verbose: false,
+        vpn_state: "/var/run/atrium/vpn-state".into(),
     };
     while let Some(k) = a.next() {
         let mut v = || a.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
@@ -82,7 +85,8 @@ fn opts(mut a: impl Iterator<Item = String>) -> Opts {
             "--jaild" => o.jaild = v(),
             "--arca" => o.arca = v(),
             "--key-uid" => o.key_uid = v().parse().unwrap_or_else(|_| die("--key-uid")),
-            _ => die("usage: atrium-cryptad [-v] [--sock P] [--state DIR] [--net-sock P] [--jaild P] [--arca P] [--key-uid N] | ctl VERB [k=v ...] | --arca-key"),
+            "--vpn-state" => o.vpn_state = v().into(),
+            _ => die("usage: atrium-cryptad [-v] [--sock P] [--state DIR] [--net-sock P] [--jaild P] [--arca P] [--key-uid N] [--vpn-state P] | ctl VERB [k=v ...] | --arca-key"),
         }
     }
     o
@@ -123,6 +127,8 @@ struct D {
     runs: Vec<Run>,
     /// Engine uids whose jails still need taking apart.
     janitor: Vec<u32>,
+    /// The `vpn-state` text last written.
+    shown: Option<String>,
 }
 
 fn hex32(l: &Line, k: &str) -> Option<[u8; 32]> {
@@ -470,6 +476,37 @@ impl D {
         }
         #[cfg(target_os = "freebsd")]
         self.janitor.retain(|&u| !jail::try_teardown(u));
+        self.publish_state();
+    }
+
+    /// `vpn-state` (vpn.md §7.4), world-readable, for frescod's chip: one
+    /// `<profile> up|connecting machine|persona` line per running tunnel; a
+    /// profile with no line is down. Written only when it changes.
+    fn publish_state(&mut self) {
+        let text: String = self
+            .runs
+            .iter()
+            .map(|r| format!("{} {} {}\n", r.p.name, if r.handshake { "up" } else { "connecting" }, if r.p.scoped { "persona" } else { "machine" }))
+            .collect();
+        if self.shown.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let p = &self.o.vpn_state;
+        let tmp = p.with_extension("tmp");
+        let w = (|| {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Some(d) = p.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o644).open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            std::fs::rename(&tmp, p)
+        })();
+        match w {
+            Ok(()) => self.shown = Some(text),
+            Err(e) => eprintln!("atrium-cryptad: {}: {e}", p.display()),
+        }
     }
 }
 
@@ -550,7 +587,7 @@ fn daemon(o: Opts) {
     }
     let keys = key::Keys::start(o.key_uid, &o.arca).unwrap_or_else(|e| die(&format!("key helper: {e}")));
     let listener = listen(&o.sock);
-    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new() };
+    let mut d = D { o, keys, net: None, runs: Vec::new(), janitor: Vec::new(), shown: None };
     #[cfg(target_os = "freebsd")]
     {
         d.janitor = jail::sweep(&d.o.jaild);

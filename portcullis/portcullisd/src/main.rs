@@ -243,6 +243,11 @@ fn publish_colours(user: &str, policy: &Policy) {
     if let Err(e) = portcullisd::persona_colours::publish(user, &named) {
         eprintln!("portcullisd: persona colours for {user} not written: {e}");
     }
+    // And each persona's VPN, for the route in the chip (vpn.md §7.4).
+    let routes: Vec<(String, String)> = policy.personas.iter().filter_map(|(n, d)| Some((n.clone(), d.vpn.clone()?))).collect();
+    if let Err(e) = portcullisd::persona_colours::publish_routes(user, &routes) {
+        eprintln!("portcullisd: persona routes for {user} not written: {e}");
+    }
 }
 
 // ── peer credential lookup (SO_PEERCRED equivalent on FreeBSD) ───

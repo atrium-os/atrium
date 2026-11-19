@@ -235,6 +235,18 @@ opifex install \$O >/dev/null
 EOS
 V "su -m alice -c 'portcullis policy grant $WIN' >/dev/null 2>&1"
 check "frescod's colours: alice's Work is blue" "alice work blue" "$(V "cat /var/run/atrium/persona-colours" | grep '^alice ')"
+# Work's VPN (vpn.md §7.4, V2b): in her policy, then a fresh portcullisd,
+# which publishes it beside the colours. The tunnel's state is written here
+# as cryptad writes it; the V2 gate checks the states themselves.
+V "sh -s" <<EOS
+P=/var/db/atrium/alice/policy.toml
+grep -q '^vpn = "acme"' \$P || { awk '{print} /^\[personas.work\]\$/{print "vpn = \\"acme\\""}' \$P > \$P.new && mv \$P.new \$P; }
+pkill -x portcullisd; sleep 1; rm -f $PSOCK
+daemon -f -o $LOG /usr/local/bin/portcullisd --socket $PSOCK
+sleep 3; chmod 666 $PSOCK; printf 'acme up persona\\n' > /var/run/atrium/vpn-state
+su -m alice -c 'portcullis personas $PROBE' >/dev/null 2>&1
+EOS
+check "portcullisd publishes Work's VPN" "alice work acme" "$(V "cat /var/run/atrium/persona-vpn" | grep '^alice ')"
 shot() { V "cp $B/screen.png $B/s.png 2>/dev/null || cp $B/screen $B/s.png"; scp -q $K -P 2222 root@localhost:$B/s.png "$OUT/$1.png" 2>/dev/null && echo "  screenshot $OUT/$1.png"; }
 px() { python3 -c "from PIL import Image; im=Image.open('$OUT/$1.png').convert('RGB'); print('%02x%02x%02x' % im.getpixel(($2,$3)))"; }
 V "daemon -f -o $B/win-w.log su -m alice -c 'portcullis launch --no-prompt --persona work $WIN'"
@@ -242,11 +254,20 @@ i=0; while [ $i -lt 90 ] && ! V "grep -q 'up (pid' $B/win-w.log"; do sleep 2; i=
 sleep 10; shot frame-work
 check "the Work window's bottom edge is Work's blue" "2563eb" "$(px frame-work 320 401)"
 check "and its right edge" "2563eb" "$(px frame-work 641 200)"
+# The window's persona tag (left of its text) with the route: up, then down
+# (amber), then connecting.
+check "VPN up: Work's tag is Work's blue (work - via acme)" "2563eb" "$(px frame-work 1 410)"
+V "rm -f /var/run/atrium/vpn-state"; sleep 4; shot route-down
+check "VPN down: Work's tag is amber (work - acme down: no network)" "f59e0b" "$(px route-down 1 410)"
+V "printf 'acme connecting persona\\n' > /var/run/atrium/vpn-state"; sleep 4; shot route-connecting
+check "connecting: Work's blue (work - connecting)" "2563eb" "$(px route-connecting 1 410)"
+V "printf 'acme up persona\\n' > /var/run/atrium/vpn-state"
 V "pkill -f 'bin/personawin'"; sleep 6
 V "daemon -f -o $B/win-p.log su -m alice -c 'portcullis launch --no-prompt $WIN'"
 i=0; while [ $i -lt 90 ] && ! V "grep -q 'up (pid' $B/win-p.log"; do sleep 2; i=$((i+2)); done
 sleep 10; shot frame-personal
 [ "$(px frame-personal 320 401)" != "2563eb" ] && ok "the Personal window has no frame" || bad "Personal framed blue"
+V "rm -f /var/run/atrium/vpn-state"
 V "pkill -f 'bin/personawin'; opifex uninstall $WIN >/dev/null 2>&1"
 V "pkill -x frescod"
 fi
