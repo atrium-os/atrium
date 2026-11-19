@@ -37,6 +37,7 @@ pub mod private;
 pub mod pgp;
 pub mod dns;
 pub mod contact;
+pub mod export;
 
 use mail_schema::{self as wire, Caps, FromJail, Opened, Summary, ToJail};
 use mail_store::{flag, AccountId, Folder, FolderId, Incoming, OpKind, Role, Store};

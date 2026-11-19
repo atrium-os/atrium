@@ -38,6 +38,17 @@ pub enum Cmd {
     Folder(FolderId),
     View(Lane),
     Saved(u32),
+    Export(Export),
+}
+
+/// What an export covers (§6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Export {
+    /// The folder shown.
+    Folder,
+    /// The search or view's results.
+    Results,
+    Everything,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -247,6 +247,14 @@ pub struct PrintAsk {
     pub text: String,
 }
 
+/// An export (§6.5): what goes in the mbox file, and the name the
+/// picker's Save suggests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportAsk {
+    pub what: mail_engine::export::What,
+    pub name: String,
+}
+
 /// The quick look viewer's slot.
 pub const LOOK_SLOT: pergola::slot::SlotKey = 0x4d41_4c4b;
 
@@ -552,6 +560,8 @@ pub struct Mail {
     asks: Rc<RefCell<Vec<FileAsk>>>,
     /// Print (⌃P) asked for, for the app.
     print: Rc<RefCell<Option<PrintAsk>>>,
+    /// An export asked for (§6.5), for the app's picker.
+    export: Rc<RefCell<Option<ExportAsk>>>,
     /// The search being typed.
     find: Rc<RefCell<pergola::text_edit::TextEdit>>,
     /// One-press unsubscribes for the app to POST through Nuntius.
@@ -1254,6 +1264,44 @@ impl Mail {
         }
         *self.print.borrow_mut() = Some(PrintAsk { msg: m.msg, subject: r.subject.clone(), head, text });
         true
+    }
+
+    /// Export as mbox (§6.5): this folder, the results shown, or all mail.
+    /// The app opens the picker's Save and writes the file.
+    pub fn export(&self, e: crate::palette::Export) {
+        use crate::palette::Export;
+        use mail_engine::export::What;
+        let ui = self.ui.get_cloned();
+        if ui.saving {
+            self.file_note("Finish saving first, then export".into());
+            return;
+        }
+        let ask = match e {
+            Export::Folder => {
+                let Some(f) = ui.folder else { return };
+                let name = ui.places.iter().find(|p| p.folder == f).map(|p| p.label.clone()).unwrap_or_else(|| "Mail".into());
+                ExportAsk { what: What::Folder(f), name: mail_engine::export::file_name(&name) }
+            }
+            Export::Results => {
+                let Some(s) = &ui.search else { return };
+                if s.hits.is_empty() {
+                    return;
+                }
+                let name = match (s.view, s.saved.and_then(|id| ui.saved.iter().find(|p| p.id == id))) {
+                    (Some(v), _) => v.label().to_string(),
+                    (None, Some(p)) => p.name.clone(),
+                    (None, None) => s.query.clone(),
+                };
+                ExportAsk { what: What::Messages(s.hits.iter().map(|h| h.msg).collect()), name: mail_engine::export::file_name(&name) }
+            }
+            Export::Everything => ExportAsk { what: What::Everything, name: "All mail.mbox".into() },
+        };
+        *self.export.borrow_mut() = Some(ask);
+    }
+
+    /// The export asked for, for the app.
+    pub fn take_export(&self) -> Option<ExportAsk> {
+        self.export.borrow_mut().take()
     }
 
     /// The print asked for, for the app.
@@ -2589,6 +2637,14 @@ impl Mail {
                 add("Save filters as a folder".into(), "", Cmd::SaveFilters);
             }
         }
+        if let Some(f) = ui.folder.filter(|_| ui.search.is_none()) {
+            let name = ui.places.iter().find(|p| p.folder == f).map(|p| p.label.clone()).unwrap_or_default();
+            add(format!("Export {name} as mbox"), "", Cmd::Export(crate::palette::Export::Folder));
+        }
+        if ui.search.as_ref().is_some_and(|s| !s.hits.is_empty()) {
+            add("Export these results as mbox".into(), "", Cmd::Export(crate::palette::Export::Results));
+        }
+        add("Export all mail as mbox".into(), "", Cmd::Export(crate::palette::Export::Everything));
         for p in &ui.places {
             let label = match &p.account {
                 Some(a) if ui.places.iter().filter(|x| x.label == p.label).count() > 1 => format!("Go to {} ({a})", p.label),
@@ -2694,6 +2750,7 @@ impl Mail {
                 self.choose_folder(f);
             }
             Cmd::View(lane) => self.show_view(lane),
+            Cmd::Export(e) => self.export(e),
             Cmd::Saved(id) => {
                 let q = self.ui.get_cloned().saved.iter().find(|s| s.id == id).map(|s| s.query.clone());
                 if let Some(q) = q {
@@ -2926,6 +2983,7 @@ impl MailView {
             composes: Rc::default(),
             asks: Rc::default(),
             print: Rc::default(),
+            export: Rc::default(),
             find: Rc::new(RefCell::new(pergola::text_edit::TextEdit::new(""))),
             unsubs: Rc::default(),
             server_ask: Rc::default(),

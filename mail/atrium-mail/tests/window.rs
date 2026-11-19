@@ -1285,6 +1285,32 @@ fn the_command_palette() {
     typed("arch");
     assert!(mail.key(&press(Key::Enter), None));
     assert_eq!(subjects(&mail), ["Two"]);
+
+    // Export (§6.5): this folder, as mbox through the picker's Save.
+    use mail_engine::export::What;
+    let inbox = engine.store.folder_id(account, "INBOX", mail_store::Role::Inbox).unwrap();
+    assert!(mail.key(&ctrl_k, None));
+    typed("export inbox");
+    assert_eq!(mail.palette_shown()[0].label, "Export Inbox as mbox");
+    assert!(mail.key(&press(Key::Enter), None));
+    let ask = mail.take_export().unwrap();
+    assert_eq!((ask.what, ask.name.as_str()), (What::Folder(inbox), "Inbox.mbox"));
+    // A search's results; all mail.
+    mail.search_for("Order", None);
+    assert!(mail.key(&ctrl_k, None));
+    typed("export these");
+    assert!(mail.key(&press(Key::Enter), None));
+    let ask = mail.take_export().unwrap();
+    assert_eq!(ask.name, "Order.mbox");
+    assert!(matches!(ask.what, What::Messages(ref v) if v.len() == 1));
+    assert!(mail.key(&ctrl_k, None));
+    typed("export all");
+    assert!(mail.key(&press(Key::Enter), None));
+    assert_eq!(mail.take_export().unwrap().what, What::Everything);
+    // Not while the picker is up for something else.
+    mail.set_saving(true);
+    mail.export(atrium_mail::palette::Export::Everything);
+    assert!(mail.take_export().is_none());
 }
 
 #[test]
