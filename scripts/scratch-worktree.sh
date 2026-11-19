@@ -21,7 +21,9 @@
 #
 # Cost: Cargo locks the build-dir, so two scratch builds running at the same
 # time may wait for each other ("Blocking waiting for file lock"). The main
-# checkout is NOT affected; it keeps its own target/ dirs.
+# checkout is NOT affected; it keeps its own target/ dirs. For that to hold,
+# <dest>'s parent must not be ~/src, $HOME, or an ancestor of this repo; the
+# script refuses those.
 #
 # Remove scratch worktrees with --remove (git worktree remove, which never
 # follows symlinks), not rm -r.
@@ -50,6 +52,20 @@ case "$PARENT" in
         git -C "$REPO" worktree remove --force "$DEST"
         exit 1 ;;
 esac
+# The config lands in $PARENT/.cargo, and Cargo applies it to every project
+# below $PARENT. A parent that is an ancestor of the main checkout or of $HOME
+# (e.g. ~/src) would route the main checkout and every unrelated project into
+# the shared build-dir; that happened on 2026-11-15 via ~/src/.cargo. Refuse.
+for ANC in "$REPO" "$HOME" "$HOME/src"; do
+    case "$ANC/" in
+        "${PARENT%/}"/*)
+            echo "error: $DEST's parent $PARENT is $ANC or one of its ancestors;" >&2
+            echo "       $PARENT/.cargo/config.toml would apply to everything under it." >&2
+            echo "       Put the worktree one level deeper, e.g. ~/src/bsd-scratch/<name>" >&2
+            git -C "$REPO" worktree remove --force "$DEST"
+            exit 1 ;;
+    esac
+done
 mkdir -p "$PARENT/.cargo" "$SHARED"
 CFG="$PARENT/.cargo/config.toml"
 if [ -f "$CFG" ] && ! grep -q '^build-dir' "$CFG"; then
