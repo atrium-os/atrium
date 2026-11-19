@@ -853,6 +853,7 @@ another origin. An active portal-profile session stays in engine memory.
   report without prompting. Unlocking the key again requires fresh approval
   before sending the changed count. Echo after both refreshes uses the
   same reconnected TLS connection or ESP association.
+  The extended arm64 case passed 30/30 on TLS and 30/30 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
