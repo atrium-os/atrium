@@ -466,3 +466,43 @@ fn an_older_copy_becomes_current_after_verification() {
     k.lock().unwrap().loaded.clear();
     assert_eq!(s.handle_verified(&dispensatord(), volume_op::VK_CURRENT, &b).status, status::DENIED);
 }
+
+#[test]
+fn a_persona_group_key_drops_when_its_person_logs_out() {
+    // tessera-encryption.md §5.4, E4.6: atrium-volumes loads a persona's
+    // group key at login; the store's lock at logout drops it, and only
+    // that person's.
+    let (_d, mut s, k) = setup();
+    let vols = Label::Service("atrium-volumes".into());
+    let mint_group = |s: &mut State, user: &str, group: u64| {
+        let r = s.handle(&vols, volume_op::VK_MINT, &body(|w| {
+            w.str(user);
+            w.str("Personal");
+            w.raw(&UUID);
+            w.u64(group);
+            w.str("Personal folders");
+        }));
+        assert_eq!(r.status, status::OK);
+        r.body.bytes().to_vec()
+    };
+    let a = mint_group(&mut s, "alice", 1);
+    let b = mint_group(&mut s, "bob", 2);
+    let (st, stick) = mint(&mut s, &dispensatord(), "alice", "Personal", [0x77; 16]);
+    assert_eq!(st, status::OK);
+    assert_eq!(k.lock().unwrap().loaded.len(), 3);
+
+    let r = s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice")));
+    assert_eq!(r.status, status::OK);
+    let ids: Vec<Vec<u8>> = k.lock().unwrap().loaded.iter().map(|(i, _)| i.key_id.to_vec()).collect();
+    assert!(!ids.contains(&a), "alice's group key stays loaded after logout");
+    assert!(ids.contains(&b), "bob's group key went with alice's logout");
+    assert!(ids.contains(&stick), "a stick key isn't a group key");
+
+    // Back at login: unlocked again, the key loads again and drops again.
+    let r = s.handle(&Label::Vestibulum, op::V_UNLOCK, &body(|w| { w.str("alice"); w.raw(&[1u8; 32]); }));
+    assert_eq!(r.status, status::OK);
+    assert_eq!(load(&mut s, &vols, "alice", "Personal", &a, UUID, 1), status::OK);
+    assert!(k.lock().unwrap().loaded.iter().any(|(i, _)| i.key_id.to_vec() == a));
+    s.handle(&Label::Vestibulum, op::V_LOCK, &body(|w| w.str("alice")));
+    assert!(!k.lock().unwrap().loaded.iter().any(|(i, _)| i.key_id.to_vec() == a));
+}

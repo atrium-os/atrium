@@ -277,12 +277,16 @@ impl<L: Launcher> Ostiarius<L> {
     /// (back to the login screen). Other humans' sessions stay alive (detached).
     pub fn logout(&mut self) -> Result<(), String> {
         if let Some(active) = self.active_human() {
-            self.lock_secrets(&active);
+            // The person's processes stop first: locking Arca drops their
+            // personas' folder keys (tessera-encryption.md §10, E4.6), and
+            // the kernel flushes those folders as each key goes, so nothing
+            // of theirs should still be writing.
             if let Some(ids) = self.sessions.remove(&active) {
                 for id in ids {
                     let _ = self.launcher.teardown(&id);
                 }
             }
+            self.lock_secrets(&active);
         }
         seat::set_active_at(&self.seat_path, "").map_err(|e| format!("unbind seat: {e}"))?;
         let _ = seat::set_locked_at(&seat::locked_path(&self.seat_path), None);

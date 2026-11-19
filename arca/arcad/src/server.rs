@@ -49,6 +49,11 @@ pub struct State {
     /// The kernel keyring (`/dev/tesserakeys`), opened at start; `None`:
     /// the volume ops answer `UNSUPPORTED`.
     pub keyring: Option<Box<dyn crate::volume::Keyring>>,
+    /// Key-group keys (tessera-encryption.md §5.4, E4.6) loaded for each
+    /// user's personas: dropped when the user's store locks at logout, so
+    /// their folders lock with them. Sticks' keys aren't here: sticks are
+    /// unmounted at the lock screen already (device-assignment.md §4.6).
+    group_keys: HashMap<String, Vec<[u8; 16]>>,
 }
 
 fn system_now() -> u64 {
@@ -134,7 +139,7 @@ impl State {
     pub fn new(dir: PathBuf) -> std::io::Result<State> {
         std::fs::DirBuilder::new().recursive(true).create(&dir)?;
         let audit = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")).ok();
-        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None })
+        Ok(State { dir, kdf_default: KdfParams::NO_TPM, stores: HashMap::new(), audit, handles: Default::default(), tickets: Default::default(), machine: None, jars: Default::default(), clock: system_now, verified: false, keyring: None, group_keys: HashMap::new() })
     }
 
     /// Run a request that answered `NEEDS_VERIFICATION` again, after
@@ -591,6 +596,13 @@ impl State {
         }))
     }
 
+    fn note_group_key(&mut self, user: &str, key_id: [u8; 16]) {
+        let ids = self.group_keys.entry(user.to_string()).or_default();
+        if !ids.contains(&key_id) {
+            ids.push(key_id);
+        }
+    }
+
     fn volume_op(&mut self, name: &str, op: u16, body: &[u8], item: &mut Option<ItemId>) -> Reply {
         use crate::volume::{decode_scope, encode_scope, owner_label, LoadInfo, RECIPIENT, SERVICES, VALUE_LEN};
         let verified = std::mem::take(&mut self.verified);
@@ -698,6 +710,9 @@ impl State {
                     }
                     return reply(status::INTERNAL);
                 }
+                if group != 0 {
+                    self.note_group_key(&user, key_id);
+                }
                 ok(key_id.to_vec())
             }
             volume_op::VK_LOAD => {
@@ -724,10 +739,14 @@ impl State {
                 let info = LoadInfo { key_id, uuid, group, high_water, owner_uid: 0, owner_label: label, older_read_only: false };
                 let key: &[u8; 32] = v.as_ref()[..32].try_into().unwrap();
                 match self.keyring.as_mut().unwrap().load(&info, key) {
-                    Ok(()) => ok(Vec::new()),
-                    Err(e) if e == libc::EEXIST => ok(Vec::new()),
-                    Err(_) => reply(status::INTERNAL),
+                    Ok(()) => {}
+                    Err(e) if e == libc::EEXIST => {}
+                    Err(_) => return reply(status::INTERNAL),
                 }
+                if group != 0 {
+                    self.note_group_key(&user, key_id);
+                }
+                ok(Vec::new())
             }
             volume_op::VK_RECORD => {
                 let key_id = field!(r.array::<16>());
@@ -1171,6 +1190,14 @@ impl State {
                 }
                 if let Some(s) = self.stores.get_mut(&user) {
                     s.lock();
+                }
+                // The person logged out: their personas' folders lock. The
+                // kernel writes back and forgets the group's plaintext
+                // before each key goes (TKEY_DROP, E4.4).
+                if let (Some(ids), Some(ring)) = (self.group_keys.remove(&user), self.keyring.as_mut()) {
+                    for id in ids {
+                        let _ = ring.drop_key(&id);
+                    }
                 }
                 self.handles.lock_user(&user);
                 self.jars.lock(&user);
