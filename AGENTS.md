@@ -8,7 +8,9 @@ long-form references are:
 - [RUNBOOK.md](RUNBOOK.md): how to build, boot, deploy and test everything
   (§0 bootstrap, §2 VM lifecycle, §4 cross-compile, §5 quirks, §13 cloud and
   remote workflows).
-- [docs/STATUS.md](docs/STATUS.md): where each workstream stands now.
+- [docs/HANDOFF.md](docs/HANDOFF.md): **start here when picking up work.**
+  Every open workstream with its exact next step and what it waits on.
+- [docs/STATUS.md](docs/STATUS.md): the long-form status of each workstream.
 - [docs/spec/](docs/spec/): one spec per subsystem (about 145). Read the spec
   before changing a subsystem, and update it in the same commit when the
   design changes.
@@ -89,9 +91,9 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
 
 - `scripts/run-vm.sh` boots it, `scripts/vssh` runs commands in it,
   `scripts/vshutdown` stops it. Always stop it with `vshutdown`.
-- **The Mac VM is shared by several agents working in parallel.** Ask before
-  taking it (in a project, ask the coordinator), and don't stop or reboot a VM
-  someone else started. `vshutdown` refuses when more than one VM runs or a
+- **The Mac VM is shared by several agents working in parallel.** Don't boot,
+  reboot or stop it without an OK typed by Shankar (inside a Claude project,
+  ask the coordinator), and never stop a VM someone else started. `vshutdown` refuses when more than one VM runs or a
   test harness owns the VM; stop the harness instead, since killing a harness
   can relaunch or kill its VM.
 - `vssh` has a 3 s connect timeout and fails with empty output when the guest
@@ -99,6 +101,21 @@ sh scripts/core-host-tests.sh                     # Tessera core C tests, plain 
   marker at the destination.
 - In cloud sessions use `scripts/cloud-vm.sh` (QEMU under TCG; never quote its
   timings as product numbers). See RUNBOOK §13.
+
+## Handing work over
+
+Claude and Codex share this project and pick up each other's work. Neither
+can see the other's conversations or memory, so the repo is the only
+handoff. Before a session ends, runs out of budget, or passes a workstream
+on:
+
+1. Commit and push what you have (or say in the row exactly what is left
+   uncommitted and where).
+2. Update that workstream's row in [docs/HANDOFF.md](docs/HANDOFF.md): where
+   it stands, the exact next step, and what it is waiting on. Add a row for a
+   new workstream; move a finished one to "Recently finished".
+3. Push. When picking work up, read the row, then the spec it links, then
+   `git log` for that area.
 
 ## Git
 
