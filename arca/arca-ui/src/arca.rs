@@ -140,13 +140,16 @@ impl Arcad {
         self.hold_value(op::U_HOLD, &w.buf, value, hold)
     }
 
-    pub fn hold_print_pin(&self, user: &str, persona: &str, key: &[u8; 32], uuid: &str, value: &[u8]) -> Result<[u8; 16], Error> {
+    pub fn print_pin(&self, user: &str, persona: &str, key: &[u8; 32], uuid: &str, typed: Option<&[u8]>, save: bool) -> Result<[u8; 16], Error> {
         let mut w = Writer::new();
         w.str(user);
         w.str(persona);
         w.raw(key);
         w.str(uuid);
-        self.hold_value(op::U_HOLD_PRINT_PIN, &w.buf, value, 0)
+        match typed {
+            Some(value) => self.hold_value(if save { op::U_SAVE_PRINT_PIN } else { op::U_HOLD_PRINT_PIN }, &w.buf, value, 0),
+            None => Self::handle(&self.call(op::U_USE_SAVED_PRINT_PIN, &w.buf)?),
+        }
     }
 
     pub fn store_print_login(&self, user: &str, persona: &str, key: &[u8; 32], uuid: &str, account: &str, value: &[u8]) -> Result<(), Error> {

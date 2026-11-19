@@ -47,6 +47,10 @@ pub enum ToChild {
     SubmitPrintPin,
     ConfigurePrintLogin { user: String, persona: String, key: [u8; 32], uuid: String },
     SavePrintLogin { account: String },
+    /// Counted Print press with “Save PIN” selected.
+    SavePrintPin,
+    /// Counted Print press with “Use saved PIN” selected.
+    UseSavedPrintPin,
 }
 
 impl ToChild {

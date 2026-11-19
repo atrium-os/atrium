@@ -75,6 +75,8 @@ pub enum Kind {
     /// A WireGuard preshared key (vpn.md §4.3): 32 bytes, released to the
     /// tunnel's engine through cryptad when it starts.
     WireGuardPsk = 9,
+    /// A saved secure-release PIN scoped to a printer and persona.
+    PrintPin = 10,
     /// An ed25519 signing key (per-service keypairs, insula.md §13.3).
     Ed25519 = 0x100,
     /// A P-256 key (passkeys, ES256).
@@ -109,6 +111,7 @@ impl Kind {
             7 => BluetoothKey,
             8 => WifiCredential,
             9 => WireGuardPsk,
+            10 => PrintPin,
             0x100 => Ed25519,
             0x101 => P256,
             0x102 => Symmetric,

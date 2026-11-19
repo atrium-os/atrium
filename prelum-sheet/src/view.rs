@@ -12,7 +12,7 @@ use pergola::widgets::Segmented;
 use pergola::{Button, Color, Mutable, TextField, TextStyle};
 use prelum_ipp_codec::ops::Sides;
 
-use crate::sheet::{Dest, Sheet, Tone, MAX_COPIES};
+use crate::sheet::{Dest, PinChoice, Sheet, Tone, MAX_COPIES};
 
 /// The sheet's size in points: limen's catalogue row for `print`.
 pub const W: f32 = 760.0;
@@ -188,6 +188,23 @@ impl View for SheetView {
             self.text(ctx, RIGHT_X, PIN_Y - 49.0, LABEL_W, "Username", style(type_size::SM, Weight::Regular, t.text_secondary()));
             self.text(ctx, RIGHT_X, PIN_Y + 8.0, LABEL_W, "Password", style(type_size::SM, Weight::Regular, t.text_secondary()));
             TextField::new(self.login_account.clone()).placeholder("Printer username").at(RIGHT_X + 126.0, PIN_Y - 56.0).width(194.0).render(ctx);
+        } else if s.pin_requested() {
+            if let Dest::Saved(printer) = s.dest() {
+                self.text(ctx, RIGHT_X, 72.0, RIGHT_W, &format!("Job PIN for {}", printer.name), style(type_size::SM, Weight::Semibold, t.text_primary()));
+            }
+            let modes = [PinChoice::Once, PinChoice::Save, PinChoice::Saved];
+            let selected = modes.iter().position(|&choice| choice == s.pin_choice).unwrap_or(0);
+            self.choice(ctx, PIN_Y - 72.0, "Job PIN", &["Use once", "Save PIN", "Use saved PIN"], selected, move |s, i| {
+                if s.working.is_none() {
+                    s.pin_choice = modes[i];
+                }
+            });
+            let hint = match s.pin_choice {
+                PinChoice::Once => "Enter a PIN for this job.",
+                PinChoice::Save => "Save this PIN in Arca and use it for this job.",
+                PinChoice::Saved => "Print with the PIN saved for this printer and persona.",
+            };
+            self.text(ctx, RIGHT_X, PIN_Y - 27.0, RIGHT_W, hint, style(type_size::XS, Weight::Regular, t.text_secondary()));
         } else {
             let mut y = self.printers(ctx, &s, PAD + 34.0);
 
@@ -257,7 +274,7 @@ impl View for SheetView {
         if s.login_printer.is_none() && matches!(s.dest(), Dest::Saved(p) if p.tls && p.uuid.is_some()) {
             let asked = self.asked.clone();
             let busy = s.working.is_some();
-            Button::secondary(if s.pin_requested() { "Remove PIN" } else { "Use PIN" })
+            Button::secondary(if s.pin_requested() { "Back" } else { "Use PIN" })
                 .at(RIGHT_X, PIN_Y + 2.0)
                 .width(98.0)
                 .on_click(move || {

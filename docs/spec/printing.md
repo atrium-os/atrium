@@ -856,8 +856,12 @@ The print sheet cannot change sharing or other printer administration settings.
 For a saved IPPS printer, **Use PIN** opens Arca's credential field inside the
 print sheet. Prelumd supplies the authenticated person, persona, TLS key and
 UUID through `PIN_BINDING`. The PIN field accepts digits and shows bullets.
-After the sheet counts the Print press, Arca stages the PIN and returns the
-one-use handle. An empty or unavailable field leaves the job unsubmitted.
+**Use once** stages the typed PIN in Arca for this job. **Save PIN** stores
+or replaces the typed PIN in Arca for the person, persona, pinned key and UUID,
+and uses it for this job. **Use saved PIN** uses that stored PIN without
+asking the person to type it again. Each choice requires a counted Print
+press. Arca issues a one-use handle, and an empty typed field or unavailable
+saved PIN leaves the job unsubmitted.
 
 A PIN job enters via `CLASS_PRINT/PRINT_PIN` with the PDF and an opaque handle
 from Arca. prelumd derives the person and persona from the connection and passes
@@ -880,6 +884,12 @@ was staged in Arca and redeemed by the jailed worker. The IPPS simulator checked
 the PIN in Create-Job before it accepted the PDF in Send-Document. The app
 reported queued and Prelum reported Done. The fixture worker used an alternate
 socket filename in the usual Arca mount so the resident Arca service stayed up.
+A separate arm64 desktop gate checked that **Use saved PIN** with no saved item
+queues nothing, then printed one job with **Save PIN** and a separate job with
+**Use saved PIN** without entering the PIN again. The jail worker redeemed a
+fresh handle per job and the simulator validated each PIN before receiving its
+PDF. The Arca store regression verifies persistence across restart and
+isolation by persona and printer.
 
 **Printer login…** lets the owning persona set a username and password for a
 saved IPPS printer. The username goes to Arca with a counted Save login press.
@@ -910,7 +920,7 @@ same desktop flow and verified that the IPPS simulator challenged an
 anonymous Validate-Job, checked the Digest response for Create-Job,
 Send-Document and job polling, and received exactly one PDF.
 
-Saved job PINs and per-persona routing and crossing policy remain open.
+Per-persona routing and crossing policy remain open.
 
 ## 12. Decisions, with recommendations
 

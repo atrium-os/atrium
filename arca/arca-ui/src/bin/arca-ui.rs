@@ -117,14 +117,13 @@ impl Ctx {
         }
     }
 
-    fn submit_print_pin(&mut self, id: EmbedId, e: &mut Embed) {
+    fn submit_print_pin(&mut self, id: EmbedId, e: &mut Embed, request: ToChild) {
         let Some(binding) = &e.printer else { return };
-        let result = if e.field.typed().is_empty() {
-            Err(Notice::Failed)
-        } else {
-            self.arcad.hold_print_pin(&binding.user, &binding.persona, &binding.key, &binding.uuid, e.field.typed())
-                .map_err(|err| if err.locked() { Notice::Locked } else { Notice::Failed })
-        };
+        let saved = matches!(request, ToChild::UseSavedPrintPin);
+        let typed = (!saved).then(|| e.field.typed());
+        let result = self.arcad.print_pin(&binding.user, &binding.persona, &binding.key, &binding.uuid,
+            typed, matches!(request, ToChild::SavePrintPin))
+            .map_err(|err| if err.locked() { Notice::Locked } else { Notice::Failed });
         match result {
             Ok(handle) => {
                 e.field.clear_print_secret();
@@ -289,7 +288,8 @@ fn main() -> ExitCode {
                             let dos = e.field.configure(Purpose::PrintPin, false);
                             cx.run(embed, e, dos);
                         }
-                        Ok(ToChild::SubmitPrintPin) if e.print_sheet && e.field.purpose == Purpose::PrintPin => cx.submit_print_pin(embed, e),
+                        Ok(request @ (ToChild::SubmitPrintPin | ToChild::SavePrintPin | ToChild::UseSavedPrintPin))
+                            if e.print_sheet && e.field.purpose == Purpose::PrintPin => cx.submit_print_pin(embed, e, request),
                         Ok(ToChild::ConfigurePrintLogin { user, persona, key, uuid }) if e.print_sheet && e.printer.is_none() => {
                             e.printer = Some(PrinterBinding { user, persona, key, uuid });
                             let dos = e.field.configure(Purpose::PrintPassword, false);

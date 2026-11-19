@@ -32,7 +32,7 @@ use limen::print::{ToChild, ToParent, Why};
 use limen::proto::{ChildEvent, EmbedId, ParentEvent, WindowToken};
 use pergola::{App, Mutable, SizeSpec, StepResult, Window, WindowDesc};
 use prelum_proto::print::{client::Client, Add, Layout, Nearby, PreviewReq, Previews, Print, Printer};
-use prelum_sheet::sheet::{Action, Dest, Sheet, Tone};
+use prelum_sheet::sheet::{Action, Dest, PinChoice, Sheet, Tone};
 use prelum_sheet::view::{self, Asked, SheetView};
 
 const PRELUM: &str = "/atrium/sockets/print/print.sock";
@@ -591,7 +591,12 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
                 Ok(Some(credential::ToParent::Cleared)) if prompt.pending.take().is_some() => {
                     set(&|s| {
                         s.working = None;
-                        s.notice = Some(("Enter a PIN in Arca and try again.".into(), Tone::Warning));
+                        let message = match s.pin_choice {
+                            PinChoice::Saved => "No saved PIN is available. Unlock Arca or choose another PIN option.",
+                            PinChoice::Save => "Arca could not save this PIN. Enter digits and check that Arca is unlocked.",
+                            PinChoice::Once => "Enter a PIN in Arca and try again.",
+                        };
+                        s.notice = Some((message.into(), Tone::Warning));
                     });
                 }
                 Err(message) => {
@@ -645,7 +650,7 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
                     match PrinterCredentialPrompt::open(&prelum, app_uid, printer.id, window, k, false) {
                         Ok(prompt) => {
                             pin = Some(prompt);
-                            set(&|s| { s.pin_printer = Some(printer.id); s.notice = None; });
+                            set(&|s| { s.pin_printer = Some(printer.id); s.pin_choice = PinChoice::Once; s.notice = None; });
                         }
                         Err(message) => set(&|s| s.notice = Some((message.clone(), Tone::Error))),
                     }
@@ -686,16 +691,21 @@ fn pane(embed: EmbedId, app_uid: u32, fresco: String, prelum: PathBuf, rx: Recei
                         Ok(()) => match doc.try_clone() {
                             Ok(fd) => {
                                 if s.pin_requested() {
+                                    let request = match s.pin_choice {
+                                        PinChoice::Once => credential::ToChild::SubmitPrintPin,
+                                        PinChoice::Save => credential::ToChild::SavePrintPin,
+                                        PinChoice::Saved => credential::ToChild::UseSavedPrintPin,
+                                    };
                                     if let (Some(prompt), Action::Print(print)) = (&mut pin, &action) {
                                         if prompt.printer == print.printer && prompt.config.is_none()
-                                            && prompt.parent.send(prompt.embed, credential::ToChild::SubmitPrintPin.encode()).is_ok()
+                                            && prompt.parent.send(prompt.embed, request.encode()).is_ok()
                                         {
                                             prompt.pending = Some((print.clone(), fd, Instant::now()));
                                             set(&|s| { s.notice = None; s.working = Some("Waiting for Arca…"); });
                                             continue;
                                         }
                                     }
-                                    set(&|s| s.notice = Some(("The Arca PIN field is unavailable. Remove the PIN field and open it again.".into(), Tone::Error)));
+                                    set(&|s| s.notice = Some(("The Arca PIN field is unavailable. Go back and open the PIN field again.".into(), Tone::Error)));
                                     continue;
                                 }
                                 let saving = matches!(action, Action::Save { .. });

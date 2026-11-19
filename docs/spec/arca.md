@@ -322,6 +322,15 @@ this call only after verifying the printer's pinned identity and checking that t
 printer can accept a PIN before document upload. See [printing.md](printing.md)
 §11.6 for the wire path and simulator gate.
 
+For an explicit **Save PIN** print, `U_SAVE_PRINT_PIN` stores or replaces a
+`PrintPin` item in the unlocked person's encrypted store and issues a one-use
+handle. The item is scoped to the persona and the printer recipient (TLS SPKI
+and IPP UUID). **Use saved PIN** calls `U_USE_SAVED_PRINT_PIN` for a fresh
+handle. Only the trusted UI can request these handles. The print worker uses
+the existing `TAKE_PRINT_PIN` operation after identity and capability checks.
+Arca reads the stored item only at redemption. Printer logins use a separate
+item kind and grant.
+
 ### Saved IPPS logins
 
 Printer recipients carry a TLS SPKI digest and IPP UUID. The trusted UI saves

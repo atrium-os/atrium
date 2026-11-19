@@ -79,13 +79,10 @@ impl Handles {
         Some(e)
     }
 
-    pub fn take_print_pin(&mut self, h: &Handle, user: &str, persona: &str, key: &[u8; 32], uuid: &str) -> Option<LockedBuf> {
+    pub fn take_print_pin(&mut self, h: &Handle, user: &str, persona: &str, key: &[u8; 32], uuid: &str) -> Option<Entry> {
         let e = self.map.remove(h)?;
-        match e.source {
-            Source::Pending(v) if e.hold == HOLD_PRINT_PIN && e.expires > Instant::now() && e.user == user && e.persona == persona
-                && e.printer.as_ref().is_some_and(|(k, id)| k == key && id == uuid) => Some(v),
-            _ => None,
-        }
+        (e.hold == HOLD_PRINT_PIN && e.expires > Instant::now() && e.user == user && e.persona == persona
+            && e.printer.as_ref().is_some_and(|(k, id)| k == key && id == uuid)).then_some(e)
     }
 
     pub fn take_print_login(&mut self, h: &Handle, recipient: &Recipient) -> Option<Entry> {

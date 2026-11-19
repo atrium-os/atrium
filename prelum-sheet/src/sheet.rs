@@ -47,6 +47,14 @@ pub enum Action {
     Save { layout: Layout, name: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PinChoice {
+    #[default]
+    Once,
+    Save,
+    Saved,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sheet {
     pub title: String,
@@ -76,6 +84,7 @@ pub struct Sheet {
     /// Something is under way ("Printing…"): the buttons wait.
     pub working: Option<&'static str>,
     pub pin_printer: Option<u32>,
+    pub pin_choice: PinChoice,
     pub login_printer: Option<u32>,
 }
 
@@ -113,6 +122,7 @@ impl Sheet {
             notice: None,
             working: None,
             pin_printer: None,
+            pin_choice: PinChoice::Once,
             login_printer: None,
         }
     }

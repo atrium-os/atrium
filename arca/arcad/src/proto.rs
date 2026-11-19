@@ -153,6 +153,10 @@ pub mod op {
     pub const U_HOLD_PRINT_PIN: u16 = 0x68;
     /// Trusted UI: `user | persona | key[32] | uuid | str account | bytes password`.
     pub const U_STORE_PRINT_LOGIN: u16 = 0x69;
+    /// Trusted UI: printer binding followed by bytes PIN → one-use handle.
+    pub const U_SAVE_PRINT_PIN: u16 = 0x6A;
+    /// Trusted UI: printer binding → one-use handle for the stored PIN.
+    pub const U_USE_SAVED_PRINT_PIN: u16 = 0x6B;
 }
 
 /// Web broker ops (0x70..): only the configured broker (arca.md §8.2).

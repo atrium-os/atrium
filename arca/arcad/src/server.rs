@@ -1484,6 +1484,8 @@ impl State {
             op::U_ACCOUNTS | op::U_HOLD | op::U_HANDLE | op::U_GENERATE => self.field_op(op, body, item),
             op::U_HOLD_PRINT_PIN => self.hold_print_pin(body),
             op::U_STORE_PRINT_LOGIN => self.store_print_login(body, item),
+            op::U_SAVE_PRINT_PIN => self.saved_print_pin(body, true, item),
+            op::U_USE_SAVED_PRINT_PIN => self.saved_print_pin(body, false, item),
             op::U_DROP => {
                 let Ok(h) = <[u8; 16]>::try_from(body) else { return malformed() };
                 self.handles.drop_handle(&h);
@@ -1603,6 +1605,43 @@ impl State {
         self.handles.issue(entry).map_or_else(|| reply(status::FULL), |h| ok(h.to_vec()))
     }
 
+    fn saved_print_pin(&mut self, body: &[u8], save: bool, item: &mut Option<ItemId>) -> Reply {
+        use crate::handles::{Entry, Source, HOLD_PRINT_PIN, TTL};
+        let mut r = Reader::new(body);
+        let parsed = (|| {
+            let (user, persona, key, uuid) = print_pin_binding(&mut r)?;
+            let recipient = Recipient::printer(key, uuid)?;
+            let pin = if save { Some(r.bytes(255)?) } else { None };
+            r.end()?;
+            Ok::<_, Error>((user, persona, key, uuid, recipient, pin))
+        })();
+        let Ok((user, persona, key, uuid, recipient, pin)) = parsed else { return malformed() };
+        if pin.is_some_and(|p| p.is_empty() || !p.iter().all(u8::is_ascii_digit)) {
+            return malformed();
+        }
+        let Some(store) = self.stores.get_mut(user).filter(|s| s.state() == LockState::Unlocked) else {
+            return reply(status::LOCKED);
+        };
+        let access = Access { persona, recipient: &recipient };
+        let current = tri!(store.list(&access)).into_iter().find(|m| m.kind == Kind::PrintPin);
+        let meta = match (pin, current) {
+            (Some(pin), Some(m)) => tri!(store.update(&m.id, &access, pin, None)),
+            (Some(pin), None) => tri!(store.add(NewItem {
+                persona, recipient: recipient.clone(), class: Class::WhileUnlocked, kind: Kind::PrintPin,
+                provenance: Provenance::UserTyped, account: "", scope: b"", value: pin,
+            })),
+            (None, Some(m)) => m,
+            (None, None) => return reply(status::DENIED),
+        };
+        *item = Some(meta.id);
+        let entry = Entry {
+            user: user.into(), persona: persona.into(), recipient, source: Source::Item(meta.id),
+            expires: std::time::Instant::now() + TTL, generated: false, hold: HOLD_PRINT_PIN,
+            printer: Some((key, uuid.into())),
+        };
+        self.handles.issue(entry).map_or_else(|| reply(status::FULL), |h| ok(h.to_vec()))
+    }
+
     fn print_user_unlocked(&self, user: &str) -> bool {
         self.stores.get(user).is_some_and(|store| store.state() == LockState::Unlocked)
     }
@@ -1619,10 +1658,20 @@ impl State {
         if !self.print_user_unlocked(user) {
             return reply(status::LOCKED);
         }
-        match self.handles.take_print_pin(&handle, user, persona, &key, uuid) {
-            Some(pin) => Reply { status: status::OK, body: Body::Secret(pin) },
-            None => reply(status::DENIED),
-        }
+        use crate::handles::Source;
+        let Some(entry) = self.handles.take_print_pin(&handle, user, persona, &key, uuid) else {
+            return reply(status::DENIED);
+        };
+        let pin = match entry.source {
+            Source::Pending(pin) => pin,
+            Source::Item(id) => {
+                let access = Access { persona, recipient: &entry.recipient };
+                let (meta, pin) = tri!(self.stores[user].release(&id, &access, None));
+                if meta.kind != Kind::PrintPin { return reply(status::DENIED); }
+                pin
+            }
+        };
+        Reply { status: status::OK, body: Body::Secret(pin) }
     }
 
     /// The credential field's ops. The recipient is the field's parent app,
