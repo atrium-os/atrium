@@ -326,6 +326,9 @@ impl Engine {
             }
             Ok(())
         })?;
+        // The person's own rules (§11.6), on what is left in the inbox.
+        let skip: Vec<u32> = block.iter().chain(&hold).copied().collect();
+        self.rules_arrived(account, folder, new, &skip)?;
         Ok(())
     }
 }

@@ -204,6 +204,7 @@ impl Notifier {
             }
         }
         let me: HashMap<AccountId, Vec<String>> = accounts.iter().map(|a| (*a, e.identities(*a).unwrap_or_default().into_iter().map(|i| i.addr.to_ascii_lowercase()).collect())).collect();
+        let rules = e.rules();
         for (id, m) in new {
             if bulk.contains(&m.account) {
                 continue;
@@ -217,6 +218,10 @@ impl Notifier {
                 continue;
             }
             let s = &m.summary;
+            // A `quiet` rule (§11.6).
+            if crate::rules::first(&rules, s).is_some_and(|r| r.then == crate::rules::Then::Quiet) {
+                continue;
+            }
             let mine = me.get(&m.account).cloned().unwrap_or_default();
             if s.from.iter().any(|a| mine.contains(&a.addr.to_ascii_lowercase())) {
                 continue;
