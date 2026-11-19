@@ -36,6 +36,18 @@ pub enum DataCmd {
     PasteFormats,
     /// The cells last copied here with rows turned into columns.
     PasteTransposed,
+    /// The copied numbers added to, taken from, multiplied with or
+    /// dividing the numbers where they land.
+    PasteAdd,
+    PasteSubtract,
+    PasteMultiply,
+    PasteDivide,
+    /// The copied cells, blank ones leaving what is under them.
+    PasteSkipBlanks,
+    /// The bar for an exact height of the selection's rows, or width of
+    /// its columns.
+    RowHeight,
+    ColWidth,
     SortAsc,
     SortDesc,
     /// Turn the auto-filter on (on the data) or off.
@@ -274,6 +286,11 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
         (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
         (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
+        (MenuItem::new("Paste Skipping Blanks").enabled(special), Some(DataCmd::PasteSkipBlanks)),
+        (MenuItem::new("Paste and Add").enabled(special), Some(DataCmd::PasteAdd)),
+        (MenuItem::new("Paste and Subtract").enabled(special), Some(DataCmd::PasteSubtract)),
+        (MenuItem::new("Paste and Multiply").enabled(special), Some(DataCmd::PasteMultiply)),
+        (MenuItem::new("Paste and Divide").enabled(special), Some(DataCmd::PasteDivide)),
         (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
@@ -281,6 +298,8 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
         (MenuItem::new(format!("Hide {}", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::HideRows)),
         (MenuItem::new("Unhide Rows").enabled(wb.sheet(s).hidden.iter().any(|&(a, b)| a <= sel.r1 && b >= sel.r0)), Some(DataCmd::UnhideRows)),
         (MenuItem::new(format!("Hide {}", plural(nc, "Column", "Columns"))).enabled(nc <= MAX_HIDE_COLS), Some(DataCmd::HideCols)),
+        (MenuItem::new("Row Height…"), Some(DataCmd::RowHeight)),
+        (MenuItem::new("Column Width…"), Some(DataCmd::ColWidth)),
         (MenuItem::new("Unhide Columns").enabled(wb.sheet(s).col_sizes.overrides().iter().any(|&(c, w)| w <= 0.0 && (sel.c0..=sel.c1).contains(&c))), Some(DataCmd::UnhideCols)),
         (MenuItem::new(if wb.comment(s, row, col).is_some() { "Edit Comment…" } else { "New Comment…" }).separated(), Some(DataCmd::Comment)),
         (MenuItem::new(if nr > 1 || nc > 1 { "Delete Comments" } else { "Delete Comment" }).enabled(comments_in(wb, s, sel).next().is_some()), Some(DataCmd::DeleteComments)),
@@ -403,6 +422,25 @@ pub const MAX_VALUES: usize = 10_000;
 /// A filter column's values to choose from: the column (of the sheet), then each
 /// distinct shown text with how many rows show it and whether the filter keeps it
 /// now. `Err` says why there is no list (no filter there, too many values).
+/// A double-click on the double line where `col` is hidden: the hidden
+/// columns around it shown again, as Unhide Columns would. False when
+/// `col` isn't hidden.
+pub fn unhide_cols_at(d: &mut Doc, col: u32) -> bool {
+    let sizes = &d.wb.sheet(d.sheet).col_sizes;
+    if sizes.size(col) > 0.0 {
+        return false;
+    }
+    let (mut lo, mut hi) = (col, col);
+    while lo > 0 && col - lo < MAX_HIDE_COLS && sizes.size(lo - 1) <= 0.0 {
+        lo -= 1;
+    }
+    while hi < officina_grid::addr::MAX_COLS - 1 && hi - lo + 1 < MAX_HIDE_COLS && sizes.size(hi + 1) <= 0.0 {
+        hi += 1;
+    }
+    run(d, CellRange { r0: 0, c0: lo, r1: 0, c1: hi }, (0, lo), DataCmd::UnhideCols);
+    true
+}
+
 pub fn column_values(d: &Doc, col: u32) -> Result<Vec<(String, u32, bool)>, String> {
     let f = d.wb.sheet(d.sheet).filter.as_ref().ok_or("There is no filter on this sheet.")?;
     if !(f.rect.c0..=f.rect.c1).contains(&col) {
@@ -499,9 +537,24 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             let inside = |c: u32| (sel.c0..=sel.c1).contains(&c);
             let mut over: Vec<(u32, f64)> = old.iter().copied().filter(|&(c, w)| !inside(c) || (cmd == DataCmd::UnhideCols && w > 0.0)).collect();
             if cmd == DataCmd::HideCols {
+                // Remember the widths, to show them again as they were.
+                for c in sel.c0..=sel.c1 {
+                    let w = d.wb.sheet(s).col_sizes.size(c);
+                    if w > 0.0 {
+                        d.hidden_widths.insert((s, c), w);
+                    }
+                }
                 over.extend((sel.c0..=sel.c1).map(|c| (c, 0.0)));
-                over.sort_by_key(|o| o.0);
+            } else {
+                for &(c, w) in &old {
+                    if inside(c) && w <= 0.0 {
+                        if let Some(&was) = d.hidden_widths.get(&(s, c)) {
+                            over.push((c, was));
+                        }
+                    }
+                }
             }
+            over.sort_by_key(|o| o.0);
             if over == old {
                 return Err(if cmd == DataCmd::HideCols { "Those columns are hidden already.".into() } else { "No hidden columns there. Select the columns around them.".into() });
             }
@@ -510,18 +563,33 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             d.run(if cmd == DataCmd::HideCols { "Hide Columns" } else { "Unhide Columns" }, vec![GridOp::Sizes { sheet: s, rows: false, over }]);
             Ok(if cmd == DataCmd::HideCols { format!("{n} columns hidden.") } else { format!("{n} columns shown.") })
         }
-        DataCmd::PasteValues | DataCmd::PasteFormulas | DataCmd::PasteFormats | DataCmd::PasteTransposed => {
-            use officina_grid::clip::What;
-            let (what, turn, label) = match cmd {
-                DataCmd::PasteValues => (What::Values, false, "Paste Values"),
-                DataCmd::PasteFormulas => (What::Formulas, false, "Paste Formulas"),
-                DataCmd::PasteFormats => (What::Formats, false, "Paste Formats"),
-                _ => (What::All, true, "Paste Transposed"),
+        DataCmd::PasteValues
+        | DataCmd::PasteFormulas
+        | DataCmd::PasteFormats
+        | DataCmd::PasteTransposed
+        | DataCmd::PasteSkipBlanks
+        | DataCmd::PasteAdd
+        | DataCmd::PasteSubtract
+        | DataCmd::PasteMultiply
+        | DataCmd::PasteDivide => {
+            use officina_grid::clip::{Arith, Special, What};
+            let of = Special::of;
+            let math = |a| Special { arith: Some(a), ..of(What::Values) };
+            let (sp, label) = match cmd {
+                DataCmd::PasteValues => (of(What::Values), "Paste Values"),
+                DataCmd::PasteFormulas => (of(What::Formulas), "Paste Formulas"),
+                DataCmd::PasteFormats => (of(What::Formats), "Paste Formats"),
+                DataCmd::PasteSkipBlanks => (Special { skip_blanks: true, ..of(What::All) }, "Paste Skipping Blanks"),
+                DataCmd::PasteAdd => (math(Arith::Add), "Paste and Add"),
+                DataCmd::PasteSubtract => (math(Arith::Sub), "Paste and Subtract"),
+                DataCmd::PasteMultiply => (math(Arith::Mul), "Paste and Multiply"),
+                DataCmd::PasteDivide => (math(Arith::Div), "Paste and Divide"),
+                _ => (Special { transpose: true, ..of(What::All) }, "Paste Transposed"),
             };
             let Some((clip, _)) = d.clip.as_ref() else {
                 return Err("Copy some cells first.".into());
             };
-            let (ops, _) = clip.paste_as(&d.wb, s, sel.r0, sel.c0, what, turn)?;
+            let (ops, _) = clip.paste_special(&d.wb, s, sel.r0, sel.c0, sp)?;
             d.run(label, ops);
             Ok(format!("{label}: done."))
         }
@@ -719,7 +787,7 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
             Ok(if hidden == 0 { "Every row shows.".into() } else { format!("{hidden} rows hidden by the filter.") })
         }
         // The window opens its value list for this one.
-        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid => Ok(String::new()),
+        DataCmd::CondFormats | DataCmd::PivotFields | DataCmd::CompareWith | DataCmd::AddSheet | DataCmd::RenameSheet | DataCmd::DeleteSheet | DataCmd::MoveSheetLeft | DataCmd::MoveSheetRight | DataCmd::TabColor | DataCmd::Comment | DataCmd::OpenLink | DataCmd::Link | DataCmd::ChooseFromList | DataCmd::Validation | DataCmd::CircleInvalid | DataCmd::RowHeight | DataCmd::ColWidth => Ok(String::new()),
         DataCmd::ChooseValues => column_values(d, col).map(|v| format!("{} values in column {}.", v.len(), officina_grid::addr::col_name(col))),
         DataCmd::FormatAsTable => {
             let t = target(d, sel, cursor).ok_or_else(need)?;
@@ -943,6 +1011,10 @@ mod tests {
         run(&mut d, one(12, 0), (12, 0), DataCmd::PasteFormulas);
         assert_eq!(d.wb.formula_text(CellAddr { sheet: 0, row: 12, col: 0 }).as_deref(), Some("=ROW()*3"));
         assert_eq!(cell(&d, 12, 0), "39");
+        // Paste and Add: 3 more on what is there.
+        d.type_into(20, 5, "4");
+        run(&mut d, one(20, 5), (20, 5), DataCmd::PasteAdd);
+        assert_eq!((d.status.as_str(), cell(&d, 20, 5)), ("Paste and Add: done.", "7".to_string()));
         // After a cut: not offered.
         d.take_clip(r, true, String::new());
         assert!(!item(&d));
@@ -960,16 +1032,23 @@ mod tests {
         run(&mut d, around, (1, 0), DataCmd::UnhideRows);
         assert_eq!(d.status, "2 rows shown.");
         assert!(d.wb.sheet(0).hidden.is_empty());
+        d.set_col_width(2, 120.0);
         run(&mut d, CellRange { r0: 0, c0: 1, r1: 0, c1: 2 }, (0, 1), DataCmd::HideCols);
         assert_eq!(d.status, "2 columns hidden.");
         assert_eq!(d.wb.sheet(0).col_sizes.size(1), 0.0);
         run(&mut d, CellRange { r0: 0, c0: 0, r1: 0, c1: 3 }, (0, 0), DataCmd::UnhideCols);
         assert_eq!(d.status, "2 columns shown.");
-        assert!(d.wb.sheet(0).col_sizes.size(2) > 0.0);
+        // C comes back as wide as it was; B at the default.
+        assert_eq!((d.wb.sheet(0).col_sizes.size(1), d.wb.sheet(0).col_sizes.size(2)), (64.0, 120.0));
         assert!(d.undo());
         assert_eq!(d.wb.sheet(0).col_sizes.size(2), 0.0);
         run(&mut d, one(0, 5), (0, 5), DataCmd::UnhideCols);
         assert!(d.status.starts_with("No hidden columns"), "{}", d.status);
+        // A double-click on the double line shows the run there.
+        run(&mut d, CellRange { r0: 0, c0: 1, r1: 0, c1: 2 }, (0, 1), DataCmd::HideCols);
+        assert!(!unhide_cols_at(&mut d, 0));
+        assert!(unhide_cols_at(&mut d, 2));
+        assert_eq!((d.wb.sheet(0).col_sizes.size(1), d.wb.sheet(0).col_sizes.size(2)), (64.0, 120.0));
     }
 
     #[test]

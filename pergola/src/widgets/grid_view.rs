@@ -472,8 +472,9 @@ pub enum GridAction {
     Redo,
     Copy(CellRange),
     Cut(CellRange),
-    /// Paste at the active cell.
-    Paste { row: u32, col: u32 },
+    /// Paste at the active cell; `sel` the selection (a bigger one may be
+    /// filled with copies).
+    Paste { row: u32, col: u32, sel: CellRange },
     /// Float `key` dragged to `at` (content px: x, y, width, height).
     PlaceFloat { key: u64, at: [f64; 4] },
     /// Delete with float `key` picked.
@@ -487,7 +488,8 @@ pub enum GridAction {
     Choose { row: u32, col: u32 },
     /// Fill `to` from `from` (inside it, `to` reaching past it one way):
     /// the fill handle (`copy` false: series), Ctrl+D and Ctrl+R (`copy`).
-    Fill { from: CellRange, to: CellRange, copy: bool },
+    /// `flip`: the handle let go with Ctrl held (series and copy swap).
+    Fill { from: CellRange, to: CellRange, copy: bool, flip: bool },
     /// A double-click on the fill handle: fill the selection down as far as
     /// the data beside it goes (the app finds how far).
     FillToData(CellRange),
@@ -858,7 +860,7 @@ impl GridView {
                             g.cursor = (to.r1, to.c1);
                             gst.set(g);
                             if let Some(f) = &act {
-                                f(GridAction::Fill { from: sel, to, copy: false });
+                                f(GridAction::Fill { from: sel, to, copy: false, flip: crate::input::pointer_modifiers().ctrl });
                             }
                             return;
                         }
@@ -1106,6 +1108,11 @@ impl GridView {
                         ctx.add(Node::Text { rect: Rect::new(cx + q(((w - lw) / 2.0) as f64), ch_rect.y() + (HEADER_H - 15.0) / 2.0, lw, 15.0), content: label, style: st });
                     }
                     ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: line, radius: 0.0 });
+                    // Hidden columns after this one: a double line, as Excel marks them.
+                    if w > 0.0 && c + 1 < cols && src.col_left(c + 2) <= xr {
+                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 4.0, ch_rect.y(), 1.0, HEADER_H), fill: t.text_secondary(), radius: 0.0 });
+                        ctx.add(Node::Rect { rect: Rect::new(cx + w - 1.0, ch_rect.y(), 1.0, HEADER_H), fill: t.text_secondary(), radius: 0.0 });
+                    }
                     ctx.pop();
                 }
                 ctx.pop();
@@ -1217,6 +1224,11 @@ impl GridView {
                     let lw = crate::text::measure_chars(&label, &st);
                     ctx.add(Node::Text { rect: Rect::new(rh_rect.x() + q((header_w - PAD - 2.0 - lw) as f64), cy + q(((h - 15.0) / 2.0).max(0.0) as f64), lw, 15.0), content: label, style: st });
                     ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: line, radius: 0.0 });
+                    // Hidden rows after this one: a double line.
+                    if row + 1 < rows && src.row_top(row + 2) <= yb {
+                        ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 4.0, header_w, 1.0), fill: t.text_secondary(), radius: 0.0 });
+                        ctx.add(Node::Rect { rect: Rect::new(rh_rect.x(), cy + h - 1.0, header_w, 1.0), fill: t.text_secondary(), radius: 0.0 });
+                    }
                     ctx.pop();
                 }
                 ctx.pop();
@@ -1935,10 +1947,14 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
             };
             Some(if cmd { src.data_edge(g.cursor.0, g.cursor.1, dr, dc) } else { past_hidden(src, g.cursor, step(g.cursor, dr as i64, dc as i64), dr, dc) })
         }
-        Key::PageUp => Some(step(g.cursor, -page(st), 0)),
-        Key::PageDown => Some(step(g.cursor, page(st), 0)),
-        Key::Home if cmd => Some((0, 0)),
-        Key::Home => Some((g.cursor.0, 0)),
+        // Hidden rows and columns are stepped over.
+        Key::PageUp => Some(past_hidden(src, g.cursor, step(g.cursor, -page(st), 0), -1, 0)),
+        Key::PageDown => Some(past_hidden(src, g.cursor, step(g.cursor, page(st), 0), 1, 0)),
+        Key::Home if cmd => {
+            let r = past_hidden(src, g.cursor, (0, 0), 1, 0);
+            Some(past_hidden(src, g.cursor, (r.0, 0), 0, 1))
+        }
+        Key::Home => Some(past_hidden(src, g.cursor, (g.cursor.0, 0), 0, 1)),
         Key::End if cmd => Some(src.last_used()),
         Key::Tab => {
             let to = step(g.cursor, 0, if m.shift { -1 } else { 1 });
@@ -1975,10 +1991,10 @@ fn on_key(src: &dyn GridSource, geom: &Geom, g: &mut GridState, st: &mut ScrollS
                         false if sel.c0 > 0 => (CellRange { c0: sel.c0 - 1, c1: sel.c0 - 1, ..sel }, CellRange { c0: sel.c0 - 1, ..sel }),
                         _ => return true,
                     };
-                    send(GridAction::Fill { from, to, copy: true });
+                    send(GridAction::Fill { from, to, copy: true, flip: false });
                 }
                 "x" => send(GridAction::Cut(g.selection())),
-                "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0 }),
+                "v" => send(GridAction::Paste { row: g.selection().r0, col: g.selection().c0, sel: g.selection() }),
                 "a" => {
                     g.anchor = (0, 0);
                     g.cursor = (last_r, last_c);
@@ -2258,6 +2274,12 @@ mod tests {
         assert_eq!(state.get_cloned().cursor, (0, 4));
         key(&mut app, Key::Left, "", none);
         assert_eq!(state.get_cloned().cursor, (0, 1));
+        // With A hidden too, Home lands on B, the first shown column.
+        grid.widths.borrow_mut().insert(0, 0.0);
+        key(&mut app, Key::Right, "", none);
+        key(&mut app, Key::Home, "", none);
+        assert_eq!(state.get_cloned().cursor, (0, 1));
+        grid.widths.borrow_mut().remove(&0);
         // Hidden up to the last column: the cursor stays.
         for c in 5..10 {
             grid.widths.borrow_mut().insert(c, 0.0);
@@ -2299,7 +2321,7 @@ mod tests {
         app.handle_event(Event::PointerUp { at: at(1.5, 6.5) });
         app.tick();
         let from = CellRange { r0: 1, c0: 1, r1: 2, c1: 1 };
-        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from, to: CellRange { r1: 6, ..from }, copy: false }));
+        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from, to: CellRange { r1: 6, ..from }, copy: false, flip: false }));
         assert_eq!(state.get_cloned().selection(), CellRange { r1: 6, ..from });
         // A double-click on the handle (now at B7's corner) asks to fill to the data's end.
         for _ in 0..2 {
@@ -2314,7 +2336,7 @@ mod tests {
         state.set(g);
         key(&mut app, Key::Char, "d", Modifiers { ctrl: true, ..Modifiers::default() });
         let one = CellRange { r0: 3, c0: 3, r1: 3, c1: 3 };
-        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from: one, to: CellRange { r1: 4, ..one }, copy: true }));
+        assert_eq!(log.borrow().last(), Some(&GridAction::Fill { from: one, to: CellRange { r1: 4, ..one }, copy: true, flip: false }));
     }
 
     #[test]
@@ -2716,6 +2738,28 @@ mod tests {
         app.handle_event(Event::PointerUp { at: Point::new(x_of("hello w") + 1.0, HEADER_H + 30.0) });
         app.tick();
         assert_eq!(state.get_cloned().edit.unwrap().selected_text(), "hello w");
+        // A double click picks the word under it.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let on_world = Point::new(x_of("hello wo") + 1.0, HEADER_H + 30.0);
+        for _ in 0..2 {
+            app.handle_event(Event::PointerDown { at: on_world });
+            app.handle_event(Event::PointerUp { at: on_world });
+        }
+        app.tick();
+        assert_eq!(state.get_cloned().edit.unwrap().selected_text(), "world");
+        // A plain press, then Shift and a press, selects between them.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let at2 = Point::new(x_of("he") + 1.0, HEADER_H + 30.0);
+        app.handle_event(Event::PointerDown { at: at2 });
+        app.handle_event(Event::PointerUp { at: at2 });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        crate::input::set_pointer_modifiers(Modifiers { shift: true, ..Default::default() });
+        let at3 = Point::new(x_of("hello") + 1.0, HEADER_H + 30.0);
+        app.handle_event(Event::PointerDown { at: at3 });
+        app.handle_event(Event::PointerUp { at: at3 });
+        crate::input::set_pointer_modifiers(Modifiers::default());
+        app.tick();
+        assert_eq!(state.get_cloned().edit.unwrap().selected_text(), "llo");
         // A press on another cell still commits and moves there.
         let c5 = Point::new(hw + 128.0 + 10.0, HEADER_H + 85.0);
         app.handle_event(Event::PointerDown { at: c5 });

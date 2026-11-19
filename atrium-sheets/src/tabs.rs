@@ -46,6 +46,9 @@ pub enum TabCmd {
     Linking,
     LinkDone,
     LinkCancel,
+    /// The exact-size bar's field submitted; closed.
+    SizeDone,
+    SizeCancel,
     /// The value a validation rule warned about: kept, or taken back.
     WarnKeep,
     WarnUndo,

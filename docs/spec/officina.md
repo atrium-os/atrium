@@ -3748,13 +3748,13 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - Anything else, and any line holding a formula or mixed kinds, repeats in turn. Formulas move as a copy moves them (relative references shift, `$` ones stay), and a column of them is one formula fill.
   - Styles repeat with the cells.
   - Filling up or left, one cell counts down ("Item 5" → "Item 4", "Item 3").
-  - `Mode::Copy` repeats without series.
+  - `Mode::Copy` repeats without series. `Mode::Flip` (2026-11-19) is Excel's Ctrl: one number counts up by one (down when filling up or left), and everything else is copied.
   - Refused: areas meeting merged cells, and more than 4 M new cells.
-- **Grid** (pergola): a source that says `fills()` gets a small square at the selection's bottom-right corner. Dragging it rings the area it reaches, down, up, right or left, whichever way the pointer is farther out. Letting go sends `GridAction::Fill { from, to, copy: false }` and selects the filled area. Ctrl+D and Ctrl+R send `copy: true`: the selection's first row (or column) into the rest, or with one row chosen, the row above.
+- **Grid** (pergola): a source that says `fills()` gets a small square at the selection's bottom-right corner. Dragging it rings the area it reaches, down, up, right or left, whichever way the pointer is farther out. Letting go sends `GridAction::Fill { from, to, copy: false, flip }`, `flip` when Ctrl is held as it is let go, and selects the filled area. Ctrl+D and Ctrl+R send `copy: true`: the selection's first row (or column) into the rest, or with one row chosen, the row above.
 - **Sheets:** `Doc::fill`, undone as one step ("Fill Series" or "Fill").
 - **Double-click on the handle** (2026-11-19) fills the selection down as far as the data beside it goes: the column left of it, or else the one right of it, to the end of its unbroken run, stopping above anything already in the selection's first column (`autofill::to_data_end`, reading the column a growing window at a time). The filled area is selected. pergola reports `GridAction::FillToData`; two presses on the handle within 450 ms are a double-click, and a press that hardly moves fills nothing.
-- **Not yet:** Excel's Ctrl-drag to flip between series and copy, the Auto Fill Options button after a drag, custom lists, and Flash Fill.
-- **Gates:** officina-grid `autofill::tests` (5); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
+- **Not yet:** the Auto Fill Options button after a drag, custom lists, and Flash Fill.
+- **Gates:** officina-grid `autofill::tests` (6, with `ctrl_flips_series_and_copy`); pergola `the_fill_handle_and_ctrl_d_ask_to_fill`; atrium-sheets `the_fill_handle_continues_a_series_and_ctrl_d_copies`, `a_double_click_on_the_fill_handle_fills_down_beside_the_data`.
 
 ### 16.88 Copy, cut and paste within Sheets (2026-11-19)
 
@@ -3763,20 +3763,24 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
   - A copy keeps formulas as expressions, so relative references move with them (`=A1*2` copied four rows down reads `=A5*2`; `$` ones stay). A column of them pastes as one formula fill.
   - A cut empties its source in the same step, so pasting moves the cells, as Excel does. Overlapping moves keep what lands.
   - References follow moved cells (2026-11-19): every formula in the workbook, the moved ones too, that reads a moved cell, or a range wholly inside the moved area, is rewritten to read it where it went, on whichever sheet. A range only partly inside stays. References from moved formulas to cells left behind keep reading them (named by sheet when the formula lands on another one).
+  - Cells written over (2026-11-19): formulas elsewhere that read a cell the move writes over (one not itself moving), or a range wholly inside them, read `#REF!` instead, as Excel's do; a range only partly over stays.
   - Refused: an area that would run off the sheet, and pasting over merged cells.
 - **Sheets:** Copy and Cut still put tab-separated values on the clipboard for other apps, and `Doc.clip` keeps the cells with that text. A paste whose clipboard text is still that text (Windows line ends allowed) pastes the clip; anything else pastes as text, as before. A cut now waits for the paste ("Cut: paste to move it.") and pastes once. One undo step ("Paste" or "Move").
-- **Paste Special** (2026-11-19; Data menu, offered after a copy, not a cut): Paste Values (formula results as they were when copied, no formats), Paste Formulas (no formats), Paste Formats (the cells keep what they hold), Paste Transposed (rows become columns, with formats). `Clip::paste_as(…, What, transpose)`. A transposed formula comes as its value for now; Excel turns its references.
-- **Not yet:** names, conditional formats, charts and validation rules following moved cells; formulas that read the cells a move overwrites becoming `#REF!` (Excel's do); pasting a clip into a larger selection as tiles, transposing formulas' references, Paste Special's arithmetic (add, multiply) and skip-blanks, and rich formats on the system clipboard for other apps.
-- **Gates:** officina-grid `clip::tests` (5); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`, `paste_special_is_offered_after_a_copy_and_pastes_values`.
+- **Paste Special** (2026-11-19; Data menu, offered after a copy, not a cut): Paste Values (formula results as they were when copied, no formats), Paste Formulas (no formats), Paste Formats (the cells keep what they hold), Paste Transposed (rows become columns, with formats). `Clip::paste_as(…, What, transpose)`. A transposed formula (2026-11-19) keeps its formula: references into the copied cells turn with them, `$` ones stay, and other relative ones move as a copy moves them (`=A1+B1*$E$9+F1` in C1, with A1:C1 pasted transposed at A5, reads `=A5+A6*$E$9+D7`).
+- **Arithmetic and skipping blanks** (2026-11-19; Data menu, after a copy): Paste and Add, Subtract, Multiply, Divide combine each copied number (a formula's value when copied) with the cell it lands on: a number there, or blank as 0, takes the result (dividing by 0 gives `#DIV/0!`); a formula there gains the operation (`=(C2*2)*10`); text there, and copied text or blanks, leave the cell alone. Paste Skipping Blanks pastes everything but lets blank copied cells keep what is under them (formats still come from the whole copy). `Clip::paste_special(…, Special { what, transpose, arith, skip_blanks })`; only the touched cells are rewritten, one edit a run down a column.
+- **Into a bigger selection** (2026-11-19): with more cells selected than the copy holds, a paste repeats it across the selection in whole copies (a 1×2 copy into 4×4 fills it twice across, four times down), with formulas moved for each copy, as one undo step. A selection smaller than the copy, or not a whole number of copies, pastes it once. At most 10,000 copies and 4 M cells (`Clip::paste_into`, `Doc::paste_in`; pergola's `GridAction::Paste` carries the selection).
+- **Not yet:** names, conditional formats, charts and validation rules following moved cells; Paste Special's arithmetic with formats or with formulas copied as formulas (Excel combines the two formulas), a Paste Special box with all choices together, and rich formats on the system clipboard for other apps.
+- **Gates:** officina-grid `clip::tests` (8, with `paste_special_adds_multiplies_and_skips_blanks`, `#REF!` checks in `references_to_moved_cells_follow_them`, `a_transposed_formula_reads_the_turned_cells`, `pasting_into_a_bigger_area_repeats_the_copy`); atrium-sheets `copy_and_paste_here_bring_formulas_and_a_cut_moves`, `paste_special_is_offered_after_a_copy_and_pastes_values` (with Paste and Add), `a_copy_fills_a_bigger_selection_and_ctrl_flips_the_handle`.
 
 ### 16.89 Hiding rows and columns by hand (2026-11-19)
 
 - **Sheets** (Data menu): Hide Rows and Hide Columns hide the selection's; Unhide Rows and Unhide Columns show the hidden ones inside the selection (select the rows or columns around them, as in Excel). Each is one undo step, and the status line counts what changed.
   - Rows join the sheet's hidden ranges (`Sheet.hidden`, which the filter shares: rows hidden by hand outside a filter's range stay hidden when it filters again; inside it, filtering decides).
-  - Columns get no width; shown again, they take the default width. At most 16,384 at once.
-- **Grid** (pergola `past_hidden`): arrow keys step over hidden rows and columns (filtered ones too) to the next shown one, or stay put if none.
+  - Columns get no width; shown again (2026-11-19) they take back the width they had when hidden in this session (`Doc.hidden_widths`), or else the default width. At most 16,384 at once.
+- **Grid** (pergola `past_hidden`): arrow keys step over hidden rows and columns (filtered ones too) to the next shown one, or stay put if none. Since 2026-11-19 Home, Ctrl+Home, Page Up and Page Down do too, landing on the nearest shown row or column. The row and column labels draw a double line where hidden ones sit, as Excel does.
 - **Files:** .xlsx columns with no width are written `hidden="1"` and read back hidden (they used to show 2 px wide, with a note); .ods columns get `table:visibility="collapse"` and are read back hidden. Hidden rows were kept already. LibreOffice keeps both ways (`officina-convert/tests/hidden.rs`).
-- **Not yet:** remembering a hidden column's width for when it is shown, the double line Excel draws where rows or columns are hidden, and Home/Page keys skipping hidden ones.
+- **Double-click on the double line** (2026-11-19): just right of where columns are hidden, a double-click on the label edge shows the hidden run again, as Unhide Columns would (`data::unhide_cols_at`, from `GridAction::FitCol` on a hidden column); just left of it still fits the shown column.
+- **Not yet:** remembering a hidden column's width across saving and reopening (the file holds no width for it), and the same double-click for hidden rows.
 - **Gates:** atrium-sheets `rows_and_columns_are_hidden_and_shown_again`; pergola `arrows_step_over_hidden_columns`; officina-convert `tests/hidden.rs`.
 
 ### 16.90 Row heights by dragging, and sizes undone in one step (2026-11-19)
@@ -3785,8 +3789,9 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 - **Sheets:** the drag shows live (`Doc::size_preview`, not journaled), and letting go makes it one undoable `GridOp::Sizes` ("Row Height" or "Column Width", `Doc::size_done`). Column widths used to change without undo.
 - **Fit a column** (2026-11-19): a double-click on a column label's right edge sends `GridAction::FitCol`; Sheets sets the column to its widest shown entry (`SheetSource::fit_width`: shown rows, cells not merged across columns, at most 200,000 cells read; pergola `needed_width` measures a cell view's widest line with its indent, icon and padding), as one undo step. An empty column is left alone.
 - **Several at once** (2026-11-19): with whole columns (or rows) selected, dragging or double-clicking the edge of one of them sizes all of them (each fitted to its own entries on a double-click), as one undo step; up to 16,384 at once (`app::sized_span`).
-- **Not yet:** fitting rows to wrapped text, and a Row Height… / Column Width… box for exact numbers.
-- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`, `an_edge_of_selected_whole_columns_sizes_them_all`.
+- **Exact sizes** (2026-11-19; Data menu): Row Height… and Column Width… open a bar holding the cursor's row height or column width in pixels; a number from 0 (hides) to 545 for rows or 1790 for columns sets every selected row or column (up to 16,384) as one undo step, and anything else leaves the bar open with a note. Sizes are in pixels, not Excel's points and characters.
+- **Not yet:** fitting rows to wrapped text, and the exact-size bar in Excel's units.
+- **Gates:** pergola `a_row_label_s_edge_resizes_the_row`, `a_double_click_on_a_column_edge_asks_to_fit_it`; atrium-sheets `a_dragged_edge_is_one_undo_step`, `a_column_fits_its_widest_shown_entry`, `an_edge_of_selected_whole_columns_sizes_them_all`, `the_size_bar_sets_exact_heights_and_widths`.
 
 ### 16.91 The grid scrolls on while a selection is dragged past its edge (2026-11-19)
 
@@ -3797,7 +3802,7 @@ Not yet: print areas, repeated titles, charts and pictures on sheets; speaker no
 ### 16.92 The pointer in the cell editor (2026-11-19)
 
 - **Grid** (pergola): while a cell is being edited, a press inside the editor (the cell, or as wide as its text runs) places the caret at the nearest character instead of committing; dragging selects text, Shift+press extends, and a double-click selects the word. A press anywhere else still commits and moves, as before. `editor_rect`, `index_at` (a binary search over measured prefixes).
-- **Gate:** pergola `a_press_in_the_editor_places_the_caret_and_a_drag_selects`.
+- **Gate:** pergola `a_press_in_the_editor_places_the_caret_and_a_drag_selects` (press, drag, double-click word, Shift+press).
 
 ## 17. Decisions (accepted 2026-11-14)
 
