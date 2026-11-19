@@ -22,6 +22,13 @@ use crate::doc::Doc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataCmd {
+    /// Paste Special: the cells last copied here, only their values (formula
+    /// results), only formulas and values, or only formats.
+    PasteValues,
+    PasteFormulas,
+    PasteFormats,
+    /// The cells last copied here with rows turned into columns.
+    PasteTransposed,
     SortAsc,
     SortDesc,
     /// Turn the auto-filter on (on the data) or off.
@@ -251,8 +258,13 @@ pub fn menu(d: &Doc, sel: CellRange, cursor: (u32, u32)) -> Vec<(MenuItem, Optio
     let (nr, nc) = (sel.r1 - sel.r0 + 1, sel.c1 - sel.c0 + 1);
     let plural = |n: u32, one: &str, many: &str| if n == 1 { one.to_string() } else { format!("{n} {many}") };
     let circling = d.circling;
+    let special = d.clip.as_ref().is_some_and(|(c, _)| !c.cut);
     let mut v = vec![
-        (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))), Some(DataCmd::InsertRows)),
+        (MenuItem::new("Paste Values").enabled(special), Some(DataCmd::PasteValues)),
+        (MenuItem::new("Paste Formulas").enabled(special), Some(DataCmd::PasteFormulas)),
+        (MenuItem::new("Paste Formats").enabled(special), Some(DataCmd::PasteFormats)),
+        (MenuItem::new("Paste Transposed").enabled(special), Some(DataCmd::PasteTransposed)),
+        (MenuItem::new(format!("Insert {} Above", plural(nr, "Row", "Rows"))).separated(), Some(DataCmd::InsertRows)),
         (MenuItem::new(format!("Insert {} Left", plural(nc, "Column", "Columns"))), Some(DataCmd::InsertCols)),
         (MenuItem::new(format!("Delete {}", plural(nr, "Row", "Rows"))), Some(DataCmd::DeleteRows)),
         (MenuItem::new(format!("Delete {}", plural(nc, "Column", "Columns"))), Some(DataCmd::DeleteCols)),
@@ -436,6 +448,21 @@ fn apply(d: &mut Doc, sel: CellRange, cursor: (u32, u32), cmd: DataCmd) -> Resul
     let (row, col) = cursor;
     let need = || "Put the cursor in your data (or select it) first.".to_string();
     match cmd {
+        DataCmd::PasteValues | DataCmd::PasteFormulas | DataCmd::PasteFormats | DataCmd::PasteTransposed => {
+            use officina_grid::clip::What;
+            let (what, turn, label) = match cmd {
+                DataCmd::PasteValues => (What::Values, false, "Paste Values"),
+                DataCmd::PasteFormulas => (What::Formulas, false, "Paste Formulas"),
+                DataCmd::PasteFormats => (What::Formats, false, "Paste Formats"),
+                _ => (What::All, true, "Paste Transposed"),
+            };
+            let Some((clip, _)) = d.clip.as_ref() else {
+                return Err("Copy some cells first.".into());
+            };
+            let (ops, _) = clip.paste_as(&d.wb, s, sel.r0, sel.c0, what, turn)?;
+            d.run(label, ops);
+            Ok(format!("{label}: done."))
+        }
         DataCmd::CenterAcross => {
             let r = Rect { sheet: s, r0: sel.r0, c0: sel.c0, r1: sel.r1, c1: sel.c1 };
             let off = across_at(&d.wb, s, sel);
@@ -836,6 +863,27 @@ mod tests {
         assert_eq!((1..=4).map(|r| cell(&d, r, 0)).collect::<Vec<_>>(), ["apple", "apple", "fig", "pear"]);
         assert_eq!(cell(&d, 4, 1), "3");
         assert_eq!(d.wb.merges(0), &list[..]);
+    }
+
+    #[test]
+    fn paste_special_is_offered_after_a_copy_and_pastes_values() {
+        let mut d = doc();
+        let item = |d: &Doc| menu(d, one(0, 0), (0, 0)).into_iter().find(|(m, _)| m.label == "Paste Values").unwrap().0.enabled;
+        assert!(!item(&d));
+        d.type_into(0, 5, "=ROW()*3");
+        let r = Rect { sheet: 0, r0: 0, c0: 5, r1: 0, c1: 5 };
+        d.take_clip(r, false, String::new());
+        assert!(item(&d));
+        run(&mut d, one(9, 5), (9, 5), DataCmd::PasteValues);
+        assert_eq!(d.status, "Paste Values: done.");
+        assert_eq!(d.wb.formula_text(CellAddr { sheet: 0, row: 9, col: 5 }), None);
+        assert_eq!(cell(&d, 9, 5), "3");
+        run(&mut d, one(12, 0), (12, 0), DataCmd::PasteFormulas);
+        assert_eq!(d.wb.formula_text(CellAddr { sheet: 0, row: 12, col: 0 }).as_deref(), Some("=ROW()*3"));
+        assert_eq!(cell(&d, 12, 0), "39");
+        // After a cut: not offered.
+        d.take_clip(r, true, String::new());
+        assert!(!item(&d));
     }
 
     #[test]
