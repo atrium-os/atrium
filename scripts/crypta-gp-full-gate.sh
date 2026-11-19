@@ -21,6 +21,7 @@ decline_final_lock=0
 case "$hip" in
     tessera-relock-decline) hip=tessera-reconnect; decline_relock=1 ;;
     tessera-relock-reconnect) hip=tessera-reconnect; decline_relock=2 ;;
+    tessera-cycle) hip=tessera-reconnect; decline_relock=2; decline_final_lock=2 ;;
     tessera-final-lock-decline) hip=tessera-reconnect; decline_relock=2; decline_final_lock=1 ;;
 esac
 if [ -n "$transport" ]; then
@@ -549,7 +550,9 @@ if [ -n "$tessera_fact" ]; then
                 check_unchanged_locked_report
                 receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
                 unlock_tessera_key
-                "$V" "rm -f '$G/tessera-key'"
+                if [ "$decline_final_lock" != 2 ]; then
+                    "$V" "rm -f '$G/tessera-key'"
+                fi
                 approve_tessera_change 1 "Tessera domain key unlock after second-decline reconnect"
                 probe "IPv4 echo after approved unlock on the second reconnect"
                 rebind_unlocked_tessera 5
@@ -557,10 +560,27 @@ if [ -n "$tessera_fact" ]; then
 
                 receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
                 lock_tessera_key
-                if [ "$decline_final_lock" = 1 ]; then
+                if [ "$decline_final_lock" != 0 ]; then
                     expected_count=0
                     change="Tessera domain key lock after the second reconnect rebind"
                     decline_active_tessera_review 5 "$reconnect_iface"
+                    if [ "$decline_final_lock" = 1 ]; then
+                        echo "$pass checks passed"
+                        exit 0
+                    fi
+                    reconnect_tessera 5 final-approved
+                    approve_tessera_change 0 "Tessera domain key lock after final decline"
+                    wait_field handshake 1
+                    probe "IPv4 echo after reconnect from final decline"
+                    check_unchanged_locked_report
+                    receipt_offset=$(wc -l < "$receipts" | tr -d ' ')
+                    unlock_tessera_key
+                    "$V" "rm -f '$G/tessera-key'"
+                    approve_tessera_change 1 "Tessera domain key unlock after final decline"
+                    probe "IPv4 echo after approved unlock from final decline"
+                    rebind_unlocked_tessera 7
+                    probe "IPv4 echo on the final rebound tunnel"
+                    "$V" "$CTL down name=gp-gate" >/dev/null
                     echo "$pass checks passed"
                     exit 0
                 fi

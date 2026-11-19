@@ -864,6 +864,13 @@ another origin. An active portal-profile session stays in engine memory.
   review on the active tunnel. It checks that the locked count remains
   unsent, the tunnel and route go down, and IPv4 echo fails. It passed
   33/33 on arm64 TLS and 33/33 with `--esp`.
+  The `--hip tessera-cycle` variant continues after that decline in one
+  run per transport. It checks that the declined choice is rejected on
+  reconnect, the locked report and traffic wait for fresh approval, the
+  identical locked report refreshes without prompting, unlock requires
+  fresh approval, and rebind sends the unchanged unlocked report before
+  echo resumes on the new data connection.
+  The batched arm64 gate passed 42/42 on TLS and 42/42 with `--esp`.
 - GlobalProtect IPv4 ESP uses UDP/4501 on the same peer as HTTPS. The first
   suite is AES-128-CBC with HMAC-SHA1-96, directional associations, random
   IVs and a 64-packet replay window. The engine probes the authenticated path
